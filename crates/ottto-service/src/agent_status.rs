@@ -2437,6 +2437,56 @@ fn codex_home_slots_checked(status: &CodexAccountsStatusV1) -> (Vec<CodexHomeSlo
     (slots, complete)
 }
 
+/// One Codex home the daily provider reference may read: the provider
+/// default home (`slot_id` `None`) or an accepted Ottto slot with the account
+/// and workspace hashes it was registered with.
+pub(crate) struct DailyReferenceHome {
+    pub(crate) slot_id: Option<String>,
+    pub(crate) home: PathBuf,
+    pub(crate) trust: CodexHomeTrust,
+    pub(crate) registered_pair: Option<(String, String)>,
+}
+
+/// Kind only: the path and the registered hashes stay out of formatted output.
+impl std::fmt::Debug for DailyReferenceHome {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DailyReferenceHome")
+            .field("slot", &self.slot_id.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// The default Codex home and every accepted Ottto slot home (never a home
+/// seen only through a running process), and whether every settings read
+/// succeeded. Read-only: a pending slot removal is left to its owner, and an
+/// unreadable registry yields the default home alone, marked incomplete.
+pub(crate) fn daily_reference_homes() -> (Vec<DailyReferenceHome>, bool) {
+    let default_home = || DailyReferenceHome {
+        slot_id: None,
+        home: default_codex_home(),
+        trust: CodexHomeTrust::ProviderDefault,
+        registered_pair: None,
+    };
+    let Ok(status) = FileCodexAccountSlotSettingsStore::default().load_for_session_launch() else {
+        return (vec![default_home()], false);
+    };
+    let (slots, complete) = codex_home_slots_checked(&status);
+    let homes = slots
+        .into_iter()
+        .map(|slot| match slot.ownership {
+            CodexAccountSlotOwnershipV1::Default => default_home(),
+            CodexAccountSlotOwnershipV1::Managed => DailyReferenceHome {
+                slot_id: Some(slot.slot_id),
+                home: slot.home,
+                trust: CodexHomeTrust::Managed,
+                registered_pair: slot.registered_binding,
+            },
+        })
+        .collect();
+    (homes, complete)
+}
+
 fn collect_codex_home_candidate(
     slot: CodexHomeSlot,
     captured_at: &str,

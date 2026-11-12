@@ -80,9 +80,11 @@ const LOOKBACK_DAYS: i64 = 120;
 /// Local grant-file schema. Independent of the wire schema on purpose: the
 /// on-disk shape may change without the contract changing.
 const GRANT_FILE_SCHEMA_VERSION: &str = "codex_daily_aggregates_grant.v1";
-// Additive state fields are serde-defaulted, so v1 files remain compatible and
-// retain their cadence/breaker history across upgrades.
-const STATE_FILE_SCHEMA_VERSION: u16 = 1;
+// Schema 2 keys one entry per account read. A schema-1 file (one account)
+// loads as empty: every account starts at its first read.
+const STATE_FILE_SCHEMA_VERSION: u16 = 2;
+/// An entry no complete discovery has seen for this many days is dropped.
+const STATE_ENTRY_RETENTION_DAYS: i64 = 7;
 
 // ---------------------------------------------------------------------------
 // Local operator surface - names an operator sees on disk
@@ -579,9 +581,45 @@ impl GrantStore {
         }))
     }
 
+    /// This installation's attribution key, for fingerprinting many logins
+    /// with one grant read.
+    pub(crate) fn hmac_key(&self) -> Result<Option<Vec<u8>>> {
+        let Some(state) = self.read()? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            decode_hex(&state.hmac_key_hex).ok_or_else(|| anyhow!("grant key is invalid"))?,
+        ))
+    }
+
+    /// The collector state that sits next to this grant.
+    pub(crate) fn state_store(&self) -> StateStore {
+        StateStore::new(self.path.with_file_name(STATE_FILE))
+    }
+
     /// Mirror the backend's durable exclusion locally so future cycles stop
     /// before contacting the provider rather than repeating a refused upload.
     pub fn set_account_excluded(&self, account_fingerprint: &str, excluded: bool) -> Result<()> {
+        self.set_account_excluded_where(account_fingerprint, excluded, None)
+            .map(|_| ())
+    }
+
+    /// [`Self::set_account_excluded`] from inside a tick: writes only while
+    /// the grant is still the `expected` binding. `Ok(false)` wrote nothing.
+    fn set_account_excluded_for(
+        &self,
+        expected: &BackendGrantBinding,
+        account_fingerprint: &str,
+    ) -> Result<bool> {
+        self.set_account_excluded_where(account_fingerprint, true, Some(expected))
+    }
+
+    fn set_account_excluded_where(
+        &self,
+        account_fingerprint: &str,
+        excluded: bool,
+        expected: Option<&BackendGrantBinding>,
+    ) -> Result<bool> {
         let _lock = crate::cloud_sessions::lock_state_file(&self.path, "daily reference grant")?;
         if !is_fingerprint(account_fingerprint) {
             return Err(anyhow!("account fingerprint is invalid"));
@@ -589,6 +627,11 @@ impl GrantStore {
         let mut state = self
             .read()?
             .ok_or_else(|| anyhow!("codex daily aggregates consent is absent"))?;
+        if expected
+            .is_some_and(|expected| !same_binding(state.grant.backend_binding.as_ref(), expected))
+        {
+            return Ok(false);
+        }
         if excluded {
             state
                 .excluded_account_fingerprints
@@ -598,7 +641,8 @@ impl GrantStore {
                 .excluded_account_fingerprints
                 .remove(account_fingerprint);
         }
-        atomic_json_write(&self.path, &state)
+        atomic_json_write(&self.path, &state)?;
+        Ok(true)
     }
 
     /// Record local consent. The grant is not live until the backend binds it:
@@ -935,19 +979,53 @@ impl GrantStore {
 
     /// Record collector health. Never resurrects a non-enabled grant.
     fn record_health(&self, success_at: Option<&str>, error_category: Option<&str>) -> Result<()> {
+        self.record_health_where(None, success_at, error_category)
+            .map(|_| ())
+    }
+
+    /// [`Self::record_health`] from inside a tick: writes only while the
+    /// grant is still the `expected` binding. `Ok(false)` wrote nothing.
+    fn record_health_for(
+        &self,
+        expected: &BackendGrantBinding,
+        success_at: Option<&str>,
+        error_category: Option<&str>,
+    ) -> Result<bool> {
+        self.record_health_where(Some(expected), success_at, error_category)
+    }
+
+    fn record_health_where(
+        &self,
+        expected: Option<&BackendGrantBinding>,
+        success_at: Option<&str>,
+        error_category: Option<&str>,
+    ) -> Result<bool> {
         let _lock = crate::cloud_sessions::lock_state_file(&self.path, "daily reference grant")?;
         let Some(mut state) = self.read()? else {
-            return Ok(());
+            return Ok(false);
         };
-        if state.grant.status != GrantStatus::Enabled {
-            return Ok(());
+        if state.grant.status != GrantStatus::Enabled
+            || expected.is_some_and(|expected| {
+                !same_binding(state.grant.backend_binding.as_ref(), expected)
+            })
+        {
+            return Ok(false);
         }
         if let Some(success_at) = success_at {
             state.grant.last_success_at = Some(success_at.to_string());
         }
         state.grant.last_error_category = error_category.map(|value| value.to_string());
-        atomic_json_write(&self.path, &state)
+        atomic_json_write(&self.path, &state)?;
+        Ok(true)
     }
+}
+
+/// Whether a stored binding is the `(grant_id, grant_version)` a tick began
+/// with. Two reads that agree are the same consent.
+fn same_binding(stored: Option<&BackendGrantBinding>, expected: &BackendGrantBinding) -> bool {
+    stored.is_some_and(|binding| {
+        binding.grant_id == expected.grant_id && binding.grant_version == expected.grant_version
+    })
 }
 
 fn validate_grant_response(
@@ -1080,6 +1158,24 @@ pub struct CollectorStatusV1 {
     pub current_account_fingerprint: Option<String>,
     #[serde(default)]
     pub current_account_excluded: bool,
+    /// Every account the latest discovery selected under the current consent.
+    /// Ordinals, home kinds and closed reasons only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accounts: Vec<CollectorAccountStatusV1>,
+}
+
+/// One discovered account in the status view. Never a slot id, fingerprint,
+/// binding, pair, digest or path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollectorAccountStatusV1 {
+    /// 1-based position in discovery order.
+    pub ordinal: u32,
+    /// `default` or `slot`.
+    pub home_kind: String,
+    /// Closed reason of the account's last evaluated attempt.
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_success_at: Option<String>,
 }
 
 /// Build the status view for a given store and off-switch state.
@@ -1138,35 +1234,32 @@ pub fn collector_status(grants: &GrantStore, network_disabled: bool) -> Collecto
         reason_code: reason_code.to_string(),
         current_account_fingerprint: None,
         current_account_excluded: false,
+        accounts: Vec::new(),
     }
 }
 
 /// Downgrade an otherwise-ready status when the live binding is not the one
-/// consent covers.
+/// consent covers, and report each discovered account.
 ///
-/// [`collector_status`] reads the grant alone, so it cannot see that the signed-in
-/// Codex account has changed. The collector checks that on every cycle and stops,
-/// which left the operator surface reporting `enabled` while nothing was being
-/// collected - a live install sat that way for over a day. Anything a cycle
-/// refuses for, the status has to be able to say.
-///
-/// The privacy ordering is preserved: the live account and installation are only
-/// resolved when consent is ALREADY runtime-ready, which is exactly when reading
-/// is permitted anyway. A grant that is absent or blocked earlier touches nothing.
+/// [`collector_status`] reads the grant alone, so it cannot see what the
+/// collector found. The collector records each tick's discovery in
+/// `state.json`; status reads that summary, the grant and the caller's device
+/// id. It never reads a credential. Anything a cycle refuses for, the status
+/// has to be able to say.
 pub fn status_with_live_binding(
     grants: &GrantStore,
     status: CollectorStatusV1,
-    runtime: Option<&Runtime>,
+    installation_id: Option<&str>,
 ) -> CollectorStatusV1 {
     if status.runtime_state != RuntimeState::Enabled {
         return status;
     }
-    if let Some(reason) = grants
-        .load()
-        .ok()
-        .flatten()
-        .as_ref()
-        .and_then(|grant| grant.last_error_category.as_deref())
+    let Some(grant) = grants.load().ok().flatten() else {
+        return status;
+    };
+    if let Some(reason) = grant
+        .last_error_category
+        .as_deref()
         .and_then(grant_rebind::status_reason)
     {
         return CollectorStatusV1 {
@@ -1176,10 +1269,10 @@ pub fn status_with_live_binding(
             ..status
         };
     }
-    let Some(runtime) = runtime else {
+    let Some(installation_id) = installation_id else {
         return status;
     };
-    if let Some(reason) = live_binding_mismatch(grants, runtime) {
+    if let Some(reason) = installation_mismatch(grants, &grant, installation_id) {
         return CollectorStatusV1 {
             runtime_state: RuntimeState::ConsentRequired,
             provider_read_permitted: false,
@@ -1187,57 +1280,121 @@ pub fn status_with_live_binding(
             ..status
         };
     }
-    let current_account_fingerprint = grants
-        .account_fingerprint_for(&runtime.provider_account_scope)
-        .ok()
-        .flatten();
+    let Some(binding) = grant.backend_binding.as_ref().map(StateBinding::of) else {
+        return status;
+    };
+    let file = grants.state_store().load_file();
+    let Some(summary) = file
+        .discovery
+        .as_ref()
+        .filter(|summary| summary.binding == binding)
+    else {
+        return CollectorStatusV1 {
+            reason_code: "discovery_pending".to_string(),
+            ..status
+        };
+    };
+    let live = summary
+        .accounts
+        .iter()
+        .filter_map(|identity| file.entries.get(identity))
+        .filter(|entry| entry.binding.as_ref() == Some(&binding))
+        .filter_map(|entry| {
+            let fingerprint = entry.account_fingerprint.as_deref()?;
+            let excluded = grants.account_is_excluded(fingerprint).unwrap_or(false);
+            Some((entry, fingerprint, excluded))
+        })
+        .collect::<Vec<_>>();
+    let accounts = live
+        .iter()
+        .enumerate()
+        .map(|(index, (entry, _, excluded))| CollectorAccountStatusV1 {
+            ordinal: u32::try_from(index + 1).unwrap_or(u32::MAX),
+            home_kind: entry.home_kind.clone().unwrap_or_default(),
+            reason: if *excluded {
+                "excluded".to_string()
+            } else {
+                entry
+                    .last_reason
+                    .clone()
+                    .unwrap_or_else(|| "discovery_pending".to_string())
+            },
+            last_success_at: i64::try_from(entry.last_success_epoch_seconds)
+                .ok()
+                .filter(|seconds| *seconds > 0)
+                .and_then(|seconds| OffsetDateTime::from_unix_timestamp(seconds).ok())
+                .map(timestamp),
+        })
+        .collect::<Vec<_>>();
+    let current_account_fingerprint = summary.default_home.fingerprint.clone();
     let current_account_excluded = current_account_fingerprint
         .as_deref()
         .is_some_and(|fingerprint| grants.account_is_excluded(fingerprint).unwrap_or(false));
-    CollectorStatusV1 {
-        runtime_state: if current_account_excluded {
-            RuntimeState::AccountExcluded
-        } else {
-            status.runtime_state
-        },
-        provider_read_permitted: status.provider_read_permitted && !current_account_excluded,
-        reason_code: if current_account_excluded {
-            "account_excluded".to_string()
-        } else {
-            status.reason_code.clone()
-        },
+    let status = CollectorStatusV1 {
         current_account_fingerprint,
         current_account_excluded,
+        accounts,
         ..status
+    };
+    if grant.disclosure_version == DISCLOSURE_VERSION_V1
+        && !live
+            .iter()
+            .any(|(_, fingerprint, _)| *fingerprint == grant.account_fingerprint)
+    {
+        return CollectorStatusV1 {
+            runtime_state: RuntimeState::ConsentRequired,
+            provider_read_permitted: false,
+            reason_code: "account_mismatch".to_string(),
+            ..status
+        };
     }
+    if live.is_empty() {
+        return CollectorStatusV1 {
+            provider_read_permitted: false,
+            reason_code: "no_live_codex_login".to_string(),
+            ..status
+        };
+    }
+    if live.iter().all(|(_, _, excluded)| *excluded) {
+        return CollectorStatusV1 {
+            runtime_state: RuntimeState::AccountExcluded,
+            provider_read_permitted: false,
+            reason_code: "account_excluded".to_string(),
+            ..status
+        };
+    }
+    status
 }
 
-/// Which half of the binding disagrees with stored consent, if either.
+/// The rebind reason when the caller's installation is not the one consent
+/// was recorded for.
 ///
 /// An unreadable fingerprint is NOT reported as a mismatch: failing to derive it
-/// is not evidence that the account differs, and claiming otherwise would send a
-/// customer to re-approve for no reason.
-fn live_binding_mismatch(grants: &GrantStore, runtime: &Runtime) -> Option<&'static str> {
-    let stored = grants.load().ok().flatten()?;
-    if let Ok(Some(installation)) = grants.installation_fingerprint_for(&runtime.installation_id) {
-        if installation != stored.installation_fingerprint {
-            return Some(
-                stored
-                    .last_error_category
-                    .as_deref()
-                    .and_then(grant_rebind::status_reason)
-                    .unwrap_or("rebinding"),
-            );
-        }
-    }
-    if stored.disclosure_version == DISCLOSURE_VERSION_V1 {
-        if let Ok(Some(account)) = grants.account_fingerprint_for(&runtime.provider_account_scope) {
-            if account != stored.account_fingerprint {
-                return Some("account_mismatch");
-            }
-        }
-    }
-    None
+/// is not evidence that the installation differs, and claiming otherwise would
+/// send a customer to re-approve for no reason.
+fn installation_mismatch(
+    grants: &GrantStore,
+    grant: &DailyReferenceGrant,
+    installation_id: &str,
+) -> Option<&'static str> {
+    let installation = grants
+        .installation_fingerprint_for(installation_id)
+        .ok()
+        .flatten()?;
+    (installation != grant.installation_fingerprint).then(|| {
+        grant
+            .last_error_category
+            .as_deref()
+            .and_then(grant_rebind::status_reason)
+            .unwrap_or("rebinding")
+    })
+}
+
+/// The Codex account scope a local privacy control acts on: the default
+/// home's login, or with `prepare_fallback` the first live login. Never
+/// called by Status, Bind, Revoke or ConfirmRevoked.
+pub(crate) fn control_account_scope(prepare_fallback: bool) -> Option<String> {
+    logins::control_account_scope(prepare_fallback, unix_seconds(OffsetDateTime::now_utc()))
 }
 
 /// Replay ledger for this capability's one-time control tokens.
@@ -1369,9 +1526,75 @@ struct CollectorState {
     opened_by: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_error_category: Option<String>,
+    /// The opaque account this entry reads. Never a provider identifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    account_fingerprint: Option<String>,
+    /// `default` or `slot`. Never a slot id or a path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    home_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    binding: Option<StateBinding>,
+    /// The last UTC day a discovery selected this account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_seen_day: Option<String>,
+    /// The closed reason of this account's last evaluated attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_reason: Option<String>,
 }
 
-/// Cadence and breaker state, keyed to one grant epoch.
+/// The consent epoch an entry or summary was written under.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StateBinding {
+    grant_id: String,
+    grant_version: u64,
+}
+
+impl StateBinding {
+    fn of(binding: &BackendGrantBinding) -> Self {
+        Self {
+            grant_id: binding.grant_id.clone(),
+            grant_version: binding.grant_version,
+        }
+    }
+}
+
+/// What the last discovery under a binding found. Counts, closed reasons and
+/// opaque labels only; status reads it instead of any credential.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct DiscoverySummary {
+    binding: StateBinding,
+    complete: bool,
+    /// State keys of the selected logins, in discovery order.
+    #[serde(default)]
+    accounts: Vec<String>,
+    #[serde(default)]
+    skipped: BTreeMap<String, u32>,
+    #[serde(default)]
+    default_home: logins::DefaultHomeState,
+}
+
+/// The whole `state.json`: one entry per account read, and the latest
+/// discovery.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct CollectorStateFile {
+    schema_version: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    discovery: Option<DiscoverySummary>,
+    #[serde(default)]
+    entries: BTreeMap<String, CollectorState>,
+}
+
+/// One selected login's bookkeeping at the end of a tick.
+struct SeenAccount {
+    identity: String,
+    account_fingerprint: String,
+    home_kind: &'static str,
+    /// `None` keeps the entry's previous reason (not yet due, or the tick
+    /// stopped before this login).
+    reason: Option<&'static str>,
+}
+
+/// Cadence and breaker state per account read, keyed to one grant epoch.
 #[derive(Debug, Clone)]
 pub struct StateStore {
     path: PathBuf,
@@ -1392,24 +1615,79 @@ impl StateStore {
         &self.path
     }
 
-    /// Load state for this grant epoch. Any change to the account, the endpoint
-    /// configuration, or the consent epoch reads as a clean slate, so a prior
-    /// verdict never carries across a change the customer made.
-    fn load(&self, identity: &str) -> CollectorState {
+    /// The whole file. Unreadable, corrupt or another schema reads as empty.
+    fn load_file(&self) -> CollectorStateFile {
+        let empty = CollectorStateFile {
+            schema_version: STATE_FILE_SCHEMA_VERSION,
+            ..CollectorStateFile::default()
+        };
         let Ok(raw) = fs::read_to_string(&self.path) else {
-            return CollectorState::default();
+            return empty;
         };
-        let Ok(state) = serde_json::from_str::<CollectorState>(&raw) else {
-            return CollectorState::default();
-        };
-        if state.schema_version != STATE_FILE_SCHEMA_VERSION || state.identity != identity {
-            return CollectorState::default();
+        match serde_json::from_str::<CollectorStateFile>(&raw) {
+            Ok(file) if file.schema_version == STATE_FILE_SCHEMA_VERSION => file,
+            _ => empty,
         }
-        state
     }
 
+    /// Load one account's state. Any change to the account, the endpoint
+    /// configuration, or the consent epoch is another identity and reads as a
+    /// clean slate, so a prior verdict never carries across a change the
+    /// customer made.
+    fn load(&self, identity: &str) -> CollectorState {
+        self.load_file()
+            .entries
+            .remove(identity)
+            .unwrap_or_default()
+    }
+
+    /// Save one account's state under its identity; other entries are kept.
     fn save(&self, state: &CollectorState) -> Result<()> {
-        atomic_json_write(&self.path, state)
+        let mut file = self.load_file();
+        file.entries.insert(state.identity.clone(), state.clone());
+        atomic_json_write(&self.path, &file)
+    }
+
+    /// End-of-tick bookkeeping: the discovery summary, each selected entry's
+    /// last-seen day and reason, and (after a complete discovery) pruning.
+    /// Writes only when something changed.
+    fn record_tick(
+        &self,
+        summary: DiscoverySummary,
+        seen: &[SeenAccount],
+        today: &str,
+    ) -> Result<()> {
+        let before = self.load_file();
+        let mut file = before.clone();
+        for account in seen {
+            let entry = file.entries.entry(account.identity.clone()).or_default();
+            entry.schema_version = STATE_FILE_SCHEMA_VERSION;
+            entry.identity = account.identity.clone();
+            entry.account_fingerprint = Some(account.account_fingerprint.clone());
+            entry.home_kind = Some(account.home_kind.to_string());
+            entry.binding = Some(summary.binding.clone());
+            entry.last_seen_day = Some(today.to_string());
+            if let Some(reason) = account.reason {
+                entry.last_reason = Some(reason.to_string());
+            }
+        }
+        if summary.complete {
+            let oldest_kept = parse_day(today)
+                .and_then(|day| day.checked_sub(TimeDuration::days(STATE_ENTRY_RETENTION_DAYS)));
+            file.entries.retain(|_, entry| {
+                entry
+                    .last_seen_day
+                    .as_deref()
+                    .and_then(parse_day)
+                    .zip(oldest_kept)
+                    .is_some_and(|(seen, oldest)| seen >= oldest)
+            });
+        }
+        file.discovery = Some(summary);
+        if file == before {
+            return Ok(());
+        }
+        atomic_json_write(&self.path, &file)
     }
 
     fn clear(&self) {
@@ -1567,7 +1845,9 @@ impl fmt::Debug for CodexCredential {
 /// One Codex login a cycle reads with: its credential, the account identity
 /// its live access token proves (if any), and when that token lapses. Built
 /// only by [`logins::read_login`] from one secure read and one parse.
+#[derive(Clone)]
 pub(crate) struct CodexLogin {
+    home_kind: logins::LoginHomeKind,
     credential: CodexCredential,
     identity: Option<AccountIdentityHashes>,
     lapses_at: u64,
@@ -1577,6 +1857,7 @@ impl fmt::Debug for CodexLogin {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("CodexLogin")
+            .field("home_kind", &self.home_kind.label())
             .field("identified", &self.identity.is_some())
             .finish_non_exhaustive()
     }
@@ -1643,21 +1924,6 @@ impl ProviderDailyUsageReader for ChatGptDailyUsageReader {
             Err(_) => Err(ProviderReadError::Transient("transport error".to_string())),
         }
     }
-}
-
-/// Read the customer's own Codex credential.
-///
-/// The already-issued access token and account id from `~/.codex/auth.json`.
-/// The token is used for exactly one request and is never persisted or logged.
-pub fn read_codex_credential() -> Option<CodexCredential> {
-    let path = std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir())
-        .join(".codex")
-        .join("auth.json");
-    let raw = fs::read_to_string(path).ok()?;
-    let json: Value = serde_json::from_str(&raw).ok()?;
-    codex_credential_from_auth(&json)
 }
 
 fn codex_credential_from_auth(json: &Value) -> Option<CodexCredential> {
@@ -2715,9 +2981,13 @@ pub enum CycleOutcome {
 pub struct Cycle {
     pub outcome: CycleOutcome,
     /// Normalized scalar rows observed when the provider read reached that
-    /// stage. `None` means no provider window was observed this cycle.
+    /// stage, summed over the tick's logins. `None` means no provider window
+    /// was observed this cycle.
     pub normalized_row_count: Option<usize>,
     pub diagnostics: Vec<AgentStatusDiagnostic>,
+    /// One element per login a tick evaluated. Empty when a tick-wide gate
+    /// stopped it first.
+    pub(crate) accounts: Vec<AccountCycle>,
 }
 
 impl Cycle {
@@ -2726,6 +2996,7 @@ impl Cycle {
             outcome,
             normalized_row_count: None,
             diagnostics: Vec::new(),
+            accounts: Vec::new(),
         }
     }
 
@@ -2734,8 +3005,20 @@ impl Cycle {
             outcome,
             normalized_row_count: None,
             diagnostics: vec![diagnostic],
+            accounts: Vec::new(),
         }
     }
+}
+
+/// What one login did in a tick. Ordinals and kinds only, never ids.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AccountCycle {
+    /// 1-based position in the tick's discovery order.
+    pub(crate) ordinal: usize,
+    pub(crate) home_kind: &'static str,
+    pub(crate) outcome: CycleOutcome,
+    /// Closed reason; `None` when the login was not yet due.
+    pub(crate) reason: Option<&'static str>,
 }
 
 /// Raw runtime identity the cycle proves against the grant's fingerprints.
@@ -2743,8 +3026,6 @@ impl Cycle {
 pub struct Runtime {
     /// Relay device id. Equals the wire `installation_id`.
     pub installation_id: String,
-    /// The provider account the live credential belongs to.
-    pub provider_account_scope: String,
 }
 
 fn info(code: &str, message: &str) -> AgentStatusDiagnostic {
@@ -2903,23 +3184,232 @@ impl Collector {
         self.sentinel.is_file()
     }
 
-    /// Run one collection cycle.
+    /// Run one collection tick over every discovered login.
     ///
-    /// Every local gate below runs before a socket is opened, in this order:
-    /// the sentinel, live consent at the current epoch and disclosure, the
-    /// live credential proving it is the installation and account consent was
-    /// taken over, the circuit breaker, and finally the cadence gate. The
-    /// backend applies build admission when the resulting batch is uploaded.
-    pub(crate) fn collect_account(
+    /// The tick-wide gates run first, before any socket is opened: the
+    /// sentinel, live consent at the current epoch and disclosure, and the
+    /// installation consent was recorded for. Each login then runs its own
+    /// gates in [`collect_account_once`], most overdue first. `clock` is
+    /// sampled once per login, so a login's cadence, window and
+    /// `collected_at` share one instant.
+    pub(crate) fn run_tick(
         &self,
         runtime: &Runtime,
-        login: &CodexLogin,
+        discovery: &logins::LoginDiscovery,
         reader: &dyn ProviderDailyUsageReader,
         transport: &dyn DailyReferenceTransport,
-        now: OffsetDateTime,
+        clock: &dyn Fn() -> OffsetDateTime,
     ) -> Cycle {
-        collect_account_once(self, runtime, login, reader, transport, now)
+        let grants = &self.grants;
+        if self.network_disabled() {
+            self.state.clear();
+            return network_disabled_cycle();
+        }
+        let grant = match runtime_ready_grant(grants) {
+            Ok(grant) => grant,
+            Err(cycle) => return cycle,
+        };
+        let Some(expected) = grant.backend_binding.clone() else {
+            return Cycle::new(CycleOutcome::Disabled);
+        };
+        // Consent is bound to this installation. The live account is
+        // attribution, not authorization under disclosure v2: each login's
+        // opaque fingerprint is derived on every tick so accounts can never
+        // overwrite one another.
+        let installation_matches = grants
+            .installation_fingerprint_for(&runtime.installation_id)
+            .ok()
+            .flatten()
+            .is_some_and(|fingerprint| fingerprint == grant.installation_fingerprint);
+        if !installation_matches {
+            return Cycle::with(
+                CycleOutcome::Disabled,
+                warning(
+                    "codex_daily_aggregates_installation_mismatch",
+                    "Codex daily aggregates consent was recorded for a different installation; collection is stopped.",
+                ),
+            );
+        }
+        if discovery.logins.is_empty() && discovery.skipped.is_empty() {
+            return deferred(logins::LoginSkip::Absent.code());
+        }
+        if !transport.is_configured() {
+            return deferred("transport_not_configured");
+        }
+        let Some(key) = grants.hmac_key().ok().flatten() else {
+            return attribution_unavailable_cycle();
+        };
+
+        let total = discovery.logins.len();
+        let mut seen = discovery
+            .logins
+            .iter()
+            .map(|login| {
+                let account_fingerprint = opaque_key(&key, &login.credential.account_scope);
+                SeenAccount {
+                    identity: state_identity_for_account(&grant, &account_fingerprint, false),
+                    account_fingerprint,
+                    home_kind: login.home_kind.label(),
+                    reason: None,
+                }
+            })
+            .collect::<Vec<_>>();
+        // Most overdue first; ties (every never-read login is due since the
+        // epoch) keep discovery order: default home, then slot id. No caps:
+        // every selected login is evaluated.
+        let state_file = self.state.load_file();
+        let mut order = seen
+            .iter()
+            .enumerate()
+            .map(|(index, account)| {
+                let due_at = state_file
+                    .entries
+                    .get(&account.identity)
+                    .map(|state| state.last_fetch_epoch_seconds)
+                    .filter(|last_fetch| *last_fetch > 0)
+                    .map_or(0, |last_fetch| {
+                        last_fetch.saturating_add(fetch_interval_seconds(&account.identity))
+                    });
+                (due_at, index)
+            })
+            .collect::<Vec<_>>();
+
+        drop(state_file);
+        order.sort_unstable();
+
+        let mut accounts = Vec::new();
+        let mut diagnostics = Vec::new();
+        let mut normalized_row_count: Option<usize> = None;
+        let mut consent_changed = false;
+        let mut last_now = clock();
+        for (_, index) in order {
+            let login = &discovery.logins[index];
+            last_now = clock();
+            let attempt =
+                collect_account_once(self, &expected, runtime, login, reader, transport, last_now);
+            let home_kind = login.home_kind.label();
+            let prefix = format!("login {}/{total} ({home_kind}): ", index + 1);
+            diagnostics.extend(attempt.cycle.diagnostics.into_iter().map(|mut diagnostic| {
+                diagnostic.message = format!("{prefix}{}", diagnostic.message);
+                diagnostic
+            }));
+            if let Some(rows) = attempt.cycle.normalized_row_count {
+                normalized_row_count = Some(normalized_row_count.unwrap_or(0).saturating_add(rows));
+            }
+            accounts.push(AccountCycle {
+                ordinal: index + 1,
+                home_kind,
+                outcome: attempt.cycle.outcome,
+                reason: attempt.reason,
+            });
+            seen[index].reason = attempt.reason;
+            match attempt.stop {
+                None => {}
+                Some(TickStop::Grant) => break,
+                Some(TickStop::Consent) => {
+                    consent_changed = true;
+                    break;
+                }
+            }
+        }
+
+        // A consent change or the off-switch mid-tick leaves no summary: the
+        // next tick discovers again under whatever consent is then live.
+        if !consent_changed {
+            let summary = DiscoverySummary {
+                binding: StateBinding::of(&expected),
+                complete: discovery.complete,
+                accounts: seen
+                    .iter()
+                    .map(|account| account.identity.clone())
+                    .collect(),
+                skipped: discovery.skipped.clone(),
+                default_home: discovery.default_home.clone(),
+            };
+            let _ = self
+                .state
+                .record_tick(summary, &seen, &date_string(last_now));
+        }
+
+        if discovery.logins.is_empty() {
+            return Cycle::with(
+                CycleOutcome::Deferred,
+                warning(
+                    "codex_daily_aggregates_deferred",
+                    &format!(
+                        "Consent is ready but no Codex sign-in on this Mac can be read: {}. Nothing was read.",
+                        skip_summary(discovery)
+                    ),
+                ),
+            );
+        }
+        let outcome = tick_outcome(&accounts);
+        if outcome != CycleOutcome::Noop && (!discovery.skipped.is_empty() || !discovery.complete) {
+            diagnostics.push(info(
+                "codex_daily_aggregates_logins_skipped",
+                &format!(
+                    "Some Codex sign-ins on this Mac were not read: {}.",
+                    skip_summary(discovery)
+                ),
+            ));
+        }
+        Cycle {
+            outcome,
+            normalized_row_count,
+            diagnostics,
+            accounts,
+        }
     }
+}
+
+/// Closed skip reasons and their counts, plus whether discovery was complete.
+fn skip_summary(discovery: &logins::LoginDiscovery) -> String {
+    let mut parts = discovery
+        .skipped
+        .iter()
+        .map(|(reason, count)| format!("{reason}={count}"))
+        .collect::<Vec<_>>();
+    if !discovery.complete {
+        parts.push("discovery_incomplete".to_string());
+    }
+    parts.join(" ")
+}
+
+/// The tick's outcome: `Uploaded` if any login uploaded, else `Failed` if any
+/// failed, else the most restrictive gate a login stopped at.
+fn tick_outcome(accounts: &[AccountCycle]) -> CycleOutcome {
+    [
+        CycleOutcome::Uploaded,
+        CycleOutcome::Failed,
+        CycleOutcome::Disabled,
+        CycleOutcome::NotAdmitted,
+        CycleOutcome::AccountExcluded,
+        CycleOutcome::CircuitOpen,
+        CycleOutcome::Deferred,
+    ]
+    .into_iter()
+    .find(|outcome| accounts.iter().any(|account| account.outcome == *outcome))
+    .unwrap_or(CycleOutcome::Noop)
+}
+
+fn network_disabled_cycle() -> Cycle {
+    Cycle::with(
+        CycleOutcome::Disabled,
+        info(
+            "codex_daily_aggregates_network_disabled",
+            "Codex daily aggregates are disabled by the local off-switch; the provider endpoint is never contacted.",
+        ),
+    )
+}
+
+fn attribution_unavailable_cycle() -> Cycle {
+    Cycle::with(
+        CycleOutcome::Disabled,
+        warning(
+            "codex_daily_aggregates_account_attribution_unavailable",
+            "The live Codex account could not be assigned an opaque attribution label; collection is stopped.",
+        ),
+    )
 }
 
 /// The consent gate both cycle entry points run first.
@@ -2972,127 +3462,185 @@ fn deferred(reason: &'static str) -> Cycle {
     )
 }
 
-/// One account's read: every local gate, then at most one provider request
-/// with `login`'s credential, then its batches.
+/// Why a login's attempt ends the whole tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TickStop {
+    /// A grant-wide answer (429, not admitted, epoch conflict): the other
+    /// logins wait for the next tick. The tick's summary is still saved.
+    Grant,
+    /// The off-switch or the consent changed under the tick: nothing more is
+    /// read or recorded.
+    Consent,
+}
+
+/// What one login's attempt did inside a tick.
+struct AccountAttempt {
+    cycle: Cycle,
+    /// The closed status reason, or `None` to keep the account's previous
+    /// one (the cadence gate has not elapsed).
+    reason: Option<&'static str>,
+    stop: Option<TickStop>,
+}
+
+impl AccountAttempt {
+    fn next(cycle: Cycle, reason: &'static str) -> Self {
+        Self {
+            cycle,
+            reason: Some(reason),
+            stop: None,
+        }
+    }
+
+    fn stop(cycle: Cycle, reason: &'static str, stop: TickStop) -> Self {
+        Self {
+            cycle,
+            reason: Some(reason),
+            stop: Some(stop),
+        }
+    }
+}
+
+/// One login's read inside a tick: every local gate is checked again, then
+/// the attempt time is saved, and only then is at most one provider request
+/// made with `login`'s own credential.
 fn collect_account_once(
     collector: &Collector,
+    expected: &BackendGrantBinding,
     runtime: &Runtime,
     login: &CodexLogin,
     reader: &dyn ProviderDailyUsageReader,
     transport: &dyn DailyReferenceTransport,
     now: OffsetDateTime,
-) -> Cycle {
+) -> AccountAttempt {
     let grants = &collector.grants;
     let state_store = &collector.state;
-    let sentinel_disabled = collector.network_disabled();
-    if sentinel_disabled {
+    if collector.network_disabled() {
         state_store.clear();
-        return Cycle::with(
-            CycleOutcome::Disabled,
-            info(
-                "codex_daily_aggregates_network_disabled",
-                "Codex daily aggregates are disabled by the local off-switch; the provider endpoint is never contacted.",
-            ),
+        return AccountAttempt::stop(
+            network_disabled_cycle(),
+            "network_disabled",
+            TickStop::Consent,
         );
     }
-
     let grant = match runtime_ready_grant(grants) {
-        Ok(grant) => grant,
-        Err(cycle) => return cycle,
+        Ok(grant) if same_binding(grant.backend_binding.as_ref(), expected) => grant,
+        Ok(_) => {
+            return AccountAttempt::stop(
+                Cycle::with(
+                    CycleOutcome::Disabled,
+                    warning(
+                        "codex_daily_aggregates_consent_changed",
+                        "Consent changed during this tick; the remaining accounts wait for the next tick.",
+                    ),
+                ),
+                "consent_changed",
+                TickStop::Consent,
+            )
+        }
+        Err(cycle) => return AccountAttempt::stop(cycle, "consent_changed", TickStop::Consent),
     };
-
-    // Consent is bound to this installation. The live account is attribution,
-    // not authorization under disclosure v2: derive its opaque fingerprint on
-    // every cycle so account A and account B can never overwrite one another.
-    let installation_matches = grants
-        .installation_fingerprint_for(&runtime.installation_id)
-        .ok()
-        .flatten()
-        .is_some_and(|fingerprint| fingerprint == grant.installation_fingerprint);
-    if !installation_matches {
-        return Cycle::with(
-            CycleOutcome::Disabled,
-            warning(
-                "codex_daily_aggregates_installation_mismatch",
-                "Codex daily aggregates consent was recorded for a different installation; collection is stopped.",
-            ),
-        );
-    }
     let Some(account_fingerprint) = grants
         .account_fingerprint_for(&login.credential.account_scope)
         .ok()
         .flatten()
     else {
-        return Cycle::with(
-            CycleOutcome::Disabled,
-            warning(
-                "codex_daily_aggregates_account_attribution_unavailable",
-                "The live Codex account could not be assigned an opaque attribution label; collection is stopped.",
-            ),
+        return AccountAttempt::stop(
+            attribution_unavailable_cycle(),
+            "consent_changed",
+            TickStop::Consent,
         );
     };
     if grant.disclosure_version == DISCLOSURE_VERSION_V1
         && account_fingerprint != grant.account_fingerprint
     {
-        return Cycle::with(
-            CycleOutcome::Disabled,
-            warning(
-                "codex_daily_aggregates_account_mismatch",
-                "The live Codex account is not the account this v1 consent covers; collection is stopped.",
+        return AccountAttempt::next(
+            Cycle::with(
+                CycleOutcome::Disabled,
+                warning(
+                    "codex_daily_aggregates_account_mismatch",
+                    "The live Codex account is not the account this v1 consent covers; it is not read.",
+                ),
             ),
+            "not_covered_by_v1_consent",
         );
     }
     if grants
         .account_is_excluded(&account_fingerprint)
         .unwrap_or(false)
     {
-        return Cycle::with(
-            CycleOutcome::AccountExcluded,
-            info(
-                "codex_daily_aggregates_account_excluded",
-                "The current Codex account is excluded. No provider read or upload was attempted.",
+        return AccountAttempt::next(
+            Cycle::with(
+                CycleOutcome::AccountExcluded,
+                info(
+                    "codex_daily_aggregates_account_excluded",
+                    "This Codex account is excluded. No provider read or upload was attempted.",
+                ),
             ),
+            "excluded",
         );
     }
 
-    if !transport.is_configured() {
-        return deferred("transport_not_configured");
-    }
-
-    let identity = state_identity_for_account(&grant, &account_fingerprint, sentinel_disabled);
+    let identity = state_identity_for_account(&grant, &account_fingerprint, false);
     let mut state = state_store.load(&identity);
     let now_seconds = unix_seconds(now);
     if breaker_is_open(&state, now_seconds) {
-        return Cycle::with(
-            CycleOutcome::CircuitOpen,
-            warning(
-                "codex_daily_aggregates_circuit_open",
-                &format!(
-                    "The Codex daily aggregate read is paused after repeated {} answers; it will retry after the cool-down.",
-                    state.opened_by
+        return AccountAttempt::next(
+            Cycle::with(
+                CycleOutcome::CircuitOpen,
+                warning(
+                    "codex_daily_aggregates_circuit_open",
+                    &format!(
+                        "The Codex daily aggregate read is paused after repeated {} answers; it will retry after the cool-down.",
+                        state.opened_by
+                    ),
                 ),
             ),
+            "circuit_open",
         );
     }
     if !fetch_due(&state, &identity, now_seconds) {
-        return Cycle::new(CycleOutcome::Noop);
+        return AccountAttempt {
+            cycle: Cycle::new(CycleOutcome::Noop),
+            reason: None,
+            stop: None,
+        };
     }
     // The token may have lapsed since the login was read. It is never
     // refreshed here: an expired sign-in waits for Codex to renew it.
     if login.lapses_at <= now_seconds.saturating_add(logins::LAPSE_MARGIN_SECONDS) {
-        return deferred(logins::LoginSkip::Expired.code());
+        return AccountAttempt::next(
+            deferred(logins::LoginSkip::Expired.code()),
+            logins::LoginSkip::Expired.reason(),
+        );
     }
 
+    // Admission: the attempt time is durable before the request, so every
+    // outcome below is next due at the ordinary cadence. A failed save makes
+    // no request at all.
     let (window_start, window_end) = collection_window(now);
     state.last_fetch_epoch_seconds = now_seconds;
     state.schema_version = STATE_FILE_SCHEMA_VERSION;
     state.identity = identity.clone();
+    state.last_seen_day = Some(date_string(now));
+    if state_store.save(&state).is_err() {
+        return AccountAttempt::next(
+            Cycle::with(
+                CycleOutcome::Deferred,
+                warning(
+                    "codex_daily_aggregates_state_unwritable",
+                    "The collector state could not be saved, so this account was not read.",
+                ),
+            ),
+            "state_unwritable",
+        );
+    }
 
     let payload = match reader.fetch_window(&login.credential, &window_start, &window_end) {
         Ok(payload) => payload,
         Err(error) => {
-            return record_provider_failure(
+            return provider_failure_attempt(
                 grants,
+                expected,
                 state_store,
                 state,
                 &identity,
@@ -3104,8 +3652,9 @@ fn collect_account_once(
     let normalized = match normalize_provider_window(&payload, &window_start, &window_end) {
         Ok(normalized) => normalized,
         Err(error) => {
-            return record_provider_failure(
+            return provider_failure_attempt(
                 grants,
+                expected,
                 state_store,
                 state,
                 &identity,
@@ -3139,31 +3688,31 @@ fn collect_account_once(
         ));
     }
     append_normalization_diagnostics(&normalized, &mut diagnostics);
+    let failed = |diagnostics: Vec<AgentStatusDiagnostic>, outcome: CycleOutcome| Cycle {
+        outcome,
+        normalized_row_count: Some(normalized_row_count),
+        diagnostics,
+        accounts: Vec::new(),
+    };
 
     let batches = match pack_batches(normalized.rows, &window_start, &window_end) {
         Ok(batches) => batches,
         Err(error) => {
             state.last_error_category = Some("row_budget_exceeded".to_string());
             let _ = state_store.save(&state);
-            let _ = grants.record_health(None, Some("row_budget_exceeded"));
+            let _ = grants.record_health_for(expected, None, Some("row_budget_exceeded"));
             diagnostics.push(warning(
                 "codex_daily_aggregates_row_budget_exceeded",
                 &format!("The provider window did not fit the upload contract: {error}"),
             ));
-            return Cycle {
-                outcome: CycleOutcome::Failed,
-                normalized_row_count: Some(normalized_row_count),
-                diagnostics,
-            };
+            return AccountAttempt::next(
+                failed(diagnostics, CycleOutcome::Failed),
+                "upload_refused",
+            );
         }
     };
 
     let collected_at = timestamp(now);
-    let grant_version = grant
-        .backend_binding
-        .as_ref()
-        .map(|binding| binding.grant_version)
-        .unwrap_or_default();
     // Disclosure v1 did not cover the account identity; only v2 carries it.
     let account_identity = if grant.disclosure_version == DISCLOSURE_VERSION {
         login.identity.clone()
@@ -3180,7 +3729,7 @@ fn collect_account_once(
             installation_id: runtime.installation_id.clone(),
             grant_scope_fingerprint: grant.grant_scope_fingerprint.clone(),
             account_fingerprint: account_fingerprint.clone(),
-            grant_version,
+            grant_version: expected.grant_version,
             provider_day_timezone: PROVIDER_DAY_TIMEZONE,
             coverage_start: coverage_start.clone(),
             coverage_end: coverage_end.clone(),
@@ -3196,11 +3745,10 @@ fn collect_account_once(
                     "codex_daily_aggregates_batch_invalid",
                     &format!("The normalized batch could not be encoded: {error}"),
                 ));
-                return Cycle {
-                    outcome: CycleOutcome::Failed,
-                    normalized_row_count: Some(normalized_row_count),
-                    diagnostics,
-                };
+                return AccountAttempt::next(
+                    failed(diagnostics, CycleOutcome::Failed),
+                    "upload_refused",
+                );
             }
         };
         // Last line of defence: refuse to send anything the contract's closed
@@ -3212,11 +3760,10 @@ fn collect_account_once(
             ));
             state.last_error_category = Some("batch_not_content_free".to_string());
             let _ = state_store.save(&state);
-            return Cycle {
-                outcome: CycleOutcome::Failed,
-                normalized_row_count: Some(normalized_row_count),
-                diagnostics,
-            };
+            return AccountAttempt::next(
+                failed(diagnostics, CycleOutcome::Failed),
+                "upload_refused",
+            );
         }
 
         match transport.send_batch(&payload) {
@@ -3228,11 +3775,10 @@ fn collect_account_once(
                     ));
                     state.last_error_category = Some("ack_invalid".to_string());
                     let _ = state_store.save(&state);
-                    return Cycle {
-                        outcome: CycleOutcome::Failed,
-                        normalized_row_count: Some(normalized_row_count),
-                        diagnostics,
-                    };
+                    return AccountAttempt::next(
+                        failed(diagnostics, CycleOutcome::Failed),
+                        "upload_failed",
+                    );
                 }
             }
             Err(UploadError::NotAdmitted(status)) => {
@@ -3240,41 +3786,40 @@ fn collect_account_once(
                 // Not a provider failure, so the circuit breaker is untouched.
                 state.last_error_category = Some("collector_not_admitted".to_string());
                 let _ = state_store.save(&state);
-                let _ = grants.record_health(None, Some("collector_not_admitted"));
+                let _ = grants.record_health_for(expected, None, Some("collector_not_admitted"));
                 diagnostics.push(info(
                     "codex_daily_aggregates_collector_not_admitted",
                     &format!(
                         "The backend has not admitted this collector build yet (HTTP {status}); nothing was stored."
                     ),
                 ));
-                return Cycle {
-                    outcome: CycleOutcome::NotAdmitted,
-                    normalized_row_count: Some(normalized_row_count),
-                    diagnostics,
-                };
+                return AccountAttempt::stop(
+                    failed(diagnostics, CycleOutcome::NotAdmitted),
+                    "upload_refused",
+                    TickStop::Grant,
+                );
             }
             Err(UploadError::AccountExcluded) => {
                 // Backend ownership is authoritative. Persist only this opaque
                 // label locally so the next cycle stops before another
                 // provider read instead of retrying a non-retryable refusal.
-                let _ = grants.set_account_excluded(&account_fingerprint, true);
+                let _ = grants.set_account_excluded_for(expected, &account_fingerprint);
                 state.last_error_category = Some("account_excluded".to_string());
                 let _ = state_store.save(&state);
-                let _ = grants.record_health(None, Some("account_excluded"));
+                let _ = grants.record_health_for(expected, None, Some("account_excluded"));
                 diagnostics.push(info(
                     "codex_daily_aggregates_account_excluded",
-                    "The backend excluded the current Codex account. Future cycles stop before reading until the customer includes it again.",
+                    "The backend excluded this Codex account. Future cycles stop before reading it until the customer includes it again.",
                 ));
-                return Cycle {
-                    outcome: CycleOutcome::AccountExcluded,
-                    normalized_row_count: Some(normalized_row_count),
-                    diagnostics,
-                };
+                return AccountAttempt::next(
+                    failed(diagnostics, CycleOutcome::AccountExcluded),
+                    "excluded",
+                );
             }
             Err(error) => {
                 state.last_error_category = Some(error.category().to_string());
                 let _ = state_store.save(&state);
-                let _ = grants.record_health(None, Some(error.category()));
+                let _ = grants.record_health_for(expected, None, Some(error.category()));
                 diagnostics.push(warning(
                     "codex_daily_aggregates_upload_unavailable",
                     &format!(
@@ -3282,10 +3827,15 @@ fn collect_account_once(
                         error.category()
                     ),
                 ));
-                return Cycle {
-                    outcome: CycleOutcome::Failed,
-                    normalized_row_count: Some(normalized_row_count),
-                    diagnostics,
+                let cycle = failed(diagnostics, CycleOutcome::Failed);
+                return match error {
+                    UploadError::GrantEpochConflict => {
+                        AccountAttempt::stop(cycle, "upload_refused", TickStop::Grant)
+                    }
+                    UploadError::ContractRejected(_) => {
+                        AccountAttempt::next(cycle, "upload_refused")
+                    }
+                    _ => AccountAttempt::next(cycle, "upload_failed"),
                 };
             }
         }
@@ -3311,16 +3861,39 @@ fn collect_account_once(
         &window_end,
     );
     let _ = state_store.save(&state);
-    let _ = grants.record_health(Some(&collected_at), None);
-    Cycle {
-        outcome: CycleOutcome::Uploaded,
-        normalized_row_count: Some(normalized_row_count),
-        diagnostics,
+    let _ = grants.record_health_for(expected, Some(&collected_at), None);
+    AccountAttempt::next(failed(diagnostics, CycleOutcome::Uploaded), "ok")
+}
+
+/// [`record_provider_failure`] as an attempt: a 429 also ends the tick.
+fn provider_failure_attempt(
+    grants: &GrantStore,
+    expected: &BackendGrantBinding,
+    state_store: &StateStore,
+    state: CollectorState,
+    identity: &str,
+    error: ProviderReadError,
+    now: u64,
+) -> AccountAttempt {
+    let rate_limited = error == ProviderReadError::RateLimited;
+    let cycle = record_provider_failure(grants, expected, state_store, state, identity, error, now);
+    let reason = if rate_limited {
+        "rate_limited"
+    } else if cycle.outcome == CycleOutcome::CircuitOpen {
+        "circuit_open"
+    } else {
+        "provider_unavailable"
+    };
+    AccountAttempt {
+        cycle,
+        reason: Some(reason),
+        stop: rate_limited.then_some(TickStop::Grant),
     }
 }
 
 fn record_provider_failure(
     grants: &GrantStore,
+    expected: &BackendGrantBinding,
     state_store: &StateStore,
     state: CollectorState,
     identity: &str,
@@ -3337,7 +3910,7 @@ fn record_provider_failure(
         let mut state = state;
         state.last_error_category = Some(category.to_string());
         let _ = state_store.save(&state);
-        let _ = grants.record_health(None, Some(category));
+        let _ = grants.record_health_for(expected, None, Some(category));
         return Cycle::with(
             CycleOutcome::Failed,
             warning(
@@ -3351,7 +3924,7 @@ fn record_provider_failure(
     let was_open = breaker_is_open(&state, now);
     let state = state_after_failure(state, identity, failure, category, now);
     let _ = state_store.save(&state);
-    let _ = grants.record_health(None, Some(category));
+    let _ = grants.record_health_for(expected, None, Some(category));
     if breaker_is_open(&state, now) && !was_open {
         return Cycle::with(
             CycleOutcome::CircuitOpen,
@@ -3628,14 +4201,9 @@ pub fn collect_composed_once(now: OffsetDateTime) -> Cycle {
     let collector = Collector::default();
     if collector.network_disabled() {
         collector.state.clear();
-        return Cycle::with(
-            CycleOutcome::Disabled,
-            info(
-                "codex_daily_aggregates_network_disabled",
-                "Codex daily aggregates are disabled by the local off-switch; the provider endpoint is never contacted.",
-            ),
-        );
+        return network_disabled_cycle();
     }
+
     // The default/off path is one local grant read. Nothing below - account,
     // device, connection, destination, credential, or keychain - is touched
     // until consent is capable of becoming runtime-ready.
@@ -3643,10 +4211,17 @@ pub fn collect_composed_once(now: OffsetDateTime) -> Cycle {
         return cycle;
     }
 
-    let (runtime, login, api_base_url) = match load_runtime_binding(now) {
+    let (runtime, api_base_url) = match load_runtime_binding() {
         Ok(binding) => binding,
         Err(reason) => return deferred(reason),
     };
+    // Every Codex home is read once here, after consent and the destination
+    // are validated and before any device credential or network use.
+    let Some(grant_key) = collector.grants.hmac_key().ok().flatten() else {
+        return attribution_unavailable_cycle();
+    };
+    let (homes, homes_complete) = crate::agent_status::daily_reference_homes();
+    let discovery = logins::discover(homes, homes_complete, &grant_key, unix_seconds(now));
     let Ok((device, device_secret)) = crate::snapshot_client::load_snapshot_device_credentials()
     else {
         return deferred("device_credentials_unavailable");
@@ -3669,14 +4244,33 @@ pub fn collect_composed_once(now: OffsetDateTime) -> Cycle {
     if device.device_id != runtime.installation_id {
         return deferred("local_binding_changed");
     }
+    // One rebind per tick. A v1 grant covers one account, so it rebinds with
+    // that account's login; v2 omits the account from its scope.
+    let v1_grant = collector
+        .grants
+        .load()
+        .ok()
+        .flatten()
+        .filter(|grant| grant.disclosure_version == DISCLOSURE_VERSION_V1);
+    let rebind_login = match &v1_grant {
+        Some(grant) => discovery.logins.iter().find(|login| {
+            opaque_key(&grant_key, &login.credential.account_scope) == grant.account_fingerprint
+        }),
+        None => discovery.logins.first(),
+    };
     let setup = GrantSetup {
         installation_id: runtime.installation_id.clone(),
         organization_scope: organization.id.clone(),
         effective_user_scope: user.id.clone(),
-        provider_account_scope: runtime.provider_account_scope.clone(),
+        provider_account_scope: rebind_login
+            .map(|login| login.credential.account_scope.clone())
+            .unwrap_or_default(),
     };
     let proposal = match collector.grants.prepare_rebind(&setup, hardware) {
         Ok(proposal) => proposal,
+        Err(_) if v1_grant.is_some() && rebind_login.is_none() => {
+            return deferred("v1_account_not_signed_in")
+        }
         Err(_) => return deferred("account_mismatch"),
     };
     if let Some(proposal) = proposal {
@@ -3722,15 +4316,19 @@ pub fn collect_composed_once(now: OffsetDateTime) -> Cycle {
         }
     }
     let transport = RelayTransport::new(api_base_url, device, device_secret);
-    collector.collect_account(&runtime, &login, &ChatGptDailyUsageReader, &transport, now)
+    collector.run_tick(
+        &runtime,
+        &discovery,
+        &ChatGptDailyUsageReader,
+        &transport,
+        &OffsetDateTime::now_utc,
+    )
 }
 
-type RuntimeBinding = (Runtime, CodexLogin, String);
-
-/// The account, device, connection, destination, and Codex sign-in a cycle
-/// collects with. A gap is a closed reason code so a waiting cycle can say
-/// which piece is missing without naming any of its contents.
-fn load_runtime_binding(now: OffsetDateTime) -> std::result::Result<RuntimeBinding, &'static str> {
+/// The account, device, connection and destination a cycle collects with. A
+/// gap is a closed reason code so a waiting cycle can say which piece is
+/// missing without naming any of its contents. No credential is read here.
+fn load_runtime_binding() -> std::result::Result<(Runtime, String), &'static str> {
     let account = FileAccountStore::default()
         .load()
         .map_err(|_| "account_state_unreadable")?;
@@ -3758,18 +4356,10 @@ fn load_runtime_binding(now: OffsetDateTime) -> std::result::Result<RuntimeBindi
     // can never receive one.
     let api_base_url =
         validated_api_base_url(&connection.api_base_url).map_err(|_| "api_base_url_refused")?;
-    let login = logins::read_login(
-        &crate::agent_status::home_dir().join(".codex"),
-        ottto_core::CodexHomeTrust::ProviderDefault,
-        unix_seconds(now),
-    )
-    .map_err(logins::LoginSkip::code)?;
     Ok((
         Runtime {
             installation_id: device.device_id,
-            provider_account_scope: login.credential.account_scope.clone(),
         },
-        login,
         api_base_url,
     ))
 }
@@ -3891,8 +4481,23 @@ fn cycle_summary_log(cycle: &Cycle) -> String {
         .normalized_row_count
         .map(|count| count.to_string())
         .unwrap_or_else(|| "unknown".to_string());
+    // Ordinals, home kinds and closed reasons only: never an id or a path.
+    let accounts = cycle
+        .accounts
+        .iter()
+        .map(|account| {
+            format!(
+                "{}:{}:{:?}:{}",
+                account.ordinal,
+                account.home_kind,
+                account.outcome,
+                account.reason.unwrap_or("not_due")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
     format!(
-        "codex_daily_aggregates_collector outcome={:?} rows={rows} diagnostics={}",
+        "codex_daily_aggregates_collector outcome={:?} rows={rows} diagnostics={} accounts=[{accounts}]",
         cycle.outcome,
         cycle.diagnostics.len()
     )

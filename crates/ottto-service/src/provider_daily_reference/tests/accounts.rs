@@ -2,20 +2,20 @@
 
 use super::*;
 use crate::provider_daily_reference::logins::{
-    codex_read_identity, read_login, LoginSkip, ReadIdentity, LAPSE_MARGIN_SECONDS,
+    codex_read_identity, read_login, LoginHomeKind, LoginSkip, ReadIdentity, LAPSE_MARGIN_SECONDS,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ottto_core::CodexHomeTrust;
 use serde::Serialize;
 use serde_json::json;
 
-const USER: &str = "user-fixture-private";
+pub(super) const USER: &str = "user-fixture-private";
 /// The grant's own account scope, so v1 consent covers this login too.
-const WORKSPACE: &str = ACCOUNT_SCOPE;
+pub(super) const WORKSPACE: &str = ACCOUNT_SCOPE;
 const ACCESS_SECRET: &str = "access-signature-private";
 
 /// A structurally valid Codex JWT naming `user` and `workspace`.
-fn jwt(user: Option<&str>, workspace: Option<&str>, expires_at: i64) -> String {
+pub(super) fn jwt(user: Option<&str>, workspace: Option<&str>, expires_at: i64) -> String {
     let mut auth = serde_json::Map::new();
     if let Some(user) = user {
         auth.insert("chatgpt_user_id".to_string(), json!(user));
@@ -37,15 +37,15 @@ fn jwt(user: Option<&str>, workspace: Option<&str>, expires_at: i64) -> String {
     )
 }
 
-fn live() -> i64 {
+pub(super) fn live() -> i64 {
     now().unix_timestamp() + 86_400
 }
 
-fn expired() -> i64 {
+pub(super) fn expired() -> i64 {
     now().unix_timestamp() - 86_400
 }
 
-fn expected_identity(user: &str, workspace: &str) -> AccountIdentityHashes {
+pub(super) fn expected_identity(user: &str, workspace: &str) -> AccountIdentityHashes {
     AccountIdentityHashes {
         account_identifier_hash: ottto_core::billing_identity_hash("openai", "account", user)
             .expect("hash"),
@@ -166,7 +166,7 @@ fn read_identity_comes_from_the_access_token_and_the_id_token_only_cross_checks(
 }
 
 /// A Codex home holding `auth` as an owner-only `auth.json`.
-fn home_with(scratch: &Path, name: &str, auth: Option<&Value>, mode: u32) -> PathBuf {
+pub(super) fn home_with(scratch: &Path, name: &str, auth: Option<&Value>, mode: u32) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let home = scratch.join(name);
     fs::create_dir(&home).expect("home");
@@ -179,7 +179,7 @@ fn home_with(scratch: &Path, name: &str, auth: Option<&Value>, mode: u32) -> Pat
     home
 }
 
-fn auth(access: &str, id_token: Option<&str>, account_id: &str) -> Value {
+pub(super) fn auth(access: &str, id_token: Option<&str>, account_id: &str) -> Value {
     let mut tokens = json!({"access_token": access, "account_id": account_id});
     if let Some(id_token) = id_token {
         tokens["id_token"] = json!(id_token);
@@ -241,7 +241,12 @@ fn read_login_skips_absent_unsafe_unusable_and_lapsing_sign_ins() {
     ];
     for (index, (case, auth, mode, expected)) in cases.into_iter().enumerate() {
         let home = home_with(&scratch, &format!("home-{index}"), auth.as_ref(), mode);
-        let read = read_login(&home, CodexHomeTrust::ProviderDefault, now_seconds);
+        let read = read_login(
+            LoginHomeKind::Default,
+            &home,
+            CodexHomeTrust::ProviderDefault,
+            now_seconds,
+        );
         assert_eq!(read.as_ref().err().copied(), expected, "{case}");
         if let Ok(login) = read {
             assert_eq!(login.identity, Some(expected_identity(USER, WORKSPACE)));
@@ -250,7 +255,13 @@ fn read_login_skips_absent_unsafe_unusable_and_lapsing_sign_ins() {
     }
     let missing = scratch.join("no-such-home");
     assert_eq!(
-        read_login(&missing, CodexHomeTrust::ProviderDefault, now_seconds).err(),
+        read_login(
+            LoginHomeKind::Default,
+            &missing,
+            CodexHomeTrust::ProviderDefault,
+            now_seconds
+        )
+        .err(),
         Some(LoginSkip::Absent)
     );
 }
@@ -285,8 +296,13 @@ fn identity_follows_the_selected_header_not_an_unused_alias() {
             Some(&auth),
             0o600,
         );
-        let login = read_login(&home, CodexHomeTrust::ProviderDefault, unix_seconds(now()))
-            .expect("live login");
+        let login = read_login(
+            LoginHomeKind::Default,
+            &home,
+            CodexHomeTrust::ProviderDefault,
+            unix_seconds(now()),
+        )
+        .expect("live login");
         assert_eq!(
             login.credential.account_id.as_deref(),
             Some(header),
@@ -303,9 +319,9 @@ fn identity_follows_the_selected_header_not_an_unused_alias() {
 
 /// Records the credential each request carries.
 #[derive(Default)]
-struct CapturingReader {
-    payload: Value,
-    headers: RefCell<Vec<(String, Option<String>)>>,
+pub(super) struct CapturingReader {
+    pub(super) payload: Value,
+    pub(super) headers: RefCell<Vec<(String, Option<String>)>>,
 }
 
 impl ProviderDailyUsageReader for CapturingReader {
@@ -346,7 +362,7 @@ fn split_payload() -> Value {
     json!({"results": days})
 }
 
-fn set_disclosure(collector: &Collector, disclosure: &str) {
+pub(super) fn set_disclosure(collector: &Collector, disclosure: &str) {
     let mut persisted: Value =
         serde_json::from_slice(&fs::read(collector.grants().path()).expect("read")).expect("json");
     persisted["grant"]["disclosure_version"] = json!(disclosure);
@@ -381,18 +397,20 @@ fn a_default_home_login_with_an_expired_id_token_uploads_identified_batches() {
         let collector = collector(&format!("default-home-{}", case.replace(' ', "-")));
         enabled(&collector);
         set_disclosure(&collector, disclosure);
-        let login = read_login(&home, CodexHomeTrust::ProviderDefault, unix_seconds(now()))
-            .expect("expired id token never skips a live access token");
-        let runtime = Runtime {
-            installation_id: INSTALLATION_ID.to_string(),
-            provider_account_scope: login.credential.account_scope.clone(),
-        };
+        let login = read_login(
+            LoginHomeKind::Default,
+            &home,
+            CodexHomeTrust::ProviderDefault,
+            unix_seconds(now()),
+        )
+        .expect("expired id token never skips a live access token");
+        let runtime = runtime();
         let reader = CapturingReader {
             payload,
             ..CapturingReader::default()
         };
         let transport = RecordingTransport::default();
-        let cycle = collector.collect_account(&runtime, &login, &reader, &transport, now());
+        let cycle = collect_one(&collector, &runtime, &login, &reader, &transport, now());
         assert_eq!(cycle.outcome, CycleOutcome::Uploaded, "{case}");
         assert_eq!(
             *reader.headers.borrow(),
@@ -425,7 +443,7 @@ fn coverage_end_is_the_last_complete_day_at_collected_at() {
         enabled(&collector);
         let transport = RecordingTransport::default();
         let reader = StaticReader::new(json!({"results": [{"date": "2026-07-20"}]}));
-        let cycle = collector.collect_account(&runtime(), &login(), &reader, &transport, clock);
+        let cycle = collect_one(&collector, &runtime(), &login(), &reader, &transport, clock);
         assert_eq!(cycle.outcome, CycleOutcome::Uploaded, "{instant}");
         for batch in transport.batches.borrow().iter() {
             let collected = OffsetDateTime::parse(
@@ -449,7 +467,8 @@ fn a_login_lapsing_before_its_request_is_skipped_without_a_read() {
     enabled(&collector);
     let mut lapsing = login();
     lapsing.lapses_at = unix_seconds(now()) + 60;
-    let cycle = collector.collect_account(
+    let cycle = collect_one(
+        &collector,
         &runtime(),
         &lapsing,
         &ForbiddenReader,
@@ -524,8 +543,13 @@ fn formatted_logins_credentials_and_batches_name_no_identifier() {
         Some(&auth(&access, None, WORKSPACE)),
         0o600,
     );
-    let login =
-        read_login(&home, CodexHomeTrust::ProviderDefault, unix_seconds(now())).expect("login");
+    let login = read_login(
+        LoginHomeKind::Default,
+        &home,
+        CodexHomeTrust::ProviderDefault,
+        unix_seconds(now()),
+    )
+    .expect("login");
     let identity = expected_identity(USER, WORKSPACE);
     let batch = fixture_batches().remove(0);
     let forbidden = [

@@ -4,6 +4,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 
 mod accounts;
+mod all_logins;
 
 const INSTALLATION_ID: &str = "00000000-0000-4000-8000-000000000001";
 const GRANT_ID: &str = "00000000-0000-4000-8000-000000000002";
@@ -42,13 +43,53 @@ fn setup() -> GrantSetup {
 fn runtime() -> Runtime {
     Runtime {
         installation_id: INSTALLATION_ID.to_string(),
-        provider_account_scope: ACCOUNT_SCOPE.to_string(),
     }
+}
+
+/// A complete discovery that selected exactly `logins`, as
+/// [`logins::discover`] reports it.
+fn discovered(collector: &Collector, logins: Vec<CodexLogin>) -> logins::LoginDiscovery {
+    let default_home = logins
+        .iter()
+        .find(|login| login.home_kind == logins::LoginHomeKind::Default)
+        .map(|login| logins::DefaultHomeState {
+            state: "ok".to_string(),
+            fingerprint: collector
+                .grants()
+                .account_fingerprint_for(&login.credential.account_scope)
+                .expect("derive"),
+        })
+        .unwrap_or_default();
+    logins::LoginDiscovery {
+        logins,
+        complete: true,
+        skipped: BTreeMap::new(),
+        default_home,
+    }
+}
+
+/// One tick over exactly `login`, with a fixed clock.
+fn collect_one(
+    collector: &Collector,
+    runtime: &Runtime,
+    login: &CodexLogin,
+    reader: &dyn ProviderDailyUsageReader,
+    transport: &dyn DailyReferenceTransport,
+    now: OffsetDateTime,
+) -> Cycle {
+    collector.run_tick(
+        runtime,
+        &discovered(collector, vec![login.clone()]),
+        reader,
+        transport,
+        &move || now,
+    )
 }
 
 /// A live, unidentified login whose header and scope are `scope`.
 fn login_with_scope(scope: &str) -> CodexLogin {
     CodexLogin {
+        home_kind: logins::LoginHomeKind::Default,
         credential: CodexCredential {
             access_token: "fixture-access-token".to_string(),
             account_id: Some(scope.to_string()),
@@ -1112,7 +1153,8 @@ fn health_never_resurrects_a_revoked_grant() {
 #[test]
 fn absent_consent_is_silent_and_contacts_nothing() {
     let collector = collector("no-consent");
-    let cycle = collector.collect_account(
+    let cycle = collect_one(
+        &collector,
         &runtime(),
         &login(),
         &ForbiddenReader,
@@ -1148,7 +1190,8 @@ fn an_unusable_consent_file_says_why_but_stays_disabled() {
         ),
     ] {
         fs::write(collector.grants().path(), &contents).expect("write");
-        let cycle = collector.collect_account(
+        let cycle = collect_one(
+            &collector,
             &runtime(),
             &login(),
             &ForbiddenReader,
@@ -1184,7 +1227,8 @@ fn revoke_stops_collection_before_the_provider_is_contacted() {
     enabled(&collector);
     collector.grants().revoke(now()).expect("revoke");
 
-    let cycle = collector.collect_account(
+    let cycle = collect_one(
+        &collector,
         &runtime(),
         &login(),
         &ForbiddenReader,
@@ -1205,15 +1249,14 @@ fn the_sentinel_disables_collection_and_retires_local_state() {
     let transport = RecordingTransport::default();
     let reader = StaticReader::new(poisoned_payload());
     assert_eq!(
-        collector
-            .collect_account(&runtime(), &login(), &reader, &transport, now())
-            .outcome,
+        collect_one(&collector, &runtime(), &login(), &reader, &transport, now()).outcome,
         CycleOutcome::Uploaded
     );
     assert!(collector.state_path().is_file());
 
     fs::write(&collector.sentinel, b"disabled\n").expect("write sentinel");
-    let cycle = collector.collect_account(
+    let cycle = collect_one(
+        &collector,
         &runtime(),
         &login(),
         &ForbiddenReader,
@@ -1251,7 +1294,7 @@ fn an_upload_from_a_different_admitted_build_is_accepted_when_disclosure_matches
     // running build under its current admission list.
     let reader = StaticReader::new(poisoned_payload());
     let transport = RecordingTransport::default();
-    let cycle = collector.collect_account(&runtime(), &login(), &reader, &transport, now());
+    let cycle = collect_one(&collector, &runtime(), &login(), &reader, &transport, now());
 
     assert_eq!(cycle.outcome, CycleOutcome::Uploaded);
     assert_eq!(reader.calls.get(), 1);
@@ -1288,7 +1331,8 @@ fn an_admitted_build_with_a_different_disclosure_is_refused() {
     )
     .expect("write");
 
-    let cycle = collector.collect_account(
+    let cycle = collect_one(
+        &collector,
         &runtime(),
         &login(),
         &ForbiddenReader,
@@ -1321,7 +1365,8 @@ fn a_v1_grant_is_not_silently_widened_after_an_account_switch() {
     .expect("write");
     let other_account = login_with_scope("acct-a-completely-different-account");
 
-    let cycle = collector.collect_account(
+    let cycle = collect_one(
+        &collector,
         &runtime(),
         &other_account,
         &ForbiddenReader,
@@ -1346,7 +1391,14 @@ fn v2_uploads_a_different_provider_account_under_its_own_attribution() {
     let other_account = login_with_scope("acct-a-completely-different-account");
     let reader = StaticReader::new(poisoned_payload());
     let transport = RecordingTransport::default();
-    let cycle = collector.collect_account(&runtime(), &other_account, &reader, &transport, now());
+    let cycle = collect_one(
+        &collector,
+        &runtime(),
+        &other_account,
+        &reader,
+        &transport,
+        now(),
+    );
     assert_eq!(cycle.outcome, CycleOutcome::Uploaded);
     let batch = &transport.batches.borrow()[0];
     assert_ne!(batch["account_fingerprint"], grant.account_fingerprint);
@@ -1370,7 +1422,7 @@ fn excluded_account_is_terminal_visible_and_clearing_restores_collection() {
     let reader = StaticReader::new(poisoned_payload());
     let rejected = RejectingTransport::new(UploadError::AccountExcluded);
 
-    let refused = collector.collect_account(&runtime(), &login(), &reader, &rejected, now());
+    let refused = collect_one(&collector, &runtime(), &login(), &reader, &rejected, now());
     assert_eq!(refused.outcome, CycleOutcome::AccountExcluded);
     assert_eq!(rejected.calls.get(), 1);
     assert!(collector
@@ -1381,7 +1433,7 @@ fn excluded_account_is_terminal_visible_and_clearing_restores_collection() {
     let status = status_with_live_binding(
         collector.grants(),
         collector_status(collector.grants(), false),
-        Some(&runtime()),
+        Some(INSTALLATION_ID),
     );
     assert_eq!(status.runtime_state, RuntimeState::AccountExcluded);
     assert_eq!(status.reason_code, "account_excluded");
@@ -1391,7 +1443,8 @@ fn excluded_account_is_terminal_visible_and_clearing_restores_collection() {
         Some(current_fingerprint.as_str())
     );
 
-    let blocked = collector.collect_account(
+    let blocked = collect_one(
+        &collector,
         &runtime(),
         &login(),
         &ForbiddenReader,
@@ -1405,7 +1458,8 @@ fn excluded_account_is_terminal_visible_and_clearing_restores_collection() {
         .set_account_excluded(&current_fingerprint, false)
         .expect("include");
     let transport = RecordingTransport::default();
-    let restored = collector.collect_account(
+    let restored = collect_one(
+        &collector,
         &runtime(),
         &login(),
         &StaticReader::new(poisoned_payload()),
@@ -1448,9 +1502,9 @@ fn a_different_installation_can_never_upload_under_this_consent() {
     enabled(&collector);
     let other_device = Runtime {
         installation_id: "00000000-0000-4000-8000-0000000000ff".to_string(),
-        provider_account_scope: ACCOUNT_SCOPE.to_string(),
     };
-    let cycle = collector.collect_account(
+    let cycle = collect_one(
+        &collector,
         &other_device,
         &login(),
         &ForbiddenReader,
@@ -1468,7 +1522,8 @@ fn a_different_installation_can_never_upload_under_this_consent() {
 fn an_unconfigured_transport_defers_before_the_provider_is_contacted() {
     let collector = collector("deferred-transport");
     enabled(&collector);
-    let cycle = collector.collect_account(
+    let cycle = collect_one(
+        &collector,
         &runtime(),
         &login(),
         &ForbiddenReader,
@@ -1491,13 +1546,12 @@ fn a_second_cycle_inside_the_cadence_window_does_nothing() {
     let reader = StaticReader::new(poisoned_payload());
     let transport = RecordingTransport::default();
     assert_eq!(
-        collector
-            .collect_account(&runtime(), &login(), &reader, &transport, now())
-            .outcome,
+        collect_one(&collector, &runtime(), &login(), &reader, &transport, now()).outcome,
         CycleOutcome::Uploaded
     );
     assert_eq!(reader.calls.get(), 1);
-    let cycle = collector.collect_account(
+    let cycle = collect_one(
+        &collector,
         &runtime(),
         &login(),
         &reader,
@@ -1507,7 +1561,8 @@ fn a_second_cycle_inside_the_cadence_window_does_nothing() {
     assert_eq!(cycle.outcome, CycleOutcome::Noop);
     assert_eq!(reader.calls.get(), 1, "day-grain data is polled sparsely");
 
-    let cycle = collector.collect_account(
+    let cycle = collect_one(
+        &collector,
         &runtime(),
         &login(),
         &reader,
@@ -1580,40 +1635,26 @@ fn one_clean_answer_clears_the_failure_counters() {
     assert_eq!(state.last_coverage_end.as_deref(), Some("2026-07-26"));
 }
 
+/// [regress] A schema-1 file (today's single-account state) loads as an
+/// empty schema-2 file: every account starts at its first read.
 #[test]
-fn old_state_without_observation_fields_loads_with_defaults() {
+fn a_schema_one_state_file_loads_empty() {
     let state = StateStore::new(temp_dir("old-state").join("state.json"));
     let identity = "compatible-state-identity";
     fs::create_dir_all(state.path().parent().expect("state parent")).expect("create parent");
     fs::write(
         state.path(),
-        serde_json::to_vec_pretty(&json!({
-            "schema_version": STATE_FILE_SCHEMA_VERSION,
-            "identity": identity,
-            "last_fetch_epoch_seconds": 42,
-            "last_success_epoch_seconds": 40,
-            "auth_failures": 1,
-            "shape_failures": 0,
-            "rate_limit_failures": 0,
-            "reopen_after_epoch_seconds": 0,
-            "opened_by": "",
-            "last_error_category": "provider_auth_rejected"
-        }))
-        .expect("encode old state"),
+        b"{\n  \"schema_version\": 1,\n  \"identity\": \"compatible-state-identity\",\n  \"last_fetch_epoch_seconds\": 42,\n  \"last_success_epoch_seconds\": 40,\n  \"auth_failures\": 1,\n  \"shape_failures\": 0,\n  \"rate_limit_failures\": 0,\n  \"reopen_after_epoch_seconds\": 0,\n  \"opened_by\": \"\",\n  \"last_error_category\": \"provider_auth_rejected\"\n}",
     )
     .expect("write old state");
-
-    let loaded = state.load(identity);
-    assert_eq!(loaded.last_fetch_epoch_seconds, 42);
-    assert_eq!(loaded.last_success_epoch_seconds, 40);
-    assert_eq!(loaded.auth_failures, 1);
+    assert_eq!(state.load(identity), CollectorState::default());
     assert_eq!(
-        loaded.last_error_category.as_deref(),
-        Some("provider_auth_rejected")
+        state.load_file(),
+        CollectorStateFile {
+            schema_version: STATE_FILE_SCHEMA_VERSION,
+            ..CollectorStateFile::default()
+        }
     );
-    assert_eq!(loaded.last_observed_row_count, None);
-    assert_eq!(loaded.last_coverage_start, None);
-    assert_eq!(loaded.last_coverage_end, None);
 }
 
 #[test]
@@ -1648,7 +1689,7 @@ fn repeated_auth_rejections_open_the_breaker_and_stop_the_provider_call() {
     let transport = RecordingTransport::default();
     let mut clock = now();
     for (consecutive, status) in [(1, 401), (2, 403)] {
-        let cycle = collector.collect_account(&runtime(), &login(), &reader, &transport, clock);
+        let cycle = collect_one(&collector, &runtime(), &login(), &reader, &transport, clock);
         assert_eq!(cycle.outcome, CycleOutcome::Failed);
         // Below the threshold the category is still named.
         assert_eq!(
@@ -1660,7 +1701,7 @@ fn repeated_auth_rejections_open_the_breaker_and_stop_the_provider_call() {
         )));
         clock += TimeDuration::hours(7);
     }
-    let cycle = collector.collect_account(&runtime(), &login(), &reader, &transport, clock);
+    let cycle = collect_one(&collector, &runtime(), &login(), &reader, &transport, clock);
     assert_eq!(cycle.outcome, CycleOutcome::CircuitOpen);
     assert_eq!(
         cycle.diagnostics[0].code,
@@ -1670,13 +1711,20 @@ fn repeated_auth_rejections_open_the_breaker_and_stop_the_provider_call() {
 
     // While open, no request is made at all.
     clock += TimeDuration::hours(7);
-    let cycle =
-        collector.collect_account(&runtime(), &login(), &ForbiddenReader, &transport, clock);
+    let cycle = collect_one(
+        &collector,
+        &runtime(),
+        &login(),
+        &ForbiddenReader,
+        &transport,
+        clock,
+    );
     assert_eq!(cycle.outcome, CycleOutcome::CircuitOpen);
     assert!(transport.batches.borrow().is_empty());
 
     // The cool-down closes it.
-    let cycle = collector.collect_account(
+    let cycle = collect_one(
+        &collector,
         &runtime(),
         &login(),
         &StaticReader::new(poisoned_payload()),
@@ -1699,7 +1747,7 @@ fn a_transient_provider_failure_never_opens_the_breaker() {
     let transport = RecordingTransport::default();
     let mut clock = now();
     for _ in 0..4 {
-        let cycle = collector.collect_account(&runtime(), &login(), &reader, &transport, clock);
+        let cycle = collect_one(&collector, &runtime(), &login(), &reader, &transport, clock);
         assert_eq!(cycle.outcome, CycleOutcome::Failed);
         let message = &cycle.diagnostics[0].message;
         assert!(message.contains("category=provider_unavailable; not counted"));
@@ -1722,7 +1770,7 @@ fn a_not_admitted_answer_is_typed_expected_and_never_trips_the_breaker() {
     let transport = RejectingTransport::new(UploadError::NotAdmitted(403));
     let mut clock = now();
     for _ in 0..5 {
-        let cycle = collector.collect_account(&runtime(), &login(), &reader, &transport, clock);
+        let cycle = collect_one(&collector, &runtime(), &login(), &reader, &transport, clock);
         assert_eq!(cycle.outcome, CycleOutcome::NotAdmitted);
         // Expected until a reviewed backend change admits this build, so it
         // is reported at info severity, not as a fault.
@@ -1749,7 +1797,7 @@ fn a_stale_consent_epoch_stops_the_cycle_rather_than_retrying() {
     enabled(&collector);
     let reader = StaticReader::new(poisoned_payload());
     let transport = RejectingTransport::new(UploadError::GrantEpochConflict);
-    let cycle = collector.collect_account(&runtime(), &login(), &reader, &transport, now());
+    let cycle = collect_one(&collector, &runtime(), &login(), &reader, &transport, now());
     assert_eq!(cycle.outcome, CycleOutcome::Failed);
     assert_eq!(transport.calls.get(), 1, "only re-consent can fix an epoch");
     let grant = collector.grants().load().expect("load").expect("grant");
@@ -1778,9 +1826,7 @@ fn the_uploaded_batch_declares_the_consented_epoch_and_identity() {
     let reader = StaticReader::new(poisoned_payload());
     let transport = RecordingTransport::default();
     assert_eq!(
-        collector
-            .collect_account(&runtime(), &login(), &reader, &transport, now())
-            .outcome,
+        collect_one(&collector, &runtime(), &login(), &reader, &transport, now()).outcome,
         CycleOutcome::Uploaded
     );
     let batches = transport.batches.borrow();

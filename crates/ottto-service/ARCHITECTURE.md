@@ -454,8 +454,16 @@ receive disabled legacy authority and cannot upload through retired routes.
 
 ## Codex daily provider reference
 
-With a live approval, `provider_daily_reference` reads the provider's own daily usage for a
-Codex login and uploads normalized scalar rows. A login is one secure read and one parse of
+With a live approval, `provider_daily_reference` reads the provider's own daily usage for
+every Codex login on the Mac and uploads normalized scalar rows. Each tick reads the default
+home and every accepted slot home once (never a home seen only through a running process),
+keeps one login per opaque account (identified first, then the default home, then the lowest
+slot id) and uses a slot only while its live token proves the pair it was registered with.
+Logins are read most overdue first, each at its own 6 h cadence and breaker; a 429 or a
+grant-wide refusal ends the tick. The attempt time is saved before every request, and a
+request is never made when that save fails. `state.json` (schema 2) keeps one entry per
+account and the latest discovery summary; status reads that summary and never a credential.
+A login is one secure read and one parse of
 its home's `auth.json`; the request token, `ChatGPT-Account-Id` header, attribution
 fingerprint and account identity all come from that parse. Expiry and identity come from the
 live access token; an id token only cross-checks the pair. A token lapsing within five minutes
