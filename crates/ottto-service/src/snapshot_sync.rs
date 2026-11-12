@@ -8951,6 +8951,10 @@ fn finish_sync_source(
     #[cfg(test)]
     tests::permanent_finish_pipeline_tests::ack_post_save_failure("finish_cycle")?;
     upload_progress.finish_cycle(&upload_progress_path)?;
+    crate::local_resource_diagnostics::pass_retained(
+        source.api_slug(),
+        daemon.transcript_cache.retained_heap_bytes(&index),
+    );
 
     if let Some(count) = deferred_entity_count {
         let state = refused_entity_state(

@@ -1514,6 +1514,7 @@ pub(crate) fn source_prepare<T>(
                 probe.started,
                 probe.process,
                 [malloc_in_use_bytes, malloc_allocated_bytes],
+                None,
             ))
         });
     }
@@ -1617,7 +1618,7 @@ fn source_finish_inner<T>(
     window.finish_sample = Some(after);
     window.pass = source_slot(source)
         .and_then(|slot| with_passes(|p| p.lock().unwrap_or_else(|e| e.into_inner())[slot].take()))
-        .map(|(start, before, zone_start)| {
+        .map(|(start, before, zone_start, retained_heap_bytes)| {
             let counters = before
                 .and_then(|p| p.disk)
                 .zip(after.and_then(|p| p.disk))
@@ -1634,13 +1635,29 @@ fn source_finish_inner<T>(
                 malloc_in_use_bytes: zone_end.0,
                 malloc_allocated_bytes: zone_end.1,
                 sample_cost_us: wall_us(started),
+                retained_heap_bytes,
             }
         });
     drop(window);
     result
 }
-type PassStart = (Instant, Option<ProcessSample>, [Option<u64>; 2]);
-process_static!(fn with_passes: std::sync::Mutex<[Option<PassStart>; 3]> = std::sync::Mutex::new([None; 3]));
+type RetainedBytes = BTreeMap<&'static str, Option<u64>>;
+type PassStart = (
+    Instant,
+    Option<ProcessSample>,
+    [Option<u64>; 2],
+    Option<RetainedBytes>,
+);
+pub(crate) fn pass_retained(source: &str, bytes: RetainedBytes) {
+    if let Some(slot) = source_slot(source) {
+        with_passes(|p| {
+            if let Some(pass) = p.lock().unwrap_or_else(|e| e.into_inner())[slot].as_mut() {
+                pass.3 = Some(bytes);
+            }
+        });
+    }
+}
+process_static!(fn with_passes: std::sync::Mutex<[Option<PassStart>; 3]> = std::sync::Mutex::new([const { None }; 3]));
 #[derive(Serialize)]
 struct PassSummary {
     wall_us: u64,
@@ -1656,6 +1673,8 @@ struct PassSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     malloc_allocated_bytes: Option<u64>,
     sample_cost_us: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retained_heap_bytes: Option<RetainedBytes>,
 }
 /// Named stage window, emitted on normal drop; unwinding emits nothing.
 /// `offpass_` stages add CPU split scalars and do not start footprint sampling.
@@ -1964,6 +1983,9 @@ pub(crate) fn usage_gaps(source: &str, bodies: &[crate::snapshots::SnapshotItem]
 impl crate::heap_layout_bound::HeapLayoutBound for StageWindow {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.probe, c)?;
+        if let Some(pass) = &self.pass {
+            crate::heap_layout_bound::HeapLayoutBound::heap_bound(&pass.retained_heap_bytes, c)?;
+        }
         crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.footprint, c)
     }
 }
@@ -3197,6 +3219,27 @@ mod tests {
         assert_eq!(rows[1]["stage"], "source_prepare");
     }
 
+    #[test]
+    fn retained_heap_is_on_each_source_finish_and_unknown_stays_unknown() {
+        for source in ["claude_code", "codex", "pi"] {
+            let (_, records) = capture(|| {
+                source_prepare(source, || (), |_| false);
+                source_finish(source, false, || {
+                    pass_retained(
+                        source,
+                        BTreeMap::from([("files_bytes", Some(123)), ("side_maps_bytes", None)]),
+                    );
+                    Ok(())
+                })
+                .unwrap();
+            });
+            let retained = &records[1]["counts"]["pass"]["retained_heap_bytes"];
+            assert_eq!(retained["files_bytes"], 123);
+            assert!(retained["side_maps_bytes"].is_null());
+            assert_eq!(retained.as_object().unwrap().len(), 2);
+            assert!(records[0]["counts"].get("pass").is_none());
+        }
+    }
     #[test]
     fn footprint_fields_are_stage_only_for_all_native_sources() {
         for source in ["claude_code", "codex", "pi"] {

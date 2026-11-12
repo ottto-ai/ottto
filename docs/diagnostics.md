@@ -403,6 +403,18 @@ The pass contains macOS `malloc_in_use_bytes_start` and
 A finish without a matching prepare omits `pass`. Three fixed source slots
 retain only endpoint samples.
 
+`pass.retained_heap_bytes` records the finishing source's in-memory index just
+before finish consumes it: `files_bytes`, `census_bytes`, `side_maps_bytes`,
+`accounts_identity_bytes`, and `traversal_bytes`. The last three split the
+existing inclusive side-map charge. Its process-wide cache fields are
+`codex_sidecar_facts_bytes`, `codex_header_cache_bytes`, and
+`desktop_title_facts_bytes`. These reuse requested-layout charges, exclude
+inline stack storage, and conservatively charge shared buffers per owner.
+Unknown/unsupported charges or busy cache locks are `null`, never invented
+zeros; finishes without the capture omit the object. Cache values repeat
+across source rows and must not be summed. CLI metadata and active-session
+reconciliation have no existing heap charge; no new estimator is introduced.
+
 `source_prepare` also reports `observation.malloc_in_use_bytes` and
 `observation.malloc_allocated_bytes`, from one allocator-zone statistics call
 at prepare start on macOS; absent when unavailable.
