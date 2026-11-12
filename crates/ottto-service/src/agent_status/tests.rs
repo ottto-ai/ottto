@@ -4151,6 +4151,131 @@ fn codex_local_status_of_failed_probes_decodes_on_shipped_mac_apps() {
     let _ = std::fs::remove_dir_all(default_root);
 }
 
+/// Make the fake app-server answer `account/read` with no account, as
+/// Codex does once a refresh of the home's login failed for good.
+#[cfg(unix)]
+fn null_account_synthetic_codex_app_server(root: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let executable = root.join("codex");
+    let script = std::fs::read_to_string(&executable).expect("fake Codex");
+    let script = script.replace(
+        r#"{"account":{"type":"chatgpt","email":"synthetic-account","planType":"pro"},"requiresOpenaiAuth":true}"#,
+        r#"{"account":null,"requiresOpenaiAuth":true}"#,
+    );
+    assert!(script.contains(r#""account":null"#));
+    std::fs::write(&executable, script).expect("null-account app-server");
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
+        .expect("fake Codex mode");
+}
+
+#[cfg(unix)]
+#[test]
+#[serial]
+fn codex_managed_home_whose_refresh_is_dead_needs_a_new_sign_in() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (root, home) = synthetic_codex_collector_home("dead-refresh", 0o600);
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))
+        .expect("managed home mode");
+    let _commands =
+        EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", root.as_os_str().to_os_string());
+    let collect = |slot_id: &str,
+                   ownership: CodexAccountSlotOwnershipV1,
+                   registered_binding: Option<(String, String)>,
+                   quota_read: CodexQuotaRead| {
+        collect_codex_home_candidate(
+            CodexHomeSlot {
+                slot_id: slot_id.to_string(),
+                ownership,
+                home: home.clone(),
+                registered_binding,
+            },
+            "2026-08-26T00:05:00Z",
+            "2026-08-26T00:20:00Z",
+            quota_read,
+        )
+    };
+    let codes = |candidate: &CodexSlotCandidate| {
+        candidate
+            .status
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code.clone())
+            .collect::<Vec<_>>()
+    };
+
+    // A normal account: accepted, bound, as today.
+    let fresh = collect(
+        "codex_slot_dead_refresh",
+        CodexAccountSlotOwnershipV1::Managed,
+        None,
+        CodexQuotaRead::Provider,
+    );
+    assert_eq!(fresh.status.state, CodexAccountSlotCollectionStateV1::Fresh);
+    let registered = fresh.binding.clone().expect("validated binding");
+
+    // The read succeeds with no account: the slot's login is dead.
+    null_account_synthetic_codex_app_server(&root);
+    let dead = collect(
+        "codex_slot_dead_refresh",
+        CodexAccountSlotOwnershipV1::Managed,
+        Some(registered.clone()),
+        CodexQuotaRead::Provider,
+    );
+    assert_eq!(
+        dead.status.state,
+        CodexAccountSlotCollectionStateV1::NeedsLogin,
+        "codes: {:?}",
+        codes(&dead)
+    );
+    assert!(codes(&dead).contains(&"codex_account_needs_login".to_string()));
+    assert!(!codes(&dead).contains(&"codex_identity_unknown".to_string()));
+    // Nothing binds to it: identity and placement are unchanged.
+    assert!(dead.binding.is_none());
+    assert!(dead.status.account_identifier_hash.is_none());
+    assert!(dead.status.quota_snapshot.is_none());
+    let status = codex_accounts_status_for(&[dead]);
+    mac_admits_codex_accounts_status(&status).expect("a dead login decodes on the Mac");
+    assert_eq!(
+        serde_json::to_value(&status.managed_slots[0].collection).expect("slot JSON")["state"],
+        "needs_login"
+    );
+    // A status read served from the saved reading says the same.
+    let served = collect(
+        "codex_slot_dead_refresh",
+        CodexAccountSlotOwnershipV1::Managed,
+        Some(registered.clone()),
+        CodexQuotaRead::Saved,
+    );
+    assert_eq!(
+        served.status.state,
+        CodexAccountSlotCollectionStateV1::NeedsLogin,
+        "codes: {:?}",
+        codes(&served)
+    );
+
+    // The default home, same answer: unchanged, today's state.
+    let default = collect(
+        "default",
+        CodexAccountSlotOwnershipV1::Default,
+        None,
+        CodexQuotaRead::Provider,
+    );
+    assert_eq!(
+        default.status.state,
+        CodexAccountSlotCollectionStateV1::IdentityUnknown
+    );
+    assert!(codes(&default).contains(&"codex_identity_unknown".to_string()));
+    assert!(default.binding.is_none());
+
+    codex_credit_grants::forget_binding_cadence(&codex_credit_grants::binding_key(
+        &registered.0,
+        &registered.1,
+    ));
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[cfg(unix)]
 #[test]
 #[serial]
