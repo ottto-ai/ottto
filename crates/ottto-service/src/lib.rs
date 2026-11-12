@@ -34,6 +34,7 @@ pub mod detected_uses;
 mod durable_tail_codec;
 #[cfg(unix)]
 mod external_scheduler_attribution;
+mod grant_rebind;
 mod hex;
 mod instruction_inventory;
 pub mod keychain;
@@ -76,6 +77,8 @@ pub mod unix_socket;
 mod upload_policy;
 pub mod upload_receipts;
 pub mod xpc_mach;
+
+pub use grant_rebind::{live_hardware_id, validated_hardware_id};
 
 pub use local_resource_diagnostics::{log_startup_resources, rotate_service_log_at_startup};
 

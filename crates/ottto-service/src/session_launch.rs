@@ -1,6 +1,6 @@
 //! Single-use, account-bound terminal launches. Paths and secrets stay local;
-//! no launcher contains a folder, credential or provider command. The daemon
-//! never runs doctor/auth/login as part of a launch.
+//! launchers contain only a safe folder label, never credentials or provider
+//! commands. The daemon never runs doctor/auth/login as part of a launch.
 mod binding;
 mod preflight;
 mod recent;
@@ -211,32 +211,12 @@ impl Registry {
             ino,
         } = validate_folder(&selected, &binding.user.home, support)?;
         preflight::evaluate(&binding, &cwd)?;
-        let program = crate::command_env::interactive_cli_path(
-            match provider {
-                Provider::ClaudeCode => "claude",
-                Provider::Codex => "codex",
-                Provider::Unknown => return Err(block(Reason::Unknown)),
-            },
-            &binding.user.home,
-        )
-        .ok_or_else(|| block(Reason::CliNotFound))?;
-        let probe_path = crate::command_env::interactive_probe_path(&binding.user.home, &program)
-            .and_then(|path| path.into_string().ok())
-            .ok_or_else(|| block(Reason::CliVersionUnsupported))?;
-        let program = program
-            .canonicalize()
-            .map_err(|_| block(Reason::CliNotFound))?;
-        let program_identity =
-            program_identity(&program).ok_or_else(|| block(Reason::CliNotFound))?;
-        let cli_version = supported_version(
-            &program,
-            &binding,
-            &cwd,
-            Some(std::ffi::OsStr::new(&probe_path)),
-        )?;
-        if self::program_identity(&program).as_ref() != Some(&program_identity) {
-            return Err(block(Reason::CliChanged));
-        }
+        let PreparedCli {
+            program,
+            identity: program_identity,
+            version: cli_version,
+            path_env: probe_path,
+        } = prepare_cli(&binding, &cwd)?;
         let ottto = ottto
             .filter(|path| executable(path))
             .ok_or_else(|| block(Reason::CliNotFound))?;
@@ -270,7 +250,7 @@ impl Registry {
         }
         let dir = launcher_directory(support, true)?;
         let secret = generate_control_token().map_err(|_| block(Reason::LauncherDirUnsafe))?;
-        let (id, launcher) = write_launcher(&dir, support, &ottto, &secret)?;
+        let (id, launcher) = write_launcher(&dir, support, &ottto, &secret, provider, &cwd)?;
         let expires =
             time::OffsetDateTime::now_utc() + time::Duration::seconds(TTL.as_secs() as i64);
         let response = SessionLaunchPrepareResultV1 {
@@ -551,12 +531,63 @@ fn executable(path: &Path) -> bool {
             .is_ok_and(|metadata| metadata.is_file() && metadata.mode() & 0o111 != 0)
 }
 
+struct PreparedCli {
+    program: PathBuf,
+    identity: ProgramIdentity,
+    version: String,
+    path_env: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ProbeError {
+    TimedOut,
+    Unsupported,
+}
+
+fn prepare_cli(binding: &Binding, cwd: &Path) -> Result<PreparedCli, Block> {
+    let name = match binding.provider {
+        Provider::ClaudeCode => "claude",
+        Provider::Codex => "codex",
+        Provider::Unknown => return Err(block(Reason::Unknown)),
+    };
+    for attempt in 0..2 {
+        let selected = crate::command_env::interactive_cli_path(name, &binding.user.home)
+            .ok_or_else(|| block(Reason::CliNotFound))?;
+        let path_env = crate::command_env::interactive_probe_path(&binding.user.home, &selected)
+            .and_then(|path| path.into_string().ok())
+            .ok_or_else(|| block(Reason::CliVersionUnsupported))?;
+        let program = selected
+            .canonicalize()
+            .map_err(|_| block(Reason::CliNotFound))?;
+        let identity = program_identity(&program).ok_or_else(|| block(Reason::CliNotFound))?;
+        let version = supported_version(&program, binding, cwd, Some(path_env.as_ref()));
+        // Updaters may replace either the binary or its install symlink while
+        // leaving the old target intact. Only prepare may re-resolve and retry.
+        let changed = selected.canonicalize().ok().as_ref() != Some(&program)
+            || program_identity(&program).as_ref() != Some(&identity);
+        if attempt == 0 && (changed || version == Err(ProbeError::TimedOut)) {
+            std::thread::sleep(Duration::from_millis(1500));
+            continue;
+        }
+        if changed {
+            return Err(block(Reason::CliChanged));
+        }
+        return Ok(PreparedCli {
+            program,
+            identity,
+            version: version.map_err(|_| block(Reason::CliVersionUnsupported))?,
+            path_env,
+        });
+    }
+    unreachable!("the second probe returns its result")
+}
+
 fn supported_version(
     program: &Path,
     binding: &Binding,
     cwd: &Path,
     path: Option<&std::ffi::OsStr>,
-) -> Result<String, Block> {
+) -> Result<String, ProbeError> {
     let (unset, set) = environment(binding);
     let mut command = Command::new(program);
     command
@@ -578,11 +609,11 @@ fn supported_version(
         command.env("PATH", path);
     }
     let mut child = crate::local_resource_diagnostics::cli_children::spawn(&mut command)
-        .map_err(|_| block(Reason::CliVersionUnsupported))?;
+        .map_err(|_| ProbeError::Unsupported)?;
     let Some(stdout) = child.stdout.take() else {
         let _ = child.kill();
         let _ = child.wait();
-        return Err(block(Reason::CliVersionUnsupported));
+        return Err(ProbeError::Unsupported);
     };
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {
@@ -590,18 +621,23 @@ fn supported_version(
         let result = stdout.take(4097).read_to_end(&mut bytes);
         let _ = sender.send((result.is_ok(), bytes));
     });
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(8);
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
-            _ => {
+            result => {
+                let error = if matches!(result, Ok(None)) {
+                    ProbeError::TimedOut
+                } else {
+                    ProbeError::Unsupported
+                };
                 unsafe {
                     libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
                 }
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(block(Reason::CliVersionUnsupported));
+                return Err(error);
             }
         }
     };
@@ -610,11 +646,14 @@ fn supported_version(
     }
     let (read, bytes) = receiver
         .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-        .map_err(|_| block(Reason::CliVersionUnsupported))?;
+        .map_err(|error| match error {
+            std::sync::mpsc::RecvTimeoutError::Timeout => ProbeError::TimedOut,
+            std::sync::mpsc::RecvTimeoutError::Disconnected => ProbeError::Unsupported,
+        })?;
     if !status.success() || !read || bytes.len() > 4096 {
-        return Err(block(Reason::CliVersionUnsupported));
+        return Err(ProbeError::Unsupported);
     }
-    parse_version(&bytes, binding.provider).ok_or_else(|| block(Reason::CliVersionUnsupported))
+    parse_version(&bytes, binding.provider).ok_or(ProbeError::Unsupported)
 }
 
 fn parse_version(bytes: &[u8], provider: Provider) -> Option<String> {
@@ -761,17 +800,39 @@ fn write_launcher(
     support: &Path,
     ottto: &Path,
     secret: &str,
+    provider: Provider,
+    cwd: &Path,
 ) -> Result<(String, PathBuf), Block> {
     let quoted = ottto
         .to_str()
         .and_then(quote_launch_executable)
         .ok_or_else(|| block(Reason::CliNotFound))?;
+    let (slug, label) = match provider {
+        Provider::ClaudeCode => ("claude", "Claude Code"),
+        Provider::Codex => ("codex", "Codex"),
+        Provider::Unknown => return Err(block(Reason::Unknown)),
+    };
+    // One literal printf argument: no shell expansion or terminal control bytes.
+    let folder = cwd
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| {
+            !name
+                .chars()
+                .any(|c| c.is_control() || c == '\'' || c == '"')
+        });
+    let message = match folder {
+        Some(folder) => format!("Starting {label} in {folder}…"),
+        None => format!("Starting {label}…"),
+    };
     for _ in 0..8 {
         let id = format!(
             "lch_{}",
             generate_control_token().map_err(|_| block(Reason::LauncherDirUnsafe))?
         );
-        let filename = format!("ottto-{id}.command");
+        // The short suffix is only a filename discriminator, never authority.
+        // O_EXCL retries collisions; the launch id and secret stay full length.
+        let filename = format!("{slug}-{}.command", &id[4..12]);
         let name = std::ffi::CString::new(filename.as_str())
             .map_err(|_| block(Reason::LauncherDirUnsafe))?;
         let fd = unsafe {
@@ -790,7 +851,7 @@ fn write_launcher(
         }
         let mut file = unsafe { File::from_raw_fd(fd) };
         let text = format!(
-            "#!/bin/sh\nrm -f -- \"$0\"\nexec {quoted} launch-check --exec {id} {secret}\n"
+            "#!/bin/sh\nprintf '\\033[3J\\033[H\\033[2J'\nprintf '%s\\n' '{message}'\nrm -f -- \"$0\"\nexec {quoted} launch-check --exec {id} {secret}\n"
         );
         if file
             .set_permissions(fs::Permissions::from_mode(0o700))
@@ -820,10 +881,12 @@ pub fn recover_at_startup() {
     };
     for entry in entries.take(256).flatten() {
         let name = entry.file_name();
-        if name
-            .to_str()
-            .is_some_and(|name| name.starts_with("ottto-lch_") && name.ends_with(".command"))
-        {
+        if name.to_str().is_some_and(|name| {
+            name.ends_with(".command")
+                && (name.starts_with("ottto-lch_")
+                    || name.starts_with("claude-")
+                    || name.starts_with("codex-"))
+        }) {
             if let Ok(name) = std::ffi::CString::new(name.as_encoded_bytes()) {
                 unsafe {
                     libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0);
