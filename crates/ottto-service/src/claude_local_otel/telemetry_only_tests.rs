@@ -2,7 +2,7 @@ use super::*;
 
 fn assert_excluded(dir: &Path) {
     assert!(telemetry_stems(dir).unwrap().is_empty());
-    assert!(telemetry_notices::detach(dir).unwrap().roots.is_empty());
+    assert!(telemetry_notices::pending(dir).unwrap().is_empty());
 }
 
 #[test]
@@ -100,15 +100,15 @@ fn reserved_smoke_json_and_protobuf_api_and_trace_never_write_or_notify() {
         capture_claude_llm_request_traces(&dir, json_trace.as_bytes(), "application/json").unwrap(),
         1
     );
-    let notices = telemetry_notices::detach(&dir).unwrap();
-    assert_eq!(notices.roots.len(), 4);
-    assert!(!notices.roots.contains(&reserved));
-    notices.committed();
+    let notices = telemetry_notices::pending(&dir).unwrap();
+    assert_eq!(notices.len(), 4);
+    assert!(!notices.contains(&reserved));
+    telemetry_notices::forget(&dir, &notices).unwrap();
     fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
-fn detached_notice_restores_on_failure_and_keeps_concurrent_append() {
+fn pending_notice_survives_failure_and_keeps_concurrent_append() {
     let dir = std::env::temp_dir().join(format!(
         "otel-notice-{}",
         crate::claude_spawn_gate::internal_session_id()
@@ -119,19 +119,21 @@ fn detached_notice_restores_on_failure_and_keeps_concurrent_append() {
             .unwrap(),
         2
     );
-    let failed_save = telemetry_notices::detach(&dir).unwrap();
-    assert!(failed_save.roots.contains("sess-mixed"));
+    let failed_save = telemetry_notices::pending(&dir).unwrap();
+    assert!(failed_save.contains("sess-mixed"));
     let next = String::from_utf8(parent_and_subagent_body().to_vec())
         .unwrap()
         .replace("sess-mixed", "next-append");
     capture_claude_api_request_logs(&dir, next.as_bytes(), "application/json").unwrap();
-    drop(failed_save);
-    let retry = telemetry_notices::detach(&dir).unwrap();
+    assert!(telemetry_notices::pending(&dir)
+        .unwrap()
+        .is_superset(&failed_save));
+    let retry = telemetry_notices::pending(&dir).unwrap();
     assert_eq!(
-        retry.roots,
+        retry,
         BTreeSet::from(["sess-mixed".into(), "next-append".into()])
     );
-    retry.committed();
-    assert!(telemetry_notices::detach(&dir).unwrap().roots.is_empty());
+    telemetry_notices::forget(&dir, &retry).unwrap();
+    assert!(telemetry_notices::pending(&dir).unwrap().is_empty());
     fs::remove_dir_all(dir).unwrap();
 }

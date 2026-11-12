@@ -2,9 +2,9 @@
 //! every transcript of that session is gone. The side files are read only for
 //! the session's own transcripts, for transcripts that copied its requests,
 //! and for state that still names its root; each of those keeps the pair.
-//! Deletion requires a committed exact accepted telemetry-only body binding
-//! (see [`delivery_proven`]). Every unproved candidate stays held and is
-//! counted from metadata; no held pair's body is read.
+//! Deletion is paused until a pair's delivery is proven (see
+//! [`delivery_proven`]): until then every candidate is held and only counted
+//! from metadata; no held pair's body is read.
 //!
 //! Runs after a successful selected save whose upload completed and fully
 //! settled (a deferred, rejected, shed or partial upload drops the run), only
@@ -13,8 +13,8 @@
 //! retired, plus every stored pair once per complete walk (the backlog), so a
 //! pair held once is rechecked once per complete walk. Nothing is persisted: a
 //! crash between the two unlinks leaves one member, which a later released run
-//! can re-evaluate without weakening the accepted generation comparison.
-
+//! deletes.
+use super::claude_request_census::held_candidates;
 use super::money_freshness::index_current_since_start;
 use super::*;
 use crate::claude_local_otel::telemetry_stem;
@@ -52,12 +52,11 @@ pub(crate) fn retire_claude_telemetry(
     scan_roots: &[PathBuf],
     removed: &BTreeSet<String>,
     named: &[String],
-    proofs: &BTreeMap<String, crate::claude_local_otel::TelemetryGeneration>,
-) -> BTreeSet<String> {
+) {
     #[cfg(test)]
     RUNS.with(|runs| runs.set(runs.get() + 1));
     let Some((roster, backlog)) = index_current_since_start(SnapshotSource::ClaudeCode) else {
-        return BTreeSet::new();
+        return;
     };
     let mut listing_fault = 0;
     let mut stems = removed
@@ -71,8 +70,7 @@ pub(crate) fn retire_claude_telemetry(
             Err(_) => listing_fault = 1,
         }
     }
-    stems.extend(proofs.keys().cloned());
-    let release = delivery_proven(&stems, proofs);
+    let release = delivery_proven(&stems);
     let mut held = Counts::default();
     // Classification only: a listed family member proves a current transcript.
     let listed = listed_keys(&roster, removed)
@@ -96,8 +94,8 @@ pub(crate) fn retire_claude_telemetry(
     if held != Counts::default() {
         crate::local_resource_diagnostics::claude_telemetry_retention(held);
     }
-    let (mut run, retired) = if release.is_empty() {
-        (Counts::default(), BTreeSet::new())
+    let mut run = if release.is_empty() {
+        Counts::default()
     } else {
         retire(
             support_dir,
@@ -107,14 +105,12 @@ pub(crate) fn retire_claude_telemetry(
             named,
             &roster,
             release,
-            proofs,
         )
     };
     run.read_fault += listing_fault;
     if run != Counts::default() {
         crate::local_resource_diagnostics::claude_telemetry_retention(run);
     }
-    retired
 }
 
 #[cfg(test)]
@@ -130,19 +126,32 @@ pub(crate) fn take_runs_for_test() -> u32 {
 }
 
 /// The `no_transcript_delivery_hold` seam: the candidates proven delivered, the
-/// only ones retention may delete. The upload-progress owner supplies a
-/// durable per-candidate ACK of
+/// only ones retention may delete; none today. The change that uploads
+/// telemetry-only sessions supplies the proof: a durable per-candidate ACK of
 /// the exact body, bound to the destination and the pair's member generations;
 /// never page completion, another session's ACK or a global switch.
-fn delivery_proven(
-    stems: &BTreeSet<String>,
-    proofs: &BTreeMap<String, crate::claude_local_otel::TelemetryGeneration>,
-) -> BTreeSet<String> {
-    stems
-        .iter()
-        .filter(|stem| proofs.contains_key(*stem))
-        .cloned()
-        .collect()
+fn delivery_proven(stems: &BTreeSet<String>) -> BTreeSet<String> {
+    let proven = BTreeSet::new();
+    #[cfg(test)]
+    let proven = if PROVEN.with(std::cell::Cell::get) {
+        stems.clone()
+    } else {
+        proven
+    };
+    stems.intersection(&proven).cloned().collect()
+}
+
+#[cfg(test)]
+thread_local! {
+    static PROVEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test seam: on this thread, treat every candidate as delivered (`true`) or
+/// none, as today (`false`), to exercise the pipeline a proof releases into.
+/// Delete when the delivery proof lands.
+#[cfg(test)]
+pub(crate) fn prove_delivery_for_test(proven: bool) {
+    PROVEN.with(|cell| cell.set(proven));
 }
 
 /// One run over `stems`: every stem with a member is retired, held or a fault.
@@ -154,13 +163,11 @@ fn retire(
     named: &[String],
     roster: &g7_debt::Roster,
     stems: BTreeSet<String>,
-    proofs: &BTreeMap<String, crate::claude_local_otel::TelemetryGeneration>,
-) -> (Counts, BTreeSet<String>) {
-    let mut retired = BTreeSet::new();
+) -> Counts {
     let mut run = Counts::default();
     let Some(protected) = protected_stems(index, scan_roots, removed, named, roster) else {
         run.held_roots = stems.len() as u64;
-        return (run, retired);
+        return run;
     };
     // A pair written after the roster's walk began is kept.
     let fence = i64::try_from(roster.started_at_ms / 1000).unwrap_or(i64::MAX);
@@ -168,45 +175,37 @@ fn retire(
     for stem in stems {
         if protected.contains(&stem) {
             run.held_roots += 1;
-            retired.insert(stem); // Transcript custody has taken over; keep its files.
             continue;
         }
         match crate::claude_local_otel::read_telemetry_pair(support_dir, &stem) {
             Err(()) => run.read_fault += 1,
-            Ok(None) => {
-                retired.insert(stem);
-            }
+            Ok(None) => {}
             Ok(Some(pair)) if pair.last_write >= fence => run.held_roots += 1,
             Ok(Some(pair)) => candidates.push((stem, pair)),
         }
     }
     let copied = copied_candidates(index, removed, roster, &candidates);
+    let mut unlinked = false;
     for ((stem, pair), copied) in candidates.iter().zip(copied) {
         if copied {
             run.held_roots += 1;
             run.held_copied += 1;
             continue;
         }
-        match crate::claude_local_otel::unlink_telemetry_pair(
-            support_dir,
-            stem,
-            pair,
-            &proofs[stem],
-        ) {
+        match crate::claude_local_otel::unlink_telemetry_pair(support_dir, stem, pair) {
             Ok(true) => {
                 run.retired_roots += 1;
                 run.retired_bytes += pair.bytes;
-                retired.insert(stem.clone());
+                unlinked = true;
             }
             Ok(false) => run.held_roots += 1,
             Err(_) => run.read_fault += 1,
         }
     }
-    if !retired.is_empty() && crate::claude_local_otel::sync_telemetry_dirs(support_dir).is_err() {
+    if unlinked && crate::claude_local_otel::sync_telemetry_dirs(support_dir).is_err() {
         run.read_fault += 1;
-        retired.clear();
     }
-    (run, retired)
+    run
 }
 /// The ONE protection set, as stems: every root the roster lists, the index
 /// keys, the census, witness families (legacy owners included),
@@ -282,11 +281,17 @@ fn copied_candidates(
     }
     let union = wanted.keys().copied().collect::<Vec<_>>();
     let mut copied = vec![false; candidates.len()];
-    for hash in claude_request_census::positive_holders(census, &union) {
-        for &at in &wanted[&hash] {
-            copied[at] = true;
-        }
-    }
+    claude_request_census::ClaudeRequestCensus::walk_transcript_holders(
+        census.records(),
+        None,
+        |_, _, record| {
+            for hash in held_candidates(record, &union) {
+                for &at in &wanted[&hash] {
+                    copied[at] = true;
+                }
+            }
+        },
+    );
     let unknown = roster
         .listed
         .iter()

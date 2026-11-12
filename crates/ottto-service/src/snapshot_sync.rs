@@ -8288,15 +8288,6 @@ fn finish_sync_source(
             crate::snapshots::claude_request_money::request_owned_family_root,
             &mut inplace_retry,
             |snapshots| {
-                if snapshots
-                    .iter()
-                    .any(|item| item.evidence_basis == Some("otel_only"))
-                {
-                    anyhow::ensure!(
-                        telemetry_only::advertised(&activity_hint).is_some(),
-                        "telemetry-only capability withdrawn"
-                    );
-                }
                 // A first Codex/Claude scan can spend several minutes parsing local
                 // history and retroactive backfill before the first upload. Relay
                 // tokens are intentionally short-lived, so mint them at the network
@@ -8856,21 +8847,13 @@ fn finish_sync_source(
         .zip(telemetry_named.as_deref())
         .filter(|_| upload_completed && upload_fully_settled)
     {
-        let proofs = upload_progress
-            .committed_telemetry_deliveries(&index_path, &upload_progress_path)
-            .unwrap_or_default();
-        let retired = crate::snapshots::claude_telemetry_retention::retire_claude_telemetry(
+        crate::snapshots::claude_telemetry_retention::retire_claude_telemetry(
             support_dir,
             &index,
             roots,
             removed,
             named,
-            &proofs,
         );
-        if !retired.is_empty() {
-            upload_progress.retire_telemetry_candidates(&retired);
-            upload_progress.save(&upload_progress_path)?;
-        }
     }
     #[cfg(test)]
     tests::permanent_finish_pipeline_tests::ack_post_save_failure("selected_save")?;
@@ -10129,7 +10112,8 @@ fn apply_claude_local_evidence_chunk(
                 .into_iter()
                 .filter(|item| synthetic_healthy.contains(&item.source_session_id))
                 .filter_map(|item| {
-                    ledger.build(
+                    let root = item.source_session_id.clone();
+                    match telemetry_only::build(
                         item,
                         &api_report,
                         &trace_report,
@@ -10137,7 +10121,14 @@ fn apply_claude_local_evidence_chunk(
                         *window,
                         accepted_identity_buckets,
                         wire_budget,
-                    )
+                    ) {
+                        Ok(Some(item)) => Some(item),
+                        Ok(None) => {
+                            ledger.settle(&root);
+                            None
+                        }
+                        Err(()) => None,
+                    }
                 }),
         );
     }
@@ -10768,15 +10759,9 @@ where
         let stored_refs = response
             .accepted_entities
             .iter()
-            .map(|entity| (entity, true))
-            .chain(
-                response
-                    .unchanged_entities
-                    .iter()
-                    .map(|entity| (entity, false)),
-            )
-            .filter(|(entity, _)| entity.unchanged_basis.is_none())
-            .map(|(entity, accepted)| (entity.snapshot_fingerprint.as_str(), (entity, accepted)))
+            .chain(&response.unchanged_entities)
+            .filter(|entity| entity.unchanged_basis.is_none())
+            .map(|entity| (entity.snapshot_fingerprint.as_str(), entity))
             .collect::<BTreeMap<_, _>>();
         for entity in response
             .accepted_entities
@@ -10795,16 +10780,6 @@ where
             if settled.contains(item_fingerprint) {
                 let witness = body_witness(item);
                 progress.record_body(item_fingerprint, &witness);
-                if let Some(root) = session_id(item) {
-                    if stored_refs
-                        .get(item_fingerprint)
-                        .is_some_and(|(entity, accepted)| {
-                            *accepted && entity.source_session_id == root
-                        })
-                    {
-                        progress.accept_telemetry(root, item_fingerprint, &witness);
-                    }
-                }
 
                 if let Some(context) = &progress.context_resend.active {
                     progress
@@ -10819,7 +10794,7 @@ where
                     false,
                     stored_refs
                         .get(item_fingerprint)
-                        .map(|(entity, _)| (*entity, witness.as_str())),
+                        .map(|entity| (*entity, witness.as_str())),
                 )?;
             } else if not_stored.contains(item_fingerprint) {
                 progress.hold_unstored_body(item_fingerprint, &body_witness(item));

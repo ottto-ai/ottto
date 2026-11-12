@@ -1,6 +1,5 @@
-//! Append notifications only. No timer, startup census or persisted duplicate catalogue.
+//! Append notifications only; admitted roots detect growth through their pair generations.
 use super::*;
-
 #[derive(Default)]
 struct Notices {
     active: bool,
@@ -10,11 +9,7 @@ fn notices() -> &'static Mutex<BTreeMap<PathBuf, Notices>> {
     static VALUE: OnceLock<Mutex<BTreeMap<PathBuf, Notices>>> = OnceLock::new();
     VALUE.get_or_init(Mutex::default)
 }
-
 pub(crate) fn configure(support: &Path, active: bool) -> Result<()> {
-    let _append = append_lock()
-        .lock()
-        .map_err(|_| anyhow::anyhow!("evidence lock poisoned"))?;
     let mut all = notices()
         .lock()
         .map_err(|_| anyhow::anyhow!("notice lock poisoned"))?;
@@ -25,7 +20,6 @@ pub(crate) fn configure(support: &Path, active: bool) -> Result<()> {
     }
     Ok(())
 }
-
 pub(super) fn appended(support: &Path, root: &str) {
     if let Ok(mut all) = notices().lock() {
         if let Some(state) = all.get_mut(support).filter(|state| state.active) {
@@ -33,38 +27,21 @@ pub(super) fn appended(support: &Path, root: &str) {
         }
     }
 }
-
-pub(crate) struct Batch {
-    support: PathBuf,
-    pub(crate) roots: BTreeSet<String>,
+pub(crate) fn pending(support: &Path) -> Result<BTreeSet<String>> {
+    Ok(notices()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("notice lock poisoned"))?
+        .get(support)
+        .map(|state| state.roots.clone())
+        .unwrap_or_default())
 }
-pub(crate) fn detach(support: &Path) -> Result<Batch> {
-    let _append = append_lock()
+pub(crate) fn forget(support: &Path, saved: &BTreeSet<String>) -> Result<()> {
+    if let Some(state) = notices()
         .lock()
-        .map_err(|_| anyhow::anyhow!("evidence lock poisoned"))?;
-    let mut all = notices()
-        .lock()
-        .map_err(|_| anyhow::anyhow!("notice lock poisoned"))?;
-    let roots = all
+        .map_err(|_| anyhow::anyhow!("notice lock poisoned"))?
         .get_mut(support)
-        .map(|state| std::mem::take(&mut state.roots))
-        .unwrap_or_default();
-    Ok(Batch {
-        support: support.to_owned(),
-        roots,
-    })
-}
-impl Batch {
-    pub(crate) fn committed(mut self) {
-        self.roots.clear();
+    {
+        state.roots.retain(|root| !saved.contains(root));
     }
-}
-impl Drop for Batch {
-    fn drop(&mut self) {
-        if let Ok(mut all) = notices().lock() {
-            if let Some(state) = all.get_mut(&self.support) {
-                state.roots.append(&mut self.roots);
-            }
-        }
-    }
+    Ok(())
 }

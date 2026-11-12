@@ -33058,3 +33058,7 @@ X-API-Key = "otel_redacted"
 
     mod claude_settings;
 }
+
+#[cfg(all(test, unix))]
+#[path = "control_smoke_session_tests.rs"]
+mod smoke_session_tests;

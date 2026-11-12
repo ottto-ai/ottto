@@ -49,20 +49,15 @@ pub(super) struct Ledger {
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct Candidate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    built: Option<Binding>,
-    #[serde(default)]
-    accepted: bool,
+    built: Option<Built>,
     #[serde(skip)]
     reading: Option<TelemetryGeneration>,
 }
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct Binding {
+struct Built {
     fingerprint: String,
     body: String,
-    #[serde(deserialize_with = "otel::telemetry_generation_codec::deserialize")]
     generation: TelemetryGeneration,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    context: Option<String>,
 }
 impl std::fmt::Debug for Ledger {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -72,10 +67,13 @@ impl std::fmt::Debug for Ledger {
     }
 }
 crate::heap_layout_bound::fields!(Ledger; floor, start, candidates);
-crate::heap_layout_bound::fields!(Candidate; built, accepted, reading);
-crate::heap_layout_bound::fields!(Binding; fingerprint, body, generation, context);
+crate::heap_layout_bound::fields!(Candidate; built, reading);
+crate::heap_layout_bound::fields!(Built; fingerprint, body, generation);
 
 impl Ledger {
+    pub(super) fn settle(&mut self, root: &str) {
+        self.candidates.remove(root);
+    }
     pub(super) fn references(&self) -> impl Iterator<Item = &str> {
         self.candidates
             .values()
@@ -121,37 +119,29 @@ impl SnapshotUploadProgress {
                 .max(window.start);
             self.save(progress_path)?;
         }
-        window.start = self
-            .telemetry_only
-            .as_ref()
-            .expect("activated ledger")
-            .start;
         otel::telemetry_notices::configure(support, true)?;
-        let batch = otel::telemetry_notices::detach(support)?;
-        if !batch.roots.is_empty() {
+        let pending = otel::telemetry_notices::pending(support)?;
+        if !pending.is_empty() {
             let ledger = self.telemetry_only.as_mut().expect("activated ledger");
-            for root in &batch.roots {
+            for root in &pending {
                 ledger.candidates.entry(root.clone()).or_default();
             }
             self.save(progress_path)?;
         }
-        batch.committed();
+        otel::telemetry_notices::forget(support, &pending)?;
         // Page facts are captured before any synthetic slot exists. An all-copy
         // page still has a transcript, even when later normalization emits none.
         let page_roots = claude_evidence_session_ids(&scan.snapshots)
             .into_iter()
             .collect::<BTreeSet<_>>();
-        let candidates = self
-            .telemetry_only
-            .as_ref()
-            .expect("activated ledger")
-            .candidates
-            .keys()
-            .cloned()
-            .collect();
+        let accepted = &self.accepted_body_witnesses;
+        let contexts = &self.accepted_body_contexts;
+        let resend = &self.context_resend;
+        let ledger = self.telemetry_only.as_mut().expect("activated ledger");
+        window.start = ledger.start;
+        let candidates = ledger.candidates.keys().cloned().collect();
         let (absent, backed) =
             crate::snapshots::claude_request_money::e2::telemetry_scope(index, &candidates);
-        let ledger = self.telemetry_only.as_mut().expect("activated ledger");
         ledger
             .candidates
             .retain(|root, _| !page_roots.contains(root) && !backed.contains(root));
@@ -162,15 +152,15 @@ impl SnapshotUploadProgress {
             let Ok(generation) = otel::telemetry_generation(support, root) else {
                 continue;
             };
-            if generation.iter().any(Option::is_none)
+            if (generation.api.is_none() || generation.trace.is_none())
                 || candidate.built.as_ref().is_some_and(|built| {
                     !otel::telemetry_not_truncated(&generation, &built.generation)
                 })
-                || (candidate.accepted
-                    && candidate.built.as_ref().is_some_and(|built| {
-                        built.generation == generation
-                            && built.context == self.context_resend.active
-                    }))
+                || candidate.built.as_ref().is_some_and(|built| {
+                    built.generation == generation
+                        && accepted.get(&built.fingerprint) == Some(&built.body)
+                        && !resend.requires_resend(&built.fingerprint, contexts)
+                })
             {
                 continue;
             }
@@ -186,7 +176,6 @@ impl SnapshotUploadProgress {
     /// Called after ordinary policy/finalization, before upload. The generations
     /// captured before strict decode must still match; no ACK-time stat mints proof.
     pub(super) fn bind_telemetry_bodies(&mut self, support: &Path, items: &mut Vec<SnapshotItem>) {
-        let context = self.context_resend.active.clone();
         let Some(ledger) = self.telemetry_only.as_mut() else {
             return;
         };
@@ -207,55 +196,13 @@ impl SnapshotUploadProgress {
             {
                 return false;
             }
-            candidate.accepted = false;
-            candidate.built = Some(Binding {
+            candidate.built = Some(Built {
                 fingerprint: item.snapshot_fingerprint.clone(),
                 body: snapshot_upload_body_witness(item),
                 generation,
-                context: context.clone(),
             });
             true
         });
-    }
-
-    pub(super) fn accept_telemetry(&mut self, root: &str, fingerprint: &str, body: &str) {
-        let Some(candidate) = self
-            .telemetry_only
-            .as_mut()
-            .and_then(|l| l.candidates.get_mut(root))
-        else {
-            return;
-        };
-        candidate.accepted = candidate
-            .built
-            .as_ref()
-            .is_some_and(|built| built.fingerprint == fingerprint && built.body == body);
-    }
-
-    pub(super) fn committed_telemetry_deliveries(
-        &self,
-        index_path: &Path,
-        path: &Path,
-    ) -> Result<BTreeMap<String, TelemetryGeneration>> {
-        if self.telemetry_only.is_none() {
-            return Ok(BTreeMap::new());
-        }
-        let committed: Self = if self.rows.is_some() {
-            let owner = SnapshotProgressLock::acquire(path)?.for_v2(path);
-            let committed = self.durable_rows(index_path, &owner)?;
-            anyhow::ensure!(
-                committed.generation > 0,
-                "telemetry delivery requires committed progress"
-            );
-            committed
-        } else {
-            serde_json::from_slice(&std::fs::read(path)?)?
-        };
-        anyhow::ensure!(
-            committed.destination_namespace_hash == self.destination_namespace_hash,
-            "telemetry delivery destination changed"
-        );
-        Ok(committed.telemetry_deliveries())
     }
 
     pub(super) fn settle_telemetry_root(&mut self, root: &str) {
@@ -263,61 +210,10 @@ impl SnapshotUploadProgress {
             ledger.candidates.remove(root);
         }
     }
-
-    pub(super) fn retire_telemetry_candidates(&mut self, retired: &BTreeSet<String>) {
-        if let Some(ledger) = self.telemetry_only.as_mut() {
-            ledger
-                .candidates
-                .retain(|root, _| !retired.contains(&otel::telemetry_stem(root)));
-        }
-    }
-
-    /// Call on a freshly loaded committed ledger. Uncommitted RAM ACKs are
-    /// never authority, even if a later graph save succeeds.
-    pub(super) fn telemetry_deliveries(&self) -> BTreeMap<String, TelemetryGeneration> {
-        self.telemetry_only
-            .iter()
-            .flat_map(|l| &l.candidates)
-            .filter_map(|(root, candidate)| {
-                let accepted = candidate.built.as_ref().filter(|_| candidate.accepted)?;
-                (self.accepted_body_witnesses.get(&accepted.fingerprint) == Some(&accepted.body)
-                    && self.accepted_body_contexts.get(&accepted.fingerprint)
-                        == accepted.context.as_ref())
-                .then(|| (otel::telemetry_stem(root), accepted.generation.clone()))
-            })
-            .collect()
-    }
-}
-
-impl Ledger {
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "shared evidence stage and scheduling owner"
-    )]
-    pub(super) fn build(
-        &mut self,
-        item: SnapshotItem,
-        api: &otel::ClaudeLocalOtelLoadReport,
-        trace: &otel::ClaudeTraceOwnershipLoadReport,
-        index: &ScanIndex,
-        window: Window,
-        accepted: Option<&crate::snapshots::claude_request_identity::AcceptedBuckets>,
-        budget: crate::snapshots::claude_request_identity::WireBudget<'_>,
-    ) -> Option<SnapshotItem> {
-        let root = item.source_session_id.clone();
-        match build(item, api, trace, index, window, accepted, budget) {
-            Ok(Some(item)) => Some(item),
-            Ok(None) => {
-                self.candidates.remove(&root);
-                None
-            }
-            Err(()) => None, // Incomplete proof and identity bounds stay owed.
-        }
-    }
 }
 
 /// Called inside the ordinary evidence chunk with its already-strict loaded rows.
-fn build(
+pub(super) fn build(
     mut item: SnapshotItem,
     api: &otel::ClaudeLocalOtelLoadReport,
     trace: &otel::ClaudeTraceOwnershipLoadReport,
@@ -364,17 +260,14 @@ fn build(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-    let held = e2::telemetry_request_holders(index, &wanted);
+    let held = claude_request_census::positive_holders(index, &wanted);
     let mut entity = e2::ClaudeEntityBody::default();
     let mut first = i128::MAX;
     let mut last = i128::MIN;
     for row in unique.values() {
         let at = clock(&row.observed_at).ok_or(())?;
         // Never turn an old root's post-activation suffix into a fresh session.
-        if at <= window.start
-            || at <= window.floor + SLACK
-            || window.ceiling.is_some_and(|end| at >= end - SLACK)
-        {
+        if at <= window.start || window.ceiling.is_some_and(|end| at >= end - SLACK) {
             return Ok(None); // Permanently before this pairing's admission window.
         }
         if held.contains(&claude_request_census::claude_request_hash(&row.request_id)) {

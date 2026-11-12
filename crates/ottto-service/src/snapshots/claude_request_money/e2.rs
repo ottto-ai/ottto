@@ -4225,19 +4225,6 @@ pub(crate) fn telemetry_scope(
         })
         .cloned()
         .collect::<BTreeSet<_>>();
-    let mut absent = roots
-        .iter()
-        .filter(|root| {
-            !index.decode_holds_family(root)
-                && !queued.contains(*root)
-                && index
-                    .claude_money_birth_store
-                    .observations(root)
-                    .next()
-                    .is_none()
-        })
-        .cloned()
-        .collect::<BTreeSet<_>>();
     let observed = index
         .traversal
         .iter()
@@ -4249,17 +4236,17 @@ pub(crate) fn telemetry_scope(
         .chain(observed)
     {
         if let Some(member) = claude_index_path_member_ref(Path::new(key)) {
-            absent.remove(member.root);
             if roots.contains(member.root) {
                 backed.insert(member.root.to_owned());
             }
         }
     }
+    let absent = roots
+        .difference(&backed)
+        .filter(|root| !index.decode_holds_family(root) && !queued.contains(*root))
+        .cloned()
+        .collect();
     (absent, backed)
-}
-
-pub(crate) fn telemetry_request_holders(index: &ScanIndex, wanted: &[u64]) -> BTreeSet<u64> {
-    crate::snapshots::claude_request_census::positive_holders(&index.claude_request_census, wanted)
 }
 
 pub(crate) fn emit_entity(item: &mut SnapshotItem, entity: &ClaudeEntityBody) -> bool {

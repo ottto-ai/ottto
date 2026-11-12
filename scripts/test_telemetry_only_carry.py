@@ -71,7 +71,12 @@ def main():
         marker.unlink(missing_ok=True)
         result = subprocess.run(["cargo", "test", "--locked", "-p", "ottto-service", "--lib", "-j", "2",
             "telemetry_only_previous_release_probe::hydrate_save_drop", "--", "--nocapture", "--test-threads=1"],
-            cwd=tree, env=env, timeout=1200)
+            cwd=tree, env=env, timeout=1200, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        log = Path(index).with_suffix(f".{tag}.log")
+        log.write_text(result.stdout)
+        if result.returncode:
+            print(f"old source failed: {log}", flush=True)
+            for line in result.stdout.splitlines()[-60:]: print("old-source: " + line, flush=True)
         result.check_returncode()
         assert marker.read_bytes() == b"TELEMETRY_ONLY_OLD_SAVE_VERIFIED"
         print(f"{tag} {pin}: TELEMETRY_ONLY_OLD_SAVE_VERIFIED", flush=True)

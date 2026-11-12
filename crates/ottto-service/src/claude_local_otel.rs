@@ -814,45 +814,28 @@ impl std::fmt::Debug for ApiFileGeneration {
         f.write_str("ApiFileGeneration")
     }
 }
-pub(crate) type TelemetryGeneration = [Option<ApiFileGeneration>; 2];
-
-pub(crate) mod telemetry_generation_codec {
-    use super::*;
-    pub(crate) fn deserialize<'de, D: serde::Deserializer<'de>>(
-        decoder: D,
-    ) -> Result<TelemetryGeneration, D::Error> {
-        struct Pair;
-        impl<'de> serde::de::Visitor<'de> for Pair {
-            type Value = TelemetryGeneration;
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("API then trace generations, with an append-only tail")
-            }
-            fn visit_seq<A: serde::de::SeqAccess<'de>>(
-                self,
-                mut seq: A,
-            ) -> Result<Self::Value, A::Error> {
-                let pair = [
-                    seq.next_element()?.unwrap_or(None),
-                    seq.next_element()?.unwrap_or(None),
-                ];
-                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
-                Ok(pair)
-            }
-        }
-        decoder.deserialize_seq(Pair)
-    }
+/// Append-only named members: API first, trace second; missing is unknown.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct TelemetryGeneration {
+    pub(crate) api: Option<ApiFileGeneration>,
+    pub(crate) trace: Option<ApiFileGeneration>,
 }
+crate::heap_layout_bound::fields!(TelemetryGeneration; api, trace);
 
 /// A shorter sidecar cannot replace a cumulative body already offered.
 pub(crate) fn telemetry_not_truncated(
     current: &TelemetryGeneration,
     prior: &TelemetryGeneration,
 ) -> bool {
-    current.iter().zip(prior).all(|(now, old)| {
-        now.as_ref()
-            .zip(old.as_ref())
-            .is_some_and(|(now, old)| now.bytes >= old.bytes)
-    })
+    [&current.api, &current.trace]
+        .into_iter()
+        .zip([&prior.api, &prior.trace])
+        .all(|(now, old)| {
+            now.as_ref()
+                .zip(old.as_ref())
+                .is_some_and(|(now, old)| now.bytes >= old.bytes)
+        })
 }
 
 pub(crate) fn telemetry_generation(
@@ -860,7 +843,10 @@ pub(crate) fn telemetry_generation(
     root: &str,
 ) -> std::result::Result<TelemetryGeneration, ()> {
     let paths = telemetry_member_paths(support_dir, &telemetry_stem(root));
-    Ok([telemetry_member(&paths[0])?, telemetry_member(&paths[1])?])
+    Ok(TelemetryGeneration {
+        api: telemetry_member(&paths[0])?,
+        trace: telemetry_member(&paths[1])?,
+    })
 }
 
 fn api_file_generation(metadata: &fs::Metadata) -> Option<ApiFileGeneration> {
@@ -1638,30 +1624,20 @@ pub(crate) fn unlink_telemetry_pair(
     support_dir: &Path,
     stem: &str,
     pair: &TelemetryPair,
-    accepted: &TelemetryGeneration,
 ) -> std::io::Result<bool> {
     let _guard = append_lock()
         .lock()
         .map_err(|_| std::io::Error::other("Claude local OTEL store lock poisoned"))?;
     let paths = telemetry_member_paths(support_dir, stem);
-    let current = [telemetry_member(&paths[0]), telemetry_member(&paths[1])];
-    for ((current, read), proof) in current.iter().zip(&pair.generations).zip(accepted) {
-        let current = current
-            .as_ref()
-            .map_err(|_| std::io::Error::other("member unreadable"))?;
-        // A prior attempt may already have removed either member. Every
-        // survivor must still be the ORIGINAL committed generation.
-        if current.as_ref().is_some_and(|generation| {
-            Some(generation) != proof.as_ref() || Some(generation) != read.as_ref()
-        }) {
+    for (path, generation) in paths.iter().zip(&pair.generations) {
+        if telemetry_member(path).map_err(|_| std::io::Error::other("member unreadable"))?
+            != *generation
+        {
             return Ok(false);
         }
     }
-    for (path, generation) in paths.iter().zip(current) {
-        if generation
-            .map_err(|_| std::io::Error::other("member unreadable"))?
-            .is_some()
-        {
+    for (path, generation) in paths.iter().zip(&pair.generations) {
+        if generation.is_some() {
             #[cfg(test)]
             if FAIL_TELEMETRY_UNLINK.with(|n| n.replace(n.get().saturating_sub(1)) == 1) {
                 return Err(std::io::Error::other("injected unlink failure"));
@@ -1674,10 +1650,6 @@ pub(crate) fn unlink_telemetry_pair(
 
 /// Make a run's unlinks durable: one sync per telemetry directory.
 pub(crate) fn sync_telemetry_dirs(support_dir: &Path) -> std::io::Result<()> {
-    #[cfg(test)]
-    if FAIL_TELEMETRY_SYNC.with(|value| value.replace(false)) {
-        return Err(std::io::Error::other("injected directory sync failure"));
-    }
     for dir in [STORE_DIR, TRACE_STORE_DIR] {
         match crate::context_composition::sync_dir(&support_dir.join(dir)) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1689,17 +1661,11 @@ pub(crate) fn sync_telemetry_dirs(support_dir: &Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 thread_local! {
-    static FAIL_TELEMETRY_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_TELEMETRY_UNLINK: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// Test seam: the `n`th member unlink from now on this thread fails, as a
 /// crash between the two unlinks of a pair would leave it.
-#[cfg(test)]
-pub(crate) fn fail_telemetry_sync_for_test() {
-    FAIL_TELEMETRY_SYNC.with(|value| value.set(true));
-}
-
 #[cfg(test)]
 pub(crate) fn fail_telemetry_unlink_for_test(n: u32) {
     FAIL_TELEMETRY_UNLINK.with(|slot| slot.set(n));

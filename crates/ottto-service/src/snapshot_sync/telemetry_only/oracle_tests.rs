@@ -26,7 +26,7 @@ fn progress() -> SnapshotUploadProgress {
     value.telemetry_only = Some(
         serde_json::from_value(json!({
             "floor":nanos("2026-08-02T06:00:00Z"), "start":nanos("2026-08-02T06:30:00Z"),
-            "candidates":{ROOT:{"accepted":false}}
+            "candidates":{ROOT:{}}
         }))
         .unwrap(),
     );
@@ -83,8 +83,18 @@ fn page(
     hint: &crate::snapshot_client::ActivityHintResponse,
     budget: WireBudget<'_>,
 ) -> Page {
+    page_from(c, progress, hint, budget, ScanIndex::default(), 100)
+}
+fn page_from(
+    c: &Corpus,
+    progress: &mut SnapshotUploadProgress,
+    hint: &crate::snapshot_client::ActivityHintResponse,
+    budget: WireBudget<'_>,
+    index: ScanIndex,
+    limit: usize,
+) -> Page {
     let scanner = E2ScanFixture::capturing_identity();
-    let mut page = c.raw(&scanner, ScanIndex::default(), 100, false, &[]);
+    let mut page = c.raw(&scanner, index, limit, false, &[]);
     let window = progress
         .seed_telemetry(
             &c.support,
@@ -135,8 +145,23 @@ fn send(page: &Page, progress: &mut SnapshotUploadProgress, mode: Mode) -> Route
             },
         );
     }
-    route.accepted_identity_buckets =
-        Some(serde_json::to_value(&progress.accepted_identity_buckets).unwrap());
+    route.accepted_identity_buckets = Some(
+        serde_json::to_value(
+            page.scan
+                .snapshots
+                .iter()
+                .map(|item| {
+                    (
+                        &item.source_session_id,
+                        progress
+                            .accepted_identity_buckets
+                            .get(&item.source_session_id),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>(),
+        )
+        .unwrap(),
+    );
     route
 }
 fn held_route(prior: &RouteResult, progress: &SnapshotUploadProgress) -> RouteResult {
@@ -181,11 +206,6 @@ fn telemetry_only_cold_ram_restore_and_restart_preserve_switch_gap_and_side_call
         }
         let restored: SnapshotUploadProgress =
             serde_json::from_slice(&serde_json::to_vec(&base).unwrap()).unwrap();
-        assert_eq!(
-            restored.telemetry_deliveries().len(),
-            1,
-            "native accepted-only ACK binds the body"
-        );
         let mut restored = restored;
         restored
             .accepted_identity_buckets
@@ -331,9 +351,8 @@ fn telemetry_only_off_pre_t_and_transcript_takeover() {
     });
 }
 
-/// [format] Both pinned prior sources hydrate the real routed store, save it
-/// without the unknown member, drop it, and head rolls forward with ACK/cache/
-/// identity custody intact. No old binary or provider process runs on a Mac.
+/// [format] Exit the writing process before the old source opens the store;
+/// the runtime registry deliberately retains the exclusive SQLite owner.
 #[test]
 fn telemetry_only_previous_release_source_round_trip() {
     if std::env::var("GITHUB_ACTIONS").as_deref() != Ok("true")
@@ -341,9 +360,55 @@ fn telemetry_only_previous_release_source_round_trip() {
     {
         return;
     }
+    let dir = test_dir("otel-only-carry-orchestration");
+    let child = |stage: &str, root: &Path| {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                concat!(module_path!(), "::telemetry_only_carry_child"),
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("OTTTO_OTEL_CARRY_STAGE", stage)
+            .env("OTTTO_OTEL_CARRY_ROOT", root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "carry {stage}: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    for tag in ["v0.1.239", "v0.1.244"] {
+        let root = dir.join(tag);
+        std::fs::create_dir_all(&root).unwrap();
+        child("write", &root);
+        let index_path = std::fs::read_to_string(root.join("index-path.txt")).unwrap();
+        let result = std::process::Command::new("python3")
+            .arg(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../scripts/test_telemetry_only_carry.py"),
+            )
+            .arg(tag)
+            .arg(index_path.trim())
+            .status()
+            .unwrap();
+        assert!(result.success(), "pinned source round trip {tag}");
+        child("verify", &root);
+        println!("TELEMETRY_ONLY_ROLL_FORWARD_VERIFIED {tag}");
+    }
+}
+
+#[test]
+fn telemetry_only_carry_child() {
+    let Ok(stage) = std::env::var("OTTTO_OTEL_CARRY_STAGE") else {
+        return;
+    };
+    let root = PathBuf::from(std::env::var_os("OTTTO_OTEL_CARRY_ROOT").unwrap());
     with_e2(|| {
-        for tag in ["v0.1.239", "v0.1.244"] {
-            let c = Corpus::new(&format!("otel-only-old-{tag}"));
+        if stage == "write" {
+            let c = Corpus::new("otel-only-carry-child");
             positive(&c);
             let scanner = E2ScanFixture::capturing_identity();
             let index = scanner.routed(ScanIndex::default(), &c.base);
@@ -362,55 +427,55 @@ fn telemetry_only_previous_release_source_round_trip() {
                 .bind_test_key(Some([0x42; 32]));
             state.telemetry_only = progress().telemetry_only;
             let built = page(&c, &mut state, &hint(), WireBudget::default());
-            let _ = send(&built, &mut state, Mode::ColdFull);
+            send(&built, &mut state, Mode::ColdFull);
             let key = cache_session_key(ROOT);
             state
                 .accepted_cache_states
                 .insert(key.clone(), json!({"observations":[]}));
             state.accepted_cache_heads.insert(key, "a".repeat(64));
             state.save(&path).unwrap();
-            let before = (
+            let expected = (
                 state.accepted_body_witnesses.clone(),
                 state.accepted_cache_states.clone(),
                 state.accepted_cache_heads.clone(),
                 serde_json::to_value(&state.accepted_identity_buckets).unwrap(),
             );
-            drop(state);
-            let script = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../scripts/test_telemetry_only_carry.py");
-            let result = std::process::Command::new("python3")
-                .arg(script)
-                .arg(tag)
-                .arg(&index_path)
-                .status()
-                .unwrap();
-            assert!(result.success(), "pinned source round trip {tag}");
+            std::fs::write(
+                root.join("expected.json"),
+                serde_json::to_vec(&expected).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(root.join("index-path.txt"), index_path.to_str().unwrap()).unwrap();
+            std::mem::forget(c); // Keep this synthetic store for the next process.
+        } else {
+            assert_eq!(stage, "verify");
+            let index_path =
+                PathBuf::from(std::fs::read_to_string(root.join("index-path.txt")).unwrap());
             let index = ScanIndex::load(&index_path).unwrap();
-            let mut restored = SnapshotUploadProgress::load_for_index(
+            let mut state = SnapshotUploadProgress::load_for_index(
                 &index,
                 &index_path,
-                &path,
+                &snapshot_upload_progress_path(&index_path),
                 &format!("{:064x}", 99),
                 snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
             )
             .unwrap();
-            restored
+            state
                 .accepted_identity_buckets
                 .bind_test_key(Some([0x42; 32]));
-            restored.load_identity([ROOT]).unwrap();
-            assert!(
-                restored.telemetry_only.is_none(),
-                "old save drops T/candidate proof conservatively"
-            );
-            assert_eq!(
-                before,
-                (
-                    restored.accepted_body_witnesses.clone(),
-                    restored.accepted_cache_states.clone(),
-                    restored.accepted_cache_heads.clone(),
-                    serde_json::to_value(&restored.accepted_identity_buckets).unwrap()
-                )
-            );
+            state.load_identity([ROOT]).unwrap();
+            assert!(state.telemetry_only.is_none());
+            let actual = serde_json::to_value((
+                state.accepted_body_witnesses.clone(),
+                state.accepted_cache_states.clone(),
+                state.accepted_cache_heads.clone(),
+                serde_json::to_value(&state.accepted_identity_buckets).unwrap(),
+            ))
+            .unwrap();
+            let expected: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(root.join("expected.json")).unwrap())
+                    .unwrap();
+            assert_eq!(actual, expected, "all known custody survives old save/drop");
         }
     });
 }
@@ -521,4 +586,8 @@ fn telemetry_only_composes_with_cross_folder_and_subagent_holders() {
             money_oracle::assert_equivalent(&cold, &send(&other, &mut restored, Mode::DiskRestore));
         }
     });
+}
+
+mod cases {
+    include!("oracle_cases.rs");
 }

@@ -91,7 +91,6 @@ fn retire_with(c: &Corpus, index: &ScanIndex, removed: &BTreeSet<String>, named:
         std::slice::from_ref(&c.root),
         removed,
         named,
-        &delivery_generations(c),
     );
 }
 
@@ -101,38 +100,7 @@ fn retire(c: &Corpus, index: &ScanIndex) {
 
 /// Treat every candidate as delivered (or none, as today) on this thread.
 fn proven(proven: bool) {
-    PROVEN.with(|value| value.set(proven));
-    COMMITTED.with(|value| value.borrow_mut().clear());
-}
-
-thread_local! {
-    static PROVEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static COMMITTED: std::cell::RefCell<BTreeMap<PathBuf, BTreeMap<String, crate::claude_local_otel::TelemetryGeneration>>> = const { std::cell::RefCell::new(BTreeMap::new()) };
-}
-fn delivery_generations(
-    c: &Corpus,
-) -> BTreeMap<String, crate::claude_local_otel::TelemetryGeneration> {
-    if !PROVEN.with(std::cell::Cell::get) {
-        return BTreeMap::new();
-    }
-    COMMITTED.with(|saved| {
-        saved
-            .borrow_mut()
-            .entry(c.support.clone())
-            .or_insert_with(|| {
-                [ROOT, COPY, GONE, COPIED, HALF, NAMED, HELD, UNREAD]
-                    .into_iter()
-                    .filter_map(|root| {
-                        crate::claude_local_otel::telemetry_generation(&c.support, root)
-                            .ok()
-                            .map(|generation| {
-                                (crate::claude_local_otel::telemetry_stem(root), generation)
-                            })
-                    })
-                    .collect()
-            })
-            .clone()
-    })
+    crate::snapshots::claude_telemetry_retention::prove_delivery_for_test(proven);
 }
 
 /// One retention run's page counters (reads and retention counts), alone.
@@ -565,15 +533,13 @@ fn telemetry_retention_fails_closed() {
         let read = crate::claude_local_otel::read_telemetry_pair(&c.support, &stem)
             .unwrap()
             .unwrap();
-        let accepted = crate::claude_local_otel::telemetry_generation(&c.support, HALF).unwrap();
         append(
             &member(&c, "claude-code-effort", HALF),
             &(serde_json::to_string(&api_for(HALF, "g5", 17, 1700)).unwrap() + "\n"),
         );
-        assert!(!crate::claude_local_otel::unlink_telemetry_pair(
-            &c.support, &stem, &read, &accepted
-        )
-        .unwrap());
+        assert!(
+            !crate::claude_local_otel::unlink_telemetry_pair(&c.support, &stem, &read).unwrap()
+        );
         assert_eq!(
             members(&c, HALF),
             (true, false),
@@ -621,8 +587,8 @@ fn telemetry_retention_fails_closed() {
         retire(&c, &warm.index);
         assert_eq!(
             gone(),
-            (true, true),
-            "repair changed the generation; the original accepted binding cannot release it"
+            (false, false),
+            "a grown transcript is known through its last read"
         );
     });
 }
@@ -670,12 +636,6 @@ fn telemetry_retention_finishes_a_pair_after_a_crash_between_unlinks() {
         assert_eq!(members(&c, GONE), (false, true));
         let crashed = cold(&c);
         assert_equivalent(&before, &routed(&crashed, crashed.upload_policy));
-        // Simulate rehydrating exactly the same committed binding after restart.
-        let committed = delivery_generations(&c);
-        let restored = serde_json::from_slice(&serde_json::to_vec(&committed).unwrap()).unwrap();
-        COMMITTED.with(|saved| {
-            saved.borrow_mut().insert(c.support.clone(), restored);
-        });
         walked(&c, now_ms() + 60_000);
         retire(&c, &warm.index);
         assert_eq!(members(&c, GONE), (false, false));
@@ -756,48 +716,5 @@ fn telemetry_retention_holds_and_reads_no_pair_until_delivery_is_proven() {
                 assert_eq!(members(&c, session), members_before, "{run}: {session}");
             }
         }
-    });
-}
-
-/// [format] Both absent after unlink, directory-sync failure, and failure to
-/// commit candidate removal all reconcile from the SAME committed binding.
-#[test]
-fn telemetry_retention_reconciles_absent_pairs_before_releasing_metadata() {
-    with_e2(|| {
-        proven(true);
-        let (c, warm) = corpus("telemetry-retention-absent-recovery");
-        let proof = delivery_generations(&c);
-        let stem = crate::claude_local_otel::telemetry_stem(GONE);
-        let run = || {
-            crate::snapshots::claude_telemetry_retention::retire_claude_telemetry(
-                &c.support,
-                &warm.index,
-                std::slice::from_ref(&c.root),
-                &BTreeSet::new(),
-                &[NAMED.to_string()],
-                &proof,
-            )
-        };
-        crate::claude_local_otel::fail_telemetry_sync_for_test();
-        walked(&c, now_ms() + 60_000);
-        assert!(
-            !run().contains(&stem),
-            "failed sync retains candidate + ACK references"
-        );
-        assert_eq!(members(&c, GONE), (false, false));
-        walked(&c, now_ms() + 60_000);
-        assert!(
-            run().contains(&stem),
-            "absent pair is synced and reconciled"
-        );
-        // Ignore that removal as if its progress COMMIT failed. The next run
-        // must settle again, even though the directory cannot list the pair.
-        walked(&c, now_ms() + 60_000);
-        assert!(run().contains(&stem));
-        assert_eq!(
-            proof,
-            delivery_generations(&c),
-            "never mint a replacement binding"
-        );
     });
 }

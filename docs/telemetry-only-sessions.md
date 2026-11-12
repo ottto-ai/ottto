@@ -30,8 +30,7 @@ whole telemetry-only body and use the existing over-cap diagnostics. They
 never authorize sending a smaller or identity-stripped replacement.
 
 Transcript takeover, pre-activation refusal, permanent server refusal and
-completed cleanup release scheduling metadata. Cleanup retries use the original
-accepted generation, tolerate already-unlinked members and sync both directories
-before releasing metadata. A committed candidate remains discoverable even when
-both files are absent. Older releases tolerate and drop this additive ledger;
-rolling forward then conservatively starts a later activation window.
+healthy empty evidence release scheduling metadata. Older releases tolerate
+and drop this additive ledger; rolling forward then conservatively starts a
+later activation window. File release, accepted-only generation custody and
+unlink recovery belong to the separate retention change.

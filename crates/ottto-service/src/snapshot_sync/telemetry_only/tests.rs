@@ -105,70 +105,34 @@ fn additive_progress_hydrate_defaults_dark() {
     assert!(progress.telemetry_only.is_none());
 }
 
-/// [format] The pair's append-only order is API, trace. Old short sequences
-/// pad with unknown; future tails are consumed without failing the ledger.
+/// [format] API precedes trace in the named shape. Missing members default
+/// unknown and future members are ignored without dropping the whole ledger.
 #[test]
 fn generation_shapes_and_candidate_ledger_golden() {
     let api = json!({"device":1,"inode":2,"bytes":3,"modified":[4,5],"changed":[6,7]});
     let trace = json!({"device":8,"inode":9,"bytes":10,"modified":[11,12],"changed":[13,14]});
     for (input, expected) in [
-        (json!([]), json!([null, null])),
-        (json!([api]), json!([api, null])),
-        (json!([api, trace]), json!([api, trace])),
-        (json!([api,trace,{"future":"tail"}]), json!([api, trace])),
+        (json!({}), json!({"api":null,"trace":null})),
+        (json!({"api":api}), json!({"api":api,"trace":null})),
+        (
+            json!({"api":api,"trace":trace}),
+            json!({"api":api,"trace":trace}),
+        ),
+        (
+            json!({"api":api,"trace":trace,"future":{}}),
+            json!({"api":api,"trace":trace}),
+        ),
     ] {
         let raw = json!({"floor":1,"start":2,"candidates":{"root":{
-            "built":{"fingerprint":"f","body":"b","generation":input,"context":"c"},"accepted":true
+            "built":{"fingerprint":"f","body":"b","generation":input}
         }}});
         let ledger: Ledger = serde_json::from_value(raw.clone()).unwrap();
         let mut golden = raw;
         golden["candidates"]["root"]["built"]["generation"] = expected;
         assert_eq!(serde_json::to_value(ledger).unwrap(), golden);
     }
-    assert!(serde_json::from_value::<Binding>(
-        json!({"fingerprint":"f","body":"b","generation":[false]})
+    assert!(serde_json::from_value::<Built>(
+        json!({"fingerprint":"f","body":"b","generation":{"api":false}})
     )
     .is_err());
-}
-
-#[test]
-fn delivery_requires_exact_accepted_body_context_and_destination() {
-    let root = "candidate";
-    let binding = json!({"fingerprint":"f","body":"b","generation":[null,null],"context":"c"});
-    let mut value = json!({"schema_version":SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION,
-        "destination_namespace_hash":"destination", "generation":1,
-        "telemetry_only":{"floor":1,"start":2,"candidates":{root:{"built":binding,"accepted":false}}},
-        "accepted_body_witnesses":{"f":"b"}, "accepted_body_contexts":{"f":"c"}});
-    let mut progress: SnapshotUploadProgress = serde_json::from_value(value.clone()).unwrap();
-    assert!(
-        progress.telemetry_deliveries().is_empty(),
-        "stored/unchanged ACK is not accepted-only proof"
-    );
-    progress.accept_telemetry(root, "other", "b");
-    assert!(progress.telemetry_deliveries().is_empty());
-    progress.accept_telemetry(root, "f", "different");
-    assert!(progress.telemetry_deliveries().is_empty());
-    progress.accept_telemetry(root, "f", "b");
-    assert_eq!(progress.telemetry_deliveries().len(), 1);
-    value = serde_json::to_value(&progress).unwrap();
-    for (field, bad) in [
-        ("accepted_body_witnesses", json!({"f":"changed"})),
-        (
-            "accepted_body_contexts",
-            json!({"f":"different-destination"}),
-        ),
-    ] {
-        let mut changed = value.clone();
-        changed[field] = bad;
-        let changed: SnapshotUploadProgress = serde_json::from_value(changed).unwrap();
-        assert!(changed.telemetry_deliveries().is_empty());
-    }
-    progress.settle_telemetry_root(root);
-    assert!(progress
-        .telemetry_only
-        .as_ref()
-        .unwrap()
-        .references()
-        .next()
-        .is_none());
 }
