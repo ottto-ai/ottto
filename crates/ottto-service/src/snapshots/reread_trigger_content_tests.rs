@@ -271,6 +271,28 @@ fn same_bytes_under_a_new_inode_read_once_for_its_object_inputs() {
     }
 }
 
+/// [money] A reboot or remount renumbers the volume (st_dev) of a settled
+/// file. The same object under the new device number reads nothing and
+/// keeps its fingerprint.
+#[test]
+fn a_renumbered_device_alone_reads_nothing() {
+    for (source, name, body) in sources() {
+        let mut fixture = Fixture::settled(source, &format!("{name}-remount"), &body);
+        let stored = fixture.fingerprint();
+        let _renumber = crate::transcript_acquisition::DeviceRenumber::by(13);
+        assert_eq!(
+            fixture.rescan(),
+            0,
+            "{name}: a new device number reads nothing"
+        );
+        assert_eq!(
+            fixture.fingerprint(),
+            stored,
+            "{name}: the same fingerprint"
+        );
+    }
+}
+
 #[test]
 fn real_content_changes_are_reread() {
     for (source, name, body) in sources() {

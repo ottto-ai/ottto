@@ -498,7 +498,7 @@ pub(in crate::snapshots) fn opened_object_identity_and_stat_retained(
     let samples = read_opened_content_samples(file, len)?;
     #[cfg(unix)]
     let stat = Some(OpenedObjectStat {
-        device: metadata.dev(),
+        device: crate::transcript_acquisition::captured_device(&metadata),
         inode: metadata.ino(),
         changed_seconds: metadata.ctime(),
         changed_nanos: metadata.ctime_nsec(),
