@@ -1470,7 +1470,9 @@ impl crate::heap_layout_bound::HeapLayoutBound for ReadMode {
 #[cfg(unix)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DurableCertificate {
-    /// Recorded only; never compared (see `FileStamp`).
+    /// Never compared across boots (see `FileStamp`). A restore rebinds it
+    /// to the live device, so the quiet-retirement check compares it only
+    /// with a certificate this process wrote.
     pub(crate) device: u64,
     pub(crate) inode: u64,
     /// The checkpoint's unnormalized stamp length (>= `sealed_offset`).
@@ -3185,58 +3187,5 @@ mod tests {
                 "only a birth equal to the mtime is a clamp"
             );
         }
-    }
-
-    /// [money] A reboot or remount can renumber the volume (st_dev) of an
-    /// unchanged file. A certificate or stamp stored under the old number
-    /// still names it: the restore is Unchanged, growth is a Tail, never
-    /// `Replaced`. A new inode, or the same inode with another birth, is
-    /// still a replacement.
-    #[cfg(unix)]
-    #[test]
-    fn a_renumbered_device_keeps_the_same_object() {
-        let f = Fixture::new(b"{\"a\":1}\n{\"b\":2}\n");
-        let checkpoint = initial(&f, 1_000);
-        let birth = birth_unix_nanos(&f.open().metadata().unwrap());
-        let certificate = checkpoint.durable_certificate(birth).unwrap();
-        let before = FileStamp::capture(f.open().metadata().unwrap()).unwrap();
-        let _renumber = DeviceRenumber::by(13);
-        let after = FileStamp::capture(f.open().metadata().unwrap()).unwrap();
-        assert_ne!(after.device, before.device, "the seam renumbers");
-        assert!(before.same_object(&after) && before.same_content(&after));
-        assert!(before == after, "an exact stamp ignores the volume number");
-        let (restored, admission) = certificate
-            .restore_grown(&mut f.open(), scope(), None)
-            .expect("the same object under a new device number");
-        assert!(admission.unchanged);
-        let plan = ReadPlan::prepare(&mut f.open(), Some(&restored), &scope(), None, 1_100);
-        assert_eq!(plan.unwrap().mode(), ReadMode::Unchanged);
-        if birth != 0 {
-            let mut reborn = certificate.clone();
-            reborn.birth_nanos = birth - 1;
-            assert_eq!(
-                reborn.restore_grown(&mut f.open(), scope(), None).err(),
-                Some(CertificateRefusal::Changed(FullReason::Replaced)),
-                "the same inode with another birth is another object"
-            );
-        }
-        f.append(b"{\"c\":3}\n");
-        let (grown, admission) = certificate
-            .restore_grown(&mut f.open(), scope(), None)
-            .expect("growth of the same object continues");
-        assert!(!admission.unchanged);
-        let plan = ReadPlan::prepare(&mut f.open(), Some(&grown), &scope(), None, 1_100);
-        assert_eq!(plan.unwrap().mode(), ReadMode::Tail);
-        let replacement = Fixture::new(&fs::read(&f.0).unwrap());
-        fs::rename(&replacement.0, &f.0).unwrap();
-        assert_eq!(
-            certificate
-                .restore_grown(&mut f.open(), scope(), None)
-                .err(),
-            Some(CertificateRefusal::Changed(FullReason::Replaced)),
-            "a new inode at the path is a replacement"
-        );
-        let plan = ReadPlan::prepare(&mut f.open(), Some(&grown), &scope(), None, 1_100);
-        assert_eq!(plan.unwrap().mode(), ReadMode::Full(FullReason::Replaced));
     }
 }

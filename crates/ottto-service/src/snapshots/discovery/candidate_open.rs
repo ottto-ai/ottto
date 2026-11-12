@@ -562,8 +562,8 @@ pub(in crate::snapshots) fn adopt_stored_changed_time(
     Ok(Some(identity))
 }
 
-/// The opened-object identity of `file` for `object` (its device, inode and
-/// a stored ctime), from fresh content samples taken now, so bytes written
+/// The opened-object identity of `file` for `object` (its inode and a stored
+/// ctime; the device is not hashed), from fresh content samples taken now, so bytes written
 /// after the open still count.
 fn opened_identity_at(file: &mut File, object: &OpenedObjectStat) -> std::io::Result<String> {
     let len = file.metadata()?.len();
