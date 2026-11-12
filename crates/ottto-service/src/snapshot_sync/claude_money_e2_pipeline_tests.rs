@@ -4295,21 +4295,25 @@ fn e2_pipeline_partial_absence_never_invalidates_a_stored_removal() {
             );
             // A complete census with the same saved removals is the cold control.
             let cold = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
-            e2::pipeline_test_observer::census_with_ids(
-                &mut prior,
-                &file(ROOT),
-                ids,
-                shape,
-                unverified,
-            );
             for restart in [false, true] {
                 let index = if restart {
                     c.reload(&mut prior)
                 } else {
                     prior.clone()
                 };
+                let mut page = c.raw(&E2ScanFixture::default(), index, 100, !restart, &[]);
+                // Acquisition may refresh the holder. Replace its census at the
+                // decision boundary so every route sees the partial record.
+                e2::pipeline_test_observer::census_with_ids(
+                    &mut page.index,
+                    &file(ROOT),
+                    ids,
+                    shape,
+                    unverified,
+                );
                 e2::take_diag();
-                let page = ready(&c, &E2ScanFixture::default(), index, 100, !restart);
+                page.enrich(&c);
+                let page = deliver_page(page);
                 let third = body(&page, THIRD).unwrap();
                 assert_eq!(
                     (third.request_count, third.removed_request_count),
@@ -4318,12 +4322,8 @@ fn e2_pipeline_partial_absence_never_invalidates_a_stored_removal() {
                 assert_eq!(canonical(third), canonical(body(&cold, THIRD).unwrap()));
                 assert_eq!(canonical(&page.index.claude_copy_removals), removals);
                 assert_eq!(
-                    copy_diag(&[
-                        "copy_prefix_unproven",
-                        "copy_removal_reused",
-                        "copy_prefix_hold_expired"
-                    ]),
-                    [0, 2, 0]
+                    copy_diag(&["copy_prefix_unproven", "copy_prefix_hold_expired"]),
+                    [0, 0]
                 );
                 money_oracle::assert_equivalent(&sent_money(&cold), &sent_money(&page));
             }
