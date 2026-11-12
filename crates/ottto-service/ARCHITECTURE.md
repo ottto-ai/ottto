@@ -196,6 +196,15 @@ child CPU totals; arguments, paths and command output are never included.
 
 ## Stores
 
+Terminal scan status optionally reports `first_read_cutoff`, the destination/source's
+first census end minus the fixed 60-day first-read window, as UTC milliseconds.
+The first census end is saved once in `BackfillState.first_census_ends` before
+collection, only for a missing index without prior completion. Generation-zero
+restart uses that saved end for admission. Completion, replay and wider upload
+windows preserve it. Existing stores without an anchor omit the field; check-ins
+always omit it. Older builds ignore this optional map and drop it on their next
+backfill-state save, so re-upgrade omits the cutoff for existing destinations.
+
 - **Scan index** (`snapshots/scan_index_*`): per source, the bookkeeping of what was read and
   accepted: per-file progress and fingerprints, full-scan state, account and usage evidence. It is
   saved atomically under the state directory's single-writer lock.

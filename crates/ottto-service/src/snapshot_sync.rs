@@ -6573,7 +6573,7 @@ fn prepare_sync_source_inner(
         );
         return Ok(None);
     }
-    let scan_started_at = current_rfc3339();
+    let mut scan_started_at = current_rfc3339();
     let relay_token = client.issue_status_relay_token(device, device_secret, source)?;
     let mut activity_hint = small_source_upload(source, || client.get_activity_hint(&relay_token))?;
     // Treat the activity hint as the only authority for the semantic evidence
@@ -6787,6 +6787,20 @@ fn prepare_sync_source_inner(
         &upload_destination_namespace,
         crate::snapshots::snapshot_quarantine_witness_for_context(source, &upload_context),
     )?;
+    let first_census_end = crate::backfill::record_first_census(
+        support_dir,
+        source,
+        &upload_destination_namespace,
+        &scan_started_at,
+        load_origin == crate::snapshots::ScanIndexLoadOrigin::Missing,
+    )?;
+    // Missing-index import stays at generation zero until the first collection save.
+    // A restart after the anchor save must admit against that same census end.
+    if index.generation == 0 {
+        if let Some(anchor) = first_census_end {
+            scan_started_at = anchor;
+        }
+    }
     if source == SnapshotSource::ClaudeCode {
         daemon.transcript_cache.bind_withheld(&mut index);
     }
@@ -8519,6 +8533,7 @@ fn finish_sync_source(
                 client,
                 device,
                 device_secret,
+                support_dir,
                 source,
                 TerminalManifestSource::Withdraw,
                 CollectorStatus {
@@ -8547,6 +8562,7 @@ fn finish_sync_source(
                 client,
                 device,
                 device_secret,
+                support_dir,
                 source,
                 TerminalManifestSource::Withdraw,
                 CollectorStatus {
@@ -8704,6 +8720,7 @@ fn finish_sync_source(
                 client,
                 device,
                 device_secret,
+                support_dir,
                 source,
                 TerminalManifestSource::Withdraw,
                 CollectorStatus {
@@ -8968,6 +8985,7 @@ fn finish_sync_source(
             client,
             device,
             device_secret,
+            support_dir,
             source,
             if scan_result.census_complete {
                 TerminalManifestSource::CompleteCensus(&index)
@@ -9001,6 +9019,7 @@ fn finish_sync_source(
             client,
             device,
             device_secret,
+            support_dir,
             source,
             if scan_result.census_complete {
                 TerminalManifestSource::CompleteCensus(&index)
@@ -11742,6 +11761,7 @@ fn collector_status_request(
         last_snapshot_unproven_terminal_count: status.counts.snapshot_unproven_terminal_count,
         last_snapshot_superseded_terminal_count: status.counts.snapshot_superseded_terminal_count,
         last_backfill_window_days: status.counts.backfill_window_days,
+        first_read_cutoff: None,
         last_backfill_file_limit: status.counts.backfill_file_limit,
         last_discovered_file_count: status.counts.discovered_file_count,
         last_skipped_file_count_due_to_limit: status.counts.skipped_file_count_due_to_limit,
@@ -11886,6 +11906,7 @@ fn report_status_with_fresh_relay_token(
     client: &SnapshotApiClient,
     device: &LocalDeviceBinding,
     device_secret: &str,
+    support_dir: &Path,
     source: SnapshotSource,
     manifest_source: TerminalManifestSource<'_>,
     mut status: CollectorStatus<'_>,
@@ -11916,11 +11937,13 @@ fn report_status_with_fresh_relay_token(
     // Keep non-blocking cooldown debt beside the terminal census counters on
     // every report, even when the re-offer work summary is unchanged/quiet.
     eprintln!("{}", status.counts.terminal_census_line(source.api_slug()));
-    let request = collector_status_request(
+    let mut request = collector_status_request(
         &destination_namespace,
         status,
         census_residue_status_admitted,
     )?;
+    request.first_read_cutoff = load_backfill_state(support_dir)
+        .first_read_cutoff(&destination_namespace, source.api_slug());
     small_source_upload(source, || client.report_status(&relay_token, &request))?;
     // Content-free, after a successful send: the closed error-code slug and
     // enabled flag, once per change per source (and once after start).
@@ -11962,6 +11985,7 @@ fn withdraw_and_report_policy_stop(
         client,
         device,
         device_secret,
+        support_dir,
         source,
         TerminalManifestSource::Withdraw,
         status,
@@ -12046,6 +12070,7 @@ fn report_checkin_status(
         last_snapshot_unproven_terminal_count: 0,
         last_snapshot_superseded_terminal_count: 0,
         last_backfill_window_days: receipt_window_days,
+        first_read_cutoff: None,
         last_backfill_file_limit: 0,
         last_discovered_file_count: 0,
         last_skipped_file_count_due_to_limit: 0,
@@ -20085,6 +20110,7 @@ mod tests {
             &client,
             &device,
             "device-secret",
+            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             TerminalManifestSource::Withdraw,
             CollectorStatus {
@@ -20118,8 +20144,54 @@ mod tests {
         }
     }
 
-    /// Capture the wire body of one liveness beat, with or without a
-    /// cycle-start clock.
+    #[test]
+    #[serial(source_manifests)]
+    fn terminal_scan_status_reads_the_durable_first_census_cutoff() {
+        let _guard = SourceManifestTestGuard::new();
+        let support = test_terminal_status_support_dir();
+        let destination =
+            snapshot_upload_destination_namespace(&report_kind_test_device(), "device-secret");
+        for source in [
+            SnapshotSource::ClaudeCode,
+            SnapshotSource::Codex,
+            SnapshotSource::Pi,
+        ] {
+            let absent = captured_terminal_receipt_for_source_under_hint(
+                source,
+                SyncCounts::for_policy(183),
+                CollectorState::Success,
+                TerminalManifestSource::Withdraw,
+                183,
+                "",
+            );
+            assert!(absent.get("first_read_cutoff").is_none());
+            crate::backfill::record_first_census(
+                support,
+                source,
+                &destination,
+                "2026-11-12T12:00:00Z",
+                true,
+            )
+            .unwrap();
+            for width in [183, 730] {
+                let present = captured_terminal_receipt_for_source_under_hint(
+                    source,
+                    SyncCounts::for_policy(width),
+                    CollectorState::Success,
+                    TerminalManifestSource::Withdraw,
+                    width,
+                    "",
+                );
+                assert_eq!(present["first_read_cutoff"], "2026-09-13T12:00:00.000Z");
+                assert_eq!(present["last_backfill_window_days"], width);
+                assert!(present.get("first_read").is_none());
+            }
+            let beat = captured_checkin_receipt(None);
+            assert!(beat.get("first_read_cutoff").is_none());
+        }
+    }
+
+    /// Capture the wire body of one liveness beat, with or without a cycle-start clock.
     fn captured_checkin_receipt(scan_started_at: Option<&str>) -> serde_json::Value {
         let captured = Arc::new(Mutex::new(Vec::new()));
         let client = SnapshotApiClient::new(snapshot_status_server(captured.clone()));
@@ -20127,6 +20199,7 @@ mod tests {
             &client,
             &report_kind_test_device(),
             "device-secret",
+            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             "otm_test",
             scan_started_at,
@@ -20182,6 +20255,7 @@ mod tests {
             &client,
             &report_kind_test_device(),
             "device-secret",
+            test_terminal_status_support_dir(),
             source,
             manifest_source,
             CollectorStatus {
@@ -21471,6 +21545,7 @@ mod tests {
             &client,
             &device,
             "synthetic-secret",
+            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             TerminalManifestSource::Withdraw,
             CollectorStatus {
@@ -21537,6 +21612,7 @@ mod tests {
             &client,
             &device,
             "device-secret",
+            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             TerminalManifestSource::Withdraw,
             CollectorStatus {
@@ -21670,6 +21746,7 @@ mod tests {
             &client,
             &device,
             "device-secret",
+            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             TerminalManifestSource::CompleteCensus(&index),
             CollectorStatus {
@@ -21776,6 +21853,7 @@ mod tests {
                 &client,
                 &device,
                 "device-secret",
+                test_terminal_status_support_dir(),
                 SnapshotSource::Codex,
                 TerminalManifestSource::Withdraw,
                 CollectorStatus {
@@ -22004,6 +22082,7 @@ mod tests {
             &client,
             &device,
             "device-secret",
+            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             TerminalManifestSource::CompleteCensus(&index),
             CollectorStatus {
@@ -22056,6 +22135,7 @@ mod tests {
             &client,
             &device,
             "device-secret",
+            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             TerminalManifestSource::CompleteCensus(&index),
             CollectorStatus {
