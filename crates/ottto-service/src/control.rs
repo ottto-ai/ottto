@@ -14487,7 +14487,9 @@ fn command_diagnostic_requires_claude_reauth(diagnostic: Option<&str>) -> bool {
         return false;
     };
     let normalized = diagnostic.to_ascii_lowercase();
-    normalized.contains("oauth session expired")
+    normalized.contains("not logged in")
+        || normalized.contains("not signed in")
+        || normalized.contains("oauth session expired")
         || normalized.contains("oauth token expired")
         || (normalized.contains("token is expired")
             && (normalized.contains("sign in again") || normalized.contains("/login")))
@@ -14501,7 +14503,16 @@ fn classify_source_smoke_failure(source: &SourceKind, result: &mut SmokeResult) 
         && command_diagnostic_requires_claude_reauth(result.diagnostic.as_deref())
     {
         result.error_code = Some(CLAUDE_OAUTH_REAUTH_REQUIRED_CODE.to_string());
-        result.message = "Claude Code sign-in expired. Open Claude Code, sign in again, then retry Verify. Ottto itself is still connected.".to_string();
+        let diagnostic = result
+            .diagnostic
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        result.message = if diagnostic.contains("not logged in") || diagnostic.contains("not signed in") {
+            "Claude Code is not signed in. Open Claude Code, sign in, then retry Verify. Ottto itself is still connected."
+        } else {
+            "Claude Code sign-in expired. Open Claude Code, sign in again, then retry Verify. Ottto itself is still connected."
+        }.to_string();
     }
 }
 
@@ -29802,10 +29813,113 @@ X-API-Key = "otel_redacted"
         assert_eq!(result.status, SourceVerificationStatus::ReconnectRequired);
         assert!(!result.verified);
         assert_eq!(result.message.code, CLAUDE_OAUTH_REAUTH_REQUIRED_CODE);
-        assert!(result
-            .message
-            .text
-            .contains("Ottto itself is still connected"));
+        assert_eq!(result.message.text, "Claude Code sign-in expired. Open Claude Code, sign in again, then retry Verify. Ottto itself is still connected.");
+    }
+
+    #[test]
+    fn claude_signed_out_smoke_requires_provider_sign_in() {
+        for diagnostic in [
+            "Not logged in · Please run /login",
+            "not signed in",
+            "NOT SIGNED IN. Please run /login",
+            "Not logged in\nPlease run /login",
+        ] {
+            let mut smoke = SmokeResult {
+                command_found: true,
+                succeeded: false,
+                exit_status: Some(1),
+                duration_ms: 12,
+                message: "Claude Code smoke session failed.".into(),
+                diagnostic: Some(diagnostic.into()),
+                error_code: Some("smoke_command_failed".into()),
+                local_session_observed: None,
+            };
+            classify_source_smoke_failure(&SourceKind::ClaudeCode, &mut smoke);
+            let result = smoke_failure_verification_result(SourceKind::ClaudeCode, &smoke, None);
+            assert_eq!(
+                result.status,
+                SourceVerificationStatus::ReconnectRequired,
+                "{diagnostic}"
+            );
+            assert_eq!(result.message.code, CLAUDE_OAUTH_REAUTH_REQUIRED_CODE);
+            assert_eq!(result.message.text, "Claude Code is not signed in. Open Claude Code, sign in, then retry Verify. Ottto itself is still connected.");
+            let daemon = daemon().with_account(connected_account());
+            daemon.record_verification_result(&result).unwrap();
+            let status = daemon.status("token").unwrap();
+            let health = status
+                .sources
+                .iter()
+                .find(|health| health.source == SourceKind::ClaudeCode)
+                .unwrap();
+            assert_eq!(
+                health.recommended_actions[0].action,
+                RepairActionKind::ReauthProvider
+            );
+            assert_eq!(
+                daemon.blocking_verification_retry_states().unwrap(),
+                vec![(SourceKind::ClaudeCode, true)]
+            );
+        }
+    }
+
+    #[test]
+    fn smoke_sign_in_classifier_preserves_other_failures_and_success() {
+        for (source, succeeded, diagnostic, code) in [
+            (
+                SourceKind::ClaudeCode,
+                false,
+                "Network connection failed",
+                "smoke_command_failed",
+            ),
+            (
+                SourceKind::ClaudeCode,
+                false,
+                "You've hit your usage limit",
+                SMOKE_USAGE_LIMIT_ERROR_CODE,
+            ),
+            (
+                SourceKind::ClaudeCode,
+                false,
+                "Help: run /login to manage your account",
+                "smoke_command_failed",
+            ),
+            (
+                SourceKind::ClaudeCode,
+                true,
+                "stdout: Not logged in · Please run /login",
+                "smoke_command_failed",
+            ),
+            (
+                SourceKind::Codex,
+                false,
+                "Not logged in · Please run /login",
+                "smoke_command_failed",
+            ),
+            (
+                SourceKind::Pi,
+                false,
+                "Not signed in",
+                "smoke_command_failed",
+            ),
+        ] {
+            let mut smoke = SmokeResult {
+                command_found: true,
+                succeeded,
+                exit_status: Some(if succeeded { 0 } else { 1 }),
+                duration_ms: 12,
+                message: "Original smoke result".into(),
+                diagnostic: Some(diagnostic.into()),
+                error_code: Some(code.into()),
+                local_session_observed: None,
+            };
+            classify_source_smoke_failure(&source, &mut smoke);
+            assert_eq!(
+                smoke.error_code.as_deref(),
+                Some(code),
+                "{source:?}: {diagnostic}"
+            );
+            assert_eq!(smoke.message, "Original smoke result");
+        }
     }
 
     #[test]

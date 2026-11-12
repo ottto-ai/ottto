@@ -1313,6 +1313,17 @@ impl LocalDaemon {
     pub fn sources_with_blocking_verification_failure(
         &self,
     ) -> Result<Vec<SourceKind>, LocalApiError> {
+        Ok(self
+            .blocking_verification_retry_states()?
+            .into_iter()
+            .map(|(source, _)| source)
+            .collect())
+    }
+
+    /// Read failure and Claude sign-in action together without collecting status or credentials.
+    pub(crate) fn blocking_verification_retry_states(
+        &self,
+    ) -> Result<Vec<(SourceKind, bool)>, LocalApiError> {
         let state = self.state()?;
         Ok(state
             .sources
@@ -1320,7 +1331,16 @@ impl LocalDaemon {
             .filter(|health| {
                 health.state == SourceState::Failed && has_verification_failure_problem(health)
             })
-            .map(|health| health.source.clone())
+            .map(|health| {
+                (
+                    health.source.clone(),
+                    health.source == SourceKind::ClaudeCode
+                        && health
+                            .recommended_actions
+                            .iter()
+                            .any(|action| action.action == RepairActionKind::ReauthProvider),
+                )
+            })
             .collect())
     }
 
