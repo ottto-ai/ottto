@@ -6,7 +6,9 @@
 //! credential. Identity and expiry come from the live access token; an id
 //! token only cross-checks it and never by itself skips a login.
 
-use super::{codex_credential_from_auth, opaque_key, AccountIdentityHashes, CodexLogin};
+use super::{
+    codex_credential_from_auth, opaque_key, AccountIdentityHashes, CodexCredential, CodexLogin,
+};
 use crate::agent_status::{
     codex_jwt_claimed_ids, structurally_valid_codex_jwt_claims, DailyReferenceHome,
 };
@@ -140,13 +142,12 @@ impl LoginSkip {
     }
 }
 
-/// Read one home's login. Never refreshes or writes a credential.
-pub(crate) fn read_login(
-    home_kind: LoginHomeKind,
+/// The one secure read of a home: its credential and id token, whatever the
+/// token's expiry. Never refreshes or writes a credential.
+fn read_signed_in(
     home: &Path,
     trust: CodexHomeTrust,
-    now: u64,
-) -> Result<CodexLogin, LoginSkip> {
+) -> Result<(CodexCredential, Option<String>), LoginSkip> {
     let body = match read_codex_auth_file_secure(home, trust) {
         Ok(Some(body)) => body,
         Ok(None) => return Err(LoginSkip::Absent),
@@ -162,7 +163,19 @@ pub(crate) fn read_login(
         .pointer("/tokens/id_token")
         .and_then(Value::as_str)
         .map(str::trim)
-        .filter(|token| !token.is_empty());
+        .filter(|token| !token.is_empty())
+        .map(str::to_string);
+    Ok((credential, id_token))
+}
+
+/// A signed-in credential as a login, when its live token proves an identity
+/// and does not lapse within the margin.
+fn usable_login(
+    home_kind: LoginHomeKind,
+    credential: CodexCredential,
+    id_token: Option<&str>,
+    now: u64,
+) -> Result<CodexLogin, LoginSkip> {
     let ReadIdentity::Usable {
         lapses_at,
         identity,
@@ -185,16 +198,34 @@ pub(crate) fn read_login(
     })
 }
 
-/// [`read_login`] for a discovered home: a registered slot is used only
-/// while its live token proves the pair it was registered with.
-fn read_home(home: &DailyReferenceHome, now: u64) -> Result<CodexLogin, LoginSkip> {
+/// One discovered home's login, with the account it is signed in to
+/// whatever the token's expiry: a registered slot is used only while its
+/// live token proves the pair it was registered with.
+pub(super) fn read_home(
+    home: &DailyReferenceHome,
+    now: u64,
+) -> (Option<String>, Result<CodexLogin, LoginSkip>) {
     let kind = match &home.slot_id {
         None => LoginHomeKind::Default,
         Some(slot_id) => LoginHomeKind::Slot {
             slot_id: slot_id.clone(),
         },
     };
-    let login = read_login(kind, &home.home, home.trust, now)?;
+    let (credential, id_token) = match read_signed_in(&home.home, home.trust) {
+        Ok(read) => read,
+        Err(skip) => return (None, Err(skip)),
+    };
+    let signed_in = credential.account_scope.clone();
+    let login = usable_login(kind, credential, id_token.as_deref(), now)
+        .and_then(|login| proven_slot_login(home, login));
+    (Some(signed_in), login)
+}
+
+/// A slot login only while its live token proves its registered pair.
+fn proven_slot_login(
+    home: &DailyReferenceHome,
+    login: CodexLogin,
+) -> Result<CodexLogin, LoginSkip> {
     if let Some((account, workspace)) = &home.registered_pair {
         let Some(identity) = &login.identity else {
             return Err(LoginSkip::SlotIdentityUnprovable);
@@ -211,7 +242,7 @@ fn read_home(home: &DailyReferenceHome, now: u64) -> Result<CodexLogin, LoginSki
 }
 
 /// The default home's login this tick, for the compatibility status fields.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct DefaultHomeState {
     /// `ok`, or the closed reason the default home yields no read.
     pub(crate) state: String,
@@ -221,12 +252,24 @@ pub(crate) struct DefaultHomeState {
     pub(crate) fingerprint: Option<String>,
 }
 
+/// The reason only: the opaque fingerprint stays out of formatted output.
+impl std::fmt::Debug for DefaultHomeState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DefaultHomeState")
+            .field("state", &self.state)
+            .field("fingerprint_present", &self.fingerprint.is_some())
+            .finish()
+    }
+}
+
 /// The logins one tick reads, and what the other homes yielded.
 #[derive(Debug)]
 pub(crate) struct LoginDiscovery {
     /// At most one login per opaque account: default home first, then slots.
     pub(crate) logins: Vec<CodexLogin>,
-    /// False when the slot registry or a slot home could not be read.
+    /// False when the slot registry, a slot home or a home's `auth.json` could
+    /// not be read.
     pub(crate) complete: bool,
     /// Closed skip reason to count. No identifiers.
     pub(crate) skipped: BTreeMap<String, u32>,
@@ -242,22 +285,31 @@ pub(crate) fn discover(
     grant_key: &[u8],
     now: u64,
 ) -> LoginDiscovery {
+    let mut complete = homes_complete;
     let mut skipped = BTreeMap::new();
     let mut default_home = DefaultHomeState::default();
     let mut candidates = Vec::new();
     for home in &homes {
-        match read_home(home, now) {
+        let (signed_in, login) = read_home(home, now);
+        if home.slot_id.is_none() {
+            // The privacy controls act on the signed-in account even while
+            // its token is renewing, so status keeps its label.
+            default_home.fingerprint = signed_in.map(|scope| opaque_key(grant_key, &scope));
+        }
+        match login {
             Ok(login) => {
                 let fingerprint = opaque_key(grant_key, &login.credential.account_scope);
                 if login.home_kind == LoginHomeKind::Default {
-                    default_home = DefaultHomeState {
-                        state: "ok".to_string(),
-                        fingerprint: Some(fingerprint.clone()),
-                    };
+                    default_home.state = "ok".to_string();
                 }
                 candidates.push((fingerprint, login));
             }
             Err(skip) => {
+                // An unreadable home may still hold a live account, so this
+                // discovery cannot justify forgetting one.
+                if skip == LoginSkip::Unreadable {
+                    complete = false;
+                }
                 if home.slot_id.is_none() {
                     default_home.state = skip.reason().to_string();
                 }
@@ -287,21 +339,37 @@ pub(crate) fn discover(
     logins.sort_by(|left, right| left.home_kind.cmp(&right.home_kind));
     LoginDiscovery {
         logins,
-        complete: homes_complete,
+        complete,
         skipped,
         default_home,
     }
 }
 
-/// The account scope local privacy controls act on: the default home's
-/// login, or with `prepare_fallback` the first live login in home order.
-/// Called only by the control actions that need it, after their token is
-/// consumed.
+/// The account scope local privacy controls act on: the account the default
+/// home is signed in to, or with `prepare_fallback` and no default sign-in,
+/// the first live slot login. Called only by the control actions that need
+/// it, after their token is consumed.
 pub(crate) fn control_account_scope(prepare_fallback: bool, now: u64) -> Option<String> {
     let (homes, _) = crate::agent_status::daily_reference_homes();
+    let default_scope = homes
+        .iter()
+        .filter(|home| home.slot_id.is_none())
+        .find_map(signed_in_account_scope);
+    if default_scope.is_some() || !prepare_fallback {
+        return default_scope;
+    }
     homes
         .iter()
-        .filter(|home| prepare_fallback || home.slot_id.is_none())
-        .find_map(|home| read_home(home, now).ok())
+        .filter(|home| home.slot_id.is_some())
+        .find_map(|home| read_home(home, now).1.ok())
         .map(|login| login.credential.account_scope)
+}
+
+/// The account a home is signed in to, whatever its token's expiry: one
+/// secure read and one parse. A privacy control must still reach an account
+/// whose token is being renewed, before its next read.
+pub(super) fn signed_in_account_scope(home: &DailyReferenceHome) -> Option<String> {
+    read_signed_in(&home.home, home.trust)
+        .ok()
+        .map(|(credential, _)| credential.account_scope)
 }

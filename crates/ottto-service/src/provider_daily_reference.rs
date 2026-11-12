@@ -1336,11 +1336,16 @@ pub fn status_with_live_binding(
         accounts,
         ..status
     };
-    if grant.disclosure_version == DISCLOSURE_VERSION_V1
-        && !live
-            .iter()
-            .any(|(_, fingerprint, _)| *fingerprint == grant.account_fingerprint)
-    {
+    // A v1 grant covers one account: only that login can make reading
+    // permitted, whatever else is signed in.
+    let eligible = live
+        .iter()
+        .filter(|(_, fingerprint, _)| {
+            grant.disclosure_version != DISCLOSURE_VERSION_V1
+                || *fingerprint == grant.account_fingerprint
+        })
+        .collect::<Vec<_>>();
+    if grant.disclosure_version == DISCLOSURE_VERSION_V1 && eligible.is_empty() {
         return CollectorStatusV1 {
             runtime_state: RuntimeState::ConsentRequired,
             provider_read_permitted: false,
@@ -1355,7 +1360,7 @@ pub fn status_with_live_binding(
             ..status
         };
     }
-    if live.iter().all(|(_, _, excluded)| *excluded) {
+    if eligible.iter().all(|(_, _, excluded)| *excluded) {
         return CollectorStatusV1 {
             runtime_state: RuntimeState::AccountExcluded,
             provider_read_permitted: false,
@@ -1504,7 +1509,7 @@ impl ProviderReadError {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct CollectorState {
     schema_version: u16,
     #[serde(default)]
@@ -1552,7 +1557,7 @@ struct CollectorState {
 }
 
 /// One account's proof that the backend stored its whole series as current.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SeriesProof {
     binding: StateBinding,
     window_start: String,
@@ -1561,7 +1566,7 @@ struct SeriesProof {
 }
 
 /// The consent epoch an entry or summary was written under.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct StateBinding {
     grant_id: String,
     grant_version: u64,
@@ -1578,7 +1583,7 @@ impl StateBinding {
 
 /// What the last discovery under a binding found. Counts, closed reasons and
 /// opaque labels only; status reads it instead of any credential.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct DiscoverySummary {
     binding: StateBinding,
     complete: bool,
@@ -1593,13 +1598,83 @@ struct DiscoverySummary {
 
 /// The whole `state.json`: one entry per account read, and the latest
 /// discovery.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct CollectorStateFile {
     schema_version: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     discovery: Option<DiscoverySummary>,
     #[serde(default)]
     entries: BTreeMap<String, CollectorState>,
+}
+
+// State types format counts, timings and closed reasons only: never a
+// fingerprint, binding id, state key or digest.
+
+impl fmt::Debug for CollectorState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CollectorState")
+            .field("last_fetch_epoch_seconds", &self.last_fetch_epoch_seconds)
+            .field(
+                "last_success_epoch_seconds",
+                &self.last_success_epoch_seconds,
+            )
+            .field("auth_failures", &self.auth_failures)
+            .field("shape_failures", &self.shape_failures)
+            .field("rate_limit_failures", &self.rate_limit_failures)
+            .field(
+                "reopen_after_epoch_seconds",
+                &self.reopen_after_epoch_seconds,
+            )
+            .field("last_error_category", &self.last_error_category)
+            .field("home_kind", &self.home_kind)
+            .field("last_reason", &self.last_reason)
+            .field("proof", &self.proof)
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for SeriesProof {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SeriesProof")
+            .field("window_start", &self.window_start)
+            .field("window_end", &self.window_end)
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for StateBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StateBinding")
+            .field("grant_version", &self.grant_version)
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for DiscoverySummary {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DiscoverySummary")
+            .field("binding", &self.binding)
+            .field("complete", &self.complete)
+            .field("accounts", &self.accounts.len())
+            .field("skipped", &self.skipped)
+            .field("default_home", &self.default_home)
+            .finish()
+    }
+}
+
+impl fmt::Debug for CollectorStateFile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CollectorStateFile")
+            .field("schema_version", &self.schema_version)
+            .field("discovery", &self.discovery)
+            .field("entries", &self.entries.values().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 /// One selected login's bookkeeping at the end of a tick.
@@ -1862,7 +1937,7 @@ impl fmt::Debug for CodexCredential {
 
 /// One Codex login a cycle reads with: its credential, the account identity
 /// its live access token proves (if any), and when that token lapses. Built
-/// only by [`logins::read_login`] from one secure read and one parse.
+/// only by [`logins::read_home`] from one secure read and one parse.
 #[derive(Clone)]
 pub(crate) struct CodexLogin {
     home_kind: logins::LoginHomeKind,
@@ -3248,9 +3323,6 @@ impl Collector {
                 ),
             );
         }
-        if discovery.logins.is_empty() && discovery.skipped.is_empty() {
-            return deferred(logins::LoginSkip::Absent.code());
-        }
         if !transport.is_configured() {
             return deferred("transport_not_configured");
         }
@@ -3357,6 +3429,10 @@ impl Collector {
                 .record_tick(summary, &seen, &date_string(last_now));
         }
 
+        // No live login: nothing was read, and the saved summary now says so.
+        if discovery.logins.is_empty() && discovery.skipped.is_empty() {
+            return deferred(logins::LoginSkip::Absent.code());
+        }
         if discovery.logins.is_empty() {
             return Cycle::with(
                 CycleOutcome::Deferred,

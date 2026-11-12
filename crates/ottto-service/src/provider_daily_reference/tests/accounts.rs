@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::provider_daily_reference::logins::{
-    codex_read_identity, read_login, LoginHomeKind, LoginSkip, ReadIdentity, LAPSE_MARGIN_SECONDS,
+    codex_read_identity, read_home, LoginSkip, ReadIdentity, LAPSE_MARGIN_SECONDS,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ottto_core::CodexHomeTrust;
@@ -165,6 +165,20 @@ fn read_identity_comes_from_the_access_token_and_the_id_token_only_cross_checks(
     .is_none());
 }
 
+/// The default home's login, through discovery's own read.
+fn read_default(home: &Path, now: u64) -> Result<CodexLogin, LoginSkip> {
+    read_home(
+        &crate::agent_status::DailyReferenceHome {
+            slot_id: None,
+            home: home.to_path_buf(),
+            trust: CodexHomeTrust::ProviderDefault,
+            registered_pair: None,
+        },
+        now,
+    )
+    .1
+}
+
 /// A Codex home holding `auth` as an owner-only `auth.json`.
 pub(super) fn home_with(scratch: &Path, name: &str, auth: Option<&Value>, mode: u32) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
@@ -241,12 +255,7 @@ fn read_login_skips_absent_unsafe_unusable_and_lapsing_sign_ins() {
     ];
     for (index, (case, auth, mode, expected)) in cases.into_iter().enumerate() {
         let home = home_with(&scratch, &format!("home-{index}"), auth.as_ref(), mode);
-        let read = read_login(
-            LoginHomeKind::Default,
-            &home,
-            CodexHomeTrust::ProviderDefault,
-            now_seconds,
-        );
+        let read = read_default(&home, now_seconds);
         assert_eq!(read.as_ref().err().copied(), expected, "{case}");
         if let Ok(login) = read {
             assert_eq!(login.identity, Some(expected_identity(USER, WORKSPACE)));
@@ -255,13 +264,7 @@ fn read_login_skips_absent_unsafe_unusable_and_lapsing_sign_ins() {
     }
     let missing = scratch.join("no-such-home");
     assert_eq!(
-        read_login(
-            LoginHomeKind::Default,
-            &missing,
-            CodexHomeTrust::ProviderDefault,
-            now_seconds
-        )
-        .err(),
+        read_default(&missing, now_seconds).err(),
         Some(LoginSkip::Absent)
     );
 }
@@ -296,13 +299,7 @@ fn identity_follows_the_selected_header_not_an_unused_alias() {
             Some(&auth),
             0o600,
         );
-        let login = read_login(
-            LoginHomeKind::Default,
-            &home,
-            CodexHomeTrust::ProviderDefault,
-            unix_seconds(now()),
-        )
-        .expect("live login");
+        let login = read_default(&home, unix_seconds(now())).expect("live login");
         assert_eq!(
             login.credential.account_id.as_deref(),
             Some(header),
@@ -397,13 +394,8 @@ fn a_default_home_login_with_an_expired_id_token_uploads_identified_batches() {
         let collector = collector(&format!("default-home-{}", case.replace(' ', "-")));
         enabled(&collector);
         set_disclosure(&collector, disclosure);
-        let login = read_login(
-            LoginHomeKind::Default,
-            &home,
-            CodexHomeTrust::ProviderDefault,
-            unix_seconds(now()),
-        )
-        .expect("expired id token never skips a live access token");
+        let login = read_default(&home, unix_seconds(now()))
+            .expect("expired id token never skips a live access token");
         let runtime = runtime();
         let reader = CapturingReader {
             payload,
@@ -543,13 +535,7 @@ fn formatted_logins_credentials_and_batches_name_no_identifier() {
         Some(&auth(&access, None, WORKSPACE)),
         0o600,
     );
-    let login = read_login(
-        LoginHomeKind::Default,
-        &home,
-        CodexHomeTrust::ProviderDefault,
-        unix_seconds(now()),
-    )
-    .expect("login");
+    let login = read_default(&home, unix_seconds(now())).expect("login");
     let identity = expected_identity(USER, WORKSPACE);
     let batch = fixture_batches().remove(0);
     let forbidden = [

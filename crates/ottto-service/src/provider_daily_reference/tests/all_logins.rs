@@ -5,7 +5,9 @@ use super::accounts::{
 };
 use super::*;
 use crate::agent_status::DailyReferenceHome;
-use crate::provider_daily_reference::logins::{discover, LoginHomeKind, LoginSkip};
+use crate::provider_daily_reference::logins::{
+    discover, signed_in_account_scope, LoginHomeKind, LoginSkip,
+};
 use ottto_core::CodexHomeTrust;
 
 const SECOND_USER: &str = "user-second-fixture-private";
@@ -296,7 +298,8 @@ fn discovery_selects_one_login_per_account_and_proves_every_slot() {
         assert!(discovery.complete, "{case}");
     }
 
-    // An unsafe default home is counted; an incomplete registry is carried.
+    // An unsafe home is counted and makes the discovery incomplete, so it
+    // never justifies forgetting an account; an incomplete registry is carried.
     let unsafe_dir = home_with(
         &scratch,
         "default-unsafe",
@@ -305,7 +308,7 @@ fn discovery_selects_one_login_per_account_and_proves_every_slot() {
     );
     let discovery = discover(
         vec![default_home(unsafe_dir)],
-        false,
+        true,
         &key,
         unix_seconds(now()),
     );
@@ -314,6 +317,64 @@ fn discovery_selects_one_login_per_account_and_proves_every_slot() {
     assert_eq!(
         discovery.skipped.get("sign_in_unreadable").copied(),
         Some(1)
+    );
+    let readable = home_with(
+        &scratch,
+        "default-readable",
+        Some(&signed_in(USER, WORKSPACE)),
+        0o600,
+    );
+    assert!(
+        !discover(
+            vec![default_home(readable)],
+            false,
+            &key,
+            unix_seconds(now())
+        )
+        .complete
+    );
+}
+
+/// [behaviour] The privacy controls reach the account a home is signed in
+/// to even while its token is being renewed; a missing or unsafe sign-in
+/// yields none.
+#[test]
+fn a_privacy_control_reaches_a_sign_in_whose_token_is_renewing() {
+    let scratch = crate::test_scratch::ScratchDir::canonical("pdr-control-scope");
+    let renewing = home_with(
+        &scratch,
+        "renewing",
+        Some(&auth(
+            &jwt(Some(USER), Some(WORKSPACE), expired()),
+            None,
+            WORKSPACE,
+        )),
+        0o600,
+    );
+    assert_eq!(
+        signed_in_account_scope(&default_home(renewing.clone())).as_deref(),
+        Some(WORKSPACE)
+    );
+    // Discovery reads nothing from it but keeps its label for status, so the
+    // controls can still be offered for it.
+    let key = b"fixture-grant-key".to_vec();
+    let discovery = discover(
+        vec![default_home(renewing)],
+        true,
+        &key,
+        unix_seconds(now()),
+    );
+    assert!(discovery.logins.is_empty());
+    assert_eq!(discovery.default_home.state, "sign_in_expired");
+    assert_eq!(
+        discovery.default_home.fingerprint,
+        Some(opaque_key(&key, WORKSPACE))
+    );
+    let unsafe_home = home_with(&scratch, "unsafe", Some(&signed_in(USER, WORKSPACE)), 0o644);
+    assert_eq!(signed_in_account_scope(&default_home(unsafe_home)), None);
+    assert_eq!(
+        signed_in_account_scope(&default_home(scratch.join("absent"))),
+        None
     );
 }
 
@@ -716,6 +777,33 @@ fn a_v1_grant_reads_only_the_covered_login() {
         .borrow()
         .iter()
         .all(|batch| batch.get("account_identity").is_none()));
+
+    // The covered account excluded: an uncovered live login never makes
+    // reading look permitted.
+    let covered = collector
+        .grants()
+        .account_fingerprint_for(ACCOUNT_SCOPE)
+        .expect("derive")
+        .expect("grant");
+    collector
+        .grants()
+        .set_account_excluded(&covered, true)
+        .expect("exclude");
+    let later = now() + TimeDuration::days(1);
+    collector.run_tick(
+        &runtime(),
+        &discovery,
+        &ForbiddenReader,
+        &ForbiddenTransport,
+        &move || later,
+    );
+    let status = status_with_live_binding(
+        collector.grants(),
+        collector_status(collector.grants(), false),
+        Some(INSTALLATION_ID),
+    );
+    assert_eq!(status.runtime_state, RuntimeState::AccountExcluded);
+    assert!(!status.provider_read_permitted);
 }
 
 /// [behaviour] Status reads the latest discovery, never a credential:
@@ -773,18 +861,55 @@ fn status_reports_every_discovered_account_from_state_only() {
             .collect::<Vec<_>>(),
         vec![(1, "default", "excluded"), (2, "slot", "ok")]
     );
-    let encoded = serde_json::to_string(&reported.accounts).expect("accounts json");
+    // The whole response: a pinned key set, and exactly one opaque label (the
+    // compatibility field). Formatted state and discovery name nothing either.
+    let response = serde_json::to_value(&reported).expect("status json");
+    let mut keys = response
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec![
+            "accounts",
+            "backend_create_pending",
+            "collector_id",
+            "current_account_excluded",
+            "current_account_fingerprint",
+            "grant_status",
+            "network_disabled",
+            "provider_read_permitted",
+            "reason_code",
+            "runtime_state",
+            "schema_version",
+            "source",
+        ]
+    );
+    let encoded = response.to_string();
+    assert_eq!(encoded.matches("hmac-sha256").count(), 1);
     let identity = expected_identity(USER, WORKSPACE);
-    for forbidden in [
-        "hmac-sha256",
-        SLOT_ID,
-        GRANT_ID,
-        ACCOUNT_SCOPE,
-        SECOND_WORKSPACE,
-        identity.account_identifier_hash.as_str(),
-        identity.provider_workspace_hash.as_str(),
-    ] {
-        assert!(!encoded.contains(forbidden), "{forbidden}");
+    let formatted = [
+        encoded,
+        format!("{:?}", collector.state.load_file()),
+        format!("{discovery:?}"),
+    ];
+    for text in &formatted {
+        for forbidden in [
+            SLOT_ID,
+            GRANT_ID,
+            ACCOUNT_SCOPE,
+            SECOND_WORKSPACE,
+            identity.account_identifier_hash.as_str(),
+            identity.provider_workspace_hash.as_str(),
+        ] {
+            assert!(!text.contains(forbidden), "{forbidden}: {text}");
+        }
+    }
+    for text in &formatted[1..] {
+        assert!(!text.contains("hmac-sha256"), "{text}");
     }
 
     // Every live account excluded.
@@ -795,6 +920,21 @@ fn status_reports_every_discovered_account_from_state_only() {
     let all_excluded = status();
     assert_eq!(all_excluded.runtime_state, RuntimeState::AccountExcluded);
     assert!(!all_excluded.provider_read_permitted);
+
+    // Signed out everywhere: nothing is read and the status says so.
+    let signed_out = now() + TimeDuration::hours(12);
+    let deferred = collector.run_tick(
+        &runtime(),
+        &discovered(&collector, Vec::new()),
+        &ForbiddenReader,
+        &ForbiddenTransport,
+        &move || signed_out,
+    );
+    assert_eq!(deferred.outcome, CycleOutcome::Deferred);
+    let gone = status();
+    assert_eq!(gone.reason_code, "no_live_codex_login");
+    assert!(gone.accounts.is_empty());
+    assert_eq!(gone.current_account_fingerprint, None);
 
     // No usable login: nothing is read and the status says so.
     let mut nobody = discovered(&collector, Vec::new());

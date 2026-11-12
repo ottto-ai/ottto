@@ -282,6 +282,15 @@ fn a_superseded_receipt_proves_nothing_for_another_login() {
     ));
     assert!(first.last_success_epoch_seconds > 0);
     assert!(first.proof.is_none());
+    let soon = now() + TimeDuration::minutes(30);
+    let quiet = collector.run_tick(
+        &runtime(),
+        &discovery,
+        &ForbiddenReader,
+        &ForbiddenTransport,
+        &move || soon,
+    );
+    assert_eq!(quiet.outcome, CycleOutcome::Noop, "next read at cadence");
 }
 
 /// What one owner case changes before the later tick.
