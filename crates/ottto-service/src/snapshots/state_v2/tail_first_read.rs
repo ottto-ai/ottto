@@ -105,7 +105,7 @@ pub(in crate::snapshots) struct Summary {
     pub(in crate::snapshots) anchor_at_ms: u64,
     pub(in crate::snapshots) certified_at_ms: Option<u64>,
     pub(in crate::snapshots) counts: Counts,
-    /// Enabled-source bitmask over `durable_sources::SOURCES` ordinals.
+    /// Enabled-source bitmask, one bit per source in wire (slug) order.
     pub(in crate::snapshots) sources_enabled: u64,
     pub(in crate::snapshots) done_at_ms: Option<u64>,
 }
@@ -292,11 +292,18 @@ pub(in crate::snapshots::state_v2) fn read_member(
         .ok_or_else(|| anyhow::anyhow!("state_v2_first_read_member"))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Fails the next member write inside its isolated block.
+    pub(in crate::snapshots) static FAIL_MEMBER_WRITE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
 /// One commit's view of the generation, from its first read of the summary.
 pub(super) struct Commit {
     /// The committed summary, or the one this commit creates.
     summary: Option<Summary>,
-    /// The summary as committed before this commit (N4 compares against it).
+    /// The summary as committed before this commit (writes compare against it).
     before: Option<Summary>,
     /// This commit creates the generation.
     creating: bool,
@@ -339,6 +346,10 @@ impl Commit {
         file: &[u8],
         observed: Observed,
     ) -> Result<Counts> {
+        #[cfg(test)]
+        if FAIL_MEMBER_WRITE.with(|fail| fail.replace(false)) {
+            anyhow::bail!("state_v2_first_read_member_injected");
+        }
         let mut counts = self.summary.map(|s| s.counts).unwrap_or_default();
         // An unreadable row is left as it is (it already counts, and the
         // freeze recount refuses it): it never rolls back the file's debt.
@@ -425,7 +436,7 @@ impl Commit {
                 return write_summary(tx, before, summary);
             };
             if recount == summary.counts {
-                let now_ms = super::super::super::sampled_scan::now_seconds().saturating_mul(1000);
+                let now_ms = super::super::super::sampled_scan::now_millis();
                 summary.done_at_ms = Some(now_ms.max(edit.floor_ms.map_or(0, |f| f + 1)));
                 clear_members(tx)?;
             } else {
@@ -442,7 +453,7 @@ impl Commit {
         write_summary(tx, before, summary)
     }
 }
-/// N4: the row is written only when it changes.
+/// The row is written only when it changes.
 fn write_summary(
     tx: &mut dyn Transaction,
     before: Option<Summary>,

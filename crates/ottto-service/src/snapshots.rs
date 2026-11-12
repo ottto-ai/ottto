@@ -218,6 +218,8 @@ pub(crate) use scan::durable_sources;
 #[cfg(test)]
 pub(crate) mod e2_pipeline_scan_fixture;
 #[cfg(test)]
+mod first_read_progress_tests;
+#[cfg(test)]
 mod held_audit_restore_tests;
 #[cfg(test)]
 mod resident_wave_tests;

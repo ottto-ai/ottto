@@ -92,7 +92,7 @@ fn member_and_summary_codecs_round_trip() {
     assert_eq!(Summary::decode(&summary.encode()), Some(summary));
 }
 
-/// D-A: the commit that creates the generation never freezes it, even when
+/// The commit that creates the generation never freezes it, even when
 /// its own page saw every member done and the walk certified; the next
 /// commit can. An empty inventory is the one exception.
 #[test]
@@ -132,7 +132,7 @@ fn creating_commit_never_freezes_except_an_empty_inventory() {
     assert_eq!(frozen.counts, Counts::default());
 }
 
-/// D-B: a new member whose isolated block rolled back is written failed
+/// A new member whose isolated block rolled back is written failed
 /// outside it, and that commit cannot freeze.
 #[test]
 fn rolled_back_new_member_is_failed_and_blocks_the_freeze() {
@@ -399,4 +399,38 @@ fn resolve_keeps_terminal_classes() {
     assert_eq!(resolve(Some(owed), gone).class, Class::Done);
     assert_eq!(resolve(Some(owed), gone).bytes, 10);
     assert_eq!(resolve(None, gone).class, Class::Owed);
+}
+
+/// Commits that only change counts (no certificate, no source mask, no
+/// freeze) save their totals: the summary always equals a recount.
+#[test]
+fn count_only_commits_save_their_totals() {
+    let mut store = db("first-read-count-only");
+    let mut tx = store.db.begin(TxnMode::Write).unwrap();
+    commit(
+        &mut tx,
+        Some(anchor(false)),
+        &[(b"/h/a.jsonl", observed(Class::Owed, 0, 10))],
+        &[],
+    );
+    commit(
+        &mut tx,
+        None,
+        &[(b"/h/b.jsonl", observed(Class::Held, 1, 20))],
+        &[],
+    );
+    assert_eq!(summary(&mut tx).counts, recount(&mut tx).unwrap());
+    commit(&mut tx, None, &[], &[b"/h/a.jsonl"]);
+    assert_eq!(summary(&mut tx).counts, recount(&mut tx).unwrap());
+    let mut generation = Commit::begin(&mut tx, None);
+    generation
+        .rolled_back(&mut tx, b"/h/c.jsonl", Some(observed(Class::Owed, 2, 5)))
+        .unwrap();
+    generation.finish(&mut tx, None).unwrap();
+    let counts = summary(&mut tx).counts;
+    assert_eq!(counts, recount(&mut tx).unwrap());
+    assert_eq!(
+        (counts.members, counts.held, counts.excluded, counts.failed),
+        (3, 1, 1, 1)
+    );
 }

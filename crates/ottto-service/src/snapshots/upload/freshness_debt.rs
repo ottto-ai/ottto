@@ -981,6 +981,11 @@ pub(crate) fn settle_first_read<'a>(
         first_read,
     };
     for key in keys.into_iter().collect::<BTreeSet<_>>() {
+        // Members only: a member was admitted in window, and a file that is
+        // not one keeps its debt as the listing staged it.
+        if !matches!(state_v2::first_read_member(index, key), Ok(Some(_))) {
+            continue;
+        }
         let path = Path::new(key);
         let Ok(metadata) = std::fs::metadata(path) else {
             continue;

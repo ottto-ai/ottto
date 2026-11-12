@@ -1467,7 +1467,11 @@ pub(super) fn apply(
             if result.is_err() {
                 applied.rolled_back += u64::from(staged.is_some());
                 rows.revert(closure);
-                failed = Some(SetAsideCause::Row);
+                // A key with no Tail write of its own (a member only) has
+                // nothing to re-read: it is not set aside.
+                if staged.is_some() || debt.is_some() {
+                    failed = Some(SetAsideCause::Row);
+                }
                 generation.rolled_back(rows.tx()?, file, member.copied())?;
             } else if let Some(counts) = counts {
                 generation.committed(counts);

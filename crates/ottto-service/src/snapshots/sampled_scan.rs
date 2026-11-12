@@ -489,6 +489,18 @@ pub(super) fn set_test_now(now: Option<u64>) {
     TEST_NOW.with(|clock| clock.set(now));
 }
 
+/// Wall-clock Unix milliseconds (the test clock's seconds when set).
+pub(super) fn now_millis() -> u64 {
+    #[cfg(test)]
+    if let Some(now) = TEST_NOW.with(std::cell::Cell::get) {
+        return now.saturating_mul(1000);
+    }
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or_default()
+}
+
 pub(super) fn now_seconds() -> u64 {
     #[cfg(test)]
     if let Some(now) = TEST_NOW.with(std::cell::Cell::get) {

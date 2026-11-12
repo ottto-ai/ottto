@@ -8853,6 +8853,9 @@ fn finish_sync_source(
     if state_v2_baseline.commit_tail().is_err() {
         eprintln!("local tail state commit deferred for {}", source.api_slug());
     }
+    // The exit commit can move or freeze the first read: the next report
+    // carries what committed, never the pre-commit totals.
+    crate::snapshots::note_first_read(&upload_destination_namespace, source, &index);
     // Maintenance is advisory: privacy deadlines alarm without failing an
     // otherwise committed collection cycle. Never print private engine errors.
     if crate::snapshots::maintain_state_v2_idle(

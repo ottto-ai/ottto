@@ -18,7 +18,7 @@ use crate::snapshots::state_v2::{
 };
 
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
-/// Coverage boundaries before the anchor, oldest first (D394: 60 days).
+/// Coverage boundaries before the anchor, oldest first (the first read is 60 days).
 const BOUNDARY_DAYS: [u64; 4] = [60, 30, 14, 7];
 
 /// The boundaries `anchor - {60, 30, 14, 7} days`, oldest first.
@@ -181,7 +181,7 @@ impl PageState {
         page
     }
 
-    /// Stage `key`'s member when it changes its committed row (N4).
+    /// Stage `key`'s member only when it changes its committed row.
     pub(in crate::snapshots) fn observe(
         &mut self,
         index: &ScanIndex,
@@ -297,8 +297,7 @@ pub(crate) fn first_read_block(
     namespace: &str,
     source: SnapshotSource,
 ) -> Option<crate::snapshot_client::FirstReadV1> {
-    let now_ms = sampled_scan::now_seconds().saturating_mul(1000);
-    blocks().block(namespace, source, now_ms)
+    blocks().block(namespace, source, sampled_scan::now_millis())
 }
 
 impl Blocks {
