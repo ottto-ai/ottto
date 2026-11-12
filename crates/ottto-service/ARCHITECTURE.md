@@ -415,7 +415,9 @@ each task's semantic digest and acknowledged head etag, scoped to destination
 and consent epoch. Fixed expiry permits safe re-offering; the server returns
 no-op for an exact repeat even after ACK loss or restart. The cache contains no
 task payloads or raw IDs and never enters local graph load/save or receipt
-settlement. Cloud failures and retry deadlines do not change local delivery.
+settlement. The file stays at `user_version` 1: its cloud tables are created
+if missing at open, and older builds open the file and ignore them. Cloud
+failures and retry deadlines do not change local delivery.
 
 ### Collector approval continuity
 
