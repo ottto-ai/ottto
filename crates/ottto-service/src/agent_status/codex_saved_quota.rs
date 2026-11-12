@@ -798,10 +798,9 @@ fn home_lock(home: &Path) -> Arc<Mutex<()>> {
 }
 
 /// Move the saved reading of a sign-in's staging home `from` to the slot
-/// home `to` its login just moved into. The rename kept the credential's
-/// metadata, which the reading's login witness names, so `to` serves the
-/// validated reading at once rather than its replaced login's. Call under
-/// `to`'s lock. Nothing is read from the provider.
+/// home `to` its login was just published into. The hard link kept the
+/// credential's metadata, which the reading's login witness names, so `to`
+/// serves the verified reading at once. Call under `to`'s lock.
 pub(crate) fn adopt_saved_codex_reading(from: &Path, to: &Path) {
     let support_dir = saved_quota_support_dir();
     let Some(mut saved) = read_saved_at(&support_dir, from) else {

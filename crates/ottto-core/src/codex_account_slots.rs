@@ -17,18 +17,15 @@ pub const CODEX_ACCOUNT_SLOT_SETTINGS_FILE_NAME: &str = "codex-account-slots.jso
 pub const CODEX_MANAGED_ACCOUNTS_DIR_NAME: &str = "codex-accounts";
 pub const MAX_CODEX_ACCOUNT_SLOTS: u8 = 10;
 pub const MAX_MANAGED_CODEX_ACCOUNT_SLOTS: usize = MAX_CODEX_ACCOUNT_SLOTS as usize - 1;
-/// The staging home of a sign-in into a registered slot, next to the slot's
-/// `home`. `codex login` revokes and deletes the login of the home it runs
-/// in before the browser opens, so a sign-in for a slot that may hold a
-/// login runs here, and the slot's credential is replaced only once the new
-/// login is accepted. Removed whenever the setup ends otherwise.
+/// `codex login` revokes and deletes the login of the home it runs in before
+/// the browser opens. A sign-in for a named account and workspace (prepare,
+/// prepare-target, reconnect, sign-in again) therefore runs in this staging
+/// home next to the slot's `home`. Only the verified login is published into
+/// the slot; the staging home is removed once the setup no longer signs in.
 const SIGN_IN_STAGING_DIR_NAME: &str = "sign-in";
-/// The accepted login inside the staging home, set aside under a name no
-/// `codex login` writes, between its acceptance and its move into the slot's
-/// home. Present while the setup is complete means the move is still due.
-const SEALED_LOGIN_FILE_NAME: &str = "accepted-auth.json";
-const PRE_STAGING_SETUP_MESSAGE: &str =
-    "Ottto was updated during this Codex sign-in, so it was stopped. Start it again.";
+/// The verified login, hard-linked into the slot's home under a name no
+/// `codex login` writes, between its check and its rename over `auth.json`.
+const PUBLISHING_LOGIN_FILE_NAME: &str = "ottto-verified-auth.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodexHomeTrust {
@@ -212,7 +209,6 @@ impl FileCodexAccountSlotSettingsStore {
 
     pub fn load(&self) -> Result<CodexAccountsStatusV1, CodexAccountSlotSettingsError> {
         self.recover_pending_deletions()?;
-        self.recover_staged_setup()?;
         let persisted = self.read_persisted()?;
         self.validate_persisted(&persisted)?;
         Ok(status_contract(&persisted))
@@ -289,8 +285,6 @@ impl FileCodexAccountSlotSettingsStore {
             ));
         }
         self.discard_pending_open_slot(&mut persisted)?;
-        self.settle_pending_adoption(&persisted)?;
-        self.discard_setup_staging_best_effort(&persisted);
 
         let (slot_id, home) = self.create_managed_slot_home()?;
         persisted.pending_open_slot_id = Some(slot_id.clone());
@@ -377,8 +371,6 @@ impl FileCodexAccountSlotSettingsStore {
         validate_setup_operation_id(&operation_id)?;
         validate_strong_hash(&expected_account_identifier_hash, "account")?;
         validate_strong_hash(&expected_workspace_identifier_hash, "workspace")?;
-        // A replay returns the stored setup: settle it first.
-        self.recover_staged_setup()?;
         let _transaction = self.transaction_lock()?;
         let mut persisted = self.read_persisted()?;
         self.validate_persisted(&persisted)?;
@@ -428,10 +420,8 @@ impl FileCodexAccountSlotSettingsStore {
         // An open setup that ended before adoption may still hold its
         // reservation; this setup replaces it, as `prepare_open_account` does.
         self.discard_pending_open_slot(&mut persisted)?;
-        self.settle_pending_adoption(&persisted)?;
-        self.discard_setup_staging_best_effort(&persisted);
         // The sign-in runs in a staging home: an existing slot's home is left
-        // as it is until the new login is accepted.
+        // as it is until the new login is verified.
         let (slot_id, home) = if let Some((slot_id, _)) = existing_slot {
             self.slot_home(&slot_id)?;
             let staging = self.fresh_sign_in_staging(&slot_id)?;
@@ -486,8 +476,6 @@ impl FileCodexAccountSlotSettingsStore {
         validate_opaque_slot_id(slot_id)?;
         validate_strong_hash(&expected_account_identifier_hash, "account")?;
         validate_strong_hash(&expected_workspace_identifier_hash, "workspace")?;
-        // A replay returns the stored setup: settle it first.
-        self.recover_staged_setup()?;
         let _transaction = self.transaction_lock()?;
         let mut persisted = self.read_persisted()?;
         self.validate_persisted(&persisted)?;
@@ -527,8 +515,6 @@ impl FileCodexAccountSlotSettingsStore {
         // An open setup that ended before adoption may still hold its
         // reservation; the reconnect replaces it, as `prepare_open_account` does.
         self.discard_pending_open_slot(&mut persisted)?;
-        self.settle_pending_adoption(&persisted)?;
-        self.discard_setup_staging_best_effort(&persisted);
         // The current login stays in the slot's home until the new one is
         // accepted: a stopped, failed or mismatched sign-in leaves it as is.
         let home = self.fresh_sign_in_staging(slot_id)?;
@@ -637,11 +623,7 @@ impl FileCodexAccountSlotSettingsStore {
             })?;
             // The wrong login goes with its staging home; a sign-in again
             // starts in a fresh one. The slot's own home was never touched.
-            let home = if setup_uses_staging(&persisted.setup_operation) {
-                self.fresh_sign_in_staging(&slot_id)?
-            } else {
-                self.slot_home(&slot_id)?
-            };
+            let home = self.fresh_sign_in_home(&persisted, &slot_id)?;
             persisted.setup_operation.launch_command = Some(codex_login_command(&home));
             persisted.setup_operation.message = Some(
                 "Signed-in Codex account or workspace does not match the selected target."
@@ -658,7 +640,6 @@ impl FileCodexAccountSlotSettingsStore {
                 // consume capacity.
                 self.discard_pending_open_slot(&mut persisted)?;
             }
-            self.discard_setup_staging_best_effort(&persisted);
         } else {
             persisted.setup_operation.launch_command = None;
             if is_open {
@@ -707,12 +688,11 @@ impl FileCodexAccountSlotSettingsStore {
         Ok(status_contract(&persisted))
     }
 
-    /// Accept the verified login. For a setup that signed in in a staging
-    /// home, `validated_login` is the mark of the staging `auth.json` the
-    /// verification read; only that file is adopted. It is set aside under a
-    /// private name, the slot's config takes the verified restriction, the
-    /// acceptance is written, and then the file replaces the slot's
-    /// `auth.json`; [`Self::load`] finishes a move a crash interrupted.
+    /// Accept the verified login. For a staged setup, `validated_login` is the
+    /// mark of the staging `auth.json` the verification read: only that file
+    /// is published into the slot (see [`publish_verified_login`]), before the
+    /// acceptance is written. A restart before that write verifies the staging
+    /// home again; after it, only the staging home's removal is left.
     pub fn complete_pinned_verification(
         &self,
         schema_version: u16,
@@ -725,14 +705,7 @@ impl FileCodexAccountSlotSettingsStore {
         validate_setup_operation_id(operation_id)?;
         validate_strong_hash(account_identifier_hash, "account")?;
         validate_strong_hash(workspace_identifier_hash, "workspace")?;
-        // Set once the accepted login was set aside; it moves once written.
-        let sealed = std::cell::Cell::new(false);
-        let move_sealed = |persisted: &PersistedCodexAccountSlotsV1| {
-            if sealed.get() {
-                self.finish_staged_adoption(persisted);
-            }
-        };
-        self.mutate_then(move_sealed, |persisted| {
+        self.mutate(|persisted| {
             require_setup_operation(persisted, operation_id)?;
             if persisted.setup_operation.state == CodexAccountSetupOperationStateV1::Complete {
                 return Ok(());
@@ -761,8 +734,6 @@ impl FileCodexAccountSlotSettingsStore {
                 })?
                 .to_string();
             if setup_uses_staging(&persisted.setup_operation) {
-                // The accepted login replaces the slot's. Its credential is
-                // checked by metadata only and never read.
                 let staging = self.sign_in_home(persisted, &slot_id)?;
                 let home = self.slot_home(&slot_id)?;
                 let validated = validated_login.ok_or_else(|| {
@@ -770,17 +741,11 @@ impl FileCodexAccountSlotSettingsStore {
                         "the verified Codex login was not named".to_string(),
                     )
                 })?;
-                seal_staged_login(&staging, validated).map_err(|error| {
+                publish_verified_login(&staging, &home, validated).map_err(|error| {
                     CodexAccountSlotSettingsError::State(format!(
-                        "set aside the verified Codex login: {error}"
+                        "publish the verified Codex login: {error}"
                     ))
                 })?;
-                copy_staged_config(&staging, &home).map_err(|error| {
-                    CodexAccountSlotSettingsError::State(format!(
-                        "restrict the Codex home to its workspace: {error}"
-                    ))
-                })?;
-                sealed.set(true);
             }
             persisted
                 .managed_bindings
@@ -809,9 +774,7 @@ impl FileCodexAccountSlotSettingsStore {
     ) -> Result<CodexAccountsStatusV1, CodexAccountSlotSettingsError> {
         validate_schema_version(schema_version)?;
         validate_setup_operation_id(operation_id)?;
-        let discard_staging =
-            |persisted: &PersistedCodexAccountSlotsV1| self.discard_ended_setup_staging(persisted);
-        self.mutate_then(discard_staging, |persisted| {
+        self.mutate(|persisted| {
             require_setup_operation(persisted, operation_id)?;
             // A late check of a setup that another check completed changes
             // nothing.
@@ -831,9 +794,7 @@ impl FileCodexAccountSlotSettingsStore {
         validate_schema_version(schema_version)?;
         validate_setup_operation_id(operation_id)?;
         let mut pending_open_to_discard: Option<String> = None;
-        let discard_staging =
-            |persisted: &PersistedCodexAccountSlotsV1| self.discard_ended_setup_staging(persisted);
-        let status = self.mutate_then(discard_staging, |persisted| {
+        let status = self.mutate(|persisted| {
             require_setup_operation(persisted, operation_id)?;
             pending_open_to_discard = stop_setup(
                 persisted,
@@ -859,9 +820,9 @@ impl FileCodexAccountSlotSettingsStore {
 
     /// Record the start of a daemon-run sign-in for the operation's managed
     /// home and return the home `codex login` runs in: a fresh staging home
-    /// for a registered slot, the reserved home for an open setup. Allowed
-    /// while the operation waits for sign-in or after an identity mismatch,
-    /// never for the default home.
+    /// for a named setup, else the slot's home. Allowed while the operation
+    /// waits for sign-in or after an identity mismatch, never for the default
+    /// home.
     /// `Ok(None)` when a run of this operation is active or has ended for
     /// good: the caller only reports status.
     pub fn begin_sign_in(
@@ -899,11 +860,7 @@ impl FileCodexAccountSlotSettingsStore {
                 "Codex setup operation has no durable connection slot".to_string(),
             )
         })?;
-        let home = if setup_uses_staging(&persisted.setup_operation) {
-            self.fresh_sign_in_staging(&slot_id)?
-        } else {
-            self.slot_home(&slot_id)?
-        };
+        let home = self.fresh_sign_in_home(&persisted, &slot_id)?;
         persisted.setup_operation.state = CodexAccountSetupOperationStateV1::WaitingForUserLogin;
         persisted.setup_operation.account_identifier_hash = None;
         persisted.setup_operation.workspace_identifier_hash = None;
@@ -1023,11 +980,7 @@ impl FileCodexAccountSlotSettingsStore {
     ) -> Result<CodexAccountsStatusV1, CodexAccountSlotSettingsError> {
         validate_setup_operation_id(operation_id)?;
         let mut pending_open_to_discard: Option<String> = None;
-        // A stopped or failed setup's staging home goes; a mismatch keeps its
-        // fresh one for the sign-in again.
-        let discard_staging =
-            |persisted: &PersistedCodexAccountSlotsV1| self.discard_ended_setup_staging(persisted);
-        let status = self.mutate_then(discard_staging, |persisted| {
+        let status = self.mutate(|persisted| {
             require_setup_operation(persisted, operation_id)?;
             if !sign_in_active(&persisted.setup_operation) {
                 return Err(CodexAccountSlotSettingsError::Invalid(
@@ -1158,10 +1111,9 @@ impl FileCodexAccountSlotSettingsStore {
     }
 
     /// The home a setup's account reads check for `slot_id`: where its
-    /// sign-in saved the new login. A registered slot's staging home while
-    /// its setup waits for a sign-in, validates it or offers a sign-in again
-    /// after a mismatch; else the slot's own home (an open setup's, or once
-    /// the setup ended: the accepted login is in the slot's home by then).
+    /// sign-in saved the new login: the staging home while a named setup of
+    /// this slot signs in, validates or offers a sign-in again (refused when
+    /// missing); else the slot's own home.
     pub fn setup_sign_in_home(
         &self,
         slot_id: &str,
@@ -1178,23 +1130,22 @@ impl FileCodexAccountSlotSettingsStore {
         slot_id: &str,
     ) -> Result<PathBuf, CodexAccountSlotSettingsError> {
         let home = self.slot_home(slot_id)?;
-        let signing_in = matches!(
-            persisted.setup_operation.state,
-            CodexAccountSetupOperationStateV1::WaitingForUserLogin
-                | CodexAccountSetupOperationStateV1::Validating
-                | CodexAccountSetupOperationStateV1::IdentityMismatch
-        );
-        if persisted.setup_operation.slot_id.as_deref() != Some(slot_id)
-            || !setup_uses_staging(&persisted.setup_operation)
-            || !signing_in
+        let operation = &persisted.setup_operation;
+        if operation.slot_id.as_deref() != Some(slot_id)
+            || !setup_uses_staging(operation)
+            || !signing_in(operation)
         {
             return Ok(home);
         }
-        let staging = self
-            .slot_root_unchecked(slot_id)?
-            .join(SIGN_IN_STAGING_DIR_NAME);
+        let staging = self.sign_in_staging(slot_id)?;
         verify_private_directory_descriptor(&staging)?;
         Ok(staging)
+    }
+
+    fn sign_in_staging(&self, slot_id: &str) -> Result<PathBuf, CodexAccountSlotSettingsError> {
+        Ok(self
+            .slot_root_unchecked(slot_id)?
+            .join(SIGN_IN_STAGING_DIR_NAME))
     }
 
     /// Replace the slot's staging home with an empty one carrying the
@@ -1204,172 +1155,37 @@ impl FileCodexAccountSlotSettingsStore {
         slot_id: &str,
     ) -> Result<PathBuf, CodexAccountSlotSettingsError> {
         self.discard_sign_in_staging(slot_id)?;
-        let staging = self
-            .slot_root_unchecked(slot_id)?
-            .join(SIGN_IN_STAGING_DIR_NAME);
+        let staging = self.sign_in_staging(slot_id)?;
         create_managed_slot_directory(&staging)?;
         write_codex_home_config(&staging, None)?;
         Ok(staging)
     }
 
+    /// Where a new sign-in of the recorded setup runs `codex login`: a fresh
+    /// staging home for a named setup (a previous attempt's login goes with
+    /// the old one), else the slot's (open) home.
+    fn fresh_sign_in_home(
+        &self,
+        persisted: &PersistedCodexAccountSlotsV1,
+        slot_id: &str,
+    ) -> Result<PathBuf, CodexAccountSlotSettingsError> {
+        if setup_uses_staging(&persisted.setup_operation) {
+            self.fresh_sign_in_staging(slot_id)
+        } else {
+            self.slot_home(slot_id)
+        }
+    }
+
     /// Remove the slot's staging home and whatever login it holds.
     fn discard_sign_in_staging(&self, slot_id: &str) -> Result<(), CodexAccountSlotSettingsError> {
-        validate_opaque_slot_id(slot_id)?;
-        // Owned by the person, not necessarily 0700: a `codex login` run by
-        // hand after a stop recreates it with its own mode.
-        match remove_private_child_tree_fd(
+        match remove_managed_slot_tree_fd(
             &self.slot_root_unchecked(slot_id)?,
             SIGN_IN_STAGING_DIR_NAME,
-            false,
         ) {
-            Ok(()) => Ok(()),
-            // A removed slot took its staging home with it.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(CodexAccountSlotSettingsError::State(format!(
-                "delete Codex sign-in staging home: {error}"
-            ))),
-        }
-    }
-
-    /// [`Self::discard_setup_staging`] for a setup the written settings show
-    /// stopped or failed.
-    fn discard_ended_setup_staging(&self, persisted: &PersistedCodexAccountSlotsV1) {
-        if matches!(
-            persisted.setup_operation.state,
-            CodexAccountSetupOperationStateV1::SetupStopped
-                | CodexAccountSetupOperationStateV1::SetupFailed
-        ) {
-            self.discard_setup_staging_best_effort(persisted);
-        }
-    }
-
-    /// [`Self::discard_setup_staging`] where a failure must not fail the
-    /// caller (a recorded end, or a new setup replacing an ended one): it
-    /// leaves an unused login in the slot's owner-only directory, which the
-    /// slot's next setup or its removal deletes.
-    fn discard_setup_staging_best_effort(&self, persisted: &PersistedCodexAccountSlotsV1) {
-        let _ = self.discard_setup_staging(persisted);
-    }
-
-    /// Move a completed setup's accepted login, set aside in its staging
-    /// home, into the slot's home, then remove the staging home. The staging
-    /// home stays while the move fails, so [`Self::load`] can finish it.
-    fn finish_staged_adoption(&self, persisted: &PersistedCodexAccountSlotsV1) {
-        let Some(slot_id) = persisted.setup_operation.slot_id.as_deref() else {
-            return;
-        };
-        let (Ok(root), Ok(home)) = (self.slot_root_unchecked(slot_id), self.slot_home(slot_id))
-        else {
-            return;
-        };
-        if move_sealed_login(&root.join(SIGN_IN_STAGING_DIR_NAME), &home).is_ok() {
-            let _ = self.discard_sign_in_staging(slot_id);
-        }
-    }
-
-    /// Before a new setup replaces a completed one: its accepted login, if
-    /// still set aside, must reach the slot's home, or the new setup is
-    /// refused (discarding the staging home would delete that login).
-    fn settle_pending_adoption(
-        &self,
-        persisted: &PersistedCodexAccountSlotsV1,
-    ) -> Result<(), CodexAccountSlotSettingsError> {
-        let operation = &persisted.setup_operation;
-        let Some(slot_id) = operation.slot_id.as_deref() else {
-            return Ok(());
-        };
-        if operation.state != CodexAccountSetupOperationStateV1::Complete
-            || !setup_uses_staging(operation)
-            || !persisted
-                .managed_slot_ids
-                .iter()
-                .any(|candidate| candidate == slot_id)
-        {
-            return Ok(());
-        }
-        let staging = self
-            .slot_root_unchecked(slot_id)?
-            .join(SIGN_IN_STAGING_DIR_NAME);
-        // Nothing set aside: the usual case, or a slot tree already gone.
-        if matches!(
-            fs::symlink_metadata(staging.join(SEALED_LOGIN_FILE_NAME)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound
-        ) {
-            return Ok(());
-        }
-        move_sealed_login(&staging, &self.slot_home(slot_id)?).map_err(|error| {
-            CodexAccountSlotSettingsError::State(format!(
-                "move the accepted Codex login into its home: {error}"
-            ))
-        })
-    }
-
-    /// Settle a setup's staging home after a restart or an upgrade: finish
-    /// the move of a completed setup's accepted login (or remove its leftover
-    /// staging home), and stop a named setup that waits for, or validates, a
-    /// sign-in but has no staging home. That setup began before sign-ins used
-    /// one: its launch command names the slot's own home, and running it
-    /// would sign the slot out.
-    fn recover_staged_setup(&self) -> Result<(), CodexAccountSlotSettingsError> {
-        if !self.staged_setup_needs_recovery(&self.read_persisted()?) {
-            return Ok(());
-        }
-        let _transaction = self.transaction_lock()?;
-        let mut persisted = self.read_persisted()?;
-        self.validate_persisted(&persisted)?;
-        if !self.staged_setup_needs_recovery(&persisted) {
-            return Ok(());
-        }
-        if persisted.setup_operation.state == CodexAccountSetupOperationStateV1::Complete {
-            self.finish_staged_adoption(&persisted);
-            return Ok(());
-        }
-        stop_setup(&mut persisted, PRE_STAGING_SETUP_MESSAGE);
-        persisted.sign_in_baseline = None;
-        if let Some(sign_in) = persisted.setup_operation.sign_in.as_mut() {
-            if sign_in.phase != CodexAccountSignInPhaseV1::Done {
-                sign_in.phase = CodexAccountSignInPhaseV1::Done;
-                sign_in.outcome = Some(CodexAccountSignInOutcomeV1::Interrupted);
-                sign_in.sign_in_url = None;
-            }
-        }
-        self.write_persisted(&persisted)
-    }
-
-    fn staged_setup_needs_recovery(&self, persisted: &PersistedCodexAccountSlotsV1) -> bool {
-        let operation = &persisted.setup_operation;
-        let Some(slot_id) = operation.slot_id.as_deref() else {
-            return false;
-        };
-        if !setup_uses_staging(operation)
-            || !persisted
-                .managed_slot_ids
-                .iter()
-                .any(|candidate| candidate == slot_id)
-        {
-            return false;
-        }
-        let Ok(root) = self.slot_root_unchecked(slot_id) else {
-            return false;
-        };
-        let staging_exists = fs::symlink_metadata(root.join(SIGN_IN_STAGING_DIR_NAME)).is_ok();
-        match operation.state {
-            CodexAccountSetupOperationStateV1::Complete => staging_exists,
-            CodexAccountSetupOperationStateV1::WaitingForUserLogin
-            | CodexAccountSetupOperationStateV1::Validating
-            | CodexAccountSetupOperationStateV1::IdentityMismatch => !staging_exists,
-            _ => false,
-        }
-    }
-
-    /// Remove the staging home of the recorded setup, if it uses one.
-    fn discard_setup_staging(
-        &self,
-        persisted: &PersistedCodexAccountSlotsV1,
-    ) -> Result<(), CodexAccountSlotSettingsError> {
-        match persisted.setup_operation.slot_id.as_deref() {
-            Some(slot_id) if setup_uses_staging(&persisted.setup_operation) => {
-                self.discard_sign_in_staging(slot_id)
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                Err(CodexAccountSlotSettingsError::State(format!(
+                    "delete Codex sign-in staging home: {error}"
+                )))
             }
             _ => Ok(()),
         }
@@ -1421,25 +1237,12 @@ impl FileCodexAccountSlotSettingsStore {
             &mut PersistedCodexAccountSlotsV1,
         ) -> Result<(), CodexAccountSlotSettingsError>,
     ) -> Result<CodexAccountsStatusV1, CodexAccountSlotSettingsError> {
-        self.mutate_then(|_| {}, change)
-    }
-
-    /// [`Self::mutate`], then `after` on the written settings, still under
-    /// the transaction lock, so no other setup starts in between.
-    fn mutate_then(
-        &self,
-        after: impl FnOnce(&PersistedCodexAccountSlotsV1),
-        change: impl FnOnce(
-            &mut PersistedCodexAccountSlotsV1,
-        ) -> Result<(), CodexAccountSlotSettingsError>,
-    ) -> Result<CodexAccountsStatusV1, CodexAccountSlotSettingsError> {
         let _transaction = self.transaction_lock()?;
         let mut persisted = self.read_persisted()?;
         self.validate_persisted(&persisted)?;
         change(&mut persisted)?;
         self.validate_persisted(&persisted)?;
         self.write_persisted(&persisted)?;
-        after(&persisted);
         Ok(status_contract(&persisted))
     }
 
@@ -1492,7 +1295,20 @@ impl FileCodexAccountSlotSettingsStore {
         })?;
         crate::write_owner_only_file_atomic(&self.path, &body).map_err(|error| {
             CodexAccountSlotSettingsError::State(format!("write settings: {error}"))
-        })
+        })?;
+        // A setup that no longer signs in needs no staging home: remove it once
+        // that is durable, still under the transaction lock. A failure leaves
+        // it for the slot's next sign-in or removal.
+        match persisted.setup_operation.slot_id.as_deref() {
+            Some(slot_id)
+                if setup_uses_staging(&persisted.setup_operation)
+                    && !signing_in(&persisted.setup_operation) =>
+            {
+                let _ = self.discard_sign_in_staging(slot_id);
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     fn validate_persisted(
@@ -1771,23 +1587,11 @@ fn finalize_managed_slot_deletion(persisted: &mut PersistedCodexAccountSlotsV1, 
 
 #[cfg(unix)]
 fn remove_managed_slot_tree_fd(managed_root: &Path, slot_id: &str) -> std::io::Result<()> {
-    remove_private_child_tree_fd(managed_root, slot_id, true)
-}
-
-/// Remove the directory `name` below the private `parent` and everything in
-/// it, never following a symlink: the directory must be the owner's, and
-/// mode 0700 when `require_private_mode`. A missing `name` is no error.
-#[cfg(unix)]
-fn remove_private_child_tree_fd(
-    parent: &Path,
-    name: &str,
-    require_private_mode: bool,
-) -> std::io::Result<()> {
     use std::ffi::CString;
     use std::os::fd::{AsRawFd, FromRawFd};
 
-    let parent = open_private_directory_chain(parent)?;
-    let name = CString::new(name).expect("validated directory name");
+    let parent = open_private_directory_chain(managed_root)?;
+    let name = CString::new(slot_id).expect("validated opaque slot id");
     let root_fd = unsafe {
         libc::openat(
             parent.as_raw_fd(),
@@ -1811,7 +1615,7 @@ fn remove_private_child_tree_fd(
     let opened_stat = unsafe { opened_stat.assume_init() };
     if opened_stat.st_mode & libc::S_IFMT != libc::S_IFDIR
         || opened_stat.st_uid != unsafe { libc::geteuid() }
-        || (require_private_mode && opened_stat.st_mode & 0o777 != 0o700)
+        || opened_stat.st_mode & 0o777 != 0o700
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -1919,113 +1723,60 @@ fn remove_managed_slot_tree_fd(managed_root: &Path, slot_id: &str) -> std::io::R
     fs::remove_dir_all(managed_root.join(slot_id))
 }
 
-#[cfg(not(unix))]
-fn remove_private_child_tree_fd(
-    parent: &Path,
-    name: &str,
-    _require_private_mode: bool,
-) -> std::io::Result<()> {
-    match fs::remove_dir_all(parent.join(name)) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        result => result,
-    }
-}
-
-/// Whether the setup's sign-in runs in a staging home: a setup for a named
-/// account and workspace (prepare, prepare-target, reconnect) targets a
-/// registered slot whose home may hold a login. An open setup's reserved
-/// home is new and empty, so its sign-in runs there.
+/// Whether the setup is for a named account and workspace, whose sign-in runs
+/// in a staging home. An open setup's reserved home is new and empty.
 fn setup_uses_staging(operation: &CodexAccountSetupOperationV1) -> bool {
     operation.slot_id.is_some() && operation.expected_account_identifier_hash.is_some()
 }
 
-/// Set the staging home's `auth.json` aside under [`SEALED_LOGIN_FILE_NAME`],
-/// a name `codex login` never writes, and keep it only when it is the file
-/// the verification read: the same `validated` mark (inode, size, modified
-/// time), a regular file of the owner, mode 0600. Any other is deleted and
-/// refused. Checked by metadata only; never read.
-fn seal_staged_login(staging: &Path, validated: CodexAuthFileMark) -> std::io::Result<()> {
-    verify_private_directory_descriptor(staging).map_err(std::io::Error::other)?;
-    let sealed = staging.join(SEALED_LOGIN_FILE_NAME);
-    fs::rename(staging.join("auth.json"), &sealed)?;
-    let metadata = fs::symlink_metadata(&sealed)?;
-    #[cfg(unix)]
-    let owned_0600 = {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        metadata.uid() == unsafe { libc::geteuid() }
-            && metadata.permissions().mode() & 0o777 == 0o600
-    };
-    #[cfg(not(unix))]
-    let owned_0600 = true;
-    if !metadata.file_type().is_file() || !owned_0600 || codex_file_mark(&sealed) != Some(validated)
-    {
-        let _ = fs::remove_file(&sealed);
+/// Whether the setup still signs in, validates a sign-in, or offers a sign-in
+/// again: the states that read its staging home.
+fn signing_in(operation: &CodexAccountSetupOperationV1) -> bool {
+    use CodexAccountSetupOperationStateV1 as State;
+    match operation.state {
+        State::WaitingForUserLogin | State::Validating | State::IdentityMismatch => true,
+        State::Idle
+        | State::Complete
+        | State::SetupStopped
+        | State::SetupFailed
+        | State::DuplicateAccount => false,
+    }
+}
+
+/// Publish the verified login of the staging home into the slot's `home`:
+/// copy its `config.toml` (the verified restriction; no credential), then
+/// hard-link its `auth.json` into `home` under [`PUBLISHING_LOGIN_FILE_NAME`]
+/// and keep that link only if it is the file the check read (`validated`:
+/// inode, size, modified time), then rename it over the slot's `auth.json`.
+/// The staging copy stays until the acceptance is written. The credential is
+/// never read.
+fn publish_verified_login(
+    staging: &Path,
+    home: &Path,
+    validated: CodexAuthFileMark,
+) -> std::io::Result<()> {
+    let config =
+        read_codex_config_file_secure(staging, CodexHomeTrust::Managed)?.ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "the Codex config is missing")
+        })?;
+    write_owner_only_file_at(home, "config.toml", &config)?;
+    let publishing = home.join(PUBLISHING_LOGIN_FILE_NAME);
+    let _ = fs::remove_file(&publishing);
+    fs::hard_link(staging.join("auth.json"), &publishing)?;
+    if codex_file_mark(&publishing) != Some(validated) {
+        let _ = fs::remove_file(&publishing);
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "the Codex login changed after it was verified",
         ));
     }
+    fs::rename(&publishing, home.join("auth.json"))?;
+    // A rename onto another link of the same file (a repeated publication)
+    // leaves the name in place.
+    let _ = fs::remove_file(&publishing);
+    #[cfg(unix)]
+    fs::File::open(home)?.sync_all()?;
     Ok(())
-}
-
-/// Copy the staging home's `config.toml` (the verified workspace
-/// restriction; no credential) over the slot home's. Repeatable.
-fn copy_staged_config(staging: &Path, home: &Path) -> std::io::Result<()> {
-    let body =
-        read_codex_config_file_secure(staging, CodexHomeTrust::Managed)?.ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "the verified Codex config is missing",
-            )
-        })?;
-    write_owner_only_file_at(home, "config.toml", &body)
-}
-
-/// Rename the set-aside accepted login over the slot home's `auth.json`. A
-/// staging home without one (already moved) is no error.
-#[cfg(unix)]
-fn move_sealed_login(staging: &Path, home: &Path) -> std::io::Result<()> {
-    use std::ffi::CString;
-    use std::os::fd::AsRawFd;
-
-    if let Err(error) = fs::symlink_metadata(staging.join(SEALED_LOGIN_FILE_NAME)) {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            return Ok(());
-        }
-    }
-    let from = match open_private_directory_chain(staging) {
-        Ok(from) => from,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
-    };
-    let to = open_private_directory_chain(home)?;
-    let sealed = CString::new(SEALED_LOGIN_FILE_NAME).expect("static Codex file name");
-    let auth = CString::new("auth.json").expect("static Codex file name");
-    if unsafe {
-        libc::renameat(
-            from.as_raw_fd(),
-            sealed.as_ptr(),
-            to.as_raw_fd(),
-            auth.as_ptr(),
-        )
-    } != 0
-    {
-        let error = std::io::Error::last_os_error();
-        return if error.kind() == std::io::ErrorKind::NotFound {
-            Ok(())
-        } else {
-            Err(error)
-        };
-    }
-    to.sync_all()
-}
-
-#[cfg(not(unix))]
-fn move_sealed_login(staging: &Path, home: &Path) -> std::io::Result<()> {
-    match fs::rename(staging.join(SEALED_LOGIN_FILE_NAME), home.join("auth.json")) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        result => result,
-    }
 }
 
 /// Whether the operation has a daemon-run sign-in that has not ended.
@@ -3463,199 +3214,6 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    /// A reconnected slot holding a synthetic login, and a new reconnect of
-    /// it waiting for its sign-in. Returns the slot's home and the reconnect.
-    fn reconnect_waiting(store: &FileCodexAccountSlotSettingsStore) -> (PathBuf, String) {
-        let slot_id = complete_a_reconnect(store);
-        let operation = format!("codex_setup_{}", "3".repeat(32));
-        store
-            .begin_reconnect(
-                CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
-                operation.clone(),
-                &slot_id,
-                "d".repeat(64),
-                "e".repeat(64),
-            )
-            .expect("begin reconnect");
-        (store.slot_home(&slot_id).expect("home"), operation)
-    }
-
-    fn set_mode(path: &Path, mode: u32) {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("mode");
-        }
-        #[cfg(not(unix))]
-        let _ = (path, mode);
-    }
-
-    #[test]
-    fn a_reconnect_prepared_before_staging_homes_is_stopped_after_the_update() {
-        let (root, store) = test_store("pre-staging-update");
-        let (home, operation) = reconnect_waiting(&store);
-        let login = fs::read(home.join("auth.json")).expect("slot login");
-        let slot_id = store
-            .setup_operation(&operation)
-            .expect("setup")
-            .slot_id
-            .expect("slot");
-        let staging = store.setup_sign_in_home(&slot_id).expect("staging");
-        assert_ne!(staging, home);
-        // The previous version prepared this reconnect: no staging home, and
-        // a launch command naming the slot's own home.
-        fs::remove_dir_all(&staging).expect("no staging home");
-
-        let status = store.load().expect("load");
-        assert_eq!(
-            status.setup_operation.state,
-            CodexAccountSetupOperationStateV1::SetupStopped
-        );
-        assert!(status.setup_operation.launch_command.is_none());
-        assert_eq!(
-            status.setup_operation.message.as_deref(),
-            Some(PRE_STAGING_SETUP_MESSAGE)
-        );
-        let replay = store
-            .begin_reconnect(
-                CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
-                operation.clone(),
-                &slot_id,
-                "d".repeat(64),
-                "e".repeat(64),
-            )
-            .expect("replay");
-        assert!(replay.setup_operation.launch_command.is_none());
-        assert!(store.registered_bindings().expect("bindings")[0].accepted);
-        assert_eq!(fs::read(home.join("auth.json")).expect("kept login"), login);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn a_login_replaced_after_its_verification_is_refused() {
-        let (root, store) = test_store("replaced-login");
-        let (home, operation) = reconnect_waiting(&store);
-        let login = fs::read(home.join("auth.json")).expect("slot login");
-        store
-            .finish_validation(
-                CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
-                &operation,
-                "d".repeat(64),
-                "e".repeat(64),
-                "raw-workspace-reconnected",
-                false,
-            )
-            .expect("pin");
-        let staging = stage_synthetic_login(&store, &operation);
-        let verified = staged_mark(&store, &operation);
-        assert!(verified.is_some());
-        // Another sign-in replaces the verified login before it is adopted.
-        fs::remove_file(staging.join("auth.json")).expect("drop verified login");
-        fs::write(staging.join("auth.json"), b"{\"synthetic\":\"other\"}").expect("replacement");
-        set_mode(&staging.join("auth.json"), 0o600);
-        assert_ne!(staged_mark(&store, &operation), verified);
-
-        let error = store
-            .complete_pinned_verification(
-                CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
-                &operation,
-                &"d".repeat(64),
-                &"e".repeat(64),
-                verified,
-            )
-            .expect_err("a replaced login is refused");
-        assert!(format!("{error}").contains("changed after it was verified"));
-        assert_eq!(fs::read(home.join("auth.json")).expect("kept login"), login);
-        assert!(!staging.join("auth.json").exists());
-        assert!(!staging.join(SEALED_LOGIN_FILE_NAME).exists());
-        assert_ne!(
-            store.setup_operation(&operation).expect("setup").state,
-            CodexAccountSetupOperationStateV1::Complete
-        );
-        assert!(store.registered_bindings().expect("bindings")[0].accepted);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn an_accepted_login_a_crash_left_aside_moves_before_anything_else() {
-        let (root, store) = test_store("adoption-roll-forward");
-        let slot_id = complete_a_reconnect(&store);
-        let home = store.slot_home(&slot_id).expect("home");
-        // A crash after the acceptance was written, before its login moved.
-        let staging = home
-            .parent()
-            .expect("slot root")
-            .join(SIGN_IN_STAGING_DIR_NAME);
-        fs::create_dir(&staging).expect("staging home");
-        set_mode(&staging, 0o700);
-        let sealed = staging.join(SEALED_LOGIN_FILE_NAME);
-        fs::write(&sealed, b"{\"synthetic\":\"set-aside\"}").expect("set-aside login");
-        set_mode(&sealed, 0o600);
-
-        let status = store.load().expect("load");
-        assert_eq!(
-            status.setup_operation.state,
-            CodexAccountSetupOperationStateV1::Complete
-        );
-        assert_eq!(
-            fs::read(home.join("auth.json")).expect("moved login"),
-            b"{\"synthetic\":\"set-aside\"}"
-        );
-        assert!(!staging.exists(), "staging home removed");
-
-        // A new setup moves a set-aside login first, never deletes it.
-        fs::create_dir(&staging).expect("staging home");
-        set_mode(&staging, 0o700);
-        fs::write(&sealed, b"{\"synthetic\":\"set-aside-again\"}").expect("set-aside login");
-        set_mode(&sealed, 0o600);
-        store
-            .prepare_open_account(
-                CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
-                format!("codex_setup_{}", "4".repeat(32)),
-            )
-            .expect("next setup");
-        assert_eq!(
-            fs::read(home.join("auth.json")).expect("moved login"),
-            b"{\"synthetic\":\"set-aside-again\"}"
-        );
-        assert!(!staging.exists(), "staging home removed");
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn a_late_check_does_not_undo_a_completed_setup() {
-        let (root, store) = test_store("late-check");
-        complete_a_reconnect(&store);
-        let reconnect = format!("codex_setup_{}", "2".repeat(32));
-        let failed = store
-            .fail_validation(
-                CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
-                &reconnect,
-                "late check",
-            )
-            .expect("late failure");
-        assert_eq!(
-            failed.setup_operation.state,
-            CodexAccountSetupOperationStateV1::Complete
-        );
-        let mismatched = store
-            .finish_validation(
-                CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
-                &reconnect,
-                "9".repeat(64),
-                "8".repeat(64),
-                "raw-other-workspace",
-                false,
-            )
-            .expect("late result");
-        assert_eq!(
-            mismatched.setup_operation.state,
-            CodexAccountSetupOperationStateV1::Complete
-        );
-        assert!(store.registered_bindings().expect("bindings")[0].accepted);
-        let _ = fs::remove_dir_all(root);
-    }
-
     #[test]
     fn managed_removal_deletes_only_managed_home_and_preserves_default_bytes() {
         let (root, store) = test_store("complete");
@@ -4142,5 +3700,68 @@ mod tests {
         );
         assert!(store.active_sign_in().expect("read").is_none());
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// Sign-ins for a named account and workspace run in a staging home and
+    /// publish only the verified login into the slot.
+    mod staging_sign_in {
+        use super::*;
+
+        /// [behaviour] A login replaced in the staging home after its check is
+        /// never published: the slot keeps its login and the setup is not
+        /// accepted.
+        #[test]
+        fn a_login_replaced_after_its_verification_is_not_published() {
+            let (root, store) = test_store("replaced-login");
+            let slot_id = complete_a_reconnect(&store);
+            let home = store.slot_home(&slot_id).expect("home");
+            let login = fs::read(home.join("auth.json")).expect("slot login");
+            let operation = format!("codex_setup_{}", "3".repeat(32));
+            store
+                .begin_reconnect(
+                    CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
+                    operation.clone(),
+                    &slot_id,
+                    "d".repeat(64),
+                    "e".repeat(64),
+                )
+                .expect("begin reconnect");
+            store
+                .finish_validation(
+                    CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
+                    &operation,
+                    "d".repeat(64),
+                    "e".repeat(64),
+                    "raw-workspace-reconnected",
+                    false,
+                )
+                .expect("pin");
+            let staging = stage_synthetic_login(&store, &operation);
+            let verified = staged_mark(&store, &operation);
+            assert!(verified.is_some());
+            // Another sign-in replaces the verified login before publication.
+            fs::remove_file(staging.join("auth.json")).expect("drop verified login");
+            fs::write(staging.join("auth.json"), b"{\"synthetic\":\"other\"}")
+                .expect("replacement");
+
+            let error = store
+                .complete_pinned_verification(
+                    CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
+                    &operation,
+                    &"d".repeat(64),
+                    &"e".repeat(64),
+                    verified,
+                )
+                .expect_err("a replaced login is refused");
+            assert!(format!("{error}").contains("changed after it was verified"));
+            assert_eq!(fs::read(home.join("auth.json")).expect("kept login"), login);
+            assert!(!home.join(PUBLISHING_LOGIN_FILE_NAME).exists());
+            assert_eq!(
+                store.setup_operation(&operation).expect("setup").state,
+                CodexAccountSetupOperationStateV1::Validating
+            );
+            assert!(store.registered_bindings().expect("bindings")[0].accepted);
+            let _ = fs::remove_dir_all(root);
+        }
     }
 }

@@ -4,14 +4,9 @@
 //! prepare-target or reconnect), `codex_account_start_sign_in` runs
 //! `codex login` for it: no terminal, stdin closed, its own `CODEX_HOME`, and
 //! the same binary, PATH and clean environment as the home's quota reads.
-//! `codex login` revokes and deletes the login of the home it runs in before
-//! the browser opens, and a stop cannot undo that. So it never runs in a home
-//! that may hold a login: a registered slot (prepare, prepare-target,
-//! reconnect, or a sign-in again after a mismatch) signs in in a fresh
-//! staging home next to the slot's, and only an accepted login moves into
-//! the slot's home; a stop, timeout, failure or mismatch deletes the staging
-//! home and leaves the slot's login as it was. An open setup's reserved home
-//! is new and empty, so its sign-in runs there. The CLI opens the sign-in
+//! A named setup's home is its slot's staging home (see
+//! `ottto_core::codex_account_slots`), so the slot's login survives a stop,
+//! timeout, failure or mismatch. The CLI opens the sign-in
 //! page in the default browser and waits on a local callback port. The
 //! daemon:
 //! - starts at most one sign-in at a time. Every `codex login` on the Mac
@@ -39,8 +34,7 @@
 //!
 //! The browser sign-in is the person's, not a provider call of ours; the call
 //! log records the account reads only (trigger `setup`). Never used for the
-//! person's own `~/.codex`: setup operations only name managed homes. Codex
-//! only: Claude sign-ins do not use this module.
+//! person's own `~/.codex`: setup operations only name managed homes.
 //!
 //! The CLI stays in the daemon's process group, so the service manager ends
 //! it with the daemon. A stop ends the CLI's own child processes too: the

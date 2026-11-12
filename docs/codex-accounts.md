@@ -112,19 +112,16 @@ runs in (`CODEX_HOME`, by default `~/.codex`) before the browser opens, even if
 the sign-in is then cancelled. Never run a plain `codex login`; use the launch
 command, which always names an Ottto-managed home.
 
-So a sign-in for an existing connection (prepare or prepare-target of an
-existing slot, reconnect, or a sign-in again after a mismatch) runs in a fresh
-staging home next to that connection's home, and the launch command names the
-staging home. Setup checks read the staging home. Only an accepted login moves
-into the connection's home: only the `auth.json` the final check read is set
-aside, its `config.toml` is copied, the acceptance is saved, and then that
-`auth.json` is renamed in place of the old one (a restart finishes an
-interrupted move). A login replaced after the check is refused. A setup begun
-by an earlier Ottto version without a staging home is stopped after the
-update. A stopped, timed-out, failed, duplicate or
-mismatched sign-in deletes the staging home and leaves the connection's
-existing login and identity as they were. A new connection ("connect another
-workspace") signs in in its own new, empty home.
+So a sign-in for a named account and workspace (prepare, prepare-target,
+reconnect, or a sign-in again after a mismatch) runs in a fresh staging home
+next to that connection's home, and the launch command names the staging home.
+Setup checks read the staging home. Once the final check passes, only the
+`auth.json` it read (with the verified `config.toml`) is published into the
+connection's home, and then the acceptance is saved; a login replaced after the
+check is refused. A stopped, timed-out, failed, duplicate or mismatched sign-in
+deletes the staging home and leaves the connection's existing login and
+identity as they were. A new connection ("connect another workspace") signs in
+in its own new, empty home.
 
 While the provider-owned browser flow is open, Companion polls a nonterminal
 setup check. An incomplete sign-in stays `waiting_for_user_login`; it is not
