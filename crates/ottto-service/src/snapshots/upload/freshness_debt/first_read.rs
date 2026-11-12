@@ -298,24 +298,34 @@ pub(crate) fn first_read_block(
     source: SnapshotSource,
 ) -> Option<crate::snapshot_client::FirstReadV1> {
     let now_ms = sampled_scan::now_seconds().saturating_mul(1000);
-    let mut state = blocks();
-    if state.namespace != namespace {
-        return None;
-    }
-    let summary = *state.summaries.get(source.api_slug())?;
-    let (computed_ms, mask) = match summary.done_at_ms {
-        Some(done_at_ms) => (done_at_ms, summary.sources_enabled),
-        None => {
-            let floor = state
-                .last_sent
-                .get(source.api_slug())
-                .map_or(0, |sent| sent.saturating_add(1));
-            let at = now_ms.max(floor).max(summary.anchor_at_ms);
-            state.last_sent.insert(source.api_slug(), at);
-            (at, state.sources.unwrap_or(summary.sources_enabled))
+    blocks().block(namespace, source, now_ms)
+}
+
+impl Blocks {
+    fn block(
+        &mut self,
+        namespace: &str,
+        source: SnapshotSource,
+        now_ms: u64,
+    ) -> Option<crate::snapshot_client::FirstReadV1> {
+        if self.namespace != namespace {
+            return None;
         }
-    };
-    Some(block(&summary, computed_ms, mask | bit(source)))
+        let summary = *self.summaries.get(source.api_slug())?;
+        let (computed_ms, mask) = match summary.done_at_ms {
+            Some(done_at_ms) => (done_at_ms, summary.sources_enabled),
+            None => {
+                let floor = self
+                    .last_sent
+                    .get(source.api_slug())
+                    .map_or(0, |sent| sent.saturating_add(1));
+                let at = now_ms.max(floor).max(summary.anchor_at_ms);
+                self.last_sent.insert(source.api_slug(), at);
+                (at, self.sources.unwrap_or(summary.sources_enabled))
+            }
+        };
+        Some(block(&summary, computed_ms, mask | bit(source)))
+    }
 }
 
 /// The V1 block of `summary` computed at `computed_ms` with `mask`.

@@ -154,6 +154,10 @@ impl Counts {
             step(&mut self.obstruct[usize::from(member.bucket)], 1);
         }
     }
+    #[cfg(test)]
+    pub(in crate::snapshots) fn add_for_test(&mut self, member: Member) {
+        self.tally(member, true);
+    }
     fn replace(&mut self, old: Option<Member>, new: Member) {
         if let Some(old) = old {
             self.tally(old, false);
@@ -492,3 +496,7 @@ pub(super) fn carried(tx: &mut dyn Transaction, from: &[u8], to: &[u8]) -> Resul
     }
     move_row(tx, &old, member_row(to)?)
 }
+
+#[cfg(test)]
+#[path = "tail_first_read_tests.rs"]
+mod tests;
