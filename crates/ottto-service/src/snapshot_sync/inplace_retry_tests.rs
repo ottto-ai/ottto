@@ -560,18 +560,34 @@ fn cursor_and_lock_shed_codes_are_retried_in_place_through_the_client() {
 
 // --- T4: one real Claude prepare/finish cycle against a loopback backend ---
 
+/// How the loopback backend answers snapshot batch POSTs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BatchFault {
+    /// Every batch is accepted.
+    None,
+    /// The first batch POST is answered `503` with `Retry-After: 1`, the
+    /// cursor-allocation class.
+    FirstShedRetryAfterOne,
+    /// Every batch: a plain `503` with no `Retry-After` and no named item.
+    PlainShed,
+    /// Every batch: HTTP `500`.
+    ServerError,
+    /// Every batch: the connection closes with no response.
+    Dropped,
+}
+
 struct InplaceRetryServer {
     url: String,
     stop: Arc<std::sync::atomic::AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
-    batch_posts: Arc<Mutex<Vec<Vec<String>>>>,
+    /// Every batch POST's snapshots, in order, across every cycle.
+    batch_posts: Arc<Mutex<Vec<Vec<serde_json::Value>>>>,
+    fault: Arc<Mutex<BatchFault>>,
     terminal: Arc<Mutex<Vec<serde_json::Value>>>,
 }
 
 impl InplaceRetryServer {
-    /// Accepts every snapshot. With `shed_first_batch`, the first batch POST
-    /// is answered `503` with `Retry-After: 1`, the cursor-allocation class.
-    fn new(shed_first_batch: bool) -> Self {
+    fn new(fault: BatchFault) -> Self {
         use std::sync::atomic::{AtomicBool, Ordering};
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -580,6 +596,8 @@ impl InplaceRetryServer {
         let done = stop.clone();
         let batch_posts = Arc::new(Mutex::new(Vec::new()));
         let posts = batch_posts.clone();
+        let fault = Arc::new(Mutex::new(fault));
+        let faults = fault.clone();
         let terminal = Arc::new(Mutex::new(Vec::new()));
         let statuses = terminal.clone();
         let worker = std::thread::spawn(move || {
@@ -611,20 +629,28 @@ impl InplaceRetryServer {
                 } else if request.contains("/agent-status/snapshots") {
                     serde_json::json!({"accepted":1,"machine_id":"otm_test","sources":["claude_code"]})
                 } else if let Some(items) = value.get("snapshots").and_then(|v| v.as_array()) {
-                    let fingerprints = items
-                        .iter()
-                        .map(|item| item["snapshot_fingerprint"].as_str().unwrap().to_string())
-                        .collect::<Vec<_>>();
                     let first = {
                         let mut posts = posts.lock().unwrap();
-                        posts.push(fingerprints);
+                        posts.push(items.clone());
                         posts.len() == 1
                     };
-                    if shed_first_batch && first {
+                    let failure = match *faults.lock().unwrap() {
+                        BatchFault::FirstShedRetryAfterOne if first => {
+                            Some("503 Service Unavailable\r\nRetry-After: 1")
+                        }
+                        BatchFault::PlainShed => Some("503 Service Unavailable"),
+                        BatchFault::ServerError => Some("500 Internal Server Error"),
+                        BatchFault::Dropped => {
+                            drop(stream);
+                            continue;
+                        }
+                        _ => None,
+                    };
+                    if let Some(status) = failure {
                         let body = r#"{"detail":"cursor_allocation_timeout"}"#;
                         write!(
                             stream,
-                            "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nRetry-After: 1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                             body.len()
                         )
                         .unwrap();
@@ -689,6 +715,7 @@ impl InplaceRetryServer {
             stop,
             worker: Some(worker),
             batch_posts,
+            fault,
             terminal,
         }
     }
@@ -702,114 +729,177 @@ impl Drop for InplaceRetryServer {
 
 struct InplaceRetryCycle {
     finished_ok: bool,
+    /// This cycle's batch POSTs, as fingerprints.
     batch_posts: Vec<Vec<String>>,
+    /// The semantic envelope of each body this cycle POSTed.
+    envelopes: BTreeMap<String, serde_json::Value>,
     offered: BTreeSet<String>,
     accepted: BTreeSet<String>,
     waits: Vec<Duration>,
     sweep_unsettled: bool,
     last_error_code: Option<serde_json::Value>,
+    /// Transcript bytes the cycle's scan consumed.
+    consumed: u64,
 }
 
-/// One real `prepare_sync_source` + `finish_sync_source` Claude cycle on a
-/// fresh synthetic home, then what its durable index and the backend saw.
-fn inplace_retry_claude_cycle(shed_first_batch: bool) -> InplaceRetryCycle {
-    let fixture = IdentityPipelineHome::new();
-    let cadence = IdentityPipelineCadence::new();
-    let support = fixture.base.join("inplace-retry-support");
-    let secrets = fixture.base.join("inplace-retry-secrets");
-    std::fs::create_dir_all(&support).unwrap();
-    std::fs::create_dir_all(&secrets).unwrap();
-    let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
-    let _secrets = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secrets);
-    let server = InplaceRetryServer::new(shed_first_batch);
-    let _api = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &server.url);
-    let device = LocalDeviceBinding {
-        device_id: "inplace-retry-device".into(),
-        machine_id: Some("otm_test".into()),
-        sources: vec!["claude_code".into()],
-    };
-    FileDeviceStore::default().save(&device).unwrap();
-    std::fs::write(
-        secrets.join(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
-        "device-secret",
-    )
-    .unwrap();
-    let client = SnapshotApiClient::new(server.url.clone());
-    let daemon = test_daemon("otm_test");
-    let mut transport = crate::net_resilience::TransportCycleOutcome::default();
-    let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
-    let collection = || AgentStatusCollection {
-        snapshots: vec![test_agent_status(SourceKind::ClaudeCode)],
-        source_health_snapshot: test_agent_status(SourceKind::ClaudeCode),
-        codex_scan_homes: Vec::new(),
-        codex_home_bindings: Vec::new(),
-    };
-    cadence.next_due_cycle();
-    let frame = crate::agent_status_refresh::with_test_collection(collection(), || {
-        prepare_sync_source(
-            &client,
-            &device,
+/// One synthetic Claude home, support directory and loopback backend that
+/// every cycle on it shares, as the passes of one installed daemon do.
+struct InplaceRetryHome {
+    server: InplaceRetryServer,
+    fixture: IdentityPipelineHome,
+    cadence: IdentityPipelineCadence,
+    support: PathBuf,
+    device: LocalDeviceBinding,
+    client: SnapshotApiClient,
+    daemon: LocalDaemon,
+    _env: [EnvVarGuard; 3],
+}
+
+impl InplaceRetryHome {
+    fn new(fault: BatchFault) -> Self {
+        let fixture = IdentityPipelineHome::new();
+        let cadence = IdentityPipelineCadence::new();
+        let support = fixture.base.join("inplace-retry-support");
+        let secrets = fixture.base.join("inplace-retry-secrets");
+        std::fs::create_dir_all(&support).unwrap();
+        std::fs::create_dir_all(&secrets).unwrap();
+        let server = InplaceRetryServer::new(fault);
+        let env = [
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support),
+            EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secrets),
+            EnvVarGuard::set_str("OTTTO_API_BASE_URL", &server.url),
+        ];
+        let device = LocalDeviceBinding {
+            device_id: "inplace-retry-device".into(),
+            machine_id: Some("otm_test".into()),
+            sources: vec!["claude_code".into()],
+        };
+        FileDeviceStore::default().save(&device).unwrap();
+        std::fs::write(
+            secrets.join(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
             "device-secret",
-            SnapshotSource::ClaudeCode,
-            "otm_test",
-            &fixture.home,
-            &support,
-            &daemon,
-            &mut transport,
-            daemon.snapshot_scan_account_witness().unwrap(),
-            false,
         )
-    })
-    .unwrap()
-    .expect("a due Claude cycle prepares a scan");
-    let (preparation, index, scan) = collect_preparation_with_rotation(frame);
-    assert!(!scan.snapshots.is_empty(), "the synthetic session uploads");
-    let index_path = preparation.index_path.clone();
-    let (result, waits) = with_inplace_retry_test_clock(None, || {
-        crate::agent_status_refresh::with_test_collection(collection(), || {
-            finish_sync_source(
-                preparation,
-                index,
-                scan,
-                &client,
-                &device,
-                "device-secret",
-                SnapshotSource::ClaudeCode,
-                "otm_test",
-                &fixture.home,
-                &support,
-                &daemon,
-                &mut transport,
-                &mut retry,
-            )
-        })
-    });
-    let saved = ScanIndex::load(&index_path).unwrap();
-    let batch_posts = server.batch_posts.lock().unwrap().clone();
-    let offered = batch_posts
-        .iter()
-        .flatten()
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    let last_error_code = server
-        .terminal
-        .lock()
-        .unwrap()
-        .last()
-        .map(|status| status["last_error_code"].clone());
-    InplaceRetryCycle {
-        finished_ok: result.is_ok(),
-        accepted: offered
-            .iter()
-            .filter(|fingerprint| saved.accepted_snapshot_fingerprint_recorded(fingerprint))
-            .cloned()
-            .collect(),
-        offered,
-        batch_posts,
-        waits,
-        sweep_unsettled: saved.bounded_sweep_had_unsettled_upload(),
-        last_error_code,
+        .unwrap();
+        let client = SnapshotApiClient::new(server.url.clone());
+        Self {
+            server,
+            fixture,
+            cadence,
+            support,
+            device,
+            client,
+            daemon: test_daemon("otm_test"),
+            _env: env,
+        }
     }
+
+    /// A daemon restart: nothing in RAM survives, only the durable state.
+    fn restart(&mut self) {
+        self.daemon = test_daemon("otm_test");
+        self.client = SnapshotApiClient::new(self.server.url.clone());
+    }
+
+    /// One real `prepare_sync_source` + `finish_sync_source` Claude cycle on
+    /// this home, then what its durable index and the backend saw.
+    fn cycle(&self) -> InplaceRetryCycle {
+        let mut transport = crate::net_resilience::TransportCycleOutcome::default();
+        let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
+        let collection = || AgentStatusCollection {
+            snapshots: vec![test_agent_status(SourceKind::ClaudeCode)],
+            source_health_snapshot: test_agent_status(SourceKind::ClaudeCode),
+            codex_scan_homes: Vec::new(),
+            codex_home_bindings: Vec::new(),
+        };
+        let posts_before = self.server.batch_posts.lock().unwrap().len();
+        self.cadence.next_due_cycle();
+        let ((preparation, index, scan), consumed) =
+            crate::snapshots::sampled_scan::transition_fixture::observe_consumed(|| {
+                let frame = crate::agent_status_refresh::with_test_collection(collection(), || {
+                    prepare_sync_source(
+                        &self.client,
+                        &self.device,
+                        "device-secret",
+                        SnapshotSource::ClaudeCode,
+                        "otm_test",
+                        &self.fixture.home,
+                        &self.support,
+                        &self.daemon,
+                        &mut transport,
+                        self.daemon.snapshot_scan_account_witness().unwrap(),
+                        false,
+                    )
+                })
+                .unwrap()
+                .expect("a due Claude cycle prepares a scan");
+                collect_preparation_with_rotation(frame)
+            });
+        let index_path = preparation.index_path.clone();
+        let (result, waits) = with_inplace_retry_test_clock(None, || {
+            crate::agent_status_refresh::with_test_collection(collection(), || {
+                finish_sync_source(
+                    preparation,
+                    index,
+                    scan,
+                    &self.client,
+                    &self.device,
+                    "device-secret",
+                    SnapshotSource::ClaudeCode,
+                    "otm_test",
+                    &self.fixture.home,
+                    &self.support,
+                    &self.daemon,
+                    &mut transport,
+                    &mut retry,
+                )
+            })
+        });
+        let saved = ScanIndex::load(&index_path).unwrap();
+        let posted = self.server.batch_posts.lock().unwrap()[posts_before..].to_vec();
+        let fingerprint =
+            |item: &serde_json::Value| item["snapshot_fingerprint"].as_str().unwrap().to_string();
+        let batch_posts = posted
+            .iter()
+            .map(|batch| batch.iter().map(fingerprint).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        let envelopes = posted
+            .iter()
+            .flatten()
+            .map(|item| (fingerprint(item), item["semantic_envelope"].clone()))
+            .collect::<BTreeMap<_, _>>();
+        let offered = envelopes.keys().cloned().collect::<BTreeSet<_>>();
+        let last_error_code = self
+            .server
+            .terminal
+            .lock()
+            .unwrap()
+            .last()
+            .map(|status| status["last_error_code"].clone());
+        InplaceRetryCycle {
+            finished_ok: result.is_ok(),
+            accepted: offered
+                .iter()
+                .filter(|fingerprint| saved.accepted_snapshot_fingerprint_recorded(fingerprint))
+                .cloned()
+                .collect(),
+            offered,
+            envelopes,
+            batch_posts,
+            waits,
+            sweep_unsettled: saved.bounded_sweep_had_unsettled_upload(),
+            last_error_code,
+            consumed,
+        }
+    }
+}
+
+/// One cycle on a fresh synthetic home.
+fn inplace_retry_claude_cycle(shed_first_batch: bool) -> InplaceRetryCycle {
+    InplaceRetryHome::new(if shed_first_batch {
+        BatchFault::FirstShedRetryAfterOne
+    } else {
+        BatchFault::None
+    })
+    .cycle()
 }
 
 /// T4: a Claude cycle whose first batch is shed with `Retry-After: 1` and
@@ -862,5 +952,82 @@ fn sync_cycle_with_recovered_shed_leaves_sweep_settled() {
         assert_eq!(recovered.sweep_unsettled, clean.sweep_unsettled);
         assert_eq!(recovered.finished_ok, clean.finished_ok);
         assert_eq!(recovered.last_error_code, clean.last_error_code);
+    });
+}
+
+/// [regress] [money] An upload outage keeps the read: a page whose upload
+/// ends in a plain shed, a 5xx or a dropped connection holds its unACKed
+/// bodies in retryable custody, so its file and head commit. The recovery
+/// pass, with or without a restart between them, re-sends the same bodies
+/// from the head without reading one transcript byte, and they are accepted
+/// with the money and placement the outage page carried. The outage records
+/// no ACK and no poison loss. Without custody the recovery pass reads the
+/// whole file again.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests)]
+#[serial(client_report)]
+#[serial(source_upload_deadlines)]
+fn upload_outage_keeps_the_read_and_resends_from_the_head() {
+    use super::permanent_finish_pipeline_tests::prior_index_lifetime_tests::Guard as RetryClock;
+    run_on_scan_worker_stack(|| {
+        if !crate::heap_layout_bound::layout_supported() {
+            writeln!(
+                std::io::stderr().lock(),
+                "upload_outage_custody: supported_positive=UNEXECUTED layout_supported=false"
+            )
+            .unwrap();
+            return;
+        }
+        for fault in [
+            BatchFault::PlainShed,
+            BatchFault::ServerError,
+            BatchFault::Dropped,
+        ] {
+            for restart in [false, true] {
+                let label = format!("{fault:?} restart={restart}");
+                clear_source_upload_deadlines_for_test();
+                let mut home = InplaceRetryHome::new(fault);
+                let outage = home.cycle();
+                assert!(
+                    outage.consumed > 0,
+                    "{label}: the outage page reads the file"
+                );
+                assert!(!outage.offered.is_empty(), "{label}: the outage page POSTs");
+                assert!(outage.accepted.is_empty(), "{label}: nothing is ACKed");
+                assert!(
+                    counted_poison_fingerprints_for_test(SnapshotSource::ClaudeCode.api_slug())
+                        .is_disjoint(&outage.offered),
+                    "{label}: an outage is no poison loss"
+                );
+
+                *home.server.fault.lock().unwrap() = BatchFault::None;
+                if restart {
+                    home.restart();
+                }
+                // Past the custody's backoff, so its retry is due.
+                let recovery = {
+                    let _clock = RetryClock::new(false, None, Some(current_unix_seconds() + 3_600));
+                    home.cycle()
+                };
+                clear_source_upload_deadlines_for_test();
+                assert_eq!(
+                    recovery.consumed, 0,
+                    "{label}: the recovery pass reads no transcript byte"
+                );
+                assert_eq!(
+                    recovery.offered, outage.offered,
+                    "{label}: the recovery pass re-sends the outage page's bodies"
+                );
+                assert_eq!(
+                    recovery.envelopes, outage.envelopes,
+                    "{label}: the same money and placement"
+                );
+                assert_eq!(
+                    recovery.accepted, recovery.offered,
+                    "{label}: every body is ACKed exactly"
+                );
+            }
+        }
     });
 }
