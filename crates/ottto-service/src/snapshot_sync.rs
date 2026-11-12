@@ -22721,6 +22721,9 @@ mod tests {
     include!("snapshot_sync/claude_request_census_pipeline_tests.rs");
     mod history_upgrade_pipeline_tests {
         include!("snapshot_sync/history_upgrade_pipeline_tests.rs");
+        mod first_read_latch_tests {
+            include!("snapshot_sync/first_read_latch_tests.rs");
+        }
     }
     pub(in crate::snapshot_sync) mod claude_money_e2_pipeline_tests {
         include!("snapshot_sync/claude_money_e2_pipeline_tests.rs");
@@ -22731,6 +22734,9 @@ mod tests {
         #[cfg(unix)]
         mod claude_first_request_login_tests {
             include!("snapshot_sync/claude_first_request_login_tests.rs");
+            mod first_read_latch_money_tests {
+                include!("snapshot_sync/first_read_latch_money_tests.rs");
+            }
         }
         #[cfg(unix)]
         mod claude_login_only_org_tests {
