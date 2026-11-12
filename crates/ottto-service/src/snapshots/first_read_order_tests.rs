@@ -512,6 +512,12 @@ impl ClaudeHistory {
             &self.births,
             hints,
         );
+        let (disposition, _, _) = crate::snapshot_sync::apply_claude_local_evidence_to_scan(
+            &self.support,
+            &mut scan,
+            &mut index,
+        );
+        assert!(disposition.quarantined_source_session_ids.is_empty());
         apply_upload_policy(
             SnapshotSource::ClaudeCode,
             &mut scan.snapshots,
@@ -530,10 +536,11 @@ impl ClaudeHistory {
         (index, scan)
     }
 
-    /// A whole first read; `hinted` is offered as a watcher hint on the
-    /// first `hint_passes` passes.
+    /// A whole first read; `hinted` is a session still in use: before each
+    /// of the first `hint_passes` passes it gains one own request (a real
+    /// change) and the watcher hints it.
     fn first_read(
-        &self,
+        &mut self,
         limit: usize,
         pending: bool,
         hinted: Option<&Path>,
@@ -554,6 +561,9 @@ impl ClaudeHistory {
                 .map(Path::to_path_buf)
                 .into_iter()
                 .collect::<Vec<_>>();
+            for path in &hints {
+                self.grow(path, pass);
+            }
             let (next, mut scan) = self.pass(&fixture, index, limit, &hints);
             assert_eq!(next.first_read_pending, pending, "runtime flag carried");
             order.extend(fixture.paths());
@@ -575,6 +585,38 @@ impl ClaudeHistory {
         assert!(scan.census_complete, "first read finished");
         scan.snapshots = latest.into_values().collect();
         FirstRead { index, scan, order }
+    }
+
+    /// One more own request on `path`, after its birth.
+    fn grow(&mut self, path: &Path, pass: usize) {
+        let stem = path.file_stem().unwrap().to_str().unwrap().to_owned();
+        let id = format!("{stem}-live-{pass}");
+        let line = json!({"type":"assistant", "sessionId":stem, "version":"2.1.229",
+            "timestamp":format!("2026-06-05T08:00:{pass:02}Z"),
+            "requestId":id, "message":{"id":format!("message-{id}"),
+                "model":"claude-haiku-4-5", "usage":{"input_tokens":50, "output_tokens":1}}});
+        let mut file = File::options().append(true).open(path).unwrap();
+        std::io::Write::write_all(&mut file, format!("{line}\n").as_bytes()).unwrap();
+        drop(file);
+        // Still older than the other folder: the sort keeps this folder later.
+        set_mtime(path, seconds("2026-06-12T00:00:00Z") + pass as u64 + 1);
+        self.distinct_requests += 1;
+    }
+
+    /// What each final body counts: (entity, counted, removed, request ids).
+    fn bodies(read: &FirstRead) -> Vec<(String, u64, u64, Vec<String>)> {
+        read.scan
+            .snapshots
+            .iter()
+            .map(|item| {
+                (
+                    item.source_session_id.clone(),
+                    item.request_count,
+                    item.removed_request_count.unwrap_or(0),
+                    item.claude_usage_request_ids.iter().cloned().collect(),
+                )
+            })
+            .collect()
     }
 
     /// Double-count detector: requests counted across all final bodies
@@ -602,59 +644,81 @@ fn copy_wait() -> Value {
         .clone()
 }
 
-/// [money] Claude, in-order decisions: a first read in pages of one folder,
+/// [money] Claude, in-order decisions: a first read one file per page,
 /// newest folder first, emits the same money and placement as the FIFO
-/// first read, and no request id is counted in two bodies. The resumed copy
-/// in each folder never needs to wait: its earlier-born holder reads first.
+/// first read, and no request id is counted in two bodies. Newest first, the
+/// resumed copy in each folder never waits: its earlier-born holder reads
+/// (and is accepted) first.
 #[test]
 fn claude_newest_folder_first_read_matches_fifo_money() {
-    let history = ClaudeHistory::new("first-read-order-claude");
-    let _ = claude_request_money::e2::take_thread_counts();
-    let fifo = history.first_read(3, false, None, 0);
-    let _ = claude_request_money::e2::take_thread_counts();
-    let newest = history.first_read(3, true, None, 0);
-    let newest_wait = copy_wait();
-    let source = SnapshotSource::ClaudeCode;
-    assert_same_money(source, &fifo, &newest);
-    for read in [&fifo, &newest] {
-        assert_eq!(history.double_counted(read), 0, "no request counted twice");
-    }
-    assert!(
-        newest_wait.get("expired").is_none(),
-        "no copy wait expires in order: {newest_wait}"
-    );
-    let folder_of = |read: &FirstRead| read.order[0].parent().unwrap().to_owned();
-    assert_eq!(folder_of(&fifo), history.folders[0].0, "walk order: a-old");
-    assert_eq!(
-        folder_of(&newest),
-        history.folders[1].0,
-        "newest folder first"
-    );
-    let (_, holder, copy) = &history.folders[1];
-    if birth(holder) != 0 {
-        let at = |path: &PathBuf| newest.order.iter().position(|p| p == path).unwrap();
-        assert!(at(holder) < at(copy), "holder (earlier birth) reads first");
-    }
+    claude_history_upgrade::with_max_gated_claude_revision(3, || {
+        let mut history = ClaudeHistory::new("first-read-order-claude");
+        let _ = claude_request_money::e2::take_thread_counts();
+        let fifo = history.first_read(1, false, None, 0);
+        let fifo_wait = copy_wait();
+        let newest = history.first_read(1, true, None, 0);
+        let newest_wait = copy_wait();
+        let report = format!(
+            "fifo order {:?}\nfifo bodies {:?}\nfifo wait {fifo_wait}\nnewest order {:?}\nnewest bodies {:?}\nnewest wait {newest_wait}\ndistinct {}",
+            fifo.order,
+            ClaudeHistory::bodies(&fifo),
+            newest.order,
+            ClaudeHistory::bodies(&newest),
+            history.distinct_requests,
+        );
+        eprintln!("{report}");
+        let folder_of = |read: &FirstRead| read.order[0].parent().unwrap().to_owned();
+        assert_eq!(folder_of(&fifo), history.folders[0].0, "walk order: a-old");
+        assert_eq!(
+            folder_of(&newest),
+            history.folders[1].0,
+            "newest folder first"
+        );
+        let (_, holder, copy) = &history.folders[1];
+        if birth(holder) != 0 {
+            let at = |path: &PathBuf| newest.order.iter().position(|p| p == path).unwrap();
+            assert!(at(holder) < at(copy), "holder (earlier birth) reads first");
+        }
+        assert_eq!(history.double_counted(&newest), 0, "{report}");
+        assert!(newest_wait.get("expired").is_none(), "{report}");
+        assert_eq!(history.double_counted(&fifo), 0, "{report}");
+        assert_same_money(SnapshotSource::ClaudeCode, &fifo, &newest);
+    });
 }
 
-/// [money] Negative control for the disclosed residual: a copy hinted in a
-/// folder the sort moved later is decided out of order while its holder stays
-/// queued. Its wait expires after its third decision, its copied prefix counts
-/// flagged, and the double-count detector sees exactly that prefix once the
-/// holder is read. Expected outcome, not an equality row; the existing
+/// [money] Negative control for the disclosed residual: a session in use
+/// (growing, watcher-hinted) that is a resumed copy, in the folder the sort
+/// moved later, is decided out of order on three passes while its holder
+/// stays queued. Its wait expires on the third decision, its copied prefix
+/// counts flagged, and once the holder is read the double-count detector sees
+/// exactly that prefix. Expected outcome, not an equality row; the existing
 /// `copy_prefix_wait.expired` counter is its witness.
 #[test]
 fn claude_hinted_copy_in_a_moved_folder_expires_its_wait() {
-    let history = ClaudeHistory::new("first-read-order-claude-residual");
-    let (_, _, copy) = history.folders[0].clone();
-    let _ = claude_request_money::e2::take_thread_counts();
-    let read = history.first_read(1, true, Some(&copy), 3);
-    let wait = copy_wait();
-    assert_eq!(read.order[0], copy, "the hint reads first");
-    assert_eq!(wait["expired"]["episodes"], json!(1), "{wait}");
-    assert_eq!(
-        history.double_counted(&read),
-        i128::from(ClaudeHistory::COPIED),
-        "the detector reports exactly the copied prefix"
-    );
+    claude_history_upgrade::with_max_gated_claude_revision(3, || {
+        let mut history = ClaudeHistory::new("first-read-order-claude-residual");
+        let (_, holder, copy) = history.folders[0].clone();
+        let _ = claude_request_money::e2::take_thread_counts();
+        // Two files a page: the hint takes one slot, the census the other.
+        let read = history.first_read(2, true, Some(&copy), 3);
+        let wait = copy_wait();
+        let report = format!(
+            "order {:?}\nbodies {:?}\nwait {wait}\ndistinct {}",
+            read.order,
+            ClaudeHistory::bodies(&read),
+            history.distinct_requests,
+        );
+        eprintln!("{report}");
+        assert_eq!(read.order[0], copy, "the hint reads first: {report}");
+        let at = |path: &PathBuf| read.order.iter().position(|p| p == path).unwrap();
+        let copy_reads = read.order.iter().filter(|p| **p == copy).count();
+        assert!(copy_reads >= 3, "{report}");
+        assert!(at(&holder) > 2, "the holder stays queued: {report}");
+        assert_eq!(wait["expired"]["episodes"], json!(1), "{report}");
+        assert_eq!(
+            history.double_counted(&read),
+            i128::from(ClaudeHistory::COPIED),
+            "the detector reports exactly the copied prefix: {report}"
+        );
+    });
 }

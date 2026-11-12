@@ -1,6 +1,6 @@
 //! One dispatch table for admitted sources.
-use crate::snapshots::*;
 use crate::snapshots::first_read_order::FirstReadOrder;
+use crate::snapshots::*;
 
 /// Sources admitted by the durable property table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
