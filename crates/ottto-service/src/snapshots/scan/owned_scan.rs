@@ -154,10 +154,6 @@ pub(crate) struct OwnedSourceScan {
     pub(in crate::snapshots) claude_authority_preflight: bool,
     pub(in crate::snapshots) forced_claude_family_reparses: BTreeSet<String>,
     pub(in crate::snapshots) claude_twin_schedule: ClaudeTwinSchedule,
-    /// The families this Claude page's selection touched, for the
-    /// count-only per-family census shadow.
-    pub(in crate::snapshots) claude_family_shadow:
-        Option<Box<claude_family_census_shadow::Touched>>,
     pub(in crate::snapshots) identified_candidates: VecDeque<CandidateFile>,
     /// The active file and, while it is a paged cursor job, its slot lease.
     /// A dropped frame returns an intact job to the slot.
@@ -381,7 +377,6 @@ impl OwnedSourceScan {
             claude_authority_preflight: false,
             forced_claude_family_reparses: Default::default(),
             claude_twin_schedule: Default::default(),
-            claude_family_shadow: Default::default(),
             identified_candidates: Default::default(),
             active_file: Default::default(),
             codex_join_inventory: evidence.map(|e| e.inventory),
@@ -891,11 +886,6 @@ impl OwnedSourceScan {
             causes,
             ..ScanCensus::default()
         };
-        let claude_family_shadow = (source == SnapshotSource::ClaudeCode).then(|| {
-            Box::new(claude_family_census_shadow::Touched::from_paths(
-                pending_paths.iter().map(|pending| pending.path.as_path()),
-            ))
-        });
         let selected_flags = pending_paths
             .iter()
             .map(|pending| {
@@ -1307,7 +1297,6 @@ impl OwnedSourceScan {
             claude_authority_preflight,
             forced_claude_family_reparses,
             claude_twin_schedule,
-            claude_family_shadow,
             identified_candidates: identified_candidates.into(),
             active_file: Default::default(),
             codex_join_inventory,
