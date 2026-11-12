@@ -1,5 +1,13 @@
 use super::*;
 
+fn capture(logs: bool, dir: &Path, bytes: &[u8], mime: &str) -> usize {
+    if logs {
+        capture_claude_api_request_logs(dir, bytes, mime)
+    } else {
+        capture_claude_llm_request_traces(dir, bytes, mime)
+    }
+    .unwrap()
+}
 fn assert_excluded(dir: &Path) {
     assert!(telemetry_stems(dir).unwrap().is_empty());
     assert!(telemetry_notices::pending(dir).unwrap().is_empty());
@@ -17,35 +25,14 @@ fn reserved_smoke_json_and_protobuf_api_and_trace_never_write_or_notify() {
     let json_api = String::from_utf8(parent_and_subagent_body().to_vec())
         .unwrap()
         .replace("sess-mixed", &reserved);
-    assert_eq!(
-        capture_claude_api_request_logs(&dir, json_api.as_bytes(), "application/json").unwrap(),
-        0
-    );
-    assert_excluded(&dir);
     let mut api = otlp_proto::ExportLogsServiceRequest::decode(api_log_body().as_slice()).unwrap();
     api.resource_logs[0].resource.as_mut().unwrap().attributes[0] =
         proto_string("session.id", &reserved);
-    assert_eq!(
-        capture_claude_api_request_logs(&dir, &api.encode_to_vec(), "application/x-protobuf")
-            .unwrap(),
-        0
-    );
-    assert_excluded(&dir);
     let json_trace = serde_json::json!({"resourceSpans":[{"resource":{"attributes":[
         {"key":"session.id","value":{"stringValue":reserved}}]},"scopeSpans":[{"spans":[{
         "name":"claude_code.llm_request","startTimeUnixNano":"1785708000000000000",
         "attributes":[{"key":"request_id","value":{"stringValue":"request"}},
             {"key":"client_request_id","value":{"stringValue":"client-request"}}]}]}]}]});
-    assert_eq!(
-        capture_claude_llm_request_traces(
-            &dir,
-            &serde_json::to_vec(&json_trace).unwrap(),
-            "application/json"
-        )
-        .unwrap(),
-        0
-    );
-    assert_excluded(&dir);
     let mut traces = otlp_proto::ExportTraceServiceRequest::decode(
         trace_body(vec![llm_span("request", None)]).as_slice(),
     )
@@ -55,12 +42,19 @@ fn reserved_smoke_json_and_protobuf_api_and_trace_never_write_or_notify() {
         .as_mut()
         .unwrap()
         .attributes[0] = proto_string("session.id", &reserved);
-    assert_eq!(
-        capture_claude_llm_request_traces(&dir, &traces.encode_to_vec(), "application/x-protobuf")
-            .unwrap(),
-        0
-    );
-    assert_excluded(&dir);
+    for (logs, mime, bytes) in [
+        (true, "application/json", json_api.as_bytes().to_vec()),
+        (true, "application/x-protobuf", api.encode_to_vec()),
+        (
+            false,
+            "application/json",
+            serde_json::to_vec(&json_trace).unwrap(),
+        ),
+        (false, "application/x-protobuf", traces.encode_to_vec()),
+    ] {
+        assert_eq!(capture(logs, &dir, &bytes, mime), 0);
+        assert_excluded(&dir);
+    }
     // Same payloads with an ordinary SDK root are positive controls, including
     // a mixed user/internal export. Query source never decides exclusion.
     let mut mixed: Value = serde_json::from_slice(json_api.as_bytes()).unwrap();
@@ -69,71 +63,30 @@ fn reserved_smoke_json_and_protobuf_api_and_trace_never_write_or_notify() {
         .as_array_mut()
         .unwrap()
         .push(ordinary["resourceLogs"][0].clone());
-    assert_eq!(
-        capture_claude_api_request_logs(
-            &dir,
-            &serde_json::to_vec(&mixed).unwrap(),
-            "application/json"
-        )
-        .unwrap(),
-        2
-    );
     api.resource_logs[0].resource.as_mut().unwrap().attributes[0] =
         proto_string("session.id", "sdk-proto");
-    assert_eq!(
-        capture_claude_api_request_logs(&dir, &api.encode_to_vec(), "application/x-protobuf")
-            .unwrap(),
-        1
-    );
     traces.resource_spans[0]
         .resource
         .as_mut()
         .unwrap()
         .attributes[0] = proto_string("session.id", "sdk-trace");
-    assert_eq!(
-        capture_claude_llm_request_traces(&dir, &traces.encode_to_vec(), "application/x-protobuf")
-            .unwrap(),
-        1
-    );
-    let json_trace = json_trace.to_string().replace(&reserved, "sdk-json-trace");
-    assert_eq!(
-        capture_claude_llm_request_traces(&dir, json_trace.as_bytes(), "application/json").unwrap(),
-        1
-    );
+    let ordinary_trace = json_trace.to_string().replace(&reserved, "sdk-json-trace");
+    for (logs, mime, bytes, count) in [
+        (
+            true,
+            "application/json",
+            serde_json::to_vec(&mixed).unwrap(),
+            2,
+        ),
+        (true, "application/x-protobuf", api.encode_to_vec(), 1),
+        (false, "application/json", ordinary_trace.into_bytes(), 1),
+        (false, "application/x-protobuf", traces.encode_to_vec(), 1),
+    ] {
+        assert_eq!(capture(logs, &dir, &bytes, mime), count);
+    }
     let notices = telemetry_notices::pending(&dir).unwrap();
     assert_eq!(notices.len(), 4);
     assert!(!notices.contains(&reserved));
     telemetry_notices::forget(&dir, &notices).unwrap();
-    fs::remove_dir_all(dir).unwrap();
-}
-
-#[test]
-fn pending_notice_survives_failure_and_keeps_concurrent_append() {
-    let dir = std::env::temp_dir().join(format!(
-        "otel-notice-{}",
-        crate::claude_spawn_gate::internal_session_id()
-    ));
-    telemetry_notices::configure(&dir, true).unwrap();
-    assert_eq!(
-        capture_claude_api_request_logs(&dir, parent_and_subagent_body(), "application/json")
-            .unwrap(),
-        2
-    );
-    let failed_save = telemetry_notices::pending(&dir).unwrap();
-    assert!(failed_save.contains("sess-mixed"));
-    let next = String::from_utf8(parent_and_subagent_body().to_vec())
-        .unwrap()
-        .replace("sess-mixed", "next-append");
-    capture_claude_api_request_logs(&dir, next.as_bytes(), "application/json").unwrap();
-    assert!(telemetry_notices::pending(&dir)
-        .unwrap()
-        .is_superset(&failed_save));
-    let retry = telemetry_notices::pending(&dir).unwrap();
-    assert_eq!(
-        retry,
-        BTreeSet::from(["sess-mixed".into(), "next-append".into()])
-    );
-    telemetry_notices::forget(&dir, &retry).unwrap();
-    assert!(telemetry_notices::pending(&dir).unwrap().is_empty());
     fs::remove_dir_all(dir).unwrap();
 }

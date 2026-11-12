@@ -1,65 +1,21 @@
 use super::*;
-use std::io::Write;
 
-fn signed(mut row: otel::ClaudeLocalOtelEvidence) -> otel::ClaudeLocalOtelEvidence {
-    row.fingerprint.clear();
-    row.fingerprint_check = Default::default();
-    row.fingerprint = format!(
-        "sha256:{:x}",
-        Sha256::digest(serde_json::to_vec(&row).unwrap())
-    );
-    row
-}
-fn pair(c: &Corpus, rows: &[otel::ClaudeLocalOtelEvidence]) {
-    let traces = rows
-        .iter()
-        .map(|row| (row.request_id.clone(), trace(&row.request_id, "")))
-        .collect::<BTreeMap<_, _>>()
-        .into_values()
-        .collect::<Vec<_>>();
-    c.evidence(rows, &traces);
-}
-fn restore(state: &SnapshotUploadProgress) -> SnapshotUploadProgress {
-    let mut state: SnapshotUploadProgress =
-        serde_json::from_slice(&serde_json::to_vec(state).unwrap()).unwrap();
-    state
-        .accepted_identity_buckets
-        .bind_test_key(Some([0x42; 32]));
-    state
-}
-pub(super) fn member(c: &Corpus, api: bool) -> PathBuf {
-    c.support
-        .join("local-otel")
-        .join(if api {
-            "claude-code-effort"
-        } else {
-            "claude-code-trace-ownership"
-        })
-        .join(format!("{}.jsonl", otel::telemetry_stem(ROOT)))
-}
 fn accounts(item: &SnapshotItem) -> BTreeSet<String> {
-    let raw = serde_json::to_value(item).unwrap();
-    raw["model_usage"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .flat_map(|row| {
-            row.get("identity_parts")
-                .and_then(serde_json::Value::as_array)
-                .into_iter()
-                .flatten()
-                .chain(std::iter::once(row))
-                .filter_map(|part| {
-                    part.get("account_identifier_hash")?
-                        .as_str()
-                        .map(str::to_owned)
-                })
-        })
-        .collect()
+    let raw = value(item).unwrap();
+    let mut accounts = BTreeSet::new();
+    for row in raw["model_usage"].as_array().unwrap() {
+        let parts = row.get("identity_parts").and_then(Value::as_array);
+        for part in parts.map_or(std::slice::from_ref(row), Vec::as_slice) {
+            if let Some(key) = part["account_identifier_hash"].as_str() {
+                accounts.insert(key.to_owned());
+            }
+        }
+    }
+    accounts
 }
 
 // Exercise the relay's shared append path, including a mixed provider export.
-fn relay_append(c: &Corpus, sessions: &[&str]) -> (usize, usize) {
+pub(super) fn relay_append(c: &Corpus, sessions: &[&str]) -> (usize, usize) {
     let attributes = |session: &str| {
         [
             ("session.id", session),
@@ -82,702 +38,414 @@ fn relay_append(c: &Corpus, sessions: &[&str]) -> (usize, usize) {
     (
         otel::capture_claude_api_request_logs(
             &c.support,
-            &serde_json::to_vec(&logs).unwrap(),
+            &encode(&logs).unwrap(),
             "application/json",
         )
         .unwrap(),
         otel::capture_claude_llm_request_traces(
             &c.support,
-            &serde_json::to_vec(&traces).unwrap(),
+            &encode(&traces).unwrap(),
             "application/json",
         )
         .unwrap(),
     )
 }
 
-#[test]
-fn mixed_smoke_and_sdk_money_reopens_settled_scheduling_without_a_registry() {
-    with_e2(|| {
-        let c = Corpus::new("otel-only-mixed-smoke-money");
-        positive(&c);
-        let mut p = progress();
-        let built = page(&c, &mut p, &hint(), WireBudget::default());
-        let accepted = send(&built, &mut p, Mode::ColdFull);
-        let generation = otel::telemetry_generation(&c.support, ROOT).unwrap();
-        let reserved = crate::claude_spawn_gate::internal_session_id();
-        assert_eq!(relay_append(&c, &[&reserved]), (0, 0));
-        assert_eq!(
-            otel::telemetry_generation(&c.support, ROOT).unwrap(),
-            generation
-        );
-        assert!(otel::telemetry_notices::pending(&c.support)
-            .unwrap()
-            .is_empty());
-        p.settle_telemetry_root(ROOT);
-        let mut p = restore(&p);
-        assert_eq!(relay_append(&c, &[&reserved, ROOT]), (1, 1));
-        assert_eq!(
-            otel::telemetry_notices::pending(&c.support).unwrap(),
-            BTreeSet::from([ROOT.into()])
-        );
-        let grown = page(&c, &mut p, &hint(), WireBudget::default());
-        assert_eq!(grown.scan.snapshots[0].request_count, 5);
-        let mut full = progress();
-        let reference = page(&c, &mut full, &hint(), WireBudget::default());
-        let reference = send(&reference, &mut full, Mode::ColdFull);
-        money_oracle::assert_no_smaller_reemit(
-            ROOT,
-            &accepted,
-            &send(&grown, &mut p, Mode::Restart),
-            &reference,
-            false,
-        );
-        assert_eq!(otel::telemetry_stems(&c.support).unwrap().len(), 1);
-    });
+pub(super) fn mixed_smoke() {
+    let (c, mut p, accepted) = accepted_case("otel-only-mixed-smoke-money");
+    let generation = otel::telemetry_generation(&c.support, ROOT).unwrap();
+    let reserved = crate::claude_spawn_gate::internal_session_id();
+    assert_eq!(relay_append(&c, &[&reserved]), (0, 0));
+    assert_eq!(
+        otel::telemetry_generation(&c.support, ROOT).unwrap(),
+        generation
+    );
+    assert!(notice(&c).is_empty());
+    p.settle_telemetry_root(ROOT);
+    let mut p = restore(&p);
+    assert_eq!(relay_append(&c, &[&reserved, ROOT]), (1, 1));
+    assert_eq!(notice(&c), BTreeSet::from([ROOT.into()]));
+    reemit(&c, &mut p, &accepted, Mode::Restart);
+    assert_eq!(otel::telemetry_stems(&c.support).unwrap().len(), 1);
 }
 
-#[test]
-fn queued_unread_failed_listing_and_decode_holds_keep_growth_owed() {
-    with_e2(|| {
-        let c = Corpus::new("otel-only-unknown-scope");
-        positive(&c);
-        let mut p = progress();
-        let built = page(&c, &mut p, &hint(), WireBudget::default());
-        let accepted = send(&built, &mut p, Mode::ColdFull);
-        assert_eq!(relay_append(&c, &[ROOT]), (1, 1));
-        let mut indices = Vec::new();
-        for failed in [false, true] {
-            let mut raw = serde_json::to_value(ScanIndex::default()).unwrap();
-            raw["traversal"] = json!({"context_fingerprint":"held", "census_window_end":AT,
+pub(super) fn scope_hold() {
+    let (c, mut p, accepted) = accepted_case("otel-only-unknown-scope");
+    assert_eq!(relay_append(&c, &[ROOT]), (1, 1));
+    let mut indices = Vec::new();
+    for failed in [false, true] {
+        let mut raw = value(ScanIndex::default()).unwrap();
+        raw["traversal"] = json!({"context_fingerprint":"held", "census_window_end":AT,
                 "scan_roots":[c.root], "pending_directories":[{"scan_root":c.root,"path":c.root.join(ROOT)}],
                 "pending_candidates":[], "observed_index_keys":[], "reconciliation_upper_bound":null,
                 "reconciliation_after":null,"reconciliation_started":false,
                 "unhealthy_retry_attempt":u8::from(failed),"counts":{"unreadable_path_count":u64::from(failed)}});
-            indices.push(serde_json::from_value::<ScanIndex>(raw).unwrap());
-        }
-        let mut raw = serde_json::to_value(ScanIndex::default()).unwrap();
-        raw["claude_usage_family_witnesses"] = json!({ROOT:{"members":[false],"opaque":"future"}});
-        let path = c.base.join("held-index.json");
-        std::fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
-        indices.push(ScanIndex::load(&path).unwrap());
-        for index in indices {
-            let (absent, backed) = crate::snapshots::claude_request_money::e2::telemetry_scope(
-                &index,
-                &BTreeSet::from([ROOT.into()]),
-            );
-            assert!(!absent.contains(ROOT) && !backed.contains(ROOT));
-            let mut next = restore(&p);
-            let mut scan = c
-                .raw(
-                    &E2ScanFixture::capturing_identity(),
-                    ScanIndex::default(),
-                    100,
-                    false,
-                    &[],
-                )
-                .scan;
-            let reads = otel::evidence_read_counts_for_test();
-            next.seed_telemetry(
-                &c.support,
-                &hint(),
-                &mut scan,
-                &index,
-                &c.base.join("held-progress.json"),
-            )
-            .unwrap();
-            assert!(scan.snapshots.is_empty());
-            assert_eq!(reads, otel::evidence_read_counts_for_test());
-            assert!(
-                serde_json::to_value(&next).unwrap()["telemetry_only"]["candidates"]
-                    .get(ROOT)
-                    .is_some()
-            );
-            money_oracle::assert_held(ROOT, &accepted, &held_route(&accepted, &next), &accepted);
-        }
-        let grown = page(&c, &mut p, &hint(), WireBudget::default());
-        assert_eq!(grown.scan.snapshots[0].request_count, 5);
-        let mut full = progress();
-        let reference = page(&c, &mut full, &hint(), WireBudget::default());
-        let reference = send(&reference, &mut full, Mode::ColdFull);
-        money_oracle::assert_no_smaller_reemit(
-            ROOT,
-            &accepted,
-            &send(&grown, &mut p, Mode::Ram),
-            &reference,
-            false,
+        indices.push(serde_json::from_value::<ScanIndex>(raw).unwrap());
+    }
+    let mut raw = value(ScanIndex::default()).unwrap();
+    raw["claude_usage_family_witnesses"] = json!({ROOT:{"members":[false],"opaque":"future"}});
+    let path = c.base.join("held-index.json");
+    fs::write(&path, encode(&raw).unwrap()).unwrap();
+    indices.push(ScanIndex::load(&path).unwrap());
+    for index in indices {
+        let (absent, backed) = crate::snapshots::claude_request_money::e2::telemetry_scope(
+            &index,
+            &BTreeSet::from([ROOT.into()]),
         );
-    });
-}
-
-#[test]
-fn priced_unpriced_dedup_cache_reasoning_and_identity_presence() {
-    with_e2(|| {
-        let c = Corpus::new("otel-only-presence");
-        let mut a = full_identity(
-            tagged_api("priced-a", 11, Some(&"a".repeat(64))),
-            &"c".repeat(64),
-        );
-        a.reasoning_output_tokens = 9;
-        a.query_source = "sdk".into();
-        a = signed(a);
-        let b = full_identity(
-            tagged_api("priced-b", 12, Some(&"b".repeat(64))),
-            &"d".repeat(64),
-        );
-        let mut unknown = api("unpriced-gap", 13, 130);
-        unknown.cost_usd_micros = None;
-        unknown = signed(unknown);
-        pair(&c, &[a.clone(), b, unknown, a]);
-        let mut p = progress();
-        let built = page(&c, &mut p, &hint(), WireBudget::default());
-        let item = &built.scan.snapshots[0];
-        assert_eq!(
-            (item.request_count, item.input_tokens, item.output_tokens),
-            (3, 36, 36)
-        );
-        assert_eq!(
-            (
-                item.cache_creation_5m_tokens,
-                item.cache_creation_1h_tokens,
-                item.reasoning_output_tokens
-            ),
-            (15, 6, 9)
-        );
-        assert_eq!(
-            accounts(item),
-            BTreeSet::from(["a".repeat(64), "b".repeat(64)])
-        );
-        assert!(item
-            .request_evidence
-            .iter()
-            .all(|e| e.provider_workspace_hash.is_some()));
-        let cold = send(&built, &mut p, Mode::ColdFull);
-        for mode in [Mode::Ram, Mode::DiskRestore, Mode::Restart] {
-            let mut next = progress();
-            let built = page(&c, &mut next, &hint(), WireBudget::default());
-            money_oracle::assert_equivalent(&cold, &send(&built, &mut next, mode));
-        }
-        // Login-only, invalid and entirely missing evidence never invent a start binding.
-        for row in [
-            tagged_api("login-only", 7, Some(&"a".repeat(64))),
-            tagged_api("invalid", 7, None),
-            api("unknown", 7, 70),
-        ] {
-            pair(&c, &[row]);
-            let mut next = progress();
-            let built = page(&c, &mut next, &hint(), WireBudget::default());
-            assert_eq!(built.scan.snapshots[0].request_count, 1);
-            assert!(built.scan.snapshots[0].session_account_evidence.is_none());
-            let full = send(&built, &mut next, Mode::ColdFull);
-            let mut next = progress();
-            let other = page(&c, &mut next, &hint(), WireBudget::default());
-            money_oracle::assert_equivalent(&full, &send(&other, &mut next, Mode::Restart));
-        }
-    });
-}
-
-#[test]
-fn dark_and_withdrawn_hints_do_no_evidence_io_or_progress_mutation() {
-    with_e2(|| {
-        let c = Corpus::new("otel-only-off-matrix");
-        positive(&c);
-        let mut p = progress();
-        let built = page(&c, &mut p, &hint(), WireBudget::default());
-        send(&built, &mut p, Mode::ColdFull);
-        let mut variants = vec![];
-        let mut h = hint();
-        h.claude_otel_only_sessions_contract = None;
-        variants.push(h);
-        let mut h = hint();
-        h.claude_otel_only_sessions_contract = Some("future".into());
-        variants.push(h);
-        let mut h = hint();
-        h.claude_otel_only_pairing_floor = Some("malformed".into());
-        variants.push(h);
-        let mut h = hint();
-        h.claude_otel_only_pairing_ceiling = Some("malformed".into());
-        variants.push(h);
-        let mut h = hint();
-        h.local_usage_reconciliation_enabled = false;
-        variants.push(h);
-        let mut h = hint();
-        h.snapshot_head_cas_required = false;
-        variants.push(h);
-        for h in variants {
-            let mut next = restore(&p);
-            let before = serde_json::to_value(&next).unwrap();
-            let reads = otel::evidence_read_counts_for_test();
-            let built = page(&c, &mut next, &h, WireBudget::default());
-            assert!(built.scan.snapshots.is_empty());
-            assert_eq!(reads, otel::evidence_read_counts_for_test());
-            assert_eq!(before, serde_json::to_value(&next).unwrap());
-            assert!(send(&built, &mut next, Mode::Restart).batches.is_empty());
-        }
-    });
-}
-
-#[test]
-fn pairing_boundaries_repair_and_healthy_empty_are_distinct_from_faults() {
-    with_e2(|| {
-        let c = Corpus::new("otel-only-pairing-boundaries");
-        for (at, ceiling, emits) in [
-            ("2026-08-02T06:30:00Z", None, false),
-            ("2026-08-02T06:30:00.000000001Z", None, true),
-            (AT, Some("2026-08-02T07:05:10Z"), false),
-            (AT, Some("2026-08-02T07:05:10.000000001Z"), true),
-        ] {
-            let mut row = api("boundary", 11, 110);
-            row.observed_at = at.into();
-            pair(&c, &[signed(row)]);
-            let mut h = hint();
-            h.claude_otel_only_pairing_ceiling = ceiling.map(str::to_owned);
-            let mut p = progress();
-            let built = page(&c, &mut p, &h, WireBudget::default());
-            assert_eq!(!built.scan.snapshots.is_empty(), emits, "{at} {ceiling:?}");
-            assert!(
-                member(&c, true).exists() && member(&c, false).exists(),
-                "no telemetry file deletion"
-            );
-        }
-        pair(&c, &[]);
-        let mut p = progress();
-        assert!(page(&c, &mut p, &hint(), WireBudget::default())
-            .scan
-            .snapshots
-            .is_empty());
-        assert!(
-            serde_json::to_value(&p).unwrap()["telemetry_only"]["candidates"]
-                .as_object()
-                .unwrap()
-                .is_empty()
-        );
-        std::fs::write(
-            member(&c, false),
-            serde_json::to_string(&trace("unmatched", "")).unwrap() + "\n",
-        )
-        .unwrap();
-        let mut partial = progress();
-        assert!(page(&c, &mut partial, &hint(), WireBudget::default())
-            .scan
-            .snapshots
-            .is_empty());
-        assert!(
-            serde_json::to_value(&partial).unwrap()["telemetry_only"]["candidates"]
-                .get(ROOT)
-                .is_some(),
-            "trace-only is owed, not healthy empty"
-        );
-        positive(&c);
-        let mut p = progress();
-        let built = page(&c, &mut p, &hint(), WireBudget::default());
-        let accepted = send(&built, &mut p, Mode::ColdFull);
-        let bytes = std::fs::read(member(&c, false)).unwrap();
-        std::fs::remove_file(member(&c, false)).unwrap();
-        let held = page(&c, &mut p, &hint(), WireBudget::default());
-        assert!(held.scan.snapshots.is_empty());
-        money_oracle::assert_held(ROOT, &accepted, &held_route(&accepted, &p), &accepted);
-        std::fs::write(member(&c, false), bytes).unwrap();
-        let repaired = page(&c, &mut p, &hint(), WireBudget::default());
-        assert_eq!(
-            snapshot_upload_body_witness(&repaired.scan.snapshots[0]),
-            accepted.accepted[ROOT].witness
-        );
-        let (result, batches, _) = upload(&repaired.scan.snapshots, &mut p, ack);
-        assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
-        assert!(
-            batches.is_empty(),
-            "repair preserves the already accepted exact body"
-        );
-        money_oracle::assert_held(ROOT, &accepted, &held_route(&accepted, &p), &accepted);
-        let mut h = hint();
-        h.claude_otel_only_pairing_floor = Some("2026-08-02T06:59:00Z".into());
-        assert!(page(&c, &mut p, &h, WireBudget::default())
-            .scan
-            .snapshots
-            .is_empty());
-        money_oracle::assert_no_smaller_reemit(
-            ROOT,
-            &accepted,
-            &held_route(&accepted, &p),
-            &accepted,
-            true,
-        );
-    });
-}
-
-#[test]
-fn trace_first_growth_without_notices_and_restart_transaction_windows() {
-    with_e2(|| {
-        let c = Corpus::new("otel-only-trace-first-restarts");
-        positive(&c);
-        let mut p = progress();
-        let built = page(&c, &mut p, &hint(), WireBudget::default());
-        let before_ack = restore(&p);
-        let cold = send(&built, &mut p, Mode::ColdFull);
-        // A lost response or a crash before local progress commit retries the exact body.
-        for _ in 0..2 {
-            let mut next = restore(&before_ack);
-            let retry = page(&c, &mut next, &hint(), WireBudget::default());
-            money_oracle::assert_equivalent(&cold, &send(&retry, &mut next, Mode::Restart));
-        }
-        let path = c.base.join("committed-progress.json");
-        p.save(&path).unwrap();
-        let mut committed = SnapshotUploadProgress::load(
-            &path,
-            &p.destination_namespace_hash,
-            snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
-        )
-        .unwrap();
-        committed
-            .accepted_identity_buckets
-            .bind_test_key(Some([0x42; 32]));
+        assert!(!absent.contains(ROOT) && !backed.contains(ROOT));
+        let mut next = restore(&p);
+        let mut scan = empty_scan(&c);
         let reads = otel::evidence_read_counts_for_test();
-        let (quiet, io) = oracle::observe_codex_quiet(|| {
-            page(&c, &mut committed, &hint(), WireBudget::default())
-        });
-        assert_eq!(reads, otel::evidence_read_counts_for_test());
-        let mut route = send(&quiet, &mut committed, Mode::Restart);
-        route.io = io;
-        money_oracle::assert_quiet_restart_zero_bytes(&route);
-        assert!(otel::telemetry_notices::pending(&c.support)
-            .unwrap()
-            .is_empty());
-        std::fs::OpenOptions::new()
-            .append(true)
-            .open(member(&c, false))
-            .unwrap()
-            .write_all(
-                (serde_json::to_string(&trace("trace-first", "")).unwrap() + "\n").as_bytes(),
-            )
-            .unwrap();
-        let held = page(&c, &mut committed, &hint(), WireBudget::default());
-        assert!(held.scan.snapshots.is_empty());
-        money_oracle::assert_held(ROOT, &cold, &held_route(&cold, &committed), &cold);
-        std::fs::OpenOptions::new()
-            .append(true)
-            .open(member(&c, true))
-            .unwrap()
-            .write_all(
-                (serde_json::to_string(&api("trace-first", 20, 200)).unwrap() + "\n").as_bytes(),
-            )
-            .unwrap();
-        let grown = page(&c, &mut committed, &hint(), WireBudget::default());
-        assert_eq!(grown.scan.snapshots[0].request_count, 5);
-        let mut reference = progress();
-        let full = page(&c, &mut reference, &hint(), WireBudget::default());
-        let full = send(&full, &mut reference, Mode::ColdFull);
-        money_oracle::assert_no_smaller_reemit(
-            ROOT,
-            &cold,
-            &send(&grown, &mut committed, Mode::Ram),
-            &full,
-            false,
-        );
-    });
-}
-
-#[test]
-fn admission_save_failure_keeps_pending_notice_and_saved_candidate_detects_growth() {
-    with_e2(|| {
-        let c = Corpus::new("otel-only-save-notice");
-        let stamp = nanos(AT).to_string();
-        let log = json!({"resourceLogs":[{"scopeLogs":[{"logRecords":[{"timeUnixNano":stamp,
-            "body":{"stringValue":"claude_code.api_request"},"attributes":[
-                {"key":"session.id","value":{"stringValue":ROOT}},
-                {"key":"model","value":{"stringValue":"claude-haiku-4-5"}},
-                {"key":"request_id","value":{"stringValue":"notice"}},
-                {"key":"input_tokens","value":{"intValue":"1"}}]}]}]}]});
-        otel::telemetry_notices::configure(&c.support, true).unwrap();
-        assert_eq!(
-            otel::capture_claude_api_request_logs(
-                &c.support,
-                &serde_json::to_vec(&log).unwrap(),
-                "application/json"
-            )
-            .unwrap(),
-            1
-        );
-        let bad = c.base.join("not-a-directory");
-        std::fs::write(&bad, b"file").unwrap();
-        let mut p = progress();
-        let mut scan = c
-            .raw(
-                &E2ScanFixture::capturing_identity(),
-                ScanIndex::default(),
-                100,
-                false,
-                &[],
-            )
-            .scan;
-        assert!(p
-            .seed_telemetry(
-                &c.support,
-                &hint(),
-                &mut scan,
-                &ScanIndex::default(),
-                &bad.join("progress.json")
-            )
-            .is_err());
-        assert!(otel::telemetry_notices::pending(&c.support)
-            .unwrap()
-            .contains(ROOT));
-        p.seed_telemetry(
+        next.seed_telemetry(
             &c.support,
             &hint(),
             &mut scan,
-            &ScanIndex::default(),
-            &c.base.join("saved.json"),
+            &index,
+            &c.base.join("held-progress.json"),
         )
         .unwrap();
-        assert!(otel::telemetry_notices::pending(&c.support)
-            .unwrap()
-            .is_empty());
-        // Existing growth tests append directly without notices: no new stat or
-        // full telemetry-directory walk is needed after forget(saved_roots).
-        assert!(
-            serde_json::to_value(&p).unwrap()["telemetry_only"]["candidates"]
-                .get(ROOT)
-                .is_some()
-        );
-    });
+        assert!(scan.snapshots.is_empty());
+        assert_eq!(reads, otel::evidence_read_counts_for_test());
+        held(&accepted, &next);
+    }
+    reemit(&c, &mut p, &accepted, Mode::Ram);
 }
 
-#[test]
-fn permanent_refusal_releases_scheduling_but_never_existing_ack_or_files() {
-    with_e2(|| {
-        let c = Corpus::new("otel-only-refusal");
-        positive(&c);
-        for permanent in [false, true] {
-            let mut p = progress();
-            let built = page(&c, &mut p, &hint(), WireBudget::default());
-            let fp = built.scan.snapshots[0].snapshot_fingerprint.clone();
-            let _ = upload(&built.scan.snapshots, &mut p, |items| {
-                let mut response = ack(items)?;
-                response.accepted = 0;
-                response.sessions_reconciled = 0;
-                response.accepted_entities.clear();
-                response.rejected_entities = items
-                    .iter()
-                    .map(|item| crate::snapshot_client::SnapshotEntityRejection {
-                        source_session_id: item.source_session_id.clone(),
-                        snapshot_fingerprint: item.snapshot_fingerprint.clone(),
-                        reason: "invalid".into(),
-                        detail: "synthetic refusal".into(),
-                        permanent,
-                        occurrence_count: 1,
-                    })
-                    .collect();
-                Ok(response)
-            });
-            assert!(!p.accepted_body_witnesses.contains_key(&fp));
-            let candidate = serde_json::to_value(&p).unwrap()["telemetry_only"]["candidates"]
-                .get(ROOT)
-                .is_some();
-            assert_eq!(
-                candidate, !permanent,
-                "only a validated permanent refusal settles scheduling"
-            );
-            assert!(member(&c, true).exists() && member(&c, false).exists());
-        }
-    });
+pub(super) fn presence() {
+    let c = Corpus::new("otel-only-presence");
+    let mut a = tagged("priced-a", 11, 7);
+    a.reasoning_output_tokens = 9;
+    a.query_source = "sdk".into();
+    a = signed(a);
+    let b = tagged("priced-b", 12, 14);
+    let mut unknown = api("unpriced-gap", 13, 130);
+    unknown.cost_usd_micros = None;
+    unknown = signed(unknown);
+    pair(&c, &[a.clone(), b, unknown, a]);
+    let mut p = progress();
+    let built = build(&c, &mut p);
+    let item = &built.scan.snapshots[0];
+    assert_eq!(
+        (item.request_count, item.input_tokens, item.output_tokens),
+        (3, 36, 36)
+    );
+    assert_eq!(
+        (
+            item.cache_creation_5m_tokens,
+            item.cache_creation_1h_tokens,
+            item.reasoning_output_tokens
+        ),
+        (15, 6, 9)
+    );
+    assert_eq!(
+        accounts(item),
+        BTreeSet::from(["1".repeat(64), "2".repeat(64)])
+    );
+    assert!(item
+        .request_evidence
+        .iter()
+        .all(|e| e.provider_workspace_hash.is_some()));
+    let cold = send(&built, &mut p, Mode::ColdFull);
+    compare_modes(&c, &cold, &[Mode::Ram, Mode::DiskRestore, Mode::Restart]);
+    // Login-only, invalid and entirely missing evidence never invent a start binding.
+    for row in [
+        tagged_api("login-only", 7, Some(&"a".repeat(64))),
+        tagged_api("invalid", 7, None),
+        api("unknown", 7, 70),
+    ] {
+        pair(&c, &[row]);
+        let mut next = progress();
+        let built = build(&c, &mut next);
+        assert_eq!(built.scan.snapshots[0].request_count, 1);
+        assert!(built.scan.snapshots[0].session_account_evidence.is_none());
+        let full = send(&built, &mut next, Mode::ColdFull);
+        compare_modes(&c, &full, &[Mode::Restart]);
+    }
 }
 
-#[test]
-fn wire_contract_excludes_transcript_and_local_metadata() {
-    with_e2(|| {
-        let c = Corpus::new("otel-only-wire-golden");
-        positive(&c);
+pub(super) fn dark() {
+    let (c, p, _) = accepted_case("otel-only-off-matrix");
+    for (field, replacement) in [
+        ("claude_otel_only_sessions_contract", json!(null)),
+        ("claude_otel_only_sessions_contract", json!("unknown")),
+        ("claude_otel_only_pairing_floor", json!(null)),
+        ("claude_otel_only_pairing_floor", json!("invalid")),
+        ("local_usage_reconciliation_enabled", json!(false)),
+        ("snapshot_head_cas_required", json!(false)),
+        ("source", json!("codex")),
+        ("source", json!("pi")),
+        ("claude_otel_only_pairing_ceiling", json!("invalid")),
+        (
+            "claude_otel_only_pairing_ceiling",
+            json!("2026-08-02T06:00:00Z"),
+        ),
+        (
+            "claude_otel_only_sessions_contract",
+            json!({"unexpected":true}),
+        ),
+        ("claude_otel_only_pairing_floor", json!({"unexpected":true})),
+        (
+            "claude_otel_only_pairing_ceiling",
+            json!({"unexpected":true}),
+        ),
+    ] {
+        let mut raw = value(hint()).unwrap();
+        raw[field] = replacement;
+        let h = crate::snapshot_client::decode_activity_hint(raw).unwrap();
+        assert!(crate::snapshot_sync::telemetry_only::advertised(&h).is_none());
+        let mut next = restore(&p);
+        let before = value(&next).unwrap();
+        let reads = otel::evidence_read_counts_for_test();
+        let built = page(&c, &mut next, &h, WireBudget::default());
+        assert!(built.scan.snapshots.is_empty());
+        assert_eq!(reads, otel::evidence_read_counts_for_test());
+        assert_eq!(before, value(&next).unwrap());
+        assert!(send(&built, &mut next, Mode::Restart).batches.is_empty());
+    }
+}
+
+pub(super) fn pairing() {
+    let c = Corpus::new("otel-only-pairing-boundaries");
+    for (at, ceiling, emits) in [
+        ("2026-08-02T06:30:00Z", None, false),
+        ("2026-08-02T06:30:00.000000001Z", None, true),
+        (AT, Some("2026-08-02T07:05:10Z"), false),
+        (AT, Some("2026-08-02T07:05:10.000000001Z"), true),
+    ] {
+        let mut row = api("boundary", 11, 110);
+        row.observed_at = at.into();
+        pair(&c, &[signed(row)]);
+        let mut h = hint();
+        h.claude_otel_only_pairing_ceiling = ceiling.map(str::to_owned);
         let mut p = progress();
-        let mut built = page(&c, &mut p, &hint(), WireBudget::default());
-        let item = &mut built.scan.snapshots[0];
-        item.workspace_hash = Some("must-not-leak-workspace".into());
-        item.source_file_fingerprint = Some("must-not-leak-file".into());
-        item.session_display_name = Some("must-not-leak-title".into());
-        let wire = serde_json::to_value(request(&built.scan.snapshots)).unwrap();
-        let item = &wire["snapshots"][0];
-        let allowed = BTreeSet::from([
-            "evidence_basis",
-            "source_session_id",
-            "snapshot_fingerprint",
-            "status",
-            "input_tokens",
-            "output_tokens",
-            "cache_read_tokens",
-            "cache_creation_5m_tokens",
-            "cache_creation_1h_tokens",
-            "reasoning_output_tokens",
-            "unattributed_total_tokens",
-            "request_count",
-            "usage_accounting_contract",
-            "removed_request_count",
-            "removed_usage",
-            "telemetry_owned_complete",
-            "resolver_conflict_count",
-            "model_usage",
-            "usage_buckets",
-            "cost",
-            "initiator",
-            "source_started_at",
-            "source_ended_at",
-            "source_last_activity_at",
-            "collected_at",
-            "provenance",
-            "request_evidence",
-            "request_identity_refusals",
-            "semantic_envelope",
-            "content_hash",
-        ]);
-        assert!(item
+        let built = page(&c, &mut p, &h, WireBudget::default());
+        assert_eq!(!built.scan.snapshots.is_empty(), emits, "{at} {ceiling:?}");
+        if at == "2026-08-02T06:30:00Z" {
+            assert!(!candidate(&p), "pre-T settlement");
+        }
+        files_held(&c);
+    }
+    pair(&c, &[]);
+    let mut p = progress();
+    assert!(build(&c, &mut p).scan.snapshots.is_empty());
+    assert!(!candidate(&p));
+    append(&c, false, &trace("unmatched", ""));
+    let mut partial = progress();
+    assert!(build(&c, &mut partial).scan.snapshots.is_empty());
+    assert!(candidate(&partial), "trace-only is owed, not healthy empty");
+    positive(&c);
+    let mut p = progress();
+    let built = build(&c, &mut p);
+    let accepted = send(&built, &mut p, Mode::ColdFull);
+    let bytes = fs::read(member(&c, false)).unwrap();
+    fs::remove_file(member(&c, false)).unwrap();
+    let held = build(&c, &mut p);
+    assert!(held.scan.snapshots.is_empty());
+    assert_held(ROOT, &accepted, &held_route(&accepted, &p), &accepted);
+    fs::write(member(&c, false), bytes).unwrap();
+    let repaired = build(&c, &mut p);
+    assert_eq!(
+        snapshot_upload_body_witness(&repaired.scan.snapshots[0]),
+        accepted.accepted[ROOT].witness
+    );
+    suppressed(&repaired, &mut p);
+    assert_held(ROOT, &accepted, &held_route(&accepted, &p), &accepted);
+    let mut h = hint();
+    h.claude_otel_only_pairing_floor = Some("2026-08-02T06:59:00Z".into());
+    assert!(page(&c, &mut p, &h, WireBudget::default())
+        .scan
+        .snapshots
+        .is_empty());
+    assert_no_smaller_reemit(ROOT, &accepted, &held_route(&accepted, &p), &accepted, true);
+}
+
+pub(super) fn save_failure() {
+    let c = Corpus::new("otel-save-notice");
+    otel::telemetry_notices::configure(&c.support, true).unwrap();
+    assert_eq!(relay_append(&c, &[ROOT]), (1, 1));
+    let bad = c.base.join("not-a-directory");
+    fs::write(&bad, b"file").unwrap();
+    let mut p = progress();
+    let mut scan = empty_scan(&c);
+    for (path, success) in [
+        (bad.join("progress.json"), false),
+        (c.base.join("saved.json"), true),
+    ] {
+        assert_eq!(
+            p.seed_telemetry(&c.support, &hint(), &mut scan, &ScanIndex::default(), &path)
+                .is_ok(),
+            success
+        );
+        assert_eq!(notice(&c).contains(ROOT), !success);
+        if !success {
+            let pending = notice(&c);
+            assert_eq!(relay_append(&c, &[COPY]), (1, 1));
+            assert!(notice(&c).is_superset(&pending));
+            assert_eq!(notice(&c), BTreeSet::from([ROOT.into(), COPY.into()]));
+        } else {
+            assert!(notice(&c).is_empty());
+        }
+    }
+    assert!(candidate(&p)); // Direct-append growth is checked by grow().
+}
+
+pub(super) fn refusal() {
+    let c = Corpus::new("otel-only-refusal");
+    positive(&c);
+    for permanent in [false, true] {
+        let mut p = progress();
+        let built = build(&c, &mut p);
+        let fp = built.scan.snapshots[0].snapshot_fingerprint.clone();
+        let _ = upload(&built.scan.snapshots, &mut p, |items| {
+            let mut response = crate::snapshot_sync::head_conflict_answer_tests::empty_ack();
+            response.rejected_entities = items
+                .iter()
+                .map(|item| crate::snapshot_client::SnapshotEntityRejection {
+                    source_session_id: item.source_session_id.clone(),
+                    snapshot_fingerprint: item.snapshot_fingerprint.clone(),
+                    reason: "invalid".into(),
+                    detail: "synthetic refusal".into(),
+                    permanent,
+                    occurrence_count: 1,
+                })
+                .collect();
+            Ok(response)
+        });
+        assert!(!p.accepted_body_witnesses.contains_key(&fp));
+        let candidate = candidate(&p);
+        assert_eq!(
+            candidate, !permanent,
+            "only a validated permanent refusal settles scheduling"
+        );
+        files_held(&c);
+    }
+}
+
+pub(super) fn wire(built: &mut Page) {
+    let item = &mut built.scan.snapshots[0];
+    item.workspace_hash = Some("must-not-leak-workspace".into());
+    item.source_file_fingerprint = Some("must-not-leak-file".into());
+    item.session_display_name = Some("must-not-leak-title".into());
+    let wire = value(request(&built.scan.snapshots)).unwrap();
+    let item = &wire["snapshots"][0];
+    let allowed = "evidence_basis source_session_id snapshot_fingerprint status input_tokens output_tokens cache_read_tokens reasoning_output_tokens unattributed_total_tokens request_count usage_accounting_contract removed_request_count removed_usage telemetry_owned_complete resolver_conflict_count model_usage usage_buckets cost initiator source_started_at source_ended_at source_last_activity_at collected_at provenance request_evidence request_identity_refusals semantic_envelope content_hash".split_whitespace().collect::<BTreeSet<_>>();
+    assert!(item
+        .as_object()
+        .unwrap()
+        .keys()
+        .all(|key| allowed.contains(key.as_str())));
+    assert_eq!(item["evidence_basis"], "otel_only");
+    assert_eq!(item["initiator"], "unknown");
+    assert_eq!(
+        item["provenance"]
             .as_object()
             .unwrap()
             .keys()
-            .all(|key| allowed.contains(key.as_str())));
-        assert_eq!(item["evidence_basis"], "otel_only");
-        assert_eq!(item["initiator"], "unknown");
-        assert_eq!(
-            item["provenance"]
-                .as_object()
-                .unwrap()
-                .keys()
-                .map(String::as_str)
-                .collect::<BTreeSet<_>>(),
-            BTreeSet::from(["collector", "input_token_scope"])
-        );
-        assert!(!wire.to_string().contains("must-not-leak"));
-    });
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["collector", "input_token_scope"])
+    );
+    assert!(!wire.to_string().contains("must-not-leak"));
 }
 
-#[test]
-fn transcript_twins_off_page_holders_and_takeover_preserve_existing_money() {
-    with_e2(|| {
-        for content_twin in [false, true] {
-            let mut c = Corpus::new("otel-only-twin-composition");
-            positive(&c);
-            let content = line(COPY, "before", AT, 11);
-            c.root(COPY, &content);
-            c.write_at(
-                &format!(
-                    "other/{}.jsonl",
-                    if content_twin {
-                        "9338a80a-f36e-4cbc-a5bb-50fc66430ba5"
-                    } else {
-                        COPY
-                    }
-                ),
-                &content,
-                "2026-08-02T07:00:00Z",
-            );
-            let mut p = progress();
-            let mut full = page(&c, &mut p, &hint(), WireBudget::default());
-            let synthetic = full
-                .scan
-                .snapshots
-                .iter()
-                .find(|item| item.evidence_basis == Some("otel_only"))
-                .unwrap();
+pub(super) fn takeover() {
+    let mut c = Corpus::new("otel-only-takeover-delete");
+    positive(&c);
+    let mut p = progress();
+    let only = build(&c, &mut p);
+    let accepted = send(&only, &mut p, Mode::ColdFull);
+    let before_takeover = restore(&p);
+    let path = c.root(ROOT, &line(ROOT, "before", AT, 11));
+    let mut transcript = build(&c, &mut p);
+    assert!(transcript_only(&transcript));
+    assert!(!candidate(&p));
+    assert_eq!(total(&transcript), 4);
+    let replacement = cas_takeover(&transcript, &mut p, Mode::Ram);
+    // Native share hints retain prior accepted keys across revisions.
+    // Both acquisition routes must start with that same ACK history.
+    let mut full = restore(&before_takeover);
+    let mut off = hint();
+    off.claude_otel_only_sessions_contract = None;
+    let reference = page(&c, &mut full, &off, WireBudget::default());
+    assert_equivalent(
+        &cas_takeover(&reference, &mut full, Mode::ColdFull),
+        &replacement,
+    );
+    assert_ne!(
+        replacement.accepted[ROOT].witness,
+        accepted.accepted[ROOT].witness
+    );
+    assert_eq!(replacement.accepted.len(), 1);
+    assert!(replacement.accepted.contains_key(ROOT));
+    let again = build(&c, &mut p);
+    suppressed(&again, &mut p);
+    let prior = settled_index(&c, &mut transcript, &p);
+    fs::remove_file(path).unwrap();
+    let mut next = progress();
+    let after = retained(&c, &mut next, prior, 1);
+    assert!(
+        transcript_only(&after),
+        "local deletion cannot create a telemetry downgrade"
+    );
+    assert!(p
+        .accepted_body_witnesses
+        .values()
+        .any(|value| value == &accepted.accepted[ROOT].witness));
+}
+
+fn cas_takeover(page: &Page, p: &mut Progress, mode: Mode) -> RouteResult {
+    use crate::snapshot_sync::head_conflict_answer_tests as cas;
+    let key = cache_session_key(ROOT);
+    let prior = p.accepted_body_witnesses.clone();
+    let stale = "1".repeat(64);
+    p.accepted_cache_heads.insert(key.clone(), stale.clone());
+    for accepted in [false, true] {
+        let mut offered = Vec::new();
+        let (result, wires) = cas::cycle_with_transport(
+            p,
+            &page.scan.snapshots,
+            1000 + u64::from(accepted),
+            |_| 0,
+            |_| true,
+            |request, _| {
+                offered = request.snapshots.clone();
+                assert_eq!(offered.len(), 1);
+                Ok(if accepted {
+                    cas::accepted(&offered[0], &"2".repeat(64))
+                } else {
+                    cas::conflict(&offered[0], &cas::challenge(0xc))
+                })
+            },
+        );
+        let envelope = cas::envelope(&wires[0]);
+        if !accepted {
             assert_eq!(
-                synthetic.request_count, 3,
-                "a copy carrier holds its request independently of emitted bodies"
+                result.unwrap(),
+                ResumableUploadResult::Deferred {
+                    count: 1,
+                    isolated: 1
+                }
             );
-            let cold = send(&full, &mut p, Mode::ColdFull);
-            accept_upload_context_acks_for_test(
-                &mut full.index,
-                &full.scan.snapshots,
-                &p.fresh_context_body_acks,
-            );
-            let saved = c.reload(&mut full.index);
-            let mut next = progress();
-            let other = page_from(&c, &mut next, &hint(), WireBudget::default(), saved, 100);
-            // Unchanged transcript carriers may be omitted: only newly offered
-            // telemetry money is compared with the same cold entity, and the
-            // retained native census must continue vetoing the copied request.
             assert_eq!(
-                other
-                    .scan
-                    .snapshots
-                    .iter()
-                    .find(|item| item.evidence_basis == Some("otel_only"))
-                    .unwrap()
-                    .request_count,
-                3
+                p.accepted_body_witnesses, prior,
+                "conflict earns no custody"
             );
-            let mut fresh = progress();
-            let reference = page(&c, &mut fresh, &hint(), WireBudget::default());
-            money_oracle::assert_equivalent(&cold, &send(&reference, &mut fresh, Mode::Restart));
+            assert_eq!(envelope["base_head_etag"], stale);
+            assert_eq!(p.accepted_cache_heads[&key], stale);
+            *p = restore(p);
+            assert_eq!(
+                p.head_conflict_challenges[&key].challenge,
+                cas::challenge(0xc)
+            );
+        } else {
+            assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+            assert_eq!(envelope["conflict_head_challenge"], cas::challenge(0xc));
+            assert_eq!(envelope["forced_full_rescan"], true);
+            assert!(envelope.get("base_head_etag").is_none());
+            assert_eq!(p.accepted_cache_heads[&key], "2".repeat(64));
+            assert!(!p.head_conflict_challenges.contains_key(&key));
+            return delivered(&offered, p, mode, wires.iter().map(canonical).collect());
         }
-        let mut c = Corpus::new("otel-only-takeover-delete");
-        positive(&c);
-        let mut p = progress();
-        let only = page(&c, &mut p, &hint(), WireBudget::default());
-        let accepted = send(&only, &mut p, Mode::ColdFull);
-        let before_takeover = restore(&p);
-        let path = c.root(ROOT, &line(ROOT, "before", AT, 11));
-        let mut transcript = page(&c, &mut p, &hint(), WireBudget::default());
-        assert!(transcript
-            .scan
-            .snapshots
-            .iter()
-            .all(|item| item.evidence_basis.is_none()));
-        assert!(
-            serde_json::to_value(&p).unwrap()["telemetry_only"]["candidates"]
-                .as_object()
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(
-            transcript
-                .scan
-                .snapshots
-                .iter()
-                .map(|item| item.request_count)
-                .sum::<u64>(),
-            4
-        );
-        let replacement = send(&transcript, &mut p, Mode::Ram);
-        // Native share hints retain prior accepted keys across revisions.
-        // Both acquisition routes must start with that same ACK history.
-        let mut full = restore(&before_takeover);
-        let reference = page(&c, &mut full, &hint(), WireBudget::default());
-        money_oracle::assert_equivalent(&send(&reference, &mut full, Mode::ColdFull), &replacement);
-        assert_ne!(
-            replacement.accepted[ROOT].witness,
-            accepted.accepted[ROOT].witness
-        );
-        assert_eq!(
-            replacement
-                .accepted
-                .keys()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
-            vec![ROOT]
-        );
-        let again = page(&c, &mut p, &hint(), WireBudget::default());
-        let (result, batches, _) = upload(&again.scan.snapshots, &mut p, ack);
-        assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
-        assert!(
-            batches.is_empty(),
-            "ordinary exact ACK suppresses the replaced body"
-        );
-        accept_upload_context_acks_for_test(
-            &mut transcript.index,
-            &transcript.scan.snapshots,
-            &p.fresh_context_body_acks,
-        );
-        let prior = c.reload(&mut transcript.index);
-        std::fs::remove_file(path).unwrap();
-        let mut next = progress();
-        let after = page_from(&c, &mut next, &hint(), WireBudget::default(), prior, 1);
-        assert!(
-            after
-                .scan
-                .snapshots
-                .iter()
-                .all(|item| item.evidence_basis.is_none()),
-            "local deletion cannot create a telemetry downgrade"
-        );
-        assert!(p
-            .accepted_body_witnesses
-            .values()
-            .any(|value| value == &accepted.accepted[ROOT].witness));
-    });
+    }
+    unreachable!("accepted cycle returns the verified route")
 }
