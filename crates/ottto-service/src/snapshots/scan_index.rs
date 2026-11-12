@@ -49,6 +49,10 @@ pub struct ScanIndex {
     /// RAM-only pacing spans ordinary + continuation pages, never durable authority.
     #[serde(skip)]
     pub(super) withheld_memo: withheld_account::Memo,
+    /// This pass's destination bootstrap or replay still needs its census:
+    /// the first read is pending. Set at prepare; never saved.
+    #[serde(skip)]
+    pub(super) first_read_pending: bool,
     #[serde(default = "scan_index_schema_version")]
     pub schema_version: u16,
     #[serde(default)]
@@ -610,6 +614,7 @@ impl Default for ScanIndex {
             persistence_legacy_recovery: None,
             decode_holds: lenient_decode::Holds::default(),
             withheld_memo: Default::default(),
+            first_read_pending: false,
             schema_version: SCAN_INDEX_SCHEMA_VERSION,
             generation: 0,
             upload_ack_retirement_handoff: None,

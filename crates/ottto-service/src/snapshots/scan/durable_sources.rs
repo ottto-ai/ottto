@@ -1,5 +1,6 @@
 //! One dispatch table for admitted sources.
 use crate::snapshots::*;
+use first_read_order::FirstReadOrder;
 
 /// Sources admitted by the durable property table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -16,6 +17,8 @@ pub(crate) struct Properties {
     /// route's custody wins, and clearing it would let v1 load the frozen
     /// JSON. Leaving needs an explicit export back to v1.
     pub(crate) state_v2: bool,
+    /// Queue order during the source's first read (`first_read_order.rs`).
+    pub(crate) first_read_order: FirstReadOrder,
 }
 
 // Enum ordinals index this table and Stores' slots.
@@ -24,16 +27,21 @@ pub(crate) const SOURCES: &[Properties] = &[
         source: DurableSource::ClaudeCode,
         snapshot: SnapshotSource::ClaudeCode,
         state_v2: true,
+        // A copied session waits for its original in the same folder, so
+        // folders move as a whole and read oldest birth first inside.
+        first_read_order: FirstReadOrder::NewestFolderFirst,
     },
     Properties {
         source: DurableSource::Codex,
         snapshot: SnapshotSource::Codex,
         state_v2: true,
+        first_read_order: FirstReadOrder::NewestFirst,
     },
     Properties {
         source: DurableSource::Pi,
         snapshot: SnapshotSource::Pi,
         state_v2: true,
+        first_read_order: FirstReadOrder::NewestFirst,
     },
 ];
 
