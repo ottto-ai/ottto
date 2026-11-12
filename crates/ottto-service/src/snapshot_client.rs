@@ -1795,6 +1795,8 @@ impl SnapshotStatusRequest {
             // Daemon process health, not scan evidence: a beat is exactly the
             // cadence it is meant to travel on (public ottto#440).
             control_plane: _,
+            // First-read progress is terminal scan-status evidence only.
+            first_read,
         } = self;
         // A collector reporting itself disabled is making a durable state
         // report, which is the opposite of a liveness beat. The backend
@@ -1819,6 +1821,9 @@ impl SnapshotStatusRequest {
         }
         if last_census_pending_file_count.is_some() {
             return Some("last_census_pending_file_count");
+        }
+        if first_read.is_some() {
+            return Some("first_read");
         }
         if last_census_block_cause.is_some() {
             return Some("last_census_block_cause");
@@ -4377,6 +4382,7 @@ mod tests {
             parser_version: Some(CODEX_SNAPSHOT_PARSER_VERSION.to_string()),
             manifest: None,
             control_plane: None,
+            first_read: None,
         }
     }
 
@@ -4684,6 +4690,7 @@ mod tests {
                 rolling_hash: "b".repeat(64),
             }),
             control_plane: None,
+            first_read: None,
         };
         let serialized = serde_json::to_string(&status).expect("serialize");
         assert!(!serialized.contains(".codex"));
@@ -4759,6 +4766,7 @@ mod tests {
                 rolling_hash: "b".repeat(64),
             }),
             control_plane: None,
+            first_read: None,
         }
     }
 

@@ -128,6 +128,7 @@ pub(in crate::snapshots) fn observe(
 /// anchor, and the members this page observed.
 #[derive(Default)]
 pub(in crate::snapshots) struct PageState {
+    pub(in crate::snapshots) source: Option<SnapshotSource>,
     pub(in crate::snapshots) anchor_ms: Option<u64>,
     pub(in crate::snapshots) members: Vec<(String, Observed)>,
     pub(in crate::snapshots) edit: Option<FirstReadEdit>,
@@ -141,12 +142,16 @@ impl PageState {
     /// and no root problem certifies an empty one at once. An unreadable
     /// summary is no generation: nothing is written until it reads again.
     pub(in crate::snapshots) fn begin(
+        source: SnapshotSource,
         index: &ScanIndex,
         route: &Path,
         anchor_at: Option<(u64, bool)>,
         now_ms: u64,
     ) -> Self {
-        let mut page = Self::default();
+        let mut page = Self {
+            source: Some(source),
+            ..Self::default()
+        };
         match state_v2::first_read_summary(index) {
             Ok(Some(summary)) => {
                 page.anchor_ms = summary.open().then_some(summary.anchor_at_ms);
@@ -155,12 +160,15 @@ impl PageState {
                 Ok(Some(anchor_ms)) => page.anchor_ms = Some(anchor_ms),
                 Ok(None) if index.first_read_pending && index.files.is_empty() => {
                     if let Some((anchor_ms, empty)) = anchor_at {
-                        let edit = FirstReadEdit {
-                            anchor_at_ms: Some(anchor_ms),
-                            certify_at_ms: empty.then_some(now_ms),
-                            empty_inventory: empty,
-                            ..Default::default()
-                        };
+                        let edit = decorated(
+                            source,
+                            Some(FirstReadEdit {
+                                anchor_at_ms: Some(anchor_ms),
+                                certify_at_ms: empty.then_some(now_ms),
+                                empty_inventory: empty,
+                                ..Default::default()
+                            }),
+                        );
                         if state_v2::observe_first_read(route, Vec::new(), Some(edit)).is_ok() {
                             page.anchor_ms = Some(anchor_ms);
                         }
@@ -206,8 +214,154 @@ impl PageState {
         if members.is_empty() && edit.is_none() {
             return Ok(());
         }
+        let edit = match self.source {
+            Some(source) => Some(decorated(source, edit)),
+            None => edit,
+        };
         state_v2::observe_first_read(route, members, edit)
     }
+}
+
+/// `edit` with the process's current source promise and the last block
+/// instant sent for `source`, so a freeze in this commit stamps `done_at`
+/// after every block already sent and stores the promise it froze with.
+pub(in crate::snapshots) fn decorated(
+    source: SnapshotSource,
+    edit: Option<FirstReadEdit>,
+) -> FirstReadEdit {
+    let state = blocks();
+    let mut edit = edit.unwrap_or_default();
+    edit.merge(FirstReadEdit {
+        sources_enabled: state.sources,
+        floor_ms: state.last_sent.get(source.api_slug()).copied(),
+        ..Default::default()
+    });
+    edit
+}
+
+/// Process state of the `first_read` block: each (destination, source)
+/// summary as of its last durable index save, the enabled-source promise, and
+/// the last `computed_at` sent per source. One destination at a time.
+#[derive(Default)]
+struct Blocks {
+    namespace: String,
+    summaries: BTreeMap<&'static str, Summary>,
+    sources: Option<u64>,
+    last_sent: BTreeMap<&'static str, u64>,
+}
+
+fn blocks() -> std::sync::MutexGuard<'static, Blocks> {
+    static BLOCKS: std::sync::OnceLock<std::sync::Mutex<Blocks>> = std::sync::OnceLock::new();
+    BLOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Sources in wire order (slug order); the stored mask uses these bits.
+const SOURCES: [SnapshotSource; 3] = [
+    SnapshotSource::ClaudeCode,
+    SnapshotSource::Codex,
+    SnapshotSource::Pi,
+];
+
+fn bit(source: SnapshotSource) -> u64 {
+    1 << SOURCES.iter().position(|s| *s == source).unwrap_or(63)
+}
+
+/// The cycle's enabled and granted sources: the promise an open block sends.
+pub(crate) fn note_first_read_sources(sources: &[SnapshotSource]) {
+    blocks().sources = Some(sources.iter().fold(0, |mask, source| mask | bit(*source)));
+}
+
+/// After a durable index save: the committed summary the next scan-status
+/// block reports. An unreadable or absent summary withdraws the block.
+pub(crate) fn note_first_read(namespace: &str, source: SnapshotSource, index: &ScanIndex) {
+    let summary = state_v2::first_read_summary(index).ok().flatten();
+    let mut state = blocks();
+    if state.namespace != namespace {
+        state.namespace = namespace.to_owned();
+        state.summaries.clear();
+        state.last_sent.clear();
+    }
+    match summary {
+        Some(summary) => state.summaries.insert(source.api_slug(), summary),
+        None => state.summaries.remove(source.api_slug()),
+    };
+}
+
+/// The scan-status `first_read` block of `source`, if its first read has an
+/// anchor. While open `computed_at` strictly increases per process; a frozen
+/// block is the same bytes on every send.
+pub(crate) fn first_read_block(
+    namespace: &str,
+    source: SnapshotSource,
+) -> Option<crate::snapshot_client::FirstReadV1> {
+    let now_ms = sampled_scan::now_seconds().saturating_mul(1000);
+    let mut state = blocks();
+    if state.namespace != namespace {
+        return None;
+    }
+    let summary = *state.summaries.get(source.api_slug())?;
+    let (computed_ms, mask) = match summary.done_at_ms {
+        Some(done_at_ms) => (done_at_ms, summary.sources_enabled),
+        None => {
+            let floor = state
+                .last_sent
+                .get(source.api_slug())
+                .map_or(0, |sent| sent.saturating_add(1));
+            let at = now_ms.max(floor).max(summary.anchor_at_ms);
+            state.last_sent.insert(source.api_slug(), at);
+            (at, state.sources.unwrap_or(summary.sources_enabled))
+        }
+    };
+    Some(block(&summary, computed_ms, mask | bit(source)))
+}
+
+/// The V1 block of `summary` computed at `computed_ms` with `mask`.
+pub(in crate::snapshots) fn block(
+    summary: &Summary,
+    computed_ms: u64,
+    mask: u64,
+) -> crate::snapshot_client::FirstReadV1 {
+    let counts = &summary.counts;
+    crate::snapshot_client::FirstReadV1 {
+        v: 1,
+        computed_at: instant(computed_ms),
+        anchor_at: instant(summary.anchor_at_ms),
+        first_read_cutoff: instant(boundaries(summary.anchor_at_ms)[0]),
+        listing_complete: summary.certified_at_ms.is_some(),
+        files_total: counts.members,
+        files_done: counts.done,
+        files_held: counts.held,
+        files_excluded: counts.excluded,
+        files_failed_retryable: counts.failed,
+        bytes_total: counts.bytes_total,
+        bytes_done: counts.bytes_done,
+        complete_since: complete_since(summary).map(instant),
+        done: summary.done_at_ms.is_some(),
+        sources_enabled: SOURCES
+            .iter()
+            .filter(|source| mask & bit(**source) != 0)
+            .map(|source| source.api_slug().to_owned())
+            .collect(),
+    }
+}
+
+/// RFC3339 UTC with millisecond precision.
+pub(in crate::snapshots) fn instant(ms: u64) -> String {
+    let at = time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000)
+        .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        at.year(),
+        u8::from(at.month()),
+        at.day(),
+        at.hour(),
+        at.minute(),
+        at.second(),
+        at.millisecond()
+    )
 }
 
 /// Summary fields at the time the block is computed.

@@ -328,7 +328,11 @@ impl Commit {
         observed: Observed,
     ) -> Result<Counts> {
         let mut counts = self.summary.map(|s| s.counts).unwrap_or_default();
-        let old = read_member(tx, file)?;
+        // An unreadable row is left as it is (it already counts, and the
+        // freeze recount refuses it): it never rolls back the file's debt.
+        let Ok(old) = read_member(tx, file) else {
+            return Ok(counts);
+        };
         let new = resolve(old, observed);
         if old != Some(new) {
             put_inline(tx, &member_row(file)?, &new.encode())?;

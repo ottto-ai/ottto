@@ -605,7 +605,7 @@ impl<'a> Page<'a> {
             .filter(|_| (root_walk && begins) || no_roots)
             .map(|anchor_ms| (anchor_ms, no_roots && !(root_walk && begins)));
         let first_read = route.as_deref().map_or_else(Default::default, |route| {
-            first_read::PageState::begin(index, route, anchor_at, now_ms)
+            first_read::PageState::begin(source, index, route, anchor_at, now_ms)
         });
         Self {
             source,
@@ -933,6 +933,10 @@ impl<'a> Page<'a> {
                     })
                     .and_then(|(anchor_ms, started_at)| first_read::certify(started_at, anchor_ms));
                 if let Some(edit) = certificate {
+                    let edit = match first_read.source {
+                        Some(source) => first_read::decorated(source, Some(edit)),
+                        None => edit,
+                    };
                     if state_v2::observe_first_read(&route, Vec::new(), Some(edit)).is_err() {
                         return Some(Report::UNAVAILABLE);
                     }
@@ -958,7 +962,7 @@ pub(crate) fn settle_first_read<'a>(
         return;
     };
     let now_ms = sampled_scan::now_seconds().saturating_mul(1000);
-    let mut first_read = first_read::PageState::begin(index, &route, None, now_ms);
+    let mut first_read = first_read::PageState::begin(source, index, &route, None, now_ms);
     if first_read.anchor_ms.is_none() {
         return;
     }

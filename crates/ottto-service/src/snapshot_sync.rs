@@ -3650,6 +3650,7 @@ fn save_index_and_publish_manifest(
     // concurrent heartbeat repeat stale agreement.
     withdraw_source_manifest(destination_namespace, source);
     index.save(index_path)?;
+    crate::snapshots::note_first_read(destination_namespace, source, index);
     if census_complete {
         publish_source_manifest(
             destination_namespace,
@@ -5319,6 +5320,7 @@ fn sync_once_with_retry(
         .map_err(|_| anyhow!("snapshot account authority unavailable"))?;
     let client = snapshot_cycle_client(support_dir, daemon)?;
     let enabled_sources = cycle_heartbeat(&client, &device, &device_secret, &machine_id, daemon);
+    crate::snapshots::note_first_read_sources(&enabled_sources);
 
     // Cycle-start scan receipts: one cheap non-terminal status per enabled
     // source before any scanning. Sources late in the sequential cycle would
@@ -11800,6 +11802,9 @@ fn collector_status_request(
         manifest,
         // A scan result, not a check-in: the field stays off this wire shape.
         control_plane: None,
+        // First-read progress from the last durable save of this source's
+        // index; omitted (no update) before an anchor or when unreadable.
+        first_read: crate::snapshots::first_read_block(destination_namespace, status.source),
     };
     Ok(request)
 }
@@ -12101,6 +12106,7 @@ fn report_checkin_status(
         // plane Setup, Repair, Verify and the Companion use is too. `None`
         // outside a serving daemon process.
         control_plane: crate::control_plane_health::snapshot(),
+        first_read: None,
     };
     small_source_upload(source, || client.report_status(relay_token, &request))?;
     Ok(())

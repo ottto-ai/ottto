@@ -130,7 +130,7 @@ mod claude_terminal_e2_retry_tests;
 #[cfg(test)]
 mod contract5_cutover_tests;
 use upload::freshness_debt as g7_debt;
-pub(crate) use upload::freshness_debt::first_read::{first_read_block, note_first_read_sources};
+pub(crate) use upload::freshness_debt::first_read::{first_read_block, note_first_read, note_first_read_sources};
 pub(crate) use upload::freshness_debt::settle_first_read;
 pub(crate) use upload::money_freshness;
 
