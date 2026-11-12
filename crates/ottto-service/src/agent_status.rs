@@ -1941,6 +1941,19 @@ fn append_configured_codex_unavailable_snapshots(
                 "This previously accepted Codex account and workspace remains configured; its current identity and limits could not be verified.",
             ).with_quota_binding(Some(account.clone()), Some(workspace.clone())),
         );
+        // A dead login's needs-login cause rides along, so the web can show it.
+        if let Some(needs_login) = candidate
+            .snapshot
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "codex_account_needs_login")
+        {
+            snapshot.diagnostics.push(
+                needs_login
+                    .clone()
+                    .with_quota_binding(Some(account.clone()), Some(workspace.clone())),
+            );
+        }
         snapshots.push(snapshot);
     }
 }

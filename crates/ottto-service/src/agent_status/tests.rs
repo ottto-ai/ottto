@@ -4259,6 +4259,32 @@ fn codex_managed_home_whose_refresh_is_dead_needs_a_new_sign_in() {
     };
     assert_eq!(snapshot_codes(&dead), 1);
     assert_eq!(snapshot_codes(&fresh), 0);
+    // The uploaded copy: the registered pair's unavailable snapshot carries
+    // it once; a healthy (bound) slot adds no snapshot here.
+    let mut uploaded = Vec::new();
+    append_configured_codex_unavailable_snapshots(
+        &mut uploaded,
+        std::slice::from_ref(&dead),
+        "2026-08-26T00:05:00Z",
+        "2026-08-26T00:20:00Z",
+    );
+    assert_eq!(uploaded.len(), 1);
+    assert_eq!(
+        uploaded[0]
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "codex_account_needs_login")
+            .count(),
+        1
+    );
+    let mut healthy = Vec::new();
+    append_configured_codex_unavailable_snapshots(
+        &mut healthy,
+        std::slice::from_ref(&fresh),
+        "2026-08-26T00:05:00Z",
+        "2026-08-26T00:20:00Z",
+    );
+    assert!(healthy.is_empty());
     // Nothing binds to it: identity and placement are unchanged.
     assert!(dead.binding.is_none());
     assert!(dead.status.account_identifier_hash.is_none());
