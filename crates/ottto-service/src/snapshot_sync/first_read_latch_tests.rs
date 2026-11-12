@@ -36,6 +36,7 @@ fn first_read_latch_new_destination_full_claim_money_oracle() {
                 "2026-08-02T09:00:00Z",
                 HistoryCycle {
                     destination: Some("new-destination"),
+                    bootstrapped: false,
                     ..HISTORY_CURRENT
                 },
             );
@@ -93,6 +94,7 @@ fn first_read_latch_marker_from_claim_keeps_cutoff_and_here() {
             "2026-08-02T09:00:00Z",
             HistoryCycle {
                 destination: Some("from-destination"),
+                bootstrapped: false,
                 ..HISTORY_CURRENT
             },
         );
@@ -146,6 +148,7 @@ fn first_read_latch_quarantine_and_process_wide_repair_until_restart() {
                 .unwrap();
                 let cycle = HistoryCycle {
                     destination: Some("repair-destination"),
+                    bootstrapped: false,
                     ..HISTORY_CURRENT
                 };
                 let held = fixture.cycle("2026-08-02T10:00:00Z", cycle);
