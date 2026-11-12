@@ -364,6 +364,10 @@ pub(super) fn malloc_zone() -> (Option<u64>, Option<u64>) {
     (None, None)
 }
 
+pub(super) fn malloc_in_use() -> Option<u64> {
+    malloc_zone().0
+}
+
 impl Observation {
     pub(super) fn memory(&self) -> (StateV2Memory, StateV2Memory) {
         (self.memory_end, self.memory_peak)
@@ -553,8 +557,4 @@ mod tests {
     fn native_reader_returns_current_bytes() {
         assert!(current().rss_bytes.is_some_and(|bytes| bytes > 0));
     }
-}
-
-pub(super) fn malloc_in_use() -> Option<u64> {
-    malloc_zone().0
 }
