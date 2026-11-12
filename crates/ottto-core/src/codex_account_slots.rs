@@ -1287,13 +1287,17 @@ impl FileCodexAccountSlotSettingsStore {
         {
             return Ok(());
         }
-        move_sealed_login(
-            &self
-                .slot_root_unchecked(slot_id)?
-                .join(SIGN_IN_STAGING_DIR_NAME),
-            &self.slot_home(slot_id)?,
-        )
-        .map_err(|error| {
+        let staging = self
+            .slot_root_unchecked(slot_id)?
+            .join(SIGN_IN_STAGING_DIR_NAME);
+        // Nothing set aside: the usual case, or a slot tree already gone.
+        if matches!(
+            fs::symlink_metadata(staging.join(SEALED_LOGIN_FILE_NAME)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        ) {
+            return Ok(());
+        }
+        move_sealed_login(&staging, &self.slot_home(slot_id)?).map_err(|error| {
             CodexAccountSlotSettingsError::State(format!(
                 "move the accepted Codex login into its home: {error}"
             ))
