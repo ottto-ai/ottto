@@ -203,6 +203,10 @@ pub(crate) struct Candidate {
 }
 
 impl Candidate {
+    /// The file this receipt candidate belongs to.
+    pub(crate) fn key(&self) -> &str {
+        &self.key
+    }
     /// A file's ACKs may split across passes; its
     /// receipt still waits until every body is exact-ACKed in this context.
     pub(crate) fn with_split_evidence(

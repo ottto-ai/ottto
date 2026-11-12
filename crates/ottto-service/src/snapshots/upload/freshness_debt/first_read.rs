@@ -131,6 +131,8 @@ pub(in crate::snapshots) struct PageState {
     pub(in crate::snapshots) anchor_ms: Option<u64>,
     pub(in crate::snapshots) members: Vec<(String, Observed)>,
     pub(in crate::snapshots) edit: Option<FirstReadEdit>,
+    /// The ACK seam reconciles existing members only.
+    pub(in crate::snapshots) settle_only: bool,
 }
 impl PageState {
     /// The open generation of this route: the committed summary, else the
@@ -186,6 +188,9 @@ impl PageState {
         let Ok(prior) = state_v2::first_read_member(index, key) else {
             return;
         };
+        if self.settle_only && prior.is_none() {
+            return;
+        }
         let Some(observed) = observe(anchor_ms, now_ms, inputs, prior) else {
             return;
         };

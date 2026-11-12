@@ -1574,6 +1574,29 @@ pub enum CensusBlockCause {
     Other,
 }
 
+/// One source's first-read progress (`first_read` V1), carried only by
+/// scan-status reports. Counts and instants only: no path or file identity.
+/// While open, `computed_at` increases; at `done` the whole block freezes and
+/// every later report repeats it byte for byte.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FirstReadV1 {
+    pub v: u8,
+    pub computed_at: String,
+    pub anchor_at: String,
+    pub first_read_cutoff: String,
+    pub listing_complete: bool,
+    pub files_total: u64,
+    pub files_done: u64,
+    pub files_held: u64,
+    pub files_excluded: u64,
+    pub files_failed_retryable: u64,
+    pub bytes_total: u64,
+    pub bytes_done: u64,
+    pub complete_since: Option<String>,
+    pub done: bool,
+    pub sources_enabled: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotStatusRequest {
     pub schema_version: u16,
@@ -1688,6 +1711,11 @@ pub struct SnapshotStatusRequest {
     /// reloading.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_plane: Option<crate::control_plane_health::ControlPlaneHealth>,
+    /// First-read progress, carried only by scan-status reports once the
+    /// destination's first read has an anchor. Additive and optional: an
+    /// older backend ignores it; omitted means no update, never a reset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_read: Option<FirstReadV1>,
 }
 
 impl SnapshotStatusRequest {

@@ -945,6 +945,59 @@ impl<'a> Page<'a> {
     }
 }
 
+/// The ACK seam: before the pass's save, each received file that is already
+/// a first-read member is reconciled again against the receipts just
+/// accepted, so its debt and its member row commit with that ACK state (or
+/// are dropped with it). Files that are not members yet wait for the listing.
+pub(crate) fn settle_first_read<'a>(
+    source: SnapshotSource,
+    index: &ScanIndex,
+    keys: impl IntoIterator<Item = &'a str>,
+) {
+    let Ok(Some(route)) = state_v2::tail_route_path(index) else {
+        return;
+    };
+    let now_ms = sampled_scan::now_seconds().saturating_mul(1000);
+    let mut first_read = first_read::PageState::begin(index, &route, None, now_ms);
+    if first_read.anchor_ms.is_none() {
+        return;
+    }
+    first_read.settle_only = true;
+    let mut fold = WalkFold::EMPTY;
+    let mut page = Page {
+        source,
+        route: Some(route.clone()),
+        root_walk: false,
+        fold: &mut fold,
+        staged: Vec::new(),
+        unindexed: Vec::new(),
+        errors: (0, 0),
+        now_ms,
+        last_complete: index.tail_discovery.last_complete_discovery_at,
+        first_read,
+    };
+    for key in keys.into_iter().collect::<BTreeSet<_>>() {
+        let path = Path::new(key);
+        let Ok(metadata) = std::fs::metadata(path) else {
+            continue;
+        };
+        page.listed(
+            index,
+            Listing {
+                path,
+                metadata: &metadata,
+                in_window: true,
+            },
+        );
+    }
+    let staged = std::mem::take(&mut page.staged);
+    // A failed stage leaves the debt and the member for the next listing.
+    if !staged.is_empty() && state_v2::observe_tails(&route, staged).is_err() {
+        return;
+    }
+    let _ = page.first_read.stage(&route);
+}
+
 /// Claude history the gate holds as Listed (`decide` or stricter), not refused.
 /// No source guard: the list loads only for Claude, so it is empty elsewhere.
 fn listed_history_held(index: &ScanIndex, key: &str, listing: &Listing<'_>) -> bool {

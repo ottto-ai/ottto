@@ -8753,8 +8753,9 @@ fn finish_sync_source(
     )?;
     // Every selected-state restoration above has finished. Retire the Claude
     // prior index before the full disk-index CAS decode.
+    let receipt_candidates = upload_progress.split_context_receipt_candidates();
     let context_rearm_counts = index.accept_file_upload_context_acks(
-        &upload_progress.split_context_receipt_candidates(),
+        &receipt_candidates,
         &upload_progress.fresh_context_body_acks,
         &upload_progress.covered_stale_bodies(),
     );
@@ -8763,6 +8764,15 @@ fn finish_sync_source(
         &upload_progress.accepted_body_witnesses,
         &upload_progress.accepted_body_contexts,
     );
+    // First-read members settle against these receipts in the same commit.
+    crate::snapshots::settle_first_read(
+        source,
+        &index,
+        receipt_candidates
+            .iter()
+            .map(crate::snapshots::UploadContextReceiptCandidate::key),
+    );
+    drop(receipt_candidates);
     let telemetry_removed = claude_scan_roots.as_ref().map(|_| {
         crate::snapshots::claude_telemetry_retention::removed_index_keys(&committed_index, &index)
     });
