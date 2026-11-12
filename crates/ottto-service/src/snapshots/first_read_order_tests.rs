@@ -5,6 +5,7 @@ use super::e2_pipeline_scan_fixture::{self as fixture, E2ScanFixture};
 use super::first_read_order::{sort, FirstReadOrder};
 use super::*;
 use sampled_scan::transition_fixture::{money_oracle, scan_money};
+use sha2::{Digest, Sha256};
 use std::time::Duration;
 
 const DAY: u64 = 24 * 60 * 60;
@@ -436,6 +437,123 @@ fn born(path: &Path) -> SystemTime {
     after
 }
 
+const ORGS: [&str; 2] = [
+    "11111111-1111-4111-8111-111111111111",
+    "22222222-2222-4222-8222-222222222222",
+];
+
+/// Rewrites `other` (two requests) with an org marker before each request,
+/// switching org mid-session, and writes its sidecar: one API row per
+/// request (accounts `a` and `b`) plus one sidecar-only side call.
+fn tag_accounts(support: &Path, other: &Path, born: &SystemTime) {
+    let session = other.file_stem().unwrap().to_str().unwrap().to_owned();
+    let folder = "b-new";
+    let mut text = String::new();
+    let mut api = Vec::new();
+    let mut side = crate::snapshots::tests::complete_api_row(&session, "side-call", 1, 7, 2, 0);
+    side.client_request_id = "side-client".into();
+    side.observed_at = clock_after(*born, 5);
+    side.app_version = "2.1.229".into();
+    side.effort = "".into();
+    side.speed = "".into();
+    side.cost_usd_micros = Some(1);
+    side.account_identifier_hash = Some("b".repeat(64).into());
+    api.push(side.clone());
+    for n in 0..2u64 {
+        let id = format!("{folder}-o-{n}");
+        let clock = clock_after(*born, 1 + n);
+        text += &(json!({"type":"attachment", "sessionId":session,
+            "attachment":{"type":"credential_org", "organizationUuid":ORGS[n as usize]}})
+        .to_string()
+            + "\n");
+        text += &assistant(&session, &id, &clock, 20);
+        let mut row = side.clone();
+        row.request_id = id.clone();
+        row.client_request_id = format!("client-{id}");
+        row.observed_at = clock;
+        row.input_tokens = 20;
+        row.output_tokens = 1;
+        row.event_sequence = Some(n + 2);
+        row.account_identifier_hash = Some(if n == 0 { "a" } else { "b" }.repeat(64).into());
+        api.push(row);
+    }
+    fs::write(other, text).unwrap();
+    let mut traces = Vec::new();
+    for row in &mut api {
+        row.fingerprint.clear();
+        row.fingerprint = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(&row).unwrap())
+        );
+        let mut trace = crate::snapshots::tests::complete_trace_row(&session, &row.request_id, "");
+        trace.client_request_id = row.client_request_id.clone();
+        trace.observed_at = row.observed_at.clone();
+        trace.fingerprint.clear();
+        trace.fingerprint = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(&trace).unwrap())
+        );
+        traces.push(trace);
+    }
+    for (directory, rows) in [
+        (
+            "claude-code-effort",
+            api.iter()
+                .map(|row| serde_json::to_string(row).unwrap() + "\n")
+                .collect::<String>(),
+        ),
+        (
+            "claude-code-trace-ownership",
+            traces
+                .iter()
+                .map(|row| serde_json::to_string(row).unwrap() + "\n")
+                .collect::<String>(),
+        ),
+    ] {
+        let sidecar = support
+            .join("local-otel")
+            .join(directory)
+            .join(format!("{:x}.jsonl", Sha256::digest(session.as_bytes())));
+        fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
+        fs::write(sidecar, rows).unwrap();
+    }
+}
+
+/// The money-check positive control on an emitted route: a tagged row, two
+/// accounts and an untagged row (the evidence gap).
+fn assert_positive_control(route: &sampled_scan::transition_fixture::RouteResult) {
+    let rows = route
+        .snapshots
+        .values()
+        .flat_map(|s| s["usage_buckets"].as_array().unwrap())
+        .flat_map(|b| b["model_usage"].as_array().unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        rows.iter()
+            .any(|r| !r["evidence_ref"].is_null() || !r["identity_parts"].is_null()),
+        "positive tagged-row control"
+    );
+    let accounts = rows
+        .iter()
+        .flat_map(|row| {
+            row["identity_parts"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or(std::slice::from_ref(*row))
+        })
+        .filter_map(|part| part["account_identifier_hash"].as_str())
+        .collect::<BTreeSet<_>>();
+    assert!(
+        accounts.contains("a".repeat(64).as_str()) && accounts.contains("b".repeat(64).as_str()),
+        "two-account control: {accounts:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row["evidence_ref"].is_null() && row["identity_parts"].is_null()),
+        "evidence-gap control"
+    );
+}
+
 impl ClaudeHistory {
     /// Copied requests per copy.
     const COPIED: u64 = 2;
@@ -449,7 +567,8 @@ impl ClaudeHistory {
         let mut folders = Vec::new();
         let mut distinct = BTreeSet::new();
         // `a-old` lists first, so the walk (FIFO) reads it first.
-        for (slot, (folder, day)) in [("a-old", 10u64), ("b-new", 40)].into_iter().enumerate() {
+        let mut modified = Vec::new();
+        for (slot, (folder, day)) in [("a-old", 10u64), ("b-new", DAY)].into_iter().enumerate() {
             let dir = root.join(format!("-synthetic-{folder}"));
             fs::create_dir_all(&dir).unwrap();
             let session =
@@ -500,12 +619,25 @@ impl ClaudeHistory {
             }
             for (offset, (path, text)) in texts.into_iter().enumerate() {
                 fs::write(path, text).unwrap();
-                set_mtime(
-                    path,
-                    seconds("2026-06-01T00:00:00Z") + (day + offset as u64) * DAY,
-                );
+                modified.push((path.clone(), day + offset as u64));
+            }
+            if slot == 1 {
+                // Two accounts with a mid-session switch, two tagged rows
+                // and one sidecar-only side call; other requests stay
+                // untagged (the evidence gap).
+                distinct.insert("side-call".into());
+                tag_accounts(&support, &other, &other_born);
             }
             folders.push((dir, holder, copy));
+        }
+        // Every mtime after every birth (a modification never precedes its
+        // file's birth); `b-new` is the newer folder.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        for (path, seconds) in modified {
+            set_mtime(&path, now + seconds);
         }
         Self {
             home,
@@ -572,7 +704,7 @@ impl ClaudeHistory {
         hinted: Option<&Path>,
         hint_passes: usize,
     ) -> FirstRead {
-        let fixture = E2ScanFixture::with_identity_capture(false);
+        let fixture = E2ScanFixture::capturing_identity();
         let mut index = ScanIndex {
             first_read_pending: pending,
             ..ScanIndex::default()
@@ -625,7 +757,11 @@ impl ClaudeHistory {
         std::io::Write::write_all(&mut file, format!("{line}\n").as_bytes()).unwrap();
         drop(file);
         // Still older than the other folder: the sort keeps this folder later.
-        set_mtime(path, seconds("2026-06-12T00:00:00Z") + pass as u64 + 1);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        set_mtime(path, now + 3600 + pass as u64);
         self.distinct_requests += 1;
     }
 
@@ -672,7 +808,10 @@ fn copy_wait() -> Value {
 
 /// Both first reads of `history`, FIFO then newest folder first, with their
 /// copy-wait counters and a report of what each emitted.
-fn claude_both(history: &mut ClaudeHistory, limit: usize) -> (FirstRead, FirstRead, Value, String) {
+fn claude_both(
+    history: &mut ClaudeHistory,
+    limit: usize,
+) -> (FirstRead, FirstRead, Value, Value, String) {
     let _ = claude_request_money::e2::take_thread_counts();
     let fifo = history.first_read(limit, false, None, 0);
     let fifo_wait = copy_wait();
@@ -694,7 +833,7 @@ fn claude_both(history: &mut ClaudeHistory, limit: usize) -> (FirstRead, FirstRe
         history.folders[1].0,
         "newest folder first: {report}"
     );
-    (fifo, newest, newest_wait, report)
+    (fifo, newest, fifo_wait, newest_wait, report)
 }
 
 /// [money] Claude, in-order decisions (each copy named after its holder, the
@@ -705,10 +844,15 @@ fn claude_both(history: &mut ClaudeHistory, limit: usize) -> (FirstRead, FirstRe
 fn claude_newest_folder_first_read_matches_fifo_money() {
     claude_history_upgrade::with_max_gated_claude_revision(3, || {
         let mut history = ClaudeHistory::new("first-read-order-claude", false);
-        let (fifo, newest, newest_wait, report) = claude_both(&mut history, 1);
+        let (fifo, newest, _, newest_wait, report) = claude_both(&mut history, 1);
         assert_eq!(history.double_counted(&fifo), 0, "{report}");
         assert_eq!(history.double_counted(&newest), 0, "{report}");
         assert!(newest_wait.get("expired").is_none(), "{report}");
+        assert_positive_control(&scan_money(
+            SnapshotSource::ClaudeCode,
+            &fifo.index,
+            &fifo.scan,
+        ));
         assert_same_money(SnapshotSource::ClaudeCode, &fifo, &newest);
     });
 }
@@ -722,7 +866,12 @@ fn claude_newest_folder_first_read_matches_fifo_money() {
 fn claude_newest_folder_first_reads_the_holder_before_its_copy() {
     claude_history_upgrade::with_max_gated_claude_revision(3, || {
         let mut history = ClaudeHistory::new("first-read-order-claude-named", true);
-        let (fifo, newest, newest_wait, report) = claude_both(&mut history, 1);
+        let (fifo, newest, fifo_wait, newest_wait, report) = claude_both(&mut history, 1);
+        if birth(&history.folders[0].1) != 0 {
+            // The row discriminates: FIFO starts a wait, newest first none.
+            assert!(fifo_wait["started"].as_u64() >= Some(1), "{report}");
+            assert!(newest_wait.get("started").is_none(), "{report}");
+        }
         for (_, holder, copy) in &history.folders {
             let at = |path: &PathBuf| newest.order.iter().position(|p| p == path).unwrap();
             assert!(at(holder) < at(copy), "holder reads first: {report}");
