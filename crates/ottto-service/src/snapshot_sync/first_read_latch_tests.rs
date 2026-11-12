@@ -144,10 +144,16 @@ fn first_read_latch_destination_evidence_and_unverified_precedence() {
             );
         }
         crate::snapshots::restart_claude_reemission_stop_for_test();
-        fixture.install_list(&[]);
-        fixture.baseline();
-        fixture.corrupt_index();
-        fixture.cycle("2026-08-02T09:00:00Z", HISTORY_CURRENT);
+        let quarantine = HistoryFixture::new("first-read-latch-quarantine");
+        quarantine.baseline();
+        quarantine.install_list(&[]);
+        std::fs::write(
+            crate::snapshots::claude_reemission_seen_marker_path(&quarantine.support),
+            b"",
+        )
+        .unwrap();
+        quarantine.corrupt_index();
+        quarantine.cycle("2026-08-02T09:00:00Z", HISTORY_CURRENT);
         assert_eq!(
             crate::snapshots::claude_reemission_stop_reason_for_test(),
             "index_rebuild_withheld",
