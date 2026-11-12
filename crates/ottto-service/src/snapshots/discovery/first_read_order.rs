@@ -32,8 +32,9 @@ pub(crate) enum FirstReadOrder {
 }
 
 pub(in crate::snapshots) fn order_for(source: SnapshotSource) -> FirstReadOrder {
-    durable_sources::DurableSource::from_snapshot(source)
-        .map_or(FirstReadOrder::Fifo, |row| row.properties().first_read_order)
+    durable_sources::DurableSource::from_snapshot(source).map_or(FirstReadOrder::Fifo, |row| {
+        row.properties().first_read_order
+    })
 }
 
 /// Reorders `queue` in place per `order`. Hint entries keep their positions;
@@ -111,10 +112,7 @@ fn newest_folder_first(
     index: &ScanIndex,
 ) -> Vec<Keys> {
     let parent_of = |keys: &Keys| queue[keys.slot].path.parent();
-    let queued = keyed
-        .iter()
-        .filter_map(parent_of)
-        .collect::<BTreeSet<_>>();
+    let queued = keyed.iter().filter_map(parent_of).collect::<BTreeSet<_>>();
     // Saved read evidence: an indexed file in a queued folder.
     let pinned = index
         .files

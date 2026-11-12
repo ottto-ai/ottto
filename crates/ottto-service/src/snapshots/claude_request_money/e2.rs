@@ -4511,7 +4511,7 @@ thread_local! {
     static PAGE_COUNTS: RefCell<Counts> = const { RefCell::new(Counts([0; COUNT_LEN])) };
 }
 #[cfg(test)]
-fn take_thread_counts() -> Counts {
+pub(crate) fn take_thread_counts() -> Counts {
     PAGE_COUNTS.take()
 }
 /// How a proof wait ended, in `WAIT_OUTCOMES` order.

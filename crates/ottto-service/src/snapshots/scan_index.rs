@@ -52,7 +52,7 @@ pub struct ScanIndex {
     /// This pass's destination bootstrap or replay still needs its census:
     /// the first read is pending. Set at prepare; never saved.
     #[serde(skip)]
-    pub(super) first_read_pending: bool,
+    pub(crate) first_read_pending: bool,
     #[serde(default = "scan_index_schema_version")]
     pub schema_version: u16,
     #[serde(default)]
