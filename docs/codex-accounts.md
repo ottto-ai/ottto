@@ -116,8 +116,12 @@ So a sign-in for an existing connection (prepare or prepare-target of an
 existing slot, reconnect, or a sign-in again after a mismatch) runs in a fresh
 staging home next to that connection's home, and the launch command names the
 staging home. Setup checks read the staging home. Only an accepted login moves
-into the connection's home: its `config.toml` and then its `auth.json` are each
-renamed in place of the old ones. A stopped, timed-out, failed, duplicate or
+into the connection's home: only the `auth.json` the final check read is set
+aside, its `config.toml` is copied, the acceptance is saved, and then that
+`auth.json` is renamed in place of the old one (a restart finishes an
+interrupted move). A login replaced after the check is refused. A setup begun
+by an earlier Ottto version without a staging home is stopped after the
+update. A stopped, timed-out, failed, duplicate or
 mismatched sign-in deletes the staging home and leaves the connection's
 existing login and identity as they were. A new connection ("connect another
 workspace") signs in in its own new, empty home.
@@ -136,9 +140,8 @@ connection only when all of these are true:
   restriction, a new App Server process reports the same identity and quota.
 
 An incorrect account or workspace remains unaccepted and can be retried in the
-same setup, in a fresh staging home. A stopped or failed setup also reuses its
-existing home. An accepted
-binding cannot be prepared again. Removing an Ottto-managed connection
+same setup, in a fresh staging home. An accepted binding cannot be prepared
+again. Removing an Ottto-managed connection
 permanently deletes only that daemon-created credential home; recovery requires
 a fresh provider login. The default Codex home is never a deletion target.
 

@@ -3202,10 +3202,12 @@ pub(crate) fn verify_pinned_codex_setup(
         {
             // A login signed in in a staging home moves into the slot's home
             // here, under that home's read lock, so no limit read rewrites
-            // the slot's credential meanwhile.
+            // the slot's credential meanwhile. Only the file this read left
+            // moves: its mark, taken now, refuses one replaced since.
             let sign_in_home = store
                 .setup_sign_in_home(slot_id)
                 .map_err(codex_account_slot_settings_error)?;
+            let validated_login = ottto_core::codex_auth_file_mark(&sign_in_home);
             let slot_home = store
                 .slot_home(slot_id)
                 .map_err(codex_account_slot_settings_error)?;
@@ -3216,6 +3218,7 @@ pub(crate) fn verify_pinned_codex_setup(
                         operation_id,
                         account_hash,
                         workspace_hash,
+                        validated_login,
                     )
                     .inspect(|_| {
                         if sign_in_home != slot_home {
