@@ -107,6 +107,21 @@ returns an exact launch command for the official `codex login` flow. The user
 completes OpenAI's browser login and workspace selection; Ottto never receives
 or types an email, password, MFA code, cookie, access token, or refresh token.
 
+Warning: `codex login` revokes and deletes the existing login of the home it
+runs in (`CODEX_HOME`, by default `~/.codex`) before the browser opens, even if
+the sign-in is then cancelled. Never run a plain `codex login`; use the launch
+command, which always names an Ottto-managed home.
+
+So a sign-in for an existing connection (prepare or prepare-target of an
+existing slot, reconnect, or a sign-in again after a mismatch) runs in a fresh
+staging home next to that connection's home, and the launch command names the
+staging home. Setup checks read the staging home. Only an accepted login moves
+into the connection's home: its `config.toml` and then its `auth.json` are each
+renamed in place of the old ones. A stopped, timed-out, failed, duplicate or
+mismatched sign-in deletes the staging home and leaves the connection's
+existing login and identity as they were. A new connection ("connect another
+workspace") signs in in its own new, empty home.
+
 While the provider-owned browser flow is open, Companion polls a nonterminal
 setup check. An incomplete sign-in stays `waiting_for_user_login`; it is not
 converted into a failed connection. As soon as the provider exposes complete
@@ -121,7 +136,8 @@ connection only when all of these are true:
   restriction, a new App Server process reports the same identity and quota.
 
 An incorrect account or workspace remains unaccepted and can be retried in the
-same home. A stopped or failed setup also reuses its existing home. An accepted
+same setup, in a fresh staging home. A stopped or failed setup also reuses its
+existing home. An accepted
 binding cannot be prepared again. Removing an Ottto-managed connection
 permanently deletes only that daemon-created credential home; recovery requires
 a fresh provider login. The default Codex home is never a deletion target.

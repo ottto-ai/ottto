@@ -2,10 +2,18 @@
 //!
 //! After a setup operation reserved a managed home (prepare, prepare-open,
 //! prepare-target or reconnect), `codex_account_start_sign_in` runs
-//! `codex login` for that home: no terminal, stdin closed, the home's own
-//! `CODEX_HOME`, and the same binary, PATH and clean environment as the
-//! home's quota reads. The CLI opens the sign-in page in the default browser
-//! and waits on a local callback port. The daemon:
+//! `codex login` for it: no terminal, stdin closed, its own `CODEX_HOME`, and
+//! the same binary, PATH and clean environment as the home's quota reads.
+//! `codex login` revokes and deletes the login of the home it runs in before
+//! the browser opens, and a stop cannot undo that. So it never runs in a home
+//! that may hold a login: a registered slot (prepare, prepare-target,
+//! reconnect, or a sign-in again after a mismatch) signs in in a fresh
+//! staging home next to the slot's, and only an accepted login moves into
+//! the slot's home; a stop, timeout, failure or mismatch deletes the staging
+//! home and leaves the slot's login as it was. An open setup's reserved home
+//! is new and empty, so its sign-in runs there. The CLI opens the sign-in
+//! page in the default browser and waits on a local callback port. The
+//! daemon:
 //! - starts at most one sign-in at a time. Every `codex login` on the Mac
 //!   listens on the same local port, and a new one takes it over from the
 //!   last, so none starts while the port is taken (`port_busy`);
@@ -16,12 +24,11 @@
 //! - decides by the home's `auth.json`, not the exit status: `codex login`
 //!   exits 0 both when it saved a credential and when it was stopped. The
 //!   baseline is taken just before the CLI starts, under the home's
-//!   quota-read lock, and scheduled and explicit quota reads leave the home
-//!   alone while the sign-in runs (each read rewrites `auth.json`). In a home
-//!   without a credential, one that appeared is the result. In a home that
-//!   had one (a reconnect, or a sign-in again after a mismatch) the person's
-//!   own Codex sessions may rewrite it too, so there the CLI must also exit 0
-//!   and print its success line;
+//!   quota-read lock, and scheduled and explicit quota reads leave that home
+//!   and the slot's alone while the sign-in runs (each read rewrites
+//!   `auth.json`). In a home without a credential, one that appeared is the
+//!   result. In a home that had one the CLI must also exit 0 and print its
+//!   success line;
 //! - then reads the account through the setup's validation, retrying that
 //!   identity read once after [`CHECK_RETRY_DELAY`] when it fails (at most
 //!   two), plus the validation's own fresh read of a pinned workspace. A
@@ -32,7 +39,8 @@
 //!
 //! The browser sign-in is the person's, not a provider call of ours; the call
 //! log records the account reads only (trigger `setup`). Never used for the
-//! person's own `~/.codex`: setup operations only name managed homes.
+//! person's own `~/.codex`: setup operations only name managed homes. Codex
+//! only: Claude sign-ins do not use this module.
 //!
 //! The CLI stays in the daemon's process group, so the service manager ends
 //! it with the daemon. A stop ends the CLI's own child processes too: the

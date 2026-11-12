@@ -3200,15 +3200,34 @@ pub(crate) fn verify_pinned_codex_setup(
             if pinned.account_identifier_hash == account_hash
                 && pinned.workspace_identifier_hash == workspace_hash =>
         {
-            store
-                .complete_pinned_verification(
-                    schema_version,
-                    operation_id,
-                    account_hash,
-                    workspace_hash,
-                )
-                .map_err(codex_account_slot_settings_error)
-                .map(|status| (status, CodexSetupValidationEnd::Accepted))
+            // A login signed in in a staging home moves into the slot's home
+            // here, under that home's read lock, so no limit read rewrites
+            // the slot's credential meanwhile.
+            let sign_in_home = store
+                .setup_sign_in_home(slot_id)
+                .map_err(codex_account_slot_settings_error)?;
+            let slot_home = store
+                .slot_home(slot_id)
+                .map_err(codex_account_slot_settings_error)?;
+            crate::agent_status::with_codex_home_read_lock(&slot_home, || {
+                store
+                    .complete_pinned_verification(
+                        schema_version,
+                        operation_id,
+                        account_hash,
+                        workspace_hash,
+                    )
+                    .inspect(|_| {
+                        if sign_in_home != slot_home {
+                            crate::agent_status::adopt_saved_codex_reading(
+                                &sign_in_home,
+                                &slot_home,
+                            );
+                        }
+                    })
+            })
+            .map_err(codex_account_slot_settings_error)
+            .map(|status| (status, CodexSetupValidationEnd::Accepted))
         }
         _ => store
             .fail_validation(
@@ -18486,10 +18505,10 @@ for line in sys.stdin:
         assert!(fixture.login_pids().is_empty(), "no sign-in restarted");
     }
 
-    /// A reconnect signs into a home that already has a credential, which
-    /// the person's own Codex sessions may rewrite meanwhile. Scheduled and
-    /// explicit quota reads leave the home alone while the sign-in runs, and
-    /// a rewritten credential counts only with the CLI's own success: a CLI
+    /// A reconnect signs in in a staging home while the slot's own home keeps
+    /// its credential, which the person's own Codex sessions may rewrite
+    /// meanwhile. Scheduled and explicit quota reads leave the slot's home
+    /// alone while the sign-in runs, and a rewrite there is no sign-in: a CLI
     /// that ends early (exit 0 or 1) is `login_failed`, with no account read.
     #[cfg(unix)]
     #[test]

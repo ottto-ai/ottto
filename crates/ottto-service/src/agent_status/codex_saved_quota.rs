@@ -797,6 +797,23 @@ fn home_lock(home: &Path) -> Arc<Mutex<()>> {
     locks.entry(home_key(home)).or_default().clone()
 }
 
+/// Move the saved reading of a sign-in's staging home `from` to the slot
+/// home `to` its login just moved into. The rename kept the credential's
+/// metadata, which the reading's login witness names, so `to` serves the
+/// validated reading at once rather than its replaced login's. Call under
+/// `to`'s lock. Nothing is read from the provider.
+pub(crate) fn adopt_saved_codex_reading(from: &Path, to: &Path) {
+    let support_dir = saved_quota_support_dir();
+    let Some(mut saved) = read_saved_at(&support_dir, from) else {
+        return;
+    };
+    saved.home_key = home_key(to);
+    write_saved_at(&support_dir, to, &saved);
+    let from_path = saved_path(&support_dir, from);
+    let _ = std::fs::remove_file(&from_path);
+    planned_cache(&PLANNED_SAVED).remove(&from_path);
+}
+
 /// Run `f` while no provider read of `home` runs: under the home's lock.
 pub(crate) fn with_codex_home_read_lock<T>(home: &Path, f: impl FnOnce() -> T) -> T {
     let lock_for_home = home_lock(home);
@@ -1321,25 +1338,24 @@ pub(super) fn homes_in_use(
 /// every tick, so a removed slot leaves the schedule at once. The device's
 /// upload grant does not matter: the companion shows these readings locally.
 ///
-/// The home of a running daemon sign-in is left out, for the schedule and
-/// the explicit refresh alike: every read rewrites `auth.json`, and the
-/// sign-in decides by that file.
+/// The homes of a running daemon sign-in are left out, for the schedule and
+/// the explicit refresh alike: every read rewrites `auth.json`, the sign-in
+/// decides by its home's file, and the slot's home takes the new login when
+/// it is accepted.
 fn scheduled_homes(support_dir: &Path, now: u64) -> Vec<ScheduledHome> {
     let PlannedSlots { slots, signing_in } = planned_slots(now);
     let running = running_homes().clone();
     let mut homes = scheduled_homes_from(support_dir, slots, &running, now);
-    if let Some(signing_in) = signing_in {
-        homes.retain(|home| home_key(&home.home) != signing_in);
-    }
+    homes.retain(|home| !signing_in.contains(&home_key(&home.home)));
     homes
 }
 
-/// The slots the stored settings schedule, and the [`home_key`] of a running
-/// daemon sign-in's home.
+/// The slots the stored settings schedule, and the [`home_key`]s of a
+/// running daemon sign-in's homes: where `codex login` runs and the slot's.
 #[derive(Clone)]
 struct PlannedSlots {
     slots: Vec<CodexHomeSlot>,
-    signing_in: Option<String>,
+    signing_in: Vec<String>,
 }
 
 /// The stored settings' slots, kept while the settings file and every
@@ -1375,7 +1391,8 @@ fn stored_slots() -> (PlannedSlots, bool) {
     let signing_in = signing_in
         .ok()
         .flatten()
-        .map(|active| home_key(&active.home));
+        .map(|active| vec![home_key(&active.home), home_key(&active.slot_home)])
+        .unwrap_or_default();
     (PlannedSlots { slots, signing_in }, complete)
 }
 
