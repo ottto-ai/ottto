@@ -4656,21 +4656,35 @@ pub struct ProviderDailyReferenceBackendGrantResponseV1 {
 
 /// Strict identity-bearing subset needed to bind an ordinary-browser grant
 /// response locally. Provider content and credentials are never represented.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `cloud_session_changes.v1` grants carry `status` `enabled`, `paused` or
+/// `revoked` and `can_collect`; a missing `can_collect` never authorizes
+/// collection. `collector_version`, `release_lane` and `server_policy_state`
+/// are optional diagnostics of older responses.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CloudSessionBackendGrantResponseV1 {
     pub id: String,
     pub installation_id: String,
     pub source: String,
     pub collector_id: String,
     pub schema_version: String,
+    #[serde(default)]
     pub collector_version: String,
+    #[serde(default)]
     pub release_lane: String,
     pub disclosure_version: String,
     pub grant_scope_fingerprint: String,
     pub account_fingerprint: String,
     pub status: String,
     pub grant_version: u64,
+    #[serde(default)]
     pub server_policy_state: CloudSessionServerPolicyState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub can_collect: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub can_read_cloud_sessions: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -7147,15 +7161,16 @@ mod tests {
                 "installation_id": "00000000-0000-4000-8000-000000000001",
                 "source": "codex",
                 "collector_id": "cloud_sessions",
-                "schema_version": "cloud_session_observations.v1",
+                "schema_version": "cloud_session_changes.v1",
                 "collector_version": "0.1.90",
-                "release_lane": "supported",
                 "disclosure_version": "cloud_sessions_disclosure.v1",
                 "grant_scope_fingerprint": format!("hmac-sha256:{}", "a".repeat(64)),
                 "account_fingerprint": format!("hmac-sha256:{}", "b".repeat(64)),
                 "status": "enabled",
                 "grant_version": 1,
-                "server_policy_state": "approved"
+                "can_collect": true,
+                "can_read_cloud_sessions": true,
+                "paused_at": null
             }
         }))
         .expect("cloud-session bind control request");
