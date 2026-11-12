@@ -4505,7 +4505,28 @@ fn codex_dead_login_survives_a_failed_quota_read() {
             "{mode}"
         );
 
-        // A new sign-in: the dead failure is not served.
+        // A new sign-in to the same account and workspace rewrites the
+        // credential: the dead failure is not served, in status or launch.
+        let mut body = std::fs::read(home.join("auth.json")).expect("auth body");
+        body.push(b' ');
+        std::fs::write(home.join("auth.json"), body).expect("same-pair sign-in");
+        let same_pair = collect(managed, Some(registered.clone()), CodexQuotaRead::Saved);
+        assert_ne!(
+            same_pair.status.state,
+            CodexAccountSlotCollectionStateV1::NeedsLogin,
+            "{mode}"
+        );
+        let relaunched = session_launch_codex_candidate(
+            slot(managed, Some(registered.clone())),
+            "2026-08-26T00:05:00Z",
+        );
+        assert_ne!(
+            relaunched.status.state,
+            CodexAccountSlotCollectionStateV1::NeedsLogin,
+            "{mode}"
+        );
+
+        // A new sign-in to another account: the dead failure is not served.
         write_other_synthetic_codex_account(&home);
         let signed_in_again = collect(managed, Some(registered.clone()), CodexQuotaRead::Saved);
         assert_ne!(

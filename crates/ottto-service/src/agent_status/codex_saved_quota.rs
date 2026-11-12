@@ -83,7 +83,7 @@ use super::{
     codex_last_known, codex_probe_failure_stage_and_kind, current_unix_seconds, default_codex_home,
     empty_codex_accounts_status, mark_quota_meters_stale, read_codex_auth_credentials_at,
     read_codex_usage_from_provider, unsupported_account, CodexHomeSlot, CodexIdentityHashes,
-    CodexLoginRefresh, CodexUsageProbe,
+    CodexLoginRefresh, CodexUsageProbe, CODEX_NO_ACCOUNT_FAILURE_PREFIX,
 };
 
 /// In use on this Mac: one provider read per 5 min.
@@ -956,6 +956,10 @@ fn serve_saved_copy(
         if saved.reading.as_ref().map_or(true, |reading| {
             failure.at_epoch_seconds >= reading.observed_at_epoch_seconds
         }) && failure.login.same_login(current)
+            // A dead login (the read named no account) lasts only until a
+            // sign-in rewrites the credential file, even for the same account.
+            && (!failure.message.starts_with(CODEX_NO_ACCOUNT_FAILURE_PREFIX)
+                || failure.login.same_credential_file(current))
             && servable_at(failure.at_epoch_seconds, now)
         {
             return Err(CodexQuotaFailure {
