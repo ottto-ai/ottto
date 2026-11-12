@@ -93,11 +93,15 @@ fn subagent_all_copy_twins_conserve_pages_restart_and_device_replace() {
         for path in &paths {
             let mut index = prior.clone();
             owe(&mut index);
+            index = crate::snapshots::e2_pipeline_scan_fixture::save_reload_for_test(
+                &mut index,
+                &c.base.join("singleton-index.json"),
+            );
             let mut page = c.raw(
                 &E2ScanFixture::with_subagent_births(),
                 index,
                 100,
-                false,
+                true,
                 &[],
             );
             let location = location_key(&path.to_string_lossy());
