@@ -17045,19 +17045,18 @@ fn codex_probe_refresh_reason(
     if login_refresh == CodexLoginRefresh::Never || home_trust != CodexHomeTrust::Managed {
         return None;
     }
-    let credentials = match read_codex_auth_credentials_at(codex_home, home_trust) {
-        Ok(Some(credentials)) => credentials,
+    let reason = match read_codex_auth_credentials_at(codex_home, home_trust) {
+        Ok(Some(credentials)) => match codex_credential_claim_lapses_at(&credentials) {
+            None => "lapsed_or_unknown",
+            Some(lapses_at)
+                if lapses_at <= now.saturating_add(CODEX_MANAGED_LOGIN_REFRESH_AHEAD_SECONDS) =>
+            {
+                "lapses_soon"
+            }
+            Some(_) => return None,
+        },
         Ok(None) => return None,
-        Err(_) => return Some("unreadable"),
-    };
-    let reason = match codex_credential_claim_lapses_at(&credentials) {
-        None => "lapsed_or_unknown",
-        Some(lapses_at)
-            if lapses_at <= now.saturating_add(CODEX_MANAGED_LOGIN_REFRESH_AHEAD_SECONDS) =>
-        {
-            "lapses_soon"
-        }
-        Some(_) => return None,
+        Err(_) => "unreadable",
     };
     if codex_saved_quota::refresh_held(codex_home) {
         return Some(CODEX_REFRESH_BACKOFF_REASON);

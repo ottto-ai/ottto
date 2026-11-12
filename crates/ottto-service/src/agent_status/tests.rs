@@ -4792,6 +4792,19 @@ fn codex_probe_holds_forced_refresh_after_a_timeout_until_a_read_succeeds() {
         ),
         Some(CODEX_REFRESH_BACKOFF_REASON)
     );
+    // An unreadable credential is held too.
+    let body = std::fs::read(&auth).expect("auth body");
+    std::fs::write(&auth, b"not json").expect("unreadable auth");
+    assert_eq!(
+        codex_probe_refresh_reason(
+            &home,
+            CodexHomeTrust::Managed,
+            CodexLoginRefresh::WhenLapsing,
+            current_unix_seconds(),
+        ),
+        Some(CODEX_REFRESH_BACKOFF_REASON)
+    );
+    std::fs::write(&auth, body).expect("auth restored");
     std::fs::remove_file(dir.join("hang")).expect("answer again");
     read().expect("held read still reads");
     assert!(!codex_saved_quota::refresh_held(&home));

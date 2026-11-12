@@ -1099,7 +1099,13 @@ fn read_and_save_at(
     next.last_attempt_at_epoch_seconds = finished_at;
     next.last_attempt_login = login.clone();
     match &result {
-        Ok(_) if !kept => {}
+        // A read that worked lifts a refresh hold even when its reading
+        // cannot be kept.
+        Ok(_) if !kept => {
+            if let Some(failure) = next.last_failure.as_mut() {
+                failure.refresh_held = false;
+            }
+        }
         Ok(probe) => {
             let observed_at = probe
                 .response_completed_at
