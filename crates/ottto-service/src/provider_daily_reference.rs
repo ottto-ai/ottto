@@ -1466,6 +1466,9 @@ pub enum ProviderReadError {
     ResponseShape(String),
     /// 429 beyond ordinary politeness.
     RateLimited,
+    /// A `users` count above one: the answer covers more than the signed-in
+    /// user. Counted as a shape failure.
+    WorkspaceWide,
     /// 5xx and transport failures. Never counted against the breaker.
     Transient(String),
 }
@@ -1476,6 +1479,7 @@ impl ProviderReadError {
             ProviderReadError::AuthRejected(_) => Some(ProviderFailure::AuthRejected),
             ProviderReadError::ResponseShape(_) => Some(ProviderFailure::ResponseShape),
             ProviderReadError::RateLimited => Some(ProviderFailure::RateLimited),
+            ProviderReadError::WorkspaceWide => Some(ProviderFailure::ResponseShape),
             ProviderReadError::Transient(_) => None,
         }
     }
@@ -1485,6 +1489,7 @@ impl ProviderReadError {
             ProviderReadError::AuthRejected(_) => "provider_auth_rejected",
             ProviderReadError::ResponseShape(_) => "provider_response_shape",
             ProviderReadError::RateLimited => "provider_rate_limited",
+            ProviderReadError::WorkspaceWide => "workspace_wide_answer",
             ProviderReadError::Transient(_) => "provider_unavailable",
         }
     }
@@ -1540,6 +1545,19 @@ struct CollectorState {
     /// The closed reason of this account's last evaluated attempt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_reason: Option<String>,
+    /// Set only after a full current-read proof; cleared by the admission
+    /// save of every newer attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    proof: Option<SeriesProof>,
+}
+
+/// One account's proof that the backend stored its whole series as current.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SeriesProof {
+    binding: StateBinding,
+    window_start: String,
+    window_end: String,
+    digest: String,
 }
 
 /// The consent epoch an entry or summary was written under.
@@ -3281,12 +3299,20 @@ impl Collector {
         let mut diagnostics = Vec::new();
         let mut normalized_row_count: Option<usize> = None;
         let mut consent_changed = false;
+        let selected = seen
+            .iter()
+            .map(|account| account.identity.clone())
+            .collect::<BTreeSet<_>>();
+        let tick = TickContext {
+            expected: &expected,
+            selected: &selected,
+        };
         let mut last_now = clock();
         for (_, index) in order {
             let login = &discovery.logins[index];
             last_now = clock();
             let attempt =
-                collect_account_once(self, &expected, runtime, login, reader, transport, last_now);
+                collect_account_once(self, &tick, runtime, login, reader, transport, last_now);
             let home_kind = login.home_kind.label();
             let prefix = format!("login {}/{total} ({home_kind}): ", index + 1);
             diagnostics.extend(attempt.cycle.diagnostics.into_iter().map(|mut diagnostic| {
@@ -3505,13 +3531,14 @@ impl AccountAttempt {
 /// made with `login`'s own credential.
 fn collect_account_once(
     collector: &Collector,
-    expected: &BackendGrantBinding,
+    tick: &TickContext<'_>,
     runtime: &Runtime,
     login: &CodexLogin,
     reader: &dyn ProviderDailyUsageReader,
     transport: &dyn DailyReferenceTransport,
     now: OffsetDateTime,
 ) -> AccountAttempt {
+    let expected = tick.expected;
     let grants = &collector.grants;
     let state_store = &collector.state;
     if collector.network_disabled() {
@@ -3615,13 +3642,18 @@ fn collect_account_once(
     }
 
     // Admission: the attempt time is durable before the request, so every
-    // outcome below is next due at the ordinary cadence. A failed save makes
-    // no request at all.
+    // outcome below is next due at the ordinary cadence. The same save clears
+    // this account's series proof, so no older proof can outlive a newer
+    // attempt. A failed save makes no request at all.
     let (window_start, window_end) = collection_window(now);
     state.last_fetch_epoch_seconds = now_seconds;
     state.schema_version = STATE_FILE_SCHEMA_VERSION;
     state.identity = identity.clone();
     state.last_seen_day = Some(date_string(now));
+    state.account_fingerprint = Some(account_fingerprint.clone());
+    state.home_kind = Some(login.home_kind.label().to_string());
+    state.binding = Some(StateBinding::of(expected));
+    state.proof = None;
     if state_store.save(&state).is_err() {
         return AccountAttempt::next(
             Cycle::with(
@@ -3649,6 +3681,19 @@ fn collect_account_once(
             )
         }
     };
+    // A count above one anywhere in the answer means it is not this user's
+    // own usage; nothing from it is uploaded.
+    if max_user_count(&payload) > 1.0 {
+        return provider_failure_attempt(
+            grants,
+            expected,
+            state_store,
+            state,
+            &identity,
+            ProviderReadError::WorkspaceWide,
+            now_seconds,
+        );
+    }
     let normalized = match normalize_provider_window(&payload, &window_start, &window_end) {
         Ok(normalized) => normalized,
         Err(error) => {
@@ -3695,6 +3740,31 @@ fn collect_account_once(
         accounts: Vec::new(),
     };
 
+    // Another login of this tick already proved this exact series current
+    // under this consent: the read is the same account seen twice, so it is
+    // not uploaded again. Due again only at cadence; not a success.
+    let digest = series_digest(&normalized.rows, &window_start, &window_end);
+    if let Some(digest) = digest.as_deref() {
+        if identical_series_owned_elsewhere(
+            grants,
+            state_store,
+            tick,
+            &identity,
+            &window_start,
+            &window_end,
+            digest,
+        ) {
+            diagnostics.push(info(
+                "codex_daily_aggregates_identical_series",
+                "This Codex account returned the same series another account already uploaded this tick; it was not uploaded again.",
+            ));
+            return AccountAttempt::next(
+                failed(diagnostics, CycleOutcome::Deferred),
+                "identical_series",
+            );
+        }
+    }
+
     let batches = match pack_batches(normalized.rows, &window_start, &window_end) {
         Ok(batches) => batches,
         Err(error) => {
@@ -3720,7 +3790,11 @@ fn collect_account_once(
         None
     };
 
+    // A full current-read proof: every batch acknowledged with none of its
+    // rows superseded.
+    let mut every_batch_current = true;
     for (coverage_start, coverage_end, rows) in batches {
+        let row_count = rows.len();
         let batch = DailyReferenceBatch {
             schema_version: SCHEMA_VERSION,
             source: SOURCE,
@@ -3767,8 +3841,15 @@ fn collect_account_once(
         }
 
         match transport.send_batch(&payload) {
-            Ok(receipt) => {
-                if let Err(error) = validate_ack(&receipt, &coverage_start, &coverage_end) {
+            Ok(receipt) => match validate_ack(
+                &receipt,
+                &expected.grant_id,
+                &coverage_start,
+                &coverage_end,
+                row_count,
+            ) {
+                Ok(proof) => every_batch_current &= proof.current,
+                Err(error) => {
                     diagnostics.push(warning(
                         "codex_daily_aggregates_ack_invalid",
                         &format!("The backend acknowledgement did not match the batch: {error}"),
@@ -3780,7 +3861,7 @@ fn collect_account_once(
                         "upload_failed",
                     );
                 }
-            }
+            },
             Err(UploadError::NotAdmitted(status)) => {
                 // Expected until a reviewed backend change admits this build.
                 // Not a provider failure, so the circuit breaker is untouched.
@@ -3852,7 +3933,7 @@ fn collect_account_once(
             "Observed Codex daily aggregate window {window_start} through {window_end}; normalized {normalized_row_count} rows."
         ),
     ));
-    let state = state_after_success(
+    let mut state = state_after_success(
         state,
         &identity,
         now_seconds,
@@ -3860,9 +3941,120 @@ fn collect_account_once(
         &window_start,
         &window_end,
     );
+    // Only a full current-read proof may later stand for an identical series.
+    state.proof = digest
+        .filter(|_| every_batch_current)
+        .map(|digest| SeriesProof {
+            binding: StateBinding::of(expected),
+            window_start: window_start.clone(),
+            window_end: window_end.clone(),
+            digest,
+        });
     let _ = state_store.save(&state);
     let _ = grants.record_health_for(expected, Some(&collected_at), None);
     AccountAttempt::next(failed(diagnostics, CycleOutcome::Uploaded), "ok")
+}
+
+/// What every login of one tick shares.
+struct TickContext<'a> {
+    /// The binding the tick began with. Every write from inside the tick is
+    /// guarded by it.
+    expected: &'a BackendGrantBinding,
+    /// State keys of every login this tick's discovery selected.
+    selected: &'a BTreeSet<String>,
+}
+
+/// The largest `users` count anywhere in a provider answer: day totals,
+/// clients, client and day models, unknown models, and days without a date
+/// or outside the window. Above one, the answer is not one user's own usage.
+fn max_user_count(value: &Value) -> f64 {
+    match value {
+        Value::Object(map) => map
+            .iter()
+            .map(|(key, value)| {
+                let own = if key == "users" {
+                    value.as_f64().unwrap_or(0.0)
+                } else {
+                    0.0
+                };
+                own.max(max_user_count(value))
+            })
+            .fold(0.0, f64::max),
+        Value::Array(items) => items.iter().map(max_user_count).fold(0.0, f64::max),
+        _ => 0.0,
+    }
+}
+
+/// A digest of one read's normalized series and window. An empty or
+/// all-zero series has none: it can never stand for another account.
+fn series_digest(
+    rows: &[DailyReferenceRow],
+    window_start: &str,
+    window_end: &str,
+) -> Option<String> {
+    let nonzero = rows.iter().any(|row| {
+        row.credits_used
+            .as_deref()
+            .and_then(|credits| credits.parse::<f64>().ok())
+            .is_some_and(|credits| credits != 0.0)
+            || [
+                row.uncached_input_tokens,
+                row.cached_input_tokens,
+                row.output_tokens,
+                row.total_tokens,
+                row.thread_count,
+                row.turn_count,
+            ]
+            .into_iter()
+            .flatten()
+            .any(|counter| counter != 0)
+    });
+    if !nonzero {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"ottto:codex-daily-aggregates-series:");
+    for part in [window_start, window_end] {
+        hasher.update(part.as_bytes());
+        hasher.update([0_u8]);
+    }
+    hasher.update(serde_json::to_vec(rows).ok()?);
+    Some(hex(&hasher.finalize()))
+}
+
+/// Whether another account selected this tick holds a full current-read
+/// proof of exactly this series and window under this consent, and is not
+/// excluded.
+fn identical_series_owned_elsewhere(
+    grants: &GrantStore,
+    state_store: &StateStore,
+    tick: &TickContext<'_>,
+    identity: &str,
+    window_start: &str,
+    window_end: &str,
+    digest: &str,
+) -> bool {
+    let binding = StateBinding::of(tick.expected);
+    state_store
+        .load_file()
+        .entries
+        .iter()
+        .any(|(owner, entry)| {
+            owner != identity
+                && tick.selected.contains(owner)
+                && entry.proof.as_ref().is_some_and(|proof| {
+                    proof.binding == binding
+                        && proof.window_start == window_start
+                        && proof.window_end == window_end
+                        && proof.digest == digest
+                })
+                && entry
+                    .account_fingerprint
+                    .as_deref()
+                    .is_some_and(|fingerprint| {
+                        !grants.account_is_excluded(fingerprint).unwrap_or(true)
+                    })
+        })
 }
 
 /// [`record_provider_failure`] as an attempt: a 429 also ends the tick.
@@ -3876,9 +4068,12 @@ fn provider_failure_attempt(
     now: u64,
 ) -> AccountAttempt {
     let rate_limited = error == ProviderReadError::RateLimited;
+    let workspace_wide = error == ProviderReadError::WorkspaceWide;
     let cycle = record_provider_failure(grants, expected, state_store, state, identity, error, now);
     let reason = if rate_limited {
         "rate_limited"
+    } else if workspace_wide {
+        "workspace_wide_answer"
     } else if cycle.outcome == CycleOutcome::CircuitOpen {
         "circuit_open"
     } else {
@@ -3956,7 +4151,23 @@ fn record_provider_failure(
     )
 }
 
-fn validate_ack(receipt: &Value, coverage_start: &str, coverage_end: &str) -> Result<()> {
+/// What a valid acknowledgement proves about one batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AckProof {
+    /// No accepted row was superseded: the backend now holds this batch as
+    /// the current series. An empty batch is current.
+    current: bool,
+}
+
+/// Check that a receipt acknowledges exactly this batch under this grant,
+/// with self-consistent counts. Every count is checked; none is assumed.
+fn validate_ack(
+    receipt: &Value,
+    expected_grant_id: &str,
+    coverage_start: &str,
+    coverage_end: &str,
+    row_count: usize,
+) -> Result<AckProof> {
     let schema_version = receipt
         .get("schema_version")
         .and_then(Value::as_str)
@@ -3969,14 +4180,27 @@ fn validate_ack(receipt: &Value, coverage_start: &str, coverage_end: &str) -> Re
     {
         return Err(anyhow!("ack does not echo the declared coverage window"));
     }
-    if receipt
-        .get("accepted_row_count")
-        .and_then(Value::as_u64)
-        .is_none()
-    {
-        return Err(anyhow!("ack is missing accepted_row_count"));
+    if receipt.get("grant_id").and_then(Value::as_str) != Some(expected_grant_id) {
+        return Err(anyhow!("ack names a different grant"));
     }
-    Ok(())
+    let count = |key: &str| {
+        receipt
+            .get(key)
+            .and_then(Value::as_u64)
+            .ok_or_else(|| anyhow!("ack is missing {key}"))
+    };
+    let accepted = count("accepted_row_count")?;
+    let stored = count("stored_row_count")?;
+    let superseded = count("superseded_row_count")?;
+    if u64::try_from(row_count).ok() != Some(accepted) {
+        return Err(anyhow!("ack accepted a different number of rows"));
+    }
+    if accepted.checked_sub(stored) != Some(superseded) {
+        return Err(anyhow!("ack row counts do not add up"));
+    }
+    Ok(AckProof {
+        current: superseded == 0,
+    })
 }
 
 // ---------------------------------------------------------------------------

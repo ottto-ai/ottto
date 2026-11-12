@@ -9,10 +9,10 @@ use crate::provider_daily_reference::logins::{discover, LoginHomeKind, LoginSkip
 use ottto_core::CodexHomeTrust;
 
 const SECOND_USER: &str = "user-second-fixture-private";
-const SECOND_WORKSPACE: &str = "acct-second-fixture-private";
+pub(super) const SECOND_WORKSPACE: &str = "acct-second-fixture-private";
 const SLOT_ID: &str = "slot-fixture-private";
 
-fn grant_key(collector: &Collector) -> Vec<u8> {
+pub(super) fn grant_key(collector: &Collector) -> Vec<u8> {
     collector.grants().hmac_key().expect("key").expect("grant")
 }
 
@@ -56,7 +56,7 @@ fn unidentified(workspace: &str) -> Value {
     auth(&jwt(None, Some(workspace), live()), None, workspace)
 }
 
-fn slot_login(scope: &str) -> CodexLogin {
+pub(super) fn slot_login(scope: &str) -> CodexLogin {
     let mut login = login_with_scope(scope);
     login.home_kind = LoginHomeKind::Slot {
         slot_id: SLOT_ID.to_string(),
@@ -79,6 +79,45 @@ fn tree(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
         }
     }
     files
+}
+
+/// A reader whose answer depends on the account asked for.
+pub(super) struct ScopedReader {
+    pub(super) payloads: BTreeMap<String, Value>,
+    pub(super) fallback: Value,
+    pub(super) calls: RefCell<Vec<String>>,
+}
+
+impl ScopedReader {
+    /// The poisoned payload for the default account, and the same payload
+    /// with other numbers for every other account.
+    pub(super) fn distinct() -> Self {
+        let mut other = poisoned_payload();
+        other["results"][0]["clients"][0]["text_total_tokens"] = json!(1751);
+        Self {
+            payloads: BTreeMap::from([(ACCOUNT_SCOPE.to_string(), poisoned_payload())]),
+            fallback: other,
+            calls: RefCell::new(Vec::new()),
+        }
+    }
+}
+
+impl ProviderDailyUsageReader for ScopedReader {
+    fn fetch_window(
+        &self,
+        credential: &CodexCredential,
+        _start: &str,
+        _end: &str,
+    ) -> Result<Value, ProviderReadError> {
+        self.calls
+            .borrow_mut()
+            .push(credential.account_scope.clone());
+        Ok(self
+            .payloads
+            .get(&credential.account_scope)
+            .unwrap_or(&self.fallback)
+            .clone())
+    }
 }
 
 /// A reader that answers from a queue, then with a fixed payload.
@@ -348,19 +387,20 @@ fn a_slot_login_with_an_expired_id_token_uploads_identified_batches() {
     );
 }
 
-/// [money] Two accounts: each read once per cadence under its own
-/// attribution, and a later tick inside the cadence reads neither.
+/// [money] Two accounts with their own series: each read once per cadence
+/// under its own attribution, and a later tick inside the cadence reads
+/// neither.
 #[test]
 fn every_login_is_read_once_per_cadence_under_its_own_attribution() {
     let collector = collector("two-logins");
     enabled(&collector);
     let key = grant_key(&collector);
     let discovery = discovered(&collector, vec![login(), slot_login(SECOND_WORKSPACE)]);
-    let reader = StaticReader::new(poisoned_payload());
+    let reader = ScopedReader::distinct();
     let transport = RecordingTransport::default();
     let cycle = collector.run_tick(&runtime(), &discovery, &reader, &transport, &now);
     assert_eq!(cycle.outcome, CycleOutcome::Uploaded);
-    assert_eq!(reader.calls.get(), 2);
+    assert_eq!(reader.calls.borrow().len(), 2);
     assert_eq!(
         cycle
             .accounts

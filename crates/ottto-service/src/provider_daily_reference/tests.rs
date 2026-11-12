@@ -5,6 +5,7 @@ use std::collections::VecDeque;
 
 mod accounts;
 mod all_logins;
+mod guards;
 
 const INSTALLATION_ID: &str = "00000000-0000-4000-8000-000000000001";
 const GRANT_ID: &str = "00000000-0000-4000-8000-000000000002";
@@ -1855,42 +1856,113 @@ fn the_uploaded_batch_declares_the_consented_epoch_and_identity() {
     assert_eq!(grant.last_error_category, None);
 }
 
+/// [money] A receipt proves a batch only when it echoes the batch under the
+/// expected grant and its counts add up exactly; nothing is assumed.
 #[test]
-fn an_acknowledgement_that_does_not_echo_the_batch_is_refused() {
-    assert!(validate_ack(
-        &json!({
+fn an_acknowledgement_proves_the_batch_only_when_its_counts_add_up() {
+    let receipt = |grant: &str, accepted: Value, stored: Value, superseded: Value| {
+        json!({
             "schema_version": ACK_SCHEMA_VERSION,
-            "grant_id": GRANT_ID,
-            "accepted_row_count": 3,
+            "grant_id": grant,
+            "accepted_row_count": accepted,
+            "stored_row_count": stored,
+            "superseded_row_count": superseded,
             "coverage_start": "2026-07-01",
             "coverage_end": "2026-07-26",
-        }),
-        "2026-07-01",
-        "2026-07-26"
-    )
-    .is_ok());
-    assert!(validate_ack(
-        &json!({
-            "schema_version": "something_else.v1",
-            "accepted_row_count": 3,
-            "coverage_start": "2026-07-01",
-            "coverage_end": "2026-07-26",
-        }),
-        "2026-07-01",
-        "2026-07-26"
-    )
-    .is_err());
-    assert!(validate_ack(
-        &json!({
-            "schema_version": ACK_SCHEMA_VERSION,
-            "accepted_row_count": 3,
-            "coverage_start": "2026-07-01",
-            "coverage_end": "2026-07-20",
-        }),
-        "2026-07-01",
-        "2026-07-26"
-    )
-    .is_err());
+        })
+    };
+    let check = |receipt: &Value, rows: usize| {
+        validate_ack(receipt, GRANT_ID, "2026-07-01", "2026-07-26", rows)
+            .ok()
+            .map(|proof| proof.current)
+    };
+    for (case, ack, rows, expected) in [
+        (
+            "current",
+            receipt(GRANT_ID, json!(3), json!(3), json!(0)),
+            3,
+            Some(true),
+        ),
+        (
+            "all superseded",
+            receipt(GRANT_ID, json!(3), json!(0), json!(3)),
+            3,
+            Some(false),
+        ),
+        (
+            "partly superseded",
+            receipt(GRANT_ID, json!(3), json!(1), json!(2)),
+            3,
+            Some(false),
+        ),
+        (
+            "valid empty batch",
+            receipt(GRANT_ID, json!(0), json!(0), json!(0)),
+            0,
+            Some(true),
+        ),
+        (
+            "another grant",
+            receipt(
+                "00000000-0000-4000-8000-0000000000ff",
+                json!(3),
+                json!(3),
+                json!(0),
+            ),
+            3,
+            None,
+        ),
+        (
+            "accepted is not the batch",
+            receipt(GRANT_ID, json!(2), json!(2), json!(0)),
+            3,
+            None,
+        ),
+        (
+            "rows but none accepted",
+            receipt(GRANT_ID, json!(0), json!(0), json!(0)),
+            3,
+            None,
+        ),
+        (
+            "stored above accepted",
+            receipt(GRANT_ID, json!(3), json!(4), json!(0)),
+            3,
+            None,
+        ),
+        (
+            "superseded does not add up",
+            receipt(GRANT_ID, json!(3), json!(2), json!(0)),
+            3,
+            None,
+        ),
+        (
+            "superseded is missing",
+            receipt(GRANT_ID, json!(3), json!(3), Value::Null),
+            3,
+            None,
+        ),
+        (
+            "stored is missing",
+            receipt(GRANT_ID, json!(3), Value::Null, json!(0)),
+            3,
+            None,
+        ),
+        (
+            "a negative count",
+            receipt(GRANT_ID, json!(3), json!(3), json!(-1)),
+            3,
+            None,
+        ),
+    ] {
+        assert_eq!(check(&ack, rows), expected, "{case}");
+    }
+    let mut other_schema = receipt(GRANT_ID, json!(3), json!(3), json!(0));
+    other_schema["schema_version"] = json!("something_else.v1");
+    assert_eq!(check(&other_schema, 3), None);
+    let mut other_window = receipt(GRANT_ID, json!(3), json!(3), json!(0));
+    other_window["coverage_end"] = json!("2026-07-20");
+    assert_eq!(check(&other_window, 3), None);
 }
 
 // -- credential --------------------------------------------------------

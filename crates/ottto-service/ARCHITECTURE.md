@@ -463,6 +463,10 @@ Logins are read most overdue first, each at its own 6 h cadence and breaker; a 4
 grant-wide refusal ends the tick. The attempt time is saved before every request, and a
 request is never made when that save fails. `state.json` (schema 2) keeps one entry per
 account and the latest discovery summary; status reads that summary and never a credential.
+An answer with a `users` count above one anywhere is refused as workspace-wide. A batch counts
+as stored only when its acknowledgement names the expected grant and its row counts add up;
+when every batch of a read is stored as current, the account keeps a proof of that series,
+and another login of the same tick returning the identical series is not uploaded again.
 A login is one secure read and one parse of
 its home's `auth.json`; the request token, `ChatGPT-Account-Id` header, attribution
 fingerprint and account identity all come from that parse. Expiry and identity come from the
