@@ -8,9 +8,10 @@ use anyhow::Result;
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use std::collections::HashMap;
 
-/// Added by `user_version` 2, atomically with the version bump.
+/// Created if missing at every open, without a version change; builds that
+/// predate these tables ignore them.
 pub(super) const SCHEMA: &str = "
-CREATE TABLE cloud_task_acks(
+CREATE TABLE IF NOT EXISTS cloud_task_acks(
  scope_key BLOB NOT NULL CHECK(length(scope_key)=32),
  entity_key TEXT NOT NULL CHECK(length(entity_key) BETWEEN 1 AND 128),
  semantic_digest BLOB NOT NULL CHECK(length(semantic_digest)=32),
@@ -19,8 +20,8 @@ CREATE TABLE cloud_task_acks(
  expires_at_unix INTEGER NOT NULL,
  PRIMARY KEY(scope_key, entity_key)
 ) STRICT, WITHOUT ROWID;
-CREATE INDEX cloud_task_acks_expiry ON cloud_task_acks(expires_at_unix);
-CREATE TABLE cloud_collector_state(
+CREATE INDEX IF NOT EXISTS cloud_task_acks_expiry ON cloud_task_acks(expires_at_unix);
+CREATE TABLE IF NOT EXISTS cloud_collector_state(
  scope_key BLOB PRIMARY KEY CHECK(length(scope_key)=32),
  crawl_completed_date TEXT
 ) STRICT, WITHOUT ROWID;";
