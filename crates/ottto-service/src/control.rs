@@ -13211,7 +13211,7 @@ fn run_verify_source_action(
         return run_pi_verify_source_action(daemon, api_base_url, credentials, action);
     }
     let smoke_after = current_rfc3339();
-    let smoke = run_smoke_prompt(&source);
+    let smoke = run_verification_smoke_prompt(daemon, &source)?;
     record_setup_action_event(
         api_base_url,
         credentials,
@@ -13402,6 +13402,20 @@ struct SmokeResult {
 /// Code for a Verify smoke the quiet window held back: starting Claude Code
 /// now could refresh, and so sign out, the saved login.
 pub(crate) const CLAUDE_LOGIN_REFRESH_PENDING_CODE: &str = "claude_login_refresh_pending";
+
+fn run_verification_smoke_prompt(
+    daemon: &LocalDaemon,
+    source: &SourceKind,
+) -> Result<SmokeResult, LocalApiError> {
+    if *source == SourceKind::ClaudeCode {
+        daemon.remember_claude_verification_auth_marker(
+            crate::agent_status::claude_credential_modified_marker(
+                &ottto_core::ClaudeConfigDirSlot::Default,
+            ),
+        )?;
+    }
+    Ok(run_smoke_prompt(source))
+}
 
 fn run_smoke_prompt(source: &SourceKind) -> SmokeResult {
     if matches!(source, SourceKind::ClaudeCode) {
@@ -15619,7 +15633,7 @@ fn verify_source_unchecked(
     }
 
     let smoke_after = current_rfc3339();
-    let smoke = run_smoke_prompt(&source);
+    let smoke = run_verification_smoke_prompt(daemon, &source)?;
     let result = if !smoke.succeeded
         && smoke.error_code.as_deref() == Some(CLAUDE_OAUTH_REAUTH_REQUIRED_CODE)
     {

@@ -277,6 +277,8 @@ struct DaemonState {
     machine: MachineIdentity,
     relay: RelayState,
     sources: Vec<SourceHealth>,
+    /// Default login marker captured before verification; RAM-only, never persisted.
+    claude_verification_auth_marker: Option<Option<String>>,
     /// Real per-source first-seen timestamps, keyed by source slug. Boot-loaded
     /// from `<source_state_dir>/<slug>-state.json` and stamped on first
     /// observation; drives `SourceHealth.connected_at`.
@@ -500,6 +502,7 @@ impl LocalDaemon {
                     last_error: None,
                 },
                 sources: Vec::new(),
+                claude_verification_auth_marker: None,
                 source_first_seen: BTreeMap::new(),
                 source_reconciliation: BTreeMap::new(),
                 scan_index_health_revisions: [[0; 3]; 3],
@@ -1318,6 +1321,20 @@ impl LocalDaemon {
             .into_iter()
             .map(|(source, _)| source)
             .collect())
+    }
+
+    pub(crate) fn remember_claude_verification_auth_marker(
+        &self,
+        marker: Option<String>,
+    ) -> Result<(), LocalApiError> {
+        self.state()?.claude_verification_auth_marker = Some(marker);
+        Ok(())
+    }
+
+    pub(crate) fn claude_verification_auth_marker(
+        &self,
+    ) -> Result<Option<Option<String>>, LocalApiError> {
+        Ok(self.state()?.claude_verification_auth_marker.clone())
     }
 
     /// Read failure and Claude sign-in action together without collecting status or credentials.

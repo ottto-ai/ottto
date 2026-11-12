@@ -5172,6 +5172,7 @@ struct ReverifySchedule {
     next_attempt_at: Option<Instant>,
     // Outer None is a transient failure; Some holds the last nonsecret auth marker.
     reauth_marker: Option<Option<String>>,
+    verification_baseline: Option<Option<String>>,
 }
 
 impl ReverifySchedule {
@@ -5181,6 +5182,15 @@ impl ReverifySchedule {
             completed_attempts: 0,
             next_attempt_at: Some(now + reverify_backoff_delay(0)),
             reauth_marker: None,
+            verification_baseline: None,
+        }
+    }
+
+    fn observe_verification_baseline(&mut self, baseline: Option<Option<String>>) {
+        if self.verification_baseline != baseline {
+            self.reauth_marker = baseline.clone();
+            self.verification_baseline = baseline;
+            self.next_attempt_at = None;
         }
     }
 
@@ -5192,9 +5202,8 @@ impl ReverifySchedule {
                 return false;
             };
             if marker.is_none() {
-                // Absence/unavailability is not a new login. Keep the last known
-                // marker so a temporary read failure cannot re-arm the same login.
-                self.next_attempt_at = None;
+                // Keep both the last known marker and any unconsumed retry.
+                // Unavailable reads neither create a retry nor discard one.
                 return false;
             }
             if *previous != marker {
@@ -5260,6 +5269,10 @@ pub fn spawn_failed_verification_reverify(daemon: LocalDaemon) -> Result<()> {
                         });
                     let schedule = &mut schedules[index];
                     let marker = if requires_reauth && source == SourceKind::ClaudeCode {
+                        let Ok(baseline) = daemon.claude_verification_auth_marker() else {
+                            continue;
+                        };
+                        schedule.observe_verification_baseline(baseline);
                         crate::agent_status::claude_credential_modified_marker(
                             &ottto_core::ClaudeConfigDirSlot::Default,
                         )
@@ -13106,7 +13119,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_reauth_removal_cancels_retry_and_new_changes_restart_quiet_window() {
+    fn provider_reauth_pending_retry_survives_absence_and_observes_quiet_window() {
         let now = Instant::now();
         let mut schedule = ReverifySchedule::new(SourceKind::ClaudeCode, now);
         assert!(!schedule.is_due(now, true, Some("old".into())));
@@ -13114,6 +13127,8 @@ mod tests {
         assert!(!schedule.is_due(now + FAILED_VERIFY_RETRY_INITIAL, true, None));
         assert!(!schedule.is_due(now + FAILED_VERIFY_RETRY_MAX, true, None));
         let now = now + FAILED_VERIFY_RETRY_MAX;
+        assert!(schedule.is_due(now, true, Some("new".into())));
+        schedule.record_attempt(now);
         assert!(!schedule.is_due(now, true, Some("newer".into())));
         let changed_at = now + Duration::from_secs(60);
         assert!(!schedule.is_due(changed_at, true, Some("latest".into())));
@@ -13126,6 +13141,30 @@ mod tests {
             changed_at + FAILED_VERIFY_RETRY_INITIAL,
             true,
             Some("latest".into())
+        ));
+    }
+
+    #[test]
+    fn sign_in_before_first_poll_uses_pre_verification_baseline() {
+        let now = Instant::now();
+        let mut schedule = ReverifySchedule::new(SourceKind::ClaudeCode, now);
+        schedule.observe_verification_baseline(Some(None));
+        assert!(!schedule.is_due(now, true, Some("signed-in".into())));
+        schedule.observe_verification_baseline(Some(None));
+        assert!(schedule.is_due(
+            now + FAILED_VERIFY_RETRY_INITIAL,
+            true,
+            Some("signed-in".into())
+        ));
+        schedule.record_attempt(now + FAILED_VERIFY_RETRY_INITIAL);
+        // A manual check already tried the changed login: consume its pending retry.
+        let now = now + FAILED_VERIFY_RETRY_MAX;
+        assert!(!schedule.is_due(now, true, Some("next-login".into())));
+        schedule.observe_verification_baseline(Some(Some("next-login".into())));
+        assert!(!schedule.is_due(
+            now + FAILED_VERIFY_RETRY_MAX,
+            true,
+            Some("next-login".into())
         ));
     }
 
