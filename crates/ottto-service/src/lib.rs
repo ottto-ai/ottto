@@ -1327,7 +1327,11 @@ impl LocalDaemon {
         &self,
         marker: Option<String>,
     ) -> Result<(), LocalApiError> {
-        self.state()?.claude_verification_auth_marker = Some(marker);
+        let mut state = self.state()?;
+        // An unavailable read must not make an already-tried login look new.
+        if marker.is_some() || state.claude_verification_auth_marker.is_none() {
+            state.claude_verification_auth_marker = Some(marker);
+        }
         Ok(())
     }
 
@@ -5402,6 +5406,29 @@ mod tests {
     use serial_test::serial;
 
     const TOKEN: &str = "local_control_token";
+
+    #[test]
+    fn claude_verification_auth_marker_keeps_last_known_on_unavailable_read() {
+        let daemon = daemon();
+        assert_eq!(daemon.claude_verification_auth_marker().unwrap(), None);
+        daemon
+            .remember_claude_verification_auth_marker(None)
+            .unwrap();
+        assert_eq!(
+            daemon.claude_verification_auth_marker().unwrap(),
+            Some(None)
+        );
+        daemon
+            .remember_claude_verification_auth_marker(Some("known".into()))
+            .unwrap();
+        daemon
+            .remember_claude_verification_auth_marker(None)
+            .unwrap();
+        assert_eq!(
+            daemon.claude_verification_auth_marker().unwrap(),
+            Some(Some("known".into()))
+        );
+    }
 
     #[test]
     fn doctor_connection_binding_finding_requires_reconnect_and_clears_after_repair() {
