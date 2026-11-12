@@ -111,7 +111,7 @@ fn relisted_archive_members_count_as_discovered() {
             .filter(|p| p.census_member && codex_archive_path(&p.path))
             .count();
         assert_eq!(archives, ARCHIVES, "pass {pass}");
-        let skipped = claude_family_census_shadow::skipped_view(&index).count();
+        let skipped = index.skipped_census_member_count();
         assert_eq!(skipped, ARCHIVES, "pass {pass}");
         let discovered = traversal.counts.discovered_file_count;
         assert_eq!(discovered, walked + ARCHIVES, "pass {pass}");
@@ -149,10 +149,7 @@ fn relisted_known_member_keeps_discovered_count() {
             "{source:?}"
         );
         assert_eq!(traversal.counts.discovered_file_count, walked, "{source:?}");
-        assert!(
-            claude_family_census_shadow::skipped_view(&index).count() <= walked,
-            "{source:?}"
-        );
+        assert!(index.skipped_census_member_count() <= walked, "{source:?}");
     }
 }
 
@@ -190,7 +187,7 @@ fn fresh_walk_hint_members_count_as_discovered() {
         // A second hint for a path already pending adds nothing.
         for pass in 0..2 {
             enqueue_watcher_hints(source, index.traversal.as_mut().unwrap(), &hints, false);
-            let skipped = claude_family_census_shadow::skipped_view(&index).count();
+            let skipped = index.skipped_census_member_count();
             let discovered = index
                 .traversal
                 .as_ref()
@@ -201,7 +198,7 @@ fn fresh_walk_hint_members_count_as_discovered() {
             assert_eq!(discovered, HINTED, "{source:?} pass {pass}");
         }
         advance_bounded_directory_traversal(source, &mut index, 7, None);
-        let skipped = claude_family_census_shadow::skipped_view(&index).count();
+        let skipped = index.skipped_census_member_count();
         let discovered = index
             .traversal
             .as_ref()
@@ -240,7 +237,7 @@ fn hint_for_walked_file_keeps_discovered_count() {
             enqueue_watcher_hints(source, traversal, std::slice::from_ref(&grown), false);
         assert_eq!(next_generation, u64::from(source == SnapshotSource::Codex));
         assert_eq!(traversal.counts.discovered_file_count, walked, "{source:?}");
-        let skipped = claude_family_census_shadow::skipped_view(&index).count();
+        let skipped = index.skipped_census_member_count();
         assert_eq!(skipped, usize::from(source != SnapshotSource::Codex));
         assert!(skipped <= walked, "{source:?}");
     }

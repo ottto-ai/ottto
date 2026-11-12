@@ -113,9 +113,8 @@ fn forked_subagents_count_the_copied_parent_response_once_in_the_root() {
     }
 }
 
-/// [regress] A root not read at its current revision holds nothing: the fork
-/// counts its copy for now, and its next page, with the root's census
-/// current, removes it.
+/// [regress] Positive root census proof survives freshness changes: the
+/// copied first response stays removed while the parent is growing.
 #[test]
 fn unread_root_leaves_the_copy_counted_until_its_census_is_current() {
     let dir = ScratchDir::new("e2-family-duplicate-unread");
@@ -123,9 +122,9 @@ fn unread_root_leaves_the_copy_counted_until_its_census_is_current() {
     let session = format!("{ROOT}_agent-a1");
     take_diag();
     let stale = page(&root_census(&dir, Some(1)), &fork);
-    assert_eq!(stale[&session], (3, 0, false), "counted, not held");
+    assert_eq!(stale[&session], (2, 1, false), "removed, not held");
     // `parse` decides each file alone, then the page decides again.
-    assert_eq!(take_diag().get("family_copy_deferred"), Some(&2));
+    assert_eq!(take_diag().get("family_copy_deferred"), None);
     let current = page(&root_census(&dir, None), &fork);
     assert_eq!(current[&session], (2, 1, false));
 }

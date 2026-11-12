@@ -982,6 +982,34 @@ crate::heap_layout_bound::fields!(SnapshotQuarantineRecord; reconstruction_contr
 crate::heap_layout_bound::fields!(SnapshotQuarantineWitness; contract, collector_version, parser_version, scan_identity_version, snapshot_schema_version, entity_ack_contract, item_wire_byte_limit);
 
 impl ScanIndex {
+    /// Census members still queued at page end, exactly what
+    /// `skipped_file_count_due_to_limit` counts. Cap refusals are not in it,
+    /// and it is not `scan_cap_hit`. No stat or read.
+    pub(in crate::snapshots) fn skipped_census_member_count(&self) -> usize {
+        self.traversal.as_ref().map_or(0, |traversal| {
+            traversal
+                .pending_candidates
+                .iter()
+                .filter(|candidate| candidate.census_member)
+                .count()
+        })
+    }
+
+    /// The walk lost namespace, so directory closure cannot be proven: from
+    /// this page's checkpoint alone.
+    pub(in crate::snapshots) fn traversal_namespace_loss(
+        &self,
+        traversal: &ScanTraversalCheckpoint,
+    ) -> bool {
+        let counts = &traversal.counts;
+        counts.directory_entry_cap_exceeded_count > 0
+            || counts.symlink_rejected_count > 0
+            || counts
+                .unreadable_causes
+                .walk_loss(counts.unreadable_path_count as u64)
+            || !self.legacy_unresolved_root_file_witnesses.is_empty()
+    }
+
     /// Mark the sweep unsettled by a path that does not name itself.
     pub fn mark_bounded_sweep_unsettled(&mut self) {
         self.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::Unattributed);
