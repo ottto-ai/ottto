@@ -28,6 +28,8 @@ struct FirstRead {
     scan: SourceScanResult,
     /// The committed summary after the first page.
     first_page: Option<state_v2::FirstReadSummary>,
+    /// The committed summary at the end, read while the route is open.
+    last: std::result::Result<Option<state_v2::FirstReadSummary>, String>,
 }
 
 fn first_read(source: SnapshotSource, root: &Path, limit: usize, pending: bool) -> FirstRead {
@@ -79,6 +81,7 @@ fn first_read(source: SnapshotSource, root: &Path, limit: usize, pending: bool) 
     }
     let mut scan = last.unwrap();
     assert!(scan.census_complete, "first read finished");
+    let last = state_v2::first_read_summary(&index).map_err(|error| error.to_string());
     let mut bodies = BTreeSet::new();
     scan.snapshots = latest
         .into_values()
@@ -88,6 +91,7 @@ fn first_read(source: SnapshotSource, root: &Path, limit: usize, pending: bool) 
         index,
         scan,
         first_page,
+        last,
     }
 }
 
@@ -102,7 +106,7 @@ fn assert_progress_changes_no_money(source: SnapshotSource, root: &Path, files: 
     money_oracle::assert_no_smaller_reemit("", &cold, &other, &cold, false);
 
     assert!(off.first_page.is_none());
-    assert!(matches!(state_v2::first_read_summary(&off.index), Ok(None)));
+    assert_eq!(off.last, Ok(None));
     let first = on
         .first_page
         .expect("the first page anchored the first read");
@@ -114,9 +118,7 @@ fn assert_progress_changes_no_money(source: SnapshotSource, root: &Path, files: 
         first.done_at_ms.is_none(),
         "the first page froze: {first:?}"
     );
-    let last = state_v2::first_read_summary(&on.index)
-        .unwrap()
-        .expect("summary");
+    let last = on.last.clone().unwrap().expect("summary");
     assert_eq!(last.counts.members, files, "{last:?}");
     assert_eq!(last.counts.done, files, "every member done: {last:?}");
 }
