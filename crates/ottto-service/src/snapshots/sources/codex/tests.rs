@@ -4,3 +4,5 @@
 mod context_window;
 #[cfg(test)]
 mod creator_slot;
+#[cfg(test)]
+mod daily_reference_identity;

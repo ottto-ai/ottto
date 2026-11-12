@@ -451,3 +451,31 @@ current same-owner HMAC scope, leaving consent revoked. Every authority, provide
 send and cache admission validates current local identity; identity changes close admission
 and drain admitted I/O before replacing account or device state. Older daemons
 receive disabled legacy authority and cannot upload through retired routes.
+
+## Codex daily provider reference
+
+With a live approval, `provider_daily_reference` reads the provider's own daily usage for
+every Codex login on the Mac and uploads normalized scalar rows. Each tick reads the default
+home and every accepted slot home once (never a home seen only through a running process),
+keeps one login per opaque account (identified first, then the default home, then the lowest
+slot id) and uses a slot only while its live token proves the pair it was registered with.
+Logins are read most overdue first, each at its own 6 h cadence and breaker; a 429 or a
+grant-wide refusal ends the tick. The attempt time is saved before every request, and a
+request is never made when that save fails. `state.json` (schema 2) keeps one entry per
+account and the latest discovery summary; status reads that summary and never a credential.
+An answer with a `users` count above one anywhere is refused as workspace-wide. A batch counts
+as stored only when its acknowledgement names the expected grant and its row counts add up;
+when every batch of a read is stored as current, the account keeps a proof of that series,
+and another login of the same tick returning the identical series is not uploaded again.
+A login is one secure read and one parse of
+its home's `auth.json`; the request token, `ChatGPT-Account-Id` header, attribution
+fingerprint and account identity all come from that parse. Expiry and identity come from the
+live access token; an id token only cross-checks the pair. A token lapsing within five minutes
+is never used, and credentials are never refreshed or written.
+
+Under the current disclosure every batch of one read carries the same optional
+`account_identity` (the account and workspace hashes Codex session evidence uses) and the
+same `collected_at`, empty batches included. The read's last covered day is always the last
+complete UTC day at that `collected_at`. `provider_daily_reference::tests::accounts` emits the
+producer fixtures in `fixtures/provider-daily-reference/`; the snapshots parity test emits the
+cross-language identity vectors.

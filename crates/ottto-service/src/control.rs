@@ -5116,10 +5116,11 @@ fn provider_daily_reference_control(
         &FileDeviceStore::default(),
         &crate::provider_daily_reference::GrantStore::default(),
         &crate::provider_daily_reference::control_token_use_store(),
-        // Consent is taken over the provider account that is signed in right
-        // now. Only the account id is read; the token never enters this path.
-        crate::provider_daily_reference::read_codex_credential()
-            .map(|credential| credential.account_scope),
+        // Consent is taken over a Codex account signed in right now. Only the
+        // account id leaves the login read; the token never enters this path.
+        &|prepare_fallback| {
+            crate::provider_daily_reference::control_account_scope(prepare_fallback)
+        },
         crate::provider_daily_reference::network_disabled(),
     )
 }
@@ -5135,7 +5136,10 @@ fn provider_daily_reference_control_with_stores(
     devices: &FileDeviceStore,
     grants: &crate::provider_daily_reference::GrantStore,
     token_uses: &crate::cloud_sessions::CloudSessionControlTokenUseStore,
-    provider_account_scope: Option<String>,
+    // Read lazily: only Prepare (`true`, which may fall back to the first
+    // live login) and the account privacy controls (`false`, the default
+    // home's login) call it, after the token is consumed.
+    provider_account_scope: &dyn Fn(bool) -> Option<String>,
     network_disabled: bool,
 ) -> Result<ProviderDailyReferenceControlResult, LocalApiError> {
     let CodexControlTokenAuthority {
@@ -5199,7 +5203,8 @@ fn provider_daily_reference_control_with_stores(
     let mut backend_revoke_target = None;
     let result = match action {
         ProviderDailyReferenceControlAction::Prepare => {
-            let Some(provider_account_scope) = provider_account_scope
+            let scope = provider_account_scope(true);
+            let Some(provider_account_scope) = scope
                 .as_deref()
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
@@ -5252,7 +5257,8 @@ fn provider_daily_reference_control_with_stores(
         ProviderDailyReferenceControlAction::Status => Ok(()),
         ProviderDailyReferenceControlAction::ExcludeCurrentAccount
         | ProviderDailyReferenceControlAction::IncludeCurrentAccount => {
-            let Some(provider_account_scope) = provider_account_scope
+            let scope = provider_account_scope(false);
+            let Some(provider_account_scope) = scope
                 .as_deref()
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
@@ -5321,16 +5327,7 @@ fn provider_daily_reference_control_with_stores(
     }
     drop(identity_lifecycle_lock);
 
-    let live_binding = provider_account_scope.as_deref().and_then(|scope| {
-        devices
-            .load()
-            .ok()
-            .flatten()
-            .map(|device| crate::provider_daily_reference::Runtime {
-                installation_id: device.device_id,
-                provider_account_scope: scope.to_string(),
-            })
-    });
+    let installation_id = devices.load().ok().flatten().map(|device| device.device_id);
 
     Ok(ProviderDailyReferenceControlResult {
         action,
@@ -5341,8 +5338,9 @@ fn provider_daily_reference_control_with_stores(
         status: crate::provider_daily_reference::status_with_live_binding(
             grants,
             crate::provider_daily_reference::collector_status(grants, network_disabled),
-            live_binding.as_ref(),
+            installation_id.as_deref(),
         ),
+
         backend_create_request,
         backend_revoke_target,
     })
@@ -26163,6 +26161,21 @@ for line in sys.stdin:
                     .unwrap()
                     .unwrap()
             });
+            // Only Prepare and the account privacy controls may read a login.
+            let reads_login = matches!(
+                action,
+                ProviderDailyReferenceControlAction::Prepare
+                    | ProviderDailyReferenceControlAction::ExcludeCurrentAccount
+                    | ProviderDailyReferenceControlAction::IncludeCurrentAccount
+            );
+            let account_scope = move |prepare_fallback: bool| {
+                assert!(reads_login, "this action must not read a Codex login");
+                assert_eq!(
+                    prepare_fallback,
+                    matches!(action_slug, "prepare_provider_daily_reference")
+                );
+                Some("provider-account-scope".to_string())
+            };
             provider_daily_reference_control_with_stores(
                 action,
                 SecretString::new(test_control_token(action_slug, "codex", 240)),
@@ -26174,7 +26187,7 @@ for line in sys.stdin:
                 &devices,
                 &grants,
                 &token_uses,
-                Some("provider-account-scope".to_string()),
+                &account_scope,
                 network_disabled,
             )
         };
@@ -26238,8 +26251,10 @@ for line in sys.stdin:
             bound.status.runtime_state,
             crate::provider_daily_reference::RuntimeState::Enabled
         );
-        assert_eq!(bound.status.reason_code, "enabled");
+        // No tick has discovered logins under the new binding yet.
+        assert_eq!(bound.status.reason_code, "discovery_pending");
         assert!(bound.status.provider_read_permitted);
+        assert!(bound.status.accounts.is_empty());
         assert!(bound.backend_create_request.is_none());
 
         // Browser status and the privacy mutation must name the same opaque
@@ -26249,6 +26264,40 @@ for line in sys.stdin:
             .account_fingerprint_for("provider-account-scope")
             .unwrap()
             .unwrap();
+        // The collector's latest discovery under this binding: one default
+        // home login. Status reads only this file, never a credential.
+        fs::write(
+            root.join("state.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 2,
+                "discovery": {
+                    "binding": {
+                        "grant_id": "00000000-0000-4000-8000-000000000002",
+                        "grant_version": 1
+                    },
+                    "complete": true,
+                    "accounts": ["entry-default"],
+                    "skipped": {},
+                    "default_home": { "state": "ok", "fingerprint": live_fingerprint }
+                },
+                "entries": {
+                    "entry-default": {
+                        "schema_version": 2,
+                        "identity": "entry-default",
+                        "account_fingerprint": live_fingerprint,
+                        "home_kind": "default",
+                        "binding": {
+                            "grant_id": "00000000-0000-4000-8000-000000000002",
+                            "grant_version": 1
+                        },
+                        "last_seen_day": "2026-07-27",
+                        "last_reason": "ok"
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         let mismatch_action = ProviderDailyReferenceControlAction::ExcludeCurrentAccount;
         let mismatch_slug = provider_daily_reference_action_slug(&mismatch_action);
         let mismatch_api = cloud_control_validation_server(
@@ -26268,7 +26317,7 @@ for line in sys.stdin:
                 &devices,
                 &grants,
                 &token_uses,
-                Some("provider-account-scope".to_string()),
+                &|_| Some("provider-account-scope".to_string()),
                 false,
             ),
             Err(LocalApiError::InvalidRequest(_))
@@ -26304,6 +26353,15 @@ for line in sys.stdin:
         assert_eq!(included.status.reason_code, "enabled");
         assert!(!included.status.current_account_excluded);
         assert!(included.status.provider_read_permitted);
+        assert_eq!(
+            included.status.accounts,
+            vec![crate::provider_daily_reference::CollectorAccountStatusV1 {
+                ordinal: 1,
+                home_kind: "default".to_string(),
+                reason: "ok".to_string(),
+                last_success_at: None,
+            }]
+        );
 
         // The local off-switch outranks a live grant in the served status.
         let switched_off = run(
@@ -26417,7 +26475,7 @@ for line in sys.stdin:
                 &devices,
                 &grants,
                 &token_uses,
-                provider_account_scope,
+                &move |_| provider_account_scope.clone(),
                 false,
             )
         };
@@ -26493,7 +26551,7 @@ for line in sys.stdin:
                 &devices,
                 &grants,
                 &token_uses,
-                Some("provider-account-scope".to_string()),
+                &|_| Some("provider-account-scope".to_string()),
                 false,
             ),
             Err(LocalApiError::LocalClientNotTrusted)
