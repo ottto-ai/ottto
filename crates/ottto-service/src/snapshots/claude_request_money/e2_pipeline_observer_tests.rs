@@ -41,6 +41,17 @@ pub(crate) fn retire_census(index: &mut ScanIndex, file_name: &str) {
     index.claude_request_census.insert(key, record);
 }
 
+/// Preserve the scan binding but simulate parse loss with only these observed ids.
+pub(crate) fn lossy_census(index: &mut ScanIndex, file_name: &str, ids: &[&str]) {
+    census_with_ids(
+        index,
+        file_name,
+        ids,
+        crate::snapshots::claude_request_census::ClaudeRequestCensusShape::Lossy,
+        false,
+    );
+}
+
 /// Replace only the census's observed ids, shape and verification state.
 pub(crate) fn census_with_ids(
     index: &mut ScanIndex,
