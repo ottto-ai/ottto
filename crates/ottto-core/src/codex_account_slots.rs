@@ -1540,13 +1540,17 @@ fn status_contract(persisted: &PersistedCodexAccountSlotsV1) -> CodexAccountsSta
     let mut setup_operation = persisted.setup_operation.clone();
     // A named setup saved by a version without staging homes names the
     // slot's own home, whose login `codex login` would revoke: never hand it
-    // out. A daemon-run sign-in of that setup creates the staging home.
-    let staging = format!("{}{SIGN_IN_STAGING_DIR_NAME}'", std::path::MAIN_SEPARATOR);
+    // out. A daemon-run sign-in of that setup creates the staging home. The
+    // home is the command's last quoted path (see `codex_login_command`).
+    let staging_command = format!(
+        "{}{SIGN_IN_STAGING_DIR_NAME}' codex login",
+        std::path::MAIN_SEPARATOR
+    );
     if setup_uses_staging(&setup_operation)
         && setup_operation
             .launch_command
             .as_deref()
-            .is_some_and(|command| !command.contains(&staging))
+            .is_some_and(|command| !command.ends_with(&staging_command))
     {
         setup_operation.launch_command = None;
     }
@@ -3724,35 +3728,40 @@ mod tests {
         /// handed out, by status or by a replay.
         #[test]
         fn a_saved_command_naming_the_slots_home_is_not_handed_out() {
-            let (root, store) = test_store("legacy-command");
-            let slot_id = complete_a_reconnect(&store);
-            let home = store.slot_home(&slot_id).expect("home");
-            let operation = format!("codex_setup_{}", "5".repeat(32));
-            let reconnect = || {
-                store.begin_reconnect(
-                    CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
-                    operation.clone(),
-                    &slot_id,
-                    "d".repeat(64),
-                    "e".repeat(64),
-                )
-            };
-            let current = reconnect().expect("begin reconnect");
-            assert!(current.setup_operation.launch_command.is_some());
-            let mut saved: serde_json::Value =
-                serde_json::from_slice(&fs::read(&store.path).expect("settings")).expect("json");
-            saved["setup_operation"]["launch_command"] = codex_login_command(&home).into();
-            fs::write(&store.path, serde_json::to_vec(&saved).expect("json")).expect("settings");
+            // The second root has a `sign-in'` path component above the home.
+            for label in ["legacy-command", "legacy/sign-in'"] {
+                let (root, store) = test_store(label);
+                let slot_id = complete_a_reconnect(&store);
+                let home = store.slot_home(&slot_id).expect("home");
+                let operation = format!("codex_setup_{}", "5".repeat(32));
+                let reconnect = || {
+                    store.begin_reconnect(
+                        CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
+                        operation.clone(),
+                        &slot_id,
+                        "d".repeat(64),
+                        "e".repeat(64),
+                    )
+                };
+                let current = reconnect().expect("begin reconnect");
+                assert!(current.setup_operation.launch_command.is_some(), "{label}");
+                let mut saved: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&store.path).expect("settings"))
+                        .expect("json");
+                saved["setup_operation"]["launch_command"] = codex_login_command(&home).into();
+                fs::write(&store.path, serde_json::to_vec(&saved).expect("json"))
+                    .expect("settings");
 
-            let loaded = store.load().expect("load");
-            assert_eq!(
-                loaded.setup_operation.state,
-                CodexAccountSetupOperationStateV1::WaitingForUserLogin
-            );
-            assert_eq!(loaded.setup_operation.launch_command, None);
-            let replay = reconnect().expect("replay");
-            assert_eq!(replay.setup_operation.launch_command, None);
-            let _ = fs::remove_dir_all(root);
+                let loaded = store.load().expect("load");
+                assert_eq!(
+                    loaded.setup_operation.state,
+                    CodexAccountSetupOperationStateV1::WaitingForUserLogin
+                );
+                assert_eq!(loaded.setup_operation.launch_command, None, "{label}");
+                let replay = reconnect().expect("replay");
+                assert_eq!(replay.setup_operation.launch_command, None, "{label}");
+                let _ = fs::remove_dir_all(root);
+            }
         }
 
         /// [behaviour] A login replaced in the staging home after its check is
