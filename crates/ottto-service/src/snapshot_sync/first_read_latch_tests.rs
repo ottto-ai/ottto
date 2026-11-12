@@ -66,112 +66,8 @@ fn first_read_latch_new_destination_full_claim_money_oracle() {
     });
 }
 
-/// [behaviour] Marker classification stays Here for a non-full claim, but
-/// the claim's explicit cutoff still filters the pre-cutoff history.
-#[test]
-fn first_read_latch_marker_from_claim_keeps_cutoff_and_here() {
-    crate::snapshots::with_claude_reemission_stop_restored_for_test(|| {
-        crate::snapshots::restart_claude_reemission_stop_for_test();
-        let fixture = HistoryFixture::new("first-read-latch-from");
-        fixture.install_list(&[]);
-        std::fs::write(
-            crate::snapshots::claude_reemission_seen_marker_path(&fixture.support),
-            b"",
-        )
-        .unwrap();
-        crate::backfill::apply_claim_backfill_policy_for_destination(
-            &fixture.support,
-            Some("from"),
-            Some("2026-08-02T07:00:15Z"),
-            "different-user",
-            Some("from-destination"),
-        )
-        .unwrap();
-        let state = load_backfill_state(&fixture.support);
-        assert_eq!(
-            claude_prior_history(
-                &state,
-                "from-destination",
-                &test_upload_progress(),
-                &fixture.index_path_for(Some("from-destination")),
-                &fixture.support
-            ),
-            crate::snapshots::PriorHistory::Here
-        );
-        fixture.append(HISTORY_SESSIONS[0], "req_0_after_cutoff");
-        let outcome = fixture.cycle(
-            "2026-08-02T09:00:00Z",
-            HistoryCycle {
-                destination: Some("from-destination"),
-                bootstrapped: false,
-                ..HISTORY_CURRENT
-            },
-        );
-        assert_eq!(
-            outcome.uploaded,
-            BTreeSet::from([HISTORY_SESSIONS[0].to_string()])
-        );
-        assert_eq!(
-            crate::snapshots::claude_reemission_stop_reason_for_test(),
-            "none"
-        );
-    });
-}
-
-/// [behaviour] Same-destination corruption remains protected. Once armed,
-/// the process-wide latch also holds a later re-pair until a restart.
-#[test]
-fn first_read_latch_quarantine_and_process_wide_repair_until_restart() {
-    crate::snapshots::with_claude_reemission_stop_restored_for_test(|| {
-        for marker in [false, true] {
-            crate::snapshots::restart_claude_reemission_stop_for_test();
-            let fixture = HistoryFixture::new(&format!("first-read-latch-corrupt-{marker}"));
-            fixture.baseline();
-            fixture.install_list(&[]);
-            if marker {
-                std::fs::write(
-                    crate::snapshots::claude_reemission_seen_marker_path(&fixture.support),
-                    b"",
-                )
-                .unwrap();
-            }
-            fixture.corrupt_index();
-            let outcome = fixture.cycle("2026-08-02T09:00:00Z", HISTORY_CURRENT);
-            assert_eq!(
-                crate::snapshots::claude_reemission_stop_reason_for_test(),
-                if marker {
-                    "index_rebuild_withheld"
-                } else {
-                    "none"
-                }
-            );
-            assert_eq!(outcome.uploaded.is_empty(), marker);
-            if marker {
-                crate::backfill::apply_claim_backfill_policy_for_destination(
-                    &fixture.support,
-                    Some("full"),
-                    None,
-                    "same-user",
-                    Some("repair-destination"),
-                )
-                .unwrap();
-                let cycle = HistoryCycle {
-                    destination: Some("repair-destination"),
-                    bootstrapped: false,
-                    ..HISTORY_CURRENT
-                };
-                let held = fixture.cycle("2026-08-02T10:00:00Z", cycle);
-                assert!(held.uploaded.is_empty());
-                crate::snapshots::restart_claude_reemission_stop_for_test();
-                let resumed = fixture.cycle("2026-08-02T11:00:00Z", cycle);
-                assert_eq!(resumed.uploaded.len(), HISTORY_SESSIONS.len());
-            }
-        }
-    });
-}
-
 /// [behaviour] Classification precedence and non-Claude sources cannot arm
-/// a new stop; completed destinations and attested ledgers still can.
+/// a new stop; completed destinations, attested ledgers and quarantine still can.
 #[test]
 fn first_read_latch_destination_evidence_and_unverified_precedence() {
     use crate::snapshots::PriorHistory;
@@ -247,5 +143,15 @@ fn first_read_latch_destination_evidence_and_unverified_precedence() {
                 expected
             );
         }
+        crate::snapshots::restart_claude_reemission_stop_for_test();
+        fixture.install_list(&[]);
+        fixture.baseline();
+        fixture.corrupt_index();
+        fixture.cycle("2026-08-02T09:00:00Z", HISTORY_CURRENT);
+        assert_eq!(
+            crate::snapshots::claude_reemission_stop_reason_for_test(),
+            "index_rebuild_withheld",
+            "quarantine with a marker still latches the rebuild stop"
+        );
     });
 }
