@@ -50,26 +50,19 @@ pub(super) struct Ledger {
 struct Candidate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     built: Option<Binding>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    accepted: Option<Binding>,
-    /// Last healthy refused generation; unchanged pre-activation bytes are not re-read.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    observed: Option<TelemetryGeneration>,
+    #[serde(default)]
+    accepted: bool,
     #[serde(skip)]
     reading: Option<TelemetryGeneration>,
-    #[serde(skip, default = "default_true")]
-    inspect: bool,
 }
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Binding {
     fingerprint: String,
     body: String,
+    #[serde(deserialize_with = "otel::telemetry_generation_codec::deserialize")]
     generation: TelemetryGeneration,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     context: Option<String>,
-}
-fn default_true() -> bool {
-    true
 }
 impl std::fmt::Debug for Ledger {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -79,14 +72,14 @@ impl std::fmt::Debug for Ledger {
     }
 }
 crate::heap_layout_bound::fields!(Ledger; floor, start, candidates);
-crate::heap_layout_bound::fields!(Candidate; built, accepted, observed, reading, inspect);
+crate::heap_layout_bound::fields!(Candidate; built, accepted, reading);
 crate::heap_layout_bound::fields!(Binding; fingerprint, body, generation, context);
 
 impl Ledger {
     pub(super) fn references(&self) -> impl Iterator<Item = &str> {
         self.candidates
             .values()
-            .flat_map(|c| c.built.iter().chain(c.accepted.iter()))
+            .filter_map(|c| c.built.as_ref())
             .map(|b| b.fingerprint.as_str())
     }
 }
@@ -100,9 +93,7 @@ impl SnapshotUploadProgress {
         index.upload_progress_ack_incidence().chain(
             self.telemetry_only
                 .iter()
-                .flat_map(|ledger| ledger.candidates.values())
-                .flat_map(|candidate| candidate.built.iter().chain(candidate.accepted.iter()))
-                .map(|binding| binding.fingerprint.as_str()),
+                .flat_map(|ledger| ledger.references()),
         )
     }
 
@@ -140,7 +131,7 @@ impl SnapshotUploadProgress {
         if !batch.roots.is_empty() {
             let ledger = self.telemetry_only.as_mut().expect("activated ledger");
             for root in &batch.roots {
-                ledger.candidates.entry(root.clone()).or_default().inspect = true;
+                ledger.candidates.entry(root.clone()).or_default();
             }
             self.save(progress_path)?;
         }
@@ -158,61 +149,36 @@ impl SnapshotUploadProgress {
             .keys()
             .cloned()
             .collect();
-        let absent =
-            crate::snapshots::claude_request_money::e2::telemetry_roots_absent(index, &candidates);
-        let mut examined = Vec::new();
-        let mut selected = Vec::new();
-        for (root, candidate) in &self
-            .telemetry_only
-            .as_ref()
-            .expect("activated ledger")
+        let (absent, backed) =
+            crate::snapshots::claude_request_money::e2::telemetry_scope(index, &candidates);
+        let ledger = self.telemetry_only.as_mut().expect("activated ledger");
+        ledger
             .candidates
-        {
-            if page_roots.contains(root) || !absent.contains(root) {
-                continue;
-            }
-            let due = candidate
-                .built
-                .as_ref()
-                .is_some_and(|b| !self.contains_body(&b.fingerprint, &b.body));
-            if !candidate.inspect && !due {
+            .retain(|root, _| !page_roots.contains(root) && !backed.contains(root));
+        for (root, candidate) in &mut ledger.candidates {
+            if !absent.contains(root) {
                 continue;
             }
             let Ok(generation) = otel::telemetry_generation(support, root) else {
                 continue;
             };
-            if generation.iter().any(Option::is_none) {
+            if generation.iter().any(Option::is_none)
+                || candidate.built.as_ref().is_some_and(|built| {
+                    !otel::telemetry_not_truncated(&generation, &built.generation)
+                })
+                || (candidate.accepted
+                    && candidate.built.as_ref().is_some_and(|built| {
+                        built.generation == generation
+                            && built.context == self.context_resend.active
+                    }))
+            {
                 continue;
             }
-            let unchanged = candidate.built.as_ref().is_some_and(|b| {
-                b.generation == generation && self.contains_body(&b.fingerprint, &b.body)
-            });
-            if unchanged {
-                examined.push(root.clone());
-                continue;
-            }
-            if !due && candidate.observed.as_ref() == Some(&generation) {
-                continue;
-            }
-            selected.push((root.clone(), generation));
-        }
-        let ledger = self.telemetry_only.as_mut().expect("activated ledger");
-        for root in examined {
-            ledger
-                .candidates
-                .get_mut(&root)
-                .expect("examined candidate")
-                .inspect = false;
-        }
-        for (root, generation) in selected {
-            let candidate = ledger
-                .candidates
-                .get_mut(&root)
-                .expect("selected candidate");
-            candidate.observed = Some(generation.clone());
             candidate.reading = Some(generation);
-            scan.snapshots
-                .push(SnapshotItem::neutral_telemetry(root, current_rfc3339()));
+            scan.snapshots.push(SnapshotItem::neutral_telemetry(
+                root.clone(),
+                current_rfc3339(),
+            ));
         }
         Ok(Some(window))
     }
@@ -239,10 +205,9 @@ impl SnapshotUploadProgress {
                 .as_ref()
                 != Some(&generation)
             {
-                candidate.inspect = true;
                 return false;
             }
-            candidate.observed = Some(generation.clone());
+            candidate.accepted = false;
             candidate.built = Some(Binding {
                 fingerprint: item.snapshot_fingerprint.clone(),
                 body: snapshot_upload_body_witness(item),
@@ -261,13 +226,10 @@ impl SnapshotUploadProgress {
         else {
             return;
         };
-        if let Some(built) = candidate
+        candidate.accepted = candidate
             .built
             .as_ref()
-            .filter(|built| built.fingerprint == fingerprint && built.body == body)
-        {
-            candidate.accepted = Some(built.clone());
-        }
+            .is_some_and(|built| built.fingerprint == fingerprint && built.body == body);
     }
 
     pub(super) fn committed_telemetry_deliveries(
@@ -280,12 +242,12 @@ impl SnapshotUploadProgress {
         }
         let committed: Self = if self.rows.is_some() {
             let owner = SnapshotProgressLock::acquire(path)?.for_v2(path);
-            let (ledger, generation) = crate::snapshots::read_progress_ledger(index_path, &owner)?;
+            let committed = self.durable_rows(index_path, &owner)?;
             anyhow::ensure!(
-                generation > 0,
+                committed.generation > 0,
                 "telemetry delivery requires committed progress"
             );
-            serde_json::from_value(ledger.context("missing committed progress ledger")?)?
+            committed
         } else {
             serde_json::from_slice(&std::fs::read(path)?)?
         };
@@ -294,6 +256,12 @@ impl SnapshotUploadProgress {
             "telemetry delivery destination changed"
         );
         Ok(committed.telemetry_deliveries())
+    }
+
+    pub(super) fn settle_telemetry_root(&mut self, root: &str) {
+        if let Some(ledger) = self.telemetry_only.as_mut() {
+            ledger.candidates.remove(root);
+        }
     }
 
     pub(super) fn retire_telemetry_candidates(&mut self, retired: &BTreeSet<String>) {
@@ -311,7 +279,7 @@ impl SnapshotUploadProgress {
             .iter()
             .flat_map(|l| &l.candidates)
             .filter_map(|(root, candidate)| {
-                let accepted = candidate.accepted.as_ref()?;
+                let accepted = candidate.built.as_ref().filter(|_| candidate.accepted)?;
                 (self.accepted_body_witnesses.get(&accepted.fingerprint) == Some(&accepted.body)
                     && self.accepted_body_contexts.get(&accepted.fingerprint)
                         == accepted.context.as_ref())
@@ -321,8 +289,35 @@ impl SnapshotUploadProgress {
     }
 }
 
+impl Ledger {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "shared evidence stage and scheduling owner"
+    )]
+    pub(super) fn build(
+        &mut self,
+        item: SnapshotItem,
+        api: &otel::ClaudeLocalOtelLoadReport,
+        trace: &otel::ClaudeTraceOwnershipLoadReport,
+        index: &ScanIndex,
+        window: Window,
+        accepted: Option<&crate::snapshots::claude_request_identity::AcceptedBuckets>,
+        budget: crate::snapshots::claude_request_identity::WireBudget<'_>,
+    ) -> Option<SnapshotItem> {
+        let root = item.source_session_id.clone();
+        match build(item, api, trace, index, window, accepted, budget) {
+            Ok(Some(item)) => Some(item),
+            Ok(None) => {
+                self.candidates.remove(&root);
+                None
+            }
+            Err(()) => None, // Incomplete proof and identity bounds stay owed.
+        }
+    }
+}
+
 /// Called inside the ordinary evidence chunk with its already-strict loaded rows.
-pub(super) fn build(
+fn build(
     mut item: SnapshotItem,
     api: &otel::ClaudeLocalOtelLoadReport,
     trace: &otel::ClaudeTraceOwnershipLoadReport,
@@ -330,37 +325,38 @@ pub(super) fn build(
     window: Window,
     accepted: Option<&crate::snapshots::claude_request_identity::AcceptedBuckets>,
     budget: crate::snapshots::claude_request_identity::WireBudget<'_>,
-) -> Option<SnapshotItem> {
+) -> Result<Option<SnapshotItem>, ()> {
     use crate::snapshots::{
         claude_request_census, claude_request_identity, claude_request_money::e2,
     };
     let root = item.source_session_id.as_str();
-    let rows = api.evidence.get(root)?;
+    // The caller already proved a healthy strict read, including empty files.
+    let rows = api.evidence.get(root).map(Vec::as_slice).unwrap_or(&[]);
     let mut unique = BTreeMap::new();
     for row in rows {
         if unique
             .insert(row.request_id.as_str(), row)
             .is_some_and(|old: &otel::ClaudeLocalOtelEvidence| old.fingerprint != row.fingerprint)
         {
-            return None;
+            return Err(());
         }
     }
     if unique.is_empty() {
-        return None;
+        return Ok(None);
     }
-    let traces = trace.evidence.get(root)?;
+    let traces = trace.evidence.get(root).ok_or(())?;
     let trace_ids = traces
         .iter()
         .map(|row| row.request_id.as_str())
         .collect::<BTreeSet<_>>();
     if trace_ids != unique.keys().copied().collect() {
-        return None;
+        return Err(());
     }
     if traces
         .iter()
         .any(|row| !crate::snapshots::claude_trace_evidence_fingerprint_is_valid(row))
     {
-        return None;
+        return Err(());
     }
     let wanted = unique
         .keys()
@@ -368,18 +364,18 @@ pub(super) fn build(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-    let held = claude_request_census::positive_holders(&index.claude_request_census, &wanted);
+    let held = e2::telemetry_request_holders(index, &wanted);
     let mut entity = e2::ClaudeEntityBody::default();
     let mut first = i128::MAX;
     let mut last = i128::MIN;
     for row in unique.values() {
-        let at = clock(&row.observed_at)?;
+        let at = clock(&row.observed_at).ok_or(())?;
         // Never turn an old root's post-activation suffix into a fresh session.
         if at <= window.start
             || at <= window.floor + SLACK
             || window.ceiling.is_some_and(|end| at >= end - SLACK)
         {
-            return None;
+            return Ok(None); // Permanently before this pairing's admission window.
         }
         if held.contains(&claude_request_census::claude_request_hash(&row.request_id)) {
             continue;
@@ -388,19 +384,20 @@ pub(super) fn build(
             || row.session_id.as_ref() != root
             || !crate::snapshots::claude_api_evidence_fingerprint_is_valid(row)
         {
-            return None;
+            return Err(());
         }
         e2::add_reported_row(
             &mut entity,
             row,
             claude_request_identity::side_call_account(row, root),
             None,
-        )?;
+        )
+        .ok_or(())?;
         first = first.min(at);
         last = last.max(at);
     }
     if entity.grains.is_empty() {
-        return None;
+        return Ok(None);
     }
     entity.telemetry_owned_complete = true;
     let format = |at| {
@@ -414,9 +411,9 @@ pub(super) fn build(
     if !e2::emit_entity(&mut item, &entity)
         || !claude_request_identity::tag_telemetry_entity(&mut item, &entity, accepted, budget)
     {
-        return None;
+        return Err(());
     }
-    Some(item)
+    Ok(Some(item))
 }
 
 #[cfg(test)]

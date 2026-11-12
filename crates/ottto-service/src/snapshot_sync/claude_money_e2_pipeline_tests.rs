@@ -258,6 +258,7 @@ impl Page {
                     &mut self.index,
                     accepted.as_deref(),
                     wire_budget,
+                    None,
                 )
             });
         if let Some(accepted) = accepted.as_deref_mut() {

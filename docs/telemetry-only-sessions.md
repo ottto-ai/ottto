@@ -24,6 +24,14 @@ persistence. Ordinary SDK sessions remain eligible. The child also disables
 OpenTelemetry exporters through inline settings and preserves
 `--no-session-persistence`. The local usage refresher is unchanged.
 
-This first draft carries an explicit oracle row inventory. Full money and
-placement comparisons, previous-release hydrate/drop verification and complete
-end-to-end retention tests remain required before review completion.
+Candidates remain in the existing root-keyed progress ledger while evidence,
+identity or delivery proof is incomplete. Receiver identity limits hold the
+whole telemetry-only body and use the existing over-cap diagnostics. They
+never authorize sending a smaller or identity-stripped replacement.
+
+Transcript takeover, pre-activation refusal, permanent server refusal and
+completed cleanup release scheduling metadata. Cleanup retries use the original
+accepted generation, tolerate already-unlinked members and sync both directories
+before releasing metadata. A committed candidate remains discoverable even when
+both files are absent. Older releases tolerate and drop this additive ledger;
+rolling forward then conservatively starts a later activation window.

@@ -71,6 +71,7 @@ pub(crate) fn retire_claude_telemetry(
             Err(_) => listing_fault = 1,
         }
     }
+    stems.extend(proofs.keys().cloned());
     let release = delivery_proven(&stems, proofs);
     let mut held = Counts::default();
     // Classification only: a listed family member proves a current transcript.
@@ -167,17 +168,19 @@ fn retire(
     for stem in stems {
         if protected.contains(&stem) {
             run.held_roots += 1;
+            retired.insert(stem); // Transcript custody has taken over; keep its files.
             continue;
         }
         match crate::claude_local_otel::read_telemetry_pair(support_dir, &stem) {
             Err(()) => run.read_fault += 1,
-            Ok(None) => {}
+            Ok(None) => {
+                retired.insert(stem);
+            }
             Ok(Some(pair)) if pair.last_write >= fence => run.held_roots += 1,
             Ok(Some(pair)) => candidates.push((stem, pair)),
         }
     }
     let copied = copied_candidates(index, removed, roster, &candidates);
-    let mut unlinked = false;
     for ((stem, pair), copied) in candidates.iter().zip(copied) {
         if copied {
             run.held_roots += 1;
@@ -193,14 +196,13 @@ fn retire(
             Ok(true) => {
                 run.retired_roots += 1;
                 run.retired_bytes += pair.bytes;
-                unlinked = true;
                 retired.insert(stem.clone());
             }
             Ok(false) => run.held_roots += 1,
             Err(_) => run.read_fault += 1,
         }
     }
-    if unlinked && crate::claude_local_otel::sync_telemetry_dirs(support_dir).is_err() {
+    if !retired.is_empty() && crate::claude_local_otel::sync_telemetry_dirs(support_dir).is_err() {
         run.read_fault += 1;
         retired.clear();
     }

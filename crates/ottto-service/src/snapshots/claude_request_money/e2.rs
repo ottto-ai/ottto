@@ -4211,11 +4211,22 @@ pub(crate) fn add_reported_row(
 /// A complete scoped negative answer, independent of this page's emissions.
 /// Birth observations include content-session and path twins, even when they
 /// emitted no body. Unknown relevant queue/decode state keeps work owed.
-pub(crate) fn telemetry_roots_absent(
+pub(crate) fn telemetry_scope(
     index: &ScanIndex,
     roots: &BTreeSet<String>,
-) -> BTreeSet<String> {
+) -> (BTreeSet<String>, BTreeSet<String>) {
     let queued = queued_directory_names(index);
+    let mut backed = roots
+        .iter()
+        .filter(|root| {
+            index
+                .claude_money_birth_store
+                .observations(root)
+                .next()
+                .is_some()
+        })
+        .cloned()
+        .collect::<BTreeSet<_>>();
     let mut absent = roots
         .iter()
         .filter(|root| {
@@ -4241,9 +4252,16 @@ pub(crate) fn telemetry_roots_absent(
     {
         if let Some(member) = claude_index_path_member_ref(Path::new(key)) {
             absent.remove(member.root);
+            if roots.contains(member.root) {
+                backed.insert(member.root.to_owned());
+            }
         }
     }
-    absent
+    (absent, backed)
+}
+
+pub(crate) fn telemetry_request_holders(index: &ScanIndex, wanted: &[u64]) -> BTreeSet<u64> {
+    claude_request_census::positive_holders(&index.claude_request_census, wanted)
 }
 
 pub(crate) fn emit_entity(item: &mut SnapshotItem, entity: &ClaudeEntityBody) -> bool {

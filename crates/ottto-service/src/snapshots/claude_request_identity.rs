@@ -1181,8 +1181,7 @@ fn apply_grouped_with_accepted(
             });
         }
     }
-    let unpriced = over_cap
-        .is_empty()
+    let unpriced = (over_cap.is_empty() && item.evidence_basis != Some("otel_only"))
         .then(|| untag_unpriced_parts(item, &grouping, accepted))
         .flatten();
     if let Some(unpriced) = unpriced {
@@ -4176,6 +4175,7 @@ pub(crate) fn tag_telemetry_entity(
     budget: WireBudget<'_>,
 ) -> bool {
     let mut grouping = entity_grouping(entity, bucket_row_count(item));
+    grouping.hold_over_cap = true;
     grouping.extra_wire_bytes = budget.reservation.map_or(0, |reserve| reserve(item));
     let known = accepted.and_then(|state| state.get(&item.source_session_id));
     matches!(

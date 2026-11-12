@@ -96,91 +96,79 @@ fn smoke_namespace_is_fresh_and_exact() {
     )));
 }
 
-/// [format] The previous ledger shape hydrates without the additive member.
-/// The existing CAS decoder is also an actual old-reader unknown-field path.
+/// [format] The additive extension defaults absent on ordinary progress.
 #[test]
-fn previous_release_progress_hydrate() {
+fn additive_progress_hydrate_defaults_dark() {
     let old = json!({"schema_version": SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION,
         "destination_namespace_hash": "fixture-destination", "generation": 7});
-    let progress: SnapshotUploadProgress = serde_json::from_value(old.clone()).unwrap();
+    let progress: SnapshotUploadProgress = serde_json::from_value(old).unwrap();
     assert!(progress.telemetry_only.is_none());
-    let mut upgraded = old;
-    upgraded["telemetry_only"] = json!({"floor": 1, "start": 2, "candidates": {}});
-    let prior_cas: SnapshotUploadProgressCas = serde_json::from_value(upgraded).unwrap();
-    assert_eq!(prior_cas.generation, 7);
-    // TODO draft: hydrate checked bytes through the previous release's full
-    // decoder, save/drop, then rehydrate head; CAS tolerance alone is not that proof.
 }
 
-/// Draft oracle inventory. These are obligations, not completed money proof.
-/// Each entry will run through cold/second Tail/restore/restart/upgrade with
-/// full money and placement comparison. No empty fixture is called verified.
-const ORACLE_ROWS: &[&str] = &[
-    "[oracle] two_accounts_mid_session_switch_side_call_gap_tagged_row",
-    "[oracle] three_priced_unpriced_rows_dedup_presence_cache_reasoning",
-    "[oracle] complete_login_org_tagged",
-    "[oracle] login_only_invalid_unknown_money_once",
-    "[oracle] all_unknown_body_no_seed",
-    "[off=main] no_malformed_unknown_hint_no_load_build_send",
-    "[off=main] withdrawn_hint_no_load_build_send",
-    "[format] pairing_T_floor_ceiling_strict_boundaries",
-    "[format] pre_activation_root_held",
-    "[format] exact_top_and_nested_wire_allowlists",
-    "[format] previous_release_hydrate_drop_roll_forward",
-    "[behaviour] root_without_transcript_emits_once_empty_page_slots",
-    "[off=main] in_scope_transcript_root_unchanged",
-    "[oracle] queued_unread_failed_listing_held_growth_owed",
-    "[oracle] partial_malformed_pair_held",
-    "[oracle] healthy_zero_rows_not_failed_evidence",
-    "[oracle] retryable_refusal_debt_permanent_scheduling_only",
-    "[oracle] truncation_repair_no_smaller_reemit",
-    "[oracle] api_only_append_cumulative",
-    "[oracle] trace_only_append_cumulative",
-    "[oracle] append_during_detached_notice_save",
-    "[oracle] failed_selected_save_restore_notice",
-    "[oracle] restart_after_build",
-    "[oracle] restart_after_ack_before_progress_commit",
-    "[oracle] restart_after_progress_commit_before_graph_save",
-    "[oracle] acked_restart_zero_content_bytes",
-    "[oracle] growth_cumulative_no_smaller",
-    "[oracle] retired_scheduling_append_reopens",
-    "[oracle] delayed_transcript_same_root_CAS_replaces_once",
-    "[oracle] late_provisional_superseded_no_retention_proof",
-    "[oracle] uploaded_transcript_local_deletion_no_downgrade",
-    "[oracle] exact_accepted_destination_pair_releases",
-    "[oracle] unrelated_ack_page_completed_global_switch_no_release",
-    "[oracle] partial_refusal_unchanged_not_stored_no_release",
-    "[oracle] post_ack_api_append_holds",
-    "[oracle] post_ack_trace_append_holds",
-    "[oracle] append_between_proof_read_unlink_holds",
-    "[oracle] restart_keeps_exact_delivery_proof",
-    "[oracle] copy_protection_unknown_listing_fence_veto",
-    "[oracle] unlink_failure_retry_directory_sync_before_retirement",
-    "[oracle] all_copy_main_twins_across_directories",
-    "[oracle] content_twins",
-    "[oracle] ack_another_carrier",
-    "[oracle] resumed_holder_on_and_off_page",
-    "[oracle] cross_folder_holder",
-    "[oracle] subagent_all_copy_prefix_own_turns",
-    "[oracle] singleton_twin_only_page",
-    "[oracle] correction_then_notice",
-    "[oracle] other_root_subagent_request_holder_veto",
-    "[behaviour] smoke_stub_persistence_flag_and_fresh_reserved_uuid",
-    "[behaviour] smoke_json_api_zero_store_notice_body",
-    "[behaviour] smoke_protobuf_api_zero_store_notice_body",
-    "[behaviour] smoke_json_trace_zero_store_notice_body",
-    "[behaviour] smoke_protobuf_trace_zero_store_notice_body",
-    "[oracle] ordinary_sdk_positive_control",
-    "[oracle] mixed_smoke_user_rows_keep_user_money",
-    "[behaviour] namespace_restart_no_registry",
-];
+/// [format] The pair's append-only order is API, trace. Old short sequences
+/// pad with unknown; future tails are consumed without failing the ledger.
+#[test]
+fn generation_shapes_and_candidate_ledger_golden() {
+    let api = json!({"device":1,"inode":2,"bytes":3,"modified":[4,5],"changed":[6,7]});
+    let trace = json!({"device":8,"inode":9,"bytes":10,"modified":[11,12],"changed":[13,14]});
+    for (input, expected) in [
+        (json!([]), json!([null, null])),
+        (json!([api]), json!([api, null])),
+        (json!([api, trace]), json!([api, trace])),
+        (json!([api,trace,{"future":"tail"}]), json!([api, trace])),
+    ] {
+        let raw = json!({"floor":1,"start":2,"candidates":{"root":{
+            "built":{"fingerprint":"f","body":"b","generation":input,"context":"c"},"accepted":true
+        }}});
+        let ledger: Ledger = serde_json::from_value(raw.clone()).unwrap();
+        let mut golden = raw;
+        golden["candidates"]["root"]["built"]["generation"] = expected;
+        assert_eq!(serde_json::to_value(ledger).unwrap(), golden);
+    }
+    assert!(serde_json::from_value::<Binding>(
+        json!({"fingerprint":"f","body":"b","generation":[false]})
+    )
+    .is_err());
+}
 
 #[test]
-fn draft_oracle_rows_are_explicit_and_unique() {
-    assert_eq!(
-        ORACLE_ROWS.len(),
-        ORACLE_ROWS.iter().copied().collect::<BTreeSet<_>>().len()
+fn delivery_requires_exact_accepted_body_context_and_destination() {
+    let root = "candidate";
+    let binding = json!({"fingerprint":"f","body":"b","generation":[null,null],"context":"c"});
+    let mut value = json!({"schema_version":SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION,
+        "destination_namespace_hash":"destination", "generation":1,
+        "telemetry_only":{"floor":1,"start":2,"candidates":{root:{"built":binding,"accepted":false}}},
+        "accepted_body_witnesses":{"f":"b"}, "accepted_body_contexts":{"f":"c"}});
+    let mut progress: SnapshotUploadProgress = serde_json::from_value(value.clone()).unwrap();
+    assert!(
+        progress.telemetry_deliveries().is_empty(),
+        "stored/unchanged ACK is not accepted-only proof"
     );
-    // TODO draft: wire each row into the shared money oracle. This catalogue
-    // deliberately makes no assertion about those unimplemented outcomes.
+    progress.accept_telemetry(root, "other", "b");
+    assert!(progress.telemetry_deliveries().is_empty());
+    progress.accept_telemetry(root, "f", "different");
+    assert!(progress.telemetry_deliveries().is_empty());
+    progress.accept_telemetry(root, "f", "b");
+    assert_eq!(progress.telemetry_deliveries().len(), 1);
+    value = serde_json::to_value(&progress).unwrap();
+    for (field, bad) in [
+        ("accepted_body_witnesses", json!({"f":"changed"})),
+        (
+            "accepted_body_contexts",
+            json!({"f":"different-destination"}),
+        ),
+    ] {
+        let mut changed = value.clone();
+        changed[field] = bad;
+        let changed: SnapshotUploadProgress = serde_json::from_value(changed).unwrap();
+        assert!(changed.telemetry_deliveries().is_empty());
+    }
+    progress.settle_telemetry_root(root);
+    assert!(progress
+        .telemetry_only
+        .as_ref()
+        .unwrap()
+        .references()
+        .next()
+        .is_none());
 }

@@ -7692,6 +7692,7 @@ fn finish_sync_source(
         upload_progress.load_identity(
             (scan_result.snapshots.iter()).map(|item| item.source_session_id.as_str()),
         )?;
+        let mut telemetry_ledger = upload_progress.telemetry_only.take();
         let reserve_cache_bytes = |item: &SnapshotItem| {
             if cache_observations_enabled {
                 identity_cache_wire_reserve(item, &upload_progress, cache_full_replacement)
@@ -7709,8 +7710,9 @@ fn finish_sync_source(
                     max_item_bytes: identity_item_cap,
                     reservation: Some(&reserve_cache_bytes),
                 },
-                telemetry_window,
+                telemetry_window.zip(telemetry_ledger.as_deref_mut()),
             );
+        upload_progress.telemetry_only = telemetry_ledger;
         // Copy-derived rows (#944): the bodies just built treat these
         // rows as never accepted; the ledger records that durably before any
         // upload, so a lost reply or restart cannot restore their proof.
@@ -9456,7 +9458,7 @@ fn pack_claude_evidence_families(
 
 /// What the chunks of one page share: its original carriers and the counters.
 struct ClaudeEvidencePage<'p> {
-    telemetry_window: Option<telemetry_only::Window>,
+    telemetry_window: Option<(telemetry_only::Window, &'p mut telemetry_only::Ledger)>,
     originals: &'p BTreeMap<String, crate::snapshots::SessionAccountEvidence>,
     request_owned_originals: &'p crate::snapshots::claude_request_identity::RequestOwnedOriginals,
     stats: ClaudeLocalEvidenceStats,
@@ -9474,7 +9476,7 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
     index: &mut ScanIndex,
     accepted_identity_buckets: Option<&crate::snapshots::claude_request_identity::AcceptedBuckets>,
     wire_budget: crate::snapshots::claude_request_identity::WireBudget<'_>,
-    telemetry_window: Option<telemetry_only::Window>,
+    telemetry_window: Option<(telemetry_only::Window, &mut telemetry_only::Ledger)>,
 ) -> (
     crate::snapshots::ClaudeUsageAuthorityDisposition,
     bool,
@@ -10121,18 +10123,18 @@ fn apply_claude_local_evidence_chunk(
     drop(window);
     drop(identity_evidence);
     drop(cross);
-    if let Some(window) = page.telemetry_window {
+    if let Some((window, ledger)) = page.telemetry_window.as_mut() {
         scan_result.snapshots.extend(
             synthetic
                 .into_iter()
                 .filter(|item| synthetic_healthy.contains(&item.source_session_id))
                 .filter_map(|item| {
-                    telemetry_only::build(
+                    ledger.build(
                         item,
                         &api_report,
                         &trace_report,
                         index,
-                        window,
+                        *window,
                         accepted_identity_buckets,
                         wire_budget,
                     )
@@ -10766,9 +10768,15 @@ where
         let stored_refs = response
             .accepted_entities
             .iter()
-            .chain(&response.unchanged_entities)
-            .filter(|entity| entity.unchanged_basis.is_none())
-            .map(|entity| (entity.snapshot_fingerprint.as_str(), entity))
+            .map(|entity| (entity, true))
+            .chain(
+                response
+                    .unchanged_entities
+                    .iter()
+                    .map(|entity| (entity, false)),
+            )
+            .filter(|(entity, _)| entity.unchanged_basis.is_none())
+            .map(|(entity, accepted)| (entity.snapshot_fingerprint.as_str(), (entity, accepted)))
             .collect::<BTreeMap<_, _>>();
         for entity in response
             .accepted_entities
@@ -10788,11 +10796,12 @@ where
                 let witness = body_witness(item);
                 progress.record_body(item_fingerprint, &witness);
                 if let Some(root) = session_id(item) {
-                    if response.accepted_entities.iter().any(|entity| {
-                        entity.source_session_id == root
-                            && entity.snapshot_fingerprint == item_fingerprint
-                            && entity.unchanged_basis.is_none()
-                    }) {
+                    if stored_refs
+                        .get(item_fingerprint)
+                        .is_some_and(|(entity, accepted)| {
+                            *accepted && entity.source_session_id == root
+                        })
+                    {
                         progress.accept_telemetry(root, item_fingerprint, &witness);
                     }
                 }
@@ -10810,7 +10819,7 @@ where
                     false,
                     stored_refs
                         .get(item_fingerprint)
-                        .map(|entity| (*entity, witness.as_str())),
+                        .map(|(entity, _)| (*entity, witness.as_str())),
                 )?;
             } else if not_stored.contains(item_fingerprint) {
                 progress.hold_unstored_body(item_fingerprint, &body_witness(item));
@@ -10857,6 +10866,7 @@ where
                         rejection.safe_reason(),
                     );
                     progress.note_refused_exposure(item_fingerprint, item);
+                    progress.settle_telemetry_root(&rejection.source_session_id);
                 } else {
                     // Any validated non-permanent answer keeps only this
                     // entity owed. Accepted siblings settle independently.
@@ -22764,6 +22774,9 @@ mod tests {
     }
     pub(in crate::snapshot_sync) mod claude_money_e2_pipeline_tests {
         include!("snapshot_sync/claude_money_e2_pipeline_tests.rs");
+        mod telemetry_only_oracle_tests {
+            include!("snapshot_sync/telemetry_only/oracle_tests.rs");
+        }
         #[cfg(unix)]
         mod privacy_flip_money_tests {
             include!("snapshot_sync/privacy_flip_money_tests.rs");
