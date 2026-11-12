@@ -111,8 +111,11 @@ file-system hint / periodic listing → select file → read new bytes from save
   Money rule three selects content twins, path twins and disclosed main files
   once, using eight smallest census hashes per candidate and one complete
   deadline-bounded census walk. It re-owes only a matching copy and its earliest
-  holder, and stamps the rule version in the same save. An incomplete walk
-  stamps nothing and retries next cycle.
+  holder, and stamps the rule version in the same save. Subagent path-twin
+  homes sharing census ids are both selected within that same deadline.
+  An incomplete selection stamps nothing and retries next cycle. An all-copy
+  subagent twin keeps the skips an earlier same-session fold proves, even
+  before the subagent cutoff; a twin with own turns retains the cutoff.
 - **Upload.** A session is uploaded as a whole-session replacement, idempotent at the receiver. It
   settles only on an exact acknowledgement of the exact bytes sent to that destination. A local
   receipt never counts as an acknowledgement; refused, not-stored and partial answers are not

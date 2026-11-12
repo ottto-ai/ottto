@@ -557,3 +557,7 @@ fn incomplete_version_three_selector_retries_without_stamping() {
         assert_eq!(prior.claude_money_birth_store.money_rule_version(), 3);
     });
 }
+
+mod subagent_twins {
+    include!("subagent_copy_twin_tests.rs");
+}

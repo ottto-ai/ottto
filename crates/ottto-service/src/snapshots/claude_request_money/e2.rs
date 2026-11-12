@@ -478,14 +478,16 @@ pub(crate) fn apply_money_rules(index: &mut ScanIndex) {
             Some(start + SIDE_CALL_DEADLINE),
             true,
         );
+        let subagents = selected
+            .as_ref()
+            .and_then(|_| subagent_twin_files(index, &twins, start + SIDE_CALL_DEADLINE));
         diag(
             "money_rule_v3_selector_ms",
             start.elapsed().as_millis() as u64,
         );
-        let Some(selected) = selected else {
+        let (Some(selected), Some(mut reowed)) = (selected, subagents) else {
             return;
         };
-        let mut reowed = BTreeSet::new();
         for (copy, holder) in selected {
             reowed.insert(copy);
             reowed.insert(holder);
@@ -500,6 +502,57 @@ pub(crate) fn apply_money_rules(index: &mut ScanIndex) {
     let store = &mut index.claude_money_birth_store;
     store.retain_money_marks(&live);
     store.set_money_rule_version(current);
+}
+
+/// Subagent path twins need no main-holder walk: their indexed census
+/// overlap selects both homes for one co-read. Share v3's deadline; no
+/// partial selection or version stamp escapes an incomplete pass.
+fn subagent_twin_files(
+    index: &ScanIndex,
+    twins: &ClaudeTwinGroups,
+    deadline: Instant,
+) -> Option<BTreeSet<String>> {
+    let mut owed = BTreeSet::new();
+    for homes in twins.values() {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        if !homes.first().is_some_and(|(key, _)| {
+            claude_index_path_member_ref(Path::new(key))
+                .is_some_and(|member| member.subagent_stem.is_some())
+        }) {
+            continue;
+        }
+        for (at, (key, _)) in homes.iter().enumerate() {
+            let Some(record) = index
+                .claude_request_census
+                .get(key)
+                .filter(|r| r.proves_scan())
+            else {
+                continue;
+            };
+            for (other, _) in &homes[..at] {
+                let Some(holder) = index
+                    .claude_request_census
+                    .get(other)
+                    .filter(|r| r.proves_scan())
+                else {
+                    continue;
+                };
+                for &hash in record.request_hashes() {
+                    if Instant::now() >= deadline {
+                        return None;
+                    }
+                    if holder.holds_hash(hash) {
+                        owed.insert(key.clone());
+                        owed.insert(other.clone());
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    (Instant::now() < deadline).then_some(owed)
 }
 
 /// Fixed count-only causes of the existing certificate veto.
@@ -2273,15 +2326,17 @@ fn decide_subagent_twins(items: &mut [SnapshotItem], at: usize) {
             })
         })
         .unwrap_or_default();
+    let all_copy = first_own_turn_at(item, 0, &earlier).is_none();
     let mut kept = 0;
     let uncovered = skipped_ids(item)
         .filter(|id| {
-            let eligible = item.claude_usage_occurrences[*id]
-                .timestamp
-                .as_deref()
-                .and_then(rfc3339_unix_nanos)
-                .expect("native skips have usable provider timestamps")
-                >= SUBAGENT_TWIN_FROM;
+            let eligible = all_copy
+                || item.claude_usage_occurrences[*id]
+                    .timestamp
+                    .as_deref()
+                    .and_then(rfc3339_unix_nanos)
+                    .expect("native skips have usable provider timestamps")
+                    >= SUBAGENT_TWIN_FROM;
             let held = eligible && earlier.iter().any(|ids| ids.contains(*id));
             kept += u64::from(held);
             !held
