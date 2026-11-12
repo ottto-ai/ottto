@@ -13532,6 +13532,7 @@ fn smoke_command(source: &SourceKind) -> SmokeCommand {
                 "ottto test",
                 "--disallowedTools",
                 "*",
+                "--no-session-persistence",
             ]
             .into_iter()
             .map(ToString::to_string)
@@ -26951,7 +26952,20 @@ for line in sys.stdin:
 
     #[test]
     #[serial]
-    fn pi_smoke_subprocess_receives_provider_environment() {
+    fn smoke_commands_keep_source_specific_flags_and_provider_environment() {
+        for source in [SourceKind::ClaudeCode, SourceKind::Codex, SourceKind::Pi] {
+            let command = smoke_command(&source);
+            assert_eq!(
+                command
+                    .args
+                    .iter()
+                    .any(|arg| arg == "--no-session-persistence"),
+                matches!(source, SourceKind::ClaudeCode),
+                "{} smoke persistence flag",
+                command.program
+            );
+        }
+
         let root = control_test_root("pi-smoke-provider-env");
         let fake_pi = fake_binary_path(&root, "pi");
         fs::write(
