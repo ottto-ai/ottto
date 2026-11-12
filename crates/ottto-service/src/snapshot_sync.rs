@@ -7688,7 +7688,7 @@ fn finish_sync_source(
             }
         };
         let (mut disposition, census_withheld, stats) =
-            apply_claude_local_evidence_to_scan_with_ledger_and_budget(
+            apply_claude_local_evidence_to_scan_in_context(
                 support_dir,
                 &mut scan_result,
                 &mut index,
@@ -7697,6 +7697,8 @@ fn finish_sync_source(
                     max_item_bytes: identity_item_cap,
                     reservation: Some(&reserve_cache_bytes),
                 },
+                claude_scan_roots.as_deref().unwrap_or_default(),
+                receipt_window_days,
             );
         // Copy-derived rows (#944): the bodies just built treat these
         // rows as never accepted; the ledger records that durably before any
@@ -9247,6 +9249,7 @@ pub struct ClaudeLocalEvidenceStats {
 }
 
 /// The ordinary evidence stage without identity ledger or wire budget inputs.
+#[cfg(test)]
 pub(crate) fn apply_claude_local_evidence_to_scan(
     support_dir: &Path,
     scan_result: &mut crate::snapshots::SourceScanResult,
@@ -9421,18 +9424,45 @@ struct ClaudeEvidencePage<'p> {
     stats: ClaudeLocalEvidenceStats,
     /// Roots already counted: a scope root two chunks read counts once.
     counted_roots: BTreeSet<String>,
+    side_call_discovery: crate::snapshots::claude_request_money::e2::SideCallDiscovery,
 }
 
 /// The evidence stage over one page: its families are packed into chunks and
 /// the evidence body runs once per chunk, so one chunk's rows are resident at
 /// a time. Copy decisions, original carriers and census health run once over
 /// the page; each chunk's emitted folds are released when it ends.
+#[cfg(test)]
 fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
     support_dir: &Path,
     scan_result: &mut SourceScanResult,
     index: &mut ScanIndex,
     accepted_identity_buckets: Option<&crate::snapshots::claude_request_identity::AcceptedBuckets>,
     wire_budget: crate::snapshots::claude_request_identity::WireBudget<'_>,
+) -> (
+    crate::snapshots::ClaudeUsageAuthorityDisposition,
+    bool,
+    ClaudeLocalEvidenceStats,
+) {
+    let lookback_days = scan_result.backfill_window_days;
+    apply_claude_local_evidence_to_scan_in_context(
+        support_dir,
+        scan_result,
+        index,
+        accepted_identity_buckets,
+        wire_budget,
+        &[],
+        lookback_days,
+    )
+}
+
+pub(crate) fn apply_claude_local_evidence_to_scan_in_context(
+    support_dir: &Path,
+    scan_result: &mut SourceScanResult,
+    index: &mut ScanIndex,
+    accepted_identity_buckets: Option<&crate::snapshots::claude_request_identity::AcceptedBuckets>,
+    wire_budget: crate::snapshots::claude_request_identity::WireBudget<'_>,
+    roots: &[PathBuf],
+    lookback_days: u64,
 ) -> (
     crate::snapshots::ClaudeUsageAuthorityDisposition,
     bool,
@@ -9461,6 +9491,11 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
             ..Default::default()
         },
         counted_roots: BTreeSet::new(),
+        side_call_discovery: crate::snapshots::claude_request_money::e2::SideCallDiscovery::new(
+            scan_result
+                .completed_parses()
+                .map(|(key, _)| Path::new(key)),
+        ),
     };
     // The named fork parents, whatever route the copy decisions take.
     let fork_parents = crate::snapshots::claude_cross_root_evidence::EvidenceScope::fork_parents(
@@ -9557,6 +9592,16 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
     disposition
         .copy_invalidated
         .sort_by_key(|row| first_slot.get(row.session()).copied());
+    scan_result.enqueue_claude_side_call_hints(
+        index,
+        roots,
+        lookback_days,
+        &page
+            .side_call_discovery
+            .hints
+            .into_iter()
+            .collect::<Vec<_>>(),
+    );
     let ClaudeEvidencePage { mut stats, .. } = page;
     for item in &scan_result.snapshots {
         if !item.source_session_id.contains("_agent-") {
@@ -9906,12 +9951,14 @@ fn apply_claude_local_evidence_chunk(
     };
     let window = step("evidence_side_calls");
     // `e2` side calls need the trace-named owner, so they follow the trace read.
-    let side_calls_unresolved = crate::snapshots::claude_request_money::e2::side_calls_page(
-        &mut scan_result.snapshots,
-        &api_report,
-        &trace_report,
-        index,
-    );
+    let side_calls_unresolved =
+        crate::snapshots::claude_request_money::e2::side_calls_page_with_discovery(
+            &mut scan_result.snapshots,
+            &api_report,
+            &trace_report,
+            index,
+            &mut page.side_call_discovery,
+        );
     let trace_discard_unfolded = {
         // Reuse the per-root read verdict before identity consumes it. Missing
         // sidecars are ordinary absence; partial pairs and failed strict reads

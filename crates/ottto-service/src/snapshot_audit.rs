@@ -236,11 +236,16 @@ pub fn run_snapshot_audit<W: Write>(
                 &index,
                 &options.machine_id,
             );
-            let (disposition, _, stats) = crate::snapshot_sync::apply_claude_local_evidence_to_scan(
-                support_dir,
-                &mut scan,
-                &mut index,
-            );
+            let (disposition, _, stats) =
+                crate::snapshot_sync::apply_claude_local_evidence_to_scan_in_context(
+                    support_dir,
+                    &mut scan,
+                    &mut index,
+                    None,
+                    Default::default(),
+                    &options.roots,
+                    options.backfill_window_days,
+                );
             claude_authority_disposition = disposition;
             claude_local_evidence = Some(stats);
         }

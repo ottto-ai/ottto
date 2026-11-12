@@ -5524,3 +5524,7 @@ fn e2_pipeline_recorded_removal_stands_when_its_holder_leaves_the_index() {
 }
 
 mod desktop_depth_tests;
+
+mod late_member_side_calls_tests {
+    include!("late_member_side_calls_tests.rs");
+}
