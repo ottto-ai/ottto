@@ -712,12 +712,12 @@ pub(in crate::snapshots) fn ram_miss_class(
 mod retained_heap_tests {
     use super::*;
     #[test]
-    fn charged_caches_are_unknown_while_busy_and_zero_when_empty() {
+    fn charged_caches_are_unknown_while_busy_and_available_when_empty() {
         let cache = SharedCache::default();
         let index = ScanIndex::default();
         let empty = cache.retained_heap_bytes(&index);
         assert_eq!(empty.len(), 8);
-        assert_eq!(empty["codex_sidecar_facts_bytes"], Some(0));
+        assert!(empty["codex_sidecar_facts_bytes"].is_some());
         let guard = cache.sidecars.lock().unwrap();
         assert_eq!(
             cache.retained_heap_bytes(&index)["codex_sidecar_facts_bytes"],
@@ -726,7 +726,16 @@ mod retained_heap_tests {
         drop(guard);
         assert_eq!(
             cache.retained_heap_bytes(&index)["codex_sidecar_facts_bytes"],
-            Some(0)
+            empty["codex_sidecar_facts_bytes"]
+        );
+        cache
+            .sidecars
+            .lock()
+            .unwrap()
+            .insert("synthetic-scope".into(), Default::default());
+        assert!(
+            cache.retained_heap_bytes(&index)["codex_sidecar_facts_bytes"]
+                > empty["codex_sidecar_facts_bytes"]
         );
     }
 }
