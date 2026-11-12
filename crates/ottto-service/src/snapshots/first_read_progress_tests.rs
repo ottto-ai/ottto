@@ -42,6 +42,12 @@ fn first_read(source: SnapshotSource, root: &Path, limit: usize, pending: bool) 
     let mut last = None;
     let mut settle = 0;
     let mut first_page = None;
+    let dir = std::env::temp_dir().join(format!("ottto-fixture-routes-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    // The daemon saves between passes: the page's stage commits on the
+    // route, and the summary is read from what committed.
+    let committed =
+        |index: &ScanIndex| state_v2::first_read_summary(index).map_err(|error| error.to_string());
     for pass in 0..64 {
         let prior = index.clone();
         let (mut next, mut scan, _) =
@@ -62,8 +68,9 @@ fn first_read(source: SnapshotSource, root: &Path, limit: usize, pending: bool) 
         let keys = next.files.keys().cloned().collect::<Vec<_>>();
         settle_first_read(source, &next, keys.iter().map(String::as_str));
         next = next.committable_subset(&prior, &accepted, &BTreeMap::new());
+        next = fixture.routed(next, &dir);
         if pass == 0 {
-            first_page = state_v2::first_read_summary(&next).ok().flatten();
+            first_page = committed(&next).unwrap();
         }
         let emitted = !scan.snapshots.is_empty();
         for item in std::mem::take(&mut scan.snapshots) {
@@ -81,7 +88,7 @@ fn first_read(source: SnapshotSource, root: &Path, limit: usize, pending: bool) 
     }
     let mut scan = last.unwrap();
     assert!(scan.census_complete, "first read finished");
-    let last = state_v2::first_read_summary(&index).map_err(|error| error.to_string());
+    let last = committed(&index);
     let mut bodies = BTreeSet::new();
     scan.snapshots = latest
         .into_values()
