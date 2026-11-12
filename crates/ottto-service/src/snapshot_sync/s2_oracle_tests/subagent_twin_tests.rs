@@ -238,7 +238,7 @@ fn identical_family_and_idless_copies() {
 fn occurrence_boundary_counts_unusable_and_old_copies() {
     with_e2(|| {
         for (name, clock, counted, removed) in [
-            ("before", "2026-11-04T23:59:59.999999999Z", 2, 2),
+            ("before", "2026-11-04T23:59:59.999999999Z", 1, 3),
             ("equal", START, 1, 3),
             ("after", TURN, 1, 3),
             ("missing", "", 2, 2),
@@ -798,8 +798,8 @@ fn restart_boundaries_and_quiet_settlement() {
     });
 }
 
-/// [money] A doubled pre-boundary accepted child stays doubled, including
-/// after new eligible shared work: the accepted prefix is never corrected.
+/// [money] All-copy pre-boundary history stays singular after acceptance.
+/// A quiet/main-only page carries its exact body; new shared work adds once.
 #[test]
 fn accepted_pre_boundary_body_keeps_its_count_and_witness() {
     with_e2(|| {
@@ -810,7 +810,7 @@ fn accepted_pre_boundary_body_keeps_its_count_and_witness() {
             &c.base.join("state"),
         );
         let first = page(&c, index, 100, true);
-        assert_eq!(body(&first, &child(0)).unwrap().request_count, 2);
+        assert_eq!(body(&first, &child(0)).unwrap().request_count, 1);
         let mut before = result(&first, Mode::ColdFull);
         accepted(&mut before, &first.scan.snapshots);
         let prior = commit(&session, first);
@@ -818,9 +818,9 @@ fn accepted_pre_boundary_body_keeps_its_count_and_witness() {
         assert!(quiet.scan.snapshots.is_empty());
         let main = c.root.join(format!("z/{ROOT}.jsonl"));
         append(&main, &line(ROOT, "main-only", GROW, 8));
-        // The doubled child is not re-sent; its accepted body equals cold.
+        // The singular child is not re-sent; its accepted body equals cold.
         let main_only = hinted(&c, prior, 100, true, &[main]);
-        assert_eq!(before.accepted[&child(0)].body["request_count"], 2);
+        assert_eq!(before.accepted[&child(0)].body["request_count"], 1);
         assert_main_only(&c, &main_only, &before.accepted, Mode::Ram);
         let prior = commit(&session, main_only);
         for home in ["a", "z"] {
@@ -833,8 +833,8 @@ fn accepted_pre_boundary_body_keeps_its_count_and_witness() {
         let grown = hinted(&c, prior, 100, true, &[path]);
         assert_eq!(
             body(&grown, &child(0)).unwrap().request_count,
-            3,
-            "old prefix twice, eligible new request once"
+            2,
+            "all-copy old prefix once, eligible new request once"
         );
         let expected = cold(&c);
         money_oracle::assert_equivalent(&expected, &result(&grown, Mode::Restart));

@@ -37,16 +37,17 @@ fn legacy(c: &Corpus, index: ScanIndex) -> (ScanIndex, SnapshotItem) {
         &E2ScanFixture::with_subagent_births(),
         index.clone(),
         100,
-        false,
+        true,
         &[],
     );
+    let committed = page.committed.clone();
     e2::pipeline_test_observer::released_subagent_copies(&mut page.scan.snapshots);
     page.enrich(c);
     page.finish();
     let head = body(&page, &member()).unwrap().clone();
     assert_eq!((head.request_count, head.output_tokens), (52, 23_050));
     assert_eq!(head.removed_request_count, Some(0));
-    let prior = settle(c, &index, page, &mut e2_progress());
+    let prior = settle(c, &committed, page, &mut e2_progress());
     (prior, head)
 }
 
@@ -192,6 +193,7 @@ fn subagent_twin_version_three_converges_once() {
         let (c, paths, index) = pair("subagent-copied-convergence");
         let (mut prior, head) = legacy(&c, index);
         prior.claude_money_birth_store.set_money_rule_version(2);
+        prior.activate_effective_upload_body_witness_revision(3);
         // Keep a main candidate in the shared walk so the existing forced
         // deadline seam exercises the complete v3 transaction as well.
         prior.claude_money_birth_store.set_money_marks(
@@ -204,6 +206,7 @@ fn subagent_twin_version_three_converges_once() {
         });
         assert_eq!(prior.claude_money_birth_store.money_rule_version(), 2);
         prior = c.reload(&mut prior);
+        prior.activate_effective_upload_body_witness_revision(3);
         e2::apply_money_rules(&mut prior);
         assert_eq!(prior.claude_money_birth_store.money_rule_version(), 3);
         assert_eq!(copy_diag(&["money_rule_v3_reowed"]), [2]);
