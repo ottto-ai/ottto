@@ -1011,20 +1011,25 @@ impl DiskBytes {
             };
             if unsafe { libc::proc_pid_rusage(libc::getpid(), 6, (&raw mut usage).cast()) } == 0 {
                 let f = usage.fields;
-                static TIMEBASE: std::sync::OnceLock<Option<libc::mach_timebase_info_data_t>> =
+                // (numer, denom); libc marks the mach timebase items deprecated in favour of
+                // the mach2 crate, which this crate does not depend on.
+                static TIMEBASE: std::sync::OnceLock<Option<(u32, u32)>> =
                     std::sync::OnceLock::new();
+                #[allow(deprecated)]
                 let timebase = TIMEBASE.get_or_init(|| {
                     let mut info = libc::mach_timebase_info_data_t { numer: 0, denom: 0 };
                     (unsafe { libc::mach_timebase_info(&mut info) } == 0 && info.denom != 0)
-                        .then_some(info)
+                        .then_some((info.numer, info.denom))
                 });
                 let micros = |ticks: Option<u64>| {
-                    ticks.zip(timebase.as_ref()).and_then(|(n, t)| {
-                        u64::try_from(
-                            u128::from(n) * u128::from(t.numer) / u128::from(t.denom) / 1000,
-                        )
-                        .ok()
-                    })
+                    ticks
+                        .zip(timebase.as_ref())
+                        .and_then(|(n, &(numer, denom))| {
+                            u64::try_from(
+                                u128::from(n) * u128::from(numer) / u128::from(denom) / 1000,
+                            )
+                            .ok()
+                        })
                 };
                 return Some(Self {
                     disk_read_bytes: f[16],
