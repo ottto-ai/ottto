@@ -4247,6 +4247,18 @@ fn codex_managed_home_whose_refresh_is_dead_needs_a_new_sign_in() {
     );
     assert!(codes(&dead).contains(&"codex_account_needs_login".to_string()));
     assert!(!codes(&dead).contains(&"codex_identity_unknown".to_string()));
+    // The snapshot carries the same cause once, for the web; a healthy
+    // slot's does not.
+    let snapshot_codes = |candidate: &CodexSlotCandidate| {
+        candidate
+            .snapshot
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "codex_account_needs_login")
+            .count()
+    };
+    assert_eq!(snapshot_codes(&dead), 1);
+    assert_eq!(snapshot_codes(&fresh), 0);
     // Nothing binds to it: identity and placement are unchanged.
     assert!(dead.binding.is_none());
     assert!(dead.status.account_identifier_hash.is_none());

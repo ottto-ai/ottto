@@ -3871,6 +3871,18 @@ fn apply_codex_dead_login(
     if let Some(account) = snapshot.account.as_mut() {
         account.login_state = AgentLoginState::SignedOut;
     }
+    // The slot's own cause, on the snapshot too, so the web can show it.
+    if !snapshot
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "codex_account_needs_login")
+    {
+        snapshot.diagnostics.push(AgentStatusDiagnostic::source(
+            "codex_account_needs_login",
+            AgentDiagnosticSeverity::Warning,
+            "Codex must be signed in again for this durable connection.",
+        ));
+    }
 }
 
 fn collect_codex_usage_for_home(
