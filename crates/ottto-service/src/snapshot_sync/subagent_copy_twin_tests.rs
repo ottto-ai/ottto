@@ -300,7 +300,10 @@ fn subagent_prefix_with_prebirth_own_turns_counts_once() {
         for mode in [Mode::Ram, Mode::Restart] {
             let mut index = prior.clone();
             if mode == Mode::Restart {
-                index = c.reload(&mut index);
+                index = crate::snapshots::e2_pipeline_scan_fixture::save_reload_for_test(
+                    &mut index,
+                    &c.base.join("prefix-restart.json"),
+                );
             }
             owe(&mut index);
             let mut page = ready(&c, &scanner, index, 100, true);
@@ -313,7 +316,8 @@ fn subagent_prefix_with_prebirth_own_turns_counts_once() {
         }
         // The copy alone includes both the shared prefix and its two own
         // responses; the original's ids are all present, so absence is safe.
-        for path in [&paths[1]] {
+        {
+            let path = &paths[1];
             let mut index = prior.clone();
             owe(&mut index);
             index = crate::snapshots::e2_pipeline_scan_fixture::save_reload_for_test(
