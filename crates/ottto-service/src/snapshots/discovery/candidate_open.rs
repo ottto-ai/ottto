@@ -438,8 +438,9 @@ pub(in crate::snapshots) fn read_opened_content_samples(
     Ok(OpenedContentSamples { head, tail })
 }
 
-/// The opened-object identity. `object` carries the unix device, inode and
-/// ctime; it is `None` exactly where those are unavailable.
+/// The opened-object identity. `object` carries the unix inode and ctime
+/// (its device number is not hashed); it is `None` exactly where those are
+/// unavailable.
 pub(in crate::snapshots) fn opened_object_identity_from(
     len: u64,
     object: Option<&OpenedObjectStat>,
@@ -449,7 +450,8 @@ pub(in crate::snapshots) fn opened_object_identity_from(
     update_length_prefixed(&mut digest, OPENED_OBJECT_IDENTITY_VERSION.as_bytes());
     update_length_prefixed(&mut digest, &len.to_be_bytes());
     if let Some(object) = object {
-        update_length_prefixed(&mut digest, &object.device.to_be_bytes());
+        // Not the device number: a reboot or remount renumbers the volume of
+        // an unchanged file (`transcript_acquisition::FileStamp`).
         update_length_prefixed(&mut digest, &object.inode.to_be_bytes());
         // ctime is an opened-object mutation witness, not business time. It
         // catches an in-place middle rewrite even when size and mtime are
@@ -522,11 +524,11 @@ pub(in crate::snapshots) fn opened_object_identity_and_stat_retained(
 /// output-relevant inputs may trigger a re-read; ctime, xattr, mode and
 /// hard-link flips never do. When this path's entry has the candidate's size
 /// and mtime and exactly its (known) file birth, the fingerprint uses the
-/// entry's stored ctime with the live device and inode and fresh head/tail
+/// entry's stored ctime with the live inode and fresh head/tail
 /// samples. With only ctime moved it then equals the stored fingerprint and
 /// the candidate gate skips: a ctime-only change costs this bounded sample
 /// re-read, never a Full read. A sampled-byte change or a new object (whose
-/// device and inode the identity hashes live) still changes the fingerprint
+/// inode the identity hashes live) still changes the fingerprint
 /// and reads; a size, mtime or birth change, or an unavailable birth, keeps
 /// the live identity and reads.
 /// Returns the opened-object identity to fingerprint with, if adopted.

@@ -4,7 +4,8 @@
 // that re-validate the bounded content samples and never read the file
 // again on their own. mtime stays a trigger: it moves only on content
 // writes, including a truncate/regrow the samples cannot see. A new object
-// (device, inode, birth) is output-relevant: the parse consumes it. All
+// (inode, birth) is output-relevant: the parse consumes it; a renumbered
+// device (reboot, remount) is not. All
 // fixtures are synthetic and content-free.
 use super::*;
 use std::io::{Seek, SeekFrom, Write};

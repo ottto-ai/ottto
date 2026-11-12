@@ -171,13 +171,9 @@ pub(in crate::snapshots) fn certified_physical_matches(
     let Ok(stamp) = crate::transcript_acquisition::FileStamp::capture(metadata.clone()) else {
         return false;
     };
-    stamp.same_listing(
-        certificate.device,
-        certificate.inode,
-        certificate.length,
-        certificate.modified,
-    ) && (certificate.birth_nanos == 0
-        || metadata.created().ok().and_then(unix_nanos) == Some(certificate.birth_nanos))
+    stamp.same_listing(certificate.inode, certificate.length, certificate.modified)
+        && (certificate.birth_nanos == 0
+            || metadata.created().ok().and_then(unix_nanos) == Some(certificate.birth_nanos))
 }
 
 /// Rebind only a Codex head's route prefix after the caller proves a path
