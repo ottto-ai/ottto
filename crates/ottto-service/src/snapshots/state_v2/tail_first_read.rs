@@ -296,6 +296,8 @@ pub(in crate::snapshots::state_v2) fn read_member(
 pub(super) struct Commit {
     /// The committed summary, or the one this commit creates.
     summary: Option<Summary>,
+    /// The summary as committed before this commit (N4 compares against it).
+    before: Option<Summary>,
     /// This commit creates the generation.
     creating: bool,
     /// A file's isolated block rolled back in this commit.
@@ -321,6 +323,7 @@ impl Commit {
         };
         Self {
             summary,
+            before: (!creating).then_some(summary).flatten(),
             creating,
             rolled_back: false,
         }
@@ -407,7 +410,7 @@ impl Commit {
         let Some(mut summary) = self.summary.filter(Summary::open) else {
             return Ok(());
         };
-        let before = (!self.creating).then_some(summary);
+        let before = self.before;
         let edit = edit.copied().unwrap_or_default();
         if summary.certified_at_ms.is_none() {
             summary.certified_at_ms = edit.certify_at_ms;
