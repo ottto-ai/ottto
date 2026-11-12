@@ -98,7 +98,9 @@ file-system hint / periodic listing → select file → read new bytes from save
   retain their existing replay path; no admitted-key ledger is persisted.
 - **Claude copied history.** Pre-birth request ids held by an earlier accepted
   main file stay removed, including same-session resumes and origins in another
-  folder. A file's own stored removals never prove another copy. These decisions
+  folder. Same-session proof uses the session's accepted body, regardless of
+  which file carried it; cross-session proof requires that file's acceptance.
+  A file's own stored removals never prove another copy. These decisions
   use the existing removal store. An incomplete census walk keeps only the
   unresolved prefix out of totals and leaves its existing prefix lease pending.
   The first deadline registers that lease at age one; subsequent deadlines

@@ -87,7 +87,7 @@ fn copy_evidence(c: &Corpus, grown: bool) {
 }
 
 /// Distinct account hashes anywhere in a route's bodies.
-fn accounts(result: &RouteResult) -> usize {
+pub(in crate::snapshot_sync) fn accounts(result: &RouteResult) -> usize {
     fn walk(value: &serde_json::Value, out: &mut std::collections::BTreeSet<String>) {
         match value {
             serde_json::Value::Object(fields) => {

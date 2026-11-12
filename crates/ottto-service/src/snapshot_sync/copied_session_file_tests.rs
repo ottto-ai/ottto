@@ -173,6 +173,7 @@ fn incomplete_all_folder_walk_never_restores_or_ages_copies() {
         let key = path.to_string_lossy().into_owned();
         for _ in 0..4 {
             let mut page = c.raw(&E2ScanFixture::default(), prior.clone(), 100, false, &[]);
+            e2::take_diag();
             crate::snapshots::claude_request_census::with_walk_deadline_for_test(|| {
                 page.enrich(&c);
             });
@@ -181,6 +182,24 @@ fn incomplete_all_folder_walk_never_restores_or_ages_copies() {
                 (item.request_count, item.removed_request_count),
                 (1, Some(0))
             );
+            assert!(
+                crate::snapshots::claude_request_money::is_request_owned_literal(item),
+                "the own turn is emitted literally on the incomplete-walk page"
+            );
+            assert_eq!(
+                item.output_tokens, 10,
+                "the own turn counts on this same page"
+            );
+            assert_eq!(
+                copy_diag(&[
+                    "copy_prefix_held_requests",
+                    "copy_prefix_hold_expired",
+                    "copy_prefix_unproven"
+                ]),
+                [2, 0, 0],
+                "only the two copied units stay held; none restore or expire"
+            );
+            assert_eq!(page.disposition.quarantined_entity_count(), 0);
             assert_eq!(
                 page.index.claude_copy_removals.hold_age(location_key(&key)),
                 1
@@ -287,24 +306,17 @@ fn copied_file_routes_preserve_money_and_placement() {
                 sampled,
             );
             page.finish();
-            let accounts = page
-                .scan
-                .snapshots
-                .iter()
-                .flat_map(|item| &item.usage_buckets)
-                .flat_map(|bucket| &bucket.model_usage)
-                .filter_map(|row| row.account_identifier_hash.as_ref())
-                .collect::<BTreeSet<_>>();
+            let route = captured(&page, mode);
             assert!(
-                accounts.len() >= 2,
-                "placement control needs two tagged accounts"
+                super::money_equivalence_tests::copy_prefix_route_tests::accounts(&route) >= 2,
+                "placement control needs two tagged accounts, identity parts included"
             );
             assert_eq!(
                 body(&page, ROOT).unwrap().request_count,
                 5,
                 "four own turns and one side call"
             );
-            routes.push(captured(&page, mode));
+            routes.push(route);
         }
         for route in &routes[1..] {
             money_oracle::assert_equivalent(&routes[0], route);

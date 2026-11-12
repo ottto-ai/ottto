@@ -2091,8 +2091,21 @@ fn census_copy_holder(
     root: &str,
     hash: u64,
 ) -> Option<(i128, LocationKey)> {
+    origin_accepted(index, key).then_some(())?;
+    census_holder(index, key, root, hash)
+}
+
+/// Positive id and order evidence, independent of which same-session file
+/// carried the accepted summed body. Cross-session callers still use
+/// `census_copy_holder`, with its per-file acceptance check.
+fn census_holder(
+    index: &ScanIndex,
+    key: &str,
+    root: &str,
+    hash: u64,
+) -> Option<(i128, LocationKey)> {
     let record = index.claude_request_census.get(key)?;
-    if !record.proves_scan() || !record.holds_hash(hash) || !origin_accepted(index, key) {
+    if !record.proves_scan() || !record.holds_hash(hash) {
         return None;
     }
     let holder = holder_order(&index.claude_money_birth_store, root, key)?;
@@ -2786,6 +2799,13 @@ fn decide_holders(
     // (A) The copy's own session, then (B) the in-folder holder's
     // session in every folder. These indexed lookups need no census walk.
     for file in &mut wanted {
+        // The first discovered path carries a summed session's ACK. Rule A
+        // uses that session acceptance regardless of the carrier's location.
+        let session_accepted = store.observations(&file.session).any(|(location, _)| {
+            live.get_or_init(|| indexed_main_files(index))
+                .get(&location)
+                .is_some_and(|key| origin_accepted(index, key))
+        });
         for session in std::iter::once(&file.session).chain(file.holder_sessions.iter()) {
             for (location, _) in store.observations(session) {
                 let Some(&key) = live
@@ -2798,14 +2818,18 @@ fn decide_holders(
                     if file.stored.contains(&hash) {
                         continue;
                     }
-                    if let Some(holder) =
-                        census_copy_holder(index, key, session, hash).filter(|&h| {
-                            h < file.order
-                                && (session != &file.session
-                                    || !file.resumed
-                                    || on_page.contains(&h.1))
-                        })
-                    {
+                    let accepted = if session == &file.session {
+                        session_accepted
+                    } else {
+                        origin_accepted(index, key)
+                    };
+                    if !accepted {
+                        continue;
+                    }
+                    if let Some(holder) = census_holder(index, key, session, hash).filter(|&h| {
+                        h < file.order
+                            && (session != &file.session || !file.resumed || on_page.contains(&h.1))
+                    }) {
                         let earliest = file.covered.entry(hash).or_insert(holder);
                         *earliest = (*earliest).min(holder);
                     }
