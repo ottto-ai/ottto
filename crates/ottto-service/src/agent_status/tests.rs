@@ -4214,6 +4214,22 @@ fn codex_managed_home_whose_refresh_is_dead_needs_a_new_sign_in() {
     );
     assert_eq!(fresh.status.state, CodexAccountSlotCollectionStateV1::Fresh);
     let registered = fresh.binding.clone().expect("validated binding");
+    let launch = || {
+        session_launch_codex_candidate(
+            CodexHomeSlot {
+                slot_id: "codex_slot_dead_refresh".to_string(),
+                ownership: CodexAccountSlotOwnershipV1::Managed,
+                home: home.clone(),
+                registered_binding: Some(registered.clone()),
+            },
+            "2026-08-26T00:05:00Z",
+        )
+    };
+    // Control: the launch projection reads the saved good reading as fresh.
+    assert_eq!(
+        launch().status.state,
+        CodexAccountSlotCollectionStateV1::Fresh
+    );
 
     // The read succeeds with no account: the slot's login is dead.
     null_account_synthetic_codex_app_server(&root);
@@ -4240,6 +4256,16 @@ fn codex_managed_home_whose_refresh_is_dead_needs_a_new_sign_in() {
     assert_eq!(
         serde_json::to_value(&status.managed_slots[0].collection).expect("slot JSON")["state"],
         "needs_login"
+    );
+    // The descriptor names the registered pair a reconnect must present.
+    assert_eq!(
+        codex_slot_status_binding(&status.managed_slots[0].collection),
+        Some(registered.clone())
+    );
+    // The launch projection says the same.
+    assert_eq!(
+        launch().status.state,
+        CodexAccountSlotCollectionStateV1::NeedsLogin
     );
     // A status read served from the saved reading says the same.
     let served = collect(
@@ -4362,6 +4388,138 @@ fn codex_forced_refresh_logs_its_outcome_class_and_home_digest_only() {
     // The same digest as the failure line, so the two rows join.
     assert!(codex_probe_failure_log_line("x", home, Duration::ZERO, 0)
         .contains(&format!(" home={} ", codex_home_log_label(home))));
+}
+
+/// Make the fake app-server answer the routine rate-limits read with an
+/// RPC error (`error`) or not at all (`silent`).
+#[cfg(unix)]
+fn fail_synthetic_codex_quota_read(root: &Path, mode: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let executable = root.join("codex");
+    let script = std::fs::read_to_string(&executable).expect("fake Codex");
+    let branch = "    elif \"account/rateLimits/read\" in line:\n";
+    assert!(script.contains(branch));
+    let answer = match mode {
+        "error" => "        print('{\"id\":\"ottto_rate_limits\",\"error\":{\"code\":-32603,\"message\":\"synthetic\"}}', flush=True)\n        continue\n",
+        _ => "        continue\n",
+    };
+    std::fs::write(
+        &executable,
+        script.replace(branch, &format!("{branch}{answer}")),
+    )
+    .expect("failing quota read");
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
+        .expect("fake Codex mode");
+}
+
+/// [regress] `account: null` followed by a failed or unanswered quota read
+/// is still a dead login: provider, saved and launch reads say needs_login,
+/// the descriptor names the registered pair, a new sign-in clears it, and
+/// the default home is unchanged.
+#[cfg(unix)]
+#[test]
+#[serial]
+fn codex_dead_login_survives_a_failed_quota_read() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for mode in ["error", "silent"] {
+        let (root, home) = synthetic_codex_collector_home(&format!("dead-quota-{mode}"), 0o600);
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))
+            .expect("managed home mode");
+        let _commands =
+            EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", root.as_os_str().to_os_string());
+        let slot =
+            |ownership: CodexAccountSlotOwnershipV1,
+             registered_binding: Option<(String, String)>| CodexHomeSlot {
+                slot_id: if ownership == CodexAccountSlotOwnershipV1::Default {
+                    "default".to_string()
+                } else {
+                    "codex_slot_dead_quota".to_string()
+                },
+                ownership,
+                home: home.clone(),
+                registered_binding,
+            };
+        let collect = |ownership: CodexAccountSlotOwnershipV1,
+                       registered_binding: Option<(String, String)>,
+                       quota_read: CodexQuotaRead| {
+            with_codex_app_server_test_timeouts(
+                Duration::from_secs(3),
+                Duration::from_secs(1),
+                Duration::from_secs(3),
+                || {
+                    collect_codex_home_candidate(
+                        slot(ownership, registered_binding),
+                        "2026-08-26T00:05:00Z",
+                        "2026-08-26T00:20:00Z",
+                        quota_read,
+                    )
+                },
+            )
+        };
+        let managed = CodexAccountSlotOwnershipV1::Managed;
+        let fresh = collect(managed, None, CodexQuotaRead::Provider);
+        let registered = fresh.binding.clone().expect("validated binding");
+
+        null_account_synthetic_codex_app_server(&root);
+        fail_synthetic_codex_quota_read(&root, mode);
+        let dead = collect(managed, Some(registered.clone()), CodexQuotaRead::Provider);
+        assert_eq!(
+            dead.status.state,
+            CodexAccountSlotCollectionStateV1::NeedsLogin,
+            "{mode}"
+        );
+        assert!(dead.binding.is_none());
+        let status = codex_accounts_status_for(&[dead]);
+        mac_admits_codex_accounts_status(&status).expect("decodes on the Mac");
+        assert_eq!(
+            codex_slot_status_binding(&status.managed_slots[0].collection),
+            Some(registered.clone())
+        );
+        let served = collect(managed, Some(registered.clone()), CodexQuotaRead::Saved);
+        assert_eq!(
+            served.status.state,
+            CodexAccountSlotCollectionStateV1::NeedsLogin,
+            "{mode}"
+        );
+        let launched = session_launch_codex_candidate(
+            slot(managed, Some(registered.clone())),
+            "2026-08-26T00:05:00Z",
+        );
+        assert_eq!(
+            launched.status.state,
+            CodexAccountSlotCollectionStateV1::NeedsLogin,
+            "{mode}"
+        );
+
+        // The default home, same answers: not a dead login.
+        let default = collect(
+            CodexAccountSlotOwnershipV1::Default,
+            None,
+            CodexQuotaRead::Provider,
+        );
+        assert_ne!(
+            default.status.state,
+            CodexAccountSlotCollectionStateV1::NeedsLogin,
+            "{mode}"
+        );
+
+        // A new sign-in: the dead failure is not served.
+        write_other_synthetic_codex_account(&home);
+        let signed_in_again = collect(managed, Some(registered.clone()), CodexQuotaRead::Saved);
+        assert_ne!(
+            signed_in_again.status.state,
+            CodexAccountSlotCollectionStateV1::NeedsLogin,
+            "{mode}"
+        );
+
+        codex_credit_grants::forget_binding_cadence(&codex_credit_grants::binding_key(
+            &registered.0,
+            &registered.1,
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
 
 #[cfg(unix)]

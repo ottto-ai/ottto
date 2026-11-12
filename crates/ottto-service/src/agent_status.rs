@@ -2212,52 +2212,70 @@ pub(crate) fn session_launch_codex_accounts_status(
         if slot.ownership == CodexAccountSlotOwnershipV1::Default {
             slot.home = default_home.into();
         }
-        let trust = if slot.ownership == CodexAccountSlotOwnershipV1::Default {
-            CodexHomeTrust::ProviderDefault
-        } else {
-            CodexHomeTrust::Managed
-        };
-        let mut snapshot = base_snapshot(
-            SourceKind::Codex,
-            AgentStatusState::Degraded,
-            AgentStatusCollectionMethod::ConfigFile,
-            captured.clone(),
-            captured.clone(),
-        );
-        if session_launch_codex_identity(&slot.home, trust).is_none() {
-            snapshot.status = AgentStatusState::AuthRequired;
-        } else if let Ok(probe) =
-            codex_saved_quota::serve_saved_for_launch(&slot.home, trust, current_unix_seconds())
-        {
-            if !probe.credential_read_failed {
-                snapshot.account = probe.account;
-                if let (Some(account), Some(identity)) =
-                    (snapshot.account.as_mut(), probe.saved_identity)
-                {
-                    account.account_identifier_hash = Some(identity.account_identifier_hash);
-                    account.organization_identifier_hash = Some(identity.workspace_identifier_hash);
-                    snapshot.quota_windows = probe.quota_windows;
-                    snapshot.credit_balances = probe.credit_balances;
-                    snapshot.status = AgentStatusState::Available;
-                }
-            }
-        }
-        let mut collection = codex_collection_status_from_snapshot(&snapshot);
-        let binding = enforce_codex_registered_binding(&slot, &mut snapshot, &mut collection);
-        let quality = codex_snapshot_quality(&snapshot, &collection);
-        candidates.push(CodexSlotCandidate {
-            slot,
-            snapshot,
-            status: collection,
-            binding,
-            workspace_targets: Vec::new(),
-            quality,
-            auth_modified_at: None,
-        });
+        candidates.push(session_launch_codex_candidate(slot, &captured));
     }
     canonicalize_codex_candidates(&mut candidates);
     apply_codex_candidate_statuses(&mut status, &candidates);
     status
+}
+
+/// One slot of [`session_launch_codex_accounts_status`]: saved evidence and
+/// local claims only.
+fn session_launch_codex_candidate(slot: CodexHomeSlot, captured: &str) -> CodexSlotCandidate {
+    let trust = if slot.ownership == CodexAccountSlotOwnershipV1::Default {
+        CodexHomeTrust::ProviderDefault
+    } else {
+        CodexHomeTrust::Managed
+    };
+    let mut snapshot = base_snapshot(
+        SourceKind::Codex,
+        AgentStatusState::Degraded,
+        AgentStatusCollectionMethod::ConfigFile,
+        captured.to_string(),
+        captured.to_string(),
+    );
+    if session_launch_codex_identity(&slot.home, trust).is_none() {
+        snapshot.status = AgentStatusState::AuthRequired;
+    } else {
+        // A dead login reads as it does in status: needs a new sign-in.
+        let account_absent = match codex_saved_quota::serve_saved_for_launch(
+            &slot.home,
+            trust,
+            current_unix_seconds(),
+        ) {
+            Ok(probe) => {
+                let account_absent = probe.provider_account_absent;
+                if !probe.credential_read_failed {
+                    snapshot.account = probe.account;
+                    if let (Some(account), Some(identity)) =
+                        (snapshot.account.as_mut(), probe.saved_identity)
+                    {
+                        account.account_identifier_hash = Some(identity.account_identifier_hash);
+                        account.organization_identifier_hash =
+                            Some(identity.workspace_identifier_hash);
+                        snapshot.quota_windows = probe.quota_windows;
+                        snapshot.credit_balances = probe.credit_balances;
+                        snapshot.status = AgentStatusState::Available;
+                    }
+                }
+                account_absent
+            }
+            Err(failure) => failure.message.starts_with(CODEX_NO_ACCOUNT_FAILURE_PREFIX),
+        };
+        apply_codex_dead_login(&mut snapshot, &slot.home, trust, account_absent);
+    }
+    let mut collection = codex_collection_status_from_snapshot(&snapshot);
+    let binding = enforce_codex_registered_binding(&slot, &mut snapshot, &mut collection);
+    let quality = codex_snapshot_quality(&snapshot, &collection);
+    CodexSlotCandidate {
+        slot,
+        snapshot,
+        status: collection,
+        binding,
+        workspace_targets: Vec::new(),
+        quality,
+        auth_modified_at: None,
+    }
 }
 
 pub(crate) fn annotate_codex_accounts_status(
@@ -2702,6 +2720,32 @@ fn apply_codex_candidate_statuses(
         {
             descriptor.collection = candidate.status.clone();
             descriptor.collection.quota_snapshot = None;
+        }
+    }
+    // A managed slot that needs a new sign-in names its registered account
+    // and workspace, the pair a reconnect must present: the read named none.
+    // Only while no other slot carries that pair (the rule above). The
+    // candidate's binding, health and placement are unchanged.
+    let mut carried = std::iter::once(&status.default_slot)
+        .chain(&status.managed_slots)
+        .filter_map(|slot| codex_slot_status_binding(&slot.collection))
+        .collect::<BTreeSet<_>>();
+    for descriptor in &mut status.managed_slots {
+        if descriptor.collection.state != CodexAccountSlotCollectionStateV1::NeedsLogin
+            || codex_slot_status_binding(&descriptor.collection).is_some()
+        {
+            continue;
+        }
+        let Some((account, workspace)) = candidates
+            .iter()
+            .find(|candidate| candidate.slot.slot_id == descriptor.slot_id)
+            .and_then(|candidate| candidate.slot.registered_binding.clone())
+        else {
+            continue;
+        };
+        if carried.insert((account.clone(), workspace.clone())) {
+            descriptor.collection.account_identifier_hash = Some(account);
+            descriptor.collection.workspace_identifier_hash = Some(workspace);
         }
     }
 }
@@ -3544,7 +3588,6 @@ fn collect_codex_status_for_home(
     });
 
     let auth_account = read_codex_auth_account_at(codex_home, home_trust);
-    let has_auth = ottto_core::codex_auth_file_mark(codex_home).is_some();
     // Reuse login metadata only when this pass's fresh auth read covers every
     // variable field the CLI fallback can fill. Incomplete/unreadable auth must
     // run the CLI fresh; the full parsed account is never cached.
@@ -3631,16 +3674,12 @@ fn collect_codex_status_for_home(
             if let Some(account) = usage.account {
                 snapshot.account = Some(merge_codex_accounts(snapshot.account.take(), account));
             }
-            // The provider read this home and found no account: its login is
-            // dead (Codex reports that after a refresh failed for good), not
-            // merely unconfirmed. Only an Ottto slot's home, which this probe
-            // keeps refreshed; the default home's lapsed login is another case.
-            if usage.provider_account_absent && has_auth && home_trust == CodexHomeTrust::Managed {
-                snapshot.status = AgentStatusState::AuthRequired;
-                if let Some(account) = snapshot.account.as_mut() {
-                    account.login_state = AgentLoginState::SignedOut;
-                }
-            }
+            apply_codex_dead_login(
+                &mut snapshot,
+                codex_home,
+                home_trust,
+                usage.provider_account_absent,
+            );
             let identity_hashes = usage
                 .identity
                 .as_ref()
@@ -3741,6 +3780,12 @@ fn collect_codex_status_for_home(
         }
         Err(failure) => {
             probe_failed = !failure.message.starts_with(CODEX_CLI_NOT_FOUND_FOR_PROBE);
+            apply_codex_dead_login(
+                &mut snapshot,
+                codex_home,
+                home_trust,
+                failure.message.starts_with(CODEX_NO_ACCOUNT_FAILURE_PREFIX),
+            );
             snapshot.quota_windows = vec![unsupported_quota_window("usage")];
             snapshot.diagnostics.push(
                 AgentStatusDiagnostic::source(
@@ -3797,6 +3842,35 @@ fn collect_codex_status_for_home(
     snapshot.runtime_defaults =
         build_codex_runtime_defaults_at(&snapshot.captured_at, codex_home, home_trust);
     (snapshot, strong_identity, workspace_targets)
+}
+
+/// Prefix of a failed read's fixed text when its `account/read` named no
+/// account before the rest of the session failed: the login is dead even
+/// though no reading came back. A prefix keeps the stage, kind and code
+/// parsing of [`codex_probe_failure_stage_and_kind`] intact.
+const CODEX_NO_ACCOUNT_FAILURE_PREFIX: &str = "The provider named no signed-in user. ";
+
+/// A managed home with an auth file whose provider read named no account
+/// (`account: null`, which Codex answers after a refresh failed for good)
+/// needs a new sign-in: not merely unconfirmed. Only an Ottto slot's home,
+/// which the probe keeps refreshed; the default home's lapsed login is
+/// another case. Changes the status cause only.
+fn apply_codex_dead_login(
+    snapshot: &mut AgentStatusSnapshot,
+    codex_home: &Path,
+    home_trust: CodexHomeTrust,
+    provider_account_absent: bool,
+) {
+    if !provider_account_absent
+        || home_trust != CodexHomeTrust::Managed
+        || ottto_core::codex_auth_file_mark(codex_home).is_none()
+    {
+        return;
+    }
+    snapshot.status = AgentStatusState::AuthRequired;
+    if let Some(account) = snapshot.account.as_mut() {
+        account.login_state = AgentLoginState::SignedOut;
+    }
 }
 
 fn collect_codex_usage_for_home(
@@ -16973,6 +17047,9 @@ fn call_codex_app_server_rate_limits_for_home(
                 current_unix_seconds(),
             )
         );
+    }
+    if run.account_absent {
+        return result.map_err(|message| format!("{CODEX_NO_ACCOUNT_FAILURE_PREFIX}{message}"));
     }
     result
 }
