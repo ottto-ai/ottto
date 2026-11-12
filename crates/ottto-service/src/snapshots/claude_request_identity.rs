@@ -4131,12 +4131,13 @@ pub(crate) fn take_identity_counts() -> IdentityCounts {
     }
 }
 
-/// Exact final `e2` rows, including copied exclusions and telemetry side calls.
-/// `e2` owns placement; this owner supplies contract-5 keys and evidence only.
-fn request_owned_grouping(item: &SnapshotItem) -> Option<Grouping> {
-    let mut grouping = Grouping::new(bucket_row_count(item));
-    super::claude_request_money::e2::visit_identity_rows(
-        item,
+fn entity_grouping(
+    entity: &super::claude_request_money::e2::ClaudeEntityBody,
+    bucket_rows: usize,
+) -> Grouping {
+    let mut grouping = Grouping::new(bucket_rows);
+    super::claude_request_money::e2::visit_entity_identity_rows(
+        entity,
         |bucket, row, account, cost, last_at| {
             let mut usage = super::usage_totals_from_model_usage(&row);
             if let Some(cost) = cost {
@@ -4164,7 +4165,32 @@ fn request_owned_grouping(item: &SnapshotItem) -> Option<Grouping> {
                 at.as_deref(),
             );
         },
-    )?;
+    );
+    grouping
+}
+
+pub(crate) fn tag_telemetry_entity(
+    item: &mut SnapshotItem,
+    entity: &super::claude_request_money::e2::ClaudeEntityBody,
+    accepted: Option<&AcceptedBuckets>,
+    budget: WireBudget<'_>,
+) -> bool {
+    let mut grouping = entity_grouping(entity, bucket_row_count(item));
+    grouping.extra_wire_bytes = budget.reservation.map_or(0, |reserve| reserve(item));
+    let known = accepted.and_then(|state| state.get(&item.source_session_id));
+    matches!(
+        apply_grouped_with_accepted(item, grouping, known, false, budget.max_item_bytes),
+        Ok(Tagged::Sent { .. })
+    )
+}
+
+/// Exact final `e2` rows, including copied exclusions and telemetry side calls.
+/// `e2` owns placement; this owner supplies contract-5 keys and evidence only.
+fn request_owned_grouping(item: &SnapshotItem) -> Option<Grouping> {
+    let mut grouping = entity_grouping(
+        &item.claude_money.as_deref()?.entity,
+        bucket_row_count(item),
+    );
     let carry_keys_over_cap = item
         .claude_money
         .as_deref()

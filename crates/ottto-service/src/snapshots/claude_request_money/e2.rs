@@ -3680,25 +3680,6 @@ pub(crate) fn side_calls_page(
             let Some(target) = targets.get(owner).copied() else {
                 continue;
             };
-            let Some((cache_5m, cache_1h, unattributed)) =
-                timed("side.cache_split", || claude_api_cache_creation(row))
-            else {
-                disclosed += 1; // contradictory cache split
-                diag("side_cache_split", 1);
-                continue;
-            };
-            let tokens = ClaudeMoneyTokens {
-                input: row.input_tokens,
-                output: row.output_tokens,
-                cache_read: row.cache_read_tokens,
-                cache_5m,
-                cache_1h,
-                unattributed,
-                reasoning: row.reasoning_output_tokens,
-            };
-            let Some(fold) = items[target].claude_money.as_deref_mut() else {
-                continue;
-            };
             let at = rfc3339_unix_nanos(&row.observed_at);
             let Some(key) = timed("side.reported_key", || {
                 let build = || reported_key(row, None, &SelectorCapture::default());
@@ -3719,31 +3700,17 @@ pub(crate) fn side_calls_page(
                 diag("side_unplaceable", 1);
                 continue;
             };
-            let origin = if row.cost_usd_micros.is_some() {
-                ClaudeRequestUsageOrigin::TelemetryReported
-            } else {
-                ClaudeRequestUsageOrigin::TelemetryUnpriced
+            let Some(fold) = items[target].claude_money.as_deref_mut() else {
+                continue;
             };
-
-            if let Some(at) = at {
-                fold.entity.note_activity(&key.0, at, at);
-            }
-
-            timed("side.add", || {
-                fold.entity.add(
-                    key,
-                    &tokens,
-                    1,
-                    row.cost_usd_micros,
-                    Some(origin),
-                    None,
-                    // Its own complete account first; else the session's.
-                    fold.accounts.as_ref().and_then(|a| {
-                        claude_request_identity::side_call_account(row, root)
-                            .or_else(|| a.fallback.clone())
-                    }),
-                )
+            let account = fold.accounts.as_ref().and_then(|a| {
+                claude_request_identity::side_call_account(row, root).or_else(|| a.fallback.clone())
             });
+            let Some(tokens) = add_reported_row(&mut fold.entity, row, account, Some(key)) else {
+                disclosed += 1;
+                diag("side_cache_split", 1);
+                continue;
+            };
             fold.side.add(&tokens);
             if fallback {
                 fold.root_fallbacks += 1;
@@ -4201,6 +4168,88 @@ fn record_decided(held: bool, counts: Counts) {
     }
 }
 
+/// Shared API row addition. Account fallback is supplied by the caller,
+/// never inferred for a telemetry-only entity.
+pub(crate) fn add_reported_row(
+    entity: &mut ClaudeEntityBody,
+    row: &ClaudeLocalOtelEvidence,
+    account: AccountPartition,
+    key: Option<ClaudeLiveKey>,
+) -> Option<ClaudeMoneyTokens> {
+    let (cache_5m, cache_1h, unattributed) = claude_api_cache_creation(row)?;
+    let tokens = ClaudeMoneyTokens {
+        input: row.input_tokens,
+        output: row.output_tokens,
+        cache_read: row.cache_read_tokens,
+        cache_5m,
+        cache_1h,
+        unattributed,
+        reasoning: row.reasoning_output_tokens,
+    };
+    let key = key.or_else(|| reported_key(row, None, &SelectorCapture::default()))?;
+    let origin = if row.cost_usd_micros.is_some() {
+        ClaudeRequestUsageOrigin::TelemetryReported
+    } else {
+        ClaudeRequestUsageOrigin::TelemetryUnpriced
+    };
+    let at = rfc3339_unix_nanos(&row.observed_at);
+    if let Some(at) = at {
+        entity.note_activity(&key.0, at, at);
+    }
+    entity.add(
+        key,
+        &tokens,
+        1,
+        row.cost_usd_micros,
+        Some(origin),
+        None,
+        account,
+    );
+    Some(tokens)
+}
+
+/// A complete scoped negative answer, independent of this page's emissions.
+/// Birth observations include content-session and path twins, even when they
+/// emitted no body. Unknown relevant queue/decode state keeps work owed.
+pub(crate) fn telemetry_roots_absent(
+    index: &ScanIndex,
+    roots: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let queued = queued_directory_names(index);
+    let mut absent = roots
+        .iter()
+        .filter(|root| {
+            !index.decode_holds_family(root)
+                && !queued.contains(*root)
+                && index
+                    .claude_money_birth_store
+                    .observations(root)
+                    .next()
+                    .is_none()
+        })
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let observed = index
+        .traversal
+        .iter()
+        .flat_map(|walk| walk.observed_index_keys.iter());
+    for key in index
+        .files
+        .keys()
+        .chain(index.claude_request_census.records().map(|(key, _)| key))
+        .chain(observed)
+    {
+        if let Some(member) = claude_index_path_member_ref(Path::new(key)) {
+            absent.remove(member.root);
+        }
+    }
+    absent
+}
+
+pub(crate) fn emit_entity(item: &mut SnapshotItem, entity: &ClaudeEntityBody) -> bool {
+    super::emit::apply(item, entity, false)
+}
+
 /// The identity row of each request a copied marker
 /// had lent an account to, as `visit_identity_rows` builds rows:
 /// (bucket start, row, lent account).
@@ -4225,9 +4274,9 @@ pub(crate) fn copied_marker_lent_rows(
         .collect()
 }
 
-/// Visit the exact final placement; account classification belongs to identity.
-pub(crate) fn visit_identity_rows(
-    item: &SnapshotItem,
+/// Visit exact entity placement; account classification belongs to identity.
+pub(crate) fn visit_entity_identity_rows(
+    entity: &ClaudeEntityBody,
     mut visit: impl FnMut(
         &str,
         super::super::SnapshotModelUsage,
@@ -4235,9 +4284,8 @@ pub(crate) fn visit_identity_rows(
         Option<u64>,
         Option<i128>,
     ),
-) -> Option<()> {
-    let fold = item.claude_money.as_deref()?;
-    for ((key, origin, account), grain) in &fold.entity.grains {
+) {
+    for ((key, origin, account), grain) in &entity.grains {
         visit(
             &key.0,
             super::emit::grain_row(key, *origin, grain, None),
@@ -4246,7 +4294,6 @@ pub(crate) fn visit_identity_rows(
             grain.last_own_at,
         );
     }
-    Some(())
 }
 
 /// Prove dominance from the current request census, else bounded member bytes.

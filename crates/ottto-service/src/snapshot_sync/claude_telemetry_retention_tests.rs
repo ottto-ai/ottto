@@ -91,6 +91,7 @@ fn retire_with(c: &Corpus, index: &ScanIndex, removed: &BTreeSet<String>, named:
         std::slice::from_ref(&c.root),
         removed,
         named,
+        &delivery_generations(c),
     );
 }
 
@@ -100,7 +101,24 @@ fn retire(c: &Corpus, index: &ScanIndex) {
 
 /// Treat every candidate as delivered (or none, as today) on this thread.
 fn proven(proven: bool) {
-    crate::snapshots::claude_telemetry_retention::prove_delivery_for_test(proven);
+    PROVEN.with(|value| value.set(proven));
+}
+
+thread_local! { static PROVEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+fn delivery_generations(
+    c: &Corpus,
+) -> BTreeMap<String, crate::claude_local_otel::TelemetryGeneration> {
+    if !PROVEN.with(std::cell::Cell::get) {
+        return BTreeMap::new();
+    }
+    [ROOT, COPY, GONE, COPIED, HALF, NAMED, HELD, UNREAD]
+        .into_iter()
+        .filter_map(|root| {
+            crate::claude_local_otel::telemetry_generation(&c.support, root)
+                .ok()
+                .map(|generation| (crate::claude_local_otel::telemetry_stem(root), generation))
+        })
+        .collect()
 }
 
 /// One retention run's page counters (reads and retention counts), alone.

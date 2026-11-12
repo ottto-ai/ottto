@@ -438,6 +438,16 @@ pub(crate) struct ClaudeFamilyHolders {
     pub(crate) members: BTreeSet<String>,
 }
 
+/// Batched positive-holder intersection. Includes every transcript record,
+/// regardless of whether this pass emitted a body for its carrier.
+pub(crate) fn positive_holders(census: &ClaudeRequestCensus, wanted: &[u64]) -> BTreeSet<u64> {
+    let mut held = BTreeSet::new();
+    ClaudeRequestCensus::walk_transcript_holders(census.records(), None, |_, _, record| {
+        held.extend(held_candidates(record, wanted));
+    });
+    held
+}
+
 /// The sorted unique `candidates` a transcript record holds.
 pub(super) fn held_candidates<'a>(
     record: &'a ClaudeRequestCensusRecord,

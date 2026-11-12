@@ -13530,6 +13530,11 @@ fn smoke_command(source: &SourceKind) -> SmokeCommand {
                 SMOKE_PROMPT,
                 "--name",
                 "ottto test",
+                "--no-session-persistence",
+                "--settings",
+                r#"{"env":{"OTEL_LOGS_EXPORTER":"none","OTEL_TRACES_EXPORTER":"none","OTEL_METRICS_EXPORTER":"none"}}"#,
+                "--session-id",
+                &crate::claude_spawn_gate::internal_session_id(),
                 "--disallowedTools",
                 "*",
             ]

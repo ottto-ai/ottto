@@ -16,6 +16,22 @@ use crate::snapshots::{
 use std::collections::BTreeMap;
 use std::path::Path;
 
+impl SnapshotItem {
+    pub(crate) fn neutral_telemetry(root: String, collected_at: String) -> Self {
+        Self {
+            evidence_basis: Some("otel_only"),
+            source_session_id: root,
+            status: "final".into(),
+            collected_at,
+            provenance: SnapshotProvenance {
+                collector: "claude_code_jsonl".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+}
+
 impl SnapshotAccumulator {
     // Production finishes through `into_items_with_repository_identity`.
     #[cfg(test)]
@@ -436,6 +452,7 @@ impl SnapshotAccumulator {
         }
         .map(Box::new);
         let mut item = SnapshotItem {
+            evidence_basis: None,
             request_evidence: Vec::new(),
             request_identity_refusals: 0,
             claude_org_markers: self.claude_org_markers,
