@@ -493,6 +493,9 @@ pub(super) struct SavedCodexReading {
     /// The provider named a signed-in ChatGPT account in this read.
     #[serde(default)]
     provider_account_signed_in: bool,
+    /// The read succeeded with no account at all (`account: null`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    provider_account_absent: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     plan_type: Option<String>,
     #[serde(default)]
@@ -578,6 +581,7 @@ impl SavedCodexReading {
                 .map(CodexIdentityHashes::from)
                 .or_else(|| probe.saved_identity.clone()),
             provider_account_signed_in: probe.account.is_some(),
+            provider_account_absent: probe.provider_account_absent,
             plan_type: probe
                 .account
                 .as_ref()
@@ -608,6 +612,7 @@ impl SavedCodexReading {
             quota_windows: self.quota_windows.clone(),
             credit_balances: self.credit_balances.clone(),
             account,
+            provider_account_absent: self.provider_account_absent,
             identity: None,
             saved_identity: self.identity.clone(),
             credential_read_failed: self.credential_read_failed,
@@ -1949,6 +1954,7 @@ mod tests {
                 plan_type: Some("pro".to_string()),
                 ..unsupported_account("openai")
             }),
+            provider_account_absent: false,
             identity: None,
             saved_identity: Some(CodexIdentityHashes {
                 account_identifier_hash: account.to_string(),

@@ -4276,6 +4276,49 @@ fn codex_managed_home_whose_refresh_is_dead_needs_a_new_sign_in() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+#[test]
+fn codex_forced_refresh_logs_its_outcome_class_and_home_digest_only() {
+    let null = serde_json::json!({"account": null, "requiresOpenaiAuth": true});
+    let named = serde_json::json!({"account": {"type": "chatgpt"}});
+    assert_eq!(codex_forced_refresh_outcome(true, None, true), "timeout");
+    assert_eq!(
+        codex_forced_refresh_outcome(false, Some(&null), true),
+        "account_null"
+    );
+    assert_eq!(
+        codex_forced_refresh_outcome(false, Some(&named), true),
+        "rewritten"
+    );
+    assert_eq!(
+        codex_forced_refresh_outcome(false, None, false),
+        "not_rewritten"
+    );
+    // No account field at all, or no sign-in needed, is not a dead login.
+    assert!(!codex_app_server_account_absent(&serde_json::json!({})));
+    assert!(!codex_app_server_account_absent(
+        &serde_json::json!({"account": null, "requiresOpenaiAuth": false})
+    ));
+
+    let home = Path::new("/synthetic/private/codex-home");
+    let line = codex_forced_refresh_log_line(
+        "lapsed_or_unknown",
+        "account_null",
+        home,
+        Duration::from_millis(1234),
+        0,
+    );
+    assert!(line.starts_with(
+        "codex usage probe: forcing account home login refresh reason=lapsed_or_unknown "
+    ));
+    assert!(line.contains(" outcome=account_null "));
+    assert!(line.contains(&format!(" home={} ", codex_home_log_label(home))));
+    assert!(line.ends_with(" elapsed_ms=1234"));
+    assert!(!line.contains("synthetic"));
+    // The same digest as the failure line, so the two rows join.
+    assert!(codex_probe_failure_log_line("x", home, Duration::ZERO, 0)
+        .contains(&format!(" home={} ", codex_home_log_label(home))));
+}
+
 #[cfg(unix)]
 #[test]
 #[serial]

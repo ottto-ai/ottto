@@ -194,6 +194,10 @@ struct CodexUsageProbe {
     quota_windows: Vec<AgentQuotaWindow>,
     credit_balances: Vec<AgentCreditBalance>,
     account: Option<AgentAccountStatus>,
+    /// The provider read succeeded and named no account at all
+    /// (`account: null`). Codex answers that once a refresh of the home's
+    /// login failed for good, so a managed home then needs a new sign-in.
+    provider_account_absent: bool,
     /// Set by a provider read only; a saved reading carries `saved_identity`.
     identity: Option<CodexStrongIdentity>,
     /// The identity hashes of a saved reading, whose provider validation
@@ -3540,6 +3544,7 @@ fn collect_codex_status_for_home(
     });
 
     let auth_account = read_codex_auth_account_at(codex_home, home_trust);
+    let has_auth = matches!(auth_account, Ok(Some(_)));
     // Reuse login metadata only when this pass's fresh auth read covers every
     // variable field the CLI fallback can fill. Incomplete/unreadable auth must
     // run the CLI fresh; the full parsed account is never cached.
@@ -3625,6 +3630,16 @@ fn collect_codex_status_for_home(
             }
             if let Some(account) = usage.account {
                 snapshot.account = Some(merge_codex_accounts(snapshot.account.take(), account));
+            }
+            // The provider read this home and found no account: its login is
+            // dead (Codex reports that after a refresh failed for good), not
+            // merely unconfirmed. Only an Ottto slot's home, which this probe
+            // keeps refreshed; the default home's lapsed login is another case.
+            if usage.provider_account_absent && has_auth && home_trust == CodexHomeTrust::Managed {
+                snapshot.status = AgentStatusState::AuthRequired;
+                if let Some(account) = snapshot.account.as_mut() {
+                    account.login_state = AgentLoginState::SignedOut;
+                }
             }
             let identity_hashes = usage
                 .identity
@@ -16490,6 +16505,13 @@ fn codex_app_server_account(value: &Value) -> Option<AgentAccountStatus> {
     })
 }
 
+/// An `account/read` result that names no account (`account: null`) and does
+/// not say the provider needs no OpenAI sign-in. A missing field is not this.
+fn codex_app_server_account_absent(value: &Value) -> bool {
+    value.get("account").is_some_and(Value::is_null)
+        && value.get("requiresOpenaiAuth").and_then(Value::as_bool) != Some(false)
+}
+
 /// Sanity window for a reported subscription-period boundary, in Unix seconds.
 ///
 /// The claim's wire type is not guaranteed, so a millisecond-encoded value is a
@@ -16578,16 +16600,20 @@ fn codex_probe_failure_log_line(
         .split_once("RPC failed with code ")
         .and_then(|(_, rest)| rest.trim_end_matches('.').parse::<i64>().ok())
         .map_or_else(|| "none".to_string(), |code| code.to_string());
-    let mut digest = Sha256::new();
-    digest.update(b"ottto:codex-home-log:v1\0");
-    digest.update(codex_home.as_os_str().as_encoded_bytes());
-    let home = format!("{:x}", digest.finalize());
     format!(
         "codex usage probe failed: at={} stage={stage} kind={kind} code={code} home={} elapsed_ms={}",
         rfc3339_from_unix_seconds(now).unwrap_or_else(|| "unknown".to_string()),
-        &home[..12],
+        codex_home_log_label(codex_home),
         elapsed.as_millis()
     )
+}
+
+/// The 12-hex digest of a Codex home that the probe's log lines carry.
+fn codex_home_log_label(codex_home: &Path) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"ottto:codex-home-log:v1\0");
+    digest.update(codex_home.as_os_str().as_encoded_bytes());
+    format!("{:x}", digest.finalize())[..12].to_string()
 }
 
 /// `(stage, kind)` of a failed app-server probe, from its fixed producer text
@@ -16679,6 +16705,7 @@ fn codex_usage_probe_from_app_server_observation(
         quota_windows,
         credit_balances,
         account: codex_app_server_account(&observation.account),
+        provider_account_absent: codex_app_server_account_absent(&observation.account),
         identity,
         saved_identity: None,
         credential_read_failed: observation.credential_read_failed,
@@ -16816,6 +16843,9 @@ struct CodexAppServerRun {
     /// read never reached the provider, and the detailed read replaced it.
     routine_read_rejected: bool,
     timed_out: bool,
+    /// Why this session forced a refresh of the home's login, if it did
+    /// ([`codex_probe_refresh_reason`]).
+    refresh_reason: Option<&'static str>,
 }
 
 /// Provider requests a started `codex app-server` quota session counts at
@@ -16891,6 +16921,7 @@ fn call_codex_app_server_rate_limits_for_home(
 ) -> Result<CodexAppServerObservation, String> {
     use crate::provider_calls::{CallKind, CallResult, Provider, ProviderCall, Trigger};
     let account_before = codex_home_claimed_account_hash(codex_home, home_trust);
+    let auth_before = ottto_core::codex_auth_file_mark(codex_home);
     let started = Instant::now();
     let mut run = CodexAppServerRun::default();
     let result = run_codex_app_server_rate_limits_for_home(
@@ -16922,7 +16953,63 @@ fn call_codex_app_server_rate_limits_for_home(
                 + u32::from(run.detail_read_sent && !run.routine_read_rejected),
         ));
     }
+    if let Some(reason) = run.refresh_reason {
+        let outcome = codex_forced_refresh_outcome(
+            run.timed_out,
+            result.as_ref().ok().map(|observation| &observation.account),
+            ottto_core::codex_auth_file_mark(codex_home) != auth_before,
+        );
+        eprintln!(
+            "{}",
+            codex_forced_refresh_log_line(
+                reason,
+                outcome,
+                codex_home,
+                started.elapsed(),
+                current_unix_seconds(),
+            )
+        );
+    }
     result
+}
+
+/// What a session that forced a login refresh saw by its end: it timed out,
+/// the provider named no account (the refresh failed for good), or the
+/// home's `auth.json` was or was not rewritten. Codex may still finish a
+/// refresh after the session ends, so `not_rewritten` is as of that end.
+fn codex_forced_refresh_outcome(
+    timed_out: bool,
+    account: Option<&Value>,
+    auth_rewritten: bool,
+) -> &'static str {
+    if timed_out {
+        "timeout"
+    } else if account.is_some_and(codex_app_server_account_absent) {
+        "account_null"
+    } else if auth_rewritten {
+        "rewritten"
+    } else {
+        "not_rewritten"
+    }
+}
+
+/// One log line per forced login refresh, in the format of
+/// [`codex_probe_failure_log_line`]: the reason, the outcome class, the home
+/// digest and the elapsed time. Fixed vocabulary only; no path, token or
+/// account text.
+fn codex_forced_refresh_log_line(
+    reason: &str,
+    outcome: &str,
+    codex_home: &Path,
+    elapsed: Duration,
+    now: u64,
+) -> String {
+    format!(
+        "codex usage probe: forcing account home login refresh reason={reason} at={} outcome={outcome} home={} elapsed_ms={}",
+        rfc3339_from_unix_seconds(now).unwrap_or_else(|| "unknown".to_string()),
+        codex_home_log_label(codex_home),
+        elapsed.as_millis()
+    )
 }
 
 /// How far ahead of its lapse the probe refreshes an account home's login: the
@@ -17048,9 +17135,7 @@ fn run_codex_app_server_rate_limits_for_home(
         login_refresh,
         current_unix_seconds(),
     );
-    if let Some(reason) = refresh_reason {
-        eprintln!("codex usage probe: forcing account home login refresh reason={reason}");
-    }
+    run.refresh_reason = refresh_reason;
     let account = serde_json::json!({
         "method": "account/read",
         "id": "ottto_account",
