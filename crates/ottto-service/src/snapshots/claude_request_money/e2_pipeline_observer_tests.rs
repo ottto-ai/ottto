@@ -41,11 +41,15 @@ pub(crate) fn retire_census(index: &mut ScanIndex, file_name: &str) {
     index.claude_request_census.insert(key, record);
 }
 
-/// Preserve the scan binding but simulate parse loss with only these observed ids.
-pub(crate) fn lossy_census(index: &mut ScanIndex, file_name: &str, ids: &[&str]) {
-    use crate::snapshots::claude_request_census::{
-        ClaudeRequestCensusRecord, ClaudeRequestCensusShape,
-    };
+/// Replace only the census's observed ids, shape and verification state.
+pub(crate) fn census_with_ids(
+    index: &mut ScanIndex,
+    file_name: &str,
+    ids: &[&str],
+    shape: crate::snapshots::claude_request_census::ClaudeRequestCensusShape,
+    unverified: bool,
+) {
+    use crate::snapshots::claude_request_census::ClaudeRequestCensusRecord;
     let key = census_key(index, file_name);
     let old = index.claude_request_census.take(&key).unwrap();
     let mut hashes = ids
@@ -57,11 +61,12 @@ pub(crate) fn lossy_census(index: &mut ScanIndex, file_name: &str, ids: &[&str])
     let record = ClaudeRequestCensusRecord::synthetic_for_test(
         &old.fingerprint_hex_for_test(),
         old.window(),
-        ClaudeRequestCensusShape::Lossy,
+        shape,
         hashes,
     )
     .with_modified_for_test(old.modified())
-    .with_birth_for_test(old.birth());
+    .with_birth_for_test(old.birth())
+    .with_unverified_for_test(unverified);
     index.claude_request_census.insert(key, record);
 }
 

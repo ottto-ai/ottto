@@ -244,6 +244,8 @@ child CPU totals; arguments, paths and command output are never included.
 - Claude's identity-incomplete request census keeps source verification through a complete,
   loss-free Tail bound to the verified predecessor entry and head. This does not supply missing
   request identities, complete-negative evidence, Full audit credit or upload acceptance.
+  A missing hash in a lossy or identity-incomplete census cannot disprove a stored copy
+  removal; listed hashes still prove presence regardless of source verification.
 - The Tail is one more kind in the same state database, committed in the same save as the index.
 - Proven Codex compression and same-object relocation carry the existing logical state,
   fingerprints, exact ACK/context facts and debt without reading or uploading. Compression

@@ -2047,8 +2047,8 @@ fn indexed_main_files(index: &ScanIndex) -> BTreeMap<LocationKey, &str> {
 /// A stored removal of `hash` under `holder` (index key): `None` when the
 /// holder is no longer indexed or its census can no longer
 /// answer (retired, over budget or no record), so the stored decision
-/// stands; else whether its record holds the hash (a record that lacks it
-/// disproves the stored ownership).
+/// stands; else whether its record holds the hash. Only a complete
+/// record that lacks it disproves the stored ownership.
 fn stored_holder_answer(index: &ScanIndex, holder: Option<&str>, hash: u64) -> Option<bool> {
     index
         .claude_request_census
@@ -2057,11 +2057,9 @@ fn stored_holder_answer(index: &ScanIndex, holder: Option<&str>, hash: u64) -> O
         .and_then(|record| {
             if record.holds_hash(hash) {
                 Some(true)
-            } else if record.is_lossy() {
+            } else if record.absence_is_unknown() {
                 None
-            }
-            // Absence is unknown.
-            else {
+            } else {
                 Some(false)
             }
         })

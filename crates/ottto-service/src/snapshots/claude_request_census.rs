@@ -271,6 +271,14 @@ impl ClaudeRequestCensusRecord {
         self.shape == ClaudeRequestCensusShape::Lossy
     }
 
+    /// These scans list only the ids they could read; omission is not absence.
+    pub(crate) fn absence_is_unknown(&self) -> bool {
+        matches!(
+            self.shape,
+            ClaudeRequestCensusShape::Lossy | ClaudeRequestCensusShape::IdentityIncomplete
+        )
+    }
+
     pub(crate) fn over_budget(&self) -> bool {
         self.shape == ClaudeRequestCensusShape::OverBudget
     }
