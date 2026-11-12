@@ -96,7 +96,9 @@ pub(super) fn paced_source_qos(
 }
 pub(super) fn resident_scan_requested(scan: &SourceScanResult) -> bool {
     scan.charge_deferred
-        || (scan.page_file_limit_hit && scan.census_status.pending_work && !scan.routine_recensus)
+        || ((scan.page_file_limit_hit || scan.first_read_pending)
+            && scan.census_status.pending_work
+            && !scan.routine_recensus)
 }
 pub(super) fn request_resident_scan(source: SnapshotSource) {
     if let Some(pacing) = resident_pacing(MacPlatformSignals::default().power()) {

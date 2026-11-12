@@ -6278,7 +6278,8 @@ impl SourcePreparation {
                 self.scan = Some(next);
                 SourcePreparationStep::Pending(self)
             }
-            Ok(crate::snapshots::OwnedSourceScanStep::Complete { index, scan }) => {
+            Ok(crate::snapshots::OwnedSourceScanStep::Complete { index, mut scan }) => {
+                scan.first_read_pending = self.backfill_pending;
                 SourcePreparationStep::Complete {
                     preparation: self,
                     index,

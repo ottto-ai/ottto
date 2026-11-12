@@ -569,6 +569,8 @@ pub struct SourceScanResult {
     pub(crate) page_file_limit_hit: bool,
     /// This process started the generation after a clean census completion.
     pub(crate) routine_recensus: bool,
+    /// The destination bootstrap or replay revision still needs its census.
+    pub(crate) first_read_pending: bool,
     pub scanned_file_count: usize,
     pub scanned_session_count: usize,
     pub semantic_noop_count: usize,

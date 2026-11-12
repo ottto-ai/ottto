@@ -3458,6 +3458,7 @@ impl OwnedSourceScan {
                     charge_deferred: history_upgrade.charge_deferred > 0,
                     page_file_limit_hit,
                     routine_recensus,
+                    first_read_pending: false,
                     claude_queued_family_deferred_paths: std::mem::take(
                         &mut history_upgrade.queued_family_deferred_paths,
                     ),
