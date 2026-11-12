@@ -27,7 +27,7 @@ fn restore(state: &SnapshotUploadProgress) -> SnapshotUploadProgress {
         .bind_test_key(Some([0x42; 32]));
     state
 }
-fn member(c: &Corpus, api: bool) -> PathBuf {
+pub(super) fn member(c: &Corpus, api: bool) -> PathBuf {
     c.support
         .join("local-otel")
         .join(if api {
@@ -56,6 +56,157 @@ fn accounts(item: &SnapshotItem) -> BTreeSet<String> {
                 })
         })
         .collect()
+}
+
+// Exercise the relay's shared append path, including a mixed provider export.
+fn relay_append(c: &Corpus, sessions: &[&str]) -> (usize, usize) {
+    let attributes = |session: &str| {
+        [
+            ("session.id", session),
+            ("request_id", "mixed-next"),
+            ("client_request_id", "client-mixed-next"),
+            ("model", "claude-haiku-4-5"),
+            ("query_source", "sdk"),
+            ("input_tokens", "17"),
+            ("output_tokens", "19"),
+        ]
+        .map(|(key, value)| json!({"key":key,"value":{"stringValue":value}}))
+    };
+    let stamp = nanos(AT).to_string();
+    let logs = json!({"resourceLogs":[{"scopeLogs":[{"logRecords":sessions.iter().map(|session|
+        json!({"timeUnixNano":stamp,"body":{"stringValue":"claude_code.api_request"},
+            "attributes":attributes(session)})).collect::<Vec<_>>()}]}]});
+    let traces = json!({"resourceSpans":[{"scopeSpans":[{"spans":sessions.iter().map(|session|
+        json!({"name":"claude_code.llm_request","startTimeUnixNano":stamp,
+            "attributes":attributes(session)})).collect::<Vec<_>>()}]}]});
+    (
+        otel::capture_claude_api_request_logs(
+            &c.support,
+            &serde_json::to_vec(&logs).unwrap(),
+            "application/json",
+        )
+        .unwrap(),
+        otel::capture_claude_llm_request_traces(
+            &c.support,
+            &serde_json::to_vec(&traces).unwrap(),
+            "application/json",
+        )
+        .unwrap(),
+    )
+}
+
+#[test]
+fn mixed_smoke_and_sdk_money_reopens_settled_scheduling_without_a_registry() {
+    with_e2(|| {
+        let c = Corpus::new("otel-only-mixed-smoke-money");
+        positive(&c);
+        let mut p = progress();
+        let built = page(&c, &mut p, &hint(), WireBudget::default());
+        let accepted = send(&built, &mut p, Mode::ColdFull);
+        let generation = otel::telemetry_generation(&c.support, ROOT).unwrap();
+        let reserved = crate::claude_spawn_gate::internal_session_id();
+        assert_eq!(relay_append(&c, &[&reserved]), (0, 0));
+        assert_eq!(
+            otel::telemetry_generation(&c.support, ROOT).unwrap(),
+            generation
+        );
+        assert!(otel::telemetry_notices::pending(&c.support)
+            .unwrap()
+            .is_empty());
+        p.settle_telemetry_root(ROOT);
+        let mut p = restore(&p);
+        assert_eq!(relay_append(&c, &[&reserved, ROOT]), (1, 1));
+        assert_eq!(
+            otel::telemetry_notices::pending(&c.support).unwrap(),
+            BTreeSet::from([ROOT.into()])
+        );
+        let grown = page(&c, &mut p, &hint(), WireBudget::default());
+        assert_eq!(grown.scan.snapshots[0].request_count, 5);
+        let mut full = progress();
+        let reference = page(&c, &mut full, &hint(), WireBudget::default());
+        let reference = send(&reference, &mut full, Mode::ColdFull);
+        money_oracle::assert_no_smaller_reemit(
+            ROOT,
+            &accepted,
+            &send(&grown, &mut p, Mode::Restart),
+            &reference,
+            false,
+        );
+        assert_eq!(otel::telemetry_stems(&c.support).unwrap().len(), 1);
+    });
+}
+
+#[test]
+fn queued_unread_failed_listing_and_decode_holds_keep_growth_owed() {
+    with_e2(|| {
+        let c = Corpus::new("otel-only-unknown-scope");
+        positive(&c);
+        let mut p = progress();
+        let built = page(&c, &mut p, &hint(), WireBudget::default());
+        let accepted = send(&built, &mut p, Mode::ColdFull);
+        assert_eq!(relay_append(&c, &[ROOT]), (1, 1));
+        let mut indices = Vec::new();
+        for failed in [false, true] {
+            let mut raw = serde_json::to_value(ScanIndex::default()).unwrap();
+            raw["traversal"] = json!({"context_fingerprint":"held", "census_window_end":AT,
+                "scan_roots":[c.root], "pending_directories":[{"scan_root":c.root,"path":c.root.join(ROOT)}],
+                "pending_candidates":[], "observed_index_keys":[], "reconciliation_upper_bound":null,
+                "reconciliation_after":null,"reconciliation_started":false,
+                "unhealthy_retry_attempt":u8::from(failed),"counts":{"unreadable_path_count":u64::from(failed)}});
+            indices.push(serde_json::from_value::<ScanIndex>(raw).unwrap());
+        }
+        let mut raw = serde_json::to_value(ScanIndex::default()).unwrap();
+        raw["claude_usage_family_witnesses"] = json!({ROOT:{"members":[false],"opaque":"future"}});
+        let path = c.base.join("held-index.json");
+        std::fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+        indices.push(ScanIndex::load(&path).unwrap());
+        for index in indices {
+            let (absent, backed) = crate::snapshots::claude_request_money::e2::telemetry_scope(
+                &index,
+                &BTreeSet::from([ROOT.into()]),
+            );
+            assert!(!absent.contains(ROOT) && !backed.contains(ROOT));
+            let mut next = restore(&p);
+            let mut scan = c
+                .raw(
+                    &E2ScanFixture::capturing_identity(),
+                    ScanIndex::default(),
+                    100,
+                    false,
+                    &[],
+                )
+                .scan;
+            let reads = otel::evidence_read_counts_for_test();
+            next.seed_telemetry(
+                &c.support,
+                &hint(),
+                &mut scan,
+                &index,
+                &c.base.join("held-progress.json"),
+            )
+            .unwrap();
+            assert!(scan.snapshots.is_empty());
+            assert_eq!(reads, otel::evidence_read_counts_for_test());
+            assert!(
+                serde_json::to_value(&next).unwrap()["telemetry_only"]["candidates"]
+                    .get(ROOT)
+                    .is_some()
+            );
+            money_oracle::assert_held(ROOT, &accepted, &held_route(&accepted, &next), &accepted);
+        }
+        let grown = page(&c, &mut p, &hint(), WireBudget::default());
+        assert_eq!(grown.scan.snapshots[0].request_count, 5);
+        let mut full = progress();
+        let reference = page(&c, &mut full, &hint(), WireBudget::default());
+        let reference = send(&reference, &mut full, Mode::ColdFull);
+        money_oracle::assert_no_smaller_reemit(
+            ROOT,
+            &accepted,
+            &send(&grown, &mut p, Mode::Ram),
+            &reference,
+            false,
+        );
+    });
 }
 
 #[test]
@@ -200,6 +351,22 @@ fn pairing_boundaries_repair_and_healthy_empty_are_distinct_from_faults() {
                 .unwrap()
                 .is_empty()
         );
+        std::fs::write(
+            member(&c, false),
+            serde_json::to_string(&trace("unmatched", "")).unwrap() + "\n",
+        )
+        .unwrap();
+        let mut partial = progress();
+        assert!(page(&c, &mut partial, &hint(), WireBudget::default())
+            .scan
+            .snapshots
+            .is_empty());
+        assert!(
+            serde_json::to_value(&partial).unwrap()["telemetry_only"]["candidates"]
+                .get(ROOT)
+                .is_some(),
+            "trace-only is owed, not healthy empty"
+        );
         positive(&c);
         let mut p = progress();
         let built = page(&c, &mut p, &hint(), WireBudget::default());
@@ -211,7 +378,17 @@ fn pairing_boundaries_repair_and_healthy_empty_are_distinct_from_faults() {
         money_oracle::assert_held(ROOT, &accepted, &held_route(&accepted, &p), &accepted);
         std::fs::write(member(&c, false), bytes).unwrap();
         let repaired = page(&c, &mut p, &hint(), WireBudget::default());
-        money_oracle::assert_equivalent(&accepted, &send(&repaired, &mut p, Mode::Restart));
+        assert_eq!(
+            snapshot_upload_body_witness(&repaired.scan.snapshots[0]),
+            accepted.accepted[ROOT].witness
+        );
+        let (result, batches, _) = upload(&repaired.scan.snapshots, &mut p, ack);
+        assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+        assert!(
+            batches.is_empty(),
+            "repair preserves the already accepted exact body"
+        );
+        money_oracle::assert_carried_equivalent(&accepted, &held_route(&accepted, &p));
         let mut h = hint();
         h.claude_otel_only_pairing_floor = Some("2026-08-02T06:59:00Z".into());
         assert!(page(&c, &mut p, &h, WireBudget::default())
@@ -503,6 +680,11 @@ fn transcript_twins_off_page_holders_and_takeover_preserve_existing_money() {
                 "a copy carrier holds its request independently of emitted bodies"
             );
             let cold = send(&full, &mut p, Mode::ColdFull);
+            accept_upload_context_acks_for_test(
+                &mut full.index,
+                &full.scan.snapshots,
+                &p.fresh_context_body_acks,
+            );
             let saved = c.reload(&mut full.index);
             let mut next = progress();
             let other = page_from(&c, &mut next, &hint(), WireBudget::default(), saved, 100);
@@ -549,6 +731,34 @@ fn transcript_twins_off_page_holders_and_takeover_preserve_existing_money() {
                 .map(|item| item.request_count)
                 .sum::<u64>(),
             4
+        );
+        let replacement = send(&transcript, &mut p, Mode::Ram);
+        let mut full = progress();
+        let reference = page(&c, &mut full, &hint(), WireBudget::default());
+        money_oracle::assert_equivalent(&send(&reference, &mut full, Mode::ColdFull), &replacement);
+        assert_ne!(
+            replacement.accepted[ROOT].witness,
+            accepted.accepted[ROOT].witness
+        );
+        assert_eq!(
+            replacement
+                .accepted
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec![ROOT]
+        );
+        let again = page(&c, &mut p, &hint(), WireBudget::default());
+        let (result, batches, _) = upload(&again.scan.snapshots, &mut p, ack);
+        assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+        assert!(
+            batches.is_empty(),
+            "ordinary exact ACK suppresses the replaced body"
+        );
+        accept_upload_context_acks_for_test(
+            &mut transcript.index,
+            &transcript.scan.snapshots,
+            &p.fresh_context_body_acks,
         );
         let prior = c.reload(&mut transcript.index);
         std::fs::remove_file(path).unwrap();

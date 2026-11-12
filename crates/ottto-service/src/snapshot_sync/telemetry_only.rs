@@ -237,16 +237,16 @@ pub(super) fn build(
             return Err(());
         }
     }
-    if unique.is_empty() {
-        return Ok(None);
-    }
-    let traces = trace.evidence.get(root).ok_or(())?;
+    let traces = trace.evidence.get(root).map(Vec::as_slice).unwrap_or(&[]);
     let trace_ids = traces
         .iter()
         .map(|row| row.request_id.as_str())
         .collect::<BTreeSet<_>>();
     if trace_ids != unique.keys().copied().collect() {
         return Err(());
+    }
+    if unique.is_empty() {
+        return Ok(None);
     }
     if traces
         .iter()

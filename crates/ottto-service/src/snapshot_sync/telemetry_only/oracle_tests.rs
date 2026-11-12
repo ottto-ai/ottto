@@ -298,6 +298,37 @@ fn telemetry_only_incomplete_growth_and_oversize_stay_held_with_prior_money() {
                 .is_some()
         );
         money_oracle::assert_held(ROOT, &cold, &held_route(&cold, &retry), &cold);
+        // The ordinary authority/evidence bounds also hold this case rather
+        // than stripping identities to make a smaller receiver-compatible body.
+        use std::io::Write;
+        for ordinal in 0..33 {
+            let request = format!("over-cap-{ordinal}");
+            let row = full_identity(
+                tagged_api(&request, 11, Some(&format!("{:064x}", ordinal + 200))),
+                &"c".repeat(64),
+            );
+            for (api, json) in [
+                (true, serde_json::to_string(&row).unwrap()),
+                (false, serde_json::to_string(&trace(&request, "")).unwrap()),
+            ] {
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(cases::member(&c, api))
+                    .unwrap()
+                    .write_all((json + "\n").as_bytes())
+                    .unwrap();
+            }
+        }
+        let before = crate::local_resource_diagnostics::identity_over_cap_counts_for_test();
+        let held = page(&c, &mut retry, &hint(), WireBudget::default());
+        assert!(
+            held.scan.snapshots.is_empty(),
+            "authority cap cannot strip tags"
+        );
+        assert!(
+            crate::local_resource_diagnostics::identity_over_cap_counts_for_test()[7] > before[7]
+        );
+        money_oracle::assert_held(ROOT, &cold, &held_route(&cold, &retry), &cold);
     });
 }
 
@@ -348,6 +379,12 @@ fn telemetry_only_off_pre_t_and_transcript_takeover() {
                 .unwrap()
                 .is_empty()
         );
+        let mut main = progress();
+        let ordinary = page(&c, &mut main, &off, WireBudget::default());
+        money_oracle::assert_equivalent(
+            &send(&ordinary, &mut main, Mode::ColdFull),
+            &send(&transcript, &mut taken, Mode::Ram),
+        );
     });
 }
 
@@ -362,13 +399,13 @@ fn telemetry_only_previous_release_source_round_trip() {
     }
     let dir = test_dir("otel-only-carry-orchestration");
     let child = |stage: &str, root: &Path| {
+        // libtest's exact names omit the crate component of module_path!().
+        let test = format!(
+            "{}::telemetry_only_carry_child",
+            module_path!().split_once("::").unwrap().1
+        );
         let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                concat!(module_path!(), "::telemetry_only_carry_child"),
-                "--nocapture",
-                "--test-threads=1",
-            ])
+            .args(["--exact", &test, "--nocapture", "--test-threads=1"])
             .env("OTTTO_OTEL_CARRY_STAGE", stage)
             .env("OTTTO_OTEL_CARRY_ROOT", root)
             .output()
@@ -547,10 +584,11 @@ fn telemetry_only_growth_is_cumulative_and_truncation_cannot_reemit_smaller() {
 #[test]
 fn telemetry_only_composes_with_cross_folder_and_subagent_holders() {
     with_e2(|| {
-        for relative in [
-            format!("{COPY}.jsonl"),
-            format!("other/{COPY}.jsonl"),
-            format!("other/{COPY}/subagents/agent-000.jsonl"),
+        for (relative, remaining) in [
+            (format!("{COPY}.jsonl"), 3),
+            (format!("other/{COPY}.jsonl"), 3),
+            (format!("other/{COPY}/subagents/agent-000.jsonl"), 3),
+            (format!("forks/{COPY}.jsonl"), 1),
         ] {
             let mut c = Corpus::new("otel-only-holder-composition");
             positive(&c);
@@ -559,6 +597,17 @@ fn telemetry_only_composes_with_cross_folder_and_subagent_holders() {
                 &line(COPY, "before", AT, 11),
                 "2026-08-02T07:00:00Z",
             );
+            if remaining == 1 {
+                // Both forks copy the parent's last response, then make
+                // independent requests. Only the gap remains telemetry-only.
+                for (agent, request, tokens) in [(0, "after", 12), (1, "side-call", 14)] {
+                    c.write_at(
+                        &format!("forks/{COPY}/subagents/agent-{agent:03}.jsonl"),
+                        &(line(COPY, "before", AT, 11) + &line(COPY, request, AT, tokens)),
+                        AT,
+                    );
+                }
+            }
             let mut full_progress = progress();
             let full = page(&c, &mut full_progress, &hint(), WireBudget::default());
             let only = full
@@ -568,8 +617,8 @@ fn telemetry_only_composes_with_cross_folder_and_subagent_holders() {
                 .find(|item| item.evidence_basis == Some("otel_only"))
                 .unwrap();
             assert_eq!(
-                only.request_count, 3,
-                "positive holder excludes its one API request: {relative}"
+                only.request_count, remaining,
+                "positive holders exclude their API requests: {relative}"
             );
             assert_eq!(
                 full.scan

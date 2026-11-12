@@ -1181,7 +1181,8 @@ fn apply_grouped_with_accepted(
             });
         }
     }
-    let unpriced = (over_cap.is_empty() && item.evidence_basis != Some("otel_only"))
+    let unpriced = over_cap
+        .is_empty()
         .then(|| untag_unpriced_parts(item, &grouping, accepted))
         .flatten();
     if let Some(unpriced) = unpriced {
@@ -2460,6 +2461,9 @@ fn untag_unpriced_parts(
     grouping: &Grouping,
     accepted: Option<&accepted::AcceptedSession>,
 ) -> Option<UnpricedStrip> {
+    if item.evidence_basis == Some("otel_only") {
+        return Some(UnpricedStrip::default());
+    }
     let keys = item
         .model_usage
         .iter()
