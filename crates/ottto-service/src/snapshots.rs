@@ -1478,6 +1478,11 @@ use discovery::candidate_open::{open_candidate_beneath_root, opened_object_ident
 #[cfg(test)]
 use discovery::candidate_open::{read_opened_content_samples, START_IDENTITY_SAMPLE_FOR_TEST};
 
+pub(crate) use claude_reemission_exclusions::note_claude_index_rebuild_stop;
+#[cfg(test)]
+pub(crate) fn claude_reemission_stop_reason_for_test() -> &'static str {
+    claude_reemission_stop_reason()
+}
 use claude_reemission_exclusions::{
     claude_reemission_stop_latched, claude_reemission_stop_reason,
     claude_reemission_stop_withheld_folds, note_claude_reemission_stop,

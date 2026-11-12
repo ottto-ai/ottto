@@ -71,17 +71,6 @@ impl ScanIndex {
             }
             requeue_unindexed_observed(source, &mut index);
         }
-        if source == SnapshotSource::ClaudeCode
-            && load_origin.is_fresh(&index)
-            && fs::symlink_metadata(ReemissionExclusions::seen_marker_path(support_dir)).is_ok()
-        {
-            note_claude_reemission_stop_with_cause_at(
-                &ClaudeContextFileBirthCounts::default(),
-                &BTreeSet::new(),
-                Some(ClaudeReemissionStopCause::IndexRebuild),
-                std::time::Instant::now(),
-            );
-        }
         Ok((index, load_origin))
     }
 

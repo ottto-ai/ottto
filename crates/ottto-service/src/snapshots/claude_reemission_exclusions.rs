@@ -573,6 +573,18 @@ fn note_claude_reemission_stop_at(
     );
 }
 
+/// Called after prepare proves this destination lost its own Claude history.
+pub(crate) fn note_claude_index_rebuild_stop(support_dir: &Path) {
+    if std::fs::symlink_metadata(ReemissionExclusions::seen_marker_path(support_dir)).is_ok() {
+        note_claude_reemission_stop_with_cause_at(
+            &ClaudeContextFileBirthCounts::default(),
+            &BTreeSet::new(),
+            Some(ClaudeReemissionStopCause::IndexRebuild),
+            std::time::Instant::now(),
+        );
+    }
+}
+
 pub(super) fn note_claude_reemission_stop_with_cause_at(
     counts: &ClaudeContextFileBirthCounts,
     over_bound_roots: &BTreeSet<String>,
