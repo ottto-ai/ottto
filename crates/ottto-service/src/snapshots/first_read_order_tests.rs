@@ -396,13 +396,17 @@ fn pi_newest_first_read_matches_fifo_money() {
 /// A Claude history of two project folders. Each holds a resumed copy of an
 /// earlier-born original (the holder of its copied requests) and one
 /// unrelated session. `copy_first` names the copy so it lists before its
-/// holder. Births are the files' real ones (the parser and the copy order's
-/// holder probe read the same stat), so every line clock is placed against
-/// the wall clock just after its file was created. Request ids are per folder.
+/// holder. Files are created in birth order (so the sorter's stat birth
+/// agrees), and the money sees synthetic births one day apart; every line
+/// clock follows its file's birth, every mtime follows every birth. Request
+/// ids are per folder.
 struct ClaudeHistory {
     home: PathBuf,
     root: PathBuf,
     support: PathBuf,
+    /// Synthetic births, set on the parser and on every holder probe (the
+    /// test runner's real births are all "now", later than the clocks).
+    births: BTreeMap<PathBuf, i128>,
     /// (folder, holder, copy) paths.
     folders: Vec<(PathBuf, PathBuf, PathBuf)>,
     /// Distinct request ids across the whole history.
@@ -429,12 +433,10 @@ fn assistant(session: &str, id: &str, clock: &str, input: u64) -> String {
         + "\n"
 }
 
-/// Creates `path` empty and returns a clock at or after its birth.
-fn born(path: &Path) -> SystemTime {
+/// Creates `path` empty: files are born in call order.
+fn born(path: &Path) {
     fs::write(path, b"").unwrap();
-    let after = SystemTime::now();
     std::thread::sleep(Duration::from_millis(50));
-    after
 }
 
 const ORGS: [&str; 2] = [
@@ -565,10 +567,11 @@ impl ClaudeHistory {
         fs::create_dir_all(&root).unwrap();
         fixture::write_exclusions(&support, &[]);
         let mut folders = Vec::new();
+        let mut births = BTreeMap::new();
         let mut distinct = BTreeSet::new();
         // `a-old` lists first, so the walk (FIFO) reads it first.
         let mut modified = Vec::new();
-        for (slot, (folder, day)) in [("a-old", 10u64), ("b-new", DAY)].into_iter().enumerate() {
+        for (slot, (folder, day)) in [("a-old", 9u64), ("b-new", 39)].into_iter().enumerate() {
             let dir = root.join(format!("-synthetic-{folder}"));
             fs::create_dir_all(&dir).unwrap();
             let session =
@@ -581,14 +584,27 @@ impl ClaudeHistory {
             let other = dir.join(format!("{}.jsonl", session('c')));
             let stem = |path: &Path| path.file_stem().unwrap().to_str().unwrap().to_owned();
             // Born in this order: holder, copy, other.
-            let holder_born = born(&holder);
-            let copy_born = born(&copy);
-            let other_born = born(&other);
+            let t0 = UNIX_EPOCH + Duration::from_secs(seconds("2026-06-01T07:00:00Z"));
+            let [holder_born, copy_born, other_born] = [&holder, &copy, &other]
+                .into_iter()
+                .zip(0u64..)
+                .map(|(path, n)| {
+                    born(path);
+                    let at = t0 + Duration::from_secs(n * DAY);
+                    births.insert(
+                        path.clone(),
+                        i128::try_from(at.duration_since(UNIX_EPOCH).unwrap().as_nanos()).unwrap(),
+                    );
+                    at
+                })
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap();
             let copied = (0..Self::COPIED)
                 .map(|n| {
                     (
                         format!("{folder}-r-{n}"),
-                        clock_after(holder_born, 1 + n),
+                        clock_after(holder_born, 60_000 + 1000 * n),
                         10 + n,
                     )
                 })
@@ -605,14 +621,19 @@ impl ClaudeHistory {
                 texts[1].1 += &assistant(&stem(copy.as_path()), id, clock, *input);
                 distinct.insert(id.clone());
             }
-            texts[1].1 += &assistant(&stem(copy.as_path()), &own, &clock_after(copy_born, 1), 30);
+            texts[1].1 += &assistant(
+                &stem(copy.as_path()),
+                &own,
+                &clock_after(copy_born, 60_000),
+                30,
+            );
             distinct.insert(own);
             for n in 0..2 {
                 let id = format!("{folder}-o-{n}");
                 texts[2].1 += &assistant(
                     &stem(other.as_path()),
                     &id,
-                    &clock_after(other_born, 1 + n),
+                    &clock_after(other_born, 60_000 + 1000 * n),
                     20,
                 );
                 distinct.insert(id);
@@ -632,17 +653,15 @@ impl ClaudeHistory {
         }
         // Every mtime after every birth (a modification never precedes its
         // file's birth); `b-new` is the newer folder.
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        for (path, seconds) in modified {
-            set_mtime(&path, now + seconds);
+        let base = seconds("2026-06-01T00:00:00Z");
+        for (path, days) in modified {
+            set_mtime(&path, base + days * DAY);
         }
         Self {
             home,
             root,
             support,
+            births,
             folders,
             distinct_requests: distinct.len() as u64,
         }
@@ -667,7 +686,7 @@ impl ClaudeHistory {
             index,
             limit,
             false,
-            &BTreeMap::new(),
+            &self.births,
             hints,
         );
         let (disposition, _, _) = crate::snapshot_sync::apply_claude_local_evidence_to_scan(
@@ -722,7 +741,17 @@ impl ClaudeHistory {
             for path in &hints {
                 self.grow(path, pass);
             }
-            let (next, mut scan) = self.pass(&fixture, index, limit, &hints);
+            // Every holder probe of the pass (scan and evidence fold) sees
+            // the same synthetic births as the parser.
+            let staged = self
+                .births
+                .iter()
+                .map(|(path, birth)| (local_index_key(path), u64::try_from(*birth).unwrap()))
+                .collect();
+            let (next, mut scan) =
+                claude_history_upgrade::with_staged_births_for_test(staged, || {
+                    self.pass(&fixture, index, limit, &hints)
+                });
             assert_eq!(next.first_read_pending, pending, "runtime flag carried");
             order.extend(fixture.paths());
             let emitted = !scan.snapshots.is_empty();
@@ -750,18 +779,14 @@ impl ClaudeHistory {
         let stem = path.file_stem().unwrap().to_str().unwrap().to_owned();
         let id = format!("{stem}-live-{pass}");
         let line = json!({"type":"assistant", "sessionId":stem, "version":"2.1.229",
-            "timestamp":clock_after(SystemTime::now(), 0),
+            "timestamp":clock_after(UNIX_EPOCH + Duration::from_secs(seconds("2026-06-05T08:00:00Z")), 1000 * pass as u64),
             "requestId":id, "message":{"id":format!("message-{id}"),
                 "model":"claude-haiku-4-5", "usage":{"input_tokens":50, "output_tokens":1}}});
         let mut file = File::options().append(true).open(path).unwrap();
         std::io::Write::write_all(&mut file, format!("{line}\n").as_bytes()).unwrap();
         drop(file);
         // Still older than the other folder: the sort keeps this folder later.
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        set_mtime(path, now + 3600 + pass as u64);
+        set_mtime(path, seconds("2026-06-20T00:00:00Z") + pass as u64);
         self.distinct_requests += 1;
     }
 
