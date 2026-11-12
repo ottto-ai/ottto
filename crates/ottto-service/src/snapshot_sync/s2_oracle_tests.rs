@@ -1278,10 +1278,11 @@ fn changed_account_evidence_matches_cold_placement() {
     });
 }
 
-/// [money] An incomplete census never ages a prefix into counted usage.
-/// A complete later pass decides the prefix after persisted own-turn ACKs.
+/// D62 guard: the census deadline holds past the expired hold's pass too.
+/// That pass's body was the hold's one delivery; the hold never restarts, and
+/// nothing selects afterwards.
 #[test]
-fn e2_pipeline_incomplete_census_keeps_prefix_owed_after_restart() {
+fn e2_pipeline_resumed_prefix_hold_expired_under_deadline_never_restarts_the_hold() {
     with_e2(|| {
         let mut c = Corpus::new("e2-pipeline-prefix-expiry-deadline");
         c.root(ROOT, &resumed(ROOT, &[A, B]));
@@ -1306,20 +1307,10 @@ fn e2_pipeline_incomplete_census_keeps_prefix_owed_after_restart() {
             let page = under_deadline(prior.clone());
             prior = settle(&c, &prior, page, &mut progress);
         }
-        let after = under_deadline(prior.clone());
-        assert_eq!(body(&after, COPY).unwrap().request_count, 1);
-        assert_eq!(
-            prior.claude_copy_removals.hold_age(
-                crate::snapshots::claude_money_birth_store::location_key(
-                    &c.root.join(file(COPY)).to_string_lossy()
-                )
-            ),
-            1
-        );
-        let completed = ready(&c, &scanner, prior, 100, true);
-        assert_eq!(
-            body(&completed, COPY).unwrap().removed_request_count,
-            Some(2)
+        let after = under_deadline(prior);
+        assert!(
+            body(&after, COPY).is_none(),
+            "the expired hold never restarts"
         );
     });
 }
