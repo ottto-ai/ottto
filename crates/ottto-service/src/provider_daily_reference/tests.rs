@@ -3,6 +3,8 @@ use serde_json::json;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 
+mod accounts;
+
 const INSTALLATION_ID: &str = "00000000-0000-4000-8000-000000000001";
 const GRANT_ID: &str = "00000000-0000-4000-8000-000000000002";
 const ORG_SCOPE: &str = "org-fixture-private";
@@ -42,6 +44,23 @@ fn runtime() -> Runtime {
         installation_id: INSTALLATION_ID.to_string(),
         provider_account_scope: ACCOUNT_SCOPE.to_string(),
     }
+}
+
+/// A live, unidentified login whose header and scope are `scope`.
+fn login_with_scope(scope: &str) -> CodexLogin {
+    CodexLogin {
+        credential: CodexCredential {
+            access_token: "fixture-access-token".to_string(),
+            account_id: Some(scope.to_string()),
+            account_scope: scope.to_string(),
+        },
+        identity: None,
+        lapses_at: u64::MAX,
+    }
+}
+
+fn login() -> CodexLogin {
+    login_with_scope(ACCOUNT_SCOPE)
 }
 
 fn grant_response(local: &DailyReferenceGrant, status: &str, version: u64) -> GrantResponse {
@@ -188,7 +207,12 @@ impl StaticReader {
 }
 
 impl ProviderDailyUsageReader for StaticReader {
-    fn fetch_window(&self, _start: &str, _end: &str) -> Result<Value, ProviderReadError> {
+    fn fetch_window(
+        &self,
+        _credential: &CodexCredential,
+        _start: &str,
+        _end: &str,
+    ) -> Result<Value, ProviderReadError> {
         self.calls.set(self.calls.get() + 1);
         Ok(self.payload.clone())
     }
@@ -209,7 +233,12 @@ impl FailingReader {
 }
 
 impl ProviderDailyUsageReader for FailingReader {
-    fn fetch_window(&self, _start: &str, _end: &str) -> Result<Value, ProviderReadError> {
+    fn fetch_window(
+        &self,
+        _credential: &CodexCredential,
+        _start: &str,
+        _end: &str,
+    ) -> Result<Value, ProviderReadError> {
         self.calls.set(self.calls.get() + 1);
         Err(self
             .errors
@@ -223,7 +252,12 @@ impl ProviderDailyUsageReader for FailingReader {
 struct ForbiddenReader;
 
 impl ProviderDailyUsageReader for ForbiddenReader {
-    fn fetch_window(&self, _start: &str, _end: &str) -> Result<Value, ProviderReadError> {
+    fn fetch_window(
+        &self,
+        _credential: &CodexCredential,
+        _start: &str,
+        _end: &str,
+    ) -> Result<Value, ProviderReadError> {
         panic!("the provider endpoint was contacted while collection was not permitted");
     }
 }
@@ -420,6 +454,7 @@ fn no_provider_free_text_survives_into_the_uploaded_batch() {
         collected_at: timestamp(now()),
         provider_data_refreshed_at: normalized.provider_data_refreshed_at.clone(),
         rows: normalized.rows.clone(),
+        account_identity: None,
     };
     let encoded = serde_json::to_string(&batch).expect("encode batch");
     for poison in poison_strings() {
@@ -454,6 +489,7 @@ fn wire_key_sets_match_the_contract() {
         collected_at: timestamp(now()),
         provider_data_refreshed_at: None,
         rows: normalized.rows,
+        account_identity: None,
     };
     let payload = serde_json::to_value(&batch).expect("batch value");
     let object = payload.as_object().expect("object");
@@ -1076,7 +1112,13 @@ fn health_never_resurrects_a_revoked_grant() {
 #[test]
 fn absent_consent_is_silent_and_contacts_nothing() {
     let collector = collector("no-consent");
-    let cycle = collector.collect_once(&runtime(), &ForbiddenReader, &ForbiddenTransport, now());
+    let cycle = collector.collect_account(
+        &runtime(),
+        &login(),
+        &ForbiddenReader,
+        &ForbiddenTransport,
+        now(),
+    );
     assert_eq!(cycle.outcome, CycleOutcome::Disabled);
     assert!(
         cycle.diagnostics.is_empty(),
@@ -1106,8 +1148,13 @@ fn an_unusable_consent_file_says_why_but_stays_disabled() {
         ),
     ] {
         fs::write(collector.grants().path(), &contents).expect("write");
-        let cycle =
-            collector.collect_once(&runtime(), &ForbiddenReader, &ForbiddenTransport, now());
+        let cycle = collector.collect_account(
+            &runtime(),
+            &login(),
+            &ForbiddenReader,
+            &ForbiddenTransport,
+            now(),
+        );
         assert_eq!(cycle.outcome, CycleOutcome::Disabled);
         assert_eq!(cycle.diagnostics.len(), 1);
         assert_eq!(
@@ -1137,8 +1184,9 @@ fn revoke_stops_collection_before_the_provider_is_contacted() {
     enabled(&collector);
     collector.grants().revoke(now()).expect("revoke");
 
-    let cycle = collector.collect_once(
+    let cycle = collector.collect_account(
         &runtime(),
+        &login(),
         &ForbiddenReader,
         &ForbiddenTransport,
         now() + TimeDuration::hours(1),
@@ -1158,15 +1206,16 @@ fn the_sentinel_disables_collection_and_retires_local_state() {
     let reader = StaticReader::new(poisoned_payload());
     assert_eq!(
         collector
-            .collect_once(&runtime(), &reader, &transport, now())
+            .collect_account(&runtime(), &login(), &reader, &transport, now())
             .outcome,
         CycleOutcome::Uploaded
     );
     assert!(collector.state_path().is_file());
 
     fs::write(&collector.sentinel, b"disabled\n").expect("write sentinel");
-    let cycle = collector.collect_once(
+    let cycle = collector.collect_account(
         &runtime(),
+        &login(),
         &ForbiddenReader,
         &ForbiddenTransport,
         now() + TimeDuration::days(1),
@@ -1202,7 +1251,7 @@ fn an_upload_from_a_different_admitted_build_is_accepted_when_disclosure_matches
     // running build under its current admission list.
     let reader = StaticReader::new(poisoned_payload());
     let transport = RecordingTransport::default();
-    let cycle = collector.collect_once(&runtime(), &reader, &transport, now());
+    let cycle = collector.collect_account(&runtime(), &login(), &reader, &transport, now());
 
     assert_eq!(cycle.outcome, CycleOutcome::Uploaded);
     assert_eq!(reader.calls.get(), 1);
@@ -1239,7 +1288,13 @@ fn an_admitted_build_with_a_different_disclosure_is_refused() {
     )
     .expect("write");
 
-    let cycle = collector.collect_once(&runtime(), &ForbiddenReader, &ForbiddenTransport, now());
+    let cycle = collector.collect_account(
+        &runtime(),
+        &login(),
+        &ForbiddenReader,
+        &ForbiddenTransport,
+        now(),
+    );
     assert_eq!(cycle.outcome, CycleOutcome::Disabled);
     let status = collector_status(collector.grants(), false);
     assert_eq!(status.runtime_state, RuntimeState::ConsentRequired);
@@ -1264,13 +1319,15 @@ fn a_v1_grant_is_not_silently_widened_after_an_account_switch() {
         serde_json::to_vec_pretty(&persisted).expect("encode"),
     )
     .expect("write");
-    let other_account = Runtime {
-        installation_id: INSTALLATION_ID.to_string(),
-        provider_account_scope: "acct-a-completely-different-account".to_string(),
-    };
+    let other_account = login_with_scope("acct-a-completely-different-account");
 
-    let cycle =
-        collector.collect_once(&other_account, &ForbiddenReader, &ForbiddenTransport, now());
+    let cycle = collector.collect_account(
+        &runtime(),
+        &other_account,
+        &ForbiddenReader,
+        &ForbiddenTransport,
+        now(),
+    );
 
     assert_eq!(cycle.outcome, CycleOutcome::Disabled);
     let lines = cycle_diagnostic_log_lines(&cycle.diagnostics);
@@ -1286,19 +1343,16 @@ fn a_v1_grant_is_not_silently_widened_after_an_account_switch() {
 fn v2_uploads_a_different_provider_account_under_its_own_attribution() {
     let collector = collector("account-switch");
     let grant = enabled(&collector);
-    let other_account = Runtime {
-        installation_id: INSTALLATION_ID.to_string(),
-        provider_account_scope: "acct-a-completely-different-account".to_string(),
-    };
+    let other_account = login_with_scope("acct-a-completely-different-account");
     let reader = StaticReader::new(poisoned_payload());
     let transport = RecordingTransport::default();
-    let cycle = collector.collect_once(&other_account, &reader, &transport, now());
+    let cycle = collector.collect_account(&runtime(), &other_account, &reader, &transport, now());
     assert_eq!(cycle.outcome, CycleOutcome::Uploaded);
     let batch = &transport.batches.borrow()[0];
     assert_ne!(batch["account_fingerprint"], grant.account_fingerprint);
     let switched_fingerprint = collector
         .grants()
-        .account_fingerprint_for(&other_account.provider_account_scope)
+        .account_fingerprint_for(&other_account.credential.account_scope)
         .expect("derive")
         .expect("grant");
     assert_eq!(batch["account_fingerprint"], switched_fingerprint);
@@ -1316,7 +1370,7 @@ fn excluded_account_is_terminal_visible_and_clearing_restores_collection() {
     let reader = StaticReader::new(poisoned_payload());
     let rejected = RejectingTransport::new(UploadError::AccountExcluded);
 
-    let refused = collector.collect_once(&runtime(), &reader, &rejected, now());
+    let refused = collector.collect_account(&runtime(), &login(), &reader, &rejected, now());
     assert_eq!(refused.outcome, CycleOutcome::AccountExcluded);
     assert_eq!(rejected.calls.get(), 1);
     assert!(collector
@@ -1337,8 +1391,9 @@ fn excluded_account_is_terminal_visible_and_clearing_restores_collection() {
         Some(current_fingerprint.as_str())
     );
 
-    let blocked = collector.collect_once(
+    let blocked = collector.collect_account(
         &runtime(),
+        &login(),
         &ForbiddenReader,
         &ForbiddenTransport,
         now() + TimeDuration::hours(7),
@@ -1350,8 +1405,9 @@ fn excluded_account_is_terminal_visible_and_clearing_restores_collection() {
         .set_account_excluded(&current_fingerprint, false)
         .expect("include");
     let transport = RecordingTransport::default();
-    let restored = collector.collect_once(
+    let restored = collector.collect_account(
         &runtime(),
+        &login(),
         &StaticReader::new(poisoned_payload()),
         &transport,
         now() + TimeDuration::days(1),
@@ -1394,7 +1450,13 @@ fn a_different_installation_can_never_upload_under_this_consent() {
         installation_id: "00000000-0000-4000-8000-0000000000ff".to_string(),
         provider_account_scope: ACCOUNT_SCOPE.to_string(),
     };
-    let cycle = collector.collect_once(&other_device, &ForbiddenReader, &ForbiddenTransport, now());
+    let cycle = collector.collect_account(
+        &other_device,
+        &login(),
+        &ForbiddenReader,
+        &ForbiddenTransport,
+        now(),
+    );
     assert_eq!(cycle.outcome, CycleOutcome::Disabled);
     assert_eq!(
         cycle.diagnostics[0].code,
@@ -1406,7 +1468,13 @@ fn a_different_installation_can_never_upload_under_this_consent() {
 fn an_unconfigured_transport_defers_before_the_provider_is_contacted() {
     let collector = collector("deferred-transport");
     enabled(&collector);
-    let cycle = collector.collect_once(&runtime(), &ForbiddenReader, &DeferredTransport, now());
+    let cycle = collector.collect_account(
+        &runtime(),
+        &login(),
+        &ForbiddenReader,
+        &DeferredTransport,
+        now(),
+    );
     assert_eq!(cycle.outcome, CycleOutcome::Deferred);
     assert_eq!(cycle.diagnostics[0].code, "codex_daily_aggregates_deferred");
     assert!(cycle.diagnostics[0]
@@ -1424,13 +1492,14 @@ fn a_second_cycle_inside_the_cadence_window_does_nothing() {
     let transport = RecordingTransport::default();
     assert_eq!(
         collector
-            .collect_once(&runtime(), &reader, &transport, now())
+            .collect_account(&runtime(), &login(), &reader, &transport, now())
             .outcome,
         CycleOutcome::Uploaded
     );
     assert_eq!(reader.calls.get(), 1);
-    let cycle = collector.collect_once(
+    let cycle = collector.collect_account(
         &runtime(),
+        &login(),
         &reader,
         &transport,
         now() + TimeDuration::hours(1),
@@ -1438,8 +1507,9 @@ fn a_second_cycle_inside_the_cadence_window_does_nothing() {
     assert_eq!(cycle.outcome, CycleOutcome::Noop);
     assert_eq!(reader.calls.get(), 1, "day-grain data is polled sparsely");
 
-    let cycle = collector.collect_once(
+    let cycle = collector.collect_account(
         &runtime(),
+        &login(),
         &reader,
         &transport,
         now() + TimeDuration::hours(7),
@@ -1578,7 +1648,7 @@ fn repeated_auth_rejections_open_the_breaker_and_stop_the_provider_call() {
     let transport = RecordingTransport::default();
     let mut clock = now();
     for (consecutive, status) in [(1, 401), (2, 403)] {
-        let cycle = collector.collect_once(&runtime(), &reader, &transport, clock);
+        let cycle = collector.collect_account(&runtime(), &login(), &reader, &transport, clock);
         assert_eq!(cycle.outcome, CycleOutcome::Failed);
         // Below the threshold the category is still named.
         assert_eq!(
@@ -1590,7 +1660,7 @@ fn repeated_auth_rejections_open_the_breaker_and_stop_the_provider_call() {
         )));
         clock += TimeDuration::hours(7);
     }
-    let cycle = collector.collect_once(&runtime(), &reader, &transport, clock);
+    let cycle = collector.collect_account(&runtime(), &login(), &reader, &transport, clock);
     assert_eq!(cycle.outcome, CycleOutcome::CircuitOpen);
     assert_eq!(
         cycle.diagnostics[0].code,
@@ -1600,13 +1670,15 @@ fn repeated_auth_rejections_open_the_breaker_and_stop_the_provider_call() {
 
     // While open, no request is made at all.
     clock += TimeDuration::hours(7);
-    let cycle = collector.collect_once(&runtime(), &ForbiddenReader, &transport, clock);
+    let cycle =
+        collector.collect_account(&runtime(), &login(), &ForbiddenReader, &transport, clock);
     assert_eq!(cycle.outcome, CycleOutcome::CircuitOpen);
     assert!(transport.batches.borrow().is_empty());
 
     // The cool-down closes it.
-    let cycle = collector.collect_once(
+    let cycle = collector.collect_account(
         &runtime(),
+        &login(),
         &StaticReader::new(poisoned_payload()),
         &transport,
         clock + TimeDuration::hours(25),
@@ -1627,7 +1699,7 @@ fn a_transient_provider_failure_never_opens_the_breaker() {
     let transport = RecordingTransport::default();
     let mut clock = now();
     for _ in 0..4 {
-        let cycle = collector.collect_once(&runtime(), &reader, &transport, clock);
+        let cycle = collector.collect_account(&runtime(), &login(), &reader, &transport, clock);
         assert_eq!(cycle.outcome, CycleOutcome::Failed);
         let message = &cycle.diagnostics[0].message;
         assert!(message.contains("category=provider_unavailable; not counted"));
@@ -1650,7 +1722,7 @@ fn a_not_admitted_answer_is_typed_expected_and_never_trips_the_breaker() {
     let transport = RejectingTransport::new(UploadError::NotAdmitted(403));
     let mut clock = now();
     for _ in 0..5 {
-        let cycle = collector.collect_once(&runtime(), &reader, &transport, clock);
+        let cycle = collector.collect_account(&runtime(), &login(), &reader, &transport, clock);
         assert_eq!(cycle.outcome, CycleOutcome::NotAdmitted);
         // Expected until a reviewed backend change admits this build, so it
         // is reported at info severity, not as a fault.
@@ -1677,7 +1749,7 @@ fn a_stale_consent_epoch_stops_the_cycle_rather_than_retrying() {
     enabled(&collector);
     let reader = StaticReader::new(poisoned_payload());
     let transport = RejectingTransport::new(UploadError::GrantEpochConflict);
-    let cycle = collector.collect_once(&runtime(), &reader, &transport, now());
+    let cycle = collector.collect_account(&runtime(), &login(), &reader, &transport, now());
     assert_eq!(cycle.outcome, CycleOutcome::Failed);
     assert_eq!(transport.calls.get(), 1, "only re-consent can fix an epoch");
     let grant = collector.grants().load().expect("load").expect("grant");
@@ -1707,7 +1779,7 @@ fn the_uploaded_batch_declares_the_consented_epoch_and_identity() {
     let transport = RecordingTransport::default();
     assert_eq!(
         collector
-            .collect_once(&runtime(), &reader, &transport, now())
+            .collect_account(&runtime(), &login(), &reader, &transport, now())
             .outcome,
         CycleOutcome::Uploaded
     );

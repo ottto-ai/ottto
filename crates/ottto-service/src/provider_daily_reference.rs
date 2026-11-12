@@ -40,6 +40,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -245,7 +246,7 @@ pub struct DailyReferenceRow {
 }
 
 /// One bounded upload of provider-reported day aggregates.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Clone, PartialEq, Serialize)]
 pub struct DailyReferenceBatch {
     pub schema_version: &'static str,
     pub source: &'static str,
@@ -262,6 +263,57 @@ pub struct DailyReferenceBatch {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_data_refreshed_at: Option<String>,
     pub rows: Vec<DailyReferenceRow>,
+    /// The account this read's credential names. Set only under a v2 grant
+    /// and only when the live access token proves it; every batch of one read
+    /// carries the same value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) account_identity: Option<AccountIdentityHashes>,
+}
+
+/// Versions, dates and counts only: the installation id and the opaque
+/// fingerprints stay out of formatted output.
+impl fmt::Debug for DailyReferenceBatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DailyReferenceBatch")
+            .field("schema_version", &self.schema_version)
+            .field("collector_version", &self.collector_version)
+            .field("grant_version", &self.grant_version)
+            .field("coverage_start", &self.coverage_start)
+            .field("coverage_end", &self.coverage_end)
+            .field("collected_at", &self.collected_at)
+            .field("rows", &self.rows.len())
+            .field("identified", &self.account_identity.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Hash scheme of [`AccountIdentityHashes`]: the session-evidence scheme.
+const IDENTITY_HASH_SCHEME: &str = "provider-sha256:v1";
+
+/// The provider account and workspace one read's credential names, hashed
+/// exactly as Codex session evidence hashes its creator pair.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct AccountIdentityHashes {
+    account_identifier_hash: String,
+    provider_workspace_hash: String,
+}
+
+impl fmt::Debug for AccountIdentityHashes {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AccountIdentityHashes(present)")
+    }
+}
+
+impl Serialize for AccountIdentityHashes {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut identity = serializer.serialize_struct("AccountIdentityHashes", 3)?;
+        identity.serialize_field("identity_hash_scheme", IDENTITY_HASH_SCHEME)?;
+        identity.serialize_field("account_identifier_hash", &self.account_identifier_hash)?;
+        identity.serialize_field("provider_workspace_hash", &self.provider_workspace_hash)?;
+        identity.end()
+    }
 }
 
 /// The exact key set the batch envelope may carry. Pinned so a future field
@@ -281,6 +333,14 @@ const BATCH_KEYS: &[&str] = &[
     "collected_at",
     "provider_data_refreshed_at",
     "rows",
+    "account_identity",
+];
+
+/// The exact key set of a batch's `account_identity`.
+const ACCOUNT_IDENTITY_KEYS: &[&str] = &[
+    "identity_hash_scheme",
+    "account_identifier_hash",
+    "provider_workspace_hash",
 ];
 
 /// The exact key set one row may carry.
@@ -1474,13 +1534,18 @@ fn fetch_due(state: &CollectorState, identity: &str, now: u64) -> bool {
 
 /// Read one bounded day window from the provider.
 pub trait ProviderDailyUsageReader {
-    fn fetch_window(&self, start_date: &str, end_date: &str) -> Result<Value, ProviderReadError>;
+    fn fetch_window(
+        &self,
+        credential: &CodexCredential,
+        start_date: &str,
+        end_date: &str,
+    ) -> Result<Value, ProviderReadError>;
 }
 
 /// The Codex credential this read uses. The daemon reads the customer's own
 /// already-issued token from their own `~/.codex/auth.json`; it never mints,
 /// refreshes, or stores one.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CodexCredential {
     pub access_token: String,
     pub account_id: Option<String>,
@@ -1489,19 +1554,44 @@ pub struct CodexCredential {
     pub account_scope: String,
 }
 
-/// The one provider route this capability may contact.
-pub struct ChatGptDailyUsageReader {
-    credential: CodexCredential,
-}
-
-impl ChatGptDailyUsageReader {
-    pub fn new(credential: CodexCredential) -> Self {
-        Self { credential }
+/// Presence only: the token, header and scope never reach formatted output.
+impl fmt::Debug for CodexCredential {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CodexCredential")
+            .field("account_id_present", &self.account_id.is_some())
+            .finish_non_exhaustive()
     }
 }
 
+/// One Codex login a cycle reads with: its credential, the account identity
+/// its live access token proves (if any), and when that token lapses. Built
+/// only by [`logins::read_login`] from one secure read and one parse.
+pub(crate) struct CodexLogin {
+    credential: CodexCredential,
+    identity: Option<AccountIdentityHashes>,
+    lapses_at: u64,
+}
+
+impl fmt::Debug for CodexLogin {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CodexLogin")
+            .field("identified", &self.identity.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// The one provider route this capability may contact.
+pub struct ChatGptDailyUsageReader;
+
 impl ProviderDailyUsageReader for ChatGptDailyUsageReader {
-    fn fetch_window(&self, start_date: &str, end_date: &str) -> Result<Value, ProviderReadError> {
+    fn fetch_window(
+        &self,
+        credential: &CodexCredential,
+        start_date: &str,
+        end_date: &str,
+    ) -> Result<Value, ProviderReadError> {
         // `workspace_user=true` scopes the answer to the signed-in user's own
         // usage. Without it a workspace member could be handed workspace-wide
         // numbers, which would be compared against one user's Ottto totals.
@@ -1517,16 +1607,15 @@ impl ProviderDailyUsageReader for ChatGptDailyUsageReader {
             .set("User-Agent", &crate::agent_status::ottto_user_agent())
             .set(
                 "Authorization",
-                &format!("Bearer {}", self.credential.access_token),
+                &format!("Bearer {}", credential.access_token),
             );
-        if let Some(account_id) = self.credential.account_id.as_deref() {
+        if let Some(account_id) = credential.account_id.as_deref() {
             request = request.set("ChatGPT-Account-Id", account_id);
         }
         // The user the request's own token names, as every other Codex line
         // does (`account_id` is the workspace).
-        let account = crate::agent_status::codex_access_token_claimed_account_hash(
-            &self.credential.access_token,
-        );
+        let account =
+            crate::agent_status::codex_access_token_claimed_account_hash(&credential.access_token);
         let started = std::time::Instant::now();
         let response = request.call();
         crate::provider_calls::record(crate::provider_calls::ProviderCall::observed(
@@ -2821,22 +2910,15 @@ impl Collector {
     /// live credential proving it is the installation and account consent was
     /// taken over, the circuit breaker, and finally the cadence gate. The
     /// backend applies build admission when the resulting batch is uploaded.
-    pub fn collect_once(
+    pub(crate) fn collect_account(
         &self,
         runtime: &Runtime,
+        login: &CodexLogin,
         reader: &dyn ProviderDailyUsageReader,
         transport: &dyn DailyReferenceTransport,
         now: OffsetDateTime,
     ) -> Cycle {
-        collect_once(
-            &self.grants,
-            &self.state,
-            self.network_disabled(),
-            runtime,
-            reader,
-            transport,
-            now,
-        )
+        collect_account_once(self, runtime, login, reader, transport, now)
     }
 }
 
@@ -2890,15 +2972,19 @@ fn deferred(reason: &'static str) -> Cycle {
     )
 }
 
-fn collect_once(
-    grants: &GrantStore,
-    state_store: &StateStore,
-    sentinel_disabled: bool,
+/// One account's read: every local gate, then at most one provider request
+/// with `login`'s credential, then its batches.
+fn collect_account_once(
+    collector: &Collector,
     runtime: &Runtime,
+    login: &CodexLogin,
     reader: &dyn ProviderDailyUsageReader,
     transport: &dyn DailyReferenceTransport,
     now: OffsetDateTime,
 ) -> Cycle {
+    let grants = &collector.grants;
+    let state_store = &collector.state;
+    let sentinel_disabled = collector.network_disabled();
     if sentinel_disabled {
         state_store.clear();
         return Cycle::with(
@@ -2933,7 +3019,7 @@ fn collect_once(
         );
     }
     let Some(account_fingerprint) = grants
-        .account_fingerprint_for(&runtime.provider_account_scope)
+        .account_fingerprint_for(&login.credential.account_scope)
         .ok()
         .flatten()
     else {
@@ -2991,13 +3077,18 @@ fn collect_once(
     if !fetch_due(&state, &identity, now_seconds) {
         return Cycle::new(CycleOutcome::Noop);
     }
+    // The token may have lapsed since the login was read. It is never
+    // refreshed here: an expired sign-in waits for Codex to renew it.
+    if login.lapses_at <= now_seconds.saturating_add(logins::LAPSE_MARGIN_SECONDS) {
+        return deferred(logins::LoginSkip::Expired.code());
+    }
 
     let (window_start, window_end) = collection_window(now);
     state.last_fetch_epoch_seconds = now_seconds;
     state.schema_version = STATE_FILE_SCHEMA_VERSION;
     state.identity = identity.clone();
 
-    let payload = match reader.fetch_window(&window_start, &window_end) {
+    let payload = match reader.fetch_window(&login.credential, &window_start, &window_end) {
         Ok(payload) => payload,
         Err(error) => {
             return record_provider_failure(
@@ -3073,6 +3164,12 @@ fn collect_once(
         .as_ref()
         .map(|binding| binding.grant_version)
         .unwrap_or_default();
+    // Disclosure v1 did not cover the account identity; only v2 carries it.
+    let account_identity = if grant.disclosure_version == DISCLOSURE_VERSION {
+        login.identity.clone()
+    } else {
+        None
+    };
 
     for (coverage_start, coverage_end, rows) in batches {
         let batch = DailyReferenceBatch {
@@ -3090,6 +3187,7 @@ fn collect_once(
             collected_at: collected_at.clone(),
             provider_data_refreshed_at: normalized.provider_data_refreshed_at.clone(),
             rows,
+            account_identity: account_identity.clone(),
         };
         let payload = match serde_json::to_value(&batch) {
             Ok(payload) => payload,
@@ -3313,11 +3411,37 @@ fn validate_ack(receipt: &Value, coverage_start: &str, coverage_end: &str) -> Re
 // ---------------------------------------------------------------------------
 
 fn is_fingerprint(value: &str) -> bool {
-    value.len() == 76
-        && value.starts_with("hmac-sha256:")
-        && value[12..]
+    value
+        .strip_prefix("hmac-sha256:")
+        .is_some_and(is_sha256_hex)
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+/// An `account_identity` is exactly the scheme literal and two hashes.
+fn is_account_identity(value: &Value) -> bool {
+    let Some(identity) = value.as_object() else {
+        return false;
+    };
+    identity.len() == ACCOUNT_IDENTITY_KEYS.len()
+        && identity
+            .keys()
+            .all(|key| ACCOUNT_IDENTITY_KEYS.contains(&key.as_str()))
+        && identity.get("identity_hash_scheme").and_then(Value::as_str)
+            == Some(IDENTITY_HASH_SCHEME)
+        && ["account_identifier_hash", "provider_workspace_hash"]
+            .iter()
+            .all(|key| {
+                identity
+                    .get(*key)
+                    .and_then(Value::as_str)
+                    .is_some_and(is_sha256_hex)
+            })
 }
 
 fn is_semver(value: &str) -> bool {
@@ -3400,6 +3524,12 @@ pub fn wire_payload_is_content_free(payload: &Value) -> bool {
         if !refreshed_at.as_str().is_some_and(is_rfc3339) {
             return false;
         }
+    }
+    if object
+        .get("account_identity")
+        .is_some_and(|identity| !is_account_identity(identity))
+    {
+        return false;
     }
     if object
         .get("grant_version")
@@ -3513,7 +3643,7 @@ pub fn collect_composed_once(now: OffsetDateTime) -> Cycle {
         return cycle;
     }
 
-    let (runtime, credential, api_base_url) = match load_runtime_binding() {
+    let (runtime, login, api_base_url) = match load_runtime_binding(now) {
         Ok(binding) => binding,
         Err(reason) => return deferred(reason),
     };
@@ -3592,16 +3722,15 @@ pub fn collect_composed_once(now: OffsetDateTime) -> Cycle {
         }
     }
     let transport = RelayTransport::new(api_base_url, device, device_secret);
-    let reader = ChatGptDailyUsageReader::new(credential);
-    collector.collect_once(&runtime, &reader, &transport, now)
+    collector.collect_account(&runtime, &login, &ChatGptDailyUsageReader, &transport, now)
 }
 
-type RuntimeBinding = (Runtime, CodexCredential, String);
+type RuntimeBinding = (Runtime, CodexLogin, String);
 
 /// The account, device, connection, destination, and Codex sign-in a cycle
 /// collects with. A gap is a closed reason code so a waiting cycle can say
 /// which piece is missing without naming any of its contents.
-fn load_runtime_binding() -> std::result::Result<RuntimeBinding, &'static str> {
+fn load_runtime_binding(now: OffsetDateTime) -> std::result::Result<RuntimeBinding, &'static str> {
     let account = FileAccountStore::default()
         .load()
         .map_err(|_| "account_state_unreadable")?;
@@ -3629,13 +3758,18 @@ fn load_runtime_binding() -> std::result::Result<RuntimeBinding, &'static str> {
     // can never receive one.
     let api_base_url =
         validated_api_base_url(&connection.api_base_url).map_err(|_| "api_base_url_refused")?;
-    let credential = read_codex_credential().ok_or("codex_sign_in_unavailable")?;
+    let login = logins::read_login(
+        &crate::agent_status::home_dir().join(".codex"),
+        ottto_core::CodexHomeTrust::ProviderDefault,
+        unix_seconds(now),
+    )
+    .map_err(logins::LoginSkip::code)?;
     Ok((
         Runtime {
             installation_id: device.device_id,
-            provider_account_scope: credential.account_scope.clone(),
+            provider_account_scope: login.credential.account_scope.clone(),
         },
-        credential,
+        login,
         api_base_url,
     ))
 }
@@ -3885,6 +4019,8 @@ fn atomic_json_write<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+pub(crate) mod logins;
 
 #[cfg(test)]
 mod tests;

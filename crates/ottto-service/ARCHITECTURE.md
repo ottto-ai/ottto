@@ -451,3 +451,19 @@ current same-owner HMAC scope, leaving consent revoked. Every authority, provide
 send and cache admission validates current local identity; identity changes close admission
 and drain admitted I/O before replacing account or device state. Older daemons
 receive disabled legacy authority and cannot upload through retired routes.
+
+## Codex daily provider reference
+
+With a live approval, `provider_daily_reference` reads the provider's own daily usage for a
+Codex login and uploads normalized scalar rows. A login is one secure read and one parse of
+its home's `auth.json`; the request token, `ChatGPT-Account-Id` header, attribution
+fingerprint and account identity all come from that parse. Expiry and identity come from the
+live access token; an id token only cross-checks the pair. A token lapsing within five minutes
+is never used, and credentials are never refreshed or written.
+
+Under the current disclosure every batch of one read carries the same optional
+`account_identity` (the account and workspace hashes Codex session evidence uses) and the
+same `collected_at`, empty batches included. The read's last covered day is always the last
+complete UTC day at that `collected_at`. `provider_daily_reference::tests::accounts` emits the
+producer fixtures in `fixtures/provider-daily-reference/`; the snapshots parity test emits the
+cross-language identity vectors.

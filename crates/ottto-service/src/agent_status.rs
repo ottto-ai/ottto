@@ -16178,31 +16178,31 @@ fn parse_codex_id_token_account(token: &str) -> Option<AgentAccountStatus> {
 /// token. Decoding a JWT never authenticates it; this names what the
 /// credential says, nothing more.
 fn codex_credential_claimed_ids(credentials: &CodexAuthCredentials) -> Option<(String, String)> {
-    let claims = structurally_valid_live_codex_jwt_claims(credentials.access_token.as_deref()?)?;
-    let auth_claim = claims.get("https://api.openai.com/auth");
-    let account_id = auth_claim
-        .and_then(|value| first_json_string(value, &["chatgpt_user_id", "user_id"]))
-        .or_else(|| first_json_string(&claims, &["sub"]))?;
-    let raw_workspace_id = auth_claim
-        .and_then(|value| first_json_string(value, &["chatgpt_account_id"]))
-        .or_else(|| first_json_string(&claims, &["chatgpt_account_id"]))?;
-    if credentials.account_id.as_deref() != Some(raw_workspace_id.as_str()) {
+    let ids = codex_jwt_claimed_ids(&structurally_valid_live_codex_jwt_claims(
+        credentials.access_token.as_deref()?,
+    )?)?;
+    if credentials.account_id.as_deref() != Some(ids.1.as_str()) {
         return None;
     }
     if let Some(id_token) = credentials.id_token.as_deref() {
-        let id_claims = structurally_valid_live_codex_jwt_claims(id_token)?;
-        let id_auth_claim = id_claims.get("https://api.openai.com/auth");
-        let id_account = id_auth_claim
-            .and_then(|value| first_json_string(value, &["chatgpt_user_id", "user_id"]))
-            .or_else(|| first_json_string(&id_claims, &["sub"]))?;
-        let id_workspace = id_auth_claim
-            .and_then(|value| first_json_string(value, &["chatgpt_account_id"]))
-            .or_else(|| first_json_string(&id_claims, &["chatgpt_account_id"]))?;
-        if id_account != account_id || id_workspace != raw_workspace_id {
+        if codex_jwt_claimed_ids(&structurally_valid_live_codex_jwt_claims(id_token)?)? != ids {
             return None;
         }
     }
-    Some((account_id, raw_workspace_id))
+    Some(ids)
+}
+
+/// The user and workspace ids a decoded Codex JWT names: the auth claim's
+/// user id (else `sub`) and its workspace (ChatGPT account) id.
+pub(crate) fn codex_jwt_claimed_ids(claims: &Value) -> Option<(String, String)> {
+    let auth_claim = claims.get("https://api.openai.com/auth");
+    let account_id = auth_claim
+        .and_then(|value| first_json_string(value, &["chatgpt_user_id", "user_id"]))
+        .or_else(|| first_json_string(claims, &["sub"]))?;
+    let workspace_id = auth_claim
+        .and_then(|value| first_json_string(value, &["chatgpt_account_id"]))
+        .or_else(|| first_json_string(claims, &["chatgpt_account_id"]))?;
+    Some((account_id, workspace_id))
 }
 
 /// When the binding a credential claims ([`codex_credential_claimed_binding`])
@@ -16377,6 +16377,15 @@ fn codex_access_token_email(claims: &Value) -> Option<String> {
 }
 
 fn structurally_valid_live_codex_jwt_claims(token: &str) -> Option<Value> {
+    let claims = structurally_valid_codex_jwt_claims(token)?;
+    let expires_at = claims.get("exp").and_then(Value::as_i64)?;
+    (expires_at > OffsetDateTime::now_utc().unix_timestamp()).then_some(claims)
+}
+
+/// The claims of a Codex JWT whose shape, algorithm, issuer and audience are
+/// plausible. Expiry is not checked here. Decoding never authenticates a
+/// token; it only names what the token says.
+pub(crate) fn structurally_valid_codex_jwt_claims(token: &str) -> Option<Value> {
     let mut segments = token.split('.');
     let header = segments.next()?;
     let payload = segments.next()?;
@@ -16405,10 +16414,6 @@ fn structurally_valid_live_codex_jwt_claims(token: &str) -> Option<Value> {
         _ => false,
     });
     if !has_audience {
-        return None;
-    }
-    let expires_at = claims.get("exp").and_then(Value::as_i64)?;
-    if expires_at <= OffsetDateTime::now_utc().unix_timestamp() {
         return None;
     }
     Some(claims)
