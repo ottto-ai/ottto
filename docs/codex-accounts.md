@@ -164,6 +164,15 @@ Canonicalization follows these rules:
 - a signed-out, mismatched, or unavailable sibling degrades source health but
   does not remove healthy subscription snapshots.
 
+A signed-in home whose limits were not read yet (`codex_quota_not_read_yet`
+or `codex_quota_background_refresh_off`) is `unverified`: still being
+checked, not a failed check. `identity_unknown` means a read did not yield a
+validated identity. When the provider read refused it, the slot row carries,
+after `codex_identity_unknown`, one code naming the failed check (for example
+`codex_identity_email_mismatch`, `codex_identity_plan_mismatch_account_read`
+or `codex_identity_plan_mismatch_rate_limits`); codes only, never the compared
+values. The saved reading keeps that code.
+
 Codex owns OAuth token persistence and refresh. Ottto does not refresh tokens
 directly and does not promise that a provider-revoked login will remain valid.
 When Codex reports that a durable home needs login, the app should offer the

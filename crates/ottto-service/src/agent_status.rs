@@ -199,6 +199,8 @@ struct CodexUsageProbe {
     /// The identity hashes of a saved reading, whose provider validation
     /// happened when it was read (see `codex_saved_quota`).
     saved_identity: Option<CodexIdentityHashes>,
+    /// The identity check that refused this read's identity, when one did.
+    identity_rejection: Option<CodexIdentityRejection>,
     credential_read_failed: bool,
     /// Completion of the app-server read, distinct from quota value changes.
     response_completed_at: Option<String>,
@@ -207,6 +209,61 @@ struct CodexUsageProbe {
     /// Counts-only view of the non-selected rate-limit pools (design C2a).
     rate_limit_pool_summary: Option<String>,
 }
+
+/// The check of [`codex_identity_check`] that refused a provider read's
+/// identity. Its code names the check only, never the compared values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CodexIdentityRejection {
+    NotProviderAuthenticated,
+    CredentialClaims,
+    AccountNotChatgpt,
+    EmailMissing,
+    EmailMismatch,
+    PlanMissing,
+    PlanMismatchAccountRead,
+    PlanMismatchRateLimits,
+    IdentityHash,
+}
+
+impl CodexIdentityRejection {
+    const ALL: [Self; 9] = [
+        Self::NotProviderAuthenticated,
+        Self::CredentialClaims,
+        Self::AccountNotChatgpt,
+        Self::EmailMissing,
+        Self::EmailMismatch,
+        Self::PlanMissing,
+        Self::PlanMismatchAccountRead,
+        Self::PlanMismatchRateLimits,
+        Self::IdentityHash,
+    ];
+
+    /// The diagnostic code, on the agent status and on the slot row alike.
+    pub(super) fn code(self) -> &'static str {
+        match self {
+            Self::NotProviderAuthenticated => "codex_identity_not_provider_authenticated",
+            Self::CredentialClaims => "codex_identity_credential_claims",
+            Self::AccountNotChatgpt => "codex_identity_account_not_chatgpt",
+            Self::EmailMissing => "codex_identity_email_missing",
+            Self::EmailMismatch => "codex_identity_email_mismatch",
+            Self::PlanMissing => "codex_identity_plan_missing",
+            Self::PlanMismatchAccountRead => "codex_identity_plan_mismatch_account_read",
+            Self::PlanMismatchRateLimits => "codex_identity_plan_mismatch_rate_limits",
+            Self::IdentityHash => "codex_identity_hash_unavailable",
+        }
+    }
+
+    pub(super) fn from_code(code: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|rejection| rejection.code() == code)
+    }
+}
+
+/// Fixed text for every [`CodexIdentityRejection`] diagnostic; the code names
+/// the failed check.
+const CODEX_IDENTITY_REJECTION_MESSAGE: &str =
+    "Codex did not confirm this login's identity; the code names the failed check.";
 
 /// Strong active Codex identity from one exact credential home. This type is
 /// intentionally neither `Debug` nor serializable because the raw workspace
@@ -3230,7 +3287,18 @@ fn codex_collection_status_from_snapshot(
     } else if account.is_some_and(|account| account.login_state == AgentLoginState::SignedIn)
         && (account_identifier_hash.is_none() || workspace_identifier_hash.is_none())
     {
-        CodexAccountSlotCollectionStateV1::IdentityUnknown
+        // Limits not read yet (or background refresh off) is a login still
+        // being checked, not a failed identity check.
+        if snapshot.diagnostics.iter().any(|diagnostic| {
+            matches!(
+                diagnostic.code.as_str(),
+                "codex_quota_not_read_yet" | "codex_quota_background_refresh_off"
+            )
+        }) {
+            CodexAccountSlotCollectionStateV1::Unverified
+        } else {
+            CodexAccountSlotCollectionStateV1::IdentityUnknown
+        }
     } else if account_identifier_hash.is_some()
         && workspace_identifier_hash.is_some()
         && has_fresh_quota
@@ -3244,11 +3312,25 @@ fn codex_collection_status_from_snapshot(
             code: "codex_account_needs_login".to_string(),
             message: "Codex must be signed in again for this durable connection.".to_string(),
         }],
-        CodexAccountSlotCollectionStateV1::IdentityUnknown => vec![CodexAccountSlotDiagnosticV1 {
-            code: "codex_identity_unknown".to_string(),
-            message: "Codex did not provide a complete active user and workspace identity."
-                .to_string(),
-        }],
+        CodexAccountSlotCollectionStateV1::IdentityUnknown => {
+            // `codex_identity_unknown` stays first: clients read the first code.
+            let mut diagnostics = vec![CodexAccountSlotDiagnosticV1 {
+                code: "codex_identity_unknown".to_string(),
+                message: "Codex did not provide a complete active user and workspace identity."
+                    .to_string(),
+            }];
+            diagnostics.extend(
+                snapshot
+                    .diagnostics
+                    .iter()
+                    .find_map(|diagnostic| CodexIdentityRejection::from_code(&diagnostic.code))
+                    .map(|rejection| CodexAccountSlotDiagnosticV1 {
+                        code: rejection.code().to_string(),
+                        message: CODEX_IDENTITY_REJECTION_MESSAGE.to_string(),
+                    }),
+            );
+            diagnostics
+        }
         CodexAccountSlotCollectionStateV1::ProviderUnavailable => {
             vec![CodexAccountSlotDiagnosticV1 {
                 code: "codex_quota_unavailable".to_string(),
@@ -3631,6 +3713,16 @@ fn collect_codex_status_for_home(
                 .as_ref()
                 .map(CodexIdentityHashes::from)
                 .or(usage.saved_identity);
+            if let Some(rejection) = usage
+                .identity_rejection
+                .filter(|_| identity_hashes.is_none())
+            {
+                snapshot.diagnostics.push(AgentStatusDiagnostic::source(
+                    rejection.code(),
+                    AgentDiagnosticSeverity::Info,
+                    CODEX_IDENTITY_REJECTION_MESSAGE,
+                ));
+            }
             strong_identity = usage.identity;
             if let Some(identity) = identity_hashes.as_ref() {
                 if let Some(account) = snapshot.account.as_mut() {
@@ -16345,34 +16437,60 @@ fn validated_codex_identity(
     rate_limits: Option<&Value>,
     provider_authenticated_active_credential: bool,
 ) -> Option<CodexStrongIdentity> {
+    codex_identity_check(
+        credentials,
+        provider_account,
+        rate_limits,
+        provider_authenticated_active_credential,
+    )
+    .ok()
+}
+
+/// [`validated_codex_identity`], naming the check that refused the identity.
+fn codex_identity_check(
+    credentials: &CodexAuthCredentials,
+    provider_account: Option<&Value>,
+    rate_limits: Option<&Value>,
+    provider_authenticated_active_credential: bool,
+) -> Result<CodexStrongIdentity, CodexIdentityRejection> {
+    use CodexIdentityRejection as Rejected;
     // Decoding a JWT never authenticates it. This flag is supplied only after
     // the provider has successfully used the active access token for the same
     // quota response. App-server does that after account/read refreshes the
     // credential; the default-only legacy fallback does it when the provider
     // accepts the access token and workspace header for its quota response.
     if !provider_authenticated_active_credential {
-        return None;
+        return Err(Rejected::NotProviderAuthenticated);
     }
-    let (account_id, raw_workspace_id) = codex_credential_claimed_ids(credentials)?;
-    let claims = structurally_valid_live_codex_jwt_claims(credentials.access_token.as_deref()?)?;
+    let (account_id, raw_workspace_id) =
+        codex_credential_claimed_ids(credentials).ok_or(Rejected::CredentialClaims)?;
+    let claims = credentials
+        .access_token
+        .as_deref()
+        .and_then(structurally_valid_live_codex_jwt_claims)
+        .ok_or(Rejected::CredentialClaims)?;
     let auth_claim = claims.get("https://api.openai.com/auth");
     if let Some(provider_account) = provider_account {
-        let active = provider_account.get("account")?;
+        let active = provider_account
+            .get("account")
+            .ok_or(Rejected::AccountNotChatgpt)?;
         if active.get("type").and_then(Value::as_str) != Some("chatgpt") {
-            return None;
+            return Err(Rejected::AccountNotChatgpt);
         }
-        let claim_email = codex_access_token_email(&claims)?;
-        let active_email = first_json_string(active, &["email"])?;
+        let claim_email = codex_access_token_email(&claims).ok_or(Rejected::EmailMissing)?;
+        let active_email = first_json_string(active, &["email"]).ok_or(Rejected::EmailMissing)?;
         if claim_email != active_email {
-            return None;
+            return Err(Rejected::EmailMismatch);
         }
         let claim_plan = auth_claim
             .and_then(|value| first_json_string(value, &["chatgpt_plan_type"]))
-            .map(normalize_plan_type)?;
-        let active_plan =
-            first_json_string(active, &["planType", "plan_type"]).map(normalize_plan_type)?;
+            .map(normalize_plan_type)
+            .ok_or(Rejected::PlanMissing)?;
+        let active_plan = first_json_string(active, &["planType", "plan_type"])
+            .map(normalize_plan_type)
+            .ok_or(Rejected::PlanMissing)?;
         if claim_plan != active_plan {
-            return None;
+            return Err(Rejected::PlanMismatchAccountRead);
         }
         if rate_limits
             .into_iter()
@@ -16381,7 +16499,7 @@ fn validated_codex_identity(
             .map(normalize_plan_type)
             .any(|plan| plan != active_plan)
         {
-            return None;
+            return Err(Rejected::PlanMismatchRateLimits);
         }
     }
     let superseded_account_identifier_hash =
@@ -16402,9 +16520,11 @@ fn validated_codex_identity(
         .and_then(|organization_id| {
             billing_identity_hash("openai", "organization", &organization_id)
         });
-    Some(CodexStrongIdentity {
-        account_identifier_hash: billing_identity_hash("openai", "account", &account_id)?,
-        workspace_identifier_hash: billing_identity_hash("openai", "workspace", &raw_workspace_id)?,
+    Ok(CodexStrongIdentity {
+        account_identifier_hash: billing_identity_hash("openai", "account", &account_id)
+            .ok_or(Rejected::IdentityHash)?,
+        workspace_identifier_hash: billing_identity_hash("openai", "workspace", &raw_workspace_id)
+            .ok_or(Rejected::IdentityHash)?,
         raw_workspace_id,
         superseded_account_identifier_hash,
         superseded_organization_identifier_hash,
@@ -16636,17 +16756,22 @@ fn codex_credit_binding(identity: &CodexStrongIdentity) -> String {
 fn codex_usage_probe_from_app_server_observation(
     observation: CodexAppServerObservation,
 ) -> CodexUsageProbe {
-    let identity = observation
+    let checked = observation
         .refreshed_credentials
         .as_ref()
-        .and_then(|credentials| {
-            validated_codex_identity(
+        .map(|credentials| {
+            codex_identity_check(
                 credentials,
                 Some(&observation.account),
                 Some(&observation.rate_limits),
                 true,
             )
         });
+    let (identity, identity_rejection) = match checked {
+        Some(Ok(identity)) => (Some(identity), None),
+        Some(Err(rejection)) => (None, Some(rejection)),
+        None => (None, None),
+    };
     let mut quota_windows = codex_app_server_quota_windows(&observation.rate_limits);
     for window in &mut quota_windows {
         window.observed_at = observation.response_completed_at.clone();
@@ -16681,6 +16806,7 @@ fn codex_usage_probe_from_app_server_observation(
         account: codex_app_server_account(&observation.account),
         identity,
         saved_identity: None,
+        identity_rejection,
         credential_read_failed: observation.credential_read_failed,
         response_completed_at: observation.response_completed_at,
         reset_credit_detail_summary,

@@ -82,7 +82,8 @@ use super::{
     codex_credential_claimed_binding, codex_credit_grants, codex_home_slots_checked,
     codex_last_known, current_unix_seconds, default_codex_home, empty_codex_accounts_status,
     mark_quota_meters_stale, read_codex_auth_credentials_at, read_codex_usage_from_provider,
-    unsupported_account, CodexHomeSlot, CodexIdentityHashes, CodexLoginRefresh, CodexUsageProbe,
+    unsupported_account, CodexHomeSlot, CodexIdentityHashes, CodexIdentityRejection,
+    CodexLoginRefresh, CodexUsageProbe,
 };
 
 /// In use on this Mac: one provider read per 5 min.
@@ -490,6 +491,10 @@ pub(super) struct SavedCodexReading {
     /// not bind the meters to an account (they are then never shown).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     identity: Option<CodexIdentityHashes>,
+    /// The code of the identity check that refused this read's identity
+    /// ([`CodexIdentityRejection::code`]); never the compared values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    identity_rejection: Option<String>,
     /// The provider named a signed-in ChatGPT account in this read.
     #[serde(default)]
     provider_account_signed_in: bool,
@@ -577,6 +582,9 @@ impl SavedCodexReading {
                 .as_ref()
                 .map(CodexIdentityHashes::from)
                 .or_else(|| probe.saved_identity.clone()),
+            identity_rejection: probe
+                .identity_rejection
+                .map(|rejection| rejection.code().to_string()),
             provider_account_signed_in: probe.account.is_some(),
             plan_type: probe
                 .account
@@ -610,6 +618,10 @@ impl SavedCodexReading {
             account,
             identity: None,
             saved_identity: self.identity.clone(),
+            identity_rejection: self
+                .identity_rejection
+                .as_deref()
+                .and_then(CodexIdentityRejection::from_code),
             credential_read_failed: self.credential_read_failed,
             response_completed_at: self.response_completed_at.clone(),
             reset_credit_detail_summary: self.reset_credit_detail_summary.clone(),
@@ -1956,6 +1968,7 @@ mod tests {
                 superseded_account_identifier_hash: Some("old-account".to_string()),
                 superseded_organization_identifier_hash: None,
             }),
+            identity_rejection: None,
             credential_read_failed: false,
             response_completed_at: Some(observed_at.to_string()),
             reset_credit_detail_summary: Some("Codex reset details: count 2.".to_string()),
