@@ -289,6 +289,7 @@ impl FileCodexAccountSlotSettingsStore {
             ));
         }
         self.discard_pending_open_slot(&mut persisted)?;
+        self.settle_pending_adoption(&persisted)?;
         self.discard_setup_staging_best_effort(&persisted);
 
         let (slot_id, home) = self.create_managed_slot_home()?;
@@ -427,6 +428,7 @@ impl FileCodexAccountSlotSettingsStore {
         // An open setup that ended before adoption may still hold its
         // reservation; this setup replaces it, as `prepare_open_account` does.
         self.discard_pending_open_slot(&mut persisted)?;
+        self.settle_pending_adoption(&persisted)?;
         self.discard_setup_staging_best_effort(&persisted);
         // The sign-in runs in a staging home: an existing slot's home is left
         // as it is until the new login is accepted.
@@ -525,6 +527,7 @@ impl FileCodexAccountSlotSettingsStore {
         // An open setup that ended before adoption may still hold its
         // reservation; the reconnect replaces it, as `prepare_open_account` does.
         self.discard_pending_open_slot(&mut persisted)?;
+        self.settle_pending_adoption(&persisted)?;
         self.discard_setup_staging_best_effort(&persisted);
         // The current login stays in the slot's home until the new one is
         // accepted: a stopped, failed or mismatched sign-in leaves it as is.
@@ -1264,6 +1267,39 @@ impl FileCodexAccountSlotSettingsStore {
         }
     }
 
+    /// Before a new setup replaces a completed one: its accepted login, if
+    /// still set aside, must reach the slot's home, or the new setup is
+    /// refused (discarding the staging home would delete that login).
+    fn settle_pending_adoption(
+        &self,
+        persisted: &PersistedCodexAccountSlotsV1,
+    ) -> Result<(), CodexAccountSlotSettingsError> {
+        let operation = &persisted.setup_operation;
+        let Some(slot_id) = operation.slot_id.as_deref() else {
+            return Ok(());
+        };
+        if operation.state != CodexAccountSetupOperationStateV1::Complete
+            || !setup_uses_staging(operation)
+            || !persisted
+                .managed_slot_ids
+                .iter()
+                .any(|candidate| candidate == slot_id)
+        {
+            return Ok(());
+        }
+        move_sealed_login(
+            &self
+                .slot_root_unchecked(slot_id)?
+                .join(SIGN_IN_STAGING_DIR_NAME),
+            &self.slot_home(slot_id)?,
+        )
+        .map_err(|error| {
+            CodexAccountSlotSettingsError::State(format!(
+                "move the accepted Codex login into its home: {error}"
+            ))
+        })
+    }
+
     /// Settle a setup's staging home after a restart or an upgrade: finish
     /// the move of a completed setup's accepted login (or remove its leftover
     /// staging home), and stop a named setup that waits for, or validates, a
@@ -1948,6 +1984,11 @@ fn move_sealed_login(staging: &Path, home: &Path) -> std::io::Result<()> {
     use std::ffi::CString;
     use std::os::fd::AsRawFd;
 
+    if let Err(error) = fs::symlink_metadata(staging.join(SEALED_LOGIN_FILE_NAME)) {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(());
+        }
+    }
     let from = match open_private_directory_chain(staging) {
         Ok(from) => from,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -3532,7 +3573,7 @@ mod tests {
     }
 
     #[test]
-    fn an_accepted_login_a_crash_left_aside_moves_on_load() {
+    fn an_accepted_login_a_crash_left_aside_moves_before_anything_else() {
         let (root, store) = test_store("adoption-roll-forward");
         let slot_id = complete_a_reconnect(&store);
         let home = store.slot_home(&slot_id).expect("home");
@@ -3555,6 +3596,23 @@ mod tests {
         assert_eq!(
             fs::read(home.join("auth.json")).expect("moved login"),
             b"{\"synthetic\":\"set-aside\"}"
+        );
+        assert!(!staging.exists(), "staging home removed");
+
+        // A new setup moves a set-aside login first, never deletes it.
+        fs::create_dir(&staging).expect("staging home");
+        set_mode(&staging, 0o700);
+        fs::write(&sealed, b"{\"synthetic\":\"set-aside-again\"}").expect("set-aside login");
+        set_mode(&sealed, 0o600);
+        store
+            .prepare_open_account(
+                CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
+                format!("codex_setup_{}", "4".repeat(32)),
+            )
+            .expect("next setup");
+        assert_eq!(
+            fs::read(home.join("auth.json")).expect("moved login"),
+            b"{\"synthetic\":\"set-aside-again\"}"
         );
         assert!(!staging.exists(), "staging home removed");
         let _ = fs::remove_dir_all(root);
