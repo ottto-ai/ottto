@@ -45,6 +45,11 @@ enum Answer {
     /// `unchanged` with an `unchanged_basis`: the server did not store it.
     Unstored,
     Conflict,
+    /// Upload outages: a plain `503` with no `Retry-After`, an HTTP `500`,
+    /// and a connection closed with no response.
+    Shed,
+    ServerError,
+    Dropped,
 }
 
 struct ReofferServer {
@@ -146,6 +151,19 @@ impl ReofferServer {
                 } else if let Some(items) = value.get("snapshots").and_then(|v| v.as_array()) {
                     assert!(!items.is_empty());
                     bodies.lock().unwrap().extend(items.iter().cloned());
+                    let outage = match *current.lock().unwrap() {
+                        Answer::Shed => Some("503 Service Unavailable"),
+                        Answer::ServerError => Some("500 Internal Server Error"),
+                        Answer::Dropped => {
+                            drop(stream);
+                            continue;
+                        }
+                        _ => None,
+                    };
+                    if let Some(status) = outage {
+                        bounded_native_response(&mut stream, status, "{}");
+                        continue;
+                    }
                     let references = items
                         .iter()
                         .map(|item| {
@@ -193,6 +211,9 @@ impl ReofferServer {
                         }
                         Answer::Conflict => {
                             outcome["conflict_entities"] = references.into();
+                        }
+                        Answer::Shed | Answer::ServerError | Answer::Dropped => {
+                            unreachable!("answered above")
                         }
                     }
                     outcome
@@ -2765,6 +2786,113 @@ fn held_probe_rearm_keeps_uncovered_and_aligned_files() {
             index.files[&key].last_snapshot_fingerprint.is_none(),
             expected == 1
         );
+    }
+}
+
+/// [regress] [money] An upload outage keeps the read. A page whose upload
+/// ends in a plain shed, an HTTP 500 or a dropped connection holds its
+/// unACKed body in retryable custody, so the file and its head commit. The
+/// due recovery pass, with or without a restart, restores the file instead of
+/// reading it in full and re-sends the same body, which is ACKed exactly. The
+/// outage records no ACK, refusal or poison loss. Without the custody the
+/// recovery pass reads the whole file again.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests)]
+#[serial(client_report)]
+fn upload_outage_keeps_the_read_and_resends_from_the_head() {
+    use super::prior_index_lifetime_tests::Guard as RetryClock;
+    if !supported("upload_outage_keeps_the_read_and_resends_from_the_head") {
+        return;
+    }
+    for outage in [Answer::Shed, Answer::ServerError, Answer::Dropped] {
+        for restart in [false, true] {
+            let label = format!("{outage:?} restart={restart}");
+            let t0 = current_unix_seconds();
+            let mut pipeline = ReofferPipeline::new("outage-custody", outage, t0);
+            // Larger than the bounded certificate samples, so the bytes read
+            // tell a restore from a Full read.
+            use std::io::Write as _;
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(pipeline.transcript())
+                .unwrap()
+                .write_all((" ".repeat(32 * 1024) + "{}\n").as_bytes())
+                .unwrap();
+            #[cfg(unix)]
+            pipeline.hold_state_dir_lock();
+            let size = std::fs::metadata(pipeline.transcript()).unwrap().len();
+            let (first, _) = with_inplace_retry_test_clock(None, || pipeline.cycle(t0));
+            let sent = pipeline.server.offered();
+            assert!(!sent.is_empty(), "{label}: the outage page POSTs");
+            let fingerprint = fingerprint_of(&sent[0]);
+            // The custody's backoff has passed: its retry is due.
+            let mut index = ScanIndex::load(&first.index_path).unwrap();
+            if let Some(record) = index
+                .quarantined_snapshot_fingerprints
+                .get_mut(&fingerprint)
+            {
+                record.retry_after_unix_seconds = 0;
+                index.save(&first.index_path).unwrap();
+            }
+            pipeline.server.answer(Answer::Accept);
+            let (recovery, _, bytes) = {
+                let _clock = RetryClock::new(false, None, Some(t0 + 3_600));
+                pipeline.measured_cycle(t0 + 3_600, restart)
+            };
+            assert!(recovery.result.is_ok(), "{label}: {:?}", recovery.result);
+            assert!(
+                bytes < size,
+                "{label}: restored, not read in full: {bytes} >= {size}"
+            );
+            let offered = pipeline.server.offered();
+            let resent = &offered[sent.len()..];
+            assert!(!resent.is_empty(), "{label}: the recovery pass re-sends");
+            for body in resent {
+                assert_eq!(
+                    fingerprint_of(body),
+                    fingerprint,
+                    "{label}: the same entity"
+                );
+                assert_eq!(
+                    body["semantic_envelope"], sent[0]["semantic_envelope"],
+                    "{label}: the same money and placement"
+                );
+                assert_eq!(usage_of(body), usage_of(&sent[0]), "{label}");
+            }
+            assert!(
+                recovery
+                    .index
+                    .accepted_snapshot_fingerprint_recorded(&fingerprint),
+                "{label}: exact ACK"
+            );
+            assert!(
+                !recovery
+                    .progress
+                    .quarantined_fingerprints
+                    .contains_key(&fingerprint),
+                "{label}: the ACK clears the custody"
+            );
+            // The outage itself held the body without an ACK, refusal or loss.
+            assert!(
+                !first.progress.accepted_fingerprints.contains(&fingerprint),
+                "{label}: no ACK invented"
+            );
+            assert!(
+                first.progress.permanent_rejections.is_empty(),
+                "{label}: no refusal"
+            );
+            assert_eq!(
+                first.progress.quarantined_fingerprints[&fingerprint].disposition,
+                SnapshotQuarantineDisposition::RetryPending,
+                "{label}: outage custody"
+            );
+            assert!(
+                !counted_poison_fingerprints_for_test(SnapshotSource::ClaudeCode.api_slug())
+                    .contains(&fingerprint),
+                "{label}: no poison loss"
+            );
+        }
     }
 }
 
