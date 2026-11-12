@@ -32,6 +32,15 @@ fn first_read_latch_new_destination_full_claim_money_oracle() {
             if restart {
                 crate::snapshots::restart_claude_reemission_stop_for_test();
             }
+            assert!(
+                !claude_destination_history_here(
+                    &load_backfill_state(&fixture.support),
+                    "new-destination",
+                    &test_upload_progress(),
+                    &fixture.index_path_for(Some("new-destination")),
+                ),
+                "a new claim has no completed, attested or quarantined history"
+            );
             let outcome = fixture.cycle(
                 "2026-08-02T09:00:00Z",
                 HistoryCycle {

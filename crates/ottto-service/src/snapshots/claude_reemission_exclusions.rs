@@ -485,8 +485,8 @@ pub(crate) fn with_no_list_cutoff<T>(cutoff: u64, f: impl FnOnce() -> T) -> T {
 // does not clear it; a restart is the human reset. In memory only, process-wide
 // across Claude destinations. One local alarm when it sets, at most one
 // reminder an hour while it holds.
-// An empty generation-0 index loaded while the exclusion seen-marker exists
-// also latches it, including a quarantined index or a new pairing destination.
+// An empty generation-0 index with this destination's own history also latches
+// it while the exclusion seen-marker exists. A new destination alone does not.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum ClaudeReemissionStopCause {
     EvidenceBound,
