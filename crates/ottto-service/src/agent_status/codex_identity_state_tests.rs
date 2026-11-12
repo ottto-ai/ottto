@@ -244,3 +244,117 @@ fn codex_valid_identity_and_accepted_rows_are_unchanged() {
 
     let _ = std::fs::remove_dir_all(root);
 }
+
+/// Every refusal of the identity check names its check; the accepted
+/// identity is exactly the one `validated_codex_identity` accepts.
+#[test]
+fn codex_identity_check_names_each_refused_check() {
+    use CodexIdentityRejection as Rejected;
+
+    let expires_at = OffsetDateTime::now_utc().unix_timestamp() + 3600;
+    let token = |workspace: &str| {
+        synthetic_codex_jwt(
+            "synthetic-user",
+            workspace,
+            "synthetic-account",
+            "pro",
+            expires_at,
+        )
+    };
+    let credentials = CodexAuthCredentials {
+        access_token: Some(token("synthetic-workspace")),
+        id_token: Some(token("synthetic-workspace")),
+        account_id: Some("synthetic-workspace".to_string()),
+    };
+    let account = |kind: &str, email: &str, plan: &str| {
+        serde_json::json!({
+            "account": {"type": kind, "email": email, "planType": plan},
+            "requiresOpenaiAuth": true
+        })
+    };
+    let limits = |plan: &str| {
+        serde_json::json!({
+            "rateLimits": {
+                "limitId": "synthetic-limit",
+                "planType": plan,
+                "primary": {"usedPercent": 25, "windowDurationMins": 300}
+            }
+        })
+    };
+    let check = |credentials: &CodexAuthCredentials, account: &Value, limits: &Value, auth| {
+        codex_identity_check(credentials, Some(account), Some(limits), auth).err()
+    };
+    let valid = account("chatgpt", "synthetic-account", "pro");
+
+    assert_eq!(check(&credentials, &valid, &limits("pro"), true), None);
+    assert!(
+        validated_codex_identity(&credentials, Some(&valid), Some(&limits("pro")), true).is_some()
+    );
+    let mut split = credentials.clone();
+    split.id_token = Some(token("synthetic-workspace-b"));
+    for (refused, expected) in [
+        (
+            check(&credentials, &valid, &limits("pro"), false),
+            Rejected::NotProviderAuthenticated,
+        ),
+        (
+            check(&split, &valid, &limits("pro"), true),
+            Rejected::CredentialClaims,
+        ),
+        (
+            check(
+                &credentials,
+                &account("apiKey", "synthetic-account", "pro"),
+                &limits("pro"),
+                true,
+            ),
+            Rejected::AccountNotChatgpt,
+        ),
+        (
+            check(
+                &credentials,
+                &account("chatgpt", "other-account", "pro"),
+                &limits("pro"),
+                true,
+            ),
+            Rejected::EmailMismatch,
+        ),
+        (
+            check(
+                &credentials,
+                &account("chatgpt", "synthetic-account", "plus"),
+                &limits("pro"),
+                true,
+            ),
+            Rejected::PlanMismatchAccountRead,
+        ),
+        (
+            check(&credentials, &valid, &limits("plus"), true),
+            Rejected::PlanMismatchRateLimits,
+        ),
+    ] {
+        assert_eq!(refused, Some(expected));
+    }
+
+    // Codes round-trip, stay distinct and carry no values.
+    let codes = CodexIdentityRejection::ALL.map(CodexIdentityRejection::code);
+    assert_eq!(
+        codes
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        codes.len()
+    );
+    for rejection in CodexIdentityRejection::ALL {
+        assert_eq!(
+            CodexIdentityRejection::from_code(rejection.code()),
+            Some(rejection)
+        );
+        assert!(rejection.code().starts_with("codex_identity_"));
+        assert_ne!(rejection.code(), "codex_identity_unknown");
+    }
+    assert_eq!(
+        CodexIdentityRejection::from_code("codex_identity_unknown"),
+        None
+    );
+}
