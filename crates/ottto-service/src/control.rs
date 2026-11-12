@@ -17872,7 +17872,9 @@ for line in sys.stdin:
         .to_string()
     }
 
-    /// A fake `codex` for the daemon-run sign-in. `login` follows the mode in
+    /// A fake `codex` for the daemon-run sign-in. `login` first deletes
+    /// `$CODEX_HOME/auth.json`, as the real CLI revokes and deletes the
+    /// home's login before the browser opens, then follows the mode in
     /// `<bin>/login-mode`:
     /// - `success`: prints the sign-in address, writes `<bin>/auth-body` to
     ///   `$CODEX_HOME/auth.json`, prints the success line and exits 0;
@@ -17911,6 +17913,10 @@ args = sys.argv[1:]
 if args == ["login"]:
     with open(os.path.join(BIN, "login-runs"), "a") as f:
         f.write("%d\n" % os.getpid())
+    try:
+        os.remove(os.path.join(os.environ["CODEX_HOME"], "auth.json"))
+    except FileNotFoundError:
+        pass
     mode = read("login-mode").strip()
     if mode == "fail":
         sys.exit(1)
@@ -18569,6 +18575,191 @@ for line in sys.stdin:
             Some(slot_id.as_str())
         );
         assert!(home.join("auth.json").is_file());
+    }
+
+    /// The staging home a sign-in for a registered slot runs in.
+    #[cfg(unix)]
+    fn sign_in_staging_home(slot_home: &Path) -> PathBuf {
+        slot_home.parent().expect("slot root").join("sign-in")
+    }
+
+    /// A synthetic credential for the fixture's account, unlike any other.
+    #[cfg(unix)]
+    fn synthetic_codex_auth_until(user: &str, workspace: &str, later_secs: i64) -> String {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_secs() as i64;
+        synthetic_codex_auth_with_claims(user, workspace, now + later_secs)
+    }
+
+    /// `codex login` revokes and deletes the login of the home it runs in
+    /// before the browser opens. A reconnect therefore signs in in a staging
+    /// home: a stopped or timed-out sign-in leaves the slot's login byte for
+    /// byte, removes the staging home and keeps the connection. A new
+    /// account ("+") still signs in in its own new home.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_daemon_reconnect_stopped_or_timed_out_keeps_the_slots_login() {
+        let fixture = SignInFixture::new("codex-sign-in-keeps-login", Duration::from_secs(3));
+        let (slot_id, home, account, workspace) = fixture.connected_account(SIGN_IN_OPERATION);
+        let staging = sign_in_staging_home(&home);
+        assert!(!staging.exists(), "a new account signs in in its own home");
+        assert_eq!(fixture.app_server_runs_for(&home), 2);
+        let credential = fs::read(home.join("auth.json")).expect("synthetic credential");
+
+        fixture.set("login-mode", "wait");
+        for (index, stop) in [true, false].into_iter().enumerate() {
+            let operation = format!("codex_setup_{:032}", index + 1);
+            reconnect_codex_account(
+                1,
+                operation.clone(),
+                &slot_id,
+                account.clone(),
+                workspace.clone(),
+            )
+            .expect("reconnect");
+            start_codex_sign_in(1, &operation).expect("start sign-in");
+            fixture.waiting_for_browser();
+            if stop {
+                stop_waiting_for_codex_account(1, &operation).expect("stop");
+            }
+            let ended = fixture.ended();
+            assert_eq!(
+                sign_in_outcome(&ended),
+                Some(if stop {
+                    ottto_protocol::CodexAccountSignInOutcomeV1::Cancelled
+                } else {
+                    ottto_protocol::CodexAccountSignInOutcomeV1::TimedOut
+                }),
+                "stop {stop}"
+            );
+            assert_eq!(
+                fs::read(home.join("auth.json")).ok().as_ref(),
+                Some(&credential),
+                "stop {stop}: the slot's login is unchanged"
+            );
+            assert!(!staging.exists(), "stop {stop}: staging home removed");
+            let bindings = FileCodexAccountSlotSettingsStore::default()
+                .registered_bindings()
+                .expect("bindings");
+            assert!(bindings.iter().any(|binding| binding.slot_id == slot_id
+                && binding.accepted
+                && binding.account_identifier_hash == account
+                && binding.workspace_identifier_hash == workspace));
+        }
+        assert_eq!(fixture.login_pids().len(), 3);
+    }
+
+    /// A reconnect signed into another account: `identity_mismatch`, the
+    /// slot's login and identity stay as they were, and the wrong login is
+    /// deleted with its staging home.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_daemon_reconnect_into_another_account_keeps_the_slots_login() {
+        let fixture = SignInFixture::new("codex-sign-in-mismatch-keeps", Duration::from_secs(60));
+        let (slot_id, home, account, workspace) = fixture.connected_account(SIGN_IN_OPERATION);
+        let staging = sign_in_staging_home(&home);
+        let credential = fs::read(home.join("auth.json")).expect("synthetic credential");
+        fixture.set(
+            "auth-body",
+            &synthetic_codex_auth_until("synthetic-other-user", "synthetic-other", 24 * 60 * 60),
+        );
+
+        let operation = "codex_setup_1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a";
+        reconnect_codex_account(
+            1,
+            operation.to_string(),
+            &slot_id,
+            account.clone(),
+            workspace.clone(),
+        )
+        .expect("reconnect");
+        start_codex_sign_in(1, operation).expect("start sign-in");
+        let ended = fixture.ended();
+        assert_eq!(
+            sign_in_outcome(&ended),
+            Some(ottto_protocol::CodexAccountSignInOutcomeV1::IdentityMismatch)
+        );
+        assert_eq!(
+            fs::read(home.join("auth.json")).ok().as_ref(),
+            Some(&credential),
+            "the slot's login is unchanged"
+        );
+        assert!(
+            !staging.join("auth.json").exists(),
+            "the wrong login is deleted"
+        );
+        let bindings = FileCodexAccountSlotSettingsStore::default()
+            .registered_bindings()
+            .expect("bindings");
+        assert!(bindings.iter().any(|binding| binding.slot_id == slot_id
+            && binding.accepted
+            && binding.account_identifier_hash == account
+            && binding.workspace_identifier_hash == workspace));
+
+        stop_waiting_for_codex_account(1, operation).expect("stop");
+        assert!(!staging.exists(), "staging home removed");
+        assert_eq!(
+            fs::read(home.join("auth.json")).ok().as_ref(),
+            Some(&credential)
+        );
+    }
+
+    /// A reconnect that signs in and is accepted moves the new login into
+    /// the slot's home; the account reads checked the staging home, which is
+    /// then removed.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn codex_daemon_reconnect_moves_the_accepted_login_into_the_slot() {
+        let fixture = SignInFixture::new("codex-sign-in-reconnect-moves", Duration::from_secs(60));
+        let (slot_id, home, account, workspace) = fixture.connected_account(SIGN_IN_OPERATION);
+        let staging = sign_in_staging_home(&home);
+        let renewed =
+            synthetic_codex_auth_until("synthetic-user", "synthetic-workspace", 2 * 24 * 60 * 60);
+        assert_ne!(
+            fs::read_to_string(home.join("auth.json")).expect("credential"),
+            renewed
+        );
+        fixture.set("auth-body", &renewed);
+
+        let operation = "codex_setup_2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b";
+        reconnect_codex_account(
+            1,
+            operation.to_string(),
+            &slot_id,
+            account.clone(),
+            workspace.clone(),
+        )
+        .expect("reconnect");
+        start_codex_sign_in(1, operation).expect("start sign-in");
+        let ended = fixture.ended();
+        assert_eq!(
+            sign_in_outcome(&ended),
+            Some(ottto_protocol::CodexAccountSignInOutcomeV1::Complete)
+        );
+        assert_eq!(
+            ended.setup_operation.state,
+            CodexAccountSetupOperationStateV1::Complete
+        );
+        assert_eq!(
+            fs::read_to_string(home.join("auth.json")).expect("new credential"),
+            renewed
+        );
+        let config = fs::read_to_string(home.join("config.toml")).expect("config");
+        assert!(config.contains("forced_chatgpt_workspace_id = \"synthetic-workspace\""));
+        assert_eq!(fixture.app_server_runs_for(&staging), 2);
+        assert!(!staging.exists(), "staging home removed");
+        let bindings = FileCodexAccountSlotSettingsStore::default()
+            .registered_bindings()
+            .expect("bindings");
+        assert!(bindings.iter().any(|binding| binding.slot_id == slot_id
+            && binding.accepted
+            && binding.account_identifier_hash == account
+            && binding.workspace_identifier_hash == workspace));
     }
 
     /// The real `codex` is a wrapper whose child listens on the port. A
