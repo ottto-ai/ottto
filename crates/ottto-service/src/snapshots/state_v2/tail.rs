@@ -18,6 +18,10 @@ const HEADER_PAGE: usize = 128;
 const HEAD: &str = "tail.head";
 const FRAG: &str = "tail.frag";
 const SET_ASIDE: &str = "tail.set_aside";
+/// The first read's import list (layout 8): one member row per file plus one
+/// summary row. Never a file's own row: no settle, retire, reset or erasure of
+/// the file's head deletes it; its owner reclassifies and finally clears it.
+const FIRST_READ: &str = "tail.first_read";
 /// The row holds the logical value itself.
 const INLINE: u32 = 1;
 /// The row holds (length, fragment count, SHA-256); `tail.frag` holds the bytes.
@@ -30,12 +34,12 @@ pub(super) fn version_supported(version: u32) -> bool {
 pub(super) fn owned(key: &RowKey) -> bool {
     matches!(key, RowKey::Record { kind, .. } if kind.name().starts_with("tail."))
 }
-/// Freshness bookkeeping: heads, revisions, set-aside markers and the discovery
-/// stamp. Never charged to the save target that sizes the next collection page;
+/// Freshness bookkeeping: heads, revisions, set-aside markers, the first-read
+/// import list and the discovery stamp. Never charged to the save target that sizes the next collection page;
 /// reduction pages and fragments are.
 pub(super) fn bookkeeping(key: &RowKey) -> bool {
     matches!(key, RowKey::Record { kind, .. }
-        if matches!(kind.name(), HEAD | REVISION | SET_ASIDE | "scan_state.tail_discovery"))
+        if matches!(kind.name(), HEAD | REVISION | SET_ASIDE | FIRST_READ | "scan_state.tail_discovery"))
 }
 
 /// Paged collections, in `catalogue::TAIL_KINDS` order. `Revisions` is the
@@ -915,12 +919,12 @@ fn purge(tx: &mut dyn Transaction, rows: Vec<Header>) -> Result<bool> {
     Ok(true)
 }
 const REVISION: &str = "tail.revision";
-/// Every row of the file except its marker; with `keep_debt`, its revisions and
-/// their fragments stay too.
+/// Every row of the file except its marker and its first-read member; with
+/// `keep_debt`, its revisions and their fragments stay too.
 fn delete_rows(tx: &mut dyn Transaction, file: &[u8], keep_debt: bool) -> Result<()> {
     for name in catalogue::TAIL_KINDS
         .iter()
-        .filter(|k| !(matches!(**k, SET_ASIDE | FRAG) || keep_debt && **k == REVISION))
+        .filter(|k| !(matches!(**k, SET_ASIDE | FRAG | FIRST_READ) || keep_debt && **k == REVISION))
     {
         let kind = RecordKind::parse(name)?;
         loop {

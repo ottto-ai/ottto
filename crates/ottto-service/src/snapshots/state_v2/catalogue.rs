@@ -190,6 +190,7 @@ pub(super) const LAYOUTS_HISTORY: &[(u32, &str)] = &[
     (5, "folder login ledger + tail revision + head envelope"),
     (6, "upload context proof stamps one row per entity"),
     (7, "upload progress rows"),
+    (8, "first-read import list"),
 ];
 pub(super) const LAYOUT: u32 = LAYOUTS_HISTORY[LAYOUTS_HISTORY.len() - 1].0;
 pub(super) const LAYOUTS: &[(&str, &str, u32)] = scan_index_fields!(layouts);
@@ -215,12 +216,17 @@ pub(super) const TAIL_KINDS: &[&str] = &[
     "tail.head",
     "tail.frag",
     "tail.set_aside",
+    "tail.first_read",
 ];
 /// The Tail store's own layout. A Tail-only exit commit raises a store to this
 /// layout at most, never to a later one whose graph roots it does not write.
 pub(super) const TAIL_LAYOUT: u32 = 4;
 /// Tail kinds added after the Tail store, each at its own layout.
-const TAIL_LATER: &[(&str, u32)] = &[("tail.revision", 5), ("tail.page.session_facts", 5)];
+const TAIL_LATER: &[(&str, u32)] = &[
+    ("tail.revision", 5),
+    ("tail.page.session_facts", 5),
+    ("tail.first_read", 8),
+];
 /// Owner-local upload progress: closed kinds owned by `progress.rs`, committed
 /// by their own `progress_generation`, never by the graph's. No `ScanIndex`
 /// field, never a row of `enumerate` or a graph baseline, and no private-path
@@ -375,6 +381,7 @@ mod tests {
         assert_eq!(introduced("tail.revision").unwrap(), 5);
         assert_eq!(introduced("tail.page.session_facts").unwrap(), 5);
         assert_eq!(introduced("proof.upload_context").unwrap(), 6);
+        assert_eq!(introduced("tail.first_read").unwrap(), 8);
         assert!(TAIL_LATER.iter().all(|(k, _)| TAIL_KINDS.contains(k)));
         // An unversioned store's inventory never names a layout-5 field, so its
         // inferred layout stays below 5 (Tail kinds are not in LAYOUTS at all).

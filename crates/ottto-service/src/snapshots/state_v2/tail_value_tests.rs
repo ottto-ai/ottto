@@ -137,3 +137,28 @@ fn unchanged_compressed_rewrite_does_not_churn_rows() {
     assert_eq!(tx.get(&old_key).unwrap().unwrap(), old);
     assert_eq!(read_value(&mut tx, b"file", 1, 1, &old).unwrap(), raw);
 }
+
+/// [format] A first-read member row (layout 8) is never one of the file's own
+/// rows: deleting the file's rows for a settle, a retire or an erasure keeps
+/// it, and it is freshness bookkeeping that never sizes a save.
+#[test]
+fn first_read_member_survives_every_file_row_deletion() {
+    let scratch = crate::test_scratch::ScratchDir::canonical("tail-first-read-kept");
+    let mut db = sqlite::Sqlite::create_import(&scratch.join("index.v2.sqlite.import")).unwrap();
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    let file = b"/synthetic/first-read/file.jsonl";
+    let member = row(FIRST_READ, file, 0).unwrap();
+    assert!(bookkeeping(&member));
+    assert!(owned(&member));
+    for keep_debt in [false, true] {
+        put_inline(&mut tx, &member, b"member").unwrap();
+        let head = row(HEAD, file, 0).unwrap();
+        put_inline(&mut tx, &head, b"head").unwrap();
+        delete_rows(&mut tx, file, keep_debt).unwrap();
+        assert!(tx.get(&head).unwrap().is_none(), "{keep_debt}");
+        let kept = tx.get(&member).unwrap().expect("member kept");
+        assert_eq!(read_inline(&mut tx, &kept).unwrap(), b"member");
+    }
+    assert_eq!(catalogue::introduced(FIRST_READ).unwrap(), 8);
+    assert_eq!(catalogue::group(FIRST_READ), Some(catalogue::Group::Tail));
+}
