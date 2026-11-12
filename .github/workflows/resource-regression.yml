@@ -38,16 +38,6 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Resource disclosure
-        if: github.event_name == 'pull_request'
-        env:
-          PR_BODY: ${{ github.event.pull_request.body }}
-        run: |
-          if ! printf '%s\n' "$PR_BODY" | grep -Eq '^Resource:[[:space:]]+[^[:space:]]'; then
-            echo 'error: daemon changes need a nonblank Resource: line in the PR body'
-            exit 1
-          fi
-
       - name: Resource scorecard contracts
         run: |
           python3 scripts/test_resource_scorecard.py
@@ -85,3 +75,13 @@ jobs:
           time cargo test -p ottto-service --locked --lib snapshots::resource_fixture::resource_hint_active_drain -- --exact --ignored --nocapture --test-threads=1
           time cargo test -p ottto-service --locked --lib snapshots::resource_fixture:: -- --ignored --skip snapshots::resource_fixture::native_qos:: --skip snapshots::resource_fixture::resource_hint_active_drain --nocapture --test-threads=1
           time cargo test -p ottto-service --locked --lib agent_status::tests::cli_metadata_tests::resource_cli_metadata_ -- --ignored --nocapture --test-threads=1
+
+      - name: Resource disclosure
+        if: always() && github.event_name == 'pull_request'
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          if ! printf '%s\n' "$PR_BODY" | grep -Eq '^Resource:[[:space:]]+[^[:space:]]'; then
+            echo 'error: daemon changes need a nonblank Resource: line in the PR body'
+            exit 1
+          fi

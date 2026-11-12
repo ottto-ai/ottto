@@ -280,7 +280,14 @@ jobs:
             echo "Stable-candidate RC evidence is missing candidate_manifest.sha256." >&2
             exit 1
           fi
-          python3 scripts/resource_scorecard.py dist/macos/stable-candidate-rc-qa.json > /dev/null
+          # The template's unfilled placeholder is not a supplied sampler scorecard.
+          if jq -e '.resource_scorecard != null and .resource_scorecard != {
+            schema_version: 1, policy: "resource-stage1-v1", status: "not_run"
+          }' dist/macos/stable-candidate-rc-qa.json > /dev/null; then
+            python3 scripts/resource_scorecard.py dist/macos/stable-candidate-rc-qa.json > /dev/null
+          else
+            echo "resource scorecard: absent"
+          fi
           jq -e --slurpfile evidence dist/macos/stable-candidate-rc-qa.json \
             '.commit == $evidence[0].candidate_manifest.commit' dist/macos/release-manifest.json > /dev/null
           jq \

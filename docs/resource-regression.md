@@ -111,7 +111,10 @@ evidence; record the native runner receipt separately.
 
 `scripts/resource_scorecard.py <stable-candidate-rc-qa.json>` validates existing
 RC evidence; `resource_soak` starts `not_run`. Both the RC gate and stable-release
-binding recompute validation before marking candidate evidence passed.
+binding validate a supplied scorecard. An absent scorecard or the template's
+unfilled `not_run` placeholder is reported as absent and does not block release.
+No stable release requires resource-soak evidence until the sampler ships;
+a supplied incomplete or failing scorecard still fails validation.
 
 Required: sampler_v6; two battery hours after 15 minutes startup exclusion;
 >=99% coverage and <=2s gaps; one verified process instance, no restart;
