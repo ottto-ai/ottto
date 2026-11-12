@@ -20173,7 +20173,7 @@ mod tests {
                 true,
             )
             .unwrap();
-            for width in [183, 730] {
+            for width in [30, 183] {
                 let present = captured_terminal_receipt_for_source_under_hint(
                     source,
                     SyncCounts::for_policy(width),
