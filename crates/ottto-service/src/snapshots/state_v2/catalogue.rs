@@ -145,6 +145,7 @@ macro_rules! scan_index_fields {
             codex_counting_evictions => Misc (runtime none) [] side,
             claude_no_list_policy => Misc (runtime none) [] side,
             claude_history_emission => Misc (runtime none) [] side,
+            first_read_pending => Misc (runtime none) [] side,
             copy_unproven_enabled => Misc (runtime none) [] side,
             copy_prefix_base_upload_context => Misc (runtime none) [] side,
             copy_prefix_last_accepted_nonce => Misc (misc check_field Field) ["setting.copy_prefix_last_accepted_nonce" => 3] side,

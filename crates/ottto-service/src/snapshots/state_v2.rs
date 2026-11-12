@@ -78,6 +78,7 @@ pub(in crate::snapshots) use tail::first_read::{
     Observed as FirstReadObserved, Summary as FirstReadSummary,
     SummaryEdit as FirstReadEdit, BUCKETS as FIRST_READ_BUCKETS,
 };
+pub(in crate::snapshots) use tail::first_read::resolve as resolve_first_read;
 #[cfg(test)]
 pub(in crate::snapshots) use runtime::tail_route::{staged_head_for_test, LOAD_HEAD_CALLS};
 pub(in crate::snapshots) use sqlite::{sidecar, sqlite_uri};

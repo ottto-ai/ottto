@@ -464,6 +464,9 @@ pub(in crate::snapshots) struct Walk {
     listed: BTreeMap<String, Option<u64>>,
     /// The walk's sums over `listed`.
     sums: Report,
+    /// The route's dropped-stage count when the walk began: a drop during the
+    /// walk lost some page's staged rows, so the walk certifies nothing.
+    discards: Option<u64>,
 }
 impl Walk {
     pub(in crate::snapshots) const EMPTY: Self = Self {
@@ -473,14 +476,19 @@ impl Walk {
         issue: false,
         listed: BTreeMap::new(),
         sums: Report::UNAVAILABLE,
+        discards: None,
     };
+
+    /// When a complete walk with no walk issue began in this process.
+    pub(in crate::snapshots) fn healthy_start(&self) -> Option<u64> {
+        self.started_at
+            .filter(|_| !self.incomplete && !self.unavailable && !self.issue)
+    }
 
     /// The roster of a complete walk begun in this process with no walk
     /// issue; `None` otherwise. Moves the roster out of the walk.
     pub(in crate::snapshots) fn complete_roster(&mut self) -> Option<Roster> {
-        let started_at_ms = self
-            .started_at
-            .filter(|_| !self.incomplete && !self.unavailable && !self.issue)?;
+        let started_at_ms = self.healthy_start()?;
         Some(Roster {
             started_at_ms,
             listed: std::mem::take(&mut self.listed),
@@ -536,6 +544,7 @@ pub(in crate::snapshots) struct Page<'a> {
     errors: (usize, usize),
     now_ms: u64,
     last_complete: Option<u64>,
+    first_read: first_read::PageState,
 }
 
 fn listing_errors(counts: &ScanTraversalCounts) -> (usize, usize) {
@@ -579,8 +588,25 @@ impl<'a> Page<'a> {
             fold.debt.started_at = Some(now_ms);
             fold.debt.incomplete =
                 listing_errors(counts) != (0, 0) || counts.disappeared_file_count > 0;
+            fold.debt.discards = route
+                .as_deref()
+                .and_then(|route| state_v2::tail_stage_discards(route).ok());
         }
         fold.debt.unavailable |= unavailable;
+        // A first root walk anchors the first read at its census time. A source
+        // with no root and no root problem lists an empty inventory at once.
+        let counts = &traversal.counts;
+        let no_roots = traversal.scan_roots.is_empty()
+            && traversal.pending_directories.is_empty()
+            && listing_errors(counts) == (0, 0)
+            && counts.disappeared_file_count == 0;
+        let anchor_at = rfc3339_unix_seconds(&traversal.census_window_end)
+            .map(|seconds| seconds.saturating_mul(1000))
+            .filter(|_| (root_walk && begins) || no_roots)
+            .map(|anchor_ms| (anchor_ms, no_roots && !(root_walk && begins)));
+        let first_read = route.as_deref().map_or_else(Default::default, |route| {
+            first_read::PageState::begin(index, route, anchor_at, now_ms)
+        });
         Self {
             source,
             route,
@@ -591,6 +617,7 @@ impl<'a> Page<'a> {
             errors: listing_errors(&traversal.counts),
             now_ms,
             last_complete: index.tail_discovery.last_complete_discovery_at,
+            first_read,
         }
     }
 
@@ -734,20 +761,25 @@ impl<'a> Page<'a> {
         }
         let key = local_index_key(listing.path);
         let live = self.live(index, &key, &listing);
+        let unknown = |page: &mut Self, key: String| {
+            page.observe_member(index, &key, &listing, &live, None, true);
+            page.count(index, listing.path, key, FileDebt::UNKNOWN, false)
+        };
         // One keyed read per listed file; an absent head is `None`.
         let head = match state_v2::load_head(index, &key, u32::MAX) {
             Ok(head) => head,
-            Err(_) => return self.count(index, listing.path, key, FileDebt::UNKNOWN, false),
+            Err(_) => return unknown(self, key),
         };
         let committed = match &head {
             Some(head) => match revisions(index, &key, head) {
                 Some(committed) => committed,
-                None => return self.count(index, listing.path, key, FileDebt::UNKNOWN, false),
+                None => return unknown(self, key),
             },
             None => BTreeMap::new(),
         };
         let plan = reconcile(&committed, &live);
         let summary = summary(&plan.owed, live.evidence);
+        self.observe_member(index, &key, &listing, &live, Some(&plan.owed), false);
         let changed = !plan.resolved.is_empty()
             || !plan.replaced.is_empty()
             || !plan.added.is_empty()
@@ -782,6 +814,41 @@ impl<'a> Page<'a> {
                 self.unindexed.push((listing.path.to_path_buf(), debt));
             }
         }
+    }
+
+    /// The file's first-read member, staged with its debt: in-window files of
+    /// an open generation only.
+    fn observe_member(
+        &mut self,
+        index: &ScanIndex,
+        key: &str,
+        listing: &Listing<'_>,
+        live: &Live,
+        owed: Option<&[Revision]>,
+        unknown: bool,
+    ) {
+        if self.first_read.anchor_ms.is_none() || !listing.in_window {
+            return;
+        }
+        let owed = owed.filter(|owed| !owed.is_empty());
+        let policy = owed.is_some()
+            && ((self.source == SnapshotSource::ClaudeCode
+                && matches!(
+                    index.history_standing_hold(listing.path, listing.metadata),
+                    Some(HistoryHold::Listed | HistoryHold::MoveNotFull)
+                ))
+                || index.authority_terminal_member(listing.path));
+        let inputs = first_read::Inputs {
+            unknown,
+            owed: owed.map(|owed| summary(owed, None)),
+            proof: live.evidence.is_some()
+                || live.len == 0
+                || (live.exact && live.len <= live.accepted),
+            policy,
+            mtime_ms: live.change.0,
+            bytes: listing.metadata.len(),
+        };
+        self.first_read.observe(index, key, &inputs, self.now_ms);
     }
 
     fn count(
@@ -825,6 +892,9 @@ impl<'a> Page<'a> {
         if let Some(route) = self.route.as_deref().filter(|_| !staged.is_empty()) {
             walk.unavailable |= state_v2::observe_tails(route, staged).is_err();
         }
+        if let Some(route) = self.route.as_deref() {
+            walk.unavailable |= self.first_read.stage(route).is_err();
+        }
         carry(index);
         for (path, debt) in std::mem::take(&mut self.unindexed) {
             let key = local_index_key(&path);
@@ -840,6 +910,7 @@ impl<'a> Page<'a> {
             root_walk,
             fold,
             now_ms,
+            first_read,
             ..
         } = self;
         let walk = &mut fold.debt;
@@ -847,7 +918,27 @@ impl<'a> Page<'a> {
             return None;
         }
         match route {
-            Some(route) => Some(aggregate(index, &route, walk, now_ms)),
+            Some(route) => {
+                let report = aggregate(index, &route, walk, now_ms);
+                // The listing certificate: a complete walk with no walk issue,
+                // begun in this process at or after the anchor, with no stage
+                // dropped since it began. Sticky once committed.
+                let certificate = first_read
+                    .anchor_ms
+                    .zip(walk.healthy_start())
+                    .filter(|_| report.available)
+                    .filter(|_| {
+                        walk.discards.is_some()
+                            && state_v2::tail_stage_discards(&route).ok() == walk.discards
+                    })
+                    .and_then(|(anchor_ms, started_at)| first_read::certify(started_at, anchor_ms));
+                if let Some(edit) = certificate {
+                    if state_v2::observe_first_read(&route, Vec::new(), Some(edit)).is_err() {
+                        return Some(Report::UNAVAILABLE);
+                    }
+                }
+                Some(report)
+            }
             None if walk.unavailable => Some(Report::UNAVAILABLE),
             None => None,
         }
@@ -915,5 +1006,6 @@ fn aggregate(index: &mut ScanIndex, route: &Path, walk: &Walk, now_ms: u64) -> R
     report
 }
 
+pub(in crate::snapshots) mod first_read;
 #[cfg(test)]
 pub(in crate::snapshots) mod tests;

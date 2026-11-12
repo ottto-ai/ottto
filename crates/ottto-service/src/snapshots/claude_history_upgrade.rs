@@ -47,8 +47,8 @@ use super::claude_reemission_exclusions::{
 use super::{
     claude_family_root_path, claude_family_subagents_dir, claude_history_upgrade,
     claude_index_path_member_ref, claude_request_money, local_index_key,
-    snapshot_file_entity_set_hex, CandidateFile, ScanIndex, SnapshotItem, SnapshotSource,
-    MALFORMED_CLAUDE_HISTORY_CUTOFF,
+    snapshot_file_entity_set_hex, unix_nanos, unix_seconds, CandidateFile, ScanIndex,
+    SnapshotItem, SnapshotSource, MALFORMED_CLAUDE_HISTORY_CUTOFF,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -494,26 +494,35 @@ pub(super) fn decide(
             _ => HistoryDecision::NotOwed,
         },
         HistoryKind::Owed => {
-            let hold = if policy.is_none() {
-                Some(HistoryHold::UngatedRevision)
-            } else if inputs.exclusions.pauses_adoption() {
-                Some(HistoryHold::ListPaused)
-            } else if inputs.listed {
-                Some(HistoryHold::Listed)
-            } else if let Some(hold) = no_list_hold(inputs, policy) {
-                Some(hold)
-            } else if inputs.latched {
-                Some(HistoryHold::Latched)
-            } else if !page.reserve(index_key, size_bytes) {
-                Some(HistoryHold::Budget)
-            } else {
-                None
-            };
+            let hold = standing_hold(inputs, policy).or_else(|| {
+                if inputs.latched {
+                    Some(HistoryHold::Latched)
+                } else if !page.reserve(index_key, size_bytes) {
+                    Some(HistoryHold::Budget)
+                } else {
+                    None
+                }
+            });
             hold.map_or(HistoryDecision::Owed, HistoryDecision::Held)
         }
     };
     page.note(kind, decision, inputs.exclusions.state());
     decision
+}
+
+/// The standing half of the owed precedence: the revision has no policy row,
+/// the list is paused, the list names the family, or the no-list hold. The
+/// latch and the page budget follow it in `decide`; neither is standing.
+fn standing_hold(inputs: &PolicyInputs<'_>, policy: Option<RevisionPolicy>) -> Option<HistoryHold> {
+    if policy.is_none() {
+        Some(HistoryHold::UngatedRevision)
+    } else if inputs.exclusions.pauses_adoption() {
+        Some(HistoryHold::ListPaused)
+    } else if inputs.listed {
+        Some(HistoryHold::Listed)
+    } else {
+        no_list_hold(inputs, policy)
+    }
 }
 
 /// Where no list is intended and the
@@ -1323,6 +1332,49 @@ fn note_prior_history_unverified_at(
 }
 
 impl ScanIndex {
+    /// The standing hold `decide` would give `path` as owed history now: the
+    /// first read counts a member the list or the move rule holds as excluded
+    /// by policy. `None` for a file that is not owed history.
+    pub(in crate::snapshots) fn history_standing_hold(
+        &self,
+        path: &Path,
+        metadata: &std::fs::Metadata,
+    ) -> Option<HistoryHold> {
+        let key = local_index_key(path);
+        let birth_unix_seconds = metadata.created().ok().and_then(unix_seconds);
+        let modified = metadata.modified().ok();
+        let kind = classify(
+            self.files.get(&key).map(|entry| FileExtent {
+                size_bytes: entry.size_bytes,
+                modified_unix_seconds: entry.modified_unix_seconds,
+                modified_unix_nanos: entry.modified_unix_nanos,
+            }),
+            FileExtent {
+                size_bytes: metadata.len(),
+                modified_unix_seconds: modified.and_then(unix_seconds).unwrap_or_default(),
+                modified_unix_nanos: modified.and_then(unix_nanos),
+            },
+            self.effective_upload_body_witness_revision_requires_adoption(&key),
+            self.claude_history_cutoff_unix_seconds,
+            birth_unix_seconds,
+        );
+        if kind != HistoryKind::Owed {
+            return None;
+        }
+        standing_hold(
+            &PolicyInputs {
+                exclusions: &self.claude_reemission_exclusions,
+                listed: self.claude_family_listed(path),
+                birth_unix_seconds,
+                latched: false,
+                active_revision: self.active_effective_upload_body_witness_revision,
+                history_cutoff_unix_seconds: self.claude_history_cutoff_unix_seconds,
+                no_list_policy: self.claude_no_list_policy,
+            },
+            revision_policy(self.active_effective_upload_body_witness_revision),
+        )
+    }
+
     /// Claude only, before scanning, every cycle. With prior history on this
     /// Mac, a fresh index, a replay that dropped entries or the
     /// first gated load of an index with no cutoff records the history
