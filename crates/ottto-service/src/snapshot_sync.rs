@@ -2971,6 +2971,33 @@ impl SnapshotUploadProgress {
         crate::snapshots::terminal_contract_retry::exhaust(record);
     }
 
+    /// Outage custody: hold each body of the page that has no exact ACK, hold
+    /// or refusal of these exact bytes yet, as an ordinary retryable
+    /// quarantine until `retry_after_unix_seconds`. Returns how many were held.
+    fn hold_outage_bodies(
+        &mut self,
+        items: &[SnapshotItem],
+        retry_after_unix_seconds: u64,
+    ) -> usize {
+        let mut held = 0;
+        for item in items {
+            let fingerprint = item.snapshot_fingerprint.as_str();
+            let witness = snapshot_upload_body_witness(item);
+            if self.accepted_body_witnesses.get(fingerprint) == Some(&witness)
+                || self
+                    .quarantined_fingerprints
+                    .get(fingerprint)
+                    .is_some_and(|record| record.upload_body_witness.as_ref() == Some(&witness))
+                || self.refused_body(fingerprint, &witness)
+            {
+                continue;
+            }
+            self.quarantine_retryable_body(fingerprint, &witness, retry_after_unix_seconds);
+            held += 1;
+        }
+        held
+    }
+
     fn retain_current_quarantines_with_diagnostics(
         &mut self,
         current: &BTreeSet<String>,
@@ -8185,6 +8212,9 @@ fn finish_sync_source(
                 bootstrap_capacity_error =
                     Some(error.context("cache-head bootstrap ACK settlement pending"));
             }
+            // A probe outage owes the main uploader's outage custody and
+            // partial checkpoint below.
+            Err(error) if is_upload_outage(&error) => bootstrap_capacity_error = Some(error),
             Err(error) => return Err(error),
         }
         if bootstrap_capacity_error.is_none() {
@@ -8344,6 +8374,34 @@ fn finish_sync_source(
             matches!(upload_result, Ok(ResumableUploadResult::Shed { .. })),
             source.api_slug(),
         );
+    }
+    // An outage (a transport failure, timeout or 5xx, or a plain shed) ends
+    // the pass before the server answered for every body. Hold each body with
+    // no exact ACK, hold or refusal in ordinary retryable custody, durably,
+    // before the partial checkpoint below: its files and heads then commit,
+    // and the next pass re-sends from the head instead of reading the file
+    // again. No ACK, refusal or loss is recorded; the entities stay owed.
+    let outage_retry_after = match &upload_result {
+        Ok(ResumableUploadResult::Shed { retry_after }) => Some(*retry_after),
+        Err(error) if is_upload_outage(error) => Some(None),
+        _ => None,
+    };
+    if let Some(retry_after) = outage_retry_after {
+        let before = upload_progress.clone();
+        let retry_at = current_unix_seconds().saturating_add(shed_backoff(retry_after).as_secs());
+        let held = upload_progress.hold_outage_bodies(&scan_result.snapshots, retry_at);
+        if held > 0 {
+            if upload_progress.save(&upload_progress_path).is_err() {
+                // Nothing durable changed: the page stays owed as before.
+                upload_progress = before;
+            } else {
+                crate::local_resource_diagnostics::traversal_point(
+                    "quarantine_retry",
+                    source.api_slug(),
+                    &serde_json::json!({"reason": "outage", "count": held}),
+                );
+            }
+        }
     }
 
     // Exact progress is durable before this seam. The same subsequent index
@@ -10266,6 +10324,14 @@ fn is_shed_failure(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<UploadFailureDiagnostics>()
         .is_some_and(|diagnostics| diagnostics.status_family() == "http_429")
+}
+
+/// The server never answered the page: a transport failure, a timeout or a
+/// 5xx. A plain shed arrives as `ResumableUploadResult::Shed` instead.
+fn is_upload_outage(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<UploadFailureDiagnostics>()
+        .is_some_and(UploadFailureDiagnostics::is_outage)
 }
 
 fn is_snapshot_batch_split_failure(error: &anyhow::Error) -> bool {
