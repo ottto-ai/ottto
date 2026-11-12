@@ -96,26 +96,31 @@ file-system hint / periodic listing → select file → read new bytes from save
   provider-skill facts merge before their existing projection; changed files stay distinct and artifacts
   use the existing union. Continuous plain groups
   retain their existing replay path; no admitted-key ledger is persisted.
-- **Claude copied history.** Pre-birth request ids held by an earlier accepted
-  main file stay removed, including same-session resumes and origins in another
-  folder. Same-session proof uses the session's accepted body, regardless of
-  which file carried it; cross-session proof requires that file's acceptance.
-  A file's own stored removals never prove another copy. These decisions
-  use the existing removal store. An incomplete census walk keeps only the
-  unresolved prefix out of totals and leaves its existing prefix lease pending.
-  The first deadline registers that lease at age one; subsequent deadlines
-  preserve its age instead of advancing the bounded proof wait.
-  An all-covered copy-only page drops its items; own turns still publish.
-  A selected content twin pulls at most its earliest accepted holder. The seed
-  set is fixed before those holders are added, so pulls never cascade.
-  Money rule three selects content twins, path twins and disclosed main files
-  once, using eight smallest census hashes per candidate and one complete
-  deadline-bounded census walk. It re-owes only a matching copy and its earliest
-  holder, and stamps the rule version in the same save. Subagent path-twin
-  homes sharing census ids are both selected within that same deadline.
-  An incomplete selection stamps nothing and retries next cycle. An all-copy
-  subagent twin keeps the skips an earlier same-session fold proves, even
-  before the subagent cutoff; a twin with own turns retains the cutoff.
+- **Claude copied history.** Earlier accepted main files prove pre-birth
+  copies within the same session, or through the in-folder holder's session
+  across folders. Same-session proof uses the session's accepted body,
+  regardless of which file carried it; cross-session proof requires that
+  file's acceptance. Stored self-removals never prove another copy. An origin
+  only under an unrelated session elsewhere leaves its copy counted.
+  The original in-folder census wait still expires on its third decision.
+  An all-covered copy-only page drops its items when the session has another
+  file; own turns still publish. A selected content twin pulls at most its
+  earliest accepted main holder. Frozen seeds prevent cascading pulls, and
+  ordinary discovery acquires the holder without an extra seed content read.
+  Money rule three selects content twins, path twins and disclosed main
+  files once, using every census hash and one in-memory census walk without
+  a deadline. Only a candidate sharing ids with an earlier accepted holder
+  and that holder are re-owed, with the rule version stamped in the same save.
+  Disclosed main files include cross-session resumes whose own path and
+  content identity would otherwise leave their counted prefix unchanged.
+  Subagent path-twin homes sharing census ids are both selected once, for
+  all-copy and prefix copies. The selector and mid-page holder lookup record
+  elapsed milliseconds; holder pulls also record a scalar count.
+  A subagent twin keeps skips held by an earlier same-session fold before
+  its first own response, regardless of the subagent cutoff or file birth.
+  Unmatched responses are own turns, including those before birth. Shared
+  responses after the first own turn keep the existing cutoff decision.
+
 - **Upload.** A session is uploaded as a whole-session replacement, idempotent at the receiver. It
   settles only on an exact acknowledgement of the exact bytes sent to that destination. A local
   receipt never counts as an acknowledgement; refused, not-stored and partial answers are not

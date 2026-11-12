@@ -157,73 +157,6 @@ fn resumed_file_uses_the_in_folder_holders_session() {
     });
 }
 
-/// [money] A forced incomplete all-folder walk preserves own turns, advances
-/// no further retry age, and keeps the pending lease across restart.
-#[test]
-fn incomplete_all_folder_walk_never_restores_or_ages_copies() {
-    with_e2(|| {
-        let mut c = Corpus::new("copy-incomplete-census");
-        c.write_at(
-            &format!("elsewhere/{ROOT}.jsonl"),
-            &resumed(ROOT, &[A, B]),
-            "2026-08-02T07:00:00Z",
-        );
-        let mut prior = warm(&c);
-        let path = c.write_at(&file(COPY), &resumed(COPY, &[A, B, C]), BORN);
-        let key = path.to_string_lossy().into_owned();
-        for _ in 0..4 {
-            let mut page = c.raw(&E2ScanFixture::default(), prior.clone(), 100, false, &[]);
-            e2::take_diag();
-            crate::snapshots::claude_request_census::with_walk_deadline_for_test(|| {
-                page.enrich(&c);
-            });
-            let item = body(&page, COPY).unwrap();
-            assert_eq!(
-                (item.request_count, item.removed_request_count),
-                (1, Some(0))
-            );
-            assert!(
-                crate::snapshots::claude_request_money::is_request_owned_literal(item),
-                "the own turn is emitted literally on the incomplete-walk page"
-            );
-            assert_eq!(
-                item.output_tokens, 10,
-                "the own turn counts on this same page"
-            );
-            assert_eq!(
-                copy_diag(&[
-                    "copy_prefix_held_requests",
-                    "copy_prefix_hold_expired",
-                    "copy_prefix_unproven"
-                ]),
-                [2, 0, 0],
-                "only the two copied units stay held; none restore or expire"
-            );
-            assert_eq!(page.disposition.quarantined_entity_count(), 0);
-            assert_eq!(
-                page.index.claude_copy_removals.hold_age(location_key(&key)),
-                1
-            );
-            prior = settle(&c, &prior, page, &mut e2_progress());
-            assert!(prior.claude_copy_removals.pending(location_key(&key)));
-            assert_eq!(prior.files[&key].effective_upload_body_witness_revision, 3);
-        }
-        let completed = ready(&c, &E2ScanFixture::default(), prior, 100, false);
-        let item = body(&completed, COPY).unwrap();
-        assert_eq!(
-            (item.request_count, item.removed_request_count),
-            (1, Some(2))
-        );
-        assert_eq!(
-            completed
-                .index
-                .claude_copy_removals
-                .hold_age(location_key(&key)),
-            0
-        );
-    });
-}
-
 /// [money] Distinct same-session turns count. A stored removal on an accepted
 /// intermediate copy cannot prove another copy after the origin disappears.
 #[test]
@@ -535,27 +468,6 @@ fn copied_file_version_three_converges_once() {
             );
         });
     }
-}
-
-/// [money] The one-shot selector never stamps an incomplete census walk.
-#[test]
-fn incomplete_version_three_selector_retries_without_stamping() {
-    with_e2(|| {
-        let mut c = Corpus::new("copied-session-selector-deadline");
-        c.root(ROOT, &resumed(ROOT, &[A, B]));
-        let mut prior = warm(&c);
-        c.write_at(&file(COPY), &resumed(ROOT, &[A, B]), BORN);
-        let page = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
-        prior = settle(&c, &prior, page, &mut e2_progress());
-        prior.claude_money_birth_store.set_money_rule_version(2);
-        crate::snapshots::claude_request_census::with_walk_deadline_for_test(|| {
-            e2::apply_money_rules(&mut prior);
-        });
-        assert_eq!(prior.claude_money_birth_store.money_rule_version(), 2);
-        prior = c.reload(&mut prior);
-        e2::apply_money_rules(&mut prior);
-        assert_eq!(prior.claude_money_birth_store.money_rule_version(), 3);
-    });
 }
 
 mod subagent_twins {

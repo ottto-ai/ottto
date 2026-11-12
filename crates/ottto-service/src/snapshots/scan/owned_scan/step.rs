@@ -3967,14 +3967,17 @@ impl OwnedSourceScan {
                     .get(&local_index_key(&candidate.path))
                     .is_some_and(|record| record.is_twin())
             {
-                let closed = claude_history_upgrade::claude_read_closure(
-                    [candidate.path.as_path()],
-                    std::iter::empty(),
-                    &BTreeMap::new(),
-                    &BTreeSet::new(),
+                let seed = local_index_key(&candidate.path);
+                let walk = std::time::Instant::now();
+                let holders = claude_request_money::e2::copied_file_holders(
                     index,
+                    std::iter::once(seed.as_str()),
                 );
-                for path in closed.into_iter().filter(|path| *path != candidate.path) {
+                claude_request_money::e2::diag(
+                    "copy_holder_walk_ms",
+                    walk.elapsed().as_millis() as u64,
+                );
+                for path in holders.into_values().map(PathBuf::from) {
                     let key = local_index_key(&path);
                     if claude_twin_schedule.root_homes.contains(&key)
                         || snapshots.iter().any(|item| {
@@ -3987,31 +3990,19 @@ impl OwnedSourceScan {
                         continue;
                     }
                     claude_twin_schedule.root_homes.insert(key);
+                    claude_request_money::e2::diag("copy_holder_pulled", 1);
                     if identified_candidates
                         .iter()
                         .any(|queued| queued.path == path)
                     {
                         continue;
                     }
-                    let Some(scan_root) = roots
-                        .iter()
-                        .filter(|root| path.starts_with(root))
-                        .max_by_key(|root| root.components().count())
-                        .cloned()
-                    else {
-                        continue;
-                    };
                     let mut discovery =
                         CandidateDiscovery::new(index, Some(&resource_probe.discovery_growth));
-                    if let Some(holder) = candidate_from_traversal_path_at(
+                    if let Some(holder) = super::forced_index_candidate(
                         source,
-                        disappearance_diagnostics::Site::CandidateForcedIndex,
-                        ScanTraversalPath {
-                            scan_root,
-                            path,
-                            census_member: false,
-                            watcher_hint: false,
-                        },
+                        &roots,
+                        (path, false),
                         &mut census,
                         census_unix_seconds,
                         backfill_window_days,

@@ -648,72 +648,72 @@ fn identity_incomplete_continuation_keeps_native_source_proof() {
 /// estimated evidence gap and a tagged row match one-home placement.
 #[test]
 fn positive_placement_matches_one_home() {
-    with_e2(|| {
-        let c = twins("subagent-twin-positive", false, TURN, false, true);
-        let actual = routes(&c);
-        assert!(accounts(&actual).len() >= 2);
-        // After an exact ACK, a main-only append carries every child's
-        // accepted body and placement (switch, side call, gap, tagged row).
-        let (session, index) = StateV2ColdSession::publish(
-            Source::Claude,
-            &ScanIndex::default(),
-            &c.base.join("state-main-only"),
-        );
-        let first = page(&c, index, 100, true);
-        let carried = acked(&first);
-        let prior = commit(&session, first);
-        let main = c.root.join(format!("z/{ROOT}.jsonl"));
-        let original = std::fs::read_to_string(&main).unwrap();
-        append(&main, &line(ROOT, "main-only", GROW, 8));
-        let warm = hinted(&c, prior, 100, true, std::slice::from_ref(&main));
-        assert_main_only(&c, &warm, &carried, Mode::Ram);
-        std::fs::write(&main, original).unwrap();
-        assert_eq!(actual.snapshots[&child(0)]["removed_request_count"], 5);
-        assert_eq!(
-            actual.snapshots[&child(0)]["removed_usage"]["input_tokens"],
-            77
-        );
-        assert_eq!(
-            actual.snapshots[&child(0)]["cost"]["total_cost_usd"],
-            "0.00067"
-        );
-        let mut one = corpus("subagent-twin-positive-one-home");
-        for agent in 0..3 {
-            let text = std::fs::read_to_string(c.root.join(member("a", agent))).unwrap();
-            let text = if agent == 0 {
-                // A kept pre-boundary copy has no own login row before it, so it
-                // takes the session's starting account, as z's kept "old" does.
-                let (fork, rest) = text.split_once('\n').unwrap();
-                format!("{fork}\n{}{rest}", line(ROOT, "old-copy", AT, 6))
-                    + &line(ROOT, "copy-own", GROW, 13)
-            } else {
-                text
-            };
-            one.write_at(&member("a", agent), &text, "2026-11-04T07:00:00Z");
-        }
-        let text = std::fs::read_to_string(c.root.join(format!("z/{ROOT}.jsonl"))).unwrap();
-        one.write_at(&format!("a/{ROOT}.jsonl"), &text, "2026-11-04T07:00:00Z");
-        // Reuse the same synthetic evidence, with independent native transcript reads.
-        one.support = c.support.clone();
-        let single = cold(&one);
-        money_oracle::assert_placement_equivalent(&single, &actual);
-        for (id, expected) in &single.snapshots {
-            let got = &actual.snapshots[id];
-            for field in [
-                "input_tokens",
-                "output_tokens",
-                "cache_read_tokens",
-                "cache_creation_5m_tokens",
-                "cache_creation_1h_tokens",
-                "reasoning_output_tokens",
-                "unattributed_total_tokens",
-                "request_count",
-                "cost",
-            ] {
-                assert_eq!(expected.get(field), got.get(field), "{id}/{field}");
+    for reverse in [false, true] {
+        with_e2(|| {
+            let (old, new) = if reverse { ("z", "a") } else { ("a", "z") };
+            let c = twins("subagent-twin-positive", reverse, TURN, false, true);
+            let actual = routes(&c);
+            assert!(accounts(&actual).len() >= 2);
+            // After an exact ACK, a main-only append carries every child's
+            // accepted body and placement (switch, side call, gap, tagged row).
+            let (session, index) = StateV2ColdSession::publish(
+                Source::Claude,
+                &ScanIndex::default(),
+                &c.base.join("state-main-only"),
+            );
+            let first = page(&c, index, 100, true);
+            let carried = acked(&first);
+            let prior = commit(&session, first);
+            let main = c.root.join(format!("{new}/{ROOT}.jsonl"));
+            let original = std::fs::read_to_string(&main).unwrap();
+            append(&main, &line(ROOT, "main-only", GROW, 8));
+            let warm = hinted(&c, prior, 100, true, std::slice::from_ref(&main));
+            assert_main_only(&c, &warm, &carried, Mode::Ram);
+            std::fs::write(&main, original).unwrap();
+            assert_eq!(actual.snapshots[&child(0)]["removed_request_count"], 6);
+            let oracle = cold(&c);
+            assert_eq!(
+                actual.snapshots[&child(0)]["removed_usage"],
+                oracle.snapshots[&child(0)]["removed_usage"]
+            );
+            assert_eq!(
+                actual.snapshots[&child(0)]["cost"],
+                oracle.snapshots[&child(0)]["cost"]
+            );
+            let mut one = corpus("subagent-twin-positive-one-home");
+            for agent in 0..3 {
+                let text = std::fs::read_to_string(c.root.join(member(old, agent))).unwrap();
+                let text = if agent == 0 {
+                    text + &line(ROOT, "copy-own", GROW, 13)
+                } else {
+                    text
+                };
+                one.write_at(&member("a", agent), &text, "2026-11-04T07:00:00Z");
             }
-        }
-    });
+            let text = std::fs::read_to_string(c.root.join(format!("{new}/{ROOT}.jsonl"))).unwrap();
+            one.write_at(&format!("a/{ROOT}.jsonl"), &text, "2026-11-04T07:00:00Z");
+            // Reuse the same synthetic evidence, with independent native transcript reads.
+            one.support = c.support.clone();
+            let single = cold(&one);
+            money_oracle::assert_placement_equivalent(&single, &actual);
+            for (id, expected) in &single.snapshots {
+                let got = &actual.snapshots[id];
+                for field in [
+                    "input_tokens",
+                    "output_tokens",
+                    "cache_read_tokens",
+                    "cache_creation_5m_tokens",
+                    "cache_creation_1h_tokens",
+                    "reasoning_output_tokens",
+                    "unattributed_total_tokens",
+                    "request_count",
+                    "cost",
+                ] {
+                    assert_eq!(expected.get(field), got.get(field), "{id}/{field}");
+                }
+            }
+        });
+    }
 }
 
 /// [format] Replay before upload, recover an exact ACK before save,

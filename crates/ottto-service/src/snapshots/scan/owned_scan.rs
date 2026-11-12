@@ -88,6 +88,39 @@ pub(in crate::snapshots) fn prepare_owned_scan_candidate(
     candidate.source_file_fingerprint = sidecar_fingerprint;
 }
 
+/// Forced discovery shares the native longest-root and metadata admission
+/// path at pass start and when a content twin pulls its proving holder.
+fn forced_index_candidate(
+    source: SnapshotSource,
+    roots: &[PathBuf],
+    path: (PathBuf, bool),
+    census: &mut ScanCensus,
+    census_unix_seconds: Option<u64>,
+    backfill_window_days: u64,
+    discovery: &mut CandidateDiscovery<'_>,
+) -> Option<CandidateFile> {
+    let (path, census_member) = path;
+    let scan_root = roots
+        .iter()
+        .filter(|root| path.starts_with(root))
+        .max_by_key(|root| root.components().count())?
+        .clone();
+    candidate_from_traversal_path_at(
+        source,
+        disappearance_diagnostics::Site::CandidateForcedIndex,
+        ScanTraversalPath {
+            scan_root,
+            path,
+            census_member,
+            watcher_hint: false,
+        },
+        census,
+        census_unix_seconds,
+        backfill_window_days,
+        discovery,
+    )
+}
+
 /// `e2`: this page's path-twin co-scheduling, transient (never persisted).
 #[derive(Default)]
 pub(in crate::snapshots) struct ClaudeTwinSchedule {
@@ -1182,7 +1215,6 @@ impl OwnedSourceScan {
                 &family_index_keys,
                 claude_twin_groups.get_or_init(Default::default),
                 &forced_claude_family_reparses,
-                index,
             )
             .into_iter()
             .inspect(|_| crate::local_resource_diagnostics::forced_family_member_pulled())
@@ -1206,23 +1238,10 @@ impl OwnedSourceScan {
                     sources: std::borrow::Cow::Borrowed(&move_sources),
                     growth: Some(&resource_probe.discovery_growth),
                 };
-                let Some(scan_root) = scan_roots
-                    .iter()
-                    .filter(|root| path.starts_with(root))
-                    .max_by_key(|root| root.components().count())
-                    .cloned()
-                else {
-                    continue;
-                };
-                let Some(mut candidate) = candidate_from_traversal_path_at(
+                let Some(mut candidate) = forced_index_candidate(
                     source,
-                    disappearance_diagnostics::Site::CandidateForcedIndex,
-                    ScanTraversalPath {
-                        scan_root,
-                        path,
-                        census_member: true,
-                        watcher_hint: false,
-                    },
+                    &scan_roots,
+                    (path, true),
                     &mut census,
                     census_unix_seconds,
                     backfill_window_days,

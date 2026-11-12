@@ -82,14 +82,6 @@ impl CopyRemovals {
             }
         }
     }
-    /// An incomplete census registers discoverable retry debt once. The
-    /// existing encoding uses age zero for no debt, so the first deadline
-    /// starts at one; later deadlines preserve the same age.
-    pub(crate) fn keep_pending(&mut self, file: LocationKey) {
-        if !self.pending(file) {
-            self.advance_hold(file);
-        }
-    }
     pub(crate) fn clear_hold(&mut self, file: LocationKey) {
         if let Ok(i) = self.files.binary_search_by_key(&file, |f| f.0) {
             if self.files[i].2.is_empty() {

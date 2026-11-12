@@ -46,7 +46,7 @@ pub(in crate::snapshots) const SLACK: i128 = 2_000_000_000;
 const HOUR_NANOS: i128 = 3_600_000_000_000;
 /// Same bound the earlier holder walk used. A census walk that hits it cannot
 /// decide: the affected sessions or families are held, never counted.
-pub(in crate::snapshots) const SIDE_CALL_DEADLINE: Duration = Duration::from_millis(250);
+const SIDE_CALL_DEADLINE: Duration = Duration::from_millis(250);
 
 /// Revision 3 keeps a listed family on ordinary (pre-`e2`) money. With the
 /// gate on, `e2` applies to every other family, also while the list pauses
@@ -127,7 +127,7 @@ pub(crate) fn without_diag<T>(f: impl FnOnce() -> T) -> T {
     value
 }
 #[inline(always)]
-fn diag(reason: &'static str, n: u64) {
+pub(in crate::snapshots) fn diag(reason: &'static str, n: u64) {
     #[cfg(test)]
     if n > 0 {
         DIAG.with(|diag| *diag.borrow_mut().entry(reason).or_default() += n);
@@ -465,29 +465,19 @@ pub(crate) fn apply_money_rules(index: &mut ScanIndex) {
                         .get(key)
                         .is_some_and(|r| r.is_twin())
                         || path_twins(&twins, member.root).is_some()
-                        || index
-                            .claude_money_birth_store
-                            .money_marks(location_key(key))
-                            & money_mark::DISCLOSED
-                            != 0)
+                        // A cross-session resume can have its own path and
+                        // content identity; its counted unproven prefix is
+                        // the evidence that selects the correction once.
+                        || index.claude_money_birth_store.money_marks(location_key(key))
+                            & money_mark::DISCLOSED != 0)
             })
         });
-        let selected = copied_file_holders(
-            index,
-            candidates.map(String::as_str),
-            Some(start + SIDE_CALL_DEADLINE),
-            true,
-        );
-        let subagents = selected
-            .as_ref()
-            .and_then(|_| subagent_twin_files(index, &twins, start + SIDE_CALL_DEADLINE));
+        let selected = copied_file_holders(index, candidates.map(String::as_str));
+        let mut reowed = subagent_twin_files(index, &twins);
         diag(
             "money_rule_v3_selector_ms",
             start.elapsed().as_millis() as u64,
         );
-        let (Some(selected), Some(mut reowed)) = (selected, subagents) else {
-            return;
-        };
         for (copy, holder) in selected {
             reowed.insert(copy);
             reowed.insert(holder);
@@ -505,18 +495,10 @@ pub(crate) fn apply_money_rules(index: &mut ScanIndex) {
 }
 
 /// Subagent path twins need no main-holder walk: their indexed census
-/// overlap selects both homes for one co-read. Share v3's deadline; no
-/// partial selection or version stamp escapes an incomplete pass.
-fn subagent_twin_files(
-    index: &ScanIndex,
-    twins: &ClaudeTwinGroups,
-    deadline: Instant,
-) -> Option<BTreeSet<String>> {
+/// overlap selects both homes for one co-read, including copied prefixes.
+fn subagent_twin_files(index: &ScanIndex, twins: &ClaudeTwinGroups) -> BTreeSet<String> {
     let mut owed = BTreeSet::new();
     for homes in twins.values() {
-        if Instant::now() >= deadline {
-            return None;
-        }
         if !homes.first().is_some_and(|(key, _)| {
             claude_index_path_member_ref(Path::new(key))
                 .is_some_and(|member| member.subagent_stem.is_some())
@@ -540,9 +522,6 @@ fn subagent_twin_files(
                     continue;
                 };
                 for &hash in record.request_hashes() {
-                    if Instant::now() >= deadline {
-                        return None;
-                    }
                     if holder.holds_hash(hash) {
                         owed.insert(key.clone());
                         owed.insert(other.clone());
@@ -552,7 +531,7 @@ fn subagent_twin_files(
             }
         }
     }
-    (Instant::now() < deadline).then_some(owed)
+    owed
 }
 
 /// Fixed count-only causes of the existing certificate veto.
@@ -1928,8 +1907,8 @@ fn skipped_ids(item: &SnapshotItem) -> impl Iterator<Item = &String> + '_ {
 /// entry's fingerprint. Requests no current revision holds count and are
 /// disclosed. What cannot be decided yet (the proof file not read at its
 /// current revision, a holder not indexed yet, the census walk deadline)
-/// defers the unresolved prefix; own turns emit. Only complete decision passes
-/// age the bounded proof wait. All the
+/// defers the unresolved prefix; own turns emit. Each decision pass ages
+/// the bounded proof wait, including an in-folder deadline. All the
 /// page's cross-session checks share ONE census walk. Runs in both gate
 /// modes; dark only counts. Returns the removals to store (gate on only):
 /// the caller applies them to the index (`CopyRemovalUpdates::apply`).
@@ -2136,21 +2115,24 @@ fn indexed_main_files(index: &ScanIndex) -> BTreeMap<LocationKey, &str> {
         .collect()
 }
 
-/// Append-only census positives survive growth. A removed hash never makes
-/// its copy a new origin, even if that copy has an accepted body of its own.
-fn census_copy_holder(
+/// Earliest accepted positive holder before this file. Rule A supplies
+/// session acceptance; other callers supply each file's own acceptance.
+fn earliest_accepted_holder<'a>(
     index: &ScanIndex,
-    key: &str,
-    root: &str,
     hash: u64,
+    before: (i128, LocationKey),
+    candidates: impl Iterator<Item = (&'a str, &'a str, bool)>,
 ) -> Option<(i128, LocationKey)> {
-    origin_accepted(index, key).then_some(())?;
-    census_holder(index, key, root, hash)
+    candidates
+        .filter(|&(_, _, accepted)| accepted)
+        .filter_map(|(key, root, _)| census_holder(index, key, root, hash))
+        .filter(|&holder| holder < before)
+        .min()
 }
 
 /// Positive id and order evidence, independent of which same-session file
 /// carried the accepted summed body. Cross-session callers still use
-/// `census_copy_holder`, with its per-file acceptance check.
+/// per-file acceptance when selecting candidates.
 fn census_holder(
     index: &ScanIndex,
     key: &str,
@@ -2172,14 +2154,11 @@ fn census_holder(
 
 /// One census-only walk for a fixed seed set. Each seed pulls at most its
 /// earliest accepted main holder; returned holders never become new seeds.
-/// The convergence selector samples eight smallest hashes; read closure uses
-/// every hash so appending own turns cannot hide a copied prefix.
+/// All census hashes participate, so an own turn cannot hide a copied prefix.
 pub(in crate::snapshots) fn copied_file_holders<'a>(
     index: &ScanIndex,
     keys: impl Iterator<Item = &'a str>,
-    deadline: Option<Instant>,
-    sample: bool,
-) -> Option<BTreeMap<String, String>> {
+) -> BTreeMap<String, String> {
     let mut wanted = BTreeMap::<u64, Vec<(&str, (i128, LocationKey))>>::new();
     for key in keys {
         let Some(member) =
@@ -2193,29 +2172,26 @@ pub(in crate::snapshots) fn copied_file_holders<'a>(
         let Some(record) = index.claude_request_census.get(key) else {
             continue;
         };
-        let hashes = record.request_hashes();
-        let hashes = if sample {
-            &hashes[..hashes.len().min(8)]
-        } else {
-            hashes
-        };
-        for &hash in hashes {
+        for &hash in record.request_hashes() {
             wanted.entry(hash).or_default().push((key, order));
         }
     }
     let union = wanted.keys().copied().collect::<Vec<_>>();
     let mut found = BTreeMap::<String, ((i128, LocationKey), String)>::new();
-    index.claude_request_census.main_transcript_holders(
+    let _ = index.claude_request_census.main_transcript_holders(
         None,
         &union,
-        deadline,
+        None,
         |key, root, _, hits| {
+            let accepted = origin_accepted(index, key);
             for &hash in hits {
-                let Some(holder) = census_copy_holder(index, key, root, hash) else {
-                    continue;
-                };
                 for &(copy, order) in &wanted[&hash] {
-                    if holder < order {
+                    if let Some(holder) = earliest_accepted_holder(
+                        index,
+                        hash,
+                        order,
+                        std::iter::once((key, root, accepted)),
+                    ) {
                         let entry = found
                             .entry(copy.to_owned())
                             .or_insert_with(|| (holder, key.to_owned()));
@@ -2226,16 +2202,11 @@ pub(in crate::snapshots) fn copied_file_holders<'a>(
                 }
             }
         },
-    )?;
-    if deadline.is_some_and(|at| Instant::now() >= at) {
-        return None;
-    }
-    Some(
-        found
-            .into_iter()
-            .map(|(copy, (_, holder))| (copy, holder))
-            .collect(),
-    )
+    );
+    found
+        .into_iter()
+        .map(|(copy, (_, holder))| (copy, holder))
+        .collect()
 }
 
 /// A stored removal of `hash` under `holder` (index key): `None` when the
@@ -2326,11 +2297,12 @@ fn decide_subagent_twins(items: &mut [SnapshotItem], at: usize) {
             })
         })
         .unwrap_or_default();
-    let all_copy = first_own_turn_at(item, 0, &earlier).is_none();
+    let first_own = first_own_turn(item, 0, &earlier).map(|o| o.sequence);
     let mut kept = 0;
     let uncovered = skipped_ids(item)
         .filter(|id| {
-            let eligible = all_copy
+            let eligible = first_own
+                .is_none_or(|own| item.claude_usage_occurrences[*id].sequence < own)
                 || item.claude_usage_occurrences[*id]
                     .timestamp
                     .as_deref()
@@ -2631,21 +2603,30 @@ pub(in crate::snapshots) fn first_own_turn_at(
     from: u64,
     earlier: &[&BTreeSet<String>],
 ) -> Option<i128> {
+    first_own_turn(item, from, earlier)
+        .and_then(|occurrence| occurrence.timestamp.as_deref())
+        .and_then(rfc3339_unix_nanos)
+}
+
+fn first_own_turn<'a>(
+    item: &'a SnapshotItem,
+    from: u64,
+    earlier: &[&BTreeSet<String>],
+) -> Option<&'a ClaudeTranscriptUsageOccurrence> {
     item.claude_usage_occurrences
         .iter()
         .filter(|(id, occurrence)| {
             occurrence.sequence >= from && !earlier.iter().any(|ids| ids.contains(*id))
         })
         .min_by_key(|(_, occurrence)| occurrence.sequence)
-        .and_then(|(_, occurrence)| occurrence.timestamp.as_deref())
-        .and_then(rfc3339_unix_nanos)
+        .map(|(_, occurrence)| occurrence)
 }
 
 /// One census walk per folder for every copied main file of the page. A
 /// Accepted earlier main files prove copies through positive census ids,
-/// including the copy's own session and origins in other folders. A copy's
-/// own stored removals prove nothing. Only complete walks permit absence;
-/// incomplete walks keep ordinary revision debt without aging retry holds.
+/// including the copy's own session and the in-folder holder's session
+/// across folders. A copy's own stored removals prove nothing. The original
+/// in-folder walk keeps its bounded deadline wait.
 fn decide_holders(
     items: &mut [SnapshotItem],
     folds: &[usize],
@@ -2881,55 +2862,21 @@ fn decide_holders(
                     if !accepted {
                         continue;
                     }
-                    if let Some(holder) = census_holder(index, key, session, hash).filter(|&h| {
-                        h < file.order
-                            && (session != &file.session || !file.resumed || on_page.contains(&h.1))
-                    }) {
-                        let earliest = file.covered.entry(hash).or_insert(holder);
-                        *earliest = (*earliest).min(holder);
-                    }
-                }
-            }
-        }
-    }
-    // (B') One all-folder walk, only for hashes still unresolved. Partial
-    // positives are safe; absence is usable only when the walk completes.
-    let mut unresolved = BTreeMap::<u64, Vec<usize>>::new();
-    for (at, file) in wanted.iter().enumerate() {
-        if file.waiting {
-            continue;
-        }
-        for &hash in &file.hashes {
-            if !file.stale.contains(&hash)
-                && !file.covered.contains_key(&hash)
-                && !file.stored.contains(&hash)
-                && !file.twin_held.contains(&hash)
-            {
-                unresolved.entry(hash).or_default().push(at);
-            }
-        }
-    }
-    let union = unresolved.keys().copied().collect::<Vec<_>>();
-    let complete = index
-        .claude_request_census
-        .main_transcript_holders(None, &union, Some(deadline), |key, root, _, hits| {
-            for &hash in hits {
-                let Some(holder) = census_copy_holder(index, key, root, hash) else {
-                    continue;
-                };
-                for &at in &unresolved[&hash] {
-                    let file = &mut wanted[at];
-                    if holder < file.order
-                        && (root != file.session || !file.resumed || on_page.contains(&holder.1))
+                    if let Some(holder) = earliest_accepted_holder(
+                        index,
+                        hash,
+                        file.order,
+                        std::iter::once((key, session.as_str(), accepted)),
+                    )
+                    .filter(|h| session != &file.session || !file.resumed || on_page.contains(&h.1))
                     {
                         let earliest = file.covered.entry(hash).or_insert(holder);
                         *earliest = (*earliest).min(holder);
                     }
                 }
             }
-        })
-        .is_some()
-        && (union.is_empty() || Instant::now() < deadline);
+        }
+    }
     let pending = std::cell::OnceCell::new();
     let mut updates = CopyRemovalUpdates {
         // Stored removals leave only with their file
@@ -2972,7 +2919,7 @@ fn decide_holders(
         // Only the unresolved prefix waits. Persisted retry debt reselects
         // the file after its own-turn ACK, even when it is unchanged; its
         // third decision emits any remaining unproven requests flagged.
-        if !uncovered.is_empty() && (!complete || unwalked.contains(&wanted.folder)) {
+        if !uncovered.is_empty() && unwalked.contains(&wanted.folder) {
             defer_prefix(
                 &mut items[wanted.at],
                 &uncovered,
@@ -3146,9 +3093,7 @@ fn defer_prefix(
         return;
     }
     let age = state.hold_age(file);
-    if reason == "held_copy_deadline" {
-        state.keep_pending(file);
-    } else if !state.advance_hold(file) {
+    if !state.advance_hold(file) {
         record_wait_settled(Settled::Expired, age);
         restore_uncovered(item, &ids);
         if let Some(fold) = item.claude_money.as_deref_mut() {

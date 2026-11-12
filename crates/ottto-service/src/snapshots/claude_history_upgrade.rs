@@ -392,28 +392,11 @@ pub(super) fn claude_read_closure<'a>(
     family_keys: impl IntoIterator<Item = &'a String>,
     twins: &ClaudeTwinGroups,
     forced_roots: &BTreeSet<String>,
-    index: &super::ScanIndex,
 ) -> BTreeSet<PathBuf> {
     let mut paths = paths
         .into_iter()
         .map(Path::to_path_buf)
         .collect::<BTreeSet<_>>();
-    // Freeze seeds before adding holders: a pulled holder never cascades.
-    let holders = crate::snapshots::claude_request_money::e2::copied_file_holders(
-        index,
-        paths.iter().filter_map(|path| path.to_str()).filter(|key| {
-            index
-                .claude_request_census
-                .get(key)
-                .is_some_and(|record| record.is_twin())
-        }),
-        Some(
-            std::time::Instant::now()
-                + crate::snapshots::claude_request_money::e2::SIDE_CALL_DEADLINE,
-        ),
-        false,
-    )
-    .unwrap_or_default();
     let mut roots = crate::snapshots::claude_request_money::e2::selected_twin_roots(
         paths.iter().map(PathBuf::as_path),
         twins,
@@ -424,7 +407,6 @@ pub(super) fn claude_read_closure<'a>(
         let member = super::claude_index_path_member_ref(path)?;
         roots.contains(member.root).then(|| path.to_path_buf())
     }));
-    paths.extend(holders.into_values().map(PathBuf::from));
     paths
 }
 

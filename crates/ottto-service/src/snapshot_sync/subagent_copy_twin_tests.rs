@@ -123,7 +123,11 @@ fn subagent_all_copy_twins_conserve_pages_restart_and_device_replace() {
                 "the absent twin is positively proven redundant"
             );
         }
-        let mut replaced = prior.clone();
+
+        let (device_c, device_paths, device_index) = pair("subagent-copied-device");
+        let (mut replaced, _) = legacy(&device_c, device_index.clone());
+        let paths = &device_paths;
+        let c = &device_c;
         let births = paths
             .iter()
             .map(|p| {
@@ -132,7 +136,7 @@ fn subagent_all_copy_twins_conserve_pages_restart_and_device_replace() {
                     .observed_birth(&member(), &p.to_string_lossy())
             })
             .collect::<Vec<_>>();
-        for path in &paths {
+        for path in paths {
             crate::snapshots::e2_pipeline_scan_fixture::renumber_device_for_test(
                 &mut replaced,
                 &path.to_string_lossy(),
@@ -140,7 +144,7 @@ fn subagent_all_copy_twins_conserve_pages_restart_and_device_replace() {
         }
         owe(&mut replaced);
         let scanner = E2ScanFixture::with_subagent_births();
-        let mut page = ready(&c, &scanner, replaced, 100, true);
+        let mut page = ready(c, &scanner, replaced, 100, true);
         page.finish();
         let item = body(&page, &member()).unwrap();
         assert_eq!((item.request_count, item.output_tokens), (26, 11_525));
@@ -159,14 +163,23 @@ fn subagent_all_copy_twins_conserve_pages_restart_and_device_replace() {
                 .collect::<Vec<_>>(),
             births
         );
-        money_oracle::assert_equivalent(&routes[0], &captured(&page, Mode::Restart));
+        let mut expected = ready(
+            c,
+            &E2ScanFixture::with_subagent_births(),
+            device_index,
+            100,
+            false,
+        );
+        expected.finish();
+        let expected = captured(&expected, Mode::ColdFull);
+        money_oracle::assert_equivalent(&expected, &captured(&page, Mode::Restart));
     });
 }
 
-/// [money] An own turn preserves the pre-cutoff decision: shared history
-/// still takes today's cutoff and the new own response counts immediately.
+/// [money] A pre-cutoff copied prefix counts once and the appended own
+/// response still counts immediately.
 #[test]
-fn subagent_twin_with_own_turn_keeps_the_cutoff() {
+fn subagent_twin_with_own_turn_counts_the_prefix_once() {
     with_e2(|| {
         let (mut c, paths, index) = pair("subagent-copied-own-turn");
         let (prior, _) = legacy(&c, index);
@@ -181,17 +194,17 @@ fn subagent_twin_with_own_turn_keeps_the_cutoff() {
             100,
             false,
         );
-        assert_eq!(body(&page, &member()).unwrap().request_count, 53);
+        assert_eq!(body(&page, &member()).unwrap().request_count, 27);
         assert_eq!(
             body(&page, &member()).unwrap().removed_request_count,
-            Some(0)
+            Some(26)
         );
     });
 }
 
-/// [money] Idle shared-id subagent homes both re-owe once. An incomplete
-/// walk stamps nothing; after restart one explained 52→26 correction is
-/// accepted, then no second re-owe or quiet upload occurs.
+/// [money] Idle shared-id subagent homes both re-owe once; after restart
+/// one explained 52→26 correction is accepted, then no second re-owe or
+/// quiet upload occurs.
 #[test]
 fn subagent_twin_version_three_converges_once() {
     with_e2(|| {
@@ -199,19 +212,7 @@ fn subagent_twin_version_three_converges_once() {
         let (mut prior, head) = legacy(&c, index);
         prior.claude_money_birth_store.set_money_rule_version(2);
         prior.activate_effective_upload_body_witness_revision(3);
-        // Keep a main candidate in the shared walk so the existing forced
-        // deadline seam exercises the complete v3 transaction as well.
-        prior.claude_money_birth_store.set_money_marks(
-            &c.root.join(file(ROOT)).to_string_lossy(),
-            e2::money_mark::DISCLOSED,
-        );
         e2::take_diag();
-        crate::snapshots::claude_request_census::with_walk_deadline_for_test(|| {
-            e2::apply_money_rules(&mut prior)
-        });
-        assert_eq!(prior.claude_money_birth_store.money_rule_version(), 2);
-        prior = c.reload(&mut prior);
-        prior.activate_effective_upload_body_witness_revision(3);
         e2::apply_money_rules(&mut prior);
         assert_eq!(prior.claude_money_birth_store.money_rule_version(), 3);
         assert_eq!(copy_diag(&["money_rule_v3_reowed"]), [2]);
@@ -273,5 +274,80 @@ fn subagent_twin_version_three_converges_once() {
         });
         assert_eq!(consumed, 0);
         assert!(quiet.scan.snapshots.is_empty());
+    });
+}
+
+/// [money] A pre-cutoff shared prefix is removed once, while unmatched
+/// pre-birth responses are own turns. Co-page, copy alone and restart
+/// conserve the same native body and account placement.
+#[test]
+fn subagent_prefix_with_prebirth_own_turns_counts_once() {
+    with_e2(|| {
+        let (mut c, paths, index) = pair("subagent-prefix-prebirth-own");
+        let own =
+            line(ROOT, "own-before-birth-1", A.1, 7) + &line(ROOT, "own-before-birth-2", A.1, 9);
+        let text = std::fs::read_to_string(&paths[1]).unwrap() + &own;
+        c.write_at(&format!("new/{ROOT}/subagents/{AGENT}.jsonl"), &text, BORN);
+        let scanner = E2ScanFixture::with_subagent_births();
+        let mut first = ready(&c, &scanner, index.clone(), 100, true);
+        first.finish();
+        let item = body(&first, &member()).unwrap();
+        assert_eq!((item.request_count, item.output_tokens), (28, 11_541));
+        assert_eq!(item.removed_request_count, Some(26));
+        let expected = captured(&first, Mode::ColdFull);
+        let committed = first.committed.clone();
+        let prior = settle(&c, &committed, first, &mut e2_progress());
+        for mode in [Mode::Ram, Mode::Restart] {
+            let mut index = prior.clone();
+            if mode == Mode::Restart {
+                index = c.reload(&mut index);
+            }
+            owe(&mut index);
+            let mut page = ready(&c, &scanner, index, 100, true);
+            page.finish();
+            assert_eq!(
+                body(&page, &member()).unwrap().removed_request_count,
+                Some(26)
+            );
+            money_oracle::assert_equivalent(&expected, &captured(&page, mode));
+        }
+        // The copy alone includes both the shared prefix and its two own
+        // responses; the original's ids are all present, so absence is safe.
+        for path in [&paths[1]] {
+            let mut index = prior.clone();
+            owe(&mut index);
+            index = crate::snapshots::e2_pipeline_scan_fixture::save_reload_for_test(
+                &mut index,
+                &c.base.join("prefix-singleton.json"),
+            );
+            let mut page = c.raw(&scanner, index, 100, true, &[]);
+            let location = location_key(&path.to_string_lossy());
+            page.scan.snapshots.retain(|item| {
+                item.claude_money
+                    .as_deref()
+                    .and_then(e2::FileFold::location_key)
+                    == Some(location)
+            });
+            assert_eq!(page.scan.snapshots.len(), 1);
+            page.enrich(&c);
+            page.finish();
+            assert_eq!(
+                (
+                    body(&page, &member()).unwrap().request_count,
+                    body(&page, &member()).unwrap().output_tokens
+                ),
+                (28, 11_541)
+            );
+        }
+        let mut index = prior;
+        index.claude_money_birth_store.set_money_rule_version(2);
+        index.activate_effective_upload_body_witness_revision(3);
+        e2::take_diag();
+        e2::apply_money_rules(&mut index);
+        assert_eq!(
+            copy_diag(&["money_rule_v3_reowed"]),
+            [2],
+            "prefix pairs are selected too"
+        );
     });
 }
