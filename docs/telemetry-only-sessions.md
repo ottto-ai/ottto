@@ -13,10 +13,9 @@ sessions. Incomplete scope or evidence stays owed.
 
 The collector regenerates cumulative bodies from the strict API and trace pair
 loaders, uses the ordinary request reducer and identity rules, and uploads
-through normal CAS and exact entity acknowledgement. Retention requires an
-accepted-only binding committed in the same progress ledger, for this
-destination, body and pair generations. Generation equality is rechecked under
-the relay append lock before unlinking.
+through normal CAS and exact entity acknowledgement. Telemetry file release
+follows separately; every file stays held, exactly as before. Unchanged-body
+suppression uses existing ACK witnesses and the candidate's API/trace generations.
 
 Verification prompts use fresh UUIDs in reserved namespace
 `6f747474-6f00-4f00-8f00-*`. The relay excludes these API and trace rows before
@@ -25,7 +24,7 @@ OpenTelemetry exporters through inline settings and preserves
 `--no-session-persistence`. The local usage refresher is unchanged.
 
 Candidates remain in the existing root-keyed progress ledger while evidence,
-identity or delivery proof is incomplete. Receiver identity limits hold the
+identity or upload settlement is incomplete. Receiver identity limits hold the
 whole telemetry-only body and use the existing over-cap diagnostics. They
 never authorize sending a smaller or identity-stripped replacement.
 

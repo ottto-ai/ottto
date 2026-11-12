@@ -323,7 +323,15 @@ fn admission_save_failure_keeps_pending_notice_and_saved_candidate_detects_growt
         let bad = c.base.join("not-a-directory");
         std::fs::write(&bad, b"file").unwrap();
         let mut p = progress();
-        let mut scan = SourceScanResult::new(SnapshotSource::ClaudeCode);
+        let mut scan = c
+            .raw(
+                &E2ScanFixture::capturing_identity(),
+                ScanIndex::default(),
+                100,
+                false,
+                &[],
+            )
+            .scan;
         assert!(p
             .seed_telemetry(
                 &c.support,
