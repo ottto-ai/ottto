@@ -411,7 +411,9 @@ existing inclusive side-map charge. Its process-wide cache fields are
 `desktop_title_facts_bytes`. These reuse requested-layout charges, exclude
 inline stack storage, and conservatively charge shared buffers per owner.
 Unknown/unsupported charges or busy cache locks are `null`, never invented
-zeros; finishes without the capture omit the object. Cache values repeat
+zeros; finishes without the capture omit the object. The existing
+`sample_cost_us` includes the retained-layout capture work. Pass wall/CPU
+include diagnostics work, too. Cache values repeat
 across source rows and must not be summed. CLI metadata and active-session
 reconciliation have no existing heap charge; no new estimator is introduced.
 

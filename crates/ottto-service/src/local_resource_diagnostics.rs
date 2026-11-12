@@ -1618,7 +1618,10 @@ fn source_finish_inner<T>(
     window.finish_sample = Some(after);
     window.pass = source_slot(source)
         .and_then(|slot| with_passes(|p| p.lock().unwrap_or_else(|e| e.into_inner())[slot].take()))
-        .map(|(start, before, zone_start, retained_heap_bytes)| {
+        .map(|(start, before, zone_start, retained)| {
+            let (retained_heap_bytes, retained_cost_us) = retained
+                .map(|(bytes, cost)| (Some(bytes), cost))
+                .unwrap_or_default();
             let counters = before
                 .and_then(|p| p.disk)
                 .zip(after.and_then(|p| p.disk))
@@ -1634,7 +1637,7 @@ fn source_finish_inner<T>(
                 malloc_allocated_bytes_start: zone_start[1],
                 malloc_in_use_bytes: zone_end.0,
                 malloc_allocated_bytes: zone_end.1,
-                sample_cost_us: wall_us(started),
+                sample_cost_us: wall_us(started).saturating_add(retained_cost_us),
                 retained_heap_bytes,
             }
         });
@@ -1646,13 +1649,16 @@ type PassStart = (
     Instant,
     Option<ProcessSample>,
     [Option<u64>; 2],
-    Option<RetainedBytes>,
+    Option<(RetainedBytes, u64)>,
 );
-pub(crate) fn pass_retained(source: &str, bytes: RetainedBytes) {
+pub(crate) fn pass_retained(source: &str, measure: impl FnOnce() -> RetainedBytes) {
+    let started = Instant::now();
+    let bytes = measure();
+    let cost_us = wall_us(started);
     if let Some(slot) = source_slot(source) {
         with_passes(|p| {
             if let Some(pass) = p.lock().unwrap_or_else(|e| e.into_inner())[slot].as_mut() {
-                pass.3 = Some(bytes);
+                pass.3 = Some((bytes, cost_us));
             }
         });
     }
@@ -3225,10 +3231,9 @@ mod tests {
             let (_, records) = capture(|| {
                 source_prepare(source, || (), |_| false);
                 source_finish(source, false, || {
-                    pass_retained(
-                        source,
-                        BTreeMap::from([("files_bytes", Some(123)), ("side_maps_bytes", None)]),
-                    );
+                    pass_retained(source, || {
+                        BTreeMap::from([("files_bytes", Some(123)), ("side_maps_bytes", None)])
+                    });
                     Ok(())
                 })
                 .unwrap();
