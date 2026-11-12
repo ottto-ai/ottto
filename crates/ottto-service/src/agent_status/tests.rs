@@ -3074,6 +3074,10 @@ mod cli_metadata_tests {
     include!("cli_metadata_tests.rs");
 }
 
+mod codex_identity_state_tests {
+    include!("codex_identity_state_tests.rs");
+}
+
 #[cfg(unix)]
 #[test]
 #[serial]
