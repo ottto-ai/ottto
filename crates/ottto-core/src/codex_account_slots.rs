@@ -1299,14 +1299,13 @@ impl FileCodexAccountSlotSettingsStore {
         // A setup that no longer signs in needs no staging home: remove it once
         // that is durable, still under the transaction lock. A failure leaves
         // it for the slot's next sign-in or removal.
-        match persisted.setup_operation.slot_id.as_deref() {
-            Some(slot_id)
-                if setup_uses_staging(&persisted.setup_operation)
-                    && !signing_in(&persisted.setup_operation) =>
-            {
-                let _ = self.discard_sign_in_staging(slot_id);
-            }
-            _ => {}
+        let operation = &persisted.setup_operation;
+        if let Some(slot_id) = operation
+            .slot_id
+            .as_deref()
+            .filter(|_| setup_uses_staging(operation) && !signing_in(operation))
+        {
+            let _ = self.discard_sign_in_staging(slot_id);
         }
         Ok(())
     }

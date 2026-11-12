@@ -18788,7 +18788,7 @@ for line in sys.stdin:
             let staging = staging_home(&home);
             let before = fs::read(home.join("auth.json")).expect("credential");
             let later =
-                |days| synthetic_auth("synthetic-user", "synthetic-workspace", days * 86_400);
+                |days: i64| synthetic_auth("synthetic-user", "synthetic-workspace", days * 86_400);
             fixture.set("auth-body", &later(2));
             fixture.set("replacement-body", &later(3));
             // The second read of the staging home is the final check.
