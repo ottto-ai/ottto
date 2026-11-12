@@ -1777,64 +1777,6 @@ Retries count again; a cooperative yield does not recount a completed decision.
 Miss keys are fixed, content-free class labels: `no_entry`,
 `ineligible.history_owed`, `missing`, `unavailable`.
 
-## Claude Family Census Shadow (schema 2 additive)
-
-Each Claude Code scan page emits one `local_resources` record with stage
-`claude_family_census_shadow`, under `counts`. It estimates, per session family
-(a root transcript and its subagents), whether the family would be complete in
-the current census window. It is shadow-only: the record changes no read,
-census bit, manifest, upload, retirement or other decision. Other sources emit
-no such record. The row holds counts, ages, fixed reason names and one order-free
-digest; no paths, ids, account hashes or request hashes.
-
-**Units.** A page evaluates the families its selection touched
-(`touched_families`, with `touched_families_over_cap` beyond the bound of 1,024),
-the families its previous page parsed (`followup_families`), and up to 64 others
-from a rotating cursor (`rotation_families`). Family counts are evaluations on
-this page: a family can repeat across pages, so they are neither distinct
-families nor a stock, and rows must not be summed into one.
-
-**Strict partition.** Every evaluated family (`families_evaluated`) is exactly
-one of `family_census_complete`, `family_complete_deferred.quantum` (complete past
-the limit of 64 per page), or one first-match reason in
-`family_census_incomplete`, tried in this order: `membership_unknown`, `queued`,
-`refused_read`, `refused_read_unattributed`, `held`, `quarantine`, `residue`,
-`evidence`, `evidence/presence_only`, `not_current_window`, `path_not_unique`.
-`singleton_families_evaluated` is included in `families_evaluated`.
-`families_unevaluated_member_budget` counts families left for a later page, which
-are not in `families_evaluated`.
-
-**Freshness.** `pending_census_members` describes the skipped set: `count`
-(queue plus replay entries), `replay`, `replay_repeat`, `oldest_age_s`,
-`over_24h`, `tracked`, `unqueued_unresolved`, `pace_evicted` and `stamped_for_s`.
-`skipped_set` holds `digest` and `retained`, the entries the previous page also
-skipped. `sticky_vetoes` holds `namespace_loss_age_s` and `unattributed_age_s`,
-null when the veto is not latched. These are process-local, and restart, a scope
-change or an eviction (`pace_evicted`) resets them, so every age is a LOWER BOUND
-across a restart and `stamped_for_s` caps it. Attestations reset the same way, so
-after a restart members count `evidence/presence_only` until ordinary work attests
-them again. Attestations and vetoes also reset with each new traversal generation.
-
-**Work counters.** These are approximate units, not exact operations.
-`member_keys_visited` is range advances of the member lookups, at most 16,384.
-Under `cost`: `root_index_keys_processed` is keys the uniqueness pass consumed,
-at most 8,192, plus one check per parse; the merged loop may also peek up to 2
-keys it does not count. `rotation_keys_visited`, `queue_entries_visited` (two
-passes over the queue, not bounded by a constant) and `history_gates_visited`
-count entries. `predicate_cpu_us` is thread CPU, and excludes mutex wait.
-`families_evaluated`, `attested_keys`, `attestations_evicted` and
-`runtime_heap_bytes` (retained shadow state after the page, excluding page
-transients) are gauges. `root_index_restarted`, `root_index_complete`,
-`root_index_overflowed`, `queued_roots_overflowed` and `history_gates_overflowed`
-are flags. At the top level, `shadow_decision_calls`
-and `shadow_attest_micros` measure this page's equality attestation, and
-`attest_capped` counts Skips past the limit of 4,096 per page, not attested.
-
-**Zero and unavailable.** A zero count is a real zero for that page. An absent
-record means the page had no traversal state or was not Claude. Uniqueness is
-unavailable while `cost.root_index_complete` is false, and families then count
-`path_not_unique`.
-
 ## Pi reported-cost parsing
 
 Pi cost fields use checked decimal arithmetic and an inclusive $100,000 ceiling
@@ -2400,30 +2342,3 @@ no authority-terminal counts, and before this process's first walk end `debt` is
 `null`. Only the walk in progress is process-local, so a walk resumed after a
 restart erases nothing and records no complete discovery. The row carries counts
 only.
-
-### Money freshness (Claude queue and replay)
-
-The Claude shadow and freshness gauges are always on and share one
-`claude_family_census_shadow` emission. Gauges are flattened into
-`counts.pending_census_members`: the existing `oldest_age_s`, `over_24h`, `tracked`
-and `unqueued_unresolved` describe the bounded pending stamps; no duplicate
-oldest-skipped or skipped-tracked fields or second queue traversal is added.
-`count` includes queue/replay occurrences, while age thresholds count retained
-unique queued files. `tracked` also includes unresolved files no longer queued.
-All ages are process-local LOWER BOUNDS, never inputs to decisions.
-
-`discovered_unread_tracked_files`, `oldest_discovered_unread_age_seconds` and
-`discovered_unread_over_24h_tracked_files` cover unindexed, non-replay queued work.
-Indexed or replay work is counted separately. No retained index is not proof a
-physical file has never been read. Queue/replay overlaps are deduplicated among
-retained stamps. `skipped_untracked_entries` and
-`discovered_unread_untracked_entries` disclose lost coverage at the existing
-16,384-stamp bound; they are occurrences, not invented distinct-file counts.
-Directories not yet enumerated and files outside the skipped view are uncovered.
-
-Memory remains bounded by the existing 16,384 stamps (16 bytes each), accounted
-by runtime_heap_bytes and its retained bound. Classification is transient in the
-existing bounded heap/vector; there is no separate gauge dedup allocation or
-scope ledger. Enlarged stamp transients are conservatively bounded by an
-additional 4 MiB. No child-finalize eligibility measurement, dormant
-family-consumer API or money/read/census decision is added.
