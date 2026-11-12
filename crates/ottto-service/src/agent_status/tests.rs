@@ -4269,6 +4269,19 @@ fn codex_managed_home_whose_refresh_is_dead_needs_a_new_sign_in() {
     assert!(codes(&default).contains(&"codex_identity_unknown".to_string()));
     assert!(default.binding.is_none());
 
+    // A new sign-in rewrites the auth file: the dead reading is not served.
+    write_other_synthetic_codex_account(&home);
+    let signed_in_again = collect(
+        "codex_slot_dead_refresh",
+        CodexAccountSlotOwnershipV1::Managed,
+        Some(registered.clone()),
+        CodexQuotaRead::Saved,
+    );
+    assert_ne!(
+        signed_in_again.status.state,
+        CodexAccountSlotCollectionStateV1::NeedsLogin
+    );
+
     codex_credit_grants::forget_binding_cadence(&codex_credit_grants::binding_key(
         &registered.0,
         &registered.1,
@@ -4278,21 +4291,22 @@ fn codex_managed_home_whose_refresh_is_dead_needs_a_new_sign_in() {
 
 #[test]
 fn codex_forced_refresh_logs_its_outcome_class_and_home_digest_only() {
-    let null = serde_json::json!({"account": null, "requiresOpenaiAuth": true});
-    let named = serde_json::json!({"account": {"type": "chatgpt"}});
-    assert_eq!(codex_forced_refresh_outcome(true, None, true), "timeout");
     assert_eq!(
-        codex_forced_refresh_outcome(false, Some(&null), true),
+        codex_forced_refresh_outcome(true, true, true),
         "account_null"
     );
+    assert_eq!(codex_forced_refresh_outcome(false, true, true), "timeout");
     assert_eq!(
-        codex_forced_refresh_outcome(false, Some(&named), true),
+        codex_forced_refresh_outcome(false, false, true),
         "rewritten"
     );
     assert_eq!(
-        codex_forced_refresh_outcome(false, None, false),
+        codex_forced_refresh_outcome(false, false, false),
         "not_rewritten"
     );
+    assert!(codex_app_server_account_absent(
+        &serde_json::json!({"account": null, "requiresOpenaiAuth": true})
+    ));
     // No account field at all, or no sign-in needed, is not a dead login.
     assert!(!codex_app_server_account_absent(&serde_json::json!({})));
     assert!(!codex_app_server_account_absent(

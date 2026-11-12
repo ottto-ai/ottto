@@ -3544,7 +3544,7 @@ fn collect_codex_status_for_home(
     });
 
     let auth_account = read_codex_auth_account_at(codex_home, home_trust);
-    let has_auth = matches!(auth_account, Ok(Some(_)));
+    let has_auth = ottto_core::codex_auth_file_mark(codex_home).is_some();
     // Reuse login metadata only when this pass's fresh auth read covers every
     // variable field the CLI fallback can fill. Incomplete/unreadable auth must
     // run the CLI fresh; the full parsed account is never cached.
@@ -16846,6 +16846,10 @@ struct CodexAppServerRun {
     /// Why this session forced a refresh of the home's login, if it did
     /// ([`codex_probe_refresh_reason`]).
     refresh_reason: Option<&'static str>,
+    /// `account/read` answered with no account
+    /// ([`codex_app_server_account_absent`]), whatever the rest of the
+    /// session did.
+    account_absent: bool,
 }
 
 /// Provider requests a started `codex app-server` quota session counts at
@@ -16955,8 +16959,8 @@ fn call_codex_app_server_rate_limits_for_home(
     }
     if let Some(reason) = run.refresh_reason {
         let outcome = codex_forced_refresh_outcome(
+            run.account_absent,
             run.timed_out,
-            result.as_ref().ok().map(|observation| &observation.account),
             ottto_core::codex_auth_file_mark(codex_home) != auth_before,
         );
         eprintln!(
@@ -16973,19 +16977,20 @@ fn call_codex_app_server_rate_limits_for_home(
     result
 }
 
-/// What a session that forced a login refresh saw by its end: it timed out,
-/// the provider named no account (the refresh failed for good), or the
-/// home's `auth.json` was or was not rewritten. Codex may still finish a
-/// refresh after the session ends, so `not_rewritten` is as of that end.
+/// What a session that forced a login refresh saw by its end: the provider
+/// named no account (the refresh failed for good, whether or not the quota
+/// read then worked), the session timed out, or the home's `auth.json` was or
+/// was not rewritten. Codex may still finish a refresh after the session
+/// ends, so `not_rewritten` is as of that end.
 fn codex_forced_refresh_outcome(
+    account_absent: bool,
     timed_out: bool,
-    account: Option<&Value>,
     auth_rewritten: bool,
 ) -> &'static str {
-    if timed_out {
-        "timeout"
-    } else if account.is_some_and(codex_app_server_account_absent) {
+    if account_absent {
         "account_null"
+    } else if timed_out {
+        "timeout"
     } else if auth_rewritten {
         "rewritten"
     } else {
@@ -17222,7 +17227,12 @@ fn run_codex_app_server_rate_limits_for_home(
             (Some("ottto_account"), Some(error)) => {
                 break Err(rpc_failure("account", error));
             }
-            (Some("ottto_account"), None) => account_result = message.get("result").cloned(),
+            (Some("ottto_account"), None) => {
+                account_result = message.get("result").cloned();
+                run.account_absent = account_result
+                    .as_ref()
+                    .is_some_and(codex_app_server_account_absent);
+            }
             (Some("ottto_rate_limits"), Some(error))
                 if !detail_requested && codex_credit_grants::routine_param_rejected(error) =>
             {
