@@ -18738,16 +18738,18 @@ for line in sys.stdin:
                 workspace.clone(),
             )
             .expect("reconnect");
-            // The fake login takes 300 ms, so the lock is held long before the
-            // final check can publish.
-            start_codex_sign_in(1, operation).expect("start sign-in");
-            crate::agent_status::with_codex_home_read_lock(&home, || {
+            // Hold the slot's read lock from before the sign-in starts. The
+            // final check cannot publish while it is held, so the slot keeps
+            // its login; once it is released, the link and rename that publish
+            // set the file's change time.
+            let released_at = crate::agent_status::with_codex_home_read_lock(&home, || {
+                start_codex_sign_in(1, operation).expect("start sign-in");
                 let deadline = Instant::now() + Duration::from_secs(20);
                 while fixture.app_server_runs_for(&staging) < 2 {
                     assert!(Instant::now() < deadline, "the final check never ran");
                     std::thread::sleep(Duration::from_millis(20));
                 }
-                std::thread::sleep(Duration::from_millis(500));
+                std::thread::sleep(Duration::from_millis(1500));
                 assert_eq!(
                     fs::read(home.join("auth.json")).expect("credential"),
                     before
@@ -18760,6 +18762,7 @@ for line in sys.stdin:
                     CodexAccountSetupOperationStateV1::Complete,
                     "published while the slot's home was locked"
                 );
+                SystemTime::now()
             });
             let ended = fixture.ended();
             assert_eq!(
@@ -18769,6 +18772,16 @@ for line in sys.stdin:
             assert_eq!(
                 fs::read_to_string(home.join("auth.json")).expect("new credential"),
                 renewed
+            );
+            let changed = {
+                use std::os::unix::fs::MetadataExt;
+                let metadata = fs::metadata(home.join("auth.json")).expect("credential");
+                UNIX_EPOCH + Duration::new(metadata.ctime() as u64, metadata.ctime_nsec() as u32)
+            };
+            // The kernel's change-time clock is coarse: allow 100 ms.
+            assert!(
+                changed + Duration::from_millis(100) >= released_at,
+                "published before the slot's lock was released"
             );
             let config = fs::read_to_string(home.join("config.toml")).expect("config");
             assert!(config.contains("forced_chatgpt_workspace_id = \"synthetic-workspace\""));

@@ -1537,9 +1537,22 @@ impl Drop for CodexAccountSlotTransactionGuard<'_> {
 
 fn status_contract(persisted: &PersistedCodexAccountSlotsV1) -> CodexAccountsStatusV1 {
     let used_slots = 1_u8.saturating_add(persisted.managed_slot_ids.len() as u8);
+    let mut setup_operation = persisted.setup_operation.clone();
+    // A named setup saved by a version without staging homes names the
+    // slot's own home, whose login `codex login` would revoke: never hand it
+    // out. A daemon-run sign-in of that setup creates the staging home.
+    let staging = format!("{}{SIGN_IN_STAGING_DIR_NAME}'", std::path::MAIN_SEPARATOR);
+    if setup_uses_staging(&setup_operation)
+        && setup_operation
+            .launch_command
+            .as_deref()
+            .is_some_and(|command| !command.contains(&staging))
+    {
+        setup_operation.launch_command = None;
+    }
     CodexAccountsStatusV1 {
         schema_version: CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
-        setup_operation: persisted.setup_operation.clone(),
+        setup_operation,
         default_slot: CodexAccountSlotDescriptorV1 {
             slot_id: "default".to_string(),
             ownership: CodexAccountSlotOwnershipV1::Default,
@@ -1743,10 +1756,10 @@ fn signing_in(operation: &CodexAccountSetupOperationV1) -> bool {
 }
 
 /// Publish the verified login of the staging home into the slot's `home`:
-/// copy its `config.toml` (the verified restriction; no credential), then
 /// hard-link its `auth.json` into `home` under [`PUBLISHING_LOGIN_FILE_NAME`]
 /// and keep that link only if it is the file the check read (`validated`:
-/// inode, size, modified time), then rename it over the slot's `auth.json`.
+/// inode, size, modified time), copy its `config.toml` (the verified
+/// restriction; no credential), then rename the link over `auth.json`.
 /// The staging copy stays until the acceptance is written. The credential is
 /// never read.
 fn publish_verified_login(
@@ -1754,11 +1767,6 @@ fn publish_verified_login(
     home: &Path,
     validated: CodexAuthFileMark,
 ) -> std::io::Result<()> {
-    let config =
-        read_codex_config_file_secure(staging, CodexHomeTrust::Managed)?.ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::NotFound, "the Codex config is missing")
-        })?;
-    write_owner_only_file_at(home, "config.toml", &config)?;
     let publishing = home.join(PUBLISHING_LOGIN_FILE_NAME);
     let _ = fs::remove_file(&publishing);
     fs::hard_link(staging.join("auth.json"), &publishing)?;
@@ -1769,6 +1777,11 @@ fn publish_verified_login(
             "the Codex login changed after it was verified",
         ));
     }
+    let config =
+        read_codex_config_file_secure(staging, CodexHomeTrust::Managed)?.ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "the Codex config is missing")
+        })?;
+    write_owner_only_file_at(home, "config.toml", &config)?;
     fs::rename(&publishing, home.join("auth.json"))?;
     // A rename onto another link of the same file (a repeated publication)
     // leaves the name in place.
@@ -3705,6 +3718,42 @@ mod tests {
     /// publish only the verified login into the slot.
     mod staging_sign_in {
         use super::*;
+
+        /// [regress] A reconnect saved by a version without staging homes
+        /// kept a launch command naming the slot's own home: it is never
+        /// handed out, by status or by a replay.
+        #[test]
+        fn a_saved_command_naming_the_slots_home_is_not_handed_out() {
+            let (root, store) = test_store("legacy-command");
+            let slot_id = complete_a_reconnect(&store);
+            let home = store.slot_home(&slot_id).expect("home");
+            let operation = format!("codex_setup_{}", "5".repeat(32));
+            let reconnect = || {
+                store.begin_reconnect(
+                    CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
+                    operation.clone(),
+                    &slot_id,
+                    "d".repeat(64),
+                    "e".repeat(64),
+                )
+            };
+            let current = reconnect().expect("begin reconnect");
+            assert!(current.setup_operation.launch_command.is_some());
+            let mut saved: serde_json::Value =
+                serde_json::from_slice(&fs::read(&store.path).expect("settings")).expect("json");
+            saved["setup_operation"]["launch_command"] = codex_login_command(&home).into();
+            fs::write(&store.path, serde_json::to_vec(&saved).expect("json")).expect("settings");
+
+            let loaded = store.load().expect("load");
+            assert_eq!(
+                loaded.setup_operation.state,
+                CodexAccountSetupOperationStateV1::WaitingForUserLogin
+            );
+            assert_eq!(loaded.setup_operation.launch_command, None);
+            let replay = reconnect().expect("replay");
+            assert_eq!(replay.setup_operation.launch_command, None);
+            let _ = fs::remove_dir_all(root);
+        }
 
         /// [behaviour] A login replaced in the staging home after its check is
         /// never published: the slot keeps its login and the setup is not
