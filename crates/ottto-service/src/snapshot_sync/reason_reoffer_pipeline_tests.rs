@@ -2867,23 +2867,25 @@ fn upload_outage_keeps_the_read_and_resends_from_the_head() {
                 "{label}: exact ACK"
             );
             assert!(
-                !recovery
-                    .progress
-                    .quarantined_fingerprints
-                    .contains_key(&fingerprint),
+                recovery
+                    .index
+                    .quarantined_snapshot_fingerprints
+                    .get(&fingerprint)
+                    .is_none_or(|record| {
+                        record.disposition != SnapshotQuarantineDisposition::RetryPending
+                    }),
                 "{label}: the ACK clears the custody"
             );
-            // The outage itself held the body without an ACK, refusal or loss.
+            // The outage itself committed the body's custody, without an ACK
+            // or a poison loss.
             assert!(
-                !first.progress.accepted_fingerprints.contains(&fingerprint),
+                !first
+                    .index
+                    .accepted_snapshot_fingerprint_recorded(&fingerprint),
                 "{label}: no ACK invented"
             );
-            assert!(
-                first.progress.permanent_rejections.is_empty(),
-                "{label}: no refusal"
-            );
             assert_eq!(
-                first.progress.quarantined_fingerprints[&fingerprint].disposition,
+                first.index.quarantined_snapshot_fingerprints[&fingerprint].disposition,
                 SnapshotQuarantineDisposition::RetryPending,
                 "{label}: outage custody"
             );
