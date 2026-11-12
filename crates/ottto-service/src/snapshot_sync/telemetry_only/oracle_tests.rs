@@ -471,6 +471,10 @@ fn telemetry_only_carry_child() {
                 .insert(key.clone(), json!({"observations":[]}));
             state.accepted_cache_heads.insert(key, "a".repeat(64));
             state.save(&path).unwrap();
+            // The row owner releases resident hints after COMMIT. Compare the
+            // durable row on both sides, not an evicted writer-side cache.
+            state.load_identity([ROOT]).unwrap();
+            assert!(state.accepted_identity_buckets.get(ROOT).is_some());
             let expected = (
                 state.accepted_body_witnesses.clone(),
                 state.accepted_cache_states.clone(),

@@ -388,7 +388,7 @@ fn pairing_boundaries_repair_and_healthy_empty_are_distinct_from_faults() {
             batches.is_empty(),
             "repair preserves the already accepted exact body"
         );
-        money_oracle::assert_carried_equivalent(&accepted, &held_route(&accepted, &p));
+        money_oracle::assert_held(ROOT, &accepted, &held_route(&accepted, &p), &accepted);
         let mut h = hint();
         h.claude_otel_only_pairing_floor = Some("2026-08-02T06:59:00Z".into());
         assert!(page(&c, &mut p, &h, WireBudget::default())
@@ -710,6 +710,7 @@ fn transcript_twins_off_page_holders_and_takeover_preserve_existing_money() {
         let mut p = progress();
         let only = page(&c, &mut p, &hint(), WireBudget::default());
         let accepted = send(&only, &mut p, Mode::ColdFull);
+        let before_takeover = restore(&p);
         let path = c.root(ROOT, &line(ROOT, "before", AT, 11));
         let mut transcript = page(&c, &mut p, &hint(), WireBudget::default());
         assert!(transcript
@@ -733,7 +734,9 @@ fn transcript_twins_off_page_holders_and_takeover_preserve_existing_money() {
             4
         );
         let replacement = send(&transcript, &mut p, Mode::Ram);
-        let mut full = progress();
+        // Native share hints retain prior accepted keys across revisions.
+        // Both acquisition routes must start with that same ACK history.
+        let mut full = restore(&before_takeover);
         let reference = page(&c, &mut full, &hint(), WireBudget::default());
         money_oracle::assert_equivalent(&send(&reference, &mut full, Mode::ColdFull), &replacement);
         assert_ne!(
