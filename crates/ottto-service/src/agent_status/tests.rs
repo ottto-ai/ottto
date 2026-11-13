@@ -3283,7 +3283,7 @@ fn codex_status_reads_serve_the_saved_reading_and_never_start_app_server() {
 }
 
 /// The explicit refresh reads now, at most once a minute per home; the
-/// schedule reads an unused home again only after 15 minutes.
+/// schedule reads an unused home again only after the unused interval.
 #[cfg(unix)]
 #[test]
 #[serial]
@@ -3305,18 +3305,19 @@ fn codex_explicit_refresh_is_rate_limited_and_the_schedule_waits_its_interval() 
     assert_eq!(second.rate_limited, 1);
     assert_eq!(codex_app_server_runs(), before + 1);
 
-    // The schedule: the home is not in use, so it is not due before 15
-    // minutes, and due at 15.
+    // The schedule: the home is not in use, so it is not due before the
+    // unused interval, and due at it.
+    let u = codex_saved_quota::UNUSED_REFRESH_SECONDS;
     let now = current_unix_seconds();
     assert_eq!(
-        codex_saved_quota::scheduled_round(&support, now + 14 * 60),
+        codex_saved_quota::scheduled_round(&support, now + u - 60),
         0
     );
     assert_eq!(codex_app_server_runs(), before + 1);
     assert_eq!(
         with_trigger(Trigger::Schedule, || codex_saved_quota::scheduled_round(
             &support,
-            now + 15 * 60 + 1
+            now + u + 1
         )),
         1
     );
@@ -3445,7 +3446,10 @@ fn codex_background_refresh_off_stops_the_schedule_but_not_refresh_or_setup() {
         .set_quota_refresh_consent(1, true)
         .expect("turn on");
     assert_eq!(
-        codex_saved_quota::scheduled_round(&support, now + 15 * 60 + 1),
+        codex_saved_quota::scheduled_round(
+            &support,
+            now + codex_saved_quota::UNUSED_REFRESH_SECONDS + 1
+        ),
         1
     );
     assert_eq!(codex_app_server_runs(), before + 3);
@@ -3651,16 +3655,14 @@ fn codex_auth_rewritten_by_the_read_keeps_the_reading_for_the_same_login() {
         )
     });
     // Not read again a minute later, nor before the unused interval.
+    let u = codex_saved_quota::UNUSED_REFRESH_SECONDS;
     assert_eq!(codex_saved_quota::scheduled_round(&support, now + 61), 0);
     assert_eq!(
-        codex_saved_quota::scheduled_round(&support, now + 15 * 60 - 30),
+        codex_saved_quota::scheduled_round(&support, now + u - 30),
         0
     );
     assert_eq!(codex_app_server_runs(), before + 1);
-    assert_eq!(
-        codex_saved_quota::scheduled_round(&support, now + 15 * 60 + 1),
-        1
-    );
+    assert_eq!(codex_saved_quota::scheduled_round(&support, now + u + 1), 1);
     assert_eq!(codex_app_server_runs(), before + 2);
 
     // The next read switches the home to another account: that reading
@@ -3671,7 +3673,7 @@ fn codex_auth_rewritten_by_the_read_keeps_the_reading_for_the_same_login() {
         &home,
         &synthetic_codex_auth_body("another-user", "another-workspace", later),
     );
-    let switch_at = now + 30 * 60 + 2;
+    let switch_at = now + 2 * u + 2;
     assert_eq!(codex_saved_quota::scheduled_round(&support, switch_at), 1);
     assert_eq!(
         codex_saved_quota::serve_saved(&home, CodexHomeTrust::ProviderDefault, switch_at)
