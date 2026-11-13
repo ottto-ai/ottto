@@ -1314,10 +1314,12 @@ the Ottto support directory, readable only by the user:
   read through `codex app-server` that started counts three (workspace
   discovery, models and the rate-limits read), or two when the daemon gave it
   that Codex's own bundled model list (`codex debug models --bundled`, saved
-  under `codex-probe/` in the support dir) so it asks for no models, and one
-  more with the detailed read, even when it fails or times out. A read given
-  the list that ends without an account answer stops its use until Codex
-  changes. A sign-in counts one once a code was submitted.
+  under `codex-probe/` in the support dir), which by Codex's source skips its
+  startup model request (modeled, not measured), and one more with the
+  detailed read, even when it fails or times out. A read given the list that
+  ends, not timed out, without an account answer stops its use until that
+  Codex binary changes, across daemon restarts. A sign-in counts one once a
+  code was submitted.
 
 Lines never contain tokens, URLs, prompts, emails or provider responses. Days
 older than 7 are deleted. A day holds at most 30,000 lines and 8 MiB, and the

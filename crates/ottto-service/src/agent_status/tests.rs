@@ -5065,7 +5065,8 @@ for line in sys.stdin:
 /// same binary printed, so it sends no models request (one fewer counted):
 /// on the probe's argv only, only while the saved bytes are intact and the
 /// binary is unchanged. A probe given the list that ends without an
-/// `account/read` answer stops its use until the binary changes.
+/// `account/read` answer stops its use until the binary changes, across
+/// restarts; only the first save after a restart prunes old files.
 #[cfg(unix)]
 #[test]
 #[serial]
@@ -5155,16 +5156,23 @@ fn codex_probe_passes_the_binary_s_own_bundled_model_list() {
     meta();
     assert_eq!(probe().1.as_ref(), Some(&first[0]));
 
-    // A new binary: no list until its own meta pass, which keeps the
-    // previous binary's file.
-    std::fs::write(
-        bin.join("codex"),
-        format!(
-            "#!/bin/sh\n# new build\nexec /usr/bin/python3 '{}' \"$@\"\n",
-            bin.join("fake_codex.py").display()
-        ),
-    )
-    .expect("new binary");
+    // A new binary with its own list: none until its own meta pass, which
+    // keeps the previous binary's file.
+    let new_binary = |comment: &str, list: &str| {
+        std::fs::write(bin.join("bundled.json"), list).expect("bundled list");
+        std::fs::write(
+            bin.join("codex"),
+            format!(
+                "#!/bin/sh\n# {comment}\nexec /usr/bin/python3 '{}' \"$@\"\n",
+                bin.join("fake_codex.py").display()
+            ),
+        )
+        .expect("new binary");
+    };
+    new_binary(
+        "new build",
+        r#"{"models":[{"id":"gpt-5","instructions":"two"}]}"#,
+    );
     assert_eq!(probe().1, None);
     meta();
     let second = saved();
@@ -5176,16 +5184,28 @@ fn codex_probe_passes_the_binary_s_own_bundled_model_list() {
     assert!(second.contains(&given));
 
     // A probe given the list that ends with no account answer: later probes
-    // run without it, even after another meta pass.
+    // run without it, after another meta pass and after a restart.
     std::fs::write(bin.join("refuse"), b"").expect("refuse");
     let (result, given) = probe();
     assert!(result.is_err());
     assert!(given.is_some());
     std::fs::remove_file(bin.join("refuse")).expect("accept again");
     meta();
-    let (result, given) = probe();
-    result.expect("probe without the list");
-    assert_eq!(given, None);
+    assert_eq!(probe().1, None);
+    codex_probe_catalog::forget_for_restart();
+    meta();
+    assert_eq!(probe().1, None);
+
+    // The first save after a restart prunes every other file.
+    new_binary(
+        "newer build",
+        r#"{"models":[{"id":"gpt-5","instructions":"three"}]}"#,
+    );
+    codex_probe_catalog::forget_for_restart();
+    meta();
+    let third = saved();
+    assert_eq!(third.len(), 1);
+    assert_eq!(probe().1.as_ref(), Some(&third[0]));
 
     // One fewer request counted only when the list was given; login and the
     // bundled read never get it.
@@ -5195,7 +5215,7 @@ fn codex_probe_passes_the_binary_s_own_bundled_model_list() {
             .iter()
             .map(|line| line.requests_at_least)
             .collect::<Vec<_>>(),
-        [3, 2, 3, 2, 3, 2, 2, 3]
+        [3, 2, 3, 2, 3, 2, 2, 3, 3, 2]
     );
     let log = std::fs::read_to_string(bin.join("argv.log")).expect("argv log");
     for argv in log

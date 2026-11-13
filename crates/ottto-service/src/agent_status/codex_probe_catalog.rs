@@ -3,7 +3,7 @@
 //! its app-server starts without asking the provider for models. The probe
 //! never lists models; displayed models still come from the bundled command.
 
-use crate::transcript_acquisition::SourceStamp;
+use crate::transcript_acquisition::{FileStamp, SourceStamp};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -25,43 +25,35 @@ fn support_dir() -> PathBuf {
 }
 
 /// Saves the bundled list `stdout` that the binary with `stamp` printed,
-/// unless a probe already gave up on that binary's list. Only a new binary
-/// prunes the folder, and it keeps the previous binary's list: a probe
-/// started just before may still read it.
+/// named by its content, unless a probe gave up on that binary's list (also
+/// before a restart: its `.refused` marker names the binary). Files are
+/// pruned only at the first save after the daemon starts, so no running
+/// probe ever loses its list.
 pub(super) fn save(stamp: SourceStamp, stdout: &str) {
-    let SourceStamp::File(file) = &stamp else {
-        return;
-    };
-    let Ok(name) = serde_json::to_vec(file) else {
-        return;
-    };
+    let hash = Sha256::digest(stdout.as_bytes());
+    let dir = support_dir().join("codex-probe");
+    let name = format!("{hash:x}");
+    let path = dir.join(format!("bundled-{}.json", &name[..8]));
     let mut saved = SAVED.lock().unwrap_or_else(|e| e.into_inner());
-    let (path, keep) = match saved.as_ref() {
-        Some((kept, _, None)) if kept.same(&stamp) => return,
-        Some((kept, path, _)) if kept.same(&stamp) => (path.clone(), None),
-        kept => {
-            let name = format!("{:x}", Sha256::digest(name));
-            let path = support_dir().join("codex-probe");
-            let previous = kept.map(|(_, path, _)| path.clone());
-            (
-                path.join(format!("bundled-{}.json", &name[..8])),
-                Some(previous),
-            )
-        }
-    };
-    if ottto_core::write_owner_only_cache_file_atomic(&path, stdout.as_bytes()).is_err() {
-        *saved = None;
+    let first = saved.is_none();
+    let refused = std::fs::read(path.with_extension("refused"))
+        .ok()
+        .and_then(|body| serde_json::from_slice::<FileStamp>(&body).ok())
+        .is_some_and(|file| SourceStamp::File(file).same(&stamp));
+    if refused || matches!(saved.as_ref(), Some((kept, _, None)) if kept.same(&stamp)) {
+        *saved = Some((stamp, path, None));
         return;
     }
-    let digest = Sha256::digest(stdout.as_bytes()).into();
-    *saved = Some((stamp, path.clone(), Some(digest)));
-    let (Some(previous), Some(dir)) = (keep, path.parent()) else {
+    if ottto_core::write_owner_only_cache_file_atomic(&path, stdout.as_bytes()).is_err() {
         return;
-    };
+    }
+    *saved = Some((stamp, path.clone(), Some(hash.into())));
+    if !first {
+        return;
+    }
     for old in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        let old = old.path();
-        if old != path && Some(&old) != previous.as_ref() {
-            let _ = std::fs::remove_file(old);
+        if old.path() != path {
+            let _ = std::fs::remove_file(old.path());
         }
     }
 }
@@ -80,13 +72,24 @@ pub(super) fn for_probe() -> Option<PathBuf> {
 }
 
 /// After a probe that passed `path` ended (reaped) with no `account/read`
-/// reply: later probes run without a list until the binary changes. The file
-/// stays, since another home's probe may still read it.
+/// reply: later probes run without a list until the binary changes, and a
+/// marker keeps that across restarts. The list stays, since another home's
+/// probe may still read it.
 pub(super) fn give_up(path: &Path) {
     let mut saved = SAVED.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, kept, digest)) = saved.as_mut() {
-        if kept == path {
+    if let Some((SourceStamp::File(file), kept, digest)) = saved.as_mut() {
+        if kept.as_path() == path {
             *digest = None;
+            if let Ok(body) = serde_json::to_vec(&*file) {
+                let marker = path.with_extension("refused");
+                let _ = ottto_core::write_owner_only_cache_file_atomic(&marker, &body);
+            }
         }
     }
+}
+
+/// What a daemon restart forgets, for tests.
+#[cfg(test)]
+pub(super) fn forget_for_restart() {
+    *SAVED.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }

@@ -17081,9 +17081,9 @@ fn call_codex_app_server_rate_limits_for_home(
                 + u32::from(run.detail_read_sent && !run.routine_read_rejected),
         ));
     }
-    // A Codex that ended without answering `account/read` may not take the
-    // list: later probes run without it until the binary changes.
-    if let (Some(path), false) = (&run.model_list, run.account_answered) {
+    // A Codex that ended (not timed out) without answering `account/read`
+    // may not take the list: later probes run without it until it changes.
+    if let (Some(path), false, false) = (&run.model_list, run.account_answered, run.timed_out) {
         codex_probe_catalog::give_up(path);
     }
     if run.spawned && ottto_core::codex_auth_file_mark(codex_home) != auth_before {
