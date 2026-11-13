@@ -242,9 +242,11 @@ fn late_member_native_pages_match_cold_money_and_placement() {
             first
                 .index
                 .record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
-            // ACKed body, before its file receipt save: the next unchanged
-            // native read is still owed, so it really carries the root fold.
+            // New telemetry makes the unchanged root owe evidence reduction.
+            // The named member still does not exist when native selection
+            // finishes listing its family; it arrives before evidence folds.
             let prior = c.reload(&mut first.index);
+            evidence(&c, true, "agent-000"); // normalize an already-prefixed id
             let mut page = c.raw(&scanner, prior, 100, true, std::slice::from_ref(&root));
             assert!(page.scan.census_complete);
             assert!(serde_json::to_value(&page.index).unwrap()["traversal"].is_null());
@@ -257,7 +259,6 @@ fn late_member_native_pages_match_cold_money_and_placement() {
                 0,
                 &(line(ROOT, "m", MEMBER, 30) + &line(ROOT, "gap", GAP, 7)),
             );
-            evidence(&c, true, "agent-000"); // already-prefixed id must round-trip
             e2::take_diag();
             enrich(&c, &mut page, &mut progress);
             let diag = e2::take_diag();
