@@ -348,32 +348,31 @@ fn interactive_shell_provider_env() -> Option<BTreeMap<String, OsString>> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
 
-    interactive_shell_provider_env_from(command, INTERACTIVE_SHELL_ENV_TIMEOUT)
+    read_shell_env(command, INTERACTIVE_SHELL_ENV_TIMEOUT)
 }
 
 #[cfg(unix)]
-fn interactive_shell_provider_env_from(
-    mut command: Command,
-    timeout: Duration,
-) -> Option<BTreeMap<String, OsString>> {
-    use std::io::Read;
+fn read_shell_env(mut command: Command, timeout: Duration) -> Option<BTreeMap<String, OsString>> {
+    use std::io::{ErrorKind, Read};
+    use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;
 
     let deadline = Instant::now() + timeout;
     let mut child = command.process_group(0).spawn().ok()?;
     let pgid = libc::pid_t::try_from(child.id()).expect("child PID fits pid_t");
     let mut stdout = child.stdout.take().expect("piped shell stdout");
-    let (sender, receiver) = std::sync::mpsc::channel();
-    thread::spawn(move || {
-        let mut output = Vec::new();
-        let result = stdout.read_to_end(&mut output).map(|_| output);
-        let _ = sender.send(result);
-    });
-    if let Ok(Ok(output)) =
-        receiver.recv_timeout(deadline.saturating_duration_since(Instant::now()))
-    {
-        while Instant::now() < deadline {
-            match child.try_wait() {
+    let nonblocking =
+        unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) } == 0;
+    let mut ready = libc::pollfd {
+        fd: stdout.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let mut output = Vec::new();
+    while nonblocking && Instant::now() < deadline {
+        let mut buffer = [0; 8192];
+        match stdout.read(&mut buffer) {
+            Ok(0) => match child.try_wait() {
                 Ok(Some(status)) => {
                     return status.success().then(|| parse_provider_env_output(&output));
                 }
@@ -381,8 +380,19 @@ fn interactive_shell_provider_env_from(
                     Duration::from_millis(50)
                         .min(deadline.saturating_duration_since(Instant::now())),
                 ),
-                _ => break,
+                Err(_) => break,
+            },
+            Ok(n) if output.len() + n <= 8 * 1024 * 1024 => {
+                output.extend_from_slice(&buffer[..n]);
             }
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                let millis = deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis();
+                unsafe { libc::poll(&mut ready, 1, millis.min(50) as libc::c_int) };
+            }
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            _ => break,
         }
     }
     // Do not reap before EOF: the child's reserved PID identifies only our group.
@@ -391,7 +401,6 @@ fn interactive_shell_provider_env_from(
     }
     let _ = child.kill();
     let _ = child.wait();
-    // An escaped job may retain stdout; never join the reader after the deadline.
     None
 }
 
@@ -705,7 +714,7 @@ mod tests {
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null());
-            interactive_shell_provider_env_from(command, timeout)
+            read_shell_env(command, timeout)
         }
 
         fn child_running(&self) -> bool {
@@ -760,6 +769,19 @@ mod tests {
                 .get("GOOGLE_CLOUD_PROJECT"),
             Some(&OsString::from("shell-project"))
         );
+    }
+
+    #[test]
+    fn provider_shell_rejects_excess_output() {
+        let shell = FakeShell::new();
+        let start = Instant::now();
+        assert!(shell
+            .run(
+                "exec /usr/bin/head -c 8388609 /dev/zero",
+                Duration::from_secs(15),
+            )
+            .is_none());
+        assert!(start.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
