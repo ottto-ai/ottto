@@ -56,6 +56,12 @@ fn stats() -> &'static Mutex<Stats> {
     static STATS: OnceLock<Mutex<Stats>> = OnceLock::new();
     STATS.get_or_init(|| Mutex::new(Stats::default()))
 }
+pub(super) fn wal_checkpoint_counts(log: u64, done: u64) {
+    if let Ok(mut stats) = stats().lock() {
+        stats.latest.insert("wal_checkpoint_log_frames", log.into());
+        stats.latest.insert("wal_checkpointed_frames", done.into());
+    }
+}
 pub(super) fn event(name: &'static str, value: &impl Serialize) {
     if name == "route" {
         if let Ok(value) = serde_json::to_value(value) {
