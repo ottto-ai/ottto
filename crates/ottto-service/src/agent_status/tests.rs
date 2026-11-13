@@ -13007,6 +13007,62 @@ fn secret_keys_are_removed_from_pi_metadata() {
 }
 
 #[test]
+fn pi_model_table_parser_ignores_no_models_output() {
+    for text in [
+        "No models available. Use /login to log into a provider via OAuth or API key. See:\n  /opt/pi/docs/providers.md\n  /opt/pi/docs/models.md\n",
+        "No models available. Set API keys in environment variables.\n",
+    ] {
+        let output = CommandOutput {
+            command_found: true,
+            success: true,
+            status_code: Some(0),
+            stdout: text.to_string(),
+            stderr: String::new(),
+        };
+
+        let status = collect_pi_model_status_from_output(&output, None);
+
+        assert!(status.available_models.is_empty());
+        assert!(status.available_model_details.is_empty());
+        assert_eq!(status.active_model, None);
+        assert_eq!(status.default_model, None);
+        assert_eq!(status.provider, None);
+    }
+}
+
+#[test]
+fn pi_model_table_parser_requires_header_and_skips_prose() {
+    let output = CommandOutput {
+        command_found: true,
+        success: true,
+        status_code: Some(0),
+        stdout: "\
+google-vertex gemini-2.5-flash-lite 1M 65.5K yes yes
+provider model
+openai-codex gpt-5.4-mini 272K 128K yes yes
+provider model context max-out thinking images
+No models available. Set API keys in environment variables.
+Please login to see available models
+Warning: models 1M 64K unknown yes
+Warning: models 1M 64K yes unknown
+Warning: models unknown 64K yes yes
+Warning: models 1M unknown yes yes
+Warning: models 1M 64K yes yes extra
+openai-codex gpt-5.4-mini 272K 128K yes yes
+"
+        .to_string(),
+        stderr: String::new(),
+    };
+
+    let status = collect_pi_model_status_from_output(&output, None);
+
+    assert_eq!(status.available_models, vec!["gpt-5.4-mini"]);
+    assert_eq!(status.available_model_details.len(), 1);
+    assert_eq!(status.provider.as_deref(), Some("openai-codex"));
+    assert_eq!(status.default_model, None);
+}
+
+#[test]
 fn pi_model_table_parser_preserves_provider_billing_and_capabilities() {
     let output = CommandOutput {
         command_found: true,
