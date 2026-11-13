@@ -919,12 +919,11 @@ fn codex_launch_and_nickname_read_only_saved_proof_and_never_probe_login() {
 }
 
 /// [regress] Codex refreshes its login only when due, so a launch must not
-/// need a live id token. Default slot, through the real prepare: an expired id
-/// token beside a live access token is admitted; an expired access token is
-/// admitted while `auth.json` is unchanged since the saved validated reading
-/// and still names it, and refused once rewritten (SlotNeedsLogin); another
-/// pair is AccountMismatch. A managed-trust read of the same home names the
-/// same identity (the check launch admission makes for a managed slot).
+/// need a live id token. Default and managed slot, through the real prepare:
+/// an expired id token beside a live access token is admitted; an expired
+/// access token is admitted while `auth.json` is unchanged since the saved
+/// validated reading and still names it, and refused once rewritten
+/// (SlotNeedsLogin); another pair is AccountMismatch.
 #[test]
 fn codex_launch_admits_a_held_login_without_a_live_id_token() {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -938,7 +937,6 @@ fn codex_launch_admits_a_held_login_without_a_live_id_token() {
     let (account, org) = codex_login_fixture(root);
     let home = root.join("home");
     let codex = home.join(".codex");
-    let auth = codex.join("auth.json");
     let support = root.join("support");
     let project = root.join("project");
     let bin = root.join("bin");
@@ -955,6 +953,60 @@ fn codex_launch_admits_a_held_login_without_a_live_id_token() {
         home: home.clone(),
         name: "synthetic".into(),
     };
+    let saved_path = |dir: &Path| {
+        let mut hash = Sha256::new();
+        hash.update(b"ottto:codex-quota-home:v1\0");
+        hash.update(dir.as_os_str().as_encoded_bytes());
+        support
+            .join("codex-quota/homes")
+            .join(format!("{:x}", hash.finalize()))
+            .join("saved-quota.json")
+    };
+    // A managed slot accepted for the same pair, with the default's saved
+    // reading. Registered only for its own cases: it then shadows the default.
+    let register_managed = || {
+        let store = ottto_core::FileCodexAccountSlotSettingsStore::default();
+        let schema = ottto_protocol::CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION;
+        let operation = "codex_setup_0123456789abcdef0123456789abcdef";
+        let slot = store
+            .prepare_managed_account(schema, operation.to_string(), account.clone(), org.clone())
+            .unwrap()
+            .managed_slots[0]
+            .slot_id
+            .clone();
+        store
+            .finish_validation(
+                schema,
+                operation,
+                account.clone(),
+                org.clone(),
+                "workspace-one",
+                false,
+            )
+            .unwrap();
+        store
+            .complete_pinned_verification(schema, operation, &account, &org)
+            .unwrap();
+        let managed = store.slot_home(&slot).unwrap();
+        let mut saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(saved_path(&codex)).unwrap()).unwrap();
+        saved["reading"]["login"]
+            .as_object_mut()
+            .unwrap()
+            .remove("auth");
+        let managed_saved = saved_path(&managed);
+        saved["home_key"] = serde_json::json!(managed_saved
+            .parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap());
+        fs::create_dir_all(managed_saved.parent().unwrap()).unwrap();
+        fs::write(&managed_saved, serde_json::to_vec(&saved).unwrap()).unwrap();
+        (slot, managed)
+    };
+
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
     let jwt = |expires_at: i64| {
         let claims = serde_json::json!({"iss":"https://auth.openai.com","aud":"synthetic","exp":expires_at,
@@ -965,83 +1017,90 @@ fn codex_launch_admits_a_held_login_without_a_live_id_token() {
             URL_SAFE_NO_PAD.encode(claims.to_string())
         )
     };
-    let write_auth = |access_expires_at: i64, id_expires_at: i64| {
-        let body = serde_json::json!({"auth_mode":"chatgpt","OPENAI_API_KEY":"synthetic-exchanged-key",
-            "tokens":{"account_id":"workspace-one","access_token":jwt(access_expires_at),"id_token":jwt(id_expires_at)}});
-        fs::write(&auth, serde_json::to_vec(&body).unwrap()).unwrap();
-        fs::set_permissions(&auth, fs::Permissions::from_mode(0o600)).unwrap();
-    };
-    let mut hash = Sha256::new();
-    hash.update(b"ottto:codex-quota-home:v1\0");
-    hash.update(codex.as_os_str().as_encoded_bytes());
-    let saved_path = support
-        .join("codex-quota/homes")
-        .join(format!("{:x}", hash.finalize()))
-        .join("saved-quota.json");
-    // The saved validated reading records this `auth.json` as its witness.
-    let pin_witness = || {
-        let metadata = fs::metadata(&auth).unwrap();
-        let modified = metadata
-            .modified()
-            .unwrap()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap();
-        let mut saved: serde_json::Value =
-            serde_json::from_slice(&fs::read(&saved_path).unwrap()).unwrap();
-        saved["reading"]["login"]["auth"] = serde_json::json!({"modified_secs":modified.as_secs(),
-            "modified_nanos":modified.subsec_nanos(),"len":metadata.len()});
-        fs::write(&saved_path, serde_json::to_vec(&saved).unwrap()).unwrap();
-    };
-    let prepare = |account: &str| {
-        Registry::default().prepare_for_user(
-            Provider::Codex,
-            "default",
-            account,
-            &org,
-            SessionLaunchFolderV1 {
-                path: Some(project.to_string_lossy().into_owned()),
-                recent_id: None,
-            },
-            Some(test_executable()),
-            &support,
-            user.clone(),
-        )
-    };
-    let identity =
-        |trust: CodexHomeTrust| crate::agent_status::session_launch_codex_identity(&codex, trust);
     let pair = Some((account.clone(), org.clone()));
-
-    write_auth(now + 3600, now - 60);
-    assert!(
-        prepare(&account).is_ok(),
-        "expired id token, live access token"
-    );
-
-    write_auth(now - 60, now - 60);
-    pin_witness();
-    assert!(
-        prepare(&account).is_ok(),
-        "expired access token, unchanged file"
-    );
-    assert_eq!(identity(CodexHomeTrust::ProviderDefault), pair);
-    assert_eq!(identity(CodexHomeTrust::Managed), pair);
-
-    let mut body = fs::read(&auth).unwrap();
-    body.push(b' ');
-    fs::write(&auth, body).unwrap();
-    assert_eq!(
-        prepare(&account).err().unwrap().reason,
-        Reason::SlotNeedsLogin,
-        "expired access token, rewritten file"
-    );
-    assert_eq!(identity(CodexHomeTrust::Managed), None);
-
-    write_auth(now + 3600, now + 3600);
     let other = billing_identity_hash("openai", "account", "user-two").unwrap();
-    assert_eq!(
-        prepare(&other).err().unwrap().reason,
-        Reason::AccountMismatch
-    );
+    for managed in [false, true] {
+        let (slot, dir, trust) = if managed {
+            let (slot, dir) = register_managed();
+            (slot, dir, CodexHomeTrust::Managed)
+        } else {
+            (
+                "default".to_string(),
+                codex.clone(),
+                CodexHomeTrust::ProviderDefault,
+            )
+        };
+        let slot = slot.as_str();
+        let auth = dir.join("auth.json");
+        let write_auth = |access_expires_at: i64, id_expires_at: i64| {
+            let body = serde_json::json!({"auth_mode":"chatgpt","OPENAI_API_KEY":"synthetic-exchanged-key",
+                "tokens":{"account_id":"workspace-one","access_token":jwt(access_expires_at),"id_token":jwt(id_expires_at)}});
+            fs::write(&auth, serde_json::to_vec(&body).unwrap()).unwrap();
+            fs::set_permissions(&auth, fs::Permissions::from_mode(0o600)).unwrap();
+        };
+        // The saved validated reading records this `auth.json` as its witness.
+        let pin_witness = || {
+            let metadata = fs::metadata(&auth).unwrap();
+            let modified = metadata
+                .modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap();
+            let path = saved_path(&dir);
+            let mut saved: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            saved["reading"]["login"]["auth"] = serde_json::json!({"modified_secs":modified.as_secs(),
+                "modified_nanos":modified.subsec_nanos(),"len":metadata.len()});
+            fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+        };
+        let prepare = |account: &str| {
+            Registry::default().prepare_for_user(
+                Provider::Codex,
+                slot,
+                account,
+                &org,
+                SessionLaunchFolderV1 {
+                    path: Some(project.to_string_lossy().into_owned()),
+                    recent_id: None,
+                },
+                Some(test_executable()),
+                &support,
+                user.clone(),
+            )
+        };
+        let identity = || crate::agent_status::session_launch_codex_identity(&dir, trust);
+
+        write_auth(now + 3600, now - 60);
+        assert!(
+            prepare(&account).is_ok(),
+            "{slot}: expired id token, live access token"
+        );
+
+        write_auth(now - 60, now - 60);
+        pin_witness();
+        assert!(
+            prepare(&account).is_ok(),
+            "{slot}: expired access token, unchanged file"
+        );
+        assert_eq!(identity(), pair, "{slot}");
+
+        let mut body = fs::read(&auth).unwrap();
+        body.push(b' ');
+        fs::write(&auth, body).unwrap();
+        assert_eq!(
+            prepare(&account).err().unwrap().reason,
+            Reason::SlotNeedsLogin,
+            "{slot}: expired access token, rewritten file"
+        );
+        assert_eq!(identity(), None, "{slot}");
+
+        write_auth(now + 3600, now + 3600);
+        assert_eq!(
+            prepare(&other).err().unwrap().reason,
+            Reason::AccountMismatch,
+            "{slot}: another pair"
+        );
+    }
     unsafe { std::env::remove_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR") };
     unsafe { std::env::remove_var("OTTTO_COMMAND_SEARCH_PATH") };
 }

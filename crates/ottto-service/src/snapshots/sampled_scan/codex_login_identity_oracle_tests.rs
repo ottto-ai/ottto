@@ -13,10 +13,11 @@ use crate::snapshots::sampled_scan::transition_fixture::{
 };
 use serde_json::json;
 
-// NOT COVERED: T4 drives the production save path with an injected read, not
-// the fake app-server; T5's same-login reader sharing needs the quota
-// scheduler, so it is checked at the binding level only; T7's launch block
-// and T8's interrupted-save-then-restart variant are not driven here.
+// NOT COVERED here: T4 drives the production save path with an injected read
+// (the provider boundary is agent_status's
+// `codex_probe_confirms_no_identity_when_the_login_switches_during_the_read`);
+// T5's same-login reader sharing needs the quota scheduler, so it is checked
+// at the binding level only; T7's launch block is covered by the launch tests.
 
 const LIVE: i64 = 30 * 86_400;
 const EXPIRED: i64 = -3_600;

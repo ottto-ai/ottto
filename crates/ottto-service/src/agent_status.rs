@@ -66,7 +66,7 @@ pub(crate) use codex_saved_quota::scheduled_round_now as codex_scheduled_round_n
 pub use codex_saved_quota::start_codex_quota_scheduler;
 pub(crate) use codex_saved_quota::{
     refresh_codex_quota_now, saved_codex_quota_generation, stop_codex_quota_scheduler,
-    wake_codex_quota_scheduler, with_codex_home_read_lock,
+    wake_codex_quota_scheduler, with_codex_home_read_lock, with_codex_home_read_lock_until,
 };
 #[cfg(test)]
 pub(crate) use codex_setup_gate::SetupGateTestClock;
@@ -16942,7 +16942,7 @@ const CODEX_APP_SERVER_MIN_REQUESTS: u32 = 3;
 /// gets to exit by itself before it is stopped: it may be refreshing its
 /// login. Codex's own refresh request times out after this long, and its
 /// app-server exits within it after stdin closes.
-const CODEX_CHILD_DRAIN: Duration = Duration::from_secs(45);
+pub(crate) const CODEX_CHILD_DRAIN: Duration = Duration::from_secs(45);
 
 /// [`CODEX_CHILD_DRAIN`], or a test's scaled bound.
 pub(crate) fn codex_child_drain() -> Duration {

@@ -825,6 +825,27 @@ pub(crate) fn with_codex_home_read_lock<T>(home: &Path, f: impl FnOnce() -> T) -
     f()
 }
 
+/// [`with_codex_home_read_lock`], waiting for the lock only until `deadline`:
+/// `None`, with nothing run, when a read of `home` still holds it then.
+pub(crate) fn with_codex_home_read_lock_until<T>(
+    home: &Path,
+    deadline: Instant,
+    f: impl FnOnce() -> T,
+) -> Option<T> {
+    let lock_for_home = home_lock(home);
+    let _guard = loop {
+        match lock_for_home.try_lock() {
+            Ok(guard) => break guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                thread::sleep(crate::codex_sign_in::POLL_INTERVAL)
+            }
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        }
+    };
+    Some(f())
+}
+
 fn lock(mutex: &Mutex<()>) -> MutexGuard<'_, ()> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }

@@ -5167,6 +5167,77 @@ fn codex_cloud_page_never_runs_beside_a_read_of_its_home() {
             "same home {same}: {log}"
         );
     }
+    // A page whose home stays busy past its deadline starts nothing.
+    let _ = std::fs::remove_file(&events);
+    let page = crate::agent_status::with_codex_home_read_lock(&cloud_home, || {
+        crate::cloud_sessions::CodexCloudCliRunner.list_page_bounded(
+            None,
+            20,
+            Duration::from_millis(300),
+        )
+    });
+    assert!(page.is_err(), "a busy home ends the page");
+    assert!(!std::fs::read_to_string(&events)
+        .unwrap_or_default()
+        .contains("start cloud"));
+}
+
+/// [regress] A probe confirms only the login its home named before the read:
+/// after a `codex login` to another account during the read, it confirms
+/// none, so nothing is saved or remembered under either account.
+#[cfg(unix)]
+#[test]
+#[serial]
+fn codex_probe_confirms_no_identity_when_the_login_switches_during_the_read() {
+    let dir = crate::test_scratch::ScratchDir::new("codex-probe-login-switch");
+    write_fake_codex_script(
+        &dir,
+        &format!(
+            "import os, shutil, sys, time\nDIR = os.path.dirname(os.path.abspath(__file__))\n\
+             for line in sys.stdin:\n\
+             \x20   if '\"id\":\"ottto_account\"' in line and os.path.exists(os.path.join(DIR, 'switch')):\n\
+             \x20       home = os.environ['CODEX_HOME']\n\
+             \x20       shutil.copy2(os.path.join(DIR, 'b-auth.json'), os.path.join(home, 'auth.tmp'))\n\
+             \x20       os.replace(os.path.join(home, 'auth.tmp'), os.path.join(home, 'auth.json'))\n\
+             {answers}",
+            answers = FAKE_CODEX_APP_SERVER_ANSWERS,
+        ),
+    );
+    let _commands =
+        EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", dir.as_os_str().to_os_string());
+    let expires_at = OffsetDateTime::now_utc().unix_timestamp() + 3_600;
+    let write_login = |path: &Path, user: &str, workspace: &str| {
+        let token = synthetic_codex_jwt(user, workspace, "synthetic-user", "pro", expires_at);
+        std::fs::write(
+            path,
+            serde_json::json!({
+                "tokens": {"access_token": token, "id_token": token},
+                "account_id": workspace,
+            })
+            .to_string(),
+        )
+        .expect("auth fixture");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).expect("auth mode");
+    };
+    // The same email and plan: only the pre-read login check tells them apart.
+    write_login(&dir.join("b-auth.json"), "user-b", "workspace-b");
+    for switch in [false, true] {
+        let home =
+            crate::test_scratch::ScratchDir::canonical(&format!("codex-probe-switch-{switch}"));
+        write_login(&home.join("auth.json"), "user-a", "workspace-a");
+        if switch {
+            std::fs::write(dir.join("switch"), b"").expect("switch");
+        }
+        let probe =
+            collect_codex_app_server_usage_for_home(&home, CodexHomeTrust::Managed).expect("read");
+        assert_eq!(probe.identity.is_some(), !switch, "switched {switch}");
+        assert_eq!(probe.saved_identity.is_some(), !switch, "switched {switch}");
+        assert_eq!(
+            codex_credit_grants::home_binding(&home).is_some(),
+            !switch,
+            "switched {switch}"
+        );
+    }
 }
 
 #[test]
