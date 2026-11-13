@@ -1862,14 +1862,9 @@ impl CodexCloudChild {
 
     fn stop_and_reap(&mut self) -> std::io::Result<std::process::ExitStatus> {
         let child = self.child.take().expect("owned cloud child");
-        if matches!(
-            crate::process_guard::exited_successfully(&child),
-            Ok(Some(true))
-        ) {
-            crate::process_guard::stop_group_and_reap(child, Duration::ZERO)
-        } else {
-            crate::process_guard::kill_group_and_reap(child)
-        }
+        // Cloud completion still validates output after reaping; preserve its
+        // unconditional cleanup rather than the env import's success policy.
+        crate::process_guard::kill_group_and_reap(child)
     }
 }
 

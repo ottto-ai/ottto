@@ -27,7 +27,14 @@ impl CloudCliFixture {
         let root = temp_dir("cloud-cli-process");
         fs::write(root.join("output"), output).unwrap();
         let quote = |path: &Path| format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"));
-        let body = if mode == "output" {
+        let body = if mode == "redirect-output" {
+            format!(
+                "echo $$ > {}\n/bin/sleep 4 >/dev/null 2>&1 &\necho $! > {}\n/bin/cat {}\nexit {exit_code}\n",
+                quote(&root.join("direct")),
+                quote(&root.join("descendant")),
+                quote(&root.join("output")),
+            )
+        } else if mode == "output" {
             format!(
                 "/bin/cat {}\nexit {exit_code}\n",
                 quote(&root.join("output"))
@@ -87,6 +94,23 @@ impl CloudCliFixture {
         {
             assert!(Instant::now() < deadline, "fake descendant did not start");
             thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn wait_stopped(&self, label: &str) {
+        let pid = self.pid(label).to_string();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let output = Command::new("/bin/ps")
+                .args(["-o", "stat=", "-p", &pid])
+                .output()
+                .unwrap();
+            let state = String::from_utf8_lossy(&output.stdout);
+            if state.trim().is_empty() || state.trim().starts_with('Z') {
+                break;
+            }
+            assert!(Instant::now() < deadline, "Cloud group descendant survived");
+            thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -214,19 +238,20 @@ fn cloud_cli_timeout_stops_group_after_leader_exit() {
         CodexCloudCliRunner.list_page_bounded(None, PAGE_LIMIT, Duration::from_millis(300));
     assert!(result.unwrap_err().to_string().contains("timed out"));
     fixture.wait_gone("direct");
-    let pid = fixture.pid("descendant").to_string();
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        let output = Command::new("/bin/ps")
-            .args(["-o", "stat=", "-p", &pid])
-            .output()
-            .unwrap();
-        let state = String::from_utf8_lossy(&output.stdout);
-        if state.trim().is_empty() || state.trim().starts_with('Z') {
-            break;
-        }
-        assert!(Instant::now() < deadline, "timed-out Cloud group survived");
-        thread::sleep(Duration::from_millis(10));
+    fixture.wait_stopped("descendant");
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn cloud_cli_completion_stops_redirected_descendants() {
+    for output in [b"{}".as_slice(), &[0xff]] {
+        let fixture = CloudCliFixture::new("redirect-output", output, 0);
+        let result =
+            CodexCloudCliRunner.list_page_bounded(None, PAGE_LIMIT, Duration::from_secs(2));
+        fixture.wait_gone("direct");
+        fixture.wait_stopped("descendant");
+        assert_eq!(result.is_ok(), std::str::from_utf8(output).is_ok());
     }
 }
 
