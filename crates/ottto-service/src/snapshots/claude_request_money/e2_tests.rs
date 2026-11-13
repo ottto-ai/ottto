@@ -4592,3 +4592,6 @@ fn retained_growth_identity_failure_cannot_suppress_another_sessions_request() {
 
 #[path = "e2_subagent_twin_tests.rs"]
 mod subagent_twin_tests;
+
+#[path = "e2_subagent_twin_tail_tests.rs"]
+mod subagent_twin_tail_tests;
