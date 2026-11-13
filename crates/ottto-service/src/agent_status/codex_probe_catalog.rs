@@ -4,7 +4,6 @@
 //! never lists models; displayed models still come from the bundled command.
 
 use crate::transcript_acquisition::SourceStamp;
-use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -27,32 +26,25 @@ fn support_dir() -> PathBuf {
 
 /// Saves the bundled list `stdout` that the binary with `stamp` printed,
 /// unless a probe already gave up on that binary's list. Only a new binary
-/// prunes older lists, and it keeps the previous one: a probe started just
-/// before may still read it.
+/// prunes the folder, and it keeps the previous binary's list: a probe
+/// started just before may still read it.
 pub(super) fn save(stamp: SourceStamp, stdout: &str) {
-    let listed = serde_json::from_str::<Value>(stdout)
-        .ok()
-        .is_some_and(|json| {
-            json.get("models")
-                .and_then(Value::as_array)
-                .is_some_and(|models| !models.is_empty())
-        });
     let SourceStamp::File(file) = &stamp else {
         return;
     };
-    let Some(name) = serde_json::to_vec(file).ok().filter(|_| listed) else {
+    let Ok(name) = serde_json::to_vec(file) else {
         return;
     };
     let mut saved = SAVED.lock().unwrap_or_else(|e| e.into_inner());
-    let (path, prune_keeping) = match saved.as_ref() {
+    let (path, keep) = match saved.as_ref() {
         Some((kept, _, None)) if kept.same(&stamp) => return,
         Some((kept, path, _)) if kept.same(&stamp) => (path.clone(), None),
         kept => {
             let name = format!("{:x}", Sha256::digest(name));
-            let dir = support_dir().join("codex-probe");
+            let path = support_dir().join("codex-probe");
             let previous = kept.map(|(_, path, _)| path.clone());
             (
-                dir.join(format!("bundled-{}.json", &name[..8])),
+                path.join(format!("bundled-{}.json", &name[..8])),
                 Some(previous),
             )
         }
@@ -63,17 +55,12 @@ pub(super) fn save(stamp: SourceStamp, stdout: &str) {
     }
     let digest = Sha256::digest(stdout.as_bytes()).into();
     *saved = Some((stamp, path.clone(), Some(digest)));
-    let (Some(previous), Some(dir)) = (prune_keeping, path.parent()) else {
+    let (Some(previous), Some(dir)) = (keep, path.parent()) else {
         return;
     };
     for old in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        let (old, name) = (old.path(), old.file_name());
-        let name = name.to_string_lossy();
-        if name.starts_with("bundled-")
-            && name.ends_with(".json")
-            && old != path
-            && Some(&old) != previous.as_ref()
-        {
+        let old = old.path();
+        if old != path && Some(&old) != previous.as_ref() {
             let _ = std::fs::remove_file(old);
         }
     }
@@ -102,17 +89,4 @@ pub(super) fn give_up(path: &Path) {
             *digest = None;
         }
     }
-}
-
-/// `model_catalog_json="<path>"`, the path as a TOML basic string, for `-c`.
-pub(super) fn override_arg(path: &Path) -> String {
-    let mut quoted = String::new();
-    for c in path.to_string_lossy().chars() {
-        match c {
-            '"' | '\\' => quoted.extend(['\\', c]),
-            c if c.is_control() => quoted.push_str(&format!("\\u{:04X}", u32::from(c))),
-            c => quoted.push(c),
-        }
-    }
-    format!("model_catalog_json=\"{quoted}\"")
 }

@@ -5046,7 +5046,8 @@ if lists and os.path.exists(os.path.join(here, "refuse")):
     sys.exit(1)
 
 def listed():
-    with open(json.loads(lists[0])) as given, open(os.path.join(here, "bundled.json")) as bundled:
+    path = lists[0][1:-1] if lists[0].startswith("'") else json.loads(lists[0])
+    with open(path) as given, open(os.path.join(here, "bundled.json")) as bundled:
         return json.load(given) == json.load(bundled)
 
 for line in sys.stdin:
@@ -5126,9 +5127,9 @@ fn codex_probe_passes_the_binary_s_own_bundled_model_list() {
                 let value = argv[5]
                     .strip_prefix("model_catalog_json=")
                     .expect("override");
-                Some(PathBuf::from(
-                    serde_json::from_str::<String>(value).expect("quoted"),
-                ))
+                let config: toml_edit::DocumentMut =
+                    format!("v = {value}").parse().expect("TOML value");
+                Some(PathBuf::from(config["v"].as_str().expect("quoted path")))
             }
             _ => panic!("unexpected argv {argv:?}"),
         };

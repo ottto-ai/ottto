@@ -17126,7 +17126,8 @@ fn run_codex_app_server_rate_limits_for_home(
     ]);
     let model_list = codex_probe_catalog::for_probe();
     if let Some(path) = &model_list {
-        command.args(["-c", &codex_probe_catalog::override_arg(path)]);
+        let path = toml_edit::Value::from(&*path.to_string_lossy());
+        command.args(["-c", &format!("model_catalog_json={path}")]);
     }
     command.args(["app-server", "--stdio"]).env_clear();
     command
