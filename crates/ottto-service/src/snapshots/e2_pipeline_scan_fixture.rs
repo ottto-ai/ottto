@@ -255,6 +255,24 @@ fn head_certificate<S: tail_source::TailSource>(
     Some(S::decode_head(revision, &body, &mut acc).ok()?.certificate)
 }
 
+/// How `key`'s committed Claude certificate answers the file now at its
+/// path: `Ok` when it restores, else the refusal.
+#[cfg(unix)]
+pub(crate) fn claude_certificate_restore_for_test(
+    index: &ScanIndex,
+    key: &str,
+) -> Result<(), crate::transcript_acquisition::CertificateRefusal> {
+    let certificate = head_certificate::<tail_source::claude::Claude>(index, key).unwrap();
+    let mut file = std::fs::File::open(key).unwrap();
+    certificate
+        .restore_grown(
+            &mut file,
+            crate::transcript_acquisition::Scope("e2-pipeline".into()),
+            None,
+        )
+        .map(|_| ())
+}
+
 /// Model a reboot's device renumber in a committed certificate, leaving
 /// inode, birth, samples and reduction unchanged. The next ordinary load
 /// keeps that certificate: the device is never compared across boots.

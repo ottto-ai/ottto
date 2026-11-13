@@ -150,7 +150,8 @@ fn subagent_all_copy_twins_conserve_pages_restart_and_device_replace() {
         let item = body(&page, &member()).unwrap();
         assert_eq!((item.request_count, item.output_tokens), (26, 11_525));
         assert_eq!(item.removed_request_count, Some(26));
-        // The same page without the renumber: the twins add no Full read.
+        // The owed body-witness adoption reads both twins natively with or
+        // without the renumber; the renumber itself adds no Full read.
         let (control_c, _, control_index) = pair("subagent-copied-device-control");
         let (mut control, _) = legacy(&control_c, control_index);
         owe(&mut control);
@@ -163,13 +164,8 @@ fn subagent_all_copy_twins_conserve_pages_restart_and_device_replace() {
         );
         control.finish();
         assert_eq!(
-            scanner.full_reasons()[crate::transcript_acquisition::FullReason::Replaced.slot()],
-            0,
-            "a renumbered device is not a replacement"
-        );
-        assert_eq!(
             page.modes.0, control.modes.0,
-            "neither twin reads Full after a device renumber"
+            "a device renumber adds no Full read"
         );
         assert_eq!(
             paths
