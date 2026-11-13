@@ -5065,8 +5065,8 @@ for line in sys.stdin:
 /// same binary printed, so it sends no models request (one fewer counted):
 /// on the probe's argv only, only while the saved bytes are intact and the
 /// binary is unchanged. A probe given the list that ends without an
-/// `account/read` answer stops its use until the binary changes, across
-/// restarts; only the first save after a restart prunes old files.
+/// `account/read` answer stops its use until the binary changes; only the
+/// first save after a restart prunes old files.
 #[cfg(unix)]
 #[test]
 #[serial]
@@ -5095,7 +5095,6 @@ fn codex_probe_passes_the_binary_s_own_bundled_model_list() {
                 entries
                     .flatten()
                     .map(|entry| entry.path())
-                    .filter(|path| path.to_string_lossy().contains("bundled-"))
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
@@ -5182,15 +5181,12 @@ fn codex_probe_passes_the_binary_s_own_bundled_model_list() {
     assert!(second.contains(&given));
 
     // A probe given the list that ends with no account answer: later probes
-    // run without it, after another meta pass and after a restart.
+    // run without it, even after another meta pass.
     std::fs::write(bin.join("refuse"), b"").expect("refuse");
     let (result, given) = probe();
     assert!(result.is_err());
     assert!(given.is_some());
     std::fs::remove_file(bin.join("refuse")).expect("accept again");
-    meta();
-    assert_eq!(probe().1, None);
-    codex_probe_catalog::forget_for_restart();
     meta();
     assert_eq!(probe().1, None);
 
@@ -5213,7 +5209,7 @@ fn codex_probe_passes_the_binary_s_own_bundled_model_list() {
             .iter()
             .map(|line| line.requests_at_least)
             .collect::<Vec<_>>(),
-        [3, 2, 3, 2, 3, 2, 2, 3, 3, 2]
+        [3, 2, 3, 2, 3, 2, 2, 3, 2]
     );
     let log = std::fs::read_to_string(bin.join("argv.log")).expect("argv log");
     for argv in log

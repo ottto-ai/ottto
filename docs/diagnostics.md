@@ -1318,7 +1318,7 @@ the Ottto support directory, readable only by the user:
   startup model request (modeled, not measured), and one more with the
   detailed read, even when it fails or times out. A read given the list that
   ends, not timed out, without an account answer stops its use until that
-  Codex binary changes, across daemon restarts. A sign-in counts one once a
+  Codex binary changes or the daemon restarts. A sign-in counts one once a
   code was submitted.
 
 Lines never contain tokens, URLs, prompts, emails or provider responses. Days

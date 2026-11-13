@@ -3,7 +3,7 @@
 //! its app-server starts without asking the provider for models. The probe
 //! never lists models; displayed models still come from the bundled command.
 
-use crate::transcript_acquisition::{FileStamp, SourceStamp};
+use crate::transcript_acquisition::SourceStamp;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -14,52 +14,31 @@ use std::sync::Mutex;
 type Saved = (SourceStamp, u64, PathBuf, Option<[u8; 32]>);
 static SAVED: Mutex<Option<Saved>> = Mutex::new(None);
 
-/// The last binary a probe gave up on, kept across restarts.
-const REFUSED: &str = "refused.json";
-
-/// The daemon support dir; in tests that name none, a scratch dir rather
-/// than the real one.
-fn support_dir() -> PathBuf {
-    #[cfg(test)]
-    if std::env::var_os("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR").is_none() {
-        return std::env::temp_dir().join(format!("ottto-codex-probe-{}", std::process::id()));
-    }
-    ottto_core::default_support_dir()
-}
-
 /// Saves the bundled list `stdout` that the binary with `stamp` printed,
-/// named by its content, unless a probe gave up on that binary (also before
-/// a restart, through [`REFUSED`]). Files are pruned only at the first save
-/// after the daemon starts, so no running probe loses its list.
+/// named by its content, unless a probe gave up on that binary. Files are
+/// pruned only at the first save after the daemon starts, so no running
+/// probe loses its list.
 pub(super) fn save(stamp: SourceStamp, stdout: &str) {
     let hash = Sha256::digest(stdout.as_bytes());
-    let dir = support_dir().join("codex-probe");
+    let dir = crate::provider_calls::log_support_dir().join("codex-probe");
     let name = format!("{hash:x}");
     let path = dir.join(format!("bundled-{}.json", &name[..8]));
     let mut saved = SAVED.lock().unwrap_or_else(|e| e.into_inner());
     let generation = match saved.as_ref() {
+        Some((kept, .., None)) if kept.same(&stamp) => return,
         Some((kept, generation, ..)) if kept.same(&stamp) => *generation,
         Some((_, generation, ..)) => generation + 1,
         None => 0,
     };
-    let refused = std::fs::read(dir.join(REFUSED))
-        .ok()
-        .and_then(|body| serde_json::from_slice::<FileStamp>(&body).ok())
-        .is_some_and(|file| SourceStamp::File(file).same(&stamp));
-    if refused || matches!(saved.as_ref(), Some((kept, .., None)) if kept.same(&stamp)) {
-        *saved = Some((stamp, generation, path, None));
-        return;
-    }
     if ottto_core::write_owner_only_cache_file_atomic(&path, stdout.as_bytes()).is_err() {
         return;
     }
-    let first = saved.is_none();
-    *saved = Some((stamp, generation, path.clone(), Some(hash.into())));
-    if !first {
+    let saving = (stamp, generation, path.clone(), Some(hash.into()));
+    if saved.replace(saving).is_some() {
         return;
     }
     for old in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
-        if old.path() != path && old.file_name() != REFUSED {
+        if old.path() != path {
             let _ = std::fs::remove_file(old.path());
         }
     }
@@ -70,31 +49,20 @@ pub(super) fn save(stamp: SourceStamp, stdout: &str) {
 /// file still holds exactly those bytes.
 pub(super) fn for_probe() -> Option<(PathBuf, u64)> {
     let stamp = super::cli_binary_stamp("codex").ok()?;
-    let (path, generation, digest) = match SAVED.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
-    {
-        Some((kept, generation, path, Some(digest))) if kept.same(&stamp) => {
-            (path.clone(), *generation, *digest)
-        }
-        _ => return None,
-    };
+    let saved = SAVED.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let (_, generation, path, digest) = saved.filter(|saved| saved.0.same(&stamp))?;
     let bytes = std::fs::read(&path).ok()?;
-    (<[u8; 32]>::from(Sha256::digest(bytes)) == digest).then_some((path, generation))
+    (digest == Some(Sha256::digest(bytes).into())).then_some((path, generation))
 }
 
 /// After a probe given the list of binary number `generation` ended (reaped)
 /// with no `account/read` reply: while that binary is still the saved one,
-/// later probes run without a list until it changes, across restarts. The
-/// list stays, since another home's probe may still read it.
+/// later probes run without a list until it changes or the daemon restarts.
+/// The list stays, since another home's probe may still read it.
 pub(super) fn give_up(generation: u64) {
     let mut saved = SAVED.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((SourceStamp::File(file), kept, path, digest)) = saved.as_mut() {
-        if *kept == generation {
-            *digest = None;
-            if let Ok(body) = serde_json::to_vec(&*file) {
-                let marker = path.with_file_name(REFUSED);
-                let _ = ottto_core::write_owner_only_cache_file_atomic(&marker, &body);
-            }
-        }
+    if let Some(saved) = saved.as_mut().filter(|saved| saved.1 == generation) {
+        saved.3 = None;
     }
 }
 

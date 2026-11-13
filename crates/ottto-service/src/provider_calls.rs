@@ -58,8 +58,8 @@ pub(crate) fn readable_for_account(path: &std::path::Path) -> bool {
 }
 
 /// Unit tests that did not choose a support dir log to a per-process
-/// scratch dir, never the real one.
-fn log_support_dir() -> PathBuf {
+/// scratch dir, never the real one (also the Codex probe's model lists).
+pub(crate) fn log_support_dir() -> PathBuf {
     #[cfg(test)]
     if std::env::var_os("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR").is_none() {
         return test_support_dir();
