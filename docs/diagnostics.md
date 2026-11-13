@@ -96,7 +96,7 @@ memory, CPU and page-fault measurements regardless of `latest` equality.
 | `bytes_written_per_pass` | Process-attributed physical writes from prepare through finish returning, including other concurrent daemon work. No encoded-size estimate is substituted. |
 | `dirty_rows_per_save`, `encoded_bytes_per_save`, `max_value_bytes`, `erasure_pending_marks` | Backend save work and transactional erasure marks; attempts may roll back. |
 | `wal_peak_bytes`, `wal_alarm`, `wal_measurement_unavailable` | Measured WAL peak, alarm at 64 MiB, and unavailable measurements. The alarm is not a cap. |
-| `latest.wal_checkpoint_log_frames`, `latest.wal_checkpointed_frames` | Last available nonnegative WAL-frame and checkpointed-page counts returned together by SQLite, process-wide across state-v2 stores. The checkpointed count is reported in WAL frames, not distinct database pages. Cached in memory and carried by the existing state-v2 save/finish snapshot; no extra row or query. Absent until a pair is available; failure or SQLite's no-applicable-WAL result leaves the last available pair intact. They do not prove the latest attempt succeeded, and reset on process restart. |
+| `latest.wal_checkpoint_log_frames`, `latest.wal_checkpointed_frames` | Last available nonnegative WAL-frame and checkpointed-page counts returned together by SQLite, process-wide across state-v2 stores. The checkpointed count is reported in WAL frames, not distinct database pages. Cached in memory and carried by the existing state-v2 save/finish snapshot; no new row type or query. Changing these counts can make existing out-of-pass diagnostic rows print more often. Absent until a pair is available; failure or SQLite's no-applicable-WAL result leaves the last available pair intact. They do not prove the latest attempt succeeded, and reset on process restart. |
 | `import_peak_rss_bytes` | Sampled process RSS peak during the latest import attempt. |
 | `commit_latency_us.{p50,p95,recent_samples}` | Latest 128 measured COMMIT calls, excluding encoding, checkpoint and VACUUM. Pre-COMMIT refusals add no latency sample. |
 | `db_bytes`, `record_rows`, `file_rows`, `progress_rows` | Logical/main-file size and backend owner counts, with existing size alarms. `record_rows` and its alarm count graph records only; `progress_rows` counts upload-progress rows and has no alarm. |
@@ -1454,10 +1454,22 @@ include `recensus_armed` (boolean) and `context_fingerprint` (only the first
 matching context, subject to truncated-hash collisions; they are not identity proof.
 On starting rows, `recensus_armed` means the new census window is routine. On
 retiring rows, it means the next walk in that context is armed as routine.
-Complete and clean-follow-up retirements arm that next walk; terminal-unhealthy
-retry starts also become routine. A context-change start stays non-routine.
-Watcher-overflow, parent-resolution and sidecar restarts do not arm a walk.
-The marker stays process-local and is not restored from a checkpoint.
+Complete and clean-follow-up retirements arm that next walk. Terminal-unhealthy
+retry starts become routine only for file-level problems: `walk_loss` must be false
+(no metadata/directory loss or unattributed unreadables), with no directory cap,
+rejected symlink or watcher overflow. Open/read failures and disappeared files remain
+eligible. Retry arming needs no same-process evidence: after a restart or upgrade,
+a kept terminal-unhealthy traversal's first eligible retry walk is routine under those
+conditions. A context-change start stays non-routine. Watcher-overflow,
+parent-resolution and sidecar restarts do not arm a walk. The active marker stays
+process-local and is not restored when resuming an unfinished walk from a checkpoint.
+
+Retry and follow-up walks are estimated to finish census about 25–45 minutes later
+at routine cadence; this is not a bound. Continuous arrivals can extend completion;
+nothing is dropped. Unhealthy retries have no give-up limit and their backoff delay
+is capped at one hour; walk time and the next eligible pass can add further delay.
+Source-generic transition tests cover Claude, Codex and Pi; end-to-end upload tests
+through retry and follow-up walks cover Pi only.
 
 Completed native scan pages carry `routine_recensus`, `page_file_limit_hit` and
 `pending_work` booleans on `native_collection_page`. `pending_work` means queued

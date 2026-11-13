@@ -127,8 +127,17 @@ impl Starting {
         let mut state = recensus();
         let key = (source.slot(), context.to_owned());
         let armed = state.remove(&key) == Some(None);
-        self.context_fingerprint = context.chars().take(8).collect();
-        self.recensus_armed = matches!(self.reason, StartReason::TerminalUnhealthyRetry)
+        self.context_fingerprint = context.get(..8).unwrap_or_default().to_owned();
+        self.recensus_armed = (matches!(self.reason, StartReason::TerminalUnhealthyRetry)
+            && self.previous.as_ref().is_some_and(|previous| {
+                !previous.watcher_overflow
+                    && previous.counts.directory_entry_cap_exceeded_count == 0
+                    && previous.counts.symlink_rejected_count == 0
+                    && !previous
+                        .counts
+                        .unreadable_causes
+                        .walk_loss(previous.counts.unreadable_path_count as u64)
+            }))
             || (matches!(self.reason, StartReason::NoRetainedTraversal) && armed);
         if self.recensus_armed {
             state.insert(key, Some(window.to_owned()));
@@ -486,28 +495,94 @@ mod tests {
             SnapshotSource::Codex,
             SnapshotSource::Pi,
         ] {
-            let scratch = crate::test_scratch::ScratchDir::new("retry-recensus");
-            let roots = [scratch.to_path_buf()];
-            let mut index = ScanIndex::default();
-            ensure_bounded_traversal(source, &roots, &mut index, T0, BACKFILL_WINDOW_DAYS);
-            let traversal = index.traversal.as_mut().unwrap();
-            traversal.pending_directories.clear();
-            traversal.counts.malformed_json_line_count = 1;
-            traversal.unhealthy_retry_not_before_unix_seconds = rfc3339_unix_seconds(T1);
-            let (_, rows) = capture(|| {
-                ensure_bounded_traversal(source, &roots, &mut index, T1, BACKFILL_WINDOW_DAYS)
-            });
-            assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0]["counts"]["reason"], "terminal_unhealthy_retry");
-            let traversal = index.traversal.as_ref().unwrap();
-            assert!(routine_recensus(source, traversal));
-            assert_recensus_witness(&rows[0], traversal, true);
-            let restored =
-                serde_json::from_value(serde_json::to_value(traversal).unwrap()).unwrap();
-            assert!(
-                routine_recensus(source, &restored),
-                "page reload keeps the window"
-            );
+            for problem in ["malformed", "open_read", "disappeared"] {
+                let scratch = crate::test_scratch::ScratchDir::new("retry-recensus");
+                let roots = [scratch.to_path_buf()];
+                let mut index = ScanIndex::default();
+                ensure_bounded_traversal(source, &roots, &mut index, T0, BACKFILL_WINDOW_DAYS);
+                let traversal = index.traversal.as_mut().unwrap();
+                traversal.pending_directories.clear();
+                match problem {
+                    "open_read" => traversal.counts.record_unreadable(
+                        crate::codex_scan_diagnostics::UnreadableCause::OpenRead,
+                        1,
+                    ),
+                    "disappeared" => traversal.counts.disappeared_file_count = 1,
+                    _ => traversal.counts.malformed_json_line_count = 1,
+                }
+                traversal.unhealthy_retry_not_before_unix_seconds = rfc3339_unix_seconds(T1);
+                // A restarted process has a retained checkpoint but no in-memory arm.
+                disarm_recensus(source, &traversal.context_fingerprint);
+                index = serde_json::from_value(serde_json::to_value(&index).unwrap()).unwrap();
+                let (_, rows) = capture(|| {
+                    ensure_bounded_traversal(source, &roots, &mut index, T1, BACKFILL_WINDOW_DAYS)
+                });
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0]["counts"]["reason"], "terminal_unhealthy_retry");
+                let traversal = index.traversal.as_ref().unwrap();
+                assert!(routine_recensus(source, traversal));
+                assert_recensus_witness(&rows[0], traversal, true);
+                let restored =
+                    serde_json::from_value(serde_json::to_value(traversal).unwrap()).unwrap();
+                assert!(
+                    routine_recensus(source, &restored),
+                    "page reload keeps the window"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_unhealthy_retry_with_walk_loss_or_overflow_stays_paced() {
+        use crate::codex_scan_diagnostics::UnreadableCause;
+        for source in [
+            SnapshotSource::ClaudeCode,
+            SnapshotSource::Codex,
+            SnapshotSource::Pi,
+        ] {
+            for problem in [
+                "directory",
+                "metadata",
+                "unattributed",
+                "directory_cap",
+                "symlink",
+                "overflow",
+            ] {
+                let scratch = crate::test_scratch::ScratchDir::new("loss-retry-recensus");
+                let roots = [scratch.to_path_buf()];
+                let mut index = ScanIndex::default();
+                ensure_bounded_traversal(source, &roots, &mut index, T0, BACKFILL_WINDOW_DAYS);
+                let traversal = index.traversal.as_mut().unwrap();
+                traversal.pending_directories.clear();
+                // Overflow alone is not unhealthy; keep a file-level error alongside it.
+                traversal
+                    .counts
+                    .record_unreadable(UnreadableCause::OpenRead, 1);
+                match problem {
+                    "directory" => traversal
+                        .counts
+                        .record_unreadable(UnreadableCause::Directory, 1),
+                    "metadata" => traversal
+                        .counts
+                        .record_unreadable(UnreadableCause::Metadata, 1),
+                    "unattributed" => traversal.counts.unreadable_path_count += 1,
+                    "directory_cap" => traversal.counts.directory_entry_cap_exceeded_count = 1,
+                    "symlink" => traversal.counts.symlink_rejected_count = 1,
+                    "overflow" => traversal.watcher_hint_seen = true,
+                    _ => unreachable!(),
+                }
+                traversal.unhealthy_retry_not_before_unix_seconds = rfc3339_unix_seconds(T1);
+                let (_, rows) = capture(|| {
+                    ensure_bounded_traversal(source, &roots, &mut index, T1, BACKFILL_WINDOW_DAYS)
+                });
+                assert_eq!(rows[0]["counts"]["reason"], "terminal_unhealthy_retry");
+                let traversal = index.traversal.as_ref().unwrap();
+                assert!(
+                    !routine_recensus(source, traversal),
+                    "{source:?}: {problem}"
+                );
+                assert_recensus_witness(&rows[0], traversal, false);
+            }
         }
     }
 
