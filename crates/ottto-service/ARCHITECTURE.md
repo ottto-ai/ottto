@@ -105,8 +105,11 @@ file-system hint / periodic listing → select file → read new bytes from save
   The original in-folder census wait still expires on its third decision.
   An all-covered copy-only page drops its items when the session has another
   file; own turns still publish. A selected content twin pulls at most its
-  earliest accepted main holder. Frozen seeds prevent cascading pulls, and
-  ordinary discovery acquires the holder without an extra seed content read.
+  earliest accepted main holder, and a selected holder (not history-held)
+  pulls the content twins it is that holder for, so neither file publishes
+  the session without the other. A holder is never a twin, so pulls never
+  cascade, and ordinary discovery acquires the pulled file without an extra
+  seed content read.
   Money rule three selects content twins, path twins and disclosed main
   files once, using every census hash and one in-memory census walk without
   a deadline. Only a candidate sharing ids with an earlier accepted holder

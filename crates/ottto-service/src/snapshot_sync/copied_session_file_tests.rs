@@ -189,6 +189,110 @@ fn distinct_same_session_file_counts_and_copies_never_prove_copies() {
     });
 }
 
+/// [money] A page that reads only the original also reads the copied file it
+/// proves, after the copy carried the session: the session keeps the copy's
+/// own turn (row one), and an all-copy file adds nothing (row two).
+#[test]
+fn holder_only_page_brings_its_content_twin() {
+    // The copy sorts first: wherever both are read it is read first and
+    // carries the session, and its own pull brings the original.
+    const FIRST: &str = "0338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+    for own in [true, false] {
+        with_e2(|| {
+            let mut c = Corpus::new("holder-brings-content-twin");
+            let holder = c.root(ROOT, &resumed(ROOT, &[A, B]));
+            let mut prior = warm(&c);
+            let twin = c.write_at(&file(FIRST), &resumed(ROOT, &[A, B]), BORN);
+            owe(&mut prior);
+            let both = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
+            assert_eq!(body(&both, ROOT).unwrap().request_count, 2);
+            prior = settle(&c, &prior, both, &mut e2_progress());
+            if own {
+                // Copy-seeded: only the copy changed; it carries the session.
+                append(&twin, &resumed(ROOT, &[C]));
+                let copy = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
+                assert_eq!(body(&copy, ROOT).unwrap().request_count, 3);
+                prior = settle(&c, &prior, copy, &mut e2_progress());
+            }
+            // Only the original changes.
+            append(&holder, &resumed(ROOT, &[D]));
+            let expected = 3 + u64::from(own);
+            let scanner = E2ScanFixture::default();
+            let seeded = ready(&c, &scanner, prior.clone(), 100, false);
+            assert_eq!(
+                body(&seeded, ROOT).unwrap().request_count,
+                expected,
+                "the copy's own turn stays counted"
+            );
+            // Reference: the owed copy is read first and its pull brings the
+            // original, the composition of a copy-seeded page.
+            let mut again = prior.clone();
+            again.activate_effective_upload_body_witness_revision(3);
+            assert!(again.re_owe_effective_upload_body_witness_revision(&twin.to_string_lossy(), 2));
+            let reference = ready(&c, &E2ScanFixture::default(), again, 100, false);
+            assert_eq!(body(&reference, ROOT).unwrap().request_count, expected);
+            money_oracle::assert_equivalent(&sent_money(&reference), &sent_money(&seeded));
+            if own {
+                assert!(
+                    scanner.paths().contains(&twin),
+                    "the original brings its copy"
+                );
+            }
+        });
+    }
+}
+
+/// [money] An unchanged original read for local work while its owed history
+/// is held emits nothing and does not bring its copy, so the session never
+/// goes out at the copy's composition alone. Its history stays owed.
+#[test]
+fn held_history_original_does_not_bring_its_copy() {
+    const FIRST: &str = "0338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+    with_e2(|| {
+        let mut c = Corpus::new("held-history-original");
+        let holder = c.root(ROOT, &resumed(ROOT, &[A, B]));
+        let mut prior = warm(&c);
+        let twin = c.write_at(&file(FIRST), &resumed(ROOT, &[A, B]), BORN);
+        owe(&mut prior);
+        let both = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
+        prior = settle(&c, &prior, both, &mut e2_progress());
+        append(&twin, &resumed(ROOT, &[C]));
+        let copy = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
+        assert_eq!(body(&copy, ROOT).unwrap().request_count, 3);
+        prior = settle(&c, &prior, copy, &mut e2_progress());
+        // The original owes history that an unreadable list holds, and a
+        // pending prefix wait selects it for local work: parsed, not emitted.
+        let key = holder.to_string_lossy().into_owned();
+        prior.activate_effective_upload_body_witness_revision(3);
+        assert!(prior.re_owe_effective_upload_body_witness_revision(&key, 2));
+        prior.claude_copy_removals.advance_hold(location_key(&key));
+        std::fs::write(
+            c.support
+                .join("snapshots/claude_code-reemission-exclusions.txt"),
+            "not a digest\n",
+        )
+        .unwrap();
+        let scanner = E2ScanFixture::default();
+        let mut page = c.raw(&scanner, prior, 100, false, &[]);
+        page.enrich(&c);
+        assert!(body(&page, ROOT).is_none(), "no copy-only session emission");
+        page.finish();
+        assert_eq!(
+            page.index.files[&key].effective_upload_body_witness_revision, 2,
+            "the held history stays owed"
+        );
+        let paths = scanner.paths();
+        assert!(
+            paths.contains(&holder),
+            "the original is read for local work"
+        );
+        assert!(
+            !paths.contains(&twin),
+            "the held original does not bring its copy"
+        );
+    });
+}
+
 /// [money] All acquisition routes conserve the corrected totals and placement
 /// with two accounts, a switch, a side call, an evidence gap and tagged rows.
 #[test]
