@@ -3461,27 +3461,22 @@ pub(crate) fn attach_page(items: &mut [SnapshotItem], read: &ClaudeApiEvidenceRe
 #[derive(Default)]
 pub(crate) struct SideCallDiscovery {
     anchors: BTreeMap<String, BTreeSet<PathBuf>>,
-    probed: BTreeMap<(PathBuf, String), bool>,
     pub(crate) hints: BTreeSet<PathBuf>,
 }
 impl SideCallDiscovery {
     pub(crate) fn new<'a>(paths: impl Iterator<Item = &'a Path>) -> Self {
         let mut page = Self::default();
         for path in paths {
-            let Some(member) = claude_index_path_member_ref(path) else {
+            let Some(member) =
+                claude_index_path_member_ref(path).filter(|member| member.subagent_stem.is_none())
+            else {
                 continue;
             };
-            let directory = if member.subagent_stem.is_some() {
-                super::super::claude_family_subagents_dir(path, member.root).map(Path::to_path_buf)
-            } else {
-                path.parent()
-                    .map(|parent| parent.join(member.root).join("subagents"))
-            };
-            if let Some(directory) = directory {
+            if let Some(parent) = path.parent() {
                 page.anchors
                     .entry(member.root.to_owned())
                     .or_default()
-                    .insert(directory);
+                    .insert(parent.join(member.root).join("subagents"));
             }
         }
         page
@@ -3491,14 +3486,6 @@ impl SideCallDiscovery {
         let Some(stem) = owner.strip_prefix(root).and_then(|s| s.strip_prefix('_')) else {
             return false;
         };
-        // Trace ids need not be hexadecimal. Require one normal component and
-        // round-trip through the same path identity parser used by acquisition.
-        let mut components = Path::new(stem).components();
-        if !matches!(components.next(), Some(std::path::Component::Normal(_)))
-            || components.next().is_some()
-        {
-            return false;
-        }
         let mut reserved = false;
         for directory in self.anchors.get(root).into_iter().flatten() {
             let path = directory.join(format!("{stem}.jsonl"));
@@ -3507,38 +3494,20 @@ impl SideCallDiscovery {
             {
                 continue;
             }
-            let found = *self
-                .probed
-                .entry((directory.clone(), owner.to_owned()))
-                .or_insert_with(|| {
-                    diag("side_call_member_probes", 1);
-                    record_counts(Counts::one(28, 1));
-                    match std::fs::symlink_metadata(&path) {
-                        Ok(metadata) => metadata.is_file(),
-                        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
-                    }
-                });
+            let found = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata.is_file(),
+                Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+            };
             if found {
                 reserved = true;
                 if self.hints.insert(path) {
                     diag("side_call_member_hints", 1);
-                    record_counts(Counts::one(29, 1));
+                    record_counts(Counts::one(28, 1));
                 }
             }
         }
         reserved
     }
-}
-
-// Existing unit fixtures without acquisition paths exercise the same fold.
-#[cfg(test)]
-pub(crate) fn side_calls_page(
-    items: &mut [SnapshotItem],
-    api: &ClaudeLocalOtelLoadReport,
-    trace: &ClaudeTraceOwnershipLoadReport,
-    index: &ScanIndex,
-) -> BTreeSet<String> {
-    side_calls_page_with_discovery(items, api, trace, index, &mut SideCallDiscovery::default())
 }
 
 /// Side calls (telemetry-only requests no family transcript holds) keep
@@ -3553,7 +3522,7 @@ pub(crate) fn side_calls_page(
 /// queued by the walk): the caller holds their owed history files through the
 /// unhealthy-telemetry seam, so a later page publishes the exact side-call
 /// money; their bodies stay telemetry-incomplete meanwhile.
-pub(crate) fn side_calls_page_with_discovery(
+pub(crate) fn side_calls_page(
     items: &mut [SnapshotItem],
     api: &ClaudeLocalOtelLoadReport,
     trace: &ClaudeTraceOwnershipLoadReport,
@@ -4506,7 +4475,7 @@ fn absent_twins(
 // Existing native_collection_page carrier, nonzero only. These are shared
 // process fold deltas since its previous Claude page line.
 use std::sync::atomic::{AtomicU64, Ordering};
-const COUNT_NAMES: [&str; 30] = [
+const COUNT_NAMES: [&str; 29] = [
     "fold_us",
     "responses",
     "copy_skipped",
@@ -4546,7 +4515,6 @@ const COUNT_NAMES: [&str; 30] = [
     "family_copy_deferred",
     // Copied requests an earlier same-session fold on the page counts.
     "copy_prefix_twin_page_removed",
-    "side_call_member_probes",
     "side_call_member_hints",
 ];
 // Then `copy_prefix_wait`: proof waits started, and (episodes, decided

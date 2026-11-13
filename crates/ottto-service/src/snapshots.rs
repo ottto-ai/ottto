@@ -832,18 +832,15 @@ impl SourceScanResult {
             index.resume_census_window_end = None;
         }
     }
-    /// Preserve late Task members through the ordinary durable discovery queue,
-    /// including a page which retired its native traversal before evidence ran.
-    pub(crate) fn enqueue_claude_side_call_hints(
-        &mut self,
+    /// Keep exact discoveries in the ordinary durable queue, also after native
+    /// selection retired this page's traversal.
+    pub(crate) fn enqueue_claude_discovery_hints(
+        &self,
         index: &mut ScanIndex,
         roots: &[PathBuf],
         lookback_days: u64,
         hints: &[PathBuf],
     ) {
-        if hints.is_empty() {
-            return;
-        }
         if index.traversal.is_none() {
             ensure_bounded_traversal(
                 SnapshotSource::ClaudeCode,
@@ -856,7 +853,6 @@ impl SourceScanResult {
         if let Some(traversal) = index.traversal.as_mut() {
             enqueue_watcher_hints(SnapshotSource::ClaudeCode, traversal, hints, false);
         }
-        self.census_complete = false;
     }
 
     /// Index keys this scan read to completion, with their parsed source
