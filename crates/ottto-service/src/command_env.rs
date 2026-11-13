@@ -358,7 +358,16 @@ fn read_shell_env(mut command: Command, timeout: Duration) -> Option<BTreeMap<St
     use std::os::unix::process::CommandExt;
 
     let deadline = Instant::now() + timeout;
-    let mut child = command.process_group(0).spawn().ok()?;
+    // setsid is async-signal-safe and prevents access to the caller's controlling tty.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().ok()?;
     let mut stdout = child.stdout.take().expect("piped shell stdout");
     let flags = unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_GETFL) };
     let nonblocking = flags >= 0
@@ -401,7 +410,11 @@ fn read_shell_env(mut command: Command, timeout: Duration) -> Option<BTreeMap<St
             _ => break,
         }
     }
-    let status = crate::process_guard::stop_group_and_reap(child, Duration::ZERO);
+    let status = if complete {
+        crate::process_guard::stop_group_and_reap(child, Duration::ZERO)
+    } else {
+        crate::process_guard::kill_group_and_reap(child)
+    };
     drop(stdout);
     (complete && status.ok()?.success()).then(|| parse_provider_env_output(&output))
 }
@@ -756,6 +769,54 @@ mod tests {
         assert!(result.is_none());
         assert!(start.elapsed() < Duration::from_secs(2));
         shell.assert_child_stopped();
+    }
+
+    #[test]
+    #[ignore = "fake session leader invoked only by provider shell tests"]
+    fn provider_shell_session_fixture() {
+        assert_eq!(unsafe { libc::getsid(0) }, unsafe { libc::getpid() });
+        assert_eq!(unsafe { libc::getpgrp() }, unsafe { libc::getpid() });
+        println!("\nGOOGLE_CLOUD_PROJECT=session-leader");
+    }
+
+    #[test]
+    fn provider_shell_starts_its_own_session_and_group() {
+        let shell = FakeShell::new();
+        let executable = std::env::current_exe().unwrap();
+        let executable = executable.to_string_lossy().replace('\'', "'\\''");
+        let script = format!(
+            "exec '{executable}' --ignored --exact command_env::tests::provider_shell_session_fixture --nocapture --test-threads=1"
+        );
+        assert_eq!(
+            shell
+                .run(&script, INTERACTIVE_SHELL_ENV_TIMEOUT)
+                .expect("shell is the session leader")
+                .get("GOOGLE_CLOUD_PROJECT"),
+            Some(&OsString::from("session-leader"))
+        );
+    }
+
+    #[test]
+    fn provider_shell_success_leaves_redirected_background_job_running() {
+        let shell = FakeShell::new();
+        let result = shell.run(
+            "/bin/sleep 10 >/dev/null 2>&1 & echo $! > \"$1\"; printf 'GOOGLE_CLOUD_PROJECT=shell-project\\n'",
+            INTERACTIVE_SHELL_ENV_TIMEOUT,
+        );
+        let was_running = shell.child_running();
+        let pid: libc::pid_t = fs::read_to_string(shell.home.join("child-pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(pid > 1);
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        shell.assert_child_stopped();
+        assert!(was_running, "successful import killed a background job");
+        assert_eq!(
+            result.expect("complete env").get("GOOGLE_CLOUD_PROJECT"),
+            Some(&OsString::from("shell-project"))
+        );
     }
 
     #[test]

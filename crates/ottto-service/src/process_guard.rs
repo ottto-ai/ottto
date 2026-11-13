@@ -44,9 +44,10 @@ impl GroupChild for crate::local_resource_diagnostics::cli_children::MeasuredChi
     }
 }
 
-/// Requires an unreaped child spawned with process_group(0), exclusively owned here.
-/// Give the leader up to `drain` to exit, then stop its group before reaping.
-/// Consume the handle so it cannot be signalled again after this reap.
+/// Requires an exclusively owned, unreaped group leader (process_group(0) or setsid()).
+/// Observe exit for up to `drain`: reap exited leaders without signalling; only
+/// force-stop the group when the leader is still running after the drain.
+/// Consume the handle so no group signal can follow a reap.
 pub(crate) fn stop_group_and_reap(
     mut child: impl GroupChild,
     drain: Duration,
@@ -54,7 +55,8 @@ pub(crate) fn stop_group_and_reap(
     let deadline = Instant::now() + drain;
     loop {
         match exited(child.child_mut()) {
-            Ok(done) if done || Instant::now() >= deadline => break,
+            Ok(true) => return child.reap(),
+            Ok(false) if Instant::now() >= deadline => break,
             Ok(_) => thread::sleep(
                 Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
             ),
@@ -68,6 +70,17 @@ pub(crate) fn stop_group_and_reap(
             // A status-read failure must still stop and reap our owned child.
             Err(_) => break,
         }
+    }
+    kill_group_and_reap(child)
+}
+
+/// Force-stop an exclusively owned, unreaped group, even if its leader exited.
+/// Used when a failed exchange must release descendants holding inherited pipes.
+pub(crate) fn kill_group_and_reap(mut child: impl GroupChild) -> io::Result<ExitStatus> {
+    if let Err(error) = exited(child.child_mut())
+        && error.raw_os_error() == Some(libc::ECHILD)
+    {
+        return child.reap();
     }
     let direct = child.child_mut();
     if let Ok(pgid) = libc::pid_t::try_from(direct.id())
