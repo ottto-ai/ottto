@@ -52,8 +52,9 @@ fn legacy(c: &Corpus, index: ScanIndex) -> (ScanIndex, SnapshotItem) {
 }
 
 /// [money] Same 26 pairs: co-page declares 26 removals; either singleton
-/// counts 26; cold/retained/restarted owners agree. A changed device refuses
-/// the old certificate without changing births or the twin decision.
+/// counts 26; cold/retained/restarted owners agree. A changed device keeps
+/// the certificate across a device renumber without changing births or the
+/// twin decision.
 #[cfg(unix)]
 #[test]
 fn subagent_all_copy_twins_conserve_pages_restart_and_device_replace() {
@@ -149,9 +150,26 @@ fn subagent_all_copy_twins_conserve_pages_restart_and_device_replace() {
         let item = body(&page, &member()).unwrap();
         assert_eq!((item.request_count, item.output_tokens), (26, 11_525));
         assert_eq!(item.removed_request_count, Some(26));
-        assert!(
-            page.modes.0 >= 2,
-            "both refused device certificates read Full"
+        // The same page without the renumber: the twins add no Full read.
+        let (control_c, _, control_index) = pair("subagent-copied-device-control");
+        let (mut control, _) = legacy(&control_c, control_index);
+        owe(&mut control);
+        let mut control = ready(
+            &control_c,
+            &E2ScanFixture::with_subagent_births(),
+            control,
+            100,
+            true,
+        );
+        control.finish();
+        assert_eq!(
+            scanner.full_reasons()[crate::transcript_acquisition::FullReason::Replaced.slot()],
+            0,
+            "a renumbered device is not a replacement"
+        );
+        assert_eq!(
+            page.modes.0, control.modes.0,
+            "neither twin reads Full after a device renumber"
         );
         assert_eq!(
             paths

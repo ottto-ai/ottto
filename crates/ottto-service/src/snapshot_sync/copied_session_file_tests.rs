@@ -472,4 +472,5 @@ fn copied_file_version_three_converges_once() {
 
 mod subagent_twins {
     include!("subagent_copy_twin_tests.rs");
+    include!("subagent_copy_twin_replace_tests.rs");
 }

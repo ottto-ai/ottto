@@ -257,7 +257,7 @@ fn head_certificate<S: tail_source::TailSource>(
 
 /// Model a reboot's device renumber in a committed certificate, leaving
 /// inode, birth, samples and reduction unchanged. The next ordinary load
-/// must refuse that physical identity and re-read the file in Full.
+/// keeps that certificate: the device is never compared across boots.
 #[cfg(unix)]
 pub(crate) fn renumber_device_for_test(index: &mut ScanIndex, key: &str) {
     let route = route_of(index).unwrap();

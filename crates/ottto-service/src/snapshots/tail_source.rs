@@ -1263,16 +1263,16 @@ pub(in crate::snapshots) fn renumber_device_for_test(body: &[u8], key: &str) -> 
     let mut certificate = DurableCertificate::take(&mut decoder).unwrap();
     certificate.device ^= 1;
     let mut file = std::fs::File::open(key).unwrap();
-    assert!(matches!(
-        certificate.restore_grown(
-            &mut file,
-            crate::transcript_acquisition::Scope("e2-pipeline".into()),
-            None
-        ),
-        Err(crate::transcript_acquisition::CertificateRefusal::Changed(
-            crate::transcript_acquisition::FullReason::Replaced
-        ))
-    ));
+    assert!(
+        certificate
+            .restore_grown(
+                &mut file,
+                crate::transcript_acquisition::Scope("e2-pipeline".into()),
+                None
+            )
+            .is_ok(),
+        "a renumbered device keeps the certificate"
+    );
     let mut edited = Enc::count_write(usize::MAX, |encoder| {
         identity.put(encoder)?;
         certificate.put(encoder)
