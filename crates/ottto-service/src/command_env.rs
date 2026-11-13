@@ -4,9 +4,9 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 #[cfg(unix)]
 use std::thread;
-#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 const COMMAND_SEARCH_PATH_ENV: &str = "OTTTO_COMMAND_SEARCH_PATH";
@@ -270,11 +270,42 @@ pub(crate) fn path_env() -> Option<OsString> {
 }
 
 pub(crate) fn provider_env() -> BTreeMap<String, OsString> {
+    provider_env_with_refresh(false)
+}
+
+pub(crate) fn provider_env_with_refresh(refresh: bool) -> BTreeMap<String, OsString> {
     let current = current_provider_env();
-    let missing_shell_env = (current.len() < PROVIDER_ENV_KEYS.len())
-        .then(interactive_shell_provider_env)
+    let missing_shell_env = (refresh || current.len() < PROVIDER_ENV_KEYS.len())
+        .then(|| cached_shell_provider_env(refresh))
         .flatten();
     provider_env_from_sources(&current, missing_shell_env.as_ref())
+}
+
+type ShellEnv = BTreeMap<String, OsString>;
+type ShellEnvCache = Mutex<Option<(Option<OsString>, Instant, Option<ShellEnv>)>>;
+
+fn cached_shell_provider_env(refresh: bool) -> Option<ShellEnv> {
+    #[cfg(not(test))]
+    static CACHE: ShellEnvCache = Mutex::new(None);
+    #[cfg(not(test))]
+    let (cache, now) = (&CACHE, Instant::now);
+    #[cfg(test)]
+    let (cache, now) = (test_shell_env::cache(), test_shell_env::now);
+    let home = env::var_os("HOME");
+    let requested = now();
+    // Hold the lock through the bounded import; waiters share success or failure.
+    let mut cached = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if cached.as_ref().is_none_or(|(key, at, _)| {
+        key != &home
+            || now().saturating_duration_since(*at) >= Duration::from_secs(1800)
+            || (refresh && *at < requested)
+    }) {
+        let shell = interactive_shell_provider_env();
+        *cached = Some((home, now(), shell));
+    }
+    cached.as_ref()?.2.clone()
 }
 
 /// The environment a stdio MCP server or the Claude CLI is spawned with,
@@ -534,11 +565,35 @@ fn push_unique(dirs: &mut Vec<PathBuf>, dir: PathBuf) {
 
 #[cfg(test)]
 pub(crate) mod test_shell_env {
-    use std::cell::RefCell;
+    use super::{Instant, ShellEnvCache};
+    use std::cell::{Cell, RefCell};
+    use std::sync::Arc;
 
     thread_local! {
         static OUTPUT: RefCell<Option<Option<Vec<u8>>>> = const { RefCell::new(None) };
         static CALLS: RefCell<usize> = const { RefCell::new(0) };
+        static CACHE: RefCell<Arc<ShellEnvCache>> = RefCell::new(Arc::default());
+        static NOW: Cell<Option<Instant>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn cache() -> Arc<ShellEnvCache> {
+        CACHE.with_borrow(Arc::clone)
+    }
+
+    pub(super) fn now() -> Instant {
+        NOW.get().unwrap_or_else(Instant::now)
+    }
+
+    pub(crate) fn set_output(output: Option<&[u8]>) {
+        OUTPUT.set(Some(output.map(<[u8]>::to_vec)));
+    }
+
+    pub(crate) fn set_now(now: Instant) {
+        NOW.set(Some(now));
+    }
+
+    pub(super) fn share_cache(cache: Arc<ShellEnvCache>) {
+        CACHE.set(cache);
     }
 
     pub(super) fn output() -> Option<Option<Vec<u8>>> {
@@ -552,16 +607,25 @@ pub(crate) mod test_shell_env {
 
     /// Inject the existing parser's shell stdout, or an import failure, on this thread.
     pub(crate) fn with_output<T>(output: Option<&[u8]>, run: impl FnOnce() -> T) -> (T, usize) {
-        struct Restore(Option<Option<Vec<u8>>>, usize);
+        struct Restore(
+            Option<Option<Vec<u8>>>,
+            usize,
+            Arc<ShellEnvCache>,
+            Option<Instant>,
+        );
         impl Drop for Restore {
             fn drop(&mut self) {
                 OUTPUT.set(self.0.take());
                 CALLS.set(self.1);
+                CACHE.set(self.2.clone());
+                NOW.set(self.3);
             }
         }
         let _restore = Restore(
             OUTPUT.replace(Some(output.map(<[u8]>::to_vec))),
             CALLS.replace(0),
+            CACHE.replace(Arc::default()),
+            NOW.replace(None),
         );
         let result = run();
         (result, CALLS.with_borrow(|calls| *calls))
@@ -574,6 +638,111 @@ mod tests {
     use crate::test_scratch;
     use std::fs;
     use std::os::unix::fs::{symlink, PermissionsExt};
+
+    const SHELL_PROJECT: &[u8] = b"GOOGLE_CLOUD_PROJECT=shell-project\n";
+
+    #[test]
+    fn shell_cache_reuses_import_within_ttl() {
+        let (_, calls) = test_shell_env::with_output(Some(SHELL_PROJECT), || {
+            let start = Instant::now();
+            test_shell_env::set_now(start);
+            let first = cached_shell_provider_env(false);
+            test_shell_env::set_now(start + Duration::from_secs(1799));
+            test_shell_env::set_output(Some(b"GOOGLE_CLOUD_PROJECT=changed\n"));
+            assert_eq!(cached_shell_provider_env(false), first);
+        });
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn shell_cache_reimports_at_ttl_boundary() {
+        let (_, calls) = test_shell_env::with_output(Some(SHELL_PROJECT), || {
+            let start = Instant::now();
+            test_shell_env::set_now(start);
+            cached_shell_provider_env(false);
+            test_shell_env::set_now(start + Duration::from_secs(1800));
+            test_shell_env::set_output(Some(b"GOOGLE_CLOUD_PROJECT=changed\n"));
+            let value = cached_shell_provider_env(false).unwrap();
+            assert_eq!(value["GOOGLE_CLOUD_PROJECT"], "changed");
+        });
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn shell_cache_retains_failure_for_full_ttl() {
+        let (_, calls) = test_shell_env::with_output(None, || {
+            let start = Instant::now();
+            test_shell_env::set_now(start);
+            assert!(cached_shell_provider_env(false).is_none());
+            test_shell_env::set_output(Some(SHELL_PROJECT));
+            test_shell_env::set_now(start + Duration::from_secs(1799));
+            assert!(cached_shell_provider_env(false).is_none());
+            test_shell_env::set_now(start + Duration::from_secs(1800));
+            assert!(cached_shell_provider_env(false).is_some());
+        });
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn shell_cache_home_change_is_a_miss() {
+        let (_, calls) = test_shell_env::with_output(Some(SHELL_PROJECT), || {
+            cached_shell_provider_env(false);
+            test_shell_env::cache().lock().unwrap().as_mut().unwrap().0 =
+                Some(OsString::from("different-synthetic-home"));
+            test_shell_env::set_output(Some(b"GOOGLE_CLOUD_PROJECT=changed\n"));
+            assert_eq!(
+                cached_shell_provider_env(false).unwrap()["GOOGLE_CLOUD_PROJECT"],
+                "changed"
+            );
+        });
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn shell_cache_concurrent_callers_share_one_import() {
+        use std::sync::{Arc, Barrier};
+        let cache = Arc::new(ShellEnvCache::default());
+        let barrier = Arc::new(Barrier::new(8));
+        let workers = (0..8)
+            .map(|_| {
+                let cache = cache.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    test_shell_env::with_output(Some(SHELL_PROJECT), || {
+                        test_shell_env::share_cache(cache);
+                        barrier.wait();
+                        cached_shell_provider_env(false).unwrap()
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut calls = 0;
+        for worker in workers {
+            let (value, imports) = worker.join().unwrap();
+            assert_eq!(value["GOOGLE_CLOUD_PROJECT"], "shell-project");
+            calls += imports;
+        }
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn shell_cache_overlapping_refresh_shares_completed_import() {
+        let (_, calls) = test_shell_env::with_output(Some(SHELL_PROJECT), || {
+            let start = Instant::now();
+            test_shell_env::set_now(start);
+            cached_shell_provider_env(false);
+            // A refresh that began no later than this completed fill shares it.
+            assert_eq!(
+                cached_shell_provider_env(true),
+                cached_shell_provider_env(false)
+            );
+            test_shell_env::set_now(start + Duration::from_secs(1));
+            test_shell_env::set_output(None);
+            assert!(cached_shell_provider_env(true).is_none());
+            assert!(cached_shell_provider_env(false).is_none());
+        });
+        assert_eq!(calls, 2);
+    }
 
     fn scratch_home(name: &str) -> PathBuf {
         std::env::temp_dir()

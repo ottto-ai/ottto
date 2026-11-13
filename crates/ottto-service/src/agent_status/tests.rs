@@ -13601,13 +13601,61 @@ fn pi_list_probe_parses_models_with_inherited_env_after_import_failure() {
 #[serial]
 fn pi_list_probe_excludes_unallowlisted_login_shell_vars_and_prefers_inherited_env() {
     with_pi_list_probe_fixture(|_| {
-        let _project = EnvVarGuard::set_os("GOOGLE_CLOUD_PROJECT", "fixture-project".into());
         let (snapshot, imports) = crate::command_env::test_shell_env::with_output(
             Some(b"GOOGLE_CLOUD_PROJECT=shell-project\nOTTTO_TEST_SHELL_ONLY=shell-only\n"),
-            || collect_pi_status("capture".into(), "expiry".into()),
+            || {
+                assert_eq!(
+                    crate::command_env::provider_env()["GOOGLE_CLOUD_PROJECT"],
+                    "shell-project"
+                );
+                let _project =
+                    EnvVarGuard::set_os("GOOGLE_CLOUD_PROJECT", "fixture-project".into());
+                collect_pi_status("capture".into(), "expiry".into())
+            },
         );
         assert_eq!(imports, 1);
         assert_pi_list_probe_model(snapshot);
+    });
+}
+
+#[test]
+#[serial]
+fn pi_manual_status_refresh_repopulates_shell_cache_but_scan_reuses_it() {
+    with_pi_list_probe_fixture(|_| {
+        let (_, imports) = crate::command_env::test_shell_env::with_output(
+            Some(b"GOOGLE_CLOUD_PROJECT=old\n"),
+            || {
+                let start = Instant::now();
+                crate::command_env::test_shell_env::set_now(start);
+                assert_eq!(
+                    crate::command_env::provider_env()["GOOGLE_CLOUD_PROJECT"],
+                    "old"
+                );
+                crate::command_env::test_shell_env::set_now(start + Duration::from_secs(1));
+                crate::command_env::test_shell_env::set_output(Some(
+                    b"GOOGLE_CLOUD_PROJECT=fixture-project\n",
+                ));
+                let refresh = |manual| {
+                    crate::agent_status_refresh::collection(
+                        &SourceKind::Pi,
+                        "capture".into(),
+                        "expiry".into(),
+                        manual,
+                    )
+                    .unwrap()
+                };
+                let ordinary = refresh(false);
+                assert!(ordinary
+                    .source_health_snapshot
+                    .model
+                    .as_ref()
+                    .is_none_or(|model| model.available_models.is_empty()));
+                assert_pi_list_probe_model(refresh(true).source_health_snapshot.clone());
+                crate::command_env::test_shell_env::set_output(None);
+                assert_pi_list_probe_model(refresh(false).source_health_snapshot.clone());
+            },
+        );
+        assert_eq!(imports, 2);
     });
 }
 
