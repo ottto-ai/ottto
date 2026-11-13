@@ -132,7 +132,7 @@ pub(in crate::snapshots) struct ClaudeTwinSchedule {
     /// and of each content twin or holder the other pulled: those homes fold
     /// together, and its children keep their own decisions.
     root_homes: BTreeSet<String>,
-    /// Sorted request hashes of every main content-twin census record, as of
+    /// Sorted request hashes of every content-twin census record, as of
     /// first use on this page; bounded by the twin records.
     twin_hashes: Option<Vec<u64>>,
 }
@@ -143,11 +143,7 @@ impl ClaudeTwinSchedule {
         self.twin_hashes.get_or_insert_with(|| {
             let mut union = census
                 .records()
-                .filter(|(key, record)| {
-                    record.is_twin()
-                        && claude_index_path_member_ref(Path::new(key.as_str()))
-                            .is_some_and(|member| member.subagent_stem.is_none())
-                })
+                .filter(|(_, record)| record.is_twin())
                 .flat_map(|(_, record)| record.request_hashes().iter().copied())
                 .collect::<Vec<_>>();
             union.sort_unstable();

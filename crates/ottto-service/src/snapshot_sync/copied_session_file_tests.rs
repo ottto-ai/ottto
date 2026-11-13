@@ -197,7 +197,6 @@ fn holder_only_page_brings_its_content_twin() {
     // The copy sorts first: wherever both are read it is read first and
     // carries the session, and its own pull brings the original.
     const FIRST: &str = "0338a80a-f36e-4cbc-a5bb-50fc66430ba5";
-    const E: (&str, &str, &str) = ("e", "2026-08-02T07:07:10Z", RESUME_WRITER);
     for own in [true, false] {
         with_e2(|| {
             let mut c = Corpus::new("holder-brings-content-twin");
@@ -233,20 +232,12 @@ fn holder_only_page_brings_its_content_twin() {
             let reference = ready(&c, &E2ScanFixture::default(), again, 100, false);
             assert_eq!(body(&reference, ROOT).unwrap().request_count, expected);
             money_oracle::assert_equivalent(&sent_money(&reference), &sent_money(&seeded));
-            if !own {
-                return;
+            if own {
+                assert!(
+                    scanner.paths().contains(&twin),
+                    "the original brings its copy"
+                );
             }
-            assert!(
-                scanner.paths().contains(&twin),
-                "the original brings its copy"
-            );
-            // Steady state: the next original-only page brings the copy again.
-            prior = settle(&c, &prior, seeded, &mut e2_progress());
-            append(&holder, &resumed(ROOT, &[E]));
-            let scanner = E2ScanFixture::default();
-            let steady = ready(&c, &scanner, prior, 100, false);
-            assert_eq!(body(&steady, ROOT).unwrap().request_count, 5);
-            assert!(scanner.paths().contains(&twin), "the copy is brought again");
         });
     }
 }

@@ -3955,25 +3955,18 @@ impl OwnedSourceScan {
             let record = (source == SnapshotSource::ClaudeCode)
                 .then(|| index.claude_request_census.get(&seed))
                 .flatten();
+            let walk = std::time::Instant::now();
             let pulls: Vec<String> = match record {
-                Some(record) if record.is_twin() => {
-                    let walk = std::time::Instant::now();
-                    let holders = claude_request_money::e2::copied_file_holders(
-                        index,
-                        std::iter::once(seed.as_str()),
-                    );
-                    claude_request_money::e2::diag(
-                        "copy_holder_walk_ms",
-                        walk.elapsed().as_millis() as u64,
-                    );
-                    holders.into_values().collect()
-                }
-                // Walk only for a holder sharing a request with some twin.
+                Some(record) if record.is_twin() => claude_request_money::e2::copied_file_holders(
+                    index,
+                    std::iter::once(seed.as_str()),
+                )
+                .into_values()
+                .collect(),
+                // Walk only for a holder sharing a request with some twin;
+                // the walk itself keeps only proving main holders.
                 Some(record)
-                    if record.proves_scan()
-                        && !history_held
-                        && claude_index_path_member_ref(&candidate.path)
-                            .is_some_and(|member| member.subagent_stem.is_none())
+                    if !history_held
                         && claude_request_census::held_candidates(
                             record,
                             claude_twin_schedule.twin_hashes(&index.claude_request_census),
@@ -3997,6 +3990,10 @@ impl OwnedSourceScan {
                 }
                 _ => Vec::new(),
             };
+            claude_request_money::e2::diag(
+                "copy_holder_walk_ms",
+                walk.elapsed().as_millis() as u64,
+            );
             for path in pulls.into_iter().map(PathBuf::from) {
                 let key = local_index_key(&path);
                 if claude_twin_schedule.root_homes.contains(&key)
