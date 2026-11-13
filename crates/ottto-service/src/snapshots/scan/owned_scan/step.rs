@@ -316,6 +316,11 @@ impl OwnedSourceScan {
                                 &selected_flags,
                                 group.members.iter().map(|member| member.path.as_path()),
                             ),
+                            // First read: newest groups admit first (order only;
+                            // each group's fold stays chronological).
+                            index
+                                .first_read_pending
+                                .then(|| first_read_order::newest_member(&group.members)),
                         )
                     });
                     let mut ordinary_singleton_slots = None;

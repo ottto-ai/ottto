@@ -7012,6 +7012,7 @@ fn prepare_sync_source_inner(
     // scan window (StateMissing H1, N2).
     let backfill_pending =
         backfill_replay_pending(source, &backfill_state, &upload_destination_namespace);
+    index.first_read_pending = backfill_pending;
     if !backfill_pending
         && index.prepare_snapshot_admission_reoffer(SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE)
     {

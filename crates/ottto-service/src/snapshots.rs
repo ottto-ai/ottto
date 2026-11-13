@@ -214,6 +214,8 @@ pub(crate) use scan::durable_sources;
 #[cfg(test)]
 pub(crate) mod e2_pipeline_scan_fixture;
 #[cfg(test)]
+mod first_read_order_tests;
+#[cfg(test)]
 mod held_audit_restore_tests;
 #[cfg(test)]
 mod resident_wave_tests;
@@ -1452,6 +1454,7 @@ use discovery::directory::{
     is_recent_enough_at, opened_candidate_is_within_frozen_window,
     reconcile_missing_index_entries_bounded, DiscoveryRecovery,
 };
+use discovery::first_read_order;
 use discovery::retention::{AccountMoveObservations, DiscoveryRetention};
 
 mod discovery;

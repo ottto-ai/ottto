@@ -7,12 +7,15 @@
 //! the decision and selection diagnostics, and admits one traversal path as a
 //! candidate. `candidate_open` resolves configured roots, opens one candidate
 //! and records its opened-object identity, and holds the per-page budgets for
-//! history files adopted only for a new body witness. `retention` holds the
-//! owed-key exemption from the discovery window that every age gate applies.
+//! history files adopted only for a new body witness. `first_read_order`
+//! reorders queued history newest first while a first read is pending.
+//! `retention` holds the owed-key exemption from the discovery window that
+//! every age gate applies.
 
 pub(super) mod candidate;
 pub(super) mod candidate_open;
 pub(super) mod directory;
+pub(super) mod first_read_order;
 pub(super) mod retention;
 #[cfg(test)]
 pub(in crate::snapshots) mod tests;
