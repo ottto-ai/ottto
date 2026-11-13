@@ -382,12 +382,12 @@ fn read_shell_env(mut command: Command, timeout: Duration) -> Option<BTreeMap<St
     while nonblocking && Instant::now() < deadline {
         let mut buffer = [0; 8192];
         match stdout.read(&mut buffer) {
-            Ok(0) => match crate::process_guard::exited_successfully(&child) {
-                Ok(Some(success)) => {
-                    complete = success && Instant::now() < deadline;
+            Ok(0) => match crate::process_guard::exited(&child) {
+                Ok(true) => {
+                    complete = Instant::now() < deadline;
                     break;
                 }
-                Ok(None) => thread::sleep(
+                Ok(false) => thread::sleep(
                     Duration::from_millis(50)
                         .min(deadline.saturating_duration_since(Instant::now())),
                 ),
@@ -410,11 +410,10 @@ fn read_shell_env(mut command: Command, timeout: Duration) -> Option<BTreeMap<St
             _ => break,
         }
     }
-    let status = if complete {
-        crate::process_guard::stop_group_and_reap(child, Duration::ZERO)
-    } else {
-        crate::process_guard::kill_group_and_reap(child)
-    };
+    let status = crate::process_guard::stop_group_and_reap(
+        child,
+        deadline.saturating_duration_since(Instant::now()),
+    );
     drop(stdout);
     (complete && status.ok()?.success()).then(|| parse_provider_env_output(&output))
 }
@@ -797,22 +796,13 @@ mod tests {
     }
 
     #[test]
-    fn provider_shell_success_leaves_redirected_background_job_running() {
+    fn provider_shell_success_stops_redirected_background_job() {
         let shell = FakeShell::new();
         let result = shell.run(
             "/bin/sleep 10 >/dev/null 2>&1 & echo $! > \"$1\"; printf 'GOOGLE_CLOUD_PROJECT=shell-project\\n'",
             INTERACTIVE_SHELL_ENV_TIMEOUT,
         );
-        let was_running = shell.child_running();
-        let pid: libc::pid_t = fs::read_to_string(shell.home.join("child-pid"))
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        assert!(pid > 1);
-        unsafe { libc::kill(pid, libc::SIGKILL) };
         shell.assert_child_stopped();
-        assert!(was_running, "successful import killed a background job");
         assert_eq!(
             result.expect("complete env").get("GOOGLE_CLOUD_PROJECT"),
             Some(&OsString::from("shell-project"))

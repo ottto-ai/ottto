@@ -5,11 +5,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub(crate) fn exited(child: &Child) -> io::Result<bool> {
-    Ok(exited_successfully(child)?.is_some())
-}
-
-/// None while running, otherwise the observed success flag; never reaps.
-pub(crate) fn exited_successfully(child: &Child) -> io::Result<Option<bool>> {
     let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
     let result = unsafe {
         libc::waitid(
@@ -22,8 +17,7 @@ pub(crate) fn exited_successfully(child: &Child) -> io::Result<Option<bool>> {
     if result < 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok((info.si_signo != 0)
-        .then(|| info.si_code == libc::CLD_EXITED && unsafe { info.si_status() } == 0))
+    Ok(info.si_signo != 0)
 }
 
 /// Preserve specialized waiters' accounting and cached exit status.
@@ -50,10 +44,14 @@ impl GroupChild for crate::local_resource_diagnostics::cli_children::MeasuredChi
     }
 }
 
-/// Requires an exclusively owned, unreaped group leader (process_group(0) or setsid()).
-/// Observe exit for up to `drain`: reap exited leaders without signalling; only
-/// force-stop the group when the leader is still running after the drain.
-/// Consume the handle so no group signal can follow a reap.
+/// Requires an exclusively owned group leader (process_group(0) or setsid()).
+/// The owner is the sole reaper: peek only with waitid(WNOWAIT) for up to `drain`.
+/// Then, whether the leader exited or is running, kill its checked group with
+/// SIGKILL before reaping; an exited zombie still reserves its pid/pgid. Kill
+/// the direct child only if it is still running, then reap. Group checks require
+/// pgid > 1 and pgid != getpgrp(), using only this owned child's pid.
+/// ECHILD means already reaped elsewhere: send no signal. Consume ownership;
+/// never send a group signal after a reap. No SIGTERM step.
 pub(crate) fn stop_group_and_reap(
     mut child: impl GroupChild,
     drain: Duration,
@@ -61,7 +59,7 @@ pub(crate) fn stop_group_and_reap(
     let deadline = Instant::now() + drain;
     loop {
         match exited(child.child_mut()) {
-            Ok(true) => return child.reap(),
+            Ok(true) => break,
             Ok(false) if Instant::now() >= deadline => break,
             Ok(_) => thread::sleep(
                 Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
@@ -77,17 +75,6 @@ pub(crate) fn stop_group_and_reap(
             Err(_) => break,
         }
     }
-    kill_group_and_reap(child)
-}
-
-/// Force-stop an exclusively owned, unreaped group, even if its leader exited.
-/// Used when a failed exchange must release descendants holding inherited pipes.
-pub(crate) fn kill_group_and_reap(mut child: impl GroupChild) -> io::Result<ExitStatus> {
-    if let Err(error) = exited(child.child_mut())
-        && error.raw_os_error() == Some(libc::ECHILD)
-    {
-        return child.reap();
-    }
     let direct = child.child_mut();
     if let Ok(pgid) = libc::pid_t::try_from(direct.id())
         && pgid > 1
@@ -96,7 +83,13 @@ pub(crate) fn kill_group_and_reap(mut child: impl GroupChild) -> io::Result<Exit
         // Even an exited leader may have live descendants in its group.
         unsafe { libc::killpg(pgid, libc::SIGKILL) };
     }
-    let _ = direct.kill();
+    match exited(direct) {
+        Ok(true) => {}
+        Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {}
+        _ => {
+            let _ = direct.kill();
+        }
+    }
     child.reap()
 }
 
@@ -121,7 +114,6 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
         assert!(exited(&child).unwrap());
-        assert_eq!(exited_successfully(&child).unwrap(), Some(false));
         let status = stop_group_and_reap(child, Duration::from_secs(2)).unwrap();
         assert_eq!(status.code(), Some(7));
     }
@@ -142,6 +134,96 @@ mod tests {
         let status = stop_group_and_reap(child, Duration::from_millis(100)).unwrap();
         assert_eq!(status.signal(), Some(libc::SIGKILL));
         assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    fn exited_leader_with_descendant() -> (Child, libc::pid_t) {
+        use std::io::Read;
+        let mut child = command("/bin/sleep 10 >/dev/null 2>&1 & echo $!; exit 7")
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut output = String::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut output)
+            .unwrap();
+        let descendant = output.trim().parse().unwrap();
+        assert!(descendant > 1);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !exited(&child).unwrap() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        (child, descendant)
+    }
+
+    fn running(pid: libc::pid_t) -> bool {
+        let output = Command::new("/bin/ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        let state = String::from_utf8_lossy(&output.stdout);
+        !state.trim().is_empty() && !state.trim().starts_with('Z')
+    }
+
+    #[test]
+    fn exited_leader_stops_descendant_before_reaping() {
+        struct Owner {
+            child: Child,
+            descendant: libc::pid_t,
+            reaped: bool,
+        }
+        impl GroupChild for Owner {
+            fn child_mut(&mut self) -> &mut Child {
+                assert!(!self.reaped, "accessed child after reap");
+                &mut self.child
+            }
+            fn reap(&mut self) -> io::Result<ExitStatus> {
+                assert!(!self.reaped, "reaped twice");
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while running(self.descendant) && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                let stopped_before_reap = !running(self.descendant);
+                let status = self.child.wait()?;
+                self.reaped = true;
+                if !stopped_before_reap {
+                    unsafe { libc::kill(self.descendant, libc::SIGKILL) };
+                }
+                assert!(stopped_before_reap, "descendant survived until leader reap");
+                Ok(status)
+            }
+        }
+        let (child, descendant) = exited_leader_with_descendant();
+        let status = stop_group_and_reap(
+            Owner {
+                child,
+                descendant,
+                reaped: false,
+            },
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert_eq!(status.code(), Some(7));
+        assert!(!running(descendant));
+    }
+
+    #[test]
+    fn echild_does_not_signal_the_remaining_group() {
+        let (child, descendant) = exited_leader_with_descendant();
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(child.id() as libc::pid_t, &mut status, 0) },
+            child.id() as libc::pid_t
+        );
+        // Bypass Child's cached status so the helper's peek really returns ECHILD.
+        let result = stop_group_and_reap(child, Duration::from_secs(2));
+        let survived = running(descendant);
+        unsafe { libc::kill(descendant, libc::SIGKILL) };
+        assert!(survived, "ECHILD path signalled the remaining group");
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ECHILD));
     }
 
     #[test]
