@@ -121,17 +121,40 @@ fn forced_index_candidate(
     )
 }
 
-/// `e2`: this page's path-twin co-scheduling, transient (never persisted).
+/// `e2`: this page's path-twin and content-twin co-scheduling, transient
+/// (page-scoped, never persisted).
 #[derive(Default)]
 pub(in crate::snapshots) struct ClaudeTwinSchedule {
     /// Forced roots selected only for path-twin co-scheduling. Their owed
     /// adoption-only members keep the history gate (both or neither).
     family_roots: BTreeSet<String>,
-    /// Index keys of every home of a root whose own seeds alone selected it:
-    /// those homes fold together, and its children keep their own decisions.
+    /// Index keys of every home of a root whose own seeds alone selected it,
+    /// and of each content twin or holder the other pulled: those homes fold
+    /// together, and its children keep their own decisions.
     root_homes: BTreeSet<String>,
+    /// Sorted request hashes of every main content-twin census record, as of
+    /// first use on this page; bounded by the twin records.
+    twin_hashes: Option<Vec<u64>>,
 }
 impl ClaudeTwinSchedule {
+    /// The page's content-twin hash union: a holder candidate walks for the
+    /// twins it proves only when it shares one of these requests.
+    pub(in crate::snapshots) fn twin_hashes(&mut self, census: &ClaudeRequestCensus) -> &[u64] {
+        self.twin_hashes.get_or_insert_with(|| {
+            let mut union = census
+                .records()
+                .filter(|(key, record)| {
+                    record.is_twin()
+                        && claude_index_path_member_ref(Path::new(key.as_str()))
+                            .is_some_and(|member| member.subagent_stem.is_none())
+                })
+                .flat_map(|(_, record)| record.request_hashes().iter().copied())
+                .collect::<Vec<_>>();
+            union.sort_unstable();
+            union.dedup();
+            union
+        })
+    }
     /// Whether `path` folds as a co-scheduled member, and whether only for
     /// path twins (`Some(true)`). A root forced for any other reason wins.
     pub(in crate::snapshots) fn forced(

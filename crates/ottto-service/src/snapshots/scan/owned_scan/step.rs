@@ -3803,6 +3803,7 @@ impl OwnedSourceScan {
             // A skipped Claude file held only by this page's budget is queued
             // again as a re-read for the next page of the walk. Codex and Pi
             // keep the adoption-only page budget.
+            let mut history_held = false;
             if decision == CandidateDecision::Parse {
                 let adoption_only = parse_reason == Some(CandidateParseReason::BodyWitnessAdoption)
                     && (index.candidate_requires_only_body_witness_adoption(&candidate, audit_now)
@@ -3877,6 +3878,7 @@ impl OwnedSourceScan {
                         decision = CandidateDecision::Skip;
                     }
                     HistoryDecision::Held(hold) => {
+                        history_held = true;
                         index.gate_claude_history_candidate(&candidate, Some(hold));
                     }
                     HistoryDecision::Owed => index.gate_claude_history_candidate(&candidate, None),
@@ -3942,58 +3944,91 @@ impl OwnedSourceScan {
                 );
                 pending!();
             }
-            // A content twin pulls its holder only after ordinary identity,
-            // decision and admission. Reuse that acquisition: no seed pre-open.
-            // A proving holder is never a census twin, so this cannot cascade.
-            if source == SnapshotSource::ClaudeCode
-                && index
-                    .claude_request_census
-                    .get(&local_index_key(&candidate.path))
-                    .is_some_and(|record| record.is_twin())
-            {
-                let seed = local_index_key(&candidate.path);
-                let walk = std::time::Instant::now();
-                let holders = claude_request_money::e2::copied_file_holders(
-                    index,
-                    std::iter::once(seed.as_str()),
-                );
-                claude_request_money::e2::diag(
-                    "copy_holder_walk_ms",
-                    walk.elapsed().as_millis() as u64,
-                );
-                for path in holders.into_values().map(PathBuf::from) {
-                    let key = local_index_key(&path);
-                    if claude_twin_schedule.root_homes.contains(&key)
-                        || snapshots.iter().any(|item| {
-                            item.claude_money
-                                .as_deref()
-                                .and_then(claude_request_money::e2::FileFold::location_key)
-                                == Some(claude_money_birth_store::location_key(&key))
-                        })
-                    {
-                        continue;
-                    }
-                    claude_twin_schedule.root_homes.insert(key);
-                    claude_request_money::e2::diag("copy_holder_pulled", 1);
-                    if identified_candidates
-                        .iter()
-                        .any(|queued| queued.path == path)
-                    {
-                        continue;
-                    }
-                    let mut discovery =
-                        CandidateDiscovery::new(index, Some(&resource_probe.discovery_growth));
-                    if let Some(holder) = super::forced_index_candidate(
-                        source,
-                        &roots,
-                        (path, false),
-                        &mut census,
-                        census_unix_seconds,
-                        backfill_window_days,
-                        &mut discovery,
-                    ) {
-                        identified_candidates.push_back(holder);
-                    }
+            // After ordinary identity, decision and admission (no seed
+            // pre-open), a content twin pulls its holder and a main holder
+            // pulls the content twins it proves (one relation), so a page
+            // never reads one without the other. A proving holder is never a
+            // census twin: the arms are disjoint and the pulled set closes at
+            // the holder and its twins. A history-held holder (its bodies
+            // vetoed) pulls nothing, so its twins never emit the session alone.
+            let seed = local_index_key(&candidate.path);
+            let record = (source == SnapshotSource::ClaudeCode)
+                .then(|| index.claude_request_census.get(&seed))
+                .flatten();
+            let pulls: Vec<String> = match record {
+                Some(record) if record.is_twin() => {
+                    let walk = std::time::Instant::now();
+                    let holders = claude_request_money::e2::copied_file_holders(
+                        index,
+                        std::iter::once(seed.as_str()),
+                    );
+                    claude_request_money::e2::diag(
+                        "copy_holder_walk_ms",
+                        walk.elapsed().as_millis() as u64,
+                    );
+                    holders.into_values().collect()
+                }
+                // Walk only for a holder sharing a request with some twin.
+                Some(record)
+                    if record.proves_scan()
+                        && !history_held
+                        && claude_index_path_member_ref(&candidate.path)
+                            .is_some_and(|member| member.subagent_stem.is_none())
+                        && claude_request_census::held_candidates(
+                            record,
+                            claude_twin_schedule.twin_hashes(&index.claude_request_census),
+                        )
+                        .next()
+                        .is_some() =>
+                {
+                    let twins = index.claude_request_census.records().filter(|(_, twin)| {
+                        twin.is_twin()
+                            && claude_request_census::held_candidates(twin, record.request_hashes())
+                                .next()
+                                .is_some()
+                    });
+                    claude_request_money::e2::copied_file_holders(
+                        index,
+                        twins.map(|(key, _)| key.as_str()),
+                    )
+                    .into_iter()
+                    .filter_map(|(twin, holder)| (holder == seed).then_some(twin))
+                    .collect()
+                }
+                _ => Vec::new(),
+            };
+            for path in pulls.into_iter().map(PathBuf::from) {
+                let key = local_index_key(&path);
+                if claude_twin_schedule.root_homes.contains(&key)
+                    || snapshots.iter().any(|item| {
+                        item.claude_money
+                            .as_deref()
+                            .and_then(claude_request_money::e2::FileFold::location_key)
+                            == Some(claude_money_birth_store::location_key(&key))
+                    })
+                {
+                    continue;
+                }
+                claude_twin_schedule.root_homes.insert(key);
+                claude_request_money::e2::diag("copy_holder_pulled", 1);
+                if identified_candidates
+                    .iter()
+                    .any(|queued| queued.path == path)
+                {
+                    continue;
+                }
+                let mut discovery =
+                    CandidateDiscovery::new(index, Some(&resource_probe.discovery_growth));
+                if let Some(holder) = super::forced_index_candidate(
+                    source,
+                    &roots,
+                    (path, false),
+                    &mut census,
+                    census_unix_seconds,
+                    backfill_window_days,
+                    &mut discovery,
+                ) {
+                    identified_candidates.push_back(holder);
                 }
             }
             #[cfg(test)]

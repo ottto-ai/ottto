@@ -189,6 +189,68 @@ fn distinct_same_session_file_counts_and_copies_never_prove_copies() {
     });
 }
 
+/// [money] A page that reads only the original also reads the copied file it
+/// proves, after the copy carried the session: the session keeps the copy's
+/// own turn (row one), and an all-copy file adds nothing (row two).
+#[test]
+fn holder_only_page_brings_its_content_twin() {
+    // The copy sorts first: wherever both are read it is read first and
+    // carries the session, and its own pull brings the original.
+    const FIRST: &str = "0338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+    const E: (&str, &str, &str) = ("e", "2026-08-02T07:07:10Z", RESUME_WRITER);
+    for own in [true, false] {
+        with_e2(|| {
+            let mut c = Corpus::new("holder-brings-content-twin");
+            let holder = c.root(ROOT, &resumed(ROOT, &[A, B]));
+            let mut prior = warm(&c);
+            let twin = c.write_at(&file(FIRST), &resumed(ROOT, &[A, B]), BORN);
+            owe(&mut prior);
+            let both = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
+            assert_eq!(body(&both, ROOT).unwrap().request_count, 2);
+            prior = settle(&c, &prior, both, &mut e2_progress());
+            if own {
+                // Copy-seeded: only the copy changed; it carries the session.
+                append(&twin, &resumed(ROOT, &[C]));
+                let copy = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
+                assert_eq!(body(&copy, ROOT).unwrap().request_count, 3);
+                prior = settle(&c, &prior, copy, &mut e2_progress());
+            }
+            // Only the original changes.
+            append(&holder, &resumed(ROOT, &[D]));
+            let expected = 3 + u64::from(own);
+            let scanner = E2ScanFixture::default();
+            let seeded = ready(&c, &scanner, prior.clone(), 100, false);
+            assert_eq!(
+                body(&seeded, ROOT).unwrap().request_count,
+                expected,
+                "the copy's own turn stays counted"
+            );
+            // Reference: the owed copy is read first and its pull brings the
+            // original, the composition of a copy-seeded page.
+            let mut again = prior.clone();
+            again.activate_effective_upload_body_witness_revision(3);
+            assert!(again.re_owe_effective_upload_body_witness_revision(&twin.to_string_lossy(), 2));
+            let reference = ready(&c, &E2ScanFixture::default(), again, 100, false);
+            assert_eq!(body(&reference, ROOT).unwrap().request_count, expected);
+            money_oracle::assert_equivalent(&sent_money(&reference), &sent_money(&seeded));
+            if !own {
+                return;
+            }
+            assert!(
+                scanner.paths().contains(&twin),
+                "the original brings its copy"
+            );
+            // Steady state: the next original-only page brings the copy again.
+            prior = settle(&c, &prior, seeded, &mut e2_progress());
+            append(&holder, &resumed(ROOT, &[E]));
+            let scanner = E2ScanFixture::default();
+            let steady = ready(&c, &scanner, prior, 100, false);
+            assert_eq!(body(&steady, ROOT).unwrap().request_count, 5);
+            assert!(scanner.paths().contains(&twin), "the copy is brought again");
+        });
+    }
+}
+
 /// [money] All acquisition routes conserve the corrected totals and placement
 /// with two accounts, a switch, a side call, an evidence gap and tagged rows.
 #[test]
