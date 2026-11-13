@@ -83,7 +83,10 @@ fn open_work(index: &ScanIndex) -> String {
     let state = serde_json::to_value(index).unwrap();
     let holds = (state.as_object().into_iter().flatten())
         .filter(|(key, value)| {
-            key.contains("hold") && !value.is_null() && *value != json!({}) && *value != json!([])
+            let empty = value.is_null()
+                || value.as_object().is_some_and(serde_json::Map::is_empty)
+                || value.as_array().is_some_and(Vec::is_empty);
+            key.contains("hold") && !empty
         })
         .map(|(key, value)| format!("{key}={value}"))
         .collect::<Vec<_>>();
