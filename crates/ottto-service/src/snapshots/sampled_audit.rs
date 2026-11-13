@@ -355,23 +355,12 @@ impl SourceScanResult {
                 .expect("current parsed entry")
                 .source_file_fingerprint
                 .clear();
-            if index.traversal.is_none() {
-                ensure_bounded_traversal(
-                    SnapshotSource::ClaudeCode,
-                    roots,
-                    index,
-                    &self.census_window_end,
-                    backfill_window_days,
-                );
-            }
-            if let Some(traversal) = index.traversal.as_mut() {
-                enqueue_watcher_hints(
-                    SnapshotSource::ClaudeCode,
-                    traversal,
-                    &[PathBuf::from(key)],
-                    false,
-                );
-            }
+            self.enqueue_claude_discovery_hints(
+                index,
+                roots,
+                backfill_window_days,
+                &[PathBuf::from(key)],
+            );
             queued += 1;
         }
         if queued > 0 {

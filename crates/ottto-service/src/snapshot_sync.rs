@@ -7856,6 +7856,16 @@ fn finish_sync_source(
                     reservation: Some(&reserve_cache_bytes),
                 },
             );
+        let hints = std::mem::take(&mut disposition.side_call_hints);
+        if !hints.is_empty() {
+            scan_result.enqueue_claude_discovery_hints(
+                &mut index,
+                claude_scan_roots.as_deref().unwrap_or_default(),
+                receipt_window_days,
+                &hints,
+            );
+            scan_result.census_complete = false;
+        }
         // Copy-derived rows (#944): the bodies just built treat these
         // rows as never accepted; the ledger records that durably before any
         // upload, so a lost reply or restart cannot restore their proof.
@@ -9615,6 +9625,7 @@ struct ClaudeEvidencePage<'p> {
     stats: ClaudeLocalEvidenceStats,
     /// Roots already counted: a scope root two chunks read counts once.
     counted_roots: BTreeSet<String>,
+    side_call_discovery: crate::snapshots::claude_request_money::e2::SideCallDiscovery,
 }
 
 /// The evidence stage over one page: its families are packed into chunks and
@@ -9655,6 +9666,11 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
             ..Default::default()
         },
         counted_roots: BTreeSet::new(),
+        side_call_discovery: crate::snapshots::claude_request_money::e2::SideCallDiscovery::new(
+            scan_result
+                .completed_parses()
+                .map(|(key, _)| Path::new(key)),
+        ),
     };
     // The named fork parents, whatever route the copy decisions take.
     let fork_parents = crate::snapshots::claude_cross_root_evidence::EvidenceScope::fork_parents(
@@ -9751,6 +9767,7 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
     disposition
         .copy_invalidated
         .sort_by_key(|row| first_slot.get(row.session()).copied());
+    disposition.side_call_hints = page.side_call_discovery.hints.into_iter().collect();
     let ClaudeEvidencePage { mut stats, .. } = page;
     for item in &scan_result.snapshots {
         if !item.source_session_id.contains("_agent-") {
@@ -10105,6 +10122,7 @@ fn apply_claude_local_evidence_chunk(
         &api_report,
         &trace_report,
         index,
+        &mut page.side_call_discovery,
     );
     let trace_discard_unfolded = {
         // Reuse the per-root read verdict before identity consumes it. Missing
