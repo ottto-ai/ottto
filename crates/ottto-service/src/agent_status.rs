@@ -19053,7 +19053,17 @@ fn collect_pi_model_status_from_output(
     let mut seen = BTreeSet::new();
     if output.command_found && output.success {
         let text = command_output_text(output);
+        let mut in_table = false;
         for line in text.lines() {
+            if line.split_whitespace().eq([
+                "provider", "model", "context", "max-out", "thinking", "images",
+            ]) {
+                in_table = true;
+                continue;
+            }
+            if !in_table {
+                continue;
+            }
             let Some(detail) = parse_pi_model_table_line(line, auth) else {
                 continue;
             };
@@ -19097,21 +19107,21 @@ fn parse_pi_model_table_line(
     if provider == "provider" || model == "model" {
         return None;
     }
-    let context = parts.next();
-    let max_output = parts.next();
-    let thinking = parts.next();
-    let images = parts.next();
-    if provider.is_empty() || model.is_empty() || !looks_like_safe_model_id(model) {
+    let context = parse_pi_token_count(parts.next()?)?;
+    let max_output = parse_pi_token_count(parts.next()?)?;
+    let thinking = parse_yes_no(parts.next()?)?;
+    let images = parse_yes_no(parts.next()?)?;
+    if parts.next().is_some() || !looks_like_safe_model_id(model) {
         return None;
     }
     let route = PiModelRoute::new(provider, model, None)?;
     let identity = pi_identity_hints_for_route(auth, &route);
     Some(pi_model_detail_from_route(
         &route,
-        context.and_then(parse_pi_token_count),
-        max_output.and_then(parse_pi_token_count),
-        thinking.and_then(parse_yes_no),
-        images.and_then(parse_yes_no),
+        Some(context),
+        Some(max_output),
+        Some(thinking),
+        Some(images),
         Some(&identity),
     ))
 }
