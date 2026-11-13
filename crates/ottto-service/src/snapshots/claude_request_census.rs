@@ -172,7 +172,7 @@ pub(crate) struct ClaudeRequestCensusRecord {
     /// working, committed and selected-subset copies hold one buffer).
     request_hashes: Option<Arc<[u64]>>,
     /// First-seen birth of the physical object at this key, set once and
-    /// bound to its (device, inode).
+    /// bound to its inode.
     birth: Option<ClaudeRequestBirth>,
     /// Retired: the hashes were dropped (old, settled file); this is how many
     /// there were. A retired record still counts as recorded.
@@ -185,8 +185,9 @@ pub(crate) struct ClaudeRequestCensusRecord {
 }
 
 /// First-seen creation time of one physical file, with the identity of the
-/// object it was read from. A different device or inode is a different
-/// object, so its birth is never carried onto the new one.
+/// object it was read from. A different inode is a different object, so its
+/// birth is never carried onto the new one. The device is recorded only: a
+/// reboot or remount renumbers it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ClaudeRequestBirth {
     pub(crate) unix_seconds: u64,
@@ -676,11 +677,7 @@ impl ClaudeRequestCensus {
     ) -> Option<ClaudeRequestBirth> {
         let previous = self.records.get(key).and_then(|record| record.birth);
         match (previous, opened) {
-            (Some(previous), Some(opened))
-                if previous.device == opened.device && previous.inode == opened.inode =>
-            {
-                Some(previous)
-            }
+            (Some(previous), Some(opened)) if previous.inode == opened.inode => Some(previous),
             // A replacement: a new object, a new first-seen birth.
             (_, Some(opened)) => Some(opened),
             // A read without an opened identity (no creation time) keeps

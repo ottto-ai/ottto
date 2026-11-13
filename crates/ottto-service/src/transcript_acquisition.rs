@@ -30,7 +30,48 @@ pub(crate) struct AuditDebt {
     pub(crate) due_unix_seconds: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg(test)]
+thread_local! {
+    /// Tests only: added to every device number a stamp captures, as a reboot
+    /// or remount renumbers the volume of an unchanged file.
+    static DEVICE_RENUMBER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Tests only: stamps captured on this thread see renumbered devices until
+/// the guard drops.
+#[cfg(test)]
+pub(crate) struct DeviceRenumber(());
+#[cfg(test)]
+impl DeviceRenumber {
+    pub(crate) fn by(offset: u64) -> Self {
+        DEVICE_RENUMBER.with(|renumber| renumber.set(offset));
+        Self(())
+    }
+}
+#[cfg(test)]
+impl Drop for DeviceRenumber {
+    fn drop(&mut self) {
+        DEVICE_RENUMBER.with(|renumber| renumber.set(0));
+    }
+}
+
+/// `metadata`'s device number, as stamps and opened-object stats capture it.
+#[cfg(unix)]
+pub(crate) fn captured_device(metadata: &Metadata) -> u64 {
+    #[cfg(test)]
+    let renumber = DEVICE_RENUMBER.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    let renumber = 0;
+    metadata.dev().wrapping_add(renumber)
+}
+
+/// An opened object's metadata. Its identity is the inode, with length and
+/// nanosecond mtime for content (and, where a durable certificate keeps it,
+/// the birth). The device number is recorded but never compared: a reboot
+/// or remount renumbers the volume of an unchanged file, so a stamp stored
+/// under the old number must still name the same object. Equality follows
+/// the same rule.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct FileStamp {
     length: u64,
     #[cfg(unix)]
@@ -54,7 +95,7 @@ impl FileStamp {
         Ok(Self {
             length: metadata.len(),
             #[cfg(unix)]
-            device: metadata.dev(),
+            device: captured_device(&metadata),
             #[cfg(unix)]
             inode: metadata.ino(),
             #[cfg(unix)]
@@ -65,30 +106,22 @@ impl FileStamp {
     }
 
     /// Compare the complete listing key without another metadata read.
-    pub(crate) fn same_listing(
-        &self,
-        device: u64,
-        inode: u64,
-        length: u64,
-        modified: (i64, i64),
-    ) -> bool {
+    pub(crate) fn same_listing(&self, inode: u64, length: u64, modified: (i64, i64)) -> bool {
         #[cfg(unix)]
         {
-            self.device == device
-                && self.inode == inode
-                && self.length == length
-                && self.modified == modified
+            self.inode == inode && self.length == length && self.modified == modified
         }
         #[cfg(not(unix))]
         {
-            let _ = (device, inode, length, modified);
+            let _ = (inode, length, modified);
             false
         }
     }
+    /// The same inode. Never the device number (see `FileStamp`).
     pub(crate) fn same_object(&self, other: &Self) -> bool {
         #[cfg(unix)]
         {
-            self.device == other.device && self.inode == other.inode
+            self.inode == other.inode
         }
         #[cfg(not(unix))]
         {
@@ -119,6 +152,21 @@ impl FileStamp {
         }
     }
 }
+
+/// Every field but the device number (see `FileStamp`).
+impl PartialEq for FileStamp {
+    fn eq(&self, other: &Self) -> bool {
+        #[cfg(unix)]
+        {
+            self.same_content(other) && self.changed == other.changed
+        }
+        #[cfg(not(unix))]
+        {
+            self.length == other.length
+        }
+    }
+}
+impl Eq for FileStamp {}
 
 /// A metadata-only witness. Symlinks and other nonregular entries are not
 /// reusable sources; absence is distinct from an unreadable source.
@@ -1422,6 +1470,9 @@ impl crate::heap_layout_bound::HeapLayoutBound for ReadMode {
 #[cfg(unix)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DurableCertificate {
+    /// Never compared across boots (see `FileStamp`). A restore rebinds it
+    /// to the live device, so the quiet-retirement check compares it only
+    /// with a certificate this process wrote.
     pub(crate) device: u64,
     pub(crate) inode: u64,
     /// The checkpoint's unnormalized stamp length (>= `sealed_offset`).
@@ -1557,9 +1608,11 @@ impl DurableCertificate {
         let (admission, head, boundary, current) =
             self.admit_samples(file, allow_append, read_changed_nanos)?;
         let checkpoint = Checkpoint {
+            // The live device number: a reboot or remount may have renumbered
+            // the volume since this certificate was stored.
             stamp: FileStamp {
                 length: self.length,
-                device: self.device,
+                device: current.device,
                 inode: self.inode,
                 modified: if admission.unchanged {
                     current.modified
@@ -1599,8 +1652,9 @@ impl DurableCertificate {
             return Err(CertificateRefusal::Changed(FullReason::InvalidCheckpoint));
         }
         let birth = birth_unix_nanos(&metadata);
-        if stamp.device != self.device
-            || stamp.inode != self.inode
+        // The object is the inode and, where both are known, the birth; never
+        // the device number (see `FileStamp`).
+        if stamp.inode != self.inode
             || (self.birth_nanos != 0
                 && birth != 0
                 && birth != self.birth_nanos
