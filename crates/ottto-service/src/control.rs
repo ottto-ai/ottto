@@ -8339,6 +8339,7 @@ fn setup_claim_complete_body(
     json!({
         "nonce": claim.nonce,
         "machine_id": machine.machine_id,
+        "machine_identity_capability": MACHINE_IDENTITY_CAPABILITY,
         "installation_id": machine.installation_id,
         "hardware_uuid": machine.hardware_uuid,
         "account_scope": machine.account_scope,
@@ -12066,6 +12067,9 @@ fn validate_device_credential_status(
 }
 
 const IDENTITY_CONTINUITY_CAPABILITY: &str = "prior_device_credential_v1";
+// Advertise only with the uploader that reprojects health and heartbeat using
+// the paired machine id. This is compatibility information, not authority.
+const MACHINE_IDENTITY_CAPABILITY: &str = "paired_machine_local_health_v1";
 
 struct PriorDeviceCredential {
     device_id: String,
@@ -12218,6 +12222,7 @@ fn telemetry_device_register_body_with_prior(
         "client_name": OTTTO_CLIENT_NAME,
         "client_version": machine.local_platform_version,
         "machine_id": machine.machine_id,
+        "machine_identity_capability": MACHINE_IDENTITY_CAPABILITY,
         "installation_id": machine.installation_id,
         "hardware_uuid": machine.hardware_uuid,
         "account_scope": machine.account_scope,
@@ -22773,6 +22778,8 @@ for line in sys.stdin:
             install_session_token: "install_token_identity".to_string(),
         };
 
+        let body = setup_claim_complete_body(&claim, &machine);
+        assert!(body["machine_identity_capability"] == MACHINE_IDENTITY_CAPABILITY);
         for payload in [
             setup_claim_create_body(&machine, &claim.nonce),
             setup_claim_complete_body(&claim, &machine),
@@ -22800,6 +22807,7 @@ for line in sys.stdin:
             first["identity_continuity_capability"],
             IDENTITY_CONTINUITY_CAPABILITY
         );
+        assert!(first["machine_identity_capability"] == MACHINE_IDENTITY_CAPABILITY);
         assert!(first.get("prior_device_id").is_none());
         assert!(first.get("prior_device_secret").is_none());
 
@@ -22812,6 +22820,7 @@ for line in sys.stdin:
         };
         let repeat =
             telemetry_device_register_body_with_prior(&install_session, &machine, Some(&prior));
+        assert!(repeat["machine_identity_capability"] == MACHINE_IDENTITY_CAPABILITY);
         assert_eq!(repeat["prior_device_id"], "device_prior");
         assert_eq!(repeat["prior_device_secret"], "secret_prior");
     }
@@ -22899,6 +22908,7 @@ for line in sys.stdin:
                 "install_test"
             )
         );
+        assert!(prepare_body["machine_identity_capability"] == MACHINE_IDENTITY_CAPABILITY);
         let confirm_request = &requests[1];
         assert!(confirm_request.starts_with(
             "POST /api/v1/telemetry/device-credential-preparations/preparation-wire/confirm HTTP/1.1"
@@ -23035,6 +23045,7 @@ for line in sys.stdin:
             serde_json::from_str(http_request_body(request)).expect("claim request json");
         let retry_body: serde_json::Value =
             serde_json::from_str(http_request_body(&requests[1])).expect("retry request json");
+        assert!(body["machine_identity_capability"] == MACHINE_IDENTITY_CAPABILITY);
         assert_eq!(
             retry_body, body,
             "retry must reproduce the exact proof body"
