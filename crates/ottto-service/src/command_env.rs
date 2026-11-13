@@ -401,7 +401,7 @@ fn read_shell_env(mut command: Command, timeout: Duration) -> Option<BTreeMap<St
             _ => break,
         }
     }
-    let status = crate::process_guard::stop_group_and_reap(&mut child, Duration::ZERO);
+    let status = crate::process_guard::stop_group_and_reap(child, Duration::ZERO);
     drop(stdout);
     (complete && status.ok()?.success()).then(|| parse_provider_env_output(&output))
 }

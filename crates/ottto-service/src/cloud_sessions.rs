@@ -1861,8 +1861,8 @@ impl CodexCloudChild {
     }
 
     fn stop_and_reap(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        let mut child = self.child.take().expect("owned cloud child");
-        crate::process_guard::stop_group_and_reap(&mut child, Duration::ZERO)
+        let child = self.child.take().expect("owned cloud child");
+        crate::process_guard::stop_group_and_reap(child, Duration::ZERO)
     }
 }
 

@@ -44,10 +44,11 @@ impl GroupChild for crate::local_resource_diagnostics::cli_children::MeasuredChi
     }
 }
 
-/// Requires a child spawned with process_group(0) and exclusively reaped here.
+/// Requires an unreaped child spawned with process_group(0), exclusively owned here.
 /// Give the leader up to `drain` to exit, then stop its group before reaping.
+/// Consume the handle so it cannot be signalled again after this reap.
 pub(crate) fn stop_group_and_reap(
-    child: &mut impl GroupChild,
+    mut child: impl GroupChild,
     drain: Duration,
 ) -> io::Result<ExitStatus> {
     let deadline = Instant::now() + drain;
@@ -89,52 +90,65 @@ mod tests {
     }
 
     #[test]
-    fn drain_observes_exit_without_reaping_and_preserves_cached_status() {
-        let mut child = command("exit 7").spawn().unwrap();
+    fn drain_observes_exit_without_reaping() {
+        let child = command("exit 7").spawn().unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
         while !exited(&child).unwrap() {
             assert!(Instant::now() < deadline);
             thread::sleep(Duration::from_millis(5));
         }
         assert!(exited(&child).unwrap());
-        let status = stop_group_and_reap(&mut child, Duration::from_secs(2)).unwrap();
+        let status = stop_group_and_reap(child, Duration::from_secs(2)).unwrap();
         assert_eq!(status.code(), Some(7));
-        assert_eq!(
-            stop_group_and_reap(&mut child, Duration::ZERO).unwrap(),
-            status
-        );
     }
 
     #[test]
     fn zero_drain_kills_immediately() {
-        let mut child = command("exec /bin/sleep 10").spawn().unwrap();
+        let child = command("exec /bin/sleep 10").spawn().unwrap();
         assert_eq!(
-            stop_group_and_reap(&mut child, Duration::ZERO)
-                .unwrap()
-                .signal(),
+            stop_group_and_reap(child, Duration::ZERO).unwrap().signal(),
             Some(libc::SIGKILL)
         );
     }
 
     #[test]
     fn positive_drain_has_a_deadline() {
-        let mut child = command("exec /bin/sleep 10").spawn().unwrap();
+        let child = command("exec /bin/sleep 10").spawn().unwrap();
         let start = Instant::now();
-        let status = stop_group_and_reap(&mut child, Duration::from_millis(100)).unwrap();
+        let status = stop_group_and_reap(child, Duration::from_millis(100)).unwrap();
         assert_eq!(status.signal(), Some(libc::SIGKILL));
         assert!(start.elapsed() < Duration::from_secs(2));
     }
 
     #[test]
     fn measured_reaper_keeps_its_exit_status_cache() {
-        let mut child =
+        struct Probe {
+            child: crate::local_resource_diagnostics::cli_children::MeasuredChild,
+            reaps: std::rc::Rc<std::cell::Cell<usize>>,
+        }
+        impl GroupChild for Probe {
+            fn child_mut(&mut self) -> &mut Child {
+                &mut self.child
+            }
+            fn reap(&mut self) -> io::Result<ExitStatus> {
+                self.reaps.set(self.reaps.get() + 1);
+                let status = GroupChild::reap(&mut self.child)?;
+                assert_eq!(self.child.wait()?, status);
+                Ok(status)
+            }
+        }
+        let child =
             crate::local_resource_diagnostics::cli_children::spawn(&mut command("exit 7")).unwrap();
-        let status = stop_group_and_reap(&mut child, Duration::from_secs(2)).unwrap();
+        let reaps = std::rc::Rc::new(std::cell::Cell::new(0));
+        let status = stop_group_and_reap(
+            Probe {
+                child,
+                reaps: reaps.clone(),
+            },
+            Duration::from_secs(2),
+        )
+        .unwrap();
         assert_eq!(status.code(), Some(7));
-        assert_eq!(child.wait().unwrap(), status);
-        assert_eq!(
-            stop_group_and_reap(&mut child, Duration::ZERO).unwrap(),
-            status
-        );
+        assert_eq!(reaps.get(), 1);
     }
 }
