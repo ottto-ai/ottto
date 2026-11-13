@@ -230,6 +230,8 @@ fn late_member_native_pages_match_cold_money_and_placement() {
                     status.unwrap(),
                     ResumableUploadResult::Rejected { .. }
                 ));
+                let index_path =
+                    crate::snapshots::e2_pipeline_scan_fixture::route_of(&page.index).unwrap();
                 page.index = checkpoint_partial_snapshot_index(
                     &page.index,
                     &page.committed,
@@ -237,7 +239,7 @@ fn late_member_native_pages_match_cold_money_and_placement() {
                     &page.scan.snapshots,
                     Some(&page.scan),
                     &BTreeSet::new(),
-                    &c.base.join("refused-index.json"),
+                    &index_path,
                     &c.base.join("refused-progress.json"),
                     || Ok(()),
                 )
