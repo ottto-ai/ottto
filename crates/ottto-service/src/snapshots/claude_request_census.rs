@@ -282,6 +282,10 @@ impl ClaudeRequestCensusRecord {
 
     /// Not source-verified (S2, prefix-certified reads included) or a path
     /// twin: never complete evidence for a negative claim.
+    pub(crate) fn is_twin(&self) -> bool {
+        self.twin
+    }
+
     pub(crate) fn unverified_or_twin(&self) -> bool {
         self.unverified || self.twin
     }

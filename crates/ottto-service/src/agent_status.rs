@@ -2437,6 +2437,56 @@ fn codex_home_slots_checked(status: &CodexAccountsStatusV1) -> (Vec<CodexHomeSlo
     (slots, complete)
 }
 
+/// One Codex home the daily provider reference may read: the provider
+/// default home (`slot_id` `None`) or an accepted Ottto slot with the account
+/// and workspace hashes it was registered with.
+pub(crate) struct DailyReferenceHome {
+    pub(crate) slot_id: Option<String>,
+    pub(crate) home: PathBuf,
+    pub(crate) trust: CodexHomeTrust,
+    pub(crate) registered_pair: Option<(String, String)>,
+}
+
+/// Kind only: the path and the registered hashes stay out of formatted output.
+impl std::fmt::Debug for DailyReferenceHome {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DailyReferenceHome")
+            .field("slot", &self.slot_id.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// The default Codex home and every accepted Ottto slot home (never a home
+/// seen only through a running process), and whether every settings read
+/// succeeded. Read-only: a pending slot removal is left to its owner, and an
+/// unreadable registry yields the default home alone, marked incomplete.
+pub(crate) fn daily_reference_homes() -> (Vec<DailyReferenceHome>, bool) {
+    let default_home = || DailyReferenceHome {
+        slot_id: None,
+        home: default_codex_home(),
+        trust: CodexHomeTrust::ProviderDefault,
+        registered_pair: None,
+    };
+    let Ok(status) = FileCodexAccountSlotSettingsStore::default().load_for_session_launch() else {
+        return (vec![default_home()], false);
+    };
+    let (slots, complete) = codex_home_slots_checked(&status);
+    let homes = slots
+        .into_iter()
+        .map(|slot| match slot.ownership {
+            CodexAccountSlotOwnershipV1::Default => default_home(),
+            CodexAccountSlotOwnershipV1::Managed => DailyReferenceHome {
+                slot_id: Some(slot.slot_id),
+                home: slot.home,
+                trust: CodexHomeTrust::Managed,
+                registered_pair: slot.registered_binding,
+            },
+        })
+        .collect();
+    (homes, complete)
+}
+
 fn collect_codex_home_candidate(
     slot: CodexHomeSlot,
     captured_at: &str,
@@ -16178,31 +16228,31 @@ fn parse_codex_id_token_account(token: &str) -> Option<AgentAccountStatus> {
 /// token. Decoding a JWT never authenticates it; this names what the
 /// credential says, nothing more.
 fn codex_credential_claimed_ids(credentials: &CodexAuthCredentials) -> Option<(String, String)> {
-    let claims = structurally_valid_live_codex_jwt_claims(credentials.access_token.as_deref()?)?;
-    let auth_claim = claims.get("https://api.openai.com/auth");
-    let account_id = auth_claim
-        .and_then(|value| first_json_string(value, &["chatgpt_user_id", "user_id"]))
-        .or_else(|| first_json_string(&claims, &["sub"]))?;
-    let raw_workspace_id = auth_claim
-        .and_then(|value| first_json_string(value, &["chatgpt_account_id"]))
-        .or_else(|| first_json_string(&claims, &["chatgpt_account_id"]))?;
-    if credentials.account_id.as_deref() != Some(raw_workspace_id.as_str()) {
+    let ids = codex_jwt_claimed_ids(&structurally_valid_live_codex_jwt_claims(
+        credentials.access_token.as_deref()?,
+    )?)?;
+    if credentials.account_id.as_deref() != Some(ids.1.as_str()) {
         return None;
     }
     if let Some(id_token) = credentials.id_token.as_deref() {
-        let id_claims = structurally_valid_live_codex_jwt_claims(id_token)?;
-        let id_auth_claim = id_claims.get("https://api.openai.com/auth");
-        let id_account = id_auth_claim
-            .and_then(|value| first_json_string(value, &["chatgpt_user_id", "user_id"]))
-            .or_else(|| first_json_string(&id_claims, &["sub"]))?;
-        let id_workspace = id_auth_claim
-            .and_then(|value| first_json_string(value, &["chatgpt_account_id"]))
-            .or_else(|| first_json_string(&id_claims, &["chatgpt_account_id"]))?;
-        if id_account != account_id || id_workspace != raw_workspace_id {
+        if codex_jwt_claimed_ids(&structurally_valid_live_codex_jwt_claims(id_token)?)? != ids {
             return None;
         }
     }
-    Some((account_id, raw_workspace_id))
+    Some(ids)
+}
+
+/// The user and workspace ids a decoded Codex JWT names: the auth claim's
+/// user id (else `sub`) and its workspace (ChatGPT account) id.
+pub(crate) fn codex_jwt_claimed_ids(claims: &Value) -> Option<(String, String)> {
+    let auth_claim = claims.get("https://api.openai.com/auth");
+    let account_id = auth_claim
+        .and_then(|value| first_json_string(value, &["chatgpt_user_id", "user_id"]))
+        .or_else(|| first_json_string(claims, &["sub"]))?;
+    let workspace_id = auth_claim
+        .and_then(|value| first_json_string(value, &["chatgpt_account_id"]))
+        .or_else(|| first_json_string(claims, &["chatgpt_account_id"]))?;
+    Some((account_id, workspace_id))
 }
 
 /// When the binding a credential claims ([`codex_credential_claimed_binding`])
@@ -16377,6 +16427,15 @@ fn codex_access_token_email(claims: &Value) -> Option<String> {
 }
 
 fn structurally_valid_live_codex_jwt_claims(token: &str) -> Option<Value> {
+    let claims = structurally_valid_codex_jwt_claims(token)?;
+    let expires_at = claims.get("exp").and_then(Value::as_i64)?;
+    (expires_at > OffsetDateTime::now_utc().unix_timestamp()).then_some(claims)
+}
+
+/// The claims of a Codex JWT whose shape, algorithm, issuer and audience are
+/// plausible. Expiry is not checked here. Decoding never authenticates a
+/// token; it only names what the token says.
+pub(crate) fn structurally_valid_codex_jwt_claims(token: &str) -> Option<Value> {
     let mut segments = token.split('.');
     let header = segments.next()?;
     let payload = segments.next()?;
@@ -16405,10 +16464,6 @@ fn structurally_valid_live_codex_jwt_claims(token: &str) -> Option<Value> {
         _ => false,
     });
     if !has_audience {
-        return None;
-    }
-    let expires_at = claims.get("exp").and_then(Value::as_i64)?;
-    if expires_at <= OffsetDateTime::now_utc().unix_timestamp() {
         return None;
     }
     Some(claims)

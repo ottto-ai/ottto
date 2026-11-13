@@ -96,6 +96,31 @@ file-system hint / periodic listing → select file → read new bytes from save
   provider-skill facts merge before their existing projection; changed files stay distinct and artifacts
   use the existing union. Continuous plain groups
   retain their existing replay path; no admitted-key ledger is persisted.
+- **Claude copied history.** Earlier accepted main files prove pre-birth
+  copies within the same session, or through the in-folder holder's session
+  across folders. Same-session proof uses the session's accepted body,
+  regardless of which file carried it; cross-session proof requires that
+  file's acceptance. Stored self-removals never prove another copy. An origin
+  only under an unrelated session elsewhere leaves its copy counted.
+  The original in-folder census wait still expires on its third decision.
+  An all-covered copy-only page drops its items when the session has another
+  file; own turns still publish. A selected content twin pulls at most its
+  earliest accepted main holder. Frozen seeds prevent cascading pulls, and
+  ordinary discovery acquires the holder without an extra seed content read.
+  Money rule three selects content twins, path twins and disclosed main
+  files once, using every census hash and one in-memory census walk without
+  a deadline. Only a candidate sharing ids with an earlier accepted holder
+  and that holder are re-owed, with the rule version stamped in the same save.
+  Disclosed main files include cross-session resumes whose own path and
+  content identity would otherwise leave their counted prefix unchanged.
+  Subagent path-twin homes sharing census ids are both selected once, for
+  all-copy and prefix copies. The selector and mid-page holder lookup record
+  elapsed milliseconds; holder pulls also record a scalar count.
+  A subagent twin keeps skips held by an earlier same-session fold before
+  its first own response, regardless of the subagent cutoff or file birth.
+  Unmatched responses are own turns, including those before birth. Shared
+  responses after the first own turn keep the existing cutoff decision.
+
 - **Upload.** A session is uploaded as a whole-session replacement, idempotent at the receiver. It
   settles only on an exact acknowledgement of the exact bytes sent to that destination. A local
   receipt never counts as an acknowledgement; refused, not-stored and partial answers are not
@@ -312,6 +337,13 @@ same-member page fold holds that id and the occurrence's usable provider timesta
 or after 2026-11-05T00:00:00Z. Other requests and idless copies count through the existing
 restoration path; the parent-repeat rule and listed-family behavior remain unchanged.
 
+A forked child's copied first response counts at its root when the same root
+path's page or valid persisted request census holds that id. Census freshness
+does not revoke positive membership. With no witness the child counts it until
+its next fold can prove the copy. A root rewrite replaces the census; the child's
+next fold then follows that replacement. Membership proves local source presence,
+not server acceptance. No extra reads or persisted fields implement this rule.
+
 ## Module map: snapshots/ (target; migration in progress)
 
 `snapshots.rs` and `snapshots/` are being split into the tree below by move-only changes. This is
@@ -415,7 +447,9 @@ each task's semantic digest and acknowledged head etag, scoped to destination
 and consent epoch. Fixed expiry permits safe re-offering; the server returns
 no-op for an exact repeat even after ACK loss or restart. The cache contains no
 task payloads or raw IDs and never enters local graph load/save or receipt
-settlement. Cloud failures and retry deadlines do not change local delivery.
+settlement. The file stays at `user_version` 1: its cloud tables are created
+if missing at open, and older builds open the file and ignore them. Cloud
+failures and retry deadlines do not change local delivery.
 
 ### Collector approval continuity
 
@@ -451,3 +485,31 @@ current same-owner HMAC scope, leaving consent revoked. Every authority, provide
 send and cache admission validates current local identity; identity changes close admission
 and drain admitted I/O before replacing account or device state. Older daemons
 receive disabled legacy authority and cannot upload through retired routes.
+
+## Codex daily provider reference
+
+With a live approval, `provider_daily_reference` reads the provider's own daily usage for
+every Codex login on the Mac and uploads normalized scalar rows. Each tick reads the default
+home and every accepted slot home once (never a home seen only through a running process),
+keeps one login per opaque account (identified first, then the default home, then the lowest
+slot id) and uses a slot only while its live token proves the pair it was registered with.
+Logins are read most overdue first, each at its own 6 h cadence and breaker; a 429 or a
+grant-wide refusal ends the tick. The attempt time is saved before every request, and a
+request is never made when that save fails. `state.json` (schema 2) keeps one entry per
+account and the latest discovery summary; status reads that summary and never a credential.
+An answer with a `users` count above one anywhere is refused as workspace-wide. A batch counts
+as stored only when its acknowledgement names the expected grant and its row counts add up;
+when every batch of a read is stored as current, the account keeps a proof of that series,
+and another login of the same tick returning the identical series is not uploaded again.
+A login is one secure read and one parse of
+its home's `auth.json`; the request token, `ChatGPT-Account-Id` header, attribution
+fingerprint and account identity all come from that parse. Expiry and identity come from the
+live access token; an id token only cross-checks the pair. A token lapsing within five minutes
+is never used, and credentials are never refreshed or written.
+
+Under the current disclosure every batch of one read carries the same optional
+`account_identity` (the account and workspace hashes Codex session evidence uses) and the
+same `collected_at`, empty batches included. The read's last covered day is always the last
+complete UTC day at that `collected_at`. `provider_daily_reference::tests::accounts` emits the
+producer fixtures in `fixtures/provider-daily-reference/`; the snapshots parity test emits the
+cross-language identity vectors.

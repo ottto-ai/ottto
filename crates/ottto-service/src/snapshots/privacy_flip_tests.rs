@@ -427,7 +427,7 @@ fn upgrade_from_delivery_bound_state_reads_and_holds_nothing() {
         };
         let current = scan_traversal_context_fingerprint(source, &roots, BACKFILL_WINDOW_DAYS);
         for (stored, adopted) in [(legacy(&delivery), true), (legacy("another"), false)] {
-            let mut traversal = claude_family_census_shadow_tests::traversal();
+            let mut traversal = tests::traversal_checkpoint();
             traversal.context_fingerprint = stored.clone();
             f.index.traversal = Some(traversal);
             adopt_legacy_traversal_fingerprint(source, &roots, &mut f.index, BACKFILL_WINDOW_DAYS);

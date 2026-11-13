@@ -144,8 +144,7 @@ impl OwnedSourceScan {
             mut pending_finalization,
             claude_authority_preflight,
             mut forced_claude_family_reparses,
-            claude_twin_schedule,
-            claude_family_shadow,
+            mut claude_twin_schedule,
             mut identified_candidates,
             active_file: active_frame,
             mut codex_join_inventory,
@@ -3137,18 +3136,6 @@ impl OwnedSourceScan {
                     traversal_transition::routine_recensus(source, &traversal_snapshot);
                 let traversal_healthy = !traversal_snapshot.counts.has_errors();
                 let clean_frozen_generation = !traversal_snapshot.watcher_hint_seen;
-                // Count-only per-family completion, from the page's
-                // settled state before any terminal effect. Acts on nothing.
-                if source == SnapshotSource::ClaudeCode {
-                    claude_family_census_shadow::observe_page(
-                        index,
-                        &claude_family_shadow,
-                        &pending_finalization,
-                        &census,
-                        &sampling,
-                        audit_now,
-                    );
-                }
                 let reconciliation_complete = if traversal_discovery_done
                     && traversal_healthy
                     && clean_frozen_generation
@@ -3215,8 +3202,7 @@ impl OwnedSourceScan {
                             .saturating_add(usize::from(reconciliation_pending))
                     })
                     .unwrap_or_default();
-                let skipped_file_count_due_to_limit =
-                    claude_family_census_shadow::skipped_view(index).count();
+                let skipped_file_count_due_to_limit = index.skipped_census_member_count();
                 let restart_after_hints =
                     traversal_discovery_done && traversal_healthy && !clean_frozen_generation;
                 let terminal_unhealthy = traversal_discovery_done && !traversal_healthy;
@@ -3929,13 +3915,6 @@ impl OwnedSourceScan {
                     if let Some(loss) = index.terminal_jsonl_loss(&candidate) {
                         census.add_terminal_jsonl_loss(loss);
                     }
-                    // The ordinary equality Skip attests this revision
-                    // for the shadow family census. Counts only.
-                    if source == SnapshotSource::ClaudeCode && parse_reason.is_none() {
-                        claude_family_census_shadow::attest_equality_skip(
-                            index, &candidate, &sampling, audit_now,
-                        );
-                    }
                     pending!();
                 }
                 CandidateDecision::Migrate => {
@@ -3957,6 +3936,60 @@ impl OwnedSourceScan {
                     &mut identified_candidates,
                 );
                 pending!();
+            }
+            // A content twin pulls its holder only after ordinary identity,
+            // decision and admission. Reuse that acquisition: no seed pre-open.
+            // A proving holder is never a census twin, so this cannot cascade.
+            if source == SnapshotSource::ClaudeCode
+                && index
+                    .claude_request_census
+                    .get(&local_index_key(&candidate.path))
+                    .is_some_and(|record| record.is_twin())
+            {
+                let seed = local_index_key(&candidate.path);
+                let walk = std::time::Instant::now();
+                let holders = claude_request_money::e2::copied_file_holders(
+                    index,
+                    std::iter::once(seed.as_str()),
+                );
+                claude_request_money::e2::diag(
+                    "copy_holder_walk_ms",
+                    walk.elapsed().as_millis() as u64,
+                );
+                for path in holders.into_values().map(PathBuf::from) {
+                    let key = local_index_key(&path);
+                    if claude_twin_schedule.root_homes.contains(&key)
+                        || snapshots.iter().any(|item| {
+                            item.claude_money
+                                .as_deref()
+                                .and_then(claude_request_money::e2::FileFold::location_key)
+                                == Some(claude_money_birth_store::location_key(&key))
+                        })
+                    {
+                        continue;
+                    }
+                    claude_twin_schedule.root_homes.insert(key);
+                    claude_request_money::e2::diag("copy_holder_pulled", 1);
+                    if identified_candidates
+                        .iter()
+                        .any(|queued| queued.path == path)
+                    {
+                        continue;
+                    }
+                    let mut discovery =
+                        CandidateDiscovery::new(index, Some(&resource_probe.discovery_growth));
+                    if let Some(holder) = super::forced_index_candidate(
+                        source,
+                        &roots,
+                        (path, false),
+                        &mut census,
+                        census_unix_seconds,
+                        backfill_window_days,
+                        &mut discovery,
+                    ) {
+                        identified_candidates.push_back(holder);
+                    }
+                }
             }
             #[cfg(test)]
             sampled_scan::test_hooks::after_selection(index, parse_reason);
@@ -4813,7 +4846,6 @@ impl OwnedSourceScan {
             claude_authority_preflight,
             forced_claude_family_reparses,
             claude_twin_schedule,
-            claude_family_shadow,
             identified_candidates,
             active_file: sampled_scan::codex_cursor::ActiveFrame::new(
                 active_file,

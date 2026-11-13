@@ -1253,3 +1253,31 @@ mod retired_slot_tests {
 #[cfg(test)]
 #[path = "tail_source/repository_binding_tests.rs"]
 mod repository_binding_tests;
+
+/// Edit only a synthetic stored device witness, preserving the opaque head
+/// identity and reduction through their owning codec. No production writer.
+#[cfg(test)]
+pub(in crate::snapshots) fn renumber_device_for_test(body: &[u8], key: &str) -> Vec<u8> {
+    let mut decoder = Dec::new(body);
+    let identity = HeadIdentity::take(&mut decoder).unwrap();
+    let mut certificate = DurableCertificate::take(&mut decoder).unwrap();
+    certificate.device ^= 1;
+    let mut file = std::fs::File::open(key).unwrap();
+    assert!(matches!(
+        certificate.restore_grown(
+            &mut file,
+            crate::transcript_acquisition::Scope("e2-pipeline".into()),
+            None
+        ),
+        Err(crate::transcript_acquisition::CertificateRefusal::Changed(
+            crate::transcript_acquisition::FullReason::Replaced
+        ))
+    ));
+    let mut edited = Enc::count_write(usize::MAX, |encoder| {
+        identity.put(encoder)?;
+        certificate.put(encoder)
+    })
+    .unwrap();
+    edited.extend_from_slice(&body[body.len() - decoder.remaining()..]);
+    edited
+}

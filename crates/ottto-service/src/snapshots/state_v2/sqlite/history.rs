@@ -7,8 +7,10 @@
 //! so no timer or other owner deletes rows. The file is never VACUUMed:
 //! `secure_delete` zeroes expired rows and later appends reuse their pages.
 //!
-//! Schema 2 adds the Codex cloud-task ACK cache ([`cloud`]) in separate tables
-//! of the same file and connection; receipt rows are unchanged.
+//! The file stays at `user_version` 1. The Codex cloud-task ACK cache
+//! ([`cloud`]) lives in separate tables of the same file and connection,
+//! created if missing at open; older builds ignore them, and receipt rows are
+//! unchanged.
 use super::super::VALUE_BYTES;
 use super::{
     linked_engine, lock_owner, pragmas, private_file, private_parent, same_object, sidecar,
@@ -29,7 +31,8 @@ pub(crate) use cloud::{CloudAck, CloudAckWrite};
 pub(crate) const FILE_NAME: &str = "upload_history.sqlite";
 /// Rows older than this expire at the next append, except each source's newest.
 pub(crate) const RETENTION_NS: i64 = 30 * 24 * 60 * 60 * 1_000_000_000;
-const USER_VERSION: i64 = 2;
+/// Never raised: released builds refuse any other version.
+const USER_VERSION: i64 = 1;
 const VALUE_VERSION: u32 = 1;
 const SCHEMA: &str = "
 CREATE TABLE upload_history(
@@ -197,18 +200,20 @@ impl Store {
         }
         pragmas(&conn, false, Checkpoint::Auto(1000))?;
         match version {
-            // A fresh file and a schema-1 upgrade reach the same tables, each
-            // in one transaction with its version bump.
-            0 | 1 => {
+            // One transaction each: a fresh file gets every table and version
+            // 1; version 1 gains any missing cloud tables; version 2 (written
+            // only by unreleased builds) returns to 1 so released builds open it.
+            0 | USER_VERSION | 2 => {
                 let tx = conn.transaction()?;
                 if version == 0 {
                     tx.execute_batch(SCHEMA)?;
                 }
                 tx.execute_batch(cloud::SCHEMA)?;
-                tx.execute_batch(&format!("PRAGMA user_version={USER_VERSION};"))?;
+                if version != USER_VERSION {
+                    tx.execute_batch(&format!("PRAGMA user_version={USER_VERSION};"))?;
+                }
                 tx.commit()?;
             }
-            USER_VERSION => {}
             _ => bail!("upload_history_schema_refused"),
         }
         private_file(path)?;

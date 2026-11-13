@@ -88,6 +88,39 @@ pub(in crate::snapshots) fn prepare_owned_scan_candidate(
     candidate.source_file_fingerprint = sidecar_fingerprint;
 }
 
+/// Forced discovery shares the native longest-root and metadata admission
+/// path at pass start and when a content twin pulls its proving holder.
+fn forced_index_candidate(
+    source: SnapshotSource,
+    roots: &[PathBuf],
+    path: (PathBuf, bool),
+    census: &mut ScanCensus,
+    census_unix_seconds: Option<u64>,
+    backfill_window_days: u64,
+    discovery: &mut CandidateDiscovery<'_>,
+) -> Option<CandidateFile> {
+    let (path, census_member) = path;
+    let scan_root = roots
+        .iter()
+        .filter(|root| path.starts_with(root))
+        .max_by_key(|root| root.components().count())?
+        .clone();
+    candidate_from_traversal_path_at(
+        source,
+        disappearance_diagnostics::Site::CandidateForcedIndex,
+        ScanTraversalPath {
+            scan_root,
+            path,
+            census_member,
+            watcher_hint: false,
+        },
+        census,
+        census_unix_seconds,
+        backfill_window_days,
+        discovery,
+    )
+}
+
 /// `e2`: this page's path-twin co-scheduling, transient (never persisted).
 #[derive(Default)]
 pub(in crate::snapshots) struct ClaudeTwinSchedule {
@@ -154,10 +187,6 @@ pub(crate) struct OwnedSourceScan {
     pub(in crate::snapshots) claude_authority_preflight: bool,
     pub(in crate::snapshots) forced_claude_family_reparses: BTreeSet<String>,
     pub(in crate::snapshots) claude_twin_schedule: ClaudeTwinSchedule,
-    /// The families this Claude page's selection touched, for the
-    /// count-only per-family census shadow.
-    pub(in crate::snapshots) claude_family_shadow:
-        Option<Box<claude_family_census_shadow::Touched>>,
     pub(in crate::snapshots) identified_candidates: VecDeque<CandidateFile>,
     /// The active file and, while it is a paged cursor job, its slot lease.
     /// A dropped frame returns an intact job to the slot.
@@ -381,7 +410,6 @@ impl OwnedSourceScan {
             claude_authority_preflight: false,
             forced_claude_family_reparses: Default::default(),
             claude_twin_schedule: Default::default(),
-            claude_family_shadow: Default::default(),
             identified_candidates: Default::default(),
             active_file: Default::default(),
             codex_join_inventory: evidence.map(|e| e.inventory),
@@ -891,11 +919,6 @@ impl OwnedSourceScan {
             causes,
             ..ScanCensus::default()
         };
-        let claude_family_shadow = (source == SnapshotSource::ClaudeCode).then(|| {
-            Box::new(claude_family_census_shadow::Touched::from_paths(
-                pending_paths.iter().map(|pending| pending.path.as_path()),
-            ))
-        });
         let selected_flags = pending_paths
             .iter()
             .map(|pending| {
@@ -1205,23 +1228,10 @@ impl OwnedSourceScan {
                     sources: std::borrow::Cow::Borrowed(&move_sources),
                     growth: Some(&resource_probe.discovery_growth),
                 };
-                let Some(scan_root) = scan_roots
-                    .iter()
-                    .filter(|root| path.starts_with(root))
-                    .max_by_key(|root| root.components().count())
-                    .cloned()
-                else {
-                    continue;
-                };
-                let Some(mut candidate) = candidate_from_traversal_path_at(
+                let Some(mut candidate) = forced_index_candidate(
                     source,
-                    disappearance_diagnostics::Site::CandidateForcedIndex,
-                    ScanTraversalPath {
-                        scan_root,
-                        path,
-                        census_member: true,
-                        watcher_hint: false,
-                    },
+                    &scan_roots,
+                    (path, true),
                     &mut census,
                     census_unix_seconds,
                     backfill_window_days,
@@ -1307,7 +1317,6 @@ impl OwnedSourceScan {
             claude_authority_preflight,
             forced_claude_family_reparses,
             claude_twin_schedule,
-            claude_family_shadow,
             identified_candidates: identified_candidates.into(),
             active_file: Default::default(),
             codex_join_inventory,
