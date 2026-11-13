@@ -4949,6 +4949,10 @@ mod family_duplicate_tests;
 #[path = "e2_activity_clock_tests.rs"]
 mod activity_clock_tests;
 
+#[cfg(test)]
+#[path = "e2_side_call_discovery_tests.rs"]
+mod side_call_discovery_tests;
+
 /// A selected path twin pulls its complete family into this existing native
 /// page's forced-family path. No parser/scope/identity bump is involved.
 pub(in crate::snapshots) fn selected_twin_roots<'a>(

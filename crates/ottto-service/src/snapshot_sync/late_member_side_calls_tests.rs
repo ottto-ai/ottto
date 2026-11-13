@@ -51,16 +51,13 @@ fn corpus() -> (Corpus, PathBuf) {
 }
 fn enrich(c: &Corpus, page: &mut Page, progress: &mut SnapshotUploadProgress) {
     page.enrich_with(c, Some(&mut progress.accepted_identity_buckets));
-    let hints = std::mem::take(&mut page.disposition.side_call_hints);
-    if !hints.is_empty() {
-        page.scan.enqueue_claude_discovery_hints(
-            &mut page.index,
-            std::slice::from_ref(&c.root),
-            183,
-            &hints,
-        );
-        page.scan.census_complete = false;
-    }
+    // The same hand-off source finish calls, not a copy of it.
+    page.scan.queue_side_call_hints(
+        &mut page.index,
+        std::slice::from_ref(&c.root),
+        183,
+        &mut page.disposition,
+    );
 }
 fn new_progress() -> SnapshotUploadProgress {
     let mut progress = e2_progress();
@@ -80,6 +77,17 @@ fn pending(index: &ScanIndex, path: &Path) -> bool {
                 && candidate["census_member"] == true
                 && candidate["watcher_hint"] == true
         })
+}
+/// What still keeps the census open, for a failed drain's message.
+fn open_work(index: &ScanIndex) -> String {
+    let state = serde_json::to_value(index).unwrap();
+    let holds = (state.as_object().into_iter().flatten())
+        .filter(|(key, value)| {
+            key.contains("hold") && !value.is_null() && *value != json!({}) && *value != json!([])
+        })
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>();
+    format!("traversal={} holds={holds:?}", state["traversal"])
 }
 fn restart(c: &Corpus, page: &mut Page, progress: &mut SnapshotUploadProgress) -> E2ScanFixture {
     page.index = c.reload(&mut page.index);
@@ -257,9 +265,18 @@ fn late_member_native_pages_match_cold_money_and_placement() {
             let mut latest = BTreeMap::from([(ROOT.to_owned(), stable[0].clone())]);
             let mut index = page.index;
             let mut member_read = false;
+            let mut complete = false;
             for _ in 0..8 {
                 let mut next = c.raw(&scanner, index, 1, true, &[]);
+                let after_member = member_read;
+                e2::take_diag();
                 enrich(&c, &mut next, &mut progress);
+                if after_member {
+                    assert!(
+                        !e2::take_diag().contains_key("side_call_member_hints"),
+                        "a read member is never hinted again"
+                    );
+                }
                 next.finish();
                 for item in &next.scan.snapshots {
                     if item.source_session_id == ROOT {
@@ -275,13 +292,17 @@ fn late_member_native_pages_match_cold_money_and_placement() {
                     latest.insert(item.source_session_id.clone(), item.clone());
                 }
                 settle_page(&c, &mut next, &mut progress);
-                let complete = next.scan.census_complete;
+                complete = next.scan.census_complete;
                 index = next.index;
                 if member_read && complete {
                     break;
                 }
             }
-            assert!(member_read, "hint eventually reaches native acquisition");
+            assert!(
+                member_read && complete,
+                "member read and census complete again; open work: {}",
+                open_work(&index)
+            );
             let mut cold = c.raw(
                 &E2ScanFixture::capturing_identity(),
                 ScanIndex::default(),
@@ -350,5 +371,82 @@ fn late_member_absence_keeps_root_fallback() {
         };
         let actual = route(&items, &mut progress, Mode::Restart);
         money_oracle::assert_equivalent(&expected, &actual);
+    });
+}
+
+/// [money] Member first: the member and the late evidence exist before any
+/// read, and the first one-file page reads only the member. Nothing is
+/// reserved or hinted; the root keeps only its own requests, and the drained
+/// result matches a cold Full read, placement included.
+#[test]
+fn late_member_read_before_its_root_matches_cold_money_and_placement() {
+    with_e2(|| {
+        let (mut c, _) = corpus();
+        evidence(&c, true, "agent-000");
+        let member = c.agent(
+            0,
+            &(line(ROOT, "m", MEMBER, 30) + &line(ROOT, "gap", GAP, 7)),
+        );
+        let scanner = E2ScanFixture::capturing_identity();
+        let mut progress = new_progress();
+        let mut latest = BTreeMap::new();
+        let mut index = ScanIndex::default();
+        let (mut root_read, mut member_read, mut complete) = (false, false, false);
+        for page in 0..8 {
+            let hints: &[PathBuf] = if page == 0 {
+                std::slice::from_ref(&member)
+            } else {
+                &[]
+            };
+            let mut next = c.raw(&scanner, index, 1, true, hints);
+            if page == 0 {
+                assert_eq!(scanner.paths(), vec![member.clone()], "member only");
+            }
+            e2::take_diag();
+            enrich(&c, &mut next, &mut progress);
+            assert!(
+                !e2::take_diag().contains_key("side_call_member_hints"),
+                "page {page}: nothing to reserve"
+            );
+            assert!(!pending(&next.index, &member), "page {page}: no exact hint");
+            next.finish();
+            for item in &next.scan.snapshots {
+                let tokens = (item.request_count, item.input_tokens);
+                if item.source_session_id == ROOT {
+                    assert_eq!(tokens, (2, 30), "root keeps a and b only");
+                    root_read = true;
+                } else {
+                    assert_eq!(tokens, (3, 42), "m, gap, s once");
+                    member_read = true;
+                }
+                latest.insert(item.source_session_id.clone(), item.clone());
+            }
+            settle_page(&c, &mut next, &mut progress);
+            complete = next.scan.census_complete;
+            index = next.index;
+            if root_read && member_read && complete {
+                break;
+            }
+        }
+        assert!(
+            root_read && member_read && complete,
+            "root and member read, census complete; open work: {}",
+            open_work(&index)
+        );
+        let mut cold = c.raw(
+            &E2ScanFixture::capturing_identity(),
+            ScanIndex::default(),
+            100,
+            false,
+            &[],
+        );
+        let mut cold_progress = new_progress();
+        enrich(&c, &mut cold, &mut cold_progress);
+        cold.finish();
+        let cold_route = route(&cold.scan.snapshots, &mut cold_progress, Mode::ColdFull);
+        let items = latest.into_values().collect::<Vec<_>>();
+        let actual = route(&items, &mut progress, Mode::Ram);
+        money_oracle::assert_equivalent(&cold_route, &actual);
+        money_oracle::assert_placement_equivalent(&cold_route, &actual);
     });
 }

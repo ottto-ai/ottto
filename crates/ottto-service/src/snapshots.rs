@@ -856,6 +856,22 @@ impl SourceScanResult {
             enqueue_watcher_hints(SnapshotSource::ClaudeCode, traversal, hints, false);
         }
     }
+    /// Queue this page's exact late Task-member hints for a later page; clears
+    /// `census_complete` when any hint is queued, so the census stays open
+    /// until those members are read.
+    pub(crate) fn queue_side_call_hints(
+        &mut self,
+        index: &mut ScanIndex,
+        roots: &[PathBuf],
+        lookback_days: u64,
+        disposition: &mut ClaudeUsageAuthorityDisposition,
+    ) {
+        let hints = std::mem::take(&mut disposition.side_call_hints);
+        if !hints.is_empty() {
+            self.enqueue_claude_discovery_hints(index, roots, lookback_days, &hints);
+            self.census_complete = false;
+        }
+    }
 
     /// Index keys this scan read to completion, with their parsed source
     /// fingerprints.
