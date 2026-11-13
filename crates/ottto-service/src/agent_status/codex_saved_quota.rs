@@ -2279,6 +2279,10 @@ mod tests {
             ottto_protocol::CodexAccountSlotCollectionStateV1::ProviderUnavailable
         );
         assert!(status.quota_snapshot.is_none());
+        assert_eq!(
+            served_error(&root, &home, now + 7 * 3_600),
+            Some(CODEX_QUOTA_NOT_READ_YET.to_string())
+        );
         // A reading between one and two unused intervals old never stands for
         // another account: once the credential names another login (here with
         // an expired access token, so no live one), nothing is served and a
@@ -2289,10 +2293,6 @@ mod tests {
         assert_eq!(held_binding(saved.as_ref(), &switched), None);
         assert_eq!(
             served_error(&root, &home, now + u + u / 2),
-            Some(CODEX_QUOTA_NOT_READ_YET.to_string())
-        );
-        assert_eq!(
-            served_error(&root, &home, now + 7 * 3_600),
             Some(CODEX_QUOTA_NOT_READ_YET.to_string())
         );
         let _ = std::fs::remove_dir_all(root);
@@ -3079,9 +3079,10 @@ mod tests {
             .is_empty());
         assert_eq!(fixture.round(start + 10 * 60 + u, false, &[]), ["default"]);
         // The slot only would be in use (a running Codex there): the shared
-        // read is at 5 minutes again.
+        // read is at 5 minutes again (the other account is left out of this
+        // round, whatever its own interval).
         let busy = start + 10 * 60 + u + 5 * 60;
-        let mut homes = fixture.scheduled(&[], busy);
+        let mut homes = fixture.scheduled(&["other"], busy);
         for home in &mut homes {
             if &home.home == fixture.home("twin") {
                 home.process_seen_at = Some(busy - 60);
