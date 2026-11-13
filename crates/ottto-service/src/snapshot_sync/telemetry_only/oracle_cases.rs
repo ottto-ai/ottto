@@ -125,18 +125,15 @@ pub(super) fn presence() {
     let mut p = progress();
     let built = build(&c, &mut p);
     let item = &built.scan.snapshots[0];
-    assert_eq!(
-        (item.request_count, item.input_tokens, item.output_tokens),
-        (3, 36, 36)
-    );
-    assert_eq!(
-        (
-            item.cache_creation_5m_tokens,
-            item.cache_creation_1h_tokens,
-            item.reasoning_output_tokens
-        ),
-        (15, 6, 9)
-    );
+    let counts = [
+        item.request_count,
+        item.input_tokens,
+        item.output_tokens,
+        item.cache_creation_5m_tokens,
+        item.cache_creation_1h_tokens,
+        item.reasoning_output_tokens,
+    ];
+    assert_eq!(counts, [3, 36, 36, 15, 6, 9]);
     assert_eq!(
         accounts(item),
         BTreeSet::from(["1".repeat(64), "2".repeat(64)])
@@ -189,7 +186,7 @@ pub(super) fn dark() {
             json!({"unexpected":true}),
         ),
     ] {
-        let mut raw = value(hint()).unwrap();
+        let mut raw = hint_json();
         raw[field] = replacement;
         let h = crate::snapshot_client::decode_activity_hint(raw).unwrap();
         assert!(crate::snapshot_sync::telemetry_only::advertised(&h).is_none());
@@ -225,14 +222,19 @@ pub(super) fn pairing() {
         }
         files_held(&c);
     }
-    pair(&c, &[]);
-    let mut p = progress();
-    assert!(build(&c, &mut p).scan.snapshots.is_empty());
-    assert!(!candidate(&p));
-    append(&c, false, &trace("unmatched", ""));
-    let mut partial = progress();
-    assert!(build(&c, &mut partial).scan.snapshots.is_empty());
-    assert!(candidate(&partial), "trace-only is owed, not healthy empty");
+    for incomplete in [false, true] {
+        pair(&c, &[]);
+        if incomplete {
+            append(&c, false, &trace("unmatched", ""));
+        }
+        let mut p = progress();
+        assert!(build(&c, &mut p).scan.snapshots.is_empty());
+        assert_eq!(
+            candidate(&p),
+            incomplete,
+            "empty settles; mismatched trace stays owed"
+        );
+    }
     positive(&c);
     let mut p = progress();
     let built = build(&c, &mut p);

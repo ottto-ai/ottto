@@ -15,11 +15,7 @@ fn assert_excluded(dir: &Path) {
 
 #[test]
 fn reserved_smoke_json_and_protobuf_api_and_trace_never_write_or_notify() {
-    let dir = std::env::temp_dir().join(format!(
-        "otel-smoke-exclusion-{}",
-        crate::claude_spawn_gate::internal_session_id()
-    ));
-    fs::create_dir_all(&dir).unwrap();
+    let dir = crate::test_scratch::ScratchDir::new("otel-smoke-exclusion");
     telemetry_notices::configure(&dir, true).unwrap();
     let reserved = crate::claude_spawn_gate::internal_session_id();
     let json_api = String::from_utf8(parent_and_subagent_body().to_vec())
@@ -88,5 +84,4 @@ fn reserved_smoke_json_and_protobuf_api_and_trace_never_write_or_notify() {
     assert_eq!(notices.len(), 4);
     assert!(!notices.contains(&reserved));
     telemetry_notices::forget(&dir, &notices).unwrap();
-    fs::remove_dir_all(dir).unwrap();
 }

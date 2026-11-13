@@ -10,7 +10,8 @@ use crate::snapshots::claude_request_identity::WireBudget;
 use crate::snapshots::sampled_scan::transition_fixture::{self as oracle, Mode, RouteResult};
 use crate::snapshots::SnapshotSource::ClaudeCode as Claude;
 use oracle::money_oracle::{
-    assert_equivalent, assert_held, assert_no_smaller_reemit, assert_quiet_restart_zero_bytes,
+    assert_carried_equivalent, assert_equivalent, assert_held, assert_no_smaller_reemit,
+    assert_quiet_restart_zero_bytes,
 };
 use otel::ClaudeLocalOtelEvidence as Api;
 use serde_json::{from_slice as decode, to_value as value, to_vec as encode, Value};
@@ -32,12 +33,10 @@ fn pair(c: &Corpus, rows: &[Api]) {
         .collect::<Vec<_>>();
     c.evidence(rows, &traces);
 }
-fn restore(state: &Progress) -> Progress {
-    let mut state: Progress = decode(&encode(state).unwrap()).unwrap();
-    state
-        .accepted_identity_buckets
-        .bind_test_key(Some([0x42; 32]));
-    state
+fn restore(p: &Progress) -> Progress {
+    let mut p: Progress = decode(&encode(p).unwrap()).unwrap();
+    p.accepted_identity_buckets.bind_test_key(Some([0x42; 32]));
+    p
 }
 fn member(c: &Corpus, api: bool) -> PathBuf {
     let kind = if api { "effort" } else { "trace-ownership" };
@@ -53,7 +52,6 @@ fn candidate(p: &Progress) -> bool {
         .get(ROOT)
         .is_some()
 }
-
 fn append(c: &Corpus, api: bool, value: &impl Serialize) {
     let line = serde_json::to_string(value).unwrap();
     super::append(&member(c, api), &format!("{line}\n"));
@@ -84,6 +82,13 @@ fn accepted_case(name: &str) -> (Corpus, Progress, RouteResult) {
 fn owed(page: &Page, p: &Progress, prior: &RouteResult) {
     assert!(page.scan.snapshots.is_empty());
     held(prior, p);
+}
+fn paged(cold: &RouteResult, page: &Page, p: &mut Progress, prior: (&RouteResult, &Progress)) {
+    let mut route = send(page, p, Mode::Restart);
+    for (id, body) in held_route(prior.0, prior.1).accepted {
+        route.accepted.entry(id).or_insert(body);
+    }
+    assert_carried_equivalent(cold, &route);
 }
 fn reemit(c: &Corpus, p: &mut Progress, prior: &RouteResult, mode: Mode) {
     let page = build(c, p);
@@ -175,17 +180,20 @@ fn transcript_only(page: &Page) -> bool {
 fn files_held(c: &Corpus) {
     assert!(member(c, true).exists() && member(c, false).exists());
 }
-fn hint() -> Hint {
-    crate::snapshot_client::decode_activity_hint(json!({
+fn hint_json() -> Value {
+    json!({
         "source":"claude_code", "server_time":AT, "record_count_15m":0,
         "record_count_24h":0, "local_usage_reconciliation_enabled":true,
         "backfill_window_days":30, "recommended_scan_after":AT,
         "snapshot_head_cas_required":true,
         "claude_otel_only_sessions_contract":"claude_otel_only_sessions:v1",
         "claude_otel_only_pairing_floor":"2026-08-02T06:00:00Z"
-    }))
-    .unwrap()
+    })
 }
+fn hint() -> Hint {
+    crate::snapshot_client::decode_activity_hint(hint_json()).unwrap()
+}
+
 fn progress() -> Progress {
     let mut value = restore(&e2_progress());
     value.telemetry_only = Some(
@@ -308,25 +316,24 @@ fn held_route(prior: &RouteResult, progress: &Progress) -> RouteResult {
 
 #[test]
 fn telemetry_only_cold_ram_restore_and_restart_preserve_switch_gap_and_side_call() {
-    with_e2(|| positive_modes());
-}
-fn positive_modes() {
-    let c = Corpus::new("otel-only-oracle-modes");
-    positive(&c);
-    let mut base = progress();
-    let mut cold_page = build(&c, &mut base);
-    assert_eq!(cold_page.scan.snapshots.len(), 1);
-    let cold = send(&cold_page, &mut base, Mode::ColdFull);
-    println!(
-        "OTEL_ONLY_RECEIVER_GOLDEN {}",
-        serde_json::to_string(&request(&cold_page.scan.snapshots)).unwrap()
-    );
-    assert_eq!(cold_page.scan.snapshots[0].request_count, 4);
-    assert!(!cold_page.scan.snapshots[0].request_evidence.is_empty());
-    compare_modes(&c, &cold, &[Mode::Ram, Mode::DiskRestore, Mode::Restart]);
-    cases::wire(&mut cold_page);
-    let mut restored = restore(&base);
-    quiet(&c, &mut restored, ScanIndex::default());
+    with_e2(|| {
+        let c = Corpus::new("otel-only-oracle-modes");
+        positive(&c);
+        let mut base = progress();
+        let mut cold_page = build(&c, &mut base);
+        assert_eq!(cold_page.scan.snapshots.len(), 1);
+        let cold = send(&cold_page, &mut base, Mode::ColdFull);
+        println!(
+            "OTEL_ONLY_RECEIVER_GOLDEN {}",
+            serde_json::to_string(&request(&cold_page.scan.snapshots)).unwrap()
+        );
+        assert_eq!(cold_page.scan.snapshots[0].request_count, 4);
+        assert!(!cold_page.scan.snapshots[0].request_evidence.is_empty());
+        compare_modes(&c, &cold, &[Mode::Ram, Mode::DiskRestore, Mode::Restart]);
+        cases::wire(&mut cold_page);
+        let mut restored = restore(&base);
+        quiet(&c, &mut restored, ScanIndex::default());
+    });
 }
 
 fn pair_hold() {
@@ -371,16 +378,13 @@ fn telemetry_only_previous_release_source_round_trip() {
             "{}::telemetry_only_carry_child",
             module_path!().split_once("::").unwrap().1
         );
-        assert!(
-            Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", &test, "--nocapture", "--test-threads=1"])
-                .env("OTTTO_OTEL_CARRY_STAGE", stage)
-                .env("OTTTO_OTEL_CARRY_ROOT", root)
-                .status()
-                .unwrap()
-                .success(),
-            "carry {stage}"
-        );
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test, "--nocapture", "--test-threads=1"])
+            .env("OTTTO_OTEL_CARRY_STAGE", stage)
+            .env("OTTTO_OTEL_CARRY_ROOT", root)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "carry {stage}: {output:?}");
     };
     for tag in ["v0.1.239", "v0.1.244"] {
         let root = dir.join(tag);
@@ -533,7 +537,11 @@ fn carriers() {
             };
             c.write_at(
                 &format!("other/{session}.jsonl"),
-                &(before.clone() + &own),
+                &(if kind == "resume" {
+                    line_by(session, "before", AT, 11, OLD_WRITER)
+                } else {
+                    before.clone()
+                } + &own),
                 "2026-08-02T07:03:00Z",
             );
         }
@@ -586,6 +594,7 @@ fn carriers() {
             if kind == "resume" {
                 assert!(body(&other, THIRD).is_none(), "resumed holder is off-page");
             }
+            paged(&cold, &other, &mut fresh, (&cold, &p));
         }
         if kind == "correction" {
             assert_eq!(cases::relay_append(&c, &[ROOT]), (1, 1));
@@ -596,10 +605,9 @@ fn carriers() {
                 remaining + 1,
                 "correction then notice retains holder veto"
             );
-        } else {
-            let mut fresh = progress();
-            let reference = build(&c, &mut fresh);
-            assert_equivalent(&cold, &send(&reference, &mut fresh, Mode::Restart));
+            paged(&reference(&c), &next, &mut fresh, (&cold, &p));
+        } else if kind == "forks" {
+            compare_modes(&c, &cold, &[Mode::DiskRestore]);
         }
     }
 }
