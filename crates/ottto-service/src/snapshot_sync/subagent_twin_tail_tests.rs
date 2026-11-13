@@ -84,9 +84,13 @@ fn subagent_twin_slack_tail() {
         }
         c.evidence(&rows, &[]);
         let agents = [0, 1].map(|n| format!("{ROOT}_agent-{n:03}"));
+        let disk = Disk::new(&c);
+        let owner = E2ScanFixture::with_subagent_births();
+        disk.begin(&owner, SnapshotSource::ClaudeCode);
         // The homes' historical births, observed before any parse, so
-        // discovery order cannot use today's file-system birth.
-        let mut seeded = ScanIndex::default();
+        // discovery order cannot use today's file-system birth. Loaded from
+        // the route, so the commit saves through it.
+        let mut seeded = ScanIndex::load(disk.path(SnapshotSource::ClaudeCode)).unwrap();
         for path in &paths[2..] {
             let member = &agents[usize::from(path.ends_with("agent-001.jsonl"))];
             seeded.claude_money_birth_store.record_observation(
@@ -95,9 +99,6 @@ fn subagent_twin_slack_tail() {
                 c.births[path],
             );
         }
-        let disk = Disk::new(&c);
-        let owner = E2ScanFixture::with_subagent_births();
-        disk.begin(&owner, SnapshotSource::ClaudeCode);
         // Committed, so every arm starts from the same stored observations.
         let seeded = disk.commit(&owner.cache, SnapshotSource::ClaudeCode, &mut seeded);
         let mut bodies = Vec::new();
