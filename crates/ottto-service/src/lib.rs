@@ -4284,6 +4284,8 @@ fn source_health_from_verification(
         || result.message.code == PI_OAUTH_REAUTH_REQUIRED_MESSAGE_CODE;
     let source_not_installed = result.message.code == SOURCE_NOT_INSTALLED_VERIFICATION_CODE;
     let agent_cli_unavailable = result.message.code == AGENT_CLI_UNAVAILABLE_VERIFICATION_CODE;
+    let ottto_claude_connected = result.source == SourceKind::ClaudeCode
+        && result.message.code == agent_status::CLAUDE_OTTTO_SIGNED_IN;
     let (source_state, grade, problems) = if source_not_installed {
         // The CLI is genuinely absent on this Mac. Report it as an informational
         // `not_found` (finish setup) with a `SourceNotInstalled` problem — never
@@ -4299,7 +4301,7 @@ fn source_health_from_verification(
                 retryable: false,
             }],
         )
-    } else if agent_cli_unavailable {
+    } else if agent_cli_unavailable || ottto_claude_connected {
         // Data/config is present (desktop-app-only install) but the CLI binary
         // can't be executed, so only the live check is unavailable while local
         // session files keep syncing. Keep the source visible as a soft
@@ -4308,15 +4310,19 @@ fn source_health_from_verification(
         (
             SourceState::NeedsConfirmation,
             HealthGrade::Warning,
-            vec![HealthProblem {
-                code: StableProblemCode::AgentCliUnavailable,
-                title: format!(
-                    "{} CLI was not found for live checks",
-                    source_display_name(&result.source)
-                ),
-                detail: result.message.text.clone(),
-                retryable: true,
-            }],
+            if ottto_claude_connected {
+                Vec::new()
+            } else {
+                vec![HealthProblem {
+                    code: StableProblemCode::AgentCliUnavailable,
+                    title: format!(
+                        "{} CLI was not found for live checks",
+                        source_display_name(&result.source)
+                    ),
+                    detail: result.message.text.clone(),
+                    retryable: true,
+                }]
+            },
         )
     } else if config_has_drift && !provider_reauth_required {
         (
@@ -4428,7 +4434,7 @@ fn source_health_from_verification(
             ),
             backup: None,
         }]
-    } else if config_has_drift {
+    } else if config_has_drift && !ottto_claude_connected {
         let authority = repair_authority_for_state(state);
         vec![RepairAction {
             action: RepairActionKind::WriteConfig,
@@ -4448,6 +4454,7 @@ fn source_health_from_verification(
             )),
         }]
     } else if result.verified
+        || ottto_claude_connected
         || patch_disabled
         || usage_limited
         || telemetry_disabled_by_admin
@@ -4626,7 +4633,10 @@ fn has_soft_smoke_timeout_problem(health: &SourceHealth) -> bool {
         && health.grade == HealthGrade::Critical
         && health.problems.iter().any(|problem| {
             problem.code == StableProblemCode::TelemetryNotVerified
-                && problem.detail.contains("smoke session timed out")
+                && (problem.detail.contains("smoke session timed out")
+                    || problem.detail.contains(
+                        "The Claude Code test run timed out before Ottto could check it.",
+                    ))
         })
 }
 
@@ -7457,7 +7467,7 @@ mod tests {
             smoke_after: Some("2026-05-05T10:00:00Z".to_string()),
             message: StableMessage {
                 code: "smoke_command_failed".to_string(),
-                text: "Claude Code smoke session failed before verification could complete: You've hit your org's monthly spend limit · run [path] to raise it, or visit claude.ai/admin-settings/usage".to_string(),
+                text: "The Claude Code test run failed before Ottto could check it: You've hit your org's monthly spend limit · run [path] to raise it, or visit claude.ai/admin-settings/usage".to_string(),
             },
             route_results: Vec::new(),
             check: None,

@@ -1141,7 +1141,7 @@ impl ClaudeSlotProbeFailure {
             Self::CredentialUnavailable => (
                 ClaudeConfigSlotCollectionStateV1::CredentialUnavailable,
                 ClaudeConfigSlotDiagnosticCodeV1::CredentialUnavailable,
-                "This registered Claude slot has no readable valid Claude Code credential.",
+                "Claude Code isn't signed in for this account on this Mac.",
             ),
             Self::IdentityMismatch => (
                 ClaudeConfigSlotCollectionStateV1::IdentityMismatch,
@@ -4715,7 +4715,11 @@ fn collect_claude_status(
         ClaudeLocalLoginState::NotSignedIn
         | ClaudeLocalLoginState::NeedsLogin
         | ClaudeLocalLoginState::SignedOutByCli => {
-            snapshot.account = Some(unsupported_account("anthropic"));
+            let mut account = unsupported_account("anthropic");
+            if login_state == ClaudeLocalLoginState::NotSignedIn {
+                account.login_state = AgentLoginState::SignedOut;
+            }
+            snapshot.account = Some(account);
             snapshot
                 .diagnostics
                 .push(default_claude_identity_diagnostic(
@@ -4909,12 +4913,12 @@ fn collect_claude_status(
         Ok(_) => {
             apply_statusline_quota(&mut snapshot, &mut quota_capability);
         }
-        Err(message) => {
+        Err(_message) => {
             if !apply_statusline_quota(&mut snapshot, &mut quota_capability) {
                 snapshot.diagnostics.push(AgentStatusDiagnostic::source(
                     "claude_oauth_usage_unavailable",
                     AgentDiagnosticSeverity::Warning,
-                    message,
+                    "Couldn't read your Claude limits",
                 ));
             }
         }
@@ -5506,6 +5510,12 @@ fn collect_claude_status_snapshots(
     let has_healthy_custom_account = custom_slot_states
         .clone()
         .any(|status| status.state == ClaudeConfigSlotCollectionStateV1::Fresh);
+    let signed_in = claude_ottto_accounts_signed_in(
+        custom_slot_states
+            .clone()
+            .filter(|status| claude_slot_connection_usable(status, OffsetDateTime::now_utc()))
+            .count(),
+    );
     let has_actionable_custom_slot =
         custom_slot_states.any(|status| claude_custom_slot_needs_attention(&status.state));
     let default_has_full_meter_evidence = default_snapshot
@@ -5560,6 +5570,10 @@ fn collect_claude_status_snapshots(
         source_health_snapshot.diagnostics.push(diagnostic);
     }
     append_registered_claude_plan_observations(&mut source_health_snapshot, &snapshots);
+    source_health_snapshot.diagnostics.extend(signed_in.clone());
+    for snapshot in &mut snapshots {
+        snapshot.diagnostics.extend(signed_in.clone());
+    }
 
     AgentStatusCollection {
         snapshots,
@@ -5567,6 +5581,18 @@ fn collect_claude_status_snapshots(
         codex_scan_homes: Vec::new(),
         codex_home_bindings: Vec::new(),
     }
+}
+
+pub(crate) const CLAUDE_OTTTO_SIGNED_IN: &str = "claude_ottto_account_signed_in";
+
+fn claude_ottto_accounts_signed_in(count: usize) -> Option<AgentStatusDiagnostic> {
+    (count > 0).then(|| {
+        AgentStatusDiagnostic::source(
+            CLAUDE_OTTTO_SIGNED_IN,
+            AgentDiagnosticSeverity::Info,
+            format!("{count} Claude accounts signed in through Ottto"),
+        )
+    })
 }
 
 /// Whether one registered Claude slot's collection state is something the
@@ -9250,7 +9276,7 @@ fn upkeep_state_diagnostic(
         ClaudeConfigSlotUpkeepResultV1::CredentialUnreadable => (
             ClaudeConfigSlotCollectionStateV1::CredentialUnavailable,
             ClaudeConfigSlotDiagnosticCodeV1::CredentialUnavailable,
-            "This registered Claude slot has no readable credential metadata.",
+            "Claude Code isn't signed in for this account on this Mac.",
         ),
         ClaudeConfigSlotUpkeepResultV1::Backoff => (
             ClaudeConfigSlotCollectionStateV1::StaleAccessToken,
@@ -9304,11 +9330,15 @@ fn default_claude_identity_diagnostic(failure: ClaudeSlotProbeFailure) -> AgentS
     AgentStatusDiagnostic::source(
         failure.diagnostic_code(),
         AgentDiagnosticSeverity::Warning,
-        status
-            .diagnostics
-            .first()
-            .map(|diagnostic| diagnostic.message.clone())
-            .unwrap_or_else(|| "Claude slot identity could not be verified.".to_string()),
+        if failure == ClaudeSlotProbeFailure::CredentialUnavailable {
+            "Claude Code isn't signed in on this Mac".to_string()
+        } else {
+            status
+                .diagnostics
+                .first()
+                .map(|diagnostic| diagnostic.message.clone())
+                .unwrap_or_else(|| "Claude slot identity could not be verified.".to_string())
+        },
     )
 }
 
