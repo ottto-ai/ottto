@@ -331,7 +331,8 @@ pub(in crate::snapshots) fn candidate_scan_identity(
 pub const CLAUDE_CODE_SCAN_IDENTITY_VERSION: &str = "claude_code_jsonl:v30";
 pub const PI_SCAN_IDENTITY_VERSION: &str = "pi_jsonl:v13";
 pub(in crate::snapshots) const LOCAL_SCAN_INDEX_IDENTITY_VERSION: &str = "semantic_sync:v2";
-pub(in crate::snapshots) const OPENED_OBJECT_IDENTITY_VERSION: &str = "opened_object:v2";
+// v3 drops the device number: a reboot or remount renumbers it.
+pub(in crate::snapshots) const OPENED_OBJECT_IDENTITY_VERSION: &str = "opened_object:v3";
 // Legacy compatibility identity, retained byte-for-byte. The reader has no
 // active line limit; consumed record loss must never advance this generation.
 pub(in crate::snapshots) const JSONL_TERMINAL_DISPOSITION_GENERATION: &str =

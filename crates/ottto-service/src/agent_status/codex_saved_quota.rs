@@ -80,9 +80,10 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use super::{
     chatgpt_subscription_product, codex_credential_claim_lapses_at,
     codex_credential_claimed_binding, codex_credit_grants, codex_home_slots_checked,
-    codex_last_known, current_unix_seconds, default_codex_home, empty_codex_accounts_status,
-    mark_quota_meters_stale, read_codex_auth_credentials_at, read_codex_usage_from_provider,
-    unsupported_account, CodexHomeSlot, CodexIdentityHashes, CodexLoginRefresh, CodexUsageProbe,
+    codex_last_known, codex_probe_failure_stage_and_kind, current_unix_seconds, default_codex_home,
+    empty_codex_accounts_status, mark_quota_meters_stale, read_codex_auth_credentials_at,
+    read_codex_usage_from_provider, unsupported_account, CodexHomeSlot, CodexIdentityHashes,
+    CodexLoginRefresh, CodexUsageProbe, CODEX_NO_ACCOUNT_FAILURE_PREFIX,
 };
 
 /// In use on this Mac: one provider read per 5 min.
@@ -493,6 +494,9 @@ pub(super) struct SavedCodexReading {
     /// The provider named a signed-in ChatGPT account in this read.
     #[serde(default)]
     provider_account_signed_in: bool,
+    /// The read succeeded with no account at all (`account: null`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    provider_account_absent: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     plan_type: Option<String>,
     #[serde(default)]
@@ -517,6 +521,11 @@ pub(super) struct SavedCodexFailure {
     message: String,
     #[serde(default)]
     login: LoginMark,
+    /// A session timed out since the home's last successful read: the probe
+    /// holds forced login refreshes until a read succeeds
+    /// ([`refresh_held`]). Held refreshes only; reads go on.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    refresh_held: bool,
 }
 
 impl SavedCodexQuota {
@@ -578,6 +587,7 @@ impl SavedCodexReading {
                 .map(CodexIdentityHashes::from)
                 .or_else(|| probe.saved_identity.clone()),
             provider_account_signed_in: probe.account.is_some(),
+            provider_account_absent: probe.provider_account_absent,
             plan_type: probe
                 .account
                 .as_ref()
@@ -608,6 +618,7 @@ impl SavedCodexReading {
             quota_windows: self.quota_windows.clone(),
             credit_balances: self.credit_balances.clone(),
             account,
+            provider_account_absent: self.provider_account_absent,
             identity: None,
             saved_identity: self.identity.clone(),
             credential_read_failed: self.credential_read_failed,
@@ -945,6 +956,10 @@ fn serve_saved_copy(
         if saved.reading.as_ref().map_or(true, |reading| {
             failure.at_epoch_seconds >= reading.observed_at_epoch_seconds
         }) && failure.login.same_login(current)
+            // A dead login (the read named no account) lasts only until a
+            // sign-in rewrites the credential file, even for the same account.
+            && (!failure.message.starts_with(CODEX_NO_ACCOUNT_FAILURE_PREFIX)
+                || failure.login.same_credential_file(current))
             && servable_at(failure.at_epoch_seconds, now)
         {
             return Err(CodexQuotaFailure {
@@ -1088,7 +1103,13 @@ fn read_and_save_at(
     next.last_attempt_at_epoch_seconds = finished_at;
     next.last_attempt_login = login.clone();
     match &result {
-        Ok(_) if !kept => {}
+        // A read that worked lifts a refresh hold even when its reading
+        // cannot be kept.
+        Ok(_) if !kept => {
+            if let Some(failure) = next.last_failure.as_mut() {
+                failure.refresh_held = false;
+            }
+        }
         Ok(probe) => {
             let observed_at = probe
                 .response_completed_at
@@ -1101,15 +1122,29 @@ fn read_and_save_at(
             next.last_failure = None;
         }
         Err(message) => {
+            let refresh_held = codex_probe_failure_stage_and_kind(message).1 == "timeout"
+                || next
+                    .last_failure
+                    .as_ref()
+                    .is_some_and(|failure| failure.refresh_held);
             next.last_failure = Some(SavedCodexFailure {
                 at_epoch_seconds: finished_at,
                 message: message.clone(),
                 login,
+                refresh_held,
             });
         }
     }
     write_saved_at(support_dir, home, &next);
     Some(result)
+}
+
+/// Whether `home`'s forced login refreshes are held: a read timed out since
+/// its last successful one.
+pub(super) fn refresh_held(home: &Path) -> bool {
+    saved_with_attempt(&saved_quota_support_dir(), home)
+        .and_then(|saved| saved.last_failure)
+        .is_some_and(|failure| failure.refresh_held)
 }
 
 /// When a read finished: the wall clock, never before the trigger's clock.
@@ -1949,6 +1984,7 @@ mod tests {
                 plan_type: Some("pro".to_string()),
                 ..unsupported_account("openai")
             }),
+            provider_account_absent: false,
             identity: None,
             saved_identity: Some(CodexIdentityHashes {
                 account_identifier_hash: account.to_string(),

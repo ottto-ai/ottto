@@ -277,6 +277,8 @@ struct DaemonState {
     machine: MachineIdentity,
     relay: RelayState,
     sources: Vec<SourceHealth>,
+    /// Default login marker captured before verification; RAM-only, never persisted.
+    claude_verification_auth_marker: Option<Option<String>>,
     /// Real per-source first-seen timestamps, keyed by source slug. Boot-loaded
     /// from `<source_state_dir>/<slug>-state.json` and stamped on first
     /// observation; drives `SourceHealth.connected_at`.
@@ -500,6 +502,7 @@ impl LocalDaemon {
                     last_error: None,
                 },
                 sources: Vec::new(),
+                claude_verification_auth_marker: None,
                 source_first_seen: BTreeMap::new(),
                 source_reconciliation: BTreeMap::new(),
                 scan_index_health_revisions: [[0; 3]; 3],
@@ -1313,6 +1316,35 @@ impl LocalDaemon {
     pub fn sources_with_blocking_verification_failure(
         &self,
     ) -> Result<Vec<SourceKind>, LocalApiError> {
+        Ok(self
+            .blocking_verification_retry_states()?
+            .into_iter()
+            .map(|(source, _)| source)
+            .collect())
+    }
+
+    pub(crate) fn remember_claude_verification_auth_marker(
+        &self,
+        marker: Option<String>,
+    ) -> Result<(), LocalApiError> {
+        let mut state = self.state()?;
+        // An unavailable read must not make an already-tried login look new.
+        if marker.is_some() || state.claude_verification_auth_marker.is_none() {
+            state.claude_verification_auth_marker = Some(marker);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn claude_verification_auth_marker(
+        &self,
+    ) -> Result<Option<Option<String>>, LocalApiError> {
+        Ok(self.state()?.claude_verification_auth_marker.clone())
+    }
+
+    /// Read failure and Claude sign-in action together without collecting status or credentials.
+    pub(crate) fn blocking_verification_retry_states(
+        &self,
+    ) -> Result<Vec<(SourceKind, bool)>, LocalApiError> {
         let state = self.state()?;
         Ok(state
             .sources
@@ -1320,7 +1352,16 @@ impl LocalDaemon {
             .filter(|health| {
                 health.state == SourceState::Failed && has_verification_failure_problem(health)
             })
-            .map(|health| health.source.clone())
+            .map(|health| {
+                (
+                    health.source.clone(),
+                    health.source == SourceKind::ClaudeCode
+                        && health
+                            .recommended_actions
+                            .iter()
+                            .any(|action| action.action == RepairActionKind::ReauthProvider),
+                )
+            })
             .collect())
     }
 
@@ -3098,7 +3139,15 @@ fn local_health_source_for_status(
     }
     let has_verify_attention =
         source.last_verified_at.is_some() && has_verification_failure_problem(source);
-    let authority = if source.last_verified_at.is_some() {
+    // A healthy scan may retain a successful Verify timestamp as history.
+    // Its current runtime observation still owns the projected health.
+    let runtime_is_current = !has_verify_attention
+        && source.state == SourceState::Healthy
+        && source.agent_status.as_ref().is_some_and(|snapshot| {
+            source.last_seen_at.as_deref() == Some(snapshot.captured_at.as_str())
+                && source.last_seen_at != source.last_verified_at
+        });
+    let authority = if source.last_verified_at.is_some() && !runtime_is_current {
         LocalHealthAuthority::Verify
     } else {
         LocalHealthAuthority::Runtime
@@ -3124,12 +3173,14 @@ fn local_health_source_for_status(
         app: source.source.clone(),
         state,
         authority,
-        authority_at: source
-            .last_verified_at
-            .clone()
-            .or_else(|| source.last_seen_at.clone())
-            .or_else(|| source.connected_at.clone())
-            .unwrap_or_else(current_rfc3339_timestamp),
+        authority_at: (if runtime_is_current {
+            source.last_seen_at.clone()
+        } else {
+            source.last_verified_at.clone()
+        })
+        .or_else(|| source.last_seen_at.clone())
+        .or_else(|| source.connected_at.clone())
+        .unwrap_or_else(current_rfc3339_timestamp),
         blocking_reason,
         clear_condition: first_problem
             .map(|problem| problem.detail.trim())
@@ -4768,6 +4819,14 @@ fn preserve_blocking_verification_state(refreshed: &mut SourceHealth, existing: 
         refreshed.problems = existing.problems.clone();
         refreshed.recommended_actions = existing.recommended_actions.clone();
         refreshed.last_verified_at = existing.last_verified_at.clone();
+    } else if existing.state == SourceState::Healthy
+        && refreshed.state == SourceState::Healthy
+        && refreshed.last_verified_at.is_none()
+        && !has_verification_failure_problem(existing)
+    {
+        // Retain successful history without carrying an expired failure or
+        // letting it supply verification authority to a later runtime failure.
+        refreshed.last_verified_at = existing.last_verified_at.clone();
     }
 }
 
@@ -5365,6 +5424,29 @@ mod tests {
     use serial_test::serial;
 
     const TOKEN: &str = "local_control_token";
+
+    #[test]
+    fn claude_verification_auth_marker_keeps_last_known_on_unavailable_read() {
+        let daemon = daemon();
+        assert_eq!(daemon.claude_verification_auth_marker().unwrap(), None);
+        daemon
+            .remember_claude_verification_auth_marker(None)
+            .unwrap();
+        assert_eq!(
+            daemon.claude_verification_auth_marker().unwrap(),
+            Some(None)
+        );
+        daemon
+            .remember_claude_verification_auth_marker(Some("known".into()))
+            .unwrap();
+        daemon
+            .remember_claude_verification_auth_marker(None)
+            .unwrap();
+        assert_eq!(
+            daemon.claude_verification_auth_marker().unwrap(),
+            Some(Some("known".into()))
+        );
+    }
 
     #[test]
     fn doctor_connection_binding_finding_requires_reconnect_and_clears_after_repair() {
@@ -6087,6 +6169,77 @@ mod tests {
             .expect("canonical Codex source");
         assert_eq!(source.state, LocalHealthSourceState::VerifyFailed);
         assert_eq!(source.authority_at, last_verified_at);
+    }
+
+    /// [regress] Healthy refreshes must not discard a passing Verify's timestamp.
+    #[test]
+    fn successful_verification_time_survives_healthy_refreshes() {
+        const PASSED_AT: &str = "2026-05-05T10:20:00Z";
+        for source in [SourceKind::ClaudeCode, SourceKind::Codex, SourceKind::Pi] {
+            for fail_first in [false, true] {
+                let daemon = daemon().with_account(account("user_1", "test@example.com"));
+                if fail_first {
+                    let mut failed = failed_codex_reconnect();
+                    failed.source = source.clone();
+                    daemon.record_verification_result(&failed).unwrap();
+                }
+                let mut passed = verified_codex(PASSED_AT);
+                passed.source = source.clone();
+                daemon.record_verification_result(&passed).unwrap();
+                assert_eq!(
+                    daemon.status(TOKEN).unwrap().sources[0]
+                        .last_verified_at
+                        .as_deref(),
+                    Some(PASSED_AT)
+                );
+
+                for refreshed_at in ["2026-05-05T10:30:00Z", "2026-05-05T10:40:00Z"] {
+                    {
+                        let mut state = daemon.inner.lock().unwrap();
+                        upsert_agent_status_snapshot(
+                            &mut state,
+                            available_agent_status(source.clone(), refreshed_at),
+                        );
+                    }
+                    let status = daemon.status(TOKEN).unwrap();
+                    let health = &status.sources[0];
+                    assert_eq!(health.state, SourceState::Healthy);
+                    assert_eq!(health.last_verified_at.as_deref(), Some(PASSED_AT));
+                    assert!(health.problems.is_empty());
+                    let canonical = status.canonical_health.unwrap();
+                    let projected = canonical
+                        .sources
+                        .iter()
+                        .find(|row| row.app == source)
+                        .unwrap();
+                    assert_eq!(projected.authority, LocalHealthAuthority::Runtime);
+                    assert_eq!(projected.authority_at, refreshed_at);
+                }
+
+                // A later runtime failure is not a new verification witness.
+                {
+                    let mut state = daemon.inner.lock().unwrap();
+                    let mut snapshot =
+                        available_agent_status(source.clone(), "2026-05-05T10:50:00Z");
+                    snapshot.status = AgentStatusState::Error;
+                    upsert_agent_status_snapshot(&mut state, snapshot);
+                }
+                let status = daemon.status(TOKEN).unwrap();
+                assert_eq!(status.sources[0].state, SourceState::Failed);
+                assert!(status.sources[0].last_verified_at.is_none());
+                {
+                    let mut state = daemon.inner.lock().unwrap();
+                    upsert_agent_status_snapshot(
+                        &mut state,
+                        available_agent_status(source.clone(), "2026-05-05T11:00:00Z"),
+                    );
+                }
+                assert_eq!(
+                    daemon.status(TOKEN).unwrap().sources[0].state,
+                    SourceState::Healthy
+                );
+            }
+        }
     }
 
     #[test]

@@ -178,3 +178,20 @@ pub(crate) fn assert_held_new_file_has_no_money_authority(index: &ScanIndex, pat
         (i128::MAX, location_key(&key))
     ));
 }
+
+/// Materialize the released pre-cutoff subagent behavior for an accepted
+/// over-counted-head fixture. Reuse native restoration, then run the ordinary
+/// enrichment/upload/ACK path; no production gate or alternate money writer.
+pub(crate) fn released_subagent_copies(items: &mut [SnapshotItem]) {
+    for item in items {
+        if item
+            .claude_money
+            .as_deref()
+            .is_some_and(|fold| fold.twin_pending)
+        {
+            let ids = skipped_ids(item).cloned().collect::<Vec<_>>();
+            restore_uncovered(item, &ids);
+            item.claude_money.as_deref_mut().unwrap().twin_pending = false;
+        }
+    }
+}

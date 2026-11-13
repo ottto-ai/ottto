@@ -661,6 +661,11 @@ impl UploadFailureDiagnostics {
             && (self.status_family == "transport_timeout" || self.http_status == Some(504))
     }
 
+    /// A transport failure (no HTTP answer) or an HTTP 5xx.
+    pub(crate) fn is_outage(&self) -> bool {
+        self.http_status.is_none_or(|status| status >= 500)
+    }
+
     pub(crate) fn is_snapshot_batch_too_large(&self) -> bool {
         self.endpoint == "snapshot_batch" && self.http_status == Some(413)
     }
@@ -1618,6 +1623,9 @@ pub struct SnapshotStatusRequest {
     pub last_snapshot_unproven_terminal_count: u64,
     pub last_snapshot_superseded_terminal_count: u64,
     pub last_backfill_window_days: u64,
+    /// First census end minus the fixed first-read window; terminal status only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_read_cutoff: Option<String>,
     pub last_backfill_file_limit: u64,
     pub last_discovered_file_count: u64,
     pub last_skipped_file_count_due_to_limit: u64,
@@ -1747,6 +1755,7 @@ impl SnapshotStatusRequest {
             // Server-negotiated policy width, not scan evidence: the beat
             // reports back the hint the server just gave it.
             last_backfill_window_days: _,
+            first_read_cutoff,
             last_backfill_file_limit,
             last_discovered_file_count,
             last_skipped_file_count_due_to_limit,
@@ -1805,6 +1814,9 @@ impl SnapshotStatusRequest {
         }
         if last_error_message.is_some() {
             return Some("last_error_message");
+        }
+        if first_read_cutoff.is_some() {
+            return Some("first_read_cutoff");
         }
         if last_census_pending_file_count.is_some() {
             return Some("last_census_pending_file_count");
@@ -4336,6 +4348,7 @@ mod tests {
             last_snapshot_unproven_terminal_count: 0,
             last_snapshot_superseded_terminal_count: 0,
             last_backfill_window_days: 183,
+            first_read_cutoff: None,
             last_backfill_file_limit: 0,
             last_discovered_file_count: 0,
             last_skipped_file_count_due_to_limit: 0,
@@ -4379,6 +4392,23 @@ mod tests {
         assert!(scan.contains(r#""report_kind":"scan_status""#), "{scan}");
     }
 
+    #[test]
+    fn first_read_cutoff_is_optional_and_round_trips_on_scan_status() {
+        let mut status = clean_checkin_request();
+        let absent = serde_json::to_value(&status).unwrap();
+        assert!(absent.get("first_read_cutoff").is_none());
+        let old: SnapshotStatusRequest = serde_json::from_value(absent).unwrap();
+        assert!(old.first_read_cutoff.is_none());
+        status.report_kind = SnapshotStatusReportKind::ScanStatus;
+        status.first_read_cutoff = Some("2026-09-13T12:00:00.000Z".to_owned());
+        let value = serde_json::to_value(&status).unwrap();
+        assert_eq!(value["first_read_cutoff"], "2026-09-13T12:00:00.000Z");
+        assert!(value.get("first_read").is_none());
+        let restored: SnapshotStatusRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.first_read_cutoff, status.first_read_cutoff);
+        restored.validate_declared_report_kind().unwrap();
+    }
+
     /// The guard is a falsifier, not a classifier: it never picks the kind, it
     /// only refuses a `checkin` the payload contradicts. Every field a beat may
     /// not disclose is enumerated here; the exhaustive destructure inside
@@ -4393,6 +4423,10 @@ mod tests {
             .expect("a clean liveness beat is truthful");
 
         let mutations: Vec<CheckinMutation> = vec![
+            (
+                "first_read_cutoff",
+                Box::new(|r| r.first_read_cutoff = Some("2026-09-13T12:00:00.000Z".to_owned())),
+            ),
             ("enabled=false", Box::new(|r| r.enabled = false)),
             (
                 "disabled_reason",
@@ -4629,6 +4663,7 @@ mod tests {
             last_scanned_session_count: 0,
             last_scanned_file_count: 0,
             last_backfill_window_days: 183,
+            first_read_cutoff: None,
             last_backfill_file_limit: 1_000,
             last_discovered_file_count: 1_100,
             last_skipped_file_count_due_to_limit: 100,
@@ -4708,6 +4743,7 @@ mod tests {
             last_snapshot_unproven_terminal_count: 0,
             last_snapshot_superseded_terminal_count: 0,
             last_backfill_window_days: window_days as u64,
+            first_read_cutoff: None,
             last_backfill_file_limit: 10_000,
             last_discovered_file_count: 1,
             last_skipped_file_count_due_to_limit: 0,

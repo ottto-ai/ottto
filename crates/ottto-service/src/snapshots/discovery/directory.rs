@@ -870,7 +870,7 @@ pub(in crate::snapshots) fn is_recent_enough_at(
 
 /// The first-read bound in days. It is in no walk identity: the walk, its
 /// pruning and the uploaded window keep `backfill_window_days`.
-pub(in crate::snapshots) const FIRST_READ_WINDOW_DAYS: u64 = 60;
+pub(crate) const FIRST_READ_WINDOW_DAYS: u64 = 60;
 
 /// First-seen bound: a file never read, whose mtime is older than
 /// `FIRST_READ_WINDOW_DAYS` at the census time, is not admitted for a first

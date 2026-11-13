@@ -89,6 +89,9 @@ pub struct BackfillState {
     pub completed_destination_namespaces: BTreeMap<String, String>,
     #[serde(default)]
     pub last_completed_at: Option<String>,
+    /// Immutable first census ends, keyed by destination namespace + ":" + source.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) first_census_ends: BTreeMap<String, String>,
     #[serde(default)]
     pub last_report: Option<BackfillReport>,
     /// Server-issued account-switch backfill cutoff (RFC3339, UTC). Set when a
@@ -276,6 +279,52 @@ pub(crate) fn update_backfill_state(
         return Ok(());
     }
     save_backfill_state_locked(state_dir, &state)
+}
+
+/// Persist before collection. Only a positively missing index may create an anchor.
+pub(crate) fn record_first_census(
+    state_dir: &Path,
+    source: SnapshotSource,
+    destination: &str,
+    census_end: &str,
+    missing_index: bool,
+) -> Result<Option<String>> {
+    let mut anchor = None;
+    update_backfill_state(state_dir, |state| {
+        let slug = source.api_slug();
+        let key = format!("{destination}:{slug}");
+        let completed = state.completed_destination_namespaces.get(slug).map_or(
+            state.completed_parser_versions.contains_key(slug)
+                || state.completed_replay_revisions.contains_key(slug),
+            |recorded| recorded == destination,
+        );
+        if missing_index && !completed && !state.prior_history_unverified {
+            state
+                .first_census_ends
+                .entry(key.clone())
+                .or_insert_with(|| census_end.to_owned());
+        }
+        anchor = state.first_census_ends.get(&key).cloned();
+    })?;
+    Ok(anchor.filter(|value| parse_rfc3339(value).is_some()))
+}
+
+impl BackfillState {
+    pub(crate) fn first_read_cutoff(&self, destination: &str, source: &str) -> Option<String> {
+        let anchor = self
+            .first_census_ends
+            .get(&format!("{destination}:{source}"))?;
+        let cutoff = parse_rfc3339(anchor)?
+            .checked_sub(time::Duration::days(
+                crate::snapshots::FIRST_READ_WINDOW_DAYS as i64,
+            ))?
+            .to_offset(time::UtcOffset::UTC);
+        let format = time::format_description::parse_borrowed::<2>(
+            "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z",
+        )
+        .ok()?;
+        cutoff.format(&format).ok()
+    }
 }
 
 /// A good list read is the only automatic transition to Set. A Set value
@@ -600,6 +649,184 @@ pub fn now_rfc3339() -> String {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn empty_first_census_map_preserves_legacy_bytes() {
+        let old = r#"{"completed_parser_versions":{},"completed_replay_revisions":{},"completed_destination_namespaces":{},"last_completed_at":null,"last_report":null}"#;
+        let state: BackfillState = serde_json::from_str(old).unwrap();
+        assert_eq!(serde_json::to_string(&state).unwrap(), old);
+        assert_eq!(state.first_read_cutoff("destination", "codex"), None);
+    }
+
+    #[test]
+    fn first_census_anchor_is_durable_per_destination_and_source() {
+        let dir = crate::test_scratch::ScratchDir::canonical("first-census-anchor");
+        let anchor = "2026-11-12T12:00:00.123Z";
+        for source in [
+            SnapshotSource::ClaudeCode,
+            SnapshotSource::Codex,
+            SnapshotSource::Pi,
+        ] {
+            assert_eq!(
+                record_first_census(&dir, source, "destination", anchor, true)
+                    .unwrap()
+                    .as_deref(),
+                Some(anchor)
+            );
+            let loaded = load_backfill_state(&dir);
+            assert_eq!(
+                loaded
+                    .first_read_cutoff("destination", source.api_slug())
+                    .as_deref(),
+                Some("2026-09-13T12:00:00.123Z")
+            );
+            assert_eq!(loaded.first_read_cutoff("other", source.api_slug()), None);
+            // Completion and explicit replay bookkeeping preserve the anchor.
+            update_backfill_state(&dir, |state| {
+                mark_backfill_complete_for_destination(state, source, "destination");
+                state
+                    .completed_replay_revisions
+                    .insert(source.api_slug().to_owned(), "later-replay".to_owned());
+            })
+            .unwrap();
+            for missing in [false, true] {
+                assert_eq!(
+                    record_first_census(
+                        &dir,
+                        source,
+                        "destination",
+                        "2026-12-12T12:00:00Z",
+                        missing
+                    )
+                    .unwrap()
+                    .as_deref(),
+                    Some(anchor)
+                );
+            }
+            // A genuinely new destination can establish its own first census.
+            assert_eq!(
+                record_first_census(&dir, source, "other", "2026-12-12T12:00:00Z", true)
+                    .unwrap()
+                    .as_deref(),
+                Some("2026-12-12T12:00:00Z")
+            );
+            assert_eq!(
+                load_backfill_state(&dir).first_read_cutoff("destination", source.api_slug()),
+                loaded.first_read_cutoff("destination", source.api_slug())
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_started_and_downgraded_sources_never_gain_an_anchor() {
+        for source in [
+            SnapshotSource::ClaudeCode,
+            SnapshotSource::Codex,
+            SnapshotSource::Pi,
+        ] {
+            let dir = crate::test_scratch::ScratchDir::canonical("first-census-legacy");
+            let anchor = "2026-11-12T12:00:00Z";
+            // An already-started index cannot be dated, even without completion.
+            assert_eq!(
+                record_first_census(&dir, source, "destination", anchor, false).unwrap(),
+                None
+            );
+            update_backfill_state(&dir, |state| {
+                mark_backfill_complete_for_destination(state, source, "destination");
+            })
+            .unwrap();
+            assert_eq!(
+                record_first_census(&dir, source, "destination", anchor, true).unwrap(),
+                None
+            );
+            // A legacy completion with no destination binding is conservative too.
+            update_backfill_state(&dir, |state| {
+                state.completed_destination_namespaces.clear();
+            })
+            .unwrap();
+            assert_eq!(
+                record_first_census(&dir, source, "destination", anchor, true).unwrap(),
+                None
+            );
+            // Old serde writers discard unknown fields; a re-upgrade with an
+            // existing index never reconstructs the missing map from a new clock.
+            let mut old: serde_json::Value =
+                serde_json::from_slice(&fs::read(backfill_state_path(&dir)).unwrap()).unwrap();
+            old.as_object_mut().unwrap().remove("first_census_ends");
+            fs::write(backfill_state_path(&dir), serde_json::to_vec(&old).unwrap()).unwrap();
+            assert_eq!(
+                record_first_census(&dir, source, "destination", anchor, false).unwrap(),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn saved_first_census_end_drives_admission_after_pre_read_restart() {
+        for source in [
+            SnapshotSource::ClaudeCode,
+            SnapshotSource::Codex,
+            SnapshotSource::Pi,
+        ] {
+            let dir = crate::test_scratch::ScratchDir::canonical("first-census-crash");
+            let support = dir.join("support");
+            fs::create_dir_all(support.join("snapshots").join("a".repeat(64))).unwrap();
+            let path = support
+                .join("snapshots")
+                .join("a".repeat(64))
+                .join(format!("{}-scan-index-v3.json", source.api_slug()));
+            let (_, origin) =
+                ScanIndex::load_for_snapshot_source_with_origin(&path, source, &support).unwrap();
+            assert_eq!(origin, crate::snapshots::ScanIndexLoadOrigin::Missing);
+            let original = "2026-11-12T12:00:00Z";
+            record_first_census(&support, source, "destination", original, true).unwrap();
+            // Crash after BackfillState's durable save, before any transcript read.
+            let (mut index, origin) =
+                ScanIndex::load_for_snapshot_source_with_origin(&path, source, &support).unwrap();
+            assert_eq!(origin, crate::snapshots::ScanIndexLoadOrigin::Loaded);
+            assert_eq!(index.generation, 0);
+            let restored = record_first_census(
+                &support,
+                source,
+                "destination",
+                "2026-11-13T12:00:00Z",
+                false,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(restored, original);
+            let roots = [dir.join("empty-root")];
+            fs::create_dir_all(&roots[0]).unwrap();
+            for width in [183, 730] {
+                let scan = scan_source_roots_with_attribution_and_claude_effort_and_hints(
+                    source,
+                    &roots,
+                    &mut index,
+                    &restored,
+                    width,
+                    None,
+                    None,
+                    &[],
+                    false,
+                )
+                .unwrap();
+                assert_eq!(scan.census_window_end, original);
+                assert_eq!(
+                    load_backfill_state(&support)
+                        .first_read_cutoff("destination", source.api_slug())
+                        .as_deref(),
+                    Some("2026-09-13T12:00:00.000Z")
+                );
+            }
+            index.prepare_historical_replay("later-generation".to_owned());
+            assert_eq!(
+                load_backfill_state(&support)
+                    .first_read_cutoff("destination", source.api_slug())
+                    .as_deref(),
+                Some("2026-09-13T12:00:00.000Z")
+            );
+        }
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -1361,6 +1588,6 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(BackfillState; completed_parser_versions, completed_replay_revisions, completed_destination_namespaces, last_completed_at, last_report, backfill_cutoff_at, backfill_cutoff_user_id, backfill_cutoff_destination_namespace, prior_history_unverified, claim_backfill_policy_full, claude_history_list_intent);
+crate::heap_layout_bound::fields!(BackfillState; first_census_ends, completed_parser_versions, completed_replay_revisions, completed_destination_namespaces, last_completed_at, last_report, backfill_cutoff_at, backfill_cutoff_user_id, backfill_cutoff_destination_namespace, prior_history_unverified, claim_backfill_policy_full, claude_history_list_intent);
 
 crate::heap_layout_bound::fields!(BackfillReport; claude_code_session_count, codex_session_count, pi_session_count, claude_code_snapshot_count, codex_snapshot_count, pi_snapshot_count, completed_at);

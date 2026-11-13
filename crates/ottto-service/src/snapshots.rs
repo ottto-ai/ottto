@@ -1438,11 +1438,13 @@ fn transcript_path_admitted(source: SnapshotSource, path: &Path) -> bool {
         || (source == SnapshotSource::Codex && codex_archive_path(path))
 }
 
+pub(crate) use discovery::directory::FIRST_READ_WINDOW_DAYS;
+
 #[cfg(test)]
 use discovery::directory::{
     advance_bounded_directory_traversal, collect_recent_jsonl_files,
     reconcile_missing_index_entries_with_limit, reconcile_missing_index_entries_with_side,
-    with_directory_read_fault, with_test_directory_entries, FIRST_READ_WINDOW_DAYS,
+    with_directory_read_fault, with_test_directory_entries,
 };
 use discovery::directory::{
     advance_bounded_directory_traversal_with_budget, claude_absence_is_removal,

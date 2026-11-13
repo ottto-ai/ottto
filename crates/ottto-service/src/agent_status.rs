@@ -194,6 +194,10 @@ struct CodexUsageProbe {
     quota_windows: Vec<AgentQuotaWindow>,
     credit_balances: Vec<AgentCreditBalance>,
     account: Option<AgentAccountStatus>,
+    /// The provider read succeeded and named no account at all
+    /// (`account: null`). Codex answers that once a refresh of the home's
+    /// login failed for good, so a managed home then needs a new sign-in.
+    provider_account_absent: bool,
     /// Set by a provider read only; a saved reading carries `saved_identity`.
     identity: Option<CodexStrongIdentity>,
     /// The identity hashes of a saved reading, whose provider validation
@@ -1937,6 +1941,19 @@ fn append_configured_codex_unavailable_snapshots(
                 "This previously accepted Codex account and workspace remains configured; its current identity and limits could not be verified.",
             ).with_quota_binding(Some(account.clone()), Some(workspace.clone())),
         );
+        // A dead login's needs-login cause rides along, so the web can show it.
+        if let Some(needs_login) = candidate
+            .snapshot
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "codex_account_needs_login")
+        {
+            snapshot.diagnostics.push(
+                needs_login
+                    .clone()
+                    .with_quota_binding(Some(account.clone()), Some(workspace.clone())),
+            );
+        }
         snapshots.push(snapshot);
     }
 }
@@ -2208,52 +2225,70 @@ pub(crate) fn session_launch_codex_accounts_status(
         if slot.ownership == CodexAccountSlotOwnershipV1::Default {
             slot.home = default_home.into();
         }
-        let trust = if slot.ownership == CodexAccountSlotOwnershipV1::Default {
-            CodexHomeTrust::ProviderDefault
-        } else {
-            CodexHomeTrust::Managed
-        };
-        let mut snapshot = base_snapshot(
-            SourceKind::Codex,
-            AgentStatusState::Degraded,
-            AgentStatusCollectionMethod::ConfigFile,
-            captured.clone(),
-            captured.clone(),
-        );
-        if session_launch_codex_identity(&slot.home, trust).is_none() {
-            snapshot.status = AgentStatusState::AuthRequired;
-        } else if let Ok(probe) =
-            codex_saved_quota::serve_saved_for_launch(&slot.home, trust, current_unix_seconds())
-        {
-            if !probe.credential_read_failed {
-                snapshot.account = probe.account;
-                if let (Some(account), Some(identity)) =
-                    (snapshot.account.as_mut(), probe.saved_identity)
-                {
-                    account.account_identifier_hash = Some(identity.account_identifier_hash);
-                    account.organization_identifier_hash = Some(identity.workspace_identifier_hash);
-                    snapshot.quota_windows = probe.quota_windows;
-                    snapshot.credit_balances = probe.credit_balances;
-                    snapshot.status = AgentStatusState::Available;
-                }
-            }
-        }
-        let mut collection = codex_collection_status_from_snapshot(&snapshot);
-        let binding = enforce_codex_registered_binding(&slot, &mut snapshot, &mut collection);
-        let quality = codex_snapshot_quality(&snapshot, &collection);
-        candidates.push(CodexSlotCandidate {
-            slot,
-            snapshot,
-            status: collection,
-            binding,
-            workspace_targets: Vec::new(),
-            quality,
-            auth_modified_at: None,
-        });
+        candidates.push(session_launch_codex_candidate(slot, &captured));
     }
     canonicalize_codex_candidates(&mut candidates);
     apply_codex_candidate_statuses(&mut status, &candidates);
     status
+}
+
+/// One slot of [`session_launch_codex_accounts_status`]: saved evidence and
+/// local claims only.
+fn session_launch_codex_candidate(slot: CodexHomeSlot, captured: &str) -> CodexSlotCandidate {
+    let trust = if slot.ownership == CodexAccountSlotOwnershipV1::Default {
+        CodexHomeTrust::ProviderDefault
+    } else {
+        CodexHomeTrust::Managed
+    };
+    let mut snapshot = base_snapshot(
+        SourceKind::Codex,
+        AgentStatusState::Degraded,
+        AgentStatusCollectionMethod::ConfigFile,
+        captured.to_string(),
+        captured.to_string(),
+    );
+    if session_launch_codex_identity(&slot.home, trust).is_none() {
+        snapshot.status = AgentStatusState::AuthRequired;
+    } else {
+        // A dead login reads as it does in status: needs a new sign-in.
+        let account_absent = match codex_saved_quota::serve_saved_for_launch(
+            &slot.home,
+            trust,
+            current_unix_seconds(),
+        ) {
+            Ok(probe) => {
+                let account_absent = probe.provider_account_absent;
+                if !probe.credential_read_failed {
+                    snapshot.account = probe.account;
+                    if let (Some(account), Some(identity)) =
+                        (snapshot.account.as_mut(), probe.saved_identity)
+                    {
+                        account.account_identifier_hash = Some(identity.account_identifier_hash);
+                        account.organization_identifier_hash =
+                            Some(identity.workspace_identifier_hash);
+                        snapshot.quota_windows = probe.quota_windows;
+                        snapshot.credit_balances = probe.credit_balances;
+                        snapshot.status = AgentStatusState::Available;
+                    }
+                }
+                account_absent
+            }
+            Err(failure) => failure.message.starts_with(CODEX_NO_ACCOUNT_FAILURE_PREFIX),
+        };
+        apply_codex_dead_login(&mut snapshot, &slot.home, trust, account_absent);
+    }
+    let mut collection = codex_collection_status_from_snapshot(&snapshot);
+    let binding = enforce_codex_registered_binding(&slot, &mut snapshot, &mut collection);
+    let quality = codex_snapshot_quality(&snapshot, &collection);
+    CodexSlotCandidate {
+        slot,
+        snapshot,
+        status: collection,
+        binding,
+        workspace_targets: Vec::new(),
+        quality,
+        auth_modified_at: None,
+    }
 }
 
 pub(crate) fn annotate_codex_accounts_status(
@@ -2698,6 +2733,32 @@ fn apply_codex_candidate_statuses(
         {
             descriptor.collection = candidate.status.clone();
             descriptor.collection.quota_snapshot = None;
+        }
+    }
+    // A managed slot that needs a new sign-in names its registered account
+    // and workspace, the pair a reconnect must present: the read named none.
+    // Only while no other slot carries that pair (the rule above). The
+    // candidate's binding, health and placement are unchanged.
+    let mut carried = std::iter::once(&status.default_slot)
+        .chain(&status.managed_slots)
+        .filter_map(|slot| codex_slot_status_binding(&slot.collection))
+        .collect::<BTreeSet<_>>();
+    for descriptor in &mut status.managed_slots {
+        if descriptor.collection.state != CodexAccountSlotCollectionStateV1::NeedsLogin
+            || codex_slot_status_binding(&descriptor.collection).is_some()
+        {
+            continue;
+        }
+        let Some((account, workspace)) = candidates
+            .iter()
+            .find(|candidate| candidate.slot.slot_id == descriptor.slot_id)
+            .and_then(|candidate| candidate.slot.registered_binding.clone())
+        else {
+            continue;
+        };
+        if carried.insert((account.clone(), workspace.clone())) {
+            descriptor.collection.account_identifier_hash = Some(account);
+            descriptor.collection.workspace_identifier_hash = Some(workspace);
         }
     }
 }
@@ -3626,6 +3687,12 @@ fn collect_codex_status_for_home(
             if let Some(account) = usage.account {
                 snapshot.account = Some(merge_codex_accounts(snapshot.account.take(), account));
             }
+            apply_codex_dead_login(
+                &mut snapshot,
+                codex_home,
+                home_trust,
+                usage.provider_account_absent,
+            );
             let identity_hashes = usage
                 .identity
                 .as_ref()
@@ -3726,6 +3793,12 @@ fn collect_codex_status_for_home(
         }
         Err(failure) => {
             probe_failed = !failure.message.starts_with(CODEX_CLI_NOT_FOUND_FOR_PROBE);
+            apply_codex_dead_login(
+                &mut snapshot,
+                codex_home,
+                home_trust,
+                failure.message.starts_with(CODEX_NO_ACCOUNT_FAILURE_PREFIX),
+            );
             snapshot.quota_windows = vec![unsupported_quota_window("usage")];
             snapshot.diagnostics.push(
                 AgentStatusDiagnostic::source(
@@ -3782,6 +3855,47 @@ fn collect_codex_status_for_home(
     snapshot.runtime_defaults =
         build_codex_runtime_defaults_at(&snapshot.captured_at, codex_home, home_trust);
     (snapshot, strong_identity, workspace_targets)
+}
+
+/// Prefix of a failed read's fixed text when its `account/read` named no
+/// account before the rest of the session failed: the login is dead even
+/// though no reading came back. A prefix keeps the stage, kind and code
+/// parsing of [`codex_probe_failure_stage_and_kind`] intact.
+const CODEX_NO_ACCOUNT_FAILURE_PREFIX: &str = "The provider named no signed-in user. ";
+
+/// A managed home with an auth file whose provider read named no account
+/// (`account: null`, which Codex answers after a refresh failed for good)
+/// needs a new sign-in: not merely unconfirmed. Only an Ottto slot's home,
+/// which the probe keeps refreshed; the default home's lapsed login is
+/// another case. Changes the status cause only.
+fn apply_codex_dead_login(
+    snapshot: &mut AgentStatusSnapshot,
+    codex_home: &Path,
+    home_trust: CodexHomeTrust,
+    provider_account_absent: bool,
+) {
+    if !provider_account_absent
+        || home_trust != CodexHomeTrust::Managed
+        || ottto_core::codex_auth_file_mark(codex_home).is_none()
+    {
+        return;
+    }
+    snapshot.status = AgentStatusState::AuthRequired;
+    if let Some(account) = snapshot.account.as_mut() {
+        account.login_state = AgentLoginState::SignedOut;
+    }
+    // The slot's own cause, on the snapshot too, so the web can show it.
+    if !snapshot
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "codex_account_needs_login")
+    {
+        snapshot.diagnostics.push(AgentStatusDiagnostic::source(
+            "codex_account_needs_login",
+            AgentDiagnosticSeverity::Warning,
+            "Codex must be signed in again for this durable connection.",
+        ));
+    }
 }
 
 fn collect_codex_usage_for_home(
@@ -16490,6 +16604,13 @@ fn codex_app_server_account(value: &Value) -> Option<AgentAccountStatus> {
     })
 }
 
+/// An `account/read` result that names no account (`account: null`) and does
+/// not say the provider needs no OpenAI sign-in. A missing field is not this.
+fn codex_app_server_account_absent(value: &Value) -> bool {
+    value.get("account").is_some_and(Value::is_null)
+        && value.get("requiresOpenaiAuth").and_then(Value::as_bool) != Some(false)
+}
+
 /// Sanity window for a reported subscription-period boundary, in Unix seconds.
 ///
 /// The claim's wire type is not guaranteed, so a millisecond-encoded value is a
@@ -16578,16 +16699,20 @@ fn codex_probe_failure_log_line(
         .split_once("RPC failed with code ")
         .and_then(|(_, rest)| rest.trim_end_matches('.').parse::<i64>().ok())
         .map_or_else(|| "none".to_string(), |code| code.to_string());
-    let mut digest = Sha256::new();
-    digest.update(b"ottto:codex-home-log:v1\0");
-    digest.update(codex_home.as_os_str().as_encoded_bytes());
-    let home = format!("{:x}", digest.finalize());
     format!(
         "codex usage probe failed: at={} stage={stage} kind={kind} code={code} home={} elapsed_ms={}",
         rfc3339_from_unix_seconds(now).unwrap_or_else(|| "unknown".to_string()),
-        &home[..12],
+        codex_home_log_label(codex_home),
         elapsed.as_millis()
     )
+}
+
+/// The 12-hex digest of a Codex home that the probe's log lines carry.
+fn codex_home_log_label(codex_home: &Path) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"ottto:codex-home-log:v1\0");
+    digest.update(codex_home.as_os_str().as_encoded_bytes());
+    format!("{:x}", digest.finalize())[..12].to_string()
 }
 
 /// `(stage, kind)` of a failed app-server probe, from its fixed producer text
@@ -16679,6 +16804,7 @@ fn codex_usage_probe_from_app_server_observation(
         quota_windows,
         credit_balances,
         account: codex_app_server_account(&observation.account),
+        provider_account_absent: codex_app_server_account_absent(&observation.account),
         identity,
         saved_identity: None,
         credential_read_failed: observation.credential_read_failed,
@@ -16816,6 +16942,13 @@ struct CodexAppServerRun {
     /// read never reached the provider, and the detailed read replaced it.
     routine_read_rejected: bool,
     timed_out: bool,
+    /// Why this session forced a refresh of the home's login, if it did
+    /// ([`codex_probe_refresh_reason`]).
+    refresh_reason: Option<&'static str>,
+    /// `account/read` answered with no account
+    /// ([`codex_app_server_account_absent`]), whatever the rest of the
+    /// session did.
+    account_absent: bool,
 }
 
 /// Provider requests a started `codex app-server` quota session counts at
@@ -16891,6 +17024,7 @@ fn call_codex_app_server_rate_limits_for_home(
 ) -> Result<CodexAppServerObservation, String> {
     use crate::provider_calls::{CallKind, CallResult, Provider, ProviderCall, Trigger};
     let account_before = codex_home_claimed_account_hash(codex_home, home_trust);
+    let auth_before = ottto_core::codex_auth_file_mark(codex_home);
     let started = Instant::now();
     let mut run = CodexAppServerRun::default();
     let result = run_codex_app_server_rate_limits_for_home(
@@ -16922,7 +17056,67 @@ fn call_codex_app_server_rate_limits_for_home(
                 + u32::from(run.detail_read_sent && !run.routine_read_rejected),
         ));
     }
+    if let Some(reason) = run.refresh_reason {
+        let outcome = codex_forced_refresh_outcome(
+            run.account_absent,
+            run.timed_out,
+            ottto_core::codex_auth_file_mark(codex_home) != auth_before,
+        );
+        eprintln!(
+            "{}",
+            codex_forced_refresh_log_line(
+                reason,
+                outcome,
+                codex_home,
+                started.elapsed(),
+                current_unix_seconds(),
+            )
+        );
+    }
+    if run.account_absent {
+        return result.map_err(|message| format!("{CODEX_NO_ACCOUNT_FAILURE_PREFIX}{message}"));
+    }
     result
+}
+
+/// What a session that forced a login refresh saw by its end: the provider
+/// named no account (the refresh failed for good, whether or not the quota
+/// read then worked), the session timed out, or the home's `auth.json` was or
+/// was not rewritten. Codex may still finish a refresh after the session
+/// ends, so `not_rewritten` is as of that end.
+fn codex_forced_refresh_outcome(
+    account_absent: bool,
+    timed_out: bool,
+    auth_rewritten: bool,
+) -> &'static str {
+    if account_absent {
+        "account_null"
+    } else if timed_out {
+        "timeout"
+    } else if auth_rewritten {
+        "rewritten"
+    } else {
+        "not_rewritten"
+    }
+}
+
+/// One log line per forced login refresh, in the format of
+/// [`codex_probe_failure_log_line`]: the reason, the outcome class, the home
+/// digest and the elapsed time. Fixed vocabulary only; no path, token or
+/// account text.
+fn codex_forced_refresh_log_line(
+    reason: &str,
+    outcome: &str,
+    codex_home: &Path,
+    elapsed: Duration,
+    now: u64,
+) -> String {
+    format!(
+        "codex usage probe: forcing account home login refresh reason={reason} at={} outcome={outcome} home={} elapsed_ms={}",
+        rfc3339_from_unix_seconds(now).unwrap_or_else(|| "unknown".to_string()),
+        codex_home_log_label(codex_home),
+        elapsed.as_millis()
+    )
 }
 
 /// How far ahead of its lapse the probe refreshes an account home's login: the
@@ -16930,8 +17124,13 @@ fn call_codex_app_server_rate_limits_for_home(
 /// lapse before the next read. A lapse alone does not bring that read forward.
 const CODEX_MANAGED_LOGIN_REFRESH_AHEAD_SECONDS: u64 = codex_saved_quota::UNUSED_REFRESH_SECONDS;
 
+/// The refresh reason of a home whose forced refreshes are held after a
+/// timed-out read ([`codex_saved_quota::refresh_held`]): logged, not sent.
+const CODEX_REFRESH_BACKOFF_REASON: &str = "backoff_after_timeout";
+
 /// Why the probe forces a token refresh in `account/read`, or `None` to leave
-/// the login as it is. Only an Ottto account slot's home
+/// the login as it is. [`CODEX_REFRESH_BACKOFF_REASON`] means it would, but a
+/// read of the home timed out since its last success, so it does not. Only an Ottto account slot's home
 /// ([`CodexLoginRefresh::WhenLapsing`]) is refreshed, and only when its
 /// claimed binding has lapsed, lapses within
 /// [`CODEX_MANAGED_LOGIN_REFRESH_AHEAD_SECONDS`] or has no readable expiry:
@@ -16948,20 +17147,23 @@ fn codex_probe_refresh_reason(
     if login_refresh == CodexLoginRefresh::Never || home_trust != CodexHomeTrust::Managed {
         return None;
     }
-    let credentials = match read_codex_auth_credentials_at(codex_home, home_trust) {
-        Ok(Some(credentials)) => credentials,
+    let reason = match read_codex_auth_credentials_at(codex_home, home_trust) {
+        Ok(Some(credentials)) => match codex_credential_claim_lapses_at(&credentials) {
+            None => "lapsed_or_unknown",
+            Some(lapses_at)
+                if lapses_at <= now.saturating_add(CODEX_MANAGED_LOGIN_REFRESH_AHEAD_SECONDS) =>
+            {
+                "lapses_soon"
+            }
+            Some(_) => return None,
+        },
         Ok(None) => return None,
-        Err(_) => return Some("unreadable"),
+        Err(_) => "unreadable",
     };
-    match codex_credential_claim_lapses_at(&credentials) {
-        None => Some("lapsed_or_unknown"),
-        Some(lapses_at)
-            if lapses_at <= now.saturating_add(CODEX_MANAGED_LOGIN_REFRESH_AHEAD_SECONDS) =>
-        {
-            Some("lapses_soon")
-        }
-        Some(_) => None,
+    if codex_saved_quota::refresh_held(codex_home) {
+        return Some(CODEX_REFRESH_BACKOFF_REASON);
     }
+    Some(reason)
 }
 
 fn run_codex_app_server_rate_limits_for_home(
@@ -17048,13 +17250,13 @@ fn run_codex_app_server_rate_limits_for_home(
         login_refresh,
         current_unix_seconds(),
     );
-    if let Some(reason) = refresh_reason {
-        eprintln!("codex usage probe: forcing account home login refresh reason={reason}");
-    }
+    run.refresh_reason = refresh_reason;
     let account = serde_json::json!({
         "method": "account/read",
         "id": "ottto_account",
-        "params": {"refreshToken": refresh_reason.is_some()}
+        "params": {
+            "refreshToken": refresh_reason.is_some_and(|reason| reason != CODEX_REFRESH_BACKOFF_REASON)
+        }
     });
     // Every poll reads usage and the count first; the reset-credit list
     // follows in this session only when the cadence asks for it.
@@ -17137,7 +17339,12 @@ fn run_codex_app_server_rate_limits_for_home(
             (Some("ottto_account"), Some(error)) => {
                 break Err(rpc_failure("account", error));
             }
-            (Some("ottto_account"), None) => account_result = message.get("result").cloned(),
+            (Some("ottto_account"), None) => {
+                account_result = message.get("result").cloned();
+                run.account_absent = account_result
+                    .as_ref()
+                    .is_some_and(codex_app_server_account_absent);
+            }
             (Some("ottto_rate_limits"), Some(error))
                 if !detail_requested && codex_credit_grants::routine_param_rejected(error) =>
             {
@@ -19053,7 +19260,17 @@ fn collect_pi_model_status_from_output(
     let mut seen = BTreeSet::new();
     if output.command_found && output.success {
         let text = command_output_text(output);
+        let mut in_table = false;
         for line in text.lines() {
+            if line.split_whitespace().eq([
+                "provider", "model", "context", "max-out", "thinking", "images",
+            ]) {
+                in_table = true;
+                continue;
+            }
+            if !in_table {
+                continue;
+            }
             let Some(detail) = parse_pi_model_table_line(line, auth) else {
                 continue;
             };
@@ -19097,21 +19314,21 @@ fn parse_pi_model_table_line(
     if provider == "provider" || model == "model" {
         return None;
     }
-    let context = parts.next();
-    let max_output = parts.next();
-    let thinking = parts.next();
-    let images = parts.next();
-    if provider.is_empty() || model.is_empty() || !looks_like_safe_model_id(model) {
+    let context = parse_pi_token_count(parts.next()?)?;
+    let max_output = parse_pi_token_count(parts.next()?)?;
+    let thinking = parse_yes_no(parts.next()?)?;
+    let images = parse_yes_no(parts.next()?)?;
+    if parts.next().is_some() || !looks_like_safe_model_id(model) {
         return None;
     }
     let route = PiModelRoute::new(provider, model, None)?;
     let identity = pi_identity_hints_for_route(auth, &route);
     Some(pi_model_detail_from_route(
         &route,
-        context.and_then(parse_pi_token_count),
-        max_output.and_then(parse_pi_token_count),
-        thinking.and_then(parse_yes_no),
-        images.and_then(parse_yes_no),
+        Some(context),
+        Some(max_output),
+        Some(thinking),
+        Some(images),
         Some(&identity),
     ))
 }

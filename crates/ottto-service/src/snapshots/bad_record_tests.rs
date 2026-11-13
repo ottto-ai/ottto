@@ -287,6 +287,42 @@ fn regression<S: SourceFixture>() {
     loss_only::<S>(&cold, &items);
     admission::<S>();
 }
+/// [money] A reboot renumbers the volume (st_dev) of every committed file.
+/// The same file under the new device number restores from its head as
+/// Unchanged: no Full, zero parser and sample bytes, no new body, and the
+/// cold Full's money. A new inode at the path is still a replacement.
+fn remount<S: SourceFixture>() {
+    let mut route = route_for(S::INDEX);
+    let path = route.dir.join(S::name());
+    write(&path, &S::lines(2));
+    let (tail, parsed) = full::<S>(&route, &path);
+    let cold = emitted::<S>(Mode::ColdFull, &route, &parsed.snapshots);
+    commit::<S>(&mut route, &path, tail, parsed);
+    route.index = ScanIndex::load(&route.path).unwrap();
+    let _renumber = crate::transcript_acquisition::DeviceRenumber::by(13);
+    let ((p, base, mode), consumed) = fixture::observe_consumed(|| stored::<S>(&route, &path));
+    assert_eq!(mode, ReadMode::Unchanged);
+    let acquisition = p.reader.acquisition.as_ref().unwrap();
+    let sample_bytes = acquisition.metrics().sample_bytes as u64;
+    let (_, restored) = finish::<S>(&route, &path, p, Some(base));
+    money_oracle::assert_equivalent(
+        &cold,
+        &emitted::<S>(Mode::DiskRestore, &route, &restored.snapshots),
+    );
+    let mut quiet = emitted::<S>(Mode::Restart, &route, &[]);
+    quiet.io.consumed = consumed;
+    quiet.io.cheap_checks = Some(0);
+    quiet.io.anchor_reads = Some(sample_bytes);
+    quiet.io.other_reads = Some(0);
+    money_oracle::assert_quiet_restart_zero_bytes(&quiet);
+    let copy = route.dir.join("replacement.tmp");
+    fs::copy(&path, &copy).unwrap();
+    fs::rename(&copy, &path).unwrap();
+    assert!(matches!(
+        load_at::<S>(&route, &path, &local_index_key(&path)),
+        Load::Cold(Some(crate::transcript_acquisition::FullReason::Replaced))
+    ));
+}
 fn suffix<S: SourceFixture>() {
     for suffix in [b"{\"paused\":".as_slice(), b"\xff".as_slice()] {
         let mut route = route_for(S::INDEX);
@@ -1137,4 +1173,19 @@ fn placement() {
         fs::remove_dir_all(dir).unwrap();
         fs::remove_dir_all(support).unwrap();
     });
+}
+
+#[test]
+fn claude_renumbered_device_restores_unchanged() {
+    remount::<Claude>();
+}
+
+#[test]
+fn codex_renumbered_device_restores_unchanged() {
+    remount::<Codex>();
+}
+
+#[test]
+fn pi_renumbered_device_restores_unchanged() {
+    remount::<Pi>();
 }

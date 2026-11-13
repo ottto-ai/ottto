@@ -211,7 +211,21 @@ fn closure(index: &ScanIndex, listed: &Request) -> Result<(Request, BTreeSet<Pat
                 .flat_map(|t| t.observed_index_keys.iter()),
         )
         .collect::<BTreeSet<_>>();
-    let twin_set = claude_history_upgrade::claude_read_closure(
+    // One holder lookup for frozen content-twin seeds; pulled holders do not
+    // recursively expand the family closure or become new lookup seeds.
+    let holders = claude_request_money::e2::copied_file_holders(
+        index,
+        paths.iter().filter_map(|path| path.to_str()).filter(|key| {
+            index
+                .claude_request_census
+                .get(key)
+                .is_some_and(|r| r.is_twin())
+        }),
+    )
+    .into_values()
+    .map(PathBuf::from)
+    .collect::<BTreeSet<_>>();
+    let mut twin_set = claude_history_upgrade::claude_read_closure(
         paths.iter().copied(),
         keys.iter().copied(),
         &twins,
@@ -225,12 +239,14 @@ fn closure(index: &ScanIndex, listed: &Request) -> Result<(Request, BTreeSet<Pat
         .filter(|m| index.claude_usage_authority_quarantine.contains_key(m.root))
         .map(|m| m.root.to_owned())
         .collect();
-    let closed = claude_history_upgrade::claude_read_closure(
+    let mut closed = claude_history_upgrade::claude_read_closure(
         paths.iter().copied(),
         keys.iter().copied(),
         &twins,
         &forced,
     );
+    twin_set.extend(holders.iter().cloned());
+    closed.extend(holders);
     let listed_paths = paths.into_iter().collect::<BTreeSet<_>>();
     let added_by_twins = twin_set
         .into_iter()
