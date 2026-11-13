@@ -4599,6 +4599,23 @@ impl SyncCounts {
                     d.rollout_extents.reused_roots, d.rollout_extents.reloaded_roots,
                     d.session_index.reused_roots, d.session_index.reloaded_roots,
                     d.state_titles.absent_roots, d.sidecar_facts_heap_bytes));
+                let or_none = |cause: &'static str| if cause.is_empty() { "none" } else { cause };
+                line.push_str(&format!(
+                    " sidecar_reload_cause={} sidecar_keep_declined={}",
+                    or_none(d.sidecar_reload_cause),
+                    or_none(d.sidecar_keep_declined)
+                ));
+                for (input, homes) in ["state_5", "thread_history_1", "session_index"]
+                    .iter()
+                    .zip(d.sidecar_changed_homes)
+                {
+                    line.push_str(&format!(" {input}_changed={}", homes.count_ones()));
+                    if homes != 0 {
+                        let bits = (0..64u32).filter(|bit| homes & (1 << bit) != 0);
+                        let bits = bits.map(|bit| bit.to_string()).collect::<Vec<_>>();
+                        line.push_str(&format!(" {input}_changed_homes={}", bits.join(",")));
+                    }
+                }
             }
         }
         line
