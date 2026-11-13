@@ -443,33 +443,68 @@ fn resident_wave_codex_join_group_straddles_budget_and_pi_drains() {
             if let Some(route) = e2_pipeline_scan_fixture::route_of(&index) {
                 fixture.on_committed_route(&route);
             }
-            let mut complete = false;
-            let mut pages = 0;
-            for _ in 0..32 {
-                let (mut next, page, _) = fixture.scan_other_page(
-                    source,
-                    std::slice::from_ref(&root),
-                    &root,
-                    index,
-                    true,
-                    2,
-                    &[],
-                );
-                pages += 1;
-                assert!(page.routine_recensus);
-                assert!(!page.charge_deferred);
-                assert!(page.snapshots.is_empty(), "no extra canonical body");
-                complete = page.census_complete;
-                index = e2_pipeline_scan_fixture::save_reload_for_test(
-                    &mut next,
-                    &root.join("routine-index.json"),
-                );
-                if complete {
-                    break;
+            for arm in ["complete", "retry", "followup"] {
+                if arm != "complete" {
+                    ensure_bounded_traversal(
+                        source,
+                        std::slice::from_ref(&root),
+                        &mut index,
+                        "2026-10-27T08:00:00Z",
+                        183,
+                    );
+                    let traversal = index.traversal.as_mut().unwrap();
+                    if arm == "retry" {
+                        traversal.pending_directories.clear();
+                        traversal.pending_candidates.clear();
+                        traversal.counts.malformed_json_line_count = 1;
+                        traversal.unhealthy_retry_not_before_unix_seconds = None;
+                    } else {
+                        traversal_transition::retiring(
+                            source,
+                            index.generation,
+                            traversal,
+                            true,
+                            0,
+                            CensusGates {
+                                clean_followup: true,
+                                ..Default::default()
+                            },
+                        );
+                        index.traversal = None;
+                    }
                 }
+                let mut complete = false;
+                let mut pages = 0;
+                for _ in 0..32 {
+                    let (mut next, page, _) = fixture.scan_other_page(
+                        source,
+                        std::slice::from_ref(&root),
+                        &root,
+                        index,
+                        true,
+                        2,
+                        &[],
+                    );
+                    pages += 1;
+                    assert!(page.routine_recensus);
+                    assert!(!page.charge_deferred);
+                    assert!(page.snapshots.is_empty(), "no extra canonical body");
+                    complete = page.census_complete;
+                    index = e2_pipeline_scan_fixture::save_reload_for_test(
+                        &mut next,
+                        &root.join("routine-index.json"),
+                    );
+                    if complete {
+                        break;
+                    }
+                }
+                assert!(complete && pages >= 3, "routine pages drain across reloads");
+                assert_eq!(canonical(&index), before);
+                money_oracle::assert_equivalent(
+                    &scan_money(source, &wide_index, &wide),
+                    &scan_money(source, &index, &small),
+                );
             }
-            assert!(complete && pages >= 3, "routine pages drain across reloads");
-            assert_eq!(canonical(&index), before);
         }
         fs::remove_dir_all(root).unwrap();
     }

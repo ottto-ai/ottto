@@ -192,7 +192,7 @@ pub(in crate::snapshots) fn ensure_bounded_traversal(
     // Capture only fixed counters before the existing reset/rearm. A missing
     // prior traversal does not explain why it was removed; the retirement
     // record, when available, supplies that independent witness.
-    let transition = traversal_transition::Starting::capture(
+    let mut transition = traversal_transition::Starting::capture(
         source,
         index,
         collected_at,

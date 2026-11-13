@@ -1424,14 +1424,29 @@ fn file_limit_full_pages_request_pacing_only_with_queued_work_and_allowed_power(
             )
             .unwrap();
         }
-        let (_, mut scan, _) = E2ScanFixture::default().scan_other_page(
-            SnapshotSource::Pi,
-            &[root],
-            &home,
-            ScanIndex::default(),
-            true,
-            2,
-            &[],
+        let ((_, mut scan, _), rows) = crate::local_resource_diagnostics::capture(|| {
+            E2ScanFixture::default().scan_other_page(
+                SnapshotSource::Pi,
+                &[root],
+                &home,
+                ScanIndex::default(),
+                true,
+                2,
+                &[],
+            )
+        });
+        let page = rows
+            .iter()
+            .find(|row| row["stage"] == "native_collection_page")
+            .unwrap();
+        assert_eq!(page["counts"]["routine_recensus"], scan.routine_recensus);
+        assert_eq!(
+            page["counts"]["page_file_limit_hit"],
+            scan.page_file_limit_hit
+        );
+        assert_eq!(
+            page["counts"]["pending_work"],
+            scan.census_status.pending_work
         );
         assert_eq!(scan.backfill_file_limit, 2);
         assert_eq!(scan.scanned_file_count, files.min(2));

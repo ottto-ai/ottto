@@ -316,6 +316,9 @@ flags. This paces work without dropping data or claiming a hard process-memory b
 resident deferral, or a selection that filled its file allowance while source work remains queued,
 requests another ordinary pass after 30 seconds on AC or 180 seconds on battery with Low Power
 Mode off. Unknown power and Low Power Mode retain ordinary cadence.
+A same-process re-walk after completion, a clean-follow-up retirement or a terminal
+unhealthy retry keeps routine cadence; resident deferral can still request pacing.
+The routine marker is process-local and binds the scan context and census window.
 Prepare, finish, server minima, upload backoff and background QoS still apply.
 
 ## SQLite
