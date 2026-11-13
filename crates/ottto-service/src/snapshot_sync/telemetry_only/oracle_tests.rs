@@ -571,6 +571,18 @@ fn carriers() {
         if kind != "forks" {
             let mut index = saved.clone();
             assert!(index.re_owe_effective_upload_body_witness_revision(path.to_str().unwrap(), 2));
+            // An accepted same-session holder now proves the twin's copy.
+            // Compare paged and full reads from that same accepted state.
+            let corrected = (kind == "twin").then(|| {
+                let mut state = progress();
+                let reference = retained(&c, &mut state, index.clone(), 100);
+                let copy = body(&reference, COPY).unwrap();
+                assert_eq!(
+                    (copy.request_count, copy.removed_request_count),
+                    (1, Some(1))
+                );
+                send(&reference, &mut state, Mode::ColdFull)
+            });
             let mut fresh = progress();
             let other = retained(&c, &mut fresh, index, 1);
             assert_eq!(
@@ -587,7 +599,12 @@ fn carriers() {
             if kind == "resume" {
                 assert!(body(&other, THIRD).is_none(), "resumed holder is off-page");
             }
-            paged(&cold, &other, &mut fresh, (&cold, &p));
+            paged(
+                corrected.as_ref().unwrap_or(&cold),
+                &other,
+                &mut fresh,
+                (&cold, &p),
+            );
         }
         if kind == "correction" {
             assert_eq!(cases::relay_append(&c, &[ROOT]), (1, 1));
