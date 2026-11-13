@@ -1484,9 +1484,8 @@ fn e2_pipeline_unlisted_twin_resume_counts_copied_requests_once() {
     }
 }
 
-/// [money] Forward only: an unlisted writer's resume whose own turns start
-/// before the cutoff keeps the count it had (its copied prefix counted on
-/// both paths), also once it grows past the cutoff.
+/// [money] A same-session accepted holder supersedes the old forward-only
+/// cutoff. Growth declares and removes the earlier copied request.
 #[test]
 fn e2_pipeline_unlisted_twin_resume_before_cutoff_keeps_its_count() {
     with_e2(|| {
@@ -1513,7 +1512,7 @@ fn e2_pipeline_unlisted_twin_resume_before_cutoff_keeps_its_count() {
         literal(&grown);
         assert_eq!(
             (total(&grown), grown.scan.snapshots[0].removed_request_count),
-            (4, Some(0))
+            (3, Some(1))
         );
         assert_eq!(copy_diag(&["copy_prefix_twin_page_removed"]), [0]);
     });
@@ -2425,10 +2424,10 @@ fn e2_pipeline_orphan_branch_copy_counts_once_and_discloses() {
 }
 
 /// [money] Restored same-session path twins, every line pre-birth: no own
-/// turn, so no request-id proof (another session's holder or the page
-/// proof). Both paths count r1 and disclose it, in either discovery order
-/// and for equal births; an unchanged repeated page emits nothing, and a
-/// later turn counts once.
+/// turn or accepted session yet, so both initially count r1 and disclose
+/// it. Once the summed body is accepted, the earlier file proves the copy
+/// regardless of the ACK carrier, discovery order or equal-birth tie break.
+/// An unchanged page emits nothing; growth declares the prior removal.
 fn restored_twins(reverse: bool, equal: bool) {
     with_e2(|| {
         let mut c = Corpus::new(&format!("e2-pipeline-restored-{reverse}-{equal}"));
@@ -2492,9 +2491,10 @@ fn restored_twins(reverse: bool, equal: bool) {
         literal(&changed);
         assert_eq!(
             total(&changed),
-            3,
-            "restart and repeated page cannot change the total; the new response counts once"
+            2,
+            "accepted same-session history counts once in every discovery/birth order"
         );
+        assert_eq!(body(&changed, ROOT).unwrap().removed_request_count, Some(1));
     });
 }
 #[test]
@@ -3506,7 +3506,7 @@ pub(in crate::snapshot_sync) mod money_equivalence_tests {
     mod lease_touch_oracle_tests {
         include!("lease_touch_oracle_tests.rs");
     }
-    mod copy_prefix_route_tests {
+    pub(in crate::snapshot_sync) mod copy_prefix_route_tests {
         include!("copy_prefix_route_tests.rs");
     }
     mod copy_route_oracle_tests {
@@ -5524,3 +5524,5 @@ fn e2_pipeline_recorded_removal_stands_when_its_holder_leaves_the_index() {
 }
 
 mod desktop_depth_tests;
+
+mod copied_session_file_tests;

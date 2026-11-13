@@ -238,7 +238,7 @@ fn identical_family_and_idless_copies() {
 fn occurrence_boundary_counts_unusable_and_old_copies() {
     with_e2(|| {
         for (name, clock, counted, removed) in [
-            ("before", "2026-11-04T23:59:59.999999999Z", 2, 2),
+            ("before", "2026-11-04T23:59:59.999999999Z", 1, 3),
             ("equal", START, 1, 3),
             ("after", TURN, 1, 3),
             ("missing", "", 2, 2),
@@ -648,72 +648,72 @@ fn identity_incomplete_continuation_keeps_native_source_proof() {
 /// estimated evidence gap and a tagged row match one-home placement.
 #[test]
 fn positive_placement_matches_one_home() {
-    with_e2(|| {
-        let c = twins("subagent-twin-positive", false, TURN, false, true);
-        let actual = routes(&c);
-        assert!(accounts(&actual).len() >= 2);
-        // After an exact ACK, a main-only append carries every child's
-        // accepted body and placement (switch, side call, gap, tagged row).
-        let (session, index) = StateV2ColdSession::publish(
-            Source::Claude,
-            &ScanIndex::default(),
-            &c.base.join("state-main-only"),
-        );
-        let first = page(&c, index, 100, true);
-        let carried = acked(&first);
-        let prior = commit(&session, first);
-        let main = c.root.join(format!("z/{ROOT}.jsonl"));
-        let original = std::fs::read_to_string(&main).unwrap();
-        append(&main, &line(ROOT, "main-only", GROW, 8));
-        let warm = hinted(&c, prior, 100, true, std::slice::from_ref(&main));
-        assert_main_only(&c, &warm, &carried, Mode::Ram);
-        std::fs::write(&main, original).unwrap();
-        assert_eq!(actual.snapshots[&child(0)]["removed_request_count"], 5);
-        assert_eq!(
-            actual.snapshots[&child(0)]["removed_usage"]["input_tokens"],
-            77
-        );
-        assert_eq!(
-            actual.snapshots[&child(0)]["cost"]["total_cost_usd"],
-            "0.00067"
-        );
-        let mut one = corpus("subagent-twin-positive-one-home");
-        for agent in 0..3 {
-            let text = std::fs::read_to_string(c.root.join(member("a", agent))).unwrap();
-            let text = if agent == 0 {
-                // A kept pre-boundary copy has no own login row before it, so it
-                // takes the session's starting account, as z's kept "old" does.
-                let (fork, rest) = text.split_once('\n').unwrap();
-                format!("{fork}\n{}{rest}", line(ROOT, "old-copy", AT, 6))
-                    + &line(ROOT, "copy-own", GROW, 13)
-            } else {
-                text
-            };
-            one.write_at(&member("a", agent), &text, "2026-11-04T07:00:00Z");
-        }
-        let text = std::fs::read_to_string(c.root.join(format!("z/{ROOT}.jsonl"))).unwrap();
-        one.write_at(&format!("a/{ROOT}.jsonl"), &text, "2026-11-04T07:00:00Z");
-        // Reuse the same synthetic evidence, with independent native transcript reads.
-        one.support = c.support.clone();
-        let single = cold(&one);
-        money_oracle::assert_placement_equivalent(&single, &actual);
-        for (id, expected) in &single.snapshots {
-            let got = &actual.snapshots[id];
-            for field in [
-                "input_tokens",
-                "output_tokens",
-                "cache_read_tokens",
-                "cache_creation_5m_tokens",
-                "cache_creation_1h_tokens",
-                "reasoning_output_tokens",
-                "unattributed_total_tokens",
-                "request_count",
-                "cost",
-            ] {
-                assert_eq!(expected.get(field), got.get(field), "{id}/{field}");
+    for reverse in [false, true] {
+        with_e2(|| {
+            let (old, new) = if reverse { ("z", "a") } else { ("a", "z") };
+            let c = twins("subagent-twin-positive", reverse, TURN, false, true);
+            let actual = routes(&c);
+            assert!(accounts(&actual).len() >= 2);
+            // After an exact ACK, a main-only append carries every child's
+            // accepted body and placement (switch, side call, gap, tagged row).
+            let (session, index) = StateV2ColdSession::publish(
+                Source::Claude,
+                &ScanIndex::default(),
+                &c.base.join("state-main-only"),
+            );
+            let first = page(&c, index, 100, true);
+            let carried = acked(&first);
+            let prior = commit(&session, first);
+            let main = c.root.join(format!("{new}/{ROOT}.jsonl"));
+            let original = std::fs::read_to_string(&main).unwrap();
+            append(&main, &line(ROOT, "main-only", GROW, 8));
+            let warm = hinted(&c, prior, 100, true, std::slice::from_ref(&main));
+            assert_main_only(&c, &warm, &carried, Mode::Ram);
+            std::fs::write(&main, original).unwrap();
+            assert_eq!(actual.snapshots[&child(0)]["removed_request_count"], 6);
+            let oracle = cold(&c);
+            assert_eq!(
+                actual.snapshots[&child(0)]["removed_usage"],
+                oracle.snapshots[&child(0)]["removed_usage"]
+            );
+            assert_eq!(
+                actual.snapshots[&child(0)]["cost"],
+                oracle.snapshots[&child(0)]["cost"]
+            );
+            let mut one = corpus("subagent-twin-positive-one-home");
+            for agent in 0..3 {
+                let text = std::fs::read_to_string(c.root.join(member(old, agent))).unwrap();
+                let text = if agent == 0 {
+                    text + &line(ROOT, "copy-own", GROW, 13)
+                } else {
+                    text
+                };
+                one.write_at(&member("a", agent), &text, "2026-11-04T07:00:00Z");
             }
-        }
-    });
+            let text = std::fs::read_to_string(c.root.join(format!("{new}/{ROOT}.jsonl"))).unwrap();
+            one.write_at(&format!("a/{ROOT}.jsonl"), &text, "2026-11-04T07:00:00Z");
+            // Reuse the same synthetic evidence, with independent native transcript reads.
+            one.support = c.support.clone();
+            let single = cold(&one);
+            money_oracle::assert_placement_equivalent(&single, &actual);
+            for (id, expected) in &single.snapshots {
+                let got = &actual.snapshots[id];
+                for field in [
+                    "input_tokens",
+                    "output_tokens",
+                    "cache_read_tokens",
+                    "cache_creation_5m_tokens",
+                    "cache_creation_1h_tokens",
+                    "reasoning_output_tokens",
+                    "unattributed_total_tokens",
+                    "request_count",
+                    "cost",
+                ] {
+                    assert_eq!(expected.get(field), got.get(field), "{id}/{field}");
+                }
+            }
+        });
+    }
 }
 
 /// [format] Replay before upload, recover an exact ACK before save,
@@ -798,8 +798,8 @@ fn restart_boundaries_and_quiet_settlement() {
     });
 }
 
-/// [money] A doubled pre-boundary accepted child stays doubled, including
-/// after new eligible shared work: the accepted prefix is never corrected.
+/// [money] All-copy pre-boundary history stays singular after acceptance.
+/// A quiet/main-only page carries its exact body; new shared work adds once.
 #[test]
 fn accepted_pre_boundary_body_keeps_its_count_and_witness() {
     with_e2(|| {
@@ -810,7 +810,7 @@ fn accepted_pre_boundary_body_keeps_its_count_and_witness() {
             &c.base.join("state"),
         );
         let first = page(&c, index, 100, true);
-        assert_eq!(body(&first, &child(0)).unwrap().request_count, 2);
+        assert_eq!(body(&first, &child(0)).unwrap().request_count, 1);
         let mut before = result(&first, Mode::ColdFull);
         accepted(&mut before, &first.scan.snapshots);
         let prior = commit(&session, first);
@@ -818,9 +818,9 @@ fn accepted_pre_boundary_body_keeps_its_count_and_witness() {
         assert!(quiet.scan.snapshots.is_empty());
         let main = c.root.join(format!("z/{ROOT}.jsonl"));
         append(&main, &line(ROOT, "main-only", GROW, 8));
-        // The doubled child is not re-sent; its accepted body equals cold.
+        // The singular child is not re-sent; its accepted body equals cold.
         let main_only = hinted(&c, prior, 100, true, &[main]);
-        assert_eq!(before.accepted[&child(0)].body["request_count"], 2);
+        assert_eq!(before.accepted[&child(0)].body["request_count"], 1);
         assert_main_only(&c, &main_only, &before.accepted, Mode::Ram);
         let prior = commit(&session, main_only);
         for home in ["a", "z"] {
@@ -833,8 +833,8 @@ fn accepted_pre_boundary_body_keeps_its_count_and_witness() {
         let grown = hinted(&c, prior, 100, true, &[path]);
         assert_eq!(
             body(&grown, &child(0)).unwrap().request_count,
-            3,
-            "old prefix twice, eligible new request once"
+            2,
+            "all-copy old prefix once, eligible new request once"
         );
         let expected = cold(&c);
         money_oracle::assert_equivalent(&expected, &result(&grown, Mode::Restart));

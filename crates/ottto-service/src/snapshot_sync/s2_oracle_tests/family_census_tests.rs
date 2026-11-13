@@ -334,8 +334,8 @@ fn stale_family_proof_preserves_two_account_placement_and_twin_order() {
             .unwrap()
             .is_empty());
         money_oracle::assert_equivalent(&cold, &actual);
-        // A same-member path twin whose old first response has no earlier
-        // eligible page holder is restored by the twin rule before family dedup.
+        // A byte-identical all-copy path twin keeps its pre-cutoff skips;
+        // distinct child responses and the side call still count once.
         c.write_at(
             &format!("other/{ROOT}.jsonl"),
             &line(ROOT, "fork", AT, 10),
@@ -347,10 +347,21 @@ fn stale_family_proof_preserves_two_account_placement_and_twin_order() {
             "2026-08-02T07:00:30Z",
         );
         let twins = page(&c, ScanIndex::default(), 100, false);
+        let twin_body = body(&twins, &child()).unwrap();
         assert_eq!(
-            body(&twins, &child()).unwrap().removed_request_count,
-            Some(2),
-            "both family copies removed after native twin restoration"
+            twin_body.removed_request_count,
+            Some(5),
+            "all-copy twin: both homes' copies removed once; distinct requests counted once"
+        );
+        assert_eq!(
+            twin_body.request_count,
+            cold.snapshots[&child()]["request_count"].as_u64().unwrap(),
+            "all-copy twin counts the same requests as the single-home cold child"
+        );
+        assert_eq!(
+            twin_body.request_count + twin_body.removed_request_count.unwrap(),
+            2 * text.lines().count() as u64 + 1,
+            "both homes' transcript occurrences plus the telemetry side call are conserved"
         );
         let twin_route = result(&twins, Mode::ColdFull);
         let restored = page(&c, ScanIndex::default(), 100, true);
