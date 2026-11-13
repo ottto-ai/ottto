@@ -32,6 +32,12 @@ impl CloudCliFixture {
                 "/bin/cat {}\nexit {exit_code}\n",
                 quote(&root.join("output"))
             )
+        } else if mode == "ignore-term" {
+            format!(
+                "trap \"echo TERM >> {}\" TERM\necho $$ > {}\nwhile :; do /bin/sleep 0.1; done\n",
+                quote(&root.join("signals")),
+                quote(&root.join("direct")),
+            )
         } else if mode == "escape" {
             format!(
                 "echo $$ > {}\nexport OTTTO_CLOUD_CLI_FIXTURE_DIR={}\n{} --ignored --exact cloud_sessions::tests::cloud_cli_fixture_process --nocapture --test-threads=1 &\nwhile [ ! -s {} ]; do /bin/sleep 0.01; done\nexit 0\n",
@@ -203,6 +209,34 @@ fn cloud_cli_escaped_writer_cannot_hold_deadline_or_kill_other_groups() {
     assert!(CloudCliFixture::alive(fixture.pid("descendant")));
     fs::write(fixture.root.join("release"), []).unwrap();
     fixture.wait_gone("descendant");
+}
+
+/// [regress] A `codex cloud list` past its deadline may be refreshing its
+/// login: it gets the drain, then SIGTERM and the grace time, and only then
+/// SIGKILL.
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn cloud_cli_past_its_deadline_gets_term_before_kill() {
+    let fixture = CloudCliFixture::new("ignore-term", &[], 0);
+    let drain = Duration::from_secs(1);
+    let started = Instant::now();
+    let result = crate::agent_status::with_codex_app_server_test_timeouts(
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+        drain,
+        || CodexCloudCliRunner.list_page_bounded(None, PAGE_LIMIT, Duration::from_secs(1)),
+    );
+    assert!(result.unwrap_err().to_string().contains("timed out"));
+    assert!(
+        started.elapsed() >= Duration::from_secs(1) + drain + crate::codex_sign_in::TERMINATE_GRACE
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("signals")).unwrap(),
+        "TERM\n"
+    );
+    fixture.wait_gone("direct");
 }
 
 fn stores(name: &str) -> (PathBuf, CloudSessionGrantStore, CloudSessionCheckpointStore) {

@@ -35,7 +35,7 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
@@ -1842,15 +1842,30 @@ impl CloudSessionTransport for RelayCloudSessionTransport {
 }
 pub struct CodexCloudCliRunner;
 
+/// One Codex CLI child (`codex cloud list`, the limits probe's `codex
+/// app-server`), started by `Command::process_group(0)` as the leader of its
+/// own group, owned until it is stopped and reaped.
 #[cfg(unix)]
-struct CodexCloudChild {
+pub(crate) struct CodexChild {
     child: Option<crate::local_resource_diagnostics::cli_children::MeasuredChild>,
 }
 
 #[cfg(unix)]
-impl CodexCloudChild {
-    fn exited(&self) -> std::io::Result<bool> {
-        let child = self.child.as_ref().expect("owned cloud child");
+impl CodexChild {
+    pub(crate) fn new(
+        child: crate::local_resource_diagnostics::cli_children::MeasuredChild,
+    ) -> Self {
+        Self { child: Some(child) }
+    }
+
+    /// The child's stdin and stdout pipes.
+    pub(crate) fn take_pipes(&mut self) -> (Option<ChildStdin>, Option<ChildStdout>) {
+        let child = self.child.as_mut().expect("owned codex child");
+        (child.stdin.take(), child.stdout.take())
+    }
+
+    pub(crate) fn exited(&self) -> std::io::Result<bool> {
+        let child = self.child.as_ref().expect("owned codex child");
         // Observe exit without reaping: reserve the PID until the owned process
         // group has been stopped, even if a descendant retains stdout.
         let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
@@ -1872,18 +1887,40 @@ impl CodexCloudChild {
         Ok(info.si_signo != 0)
     }
 
-    fn stop_and_reap(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        let mut child = self.child.take().expect("owned cloud child");
+    /// Whether the child exits within `limit`.
+    fn exits_within(&self, limit: Duration) -> bool {
+        let until = Instant::now() + limit;
+        while !self.exited().unwrap_or(false) {
+            if Instant::now() >= until {
+                return false;
+            }
+            thread::sleep(crate::codex_sign_in::POLL_INTERVAL);
+        }
+        true
+    }
+
+    /// Ends the child without cutting off a login refresh it may be making.
+    /// The caller has closed its stdin (or it had none). It gets
+    /// [`crate::agent_status::codex_child_drain`] to exit by itself, then
+    /// SIGTERM and the grace time of a stopped sign-in, then SIGKILL; the
+    /// group goes last either way (a descendant may hold its output).
+    pub(crate) fn stop_and_reap(&mut self) -> std::io::Result<std::process::ExitStatus> {
         // Command::process_group(0) created this group; the direct child has
         // never been reaped, so its PID cannot have been reused by another group.
-        unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+        let group = -(self.child.as_ref().expect("owned codex child").id() as libc::pid_t);
+        if !self.exits_within(crate::agent_status::codex_child_drain()) {
+            unsafe { libc::kill(group, libc::SIGTERM) };
+            self.exits_within(crate::codex_sign_in::TERMINATE_GRACE);
+        }
+        let mut child = self.child.take().expect("owned codex child");
+        unsafe { libc::kill(group, libc::SIGKILL) };
         let _ = child.kill();
         child.wait()
     }
 }
 
 #[cfg(unix)]
-impl Drop for CodexCloudChild {
+impl Drop for CodexChild {
     fn drop(&mut self) {
         if self.child.is_some() {
             let _ = self.stop_and_reap();
@@ -1925,18 +1962,13 @@ fn run_codex_cloud_command(command: &mut Command, deadline: Instant) -> Result<S
         return Err(anyhow!("Codex cloud list timed out"));
     }
     command.process_group(0);
-    let mut owned = CodexCloudChild {
-        child: Some(
-            crate::local_resource_diagnostics::cli_children::spawn(command)
-                .map_err(|_| anyhow!("Codex cloud list could not be started"))?,
-        ),
-    };
+    let mut owned = CodexChild::new(
+        crate::local_resource_diagnostics::cli_children::spawn(command)
+            .map_err(|_| anyhow!("Codex cloud list could not be started"))?,
+    );
     let stdout = owned
-        .child
-        .as_mut()
-        .expect("owned cloud child")
-        .stdout
-        .take()
+        .take_pipes()
+        .1
         .ok_or_else(|| anyhow!("Codex cloud list stdout could not be opened"))?;
     let flags = unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_GETFL) };
     if flags < 0
@@ -2061,15 +2093,20 @@ impl CloudSessionRunner for CodexCloudCliRunner {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        // One Codex child per home: never beside a limits read of the same
+        // home, which may be refreshing its login.
         #[cfg(unix)]
         {
-            let started = Instant::now();
-            let result = run_codex_cloud_command(&mut command, deadline);
-            // A deadline already spent starts nothing.
-            if started < deadline {
-                record_codex_cloud_list(&result, started);
-            }
-            result
+            let home = crate::agent_status::codex_cli_home();
+            crate::agent_status::with_codex_home_read_lock(&home, || {
+                let started = Instant::now();
+                let result = run_codex_cloud_command(&mut command, deadline);
+                // A deadline already spent starts nothing.
+                if started < deadline {
+                    record_codex_cloud_list(&result, started);
+                }
+                result
+            })
         }
         #[cfg(not(unix))]
         {

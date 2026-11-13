@@ -24,18 +24,24 @@ const SIX_HOURS: u64 = 6 * 60 * 60;
 
 /// While held, the command search finds no `codex`: the status collection
 /// runs no CLI against the scratch homes.
-struct NoCodexCli(Option<std::ffi::OsString>, crate::test_scratch::ScratchDir);
+struct NoCodexCli {
+    previous: Option<std::ffi::OsString>,
+    _empty: crate::test_scratch::ScratchDir,
+}
 
 fn no_codex_cli() -> NoCodexCli {
     let empty = crate::test_scratch::ScratchDir::new("codex-login-no-cli");
     let previous = std::env::var_os("OTTTO_COMMAND_SEARCH_PATH");
     unsafe { std::env::set_var("OTTTO_COMMAND_SEARCH_PATH", empty.as_os_str()) };
-    NoCodexCli(previous, empty)
+    NoCodexCli {
+        previous,
+        _empty: empty,
+    }
 }
 
 impl Drop for NoCodexCli {
     fn drop(&mut self) {
-        match self.0.take() {
+        match self.previous.take() {
             Some(previous) => unsafe { std::env::set_var("OTTTO_COMMAND_SEARCH_PATH", previous) },
             None => unsafe { std::env::remove_var("OTTTO_COMMAND_SEARCH_PATH") },
         }

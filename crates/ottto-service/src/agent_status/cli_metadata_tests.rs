@@ -201,7 +201,6 @@ fn cli_metadata_identity_text_stays_fresh() {
             "2026-08-26T00:15:00Z".to_string(),
             &home,
             CodexHomeTrust::ProviderDefault,
-            CodexLoginRefresh::Never,
             CodexQuotaRead::Saved,
         );
         let account = snapshot.account.unwrap();
@@ -246,7 +245,6 @@ fn cli_metadata_complete_auth_matches_legacy_merge() {
             "2026-08-26T00:15:00Z".to_string(),
             &home,
             CodexHomeTrust::ProviderDefault,
-            CodexLoginRefresh::Never,
             CodexQuotaRead::Saved,
         );
         assert_eq!(snapshot.account.as_ref(), Some(&expected));
@@ -384,7 +382,6 @@ fn cli_metadata_cache_hit_skips_spawn() {
                         "2026-08-26T00:15:00Z".to_string(),
                         &home,
                         CodexHomeTrust::ProviderDefault,
-                        CodexLoginRefresh::Never,
                         CodexQuotaRead::Saved,
                     );
                     assert_eq!(
@@ -445,7 +442,6 @@ fn cli_metadata_stderr_login_status_is_cached() {
             "2026-08-26T00:15:00Z".to_string(),
             &home,
             CodexHomeTrust::ProviderDefault,
-            CodexLoginRefresh::Never,
             CodexQuotaRead::Saved,
         );
         serde_json::to_value((&snapshot.account, &snapshot.model, &snapshot.status)).unwrap()
