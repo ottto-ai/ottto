@@ -65,8 +65,9 @@ use codex_saved_quota::{path_stamp, PathStamp};
 pub(crate) use codex_saved_quota::scheduled_round_now as codex_scheduled_round_now;
 pub use codex_saved_quota::start_codex_quota_scheduler;
 pub(crate) use codex_saved_quota::{
-    refresh_codex_quota_now, saved_codex_quota_generation, stop_codex_quota_scheduler,
-    wake_codex_quota_scheduler, with_codex_home_read_lock, with_codex_home_read_lock_until,
+    adopt_saved_codex_reading, refresh_codex_quota_now, saved_codex_quota_generation,
+    stop_codex_quota_scheduler, wake_codex_quota_scheduler, with_codex_home_read_lock,
+    with_codex_home_read_lock_until,
 };
 #[cfg(test)]
 pub(crate) use codex_setup_gate::SetupGateTestClock;
@@ -2321,7 +2322,9 @@ pub(crate) fn collect_registered_codex_slot_for_setup(
 ) -> Result<(CodexStrongIdentity, CodexAccountSlotCollectionStatusV1), CodexSlotSetupCollectionError>
 {
     let store = FileCodexAccountSlotSettingsStore::default();
-    let home = store.slot_home(slot_id).map_err(|_| {
+    // Where the setup's sign-in saved the new login: a registered slot's
+    // staging home, so its own login is never read as the new one.
+    let home = store.setup_sign_in_home(slot_id).map_err(|_| {
         CodexSlotSetupCollectionError::DurableStateUnavailable(
             "Codex durable connection state is unavailable.".to_string(),
         )
