@@ -58,7 +58,11 @@ pub(crate) fn stop_group_and_reap(
             Ok(_) => thread::sleep(
                 Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
             ),
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error)
+                if error.kind() == io::ErrorKind::Interrupted && Instant::now() < deadline =>
+            {
+                continue;
+            }
             // An already-reaped child's PID is no longer reserved. Never signal it.
             Err(error) if error.raw_os_error() == Some(libc::ECHILD) => return child.reap(),
             // A status-read failure must still stop and reap our owned child.
