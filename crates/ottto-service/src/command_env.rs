@@ -291,12 +291,9 @@ fn cached_shell_provider_env(refresh: bool) -> Option<ShellEnv> {
     let (cache, now) = (&CACHE, Instant::now);
     #[cfg(test)]
     let (cache, now) = (test_shell_env::cache(), test_shell_env::now);
-    let home = env::var_os("HOME");
-    let requested = now();
+    let (home, requested) = (env::var_os("HOME"), now());
     // Hold the lock through the bounded import; waiters share success or failure.
-    let mut cached = cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut cached = cache.lock().unwrap_or_else(|poison| poison.into_inner());
     if cached.as_ref().is_none_or(|(key, at, _)| {
         key != &home
             || now().saturating_duration_since(*at) >= Duration::from_secs(1800)
