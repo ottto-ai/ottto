@@ -2411,7 +2411,7 @@ fn e2_switch_on_rereads_history_once_paced_and_money_rules_reread_only_marked_fi
     use crate::snapshots::claude_request_money::e2::{money_mark, with_money_rules};
     use crate::snapshots::{history_local_count, HistoryLocalCount};
     // Version 2 is #825's zero-mask row, kept for version stability.
-    const RELEASE: &[(u16, u8)] = &[(1, 0), (2, 0), (3, money_mark::ESTIMATED)];
+    const RELEASE: &[(u16, u8)] = &[(1, 0), (2, 0), (4, money_mark::ESTIMATED)];
     let fixture = HistoryFixture::new("e2-switch-on-once");
     let at_two = fixture.baseline_at(2);
     assert!(at_two
@@ -2443,7 +2443,7 @@ fn e2_switch_on_rereads_history_once_paced_and_money_rules_reread_only_marked_fi
             assert!(again.uploaded.is_empty());
             let index = &again.index;
             let store = &index.claude_money_birth_store;
-            assert_eq!(store.money_rule_version(), 2);
+            assert_eq!(store.money_rule_version(), 3);
             let estimated = money_mark::DISCLOSED | money_mark::ESTIMATED;
             for (session, marks) in
                 HISTORY_SESSIONS
@@ -2468,7 +2468,7 @@ fn e2_switch_on_rereads_history_once_paced_and_money_rules_reread_only_marked_fi
                     .iter()
                     .all(|(uploaded, _)| !uploaded.contains(HISTORY_SESSIONS[0])));
                 let index = &done.index;
-                assert_eq!(index.claude_money_birth_store.money_rule_version(), 3);
+                assert_eq!(index.claude_money_birth_store.money_rule_version(), 4);
                 assert!(index
                     .files
                     .values()

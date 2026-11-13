@@ -96,6 +96,31 @@ file-system hint / periodic listing → select file → read new bytes from save
   provider-skill facts merge before their existing projection; changed files stay distinct and artifacts
   use the existing union. Continuous plain groups
   retain their existing replay path; no admitted-key ledger is persisted.
+- **Claude copied history.** Earlier accepted main files prove pre-birth
+  copies within the same session, or through the in-folder holder's session
+  across folders. Same-session proof uses the session's accepted body,
+  regardless of which file carried it; cross-session proof requires that
+  file's acceptance. Stored self-removals never prove another copy. An origin
+  only under an unrelated session elsewhere leaves its copy counted.
+  The original in-folder census wait still expires on its third decision.
+  An all-covered copy-only page drops its items when the session has another
+  file; own turns still publish. A selected content twin pulls at most its
+  earliest accepted main holder. Frozen seeds prevent cascading pulls, and
+  ordinary discovery acquires the holder without an extra seed content read.
+  Money rule three selects content twins, path twins and disclosed main
+  files once, using every census hash and one in-memory census walk without
+  a deadline. Only a candidate sharing ids with an earlier accepted holder
+  and that holder are re-owed, with the rule version stamped in the same save.
+  Disclosed main files include cross-session resumes whose own path and
+  content identity would otherwise leave their counted prefix unchanged.
+  Subagent path-twin homes sharing census ids are both selected once, for
+  all-copy and prefix copies. The selector and mid-page holder lookup record
+  elapsed milliseconds; holder pulls also record a scalar count.
+  A subagent twin keeps skips held by an earlier same-session fold before
+  its first own response, regardless of the subagent cutoff or file birth.
+  Unmatched responses are own turns, including those before birth. Shared
+  responses after the first own turn keep the existing cutoff decision.
+
 - **Upload.** A session is uploaded as a whole-session replacement, idempotent at the receiver. It
   settles only on an exact acknowledgement of the exact bytes sent to that destination. A local
   receipt never counts as an acknowledgement; refused, not-stored and partial answers are not

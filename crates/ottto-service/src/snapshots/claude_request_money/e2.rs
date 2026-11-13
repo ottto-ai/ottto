@@ -127,7 +127,7 @@ pub(crate) fn without_diag<T>(f: impl FnOnce() -> T) -> T {
     value
 }
 #[inline(always)]
-fn diag(reason: &'static str, n: u64) {
+pub(in crate::snapshots) fn diag(reason: &'static str, n: u64) {
     #[cfg(test)]
     if n > 0 {
         DIAG.with(|diag| *diag.borrow_mut().entry(reason).or_default() += n);
@@ -283,7 +283,7 @@ pub(crate) const RULE_EPOCH: u8 = 2;
 /// re-owed (once, under the history budget); never a revision bump, which
 /// re-reads the whole history. Version 2 re-owes nothing (#825 seeded its
 /// retired permit mark there); it stays so stored versions keep their meaning.
-const MONEY_RULES: &[(u16, u8)] = &[(1, 0), (2, 0)];
+const MONEY_RULES: &[(u16, u8)] = &[(1, 0), (2, 0), (3, 0)];
 #[cfg(test)]
 thread_local! {
     static TEST_MONEY_RULES: std::cell::Cell<Option<&'static [(u16, u8)]>> =
@@ -454,6 +454,37 @@ pub(crate) fn apply_money_rules(index: &mut ScanIndex) {
         }
         live.push(location);
     }
+    if stored < 3 && rules.iter().any(|&(version, _)| version == 3) {
+        let start = Instant::now();
+        let twins = claude_path_twin_groups(index, &BTreeSet::new());
+        let candidates = index.files.keys().filter(|key| {
+            claude_index_path_member_ref(Path::new(key)).is_some_and(|member| {
+                member.subagent_stem.is_none()
+                    && (index
+                        .claude_request_census
+                        .get(key)
+                        .is_some_and(|r| r.is_twin())
+                        || path_twins(&twins, member.root).is_some()
+                        // A cross-session resume can have its own path and
+                        // content identity; its counted unproven prefix is
+                        // the evidence that selects the correction once.
+                        || index.claude_money_birth_store.money_marks(location_key(key))
+                            & money_mark::DISCLOSED != 0)
+            })
+        });
+        let selected = copied_file_holders(index, candidates.map(String::as_str));
+        let mut reowed = subagent_twin_files(index, &twins);
+        diag(
+            "money_rule_v3_selector_ms",
+            start.elapsed().as_millis() as u64,
+        );
+        for (copy, holder) in selected {
+            reowed.insert(copy);
+            reowed.insert(holder);
+        }
+        diag("money_rule_v3_reowed", reowed.len() as u64);
+        owed.extend(reowed);
+    }
     for key in owed {
         index.re_owe_effective_upload_body_witness_revision(&key, to);
     }
@@ -461,6 +492,46 @@ pub(crate) fn apply_money_rules(index: &mut ScanIndex) {
     let store = &mut index.claude_money_birth_store;
     store.retain_money_marks(&live);
     store.set_money_rule_version(current);
+}
+
+/// Subagent path twins need no main-holder walk: their indexed census
+/// overlap selects both homes for one co-read, including copied prefixes.
+fn subagent_twin_files(index: &ScanIndex, twins: &ClaudeTwinGroups) -> BTreeSet<String> {
+    let mut owed = BTreeSet::new();
+    for homes in twins.values() {
+        if !homes.first().is_some_and(|(key, _)| {
+            claude_index_path_member_ref(Path::new(key))
+                .is_some_and(|member| member.subagent_stem.is_some())
+        }) {
+            continue;
+        }
+        for (at, (key, _)) in homes.iter().enumerate() {
+            let Some(record) = index
+                .claude_request_census
+                .get(key)
+                .filter(|r| r.proves_scan())
+            else {
+                continue;
+            };
+            for (other, _) in &homes[..at] {
+                let Some(holder) = index
+                    .claude_request_census
+                    .get(other)
+                    .filter(|r| r.proves_scan())
+                else {
+                    continue;
+                };
+                for &hash in record.request_hashes() {
+                    if holder.holds_hash(hash) {
+                        owed.insert(key.clone());
+                        owed.insert(other.clone());
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    owed
 }
 
 /// Fixed count-only causes of the existing certificate veto.
@@ -1836,8 +1907,8 @@ fn skipped_ids(item: &SnapshotItem) -> impl Iterator<Item = &String> + '_ {
 /// entry's fingerprint. Requests no current revision holds count and are
 /// disclosed. What cannot be decided yet (the proof file not read at its
 /// current revision, a holder not indexed yet, the census walk deadline)
-/// defers the unresolved prefix; own turns emit. The third decision pass
-/// emits any still-unproven prefix flagged. All the
+/// defers the unresolved prefix; own turns emit. Each decision pass ages
+/// the bounded proof wait, including an in-folder deadline. All the
 /// page's cross-session checks share ONE census walk. Runs in both gate
 /// modes; dark only counts. Returns the removals to store (gate on only):
 /// the caller applies them to the index (`CopyRemovalUpdates::apply`).
@@ -2044,6 +2115,100 @@ fn indexed_main_files(index: &ScanIndex) -> BTreeMap<LocationKey, &str> {
         .collect()
 }
 
+/// Earliest accepted positive holder before this file. Rule A supplies
+/// session acceptance; other callers supply each file's own acceptance.
+fn earliest_accepted_holder<'a>(
+    index: &ScanIndex,
+    hash: u64,
+    before: (i128, LocationKey),
+    candidates: impl Iterator<Item = (&'a str, &'a str, bool)>,
+) -> Option<(i128, LocationKey)> {
+    candidates
+        .filter(|&(_, _, accepted)| accepted)
+        .filter_map(|(key, root, _)| census_holder(index, key, root, hash))
+        .filter(|&holder| holder < before)
+        .min()
+}
+
+/// Positive id and order evidence, independent of which same-session file
+/// carried the accepted summed body. Cross-session callers still use
+/// per-file acceptance when selecting candidates.
+fn census_holder(
+    index: &ScanIndex,
+    key: &str,
+    root: &str,
+    hash: u64,
+) -> Option<(i128, LocationKey)> {
+    let record = index.claude_request_census.get(key)?;
+    if !record.proves_scan() || !record.holds_hash(hash) {
+        return None;
+    }
+    let holder = holder_order(&index.claude_money_birth_store, root, key)?;
+    (!index
+        .claude_copy_removals
+        .get(holder.1)
+        .iter()
+        .any(|(_, hashes)| hashes.binary_search(&hash).is_ok()))
+    .then_some(holder)
+}
+
+/// One census-only walk for a fixed seed set. Each seed pulls at most its
+/// earliest accepted main holder; returned holders never become new seeds.
+/// All census hashes participate, so an own turn cannot hide a copied prefix.
+pub(in crate::snapshots) fn copied_file_holders<'a>(
+    index: &ScanIndex,
+    keys: impl Iterator<Item = &'a str>,
+) -> BTreeMap<String, String> {
+    let mut wanted = BTreeMap::<u64, Vec<(&str, (i128, LocationKey))>>::new();
+    for key in keys {
+        let Some(member) =
+            claude_index_path_member_ref(Path::new(key)).filter(|m| m.subagent_stem.is_none())
+        else {
+            continue;
+        };
+        let Some(order) = holder_order(&index.claude_money_birth_store, member.root, key) else {
+            continue;
+        };
+        let Some(record) = index.claude_request_census.get(key) else {
+            continue;
+        };
+        for &hash in record.request_hashes() {
+            wanted.entry(hash).or_default().push((key, order));
+        }
+    }
+    let union = wanted.keys().copied().collect::<Vec<_>>();
+    let mut found = BTreeMap::<String, ((i128, LocationKey), String)>::new();
+    let _ = index.claude_request_census.main_transcript_holders(
+        None,
+        &union,
+        None,
+        |key, root, _, hits| {
+            let accepted = origin_accepted(index, key);
+            for &hash in hits {
+                for &(copy, order) in &wanted[&hash] {
+                    if let Some(holder) = earliest_accepted_holder(
+                        index,
+                        hash,
+                        order,
+                        std::iter::once((key, root, accepted)),
+                    ) {
+                        let entry = found
+                            .entry(copy.to_owned())
+                            .or_insert_with(|| (holder, key.to_owned()));
+                        if holder < entry.0 {
+                            *entry = (holder, key.to_owned());
+                        }
+                    }
+                }
+            }
+        },
+    );
+    found
+        .into_iter()
+        .map(|(copy, (_, holder))| (copy, holder))
+        .collect()
+}
+
 /// A stored removal of `hash` under `holder` (index key): `None` when the
 /// holder is no longer indexed or its census can no longer
 /// answer (retired, over budget or no record), so the stored decision
@@ -2132,15 +2297,18 @@ fn decide_subagent_twins(items: &mut [SnapshotItem], at: usize) {
             })
         })
         .unwrap_or_default();
+    let first_own = first_own_turn(item, 0, &earlier).map(|o| o.sequence);
     let mut kept = 0;
     let uncovered = skipped_ids(item)
         .filter(|id| {
-            let eligible = item.claude_usage_occurrences[*id]
-                .timestamp
-                .as_deref()
-                .and_then(rfc3339_unix_nanos)
-                .expect("native skips have usable provider timestamps")
-                >= SUBAGENT_TWIN_FROM;
+            let eligible = first_own
+                .is_none_or(|own| item.claude_usage_occurrences[*id].sequence < own)
+                || item.claude_usage_occurrences[*id]
+                    .timestamp
+                    .as_deref()
+                    .and_then(rfc3339_unix_nanos)
+                    .expect("native skips have usable provider timestamps")
+                    >= SUBAGENT_TWIN_FROM;
             let held = eligible && earlier.iter().any(|ids| ids.contains(*id));
             kept += u64::from(held);
             !held
@@ -2433,22 +2601,30 @@ pub(in crate::snapshots) fn first_own_turn_at(
     from: u64,
     earlier: &[&BTreeSet<String>],
 ) -> Option<i128> {
+    first_own_turn(item, from, earlier)
+        .and_then(|occurrence| occurrence.timestamp.as_deref())
+        .and_then(rfc3339_unix_nanos)
+}
+
+fn first_own_turn<'a>(
+    item: &'a SnapshotItem,
+    from: u64,
+    earlier: &[&BTreeSet<String>],
+) -> Option<&'a ClaudeTranscriptUsageOccurrence> {
     item.claude_usage_occurrences
         .iter()
         .filter(|(id, occurrence)| {
             occurrence.sequence >= from && !earlier.iter().any(|ids| ids.contains(*id))
         })
         .min_by_key(|(_, occurrence)| occurrence.sequence)
-        .and_then(|(_, occurrence)| occurrence.timestamp.as_deref())
-        .and_then(rfc3339_unix_nanos)
+        .map(|(_, occurrence)| occurrence)
 }
 
 /// One census walk per folder for every copied main file of the page. A
-/// holder proves a request when it is another session's main file in the
-/// copy's folder whose scan state holds it (`scan_evidence`) and earlier in
-/// (effective birth, location). The folder's walk deadline, a queued size
-/// change, a holder modified since its census read, an unscanned
-/// other-session main file of the folder or an unaccepted holder delay it.
+/// Accepted earlier main files prove copies through positive census ids,
+/// including the copy's own session and the in-folder holder's session
+/// across folders. A copy's own stored removals prove nothing. The original
+/// in-folder walk keeps its bounded deadline wait.
 fn decide_holders(
     items: &mut [SnapshotItem],
     folds: &[usize],
@@ -2490,6 +2666,7 @@ fn decide_holders(
         /// Hashes an earlier same-session fold on this page counts
         /// (`twin_page_held`): removed, never stored.
         twin_held: BTreeSet<u64>,
+        holder_sessions: BTreeSet<String>,
     }
     let live = std::cell::OnceCell::<BTreeMap<LocationKey, &str>>::new();
     // The page's folds by session, for the same-session page proof. By
@@ -2570,6 +2747,7 @@ fn decide_holders(
                 unaccepted,
                 parent,
                 folder,
+                holder_sessions: BTreeSet::new(),
             })
         })
         .collect::<Vec<_>>();
@@ -2598,7 +2776,9 @@ fn decide_holders(
             |key, root, record, hits| {
                 // Per holder record, each at most once and only when another
                 // session wants one of its ids: evidence, then (birth, location).
-                let mut holder = None::<Option<(Evidence, (i128, LocationKey), bool)>>;
+                let evidence = scan_evidence(index, key, record);
+                let proven = origin_accepted(index, key);
+                let holder = holder_order(store, root, key).map(|order| (evidence, order, proven));
                 for &hash in hits {
                     let from = wanting.partition_point(|&(wanted, _)| wanted < hash);
                     for &(_, at) in wanting[from..].iter().take_while(|&&(h, _)| h == hash) {
@@ -2606,17 +2786,17 @@ fn decide_holders(
                         if file.session == root {
                             continue;
                         }
-                        let holder = *holder.get_or_insert_with(|| {
-                            let evidence = scan_evidence(index, key, record);
-                            if evidence == Evidence::None {
-                                return None;
-                            }
-                            Some((
-                                evidence,
-                                holder_order(store, root, key)?,
-                                origin_accepted(index, key),
-                            ))
-                        });
+                        if !proven || evidence == Evidence::None {
+                            file.holder_sessions.insert(root.to_owned());
+                        }
+                        if index
+                            .claude_copy_removals
+                            .get(location_key(key))
+                            .iter()
+                            .any(|(_, hashes)| hashes.binary_search(&hash).is_ok())
+                        {
+                            continue;
+                        }
                         match holder {
                             Some((evidence, holder, proven)) if holder < file.order => {
                                 match evidence {
@@ -2644,6 +2824,55 @@ fn decide_holders(
         );
         if walked.is_none() {
             unwalked.insert(folder);
+        }
+    }
+    let on_page = page
+        .iter()
+        .filter_map(|item| item.claude_money.as_deref()?.location_key())
+        .collect::<BTreeSet<_>>();
+    // (A) The copy's own session, then (B) the in-folder holder's
+    // session in every folder. These indexed lookups need no census walk.
+    for file in &mut wanted {
+        // The first discovered path carries a summed session's ACK. Rule A
+        // uses that session acceptance regardless of the carrier's location.
+        let session_accepted = store.observations(&file.session).any(|(location, _)| {
+            live.get_or_init(|| indexed_main_files(index))
+                .get(&location)
+                .is_some_and(|key| origin_accepted(index, key))
+        });
+        for session in std::iter::once(&file.session).chain(file.holder_sessions.iter()) {
+            for (location, _) in store.observations(session) {
+                let Some(&key) = live
+                    .get_or_init(|| indexed_main_files(index))
+                    .get(&location)
+                else {
+                    continue;
+                };
+                for &hash in &file.hashes {
+                    if file.stored.contains(&hash) {
+                        continue;
+                    }
+                    let accepted = if session == &file.session {
+                        session_accepted
+                    } else {
+                        origin_accepted(index, key)
+                    };
+                    if !accepted {
+                        continue;
+                    }
+                    if let Some(holder) = earliest_accepted_holder(
+                        index,
+                        hash,
+                        file.order,
+                        std::iter::once((key, session.as_str(), accepted)),
+                    )
+                    .filter(|h| session != &file.session || !file.resumed || on_page.contains(&h.1))
+                    {
+                        let earliest = file.covered.entry(hash).or_insert(holder);
+                        *earliest = (*earliest).min(holder);
+                    }
+                }
+            }
         }
     }
     let pending = std::cell::OnceCell::new();
@@ -2688,7 +2917,7 @@ fn decide_holders(
         // Only the unresolved prefix waits. Persisted retry debt reselects
         // the file after its own-turn ACK, even when it is unchanged; its
         // third decision emits any remaining unproven requests flagged.
-        if unwalked.contains(&wanted.folder) {
+        if !uncovered.is_empty() && unwalked.contains(&wanted.folder) {
             defer_prefix(
                 &mut items[wanted.at],
                 &uncovered,
@@ -4001,6 +4230,25 @@ pub(crate) fn finish_page(
 
     claude_request_identity::inherit_root_accounts(items, true);
 
+    let mut drop_copies = BTreeMap::<String, bool>::new();
+    for item in items.iter() {
+        if let Some(fold) = item.claude_money.as_deref() {
+            let covered = fold.first_own.is_none()
+                && fold.entity.removed_requests > 0
+                && fold.entity.totals().1 == 0
+                && !fold.entity.held
+                && fold.prefix.held_requests == 0
+                && fold.location_key().is_some_and(|here| {
+                    index
+                        .claude_money_birth_store
+                        .observations(&item.source_session_id)
+                        .any(|(location, _)| location != here)
+                });
+            *drop_copies
+                .entry(item.source_session_id.clone())
+                .or_insert(true) &= covered;
+        }
+    }
     let mut corrected_sessions = BTreeSet::new();
     let mut sessions = BTreeMap::<String, Session>::new();
     for item in items.iter_mut() {
@@ -4144,6 +4392,9 @@ pub(crate) fn finish_page(
     items.retain_mut(|item| {
         if item.claude_money.is_none() {
             return true;
+        }
+        if drop_copies.get(&item.source_session_id) == Some(&true) {
+            return false;
         }
         // One body per session: the first item carries the summed entity.
         // A withheld session keeps every item (twins too) for the hold.
