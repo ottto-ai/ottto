@@ -69,6 +69,56 @@ pub(crate) fn write_saved(home: &Path, body: &str) {
     codex_saved_quota::write_saved_bytes_for_test(home, body);
 }
 
+/// The directory of `home`'s saved file: the saved-quota store's support dir
+/// (a per-process scratch dir unless a test chose one) and the home's key.
+fn saved_dir(home: &Path) -> PathBuf {
+    let support = std::env::var_os("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::temp_dir().join(format!(
+                "ottto-codex-saved-quota-tests-{}",
+                std::process::id()
+            ))
+        });
+    let dir = support
+        .join("codex-quota/homes")
+        .join(codex_saved_quota::home_key(home));
+    assert!(
+        dir.join("saved-quota.json").is_file(),
+        "no saved file where the store keeps it"
+    );
+    dir
+}
+
+/// `home`'s saved file as it is on disk.
+pub(crate) fn saved_bytes(home: &Path) -> Vec<u8> {
+    std::fs::read(saved_dir(home).join("saved-quota.json")).unwrap()
+}
+
+/// What a save of `body` leaves when it stops after writing its temp file and
+/// before the rename (`write_owner_only_cache_file_atomic`): an owner-only
+/// temp file, named as that writer names it, beside the untouched saved file.
+/// `{home_key}` as in [`write_saved`].
+pub(crate) fn interrupt_save(home: &Path, body: &str) {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let before = saved_bytes(home);
+    let temp = saved_dir(home).join(format!(
+        ".saved-quota.json.tmp.{}.{}.0",
+        std::process::id(),
+        current_unix_seconds()
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temp)
+        .unwrap();
+    let body = body.replace("{home_key}", &codex_saved_quota::home_key(home));
+    file.write_all(body.as_bytes()).unwrap();
+    assert_eq!(saved_bytes(home), before, "the saved file is untouched");
+}
+
 /// The collection the Codex status lane publishes for these managed homes,
 /// each read from its saved reading; bindings built as
 /// `collect_codex_status_snapshots` builds them.

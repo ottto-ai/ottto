@@ -18,6 +18,8 @@ use serde_json::json;
 // `codex_probe_confirms_no_identity_when_the_login_switches_during_the_read`);
 // T5's same-login reader sharing needs the quota scheduler, so it is checked
 // at the binding level only; T7's launch block is covered by the launch tests.
+// `Disk` has no durable-restore arm apart from a restarted owner over the
+// committed route, so `Mode::DiskRestore` is not driven separately here.
 
 const LIVE: i64 = 30 * 86_400;
 const EXPIRED: i64 = -3_600;
@@ -140,10 +142,29 @@ type Owners = BTreeMap<String, Option<String>>;
 
 /// Session `id` started in `home` at `at`, with one turn.
 fn start(home: &Path, id: &str, at: &str) -> Session {
+    write_session(home, id, at, json!({}))
+}
+
+/// A side call: a subagent session `parent` spawned in the same home at `at`,
+/// headed as Codex heads a spawned thread (no copied history).
+fn side_call(home: &Path, id: &str, parent: &str, at: &str) -> Session {
+    let source = json!({"subagent":{"thread_spawn":{"parent_thread_id":parent,"depth":1}}});
+    write_session(
+        home,
+        id,
+        at,
+        json!({"thread_source":"subagent","source":source}),
+    )
+}
+
+fn write_session(home: &Path, id: &str, at: &str, header: serde_json::Value) -> Session {
     let stamp = at.replace(':', "-");
     let path = home.join(format!("sessions/rollout-{}-{id}.jsonl", &stamp[..19]));
-    let header = json!({"type":"session_meta","timestamp":at,
-        "payload":{"id":id,"timestamp":at}});
+    let mut payload = json!({"id":id,"timestamp":at});
+    for (key, value) in header.as_object().unwrap() {
+        payload[key] = value.clone();
+    }
+    let header = json!({"type":"session_meta","timestamp":at,"payload":payload});
     std::fs::write(
         &path,
         header.to_string() + "\n" + &rows(id, at, "turn-a", 10),
@@ -154,8 +175,12 @@ fn start(home: &Path, id: &str, at: &str) -> Session {
 }
 
 fn grow(sessions: &[Session]) {
+    grow_by(sessions, "turn-b", 20);
+}
+
+fn grow_by(sessions: &[Session], turn: &str, tokens: u64) {
     for (path, id, at) in sessions {
-        append(path, &rows(id, at, "turn-b", 20));
+        append(path, &rows(id, at, turn, tokens));
         input_clock(path);
     }
 }
@@ -212,6 +237,44 @@ fn tags(scan: &SourceScanResult) -> Owners {
     tags
 }
 
+/// A page's index and scan.
+type Scanned = (ScanIndex, SourceScanResult);
+
+/// `page`'s ACKs land and the daemon commits it; with `walk`, the saved
+/// indexed walk a quiet restart resumes from.
+fn commit_page(
+    disk: &Disk,
+    scanner: &E2ScanFixture,
+    (mut index, scan): Scanned,
+    walk: Option<&[PathBuf]>,
+) -> ScanIndex {
+    let source = SnapshotSource::Codex;
+    index.record_accepted_snapshot_fingerprints(
+        &scan
+            .snapshots
+            .iter()
+            .map(|s| s.snapshot_fingerprint.clone())
+            .collect(),
+    );
+    if let Some(roots) = walk {
+        crate::snapshots::e2_pipeline_scan_fixture::retain_indexed_walk_for_test(
+            &mut index,
+            source,
+            roots,
+            "2026-10-27T08:00:00Z",
+            183,
+        );
+    }
+    let committed = disk.commit(&scanner.cache, source, &mut index);
+    assert!(
+        scan.snapshots
+            .iter()
+            .all(|s| { committed.accepted_snapshot_fingerprint_recorded(&s.snapshot_fingerprint) }),
+        "the page's ACKs are saved"
+    );
+    committed
+}
+
 /// The first page on a fresh owner, accepted and committed.
 fn first_page(
     c: &Corpus,
@@ -220,20 +283,48 @@ fn first_page(
     collected: &AgentStatusCollection,
 ) -> (E2ScanFixture, ScanIndex, Owners) {
     let scanner = disk.owner(SnapshotSource::Codex);
-    let (mut live, first, _) = page(&scanner, &c.support, roots, ScanIndex::default(), collected);
-    live.record_accepted_snapshot_fingerprints(
-        &first
-            .snapshots
-            .iter()
-            .map(|s| s.snapshot_fingerprint.clone())
-            .collect(),
-    );
-    let prior = disk.commit(&scanner.cache, SnapshotSource::Codex, &mut live);
-    (scanner, prior, tags(&first))
+    let (live, first, _) = page(&scanner, &c.support, roots, ScanIndex::default(), collected);
+    let owners = tags(&first);
+    let prior = commit_page(disk, &scanner, (live, first), None);
+    (scanner, prior, owners)
+}
+
+/// After a changed transition: the warm owner's page (`ram`) is accepted and
+/// committed; a restarted owner over the unchanged transcripts then opens
+/// none, reads no byte and emits nothing. Returns the committed index.
+fn quiet_restart(
+    c: &Corpus,
+    disk: &mut Disk,
+    scanner: &E2ScanFixture,
+    roots: &[PathBuf],
+    ram: Scanned,
+    collected: &AgentStatusCollection,
+) -> ScanIndex {
+    let source = SnapshotSource::Codex;
+    let settled = commit_page(disk, scanner, ram, Some(roots));
+    let restarted = disk.owner(source);
+    let opens = crate::snapshots::all_transcript_opens_for_test();
+    let ((_, quiet_scan, modes), consumed) = fixture::observe_consumed(|| {
+        page(&restarted, &c.support, roots, settled.clone(), collected)
+    });
+    assert!(quiet_scan.snapshots.is_empty(), "no re-emission");
+    let measured = (crate::snapshots::all_transcript_opens_for_test() == opens).then_some(0);
+    let mut quiet = RouteResult::emitted(Mode::Restart, source, Vec::new(), &[]);
+    quiet.modes = modes;
+    quiet.io = fixture::IoBytes {
+        consumed,
+        cheap_checks: measured,
+        anchor_reads: measured,
+        other_reads: measured,
+        ..Default::default()
+    };
+    money_oracle::assert_quiet_restart_zero_bytes(&quiet);
+    settled
 }
 
 /// The next page on cold Full, a restarted owner and the current owner's
-/// Tail, each equal to cold Full in money and placement; and cold's owners.
+/// Tail, each equal to cold Full in money and placement; cold's owners; and
+/// the current owner's page, for the commit after it.
 fn routes(
     c: &Corpus,
     disk: &mut Disk,
@@ -241,7 +332,7 @@ fn routes(
     roots: &[PathBuf],
     prior: &ScanIndex,
     collected: &AgentStatusCollection,
-) -> (Vec<RouteResult>, Owners) {
+) -> (Vec<RouteResult>, Owners, Scanned) {
     let source = SnapshotSource::Codex;
     let cold = page(
         &E2ScanFixture::default(),
@@ -260,23 +351,24 @@ fn routes(
         "Tail from committed heads"
     );
     let owners = tags(&cold.1);
-    let routes = [
-        (Mode::ColdFull, cold),
-        (Mode::Restart, restart),
-        (Mode::Ram, ram),
-    ]
-    .into_iter()
-    .map(|(mode, (index, scan, _))| {
-        let wire = vec![other_wire(source, &scan)];
-        let mut route = RouteResult::emitted(mode, source, wire, &scan.snapshots);
-        route.codex_evidence = fixture::codex_evidence(&index, &scan);
-        route
-    })
-    .collect::<Vec<_>>();
+    let route =
+        |mode: Mode,
+         (index, scan, modes): &(ScanIndex, SourceScanResult, (usize, usize, usize))| {
+            let wire = vec![other_wire(source, scan)];
+            let mut route = RouteResult::emitted(mode, source, wire, &scan.snapshots);
+            route.codex_evidence = fixture::codex_evidence(index, scan);
+            route.modes = *modes;
+            route
+        };
+    let routes = vec![
+        route(Mode::ColdFull, &cold),
+        route(Mode::Restart, &restart),
+        route(Mode::Ram, &ram),
+    ];
     for other in &routes[1..] {
         money_oracle::assert_equivalent(&routes[0], other);
     }
-    (routes, owners)
+    (routes, owners, (ram.0, ram.1))
 }
 
 /// A row: `setup` before the first page; `change` before the second page's
@@ -320,6 +412,37 @@ fn live(home: &Path, tag: &str) {
 }
 
 fn same(_: &Path, _: &str) {}
+
+/// Pre-change saved bytes for `tag`'s login `a`: a success, then a newer
+/// failure saved with no binding and `refresh_held`, as an older release
+/// wrote them. `auth.json` must already be written.
+fn pinned_saved(home: &Path, tag: &str) -> serde_json::Value {
+    let metadata = std::fs::metadata(home.join("auth.json")).unwrap();
+    let modified = metadata.modified().unwrap();
+    let modified = modified.duration_since(std::time::UNIX_EPOCH).unwrap();
+    let auth = json!({"modified_secs":modified.as_secs(),
+        "modified_nanos":modified.subsec_nanos(),"len":metadata.len()});
+    let account = hash("account", &format!("{tag}-a"));
+    let workspace = hash("workspace", &format!("ws-{tag}-a"));
+    let now = OffsetDateTime::now_utc().unix_timestamp() as u64;
+    json!({"schema_version":1,"home_key":"{home_key}",
+        "reading":{"observed_at_epoch_seconds":now - 600,
+            "login":{"binding":format!("{account}:{workspace}"),"auth":auth},
+            "identity":{"account_identifier_hash":account,
+                "workspace_identifier_hash":workspace},
+            "provider_account_signed_in":true,"plan_type":"pro",
+            "quota_windows":[],"credit_balances":[],"credential_read_failed":false},
+        "last_attempt_at_epoch_seconds":now - 60,"last_attempt_login":{"auth":auth},
+        "last_failure":{"at_epoch_seconds":now - 60,
+            "message":"Codex app-server account read failed.",
+            "login":{"auth":auth},"refresh_held":true}})
+}
+
+/// T8's setup: id token expired, access live; the pinned bytes saved.
+fn pinned_failure(home: &Path, tag: &str) {
+    login(home, tag, 'a', (EXPIRED, LIVE), "2026-10-27T06:00:00Z");
+    status::write_saved(home, &pinned_saved(home, tag).to_string());
+}
 
 const ROWS: &[Row] = &[
     // T1: id expired, access live, file unchanged: sessions after the
@@ -412,28 +535,7 @@ const ROWS: &[Row] = &[
     // no binding (id expired then) is still served, not the older success.
     Row {
         tag: "t8",
-        setup: |home, tag| {
-            login(home, tag, 'a', (EXPIRED, LIVE), "2026-10-27T06:00:00Z");
-            let metadata = std::fs::metadata(home.join("auth.json")).unwrap();
-            let modified = metadata.modified().unwrap();
-            let modified = modified.duration_since(std::time::UNIX_EPOCH).unwrap();
-            let auth = json!({"modified_secs":modified.as_secs(),
-                "modified_nanos":modified.subsec_nanos(),"len":metadata.len()});
-            let (account, workspace) = (hash("account", "t8-a"), hash("workspace", "ws-t8-a"));
-            let now = OffsetDateTime::now_utc().unix_timestamp() as u64;
-            let saved = json!({"schema_version":1,"home_key":"{home_key}",
-                "reading":{"observed_at_epoch_seconds":now - 600,
-                    "login":{"binding":format!("{account}:{workspace}"),"auth":auth},
-                    "identity":{"account_identifier_hash":account,
-                        "workspace_identifier_hash":workspace},
-                    "provider_account_signed_in":true,"plan_type":"pro",
-                    "quota_windows":[],"credit_balances":[],"credential_read_failed":false},
-                "last_attempt_at_epoch_seconds":now - 60,"last_attempt_login":{"auth":auth},
-                "last_failure":{"at_epoch_seconds":now - 60,
-                    "message":"Codex app-server account read failed.",
-                    "login":{"auth":auth},"refresh_held":true}});
-            status::write_saved(home, &saved.to_string());
-        },
+        setup: pinned_failure,
         change: same,
         between: same,
         expect: [None, None, None],
@@ -492,7 +594,10 @@ fn codex_login_identity_rows_bind_through_the_status_lane() {
     for (row, home) in ROWS.iter().zip(&homes) {
         (row.between)(home, row.tag);
     }
-    let (_, owners) = routes(&c, &mut disk, &scanner, &roots, &prior, &collected);
+    let (_, owners, ram) = routes(&c, &mut disk, &scanner, &roots, &prior, &collected);
+    // Every row's change (T3's rewrites, (a)'s rewrite before the bind) left
+    // the transcripts alone: a restart over the committed page reads nothing.
+    quiet_restart(&c, &mut disk, &scanner, &roots, ram, &collected);
     for (index, row) in ROWS.iter().enumerate() {
         assert_eq!(
             owners[&sid(2 * index)],
@@ -511,8 +616,11 @@ fn codex_login_identity_rows_bind_through_the_status_lane() {
 
 /// [money] The positive control: two accounts, one user in two workspaces
 /// (T5), a read gap that recovers on the same file (T9), and a `codex login`
-/// switch in the middle of a session with a side session after it (T10).
-/// Every route equals cold Full; swapped owners fail the comparator.
+/// switch in the middle of a session (T10). Its parent spawns side calls in
+/// the same home before the switch (owned as the parent) and after it (owned
+/// by the new login), both through the home's binding. Every route equals
+/// cold Full; a restart after the switch reads nothing; swapped owners fail
+/// the comparator.
 #[test]
 #[serial_test::serial]
 fn codex_login_switch_gap_and_twin_workspaces_match_cold_full() {
@@ -535,11 +643,12 @@ fn codex_login_switch_gap_and_twin_workspaces_match_cold_full() {
     read(gap, ProviderRead::Failed);
     sign_in(twin, "m-u", "m-w2", (EXPIRED, LIVE), six);
     read(twin, bound("m-u", "m-w2", 60));
-    let [s1, s2, s3, s4] = [0, 1, 2, 3].map(|n| sid(100 + n));
+    let [s1, s2, s3, s4, s5] = [0, 1, 2, 3, 4].map(|n| sid(100 + n));
     let sessions = [
         start(switch, &s1, "2026-10-27T07:00:00Z"),
         start(gap, &s2, "2026-10-27T07:00:00Z"),
         start(twin, &s3, "2026-10-27T07:00:00Z"),
+        side_call(switch, &s5, &s1, "2026-10-27T07:05:00Z"),
     ];
     let collected = status::collection(homes.as_slice());
     // T5: one user, two workspaces, two homes: two bindings, never shared.
@@ -566,6 +675,7 @@ fn codex_login_switch_gap_and_twin_workspaces_match_cold_full() {
         (s1.clone(), u.clone()),
         (s2.clone(), None),
         (s3.clone(), u.clone()),
+        (s5.clone(), u.clone()),
     ]);
     assert_eq!(
         first, expected,
@@ -577,14 +687,15 @@ fn codex_login_switch_gap_and_twin_workspaces_match_cold_full() {
     read(switch, bound("m-b", "m-wb", 0));
     read(gap, bound("m-v", "m-wv", 0));
     grow(&sessions);
-    start(switch, &s4, "2026-10-27T07:45:00Z");
+    side_call(switch, &s4, &s1, "2026-10-27T07:45:00Z");
     let collected = status::collection(homes.as_slice());
-    let (routes, owners) = routes(&c, &mut disk, &scanner, &roots, &prior, &collected);
+    let (routes, owners, ram) = routes(&c, &mut disk, &scanner, &roots, &prior, &collected);
     let expected = BTreeMap::from([
         (s1.clone(), u.clone()),
         (s2.clone(), v),
-        (s3, u),
+        (s3, u.clone()),
         (s4.clone(), b),
+        (s5, u),
     ]);
     assert_eq!(
         owners, expected,
@@ -609,4 +720,69 @@ fn codex_login_switch_gap_and_twin_workspaces_match_cold_full() {
         money_oracle::assert_placement_equivalent(&routes[0], &wrong)
     })
     .is_err());
+    quiet_restart(&c, &mut disk, &scanner, &roots, ram, &collected);
+}
+
+/// [money] T8, interrupted: over the pinned pre-change bytes (a success,
+/// then a newer failure with `refresh_held`), a save stops after writing its
+/// temp file (holding that older success alone) and before the rename; the
+/// process restarts. Before and after the next completed save (another
+/// failure), the failure is served, never the older success, and every route
+/// equals cold Full. A second home's login is the tagged control.
+#[test]
+#[serial_test::serial]
+fn codex_interrupted_save_then_restart_still_serves_the_failure() {
+    if !supported("codex_interrupted_save_then_restart") {
+        return;
+    }
+    let _cutover = crate::snapshots::TestCutover::set(0);
+    let _no_cli = no_codex_cli();
+    let c = corpus("transition-codex-login-interrupted-save");
+    let mut disk = Disk::with_route(&c, SnapshotSource::Codex);
+    let root = crate::test_scratch::ScratchDir::canonical("codex-login-interrupted");
+    let homes = ["t8i", "ctl"].map(|name| home(&root, name));
+    let [held, control] = &homes;
+    let roots = homes.iter().map(|h| h.join("sessions")).collect::<Vec<_>>();
+    pinned_failure(held, "t8i");
+    live(control, "ctl");
+    let mut sessions = vec![
+        start(held, &sid(200), "2026-10-27T07:00:00Z"),
+        start(control, &sid(201), "2026-10-27T07:00:00Z"),
+    ];
+    let a = Some(hash("account", "ctl-a"));
+    let collected = status::collection(homes.as_slice());
+    let (scanner, prior, first) = first_page(&c, &mut disk, &roots, &collected);
+    assert_eq!(
+        first,
+        BTreeMap::from([(sid(200), None), (sid(201), a.clone())])
+    );
+    let pinned = status::saved_bytes(held);
+    let mut success = pinned_saved(held, "t8i");
+    success.as_object_mut().unwrap().remove("last_failure");
+    status::interrupt_save(held, &success.to_string());
+    // Each served state: the held home has no binding; the control keeps its.
+    let served = |collected: &AgentStatusCollection| {
+        let bound = collected
+            .codex_home_bindings
+            .iter()
+            .map(|b| b.home.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(bound, vec![control.clone()], "the failure is served");
+    };
+    let expected = BTreeMap::from([(sid(200), None), (sid(201), a), (sid(202), None)]);
+    // The restarted status lane reads the saved file (no attempt in memory).
+    let collected = status::collection(homes.as_slice());
+    served(&collected);
+    grow(&sessions);
+    sessions.push(start(held, &sid(202), "2026-10-27T07:45:00Z"));
+    let (_, owners, ram) = routes(&c, &mut disk, &scanner, &roots, &prior, &collected);
+    assert_eq!(owners, expected, "before the next completed save");
+    let prior = commit_page(&disk, &scanner, ram, None);
+    read(held, ProviderRead::Failed);
+    assert_ne!(status::saved_bytes(held), pinned, "the next save completed");
+    let collected = status::collection(homes.as_slice());
+    served(&collected);
+    grow_by(&sessions, "turn-c", 40);
+    let (_, owners, _) = routes(&c, &mut disk, &scanner, &roots, &prior, &collected);
+    assert_eq!(owners, expected, "after the next completed save");
 }

@@ -984,8 +984,19 @@ fn codex_launch_admits_a_held_login_without_a_live_id_token() {
                 false,
             )
             .unwrap();
+        // A named setup signs in to a staging home; the verified login is
+        // published into the slot's home.
+        let staging = store.setup_sign_in_home(&slot).unwrap();
+        fs::write(staging.join("auth.json"), b"{}").unwrap();
+        fs::set_permissions(staging.join("auth.json"), fs::Permissions::from_mode(0o600)).unwrap();
         store
-            .complete_pinned_verification(schema, operation, &account, &org)
+            .complete_pinned_verification(
+                schema,
+                operation,
+                &account,
+                &org,
+                ottto_core::codex_auth_file_mark(&staging),
+            )
             .unwrap();
         let managed = store.slot_home(&slot).unwrap();
         let mut saved: serde_json::Value =
