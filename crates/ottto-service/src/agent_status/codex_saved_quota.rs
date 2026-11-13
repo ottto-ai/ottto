@@ -2151,7 +2151,12 @@ mod tests {
     fn saved_reading_round_trips_without_the_email() {
         use std::os::unix::fs::PermissionsExt;
         let root = scratch("round-trip");
-        let home = opaque_home(&root);
+        let home = root.join("home");
+        crate::test_scratch::create_private_dir(&home).unwrap();
+        // A saved identity is served only while the credential names it.
+        sign_in_home_with_id_token_lifetime(&home, "u1", "w", 3_600);
+        let account = ottto_core::billing_identity_hash("openai", "account", "u1").unwrap();
+        let workspace = ottto_core::billing_identity_hash("openai", "workspace", "w").unwrap();
         let now = current_unix_seconds();
         let read = read_and_save_at(
             &root,
@@ -2159,7 +2164,7 @@ mod tests {
             CodexHomeTrust::Managed,
             now,
             |_, _| true,
-            || Ok(probe("account-a", "workspace-a", &rfc3339(now))),
+            || Ok(probe(&account, &workspace, &rfc3339(now))),
         );
         assert!(matches!(read, Some(Ok(_))));
         let path = saved_path(&root, &home);
@@ -2173,7 +2178,7 @@ mod tests {
         );
 
         let served = serve_saved_at(&root, &home, CodexHomeTrust::Managed, now + 60).unwrap();
-        let original = probe("account-a", "workspace-a", &rfc3339(now));
+        let original = probe(&account, &workspace, &rfc3339(now));
         assert_eq!(served.quota_windows, original.quota_windows);
         assert_eq!(served.credit_balances, original.credit_balances);
         assert_eq!(served.saved_identity, original.saved_identity);
@@ -2317,7 +2322,9 @@ mod tests {
 
     /// A read that rewrites a credential naming no account, before or after
     /// (no account id, no current id_token): the rewrite is the read's own,
-    /// so the reading is kept and the next read waits the full interval.
+    /// so the reading is kept and the next read waits the full interval. A
+    /// credential that names no account carries none: the reading's account
+    /// is not served under it.
     #[test]
     fn a_read_that_rewrites_an_unnamed_credential_keeps_its_reading() {
         let root = scratch("unnamed-rewrite");
@@ -2344,7 +2351,7 @@ mod tests {
         let saved = read_saved_at(&root, &home).unwrap();
         assert!(saved.reading.is_some(), "the reading is kept");
         assert_eq!(saved.last_attempt_login, after);
-        assert!(serve_saved_at(&root, &home, CodexHomeTrust::Managed, now).is_ok());
+        assert!(serve_saved_at(&root, &home, CodexHomeTrust::Managed, now).is_err());
         for in_use in [true, false] {
             let interval = refresh_interval_seconds(in_use);
             assert!(!scheduled_read_due(Some(&saved), &after, in_use, now + 61));
@@ -2553,8 +2560,11 @@ mod tests {
         let derived = planned_derives();
         assert_eq!(planned_login_mark(&home, trust, now), first);
         assert_eq!(planned_derives(), derived, "kept");
-        // Past the id token's expiry: derived again.
+        // Past the id token's expiry: kept (the access token names the login).
         planned_login_mark(&home, trust, now + 3_600 + 1);
+        assert_eq!(planned_derives(), derived, "kept past the id token");
+        // Past the access token's expiry: derived again.
+        planned_login_mark(&home, trust, now + 30 * 86_400 + 1);
         assert_eq!(planned_derives(), derived + 1);
 
         // Another account, the same length: derived again, and the new one,
@@ -2688,6 +2698,16 @@ mod tests {
         workspace: &str,
         id_token_lifetime: i64,
     ) {
+        sign_in_home_with_lifetimes(home, user, workspace, id_token_lifetime, 30 * 86_400);
+    }
+
+    fn sign_in_home_with_lifetimes(
+        home: &Path,
+        user: &str,
+        workspace: &str,
+        id_token_lifetime: i64,
+        access_token_lifetime: i64,
+    ) {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
         use std::os::unix::fs::PermissionsExt;
         let jwt = |user: &str, workspace: &str, lifetime: i64| {
@@ -2712,7 +2732,7 @@ mod tests {
             &auth,
             serde_json::json!({
                 "tokens": {
-                    "access_token": jwt(user, workspace, 30 * 86_400),
+                    "access_token": jwt(user, workspace, access_token_lifetime),
                     "id_token": jwt(user, workspace, id_token_lifetime),
                 },
                 "account_id": workspace,
@@ -3009,9 +3029,9 @@ mod tests {
     }
 
     /// The slot's id token expired an hour after its own read, while its
-    /// `auth.json` is unchanged since then: it still holds the login it read,
-    /// so it stays shared, is served the default home's fresh reading, and is
-    /// read by itself only for the keep-alive.
+    /// access token lives: it still names the login it read, so it stays
+    /// shared, is served the default home's fresh reading, and is read by
+    /// itself only for the keep-alive.
     #[test]
     fn a_twin_whose_id_token_expired_stays_shared_until_its_keepalive() {
         let fixture = SameLoginFixture::new(
@@ -3022,10 +3042,9 @@ mod tests {
             ],
         );
         fixture.sign_in_with_id_token_lifetime("twin", "user-a", "workspace-a", -60);
-        assert_eq!(
-            login_mark(fixture.home("twin"), fixture.trust("twin")).binding,
-            None
-        );
+        assert!(login_mark(fixture.home("twin"), fixture.trust("twin"))
+            .binding
+            .is_some());
         let start = current_unix_seconds();
         assert_eq!(fixture.round(start, false, &[]), ["default", "twin"]);
         assert_eq!(fixture.round(start + 5 * 60, true, &[]), ["default"]);
@@ -3047,9 +3066,10 @@ mod tests {
         assert!(fixture.round(day, false, &[]).contains(&"twin".to_string()));
     }
 
-    /// The slot's `auth.json` is rewritten after its read and names no login:
-    /// it may hold another one now, so it is never served the default home's
-    /// reading, and it is back on its own schedule.
+    /// The slot's `auth.json` is rewritten after its read and names no live
+    /// login (its access token expired): it may hold another one now, so it is
+    /// never served the default home's reading, and it is back on its own
+    /// schedule.
     #[test]
     fn a_rewritten_credential_that_names_no_login_ends_the_sharing() {
         let fixture = SameLoginFixture::new(
@@ -3068,7 +3088,7 @@ mod tests {
             Ok(rfc3339(start + 5 * 60))
         );
 
-        fixture.sign_in_with_id_token_lifetime("twin", "user-a", "workspace-a", -60);
+        sign_in_home_with_lifetimes(fixture.home("twin"), "user-a", "workspace-a", -60, -60);
         std::fs::File::options()
             .write(true)
             .open(fixture.home("twin").join("auth.json"))
