@@ -3503,6 +3503,10 @@ pub(in crate::snapshot_sync) mod money_equivalence_tests {
         include!("root_twin_scope_tests.rs");
     }
     #[cfg(unix)]
+    mod subagent_twin_tail_tests {
+        include!("subagent_twin_tail_tests.rs");
+    }
+    #[cfg(unix)]
     mod lease_touch_oracle_tests {
         include!("lease_touch_oracle_tests.rs");
     }
