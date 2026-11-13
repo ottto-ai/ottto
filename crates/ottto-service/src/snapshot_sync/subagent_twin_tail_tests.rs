@@ -84,23 +84,28 @@ fn subagent_twin_slack_tail() {
         }
         c.evidence(&rows, &[]);
         let agents = [0, 1].map(|n| format!("{ROOT}_agent-{n:03}"));
+        // The homes' historical births, observed before any parse, so
+        // discovery order cannot use today's file-system birth.
+        let mut seeded = ScanIndex::default();
+        for path in &paths[2..] {
+            let member = &agents[usize::from(path.ends_with("agent-001.jsonl"))];
+            seeded.claude_money_birth_store.record_observation(
+                member,
+                &path.to_string_lossy(),
+                c.births[path],
+            );
+        }
         let disk = Disk::new(&c);
-        let owner = E2ScanFixture::capturing_identity();
+        let owner = E2ScanFixture::with_subagent_births();
         disk.begin(&owner, SnapshotSource::ClaudeCode);
+        // Committed, so every arm starts from the same stored observations.
+        let seeded = disk.commit(&owner.cache, SnapshotSource::ClaudeCode, &mut seeded);
         let mut bodies = Vec::new();
         // First sight: every arm reads both homes of both subagents.
         let mut pages = [
-            resumed_page(&c, &owner, ScanIndex::default()),
-            resumed_page(
-                &c,
-                &E2ScanFixture::capturing_identity(),
-                ScanIndex::default(),
-            ),
-            resumed_page(
-                &c,
-                &E2ScanFixture::capturing_identity(),
-                ScanIndex::default(),
-            ),
+            resumed_page(&c, &owner, seeded.clone()),
+            resumed_page(&c, &E2ScanFixture::with_subagent_births(), seeded.clone()),
+            resumed_page(&c, &E2ScanFixture::with_subagent_births(), seeded),
         ];
         finish_claude_pages(&c, &mut pages);
         for page in &pages {
@@ -126,11 +131,11 @@ fn subagent_twin_slack_tail() {
             rows.push(observed(&request, &at, 23));
         }
         c.evidence(&rows, &[]);
-        let restart = E2ScanFixture::capturing_identity();
+        let restart = E2ScanFixture::with_subagent_births();
         disk.begin(&restart, SnapshotSource::ClaudeCode);
         let mut pages = [
             resumed_page(&c, &owner, prior.clone()),
-            resumed_page(&c, &E2ScanFixture::capturing_identity(), prior.clone()),
+            resumed_page(&c, &E2ScanFixture::with_subagent_births(), prior.clone()),
             resumed_page(&c, &restart, prior),
         ];
         finish_claude_pages(&c, &mut pages);
