@@ -1872,70 +1872,24 @@ impl CodexChild {
     }
 
     pub(crate) fn exited(&self) -> std::io::Result<bool> {
-        child_exited(self.child.as_ref().expect("owned codex child"))
+        let child = self.child.as_ref().expect("owned codex child");
+        crate::process_guard::exited(child).or_else(|error| {
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                Ok(false)
+            } else {
+                Err(error)
+            }
+        })
     }
 
     /// Ends the child without cutting off a login refresh it may be making:
     /// the caller has closed its stdin (or it had none) and its output reader.
     pub(crate) fn stop_and_reap(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        stop_group_and_reap(
+        crate::process_guard::stop_group_and_reap(
             self.child.take().expect("owned codex child"),
             crate::agent_status::codex_child_drain(),
         )
     }
-}
-
-/// Observe exit without reaping: the PID, and so the group id, stays reserved
-/// until the group has been stopped, even if a descendant keeps its stdout.
-#[cfg(unix)]
-fn child_exited(child: &std::process::Child) -> std::io::Result<bool> {
-    let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
-    let result = unsafe {
-        libc::waitid(
-            libc::P_PID,
-            child.id() as libc::id_t,
-            &mut info,
-            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-        )
-    };
-    if result < 0 {
-        let error = std::io::Error::last_os_error();
-        if error.kind() == std::io::ErrorKind::Interrupted {
-            return Ok(false);
-        }
-        return Err(error);
-    }
-    Ok(info.si_signo != 0)
-}
-
-/// Give the leader of a group started by `Command::process_group(0)` up to
-/// `drain` to exit by itself, then SIGKILL its group and reap it. This is the
-/// only reaper, and nothing is signalled after a reap.
-#[cfg(unix)]
-pub(crate) fn stop_group_and_reap(
-    mut child: crate::local_resource_diagnostics::cli_children::MeasuredChild,
-    drain: Duration,
-) -> std::io::Result<std::process::ExitStatus> {
-    let deadline = Instant::now() + drain;
-    loop {
-        match child_exited(&child) {
-            Ok(done) if done || Instant::now() >= deadline => break,
-            Ok(_) => thread::sleep(
-                Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
-            ),
-            // Already reaped: its PID is no longer reserved. Never signal it.
-            Err(error) if error.raw_os_error() == Some(libc::ECHILD) => return child.wait(),
-            Err(_) => break,
-        }
-    }
-    if let Ok(group) = libc::pid_t::try_from(child.id()) {
-        if group > 1 && group != unsafe { libc::getpgrp() } {
-            // Even an exited leader may leave live descendants in its group.
-            unsafe { libc::killpg(group, libc::SIGKILL) };
-        }
-    }
-    let _ = child.kill();
-    child.wait()
 }
 
 #[cfg(unix)]

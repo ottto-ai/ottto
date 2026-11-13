@@ -834,6 +834,29 @@ impl SourceScanResult {
             index.resume_census_window_end = None;
         }
     }
+    /// Keep exact discoveries in the ordinary durable queue, also after native
+    /// selection retired this page's traversal.
+    pub(crate) fn enqueue_claude_discovery_hints(
+        &self,
+        index: &mut ScanIndex,
+        roots: &[PathBuf],
+        lookback_days: u64,
+        hints: &[PathBuf],
+    ) {
+        if index.traversal.is_none() {
+            ensure_bounded_traversal(
+                SnapshotSource::ClaudeCode,
+                roots,
+                index,
+                &self.census_window_end,
+                lookback_days,
+            );
+        }
+        if let Some(traversal) = index.traversal.as_mut() {
+            enqueue_watcher_hints(SnapshotSource::ClaudeCode, traversal, hints, false);
+        }
+    }
+
     /// Index keys this scan read to completion, with their parsed source
     /// fingerprints.
     pub(crate) fn completed_parses(&self) -> impl Iterator<Item = (&str, &str)> {

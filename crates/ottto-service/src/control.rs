@@ -402,7 +402,15 @@ pub fn handle_request_json_with_peer(
     request_json: &str,
     peer: Option<LocalClientPeer>,
 ) -> String {
-    let response = match serde_json::from_str::<LocalControlRequest>(request_json) {
+    let request = serde_json::from_str::<LocalControlRequest>(request_json);
+    crate::local_resource_diagnostics::control_class(match request.as_ref().map(|r| &r.command) {
+        Ok(LocalControlCommand::Status { .. }) => "status",
+        Ok(LocalControlCommand::ClaudeAccountsStatus) => "claude_accounts_status",
+        Ok(LocalControlCommand::CodexAccountsStatus) => "codex_accounts_status",
+        Ok(LocalControlCommand::AgentStatusRefresh { .. }) => "agent_status_refresh",
+        _ => "other",
+    });
+    let response = match request {
         Ok(request) => handle_request_with_peer(daemon, request, peer),
         Err(error) => LocalControlResponse {
             request_id: "req_xpc_invalid".to_string(),
@@ -466,7 +474,7 @@ fn companion_peer_is_trusted(peer: Option<&LocalClientPeer>) -> bool {
         return false;
     };
 
-    trusted_companion_pid(pid)
+    crate::local_resource_diagnostics::trust_check(|| trusted_companion_pid(pid))
 }
 
 #[cfg(target_os = "macos")]
@@ -24470,6 +24478,45 @@ for line in sys.stdin:
             .join("snapshots/destinations/old/codex-scan-index.json")
             .exists());
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// [behaviour] Each decoded XPC command counts once under its class.
+    #[test]
+    fn raw_local_control_json_counts_command_class() {
+        let status = LocalControlCommand::Status {
+            refresh_agent_status: false,
+            retry_relay_authorization: false,
+        };
+        let refresh = LocalControlCommand::AgentStatusRefresh {
+            source: None,
+            quota_refresh: false,
+        };
+        for (command, class) in [
+            (status, "status"),
+            (
+                LocalControlCommand::ClaudeAccountsStatus,
+                "claude_accounts_status",
+            ),
+            (
+                LocalControlCommand::CodexAccountsStatus,
+                "codex_accounts_status",
+            ),
+            (refresh, "agent_status_refresh"),
+            (LocalControlCommand::AuthStatus, "other"),
+        ] {
+            let request = LocalControlRequest {
+                request_id: "r".to_string(),
+                protocol_version: ottto_protocol::expected_local_control_protocol_version(&command),
+                token: Some("wrong".to_string()),
+                client_kind: None,
+                client_install_owner: None,
+                command,
+            };
+            let json = serde_json::to_string(&request).unwrap();
+            handle_request_json_with_peer(&daemon(), &json, None);
+            let counts = crate::local_resource_diagnostics::take_control();
+            assert_eq!(counts, BTreeMap::from([(class, 1)]), "{class}");
+        }
     }
 
     #[test]

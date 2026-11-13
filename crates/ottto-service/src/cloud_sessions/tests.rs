@@ -27,7 +27,14 @@ impl CloudCliFixture {
         let root = temp_dir("cloud-cli-process");
         fs::write(root.join("output"), output).unwrap();
         let quote = |path: &Path| format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"));
-        let body = if mode == "output" {
+        let body = if mode == "redirect-output" {
+            format!(
+                "echo $$ > {}\n/bin/sleep 4 >/dev/null 2>&1 &\necho $! > {}\n/bin/cat {}\nexit {exit_code}\n",
+                quote(&root.join("direct")),
+                quote(&root.join("descendant")),
+                quote(&root.join("output")),
+            )
+        } else if mode == "output" {
             format!(
                 "/bin/cat {}\nexit {exit_code}\n",
                 quote(&root.join("output"))
@@ -93,6 +100,23 @@ impl CloudCliFixture {
         {
             assert!(Instant::now() < deadline, "fake descendant did not start");
             thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn wait_stopped(&self, label: &str) {
+        let pid = self.pid(label).to_string();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let output = Command::new("/bin/ps")
+                .args(["-o", "stat=", "-p", &pid])
+                .output()
+                .unwrap();
+            let state = String::from_utf8_lossy(&output.stdout);
+            if state.trim().is_empty() || state.trim().starts_with('Z') {
+                break;
+            }
+            assert!(Instant::now() < deadline, "Cloud group descendant survived");
+            thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -214,8 +238,8 @@ fn cloud_cli_escaped_writer_cannot_hold_deadline_or_kill_other_groups() {
 /// [regress] Pause while a `codex cloud list` page lingers past its deadline
 /// (it may be refreshing its login) completes within the stop wait: after the
 /// page's deadline and the child's drain, with no SIGTERM, never before the
-/// child is gone. An account change waits the same
-/// way, so its CLI call must not time out first.
+/// child is gone. An account change waits the same way, so its CLI call must
+/// not time out first.
 #[cfg(unix)]
 #[test]
 #[serial_test::serial]
@@ -266,27 +290,30 @@ fn pause_during_a_lingering_cloud_child_completes_within_the_stop_wait() {
     );
 }
 
-/// [regress] The child's owner is its only reaper: an exited child stays
-/// unreaped (its PID and group id reserved) after any number of exit checks,
-/// until `stop_and_reap` reaps it with its own status and no signal.
 #[cfg(unix)]
 #[test]
-fn codex_child_exit_is_observed_without_reaping() {
-    use std::os::unix::process::{CommandExt, ExitStatusExt};
-    let mut command = Command::new("/bin/sh");
-    command.args(["-c", "exit 7"]).env_clear().process_group(0);
-    let mut child = CodexChild::new(
-        crate::local_resource_diagnostics::cli_children::spawn(&mut command).unwrap(),
-    );
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !child.exited().unwrap() {
-        assert!(Instant::now() < deadline, "the exit is observed");
-        thread::sleep(Duration::from_millis(5));
+#[serial_test::serial]
+fn cloud_cli_timeout_stops_group_after_leader_exit() {
+    let fixture = CloudCliFixture::new("hold-exit", &[], 0);
+    let result =
+        CodexCloudCliRunner.list_page_bounded(None, PAGE_LIMIT, Duration::from_millis(300));
+    assert!(result.unwrap_err().to_string().contains("timed out"));
+    fixture.wait_gone("direct");
+    fixture.wait_stopped("descendant");
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn cloud_cli_completion_stops_redirected_descendants() {
+    for output in [b"{}".as_slice(), &[0xff]] {
+        let fixture = CloudCliFixture::new("redirect-output", output, 0);
+        let result =
+            CodexCloudCliRunner.list_page_bounded(None, PAGE_LIMIT, Duration::from_secs(2));
+        fixture.wait_gone("direct");
+        fixture.wait_stopped("descendant");
+        assert_eq!(result.is_ok(), std::str::from_utf8(output).is_ok());
     }
-    assert!(child.exited().unwrap(), "still unreaped after a check");
-    let status = child.stop_and_reap().unwrap();
-    assert_eq!(status.code(), Some(7));
-    assert_eq!(status.signal(), None);
 }
 
 fn stores(name: &str) -> (PathBuf, CloudSessionGrantStore, CloudSessionCheckpointStore) {

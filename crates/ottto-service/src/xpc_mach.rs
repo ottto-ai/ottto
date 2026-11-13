@@ -53,7 +53,7 @@ extern "C" fn handle_xpc_request(
     peer_euid: libc::uid_t,
     context: *mut c_void,
 ) -> *mut c_char {
-    let _stage =
+    let mut stage =
         crate::local_resource_diagnostics::StageWindow::begin("unknown", "offpass_control_xpc");
     if request_json.is_null() || context.is_null() {
         crate::control_plane_health::record_request_error();
@@ -73,7 +73,8 @@ extern "C" fn handle_xpc_request(
     // connection level; capturing the euid here lets the control layer re-assert
     // the match as defense in depth. On macOS `libc::uid_t` is `u32`.
     let peer = Some(LocalClientPeer::from_pid_and_euid(pid, Some(peer_euid)));
-    let response = run_control_on_xpc_worker(daemon, request, peer);
+    let (response, control) = run_control_on_xpc_worker(daemon, request, peer);
+    stage.control = control;
     c_string_or_null(&response)
 }
 
@@ -82,8 +83,16 @@ fn run_control_on_xpc_worker(
     daemon: LocalDaemon,
     request: String,
     peer: Option<LocalClientPeer>,
-) -> String {
-    run_xpc_worker(move || handle_request_json_with_peer(&daemon, &request, peer))
+) -> (String, std::collections::BTreeMap<&'static str, u64>) {
+    // The worker hands back its request's counts; none (a panic) counts as other.
+    let (sent, counts) = std::sync::mpsc::channel();
+    let response = run_xpc_worker(move || {
+        let response = handle_request_json_with_peer(&daemon, &request, peer);
+        let _ = sent.send(crate::local_resource_diagnostics::take_control());
+        response
+    });
+    let other = || std::collections::BTreeMap::from([("other", 1)]);
+    (response, counts.try_recv().unwrap_or_else(|_| other()))
 }
 
 #[cfg(target_os = "macos")]
@@ -149,12 +158,13 @@ mod tests {
             r#"{{"request_id":"req_xpc_worker","protocol_version":{PROTOCOL_VERSION},"token":"token","client_kind":"cli","command":"status"}}"#
         );
 
-        let response = run_control_on_xpc_worker(daemon(), request, None);
+        let (response, control) = run_control_on_xpc_worker(daemon(), request, None);
         let response: LocalControlResponse =
             serde_json::from_str(&response).expect("local control response");
 
         assert_eq!(response.request_id, "req_xpc_worker");
         assert!(response.ok);
+        assert_eq!(control, std::collections::BTreeMap::from([("status", 1)]));
     }
 
     #[test]

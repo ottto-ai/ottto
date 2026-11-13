@@ -498,6 +498,7 @@ fn recovery_emission_boundaries(
         },
         &Default::default(),
         index,
+        &mut Default::default(),
     );
     let held = e2::finish_page(
         &mut items,

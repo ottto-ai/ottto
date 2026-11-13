@@ -2,11 +2,15 @@ use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::{Command, Stdio};
+#[cfg(unix)]
 use std::thread;
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 const COMMAND_SEARCH_PATH_ENV: &str = "OTTTO_COMMAND_SEARCH_PATH";
+#[cfg(unix)]
 const INTERACTIVE_SHELL_ENV_TIMEOUT: Duration = Duration::from_secs(3);
 const PROVIDER_ENV_KEYS: &[&str] = &[
     "GOOGLE_APPLICATION_CREDENTIALS",
@@ -325,6 +329,12 @@ fn provider_env_from_sources(
     values
 }
 
+#[cfg(not(unix))]
+fn interactive_shell_provider_env() -> Option<BTreeMap<String, OsString>> {
+    None
+}
+
+#[cfg(unix)]
 fn interactive_shell_provider_env() -> Option<BTreeMap<String, OsString>> {
     let home = env::var_os("HOME")?;
     let path = path_env_from(None, Some(home.clone()))?;
@@ -338,30 +348,74 @@ fn interactive_shell_provider_env() -> Option<BTreeMap<String, OsString>> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
 
+    read_shell_env(command, INTERACTIVE_SHELL_ENV_TIMEOUT)
+}
+
+#[cfg(unix)]
+fn read_shell_env(mut command: Command, timeout: Duration) -> Option<BTreeMap<String, OsString>> {
+    use std::io::{ErrorKind, Read};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+
+    let deadline = Instant::now() + timeout;
+    // setsid is async-signal-safe and prevents access to the caller's controlling tty.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     let mut child = command.spawn().ok()?;
-    let start = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_status)) => {
-                let output = child.wait_with_output().ok()?;
-                if !output.status.success() {
-                    return None;
+    let mut stdout = child.stdout.take().expect("piped shell stdout");
+    let flags = unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_GETFL) };
+    let nonblocking = flags >= 0
+        && unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } == 0;
+    let mut ready = libc::pollfd {
+        fd: stdout.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let mut output = Vec::new();
+    let mut complete = false;
+    while nonblocking && Instant::now() < deadline {
+        let mut buffer = [0; 8192];
+        match stdout.read(&mut buffer) {
+            Ok(0) => match crate::process_guard::exited(&child) {
+                Ok(true) => {
+                    complete = Instant::now() < deadline;
+                    break;
                 }
-                return Some(parse_provider_env_output(&output.stdout));
+                Ok(false) => thread::sleep(
+                    Duration::from_millis(50)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                ),
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            },
+            Ok(n) if output.len() + n <= 1024 * 1024 => {
+                output.extend_from_slice(&buffer[..n]);
             }
-            Ok(None) if start.elapsed() >= INTERACTIVE_SHELL_ENV_TIMEOUT => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                let millis = deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis();
+                let result = unsafe { libc::poll(&mut ready, 1, millis.min(50) as libc::c_int) };
+                if result < 0 && std::io::Error::last_os_error().kind() != ErrorKind::Interrupted {
+                    break;
+                }
             }
-            Ok(None) => thread::sleep(Duration::from_millis(50)),
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            _ => break,
         }
     }
+    let status = crate::process_guard::stop_group_and_reap(
+        child,
+        deadline.saturating_duration_since(Instant::now()),
+    );
+    drop(stdout);
+    (complete && status.ok()?.success()).then(|| parse_provider_env_output(&output))
 }
 
 fn parse_provider_env_output(output: &[u8]) -> BTreeMap<String, OsString> {
@@ -651,6 +705,233 @@ mod tests {
         let path_env = path_env_from_override(Some(override_path)).expect("path env");
         let dirs = env::split_paths(&path_env).collect::<Vec<_>>();
         assert_eq!(dirs, vec![PathBuf::from("/tmp/ottto-only-bin")]);
+    }
+
+    struct FakeShell {
+        home: PathBuf,
+    }
+
+    impl FakeShell {
+        fn new() -> Self {
+            let home = scratch_home("provider-shell");
+            fs::create_dir_all(&home).expect("fake shell directory");
+            Self { home }
+        }
+
+        fn run(&self, script: &str, timeout: Duration) -> Option<BTreeMap<String, OsString>> {
+            let mut command = Command::new("/bin/sh");
+            command
+                .args(["-c", script, "fake-shell"])
+                .arg(self.home.join("child-pid"))
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+            read_shell_env(command, timeout)
+        }
+
+        fn child_running(&self) -> bool {
+            let pid = fs::read_to_string(self.home.join("child-pid")).expect("child started");
+            let status = Command::new("/bin/ps")
+                .args(["-o", "stat=", "-p", pid.trim()])
+                .output()
+                .expect("child status");
+            let status = String::from_utf8_lossy(&status.stdout);
+            // An orphan killed in the group can await init's reaping as a zombie.
+            !status.trim().is_empty() && !status.trim().starts_with('Z')
+        }
+
+        fn assert_child_stopped(&self) {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while self.child_running() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(!self.child_running(), "shell group child survived");
+        }
+    }
+
+    impl Drop for FakeShell {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.home).ok();
+        }
+    }
+
+    #[test]
+    fn provider_shell_bounds_inherited_stdout_after_shell_exit() {
+        let shell = FakeShell::new();
+        let start = Instant::now();
+        let result = shell.run(
+            "/bin/sleep 10 & echo $! > \"$1\"; printf 'GOOGLE_CLOUD_PROJECT=shell-project\\n'",
+            Duration::from_millis(300),
+        );
+        assert!(result.is_none());
+        assert!(start.elapsed() < Duration::from_secs(2));
+        shell.assert_child_stopped();
+    }
+
+    #[test]
+    #[ignore = "fake session leader invoked only by provider shell tests"]
+    fn provider_shell_session_fixture() {
+        assert_eq!(unsafe { libc::getsid(0) }, unsafe { libc::getpid() });
+        assert_eq!(unsafe { libc::getpgrp() }, unsafe { libc::getpid() });
+        println!("\nGOOGLE_CLOUD_PROJECT=session-leader");
+    }
+
+    #[test]
+    fn provider_shell_starts_its_own_session_and_group() {
+        let shell = FakeShell::new();
+        let executable = std::env::current_exe().unwrap();
+        let executable = executable.to_string_lossy().replace('\'', "'\\''");
+        let script = format!(
+            "exec '{executable}' --ignored --exact command_env::tests::provider_shell_session_fixture --nocapture --test-threads=1"
+        );
+        assert_eq!(
+            shell
+                .run(&script, INTERACTIVE_SHELL_ENV_TIMEOUT)
+                .expect("shell is the session leader")
+                .get("GOOGLE_CLOUD_PROJECT"),
+            Some(&OsString::from("session-leader"))
+        );
+    }
+
+    #[test]
+    fn provider_shell_success_stops_redirected_background_job() {
+        let shell = FakeShell::new();
+        let result = shell.run(
+            "/bin/sleep 10 >/dev/null 2>&1 & echo $! > \"$1\"; printf 'GOOGLE_CLOUD_PROJECT=shell-project\\n'",
+            INTERACTIVE_SHELL_ENV_TIMEOUT,
+        );
+        shell.assert_child_stopped();
+        assert_eq!(
+            result.expect("complete env").get("GOOGLE_CLOUD_PROJECT"),
+            Some(&OsString::from("shell-project"))
+        );
+    }
+
+    #[test]
+    fn provider_shell_nonzero_exit_stops_redirected_background_job() {
+        let shell = FakeShell::new();
+        assert!(shell.run(
+            "/bin/sleep 10 >/dev/null 2>&1 & echo $! > \"$1\"; printf 'GOOGLE_CLOUD_PROJECT=failed\\n'; exit 7",
+            INTERACTIVE_SHELL_ENV_TIMEOUT,
+        ).is_none());
+        shell.assert_child_stopped();
+    }
+
+    #[test]
+    fn provider_shell_drains_more_than_a_pipe_buffer() {
+        let shell = FakeShell::new();
+        let result = shell.run(
+            "i=0; while [ $i -lt 8192 ]; do printf 'IGNORED=0123456789abcdef\\n'; i=$((i+1)); done; printf 'GOOGLE_CLOUD_PROJECT=shell-project\\n'",
+            INTERACTIVE_SHELL_ENV_TIMEOUT,
+        );
+        assert_eq!(
+            result
+                .expect("large env parsed")
+                .get("GOOGLE_CLOUD_PROJECT"),
+            Some(&OsString::from("shell-project"))
+        );
+    }
+
+    #[test]
+    fn provider_shell_rejects_excess_output() {
+        let shell = FakeShell::new();
+        let start = Instant::now();
+        assert!(shell
+            .run(
+                "printf 'GOOGLE_CLOUD_PROJECT=partial\\n'; exec /usr/bin/head -c 1048577 /dev/zero",
+                Duration::from_secs(15),
+            )
+            .is_none());
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn provider_shell_accepts_exact_byte_bound() {
+        let shell = FakeShell::new();
+        let line = "GOOGLE_CLOUD_PROJECT=shell-project\n";
+        let script = format!(
+            "printf 'GOOGLE_CLOUD_PROJECT=shell-project\\n'; exec /usr/bin/head -c {} /dev/zero",
+            1024 * 1024 - line.len()
+        );
+        assert_eq!(
+            shell
+                .run(&script, INTERACTIVE_SHELL_ENV_TIMEOUT)
+                .expect("complete environment at the bound")
+                .get("GOOGLE_CLOUD_PROJECT"),
+            Some(&OsString::from("shell-project"))
+        );
+    }
+
+    #[test]
+    #[ignore = "finite escaped child invoked only by provider shell tests"]
+    fn provider_shell_escaped_writer_fixture() {
+        let Some(pid_file) = env::var_os("OTTTO_PROVIDER_SHELL_PIPE_FIXTURE").map(PathBuf::from)
+        else {
+            return;
+        };
+        assert!(unsafe { libc::setsid() } >= 0);
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
+        fs::write(&pid_file, std::process::id().to_string()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while Instant::now() < deadline {
+            if unsafe { libc::write(libc::STDOUT_FILENO, b"x".as_ptr().cast(), 1) } < 0
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPIPE)
+            {
+                fs::write(pid_file.with_extension("closed"), []).unwrap();
+                std::process::exit(0);
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        std::process::exit(1);
+    }
+
+    #[test]
+    fn provider_shell_closes_pipe_on_escaped_writer() {
+        let shell = FakeShell::new();
+        let executable = std::env::current_exe().unwrap();
+        let executable = executable.to_string_lossy().replace('\'', "'\\''");
+        let script = format!(
+            "export OTTTO_PROVIDER_SHELL_PIPE_FIXTURE=\"$1\"; '{executable}' --ignored --exact command_env::tests::provider_shell_escaped_writer_fixture --nocapture --test-threads=1 & while [ ! -s \"$1\" ]; do /bin/sleep 0.01; done"
+        );
+        let start = Instant::now();
+        assert!(shell.run(&script, Duration::from_millis(700)).is_none());
+        assert!(start.elapsed() < Duration::from_secs(2));
+        shell.assert_child_stopped();
+        assert!(
+            shell.home.join("child-pid.closed").exists(),
+            "escaped writer did not observe EPIPE"
+        );
+    }
+
+    #[test]
+    fn provider_shell_timeout_kills_its_group_after_stdout_closes() {
+        let shell = FakeShell::new();
+        let start = Instant::now();
+        let result = shell.run(
+            "exec 1>&-; /bin/sleep 10 & echo $! > \"$1\"; exec /bin/sleep 10",
+            Duration::from_millis(300),
+        );
+        assert!(result.is_none());
+        assert!(start.elapsed() < Duration::from_secs(2));
+        shell.assert_child_stopped();
+    }
+
+    #[test]
+    fn provider_shell_normal_output_and_failure_are_unchanged() {
+        let shell = FakeShell::new();
+        let output =
+            "printf 'GOOGLE_CLOUD_PROJECT=shell-project\\nIGNORED=value\\nGEMINI_API_KEY=\\n'";
+        let expected = BTreeMap::from([(
+            "GOOGLE_CLOUD_PROJECT".to_string(),
+            OsString::from("shell-project"),
+        )]);
+        assert_eq!(
+            shell.run(output, INTERACTIVE_SHELL_ENV_TIMEOUT),
+            Some(expected)
+        );
+        assert!(shell.run("exit 1", INTERACTIVE_SHELL_ENV_TIMEOUT).is_none());
     }
 
     #[test]
