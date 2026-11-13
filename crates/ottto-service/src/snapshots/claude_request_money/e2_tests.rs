@@ -234,6 +234,7 @@ fn publish(
             &api_report(read),
             &ClaudeTraceOwnershipLoadReport::default(),
             index,
+            &mut Default::default(),
         );
     }
     finish_page(
@@ -774,7 +775,13 @@ fn e2_side_call_goes_to_the_trace_named_subagent_else_the_root() {
             )]),
             ..Default::default()
         };
-        side_calls_page(&mut items, &api_report(&read), &trace, &index);
+        side_calls_page(
+            &mut items,
+            &api_report(&read),
+            &trace,
+            &index,
+            &mut Default::default(),
+        );
         let (root, sub) = (fold(&items[0]), fold(&items[1]));
         assert_eq!((requests(&items[1], REPORTED), sub.root_fallbacks), (1, 0));
         assert_eq!((requests(&items[0], REPORTED), root.root_fallbacks), (1, 1));
@@ -845,6 +852,7 @@ fn e2_side_call_held_by_an_untraced_off_page_transcript_is_not_re_added_to_the_r
             &api_report(&read),
             &ClaudeTraceOwnershipLoadReport::default(),
             &index,
+            &mut Default::default(),
         );
         // Without the holder the held row is an untraced root fallback too.
         let side = if holder { 1 } else { 2 };
@@ -896,7 +904,13 @@ fn e2_side_call_waits_while_the_walk_has_not_listed_the_named_members_directory(
             }
             let mut items = vec![parse(&p, Some(t0()), &index, &[line("r", &at(1), 10)])];
             attach_page(&mut items, &read);
-            let unresolved = side_calls_page(&mut items, &api_report(&read), &trace, &index);
+            let unresolved = side_calls_page(
+                &mut items,
+                &api_report(&read),
+                &trace,
+                &index,
+                &mut Default::default(),
+            );
             let root = fold(&items[0]);
             assert_eq!(unresolved.contains(ROOT), held, "{queued:?}");
             assert_eq!(root.entity.held, held, "{queued:?}");
@@ -2169,6 +2183,7 @@ fn e2_identity_attach_unpriced_and_side_calls_keep_account_partition() {
             &api_report(&read),
             &ClaudeTraceOwnershipLoadReport::default(),
             &index,
+            &mut Default::default(),
         );
         let item = tag_owned(items, &index).remove(0);
         assert_eq!((item.request_count, item.input_tokens), (4, 100));
@@ -2231,6 +2246,7 @@ fn side_call_page(side: ClaudeLocalOtelEvidence) -> (SnapshotItem, Option<(Strin
         &api_report(&read),
         &ClaudeTraceOwnershipLoadReport::default(),
         &index,
+        &mut Default::default(),
     );
     let item = tag_owned(items, &index).remove(0);
     let side = item
@@ -2454,7 +2470,7 @@ fn e2_identity_twin_native_mapping_survives_side_pass_before_reconciliation() {
             attach_page(&mut items, &read);
             let api = api_report(&read);
             let trace = ClaudeTraceOwnershipLoadReport::default();
-            side_calls_page(&mut items, &api, &trace, &index);
+            side_calls_page(&mut items, &api, &trace, &index, &mut Default::default());
             let evidence =
                 claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new());
             claude_request_identity::reconcile_request_accounts(&mut items, &evidence);
@@ -2538,7 +2554,7 @@ fn e2_identity_conflicting_account_attributes_preserve_complete_own_orgs() {
         attach_page(&mut items, &read);
         let api = api_report(&read);
         let trace = ClaudeTraceOwnershipLoadReport::default();
-        side_calls_page(&mut items, &api, &trace, &index);
+        side_calls_page(&mut items, &api, &trace, &index, &mut Default::default());
         let evidence = claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new());
         claude_request_identity::reconcile_request_accounts(&mut items, &evidence);
         let item = tag_owned(items, &index).remove(0);
@@ -2714,7 +2730,7 @@ fn e2_identity_provisional_unknown_twin_does_not_poison_later_marked_twin() {
             attach_page(&mut items, &read);
             let api = api_report(&read);
             let trace = ClaudeTraceOwnershipLoadReport::default();
-            side_calls_page(&mut items, &api, &trace, &index);
+            side_calls_page(&mut items, &api, &trace, &index, &mut Default::default());
             let evidence =
                 claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new());
             claude_request_identity::reconcile_request_accounts(&mut items, &evidence);
@@ -2935,7 +2951,13 @@ fn e2_identity_changed_child_only_page_inherits_durable_root_binding_after_resta
                 &[org_marker(ORG_B), sub.clone()],
             )];
             claude_request_identity::retain_root_accounts(&mut items, &index, machine);
-            side_calls_page(&mut items, &Default::default(), &Default::default(), &index);
+            side_calls_page(
+                &mut items,
+                &Default::default(),
+                &Default::default(),
+                &index,
+                &mut Default::default(),
+            );
             let item = tag_owned(items, &index).remove(0);
             assert_eq!((item.request_count, item.input_tokens), (1, 30));
             if machine == "synthetic-machine" {
@@ -3346,6 +3368,7 @@ fn e2_identity_copied_prefix_cannot_choose_subagent_or_side_call_start() {
             &api_report(&read),
             &ClaudeTraceOwnershipLoadReport::default(),
             &index,
+            &mut Default::default(),
         );
         let items = tag_owned(items, &index);
         assert_eq!(items.iter().map(|item| item.request_count).sum::<u64>(), 3);
@@ -3650,7 +3673,13 @@ fn e2_identity_equal_start_login_org_twins_keep_own_orgs_with_binding() {
                 let evidence =
                     claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new());
                 claude_request_identity::reconcile_request_accounts(&mut items, &evidence);
-                side_calls_page(&mut items, &Default::default(), &Default::default(), &index);
+                side_calls_page(
+                    &mut items,
+                    &Default::default(),
+                    &Default::default(),
+                    &index,
+                    &mut Default::default(),
+                );
                 assert!(items
                     .iter()
                     .all(|item| !fold(item).accounts.as_ref().unwrap().conflict));
@@ -3862,7 +3891,13 @@ fn e2_side_call_named_member_without_transcript_falls_back_to_the_root() {
             )]),
             ..Default::default()
         };
-        let unresolved = side_calls_page(&mut items, &api_report(&read), &trace, &index);
+        let unresolved = side_calls_page(
+            &mut items,
+            &api_report(&read),
+            &trace,
+            &index,
+            &mut Default::default(),
+        );
         assert!(unresolved.is_empty(), "the census walk decided");
         let (root, sub) = (fold(&items[0]), fold(&items[1]));
         assert_eq!((requests(&items[0], REPORTED), root.root_fallbacks), (1, 1));
@@ -3885,6 +3920,7 @@ fn e2_side_call_census_deadline_counts_nothing_and_reports_the_family() {
             &api_report(&read),
             &ClaudeTraceOwnershipLoadReport::default(),
             &index,
+            &mut Default::default(),
         )
     });
     assert_eq!(unresolved, BTreeSet::from([ROOT.to_owned()]));
@@ -3897,6 +3933,7 @@ fn e2_side_call_census_deadline_counts_nothing_and_reports_the_family() {
         &api_report(&read),
         &ClaudeTraceOwnershipLoadReport::default(),
         &index,
+        &mut Default::default(),
     );
     assert!(unresolved.is_empty());
     cleanup(&[&p]);
