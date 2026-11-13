@@ -487,32 +487,6 @@ fn claude_prior_history(
         return PriorHistory::Unverified;
     }
     let slug = SnapshotSource::ClaudeCode.api_slug();
-    let here = backfill_state
-        .completed_destination_namespaces
-        .get(slug)
-        .map(String::as_str)
-        == Some(destination_namespace);
-    // A quarantined copy of this index, of a legacy index or of this
-    // destination's ledger. An unreadable directory fails closed; a missing
-    // one is empty.
-    let quarantined_sibling = || {
-        let own_stem = index_path.file_stem().and_then(|stem| stem.to_str());
-        let claude_prefix = format!("{slug}-scan-index");
-        let Some(parent) = index_path.parent() else {
-            return false;
-        };
-        match std::fs::read_dir(parent) {
-            Ok(mut entries) => entries.any(|entry| match entry {
-                Ok(entry) => entry.file_name().to_str().is_some_and(|name| {
-                    name.contains(".corrupt.")
-                        && (own_stem.is_some_and(|stem| name.starts_with(stem))
-                            || name.starts_with(&claude_prefix))
-                }),
-                Err(_) => true,
-            }),
-            Err(error) => error.kind() != std::io::ErrorKind::NotFound,
-        }
-    };
     // Only a different namespace's directory is another destination. An
     // unscoped legacy `claude_code-scan-index*` beside `destinations/` names
     // no destination; it is usually this Mac's own pre-scoping index, so it
@@ -537,10 +511,12 @@ fn claude_prior_history(
         Ok(_) => true,
         Err(error) => error.kind() != std::io::ErrorKind::NotFound,
     };
-    if here
-        || upload_progress.records_server_attested_upload()
-        || quarantined_sibling()
-        || seen_marker()
+    if claude_destination_history_here(
+        backfill_state,
+        destination_namespace,
+        upload_progress,
+        index_path,
+    ) || seen_marker()
     {
         return PriorHistory::Here;
     }
@@ -573,6 +549,66 @@ fn claude_prior_history(
         PriorHistory::Here
     } else {
         PriorHistory::None
+    }
+}
+
+/// Evidence belongs to this destination, independent of the Mac-wide marker.
+fn claude_destination_history_here(
+    backfill_state: &crate::backfill::BackfillState,
+    destination_namespace: &str,
+    upload_progress: &SnapshotUploadProgress,
+    index_path: &Path,
+) -> bool {
+    let slug = SnapshotSource::ClaudeCode.api_slug();
+    let here = backfill_state
+        .completed_destination_namespaces
+        .get(slug)
+        .map(String::as_str)
+        == Some(destination_namespace);
+    // A quarantined copy of this index, of a legacy index or of this
+    // destination's ledger. An unreadable directory fails closed; a missing
+    // one is empty.
+    let quarantined_sibling = || {
+        let own_stem = index_path.file_stem().and_then(|stem| stem.to_str());
+        let claude_prefix = format!("{slug}-scan-index");
+        let Some(parent) = index_path.parent() else {
+            return false;
+        };
+        match std::fs::read_dir(parent) {
+            Ok(mut entries) => entries.any(|entry| match entry {
+                Ok(entry) => entry.file_name().to_str().is_some_and(|name| {
+                    name.contains(".corrupt.")
+                        && (own_stem.is_some_and(|stem| name.starts_with(stem))
+                            || name.starts_with(&claude_prefix))
+                }),
+                Err(_) => true,
+            }),
+            Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+        }
+    };
+    here || upload_progress.records_server_attested_upload() || quarantined_sibling()
+}
+
+/// Narrow the corruption stop to loss of this destination's own history.
+fn note_claude_index_rebuild_for_destination(
+    source: SnapshotSource,
+    loaded_fresh: bool,
+    backfill_state: &crate::backfill::BackfillState,
+    destination_namespace: &str,
+    upload_progress: &SnapshotUploadProgress,
+    index_path: &Path,
+    support_dir: &Path,
+) {
+    if source == SnapshotSource::ClaudeCode
+        && loaded_fresh
+        && claude_destination_history_here(
+            backfill_state,
+            destination_namespace,
+            upload_progress,
+            index_path,
+        )
+    {
+        crate::snapshots::note_claude_index_rebuild_stop(support_dir);
     }
 }
 
@@ -6952,6 +6988,15 @@ fn prepare_sync_source_inner(
             support_dir,
         )
     });
+    note_claude_index_rebuild_for_destination(
+        source,
+        claude_index_loaded_fresh,
+        &backfill_state,
+        &upload_destination_namespace,
+        &upload_progress,
+        &index_path,
+        support_dir,
+    );
     if let Some(prior) = prior_claude_history {
         crate::snapshots::note_prior_history_unverified(
             prior == crate::snapshots::PriorHistory::Unverified,
@@ -23008,6 +23053,9 @@ mod tests {
     include!("snapshot_sync/claude_request_census_pipeline_tests.rs");
     mod history_upgrade_pipeline_tests {
         include!("snapshot_sync/history_upgrade_pipeline_tests.rs");
+        mod first_read_latch_tests {
+            include!("snapshot_sync/first_read_latch_tests.rs");
+        }
     }
     pub(in crate::snapshot_sync) mod claude_money_e2_pipeline_tests {
         include!("snapshot_sync/claude_money_e2_pipeline_tests.rs");
@@ -23018,6 +23066,9 @@ mod tests {
         #[cfg(unix)]
         mod claude_first_request_login_tests {
             include!("snapshot_sync/claude_first_request_login_tests.rs");
+            mod first_read_latch_money_tests {
+                include!("snapshot_sync/first_read_latch_money_tests.rs");
+            }
         }
         #[cfg(unix)]
         mod claude_login_only_org_tests {

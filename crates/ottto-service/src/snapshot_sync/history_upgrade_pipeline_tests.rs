@@ -214,6 +214,15 @@ impl HistoryFixture {
             &index_path,
             &self.support,
         );
+        note_claude_index_rebuild_for_destination(
+            SnapshotSource::ClaudeCode,
+            loaded_fresh,
+            &backfill,
+            destination,
+            &progress,
+            &index_path,
+            &self.support,
+        );
         // Production's replay rule: an unreadable state arms no Claude
         // replay. A due replay generation stands in for a pending replay.
         let replay_pending = cycle.replay_generation.is_some()
