@@ -16941,17 +16941,18 @@ struct CodexAppServerRun {
     /// login there ([`codex_app_server_auth_rejected`]), whatever the rest of
     /// the session did.
     account_absent: bool,
-    /// The bundled model list passed to Codex ([`codex_probe_catalog`]), so
-    /// it sent no models request.
-    model_list: Option<PathBuf>,
+    /// The number of the binary whose bundled model list was passed to Codex
+    /// ([`codex_probe_catalog`]), so it sent no models request.
+    model_list: Option<u64>,
     /// `account/read` answered, with a result or an error.
     account_answered: bool,
 }
 
 /// Provider requests a started `codex app-server` quota session counts at
 /// least, sent whether or not they were answered: workspace discovery, models
-/// (one fewer when given its bundled list) and the rate-limits read. Each read lets Codex refresh its login when due;
-/// such a refresh is counted only by the rewrite log line.
+/// (one fewer when given its bundled list) and the rate-limits read. Each
+/// read lets Codex refresh its login when due; such a refresh is counted only
+/// by the rewrite log line.
 const CODEX_APP_SERVER_MIN_REQUESTS: u32 = 3;
 
 /// How long an ended Codex child (stdin closed, or a run past its deadline)
@@ -17083,8 +17084,9 @@ fn call_codex_app_server_rate_limits_for_home(
     }
     // A Codex that ended (not timed out) without answering `account/read`
     // may not take the list: later probes run without it until it changes.
-    if let (Some(path), false, false) = (&run.model_list, run.account_answered, run.timed_out) {
-        codex_probe_catalog::give_up(path);
+    if let (Some(generation), false, false) = (run.model_list, run.account_answered, run.timed_out)
+    {
+        codex_probe_catalog::give_up(generation);
     }
     if run.spawned && ottto_core::codex_auth_file_mark(codex_home) != auth_before {
         eprintln!(
@@ -17125,7 +17127,7 @@ fn run_codex_app_server_rate_limits_for_home(
         "features.plugins=false",
     ]);
     let model_list = codex_probe_catalog::for_probe();
-    if let Some(path) = &model_list {
+    if let Some((path, _)) = &model_list {
         let path = toml_edit::Value::from(&*path.to_string_lossy());
         command.args(["-c", &format!("model_catalog_json={path}")]);
     }
@@ -17153,7 +17155,7 @@ fn run_codex_app_server_rate_limits_for_home(
             .map_err(|_| "Codex app-server could not be started.".to_string())?,
     );
     run.spawned = true;
-    run.model_list = model_list;
+    run.model_list = model_list.map(|(_, generation)| generation);
     // Declared after `child`: stdin and the output reader close before the
     // child is ended, so neither holds up its own exit.
     let (stdin, stdout) = child.take_pipes();

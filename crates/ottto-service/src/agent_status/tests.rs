@@ -5095,6 +5095,7 @@ fn codex_probe_passes_the_binary_s_own_bundled_model_list() {
                 entries
                     .flatten()
                     .map(|entry| entry.path())
+                    .filter(|path| path.to_string_lossy().contains("bundled-"))
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
@@ -5160,14 +5161,11 @@ fn codex_probe_passes_the_binary_s_own_bundled_model_list() {
     // keeps the previous binary's file.
     let new_binary = |comment: &str, list: &str| {
         std::fs::write(bin.join("bundled.json"), list).expect("bundled list");
-        std::fs::write(
-            bin.join("codex"),
-            format!(
-                "#!/bin/sh\n# {comment}\nexec /usr/bin/python3 '{}' \"$@\"\n",
-                bin.join("fake_codex.py").display()
-            ),
-        )
-        .expect("new binary");
+        let launcher = format!(
+            "#!/bin/sh\n# {comment}\nexec /usr/bin/python3 '{}' \"$@\"\n",
+            bin.join("fake_codex.py").display()
+        );
+        crate::test_scratch::write_executable(&bin.join("codex"), launcher.as_bytes(), 0o755);
     };
     new_binary(
         "new build",
