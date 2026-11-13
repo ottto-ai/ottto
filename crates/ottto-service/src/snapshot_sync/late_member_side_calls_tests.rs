@@ -378,13 +378,17 @@ fn late_member_absence_keeps_root_fallback() {
 }
 
 /// [money] Member first: the member and the late evidence exist before any
-/// read, and the first one-file page reads only the member. Nothing is
-/// reserved or hinted; the root keeps only its own requests, and the drained
-/// result matches a cold Full read, placement included.
+/// read, and the first one-file page reads only the member (a cold page reads
+/// the root first even when the member is hinted, so the root transcript is
+/// written after that page). Nothing is reserved or hinted; the root keeps
+/// only its own requests, and the drained result matches a cold Full read,
+/// placement included.
 #[test]
 fn late_member_read_before_its_root_matches_cold_money_and_placement() {
     with_e2(|| {
-        let (mut c, _) = corpus();
+        let (mut c, root) = corpus();
+        let root_bytes = std::fs::read(&root).unwrap();
+        std::fs::remove_file(&root).unwrap();
         evidence(&c, true, "agent-000");
         let member = c.agent(
             0,
@@ -396,12 +400,7 @@ fn late_member_read_before_its_root_matches_cold_money_and_placement() {
         let mut index = ScanIndex::default();
         let (mut root_read, mut member_read, mut complete) = (false, false, false);
         for page in 0..8 {
-            let hints: &[PathBuf] = if page == 0 {
-                std::slice::from_ref(&member)
-            } else {
-                &[]
-            };
-            let mut next = c.raw(&scanner, index, 1, true, hints);
+            let mut next = c.raw(&scanner, index, 1, true, &[]);
             if page == 0 {
                 assert_eq!(scanner.paths(), vec![member.clone()], "member only");
             }
@@ -427,6 +426,9 @@ fn late_member_read_before_its_root_matches_cold_money_and_placement() {
             settle_page(&c, &mut next, &mut progress);
             complete = next.scan.census_complete;
             index = next.index;
+            if page == 0 {
+                std::fs::write(&root, &root_bytes).unwrap();
+            }
             if root_read && member_read && complete {
                 break;
             }
