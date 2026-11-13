@@ -359,49 +359,51 @@ fn read_shell_env(mut command: Command, timeout: Duration) -> Option<BTreeMap<St
 
     let deadline = Instant::now() + timeout;
     let mut child = command.process_group(0).spawn().ok()?;
-    let pgid = libc::pid_t::try_from(child.id()).expect("child PID fits pid_t");
     let mut stdout = child.stdout.take().expect("piped shell stdout");
-    let nonblocking =
-        unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) } == 0;
+    let flags = unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_GETFL) };
+    let nonblocking = flags >= 0
+        && unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } == 0;
     let mut ready = libc::pollfd {
         fd: stdout.as_raw_fd(),
         events: libc::POLLIN,
         revents: 0,
     };
     let mut output = Vec::new();
+    let mut complete = false;
     while nonblocking && Instant::now() < deadline {
         let mut buffer = [0; 8192];
         match stdout.read(&mut buffer) {
-            Ok(0) => match child.try_wait() {
-                Ok(Some(status)) => {
-                    return status.success().then(|| parse_provider_env_output(&output));
+            Ok(0) => match crate::process_guard::exited(&child) {
+                Ok(true) => {
+                    complete = Instant::now() < deadline;
+                    break;
                 }
-                Ok(None) => thread::sleep(
+                Ok(false) => thread::sleep(
                     Duration::from_millis(50)
                         .min(deadline.saturating_duration_since(Instant::now())),
                 ),
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
                 Err(_) => break,
             },
-            Ok(n) if output.len() + n <= 8 * 1024 * 1024 => {
+            Ok(n) if output.len() + n <= 1024 * 1024 => {
                 output.extend_from_slice(&buffer[..n]);
             }
             Err(error) if error.kind() == ErrorKind::WouldBlock => {
                 let millis = deadline
                     .saturating_duration_since(Instant::now())
                     .as_millis();
-                unsafe { libc::poll(&mut ready, 1, millis.min(50) as libc::c_int) };
+                let result = unsafe { libc::poll(&mut ready, 1, millis.min(50) as libc::c_int) };
+                if result < 0 && std::io::Error::last_os_error().kind() != ErrorKind::Interrupted {
+                    break;
+                }
             }
             Err(error) if error.kind() == ErrorKind::Interrupted => continue,
             _ => break,
         }
     }
-    // Do not reap before EOF: the child's reserved PID identifies only our group.
-    if pgid > 1 && pgid != unsafe { libc::getpgrp() } {
-        unsafe { libc::killpg(pgid, libc::SIGKILL) };
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-    None
+    let status = crate::process_guard::stop_group_and_reap(&mut child, Duration::ZERO);
+    drop(stdout);
+    (complete && status.ok()?.success()).then(|| parse_provider_env_output(&output))
 }
 
 fn parse_provider_env_output(output: &[u8]) -> BTreeMap<String, OsString> {
@@ -777,11 +779,69 @@ mod tests {
         let start = Instant::now();
         assert!(shell
             .run(
-                "exec /usr/bin/head -c 8388609 /dev/zero",
+                "printf 'GOOGLE_CLOUD_PROJECT=partial\\n'; exec /usr/bin/head -c 1048577 /dev/zero",
                 Duration::from_secs(15),
             )
             .is_none());
         assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn provider_shell_accepts_exact_byte_bound() {
+        let shell = FakeShell::new();
+        let line = "GOOGLE_CLOUD_PROJECT=shell-project\n";
+        let script = format!(
+            "printf 'GOOGLE_CLOUD_PROJECT=shell-project\\n'; exec /usr/bin/head -c {} /dev/zero",
+            1024 * 1024 - line.len()
+        );
+        assert_eq!(
+            shell
+                .run(&script, INTERACTIVE_SHELL_ENV_TIMEOUT)
+                .expect("complete environment at the bound")
+                .get("GOOGLE_CLOUD_PROJECT"),
+            Some(&OsString::from("shell-project"))
+        );
+    }
+
+    #[test]
+    #[ignore = "finite escaped child invoked only by provider shell tests"]
+    fn provider_shell_escaped_writer_fixture() {
+        let Some(pid_file) = env::var_os("OTTTO_PROVIDER_SHELL_PIPE_FIXTURE").map(PathBuf::from)
+        else {
+            return;
+        };
+        assert!(unsafe { libc::setsid() } >= 0);
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
+        fs::write(&pid_file, std::process::id().to_string()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while Instant::now() < deadline {
+            if unsafe { libc::write(libc::STDOUT_FILENO, b"x".as_ptr().cast(), 1) } < 0
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPIPE)
+            {
+                fs::write(pid_file.with_extension("closed"), []).unwrap();
+                std::process::exit(0);
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        std::process::exit(1);
+    }
+
+    #[test]
+    fn provider_shell_closes_pipe_on_escaped_writer() {
+        let shell = FakeShell::new();
+        let executable = std::env::current_exe().unwrap();
+        let executable = executable.to_string_lossy().replace('\'', "'\\''");
+        let script = format!(
+            "export OTTTO_PROVIDER_SHELL_PIPE_FIXTURE=\"$1\"; '{executable}' --ignored --exact command_env::tests::provider_shell_escaped_writer_fixture --nocapture --test-threads=1 & while [ ! -s \"$1\" ]; do /bin/sleep 0.01; done"
+        );
+        let start = Instant::now();
+        assert!(shell.run(&script, Duration::from_millis(700)).is_none());
+        assert!(start.elapsed() < Duration::from_secs(2));
+        shell.assert_child_stopped();
+        assert!(
+            shell.home.join("child-pid.closed").exists(),
+            "escaped writer did not observe EPIPE"
+        );
     }
 
     #[test]

@@ -50,6 +50,8 @@ pub mod mcp_inventory;
 pub(crate) mod net_resilience;
 pub mod net_transition;
 pub mod otlp_relay;
+#[cfg(unix)]
+pub(crate) mod process_guard;
 pub(crate) mod provider_calls;
 pub mod provider_daily_reference;
 pub(crate) mod quota_credit_model;
