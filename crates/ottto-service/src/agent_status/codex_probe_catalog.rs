@@ -12,7 +12,8 @@ use std::sync::Mutex;
 /// The binary whose list was saved last, its file, and the digest of the
 /// bytes written there; `None` once a probe that used it got no
 /// `account/read` reply.
-static SAVED: Mutex<Option<(SourceStamp, PathBuf, Option<[u8; 32]>)>> = Mutex::new(None);
+type Saved = (SourceStamp, PathBuf, Option<[u8; 32]>);
+static SAVED: Mutex<Option<Saved>> = Mutex::new(None);
 
 /// The daemon support dir; in tests that name none, a scratch dir rather
 /// than the real one.
