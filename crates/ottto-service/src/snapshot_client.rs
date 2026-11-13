@@ -661,6 +661,11 @@ impl UploadFailureDiagnostics {
             && (self.status_family == "transport_timeout" || self.http_status == Some(504))
     }
 
+    /// A transport failure (no HTTP answer) or an HTTP 5xx.
+    pub(crate) fn is_outage(&self) -> bool {
+        self.http_status.is_none_or(|status| status >= 500)
+    }
+
     pub(crate) fn is_snapshot_batch_too_large(&self) -> bool {
         self.endpoint == "snapshot_batch" && self.http_status == Some(413)
     }
