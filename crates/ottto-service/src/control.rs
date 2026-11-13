@@ -9423,6 +9423,100 @@ fn agent_read_timeout_message(error: &LocalApiError) -> Option<String> {
     None
 }
 
+#[derive(Default)]
+struct SetupScanReconcile {
+    binding: Option<(String, String)>,
+    failures: u32,
+    next_due: Option<Instant>,
+    outcome: &'static str,
+}
+static SETUP_SCAN: std::sync::LazyLock<Mutex<SetupScanReconcile>> =
+    std::sync::LazyLock::new(|| Mutex::new(SetupScanReconcile::default()));
+
+pub(crate) fn reconcile_setup_scan_in_background(daemon: &LocalDaemon) {
+    let Ok(mut state) = SETUP_SCAN.try_lock() else {
+        return;
+    };
+    let store = FileConnectionStore::default();
+    let Ok(Some(binding)) = store.load() else {
+        return;
+    };
+    let key = (binding.api_base_url.clone(), binding.setup_run_id.clone());
+    if state.binding.as_ref() != Some(&key) {
+        *state = SetupScanReconcile {
+            binding: Some(key),
+            ..Default::default()
+        };
+    }
+    if state.next_due.is_some_and(|due| Instant::now() < due) {
+        return;
+    }
+    let result = (|| {
+        let settled_run = store.setup_scan_settled_run_id().or_state_poisoned()?;
+        if settled_run.as_deref() == Some(binding.setup_run_id.as_str()) {
+            return Ok(true);
+        }
+        let device = FileDeviceStore::default()
+            .load()
+            .or_state_poisoned()?
+            .ok_or(LocalApiError::SetupRunConnectionMissing)?;
+        let refreshed = refresh_setup_run_token_via_device_secret(&binding.api_base_url, &binding)?;
+        let run = refreshed
+            .run
+            .ok_or(LocalApiError::SetupRunConnectionMissing)?;
+        let mut credentials = SetupRunCredentials {
+            connection: refreshed.connection,
+            setup_run_token: refreshed.setup_run_token,
+        };
+        let machine = daemon.machine_for_trusted_client()?;
+        match run.status.as_str() {
+            "scanning" => {
+                let result = scan_setup_run(
+                    daemon,
+                    &binding.api_base_url,
+                    &mut credentials,
+                    &machine,
+                    Vec::new(),
+                    false,
+                    Some(&device.device_id),
+                )?;
+                Ok(!matches!(
+                    result["status"].as_str(),
+                    Some("scanning" | "waiting_for_companion" | "running_action")
+                ))
+            }
+            "waiting_for_companion" | "running_action" => {
+                let actions = process_setup_actions(
+                    daemon,
+                    &binding.api_base_url,
+                    &mut credentials,
+                    &machine,
+                )?;
+                request_snapshot_sync_after_setup_actions(daemon, &actions);
+                Ok(false)
+            }
+            _ => Ok(true),
+        }
+    })();
+    let mut settled = result.unwrap_or_else(|error| terminal_refresh_rejection(&error).is_some());
+    if settled {
+        let _binding_lock = lock_setup_run_binding();
+        settled = store.settle_setup_scan(&binding).is_ok();
+    }
+    if !settled {
+        state.failures = state.failures.saturating_add(1);
+        state.next_due =
+            Some(Instant::now() + crate::snapshot_sync::full_jitter_backoff(state.failures));
+    } else {
+        state.failures = 0;
+    }
+    let outcome = if settled { "settled" } else { "retry" };
+    if state.outcome != outcome {
+        eprintln!("setup reconcile outcome={outcome}");
+        state.outcome = outcome;
+    }
+}
+
 fn setup_run(
     daemon: &LocalDaemon,
     authorization: &RequestAuthorization,
@@ -9431,6 +9525,7 @@ fn setup_run(
     setup_run_id: Option<String>,
     api_base_url: Option<String>,
 ) -> Result<serde_json::Value, LocalApiError> {
+    let _attempt = SETUP_SCAN.lock().unwrap_or_else(|p| p.into_inner());
     let status = status_for(daemon, authorization)?;
     crate::snapshot_sync::reset_relay_authorization_backoff();
     let mut connection = daemon.connection_for_authorized_client()?;
@@ -9533,8 +9628,34 @@ fn setup_run(
         connection,
     };
 
-    let scan = build_local_scan(&status.machine, sources);
-    let mut detail = match publish_scan_result(&api_base_url, &mut credentials, &scan) {
+    scan_setup_run(
+        daemon,
+        &api_base_url,
+        &mut credentials,
+        &status.machine,
+        sources,
+        claim_code_provided,
+        None,
+    )
+}
+
+fn scan_setup_run(
+    daemon: &LocalDaemon,
+    api_base_url: &str,
+    credentials: &mut SetupRunCredentials,
+    machine: &MachineIdentity,
+    sources: Vec<SourceKind>,
+    claim_code_provided: bool,
+    expected_device: Option<&str>,
+) -> Result<serde_json::Value, LocalApiError> {
+    let scan = build_local_scan(machine, sources);
+    if let Some(expected) = expected_device {
+        let device = FileDeviceStore::default().load().or_state_poisoned()?;
+        if device.as_ref().map(|d| d.device_id.as_str()) != Some(expected) {
+            return Err(LocalApiError::SetupRunConnectionMismatch);
+        }
+    }
+    let mut detail = match publish_scan_result(api_base_url, credentials, &scan) {
         Ok(detail) => detail,
         Err(error) if is_terminal_setup_run_scan_error(&error) => {
             clear_setup_run_connection_if_current(
@@ -9546,8 +9667,7 @@ fn setup_run(
         }
         Err(error) => return Err(error),
     };
-    let action_results =
-        process_setup_actions(daemon, &api_base_url, &mut credentials, &status.machine)?;
+    let action_results = process_setup_actions(daemon, api_base_url, credentials, machine)?;
     if let Some(last) = action_results.last() {
         if let Some(refreshed) = &last.detail {
             detail = refreshed.clone();
@@ -10015,6 +10135,7 @@ fn setup_run_attach_body(machine: &MachineIdentity) -> serde_json::Value {
 
 #[derive(Debug, Deserialize)]
 struct SetupRunRefreshResponse {
+    run: Option<SetupRunApiRun>,
     setup_run_id: Option<String>,
     setup_run_token: String,
     expires_at: String,
@@ -10022,6 +10143,7 @@ struct SetupRunRefreshResponse {
 
 #[derive(Debug, Clone)]
 struct RefreshedSetupRunToken {
+    run: Option<SetupRunApiRun>,
     setup_run_token: String,
     connection: LocalConnectionBinding,
 }
@@ -10215,6 +10337,7 @@ fn refresh_setup_run_token_via_device_secret(
         )?
     };
     Ok(RefreshedSetupRunToken {
+        run: response.run,
         setup_run_token: response.setup_run_token,
         connection: committed,
     })
@@ -22192,6 +22315,175 @@ for line in sys.stdin:
             assert!(requests[3].contains("/run_repaired/local-client/next-action "));
             fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    fn scan_refresh(status: &str) -> &'static str {
+        Box::leak(json!({
+            "setup_run_id":"run_connected_setup", "setup_run_token":"synthetic-token", "expires_at":"2100-01-01T00:00:00Z",
+            "run":{"id":"run_connected_setup", "status":status, "machine_id":null}
+        }).to_string().into_boxed_str())
+    }
+    const SCAN_DETAIL: &str = r#"{"run":{"id":"run_connected_setup","status":"completed","machine_id":null},"sources":[],"next_action":null,"next_question":null}"#;
+    fn scan_fixture(base: String) -> (PathBuf, Vec<EnvVarGuard>, LocalDaemon, LocalDeviceBinding) {
+        *SETUP_SCAN.lock().unwrap() = SetupScanReconcile::default();
+        let (root, mut guards, daemon, device) = connected_binding_fixture("setup-scan", base);
+        guards.push(EnvVarGuard::set_path("HOME", &root));
+        guards.push(EnvVarGuard::set_path(
+            "OTTTO_COMMAND_SEARCH_PATH",
+            &root.join("bin"),
+        ));
+        (root, guards, daemon, device)
+    }
+
+    /// [regress] Missing initial scans recover after connectivity returns, without the app.
+    #[test]
+    #[serial]
+    fn background_setup_scan_repairs_offline_debt_once_without_app() {
+        let _lock = lock_backend_test_env();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let script = Arc::new(Mutex::new(SetupRunReadScript {
+            refresh: (0, ""),
+            read: (200, SCAN_DETAIL),
+        }));
+        let base = expired_setup_run_read_server(calls.clone(), script.clone());
+        let (_root, _guards, daemon, _) = scan_fixture(base);
+        reconcile_setup_scan_in_background(&daemon);
+        assert!(FileConnectionStore::default()
+            .setup_scan_settled_run_id()
+            .unwrap()
+            .is_none());
+        assert_eq!(SETUP_SCAN.lock().unwrap().failures, 1);
+        script.lock().unwrap().refresh = (200, scan_refresh("scanning"));
+        SETUP_SCAN.lock().unwrap().next_due = None;
+        reconcile_setup_scan_in_background(&daemon);
+        reconcile_setup_scan_in_background(&daemon);
+        assert_eq!(SETUP_SCAN.lock().unwrap().failures, 0);
+        assert_eq!(
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|p| p.ends_with("/scan-result"))
+                .count(),
+            1
+        );
+    }
+
+    /// [behaviour] Scan debt posts, action debt polls without scanning, and other statuses settle.
+    #[test]
+    #[serial]
+    fn background_setup_scan_status_decisions() {
+        let _lock = lock_backend_test_env();
+        for status in [
+            "scanning",
+            "completed",
+            "waiting_for_companion",
+            "running_action",
+        ] {
+            let actions = matches!(status, "waiting_for_companion" | "running_action");
+            let mut answers = vec![(200, scan_refresh(status))];
+            if status == "scanning" {
+                answers.push((200, SCAN_DETAIL));
+            }
+            if status == "scanning" || actions {
+                answers.extend([(200, "{}"), (200, r#"{"action":null}"#)]);
+            }
+            let (base, server) = scripted_json_backend(answers);
+            let (_root, _guards, daemon, _) = scan_fixture(base);
+            reconcile_setup_scan_in_background(&daemon);
+            let requests = server.join().unwrap();
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|r| r.contains("/scan-result"))
+                    .count(),
+                usize::from(status == "scanning")
+            );
+            assert_eq!(
+                FileConnectionStore::default()
+                    .setup_scan_settled_run_id()
+                    .unwrap()
+                    .is_some(),
+                !actions
+            );
+            if actions {
+                assert!(SETUP_SCAN.lock().unwrap().next_due.is_some());
+            }
+        }
+    }
+
+    /// [behaviour] Rejected background authority parks; only the existing health hold owns logout.
+    #[test]
+    #[serial]
+    fn terminal_setup_refresh_parks_without_resetting_identity() {
+        let _lock = lock_backend_test_env();
+        for detail in ["Setup run expired", "Telemetry device secret is invalid"] {
+            let body = Box::leak(json!({"detail":detail}).to_string().into_boxed_str());
+            let (base, server) = scripted_json_backend(vec![(401, body)]);
+            let (_root, _guards, daemon, device) = scan_fixture(base);
+            let store = FileConnectionStore::default();
+            let binding = store.load().unwrap();
+            let account = FileAccountStore::default().load().unwrap();
+            let setup_token = KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
+                .load()
+                .unwrap();
+            let device_secret = KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+                .load()
+                .unwrap();
+            reconcile_setup_scan_in_background(&daemon);
+            assert!(store.setup_scan_settled_run_id().unwrap().is_some());
+            assert_eq!(store.load().unwrap(), binding);
+            assert_eq!(FileAccountStore::default().load().unwrap(), account);
+            assert_eq!(FileDeviceStore::default().load().unwrap(), Some(device));
+            assert_eq!(
+                KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
+                    .load()
+                    .unwrap(),
+                setup_token
+            );
+            assert_eq!(
+                KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+                    .load()
+                    .unwrap(),
+                device_secret
+            );
+            reconcile_setup_scan_in_background(&daemon);
+            assert_eq!(server.join().unwrap().len(), 1);
+        }
+    }
+
+    /// [format] Settlement survives restart, remains readable by the old binding type, and clears on save.
+    #[test]
+    #[serial]
+    fn persisted_setup_settlement_skips_restart_refresh_and_is_backward_compatible() {
+        let _lock = lock_backend_test_env();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let script = Arc::new(Mutex::new(SetupRunReadScript {
+            refresh: (200, scan_refresh("completed")),
+            read: (200, "{}"),
+        }));
+        let base = expired_setup_run_read_server(calls.clone(), script);
+        let (_root, _guards, daemon, _) = scan_fixture(base);
+        let store = FileConnectionStore::default();
+        assert!(store.setup_scan_settled_run_id().unwrap().is_none());
+        reconcile_setup_scan_in_background(&daemon);
+        let binding = store.load().unwrap().unwrap();
+        let legacy: LocalConnectionBinding =
+            serde_json::from_slice(&fs::read(store.path()).unwrap()).unwrap();
+        assert_eq!(legacy, binding);
+        assert_eq!(
+            store.setup_scan_settled_run_id().unwrap().as_deref(),
+            Some(binding.setup_run_id.as_str())
+        );
+        *SETUP_SCAN.lock().unwrap() = SetupScanReconcile::default();
+        reconcile_setup_scan_in_background(&daemon);
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        let mut replacement = binding.clone();
+        replacement.setup_run_id = "replacement-run".into();
+        store.save(&replacement).unwrap();
+        assert!(store.setup_scan_settled_run_id().unwrap().is_none());
+        store.settle_setup_scan(&binding).unwrap();
+        assert!(store.setup_scan_settled_run_id().unwrap().is_none());
     }
 
     #[test]

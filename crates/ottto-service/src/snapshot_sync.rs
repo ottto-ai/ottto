@@ -5148,6 +5148,7 @@ pub fn spawn_local_health_projection_sync(daemon: LocalDaemon) -> Result<()> {
                     );
                 }
             }
+            crate::control::reconcile_setup_scan_in_background(&daemon);
             std::thread::sleep(LOCAL_HEALTH_PROJECTION_INTERVAL);
         })
         .context("spawn local health projection sync")?;
