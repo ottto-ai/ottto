@@ -3382,10 +3382,15 @@ fn remove_codex_account(
             }
         }
     }
-    store
-        .remove(schema_version, slot_id)
-        .map_err(codex_account_slot_settings_error)
-        .map(crate::agent_status::annotate_codex_accounts_status)
+    // Under the home's read lock: a limits read that may be renewing its login
+    // ends (and drains) before the home is removed, so none writes it back.
+    let remove = || store.remove(schema_version, slot_id);
+    match store.slot_home(slot_id) {
+        Ok(home) => crate::agent_status::with_codex_home_read_lock(&home, remove),
+        Err(_) => remove(),
+    }
+    .map_err(codex_account_slot_settings_error)
+    .map(crate::agent_status::annotate_codex_accounts_status)
 }
 
 fn codex_account_slot_settings_error(error: CodexAccountSlotSettingsError) -> LocalApiError {

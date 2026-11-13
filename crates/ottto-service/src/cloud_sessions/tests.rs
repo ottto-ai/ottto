@@ -212,12 +212,11 @@ fn cloud_cli_escaped_writer_cannot_hold_deadline_or_kill_other_groups() {
 }
 
 /// [regress] A `codex cloud list` past its deadline may be refreshing its
-/// login: it gets the drain, then SIGTERM and the grace time, and only then
-/// SIGKILL.
+/// login: it gets the drain, and only then is its group SIGKILLed.
 #[cfg(unix)]
 #[test]
 #[serial_test::serial]
-fn cloud_cli_past_its_deadline_gets_term_before_kill() {
+fn cloud_cli_past_its_deadline_is_killed_after_the_drain() {
     let fixture = CloudCliFixture::new("ignore-term", &[], 0);
     let drain = Duration::from_secs(1);
     let started = Instant::now();
@@ -229,14 +228,74 @@ fn cloud_cli_past_its_deadline_gets_term_before_kill() {
         || CodexCloudCliRunner.list_page_bounded(None, PAGE_LIMIT, Duration::from_secs(1)),
     );
     assert!(result.unwrap_err().to_string().contains("timed out"));
-    assert!(
-        started.elapsed() >= Duration::from_secs(1) + drain + crate::codex_sign_in::TERMINATE_GRACE
-    );
-    assert_eq!(
-        fs::read_to_string(fixture.root.join("signals")).unwrap(),
-        "TERM\n"
-    );
+    assert!(started.elapsed() >= Duration::from_secs(1) + drain);
+    assert!(!fixture.root.join("signals").exists(), "no SIGTERM");
     fixture.wait_gone("direct");
+}
+
+/// [regress] Pause while a `codex cloud list` page lingers past its deadline
+/// completes within the stop wait: after the page's deadline and the child's
+/// drain, never before the child is gone.
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn pause_during_a_lingering_cloud_child_completes_within_the_stop_wait() {
+    let fixture = CloudCliFixture::new("ignore-term", &[], 0);
+    let (_root, grants, checkpoints) = stores("lingering-child-pause");
+    enabled(&grants);
+    let checkpoints = Arc::new(checkpoints);
+    let collector_grants = grants.clone();
+    let collector_checkpoints = Arc::clone(&checkpoints);
+    let drain = Duration::from_secs(1);
+    let run = thread::spawn(move || {
+        crate::agent_status::with_codex_app_server_test_timeouts(drain, drain, drain, drain, || {
+            let server = Server::new();
+            CloudCollector::default().run_slice(
+                &inputs(
+                    &collector_grants,
+                    &collector_checkpoints,
+                    &CodexCloudCliRunner,
+                    &server,
+                ),
+                Instant::now(),
+                midnight(),
+            )
+        })
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !fixture.root.join("direct").exists() {
+        assert!(Instant::now() < deadline, "the page's child started");
+        thread::sleep(Duration::from_millis(5));
+    }
+    grants.pause(now()).unwrap();
+    checkpoints
+        .wait_for_collector_io_idle(COLLECTOR_IO_STOP_TIMEOUT)
+        .expect("stopped within the stop wait");
+    fixture.wait_gone("direct");
+    run.join().unwrap();
+}
+
+/// [regress] The child's owner is its only reaper: an exited child stays
+/// unreaped (its PID and group id reserved) after any number of exit checks,
+/// until `stop_and_reap` reaps it with its own status and no signal.
+#[cfg(unix)]
+#[test]
+fn codex_child_exit_is_observed_without_reaping() {
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+    let mut command = Command::new("/bin/sh");
+    command.args(["-c", "exit 7"]).env_clear().process_group(0);
+    let mut child = CodexChild::new(
+        crate::local_resource_diagnostics::cli_children::spawn(&mut command).unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !child.exited().unwrap() {
+        assert!(Instant::now() < deadline, "the exit is observed");
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(child.exited().unwrap(), "still unreaped after a check");
+    let status = child.stop_and_reap().unwrap();
+    assert_eq!(status.code(), Some(7));
+    assert_eq!(status.signal(), None);
 }
 
 fn stores(name: &str) -> (PathBuf, CloudSessionGrantStore, CloudSessionCheckpointStore) {

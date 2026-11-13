@@ -68,11 +68,13 @@ const CYCLE_BUDGET: Duration = Duration::from_secs(45);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(12);
 const RELAY_IO_TIMEOUT: Duration = COMMAND_TIMEOUT;
 /// One page's deadline (its home-lock wait included), then a lingering
-/// child's drain and termination grace, plus a margin.
+/// child's drain, plus a margin.
 pub(crate) const COLLECTOR_IO_STOP_TIMEOUT: Duration = COMMAND_TIMEOUT
     .saturating_add(crate::agent_status::CODEX_CHILD_DRAIN)
-    .saturating_add(crate::codex_sign_in::TERMINATE_GRACE)
     .saturating_add(Duration::from_secs(3));
+/// A page that waited for its home starts only with this much of its
+/// deadline left.
+const PAGE_START_FLOOR: Duration = Duration::from_secs(5);
 const KILL_SWITCH_ENV: &str = "OTTTO_CODEX_CLOUD_SESSIONS_DISABLED";
 const DEFAULT_API_BASE_URL: &str = "https://api.ottto.net";
 const LEGACY_API_BASE_URL: &str = "https://ottto.net/backend";
@@ -1870,58 +1872,70 @@ impl CodexChild {
     }
 
     pub(crate) fn exited(&self) -> std::io::Result<bool> {
-        let child = self.child.as_ref().expect("owned codex child");
-        // Observe exit without reaping: reserve the PID until the owned process
-        // group has been stopped, even if a descendant retains stdout.
-        let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
-        let result = unsafe {
-            libc::waitid(
-                libc::P_PID,
-                child.id() as libc::id_t,
-                &mut info,
-                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-            )
-        };
-        if result < 0 {
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::Interrupted {
-                return Ok(false);
-            }
-            return Err(error);
-        }
-        Ok(info.si_signo != 0)
+        child_exited(self.child.as_ref().expect("owned codex child"))
     }
 
-    /// Whether the child exits within `limit`.
-    fn exits_within(&self, limit: Duration) -> bool {
-        let until = Instant::now() + limit;
-        while !self.exited().unwrap_or(false) {
-            if Instant::now() >= until {
-                return false;
-            }
-            thread::sleep(crate::codex_sign_in::POLL_INTERVAL);
-        }
-        true
-    }
-
-    /// Ends the child without cutting off a login refresh it may be making.
-    /// The caller has closed its stdin (or it had none). It gets
-    /// [`crate::agent_status::codex_child_drain`] to exit by itself, then
-    /// SIGTERM and the grace time of a stopped sign-in, then SIGKILL; the
-    /// group goes last either way (a descendant may hold its output).
+    /// Ends the child without cutting off a login refresh it may be making:
+    /// the caller has closed its stdin (or it had none) and its output reader.
     pub(crate) fn stop_and_reap(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        // Command::process_group(0) created this group; the direct child has
-        // never been reaped, so its PID cannot have been reused by another group.
-        let group = -(self.child.as_ref().expect("owned codex child").id() as libc::pid_t);
-        if !self.exits_within(crate::agent_status::codex_child_drain()) {
-            unsafe { libc::kill(group, libc::SIGTERM) };
-            self.exits_within(crate::codex_sign_in::TERMINATE_GRACE);
-        }
-        let mut child = self.child.take().expect("owned codex child");
-        unsafe { libc::kill(group, libc::SIGKILL) };
-        let _ = child.kill();
-        child.wait()
+        stop_group_and_reap(
+            self.child.take().expect("owned codex child"),
+            crate::agent_status::codex_child_drain(),
+        )
     }
+}
+
+/// Observe exit without reaping: the PID, and so the group id, stays reserved
+/// until the group has been stopped, even if a descendant keeps its stdout.
+#[cfg(unix)]
+fn child_exited(child: &std::process::Child) -> std::io::Result<bool> {
+    let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            child.id() as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            return Ok(false);
+        }
+        return Err(error);
+    }
+    Ok(info.si_signo != 0)
+}
+
+/// Give the leader of a group started by `Command::process_group(0)` up to
+/// `drain` to exit by itself, then SIGKILL its group and reap it. This is the
+/// only reaper, and nothing is signalled after a reap.
+#[cfg(unix)]
+pub(crate) fn stop_group_and_reap(
+    mut child: crate::local_resource_diagnostics::cli_children::MeasuredChild,
+    drain: Duration,
+) -> std::io::Result<std::process::ExitStatus> {
+    let deadline = Instant::now() + drain;
+    loop {
+        match child_exited(&child) {
+            Ok(done) if done || Instant::now() >= deadline => break,
+            Ok(_) => thread::sleep(
+                Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
+            ),
+            // Already reaped: its PID is no longer reserved. Never signal it.
+            Err(error) if error.raw_os_error() == Some(libc::ECHILD) => return child.wait(),
+            Err(_) => break,
+        }
+    }
+    if let Ok(group) = libc::pid_t::try_from(child.id()) {
+        if group > 1 && group != unsafe { libc::getpgrp() } {
+            // Even an exited leader may leave live descendants in its group.
+            unsafe { libc::killpg(group, libc::SIGKILL) };
+        }
+    }
+    let _ = child.kill();
+    child.wait()
 }
 
 #[cfg(unix)]
@@ -2112,12 +2126,15 @@ impl CloudSessionRunner for CodexCloudCliRunner {
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
         // One Codex child per home: never beside a limits read of the same
-        // home, which may be refreshing its login. The wait for it ends with
-        // the page's deadline.
+        // home, which may be refreshing its login. A page that has to wait for
+        // it starts only with PAGE_START_FLOOR of its deadline left.
         #[cfg(unix)]
         {
             let home = crate::agent_status::codex_cli_home();
-            crate::agent_status::with_codex_home_read_lock_until(&home, deadline, || {
+            let wait_until = deadline
+                .checked_sub(PAGE_START_FLOOR)
+                .unwrap_or_else(Instant::now);
+            crate::agent_status::with_codex_home_read_lock_until(&home, wait_until, || {
                 let started = Instant::now();
                 let result = run_codex_cloud_command(&mut command, deadline);
                 // A deadline already spent starts nothing.

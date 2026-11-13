@@ -70,9 +70,8 @@ const CHECK_RETRY_DELAY: Duration = Duration::from_secs(15);
 /// The local callback port of every `codex login` browser sign-in.
 const CODEX_LOGIN_PORT: u16 = 1455;
 pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(100);
-/// Time the CLI gets to exit after SIGTERM before SIGKILL; a stopped Codex
-/// app-server or `codex cloud list` gets the same.
-pub(crate) const TERMINATE_GRACE: Duration = Duration::from_secs(5);
+/// Time the CLI gets to exit after SIGTERM before SIGKILL.
+const TERMINATE_GRACE: Duration = Duration::from_secs(5);
 /// Time to wait for the CLI's output reader to read the last lines after it
 /// exited.
 const OUTPUT_READ_WAIT: Duration = Duration::from_secs(2);

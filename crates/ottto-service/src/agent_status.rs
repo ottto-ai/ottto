@@ -16942,10 +16942,9 @@ struct CodexAppServerRun {
 const CODEX_APP_SERVER_MIN_REQUESTS: u32 = 3;
 
 /// How long an ended Codex child (stdin closed, or a run past its deadline)
-/// gets to exit by itself before it is stopped: it may be refreshing its
-/// login. Codex's own refresh request times out after this long, and its
-/// app-server exits within it after stdin closes.
-pub(crate) const CODEX_CHILD_DRAIN: Duration = Duration::from_secs(45);
+/// gets to exit by itself before its group is killed: it may be refreshing
+/// its login. Codex's app-server exits within 45 s of its stdin closing.
+pub(crate) const CODEX_CHILD_DRAIN: Duration = Duration::from_secs(46);
 
 /// [`CODEX_CHILD_DRAIN`], or a test's scaled bound.
 pub(crate) fn codex_child_drain() -> Duration {
@@ -17134,7 +17133,8 @@ fn run_codex_app_server_rate_limits_for_home(
             .map_err(|_| "Codex app-server could not be started.".to_string())?,
     );
     run.spawned = true;
-    // Declared after `child`, so stdin closes before the child is ended.
+    // Declared after `child`: stdin and the output reader close before the
+    // child is ended, so neither holds up its own exit.
     let (stdin, stdout) = child.take_pipes();
     let stdout = stdout.ok_or_else(|| "Codex app-server stdout was unavailable.".to_string())?;
     let (sender, receiver) =
@@ -17184,7 +17184,7 @@ fn run_codex_app_server_rate_limits_for_home(
             .map_err(|_| "Codex app-server request flush failed.".to_string())
     })();
     if let Err(message) = write_result {
-        drop(stdin);
+        drop((stdin, receiver));
         let _ = child.stop_and_reap();
         return Err(message);
     }
@@ -17337,7 +17337,7 @@ fn run_codex_app_server_rate_limits_for_home(
     let settled = match outcome {
         Ok(settled) => settled || (detail_requested && rate_limits_result.is_some()),
         Err(message) => {
-            drop(stdin);
+            drop((stdin, receiver));
             let _ = child.stop_and_reap();
             return Err(message);
         }
@@ -17357,7 +17357,7 @@ fn run_codex_app_server_rate_limits_for_home(
     ) else {
         // Observe the child's own end before our cleanup.
         let ended = child.exited().unwrap_or(false);
-        drop(stdin);
+        drop((stdin, receiver));
         let status = child.stop_and_reap().ok().filter(|_| ended);
         return Err(codex_app_server_end_failure(
             phase,
@@ -17368,7 +17368,7 @@ fn run_codex_app_server_rate_limits_for_home(
     };
     let (refreshed_credentials, credential_read_failed) =
         credentials.unwrap_or_else(read_credentials);
-    drop(stdin);
+    drop((stdin, receiver));
     let _ = child.stop_and_reap();
     Ok(CodexAppServerObservation {
         account,

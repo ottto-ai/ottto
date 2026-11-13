@@ -4576,7 +4576,7 @@ fn codex_dead_login_survives_a_failed_quota_read() {
 #[cfg(unix)]
 #[test]
 #[serial]
-fn codex_account_stage_auth_rejection_is_a_dead_login() {
+fn codex_account_stage_auth_rejection_is_a_dead_login_until_a_good_read() {
     use std::os::unix::fs::PermissionsExt;
 
     for (label, text, dead) in [
@@ -4633,6 +4633,20 @@ fn codex_account_stage_auth_rejection_is_a_dead_login() {
                 "{label}"
             );
             assert!(read.binding.is_none(), "{label}");
+        }
+        if label == "v0163" {
+            // Codex 0.163 gives the same text for a transient refresh
+            // failure: it reads as a dead login only until the next good read.
+            std::fs::write(&executable, &script).expect("answering account read");
+            for quota_read in [CodexQuotaRead::Provider, CodexQuotaRead::Saved] {
+                let read = collect(Some(registered.clone()), quota_read);
+                assert_ne!(
+                    read.status.state,
+                    CodexAccountSlotCollectionStateV1::NeedsLogin,
+                    "{label}: recovered"
+                );
+                assert_eq!(read.binding.as_ref(), Some(&registered), "{label}: recovered");
+            }
         }
 
         codex_credit_grants::forget_binding_cadence(&codex_credit_grants::binding_key(
@@ -5034,14 +5048,14 @@ const FAKE_CODEX_APP_SERVER_ANSWERS: &str = r#"    if '"id":1' in line:
         print('{"id":"ottto_rate_limits","result":{"rateLimitResetCredits":{"availableCount":2},"rateLimitsByLimitId":{},"rateLimits":{}}}', flush=True)
 "#;
 
-/// [regress] A probe child is never killed while it may still be refreshing
-/// its login: once its stdin closes, one that exits within the drain is
-/// reaped without a signal; one that does not gets SIGTERM, and SIGKILL only
-/// after the grace time. The whole group goes, the native child included.
+/// [regress] A probe child gets a bounded wait to finish (it may be
+/// refreshing its login) before it is stopped: once its stdin closes, one
+/// that exits within the drain is reaped without a signal; one that does not
+/// is SIGKILLed with its group only after the drain.
 #[cfg(unix)]
 #[test]
 #[serial]
-fn codex_probe_child_ends_by_drain_then_term_then_kill() {
+fn codex_probe_child_ends_by_drain_then_kill() {
     for (mode, drain) in [
         ("exit_after_eof", Duration::from_secs(5)),
         ("ignore_eof", Duration::from_secs(1)),
@@ -5089,15 +5103,11 @@ fn codex_probe_child_ends_by_drain_then_term_then_kill() {
             0,
             "{mode}: the child is gone"
         );
+        assert_eq!(signals, "", "{mode}: no SIGTERM");
         if mode == "exit_after_eof" {
-            assert_eq!(signals, "", "{mode}: no signal");
             assert!(elapsed >= Duration::from_secs(2), "{mode}: its own exit");
         } else {
-            assert_eq!(signals, "TERM\n", "{mode}: SIGTERM first");
-            assert!(
-                elapsed >= drain + crate::codex_sign_in::TERMINATE_GRACE,
-                "{mode}: SIGKILL only after the grace time"
-            );
+            assert!(elapsed >= drain, "{mode}: SIGKILL only after the drain");
         }
     }
 }
