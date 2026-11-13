@@ -235,7 +235,8 @@ fn cloud_cli_past_its_deadline_is_killed_after_the_drain() {
 
 /// [regress] Pause while a `codex cloud list` page lingers past its deadline
 /// completes within the stop wait: after the page's deadline and the child's
-/// drain, never before the child is gone.
+/// drain, never before the child is gone. An account change waits the same
+/// way, so its CLI call must not time out first.
 #[cfg(unix)]
 #[test]
 #[serial_test::serial]
@@ -268,11 +269,21 @@ fn pause_during_a_lingering_cloud_child_completes_within_the_stop_wait() {
         thread::sleep(Duration::from_millis(5));
     }
     grants.pause(now()).unwrap();
+    let waited = Instant::now();
     checkpoints
         .wait_for_collector_io_idle(COLLECTOR_IO_STOP_TIMEOUT)
         .expect("stopped within the stop wait");
+    assert!(waited.elapsed() < COLLECTOR_IO_STOP_TIMEOUT);
     fixture.wait_gone("direct");
     run.join().unwrap();
+    // An account change replies only after this same wait, so its CLI call
+    // (the long control timeout) outlasts it with room for the change itself;
+    // the ordinary timeout would not.
+    assert!(COLLECTOR_IO_STOP_TIMEOUT > ottto_core::LOCAL_CONTROL_SOCKET_TIMEOUT);
+    assert!(
+        COLLECTOR_IO_STOP_TIMEOUT + Duration::from_secs(60)
+            <= ottto_core::LOCAL_CONTROL_REFRESH_TIMEOUT
+    );
 }
 
 /// [regress] The child's owner is its only reaper: an exited child stays
