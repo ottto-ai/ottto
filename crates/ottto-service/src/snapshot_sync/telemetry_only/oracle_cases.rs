@@ -220,7 +220,7 @@ pub(super) fn pairing() {
         if at == "2026-08-02T06:30:00Z" {
             assert!(!candidate(&p), "pre-T settlement");
         }
-        files_held(&c);
+        assert!(member(&c, true).exists() && member(&c, false).exists());
     }
     for incomplete in [false, true] {
         pair(&c, &[]);
@@ -319,7 +319,7 @@ pub(super) fn refusal() {
             candidate, !permanent,
             "only a validated permanent refusal settles scheduling"
         );
-        files_held(&c);
+        assert!(member(&c, true).exists() && member(&c, false).exists());
     }
 }
 

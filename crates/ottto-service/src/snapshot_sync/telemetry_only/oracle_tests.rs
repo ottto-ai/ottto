@@ -157,11 +157,10 @@ fn only(page: &Page) -> &SnapshotItem {
 }
 fn compare_modes(c: &Corpus, cold: &RouteResult, modes: &[Mode]) {
     for &mode in modes {
-        let mut p = if matches!(mode, Mode::Ram) {
-            progress()
-        } else {
-            restore(&progress())
-        };
+        let mut p = progress();
+        if !matches!(mode, Mode::Ram) {
+            p = restore(&p);
+        }
         assert_equivalent(cold, &send(&build(c, &mut p), &mut p, mode));
     }
 }
@@ -176,9 +175,6 @@ fn suppressed(page: &Page, p: &mut Progress) {
 fn transcript_only(page: &Page) -> bool {
     let items = &page.scan.snapshots;
     items.iter().all(|i| i.evidence_basis.is_none())
-}
-fn files_held(c: &Corpus) {
-    assert!(member(c, true).exists() && member(c, false).exists());
 }
 fn hint_json() -> Value {
     json!({
@@ -362,8 +358,7 @@ fn pair_hold() {
     }
 }
 
-/// [format] Exit the writing process before the old source opens the store;
-/// the runtime registry deliberately retains the exclusive SQLite owner.
+/// [format] Separate processes release the exclusive SQLite owner for old sources.
 #[test]
 fn telemetry_only_previous_release_source_round_trip() {
     if std::env::var("GITHUB_ACTIONS").as_deref() != Ok("true")
@@ -373,7 +368,6 @@ fn telemetry_only_previous_release_source_round_trip() {
     }
     let dir = test_dir("otel-only-carry-orchestration");
     let child = |stage: &str, root: &Path| {
-        // libtest's exact names omit the crate component of module_path!().
         let test = format!(
             "{}::telemetry_only_carry_child",
             module_path!().split_once("::").unwrap().1
@@ -432,8 +426,6 @@ fn telemetry_only_carry_child() {
                 .insert(key.clone(), json!({"observations":[]}));
             state.accepted_cache_heads.insert(key, "a".repeat(64));
             state.save(&path).unwrap();
-            // The row owner releases resident hints after COMMIT. Compare the
-            // durable row on both sides, not an evicted writer-side cache.
             state.load_identity([ROOT]).unwrap();
             assert!(state.accepted_identity_buckets.get(ROOT).is_some());
             fs::write(
@@ -560,8 +552,6 @@ fn carriers() {
         let mut p = progress();
         let mut index = ScanIndex::default();
         if kind == "correction" {
-            // Native revision-2 acquisition/ACK, then revision-3 correction,
-            // then a relay notice. The retained census must survive both.
             let scanner = Scanner::capturing_identity();
             let old = crate::snapshots::with_max_gated_claude_revision(2, || {
                 ready(&c, &scanner, index.clone(), 100, false)
@@ -570,7 +560,15 @@ fn carriers() {
         }
         let mut full = retained(&c, &mut p, index, 100);
         assert_eq!(only(&full).request_count, remaining, "{kind}");
-        assert_eq!(total(&full), 4, "request conservation: {kind}");
+        // Main counts unproven all-copy twins twice; preserve its exact bodies.
+        let mut off = hint();
+        off.claude_otel_only_sessions_contract = None;
+        let native = page(&c, &mut progress(), &off, WireBudget::default());
+        let mut bodies = full.scan.snapshots.clone();
+        bodies.retain(|i| i.evidence_basis.is_none());
+        let count = total(&native) + remaining;
+        let expected = (canonical(&native.scan.snapshots), count);
+        assert_eq!((canonical(&bodies), total(&full)), expected, "{kind}");
         let cold = send(&full, &mut p, Mode::ColdFull);
         let saved = settled_index(&c, &mut full, &p);
         if kind != "forks" {
