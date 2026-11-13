@@ -382,12 +382,12 @@ fn read_shell_env(mut command: Command, timeout: Duration) -> Option<BTreeMap<St
     while nonblocking && Instant::now() < deadline {
         let mut buffer = [0; 8192];
         match stdout.read(&mut buffer) {
-            Ok(0) => match crate::process_guard::exited(&child) {
-                Ok(true) => {
-                    complete = Instant::now() < deadline;
+            Ok(0) => match crate::process_guard::exited_successfully(&child) {
+                Ok(Some(success)) => {
+                    complete = success && Instant::now() < deadline;
                     break;
                 }
-                Ok(false) => thread::sleep(
+                Ok(None) => thread::sleep(
                     Duration::from_millis(50)
                         .min(deadline.saturating_duration_since(Instant::now())),
                 ),
@@ -817,6 +817,16 @@ mod tests {
             result.expect("complete env").get("GOOGLE_CLOUD_PROJECT"),
             Some(&OsString::from("shell-project"))
         );
+    }
+
+    #[test]
+    fn provider_shell_nonzero_exit_stops_redirected_background_job() {
+        let shell = FakeShell::new();
+        assert!(shell.run(
+            "/bin/sleep 10 >/dev/null 2>&1 & echo $! > \"$1\"; printf 'GOOGLE_CLOUD_PROJECT=failed\\n'; exit 7",
+            INTERACTIVE_SHELL_ENV_TIMEOUT,
+        ).is_none());
+        shell.assert_child_stopped();
     }
 
     #[test]

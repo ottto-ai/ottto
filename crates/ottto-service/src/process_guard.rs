@@ -5,6 +5,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub(crate) fn exited(child: &Child) -> io::Result<bool> {
+    Ok(exited_successfully(child)?.is_some())
+}
+
+/// None while running, otherwise the observed success flag; never reaps.
+pub(crate) fn exited_successfully(child: &Child) -> io::Result<Option<bool>> {
     let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
     let result = unsafe {
         libc::waitid(
@@ -17,7 +22,8 @@ pub(crate) fn exited(child: &Child) -> io::Result<bool> {
     if result < 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(info.si_signo != 0)
+    Ok((info.si_signo != 0)
+        .then(|| info.si_code == libc::CLD_EXITED && unsafe { info.si_status() } == 0))
 }
 
 /// Preserve specialized waiters' accounting and cached exit status.
@@ -115,6 +121,7 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
         assert!(exited(&child).unwrap());
+        assert_eq!(exited_successfully(&child).unwrap(), Some(false));
         let status = stop_group_and_reap(child, Duration::from_secs(2)).unwrap();
         assert_eq!(status.code(), Some(7));
     }

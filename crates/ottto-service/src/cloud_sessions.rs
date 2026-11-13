@@ -1862,15 +1862,22 @@ impl CodexCloudChild {
 
     fn stop_and_reap(&mut self) -> std::io::Result<std::process::ExitStatus> {
         let child = self.child.take().expect("owned cloud child");
-        crate::process_guard::stop_group_and_reap(child, Duration::ZERO)
+        if matches!(
+            crate::process_guard::exited_successfully(&child),
+            Ok(Some(true))
+        ) {
+            crate::process_guard::stop_group_and_reap(child, Duration::ZERO)
+        } else {
+            crate::process_guard::kill_group_and_reap(child)
+        }
     }
 }
 
 #[cfg(unix)]
 impl Drop for CodexCloudChild {
     fn drop(&mut self) {
-        if self.child.is_some() {
-            let _ = self.stop_and_reap();
+        if let Some(child) = self.child.take() {
+            let _ = crate::process_guard::kill_group_and_reap(child);
         }
     }
 }

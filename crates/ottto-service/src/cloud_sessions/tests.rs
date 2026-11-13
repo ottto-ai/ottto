@@ -205,6 +205,31 @@ fn cloud_cli_escaped_writer_cannot_hold_deadline_or_kill_other_groups() {
     fixture.wait_gone("descendant");
 }
 
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn cloud_cli_timeout_stops_group_after_leader_exit() {
+    let fixture = CloudCliFixture::new("hold-exit", &[], 0);
+    let result =
+        CodexCloudCliRunner.list_page_bounded(None, PAGE_LIMIT, Duration::from_millis(300));
+    assert!(result.unwrap_err().to_string().contains("timed out"));
+    fixture.wait_gone("direct");
+    let pid = fixture.pid("descendant").to_string();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let output = Command::new("/bin/ps")
+            .args(["-o", "stat=", "-p", &pid])
+            .output()
+            .unwrap();
+        let state = String::from_utf8_lossy(&output.stdout);
+        if state.trim().is_empty() || state.trim().starts_with('Z') {
+            break;
+        }
+        assert!(Instant::now() < deadline, "timed-out Cloud group survived");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn stores(name: &str) -> (PathBuf, CloudSessionGrantStore, CloudSessionCheckpointStore) {
     let root = temp_dir(name);
     (
