@@ -16927,7 +16927,7 @@ fn codex_app_server_end_failure(
 
 /// What one `codex app-server` run asked of the provider, for the
 /// provider-call log.
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct CodexAppServerRun {
     spawned: bool,
     /// Whether the session asked for the detailed rate-limits read.
@@ -16941,9 +16941,9 @@ struct CodexAppServerRun {
     /// login there ([`codex_app_server_auth_rejected`]), whatever the rest of
     /// the session did.
     account_absent: bool,
-    /// The number of the binary whose bundled model list was passed to Codex
+    /// The binary whose bundled model list was passed to Codex
     /// ([`codex_probe_catalog`]), so it sent no models request.
-    model_list: Option<u64>,
+    model_list: Option<crate::transcript_acquisition::SourceStamp>,
     /// `account/read` answered, with a result or an error.
     account_answered: bool,
 }
@@ -17084,9 +17084,8 @@ fn call_codex_app_server_rate_limits_for_home(
     }
     // A Codex that ended (not timed out) without answering `account/read`
     // may not take the list: later probes run without it until it changes.
-    if let (Some(generation), false, false) = (run.model_list, run.account_answered, run.timed_out)
-    {
-        codex_probe_catalog::give_up(generation);
+    if let (Some(binary), false, false) = (&run.model_list, run.account_answered, run.timed_out) {
+        codex_probe_catalog::give_up(binary);
     }
     if run.spawned && ottto_core::codex_auth_file_mark(codex_home) != auth_before {
         eprintln!(
@@ -17155,7 +17154,7 @@ fn run_codex_app_server_rate_limits_for_home(
             .map_err(|_| "Codex app-server could not be started.".to_string())?,
     );
     run.spawned = true;
-    run.model_list = model_list.map(|(_, generation)| generation);
+    run.model_list = model_list.map(|(_, binary)| binary);
     // Declared after `child`: stdin and the output reader close before the
     // child is ended, so neither holds up its own exit.
     let (stdin, stdout) = child.take_pipes();

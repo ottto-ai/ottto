@@ -8,10 +8,10 @@ use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-/// The binary whose list was saved last, a number that changes only with
-/// that binary, the list's file and the digest of the bytes written there
-/// (`None` once a probe that used it got no `account/read` reply).
-type Saved = (SourceStamp, u64, PathBuf, Option<[u8; 32]>);
+/// The binary whose list was saved last, the list's file and that file's
+/// stamp right after the write (`None` once a probe that used it got no
+/// `account/read` reply).
+type Saved = (SourceStamp, PathBuf, Option<SourceStamp>);
 static SAVED: Mutex<Option<Saved>> = Mutex::new(None);
 
 /// Saves the bundled list `stdout` that the binary with `stamp` printed,
@@ -19,22 +19,20 @@ static SAVED: Mutex<Option<Saved>> = Mutex::new(None);
 /// pruned only at the first save after the daemon starts, so no running
 /// probe loses its list.
 pub(super) fn save(stamp: SourceStamp, stdout: &str) {
-    let hash = Sha256::digest(stdout.as_bytes());
+    let name = format!("{:x}", Sha256::digest(stdout.as_bytes()));
     let dir = crate::provider_calls::log_support_dir().join("codex-probe");
-    let name = format!("{hash:x}");
     let path = dir.join(format!("bundled-{}.json", &name[..8]));
     let mut saved = SAVED.lock().unwrap_or_else(|e| e.into_inner());
-    let generation = match saved.as_ref() {
-        Some((kept, .., None)) if kept.same(&stamp) => return,
-        Some((kept, generation, ..)) if kept.same(&stamp) => *generation,
-        Some((_, generation, ..)) => generation + 1,
-        None => 0,
-    };
+    if matches!(saved.as_ref(), Some((kept, _, None)) if kept.same(&stamp)) {
+        return;
+    }
     if ottto_core::write_owner_only_cache_file_atomic(&path, stdout.as_bytes()).is_err() {
         return;
     }
-    let saving = (stamp, generation, path.clone(), Some(hash.into()));
-    if saved.replace(saving).is_some() {
+    let Ok(file @ SourceStamp::File(_)) = SourceStamp::capture_file(&path) else {
+        return;
+    };
+    if saved.replace((stamp, path.clone(), Some(file))).is_some() {
         return;
     }
     for old in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
@@ -44,25 +42,25 @@ pub(super) fn save(stamp: SourceStamp, stdout: &str) {
     }
 }
 
-/// The list file and its binary's number, for the binary about to run, read
-/// right before its spawn: only when that binary's list was saved and the
-/// file still holds exactly those bytes.
-pub(super) fn for_probe() -> Option<(PathBuf, u64)> {
+/// The list file and its binary, for the binary about to run, checked right
+/// before its spawn: only when that binary's list was saved and the file is
+/// still the one written (a truncated or replaced file changes its stamp).
+pub(super) fn for_probe() -> Option<(PathBuf, SourceStamp)> {
     let stamp = super::cli_binary_stamp("codex").ok()?;
     let saved = SAVED.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let (_, generation, path, digest) = saved.filter(|saved| saved.0.same(&stamp))?;
-    let bytes = std::fs::read(&path).ok()?;
-    (digest == Some(Sha256::digest(bytes).into())).then_some((path, generation))
+    let (binary, path, file) = saved.filter(|saved| saved.0.same(&stamp))?;
+    let current = SourceStamp::capture_file(&path).ok()?;
+    file?.same(&current).then_some((path, binary))
 }
 
-/// After a probe given the list of binary number `generation` ended (reaped)
-/// with no `account/read` reply: while that binary is still the saved one,
-/// later probes run without a list until it changes or the daemon restarts.
-/// The list stays, since another home's probe may still read it.
-pub(super) fn give_up(generation: u64) {
+/// After a probe given the list of `binary` ended (reaped) with no
+/// `account/read` reply: while that binary is still the saved one, later
+/// probes run without a list until it changes or the daemon restarts. The
+/// list stays, since another home's probe may still read it.
+pub(super) fn give_up(binary: &SourceStamp) {
     let mut saved = SAVED.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(saved) = saved.as_mut().filter(|saved| saved.1 == generation) {
-        saved.3 = None;
+    if let Some(saved) = saved.as_mut().filter(|saved| saved.0.same(binary)) {
+        saved.2 = None;
     }
 }
 

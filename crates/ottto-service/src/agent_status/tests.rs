@@ -5157,7 +5157,9 @@ fn codex_probe_passes_the_binary_s_own_bundled_model_list() {
     assert_eq!(probe().1.as_ref(), Some(&first[0]));
 
     // A new binary with its own list: none until its own meta pass, which
-    // keeps the previous binary's file.
+    // keeps the previous binary's file. Giving up on the old binary later
+    // leaves the new one's list in use.
+    let old_binary = cli_binary_stamp("codex").expect("old binary");
     let new_binary = |comment: &str, list: &str| {
         std::fs::write(bin.join("bundled.json"), list).expect("bundled list");
         let launcher = format!(
@@ -5179,6 +5181,8 @@ fn codex_probe_passes_the_binary_s_own_bundled_model_list() {
     let given = given.expect("new list");
     assert_ne!(given, first[0]);
     assert!(second.contains(&given));
+    codex_probe_catalog::give_up(&old_binary);
+    assert_eq!(probe().1.as_ref(), Some(&given));
 
     // A probe given the list that ends with no account answer: later probes
     // run without it, even after another meta pass.
@@ -5209,7 +5213,7 @@ fn codex_probe_passes_the_binary_s_own_bundled_model_list() {
             .iter()
             .map(|line| line.requests_at_least)
             .collect::<Vec<_>>(),
-        [3, 2, 3, 2, 3, 2, 2, 3, 2]
+        [3, 2, 3, 2, 3, 2, 2, 2, 3, 2]
     );
     let log = std::fs::read_to_string(bin.join("argv.log")).expect("argv log");
     for argv in log
