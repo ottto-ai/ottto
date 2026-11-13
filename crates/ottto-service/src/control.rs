@@ -10621,6 +10621,25 @@ fn process_setup_actions(
         };
         let source_slug = action.source.clone();
         let source = source_slug.as_deref().and_then(source_from_slug);
+        if source.as_ref().is_some_and(setup_source_paused) {
+            let detail = complete_setup_action(
+                api_base_url,
+                credentials,
+                &action,
+                "cancelled",
+                "source_paused",
+                json!({ "reason": "source_paused" }),
+            )?;
+            results.push(SetupActionResult {
+                action_id: action.id,
+                action_type: action.action_type,
+                source: source_slug,
+                status: "cancelled".to_string(),
+                detail: Some(detail),
+                verification: None,
+            });
+            continue;
+        }
         if let Err(error) = record_setup_action_event(
             api_base_url,
             credentials,
@@ -11366,6 +11385,14 @@ fn source_patch_env_token(source_kind: &SourceKind) -> Option<&'static str> {
         SourceKind::ClaudeCode => Some("CLAUDE_CODE"),
         SourceKind::Pi => None,
     }
+}
+
+fn setup_source_paused(source: &SourceKind) -> bool {
+    source_patch_disabled(source)
+        || crate::snapshot_sync::source_paused(
+            &default_support_dir(),
+            crate::snapshot_sync::snapshot_source_of_kind(source),
+        )
 }
 
 fn source_patch_disabled(source_kind: &SourceKind) -> bool {
@@ -14735,15 +14762,23 @@ fn pi_route_summary_metadata(result: &SourceVerificationResult) -> serde_json::V
     })
 }
 
-fn build_local_scan(
-    machine: &MachineIdentity,
-    requested_sources: Vec<SourceKind>,
-) -> SetupScanPayload {
+fn setup_scan_sources(requested_sources: Vec<SourceKind>) -> Vec<SourceKind> {
     let source_filter = if requested_sources.is_empty() {
         vec![SourceKind::Codex, SourceKind::ClaudeCode, SourceKind::Pi]
     } else {
         requested_sources
     };
+    source_filter
+        .into_iter()
+        .filter(|source| !setup_source_paused(source))
+        .collect()
+}
+
+fn build_local_scan(
+    machine: &MachineIdentity,
+    requested_sources: Vec<SourceKind>,
+) -> SetupScanPayload {
+    let source_filter = setup_scan_sources(requested_sources);
     let mut machine_json = BTreeMap::new();
     machine_json.insert("id".to_string(), json!(machine.machine_id));
     machine_json.insert("name".to_string(), json!(machine.display_name));
@@ -14784,6 +14819,8 @@ fn build_local_scan(
 }
 
 fn scan_source(source: &SourceKind) -> SetupScanSource {
+    #[cfg(test)]
+    tests::SETUP_SCAN_PROBES.with(|count| count.set(count.get() + 1));
     match source {
         SourceKind::Codex => {
             let command_found = executable_exists("codex");
@@ -29421,6 +29458,82 @@ X-API-Key = "otel_redacted"
             MAX_CONFIG_BACKUPS_PER_SOURCE
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    thread_local! {
+        pub(super) static SETUP_SCAN_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[test]
+    #[serial]
+    fn setup_pause_filters_probes_and_cancels_claimed_actions_for_all_sources() {
+        let _lock = lock_backend_test_env();
+        let root = control_test_root("setup-paused-sources");
+        let support = root.join("support");
+        fs::create_dir_all(support.join("snapshots")).unwrap();
+        let _home = EnvVarGuard::set_path("HOME", &root);
+        let _commands = EnvVarGuard::set_path("OTTTO_COMMAND_SEARCH_PATH", &root.join("bin"));
+        let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        for source in [SourceKind::ClaudeCode, SourceKind::Codex, SourceKind::Pi] {
+            let slug = source_slug(&source);
+            let marker = support.join(format!("snapshots/{slug}.source-disabled"));
+            fs::write(&marker, "pending").unwrap();
+            SETUP_SCAN_PROBES.with(|count| count.set(0));
+            assert!(build_local_scan(&test_machine(), vec![source.clone()])
+                .sources
+                .is_empty());
+            fs::remove_file(&marker).unwrap();
+            fs::create_dir(&marker).unwrap();
+            assert!(build_local_scan(&test_machine(), vec![source])
+                .sources
+                .is_empty());
+            assert_eq!(SETUP_SCAN_PROBES.with(|count| count.get()), 0);
+            fs::remove_dir(&marker).unwrap();
+            fs::write(&marker, "pending").unwrap();
+        }
+        assert!(build_local_scan(&test_machine(), vec![]).sources.is_empty());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            for i in 0..11 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_complete_http_request(&mut stream);
+                if request.contains("/complete") {
+                    assert!(request.contains("cancelled") && request.contains("source_paused"));
+                }
+                let source = ["claude_code", "codex", "pi"].get(i / 3).copied();
+                let body = json!({
+                    "action": source.map(|source| json!({"id":"action", "action_type":"verify_source", "source":source})),
+                    "run": {"id":"run", "status":"completed", "machine_id":null},
+                    "sources":[], "next_action":null, "next_question":null,
+                });
+                write_json_response(&mut stream, 200, "OK", &body.to_string());
+            }
+        });
+        let mut credentials = SetupRunCredentials {
+            setup_run_token: "synthetic".into(),
+            connection: LocalConnectionBinding {
+                setup_run_id: "run".into(),
+                api_base_url: base.clone(),
+                setup_run_token_expires_at: "".into(),
+                machine_id: None,
+                claim_code: None,
+            },
+        };
+        let results =
+            process_setup_actions(&daemon(), &base, &mut credentials, &test_machine()).unwrap();
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(|action| action.status == "cancelled"));
+        server.join().unwrap();
+        fs::remove_dir_all(support.join("snapshots")).unwrap();
+        fs::create_dir_all(root.join(".codex")).unwrap();
+        fs::write(root.join(".codex/config.toml"), "model = \"synthetic\"\n").unwrap();
+        let scan = build_local_scan(&test_machine(), vec![SourceKind::Codex]);
+        assert!(scan.sources[0].detected);
+        let _admin = EnvVarGuard::set_str("OTTTO_PATCH_CODEX_DISABLED", "1");
+        assert!(build_local_scan(&test_machine(), vec![SourceKind::Codex])
+            .sources
+            .is_empty());
     }
 
     #[test]
