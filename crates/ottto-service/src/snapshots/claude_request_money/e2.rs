@@ -2300,7 +2300,7 @@ const SUBAGENT_TWIN_FROM: i128 = 1_793_836_800_000_000_000;
 /// a held native skip stays removed, an unheld one counts again, and a held
 /// response it would count (a copy within the slack before its birth) is
 /// dropped. A grandfathered home keeps its accepted skips and only drops. A
-/// zero-usage response is never dropped.
+/// zero-usage or untimed response is never dropped.
 fn decide_subagent_twins(items: &mut [SnapshotItem], at: usize) {
     let item = &items[at];
     let Some(fold) = item.claude_money.as_deref() else {
@@ -2345,7 +2345,17 @@ fn decide_subagent_twins(items: &mut [SnapshotItem], at: usize) {
             } else {
                 uncovered.push(id.clone());
             }
-        } else if !occurrence.usage.is_zero() && held() && !fold.is_ambiguous(id) && before_own {
+        } else if !occurrence.usage.is_zero()
+            && held()
+            && !fold.is_ambiguous(id)
+            && before_own
+            // An unknown time is never newly dropped: it stays counted.
+            && occurrence
+                .timestamp
+                .as_deref()
+                .and_then(rfc3339_unix_nanos)
+                .is_some()
+        {
             drops.push(id.clone());
         }
     }
