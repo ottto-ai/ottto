@@ -6713,7 +6713,7 @@ fn codex_id_token_parser_extracts_chatgpt_plan_claims() {
     assert_eq!(account.confidence, AgentStatusConfidence::Low);
 }
 
-fn synthetic_codex_jwt(
+pub(crate) fn synthetic_codex_jwt(
     user: &str,
     workspace: &str,
     account_label: &str,

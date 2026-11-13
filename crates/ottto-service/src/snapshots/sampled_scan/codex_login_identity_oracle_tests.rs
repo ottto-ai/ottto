@@ -63,16 +63,8 @@ fn clock(at: &str) -> std::time::SystemTime {
 }
 
 fn jwt(user: &str, workspace: &str, lifetime: i64) -> String {
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-    let claims = json!({"iss":"https://auth.openai.com","aud":"synthetic-client",
-        "exp":OffsetDateTime::now_utc().unix_timestamp() + lifetime,
-        "https://api.openai.com/auth":{"chatgpt_user_id":user,
-            "chatgpt_account_id":workspace,"chatgpt_plan_type":"pro"}});
-    let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256","typ":"JWT"}"#);
-    format!(
-        "{header}.{}.synthetic-signature",
-        URL_SAFE_NO_PAD.encode(claims.to_string())
-    )
+    let expires_at = OffsetDateTime::now_utc().unix_timestamp() + lifetime;
+    crate::agent_status::tests::synthetic_codex_jwt(user, workspace, "synthetic", "pro", expires_at)
 }
 
 /// A managed home (owner-only, canonical) with a config and no login yet.

@@ -20303,7 +20303,7 @@ pub(crate) fn claude_session_registrations() -> crate::claude_session_registrati
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 #[cfg(test)]
 mod usage_checks_paused_tests {

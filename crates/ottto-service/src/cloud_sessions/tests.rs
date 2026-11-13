@@ -211,31 +211,10 @@ fn cloud_cli_escaped_writer_cannot_hold_deadline_or_kill_other_groups() {
     fixture.wait_gone("descendant");
 }
 
-/// [regress] A `codex cloud list` past its deadline may be refreshing its
-/// login: it gets the drain, and only then is its group SIGKILLed.
-#[cfg(unix)]
-#[test]
-#[serial_test::serial]
-fn cloud_cli_past_its_deadline_is_killed_after_the_drain() {
-    let fixture = CloudCliFixture::new("ignore-term", &[], 0);
-    let drain = Duration::from_secs(1);
-    let started = Instant::now();
-    let result = crate::agent_status::with_codex_app_server_test_timeouts(
-        Duration::from_secs(1),
-        Duration::from_secs(1),
-        Duration::from_secs(1),
-        drain,
-        || CodexCloudCliRunner.list_page_bounded(None, PAGE_LIMIT, Duration::from_secs(1)),
-    );
-    assert!(result.unwrap_err().to_string().contains("timed out"));
-    assert!(started.elapsed() >= Duration::from_secs(1) + drain);
-    assert!(!fixture.root.join("signals").exists(), "no SIGTERM");
-    fixture.wait_gone("direct");
-}
-
 /// [regress] Pause while a `codex cloud list` page lingers past its deadline
-/// completes within the stop wait: after the page's deadline and the child's
-/// drain, never before the child is gone. An account change waits the same
+/// (it may be refreshing its login) completes within the stop wait: after the
+/// page's deadline and the child's drain, with no SIGTERM, never before the
+/// child is gone. An account change waits the same
 /// way, so its CLI call must not time out first.
 #[cfg(unix)]
 #[test]
@@ -275,6 +254,7 @@ fn pause_during_a_lingering_cloud_child_completes_within_the_stop_wait() {
         .expect("stopped within the stop wait");
     assert!(waited.elapsed() < COLLECTOR_IO_STOP_TIMEOUT);
     fixture.wait_gone("direct");
+    assert!(!fixture.root.join("signals").exists(), "no SIGTERM");
     run.join().unwrap();
     // An account change replies only after this same wait, so its CLI call
     // (the long control timeout) outlasts it with room for the change itself;
