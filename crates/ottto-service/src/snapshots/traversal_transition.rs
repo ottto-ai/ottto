@@ -1,5 +1,5 @@
 //! Local-only, content-free witnesses of actual traversal decisions.
-//! No paths, identities, arbitrary strings, persisted fields or extra scans.
+//! No paths, identities, arbitrary strings, persisted writes or extra scans.
 use super::{
     disappearance_diagnostics, rfc3339_unix_seconds, CensusGates, ScanIndex,
     ScanTraversalCheckpoint, ScanTraversalCounts, SnapshotSource, UnsettledUploadCause,

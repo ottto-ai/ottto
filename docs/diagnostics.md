@@ -1444,6 +1444,27 @@ checkpoint. This is distinct from `retiring` and does not count as census comple
 The store census also reports `max_depth_seen` as a diagnostic scalar; depth never
 feeds its error state or an alert.
 
+## Routine census scheduling observations
+
+Claude, Codex and Pi share these local scheduling observations.
+`bounded_traversal_transition` rows with `event: starting` or `event: retiring`
+include `recensus_armed` (boolean) and `context_fingerprint` (only the first
+8 hex characters of the traversal context digest). Equal prefixes suggest a
+matching context, subject to truncated-hash collisions; they are not identity proof.
+On starting rows, `recensus_armed` means the new census window is routine. On
+retiring rows, it means the next walk in that context is armed as routine.
+Complete and clean-follow-up retirements arm that next walk; terminal-unhealthy
+retry starts also become routine. A context-change start stays non-routine.
+Watcher-overflow, parent-resolution and sidecar restarts do not arm a walk.
+The marker stays process-local and is not restored from a checkpoint.
+
+Completed native scan pages carry `routine_recensus`, `page_file_limit_hit` and
+`pending_work` booleans on `native_collection_page`. `pending_work` means queued
+directories or candidates remain. The file-limit pacing decision is
+`page_file_limit_hit && pending_work && !routine_recensus`; a resident deferral
+can still request pacing independently. These observations add no timer or trigger.
+No full fingerprint, path or key is emitted, and none of these fields enters uploads.
+
 ## Prior Held Family Observation
 
 A `bounded_traversal_transition` row with `event: starting` includes
