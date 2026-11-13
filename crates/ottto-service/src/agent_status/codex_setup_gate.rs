@@ -22,9 +22,9 @@
 //! - a person's explicit check at most once per [`EXPLICIT_MIN_GAP_SECONDS`].
 //!
 //! A sign-in is the account and workspace the credential names, compared as
-//! the saved-quota schedule does ([`LoginMark::same_login`]): every read
-//! refreshes the token and so rewrites `auth.json`, and that rewrite, or one
-//! by another reader of the home, is not a new sign-in. Only a credential
+//! the saved-quota schedule does ([`LoginMark::same_login`]): a read lets
+//! Codex refresh the token when due, which rewrites `auth.json`, and that
+//! rewrite, or one by another reader of the home, is not a new sign-in. Only a credential
 //! that names no account falls back to the file's metadata. Whether a read
 //! continues a run of failures is decided from the sign-in seen before it.
 //!
@@ -96,8 +96,7 @@ impl Failures {
     /// The claimed sign-in exists only while the access token has not
     /// expired by the wall clock. When the stored token expires between
     /// reads, or the clock steps across its expiry, the claim appears or
-    /// disappears and a new run starts, with its short retries. That happens
-    /// once per expiry: the next read refreshes the token.
+    /// disappears on an unchanged file: the same sign-in, so the run goes on.
     fn continued_by(&self, operation_id: &str, current_login: &LoginMark) -> bool {
         self.operation_id == operation_id && self.login.same_login(current_login)
     }
@@ -348,7 +347,7 @@ mod tests {
 
     #[test]
     fn a_rewritten_credential_of_the_same_account_continues_the_run() {
-        // Every read refreshes the token and rewrites `auth.json`.
+        // A read may refresh the token and rewrite `auth.json`.
         let before = LoginMark::for_test(Some("account-a"), Some(1));
         let rewritten = LoginMark::for_test(Some("account-a"), Some(2));
         let other_account = LoginMark::for_test(Some("account-b"), Some(2));
