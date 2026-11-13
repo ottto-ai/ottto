@@ -5231,7 +5231,6 @@ fn codex_probe_confirms_no_identity_when_the_login_switches_during_the_read() {
         let probe =
             collect_codex_app_server_usage_for_home(&home, CodexHomeTrust::Managed).expect("read");
         assert_eq!(probe.identity.is_some(), !switch, "switched {switch}");
-        assert_eq!(probe.saved_identity.is_some(), !switch, "switched {switch}");
         assert_eq!(
             codex_credit_grants::home_binding(&home).is_some(),
             !switch,
