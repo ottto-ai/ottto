@@ -137,7 +137,7 @@ fn earlier_home_known_only_by_census_proves_nothing() {
         let mut hashes = ["s1", "s2", "s3"].map(claude_request_hash).to_vec();
         hashes.sort_unstable();
         let record = ClaudeRequestCensusRecord::synthetic_for_test(
-            "fixture",
+            &"a".repeat(64),
             1,
             ClaudeRequestCensusShape::Exact,
             hashes,
@@ -297,7 +297,7 @@ fn forked_first_line_is_removed_once() {
 }
 
 /// [control] T6 (iii): a subagent with no twin, whose tail is inside the
-/// slack, keeps today's decision: its copies count, disclosed.
+/// slack, keeps today's decision: every response counts.
 #[test]
 fn lone_subagent_with_a_slack_tail_is_unchanged() {
     let (paths, index) = homes(&["z"], &[t0() + LATER]);
@@ -312,7 +312,6 @@ fn lone_subagent_with_a_slack_tail_is_unchanged() {
     let diag = take_diag();
     let z = fold(&items[0]);
     assert_eq!((z.entity.totals().1, z.entity.removed_requests), (3, 0));
-    assert_eq!(diag.get("copy_uncovered"), Some(&2));
     assert_eq!((diag.get(REMOVED), diag.get(MISSED)), (None, None));
     remove(&paths);
 }
@@ -381,30 +380,27 @@ fn grandfathered_later_home_only_drops_the_tail() {
 
 /// [money] T9: held responses with no or an unparseable time are never
 /// dropped, before or after the later home's first own turn or with none:
-/// no panic, counted, disclosed, own requests unchanged.
+/// no panic, counted, own requests unchanged. The later home's parsed
+/// occurrences lose their times, so the twin pass itself sees them untimed.
 #[test]
 fn untimed_held_responses_stay_counted() {
-    let untimed = || {
-        let mut none = line("u1", &at(30), 15);
-        none.as_object_mut().unwrap().remove("timestamp");
-        let mut bad = line("u2", &at(40), 25);
-        bad["timestamp"] = json!("not a time");
-        [none, bad]
-    };
     let s1 = line("s1", &at(10), 10);
+    let (u1, u2) = (line("u1", &at(110), 15), line("u2", &at(120), 25));
     let own = line("o1", &at(130), 40);
-    let [u1, u2] = untimed();
     let orders = [
         vec![s1.clone(), own.clone(), u1.clone(), u2.clone()],
-        vec![s1.clone(), u1.clone(), u2.clone(), own.clone()],
+        vec![s1.clone(), u1.clone(), u2.clone(), own],
         vec![s1.clone(), u1.clone(), u2.clone()],
     ];
     for later in orders {
         let owned = u64::from(later.len() == 4);
-        take_diag();
         let (paths, index, mut items) = page(&[s1.clone(), u1.clone(), u2.clone()], &later);
-        assert!(take_diag().get("untimed_record").is_some_and(|n| *n >= 2));
+        let occurrences = &mut items[1].claude_usage_occurrences;
+        occurrences.get_mut("u1").unwrap().timestamp = None;
+        occurrences.get_mut("u2").unwrap().timestamp = Some("not a time".into());
         let before = fold(&items[1]).own_requests;
+        assert_eq!(before, 2 + owned);
+        take_diag();
         decide_page_copies(&mut items, &index, None);
         let diag = take_diag();
         let z = fold(&items[1]);

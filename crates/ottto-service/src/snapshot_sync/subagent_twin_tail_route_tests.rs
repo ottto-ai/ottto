@@ -78,7 +78,7 @@ fn pre_fix(c: &Corpus, index: ScanIndex) -> (ScanIndex, SnapshotItem) {
 fn subagent_twin_tail_corrects_the_accepted_head_once() {
     with_e2(|| {
         let (c, index) = tail_pair("subagent-twin-tail-routes");
-        let (prior, head) = pre_fix(&c, index);
+        let (prior, _) = pre_fix(&c, index);
         let mut routes = Vec::new();
         for (mode, sampled) in [
             (Mode::ColdFull, false),
@@ -110,7 +110,10 @@ fn subagent_twin_tail_corrects_the_accepted_head_once() {
         for route in &routes[1..] {
             money_oracle::assert_equivalent(&routes[0], route);
         }
-        let mut prior = prior;
+        // The restart arm committed through this corpus's route: upgrade a
+        // fresh copy of the same accepted n + 1 body.
+        let (c, index) = tail_pair("subagent-twin-tail-upgrade");
+        let (mut prior, head) = pre_fix(&c, index);
         prior.claude_money_birth_store.set_money_rule_version(3);
         prior.activate_effective_upload_body_witness_revision(3);
         let revisions = |index: &ScanIndex| {
