@@ -487,32 +487,6 @@ fn claude_prior_history(
         return PriorHistory::Unverified;
     }
     let slug = SnapshotSource::ClaudeCode.api_slug();
-    let here = backfill_state
-        .completed_destination_namespaces
-        .get(slug)
-        .map(String::as_str)
-        == Some(destination_namespace);
-    // A quarantined copy of this index, of a legacy index or of this
-    // destination's ledger. An unreadable directory fails closed; a missing
-    // one is empty.
-    let quarantined_sibling = || {
-        let own_stem = index_path.file_stem().and_then(|stem| stem.to_str());
-        let claude_prefix = format!("{slug}-scan-index");
-        let Some(parent) = index_path.parent() else {
-            return false;
-        };
-        match std::fs::read_dir(parent) {
-            Ok(mut entries) => entries.any(|entry| match entry {
-                Ok(entry) => entry.file_name().to_str().is_some_and(|name| {
-                    name.contains(".corrupt.")
-                        && (own_stem.is_some_and(|stem| name.starts_with(stem))
-                            || name.starts_with(&claude_prefix))
-                }),
-                Err(_) => true,
-            }),
-            Err(error) => error.kind() != std::io::ErrorKind::NotFound,
-        }
-    };
     // Only a different namespace's directory is another destination. An
     // unscoped legacy `claude_code-scan-index*` beside `destinations/` names
     // no destination; it is usually this Mac's own pre-scoping index, so it
@@ -537,10 +511,12 @@ fn claude_prior_history(
         Ok(_) => true,
         Err(error) => error.kind() != std::io::ErrorKind::NotFound,
     };
-    if here
-        || upload_progress.records_server_attested_upload()
-        || quarantined_sibling()
-        || seen_marker()
+    if claude_destination_history_here(
+        backfill_state,
+        destination_namespace,
+        upload_progress,
+        index_path,
+    ) || seen_marker()
     {
         return PriorHistory::Here;
     }
@@ -573,6 +549,66 @@ fn claude_prior_history(
         PriorHistory::Here
     } else {
         PriorHistory::None
+    }
+}
+
+/// Evidence belongs to this destination, independent of the Mac-wide marker.
+fn claude_destination_history_here(
+    backfill_state: &crate::backfill::BackfillState,
+    destination_namespace: &str,
+    upload_progress: &SnapshotUploadProgress,
+    index_path: &Path,
+) -> bool {
+    let slug = SnapshotSource::ClaudeCode.api_slug();
+    let here = backfill_state
+        .completed_destination_namespaces
+        .get(slug)
+        .map(String::as_str)
+        == Some(destination_namespace);
+    // A quarantined copy of this index, of a legacy index or of this
+    // destination's ledger. An unreadable directory fails closed; a missing
+    // one is empty.
+    let quarantined_sibling = || {
+        let own_stem = index_path.file_stem().and_then(|stem| stem.to_str());
+        let claude_prefix = format!("{slug}-scan-index");
+        let Some(parent) = index_path.parent() else {
+            return false;
+        };
+        match std::fs::read_dir(parent) {
+            Ok(mut entries) => entries.any(|entry| match entry {
+                Ok(entry) => entry.file_name().to_str().is_some_and(|name| {
+                    name.contains(".corrupt.")
+                        && (own_stem.is_some_and(|stem| name.starts_with(stem))
+                            || name.starts_with(&claude_prefix))
+                }),
+                Err(_) => true,
+            }),
+            Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+        }
+    };
+    here || upload_progress.records_server_attested_upload() || quarantined_sibling()
+}
+
+/// Narrow the corruption stop to loss of this destination's own history.
+fn note_claude_index_rebuild_for_destination(
+    source: SnapshotSource,
+    loaded_fresh: bool,
+    backfill_state: &crate::backfill::BackfillState,
+    destination_namespace: &str,
+    upload_progress: &SnapshotUploadProgress,
+    index_path: &Path,
+    support_dir: &Path,
+) {
+    if source == SnapshotSource::ClaudeCode
+        && loaded_fresh
+        && claude_destination_history_here(
+            backfill_state,
+            destination_namespace,
+            upload_progress,
+            index_path,
+        )
+    {
+        crate::snapshots::note_claude_index_rebuild_stop(support_dir);
     }
 }
 
@@ -2969,6 +3005,33 @@ impl SnapshotUploadProgress {
         record.disposition = SnapshotQuarantineDisposition::RetryPending;
         record.retry_after_unix_seconds = retry_after_unix_seconds;
         crate::snapshots::terminal_contract_retry::exhaust(record);
+    }
+
+    /// Outage custody: hold each body of the page that has no exact ACK, hold
+    /// or refusal of these exact bytes yet, as an ordinary retryable
+    /// quarantine until `retry_after_unix_seconds`. Returns how many were held.
+    fn hold_outage_bodies(
+        &mut self,
+        items: &[SnapshotItem],
+        retry_after_unix_seconds: u64,
+    ) -> usize {
+        let mut held = 0;
+        for item in items {
+            let fingerprint = item.snapshot_fingerprint.as_str();
+            let witness = snapshot_upload_body_witness(item);
+            if self.accepted_body_witnesses.get(fingerprint) == Some(&witness)
+                || self
+                    .quarantined_fingerprints
+                    .get(fingerprint)
+                    .is_some_and(|record| record.upload_body_witness.as_ref() == Some(&witness))
+                || self.refused_body(fingerprint, &witness)
+            {
+                continue;
+            }
+            self.quarantine_retryable_body(fingerprint, &witness, retry_after_unix_seconds);
+            held += 1;
+        }
+        held
     }
 
     fn retain_current_quarantines_with_diagnostics(
@@ -6643,7 +6706,7 @@ fn prepare_sync_source_inner(
         );
         return Ok(None);
     }
-    let scan_started_at = current_rfc3339();
+    let mut scan_started_at = current_rfc3339();
     let relay_token = client.issue_status_relay_token(device, device_secret, source)?;
     let mut activity_hint = small_source_upload(source, || client.get_activity_hint(&relay_token))?;
     // Treat the activity hint as the only authority for the semantic evidence
@@ -6857,6 +6920,20 @@ fn prepare_sync_source_inner(
         &upload_destination_namespace,
         crate::snapshots::snapshot_quarantine_witness_for_context(source, &upload_context),
     )?;
+    let first_census_end = crate::backfill::record_first_census(
+        support_dir,
+        source,
+        &upload_destination_namespace,
+        &scan_started_at,
+        load_origin == crate::snapshots::ScanIndexLoadOrigin::Missing,
+    )?;
+    // Missing-index import stays at generation zero until the first collection save.
+    // A restart after the anchor save must admit against that same census end.
+    if index.generation == 0 {
+        if let Some(anchor) = first_census_end {
+            scan_started_at = anchor;
+        }
+    }
     if source == SnapshotSource::ClaudeCode {
         daemon.transcript_cache.bind_withheld(&mut index);
     }
@@ -6911,6 +6988,15 @@ fn prepare_sync_source_inner(
             support_dir,
         )
     });
+    note_claude_index_rebuild_for_destination(
+        source,
+        claude_index_loaded_fresh,
+        &backfill_state,
+        &upload_destination_namespace,
+        &upload_progress,
+        &index_path,
+        support_dir,
+    );
     if let Some(prior) = prior_claude_history {
         crate::snapshots::note_prior_history_unverified(
             prior == crate::snapshots::PriorHistory::Unverified,
@@ -6926,6 +7012,7 @@ fn prepare_sync_source_inner(
     // scan window (StateMissing H1, N2).
     let backfill_pending =
         backfill_replay_pending(source, &backfill_state, &upload_destination_namespace);
+    index.first_read_pending = backfill_pending;
     if !backfill_pending
         && index.prepare_snapshot_admission_reoffer(SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE)
     {
@@ -7768,6 +7855,16 @@ fn finish_sync_source(
                     reservation: Some(&reserve_cache_bytes),
                 },
             );
+        let hints = std::mem::take(&mut disposition.side_call_hints);
+        if !hints.is_empty() {
+            scan_result.enqueue_claude_discovery_hints(
+                &mut index,
+                claude_scan_roots.as_deref().unwrap_or_default(),
+                receipt_window_days,
+                &hints,
+            );
+            scan_result.census_complete = false;
+        }
         // Copy-derived rows (#944): the bodies just built treat these
         // rows as never accepted; the ledger records that durably before any
         // upload, so a lost reply or restart cannot restore their proof.
@@ -8255,6 +8352,9 @@ fn finish_sync_source(
                 bootstrap_capacity_error =
                     Some(error.context("cache-head bootstrap ACK settlement pending"));
             }
+            // A probe outage owes the main uploader's outage custody and
+            // partial checkpoint below.
+            Err(error) if is_upload_outage(&error) => bootstrap_capacity_error = Some(error),
             Err(error) => return Err(error),
         }
         if bootstrap_capacity_error.is_none() {
@@ -8414,6 +8514,34 @@ fn finish_sync_source(
             matches!(upload_result, Ok(ResumableUploadResult::Shed { .. })),
             source.api_slug(),
         );
+    }
+    // An outage (a transport failure, timeout or 5xx, or a plain shed) ends
+    // the pass before the server answered for every body. Hold each body with
+    // no exact ACK, hold or refusal in ordinary retryable custody, durably,
+    // before the partial checkpoint below: its files and heads then commit,
+    // and the next pass re-sends from the head instead of reading the file
+    // again. No ACK, refusal or loss is recorded; the entities stay owed.
+    let outage_retry_after = match &upload_result {
+        Ok(ResumableUploadResult::Shed { retry_after }) => Some(*retry_after),
+        Err(error) if is_upload_outage(error) => Some(None),
+        _ => None,
+    };
+    if let Some(retry_after) = outage_retry_after {
+        let before = upload_progress.clone();
+        let retry_at = current_unix_seconds().saturating_add(shed_backoff(retry_after).as_secs());
+        let held = upload_progress.hold_outage_bodies(&scan_result.snapshots, retry_at);
+        if held > 0 {
+            if upload_progress.save(&upload_progress_path).is_err() {
+                // Nothing durable changed: the page stays owed as before.
+                upload_progress = before;
+            } else {
+                crate::local_resource_diagnostics::traversal_point(
+                    "quarantine_retry",
+                    source.api_slug(),
+                    &serde_json::json!({"reason": "outage", "count": held}),
+                );
+            }
+        }
     }
 
     // Exact progress is durable before this seam. The same subsequent index
@@ -8589,6 +8717,7 @@ fn finish_sync_source(
                 client,
                 device,
                 device_secret,
+                support_dir,
                 source,
                 TerminalManifestSource::Withdraw,
                 CollectorStatus {
@@ -8617,6 +8746,7 @@ fn finish_sync_source(
                 client,
                 device,
                 device_secret,
+                support_dir,
                 source,
                 TerminalManifestSource::Withdraw,
                 CollectorStatus {
@@ -8774,6 +8904,7 @@ fn finish_sync_source(
                 client,
                 device,
                 device_secret,
+                support_dir,
                 source,
                 TerminalManifestSource::Withdraw,
                 CollectorStatus {
@@ -9038,6 +9169,7 @@ fn finish_sync_source(
             client,
             device,
             device_secret,
+            support_dir,
             source,
             if scan_result.census_complete {
                 TerminalManifestSource::CompleteCensus(&index)
@@ -9071,6 +9203,7 @@ fn finish_sync_source(
             client,
             device,
             device_secret,
+            support_dir,
             source,
             if scan_result.census_complete {
                 TerminalManifestSource::CompleteCensus(&index)
@@ -9491,6 +9624,7 @@ struct ClaudeEvidencePage<'p> {
     stats: ClaudeLocalEvidenceStats,
     /// Roots already counted: a scope root two chunks read counts once.
     counted_roots: BTreeSet<String>,
+    side_call_discovery: crate::snapshots::claude_request_money::e2::SideCallDiscovery,
 }
 
 /// The evidence stage over one page: its families are packed into chunks and
@@ -9531,6 +9665,11 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
             ..Default::default()
         },
         counted_roots: BTreeSet::new(),
+        side_call_discovery: crate::snapshots::claude_request_money::e2::SideCallDiscovery::new(
+            scan_result
+                .completed_parses()
+                .map(|(key, _)| Path::new(key)),
+        ),
     };
     // The named fork parents, whatever route the copy decisions take.
     let fork_parents = crate::snapshots::claude_cross_root_evidence::EvidenceScope::fork_parents(
@@ -9627,6 +9766,7 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
     disposition
         .copy_invalidated
         .sort_by_key(|row| first_slot.get(row.session()).copied());
+    disposition.side_call_hints = page.side_call_discovery.hints.into_iter().collect();
     let ClaudeEvidencePage { mut stats, .. } = page;
     for item in &scan_result.snapshots {
         if !item.source_session_id.contains("_agent-") {
@@ -9981,6 +10121,7 @@ fn apply_claude_local_evidence_chunk(
         &api_report,
         &trace_report,
         index,
+        &mut page.side_call_discovery,
     );
     let trace_discard_unfolded = {
         // Reuse the per-root read verdict before identity consumes it. Missing
@@ -10336,6 +10477,14 @@ fn is_shed_failure(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<UploadFailureDiagnostics>()
         .is_some_and(|diagnostics| diagnostics.status_family() == "http_429")
+}
+
+/// The server never answered the page: a transport failure, a timeout or a
+/// 5xx. A plain shed arrives as `ResumableUploadResult::Shed` instead.
+fn is_upload_outage(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<UploadFailureDiagnostics>()
+        .is_some_and(UploadFailureDiagnostics::is_outage)
 }
 
 fn is_snapshot_batch_split_failure(error: &anyhow::Error) -> bool {
@@ -11812,6 +11961,7 @@ fn collector_status_request(
         last_snapshot_unproven_terminal_count: status.counts.snapshot_unproven_terminal_count,
         last_snapshot_superseded_terminal_count: status.counts.snapshot_superseded_terminal_count,
         last_backfill_window_days: status.counts.backfill_window_days,
+        first_read_cutoff: None,
         last_backfill_file_limit: status.counts.backfill_file_limit,
         last_discovered_file_count: status.counts.discovered_file_count,
         last_skipped_file_count_due_to_limit: status.counts.skipped_file_count_due_to_limit,
@@ -11956,6 +12106,7 @@ fn report_status_with_fresh_relay_token(
     client: &SnapshotApiClient,
     device: &LocalDeviceBinding,
     device_secret: &str,
+    support_dir: &Path,
     source: SnapshotSource,
     manifest_source: TerminalManifestSource<'_>,
     mut status: CollectorStatus<'_>,
@@ -11986,11 +12137,13 @@ fn report_status_with_fresh_relay_token(
     // Keep non-blocking cooldown debt beside the terminal census counters on
     // every report, even when the re-offer work summary is unchanged/quiet.
     eprintln!("{}", status.counts.terminal_census_line(source.api_slug()));
-    let request = collector_status_request(
+    let mut request = collector_status_request(
         &destination_namespace,
         status,
         census_residue_status_admitted,
     )?;
+    request.first_read_cutoff = load_backfill_state(support_dir)
+        .first_read_cutoff(&destination_namespace, source.api_slug());
     small_source_upload(source, || client.report_status(&relay_token, &request))?;
     // Content-free, after a successful send: the closed error-code slug and
     // enabled flag, once per change per source (and once after start).
@@ -12032,6 +12185,7 @@ fn withdraw_and_report_policy_stop(
         client,
         device,
         device_secret,
+        support_dir,
         source,
         TerminalManifestSource::Withdraw,
         status,
@@ -12116,6 +12270,7 @@ fn report_checkin_status(
         last_snapshot_unproven_terminal_count: 0,
         last_snapshot_superseded_terminal_count: 0,
         last_backfill_window_days: receipt_window_days,
+        first_read_cutoff: None,
         last_backfill_file_limit: 0,
         last_discovered_file_count: 0,
         last_skipped_file_count_due_to_limit: 0,
@@ -20272,6 +20427,7 @@ mod tests {
             &client,
             &device,
             "device-secret",
+            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             TerminalManifestSource::Withdraw,
             CollectorStatus {
@@ -20305,8 +20461,54 @@ mod tests {
         }
     }
 
-    /// Capture the wire body of one liveness beat, with or without a
-    /// cycle-start clock.
+    #[test]
+    #[serial(source_manifests)]
+    fn terminal_scan_status_reads_the_durable_first_census_cutoff() {
+        let _guard = SourceManifestTestGuard::new();
+        let support = test_terminal_status_support_dir();
+        let destination =
+            snapshot_upload_destination_namespace(&report_kind_test_device(), "device-secret");
+        for source in [
+            SnapshotSource::ClaudeCode,
+            SnapshotSource::Codex,
+            SnapshotSource::Pi,
+        ] {
+            let absent = captured_terminal_receipt_for_source_under_hint(
+                source,
+                SyncCounts::for_policy(183),
+                CollectorState::Success,
+                TerminalManifestSource::Withdraw,
+                183,
+                "",
+            );
+            assert!(absent.get("first_read_cutoff").is_none());
+            crate::backfill::record_first_census(
+                support,
+                source,
+                &destination,
+                "2026-11-12T12:00:00Z",
+                true,
+            )
+            .unwrap();
+            for width in [30, 183] {
+                let present = captured_terminal_receipt_for_source_under_hint(
+                    source,
+                    SyncCounts::for_policy(width),
+                    CollectorState::Success,
+                    TerminalManifestSource::Withdraw,
+                    width,
+                    "",
+                );
+                assert_eq!(present["first_read_cutoff"], "2026-09-13T12:00:00.000Z");
+                assert_eq!(present["last_backfill_window_days"], width);
+                assert!(present.get("first_read").is_none());
+            }
+            let beat = captured_checkin_receipt(None);
+            assert!(beat.get("first_read_cutoff").is_none());
+        }
+    }
+
+    /// Capture the wire body of one liveness beat, with or without a cycle-start clock.
     fn captured_checkin_receipt(scan_started_at: Option<&str>) -> serde_json::Value {
         let captured = Arc::new(Mutex::new(Vec::new()));
         let client = SnapshotApiClient::new(snapshot_status_server(captured.clone()));
@@ -20369,6 +20571,7 @@ mod tests {
             &client,
             &report_kind_test_device(),
             "device-secret",
+            test_terminal_status_support_dir(),
             source,
             manifest_source,
             CollectorStatus {
@@ -21658,6 +21861,7 @@ mod tests {
             &client,
             &device,
             "synthetic-secret",
+            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             TerminalManifestSource::Withdraw,
             CollectorStatus {
@@ -21724,6 +21928,7 @@ mod tests {
             &client,
             &device,
             "device-secret",
+            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             TerminalManifestSource::Withdraw,
             CollectorStatus {
@@ -21857,6 +22062,7 @@ mod tests {
             &client,
             &device,
             "device-secret",
+            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             TerminalManifestSource::CompleteCensus(&index),
             CollectorStatus {
@@ -21963,6 +22169,7 @@ mod tests {
                 &client,
                 &device,
                 "device-secret",
+                test_terminal_status_support_dir(),
                 SnapshotSource::Codex,
                 TerminalManifestSource::Withdraw,
                 CollectorStatus {
@@ -22191,6 +22398,7 @@ mod tests {
             &client,
             &device,
             "device-secret",
+            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             TerminalManifestSource::CompleteCensus(&index),
             CollectorStatus {
@@ -22243,6 +22451,7 @@ mod tests {
             &client,
             &device,
             "device-secret",
+            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             TerminalManifestSource::CompleteCensus(&index),
             CollectorStatus {
@@ -22863,6 +23072,9 @@ mod tests {
     include!("snapshot_sync/claude_request_census_pipeline_tests.rs");
     mod history_upgrade_pipeline_tests {
         include!("snapshot_sync/history_upgrade_pipeline_tests.rs");
+        mod first_read_latch_tests {
+            include!("snapshot_sync/first_read_latch_tests.rs");
+        }
     }
     pub(in crate::snapshot_sync) mod claude_money_e2_pipeline_tests {
         include!("snapshot_sync/claude_money_e2_pipeline_tests.rs");
@@ -22873,6 +23085,9 @@ mod tests {
         #[cfg(unix)]
         mod claude_first_request_login_tests {
             include!("snapshot_sync/claude_first_request_login_tests.rs");
+            mod first_read_latch_money_tests {
+                include!("snapshot_sync/first_read_latch_money_tests.rs");
+            }
         }
         #[cfg(unix)]
         mod claude_login_only_org_tests {

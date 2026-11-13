@@ -214,6 +214,8 @@ pub(crate) use scan::durable_sources;
 #[cfg(test)]
 pub(crate) mod e2_pipeline_scan_fixture;
 #[cfg(test)]
+mod first_read_order_tests;
+#[cfg(test)]
 mod held_audit_restore_tests;
 #[cfg(test)]
 mod resident_wave_tests;
@@ -832,6 +834,29 @@ impl SourceScanResult {
             index.resume_census_window_end = None;
         }
     }
+    /// Keep exact discoveries in the ordinary durable queue, also after native
+    /// selection retired this page's traversal.
+    pub(crate) fn enqueue_claude_discovery_hints(
+        &self,
+        index: &mut ScanIndex,
+        roots: &[PathBuf],
+        lookback_days: u64,
+        hints: &[PathBuf],
+    ) {
+        if index.traversal.is_none() {
+            ensure_bounded_traversal(
+                SnapshotSource::ClaudeCode,
+                roots,
+                index,
+                &self.census_window_end,
+                lookback_days,
+            );
+        }
+        if let Some(traversal) = index.traversal.as_mut() {
+            enqueue_watcher_hints(SnapshotSource::ClaudeCode, traversal, hints, false);
+        }
+    }
+
     /// Index keys this scan read to completion, with their parsed source
     /// fingerprints.
     pub(crate) fn completed_parses(&self) -> impl Iterator<Item = (&str, &str)> {
@@ -1438,11 +1463,13 @@ fn transcript_path_admitted(source: SnapshotSource, path: &Path) -> bool {
         || (source == SnapshotSource::Codex && codex_archive_path(path))
 }
 
+pub(crate) use discovery::directory::FIRST_READ_WINDOW_DAYS;
+
 #[cfg(test)]
 use discovery::directory::{
     advance_bounded_directory_traversal, collect_recent_jsonl_files,
     reconcile_missing_index_entries_with_limit, reconcile_missing_index_entries_with_side,
-    with_directory_read_fault, with_test_directory_entries, FIRST_READ_WINDOW_DAYS,
+    with_directory_read_fault, with_test_directory_entries,
 };
 use discovery::directory::{
     advance_bounded_directory_traversal_with_budget, claude_absence_is_removal,
@@ -1450,6 +1477,7 @@ use discovery::directory::{
     is_recent_enough_at, opened_candidate_is_within_frozen_window,
     reconcile_missing_index_entries_bounded, DiscoveryRecovery,
 };
+use discovery::first_read_order;
 use discovery::retention::{AccountMoveObservations, DiscoveryRetention};
 
 mod discovery;
@@ -1475,10 +1503,18 @@ use discovery::candidate_open::{open_candidate_beneath_root, opened_object_ident
 #[cfg(test)]
 use discovery::candidate_open::{read_opened_content_samples, START_IDENTITY_SAMPLE_FOR_TEST};
 
+pub(crate) use claude_reemission_exclusions::note_claude_index_rebuild_stop;
+#[cfg(test)]
+use claude_reemission_exclusions::{
+    note_claude_reemission_stop_with_cause_at, ClaudeReemissionStopCause,
+};
+#[cfg(test)]
+pub(crate) fn claude_reemission_stop_reason_for_test() -> &'static str {
+    claude_reemission_stop_reason()
+}
 use claude_reemission_exclusions::{
     claude_reemission_stop_latched, claude_reemission_stop_reason,
     claude_reemission_stop_withheld_folds, note_claude_reemission_stop,
-    note_claude_reemission_stop_with_cause_at, ClaudeReemissionStopCause,
 };
 #[cfg(test)]
 pub(crate) use claude_reemission_exclusions::{

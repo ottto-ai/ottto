@@ -1851,42 +1851,26 @@ struct CodexCloudChild {
 impl CodexCloudChild {
     fn exited(&self) -> std::io::Result<bool> {
         let child = self.child.as_ref().expect("owned cloud child");
-        // Observe exit without reaping: reserve the PID until the owned process
-        // group has been stopped, even if a descendant retains stdout.
-        let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
-        let result = unsafe {
-            libc::waitid(
-                libc::P_PID,
-                child.id() as libc::id_t,
-                &mut info,
-                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-            )
-        };
-        if result < 0 {
-            let error = std::io::Error::last_os_error();
+        crate::process_guard::exited(child).or_else(|error| {
             if error.kind() == std::io::ErrorKind::Interrupted {
-                return Ok(false);
+                Ok(false)
+            } else {
+                Err(error)
             }
-            return Err(error);
-        }
-        Ok(info.si_signo != 0)
+        })
     }
 
     fn stop_and_reap(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        let mut child = self.child.take().expect("owned cloud child");
-        // Command::process_group(0) created this group; the direct child has
-        // never been reaped, so its PID cannot have been reused by another group.
-        unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
-        let _ = child.kill();
-        child.wait()
+        let child = self.child.take().expect("owned cloud child");
+        crate::process_guard::stop_group_and_reap(child, Duration::ZERO)
     }
 }
 
 #[cfg(unix)]
 impl Drop for CodexCloudChild {
     fn drop(&mut self) {
-        if self.child.is_some() {
-            let _ = self.stop_and_reap();
+        if let Some(child) = self.child.take() {
+            let _ = crate::process_guard::stop_group_and_reap(child, Duration::ZERO);
         }
     }
 }

@@ -882,7 +882,7 @@ impl Sqlite {
             self.stats.erasure_pending_marks = 0;
             self.stats.dirty_rows_per_save = 0;
             self.stats.encoded_bytes_per_save = 0;
-            self.maintenance(false)?;
+            self.maintenance_unprinted()?;
         }
         if mode == TxnMode::Write {
             migrations::begin_write(self.conn()?)?;

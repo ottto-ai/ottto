@@ -5,6 +5,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
@@ -22,6 +23,8 @@ use crate::snapshots::{
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ClaudeUsageAuthorityDisposition {
+    /// Exact late Task-member discoveries, queued by source finish before upload.
+    pub(crate) side_call_hints: Vec<PathBuf>,
     /// Local counters for how this fold's Claude scalars were decided.
     pub(crate) context_file_birth: ClaudeContextFileBirthCounts,
     pub(in crate::snapshots) quarantined_source_session_ids: BTreeSet<String>,
@@ -193,6 +196,7 @@ impl ClaudeUsageAuthorityDisposition {
     /// puts `copy_invalidated` back in page order.
     pub(crate) fn absorb(&mut self, chunk: Self) {
         let Self {
+            side_call_hints,
             context_file_birth,
             quarantined_source_session_ids,
             account_deferred_source_session_ids,
@@ -203,6 +207,7 @@ impl ClaudeUsageAuthorityDisposition {
             #[cfg(test)]
             posture_admissions,
         } = chunk;
+        self.side_call_hints.extend(side_call_hints);
         self.context_file_birth.absorb(context_file_birth);
         self.quarantined_source_session_ids
             .extend(quarantined_source_session_ids);
