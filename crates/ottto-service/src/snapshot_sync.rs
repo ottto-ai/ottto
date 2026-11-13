@@ -10659,13 +10659,6 @@ enum SnapshotPageOutcome {
     Disabled(Option<String>),
 }
 
-/// Diagnostics only (`change_reason`): an unchanged ACK without a basis
-/// (the stored body itself) or with `usage_identical` settles identical
-/// usage; an accepted one never does.
-fn ack_usage_identical(unchanged: bool, basis: Option<&str>) -> bool {
-    unchanged && matches!(basis, None | Some("usage_identical"))
-}
-
 // Scratch extraction only: the upload callback remains the existing canonical
 // preflight/token/ACK-validator/client-report boundary. No inventory pruning.
 #[expect(clippy::too_many_arguments, reason = "10 args; no options struct yet")]
@@ -10903,21 +10896,15 @@ where
             .filter(|entity| entity.unchanged_basis.is_none())
             .map(|entity| (entity.snapshot_fingerprint.as_str(), entity))
             .collect::<BTreeMap<_, _>>();
-        for (entity, unchanged) in response
+        for entity in response
             .accepted_entities
             .iter()
-            .map(|entity| (entity, false))
-            .chain(
-                response
-                    .unchanged_entities
-                    .iter()
-                    .map(|entity| (entity, true)),
-            )
+            .chain(&response.unchanged_entities)
         {
             crate::local_resource_diagnostics::change_reason::settled(
                 poison_scope,
                 &entity.snapshot_fingerprint,
-                ack_usage_identical(unchanged, entity.unchanged_basis.as_deref()),
+                entity.unchanged_basis.as_deref() == Some("usage_identical"),
             );
         }
         for index in indices {

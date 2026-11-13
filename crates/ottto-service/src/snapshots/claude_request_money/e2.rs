@@ -456,11 +456,17 @@ pub(crate) fn apply_money_rules(index: &mut ScanIndex) {
         }
         live.push(location);
     }
-    let started = Instant::now();
-    let twins = std::cell::OnceCell::new();
-    if stored < 3 && rules.iter().any(|&(version, _)| version == 3) {
+    let rule = |version: u16| stored < version && rules.iter().any(|&(v, _)| v == version);
+    let (three, four) = (rule(3), rule(4));
+    let twins = (three || four).then(|| claude_path_twin_groups(index, &BTreeSet::new()));
+    // Subagent path twins: rule 3 re-owes them with its main copies; from
+    // version 3, rule 4 re-owes them alone. Selected once either way.
+    let mut subagent = twins
+        .as_ref()
+        .map(|twins| subagent_twin_files(index, twins))
+        .unwrap_or_default();
+    if let Some(twins) = twins.as_ref().filter(|_| three) {
         let start = Instant::now();
-        let twins = twins.get_or_init(|| claude_path_twin_groups(index, &BTreeSet::new()));
         let candidates = index.files.keys().filter(|key| {
             claude_index_path_member_ref(Path::new(key)).is_some_and(|member| {
                 member.subagent_stem.is_none()
@@ -477,7 +483,7 @@ pub(crate) fn apply_money_rules(index: &mut ScanIndex) {
             })
         });
         let selected = copied_file_holders(index, candidates.map(String::as_str));
-        let mut reowed = subagent_twin_files(index, twins);
+        let mut reowed = std::mem::take(&mut subagent);
         diag(
             "money_rule_v3_selector_ms",
             start.elapsed().as_millis() as u64,
@@ -489,28 +495,16 @@ pub(crate) fn apply_money_rules(index: &mut ScanIndex) {
         diag("money_rule_v3_reowed", reowed.len() as u64);
         owed.extend(reowed);
     }
-    if stored < 4 && rules.iter().any(|&(version, _)| version == 4) {
-        let twins = twins.get_or_init(|| claude_path_twin_groups(index, &BTreeSet::new()));
-        owed.extend(subagent_twin_files(index, twins));
+    if four {
+        owed.extend(subagent);
     }
-    let selector_ms = started.elapsed().as_millis();
-    owed.sort_unstable();
-    owed.dedup();
-    let selected = owed.len();
-    let reowed = owed
-        .iter()
-        .filter(|key| index.re_owe_effective_upload_body_witness_revision(key, to))
-        .count();
-    diag("money_rule_selected", selected as u64);
-    diag("money_rule_reowed", reowed as u64);
+    for key in owed {
+        index.re_owe_effective_upload_body_witness_revision(&key, to);
+    }
     live.sort_unstable();
     let store = &mut index.claude_money_birth_store;
     store.retain_money_marks(&live);
     store.set_money_rule_version(current);
-    eprintln!(
-        "claude money rule applied from={stored} to={current} selected={selected} \
-         reowed={reowed} selector_ms={selector_ms}"
-    );
 }
 
 /// Subagent path twins need no main-holder walk: their indexed census
@@ -2300,29 +2294,27 @@ fn current_witness<'a>(
 /// Activation boundary: 2026-11-05T00:00:00Z, the ship date (UTC ns).
 const SUBAGENT_TWIN_FROM: i128 = 1_793_836_800_000_000_000;
 
-/// Each eligible shared request counts once, at the earliest home that holds
-/// it (`copy_order`: effective birth, then `LocationKey` for equal births).
-/// A later home retains native skips only for eligible requests an earlier
-/// member counts, and drops an eligible held response it would count (a copy
-/// within the slack before its birth). A grandfathered home keeps its
-/// accepted skips and only drops. A zero-usage or untimed response is never
-/// dropped.
+/// Each shared request before the later home's first own turn counts once,
+/// at the earliest home that holds it (`copy_order`: effective birth, then
+/// `LocationKey` for equal births). One pass over a later home's responses:
+/// a held native skip stays removed, an unheld one counts again, and a held
+/// response it would count (a copy within the slack before its birth) is
+/// dropped. A grandfathered home keeps its accepted skips and only drops. A
+/// zero-usage response is never dropped.
 fn decide_subagent_twins(items: &mut [SnapshotItem], at: usize) {
     let item = &items[at];
-    let drop_only = item
-        .claude_money
-        .as_deref()
-        .is_some_and(|fold| fold.grandfathered);
+    let Some(fold) = item.claude_money.as_deref() else {
+        return;
+    };
+    let drop_only = fold.grandfathered;
     let group = items
         .iter()
         .enumerate()
         .filter(|(_, other)| other.source_session_id == item.source_session_id)
         .map(|(other, _)| other)
         .collect::<Vec<_>>();
-    let earlier = item
-        .claude_money
-        .as_deref()
-        .and_then(FileFold::copy_order)
+    let earlier = fold
+        .copy_order()
         .map(|order| {
             earlier_holders(items, &group, &order, |other| {
                 items[other].claude_money.as_deref()?.copy_order()
@@ -2333,47 +2325,30 @@ fn decide_subagent_twins(items: &mut [SnapshotItem], at: usize) {
         return;
     }
     let first_own = first_own_turn(item, 0, &earlier).map(|o| o.sequence);
-    let mut kept = 0;
-    let uncovered = if drop_only {
-        Vec::new()
-    } else {
-        skipped_ids(item)
-            .filter(|id| {
-                let eligible = first_own
-                    .is_none_or(|own| item.claude_usage_occurrences[*id].sequence < own)
-                    || item.claude_usage_occurrences[*id]
-                        .timestamp
-                        .as_deref()
-                        .and_then(rfc3339_unix_nanos)
-                        .expect("native skips have usable provider timestamps")
-                        >= SUBAGENT_TWIN_FROM;
-                let held = eligible && earlier.iter().any(|ids| ids.contains(*id));
-                kept += u64::from(held);
-                !held
-            })
-            .cloned()
-            .collect::<Vec<_>>()
-    };
-    let drops = item.claude_money.as_deref().map_or_else(Vec::new, |fold| {
-        item.claude_usage_occurrences
-            .iter()
-            .filter(|(id, occurrence)| {
-                !fold.is_skipped(occurrence.sequence)
-                    && !occurrence.usage.is_zero()
-                    && earlier.iter().any(|ids| ids.contains(*id))
-                    && !fold.is_ambiguous(id)
-                    && occurrence
-                        .timestamp
-                        .as_deref()
-                        .and_then(rfc3339_unix_nanos)
-                        .is_some_and(|time| {
-                            first_own.is_none_or(|own| occurrence.sequence < own)
-                                || time >= SUBAGENT_TWIN_FROM
-                        })
-            })
-            .map(|(id, _)| id.clone())
-            .collect::<Vec<_>>()
-    });
+    let (mut kept, mut uncovered, mut drops) = (0, Vec::new(), Vec::new());
+    for (id, occurrence) in &item.claude_usage_occurrences {
+        let held = || earlier.iter().any(|ids| ids.contains(id));
+        let before_own = first_own.is_none_or(|own| occurrence.sequence < own);
+        if fold.is_skipped(occurrence.sequence) {
+            if drop_only {
+                continue;
+            }
+            let eligible = before_own
+                || occurrence
+                    .timestamp
+                    .as_deref()
+                    .and_then(rfc3339_unix_nanos)
+                    .expect("native skips have usable provider timestamps")
+                    >= SUBAGENT_TWIN_FROM;
+            if eligible && held() {
+                kept += 1;
+            } else {
+                uncovered.push(id.clone());
+            }
+        } else if !occurrence.usage.is_zero() && held() && !fold.is_ambiguous(id) && before_own {
+            drops.push(id.clone());
+        }
+    }
     if !drop_only {
         restore_uncovered(&mut items[at], &uncovered);
     }
@@ -4973,10 +4948,6 @@ mod family_duplicate_tests;
 #[cfg(test)]
 #[path = "e2_activity_clock_tests.rs"]
 mod activity_clock_tests;
-
-#[cfg(test)]
-#[path = "e2_subagent_twin_tail_support.rs"]
-pub(crate) mod subagent_twin_tail_support;
 
 /// A selected path twin pulls its complete family into this existing native
 /// page's forced-family path. No parser/scope/identity bump is involved.

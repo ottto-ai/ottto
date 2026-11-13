@@ -1,5 +1,6 @@
 // A subagent stored in two homes whose last shared response is inside the
 // copy slack before the later home's birth: routes and the rule-4 re-owe.
+use crate::snapshots::{history_local_count, HistoryLocalCount};
 
 const TAIL_AGENT: &str = "agent-7a11";
 
@@ -47,9 +48,9 @@ fn tail_pair(name: &str) -> (Corpus, ScanIndex) {
     (c, index)
 }
 
-/// The accepted body of the decision before this rule: the tail counted in
-/// both homes (n + 1).
-fn pre_fix(c: &Corpus, index: ScanIndex) -> (ScanIndex, SnapshotItem) {
+/// An accepted over-counted body: the released pre-cutoff behaviour counted
+/// every shared response in both homes (`released_subagent_copies`).
+fn over_counted(c: &Corpus, index: ScanIndex) -> (ScanIndex, SnapshotItem) {
     let mut page = c.raw(
         &E2ScanFixture::with_subagent_births(),
         index.clone(),
@@ -58,19 +59,28 @@ fn pre_fix(c: &Corpus, index: ScanIndex) -> (ScanIndex, SnapshotItem) {
         &[],
     );
     let committed = page.committed.clone();
-    e2::subagent_twin_tail_support::pre_fix_twin_tail(&mut page.scan.snapshots);
+    e2::pipeline_test_observer::released_subagent_copies(&mut page.scan.snapshots);
     page.enrich(c);
     page.finish();
     let head = body(&page, &tail_member()).unwrap().clone();
-    assert_eq!((head.request_count, head.output_tokens), (4, 85));
-    assert_eq!(head.removed_request_count, Some(2));
+    assert_eq!((head.request_count, head.output_tokens), (6, 126));
+    assert_eq!(head.removed_request_count, Some(0));
     let prior = settle(c, &committed, page, &mut e2_progress());
     (prior, head)
 }
 
-/// [money] T4/T7: from an accepted n + 1 body, cold, retained and restarted
-/// owners emit the same corrected body (n, one more removal). Rule 4 selects
-/// and re-owes the pair once (not the root or the lone sibling); after a
+/// Each indexed file's stored body revision.
+fn revisions(index: &ScanIndex) -> BTreeMap<String, u64> {
+    index
+        .files
+        .iter()
+        .map(|(key, entry)| (key.clone(), entry.effective_upload_body_witness_revision))
+        .collect()
+}
+
+/// [money] T4/T7: from an accepted over-counted body, cold, retained and
+/// restarted owners emit the same corrected body (each shared request once).
+/// Rule 4 re-owes the pair once (not the root or the lone sibling); after a
 /// restart nothing is re-owed again. The receiver accepts the decrease, and
 /// the next unchanged page uploads nothing.
 #[cfg(unix)]
@@ -78,7 +88,7 @@ fn pre_fix(c: &Corpus, index: ScanIndex) -> (ScanIndex, SnapshotItem) {
 fn subagent_twin_tail_corrects_the_accepted_head_once() {
     with_e2(|| {
         let (c, index) = tail_pair("subagent-twin-tail-routes");
-        let (prior, _) = pre_fix(&c, index);
+        let (prior, _) = over_counted(&c, index);
         let mut routes = Vec::new();
         for (mode, sampled) in [
             (Mode::ColdFull, false),
@@ -111,29 +121,18 @@ fn subagent_twin_tail_corrects_the_accepted_head_once() {
             money_oracle::assert_equivalent(&routes[0], route);
         }
         // The restart arm committed through this corpus's route: upgrade a
-        // fresh copy of the same accepted n + 1 body.
+        // fresh copy of the same accepted body.
         let (c, index) = tail_pair("subagent-twin-tail-upgrade");
-        let (mut prior, head) = pre_fix(&c, index);
+        let (mut prior, head) = over_counted(&c, index);
         prior.claude_money_birth_store.set_money_rule_version(3);
         prior.activate_effective_upload_body_witness_revision(3);
-        let revisions = |index: &ScanIndex| {
-            index
-                .files
-                .iter()
-                .map(|(key, entry)| (key.clone(), entry.effective_upload_body_witness_revision))
-                .collect::<BTreeMap<_, _>>()
-        };
         let before = revisions(&prior);
-        e2::take_diag();
+        let reowed = history_local_count(HistoryLocalCount::Reowed);
         e2::apply_money_rules(&mut prior);
         assert_eq!(prior.claude_money_birth_store.money_rule_version(), 4);
         assert_eq!(
-            copy_diag(&[
-                "money_rule_selected",
-                "money_rule_reowed",
-                "money_rule_v3_reowed"
-            ]),
-            [2, 2, 0],
+            history_local_count(HistoryLocalCount::Reowed),
+            reowed + 2,
             "the pair only"
         );
         // The root and the lone sibling keep their revisions: their co-read
@@ -147,10 +146,15 @@ fn subagent_twin_tail_corrects_the_accepted_head_once() {
             assert_eq!(revision, expected, "{key}");
         }
         prior = c.reload(&mut prior);
+        let settled = revisions(&prior);
+        let reowed = history_local_count(HistoryLocalCount::Reowed);
         e2::apply_money_rules(&mut prior);
         assert_eq!(
-            copy_diag(&["money_rule_selected", "money_rule_reowed"]),
-            [0, 0],
+            (
+                history_local_count(HistoryLocalCount::Reowed),
+                revisions(&prior)
+            ),
+            (reowed, settled),
             "no second re-owe after restart"
         );
         let mut page = ready(
@@ -201,27 +205,22 @@ fn subagent_twin_tail_corrects_the_accepted_head_once() {
     });
 }
 
-/// [money] T7: from version 2, rules 3 and 4 select the same pair; each key
-/// is re-owed once. Without a pair, rule 4 selects nothing.
+/// [money] T7: from version 2, rules 3 and 4 select the same pair: the jump
+/// to version 4 re-owes each key once. Without a pair, rule 4 re-owes nothing.
 #[cfg(unix)]
 #[test]
 fn subagent_twin_tail_rule_four_unions_with_rule_three() {
     with_e2(|| {
         let (c, index) = tail_pair("subagent-twin-tail-union");
-        let (mut prior, _) = pre_fix(&c, index);
+        let (mut prior, _) = over_counted(&c, index);
         prior.claude_money_birth_store.set_money_rule_version(2);
         prior.activate_effective_upload_body_witness_revision(3);
         e2::take_diag();
+        let reowed = history_local_count(HistoryLocalCount::Reowed);
         e2::apply_money_rules(&mut prior);
         assert_eq!(prior.claude_money_birth_store.money_rule_version(), 4);
-        assert_eq!(
-            copy_diag(&[
-                "money_rule_v3_reowed",
-                "money_rule_selected",
-                "money_rule_reowed"
-            ]),
-            [2, 2, 2]
-        );
+        assert_eq!(copy_diag(&["money_rule_v3_reowed"]), [2]);
+        assert_eq!(history_local_count(HistoryLocalCount::Reowed), reowed + 2);
         let mut c = Corpus::new("subagent-twin-tail-none");
         c.root(ROOT, &line(ROOT, "root-only", A.1, 10));
         c.write_at(
@@ -232,24 +231,9 @@ fn subagent_twin_tail_rule_four_unions_with_rule_three() {
         let mut lone = warm(&c);
         lone.claude_money_birth_store.set_money_rule_version(3);
         lone.activate_effective_upload_body_witness_revision(3);
-        e2::take_diag();
+        let reowed = history_local_count(HistoryLocalCount::Reowed);
         e2::apply_money_rules(&mut lone);
         assert_eq!(lone.claude_money_birth_store.money_rule_version(), 4);
-        assert_eq!(
-            copy_diag(&["money_rule_selected", "money_rule_reowed"]),
-            [0, 0]
-        );
+        assert_eq!(history_local_count(HistoryLocalCount::Reowed), reowed);
     });
-}
-
-/// [money] U1: an unchanged ACK settles identical usage without a basis or
-/// with `usage_identical`; a dominated one or an accepted one never does.
-#[test]
-fn unchanged_ack_usage_identical_is_diagnostic_only() {
-    use crate::snapshot_sync::ack_usage_identical as identical;
-    assert!(identical(true, None));
-    assert!(identical(true, Some("usage_identical")));
-    assert!(!identical(true, Some("dominated_by_head")));
-    assert!(!identical(false, None));
-    assert!(!identical(false, Some("usage_identical")));
 }
