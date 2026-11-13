@@ -4184,7 +4184,7 @@ const SHED_BACKOFF_BASE: Duration = Duration::from_secs(30);
 
 /// Uniform random in `[0, span]`, from the OS entropy source already used for
 /// token material. Jitter that is not random is not jitter.
-fn uniform_duration(span: Duration) -> Duration {
+pub(crate) fn uniform_duration(span: Duration) -> Duration {
     if span.is_zero() {
         return Duration::ZERO;
     }
@@ -5148,6 +5148,7 @@ pub fn spawn_local_health_projection_sync(daemon: LocalDaemon) -> Result<()> {
                     );
                 }
             }
+            crate::control::reconcile_setup_scan_in_background(&daemon);
             std::thread::sleep(LOCAL_HEALTH_PROJECTION_INTERVAL);
         })
         .context("spawn local health projection sync")?;
