@@ -330,12 +330,14 @@ pub(super) fn wire(built: &mut Page) {
     item.session_display_name = Some("must-not-leak-title".into());
     let wire = value(request(&built.scan.snapshots)).unwrap();
     let item = &wire["snapshots"][0];
-    let allowed = "evidence_basis source_session_id snapshot_fingerprint status input_tokens output_tokens cache_read_tokens reasoning_output_tokens unattributed_total_tokens request_count usage_accounting_contract removed_request_count removed_usage telemetry_owned_complete resolver_conflict_count model_usage usage_buckets cost initiator source_started_at source_ended_at source_last_activity_at collected_at provenance request_evidence request_identity_refusals semantic_envelope content_hash".split_whitespace().collect::<BTreeSet<_>>();
+    let allowed = "evidence_basis source_session_id snapshot_fingerprint status input_tokens output_tokens cache_read_tokens cache_creation_5m_tokens cache_creation_1h_tokens reasoning_output_tokens unattributed_total_tokens request_count usage_accounting_contract removed_request_count removed_usage telemetry_owned_complete resolver_conflict_count model_usage usage_buckets cost initiator source_started_at source_ended_at source_last_activity_at collected_at provenance request_evidence request_identity_refusals semantic_envelope content_hash".split_whitespace().collect::<BTreeSet<_>>();
     assert!(item
         .as_object()
         .unwrap()
         .keys()
         .all(|key| allowed.contains(key.as_str())));
+    assert_eq!(item["cache_creation_5m_tokens"], 20);
+    assert_eq!(item["cache_creation_1h_tokens"], 8);
     assert_eq!(item["evidence_basis"], "otel_only");
     assert_eq!(item["initiator"], "unknown");
     assert_eq!(

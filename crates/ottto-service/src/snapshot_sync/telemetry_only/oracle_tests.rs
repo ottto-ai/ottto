@@ -1,4 +1,3 @@
-// Real evidence chunks, native finalization, wire preflight and entity ACK.
 use super::state_v2_money_tests::tagged_api;
 use super::E2ScanFixture as Scanner;
 use super::*;
@@ -35,6 +34,7 @@ fn pair(c: &Corpus, rows: &[Api]) {
 }
 fn restore(p: &Progress) -> Progress {
     let mut p: Progress = decode(&encode(p).unwrap()).unwrap();
+    p.finish_load(snapshot_quarantine_witness(Claude));
     p.accepted_identity_buckets.bind_test_key(Some([0x42; 32]));
     p
 }
@@ -504,9 +504,7 @@ fn growth() {
     }
 }
 
-/// [oracle] Composition with copy-family ownership: roots in another folder
-/// and their subagents are positive holders, including when their body is not
-/// the telemetry root's carrier. No request can be emitted by both entities.
+/// Native holders, including off-page copies, never duplicate telemetry requests.
 fn carriers() {
     for kind in [
         "main",
