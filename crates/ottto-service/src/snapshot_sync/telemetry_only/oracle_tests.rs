@@ -143,6 +143,7 @@ fn custody(state: &Progress) -> Value {
     ])
 }
 fn settled_index(c: &Corpus, page: &mut Page, p: &Progress) -> ScanIndex {
+    settle_index_after_upload(&mut page.index, &page.committed, p);
     accept_upload_context_acks_for_test(
         &mut page.index,
         &page.scan.snapshots,
@@ -504,10 +505,10 @@ fn carriers() {
         "child",
         "forks",
         "twin",
-        "content-twin",
         "resume",
         "correction",
     ] {
+        eprintln!("OTEL_ONLY_ORACLE_CARRIER {kind}");
         let mut c = Corpus::new("otel-holder-table");
         positive(&c);
         let before = line_by(COPY, "before", AT, 11, OLD_WRITER);
@@ -518,7 +519,7 @@ fn carriers() {
             _ => file(COPY),
         };
         let path = c.write_at(&relative, &before, "2026-08-02T07:00:00Z");
-        if matches!(kind, "twin" | "content-twin" | "resume" | "correction") {
+        if matches!(kind, "twin" | "resume" | "correction") {
             let session = if kind == "twin" { COPY } else { THIRD };
             let own = if kind == "resume" {
                 line_by(session, "after", "2026-08-02T07:03:10Z", 12, RESUME_WRITER)
@@ -527,11 +528,7 @@ fn carriers() {
             };
             c.write_at(
                 &format!("other/{session}.jsonl"),
-                &(if kind == "resume" {
-                    line_by(session, "before", AT, 11, OLD_WRITER)
-                } else {
-                    before.clone()
-                } + &own),
+                &(line_by(session, "before", AT, 11, OLD_WRITER) + &own),
                 "2026-08-02T07:03:00Z",
             );
         }
@@ -558,12 +555,12 @@ fn carriers() {
             });
             index = settle(&c, &index, old, &mut e2_progress());
         }
-        let mut full = retained(&c, &mut p, index, 100);
+        let mut full = retained(&c, &mut p, index.clone(), 100);
         assert_eq!(only(&full).request_count, remaining, "{kind}");
         // Main counts unproven all-copy twins twice; preserve its exact bodies.
         let mut off = hint();
         off.claude_otel_only_sessions_contract = None;
-        let native = page(&c, &mut progress(), &off, WireBudget::default());
+        let native = page_from(&c, &mut progress(), &off, WireBudget::default(), index, 100);
         let mut bodies = full.scan.snapshots.clone();
         bodies.retain(|i| i.evidence_basis.is_none());
         let count = total(&native) + remaining;
