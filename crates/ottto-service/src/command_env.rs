@@ -574,6 +574,7 @@ pub(crate) mod test_shell_env {
         static CALLS: RefCell<usize> = const { RefCell::new(0) };
         static CACHE: RefCell<Arc<ShellEnvCache>> = RefCell::new(Arc::default());
         static NOW: Cell<Option<Instant>> = const { Cell::new(None) };
+        static BEFORE_OUTPUT: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
     }
 
     pub(super) fn cache() -> Arc<ShellEnvCache> {
@@ -596,7 +597,14 @@ pub(crate) mod test_shell_env {
         CACHE.set(cache);
     }
 
+    pub(super) fn before_output(hook: impl FnOnce() + 'static) {
+        BEFORE_OUTPUT.set(Some(Box::new(hook)));
+    }
+
     pub(super) fn output() -> Option<Option<Vec<u8>>> {
+        if let Some(hook) = BEFORE_OUTPUT.take() {
+            hook();
+        }
         OUTPUT.with_borrow(|output| {
             if output.is_some() {
                 CALLS.with_borrow_mut(|calls| *calls += 1);
@@ -612,6 +620,7 @@ pub(crate) mod test_shell_env {
             usize,
             Arc<ShellEnvCache>,
             Option<Instant>,
+            Option<Box<dyn FnOnce()>>,
         );
         impl Drop for Restore {
             fn drop(&mut self) {
@@ -619,6 +628,7 @@ pub(crate) mod test_shell_env {
                 CALLS.set(self.1);
                 CACHE.set(self.2.clone());
                 NOW.set(self.3);
+                BEFORE_OUTPUT.set(self.4.take());
             }
         }
         let _restore = Restore(
@@ -626,6 +636,7 @@ pub(crate) mod test_shell_env {
             CALLS.replace(0),
             CACHE.replace(Arc::default()),
             NOW.replace(None),
+            BEFORE_OUTPUT.replace(None),
         );
         let result = run();
         (result, CALLS.with_borrow(|calls| *calls))
@@ -642,6 +653,7 @@ mod tests {
     const SHELL_PROJECT: &[u8] = b"GOOGLE_CLOUD_PROJECT=shell-project\n";
 
     #[test]
+    #[serial_test::serial]
     fn shell_cache_reuses_import_within_ttl() {
         let (_, calls) = test_shell_env::with_output(Some(SHELL_PROJECT), || {
             let start = Instant::now();
@@ -655,6 +667,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn shell_cache_reimports_at_ttl_boundary() {
         let (_, calls) = test_shell_env::with_output(Some(SHELL_PROJECT), || {
             let start = Instant::now();
@@ -669,6 +682,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn shell_cache_retains_failure_for_full_ttl() {
         let (_, calls) = test_shell_env::with_output(None, || {
             let start = Instant::now();
@@ -684,6 +698,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn shell_cache_home_change_is_a_miss() {
         let (_, calls) = test_shell_env::with_output(Some(SHELL_PROJECT), || {
             cached_shell_provider_env(false);
@@ -699,33 +714,60 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn shell_cache_concurrent_callers_share_one_import() {
-        use std::sync::{Arc, Barrier};
+        use std::sync::{mpsc, Arc, Barrier};
         let cache = Arc::new(ShellEnvCache::default());
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let importer_cache = cache.clone();
+        let importer = std::thread::spawn(move || {
+            test_shell_env::with_output(Some(SHELL_PROJECT), || {
+                test_shell_env::share_cache(importer_cache);
+                test_shell_env::before_output(move || {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                });
+                cached_shell_provider_env(false).unwrap()
+            })
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let barrier = Arc::new(Barrier::new(8));
-        let workers = (0..8)
+        let (done_tx, done_rx) = mpsc::channel();
+        let workers = (0..7)
             .map(|_| {
                 let cache = cache.clone();
                 let barrier = barrier.clone();
+                let done = done_tx.clone();
                 std::thread::spawn(move || {
                     test_shell_env::with_output(Some(SHELL_PROJECT), || {
                         test_shell_env::share_cache(cache);
                         barrier.wait();
-                        cached_shell_provider_env(false).unwrap()
+                        let result = cached_shell_provider_env(false).unwrap();
+                        done.send(()).unwrap();
+                        result
                     })
                 })
             })
             .collect::<Vec<_>>();
-        let mut calls = 0;
+        barrier.wait();
+        let waiting = done_rx.recv_timeout(Duration::from_millis(50)).is_err();
+        release_tx.send(()).unwrap();
+        let (_, mut calls) = importer.join().unwrap();
         for worker in workers {
             let (value, imports) = worker.join().unwrap();
             assert_eq!(value["GOOGLE_CLOUD_PROJECT"], "shell-project");
             calls += imports;
         }
+        assert!(
+            waiting,
+            "callers must wait until the in-flight import completes"
+        );
         assert_eq!(calls, 1);
     }
 
     #[test]
+    #[serial_test::serial]
     fn shell_cache_overlapping_refresh_shares_completed_import() {
         let (_, calls) = test_shell_env::with_output(Some(SHELL_PROJECT), || {
             let start = Instant::now();
