@@ -34,7 +34,7 @@ use crate::telemetry_attach::{join, Attachment, DisclosureReason, Holders};
 use serde::Serialize;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -3754,6 +3754,60 @@ pub(crate) fn attach_page(items: &mut [SnapshotItem], read: &ClaudeApiEvidenceRe
     }
 }
 
+/// Page-local exact Task-member discovery. Concrete anchors preserve path twins;
+/// neither the index nor telemetry supplies a guessed project directory.
+#[derive(Default)]
+pub(crate) struct SideCallDiscovery {
+    anchors: BTreeMap<String, BTreeSet<PathBuf>>,
+    pub(crate) hints: BTreeSet<PathBuf>,
+}
+impl SideCallDiscovery {
+    pub(crate) fn new<'a>(paths: impl Iterator<Item = &'a Path>) -> Self {
+        let mut page = Self::default();
+        for path in paths {
+            let Some(member) =
+                claude_index_path_member_ref(path).filter(|member| member.subagent_stem.is_none())
+            else {
+                continue;
+            };
+            if let Some(parent) = path.parent() {
+                page.anchors
+                    .entry(member.root.to_owned())
+                    .or_default()
+                    .insert(parent.join(member.root).join("subagents"));
+            }
+        }
+        page
+    }
+
+    fn reserve_member(&mut self, root: &str, owner: &str) -> bool {
+        let Some(stem) = owner.strip_prefix(root).and_then(|s| s.strip_prefix('_')) else {
+            return false;
+        };
+        let mut reserved = false;
+        for directory in self.anchors.get(root).into_iter().flatten() {
+            let path = directory.join(format!("{stem}.jsonl"));
+            if !claude_index_path_family_member(&path)
+                .is_some_and(|member| member.0 == root && member.1 == owner)
+            {
+                continue;
+            }
+            let found = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata.is_file(),
+                Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+            };
+            if found {
+                reserved = true;
+                if self.hints.insert(path) {
+                    diag("side_call_member_hints", 1);
+                    record_counts(Counts::one(28, 1));
+                }
+            }
+        }
+        reserved
+    }
+}
+
 /// Side calls (telemetry-only requests no family transcript holds) keep
 /// today's attribution: the trace-named member's body; the root only
 /// when no trace row names a member (counted). One membership pass over the
@@ -3771,6 +3825,7 @@ pub(crate) fn side_calls_page(
     api: &ClaudeLocalOtelLoadReport,
     trace: &ClaudeTraceOwnershipLoadReport,
     index: &ScanIndex,
+    discovery: &mut SideCallDiscovery,
 ) -> BTreeSet<String> {
     if !index.persistence_available() {
         return items.iter().map(|i| i.source_session_id.clone()).collect();
@@ -3969,6 +4024,9 @@ pub(crate) fn side_calls_page(
                     waiting = true;
                     diag("side_call_undiscovered", 1);
                     continue;
+                }
+                if discovery.reserve_member(root, owner) {
+                    continue; // same off-page skip as census/unread members
                 }
                 owner = root.as_str();
                 fallback = true;
@@ -4737,7 +4795,7 @@ fn absent_twins(
 // Existing native_collection_page carrier, nonzero only. These are shared
 // process fold deltas since its previous Claude page line.
 use std::sync::atomic::{AtomicU64, Ordering};
-const COUNT_NAMES: [&str; 28] = [
+const COUNT_NAMES: [&str; 29] = [
     "fold_us",
     "responses",
     "copy_skipped",
@@ -4777,6 +4835,7 @@ const COUNT_NAMES: [&str; 28] = [
     "family_copy_deferred",
     // Copied requests an earlier same-session fold on the page counts.
     "copy_prefix_twin_page_removed",
+    "side_call_member_hints",
 ];
 // Then `copy_prefix_wait`: proof waits started, and (episodes, decided
 // passes) settled by holder proof, third-pass expiry or counting.
