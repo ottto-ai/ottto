@@ -2832,8 +2832,13 @@ exit 1
             .login_state,
         AgentLoginState::SignedOut
     );
-    for slot in [&managed, &healthy_external, &duplicate] {
-        fs::remove_file(slot.join(".credentials.json")).unwrap();
+    for slot in status.managed_slots.iter().chain(&status.external_slots) {
+        store
+            .remove(
+                ottto_protocol::CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
+                &slot.slot_id,
+            )
+            .unwrap();
     }
     let no_slots = collect();
     for snapshot in no_slots
