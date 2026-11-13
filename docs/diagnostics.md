@@ -1311,9 +1311,13 @@ the Ottto support directory, readable only by the user:
   request), or `subprocess_lower_bound` for a provider CLI run, which makes at
   least `requests_at_least` requests the daemon cannot see. Requests count
   when sent, answered or not; `result` shows how the call ended. A Codex quota
-  read through `codex app-server` that started counts two (a token refresh and
-  a rate-limits read), or three with the detailed read, even when it fails or
-  times out. A sign-in counts one once a code was submitted.
+  read through `codex app-server` that started counts three (workspace
+  discovery, models and the rate-limits read), or two when the daemon gave it
+  that Codex's own bundled model list (`codex debug models --bundled`, saved
+  under `codex-probe/` in the support dir) so it asks for no models, and one
+  more with the detailed read, even when it fails or times out. A read given
+  the list that ends without an account answer stops its use until Codex
+  changes. A sign-in counts one once a code was submitted.
 
 Lines never contain tokens, URLs, prompts, emails or provider responses. Days
 older than 7 are deleted. A day holds at most 30,000 lines and 8 MiB, and the

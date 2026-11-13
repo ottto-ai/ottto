@@ -1,0 +1,117 @@
+//! The limits probe's model catalog: the installed Codex's own bundled model
+//! list (`codex debug models --bundled`), handed back to that same binary so
+//! its app-server starts without asking the provider for models. The probe
+//! never lists models; displayed models still come from the bundled command.
+
+use crate::transcript_acquisition::SourceStamp;
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+/// The binary whose list was saved last, its file, and the digest of the
+/// bytes written there; `None` once a probe that used it got no
+/// `account/read` reply.
+static SAVED: Mutex<Option<(SourceStamp, PathBuf, Option<[u8; 32]>)>> = Mutex::new(None);
+
+/// The daemon support dir; in tests that name none, a scratch dir rather
+/// than the real one.
+fn support_dir() -> PathBuf {
+    #[cfg(test)]
+    if std::env::var_os("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR").is_none() {
+        return std::env::temp_dir().join(format!("ottto-codex-probe-{}", std::process::id()));
+    }
+    ottto_core::default_support_dir()
+}
+
+/// Saves the bundled list `stdout` that the binary with `stamp` printed,
+/// unless a probe already gave up on that binary's list. Only a new binary
+/// prunes older lists, and it keeps the previous one: a probe started just
+/// before may still read it.
+pub(super) fn save(stamp: SourceStamp, stdout: &str) {
+    let listed = serde_json::from_str::<Value>(stdout)
+        .ok()
+        .is_some_and(|json| {
+            json.get("models")
+                .and_then(Value::as_array)
+                .is_some_and(|models| !models.is_empty())
+        });
+    let SourceStamp::File(file) = &stamp else {
+        return;
+    };
+    let Some(name) = serde_json::to_vec(file).ok().filter(|_| listed) else {
+        return;
+    };
+    let mut saved = SAVED.lock().unwrap_or_else(|e| e.into_inner());
+    let (path, prune_keeping) = match saved.as_ref() {
+        Some((kept, _, None)) if kept.same(&stamp) => return,
+        Some((kept, path, _)) if kept.same(&stamp) => (path.clone(), None),
+        kept => {
+            let name = format!("{:x}", Sha256::digest(name));
+            let dir = support_dir().join("codex-probe");
+            let previous = kept.map(|(_, path, _)| path.clone());
+            (
+                dir.join(format!("bundled-{}.json", &name[..8])),
+                Some(previous),
+            )
+        }
+    };
+    if ottto_core::write_owner_only_cache_file_atomic(&path, stdout.as_bytes()).is_err() {
+        *saved = None;
+        return;
+    }
+    let digest = Sha256::digest(stdout.as_bytes()).into();
+    *saved = Some((stamp, path.clone(), Some(digest)));
+    let (Some(previous), Some(dir)) = (prune_keeping, path.parent()) else {
+        return;
+    };
+    for old in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let (old, name) = (old.path(), old.file_name());
+        let name = name.to_string_lossy();
+        if name.starts_with("bundled-")
+            && name.ends_with(".json")
+            && old != path
+            && Some(&old) != previous.as_ref()
+        {
+            let _ = std::fs::remove_file(old);
+        }
+    }
+}
+
+/// The list file for the binary about to run, read right before its spawn:
+/// only when that binary's list was saved and the file still holds exactly
+/// those bytes.
+pub(super) fn for_probe() -> Option<PathBuf> {
+    let stamp = super::cli_binary_stamp("codex").ok()?;
+    let (path, digest) = match SAVED.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        Some((kept, path, Some(digest))) if kept.same(&stamp) => (path.clone(), *digest),
+        _ => return None,
+    };
+    let bytes = std::fs::read(&path).ok()?;
+    (<[u8; 32]>::from(Sha256::digest(bytes)) == digest).then_some(path)
+}
+
+/// After a probe that passed `path` ended (reaped) with no `account/read`
+/// reply: later probes run without a list until the binary changes. The file
+/// stays, since another home's probe may still read it.
+pub(super) fn give_up(path: &Path) {
+    let mut saved = SAVED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, kept, digest)) = saved.as_mut() {
+        if kept == path {
+            *digest = None;
+        }
+    }
+}
+
+/// `model_catalog_json="<path>"`, the path as a TOML basic string, for `-c`.
+pub(super) fn override_arg(path: &Path) -> String {
+    let mut quoted = String::new();
+    for c in path.to_string_lossy().chars() {
+        match c {
+            '"' | '\\' => quoted.extend(['\\', c]),
+            c if c.is_control() => quoted.push_str(&format!("\\u{:04X}", u32::from(c))),
+            c => quoted.push(c),
+        }
+    }
+    format!("model_catalog_json=\"{quoted}\"")
+}
