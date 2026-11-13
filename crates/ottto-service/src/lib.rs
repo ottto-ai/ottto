@@ -4301,7 +4301,10 @@ fn source_health_from_verification(
                 retryable: false,
             }],
         )
-    } else if agent_cli_unavailable || ottto_claude_connected {
+    } else if ottto_claude_connected {
+        // A usable Ottto account is connected; the signed-out Default cannot run a live check.
+        claude_connected_health()
+    } else if agent_cli_unavailable {
         // Data/config is present (desktop-app-only install) but the CLI binary
         // can't be executed, so only the live check is unavailable while local
         // session files keep syncing. Keep the source visible as a soft
@@ -4310,19 +4313,15 @@ fn source_health_from_verification(
         (
             SourceState::NeedsConfirmation,
             HealthGrade::Warning,
-            if ottto_claude_connected {
-                Vec::new()
-            } else {
-                vec![HealthProblem {
-                    code: StableProblemCode::AgentCliUnavailable,
-                    title: format!(
-                        "{} CLI was not found for live checks",
-                        source_display_name(&result.source)
-                    ),
-                    detail: result.message.text.clone(),
-                    retryable: true,
-                }]
-            },
+            vec![HealthProblem {
+                code: StableProblemCode::AgentCliUnavailable,
+                title: format!(
+                    "{} CLI was not found for live checks",
+                    source_display_name(&result.source)
+                ),
+                detail: result.message.text.clone(),
+                retryable: true,
+            }],
         )
     } else if config_has_drift && !provider_reauth_required {
         (
@@ -4434,7 +4433,7 @@ fn source_health_from_verification(
             ),
             backup: None,
         }]
-    } else if config_has_drift && !ottto_claude_connected {
+    } else if config_has_drift {
         let authority = repair_authority_for_state(state);
         vec![RepairAction {
             action: RepairActionKind::WriteConfig,
@@ -4634,9 +4633,9 @@ fn has_soft_smoke_timeout_problem(health: &SourceHealth) -> bool {
         && health.problems.iter().any(|problem| {
             problem.code == StableProblemCode::TelemetryNotVerified
                 && (problem.detail.contains("smoke session timed out")
-                    || problem.detail.contains(
-                        "The Claude Code test run timed out before Ottto could check it.",
-                    ))
+                    || problem
+                        .detail
+                        .contains(control::CLAUDE_SMOKE_TIMEOUT_MESSAGE))
         })
 }
 
@@ -4797,10 +4796,14 @@ fn preserve_blocking_verification_state(refreshed: &mut SourceHealth, existing: 
     if preserve_config_drift {
         refreshed.config.drift = existing.config.drift.clone();
     }
+    let snapshot = refreshed.agent_status.as_ref();
     let clear_failed_verification = has_soft_no_fresh_telemetry_problem(existing)
         || has_soft_smoke_timeout_problem(existing)
         || has_soft_verification_service_unavailable_problem(existing)
         || has_usage_limited_verification_problem(existing)
+        || (snapshot.is_some_and(agent_status::claude_default_check_skipped)
+            && matches!(existing.recommended_actions.as_slice(), [a] if a.action == RepairActionKind::ReauthProvider)
+            && existing.problems.len() == 1)
         || (has_pi_route_smoke_failure_problem(existing)
             && refreshed_pi_status_has_available_routes(refreshed))
         || (has_pi_oauth_reauth_problem(existing)
@@ -4882,6 +4885,15 @@ fn is_usage_checks_paused_problem(problem: &HealthProblem) -> bool {
     problem.code == StableProblemCode::Unknown && problem.title == USAGE_CHECKS_PAUSED_TITLE
 }
 
+fn claude_connected_health() -> (SourceState, HealthGrade, Vec<HealthProblem>) {
+    (SourceState::NeedsConfirmation, HealthGrade::Warning, vec![HealthProblem {
+        code: StableProblemCode::AgentCliUnavailable,
+        title: "Claude Code live check is unavailable".to_string(),
+        detail: "Claude is connected through an account added in Ottto. The live check is skipped because Claude Code isn't signed in on this Mac.".to_string(),
+        retryable: false,
+    }])
+}
+
 fn source_health_from_agent_status(
     state: &DaemonState,
     snapshot: AgentStatusSnapshot,
@@ -4892,6 +4904,7 @@ fn source_health_from_agent_status(
         .and_then(|account| account.account_id.clone().or_else(|| account.email.clone()));
     let expected_account_id = state.account.user.as_ref().map(|user| user.id.clone());
     let (source_state, grade, problems) = match snapshot.status {
+        AgentStatusState::Available if agent_status::claude_default_check_skipped(&snapshot) => claude_connected_health(),
         AgentStatusState::Available => match usage_checks_paused_problem(&snapshot) {
             // The current login works, so the source stays healthy; paused
             // usage checks for an account are an attention grade with a

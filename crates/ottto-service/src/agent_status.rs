@@ -5585,12 +5585,22 @@ fn collect_claude_status_snapshots(
 
 pub(crate) const CLAUDE_OTTTO_SIGNED_IN: &str = "claude_ottto_account_signed_in";
 
+pub(crate) fn claude_default_check_skipped(snapshot: &AgentStatusSnapshot) -> bool {
+    snapshot.source == SourceKind::ClaudeCode
+        && matches!(&snapshot.account, Some(a) if a.login_state == AgentLoginState::SignedOut)
+        && snapshot
+            .diagnostics
+            .iter()
+            .any(|d| d.code == CLAUDE_OTTTO_SIGNED_IN)
+}
+
 fn claude_ottto_accounts_signed_in(count: usize) -> Option<AgentStatusDiagnostic> {
+    let noun = if count == 1 { "account" } else { "accounts" };
     (count > 0).then(|| {
         AgentStatusDiagnostic::source(
             CLAUDE_OTTTO_SIGNED_IN,
             AgentDiagnosticSeverity::Info,
-            format!("{count} Claude accounts signed in through Ottto"),
+            format!("{count} Claude {noun} signed in through Ottto"),
         )
     })
 }
