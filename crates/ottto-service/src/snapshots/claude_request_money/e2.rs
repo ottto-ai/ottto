@@ -468,7 +468,7 @@ pub(crate) fn apply_money_rules(index: &mut ScanIndex) {
                         .claude_request_census
                         .get(key)
                         .is_some_and(|r| r.is_twin())
-                        || path_twins(&twins, member.root).is_some()
+                        || path_twins(twins, member.root).is_some()
                         // A cross-session resume can have its own path and
                         // content identity; its counted unproven prefix is
                         // the evidence that selects the correction once.
