@@ -326,6 +326,10 @@ fn provider_env_from_sources(
 }
 
 fn interactive_shell_provider_env() -> Option<BTreeMap<String, OsString>> {
+    #[cfg(test)]
+    if let Some(output) = test_shell_env::output() {
+        return output.as_deref().map(parse_provider_env_output);
+    }
     let home = env::var_os("HOME")?;
     let path = path_env_from(None, Some(home.clone()))?;
     let mut command = Command::new("/bin/zsh");
@@ -471,6 +475,42 @@ fn nvm_node_bin_dirs(home: &Path) -> Vec<PathBuf> {
 fn push_unique(dirs: &mut Vec<PathBuf>, dir: PathBuf) {
     if !dirs.iter().any(|existing| existing == &dir) {
         dirs.push(dir);
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_shell_env {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static OUTPUT: RefCell<Option<Option<Vec<u8>>>> = const { RefCell::new(None) };
+        static CALLS: RefCell<usize> = const { RefCell::new(0) };
+    }
+
+    pub(super) fn output() -> Option<Option<Vec<u8>>> {
+        OUTPUT.with_borrow(|output| {
+            if output.is_some() {
+                CALLS.with_borrow_mut(|calls| *calls += 1);
+            }
+            output.clone()
+        })
+    }
+
+    /// Inject the existing parser's shell stdout, or an import failure, on this thread.
+    pub(crate) fn with_output<T>(output: Option<&[u8]>, run: impl FnOnce() -> T) -> (T, usize) {
+        struct Restore(Option<Option<Vec<u8>>>, usize);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                OUTPUT.set(self.0.take());
+                CALLS.set(self.1);
+            }
+        }
+        let _restore = Restore(
+            OUTPUT.replace(Some(output.map(<[u8]>::to_vec))),
+            CALLS.replace(0),
+        );
+        let result = run();
+        (result, CALLS.with_borrow(|calls| *calls))
     }
 }
 

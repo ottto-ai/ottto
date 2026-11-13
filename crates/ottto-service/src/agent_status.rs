@@ -20275,6 +20275,9 @@ fn run_command_capture_with_exact_env(
     if let Some(path_env) = crate::command_env::path_env() {
         command.env("PATH", path_env);
     }
+    if program == "pi" && args == ["--list-models"] {
+        command.envs(crate::command_env::provider_env());
+    }
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
