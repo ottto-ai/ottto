@@ -5169,7 +5169,68 @@ fn reverify_backoff_delay(completed_attempts: u32) -> Duration {
 struct ReverifySchedule {
     source: SourceKind,
     completed_attempts: u32,
-    next_attempt_at: std::time::Instant,
+    next_attempt_at: Option<Instant>,
+    // Outer None is a transient failure; Some holds the last nonsecret auth marker.
+    reauth_marker: Option<Option<String>>,
+    verification_baseline: Option<Option<String>>,
+}
+
+impl ReverifySchedule {
+    fn new(source: SourceKind, now: Instant) -> Self {
+        Self {
+            source,
+            completed_attempts: 0,
+            next_attempt_at: Some(now + reverify_backoff_delay(0)),
+            reauth_marker: None,
+            verification_baseline: None,
+        }
+    }
+
+    fn observe_verification_baseline(&mut self, baseline: Option<Option<String>>) {
+        if self.verification_baseline != baseline {
+            self.reauth_marker = baseline.clone();
+            self.verification_baseline = baseline;
+            self.next_attempt_at = None;
+        }
+    }
+
+    fn is_due(&mut self, now: Instant, requires_reauth: bool, marker: Option<String>) -> bool {
+        if requires_reauth {
+            let Some(previous) = self.reauth_marker.as_mut() else {
+                self.reauth_marker = Some(marker);
+                self.next_attempt_at = None;
+                return false;
+            };
+            if marker.is_none() {
+                // Keep both the last known marker and any unconsumed retry.
+                // Unavailable reads neither create a retry nor discard one.
+                return false;
+            }
+            if *previous != marker {
+                // A new marker gets one attempt after the quiet window,
+                // even if that attempt still fails auth.
+                self.next_attempt_at = Some(now + reverify_backoff_delay(0));
+                *previous = marker;
+                return false;
+            }
+        } else if self.reauth_marker.take().is_some() {
+            self.completed_attempts = 0;
+            self.next_attempt_at = Some(now + reverify_backoff_delay(0));
+        }
+        if self.next_attempt_at.is_some_and(|deadline| now >= deadline) {
+            self.next_attempt_at = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn record_attempt(&mut self, now: Instant) {
+        self.completed_attempts = self.completed_attempts.saturating_add(1);
+        if self.reauth_marker.is_none() {
+            self.next_attempt_at = Some(now + reverify_backoff_delay(self.completed_attempts));
+        }
+    }
 }
 
 /// A blocking verification failure (`Failed` + `TelemetryNotVerified`) is
@@ -5179,6 +5240,8 @@ struct ReverifySchedule {
 /// though pressing Verify immediately healed it. Retry those sources
 /// automatically with exponential backoff so the state converges on its own;
 /// the companion app already self-heals once the daemon reports healthy.
+/// Provider sign-in failures stay quiet until the Default Claude credential's
+/// nonsecret modification marker changes. Other sources keep their existing backoff.
 pub fn spawn_failed_verification_reverify(daemon: LocalDaemon) -> Result<()> {
     std::thread::Builder::new()
         .name("ottto-failed-verify-retry".to_string())
@@ -5186,28 +5249,37 @@ pub fn spawn_failed_verification_reverify(daemon: LocalDaemon) -> Result<()> {
             let mut schedules: Vec<ReverifySchedule> = Vec::new();
             loop {
                 std::thread::sleep(FAILED_VERIFY_POLL_INTERVAL);
-                let failed = match daemon.sources_with_blocking_verification_failure() {
+                let failed = match daemon.blocking_verification_retry_states() {
                     Ok(failed) => failed,
                     Err(_) => continue,
                 };
                 // A source that healed (retry success, manual Verify, sign-in)
                 // drops its schedule so a future failure restarts the backoff
                 // from the initial delay.
-                schedules.retain(|schedule| failed.contains(&schedule.source));
-                for source in failed {
+                schedules
+                    .retain(|schedule| failed.iter().any(|(source, _)| source == &schedule.source));
+                for (source, requires_reauth) in failed {
                     let now = std::time::Instant::now();
-                    let Some(schedule) = schedules
-                        .iter_mut()
-                        .find(|schedule| schedule.source == source)
-                    else {
-                        schedules.push(ReverifySchedule {
-                            source,
-                            completed_attempts: 0,
-                            next_attempt_at: now + reverify_backoff_delay(0),
+                    let index = schedules
+                        .iter()
+                        .position(|schedule| schedule.source == source)
+                        .unwrap_or_else(|| {
+                            schedules.push(ReverifySchedule::new(source.clone(), now));
+                            schedules.len() - 1
                         });
-                        continue;
+                    let schedule = &mut schedules[index];
+                    let marker = if requires_reauth && source == SourceKind::ClaudeCode {
+                        let Ok(baseline) = daemon.claude_verification_auth_marker() else {
+                            continue;
+                        };
+                        schedule.observe_verification_baseline(baseline);
+                        crate::agent_status::claude_credential_modified_marker(
+                            &ottto_core::ClaudeConfigDirSlot::Default,
+                        )
+                    } else {
+                        None
                     };
-                    if now < schedule.next_attempt_at {
+                    if !schedule.is_due(now, requires_reauth, marker) {
                         continue;
                     }
                     match crate::control::reverify_failed_source(&daemon, source.clone()) {
@@ -5221,9 +5293,7 @@ pub fn spawn_failed_verification_reverify(daemon: LocalDaemon) -> Result<()> {
                             crate::source_slug(&source)
                         ),
                     }
-                    schedule.completed_attempts = schedule.completed_attempts.saturating_add(1);
-                    schedule.next_attempt_at = std::time::Instant::now()
-                        + reverify_backoff_delay(schedule.completed_attempts);
+                    schedule.record_attempt(Instant::now());
                 }
             }
         })
@@ -13009,6 +13079,123 @@ pub(crate) use tests::codex_archive_tests::{
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn provider_reauth_retries_once_per_default_login_marker_change() {
+        for initial in [None, Some("original".to_string())] {
+            let now = Instant::now();
+            let mut schedule = ReverifySchedule::new(SourceKind::ClaudeCode, now);
+            for minute in 0..=180 {
+                assert!(!schedule.is_due(
+                    now + Duration::from_secs(minute * 60),
+                    true,
+                    initial.clone()
+                ));
+            }
+            let changed_at = now + Duration::from_secs(181 * 60);
+            assert!(!schedule.is_due(changed_at, true, Some("new".into())));
+            assert!(!schedule.is_due(
+                changed_at + Duration::from_secs(60),
+                true,
+                Some("new".into())
+            ));
+            assert!(schedule.is_due(
+                changed_at + FAILED_VERIFY_RETRY_INITIAL,
+                true,
+                Some("new".into())
+            ));
+            schedule.record_attempt(changed_at + FAILED_VERIFY_RETRY_INITIAL);
+            for minute in 184..=360 {
+                assert!(!schedule.is_due(
+                    now + Duration::from_secs(minute * 60),
+                    true,
+                    Some("new".into())
+                ));
+            }
+            // Restart establishes a baseline; it must not replay a consumed change.
+            let mut restarted = ReverifySchedule::new(SourceKind::ClaudeCode, now);
+            assert!(!restarted.is_due(now, true, Some("new".into())));
+            assert!(!restarted.is_due(now + FAILED_VERIFY_RETRY_MAX, true, Some("new".into())));
+        }
+    }
+
+    #[test]
+    fn provider_reauth_pending_retry_survives_absence_and_observes_quiet_window() {
+        let now = Instant::now();
+        let mut schedule = ReverifySchedule::new(SourceKind::ClaudeCode, now);
+        assert!(!schedule.is_due(now, true, Some("old".into())));
+        assert!(!schedule.is_due(now, true, Some("new".into())));
+        assert!(!schedule.is_due(now + FAILED_VERIFY_RETRY_INITIAL, true, None));
+        assert!(!schedule.is_due(now + FAILED_VERIFY_RETRY_MAX, true, None));
+        let now = now + FAILED_VERIFY_RETRY_MAX;
+        assert!(schedule.is_due(now, true, Some("new".into())));
+        schedule.record_attempt(now);
+        assert!(!schedule.is_due(now, true, Some("newer".into())));
+        let changed_at = now + Duration::from_secs(60);
+        assert!(!schedule.is_due(changed_at, true, Some("latest".into())));
+        assert!(!schedule.is_due(
+            now + FAILED_VERIFY_RETRY_INITIAL,
+            true,
+            Some("latest".into())
+        ));
+        assert!(schedule.is_due(
+            changed_at + FAILED_VERIFY_RETRY_INITIAL,
+            true,
+            Some("latest".into())
+        ));
+    }
+
+    #[test]
+    fn sign_in_before_first_poll_uses_pre_verification_baseline() {
+        let now = Instant::now();
+        let mut schedule = ReverifySchedule::new(SourceKind::ClaudeCode, now);
+        schedule.observe_verification_baseline(Some(None));
+        assert!(!schedule.is_due(now, true, Some("signed-in".into())));
+        schedule.observe_verification_baseline(Some(None));
+        assert!(schedule.is_due(
+            now + FAILED_VERIFY_RETRY_INITIAL,
+            true,
+            Some("signed-in".into())
+        ));
+        schedule.record_attempt(now + FAILED_VERIFY_RETRY_INITIAL);
+        // A manual check already tried the changed login: consume its pending retry.
+        let now = now + FAILED_VERIFY_RETRY_MAX;
+        assert!(!schedule.is_due(now, true, Some("next-login".into())));
+        schedule.observe_verification_baseline(Some(Some("next-login".into())));
+        assert!(!schedule.is_due(
+            now + FAILED_VERIFY_RETRY_MAX,
+            true,
+            Some("next-login".into())
+        ));
+    }
+
+    #[test]
+    fn unavailable_auth_marker_does_not_rearm_the_same_login() {
+        let now = Instant::now();
+        let mut schedule = ReverifySchedule::new(SourceKind::ClaudeCode, now);
+        assert!(!schedule.is_due(now, true, Some("same".into())));
+        assert!(!schedule.is_due(now, true, None));
+        assert!(!schedule.is_due(now, true, Some("same".into())));
+        assert!(!schedule.is_due(now + FAILED_VERIFY_RETRY_MAX, true, Some("same".into())));
+    }
+
+    #[test]
+    fn transient_verification_failures_keep_exponential_backoff() {
+        let mut now = Instant::now();
+        let mut schedule = ReverifySchedule::new(SourceKind::ClaudeCode, now);
+        for minutes in [2, 4, 8, 16, 30, 30] {
+            assert!(!schedule.is_due(now, false, None));
+            let due = now + Duration::from_secs(minutes * 60);
+            assert!(!schedule.is_due(due - Duration::from_secs(1), false, None));
+            assert!(schedule.is_due(due, false, None));
+            schedule.record_attempt(due);
+            now = due;
+        }
+        // A transient failure following a sign-in failure resumes normal backoff.
+        assert!(!schedule.is_due(now, true, None));
+        assert!(!schedule.is_due(now, false, None));
+        assert!(schedule.is_due(now + FAILED_VERIFY_RETRY_INITIAL, false, None));
+    }
+
     mod upload_error_tests {
         include!("snapshot_sync/upload_error_tests.rs");
     }

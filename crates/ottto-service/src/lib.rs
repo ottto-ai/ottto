@@ -277,6 +277,8 @@ struct DaemonState {
     machine: MachineIdentity,
     relay: RelayState,
     sources: Vec<SourceHealth>,
+    /// Default login marker captured before verification; RAM-only, never persisted.
+    claude_verification_auth_marker: Option<Option<String>>,
     /// Real per-source first-seen timestamps, keyed by source slug. Boot-loaded
     /// from `<source_state_dir>/<slug>-state.json` and stamped on first
     /// observation; drives `SourceHealth.connected_at`.
@@ -500,6 +502,7 @@ impl LocalDaemon {
                     last_error: None,
                 },
                 sources: Vec::new(),
+                claude_verification_auth_marker: None,
                 source_first_seen: BTreeMap::new(),
                 source_reconciliation: BTreeMap::new(),
                 scan_index_health_revisions: [[0; 3]; 3],
@@ -1313,6 +1316,35 @@ impl LocalDaemon {
     pub fn sources_with_blocking_verification_failure(
         &self,
     ) -> Result<Vec<SourceKind>, LocalApiError> {
+        Ok(self
+            .blocking_verification_retry_states()?
+            .into_iter()
+            .map(|(source, _)| source)
+            .collect())
+    }
+
+    pub(crate) fn remember_claude_verification_auth_marker(
+        &self,
+        marker: Option<String>,
+    ) -> Result<(), LocalApiError> {
+        let mut state = self.state()?;
+        // An unavailable read must not make an already-tried login look new.
+        if marker.is_some() || state.claude_verification_auth_marker.is_none() {
+            state.claude_verification_auth_marker = Some(marker);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn claude_verification_auth_marker(
+        &self,
+    ) -> Result<Option<Option<String>>, LocalApiError> {
+        Ok(self.state()?.claude_verification_auth_marker.clone())
+    }
+
+    /// Read failure and Claude sign-in action together without collecting status or credentials.
+    pub(crate) fn blocking_verification_retry_states(
+        &self,
+    ) -> Result<Vec<(SourceKind, bool)>, LocalApiError> {
         let state = self.state()?;
         Ok(state
             .sources
@@ -1320,7 +1352,16 @@ impl LocalDaemon {
             .filter(|health| {
                 health.state == SourceState::Failed && has_verification_failure_problem(health)
             })
-            .map(|health| health.source.clone())
+            .map(|health| {
+                (
+                    health.source.clone(),
+                    health.source == SourceKind::ClaudeCode
+                        && health
+                            .recommended_actions
+                            .iter()
+                            .any(|action| action.action == RepairActionKind::ReauthProvider),
+                )
+            })
             .collect())
     }
 
@@ -5365,6 +5406,29 @@ mod tests {
     use serial_test::serial;
 
     const TOKEN: &str = "local_control_token";
+
+    #[test]
+    fn claude_verification_auth_marker_keeps_last_known_on_unavailable_read() {
+        let daemon = daemon();
+        assert_eq!(daemon.claude_verification_auth_marker().unwrap(), None);
+        daemon
+            .remember_claude_verification_auth_marker(None)
+            .unwrap();
+        assert_eq!(
+            daemon.claude_verification_auth_marker().unwrap(),
+            Some(None)
+        );
+        daemon
+            .remember_claude_verification_auth_marker(Some("known".into()))
+            .unwrap();
+        daemon
+            .remember_claude_verification_auth_marker(None)
+            .unwrap();
+        assert_eq!(
+            daemon.claude_verification_auth_marker().unwrap(),
+            Some(Some("known".into()))
+        );
+    }
 
     #[test]
     fn doctor_connection_binding_finding_requires_reconnect_and_clears_after_repair() {
