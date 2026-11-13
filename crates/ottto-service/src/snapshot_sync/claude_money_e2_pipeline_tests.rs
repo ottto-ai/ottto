@@ -3520,6 +3520,10 @@ pub(in crate::snapshot_sync) mod money_equivalence_tests {
     mod codex_creator_slot_oracle_tests {
         include!("../snapshots/sampled_scan/codex_creator_slot_oracle_tests.rs");
     }
+    #[cfg(unix)]
+    mod codex_login_identity_oracle_tests {
+        include!("../snapshots/sampled_scan/codex_login_identity_oracle_tests.rs");
+    }
 }
 
 pub(in crate::snapshot_sync) mod reject_isolation_tests {

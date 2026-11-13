@@ -4581,6 +4581,80 @@ fn codex_dead_login_survives_a_failed_quota_read() {
     }
 }
 
+/// [regress] With refresh never forced, a dead refresh token shows as an
+/// account-stage error, not `account: null`. Codex 0.163's workspace
+/// discovery 401 and 0.167's "sign in again" read as a dead login in the
+/// provider and saved reads; a discovery timeout is a plain failure.
+#[cfg(unix)]
+#[test]
+#[serial]
+fn codex_account_stage_auth_rejection_is_a_dead_login() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for (label, text, dead) in [
+        ("v0163", "workspace routing discovery unauthorized (401)", true),
+        (
+            "v0167",
+            "Your access token could not be refreshed because your refresh token was revoked. Please log out and sign in again.",
+            true,
+        ),
+        ("timeout", "workspace routing discovery timed out", false),
+    ] {
+        let (root, home) = synthetic_codex_collector_home(&format!("auth-rejected-{label}"), 0o600);
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))
+            .expect("managed home mode");
+        let _commands =
+            EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", root.as_os_str().to_os_string());
+        let collect = |registered_binding: Option<(String, String)>, quota_read: CodexQuotaRead| {
+            collect_codex_home_candidate(
+                CodexHomeSlot {
+                    slot_id: "codex_slot_auth_rejected".to_string(),
+                    ownership: CodexAccountSlotOwnershipV1::Managed,
+                    home: home.clone(),
+                    registered_binding,
+                },
+                "2026-08-26T00:05:00Z",
+                "2026-08-26T00:20:00Z",
+                quota_read,
+            )
+        };
+        let registered = collect(None, CodexQuotaRead::Provider)
+            .binding
+            .expect("validated binding");
+
+        let executable = root.join("codex");
+        let script = std::fs::read_to_string(&executable).expect("fake Codex");
+        let answer = r#""result":{"account":{"type":"chatgpt","email":"synthetic-account","planType":"pro"},"requiresOpenaiAuth":true}"#;
+        assert!(script.contains(answer));
+        std::fs::write(
+            &executable,
+            script.replace(
+                answer,
+                &format!(r#""error":{{"code":-32603,"message":"{text}"}}"#),
+            ),
+        )
+        .expect("rejecting account read");
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
+            .expect("fake Codex mode");
+
+        for quota_read in [CodexQuotaRead::Provider, CodexQuotaRead::Saved] {
+            let read = collect(Some(registered.clone()), quota_read);
+            assert_eq!(
+                read.status.state == CodexAccountSlotCollectionStateV1::NeedsLogin,
+                dead,
+                "{label}"
+            );
+            assert!(read.binding.is_none(), "{label}");
+        }
+
+        codex_credit_grants::forget_binding_cadence(&codex_credit_grants::binding_key(
+            &registered.0,
+            &registered.1,
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
 #[cfg(unix)]
 #[test]
 #[serial]

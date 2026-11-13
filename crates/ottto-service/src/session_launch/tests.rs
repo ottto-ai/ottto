@@ -918,6 +918,134 @@ fn codex_launch_and_nickname_read_only_saved_proof_and_never_probe_login() {
     }
 }
 
+/// [regress] Codex refreshes its login only when due, so a launch must not
+/// need a live id token. Default slot, through the real prepare: an expired id
+/// token beside a live access token is admitted; an expired access token is
+/// admitted while `auth.json` is unchanged since the saved validated reading
+/// and still names it, and refused once rewritten (SlotNeedsLogin); another
+/// pair is AccountMismatch. A managed-trust read of the same home names the
+/// same identity (the check launch admission makes for a managed slot).
+#[test]
+fn codex_launch_admits_a_held_login_without_a_live_id_token() {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use ottto_core::CodexHomeTrust;
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    let scratch = crate::test_scratch::ScratchDir::new("codex-launch-held");
+    let canonical_root = scratch.canonicalize().expect("canonical scratch directory");
+    let root = canonical_root.as_path();
+    let (account, org) = codex_login_fixture(root);
+    let home = root.join("home");
+    let codex = home.join(".codex");
+    let auth = codex.join("auth.json");
+    let support = root.join("support");
+    let project = root.join("project");
+    let bin = root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o700)).unwrap();
+    unsafe { std::env::set_var("OTTTO_COMMAND_SEARCH_PATH", &bin) };
+    fs::write(
+        bin.join("codex"),
+        "#!/bin/sh\n[ \"$1\" = --version ] || exit 99\nprintf 'codex-cli 0.170.0\\n'\n",
+    )
+    .unwrap();
+    fs::set_permissions(bin.join("codex"), fs::Permissions::from_mode(0o700)).unwrap();
+    let user = LaunchUser {
+        home: home.clone(),
+        name: "synthetic".into(),
+    };
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let jwt = |expires_at: i64| {
+        let claims = serde_json::json!({"iss":"https://auth.openai.com","aud":"synthetic","exp":expires_at,
+            "https://api.openai.com/auth":{"chatgpt_user_id":"user-one","chatgpt_account_id":"workspace-one"}});
+        format!(
+            "{}.{}.synthetic-signature",
+            URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256"}"#),
+            URL_SAFE_NO_PAD.encode(claims.to_string())
+        )
+    };
+    let write_auth = |access_expires_at: i64, id_expires_at: i64| {
+        let body = serde_json::json!({"auth_mode":"chatgpt","OPENAI_API_KEY":"synthetic-exchanged-key",
+            "tokens":{"account_id":"workspace-one","access_token":jwt(access_expires_at),"id_token":jwt(id_expires_at)}});
+        fs::write(&auth, serde_json::to_vec(&body).unwrap()).unwrap();
+        fs::set_permissions(&auth, fs::Permissions::from_mode(0o600)).unwrap();
+    };
+    let mut hash = Sha256::new();
+    hash.update(b"ottto:codex-quota-home:v1\0");
+    hash.update(codex.as_os_str().as_encoded_bytes());
+    let saved_path = support
+        .join("codex-quota/homes")
+        .join(format!("{:x}", hash.finalize()))
+        .join("saved-quota.json");
+    // The saved validated reading records this `auth.json` as its witness.
+    let pin_witness = || {
+        let metadata = fs::metadata(&auth).unwrap();
+        let modified = metadata
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        let mut saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(&saved_path).unwrap()).unwrap();
+        saved["reading"]["login"]["auth"] = serde_json::json!({"modified_secs":modified.as_secs(),
+            "modified_nanos":modified.subsec_nanos(),"len":metadata.len()});
+        fs::write(&saved_path, serde_json::to_vec(&saved).unwrap()).unwrap();
+    };
+    let prepare = |account: &str| {
+        Registry::default().prepare_for_user(
+            Provider::Codex,
+            "default",
+            account,
+            &org,
+            SessionLaunchFolderV1 {
+                path: Some(project.to_string_lossy().into_owned()),
+                recent_id: None,
+            },
+            Some(test_executable()),
+            &support,
+            user.clone(),
+        )
+    };
+    let identity =
+        |trust: CodexHomeTrust| crate::agent_status::session_launch_codex_identity(&codex, trust);
+    let pair = Some((account.clone(), org.clone()));
+
+    write_auth(now + 3600, now - 60);
+    assert!(
+        prepare(&account).is_ok(),
+        "expired id token, live access token"
+    );
+
+    write_auth(now - 60, now - 60);
+    pin_witness();
+    assert!(
+        prepare(&account).is_ok(),
+        "expired access token, unchanged file"
+    );
+    assert_eq!(identity(CodexHomeTrust::ProviderDefault), pair);
+    assert_eq!(identity(CodexHomeTrust::Managed), pair);
+
+    let mut body = fs::read(&auth).unwrap();
+    body.push(b' ');
+    fs::write(&auth, body).unwrap();
+    assert_eq!(
+        prepare(&account).err().unwrap().reason,
+        Reason::SlotNeedsLogin,
+        "expired access token, rewritten file"
+    );
+    assert_eq!(identity(CodexHomeTrust::Managed), None);
+
+    write_auth(now + 3600, now + 3600);
+    let other = billing_identity_hash("openai", "account", "user-two").unwrap();
+    assert_eq!(
+        prepare(&other).err().unwrap().reason,
+        Reason::AccountMismatch
+    );
+    unsafe { std::env::remove_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR") };
+    unsafe { std::env::remove_var("OTTTO_COMMAND_SEARCH_PATH") };
+}
+
 /// [regress] A stale Codex CLI earlier in the search order failed its version
 /// probe and blocked the launch while agent status used a desktop-bundled CLI.
 #[test]

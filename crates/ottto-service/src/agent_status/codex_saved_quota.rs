@@ -1147,6 +1147,37 @@ pub(super) fn refresh_held(home: &Path) -> bool {
         .is_some_and(|failure| failure.refresh_held)
 }
 
+/// Test only: a provider read of the managed `home` that `read` answers,
+/// saved as [`read_provider_and_save`] saves one.
+#[cfg(test)]
+pub(super) fn save_read_for_test(
+    home: &Path,
+    read: impl FnOnce() -> Result<CodexUsageProbe, String>,
+) {
+    let now = current_unix_seconds();
+    let support_dir = saved_quota_support_dir();
+    let _ = read_and_save_at(
+        &support_dir,
+        home,
+        CodexHomeTrust::Managed,
+        now,
+        |_, _| true,
+        read,
+    );
+}
+
+/// Test only: `body` as `home`'s saved file (bytes another release wrote),
+/// with `{home_key}` replaced by the home's key.
+#[cfg(test)]
+pub(super) fn write_saved_bytes_for_test(home: &Path, body: &str) {
+    let support_dir = saved_quota_support_dir();
+    let path = saved_path(&support_dir, home);
+    let body = body.replace("{home_key}", &home_key(home));
+    restrict_state_dirs(&support_dir).unwrap();
+    ottto_core::write_owner_only_cache_file_atomic(&path, body.as_bytes()).unwrap();
+    planned_cache(&PLANNED_SAVED).remove(&path);
+}
+
 /// When a read finished: the wall clock, never before the trigger's clock.
 #[cfg(not(test))]
 fn read_finished_at(_support_dir: &Path, now: u64) -> u64 {

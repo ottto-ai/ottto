@@ -53,6 +53,8 @@ mod claude_credit_pools;
 mod claude_token_owner;
 mod codex_credit_grants;
 mod codex_last_known;
+#[cfg(test)]
+pub(crate) mod codex_login_oracle_support;
 mod codex_saved_quota;
 mod codex_setup_gate;
 mod credit_amount_input;
