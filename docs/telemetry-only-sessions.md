@@ -17,9 +17,8 @@ through normal CAS and exact entity acknowledgement. Telemetry file release
 follows separately; every file stays held, exactly as before. Unchanged-body
 suppression uses existing ACK witnesses and the candidate's API/trace generations.
 
-Verification prompts use fresh UUIDs in reserved namespace
-`6f747474-6f00-4f00-8f00-*`. The relay excludes these API and trace rows before
-persistence. Ordinary SDK sessions remain eligible. The child also disables
+Verification prompts share reserved UUID namespace `6f747474-6f00-4f00-8f00-*`: Claude internal sessions are dropped locally by the relay; Pi internal sessions upload and the server retracts them.
+Ordinary SDK sessions remain eligible. The Claude child also disables
 OpenTelemetry exporters through inline settings and preserves
 `--no-session-persistence`. The local usage refresher is unchanged.
 

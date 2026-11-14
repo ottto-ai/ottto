@@ -13807,8 +13807,11 @@ fn pi_smoke_command_with_version(
     }
     // parse_version accepts missing or malformed patch components and extra parts.
     let version = version.filter(|v| {
-        let core = v.trim().split(['-', '+', ' ']).next().unwrap_or("");
-        core.split('.').count() == 3 && core.split('.').all(|p| p.parse::<u64>().is_ok())
+        let core = v.trim();
+        core.split('.').count() == 3
+            && core
+                .split('.')
+                .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
     });
     if version
         .and_then(crate::mcp_inventory::parse_version)
@@ -27741,6 +27744,10 @@ for line in sys.stdin:
                 Some("unknown"),
                 Some("0.76.bad"),
                 Some("0.76.0.1"),
+                Some("0.76.0-beta"),
+                Some("0.76.0-beta.1"),
+                Some("0.76"),
+                Some("pi 0.76.0"),
             ] {
                 assert_eq!(pi_smoke_command_with_version(route, version).args, expected);
             }
@@ -27749,6 +27756,7 @@ for line in sys.stdin:
                 for _ in 0..2 {
                     let mut args = pi_smoke_command_with_version(route, Some(version)).args;
                     let flag = args.iter().position(|arg| arg == "--session-id").unwrap();
+                    assert_eq!(flag, args.len() - 3);
                     let id = args.remove(flag + 1);
                     args.remove(flag);
                     assert_eq!(args, expected);
