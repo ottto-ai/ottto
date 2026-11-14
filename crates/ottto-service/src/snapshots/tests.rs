@@ -22301,6 +22301,8 @@ fn partial_commit_grants_no_upload_context_proof_and_forces_policy_reparse() {
 fn committable_subset_uses_exact_multi_entity_set_and_preserves_quarantine() {
     let accepted = "a".repeat(64);
     let quarantined = "b".repeat(64);
+    // One record: each call stamps retry_after from the wall clock.
+    let record = snapshot_quarantine_record(SnapshotSource::Codex);
     let mut scanned = ScanIndex::default();
     scanned.files.insert(
         "split.jsonl".to_string(),
@@ -22314,10 +22316,7 @@ fn committable_subset_uses_exact_multi_entity_set_and_preserves_quarantine() {
     let committable = scanned.committable_subset(
         &ScanIndex::default(),
         &BTreeSet::from([accepted]),
-        &BTreeMap::from([(
-            quarantined.clone(),
-            snapshot_quarantine_record(SnapshotSource::Codex),
-        )]),
+        &BTreeMap::from([(quarantined.clone(), record.clone())]),
     );
     assert!(committable.files.contains_key("split.jsonl"));
     assert_eq!(
@@ -22326,10 +22325,7 @@ fn committable_subset_uses_exact_multi_entity_set_and_preserves_quarantine() {
     );
     assert_eq!(
         committable.quarantined_snapshot_fingerprints,
-        BTreeMap::from([(
-            quarantined,
-            snapshot_quarantine_record(SnapshotSource::Codex),
-        )])
+        BTreeMap::from([(quarantined, record,)])
     );
     assert_eq!(
         committable
