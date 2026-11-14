@@ -219,6 +219,8 @@ mod first_read_order_tests;
 mod held_audit_restore_tests;
 #[cfg(test)]
 mod resident_wave_tests;
+#[cfg(all(test, unix))]
+pub(crate) mod resource_fixture;
 pub(crate) use scan::lines::delivery as line_delivery;
 #[cfg(test)]
 use scan::lines::delivery::tests as line_delivery_tests;

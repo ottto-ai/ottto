@@ -181,7 +181,18 @@ candidate_sha = hashlib.sha256(candidate_manifest_path.read_bytes()).hexdigest()
 
 if SECRET_PATTERN.search(evidence_path.read_text(encoding="utf-8")):
     die(f"evidence contains private path or secret-like material: {evidence_path}")
-if contains_placeholder(evidence):
+# Optional, unfilled resource evidence must not become a release requirement.
+placeholder_evidence = dict(evidence)
+if evidence.get("resource_scorecard") == {
+    "schema_version": 1, "policy": "resource-stage1-v1", "status": "not_run"
+}:
+    placeholder_evidence.pop("resource_scorecard")
+if isinstance(evidence.get("checks"), dict):
+    placeholder_evidence["checks"] = {
+        key: value for key, value in evidence["checks"].items()
+        if not (key == "resource_soak" and value == "not_run")
+    }
+if contains_placeholder(placeholder_evidence):
     die("evidence still contains template placeholders")
 
 if candidate_manifest.get("product") != "ottto-local-platform":
@@ -316,3 +327,12 @@ if stable_manifest_path is not None:
 
 print(f"stable-candidate-rc-gate: passed for {candidate_version} ({candidate_commit})")
 PY
+
+# The template's unfilled placeholder is not a supplied sampler scorecard.
+if jq -e '.resource_scorecard != null and .resource_scorecard != {
+  schema_version: 1, policy: "resource-stage1-v1", status: "not_run"
+}' "$EVIDENCE" >/dev/null; then
+  python3 "$ROOT/scripts/resource_scorecard.py" "$EVIDENCE" >/dev/null
+else
+  echo "resource scorecard: absent"
+fi

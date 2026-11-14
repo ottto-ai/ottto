@@ -327,7 +327,26 @@ jq \
    | .checks |= with_entries(.value = "passed")
    | .operator_notes = ["redacted stable-candidate RC evidence"]' \
   "$template_evidence" > "$passed_evidence"
+python3 "$ROOT/scripts/test_resource_scorecard.py" --fixture "$passed_evidence"
 "$GATE" --candidate-manifest "$candidate_manifest" --evidence "$passed_evidence" >/dev/null
+
+# Releases do not require sampler evidence; supplied scorecards still fail closed.
+optional_resource_evidence="$TMP_DIR/optional-resource-rc-qa.json"
+jq 'del(.resource_scorecard, .checks.resource_soak)' "$passed_evidence" > "$optional_resource_evidence"
+"$GATE" --candidate-manifest "$candidate_manifest" --evidence "$optional_resource_evidence" \
+  | grep -q '^resource scorecard: absent$'
+jq '.resource_scorecard = {schema_version: 1, policy: "resource-stage1-v1", status: "not_run"}
+    | .checks.resource_soak = "not_run"' "$passed_evidence" > "$optional_resource_evidence"
+"$GATE" --candidate-manifest "$candidate_manifest" --evidence "$optional_resource_evidence" \
+  | grep -q '^resource scorecard: absent$'
+jq '.resource_scorecard = {}' "$passed_evidence" > "$optional_resource_evidence"
+expect_failure "supplied incomplete resource scorecard rejected" \
+  "$GATE" --candidate-manifest "$candidate_manifest" --evidence "$optional_resource_evidence"
+grep -q 'resource_scorecard: schema_version must be 1' /tmp/macos-public-rc-gate.out
+jq '.resource_scorecard.candidate.metrics.energy_mw = 101' "$passed_evidence" > "$optional_resource_evidence"
+expect_failure "supplied resource regression rejected" \
+  "$GATE" --candidate-manifest "$candidate_manifest" --evidence "$optional_resource_evidence"
+grep -q 'energy_mw: absolute bound exceeded' /tmp/macos-public-rc-gate.out
 
 bad_app_commit_evidence="$TMP_DIR/bad-app-commit-stable-candidate-rc-qa.json"
 jq '.candidate_manifest.app_source_commit = "999999abcdef123456abcdef123456abcdef1234"' \

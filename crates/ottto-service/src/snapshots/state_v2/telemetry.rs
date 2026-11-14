@@ -419,6 +419,8 @@ pub(in super::super) fn plateau(relief: crate::local_resource_diagnostics::Alloc
 /// Successful physical decodes, including repeated reads for checks/encoding.
 /// Thread-local counters never carry record keys and reset at prepare.
 pub(super) fn decoded(rows: u64, headers: u64, chunks: u64) {
+    #[cfg(all(test, unix))]
+    crate::snapshots::resource_fixture::record_hydrated(rows);
     PASS.with(|pass| {
         let mut pass = pass.borrow_mut();
         pass.decoded.rows = pass.decoded.rows.saturating_add(rows);
@@ -564,6 +566,8 @@ pub(in super::super) fn acquire_window(index: &ScanIndex) -> Option<Window> {
 /// One bounded sample per save attempt; rejected work is visible too. Gauges
 /// share the claude_state_v2 diagnostic row and contain counts/bytes only.
 pub(super) fn save_work(rows: u64, bytes: u64) {
+    #[cfg(all(test, unix))]
+    crate::snapshots::resource_fixture::record_save(rows, bytes);
     if let Ok(mut stats) = stats().lock() {
         stats.save_dirty_rows.observe(rows);
         stats.save_dirty_bytes.observe(bytes);

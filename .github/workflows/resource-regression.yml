@@ -1,0 +1,87 @@
+name: Resource regression
+
+# Advisory calibration only. Keep this name out of required status checks,
+# merge groups and aggregate test jobs until calibration has been reviewed.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - 'crates/ottto-service/**'
+  schedule:
+    - cron: '30 4 * * *'
+  workflow_dispatch:
+    inputs:
+      record_baseline:
+        description: 'Emit calibration counts without comparing B (never passing budget evidence)'
+        type: boolean
+        default: false
+
+concurrency:
+  group: resource-regression-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  resource-linux:
+    name: Resource regression (advisory)
+    runs-on: ubuntu-latest
+    # Full native 18k corpus work exceeds the initial 40m estimate. Advisory
+    # only; report duration drift, never increase a required job's timeout.
+    timeout-minutes: 75
+    env:
+      CARGO_BUILD_JOBS: '2'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: Resource scorecard contracts
+        run: |
+          python3 scripts/test_resource_scorecard.py
+          python3 scripts/test_resource_baseline.py
+          bash scripts/test_macos_public_rc_gate.sh
+          bash scripts/test_resource_native_qos_pr.sh
+
+      # SQLite is bundled and selected resource tests use Python CLI stubs,
+      # so no apt/zsh bootstrap is needed. Preserve the existing private,
+      # symlinked TMPDIR contract used by state/credential path validation.
+      - name: Private resource temp directory
+        run: |
+          install -d -m 0700 "$RUNNER_TEMP/private/var/tmp"
+          ln -s private/var "$RUNNER_TEMP/var"
+          echo "TMPDIR=$RUNNER_TEMP/var/tmp" >> "$GITHUB_ENV"
+
+      - name: Rust setup
+        uses: ./.github/actions/rust-setup
+        with:
+          cache-key: linux-tests
+          cache-save: 'false'
+
+      - name: Build resource tests
+        run: |
+          free -m
+          nproc
+          /usr/bin/time -v cargo test -p ottto-service --locked --lib --no-run
+
+      # Ignored in ordinary Linux/Mac suites so this advisory calibration never
+      # becomes a required check indirectly. One serial run; no retries.
+      - name: Native resource gate
+        env:
+          OTTTO_RESOURCE_RECORD_BASELINE: ${{ inputs.record_baseline && '1' || '0' }}
+        run: |
+          time cargo test -p ottto-service --locked --lib snapshots::resource_fixture::resource_hint_active_drain -- --exact --ignored --nocapture --test-threads=1
+          time cargo test -p ottto-service --locked --lib snapshots::resource_fixture:: -- --ignored --skip snapshots::resource_fixture::native_qos:: --skip snapshots::resource_fixture::resource_hint_active_drain --nocapture --test-threads=1
+          time cargo test -p ottto-service --locked --lib agent_status::tests::cli_metadata_tests::resource_cli_metadata_ -- --ignored --nocapture --test-threads=1
+
+      - name: Resource disclosure
+        if: always() && github.event_name == 'pull_request'
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          if ! printf '%s\n' "$PR_BODY" | grep -Eq '^Resource:[[:space:]]+[^[:space:]]'; then
+            echo 'error: daemon changes need a nonblank Resource: line in the PR body'
+            exit 1
+          fi
