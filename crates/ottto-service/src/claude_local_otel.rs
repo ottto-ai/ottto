@@ -2008,7 +2008,7 @@ fn append_trace_ownership_evidence(
 }
 
 fn append_row(support_dir: &Path, root: &str, path: PathBuf, row: &impl Serialize) -> Result<bool> {
-    if crate::claude_spawn_gate::is_internal_session_id(root) {
+    if crate::internal_session::is_internal_session_id(root) {
         return Ok(false);
     }
     let dir = path.parent().expect("evidence path has parent");

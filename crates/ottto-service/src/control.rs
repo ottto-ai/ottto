@@ -95,7 +95,6 @@ const PENDING_DEVICE_CREDENTIAL_SCHEMA_VERSION: u16 = 2;
 // they re-onboard onto the direct api.ottto.net base.
 const LEGACY_API_BASE_URL: &str = "https://ottto.net/backend";
 const SMOKE_PROMPT: &str = "Reply with exactly: ottto smoke test";
-const PI_CHECK_SESSION_PREFIX: &str = "ottto-check-";
 const BACKEND_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const AGENT_READ_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
 const SETUP_SCAN_RESULT_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
@@ -13769,7 +13768,7 @@ fn smoke_command(source: &SourceKind) -> SmokeCommand {
                 "--settings",
                 r#"{"env":{"OTEL_LOGS_EXPORTER":"none","OTEL_TRACES_EXPORTER":"none","OTEL_METRICS_EXPORTER":"none"}}"#,
                 "--session-id",
-                &crate::claude_spawn_gate::internal_session_id(),
+                &crate::internal_session::internal_session_id(),
                 "--disallowedTools",
                 "*",
                 "--no-session-persistence",
@@ -13806,6 +13805,7 @@ fn pi_smoke_command_with_version(
             args.extend(["--thinking".to_string(), thinking_level.to_string()]);
         }
     }
+    // parse_version accepts missing or malformed patch components and extra parts.
     let version = version.filter(|v| {
         let core = v.trim().split(['-', '+', ' ']).next().unwrap_or("");
         core.split('.').count() == 3 && core.split('.').all(|p| p.parse::<u64>().is_ok())
@@ -13814,23 +13814,10 @@ fn pi_smoke_command_with_version(
         .and_then(crate::mcp_inventory::parse_version)
         .is_some_and(|v| v >= (0, 76, 0))
     {
-        let mut bytes = [0_u8; 16];
-        if getrandom::fill(&mut bytes).is_ok() {
-            bytes[6] = (bytes[6] & 0x0f) | 0x40;
-            bytes[8] = (bytes[8] & 0x3f) | 0x80;
-            let id = crate::hex::encode(&bytes);
-            args.extend([
-                "--session-id".to_string(),
-                format!(
-                    "{PI_CHECK_SESSION_PREFIX}{}-{}-{}-{}-{}",
-                    &id[..8],
-                    &id[8..12],
-                    &id[12..16],
-                    &id[16..20],
-                    &id[20..]
-                ),
-            ]);
-        }
+        args.extend([
+            "--session-id".to_string(),
+            crate::internal_session::internal_session_id(),
+        ]);
     }
     args.push(SMOKE_PROMPT.to_string());
     SmokeCommand {
@@ -27765,10 +27752,7 @@ for line in sys.stdin:
                     let id = args.remove(flag + 1);
                     args.remove(flag);
                     assert_eq!(args, expected);
-                    let uuid = id.strip_prefix(PI_CHECK_SESSION_PREFIX).unwrap();
-                    assert!(crate::hex::is_uuid(uuid));
-                    assert_eq!(uuid.as_bytes()[14], b'4');
-                    assert!(matches!(uuid.as_bytes()[19], b'8' | b'9' | b'a' | b'b'));
+                    assert!(crate::internal_session::is_internal_session_id(&id));
                     assert_ne!(id, previous);
                     previous = id;
                 }

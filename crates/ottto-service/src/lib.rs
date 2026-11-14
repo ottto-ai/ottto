@@ -37,6 +37,7 @@ mod external_scheduler_attribution;
 mod grant_rebind;
 mod hex;
 mod instruction_inventory;
+mod internal_session;
 pub mod keychain;
 mod launch_events;
 pub mod legacy_service;
