@@ -626,14 +626,18 @@ pub fn write_owner_only_file_atomic(path: &Path, bytes: &[u8]) -> std::io::Resul
     write_secret_file_0600(path, bytes)
 }
 
-/// [`write_owner_only_file_atomic`] for often-refreshed status caches: a file
-/// that already holds exactly `bytes` owner-only is left as is (no rewrite,
-/// no fsync, same mtime); only its parent's owner-only mode is reapplied.
+/// [`write_owner_only_file_atomic`] for often-refreshed status caches. After
+/// the parent is made owner-only, a file that already holds exactly `bytes`
+/// owner-only is left as is (no rewrite, no fsync, same mtime).
 pub fn write_owner_only_file_atomic_if_changed(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    if !holds_owner_only_bytes(path, bytes) {
-        return write_owner_only_file_atomic(path, bytes);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+        restrict_secret_dir_to_owner(parent)?;
     }
-    path.parent().map_or(Ok(()), restrict_secret_dir_to_owner)
+    if holds_owner_only_bytes(path, bytes) {
+        return Ok(());
+    }
+    write_secret_file_0600(path, bytes)
 }
 
 /// Owner-only atomic replacement for disposable local diagnostics/cache data.
@@ -658,7 +662,7 @@ pub fn write_owner_only_cache_file_atomic(path: &Path, bytes: &[u8]) -> std::io:
 fn holds_owner_only_bytes(path: &Path, bytes: &[u8]) -> bool {
     use std::io::Read;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    let flags = libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+    let flags = libc::O_NOFOLLOW | libc::O_NONBLOCK;
     let Ok(file) = fs::OpenOptions::new()
         .read(true)
         .custom_flags(flags)
