@@ -97,9 +97,6 @@ pub(in crate::context_composition) fn spawn_v2_sync() -> Result<()> {
                         crate::snapshot_sync::safe_error(&error)
                     );
                 }
-                // All daily state, pipe buffers and superseded hourly
-                // metadata have dropped before this single relief call.
-                crate::local_resource_diagnostics::release_memory();
                 std::thread::sleep(WAKE_INTERVAL);
             }
         })
