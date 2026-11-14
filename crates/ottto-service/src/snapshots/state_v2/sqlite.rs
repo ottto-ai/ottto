@@ -599,8 +599,8 @@ impl Sqlite {
     }
     /// Between passes: commit the clean marker (FULL + fullfsync) unless
     /// checkpoint debt remains. The WAL is not truncated here; maintenance
-    /// checkpoints it by size, and `open_locked` checks a store whose WAL
-    /// still holds frames.
+    /// checkpoints it by size. Committed frames behind the marker replay at
+    /// the next open, and any later write first commits `phase` 1.
     pub(super) fn clean_checkpoint(&mut self) -> Result<()> {
         if !self.clean && !self.debt {
             self.control("phase", &0_u8)?;
@@ -743,13 +743,6 @@ impl Sqlite {
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(path)?;
         let before = file.metadata()?;
-        // The clean marker is committed without truncating the WAL, so a
-        // crash can leave committed frames behind it. Skip the check only
-        // when the WAL is also absent or empty (a clean close or a TRUNCATE).
-        let wal_empty = match fs::symlink_metadata(sidecar(path, "-wal")) {
-            Ok(wal) => wal.is_file() && wal.len() == 0,
-            Err(error) => error.kind() == io::ErrorKind::NotFound,
-        };
         Self::probe(path, identity)?;
         let conn = Connection::open_with_flags(
             path,
@@ -777,10 +770,7 @@ impl Sqlite {
             expected.is_none_or(|g| g == generation),
             "state_v2_generation_changed"
         );
-        if force_quick_check
-            || !wal_empty
-            || read_json::<u8>(&conn, &RowKey::Meta("phase".into()))? != Some(0)
-        {
+        if force_quick_check || read_json::<u8>(&conn, &RowKey::Meta("phase".into()))? != Some(0) {
             let pages: u64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
             quick_check(
                 &conn,
@@ -1952,4 +1942,4 @@ mod fixtures;
 #[cfg(test)]
 pub(super) use fixtures::*;
 #[cfg(test)]
-mod tests;
+mod checkpoint_tests;

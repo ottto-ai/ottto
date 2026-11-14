@@ -830,9 +830,10 @@ impl Sqlite {
             let result = self.checkpoint(CheckpointMode::Passive);
             self.debt = required && result.state != CheckpointState::Complete;
         }
-        // Only debt left by an incomplete checkpoint is truncated between
-        // passes; erasure still truncates before its copy (`vacuum`).
-        if idle && self.debt {
+        // Between passes, truncate only to clear debt from an incomplete
+        // checkpoint, or while erasure is overdue so old frames do not
+        // outlive its deadline. Erasure itself truncates before its copy.
+        if idle && (self.debt || overdue) {
             let result = self.checkpoint(CheckpointMode::IdleReclaim);
             if result.state == CheckpointState::Complete {
                 self.debt = false;
