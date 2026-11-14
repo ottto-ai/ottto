@@ -9428,10 +9428,23 @@ struct SetupScanReconcile {
     binding: Option<(String, String)>,
     failures: u32,
     next_due: Option<Instant>,
-    outcome: &'static str,
 }
 static SETUP_SCAN: std::sync::LazyLock<Mutex<SetupScanReconcile>> =
     std::sync::LazyLock::new(|| Mutex::new(SetupScanReconcile::default()));
+
+fn setup_run_status_is_active(status: &str) -> bool {
+    matches!(
+        status,
+        "scanning" | "waiting_for_companion" | "running_action"
+    )
+}
+
+fn setup_reconcile_status_reason(status: Option<&str>) -> String {
+    format!(
+        "status:{}",
+        bounded_display_text(status.unwrap_or("unknown"), 64)
+    )
+}
 
 pub(crate) fn reconcile_setup_scan_in_background(daemon: &LocalDaemon) {
     let Ok(mut state) = SETUP_SCAN.try_lock() else {
@@ -9451,15 +9464,18 @@ pub(crate) fn reconcile_setup_scan_in_background(daemon: &LocalDaemon) {
     if state.next_due.is_some_and(|due| Instant::now() < due) {
         return;
     }
+    let mut network_attempted = false;
+    let mut actions_processed = 0;
     let result = (|| {
         let settled_run = store.setup_scan_settled_run_id().or_state_poisoned()?;
         if settled_run.as_deref() == Some(binding.setup_run_id.as_str()) {
-            return Ok(true);
+            return Ok((true, String::new()));
         }
         let device = FileDeviceStore::default()
             .load()
             .or_state_poisoned()?
             .ok_or(LocalApiError::SetupRunConnectionMissing)?;
+        network_attempted = true;
         let refreshed = refresh_setup_run_token_via_device_secret(&binding.api_base_url, &binding)?;
         let run = refreshed
             .run
@@ -9471,7 +9487,7 @@ pub(crate) fn reconcile_setup_scan_in_background(daemon: &LocalDaemon) {
         let machine = daemon.machine_for_trusted_client()?;
         match run.status.as_str() {
             "scanning" => {
-                let result = scan_setup_run(
+                let result = scan_setup_run_with_action_count(
                     daemon,
                     &binding.api_base_url,
                     &mut credentials,
@@ -9479,41 +9495,67 @@ pub(crate) fn reconcile_setup_scan_in_background(daemon: &LocalDaemon) {
                     Vec::new(),
                     false,
                     Some(&device.device_id),
+                    &mut actions_processed,
                 )?;
-                Ok(!matches!(
-                    result["status"].as_str(),
-                    Some("scanning" | "waiting_for_companion" | "running_action")
+                let status = result["status"].as_str();
+                Ok((
+                    !status.is_some_and(setup_run_status_is_active),
+                    setup_reconcile_status_reason(status),
                 ))
             }
             "waiting_for_companion" | "running_action" => {
-                let actions = process_setup_actions(
+                let (actions, last_run_status, idle) = process_setup_actions_with_status(
                     daemon,
                     &binding.api_base_url,
                     &mut credentials,
                     &machine,
+                    &mut actions_processed,
                 )?;
                 request_snapshot_sync_after_setup_actions(daemon, &actions);
-                Ok(false)
+                Ok((
+                    idle && matches!(
+                        last_run_status.as_deref(),
+                        Some("waiting_for_user" | "completed")
+                    ),
+                    setup_reconcile_status_reason(last_run_status.as_deref()),
+                ))
             }
-            _ => Ok(true),
+            _ => Ok((true, setup_reconcile_status_reason(Some(&run.status)))),
         }
     })();
-    let mut settled = result.unwrap_or_else(|error| terminal_refresh_rejection(&error).is_some());
+    let (mut settled, mut reason) = match result {
+        Ok(outcome) => outcome,
+        Err(error) => (
+            terminal_refresh_rejection(&error).is_some(),
+            format!("error:{}", setup_action_execution_error_detail(&error).0),
+        ),
+    };
     if settled {
         let _binding_lock = lock_setup_run_binding();
-        settled = store.settle_setup_scan(&binding).is_ok();
+        if let Err(error) = store.settle_setup_scan(&binding).or_state_poisoned() {
+            settled = false;
+            reason = format!("error:{}", setup_action_execution_error_detail(&error).0);
+        }
     }
-    if !settled {
-        state.failures = state.failures.saturating_add(1);
-        state.next_due =
-            Some(Instant::now() + crate::snapshot_sync::full_jitter_backoff(state.failures));
-    } else {
+    let attempt = state.failures.saturating_add(1);
+    let next_in = if settled {
         state.failures = 0;
-    }
-    let outcome = if settled { "settled" } else { "retry" };
-    if state.outcome != outcome {
-        eprintln!("setup reconcile outcome={outcome}");
-        state.outcome = outcome;
+        state.next_due = None;
+        None
+    } else {
+        state.failures = attempt;
+        let delay = crate::snapshot_sync::full_jitter_backoff(state.failures);
+        state.next_due = Some(Instant::now() + delay);
+        Some(delay.as_secs())
+    };
+    if network_attempted {
+        let outcome = if settled { "settled" } else { "retry" };
+        let next_in = next_in
+            .map(|seconds| format!(" next_in={seconds}s"))
+            .unwrap_or_default();
+        eprintln!(
+            "setup reconcile attempt={attempt} outcome={outcome} reason={reason} actions={actions_processed}{next_in}"
+        );
     }
 }
 
@@ -9628,7 +9670,7 @@ fn setup_run(
         connection,
     };
 
-    scan_setup_run(
+    scan_setup_run_with_action_count(
         daemon,
         &api_base_url,
         &mut credentials,
@@ -9636,10 +9678,15 @@ fn setup_run(
         sources,
         claim_code_provided,
         None,
+        &mut 0,
     )
 }
 
-fn scan_setup_run(
+#[expect(
+    clippy::too_many_arguments,
+    reason = "preserves scan inputs while reporting partial action progress on errors"
+)]
+fn scan_setup_run_with_action_count(
     daemon: &LocalDaemon,
     api_base_url: &str,
     credentials: &mut SetupRunCredentials,
@@ -9647,6 +9694,7 @@ fn scan_setup_run(
     sources: Vec<SourceKind>,
     claim_code_provided: bool,
     expected_device: Option<&str>,
+    actions_processed: &mut usize,
 ) -> Result<serde_json::Value, LocalApiError> {
     let scan = build_local_scan(machine, sources);
     if let Some(expected) = expected_device {
@@ -9667,7 +9715,13 @@ fn scan_setup_run(
         }
         Err(error) => return Err(error),
     };
-    let action_results = process_setup_actions(daemon, api_base_url, credentials, machine)?;
+    let (action_results, _, _) = process_setup_actions_with_status(
+        daemon,
+        api_base_url,
+        credentials,
+        machine,
+        actions_processed,
+    )?;
     if let Some(last) = action_results.last() {
         if let Some(refreshed) = &last.detail {
             detail = refreshed.clone();
@@ -10736,11 +10790,24 @@ fn process_setup_actions(
     credentials: &mut SetupRunCredentials,
     machine: &MachineIdentity,
 ) -> Result<Vec<SetupActionResult>, LocalApiError> {
+    process_setup_actions_with_status(daemon, api_base_url, credentials, machine, &mut 0)
+        .map(|(results, _, _)| results)
+}
+
+fn process_setup_actions_with_status(
+    daemon: &LocalDaemon,
+    api_base_url: &str,
+    credentials: &mut SetupRunCredentials,
+    machine: &MachineIdentity,
+    actions_processed: &mut usize,
+) -> Result<(Vec<SetupActionResult>, Option<String>, bool), LocalApiError> {
     let mut results = Vec::new();
+    let mut last_run_status = None;
     for _ in 0..8 {
         let next = get_next_setup_action(api_base_url, credentials)?;
+        last_run_status = next.run_status;
         let Some(action) = next.action else {
-            break;
+            return Ok((results, last_run_status, true));
         };
         let source_slug = action.source.clone();
         let source = source_slug.as_deref().and_then(source_from_slug);
@@ -10761,6 +10828,7 @@ fn process_setup_actions(
                 detail: Some(detail),
                 verification: None,
             });
+            *actions_processed += 1;
             continue;
         }
         if let Err(error) = record_setup_action_event(
@@ -10792,6 +10860,7 @@ fn process_setup_actions(
                 detail: Some(detail),
                 verification: None,
             });
+            *actions_processed += 1;
             continue;
         }
         let action_outcome = match action.action_type.as_str() {
@@ -10848,6 +10917,7 @@ fn process_setup_actions(
                     detail: None,
                     verification: None,
                 });
+                *actions_processed += 1;
                 break;
             }
             Err(error) => {
@@ -10872,8 +10942,10 @@ fn process_setup_actions(
             detail: Some(detail),
             verification,
         });
+        *actions_processed += 1;
     }
-    Ok(results)
+    // A response containing an action cannot establish that the run is idle.
+    Ok((results, last_run_status, false))
 }
 
 fn setup_action_execution_error_result(
@@ -10989,6 +11061,8 @@ fn setup_action_execution_error_detail(error: &LocalApiError) -> (&'static str, 
 
 #[derive(Debug, Deserialize)]
 struct SetupRunNextActionResponse {
+    #[serde(default)]
+    run_status: Option<String>,
     action: Option<SetupRunActionApiResponse>,
 }
 
@@ -22470,6 +22544,82 @@ for line in sys.stdin:
                 assert!(SETUP_SCAN.lock().unwrap().next_due.is_some());
             }
         }
+    }
+
+    /// [regress] The idle poll's status settles action debt without another refresh.
+    #[test]
+    #[serial]
+    fn background_setup_scan_uses_idle_poll_status() {
+        let _lock = lock_backend_test_env();
+        for status in [
+            Some("completed"),
+            Some("waiting_for_user"),
+            Some("waiting_for_companion"),
+            Some("future_status"),
+            None,
+        ] {
+            let response = match status {
+                Some(status) => json!({"action":null,"run_status":status}),
+                None => json!({"action":null}),
+            };
+            let body = Box::leak(response.to_string().into_boxed_str());
+            let (base, server) = scripted_json_backend(vec![
+                (200, scan_refresh("waiting_for_companion")),
+                (200, "{}"),
+                (200, body),
+            ]);
+            let (_root, _guards, daemon, _) = scan_fixture(base);
+            reconcile_setup_scan_in_background(&daemon);
+            assert_eq!(server.join().unwrap().len(), 3);
+            let settled = matches!(status, Some("completed" | "waiting_for_user"));
+            assert_eq!(
+                FileConnectionStore::default()
+                    .setup_scan_settled_run_id()
+                    .unwrap()
+                    .as_deref(),
+                settled.then_some("run_connected_setup"),
+            );
+            let state = SETUP_SCAN.lock().unwrap();
+            assert_eq!(state.failures, u32::from(!settled));
+            assert_eq!(state.next_due.is_some(), !settled);
+        }
+    }
+
+    /// [behaviour] One completed action and its final idle poll settle in one attempt.
+    #[test]
+    #[serial]
+    fn background_setup_scan_settles_after_one_action() {
+        let _lock = lock_backend_test_env();
+        let (base, server) = scripted_json_backend(vec![
+            (200, scan_refresh("waiting_for_companion")),
+            (200, "{}"),
+            (
+                200,
+                r#"{"run_status":"running_action","action":{"id":"synthetic-action","action_type":"unsupported","source":null}}"#,
+            ),
+            (200, "{}"),
+            (200, SCAN_DETAIL),
+            (200, "{}"),
+            (200, r#"{"run_status":"completed","action":null}"#),
+        ]);
+        let (_root, _guards, daemon, _) = scan_fixture(base);
+        reconcile_setup_scan_in_background(&daemon);
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 7);
+        assert_eq!(
+            requests.iter().filter(|r| r.contains("/complete ")).count(),
+            1
+        );
+        assert_eq!(
+            FileConnectionStore::default()
+                .setup_scan_settled_run_id()
+                .unwrap()
+                .as_deref(),
+            Some("run_connected_setup"),
+        );
+        let state = SETUP_SCAN.lock().unwrap();
+        assert_eq!(state.failures, 0);
+        assert!(state.next_due.is_none());
     }
 
     /// [behaviour] Rejected background authority parks; only the existing health hold owns logout.
