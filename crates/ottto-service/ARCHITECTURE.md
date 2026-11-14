@@ -213,6 +213,11 @@ Cached login facts contain no account, email, plan or identity. Auth-file and
 provider identity reads and config-model application keep their ordinary freshness.
 Claude version detection uses the same helper with only its binary stamp. Pi
 model listings remain uncached because their output depends on Pi config/auth.
+The allowlisted zsh login-shell provider environment is shared in process memory
+for 30 minutes per effective HOME, including failed imports. Concurrent callers
+share one bounded import; current process values are merged afresh and win.
+Pi verification and explicit status refresh re-import and repopulate it.
+Environment values are never logged or persisted.
 
 The status read of each source's active-session reconciliation uses the same
 helper, keyed by its cache file. Every local request builds status, so the

@@ -13743,6 +13743,156 @@ fn secret_keys_are_removed_from_pi_metadata() {
     );
 }
 
+fn with_pi_list_probe_fixture(run: impl FnOnce(&Path)) {
+    let root = std::env::temp_dir().join(crate::test_scratch::unique_name("pi-list-login-env"));
+    fs::create_dir_all(&root).expect("fixture home");
+    let pi = root.join("pi");
+    fs::write(
+        &pi,
+        "#!/bin/sh\n\
+         [ \"$1\" = --list-models ] || exit 40\n\
+         [ \"$GOOGLE_CLOUD_PROJECT\" = fixture-project ] || exit 41\n\
+         [ \"$OTTTO_TEST_SHELL_ONLY\" != shell-only ] || exit 42\n\
+         echo 'provider model context max-out thinking images'\n\
+         echo 'google-vertex gemini-2.5-flash 1M 64K yes yes'\n",
+    )
+    .expect("fake pi");
+    fs::set_permissions(pi, fs::Permissions::from_mode(0o755)).expect("executable pi");
+    let _home = EnvVarGuard::set_os("HOME", root.as_os_str().to_owned());
+    let _search = EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", root.as_os_str().to_owned());
+    let _agent = EnvVarGuard::set_os("PI_CODING_AGENT_DIR", root.join("agent").into_os_string());
+    let _project = EnvVarGuard::set_os("GOOGLE_CLOUD_PROJECT", OsString::new());
+    let _location = EnvVarGuard::set_os("GOOGLE_CLOUD_LOCATION", OsString::new());
+    let _shell_only = EnvVarGuard::set_os("OTTTO_TEST_SHELL_ONLY", OsString::new());
+    run(&root);
+    fs::remove_dir_all(root).expect("remove fixture");
+}
+
+fn assert_pi_list_probe_model(snapshot: AgentStatusSnapshot) {
+    assert_eq!(snapshot.status, AgentStatusState::Available);
+    assert_eq!(
+        snapshot.collection_method,
+        AgentStatusCollectionMethod::CommandProbe
+    );
+    let model = snapshot.model.expect("model status");
+    assert_eq!(model.provider.as_deref(), Some("google-vertex"));
+    assert_eq!(model.available_models, ["gemini-2.5-flash"]);
+}
+
+#[test]
+#[serial]
+fn pi_list_probe_receives_login_shell_provider_env() {
+    with_pi_list_probe_fixture(|_| {
+        let (snapshot, imports) = crate::command_env::test_shell_env::with_output(
+            Some(b"GOOGLE_CLOUD_PROJECT=fixture-project\n"),
+            || collect_pi_status("capture".into(), "expiry".into()),
+        );
+        assert_eq!(imports, 1);
+        assert_pi_list_probe_model(snapshot);
+    });
+}
+
+#[test]
+#[serial]
+fn pi_list_probe_parses_models_with_inherited_env_after_import_failure() {
+    with_pi_list_probe_fixture(|_| {
+        let _project = EnvVarGuard::set_os("GOOGLE_CLOUD_PROJECT", "fixture-project".into());
+        let (snapshot, imports) = crate::command_env::test_shell_env::with_output(None, || {
+            collect_pi_status("capture".into(), "expiry".into())
+        });
+        assert_eq!(imports, 1);
+        assert_pi_list_probe_model(snapshot);
+    });
+}
+
+#[test]
+#[serial]
+fn pi_list_probe_excludes_unallowlisted_login_shell_vars_and_prefers_inherited_env() {
+    with_pi_list_probe_fixture(|_| {
+        let (snapshot, imports) = crate::command_env::test_shell_env::with_output(
+            Some(b"GOOGLE_CLOUD_PROJECT=shell-project\nOTTTO_TEST_SHELL_ONLY=shell-only\n"),
+            || {
+                assert_eq!(
+                    crate::command_env::provider_env()["GOOGLE_CLOUD_PROJECT"],
+                    "shell-project"
+                );
+                let _project =
+                    EnvVarGuard::set_os("GOOGLE_CLOUD_PROJECT", "fixture-project".into());
+                collect_pi_status("capture".into(), "expiry".into())
+            },
+        );
+        assert_eq!(imports, 1);
+        assert_pi_list_probe_model(snapshot);
+    });
+}
+
+#[test]
+#[serial]
+fn pi_manual_status_refresh_repopulates_shell_cache_but_scan_reuses_it() {
+    with_pi_list_probe_fixture(|_| {
+        let (_, imports) = crate::command_env::test_shell_env::with_output(
+            Some(b"GOOGLE_CLOUD_PROJECT=old\n"),
+            || {
+                let start = Instant::now();
+                crate::command_env::test_shell_env::set_now(start);
+                assert_eq!(
+                    crate::command_env::provider_env()["GOOGLE_CLOUD_PROJECT"],
+                    "old"
+                );
+                crate::command_env::test_shell_env::set_now(start + Duration::from_secs(1));
+                crate::command_env::test_shell_env::set_output(Some(
+                    b"GOOGLE_CLOUD_PROJECT=fixture-project\n",
+                ));
+                let refresh = |manual| {
+                    crate::agent_status_refresh::collection(
+                        &SourceKind::Pi,
+                        "capture".into(),
+                        "expiry".into(),
+                        manual,
+                    )
+                    .unwrap()
+                };
+                let ordinary = refresh(false);
+                assert!(ordinary
+                    .source_health_snapshot
+                    .model
+                    .as_ref()
+                    .is_none_or(|model| model.available_models.is_empty()));
+                assert_pi_list_probe_model(refresh(true).source_health_snapshot.clone());
+                crate::command_env::test_shell_env::set_output(None);
+                assert_pi_list_probe_model(refresh(false).source_health_snapshot.clone());
+            },
+        );
+        assert_eq!(imports, 2);
+    });
+}
+
+#[test]
+#[serial]
+fn pi_settings_skip_list_probe_and_login_shell_import() {
+    with_pi_list_probe_fixture(|root| {
+        fs::create_dir(root.join("agent")).expect("agent directory");
+        fs::write(
+            root.join("agent/settings.json"),
+            r#"{"enabledModels":["google-vertex/gemini-2.5-flash"]}"#,
+        )
+        .expect("settings fixture");
+        let (snapshot, imports) = crate::command_env::test_shell_env::with_output(
+            Some(b"GOOGLE_CLOUD_PROJECT=fixture-project\n"),
+            || collect_pi_status("capture".into(), "expiry".into()),
+        );
+        assert_eq!(imports, 0);
+        assert_eq!(
+            snapshot.collection_method,
+            AgentStatusCollectionMethod::ConfigFile
+        );
+        assert_eq!(
+            snapshot.model.expect("model").available_models,
+            ["gemini-2.5-flash"]
+        );
+    });
+}
+
 #[test]
 fn pi_model_table_parser_ignores_no_models_output() {
     for text in [

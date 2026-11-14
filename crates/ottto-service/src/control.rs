@@ -13829,7 +13829,7 @@ fn run_bounded_command(
         command.env("PATH", path_env);
     }
     if program == "pi" {
-        command.envs(crate::command_env::provider_env());
+        command.envs(crate::command_env::provider_env_with_refresh(true));
     }
     // The Claude smoke runs on the default login, the one its gate checked.
     let claude_login = (program == "claude").then_some(ottto_core::ClaudeConfigDirSlot::Default);
@@ -27657,6 +27657,46 @@ for line in sys.stdin:
             result.message, result.diagnostic, result.exit_status
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[serial]
+    fn pi_verification_refreshes_and_repopulates_shell_cache() {
+        let root = control_test_root("pi-verify-shell-cache");
+        let fake_pi = fake_binary_path(&root, "pi");
+        fs::write(
+            &fake_pi,
+            "#!/bin/sh\n[ \"$GOOGLE_CLOUD_PROJECT\" = refreshed ]\n",
+        )
+        .expect("fake pi");
+        fs::set_permissions(&fake_pi, fs::Permissions::from_mode(0o755)).unwrap();
+        let _search = EnvVarGuard::set_path("OTTTO_COMMAND_SEARCH_PATH", fake_pi.parent().unwrap());
+        let _project = EnvVarGuard::remove("GOOGLE_CLOUD_PROJECT");
+        let (_, imports) = crate::command_env::test_shell_env::with_output(
+            Some(b"GOOGLE_CLOUD_PROJECT=old\n"),
+            || {
+                let start = Instant::now();
+                crate::command_env::test_shell_env::set_now(start);
+                assert_eq!(
+                    crate::command_env::provider_env()["GOOGLE_CLOUD_PROJECT"],
+                    "old"
+                );
+                crate::command_env::test_shell_env::set_now(start + Duration::from_secs(1));
+                crate::command_env::test_shell_env::set_output(Some(
+                    b"GOOGLE_CLOUD_PROJECT=refreshed\n",
+                ));
+                assert!(
+                    run_bounded_command("pi", &[], Duration::from_secs(5), "Pi", None).succeeded
+                );
+                crate::command_env::test_shell_env::set_output(None);
+                assert_eq!(
+                    crate::command_env::provider_env()["GOOGLE_CLOUD_PROJECT"],
+                    "refreshed"
+                );
+            },
+        );
+        assert_eq!(imports, 2);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
