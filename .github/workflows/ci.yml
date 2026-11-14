@@ -245,7 +245,7 @@ jobs:
       # Pinned binary with the action's per-version SHA-256; no unverified
       # cargo-install fallback.
       - name: Install shellcheck
-        uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2.90.0
+        uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
         with:
           tool: shellcheck@0.11.0
           fallback: none
@@ -297,7 +297,7 @@ jobs:
 
       # cargo audit reads only the lockfiles, so the runner OS does not matter.
       - name: Install cargo-audit
-        uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2.90.0
+        uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
         with:
           tool: cargo-audit@0.22.2
           fallback: none
