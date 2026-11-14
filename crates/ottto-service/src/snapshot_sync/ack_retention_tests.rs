@@ -631,7 +631,6 @@ fn bootstrap_capacity_drains_admitted_bodies_through_partial_settlement() {
             &probes,
             &unique_poison_scope(),
             &mut progress,
-            true,
             &mut InplaceRetryBudget::default(),
             |batch, _| {
                 let mut response = exact_ack(batch)?;
@@ -1424,7 +1423,6 @@ fn resumed_probe_capacity_preserves_durable_equality_for_census_retirement() {
         std::slice::from_ref(&probe),
         &unique_poison_scope(),
         &mut progress,
-        true,
         &mut InplaceRetryBudget::default(),
         |_, _| panic!("full-cap reoffer must not POST"),
         |state| state.save(&f.progress_path),
@@ -1474,7 +1472,6 @@ fn resumed_probe_capacity_preserves_durable_equality_for_census_retirement() {
         std::slice::from_ref(&probe),
         &unique_poison_scope(),
         &mut progress,
-        true,
         &mut InplaceRetryBudget::default(),
         |batch, _| {
             attempts += 1;

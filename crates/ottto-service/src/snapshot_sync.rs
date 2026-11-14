@@ -147,7 +147,6 @@ fn bootstrap_cache_heads(
     probes: &[SnapshotItem],
     poison_scope: &str,
     progress: &mut SnapshotUploadProgress,
-    ordinary_bootstrap: bool,
     upload: impl FnMut(Vec<SnapshotItem>, bool) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
     persist: impl FnMut(&mut SnapshotUploadProgress) -> Result<()>,
 ) -> Result<usize> {
@@ -155,7 +154,6 @@ fn bootstrap_cache_heads(
         probes,
         poison_scope,
         progress,
-        ordinary_bootstrap,
         &mut InplaceRetryBudget::default(),
         upload,
         persist,
@@ -169,7 +167,6 @@ fn bootstrap_cache_heads_with_budget(
     probes: &[SnapshotItem],
     poison_scope: &str,
     progress: &mut SnapshotUploadProgress,
-    ordinary_bootstrap: bool,
     inplace_retry: &mut InplaceRetryBudget,
     mut upload: impl FnMut(
         Vec<SnapshotItem>,
@@ -185,12 +182,9 @@ fn bootstrap_cache_heads_with_budget(
     let mut shed = false;
     let result = (|| -> Result<usize> {
         let mut deferred = 0usize;
-        let stages: &[bool] = if ordinary_bootstrap {
-            &[false, true]
-        } else {
-            &[true]
-        };
-        for &enforce_head_cas in stages {
+        // A headless patched body reaches here only when head CAS is optional
+        // and no legacy reconciliation is pending; otherwise prepare strips it.
+        for enforce_head_cas in [false, true] {
             // A prior ordinary body ACK has no head proof. Force the exact probe
             // even when delivery of these bytes was previously acknowledged.
             if enforce_head_cas {
@@ -284,10 +278,57 @@ fn held_cache_head_probe(
     .then_some(probe)
 }
 
+/// Patched bodies of sessions this ledger never settled: no saved head, cache
+/// state or owed challenge for the session, no ACK, hold or refusal for the
+/// body, and the session's only body on the page. Each skips the probe stages
+/// and goes out once, whole, as a token-less head-CAS write: the backend
+/// completes the patch against an empty prior and returns the head and state
+/// echo, or, if it does hold a head, answers a conflict and challenge that
+/// the next page recovers through the ordinary bootstrap.
+fn cas_bootstrap_bodies(
+    progress: &SnapshotUploadProgress,
+    items: &[SnapshotItem],
+) -> BTreeSet<String> {
+    let mut per_session = BTreeMap::<&str, usize>::new();
+    for item in items {
+        *per_session
+            .entry(item.source_session_id.as_str())
+            .or_default() += 1;
+    }
+    items
+        .iter()
+        .filter(|item| {
+            let key = cache_session_key(&item.source_session_id);
+            let fingerprint = &item.snapshot_fingerprint;
+            item.cache_observations.is_some()
+                && item.cache_base_head_etag.is_none()
+                && per_session[item.source_session_id.as_str()] == 1
+                && !progress.accepted_fingerprints.contains(fingerprint)
+                && !progress.quarantined_fingerprints.contains_key(fingerprint)
+                && !progress.permanent_rejections.contains_key(fingerprint)
+                && !progress.accepted_cache_heads.contains_key(&key)
+                && !progress.accepted_cache_states.contains_key(&key)
+                && !progress.head_conflict_challenges.contains_key(&key)
+        })
+        .map(|item| item.snapshot_fingerprint.clone())
+        .collect()
+}
+
+#[cfg(test)]
 fn apply_bootstrapped_cache_heads(
     source: &str,
     snapshots: &mut [SnapshotItem],
     progress: &SnapshotUploadProgress,
+) -> Result<Vec<(String, String, String)>> {
+    apply_bootstrapped_cache_heads_except(source, snapshots, progress, &BTreeSet::new())
+}
+
+/// `cas_bootstrap` bodies (see `cas_bootstrap_bodies`) stay token-less.
+fn apply_bootstrapped_cache_heads_except(
+    source: &str,
+    snapshots: &mut [SnapshotItem],
+    progress: &SnapshotUploadProgress,
+    cas_bootstrap: &BTreeSet<String>,
 ) -> Result<Vec<(String, String, String)>> {
     let mut held = Vec::new();
     for snapshot in snapshots {
@@ -322,7 +363,9 @@ fn apply_bootstrapped_cache_heads(
             .accepted_cache_heads
             .get(&cache_session_key(&snapshot.source_session_id))
             .cloned();
-        if snapshot.cache_base_head_etag.is_none() {
+        if snapshot.cache_base_head_etag.is_none()
+            && !cas_bootstrap.contains(&snapshot.snapshot_fingerprint)
+        {
             return Err(anyhow::Error::new(SnapshotAckRejected {
                 reason: "cache head probe lacks accepted predecessor token",
             }));
@@ -1409,10 +1452,10 @@ fn identity_cache_wire_reserve(
 }
 
 /// Request class of one main-upload body: 2 for a legacy reconciliation,
-/// 1 when it carries a cache patch (admitted, unchanged or partial-empty), 0
-/// otherwise (no patch, birth- or cap-withheld). The client declares head CAS
-/// for a whole request when one body carries a patch, so the packer never
-/// mixes classes: an unpatched body sends no CAS contract and cannot conflict
+/// 1 when it carries a cache patch (admitted, unchanged or partial-empty) or a
+/// saved head, 0 otherwise (no patch and no head). The client declares head
+/// CAS for a whole request when one body does, so the packer never mixes
+/// classes: a body with neither sends no CAS contract and cannot conflict
 /// with a server head it never claimed.
 fn snapshot_upload_batch_class(snapshot: &SnapshotItem, legacy: bool) -> u8 {
     if legacy {
@@ -1443,9 +1486,9 @@ fn attach_head_conflict_answers(
         if let Some(patch) = snapshot.cache_observations.as_mut() {
             patch.full_replacement = false;
         }
-        // A withheld cache patch keeps its base but sends no CAS contract, so
-        // the request and its ACK validation would not admit a handshake.
-        if snapshot.cache_base_head_etag.is_none() || snapshot.cache_observations.is_none() {
+        // A saved base declares head CAS with or without a patch, so the
+        // request and its ACK validation admit the handshake.
+        if snapshot.cache_base_head_etag.is_none() {
             continue;
         }
         let key = cache_session_key(&snapshot.source_session_id);
@@ -8059,6 +8102,7 @@ fn finish_sync_source(
     #[cfg(test)]
     tests::permanent_finish_pipeline_tests::reason_reoffer_pipeline_tests::prepare_probe_for_test(
         &mut scan_result.snapshots,
+        &mut upload_progress,
     );
     finalize_scan_after_policy_with_body_witness(
         source,
@@ -8294,10 +8338,15 @@ fn finish_sync_source(
         .context_resend
         .retain_candidates(&upload_progress.context_receipt_candidates);
     crate::local_resource_diagnostics::change_reason::propagate(source.api_slug(), &index);
+    let cas_bootstrap = cas_bootstrap_bodies(&upload_progress, &scan_result.snapshots);
     let probes = scan_result
         .snapshots
         .iter()
-        .filter(|item| item.cache_observations.is_some() && item.cache_base_head_etag.is_none())
+        .filter(|item| {
+            item.cache_observations.is_some()
+                && item.cache_base_head_etag.is_none()
+                && !cas_bootstrap.contains(&item.snapshot_fingerprint)
+        })
         .map(cache_head_probe)
         .collect::<Vec<_>>();
     let mut bootstrap_deferred = 0usize;
@@ -8346,15 +8395,10 @@ fn finish_sync_source(
                 }
             }
         };
-        let ordinary_bootstrap = !activity_hint.snapshot_head_cas_required
-            && probes
-                .iter()
-                .all(|item| !legacy_reconciliation_pending.contains(&item.snapshot_fingerprint));
         let bootstrap_result = bootstrap_cache_heads_with_budget(
             &probes,
             source.api_slug(),
             &mut upload_progress,
-            ordinary_bootstrap,
             &mut inplace_retry,
             |snapshots, enforce_head_cas| {
                 let request = snapshot_batch_request(
@@ -8396,10 +8440,11 @@ fn finish_sync_source(
                     .deferred
                     .contains(&item.snapshot_fingerprint)
             });
-            let held = apply_bootstrapped_cache_heads(
+            let held = apply_bootstrapped_cache_heads_except(
                 source.api_slug(),
                 &mut scan_result.snapshots,
                 &upload_progress,
+                &cas_bootstrap,
             )
             .inspect_err(log_bootstrap_failure("apply"))
             .inspect_err(|_| {
@@ -13656,7 +13701,6 @@ mod tests {
             &[probe.clone()],
             &unique_poison_scope(),
             &mut progress,
-            true,
             |items, enforce| {
                 let request = SnapshotBatchRequest {
                     schema_version: SNAPSHOT_SCHEMA_VERSION,
@@ -13877,7 +13921,6 @@ mod tests {
             &ordinary,
             &scope,
             &mut progress,
-            true,
             |items, enforce| {
                 let request = SnapshotBatchRequest {
                     schema_version: SNAPSHOT_SCHEMA_VERSION,
@@ -14174,7 +14217,6 @@ mod tests {
             &[probe],
             &unique_poison_scope(),
             &mut progress,
-            true,
             |items, enforce| {
                 let request = SnapshotBatchRequest {
                     schema_version: SNAPSHOT_SCHEMA_VERSION,
@@ -14669,7 +14711,6 @@ mod tests {
             &off.snapshots,
             &unique_poison_scope(),
             &mut progress,
-            true,
             |items, enforce| response(items, enforce, enforce.then(|| "e".repeat(64))),
             |state| state.save(&progress_path),
         )
@@ -14876,7 +14917,6 @@ mod tests {
             &[probe],
             &unique_poison_scope(),
             &mut progress,
-            true,
             |items, enforce| {
                 stages.push(enforce);
                 let request = SnapshotBatchRequest {
@@ -15012,7 +15052,6 @@ mod tests {
             &[current.clone()],
             &unique_poison_scope(),
             &mut progress,
-            true,
             |items, enforce| {
                 assert!(items[0].cache_observations.is_none());
                 let incoming = revision(&items[0]);
@@ -15073,25 +15112,6 @@ mod tests {
             "e".repeat(64)
         );
         assert_eq!(server_revision, current_revision);
-        // Mandatory-CAS policy cannot take the optional ordinary stage.
-        let mut progress = test_upload_progress();
-        let mut attempts = Vec::new();
-        assert!(bootstrap_cache_heads(
-            &[current],
-            &unique_poison_scope(),
-            &mut progress,
-            false,
-            |_, enforce| {
-                attempts.push(enforce);
-                Err(anyhow!(
-                    "server rejects grown body without predecessor authority"
-                ))
-            },
-            |_| Ok(())
-        )
-        .is_err());
-        assert_eq!(attempts, [true]);
-        assert!(progress.accepted_cache_heads.is_empty());
     }
 
     /// An `unchanged` ACK whose
@@ -15358,7 +15378,6 @@ mod tests {
                 &[item.clone()],
                 &unique_poison_scope(),
                 &mut progress,
-                true,
                 |items, enforce| {
                     stages.push(enforce);
                     assert!(enforce, "ordinary exact bytes were already acknowledged");
@@ -17124,7 +17143,7 @@ mod tests {
         include!("snapshot_sync/e2_upload_tests.rs");
     }
 
-    mod class_split_tests {
+    pub(in crate::snapshot_sync) mod class_split_tests {
         use super::*;
         include!("snapshot_sync/class_split_tests.rs");
     }
@@ -24269,7 +24288,6 @@ mod tests {
                     &f.items[..1],
                     &unique_poison_scope(),
                     &mut f.progress,
-                    false,
                     &mut InplaceRetryBudget::default(),
                     |items, _| {
                         post(items.as_slice());

@@ -938,9 +938,10 @@ pub(in crate::snapshot_sync) fn ack(
 ) -> Result<crate::snapshot_client::SnapshotBatchResponse> {
     let mut response = accepted_batch(0);
     response.entity_ack_contract = Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
-    // Head-CAS covers the whole request once any item carries cache
-    // observations (`validate_entity_ack`): every accepted entity gets a head.
-    let head_cas = batch.iter().any(|item| item.cache_observations.is_some());
+    // Head-CAS covers the whole request once any item declares it (a cache
+    // patch or a saved head, `validate_entity_ack`): every accepted entity
+    // gets a head.
+    let head_cas = batch.iter().any(crate::snapshot_client::declares_head_cas);
     for item in batch {
         let mut reference = entity_ack_ref(&item.snapshot_fingerprint);
         reference.source_session_id = item.source_session_id.clone();
