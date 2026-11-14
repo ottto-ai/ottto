@@ -1930,3 +1930,5 @@ mod open_check_tests;
 mod fixtures;
 #[cfg(test)]
 pub(super) use fixtures::*;
+#[cfg(test)]
+mod tests;
