@@ -496,7 +496,7 @@ fn copied_file_version_three_converges_once() {
             prior.claude_money_birth_store.set_money_rule_version(2);
             e2::take_diag();
             e2::apply_money_rules(&mut prior);
-            assert_eq!(prior.claude_money_birth_store.money_rule_version(), 3);
+            assert_eq!(prior.claude_money_birth_store.money_rule_version(), 4);
             assert_eq!(copy_diag(&["money_rule_v3_reowed"]), [2]);
             prior = c.reload(&mut prior);
             e2::apply_money_rules(&mut prior);
@@ -577,4 +577,5 @@ fn copied_file_version_three_converges_once() {
 mod subagent_twins {
     include!("subagent_copy_twin_tests.rs");
     include!("subagent_copy_twin_replace_tests.rs");
+    include!("subagent_twin_tail_route_tests.rs");
 }

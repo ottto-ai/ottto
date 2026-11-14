@@ -36,8 +36,8 @@ fn counts(page: &Page, session: &str) -> (u64, u64) {
 /// 2 s copy slack. agent-000 dates from 2026-08 and its later home keeps an
 /// accepted copy body (its re-read is accepted history); agent-001 dates
 /// from 2026-11. First sight, then an own turn in each later home. The
-/// retained, cold and restarted owners emit the same envelopes. The counts
-/// pinned here are the current rule's: the shared tail counts in both homes.
+/// retained, cold and restarted owners emit the same envelopes. Each shared
+/// request counts once, at the earlier home; the later home removes all three.
 #[cfg(unix)]
 #[test]
 fn subagent_twin_slack_tail() {
@@ -111,7 +111,7 @@ fn subagent_twin_slack_tail() {
         finish_claude_pages(&c, &mut pages);
         for page in &pages {
             for agent in &agents {
-                assert_eq!(counts(page, agent), (4, 2), "{agent}: 3 shared, tail twice");
+                assert_eq!(counts(page, agent), (3, 3), "{agent}: 3 shared, once");
             }
         }
         bodies.push(compare_claude_uploads(&pages));
@@ -142,7 +142,7 @@ fn subagent_twin_slack_tail() {
         finish_claude_pages(&c, &mut pages);
         for page in &pages {
             for agent in &agents {
-                assert_eq!(counts(page, agent), (5, 2), "{agent}: own turn, tail twice");
+                assert_eq!(counts(page, agent), (4, 3), "{agent}: own turn, tail once");
             }
         }
         bodies.push(compare_claude_uploads(&pages));
