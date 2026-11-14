@@ -12,7 +12,7 @@
 //! Schedule per home:
 //! - in use on this Mac (a Codex process held a rollout in the home, or a
 //!   session that belongs to it was written, in the last 30 min): every 5 min;
-//! - otherwise every 15 min;
+//! - otherwise every 30 min;
 //! - a failed read waits the same interval before the next attempt;
 //! - a changed local login (the credential names another account or
 //!   workspace than at the last read) is read again after at least 1 min;
@@ -88,8 +88,8 @@ use super::{
 
 /// In use on this Mac: one provider read per 5 min.
 pub(super) const IN_USE_REFRESH_SECONDS: u64 = 5 * 60;
-/// Not in use: one provider read per 15 min.
-pub(super) const UNUSED_REFRESH_SECONDS: u64 = 15 * 60;
+/// Not in use: one provider read per 30 min.
+pub(super) const UNUSED_REFRESH_SECONDS: u64 = 30 * 60;
 /// A home is in use while its latest session or process sighting is this
 /// recent.
 pub(super) const IN_USE_WINDOW_SECONDS: u64 = 30 * 60;
@@ -119,6 +119,9 @@ const PLANNED_ENTRIES_MAX: usize = 64;
 /// A served reading older than this (two unused intervals: the schedule
 /// failed to run) is labelled stale.
 const SERVED_FRESH_MAX_AGE_SECONDS: u64 = 2 * UNUSED_REFRESH_SECONDS;
+// A saved reading counts as fresh, and admits a session launch, for at most
+// an hour.
+const _: () = assert!(SERVED_FRESH_MAX_AGE_SECONDS <= 60 * 60);
 /// Beyond this a saved reading is not served at all (the last-known cap).
 const SERVED_MAX_AGE_SECONDS: u64 = codex_last_known::LAST_KNOWN_MAX_AGE_SECS;
 /// A local clock this far behind a stored time means the clock stepped back.
@@ -1251,7 +1254,7 @@ pub(super) fn refresh_interval_seconds(in_use: bool) -> u64 {
     }
 }
 
-/// [`scheduled_read_due_every`] at a home's own 5 or 15 minutes.
+/// [`scheduled_read_due_every`] at a home's own 5 or 30 minutes.
 #[cfg(test)]
 pub(super) fn scheduled_read_due(
     saved: Option<&SavedCodexQuota>,
@@ -1681,7 +1684,7 @@ struct ScheduledRound {
     next_due_at: Option<u64>,
 }
 
-/// Each home's interval this round: its own 5 or 15 minutes, the in-use one
+/// Each home's interval this round: its own 5 or 30 minutes, the in-use one
 /// for a home that reads for others when any of them is in use, and the
 /// keep-alive for the homes it reads for. With the grouping.
 fn round_intervals(
@@ -2236,14 +2239,60 @@ mod tests {
         assert_eq!(account.plan_type.as_deref(), Some("pro"));
         assert!(account.email.is_none());
 
-        // Old readings are labelled stale, then not served at all.
-        let stale = serve_saved_at(&root, &home, CodexHomeTrust::Managed, now + 31 * 60).unwrap();
+        // A reading is fresh for two unused intervals, then labelled stale
+        // (still naming its account), then not served at all. A slot whose
+        // reading is stale shows no limits.
+        let u = UNUSED_REFRESH_SECONDS;
+        let slot_status = |served: &CodexUsageProbe, at: u64| {
+            let mut snapshot = crate::agent_status::base_snapshot(
+                SourceKind::Codex,
+                ottto_protocol::AgentStatusState::Available,
+                ottto_protocol::AgentStatusCollectionMethod::CommandProbe,
+                rfc3339(at),
+                rfc3339(at),
+            );
+            let identity = served.saved_identity.clone().unwrap();
+            snapshot.account = Some(AgentAccountStatus {
+                login_state: AgentLoginState::SignedIn,
+                account_identifier_hash: Some(identity.account_identifier_hash),
+                organization_identifier_hash: Some(identity.workspace_identifier_hash),
+                ..unsupported_account("openai")
+            });
+            snapshot.quota_windows = served.quota_windows.clone();
+            crate::agent_status::codex_collection_status_from_snapshot(&snapshot)
+        };
+        let fresh = serve_saved_at(&root, &home, CodexHomeTrust::Managed, now + 2 * u).unwrap();
+        assert_eq!(
+            fresh.quota_windows[0].freshness,
+            AgentQuotaWindowFreshness::Fresh
+        );
+        assert!(slot_status(&fresh, now + 2 * u).quota_snapshot.is_some());
+        let stale = serve_saved_at(&root, &home, CodexHomeTrust::Managed, now + 2 * u + 1).unwrap();
         assert_eq!(
             stale.quota_windows[0].freshness,
             AgentQuotaWindowFreshness::Stale
         );
+        assert_eq!(stale.saved_identity, original.saved_identity);
+        let status = slot_status(&stale, now + 2 * u + 1);
+        assert_eq!(
+            status.state,
+            ottto_protocol::CodexAccountSlotCollectionStateV1::ProviderUnavailable
+        );
+        assert!(status.quota_snapshot.is_none());
         assert_eq!(
             served_error(&root, &home, now + 7 * 3_600),
+            Some(CODEX_QUOTA_NOT_READ_YET.to_string())
+        );
+        // A reading between one and two unused intervals old never stands for
+        // another account: once the credential names another login (here with
+        // an expired access token, so no live one), nothing is served and a
+        // launch gets no binding.
+        let saved = read_saved_at(&root, &home);
+        sign_in_home_with_lifetimes(&home, "u2", "w", -60, -60);
+        let switched = login_mark(&home, CodexHomeTrust::Managed);
+        assert_eq!(held_binding(saved.as_ref(), &switched), None);
+        assert_eq!(
+            served_error(&root, &home, now + u + u / 2),
             Some(CODEX_QUOTA_NOT_READ_YET.to_string())
         );
         let _ = std::fs::remove_dir_all(root);
@@ -2297,9 +2346,9 @@ mod tests {
     }
 
     /// The whole schedule over four homes: a home tied to a session or a
-    /// running process is read every 5 minutes, the others every 15, and a
-    /// removed slot is no longer read; its sessions then count for the
-    /// default home.
+    /// running process is read every 5 minutes, the others at the unused
+    /// interval, and a removed slot is no longer read; its sessions then
+    /// count for the default home.
     #[test]
     fn a_schedule_round_reads_homes_in_use_every_five_minutes_and_drops_removed_ones() {
         let root = scratch("round");
@@ -2348,19 +2397,23 @@ mod tests {
             read.sort();
             read
         };
+        let u = UNUSED_REFRESH_SECONDS;
         let all = [0, 1, 2, 3];
         assert_eq!(round(&all, start), ["busy", "default", "idle", "process"]);
         assert!(round(&all, start + 5 * 60 - 1).is_empty());
         assert_eq!(round(&all, start + 5 * 60), ["busy", "process"]);
         assert_eq!(round(&all, start + 10 * 60), ["busy", "process"]);
         assert_eq!(
-            round(&all, start + 15 * 60),
+            round(&all, start + u),
             ["busy", "default", "idle", "process"]
         );
         // "busy" is removed: never read again, and its session now counts for
         // the default home, which is read at the in-use interval.
-        assert_eq!(round(&[0, 2, 3], start + 20 * 60), ["default", "process"]);
-        assert!(round(&[0, 2, 3], start + 24 * 60).is_empty());
+        assert_eq!(
+            round(&[0, 2, 3], start + u + 5 * 60),
+            ["default", "process"]
+        );
+        assert!(round(&[0, 2, 3], start + u + 9 * 60).is_empty());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2439,7 +2492,8 @@ mod tests {
         assert!(read_and_save_at(&root, &home, CodexHomeTrust::Managed, now, due, read).is_some());
         assert!(read_saved_at(&root, &home).is_none(), "nothing was written");
         // Later ticks inside the interval do not read again.
-        for tick in [15, 60, 14 * 60] {
+        let u = UNUSED_REFRESH_SECONDS;
+        for tick in [15, 60, u - 60] {
             assert!(
                 read_and_save_at(&root, &home, CodexHomeTrust::Managed, now + tick, due, read)
                     .is_none()
@@ -2449,7 +2503,7 @@ mod tests {
             &root,
             &home,
             CodexHomeTrust::Managed,
-            now + 15 * 60 + 1,
+            now + u + 1,
             due,
             read
         )
@@ -2462,7 +2516,7 @@ mod tests {
             &root,
             &home,
             CodexHomeTrust::Managed,
-            now + 15 * 60 + 30,
+            now + u + 30,
             explicit,
             read
         )
@@ -2555,6 +2609,7 @@ mod tests {
     #[test]
     fn a_round_tells_when_the_next_home_is_due() {
         let fixture = SameLoginFixture::new("next-due", &[("default", true, "u1", "w")]);
+        let u = UNUSED_REFRESH_SECONDS;
         let start = current_unix_seconds() + 30;
         assert_eq!(
             fixture.planned_round(start, true),
@@ -2562,7 +2617,7 @@ mod tests {
         );
         assert_eq!(
             fixture.planned_round(start + 10, false),
-            (Vec::new(), Some(start + 15 * 60))
+            (Vec::new(), Some(start + u))
         );
         fixture.sign_in("default", "u2", "w");
         assert_eq!(
@@ -2571,7 +2626,7 @@ mod tests {
         );
         assert_eq!(
             fixture.planned_round(start + 60, false),
-            (vec!["default".to_string()], Some(start + 60 + 15 * 60))
+            (vec!["default".to_string()], Some(start + 60 + u))
         );
     }
 
@@ -2980,8 +3035,9 @@ mod tests {
 
     /// The default home and a managed slot signed into the same account and
     /// workspace share one read: the default home reads at 5 minutes while
-    /// either is in use and at 15 otherwise, the slot is read by itself once
-    /// a day, and its status serves the default home's reading.
+    /// either is in use and at the unused interval otherwise, the slot is
+    /// read by itself once a day, and its status serves the default home's
+    /// reading.
     #[test]
     fn homes_with_the_same_login_are_read_once_and_share_the_reading() {
         let fixture = SameLoginFixture::new(
@@ -2992,6 +3048,7 @@ mod tests {
                 ("other", false, "user-b", "workspace-a"),
             ],
         );
+        let u = UNUSED_REFRESH_SECONDS;
         let start = current_unix_seconds();
         // Nothing read yet: nothing is known to be shared.
         assert_eq!(
@@ -3014,28 +3071,32 @@ mod tests {
             expected.reset_credit_detail_summary
         );
         assert_eq!(served.saved_identity, expected.saved_identity);
-        // Not in use: 15 minutes since the default home's last read; the
-        // other account keeps its own 15 minutes.
-        assert_eq!(fixture.round(start + 15 * 60, false, &[]), ["other"]);
-        assert!(fixture.round(start + 25 * 60 - 1, false, &[]).is_empty());
-        assert_eq!(fixture.round(start + 25 * 60, false, &[]), ["default"]);
+        // Not in use: the unused interval since the default home's last read;
+        // the other account keeps its own.
+        assert_eq!(fixture.round(start + u, false, &[]), ["other"]);
+        assert!(fixture
+            .round(start + 10 * 60 + u - 1, false, &[])
+            .is_empty());
+        assert_eq!(fixture.round(start + 10 * 60 + u, false, &[]), ["default"]);
         // The slot only would be in use (a running Codex there): the shared
-        // read is at 5 minutes again.
-        let mut homes = fixture.scheduled(&[], start + 30 * 60);
+        // read is at 5 minutes again (the other account is left out of this
+        // round, whatever its own interval).
+        let busy = start + 10 * 60 + u + 5 * 60;
+        let mut homes = fixture.scheduled(&["other"], busy);
         for home in &mut homes {
             if &home.home == fixture.home("twin") {
-                home.process_seen_at = Some(start + 29 * 60);
+                home.process_seen_at = Some(busy - 60);
             }
         }
         scheduled_round_for(
             &fixture.root,
             homes,
             &[],
-            start + 30 * 60,
+            busy,
             || true,
-            |home| fixture.read(home, start + 30 * 60),
+            |home| fixture.read(home, busy),
         );
-        assert_eq!(fixture.taken_reads(), ["default", "other"]);
+        assert_eq!(fixture.taken_reads(), ["default"]);
 
         // Keep-alive: the slot reads by itself once a day, not before.
         let day = start + SAME_LOGIN_KEEPALIVE_SECONDS;
@@ -3044,7 +3105,7 @@ mod tests {
             .contains(&"twin".to_string()));
         assert!(fixture.round(day, false, &[]).contains(&"twin".to_string()));
         assert!(!fixture
-            .round(day + 15 * 60, false, &[])
+            .round(day + u, false, &[])
             .contains(&"twin".to_string()));
     }
 
@@ -3059,15 +3120,16 @@ mod tests {
                 ("slot", false, "user-a", "workspace-b"),
             ],
         );
+        let u = UNUSED_REFRESH_SECONDS;
         let start = current_unix_seconds();
         assert_eq!(fixture.round(start, false, &[]), ["default", "slot"]);
         assert_eq!(fixture.round(start + 5 * 60, true, &[]), ["default"]);
-        assert_eq!(fixture.round(start + 15 * 60, false, &[]), ["slot"]);
+        assert_eq!(fixture.round(start + u, false, &[]), ["slot"]);
         assert_eq!(
-            fixture.served("slot", start + 15 * 60).saved_identity,
+            fixture.served("slot", start + u).saved_identity,
             bound_probe("user-a", "workspace-b", start).saved_identity
         );
-        let (refresh, reads) = fixture.refresh(start + 17 * 60);
+        let (refresh, reads) = fixture.refresh(start + u + 2 * 60);
         assert_eq!((refresh.read, refresh.rate_limited), (2, 0));
         assert_eq!(reads, ["default", "slot"]);
     }
@@ -3089,15 +3151,18 @@ mod tests {
         assert!(login_mark(fixture.home("twin"), fixture.trust("twin"))
             .binding
             .is_some());
+        let u = UNUSED_REFRESH_SECONDS;
         let start = current_unix_seconds();
         assert_eq!(fixture.round(start, false, &[]), ["default", "twin"]);
         assert_eq!(fixture.round(start + 5 * 60, true, &[]), ["default"]);
-        assert!(fixture.round(start + 15 * 60, false, &[]).is_empty());
-        assert_eq!(fixture.round(start + 20 * 60, false, &[]), ["default"]);
-        assert_eq!(fixture.round(start + 35 * 60, false, &[]), ["default"]);
-        // Fresh, although the slot's own reading is 35 minutes old.
-        let served = fixture.served("twin", start + 35 * 60);
-        assert_eq!(served.response_completed_at, Some(rfc3339(start + 35 * 60)));
+        assert!(fixture.round(start + u, false, &[]).is_empty());
+        assert_eq!(fixture.round(start + 5 * 60 + u, false, &[]), ["default"]);
+        let later = start + 5 * 60 + 2 * u;
+        assert_eq!(fixture.round(later, false, &[]), ["default"]);
+        // Fresh, although the slot's own reading is older than the stale
+        // threshold.
+        let served = fixture.served("twin", later);
+        assert_eq!(served.response_completed_at, Some(rfc3339(later)));
         assert!(served
             .quota_windows
             .iter()
@@ -3143,12 +3208,10 @@ mod tests {
             fixture.served_at("twin", start + 5 * 60 + 30),
             Err(CODEX_QUOTA_NOT_READ_YET.to_string())
         );
-        assert!(fixture.round(start + 15 * 60 - 1, false, &[]).is_empty());
-        assert_eq!(fixture.round(start + 15 * 60, false, &[]), ["twin"]);
-        assert_eq!(
-            fixture.served_at("twin", start + 15 * 60),
-            Ok(rfc3339(start + 15 * 60))
-        );
+        let u = UNUSED_REFRESH_SECONDS;
+        assert!(fixture.round(start + u - 1, false, &[]).is_empty());
+        assert_eq!(fixture.round(start + u, false, &[]), ["twin"]);
+        assert_eq!(fixture.served_at("twin", start + u), Ok(rfc3339(start + u)));
     }
 
     /// When the default home signs into another account, the slot no longer
@@ -3180,13 +3243,11 @@ mod tests {
             Err(CODEX_QUOTA_NOT_READ_YET.to_string())
         );
         assert_eq!(fixture.round(switched + 61, true, &[]), ["default"]);
-        // The slot is read on its own 15 minutes again, not once a day.
-        assert!(fixture.round(start + 15 * 60 - 1, false, &[]).is_empty());
-        assert_eq!(fixture.round(start + 15 * 60, false, &[]), ["twin"]);
-        assert_eq!(
-            fixture.served_at("twin", start + 15 * 60),
-            Ok(rfc3339(start + 15 * 60))
-        );
+        // The slot is read on its own unused interval again, not once a day.
+        let u = UNUSED_REFRESH_SECONDS;
+        assert!(fixture.round(start + u - 1, false, &[]).is_empty());
+        assert_eq!(fixture.round(start + u, false, &[]), ["twin"]);
+        assert_eq!(fixture.served_at("twin", start + u), Ok(rfc3339(start + u)));
     }
 
     /// A failed read of the home that reads for both ends the sharing: the
@@ -3214,18 +3275,14 @@ mod tests {
             fixture.served_at("twin", start + 10 * 60),
             Ok(rfc3339(start))
         );
-        assert_eq!(
-            fixture.round(start + 15 * 60, true, &[]),
-            ["default", "twin"]
-        );
+        let u = UNUSED_REFRESH_SECONDS;
+        assert_eq!(fixture.round(start + u, true, &[]), ["default", "twin"]);
         // A later good read of the default home shares again.
         fixture.failing.lock().unwrap().clear();
-        assert_eq!(fixture.round(start + 20 * 60, true, &[]), ["default"]);
-        assert_eq!(fixture.round(start + 35 * 60, false, &[]), ["default"]);
-        assert_eq!(
-            fixture.served_at("twin", start + 35 * 60),
-            Ok(rfc3339(start + 35 * 60))
-        );
+        assert_eq!(fixture.round(start + u + 5 * 60, true, &[]), ["default"]);
+        let later = start + 5 * 60 + 2 * u;
+        assert_eq!(fixture.round(later, false, &[]), ["default"]);
+        assert_eq!(fixture.served_at("twin", later), Ok(rfc3339(later)));
     }
 
     /// The keep-alive read of the other home fails (its login died there):
@@ -3249,7 +3306,10 @@ mod tests {
             Err("Codex app-server quota read timed out.".to_string())
         );
         assert_eq!(fixture.round(day + 5 * 60, true, &[]), ["default"]);
-        assert_eq!(fixture.round(day + 15 * 60, true, &[]), ["default", "twin"]);
+        // Its failed read is retried at the unused interval, not before.
+        let u = UNUSED_REFRESH_SECONDS;
+        assert_eq!(fixture.round(day + u - 1, true, &[]), ["default"]);
+        assert_eq!(fixture.round(day + u, true, &[]), ["twin"]);
     }
 
     /// An explicit refresh reads homes that hold the same login once, with
@@ -3299,27 +3359,24 @@ mod tests {
         assert_eq!(fixture.round(start + 5 * 60, true, &[]), ["default"]);
 
         // A sign-in runs in the default home: the slot reads alone.
-        assert!(fixture
-            .round(start + 15 * 60 - 1, true, &["default"])
-            .is_empty());
-        assert_eq!(fixture.round(start + 15 * 60, true, &["default"]), ["twin"]);
-        assert_eq!(fixture.round(start + 30 * 60, true, &["default"]), ["twin"]);
+        let u = UNUSED_REFRESH_SECONDS;
+        assert!(fixture.round(start + u - 1, true, &["default"]).is_empty());
+        assert_eq!(fixture.round(start + u, true, &["default"]), ["twin"]);
+        assert_eq!(fixture.round(start + 2 * u, true, &["default"]), ["twin"]);
 
         // A sign-in runs in the slot and writes another account, before and
         // after the next round: never the default home's reading.
-        assert_eq!(fixture.round(start + 31 * 60, true, &[]), ["default"]);
-        assert_eq!(
-            fixture.served_at("twin", start + 31 * 60),
-            Ok(rfc3339(start + 31 * 60))
-        );
+        let shared = start + 2 * u + 60;
+        assert_eq!(fixture.round(shared, true, &[]), ["default"]);
+        assert_eq!(fixture.served_at("twin", shared), Ok(rfc3339(shared)));
         fixture.sign_in("twin", "user-d", "workspace-d");
         assert_eq!(
-            fixture.served_at("twin", start + 31 * 60),
+            fixture.served_at("twin", shared),
             Err(CODEX_QUOTA_NOT_READ_YET.to_string())
         );
-        assert_eq!(fixture.round(start + 36 * 60, true, &["twin"]), ["default"]);
+        assert_eq!(fixture.round(shared + 5 * 60, true, &["twin"]), ["default"]);
         assert_eq!(
-            fixture.served_at("twin", start + 36 * 60),
+            fixture.served_at("twin", shared + 5 * 60),
             Err(CODEX_QUOTA_NOT_READ_YET.to_string())
         );
     }

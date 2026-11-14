@@ -69,9 +69,8 @@ const MAX_RETRY_SECONDS: u64 = 5 * 60;
 /// minutes; past this nobody is waiting on the setup.
 const LONG_FAILURE_SECONDS: u64 = 30 * 60;
 /// Wait between automatic reads once the failures are older than
-/// [`LONG_FAILURE_SECONDS`], the saved-quota schedule's interval for a home
-/// not in use. A cleared cause (network back, Codex CLI updated) is still
-/// noticed without a new sign-in or a person's check.
+/// [`LONG_FAILURE_SECONDS`]. A cleared cause (network back, Codex CLI
+/// updated) is still noticed without a new sign-in or a person's check.
 const SLOW_RETRY_SECONDS: u64 = 15 * 60;
 /// Shortest gap before a person's explicit check reads again after a failure.
 const EXPLICIT_MIN_GAP_SECONDS: u64 = 5;
