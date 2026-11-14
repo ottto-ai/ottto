@@ -1153,6 +1153,44 @@ fn maintenance_cache_counters_are_optional_counts() {
     }
 }
 
+/// [regress] A write transaction prints one maintenance row, after its commit;
+/// that row counts every cache access since the previous printed row, once.
+#[test]
+fn write_transaction_prints_only_the_commit_maintenance_row() {
+    let tmp = Scratch::new();
+    let mut db = tmp.live_store();
+    let key = traversal("one".into());
+    let mut between = 0;
+    let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+        for generation in 0..2 {
+            let mut tx = db.begin(TxnMode::Write).unwrap();
+            put(&mut tx, &key, b"x");
+            let next = DurableCommitOutcome::Committed(generation + 1);
+            assert_eq!(tx.commit(generation, generation + 1), next);
+            if generation == 0 {
+                for _ in 0..200 {
+                    db.begin(TxnMode::Read).unwrap().get(&key).unwrap();
+                }
+                between = db.cache_accesses_for_test();
+            }
+        }
+    });
+    let stats: Vec<_> = rows
+        .iter()
+        .filter(|r| r["counts"].get("cache_used_bytes").is_some())
+        .collect();
+    assert_eq!(stats.len(), 2, "{rows:?}");
+    let accesses = |r: &serde_json::Value| {
+        r["counts"]["cache_hit"].as_u64().unwrap() + r["counts"]["cache_miss"].as_u64().unwrap()
+    };
+    // The second commit's row includes the reads after the first commit.
+    assert!(
+        between >= 200 && accesses(stats[1]) >= between,
+        "{between} {rows:?}"
+    );
+    assert!(db.cache_accesses_for_test() < between, "printed rows reset");
+}
+
 /// [behaviour] idle maintenance emits counts once per day.
 #[test]
 fn store_growth_gauge_is_daily_and_counts_only() {
@@ -1279,6 +1317,43 @@ fn freshness_bookkeeping_never_counts_toward_the_save_target() {
     assert_eq!(db.read_control::<u64>("erasure_pending").unwrap(), Some(4));
     assert_eq!(sqlite::dirty_rows_for_test(&db), 5_001);
     assert!(db.save_over_target());
+}
+
+/// [behaviour] A save reports charged rows and bytes per kind; they sum to the
+/// save's totals, and an identical rewrite is skipped before it is charged.
+#[test]
+fn save_reports_charged_rows_and_bytes_per_kind() {
+    let tmp = Scratch::new();
+    let mut db = tmp.live_store();
+    for (generation, rows) in [(0, ["a", "b", "c"]), (1, ["a", "b", "changed"])] {
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        for (row, value) in rows.into_iter().enumerate() {
+            put(&mut tx, &traversal(format!("t-{row}")), value.as_bytes());
+        }
+        put(&mut tx, &file("f".into()), b"evidence");
+        put(&mut tx, &census(format!("c-{generation}")), b"evidence");
+        telemetry::take_thread_event_for_test("save_kinds");
+        let next = generation + 1;
+        assert_eq!(
+            tx.commit(generation, next),
+            DurableCommitOutcome::Committed(next)
+        );
+        let kinds = telemetry::take_thread_event_for_test("save_kinds").unwrap();
+        let kinds = kinds.as_object().unwrap();
+        // Unchanged rows are never charged: only the changed traversal row.
+        let rows = |kind: &str| kinds.get(kind).and_then(|k| k[0].as_u64());
+        let expected = [[Some(3), Some(1), Some(1)], [Some(1), None, Some(1)]];
+        assert_eq!(
+            ["scan_state.traversal", "file.progress", "file.census"].map(rows),
+            expected[generation as usize]
+        );
+        let sum = |i: usize| kinds.values().map(|k| k[i].as_u64().unwrap()).sum::<u64>();
+        assert_eq!(sum(0), sqlite::dirty_rows_for_test(&db));
+        assert_eq!(sum(1), sqlite::dirty_bytes_for_test(&db));
+        assert!(kinds
+            .values()
+            .all(|k| k[0].as_u64() > Some(0) && k[1].as_u64() > Some(0)));
+    }
 }
 
 /// [format] one save commits all dirty rows above soft targets.

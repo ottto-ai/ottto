@@ -266,6 +266,11 @@ pub(crate) fn claude_identity_over_cap(
     with_claude_identity_over_cap(record);
 }
 
+#[cfg(test)]
+pub(crate) fn identity_over_cap_counts_for_test() -> [u64; 8] {
+    with_claude_identity_over_cap(|counts| std::array::from_fn(|i| counts[i].load(Relaxed)))
+}
+
 /// Wire bytes of the last over-cap tagged body by component, measured before
 /// its display leaves are shed; `after_shed` is what the tag selector then
 /// sees. Counts and an 8-hex entity digest only.
@@ -984,6 +989,39 @@ impl Source {
 struct ProcessSample {
     cpu_us: u64,
     lifetime_max_rss_bytes: u64,
+    disk: Option<DiskBytes>,
+}
+/// Process-wide disk bytes: cumulative in a sample, a delta on a window row.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub(crate) struct DiskBytes {
+    pub(crate) disk_read_bytes: u64,
+    pub(crate) disk_written_bytes: u64,
+}
+impl DiskBytes {
+    /// macOS `proc_pid_rusage` only; `None` elsewhere or on a failed read.
+    pub(crate) fn now() -> Option<Self> {
+        #[cfg(target_os = "macos")]
+        {
+            // SAFETY: a plain C struct that proc_pid_rusage fills on success.
+            let mut usage: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
+            let read = (&raw mut usage).cast();
+            (unsafe { libc::proc_pid_rusage(libc::getpid(), libc::RUSAGE_INFO_V2, read) } == 0)
+                .then_some(Self {
+                    disk_read_bytes: usage.ri_diskio_bytesread,
+                    disk_written_bytes: usage.ri_diskio_byteswritten,
+                })
+        }
+        #[cfg(not(target_os = "macos"))]
+        None
+    }
+    /// `None` when either sample is unavailable or a counter regressed.
+    fn between(before: Option<ProcessSample>, after: Option<ProcessSample>) -> Option<Self> {
+        let (a, b) = before?.disk.zip(after?.disk)?;
+        Some(Self {
+            disk_read_bytes: b.disk_read_bytes.checked_sub(a.disk_read_bytes)?,
+            disk_written_bytes: b.disk_written_bytes.checked_sub(a.disk_written_bytes)?,
+        })
+    }
 }
 
 fn process_sample() -> Option<ProcessSample> {
@@ -1024,6 +1062,7 @@ fn process_usage() -> Option<(ProcessSample, StateV2Cpu)> {
         };
         Some((
             ProcessSample {
+                disk: DiskBytes::now(),
                 cpu_us: split.cpu_user_us.checked_add(split.cpu_sys_us)?,
                 lifetime_max_rss_bytes: if cfg!(target_os = "macos") {
                     raw_rss
@@ -1325,6 +1364,8 @@ struct Observation {
     #[serde(skip_serializing_if = "Option::is_none")]
     malloc_in_use_bytes: Option<u64>,
     shared_process_cpu_delta_us: Option<u64>,
+    #[serde(flatten)]
+    shared_process_disk_delta: Option<DiskBytes>,
     process_lifetime_max_rss_bytes: Option<u64>,
     process_lifetime_max_rss_before_bytes: Option<u64>,
     #[serde(flatten)]
@@ -1346,10 +1387,11 @@ impl Observation {
             wall_elapsed_us: wall,
             malloc_in_use_bytes: None,
             footprint: Default::default(),
-            cli_children: cli_children::snapshot(),
+            cli_children: Vec::new(),
             shared_process_cpu_delta_us: before
                 .zip(after)
                 .and_then(|(before, after)| after.cpu_us.checked_sub(before.cpu_us)),
+            shared_process_disk_delta: DiskBytes::between(before, after),
             process_lifetime_max_rss_bytes: after.map(|sample| sample.lifetime_max_rss_bytes),
             process_lifetime_max_rss_before_bytes: before.zip(after).and_then(|(before, after)| {
                 (before.lifetime_max_rss_bytes <= after.lifetime_max_rss_bytes)
@@ -1381,6 +1423,8 @@ pub(crate) fn source_prepare<T>(
         source: Source::from_slug(source),
         observation: Observation {
             malloc_in_use_bytes,
+            // Cumulative totals: once per prepare, not on every row.
+            cli_children: cli_children::snapshot(),
             ..probe.stage_observation(footprint.as_ref())
         },
         counts: BTreeMap::<&str, u64>::new(),
@@ -1476,6 +1520,8 @@ pub(crate) struct StageWindow {
     evidence_mem: Option<EvidenceMem>,
     allocator_relief: Option<AllocatorRelief>,
     offpass_cpu: Option<Option<StateV2Cpu>>,
+    /// Off-pass control request counts from `take_control` (no ids or args).
+    pub(crate) control: BTreeMap<&'static str, u64>,
 }
 /// Evidence-read memory checkpoints, scalars only. Raw allocator in-use bytes
 /// at A (API evidence attached), B (root loop done) and C (cross-root finish
@@ -1535,6 +1581,7 @@ impl StageWindow {
             evidence_mem: None,
             allocator_relief: None,
             offpass_cpu: offpass.then(|| process_usage().map(|(_, cpu)| cpu)),
+            control: BTreeMap::new(),
         }
     }
     /// A window that also scopes and reports JSONL line scalars for `source`.
@@ -1563,6 +1610,7 @@ impl Drop for StageWindow {
                     cpu_user_us: samples
                         .and_then(|(a, b)| b.cpu_user_us.checked_sub(a.cpu_user_us)),
                     cpu_sys_us: samples.and_then(|(a, b)| b.cpu_sys_us.checked_sub(a.cpu_sys_us)),
+                    control: std::mem::take(&mut self.control),
                 },
                 observation,
             });
@@ -1601,6 +1649,36 @@ struct OffpassCounts {
     cpu_user_us: Option<u64>,
     cpu_sys_us: Option<u64>,
     wall_max_us: u64,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    control: BTreeMap<&'static str, u64>,
+}
+std::thread_local! {
+    static CONTROL: std::cell::RefCell<BTreeMap<&'static str, u64>> = const {
+        std::cell::RefCell::new(BTreeMap::new())
+    };
+}
+/// One control request's command class on its worker thread; counts only.
+pub(crate) fn control_class(class: &'static str) {
+    CONTROL.with_borrow_mut(|counts| counts.insert(class, 1));
+}
+/// Times the Companion code-signature check; its result passes through as is.
+pub(crate) fn trust_check(check: impl FnOnce() -> bool) -> bool {
+    let started = Instant::now();
+    let trusted = check();
+    let us = wall_us(started);
+    if cfg!(target_os = "macos") {
+        let timer = [
+            ("trust_checks", 1),
+            ("trust_us_sum", us),
+            ("trust_us_max", us),
+        ];
+        CONTROL.with_borrow_mut(|counts| counts.extend(timer));
+    }
+    trusted
+}
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn take_control() -> BTreeMap<&'static str, u64> {
+    CONTROL.take()
 }
 // Literal source/stage keys only; one pending row per lane, no work-unit history.
 process_static!(fn with_offpass: std::sync::Mutex<BTreeMap<(Source, &'static str), Record<OffpassCounts>>> =
@@ -1612,6 +1690,11 @@ fn aggregate_offpass(mut row: Record<OffpassCounts>) {
         if let Some(previous) = rows.remove(&key) {
             row.counts.count += previous.counts.count;
             row.counts.wall_max_us = row.counts.wall_max_us.max(previous.counts.wall_max_us);
+            for (key, n) in previous.counts.control {
+                let max = key.ends_with("_max");
+                let total = row.counts.control.entry(key).or_default();
+                *total = if max { n.max(*total) } else { n + *total };
+            }
             for (sum, prior) in [
                 (&mut row.counts.cpu_user_us, previous.counts.cpu_user_us),
                 (&mut row.counts.cpu_sys_us, previous.counts.cpu_sys_us),
@@ -1622,6 +1705,14 @@ fn aggregate_offpass(mut row: Record<OffpassCounts>) {
             ] {
                 *sum = sum.zip(prior).map(|(a, b)| a + b);
             }
+            row.observation.shared_process_disk_delta = row
+                .observation
+                .shared_process_disk_delta
+                .zip(previous.observation.shared_process_disk_delta)
+                .map(|(a, b)| DiskBytes {
+                    disk_read_bytes: a.disk_read_bytes + b.disk_read_bytes,
+                    disk_written_bytes: a.disk_written_bytes + b.disk_written_bytes,
+                });
             row.observation.wall_elapsed_us += previous.observation.wall_elapsed_us;
             row.observation.process_lifetime_max_rss_before_bytes =
                 previous.observation.process_lifetime_max_rss_before_bytes;
@@ -1738,6 +1829,7 @@ pub(crate) fn usage_gaps(source: &str, bodies: &[crate::snapshots::SnapshotItem]
 impl crate::heap_layout_bound::HeapLayoutBound for StageWindow {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.probe, c)?;
+        crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.control, c)?;
         crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.footprint, c)
     }
 }
@@ -1874,14 +1966,6 @@ pub(crate) fn claude_history_upgrade_owed_without_list(counts: &impl Serialize) 
         "claude_code",
         counts,
     );
-}
-/// Shadow, once per Claude page: per-family census completion counts
-/// (`family_census_complete`, `family_census_incomplete{reason}`,
-/// `family_complete_deferred{quantum}`), `pending_census_members`, the
-/// skipped-set digest and predicate cost. Counts only; never an authority
-/// input, no path, id or wire event.
-pub(crate) fn claude_family_census_shadow(counts: &impl Serialize) {
-    traversal_point("claude_family_census_shadow", "claude_code", counts);
 }
 static HISTORY_PROOF_CORRECTION_DEFERRED_TOTAL: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -2899,10 +2983,17 @@ mod tests {
             assert_eq!(row["stage"], "offpass_agent_status");
             assert_eq!(row["source"], source);
             assert!(row["observation"]["wall_elapsed_us"].is_u64());
+            assert!(row["observation"].get("cli_children").is_none());
             for field in ["cpu_user_us", "cpu_sys_us"] {
                 assert!(row["counts"].get(field).is_some());
                 #[cfg(any(target_os = "macos", target_os = "linux"))]
                 assert!(row["counts"][field].is_u64());
+            }
+            // Disk byte deltas: macOS only, absent elsewhere.
+            for field in ["disk_read_bytes", "disk_written_bytes"] {
+                let present = row["observation"].get(field).is_some();
+                assert_eq!(present, cfg!(target_os = "macos"));
+                assert_eq!(row["observation"][field].is_u64(), present);
             }
             assert!(row["observation"].get("footprint_samples").is_none());
             assert!(row["observation"]
@@ -2927,6 +3018,7 @@ mod tests {
                         cpu_user_us: Some(2),
                         cpu_sys_us: Some(5),
                         wall_max_us: 7,
+                        control: BTreeMap::new(),
                     },
                 });
             }
@@ -2940,6 +3032,34 @@ mod tests {
         );
         assert_eq!(rows[0]["observation"]["wall_elapsed_us"], 21);
         assert_eq!(rows[1]["stage"], "source_prepare");
+    }
+
+    /// [behaviour] Control requests sum per class; the trust timer sums, maxes
+    /// and counts on macOS and is absent elsewhere.
+    #[test]
+    fn offpass_control_counts_classes_and_trust_time() {
+        let (_, rows) = capture(|| {
+            for class in ["status", "status", "other"] {
+                control_class(class);
+                assert!(trust_check(|| true));
+                let mut stage = StageWindow::begin("unknown", "offpass_control_xpc");
+                stage.control = take_control();
+            }
+            flush_offpass();
+        });
+        let control = &rows[0]["counts"]["control"];
+        assert_eq!(
+            (control["status"].as_u64(), control["other"].as_u64()),
+            (Some(2), Some(1))
+        );
+        assert_eq!(
+            control.get("trust_checks").is_some(),
+            cfg!(target_os = "macos")
+        );
+        if cfg!(target_os = "macos") {
+            assert_eq!(control["trust_checks"], 3);
+            assert!(control["trust_us_max"].as_u64() <= control["trust_us_sum"].as_u64());
+        }
     }
 
     #[test]
@@ -3498,11 +3618,15 @@ mod tests {
     }
 
     #[test]
-    fn resource_unavailable_or_regressing_cpu_is_unknown_not_zero() {
-        let sample = |cpu_us| {
+    fn resource_unavailable_or_regressing_cpu_and_disk_are_unknown_not_zero() {
+        let sample = |cpu_us: u64| {
             Some(ProcessSample {
                 cpu_us,
                 lifetime_max_rss_bytes: 4096,
+                disk: Some(DiskBytes {
+                    disk_read_bytes: cpu_us * 100,
+                    disk_written_bytes: cpu_us,
+                }),
             })
         };
         for (before, after) in [
@@ -3514,9 +3638,15 @@ mod tests {
                 Observation::between(12, before, after).shared_process_cpu_delta_us,
                 None
             );
+            let record = serde_json::to_value(Observation::between(12, before, after)).unwrap();
+            assert!(record.get("disk_read_bytes").is_none());
+            assert!(record.get("disk_written_bytes").is_none());
         }
         let result = Observation::between(12, sample(10), sample(17));
         assert_eq!(result.shared_process_cpu_delta_us, Some(7));
+        let record = serde_json::to_value(&result).unwrap();
+        assert_eq!(record["disk_read_bytes"], 700);
+        assert_eq!(record["disk_written_bytes"], 7);
         assert_eq!(result.process_lifetime_max_rss_bytes, Some(4096));
         assert_eq!(result.process_lifetime_max_rss_before_bytes, Some(4096));
         for (before, after) in [
@@ -3527,11 +3657,13 @@ mod tests {
                 Some(ProcessSample {
                     cpu_us: 17,
                     lifetime_max_rss_bytes: 2048,
+                    disk: None,
                 }),
             ),
         ] {
             let record = serde_json::to_value(Observation::between(12, before, after)).unwrap();
             assert!(record["process_lifetime_max_rss_before_bytes"].is_null());
+            assert!(record.get("disk_written_bytes").is_none());
         }
         let rising = Observation::between(
             12,
@@ -3539,6 +3671,7 @@ mod tests {
             Some(ProcessSample {
                 cpu_us: 17,
                 lifetime_max_rss_bytes: 8192,
+                disk: None,
             }),
         );
         assert_eq!(rising.process_lifetime_max_rss_before_bytes, Some(4096));
@@ -3798,6 +3931,9 @@ impl StateV2Probe {
     }
     pub(crate) fn wall_us(&self) -> u64 {
         wall_us(self.started)
+    }
+    pub(crate) fn disk(&self) -> Option<DiskBytes> {
+        DiskBytes::between(self.cpu, process_sample())
     }
     pub(crate) fn memory(&self) -> (StateV2Memory, StateV2Memory) {
         self.footprint

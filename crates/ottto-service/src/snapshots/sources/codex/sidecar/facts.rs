@@ -61,7 +61,9 @@ impl SidecarFacts {
         let reuse = listed.len() == self.homes.kept.len() && before.iter().all(|(home, stamp)| {
             matches!((witness(stamp), self.homes.kept.get(home)), (Some(now), Some((old, _))) if now.same(old))
         });
+        let mut cause = ("", [0; 3]);
         if !reuse {
+            cause = reload_cause(&before, &self.homes.kept);
             self.homes.kept.clear();
         }
         let mut after = BTreeMap::new();
@@ -78,6 +80,8 @@ impl SidecarFacts {
         }
         let mut metadata = CodexTitleMetadata::merge_roots(loaded, reuse);
         metadata.compact_titles();
+        let d = &mut metadata.local_diagnostics;
+        (d.sidecar_reload_cause, d.sidecar_changed_homes) = cause;
         if !reuse {
             // Both complete flags already imply no identity conflict; reuse
             // merges a kept home from its own physical views (merge_roots).
@@ -109,6 +113,8 @@ impl SidecarFacts {
             // A partial group can never be reused; do not retain or charge
             // its otherwise-cacheable homes while another input declines.
             if self.homes.kept.len() != listed.len() {
+                metadata.local_diagnostics.sidecar_keep_declined =
+                    keep_declined(&metadata, &before, &after);
                 self.homes.kept.clear();
             }
             self.charge_homes();
@@ -150,6 +156,50 @@ impl SidecarFacts {
                     .saturating_add(facts)
                     .saturating_add(2 * std::mem::size_of::<usize>())
             });
+    }
+}
+
+type Captured = BTreeMap<PathBuf, [Option<SourceStamp>; 3]>;
+
+/// Content-free cause of a refused reuse: no group kept, another roster, or
+/// per input the sorted-roster positions (below 64) of changed homes.
+fn reload_cause<F>(
+    before: &Captured,
+    kept: &BTreeMap<PathBuf, ([SourceStamp; 3], F)>,
+) -> (&'static str, [u64; 3]) {
+    let mut homes = [0u64; 3];
+    if kept.is_empty() {
+        return ("not_kept", homes);
+    }
+    if !before.keys().eq(kept.keys()) {
+        return ("roster_changed", homes);
+    }
+    for (position, (home, now)) in before.iter().enumerate() {
+        for (input, (now, old)) in now.iter().zip(&kept[home].0).enumerate() {
+            if position < 64 && !now.as_ref().is_some_and(|now| now.same(old)) {
+                homes[input] |= 1 << position;
+            }
+        }
+    }
+    ("stamp_changed", homes)
+}
+
+/// Why a loaded group is not kept, in the order the keep condition checks.
+fn keep_declined(
+    metadata: &CodexTitleMetadata,
+    before: &Captured,
+    after: &BTreeMap<PathBuf, Option<[SourceStamp; 3]>>,
+) -> &'static str {
+    if metadata.state_census_incomplete || metadata.sidecar_census_incomplete {
+        "incomplete"
+    } else if !metadata.identity_conflicts.is_empty() {
+        "conflict"
+    } else if after.iter().any(
+        |(home, after)| matches!((witness(&before[home]), after), (Some(b), Some(a)) if !b.same(a)),
+    ) {
+        "changed_during_load"
+    } else {
+        "unstamped"
     }
 }
 

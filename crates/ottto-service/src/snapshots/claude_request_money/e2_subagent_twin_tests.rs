@@ -143,3 +143,51 @@ fn eligible_copy_without_a_holder_counts() {
         fs::remove_dir_all(a.ancestors().nth(4).unwrap()).unwrap();
     }
 }
+
+/// Which member paths reserve a trace-named side call. A final symlink or a
+/// directory leaves the row to the root fallback, counted once because the
+/// native walk never opens a symlink either (`candidate_from_traversal_path_at`
+/// and the directory listing refuse them). A lookup that fails other than
+/// NotFound may still be a member: reserve it, with one exact hint.
+#[cfg(unix)]
+#[test]
+fn member_path_type_decides_side_call_reservation() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    struct Restore(PathBuf);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+        }
+    }
+    // SAFETY: geteuid() has no preconditions and always succeeds.
+    let superuser = unsafe { libc::geteuid() } == 0;
+    for case in ["symlink", "directory", "denied"] {
+        if case == "denied" && superuser {
+            eprintln!("skipped denied: root bypasses directory permissions");
+            continue;
+        }
+        let root = scratch(&format!("side-call-{case}")).join(format!("{ROOT}.jsonl"));
+        let subagents = root.with_extension("").join("subagents");
+        let member = subagents.join("agent-abc.jsonl");
+        fs::write(&root, b"{}\n").unwrap();
+        fs::create_dir_all(&subagents).unwrap();
+        let _restore = Restore(subagents.clone());
+        match case {
+            "symlink" => symlink(&root, &member).unwrap(),
+            "directory" => fs::create_dir(&member).unwrap(),
+            _ => {
+                fs::write(&member, b"{}\n").unwrap();
+                fs::set_permissions(&subagents, fs::Permissions::from_mode(0o600)).unwrap();
+                let lookup = fs::symlink_metadata(&member).unwrap_err().kind();
+                assert_eq!(lookup, std::io::ErrorKind::PermissionDenied, "precheck");
+            }
+        }
+        let mut discovery = SideCallDiscovery::new(std::iter::once(root.as_path()));
+        take_diag();
+        let reserved = discovery.reserve_member(ROOT, &format!("{ROOT}_agent-abc"));
+        let hints = take_diag().get("side_call_member_hints").copied();
+        let expected = (case == "denied").then_some(1);
+        assert_eq!((reserved, hints), (expected.is_some(), expected), "{case}");
+        assert_eq!(discovery.hints.len(), usize::from(reserved), "{case}");
+    }
+}

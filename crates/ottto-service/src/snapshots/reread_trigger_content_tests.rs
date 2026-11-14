@@ -4,7 +4,8 @@
 // that re-validate the bounded content samples and never read the file
 // again on their own. mtime stays a trigger: it moves only on content
 // writes, including a truncate/regrow the samples cannot see. A new object
-// (device, inode, birth) is output-relevant: the parse consumes it. All
+// (inode, birth) is output-relevant: the parse consumes it; a renumbered
+// device (reboot, remount) is not. All
 // fixtures are synthetic and content-free.
 use super::*;
 use std::io::{Seek, SeekFrom, Write};
@@ -268,6 +269,28 @@ fn same_bytes_under_a_new_inode_read_once_for_its_object_inputs() {
                 .expect("chmod");
             assert_eq!(fixture.rescan(), 0, "{name}: chmod after replace");
         }
+    }
+}
+
+/// [money] A reboot or remount renumbers the volume (st_dev) of a settled
+/// file. The same object under the new device number reads nothing and
+/// keeps its fingerprint.
+#[test]
+fn a_renumbered_device_alone_reads_nothing() {
+    for (source, name, body) in sources() {
+        let mut fixture = Fixture::settled(source, &format!("{name}-remount"), &body);
+        let stored = fixture.fingerprint();
+        let _renumber = crate::transcript_acquisition::DeviceRenumber::by(13);
+        assert_eq!(
+            fixture.rescan(),
+            0,
+            "{name}: a new device number reads nothing"
+        );
+        assert_eq!(
+            fixture.fingerprint(),
+            stored,
+            "{name}: the same fingerprint"
+        );
     }
 }
 

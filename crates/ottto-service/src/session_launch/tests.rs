@@ -82,16 +82,30 @@ fn launcher_permissions_symlinks_and_content() {
         root,
         Path::new("/Applications/Ottto's 雪 $(x)`/ottto"),
         "synthetic",
+        Provider::ClaudeCode,
+        Path::new("/synthetic/project"),
     )
     .unwrap();
     let text = fs::read_to_string(&path).unwrap();
     assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o700);
     assert!(text.contains("launch-check --exec"));
     assert!(text.contains(&id));
-    assert!(!text.contains("project"));
+    assert!(text.contains("Starting Claude Code in project…"));
+    assert!(!text.contains("/synthetic/project"));
+    assert_eq!(
+        path.file_name().unwrap().to_str().unwrap().len(),
+        "claude-12345678.command".len()
+    );
+    assert!(path
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .starts_with("claude-"));
     assert!(!text.contains("CLAUDE_CONFIG_DIR"));
     assert!(text.contains("Ottto'\\''s"));
-    assert_eq!(text.lines().count(), 3);
+    assert!(text.starts_with("#!/bin/sh\nprintf '\\033[3J\\033[H\\033[2J'\n"));
+    assert_eq!(text.lines().count(), 5);
     fs::set_permissions(
         root.join("session-launch"),
         fs::Permissions::from_mode(0o755),
@@ -112,6 +126,204 @@ fn launcher_permissions_symlinks_and_content() {
         launcher_directory(root, true).unwrap_err().reason,
         Reason::LauncherDirUnsafe
     );
+}
+
+/// [regress] Terminal launchers clear the echoed handoff and show only a safe
+/// folder basename, without interpreting shell metacharacters or account data.
+#[test]
+fn launcher_shows_a_safe_line_and_deletes_itself() {
+    let scratch = crate::test_scratch::ScratchDir::new("launcher-greeting");
+    let root = scratch.as_ref();
+    let directory = launcher_directory(root, true).unwrap();
+    let ottto = root.join("fake-ottto");
+    fs::write(
+        &ottto,
+        "#!/bin/sh\n[ \"$1\" = launch-check ] && [ \"$2\" = --exec ]\n",
+    )
+    .unwrap();
+    fs::set_permissions(&ottto, fs::Permissions::from_mode(0o700)).unwrap();
+    for (provider, label, slug) in [
+        (Provider::ClaudeCode, "Claude Code", "claude"),
+        (Provider::Codex, "Codex", "codex"),
+    ] {
+        for folder in [
+            "project",
+            "雪 $(exit 99)`exit 99`%s",
+            "it's",
+            "a\"b",
+            "a\nb",
+            "a\u{1b}b",
+        ] {
+            let cwd = root.join("private-parent").join(folder);
+            let (id, path) =
+                write_launcher(&directory, root, &ottto, "synthetic-secret", provider, &cwd)
+                    .unwrap();
+            let filename = path.file_name().unwrap().to_str().unwrap();
+            assert!(filename.starts_with(&format!("{slug}-")));
+            assert_eq!(filename.len(), slug.len() + 17);
+            let text = fs::read_to_string(&path).unwrap();
+            assert!(!text.contains("private-parent"));
+            assert!(!text.contains("account@example.invalid"));
+            assert!(!text.contains("nickname"));
+            assert!(!text.contains("slot-id"));
+            let output = Command::new("/bin/sh").arg(&path).output().unwrap();
+            assert!(output.status.success());
+            let suffix = if folder
+                .chars()
+                .any(|c| c.is_control() || c == '\'' || c == '"')
+            {
+                String::new()
+            } else {
+                format!(" in {folder}")
+            };
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap(),
+                format!("\u{1b}[3J\u{1b}[H\u{1b}[2JStarting {label}{suffix}…\n")
+            );
+            assert!(output.stderr.is_empty());
+            assert!(!path.exists());
+            assert!(!filename.contains(&id));
+        }
+    }
+}
+
+/// [behaviour] Startup removes both generations of launchers without following
+/// a symlink or deleting unrelated files in the owner-only launcher directory.
+#[test]
+fn startup_cleans_short_and_legacy_launcher_names() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    let scratch = crate::test_scratch::ScratchDir::new("launch-recovery");
+    let root = scratch.as_ref();
+    let _directory = launcher_directory(root, true).unwrap();
+    let dir = root.join("session-launch");
+    let outside = root.join("keep");
+    fs::write(&outside, "synthetic").unwrap();
+    for name in [
+        "claude-1234abcd.command",
+        "codex-1234abcd.command",
+        "ottto-lch_legacy.command",
+    ] {
+        symlink(&outside, dir.join(name)).unwrap();
+    }
+    fs::write(dir.join("keep.txt"), "synthetic").unwrap();
+    unsafe { std::env::set_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", root) };
+    recover_at_startup();
+    assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+    assert!(dir.join("keep.txt").exists());
+    assert_eq!(fs::read_to_string(outside).unwrap(), "synthetic");
+    unsafe { std::env::remove_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR") };
+}
+
+/// [regress] Prepare tolerates one in-place update, symlink swap or overloaded
+/// version probe; a repeated failure refuses and unsupported output never retries.
+#[test]
+fn prepare_cli_retries_transient_failures_once() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    let scratch = crate::test_scratch::ScratchDir::new("launch-cli-retry");
+    let root = scratch.canonicalize().unwrap();
+    let bin = root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    unsafe { std::env::set_var("OTTTO_COMMAND_SEARCH_PATH", &bin) };
+    let binding = fixture_binding(&root);
+    let cli = bin.join("claude");
+    let witness = root.join("probes");
+    let flag = root.join("updated");
+    let quote = |path: &Path| quote_launch_executable(path.to_str().unwrap()).unwrap();
+    for case in [
+        "symlink",
+        "in-place",
+        "timeout-once",
+        "changed-twice",
+        "timeout-twice",
+        "unsupported",
+    ] {
+        let _ = fs::remove_file(&cli);
+        let _ = fs::remove_file(&witness);
+        let _ = fs::remove_file(&flag);
+        let initial = root.join("initial");
+        let next = root.join("next");
+        let swapped = bin.join("swapped");
+        let success = "printf '2.1.322 (Claude Code)\\n'\n";
+        let action = match case {
+            "symlink" => format!(
+                "/bin/ln -s {} {}\n/bin/mv -f {} {}\n",
+                quote(&next),
+                quote(&swapped),
+                quote(&swapped),
+                quote(&cli)
+            ),
+            "in-place" | "changed-twice" => "printf '# updated\\n' >> \"$0\"\n".into(),
+            "timeout-once" => format!(
+                "[ -f {} ] || {{ printf 'first\\n' > {}; /bin/sleep 30; }}\n",
+                quote(&flag),
+                quote(&flag)
+            ),
+            "timeout-twice" => "/bin/sleep 30\n".into(),
+            "unsupported" => String::new(),
+            _ => unreachable!(),
+        };
+        // Mutate just once for the in-place recovery case, always for refusal.
+        let action = if case == "in-place" {
+            format!(
+                "[ -f {} ] || {{ {action}/usr/bin/touch {}; }}\n",
+                quote(&flag),
+                quote(&flag)
+            )
+        } else {
+            action
+        };
+        let version = if case == "unsupported" {
+            "printf 'unsupported\\n'\n"
+        } else {
+            success
+        };
+        fs::write(
+            &initial,
+            format!(
+                "#!/bin/sh\nprintf 'probe\\n' >> {}\n{action}{version}",
+                quote(&witness)
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &next,
+            format!(
+                "#!/bin/sh\nprintf 'probe\\n' >> {}\n{success}",
+                quote(&witness)
+            ),
+        )
+        .unwrap();
+        for path in [&initial, &next] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        symlink(&initial, &cli).unwrap();
+        let result = prepare_cli(&binding, &root);
+        match case {
+            "changed-twice" => assert_eq!(result.err().unwrap().reason, Reason::CliChanged),
+            "timeout-twice" | "unsupported" => {
+                assert_eq!(result.err().unwrap().reason, Reason::CliVersionUnsupported)
+            }
+            _ => {
+                let prepared = result.ok().unwrap();
+                assert_eq!(prepared.version, "2.1.322");
+                assert_eq!(
+                    prepared.program,
+                    if case == "symlink" { next } else { initial }
+                );
+                assert!(program_identity(&prepared.program).as_ref() == Some(&prepared.identity));
+            }
+        }
+        let probes = fs::read_to_string(&witness).unwrap();
+        assert_eq!(
+            probes.lines().filter(|line| *line == "probe").count(),
+            if case == "unsupported" { 1 } else { 2 }
+        );
+    }
+    unsafe { std::env::remove_var("OTTTO_COMMAND_SEARCH_PATH") };
 }
 
 #[test]
@@ -704,6 +916,204 @@ fn codex_launch_and_nickname_read_only_saved_proof_and_never_probe_login() {
     for key in ambient_keys {
         unsafe { std::env::remove_var(key) };
     }
+}
+
+/// [regress] Codex refreshes its login only when due, so a launch must not
+/// need a live id token. Default and managed slot, through the real prepare:
+/// an expired id token beside a live access token is admitted; an expired
+/// access token is admitted while `auth.json` is unchanged since the saved
+/// validated reading and still names it, and refused once rewritten
+/// (SlotNeedsLogin); another pair is AccountMismatch.
+#[test]
+fn codex_launch_admits_a_held_login_without_a_live_id_token() {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use ottto_core::CodexHomeTrust;
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    let scratch = crate::test_scratch::ScratchDir::new("codex-launch-held");
+    let canonical_root = scratch.canonicalize().expect("canonical scratch directory");
+    let root = canonical_root.as_path();
+    let (account, org) = codex_login_fixture(root);
+    let home = root.join("home");
+    let codex = home.join(".codex");
+    let support = root.join("support");
+    let project = root.join("project");
+    let bin = root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o700)).unwrap();
+    unsafe { std::env::set_var("OTTTO_COMMAND_SEARCH_PATH", &bin) };
+    fs::write(
+        bin.join("codex"),
+        "#!/bin/sh\n[ \"$1\" = --version ] || exit 99\nprintf 'codex-cli 0.170.0\\n'\n",
+    )
+    .unwrap();
+    fs::set_permissions(bin.join("codex"), fs::Permissions::from_mode(0o700)).unwrap();
+    let user = LaunchUser {
+        home: home.clone(),
+        name: "synthetic".into(),
+    };
+    let saved_path = |dir: &Path| {
+        let mut hash = Sha256::new();
+        hash.update(b"ottto:codex-quota-home:v1\0");
+        hash.update(dir.as_os_str().as_encoded_bytes());
+        support
+            .join("codex-quota/homes")
+            .join(format!("{:x}", hash.finalize()))
+            .join("saved-quota.json")
+    };
+    // A managed slot accepted for the same pair, with the default's saved
+    // reading. Registered only for its own cases: it then shadows the default.
+    let register_managed = || {
+        let store = ottto_core::FileCodexAccountSlotSettingsStore::default();
+        let schema = ottto_protocol::CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION;
+        let operation = "codex_setup_0123456789abcdef0123456789abcdef";
+        let slot = store
+            .prepare_managed_account(schema, operation.to_string(), account.clone(), org.clone())
+            .unwrap()
+            .managed_slots[0]
+            .slot_id
+            .clone();
+        store
+            .finish_validation(
+                schema,
+                operation,
+                account.clone(),
+                org.clone(),
+                "workspace-one",
+                false,
+            )
+            .unwrap();
+        // A named setup signs in to a staging home; the verified login is
+        // published into the slot's home.
+        let staging = store.setup_sign_in_home(&slot).unwrap();
+        fs::write(staging.join("auth.json"), b"{}").unwrap();
+        fs::set_permissions(staging.join("auth.json"), fs::Permissions::from_mode(0o600)).unwrap();
+        store
+            .complete_pinned_verification(
+                schema,
+                operation,
+                &account,
+                &org,
+                ottto_core::codex_auth_file_mark(&staging),
+            )
+            .unwrap();
+        let managed = store.slot_home(&slot).unwrap();
+        let mut saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(saved_path(&codex)).unwrap()).unwrap();
+        saved["reading"]["login"]
+            .as_object_mut()
+            .unwrap()
+            .remove("auth");
+        let managed_saved = saved_path(&managed);
+        saved["home_key"] = serde_json::json!(managed_saved
+            .parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap());
+        fs::create_dir_all(managed_saved.parent().unwrap()).unwrap();
+        fs::write(&managed_saved, serde_json::to_vec(&saved).unwrap()).unwrap();
+        (slot, managed)
+    };
+
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let jwt = |expires_at: i64| {
+        let claims = serde_json::json!({"iss":"https://auth.openai.com","aud":"synthetic","exp":expires_at,
+            "https://api.openai.com/auth":{"chatgpt_user_id":"user-one","chatgpt_account_id":"workspace-one"}});
+        format!(
+            "{}.{}.synthetic-signature",
+            URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256"}"#),
+            URL_SAFE_NO_PAD.encode(claims.to_string())
+        )
+    };
+    let pair = Some((account.clone(), org.clone()));
+    let other = billing_identity_hash("openai", "account", "user-two").unwrap();
+    for managed in [false, true] {
+        let (slot, dir, trust) = if managed {
+            let (slot, dir) = register_managed();
+            (slot, dir, CodexHomeTrust::Managed)
+        } else {
+            (
+                "default".to_string(),
+                codex.clone(),
+                CodexHomeTrust::ProviderDefault,
+            )
+        };
+        let slot = slot.as_str();
+        let auth = dir.join("auth.json");
+        let write_auth = |access_expires_at: i64, id_expires_at: i64| {
+            let body = serde_json::json!({"auth_mode":"chatgpt","OPENAI_API_KEY":"synthetic-exchanged-key",
+                "tokens":{"account_id":"workspace-one","access_token":jwt(access_expires_at),"id_token":jwt(id_expires_at)}});
+            fs::write(&auth, serde_json::to_vec(&body).unwrap()).unwrap();
+            fs::set_permissions(&auth, fs::Permissions::from_mode(0o600)).unwrap();
+        };
+        // The saved validated reading records this `auth.json` as its witness.
+        let pin_witness = || {
+            let metadata = fs::metadata(&auth).unwrap();
+            let modified = metadata
+                .modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap();
+            let path = saved_path(&dir);
+            let mut saved: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            saved["reading"]["login"]["auth"] = serde_json::json!({"modified_secs":modified.as_secs(),
+                "modified_nanos":modified.subsec_nanos(),"len":metadata.len()});
+            fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+        };
+        let prepare = |account: &str| {
+            Registry::default().prepare_for_user(
+                Provider::Codex,
+                slot,
+                account,
+                &org,
+                SessionLaunchFolderV1 {
+                    path: Some(project.to_string_lossy().into_owned()),
+                    recent_id: None,
+                },
+                Some(test_executable()),
+                &support,
+                user.clone(),
+            )
+        };
+        let identity = || crate::agent_status::session_launch_codex_identity(&dir, trust);
+
+        write_auth(now + 3600, now - 60);
+        assert!(
+            prepare(&account).is_ok(),
+            "{slot}: expired id token, live access token"
+        );
+
+        write_auth(now - 60, now - 60);
+        pin_witness();
+        assert!(
+            prepare(&account).is_ok(),
+            "{slot}: expired access token, unchanged file"
+        );
+        assert_eq!(identity(), pair, "{slot}");
+
+        let mut body = fs::read(&auth).unwrap();
+        body.push(b' ');
+        fs::write(&auth, body).unwrap();
+        assert_eq!(
+            prepare(&account).err().unwrap().reason,
+            Reason::SlotNeedsLogin,
+            "{slot}: expired access token, rewritten file"
+        );
+        assert_eq!(identity(), None, "{slot}");
+
+        write_auth(now + 3600, now + 3600);
+        assert_eq!(
+            prepare(&other).err().unwrap().reason,
+            Reason::AccountMismatch,
+            "{slot}: another pair"
+        );
+    }
+    unsafe { std::env::remove_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR") };
+    unsafe { std::env::remove_var("OTTTO_COMMAND_SEARCH_PATH") };
 }
 
 /// [regress] A stale Codex CLI earlier in the search order failed its version

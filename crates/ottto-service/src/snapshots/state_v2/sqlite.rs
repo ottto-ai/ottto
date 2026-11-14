@@ -335,6 +335,8 @@ pub(super) struct Txn<'a> {
     dirty_bytes: u64,
     estimated_pages: u64,
     dirty_rows: u64,
+    /// Charged (rows, bytes) per record kind, `meta` or `shared_set`.
+    kinds: BTreeMap<String, (u64, u64)>,
 }
 impl Drop for Txn<'_> {
     fn drop(&mut self) {
@@ -807,6 +809,7 @@ impl Sqlite {
                 dirty_bytes: 0,
                 estimated_pages: 0,
                 dirty_rows: 0,
+                kinds: BTreeMap::new(),
             };
             tx.put(RowInput {
                 value_version: 1,
@@ -879,7 +882,7 @@ impl Sqlite {
             self.stats.erasure_pending_marks = 0;
             self.stats.dirty_rows_per_save = 0;
             self.stats.encoded_bytes_per_save = 0;
-            self.maintenance(false)?;
+            self.maintenance_unprinted()?;
         }
         if mode == TxnMode::Write {
             migrations::begin_write(self.conn()?)?;
@@ -902,6 +905,7 @@ impl Sqlite {
             dirty_bytes: 0,
             estimated_pages: 0,
             dirty_rows: 0,
+            kinds: BTreeMap::new(),
         })
     }
     pub(super) fn checkpoint(&mut self, mode: CheckpointMode) -> CheckpointResult {
@@ -1242,10 +1246,17 @@ fn systemic(error: &anyhow::Error) -> bool {
 const SAVE_TARGET_BYTES: u64 = 32 * 1024 * 1024;
 const PATH_DIFF_BUDGET_BYTES: usize = 32 * 1024 * 1024;
 impl Txn<'_> {
-    fn charge(&mut self, bytes: u64, rows: u64, pages: u64) -> Result<()> {
+    fn charge(&mut self, key: &RowKey, bytes: u64, rows: u64, pages: u64) -> Result<()> {
         if self.store.import {
             return Ok(());
         }
+        let kind = match key {
+            RowKey::Record { kind, .. } => kind.name(),
+            RowKey::Meta(_) => "meta",
+            RowKey::RequestSet(_) => "shared_set",
+        };
+        let tally = self.kinds.entry(kind.to_owned()).or_default();
+        *tally = (tally.0.saturating_add(rows), tally.1.saturating_add(bytes));
         self.dirty_rows = self.dirty_rows.saturating_add(rows);
         self.dirty_bytes = self.dirty_bytes.saturating_add(bytes);
         self.estimated_pages = self.estimated_pages.saturating_add(pages);
@@ -1289,7 +1300,7 @@ impl Txn<'_> {
             .saturating_add(key_bytes.saturating_mul(2))
             .saturating_add(rows.saturating_mul(key_bytes + 512));
         let pages = charged.div_ceil(4096).saturating_mul(2).saturating_add(16);
-        self.charge(charged, rows, pages)
+        self.charge(key, charged, rows, pages)
     }
     fn remember_paths(&mut self, old: &Header) -> Result<()> {
         // Binary: no paths to extract. Its owner marks erasure explicitly.
@@ -1618,6 +1629,7 @@ impl Transaction for Txn<'_> {
         let shared_erasure = (self.shared_erasure, self.bookkeeping_erasure);
         let deltas = (self.record_delta, self.file_delta);
         let dirty = (self.dirty_bytes, self.estimated_pages, self.dirty_rows);
+        let kinds = self.kinds.clone();
         let save_failure = self.store.save_failure;
         let result = body(&mut *self);
         if let Err(error) = &result {
@@ -1646,6 +1658,7 @@ impl Transaction for Txn<'_> {
             (self.shared_erasure, self.bookkeeping_erasure) = shared_erasure;
             (self.record_delta, self.file_delta) = deltas;
             (self.dirty_bytes, self.estimated_pages, self.dirty_rows) = dirty;
+            self.kinds = kinds;
             self.store.save_failure = save_failure;
             self.failed = false;
         }
@@ -1797,6 +1810,7 @@ impl Txn<'_> {
             if !self.store.import {
                 telemetry::save_work(self.dirty_rows, self.dirty_bytes);
                 telemetry::event("save_estimated_pages", &self.estimated_pages);
+                telemetry::event("save_kinds", &self.kinds);
             }
             self.store.stats.record_rows = self
                 .store

@@ -86,7 +86,7 @@ pub(super) fn empty_ack() -> SnapshotBatchResponse {
 }
 
 /// The server stored the body and returns its new head with the exact echo.
-fn accepted(item: &SnapshotItem, head: &str) -> SnapshotBatchResponse {
+pub(super) fn accepted(item: &SnapshotItem, head: &str) -> SnapshotBatchResponse {
     let version = crate::snapshot_client::snapshot_ack_body_witness_version(item).unwrap();
     let mut ack = empty_ack();
     ack.accepted = 1;
@@ -100,7 +100,7 @@ fn accepted(item: &SnapshotItem, head: &str) -> SnapshotBatchResponse {
 }
 
 /// The server's CAS check refused the base and minted a rescan challenge.
-fn conflict(item: &SnapshotItem, challenge: &str) -> SnapshotBatchResponse {
+pub(super) fn conflict(item: &SnapshotItem, challenge: &str) -> SnapshotBatchResponse {
     let mut ack = empty_ack();
     ack.conflict_entities.push(SnapshotEntityRef {
         head_challenge: Some(challenge.to_string()),

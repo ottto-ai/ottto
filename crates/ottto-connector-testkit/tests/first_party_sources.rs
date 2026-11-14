@@ -10,7 +10,6 @@ use ottto_connector_testkit::{
 };
 use serde::Deserialize;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 const SOURCE_FIELDS: &[&str] = &[
     "schema_version",
@@ -287,17 +286,17 @@ fn assert_collector_fixture(
         },
     );
     if source.manifest.source_id == "codex" && collector.manifest.collector_id == "cloud_sessions" {
-        assert_cloud_session_fixture_digests(fixture);
+        assert_cloud_session_fixture_wire(fixture);
     }
 }
 
-fn assert_cloud_session_fixture_digests(fixture: &LoadedFixture) {
+fn assert_cloud_session_fixture_wire(fixture: &LoadedFixture) {
     for record in &fixture.payload.emitted_records {
         let sample = &record.sample;
         assert_eq!(
             sample.get("schema_version").and_then(Value::as_str),
-            Some("cloud_session_observation_chunk.v2"),
-            "{} must carry the strict v2 chunk schema",
+            Some("cloud_session_changes.v1"),
+            "{} must carry the cloud_session_changes.v1 request schema",
             fixture.path.display()
         );
         for field in ["grant_scope_fingerprint", "account_fingerprint"] {
@@ -308,60 +307,40 @@ fn assert_cloud_session_fixture_digests(fixture: &LoadedFixture) {
             .and_then(Value::as_array)
             .unwrap_or_else(|| panic!("{} has no observations", fixture.path.display()));
         assert!(
-            !observations.is_empty(),
-            "{} is empty",
+            (1..=200).contains(&observations.len()),
+            "{} must carry 1..200 observations",
             fixture.path.display()
         );
-
-        let mut identity_keys = Vec::new();
-        let mut semantics = Vec::new();
+        let mut keys = BTreeSet::new();
         for observation in observations {
             let entity_key = observation
                 .get("entity_key")
                 .and_then(Value::as_str)
                 .unwrap_or_else(|| panic!("{} has no entity_key", fixture.path.display()));
             assert!(
-                valid_prefixed_lower_hex(entity_key, "hmac-sha256:", 64),
-                "{} has a noncanonical entity_key",
+                valid_prefixed_lower_hex(entity_key, "hmac-sha256:", 64)
+                    && keys.insert(entity_key.to_string()),
+                "{} has a noncanonical or repeated entity_key",
                 fixture.path.display()
             );
-            identity_keys.push(entity_key.as_bytes().to_vec());
-            let mut semantic = observation.clone();
-            let object = semantic
-                .as_object_mut()
-                .expect("cloud-session fixture observation is an object");
-            object.remove("observed_at");
-            object.remove("collected_at");
-            semantics.push((entity_key.to_string(), semantic));
+            // The predecessor etag is always present: null or 64 lowercase hex.
+            match observation.get("expected_head_etag") {
+                Some(Value::Null) => {}
+                Some(Value::String(etag)) => assert!(
+                    valid_prefixed_lower_hex(etag, "", 64),
+                    "{} has a noncanonical expected_head_etag",
+                    fixture.path.display()
+                ),
+                _ => panic!("{} lacks expected_head_etag", fixture.path.display()),
+            }
+            for local_only in ["semantic_digest", "observed_at", "cursor"] {
+                assert!(
+                    observation.get(local_only).is_none(),
+                    "{} uploads local-only {local_only}",
+                    fixture.path.display()
+                );
+            }
         }
-        identity_keys.sort_unstable();
-        identity_keys.dedup();
-        let mut framed = Vec::new();
-        for key in identity_keys {
-            framed.extend_from_slice(&(key.len() as u64).to_be_bytes());
-            framed.extend_from_slice(&key);
-        }
-        let expected_identity = format!("sha256:{:x}", Sha256::digest(&framed));
-        assert_eq!(
-            sample.get("chunk_identity_digest").and_then(Value::as_str),
-            Some(expected_identity.as_str()),
-            "{} identity digest drifted from its observations",
-            fixture.path.display()
-        );
-
-        semantics.sort_by(|left, right| left.0.cmp(&right.0));
-        let canonical = semantics
-            .into_iter()
-            .map(|(_, value)| value)
-            .collect::<Vec<_>>();
-        let semantic_bytes = serde_json::to_vec(&canonical).unwrap();
-        let expected_semantic = format!("sha256:{:x}", Sha256::digest(&semantic_bytes));
-        assert_eq!(
-            sample.get("chunk_semantic_digest").and_then(Value::as_str),
-            Some(expected_semantic.as_str()),
-            "{} semantic digest drifted from its observations",
-            fixture.path.display()
-        );
     }
 }
 

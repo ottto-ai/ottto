@@ -220,6 +220,10 @@ pub(in super::super) fn set_path_diff_budget(db: &mut Sqlite, bytes: usize) {
 pub(in super::super) fn dirty_rows_for_test(db: &Sqlite) -> u64 {
     db.stats.dirty_rows_per_save
 }
+/// Bytes the last committed save charged to the save target.
+pub(in super::super) fn dirty_bytes_for_test(db: &Sqlite) -> u64 {
+    db.stats.encoded_bytes_per_save
+}
 
 type ReopenHook = Box<dyn FnOnce(&Path)>;
 thread_local! {
