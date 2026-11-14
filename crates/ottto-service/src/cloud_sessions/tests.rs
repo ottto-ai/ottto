@@ -2804,7 +2804,7 @@ fn not_connected_is_zero_touch_and_connecting_activates_without_restart() {
                         "device-secret".to_string(),
                     ))
                 },
-                compose_transport: |binding, _| {
+                compose_transport: |binding: CloudSessionRuntimeBinding, _: String| {
                     assert_eq!(
                         (binding.organization_id.as_str(), binding.user_id.as_str()),
                         (ORG_ID, USER_ID)
@@ -3161,7 +3161,9 @@ fn relay_reads_the_hint_and_maps_refusals_on_the_exact_routes() {
         ),
         refused(410, "cloud_sessions_contract_retired", None)
     );
-    let missing = relay.read_hint(Duration::from_secs(5)).unwrap_err();
+    let Err(missing) = relay.read_hint(Duration::from_secs(5)) else {
+        panic!("a missing hint route must fail");
+    };
     assert!(missing
         .downcast_ref::<crate::snapshot_client::CloudSessionRouteUnsupported>()
         .is_some());
