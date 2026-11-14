@@ -56,47 +56,85 @@ impl SidecarFacts {
             .iter()
             .map(|home| (home.clone(), capture(home)))
             .collect::<BTreeMap<_, _>>();
-        // Every retained prefix depends on the complete merged group. A
-        // changed roster, failed pass or changed input reloads the group.
-        let reuse = listed.len() == self.homes.kept.len() && before.iter().all(|(home, stamp)| {
+        // Each home is reused while its own stamps match; the others reload.
+        let exact = listed.len() == self.homes.kept.len() && before.iter().all(|(home, stamp)| {
             matches!((witness(stamp), self.homes.kept.get(home)), (Some(now), Some((old, _))) if now.same(old))
         });
-        let mut cause = ("", [0; 3]);
-        if !reuse {
-            cause = reload_cause(&before, &self.homes.kept);
-            self.homes.kept.clear();
-        }
+        let cause = if exact {
+            ("", [0; 3])
+        } else {
+            reload_cause(&before, &self.homes.kept)
+        };
+        self.homes.retain_listed(&listed);
+        let mut reused = BTreeSet::new();
         let mut after = BTreeMap::new();
         let mut loaded = BTreeMap::new();
         for home in &listed {
-            let raw = if reuse {
-                self.homes.kept[home].1.clone()
-            } else {
-                let (facts, witness) = load_home(home, &before[home]);
-                after.insert(home.clone(), witness);
-                Arc::new(facts)
+            let raw = match (witness(&before[home]), self.homes.kept.get(home)) {
+                (Some(now), Some((old, facts))) if now.same(old) => {
+                    reused.insert(home.clone());
+                    facts.clone()
+                }
+                _ => {
+                    let (facts, witness) = load_home(home, &before[home]);
+                    after.insert(home.clone(), witness);
+                    Arc::new(facts)
+                }
             };
             loaded.insert(home.clone(), raw);
         }
-        let mut metadata = CodexTitleMetadata::merge_roots(loaded, reuse);
+        let mut metadata = CodexTitleMetadata::merge_roots(loaded, &reused);
         metadata.compact_titles();
+        // A reused home's views and title prefixes are exact only while the
+        // merged pass has no identity conflict and its title inputs are
+        // unchanged. Otherwise drop every kept home and load this pass cold
+        // once: with nothing kept, nothing is reused or checked again.
+        if !exact && !reused.is_empty() {
+            let fallback = if !metadata.identity_conflicts.is_empty() {
+                "conflict"
+            } else if reused.iter().any(|home| {
+                let facts = &metadata.root_sidecars[home];
+                facts.title_inputs != metadata.title_inputs(facts)
+            }) {
+                "title_inputs"
+            } else {
+                ""
+            };
+            if !fallback.is_empty() {
+                self.homes.kept.clear();
+                let mut metadata = self.load(roots);
+                let d = &mut metadata.local_diagnostics;
+                (d.sidecar_reload_cause, d.sidecar_changed_homes) = (fallback, cause.1);
+                return metadata;
+            }
+        }
         let d = &mut metadata.local_diagnostics;
         (d.sidecar_reload_cause, d.sidecar_changed_homes) = cause;
-        if !reuse {
-            // Both complete flags already imply no identity conflict; reuse
-            // merges a kept home from its own physical views (merge_roots).
+        if !exact {
+            // Both complete flags already imply no identity conflict.
             if !metadata.state_census_incomplete
                 && !metadata.sidecar_census_incomplete
                 && metadata.identity_conflicts.is_empty()
             {
+                let inputs = metadata
+                    .root_sidecars
+                    .iter()
+                    .filter(|(home, _)| !reused.contains(*home))
+                    .map(|(home, facts)| (home.clone(), metadata.title_inputs(facts)))
+                    .collect::<BTreeMap<_, _>>();
                 for (home, facts) in &mut metadata.root_sidecars {
+                    if reused.contains(home) {
+                        continue;
+                    }
                     if let Some(unique) = Arc::get_mut(facts) {
                         // The views hold these rows' merged result.
                         unique.raw.threads = Vec::new();
                         unique.raw.history = Vec::new();
+                        unique.title_inputs = inputs[home];
                     }
                     // The helper consumes the captures already made around
                     // acquisition; compaction must finish before sharing.
+                    // An unstamped or changed home is dropped, not kept.
                     let mut stamps = [witness(&before[home]), after[home].clone()].into_iter();
                     let _: Result<_, std::convert::Infallible> = self.homes.reuse_or_load(
                         home.clone(),
@@ -109,13 +147,12 @@ impl SidecarFacts {
                         || Ok(facts.clone()),
                     );
                 }
+            } else {
+                self.homes.kept.clear();
             }
-            // A partial group can never be reused; do not retain or charge
-            // its otherwise-cacheable homes while another input declines.
             if self.homes.kept.len() != listed.len() {
                 metadata.local_diagnostics.sidecar_keep_declined =
                     keep_declined(&metadata, &before, &after);
-                self.homes.kept.clear();
             }
             self.charge_homes();
         }
@@ -161,8 +198,10 @@ impl SidecarFacts {
 
 type Captured = BTreeMap<PathBuf, [Option<SourceStamp>; 3]>;
 
-/// Content-free cause of a refused reuse: no group kept, another roster, or
-/// per input the sorted-roster positions (below 64) of changed homes.
+/// Content-free cause of a pass that is not the exact kept group: no home
+/// kept, another roster, or per input the sorted-roster positions (below 64)
+/// of changed homes. A cold fallback (`load`) replaces the cause with
+/// `conflict` or `title_inputs` and keeps these positions.
 fn reload_cause<F>(
     before: &Captured,
     kept: &BTreeMap<PathBuf, ([SourceStamp; 3], F)>,
