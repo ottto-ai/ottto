@@ -5072,6 +5072,215 @@ fn codex_probe_never_forces_a_refresh_on_any_home() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// A fake Codex whose `debug models --bundled` prints `dir/bundled.json`,
+/// logging every argv. Its app-server exits while `dir/refuse` exists if it
+/// was given a model list, and checks at `account/read` that the list it was
+/// given is still readable and is exactly the bundled one.
+const FAKE_CODEX_BUNDLED_LIST: &str = r#"import json
+import os
+import sys
+
+here = os.path.dirname(os.path.abspath(__file__))
+args = sys.argv[1:]
+with open(os.path.join(here, "argv.log"), "a") as log:
+    log.write(json.dumps(args) + "\n")
+if args == ["login", "status"]:
+    print("Logged in")
+    sys.exit(0)
+if args == ["debug", "models", "--bundled"]:
+    with open(os.path.join(here, "bundled.json")) as bundled:
+        print(bundled.read())
+    sys.exit(0)
+if args[-2:] != ["app-server", "--stdio"]:
+    sys.exit(1)
+lists = [arg[len("model_catalog_json="):] for arg in args if arg.startswith("model_catalog_json=")]
+if lists and os.path.exists(os.path.join(here, "refuse")):
+    sys.exit(1)
+
+def listed():
+    path = lists[0][1:-1] if lists[0].startswith("'") else json.loads(lists[0])
+    with open(path) as given, open(os.path.join(here, "bundled.json")) as bundled:
+        return json.load(given) == json.load(bundled)
+
+for line in sys.stdin:
+    if '"id":1' in line:
+        print('{"id":1,"result":{"userAgent":"fake"}}', flush=True)
+    if '"id":"ottto_account"' in line:
+        if lists and not listed():
+            sys.exit(4)
+        print('{"id":"ottto_account","result":{"account":{"type":"chatgpt","email":"synthetic-user","planType":"pro"},"requiresOpenaiAuth":true}}', flush=True)
+    if "account/rateLimits/read" in line:
+        print('{"id":"ottto_rate_limits","result":{"rateLimitResetCredits":{"availableCount":2},"rateLimitsByLimitId":{},"rateLimits":{}}}', flush=True)
+"#;
+
+/// [behaviour] The limits probe hands Codex the bundled model list that the
+/// same binary printed, so it sends no models request (one fewer counted):
+/// on the probe's argv only, only while the saved bytes are intact and the
+/// binary is unchanged. A probe given the list that ends without an
+/// `account/read` answer stops its use until the binary changes; only the
+/// first save after a restart prunes old files.
+#[cfg(unix)]
+#[test]
+#[serial]
+fn codex_probe_passes_the_binary_s_own_bundled_model_list() {
+    use crate::provider_calls::CallKind;
+    let root = crate::test_scratch::ScratchDir::canonical("codex-probe-model-list");
+    let bin = root.join("bin");
+    let home = root.join("codex-home");
+    let support = root.join("sup\"port dir");
+    for dir in [&bin, &home, &support] {
+        std::fs::create_dir_all(dir).expect("fixture dir");
+    }
+    write_fake_codex_script(&bin, FAKE_CODEX_BUNDLED_LIST);
+    let bundled = r#"{"models":[{"id":"gpt-5","instructions":"synthetic"}]}"#;
+    std::fs::write(bin.join("bundled.json"), bundled).expect("bundled list");
+    let _commands =
+        EnvVarGuard::set_os("OTTTO_COMMAND_SEARCH_PATH", bin.as_os_str().to_os_string());
+    let _support = EnvVarGuard::set_os(
+        "OTTTO_LOCAL_PLATFORM_SUPPORT_DIR",
+        support.as_os_str().to_os_string(),
+    );
+    let lists = support.join("codex-probe");
+    let saved = || {
+        let mut names = std::fs::read_dir(&lists)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    };
+    let meta = || assert!(codex_cli_meta(&home, false, false).0.is_ok());
+    // The list the last probe was given, if any.
+    let probe = || {
+        let result = call_codex_app_server_rate_limits_for_home(
+            &home,
+            CodexHomeTrust::Managed,
+            &|_, _, _| false,
+        );
+        let log = std::fs::read_to_string(bin.join("argv.log")).expect("argv log");
+        let argv: Vec<String> = serde_json::from_str(log.lines().last().unwrap()).unwrap();
+        assert_eq!(
+            &argv[..4],
+            [
+                "-c",
+                "skills.bundled.enabled=false",
+                "-c",
+                "features.plugins=false"
+            ]
+        );
+        assert_eq!(&argv[argv.len() - 2..], ["app-server", "--stdio"]);
+        let given = match argv.len() {
+            6 => None,
+            8 => {
+                assert_eq!(argv[4], "-c");
+                let value = argv[5]
+                    .strip_prefix("model_catalog_json=")
+                    .expect("override");
+                let config: toml_edit::DocumentMut =
+                    format!("v = {value}").parse().expect("TOML value");
+                Some(PathBuf::from(config["v"].as_str().expect("quoted path")))
+            }
+            _ => panic!("unexpected argv {argv:?}"),
+        };
+        (result, given)
+    };
+
+    // The meta pass saves the list; the probe gets it, quoted, readable
+    // through the session.
+    assert!(probe().1.is_none(), "no list before the meta pass");
+    meta();
+    let first = saved();
+    assert_eq!(first.len(), 1);
+    assert_eq!(std::fs::read_to_string(&first[0]).unwrap().trim(), bundled);
+    let (result, given) = probe();
+    result.expect("probe with the list");
+    assert_eq!(given.as_ref(), Some(&first[0]));
+
+    // Changed bytes: no list, until the next meta pass rewrites it.
+    std::fs::write(&first[0], &bundled[..10]).expect("torn list");
+    let (result, given) = probe();
+    result.expect("probe without the list");
+    assert_eq!(given, None);
+    meta();
+    assert_eq!(probe().1.as_ref(), Some(&first[0]));
+
+    // A new binary with its own list: none until its own meta pass, which
+    // keeps the previous binary's file. Giving up on the old binary later
+    // leaves the new one's list in use.
+    let old_binary = cli_binary_stamp("codex").expect("old binary");
+    let new_binary = |comment: &str, list: &str| {
+        std::fs::write(bin.join("bundled.json"), list).expect("bundled list");
+        let launcher = format!(
+            "#!/bin/sh\n# {comment}\nexec /usr/bin/python3 '{}' \"$@\"\n",
+            bin.join("fake_codex.py").display()
+        );
+        crate::test_scratch::write_executable(&bin.join("codex"), launcher.as_bytes(), 0o755);
+    };
+    new_binary(
+        "new build",
+        r#"{"models":[{"id":"gpt-5","instructions":"two"}]}"#,
+    );
+    assert_eq!(probe().1, None);
+    meta();
+    let second = saved();
+    assert_eq!(second.len(), 2);
+    let (result, given) = probe();
+    result.expect("probe with the new list");
+    let given = given.expect("new list");
+    assert_ne!(given, first[0]);
+    assert!(second.contains(&given));
+    codex_probe_catalog::give_up(&old_binary);
+    assert_eq!(probe().1.as_ref(), Some(&given));
+
+    // A probe given the list that ends with no account answer: later probes
+    // run without it, even after another meta pass.
+    std::fs::write(bin.join("refuse"), b"").expect("refuse");
+    let (result, given) = probe();
+    assert!(result.is_err());
+    assert!(given.is_some());
+    std::fs::remove_file(bin.join("refuse")).expect("accept again");
+    meta();
+    assert_eq!(probe().1, None);
+
+    // The first save after a restart prunes every other file.
+    new_binary(
+        "newer build",
+        r#"{"models":[{"id":"gpt-5","instructions":"three"}]}"#,
+    );
+    codex_probe_catalog::forget_for_restart();
+    meta();
+    let third = saved();
+    assert_eq!(third.len(), 1);
+    assert_eq!(probe().1.as_ref(), Some(&third[0]));
+
+    // One fewer request counted only when the list was given; login and the
+    // bundled read never get it.
+    let lines = crate::provider_calls::test_lines(CallKind::CodexAppServerQuota, "unknown");
+    assert_eq!(
+        lines
+            .iter()
+            .map(|line| line.requests_at_least)
+            .collect::<Vec<_>>(),
+        [3, 2, 3, 2, 3, 2, 2, 2, 3, 2]
+    );
+    let log = std::fs::read_to_string(bin.join("argv.log")).expect("argv log");
+    for argv in log
+        .lines()
+        .map(|line| serde_json::from_str::<Vec<String>>(line).unwrap())
+    {
+        if !argv.ends_with(&["app-server".to_string(), "--stdio".to_string()]) {
+            assert!(
+                argv == ["login", "status"] || argv == ["debug", "models", "--bundled"],
+                "{argv:?}"
+            );
+        }
+    }
+}
+
 /// Writes `dir/codex`, a fake Codex CLI running `dir/fake_codex.py`.
 #[cfg(unix)]
 fn write_fake_codex_script(dir: &Path, script: &str) {

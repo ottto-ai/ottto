@@ -55,6 +55,7 @@ mod codex_credit_grants;
 mod codex_last_known;
 #[cfg(test)]
 pub(crate) mod codex_login_oracle_support;
+mod codex_probe_catalog;
 mod codex_saved_quota;
 mod codex_setup_gate;
 mod credit_amount_input;
@@ -3464,6 +3465,7 @@ fn codex_cli_meta(
                 COMMAND_TIMEOUT,
                 allow_legacy_oauth,
             );
+            let binary = cli_binary_stamp("codex");
             let models = run_codex_home_command(
                 home,
                 &["debug", "models", "--bundled"],
@@ -3492,6 +3494,12 @@ fn codex_cli_meta(
                 && models.status_code == Some(0)
                 && !parsed_models.available_models.is_empty();
             if valid {
+                // That binary's own list, for its limits probe.
+                if let (Ok(binary), Ok(after)) = (binary, cli_binary_stamp("codex")) {
+                    if binary.same(&after) {
+                        codex_probe_catalog::save(binary, &models.stdout);
+                    }
+                }
                 // The fresh fallback is used this pass only, never kept in facts.
                 fresh_login_account = parsed_account;
                 Ok(CodexCliMeta {
@@ -16959,7 +16967,7 @@ fn codex_app_server_end_failure(
 
 /// What one `codex app-server` run asked of the provider, for the
 /// provider-call log.
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct CodexAppServerRun {
     spawned: bool,
     /// Whether the session asked for the detailed rate-limits read.
@@ -16973,12 +16981,18 @@ struct CodexAppServerRun {
     /// login there ([`codex_app_server_auth_rejected`]), whatever the rest of
     /// the session did.
     account_absent: bool,
+    /// The binary whose bundled model list was passed to Codex
+    /// ([`codex_probe_catalog`]), so it sent no models request.
+    model_list: Option<crate::transcript_acquisition::SourceStamp>,
+    /// `account/read` answered, with a result or an error.
+    account_answered: bool,
 }
 
 /// Provider requests a started `codex app-server` quota session counts at
 /// least, sent whether or not they were answered: workspace discovery, models
-/// and the rate-limits read. Each read lets Codex refresh its login when due;
-/// such a refresh is counted only by the rewrite log line.
+/// (one fewer when given its bundled list) and the rate-limits read. Each
+/// read lets Codex refresh its login when due; such a refresh is counted only
+/// by the rewrite log line.
 const CODEX_APP_SERVER_MIN_REQUESTS: u32 = 3;
 
 /// How long an ended Codex child (stdin closed, or a run past its deadline)
@@ -17104,9 +17118,14 @@ fn call_codex_app_server_rate_limits_for_home(
             account.as_deref(),
             result_class,
             started.elapsed(),
-            CODEX_APP_SERVER_MIN_REQUESTS
+            CODEX_APP_SERVER_MIN_REQUESTS - u32::from(run.model_list.is_some())
                 + u32::from(run.detail_read_sent && !run.routine_read_rejected),
         ));
+    }
+    // A Codex that ended (not timed out) without answering `account/read`
+    // may not take the list: later probes run without it until it changes.
+    if let (Some(binary), false, false) = (&run.model_list, run.account_answered, run.timed_out) {
+        codex_probe_catalog::give_up(binary);
     }
     if run.spawned && ottto_core::codex_auth_file_mark(codex_home) != auth_before {
         eprintln!(
@@ -17140,16 +17159,18 @@ fn run_codex_app_server_rate_limits_for_home(
     // Turn off Codex's startup installers, which write into the account's home:
     // the bundled system-skill install and the curated plugin sync. A CLI that
     // lacks either key warns and keeps its default.
-    command
-        .args([
-            "-c",
-            "skills.bundled.enabled=false",
-            "-c",
-            "features.plugins=false",
-            "app-server",
-            "--stdio",
-        ])
-        .env_clear();
+    command.args([
+        "-c",
+        "skills.bundled.enabled=false",
+        "-c",
+        "features.plugins=false",
+    ]);
+    let model_list = codex_probe_catalog::for_probe();
+    if let Some((path, _)) = &model_list {
+        let path = toml_edit::Value::from(&*path.to_string_lossy());
+        command.args(["-c", &format!("model_catalog_json={path}")]);
+    }
+    command.args(["app-server", "--stdio"]).env_clear();
     command
         .env("HOME", &identity.home_dir)
         .env("USER", identity.account_name)
@@ -17173,6 +17194,7 @@ fn run_codex_app_server_rate_limits_for_home(
             .map_err(|_| "Codex app-server could not be started.".to_string())?,
     );
     run.spawned = true;
+    run.model_list = model_list.map(|(_, binary)| binary);
     // Declared after `child`: stdin and the output reader close before the
     // child is ended, so neither holds up its own exit.
     let (stdin, stdout) = child.take_pipes();
@@ -17289,6 +17311,7 @@ fn run_codex_app_server_rate_limits_for_home(
                 .unwrap_or_else(|| codex_app_server_rpc_failure(phase, error))
         };
         let response_id = message.get("id").and_then(Value::as_str);
+        run.account_answered |= response_id == Some("ottto_account");
         let error = message.get("error");
         let arrived_at = || rfc3339_from_unix_seconds(current_unix_seconds());
         let mut send_details = false;
