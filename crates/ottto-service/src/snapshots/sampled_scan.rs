@@ -122,6 +122,31 @@ impl HeapLayoutBound for SharedCache {
     }
 }
 impl SharedCache {
+    /// Requested-layout bytes only; busy/poisoned caches stay unknown.
+    pub(crate) fn retained_heap_bytes(
+        &self,
+        index: &ScanIndex,
+    ) -> BTreeMap<&'static str, Option<u64>> {
+        use super::state_v2::telemetry::{heap, retained_breakdown};
+        let mut bytes = retained_breakdown(index);
+        bytes.insert(
+            "codex_sidecar_facts_bytes",
+            self.sidecars.try_lock().ok().and_then(|v| heap(&*v)),
+        );
+        bytes.insert(
+            "desktop_title_facts_bytes",
+            self.desktop_titles.try_lock().ok().and_then(|v| heap(&*v)),
+        );
+        bytes.insert(
+            "codex_header_cache_bytes",
+            self.cursor.try_lock().ok().and_then(|v| {
+                let mut c = Counter::new(usize::MAX);
+                v.headers.charge(&mut c)?;
+                u64::try_from(c.bytes).ok()
+            }),
+        );
+        bytes
+    }
     /// Move the caller's facts out while doing I/O; no shared lock spans reads.
     pub(in crate::snapshots) fn with_codex_sidecars<T>(
         &self,
@@ -161,6 +186,7 @@ impl SharedCache {
         result
     }
 }
+
 #[cfg(test)]
 impl SharedCache {
     pub(super) fn cap_pace_for_test(&self, key: &str, now: SystemTime) -> (bool, bool, usize) {
@@ -679,5 +705,37 @@ pub(in crate::snapshots) fn ram_miss_class(
         MissClass::Missing
     } else {
         MissClass::Unavailable
+    }
+}
+
+#[cfg(test)]
+mod retained_heap_tests {
+    use super::*;
+    #[test]
+    fn charged_caches_are_unknown_while_busy_and_available_when_empty() {
+        let cache = SharedCache::default();
+        let index = ScanIndex::default();
+        let empty = cache.retained_heap_bytes(&index);
+        assert_eq!(empty.len(), 8);
+        assert!(empty["codex_sidecar_facts_bytes"].is_some());
+        let guard = cache.sidecars.lock().unwrap();
+        assert_eq!(
+            cache.retained_heap_bytes(&index)["codex_sidecar_facts_bytes"],
+            None
+        );
+        drop(guard);
+        assert_eq!(
+            cache.retained_heap_bytes(&index)["codex_sidecar_facts_bytes"],
+            empty["codex_sidecar_facts_bytes"]
+        );
+        cache
+            .sidecars
+            .lock()
+            .unwrap()
+            .insert("synthetic-scope".into(), Default::default());
+        assert!(
+            cache.retained_heap_bytes(&index)["codex_sidecar_facts_bytes"]
+                > empty["codex_sidecar_facts_bytes"]
+        );
     }
 }

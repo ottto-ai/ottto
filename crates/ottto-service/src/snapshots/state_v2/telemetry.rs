@@ -440,7 +440,9 @@ struct RetainedHeap {
 /// Existing requested-layout accounting, excluding inline stack slots. Shared
 /// Arc buffers are conservatively charged to each owning graph. No JSON size
 /// is substituted for heap, and opaque/unsupported layouts remain unavailable.
-fn heap<T: crate::heap_layout_bound::HeapLayoutBound>(value: &T) -> Option<u64> {
+pub(in crate::snapshots) fn heap<T: crate::heap_layout_bound::HeapLayoutBound>(
+    value: &T,
+) -> Option<u64> {
     crate::heap_layout_bound::completed_bound(value, usize::MAX)?
         .checked_sub(std::mem::size_of_val(value))?
         .try_into()
@@ -464,6 +466,36 @@ fn retained_heap(index: &ScanIndex) -> RetainedHeap {
         census_occupancy_alarm: hashes
             >= super::super::claude_request_census::CLAUDE_REQUEST_CENSUS_HASH_ALARM_BASE / 4 * 3,
     }
+}
+pub(in crate::snapshots) fn retained_breakdown(
+    index: &ScanIndex,
+) -> BTreeMap<&'static str, Option<u64>> {
+    let retained = retained_heap(index);
+    let mut accounts = Some(0u64);
+    macro_rules! account {
+        ($f:ident, Accounts, $codec:tt, $kinds:tt, $class:ident) => {
+            accounts = accounts
+                .zip(heap(&index.$f))
+                .and_then(|(a, b)| a.checked_add(b));
+        };
+        ($($other:tt)*) => {};
+    }
+    scan_index_fields!(each account);
+    let traversal = heap(&index.traversal);
+    BTreeMap::from([
+        ("files_bytes", retained.files),
+        ("census_bytes", retained.census),
+        ("accounts_identity_bytes", accounts),
+        ("traversal_bytes", traversal),
+        (
+            "side_maps_bytes",
+            retained
+                .side_maps
+                .zip(accounts)
+                .zip(traversal)
+                .and_then(|((s, a), t)| s.checked_sub(a)?.checked_sub(t)),
+        ),
+    ])
 }
 fn side_maps(index: &ScanIndex) -> Option<u64> {
     let mut bytes = if index.v2.is_some() {
@@ -1000,6 +1032,29 @@ mod ops_tests {
         );
     }
 
+    #[test]
+    fn retained_parts_split_accounts_and_traversal_without_changing_legacy_side_sum() {
+        let mut index = ScanIndex::default();
+        index.session_account_bindings.insert(
+            "synthetic".into(),
+            super::super::super::SessionAccountBinding {
+                account_identifier_hash: "a".repeat(64),
+                workspace_identifier_hash: None,
+            },
+        );
+        let parts = retained_breakdown(&index);
+        assert_eq!(parts.len(), 5);
+        assert_eq!(parts["files_bytes"], retained_heap(&index).files);
+        assert!(parts["accounts_identity_bytes"].is_none_or(|n| n >= 64));
+        if let (Some(side), Some(accounts), Some(traversal), Some(legacy)) = (
+            parts["side_maps_bytes"],
+            parts["accounts_identity_bytes"],
+            parts["traversal_bytes"],
+            retained_heap(&index).side_maps,
+        ) {
+            assert_eq!(side + accounts + traversal, legacy);
+        }
+    }
     /// [behaviour] The existing state_v2 line flags census occupancy at 75%
     /// of the alarm base.
     #[test]
