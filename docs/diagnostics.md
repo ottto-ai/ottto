@@ -90,7 +90,7 @@ memory, CPU and page-fault measurements regardless of `latest` equality.
 | `rss_bytes.{steady,peak}` | Current endpoint and sampled process RSS peak around save/hydrate. |
 | `decoded_per_pass.{rows,headers,chunks}` | Successful physical value/header/chunk decodes since prepare, including repeated reads for validation or encoding. A failed value may still contribute validated chunks. Reset at each prepare, published at the completed pass boundary. |
 | `tail_per_pass.{loads,load_bytes_sum,load_ms_sum,load_ms_max,stage_reports,stage_files_max,stage_bytes_max}` | Completed Tail read transactions since the pass started, their summed decoded reduction-page bytes (excluding heads and revisions), summed and largest wall time in whole milliseconds, and the number of staged-buffer reports with their largest `files` and `bytes`. Reset at each pass end, published at the completed pass boundary. `latest.tail_load_tx_ms` and `latest.tail_stage{files,bytes,peak_bytes}` keep the last values. Outside a pass each load or stage still prints the full snapshot at once. |
-| `cache_hit`, `cache_miss` | Optional connection cache-hit/miss counts since the previous maintenance sample (`SQLITE_DBSTATUS_CACHE_HIT` / `CACHE_MISS`, reset after reading); null when unavailable. The first sample covers the connection lifetime so far. The cache target is 8 MiB per connection; these counts measure the read tradeoff. |
+| `cache_hit`, `cache_miss` | Optional connection cache-hit/miss counts since the previous maintenance sample (`SQLITE_DBSTATUS_CACHE_HIT` / `CACHE_MISS`, reset after reading); null when unavailable. The first sample covers the connection lifetime so far. The cache target is 8 MiB per connection; these counts measure the read tradeoff. A write transaction prints one maintenance-stats row, after its commit: the write-begin maintenance still does its work but neither prints nor resets these counts, so each printed row counts every hit and miss since the previous printed row. A write that fails before commit prints no maintenance row. |
 | `stage_memory.post_pass_plateau.allocator_relief.{before_footprint_bytes,after_footprint_bytes,wall_us}` | macOS process footprint immediately before/after one allocator relief call after the consuming finish returns, with wall time in microseconds (including the after-sample); footprint is null if unavailable. Also carried in `source_finish` `counts.allocator_relief` for Claude, Codex and Pi. Fields absent elsewhere. The shared helper is a no-op off macOS, including harvest calls. No new wake; relief can return no pages. |
 | `cache_used_bytes` | SQLite `SQLITE_DBSTATUS_CACHE_USED` current connection bytes, refreshed at maintenance boundaries. |
 | `bytes_written_per_pass` | Process-attributed physical writes from prepare through finish returning, including other concurrent daemon work. No encoded-size estimate is substituted. |
@@ -477,6 +477,14 @@ regressing.
 The timestamp and process endpoints describe the latest completion, with the
 RSS-before endpoint from the first completion; child counters remain cumulative.
 Pending aggregates are in memory only and are lost on process exit.
+`offpass_control_xpc` rows also add `counts.control`: requests per decoded
+command class (`status`, `claude_accounts_status`, `codex_accounts_status`,
+`agent_status_refresh`, `other`; undecodable or panicked requests count as
+`other`), and on macOS the Companion code-signature trust check:
+`trust_checks`, `trust_us_sum` and `trust_us_max` (wall µs). Counts and µs
+only; no request ids, arguments or peers. Trust fields are absent off macOS.
+The cumulative `observation.cli_children` totals (child starts and CPU per
+fixed argv class) print on `source_prepare` rows only, not on every row.
 The `offpass_` prefix selects these CPU-only windows in `StageWindow`; ordinary
 in-pass fields and counts remain unchanged. `source` is the existing source
 slug for source-bound work and `unknown` for shared/mixed work. Off-pass names
@@ -1339,9 +1347,15 @@ the Ottto support directory, readable only by the user:
   request), or `subprocess_lower_bound` for a provider CLI run, which makes at
   least `requests_at_least` requests the daemon cannot see. Requests count
   when sent, answered or not; `result` shows how the call ended. A Codex quota
-  read through `codex app-server` that started counts two (a token refresh and
-  a rate-limits read), or three with the detailed read, even when it fails or
-  times out. A sign-in counts one once a code was submitted.
+  read through `codex app-server` that started counts three (workspace
+  discovery, models and the rate-limits read), or two when the daemon gave it
+  that Codex's own bundled model list (`codex debug models --bundled`, saved
+  under `codex-probe/` in the support dir), which by Codex's source skips its
+  startup model request (modeled, not measured), and one more with the
+  detailed read, even when it fails or times out. A read given the list that
+  ends, not timed out, without an account answer stops its use until that
+  Codex binary changes or the daemon restarts. A sign-in counts one once a
+  code was submitted.
 
 Lines never contain tokens, URLs, prompts, emails or provider responses. Days
 older than 7 are deleted. A day holds at most 30,000 lines and 8 MiB, and the

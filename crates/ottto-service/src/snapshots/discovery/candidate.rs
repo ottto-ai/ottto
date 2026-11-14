@@ -29,15 +29,16 @@ pub(in crate::snapshots) struct CandidateFile {
     pub(in crate::snapshots) withheld_content_stamp: Option<String>,
 }
 
-/// The object inputs of one opened-object identity (unix device, inode and
-/// ctime), plus the birth and mtime the content-only re-read rule checks.
+/// The object inputs of one opened-object identity (unix inode and ctime),
+/// plus the birth and mtime the content-only re-read rule checks. The device
+/// number is not hashed: a reboot or remount renumbers it.
 /// Never persisted: entries keep only the ctime and birth. A later open of
 /// the same object rebuilds
-/// the identity from its live device and inode, that stored ctime and fresh
+/// the identity from its live inode, that stored ctime and fresh
 /// content samples, so a ctime-only change (chmod, xattr, hard link,
 /// Spotlight, backup) reproduces the stored identity and never triggers a
 /// re-read on its own. A wrong or missing stored ctime only causes a read.
-/// Device and inode stay triggers (they are hashed live); birth binds the
+/// The inode stays a trigger (it is hashed live); birth binds the
 /// stored ctime to its object generation (a reused inode, even after a clock
 /// rollback, has another birth; an unavailable birth never adopts); mtime
 /// stays a trigger: it moves only on content writes (truncate/regrow too).

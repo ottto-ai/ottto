@@ -34,3 +34,15 @@ fn pure_resend_overrides_to_delivery_cause() {
         "an untracked entity never computes its body witness"
     );
 }
+
+/// [diagnostics] An unchanged ACK settles identical usage without a basis
+/// (the stored body itself) or with `usage_identical`; a dominated one or an
+/// accepted one never does.
+#[test]
+fn unchanged_ack_usage_identical_is_diagnostic_only() {
+    assert!(ack_usage_identical(true, None));
+    assert!(ack_usage_identical(true, Some("usage_identical")));
+    assert!(!ack_usage_identical(true, Some("dominated_by_head")));
+    assert!(!ack_usage_identical(false, None));
+    assert!(!ack_usage_identical(false, Some("usage_identical")));
+}

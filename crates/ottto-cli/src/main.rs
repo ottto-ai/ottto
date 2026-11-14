@@ -1128,8 +1128,9 @@ fn run(invocation: Invocation) -> i32 {
 }
 
 /// Commands that can run live smoke, telemetry collect, or backend verification
-/// work before replying. They run far longer than ordinary control commands, so
-/// they need the wider local-control timeout.
+/// work before replying, or that change the daemon's account and first wait for
+/// in-flight Cloud session work to stop. They run far longer than ordinary
+/// control commands, so they need the wider local-control timeout.
 fn is_long_running_command(command: &LocalControlCommand) -> bool {
     matches!(
         command,
@@ -1153,6 +1154,10 @@ fn is_long_running_command(command: &LocalControlCommand) -> bool {
             | LocalControlCommand::SetupAction { .. }
             | LocalControlCommand::SourceCollection { .. }
             | LocalControlCommand::Verify { .. }
+            | LocalControlCommand::AuthComplete { .. }
+            | LocalControlCommand::AuthCompletePending { .. }
+            | LocalControlCommand::AuthSwitchAccount { .. }
+            | LocalControlCommand::AuthReset { .. }
     )
 }
 
@@ -2908,6 +2913,23 @@ mod tests {
                 source: SourceKind::Codex,
                 action_type: "verify_source".to_string(),
                 api_base_url: None,
+            },
+            // Account changes first wait for a lingering Cloud session page
+            // child to stop (over a minute at worst; the daemon's tests pin
+            // that wait under this timeout).
+            LocalControlCommand::AuthComplete {
+                claim_code: "claim".to_string(),
+                nonce: "nonce".to_string(),
+            },
+            LocalControlCommand::AuthCompletePending {
+                claim_code: "claim".to_string(),
+            },
+            LocalControlCommand::AuthSwitchAccount {
+                claim_code: "claim".to_string(),
+            },
+            LocalControlCommand::AuthReset {
+                local_only: true,
+                forget_installation: false,
             },
         ] {
             assert!(

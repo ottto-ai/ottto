@@ -661,6 +661,11 @@ impl UploadFailureDiagnostics {
             && (self.status_family == "transport_timeout" || self.http_status == Some(504))
     }
 
+    /// A transport failure (no HTTP answer) or an HTTP 5xx.
+    pub(crate) fn is_outage(&self) -> bool {
+        self.http_status.is_none_or(|status| status >= 500)
+    }
+
     pub(crate) fn is_snapshot_batch_too_large(&self) -> bool {
         self.endpoint == "snapshot_batch" && self.http_status == Some(413)
     }
@@ -800,6 +805,12 @@ pub struct ActivityHintResponse {
     /// Receiver item limit; decoded tolerantly by `decode_activity_hint`.
     #[serde(skip)]
     pub max_snapshot_item_bytes: Option<u64>,
+    #[serde(skip)]
+    pub claude_otel_only_sessions_contract: Option<String>,
+    #[serde(skip)]
+    pub claude_otel_only_pairing_floor: Option<String>,
+    #[serde(skip)]
+    pub claude_otel_only_pairing_ceiling: Option<String>,
     /// Existing server mandate: ordinary bootstrap may not bypass required CAS.
     #[serde(default)]
     pub snapshot_head_cas_required: bool,
@@ -829,6 +840,17 @@ pub(crate) fn decode_activity_hint(value: Value) -> Result<ActivityHintResponse>
     let mut hint = ActivityHintResponse::deserialize(&value)
         .map_err(|error| anyhow!("parse activity hint response failed: {error}"))?;
     hint.max_snapshot_item_bytes = value.get("max_snapshot_item_bytes").and_then(Value::as_u64);
+    let text = |key| value.get(key).and_then(Value::as_str).map(str::to_owned);
+    hint.claude_otel_only_sessions_contract = text("claude_otel_only_sessions_contract");
+    hint.claude_otel_only_pairing_floor = text("claude_otel_only_pairing_floor");
+    hint.claude_otel_only_pairing_ceiling = text("claude_otel_only_pairing_ceiling");
+    // A present non-string ceiling cannot be mistaken for an open window.
+    if value
+        .get("claude_otel_only_pairing_ceiling")
+        .is_some_and(|v| !v.is_null() && !v.is_string())
+    {
+        hint.claude_otel_only_sessions_contract = None;
+    }
     hint.workspace_labels_explicit = value
         .get("workspace_labels_enabled")
         .and_then(Value::as_bool);
@@ -1601,6 +1623,9 @@ pub struct SnapshotStatusRequest {
     pub last_snapshot_unproven_terminal_count: u64,
     pub last_snapshot_superseded_terminal_count: u64,
     pub last_backfill_window_days: u64,
+    /// First census end minus the fixed first-read window; terminal status only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_read_cutoff: Option<String>,
     pub last_backfill_file_limit: u64,
     pub last_discovered_file_count: u64,
     pub last_skipped_file_count_due_to_limit: u64,
@@ -1730,6 +1755,7 @@ impl SnapshotStatusRequest {
             // Server-negotiated policy width, not scan evidence: the beat
             // reports back the hint the server just gave it.
             last_backfill_window_days: _,
+            first_read_cutoff,
             last_backfill_file_limit,
             last_discovered_file_count,
             last_skipped_file_count_due_to_limit,
@@ -1788,6 +1814,9 @@ impl SnapshotStatusRequest {
         }
         if last_error_message.is_some() {
             return Some("last_error_message");
+        }
+        if first_read_cutoff.is_some() {
+            return Some("first_read_cutoff");
         }
         if last_census_pending_file_count.is_some() {
             return Some("last_census_pending_file_count");
@@ -4319,6 +4348,7 @@ mod tests {
             last_snapshot_unproven_terminal_count: 0,
             last_snapshot_superseded_terminal_count: 0,
             last_backfill_window_days: 183,
+            first_read_cutoff: None,
             last_backfill_file_limit: 0,
             last_discovered_file_count: 0,
             last_skipped_file_count_due_to_limit: 0,
@@ -4362,6 +4392,23 @@ mod tests {
         assert!(scan.contains(r#""report_kind":"scan_status""#), "{scan}");
     }
 
+    #[test]
+    fn first_read_cutoff_is_optional_and_round_trips_on_scan_status() {
+        let mut status = clean_checkin_request();
+        let absent = serde_json::to_value(&status).unwrap();
+        assert!(absent.get("first_read_cutoff").is_none());
+        let old: SnapshotStatusRequest = serde_json::from_value(absent).unwrap();
+        assert!(old.first_read_cutoff.is_none());
+        status.report_kind = SnapshotStatusReportKind::ScanStatus;
+        status.first_read_cutoff = Some("2026-09-13T12:00:00.000Z".to_owned());
+        let value = serde_json::to_value(&status).unwrap();
+        assert_eq!(value["first_read_cutoff"], "2026-09-13T12:00:00.000Z");
+        assert!(value.get("first_read").is_none());
+        let restored: SnapshotStatusRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.first_read_cutoff, status.first_read_cutoff);
+        restored.validate_declared_report_kind().unwrap();
+    }
+
     /// The guard is a falsifier, not a classifier: it never picks the kind, it
     /// only refuses a `checkin` the payload contradicts. Every field a beat may
     /// not disclose is enumerated here; the exhaustive destructure inside
@@ -4376,6 +4423,10 @@ mod tests {
             .expect("a clean liveness beat is truthful");
 
         let mutations: Vec<CheckinMutation> = vec![
+            (
+                "first_read_cutoff",
+                Box::new(|r| r.first_read_cutoff = Some("2026-09-13T12:00:00.000Z".to_owned())),
+            ),
             ("enabled=false", Box::new(|r| r.enabled = false)),
             (
                 "disabled_reason",
@@ -4612,6 +4663,7 @@ mod tests {
             last_scanned_session_count: 0,
             last_scanned_file_count: 0,
             last_backfill_window_days: 183,
+            first_read_cutoff: None,
             last_backfill_file_limit: 1_000,
             last_discovered_file_count: 1_100,
             last_skipped_file_count_due_to_limit: 100,
@@ -4691,6 +4743,7 @@ mod tests {
             last_snapshot_unproven_terminal_count: 0,
             last_snapshot_superseded_terminal_count: 0,
             last_backfill_window_days: window_days as u64,
+            first_read_cutoff: None,
             last_backfill_file_limit: 10_000,
             last_discovered_file_count: 1,
             last_skipped_file_count_due_to_limit: 0,
@@ -5612,7 +5665,7 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(ActivityHintResponse; source, server_time, last_data_at, record_count_15m, record_count_24h, local_usage_reconciliation_enabled, backfill_window_days, session_titles_enabled, workspace_labels_enabled, workspace_labels_explicit, session_artifacts_enabled, mcp_inventory_harvest_enabled, context_footprint_harvest_enabled, context_composition_details_contract, names_withheld_contract, session_attribution_enabled, session_attribution_labels_enabled, session_attribution_hmac_key, session_attribution_hmac_key_version, session_cache_observations_contract, cache_full_replacement_contract, copy_unproven_contract, session_request_identity_retained_contract, session_request_account_source_contract, max_snapshot_item_bytes, snapshot_head_cas_required, census_residue_status_contract, session_request_identity_contract, recommended_scan_after);
+crate::heap_layout_bound::fields!(ActivityHintResponse; claude_otel_only_sessions_contract, claude_otel_only_pairing_floor, claude_otel_only_pairing_ceiling, source, server_time, last_data_at, record_count_15m, record_count_24h, local_usage_reconciliation_enabled, backfill_window_days, session_titles_enabled, workspace_labels_enabled, workspace_labels_explicit, session_artifacts_enabled, mcp_inventory_harvest_enabled, context_footprint_harvest_enabled, context_composition_details_contract, names_withheld_contract, session_attribution_enabled, session_attribution_labels_enabled, session_attribution_hmac_key, session_attribution_hmac_key_version, session_cache_observations_contract, cache_full_replacement_contract, copy_unproven_contract, session_request_identity_retained_contract, session_request_account_source_contract, max_snapshot_item_bytes, snapshot_head_cas_required, census_residue_status_contract, session_request_identity_contract, recommended_scan_after);
 
 impl crate::heap_layout_bound::HeapLayoutBound for SnapshotApiClient {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {

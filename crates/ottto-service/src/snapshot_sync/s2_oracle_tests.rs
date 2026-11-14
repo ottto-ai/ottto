@@ -1576,3 +1576,5 @@ fn current_again_quarantines_retry_root_and_subagent_without_changing_money() {
         assert!(quiet.scan.snapshots.is_empty());
     });
 }
+
+mod family_census_tests;
