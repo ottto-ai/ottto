@@ -324,6 +324,14 @@ flags. This paces work without dropping data or claiming a hard process-memory b
 resident deferral, or a selection that filled its file allowance while source work remains queued,
 requests another ordinary pass after 30 seconds on AC or 180 seconds on battery with Low Power
 Mode off. Unknown power and Low Power Mode retain ordinary cadence.
+A same-process re-walk after completion or a clean-follow-up retirement keeps routine
+cadence. A terminal-unhealthy retry also runs at routine cadence when its problems are
+file-level only: no namespace loss, directory cap, rejected symlink or watcher overflow.
+Retry arming needs no same-process evidence: after a restart or upgrade, a kept
+terminal-unhealthy traversal's first eligible retry walk is routine under those conditions.
+The active routine marker is process-local and binds the scan context and census window;
+resuming an unfinished walk after restart does not restore it. Resident deferral can still
+request pacing.
 Prepare, finish, server minima, upload backoff and background QoS still apply.
 
 ## SQLite
