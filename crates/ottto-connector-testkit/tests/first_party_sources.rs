@@ -295,13 +295,40 @@ fn assert_cloud_session_fixture_wire(fixture: &LoadedFixture) {
         let sample = &record.sample;
         assert_eq!(
             sample.get("schema_version").and_then(Value::as_str),
-            Some("cloud_session_changes.v1"),
-            "{} must carry the cloud_session_changes.v1 request schema",
+            Some("cloud_session_changes.v2"),
+            "{} must carry the cloud_session_changes.v2 request schema",
             fixture.path.display()
         );
-        for field in ["grant_scope_fingerprint", "account_fingerprint"] {
-            assert_prefixed_lower_hex(sample, field, "hmac-sha256:", 64, &fixture.path);
+        for retired in [
+            "grant_id",
+            "grant_version",
+            "grant_scope_fingerprint",
+            "account_fingerprint",
+            "collector_id",
+        ] {
+            assert!(
+                sample.get(retired).is_none(),
+                "{} carries retired field {retired}",
+                fixture.path.display()
+            );
         }
+        let policy = sample
+            .get("upload_policy")
+            .and_then(Value::as_object)
+            .unwrap_or_else(|| panic!("{} has no upload_policy", fixture.path.display()));
+        let mut policy_fields = policy.keys().map(String::as_str).collect::<Vec<_>>();
+        policy_fields.sort_unstable();
+        assert_eq!(
+            policy_fields,
+            ["session_titles_enabled", "workspace_labels_enabled"],
+            "{} has an unknown upload_policy field",
+            fixture.path.display()
+        );
+        assert!(
+            policy.values().all(Value::is_boolean),
+            "{} upload_policy values must be booleans",
+            fixture.path.display()
+        );
         let observations = sample
             .get("observations")
             .and_then(Value::as_array)
@@ -333,6 +360,19 @@ fn assert_cloud_session_fixture_wire(fixture: &LoadedFixture) {
                 ),
                 _ => panic!("{} lacks expected_head_etag", fixture.path.display()),
             }
+            for (label, setting) in [
+                ("title", "session_titles_enabled"),
+                ("environment_label", "workspace_labels_enabled"),
+            ] {
+                if observation.get(label).is_some_and(|value| !value.is_null()) {
+                    assert_eq!(
+                        policy.get(setting).and_then(Value::as_bool),
+                        Some(true),
+                        "{} sends {label} while {setting} is off",
+                        fixture.path.display()
+                    );
+                }
+            }
             for local_only in ["semantic_digest", "observed_at", "cursor"] {
                 assert!(
                     observation.get(local_only).is_none(),
@@ -342,24 +382,6 @@ fn assert_cloud_session_fixture_wire(fixture: &LoadedFixture) {
             }
         }
     }
-}
-
-fn assert_prefixed_lower_hex(
-    sample: &Value,
-    field: &str,
-    prefix: &str,
-    digits: usize,
-    path: &Path,
-) {
-    let value = sample
-        .get(field)
-        .and_then(Value::as_str)
-        .unwrap_or_else(|| panic!("{} has no {field}", path.display()));
-    assert!(
-        valid_prefixed_lower_hex(value, prefix, digits),
-        "{} has noncanonical {field}",
-        path.display()
-    );
 }
 
 fn valid_prefixed_lower_hex(value: &str, prefix: &str, digits: usize) -> bool {

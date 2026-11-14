@@ -1,19 +1,25 @@
 //! When the collector calls `codex cloud list`.
 //!
-//! Head (the newest provider page): every five minutes while that page holds
-//! a queued, running or unknown task; every 30 minutes while local Codex is
-//! active; otherwise every six hours. One daily crawl walks every page,
-//! continuing every five minutes across slices and UTC days until it reaches
-//! the end. No consent, a pause, an unsupported server or a cloud backoff
-//! means no call. All times are monotonic; only the crawl's completion date is
-//! a UTC day.
+//! Head (the newest provider page): every five minutes at first, doubling
+//! after each successful head listing that the server accepted nothing new
+//! from, up to once a day; an `accepted` upload resets it to five minutes.
+//! One daily crawl walks every page, continuing every five minutes across
+//! slices and UTC days until it reaches the end. Listing off, an unsupported
+//! server or a cloud backoff means no call. All times are monotonic; only the
+//! crawl's completion date is a UTC day.
 
 use std::time::{Duration, Instant};
 use time::Date;
 
 pub(super) const FAST_HEAD_INTERVAL: Duration = Duration::from_secs(5 * 60);
-pub(super) const ACTIVE_HEAD_INTERVAL: Duration = Duration::from_secs(30 * 60);
-pub(super) const IDLE_HEAD_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+pub(super) const MAX_HEAD_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+/// Listing is off (or the server refused it): read the hint again after this.
+pub(super) const OFF_RECHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
+/// The server lacks the route: check again after this.
+pub(super) const UNSUPPORTED_RECHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+/// The supervisor never sleeps longer than this, so the daily crawl and the
+/// rechecks still run when nothing else wakes it.
+pub(super) const SUPERVISOR_FALLBACK_WAIT: Duration = Duration::from_secs(6 * 60 * 60);
 pub(super) const CRAWL_CONTINUATION_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// Pacing per work slice, not coverage: a crawl resumes where it stopped.
 pub(super) const MAX_SLICE_PAGES: usize = 10;
@@ -65,11 +71,10 @@ pub(super) struct Crawl {
 
 #[derive(Clone, Default)]
 pub(super) struct CloudSchedule {
-    /// The consent scope these facts belong to; a different scope resets all.
+    /// The destination and local user these facts belong to; a different
+    /// scope resets all.
     pub(super) scope: Option<[u8; 32]>,
     pub(super) last_head_attempt: Option<Instant>,
-    /// The latest successful head page held a queued/running/unknown task.
-    pub(super) head_nonterminal: bool,
     pub(super) crawl: Option<Crawl>,
     /// UTC day of the last crawl that reached the end (persisted).
     pub(super) crawl_completed: Option<Date>,
@@ -80,8 +85,8 @@ pub(super) struct CloudSchedule {
     /// Cloud-only backoff after a failed slice, anchored at the failure.
     pub(super) retry_not_before: Option<Instant>,
     pub(super) consecutive_failures: u32,
-    /// The server does not authorize collection (paused, policy-disabled or
-    /// an older server). Recheck at the idle cadence or on a local wake.
+    /// Listing is off, the server refused it, or the server lacks the route.
+    /// No call before this instant.
     pub(super) unsupported_until: Option<Instant>,
 }
 
@@ -102,27 +107,14 @@ impl CloudSchedule {
         }
     }
 
-    /// Drop transient work (cursor, backoff) after a pause, revoke or wake.
+    /// Drop transient work (cursor, backoff) when collection stops locally.
     pub(super) fn clear(&mut self) {
         *self = Self::default();
     }
 
-    pub(super) fn head_interval(&self, now: Instant, last_activity: Option<Instant>) -> Duration {
-        if self.head_nonterminal {
-            FAST_HEAD_INTERVAL
-        } else if last_activity.is_some_and(|activity| {
-            now.saturating_duration_since(activity)
-                <= crate::adaptive_collector::CadenceConfig::default().warm_window
-        }) {
-            ACTIVE_HEAD_INTERVAL
-        } else {
-            IDLE_HEAD_INTERVAL
-        }
-    }
-
-    fn head_due_at(&self, now: Instant, last_activity: Option<Instant>) -> Instant {
+    fn head_due_at(&self, now: Instant, head_interval: Duration) -> Instant {
         match self.last_head_attempt {
-            Some(last) => last + self.head_interval(now, last_activity),
+            Some(last) => last + head_interval,
             None => now,
         }
     }
@@ -139,13 +131,8 @@ impl CloudSchedule {
 
     /// The next instant any work is due. Backoff and the unsupported-server
     /// recheck defer, never discard, due work.
-    pub(super) fn next_due(
-        &self,
-        now: Instant,
-        today: Date,
-        last_activity: Option<Instant>,
-    ) -> Instant {
-        let mut due = self.head_due_at(now, last_activity);
+    pub(super) fn next_due(&self, now: Instant, today: Date, head_interval: Duration) -> Instant {
+        let mut due = self.head_due_at(now, head_interval);
         if let Some(crawl) = self.crawl_due_at(now, today) {
             due = due.min(crawl);
         }
@@ -158,7 +145,7 @@ impl CloudSchedule {
         due
     }
 
-    pub(super) fn due(&self, now: Instant, today: Date, last_activity: Option<Instant>) -> Due {
+    pub(super) fn due(&self, now: Instant, today: Date, head_interval: Duration) -> Due {
         if self.unsupported_until.is_some_and(|until| until > now)
             || self.retry_not_before.is_some_and(|retry| retry > now)
         {
@@ -168,7 +155,7 @@ impl CloudSchedule {
             };
         }
         Due {
-            head: self.head_due_at(now, last_activity) <= now,
+            head: self.head_due_at(now, head_interval) <= now,
             crawl: self.crawl_due_at(now, today).is_some_and(|at| at <= now),
         }
     }
@@ -183,4 +170,15 @@ impl CloudSchedule {
         self.retry_not_before = None;
         self.unsupported_until = None;
     }
+}
+
+/// The head interval after `unchanged` successful head listings in a row
+/// that the server accepted nothing new from: 5, 10, 20 … 1280 minutes, then
+/// one day. Kept in memory only; a restart starts at five minutes.
+pub(super) fn head_interval(unchanged: u32) -> Duration {
+    FAST_HEAD_INTERVAL
+        .checked_mul(1_u32.checked_shl(unchanged).unwrap_or(u32::MAX))
+        .map_or(MAX_HEAD_INTERVAL, |interval| {
+            interval.min(MAX_HEAD_INTERVAL)
+        })
 }

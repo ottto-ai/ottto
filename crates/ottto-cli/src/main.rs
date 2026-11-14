@@ -2561,7 +2561,6 @@ fn local_command_name(command: &LocalControlCommand) -> &'static str {
         LocalControlCommand::SetupAction { .. } => "setup_action",
         LocalControlCommand::SourceCollection { .. } => "source_collection",
         LocalControlCommand::TelemetryControl { .. } => "telemetry_control",
-        LocalControlCommand::CloudSessionsControl { .. } => "cloud_sessions_control",
         LocalControlCommand::ProviderDailyReferenceControl { .. } => {
             "provider_daily_reference_control"
         }

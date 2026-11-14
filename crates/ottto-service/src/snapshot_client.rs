@@ -464,8 +464,56 @@ impl std::fmt::Display for CloudSessionContractRejected {
 
 impl std::error::Error for CloudSessionContractRejected {}
 
-/// The server answered that this cloud-session route or grant epoch is not
-/// available: an older server, or a grant this installation must re-consent.
+/// The server refused a cloud-task upload as a whole: HTTP 409 (listing off,
+/// a policy mismatch, an unavailable predecessor) or 410 (this contract is
+/// retired). `code` and `retryable` come from the body's `detail`, read up to
+/// 4 KiB; an unreadable body leaves them unset. Nothing else is kept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloudTaskRefused {
+    pub status: u16,
+    pub code: Option<String>,
+    pub retryable: Option<bool>,
+}
+
+impl CloudTaskRefused {
+    fn from_response(status: u16, response: ureq::Response) -> Self {
+        let detail = bounded_response_json::<Value>(response, 4 * 1024)
+            .ok()
+            .and_then(|body| body.get("detail").cloned());
+        let detail = detail.as_ref();
+        Self {
+            status,
+            code: detail
+                .and_then(|detail| detail.get("code"))
+                .and_then(Value::as_str)
+                .filter(|code| {
+                    code.len() <= 64
+                        && code
+                            .bytes()
+                            .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+                })
+                .map(str::to_string),
+            retryable: detail
+                .and_then(|detail| detail.get("retryable"))
+                .and_then(Value::as_bool),
+        }
+    }
+}
+
+impl std::fmt::Display for CloudTaskRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "backend refused cloud tasks: HTTP {} ({})",
+            self.status,
+            self.code.as_deref().unwrap_or("no code")
+        )
+    }
+}
+
+impl std::error::Error for CloudTaskRefused {}
+
+/// The server does not offer this cloud-task route (an older server).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CloudSessionRouteUnsupported {
     pub status: u16,
@@ -475,7 +523,7 @@ impl std::fmt::Display for CloudSessionRouteUnsupported {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "backend does not offer this cloud-session route or grant: HTTP {}",
+            "backend does not offer this cloud-session route: HTTP {}",
             self.status
         )
     }
@@ -831,6 +879,17 @@ pub struct ActivityHintResponse {
     /// it for permit-era daemons.
     #[serde(default)]
     pub session_request_identity_contract: Option<String>,
+    /// Codex only: the user's "List my Codex cloud tasks" setting as this
+    /// server resolves it. An older server omits it, which means off.
+    #[serde(default)]
+    pub codex_cloud_tasks_enabled: bool,
+    /// Codex only: the user's fixed cloud-task key (unpadded base64url of 32
+    /// bytes), present only while listing is on.
+    #[serde(default)]
+    pub codex_cloud_task_key: Option<String>,
+    /// Codex only: the task-list contract the server accepts.
+    #[serde(default)]
+    pub codex_cloud_tasks_contract: Option<String>,
     pub recommended_scan_after: String,
 }
 
@@ -2090,10 +2149,10 @@ fn relay_token_upload_response(
 }
 
 /// A failed cloud-session request: 401/403 is an authorization rejection;
-/// 404/405/409/410 means this server does not offer the route or this grant
-/// epoch; 400/415/422 a contract rejection; 408/429/503 a shed with its
-/// `Retry-After`; any other status or a transport failure carries upload
-/// diagnostics. Response bodies are never kept.
+/// 404/405 means this server does not offer the route; 409/410 a refusal with
+/// its bounded typed code; 400/415/422 a contract rejection; 408/429/503 a
+/// shed with its `Retry-After`; any other status or a transport failure
+/// carries upload diagnostics. No other response body is read.
 fn cloud_session_request_error(
     error: ureq::Error,
     operation: &'static str,
@@ -2103,8 +2162,11 @@ fn cloud_session_request_error(
         ureq::Error::Status(code @ (401 | 403), _response) => {
             anyhow::Error::new(CloudSessionAuthorizationRejected { status: code })
         }
-        ureq::Error::Status(code @ (404 | 405 | 409 | 410), _response) => {
+        ureq::Error::Status(code @ (404 | 405), _response) => {
             anyhow::Error::new(CloudSessionRouteUnsupported { status: code })
+        }
+        ureq::Error::Status(code @ (409 | 410), response) => {
+            anyhow::Error::new(CloudTaskRefused::from_response(code, response))
         }
         ureq::Error::Status(code @ (400 | 415 | 422), _response) => {
             anyhow::Error::new(CloudSessionContractRejected { status: code })
@@ -3040,9 +3102,9 @@ impl SnapshotApiClient {
             .set("Accept", "application/json")
             .set("Authorization", &format!("Bearer {relay_token}"))
     }
-    /// Upload one `cloud_session_changes.v1` request with the same
-    /// source-scoped relay principal as local snapshots. Only the parsed ACK
-    /// is returned; response bodies of refusals are never kept.
+    /// Upload one `cloud_session_changes.v2` request with the same
+    /// source-scoped relay principal as local snapshots. Only the parsed ACK,
+    /// or a refusal's typed code, is returned.
     pub fn upload_cloud_session_changes_with_timeout(
         &self,
         relay_token: &str,
@@ -3113,42 +3175,33 @@ impl SnapshotApiClient {
         }
     }
 
-    /// Read one exact, relay-device-bound cloud grant epoch on the
-    /// `cloud_session_changes.v1` authority. Not a list; never browser auth.
-    pub fn get_cloud_session_authority_with_timeout(
+    /// Read the activity hint for the cloud-task collector within its slice
+    /// deadline. Errors map like the other cloud-task requests, so a 401/403
+    /// refreshes the relay token once.
+    pub(crate) fn get_activity_hint_with_timeout(
         &self,
         relay_token: &str,
-        grant_id: &str,
-        grant_version: u64,
         timeout: Duration,
-    ) -> Result<Value> {
-        if !crate::hex::is_uuid(grant_id) || grant_version == 0 {
-            return Err(anyhow!("cloud-session authority identity is invalid"));
-        }
+    ) -> Result<ActivityHintResponse> {
         let (agent, request_timeout) = cloud_session_deadline_agent(timeout)?;
-        let path = format!(
-            "/api/v1/cloud-sessions/grants/{grant_id}/authority?grant_version={grant_version}"
-        );
         match relay_sent(
             relay_token,
             agent
-                .get(&self.api_url(&path))
+                .get(&self.api_url("/api/v1/agent-session-snapshots/activity-hints"))
                 .timeout(request_timeout)
                 .set("Accept", "application/json")
                 .set("Authorization", &format!("Bearer {relay_token}"))
                 .call(),
         ) {
-            Ok(response) => require_cloud_session_success(
-                response,
-                "cloud-session authority read",
-                "cloud_session_authority",
-            )?
-            .into_json()
-            .map_err(|error| anyhow!("parse cloud-session authority response failed: {error}")),
+            Ok(response) => bounded_response_json::<Value>(
+                require_cloud_session_success(response, "activity hint request", "activity_hint")?,
+                crate::snapshot_retry::TOKEN_RESPONSE_BYTES,
+            )
+            .and_then(decode_activity_hint),
             Err(error) => Err(cloud_session_request_error(
                 error,
-                "cloud-session authority read",
-                "cloud_session_authority",
+                "activity hint request",
+                "activity_hint",
             )),
         }
     }
@@ -3819,6 +3872,26 @@ mod tests {
             }
         }
         String::from_utf8_lossy(&request).to_string()
+    }
+
+    #[test]
+    fn codex_cloud_task_fields_default_off_when_an_older_server_omits_them() {
+        let hint: ActivityHintResponse = serde_json::from_str(&activity_hint_json("")).unwrap();
+        assert!(!hint.codex_cloud_tasks_enabled);
+        assert_eq!(hint.codex_cloud_task_key, None);
+        assert_eq!(hint.codex_cloud_tasks_contract, None);
+        let hint: ActivityHintResponse = serde_json::from_str(&activity_hint_json(
+            r#", "codex_cloud_tasks_enabled":true,
+               "codex_cloud_task_key":"BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc",
+               "codex_cloud_tasks_contract":"cloud_session_changes.v2""#,
+        ))
+        .unwrap();
+        assert!(hint.codex_cloud_tasks_enabled);
+        assert_eq!(hint.codex_cloud_task_key.map(|key| key.len()), Some(43));
+        assert_eq!(
+            hint.codex_cloud_tasks_contract.as_deref(),
+            Some("cloud_session_changes.v2")
+        );
     }
 
     #[test]

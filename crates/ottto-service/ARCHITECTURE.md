@@ -443,41 +443,55 @@ applies to bodies from then on, never retroactively.
 
 ## Codex cloud task collection
 
-`cloud_sessions` runs independently of local transcript collection and upload.
-Explicit consent binds one installation/user/organization and the
-`cloud_session_changes.v1` contract. Each due slice reads the exact grant's
-authority once through the source-scoped relay. An older backend leaves the
-collector idle; uploads never fall back to the retired protocol. Backend
-authority is checked again when accepting changes, so a remote pause during a
-slice cannot admit later uploads. Local pause/revoke closes the I/O fence and
-waits for admitted work to finish.
+`cloud_sessions` runs independently of local transcript collection and upload,
+under the same consent as local Codex sessions. There is no per-Mac grant.
+Each due slice reads the Codex activity hint once through the source-scoped
+relay, under an I/O lease. Listing runs only when the hint turns it on, names
+the `cloud_session_changes.v2` contract and carries the user's 32-byte task
+key; anything else (listing off, an older server, a malformed key) is off and
+the hint is read again in 30 minutes, or six hours when the route is missing.
+The same hint's `SnapshotUploadPolicy` decides whether titles and environment
+names are sent, and every body is stamped with it. A 409 the server marks
+retryable (a policy mismatch) backs off and re-reads the hint; one it marks not
+retryable rechecks like listing off. A 410 (contract retired) stops the
+collector for the life of the process. Refusals settle nothing.
 
-The latest provider page controls head polling: five minutes for queued,
-running or unknown tasks, 30 minutes during recent local Codex filesystem
-activity, six hours otherwise. A daily crawl streams pages and retains only
-its next cursor in memory, continuing five minutes later when its slice
-budget ends. It continues across midnight without a total page/task ceiling.
-Only positive task facts are uploaded; missing tasks never imply deletion.
+The head interval lives in the collector, outside the schedule: five minutes,
+doubling after each successful head listing from which the server accepted
+nothing new, up to 24 hours. Only an `accepted` outcome resets it; a `noop`
+(another Mac already sent it, or an expired ACK) does not. A daily crawl streams
+pages and retains only its next cursor in memory, continuing five minutes later
+when its slice budget ends. It continues across midnight without a total
+page/task ceiling. Only positive task facts are uploaded; missing tasks never
+imply deletion. The supervisor wakes at least every six hours.
 
+The task key is per user, so every Mac of that user sends one head per task.
 The existing graph-independent upload-history SQLite connection stores only
-each task's semantic digest and acknowledged head etag, scoped to destination
-and consent epoch. Fixed expiry permits safe re-offering; the server returns
-no-op for an exact repeat even after ACK loss or restart. The cache contains no
-task payloads or raw IDs and never enters local graph load/save or receipt
-settlement. The file stays at `user_version` 1: its cloud tables are created
-if missing at open, and older builds open the file and ignore them. Cloud
-failures and retry deadlines do not change local delivery.
+each task's semantic digest (over its facts and the applied policy) and head
+etag, scoped to destination, organization, user, key digest and contract.
+Accepted and noop ACKs store the head; a rejected task or a conflict without a
+head stores none, earns no credit and is not resent until it changes. Fixed
+expiry permits safe re-offering; the server returns no-op for an exact repeat
+even after ACK loss or restart. Requests are packed under 200 tasks and the
+server's 512 KiB body ceiling. The cache contains no task payloads, titles or
+raw IDs and never enters local graph load/save or receipt settlement. The file
+stays at `user_version` 1: its cloud tables are created if missing at open, and
+older builds open the file and ignore them. Cloud failures and retry deadlines
+do not change local delivery. Every hint, provider, send and cache admission
+validates current local identity; identity changes close admission and drain
+admitted I/O before replacing account or device state. Startup removes the
+retired per-Mac grant files under `cloud_sessions/` and nothing else.
 
 ### Collector approval continuity
 
-Daily provider reporting and cloud-session approvals survive daemon updates and
-sign-ins to the same Ottto account on the same physical Mac. An enabled bound
-approval can rebind to the current relay device through its collector-specific
-`grants/{id}/rebind` endpoint, authenticated with that target device's relay token.
-The request sends the stored grant version, new scope fingerprint, live hardware
-hash and original disclosure; the server resolves the previous device. Successful
-rebind preserves the grant epoch, consent-time build, account fingerprint and
-exclusions. The local grant is replaced atomically. It never replays transcripts.
+Daily provider reporting approvals survive daemon updates and sign-ins to the
+same Ottto account on the same physical Mac. An enabled bound approval can rebind
+to the current relay device through its `grants/{id}/rebind` endpoint,
+authenticated with that target device's relay token. The request sends the
+stored grant version, new scope fingerprint, live hardware hash and original
+disclosure; the server resolves the previous device. Successful rebind preserves
+the grant epoch, consent-time build, account fingerprint and exclusions. The
+local grant is replaced atomically. It never replays transcripts.
 
 Live hardware must match the saved identity before collection and rebind. Missing
 hardware proof stops collection. A copied saved hardware identity requires an explicit
@@ -486,22 +500,6 @@ alone cannot override the hardware check. A revoked or disabled approval is neve
 Terminal refusals stop retries for that binding until the binding changes or the
 service restarts. HTTP 404 retains the stopped-binding behavior for servers that
 have not deployed rebind yet. Transport, 429 and server errors use normal polling.
-
-Cloud changes report the running build for diagnostics; approval binds the
-collection contract independently of the binary version. Each due slice reads
-`cloud-sessions/grants/{id}/authority?grant_version=N` once. Rebind accepts the
-same-epoch management DTO using `can_collect`, preserving the bound collection
-contract and provider-creation cutoff. It drops transient traversal and transport
-state, retaining the original consent's cache namespace through optional opaque
-origin fingerprints in the binding. The grant file update preserves that namespace
-atomically with the rebound identity, so unchanged tasks stay suppressed after a
-restart. Destination, owner, grant epoch, account and contract still isolate cache
-entries. A lost rebind reply does not require another rebind after revoke: trusted
-local control can reconcile the exact authenticated DELETE response against the
-current same-owner HMAC scope, leaving consent revoked. Every authority, provider,
-send and cache admission validates current local identity; identity changes close admission
-and drain admitted I/O before replacing account or device state. Older daemons
-receive disabled legacy authority and cannot upload through retired routes.
 
 ## Codex daily provider reference
 

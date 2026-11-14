@@ -37,7 +37,6 @@ const PRUNE: &str = "DELETE FROM cloud_task_acks WHERE (scope_key,entity_key) IN
 const READ_STATE: &str =
     "SELECT crawl_completed_date FROM cloud_collector_state WHERE scope_key=?1";
 const WRITE_STATE: &str = "INSERT INTO cloud_collector_state(scope_key,crawl_completed_date) VALUES(?1,?2) ON CONFLICT(scope_key) DO UPDATE SET crawl_completed_date=excluded.crawl_completed_date";
-const ERASE_ACKS: &str = "DELETE FROM cloud_task_acks WHERE (scope_key,entity_key) IN (SELECT scope_key,entity_key FROM cloud_task_acks LIMIT ?1)";
 
 /// One task's remembered ACK. `head_etag` is `None` for a per-task refusal of
 /// exactly this content.
@@ -132,24 +131,6 @@ impl Store {
             .query_row([&scope[..]], |row| row.get::<_, Option<String>>(0))
             .optional()?
             .flatten())
-    }
-
-    /// Delete every cloud row, a bounded page per transaction, after a local
-    /// revoke. Only one grant scope exists per installation.
-    pub(crate) fn cloud_erase_all(&mut self) -> Result<()> {
-        self.check_object()?;
-        loop {
-            let tx = self
-                .conn
-                .transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let deleted = tx.prepare_cached(ERASE_ACKS)?.execute([1_000_i64])?;
-            if deleted == 0 {
-                tx.execute("DELETE FROM cloud_collector_state", [])?;
-                tx.commit()?;
-                return Ok(());
-            }
-            tx.commit()?;
-        }
     }
 }
 

@@ -1,23 +1,25 @@
-//! Supported, metadata-only Codex Cloud session collector.
+//! Supported, metadata-only Codex Cloud task collector.
 //!
 //! The collector invokes only `codex cloud list --json` as the effective user.
 //! It never opens `auth.json`, reads OpenAI credentials, or calls provider
-//! endpoints directly. After exact consent and destination checks, it reads
-//! only Ottto's relay device credential for Ottto backend authentication. Raw
-//! CLI JSON, task titles, URLs, provider ids, and cursors are used only in
-//! memory to derive content-free task facts.
+//! endpoints directly. It reads only Ottto's relay device credential for
+//! Ottto backend authentication. Raw CLI JSON, URLs, provider ids and cursors
+//! are used only in memory; a task's title and environment name leave the Mac
+//! only while the metadata policy that governs local sessions allows them.
 //!
-//! Each due work slice makes one authority read, lists provider pages and
+//! Each due work slice reads the Codex activity hint once (listing on or off,
+//! the user's task key and the metadata policy), lists provider pages and
 //! uploads only tasks whose facts changed since their last exact server ACK
-//! (`cloud_session_changes.v1`). When it calls the provider is in
+//! (`cloud_session_changes.v2`). When it calls the provider is in
 //! [`schedule`]; the ACK cache lives in the upload-history SQLite file.
 
-use crate::grant_rebind::{self, GrantKind, RebindProposal, RebindRequest};
-use crate::hex::{decode as decode_hex, encode as hex, is_uuid};
+use crate::hex::{encode as hex, is_uuid};
 use crate::local_resource_diagnostics::StageWindow;
 use crate::locked_state_dir::FileLock;
+use crate::snapshot_client::ActivityHintResponse;
 use crate::snapshots::state_v2::upload_history::{CloudAck, CloudAckWrite};
 use anyhow::{anyhow, Context, Result};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use getrandom::fill as random_fill;
 use hmac::{Hmac, Mac};
 use ottto_core::{
@@ -25,7 +27,6 @@ use ottto_core::{
     FileDeviceStore, LocalDeviceBinding,
 };
 use ottto_protocol::LocalAccountState;
-pub use ottto_protocol::{CloudSessionBackendGrantResponseV1, CloudSessionServerPolicyState};
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use serde_json::json;
@@ -45,18 +46,15 @@ use time::{format_description::well_known::Rfc3339, Date, OffsetDateTime, UtcOff
 mod schedule;
 mod wire;
 use schedule::{
-    CloudSchedule, Crawl, Due, CRAWL_CONTINUATION_INTERVAL, IDLE_HEAD_INTERVAL, MAX_SLICE_PAGES,
+    head_interval, CloudSchedule, Crawl, Due, CRAWL_CONTINUATION_INTERVAL, MAX_SLICE_PAGES,
+    OFF_RECHECK_INTERVAL, SUPERVISOR_FALLBACK_WAIT, UNSUPPORTED_RECHECK_INTERVAL,
 };
 pub use wire::{
-    CloudSessionChangeAckV1, CloudSessionChangeOutcome, CloudSessionChangeV1,
-    CloudSessionChangesAckV1, CloudSessionChangesV1, CloudSessionGrantAuthorityV1,
+    CloudSessionChangeAckV2, CloudSessionChangeOutcome, CloudSessionChangeV2,
+    CloudSessionChangesAckV2, CloudSessionChangesV2, CloudUploadPolicyV2,
 };
-use wire::{Settled, AUTHORITY_SCHEMA_VERSION, CHANGES_SCHEMA_VERSION, MAX_CHANGES_PER_REQUEST};
+use wire::{Settled, CHANGES_SCHEMA_VERSION, MAX_LABEL_CHARS};
 
-const COLLECTOR_ID: &str = "cloud_sessions";
-const DISCLOSURE_VERSION: &str = "cloud_sessions_disclosure.v1";
-const LEGACY_COLLECTION_SCHEMA_VERSION: &str = "cloud_session_observations.v1";
-const GRANT_SCHEMA_VERSION: &str = "cloud_session_grant.v1";
 const CONTROL_TOKEN_LEDGER_SCHEMA_VERSION: &str = "cloud_session_control_token_uses.v1";
 const MAX_CONTROL_TOKEN_USES: usize = 64;
 const PAGE_LIMIT: usize = 20;
@@ -78,188 +76,21 @@ const PAGE_START_FLOOR: Duration = Duration::from_secs(5);
 const KILL_SWITCH_ENV: &str = "OTTTO_CODEX_CLOUD_SESSIONS_DISABLED";
 const DEFAULT_API_BASE_URL: &str = "https://api.ottto.net";
 const LEGACY_API_BASE_URL: &str = "https://ottto.net/backend";
+/// The task-list contract this build speaks; the hint must name exactly it.
+const CODEX_CLOUD_TASKS_CONTRACT: &str = CHANGES_SCHEMA_VERSION;
+/// The retired per-Mac grant (which held the old per-Mac task key), its
+/// replay ledger and the pre-cache checkpoint. Removed once at startup.
+const RETIRED_STATE_FILES: [&str; 5] = [
+    "grant.json",
+    "grant.lock",
+    "control-token-uses.json",
+    "control-token-uses.lock",
+    "checkpoint.json",
+];
 
 static COLLECTOR_SUPERVISOR_STARTED: AtomicBool = AtomicBool::new(false);
 
 type HmacSha256 = Hmac<Sha256>;
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CloudSessionGrantStatus {
-    Off,
-    ConsentRequired,
-    Enabled,
-    Paused,
-    Revoked,
-    PolicyDisabled,
-}
-
-/// Operator/UI status for this collector. The service exposes this without
-/// starting the provider CLI, so setup and transport readiness can be shown
-/// safely before any cloud-session collection is permitted.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CloudSessionRuntimeState {
-    Off,
-    ConsentRequired,
-    Enabled,
-    Paused,
-    Revoked,
-    PolicyDisabled,
-    TransportDeferred,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CloudSessionCollectorStatusV1 {
-    pub schema_version: String,
-    pub collector_id: String,
-    pub grant_status: CloudSessionGrantStatus,
-    pub runtime_state: CloudSessionRuntimeState,
-    pub transport_configured: bool,
-    /// This is false while the typed ingest transport is deferred. Consumers
-    /// must not imply that enabling a grant will call the Codex CLI.
-    pub provider_cli_invocation_permitted: bool,
-    pub reason_code: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CloudSessionGrant {
-    pub schema_version: String,
-    pub collector_id: String,
-    pub collector_version: String,
-    pub release_lane: String,
-    pub disclosure_version: String,
-    pub status: CloudSessionGrantStatus,
-    /// Opaque grant-local fingerprint; the raw installation id is never persisted.
-    pub installation_fingerprint: String,
-    /// Immutable identity for this exact installation/user/collector grant.
-    pub grant_scope_id: String,
-    pub organization_fingerprint: String,
-    pub effective_user_fingerprint: String,
-    /// Opaque local Ottto org/user collector scope. This is not a Codex or
-    /// OpenAI provider-account identity; the supported CLI exposes none.
-    pub account_fingerprint: String,
-    /// Server-owned grant epoch. Absent until an authenticated companion/UI
-    /// creates the backend grant and binds its response into this local state.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub backend_binding: Option<CloudSessionBackendGrantBindingV1>,
-    /// True from authenticated create-payload handoff until its POST is
-    /// reconciled. Scope replacement is blocked because a timed-out POST may
-    /// still have created a backend grant whose id has not returned yet.
-    #[serde(default)]
-    pub backend_create_pending: bool,
-    /// Content-free identity for the exact create request represented by the
-    /// pending tombstone. The raw installation id remains caller-supplied and
-    /// is accepted only when it matches `installation_fingerprint`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pending_backend_create: Option<CloudSessionPendingBackendCreateV1>,
-    pub granted_at: Option<String>,
-    pub paused_at: Option<String>,
-    pub revoked_at: Option<String>,
-    pub last_collector_health: Option<String>,
-    pub last_freshness: Option<String>,
-    pub last_error_category: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CloudSessionBackendGrantBindingV1 {
-    pub grant_id: String,
-    pub grant_version: u64,
-    #[serde(default)]
-    pub backend_revoked: bool,
-    /// Missing policy on an older persisted binding fails closed.
-    #[serde(default)]
-    pub server_policy_state: CloudSessionServerPolicyState,
-    /// The collection contract the server confirmed for this epoch. A binding
-    /// written before `cloud_session_changes.v1` has none and needs consent
-    /// on the new contract before collection.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub collection_contract: Option<String>,
-    /// The server's provider-creation cutoff after an erasure, if any.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub collect_not_before: Option<String>,
-    /// Original consent identity for cache isolation across verified same-epoch
-    /// relay rebinds. No raw device id is retained. Absent on older grants.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_origin: Option<CloudSessionCacheOrigin>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CloudSessionCacheOrigin {
-    pub installation_fingerprint: String,
-    pub grant_scope_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CloudSessionPendingBackendCreateV1 {
-    pub source: String,
-    pub collector_id: String,
-    pub schema_version: String,
-    pub collector_version: String,
-    pub grant_scope_fingerprint: String,
-    pub account_fingerprint: String,
-    pub consent: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CloudSessionBackendGrantCreateRequestV1 {
-    pub installation_id: String,
-    pub source: String,
-    pub collector_id: String,
-    pub schema_version: String,
-    pub collector_version: String,
-    pub grant_scope_fingerprint: String,
-    pub account_fingerprint: String,
-    pub consent: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct CloudSessionBackendGrantRevokeTargetV1 {
-    pub grant_id: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct CloudSessionGrantSetup {
-    pub installation_id: String,
-    pub organization_scope: String,
-    pub effective_user_scope: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PersistedGrant {
-    schema_version: String,
-    hmac_key_hex: String,
-    grant: CloudSessionGrant,
-}
-
-/// Upgrade-only representation written before installation scope became
-/// content-free. It is never serialized again after a successful read.
-#[derive(Debug, Clone, Deserialize)]
-struct LegacyPersistedGrantV1 {
-    schema_version: String,
-    hmac_key_hex: String,
-    grant: LegacyCloudSessionGrantV1,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct LegacyCloudSessionGrantV1 {
-    schema_version: String,
-    collector_id: String,
-    collector_version: String,
-    release_lane: String,
-    disclosure_version: String,
-    status: CloudSessionGrantStatus,
-    installation_id: String,
-    organization_fingerprint: String,
-    effective_user_fingerprint: String,
-    account_fingerprint: String,
-    granted_at: Option<String>,
-    paused_at: Option<String>,
-    revoked_at: Option<String>,
-    last_collector_health: Option<String>,
-    last_freshness: Option<String>,
-    last_error_category: Option<String>,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CloudSessionControlTokenUseLedger {
@@ -342,862 +173,6 @@ impl CloudSessionControlTokenUseStore {
     }
 }
 
-impl Default for CloudSessionControlTokenUseStore {
-    fn default() -> Self {
-        Self::new(
-            default_support_dir()
-                .join("cloud_sessions")
-                .join("control-token-uses.json"),
-        )
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct CloudSessionGrantStore {
-    path: PathBuf,
-}
-
-impl CloudSessionGrantStore {
-    pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    pub fn load(&self) -> Result<Option<CloudSessionGrant>> {
-        Ok(self.read()?.map(|state| state.grant))
-    }
-
-    /// Return a collection candidate only when the persisted HMAC scope still
-    /// binds the exact local device, organization, and user. This is read-only:
-    /// a mismatch cannot rewrite consent or make a stale grant current again.
-    fn runtime_candidate_for(
-        &self,
-        setup: &CloudSessionGrantSetup,
-    ) -> Result<Option<CloudSessionGrant>> {
-        let Some(state) = self.read()? else {
-            return Ok(None);
-        };
-        if !cloud_grant_preflight_eligible(&state.grant) {
-            return Ok(None);
-        }
-        let key = decode_hex(&state.hmac_key_hex)
-            .filter(|key| key.len() == 32)
-            .ok_or_else(|| anyhow!("invalid cloud-session HMAC key"))?;
-        let exact_scope = state.grant.installation_fingerprint
-            == opaque_key(&key, &setup.installation_id)
-            && state.grant.organization_fingerprint == opaque_key(&key, &setup.organization_scope)
-            && state.grant.effective_user_fingerprint
-                == opaque_key(&key, &setup.effective_user_scope)
-            && state.grant.account_fingerprint
-                == opaque_key(
-                    &key,
-                    &format!(
-                        "{}\u{0}{}",
-                        setup.organization_scope, setup.effective_user_scope
-                    ),
-                )
-            && state.grant.grant_scope_id == grant_scope_fingerprint(&key, setup);
-        if !exact_scope {
-            return Err(anyhow!(
-                "cloud-session grant does not match the current local identity"
-            ));
-        }
-        Ok(Some(state.grant))
-    }
-
-    /// Prepare explicit local consent. Scope inputs are converted to HMAC
-    /// fingerprints before persistence; the raw values are never serialized.
-    /// Collection remains blocked in `consent_required` until `bind_backend_grant`
-    /// accepts the authenticated backend's grant id and version.
-    pub fn enable(
-        &self,
-        setup: &CloudSessionGrantSetup,
-        _now: OffsetDateTime,
-    ) -> Result<CloudSessionGrant> {
-        if !is_uuid(&setup.installation_id)
-            || setup.organization_scope.trim().is_empty()
-            || setup.effective_user_scope.trim().is_empty()
-        {
-            return Err(anyhow!("cloud-session grant scope is incomplete"));
-        }
-        let _lock = self.lock()?;
-        let existing = self.read_locked()?;
-        if let Some(mut state) = existing {
-            let key = decode_hex(&state.hmac_key_hex)
-                .filter(|key| key.len() == 32)
-                .ok_or_else(|| anyhow!("invalid cloud-session HMAC key"))?;
-            let expected_scope = grant_scope_fingerprint(&key, setup);
-            if state.grant.grant_scope_id == expected_scope {
-                if state.grant.backend_create_pending {
-                    // A browser may lose the loopback prepare response before
-                    // issuing the authenticated POST. Repeating the exact
-                    // device/user/org action returns the same tombstoned create
-                    // payload; scope replacement remains blocked below.
-                    if state.grant.status == CloudSessionGrantStatus::ConsentRequired {
-                        validate_pending_backend_create(
-                            &state.grant,
-                            &state
-                                .grant
-                                .pending_backend_create
-                                .clone()
-                                .unwrap_or_else(|| pending_backend_create(&state.grant)),
-                        )?;
-                        return Ok(state.grant);
-                    }
-                    return Err(anyhow!(
-                        "pending cloud-session backend grant creation must be reconciled before setup changes"
-                    ));
-                }
-                if state.grant.revoked_at.is_some()
-                    && state
-                        .grant
-                        .backend_binding
-                        .as_ref()
-                        .is_some_and(|binding| !binding.backend_revoked)
-                {
-                    return Err(anyhow!(
-                        "revoked cloud-session backend grant must be deleted before re-consent"
-                    ));
-                }
-                if state.grant.status == CloudSessionGrantStatus::Enabled
-                    && cloud_grant_runtime_ready(&state.grant)
-                {
-                    return Ok(state.grant);
-                }
-                if state.grant.status == CloudSessionGrantStatus::Paused
-                    && binding_contract_current(&state.grant)
-                    && state
-                        .grant
-                        .backend_binding
-                        .as_ref()
-                        .is_some_and(|binding| !binding.backend_revoked)
-                {
-                    state.grant.status =
-                        if state.grant.backend_binding.as_ref().is_some_and(|binding| {
-                            binding.server_policy_state == CloudSessionServerPolicyState::Approved
-                        }) {
-                            CloudSessionGrantStatus::Enabled
-                        } else {
-                            CloudSessionGrantStatus::PolicyDisabled
-                        };
-                    state.grant.paused_at = None;
-                    state.grant.last_collector_health = Some(
-                        match state.grant.status {
-                            CloudSessionGrantStatus::Enabled => "enabled",
-                            _ => "policy_disabled",
-                        }
-                        .to_string(),
-                    );
-                    self.write(&state)?;
-                    return Ok(state.grant);
-                }
-                if state.grant.status == CloudSessionGrantStatus::PolicyDisabled
-                    && binding_contract_current(&state.grant)
-                    && state
-                        .grant
-                        .backend_binding
-                        .as_ref()
-                        .is_some_and(|binding| !binding.backend_revoked)
-                {
-                    return Ok(state.grant);
-                }
-                state.grant.status = CloudSessionGrantStatus::ConsentRequired;
-                state.grant.paused_at = None;
-                state.grant.last_collector_health = Some("consent_required".to_string());
-                state.grant.last_freshness = Some("unavailable".to_string());
-                state.grant.last_error_category = None;
-                self.write(&state)?;
-                return Ok(state.grant);
-            }
-            if state.grant.backend_create_pending
-                || (state.grant.status == CloudSessionGrantStatus::Revoked
-                    && state
-                        .grant
-                        .backend_binding
-                        .as_ref()
-                        .is_some_and(|binding| !binding.backend_revoked))
-            {
-                return Err(anyhow!("pending cloud-session consent mutation must be reconciled before scope replacement"));
-            }
-            let same_owner = state.grant.organization_fingerprint
-                == opaque_key(&key, &setup.organization_scope)
-                && state.grant.effective_user_fingerprint
-                    == opaque_key(&key, &setup.effective_user_scope);
-            let can_resume = same_owner
-                && binding_contract_current(&state.grant)
-                && state.grant.backend_binding.as_ref().is_some_and(|binding| {
-                    !binding.backend_revoked
-                        && binding.server_policy_state == CloudSessionServerPolicyState::Approved
-                })
-                && matches!(
-                    state.grant.status,
-                    CloudSessionGrantStatus::Enabled | CloudSessionGrantStatus::Paused
-                )
-                && matches!(
-                    state.grant.last_error_category.as_deref(),
-                    None | Some("rebinding" | "rebind_unavailable")
-                );
-            if can_resume {
-                // Explicit resume restores admission to the original approval;
-                // the supervisor rebinds it before any provider execution.
-                state.grant.status = CloudSessionGrantStatus::Enabled;
-                state.grant.paused_at = None;
-                state.grant.last_error_category = Some("rebinding".to_string());
-                self.write(&state)?;
-                return Ok(state.grant);
-            }
-            // Explicit approval for another owner, or after a terminal refusal,
-            // replaces the sole local approval. It never authorizes collection
-            // until the ordinary-browser create response has been bound.
-        }
-        let key = random_key()?;
-        let installation_fingerprint = opaque_key(&key, &setup.installation_id);
-        let grant_scope_id = grant_scope_fingerprint(&key, setup);
-        let grant = CloudSessionGrant {
-            schema_version: GRANT_SCHEMA_VERSION.to_string(),
-            collector_id: COLLECTOR_ID.to_string(),
-            collector_version: compiled_release_version(),
-            release_lane: "supported".to_string(),
-            disclosure_version: DISCLOSURE_VERSION.to_string(),
-            status: CloudSessionGrantStatus::ConsentRequired,
-            installation_fingerprint,
-            grant_scope_id,
-            organization_fingerprint: opaque_key(&key, &setup.organization_scope),
-            effective_user_fingerprint: opaque_key(&key, &setup.effective_user_scope),
-            account_fingerprint: opaque_key(
-                &key,
-                &format!(
-                    "{}\u{0}{}",
-                    setup.organization_scope, setup.effective_user_scope
-                ),
-            ),
-            backend_binding: None,
-            backend_create_pending: false,
-            pending_backend_create: None,
-            granted_at: None,
-            paused_at: None,
-            revoked_at: None,
-            last_collector_health: Some("consent_required".to_string()),
-            last_freshness: Some("unavailable".to_string()),
-            last_error_category: None,
-        };
-        self.write(&PersistedGrant {
-            schema_version: GRANT_SCHEMA_VERSION.to_string(),
-            hmac_key_hex: hex(&key),
-            grant: grant.clone(),
-        })?;
-        Ok(grant)
-    }
-
-    /// Build the exact authenticated backend consent payload without retaining
-    /// the raw installation id. The caller must POST it with ordinary-user auth.
-    pub fn grant_create_request(
-        &self,
-        installation_id: &str,
-    ) -> Result<CloudSessionBackendGrantCreateRequestV1> {
-        let _lock = self.lock()?;
-        let mut state = self
-            .read_locked()?
-            .ok_or_else(|| anyhow!("cloud-session grant is absent"))?;
-        let key = decode_hex(&state.hmac_key_hex)
-            .filter(|key| key.len() == 32)
-            .ok_or_else(|| anyhow!("invalid cloud-session HMAC key"))?;
-        if !is_uuid(installation_id)
-            || opaque_key(&key, installation_id) != state.grant.installation_fingerprint
-        {
-            return Err(anyhow!("cloud-session installation binding is invalid"));
-        }
-        if state.grant.backend_create_pending {
-            let pending = state
-                .grant
-                .pending_backend_create
-                .clone()
-                .unwrap_or_else(|| pending_backend_create(&state.grant));
-            validate_pending_backend_create(&state.grant, &pending)?;
-            if state.grant.pending_backend_create.is_none() {
-                state.grant.pending_backend_create = Some(pending.clone());
-                self.write(&state)?;
-            }
-            return Ok(backend_create_request(installation_id, &pending));
-        }
-        if state.grant.status != CloudSessionGrantStatus::ConsentRequired {
-            return Err(anyhow!(
-                "cloud-session backend grant creation requires fresh local consent"
-            ));
-        }
-        let pending = CloudSessionPendingBackendCreateV1 {
-            source: "codex".to_string(),
-            collector_id: COLLECTOR_ID.to_string(),
-            schema_version: CHANGES_SCHEMA_VERSION.to_string(),
-            collector_version: compiled_release_version(),
-            grant_scope_fingerprint: state.grant.grant_scope_id.clone(),
-            account_fingerprint: state.grant.account_fingerprint.clone(),
-            consent: true,
-        };
-        state.grant.backend_create_pending = true;
-        state.grant.pending_backend_create = Some(pending.clone());
-        self.write(&state)?;
-        Ok(backend_create_request(installation_id, &pending))
-    }
-
-    fn prepare_rebind(
-        &self,
-        setup: &CloudSessionGrantSetup,
-        hardware_id: String,
-    ) -> Result<Option<RebindProposal<CloudSessionGrant>>> {
-        let Some(state) = self.read()? else {
-            return Ok(None);
-        };
-        if !cloud_grant_runtime_ready(&state.grant) {
-            return Ok(None);
-        }
-        let key = decode_hex(&state.hmac_key_hex)
-            .ok_or_else(|| anyhow!("invalid cloud-session HMAC key"))?;
-        if !is_uuid(&setup.installation_id)
-            || state.grant.organization_fingerprint != opaque_key(&key, &setup.organization_scope)
-            || state.grant.effective_user_fingerprint
-                != opaque_key(&key, &setup.effective_user_scope)
-        {
-            return Err(anyhow!("cloud-session rebind owner changed"));
-        }
-        let installation_fingerprint = opaque_key(&key, &setup.installation_id);
-        if installation_fingerprint == state.grant.installation_fingerprint {
-            return Ok(None);
-        }
-        let version = state
-            .grant
-            .backend_binding
-            .as_ref()
-            .expect("runtime-ready binding")
-            .grant_version;
-        Ok(Some(RebindProposal {
-            expected: state.grant.clone(),
-            installation_fingerprint,
-            request: RebindRequest {
-                installation_id: setup.installation_id.clone(),
-                grant_version: version,
-                grant_scope_fingerprint: grant_scope_fingerprint(&key, setup),
-                hardware_id: Some(hardware_id),
-                disclosure_version: state.grant.disclosure_version,
-            },
-        }))
-    }
-
-    /// Bind an authenticated backend grant response. Exact scope matching and
-    /// monotonic grant versions prevent a pre-revoke batch epoch from being
-    /// resurrected after re-consent.
-    pub fn bind_backend_grant(
-        &self,
-        response: &CloudSessionBackendGrantResponseV1,
-        expected_installation_id: &str,
-    ) -> Result<CloudSessionGrant> {
-        self.bind_backend_grant_with_rebind(response, expected_installation_id, None)
-    }
-
-    fn bind_backend_grant_with_rebind(
-        &self,
-        response: &CloudSessionBackendGrantResponseV1,
-        expected_installation_id: &str,
-        rebind: Option<&RebindProposal<CloudSessionGrant>>,
-    ) -> Result<CloudSessionGrant> {
-        let _lock = self.lock()?;
-        let mut state = self
-            .read_locked()?
-            .ok_or_else(|| anyhow!("cloud-session grant is absent"))?;
-        if let Some(proposal) = rebind {
-            if !(cloud_grant_runtime_ready(&state.grant)
-                || matches!(
-                    state.grant.status,
-                    CloudSessionGrantStatus::Paused | CloudSessionGrantStatus::Revoked
-                ))
-                || !same_runtime_grant_identity(&state.grant, &proposal.expected)
-                || state.grant.backend_binding != proposal.expected.backend_binding
-                || response.grant_version != proposal.request.grant_version
-                || response.status != "enabled"
-                || response.schema_version != CHANGES_SCHEMA_VERSION
-            {
-                return Err(anyhow!("cloud-session rebind consent changed"));
-            }
-            let binding = state.grant.backend_binding.as_mut().expect("bound grant");
-            binding
-                .cache_origin
-                .get_or_insert_with(|| CloudSessionCacheOrigin {
-                    installation_fingerprint: state.grant.installation_fingerprint.clone(),
-                    grant_scope_id: state.grant.grant_scope_id.clone(),
-                });
-            binding.server_policy_state = authority_policy(response);
-            state.grant.installation_fingerprint = proposal.installation_fingerprint.clone();
-            state.grant.grant_scope_id = proposal.request.grant_scope_fingerprint.clone();
-            if authority_policy(response) == CloudSessionServerPolicyState::Disabled
-                && state.grant.status == CloudSessionGrantStatus::Enabled
-            {
-                state.grant.status = CloudSessionGrantStatus::PolicyDisabled;
-            }
-        }
-        let local_status = state.grant.status.clone();
-        validate_local_installation_binding(
-            &state,
-            expected_installation_id,
-            "backend cloud-session grant",
-        )?;
-        if !state.grant.backend_create_pending {
-            validate_backend_grant_response(&state, response)?;
-            if response.installation_id != expected_installation_id
-                || !matches!(response.status.as_str(), "enabled" | "paused")
-            {
-                return Err(anyhow!("backend cloud-session grant does not match"));
-            }
-            let existing = state
-                .grant
-                .backend_binding
-                .as_ref()
-                .ok_or_else(|| anyhow!("backend cloud-session grant is unbound"))?;
-            if existing.grant_id == response.id
-                && existing.grant_version == response.grant_version
-                && !existing.backend_revoked
-                && existing.collection_contract.as_deref()
-                    == (response.schema_version == CHANGES_SCHEMA_VERSION)
-                        .then_some(CHANGES_SCHEMA_VERSION)
-            {
-                // Lost loopback responses retry the exact authenticated bind.
-                // Return the current local state without rewriting timestamps
-                // or resurrecting a later pause/revoke.
-                if rebind.is_some() {
-                    state.grant.last_error_category = None;
-                    self.write(&state)?;
-                }
-                return Ok(state.grant);
-            }
-            return Err(anyhow!(
-                "backend cloud-session grant response differs from the bound grant"
-            ));
-        }
-        let pending = state
-            .grant
-            .pending_backend_create
-            .clone()
-            .unwrap_or_else(|| pending_backend_create(&state.grant));
-        validate_pending_backend_create(&state.grant, &pending)?;
-        validate_backend_grant_response(&state, response)?;
-        if response.schema_version != pending.schema_version {
-            return Err(anyhow!(
-                "backend cloud-session grant contract differs from pending create"
-            ));
-        }
-        if response.installation_id != expected_installation_id {
-            return Err(anyhow!("backend cloud-session grant scope does not match"));
-        }
-        if !matches!(response.status.as_str(), "enabled" | "paused") {
-            return Err(anyhow!("backend cloud-session grant is not consented"));
-        }
-        if let Some(existing) = &state.grant.backend_binding {
-            if existing.grant_id != response.id {
-                return Err(anyhow!("backend cloud-session grant identity changed"));
-            }
-            // The same epoch may be re-bound only to move a binding written
-            // before this collection contract onto it.
-            if response.grant_version < existing.grant_version
-                || (state.grant.status != CloudSessionGrantStatus::Enabled
-                    && response.grant_version == existing.grant_version
-                    && existing.collection_contract.as_deref() == Some(CHANGES_SCHEMA_VERSION))
-            {
-                return Err(anyhow!("backend cloud-session grant epoch is stale"));
-            }
-        }
-        state.grant.backend_binding = Some(authority_binding(response, false));
-        state.grant.backend_create_pending = false;
-        state.grant.pending_backend_create = None;
-        state.grant.collector_version = compiled_release_version();
-        if local_status == CloudSessionGrantStatus::Revoked {
-            self.write(&state)?;
-            // A POST may commit just before local revoke or rollout removal.
-            // Preserve only its exact identity for compensating DELETE; local
-            // revoked state continues to block every provider admission.
-            return Ok(state.grant);
-        }
-        if local_status == CloudSessionGrantStatus::Paused {
-            state.grant.granted_at = Some(timestamp(OffsetDateTime::now_utc()));
-            self.write(&state)?;
-            return Ok(state.grant);
-        }
-        if !matches!(
-            local_status,
-            CloudSessionGrantStatus::ConsentRequired | CloudSessionGrantStatus::Enabled
-        ) {
-            return Err(anyhow!(
-                "local cloud-session consent changed before backend grant binding"
-            ));
-        }
-        state.grant.status = match authority_policy(response) {
-            CloudSessionServerPolicyState::Approved => CloudSessionGrantStatus::Enabled,
-            CloudSessionServerPolicyState::Disabled => CloudSessionGrantStatus::PolicyDisabled,
-        };
-        state.grant.granted_at = Some(timestamp(OffsetDateTime::now_utc()));
-        state.grant.revoked_at = None;
-        state.grant.last_collector_health = Some(
-            match authority_policy(response) {
-                CloudSessionServerPolicyState::Approved => "enabled",
-                CloudSessionServerPolicyState::Disabled => "policy_disabled",
-            }
-            .to_string(),
-        );
-        state.grant.last_freshness = Some("unavailable".to_string());
-        state.grant.last_error_category = None;
-        self.write(&state)?;
-        Ok(state.grant)
-    }
-
-    /// Apply the server's exact DELETE response after local revocation. A
-    /// monotonic version is retained so re-consent must bind a newer epoch.
-    pub fn apply_backend_revocation(
-        &self,
-        response: &CloudSessionBackendGrantResponseV1,
-        expected_installation_id: &str,
-    ) -> Result<CloudSessionGrant> {
-        self.apply_backend_revocation_inner(response, expected_installation_id, None)
-    }
-
-    /// Reconcile a DELETE after a rebind committed but its reply was lost.
-    /// This only proves cleanup of the known grant; it never enables consent.
-    pub(crate) fn reconcile_backend_revocation(
-        &self,
-        response: &CloudSessionBackendGrantResponseV1,
-        setup: &CloudSessionGrantSetup,
-    ) -> Result<CloudSessionGrant> {
-        self.apply_backend_revocation_inner(response, &setup.installation_id, Some(setup))
-    }
-
-    fn apply_backend_revocation_inner(
-        &self,
-        response: &CloudSessionBackendGrantResponseV1,
-        expected_installation_id: &str,
-        current: Option<&CloudSessionGrantSetup>,
-    ) -> Result<CloudSessionGrant> {
-        let _lock = self.lock()?;
-        let mut state = self
-            .read_locked()?
-            .ok_or_else(|| anyhow!("cloud-session grant is absent"))?;
-        if let Some(setup) = current {
-            let key = decode_hex(&state.hmac_key_hex)
-                .filter(|key| key.len() == 32)
-                .ok_or_else(|| anyhow!("invalid cloud-session HMAC key"))?;
-            let rebound = CloudSessionGrantSetup {
-                installation_id: response.installation_id.clone(),
-                ..setup.clone()
-            };
-            if response.grant_scope_fingerprint == grant_scope_fingerprint(&key, &rebound)
-                && state.grant.status == CloudSessionGrantStatus::Revoked
-                && state.grant.organization_fingerprint
-                    == opaque_key(&key, &setup.organization_scope)
-                && state.grant.effective_user_fingerprint
-                    == opaque_key(&key, &setup.effective_user_scope)
-            {
-                // The authenticated exact DELETE response proves where the
-                // known grant ended up, without retrying rebind after revoke.
-                state.grant.installation_fingerprint = opaque_key(&key, &response.installation_id);
-                state.grant.grant_scope_id = response.grant_scope_fingerprint.clone();
-            }
-        }
-        validate_local_installation_binding(
-            &state,
-            &response.installation_id,
-            "backend cloud-session revocation",
-        )?;
-        validate_backend_grant_response(&state, response)?;
-        if !is_uuid(expected_installation_id) {
-            return Err(anyhow!("current cloud-session installation is invalid"));
-        }
-        let existing = state
-            .grant
-            .backend_binding
-            .as_ref()
-            .ok_or_else(|| anyhow!("backend cloud-session grant is unbound"))?;
-        if response.status != "revoked"
-            || response.id != existing.grant_id
-            || response.grant_version < existing.grant_version
-        {
-            return Err(anyhow!("backend cloud-session revocation does not match"));
-        }
-        state.grant.backend_binding = Some(authority_binding(response, true));
-        state.grant.backend_create_pending = false;
-        state.grant.pending_backend_create = None;
-        state.grant.status = CloudSessionGrantStatus::Revoked;
-        state.grant.last_collector_health = Some("revoked".to_string());
-        state.grant.last_freshness = Some("unavailable".to_string());
-        self.write(&state)?;
-        Ok(state.grant)
-    }
-
-    /// Apply the one authority read made before each due work slice.
-    /// Unknown, malformed, stale, or mismatched responses are rejected without
-    /// changing runtime readiness. A remote pause or policy-disabled answer
-    /// leaves local consent untouched; a remote revoke revokes locally.
-    pub fn apply_backend_authority(
-        &self,
-        authority: &CloudSessionGrantAuthorityV1,
-    ) -> Result<CloudSessionGrant> {
-        let _lock = self.lock()?;
-        let mut state = self
-            .read_locked()?
-            .ok_or_else(|| anyhow!("cloud-session grant is absent"))?;
-        let existing = state
-            .grant
-            .backend_binding
-            .as_ref()
-            .ok_or_else(|| anyhow!("backend cloud-session grant is unbound"))?;
-        if authority.schema_version != AUTHORITY_SCHEMA_VERSION
-            || !is_uuid(&authority.grant_id)
-            || !authority.grant_id.eq_ignore_ascii_case(&existing.grant_id)
-            || authority.grant_version != existing.grant_version
-            || authority.contract_version != CHANGES_SCHEMA_VERSION
-            || authority.disclosure_version != DISCLOSURE_VERSION
-            || !matches!(authority.status.as_str(), "enabled" | "paused" | "revoked")
-            || authority
-                .collect_not_before
-                .as_deref()
-                .is_some_and(|value| !valid_rfc3339(value))
-        {
-            return Err(anyhow!("backend cloud-session authority does not match"));
-        }
-        let backend_revoked = authority.status == "revoked";
-        let policy = if authority.status == "enabled" && authority.can_collect {
-            CloudSessionServerPolicyState::Approved
-        } else {
-            CloudSessionServerPolicyState::Disabled
-        };
-        let before = state.grant.clone();
-        // The bound contract is the one consent created; authority never
-        // upgrades a grant created on an earlier contract.
-        let binding = state
-            .grant
-            .backend_binding
-            .as_mut()
-            .expect("binding checked above");
-        binding.backend_revoked = backend_revoked;
-        binding.server_policy_state = policy.clone();
-        binding.collect_not_before = authority.collect_not_before.clone();
-        if backend_revoked {
-            state.grant.status = CloudSessionGrantStatus::Revoked;
-            state.grant.backend_create_pending = false;
-            state.grant.pending_backend_create = None;
-            state.grant.last_collector_health = Some("revoked".to_string());
-            state.grant.last_freshness = Some("unavailable".to_string());
-        } else if !matches!(
-            state.grant.status,
-            CloudSessionGrantStatus::Paused | CloudSessionGrantStatus::Revoked
-        ) {
-            state.grant.status = match policy {
-                CloudSessionServerPolicyState::Approved => CloudSessionGrantStatus::Enabled,
-                CloudSessionServerPolicyState::Disabled => CloudSessionGrantStatus::PolicyDisabled,
-            };
-            if state.grant.status != before.status {
-                state.grant.last_collector_health = Some(
-                    match state.grant.status {
-                        CloudSessionGrantStatus::Enabled => "enabled",
-                        _ => "policy_disabled",
-                    }
-                    .to_string(),
-                );
-            }
-        }
-        if state.grant != before {
-            self.write(&state)?;
-        }
-        Ok(state.grant)
-    }
-
-    /// A list absence cannot resolve an ambiguous POST: its response may have
-    /// raced the list. Preserve the tombstone and retry the same idempotent
-    /// create until the exact backend grant id is bound, then delete that id if
-    /// local consent was revoked.
-    #[cfg(test)]
-    pub fn confirm_backend_grant_absent_after_reconciliation(&self) -> Result<()> {
-        let _lock = self.lock()?;
-        let state = self
-            .read_locked()?
-            .ok_or_else(|| anyhow!("cloud-session grant is absent"))?;
-        if state.grant.backend_binding.is_some() {
-            return Err(anyhow!("backend cloud-session grant is already bound"));
-        }
-        Err(anyhow!(
-            "backend grant absence cannot resolve an ambiguous create; retry the exact create"
-        ))
-    }
-
-    /// Exact DELETE target retained after local stop. The companion/UI uses
-    /// ordinary-user auth for `/api/v1/cloud-sessions/grants/{grant_id}`.
-    pub fn grant_revoke_target(&self) -> Result<CloudSessionBackendGrantRevokeTargetV1> {
-        let grant = self
-            .load()?
-            .ok_or_else(|| anyhow!("cloud-session grant is absent"))?;
-        let binding = grant
-            .backend_binding
-            .ok_or_else(|| anyhow!("backend cloud-session grant is unbound"))?;
-        Ok(CloudSessionBackendGrantRevokeTargetV1 {
-            grant_id: binding.grant_id,
-        })
-    }
-
-    pub fn pause(&self, now: OffsetDateTime) -> Result<()> {
-        self.change_status(CloudSessionGrantStatus::Paused, now)
-    }
-
-    pub fn revoke(&self, now: OffsetDateTime) -> Result<()> {
-        self.change_status(CloudSessionGrantStatus::Revoked, now)
-    }
-
-    fn change_status(&self, status: CloudSessionGrantStatus, now: OffsetDateTime) -> Result<()> {
-        let _lock = self.lock()?;
-        let mut state = self
-            .read_locked()?
-            .ok_or_else(|| anyhow!("cloud-session grant is absent"))?;
-        state.grant.status = status.clone();
-        state.grant.last_collector_health = Some(
-            match status {
-                CloudSessionGrantStatus::Paused => "paused",
-                CloudSessionGrantStatus::Revoked => "revoked",
-                _ => "disabled",
-            }
-            .to_string(),
-        );
-        state.grant.last_freshness = Some("unavailable".to_string());
-        state.grant.last_error_category = None;
-        match status {
-            CloudSessionGrantStatus::Paused => state.grant.paused_at = Some(timestamp(now)),
-            CloudSessionGrantStatus::Revoked => state.grant.revoked_at = Some(timestamp(now)),
-            _ => {}
-        }
-        self.write(&state)
-    }
-
-    fn read(&self) -> Result<Option<PersistedGrant>> {
-        if !self.path.exists() {
-            return Ok(None);
-        }
-        let _lock = self.lock()?;
-        self.read_locked()
-    }
-
-    fn read_locked(&self) -> Result<Option<PersistedGrant>> {
-        if !self.path.exists() {
-            return Ok(None);
-        }
-        let bytes = fs::read(&self.path).context("read cloud-session grant")?;
-        let state = match serde_json::from_slice::<PersistedGrant>(&bytes) {
-            Ok(state) => state,
-            Err(current_error) => {
-                let legacy: LegacyPersistedGrantV1 = serde_json::from_slice(&bytes)
-                    .with_context(|| format!("decode cloud-session grant: {current_error}"))?;
-                self.migrate_legacy_v1(legacy)?
-            }
-        };
-        if state.schema_version != GRANT_SCHEMA_VERSION
-            || state.grant.schema_version != GRANT_SCHEMA_VERSION
-        {
-            return Err(anyhow!("unsupported cloud-session grant version"));
-        }
-        Ok(Some(state))
-    }
-
-    fn migrate_legacy_v1(&self, legacy: LegacyPersistedGrantV1) -> Result<PersistedGrant> {
-        if legacy.schema_version != GRANT_SCHEMA_VERSION
-            || legacy.grant.schema_version != GRANT_SCHEMA_VERSION
-            || legacy.grant.installation_id.trim().is_empty()
-        {
-            return Err(anyhow!("unsupported cloud-session grant version"));
-        }
-        let key = decode_hex(&legacy.hmac_key_hex)
-            .filter(|key| key.len() == 32)
-            .ok_or_else(|| anyhow!("invalid cloud-session HMAC key"))?;
-        let installation_fingerprint = opaque_key(&key, &legacy.grant.installation_id);
-        let grant_scope_id = opaque_key(
-            &key,
-            &format!(
-                "{}\u{0}{}\u{0}{}\u{0}{}",
-                legacy.grant.installation_id,
-                legacy.grant.organization_fingerprint,
-                legacy.grant.effective_user_fingerprint,
-                legacy.grant.collector_id
-            ),
-        );
-        let state = PersistedGrant {
-            schema_version: legacy.schema_version,
-            hmac_key_hex: legacy.hmac_key_hex,
-            grant: CloudSessionGrant {
-                schema_version: legacy.grant.schema_version,
-                collector_id: legacy.grant.collector_id,
-                collector_version: legacy.grant.collector_version,
-                release_lane: legacy.grant.release_lane,
-                disclosure_version: legacy.grant.disclosure_version,
-                status: legacy.grant.status,
-                installation_fingerprint,
-                grant_scope_id,
-                organization_fingerprint: legacy.grant.organization_fingerprint,
-                effective_user_fingerprint: legacy.grant.effective_user_fingerprint,
-                account_fingerprint: legacy.grant.account_fingerprint,
-                backend_binding: None,
-                backend_create_pending: false,
-                pending_backend_create: None,
-                granted_at: legacy.grant.granted_at,
-                paused_at: legacy.grant.paused_at,
-                revoked_at: legacy.grant.revoked_at,
-                last_collector_health: legacy.grant.last_collector_health,
-                last_freshness: legacy.grant.last_freshness,
-                last_error_category: legacy.grant.last_error_category,
-            },
-        };
-        self.write(&state)?;
-        Ok(state)
-    }
-
-    fn write(&self, state: &PersistedGrant) -> Result<()> {
-        atomic_json_write(&self.path, state)
-    }
-
-    fn record_health(
-        &self,
-        health: &str,
-        freshness: &str,
-        error_category: Option<&str>,
-    ) -> Result<()> {
-        let _lock = self.lock()?;
-        let Some(mut state) = self.read_locked()? else {
-            return Ok(());
-        };
-        if state.grant.status != CloudSessionGrantStatus::Enabled
-            || (state.grant.last_collector_health.as_deref() == Some(health)
-                && state.grant.last_freshness.as_deref() == Some(freshness)
-                && state.grant.last_error_category.as_deref() == error_category)
-        {
-            return Ok(());
-        }
-        state.grant.last_collector_health = Some(health.to_string());
-        state.grant.last_freshness = Some(freshness.to_string());
-        state.grant.last_error_category = error_category.map(str::to_string);
-        self.write(&state)
-    }
-
-    /// The state can be changed by the local UI/control process while the
-    /// collector thread records health. Hold a process-wide lock so stale
-    /// read-modify-write health updates cannot restore consent.
-    fn lock(&self) -> Result<FileLock> {
-        lock_state_file(&self.path, "grant")
-    }
-}
-
-impl Default for CloudSessionGrantStore {
-    fn default() -> Self {
-        Self::new(
-            default_support_dir()
-                .join("cloud_sessions")
-                .join("grant.json"),
-        )
-    }
-}
-
 /// Waits for an exclusive flock on `<state_path>.lock` (0600) in an owner-only
 /// (0700) directory.
 pub(crate) fn lock_state_file(state_path: &Path, label: &str) -> Result<FileLock> {
@@ -1218,149 +193,6 @@ pub(crate) fn lock_state_file(state_path: &Path, label: &str) -> Result<FileLock
         .with_context(|| format!("open cloud-session {label} lock"))?;
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
     FileLock::exclusive(file).map_err(|_| anyhow!("lock cloud-session {label}"))
-}
-
-/// Build the visible collector state without creating a runner or invoking
-/// Codex. Runtime readiness is supplied as a credential-free status view;
-/// collection still requires exact grant authority inside the supervisor.
-pub fn cloud_session_collector_status(
-    grants: &CloudSessionGrantStore,
-    transport: &dyn CloudSessionTransport,
-) -> CloudSessionCollectorStatusV1 {
-    let stored_grant = grants.load().ok().flatten();
-    let backend_reconciliation_required = stored_grant
-        .as_ref()
-        .is_some_and(|grant| grant.backend_create_pending);
-    let backend_revocation_confirmation_required = stored_grant.as_ref().is_some_and(|grant| {
-        grant.status == CloudSessionGrantStatus::Revoked
-            && grant
-                .backend_binding
-                .as_ref()
-                .is_some_and(|binding| !binding.backend_revoked)
-    });
-    let grant_status = if kill_switch_enabled() {
-        CloudSessionGrantStatus::PolicyDisabled
-    } else {
-        stored_grant
-            .clone()
-            .map(|grant| {
-                if grant.status == CloudSessionGrantStatus::Enabled
-                    && grant.backend_binding.as_ref().is_some_and(|binding| {
-                        !binding.backend_revoked
-                            && binding.server_policy_state
-                                != CloudSessionServerPolicyState::Approved
-                    })
-                {
-                    CloudSessionGrantStatus::PolicyDisabled
-                } else if grant.status == CloudSessionGrantStatus::Enabled
-                    && !cloud_grant_runtime_ready(&grant)
-                {
-                    CloudSessionGrantStatus::ConsentRequired
-                } else {
-                    grant.status
-                }
-            })
-            .unwrap_or(CloudSessionGrantStatus::Off)
-    };
-    let transport_configured = transport.is_configured();
-    let continuity_reason = stored_grant
-        .as_ref()
-        .and_then(|grant| grant.last_error_category.as_deref())
-        .and_then(grant_rebind::status_reason);
-    let provider_cli_invocation_permitted =
-        stored_grant.as_ref().is_some_and(cloud_grant_runtime_ready)
-            && transport_configured
-            && continuity_reason.is_none()
-            && !kill_switch_enabled();
-    let (runtime_state, reason_code) = if kill_switch_enabled() {
-        (
-            CloudSessionRuntimeState::PolicyDisabled,
-            "policy_disabled".to_string(),
-        )
-    } else if let Some(reason) = continuity_reason {
-        (
-            CloudSessionRuntimeState::ConsentRequired,
-            reason.to_string(),
-        )
-    } else if grant_status == CloudSessionGrantStatus::Enabled && !transport_configured {
-        (
-            CloudSessionRuntimeState::TransportDeferred,
-            "transport_deferred".to_string(),
-        )
-    } else {
-        let reason_code = if backend_reconciliation_required {
-            "backend_grant_reconciliation_required"
-        } else if backend_revocation_confirmation_required {
-            "backend_revocation_confirmation_required"
-        } else {
-            match grant_status {
-                CloudSessionGrantStatus::Off => "setup_required",
-                CloudSessionGrantStatus::ConsentRequired => "consent_required",
-                CloudSessionGrantStatus::Enabled => "enabled",
-                CloudSessionGrantStatus::Paused => "paused",
-                CloudSessionGrantStatus::Revoked => "revoked",
-                CloudSessionGrantStatus::PolicyDisabled => "policy_disabled",
-            }
-        };
-        (
-            match grant_status {
-                CloudSessionGrantStatus::Off => CloudSessionRuntimeState::Off,
-                CloudSessionGrantStatus::ConsentRequired => {
-                    CloudSessionRuntimeState::ConsentRequired
-                }
-                CloudSessionGrantStatus::Enabled => CloudSessionRuntimeState::Enabled,
-                CloudSessionGrantStatus::Paused => CloudSessionRuntimeState::Paused,
-                CloudSessionGrantStatus::Revoked => CloudSessionRuntimeState::Revoked,
-                CloudSessionGrantStatus::PolicyDisabled => CloudSessionRuntimeState::PolicyDisabled,
-            },
-            reason_code.to_string(),
-        )
-    };
-    CloudSessionCollectorStatusV1 {
-        schema_version: "cloud_session_collector_status.v1".to_string(),
-        collector_id: COLLECTOR_ID.to_string(),
-        grant_status,
-        runtime_state,
-        transport_configured,
-        provider_cli_invocation_permitted,
-        reason_code,
-    }
-}
-
-pub fn default_cloud_session_collector_status() -> CloudSessionCollectorStatusV1 {
-    let transport_configured = runtime_transport_locally_configured_with(
-        &CloudSessionGrantStore::default(),
-        &FileAccountStore::default(),
-        &FileDeviceStore::default(),
-        &FileConnectionStore::default(),
-        crate::snapshot_client::load_snapshot_device_credentials,
-    );
-    cloud_session_collector_status(
-        &CloudSessionGrantStore::default(),
-        &RuntimeAvailabilityTransport(transport_configured),
-    )
-}
-
-fn runtime_transport_locally_configured_with<F>(
-    grants: &CloudSessionGrantStore,
-    accounts: &FileAccountStore,
-    devices: &FileDeviceStore,
-    connections: &FileConnectionStore,
-    load_credentials: F,
-) -> bool
-where
-    F: FnOnce() -> Result<(LocalDeviceBinding, String)>,
-{
-    !kill_switch_enabled()
-        && load_cloud_session_runtime_binding(grants, accounts, devices, connections)
-            .ok()
-            .flatten()
-            .and_then(|candidate| {
-                load_credentials().ok().map(|(device, secret)| {
-                    device == candidate.binding.device && !secret.trim().is_empty()
-                })
-            })
-            .unwrap_or(false)
 }
 
 /// Process-local collector state shared with local control: the provider and
@@ -1422,13 +254,9 @@ impl CloudSessionCheckpointStore {
 
     fn begin_collector_io<'a>(
         &'a self,
-        grants: &CloudSessionGrantStore,
-        expected: &CloudSessionGrant,
         transport: &dyn CloudSessionTransport,
     ) -> Result<Option<CloudSessionIoLease<'a>>> {
-        self.begin_io(|| {
-            transport.local_binding_current(expected) && grant_still_current(grants, expected)
-        })
+        self.begin_io(|| transport.local_binding_current())
     }
 
     /// Serialize admission with identity mutation, then release that lock
@@ -1444,7 +272,7 @@ impl CloudSessionCheckpointStore {
             .lock()
             .map_err(|_| anyhow!("cloud-session collector-I/O fence is unavailable"))?;
         // Keep the stop check and lease registration under the same mutex
-        // used by the drain, so a pause cannot return between them.
+        // used by the drain, so an identity change cannot return between them.
         if !current() {
             return Ok(None);
         }
@@ -1454,10 +282,10 @@ impl CloudSessionCheckpointStore {
         }))
     }
 
-    /// Wait until every provider subprocess, relay write or cache commit
-    /// admitted before a local stop has returned. Persisted pause/revoke state
-    /// closes admission; callers must then complete this wait before reporting
-    /// the stop, erasing the cache or deleting backend consent.
+    /// Wait until every provider subprocess, relay read or write, or cache
+    /// commit admitted before an identity change has returned. The identity
+    /// reservation closes admission; callers complete this wait before
+    /// replacing account or device state.
     pub fn wait_for_collector_io_idle(&self, timeout: Duration) -> Result<()> {
         let deadline = Instant::now() + timeout;
         let mut active = self
@@ -1482,12 +310,6 @@ impl CloudSessionCheckpointStore {
         Ok(())
     }
 
-    /// Erase the cloud-task ACK cache after a local revoke, once collector I/O
-    /// is idle. The server-owned cutoff, not this cache, prevents revival.
-    pub fn erase_cache(&self) -> Result<()> {
-        crate::upload_receipts::cloud_erase_all(&self.state_dir)
-    }
-
     fn read_acks(
         &self,
         scope: &[u8; 32],
@@ -1506,11 +328,10 @@ impl CloudSessionCheckpointStore {
     }
 
     /// Commit one slice's settled tasks under an I/O lease, so a commit racing
-    /// a local revoke either finishes before the revoke's erase or is refused.
+    /// an identity change either finishes before the change or is refused.
     fn commit(
         &self,
-        inputs: &SliceInputs<'_>,
-        expected: &CloudSessionGrant,
+        transport: &dyn CloudSessionTransport,
         scope: &[u8; 32],
         settled: &HashMap<String, ([u8; 32], Option<String>)>,
         crawl_completed: Option<Date>,
@@ -1519,8 +340,7 @@ impl CloudSessionCheckpointStore {
         if settled.is_empty() && crawl_completed.is_none() {
             return Ok(());
         }
-        let Some(lease) = self.begin_collector_io(inputs.grants, expected, inputs.transport)?
-        else {
+        let Some(lease) = self.begin_collector_io(transport)? else {
             return Ok(());
         };
         let acks = settled
@@ -1541,16 +361,6 @@ impl CloudSessionCheckpointStore {
         );
         drop(lease);
         result
-    }
-
-    /// The pre-ACK-cache collector kept a page digest here; it cannot seed
-    /// per-task ACKs, so it is removed once the cache is in use.
-    fn retire_legacy_checkpoint(&self) {
-        let _ = fs::remove_file(
-            self.state_dir
-                .join("cloud_sessions")
-                .join("checkpoint.json"),
-        );
     }
 
     #[cfg(test)]
@@ -1629,105 +439,44 @@ pub trait CloudSessionRunner {
 }
 
 pub trait CloudSessionTransport {
-    /// A backend route must be explicitly wired before collection starts. This
-    /// prevents a setup grant from causing provider calls that cannot yield a
-    /// permitted upload.
+    /// A backend route must be explicitly wired before collection starts.
     fn is_configured(&self) -> bool {
         true
     }
-    /// Current local device/account authority must still match at every I/O fence.
-    fn local_binding_current(&self, _grant: &CloudSessionGrant) -> bool {
+    /// The connected account, organization, Codex relay device and
+    /// destination this transport was composed for are still current.
+    /// Checked at every I/O fence.
+    fn local_binding_current(&self) -> bool {
         true
     }
 
-    /// One bounded relay-authenticated read of the exact bound grant epoch on
-    /// the `cloud_session_changes.v1` authority. Fails closed on any network,
-    /// authentication, parsing or absence error.
-    fn read_authority(
-        &self,
-        grant: &CloudSessionGrant,
-        timeout: Duration,
-    ) -> Result<CloudSessionGrantAuthorityV1>;
+    /// One bounded relay-authenticated read of the Codex activity hint. Fails
+    /// closed on any network, authentication or parsing error.
+    fn read_hint(&self, timeout: Duration) -> Result<ActivityHintResponse>;
     /// Upload one validated request and return its parsed ACK. Matching the
     /// ACK to the offered tasks is the caller's job.
     fn send_changes(
         &self,
-        request: &CloudSessionChangesV1,
+        request: &CloudSessionChangesV2,
         timeout: Duration,
-    ) -> Result<CloudSessionChangesAckV1>;
+    ) -> Result<CloudSessionChangesAckV2>;
 }
 
-/// Used where no relay transport is composed (local control status).
-pub struct DeferredCloudSessionTransport;
-impl CloudSessionTransport for DeferredCloudSessionTransport {
-    fn is_configured(&self) -> bool {
-        false
-    }
-
-    fn read_authority(
-        &self,
-        _grant: &CloudSessionGrant,
-        _timeout: Duration,
-    ) -> Result<CloudSessionGrantAuthorityV1> {
-        Err(anyhow!("cloud-session authority is not configured"))
-    }
-
-    fn send_changes(
-        &self,
-        _request: &CloudSessionChangesV1,
-        _timeout: Duration,
-    ) -> Result<CloudSessionChangesAckV1> {
-        Err(anyhow!("cloud-session ingest endpoint is not configured"))
-    }
-}
-
-/// Status-only view of the process-local runtime composition. It carries no
-/// credentials and cannot send; collection always uses the relay transport.
-struct RuntimeAvailabilityTransport(bool);
-
-impl CloudSessionTransport for RuntimeAvailabilityTransport {
-    fn is_configured(&self) -> bool {
-        self.0
-    }
-
-    fn read_authority(
-        &self,
-        _grant: &CloudSessionGrant,
-        _timeout: Duration,
-    ) -> Result<CloudSessionGrantAuthorityV1> {
-        Err(anyhow!(
-            "cloud-session status transport cannot read authority"
-        ))
-    }
-
-    fn send_changes(
-        &self,
-        _request: &CloudSessionChangesV1,
-        _timeout: Duration,
-    ) -> Result<CloudSessionChangesAckV1> {
-        Err(anyhow!("cloud-session status transport cannot send"))
-    }
-}
-
-/// Relay transport for the strict backend routes, composed only after exact
-/// local identity/grant checks. It acquires through the shared relay-token
-/// cache and retries once on 401/403 within the caller's deadline.
+/// Relay transport for the strict backend routes, composed only for the
+/// connected Codex Mac. It acquires through the shared relay-token cache and
+/// retries once on 401/403 within the caller's deadline.
 pub struct RelayCloudSessionTransport {
     client: crate::snapshot_client::SnapshotApiClient,
-    device: LocalDeviceBinding,
+    binding: CloudSessionRuntimeBinding,
     device_secret: String,
     gzip_enabled: AtomicBool,
 }
 
 impl RelayCloudSessionTransport {
-    pub fn new(
-        api_base_url: impl Into<String>,
-        device: LocalDeviceBinding,
-        device_secret: String,
-    ) -> Self {
+    fn new(binding: CloudSessionRuntimeBinding, device_secret: String) -> Self {
         Self {
-            client: crate::snapshot_client::SnapshotApiClient::new(api_base_url),
-            device,
+            client: crate::snapshot_client::SnapshotApiClient::new(binding.api_base_url.clone()),
+            binding,
             device_secret,
             gzip_enabled: AtomicBool::new(true),
         }
@@ -1737,16 +486,16 @@ impl RelayCloudSessionTransport {
         let timeout = remaining_budget(deadline)
             .ok_or_else(|| anyhow!("cloud-session cycle budget exhausted"))?;
         self.client.issue_relay_token_with_timeout(
-            &self.device,
+            &self.binding.device,
             &self.device_secret,
             crate::snapshots::SnapshotSource::Codex,
             timeout,
         )
     }
 
-    fn with_relay_retry<F>(&self, timeout: Duration, request: F) -> Result<Value>
+    fn with_relay_retry<T, F>(&self, timeout: Duration, request: F) -> Result<T>
     where
-        F: Fn(&crate::snapshot_client::SnapshotApiClient, &str, Duration) -> Result<Value>,
+        F: Fn(&crate::snapshot_client::SnapshotApiClient, &str, Duration) -> Result<T>,
     {
         if !self.is_configured() {
             return Err(anyhow!("cloud-session relay transport is not source-bound"));
@@ -1774,65 +523,37 @@ impl RelayCloudSessionTransport {
 impl CloudSessionTransport for RelayCloudSessionTransport {
     fn is_configured(&self) -> bool {
         !self.device_secret.is_empty()
-            && is_uuid(&self.device.device_id)
-            && self.device.sources.iter().any(|source| source == "codex")
+            && is_uuid(&self.binding.device.device_id)
+            && self
+                .binding
+                .device
+                .sources
+                .iter()
+                .any(|source| source == "codex")
     }
 
-    fn local_binding_current(&self, grant: &CloudSessionGrant) -> bool {
-        if grant_rebind::verified_live_hardware().is_err() {
-            return false;
-        }
+    fn local_binding_current(&self) -> bool {
         load_cloud_session_runtime_binding(
-            &CloudSessionGrantStore::default(),
             &FileAccountStore::default(),
             &FileDeviceStore::default(),
             &FileConnectionStore::default(),
         )
         .ok()
         .flatten()
-        .is_some_and(|candidate| {
-            candidate.binding.device == self.device
-                && self
-                    .client
-                    .matches_api_base(&candidate.binding.api_base_url)
-                && same_runtime_grant_identity(&candidate.grant, grant)
-        })
+        .is_some_and(|current| current == self.binding)
     }
 
-    fn read_authority(
-        &self,
-        grant: &CloudSessionGrant,
-        timeout: Duration,
-    ) -> Result<CloudSessionGrantAuthorityV1> {
-        let binding = grant
-            .backend_binding
-            .as_ref()
-            .ok_or_else(|| anyhow!("cloud-session backend grant is unbound"))?;
-        if !is_uuid(&binding.grant_id) || binding.grant_version == 0 {
-            return Err(anyhow!("cloud-session backend grant binding is invalid"));
-        }
-        let value = self.with_relay_retry(timeout, |client, token, request_timeout| {
-            client.get_cloud_session_authority_with_timeout(
-                token,
-                &binding.grant_id,
-                binding.grant_version,
-                request_timeout,
-            )
-        })?;
-        if value.get("schema_version").and_then(Value::as_str) != Some(AUTHORITY_SCHEMA_VERSION) {
-            return Err(
-                crate::snapshot_client::CloudSessionRouteUnsupported { status: 200 }.into(),
-            );
-        }
-        serde_json::from_value(value)
-            .map_err(|_| anyhow!("invalid cloud-session authority response"))
+    fn read_hint(&self, timeout: Duration) -> Result<ActivityHintResponse> {
+        self.with_relay_retry(timeout, |client, token, request_timeout| {
+            client.get_activity_hint_with_timeout(token, request_timeout)
+        })
     }
 
     fn send_changes(
         &self,
-        request: &CloudSessionChangesV1,
+        request: &CloudSessionChangesV2,
         timeout: Duration,
-    ) -> Result<CloudSessionChangesAckV1> {
+    ) -> Result<CloudSessionChangesAckV2> {
         request.validate()?;
         let body = serde_json::to_value(request)?;
         let value = self.with_relay_retry(timeout, |client, token, request_timeout| {
@@ -1847,6 +568,7 @@ impl CloudSessionTransport for RelayCloudSessionTransport {
             .map_err(|error| anyhow!("invalid cloud-session changes ACK: {error}"))
     }
 }
+
 pub struct CodexCloudCliRunner;
 
 /// One Codex CLI child (`codex cloud list`, the limits probe's `codex
@@ -2153,14 +875,13 @@ impl CloudSessionRunner for CodexCloudCliRunner {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloudSessionCycleOutcome {
-    /// No consent, a local pause or revoke, the kill switch, or no binding:
-    /// no provider or backend call was made.
+    /// The kill switch, no connected Codex Mac, a local identity change or a
+    /// retired contract: no provider or backend call was made.
     Disabled,
     /// Nothing was due yet.
     NotDue,
-    /// The server does not authorize collection now (remote pause, policy,
-    /// or an older server without this contract). Rechecked at the idle
-    /// cadence or after a local consent change.
+    /// Listing is off for this user, the server refused it, or the server
+    /// lacks the route. Rechecked later; no provider call was made.
     Unsupported,
     /// Work ran and no task changed.
     Noop,
@@ -2170,22 +891,30 @@ pub enum CloudSessionCycleOutcome {
     Failed,
 }
 
-/// The collector's in-memory schedule; one per supervisor.
+/// The collector's in-memory state; one per supervisor.
 #[derive(Default)]
 pub struct CloudCollector {
     schedule: CloudSchedule,
+    /// Successful head listings in a row from which the server accepted
+    /// nothing new; sets the head interval. Outlives `schedule.clear()`.
+    unchanged_heads: u32,
+    /// The server retired the contract this build speaks (HTTP 410): nothing
+    /// runs again in this process. An update restarts the daemon.
+    retired: bool,
+    /// The last state logged, so each transition logs one line.
+    reported: Option<&'static str>,
 }
 
 /// Everything one work slice uses.
 pub struct SliceInputs<'a> {
-    pub grants: &'a CloudSessionGrantStore,
     pub checkpoints: &'a CloudSessionCheckpointStore,
     pub runner: &'a dyn CloudSessionRunner,
     pub transport: &'a dyn CloudSessionTransport,
-    /// The validated backend destination; part of the ACK-cache scope.
+    /// The validated backend destination; part of every cache scope.
     pub destination: &'a str,
-    /// The latest local Codex transcript event the file watcher saw.
-    pub last_activity: Option<Instant>,
+    /// The connected local organization and user; part of every cache scope.
+    pub organization_id: &'a str,
+    pub user_id: &'a str,
 }
 
 #[derive(Debug)]
@@ -2198,9 +927,14 @@ struct SliceError {
 enum SliceErrorKind {
     /// Retry after the cloud-only backoff (a `Retry-After` when given).
     Backoff(Option<Duration>),
-    /// The server does not offer this route or epoch now.
+    /// The server does not offer this route.
     Unsupported,
-    /// Local consent closed the I/O fence mid-slice.
+    /// The server refused listing for now (turned off, or a refusal it marks
+    /// not retryable); read the hint again later.
+    Off,
+    /// The server retired this contract (HTTP 410).
+    Retired,
+    /// A local identity change closed the I/O fence mid-slice.
     Stopped,
     /// The slice budget ran out; the next slice continues.
     Deferred,
@@ -2219,6 +953,21 @@ impl SliceError {
             return Self {
                 category: "backend_shed",
                 kind: SliceErrorKind::Backoff(shed.retry_after),
+            };
+        }
+        if let Some(refused) = error.downcast_ref::<crate::snapshot_client::CloudTaskRefused>() {
+            return if refused.status == 410 {
+                Self {
+                    category: "contract_retired",
+                    kind: SliceErrorKind::Retired,
+                }
+            } else if refused.retryable == Some(true) {
+                Self::backoff("server_refused_retryable")
+            } else {
+                Self {
+                    category: "server_refused",
+                    kind: SliceErrorKind::Off,
+                }
             };
         }
         if error
@@ -2249,38 +998,48 @@ struct PageFacts {
 /// One slice's working memory: only ACK metadata of tasks it settled.
 struct SliceWork<'a, 'b> {
     inputs: &'a SliceInputs<'b>,
-    grant: CloudSessionGrant,
-    binding: CloudSessionBackendGrantBindingV1,
+    /// The user's task key from this slice's hint; memory only.
     key: Vec<u8>,
+    policy: CloudUploadPolicyV2,
     scope: [u8; 32],
-    cutoff: Option<OffsetDateTime>,
     deadline: Instant,
     wall: OffsetDateTime,
     pages: usize,
     offered: usize,
-    observed_head_nonterminal: Option<bool>,
+    /// Tasks the server answered `accepted` (its head moved).
+    accepted: usize,
+    head_listed: bool,
     settled: HashMap<String, ([u8; 32], Option<String>)>,
 }
 
 impl CloudCollector {
     /// When the supervisor should next run a slice; `None` waits for a local
-    /// consent change (or the supervisor's idle fallback).
-    pub fn next_wake(
-        &self,
-        now: Instant,
-        wall: OffsetDateTime,
-        last_activity: Option<Instant>,
-    ) -> Option<Instant> {
+    /// wake (or the supervisor's fallback).
+    pub fn next_wake(&self, now: Instant, wall: OffsetDateTime) -> Option<Instant> {
+        if self.retired {
+            return None;
+        }
         if self.schedule.scope.is_none() {
             return self.schedule.retry_not_before;
         }
-        Some(self.schedule.next_due(now, wall.date(), last_activity))
+        Some(
+            self.schedule
+                .next_due(now, wall.date(), head_interval(self.unchanged_heads)),
+        )
     }
 
-    /// Drop transient work (cursor, backoff, unsupported recheck) after a
-    /// local consent change; the next slice starts with an immediate head.
+    /// Drop transient work (cursor, backoff, recheck) after collection stops
+    /// locally; the next slice starts with an immediate head.
     pub fn reset(&mut self) {
         self.schedule.clear();
+    }
+
+    /// One log line per state transition; never task data.
+    fn report(&mut self, state: &'static str) {
+        if self.reported != Some(state) {
+            self.reported = Some(state);
+            eprintln!("codex_cloud_tasks state={state}");
+        }
     }
 
     fn defer_after_local_failure(&mut self, now: Instant) {
@@ -2288,8 +1047,8 @@ impl CloudCollector {
         self.schedule.note_failure(now, backoff);
     }
 
-    /// Run whatever is due: one authority read, then the head and/or the
-    /// next crawl pages, uploading only changed tasks, then one cache commit.
+    /// Run whatever is due: one hint read, then the head and/or the next
+    /// crawl pages, uploading only changed tasks, then one cache commit.
     pub fn run_slice(
         &mut self,
         inputs: &SliceInputs<'_>,
@@ -2299,43 +1058,36 @@ impl CloudCollector {
         let started = Instant::now();
         if kill_switch_enabled() {
             self.schedule.clear();
+            self.report("kill_switch");
             return CloudSessionCycleOutcome::Disabled;
         }
-        let state = match inputs.grants.read() {
-            Ok(Some(state)) if cloud_grant_preflight_eligible(&state.grant) => state,
-            _ => {
-                self.schedule.clear();
-                return CloudSessionCycleOutcome::Disabled;
-            }
-        };
-        let (Some(binding), Some(key)) = (
-            state.grant.backend_binding.clone(),
-            decode_hex(&state.hmac_key_hex).filter(|key| key.len() == 32),
-        ) else {
-            self.schedule.clear();
+        if self.retired {
             return CloudSessionCycleOutcome::Disabled;
-        };
+        }
         if !inputs.transport.is_configured() {
-            let _ = inputs.grants.record_health(
-                "unavailable",
-                "unavailable",
-                Some("transport_unconfigured"),
-            );
             self.schedule.clear();
+            self.report("transport_unconfigured");
             return CloudSessionCycleOutcome::Disabled;
         }
-        let scope = cache_scope(inputs.destination, &state.grant, &binding);
-        self.schedule.reset_for_scope(scope);
+        self.schedule.reset_for_scope(schedule_scope(inputs));
         let today = wall.date();
-        let opportunity = self.schedule.due(now, today, inputs.last_activity);
+        let interval = head_interval(self.unchanged_heads);
+        let opportunity = self.schedule.due(now, today, interval);
         if !opportunity.head && !opportunity.crawl {
             return CloudSessionCycleOutcome::NotDue;
         }
+        let deadline = Instant::now() + CYCLE_BUDGET;
+        let Some((key, policy)) = (match self.preflight(inputs, deadline, now, started) {
+            Ok(listing) => listing,
+            Err(outcome) => return outcome,
+        }) else {
+            self.recheck_after(now, OFF_RECHECK_INTERVAL);
+            self.report("listing_off");
+            return CloudSessionCycleOutcome::Unsupported;
+        };
+        let scope = cache_scope(inputs, &key);
         if !self.schedule.crawl_completed_loaded {
-            let lease = match inputs.checkpoints.begin_io(|| {
-                inputs.transport.local_binding_current(&state.grant)
-                    && preflight_grant_still_current(inputs.grants, &state.grant)
-            }) {
+            let lease = match inputs.checkpoints.begin_collector_io(inputs.transport) {
                 Ok(Some(lease)) => lease,
                 _ => {
                     self.schedule.clear();
@@ -2346,7 +1098,6 @@ impl CloudCollector {
                 Ok(date) => date,
                 Err(_) => {
                     return self.settle_failure(
-                        inputs,
                         SliceError::backoff("ack_cache_unavailable"),
                         now,
                         now + started.elapsed(),
@@ -2354,35 +1105,23 @@ impl CloudCollector {
                 }
             };
             self.schedule.crawl_completed_loaded = true;
-            inputs.checkpoints.retire_legacy_checkpoint();
             drop(lease);
         }
-        let due = self.schedule.due(now, today, inputs.last_activity);
+        let due = self.schedule.due(now, today, interval);
         if !due.head && !due.crawl {
             return CloudSessionCycleOutcome::NotDue;
         }
-        let deadline = Instant::now() + CYCLE_BUDGET;
-        let grant = match self.preflight(inputs, &state.grant, deadline, now, started) {
-            Ok(grant) => grant,
-            Err(outcome) => return outcome,
-        };
-        let binding = grant.backend_binding.clone().unwrap_or(binding);
-        let cutoff = binding
-            .collect_not_before
-            .as_deref()
-            .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok());
         let mut work = SliceWork {
             inputs,
-            grant,
-            binding,
             key,
+            policy,
             scope,
-            cutoff,
             deadline,
             wall,
             pages: 0,
             offered: 0,
-            observed_head_nonterminal: None,
+            accepted: 0,
+            head_listed: false,
             settled: HashMap::new(),
         };
         let mut crawl_completed = None;
@@ -2390,41 +1129,41 @@ impl CloudCollector {
         let cache_unavailable = inputs
             .checkpoints
             .commit(
-                inputs,
-                &work.grant,
+                inputs.transport,
                 &scope,
                 &work.settled,
                 crawl_completed,
                 wall.unix_timestamp(),
             )
             .is_err();
-        // A cache failure re-offers tasks next time (server no-op). Preserve
-        // its diagnostic instead of overwriting it with an unconditional OK.
+        // Only an accepted upload (the server head moved) is new work; a
+        // noop, a refusal or a failure is not.
+        if work.accepted > 0 {
+            self.unchanged_heads = 0;
+        } else if failure.is_none() && work.head_listed {
+            self.unchanged_heads = self.unchanged_heads.saturating_add(1);
+        }
+        // A cache failure re-offers tasks next time (server no-op).
         match failure {
             None => {
                 self.schedule.note_success();
-                if cache_unavailable {
-                    let _ = inputs.grants.record_health(
-                        "degraded",
-                        "fresh",
-                        Some("ack_cache_unavailable"),
-                    );
+                self.report(if cache_unavailable {
+                    "ack_cache_unavailable"
                 } else {
-                    let _ = inputs.grants.record_health("ok", "fresh", None);
-                }
+                    "ok"
+                });
                 if work.offered > 0 {
                     CloudSessionCycleOutcome::Uploaded
                 } else {
                     CloudSessionCycleOutcome::Noop
                 }
             }
-            Some(error) => self.settle_failure(inputs, error, now, now + started.elapsed()),
+            Some(error) => self.settle_failure(error, now, now + started.elapsed()),
         }
     }
 
     fn settle_failure(
         &mut self,
-        inputs: &SliceInputs<'_>,
         error: SliceError,
         now: Instant,
         failed_at: Instant,
@@ -2437,17 +1176,29 @@ impl CloudCollector {
                         self.schedule.consecutive_failures,
                     ),
                 };
-                // Retry-After begins at failure receipt. Unsupported feature
-                // rechecks below keep their ordinary planned opportunity.
+                // Retry-After begins at failure receipt. Rechecks below keep
+                // their ordinary planned opportunity.
                 self.schedule.note_failure(failed_at, backoff);
-                let _ = inputs
-                    .grants
-                    .record_health("failing", "stale", Some(error.category));
+                self.report(error.category);
                 CloudSessionCycleOutcome::Failed
             }
             SliceErrorKind::Unsupported => {
-                self.mark_unsupported(inputs, now);
+                self.recheck_after(now, UNSUPPORTED_RECHECK_INTERVAL);
+                self.report(error.category);
                 CloudSessionCycleOutcome::Unsupported
+            }
+            SliceErrorKind::Off => {
+                self.recheck_after(now, OFF_RECHECK_INTERVAL);
+                self.report(error.category);
+                CloudSessionCycleOutcome::Unsupported
+            }
+            SliceErrorKind::Retired => {
+                // Never retried in this process. One stable line to alarm on.
+                self.retired = true;
+                self.schedule.clear();
+                self.reported = Some(error.category);
+                eprintln!("codex_cloud_tasks contract_retired status=410");
+                CloudSessionCycleOutcome::Disabled
             }
             SliceErrorKind::Stopped => {
                 self.schedule.clear();
@@ -2457,69 +1208,42 @@ impl CloudCollector {
         }
     }
 
-    fn mark_unsupported(&mut self, inputs: &SliceInputs<'_>, now: Instant) {
+    /// No provider call before `now + interval`; the next slice reads the
+    /// hint again first.
+    fn recheck_after(&mut self, now: Instant, interval: Duration) {
         self.schedule.crawl = None;
         self.schedule.retry_not_before = None;
-        self.schedule.unsupported_until = Some(now + IDLE_HEAD_INTERVAL);
-        let _ =
-            inputs
-                .grants
-                .record_health("unavailable", "unavailable", Some("server_unsupported"));
+        self.schedule.unsupported_until = Some(now + interval);
     }
 
-    /// The one authority read of a due slice. Local pause/revoke never reach
-    /// here; a remote revoke revokes locally and erases the cache.
+    /// The one hint read of a due slice: the user's task key and the
+    /// metadata policy when listing is on, `None` when it is off.
     fn preflight(
         &mut self,
         inputs: &SliceInputs<'_>,
-        expected: &CloudSessionGrant,
         deadline: Instant,
         now: Instant,
         started: Instant,
-    ) -> std::result::Result<CloudSessionGrant, CloudSessionCycleOutcome> {
+    ) -> std::result::Result<Option<(Vec<u8>, CloudUploadPolicyV2)>, CloudSessionCycleOutcome> {
         let Some(timeout) = remaining_relay_budget(deadline) else {
             return Err(CloudSessionCycleOutcome::NotDue);
         };
-        let lease = match inputs.checkpoints.begin_io(|| {
-            inputs.transport.local_binding_current(expected)
-                && preflight_grant_still_current(inputs.grants, expected)
-        }) {
+        let lease = match inputs.checkpoints.begin_collector_io(inputs.transport) {
             Ok(Some(lease)) => lease,
             _ => {
                 self.schedule.clear();
                 return Err(CloudSessionCycleOutcome::Disabled);
             }
         };
-        let result = inputs.transport.read_authority(expected, timeout);
+        let result = inputs.transport.read_hint(timeout);
         drop(lease);
-        let response = match result {
-            Ok(response) => response,
+        match result {
+            Ok(hint) => Ok(codex_cloud_listing(&hint)),
             Err(error) => {
                 let error = SliceError::from_request(&error, deadline);
-                return Err(self.settle_failure(inputs, error, now, now + started.elapsed()));
+                Err(self.settle_failure(error, now, now + started.elapsed()))
             }
-        };
-        let current = match inputs.grants.apply_backend_authority(&response) {
-            Ok(current) => current,
-            Err(_) => {
-                self.mark_unsupported(inputs, now);
-                return Err(CloudSessionCycleOutcome::Unsupported);
-            }
-        };
-        if current.status == CloudSessionGrantStatus::Revoked {
-            let _ = inputs.checkpoints.erase_cache();
-            self.schedule.clear();
-            return Err(CloudSessionCycleOutcome::Disabled);
         }
-        if !same_runtime_grant_identity(&current, expected) {
-            self.schedule.clear();
-            return Err(CloudSessionCycleOutcome::Disabled);
-        }
-        if !cloud_grant_runtime_ready(&current) {
-            self.mark_unsupported(inputs, now);
-            return Err(CloudSessionCycleOutcome::Unsupported);
-        }
-        Ok(current)
     }
 
     fn work(
@@ -2538,14 +1262,7 @@ impl CloudCollector {
                 .is_none_or(|crawl| crawl.cursor.is_none());
         if due.head || start_crawl {
             self.schedule.last_head_attempt = Some(now);
-            let listed = work.page(None);
-            // Provider facts remain valid when their delivery fails. A failed
-            // provider read preserves the previous predicate; deep pages never
-            // set this head-only observation.
-            if let Some(nonterminal) = work.observed_head_nonterminal {
-                self.schedule.head_nonterminal = nonterminal;
-            }
-            let page = match listed {
+            let page = match work.page(None) {
                 Ok(page) => page,
                 Err(error) => {
                     if start_crawl {
@@ -2625,7 +1342,12 @@ impl CloudCollector {
         }
         if matches!(
             failure.as_ref().map(|error| &error.kind),
-            Some(SliceErrorKind::Unsupported | SliceErrorKind::Stopped)
+            Some(
+                SliceErrorKind::Unsupported
+                    | SliceErrorKind::Off
+                    | SliceErrorKind::Retired
+                    | SliceErrorKind::Stopped
+            )
         ) {
             return failure;
         }
@@ -2646,7 +1368,7 @@ impl SliceWork<'_, '_> {
         let lease = self
             .inputs
             .checkpoints
-            .begin_collector_io(self.inputs.grants, &self.grant, self.inputs.transport)
+            .begin_collector_io(self.inputs.transport)
             .map_err(|_| SliceError::backoff("collector_io_fence_unavailable"))?
             .ok_or(SliceError {
                 category: "stopped",
@@ -2673,7 +1395,7 @@ impl SliceWork<'_, '_> {
     }
 
     fn parse(&self, raw: &str) -> std::result::Result<ParsedPage, SliceError> {
-        match parse_cloud_page(raw, &self.key, self.wall) {
+        match parse_cloud_page(raw, &self.key, self.policy, self.wall) {
             // A nonempty page with no valid task is a provider failure, not
             // an empty healthy page.
             Ok(page) if page.source_item_count == 0 || !page.changes.is_empty() => Ok(page),
@@ -2688,7 +1410,7 @@ impl SliceWork<'_, '_> {
         let parsed = self.parse(&raw)?;
         drop(raw);
         if cursor.is_none() {
-            self.observed_head_nonterminal = Some(parsed.has_nonterminal());
+            self.head_listed = true;
         }
         let facts = PageFacts {
             next: match &parsed.cursor {
@@ -2710,13 +1432,9 @@ impl SliceWork<'_, '_> {
             Ok(fresh) => fresh,
             Err(_) => return Ok(facts),
         };
-        if cursor.is_none() {
-            self.observed_head_nonterminal = Some(fresh.has_nonterminal());
-        }
         let retry = fresh
             .changes
             .into_iter()
-            .filter(|change| self.admissible(change))
             .filter_map(|mut change| {
                 let hint = conflicts.get(&change.entity_key)?.clone();
                 change.expected_head_etag = Some(hint);
@@ -2727,30 +1445,17 @@ impl SliceWork<'_, '_> {
         Ok(facts)
     }
 
-    /// After an erasure only tasks with a trustworthy provider creation time
-    /// after the server's cutoff may be offered. The server enforces this too.
-    fn admissible(&self, change: &CloudSessionChangeV1) -> bool {
-        self.cutoff.map_or(true, |cutoff| {
-            change
-                .created_at
-                .as_deref()
-                .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
-                .is_some_and(|created| created > cutoff)
-        })
-    }
-
-    /// Offer only tasks whose digest differs from their last exact ACK in
-    /// this slice or the cache. Returns conflict hints by task.
+    /// Offer only tasks whose digest differs from their last settled digest
+    /// in this slice or the cache. Returns conflict hints by task.
     fn deliver(
         &mut self,
-        changes: Vec<CloudSessionChangeV1>,
+        changes: Vec<CloudSessionChangeV2>,
     ) -> std::result::Result<HashMap<String, String>, SliceError> {
         let mut unique = Vec::with_capacity(changes.len());
         for change in changes {
-            if self.admissible(&change)
-                && !unique
-                    .iter()
-                    .any(|seen: &CloudSessionChangeV1| seen.entity_key == change.entity_key)
+            if !unique
+                .iter()
+                .any(|seen: &CloudSessionChangeV2| seen.entity_key == change.entity_key)
             {
                 unique.push(change);
             }
@@ -2771,7 +1476,7 @@ impl SliceWork<'_, '_> {
             let _lease = self
                 .inputs
                 .checkpoints
-                .begin_collector_io(self.inputs.grants, &self.grant, self.inputs.transport)
+                .begin_collector_io(self.inputs.transport)
                 .map_err(|_| SliceError::backoff("collector_io_fence_unavailable"))?
                 .ok_or(SliceError {
                     category: "stopped",
@@ -2784,7 +1489,7 @@ impl SliceWork<'_, '_> {
         };
         let mut offer = Vec::new();
         for mut change in unique {
-            let digest = change.semantic_digest();
+            let digest = change.semantic_digest(self.policy);
             let known = self
                 .settled
                 .get(&change.entity_key)
@@ -2804,22 +1509,21 @@ impl SliceWork<'_, '_> {
         self.offer(offer)
     }
 
+    /// Send changed tasks, packed by count and bytes, and settle each exact
+    /// ACK. Only accepted/noop entries carry an etag into the cache; a
+    /// refusal or a conflict without a head is remembered with none.
     fn offer(
         &mut self,
-        changes: Vec<CloudSessionChangeV1>,
+        changes: Vec<CloudSessionChangeV2>,
     ) -> std::result::Result<HashMap<String, String>, SliceError> {
         let mut conflicts = HashMap::new();
-        for chunk in changes.chunks(MAX_CHANGES_PER_REQUEST) {
-            let request = CloudSessionChangesV1 {
+        for observations in wire::pack(changes) {
+            let request = CloudSessionChangesV2 {
                 schema_version: CHANGES_SCHEMA_VERSION.to_string(),
-                grant_id: self.binding.grant_id.clone(),
-                grant_version: self.binding.grant_version,
-                grant_scope_fingerprint: self.grant.grant_scope_id.clone(),
-                account_fingerprint: self.grant.account_fingerprint.clone(),
-                collector_id: COLLECTOR_ID.to_string(),
                 collector_version: compiled_release_version(),
                 collected_at: timestamp(self.wall),
-                observations: chunk.to_vec(),
+                upload_policy: self.policy,
+                observations,
             };
             request
                 .validate()
@@ -2836,7 +1540,7 @@ impl SliceWork<'_, '_> {
             let lease = self
                 .inputs
                 .checkpoints
-                .begin_collector_io(self.inputs.grants, &self.grant, self.inputs.transport)
+                .begin_collector_io(self.inputs.transport)
                 .map_err(|_| SliceError::backoff("collector_io_fence_unavailable"))?
                 .ok_or(SliceError {
                     category: "stopped",
@@ -2848,30 +1552,59 @@ impl SliceWork<'_, '_> {
             let settled = request
                 .settle(&ack)
                 .map_err(|_| SliceError::backoff("ack_invalid"))?;
-            self.offered += chunk.len();
-            for change in chunk {
+            self.offered += request.observations.len();
+            for change in &request.observations {
+                let digest = change.semantic_digest(self.policy);
                 match settled.get(&change.entity_key) {
-                    Some(Settled::Acked { head_etag }) => {
-                        self.settled.insert(
-                            change.entity_key.clone(),
-                            (change.semantic_digest(), Some(head_etag.clone())),
-                        );
+                    Some(Settled::Acked {
+                        head_etag,
+                        accepted,
+                    }) => {
+                        if *accepted {
+                            self.accepted += 1;
+                        }
+                        self.settled
+                            .insert(change.entity_key.clone(), (digest, Some(head_etag.clone())));
                     }
                     Some(Settled::Refused) => {
                         self.settled
-                            .insert(change.entity_key.clone(), (change.semantic_digest(), None));
+                            .insert(change.entity_key.clone(), (digest, None));
                     }
-                    Some(Settled::Conflict {
-                        head_etag: Some(hint),
-                    }) => {
-                        conflicts.insert(change.entity_key.clone(), hint.clone());
+                    Some(Settled::Conflict { head_etag }) => {
+                        conflicts.insert(change.entity_key.clone(), head_etag.clone());
                     }
-                    Some(Settled::Conflict { head_etag: None }) | None => {}
+                    None => {}
                 }
             }
         }
         Ok(conflicts)
     }
+}
+
+/// Listing runs only when the hint turns it on, names exactly the contract
+/// this build speaks and carries the user's 32-byte key; anything else (an
+/// older server omits all three) is off. The policy is the one local session
+/// uploads apply, from the same hint.
+fn codex_cloud_listing(hint: &ActivityHintResponse) -> Option<(Vec<u8>, CloudUploadPolicyV2)> {
+    if !hint.codex_cloud_tasks_enabled
+        || hint.codex_cloud_tasks_contract.as_deref() != Some(CODEX_CLOUD_TASKS_CONTRACT)
+    {
+        return None;
+    }
+    let key = hint
+        .codex_cloud_task_key
+        .as_deref()
+        .filter(|key| key.len() == 43)
+        .and_then(|key| URL_SAFE_NO_PAD.decode(key).ok())
+        .filter(|key| key.len() == 32)?;
+    let policy = crate::upload_policy::SnapshotUploadPolicy::from_hint(hint);
+    Some((
+        key,
+        CloudUploadPolicyV2 {
+            session_titles_enabled: policy.titles(),
+            workspace_labels_enabled: policy.workspace(),
+        },
+    ))
 }
 
 fn remaining_budget(deadline: Instant) -> Option<Duration> {
@@ -2888,55 +1621,42 @@ fn cursor_digest(cursor: &str) -> [u8; 32] {
     Sha256::digest(cursor.as_bytes()).into()
 }
 
-/// Cache isolation: the destination, local identity, grant epoch, scope,
-/// account and contract. Never a Results identity.
-fn cache_scope(
-    destination: &str,
-    grant: &CloudSessionGrant,
-    binding: &CloudSessionBackendGrantBindingV1,
-) -> [u8; 32] {
-    let installation = binding
-        .cache_origin
-        .as_ref()
-        .map_or(grant.installation_fingerprint.as_str(), |origin| {
-            origin.installation_fingerprint.as_str()
-        });
-    let grant_scope = binding
-        .cache_origin
-        .as_ref()
-        .map_or(grant.grant_scope_id.as_str(), |origin| {
-            origin.grant_scope_id.as_str()
-        });
-    let mut framed = Vec::new();
-    for part in [
-        b"ottto.cloud-session.cache-scope.v1".as_slice(),
-        destination.as_bytes(),
-        installation.as_bytes(),
-        grant.organization_fingerprint.as_bytes(),
-        grant.effective_user_fingerprint.as_bytes(),
-        binding.grant_id.as_bytes(),
-        &binding.grant_version.to_be_bytes(),
-        grant_scope.as_bytes(),
-        grant.account_fingerprint.as_bytes(),
+/// ACK-cache isolation: the destination, the local organization and user,
+/// the user's task key (by digest) and the contract. Never a Results identity.
+fn cache_scope(inputs: &SliceInputs<'_>, key: &[u8]) -> [u8; 32] {
+    framed_digest(&[
+        b"ottto.cloud-session.cache-scope.v2",
+        inputs.destination.as_bytes(),
+        inputs.organization_id.as_bytes(),
+        inputs.user_id.as_bytes(),
+        Sha256::digest(key).as_slice(),
         CHANGES_SCHEMA_VERSION.as_bytes(),
-    ] {
+    ])
+}
+
+/// Schedule isolation: the destination and the local organization and user.
+/// Known before the hint is read, so it carries no key.
+fn schedule_scope(inputs: &SliceInputs<'_>) -> [u8; 32] {
+    framed_digest(&[
+        b"ottto.cloud-session.schedule-scope.v2",
+        inputs.destination.as_bytes(),
+        inputs.organization_id.as_bytes(),
+        inputs.user_id.as_bytes(),
+    ])
+}
+
+fn framed_digest(parts: &[&[u8]]) -> [u8; 32] {
+    let mut framed = Vec::new();
+    for part in parts {
         push_length_framed(&mut framed, part);
     }
     Sha256::digest(&framed).into()
 }
 
 struct ParsedPage {
-    changes: Vec<CloudSessionChangeV1>,
+    changes: Vec<CloudSessionChangeV2>,
     cursor: CloudPageCursor,
     source_item_count: usize,
-}
-
-impl ParsedPage {
-    fn has_nonterminal(&self) -> bool {
-        self.changes
-            .iter()
-            .any(|change| matches!(change.lifecycle.as_str(), "queued" | "running" | "unknown"))
-    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -2956,7 +1676,12 @@ impl std::fmt::Debug for CloudPageCursor {
     }
 }
 
-fn parse_cloud_page(raw: &str, key: &[u8], observed_at: OffsetDateTime) -> Result<ParsedPage> {
+fn parse_cloud_page(
+    raw: &str,
+    key: &[u8],
+    policy: CloudUploadPolicyV2,
+    observed_at: OffsetDateTime,
+) -> Result<ParsedPage> {
     let root: Value = serde_json::from_str(raw).context("parse Codex cloud list JSON")?;
     let items = if let Some(items) = root.as_array() {
         items
@@ -3030,7 +1755,15 @@ fn parse_cloud_page(raw: &str, key: &[u8], observed_at: OffsetDateTime) -> Resul
             coverage.push("attempts".to_string());
         }
         coverage.sort();
-        changes.push(CloudSessionChangeV1 {
+        // The title and environment name enter the body only while the
+        // metadata policy allows them; the server cleans and caps both.
+        let label = |names: &[&str], allowed: bool| {
+            allowed
+                .then(|| string_field(object, names))
+                .flatten()
+                .map(|value| value.chars().take(MAX_LABEL_CHARS).collect::<String>())
+        };
+        changes.push(CloudSessionChangeV2 {
             entity_key: opaque_key(key, provider_id),
             expected_head_etag: None,
             entity_kind: "task".to_string(),
@@ -3046,6 +1779,8 @@ fn parse_cloud_page(raw: &str, key: &[u8], observed_at: OffsetDateTime) -> Resul
             started_at,
             updated_at,
             completed_at,
+            title: label(&["title"], policy.session_titles_enabled),
+            environment_label: label(&["environment_label"], policy.workspace_labels_enabled),
         });
     }
     let cursor = if root.is_array() {
@@ -3152,222 +1887,6 @@ fn environment_kind(value: Option<&str>) -> String {
     .to_string()
 }
 
-fn grant_scope_fingerprint(key: &[u8], setup: &CloudSessionGrantSetup) -> String {
-    opaque_key(
-        key,
-        &format!(
-            "{}\u{0}{}\u{0}{}\u{0}{}",
-            setup.installation_id,
-            setup.organization_scope,
-            setup.effective_user_scope,
-            COLLECTOR_ID
-        ),
-    )
-}
-
-/// Older pending tombstones predate the explicit descriptor and used the
-/// retired observation contract. Reconcile that exact request; never upgrade it.
-fn pending_backend_create(grant: &CloudSessionGrant) -> CloudSessionPendingBackendCreateV1 {
-    CloudSessionPendingBackendCreateV1 {
-        source: "codex".to_string(),
-        collector_id: COLLECTOR_ID.to_string(),
-        schema_version: LEGACY_COLLECTION_SCHEMA_VERSION.to_string(),
-        collector_version: grant.collector_version.clone(),
-        grant_scope_fingerprint: grant.grant_scope_id.clone(),
-        account_fingerprint: grant.account_fingerprint.clone(),
-        consent: true,
-    }
-}
-
-fn validate_pending_backend_create(
-    grant: &CloudSessionGrant,
-    pending: &CloudSessionPendingBackendCreateV1,
-) -> Result<()> {
-    if pending.source != "codex"
-        || pending.collector_id != COLLECTOR_ID
-        || !matches!(
-            pending.schema_version.as_str(),
-            CHANGES_SCHEMA_VERSION | LEGACY_COLLECTION_SCHEMA_VERSION
-        )
-        || pending.collector_version.trim().is_empty()
-        || pending.grant_scope_fingerprint != grant.grant_scope_id
-        || pending.account_fingerprint != grant.account_fingerprint
-        || !pending.consent
-    {
-        return Err(anyhow!(
-            "pending cloud-session backend grant create is invalid"
-        ));
-    }
-    Ok(())
-}
-
-fn backend_create_request(
-    installation_id: &str,
-    pending: &CloudSessionPendingBackendCreateV1,
-) -> CloudSessionBackendGrantCreateRequestV1 {
-    CloudSessionBackendGrantCreateRequestV1 {
-        installation_id: installation_id.to_string(),
-        source: pending.source.clone(),
-        collector_id: pending.collector_id.clone(),
-        schema_version: pending.schema_version.clone(),
-        collector_version: pending.collector_version.clone(),
-        grant_scope_fingerprint: pending.grant_scope_fingerprint.clone(),
-        account_fingerprint: pending.account_fingerprint.clone(),
-        consent: pending.consent,
-    }
-}
-
-fn validate_local_installation_binding(
-    state: &PersistedGrant,
-    installation_id: &str,
-    operation: &str,
-) -> Result<()> {
-    let key = decode_hex(&state.hmac_key_hex)
-        .filter(|key| key.len() == 32)
-        .ok_or_else(|| anyhow!("invalid cloud-session HMAC key"))?;
-    if !is_uuid(installation_id)
-        || opaque_key(&key, installation_id) != state.grant.installation_fingerprint
-    {
-        return Err(anyhow!("{operation} installation binding is invalid"));
-    }
-    Ok(())
-}
-
-/// Consent binds the installation, scope, account, disclosure and the
-/// `cloud_session_changes.v1` contract, never a binary release.
-fn validate_backend_grant_response(
-    state: &PersistedGrant,
-    response: &CloudSessionBackendGrantResponseV1,
-) -> Result<()> {
-    let key = decode_hex(&state.hmac_key_hex)
-        .filter(|key| key.len() == 32)
-        .ok_or_else(|| anyhow!("invalid cloud-session HMAC key"))?;
-    if !is_uuid(&response.id)
-        || !is_uuid(&response.installation_id)
-        || opaque_key(&key, &response.installation_id) != state.grant.installation_fingerprint
-        || response.source != "codex"
-        || response.collector_id != COLLECTOR_ID
-        || !matches!(
-            response.schema_version.as_str(),
-            CHANGES_SCHEMA_VERSION | LEGACY_COLLECTION_SCHEMA_VERSION
-        )
-        || response.disclosure_version != DISCLOSURE_VERSION
-        || response.grant_scope_fingerprint != state.grant.grant_scope_id
-        || response.account_fingerprint != state.grant.account_fingerprint
-        || response.grant_version == 0
-    {
-        return Err(anyhow!("backend cloud-session grant scope does not match"));
-    }
-    Ok(())
-}
-
-fn grant_preflight_eligible(store: &CloudSessionGrantStore) -> bool {
-    store
-        .load()
-        .ok()
-        .flatten()
-        .is_some_and(|grant| cloud_grant_preflight_eligible(&grant))
-}
-
-fn cloud_grant_preflight_eligible(grant: &CloudSessionGrant) -> bool {
-    matches!(
-        grant.status,
-        CloudSessionGrantStatus::Enabled | CloudSessionGrantStatus::PolicyDisabled
-    ) && !grant.backend_create_pending
-        && grant
-            .backend_binding
-            .as_ref()
-            .is_some_and(|binding| !binding.backend_revoked)
-}
-
-fn cloud_grant_runtime_ready(grant: &CloudSessionGrant) -> bool {
-    grant.status == CloudSessionGrantStatus::Enabled
-        && !grant.backend_create_pending
-        && binding_contract_current(grant)
-        && grant.backend_binding.as_ref().is_some_and(|binding| {
-            !binding.backend_revoked
-                && binding.server_policy_state == CloudSessionServerPolicyState::Approved
-        })
-}
-
-/// The bound epoch was confirmed on the `cloud_session_changes.v1` contract.
-fn binding_contract_current(grant: &CloudSessionGrant) -> bool {
-    grant.backend_binding.as_ref().is_some_and(|binding| {
-        binding.collection_contract.as_deref() == Some(CHANGES_SCHEMA_VERSION)
-    })
-}
-
-/// Collection is approved only for an enabled grant on this contract with
-/// explicit `can_collect`; anything else, including older responses, is
-/// disabled.
-fn authority_policy(
-    response: &CloudSessionBackendGrantResponseV1,
-) -> CloudSessionServerPolicyState {
-    if response.status == "enabled"
-        && response.can_collect == Some(true)
-        && response.schema_version == CHANGES_SCHEMA_VERSION
-    {
-        CloudSessionServerPolicyState::Approved
-    } else {
-        CloudSessionServerPolicyState::Disabled
-    }
-}
-
-fn authority_binding(
-    response: &CloudSessionBackendGrantResponseV1,
-    backend_revoked: bool,
-) -> CloudSessionBackendGrantBindingV1 {
-    CloudSessionBackendGrantBindingV1 {
-        grant_id: response.id.clone(),
-        grant_version: response.grant_version,
-        backend_revoked,
-        server_policy_state: authority_policy(response),
-        collection_contract: (response.schema_version == CHANGES_SCHEMA_VERSION)
-            .then(|| CHANGES_SCHEMA_VERSION.to_string()),
-        collect_not_before: None,
-        cache_origin: None,
-    }
-}
-
-fn preflight_grant_still_current(
-    store: &CloudSessionGrantStore,
-    expected: &CloudSessionGrant,
-) -> bool {
-    store.load().ok().flatten().is_some_and(|current| {
-        cloud_grant_preflight_eligible(&current) && same_runtime_grant_identity(&current, expected)
-    })
-}
-
-fn grant_still_current(store: &CloudSessionGrantStore, expected: &CloudSessionGrant) -> bool {
-    store.load().ok().flatten().is_some_and(|current| {
-        cloud_grant_runtime_ready(&current)
-            && same_runtime_grant_identity(&current, expected)
-            && current
-                .backend_binding
-                .is_some_and(|binding| !binding.backend_revoked)
-    })
-}
-
-fn same_runtime_grant_identity(current: &CloudSessionGrant, expected: &CloudSessionGrant) -> bool {
-    current.schema_version == expected.schema_version
-        && current.collector_id == expected.collector_id
-        && current.disclosure_version == expected.disclosure_version
-        && current.installation_fingerprint == expected.installation_fingerprint
-        && current.grant_scope_id == expected.grant_scope_id
-        && current.organization_fingerprint == expected.organization_fingerprint
-        && current.effective_user_fingerprint == expected.effective_user_fingerprint
-        && current.account_fingerprint == expected.account_fingerprint
-        && matches!(
-            (
-                current.backend_binding.as_ref(),
-                expected.backend_binding.as_ref(),
-            ),
-            (Some(current), Some(expected))
-                if current.grant_id == expected.grant_id
-                    && current.grant_version == expected.grant_version
-        )
-}
-
 fn kill_switch_enabled() -> bool {
     truthy_env(KILL_SWITCH_ENV)
 }
@@ -3405,11 +1924,6 @@ fn opaque_key(key: &[u8], raw: &str) -> String {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(raw.as_bytes());
     format!("hmac-sha256:{}", hex(&mac.finalize().into_bytes()))
-}
-fn random_key() -> Result<Vec<u8>> {
-    let mut key = vec![0_u8; 32];
-    random_fill(&mut key).map_err(|_| anyhow!("generate cloud-session HMAC key"))?;
-    Ok(key)
 }
 fn atomic_json_write<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let parent = path
@@ -3469,18 +1983,13 @@ pub enum CloudSessionCollectorStartup {
     Started,
 }
 
+/// The connected Codex Mac the collector acts for. No secret.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CloudSessionRuntimeBinding {
     api_base_url: String,
     device: LocalDeviceBinding,
-    grant_id: String,
-    grant_version: u64,
-    grant_scope_id: String,
-}
-
-struct CloudSessionRuntimeCandidate {
-    binding: CloudSessionRuntimeBinding,
-    grant: CloudSessionGrant,
+    organization_id: String,
+    user_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3494,64 +2003,38 @@ type ActiveCloudSessionTransport = Option<(
     Box<dyn CloudSessionTransport + Send>,
 )>;
 
+/// `None` while this Mac has no connected account or no Codex relay device:
+/// the collector then stays idle without reading any secret. An inconsistent
+/// binding or an untrusted destination is an error.
 fn load_cloud_session_runtime_binding(
-    grants: &CloudSessionGrantStore,
     accounts: &FileAccountStore,
     devices: &FileDeviceStore,
     connections: &FileConnectionStore,
-) -> Result<Option<CloudSessionRuntimeCandidate>> {
-    // The default/off path is intentionally one local grant read. Do not touch
-    // account, connection, device, or Keychain state until consent is capable
-    // of becoming runtime-ready.
-    if !grant_preflight_eligible(grants) {
-        return Ok(None);
-    }
-    let (setup, api_base_url, device) =
-        load_cloud_session_local_identity(accounts, devices, connections)?;
-    let Some(grant) = grants.runtime_candidate_for(&setup)? else {
-        return Ok(None);
-    };
-    let backend = grant
-        .backend_binding
-        .as_ref()
-        .ok_or_else(|| anyhow!("cloud-session backend grant is unbound"))?;
-    Ok(Some(CloudSessionRuntimeCandidate {
-        binding: CloudSessionRuntimeBinding {
-            api_base_url,
-            device,
-            grant_id: backend.grant_id.clone(),
-            grant_version: backend.grant_version,
-            grant_scope_id: grant.grant_scope_id.clone(),
-        },
-        grant,
-    }))
-}
-
-fn load_cloud_session_local_identity(
-    accounts: &FileAccountStore,
-    devices: &FileDeviceStore,
-    connections: &FileConnectionStore,
-) -> Result<(CloudSessionGrantSetup, String, LocalDeviceBinding)> {
+) -> Result<Option<CloudSessionRuntimeBinding>> {
     let account = accounts.load()?;
     let user_id = account
         .user
         .as_ref()
         .map(|user| user.id.trim())
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow!("cloud-session local user binding is unavailable"))?;
+        .filter(|value| !value.is_empty());
     let organization_id = account
         .organization
         .as_ref()
         .map(|organization| organization.id.trim())
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow!("cloud-session local organization binding is unavailable"))?;
+        .filter(|value| !value.is_empty());
+    let (Some(user_id), Some(organization_id)) = (user_id, organization_id) else {
+        return Ok(None);
+    };
     if account.state != LocalAccountState::Connected {
-        return Err(anyhow!("cloud-session local account is not connected"));
+        return Ok(None);
     }
-    let device = devices
+    let Some(device) = devices
         .load()?
-        .ok_or_else(|| anyhow!("cloud-session relay device binding is unavailable"))?;
-    if !is_uuid(&device.device_id) || !device.sources.iter().any(|source| source == "codex") {
+        .filter(|device| device.sources.iter().any(|source| source == "codex"))
+    else {
+        return Ok(None);
+    };
+    if !is_uuid(&device.device_id) {
         return Err(anyhow!(
             "cloud-session relay device is not exactly Codex-bound"
         ));
@@ -3568,12 +2051,12 @@ fn load_cloud_session_local_identity(
     // secret. Loopback is accepted only when the daemon process explicitly
     // carries the exact same developer override.
     let api_base_url = validated_cloud_session_api_base_url(&connection.api_base_url)?;
-    let setup = CloudSessionGrantSetup {
-        installation_id: device.device_id.clone(),
-        organization_scope: organization_id.to_string(),
-        effective_user_scope: user_id.to_string(),
-    };
-    Ok((setup, api_base_url, device))
+    Ok(Some(CloudSessionRuntimeBinding {
+        api_base_url,
+        device,
+        organization_id: organization_id.to_string(),
+        user_id: user_id.to_string(),
+    }))
 }
 
 fn validated_cloud_session_api_base_url(raw: &str) -> Result<String> {
@@ -3612,7 +2095,6 @@ fn is_loopback_http_base(value: &str) -> bool {
 
 /// The local inputs a composed slice reads before any network call.
 struct ComposedSliceInputs<'a, FLoadCredentials, FComposeTransport> {
-    grants: &'a CloudSessionGrantStore,
     checkpoints: &'a CloudSessionCheckpointStore,
     runner: &'a dyn CloudSessionRunner,
     accounts: &'a FileAccountStore,
@@ -3620,149 +2102,40 @@ struct ComposedSliceInputs<'a, FLoadCredentials, FComposeTransport> {
     connections: &'a FileConnectionStore,
     load_credentials: FLoadCredentials,
     compose_transport: FComposeTransport,
-    last_activity: Option<Instant>,
 }
 
 fn collect_composed_cloud_sessions_once(
     collector: &mut CloudCollector,
-    grants: &CloudSessionGrantStore,
     checkpoints: &CloudSessionCheckpointStore,
     runner: &dyn CloudSessionRunner,
     active_transport: &mut ActiveCloudSessionTransport,
     now: Instant,
 ) -> CloudSessionCycleOutcome {
     let _stage = StageWindow::begin("codex", "offpass_cloud_sessions");
-    let accounts = FileAccountStore::default();
-    let devices = FileDeviceStore::default();
-    let connections = FileConnectionStore::default();
     let wall = OffsetDateTime::now_utc();
-    let last_activity = last_local_codex_activity();
     if collector
-        .next_wake(now, wall, last_activity)
+        .next_wake(now, wall)
         .is_some_and(|wake| wake > now)
     {
         return CloudSessionCycleOutcome::NotDue;
-    }
-    if !kill_switch_enabled() && grant_preflight_eligible(grants) {
-        let hardware = match grant_rebind::verified_live_hardware() {
-            Ok(hardware) => hardware,
-            Err(reason) => {
-                active_transport.take();
-                collector.schedule.crawl = None;
-                let _ = grants.record_health("unavailable", "unavailable", Some(reason));
-                collector.schedule.retry_not_before = Some(now + IDLE_HEAD_INTERVAL);
-                return CloudSessionCycleOutcome::Disabled;
-            }
-        };
-        let identity = load_cloud_session_local_identity(&accounts, &devices, &connections);
-        if let Ok((setup, api_base_url, device)) = identity {
-            let proposal = grants.prepare_rebind(&setup, hardware);
-            if let Ok(Some(proposal)) = proposal {
-                active_transport.take();
-                collector.schedule.crawl = None;
-                let _ = grants.record_health("unavailable", "unavailable", Some("rebinding"));
-                let lease = checkpoints.begin_io(|| {
-                    grant_still_current(grants, &proposal.expected)
-                        && load_cloud_session_local_identity(&accounts, &devices, &connections)
-                            .is_ok_and(|(current, base, target)| {
-                                current.installation_id == setup.installation_id
-                                    && current.organization_scope == setup.organization_scope
-                                    && current.effective_user_scope == setup.effective_user_scope
-                                    && base == api_base_url
-                                    && target == device
-                            })
-                });
-                let Ok(Some(lease)) = lease else {
-                    collector.reset();
-                    return CloudSessionCycleOutcome::Disabled;
-                };
-                let credentials = crate::snapshot_client::load_snapshot_device_credentials();
-                let result = match credentials {
-                    Ok((credential_device, secret)) if credential_device == device => {
-                        let client = crate::snapshot_client::SnapshotApiClient::new(api_base_url);
-                        let binding = proposal
-                            .expected
-                            .backend_binding
-                            .as_ref()
-                            .expect("bound grant");
-                        grant_rebind::rebind(
-                            &client,
-                            GrantKind::CloudSessions,
-                            &binding.grant_id,
-                            &proposal.request,
-                            &device,
-                            &secret,
-                            COMMAND_TIMEOUT,
-                        )
-                    }
-                    _ => Err(grant_rebind::RebindFailure::unavailable()),
-                };
-                // Bind before releasing the lease: a concurrent local stop
-                // must retain the committed target identity for cleanup.
-                match result {
-                    Ok(value) => {
-                        let response =
-                            serde_json::from_value::<CloudSessionBackendGrantResponseV1>(value);
-                        if response
-                            .ok()
-                            .and_then(|response| {
-                                grants
-                                    .bind_backend_grant_with_rebind(
-                                        &response,
-                                        &setup.installation_id,
-                                        Some(&proposal),
-                                    )
-                                    .ok()
-                            })
-                            .is_none()
-                        {
-                            let _ = grants.record_health(
-                                "unavailable",
-                                "unavailable",
-                                Some("stale_binding"),
-                            );
-                            collector.schedule.retry_not_before = Some(now + IDLE_HEAD_INTERVAL);
-                            return CloudSessionCycleOutcome::Failed;
-                        }
-                        collector.reset();
-                    }
-                    Err(failure) => {
-                        let _ =
-                            grants.record_health("unavailable", "unavailable", Some(failure.code));
-                        if failure.retryable {
-                            collector.defer_after_local_failure(Instant::now());
-                        } else {
-                            collector.schedule.retry_not_before = Some(now + IDLE_HEAD_INTERVAL);
-                        }
-                        return CloudSessionCycleOutcome::Disabled;
-                    }
-                }
-                drop(lease);
-            }
-        }
     }
     collect_composed_cloud_sessions_once_with(
         collector,
         active_transport,
         ComposedSliceInputs {
-            grants,
             checkpoints,
             runner,
-            accounts: &accounts,
-            devices: &devices,
-            connections: &connections,
+            accounts: &FileAccountStore::default(),
+            devices: &FileDeviceStore::default(),
+            connections: &FileConnectionStore::default(),
             load_credentials: crate::snapshot_client::load_snapshot_device_credentials,
-            compose_transport: |api_base_url, device, device_secret| {
-                Box::new(RelayCloudSessionTransport::new(
-                    api_base_url,
-                    device,
-                    device_secret,
-                )) as Box<dyn CloudSessionTransport + Send>
+            compose_transport: |binding, device_secret| {
+                Box::new(RelayCloudSessionTransport::new(binding, device_secret))
+                    as Box<dyn CloudSessionTransport + Send>
             },
-            last_activity: last_local_codex_activity(),
         },
         now,
-        OffsetDateTime::now_utc(),
+        wall,
     )
 }
 
@@ -3776,55 +2149,48 @@ fn collect_composed_cloud_sessions_once_with<FLoadCredentials, FComposeTransport
 where
     FLoadCredentials: FnOnce() -> Result<(LocalDeviceBinding, String)>,
     FComposeTransport:
-        FnOnce(String, LocalDeviceBinding, String) -> Box<dyn CloudSessionTransport + Send>,
+        FnOnce(CloudSessionRuntimeBinding, String) -> Box<dyn CloudSessionTransport + Send>,
 {
     let started = Instant::now();
-    let grants = inputs.grants;
-    if kill_switch_enabled() {
+    if kill_switch_enabled() || collector.retired {
         active_transport.take();
         collector.reset();
         return CloudSessionCycleOutcome::Disabled;
     }
-    let candidate = match load_cloud_session_runtime_binding(
-        grants,
+    let binding = match load_cloud_session_runtime_binding(
         inputs.accounts,
         inputs.devices,
         inputs.connections,
     ) {
-        Ok(Some(candidate)) => candidate,
+        Ok(Some(binding)) => binding,
         Ok(None) => {
             active_transport.take();
             collector.reset();
+            collector.report("not_connected");
             return CloudSessionCycleOutcome::Disabled;
         }
         Err(_) => {
             active_transport.take();
-            let _ =
-                grants.record_health("unavailable", "unavailable", Some("local_binding_invalid"));
+            collector.report("local_binding_invalid");
             collector.defer_after_local_failure(now + started.elapsed());
             return CloudSessionCycleOutcome::Failed;
         }
     };
-    let binding = candidate.binding;
-    // `load_cloud_session_runtime_binding` validates the destination first, so
-    // an on-disk URL cannot receive this long-lived secret. Reloading the
-    // device with the secret also closes an identity-change race.
+    // The destination is validated above, so an on-disk URL cannot receive
+    // this long-lived secret. Reloading the device with the secret also closes
+    // an identity-change race.
     let (credential_device, device_secret) = match (inputs.load_credentials)() {
         Ok(credentials) => credentials,
         Err(_) => {
             active_transport.take();
-            let _ = grants.record_health(
-                "unavailable",
-                "unavailable",
-                Some("relay_credentials_unavailable"),
-            );
+            collector.report("relay_credentials_unavailable");
             collector.defer_after_local_failure(now + started.elapsed());
             return CloudSessionCycleOutcome::Failed;
         }
     };
     if credential_device != binding.device || device_secret.trim().is_empty() {
         active_transport.take();
-        let _ = grants.record_health("unavailable", "unavailable", Some("local_binding_changed"));
+        collector.report("local_binding_changed");
         collector.defer_after_local_failure(now + started.elapsed());
         return CloudSessionCycleOutcome::Failed;
     }
@@ -3834,13 +2200,9 @@ where
     };
     if active_transport
         .as_ref()
-        .map_or(true, |(current, _)| current != &key)
+        .is_none_or(|(current, _)| current != &key)
     {
-        let transport = (inputs.compose_transport)(
-            binding.api_base_url.clone(),
-            credential_device,
-            device_secret,
-        );
+        let transport = (inputs.compose_transport)(binding.clone(), device_secret);
         *active_transport = Some((key, transport));
     }
     let transport = active_transport
@@ -3850,101 +2212,78 @@ where
         .as_ref();
     let outcome = collector.run_slice(
         &SliceInputs {
-            grants,
             checkpoints: inputs.checkpoints,
             runner: inputs.runner,
             transport,
             destination: &binding.api_base_url,
-            last_activity: inputs.last_activity,
+            organization_id: &binding.organization_id,
+            user_id: &binding.user_id,
         },
         now + started.elapsed(),
         wall,
     );
-    if kill_switch_enabled() || !grant_preflight_eligible(grants) {
+    if kill_switch_enabled() || collector.retired {
         active_transport.take();
     }
     outcome
 }
 
-/// Wakes the supervisor: a local consent change resets its schedule (one
-/// immediate head), local Codex activity only re-evaluates the cadence.
+/// Wakes the supervisor when local Codex activity starts, so a Mac that just
+/// connected does not wait for the fallback.
 struct CollectorWake {
-    state: Mutex<WakeCounts>,
+    activity: Mutex<u64>,
     changed: Condvar,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct WakeCounts {
-    consent: u64,
-    activity: u64,
-}
-
 static COLLECTOR_WAKE: CollectorWake = CollectorWake {
-    state: Mutex::new(WakeCounts {
-        consent: 0,
-        activity: 0,
-    }),
+    activity: Mutex::new(0),
     changed: Condvar::new(),
 };
 static LAST_CODEX_ACTIVITY: Mutex<Option<Instant>> = Mutex::new(None);
 
 impl CollectorWake {
-    fn counts(&self) -> WakeCounts {
+    fn count(&self) -> u64 {
         *self
-            .state
+            .activity
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn bump(&self, consent: bool) {
-        let mut state = self
-            .state
+    fn bump(&self) {
+        let mut activity = self
+            .activity
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if consent {
-            state.consent = state.consent.wrapping_add(1);
-        } else {
-            state.activity = state.activity.wrapping_add(1);
-        }
+        *activity = activity.wrapping_add(1);
         self.changed.notify_all();
     }
 
-    /// Wait until `until` (or the idle fallback) or a wake. True when local
-    /// consent changed since `seen`.
-    fn wait(&self, until: Option<Instant>, seen: &mut WakeCounts) -> bool {
-        let fallback = Instant::now() + IDLE_HEAD_INTERVAL;
+    /// Wait until `until` (at most the fallback wait) or a wake.
+    fn wait(&self, until: Option<Instant>, seen: &mut u64) {
+        let fallback = Instant::now() + SUPERVISOR_FALLBACK_WAIT;
         let until = until.map_or(fallback, |until| until.min(fallback));
-        let mut state = self
-            .state
+        let mut activity = self
+            .activity
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         loop {
-            if state.consent != seen.consent {
-                *seen = *state;
-                return true;
-            }
-            if state.activity != seen.activity {
-                *seen = *state;
-                return false;
+            if *activity != *seen {
+                *seen = *activity;
+                return;
             }
             let Some(remaining) = until.checked_duration_since(Instant::now()) else {
-                return false;
+                return;
             };
             if remaining.is_zero() {
-                return false;
+                return;
             }
-            state = self
+            activity = self
                 .changed
-                .wait_timeout(state, remaining)
+                .wait_timeout(activity, remaining)
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .0;
         }
     }
-}
-
-/// Local control changed cloud-session consent: run a fresh slice now.
-pub fn wake_cloud_session_collector() {
-    COLLECTOR_WAKE.bump(true);
 }
 
 /// The file watcher saw a real local Codex transcript event. Only the first
@@ -3963,14 +2302,8 @@ pub(crate) fn note_local_codex_activity() {
         warm
     };
     if !was_warm {
-        COLLECTOR_WAKE.bump(false);
+        COLLECTOR_WAKE.bump();
     }
-}
-
-fn last_local_codex_activity() -> Option<Instant> {
-    *LAST_CODEX_ACTIVITY
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn reserve_collector_supervisor(started: &AtomicBool) -> bool {
@@ -3979,51 +2312,59 @@ fn reserve_collector_supervisor(started: &AtomicBool) -> bool {
         .is_ok()
 }
 
+/// The per-Mac grant, its replay ledger and the pre-cache checkpoint are no
+/// longer used. Remove them before the supervisor starts; touch nothing else
+/// (the daily reference keeps its own ledger in its own directory).
+fn remove_retired_consent_state(support_dir: &Path) {
+    let directory = support_dir.join("cloud_sessions");
+    for name in RETIRED_STATE_FILES {
+        match fs::remove_file(directory.join(name)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => eprintln!(
+                "codex_cloud_tasks retired_state_not_removed file={name} kind={:?}",
+                error.kind()
+            ),
+        }
+    }
+}
+
 pub fn spawn_cloud_session_collector() -> Result<CloudSessionCollectorStartup> {
-    // The supervisor is always available so a newly approved local grant can
-    // activate without restarting the daemon. Each slice stays inert until
-    // exact local consent and server authority both authorize collection.
+    // The supervisor is always available so listing turned on in the app
+    // starts without restarting the daemon. Each slice stays inert until the
+    // Codex hint turns listing on for the connected user.
     if !reserve_collector_supervisor(&COLLECTOR_SUPERVISOR_STARTED) {
         return Ok(CloudSessionCollectorStartup::Started);
     }
+    remove_retired_consent_state(&default_support_dir());
     let spawned = thread::Builder::new()
         .name("ottto-codex-cloud-sessions".to_string())
         .spawn(|| {
-            let grants = CloudSessionGrantStore::default();
             let checkpoints = CloudSessionCheckpointStore::default();
             let runner = CodexCloudCliRunner;
             let mut active_transport = None;
             let mut collector = CloudCollector::default();
-            let mut seen = COLLECTOR_WAKE.counts();
+            let mut seen = COLLECTOR_WAKE.count();
             loop {
-                let outcome = collect_composed_cloud_sessions_once(
+                collect_composed_cloud_sessions_once(
                     &mut collector,
-                    &grants,
                     &checkpoints,
                     &runner,
                     &mut active_transport,
                     Instant::now(),
                 );
-                if outcome == CloudSessionCycleOutcome::Failed {
-                    eprintln!("codex_cloud_session_collector outcome={outcome:?}");
-                }
-                let wake_at = collector.next_wake(
-                    Instant::now(),
-                    OffsetDateTime::now_utc(),
-                    last_local_codex_activity(),
-                );
-                let wake_at = wake_at.map(|deadline| {
-                    let mut random = [0_u8; 8];
-                    let seconds = if random_fill(&mut random).is_ok() {
-                        u64::from_ne_bytes(random) % 21
-                    } else {
-                        0
-                    };
-                    deadline + Duration::from_secs(seconds)
-                });
-                if COLLECTOR_WAKE.wait(wake_at, &mut seen) {
-                    collector.reset();
-                }
+                let wake_at = collector
+                    .next_wake(Instant::now(), OffsetDateTime::now_utc())
+                    .map(|deadline| {
+                        let mut random = [0_u8; 8];
+                        let seconds = if random_fill(&mut random).is_ok() {
+                            u64::from_ne_bytes(random) % 21
+                        } else {
+                            0
+                        };
+                        deadline + Duration::from_secs(seconds)
+                    });
+                COLLECTOR_WAKE.wait(wake_at, &mut seen);
             }
         });
     if let Err(error) = spawned {
