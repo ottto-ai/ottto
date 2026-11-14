@@ -162,13 +162,31 @@ pub(super) fn presence() {
 
 pub(super) fn dark() {
     let (c, p, _) = accepted_case("otel-only-off-matrix");
+    assert!(crate::snapshot_sync::telemetry_only::advertised(&hint()).is_some());
+    let mut missing = hint_json();
+    missing
+        .as_object_mut()
+        .unwrap()
+        .remove("snapshot_head_cas_enabled");
+    let missing = crate::snapshot_client::decode_activity_hint(missing).unwrap();
+    assert!(!missing.snapshot_head_cas_enabled);
+    assert!(crate::snapshot_sync::telemetry_only::advertised(&missing).is_none());
+    let mut next = restore(&p);
+    let before = value(&next).unwrap();
+    let reads = otel::evidence_read_counts_for_test();
+    assert!(page(&c, &mut next, &missing, WireBudget::default())
+        .scan
+        .snapshots
+        .is_empty());
+    assert_eq!(reads, otel::evidence_read_counts_for_test());
+    assert_eq!(before, value(&next).unwrap());
     for (field, replacement) in [
         ("claude_otel_only_sessions_contract", json!(null)),
         ("claude_otel_only_sessions_contract", json!("unknown")),
         ("claude_otel_only_pairing_floor", json!(null)),
         ("claude_otel_only_pairing_floor", json!("invalid")),
         ("local_usage_reconciliation_enabled", json!(false)),
-        ("snapshot_head_cas_required", json!(false)),
+        ("snapshot_head_cas_enabled", json!(false)),
         ("source", json!("codex")),
         ("source", json!("pi")),
         ("claude_otel_only_pairing_ceiling", json!("invalid")),

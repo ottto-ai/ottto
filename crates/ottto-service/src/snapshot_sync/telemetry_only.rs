@@ -20,7 +20,7 @@ const SLACK: i128 = 300_000_000_000;
 pub(super) fn advertised(hint: &crate::snapshot_client::ActivityHintResponse) -> Option<Window> {
     if hint.source != "claude_code"
         || !hint.local_usage_reconciliation_enabled
-        || !hint.snapshot_head_cas_required
+        || !hint.snapshot_head_cas_enabled
         || hint.claude_otel_only_sessions_contract.as_deref() != Some(CONTRACT)
     {
         return None;

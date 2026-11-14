@@ -68,8 +68,9 @@ impl Switch {
 pub(crate) fn collection_window(receipt_window_days: u64, replay: bool) -> u64 {
     scan_request_window_days(receipt_window_days, replay)
 }
+/// The fixture keeps the routine rule: its gate numbers predate first-backfill byte pacing.
 pub(crate) fn needs_pacing(scan: &SourceScanResult) -> bool {
-    continuation::resident_scan_requested(scan)
+    continuation::resident_scan_requested(scan, false)
 }
 
 pub(crate) fn native_source_qos(

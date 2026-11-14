@@ -134,7 +134,8 @@ fn cycle(
 /// boundary. Held conflict bodies are offered under their bounded retry
 /// lease, as the quarantine retry selection does. A request that `enforce`
 /// accepts declares head CAS on the wire (a legacy reconciliation, or the
-/// single-body cycle); any other declares it when a body carries a patch.
+/// single-body cycle); any other declares it for a body with a cache patch or
+/// a telemetry-only body.
 /// Returns the result and each request's wire, in send order.
 pub(super) fn cycle_with_transport(
     progress: &mut SnapshotUploadProgress,
