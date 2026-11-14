@@ -96,6 +96,7 @@ memory, CPU and page-fault measurements regardless of `latest` equality.
 | `bytes_written_per_pass` | Process-attributed physical writes from prepare through finish returning, including other concurrent daemon work. No encoded-size estimate is substituted. |
 | `dirty_rows_per_save`, `encoded_bytes_per_save`, `max_value_bytes`, `erasure_pending_marks` | Backend save work and transactional erasure marks; attempts may roll back. |
 | `wal_peak_bytes`, `wal_alarm`, `wal_measurement_unavailable` | Measured WAL peak, alarm at 64 MiB, and unavailable measurements. The alarm is not a cap. |
+| `latest.wal_checkpoint_log_frames`, `latest.wal_checkpointed_frames` | Last available nonnegative WAL-frame and checkpointed-page counts returned together by SQLite, process-wide across state-v2 stores. The checkpointed count is reported in WAL frames, not distinct database pages. Cached in memory and carried by the existing state-v2 save/finish snapshot; no new row type or query. Changing these counts can make existing out-of-pass diagnostic rows print more often. Absent until a pair is available; failure or SQLite's no-applicable-WAL result leaves the last available pair intact. They do not prove the latest attempt succeeded, and reset on process restart. |
 | `import_peak_rss_bytes` | Sampled process RSS peak during the latest import attempt. |
 | `commit_latency_us.{p50,p95,recent_samples}` | Latest 128 measured COMMIT calls, excluding encoding, checkpoint and VACUUM. Pre-COMMIT refusals add no latency sample. |
 | `db_bytes`, `record_rows`, `file_rows`, `progress_rows` | Logical/main-file size and backend owner counts, with existing size alarms. `record_rows` and its alarm count graph records only; `progress_rows` counts upload-progress rows and has no alarm. |
@@ -352,8 +353,8 @@ keeping the prior body rather than emitting a zero replacement.
 
 A `source_finish` record wraps rotation finish, including its validation,
 post-policy finalization and upload work. It exists exactly when finish was
-called and returned normally, including an error return. It has `counts: {}`
-and no result field; outcome reporting and transport receipts remain the
+called and returned normally, including an error return. It has no result
+field; outcome reporting and transport receipts remain the
 existing outcome owners. Prepare failures, prepare returning no frame,
 rotation validation failures before finish, panics, aborts and hard kills
 produce no finish record.
@@ -383,7 +384,43 @@ across the same window, on every windowed stage record: `source_prepare`,
 overlap, so never sum overlapping windows. They are macOS only and absent
 elsewhere, after a failed sample or on a regressing counter. Summed windows
 (`evidence_decode`, `evidence_cross_root`) and point records omit them.
-`source_prepare` also reports `observation.malloc_in_use_bytes` sampled at prepare start on macOS; absent when unavailable.
+Energy and wakeup measurements use the same process sample as disk bytes:
+`energy_nj`, `penergy_nj`, `interrupt_wkups`, and `pkg_idle_wkups`.
+They are macOS-only deltas from `RUSAGE_INFO_V6`, omitted when unavailable
+or regressing. Older kernels fall back to v2 disk counters. Off-pass
+aggregates sum these deltas. Inner evidence steps and upload-call rows omit
+them; their outer windows measure the work. State-v2 stage windows carry
+the same four counters beside disk bytes. All measurements are process-wide:
+never sum overlapping stage or source windows.
+
+After prepare, `source_finish.counts.pass` measures prepare start through
+finish end, after allocator relief: `wall_us`, `cpu_us`, the four counters,
+and `qos_utility_us`, `qos_background_us` (maintenance + background), and
+`qos_default_us` (default + legacy + user initiated + user interactive).
+QoS uses a cached Mach timebase. CPU and wall are portable; QoS is macOS-only.
+The pass contains macOS `malloc_in_use_bytes_start` and
+`malloc_allocated_bytes_start`, with finish values `malloc_in_use_bytes` and
+`malloc_allocated_bytes`. `sample_cost_us` measures the summary sample work.
+A finish without a matching prepare omits `pass`. Three fixed source slots
+retain only endpoint samples.
+
+`pass.retained_heap_bytes` records the finishing source's in-memory index just
+before finish consumes it: `files_bytes`, `census_bytes`, `side_maps_bytes`,
+`accounts_identity_bytes`, and `traversal_bytes`. The last three split the
+existing inclusive side-map charge. Its process-wide cache fields are
+`codex_sidecar_facts_bytes`, `codex_header_cache_bytes`, and
+`desktop_title_facts_bytes`. These reuse requested-layout charges, exclude
+inline stack storage, and conservatively charge shared buffers per owner.
+Unknown/unsupported charges or busy cache locks are `null`, never invented
+zeros; finishes without the capture omit the object. The existing
+`sample_cost_us` includes the retained-layout capture work. Pass wall/CPU
+include diagnostics work, too. Cache values repeat
+across source rows and must not be summed. CLI metadata and active-session
+reconciliation have no existing heap charge; no new estimator is introduced.
+
+`source_prepare` also reports `observation.malloc_in_use_bytes` and
+`observation.malloc_allocated_bytes`, from one allocator-zone statistics call
+at prepare start on macOS; absent when unavailable.
 `source_prepare` wraps synchronous source preparation (including index load
 and baseline construction); it emits an empty counts object on normal return,
 including errors or no-frame returns. Like `source_finish`, it emits no record
@@ -1458,6 +1495,39 @@ checkpoint. This is distinct from `retiring` and does not count as census comple
 The store census also reports `max_depth_seen` as a diagnostic scalar; depth never
 feeds its error state or an alert.
 
+## Routine census scheduling observations
+
+Claude, Codex and Pi share these local scheduling observations.
+`bounded_traversal_transition` rows with `event: starting` or `event: retiring`
+include `recensus_armed` (boolean) and `context_fingerprint` (only the first
+8 hex characters of the traversal context digest). Equal prefixes suggest a
+matching context, subject to truncated-hash collisions; they are not identity proof.
+On starting rows, `recensus_armed` means the new census window is routine. On
+retiring rows, it means the next walk in that context is armed as routine.
+Complete and clean-follow-up retirements arm that next walk. Terminal-unhealthy
+retry starts become routine only for file-level problems: `walk_loss` must be false
+(no metadata/directory loss or unattributed unreadables), with no directory cap,
+rejected symlink or watcher overflow. Open/read failures and disappeared files remain
+eligible. Retry arming needs no same-process evidence: after a restart or upgrade,
+a kept terminal-unhealthy traversal's first eligible retry walk is routine under those
+conditions. A context-change start stays non-routine. Watcher-overflow,
+parent-resolution and sidecar restarts do not arm a walk. The active marker stays
+process-local and is not restored when resuming an unfinished walk from a checkpoint.
+
+Retry and follow-up walks are estimated to finish census about 25–45 minutes later
+at routine cadence; this is not a bound. Continuous arrivals can extend completion;
+nothing is dropped. Unhealthy retries have no give-up limit and their backoff delay
+is capped at one hour; walk time and the next eligible pass can add further delay.
+Source-generic transition tests cover Claude, Codex and Pi; end-to-end upload tests
+through retry and follow-up walks cover Pi only.
+
+Completed native scan pages carry `routine_recensus`, `page_file_limit_hit` and
+`pending_work` booleans on `native_collection_page`. `pending_work` means queued
+directories or candidates remain. The file-limit pacing decision is
+`page_file_limit_hit && pending_work && !routine_recensus`; a resident deferral
+can still request pacing independently. These observations add no timer or trigger.
+No full fingerprint, path or key is emitted, and none of these fields enters uploads.
+
 ## Prior Held Family Observation
 
 A `bounded_traversal_transition` row with `event: starting` includes
@@ -1825,6 +1895,13 @@ every seed of the root is an identified root copy and its other copies are
 unchanged and verified, so its subagents keep their own decisions). Counted after
 selection since the previous Claude page; counts only, no ids or paths; they
 never affect selection or money.
+
+## Codex byte-budget pacing
+
+The Codex `native_collection_page` line carries `page_byte_budget_hit: 1` in
+`page_selection` when the page put a file back because a page byte budget was
+spent. During a first backfill, such a page with queued work requests a paced
+pass. It never affects selection or money.
 
 ## Claude OTLP spans and relay requests not stored
 

@@ -127,6 +127,20 @@ impl PartialEq for CodexStateThread {
 }
 impl Eq for CodexStateThread {}
 
+/// The merged inputs a home's compacted title prefixes take from outside its
+/// own rows: per view id, `title_prefix` without the home's raw title.
+fn title_inputs(
+    titles: &BTreeMap<String, CodexTitleCandidate>,
+    created: &BTreeSet<String>,
+    home: &codex_root_copies::RootSidecar,
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    for id in home.threads.keys() {
+        digest.update(title_prefix(id, created.contains(id), titles.get(id), None).finalize());
+    }
+    digest.finalize().into()
+}
+
 fn title_prefix(
     id: &str,
     created: bool,
@@ -514,12 +528,13 @@ impl CodexTitleMetadata {
 
     fn merge_roots(
         homes: BTreeMap<PathBuf, Arc<codex_root_copies::RootSidecar>>,
-        reused: bool,
+        reused: &BTreeSet<PathBuf>,
     ) -> Self {
         let mut metadata = Self::default();
         let mut legacy_sidecar_parts = Vec::new();
         let mut parentless_ineligible = BTreeSet::new();
         for (codex_dir, mut root_sidecar) in homes {
+            let reused = reused.contains(&codex_dir);
             for input in [
                 "config.toml",
                 "state_5.sqlite",
@@ -549,8 +564,9 @@ impl CodexTitleMetadata {
             );
             let conflicts_before = metadata.identity_conflicts.len();
             let mut threads = BTreeMap::new();
-            // A reused home belongs to a complete, conflict-free group, whose
-            // physical views are exactly what its dropped raw rows produced.
+            // A reused home was kept from a complete, conflict-free pass, so
+            // its physical views are exactly what its dropped raw rows
+            // produced; a pass with any conflict reloads cold (`load`).
             let rows: IdRows<'_, &Shared<CodexStateThread>> = if reused {
                 Box::new(
                     root_sidecar
@@ -657,8 +673,8 @@ impl CodexTitleMetadata {
                 metadata.sidecar_census_incomplete = true;
             }
             // Fresh homes acquire their existing physical-home view during
-            // the ordered merge. Reused groups are complete and unchanged,
-            // so this view is already identical; conflicts are never retained.
+            // the ordered merge. A reused home is shared with the kept facts
+            // and its view is already identical; conflicts are never retained.
             if let Some(home) = Arc::get_mut(&mut root_sidecar) {
                 home.threads = threads;
                 home.extents = extents;
@@ -1339,4 +1355,4 @@ crate::heap_layout_bound::fields!(CodexTitleCandidate; title, source);
 crate::heap_layout_bound::fields!(CodexTitleMetadata; local_diagnostics, titles, state_threads, rollout_extents, root_sidecars, state_created_threads, spawn_parents, spawn_parent_conflicts, identity_conflicts, state_census_incomplete, sidecar_census_incomplete, state_census_unscoped_incomplete, sidecar_census_unscoped_incomplete, created_thread_census_failed_homes, created_thread_scoped, legacy_sidecar_fingerprint, legacy_config_file_present);
 
 #[cfg(test)]
-mod reuse_tests;
+pub(in crate::snapshots) mod reuse_tests;
