@@ -750,7 +750,7 @@ impl CodexTitleMetadata {
                 .pending_directories
                 .iter()
                 .any(|directory| under_failed(&directory.path))
-            || claude_family_census_shadow::Vetoes::current(index, traversal).namespace_loss
+            || index.traversal_namespace_loss(traversal)
         {
             return;
         }

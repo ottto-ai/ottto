@@ -476,12 +476,16 @@ impl Sqlite {
         Ok(())
     }
     pub(in super::super) fn maintenance(&mut self, idle: bool) -> Result<()> {
-        self.maintain(idle.then_some(true), false)
+        self.maintain(idle.then_some(true), false, true)
+    }
+    /// Write-begin maintenance: the same work; the commit prints its row.
+    pub(in super::super) fn maintenance_unprinted(&mut self) -> Result<()> {
+        self.maintain(None, false, false)
     }
     /// Acquisition yields our connection and transactions at this boundary.
     /// Own work never takes priority over a due privacy maintenance pause.
     pub(in super::super) fn between_cycles(&mut self, quiet: bool) -> Result<()> {
-        self.maintain(Some(quiet), false)
+        self.maintain(Some(quiet), false, true)
     }
     /// A failed idle attempt is debt, not a recovery boundary. Only overdue
     /// startup, a wall/monotonic sleep gap, or recovered space arms recovery.
@@ -547,7 +551,7 @@ impl Sqlite {
         }
         let recovering = self.recovery_attempts_left > 0;
         self.recovery_attempts_left = self.recovery_attempts_left.saturating_sub(1);
-        self.maintain(Some(false), recovering)?;
+        self.maintain(Some(false), recovering, true)?;
         if recovering && self.read_control::<u64>("erasure_pending")?.unwrap_or(0) != 0 {
             self.stats.erasure_resume_refusals =
                 self.stats.erasure_resume_refusals.saturating_add(1);
@@ -586,7 +590,7 @@ impl Sqlite {
             crate::local_resource_diagnostics::claude_state_v2(&self.stats);
         }
     }
-    fn maintain(&mut self, window: Option<bool>, resume: bool) -> Result<()> {
+    fn maintain(&mut self, window: Option<bool>, resume: bool, print: bool) -> Result<()> {
         let result = self.maintenance_inner(window, resume);
         self.stats.db_bytes = self
             .logical_bytes()
@@ -594,10 +598,13 @@ impl Sqlite {
             .zip(fs::metadata(&self.path).ok())
             .map(|(logical, m)| logical.max(m.len()));
         self.stats.db_size_alarm = self.stats.db_bytes.is_some_and(|n| n > 1_000_000_000);
+        // Hit/miss reset only where a row prints, so that row counts every
+        // access since the previous printed row.
+        let reset = i32::from(print);
         let [cache_used_bytes, cache_hit, cache_miss] = [
             (rusqlite::ffi::SQLITE_DBSTATUS_CACHE_USED, 0),
-            (rusqlite::ffi::SQLITE_DBSTATUS_CACHE_HIT, 1),
-            (rusqlite::ffi::SQLITE_DBSTATUS_CACHE_MISS, 1),
+            (rusqlite::ffi::SQLITE_DBSTATUS_CACHE_HIT, reset),
+            (rusqlite::ffi::SQLITE_DBSTATUS_CACHE_MISS, reset),
         ]
         .map(|(op, reset)| {
             self.conn().ok().and_then(|conn| {
@@ -621,8 +628,28 @@ impl Sqlite {
         self.stats.cache_used_bytes = cache_used_bytes;
         self.stats.cache_hit = cache_hit;
         self.stats.cache_miss = cache_miss;
-        crate::local_resource_diagnostics::claude_state_v2(&self.stats);
+        if print {
+            crate::local_resource_diagnostics::claude_state_v2(&self.stats);
+        }
         result
+    }
+    /// Connection cache hits plus misses since the last reset, read without reset.
+    #[cfg(test)]
+    pub(in super::super) fn cache_accesses_for_test(&self) -> u64 {
+        let ops = [
+            rusqlite::ffi::SQLITE_DBSTATUS_CACHE_HIT,
+            rusqlite::ffi::SQLITE_DBSTATUS_CACHE_MISS,
+        ];
+        ops.map(|op| {
+            let (mut current, mut high) = (0, 0);
+            let conn = self.conn().unwrap();
+            unsafe {
+                rusqlite::ffi::sqlite3_db_status(conn.handle(), op, &mut current, &mut high, 0)
+            };
+            u64::try_from(current).unwrap()
+        })
+        .iter()
+        .sum()
     }
     /// Daily counts on any between-cycles window, under its own budget, so
     /// neither a busy store nor a slow reference check can starve it. One

@@ -167,6 +167,11 @@ fn record_watcher_events(
         if paths.is_empty() {
             continue;
         }
+        if *source == SnapshotSource::Codex {
+            // Recorded before the channel can coalesce or drop the event;
+            // the cloud collector reads it for its active-Codex cadence.
+            crate::cloud_sessions::note_local_codex_activity();
+        }
         record_pending_snapshot_paths(*source, &paths);
         let _ = event_tx.try_send(SnapshotFileEvent {
             source: *source,

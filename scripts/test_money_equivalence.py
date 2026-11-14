@@ -910,7 +910,7 @@ class HeadOnlyFixtureTests(unittest.TestCase):
 
     @mock.patch.object(money_equivalence, "HEAD_ONLY_FIXTURES", ())
     def test_empty_head_only_set_is_todays_gate(self):
-        self.assertEqual(len(NATIVE_FIXTURES), 10)
+        self.assertEqual(len(NATIVE_FIXTURES), 11)
         names = sorted(NATIVE_FIXTURES)
         self.assertEqual(self.coverage_and_receipts(names, names),
                          ([f"{name}.json" for name in names], []))
@@ -921,7 +921,7 @@ class HeadOnlyFixtureTests(unittest.TestCase):
             receipt_names(*self.receipts(names, names + [NEW_FIXTURE]), NATIVE_FIXTURES)
         self.assertEqual(
             verified_summary(names, [], "b", "h", 1.0),
-            "Money equivalence VERIFIED: 10 + 2 disk-restore fixtures, base `b`, head `h`. "
+            "Money equivalence VERIFIED: 11 + 2 disk-restore fixtures, base `b`, head `h`. "
             "1.0s. Family vector/Pi remain ignored.\n")
 
     def test_alias_receipt_on_both_arms_is_red(self):
@@ -937,7 +937,7 @@ class HeadOnlyFixtureTests(unittest.TestCase):
         compared, uncompared = self.coverage_and_receipts(names, names + [NEW_FIXTURE])
         self.assertEqual(compared, [f"{name}.json" for name in names])
         self.assertEqual(uncompared, [f"{NEW_FIXTURE}.json"])
-        self.assertIn(f"10 compared | 1 new fixtures uncompared (absent on base): {NEW_FIXTURE}.json.",
+        self.assertIn(f"11 compared | 1 new fixtures uncompared (absent on base): {NEW_FIXTURE}.json.",
                       verified_summary(compared, uncompared, "b", "h", 1.0))
         _, right = self.receipts(names, names + [NEW_FIXTURE])
         with contextlib.redirect_stdout(io.StringIO()) as log:

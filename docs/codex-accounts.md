@@ -107,6 +107,22 @@ returns an exact launch command for the official `codex login` flow. The user
 completes OpenAI's browser login and workspace selection; Ottto never receives
 or types an email, password, MFA code, cookie, access token, or refresh token.
 
+Warning: `codex login` revokes and deletes the existing login of the home it
+runs in (`CODEX_HOME`, by default `~/.codex`) before the browser opens, even if
+the sign-in is then cancelled. Never run a plain `codex login`; use the launch
+command, which always names an Ottto-managed home.
+
+So a sign-in for a named account and workspace (prepare, prepare-target,
+reconnect, or a sign-in again after a mismatch) runs in a fresh staging home
+next to that connection's home, and the launch command names the staging home.
+Setup checks read the staging home. Once the final check passes, only the
+`auth.json` it read (with the verified `config.toml`) is published into the
+connection's home, and then the acceptance is saved; a login replaced after the
+check is refused. A stopped, timed-out, failed, duplicate or mismatched sign-in
+deletes the staging home and leaves the connection's existing login and
+identity as they were. A new connection ("connect another workspace") signs in
+in its own new, empty home.
+
 While the provider-owned browser flow is open, Companion polls a nonterminal
 setup check. An incomplete sign-in stays `waiting_for_user_login`; it is not
 converted into a failed connection. As soon as the provider exposes complete
@@ -121,8 +137,8 @@ connection only when all of these are true:
   restriction, a new App Server process reports the same identity and quota.
 
 An incorrect account or workspace remains unaccepted and can be retried in the
-same home. A stopped or failed setup also reuses its existing home. An accepted
-binding cannot be prepared again. Removing an Ottto-managed connection
+same setup, in a fresh staging home. An accepted binding cannot be prepared
+again. Removing an Ottto-managed connection
 permanently deletes only that daemon-created credential home; recovery requires
 a fresh provider login. The default Codex home is never a deletion target.
 
@@ -172,9 +188,11 @@ same provider-owned reconnect flow for that exact home.
 ## Background limit refresh
 
 The daemon reads each Codex home's limits on its own schedule (every 5 minutes
-for a home in use on this Mac, every 15 minutes otherwise, and once a day for a
+for a home in use on this Mac, every 30 minutes otherwise, and once a day for a
 second home signed into the same login) and every status read serves the saved
-reading. Each scheduled read is one `codex app-server` run, which also lets
+reading. A saved reading older than 60 minutes is shown stale; the account slot
+then shows its limits as unavailable and is not used to start a session until it
+is read again. Each scheduled read is one `codex app-server` run, which also lets
 Codex renew that home's sign-in. The scheduler sleeps until the next home is
 due, and at most a minute, whether or not any app is in front, so a login
 switched outside the daemon is read within a minute (and at least a minute
@@ -196,8 +214,9 @@ While it is off:
   scheduler wake and checked again under the settings lock right before each
   read; switching it back on wakes the scheduler at once;
 - a person's **Refresh limits**, setup and sign-in checks still read;
-- saved readings are still served and age as usual: shown stale after 30
-  minutes, and not shown past the last-known cap;
+- saved readings are still served and age as usual: shown stale after 60
+  minutes (the account slot then shows as unavailable and starts no session),
+  and not shown past the last-known cap;
 - a home with no usable saved reading reports
   `codex_quota_background_refresh_off` instead of `codex_quota_not_read_yet`;
 - an older companion app's status refresh, which cannot be told from its timer,

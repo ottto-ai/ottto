@@ -483,7 +483,7 @@ mod tests {
     #[test]
     fn retired_traversal_counters_load_and_reencode_without_them() {
         use crate::snapshots::ScanTraversalCheckpoint as Checkpoint;
-        let current = Some(crate::snapshots::claude_family_census_shadow_tests::traversal());
+        let current = Some(crate::snapshots::tests::traversal_checkpoint());
         let mut row = serde_json::to_value(&current).unwrap();
         row["counts"]["listing_owed_pace_evicted"] = 3.into();
         row["counts"]["caps"] = serde_json::json!({"inventory_hold_keys_discarded": 4});
@@ -531,7 +531,7 @@ mod tests {
         use crate::snapshots::{
             ScanResidueWitness as Witness, ScanTraversalCheckpoint as Checkpoint,
         };
-        let current = Some(crate::snapshots::claude_family_census_shadow_tests::traversal());
+        let current = Some(crate::snapshots::tests::traversal_checkpoint());
         let mut row = serde_json::to_value(&current).unwrap();
         row["residue"] = serde_json::json!({"blocked_session_ids": ["session-a"]});
         let old = serde_json::to_vec(&row).unwrap();
@@ -656,10 +656,8 @@ mod alias_tests {
     /// and the ledger retired, and still refuses an unknown sibling beside it.
     #[test]
     fn inventory_admits_retired_leaves_and_refuses_unknown_siblings() {
-        let traversal = serde_json::to_value(Some(
-            crate::snapshots::claude_family_census_shadow_tests::traversal(),
-        ))
-        .unwrap();
+        let traversal =
+            serde_json::to_value(Some(crate::snapshots::tests::traversal_checkpoint())).unwrap();
         let mut legacy_fork = traversal.clone();
         legacy_fork["codex_parent_resolution_retry_required"] = true.into();
         legacy_fork["counts"]["parent_unresolvable"] =

@@ -430,7 +430,7 @@ impl ContentStamp {
         &self,
         stamp: &crate::transcript_acquisition::FileStamp,
     ) -> bool {
-        stamp.same_listing(self.dev, self.ino, self.extent, self.modified)
+        stamp.same_listing(self.ino, self.extent, self.modified)
     }
     pub(in crate::snapshots) fn same_content(&self, other: &Self) -> bool {
         self == other

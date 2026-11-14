@@ -2885,6 +2885,60 @@ mod tests {
         assert_eq!(harness.requests(), 3);
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn post_sign_in_quota_collection_requests_a_fresh_read_and_keeps_limits() {
+        let harness = VariantHarness::new("post-sign-in-refresh");
+        harness.due(ClaudeReadSchedule::default());
+        harness.collect(respond_recognized);
+        harness.age_reading(120);
+        harness.collect(respond_recognized);
+        assert_eq!(
+            harness.requests(),
+            1,
+            "the slot still serves its recent cache"
+        );
+
+        let store = ottto_core::FileClaudeConfigSlotSettingsStore::default();
+        store.set_upkeep_consent(1, true).expect("consent");
+        // Exercise the shared post-sign-in entry point. This fixture drives
+        // the binding's collector directly, without a real login or keychain.
+        crate::claude_browser_auth::collect_allowed_quota(&store, "slot-variant");
+        assert_eq!(
+            super::super::claude_explicit_refresh_request().trigger,
+            crate::provider_calls::Trigger::Setup
+        );
+        harness.collect(respond_recognized);
+        assert_eq!(harness.requests(), 2, "sign-in refreshes inside the slot");
+
+        harness.age_reading(30);
+        crate::claude_browser_auth::collect_allowed_quota(&store, "slot-variant");
+        harness.collect(respond_recognized);
+        assert_eq!(
+            harness.requests(),
+            2,
+            "a second request waits out 60 seconds"
+        );
+
+        harness.age_reading(90);
+        let now = super::super::current_unix_seconds();
+        let mut cache =
+            super::super::read_claude_oauth_usage_cache(harness.account, harness.organization)
+                .expect("stored reading");
+        cache.next_refresh_after_epoch_seconds = now + 600;
+        super::super::write_claude_oauth_usage_cache(&cache).unwrap();
+        super::super::record_claude_oauth_usage_failure(
+            super::super::ClaudeOAuthUsageFailure::RateLimited,
+            harness.account,
+            harness.organization,
+            &super::super::claude_oauth_usage_config_fingerprint(),
+            now,
+        );
+        crate::claude_browser_auth::collect_allowed_quota(&store, "slot-variant");
+        harness.collect(respond_recognized);
+        assert_eq!(harness.requests(), 2, "sign-in still respects Retry-After");
+    }
+
     /// A 429 with a short Retry-After inside the success spacing: an explicit
     /// refresh still waits it out when the persisted breaker cannot say so
     /// (for example after a configuration change).

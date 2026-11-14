@@ -266,6 +266,11 @@ pub(crate) fn claude_identity_over_cap(
     with_claude_identity_over_cap(record);
 }
 
+#[cfg(test)]
+pub(crate) fn identity_over_cap_counts_for_test() -> [u64; 8] {
+    with_claude_identity_over_cap(|counts| std::array::from_fn(|i| counts[i].load(Relaxed)))
+}
+
 /// Wire bytes of the last over-cap tagged body by component, measured before
 /// its display leaves are shed; `after_shed` is what the tag selector then
 /// sees. Counts and an 8-hex entity digest only.
@@ -1382,7 +1387,7 @@ impl Observation {
             wall_elapsed_us: wall,
             malloc_in_use_bytes: None,
             footprint: Default::default(),
-            cli_children: cli_children::snapshot(),
+            cli_children: Vec::new(),
             shared_process_cpu_delta_us: before
                 .zip(after)
                 .and_then(|(before, after)| after.cpu_us.checked_sub(before.cpu_us)),
@@ -1418,6 +1423,8 @@ pub(crate) fn source_prepare<T>(
         source: Source::from_slug(source),
         observation: Observation {
             malloc_in_use_bytes,
+            // Cumulative totals: once per prepare, not on every row.
+            cli_children: cli_children::snapshot(),
             ..probe.stage_observation(footprint.as_ref())
         },
         counts: BTreeMap::<&str, u64>::new(),
@@ -1475,6 +1482,8 @@ pub(crate) struct StageWindow {
     jsonl: Option<jsonl::Scope>,
     evidence_mem: Option<EvidenceMem>,
     offpass_cpu: Option<Option<StateV2Cpu>>,
+    /// Off-pass control request counts from `take_control` (no ids or args).
+    pub(crate) control: BTreeMap<&'static str, u64>,
 }
 /// Evidence-read memory checkpoints, scalars only. Raw allocator in-use bytes
 /// at A (API evidence attached), B (root loop done) and C (cross-root finish
@@ -1533,6 +1542,7 @@ impl StageWindow {
             jsonl: None,
             evidence_mem: None,
             offpass_cpu: offpass.then(|| process_usage().map(|(_, cpu)| cpu)),
+            control: BTreeMap::new(),
         }
     }
     /// A window that also scopes and reports JSONL line scalars for `source`.
@@ -1561,6 +1571,7 @@ impl Drop for StageWindow {
                     cpu_user_us: samples
                         .and_then(|(a, b)| b.cpu_user_us.checked_sub(a.cpu_user_us)),
                     cpu_sys_us: samples.and_then(|(a, b)| b.cpu_sys_us.checked_sub(a.cpu_sys_us)),
+                    control: std::mem::take(&mut self.control),
                 },
                 observation,
             });
@@ -1596,6 +1607,36 @@ struct OffpassCounts {
     cpu_user_us: Option<u64>,
     cpu_sys_us: Option<u64>,
     wall_max_us: u64,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    control: BTreeMap<&'static str, u64>,
+}
+std::thread_local! {
+    static CONTROL: std::cell::RefCell<BTreeMap<&'static str, u64>> = const {
+        std::cell::RefCell::new(BTreeMap::new())
+    };
+}
+/// One control request's command class on its worker thread; counts only.
+pub(crate) fn control_class(class: &'static str) {
+    CONTROL.with_borrow_mut(|counts| counts.insert(class, 1));
+}
+/// Times the Companion code-signature check; its result passes through as is.
+pub(crate) fn trust_check(check: impl FnOnce() -> bool) -> bool {
+    let started = Instant::now();
+    let trusted = check();
+    let us = wall_us(started);
+    if cfg!(target_os = "macos") {
+        let timer = [
+            ("trust_checks", 1),
+            ("trust_us_sum", us),
+            ("trust_us_max", us),
+        ];
+        CONTROL.with_borrow_mut(|counts| counts.extend(timer));
+    }
+    trusted
+}
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn take_control() -> BTreeMap<&'static str, u64> {
+    CONTROL.take()
 }
 // Literal source/stage keys only; one pending row per lane, no work-unit history.
 process_static!(fn with_offpass: std::sync::Mutex<BTreeMap<(Source, &'static str), Record<OffpassCounts>>> =
@@ -1607,6 +1648,11 @@ fn aggregate_offpass(mut row: Record<OffpassCounts>) {
         if let Some(previous) = rows.remove(&key) {
             row.counts.count += previous.counts.count;
             row.counts.wall_max_us = row.counts.wall_max_us.max(previous.counts.wall_max_us);
+            for (key, n) in previous.counts.control {
+                let max = key.ends_with("_max");
+                let total = row.counts.control.entry(key).or_default();
+                *total = if max { n.max(*total) } else { n + *total };
+            }
             for (sum, prior) in [
                 (&mut row.counts.cpu_user_us, previous.counts.cpu_user_us),
                 (&mut row.counts.cpu_sys_us, previous.counts.cpu_sys_us),
@@ -1741,6 +1787,7 @@ pub(crate) fn usage_gaps(source: &str, bodies: &[crate::snapshots::SnapshotItem]
 impl crate::heap_layout_bound::HeapLayoutBound for StageWindow {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.probe, c)?;
+        crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.control, c)?;
         crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.footprint, c)
     }
 }
@@ -1877,14 +1924,6 @@ pub(crate) fn claude_history_upgrade_owed_without_list(counts: &impl Serialize) 
         "claude_code",
         counts,
     );
-}
-/// Shadow, once per Claude page: per-family census completion counts
-/// (`family_census_complete`, `family_census_incomplete{reason}`,
-/// `family_complete_deferred{quantum}`), `pending_census_members`, the
-/// skipped-set digest and predicate cost. Counts only; never an authority
-/// input, no path, id or wire event.
-pub(crate) fn claude_family_census_shadow(counts: &impl Serialize) {
-    traversal_point("claude_family_census_shadow", "claude_code", counts);
 }
 static HISTORY_PROOF_CORRECTION_DEFERRED_TOTAL: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -2896,6 +2935,7 @@ mod tests {
             assert_eq!(row["stage"], "offpass_agent_status");
             assert_eq!(row["source"], source);
             assert!(row["observation"]["wall_elapsed_us"].is_u64());
+            assert!(row["observation"].get("cli_children").is_none());
             for field in ["cpu_user_us", "cpu_sys_us"] {
                 assert!(row["counts"].get(field).is_some());
                 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -2930,6 +2970,7 @@ mod tests {
                         cpu_user_us: Some(2),
                         cpu_sys_us: Some(5),
                         wall_max_us: 7,
+                        control: BTreeMap::new(),
                     },
                 });
             }
@@ -2943,6 +2984,34 @@ mod tests {
         );
         assert_eq!(rows[0]["observation"]["wall_elapsed_us"], 21);
         assert_eq!(rows[1]["stage"], "source_prepare");
+    }
+
+    /// [behaviour] Control requests sum per class; the trust timer sums, maxes
+    /// and counts on macOS and is absent elsewhere.
+    #[test]
+    fn offpass_control_counts_classes_and_trust_time() {
+        let (_, rows) = capture(|| {
+            for class in ["status", "status", "other"] {
+                control_class(class);
+                assert!(trust_check(|| true));
+                let mut stage = StageWindow::begin("unknown", "offpass_control_xpc");
+                stage.control = take_control();
+            }
+            flush_offpass();
+        });
+        let control = &rows[0]["counts"]["control"];
+        assert_eq!(
+            (control["status"].as_u64(), control["other"].as_u64()),
+            (Some(2), Some(1))
+        );
+        assert_eq!(
+            control.get("trust_checks").is_some(),
+            cfg!(target_os = "macos")
+        );
+        if cfg!(target_os = "macos") {
+            assert_eq!(control["trust_checks"], 3);
+            assert!(control["trust_us_max"].as_u64() <= control["trust_us_sum"].as_u64());
+        }
     }
 
     #[test]

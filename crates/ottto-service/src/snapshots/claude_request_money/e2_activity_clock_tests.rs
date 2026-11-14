@@ -79,7 +79,7 @@ fn body(name: &str, lines: &[Value], rows: &[ClaudeLocalOtelEvidence]) -> Snapsh
         health: Default::default(),
     };
     let trace = ClaudeTraceOwnershipLoadReport::default();
-    side_calls_page(&mut items, &api, &trace, &index);
+    side_calls_page(&mut items, &api, &trace, &index, &mut Default::default());
     decide_page_copies(&mut items, &index, None);
     let (mut held, queued) = (Default::default(), Default::default());
     finish_page(

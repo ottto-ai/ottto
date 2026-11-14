@@ -171,13 +171,9 @@ pub(in crate::snapshots) fn certified_physical_matches(
     let Ok(stamp) = crate::transcript_acquisition::FileStamp::capture(metadata.clone()) else {
         return false;
     };
-    stamp.same_listing(
-        certificate.device,
-        certificate.inode,
-        certificate.length,
-        certificate.modified,
-    ) && (certificate.birth_nanos == 0
-        || metadata.created().ok().and_then(unix_nanos) == Some(certificate.birth_nanos))
+    stamp.same_listing(certificate.inode, certificate.length, certificate.modified)
+        && (certificate.birth_nanos == 0
+            || metadata.created().ok().and_then(unix_nanos) == Some(certificate.birth_nanos))
 }
 
 /// Rebind only a Codex head's route prefix after the caller proves a path
@@ -1257,3 +1253,31 @@ mod retired_slot_tests {
 #[cfg(test)]
 #[path = "tail_source/repository_binding_tests.rs"]
 mod repository_binding_tests;
+
+/// Edit only a synthetic stored device witness, preserving the opaque head
+/// identity and reduction through their owning codec. No production writer.
+#[cfg(test)]
+pub(in crate::snapshots) fn renumber_device_for_test(body: &[u8], key: &str) -> Vec<u8> {
+    let mut decoder = Dec::new(body);
+    let identity = HeadIdentity::take(&mut decoder).unwrap();
+    let mut certificate = DurableCertificate::take(&mut decoder).unwrap();
+    certificate.device ^= 1;
+    let mut file = std::fs::File::open(key).unwrap();
+    assert!(
+        certificate
+            .restore_grown(
+                &mut file,
+                crate::transcript_acquisition::Scope("e2-pipeline".into()),
+                None
+            )
+            .is_ok(),
+        "a renumbered device keeps the certificate"
+    );
+    let mut edited = Enc::count_write(usize::MAX, |encoder| {
+        identity.put(encoder)?;
+        certificate.put(encoder)
+    })
+    .unwrap();
+    edited.extend_from_slice(&body[body.len() - decoder.remaining()..]);
+    edited
+}

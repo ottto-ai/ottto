@@ -89,7 +89,7 @@ fn version_two_reowes_nothing_and_seeds_no_mark() {
         assert_eq!(index.files[three].effective_upload_body_witness_revision, 3);
         assert_eq!(marks(&index, three), money_mark::ESTIMATED, "{record:?}");
         assert_eq!(marks(&index, two), 0, "{record:?}");
-        assert_eq!(index.claude_money_birth_store.money_rule_version(), 2);
+        assert_eq!(index.claude_money_birth_store.money_rule_version(), 4);
     }
 }
 
@@ -130,7 +130,7 @@ fn a_retired_permit_bit_is_decoded_and_never_replayed() {
             "v{stored_version}: never cleared or replayed"
         );
         assert_eq!(marks(&loaded, plain), 0, "never set");
-        assert_eq!(loaded.claude_money_birth_store.money_rule_version(), 2);
+        assert_eq!(loaded.claude_money_birth_store.money_rule_version(), 4);
     }
     std::fs::remove_dir_all(root).unwrap();
 }

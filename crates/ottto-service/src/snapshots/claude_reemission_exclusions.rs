@@ -485,8 +485,8 @@ pub(crate) fn with_no_list_cutoff<T>(cutoff: u64, f: impl FnOnce() -> T) -> T {
 // does not clear it; a restart is the human reset. In memory only, process-wide
 // across Claude destinations. One local alarm when it sets, at most one
 // reminder an hour while it holds.
-// An empty generation-0 index loaded while the exclusion seen-marker exists
-// also latches it, including a quarantined index or a new pairing destination.
+// An empty generation-0 index with this destination's own history also latches
+// it while the exclusion seen-marker exists. A new destination alone does not.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum ClaudeReemissionStopCause {
     EvidenceBound,
@@ -571,6 +571,18 @@ fn note_claude_reemission_stop_at(
             .then_some(ClaudeReemissionStopCause::EvidenceBound),
         now,
     );
+}
+
+/// Called after prepare proves this destination lost its own Claude history.
+pub(crate) fn note_claude_index_rebuild_stop(support_dir: &Path) {
+    if std::fs::symlink_metadata(ReemissionExclusions::seen_marker_path(support_dir)).is_ok() {
+        note_claude_reemission_stop_with_cause_at(
+            &ClaudeContextFileBirthCounts::default(),
+            &BTreeSet::new(),
+            Some(ClaudeReemissionStopCause::IndexRebuild),
+            std::time::Instant::now(),
+        );
+    }
 }
 
 pub(super) fn note_claude_reemission_stop_with_cause_at(
