@@ -451,10 +451,10 @@ the `cloud_session_changes.v2` contract and carries the user's 32-byte task
 key; anything else (listing off, an older server, a malformed key) is off and
 the hint is read again in 30 minutes, or six hours when the route is missing.
 The same hint's `SnapshotUploadPolicy` decides whether titles and environment
-names are sent, and every body is stamped with it. A 409 the server marks
-retryable (a policy mismatch) backs off and re-reads the hint; one it marks not
-retryable rechecks like listing off. A 410 (contract retired) stops the
-collector for the life of the process. Refusals settle nothing.
+names are sent, and every body is stamped with it. Any 409 (listing off, a
+policy mismatch) rechecks like listing off, so a policy mismatch waits up to
+30 minutes; a 410 (contract retired) rechecks like a missing route, every six
+hours. Refusals settle nothing.
 
 The head interval lives in the collector, outside the schedule: five minutes,
 doubling after each successful head listing from which the server accepted

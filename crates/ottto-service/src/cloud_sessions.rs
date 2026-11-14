@@ -875,13 +875,13 @@ impl CloudSessionRunner for CodexCloudCliRunner {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloudSessionCycleOutcome {
-    /// The kill switch, no connected Codex Mac, a local identity change or a
-    /// retired contract: no provider or backend call was made.
+    /// The kill switch, no connected Codex Mac or a local identity change: no
+    /// provider or backend call was made.
     Disabled,
     /// Nothing was due yet.
     NotDue,
     /// Listing is off for this user, the server refused it, or the server
-    /// lacks the route. Rechecked later; no provider call was made.
+    /// lacks the route (or retired this contract). Rechecked later.
     Unsupported,
     /// Work ran and no task changed.
     Noop,
@@ -898,9 +898,6 @@ pub struct CloudCollector {
     /// Successful head listings in a row from which the server accepted
     /// nothing new; sets the head interval. Outlives `schedule.clear()`.
     unchanged_heads: u32,
-    /// The server retired the contract this build speaks (HTTP 410): nothing
-    /// runs again in this process. An update restarts the daemon.
-    retired: bool,
     /// The last state logged, so each transition logs one line.
     reported: Option<&'static str>,
 }
@@ -927,13 +924,11 @@ struct SliceError {
 enum SliceErrorKind {
     /// Retry after the cloud-only backoff (a `Retry-After` when given).
     Backoff(Option<Duration>),
-    /// The server does not offer this route.
+    /// The server does not offer this route or retired this contract.
     Unsupported,
-    /// The server refused listing for now (turned off, or a refusal it marks
-    /// not retryable); read the hint again later.
+    /// Listing is off, or the server refused the request (any 409); read
+    /// the hint again later.
     Off,
-    /// The server retired this contract (HTTP 410).
-    Retired,
     /// A local identity change closed the I/O fence mid-slice.
     Stopped,
     /// The slice budget ran out; the next slice continues.
@@ -955,19 +950,13 @@ impl SliceError {
                 kind: SliceErrorKind::Backoff(shed.retry_after),
             };
         }
-        if let Some(refused) = error.downcast_ref::<crate::snapshot_client::CloudTaskRefused>() {
-            return if refused.status == 410 {
-                Self {
-                    category: "contract_retired",
-                    kind: SliceErrorKind::Retired,
-                }
-            } else if refused.retryable == Some(true) {
-                Self::backoff("server_refused_retryable")
-            } else {
-                Self {
-                    category: "server_refused",
-                    kind: SliceErrorKind::Off,
-                }
+        if error
+            .downcast_ref::<crate::snapshot_client::CloudTaskRefused>()
+            .is_some()
+        {
+            return Self {
+                category: "server_refused",
+                kind: SliceErrorKind::Off,
             };
         }
         if error
@@ -1016,9 +1005,6 @@ impl CloudCollector {
     /// When the supervisor should next run a slice; `None` waits for a local
     /// wake (or the supervisor's fallback).
     pub fn next_wake(&self, now: Instant, wall: OffsetDateTime) -> Option<Instant> {
-        if self.retired {
-            return None;
-        }
         if self.schedule.scope.is_none() {
             return self.schedule.retry_not_before;
         }
@@ -1059,9 +1045,6 @@ impl CloudCollector {
         if kill_switch_enabled() {
             self.schedule.clear();
             self.report("kill_switch");
-            return CloudSessionCycleOutcome::Disabled;
-        }
-        if self.retired {
             return CloudSessionCycleOutcome::Disabled;
         }
         if !inputs.transport.is_configured() {
@@ -1191,14 +1174,6 @@ impl CloudCollector {
                 self.recheck_after(now, OFF_RECHECK_INTERVAL);
                 self.report(error.category);
                 CloudSessionCycleOutcome::Unsupported
-            }
-            SliceErrorKind::Retired => {
-                // Never retried in this process. One stable line to alarm on.
-                self.retired = true;
-                self.schedule.clear();
-                self.reported = Some(error.category);
-                eprintln!("codex_cloud_tasks contract_retired status=410");
-                CloudSessionCycleOutcome::Disabled
             }
             SliceErrorKind::Stopped => {
                 self.schedule.clear();
@@ -1344,12 +1319,7 @@ impl CloudCollector {
         }
         if matches!(
             failure.as_ref().map(|error| &error.kind),
-            Some(
-                SliceErrorKind::Unsupported
-                    | SliceErrorKind::Off
-                    | SliceErrorKind::Retired
-                    | SliceErrorKind::Stopped
-            )
+            Some(SliceErrorKind::Unsupported | SliceErrorKind::Off | SliceErrorKind::Stopped)
         ) {
             return failure;
         }
@@ -2154,7 +2124,7 @@ where
         FnOnce(CloudSessionRuntimeBinding, String) -> Box<dyn CloudSessionTransport + Send>,
 {
     let started = Instant::now();
-    if kill_switch_enabled() || collector.retired {
+    if kill_switch_enabled() {
         active_transport.take();
         collector.reset();
         return CloudSessionCycleOutcome::Disabled;
@@ -2224,7 +2194,7 @@ where
         now + started.elapsed(),
         wall,
     );
-    if kill_switch_enabled() || collector.retired {
+    if kill_switch_enabled() {
         active_transport.take();
     }
     outcome

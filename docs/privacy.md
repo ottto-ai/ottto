@@ -205,9 +205,8 @@ only in process memory; after a restart the crawl starts again from the newest
 page and the cache suppresses tasks already acknowledged. While listing is off
 the hint is read again every 30 minutes, so the first listing can follow up to
 30 minutes after it is turned on; a server without the hint route is rechecked
-every six hours. A refusal the server marks retryable backs off and reads the
-hint again; one it does not is treated like listing off; a retired contract
-(HTTP 410) stops the collector until the daemon restarts. A nonempty CLI page
+every six hours. Any HTTP 409 refusal is treated like listing off; a retired
+contract (HTTP 410) is treated like a missing route. A nonempty CLI page
 with no valid task identity and status is classified locally as
 `provider_payload_invalid`; it never becomes an empty healthy page. A malformed
 row is skipped alone and its valid siblings are still processed. The Codex

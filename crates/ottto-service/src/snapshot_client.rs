@@ -464,50 +464,16 @@ impl std::fmt::Display for CloudSessionContractRejected {
 
 impl std::error::Error for CloudSessionContractRejected {}
 
-/// The server refused a cloud-task upload as a whole: HTTP 409 (listing off,
-/// a policy mismatch, an unavailable predecessor) or 410 (this contract is
-/// retired). `code` and `retryable` come from the body's `detail`, read up to
-/// 4 KiB; an unreadable body leaves them unset. Nothing else is kept.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The server refused a cloud-task request as a whole (HTTP 409: listing
+/// off, a policy mismatch, an unavailable predecessor). No body is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CloudTaskRefused {
     pub status: u16,
-    pub code: Option<String>,
-    pub retryable: Option<bool>,
-}
-
-impl CloudTaskRefused {
-    fn from_response(status: u16, response: ureq::Response) -> Self {
-        let detail = bounded_response_json::<Value>(response, 4 * 1024)
-            .ok()
-            .and_then(|body| body.get("detail").cloned());
-        let detail = detail.as_ref();
-        Self {
-            status,
-            code: detail
-                .and_then(|detail| detail.get("code"))
-                .and_then(Value::as_str)
-                .filter(|code| {
-                    code.len() <= 64
-                        && code
-                            .bytes()
-                            .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
-                })
-                .map(str::to_string),
-            retryable: detail
-                .and_then(|detail| detail.get("retryable"))
-                .and_then(Value::as_bool),
-        }
-    }
 }
 
 impl std::fmt::Display for CloudTaskRefused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "backend refused cloud tasks: HTTP {} ({})",
-            self.status,
-            self.code.as_deref().unwrap_or("no code")
-        )
+        write!(f, "backend refused cloud tasks: HTTP {}", self.status)
     }
 }
 
@@ -2157,8 +2123,8 @@ fn relay_token_upload_response(
 }
 
 /// A failed cloud-session request: 401/403 is an authorization rejection;
-/// 404/405 means this server does not offer the route; 409/410 a refusal with
-/// its bounded typed code; 400/415/422 a contract rejection; 408/429/503 a
+/// 404/405/410 means this server does not offer the route (410: not this
+/// contract any more); 409 a refusal; 400/415/422 a contract rejection; 408/429/503 a
 /// shed with its `Retry-After`; any other status or a transport failure
 /// carries upload diagnostics. No other response body is read.
 fn cloud_session_request_error(
@@ -2170,12 +2136,10 @@ fn cloud_session_request_error(
         ureq::Error::Status(code @ (401 | 403), _response) => {
             anyhow::Error::new(CloudSessionAuthorizationRejected { status: code })
         }
-        ureq::Error::Status(code @ (404 | 405), _response) => {
+        ureq::Error::Status(code @ (404 | 405 | 410), _response) => {
             anyhow::Error::new(CloudSessionRouteUnsupported { status: code })
         }
-        ureq::Error::Status(code @ (409 | 410), response) => {
-            anyhow::Error::new(CloudTaskRefused::from_response(code, response))
-        }
+        ureq::Error::Status(409, _response) => anyhow::Error::new(CloudTaskRefused { status: 409 }),
         ureq::Error::Status(code @ (400 | 415 | 422), _response) => {
             anyhow::Error::new(CloudSessionContractRejected { status: code })
         }
@@ -2502,11 +2466,8 @@ impl SnapshotApiClient {
         let (agent, timeout) = bounded_snapshot_deadline_agent(budget.deadline()?)?;
         let response = relay_sent(
             relay_token,
-            agent
-                .get(&self.api_url("/api/v1/agent-session-snapshots/activity-hints"))
+            self.activity_hint_request(&agent, relay_token)
                 .timeout(timeout)
-                .set("Accept", "application/json")
-                .set("Authorization", &format!("Bearer {relay_token}"))
                 .call(),
         )
         .map_err(|error| small_upload_error(error, "activity hint request", "activity_hint"))?;
@@ -2518,14 +2479,18 @@ impl SnapshotApiClient {
         Ok(hint)
     }
 
+    /// The one activity-hint GET every caller sends.
+    fn activity_hint_request(&self, agent: &ureq::Agent, relay_token: &str) -> ureq::Request {
+        agent
+            .get(&self.api_url("/api/v1/agent-session-snapshots/activity-hints"))
+            .set("Accept", "application/json")
+            .set("Authorization", &format!("Bearer {relay_token}"))
+    }
+
     pub fn get_activity_hint(&self, relay_token: &str) -> Result<ActivityHintResponse> {
         relay_sent(
             relay_token,
-            self.agent
-                .get(&self.api_url("/api/v1/agent-session-snapshots/activity-hints"))
-                .set("Accept", "application/json")
-                .set("Authorization", &format!("Bearer {relay_token}"))
-                .call(),
+            self.activity_hint_request(&self.agent, relay_token).call(),
         )
         // Typed diagnostics (not a plain string) so a transport-layer
         // failure on this early per-source call feeds the outage streak.
@@ -3194,11 +3159,8 @@ impl SnapshotApiClient {
         let (agent, request_timeout) = cloud_session_deadline_agent(timeout)?;
         match relay_sent(
             relay_token,
-            agent
-                .get(&self.api_url("/api/v1/agent-session-snapshots/activity-hints"))
+            self.activity_hint_request(&agent, relay_token)
                 .timeout(request_timeout)
-                .set("Accept", "application/json")
-                .set("Authorization", &format!("Bearer {relay_token}"))
                 .call(),
         ) {
             Ok(response) => bounded_response_json::<Value>(

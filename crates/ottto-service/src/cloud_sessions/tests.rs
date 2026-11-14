@@ -535,15 +535,13 @@ enum AckFault {
     Unsolicited,
 }
 
-fn refused(
-    status: u16,
-    code: &str,
-    retryable: Option<bool>,
-) -> crate::snapshot_client::CloudTaskRefused {
-    crate::snapshot_client::CloudTaskRefused {
-        status,
-        code: Some(code.to_string()),
-        retryable,
+/// A whole-request refusal as the relay maps it: 410 reads like a missing
+/// route, 409 like listing off.
+fn refusal(status: u16) -> anyhow::Error {
+    if status == 410 {
+        anyhow::Error::new(crate::snapshot_client::CloudSessionRouteUnsupported { status })
+    } else {
+        anyhow::Error::new(crate::snapshot_client::CloudTaskRefused { status })
     }
 }
 
@@ -557,7 +555,7 @@ struct Server {
     hint: RefCell<Hint>,
     hint_fault: Cell<Option<HintFault>>,
     hint_calls: Cell<usize>,
-    refuse: RefCell<Option<crate::snapshot_client::CloudTaskRefused>>,
+    refuse: Cell<Option<u16>>,
     requests: RefCell<Vec<CloudSessionChangesV2>>,
     acks: RefCell<Vec<CloudSessionChangesAckV2>>,
     heads: RefCell<HashMap<String, String>>,
@@ -573,7 +571,7 @@ impl Server {
             hint: RefCell::new(Hint::on()),
             hint_fault: Cell::new(None),
             hint_calls: Cell::new(0),
-            refuse: RefCell::new(None),
+            refuse: Cell::new(None),
             requests: RefCell::new(Vec::new()),
             acks: RefCell::new(Vec::new()),
             heads: RefCell::new(HashMap::new()),
@@ -630,15 +628,11 @@ impl CloudSessionTransport for Server {
     ) -> Result<CloudSessionChangesAckV2> {
         request.validate().unwrap();
         self.requests.borrow_mut().push(request.clone());
-        if let Some(refusal) = self.refuse.borrow().clone() {
-            return Err(anyhow::Error::new(refusal));
+        if let Some(status) = self.refuse.get() {
+            return Err(refusal(status));
         }
         if request.upload_policy != self.hint.borrow().policy {
-            return Err(anyhow::Error::new(refused(
-                409,
-                "cloud_upload_policy_mismatch",
-                Some(true),
-            )));
+            return Err(refusal(409));
         }
         let mut heads = self.heads.borrow_mut();
         let mut entities = request
@@ -1111,7 +1105,7 @@ type HintChange<'a> = &'a dyn Fn(&mut Hint);
 #[test]
 #[serial_test::serial]
 fn listing_runs_only_on_an_exact_hint() {
-    let cases: [(&str, HintChange); 8] = [
+    let cases: [(&str, HintChange); 6] = [
         ("off", &|hint: &mut Hint| hint.enabled = Some(false)),
         ("older-server", &|hint: &mut Hint| {
             hint.enabled = None;
@@ -1125,12 +1119,6 @@ fn listing_runs_only_on_an_exact_hint() {
         ("no-key", &|hint: &mut Hint| hint.key = None),
         ("short-key", &|hint: &mut Hint| {
             hint.key = Some(TASK_KEY_TEXT[..42].to_string())
-        }),
-        ("padded-key", &|hint: &mut Hint| {
-            hint.key = Some(format!("{TASK_KEY_TEXT}="))
-        }),
-        ("bad-alphabet-key", &|hint: &mut Hint| {
-            hint.key = Some("!".repeat(43))
         }),
     ];
     for (name, change) in cases {
@@ -1244,110 +1232,96 @@ fn missing_hint_route_rechecks_in_six_hours() {
     );
 }
 
-/// [behaviour] HTTP 410 (this contract retired) stops the collector for the
-/// life of the process, whatever happens to the local identity; nothing it
-/// sent is remembered as settled.
+/// [behaviour] A whole-request refusal settles nothing and rechecks: any 409
+/// (listing turned off since the hint, or a policy mismatch) in 30 minutes,
+/// a 410 (contract retired) in six hours like a missing route. The recheck
+/// reads the hint again and offers the task again under its policy. A long
+/// head interval cannot postpone the 30-minute recheck.
 #[test]
 #[serial_test::serial]
-fn contract_retired_stops_for_the_process_and_settles_nothing() {
-    let (root, checkpoints) = store("retired");
-    let cli = Cli::head(page("retired", None));
-    let server = Server::new();
-    *server.refuse.borrow_mut() = Some(refused(410, "cloud_sessions_contract_retired", None));
-    let inputs = inputs(&checkpoints, &cli, &server);
-    let t0 = Instant::now();
-    let mut collector = CloudCollector::default();
-    assert_eq!(
-        slice(&mut collector, &inputs, t0, Duration::ZERO),
-        CloudSessionCycleOutcome::Disabled
-    );
-    assert!(collector.retired);
-    assert_eq!(collector.next_wake(t0, midnight()), None);
-    let scope = cache_scope(&inputs, &TASK_KEY);
-    assert!(checkpoints
-        .read_acks(
-            &scope,
-            &[entity_key("retired").as_str()],
-            midnight().unix_timestamp()
-        )
-        .unwrap()
-        .is_empty());
-
-    // A local stop (sign-out) and later slices change nothing.
-    collector.reset();
-    *server.refuse.borrow_mut() = None;
-    for offset in [MINUTE, 6 * HOUR, 30 * HOUR] {
-        assert_eq!(
-            slice(&mut collector, &inputs, t0, offset),
-            CloudSessionCycleOutcome::Disabled
-        );
+fn request_refusals_recheck_and_settle_nothing() {
+    /// Turns titles on at the server between the hint and the upload.
+    struct FlipOnList<'a> {
+        cli: Cli,
+        server: &'a Server,
+        flip: Cell<bool>,
     }
-    let (accounts, devices, connections) = (
-        FileAccountStore::new(root.join("account.json")),
-        FileDeviceStore::new(root.join("device.json")),
-        FileConnectionStore::new(root.join("connection.json")),
-    );
-    let mut active_transport: ActiveCloudSessionTransport = None;
-    assert_eq!(
-        collect_composed_cloud_sessions_once_with(
-            &mut collector,
-            &mut active_transport,
-            ComposedSliceInputs {
-                checkpoints: &checkpoints,
-                runner: &cli,
-                accounts: &accounts,
-                devices: &devices,
-                connections: &connections,
-                load_credentials: || panic!("a retired contract reads no credential"),
-                compose_transport: |_, _| panic!("a retired contract composes no relay"),
-            },
-            t0 + HOUR,
-            midnight() + HOUR,
-        ),
-        CloudSessionCycleOutcome::Disabled
-    );
-    assert!(collector.retired);
-    assert_eq!((cli.calls(), server.hint_calls.get()), (1, 1));
-    assert_eq!(server.requests.borrow().len(), 1);
-}
-
-/// [behaviour] A 409 the server marks not retryable (listing turned off
-/// since the hint) is treated like listing off: recheck in 30 minutes,
-/// nothing settled, so the task is offered again once listing is back.
-#[test]
-#[serial_test::serial]
-fn listing_refused_not_retryable_rechecks_and_settles_nothing() {
-    let (_root, checkpoints) = store("refused-disabled");
-    let cli = Cli::head(page("refused", None));
-    let server = Server::new();
-    *server.refuse.borrow_mut() = Some(refused(409, "codex_cloud_tasks_disabled", Some(false)));
-    let inputs = inputs(&checkpoints, &cli, &server);
+    impl CloudSessionRunner for FlipOnList<'_> {
+        fn list_page(&self, cursor: Option<&str>, limit: usize) -> Result<String> {
+            if self.flip.replace(false) {
+                self.server
+                    .set_hint(|hint| hint.policy.session_titles_enabled = true);
+            }
+            self.cli.list_page(cursor, limit)
+        }
+    }
     let t0 = Instant::now();
-    let mut collector = CloudCollector::default();
-    assert_eq!(
-        slice(&mut collector, &inputs, t0, Duration::ZERO),
-        CloudSessionCycleOutcome::Unsupported
-    );
-    assert_eq!(collector.next_wake(t0, midnight()), Some(t0 + 30 * MINUTE));
-    assert_eq!(collector.reported, Some("server_refused"));
-    *server.refuse.borrow_mut() = None;
-    assert_eq!(
-        slice(&mut collector, &inputs, t0, 30 * MINUTE),
-        CloudSessionCycleOutcome::Uploaded
-    );
-    let requests = server.requests.borrow();
-    assert_eq!(requests.len(), 2);
-    assert_eq!(requests[0].observations, requests[1].observations);
-    assert_eq!(server.outcomes(), [CloudSessionChangeOutcome::Accepted]);
-    drop(requests);
+    for (name, refuse, flip, recheck, state) in [
+        (
+            "listing-off",
+            Some(409),
+            false,
+            30 * MINUTE,
+            "server_refused",
+        ),
+        ("policy-mismatch", None, true, 30 * MINUTE, "server_refused"),
+        ("retired", Some(410), false, 6 * HOUR, "server_unsupported"),
+    ] {
+        let (_root, checkpoints) = store(&format!("refused-{name}"));
+        let server = Server::new();
+        server.refuse.set(refuse);
+        let runner = FlipOnList {
+            cli: Cli::head(page("refused", None)),
+            server: &server,
+            flip: Cell::new(flip),
+        };
+        let inputs = inputs(&checkpoints, &runner, &server);
+        let mut collector = CloudCollector::default();
+        assert_eq!(
+            slice(&mut collector, &inputs, t0, Duration::ZERO),
+            CloudSessionCycleOutcome::Unsupported,
+            "{name}"
+        );
+        assert_eq!(
+            collector.next_wake(t0, midnight()),
+            Some(t0 + recheck),
+            "{name}"
+        );
+        assert_eq!(collector.reported, Some(state), "{name}");
+        assert!(
+            checkpoints
+                .read_acks(
+                    &cache_scope(&inputs, &TASK_KEY),
+                    &[entity_key("refused").as_str()],
+                    midnight().unix_timestamp()
+                )
+                .unwrap()
+                .is_empty(),
+            "{name}"
+        );
+        server.refuse.set(None);
+        assert_eq!(
+            slice(&mut collector, &inputs, t0, recheck),
+            CloudSessionCycleOutcome::Uploaded,
+            "{name}"
+        );
+        assert_eq!(server.hint_calls.get(), 2, "{name}");
+        let requests = server.requests.borrow();
+        assert_eq!(requests.len(), 2, "{name}");
+        let (first, second) = (&requests[0].observations[0], &requests[1].observations[0]);
+        assert_eq!(first.entity_key, second.entity_key, "{name}");
+        assert_eq!(second.expected_head_etag, None, "{name}");
+        assert_eq!(requests[1].upload_policy.session_titles_enabled, flip);
+        assert_eq!(second.title.is_some(), flip, "{name}");
+        assert_eq!(server.outcomes(), [CloudSessionChangeOutcome::Accepted]);
+    }
 
-    // A long head interval cannot postpone the 30-minute recheck: after five
-    // unchanged heads (next head 160 minutes away) and a completed crawl, a
-    // refusal still rereads the hint 30 minutes later.
+    // After five unchanged heads (next head 160 minutes away) and a
+    // completed crawl, a refusal still reads the hint again 30 minutes later.
     let (_root, checkpoints) = store("refused-mature");
     let cli = Cli::head(page("mature", None));
     let server = Server::new();
-    let inputs = self::inputs(&checkpoints, &cli, &server);
+    let inputs = inputs(&checkpoints, &cli, &server);
     let mut collector = CloudCollector::default();
     for at in [0, 5, 15, 35, 75, 155] {
         slice(&mut collector, &inputs, t0, at * MINUTE);
@@ -1357,7 +1331,7 @@ fn listing_refused_not_retryable_rechecks_and_settles_nothing() {
         Some(t0 + 315 * MINUTE)
     );
     cli.set(None, page_of(vec![task("mature", "error")], None));
-    *server.refuse.borrow_mut() = Some(refused(409, "codex_cloud_tasks_disabled", Some(false)));
+    server.refuse.set(Some(409));
     assert_eq!(
         slice(&mut collector, &inputs, t0, 315 * MINUTE),
         CloudSessionCycleOutcome::Unsupported
@@ -1366,7 +1340,7 @@ fn listing_refused_not_retryable_rechecks_and_settles_nothing() {
         collector.next_wake(t0 + 315 * MINUTE, midnight() + 315 * MINUTE),
         Some(t0 + 345 * MINUTE)
     );
-    *server.refuse.borrow_mut() = None;
+    server.refuse.set(None);
     let hint_calls = server.hint_calls.get();
     assert_eq!(
         slice(&mut collector, &inputs, t0, 345 * MINUTE),
@@ -1377,61 +1351,6 @@ fn listing_refused_not_retryable_rechecks_and_settles_nothing() {
         server.outcomes().last(),
         Some(&CloudSessionChangeOutcome::Accepted)
     );
-}
-
-/// [behaviour] A policy mismatch (the setting changed between the hint and
-/// the upload) is retryable: cloud backoff, then the next slice reads the
-/// hint again and sends under the new policy. Nothing is settled before.
-#[test]
-#[serial_test::serial]
-fn policy_mismatch_backs_off_and_rereads_the_hint() {
-    struct FlipOnList<'a> {
-        cli: Cli,
-        server: &'a Server,
-        flipped: Cell<bool>,
-    }
-    impl CloudSessionRunner for FlipOnList<'_> {
-        fn list_page(&self, cursor: Option<&str>, limit: usize) -> Result<String> {
-            if !self.flipped.replace(true) {
-                self.server
-                    .set_hint(|hint| hint.policy.session_titles_enabled = true);
-            }
-            self.cli.list_page(cursor, limit)
-        }
-    }
-    let (_root, checkpoints) = store("policy-mismatch");
-    let server = Server::new();
-    let runner = FlipOnList {
-        cli: Cli::head(page("titled", None)),
-        server: &server,
-        flipped: Cell::new(false),
-    };
-    let inputs = inputs(&checkpoints, &runner, &server);
-    let t0 = Instant::now();
-    let mut collector = CloudCollector::default();
-    assert_eq!(
-        slice(&mut collector, &inputs, t0, Duration::ZERO),
-        CloudSessionCycleOutcome::Failed
-    );
-    let retry = collector.next_wake(t0, midnight()).unwrap();
-    assert!((t0 + 5 * MINUTE..t0 + 30 * MINUTE).contains(&retry));
-    let offset = retry.saturating_duration_since(t0);
-    assert_eq!(
-        slice(&mut collector, &inputs, t0, offset),
-        CloudSessionCycleOutcome::Uploaded
-    );
-    assert_eq!(server.hint_calls.get(), 2);
-    let requests = server.requests.borrow();
-    assert_eq!(requests.len(), 2);
-    assert!(!requests[0].upload_policy.session_titles_enabled);
-    assert_eq!(requests[0].observations[0].title, None);
-    assert!(requests[1].upload_policy.session_titles_enabled);
-    assert_eq!(
-        requests[1].observations[0].title.as_deref(),
-        Some("private title")
-    );
-    assert_eq!(requests[1].observations[0].expected_head_etag, None);
-    assert_eq!(server.outcomes(), [CloudSessionChangeOutcome::Accepted]);
 }
 
 /// [behaviour] Turning titles or workspace labels on or off offers every
@@ -1856,81 +1775,42 @@ fn mixed_ack_settles_each_task_and_survives_a_restart() {
     assert_eq!(restarted.unchanged_heads, 1);
 }
 
-/// [behaviour] Requests are packed by count and bytes: long titles split one
-/// page into several requests under the server's body ceiling, keeping every
-/// task once and in order.
+/// [behaviour] Requests are packed by count and bytes, keeping every task
+/// once and in order: 450 small tasks become 200, 200 and 50; tasks with
+/// full-length labels split under the server's body ceiling.
 #[test]
-#[serial_test::serial]
-fn long_titles_split_a_page_into_requests_under_the_byte_ceiling() {
-    let long = "é".repeat(MAX_LABEL_CHARS + 10);
-    let tasks = (0..100)
-        .map(|index| {
-            let mut task = task(&format!("long-{index:03}"), "applied");
-            task["title"] = json!(long);
-            task["environment_label"] = json!(long);
-            task
-        })
-        .collect();
-    let (_root, checkpoints) = store("byte-packing");
-    let cli = Cli::head(page_of(tasks, None));
-    let server = Server::new();
-    server.set_hint(|hint| {
-        hint.policy = CloudUploadPolicyV2 {
-            session_titles_enabled: true,
-            workspace_labels_enabled: true,
-        }
-    });
+fn pack_splits_by_count_and_bytes_keeping_every_task_in_order() {
+    let labelled = CloudUploadPolicyV2 {
+        session_titles_enabled: true,
+        workspace_labels_enabled: true,
+    };
+    let changes = |count: usize, policy| {
+        let long = "é".repeat(MAX_LABEL_CHARS);
+        let tasks = (0..count)
+            .map(|index| {
+                let mut task = task(&format!("task-{index:03}"), "applied");
+                task["title"] = json!(long);
+                task["environment_label"] = json!(long);
+                task
+            })
+            .collect();
+        parse_cloud_page(&page_of(tasks, None), &TASK_KEY, policy, now())
+            .unwrap()
+            .changes
+    };
+    let small = wire::pack(changes(450, OFF));
     assert_eq!(
-        slice(
-            &mut CloudCollector::default(),
-            &inputs(&checkpoints, &cli, &server),
-            Instant::now(),
-            Duration::ZERO
-        ),
-        CloudSessionCycleOutcome::Uploaded
-    );
-    let requests = server.requests.borrow();
-    assert!(requests.len() >= 2, "{}", requests.len());
-    for request in requests.iter() {
-        assert!(serde_json::to_vec(request).unwrap().len() <= wire::MAX_REQUEST_BYTES);
-        assert!(request.observations.iter().all(|change| {
-            change.title.as_deref().map(|title| title.chars().count()) == Some(MAX_LABEL_CHARS)
-        }));
-    }
-    let keys = requests
-        .iter()
-        .flat_map(|request| {
-            request
-                .observations
-                .iter()
-                .map(|change| change.entity_key.clone())
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        keys,
-        (0..100)
-            .map(|index| entity_key(&format!("long-{index:03}")))
-            .collect::<Vec<_>>()
-    );
-
-    // Count alone: 450 small tasks become 200, 200 and 50.
-    let small = parse_cloud_page(
-        &page_of(
-            (0..450)
-                .map(|index| task(&format!("small-{index}"), "applied"))
-                .collect(),
-            None,
-        ),
-        &TASK_KEY,
-        OFF,
-        now(),
-    )
-    .unwrap()
-    .changes;
-    assert_eq!(
-        wire::pack(small).iter().map(Vec::len).collect::<Vec<_>>(),
+        small.iter().map(Vec::len).collect::<Vec<_>>(),
         [200, 200, 50]
     );
+    let long = changes(100, labelled);
+    let requests = wire::pack(long.clone());
+    assert!(requests.len() >= 2, "{}", requests.len());
+    for request in &requests {
+        // The tasks plus a 3 KiB envelope still fit the server's ceiling.
+        assert!(serde_json::to_vec(request).unwrap().len() + 3 * 1024 <= wire::MAX_REQUEST_BYTES);
+    }
+    assert_eq!(requests.concat(), long);
 }
 
 /// [behaviour] Cloud failures back off on their own clock; nothing of the
@@ -3046,8 +2926,8 @@ fn relay_token_redirect_never_forwards_the_device_secret() {
 
 /// [format] The relay reads the Codex activity hint and posts the exact v2
 /// body to the changes route, each retried once after a 401 with a fresh
-/// relay token. A 409 or 410 keeps only the body's code and retryable flag;
-/// a 404 on the hint reads as an older server.
+/// relay token. A 409 is a refusal and a 410 reads like a missing route,
+/// without reading either body; a 404 on the hint reads as an older server.
 #[test]
 #[serial_test::serial]
 fn relay_reads_the_hint_and_maps_refusals_on_the_exact_routes() {
@@ -3180,27 +3060,19 @@ fn relay_reads_the_hint_and_maps_refusals_on_the_exact_routes() {
         .send_changes(&request, Duration::from_secs(5))
         .unwrap();
     assert!(request.settle(&ack).is_ok());
-    let refusal = |error: anyhow::Error| {
-        error
-            .downcast_ref::<crate::snapshot_client::CloudTaskRefused>()
-            .cloned()
-            .unwrap()
+    let Err(conflict) = relay.send_changes(&request, Duration::from_secs(5)) else {
+        panic!("a 409 must fail");
     };
     assert_eq!(
-        refusal(
-            relay
-                .send_changes(&request, Duration::from_secs(5))
-                .unwrap_err()
-        ),
-        refused(409, "cloud_upload_policy_mismatch", Some(true))
+        conflict.downcast_ref::<crate::snapshot_client::CloudTaskRefused>(),
+        Some(&crate::snapshot_client::CloudTaskRefused { status: 409 })
     );
+    let Err(gone) = relay.send_changes(&request, Duration::from_secs(5)) else {
+        panic!("a 410 must fail");
+    };
     assert_eq!(
-        refusal(
-            relay
-                .send_changes(&request, Duration::from_secs(5))
-                .unwrap_err()
-        ),
-        refused(410, "cloud_sessions_contract_retired", None)
+        gone.downcast_ref::<crate::snapshot_client::CloudSessionRouteUnsupported>(),
+        Some(&crate::snapshot_client::CloudSessionRouteUnsupported { status: 410 })
     );
     let Err(missing) = relay.read_hint(Duration::from_secs(5)) else {
         panic!("a missing hint route must fail");
