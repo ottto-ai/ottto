@@ -701,7 +701,9 @@ fn conflict_in_a_changed_home_reloads_cold() {
         let conflict = pass(&mut facts, &roots, &paths, 0, "conflict");
         assert!(conflict.identity_conflicts.contains(x));
         assert!(facts.homes.kept.is_empty());
+        pass(&mut facts, &roots, &paths, 0, "not_kept");
         history(&homes[changed], &alias(y));
+        pass(&mut facts, &roots, &paths, 0, "not_kept");
         pass(&mut facts, &roots, &paths, 0, "not_kept");
         history(
             &homes[changed],
