@@ -744,7 +744,6 @@ pub(crate) enum PageSelection {
     ChargeEstimate,
     /// Distinct Claude roots whose own seeds read only the root's homes.
     ForcedFamilyMemberScoped,
-    /// 1 when a Codex page deferred a file on a spent byte budget.
     ByteBudgetHit,
 }
 pub(crate) fn page_selection(source: &str, event: PageSelection, amount: u64) {

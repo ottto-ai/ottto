@@ -659,22 +659,6 @@ fn backfill_replay_pending(
         .contains(&source)
 }
 
-/// The source's first backfill for this destination, not a declared replay
-/// revision bump: only it lets a byte-bound page ask for a paced pass.
-fn first_read_bootstrap_pending(
-    source: SnapshotSource,
-    backfill_state: &crate::backfill::BackfillState,
-    destination_namespace: &str,
-    backfill_pending: bool,
-) -> bool {
-    backfill_pending
-        && crate::backfill::bootstrap_pending_for_destination(
-            backfill_state,
-            source,
-            destination_namespace,
-        )
-}
-
 /// Claude only: the unreadable backfill state suppresses replays until a
 /// Claude census under the history gate clears it (N2).
 fn claude_replay_suppressed(
@@ -5772,8 +5756,7 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
         _remaining: Option<usize>,
     ) -> Result<Option<SourcePreparation>> {
         drop(self.paced_qos.take());
-        self.paced_qos =
-            continuation::paced_source_qos(source, continuation::paced_pass_qos(source));
+        self.paced_qos = continuation::paced_source_qos(source, continuation::resident_background);
         if source == SnapshotSource::Codex {
             self.codex_started = Some(Instant::now());
             // K2: this prepare's policy replaces any older cached inputs.
@@ -9116,15 +9099,14 @@ fn finish_sync_source(
     with_source_cadence(source, |cadence| {
         cadence.record_scan_success(Instant::now(), accepted)
     });
-    let first_read_bootstrap = first_read_bootstrap_pending(
-        source,
-        &backfill_state,
-        &upload_destination_namespace,
-        backfill_pending,
-    );
+    let first_read_bootstrap = backfill_pending
+        && crate::backfill::bootstrap_pending_for_destination(
+            &backfill_state,
+            source,
+            &upload_destination_namespace,
+        );
     if continuation::resident_scan_requested(&scan_result, first_read_bootstrap) {
-        let bytes_only = !continuation::resident_scan_requested(&scan_result, false);
-        continuation::request_resident_scan(source, bytes_only);
+        continuation::request_resident_scan(source);
     }
 
     // Refresh the per-source detected-uses cache the daemon health assembly

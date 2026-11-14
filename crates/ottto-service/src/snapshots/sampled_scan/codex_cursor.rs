@@ -186,8 +186,7 @@ pub(in crate::snapshots) struct PageBudget {
     /// G1: watcher hints this page's start enqueued as next-generation
     /// evidence, counted in `deferred_next_generation` at the page tick.
     next_generation_hints: u64,
-    /// A file was deferred because a byte budget is spent (`budget_spent`),
-    /// never for a rotation turn, a pace verdict, a busy slot or a fence.
+    /// A file was deferred because a byte budget is spent (`budget_spent`).
     budget_deferred: bool,
 }
 crate::heap_layout_bound::fields!(PageBudget; cursor_decoded, singleton_decoded,
@@ -277,8 +276,7 @@ impl PageBudget {
         limits.singleton.saturating_sub(self.singleton_decoded)
     }
 
-    /// The byte budget `expected` would be charged to is spent: the cursor's
-    /// for a file above the singleton budget, else the page's singleton bytes.
+    /// The cursor or singleton budget `expected` would be charged to is spent.
     fn budget_spent(&self, limits: Limits, expected: u64) -> bool {
         if expected > limits.singleton {
             self.cursor_exhausted(limits)
@@ -287,7 +285,6 @@ impl PageBudget {
         }
     }
 
-    /// This page deferred a file because a byte budget is spent.
     pub(in crate::snapshots) fn budget_deferred(&self) -> bool {
         self.budget_deferred
     }
@@ -3411,8 +3408,7 @@ impl SharedCache {
         pace: Option<PaceProbe<'_>>,
     ) -> StartPlan {
         let plan = page.plan(limits, expected, slot_free, cursor_enabled);
-        // Only a returned budget Defer counts: a busy slot alone, a rotation
-        // turn, a pace verdict or a fence below does not.
+        // Only a returned budget Defer counts (not busy, rotation, pace or fence).
         let spent = plan == StartPlan::Defer && page.budget_spent(limits, expected);
         if !matches!(plan, StartPlan::Cursor | StartPlan::Defer) || expected <= limits.singleton {
             page.budget_deferred |= spent;

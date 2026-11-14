@@ -1462,13 +1462,10 @@ fn file_limit_full_pages_request_pacing_only_with_queued_work_and_allowed_power(
     std::fs::remove_dir_all(home).unwrap();
 }
 
-/// [behaviour] A spent Codex byte budget paces queued work only during a
-/// first backfill, routine or not, through the same power gates. Only then
-/// does the request carry the byte-term reason (`!resident_scan_requested(
-/// scan, false)`); a full file allowance keeps today's term and reason.
+/// [behaviour] A spent Codex byte budget asks for pacing with queued work
+/// only during a first backfill, routine or not.
 #[test]
 fn byte_budget_pages_pace_only_during_a_first_backfill() {
-    let now = Instant::now();
     let mut scan = empty_scan();
     assert!(!scan.charge_deferred && !scan.page_file_limit_hit);
     for bits in 0..16_u8 {
@@ -1477,29 +1474,7 @@ fn byte_budget_pages_pace_only_during_a_first_backfill() {
         scan.census_status.pending_work = pending;
         let requested = resident_scan_requested(&scan, bootstrap);
         assert_eq!(requested, bootstrap && byte_hit && pending, "{bits:04b}");
-        assert!(!resident_scan_requested(&scan, false), "byte term alone");
-        for (power, gap) in [
-            (PlatformState::Allowed, Some(30)),
-            (PlatformState::Battery, Some(180)),
-            (PlatformState::Refused, None),
-            (PlatformState::Unknown, None),
-        ] {
-            let mut cadence = SourceCadence::new(CadenceConfig::cost_first(SNAPSHOT_SYNC_INTERVAL));
-            cadence.record_scan_success(now, 1);
-            if requested && let Some(pacing) = resident_pacing(power) {
-                assert!(cadence.request_paced_scan(now, Duration::ZERO, pacing));
-            }
-            let due = gap
-                .filter(|_| requested)
-                .map(|gap| now + Duration::from_secs(gap));
-            assert_eq!(cadence.paced_scan_due(), due, "{bits:04b} {power:?}");
-        }
     }
-    (scan.page_file_limit_hit, scan.routine_recensus) = (true, false);
-    assert!(
-        resident_scan_requested(&scan, false),
-        "today's term and QoS"
-    );
 }
 
 /// `count` Codex rollouts of about 1.7 KiB each in `root`, numbered from `first`.
@@ -1531,14 +1506,16 @@ fn codex_rollouts(root: &Path, first: u64, count: u64) -> Vec<PathBuf> {
 /// revision is not a first backfill; a re-paired destination is.
 #[test]
 fn first_read_byte_pacing_stops_when_backfill_completes() {
-    use super::super::{backfill_replay_pending, first_read_bootstrap_pending};
-    use crate::backfill::{mark_backfill_complete_for_destination, BackfillState};
+    use super::super::backfill_replay_pending;
+    use crate::backfill::{
+        bootstrap_pending_for_destination, mark_backfill_complete_for_destination, BackfillState,
+    };
     use crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture;
     const DESTINATION: &str = "first-read-destination";
     let codex = SnapshotSource::Codex;
     let bootstrap = |state: &BackfillState| {
-        let pending = backfill_replay_pending(codex, state, DESTINATION);
-        first_read_bootstrap_pending(codex, state, DESTINATION, pending)
+        backfill_replay_pending(codex, state, DESTINATION)
+            && bootstrap_pending_for_destination(state, codex, DESTINATION)
     };
     let home = crate::test_scratch::private_dir("first-read-byte-pacing")
         .canonicalize()
@@ -1592,12 +1569,8 @@ fn first_read_byte_pacing_stops_when_backfill_completes() {
         .insert("codex".into(), "codex_replay:v0".into());
     assert!(backfill_replay_pending(codex, &state, DESTINATION));
     assert!(!bootstrap(&state), "a pending replay revision");
-    assert!(first_read_bootstrap_pending(
-        codex,
-        &state,
-        "re-paired",
-        true
-    ));
+    let repaired = bootstrap_pending_for_destination(&state, codex, "re-paired");
+    assert!(repaired, "a re-paired destination");
     std::fs::remove_dir_all(home).unwrap();
 }
 
