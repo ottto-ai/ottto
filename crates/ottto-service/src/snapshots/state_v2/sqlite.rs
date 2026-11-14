@@ -23,6 +23,10 @@ const MMAP_BYTES: i64 = 2_147_418_112;
 const CACHE_KIB: i64 = -8192;
 const BUSY: Duration = Duration::from_millis(100);
 const PAGE_HEADERS: usize = 128;
+const JOURNAL_LIMIT_BYTES: i64 = 16 * 1024 * 1024;
+const _: () = assert!(
+    (JOURNAL_LIMIT_BYTES as u64) < WAL_PASSIVE_BYTES && WAL_PASSIVE_BYTES < WAL_ALARM_BYTES
+);
 
 impl Table {
     fn name(self) -> &'static str {
@@ -497,14 +501,14 @@ fn pragmas(conn: &Connection, import: bool, checkpoint: Checkpoint) -> Result<()
     };
     conn.set_prepared_statement_cache_capacity(32);
     conn.busy_timeout(BUSY)?;
-    conn.execute_batch(&format!("PRAGMA synchronous=FULL; PRAGMA fullfsync=ON; PRAGMA checkpoint_fullfsync=ON; PRAGMA secure_delete=ON; PRAGMA wal_autocheckpoint={autocheckpoint}; PRAGMA journal_size_limit=16777216; PRAGMA cache_size={CACHE_KIB}; PRAGMA mmap_size={MMAP_BYTES}; PRAGMA temp_store=FILE; PRAGMA soft_heap_limit=50331648;"))?;
+    conn.execute_batch(&format!("PRAGMA synchronous=FULL; PRAGMA fullfsync=ON; PRAGMA checkpoint_fullfsync=ON; PRAGMA secure_delete=ON; PRAGMA wal_autocheckpoint={autocheckpoint}; PRAGMA journal_size_limit={JOURNAL_LIMIT_BYTES}; PRAGMA cache_size={CACHE_KIB}; PRAGMA mmap_size={MMAP_BYTES}; PRAGMA temp_store=FILE; PRAGMA soft_heap_limit=50331648;"))?;
     for (name, expected) in [
         ("synchronous", 2_i64),
         ("fullfsync", 1),
         ("checkpoint_fullfsync", 1),
         ("secure_delete", 1),
         ("wal_autocheckpoint", autocheckpoint),
-        ("journal_size_limit", 16 * 1024 * 1024),
+        ("journal_size_limit", JOURNAL_LIMIT_BYTES),
         ("cache_size", CACHE_KIB),
         ("mmap_size", MMAP_BYTES),
         ("temp_store", 1),
@@ -593,8 +597,12 @@ impl Sqlite {
         }
         Ok(())
     }
+    /// Between passes: commit the clean marker (FULL + fullfsync) unless
+    /// checkpoint debt remains. The WAL is not truncated here; maintenance
+    /// checkpoints it by size, and `open_locked` checks a store whose WAL
+    /// still holds frames.
     pub(super) fn clean_checkpoint(&mut self) -> Result<()> {
-        if self.checkpoint(CheckpointMode::IdleReclaim).state == CheckpointState::Complete {
+        if !self.clean && !self.debt {
             self.control("phase", &0_u8)?;
             self.clean = true;
         }
@@ -735,6 +743,13 @@ impl Sqlite {
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(path)?;
         let before = file.metadata()?;
+        // The clean marker is committed without truncating the WAL, so a
+        // crash can leave committed frames behind it. Skip the check only
+        // when the WAL is also absent or empty (a clean close or a TRUNCATE).
+        let wal_empty = match fs::symlink_metadata(sidecar(path, "-wal")) {
+            Ok(wal) => wal.is_file() && wal.len() == 0,
+            Err(error) => error.kind() == io::ErrorKind::NotFound,
+        };
         Self::probe(path, identity)?;
         let conn = Connection::open_with_flags(
             path,
@@ -762,7 +777,10 @@ impl Sqlite {
             expected.is_none_or(|g| g == generation),
             "state_v2_generation_changed"
         );
-        if force_quick_check || read_json::<u8>(&conn, &RowKey::Meta("phase".into()))? != Some(0) {
+        if force_quick_check
+            || !wal_empty
+            || read_json::<u8>(&conn, &RowKey::Meta("phase".into()))? != Some(0)
+        {
             let pages: u64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
             quick_check(
                 &conn,

@@ -50,6 +50,10 @@ resolving a string reads directly into the final owned string without loading a
 whole dictionary. Semantic caller mapping and reference-closure checks across
 owners remain prerequisites for routing this backend.
 
+An open is clean only when the store's last committed `phase` marker is 0 and
+its WAL is absent or empty (a clean close or a TRUNCATE). The marker is
+committed between passes without truncating the WAL, so a crash between passes
+leaves committed frames behind it and the next open still checks the store.
 On an unclean state v2 open, `PRAGMA quick_check(1)` runs to completion without
 an interrupt deadline. The former size budget (2 seconds plus 10 ms per allocated
 MiB) is a slow-alarm threshold: `quick_check_ms` records duration and
@@ -63,7 +67,9 @@ limits and VACUUM work budgets retain their existing bounds and refusal behavior
 Removing potentially private keys or values marks the first pending generation
 and its start time in that same transaction. Later removals preserve the oldest
 deadline. `secure_delete` and TRUNCATE alone cannot establish erasure: stale text
-may remain in gaps in live pages. Completion requires a successful TRUNCATE with
+may remain in gaps in live pages, and, since the WAL is checkpointed by size
+rather than truncated every pass, in WAL frames until the erasure's own
+TRUNCATE. Completion requires a successful TRUNCATE with
 a measured zero-length WAL, then a `VACUUM INTO` copy that holds only live
 records, converted to WAL and passing the shared database/connection validation
 (identity, generation, schema, writer capability, limits, WAL mode,
@@ -608,8 +614,13 @@ SQLITE_FULL likewise rolls back and holds for retry. No partial publication or d
 committed checkpoints retain retry custody. Unknown persisted kinds are refused.
 
 WAL above 64 MiB, save payload above 32 MiB and page reduction are alarms, not
-transaction caps. WAL/FULL, fullfsync, the 16 MiB journal size limit, PASSIVE at
-8 MiB and idle TRUNCATE remain in effect.
+transaction caps. WAL/FULL, fullfsync and the 16 MiB journal size limit remain in
+effect. Maintenance runs a PASSIVE checkpoint once the WAL reaches 32 MiB, not
+on every pass: a save rewrites the same pages each pass, so each database page
+is written once per checkpoint instead of once per pass. A TRUNCATE runs between
+passes only while an incomplete checkpoint left debt, and before every erasure
+copy. The WAL file shrinks back to the journal size limit at the first commit
+after a checkpoint, so that limit stays below the 32 MiB threshold.
 Custody stores and upload history allow read-only SQLite mappings up to 2147418112 bytes per database.
 The effective ceiling is read back at open; larger databases continue through ordinary reads.
 WAL/FULL, fullfsync, secure_delete and erasure maintenance retain their settings.

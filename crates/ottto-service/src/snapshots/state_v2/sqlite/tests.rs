@@ -1,4 +1,5 @@
-//! Write-amplification fixture for the state store. Synthetic values only.
+//! State-store checkpoint cadence: the write-amplification fixture and the
+//! clean-marker and idle-debt regressions. Synthetic values only.
 //!
 //! Replays whole-value rewrites through the real store, save path and
 //! checkpoint calls under each checkpoint/secure_delete configuration and
@@ -197,13 +198,14 @@ fn between(db: &mut Sqlite, config: &Config) {
     }
 }
 
-fn measure(config: &Config) -> serde_json::Value {
-    let scratch = crate::test_scratch::ScratchDir::canonical("v2-write-amp");
-    let import = scratch.join("index.v2.sqlite.import");
-    let mut db = Sqlite::create_import(&import).unwrap();
+/// A published synthetic store: its scratch directory, path and identity.
+fn live_store(prefix: &str) -> (crate::test_scratch::ScratchDir, PathBuf, Identity) {
+    let scratch = crate::test_scratch::ScratchDir::canonical(prefix);
+    let path = scratch.join("index.v2.sqlite.import");
+    let mut db = Sqlite::create_import(&path).unwrap();
     let identity = Identity {
         format: FORMAT,
-        db_id: "synthetic-write-amp".into(),
+        db_id: "synthetic-checkpoint".into(),
         fence_generation: 0,
         binding: super::super::super::scan_index_persistence::Binding {
             source: super::super::super::scan_index_persistence::Source::Claude,
@@ -213,6 +215,26 @@ fn measure(config: &Config) -> serde_json::Value {
     db.control("identity", &identity).unwrap();
     db.control("generation", &0_u64).unwrap();
     db.finish_import().unwrap();
+    (scratch, path, identity)
+}
+fn save(db: &mut Sqlite, generation: u64, bytes: &[u8]) {
+    let key = RowKey::record("scan_state.traversal", b"traversal".to_vec(), 0).unwrap();
+    let mut tx = db.begin(TxnMode::Write).unwrap();
+    tx.put(RowInput {
+        value_version: 1,
+        key: &key,
+        fixed: &Fixed::None,
+        value: bytes,
+    })
+    .unwrap();
+    assert_eq!(
+        tx.commit(generation, generation + 1),
+        DurableCommitOutcome::Committed(generation + 1)
+    );
+}
+
+fn measure(config: &Config) -> serde_json::Value {
+    let (_scratch, import, identity) = live_store("v2-write-amp");
     let mut db = Sqlite::open(&import, &identity).unwrap();
     db.path_extractor(key_only);
     if let Some(mode) = config.secure_delete {
@@ -389,4 +411,75 @@ fn write_amplification_per_checkpoint_configuration() {
         let line = measure(&config);
         println!("WRITE_AMP_FIXTURE {line}");
     }
+}
+
+/// [regress] between passes the WAL is kept, and a crash that leaves committed
+/// frames behind the clean marker is still checked at open.
+#[test]
+fn clean_marker_skips_open_check_only_with_an_empty_wal() {
+    let (_scratch, path, identity) = live_store("v2-clean-marker");
+    let mut db = Sqlite::open(&path, &identity).unwrap();
+    db.path_extractor(key_only);
+    save(&mut db, 0, b"first");
+    db.between_cycles(false).unwrap();
+    db.clean_checkpoint().unwrap();
+    assert_eq!(db.read_control::<u8>("phase").unwrap(), Some(0));
+    assert!(db.wal_bytes().unwrap() > 0, "no TRUNCATE between passes");
+    // A clean close checkpoints and removes the WAL: no check.
+    drop(db);
+    super::super::telemetry::take_thread_event_for_test("quick_check");
+    let mut db = Sqlite::open(&path, &identity).unwrap();
+    assert_eq!(
+        super::super::telemetry::take_thread_event_for_test("quick_check"),
+        None
+    );
+    db.clean_checkpoint().unwrap();
+    drop(db);
+    // A crash between passes: committed frames stay behind phase=0.
+    let other = Connection::open(&path).unwrap();
+    other
+        .execute_batch("UPDATE control SET name=name WHERE name='generation'")
+        .unwrap();
+    assert!(fs::metadata(sidecar(&path, "-wal")).unwrap().len() > 0);
+    let db = Sqlite::open(&path, &identity).unwrap();
+    assert_eq!(
+        super::super::telemetry::take_thread_event_for_test("quick_check"),
+        Some(serde_json::json!(1))
+    );
+    drop(db);
+    drop(other);
+}
+
+/// [regress] an idle pass truncates the WAL only to clear checkpoint debt.
+#[test]
+fn idle_truncate_runs_only_for_checkpoint_debt() {
+    let (_scratch, path, identity) = live_store("v2-idle-debt");
+    let mut db = Sqlite::open(&path, &identity).unwrap();
+    db.path_extractor(key_only);
+    let idle = |db: &Sqlite| {
+        let stats = serde_json::to_value(db.maintenance_stats()).unwrap();
+        (
+            stats["checkpoint_complete"][2].as_u64().unwrap(),
+            stats["checkpoint_incomplete"][2].as_u64().unwrap(),
+        )
+    };
+    save(&mut db, 0, b"first");
+    db.between_cycles(false).unwrap();
+    assert_eq!(idle(&db), (0, 0));
+    assert!(db.wal_bytes().unwrap() > 0);
+    // A reader pins its snapshot, so PASSIVE stops short and leaves debt.
+    db.purge_policy.checkpoint_bytes = 0;
+    let reader = reader_for_test(&db);
+    save(&mut db, 1, b"second");
+    db.between_cycles(false).unwrap();
+    assert!(db.debt);
+    assert_eq!(idle(&db), (0, 1));
+    db.clean_checkpoint().unwrap();
+    assert_eq!(db.read_control::<u8>("phase").unwrap(), Some(1));
+    drop(reader);
+    db.between_cycles(false).unwrap();
+    assert!(!db.debt);
+    assert_eq!(idle(&db), (0, 1));
+    db.clean_checkpoint().unwrap();
+    assert_eq!(db.read_control::<u8>("phase").unwrap(), Some(0));
 }
