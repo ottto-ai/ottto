@@ -13768,7 +13768,7 @@ fn smoke_command(source: &SourceKind) -> SmokeCommand {
                 "--settings",
                 r#"{"env":{"OTEL_LOGS_EXPORTER":"none","OTEL_TRACES_EXPORTER":"none","OTEL_METRICS_EXPORTER":"none"}}"#,
                 "--session-id",
-                &crate::claude_spawn_gate::internal_session_id(),
+                &crate::internal_session::internal_session_id(),
                 "--disallowedTools",
                 "*",
                 "--no-session-persistence",
@@ -13782,6 +13782,14 @@ fn smoke_command(source: &SourceKind) -> SmokeCommand {
 }
 
 fn pi_smoke_command(route: Option<&PiModelRoute>) -> SmokeCommand {
+    let version = detect_agent_installation(&SourceKind::Pi).version;
+    pi_smoke_command_with_version(route, version.as_deref())
+}
+
+fn pi_smoke_command_with_version(
+    route: Option<&PiModelRoute>,
+    version: Option<&str>,
+) -> SmokeCommand {
     let mut args = vec!["--no-builtin-tools", "--no-context-files", "--print"]
         .into_iter()
         .map(ToString::to_string)
@@ -13796,6 +13804,23 @@ fn pi_smoke_command(route: Option<&PiModelRoute>) -> SmokeCommand {
         if let Some(thinking_level) = route.thinking_level.as_deref() {
             args.extend(["--thinking".to_string(), thinking_level.to_string()]);
         }
+    }
+    // parse_version accepts missing or malformed patch components and extra parts.
+    let version = version.filter(|v| {
+        let core = v.trim();
+        core.split('.').count() == 3
+            && core
+                .split('.')
+                .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+    });
+    if version
+        .and_then(crate::mcp_inventory::parse_version)
+        .is_some_and(|v| v >= (0, 76, 0))
+    {
+        args.extend([
+            "--session-id".to_string(),
+            crate::internal_session::internal_session_id(),
+        ]);
     }
     args.push(SMOKE_PROMPT.to_string());
     SmokeCommand {
@@ -27692,6 +27717,55 @@ for line in sys.stdin:
             result.message, result.diagnostic, result.exit_status
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pi_smoke_session_ids_are_version_gated_for_default_and_route_commands() {
+        let mut live_route = live_pi_route();
+        live_route.thinking_level = Some("low".to_string());
+        for route in [None, Some(&live_route)] {
+            let mut expected = ["--no-builtin-tools", "--no-context-files", "--print"]
+                .map(str::to_string)
+                .to_vec();
+            if let Some(route) = route {
+                expected.extend([
+                    "--provider".to_string(),
+                    route.provider.clone(),
+                    "--model".to_string(),
+                    route.model.clone(),
+                    "--thinking".to_string(),
+                    "low".to_string(),
+                ]);
+            }
+            expected.push(SMOKE_PROMPT.to_string());
+            for version in [
+                None,
+                Some("0.75.9"),
+                Some("unknown"),
+                Some("0.76.bad"),
+                Some("0.76.0.1"),
+                Some("0.76.0-beta"),
+                Some("0.76.0-beta.1"),
+                Some("0.76"),
+                Some("pi 0.76.0"),
+            ] {
+                assert_eq!(pi_smoke_command_with_version(route, version).args, expected);
+            }
+            for version in ["0.76.0", "0.86.0", "1.0.0"] {
+                let mut previous = String::new();
+                for _ in 0..2 {
+                    let mut args = pi_smoke_command_with_version(route, Some(version)).args;
+                    let flag = args.iter().position(|arg| arg == "--session-id").unwrap();
+                    assert_eq!(flag, args.len() - 3);
+                    let id = args.remove(flag + 1);
+                    args.remove(flag);
+                    assert_eq!(args, expected);
+                    assert!(crate::internal_session::is_internal_session_id(&id));
+                    assert_ne!(id, previous);
+                    previous = id;
+                }
+            }
+        }
     }
 
     #[test]

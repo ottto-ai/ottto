@@ -246,23 +246,6 @@ pub(crate) fn stop_claude_child(
 /// set to that login's config dir (unset for the default login), and no
 /// `CLAUDE_SECURESTORAGE_CONFIG_DIR`, which would select another keychain
 /// item.
-/// Reserved for this service's verification requests. Random suffixes keep
-/// concurrent invocations distinct; the relay excludes this namespace before IO.
-const INTERNAL_SESSION_PREFIX: &str = "6f747474-6f00-4f00-8f00-";
-
-pub(crate) fn internal_session_id() -> String {
-    let mut bytes = [0_u8; 6];
-    getrandom::fill(&mut bytes).expect("system randomness for verification session");
-    let suffix = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
-    format!("{INTERNAL_SESSION_PREFIX}{suffix}")
-}
-
-pub(crate) fn is_internal_session_id(id: &str) -> bool {
-    id.len() == 36
-        && id.starts_with(INTERNAL_SESSION_PREFIX)
-        && id[24..].bytes().all(|b| b.is_ascii_hexdigit())
-}
-
 /// Pin the child to its selected configuration directory.
 pub(crate) fn pin_claude_login(command: &mut std::process::Command, slot: &ClaudeConfigDirSlot) {
     match slot.config_dir() {

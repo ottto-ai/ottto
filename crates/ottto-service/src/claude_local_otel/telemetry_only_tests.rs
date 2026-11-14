@@ -17,7 +17,7 @@ fn assert_excluded(dir: &Path) {
 fn reserved_smoke_json_and_protobuf_api_and_trace_never_write_or_notify() {
     let dir = crate::test_scratch::ScratchDir::new("otel-smoke-exclusion");
     telemetry_notices::configure(&dir, true).unwrap();
-    let reserved = crate::claude_spawn_gate::internal_session_id();
+    let reserved = crate::internal_session::internal_session_id();
     let json_api = String::from_utf8(parent_and_subagent_body().to_vec())
         .unwrap()
         .replace("sess-mixed", &reserved);

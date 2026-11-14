@@ -54,7 +54,7 @@ pub(super) fn relay_append(c: &Corpus, sessions: &[&str]) -> (usize, usize) {
 pub(super) fn mixed_smoke() {
     let (c, mut p, accepted) = accepted_case("otel-only-mixed-smoke-money");
     let generation = otel::telemetry_generation(&c.support, ROOT).unwrap();
-    let reserved = crate::claude_spawn_gate::internal_session_id();
+    let reserved = crate::internal_session::internal_session_id();
     assert_eq!(relay_append(&c, &[&reserved]), (0, 0));
     assert_eq!(
         otel::telemetry_generation(&c.support, ROOT).unwrap(),
