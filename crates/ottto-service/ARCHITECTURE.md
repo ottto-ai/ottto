@@ -133,6 +133,13 @@ file-system hint / periodic listing → select file → read new bytes from save
   mode while unaffected file receipts use the base context. A copy-capability change therefore
   conservatively re-sends unchanged files once.
 
+Telemetry-only Claude uploads require the advertised head-CAS capability and the
+exact telemetry contract and pairing window. They declare head CAS in isolated
+requests, without cache patches or cache-state ACK negotiation. Growth carries
+the saved ACK head etag; an owed conflict challenge replaces that base in the
+semantic envelope after the ordinary evidence chunk rebuilds the telemetry body.
+Normal source requests retain their existing batch classes and ACK contracts.
+
 Stale-older refusals from current servers mean the server already holds the
 newer usage. Earlier refusals stay counted as owed, with their dispositions
 unchanged. Owed entities never grant an automatic rebuild or re-offer. Retries

@@ -83,7 +83,7 @@ fn sessions(wire: &Value) -> Vec<String> {
 /// current head conflicts with a fresh challenge unless it answers the
 /// current one. An exact repeat is unchanged; a conflict stores nothing.
 #[derive(Clone, Default)]
-struct HeadStore {
+pub(in crate::snapshot_sync) struct HeadStore {
     /// session -> (head etag, stored body content identity)
     heads: BTreeMap<String, (String, String)>,
     challenges: BTreeMap<String, String>,
@@ -98,14 +98,18 @@ impl HeadStore {
     }
 
     /// The server already holds an older body of `session`.
-    fn seed(&mut self, session: &str) -> String {
+    pub(in crate::snapshot_sync) fn seed(&mut self, session: &str) -> String {
         let head = self.mint();
         self.heads
             .insert(session.into(), (head.clone(), "older".into()));
         head
     }
 
-    fn post(&mut self, request: &SnapshotBatchRequest, wire: &Value) -> SnapshotBatchResponse {
+    pub(in crate::snapshot_sync) fn post(
+        &mut self,
+        request: &SnapshotBatchRequest,
+        wire: &Value,
+    ) -> SnapshotBatchResponse {
         let cas = wire["head_cas_contract"].is_string();
         let mut ack = empty_ack();
         for (item, sent) in request
@@ -864,8 +868,7 @@ fn with_class(mut item: FamilyItem, class: u8) -> FamilyItem {
 /// stay contiguous and root first, and each settles by its own ACKs.
 #[test]
 fn mixed_class_family_is_class_pure_root_first_in_both_directions() {
-    for root_class in [1u8, 0] {
-        let member_class = 1 - root_class;
+    for (root_class, member_class) in [(1u8, 0), (0, 1), (3, 0), (0, 3), (3, 1), (1, 3)] {
         let mut family = family("root-m", 4, 0);
         family[0].class = root_class;
         family[2].class = member_class;
@@ -910,12 +913,17 @@ fn mixed_class_family_is_class_pure_root_first_in_both_directions() {
                 .collect::<Vec<_>>()[..],
             "family contiguous and root first"
         );
-        // The family's own groups follow its root's class run; singles are
-        // grouped by class, ordinary first.
-        let expected = if root_class == 1 {
-            vec![0, 1, 0]
-        } else {
-            vec![0, 1]
+        // Stable-sort singles by class and the family by its root's class.
+        // Keep root-first member order, including family[1]'s class 0;
+        // only adjacent same-class groups merge into one request.
+        let expected = match (root_class, member_class) {
+            (1, 0) => vec![0, 1, 0],
+            (0, 1) => vec![0, 1],
+            (3, 0) => vec![0, 1, 3, 0],
+            (0, 3) => vec![0, 3, 1],
+            (3, 1) => vec![0, 1, 3, 0, 1],
+            (1, 3) => vec![0, 1, 0, 3],
+            _ => unreachable!(),
         };
         assert_eq!(seen, expected, "root class {root_class}");
         let single_runs = batches
@@ -930,7 +938,7 @@ fn mixed_class_family_is_class_pure_root_first_in_both_directions() {
 /// packed exactly as before the class split: same requests, same order.
 #[test]
 fn single_class_pages_keep_the_previous_batches() {
-    for class in [0u8, 1, 2] {
+    for class in [0u8, 1, 2, 3] {
         let mut items = (0..60).rev().map(plain_item).collect::<Vec<_>>();
         items.extend(family("root-s", 5, 0));
         items.extend(family("root-t", 3, 0));
@@ -1100,5 +1108,61 @@ fn assert_lost_class_request_resends_only_unsettled(items: &[FamilyItem], first:
         });
         assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
         assert!(batches.is_empty());
+    }
+}
+
+/// Ordinary sources keep the released patch-only declaration and ACK rules.
+#[test]
+fn normal_source_requests_keep_patch_only_head_contract_and_ack_validation() {
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        for patched in [false, true] {
+            if patched && source == SnapshotSource::Pi {
+                continue;
+            }
+            let mut item = body("ordinary-source", patched.then(complete_empty));
+            let mut progress = fresh_progress();
+            progress
+                .accepted_cache_heads
+                .insert(cache_session_key(&item.source_session_id), stale_head());
+            prepare_snapshot_cache_for_upload(
+                &mut item,
+                &progress,
+                patched,
+                false,
+                &BTreeSet::new(),
+            );
+            assert_eq!(snapshot_upload_batch_class(&item, false), u8::from(patched));
+            assert_eq!(snapshot_upload_batch_class(&item, true), 2);
+            let mut request = request(vec![item.clone()]);
+            request.source = source.api_slug().into();
+            let wire = serde_json::to_value(&request).unwrap();
+            let mut released = serde_json::to_value(request.wire_with_head_cas()).unwrap();
+            if !patched {
+                released
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("head_cas_contract");
+            }
+            assert_eq!(
+                serde_json::to_vec(&wire).unwrap(),
+                serde_json::to_vec(&released).unwrap()
+            );
+            assert_eq!(wire.get("cache_state_ack_contract").is_some(), patched);
+            let mut store = HeadStore::default();
+            store.seed(&item.source_session_id);
+            let ack = store.post(&request, &wire);
+            // Unpatched ordinary requests still advance an existing head with
+            // no predecessor, and the receiver returns no head token.
+            ack.validate_entity_ack(&request).unwrap();
+            if !patched {
+                let mut unexpected = ack.clone();
+                unexpected.accepted_entities[0].head_etag = Some(stale_head());
+                assert!(unexpected.validate_entity_ack(&request).is_err());
+            }
+        }
     }
 }
