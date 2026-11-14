@@ -258,6 +258,7 @@ impl Page {
                     &mut self.index,
                     accepted.as_deref(),
                     wire_budget,
+                    None,
                 )
             });
         if let Some(accepted) = accepted.as_deref_mut() {
@@ -3503,6 +3504,10 @@ pub(in crate::snapshot_sync) mod money_equivalence_tests {
         include!("root_twin_scope_tests.rs");
     }
     #[cfg(unix)]
+    mod subagent_twin_tail_tests {
+        include!("subagent_twin_tail_tests.rs");
+    }
+    #[cfg(unix)]
     mod lease_touch_oracle_tests {
         include!("lease_touch_oracle_tests.rs");
     }
@@ -3519,6 +3524,10 @@ pub(in crate::snapshot_sync) mod money_equivalence_tests {
     #[cfg(unix)]
     mod codex_creator_slot_oracle_tests {
         include!("../snapshots/sampled_scan/codex_creator_slot_oracle_tests.rs");
+    }
+    #[cfg(unix)]
+    mod codex_login_identity_oracle_tests {
+        include!("../snapshots/sampled_scan/codex_login_identity_oracle_tests.rs");
     }
 }
 

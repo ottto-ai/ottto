@@ -508,10 +508,11 @@ fn persist_api_evidence(
     let _guard = append_lock()
         .lock()
         .map_err(|_| anyhow::anyhow!("effort store lock poisoned"))?;
+    let mut stored = 0;
     for item in &evidence {
-        append_evidence(support_dir, item)?;
+        stored += usize::from(append_evidence(support_dir, item)?);
     }
-    Ok(evidence.len())
+    Ok(stored)
 }
 
 /// Reduce Claude Code's enhanced `claude_code.llm_request` spans to a bounded,
@@ -536,10 +537,11 @@ pub fn capture_claude_llm_request_traces(
     let _guard = append_lock()
         .lock()
         .map_err(|_| anyhow::anyhow!("Claude local OTEL store lock poisoned"))?;
+    let mut stored = 0;
     for item in &evidence {
-        append_trace_ownership_evidence(support_dir, item)?;
+        stored += usize::from(append_trace_ownership_evidence(support_dir, item)?);
     }
-    Ok(evidence.len())
+    Ok(stored)
 }
 
 fn trace_evidence_from_json(body: &[u8]) -> Result<Vec<ClaudeTraceOwnershipEvidence>> {
@@ -797,14 +799,54 @@ struct ApiReadWitness {
 }
 
 // Length/mtime alone cannot detect same-size replacement or restored mtimes.
-// This witness never becomes a persisted sidecar/candidate fingerprint.
-#[derive(Debug, PartialEq, Eq)]
-struct ApiFileGeneration {
+// Opaque local equality witness; never uploaded or printed.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ApiFileGeneration {
     device: u64,
     inode: u64,
     bytes: u64,
     modified: (i64, i64),
     changed: (i64, i64),
+}
+
+impl std::fmt::Debug for ApiFileGeneration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ApiFileGeneration")
+    }
+}
+/// Append-only named members: API first, trace second; missing is unknown.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct TelemetryGeneration {
+    pub(crate) api: Option<ApiFileGeneration>,
+    pub(crate) trace: Option<ApiFileGeneration>,
+}
+crate::heap_layout_bound::fields!(TelemetryGeneration; api, trace);
+
+/// A shorter sidecar cannot replace a cumulative body already offered.
+pub(crate) fn telemetry_not_truncated(
+    current: &TelemetryGeneration,
+    prior: &TelemetryGeneration,
+) -> bool {
+    [&current.api, &current.trace]
+        .into_iter()
+        .zip([&prior.api, &prior.trace])
+        .all(|(now, old)| {
+            now.as_ref()
+                .zip(old.as_ref())
+                .is_some_and(|(now, old)| now.bytes >= old.bytes)
+        })
+}
+
+pub(crate) fn telemetry_generation(
+    support_dir: &Path,
+    root: &str,
+) -> std::result::Result<TelemetryGeneration, ()> {
+    let paths = telemetry_member_paths(support_dir, &telemetry_stem(root));
+    Ok(TelemetryGeneration {
+        api: telemetry_member(&paths[0])?,
+        trace: telemetry_member(&paths[1])?,
+    })
 }
 
 fn api_file_generation(metadata: &fs::Metadata) -> Option<ApiFileGeneration> {
@@ -1944,34 +1986,33 @@ fn proto_any_value(value: &otlp_proto::AnyValue) -> Option<String> {
     }
 }
 
-fn append_evidence(support_dir: &Path, item: &ClaudeLocalOtelEvidence) -> Result<()> {
-    let path = evidence_path(support_dir, &item.session_id);
-    let dir = path.parent().expect("evidence path has parent");
-    fs::create_dir_all(dir).context("create Claude effort evidence directory")?;
-    #[cfg(unix)]
-    fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
-    let mut options = OpenOptions::new();
-    options.create(true).append(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(path)
-        .context("open Claude effort evidence append file")?;
-    let mut encoded = serde_json::to_vec(item)?;
-    encoded.push(b'\n');
-    append_evidence_bytes(&mut file, &encoded).context("append Claude effort evidence")
+fn append_evidence(support_dir: &Path, item: &ClaudeLocalOtelEvidence) -> Result<bool> {
+    append_row(
+        support_dir,
+        &item.session_id,
+        evidence_path(support_dir, &item.session_id),
+        item,
+    )
 }
 
 fn append_trace_ownership_evidence(
     support_dir: &Path,
     item: &ClaudeTraceOwnershipEvidence,
-) -> Result<()> {
-    let path = trace_evidence_path(support_dir, &item.session_id);
-    let dir = path.parent().expect("trace evidence path has parent");
-    fs::create_dir_all(dir).context("create Claude trace ownership evidence directory")?;
+) -> Result<bool> {
+    append_row(
+        support_dir,
+        &item.session_id,
+        trace_evidence_path(support_dir, &item.session_id),
+        item,
+    )
+}
+
+fn append_row(support_dir: &Path, root: &str, path: PathBuf, row: &impl Serialize) -> Result<bool> {
+    if crate::claude_spawn_gate::is_internal_session_id(root) {
+        return Ok(false);
+    }
+    let dir = path.parent().expect("evidence path has parent");
+    fs::create_dir_all(dir).context("create Claude evidence directory")?;
     #[cfg(unix)]
     fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
     let mut options = OpenOptions::new();
@@ -1983,11 +2024,15 @@ fn append_trace_ownership_evidence(
     }
     let mut file = options
         .open(path)
-        .context("open Claude trace ownership evidence append file")?;
-    let mut encoded = serde_json::to_vec(item)?;
+        .context("open Claude evidence append file")?;
+    let mut encoded = serde_json::to_vec(row)?;
     encoded.push(b'\n');
-    append_evidence_bytes(&mut file, &encoded).context("append Claude trace ownership evidence")
+    append_evidence_bytes(&mut file, &encoded).context("append Claude evidence")?;
+    telemetry_notices::appended(support_dir, root);
+    Ok(true)
 }
+
+pub(crate) mod telemetry_notices;
 
 /// Capture succeeds only after the complete row has been written. The warning
 /// threshold never rejects a row; I/O errors still propagate to the relay.
@@ -2136,6 +2181,9 @@ mod otlp_proto {
 
 #[cfg(test)]
 mod tests {
+    mod telemetry_only_tests {
+        include!("claude_local_otel/telemetry_only_tests.rs");
+    }
 
     /// [regress] Failed writes must never be reported as captured rows.
     #[test]

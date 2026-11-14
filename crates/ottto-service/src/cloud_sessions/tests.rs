@@ -27,10 +27,23 @@ impl CloudCliFixture {
         let root = temp_dir("cloud-cli-process");
         fs::write(root.join("output"), output).unwrap();
         let quote = |path: &Path| format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"));
-        let body = if mode == "output" {
+        let body = if mode == "redirect-output" {
+            format!(
+                "echo $$ > {}\n/bin/sleep 4 >/dev/null 2>&1 &\necho $! > {}\n/bin/cat {}\nexit {exit_code}\n",
+                quote(&root.join("direct")),
+                quote(&root.join("descendant")),
+                quote(&root.join("output")),
+            )
+        } else if mode == "output" {
             format!(
                 "/bin/cat {}\nexit {exit_code}\n",
                 quote(&root.join("output"))
+            )
+        } else if mode == "ignore-term" {
+            format!(
+                "trap \"echo TERM >> {}\" TERM\necho $$ > {}\nwhile :; do /bin/sleep 0.1; done\n",
+                quote(&root.join("signals")),
+                quote(&root.join("direct")),
             )
         } else if mode == "escape" {
             format!(
@@ -87,6 +100,23 @@ impl CloudCliFixture {
         {
             assert!(Instant::now() < deadline, "fake descendant did not start");
             thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn wait_stopped(&self, label: &str) {
+        let pid = self.pid(label).to_string();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let output = Command::new("/bin/ps")
+                .args(["-o", "stat=", "-p", &pid])
+                .output()
+                .unwrap();
+            let state = String::from_utf8_lossy(&output.stdout);
+            if state.trim().is_empty() || state.trim().starts_with('Z') {
+                break;
+            }
+            assert!(Instant::now() < deadline, "Cloud group descendant survived");
+            thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -203,6 +233,87 @@ fn cloud_cli_escaped_writer_cannot_hold_deadline_or_kill_other_groups() {
     assert!(CloudCliFixture::alive(fixture.pid("descendant")));
     fs::write(fixture.root.join("release"), []).unwrap();
     fixture.wait_gone("descendant");
+}
+
+/// [regress] Pause while a `codex cloud list` page lingers past its deadline
+/// (it may be refreshing its login) completes within the stop wait: after the
+/// page's deadline and the child's drain, with no SIGTERM, never before the
+/// child is gone. An account change waits the same way, so its CLI call must
+/// not time out first.
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn pause_during_a_lingering_cloud_child_completes_within_the_stop_wait() {
+    let fixture = CloudCliFixture::new("ignore-term", &[], 0);
+    let (_root, grants, checkpoints) = stores("lingering-child-pause");
+    enabled(&grants);
+    let checkpoints = Arc::new(checkpoints);
+    let collector_grants = grants.clone();
+    let collector_checkpoints = Arc::clone(&checkpoints);
+    let drain = Duration::from_secs(1);
+    let run = thread::spawn(move || {
+        crate::agent_status::with_codex_app_server_test_timeouts(drain, drain, drain, drain, || {
+            let server = Server::new();
+            CloudCollector::default().run_slice(
+                &inputs(
+                    &collector_grants,
+                    &collector_checkpoints,
+                    &CodexCloudCliRunner,
+                    &server,
+                ),
+                Instant::now(),
+                midnight(),
+            )
+        })
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !fixture.root.join("direct").exists() {
+        assert!(Instant::now() < deadline, "the page's child started");
+        thread::sleep(Duration::from_millis(5));
+    }
+    grants.pause(now()).unwrap();
+    let waited = Instant::now();
+    checkpoints
+        .wait_for_collector_io_idle(COLLECTOR_IO_STOP_TIMEOUT)
+        .expect("stopped within the stop wait");
+    assert!(waited.elapsed() < COLLECTOR_IO_STOP_TIMEOUT);
+    fixture.wait_gone("direct");
+    assert!(!fixture.root.join("signals").exists(), "no SIGTERM");
+    run.join().unwrap();
+    // An account change replies only after this same wait, so its CLI call
+    // (the long control timeout) outlasts it with room for the change itself;
+    // the ordinary timeout would not.
+    assert!(COLLECTOR_IO_STOP_TIMEOUT > ottto_core::LOCAL_CONTROL_SOCKET_TIMEOUT);
+    assert!(
+        COLLECTOR_IO_STOP_TIMEOUT + Duration::from_secs(60)
+            <= ottto_core::LOCAL_CONTROL_REFRESH_TIMEOUT
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn cloud_cli_timeout_stops_group_after_leader_exit() {
+    let fixture = CloudCliFixture::new("hold-exit", &[], 0);
+    let result =
+        CodexCloudCliRunner.list_page_bounded(None, PAGE_LIMIT, Duration::from_millis(300));
+    assert!(result.unwrap_err().to_string().contains("timed out"));
+    fixture.wait_gone("direct");
+    fixture.wait_stopped("descendant");
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn cloud_cli_completion_stops_redirected_descendants() {
+    for output in [b"{}".as_slice(), &[0xff]] {
+        let fixture = CloudCliFixture::new("redirect-output", output, 0);
+        let result =
+            CodexCloudCliRunner.list_page_bounded(None, PAGE_LIMIT, Duration::from_secs(2));
+        fixture.wait_gone("direct");
+        fixture.wait_stopped("descendant");
+        assert_eq!(result.is_ok(), std::str::from_utf8(output).is_ok());
+    }
 }
 
 fn stores(name: &str) -> (PathBuf, CloudSessionGrantStore, CloudSessionCheckpointStore) {

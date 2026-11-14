@@ -846,6 +846,7 @@ mod tests {
         ended_at: Option<&str>,
     ) -> SnapshotItem {
         SnapshotItem {
+            evidence_basis: None,
             request_evidence: Vec::new(),
             request_identity_refusals: 0,
             claude_org_markers: None,

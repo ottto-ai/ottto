@@ -50,6 +50,8 @@ pub mod mcp_inventory;
 pub(crate) mod net_resilience;
 pub mod net_transition;
 pub mod otlp_relay;
+#[cfg(unix)]
+pub(crate) mod process_guard;
 pub(crate) mod provider_calls;
 pub mod provider_daily_reference;
 pub(crate) mod quota_credit_model;
@@ -4294,6 +4296,8 @@ fn source_health_from_verification(
         || result.message.code == PI_OAUTH_REAUTH_REQUIRED_MESSAGE_CODE;
     let source_not_installed = result.message.code == SOURCE_NOT_INSTALLED_VERIFICATION_CODE;
     let agent_cli_unavailable = result.message.code == AGENT_CLI_UNAVAILABLE_VERIFICATION_CODE;
+    let ottto_claude_connected = result.source == SourceKind::ClaudeCode
+        && result.message.code == agent_status::CLAUDE_OTTTO_SIGNED_IN;
     let (source_state, grade, problems) = if source_not_installed {
         // The CLI is genuinely absent on this Mac. Report it as an informational
         // `not_found` (finish setup) with a `SourceNotInstalled` problem — never
@@ -4309,6 +4313,9 @@ fn source_health_from_verification(
                 retryable: false,
             }],
         )
+    } else if ottto_claude_connected {
+        // A usable Ottto account is connected; the signed-out Default cannot run a live check.
+        claude_connected_health()
     } else if agent_cli_unavailable {
         // Data/config is present (desktop-app-only install) but the CLI binary
         // can't be executed, so only the live check is unavailable while local
@@ -4458,6 +4465,7 @@ fn source_health_from_verification(
             )),
         }]
     } else if result.verified
+        || ottto_claude_connected
         || patch_disabled
         || usage_limited
         || telemetry_disabled_by_admin
@@ -4636,7 +4644,10 @@ fn has_soft_smoke_timeout_problem(health: &SourceHealth) -> bool {
         && health.grade == HealthGrade::Critical
         && health.problems.iter().any(|problem| {
             problem.code == StableProblemCode::TelemetryNotVerified
-                && problem.detail.contains("smoke session timed out")
+                && (problem.detail.contains("smoke session timed out")
+                    || problem
+                        .detail
+                        .contains(control::CLAUDE_SMOKE_TIMEOUT_MESSAGE))
         })
 }
 
@@ -4797,10 +4808,14 @@ fn preserve_blocking_verification_state(refreshed: &mut SourceHealth, existing: 
     if preserve_config_drift {
         refreshed.config.drift = existing.config.drift.clone();
     }
+    let snapshot = refreshed.agent_status.as_ref();
     let clear_failed_verification = has_soft_no_fresh_telemetry_problem(existing)
         || has_soft_smoke_timeout_problem(existing)
         || has_soft_verification_service_unavailable_problem(existing)
         || has_usage_limited_verification_problem(existing)
+        || (snapshot.is_some_and(agent_status::claude_default_check_skipped)
+            && matches!(existing.recommended_actions.as_slice(), [a] if a.action == RepairActionKind::ReauthProvider)
+            && existing.problems.len() == 1)
         || (has_pi_route_smoke_failure_problem(existing)
             && refreshed_pi_status_has_available_routes(refreshed))
         || (has_pi_oauth_reauth_problem(existing)
@@ -4890,6 +4905,15 @@ fn is_usage_checks_paused_problem(problem: &HealthProblem) -> bool {
     problem.code == StableProblemCode::Unknown && problem.title == USAGE_CHECKS_PAUSED_TITLE
 }
 
+fn claude_connected_health() -> (SourceState, HealthGrade, Vec<HealthProblem>) {
+    (SourceState::NeedsConfirmation, HealthGrade::Warning, vec![HealthProblem {
+        code: StableProblemCode::AgentCliUnavailable,
+        title: "Claude Code live check is unavailable".to_string(),
+        detail: "Claude is connected through an account added in Ottto. The live check is skipped because Claude Code isn't signed in on this Mac.".to_string(),
+        retryable: false,
+    }])
+}
+
 fn source_health_from_agent_status(
     state: &DaemonState,
     snapshot: AgentStatusSnapshot,
@@ -4900,6 +4924,7 @@ fn source_health_from_agent_status(
         .and_then(|account| account.account_id.clone().or_else(|| account.email.clone()));
     let expected_account_id = state.account.user.as_ref().map(|user| user.id.clone());
     let (source_state, grade, problems) = match snapshot.status {
+        AgentStatusState::Available if agent_status::claude_default_check_skipped(&snapshot) => claude_connected_health(),
         AgentStatusState::Available => match usage_checks_paused_problem(&snapshot) {
             // The current login works, so the source stays healthy; paused
             // usage checks for an account are an attention grade with a
@@ -7546,7 +7571,7 @@ mod tests {
             smoke_after: Some("2026-05-05T10:00:00Z".to_string()),
             message: StableMessage {
                 code: "smoke_command_failed".to_string(),
-                text: "Claude Code smoke session failed before verification could complete: You've hit your org's monthly spend limit · run [path] to raise it, or visit claude.ai/admin-settings/usage".to_string(),
+                text: "The Claude Code test run failed before Ottto could check it: You've hit your org's monthly spend limit · run [path] to raise it, or visit claude.ai/admin-settings/usage".to_string(),
             },
             route_results: Vec::new(),
             check: None,

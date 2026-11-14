@@ -149,12 +149,71 @@ pub struct SnapshotSemanticEnvelope {
     pub forced_full_rescan: bool,
 }
 
-#[derive(Serialize)]
 pub(super) struct SnapshotItemWire<'a> {
-    #[serde(flatten)]
     pub(super) snapshot: &'a SnapshotItem,
     pub(super) semantic_envelope: SnapshotSemanticEnvelope,
 }
+
+impl Serialize for SnapshotItemWire<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            #[serde(flatten)]
+            snapshot: &'a SnapshotItem,
+            semantic_envelope: &'a SnapshotSemanticEnvelope,
+        }
+        let wire = Wire {
+            snapshot: self.snapshot,
+            semantic_envelope: &self.semantic_envelope,
+        };
+        if self.snapshot.evidence_basis != Some("otel_only") {
+            return wire.serialize(serializer);
+        }
+        let mut body = serde_json::to_value(wire).map_err(serde::ser::Error::custom)?;
+        if let Some(fields) = body.as_object_mut() {
+            fields.retain(|key, _| TELEMETRY_ONLY_FIELDS.contains(&key.as_str()));
+            fields.insert("initiator".into(), serde_json::json!("unknown"));
+            if let Some(provenance) = fields.get_mut("provenance").and_then(Value::as_object_mut) {
+                provenance
+                    .retain(|key, _| matches!(key.as_str(), "collector" | "input_token_scope"));
+            }
+        }
+        body.serialize(serializer)
+    }
+}
+
+const TELEMETRY_ONLY_FIELDS: &[&str] = &[
+    "evidence_basis",
+    "source_session_id",
+    "snapshot_fingerprint",
+    "status",
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_creation_5m_tokens",
+    "cache_creation_1h_tokens",
+    "reasoning_output_tokens",
+    "unattributed_total_tokens",
+    "request_count",
+    "usage_accounting_contract",
+    "removed_request_count",
+    "removed_usage",
+    "telemetry_owned_complete",
+    "resolver_conflict_count",
+    "model_usage",
+    "usage_buckets",
+    "cost",
+    "initiator",
+    "source_started_at",
+    "source_ended_at",
+    "source_last_activity_at",
+    "collected_at",
+    "provenance",
+    "request_evidence",
+    "request_identity_refusals",
+    "semantic_envelope",
+    "content_hash",
+];
 
 /// Normal batch wire with optional optimistic-head enforcement. Reconciliation
 /// uses the same write endpoint and entity ACKs as every upload; this wrapper
@@ -393,8 +452,10 @@ pub struct SessionAccountEvidence {
     pub source_created_at: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct SnapshotItem {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence_basis: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_account_evidence: Option<SessionAccountEvidence>,
     pub source_session_id: String,
@@ -841,7 +902,7 @@ pub struct SnapshotCost {
     pub evidence_source: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct SnapshotProvenance {
     pub collector: String,
     pub source_file_count: u64,
@@ -890,7 +951,7 @@ crate::heap_layout_bound::fields!(SnapshotActivitySummary; capability_collection
 crate::heap_layout_bound::fields!(SnapshotCapabilityBucket; bucket_start, capability_id, raw_origin, call_count);
 crate::heap_layout_bound::fields!(SnapshotCapabilityCount; capability_id, raw_origin, count);
 crate::heap_layout_bound::fields!(SnapshotCost; total_cost_usd, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd, evidence_source);
-crate::heap_layout_bound::split_fields!(SnapshotItem; inline: [input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, claude_file_birth, tool_usage_truncated, request_identity_refusals]; heap: [session_account_evidence, source_session_id, snapshot_fingerprint, status, usage_accounting_contract, removed_request_count, removed_usage, telemetry_owned_complete, resolver_conflict_count, copy_unproven_counts, claude_money, claude_usage_request_ids, claude_usage_occurrences, cache_observations, cache_observations_state, cache_base_head_etag, cache_conflict_answer, cache_requests, avg_duration_ms, avg_time_to_first_token_ms, max_duration_ms, max_time_to_first_token_ms, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, first_turn_context_window_tokens, peak_context_fill_window_tokens, last_turn_context_window_tokens, compaction_count, compaction_timestamps, compaction_events, first_own_request_at, local_context_points, compaction_total_pre_tokens, compaction_total_post_tokens, compaction_total_cumulative_dropped_tokens, compaction_total_duration_ms, context_curve, claude_context_curve_boundaries, claude_file_birth_verdict, activity_summary, tool_usage, session_start, model_usage, usage_buckets, cost, session_display_name, session_display_name_source, source_started_at, source_ended_at, source_last_activity_at, collected_at, workspace_hash, workspace_display_label, workspace_label_source, repository_hash, repository_label, repository_label_source, repository_identity_source, workspace_kind, source_file_fingerprint, session_artifacts, provenance, origin, originator, attribution_facts, request_evidence, claude_org_markers, claude_account_withheld_reason, claude_account_display]);
+crate::heap_layout_bound::split_fields!(SnapshotItem; inline: [input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, claude_file_birth, tool_usage_truncated, request_identity_refusals]; heap: [evidence_basis, session_account_evidence, source_session_id, snapshot_fingerprint, status, usage_accounting_contract, removed_request_count, removed_usage, telemetry_owned_complete, resolver_conflict_count, copy_unproven_counts, claude_money, claude_usage_request_ids, claude_usage_occurrences, cache_observations, cache_observations_state, cache_base_head_etag, cache_conflict_answer, cache_requests, avg_duration_ms, avg_time_to_first_token_ms, max_duration_ms, max_time_to_first_token_ms, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, first_turn_context_window_tokens, peak_context_fill_window_tokens, last_turn_context_window_tokens, compaction_count, compaction_timestamps, compaction_events, first_own_request_at, local_context_points, compaction_total_pre_tokens, compaction_total_post_tokens, compaction_total_cumulative_dropped_tokens, compaction_total_duration_ms, context_curve, claude_context_curve_boundaries, claude_file_birth_verdict, activity_summary, tool_usage, session_start, model_usage, usage_buckets, cost, session_display_name, session_display_name_source, source_started_at, source_ended_at, source_last_activity_at, collected_at, workspace_hash, workspace_display_label, workspace_label_source, repository_hash, repository_label, repository_label_source, repository_identity_source, workspace_kind, source_file_fingerprint, session_artifacts, provenance, origin, originator, attribution_facts, request_evidence, claude_org_markers, claude_account_withheld_reason, claude_account_display]);
 crate::heap_layout_bound::split_fields!(SnapshotModelUsage; inline: [copy_unproven, identity_retained, copy_invalidated, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count]; heap: [model, reasoning_effort, selector_context, selector_sources, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product, account_identifier_hash, evidence_ref, identity_parts, cost_usd, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd]);
 crate::heap_layout_bound::fields!(SnapshotIdentityPart; account_identifier_hash, evidence_ref, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count, cost_usd, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd);
 crate::heap_layout_bound::fields!(SnapshotRequestEvidence; identity_basis, provider_workspace_hash, account_source);
