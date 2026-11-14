@@ -913,15 +913,16 @@ fn mixed_class_family_is_class_pure_root_first_in_both_directions() {
                 .collect::<Vec<_>>()[..],
             "family contiguous and root first"
         );
-        // The family's own groups follow its root's class run; singles are
-        // grouped by class, ordinary first.
+        // Stable-sort singles by class and the family by its root's class.
+        // Keep root-first member order, including family[1]'s class 0;
+        // only adjacent same-class groups merge into one request.
         let expected = match (root_class, member_class) {
             (1, 0) => vec![0, 1, 0],
             (0, 1) => vec![0, 1],
             (3, 0) => vec![0, 1, 3, 0],
             (0, 3) => vec![0, 3, 1],
-            (3, 1) => vec![0, 1, 3, 1],
-            (1, 3) => vec![0, 1, 3],
+            (3, 1) => vec![0, 1, 3, 0, 1],
+            (1, 3) => vec![0, 1, 0, 3],
             _ => unreachable!(),
         };
         assert_eq!(seen, expected, "root class {root_class}");
