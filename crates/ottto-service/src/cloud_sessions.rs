@@ -1209,10 +1209,12 @@ impl CloudCollector {
     }
 
     /// No provider call before `now + interval`; the next slice reads the
-    /// hint again first.
+    /// hint again first. The head is owed at that recheck, so a long head
+    /// interval cannot postpone it.
     fn recheck_after(&mut self, now: Instant, interval: Duration) {
         self.schedule.crawl = None;
         self.schedule.retry_not_before = None;
+        self.schedule.last_head_attempt = None;
         self.schedule.unsupported_until = Some(now + interval);
     }
 

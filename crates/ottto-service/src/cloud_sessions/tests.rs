@@ -1339,6 +1339,44 @@ fn listing_refused_not_retryable_rechecks_and_settles_nothing() {
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0].observations, requests[1].observations);
     assert_eq!(server.outcomes(), [CloudSessionChangeOutcome::Accepted]);
+    drop(requests);
+
+    // A long head interval cannot postpone the 30-minute recheck: after five
+    // unchanged heads (next head 160 minutes away) and a completed crawl, a
+    // refusal still rereads the hint 30 minutes later.
+    let (_root, checkpoints) = store("refused-mature");
+    let cli = Cli::head(page("mature", None));
+    let server = Server::new();
+    let inputs = self::inputs(&checkpoints, &cli, &server);
+    let mut collector = CloudCollector::default();
+    for at in [0, 5, 15, 35, 75, 155] {
+        slice(&mut collector, &inputs, t0, at * MINUTE);
+    }
+    assert_eq!(
+        collector.next_wake(t0 + 155 * MINUTE, midnight() + 155 * MINUTE),
+        Some(t0 + 315 * MINUTE)
+    );
+    cli.set(None, page_of(vec![task("mature", "error")], None));
+    *server.refuse.borrow_mut() = Some(refused(409, "codex_cloud_tasks_disabled", Some(false)));
+    assert_eq!(
+        slice(&mut collector, &inputs, t0, 315 * MINUTE),
+        CloudSessionCycleOutcome::Unsupported
+    );
+    assert_eq!(
+        collector.next_wake(t0 + 315 * MINUTE, midnight() + 315 * MINUTE),
+        Some(t0 + 345 * MINUTE)
+    );
+    *server.refuse.borrow_mut() = None;
+    let hint_calls = server.hint_calls.get();
+    assert_eq!(
+        slice(&mut collector, &inputs, t0, 345 * MINUTE),
+        CloudSessionCycleOutcome::Uploaded
+    );
+    assert_eq!(server.hint_calls.get(), hint_calls + 1);
+    assert_eq!(
+        server.outcomes().last(),
+        Some(&CloudSessionChangeOutcome::Accepted)
+    );
 }
 
 /// [behaviour] A policy mismatch (the setting changed between the hint and

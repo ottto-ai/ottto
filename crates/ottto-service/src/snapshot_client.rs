@@ -880,15 +880,17 @@ pub struct ActivityHintResponse {
     #[serde(default)]
     pub session_request_identity_contract: Option<String>,
     /// Codex only: the user's "List my Codex cloud tasks" setting as this
-    /// server resolves it. An older server omits it, which means off.
-    #[serde(default)]
+    /// server resolves it. An older server omits it, which means off. This
+    /// and the next two are set only by `decode_activity_hint`, tolerantly:
+    /// a missing or malformed value is off and never fails the hint.
+    #[serde(skip)]
     pub codex_cloud_tasks_enabled: bool,
     /// Codex only: the user's fixed cloud-task key (unpadded base64url of 32
     /// bytes), present only while listing is on.
-    #[serde(default)]
+    #[serde(skip)]
     pub codex_cloud_task_key: Option<String>,
     /// Codex only: the task-list contract the server accepts.
-    #[serde(default)]
+    #[serde(skip)]
     pub codex_cloud_tasks_contract: Option<String>,
     pub recommended_scan_after: String,
 }
@@ -913,6 +915,12 @@ pub(crate) fn decode_activity_hint(value: Value) -> Result<ActivityHintResponse>
     hint.workspace_labels_explicit = value
         .get("workspace_labels_enabled")
         .and_then(Value::as_bool);
+    hint.codex_cloud_tasks_enabled = value
+        .get("codex_cloud_tasks_enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    hint.codex_cloud_task_key = text("codex_cloud_task_key");
+    hint.codex_cloud_tasks_contract = text("codex_cloud_tasks_contract");
     Ok(hint)
 }
 
@@ -3875,17 +3883,25 @@ mod tests {
     }
 
     #[test]
-    fn codex_cloud_task_fields_default_off_when_an_older_server_omits_them() {
-        let hint: ActivityHintResponse = serde_json::from_str(&activity_hint_json("")).unwrap();
-        assert!(!hint.codex_cloud_tasks_enabled);
-        assert_eq!(hint.codex_cloud_task_key, None);
-        assert_eq!(hint.codex_cloud_tasks_contract, None);
-        let hint: ActivityHintResponse = serde_json::from_str(&activity_hint_json(
+    fn codex_cloud_task_fields_default_off_and_never_fail_the_hint() {
+        let decode = |extra: &str| {
+            decode_activity_hint(serde_json::from_str(&activity_hint_json(extra)).unwrap()).unwrap()
+        };
+        for extra in [
+            "",
+            r#", "codex_cloud_tasks_enabled":"yes", "codex_cloud_task_key":42,
+               "codex_cloud_tasks_contract":{"v":2}"#,
+        ] {
+            let hint = decode(extra);
+            assert!(!hint.codex_cloud_tasks_enabled);
+            assert_eq!(hint.codex_cloud_task_key, None);
+            assert_eq!(hint.codex_cloud_tasks_contract, None);
+        }
+        let hint = decode(
             r#", "codex_cloud_tasks_enabled":true,
                "codex_cloud_task_key":"BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc",
                "codex_cloud_tasks_contract":"cloud_session_changes.v2""#,
-        ))
-        .unwrap();
+        );
         assert!(hint.codex_cloud_tasks_enabled);
         assert_eq!(hint.codex_cloud_task_key.map(|key| key.len()), Some(43));
         assert_eq!(
