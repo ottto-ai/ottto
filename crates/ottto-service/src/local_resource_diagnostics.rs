@@ -1089,6 +1089,7 @@ crate::heap_layout_bound::fields!(RefusalExposure; owed_entities, held_terminal_
 #[derive(Debug)]
 pub(crate) struct Probe {
     pub(crate) refusal_exposure: Option<RefusalExposure>,
+    pub(crate) page_schedule: BTreeMap<&'static str, bool>,
     withheld_memo: Option<crate::snapshots::withheld_account::Memo>,
     started: Instant,
     process: Option<ProcessSample>,
@@ -1151,6 +1152,7 @@ impl Probe {
     pub(crate) fn start() -> Self {
         Self {
             refusal_exposure: None,
+            page_schedule: BTreeMap::new(),
             withheld_memo: None,
             started: Instant::now(),
             process: process_sample(),
@@ -1186,7 +1188,9 @@ impl Probe {
     }
     pub(crate) fn collection(&self, source: &str, counts: CollectionCounts) {
         #[derive(Serialize)]
-        struct Counts {
+        struct Counts<'a> {
+            #[serde(flatten)]
+            page_schedule: &'a BTreeMap<&'static str, bool>,
             #[serde(skip_serializing_if = "Option::is_none")]
             refusal_exposure: Option<RefusalExposure>,
             #[serde(flatten)]
@@ -1245,6 +1249,7 @@ impl Probe {
         let seeds = seeds.chain(["root_member", "child_member"]);
         let seeds = seeds.zip(FORCED_SEED_START..).collect::<Vec<_>>();
         let counts = Counts {
+            page_schedule: &self.page_schedule,
             forced_family_seeds: drain(source, &seeds),
             line_delivery: self
                 .line_delivery

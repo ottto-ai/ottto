@@ -1,5 +1,5 @@
 //! Local-only, content-free witnesses of actual traversal decisions.
-//! No paths, identities, arbitrary strings, persisted fields or extra scans.
+//! No paths, identities, arbitrary strings, persisted writes or extra scans.
 use super::{
     disappearance_diagnostics, rfc3339_unix_seconds, CensusGates, ScanIndex,
     ScanTraversalCheckpoint, ScanTraversalCounts, SnapshotSource, UnsettledUploadCause,
@@ -64,6 +64,8 @@ pub(super) struct Starting {
     index_generation: u64,
     window_unix_seconds: Option<u64>,
     context_matches: bool,
+    recensus_armed: bool,
+    context_fingerprint: String,
     retry_due: Option<bool>,
     prior_unsettled_upload: bool,
     /// Fixed names of the paths that set `prior_unsettled_upload`. Empty
@@ -107,6 +109,8 @@ impl Starting {
             index_generation: index.generation,
             window_unix_seconds: rfc3339_unix_seconds(now),
             context_matches: matches,
+            recensus_armed: false,
+            context_fingerprint: String::new(),
             retry_due: matches.then_some(true),
             prior_unsettled_upload: index.bounded_sweep_had_unsettled_upload,
             prior_unsettled_causes: UnsettledUploadCause::names(index.unsettled_cause_bits()),
@@ -119,11 +123,23 @@ impl Starting {
         crate::local_resource_diagnostics::traversal_transition(source.api_slug(), self);
     }
 
-    pub(super) fn start_recensus(&self, source: SnapshotSource, context: &str, window: &str) {
+    pub(super) fn start_recensus(&mut self, source: SnapshotSource, context: &str, window: &str) {
         let mut state = recensus();
         let key = (source.slot(), context.to_owned());
         let armed = state.remove(&key) == Some(None);
-        if matches!(self.reason, StartReason::NoRetainedTraversal) && armed {
+        self.context_fingerprint = context.get(..8).unwrap_or_default().to_owned();
+        self.recensus_armed = (matches!(self.reason, StartReason::TerminalUnhealthyRetry)
+            && self.previous.as_ref().is_some_and(|previous| {
+                !previous.watcher_overflow
+                    && previous.counts.directory_entry_cap_exceeded_count == 0
+                    && previous.counts.symlink_rejected_count == 0
+                    && !previous
+                        .counts
+                        .unreadable_causes
+                        .walk_loss(previous.counts.unreadable_path_count as u64)
+            }))
+            || (matches!(self.reason, StartReason::NoRetainedTraversal) && armed);
+        if self.recensus_armed {
             state.insert(key, Some(window.to_owned()));
         }
     }
@@ -181,6 +197,8 @@ pub(super) fn retiring(
         index_generation: u64,
         window_unix_seconds: Option<u64>,
         raw_census_complete: bool,
+        recensus_armed: bool,
+        context_fingerprint: &'a str,
         gates: CensusGates,
         /// Fixed names of the paths that set the clean follow-up's flag.
         unsettled_causes: Vec<&'static str>,
@@ -203,7 +221,7 @@ pub(super) fn retiring(
         let mut state = recensus();
         let key = (source.slot(), traversal.context_fingerprint.clone());
         state.remove(&key);
-        if matches!(reason, RetireReason::Complete) {
+        if raw_complete {
             state.insert(key, None);
         }
     }
@@ -215,6 +233,8 @@ pub(super) fn retiring(
             index_generation,
             window_unix_seconds: rfc3339_unix_seconds(&traversal.census_window_end),
             raw_census_complete: raw_complete,
+            recensus_armed: raw_complete,
+            context_fingerprint: traversal.context_fingerprint.get(..8).unwrap_or_default(),
             gates,
             unsettled_causes: UnsettledUploadCause::names(unsettled_causes),
             counts: &traversal.counts,
@@ -321,7 +341,7 @@ mod tests {
         assert_eq!(serde_json::to_value(&index).unwrap(), before);
         let retried = start(&mut index, "2026-08-01T00:03:00Z", BACKFILL_WINDOW_DAYS + 1);
         assert_eq!(retried.len(), 1);
-        assert!(!routine_recensus(
+        assert!(routine_recensus(
             SnapshotSource::Pi,
             index.traversal.as_ref().unwrap()
         ));
@@ -413,8 +433,8 @@ mod tests {
         let started = start(&mut index, T2, BACKFILL_WINDOW_DAYS);
         assert_eq!(started.len(), 1);
         assert!(
-            !routine_recensus(SnapshotSource::Pi, index.traversal.as_ref().unwrap()),
-            "clean follow-up stays paced"
+            routine_recensus(SnapshotSource::Pi, index.traversal.as_ref().unwrap()),
+            "clean follow-up stays routine"
         );
         assert_eq!(started[0]["counts"]["prior_unsettled_upload"], true);
         assert_eq!(
@@ -457,6 +477,180 @@ mod tests {
                 SnapshotSource::Pi,
                 index.traversal.as_ref().unwrap()
             ));
+        }
+    }
+
+    fn assert_recensus_witness(row: &Value, traversal: &ScanTraversalCheckpoint, armed: bool) {
+        assert_eq!(row["counts"]["recensus_armed"], armed);
+        let prefix = row["counts"]["context_fingerprint"].as_str().unwrap();
+        assert_eq!(prefix, &traversal.context_fingerprint[..8]);
+        assert_eq!(prefix.len(), 8);
+        assert!(prefix.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn terminal_unhealthy_retry_arms_routine_recensus_for_each_source() {
+        for source in [
+            SnapshotSource::ClaudeCode,
+            SnapshotSource::Codex,
+            SnapshotSource::Pi,
+        ] {
+            for problem in ["malformed", "open_read", "disappeared"] {
+                let scratch = crate::test_scratch::ScratchDir::new("retry-recensus");
+                let roots = [scratch.to_path_buf()];
+                let mut index = ScanIndex::default();
+                ensure_bounded_traversal(source, &roots, &mut index, T0, BACKFILL_WINDOW_DAYS);
+                let traversal = index.traversal.as_mut().unwrap();
+                traversal.pending_directories.clear();
+                match problem {
+                    "open_read" => traversal.counts.record_unreadable(
+                        crate::codex_scan_diagnostics::UnreadableCause::OpenRead,
+                        1,
+                    ),
+                    "disappeared" => traversal.counts.disappeared_file_count = 1,
+                    _ => traversal.counts.malformed_json_line_count = 1,
+                }
+                traversal.unhealthy_retry_not_before_unix_seconds = rfc3339_unix_seconds(T1);
+                // A restarted process has a retained checkpoint but no in-memory arm.
+                disarm_recensus(source, &traversal.context_fingerprint);
+                index = serde_json::from_value(serde_json::to_value(&index).unwrap()).unwrap();
+                let (_, rows) = capture(|| {
+                    ensure_bounded_traversal(source, &roots, &mut index, T1, BACKFILL_WINDOW_DAYS)
+                });
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0]["counts"]["reason"], "terminal_unhealthy_retry");
+                let traversal = index.traversal.as_ref().unwrap();
+                assert!(routine_recensus(source, traversal));
+                assert_recensus_witness(&rows[0], traversal, true);
+                let restored =
+                    serde_json::from_value(serde_json::to_value(traversal).unwrap()).unwrap();
+                assert!(
+                    routine_recensus(source, &restored),
+                    "page reload keeps the window"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_unhealthy_retry_with_walk_loss_or_overflow_stays_paced() {
+        use crate::codex_scan_diagnostics::UnreadableCause;
+        for source in [
+            SnapshotSource::ClaudeCode,
+            SnapshotSource::Codex,
+            SnapshotSource::Pi,
+        ] {
+            for problem in [
+                "directory",
+                "metadata",
+                "unattributed",
+                "directory_cap",
+                "symlink",
+                "overflow",
+            ] {
+                let scratch = crate::test_scratch::ScratchDir::new("loss-retry-recensus");
+                let roots = [scratch.to_path_buf()];
+                let mut index = ScanIndex::default();
+                ensure_bounded_traversal(source, &roots, &mut index, T0, BACKFILL_WINDOW_DAYS);
+                let traversal = index.traversal.as_mut().unwrap();
+                traversal.pending_directories.clear();
+                // Overflow alone is not unhealthy; keep a file-level error alongside it.
+                traversal
+                    .counts
+                    .record_unreadable(UnreadableCause::OpenRead, 1);
+                match problem {
+                    "directory" => traversal
+                        .counts
+                        .record_unreadable(UnreadableCause::Directory, 1),
+                    "metadata" => traversal
+                        .counts
+                        .record_unreadable(UnreadableCause::Metadata, 1),
+                    "unattributed" => traversal.counts.unreadable_path_count += 1,
+                    "directory_cap" => traversal.counts.directory_entry_cap_exceeded_count = 1,
+                    "symlink" => traversal.counts.symlink_rejected_count = 1,
+                    "overflow" => traversal.watcher_hint_seen = true,
+                    _ => unreachable!(),
+                }
+                traversal.unhealthy_retry_not_before_unix_seconds = rfc3339_unix_seconds(T1);
+                let (_, rows) = capture(|| {
+                    ensure_bounded_traversal(source, &roots, &mut index, T1, BACKFILL_WINDOW_DAYS)
+                });
+                assert_eq!(rows[0]["counts"]["reason"], "terminal_unhealthy_retry");
+                let traversal = index.traversal.as_ref().unwrap();
+                assert!(
+                    !routine_recensus(source, traversal),
+                    "{source:?}: {problem}"
+                );
+                assert_recensus_witness(&rows[0], traversal, false);
+            }
+        }
+    }
+
+    #[test]
+    fn clean_followup_retirement_arms_routine_recensus_for_each_source() {
+        for source in [
+            SnapshotSource::ClaudeCode,
+            SnapshotSource::Codex,
+            SnapshotSource::Pi,
+        ] {
+            let scratch = crate::test_scratch::ScratchDir::new("followup-recensus");
+            let roots = [scratch.to_path_buf()];
+            let mut index = ScanIndex::default();
+            ensure_bounded_traversal(source, &roots, &mut index, T0, BACKFILL_WINDOW_DAYS);
+            let old = index.traversal.as_ref().unwrap();
+            let (_, rows) = capture(|| {
+                retiring(
+                    source,
+                    0,
+                    old,
+                    true,
+                    0,
+                    CensusGates {
+                        clean_followup: true,
+                        ..Default::default()
+                    },
+                )
+            });
+            assert_eq!(rows[0]["counts"]["reason"], "complete_needs_clean_followup");
+            assert_recensus_witness(&rows[0], old, true);
+            index.traversal = None;
+            let (_, rows) = capture(|| {
+                ensure_bounded_traversal(source, &roots, &mut index, T1, BACKFILL_WINDOW_DAYS)
+            });
+            let traversal = index.traversal.as_ref().unwrap();
+            assert!(routine_recensus(source, traversal));
+            assert_recensus_witness(&rows[0], traversal, true);
+        }
+    }
+
+    #[test]
+    fn context_changed_does_not_consume_an_arm_as_routine_for_each_source() {
+        for source in [
+            SnapshotSource::ClaudeCode,
+            SnapshotSource::Codex,
+            SnapshotSource::Pi,
+        ] {
+            let scratch = crate::test_scratch::ScratchDir::new("changed-recensus");
+            let roots = [scratch.to_path_buf()];
+            let mut index = ScanIndex::default();
+            ensure_bounded_traversal(source, &roots, &mut index, T0, BACKFILL_WINDOW_DAYS);
+            retiring(
+                source,
+                0,
+                index.traversal.as_ref().unwrap(),
+                true,
+                0,
+                CensusGates::default(),
+            );
+            // Even an already armed destination context cannot make a context change routine.
+            index.traversal.as_mut().unwrap().context_fingerprint = "0".repeat(64);
+            let (_, rows) = capture(|| {
+                ensure_bounded_traversal(source, &roots, &mut index, T1, BACKFILL_WINDOW_DAYS)
+            });
+            assert_eq!(rows[0]["counts"]["reason"], "context_changed");
+            let traversal = index.traversal.as_ref().unwrap();
+            assert!(!routine_recensus(source, traversal));
+            assert_recensus_witness(&rows[0], traversal, false);
         }
     }
 
@@ -899,6 +1093,7 @@ mod tests {
             let traversal = index.traversal.as_mut().unwrap();
             traversal.counts = max_traversal_counts();
             let mut starting = Starting::capture(source, &index, T1, true, u8::MAX);
+            starting.context_fingerprint = "01234567".into();
             starting.context_matches = false; // longest boolean spelling
             starting.prior_unsettled_upload = false;
             starting.prior_unsettled_causes = UnsettledUploadCause::names(u16::MAX);

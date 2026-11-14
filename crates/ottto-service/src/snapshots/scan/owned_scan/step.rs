@@ -3606,6 +3606,11 @@ impl OwnedSourceScan {
                     resource_probe.line_delivery = Some(delivery.take_page());
                 }
                 let full_causes = std::mem::take(&mut resource_probe.full_causes);
+                resource_probe.page_schedule = BTreeMap::from([
+                    ("routine_recensus", scan.routine_recensus),
+                    ("page_file_limit_hit", scan.page_file_limit_hit),
+                    ("pending_work", scan.census_status.pending_work),
+                ]);
                 resource_probe.collection(
                     source.api_slug(),
                     crate::local_resource_diagnostics::CollectionCounts {
