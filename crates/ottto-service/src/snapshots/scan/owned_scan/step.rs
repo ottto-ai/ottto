@@ -3612,6 +3612,11 @@ impl OwnedSourceScan {
                     crate::local_resource_diagnostics::PageSelection::ByteBudgetHit,
                     u64::from(scan.page_byte_budget_hit),
                 );
+                resource_probe.page_schedule = BTreeMap::from([
+                    ("routine_recensus", scan.routine_recensus),
+                    ("page_file_limit_hit", scan.page_file_limit_hit),
+                    ("pending_work", scan.census_status.pending_work),
+                ]);
                 resource_probe.collection(
                     source.api_slug(),
                     crate::local_resource_diagnostics::CollectionCounts {
