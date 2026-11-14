@@ -705,6 +705,7 @@ fn conflict_in_a_changed_home_reloads_cold() {
         pass(&mut facts, &roots, &paths, 0, "not_kept");
         history(&homes[changed], &alias(y));
         pass(&mut facts, &roots, &paths, 0, "not_kept");
+        pass(&mut facts, &roots, &paths, 0, "not_kept");
         history(
             &homes[changed],
             "DELETE FROM thread_history_projection_state",
@@ -735,6 +736,7 @@ fn conflict_between_kept_homes_reloads_cold() {
         .unwrap();
     let conflict = pass(&mut facts, &roots, &paths, 0, "conflict");
     assert!(conflict.identity_conflicts.contains(ID));
+    pass(&mut facts, &roots, &paths, 0, "not_kept");
     state(&homes[1])
         .execute_batch("UPDATE threads SET model='gpt-5.2'")
         .unwrap();
@@ -811,7 +813,9 @@ fn roster_changes_reuse_the_remaining_homes() {
     pass(&mut facts, &three, &paths, 0, "not_kept");
     pass(&mut facts, &three, &paths, 3, "");
     pass(&mut facts, &all, &paths, 3, "roster_changed");
+    pass(&mut facts, &all, &paths, 4, "");
     pass(&mut facts, &three, &paths, 3, "roster_changed");
+    pass(&mut facts, &three, &paths, 3, "");
     let winning = json!({"id": ID, "thread_name": "Winning title"}).to_string() + "\n";
     fs::write(homes[3].0.join("session_index.jsonl"), winning).unwrap();
     pass(&mut facts, &all, &paths, 0, "title_inputs");
