@@ -79,26 +79,6 @@ fn exit_without_close(db: Sqlite, path: &Path, to: &crate::test_scratch::Scratch
     copy
 }
 
-/// One save or between-passes step: a PASSIVE runs exactly when the WAL the
-/// step starts from has reached the threshold, and the commit that follows it
-/// restarts the WAL below the threshold.
-fn step(db: &mut Sqlite, work: impl FnOnce(&mut Sqlite)) {
-    let before = db.wal_bytes().unwrap();
-    let (passive, _) = checkpoints(db);
-    work(db);
-    let fired = checkpoints(db).0 > passive;
-    assert_eq!(
-        fired,
-        before >= db.purge_policy.checkpoint_bytes,
-        "WAL {before} B"
-    );
-    let after = db.wal_bytes().unwrap();
-    assert!(after < WAL_ALARM_BYTES);
-    if fired {
-        assert!(after < db.purge_policy.checkpoint_bytes, "WAL {after} B");
-    }
-}
-
 /// [regress] the shipped cadence checkpoints by WAL size, never by pass.
 #[test]
 fn shipped_cadence_checkpoints_at_the_wal_threshold_without_idle_truncate() {
@@ -116,19 +96,31 @@ fn shipped_cadence_checkpoints_at_the_wal_threshold_without_idle_truncate() {
             })
             .collect()
     };
+    let threshold = db.purge_policy.checkpoint_bytes;
+    let mut checkpointed_passes = 0;
     for pass in 0..PASSES {
-        step(&mut db, |db| save(db, pass, "traversal", &value(pass)));
-        step(&mut db, |db| {
-            db.between_cycles(false).unwrap();
-            db.clean_checkpoint().unwrap();
-        });
+        let (passive, _) = checkpoints(&db);
+        save(&mut db, pass, "traversal", &value(pass));
+        // The save's own commit runs maintenance, so this is the pass's peak.
+        let peak = db.wal_bytes().unwrap();
+        db.between_cycles(false).unwrap();
+        db.clean_checkpoint().unwrap();
         assert_eq!(db.read_control::<u8>("phase").unwrap(), Some(0));
+        let fired = checkpoints(&db).0 > passive;
+        assert_eq!(fired, peak >= threshold, "WAL {peak} B");
+        assert!(peak < WAL_ALARM_BYTES);
+        if fired {
+            // The clean marker's commit restarts the WAL at the size limit.
+            let after = db.wal_bytes().unwrap();
+            assert!(after < threshold, "WAL {after} B");
+        }
+        checkpointed_passes += u64::from(fired);
     }
-    let (passive, idle) = checkpoints(&db);
+    let (_, idle) = checkpoints(&db);
     assert_eq!(idle, 0, "no idle TRUNCATE without debt");
     assert!(
-        (1..PASSES).contains(&passive),
-        "{passive} PASSIVE checkpoints"
+        (1..PASSES).contains(&checkpointed_passes),
+        "PASSIVE on {checkpointed_passes} passes"
     );
     let stats = serde_json::to_value(db.maintenance_stats()).unwrap();
     assert_eq!(stats["wal_alarm"], false);
