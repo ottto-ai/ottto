@@ -88,17 +88,69 @@ pub(in crate::snapshots) fn prepare_owned_scan_candidate(
     candidate.source_file_fingerprint = sidecar_fingerprint;
 }
 
-/// `e2`: this page's path-twin co-scheduling, transient (never persisted).
+/// Forced discovery shares the native longest-root and metadata admission
+/// path at pass start and when a content twin pulls its proving holder.
+fn forced_index_candidate(
+    source: SnapshotSource,
+    roots: &[PathBuf],
+    path: (PathBuf, bool),
+    census: &mut ScanCensus,
+    census_unix_seconds: Option<u64>,
+    backfill_window_days: u64,
+    discovery: &mut CandidateDiscovery<'_>,
+) -> Option<CandidateFile> {
+    let (path, census_member) = path;
+    let scan_root = roots
+        .iter()
+        .filter(|root| path.starts_with(root))
+        .max_by_key(|root| root.components().count())?
+        .clone();
+    candidate_from_traversal_path_at(
+        source,
+        disappearance_diagnostics::Site::CandidateForcedIndex,
+        ScanTraversalPath {
+            scan_root,
+            path,
+            census_member,
+            watcher_hint: false,
+        },
+        census,
+        census_unix_seconds,
+        backfill_window_days,
+        discovery,
+    )
+}
+
+/// `e2`: this page's path-twin and content-twin co-scheduling, transient
+/// (page-scoped, never persisted).
 #[derive(Default)]
 pub(in crate::snapshots) struct ClaudeTwinSchedule {
     /// Forced roots selected only for path-twin co-scheduling. Their owed
     /// adoption-only members keep the history gate (both or neither).
     family_roots: BTreeSet<String>,
-    /// Index keys of every home of a root whose own seeds alone selected it:
-    /// those homes fold together, and its children keep their own decisions.
+    /// Index keys of every home of a root whose own seeds alone selected it,
+    /// and of each content twin or holder the other pulled: those homes fold
+    /// together, and its children keep their own decisions.
     root_homes: BTreeSet<String>,
+    /// Sorted request hashes of every content-twin census record, as of
+    /// first use on this page; bounded by the twin records.
+    twin_hashes: Option<Vec<u64>>,
 }
 impl ClaudeTwinSchedule {
+    /// The page's content-twin hash union: a holder candidate walks for the
+    /// twins it proves only when it shares one of these requests.
+    pub(in crate::snapshots) fn twin_hashes(&mut self, census: &ClaudeRequestCensus) -> &[u64] {
+        self.twin_hashes.get_or_insert_with(|| {
+            let mut union = census
+                .records()
+                .filter(|(_, record)| record.is_twin())
+                .flat_map(|(_, record)| record.request_hashes().iter().copied())
+                .collect::<Vec<_>>();
+            union.sort_unstable();
+            union.dedup();
+            union
+        })
+    }
     /// Whether `path` folds as a co-scheduled member, and whether only for
     /// path twins (`Some(true)`). A root forced for any other reason wins.
     pub(in crate::snapshots) fn forced(
@@ -154,10 +206,6 @@ pub(crate) struct OwnedSourceScan {
     pub(in crate::snapshots) claude_authority_preflight: bool,
     pub(in crate::snapshots) forced_claude_family_reparses: BTreeSet<String>,
     pub(in crate::snapshots) claude_twin_schedule: ClaudeTwinSchedule,
-    /// The families this Claude page's selection touched, for the
-    /// count-only per-family census shadow.
-    pub(in crate::snapshots) claude_family_shadow:
-        Option<Box<claude_family_census_shadow::Touched>>,
     pub(in crate::snapshots) identified_candidates: VecDeque<CandidateFile>,
     /// The active file and, while it is a paged cursor job, its slot lease.
     /// A dropped frame returns an intact job to the slot.
@@ -381,7 +429,6 @@ impl OwnedSourceScan {
             claude_authority_preflight: false,
             forced_claude_family_reparses: Default::default(),
             claude_twin_schedule: Default::default(),
-            claude_family_shadow: Default::default(),
             identified_candidates: Default::default(),
             active_file: Default::default(),
             codex_join_inventory: evidence.map(|e| e.inventory),
@@ -891,11 +938,6 @@ impl OwnedSourceScan {
             causes,
             ..ScanCensus::default()
         };
-        let claude_family_shadow = (source == SnapshotSource::ClaudeCode).then(|| {
-            Box::new(claude_family_census_shadow::Touched::from_paths(
-                pending_paths.iter().map(|pending| pending.path.as_path()),
-            ))
-        });
         let selected_flags = pending_paths
             .iter()
             .map(|pending| {
@@ -1205,23 +1247,10 @@ impl OwnedSourceScan {
                     sources: std::borrow::Cow::Borrowed(&move_sources),
                     growth: Some(&resource_probe.discovery_growth),
                 };
-                let Some(scan_root) = scan_roots
-                    .iter()
-                    .filter(|root| path.starts_with(root))
-                    .max_by_key(|root| root.components().count())
-                    .cloned()
-                else {
-                    continue;
-                };
-                let Some(mut candidate) = candidate_from_traversal_path_at(
+                let Some(mut candidate) = forced_index_candidate(
                     source,
-                    disappearance_diagnostics::Site::CandidateForcedIndex,
-                    ScanTraversalPath {
-                        scan_root,
-                        path,
-                        census_member: true,
-                        watcher_hint: false,
-                    },
+                    &scan_roots,
+                    (path, true),
                     &mut census,
                     census_unix_seconds,
                     backfill_window_days,
@@ -1307,7 +1336,6 @@ impl OwnedSourceScan {
             claude_authority_preflight,
             forced_claude_family_reparses,
             claude_twin_schedule,
-            claude_family_shadow,
             identified_candidates: identified_candidates.into(),
             active_file: Default::default(),
             codex_join_inventory,

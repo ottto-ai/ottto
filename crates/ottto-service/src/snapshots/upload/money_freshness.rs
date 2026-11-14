@@ -1,10 +1,8 @@
 //! Freshness diagnostics; none grants a read, alters a hold or adds a read.
 //! `freshness_alarm` is each source's persisted per-file debt (`g7_debt`) under
 //! `debt`, aggregated at each root walk's end, so it survives restarts.
-//! `Counts` are count-only Claude gauges over the bounded FirstPending stamps.
 use crate::snapshots::g7_debt::{Report, Roster, Walk};
 use crate::snapshots::SnapshotSource;
-use serde::Serialize;
 
 pub(in crate::snapshots) const ALARM_AFTER: u64 = 6 * 60 * 60;
 
@@ -141,18 +139,6 @@ fn emit(source: SnapshotSource, fold: &WalkFold, basis: &'static str, debt: Opti
 pub(crate) fn report_failed_pass(source: SnapshotSource) {
     let debt = with_walks(|walks| walks.last[source as usize]).unwrap_or(Report::UNAVAILABLE);
     emit(source, &WalkFold::EMPTY, "last_walk", Some(&debt));
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-pub(in crate::snapshots) struct Counts {
-    pub(in crate::snapshots) ages_are_process_local_lower_bounds: bool,
-    pub(in crate::snapshots) skipped_untracked_entries: u64,
-    /// No indexed scan and not a replay: separate from indexed held work.
-    pub(in crate::snapshots) discovered_unread_tracked_files: u64,
-    pub(in crate::snapshots) discovered_unread_untracked_entries: u64,
-    pub(in crate::snapshots) oldest_discovered_unread_age_seconds: u64,
-    pub(in crate::snapshots) discovered_unread_over_24h_tracked_files: u64,
-    pub(in crate::snapshots) indexed_or_replay_tracked_files: u64,
 }
 
 #[cfg(test)]

@@ -255,6 +255,56 @@ fn head_certificate<S: tail_source::TailSource>(
     Some(S::decode_head(revision, &body, &mut acc).ok()?.certificate)
 }
 
+/// How `key`'s committed Claude certificate answers the file now at its
+/// path: `Ok` when it restores, else the refusal.
+#[cfg(unix)]
+pub(crate) fn claude_certificate_restore_for_test(
+    index: &ScanIndex,
+    key: &str,
+) -> Result<(), crate::transcript_acquisition::CertificateRefusal> {
+    let certificate = head_certificate::<tail_source::claude::Claude>(index, key).unwrap();
+    let mut file = std::fs::File::open(key).unwrap();
+    certificate
+        .restore_grown(
+            &mut file,
+            crate::transcript_acquisition::Scope("e2-pipeline".into()),
+            None,
+        )
+        .map(|_| ())
+}
+
+/// Model a reboot's device renumber in a committed certificate, leaving
+/// inode, birth, samples and reduction unchanged. The next ordinary load
+/// keeps that certificate: the device is never compared across boots.
+#[cfg(unix)]
+pub(crate) fn renumber_device_for_test(index: &mut ScanIndex, key: &str) {
+    let route = route_of(index).unwrap();
+    let revision = tail_source::reduction_revision(SnapshotSource::ClaudeCode);
+    let head = state_v2::load_head(index, key, revision).unwrap().unwrap();
+    let device = tail_source::certified_certificate(&head.body)
+        .unwrap()
+        .device
+        ^ 1;
+    let body = tail_source::renumber_device_for_test(&head.body, key);
+    state_v2::stage_tail(
+        &route,
+        key,
+        state_v2::StagedFile {
+            revision,
+            head: body,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    save_on_route(index, &route).unwrap();
+    assert_eq!(
+        head_certificate::<tail_source::claude::Claude>(index, key)
+            .unwrap()
+            .device,
+        device
+    );
+}
+
 /// The graph compared byte for byte, routed or not.
 pub(crate) fn resident_for_test(index: &ScanIndex) -> ScanIndex {
     index.clone()
@@ -419,6 +469,7 @@ pub(crate) struct E2ScanFixture {
     capture_claude_identity: bool,
     collection_clock: bool,
     collection_window_days: Option<u64>,
+    subagent_births: bool,
     attribution: Mutex<Option<crate::session_attribution::SessionAttributionContext>>,
 }
 impl E2ScanFixture {
@@ -449,6 +500,15 @@ impl E2ScanFixture {
 
     pub(crate) fn mark_sidecar_sweep_incomplete(index: &mut ScanIndex) {
         index.claude_desktop_store_retry_not_before_unix_seconds = Some(0);
+    }
+
+    /// Model historical child births only for tests that name them. Existing
+    /// fixtures keep their subagent birth exemption and captured receipts.
+    pub(crate) fn with_subagent_births() -> Self {
+        Self {
+            subagent_births: true,
+            ..Self::default()
+        }
     }
 
     /// Opt in when the fixture asserts marker/identity behavior. Money-only
@@ -551,7 +611,7 @@ impl E2ScanFixture {
             .iter()
             .filter(|(path, _)| {
                 claude_index_path_member_ref(path)
-                    .is_some_and(|member| member.subagent_stem.is_none())
+                    .is_some_and(|member| member.subagent_stem.is_none() || self.subagent_births)
             })
             .filter_map(|(path, birth)| Some((local_index_key(path), u64::try_from(*birth).ok()?)))
             .collect();
@@ -627,11 +687,12 @@ impl E2ScanFixture {
                         .push(active.candidate.path.clone());
                 }
                 if let Some(birth) = births.get(&active.candidate.path) {
-                    if !active
-                        .parser
-                        .accumulator
-                        .claude_file_birth
-                        .is_subagent_for_test()
+                    if self.subagent_births
+                        || !active
+                            .parser
+                            .accumulator
+                            .claude_file_birth
+                            .is_subagent_for_test()
                     {
                         active
                             .parser

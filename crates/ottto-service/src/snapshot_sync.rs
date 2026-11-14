@@ -487,32 +487,6 @@ fn claude_prior_history(
         return PriorHistory::Unverified;
     }
     let slug = SnapshotSource::ClaudeCode.api_slug();
-    let here = backfill_state
-        .completed_destination_namespaces
-        .get(slug)
-        .map(String::as_str)
-        == Some(destination_namespace);
-    // A quarantined copy of this index, of a legacy index or of this
-    // destination's ledger. An unreadable directory fails closed; a missing
-    // one is empty.
-    let quarantined_sibling = || {
-        let own_stem = index_path.file_stem().and_then(|stem| stem.to_str());
-        let claude_prefix = format!("{slug}-scan-index");
-        let Some(parent) = index_path.parent() else {
-            return false;
-        };
-        match std::fs::read_dir(parent) {
-            Ok(mut entries) => entries.any(|entry| match entry {
-                Ok(entry) => entry.file_name().to_str().is_some_and(|name| {
-                    name.contains(".corrupt.")
-                        && (own_stem.is_some_and(|stem| name.starts_with(stem))
-                            || name.starts_with(&claude_prefix))
-                }),
-                Err(_) => true,
-            }),
-            Err(error) => error.kind() != std::io::ErrorKind::NotFound,
-        }
-    };
     // Only a different namespace's directory is another destination. An
     // unscoped legacy `claude_code-scan-index*` beside `destinations/` names
     // no destination; it is usually this Mac's own pre-scoping index, so it
@@ -537,10 +511,12 @@ fn claude_prior_history(
         Ok(_) => true,
         Err(error) => error.kind() != std::io::ErrorKind::NotFound,
     };
-    if here
-        || upload_progress.records_server_attested_upload()
-        || quarantined_sibling()
-        || seen_marker()
+    if claude_destination_history_here(
+        backfill_state,
+        destination_namespace,
+        upload_progress,
+        index_path,
+    ) || seen_marker()
     {
         return PriorHistory::Here;
     }
@@ -573,6 +549,66 @@ fn claude_prior_history(
         PriorHistory::Here
     } else {
         PriorHistory::None
+    }
+}
+
+/// Evidence belongs to this destination, independent of the Mac-wide marker.
+fn claude_destination_history_here(
+    backfill_state: &crate::backfill::BackfillState,
+    destination_namespace: &str,
+    upload_progress: &SnapshotUploadProgress,
+    index_path: &Path,
+) -> bool {
+    let slug = SnapshotSource::ClaudeCode.api_slug();
+    let here = backfill_state
+        .completed_destination_namespaces
+        .get(slug)
+        .map(String::as_str)
+        == Some(destination_namespace);
+    // A quarantined copy of this index, of a legacy index or of this
+    // destination's ledger. An unreadable directory fails closed; a missing
+    // one is empty.
+    let quarantined_sibling = || {
+        let own_stem = index_path.file_stem().and_then(|stem| stem.to_str());
+        let claude_prefix = format!("{slug}-scan-index");
+        let Some(parent) = index_path.parent() else {
+            return false;
+        };
+        match std::fs::read_dir(parent) {
+            Ok(mut entries) => entries.any(|entry| match entry {
+                Ok(entry) => entry.file_name().to_str().is_some_and(|name| {
+                    name.contains(".corrupt.")
+                        && (own_stem.is_some_and(|stem| name.starts_with(stem))
+                            || name.starts_with(&claude_prefix))
+                }),
+                Err(_) => true,
+            }),
+            Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+        }
+    };
+    here || upload_progress.records_server_attested_upload() || quarantined_sibling()
+}
+
+/// Narrow the corruption stop to loss of this destination's own history.
+fn note_claude_index_rebuild_for_destination(
+    source: SnapshotSource,
+    loaded_fresh: bool,
+    backfill_state: &crate::backfill::BackfillState,
+    destination_namespace: &str,
+    upload_progress: &SnapshotUploadProgress,
+    index_path: &Path,
+    support_dir: &Path,
+) {
+    if source == SnapshotSource::ClaudeCode
+        && loaded_fresh
+        && claude_destination_history_here(
+            backfill_state,
+            destination_namespace,
+            upload_progress,
+            index_path,
+        )
+    {
+        crate::snapshots::note_claude_index_rebuild_stop(support_dir);
     }
 }
 
@@ -1603,10 +1639,13 @@ struct PermanentSnapshotRejection {
 mod ack_retention;
 mod head_conflict;
 mod progress_rows;
+mod telemetry_only;
 mod upload_context_resend;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SnapshotUploadProgress {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    telemetry_only: Option<Box<telemetry_only::Ledger>>,
     schema_version: u16,
     /// A routed source's progress rows; never serialized into the ledger.
     #[serde(skip)]
@@ -1724,6 +1763,7 @@ impl SnapshotUploadProgress {
     ) -> Self {
         Self {
             schema_version: SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION,
+            telemetry_only: None,
             rows: None,
             generation: 0,
             destination_namespace_hash,
@@ -2969,6 +3009,33 @@ impl SnapshotUploadProgress {
         record.disposition = SnapshotQuarantineDisposition::RetryPending;
         record.retry_after_unix_seconds = retry_after_unix_seconds;
         crate::snapshots::terminal_contract_retry::exhaust(record);
+    }
+
+    /// Outage custody: hold each body of the page that has no exact ACK, hold
+    /// or refusal of these exact bytes yet, as an ordinary retryable
+    /// quarantine until `retry_after_unix_seconds`. Returns how many were held.
+    fn hold_outage_bodies(
+        &mut self,
+        items: &[SnapshotItem],
+        retry_after_unix_seconds: u64,
+    ) -> usize {
+        let mut held = 0;
+        for item in items {
+            let fingerprint = item.snapshot_fingerprint.as_str();
+            let witness = snapshot_upload_body_witness(item);
+            if self.accepted_body_witnesses.get(fingerprint) == Some(&witness)
+                || self
+                    .quarantined_fingerprints
+                    .get(fingerprint)
+                    .is_some_and(|record| record.upload_body_witness.as_ref() == Some(&witness))
+                || self.refused_body(fingerprint, &witness)
+            {
+                continue;
+            }
+            self.quarantine_retryable_body(fingerprint, &witness, retry_after_unix_seconds);
+            held += 1;
+        }
+        held
     }
 
     fn retain_current_quarantines_with_diagnostics(
@@ -4533,6 +4600,23 @@ impl SyncCounts {
                     d.rollout_extents.reused_roots, d.rollout_extents.reloaded_roots,
                     d.session_index.reused_roots, d.session_index.reloaded_roots,
                     d.state_titles.absent_roots, d.sidecar_facts_heap_bytes));
+                let or_none = |cause: &'static str| if cause.is_empty() { "none" } else { cause };
+                line.push_str(&format!(
+                    " sidecar_reload_cause={} sidecar_keep_declined={}",
+                    or_none(d.sidecar_reload_cause),
+                    or_none(d.sidecar_keep_declined)
+                ));
+                for (input, homes) in ["state_5", "thread_history_1", "session_index"]
+                    .iter()
+                    .zip(d.sidecar_changed_homes)
+                {
+                    line.push_str(&format!(" {input}_changed={}", homes.count_ones()));
+                    if homes != 0 {
+                        let bits = (0..64u32).filter(|bit| homes & (1 << bit) != 0);
+                        let bits = bits.map(|bit| bit.to_string()).collect::<Vec<_>>();
+                        line.push_str(&format!(" {input}_changed_homes={}", bits.join(",")));
+                    }
+                }
             }
         }
         line
@@ -5082,6 +5166,7 @@ pub fn spawn_local_health_projection_sync(daemon: LocalDaemon) -> Result<()> {
                     );
                 }
             }
+            crate::control::reconcile_setup_scan_in_background(&daemon);
             std::thread::sleep(LOCAL_HEALTH_PROJECTION_INTERVAL);
         })
         .context("spawn local health projection sync")?;
@@ -5166,7 +5251,68 @@ fn reverify_backoff_delay(completed_attempts: u32) -> Duration {
 struct ReverifySchedule {
     source: SourceKind,
     completed_attempts: u32,
-    next_attempt_at: std::time::Instant,
+    next_attempt_at: Option<Instant>,
+    // Outer None is a transient failure; Some holds the last nonsecret auth marker.
+    reauth_marker: Option<Option<String>>,
+    verification_baseline: Option<Option<String>>,
+}
+
+impl ReverifySchedule {
+    fn new(source: SourceKind, now: Instant) -> Self {
+        Self {
+            source,
+            completed_attempts: 0,
+            next_attempt_at: Some(now + reverify_backoff_delay(0)),
+            reauth_marker: None,
+            verification_baseline: None,
+        }
+    }
+
+    fn observe_verification_baseline(&mut self, baseline: Option<Option<String>>) {
+        if self.verification_baseline != baseline {
+            self.reauth_marker = baseline.clone();
+            self.verification_baseline = baseline;
+            self.next_attempt_at = None;
+        }
+    }
+
+    fn is_due(&mut self, now: Instant, requires_reauth: bool, marker: Option<String>) -> bool {
+        if requires_reauth {
+            let Some(previous) = self.reauth_marker.as_mut() else {
+                self.reauth_marker = Some(marker);
+                self.next_attempt_at = None;
+                return false;
+            };
+            if marker.is_none() {
+                // Keep both the last known marker and any unconsumed retry.
+                // Unavailable reads neither create a retry nor discard one.
+                return false;
+            }
+            if *previous != marker {
+                // A new marker gets one attempt after the quiet window,
+                // even if that attempt still fails auth.
+                self.next_attempt_at = Some(now + reverify_backoff_delay(0));
+                *previous = marker;
+                return false;
+            }
+        } else if self.reauth_marker.take().is_some() {
+            self.completed_attempts = 0;
+            self.next_attempt_at = Some(now + reverify_backoff_delay(0));
+        }
+        if self.next_attempt_at.is_some_and(|deadline| now >= deadline) {
+            self.next_attempt_at = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn record_attempt(&mut self, now: Instant) {
+        self.completed_attempts = self.completed_attempts.saturating_add(1);
+        if self.reauth_marker.is_none() {
+            self.next_attempt_at = Some(now + reverify_backoff_delay(self.completed_attempts));
+        }
+    }
 }
 
 /// A blocking verification failure (`Failed` + `TelemetryNotVerified`) is
@@ -5176,6 +5322,8 @@ struct ReverifySchedule {
 /// though pressing Verify immediately healed it. Retry those sources
 /// automatically with exponential backoff so the state converges on its own;
 /// the companion app already self-heals once the daemon reports healthy.
+/// Provider sign-in failures stay quiet until the Default Claude credential's
+/// nonsecret modification marker changes. Other sources keep their existing backoff.
 pub fn spawn_failed_verification_reverify(daemon: LocalDaemon) -> Result<()> {
     std::thread::Builder::new()
         .name("ottto-failed-verify-retry".to_string())
@@ -5183,28 +5331,37 @@ pub fn spawn_failed_verification_reverify(daemon: LocalDaemon) -> Result<()> {
             let mut schedules: Vec<ReverifySchedule> = Vec::new();
             loop {
                 std::thread::sleep(FAILED_VERIFY_POLL_INTERVAL);
-                let failed = match daemon.sources_with_blocking_verification_failure() {
+                let failed = match daemon.blocking_verification_retry_states() {
                     Ok(failed) => failed,
                     Err(_) => continue,
                 };
                 // A source that healed (retry success, manual Verify, sign-in)
                 // drops its schedule so a future failure restarts the backoff
                 // from the initial delay.
-                schedules.retain(|schedule| failed.contains(&schedule.source));
-                for source in failed {
+                schedules
+                    .retain(|schedule| failed.iter().any(|(source, _)| source == &schedule.source));
+                for (source, requires_reauth) in failed {
                     let now = crate::scan_clock::now();
-                    let Some(schedule) = schedules
-                        .iter_mut()
-                        .find(|schedule| schedule.source == source)
-                    else {
-                        schedules.push(ReverifySchedule {
-                            source,
-                            completed_attempts: 0,
-                            next_attempt_at: now + reverify_backoff_delay(0),
+                    let index = schedules
+                        .iter()
+                        .position(|schedule| schedule.source == source)
+                        .unwrap_or_else(|| {
+                            schedules.push(ReverifySchedule::new(source.clone(), now));
+                            schedules.len() - 1
                         });
-                        continue;
+                    let schedule = &mut schedules[index];
+                    let marker = if requires_reauth && source == SourceKind::ClaudeCode {
+                        let Ok(baseline) = daemon.claude_verification_auth_marker() else {
+                            continue;
+                        };
+                        schedule.observe_verification_baseline(baseline);
+                        crate::agent_status::claude_credential_modified_marker(
+                            &ottto_core::ClaudeConfigDirSlot::Default,
+                        )
+                    } else {
+                        None
                     };
-                    if now < schedule.next_attempt_at {
+                    if !schedule.is_due(now, requires_reauth, marker) {
                         continue;
                     }
                     match crate::control::reverify_failed_source(&daemon, source.clone()) {
@@ -5218,9 +5375,7 @@ pub fn spawn_failed_verification_reverify(daemon: LocalDaemon) -> Result<()> {
                             crate::source_slug(&source)
                         ),
                     }
-                    schedule.completed_attempts = schedule.completed_attempts.saturating_add(1);
-                    schedule.next_attempt_at = crate::scan_clock::now()
-                        + reverify_backoff_delay(schedule.completed_attempts);
+                    schedule.record_attempt(crate::scan_clock::now());
                 }
             }
         })
@@ -5424,6 +5579,7 @@ fn retry_ordinary_owned(item: &SnapshotItem) -> Option<SnapshotItem> {
         return None;
     }
     Some(SnapshotItem {
+        evidence_basis: None,
         request_evidence: Vec::new(),
         request_identity_refusals: 0,
         claude_org_markers: None,
@@ -6569,7 +6725,7 @@ fn prepare_sync_source_inner(
         );
         return Ok(None);
     }
-    let scan_started_at = current_rfc3339();
+    let mut scan_started_at = current_rfc3339();
     let relay_token = client.issue_status_relay_token(device, device_secret, source)?;
     let mut activity_hint = small_source_upload(source, || client.get_activity_hint(&relay_token))?;
     // Treat the activity hint as the only authority for the semantic evidence
@@ -6783,6 +6939,20 @@ fn prepare_sync_source_inner(
         &upload_destination_namespace,
         crate::snapshots::snapshot_quarantine_witness_for_context(source, &upload_context),
     )?;
+    let first_census_end = crate::backfill::record_first_census(
+        support_dir,
+        source,
+        &upload_destination_namespace,
+        &scan_started_at,
+        load_origin == crate::snapshots::ScanIndexLoadOrigin::Missing,
+    )?;
+    // Missing-index import stays at generation zero until the first collection save.
+    // A restart after the anchor save must admit against that same census end.
+    if index.generation == 0 {
+        if let Some(anchor) = first_census_end {
+            scan_started_at = anchor;
+        }
+    }
     if source == SnapshotSource::ClaudeCode {
         daemon.transcript_cache.bind_withheld(&mut index);
     }
@@ -6837,6 +7007,15 @@ fn prepare_sync_source_inner(
             support_dir,
         )
     });
+    note_claude_index_rebuild_for_destination(
+        source,
+        claude_index_loaded_fresh,
+        &backfill_state,
+        &upload_destination_namespace,
+        &upload_progress,
+        &index_path,
+        support_dir,
+    );
     if let Some(prior) = prior_claude_history {
         crate::snapshots::note_prior_history_unverified(
             prior == crate::snapshots::PriorHistory::Unverified,
@@ -6852,6 +7031,7 @@ fn prepare_sync_source_inner(
     // scan window (StateMissing H1, N2).
     let backfill_pending =
         backfill_replay_pending(source, &backfill_state, &upload_destination_namespace);
+    index.first_read_pending = backfill_pending;
     if !backfill_pending
         && index.prepare_snapshot_admission_reoffer(SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE)
     {
@@ -7673,9 +7853,17 @@ fn finish_sync_source(
             &index,
             machine_id,
         );
+        let telemetry_window = upload_progress.seed_telemetry(
+            support_dir,
+            &activity_hint,
+            &mut scan_result,
+            &index,
+            &upload_progress_path,
+        )?;
         upload_progress.load_identity(
             (scan_result.snapshots.iter()).map(|item| item.source_session_id.as_str()),
         )?;
+        let mut telemetry_ledger = upload_progress.telemetry_only.take();
         let reserve_cache_bytes = |item: &SnapshotItem| {
             if cache_observations_enabled {
                 identity_cache_wire_reserve(item, &upload_progress, cache_full_replacement)
@@ -7693,7 +7881,15 @@ fn finish_sync_source(
                     max_item_bytes: identity_item_cap,
                     reservation: Some(&reserve_cache_bytes),
                 },
+                telemetry_window.zip(telemetry_ledger.as_deref_mut()),
             );
+        upload_progress.telemetry_only = telemetry_ledger;
+        scan_result.queue_side_call_hints(
+            &mut index,
+            claude_scan_roots.as_deref().unwrap_or_default(),
+            receipt_window_days,
+            &mut disposition,
+        );
         // Copy-derived rows (#944): the bodies just built treat these
         // rows as never accepted; the ledger records that durably before any
         // upload, so a lost reply or restart cannot restore their proof.
@@ -8181,6 +8377,9 @@ fn finish_sync_source(
                 bootstrap_capacity_error =
                     Some(error.context("cache-head bootstrap ACK settlement pending"));
             }
+            // A probe outage owes the main uploader's outage custody and
+            // partial checkpoint below.
+            Err(error) if is_upload_outage(&error) => bootstrap_capacity_error = Some(error),
             Err(error) => return Err(error),
         }
         if bootstrap_capacity_error.is_none() {
@@ -8236,6 +8435,14 @@ fn finish_sync_source(
             "local snapshot upload answers {head_conflict_answers} head-CAS conflict challenge(s) for {} through the rescan handshake",
             source.api_slug()
         );
+    }
+    upload_progress.bind_telemetry_bodies(support_dir, &mut scan_result.snapshots);
+    if scan_result
+        .snapshots
+        .iter()
+        .any(|item| item.evidence_basis == Some("otel_only"))
+    {
+        upload_progress.save(&upload_progress_path)?;
     }
     let projected_pending_head_file_witnesses =
         upload_progress.pending_cache_head_file_witnesses(&index);
@@ -8340,6 +8547,34 @@ fn finish_sync_source(
             matches!(upload_result, Ok(ResumableUploadResult::Shed { .. })),
             source.api_slug(),
         );
+    }
+    // An outage (a transport failure, timeout or 5xx, or a plain shed) ends
+    // the pass before the server answered for every body. Hold each body with
+    // no exact ACK, hold or refusal in ordinary retryable custody, durably,
+    // before the partial checkpoint below: its files and heads then commit,
+    // and the next pass re-sends from the head instead of reading the file
+    // again. No ACK, refusal or loss is recorded; the entities stay owed.
+    let outage_retry_after = match &upload_result {
+        Ok(ResumableUploadResult::Shed { retry_after }) => Some(*retry_after),
+        Err(error) if is_upload_outage(error) => Some(None),
+        _ => None,
+    };
+    if let Some(retry_after) = outage_retry_after {
+        let before = upload_progress.clone();
+        let retry_at = current_unix_seconds().saturating_add(shed_backoff(retry_after).as_secs());
+        let held = upload_progress.hold_outage_bodies(&scan_result.snapshots, retry_at);
+        if held > 0 {
+            if upload_progress.save(&upload_progress_path).is_err() {
+                // Nothing durable changed: the page stays owed as before.
+                upload_progress = before;
+            } else {
+                crate::local_resource_diagnostics::traversal_point(
+                    "quarantine_retry",
+                    source.api_slug(),
+                    &serde_json::json!({"reason": "outage", "count": held}),
+                );
+            }
+        }
     }
 
     // Exact progress is durable before this seam. The same subsequent index
@@ -8515,6 +8750,7 @@ fn finish_sync_source(
                 client,
                 device,
                 device_secret,
+                support_dir,
                 source,
                 TerminalManifestSource::Withdraw,
                 CollectorStatus {
@@ -8543,6 +8779,7 @@ fn finish_sync_source(
                 client,
                 device,
                 device_secret,
+                support_dir,
                 source,
                 TerminalManifestSource::Withdraw,
                 CollectorStatus {
@@ -8700,6 +8937,7 @@ fn finish_sync_source(
                 client,
                 device,
                 device_secret,
+                support_dir,
                 source,
                 TerminalManifestSource::Withdraw,
                 CollectorStatus {
@@ -8964,6 +9202,7 @@ fn finish_sync_source(
             client,
             device,
             device_secret,
+            support_dir,
             source,
             if scan_result.census_complete {
                 TerminalManifestSource::CompleteCensus(&index)
@@ -8997,6 +9236,7 @@ fn finish_sync_source(
             client,
             device,
             device_secret,
+            support_dir,
             source,
             if scan_result.census_complete {
                 TerminalManifestSource::CompleteCensus(&index)
@@ -9258,6 +9498,7 @@ pub(crate) fn apply_claude_local_evidence_to_scan(
         index,
         None,
         Default::default(),
+        None,
     )
 }
 
@@ -9279,6 +9520,7 @@ pub(crate) fn apply_claude_local_evidence_to_scan_with_accepted_for_test(
         index,
         accepted_identity_buckets,
         Default::default(),
+        None,
     )
 }
 
@@ -9412,11 +9654,13 @@ fn pack_claude_evidence_families(
 
 /// What the chunks of one page share: its original carriers and the counters.
 struct ClaudeEvidencePage<'p> {
+    telemetry_window: Option<(telemetry_only::Window, &'p mut telemetry_only::Ledger)>,
     originals: &'p BTreeMap<String, crate::snapshots::SessionAccountEvidence>,
     request_owned_originals: &'p crate::snapshots::claude_request_identity::RequestOwnedOriginals,
     stats: ClaudeLocalEvidenceStats,
     /// Roots already counted: a scope root two chunks read counts once.
     counted_roots: BTreeSet<String>,
+    side_call_discovery: crate::snapshots::claude_request_money::e2::SideCallDiscovery,
 }
 
 /// The evidence stage over one page: its families are packed into chunks and
@@ -9429,6 +9673,7 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
     index: &mut ScanIndex,
     accepted_identity_buckets: Option<&crate::snapshots::claude_request_identity::AcceptedBuckets>,
     wire_budget: crate::snapshots::claude_request_identity::WireBudget<'_>,
+    telemetry_window: Option<(telemetry_only::Window, &mut telemetry_only::Ledger)>,
 ) -> (
     crate::snapshots::ClaudeUsageAuthorityDisposition,
     bool,
@@ -9450,6 +9695,7 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
             &scan_result.snapshots,
         );
     let mut page = ClaudeEvidencePage {
+        telemetry_window,
         originals: &originals,
         request_owned_originals: &request_owned_originals,
         stats: ClaudeLocalEvidenceStats {
@@ -9457,6 +9703,11 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
             ..Default::default()
         },
         counted_roots: BTreeSet::new(),
+        side_call_discovery: crate::snapshots::claude_request_money::e2::SideCallDiscovery::new(
+            scan_result
+                .completed_parses()
+                .map(|(key, _)| Path::new(key)),
+        ),
     };
     // The named fork parents, whatever route the copy decisions take.
     let fork_parents = crate::snapshots::claude_cross_root_evidence::EvidenceScope::fork_parents(
@@ -9553,6 +9804,9 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
     disposition
         .copy_invalidated
         .sort_by_key(|row| first_slot.get(row.session()).copied());
+    disposition
+        .side_call_hints
+        .extend(page.side_call_discovery.hints);
     let ClaudeEvidencePage { mut stats, .. } = page;
     for item in &scan_result.snapshots {
         if !item.source_session_id.contains("_agent-") {
@@ -9638,6 +9892,13 @@ fn apply_claude_local_evidence_chunk(
         crate::local_resource_diagnostics::EvidenceMem,
     ),
 ) -> crate::snapshots::ClaudeUsageAuthorityDisposition {
+    let synthetic_roots = scan_result
+        .snapshots
+        .iter()
+        .filter(|item| item.evidence_basis == Some("otel_only"))
+        .map(|item| item.source_session_id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut synthetic_healthy = BTreeSet::new();
     let builds_evidence = crate::snapshots::claude_request_identity::builds_evidence();
     let (originals, request_owned_originals) = (page.originals, page.request_owned_originals);
     let stats = &mut page.stats;
@@ -9829,6 +10090,9 @@ fn apply_claude_local_evidence_chunk(
             }
             continue;
         }
+        if synthetic_roots.contains(&root_session_id) && trace.rows_discarded.is_empty() {
+            synthetic_healthy.insert(root_session_id.clone());
+        }
         stats.complete_sidecar_root_count += 1;
         if request_owned(&root_session_id) {
             strict_healthy_roots.insert(root_session_id.clone());
@@ -9900,6 +10164,10 @@ fn apply_claude_local_evidence_chunk(
     let step = |stage: &'static str| {
         crate::local_resource_diagnostics::StageWindow::begin("claude_code", stage)
     };
+    let (synthetic, ordinary): (Vec<_>, Vec<_>) = std::mem::take(&mut scan_result.snapshots)
+        .into_iter()
+        .partition(|item| item.evidence_basis == Some("otel_only"));
+    scan_result.snapshots = ordinary;
     let window = step("evidence_side_calls");
     // `e2` side calls need the trace-named owner, so they follow the trace read.
     let side_calls_unresolved = crate::snapshots::claude_request_money::e2::side_calls_page(
@@ -9907,6 +10175,7 @@ fn apply_claude_local_evidence_chunk(
         &api_report,
         &trace_report,
         index,
+        &mut page.side_call_discovery,
     );
     let trace_discard_unfolded = {
         // Reuse the per-root read verdict before identity consumes it. Missing
@@ -10060,6 +10329,32 @@ fn apply_claude_local_evidence_chunk(
     drop(window);
     drop(identity_evidence);
     drop(cross);
+    if let Some((window, ledger)) = page.telemetry_window.as_mut() {
+        scan_result.snapshots.extend(
+            synthetic
+                .into_iter()
+                .filter(|item| synthetic_healthy.contains(&item.source_session_id))
+                .filter_map(|item| {
+                    let root = item.source_session_id.clone();
+                    match telemetry_only::build(
+                        item,
+                        &api_report,
+                        &trace_report,
+                        index,
+                        *window,
+                        accepted_identity_buckets,
+                        wire_budget,
+                    ) {
+                        Ok(Some(item)) => Some(item),
+                        Ok(None) => {
+                            ledger.settle(&root);
+                            None
+                        }
+                        Err(()) => None,
+                    }
+                }),
+        );
+    }
     // Qualification above was the last row reader.
     drop(api_report);
     drop(trace_report);
@@ -10264,6 +10559,14 @@ fn is_shed_failure(error: &anyhow::Error) -> bool {
         .is_some_and(|diagnostics| diagnostics.status_family() == "http_429")
 }
 
+/// The server never answered the page: a transport failure, a timeout or a
+/// 5xx. A plain shed arrives as `ResumableUploadResult::Shed` instead.
+fn is_upload_outage(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<UploadFailureDiagnostics>()
+        .is_some_and(UploadFailureDiagnostics::is_outage)
+}
+
 fn is_snapshot_batch_split_failure(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<UploadFailureDiagnostics>()
@@ -10452,6 +10755,13 @@ where
 enum SnapshotPageOutcome {
     Settled { conflicted: usize, isolated: usize },
     Disabled(Option<String>),
+}
+
+/// Diagnostics only (`change_reason`): an unchanged ACK without a basis
+/// (the stored body itself) or with `usage_identical` settles identical
+/// usage; an accepted one never does.
+fn ack_usage_identical(unchanged: bool, basis: Option<&str>) -> bool {
+    unchanged && matches!(basis, None | Some("usage_identical"))
 }
 
 // Scratch extraction only: the upload callback remains the existing canonical
@@ -10691,15 +11001,21 @@ where
             .filter(|entity| entity.unchanged_basis.is_none())
             .map(|entity| (entity.snapshot_fingerprint.as_str(), entity))
             .collect::<BTreeMap<_, _>>();
-        for entity in response
+        for (entity, unchanged) in response
             .accepted_entities
             .iter()
-            .chain(&response.unchanged_entities)
+            .map(|entity| (entity, false))
+            .chain(
+                response
+                    .unchanged_entities
+                    .iter()
+                    .map(|entity| (entity, true)),
+            )
         {
             crate::local_resource_diagnostics::change_reason::settled(
                 poison_scope,
                 &entity.snapshot_fingerprint,
-                entity.unchanged_basis.as_deref() == Some("usage_identical"),
+                ack_usage_identical(unchanged, entity.unchanged_basis.as_deref()),
             );
         }
         for index in indices {
@@ -10708,6 +11024,7 @@ where
             if settled.contains(item_fingerprint) {
                 let witness = body_witness(item);
                 progress.record_body(item_fingerprint, &witness);
+
                 if let Some(context) = &progress.context_resend.active {
                     progress
                         .accepted_body_contexts
@@ -10768,6 +11085,7 @@ where
                         rejection.safe_reason(),
                     );
                     progress.note_refused_exposure(item_fingerprint, item);
+                    progress.settle_telemetry_root(&rejection.source_session_id);
                 } else {
                     // Any validated non-permanent answer keeps only this
                     // entity owed. Accepted siblings settle independently.
@@ -11738,6 +12056,7 @@ fn collector_status_request(
         last_snapshot_unproven_terminal_count: status.counts.snapshot_unproven_terminal_count,
         last_snapshot_superseded_terminal_count: status.counts.snapshot_superseded_terminal_count,
         last_backfill_window_days: status.counts.backfill_window_days,
+        first_read_cutoff: None,
         last_backfill_file_limit: status.counts.backfill_file_limit,
         last_discovered_file_count: status.counts.discovered_file_count,
         last_skipped_file_count_due_to_limit: status.counts.skipped_file_count_due_to_limit,
@@ -11882,6 +12201,7 @@ fn report_status_with_fresh_relay_token(
     client: &SnapshotApiClient,
     device: &LocalDeviceBinding,
     device_secret: &str,
+    support_dir: &Path,
     source: SnapshotSource,
     manifest_source: TerminalManifestSource<'_>,
     mut status: CollectorStatus<'_>,
@@ -11912,11 +12232,13 @@ fn report_status_with_fresh_relay_token(
     // Keep non-blocking cooldown debt beside the terminal census counters on
     // every report, even when the re-offer work summary is unchanged/quiet.
     eprintln!("{}", status.counts.terminal_census_line(source.api_slug()));
-    let request = collector_status_request(
+    let mut request = collector_status_request(
         &destination_namespace,
         status,
         census_residue_status_admitted,
     )?;
+    request.first_read_cutoff = load_backfill_state(support_dir)
+        .first_read_cutoff(&destination_namespace, source.api_slug());
     small_source_upload(source, || client.report_status(&relay_token, &request))?;
     // Content-free, after a successful send: the closed error-code slug and
     // enabled flag, once per change per source (and once after start).
@@ -11958,6 +12280,7 @@ fn withdraw_and_report_policy_stop(
         client,
         device,
         device_secret,
+        support_dir,
         source,
         TerminalManifestSource::Withdraw,
         status,
@@ -12042,6 +12365,7 @@ fn report_checkin_status(
         last_snapshot_unproven_terminal_count: 0,
         last_snapshot_superseded_terminal_count: 0,
         last_backfill_window_days: receipt_window_days,
+        first_read_cutoff: None,
         last_backfill_file_limit: 0,
         last_discovered_file_count: 0,
         last_skipped_file_count_due_to_limit: 0,
@@ -13005,6 +13329,123 @@ pub(crate) use tests::codex_archive_tests::{
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn provider_reauth_retries_once_per_default_login_marker_change() {
+        for initial in [None, Some("original".to_string())] {
+            let now = Instant::now();
+            let mut schedule = ReverifySchedule::new(SourceKind::ClaudeCode, now);
+            for minute in 0..=180 {
+                assert!(!schedule.is_due(
+                    now + Duration::from_secs(minute * 60),
+                    true,
+                    initial.clone()
+                ));
+            }
+            let changed_at = now + Duration::from_secs(181 * 60);
+            assert!(!schedule.is_due(changed_at, true, Some("new".into())));
+            assert!(!schedule.is_due(
+                changed_at + Duration::from_secs(60),
+                true,
+                Some("new".into())
+            ));
+            assert!(schedule.is_due(
+                changed_at + FAILED_VERIFY_RETRY_INITIAL,
+                true,
+                Some("new".into())
+            ));
+            schedule.record_attempt(changed_at + FAILED_VERIFY_RETRY_INITIAL);
+            for minute in 184..=360 {
+                assert!(!schedule.is_due(
+                    now + Duration::from_secs(minute * 60),
+                    true,
+                    Some("new".into())
+                ));
+            }
+            // Restart establishes a baseline; it must not replay a consumed change.
+            let mut restarted = ReverifySchedule::new(SourceKind::ClaudeCode, now);
+            assert!(!restarted.is_due(now, true, Some("new".into())));
+            assert!(!restarted.is_due(now + FAILED_VERIFY_RETRY_MAX, true, Some("new".into())));
+        }
+    }
+
+    #[test]
+    fn provider_reauth_pending_retry_survives_absence_and_observes_quiet_window() {
+        let now = Instant::now();
+        let mut schedule = ReverifySchedule::new(SourceKind::ClaudeCode, now);
+        assert!(!schedule.is_due(now, true, Some("old".into())));
+        assert!(!schedule.is_due(now, true, Some("new".into())));
+        assert!(!schedule.is_due(now + FAILED_VERIFY_RETRY_INITIAL, true, None));
+        assert!(!schedule.is_due(now + FAILED_VERIFY_RETRY_MAX, true, None));
+        let now = now + FAILED_VERIFY_RETRY_MAX;
+        assert!(schedule.is_due(now, true, Some("new".into())));
+        schedule.record_attempt(now);
+        assert!(!schedule.is_due(now, true, Some("newer".into())));
+        let changed_at = now + Duration::from_secs(60);
+        assert!(!schedule.is_due(changed_at, true, Some("latest".into())));
+        assert!(!schedule.is_due(
+            now + FAILED_VERIFY_RETRY_INITIAL,
+            true,
+            Some("latest".into())
+        ));
+        assert!(schedule.is_due(
+            changed_at + FAILED_VERIFY_RETRY_INITIAL,
+            true,
+            Some("latest".into())
+        ));
+    }
+
+    #[test]
+    fn sign_in_before_first_poll_uses_pre_verification_baseline() {
+        let now = Instant::now();
+        let mut schedule = ReverifySchedule::new(SourceKind::ClaudeCode, now);
+        schedule.observe_verification_baseline(Some(None));
+        assert!(!schedule.is_due(now, true, Some("signed-in".into())));
+        schedule.observe_verification_baseline(Some(None));
+        assert!(schedule.is_due(
+            now + FAILED_VERIFY_RETRY_INITIAL,
+            true,
+            Some("signed-in".into())
+        ));
+        schedule.record_attempt(now + FAILED_VERIFY_RETRY_INITIAL);
+        // A manual check already tried the changed login: consume its pending retry.
+        let now = now + FAILED_VERIFY_RETRY_MAX;
+        assert!(!schedule.is_due(now, true, Some("next-login".into())));
+        schedule.observe_verification_baseline(Some(Some("next-login".into())));
+        assert!(!schedule.is_due(
+            now + FAILED_VERIFY_RETRY_MAX,
+            true,
+            Some("next-login".into())
+        ));
+    }
+
+    #[test]
+    fn unavailable_auth_marker_does_not_rearm_the_same_login() {
+        let now = Instant::now();
+        let mut schedule = ReverifySchedule::new(SourceKind::ClaudeCode, now);
+        assert!(!schedule.is_due(now, true, Some("same".into())));
+        assert!(!schedule.is_due(now, true, None));
+        assert!(!schedule.is_due(now, true, Some("same".into())));
+        assert!(!schedule.is_due(now + FAILED_VERIFY_RETRY_MAX, true, Some("same".into())));
+    }
+
+    #[test]
+    fn transient_verification_failures_keep_exponential_backoff() {
+        let mut now = Instant::now();
+        let mut schedule = ReverifySchedule::new(SourceKind::ClaudeCode, now);
+        for minutes in [2, 4, 8, 16, 30, 30] {
+            assert!(!schedule.is_due(now, false, None));
+            let due = now + Duration::from_secs(minutes * 60);
+            assert!(!schedule.is_due(due - Duration::from_secs(1), false, None));
+            assert!(schedule.is_due(due, false, None));
+            schedule.record_attempt(due);
+            now = due;
+        }
+        // A transient failure following a sign-in failure resumes normal backoff.
+        assert!(!schedule.is_due(now, true, None));
+        assert!(!schedule.is_due(now, false, None));
+        assert!(schedule.is_due(now + FAILED_VERIFY_RETRY_INITIAL, false, None));
+    }
+
     mod upload_error_tests {
         include!("snapshot_sync/upload_error_tests.rs");
     }
@@ -20081,6 +20522,7 @@ mod tests {
             &client,
             &device,
             "device-secret",
+            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             TerminalManifestSource::Withdraw,
             CollectorStatus {
@@ -20114,8 +20556,54 @@ mod tests {
         }
     }
 
-    /// Capture the wire body of one liveness beat, with or without a
-    /// cycle-start clock.
+    #[test]
+    #[serial(source_manifests)]
+    fn terminal_scan_status_reads_the_durable_first_census_cutoff() {
+        let _guard = SourceManifestTestGuard::new();
+        let support = test_terminal_status_support_dir();
+        let destination =
+            snapshot_upload_destination_namespace(&report_kind_test_device(), "device-secret");
+        for source in [
+            SnapshotSource::ClaudeCode,
+            SnapshotSource::Codex,
+            SnapshotSource::Pi,
+        ] {
+            let absent = captured_terminal_receipt_for_source_under_hint(
+                source,
+                SyncCounts::for_policy(183),
+                CollectorState::Success,
+                TerminalManifestSource::Withdraw,
+                183,
+                "",
+            );
+            assert!(absent.get("first_read_cutoff").is_none());
+            crate::backfill::record_first_census(
+                support,
+                source,
+                &destination,
+                "2026-11-12T12:00:00Z",
+                true,
+            )
+            .unwrap();
+            for width in [30, 183] {
+                let present = captured_terminal_receipt_for_source_under_hint(
+                    source,
+                    SyncCounts::for_policy(width),
+                    CollectorState::Success,
+                    TerminalManifestSource::Withdraw,
+                    width,
+                    "",
+                );
+                assert_eq!(present["first_read_cutoff"], "2026-09-13T12:00:00.000Z");
+                assert_eq!(present["last_backfill_window_days"], width);
+                assert!(present.get("first_read").is_none());
+            }
+            let beat = captured_checkin_receipt(None);
+            assert!(beat.get("first_read_cutoff").is_none());
+        }
+    }
+
+    /// Capture the wire body of one liveness beat, with or without a cycle-start clock.
     fn captured_checkin_receipt(scan_started_at: Option<&str>) -> serde_json::Value {
         let captured = Arc::new(Mutex::new(Vec::new()));
         let client = SnapshotApiClient::new(snapshot_status_server(captured.clone()));
@@ -20178,6 +20666,7 @@ mod tests {
             &client,
             &report_kind_test_device(),
             "device-secret",
+            test_terminal_status_support_dir(),
             source,
             manifest_source,
             CollectorStatus {
@@ -21467,6 +21956,7 @@ mod tests {
             &client,
             &device,
             "synthetic-secret",
+            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             TerminalManifestSource::Withdraw,
             CollectorStatus {
@@ -21533,6 +22023,7 @@ mod tests {
             &client,
             &device,
             "device-secret",
+            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             TerminalManifestSource::Withdraw,
             CollectorStatus {
@@ -21666,6 +22157,7 @@ mod tests {
             &client,
             &device,
             "device-secret",
+            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             TerminalManifestSource::CompleteCensus(&index),
             CollectorStatus {
@@ -21772,6 +22264,7 @@ mod tests {
                 &client,
                 &device,
                 "device-secret",
+                test_terminal_status_support_dir(),
                 SnapshotSource::Codex,
                 TerminalManifestSource::Withdraw,
                 CollectorStatus {
@@ -22000,6 +22493,7 @@ mod tests {
             &client,
             &device,
             "device-secret",
+            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             TerminalManifestSource::CompleteCensus(&index),
             CollectorStatus {
@@ -22052,6 +22546,7 @@ mod tests {
             &client,
             &device,
             "device-secret",
+            test_terminal_status_support_dir(),
             SnapshotSource::Codex,
             TerminalManifestSource::CompleteCensus(&index),
             CollectorStatus {
@@ -22672,9 +23167,15 @@ mod tests {
     include!("snapshot_sync/claude_request_census_pipeline_tests.rs");
     mod history_upgrade_pipeline_tests {
         include!("snapshot_sync/history_upgrade_pipeline_tests.rs");
+        mod first_read_latch_tests {
+            include!("snapshot_sync/first_read_latch_tests.rs");
+        }
     }
     pub(in crate::snapshot_sync) mod claude_money_e2_pipeline_tests {
         include!("snapshot_sync/claude_money_e2_pipeline_tests.rs");
+        mod telemetry_only_oracle_tests {
+            include!("snapshot_sync/telemetry_only/oracle_tests.rs");
+        }
         #[cfg(unix)]
         mod privacy_flip_money_tests {
             include!("snapshot_sync/privacy_flip_money_tests.rs");
@@ -22682,6 +23183,9 @@ mod tests {
         #[cfg(unix)]
         mod claude_first_request_login_tests {
             include!("snapshot_sync/claude_first_request_login_tests.rs");
+            mod first_read_latch_money_tests {
+                include!("snapshot_sync/first_read_latch_money_tests.rs");
+            }
         }
         #[cfg(unix)]
         mod claude_login_only_org_tests {
@@ -24674,7 +25178,7 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, rows, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_body_contexts, context_resend, ack_capacity, retained_stale_ack_count, accepted_cache_states, accepted_identity_buckets, accepted_identity_scope, accepted_cache_heads, pending_cache_heads, head_conflict_challenges, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts, terminal_contract_retry_pending_save, fresh_context_body_acks, context_receipt_candidates);
+crate::heap_layout_bound::fields!(SnapshotUploadProgress; telemetry_only, schema_version, rows, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_body_contexts, context_resend, ack_capacity, retained_stale_ack_count, accepted_cache_states, accepted_identity_buckets, accepted_identity_scope, accepted_cache_heads, pending_cache_heads, head_conflict_challenges, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts, terminal_contract_retry_pending_save, fresh_context_body_acks, context_receipt_candidates);
 
 crate::heap_layout_bound::fields!(PendingCacheHeadFile; source_file_fingerprint, group_fingerprint, entities, reselected_heads, settled_entities);
 

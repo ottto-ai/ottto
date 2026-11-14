@@ -1153,6 +1153,44 @@ fn maintenance_cache_counters_are_optional_counts() {
     }
 }
 
+/// [regress] A write transaction prints one maintenance row, after its commit;
+/// that row counts every cache access since the previous printed row, once.
+#[test]
+fn write_transaction_prints_only_the_commit_maintenance_row() {
+    let tmp = Scratch::new();
+    let mut db = tmp.live_store();
+    let key = traversal("one".into());
+    let mut between = 0;
+    let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+        for generation in 0..2 {
+            let mut tx = db.begin(TxnMode::Write).unwrap();
+            put(&mut tx, &key, b"x");
+            let next = DurableCommitOutcome::Committed(generation + 1);
+            assert_eq!(tx.commit(generation, generation + 1), next);
+            if generation == 0 {
+                for _ in 0..200 {
+                    db.begin(TxnMode::Read).unwrap().get(&key).unwrap();
+                }
+                between = db.cache_accesses_for_test();
+            }
+        }
+    });
+    let stats: Vec<_> = rows
+        .iter()
+        .filter(|r| r["counts"].get("cache_used_bytes").is_some())
+        .collect();
+    assert_eq!(stats.len(), 2, "{rows:?}");
+    let accesses = |r: &serde_json::Value| {
+        r["counts"]["cache_hit"].as_u64().unwrap() + r["counts"]["cache_miss"].as_u64().unwrap()
+    };
+    // The second commit's row includes the reads after the first commit.
+    assert!(
+        between >= 200 && accesses(stats[1]) >= between,
+        "{between} {rows:?}"
+    );
+    assert!(db.cache_accesses_for_test() < between, "printed rows reset");
+}
+
 /// [behaviour] idle maintenance emits counts once per day.
 #[test]
 fn store_growth_gauge_is_daily_and_counts_only() {

@@ -269,6 +269,7 @@ impl ScanIndex {
             }),
             decode_holds: self.decode_holds.clone(),
             withheld_memo: self.withheld_memo.clone(),
+            first_read_pending: self.first_read_pending,
             schema_version: SCAN_INDEX_SCHEMA_VERSION,
             generation: previous.generation,
             upload_ack_retirement_handoff: previous.upload_ack_retirement_handoff.clone(),

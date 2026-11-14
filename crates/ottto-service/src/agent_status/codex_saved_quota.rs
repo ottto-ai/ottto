@@ -12,7 +12,7 @@
 //! Schedule per home:
 //! - in use on this Mac (a Codex process held a rollout in the home, or a
 //!   session that belongs to it was written, in the last 30 min): every 5 min;
-//! - otherwise every 15 min;
+//! - otherwise every 30 min;
 //! - a failed read waits the same interval before the next attempt;
 //! - a changed local login (the credential names another account or
 //!   workspace than at the last read) is read again after at least 1 min;
@@ -22,9 +22,9 @@
 //! signed into the same account and workspace). They share one quota, so one
 //! of them reads for both: the default home when it is one of them, else the
 //! one with the lowest home key. Its interval is the in-use one when any of
-//! them is in use; the others are read by themselves only once a day (their
-//! own tokens stay refreshed and a dead login there is noticed), and their
-//! status serves the reader's reading. Homes hold the same login only while
+//! them is in use; the others are read by themselves only once a day (each
+//! read lets Codex refresh that home's own login when due, and a dead login
+//! there is noticed), and their status serves the reader's reading. Homes hold the same login only while
 //! both their saved readings and their current credentials name the same
 //! account and workspace, and their latest reads did not fail; anything else
 //! is read on its own, as before.
@@ -51,9 +51,9 @@
 //! checks still read; saved readings are served and age as usual.
 //!
 //! A login is the account and workspace the home's credential names, not the
-//! `auth.json` file: each provider read refreshes the token, so Codex rewrites
-//! that file on every read. Only a credential that names no account falls back
-//! to the file's metadata. A saved reading or failure is served only while the
+//! `auth.json` file: each provider read lets Codex refresh the token when due,
+//! and Codex then rewrites that file. Only a credential that names no account
+//! falls back to the file's metadata. A saved reading or failure is served only while the
 //! home's login is the one it was read under, so it never moves to another
 //! login. A reading carries identity hashes only.
 
@@ -82,13 +82,14 @@ use super::{
     codex_credential_claimed_binding, codex_credit_grants, codex_home_slots_checked,
     codex_last_known, current_unix_seconds, default_codex_home, empty_codex_accounts_status,
     mark_quota_meters_stale, read_codex_auth_credentials_at, read_codex_usage_from_provider,
-    unsupported_account, CodexHomeSlot, CodexIdentityHashes, CodexLoginRefresh, CodexUsageProbe,
+    unsupported_account, CodexHomeSlot, CodexIdentityHashes, CodexUsageProbe,
+    CODEX_NO_ACCOUNT_FAILURE_PREFIX,
 };
 
 /// In use on this Mac: one provider read per 5 min.
 pub(super) const IN_USE_REFRESH_SECONDS: u64 = 5 * 60;
-/// Not in use: one provider read per 15 min.
-pub(super) const UNUSED_REFRESH_SECONDS: u64 = 15 * 60;
+/// Not in use: one provider read per 30 min.
+pub(super) const UNUSED_REFRESH_SECONDS: u64 = 30 * 60;
 /// A home is in use while its latest session or process sighting is this
 /// recent.
 pub(super) const IN_USE_WINDOW_SECONDS: u64 = 30 * 60;
@@ -97,8 +98,8 @@ pub(super) const EXPLICIT_REFRESH_MIN_GAP_SECONDS: u64 = 60;
 /// A changed local login is read again after at least this long.
 const LOGIN_CHANGED_MIN_GAP_SECONDS: u64 = 60;
 /// A home that holds the same login as the home reading for it is still read
-/// by itself this often: each read refreshes that home's own tokens, and a
-/// login that died there (revoked, signed out elsewhere) shows as its own
+/// by itself this often: each read lets Codex refresh that home's own tokens
+/// when due, and a login that died there (revoked, signed out elsewhere) shows as its own
 /// failed read within a day instead of hiding behind the other home's
 /// readings.
 const SAME_LOGIN_KEEPALIVE_SECONDS: u64 = 24 * 60 * 60;
@@ -118,6 +119,9 @@ const PLANNED_ENTRIES_MAX: usize = 64;
 /// A served reading older than this (two unused intervals: the schedule
 /// failed to run) is labelled stale.
 const SERVED_FRESH_MAX_AGE_SECONDS: u64 = 2 * UNUSED_REFRESH_SECONDS;
+// A saved reading counts as fresh, and admits a session launch, for at most
+// an hour.
+const _: () = assert!(SERVED_FRESH_MAX_AGE_SECONDS <= 60 * 60);
 /// Beyond this a saved reading is not served at all (the last-known cap).
 const SERVED_MAX_AGE_SECONDS: u64 = codex_last_known::LAST_KNOWN_MAX_AGE_SECS;
 /// A local clock this far behind a stored time means the clock stepped back.
@@ -189,24 +193,37 @@ fn auth_witness(home: &Path) -> Option<AuthWitness> {
 
 /// A home's local login: the account and workspace binding its credential
 /// claims, and `auth.json`'s metadata for a credential that claims none.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(super) struct LoginMark {
     /// [`codex_credit_grants::binding_key`] of the claimed identity hashes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     binding: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     auth: Option<AuthWitness>,
+    /// The binding the same credential names at any token age, from the same
+    /// read; never saved. A carried binding needs it ([`held_binding`]).
+    #[serde(skip)]
+    named: Option<String>,
 }
+
+/// Compares what is saved: `named` follows from the same file.
+impl PartialEq for LoginMark {
+    fn eq(&self, other: &Self) -> bool {
+        self.binding == other.binding && self.auth == other.auth
+    }
+}
+
+impl Eq for LoginMark {}
 
 impl LoginMark {
     /// The same login: the same claimed account and workspace. The file
-    /// metadata decides only when neither side claims one (a token rewrite
-    /// for the same account is not a new login).
+    /// metadata decides when either side claims none (a token rewrite for the
+    /// same account is not a new login, and an unchanged file is the same
+    /// login whether or not its tokens still live).
     pub(super) fn same_login(&self, other: &Self) -> bool {
         match (&self.binding, &other.binding) {
             (Some(own), Some(other)) => own == other,
-            (None, None) => self.auth == other.auth,
-            _ => false,
+            _ => self.auth == other.auth,
         }
     }
 
@@ -240,6 +257,7 @@ impl LoginMark {
                 modified_nanos: 0,
                 len: 1,
             }),
+            named: None,
         }
     }
 }
@@ -249,13 +267,13 @@ pub(super) fn login_mark(home: &Path, home_trust: CodexHomeTrust) -> LoginMark {
 }
 
 /// [`login_mark`], and how long it holds while `auth.json` is unchanged: a
-/// claimed binding lapses when the earliest of its tokens expires, a missing
-/// one stays missing. `None`: it may change without the file changing (the
-/// credential could not be read, or its tokens' expiry is unknown).
+/// claimed binding lapses when its access token expires, a missing one stays
+/// missing. `None`: it may change without the file changing (the credential
+/// could not be read, or its expiry is unknown).
 fn login_mark_lasting(home: &Path, home_trust: CodexHomeTrust) -> (LoginMark, Option<Lasts>) {
     let credentials = read_codex_auth_credentials_at(home, home_trust);
     let claimed = credentials.as_ref().ok().and_then(Option::as_ref);
-    let binding = claimed.and_then(codex_credential_claimed_binding);
+    let binding = claimed.and_then(|claimed| codex_credential_claimed_binding(claimed, true));
     let lasts = match (&credentials, &binding) {
         (Err(_), _) => None,
         (Ok(_), None) => Some(Lasts::WhileUnchanged),
@@ -266,6 +284,7 @@ fn login_mark_lasting(home: &Path, home_trust: CodexHomeTrust) -> (LoginMark, Op
     let mark = LoginMark {
         binding,
         auth: auth_witness(home),
+        named: claimed.and_then(|claimed| codex_credential_claimed_binding(claimed, false)),
     };
     (mark, lasts)
 }
@@ -493,6 +512,9 @@ pub(super) struct SavedCodexReading {
     /// The provider named a signed-in ChatGPT account in this read.
     #[serde(default)]
     provider_account_signed_in: bool,
+    /// The read succeeded with no account at all (`account: null`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    provider_account_absent: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     plan_type: Option<String>,
     #[serde(default)]
@@ -578,6 +600,7 @@ impl SavedCodexReading {
                 .map(CodexIdentityHashes::from)
                 .or_else(|| probe.saved_identity.clone()),
             provider_account_signed_in: probe.account.is_some(),
+            provider_account_absent: probe.provider_account_absent,
             plan_type: probe
                 .account
                 .as_ref()
@@ -608,6 +631,7 @@ impl SavedCodexReading {
             quota_windows: self.quota_windows.clone(),
             credit_balances: self.credit_balances.clone(),
             account,
+            provider_account_absent: self.provider_account_absent,
             identity: None,
             saved_identity: self.identity.clone(),
             credential_read_failed: self.credential_read_failed,
@@ -797,11 +821,55 @@ fn home_lock(home: &Path) -> Arc<Mutex<()>> {
     locks.entry(home_key(home)).or_default().clone()
 }
 
+/// Move the saved reading of a sign-in's staging home `from` to the slot
+/// home `to` its login was just published into (the same file, hard-linked),
+/// so `to` serves the verified reading at once. Call under `to`'s lock.
+pub(crate) fn adopt_saved_codex_reading(from: &Path, to: &Path) {
+    let support_dir = saved_quota_support_dir();
+    let Some(mut saved) = read_saved_at(&support_dir, from) else {
+        return;
+    };
+    saved.home_key = home_key(to);
+    write_saved_at(&support_dir, to, &saved);
+    let from_path = saved_path(&support_dir, from);
+    let _ = std::fs::remove_file(&from_path);
+    planned_cache(&PLANNED_SAVED).remove(&from_path);
+}
+
 /// Run `f` while no provider read of `home` runs: under the home's lock.
 pub(crate) fn with_codex_home_read_lock<T>(home: &Path, f: impl FnOnce() -> T) -> T {
     let lock_for_home = home_lock(home);
     let _guard = lock(&lock_for_home);
     f()
+}
+
+/// [`with_codex_home_read_lock`], waiting for the lock only until `deadline`:
+/// a free lock is taken at once; one that had to be waited for, only before
+/// `deadline`. `None`, with nothing run, otherwise.
+pub(crate) fn with_codex_home_read_lock_until<T>(
+    home: &Path,
+    deadline: Instant,
+    f: impl FnOnce() -> T,
+) -> Option<T> {
+    let lock_for_home = home_lock(home);
+    let mut waited = false;
+    let _guard = loop {
+        let guard = match lock_for_home.try_lock() {
+            Ok(guard) => Some(guard),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        };
+        let now = Instant::now();
+        match guard {
+            Some(guard) if !waited || now < deadline => break guard,
+            None if now < deadline => {
+                thread::sleep(crate::codex_sign_in::POLL_INTERVAL.min(deadline - now))
+            }
+            _ => return None,
+        }
+        waited = true;
+    };
+    Some(f())
 }
 
 fn lock(mutex: &Mutex<()>) -> MutexGuard<'_, ()> {
@@ -912,20 +980,30 @@ fn serve_same_login_reading(
 }
 
 /// The account and workspace a home holds now, from local files only: the
-/// ones its credential names, or, when it names none (its id token lives an
-/// hour, and only a read refreshes it), its saved reading's while its latest
-/// read did not fail and `auth.json` is unchanged since that read. An
-/// unchanged file still holds the login the provider validated, so this never
-/// takes one login for another.
+/// ones its live credential names, or, when its access token has expired
+/// (Codex refreshes it only when due, at a read or a session), its saved
+/// reading's while its latest read did not fail, `auth.json` is unchanged
+/// since that read and the credential still names that account and
+/// workspace. An unchanged file still holds the login the provider
+/// validated, so this never takes one login for another.
 fn held_binding(saved: Option<&SavedCodexQuota>, current: &LoginMark) -> Option<String> {
     if let Some(binding) = current.binding.as_ref() {
         return Some(binding.clone());
     }
     let saved = saved.filter(|saved| latest_read_succeeded(saved))?;
     let reading = saved.reading.as_ref()?;
-    (reading.login.auth.is_some() && reading.login.auth == current.auth)
-        .then(|| saved.binding())
-        .flatten()
+    let binding = saved.binding()?;
+    (reading.login.auth.is_some()
+        && reading.login.auth == current.auth
+        && current.named.as_ref() == Some(&binding))
+    .then_some(binding)
+}
+
+/// [`held_binding`] of a home now, for launch admission: from local files
+/// only, never a provider read.
+pub(super) fn held_launch_binding(home: &Path, home_trust: CodexHomeTrust) -> Option<String> {
+    let saved = read_saved_at(&saved_quota_support_dir(), home);
+    held_binding(saved.as_ref(), &login_mark(home, home_trust))
 }
 
 fn serve_saved_copy(
@@ -945,6 +1023,10 @@ fn serve_saved_copy(
         if saved.reading.as_ref().map_or(true, |reading| {
             failure.at_epoch_seconds >= reading.observed_at_epoch_seconds
         }) && failure.login.same_login(current)
+            // A dead login (the read named no account) lasts only until a
+            // sign-in rewrites the credential file, even for the same account.
+            && (!failure.message.starts_with(CODEX_NO_ACCOUNT_FAILURE_PREFIX)
+                || failure.login.same_credential_file(current))
             && servable_at(failure.at_epoch_seconds, now)
         {
             return Err(CodexQuotaFailure {
@@ -988,9 +1070,13 @@ fn reading_matches_login(
     match (saved.binding(), current.binding.as_ref()) {
         (Some(saved), Some(claimed)) => &saved == claimed,
         // The credential cannot name a binding (for example its access token
-        // expired) or the reading had none: only an unchanged auth file keeps
-        // the reading.
-        _ => reading.login.auth.is_some() && reading.login.auth == current.auth,
+        // expired) or the reading had none: only an unchanged auth file that
+        // still names the reading's binding, if any, keeps the reading.
+        (validated, _) => {
+            reading.login.auth.is_some()
+                && reading.login.auth == current.auth
+                && validated.map_or(true, |validated| current.named.as_ref() == Some(&validated))
+        }
     }
 }
 
@@ -1000,7 +1086,6 @@ fn reading_matches_login(
 pub(super) fn read_provider_and_save(
     home: &Path,
     home_trust: CodexHomeTrust,
-    login_refresh: CodexLoginRefresh,
     admit: impl FnOnce(Option<&SavedCodexQuota>, u64) -> bool,
 ) -> Option<Result<CodexUsageProbe, String>> {
     read_and_save_at(
@@ -1009,7 +1094,7 @@ pub(super) fn read_provider_and_save(
         home_trust,
         current_unix_seconds(),
         admit,
-        || read_codex_usage_from_provider(home, home_trust, login_refresh),
+        || read_codex_usage_from_provider(home, home_trust),
     )
 }
 
@@ -1027,8 +1112,8 @@ fn probe_binding(probe: &CodexUsageProbe) -> Option<String> {
 }
 
 /// Whether a read ran under one login from start to end. The read itself
-/// rewrites `auth.json` (it refreshes the token), so only a positively
-/// different account or workspace is a change. A credential that named none
+/// may rewrite `auth.json` (Codex refreshes the token when due), so only a
+/// positively different account or workspace is a change. A credential that named none
 /// before the read (an expired token) and names one after it is the same
 /// login when the read validated exactly that account. A credential that
 /// names none after the read is the same login unless the read validated
@@ -1112,6 +1197,37 @@ fn read_and_save_at(
     Some(result)
 }
 
+/// Test only: a provider read of the managed `home` that `read` answers,
+/// saved as [`read_provider_and_save`] saves one.
+#[cfg(test)]
+pub(super) fn save_read_for_test(
+    home: &Path,
+    read: impl FnOnce() -> Result<CodexUsageProbe, String>,
+) {
+    let now = current_unix_seconds();
+    let support_dir = saved_quota_support_dir();
+    let _ = read_and_save_at(
+        &support_dir,
+        home,
+        CodexHomeTrust::Managed,
+        now,
+        |_, _| true,
+        read,
+    );
+}
+
+/// Test only: `body` as `home`'s saved file (bytes another release wrote),
+/// with `{home_key}` replaced by the home's key.
+#[cfg(test)]
+pub(super) fn write_saved_bytes_for_test(home: &Path, body: &str) {
+    let support_dir = saved_quota_support_dir();
+    let path = saved_path(&support_dir, home);
+    let body = body.replace("{home_key}", &home_key(home));
+    restrict_state_dirs(&support_dir).unwrap();
+    ottto_core::write_owner_only_cache_file_atomic(&path, body.as_bytes()).unwrap();
+    planned_cache(&PLANNED_SAVED).remove(&path);
+}
+
 /// When a read finished: the wall clock, never before the trigger's clock.
 #[cfg(not(test))]
 fn read_finished_at(_support_dir: &Path, now: u64) -> u64 {
@@ -1138,7 +1254,7 @@ pub(super) fn refresh_interval_seconds(in_use: bool) -> u64 {
     }
 }
 
-/// [`scheduled_read_due_every`] at a home's own 5 or 15 minutes.
+/// [`scheduled_read_due_every`] at a home's own 5 or 30 minutes.
 #[cfg(test)]
 pub(super) fn scheduled_read_due(
     saved: Option<&SavedCodexQuota>,
@@ -1266,9 +1382,6 @@ pub(super) struct ScheduledHome {
     pub(super) home: PathBuf,
     pub(super) trust: CodexHomeTrust,
     pub(super) ownership: CodexAccountSlotOwnershipV1,
-    /// Whether the limits probe may refresh its login: a registered account
-    /// slot's home only, never a process-only home.
-    pub(super) login_refresh: CodexLoginRefresh,
     /// The account binding of its saved reading.
     pub(super) binding: Option<String>,
     /// Latest running-process sighting in this home.
@@ -1321,25 +1434,24 @@ pub(super) fn homes_in_use(
 /// every tick, so a removed slot leaves the schedule at once. The device's
 /// upload grant does not matter: the companion shows these readings locally.
 ///
-/// The home of a running daemon sign-in is left out, for the schedule and
-/// the explicit refresh alike: every read rewrites `auth.json`, and the
-/// sign-in decides by that file.
+/// The homes of a running daemon sign-in are left out, for the schedule and
+/// the explicit refresh alike: every read rewrites `auth.json`, the sign-in
+/// decides by its home's file, and the slot's home takes the new login when
+/// it is accepted.
 fn scheduled_homes(support_dir: &Path, now: u64) -> Vec<ScheduledHome> {
     let PlannedSlots { slots, signing_in } = planned_slots(now);
     let running = running_homes().clone();
     let mut homes = scheduled_homes_from(support_dir, slots, &running, now);
-    if let Some(signing_in) = signing_in {
-        homes.retain(|home| home_key(&home.home) != signing_in);
-    }
+    homes.retain(|home| !signing_in.contains(&home_key(&home.home)));
     homes
 }
 
-/// The slots the stored settings schedule, and the [`home_key`] of a running
-/// daemon sign-in's home.
+/// The slots the stored settings schedule, and the [`home_key`]s of a
+/// running daemon sign-in's homes: where `codex login` runs and the slot's.
 #[derive(Clone)]
 struct PlannedSlots {
     slots: Vec<CodexHomeSlot>,
-    signing_in: Option<String>,
+    signing_in: Vec<String>,
 }
 
 /// The stored settings' slots, kept while the settings file and every
@@ -1375,7 +1487,8 @@ fn stored_slots() -> (PlannedSlots, bool) {
     let signing_in = signing_in
         .ok()
         .flatten()
-        .map(|active| home_key(&active.home));
+        .map(|active| vec![home_key(&active.home), home_key(&active.slot_home)])
+        .unwrap_or_default();
     (PlannedSlots { slots, signing_in }, complete)
 }
 
@@ -1426,7 +1539,6 @@ fn scheduled_home(
             .as_ref()
             .and_then(SavedCodexQuota::binding),
         process_seen_at: running.get(&slot.home).copied(),
-        login_refresh: slot.login_refresh(),
         home: slot.home,
         trust,
         ownership: slot.ownership,
@@ -1572,7 +1684,7 @@ struct ScheduledRound {
     next_due_at: Option<u64>,
 }
 
-/// Each home's interval this round: its own 5 or 15 minutes, the in-use one
+/// Each home's interval this round: its own 5 or 30 minutes, the in-use one
 /// for a home that reads for others when any of them is in use, and the
 /// keep-alive for the homes it reads for. With the grouping.
 fn round_intervals(
@@ -1724,7 +1836,7 @@ fn scheduled_round_due(support_dir: &Path, now: u64) -> ScheduledRound {
             &sessions,
             now,
             || settings.background_quota_refresh_allowed_locked(),
-            |home| read_codex_usage_from_provider(&home.home, home.trust, home.login_refresh),
+            |home| read_codex_usage_from_provider(&home.home, home.trust),
         )
     };
     round.next_due_at = Some(
@@ -1772,7 +1884,7 @@ pub(crate) fn refresh_codex_quota_now(min_gap_seconds: u64) -> CodexExplicitRefr
         scheduled_homes(&support_dir, now),
         min_gap_seconds,
         now,
-        |home| read_codex_usage_from_provider(&home.home, home.trust, home.login_refresh),
+        |home| read_codex_usage_from_provider(&home.home, home.trust),
     )
 }
 
@@ -1949,6 +2061,7 @@ mod tests {
                 plan_type: Some("pro".to_string()),
                 ..unsupported_account("openai")
             }),
+            provider_account_absent: false,
             identity: None,
             saved_identity: Some(CodexIdentityHashes {
                 account_identifier_hash: account.to_string(),
@@ -2007,6 +2120,7 @@ mod tests {
     fn mark(binding: Option<&str>, modified_secs: u64) -> LoginMark {
         LoginMark {
             binding: binding.map(str::to_string),
+            named: binding.map(str::to_string),
             auth: Some(AuthWitness {
                 modified_secs,
                 modified_nanos: 0,
@@ -2084,7 +2198,12 @@ mod tests {
     fn saved_reading_round_trips_without_the_email() {
         use std::os::unix::fs::PermissionsExt;
         let root = scratch("round-trip");
-        let home = opaque_home(&root);
+        let home = root.join("home");
+        crate::test_scratch::create_private_dir(&home).unwrap();
+        // A saved identity is served only while the credential names it.
+        sign_in_home_with_id_token_lifetime(&home, "u1", "w", 3_600);
+        let account = ottto_core::billing_identity_hash("openai", "account", "u1").unwrap();
+        let workspace = ottto_core::billing_identity_hash("openai", "workspace", "w").unwrap();
         let now = current_unix_seconds();
         let read = read_and_save_at(
             &root,
@@ -2092,7 +2211,7 @@ mod tests {
             CodexHomeTrust::Managed,
             now,
             |_, _| true,
-            || Ok(probe("account-a", "workspace-a", &rfc3339(now))),
+            || Ok(probe(&account, &workspace, &rfc3339(now))),
         );
         assert!(matches!(read, Some(Ok(_))));
         let path = saved_path(&root, &home);
@@ -2106,7 +2225,7 @@ mod tests {
         );
 
         let served = serve_saved_at(&root, &home, CodexHomeTrust::Managed, now + 60).unwrap();
-        let original = probe("account-a", "workspace-a", &rfc3339(now));
+        let original = probe(&account, &workspace, &rfc3339(now));
         assert_eq!(served.quota_windows, original.quota_windows);
         assert_eq!(served.credit_balances, original.credit_balances);
         assert_eq!(served.saved_identity, original.saved_identity);
@@ -2120,14 +2239,60 @@ mod tests {
         assert_eq!(account.plan_type.as_deref(), Some("pro"));
         assert!(account.email.is_none());
 
-        // Old readings are labelled stale, then not served at all.
-        let stale = serve_saved_at(&root, &home, CodexHomeTrust::Managed, now + 31 * 60).unwrap();
+        // A reading is fresh for two unused intervals, then labelled stale
+        // (still naming its account), then not served at all. A slot whose
+        // reading is stale shows no limits.
+        let u = UNUSED_REFRESH_SECONDS;
+        let slot_status = |served: &CodexUsageProbe, at: u64| {
+            let mut snapshot = crate::agent_status::base_snapshot(
+                SourceKind::Codex,
+                ottto_protocol::AgentStatusState::Available,
+                ottto_protocol::AgentStatusCollectionMethod::CommandProbe,
+                rfc3339(at),
+                rfc3339(at),
+            );
+            let identity = served.saved_identity.clone().unwrap();
+            snapshot.account = Some(AgentAccountStatus {
+                login_state: AgentLoginState::SignedIn,
+                account_identifier_hash: Some(identity.account_identifier_hash),
+                organization_identifier_hash: Some(identity.workspace_identifier_hash),
+                ..unsupported_account("openai")
+            });
+            snapshot.quota_windows = served.quota_windows.clone();
+            crate::agent_status::codex_collection_status_from_snapshot(&snapshot)
+        };
+        let fresh = serve_saved_at(&root, &home, CodexHomeTrust::Managed, now + 2 * u).unwrap();
+        assert_eq!(
+            fresh.quota_windows[0].freshness,
+            AgentQuotaWindowFreshness::Fresh
+        );
+        assert!(slot_status(&fresh, now + 2 * u).quota_snapshot.is_some());
+        let stale = serve_saved_at(&root, &home, CodexHomeTrust::Managed, now + 2 * u + 1).unwrap();
         assert_eq!(
             stale.quota_windows[0].freshness,
             AgentQuotaWindowFreshness::Stale
         );
+        assert_eq!(stale.saved_identity, original.saved_identity);
+        let status = slot_status(&stale, now + 2 * u + 1);
+        assert_eq!(
+            status.state,
+            ottto_protocol::CodexAccountSlotCollectionStateV1::ProviderUnavailable
+        );
+        assert!(status.quota_snapshot.is_none());
         assert_eq!(
             served_error(&root, &home, now + 7 * 3_600),
+            Some(CODEX_QUOTA_NOT_READ_YET.to_string())
+        );
+        // A reading between one and two unused intervals old never stands for
+        // another account: once the credential names another login (here with
+        // an expired access token, so no live one), nothing is served and a
+        // launch gets no binding.
+        let saved = read_saved_at(&root, &home);
+        sign_in_home_with_lifetimes(&home, "u2", "w", -60, -60);
+        let switched = login_mark(&home, CodexHomeTrust::Managed);
+        assert_eq!(held_binding(saved.as_ref(), &switched), None);
+        assert_eq!(
+            served_error(&root, &home, now + u + u / 2),
             Some(CODEX_QUOTA_NOT_READ_YET.to_string())
         );
         let _ = std::fs::remove_dir_all(root);
@@ -2181,9 +2346,9 @@ mod tests {
     }
 
     /// The whole schedule over four homes: a home tied to a session or a
-    /// running process is read every 5 minutes, the others every 15, and a
-    /// removed slot is no longer read; its sessions then count for the
-    /// default home.
+    /// running process is read every 5 minutes, the others at the unused
+    /// interval, and a removed slot is no longer read; its sessions then
+    /// count for the default home.
     #[test]
     fn a_schedule_round_reads_homes_in_use_every_five_minutes_and_drops_removed_ones() {
         let root = scratch("round");
@@ -2232,25 +2397,31 @@ mod tests {
             read.sort();
             read
         };
+        let u = UNUSED_REFRESH_SECONDS;
         let all = [0, 1, 2, 3];
         assert_eq!(round(&all, start), ["busy", "default", "idle", "process"]);
         assert!(round(&all, start + 5 * 60 - 1).is_empty());
         assert_eq!(round(&all, start + 5 * 60), ["busy", "process"]);
         assert_eq!(round(&all, start + 10 * 60), ["busy", "process"]);
         assert_eq!(
-            round(&all, start + 15 * 60),
+            round(&all, start + u),
             ["busy", "default", "idle", "process"]
         );
         // "busy" is removed: never read again, and its session now counts for
         // the default home, which is read at the in-use interval.
-        assert_eq!(round(&[0, 2, 3], start + 20 * 60), ["default", "process"]);
-        assert!(round(&[0, 2, 3], start + 24 * 60).is_empty());
+        assert_eq!(
+            round(&[0, 2, 3], start + u + 5 * 60),
+            ["default", "process"]
+        );
+        assert!(round(&[0, 2, 3], start + u + 9 * 60).is_empty());
         let _ = std::fs::remove_dir_all(root);
     }
 
     /// A read that rewrites a credential naming no account, before or after
     /// (no account id, no current id_token): the rewrite is the read's own,
-    /// so the reading is kept and the next read waits the full interval.
+    /// so the reading is kept and the next read waits the full interval. A
+    /// credential that names no account carries none: the reading's account
+    /// is not served under it.
     #[test]
     fn a_read_that_rewrites_an_unnamed_credential_keeps_its_reading() {
         let root = scratch("unnamed-rewrite");
@@ -2277,7 +2448,7 @@ mod tests {
         let saved = read_saved_at(&root, &home).unwrap();
         assert!(saved.reading.is_some(), "the reading is kept");
         assert_eq!(saved.last_attempt_login, after);
-        assert!(serve_saved_at(&root, &home, CodexHomeTrust::Managed, now).is_ok());
+        assert!(serve_saved_at(&root, &home, CodexHomeTrust::Managed, now).is_err());
         for in_use in [true, false] {
             let interval = refresh_interval_seconds(in_use);
             assert!(!scheduled_read_due(Some(&saved), &after, in_use, now + 61));
@@ -2321,7 +2492,8 @@ mod tests {
         assert!(read_and_save_at(&root, &home, CodexHomeTrust::Managed, now, due, read).is_some());
         assert!(read_saved_at(&root, &home).is_none(), "nothing was written");
         // Later ticks inside the interval do not read again.
-        for tick in [15, 60, 14 * 60] {
+        let u = UNUSED_REFRESH_SECONDS;
+        for tick in [15, 60, u - 60] {
             assert!(
                 read_and_save_at(&root, &home, CodexHomeTrust::Managed, now + tick, due, read)
                     .is_none()
@@ -2331,7 +2503,7 @@ mod tests {
             &root,
             &home,
             CodexHomeTrust::Managed,
-            now + 15 * 60 + 1,
+            now + u + 1,
             due,
             read
         )
@@ -2344,7 +2516,7 @@ mod tests {
             &root,
             &home,
             CodexHomeTrust::Managed,
-            now + 15 * 60 + 30,
+            now + u + 30,
             explicit,
             read
         )
@@ -2437,6 +2609,7 @@ mod tests {
     #[test]
     fn a_round_tells_when_the_next_home_is_due() {
         let fixture = SameLoginFixture::new("next-due", &[("default", true, "u1", "w")]);
+        let u = UNUSED_REFRESH_SECONDS;
         let start = current_unix_seconds() + 30;
         assert_eq!(
             fixture.planned_round(start, true),
@@ -2444,7 +2617,7 @@ mod tests {
         );
         assert_eq!(
             fixture.planned_round(start + 10, false),
-            (Vec::new(), Some(start + 15 * 60))
+            (Vec::new(), Some(start + u))
         );
         fixture.sign_in("default", "u2", "w");
         assert_eq!(
@@ -2453,7 +2626,7 @@ mod tests {
         );
         assert_eq!(
             fixture.planned_round(start + 60, false),
-            (vec!["default".to_string()], Some(start + 60 + 15 * 60))
+            (vec!["default".to_string()], Some(start + 60 + u))
         );
     }
 
@@ -2486,8 +2659,11 @@ mod tests {
         let derived = planned_derives();
         assert_eq!(planned_login_mark(&home, trust, now), first);
         assert_eq!(planned_derives(), derived, "kept");
-        // Past the id token's expiry: derived again.
+        // Past the id token's expiry: kept (the access token names the login).
         planned_login_mark(&home, trust, now + 3_600 + 1);
+        assert_eq!(planned_derives(), derived, "kept past the id token");
+        // Past the access token's expiry: derived again.
+        planned_login_mark(&home, trust, now + 30 * 86_400 + 1);
         assert_eq!(planned_derives(), derived + 1);
 
         // Another account, the same length: derived again, and the new one,
@@ -2621,6 +2797,16 @@ mod tests {
         workspace: &str,
         id_token_lifetime: i64,
     ) {
+        sign_in_home_with_lifetimes(home, user, workspace, id_token_lifetime, 30 * 86_400);
+    }
+
+    fn sign_in_home_with_lifetimes(
+        home: &Path,
+        user: &str,
+        workspace: &str,
+        id_token_lifetime: i64,
+        access_token_lifetime: i64,
+    ) {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
         use std::os::unix::fs::PermissionsExt;
         let jwt = |user: &str, workspace: &str, lifetime: i64| {
@@ -2645,7 +2831,7 @@ mod tests {
             &auth,
             serde_json::json!({
                 "tokens": {
-                    "access_token": jwt(user, workspace, 30 * 86_400),
+                    "access_token": jwt(user, workspace, access_token_lifetime),
                     "id_token": jwt(user, workspace, id_token_lifetime),
                 },
                 "account_id": workspace,
@@ -2849,8 +3035,9 @@ mod tests {
 
     /// The default home and a managed slot signed into the same account and
     /// workspace share one read: the default home reads at 5 minutes while
-    /// either is in use and at 15 otherwise, the slot is read by itself once
-    /// a day, and its status serves the default home's reading.
+    /// either is in use and at the unused interval otherwise, the slot is
+    /// read by itself once a day, and its status serves the default home's
+    /// reading.
     #[test]
     fn homes_with_the_same_login_are_read_once_and_share_the_reading() {
         let fixture = SameLoginFixture::new(
@@ -2861,6 +3048,7 @@ mod tests {
                 ("other", false, "user-b", "workspace-a"),
             ],
         );
+        let u = UNUSED_REFRESH_SECONDS;
         let start = current_unix_seconds();
         // Nothing read yet: nothing is known to be shared.
         assert_eq!(
@@ -2883,28 +3071,32 @@ mod tests {
             expected.reset_credit_detail_summary
         );
         assert_eq!(served.saved_identity, expected.saved_identity);
-        // Not in use: 15 minutes since the default home's last read; the
-        // other account keeps its own 15 minutes.
-        assert_eq!(fixture.round(start + 15 * 60, false, &[]), ["other"]);
-        assert!(fixture.round(start + 25 * 60 - 1, false, &[]).is_empty());
-        assert_eq!(fixture.round(start + 25 * 60, false, &[]), ["default"]);
+        // Not in use: the unused interval since the default home's last read;
+        // the other account keeps its own.
+        assert_eq!(fixture.round(start + u, false, &[]), ["other"]);
+        assert!(fixture
+            .round(start + 10 * 60 + u - 1, false, &[])
+            .is_empty());
+        assert_eq!(fixture.round(start + 10 * 60 + u, false, &[]), ["default"]);
         // The slot only would be in use (a running Codex there): the shared
-        // read is at 5 minutes again.
-        let mut homes = fixture.scheduled(&[], start + 30 * 60);
+        // read is at 5 minutes again (the other account is left out of this
+        // round, whatever its own interval).
+        let busy = start + 10 * 60 + u + 5 * 60;
+        let mut homes = fixture.scheduled(&["other"], busy);
         for home in &mut homes {
             if &home.home == fixture.home("twin") {
-                home.process_seen_at = Some(start + 29 * 60);
+                home.process_seen_at = Some(busy - 60);
             }
         }
         scheduled_round_for(
             &fixture.root,
             homes,
             &[],
-            start + 30 * 60,
+            busy,
             || true,
-            |home| fixture.read(home, start + 30 * 60),
+            |home| fixture.read(home, busy),
         );
-        assert_eq!(fixture.taken_reads(), ["default", "other"]);
+        assert_eq!(fixture.taken_reads(), ["default"]);
 
         // Keep-alive: the slot reads by itself once a day, not before.
         let day = start + SAME_LOGIN_KEEPALIVE_SECONDS;
@@ -2913,7 +3105,7 @@ mod tests {
             .contains(&"twin".to_string()));
         assert!(fixture.round(day, false, &[]).contains(&"twin".to_string()));
         assert!(!fixture
-            .round(day + 15 * 60, false, &[])
+            .round(day + u, false, &[])
             .contains(&"twin".to_string()));
     }
 
@@ -2928,23 +3120,24 @@ mod tests {
                 ("slot", false, "user-a", "workspace-b"),
             ],
         );
+        let u = UNUSED_REFRESH_SECONDS;
         let start = current_unix_seconds();
         assert_eq!(fixture.round(start, false, &[]), ["default", "slot"]);
         assert_eq!(fixture.round(start + 5 * 60, true, &[]), ["default"]);
-        assert_eq!(fixture.round(start + 15 * 60, false, &[]), ["slot"]);
+        assert_eq!(fixture.round(start + u, false, &[]), ["slot"]);
         assert_eq!(
-            fixture.served("slot", start + 15 * 60).saved_identity,
+            fixture.served("slot", start + u).saved_identity,
             bound_probe("user-a", "workspace-b", start).saved_identity
         );
-        let (refresh, reads) = fixture.refresh(start + 17 * 60);
+        let (refresh, reads) = fixture.refresh(start + u + 2 * 60);
         assert_eq!((refresh.read, refresh.rate_limited), (2, 0));
         assert_eq!(reads, ["default", "slot"]);
     }
 
     /// The slot's id token expired an hour after its own read, while its
-    /// `auth.json` is unchanged since then: it still holds the login it read,
-    /// so it stays shared, is served the default home's fresh reading, and is
-    /// read by itself only for the keep-alive.
+    /// access token lives: it still names the login it read, so it stays
+    /// shared, is served the default home's fresh reading, and is read by
+    /// itself only for the keep-alive.
     #[test]
     fn a_twin_whose_id_token_expired_stays_shared_until_its_keepalive() {
         let fixture = SameLoginFixture::new(
@@ -2955,19 +3148,21 @@ mod tests {
             ],
         );
         fixture.sign_in_with_id_token_lifetime("twin", "user-a", "workspace-a", -60);
-        assert_eq!(
-            login_mark(fixture.home("twin"), fixture.trust("twin")).binding,
-            None
-        );
+        assert!(login_mark(fixture.home("twin"), fixture.trust("twin"))
+            .binding
+            .is_some());
+        let u = UNUSED_REFRESH_SECONDS;
         let start = current_unix_seconds();
         assert_eq!(fixture.round(start, false, &[]), ["default", "twin"]);
         assert_eq!(fixture.round(start + 5 * 60, true, &[]), ["default"]);
-        assert!(fixture.round(start + 15 * 60, false, &[]).is_empty());
-        assert_eq!(fixture.round(start + 20 * 60, false, &[]), ["default"]);
-        assert_eq!(fixture.round(start + 35 * 60, false, &[]), ["default"]);
-        // Fresh, although the slot's own reading is 35 minutes old.
-        let served = fixture.served("twin", start + 35 * 60);
-        assert_eq!(served.response_completed_at, Some(rfc3339(start + 35 * 60)));
+        assert!(fixture.round(start + u, false, &[]).is_empty());
+        assert_eq!(fixture.round(start + 5 * 60 + u, false, &[]), ["default"]);
+        let later = start + 5 * 60 + 2 * u;
+        assert_eq!(fixture.round(later, false, &[]), ["default"]);
+        // Fresh, although the slot's own reading is older than the stale
+        // threshold.
+        let served = fixture.served("twin", later);
+        assert_eq!(served.response_completed_at, Some(rfc3339(later)));
         assert!(served
             .quota_windows
             .iter()
@@ -2980,9 +3175,10 @@ mod tests {
         assert!(fixture.round(day, false, &[]).contains(&"twin".to_string()));
     }
 
-    /// The slot's `auth.json` is rewritten after its read and names no login:
-    /// it may hold another one now, so it is never served the default home's
-    /// reading, and it is back on its own schedule.
+    /// The slot's `auth.json` is rewritten after its read and names no live
+    /// login (its access token expired): it may hold another one now, so it is
+    /// never served the default home's reading, and it is back on its own
+    /// schedule.
     #[test]
     fn a_rewritten_credential_that_names_no_login_ends_the_sharing() {
         let fixture = SameLoginFixture::new(
@@ -3001,7 +3197,7 @@ mod tests {
             Ok(rfc3339(start + 5 * 60))
         );
 
-        fixture.sign_in_with_id_token_lifetime("twin", "user-a", "workspace-a", -60);
+        sign_in_home_with_lifetimes(fixture.home("twin"), "user-a", "workspace-a", -60, -60);
         std::fs::File::options()
             .write(true)
             .open(fixture.home("twin").join("auth.json"))
@@ -3012,12 +3208,10 @@ mod tests {
             fixture.served_at("twin", start + 5 * 60 + 30),
             Err(CODEX_QUOTA_NOT_READ_YET.to_string())
         );
-        assert!(fixture.round(start + 15 * 60 - 1, false, &[]).is_empty());
-        assert_eq!(fixture.round(start + 15 * 60, false, &[]), ["twin"]);
-        assert_eq!(
-            fixture.served_at("twin", start + 15 * 60),
-            Ok(rfc3339(start + 15 * 60))
-        );
+        let u = UNUSED_REFRESH_SECONDS;
+        assert!(fixture.round(start + u - 1, false, &[]).is_empty());
+        assert_eq!(fixture.round(start + u, false, &[]), ["twin"]);
+        assert_eq!(fixture.served_at("twin", start + u), Ok(rfc3339(start + u)));
     }
 
     /// When the default home signs into another account, the slot no longer
@@ -3049,13 +3243,11 @@ mod tests {
             Err(CODEX_QUOTA_NOT_READ_YET.to_string())
         );
         assert_eq!(fixture.round(switched + 61, true, &[]), ["default"]);
-        // The slot is read on its own 15 minutes again, not once a day.
-        assert!(fixture.round(start + 15 * 60 - 1, false, &[]).is_empty());
-        assert_eq!(fixture.round(start + 15 * 60, false, &[]), ["twin"]);
-        assert_eq!(
-            fixture.served_at("twin", start + 15 * 60),
-            Ok(rfc3339(start + 15 * 60))
-        );
+        // The slot is read on its own unused interval again, not once a day.
+        let u = UNUSED_REFRESH_SECONDS;
+        assert!(fixture.round(start + u - 1, false, &[]).is_empty());
+        assert_eq!(fixture.round(start + u, false, &[]), ["twin"]);
+        assert_eq!(fixture.served_at("twin", start + u), Ok(rfc3339(start + u)));
     }
 
     /// A failed read of the home that reads for both ends the sharing: the
@@ -3083,18 +3275,14 @@ mod tests {
             fixture.served_at("twin", start + 10 * 60),
             Ok(rfc3339(start))
         );
-        assert_eq!(
-            fixture.round(start + 15 * 60, true, &[]),
-            ["default", "twin"]
-        );
+        let u = UNUSED_REFRESH_SECONDS;
+        assert_eq!(fixture.round(start + u, true, &[]), ["default", "twin"]);
         // A later good read of the default home shares again.
         fixture.failing.lock().unwrap().clear();
-        assert_eq!(fixture.round(start + 20 * 60, true, &[]), ["default"]);
-        assert_eq!(fixture.round(start + 35 * 60, false, &[]), ["default"]);
-        assert_eq!(
-            fixture.served_at("twin", start + 35 * 60),
-            Ok(rfc3339(start + 35 * 60))
-        );
+        assert_eq!(fixture.round(start + u + 5 * 60, true, &[]), ["default"]);
+        let later = start + 5 * 60 + 2 * u;
+        assert_eq!(fixture.round(later, false, &[]), ["default"]);
+        assert_eq!(fixture.served_at("twin", later), Ok(rfc3339(later)));
     }
 
     /// The keep-alive read of the other home fails (its login died there):
@@ -3118,7 +3306,10 @@ mod tests {
             Err("Codex app-server quota read timed out.".to_string())
         );
         assert_eq!(fixture.round(day + 5 * 60, true, &[]), ["default"]);
-        assert_eq!(fixture.round(day + 15 * 60, true, &[]), ["default", "twin"]);
+        // Its failed read is retried at the unused interval, not before.
+        let u = UNUSED_REFRESH_SECONDS;
+        assert_eq!(fixture.round(day + u - 1, true, &[]), ["default"]);
+        assert_eq!(fixture.round(day + u, true, &[]), ["twin"]);
     }
 
     /// An explicit refresh reads homes that hold the same login once, with
@@ -3168,27 +3359,24 @@ mod tests {
         assert_eq!(fixture.round(start + 5 * 60, true, &[]), ["default"]);
 
         // A sign-in runs in the default home: the slot reads alone.
-        assert!(fixture
-            .round(start + 15 * 60 - 1, true, &["default"])
-            .is_empty());
-        assert_eq!(fixture.round(start + 15 * 60, true, &["default"]), ["twin"]);
-        assert_eq!(fixture.round(start + 30 * 60, true, &["default"]), ["twin"]);
+        let u = UNUSED_REFRESH_SECONDS;
+        assert!(fixture.round(start + u - 1, true, &["default"]).is_empty());
+        assert_eq!(fixture.round(start + u, true, &["default"]), ["twin"]);
+        assert_eq!(fixture.round(start + 2 * u, true, &["default"]), ["twin"]);
 
         // A sign-in runs in the slot and writes another account, before and
         // after the next round: never the default home's reading.
-        assert_eq!(fixture.round(start + 31 * 60, true, &[]), ["default"]);
-        assert_eq!(
-            fixture.served_at("twin", start + 31 * 60),
-            Ok(rfc3339(start + 31 * 60))
-        );
+        let shared = start + 2 * u + 60;
+        assert_eq!(fixture.round(shared, true, &[]), ["default"]);
+        assert_eq!(fixture.served_at("twin", shared), Ok(rfc3339(shared)));
         fixture.sign_in("twin", "user-d", "workspace-d");
         assert_eq!(
-            fixture.served_at("twin", start + 31 * 60),
+            fixture.served_at("twin", shared),
             Err(CODEX_QUOTA_NOT_READ_YET.to_string())
         );
-        assert_eq!(fixture.round(start + 36 * 60, true, &["twin"]), ["default"]);
+        assert_eq!(fixture.round(shared + 5 * 60, true, &["twin"]), ["default"]);
         assert_eq!(
-            fixture.served_at("twin", start + 36 * 60),
+            fixture.served_at("twin", shared + 5 * 60),
             Err(CODEX_QUOTA_NOT_READ_YET.to_string())
         );
     }

@@ -22,9 +22,9 @@
 //! - a person's explicit check at most once per [`EXPLICIT_MIN_GAP_SECONDS`].
 //!
 //! A sign-in is the account and workspace the credential names, compared as
-//! the saved-quota schedule does ([`LoginMark::same_login`]): every read
-//! refreshes the token and so rewrites `auth.json`, and that rewrite, or one
-//! by another reader of the home, is not a new sign-in. Only a credential
+//! the saved-quota schedule does ([`LoginMark::same_login`]): a read lets
+//! Codex refresh the token when due, which rewrites `auth.json`, and that
+//! rewrite, or one by another reader of the home, is not a new sign-in. Only a credential
 //! that names no account falls back to the file's metadata. Whether a read
 //! continues a run of failures is decided from the sign-in seen before it.
 //!
@@ -69,9 +69,8 @@ const MAX_RETRY_SECONDS: u64 = 5 * 60;
 /// minutes; past this nobody is waiting on the setup.
 const LONG_FAILURE_SECONDS: u64 = 30 * 60;
 /// Wait between automatic reads once the failures are older than
-/// [`LONG_FAILURE_SECONDS`], the saved-quota schedule's interval for a home
-/// not in use. A cleared cause (network back, Codex CLI updated) is still
-/// noticed without a new sign-in or a person's check.
+/// [`LONG_FAILURE_SECONDS`]. A cleared cause (network back, Codex CLI
+/// updated) is still noticed without a new sign-in or a person's check.
 const SLOW_RETRY_SECONDS: u64 = 15 * 60;
 /// Shortest gap before a person's explicit check reads again after a failure.
 const EXPLICIT_MIN_GAP_SECONDS: u64 = 5;
@@ -96,8 +95,7 @@ impl Failures {
     /// The claimed sign-in exists only while the access token has not
     /// expired by the wall clock. When the stored token expires between
     /// reads, or the clock steps across its expiry, the claim appears or
-    /// disappears and a new run starts, with its short retries. That happens
-    /// once per expiry: the next read refreshes the token.
+    /// disappears on an unchanged file: the same sign-in, so the run goes on.
     fn continued_by(&self, operation_id: &str, current_login: &LoginMark) -> bool {
         self.operation_id == operation_id && self.login.same_login(current_login)
     }
@@ -348,7 +346,7 @@ mod tests {
 
     #[test]
     fn a_rewritten_credential_of_the_same_account_continues_the_run() {
-        // Every read refreshes the token and rewrites `auth.json`.
+        // A read may refresh the token and rewrite `auth.json`.
         let before = LoginMark::for_test(Some("account-a"), Some(1));
         let rewritten = LoginMark::for_test(Some("account-a"), Some(2));
         let other_account = LoginMark::for_test(Some("account-b"), Some(2));

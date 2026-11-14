@@ -383,28 +383,47 @@ impl RouteResult {
                     fields
                         .remove("semantic_envelope")
                         .expect("production envelope");
-                    assert_eq!(Value::Object(fields), serde_json::to_value(item).unwrap());
+                    let expected = if item.evidence_basis == Some("otel_only") {
+                        let mut projected =
+                            serde_json::to_value(super::super::wire::SnapshotItemWire {
+                                snapshot: item,
+                                semantic_envelope: snapshot_semantic_envelope(source, item, policy),
+                            })
+                            .unwrap();
+                        projected
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("semantic_envelope");
+                        projected
+                    } else {
+                        serde_json::to_value(item).unwrap()
+                    };
+                    assert_eq!(Value::Object(fields), expected);
                     assert_eq!(
                         raw["semantic_envelope"],
                         serde_json::to_value(snapshot_semantic_envelope(source, item, policy))
                             .unwrap()
                     );
-                    let mut neutral = item.clone();
-                    neutral.source_file_fingerprint = Some("physical-identity:excluded".into());
-                    snapshot["source_file_fingerprint"] = json!(neutral.source_file_fingerprint);
-                    snapshot["semantic_envelope"] =
-                        serde_json::to_value(snapshot_semantic_envelope(source, &neutral, policy))
-                            .unwrap();
-                    let mut restored = snapshot.clone();
-                    for path in [
-                        "/source_file_fingerprint",
-                        "/semantic_envelope/revision_hash",
-                        "/semantic_envelope/revision_v2_hash",
-                    ] {
-                        *restored.pointer_mut(path).expect("existing sentinel path") =
-                            raw.pointer(path).expect("existing raw path").clone();
+                    if item.evidence_basis != Some("otel_only") {
+                        let mut neutral = item.clone();
+                        neutral.source_file_fingerprint = Some("physical-identity:excluded".into());
+                        snapshot["source_file_fingerprint"] =
+                            json!(neutral.source_file_fingerprint);
+                        snapshot["semantic_envelope"] = serde_json::to_value(
+                            snapshot_semantic_envelope(source, &neutral, policy),
+                        )
+                        .unwrap();
+                        let mut restored = snapshot.clone();
+                        for path in [
+                            "/source_file_fingerprint",
+                            "/semantic_envelope/revision_hash",
+                            "/semantic_envelope/revision_v2_hash",
+                        ] {
+                            *restored.pointer_mut(path).expect("existing sentinel path") =
+                                raw.pointer(path).expect("existing raw path").clone();
+                        }
+                        assert_eq!(restored, raw, "normalization escaped sentinel scope");
                     }
-                    assert_eq!(restored, raw, "normalization escaped sentinel scope");
                     assert!(
                         snapshots
                             .insert(item.source_session_id.clone(), snapshot.clone())
