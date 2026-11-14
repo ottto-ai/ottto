@@ -1896,6 +1896,13 @@ unchanged and verified, so its subagents keep their own decisions). Counted afte
 selection since the previous Claude page; counts only, no ids or paths; they
 never affect selection or money.
 
+## Codex byte-budget pacing
+
+The Codex `native_collection_page` line carries `page_byte_budget_hit: 1` in
+`page_selection` when the page put a file back because a page byte budget was
+spent. During a first backfill, such a page with queued work requests a paced
+pass. It never affects selection or money.
+
 ## Claude OTLP spans and relay requests not stored
 
 These `process_retained_cache_lifecycle_totals` counters tell a request Claude

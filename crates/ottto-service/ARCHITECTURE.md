@@ -333,6 +333,8 @@ The active routine marker is process-local and binds the scan context and census
 resuming an unfinished walk after restart does not restore it. Resident deferral can still
 request pacing.
 Prepare, finish, server minima, upload backoff and background QoS still apply.
+During a first backfill (not a replay revision bump), a Codex page that spent a byte budget with
+work still queued also requests a paced pass.
 
 ## SQLite
 

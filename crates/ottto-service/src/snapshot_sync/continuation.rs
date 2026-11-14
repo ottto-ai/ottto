@@ -94,9 +94,12 @@ pub(super) fn paced_source_qos(
     }
     qos
 }
-pub(super) fn resident_scan_requested(scan: &SourceScanResult) -> bool {
+/// A spent byte budget asks only during the source's first backfill.
+pub(super) fn resident_scan_requested(scan: &SourceScanResult, first_read_bootstrap: bool) -> bool {
     scan.charge_deferred
-        || (scan.page_file_limit_hit && scan.census_status.pending_work && !scan.routine_recensus)
+        || (scan.census_status.pending_work
+            && ((scan.page_file_limit_hit && !scan.routine_recensus)
+                || (first_read_bootstrap && scan.page_byte_budget_hit)))
 }
 pub(super) fn request_resident_scan(source: SnapshotSource) {
     if let Some(pacing) = resident_pacing(MacPlatformSignals::default().power()) {

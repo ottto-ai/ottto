@@ -1123,18 +1123,23 @@ const MINT_SESSION: &str = "019fa111-2222-7333-8444-555555555555";
 
 /// A real ordinary page that leaves one rollout's job paused and accelerated.
 /// Run under `with_test_limits_for_test`.
-fn paused_accelerated_scan(root: &Path, cache: &Arc<SharedCache>) -> SourceScanResult {
-    let session = MINT_SESSION;
+/// A Codex rollout body: the session header and `turns` token counts.
+fn rollout_body(session: &str, turns: u64) -> String {
     let mut body = format!(
         "{}\n",
         serde_json::json!({"type":"session_meta", "timestamp":"2026-10-24T00:00:00Z", "payload":{"id":session}})
     );
-    for n in 1..=80 {
+    for n in 1..=turns {
         body.push_str(&format!("{}\n", serde_json::json!({"type":"event_msg", "timestamp":"2026-10-24T00:30:00Z", "payload":{"type":"token_count", "info":{"model":"fixture-model", "total_token_usage":{"input_tokens":n*100,"cached_input_tokens":n*50,"output_tokens":n*10},"last_token_usage":{"input_tokens":100,"cached_input_tokens":50,"output_tokens":10}}}})));
     }
+    body
+}
+
+fn paused_accelerated_scan(root: &Path, cache: &Arc<SharedCache>) -> SourceScanResult {
+    let session = MINT_SESSION;
     std::fs::write(
         root.join(format!("rollout-2026-10-24T00-00-00-{session}.jsonl")),
-        body,
+        rollout_body(session, 80),
     )
     .unwrap();
     let mut owned = crate::snapshots::OwnedSourceScan::new(
@@ -1464,7 +1469,7 @@ fn file_limit_full_pages_request_pacing_only_with_queued_work_and_allowed_power(
         scan.charge_deferred = charge;
         let mut cadence = SourceCadence::new(CadenceConfig::cost_first(SNAPSHOT_SYNC_INTERVAL));
         cadence.record_scan_success(now, 1);
-        if resident_scan_requested(&scan)
+        if resident_scan_requested(&scan, false)
             && let Some(pacing) = resident_pacing(power)
         {
             assert!(cadence.request_paced_scan(now, Duration::ZERO, pacing));
@@ -1474,6 +1479,105 @@ fn file_limit_full_pages_request_pacing_only_with_queued_work_and_allowed_power(
             gap.map(|gap| now + Duration::from_secs(gap))
         );
     }
+    std::fs::remove_dir_all(home).unwrap();
+}
+
+/// [behaviour] A spent Codex byte budget asks for pacing with queued work
+/// only during a first backfill, routine or not.
+#[test]
+fn byte_budget_pages_pace_only_during_a_first_backfill() {
+    let mut scan = empty_scan();
+    assert!(!scan.charge_deferred && !scan.page_file_limit_hit);
+    for bits in 0..16_u8 {
+        let [bootstrap, byte_hit, routine, pending] = [1, 2, 4, 8].map(|bit| bits & bit != 0);
+        (scan.page_byte_budget_hit, scan.routine_recensus) = (byte_hit, routine);
+        scan.census_status.pending_work = pending;
+        let requested = resident_scan_requested(&scan, bootstrap);
+        assert_eq!(requested, bootstrap && byte_hit && pending, "{bits:04b}");
+    }
+}
+
+/// `count` Codex rollouts of about 1.7 KiB each in `root`, numbered from `first`.
+fn codex_rollouts(root: &Path, first: u64, count: u64) -> Vec<PathBuf> {
+    (first..first + count)
+        .map(|n| {
+            let session = format!("019fa111-2222-7333-8444-{n:012}");
+            let path = root.join(format!("rollout-2026-10-24T00-00-00-{session}.jsonl"));
+            std::fs::write(&path, rollout_body(&session, 5)).unwrap();
+            path
+        })
+        .collect()
+}
+
+/// [behaviour] Byte-bound Codex pages ask for paced passes during the first
+/// backfill. Once census completion marks the backfill state, new large
+/// files still spend the byte budget but ask for nothing. A pending replay
+/// revision is not a first backfill.
+#[test]
+fn first_read_byte_pacing_stops_when_backfill_completes() {
+    use super::super::backfill_replay_pending;
+    use crate::backfill::{
+        bootstrap_pending_for_destination, mark_backfill_complete_for_destination, BackfillState,
+    };
+    use crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture;
+    const DESTINATION: &str = "first-read-destination";
+    let codex = SnapshotSource::Codex;
+    let bootstrap = |state: &BackfillState| {
+        backfill_replay_pending(codex, state, DESTINATION)
+            && bootstrap_pending_for_destination(state, codex, DESTINATION)
+    };
+    let home = crate::test_scratch::private_dir("first-read-byte-pacing")
+        .canonicalize()
+        .unwrap();
+    let root = home.join(".codex/sessions");
+    std::fs::create_dir_all(&root).unwrap();
+    codex_rollouts(&root, 0, 6);
+    let scanner = E2ScanFixture::default();
+    let mut state = BackfillState::default();
+    crate::snapshots::with_test_limits_for_test(1 << 20, 4096, 64, || {
+        let page = |index, hints: &[PathBuf]| {
+            let roots = std::slice::from_ref(&root);
+            let (index, scan, _) =
+                scanner.scan_other_page(codex, roots, &home, index, true, 100, hints);
+            (index, scan)
+        };
+        let (mut index, mut paced, mut complete) = (ScanIndex::default(), 0, false);
+        for _ in 0..16 {
+            let (next, scan) = page(index, &[]);
+            index = next;
+            paced += usize::from(resident_scan_requested(&scan, bootstrap(&state)));
+            complete = scan.census_complete;
+            if complete {
+                break;
+            }
+        }
+        assert!(
+            complete && paced > 0,
+            "{paced} paced pages, complete {complete}"
+        );
+        mark_backfill_complete_for_destination(&mut state, codex, DESTINATION);
+        assert!(!bootstrap(&state));
+        let hints = codex_rollouts(&root, 100, 6);
+        let mut byte_bound = 0;
+        for _ in 0..16 {
+            let (next, scan) = page(index, &hints);
+            index = next;
+            byte_bound += usize::from(scan.page_byte_budget_hit && scan.census_status.pending_work);
+            assert!(!resident_scan_requested(&scan, bootstrap(&state)));
+            if byte_bound > 0 {
+                break;
+            }
+        }
+        assert!(
+            byte_bound > 0,
+            "new large files still spend the byte budget"
+        );
+    });
+    state
+        .completed_replay_revisions
+        .insert("codex".into(), "codex_replay:v0".into());
+    assert!(backfill_replay_pending(codex, &state, DESTINATION));
+    assert!(!bootstrap(&state), "a pending replay revision");
     std::fs::remove_dir_all(home).unwrap();
 }
 

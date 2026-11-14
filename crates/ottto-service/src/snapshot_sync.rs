@@ -9099,7 +9099,13 @@ fn finish_sync_source(
     with_source_cadence(source, |cadence| {
         cadence.record_scan_success(Instant::now(), accepted)
     });
-    if continuation::resident_scan_requested(&scan_result) {
+    let first_read_bootstrap = backfill_pending
+        && crate::backfill::bootstrap_pending_for_destination(
+            &backfill_state,
+            source,
+            &upload_destination_namespace,
+        );
+    if continuation::resident_scan_requested(&scan_result, first_read_bootstrap) {
         continuation::request_resident_scan(source);
     }
 
