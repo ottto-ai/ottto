@@ -6254,12 +6254,13 @@ fn upload_local_health_projection_with(
     let mut status = daemon
         .status_for_trusted_client()
         .map_err(|error| anyhow!("read local health status failed: {error}"))?;
+    // Pairing can select a different machine from the durable local identity.
+    // Both heartbeat and health must match the paired identity on the server.
+    // Set it before reprojection, using this owned status copy only.
+    // Keep daemon state, machine store and setup request authority unchanged.
+    // Source-control replies continue to fence on the current device binding.
+    status.machine.machine_id = machine_id.to_owned();
     crate::refresh_canonical_local_health(&mut status);
-    if status.machine.machine_id != machine_id {
-        return Err(anyhow!(
-            "local health machine identity does not match registered device"
-        ));
-    }
     let heartbeat = status
         .runtime_heartbeat
         .as_ref()
@@ -20213,7 +20214,7 @@ mod tests {
         }
     }
 
-    /// [behaviour] The heartbeat lists `source_control:v1` and keeps running
+    /// [regress] Paired health identity stays separate while the heartbeat runs
     /// on a granted source's token while every source is paused, so a web ON
     /// still arrives: OFF then ON pauses and resumes the source.
     #[test]
@@ -20224,7 +20225,14 @@ mod tests {
             &[("codex", 1, "disabled"), ("codex", 2, "enabled")],
         );
         let codex = SnapshotSource::Codex;
-        let daemon = test_daemon("otm_test");
+        let daemon = test_daemon("otm_local");
+        FileMachineStore::default()
+            .save(&ottto_core::LocalMachineBinding {
+                machine_id: "otm_local".into(),
+                installation_id: "install_test".into(),
+                hardware_uuid: None,
+            })
+            .unwrap();
         upload_local_health_projection_now(&daemon).expect("heartbeat");
         assert_eq!(
             source_marker(&backend.support_dir, codex).as_deref(),
@@ -20232,7 +20240,12 @@ mod tests {
         );
         assert!(enabled_snapshot_sources(&backend.device).is_empty());
         assert_eq!(heartbeat_source(&backend.device), Some(codex));
+        let mut unpaired = backend.device.clone();
+        unpaired.machine_id = None;
+        FileDeviceStore::default().save(&unpaired).unwrap();
         upload_local_health_projection_now(&daemon).expect("heartbeat while all paused");
+        assert!(snapshot_machine_id(&unpaired).unwrap().as_deref() == Some("otm_local"));
+        assert!(daemon.machine_for_trusted_client().unwrap().machine_id == "otm_local");
         assert_eq!(
             source_marker(&backend.support_dir, codex).as_deref(),
             Some("reconnect")
@@ -20248,6 +20261,16 @@ mod tests {
         assert!(heartbeats
             .iter()
             .all(|request| request.contains("\"source_control:v1\"")));
+        assert_eq!(requests.len(), 6);
+        for (request, id) in requests
+            .iter()
+            .filter(|r| r.contains("/apps/health/"))
+            .zip(["otm_test", "otm_test", "otm_local", "otm_local"])
+        {
+            let body: serde_json::Value =
+                serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+            assert_eq!(body["machine_id"], id);
+        }
         let _ = std::fs::remove_dir_all(&backend.root);
     }
 
