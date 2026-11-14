@@ -2,11 +2,15 @@ use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
+#[cfg(unix)]
 use std::thread;
 use std::time::{Duration, Instant};
 
 const COMMAND_SEARCH_PATH_ENV: &str = "OTTTO_COMMAND_SEARCH_PATH";
+#[cfg(unix)]
 const INTERACTIVE_SHELL_ENV_TIMEOUT: Duration = Duration::from_secs(3);
 const PROVIDER_ENV_KEYS: &[&str] = &[
     "GOOGLE_APPLICATION_CREDENTIALS",
@@ -266,11 +270,39 @@ pub(crate) fn path_env() -> Option<OsString> {
 }
 
 pub(crate) fn provider_env() -> BTreeMap<String, OsString> {
+    provider_env_with_refresh(false)
+}
+
+pub(crate) fn provider_env_with_refresh(refresh: bool) -> BTreeMap<String, OsString> {
     let current = current_provider_env();
-    let missing_shell_env = (current.len() < PROVIDER_ENV_KEYS.len())
-        .then(interactive_shell_provider_env)
+    let missing_shell_env = (refresh || current.len() < PROVIDER_ENV_KEYS.len())
+        .then(|| cached_shell_provider_env(refresh))
         .flatten();
     provider_env_from_sources(&current, missing_shell_env.as_ref())
+}
+
+type ShellEnv = BTreeMap<String, OsString>;
+type ShellEnvCache = Mutex<Option<(Option<OsString>, Instant, Option<ShellEnv>)>>;
+
+fn cached_shell_provider_env(refresh: bool) -> Option<ShellEnv> {
+    #[cfg(not(test))]
+    static CACHE: ShellEnvCache = Mutex::new(None);
+    #[cfg(not(test))]
+    let (cache, now) = (&CACHE, Instant::now);
+    #[cfg(test)]
+    let (cache, now) = (test_shell_env::cache(), test_shell_env::now);
+    let (home, requested) = (env::var_os("HOME"), now());
+    // Hold the lock through the bounded import; waiters share success or failure.
+    let mut cached = cache.lock().unwrap_or_else(|poison| poison.into_inner());
+    if cached.as_ref().is_none_or(|(key, at, _)| {
+        key != &home
+            || now().saturating_duration_since(*at) >= Duration::from_secs(1800)
+            || (refresh && *at < requested)
+    }) {
+        let shell = interactive_shell_provider_env();
+        *cached = Some((home, now(), shell));
+    }
+    cached.as_ref()?.2.clone()
 }
 
 /// The environment a stdio MCP server or the Claude CLI is spawned with,
@@ -325,7 +357,17 @@ fn provider_env_from_sources(
     values
 }
 
+#[cfg(not(unix))]
 fn interactive_shell_provider_env() -> Option<BTreeMap<String, OsString>> {
+    None
+}
+
+#[cfg(unix)]
+fn interactive_shell_provider_env() -> Option<BTreeMap<String, OsString>> {
+    #[cfg(test)]
+    if let Some(output) = test_shell_env::output() {
+        return output.as_deref().map(parse_provider_env_output);
+    }
     let home = env::var_os("HOME")?;
     let path = path_env_from(None, Some(home.clone()))?;
     let mut command = Command::new("/bin/zsh");
@@ -338,30 +380,74 @@ fn interactive_shell_provider_env() -> Option<BTreeMap<String, OsString>> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
 
+    read_shell_env(command, INTERACTIVE_SHELL_ENV_TIMEOUT)
+}
+
+#[cfg(unix)]
+fn read_shell_env(mut command: Command, timeout: Duration) -> Option<BTreeMap<String, OsString>> {
+    use std::io::{ErrorKind, Read};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+
+    let deadline = Instant::now() + timeout;
+    // setsid is async-signal-safe and prevents access to the caller's controlling tty.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     let mut child = command.spawn().ok()?;
-    let start = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_status)) => {
-                let output = child.wait_with_output().ok()?;
-                if !output.status.success() {
-                    return None;
+    let mut stdout = child.stdout.take().expect("piped shell stdout");
+    let flags = unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_GETFL) };
+    let nonblocking = flags >= 0
+        && unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } == 0;
+    let mut ready = libc::pollfd {
+        fd: stdout.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let mut output = Vec::new();
+    let mut complete = false;
+    while nonblocking && Instant::now() < deadline {
+        let mut buffer = [0; 8192];
+        match stdout.read(&mut buffer) {
+            Ok(0) => match crate::process_guard::exited(&child) {
+                Ok(true) => {
+                    complete = Instant::now() < deadline;
+                    break;
                 }
-                return Some(parse_provider_env_output(&output.stdout));
+                Ok(false) => thread::sleep(
+                    Duration::from_millis(50)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                ),
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            },
+            Ok(n) if output.len() + n <= 1024 * 1024 => {
+                output.extend_from_slice(&buffer[..n]);
             }
-            Ok(None) if start.elapsed() >= INTERACTIVE_SHELL_ENV_TIMEOUT => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                let millis = deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis();
+                let result = unsafe { libc::poll(&mut ready, 1, millis.min(50) as libc::c_int) };
+                if result < 0 && std::io::Error::last_os_error().kind() != ErrorKind::Interrupted {
+                    break;
+                }
             }
-            Ok(None) => thread::sleep(Duration::from_millis(50)),
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            _ => break,
         }
     }
+    let status = crate::process_guard::stop_group_and_reap(
+        child,
+        deadline.saturating_duration_since(Instant::now()),
+    );
+    drop(stdout);
+    (complete && status.ok()?.success()).then(|| parse_provider_env_output(&output))
 }
 
 fn parse_provider_env_output(output: &[u8]) -> BTreeMap<String, OsString> {
@@ -475,11 +561,227 @@ fn push_unique(dirs: &mut Vec<PathBuf>, dir: PathBuf) {
 }
 
 #[cfg(test)]
+pub(crate) mod test_shell_env {
+    use super::{Instant, ShellEnvCache};
+    use std::cell::{Cell, RefCell};
+    use std::sync::Arc;
+
+    thread_local! {
+        static OUTPUT: RefCell<Option<Option<Vec<u8>>>> = const { RefCell::new(None) };
+        static CALLS: RefCell<usize> = const { RefCell::new(0) };
+        static CACHE: RefCell<Arc<ShellEnvCache>> = RefCell::new(Arc::default());
+        static NOW: Cell<Option<Instant>> = const { Cell::new(None) };
+        static BEFORE_OUTPUT: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn cache() -> Arc<ShellEnvCache> {
+        CACHE.with_borrow(Arc::clone)
+    }
+
+    pub(super) fn now() -> Instant {
+        NOW.get().unwrap_or_else(Instant::now)
+    }
+
+    pub(crate) fn set_output(output: Option<&[u8]>) {
+        OUTPUT.set(Some(output.map(<[u8]>::to_vec)));
+    }
+
+    pub(crate) fn set_now(now: Instant) {
+        NOW.set(Some(now));
+    }
+
+    pub(super) fn share_cache(cache: Arc<ShellEnvCache>) {
+        CACHE.set(cache);
+    }
+
+    pub(super) fn before_output(hook: impl FnOnce() + 'static) {
+        BEFORE_OUTPUT.set(Some(Box::new(hook)));
+    }
+
+    pub(super) fn output() -> Option<Option<Vec<u8>>> {
+        if let Some(hook) = BEFORE_OUTPUT.take() {
+            hook();
+        }
+        OUTPUT.with_borrow(|output| {
+            if output.is_some() {
+                CALLS.with_borrow_mut(|calls| *calls += 1);
+            }
+            output.clone()
+        })
+    }
+
+    /// Inject the existing parser's shell stdout, or an import failure, on this thread.
+    pub(crate) fn with_output<T>(output: Option<&[u8]>, run: impl FnOnce() -> T) -> (T, usize) {
+        struct Restore(
+            Option<Option<Vec<u8>>>,
+            usize,
+            Arc<ShellEnvCache>,
+            Option<Instant>,
+            Option<Box<dyn FnOnce()>>,
+        );
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                OUTPUT.set(self.0.take());
+                CALLS.set(self.1);
+                CACHE.set(self.2.clone());
+                NOW.set(self.3);
+                BEFORE_OUTPUT.set(self.4.take());
+            }
+        }
+        let _restore = Restore(
+            OUTPUT.replace(Some(output.map(<[u8]>::to_vec))),
+            CALLS.replace(0),
+            CACHE.replace(Arc::default()),
+            NOW.replace(None),
+            BEFORE_OUTPUT.replace(None),
+        );
+        let result = run();
+        (result, CALLS.with_borrow(|calls| *calls))
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_scratch;
     use std::fs;
     use std::os::unix::fs::{symlink, PermissionsExt};
+
+    const SHELL_PROJECT: &[u8] = b"GOOGLE_CLOUD_PROJECT=shell-project\n";
+
+    #[test]
+    #[serial_test::serial]
+    fn shell_cache_reuses_import_within_ttl() {
+        let (_, calls) = test_shell_env::with_output(Some(SHELL_PROJECT), || {
+            let start = Instant::now();
+            test_shell_env::set_now(start);
+            let first = cached_shell_provider_env(false);
+            test_shell_env::set_now(start + Duration::from_secs(1799));
+            test_shell_env::set_output(Some(b"GOOGLE_CLOUD_PROJECT=changed\n"));
+            assert_eq!(cached_shell_provider_env(false), first);
+        });
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn shell_cache_reimports_at_ttl_boundary() {
+        let (_, calls) = test_shell_env::with_output(Some(SHELL_PROJECT), || {
+            let start = Instant::now();
+            test_shell_env::set_now(start);
+            cached_shell_provider_env(false);
+            test_shell_env::set_now(start + Duration::from_secs(1800));
+            test_shell_env::set_output(Some(b"GOOGLE_CLOUD_PROJECT=changed\n"));
+            let value = cached_shell_provider_env(false).unwrap();
+            assert_eq!(value["GOOGLE_CLOUD_PROJECT"], "changed");
+        });
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn shell_cache_retains_failure_for_full_ttl() {
+        let (_, calls) = test_shell_env::with_output(None, || {
+            let start = Instant::now();
+            test_shell_env::set_now(start);
+            assert!(cached_shell_provider_env(false).is_none());
+            test_shell_env::set_output(Some(SHELL_PROJECT));
+            test_shell_env::set_now(start + Duration::from_secs(1799));
+            assert!(cached_shell_provider_env(false).is_none());
+            test_shell_env::set_now(start + Duration::from_secs(1800));
+            assert!(cached_shell_provider_env(false).is_some());
+        });
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn shell_cache_home_change_is_a_miss() {
+        let (_, calls) = test_shell_env::with_output(Some(SHELL_PROJECT), || {
+            cached_shell_provider_env(false);
+            test_shell_env::cache().lock().unwrap().as_mut().unwrap().0 =
+                Some(OsString::from("different-synthetic-home"));
+            test_shell_env::set_output(Some(b"GOOGLE_CLOUD_PROJECT=changed\n"));
+            assert_eq!(
+                cached_shell_provider_env(false).unwrap()["GOOGLE_CLOUD_PROJECT"],
+                "changed"
+            );
+        });
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn shell_cache_concurrent_callers_share_one_import() {
+        use std::sync::{mpsc, Arc, Barrier};
+        let cache = Arc::new(ShellEnvCache::default());
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let importer_cache = cache.clone();
+        let importer = std::thread::spawn(move || {
+            test_shell_env::with_output(Some(SHELL_PROJECT), || {
+                test_shell_env::share_cache(importer_cache);
+                test_shell_env::before_output(move || {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                });
+                cached_shell_provider_env(false).unwrap()
+            })
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let barrier = Arc::new(Barrier::new(8));
+        let (done_tx, done_rx) = mpsc::channel();
+        let workers = (0..7)
+            .map(|_| {
+                let cache = cache.clone();
+                let barrier = barrier.clone();
+                let done = done_tx.clone();
+                std::thread::spawn(move || {
+                    test_shell_env::with_output(Some(SHELL_PROJECT), || {
+                        test_shell_env::share_cache(cache);
+                        barrier.wait();
+                        let result = cached_shell_provider_env(false).unwrap();
+                        done.send(()).unwrap();
+                        result
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let waiting = done_rx.recv_timeout(Duration::from_millis(50)).is_err();
+        release_tx.send(()).unwrap();
+        let (_, mut calls) = importer.join().unwrap();
+        for worker in workers {
+            let (value, imports) = worker.join().unwrap();
+            assert_eq!(value["GOOGLE_CLOUD_PROJECT"], "shell-project");
+            calls += imports;
+        }
+        assert!(
+            waiting,
+            "callers must wait until the in-flight import completes"
+        );
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn shell_cache_overlapping_refresh_shares_completed_import() {
+        let (_, calls) = test_shell_env::with_output(Some(SHELL_PROJECT), || {
+            let start = Instant::now();
+            test_shell_env::set_now(start);
+            cached_shell_provider_env(false);
+            // A refresh that began no later than this completed fill shares it.
+            assert_eq!(
+                cached_shell_provider_env(true),
+                cached_shell_provider_env(false)
+            );
+            test_shell_env::set_now(start + Duration::from_secs(1));
+            test_shell_env::set_output(None);
+            assert!(cached_shell_provider_env(true).is_none());
+            assert!(cached_shell_provider_env(false).is_none());
+        });
+        assert_eq!(calls, 2);
+    }
 
     fn scratch_home(name: &str) -> PathBuf {
         std::env::temp_dir()
@@ -651,6 +953,233 @@ mod tests {
         let path_env = path_env_from_override(Some(override_path)).expect("path env");
         let dirs = env::split_paths(&path_env).collect::<Vec<_>>();
         assert_eq!(dirs, vec![PathBuf::from("/tmp/ottto-only-bin")]);
+    }
+
+    struct FakeShell {
+        home: PathBuf,
+    }
+
+    impl FakeShell {
+        fn new() -> Self {
+            let home = scratch_home("provider-shell");
+            fs::create_dir_all(&home).expect("fake shell directory");
+            Self { home }
+        }
+
+        fn run(&self, script: &str, timeout: Duration) -> Option<BTreeMap<String, OsString>> {
+            let mut command = Command::new("/bin/sh");
+            command
+                .args(["-c", script, "fake-shell"])
+                .arg(self.home.join("child-pid"))
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+            read_shell_env(command, timeout)
+        }
+
+        fn child_running(&self) -> bool {
+            let pid = fs::read_to_string(self.home.join("child-pid")).expect("child started");
+            let status = Command::new("/bin/ps")
+                .args(["-o", "stat=", "-p", pid.trim()])
+                .output()
+                .expect("child status");
+            let status = String::from_utf8_lossy(&status.stdout);
+            // An orphan killed in the group can await init's reaping as a zombie.
+            !status.trim().is_empty() && !status.trim().starts_with('Z')
+        }
+
+        fn assert_child_stopped(&self) {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while self.child_running() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(!self.child_running(), "shell group child survived");
+        }
+    }
+
+    impl Drop for FakeShell {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.home).ok();
+        }
+    }
+
+    #[test]
+    fn provider_shell_bounds_inherited_stdout_after_shell_exit() {
+        let shell = FakeShell::new();
+        let start = Instant::now();
+        let result = shell.run(
+            "/bin/sleep 10 & echo $! > \"$1\"; printf 'GOOGLE_CLOUD_PROJECT=shell-project\\n'",
+            Duration::from_millis(300),
+        );
+        assert!(result.is_none());
+        assert!(start.elapsed() < Duration::from_secs(2));
+        shell.assert_child_stopped();
+    }
+
+    #[test]
+    #[ignore = "fake session leader invoked only by provider shell tests"]
+    fn provider_shell_session_fixture() {
+        assert_eq!(unsafe { libc::getsid(0) }, unsafe { libc::getpid() });
+        assert_eq!(unsafe { libc::getpgrp() }, unsafe { libc::getpid() });
+        println!("\nGOOGLE_CLOUD_PROJECT=session-leader");
+    }
+
+    #[test]
+    fn provider_shell_starts_its_own_session_and_group() {
+        let shell = FakeShell::new();
+        let executable = std::env::current_exe().unwrap();
+        let executable = executable.to_string_lossy().replace('\'', "'\\''");
+        let script = format!(
+            "exec '{executable}' --ignored --exact command_env::tests::provider_shell_session_fixture --nocapture --test-threads=1"
+        );
+        assert_eq!(
+            shell
+                .run(&script, INTERACTIVE_SHELL_ENV_TIMEOUT)
+                .expect("shell is the session leader")
+                .get("GOOGLE_CLOUD_PROJECT"),
+            Some(&OsString::from("session-leader"))
+        );
+    }
+
+    #[test]
+    fn provider_shell_success_stops_redirected_background_job() {
+        let shell = FakeShell::new();
+        let result = shell.run(
+            "/bin/sleep 10 >/dev/null 2>&1 & echo $! > \"$1\"; printf 'GOOGLE_CLOUD_PROJECT=shell-project\\n'",
+            INTERACTIVE_SHELL_ENV_TIMEOUT,
+        );
+        shell.assert_child_stopped();
+        assert_eq!(
+            result.expect("complete env").get("GOOGLE_CLOUD_PROJECT"),
+            Some(&OsString::from("shell-project"))
+        );
+    }
+
+    #[test]
+    fn provider_shell_nonzero_exit_stops_redirected_background_job() {
+        let shell = FakeShell::new();
+        assert!(shell.run(
+            "/bin/sleep 10 >/dev/null 2>&1 & echo $! > \"$1\"; printf 'GOOGLE_CLOUD_PROJECT=failed\\n'; exit 7",
+            INTERACTIVE_SHELL_ENV_TIMEOUT,
+        ).is_none());
+        shell.assert_child_stopped();
+    }
+
+    #[test]
+    fn provider_shell_drains_more_than_a_pipe_buffer() {
+        let shell = FakeShell::new();
+        let result = shell.run(
+            "i=0; while [ $i -lt 8192 ]; do printf 'IGNORED=0123456789abcdef\\n'; i=$((i+1)); done; printf 'GOOGLE_CLOUD_PROJECT=shell-project\\n'",
+            INTERACTIVE_SHELL_ENV_TIMEOUT,
+        );
+        assert_eq!(
+            result
+                .expect("large env parsed")
+                .get("GOOGLE_CLOUD_PROJECT"),
+            Some(&OsString::from("shell-project"))
+        );
+    }
+
+    #[test]
+    fn provider_shell_rejects_excess_output() {
+        let shell = FakeShell::new();
+        let start = Instant::now();
+        assert!(shell
+            .run(
+                "printf 'GOOGLE_CLOUD_PROJECT=partial\\n'; exec /usr/bin/head -c 1048577 /dev/zero",
+                Duration::from_secs(15),
+            )
+            .is_none());
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn provider_shell_accepts_exact_byte_bound() {
+        let shell = FakeShell::new();
+        let line = "GOOGLE_CLOUD_PROJECT=shell-project\n";
+        let script = format!(
+            "printf 'GOOGLE_CLOUD_PROJECT=shell-project\\n'; exec /usr/bin/head -c {} /dev/zero",
+            1024 * 1024 - line.len()
+        );
+        assert_eq!(
+            shell
+                .run(&script, INTERACTIVE_SHELL_ENV_TIMEOUT)
+                .expect("complete environment at the bound")
+                .get("GOOGLE_CLOUD_PROJECT"),
+            Some(&OsString::from("shell-project"))
+        );
+    }
+
+    #[test]
+    #[ignore = "finite escaped child invoked only by provider shell tests"]
+    fn provider_shell_escaped_writer_fixture() {
+        let Some(pid_file) = env::var_os("OTTTO_PROVIDER_SHELL_PIPE_FIXTURE").map(PathBuf::from)
+        else {
+            return;
+        };
+        assert!(unsafe { libc::setsid() } >= 0);
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
+        fs::write(&pid_file, std::process::id().to_string()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while Instant::now() < deadline {
+            if unsafe { libc::write(libc::STDOUT_FILENO, b"x".as_ptr().cast(), 1) } < 0
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPIPE)
+            {
+                fs::write(pid_file.with_extension("closed"), []).unwrap();
+                std::process::exit(0);
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        std::process::exit(1);
+    }
+
+    #[test]
+    fn provider_shell_closes_pipe_on_escaped_writer() {
+        let shell = FakeShell::new();
+        let executable = std::env::current_exe().unwrap();
+        let executable = executable.to_string_lossy().replace('\'', "'\\''");
+        let script = format!(
+            "export OTTTO_PROVIDER_SHELL_PIPE_FIXTURE=\"$1\"; '{executable}' --ignored --exact command_env::tests::provider_shell_escaped_writer_fixture --nocapture --test-threads=1 & while [ ! -s \"$1\" ]; do /bin/sleep 0.01; done"
+        );
+        let start = Instant::now();
+        assert!(shell.run(&script, Duration::from_millis(700)).is_none());
+        assert!(start.elapsed() < Duration::from_secs(2));
+        shell.assert_child_stopped();
+        assert!(
+            shell.home.join("child-pid.closed").exists(),
+            "escaped writer did not observe EPIPE"
+        );
+    }
+
+    #[test]
+    fn provider_shell_timeout_kills_its_group_after_stdout_closes() {
+        let shell = FakeShell::new();
+        let start = Instant::now();
+        let result = shell.run(
+            "exec 1>&-; /bin/sleep 10 & echo $! > \"$1\"; exec /bin/sleep 10",
+            Duration::from_millis(300),
+        );
+        assert!(result.is_none());
+        assert!(start.elapsed() < Duration::from_secs(2));
+        shell.assert_child_stopped();
+    }
+
+    #[test]
+    fn provider_shell_normal_output_and_failure_are_unchanged() {
+        let shell = FakeShell::new();
+        let output =
+            "printf 'GOOGLE_CLOUD_PROJECT=shell-project\\nIGNORED=value\\nGEMINI_API_KEY=\\n'";
+        let expected = BTreeMap::from([(
+            "GOOGLE_CLOUD_PROJECT".to_string(),
+            OsString::from("shell-project"),
+        )]);
+        assert_eq!(
+            shell.run(output, INTERACTIVE_SHELL_ENV_TIMEOUT),
+            Some(expected)
+        );
+        assert!(shell.run("exit 1", INTERACTIVE_SHELL_ENV_TIMEOUT).is_none());
     }
 
     #[test]

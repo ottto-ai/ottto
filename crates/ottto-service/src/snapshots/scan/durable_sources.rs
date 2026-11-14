@@ -16,6 +16,8 @@ pub(crate) struct Properties {
     /// route's custody wins, and clearing it would let v1 load the frozen
     /// JSON. Leaving needs an explicit export back to v1.
     pub(crate) state_v2: bool,
+    /// Queue order during the source's first read (`first_read_order.rs`).
+    pub(crate) first_read_newest_first: bool,
 }
 
 // Enum ordinals index this table and Stores' slots.
@@ -24,16 +26,19 @@ pub(crate) const SOURCES: &[Properties] = &[
         source: DurableSource::ClaudeCode,
         snapshot: SnapshotSource::ClaudeCode,
         state_v2: true,
+        first_read_newest_first: false,
     },
     Properties {
         source: DurableSource::Codex,
         snapshot: SnapshotSource::Codex,
         state_v2: true,
+        first_read_newest_first: true,
     },
     Properties {
         source: DurableSource::Pi,
         snapshot: SnapshotSource::Pi,
         state_v2: true,
+        first_read_newest_first: true,
     },
 ];
 

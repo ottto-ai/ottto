@@ -214,6 +214,8 @@ pub(crate) use scan::durable_sources;
 #[cfg(test)]
 pub(crate) mod e2_pipeline_scan_fixture;
 #[cfg(test)]
+mod first_read_order_tests;
+#[cfg(test)]
 mod held_audit_restore_tests;
 #[cfg(test)]
 mod resident_wave_tests;
@@ -832,6 +834,45 @@ impl SourceScanResult {
             index.resume_census_window_end = None;
         }
     }
+    /// Keep exact discoveries in the ordinary durable queue, also after native
+    /// selection retired this page's traversal.
+    pub(crate) fn enqueue_claude_discovery_hints(
+        &self,
+        index: &mut ScanIndex,
+        roots: &[PathBuf],
+        lookback_days: u64,
+        hints: &[PathBuf],
+    ) {
+        if index.traversal.is_none() {
+            ensure_bounded_traversal(
+                SnapshotSource::ClaudeCode,
+                roots,
+                index,
+                &self.census_window_end,
+                lookback_days,
+            );
+        }
+        if let Some(traversal) = index.traversal.as_mut() {
+            enqueue_watcher_hints(SnapshotSource::ClaudeCode, traversal, hints, false);
+        }
+    }
+    /// Queue this page's exact late Task-member hints for a later page; clears
+    /// `census_complete` when any hint is queued, so the census stays open
+    /// until those members are read.
+    pub(crate) fn queue_side_call_hints(
+        &mut self,
+        index: &mut ScanIndex,
+        roots: &[PathBuf],
+        lookback_days: u64,
+        disposition: &mut ClaudeUsageAuthorityDisposition,
+    ) {
+        let hints = std::mem::take(&mut disposition.side_call_hints);
+        if !hints.is_empty() {
+            self.enqueue_claude_discovery_hints(index, roots, lookback_days, &hints);
+            self.census_complete = false;
+        }
+    }
+
     /// Index keys this scan read to completion, with their parsed source
     /// fingerprints.
     pub(crate) fn completed_parses(&self) -> impl Iterator<Item = (&str, &str)> {
@@ -1452,6 +1493,7 @@ use discovery::directory::{
     is_recent_enough_at, opened_candidate_is_within_frozen_window,
     reconcile_missing_index_entries_bounded, DiscoveryRecovery,
 };
+use discovery::first_read_order;
 use discovery::retention::{AccountMoveObservations, DiscoveryRetention};
 
 mod discovery;
@@ -1477,10 +1519,18 @@ use discovery::candidate_open::{open_candidate_beneath_root, opened_object_ident
 #[cfg(test)]
 use discovery::candidate_open::{read_opened_content_samples, START_IDENTITY_SAMPLE_FOR_TEST};
 
+pub(crate) use claude_reemission_exclusions::note_claude_index_rebuild_stop;
+#[cfg(test)]
+use claude_reemission_exclusions::{
+    note_claude_reemission_stop_with_cause_at, ClaudeReemissionStopCause,
+};
+#[cfg(test)]
+pub(crate) fn claude_reemission_stop_reason_for_test() -> &'static str {
+    claude_reemission_stop_reason()
+}
 use claude_reemission_exclusions::{
     claude_reemission_stop_latched, claude_reemission_stop_reason,
     claude_reemission_stop_withheld_folds, note_claude_reemission_stop,
-    note_claude_reemission_stop_with_cause_at, ClaudeReemissionStopCause,
 };
 #[cfg(test)]
 pub(crate) use claude_reemission_exclusions::{

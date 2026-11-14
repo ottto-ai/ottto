@@ -2116,22 +2116,29 @@ fn account_display(grouping: &Grouping, withheld: bool) -> AccountDisplay {
     } else if latest.ties_overflowed {
         Err(LATEST_CONFLICTING)
     } else {
-        // A newest request's key counts only while its row still carries it
-        // (an unsplittable row was untagged after the request was noted).
-        let triples = latest
+        // Ignore empty entries just as history does, including unnamed ones.
+        // A removed key follows its row's unnamed entry after an untag.
+        let mut triples = latest
             .ties
             .iter()
-            .map(|(bucket_start, row_key, key)| {
-                let carried = key.as_ref().filter(|key| {
-                    grouping
-                        .get(bucket_start, row_key)
-                        .and_then(|group| group.by_key.get(&Some((*key).clone())))
-                        .is_some_and(|amounts| amounts.counts != [0; 8])
-                });
-                account_triple(carried, row_key)
+            .filter_map(|(bucket_start, row_key, key)| {
+                let group = grouping.get(bucket_start, row_key)?;
+                let (carried, amounts) = match group.by_key.get(key) {
+                    Some(amounts) => (key.as_ref(), amounts),
+                    None => (None, group.by_key.get(&None)?),
+                };
+                (amounts.counts != [0; 8]).then(|| account_triple(carried, row_key))
             })
             .collect::<BTreeSet<_>>();
-        if triples.iter().any(|(account, _, _)| account.is_none()) {
+        if triples.is_empty() {
+            // Recover only uses at that same instant, never an older account.
+            triples.extend(
+                uses.iter()
+                    .filter(|(_, (_, last_at))| *last_at == latest.at)
+                    .map(|(triple, _)| triple.clone()),
+            );
+        }
+        if triples.is_empty() || triples.iter().any(|(account, _, _)| account.is_none()) {
             Err(LATEST_UNIDENTIFIED)
         } else if triples.len() != 1 {
             Err(LATEST_CONFLICTING)

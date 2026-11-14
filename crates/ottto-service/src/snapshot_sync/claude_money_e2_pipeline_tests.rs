@@ -3504,6 +3504,10 @@ pub(in crate::snapshot_sync) mod money_equivalence_tests {
         include!("root_twin_scope_tests.rs");
     }
     #[cfg(unix)]
+    mod subagent_twin_tail_tests {
+        include!("subagent_twin_tail_tests.rs");
+    }
+    #[cfg(unix)]
     mod lease_touch_oracle_tests {
         include!("lease_touch_oracle_tests.rs");
     }
@@ -3520,6 +3524,10 @@ pub(in crate::snapshot_sync) mod money_equivalence_tests {
     #[cfg(unix)]
     mod codex_creator_slot_oracle_tests {
         include!("../snapshots/sampled_scan/codex_creator_slot_oracle_tests.rs");
+    }
+    #[cfg(unix)]
+    mod codex_login_identity_oracle_tests {
+        include!("../snapshots/sampled_scan/codex_login_identity_oracle_tests.rs");
     }
 }
 
@@ -5525,5 +5533,8 @@ fn e2_pipeline_recorded_removal_stands_when_its_holder_leaves_the_index() {
 }
 
 mod desktop_depth_tests;
+mod late_member_side_calls_tests {
+    include!("late_member_side_calls_tests.rs");
+}
 
 mod copied_session_file_tests;

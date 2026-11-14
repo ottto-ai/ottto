@@ -35,7 +35,7 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
@@ -67,7 +67,14 @@ const MAX_PAGE_OUTPUT_BYTES: u64 = (PAGE_LIMIT * 256 * 1024) as u64;
 const CYCLE_BUDGET: Duration = Duration::from_secs(45);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(12);
 const RELAY_IO_TIMEOUT: Duration = COMMAND_TIMEOUT;
-pub(crate) const COLLECTOR_IO_STOP_TIMEOUT: Duration = Duration::from_secs(15);
+/// One page's deadline (its home-lock wait included), then a lingering
+/// child's drain, plus a margin.
+pub(crate) const COLLECTOR_IO_STOP_TIMEOUT: Duration = COMMAND_TIMEOUT
+    .saturating_add(crate::agent_status::CODEX_CHILD_DRAIN)
+    .saturating_add(Duration::from_secs(3));
+/// A page that waited for its home starts only with this much of its
+/// deadline left.
+const PAGE_START_FLOOR: Duration = Duration::from_secs(5);
 const KILL_SWITCH_ENV: &str = "OTTTO_CODEX_CLOUD_SESSIONS_DISABLED";
 const DEFAULT_API_BASE_URL: &str = "https://api.ottto.net";
 const LEGACY_API_BASE_URL: &str = "https://ottto.net/backend";
@@ -1842,48 +1849,51 @@ impl CloudSessionTransport for RelayCloudSessionTransport {
 }
 pub struct CodexCloudCliRunner;
 
+/// One Codex CLI child (`codex cloud list`, the limits probe's `codex
+/// app-server`), started by `Command::process_group(0)` as the leader of its
+/// own group, owned until it is stopped and reaped.
 #[cfg(unix)]
-struct CodexCloudChild {
+pub(crate) struct CodexChild {
     child: Option<crate::local_resource_diagnostics::cli_children::MeasuredChild>,
 }
 
 #[cfg(unix)]
-impl CodexCloudChild {
-    fn exited(&self) -> std::io::Result<bool> {
-        let child = self.child.as_ref().expect("owned cloud child");
-        // Observe exit without reaping: reserve the PID until the owned process
-        // group has been stopped, even if a descendant retains stdout.
-        let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
-        let result = unsafe {
-            libc::waitid(
-                libc::P_PID,
-                child.id() as libc::id_t,
-                &mut info,
-                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-            )
-        };
-        if result < 0 {
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::Interrupted {
-                return Ok(false);
-            }
-            return Err(error);
-        }
-        Ok(info.si_signo != 0)
+impl CodexChild {
+    pub(crate) fn new(
+        child: crate::local_resource_diagnostics::cli_children::MeasuredChild,
+    ) -> Self {
+        Self { child: Some(child) }
     }
 
-    fn stop_and_reap(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        let mut child = self.child.take().expect("owned cloud child");
-        // Command::process_group(0) created this group; the direct child has
-        // never been reaped, so its PID cannot have been reused by another group.
-        unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
-        let _ = child.kill();
-        child.wait()
+    /// The child's stdin and stdout pipes.
+    pub(crate) fn take_pipes(&mut self) -> (Option<ChildStdin>, Option<ChildStdout>) {
+        let child = self.child.as_mut().expect("owned codex child");
+        (child.stdin.take(), child.stdout.take())
+    }
+
+    pub(crate) fn exited(&self) -> std::io::Result<bool> {
+        let child = self.child.as_ref().expect("owned codex child");
+        crate::process_guard::exited(child).or_else(|error| {
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                Ok(false)
+            } else {
+                Err(error)
+            }
+        })
+    }
+
+    /// Ends the child without cutting off a login refresh it may be making:
+    /// the caller has closed its stdin (or it had none) and its output reader.
+    pub(crate) fn stop_and_reap(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        crate::process_guard::stop_group_and_reap(
+            self.child.take().expect("owned codex child"),
+            crate::agent_status::codex_child_drain(),
+        )
     }
 }
 
 #[cfg(unix)]
-impl Drop for CodexCloudChild {
+impl Drop for CodexChild {
     fn drop(&mut self) {
         if self.child.is_some() {
             let _ = self.stop_and_reap();
@@ -1925,18 +1935,13 @@ fn run_codex_cloud_command(command: &mut Command, deadline: Instant) -> Result<S
         return Err(anyhow!("Codex cloud list timed out"));
     }
     command.process_group(0);
-    let mut owned = CodexCloudChild {
-        child: Some(
-            crate::local_resource_diagnostics::cli_children::spawn(command)
-                .map_err(|_| anyhow!("Codex cloud list could not be started"))?,
-        ),
-    };
+    let mut owned = CodexChild::new(
+        crate::local_resource_diagnostics::cli_children::spawn(command)
+            .map_err(|_| anyhow!("Codex cloud list could not be started"))?,
+    );
     let stdout = owned
-        .child
-        .as_mut()
-        .expect("owned cloud child")
-        .stdout
-        .take()
+        .take_pipes()
+        .1
         .ok_or_else(|| anyhow!("Codex cloud list stdout could not be opened"))?;
     let flags = unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_GETFL) };
     if flags < 0
@@ -2009,6 +2014,19 @@ fn run_codex_cloud_command(command: &mut Command, deadline: Instant) -> Result<S
     }
 }
 
+/// A page not started: a limits read of its home held the home past the
+/// page's deadline.
+#[derive(Debug)]
+struct CodexHomeBusy;
+
+impl std::fmt::Display for CodexHomeBusy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Codex home busy with a limits read")
+    }
+}
+
+impl std::error::Error for CodexHomeBusy {}
+
 impl CloudSessionRunner for CodexCloudCliRunner {
     fn list_page(&self, cursor: Option<&str>, limit: usize) -> Result<String> {
         self.list_page_bounded(cursor, limit, COMMAND_TIMEOUT)
@@ -2061,15 +2079,25 @@ impl CloudSessionRunner for CodexCloudCliRunner {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        // One Codex child per home: never beside a limits read of the same
+        // home, which may be refreshing its login. A page that has to wait for
+        // it starts only with PAGE_START_FLOOR of its deadline left.
         #[cfg(unix)]
         {
-            let started = Instant::now();
-            let result = run_codex_cloud_command(&mut command, deadline);
-            // A deadline already spent starts nothing.
-            if started < deadline {
-                record_codex_cloud_list(&result, started);
-            }
-            result
+            let home = crate::agent_status::codex_cli_home();
+            let wait_until = deadline
+                .checked_sub(PAGE_START_FLOOR)
+                .unwrap_or_else(Instant::now);
+            crate::agent_status::with_codex_home_read_lock_until(&home, wait_until, || {
+                let started = Instant::now();
+                let result = run_codex_cloud_command(&mut command, deadline);
+                // A deadline already spent starts nothing.
+                if started < deadline {
+                    record_codex_cloud_list(&result, started);
+                }
+                result
+            })
+            .unwrap_or_else(|| Err(CodexHomeBusy.into()))
         }
         #[cfg(not(unix))]
         {
@@ -2631,8 +2659,9 @@ impl SliceWork<'_, '_> {
                 .list_page_bounded(cursor, PAGE_LIMIT, timeout.min(COMMAND_TIMEOUT));
         // The lease covers provider-process activity only.
         drop(lease);
-        result.map_err(|_| {
-            if remaining_budget(self.deadline).is_none() {
+        result.map_err(|error| {
+            // A page that never started is retried by the schedule.
+            if remaining_budget(self.deadline).is_none() || error.is::<CodexHomeBusy>() {
                 SliceError {
                     category: "budget_exhausted",
                     kind: SliceErrorKind::Deferred,

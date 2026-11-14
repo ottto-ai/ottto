@@ -71,9 +71,10 @@ pub enum CallKind {
     ClaudeOauthProfile,
     /// `GET chatgpt.com/.../daily-workspace-usage-counts` (Codex daily totals).
     CodexDailyWorkspaceUsage,
-    /// One `codex app-server` quota read: a token refresh and a rate-limits
-    /// read, plus a detailed rate-limits read when due. Counts the requests
-    /// sent, answered or not: 2, or 3 with the detailed read.
+    /// One `codex app-server` quota read: workspace discovery, models and a
+    /// rate-limits read, plus a detailed rate-limits read when due; each read
+    /// lets Codex refresh its login when due. Counts the requests sent,
+    /// answered or not: 3, or 4 with the detailed read.
     CodexAppServerQuota,
     /// One `codex cloud list` page.
     CodexCloudList,

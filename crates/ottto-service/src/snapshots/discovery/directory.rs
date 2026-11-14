@@ -540,6 +540,13 @@ pub(in crate::snapshots) fn advance_bounded_directory_traversal_with_budget(
         }
     }
     let walk_ended = traversal.pending_directories.is_empty();
+    // Every root-walk end of a first read reorders the queue (order only).
+    if walk_ended && root_walk && index.first_read_pending {
+        first_read_order::sort(
+            &mut traversal.pending_candidates,
+            first_read_order::order_for(source),
+        );
+    }
     // Path carries run on the restored walk, before its debt is counted.
     index.traversal = Some(traversal);
     let debt = debt.end(index, walk_ended, carry);

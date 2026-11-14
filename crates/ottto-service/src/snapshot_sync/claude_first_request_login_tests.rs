@@ -57,8 +57,38 @@ fn pass(c: &Corpus, scanner: &E2ScanFixture, index: ScanIndex) -> Page {
 /// retain placement through Tail, restore and upgrade. Deliberately red before the rule.
 #[test]
 fn first_request_own_login_transition_oracle() {
+    first_request_own_login_transition_oracle_with_marker(false);
+}
+
+fn first_request_own_login_transition_oracle_with_marker(marker: bool) {
     with_e2(|| {
         let mut c = Corpus::new("first-request-own-login");
+        if marker {
+            let state = crate::backfill::BackfillState::default();
+            let list = c
+                .support
+                .join("snapshots/claude_code-reemission-exclusions.txt");
+            std::fs::create_dir_all(list.parent().unwrap()).unwrap();
+            std::fs::write(list, b"").unwrap();
+            std::fs::write(
+                crate::snapshots::claude_reemission_seen_marker_path(&c.support),
+                b"",
+            )
+            .unwrap();
+            note_claude_index_rebuild_for_destination(
+                SnapshotSource::ClaudeCode,
+                true,
+                &state,
+                "new-destination",
+                &e2_progress(),
+                &c.base.join("new-index.json"),
+                &c.support,
+            );
+            assert_eq!(
+                crate::snapshots::claude_reemission_stop_reason_for_test(),
+                "none"
+            );
+        }
         let at = cutoff_clock(0);
         let parent = c.root(ROOT, &line(ROOT, "first", &at, 11));
         let mut rows = vec![api_login(ROOT, "first", 11, 'a', Some('b'))];
