@@ -185,8 +185,11 @@ Desktop metadata cache.
 The process-owned transcript cache retains complete Codex home facts in RAM,
 using the shared file stamp for the resolved SQLite main file and its WAL.
 Every pass lists the homes and rebuilds metadata merges, ownership conflicts,
-completeness and path fingerprints. Roster changes, changed inputs and partial
-loads reload the complete title group. Changed thread databases use one
+completeness and path fingerprints. A home whose stamps match is reused; only
+changed or added homes reload, and an unstamped or incomplete home is not kept.
+A pass that reuses a home and ends with an identity conflict, or with changed
+merged title inputs for a reused home's ids, reloads every home cold once.
+Changed thread databases use one
 streaming census with independent staging for title, usage and created rows.
 Raw title equality uses an optional digest; a SHA midstate preserves the exact
 existing fingerprint bytes after the merged title prefix is known.
