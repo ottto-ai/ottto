@@ -13602,12 +13602,33 @@ struct SmokeResult {
 /// Code for a Verify smoke the quiet window held back: starting Claude Code
 /// now could refresh, and so sign out, the saved login.
 pub(crate) const CLAUDE_LOGIN_REFRESH_PENDING_CODE: &str = "claude_login_refresh_pending";
+pub(crate) const CLAUDE_SMOKE_TIMEOUT_MESSAGE: &str =
+    "The Claude Code test run timed out before Ottto could check it.";
 
 fn run_verification_smoke_prompt(
     daemon: &LocalDaemon,
     source: &SourceKind,
 ) -> Result<SmokeResult, LocalApiError> {
     if *source == SourceKind::ClaudeCode {
+        let connected = daemon
+            .state()?
+            .sources
+            .iter()
+            .find(|health| health.source == *source)
+            .and_then(|health| health.agent_status.as_ref())
+            .is_some_and(crate::agent_status::claude_default_check_skipped);
+        if connected {
+            return Ok(SmokeResult {
+                command_found: true,
+                succeeded: false,
+                exit_status: None,
+                duration_ms: 0,
+                message: "Claude is connected through an account added in Ottto. The live check is skipped because Claude Code isn't signed in on this Mac.".to_string(),
+                diagnostic: None,
+                error_code: Some(crate::agent_status::CLAUDE_OTTTO_SIGNED_IN.to_string()),
+                local_session_observed: None,
+            });
+        }
         daemon.remember_claude_verification_auth_marker(
             crate::agent_status::claude_credential_modified_marker(
                 &ottto_core::ClaudeConfigDirSlot::Default,
@@ -13868,6 +13889,11 @@ fn run_bounded_command(
                         format!("{display_name} smoke session completed.")
                     } else if usage_limited {
                         usage_limited_smoke_message(display_name)
+                    } else if program == "claude" {
+                        match diagnostic.as_deref() {
+                            Some(diagnostic) => format!("The Claude Code test run failed before Ottto could check it: {diagnostic}"),
+                            None => "The Claude Code test run failed before Ottto could check it.".to_string(),
+                        }
                     } else if let Some(diagnostic) = diagnostic.as_deref() {
                         format!(
                             "{display_name} smoke session failed before verification could complete: {diagnostic}"
@@ -13912,6 +13938,8 @@ fn run_bounded_command(
                     duration_ms: start.elapsed().as_millis(),
                     message: if usage_limited {
                         usage_limited_smoke_message(display_name)
+                    } else if program == "claude" {
+                        CLAUDE_SMOKE_TIMEOUT_MESSAGE.to_string()
                     } else {
                         format!(
                         "{display_name} smoke session timed out before verification could complete."
@@ -14766,7 +14794,10 @@ fn smoke_failure_verification_result_with_config(
     verification_result_with_config(
         source,
         config,
-        if usage_limited || refresh_pending {
+        if usage_limited
+            || refresh_pending
+            || smoke.error_code.as_deref() == Some(crate::agent_status::CLAUDE_OTTTO_SIGNED_IN)
+        {
             SourceVerificationStatus::Warning
         } else if provider_reauth_required {
             SourceVerificationStatus::ReconnectRequired
@@ -28340,6 +28371,10 @@ for line in sys.stdin:
                 SourceVerificationStatus::Warning,
                 CLAUDE_LOGIN_REFRESH_PENDING_CODE,
             ),
+            (
+                SourceVerificationStatus::Warning,
+                crate::agent_status::CLAUDE_OTTTO_SIGNED_IN,
+            ),
             (SourceVerificationStatus::Warning, SOURCE_NOT_INSTALLED_CODE),
             (
                 SourceVerificationStatus::NoFreshTelemetry,
@@ -30575,8 +30610,7 @@ X-API-Key = "otel_redacted"
             succeeded: false,
             exit_status: Some(1),
             duration_ms: 12,
-            message: "Claude Code smoke session failed before verification could complete."
-                .to_string(),
+            message: "The Claude Code test run failed before Ottto could check it.".to_string(),
             diagnostic: Some(
                 "Failed to authenticate: OAuth session expired and could not be refreshed"
                     .to_string(),
@@ -30599,7 +30633,21 @@ X-API-Key = "otel_redacted"
     }
 
     #[test]
+    #[serial]
     fn claude_signed_out_smoke_requires_provider_sign_in() {
+        let _lock = lock_backend_test_env();
+        let root = control_test_root("claude-ottto-connected-smoke");
+        let fake_claude = fake_binary_path(&root, "claude");
+        fs::write(&fake_claude, "#!/bin/sh\n: > \"$HOME/spawned\"\necho 'Not logged in · Please run /login' >&2\nexit 1\n").unwrap();
+        let fake_security = fake_binary_path(&root, "security");
+        fs::write(&fake_security, "#!/bin/sh\nexit 44\n").unwrap();
+        for path in [&fake_claude, &fake_security] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _home = EnvVarGuard::set_path("HOME", &root);
+        let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
+        let _search =
+            EnvVarGuard::set_path("OTTTO_COMMAND_SEARCH_PATH", fake_claude.parent().unwrap());
         for diagnostic in [
             "Not logged in · Please run /login",
             "not signed in",
@@ -30642,6 +30690,116 @@ X-API-Key = "otel_redacted"
                 vec![(SourceKind::ClaudeCode, true)]
             );
         }
+        let daemon = daemon().with_account(connected_account());
+        let snapshot: AgentStatusSnapshot = serde_json::from_value(json!({
+            "source": "claude_code", "status": "available", "collection_method": "command_probe",
+            "captured_at": "2026-11-13T00:00:00Z", "expires_at": "2026-11-13T00:15:00Z",
+            "account": {"login_state": "signed_out", "confidence": "low"},
+            "diagnostics": [{"code": crate::agent_status::CLAUDE_OTTTO_SIGNED_IN,
+                "severity": "info", "message": "1 Claude account signed in through Ottto"}]
+        }))
+        .unwrap();
+        let mut initial = verification_result(
+            SourceKind::ClaudeCode,
+            SourceVerificationStatus::Failed,
+            false,
+            0,
+            None,
+            None,
+            None,
+            "smoke_command_failed",
+            "old failed check",
+        );
+        for (code, clears) in [
+            ("smoke_command_failed", false),
+            (CLAUDE_OAUTH_REAUTH_REQUIRED_CODE, true),
+        ] {
+            initial.message.code = code.into();
+            daemon.record_verification_result(&initial).unwrap();
+            daemon.record_agent_status_health(snapshot.clone()).unwrap();
+            let status = daemon.status("token").unwrap();
+            assert_eq!(
+                status.sources[0].state,
+                if clears {
+                    ottto_protocol::SourceState::NeedsConfirmation
+                } else {
+                    ottto_protocol::SourceState::Failed
+                }
+            );
+            if clears {
+                let canonical = status.canonical_health.unwrap();
+                assert_ne!(
+                    canonical.overall.next_action.as_deref(),
+                    Some("finish_source_setup")
+                );
+            }
+        }
+        assert_eq!(daemon.claude_verification_auth_marker().unwrap(), None);
+        assert!(!root.join("spawned").exists());
+        let smoke = run_verification_smoke_prompt(&daemon, &SourceKind::ClaudeCode).unwrap();
+        assert_eq!(smoke.duration_ms, 0);
+        assert_eq!(smoke.exit_status, None);
+        assert!(!root.join("spawned").exists());
+        assert_eq!(daemon.claude_verification_auth_marker().unwrap(), None);
+        initial = smoke_failure_verification_result(SourceKind::ClaudeCode, &smoke, None);
+        attach_verification_check(&mut initial);
+        assert_eq!(initial.status, SourceVerificationStatus::Warning);
+        assert!(!initial.verified);
+        assert_eq!(
+            initial.message.code,
+            crate::agent_status::CLAUDE_OTTTO_SIGNED_IN
+        );
+        assert_eq!(
+            initial.check.as_ref().unwrap().scope,
+            SourceVerificationScope::NotEstablished
+        );
+        daemon.record_verification_result(&initial).unwrap();
+        let status = daemon.status("token").unwrap();
+        let health = &status.sources[0];
+        assert_eq!(health.state, ottto_protocol::SourceState::NeedsConfirmation);
+        assert_eq!(health.grade, ottto_protocol::HealthGrade::Warning);
+        assert_eq!(health.problems.len(), 1);
+        assert_eq!(
+            health.problems[0].code,
+            ottto_protocol::StableProblemCode::AgentCliUnavailable
+        );
+        assert!(health.recommended_actions.is_empty());
+        assert!(daemon
+            .blocking_verification_retry_states()
+            .unwrap()
+            .is_empty());
+        let canonical_health = status.canonical_health.unwrap();
+        assert_ne!(
+            canonical_health.overall.severity,
+            ottto_protocol::LocalHealthSeverity::Blocking
+        );
+        assert_ne!(
+            canonical_health.overall.next_action.as_deref(),
+            Some("finish_source_setup")
+        );
+        let canonical = &canonical_health.sources[0];
+        assert_eq!(
+            canonical.state,
+            ottto_protocol::LocalHealthSourceState::PendingSetup
+        );
+        assert!(canonical.next_action.is_none());
+        for (has_slot, login) in [(false, "signed_out"), (true, "unsupported")] {
+            let mut saved = serde_json::to_value(&snapshot).unwrap();
+            saved["account"]["login_state"] = json!(login);
+            if !has_slot {
+                saved["diagnostics"] = json!([]);
+            }
+            daemon.state().unwrap().sources[0].agent_status =
+                Some(serde_json::from_value(saved).unwrap());
+            let smoke = run_verification_smoke_prompt(&daemon, &SourceKind::ClaudeCode).unwrap();
+            assert!(root.join("spawned").exists());
+            assert_eq!(
+                smoke.error_code.as_deref(),
+                Some(CLAUDE_OAUTH_REAUTH_REQUIRED_CODE)
+            );
+            fs::remove_file(root.join("spawned")).unwrap();
+        }
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

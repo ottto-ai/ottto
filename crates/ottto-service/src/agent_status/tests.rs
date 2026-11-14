@@ -2460,6 +2460,19 @@ exit 1
         "2026-08-04T12:49:56Z".to_string(),
     );
     let snapshots = collection.snapshots;
+    for snapshot in &snapshots {
+        let uploaded = snapshot.clone().redacted_for_backend();
+        let signed_in = uploaded
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == CLAUDE_OTTTO_SIGNED_IN)
+            .expect("signed-in slot count reaches the uploaded diagnostics");
+        assert_eq!(signed_in.severity, AgentDiagnosticSeverity::Info);
+        assert_eq!(
+            signed_in.message,
+            "3 Claude accounts signed in through Ottto"
+        );
+    }
 
     // A slot with no stored login proves no account locally (as `claude
     // auth status` reported `loggedIn: false` for it), so it emits no
@@ -2801,6 +2814,43 @@ exit 1
     assert!(!local_state.contains(root.to_string_lossy().as_ref()));
     assert!(!local_state.contains("fixture"));
 
+    drop((_oauth_poison, _api_poison, _bedrock_poison, _vertex_poison));
+    fs::remove_file(home.join(".claude/.credentials.json")).unwrap();
+    let collect = || {
+        collect_agent_status_collection(
+            &SourceKind::ClaudeCode,
+            captured_at.clone(),
+            "2026-08-04T12:49:56Z".to_string(),
+        )
+    };
+    let signed_out = collect();
+    assert_eq!(
+        signed_out
+            .source_health_snapshot
+            .account
+            .unwrap()
+            .login_state,
+        AgentLoginState::SignedOut
+    );
+    for slot in status.managed_slots.iter().chain(&status.external_slots) {
+        store
+            .remove(
+                ottto_protocol::CLAUDE_CONFIG_SLOT_SETTINGS_SCHEMA_VERSION,
+                &slot.slot_id,
+            )
+            .unwrap();
+    }
+    let no_slots = collect();
+    for snapshot in no_slots
+        .snapshots
+        .iter()
+        .chain(std::iter::once(&no_slots.source_health_snapshot))
+    {
+        assert!(!snapshot
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == CLAUDE_OTTTO_SIGNED_IN));
+    }
     let _ = fs::remove_dir_all(root);
 }
 
