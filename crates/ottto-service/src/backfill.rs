@@ -500,9 +500,7 @@ fn source_needs_backfill(
     directive: HistoricalReplayDirective,
 ) -> bool {
     let slug = source.api_slug();
-    let has_bootstrapped = state.completed_parser_versions.contains_key(slug)
-        || state.completed_replay_revisions.contains_key(slug);
-    if !has_bootstrapped {
+    if !has_bootstrapped(state, slug) {
         return true;
     }
     directive.policy == HistoricalReplayPolicy::Full
@@ -511,6 +509,27 @@ fn source_needs_backfill(
             .get(slug)
             .map(|recorded| recorded.as_str() != directive.revision)
             .unwrap_or(true)
+}
+
+fn has_bootstrapped(state: &BackfillState, slug: &str) -> bool {
+    state.completed_parser_versions.contains_key(slug)
+        || state.completed_replay_revisions.contains_key(slug)
+}
+
+/// The source's first backfill for this destination: none completed, or one
+/// completed for another destination. A replay revision bump alone is not.
+pub fn bootstrap_pending_for_destination(
+    state: &BackfillState,
+    source: SnapshotSource,
+    destination_namespace_hash: &str,
+) -> bool {
+    let slug = source.api_slug();
+    !has_bootstrapped(state, slug)
+        || state
+            .completed_destination_namespaces
+            .get(slug)
+            .map(String::as_str)
+            != Some(destination_namespace_hash)
 }
 
 /// Returns sources that need their first historical bootstrap or an explicit

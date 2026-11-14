@@ -1862,6 +1862,17 @@ unchanged and verified, so its subagents keep their own decisions). Counted afte
 selection since the previous Claude page; counts only, no ids or paths; they
 never affect selection or money.
 
+## Codex byte-budget pacing
+
+The Codex `native_collection_page` line carries `page_byte_budget_hit: 1` in
+`page_selection` when the page put a file back because a page byte budget was
+spent (the singleton bytes, or the cursor's for a large file). A rotation turn,
+a pace verdict, a busy cursor slot or a census fence does not set it. During a
+destination's first backfill, a page with this flag and queued work asks for
+the next pass on the resident pacing gap (30 s on AC, 180 s on battery, at
+background QoS); afterwards it asks for nothing. It never affects selection or
+money.
+
 ## Claude OTLP spans and relay requests not stored
 
 These `process_retained_cache_lifecycle_totals` counters tell a request Claude

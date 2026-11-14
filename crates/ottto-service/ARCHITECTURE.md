@@ -325,6 +325,9 @@ resident deferral, or a selection that filled its file allowance while source wo
 requests another ordinary pass after 30 seconds on AC or 180 seconds on battery with Low Power
 Mode off. Unknown power and Low Power Mode retain ordinary cadence.
 Prepare, finish, server minima, upload backoff and background QoS still apply.
+During a source's first backfill for its destination (not a replay revision bump), a Codex page
+that put a file back because a page byte budget was spent, with work still queued, requests the
+same paced pass. Its QoS comes from one function, background like every paced pass.
 
 ## SQLite
 

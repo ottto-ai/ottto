@@ -94,11 +94,33 @@ pub(super) fn paced_source_qos(
     }
     qos
 }
-pub(super) fn resident_scan_requested(scan: &SourceScanResult) -> bool {
+/// A page with queued work asks for the next pass sooner. A spent byte budget
+/// asks only during the source's first backfill for this destination.
+pub(super) fn resident_scan_requested(scan: &SourceScanResult, first_read_bootstrap: bool) -> bool {
     scan.charge_deferred
-        || (scan.page_file_limit_hit && scan.census_status.pending_work && !scan.routine_recensus)
+        || (scan.census_status.pending_work
+            && ((scan.page_file_limit_hit && !scan.routine_recensus)
+                || (first_read_bootstrap && scan.page_byte_budget_hit)))
 }
-pub(super) fn request_resident_scan(source: SnapshotSource) {
+/// Per source: the standing paced request came from the first-read byte term
+/// alone. RAM only; read only while that request is due.
+static FIRST_READ_BYTE_PASS: [AtomicBool; 3] = [const { AtomicBool::new(false) }; 3];
+/// The QoS of `source`'s due paced pass, chosen by why it was requested.
+pub(super) fn paced_pass_qos(source: SnapshotSource) -> fn() -> Option<MacPlatformSignals> {
+    if FIRST_READ_BYTE_PASS[source as usize].load(Ordering::Relaxed) {
+        first_read_byte_pass_qos
+    } else {
+        resident_background
+    }
+}
+/// The one site that sets the QoS of a pass only the first-read byte term
+/// asked for: background, as for every paced pass today.
+/// `Some(MacPlatformSignals::default())` would keep the default QoS instead.
+pub(super) fn first_read_byte_pass_qos() -> Option<MacPlatformSignals> {
+    resident_background()
+}
+pub(super) fn request_resident_scan(source: SnapshotSource, first_read_bytes_only: bool) {
+    FIRST_READ_BYTE_PASS[source as usize].store(first_read_bytes_only, Ordering::Relaxed);
     if let Some(pacing) = resident_pacing(MacPlatformSignals::default().power()) {
         with_source_cadence(source, |cadence| {
             cadence.request_paced_scan(Instant::now(), Duration::ZERO, pacing)
