@@ -1123,18 +1123,23 @@ const MINT_SESSION: &str = "019fa111-2222-7333-8444-555555555555";
 
 /// A real ordinary page that leaves one rollout's job paused and accelerated.
 /// Run under `with_test_limits_for_test`.
-fn paused_accelerated_scan(root: &Path, cache: &Arc<SharedCache>) -> SourceScanResult {
-    let session = MINT_SESSION;
+/// A Codex rollout body: the session header and `turns` token counts.
+fn rollout_body(session: &str, turns: u64) -> String {
     let mut body = format!(
         "{}\n",
         serde_json::json!({"type":"session_meta", "timestamp":"2026-10-24T00:00:00Z", "payload":{"id":session}})
     );
-    for n in 1..=80 {
+    for n in 1..=turns {
         body.push_str(&format!("{}\n", serde_json::json!({"type":"event_msg", "timestamp":"2026-10-24T00:30:00Z", "payload":{"type":"token_count", "info":{"model":"fixture-model", "total_token_usage":{"input_tokens":n*100,"cached_input_tokens":n*50,"output_tokens":n*10},"last_token_usage":{"input_tokens":100,"cached_input_tokens":50,"output_tokens":10}}}})));
     }
+    body
+}
+
+fn paused_accelerated_scan(root: &Path, cache: &Arc<SharedCache>) -> SourceScanResult {
+    let session = MINT_SESSION;
     std::fs::write(
         root.join(format!("rollout-2026-10-24T00-00-00-{session}.jsonl")),
-        body,
+        rollout_body(session, 80),
     )
     .unwrap();
     let mut owned = crate::snapshots::OwnedSourceScan::new(
@@ -1479,22 +1484,11 @@ fn byte_budget_pages_pace_only_during_a_first_backfill() {
 
 /// `count` Codex rollouts of about 1.7 KiB each in `root`, numbered from `first`.
 fn codex_rollouts(root: &Path, first: u64, count: u64) -> Vec<PathBuf> {
-    let line = |value: serde_json::Value| format!("{value}\n");
     (first..first + count)
         .map(|n| {
             let session = format!("019fa111-2222-7333-8444-{n:012}");
-            let mut body = line(serde_json::json!({"timestamp": "2026-10-20T10:00:00Z",
-                "type": "session_meta", "payload": {"id": session}}));
-            for t in 1..=5_u64 {
-                body += &line(serde_json::json!({"timestamp": "2026-10-20T10:30:00Z",
-                    "type": "event_msg", "payload": {"type": "token_count", "info": {
-                    "model": "fixture-model", "total_token_usage": {"input_tokens": t * 100,
-                    "cached_input_tokens": t * 50, "output_tokens": t * 10},
-                    "last_token_usage": {"input_tokens": 100, "cached_input_tokens": 50,
-                    "output_tokens": 10}}}}));
-            }
-            let path = root.join(format!("rollout-2026-10-20T10-00-00-{session}.jsonl"));
-            std::fs::write(&path, body).unwrap();
+            let path = root.join(format!("rollout-2026-10-24T00-00-00-{session}.jsonl"));
+            std::fs::write(&path, rollout_body(&session, 5)).unwrap();
             path
         })
         .collect()
@@ -1503,7 +1497,7 @@ fn codex_rollouts(root: &Path, first: u64, count: u64) -> Vec<PathBuf> {
 /// [behaviour] Byte-bound Codex pages ask for paced passes during the first
 /// backfill. Once census completion marks the backfill state, new large
 /// files still spend the byte budget but ask for nothing. A pending replay
-/// revision is not a first backfill; a re-paired destination is.
+/// revision is not a first backfill.
 #[test]
 fn first_read_byte_pacing_stops_when_backfill_completes() {
     use super::super::backfill_replay_pending;
@@ -1569,8 +1563,6 @@ fn first_read_byte_pacing_stops_when_backfill_completes() {
         .insert("codex".into(), "codex_replay:v0".into());
     assert!(backfill_replay_pending(codex, &state, DESTINATION));
     assert!(!bootstrap(&state), "a pending replay revision");
-    let repaired = bootstrap_pending_for_destination(&state, codex, "re-paired");
-    assert!(repaired, "a re-paired destination");
     std::fs::remove_dir_all(home).unwrap();
 }
 

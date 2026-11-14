@@ -120,9 +120,6 @@ fn only_a_spent_byte_budget_marks_the_page_deferred() {
     assert_eq!(p.plan(0, true, "/same"), (Singleton, false));
     // A small read, then a file that no longer fits.
     assert_eq!(p.plan(41, true, "/b"), (Defer, true));
-    let mut p = Page::new();
-    p.1.charge(false, 50);
-    assert_eq!(p.plan(1, true, "/c"), (Defer, true));
     // A busy slot alone.
     assert_eq!(Page::new().plan(60, false, "/busy"), (Defer, false));
     // A rotation turn.

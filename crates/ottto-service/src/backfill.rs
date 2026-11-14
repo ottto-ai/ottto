@@ -566,11 +566,7 @@ pub fn pending_backfill_sources_for_destination(
     .filter(|source| !(state.prior_history_unverified && *source == SnapshotSource::ClaudeCode))
     .filter(|source| {
         source_needs_backfill(state, *source, current_historical_replay(*source))
-            || state
-                .completed_destination_namespaces
-                .get(source.api_slug())
-                .map(String::as_str)
-                != Some(destination_namespace_hash)
+            || bootstrap_pending_for_destination(state, *source, destination_namespace_hash)
     })
     .collect()
 }
