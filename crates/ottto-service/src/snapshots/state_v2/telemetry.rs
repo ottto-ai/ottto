@@ -383,7 +383,7 @@ pub(in super::super) fn retained_pass_end(index: &ScanIndex) {
         retained(index, "active_graph");
     }
 }
-pub(in super::super) fn plateau(relief: crate::local_resource_diagnostics::AllocatorRelief) {
+pub(in super::super) fn plateau() {
     if !PASS.with(|pass| pass.borrow().active) {
         return;
     }
@@ -391,7 +391,6 @@ pub(in super::super) fn plateau(relief: crate::local_resource_diagnostics::Alloc
         "post_pass_plateau",
         MemoryWindow {
             current: crate::local_resource_diagnostics::state_v2_memory(),
-            allocator_relief: cfg!(target_os = "macos").then_some(relief),
             ..Default::default()
         },
     );
@@ -522,8 +521,6 @@ fn side_maps(index: &ScanIndex) -> Option<u64> {
 
 #[derive(Default, Serialize)]
 struct MemoryWindow {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    allocator_relief: Option<crate::local_resource_diagnostics::AllocatorRelief>,
     current: crate::local_resource_diagnostics::StateV2Memory,
     peak: crate::local_resource_diagnostics::StateV2Memory,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -733,7 +730,7 @@ mod ops_tests {
         decoded(13, 0, 0);
         let (_, records) = crate::local_resource_diagnostics::capture(|| {
             ScanIndex::load(&path).unwrap();
-            plateau(Default::default());
+            plateau();
         });
         let record = records
             .iter()
@@ -768,7 +765,7 @@ mod ops_tests {
             save_work(1, 1);
             decoded(5, 0, 0);
             event("hold", &"none");
-            plateau(Default::default());
+            plateau();
         });
         let (_, outside) = crate::local_resource_diagnostics::capture(|| {
             event("hold", &"none");
@@ -838,9 +835,8 @@ mod ops_tests {
             }
             for _ in 0..2 {
                 pass_start();
-                let relief = crate::local_resource_diagnostics::release_memory();
-                plateau(relief);
-                plateau(relief); // A completed pass cannot emit a second end row.
+                plateau();
+                plateau(); // A completed pass cannot emit a second end row.
             }
         });
         PASS.with(|pass| *pass.borrow_mut() = previous);
@@ -852,13 +848,7 @@ mod ops_tests {
         for record in &records[10..] {
             let plateau = &record["counts"]["stage_memory"]["post_pass_plateau"];
             assert!(plateau.is_object());
-            if cfg!(target_os = "macos") {
-                for field in ["before_footprint_bytes", "after_footprint_bytes", "wall_us"] {
-                    assert!(plateau["allocator_relief"][field].is_u64());
-                }
-            } else {
-                assert!(plateau.get("allocator_relief").is_none());
-            }
+            assert!(plateau.get("allocator_relief").is_none());
         }
     }
 
@@ -870,7 +860,7 @@ mod ops_tests {
         let (_, records) = crate::local_resource_diagnostics::capture(|| {
             pass_start();
             baseline(Path::new("/synthetic-missing-baseline/scan-index.json"));
-            plateau(Default::default());
+            plateau();
         });
         PASS.with(|pass| *pass.borrow_mut() = previous);
         assert_eq!(records.len(), 1, "{records:?}");
@@ -901,7 +891,7 @@ mod ops_tests {
             }
             tail_stage(2, 100, 100);
             tail_stage(5, 40, 100);
-            plateau(Default::default());
+            plateau();
         });
         let tail = PASS.with(|pass| std::mem::replace(&mut *pass.borrow_mut(), previous).tail);
         let rows: Vec<_> = records
@@ -969,7 +959,7 @@ mod ops_tests {
                 drop(Stage::new(Kind::Save));
             }
             save_work(1, 1);
-            plateau(Default::default());
+            plateau();
             PASS.with(|pass| *pass.borrow_mut() = previous);
             let mut window = crate::local_resource_diagnostics::StageSum::begin(
                 "claude_code",
