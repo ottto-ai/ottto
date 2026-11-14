@@ -266,6 +266,11 @@ pub(crate) fn claude_identity_over_cap(
     with_claude_identity_over_cap(record);
 }
 
+#[cfg(test)]
+pub(crate) fn identity_over_cap_counts_for_test() -> [u64; 8] {
+    with_claude_identity_over_cap(|counts| std::array::from_fn(|i| counts[i].load(Relaxed)))
+}
+
 /// Wire bytes of the last over-cap tagged body by component, measured before
 /// its display leaves are shed; `after_shed` is what the tag selector then
 /// sees. Counts and an 8-hex entity digest only.

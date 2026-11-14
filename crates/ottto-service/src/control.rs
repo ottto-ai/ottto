@@ -13765,6 +13765,10 @@ fn smoke_command(source: &SourceKind) -> SmokeCommand {
                 SMOKE_PROMPT,
                 "--name",
                 "ottto test",
+                "--settings",
+                r#"{"env":{"OTEL_LOGS_EXPORTER":"none","OTEL_TRACES_EXPORTER":"none","OTEL_METRICS_EXPORTER":"none"}}"#,
+                "--session-id",
+                &crate::claude_spawn_gate::internal_session_id(),
                 "--disallowedTools",
                 "*",
                 "--no-session-persistence",
@@ -34107,3 +34111,7 @@ X-API-Key = "otel_redacted"
 
     mod claude_settings;
 }
+
+#[cfg(all(test, unix))]
+#[path = "control_smoke_session_tests.rs"]
+mod smoke_session_tests;

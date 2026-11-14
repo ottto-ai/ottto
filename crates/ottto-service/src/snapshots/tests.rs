@@ -6469,6 +6469,7 @@ fn apply_upload_policy_strips_artifacts_when_disabled() {
 
 pub(super) fn sample_session_artifact_item() -> SnapshotItem {
     let mut item = SnapshotItem {
+        evidence_basis: None,
         request_evidence: Vec::new(),
         request_identity_refusals: 0,
         claude_org_markers: None,
@@ -19207,6 +19208,7 @@ fn v6_snapshot_batch_matches_backend_contract() {
         cache_creation_cost_usd: None,
     };
     let mut item = SnapshotItem {
+        evidence_basis: None,
         request_evidence: Vec::new(),
         request_identity_refusals: 0,
         claude_org_markers: None,
@@ -21002,6 +21004,7 @@ pub(super) fn valid_v6_batch_request() -> SnapshotBatchRequest {
         machine_id: "machine-contract-0001".to_string(),
         collector_version: Some("local-enriched/1".to_string()),
         snapshots: vec![SnapshotItem {
+            evidence_basis: None,
             request_evidence: Vec::new(),
             request_identity_refusals: 0,
             claude_org_markers: None,

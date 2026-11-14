@@ -957,13 +957,13 @@ fn take_throttled_alarm_slot(
 }
 
 use sources::claude::census::usage_ledger::{
-    classify_claude_legacy_request_owners, claude_api_cache_creation,
-    claude_api_evidence_fingerprint_is_valid, claude_api_reasoning_matches,
-    claude_snapshot_request_id_hashes, claude_trace_evidence_fingerprint_is_valid,
-    claude_trace_owner_session_id, reconstruct_claude_usage_family, serialized_json_digest,
+    classify_claude_legacy_request_owners, claude_api_cache_creation, claude_api_reasoning_matches,
+    claude_snapshot_request_id_hashes, claude_trace_owner_session_id,
+    reconstruct_claude_usage_family, serialized_json_digest,
 };
 pub(crate) use sources::claude::census::usage_ledger::{
-    claude_api_cache_creation_rejection_count, claude_api_matches_transcript_occurrence,
+    claude_api_cache_creation_rejection_count, claude_api_evidence_fingerprint_is_valid,
+    claude_api_matches_transcript_occurrence, claude_trace_evidence_fingerprint_is_valid,
     validate_claude_api_row, ClaudeLegacyRequestOwners,
 };
 #[cfg(test)]
