@@ -9440,7 +9440,10 @@ fn setup_run_status_is_active(status: &str) -> bool {
 }
 
 fn setup_reconcile_status_reason(status: Option<&str>) -> String {
-    format!("status:{}", status.unwrap_or("unknown"))
+    format!(
+        "status:{}",
+        bounded_display_text(status.unwrap_or("unknown"), 64)
+    )
 }
 
 fn setup_reconcile_error_kind(error: &LocalApiError) -> &'static str {
@@ -9539,9 +9542,17 @@ pub(crate) fn reconcile_setup_scan_in_background(daemon: &LocalDaemon) {
                 )?;
                 request_snapshot_sync_after_setup_actions(daemon, &actions);
                 Ok((
-                    idle && last_run_status
-                        .as_deref()
-                        .is_some_and(|status| !setup_run_status_is_active(status)),
+                    idle && matches!(
+                        last_run_status.as_deref(),
+                        Some(
+                            "waiting_for_user"
+                                | "completed"
+                                | "failed"
+                                | "expired"
+                                | "cancelled"
+                                | "pending_auth"
+                        )
+                    ),
                     setup_reconcile_status_reason(last_run_status.as_deref()),
                 ))
             }
@@ -9695,7 +9706,7 @@ fn setup_run(
         connection,
     };
 
-    scan_setup_run(
+    scan_setup_run_with_action_count(
         daemon,
         &api_base_url,
         &mut credentials,
@@ -9703,26 +9714,6 @@ fn setup_run(
         sources,
         claim_code_provided,
         None,
-    )
-}
-
-fn scan_setup_run(
-    daemon: &LocalDaemon,
-    api_base_url: &str,
-    credentials: &mut SetupRunCredentials,
-    machine: &MachineIdentity,
-    sources: Vec<SourceKind>,
-    claim_code_provided: bool,
-    expected_device: Option<&str>,
-) -> Result<serde_json::Value, LocalApiError> {
-    scan_setup_run_with_action_count(
-        daemon,
-        api_base_url,
-        credentials,
-        machine,
-        sources,
-        claim_code_provided,
-        expected_device,
         &mut 0,
     )
 }
@@ -22602,6 +22593,8 @@ for line in sys.stdin:
             Some("waiting_for_companion"),
             Some("scanning"),
             Some("running_action"),
+            Some("unknown"),
+            Some("future_status"),
             None,
         ] {
             let response = match status {
@@ -22629,6 +22622,43 @@ for line in sys.stdin:
             assert_eq!(state.failures, u32::from(!settled));
             assert_eq!(state.next_due.is_some(), !settled);
         }
+    }
+
+    /// [regress] One completed action and its final idle poll settle in one attempt.
+    #[test]
+    #[serial]
+    fn background_setup_scan_settles_after_one_action() {
+        let _lock = lock_backend_test_env();
+        let (base, server) = scripted_json_backend(vec![
+            (200, scan_refresh("waiting_for_companion")),
+            (200, "{}"),
+            (
+                200,
+                r#"{"run_status":"running_action","action":{"id":"synthetic-action","action_type":"unsupported","source":null}}"#,
+            ),
+            (200, "{}"),
+            (200, SCAN_DETAIL),
+            (200, "{}"),
+            (200, r#"{"run_status":"completed","action":null}"#),
+        ]);
+        let (_root, _guards, daemon, _) = scan_fixture(base);
+        reconcile_setup_scan_in_background(&daemon);
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 7);
+        assert_eq!(
+            requests.iter().filter(|r| r.contains("/complete ")).count(),
+            1
+        );
+        assert_eq!(
+            FileConnectionStore::default()
+                .setup_scan_settled_run_id()
+                .unwrap()
+                .as_deref(),
+            Some("run_connected_setup"),
+        );
+        let state = SETUP_SCAN.lock().unwrap();
+        assert_eq!(state.failures, 0);
+        assert!(state.next_due.is_none());
     }
 
     /// [regress] An action-bearing poll cannot settle when the loop reaches its cap.
@@ -22665,6 +22695,14 @@ for line in sys.stdin:
             "status:completed"
         );
         assert_eq!(setup_reconcile_status_reason(None), "status:unknown");
+        assert_eq!(
+            setup_reconcile_status_reason(Some(" \ncompleted\t\r")),
+            "status:completed"
+        );
+        assert_eq!(
+            setup_reconcile_status_reason(Some(&"x".repeat(100))),
+            format!("status:{}", "x".repeat(64))
+        );
         assert_eq!(
             format!(
                 "error:{}",
