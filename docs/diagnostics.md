@@ -352,8 +352,8 @@ keeping the prior body rather than emitting a zero replacement.
 
 A `source_finish` record wraps rotation finish, including its validation,
 post-policy finalization and upload work. It exists exactly when finish was
-called and returned normally, including an error return. It has `counts: {}`
-and no result field; outcome reporting and transport receipts remain the
+called and returned normally, including an error return. It has no result
+field; outcome reporting and transport receipts remain the
 existing outcome owners. Prepare failures, prepare returning no frame,
 rotation validation failures before finish, panics, aborts and hard kills
 produce no finish record.
@@ -383,7 +383,43 @@ across the same window, on every windowed stage record: `source_prepare`,
 overlap, so never sum overlapping windows. They are macOS only and absent
 elsewhere, after a failed sample or on a regressing counter. Summed windows
 (`evidence_decode`, `evidence_cross_root`) and point records omit them.
-`source_prepare` also reports `observation.malloc_in_use_bytes` sampled at prepare start on macOS; absent when unavailable.
+Energy and wakeup measurements use the same process sample as disk bytes:
+`energy_nj`, `penergy_nj`, `interrupt_wkups`, and `pkg_idle_wkups`.
+They are macOS-only deltas from `RUSAGE_INFO_V6`, omitted when unavailable
+or regressing. Older kernels fall back to v2 disk counters. Off-pass
+aggregates sum these deltas. Inner evidence steps and upload-call rows omit
+them; their outer windows measure the work. State-v2 stage windows carry
+the same four counters beside disk bytes. All measurements are process-wide:
+never sum overlapping stage or source windows.
+
+After prepare, `source_finish.counts.pass` measures prepare start through
+finish end, after allocator relief: `wall_us`, `cpu_us`, the four counters,
+and `qos_utility_us`, `qos_background_us` (maintenance + background), and
+`qos_default_us` (default + legacy + user initiated + user interactive).
+QoS uses a cached Mach timebase. CPU and wall are portable; QoS is macOS-only.
+The pass contains macOS `malloc_in_use_bytes_start` and
+`malloc_allocated_bytes_start`, with finish values `malloc_in_use_bytes` and
+`malloc_allocated_bytes`. `sample_cost_us` measures the summary sample work.
+A finish without a matching prepare omits `pass`. Three fixed source slots
+retain only endpoint samples.
+
+`pass.retained_heap_bytes` records the finishing source's in-memory index just
+before finish consumes it: `files_bytes`, `census_bytes`, `side_maps_bytes`,
+`accounts_identity_bytes`, and `traversal_bytes`. The last three split the
+existing inclusive side-map charge. Its process-wide cache fields are
+`codex_sidecar_facts_bytes`, `codex_header_cache_bytes`, and
+`desktop_title_facts_bytes`. These reuse requested-layout charges, exclude
+inline stack storage, and conservatively charge shared buffers per owner.
+Unknown/unsupported charges or busy cache locks are `null`, never invented
+zeros; finishes without the capture omit the object. The existing
+`sample_cost_us` includes the retained-layout capture work. Pass wall/CPU
+include diagnostics work, too. Cache values repeat
+across source rows and must not be summed. CLI metadata and active-session
+reconciliation have no existing heap charge; no new estimator is introduced.
+
+`source_prepare` also reports `observation.malloc_in_use_bytes` and
+`observation.malloc_allocated_bytes`, from one allocator-zone statistics call
+at prepare start on macOS; absent when unavailable.
 `source_prepare` wraps synchronous source preparation (including index load
 and baseline construction); it emits an empty counts object on normal return,
 including errors or no-frame returns. Like `source_finish`, it emits no record
