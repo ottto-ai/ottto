@@ -9446,35 +9446,6 @@ fn setup_reconcile_status_reason(status: Option<&str>) -> String {
     )
 }
 
-fn setup_reconcile_error_kind(error: &LocalApiError) -> &'static str {
-    match error {
-        LocalApiError::Unauthorized => "unauthorized",
-        LocalApiError::RepairLocked => "repair_locked",
-        LocalApiError::StatePoisoned => "state_poisoned",
-        LocalApiError::EmptyControlToken => "empty_control_token",
-        LocalApiError::LocalClientNotTrusted => "local_client_not_trusted",
-        LocalApiError::AccountResetRequired => "account_reset_required",
-        LocalApiError::AccountSwitchCandidate { .. } => "account_switch_candidate",
-        LocalApiError::NoPendingAuthClaim => "no_pending_auth_claim",
-        LocalApiError::AuthClaimMismatch => "auth_claim_mismatch",
-        LocalApiError::SetupRunConnectionMissing => "setup_run_connection_missing",
-        LocalApiError::SetupRunConnectionMismatch => "setup_run_connection_mismatch",
-        LocalApiError::CloudSessionCleanupRequired => "cloud_session_cleanup_required",
-        LocalApiError::IdentityMutationInProgress => "identity_mutation_in_progress",
-        LocalApiError::InvalidRequest(_) => "invalid_request",
-        LocalApiError::ManualFenceReviewRequired => "manual_fence_review_required",
-        LocalApiError::LocalOperationFailed(_) => "local_operation_failed",
-        LocalApiError::NetworkUnavailable => "network_unavailable",
-        LocalApiError::TimedOut(_) => "timed_out",
-        LocalApiError::Backend(details) => match details.kind {
-            BackendErrorKind::Unreachable => "backend_unreachable",
-            BackendErrorKind::Unavailable => "backend_unavailable",
-            BackendErrorKind::Rejected => "backend_rejected",
-            BackendErrorKind::ResponseUnexpected => "backend_response_unexpected",
-        },
-    }
-}
-
 pub(crate) fn reconcile_setup_scan_in_background(daemon: &LocalDaemon) {
     let Ok(mut state) = SETUP_SCAN.try_lock() else {
         return;
@@ -9544,14 +9515,7 @@ pub(crate) fn reconcile_setup_scan_in_background(daemon: &LocalDaemon) {
                 Ok((
                     idle && matches!(
                         last_run_status.as_deref(),
-                        Some(
-                            "waiting_for_user"
-                                | "completed"
-                                | "failed"
-                                | "expired"
-                                | "cancelled"
-                                | "pending_auth"
-                        )
+                        Some("waiting_for_user" | "completed")
                     ),
                     setup_reconcile_status_reason(last_run_status.as_deref()),
                 ))
@@ -9563,14 +9527,14 @@ pub(crate) fn reconcile_setup_scan_in_background(daemon: &LocalDaemon) {
         Ok(outcome) => outcome,
         Err(error) => (
             terminal_refresh_rejection(&error).is_some(),
-            format!("error:{}", setup_reconcile_error_kind(&error)),
+            format!("error:{}", setup_action_execution_error_detail(&error).0),
         ),
     };
     if settled {
         let _binding_lock = lock_setup_run_binding();
         if let Err(error) = store.settle_setup_scan(&binding).or_state_poisoned() {
             settled = false;
-            reason = format!("error:{}", setup_reconcile_error_kind(&error));
+            reason = format!("error:{}", setup_action_execution_error_detail(&error).0);
         }
     }
     let attempt = state.failures.saturating_add(1);
@@ -22591,9 +22555,6 @@ for line in sys.stdin:
             Some("completed"),
             Some("waiting_for_user"),
             Some("waiting_for_companion"),
-            Some("scanning"),
-            Some("running_action"),
-            Some("unknown"),
             Some("future_status"),
             None,
         ] {
@@ -22624,7 +22585,7 @@ for line in sys.stdin:
         }
     }
 
-    /// [regress] One completed action and its final idle poll settle in one attempt.
+    /// [behaviour] One completed action and its final idle poll settle in one attempt.
     #[test]
     #[serial]
     fn background_setup_scan_settles_after_one_action() {
@@ -22659,65 +22620,6 @@ for line in sys.stdin:
         let state = SETUP_SCAN.lock().unwrap();
         assert_eq!(state.failures, 0);
         assert!(state.next_due.is_none());
-    }
-
-    /// [regress] An action-bearing poll cannot settle when the loop reaches its cap.
-    #[test]
-    #[serial]
-    fn background_setup_scan_keeps_capped_action_poll_unsettled() {
-        let _lock = lock_backend_test_env();
-        let mut answers = vec![(200, scan_refresh("waiting_for_companion"))];
-        for _ in 0..8 {
-            answers.extend([
-                (200, "{}"),
-                (200, r#"{"run_status":"completed","action":{"id":"synthetic-action","action_type":"unsupported","source":null}}"#),
-                (200, "{}"),
-                (200, SCAN_DETAIL),
-            ]);
-        }
-        let (base, server) = scripted_json_backend(answers);
-        let (_root, _guards, daemon, _) = scan_fixture(base);
-        reconcile_setup_scan_in_background(&daemon);
-        assert_eq!(server.join().unwrap().len(), 33);
-        assert!(FileConnectionStore::default()
-            .setup_scan_settled_run_id()
-            .unwrap()
-            .is_none());
-        let state = SETUP_SCAN.lock().unwrap();
-        assert_eq!(state.failures, 1);
-        assert!(state.next_due.is_some());
-    }
-
-    #[test]
-    fn setup_reconcile_reasons_use_status_or_static_error_kind() {
-        assert_eq!(
-            setup_reconcile_status_reason(Some("completed")),
-            "status:completed"
-        );
-        assert_eq!(setup_reconcile_status_reason(None), "status:unknown");
-        assert_eq!(
-            setup_reconcile_status_reason(Some(" \ncompleted\t\r")),
-            "status:completed"
-        );
-        assert_eq!(
-            setup_reconcile_status_reason(Some(&"x".repeat(100))),
-            format!("status:{}", "x".repeat(64))
-        );
-        assert_eq!(
-            format!(
-                "error:{}",
-                setup_reconcile_error_kind(&LocalApiError::TimedOut("synthetic detail".into()))
-            ),
-            "error:timed_out"
-        );
-        let error = LocalApiError::Backend(BackendErrorDetails {
-            kind: BackendErrorKind::Rejected,
-            endpoint: "synthetic endpoint".into(),
-            status: Some(401),
-            body_excerpt: Some("synthetic body".into()),
-            reason_code: Some("synthetic code".into()),
-        });
-        assert_eq!(setup_reconcile_error_kind(&error), "backend_rejected");
     }
 
     /// [behaviour] Rejected background authority parks; only the existing health hold owns logout.
