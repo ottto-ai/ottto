@@ -508,11 +508,16 @@ fn persist_api_evidence(
     let _guard = append_lock()
         .lock()
         .map_err(|_| anyhow::anyhow!("effort store lock poisoned"))?;
-    let mut stored = 0;
-    for item in &evidence {
-        stored += usize::from(append_evidence(support_dir, item)?);
-    }
-    Ok(stored)
+    append_rows(
+        support_dir,
+        evidence.iter().map(|item| {
+            (
+                item.session_id.as_ref(),
+                evidence_path(support_dir, &item.session_id),
+                item,
+            )
+        }),
+    )
 }
 
 /// Reduce Claude Code's enhanced `claude_code.llm_request` spans to a bounded,
@@ -537,11 +542,16 @@ pub fn capture_claude_llm_request_traces(
     let _guard = append_lock()
         .lock()
         .map_err(|_| anyhow::anyhow!("Claude local OTEL store lock poisoned"))?;
-    let mut stored = 0;
-    for item in &evidence {
-        stored += usize::from(append_trace_ownership_evidence(support_dir, item)?);
-    }
-    Ok(stored)
+    append_rows(
+        support_dir,
+        evidence.iter().map(|item| {
+            (
+                item.session_id.as_ref(),
+                trace_evidence_path(support_dir, &item.session_id),
+                item,
+            )
+        }),
+    )
 }
 
 fn trace_evidence_from_json(body: &[u8]) -> Result<Vec<ClaudeTraceOwnershipEvidence>> {
@@ -1986,50 +1996,89 @@ fn proto_any_value(value: &otlp_proto::AnyValue) -> Option<String> {
     }
 }
 
+#[cfg(test)]
 fn append_evidence(support_dir: &Path, item: &ClaudeLocalOtelEvidence) -> Result<bool> {
-    append_row(
+    append_rows(
         support_dir,
-        &item.session_id,
-        evidence_path(support_dir, &item.session_id),
-        item,
+        [(
+            item.session_id.as_ref(),
+            evidence_path(support_dir, &item.session_id),
+            item,
+        )],
     )
+    .map(|stored| stored != 0)
 }
 
+#[cfg(test)]
 fn append_trace_ownership_evidence(
     support_dir: &Path,
     item: &ClaudeTraceOwnershipEvidence,
 ) -> Result<bool> {
-    append_row(
+    append_rows(
         support_dir,
-        &item.session_id,
-        trace_evidence_path(support_dir, &item.session_id),
-        item,
+        [(
+            item.session_id.as_ref(),
+            trace_evidence_path(support_dir, &item.session_id),
+            item,
+        )],
     )
+    .map(|stored| stored != 0)
 }
 
-fn append_row(support_dir: &Path, root: &str, path: PathBuf, row: &impl Serialize) -> Result<bool> {
-    if crate::internal_session::is_internal_session_id(root) {
-        return Ok(false);
+/// Preserve each file's row order and encoding, with one append per request.
+/// The caller holds `append_lock`; handles remain local and writes do not fsync.
+fn append_rows<'a, T: Serialize + 'a>(
+    support_dir: &Path,
+    rows: impl IntoIterator<Item = (&'a str, PathBuf, &'a T)>,
+) -> Result<usize> {
+    use crate::local_resource_diagnostics::cache_lifecycle::{self, Event};
+
+    let mut batches = BTreeMap::<PathBuf, (Vec<u8>, usize, BTreeSet<&str>)>::new();
+    for (root, path, row) in rows {
+        if crate::internal_session::is_internal_session_id(root) {
+            continue;
+        }
+        let encoded = serde_json::to_vec(row)?;
+        let (bytes, count, roots) = batches.entry(path).or_default();
+        bytes.extend_from_slice(&encoded);
+        bytes.push(b'\n');
+        *count += 1;
+        roots.insert(root);
     }
-    let dir = path.parent().expect("evidence path has parent");
-    fs::create_dir_all(dir).context("create Claude evidence directory")?;
-    #[cfg(unix)]
-    fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
-    let mut options = OpenOptions::new();
-    options.create(true).append(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+
+    let mut prepared_dirs = BTreeSet::new();
+    let mut stored = 0;
+    for (path, (encoded, count, roots)) in batches {
+        let dir = path.parent().expect("evidence path has parent");
+        if prepared_dirs.insert(dir.to_path_buf()) {
+            fs::create_dir_all(dir).context("create Claude evidence directory")?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if fs::metadata(dir)?.permissions().mode() & 0o777 != 0o700 {
+                    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+                }
+            }
+        }
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(path)
+            .context("open Claude evidence append file")?;
+        append_evidence_bytes(&mut file, &encoded).context("append Claude evidence")?;
+        cache_lifecycle::add(Event::OtlpRelayAppendedRows, count as u64);
+        cache_lifecycle::add(Event::OtlpRelayAppendedBytes, encoded.len() as u64);
+        for root in roots {
+            telemetry_notices::appended(support_dir, root);
+        }
+        stored += count;
     }
-    let mut file = options
-        .open(path)
-        .context("open Claude evidence append file")?;
-    let mut encoded = serde_json::to_vec(row)?;
-    encoded.push(b'\n');
-    append_evidence_bytes(&mut file, &encoded).context("append Claude evidence")?;
-    telemetry_notices::appended(support_dir, root);
-    Ok(true)
+    Ok(stored)
 }
 
 pub(crate) mod telemetry_notices;
@@ -2845,6 +2894,151 @@ mod tests {
         assert_eq!(index.get("req_PARENT").map(String::as_str), Some("xhigh"));
         assert_eq!(index.get("req_SUB").map(String::as_str), Some("high"));
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn batches_request_rows_without_changing_bytes_counts_or_notices() {
+        use crate::local_resource_diagnostics::cache_lifecycle::observe;
+
+        let internal = crate::internal_session::internal_session_id();
+        let sessions = [
+            "sess-batch-a",
+            "sess-batch-b",
+            &internal,
+            "sess-batch-a",
+            "sess-batch-b",
+            "sess-batch-a",
+            "sess-batch-b",
+        ];
+        let mut logs: Value = serde_json::from_slice(parent_and_subagent_body()).unwrap();
+        let template = logs["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0].clone();
+        let records = sessions
+            .iter()
+            .enumerate()
+            .map(|(i, session)| {
+                let mut record = template.clone();
+                for attr in record["attributes"].as_array_mut().unwrap() {
+                    match attr["key"].as_str().unwrap() {
+                        "session.id" => attr["value"]["stringValue"] = Value::from(*session),
+                        "request_id" => {
+                            attr["value"]["stringValue"] = Value::from(format!("req-{i}"))
+                        }
+                        _ => {}
+                    }
+                }
+                record
+            })
+            .collect::<Vec<_>>();
+        logs["resourceLogs"][0]["scopeLogs"][0]["logRecords"] = Value::from(records);
+        let logs = serde_json::to_vec(&logs).unwrap();
+        let traces = trace_body(
+            sessions
+                .iter()
+                .enumerate()
+                .map(|(i, session)| {
+                    let mut span = llm_span(&format!("req-{i}"), None);
+                    span.attributes.push(proto_string("session.id", session));
+                    span
+                })
+                .collect(),
+        );
+
+        for is_trace in [false, true] {
+            let dir = std::env::temp_dir().join(format!(
+                "ottto-relay-batch-{is_trace}-{}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&dir);
+            telemetry_notices::configure(&dir, true).unwrap();
+            // Encode independently, exactly as the old per-row appends did.
+            let rows = if is_trace {
+                trace_evidence_from_protobuf(&traces)
+                    .unwrap()
+                    .into_iter()
+                    .map(|row| (row.session_id.clone(), serde_json::to_vec(&row).unwrap()))
+                    .collect::<Vec<_>>()
+            } else {
+                api_evidence_from_json(&logs)
+                    .unwrap()
+                    .into_iter()
+                    .map(|row| (row.session_id.clone(), serde_json::to_vec(&row).unwrap()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(rows.len(), sessions.len());
+            let (stored, counts) = observe(|| {
+                if is_trace {
+                    capture_claude_llm_request_traces(&dir, &traces, "application/x-protobuf")
+                } else {
+                    capture_claude_api_request_logs(&dir, &logs, "application/json")
+                }
+                .unwrap()
+            });
+            assert_eq!(stored, 6);
+            assert_eq!(counts.otlp_relay_appended_rows, 6);
+            let mut total_bytes = 0;
+            for session in ["sess-batch-a", "sess-batch-b"] {
+                let mut expected = Vec::new();
+                for (_, encoded) in rows.iter().filter(|(root, _)| root.as_ref() == session) {
+                    expected.extend_from_slice(encoded);
+                    expected.push(b'\n');
+                }
+                let path = if is_trace {
+                    trace_evidence_path(&dir, session)
+                } else {
+                    evidence_path(&dir, session)
+                };
+                assert_eq!(fs::read(&path).unwrap(), expected);
+                total_bytes += expected.len() as u64;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    assert_eq!(
+                        fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                        0o600
+                    );
+                }
+            }
+            assert_eq!(counts.otlp_relay_appended_bytes, total_bytes);
+            assert!(!evidence_path(&dir, &internal).exists());
+            assert!(!trace_evidence_path(&dir, &internal).exists());
+            assert_eq!(
+                telemetry_notices::pending(&dir).unwrap(),
+                BTreeSet::from(["sess-batch-a".to_string(), "sess-batch-b".to_string(),])
+            );
+            telemetry_notices::configure(&dir, false).unwrap();
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn request_appends_secure_existing_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("ottto-relay-mode-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = evidence_path(&dir, "sess-mode");
+        let parent = path.parent().unwrap();
+        fs::create_dir_all(parent).unwrap();
+        for mode in [0o755, 0o700] {
+            fs::set_permissions(parent, fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(
+                persist_api_evidence(
+                    &dir,
+                    vec![ClaudeLocalOtelEvidence {
+                        session_id: "sess-mode".into(),
+                        ..Default::default()
+                    }]
+                )
+                .unwrap(),
+                1
+            );
+            assert_eq!(
+                fs::metadata(parent).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
