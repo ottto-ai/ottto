@@ -13,5 +13,6 @@ pub(in crate::snapshots) mod recovery_capture;
 pub(in crate::snapshots) mod rollout_header;
 pub(crate) mod root_copies;
 pub(in crate::snapshots) mod sidecar;
+pub(crate) mod sqlite_read;
 #[cfg(test)]
 pub(in crate::snapshots) mod tests;

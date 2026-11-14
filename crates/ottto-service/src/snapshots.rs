@@ -161,7 +161,7 @@ pub(crate) use tests::claude_request_account_mixed_fixture;
 pub(crate) use tests::output as claude_request_account_output;
 mod codex_compressed_input;
 mod codex_rollout_carry;
-pub(crate) mod codex_sqlite_read;
+pub(crate) use sources::codex::sqlite_read as codex_sqlite_read;
 #[cfg(test)]
 mod codex_zst_refusal_tests;
 mod compaction_events;
