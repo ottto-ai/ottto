@@ -182,7 +182,7 @@ fn hint_json() -> Value {
         "source":"claude_code", "server_time":AT, "record_count_15m":0,
         "record_count_24h":0, "local_usage_reconciliation_enabled":true,
         "backfill_window_days":30, "recommended_scan_after":AT,
-        "snapshot_head_cas_required":true,
+        "snapshot_head_cas_enabled":true, "snapshot_head_cas_required":false,
         "claude_otel_only_sessions_contract":"claude_otel_only_sessions:v1",
         "claude_otel_only_pairing_floor":"2026-08-02T06:00:00Z"
     })
@@ -320,9 +320,40 @@ fn telemetry_only_cold_ram_restore_and_restart_preserve_switch_gap_and_side_call
         let mut cold_page = build(&c, &mut base);
         assert_eq!(cold_page.scan.snapshots.len(), 1);
         let cold = send(&cold_page, &mut base, Mode::ColdFull);
+        let native = value(request(&cold_page.scan.snapshots)).unwrap();
+        let golden: Value = serde_json::from_str(include_str!("receiver_golden.json")).unwrap();
+        let released: Value =
+            serde_json::from_str(include_str!("receiver_golden_0_1_248.json")).unwrap();
+        assert_eq!(
+            native, golden,
+            "default serialization pins the native batch"
+        );
+        let mut old_wire = native.clone();
+        assert_eq!(
+            old_wire
+                .as_object_mut()
+                .unwrap()
+                .remove("head_cas_contract"),
+            Some(json!("snapshot_head_etag:v1"))
+        );
+        assert_eq!(old_wire, released, "only the batch declaration changes");
         println!(
             "OTEL_ONLY_RECEIVER_GOLDEN {}",
             serde_json::to_string(&request(&cold_page.scan.snapshots)).unwrap()
+        );
+        let item = &cold_page.scan.snapshots[0];
+        let components = crate::snapshots::snapshot_semantic_component_hashes(Claude, item);
+        assert_eq!(
+            value(&components).unwrap(),
+            released["snapshots"][0]["semantic_envelope"]["component_hashes"]
+        );
+        let mut transcript_basis = item.clone();
+        transcript_basis.evidence_basis = None;
+        assert_eq!(
+            components["usage_accounting"],
+            crate::snapshots::snapshot_semantic_component_hashes(Claude, &transcript_basis)
+                ["usage_accounting"],
+            "evidence basis stays outside the usage component"
         );
         assert_eq!(cold_page.scan.snapshots[0].request_count, 4);
         assert!(!cold_page.scan.snapshots[0].request_evidence.is_empty());
@@ -645,4 +676,192 @@ fn telemetry_only_oracle_matrix() {
 }
 mod cases {
     include!("oracle_cases.rs");
+}
+
+// Native telemetry bodies through the shared class packer, ACK validator and
+// receiver-shaped head store; no separate upload or recovery path.
+fn head_page(
+    p: &mut Progress,
+    items: &[SnapshotItem],
+    store: &mut crate::snapshot_sync::tests::class_split_tests::HeadStore,
+) -> (Result<ResumableUploadResult>, Vec<Value>) {
+    crate::snapshot_sync::head_conflict_answer_tests::cycle_with_transport(
+        p,
+        items,
+        current_unix_seconds(),
+        |item| snapshot_upload_batch_class(item, false),
+        |_| false,
+        |request, wire| {
+            assert_eq!(request.source, Claude.api_slug());
+            assert_eq!(
+                wire,
+                &value(request).unwrap(),
+                "default and client wire agree"
+            );
+            Ok(store.post(request, wire))
+        },
+    )
+}
+
+#[test]
+fn telemetry_class_isolates_normal_claude_requests_without_changing_their_bytes() {
+    with_e2(|| {
+        use crate::snapshot_sync::tests::class_split_tests::HeadStore;
+        let mut c = Corpus::new("otel-only-class-isolation");
+        positive(&c);
+        let mut p = progress();
+        let telemetry = only(&build(&c, &mut p)).clone();
+        c.root(COPY, &line(COPY, "transcript", AT, 11));
+        let native = build(&c, &mut p);
+        let mut ordinary = body(&native, COPY).unwrap().clone();
+        ordinary.cache_observations = None;
+        ordinary.cache_observations_state = None;
+        let mut patched = ordinary.clone();
+        patched.source_session_id = "3338a80a-f36e-4cbc-a5bb-50fc66430ba5".into();
+        let cache = crate::snapshot_sync::head_conflict_answer_tests::item();
+        patched.cache_observations = cache.cache_observations;
+        patched.cache_observations_state = cache.cache_observations_state;
+        patched.snapshot_fingerprint = crate::snapshots::snapshot_fingerprint(Claude, &patched);
+        let normal = [ordinary.clone(), patched.clone()];
+        let mut store = HeadStore::default();
+        // An existing ordinary head must still accept without CAS or a base.
+        store.seed(&ordinary.source_session_id);
+        let mut control_store = store.clone();
+        let mut control = restore(&p);
+        let (result, normal_wires) = head_page(&mut control, &normal, &mut control_store);
+        assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+        let (result, wires) = head_page(&mut p, &[patched, telemetry, ordinary], &mut store);
+        assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+        assert_eq!(wires.len(), 3);
+        assert_eq!(
+            canonical(&wires[..2]),
+            canonical(&normal_wires),
+            "normal requests keep their bytes"
+        );
+        assert!(wires[0].get("head_cas_contract").is_none());
+        assert!(wires[1].get("cache_state_ack_contract").is_some());
+        assert_eq!(wires[2]["head_cas_contract"], "snapshot_head_etag:v1");
+        assert!(wires[2].get("cache_state_ack_contract").is_none());
+        assert!(wires[2]["snapshots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["evidence_basis"] == "otel_only"));
+        for item in normal {
+            assert_eq!(
+                p.accepted_body_witnesses[&item.snapshot_fingerprint],
+                control.accepted_body_witnesses[&item.snapshot_fingerprint]
+            );
+        }
+    });
+}
+
+#[test]
+fn telemetry_growth_uses_saved_ack_then_rebuilds_to_answer_a_conflict_without_a_patch() {
+    with_e2(|| {
+        use crate::snapshot_sync::head_conflict_answer_tests::envelope;
+        use crate::snapshot_sync::tests::class_split_tests::HeadStore;
+        for cache_enabled in [false, true] {
+            for keep_base in [false, true] {
+                let c = Corpus::new("otel-only-head-replacement");
+                positive(&c);
+                let mut p = progress();
+                let first = build(&c, &mut p);
+                let mut store = HeadStore::default();
+                let (result, wires) = head_page(&mut p, &first.scan.snapshots, &mut store);
+                assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+                assert!(envelope(&wires[0]).get("base_head_etag").is_none());
+                let key = cache_session_key(ROOT);
+                let first_head = p.accepted_cache_heads[&key].clone();
+                append(&c, true, &api("head-growth", 20, 200));
+                append(&c, false, &trace("head-growth", ""));
+                let mut grown = build(&c, &mut p);
+                for item in &mut grown.scan.snapshots {
+                    prepare_snapshot_cache_for_upload(
+                        item,
+                        &p,
+                        cache_enabled,
+                        false,
+                        &BTreeSet::new(),
+                    );
+                    assert_eq!(item.cache_base_head_etag.as_ref(), Some(&first_head));
+                    assert!(item.cache_observations.is_none());
+                    assert!(item.cache_observations_state.is_none());
+                }
+                let (result, wires) = head_page(&mut p, &grown.scan.snapshots, &mut store);
+                assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+                assert_eq!(envelope(&wires[0])["base_head_etag"], first_head);
+                let saved_head = p.accepted_cache_heads[&key].clone();
+                append(&c, true, &api("conflict-growth", 21, 210));
+                append(&c, false, &trace("conflict-growth", ""));
+                let grown = build(&c, &mut p);
+                let prior = p.accepted_body_witnesses.clone();
+                // A concurrent stored head makes the saved predecessor stale.
+                store.seed(ROOT);
+                let (result, wires) = head_page(&mut p, &grown.scan.snapshots, &mut store);
+                assert_eq!(
+                    result.unwrap(),
+                    ResumableUploadResult::Deferred {
+                        count: 1,
+                        isolated: 1
+                    }
+                );
+                assert_eq!(envelope(&wires[0])["base_head_etag"], saved_head);
+                assert_eq!(p.accepted_body_witnesses, prior, "conflict credits nothing");
+                let challenge = p.head_conflict_challenges[&key].clone();
+                assert_eq!(p.accepted_cache_heads[&key], saved_head);
+                p = restore(&p);
+                if !keep_base {
+                    p.accepted_cache_heads.remove(&key);
+                }
+                let reads = otel::evidence_read_counts_for_test();
+                let mut rebuilt = build(&c, &mut p);
+                assert_ne!(
+                    reads,
+                    otel::evidence_read_counts_for_test(),
+                    "fresh evidence rebuild"
+                );
+                assert_eq!(only(&rebuilt).request_count, 6);
+                for item in &mut rebuilt.scan.snapshots {
+                    prepare_snapshot_cache_for_upload(
+                        item,
+                        &p,
+                        cache_enabled,
+                        false,
+                        &BTreeSet::new(),
+                    );
+                }
+                let mut projected = only(&rebuilt).clone();
+                let reserve = identity_cache_wire_reserve(&projected, &p, false);
+                attach_head_conflict_answers(
+                    std::slice::from_mut(&mut projected),
+                    &p,
+                    u64::MAX,
+                    |_| false,
+                );
+                assert_eq!(
+                    crate::snapshots::claude_request_identity::item_bytes(only(&rebuilt)) + reserve,
+                    crate::snapshots::claude_request_identity::item_bytes(&projected)
+                );
+                let (result, wires) = head_page(&mut p, &rebuilt.scan.snapshots, &mut store);
+                assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+                let answer = envelope(&wires[0]);
+                assert_eq!(answer["conflict_head_challenge"], challenge.challenge);
+                assert_eq!(
+                    answer["rescan_from_revision_hash"],
+                    challenge.stale_revision_v2_hash
+                );
+                assert_eq!(answer["forced_full_rescan"], true);
+                assert!(answer.get("base_head_etag").is_none());
+                assert!(wires[0]["snapshots"][0].get("cache_observations").is_none());
+                assert!(wires[0].get("cache_state_ack_contract").is_none());
+                assert!(p.accepted_cache_states.is_empty());
+                assert!(p.head_conflict_challenges.is_empty());
+                assert!(p.contains_body(
+                    &only(&rebuilt).snapshot_fingerprint,
+                    &snapshot_upload_body_witness(only(&rebuilt))
+                ));
+            }
+        }
+    });
 }

@@ -1358,6 +1358,17 @@ fn prepare_snapshot_cache_for_upload(
     head_cas_required: bool,
     legacy_pending: &BTreeSet<String>,
 ) {
+    // Telemetry bodies use head CAS without negotiating cache evidence. Their
+    // predecessor is the exact saved ACK, and they never carry a cache patch.
+    if snapshot.evidence_basis == Some("otel_only") {
+        snapshot.cache_observations = None;
+        snapshot.cache_observations_state = None;
+        snapshot.cache_base_head_etag = progress
+            .accepted_cache_heads
+            .get(&cache_session_key(&snapshot.source_session_id))
+            .cloned();
+        return;
+    }
     if !enabled {
         snapshot.cache_observations = None;
         snapshot.cache_observations_state = None;
@@ -1386,7 +1397,8 @@ fn identity_cache_wire_reserve(
     progress: &SnapshotUploadProgress,
     full_replacement: bool,
 ) -> usize {
-    if snapshot.cache_observations.is_none()
+    if snapshot.evidence_basis != Some("otel_only")
+        && snapshot.cache_observations.is_none()
         && !progress
             .accepted_cache_heads
             .contains_key(&cache_session_key(&snapshot.source_session_id))
@@ -1408,14 +1420,12 @@ fn identity_cache_wire_reserve(
     )
 }
 
-/// Request class of one main-upload body: 2 for a legacy reconciliation,
-/// 1 when it carries a cache patch (admitted, unchanged or partial-empty), 0
-/// otherwise (no patch, birth- or cap-withheld). The client declares head CAS
-/// for a whole request when one body carries a patch, so the packer never
-/// mixes classes: an unpatched body sends no CAS contract and cannot conflict
-/// with a server head it never claimed.
+/// Keep ordinary (0), patched (1), legacy (2), and telemetry-only (3)
+/// requests separate: the head-CAS declaration applies to the entire batch.
 fn snapshot_upload_batch_class(snapshot: &SnapshotItem, legacy: bool) -> u8 {
-    if legacy {
+    if snapshot.evidence_basis == Some("otel_only") {
+        3
+    } else if legacy {
         2
     } else {
         u8::from(crate::snapshot_client::declares_head_cas(snapshot))
@@ -1426,7 +1436,8 @@ fn snapshot_upload_batch_class(snapshot: &SnapshotItem, legacy: bool) -> u8 {
 /// After a validated conflict refuses this exact challenge's answer, only a
 /// re-send of a held conflicted body waits, until that body's own conflict
 /// probe (within one hour); a new revision answers at once. Only a body that
-/// sends the stale base under the head-CAS contract carries the answer; the
+/// declares head CAS carries the answer; telemetry is freshly rebuilt from its
+/// ordinary evidence chunk and needs neither a cache patch nor a saved base. The
 /// body itself, its fingerprint and its witness are unchanged.
 /// `replacement_owed` (negotiated, real-Full session) may also mark the patch
 /// a full replacement when no local cache state exists: that patch already
@@ -1445,7 +1456,9 @@ fn attach_head_conflict_answers(
         }
         // A withheld cache patch keeps its base but sends no CAS contract, so
         // the request and its ACK validation would not admit a handshake.
-        if snapshot.cache_base_head_etag.is_none() || snapshot.cache_observations.is_none() {
+        if snapshot.evidence_basis != Some("otel_only")
+            && (snapshot.cache_base_head_etag.is_none() || snapshot.cache_observations.is_none())
+        {
             continue;
         }
         let key = cache_session_key(&snapshot.source_session_id);
@@ -7870,7 +7883,7 @@ fn finish_sync_source(
         )?;
         let mut telemetry_ledger = upload_progress.telemetry_only.take();
         let reserve_cache_bytes = |item: &SnapshotItem| {
-            if cache_observations_enabled {
+            if cache_observations_enabled || item.evidence_basis == Some("otel_only") {
                 identity_cache_wire_reserve(item, &upload_progress, cache_full_replacement)
             } else {
                 0
@@ -11468,8 +11481,8 @@ where
             catchup_units.push((catchup, family_key));
         }
     }
-    // A request declares head CAS when any body in it carries a cache patch,
-    // so every request is class-pure: an unpatched body never travels under
+    // Cache patches and telemetry bodies declare head CAS for the request,
+    // so every request is class-pure: an ordinary body never travels under
     // another body's CAS contract. Stable-sort each lane by family key so
     // single bodies form one run per class, each family's groups stay
     // contiguous and root first, and a single-class page keeps its order.
@@ -17128,7 +17141,7 @@ mod tests {
         include!("snapshot_sync/e2_upload_tests.rs");
     }
 
-    mod class_split_tests {
+    pub(in crate::snapshot_sync) mod class_split_tests {
         use super::*;
         include!("snapshot_sync/class_split_tests.rs");
     }
