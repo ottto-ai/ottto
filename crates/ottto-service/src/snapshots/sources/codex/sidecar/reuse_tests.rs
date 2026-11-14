@@ -285,6 +285,42 @@ fn sidecar_state_transitions_match_fresh() {
     assert_eq!(repaired.local_diagnostics.state_titles.reused_roots, 2);
 }
 
+/// [regress] A refused reuse records its content-free cause and the changed
+/// sorted-roster positions per input; a declined keep records why.
+#[test]
+fn sidecar_reload_cause_is_recorded() {
+    let (a, b) = (Fixture::new(), Fixture::new());
+    let mut roots = a.roots();
+    roots.extend(b.roots());
+    let mut facts = SidecarFacts::default();
+    let cause = |facts: &mut SidecarFacts, roots: &[PathBuf]| {
+        let d = CodexTitleMetadata::load_reused(roots, facts).local_diagnostics;
+        (
+            d.sidecar_reload_cause,
+            d.sidecar_changed_homes,
+            d.sidecar_keep_declined,
+        )
+    };
+    assert_eq!(cause(&mut facts, &roots), ("not_kept", [0; 3], ""));
+    assert_eq!(cause(&mut facts, &roots), ("", [0; 3], ""));
+    let line = json!({"id": ID, "thread_name": "Touched"}).to_string() + "\n";
+    fs::write(b.0.join("session_index.jsonl"), line).unwrap();
+    let position = usize::from(a.0 < b.0);
+    let touched = cause(&mut facts, &roots);
+    assert_eq!(touched, ("stamp_changed", [0, 0, 1 << position], ""));
+    assert_eq!(
+        cause(&mut facts, &b.roots()),
+        ("roster_changed", [0; 3], "")
+    );
+    // A hard link leaves the state stamp unavailable: read, but not kept.
+    fs::hard_link(b.0.join("state_5.sqlite"), b.0.join("hardlink")).unwrap();
+    let unstamped = cause(&mut facts, &b.roots());
+    assert_eq!(unstamped, ("stamp_changed", [1, 0, 0], "unstamped"));
+    assert!(facts.homes.kept.is_empty());
+    let next = cause(&mut facts, &b.roots());
+    assert_eq!(next, ("not_kept", [0; 3], "unstamped"));
+}
+
 /// [money] Compact digest and clone/continue keep the legacy byte stream;
 /// None and Some("") have distinct copy equality, including SHA block edges.
 #[test]
