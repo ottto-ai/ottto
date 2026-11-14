@@ -7873,16 +7873,12 @@ fn finish_sync_source(
                     reservation: Some(&reserve_cache_bytes),
                 },
             );
-        let hints = std::mem::take(&mut disposition.side_call_hints);
-        if !hints.is_empty() {
-            scan_result.enqueue_claude_discovery_hints(
-                &mut index,
-                claude_scan_roots.as_deref().unwrap_or_default(),
-                receipt_window_days,
-                &hints,
-            );
-            scan_result.census_complete = false;
-        }
+        scan_result.queue_side_call_hints(
+            &mut index,
+            claude_scan_roots.as_deref().unwrap_or_default(),
+            receipt_window_days,
+            &mut disposition,
+        );
         // Copy-derived rows (#944): the bodies just built treat these
         // rows as never accepted; the ledger records that durably before any
         // upload, so a lost reply or restart cannot restore their proof.
@@ -9784,7 +9780,9 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
     disposition
         .copy_invalidated
         .sort_by_key(|row| first_slot.get(row.session()).copied());
-    disposition.side_call_hints = page.side_call_discovery.hints.into_iter().collect();
+    disposition
+        .side_call_hints
+        .extend(page.side_call_discovery.hints);
     let ClaudeEvidencePage { mut stats, .. } = page;
     for item in &scan_result.snapshots {
         if !item.source_session_id.contains("_agent-") {
