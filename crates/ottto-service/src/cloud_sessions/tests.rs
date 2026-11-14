@@ -1101,6 +1101,9 @@ fn cursor_cycle_detector_finds_every_loop_length() {
 // ---------------------------------------------------------------------------
 // Listing on/off and server refusals. [behaviour]
 
+/// One way to change the server's hint.
+type HintChange<'a> = &'a dyn Fn(&mut Hint);
+
 /// [behaviour] Only a hint that turns listing on, names exactly this
 /// contract and carries a valid 32-byte key lets a slice call the provider.
 /// Anything else is off: no provider call, no upload, a hint recheck in 30
@@ -1108,7 +1111,7 @@ fn cursor_cycle_detector_finds_every_loop_length() {
 #[test]
 #[serial_test::serial]
 fn listing_runs_only_on_an_exact_hint() {
-    let cases: [(&str, &dyn Fn(&mut Hint)); 8] = [
+    let cases: [(&str, HintChange); 8] = [
         ("off", &|hint: &mut Hint| hint.enabled = Some(false)),
         ("older-server", &|hint: &mut Hint| {
             hint.enabled = None;
