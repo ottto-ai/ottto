@@ -56,16 +56,10 @@ impl SidecarFacts {
             .iter()
             .map(|home| (home.clone(), capture(home)))
             .collect::<BTreeMap<_, _>>();
-        // Each home is reused while its own stamps match; the others reload.
-        let exact = listed.len() == self.homes.kept.len() && before.iter().all(|(home, stamp)| {
-            matches!((witness(stamp), self.homes.kept.get(home)), (Some(now), Some((old, _))) if now.same(old))
-        });
-        let cause = if exact {
-            ("", [0; 3])
-        } else {
-            reload_cause(&before, &self.homes.kept)
-        };
+        let kept = self.homes.kept.len();
+        let cause = reload_cause(&before, &self.homes.kept);
         self.homes.retain_listed(&listed);
+        // Each home is reused while its own stamps match; the others reload.
         let mut reused = BTreeSet::new();
         let mut after = BTreeMap::new();
         let mut loaded = BTreeMap::new();
@@ -83,6 +77,9 @@ impl SidecarFacts {
             };
             loaded.insert(home.clone(), raw);
         }
+        // The exact kept group: nothing reloaded, added or removed.
+        let exact = kept == listed.len() && reused.len() == listed.len();
+        let cause = if exact { ("", [0; 3]) } else { cause };
         let mut metadata = CodexTitleMetadata::merge_roots(loaded, &reused);
         metadata.compact_titles();
         // A reused home's views and title prefixes are exact only while the
@@ -94,7 +91,8 @@ impl SidecarFacts {
                 "conflict"
             } else if reused.iter().any(|home| {
                 let facts = &metadata.root_sidecars[home];
-                facts.title_inputs != metadata.title_inputs(facts)
+                let now = title_inputs(&metadata.titles, &metadata.state_created_threads, facts);
+                facts.title_inputs != now
             }) {
                 "title_inputs"
             } else {
@@ -116,12 +114,7 @@ impl SidecarFacts {
                 && !metadata.sidecar_census_incomplete
                 && metadata.identity_conflicts.is_empty()
             {
-                let inputs = metadata
-                    .root_sidecars
-                    .iter()
-                    .filter(|(home, _)| !reused.contains(*home))
-                    .map(|(home, facts)| (home.clone(), metadata.title_inputs(facts)))
-                    .collect::<BTreeMap<_, _>>();
+                let (titles, created) = (&metadata.titles, &metadata.state_created_threads);
                 for (home, facts) in &mut metadata.root_sidecars {
                     if reused.contains(home) {
                         continue;
@@ -130,7 +123,7 @@ impl SidecarFacts {
                         // The views hold these rows' merged result.
                         unique.raw.threads = Vec::new();
                         unique.raw.history = Vec::new();
-                        unique.title_inputs = inputs[home];
+                        unique.title_inputs = title_inputs(titles, created, unique);
                     }
                     // The helper consumes the captures already made around
                     // acquisition; compaction must finish before sharing.

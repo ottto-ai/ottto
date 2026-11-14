@@ -127,6 +127,20 @@ impl PartialEq for CodexStateThread {
 }
 impl Eq for CodexStateThread {}
 
+/// The merged inputs a home's compacted title prefixes take from outside its
+/// own rows: per view id, `title_prefix` without the home's raw title.
+fn title_inputs(
+    titles: &BTreeMap<String, CodexTitleCandidate>,
+    created: &BTreeSet<String>,
+    home: &codex_root_copies::RootSidecar,
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    for id in home.threads.keys() {
+        digest.update(title_prefix(id, created.contains(id), titles.get(id), None).finalize());
+    }
+    digest.finalize().into()
+}
+
 fn title_prefix(
     id: &str,
     created: bool,
@@ -510,26 +524,6 @@ impl CodexTitleMetadata {
         let mut metadata = facts.load(roots);
         metadata.local_diagnostics.sidecar_facts_heap_bytes = facts.heap_bytes() as u64;
         metadata
-    }
-
-    /// Digest of the merged inputs a home's compacted title prefixes take
-    /// from outside its own rows (`title_prefix`): per view id, the created
-    /// classification and the merged title and its source.
-    fn title_inputs(&self, home: &codex_root_copies::RootSidecar) -> [u8; 32] {
-        let mut digest = Sha256::new();
-        for id in home.threads.keys() {
-            let (title, created) = (self.titles.get(id), self.state_created_threads.contains(id));
-            for part in [
-                id.as_str(),
-                if created { "1" } else { "0" },
-                title.map_or("", |title| &title.title),
-                title.map_or("", |title| &title.source),
-            ] {
-                digest.update(part.len().to_le_bytes());
-                digest.update(part.as_bytes());
-            }
-        }
-        digest.finalize().into()
     }
 
     fn merge_roots(

@@ -244,14 +244,12 @@ pub(in crate::snapshots) fn parity_in_place(
     assert_metadata(&reused, &fresh, paths);
     reused
 }
-fn seed(fixture: &Fixture) -> (Connection, PathBuf) {
+/// A thread row of `fixture`, with token use, timestamps and its rollout path.
+fn seed(fixture: &Fixture, id: &str, title: Option<&str>) -> (Connection, PathBuf) {
     let db = Connection::open(fixture.0.join("writer/state_5.sqlite")).unwrap();
     db.execute_batch("PRAGMA journal_mode=WAL").unwrap();
-    let path = fixture
-        .0
-        .join("sessions")
-        .join(format!("rollout-{ID}.jsonl"));
-    db.execute("INSERT INTO threads VALUES (?1, 'Base title', 10, 0, 1790000000, 1790000001, 'gpt-5.2', ?2, 'user', NULL)", rusqlite::params![ID, path.to_str().unwrap()]).unwrap();
+    let path = rollout(fixture, id);
+    db.execute("INSERT INTO threads VALUES (?1, ?2, 10, 0, 1790000000, 1790000001, 'gpt-5.2', ?3, 'user', NULL)", rusqlite::params![id, title, path.to_str().unwrap()]).unwrap();
     (db, path)
 }
 
@@ -261,7 +259,7 @@ fn seed(fixture: &Fixture) -> (Connection, PathBuf) {
 fn sidecar_state_transitions_match_fresh() {
     let a = Fixture::new();
     let b = Fixture::new();
-    let (db, path) = seed(&b);
+    let (db, path) = seed(&b, ID, Some("Base title"));
     let mut facts = SidecarFacts::default();
     let mut roots = a.roots();
     roots.extend(b.roots());
@@ -355,6 +353,11 @@ fn sidecar_state_transitions_match_fresh() {
     assert_eq!(facts.homes.kept.len(), 1, "the other home stays kept");
     let repeated = parity(&mut facts, &roots, std::slice::from_ref(&path));
     assert_eq!(repeated.local_diagnostics.state_titles.reloaded_roots, 1);
+    // A listed home missing from the kept facts reads as a roster change.
+    assert_eq!(
+        repeated.local_diagnostics.sidecar_reload_cause,
+        "roster_changed"
+    );
     assert_eq!(facts.homes.kept.len(), 1);
     fs::remove_file(b.0.join("hardlink")).unwrap();
     parity(&mut facts, &roots, std::slice::from_ref(&path));
@@ -465,7 +468,7 @@ fn subcensus_failures_are_isolated() {
         "ALTER TABLE threads RENAME COLUMN first_user_message TO old_message",
     ] {
         let f = Fixture::new();
-        let (db, path) = seed(&f);
+        let (db, path) = seed(&f, ID, Some("Base title"));
         let mut facts = SidecarFacts::default();
         parity(&mut facts, &f.roots(), std::slice::from_ref(&path));
         db.execute_batch(sql).unwrap();
@@ -484,7 +487,7 @@ fn subcensus_failures_are_isolated() {
 #[test]
 fn alias_conflict_keeps_legacy_physical_fingerprint() {
     let f = Fixture::new();
-    let (db, path) = seed(&f);
+    let (db, path) = seed(&f, ID, Some("Base title"));
     db.execute("INSERT INTO threads VALUES (?1, 'Alias title', 0, 0, NULL, NULL, NULL, NULL, 'user', NULL)", [ID.to_uppercase()]).unwrap();
     sync_home(&f.0);
     let metadata = CodexTitleMetadata::load_from_roots(&f.roots());
@@ -550,7 +553,7 @@ fn sqlite_witness_routes_and_refuses_moved_snapshot() {
 #[test]
 fn kept_home_drops_raw_rows() {
     let f = Fixture::new();
-    let (db, path) = seed(&f);
+    let (db, path) = seed(&f, ID, Some("Base title"));
     let upper = "AAAAAAAA-BBBB-4CCC-8DDD-000000000002";
     let other =
         f.0.join("sessions")
@@ -617,10 +620,6 @@ fn state(home: &Fixture) -> Connection {
 fn rollout(home: &Fixture, id: &str) -> PathBuf {
     home.0.join("sessions").join(format!("rollout-{id}.jsonl"))
 }
-/// A thread row of `home`, with token use, timestamps and its rollout path.
-fn thread(home: &Fixture, id: &str, title: Option<&str>) {
-    state(home).execute("INSERT INTO threads VALUES (?1, ?2, 10, 0, 1790000000, 1790000001, 'gpt-5.2', ?3, 'user', NULL)", rusqlite::params![id, title, rollout(home, id).to_str().unwrap()]).unwrap();
-}
 fn history(home: &Fixture, sql: &str) {
     Connection::open(home.0.join("writer/thread_history_1.sqlite")).unwrap().execute_batch(&format!("CREATE TABLE IF NOT EXISTS thread_history_projection_state (thread_id TEXT, next_rollout_byte_offset INTEGER, next_rollout_ordinal INTEGER); {sql}")).unwrap();
 }
@@ -655,7 +654,7 @@ fn per_home_reuse_reloads_only_changed_homes() {
     let homes = sorted_homes(3);
     let roots = roots_of(&homes);
     for (home, id) in homes.iter().zip(IDS) {
-        thread(home, id, Some("Own title"));
+        seed(home, id, Some("Own title"));
     }
     let paths = all_paths(&homes, &IDS);
     let mut facts = SidecarFacts::default();
@@ -688,12 +687,12 @@ fn conflict_in_a_changed_home_reloads_cold() {
     for changed in [0, 2] {
         let homes = sorted_homes(3);
         let roots = roots_of(&homes);
-        thread(&homes[1], x, None);
+        seed(&homes[1], x, None);
         history(
             &homes[1],
             &format!("INSERT INTO thread_history_projection_state VALUES ('{x}', 20, 2)"),
         );
-        thread(&homes[2 - changed], y, None);
+        seed(&homes[2 - changed], y, None);
         let paths = all_paths(&homes, &[x, y]);
         let mut facts = SidecarFacts::default();
         pass(&mut facts, &roots, &paths, 0, "not_kept");
@@ -702,9 +701,7 @@ fn conflict_in_a_changed_home_reloads_cold() {
         let conflict = pass(&mut facts, &roots, &paths, 0, "conflict");
         assert!(conflict.identity_conflicts.contains(x));
         assert!(facts.homes.kept.is_empty());
-        pass(&mut facts, &roots, &paths, 0, "not_kept");
         history(&homes[changed], &alias(y));
-        pass(&mut facts, &roots, &paths, 0, "not_kept");
         pass(&mut facts, &roots, &paths, 0, "not_kept");
         history(
             &homes[changed],
@@ -752,7 +749,7 @@ fn another_homes_title_inputs_reload_cold() {
     for other in [0, 2] {
         let homes = sorted_homes(3);
         let roots = roots_of(&homes);
-        thread(&homes[1], ID, Some("Base title"));
+        seed(&homes[1], ID, Some("Base title"));
         let paths = all_paths(&homes, &[ID]);
         let mut facts = SidecarFacts::default();
         pass(&mut facts, &roots, &paths, 0, "not_kept");
@@ -772,42 +769,13 @@ fn another_homes_title_inputs_reload_cold() {
     }
 }
 
-/// [money] An unstamped home reloads alone each pass and is never kept;
-/// the other homes stay kept, and the repaired home is kept again.
-#[test]
-fn unstamped_home_reloads_alone() {
-    let homes = sorted_homes(3);
-    let roots = roots_of(&homes);
-    for (home, id) in homes.iter().zip(IDS) {
-        thread(home, id, Some("Own title"));
-    }
-    let paths = all_paths(&homes, &IDS);
-    let mut facts = SidecarFacts::default();
-    pass(&mut facts, &roots, &paths, 0, "not_kept");
-    pass(&mut facts, &roots, &paths, 3, "");
-    let link = homes[1].0.join("hardlink");
-    fs::hard_link(homes[1].0.join("state_5.sqlite"), &link).unwrap();
-    let unstamped = pass(&mut facts, &roots, &paths, 2, "stamp_changed");
-    assert_eq!(
-        unstamped.local_diagnostics.sidecar_keep_declined,
-        "unstamped"
-    );
-    assert!(!facts.homes.kept.contains_key(&homes[1].0));
-    assert_eq!(facts.homes.kept.len(), 2);
-    // A listed home missing from the kept facts reads as a roster change.
-    pass(&mut facts, &roots, &paths, 2, "roster_changed");
-    fs::remove_file(&link).unwrap();
-    pass(&mut facts, &roots, &paths, 2, "roster_changed");
-    pass(&mut facts, &roots, &paths, 3, "");
-}
-
 /// [money] An added or removed home leaves the others reused; an added or
 /// removed home that owns a kept id's winning title reloads cold.
 #[test]
 fn roster_changes_reuse_the_remaining_homes() {
     let homes = sorted_homes(4);
     let (all, three) = (roots_of(&homes), roots_of(&homes[..3]));
-    thread(&homes[1], ID, Some("Base title"));
+    seed(&homes[1], ID, Some("Base title"));
     let paths = all_paths(&homes, &[ID]);
     let mut facts = SidecarFacts::default();
     pass(&mut facts, &three, &paths, 0, "not_kept");

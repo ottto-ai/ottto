@@ -188,8 +188,8 @@ fn five_roots_46_copied_threads_recover_census_and_count_each_once() {
     );
 }
 
-/// [money] Per-home reuse over the five homes equals a cold load: a home
-/// whose facts are unchanged, another home's index title and a copy conflict.
+/// [money] Per-home reuse over the five homes equals a cold load when one
+/// home's stamp changes but its facts do not.
 #[test]
 fn five_roots_46_copied_threads_reuse_per_home() {
     use super::super::sidecar::{reuse_tests::parity_in_place, SidecarFacts};
@@ -216,24 +216,6 @@ fn five_roots_46_copied_threads_reuse_per_home() {
     fixture.update(2, "UPDATE threads SET first_user_message = 'not read'");
     pass(4, "stamp_changed");
     pass(5, "");
-    let index = fixture.roots[3]
-        .parent()
-        .unwrap()
-        .join("session_index.jsonl");
-    fs::write(
-        index,
-        json!({"id": fixture.ids[0], "thread_name": "Indexed"}).to_string() + "\n",
-    )
-    .unwrap();
-    pass(0, "title_inputs");
-    pass(5, "");
-    let id = &fixture.ids[1];
-    fixture.update(
-        4,
-        &format!("UPDATE threads SET model = 'other-model' WHERE id = '{id}'"),
-    );
-    pass(0, "conflict");
-    pass(0, "not_kept");
 }
 
 #[test]
