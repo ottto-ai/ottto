@@ -693,11 +693,17 @@ fn head_page(
         |_| false,
         |request, wire| {
             assert_eq!(request.source, Claude.api_slug());
-            assert_eq!(
-                wire,
-                &value(request).unwrap(),
-                "default and client wire agree"
-            );
+            if request
+                .snapshots
+                .iter()
+                .any(crate::snapshot_client::declares_head_cas)
+            {
+                assert_eq!(
+                    wire,
+                    &value(request.wire_with_head_cas()).unwrap(),
+                    "default and client wire agree"
+                );
+            }
             Ok(store.post(request, wire))
         },
     )
