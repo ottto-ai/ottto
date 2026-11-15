@@ -397,19 +397,28 @@ pub fn handle_request_with_peer(
     }
 }
 
+/// The diagnostic class of a control command; counts only, no ids or args.
+pub(crate) fn control_command_class(command: &LocalControlCommand) -> &'static str {
+    match command {
+        LocalControlCommand::Status { .. } => "status",
+        LocalControlCommand::ClaudeAccountsStatus => "claude_accounts_status",
+        LocalControlCommand::CodexAccountsStatus => "codex_accounts_status",
+        LocalControlCommand::AgentStatusRefresh { .. } => "agent_status_refresh",
+        _ => "other",
+    }
+}
+
 pub fn handle_request_json_with_peer(
     daemon: &LocalDaemon,
     request_json: &str,
     peer: Option<LocalClientPeer>,
 ) -> String {
     let request = serde_json::from_str::<LocalControlRequest>(request_json);
-    crate::local_resource_diagnostics::control_class(match request.as_ref().map(|r| &r.command) {
-        Ok(LocalControlCommand::Status { .. }) => "status",
-        Ok(LocalControlCommand::ClaudeAccountsStatus) => "claude_accounts_status",
-        Ok(LocalControlCommand::CodexAccountsStatus) => "codex_accounts_status",
-        Ok(LocalControlCommand::AgentStatusRefresh { .. }) => "agent_status_refresh",
-        _ => "other",
-    });
+    crate::local_resource_diagnostics::control_class(
+        request
+            .as_ref()
+            .map_or("other", |request| control_command_class(&request.command)),
+    );
     let response = match request {
         Ok(request) => handle_request_with_peer(daemon, request, peer),
         Err(error) => LocalControlResponse {

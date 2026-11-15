@@ -968,12 +968,12 @@ crate::heap_layout_bound::no_heap!(true; InlineInstant);
 /// recomputed from the current entries at every resume and at emission.
 /// `"legacy"` while the counting cutover is inactive.
 pub(in crate::snapshots) fn counting_view(candidate: &CandidateFile, index: &ScanIndex) -> String {
-    crate::snapshots::codex_counting_version::singleton_view(candidate, index)
+    crate::snapshots::sources::codex::counting::version::singleton_view(candidate, index)
 }
 
 /// A group's counting view (#603): what
 /// `configure_group_once` would configure now from every member's index
-/// entry (`codex_counting_version::group_view`, the same evidence as
+/// entry (`sources::codex::counting::version::group_view`, the same evidence as
 /// `group_evidence` at boot). A counting change on any member, not only the
 /// live one, changes it; `counting_reusable` decides resume and emission
 /// against it exactly as for a singleton (any member's Legacy ACK takes
@@ -982,7 +982,7 @@ pub(in crate::snapshots) fn group_counting_view<'a>(
     members: impl IntoIterator<Item = &'a CandidateFile>,
     index: &ScanIndex,
 ) -> String {
-    crate::snapshots::codex_counting_version::group_view(members, index)
+    crate::snapshots::sources::codex::counting::version::group_view(members, index)
 }
 
 /// The counting view a job is decided under: a group's over all members.
@@ -1010,7 +1010,7 @@ pub(in crate::snapshots) fn group_scope() -> String {
 /// the rule `current` would select. The paused accumulator carries the
 /// configuration it was decided under, so `recorded` adds nothing to it.
 fn counting_reusable(accumulator: &SnapshotAccumulator, _recorded: &str, current: &str) -> bool {
-    crate::snapshots::codex_counting_version::reusable_under_view(accumulator, current)
+    crate::snapshots::sources::codex::counting::version::reusable_under_view(accumulator, current)
 }
 
 /// The strict census generation a cursor attempt belongs to (K7): the

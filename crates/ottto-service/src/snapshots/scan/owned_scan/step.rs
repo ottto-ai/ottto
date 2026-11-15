@@ -237,9 +237,11 @@ impl OwnedSourceScan {
                         })
                         .collect::<BTreeMap<_, _>>();
                     let absence_coverage = inventory.held_owners.is_empty()
-                        && codex_counting_version::absence_coverage_complete(index, inventory);
-                    codex_counting_version::note_inventory_created(index, inventory);
-                    codex_counting_version::prepare_moved_evidence(
+                        && sources::codex::counting::version::absence_coverage_complete(
+                            index, inventory,
+                        );
+                    sources::codex::counting::version::note_inventory_created(index, inventory);
+                    sources::codex::counting::version::prepare_moved_evidence(
                         index,
                         &current_owners,
                         absence_coverage,
@@ -1627,10 +1629,10 @@ impl OwnedSourceScan {
                         active.parser.reader.acquisition.as_ref(),
                     ) {
                         let start = plan.start_offset();
-                        codex_fragment::note_tail_repeat(
+                        sources::codex::eof_fragment::note_tail_repeat(
                             entry,
                             &active.candidate,
-                            codex_fragment::TailRead {
+                            sources::codex::eof_fragment::TailRead {
                                 mode: plan.mode(),
                                 start,
                                 end: start.saturating_add(active.parser.reader.consumed_bytes()),
@@ -2080,7 +2082,7 @@ impl OwnedSourceScan {
                     .source_session_id
                     .as_deref()
                     .filter(|_| {
-                        codex_counting_version::evicted_legacy_selected_v2(
+                        sources::codex::counting::version::evicted_legacy_selected_v2(
                             &parser.accumulator,
                             index,
                         )
@@ -2252,7 +2254,9 @@ impl OwnedSourceScan {
                 };
                 if let Some(receipts) = codex_counting_receipts {
                     if let Some(owner) = evicted_legacy_v2_owner {
-                        codex_counting_version::note_evicted_legacy_v2_selection(index, &owner);
+                        sources::codex::counting::version::note_evicted_legacy_v2_selection(
+                            index, &owner,
+                        );
                     }
                     census.codex_counting_v2 = Some(receipts);
                 }
@@ -2617,7 +2621,10 @@ impl OwnedSourceScan {
                             (prefix_continued
                                 && completed.checkpoint.sealed_offset() == fragment.offset)
                                 .then(|| {
-                                    codex_fragment::BoundFragment::bind(&candidate, fragment.offset)
+                                    sources::codex::eof_fragment::BoundFragment::bind(
+                                        &candidate,
+                                        fragment.offset,
+                                    )
                                 })
                                 .flatten()
                         })
@@ -3060,7 +3067,9 @@ impl OwnedSourceScan {
                         .get(index_key)
                         .is_some_and(ScanIndexEntry::codex_history_is_protected)
                         && (source != SnapshotSource::Codex
-                            || codex_counting_version::tombstone_before_retire(index, index_key))
+                            || sources::codex::counting::version::tombstone_before_retire(
+                                index, index_key,
+                            ))
                     {
                         // A member that vanished beneath its present parent
                         // also drops its unverified audit debt, proven again
@@ -3187,7 +3196,7 @@ impl OwnedSourceScan {
                 // Retirements on this page can already have a moved header in
                 // the inventory, even while that file's parse is deferred.
                 if let Some(inventory) = codex_join_inventory.as_ref() {
-                    codex_counting_version::note_inventory_created(index, inventory);
+                    sources::codex::counting::version::note_inventory_created(index, inventory);
                 }
                 let raw_census_complete = traversal_discovery_done
                     && traversal_healthy
@@ -3527,7 +3536,7 @@ impl OwnedSourceScan {
                     codex_join_validation,
                     // Moved, not copied: the box was charged with the census.
                     codex_counting_v2: if source == SnapshotSource::Codex {
-                        codex_counting_version::take_local_receipts(
+                        sources::codex::counting::version::take_local_receipts(
                             index,
                             census.codex_counting_v2.take(),
                         )

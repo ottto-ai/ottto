@@ -734,7 +734,7 @@ fn refresh_retained_codex_directories(
                 &path,
                 metadata.len(),
                 modified_unix_seconds,
-                codex_fragment::Stamp::metadata(&metadata),
+                sources::codex::eof_fragment::Stamp::metadata(&metadata),
             );
             let aged = census_unix_seconds.is_some_and(|now| {
                 !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
@@ -744,7 +744,7 @@ fn refresh_retained_codex_directories(
                     source,
                     &path,
                     metadata.len(),
-                    codex_fragment::Stamp::metadata(&metadata),
+                    sources::codex::eof_fragment::Stamp::metadata(&metadata),
                 );
             let requires_recovery = recovery.requires(source, &path, metadata.len());
             if !requires_recovery && aged && !owes_stamped {

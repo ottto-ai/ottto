@@ -1035,7 +1035,7 @@ fn observed_pass(
 /// so it cannot poison other decoder rows.
 #[test]
 fn archive_whole_unread_debt_settles_after_one_counted_full() {
-    use crate::snapshots::g7_debt::tests as g7;
+    use crate::snapshots::upload::freshness_debt::tests as g7;
     const CONTEXT: &str = "g7-archive-whole-context";
     struct Arm {
         seeded: bool,
@@ -1440,11 +1440,11 @@ fn unfunded_compressed_header_isolates_filename_owner_and_recovers() {
     let _lock = DECODER_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _cutover = codex_counting_version::TestCutover::set(0);
+    let _cutover = sources::codex::counting::version::TestCutover::set(0);
     let mut seed = ScanIndex::default();
     let owner = codex_protected_owner(MAIN);
-    let tombstone = codex_counting_version::CountingTombstone {
-        evidence: codex_counting_version::AckEvidence::LegacyAcked,
+    let tombstone = sources::codex::counting::version::CountingTombstone {
+        evidence: sources::codex::counting::version::AckEvidence::LegacyAcked,
         retired_in: "2026-10-06T00:00:00Z".into(),
         created_unix_ms: None,
     };

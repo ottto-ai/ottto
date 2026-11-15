@@ -2066,7 +2066,7 @@ fn renamed_aged_account_hold_moves_custody_before_age_or_keeps_uncertain_debt() 
         ));
         if !known_generation {
             // Real legacy/unknown owner state, using its existing observation API.
-            let birth = claude_context_file_birth::ClaudeOpenedBirth::from_metadata(
+            let birth = sources::claude::context_file_birth::ClaudeOpenedBirth::from_metadata(
                 &fs::metadata(&original).unwrap(),
             )
             .birth;
@@ -2224,7 +2224,7 @@ fn renamed_aged_account_hold_moves_custody_before_age_or_keeps_uncertain_debt() 
             raced
                 .snapshot_activity_at
                 .extend(resolved.snapshot_activity_at.clone());
-            let opened = claude_context_file_birth::ClaudeOpenedBirth::from_metadata(
+            let opened = sources::claude::context_file_birth::ClaudeOpenedBirth::from_metadata(
                 &fs::metadata(&moved).unwrap(),
             );
             raced.claude_money_birth_store.record_opened(

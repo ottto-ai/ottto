@@ -15,7 +15,7 @@ mod rss_test_support;
 
 use crate::codex_scan_diagnostics::CountingV2Receipts;
 use crate::owned_heap::OwnedMap;
-use crate::snapshots::codex_counting_version::{self, AckEvidence, CountingVersion};
+use crate::snapshots::sources::codex::counting::version::{self, AckEvidence, CountingVersion};
 use crate::snapshots::*;
 
 /// Counting-contract row cap for one open turn's staged UI money. Changing it
@@ -658,7 +658,7 @@ impl SnapshotAccumulator {
             let version = counting
                 .cutover_unix_ms
                 .map_or(CountingVersion::Legacy, |cutover| {
-                    codex_counting_version::decide(value, counting.evidence, cutover)
+                    version::decide(value, counting.evidence, cutover)
                 });
             counting.version = Some(version);
             if version == CountingVersion::V2 {
