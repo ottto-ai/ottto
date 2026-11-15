@@ -99,12 +99,14 @@ pub(super) fn enter_source_qos(slot: &mut Option<MacPlatformSignals>, source: Sn
     drop(slot.take());
     *slot = paced_source_qos(source, resident_background);
 }
-/// A spent byte budget asks only during the source's first backfill.
+/// A spent byte budget or first-read progress asks only during the source's
+/// first backfill; a page that read and listed nothing new does not ask.
 pub(super) fn resident_scan_requested(scan: &SourceScanResult, first_read_bootstrap: bool) -> bool {
     scan.charge_deferred
         || (scan.census_status.pending_work
             && ((scan.page_file_limit_hit && !scan.routine_recensus)
-                || (first_read_bootstrap && scan.page_byte_budget_hit)))
+                || (first_read_bootstrap && scan.page_byte_budget_hit)
+                || (first_read_bootstrap && scan.first_read_progress)))
 }
 pub(super) fn request_resident_scan(source: SnapshotSource) {
     if let Some(pacing) = resident_pacing(MacPlatformSignals::default().power()) {

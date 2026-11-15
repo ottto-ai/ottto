@@ -1581,6 +1581,158 @@ fn first_read_byte_pacing_stops_when_backfill_completes() {
     std::fs::remove_dir_all(home).unwrap();
 }
 
+/// [behaviour] First-read progress asks for pacing with queued work only
+/// during a first backfill. The charge, file-limit and byte-budget terms keep
+/// their own rules, and a routine pass ignores progress.
+#[test]
+fn first_read_progress_pages_pace_only_during_a_first_backfill() {
+    let mut scan = empty_scan();
+    for bits in 0..128_u8 {
+        let [bootstrap, pending, progress, byte_hit, file_hit, routine, charge] =
+            [1, 2, 4, 8, 16, 32, 64].map(|bit| bits & bit != 0);
+        scan.census_status.pending_work = pending;
+        scan.first_read_progress = progress;
+        scan.page_byte_budget_hit = byte_hit;
+        scan.page_file_limit_hit = file_hit;
+        scan.routine_recensus = routine;
+        scan.charge_deferred = charge;
+        let existing = charge || (pending && ((file_hit && !routine) || (bootstrap && byte_hit)));
+        let requested = resident_scan_requested(&scan, bootstrap);
+        assert_eq!(
+            requested,
+            existing || (bootstrap && pending && progress),
+            "{bits:07b}"
+        );
+        if !bootstrap {
+            scan.first_read_progress = !progress;
+            assert_eq!(
+                resident_scan_requested(&scan, false),
+                requested,
+                "{bits:07b}"
+            );
+        }
+    }
+}
+
+/// Synthetic transcripts under dated day directories: two Codex rollouts in
+/// `2026/10/24` (their file date), or two Pi sessions in each of `2026/10/23`
+/// and `2026/10/24`.
+fn first_read_tree(source: SnapshotSource, root: &Path) {
+    if source == SnapshotSource::Codex {
+        let dir = root.join("2026/10/24");
+        std::fs::create_dir_all(&dir).unwrap();
+        codex_rollouts(&dir, 0, 2);
+        return;
+    }
+    for day in [23_u64, 24] {
+        let dir = root.join(format!("2026/10/{day}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        for file in 0..2 {
+            std::fs::write(
+                dir.join(format!("session-{day}-{file}.jsonl")),
+                "{\"type\":\"message_end\",\"message\":{\"model\":\"gpt-5.4\",\"timestamp\":1793088001000,\"usage\":{\"input\":1,\"output\":1}}}\n",
+            )
+            .unwrap();
+        }
+    }
+}
+
+/// [behaviour] During a first backfill, listing ticks and small-file pages
+/// ask for paced passes although they fill no file allowance and spend no
+/// byte budget. A page that reads nothing new and finishes its listing asks
+/// for nothing (a stuck tail cannot spin), and once the backfill is marked
+/// complete no page asks.
+#[test]
+fn first_read_progress_paces_first_import_listing_and_small_file_pages() {
+    use super::super::backfill_replay_pending;
+    use crate::backfill::{
+        bootstrap_pending_for_destination, mark_backfill_complete_for_destination, BackfillState,
+    };
+    use crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture;
+    use crate::snapshots::with_test_directory_entries;
+    const DESTINATION: &str = "first-read-progress-destination";
+    for source in [SnapshotSource::Codex, SnapshotSource::Pi] {
+        let bootstrap = |state: &BackfillState| {
+            backfill_replay_pending(source, state, DESTINATION)
+                && bootstrap_pending_for_destination(state, source, DESTINATION)
+        };
+        let home = crate::test_scratch::private_dir("first-read-progress")
+            .canonicalize()
+            .unwrap();
+        let root = home.join(match source {
+            SnapshotSource::Codex => ".codex/sessions",
+            _ => ".pi/agent/sessions",
+        });
+        first_read_tree(source, &root);
+        let scanner = E2ScanFixture::default();
+        let page = |index, limit| {
+            let roots = std::slice::from_ref(&root);
+            let (index, scan, _) =
+                scanner.scan_other_page(source, roots, &home, index, true, limit, &[]);
+            (index, scan)
+        };
+        let mut state = BackfillState::default();
+        assert!(bootstrap(&state), "{source:?}");
+        // Walk one directory per tick until the census completes.
+        let walk = |state: &BackfillState| {
+            with_test_directory_entries(1, || {
+                let (mut index, mut listing, mut reading) = (ScanIndex::default(), 0, 0);
+                for _ in 0..32 {
+                    let (next, scan) = page(index, 100);
+                    index = next;
+                    let pending = scan.census_status.pending_work;
+                    assert!(
+                        !scan.page_file_limit_hit && !scan.page_byte_budget_hit,
+                        "{source:?}"
+                    );
+                    assert!(!scan.charge_deferred, "{source:?}");
+                    assert!(!resident_scan_requested(&scan, false), "{source:?}");
+                    assert_eq!(
+                        resident_scan_requested(&scan, bootstrap(state)),
+                        bootstrap(state) && pending && scan.first_read_progress,
+                        "{source:?}"
+                    );
+                    if pending && scan.first_read_progress {
+                        if scan.scanned_file_count == 0 {
+                            listing += 1;
+                        } else {
+                            reading += 1;
+                        }
+                    }
+                    if scan.census_complete {
+                        return (listing, reading);
+                    }
+                }
+                panic!("{source:?} census did not complete");
+            })
+        };
+        let (listing, reading) = walk(&state);
+        assert!(listing > 0, "{source:?}: listing ticks ask");
+        if source == SnapshotSource::Pi {
+            assert!(reading > 0, "{source:?}: small-file pages ask");
+        }
+
+        // One full listing tick and no selection: queued work, no progress.
+        let (index, stuck) = page(ScanIndex::default(), 0);
+        assert!(stuck.census_status.pending_work, "{source:?}");
+        assert_eq!(stuck.scanned_file_count, 0, "{source:?}");
+        assert!(!stuck.first_read_progress, "{source:?}");
+        assert!(!resident_scan_requested(&stuck, bootstrap(&state)));
+        let (index, stuck) = page(index, 0);
+        assert!(stuck.census_status.pending_work && !stuck.first_read_progress);
+        assert!(!resident_scan_requested(&stuck, bootstrap(&state)));
+        // Reading the new census members is progress, even after listing ends.
+        let (_, read) = page(index, 100);
+        assert!(read.scanned_file_count > 0 && read.first_read_progress);
+
+        mark_backfill_complete_for_destination(&mut state, source, DESTINATION);
+        assert!(!bootstrap(&state), "{source:?}");
+        let (listing, _) = walk(&state);
+        assert!(listing > 0, "{source:?}: progress without a first backfill");
+        std::fs::remove_dir_all(home).unwrap();
+    }
+}
+
 /// [behaviour] A resident wake starts another ordinary pass, releases the
 /// sync lock while waiting, and adds no wake after a quiet successful drain.
 #[test]

@@ -121,6 +121,7 @@ impl OwnedSourceScan {
             audit_now,
             backfill_window_days,
             file_limit,
+            mut first_read_progress,
             page_file_limit_hit,
             claude_request_identity_capture,
             claude_effort_support_dir,
@@ -2620,6 +2621,7 @@ impl OwnedSourceScan {
                     if parse_complete && !non_progressing_residue {
                         sampled_audit::settle_growth(index, &index_key);
                     }
+                    first_read_progress |= selected_flags.get(&index_key).is_some_and(|f| f.0);
                     index.record(recorded, last_snapshot_fingerprint, outcome);
                     // The counting version travels in the same entry as the
                     // fingerprint it describes; no separate save can split them.
@@ -3450,6 +3452,7 @@ impl OwnedSourceScan {
                     page_file_limit_hit,
                     routine_recensus,
                     page_byte_budget_hit: codex_page.budget_deferred(),
+                    first_read_progress,
                     claude_queued_family_deferred_paths: std::mem::take(
                         &mut history_upgrade.queued_family_deferred_paths,
                     ),
@@ -3616,6 +3619,7 @@ impl OwnedSourceScan {
                     ("routine_recensus", scan.routine_recensus),
                     ("page_file_limit_hit", scan.page_file_limit_hit),
                     ("pending_work", scan.census_status.pending_work),
+                    ("first_read_progress", scan.first_read_progress),
                 ]);
                 resource_probe.collection(
                     source.api_slug(),
@@ -4870,6 +4874,7 @@ impl OwnedSourceScan {
             audit_now,
             backfill_window_days,
             file_limit,
+            first_read_progress,
             page_file_limit_hit,
             claude_request_identity_capture,
             claude_effort_support_dir,

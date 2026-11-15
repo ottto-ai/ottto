@@ -1520,11 +1520,16 @@ is capped at one hour; walk time and the next eligible pass can add further dela
 Source-generic transition tests cover Claude, Codex and Pi; end-to-end upload tests
 through retry and follow-up walks cover Pi only.
 
-Completed native scan pages carry `routine_recensus`, `page_file_limit_hit` and
-`pending_work` booleans on `native_collection_page`. `pending_work` means queued
-directories or candidates remain. The file-limit pacing decision is
-`page_file_limit_hit && pending_work && !routine_recensus`; a resident deferral
-can still request pacing independently. These observations add no timer or trigger.
+Completed native scan pages carry `routine_recensus`, `page_file_limit_hit`,
+`pending_work` and `first_read_progress` booleans on `native_collection_page`.
+`pending_work` means queued directories or candidates remain. The file-limit
+pacing decision is `page_file_limit_hit && pending_work && !routine_recensus`; a
+resident deferral can still request pacing independently. `first_read_progress`
+means the page completed a census-member read or listed census directories and
+left the walk unfinished; during a source's first backfill,
+`first_read_progress && pending_work` also requests the existing paced pass. A
+page that read and listed nothing new does not. These observations add no timer
+or trigger.
 No full fingerprint, path or key is emitted, and none of these fields enters uploads.
 
 ## Prior Held Family Observation
