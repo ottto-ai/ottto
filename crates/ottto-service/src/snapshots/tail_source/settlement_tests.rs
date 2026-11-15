@@ -336,62 +336,50 @@ fn the_shipped_selections_reuse_stored_state() {
 /// cannot supply; the rest recompose.
 #[test]
 fn a_forced_member_reads_natively_only_for_missing_evidence() {
+    use ClaudeRequestCensusShape::{Empty, Exact, IdentityIncomplete, Lossy, OverBudget};
+
     let fingerprint = "a".repeat(64);
     let record = |shape| {
         ClaudeRequestCensusRecord::synthetic_for_test(
             &fingerprint,
             7,
             shape,
-            if matches!(
-                shape,
-                ClaudeRequestCensusShape::Empty | ClaudeRequestCensusShape::OverBudget
-            ) {
+            if matches!(shape, Empty | OverBudget) {
                 vec![]
             } else {
                 vec![1]
             },
         )
     };
-    let cases = [
-        (
-            "verified.jsonl",
-            record(ClaudeRequestCensusShape::Exact),
-            false,
-        ),
+    let mut cases = vec![
+        ("verified.jsonl", record(Exact), false),
         (
             "bindable.jsonl",
-            record(ClaudeRequestCensusShape::Exact).with_unverified_for_test(true),
+            record(Exact).with_unverified_for_test(true),
             false,
         ),
         (
             "incomplete.jsonl",
-            record(ClaudeRequestCensusShape::IdentityIncomplete).with_unverified_for_test(true),
+            record(IdentityIncomplete).with_unverified_for_test(true),
             true,
         ),
         (
             "old.jsonl",
-            record(ClaudeRequestCensusShape::Exact)
+            record(Exact)
                 .with_unverified_for_test(true)
                 .with_derivation_for_test(0),
             true,
         ),
     ];
-    let mut cases = cases.to_vec();
-    for shape in [
-        ClaudeRequestCensusShape::Exact,
-        ClaudeRequestCensusShape::Empty,
-        ClaudeRequestCensusShape::IdentityIncomplete,
-        ClaudeRequestCensusShape::Lossy,
-        ClaudeRequestCensusShape::OverBudget,
+    for (shape, native) in [
+        (Exact, false),
+        (Empty, false),
+        (IdentityIncomplete, false),
+        (Lossy, true),
+        (OverBudget, true),
     ] {
         let twin = record(shape).with_twin_for_test(true);
-        let admitted = matches!(
-            shape,
-            ClaudeRequestCensusShape::Exact
-                | ClaudeRequestCensusShape::Empty
-                | ClaudeRequestCensusShape::IdentityIncomplete
-        );
-        cases.push(("twin", twin.clone(), !admitted));
+        cases.push(("twin", twin.clone(), native));
         cases.push((
             "unverified twin",
             twin.clone().with_unverified_for_test(true),

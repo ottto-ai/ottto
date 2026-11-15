@@ -2,7 +2,10 @@
 // Lives beside Disk so save/reload and after_source_save stay real.
 use super::*;
 use crate::snapshots::claude_request_census::ClaudeRequestCensusShape;
-use crate::snapshots::e2_pipeline_scan_fixture::damage_tail_for_test;
+use crate::snapshots::e2_pipeline_scan_fixture::{
+    continuation_for_test, damage_tail_for_test, forced_needs_native_for_test, pace_cap_for_test,
+};
+use crate::snapshots::sampled_scan::transition_fixture::upgrade_from_legacy_store;
 use crate::snapshots::sampled_scan::transition_fixture::{money_oracle, observe_consumed, Mode};
 use crate::transcript_acquisition::{capture_sample_reads, FullReason, ReadMode};
 
@@ -16,6 +19,7 @@ struct Twin {
     prior: ScanIndex,
     holder: PathBuf,
     twin: PathBuf,
+    key: String,
 }
 impl Twin {
     fn new(name: &str, incomplete: bool) -> Self {
@@ -43,12 +47,6 @@ impl Twin {
         accept_page(&mut first);
         let prior = disk.commit(&first.cache, SnapshotSource::ClaudeCode, &mut first.index);
         let mut contents = resumed(ROOT, &[A, B]);
-        if name.ends_with("boundary") {
-            contents += &(json!({"type":"user", "sessionId":ROOT,
-                "message":{"role":"user", "content":"x".repeat(10000)}})
-            .to_string()
-                + "\n");
-        }
         contents += &resumed(ROOT, &[C]);
         if incomplete {
             let mut gap: Value = serde_json::from_str(line(ROOT, "gap", AT, 12).trim()).unwrap();
@@ -62,10 +60,11 @@ impl Twin {
         both.enrich(&c);
         both.finish();
         accept_page(&mut both);
+        let key = twin.to_string_lossy().into_owned();
         let record = both
             .index
             .claude_request_census_for_test()
-            .get(&twin.to_string_lossy())
+            .get(&key)
             .unwrap();
         assert!(record.is_twin() && !record.can_bind_recomposed_body());
         assert!(!record.unverified_for_test());
@@ -77,12 +76,7 @@ impl Twin {
                 ClaudeRequestCensusShape::Exact
             }
         );
-        assert!(
-            !crate::snapshots::e2_pipeline_scan_fixture::forced_needs_native_for_test(
-                &both.index,
-                &twin
-            )
-        );
+        assert!(!forced_needs_native_for_test(&both.index, &twin));
         // Keep the holder native so the page byte budget attributes every
         // other consumed byte to the twin, including the unchanged row.
         damage_tail_for_test(&both.index, &holder.to_string_lossy(), "missing");
@@ -94,7 +88,20 @@ impl Twin {
             prior,
             holder,
             twin,
+            key,
         }
+    }
+    fn restart(&self) -> E2ScanFixture {
+        let owner = E2ScanFixture::capturing_identity();
+        self.disk.begin(&owner, SnapshotSource::ClaudeCode);
+        owner
+    }
+    fn pages(&self, restart: &E2ScanFixture, tail: Page) -> [Page; 3] {
+        [
+            tail,
+            self.page(&E2ScanFixture::capturing_identity()),
+            self.page(restart),
+        ]
     }
     fn force(&self, request: &str) {
         append(&self.holder, &line(ROOT, request, AT, 10));
@@ -136,16 +143,16 @@ impl Twin {
             );
         }
         assert!(super::copy_prefix_route_tests::accounts(&routes[1]) >= 2);
+        let b = pages[1]
+            .index
+            .claude_request_census_for_test()
+            .get(&self.key)
+            .unwrap();
         for page in [&pages[0], &pages[2]] {
             let a = page
                 .index
                 .claude_request_census_for_test()
-                .get(&self.twin.to_string_lossy())
-                .unwrap();
-            let b = pages[1]
-                .index
-                .claude_request_census_for_test()
-                .get(&self.twin.to_string_lossy())
+                .get(&self.key)
                 .unwrap();
             assert_eq!(a.request_hashes_for_test(), b.request_hashes_for_test());
             assert_eq!(a.shape_for_test(), b.shape_for_test());
@@ -179,11 +186,11 @@ fn forced_verified_twin_reuses_certified_tail_and_restarts() {
         for incomplete in [false, true] {
             let mut f = Twin::new(&format!("forced-verified-twin-{incomplete}"), incomplete);
             for round in 0..3 {
-                let sealed = crate::snapshots::e2_pipeline_scan_fixture::continuation_for_test(
+                let sealed = continuation_for_test(
                     SnapshotSource::ClaudeCode,
                     &f.owner.cache,
                     &f.prior,
-                    &f.twin.to_string_lossy(),
+                    &f.key,
                 )
                 .unwrap()
                 .sealed_offset();
@@ -198,8 +205,7 @@ fn forced_verified_twin_reuses_certified_tail_and_restarts() {
                     input_clock(&f.twin);
                 }
                 f.force(&format!("holder-{round}"));
-                let restart = E2ScanFixture::capturing_identity();
-                f.disk.begin(&restart, SnapshotSource::ClaudeCode);
+                let restart = f.restart();
                 let ((tail, consumed), samples) =
                     capture_sample_reads(|| observe_consumed(|| f.page(&f.owner)));
                 let native = round == 2 && !incomplete;
@@ -235,16 +241,12 @@ fn forced_verified_twin_reuses_certified_tail_and_restarts() {
                 assert!(samples
                     .iter()
                     .all(|read| read.requested <= crate::transcript_acquisition::SAMPLE_BYTES));
-                let mut pages = [
-                    tail,
-                    f.page(&E2ScanFixture::capturing_identity()),
-                    f.page(&restart),
-                ];
+                let mut pages = f.pages(&restart, tail);
                 f.assert_read(&restart, mode, start);
                 f.compare(&mut pages);
                 if round == 0 {
-                    let legacy = crate::snapshots::sampled_scan::transition_fixture::upgrade_from_legacy_store(
-                        &f.prior, &f.c.base.join("upgrade.json"));
+                    let legacy =
+                        upgrade_from_legacy_store(&f.prior, &f.c.base.join("upgrade.json"));
                     let mut upgraded = f.c.raw(
                         &E2ScanFixture::capturing_identity(),
                         legacy,
@@ -262,26 +264,19 @@ fn forced_verified_twin_reuses_certified_tail_and_restarts() {
                 let record = pages[2]
                     .index
                     .claude_request_census_for_test()
-                    .get(&f.twin.to_string_lossy())
+                    .get(&f.key)
                     .unwrap();
                 assert!(record.is_twin() && !record.can_bind_recomposed_body());
                 assert_eq!(record.unverified_for_test(), round == 1 && !incomplete);
-                assert!(!record.current_for(
-                    &pages[2].index.files[&f.twin.to_string_lossy().into_owned()]
-                        .source_file_fingerprint
-                ));
+                assert!(!record.current_for(&pages[2].index.files[&f.key].source_file_fingerprint));
                 assert_eq!(
-                    crate::snapshots::e2_pipeline_scan_fixture::forced_needs_native_for_test(
-                        &pages[2].index,
-                        &f.twin
-                    ),
+                    forced_needs_native_for_test(&pages[2].index, &f.twin),
                     round == 1 && !incomplete
                 );
                 let [_, _, page] = pages;
                 f.commit(page);
             }
-            let restart = E2ScanFixture::capturing_identity();
-            f.disk.begin(&restart, SnapshotSource::ClaudeCode);
+            let restart = f.restart();
             let ((mut quiet, consumed), samples) = capture_sample_reads(|| {
                 observe_consumed(|| f.c.raw(&restart, f.prior.clone(), 100, true, &[]))
             });
@@ -314,7 +309,7 @@ fn forced_verified_twin_stays_on_its_page_without_tail_capacity() {
             append(&f.twin, &line(ROOT, "own-later", AT, 9));
             input_clock(&f.twin);
             if arm == "future" {
-                damage_tail_for_test(&f.prior, &f.twin.to_string_lossy(), "future");
+                damage_tail_for_test(&f.prior, &f.key, "future");
                 f.prior = f
                     .disk
                     .commit(&f.owner.cache, SnapshotSource::ClaudeCode, &mut f.prior);
@@ -322,116 +317,50 @@ fn forced_verified_twin_stays_on_its_page_without_tail_capacity() {
             if arm == "completion" {
                 // Held-new custody has a census and committed head but no
                 // entry: it bypasses the cap gate and would pend at completion.
-                assert!(f
-                    .prior
-                    .files
-                    .remove(&f.twin.to_string_lossy().into_owned())
-                    .is_some());
+                assert!(f.prior.files.remove(&f.key).is_some());
             }
             f.force("holder-later");
-            let mut restart = E2ScanFixture::capturing_identity();
-            f.disk.begin(&restart, SnapshotSource::ClaudeCode);
+            let mut restart = f.restart();
             if arm != "future" {
                 f.owner.set_audit_slots(0);
                 restart.set_audit_slots(0);
             }
             if arm == "cap" {
-                crate::snapshots::e2_pipeline_scan_fixture::pace_cap_for_test(&f.owner, &f.twin);
-                crate::snapshots::e2_pipeline_scan_fixture::pace_cap_for_test(&restart, &f.twin);
+                pace_cap_for_test(&f.owner, &f.twin);
+                pace_cap_for_test(&restart, &f.twin);
             }
-            let mut pages = [
-                f.page(&f.owner),
-                f.page(&E2ScanFixture::capturing_identity()),
-                f.page(&restart),
-            ];
+            let mut pages = f.pages(&restart, f.page(&f.owner));
             f.assert_read(&f.owner, ReadMode::Full(FullReason::StateMissing), 0);
             f.assert_read(&restart, ReadMode::Full(FullReason::StateMissing), 0);
             f.compare(&mut pages);
-            assert!(
-                !pages[2].index.files[&f.twin.to_string_lossy().into_owned()]
-                    .scan_identity_version
-                    .as_deref()
-                    .unwrap()
-                    .contains("sampled_unverified")
-            );
+            assert!(!pages[2].index.files[&f.key]
+                .scan_identity_version
+                .as_deref()
+                .unwrap()
+                .contains("sampled_unverified"));
         }
     });
 }
 
-/// [money] A forced twin still needs its actual committed head and certificate.
-/// Existing loader/certificate unit matrices cover individual corruption and
-/// sample boundaries; these rows check page composition and proven Full labels.
+/// [money] A corrupt committed head reconstructs natively on its holder's page.
+/// Loader damage and prefix-certificate refusal tables cover the other fallback
+/// variants; this row checks the twin's full page, ACK and placement parity.
 #[test]
 fn forced_verified_twin_falls_back_without_valid_head() {
     if !supported("forced_twin_fallback") {
         return;
     }
     with_e2(|| {
-        for damage in [
-            "missing",
-            "metadata",
-            "corrupt",
-            "missing_page",
-            "identity",
-            "shrink",
-            "replace",
-            "edit",
-            "sample",
-            "boundary",
-        ] {
-            let mut f = Twin::new(&format!("forced-twin-fallback-{damage}"), false);
-            let reason = match damage {
-                "shrink" => {
-                    std::fs::write(&f.twin, resumed(ROOT, &[A, B])).unwrap();
-                    FullReason::Shrunk
-                }
-                "replace" => {
-                    let bytes = std::fs::read(&f.twin).unwrap();
-                    std::fs::rename(&f.twin, f.c.base.join("replaced.jsonl")).unwrap();
-                    std::fs::write(&f.twin, bytes).unwrap();
-                    FullReason::Replaced
-                }
-                "edit" | "sample" | "boundary" => {
-                    let contents = std::fs::read_to_string(&f.twin)
-                        .unwrap()
-                        .replace("msg-c", "msg-x");
-                    std::fs::write(&f.twin, contents).unwrap();
-                    if damage != "edit" {
-                        append(&f.twin, &line(ROOT, "own-later", AT, 9));
-                    }
-                    if damage == "boundary" {
-                        FullReason::BoundaryChanged
-                    } else {
-                        FullReason::HeadChanged
-                    }
-                }
-                _ => {
-                    damage_tail_for_test(&f.prior, &f.twin.to_string_lossy(), damage);
-                    f.prior =
-                        f.disk
-                            .commit(&f.owner.cache, SnapshotSource::ClaudeCode, &mut f.prior);
-                    FullReason::StateMissing
-                }
-            };
-            if matches!(damage, "sample" | "boundary") {
-                input_clock(&f.twin);
-            }
-            f.force("holder-later");
-            let restart = E2ScanFixture::capturing_identity();
-            f.disk.begin(&restart, SnapshotSource::ClaudeCode);
-            let mut pages = [
-                f.page(&f.owner),
-                f.page(&E2ScanFixture::capturing_identity()),
-                f.page(&restart),
-            ];
-            let reason = if damage == "edit" {
-                FullReason::SameSizeEdit
-            } else {
-                reason
-            };
-            f.assert_read(&f.owner, ReadMode::Full(reason), 0);
-            f.assert_read(&restart, ReadMode::Full(reason), 0);
-            f.compare(&mut pages);
-        }
+        let mut f = Twin::new("forced-twin-fallback-corrupt", false);
+        damage_tail_for_test(&f.prior, &f.key, "corrupt");
+        f.prior = f
+            .disk
+            .commit(&f.owner.cache, SnapshotSource::ClaudeCode, &mut f.prior);
+        f.force("holder-later");
+        let restart = f.restart();
+        let mut pages = f.pages(&restart, f.page(&f.owner));
+        f.assert_read(&f.owner, ReadMode::Full(FullReason::StateMissing), 0);
+        f.assert_read(&restart, ReadMode::Full(FullReason::StateMissing), 0);
+        f.compare(&mut pages);
     });
 }

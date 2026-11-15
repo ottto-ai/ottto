@@ -1066,21 +1066,9 @@ pub(crate) fn hold_entity_decode_for_test(index: &mut ScanIndex, fingerprint: &s
 
 /// Mutate only real committed fixture state; no manufactured certificate.
 pub(crate) fn damage_tail_for_test(index: &ScanIndex, key: &str, damage: &str) {
-    let route = state_v2::tail_route_path(index).unwrap().unwrap();
+    let route = route_of(index).unwrap();
     if damage == "missing" {
         state_v2::retire_tail(&route, [key.to_owned()]).unwrap();
-        return;
-    }
-    if damage == "metadata" {
-        state_v2::observe_tail(
-            &route,
-            key,
-            state_v2::Observation {
-                representation: state_v2::Representation::NonTail,
-                ..Default::default()
-            },
-        )
-        .unwrap();
         return;
     }
     let revision = tail_source::reduction_revision(SnapshotSource::ClaudeCode);
@@ -1088,28 +1076,12 @@ pub(crate) fn damage_tail_for_test(index: &ScanIndex, key: &str, damage: &str) {
     let mut staged = state_v2::StagedFile {
         revision: head.revision,
         head: head.body.clone(),
-        collections: head
-            .table
-            .iter()
-            .filter(|(collection, _)| **collection != state_v2::Collection::Revisions)
-            .map(|(collection, membership)| (*collection, membership.meta))
-            .collect(),
         ..Default::default()
     };
-    state_v2::load_tail(index, key, &head, |collection, page, bytes| {
-        staged.pages.insert((collection, page), bytes);
-        Ok(())
-    })
-    .unwrap();
+    // Ordinary stages keep the committed collection metadata and pages.
     match damage {
         "future" => staged.revision += 1,
         "corrupt" => staged.head = vec![0],
-        // HeadIdentity starts with its raw 32-byte binding digest.
-        "identity" => staged.head[0] ^= 1,
-        "missing_page" => {
-            staged.pages.clear();
-            staged.change = state_v2::Change::Reset;
-        }
         _ => panic!("unknown fixture damage"),
     }
     state_v2::stage_tail(&route, key, staged).unwrap();

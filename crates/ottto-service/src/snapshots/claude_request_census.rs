@@ -300,8 +300,10 @@ impl ClaudeRequestCensusRecord {
         !self.unverified && self.not_twin_or_retired()
     }
 
-    /// Acquisition may try validated stored state without granting copy proof.
-    fn verified_loss_free_twin(&self) -> bool {
+    /// Acquisition may reuse validated stored state; this grants no proof.
+    /// IdentityIncomplete has a reusable reduction even though the census
+    /// classes its identity as unknown.
+    fn verified_reusable_twin(&self) -> bool {
         self.twin
             && !self.unverified
             && self.current_derivation()
@@ -1927,7 +1929,7 @@ pub(super) fn forced_member_needs_native(index: &ScanIndex, key: &str) -> bool {
     index.claude_request_census.get(key).map_or(true, |record| {
         record.unverified_or_twin()
             && !record.can_bind_recomposed_body()
-            && !record.verified_loss_free_twin()
+            && !record.verified_reusable_twin()
     })
 }
 
