@@ -2135,8 +2135,6 @@ struct AppendHandles {
     disabled: bool,
     #[cfg(test)]
     opens: usize,
-    #[cfg(test)]
-    open_error: Option<i32>,
 }
 
 impl AppendHandles {
@@ -2157,9 +2155,6 @@ impl AppendHandles {
         #[cfg(test)]
         {
             self.opens += 1;
-            if let Some(code) = self.open_error.take() {
-                return Err(std::io::Error::from_raw_os_error(code));
-            }
         }
         let mut options = OpenOptions::new();
         options.create(true).append(true);
@@ -2190,19 +2185,9 @@ impl AppendHandles {
                 if !self.open.is_empty() && self.open.len() >= self.cap {
                     self.open.remove(0); // Release before opening a replacement.
                 }
-                let file = match self.open_file(path) {
-                    #[cfg(unix)]
-                    Err(error)
-                        if matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE)) =>
-                    {
-                        if !self.open.is_empty() {
-                            self.open.remove(0);
-                        }
-                        self.open_file(path)
-                    }
-                    result => result,
-                }
-                .context("open Claude evidence append file")?;
+                let file = self
+                    .open_file(path)
+                    .context("open Claude evidence append file")?;
                 // The witness must describe the opened object, not a prior path stat.
                 let generation = api_file_generation(&file.metadata()?);
                 self.open.push(OpenAppendFile {

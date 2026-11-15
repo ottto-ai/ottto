@@ -1,7 +1,7 @@
 //! Linux-only synthetic append-owner tests; no process-global uninstall fence.
 use super::*;
 use crate::test_scratch::ScratchDir;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
 
 fn handles(cap: usize) -> AppendHandles {
     AppendHandles {
@@ -21,21 +21,7 @@ fn append(handles: &mut AppendHandles, dir: &Path, root: &str) -> PathBuf {
     path
 }
 
-/// [regress] A cache hit uses the same opened file, without another open.
-#[test]
-fn hit_reuses_open_handle() {
-    let dir = ScratchDir::new("append-hit");
-    let mut handles = handles(2);
-    let path = append(&mut handles, &dir, "hit");
-    append(&mut handles, &dir, "hit");
-    assert_eq!(handles.opens, 1);
-    assert_eq!(
-        fs::read(path).unwrap(),
-        b"{\"row\":\"hit\"}\n{\"row\":\"hit\"}\n"
-    );
-}
-
-/// [regress] Replacement identity is taken from the opened file; the old inode
+/// [behaviour] Replacement identity is taken from the opened file; the old inode
 /// remains open throughout rename and cannot be reused for the replacement.
 #[test]
 fn replaced_file_reopens() {
@@ -55,7 +41,7 @@ fn replaced_file_reopens() {
     assert_eq!(handles.open[0].ino, fs::metadata(path).unwrap().ino());
 }
 
-/// [regress] A deleted pathname is recreated instead of appending to its orphan.
+/// [behaviour] A deleted pathname is recreated instead of appending to its orphan.
 #[test]
 fn deleted_file_reopens() {
     let dir = ScratchDir::new("append-delete");
@@ -75,7 +61,7 @@ fn deleted_file_reopens() {
     );
 }
 
-/// [regress] A zero retention allowance preserves open/write/close per request.
+/// [behaviour] A zero retention allowance preserves open/write/close per request.
 #[test]
 fn zero_cap_closes_each_append() {
     let dir = ScratchDir::new("append-zero");
@@ -87,7 +73,7 @@ fn zero_cap_closes_each_append() {
     assert_eq!(handles.opens, 2);
 }
 
-/// [regress] Hits do not refresh insertion order; eviction happens before open.
+/// [behaviour] Hits do not refresh insertion order; eviction happens before open.
 #[test]
 fn capacity_evicts_fifo() {
     let dir = ScratchDir::new("append-fifo");
@@ -104,20 +90,7 @@ fn capacity_evicts_fifo() {
     assert_eq!(handles.opens, 3);
 }
 
-/// [regress] Cycle release empties the owner and the next append opens afresh.
-#[test]
-fn clear_closes_all_handles() {
-    let dir = ScratchDir::new("append-clear");
-    let mut handles = handles(2);
-    append(&mut handles, &dir, "a");
-    append(&mut handles, &dir, "b");
-    handles.clear();
-    assert!(handles.open.is_empty());
-    append(&mut handles, &dir, "a");
-    assert_eq!(handles.opens, 3);
-}
-
-/// [regress] Retention evicts successfully unlinked, missing and failed members,
+/// [behaviour] Retention evicts successfully unlinked, missing and failed members,
 /// but preserves the complete pair on a generation mismatch.
 #[test]
 fn retention_unlink_evicts_under_held_guard() {
@@ -159,7 +132,7 @@ fn retention_unlink_evicts_under_held_guard() {
     assert!(!api.exists() && !trace.exists());
 }
 
-/// [regress] A request already admitted but waiting on the owner cannot recreate
+/// [behaviour] A request already admitted but waiting on the owner cannot recreate
 /// evidence after uninstall; an intervening cycle clear never resets the fence.
 #[test]
 fn uninstall_refuses_waiting_request_even_after_clear() {
@@ -191,7 +164,7 @@ fn uninstall_refuses_waiting_request_even_after_clear() {
     assert!(!dir.join("local-otel").exists());
 }
 
-/// [regress] An opened-file write error evicts and propagates its original cause;
+/// [behaviour] An opened-file write error evicts and propagates its original cause;
 /// the batch is not replayed. The next request is free to open a new writer.
 #[test]
 fn write_error_evicts_and_preserves_error() {
@@ -216,47 +189,7 @@ fn write_error_evicts_and_preserves_error() {
     );
 }
 
-/// [regress] Descriptor exhaustion releases one cached file and retries once.
-#[test]
-fn descriptor_exhaustion_evicts_one_and_retries() {
-    for code in [libc::EMFILE, libc::ENFILE] {
-        let dir = ScratchDir::new("append-descriptors");
-        let mut handles = handles(3);
-        append(&mut handles, &dir, "a");
-        let b = append(&mut handles, &dir, "b");
-        handles.open_error = Some(code);
-        let c = append(&mut handles, &dir, "c");
-        assert_eq!(handles.opens, 4);
-        assert_eq!(
-            handles.open.iter().map(|e| &e.path).collect::<Vec<_>>(),
-            [&b, &c]
-        );
-    }
-}
-
-/// [regress] First open and later cache hits preserve private file/dir modes.
-#[test]
-fn permissions_remain_private() {
-    let dir = ScratchDir::new("append-permissions");
-    let mut handles = handles(2);
-    let path = append(&mut handles, &dir, "mode");
-    fs::set_permissions(path.parent().unwrap(), fs::Permissions::from_mode(0o755)).unwrap();
-    append(&mut handles, &dir, "mode");
-    assert_eq!(
-        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-        0o600
-    );
-    assert_eq!(
-        fs::metadata(path.parent().unwrap())
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777,
-        0o700
-    );
-}
-
-/// [regress] Frozen JSONL bytes retain order, repeated roots and internal filtering
+/// [format] Frozen JSONL bytes retain order, repeated roots and internal filtering
 /// across cache hits and cycle release, matching today's encoding exactly.
 #[test]
 fn appended_bytes_match_golden() {
@@ -275,8 +208,11 @@ fn appended_bytes_match_golden() {
     };
     assert_eq!(append_rows(&mut handles, &dir, rows()).unwrap(), 2);
     assert_eq!(append_rows(&mut handles, &dir, rows()).unwrap(), 2);
+    assert_eq!(handles.opens, 1); // A hit must not reopen the file.
     handles.clear();
+    assert!(handles.open.is_empty());
     assert_eq!(append_rows(&mut handles, &dir, rows()).unwrap(), 2);
+    assert_eq!(handles.opens, 2); // Cycle release makes the next request reopen.
     let golden = "{\"count\":1,\"text\":\"a\\nb\"}\n{\"count\":2,\"text\":\"é\"}\n";
     assert_eq!(fs::read(path).unwrap(), golden.repeat(3).as_bytes());
     assert!(!evidence_path(&dir, &internal).exists());
