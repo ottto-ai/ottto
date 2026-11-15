@@ -129,6 +129,31 @@ struct ConfiguredServer {
     /// against THIS, exactly as the agent resolves them — never against the
     /// daemon's working directory, which under launchd is `/`.
     config_dir: Option<PathBuf>,
+    /// Where the agent reads the server from; policy scopes depend on it.
+    source: ServerSource,
+}
+
+/// Where Claude Code reads a configured server from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ServerSource {
+    /// A home settings file (and every non-Claude source).
+    UserSettings,
+    /// `~/.claude.json` top-level `mcpServers` (user scope).
+    User,
+    /// `~/.claude.json` `projects[<dir>].mcpServers` (local scope).
+    Local(PathBuf),
+    /// `<dir>/.mcp.json` (project scope).
+    Project(PathBuf),
+    /// Declared by the installed plugin `plugin`; the client names it
+    /// `plugin:<plugin>:<server>`.
+    Plugin { plugin: String, server: String },
+}
+
+impl ConfiguredServer {
+    fn from_source(mut self, source: ServerSource) -> Self {
+        self.source = source;
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -602,6 +627,7 @@ fn normalize_claude_server(
         transport,
         disabled: false,
         always_load: cfg.get("alwaysLoad").and_then(Value::as_bool) == Some(true),
+        source: ServerSource::UserSettings,
     })
 }
 
@@ -635,6 +661,7 @@ fn normalize_codex_server(
         transport,
         disabled: cfg.get("enabled").and_then(Value::as_bool) == Some(false),
         always_load: false,
+        source: ServerSource::UserSettings,
     })
 }
 
@@ -757,7 +784,7 @@ fn discover_claude_code(home: &Path) -> Vec<ConfiguredServer> {
         // Top-level mcpServers.
         for (name, cfg) in mcp_servers_block(root) {
             if let Some(server) = normalize_claude_server(name, cfg, Some(home)) {
-                servers.insert(name.clone(), server);
+                servers.insert(name.clone(), server.from_source(ServerSource::User));
             }
         }
         // Per-project mcpServers and each project's <dir>/.mcp.json.
@@ -765,7 +792,9 @@ fn discover_claude_code(home: &Path) -> Vec<ConfiguredServer> {
             for (project_dir, project_cfg) in projects {
                 for (name, cfg) in mcp_servers_block(project_cfg) {
                     if let Some(server) =
-                        normalize_claude_server(name, cfg, Some(Path::new(project_dir)))
+                        normalize_claude_server(name, cfg, Some(Path::new(project_dir))).map(
+                            |server| server.from_source(ServerSource::Local(project_dir.into())),
+                        )
                     {
                         servers.insert(name.clone(), server);
                     }
@@ -777,6 +806,15 @@ fn discover_claude_code(home: &Path) -> Vec<ConfiguredServer> {
                         {
                             servers.insert(name.clone(), server);
                         }
+                    }
+                }
+                // Rows this project's `.mcp.json` just added are project scope.
+                let dir = Path::new(project_dir);
+                for server in servers.values_mut() {
+                    if server.source == ServerSource::UserSettings
+                        && server.config_dir.as_deref() == Some(dir)
+                    {
+                        server.source = ServerSource::Project(dir.to_path_buf());
                     }
                 }
             }
@@ -825,7 +863,8 @@ fn discover_claude_code(home: &Path) -> Vec<ConfiguredServer> {
         if enabled_plugins.get(id) != Some(&true) {
             continue;
         }
-        let prefix = format!("plugin_{}_", id.split('@').next().unwrap_or(id));
+        let plugin = id.split('@').next().unwrap_or(id);
+        let prefix = format!("plugin_{plugin}_");
         let roots = installs
             .as_array()
             .into_iter()
@@ -839,7 +878,13 @@ fn discover_claude_code(home: &Path) -> Vec<ConfiguredServer> {
                 &prefix,
                 normalize_claude_server,
             ) {
-                servers.entry(server.name.clone()).or_insert(server);
+                let source = ServerSource::Plugin {
+                    plugin: plugin.to_string(),
+                    server: server.name[prefix.len()..].to_string(),
+                };
+                servers
+                    .entry(server.name.clone())
+                    .or_insert(server.from_source(source));
             }
         }
     }
@@ -1051,12 +1096,7 @@ fn discover_servers_in(
                 .iter()
                 .filter_map(|path| load_json(path))
                 .collect();
-            managed_policy::apply_claude_policy(
-                &mut servers,
-                home,
-                &user_settings,
-                claude_managed_dir,
-            );
+            managed_policy::apply_claude_policy(&mut servers, &user_settings, claude_managed_dir);
             servers
         }
         SnapshotSource::Codex => discover_codex(home),
@@ -2418,6 +2458,7 @@ mod tests {
                 disabled: false,
                 always_load: false,
                 config_dir: None,
+                source: ServerSource::UserSettings,
                 transport: Transport::Stdio {
                     command: fixture.script.to_string_lossy().into_owned(),
                     args: Vec::new(),
@@ -2515,6 +2556,7 @@ mod tests {
             disabled: false,
             always_load: false,
             config_dir: None,
+            source: ServerSource::UserSettings,
             transport: Transport::Stdio {
                 command: fixture.script.to_string_lossy().into_owned(),
                 args: Vec::new(),
@@ -2790,6 +2832,7 @@ url = "https://unset.test/mcp"
     fn network_transports_are_reported_unreachable_with_no_tools() {
         let http = ConfiguredServer {
             config_dir: None,
+            source: ServerSource::UserSettings,
             name: "remote".to_string(),
             transport: Transport::Http {
                 url: "https://remote.test/mcp".to_string(),
@@ -2811,6 +2854,7 @@ url = "https://unset.test/mcp"
     fn unreachable_stdio_server_is_marked_unreachable() {
         let server = ConfiguredServer {
             config_dir: None,
+            source: ServerSource::UserSettings,
             name: "broken".to_string(),
             transport: Transport::Stdio {
                 command: "/nonexistent/ottto-mcp-binary-xyz".to_string(),
@@ -3959,6 +4003,7 @@ done
             disabled: false,
             always_load: false,
             config_dir: None,
+            source: ServerSource::UserSettings,
         };
         let env = SpawnEnv {
             path: None,

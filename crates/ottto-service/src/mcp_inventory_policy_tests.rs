@@ -342,18 +342,18 @@ fn provenance_home(name: &str) -> (PathBuf, PathBuf, PathBuf) {
 
 /// Harvest each provenance server; `true` where it is vetoed: reported disabled
 /// and its process never ran. A server that is not vetoed must start.
-fn provenance_vetoes(home: &Path, managed: &Path) -> [bool; 3] {
-    PROVENANCE_SERVERS.map(|name| {
-        let marker = home.join(format!("{name}.started"));
-        let _ = fs::remove_file(&marker);
-        let server = policy_server(home, managed, name);
-        assert_eq!(
-            harvest_started(&server, &marker),
-            !server.disabled,
-            "{name}"
-        );
-        server.disabled
-    })
+fn provenance_vetoes(home: &Path, managed: &Path, names: &[&str]) -> Vec<bool> {
+    names
+        .iter()
+        .map(|name| {
+            let marker = home.join(format!("{name}.started"));
+            let _ = fs::remove_file(&marker);
+            let server = policy_server(home, managed, name);
+            let started = harvest_started(&server, &marker);
+            assert_eq!(started, !server.disabled, "{name}");
+            server.disabled
+        })
+        .collect()
 }
 
 #[test]
@@ -373,6 +373,8 @@ fn identity_and_scope_rows_veto_only_the_servers_they_name() {
             .collect()
     };
     let unset = "OTTTO_POLICY_TEST_UNSET";
+    let (cmd_var, fill_var) = ("OTTTO_POLICY_TEST_CMD", "OTTTO_POLICY_TEST_FILL");
+    let by_var = |var: &str| json!([{"serverCommand": [format!("${{{var}}}"), &user_marker]}]);
     let defaulted = json!([format!("${{{unset}:-/usr/bin/touch}}"), &user_marker]);
     let lock = |on: bool| {
         let allowed = names(&["project-srv"]);
@@ -457,6 +459,29 @@ fn identity_and_scope_rows_veto_only_the_servers_they_name() {
             )],
             [true, true, true],
         ),
+        // Entries expand from the managed `env` first; a deny entry also fills
+        // from the user settings `env`.
+        (
+            vec![(
+                &settings,
+                json!({"env": {cmd_var: "/usr/bin/touch"}, "deniedMcpServers": by_var(cmd_var)}),
+            )],
+            [true, false, false],
+        ),
+        (
+            vec![
+                (&settings, json!({"deniedMcpServers": by_var(fill_var)})),
+                (&user, json!({"env": {fill_var: "/usr/bin/touch"}})),
+            ],
+            [true, false, false],
+        ),
+        (
+            vec![(
+                &settings,
+                json!({"env": {cmd_var: "/usr/bin/touch"}, "allowedMcpServers": by_var(cmd_var)}),
+            )],
+            [false, true, true],
+        ),
         // In the managed drop-ins a later single value wins.
         (
             vec![
@@ -482,7 +507,89 @@ fn identity_and_scope_rows_veto_only_the_servers_they_name() {
         for (path, policy) in files {
             write_json(path, policy);
         }
-        assert_eq!(provenance_vetoes(&home, &managed), expected, "row {row}");
+        let vetoes = provenance_vetoes(&home, &managed, &PROVENANCE_SERVERS);
+        assert_eq!(vetoes, expected, "row {row}");
+    }
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn local_scope_servers_keep_their_project_and_identity() {
+    let home = test_home("policy-local-scope");
+    let touch = |server: &str| {
+        let marker = home.join(format!("{server}.started"));
+        json!({"command": "/usr/bin/touch", "args": [marker]})
+    };
+    let project = home.join("proj");
+    let root = home.join("plugin-root");
+    // A local-scope row whose name looks like a plugin row, in a project at the
+    // plugin's own root, stays a local server.
+    write_json(
+        &home.join(".claude.json"),
+        json!({"projects": {
+            project.to_string_lossy(): {"mcpServers": {"local-srv": touch("local-srv")}},
+            root.to_string_lossy(): {"mcpServers": {"plugin_kit_tool": touch("plugin_kit_tool")}},
+        }}),
+    );
+    write_json(
+        &root.join(".mcp.json"),
+        json!({"mcpServers": {"tool": {"command": "/usr/bin/true"}}}),
+    );
+    write_json(
+        &home
+            .join(".claude")
+            .join("plugins")
+            .join("installed_plugins.json"),
+        json!({"plugins": {"kit@m": [{"installPath": root}]}}),
+    );
+    write_json(
+        &home.join(".claude").join("settings.json"),
+        json!({"enabledPlugins": {"kit@m": true}}),
+    );
+    let managed = home.join("managed");
+    let settings = managed.join("managed-settings.json");
+    let project_local = project.join(".claude").join("settings.local.json");
+    let project_shared = project.join(".claude").join("settings.json");
+    let deny = |entry: Value| json!({"deniedMcpServers": [entry]});
+    let local_command = json!(["/usr/bin/touch", home.join("local-srv.started")]);
+    // (policy file, policy, vetoed [local-srv, plugin_kit_tool])
+    let rows = [
+        (&settings, json!({}), [false, false]),
+        // The declaring project's settings deny its local-scope servers.
+        (
+            &project_local,
+            deny(json!({"serverName": "local-srv"})),
+            [true, false],
+        ),
+        (
+            &project_shared,
+            deny(json!({"serverCommand": local_command})),
+            [true, false],
+        ),
+        // The lookalike row is not a plugin server.
+        (
+            &settings,
+            json!({"strictPluginOnlyCustomization": ["mcp"]}),
+            [true, true],
+        ),
+        (
+            &settings,
+            deny(json!({"serverName": "plugin_kit_tool"})),
+            [false, true],
+        ),
+        (
+            &settings,
+            deny(json!({"serverName": "plugin:kit:tool"})),
+            [false, false],
+        ),
+    ];
+    for (row, (path, policy, expected)) in rows.into_iter().enumerate() {
+        for path in [&settings, &project_local, &project_shared] {
+            let _ = fs::remove_file(path);
+        }
+        write_json(path, policy);
+        let vetoes = provenance_vetoes(&home, &managed, &["local-srv", "plugin_kit_tool"]);
+        assert_eq!(vetoes, expected, "row {row}");
     }
     let _ = fs::remove_dir_all(&home);
 }

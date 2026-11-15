@@ -14,25 +14,26 @@
 //!   * `strictPluginOnlyCustomization` (`true`, or a list naming `mcp`) blocks
 //!     every server that does not come from a plugin.
 //!   * `deniedMcpServers` from the managed settings and the user settings files,
-//!     plus, for a project `.mcp.json` server, that project's own settings
-//!     files, block by name, command or URL; nothing overrides a match.
-//!     `disabledMcpjsonServers` (managed, or the declaring project's) rejects
-//!     project `.mcp.json` servers by name.
+//!     plus, for a local-scope or `.mcp.json` server of a project, that
+//!     project's own settings files, block by name, command or URL; nothing
+//!     overrides a match. `disabledMcpjsonServers` (managed, or the project's)
+//!     rejects `.mcp.json` servers by name.
 //!   * `allowedMcpServers`: when a list is set, a server that matches no entry is
 //!     blocked. Without `allowManagedMcpServersOnly` the managed and user lists
 //!     merge; with it only the managed list counts. A managed value that is not
 //!     a list, or a list whose entries are all invalid, blocks every server.
 //!
-//! Names match the server's client identity: a plugin server is
-//! `plugin:<plugin>:<server>` to the client, never its inventory row name.
-//! This step only ever sets `disabled`; it never enables a server. Nothing here
-//! is logged.
+//! Each server's scope and client identity come from discovery
+//! ([`ServerSource`]): a plugin server is `plugin:<plugin>:<server>` to the
+//! client, never its inventory row name. This step only ever sets `disabled`;
+//! it never enables a server. Nothing here is logged.
 
 use super::{
-    claude_project_settings, get_disabled_servers, load_json, normalize_claude_server,
-    ConfiguredServer, Transport,
+    claude_project_settings, get_disabled_servers, load_json, ConfiguredServer, ServerSource,
+    Transport,
 };
-use serde_json::Value;
+use serde_json::{Map, Value};
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 /// The system directory holding Claude Code's file-based managed policy.
@@ -56,15 +57,6 @@ enum Rule {
     Url(String),
 }
 
-/// Who a discovered server is to the client.
-struct Identity<'a> {
-    /// The client's name for it: `plugin:<plugin>:<server>` for a plugin.
-    name: &'a str,
-    plugin: bool,
-    /// The project whose `.mcp.json` declares it.
-    project: Option<&'a Path>,
-}
-
 /// The vetoes Claude Code applies on this machine.
 #[derive(Debug, Default)]
 struct ClaudeMcpPolicy {
@@ -72,73 +64,41 @@ struct ClaudeMcpPolicy {
     block_all: bool,
     plugin_only: bool,
     denied: Vec<Rule>,
-    /// Managed `disabledMcpjsonServers`: project `.mcp.json` servers only.
+    /// Managed `disabledMcpjsonServers`: `.mcp.json` servers only.
     project_disabled: Vec<String>,
     /// `None` when no allowlist is set anywhere.
     allowed: Option<Vec<Rule>>,
+    /// The managed settings `env`; policy entries expand from it first.
+    managed_env: Map<String, Value>,
+    /// The user settings `env`; it fills variables left in deny entries.
+    user_env: Map<String, Value>,
 }
 
 /// Mark every discovered server that Claude Code's policy blocks as disabled.
 pub(super) fn apply_claude_policy(
     servers: &mut [ConfiguredServer],
-    home: &Path,
     user_settings: &[Value],
     managed_dir: Option<&Path>,
 ) {
     let policy = ClaudeMcpPolicy::read(user_settings, managed_dir);
-    let claude_json = load_json(&home.join(".claude.json")).unwrap_or_default();
-    let installed = load_json(
-        &home
-            .join(".claude")
-            .join("plugins")
-            .join("installed_plugins.json"),
-    )
-    .unwrap_or_default();
     for server in servers.iter_mut() {
-        let plugin = plugin_client_name(server, &installed);
-        let project = match plugin {
-            Some(_) => None,
-            None => declaring_project(server, &claude_json),
-        };
-        let identity = Identity {
-            name: plugin.as_deref().unwrap_or(&server.name),
-            plugin: plugin.is_some(),
-            project: project.as_deref(),
-        };
-        if policy.blocks(server, &identity) {
+        if policy.blocks(server) {
             server.disabled = true;
         }
     }
 }
 
-/// `plugin:<plugin>:<server>` when `server` was declared by an installed
-/// plugin: its directory is that plugin's install path and its row name
-/// carries the plugin's prefix.
-fn plugin_client_name(server: &ConfiguredServer, installed: &Value) -> Option<String> {
-    let dir = server.config_dir.as_deref()?;
-    let plugins = installed.get("plugins")?.as_object()?;
-    plugins.iter().find_map(|(id, installs)| {
-        let plugin = id.split('@').next().unwrap_or(id);
-        let rest = server.name.strip_prefix(&format!("plugin_{plugin}_"))?;
-        let at_root = installs.as_array()?.iter().any(|install| {
-            install
-                .get("installPath")
-                .and_then(Value::as_str)
-                .map(Path::new)
-                == Some(dir)
-        });
-        at_root.then(|| format!("plugin:{plugin}:{rest}"))
-    })
+/// The client's name for `server`: `plugin:<plugin>:<server>` for a plugin.
+fn client_name(server: &ConfiguredServer) -> Cow<'_, str> {
+    match &server.source {
+        ServerSource::Plugin { plugin, server } => Cow::Owned(format!("plugin:{plugin}:{server}")),
+        _ => Cow::Borrowed(&server.name),
+    }
 }
 
-/// The known project whose `.mcp.json` declares `server` as configured.
-fn declaring_project(server: &ConfiguredServer, claude_json: &Value) -> Option<PathBuf> {
-    let dir = server.config_dir.as_deref()?;
-    let _known = claude_json.get("projects")?.get(dir.to_str()?)?;
-    let dot_mcp = load_json(&dir.join(".mcp.json"))?;
-    let cfg = dot_mcp.get("mcpServers")?.get(&server.name)?;
-    let declared = normalize_claude_server(&server.name, cfg, Some(dir))?;
-    (declared.transport == server.transport).then(|| dir.to_path_buf())
+/// The string value of `var` in an `env` block.
+fn env_value(env: &Map<String, Value>, var: &str) -> Option<String> {
+    env.get(var)?.as_str().map(str::to_string)
 }
 
 /// The managed settings: `managed-settings.json`, then each
@@ -283,8 +243,18 @@ impl ClaudeMcpPolicy {
                 .is_some_and(|dir| load_json(&dir.join("managed-mcp.json")).is_some()),
             plugin_only: plugin_only(managed.get("strictPluginOnlyCustomization")),
             project_disabled: get_disabled_servers(&managed),
+            managed_env: managed
+                .get("env")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default(),
             ..Self::default()
         };
+        for scope in user {
+            if let Some(env) = scope.get("env").and_then(Value::as_object) {
+                policy.user_env.extend(env.clone());
+            }
+        }
         for scope in std::iter::once(&managed).chain(user) {
             policy
                 .denied
@@ -307,34 +277,40 @@ impl ClaudeMcpPolicy {
         policy
     }
 
-    fn blocks(&self, server: &ConfiguredServer, identity: &Identity) -> bool {
-        if self.block_all || (self.plugin_only && !identity.plugin) {
+    fn blocks(&self, server: &ConfiguredServer) -> bool {
+        let plugin = matches!(server.source, ServerSource::Plugin { .. });
+        if self.block_all || (self.plugin_only && !plugin) {
             return true;
         }
-        if self
-            .denied
-            .iter()
-            .any(|rule| rule_matches(rule, server, identity, false))
-        {
-            return true;
-        }
-        if let Some(project) = identity.project {
-            let named = |names: &[String]| names.iter().any(|name| name == identity.name);
-            if named(self.project_disabled.as_slice()) {
-                return true;
-            }
-            for settings in claude_project_settings(project)
+        let name = client_name(server);
+        let denies = |rules: &[Rule]| {
+            rules
                 .iter()
-                .filter_map(|p| load_json(p))
-            {
-                let denied = rules(&settings, "deniedMcpServers").unwrap_or_default();
-                if named(get_disabled_servers(&settings).as_slice())
-                    || denied
-                        .iter()
-                        .any(|rule| rule_matches(rule, server, identity, false))
-                {
-                    return true;
-                }
+                .any(|rule| self.matches(rule, server, &name, false))
+        };
+        if denies(&self.denied) {
+            return true;
+        }
+        // A project's own settings files deny its local-scope and `.mcp.json`
+        // servers; `disabledMcpjsonServers` rejects `.mcp.json` servers only.
+        let (project, dot_mcp) = match &server.source {
+            ServerSource::Local(dir) => (Some(dir), false),
+            ServerSource::Project(dir) => (Some(dir), true),
+            _ => (None, false),
+        };
+        let rejected = |names: &[String]| dot_mcp && names.iter().any(|n| *n == *name);
+        if rejected(&self.project_disabled) {
+            return true;
+        }
+        for settings in project
+            .map(|dir| claude_project_settings(dir))
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|path| load_json(path))
+        {
+            let denied = rules(&settings, "deniedMcpServers").unwrap_or_default();
+            if rejected(&get_disabled_servers(&settings)) || denies(&denied) {
+                return true;
             }
         }
         let Some(allowed) = &self.allowed else {
@@ -350,45 +326,71 @@ impl ClaudeMcpPolicy {
         });
         !allowed.iter().any(|rule| match rule {
             Rule::Name(_) if kind_listed => false,
-            _ => rule_matches(rule, server, identity, true),
+            _ => self.matches(rule, server, &name, true),
         })
     }
-}
 
-/// Whether `rule` matches. Names compare with the client identity and never
-/// expand. Command and URL values expand `${VAR}` / `${VAR:-default}` on both
-/// sides first. The daemon's environment stands in for the session's and may
-/// differ from it; an allowlist entry left with a variable that cannot be
-/// expanded matches nothing.
-fn rule_matches(rule: &Rule, server: &ConfiguredServer, identity: &Identity, allow: bool) -> bool {
-    let entry = |text: &str| match expand(text) {
-        Some(value) => Some(value),
-        None if allow => None,
-        None => Some(text.to_string()),
-    };
-    let configured = |text: &str| expand(text).unwrap_or_else(|| text.to_string());
-    match (rule, &server.transport) {
-        (Rule::Name(name), _) => name == identity.name,
-        (Rule::Command(expected), Transport::Stdio { command, args, .. }) => {
-            let expected: Option<Vec<String>> =
-                expected.iter().map(|part| entry(part.as_str())).collect();
-            expected.is_some_and(|expected| {
-                std::iter::once(command)
-                    .chain(args)
-                    .map(|part| configured(part.as_str()))
-                    .eq(expected)
-            })
+    /// Whether `rule` matches `server`, whose client name is `name`. Names
+    /// never expand. Command and URL values expand `${VAR}` and
+    /// `${VAR:-default}`: a policy entry from the managed `env` first, then the
+    /// daemon's environment; a configured value from the daemon's environment.
+    /// The daemon's environment stands in for a session's and can differ from
+    /// it. An allowlist entry left with an unset variable matches nothing. A
+    /// denylist entry is also tried with unset variables filled from the user
+    /// settings `env`, and as written, against the configured value both
+    /// expanded and as written, so a deny never matches less.
+    fn matches(&self, rule: &Rule, server: &ConfiguredServer, name: &str, allow: bool) -> bool {
+        let pinned =
+            |var: &str| env_value(&self.managed_env, var).or_else(|| std::env::var(var).ok());
+        let entries = |text: &str| -> Vec<String> {
+            let expanded = expand(text, pinned);
+            if allow {
+                return expanded.into_iter().collect();
+            }
+            let filled = expand(text, |var| {
+                pinned(var).or_else(|| env_value(&self.user_env, var))
+            });
+            [expanded, filled, Some(text.to_string())]
+                .into_iter()
+                .flatten()
+                .collect()
+        };
+        let configured = |text: &str| -> Vec<String> {
+            let expanded = expand(text, |var| std::env::var(var).ok());
+            if allow {
+                return vec![expanded.unwrap_or_else(|| text.to_string())];
+            }
+            [expanded, Some(text.to_string())]
+                .into_iter()
+                .flatten()
+                .collect()
+        };
+        match (rule, &server.transport) {
+            (Rule::Name(entry), _) => entry == name,
+            (Rule::Command(expected), Transport::Stdio { command, args, .. }) => {
+                expected.len() == args.len() + 1
+                    && std::iter::once(command)
+                        .chain(args)
+                        .zip(expected)
+                        .all(|(value, entry)| {
+                            let values = configured(value);
+                            entries(entry).iter().any(|entry| values.contains(entry))
+                        })
+            }
+            (Rule::Url(pattern), Transport::Http { url } | Transport::Sse { url }) => {
+                let urls = configured(url);
+                entries(pattern)
+                    .iter()
+                    .any(|pattern| urls.iter().any(|url| url_matches(pattern, url)))
+            }
+            _ => false,
         }
-        (Rule::Url(pattern), Transport::Http { url } | Transport::Sse { url }) => {
-            entry(pattern).is_some_and(|pattern| url_matches(&pattern, &configured(url)))
-        }
-        _ => false,
     }
 }
 
-/// Expand `${VAR}` and `${VAR:-default}` from the daemon's environment; `None`
-/// when a variable has neither a value nor a default.
-fn expand(text: &str) -> Option<String> {
+/// Expand `${VAR}` and `${VAR:-default}` with `lookup`; `None` when a variable
+/// has neither a value nor a default.
+fn expand(text: &str, lookup: impl Fn(&str) -> Option<String>) -> Option<String> {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(start) = rest.find("${") {
@@ -399,7 +401,7 @@ fn expand(text: &str) -> Option<String> {
             Some((name, default)) => (name, Some(default)),
             None => (&after[..end], None),
         };
-        out.push_str(&std::env::var(name).ok().or(default.map(str::to_string))?);
+        out.push_str(&lookup(name).or(default.map(str::to_string))?);
         rest = &after[end + 1..];
     }
     out.push_str(rest);
