@@ -71,22 +71,14 @@ pub struct ContinuationPacing {
     pub idle_per_work: u32,
 }
 
-/// Why a paced scan was asked for. RAM-only; it lives and ends with its request.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct PacedReason {
-    /// Asked for during the source's first import.
-    pub first_import: bool,
-    /// Asked for by that import's spent page byte budget with work queued.
-    pub byte_hit: bool,
-}
-
 /// A continuation asked for by a page that paused a still-valid job only
 /// because its byte budget ran out. `work` is all of that page's measured work.
 #[derive(Debug, Clone, Copy)]
 struct ContinuationRequest {
     finished_at: Instant,
     work: Duration,
-    reason: PacedReason,
+    /// A paced request made during the source's first import (RAM-only).
+    first_import: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -254,25 +246,25 @@ impl SourceCadence {
         self.continuation = (!self.disabled).then_some(ContinuationRequest {
             finished_at,
             work,
-            reason: PacedReason::default(),
+            first_import: false,
         });
         self.continuation.is_some()
     }
 
     /// Reuse the continuation request to bring the next ordinary scan forward.
     /// It still prepares, saves and moves the ordinary clock on success.
-    /// `reason` rides on this request only and ends with it.
+    /// `first_import` rides on this request only and ends with it.
     pub fn request_paced_scan(
         &mut self,
         finished_at: Instant,
         work: Duration,
         pacing: ContinuationPacing,
-        reason: PacedReason,
+        first_import: bool,
     ) -> bool {
         let requested = self.request_continuation(finished_at, work);
         self.ordinary_pacing = requested.then_some(pacing);
         if let Some(request) = self.continuation.as_mut() {
-            request.reason = reason;
+            request.first_import = first_import;
         }
         requested
     }
@@ -281,11 +273,9 @@ impl SourceCadence {
         self.due_with_pacing(self.ordinary_pacing?)
     }
 
-    /// The pending paced request's reason, `None` without one.
-    pub fn paced_reason(&self) -> Option<PacedReason> {
-        self.ordinary_pacing
-            .and(self.continuation)
-            .map(|r| r.reason)
+    /// Whether the pending paced request was made during the first import.
+    pub fn paced_first_import(&self) -> bool {
+        self.ordinary_pacing.is_some() && self.continuation.is_some_and(|r| r.first_import)
     }
 
     pub fn clear_cursor_continuation(&mut self) {

@@ -43,17 +43,8 @@ pub(crate) fn finished(source: SnapshotSource, uploaded: u64, paced: bool) {
     })
     .unwrap();
     if paced {
-        continuation::request_resident_scan(source, Default::default());
+        continuation::request_resident_scan(source, false);
     }
-}
-/// A successful pass during the first import that asks for a paced pass.
-pub(crate) fn finished_first_import(source: SnapshotSource, byte_hit: bool) {
-    finished(source, 1, false);
-    let reason = crate::adaptive_collector::PacedReason {
-        first_import: true,
-        byte_hit,
-    };
-    continuation::request_resident_scan(source, reason);
 }
 pub(crate) struct Switch(ClaudeAccountSwitchProbe);
 impl Switch {
@@ -109,9 +100,6 @@ pub(crate) fn native_set_qos(class: u32) -> NativeQos {
     let prior = native_qos();
     assert!(continuation::resource_set_qos(class, 0));
     NativeQos(prior)
-}
-pub(crate) fn native_lowered(class: u32) -> continuation::MacPlatformSignals {
-    continuation::MacPlatformSignals::lowered(class).expect("native QoS set missing")
 }
 pub(crate) fn native_background() -> continuation::MacPlatformSignals {
     continuation::MacPlatformSignals::background()
