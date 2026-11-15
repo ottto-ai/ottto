@@ -262,7 +262,18 @@ fn accept_monotone_page(
     mut page: Page,
     accepted: &mut BTreeMap<String, u64>,
 ) -> ScanIndex {
-    page.finish();
+    let holds = page.finish();
+    accept_finished_monotone_page(c, committed, page, accepted, holds)
+}
+
+// Keep the classification from the one finish, before it removes held bodies.
+fn accept_finished_monotone_page(
+    c: &Corpus,
+    committed: &ScanIndex,
+    page: Page,
+    accepted: &mut BTreeMap<String, u64>,
+    holds: LocalHoldSettlement,
+) -> ScanIndex {
     let sent = page.scan.snapshots.clone();
     let mut progress = e2_progress();
     let (status, _, _) = upload(&sent, &mut progress, |items| {
@@ -278,12 +289,6 @@ fn accept_monotone_page(
         response
     });
     assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
-    let holds = LocalHoldSettlement::classify(
-        SnapshotSource::ClaudeCode,
-        &mut page.index,
-        &mut page.scan,
-        &page.disposition,
-    );
     let mut settled = settle_completed_upload(page.index, committed, &progress, &holds);
     settle_index_after_upload(&mut settled.index, committed, &progress);
     accept_upload_context_acks_for_test(
@@ -387,7 +392,12 @@ fn unrelated_main_and_growing_twin_pull_complete_session() {
                         &resumed(ROOT, &[("e", "2026-08-02T07:07:10Z", RESUME_WRITER)]),
                     );
                     let mut full_index = prior.clone();
-                    owe(&mut full_index);
+                    // Rebuild S's complete membership; Q stays accepted on both
+                    // routes and is pulled only as unchanged counting evidence.
+                    full_index.activate_effective_upload_body_witness_revision(3);
+                    for key in [&main_key, &twin_key] {
+                        assert!(full_index.re_owe_effective_upload_body_witness_revision(key, 2));
+                    }
                     let mut full = c.raw(&E2ScanFixture::default(), full_index, 100, sampled, &[]);
                     full.enrich(&c);
                     assert_eq!(body(&full, ROOT).unwrap().request_count, 5);
@@ -407,9 +417,22 @@ fn unrelated_main_and_growing_twin_pull_complete_session() {
                         .disposition
                         .request_owned_hold_reasons
                         .contains_key("absent_content_twin"));
-                    money_oracle::assert_equivalent(&reference, &ordered_money(&grown));
-                    assert!(!grown.finish().progress_blocking);
-                    prior = accept_monotone_page(&c, &prior, grown, &mut accepted);
+                    let actual = ordered_money(&grown);
+                    for route in [&reference, &actual] {
+                        assert_eq!(
+                            route
+                                .snapshots
+                                .keys()
+                                .map(String::as_str)
+                                .collect::<Vec<_>>(),
+                            vec![ROOT],
+                            "growth routes emit the complete growing session"
+                        );
+                    }
+                    money_oracle::assert_equivalent(&reference, &actual);
+                    let holds = grown.finish();
+                    assert!(!holds.progress_blocking);
+                    prior = accept_finished_monotone_page(&c, &prior, grown, &mut accepted, holds);
                     assert_eq!(accepted[ROOT], 5, "T's new turn reaches the receiver");
                     continue;
                 }
@@ -505,7 +528,8 @@ fn unrelated_main_and_growing_twin_pull_complete_session() {
                 if q_pull {
                     assert_eq!(page.disposition.quarantined_entity_count(), 1);
                 }
-                assert!(page.finish().progress_blocking);
+                let holds = page.finish();
+                assert!(holds.progress_blocking);
                 assert!(body(&page, ROOT).is_none(), "partial bodies never upload");
                 if !q_pull {
                     assert_eq!(
@@ -518,7 +542,7 @@ fn unrelated_main_and_growing_twin_pull_complete_session() {
                     );
                 }
                 if q_pull {
-                    prior = accept_monotone_page(&c, &prior, page, &mut accepted);
+                    prior = accept_finished_monotone_page(&c, &prior, page, &mut accepted, holds);
                 } else {
                     // The synthetic bound/lossy seam must not be persisted.
                     assert_eq!(
@@ -557,8 +581,9 @@ fn unrelated_main_and_growing_twin_pull_complete_session() {
                 if q_pull {
                     money_oracle::assert_equivalent(&reference, &ordered_money(&recovered));
                 }
-                assert!(!recovered.finish().progress_blocking);
-                prior = accept_monotone_page(&c, &prior, recovered, &mut accepted);
+                let holds = recovered.finish();
+                assert!(!holds.progress_blocking);
+                prior = accept_finished_monotone_page(&c, &prior, recovered, &mut accepted, holds);
                 assert_eq!(accepted[ROOT], 4);
             }
         });
@@ -674,9 +699,10 @@ fn deferred_main_with_read_content_twin_holds_until_complete() {
                         .get("absent_content_twin"),
                     Some(&1)
                 );
-                assert!(held.finish().progress_blocking);
+                let holds = held.finish();
+                assert!(holds.progress_blocking);
                 assert!(body(&held, ROOT).is_none(), "T alone cannot publish S");
-                prior = accept_monotone_page(&c, &selected, held, &mut accepted);
+                prior = accept_finished_monotone_page(&c, &selected, held, &mut accepted, holds);
                 assert_eq!(
                     accepted[ROOT], 3,
                     "held pages never change the receiver ledger"
