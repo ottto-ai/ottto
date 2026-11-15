@@ -3990,10 +3990,10 @@ impl OwnedSourceScan {
                 Some(record) if record.is_twin() => {
                     let mains = index.claude_request_census.records().filter(|(key, main)| {
                         !main.is_twin()
-                            && Path::new(key).is_file()
                             && claude_request_census::held_candidates(main, record.request_hashes())
                                 .next()
                                 .is_some()
+                            && Path::new(key).is_file()
                     });
                     mains.map(|(key, _)| key.clone()).collect()
                 }
@@ -4010,10 +4010,10 @@ impl OwnedSourceScan {
                 {
                     let twins = index.claude_request_census.records().filter(|(key, twin)| {
                         twin.is_twin()
-                            && Path::new(key).is_file()
                             && claude_request_census::held_candidates(twin, record.request_hashes())
                                 .next()
                                 .is_some()
+                            && Path::new(key).is_file()
                     });
                     twins.map(|(key, _)| key.clone()).collect()
                 }
