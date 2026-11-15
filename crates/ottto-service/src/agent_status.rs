@@ -5,8 +5,8 @@ use ottto_core::claude_account_identifier_hash;
 use ottto_core::{
     billing_identity_hash, compiled_release_version, default_support_dir,
     read_claude_statusline_cache, read_claude_statusline_context_cache,
-    read_claude_statusline_context_history, write_owner_only_file_atomic, ClaudeConfigDirSlot,
-    ClaudeSlotAccountBinding, ClaudeStatusLineContextWindowCache,
+    read_claude_statusline_context_history, write_owner_only_file_atomic_if_changed,
+    ClaudeConfigDirSlot, ClaudeSlotAccountBinding, ClaudeStatusLineContextWindowCache,
     ClaudeStatusLineContextWindowHistory, ClaudeStatusLineContextWindowSample,
     ClaudeStatusLineRateLimitCache, CodexHomeTrust, FileClaudeConfigSlotSettingsStore,
     FileCodexAccountSlotSettingsStore, MAX_CLAUDE_ACCOUNT_SLOTS,
@@ -1422,7 +1422,7 @@ fn read_claude_oauth_usage_breaker_file_migrating(path: &Path) -> Option<ClaudeO
     let mut breaker: ClaudeOAuthUsageBreaker = serde_json::from_str(&body).ok()?;
     if breaker.migrate_raw_caller_keys() {
         if let Ok(body) = serde_json::to_vec_pretty(&breaker) {
-            let _ = write_owner_only_file_atomic(path, &body);
+            let _ = write_owner_only_file_atomic_if_changed(path, &body);
         }
     }
     Some(breaker)
@@ -9741,7 +9741,7 @@ fn write_persisted_claude_slot_collection_state(
     state: &PersistedClaudeSlotCollectionStateV1,
 ) -> std::io::Result<()> {
     let body = serde_json::to_vec_pretty(state).map_err(std::io::Error::other)?;
-    write_owner_only_file_atomic(&claude_slot_collection_state_path(), &body)
+    write_owner_only_file_atomic_if_changed(&claude_slot_collection_state_path(), &body)
 }
 
 pub(crate) fn persist_one_claude_slot_collection_state(
@@ -13849,14 +13849,14 @@ fn write_claude_oauth_usage_breaker_locked(
         &breaker.organization_identifier_hash,
     );
     let body = serde_json::to_vec_pretty(breaker).map_err(std::io::Error::other)?;
-    write_owner_only_file_atomic(&path, &body)
+    write_owner_only_file_atomic_if_changed(&path, &body)
 }
 
 fn write_legacy_claude_oauth_usage_breaker(
     breaker: &ClaudeOAuthUsageBreaker,
 ) -> std::io::Result<()> {
     let body = serde_json::to_vec_pretty(breaker).map_err(std::io::Error::other)?;
-    write_owner_only_file_atomic(&claude_oauth_usage_legacy_breaker_path(), &body)
+    write_owner_only_file_atomic_if_changed(&claude_oauth_usage_legacy_breaker_path(), &body)
 }
 
 #[cfg(test)]
@@ -13941,7 +13941,7 @@ pub(crate) fn clear_claude_oauth_usage_auth_breaker(
             return;
         }
         if let Ok(body) = serde_json::to_vec_pretty(&breaker) {
-            let _ = write_owner_only_file_atomic(path, &body);
+            let _ = write_owner_only_file_atomic_if_changed(path, &body);
         }
     };
     let lock =
@@ -14957,14 +14957,14 @@ fn write_claude_oauth_usage_cache_locked(cache: &ClaudeOAuthUsageCache) -> std::
         &cache.organization_identifier_hash,
     );
     let body = serde_json::to_vec_pretty(cache).map_err(std::io::Error::other)?;
-    write_owner_only_file_atomic(&path, &body)
+    write_owner_only_file_atomic_if_changed(&path, &body)
 }
 
 fn write_legacy_claude_oauth_usage_cache(cache: &ClaudeOAuthUsageCache) -> std::io::Result<()> {
     let mut legacy_cache = cache.clone();
     legacy_cache.schema_version = CLAUDE_OAUTH_USAGE_LEGACY_CACHE_SCHEMA_VERSION;
     let body = serde_json::to_vec_pretty(&legacy_cache).map_err(std::io::Error::other)?;
-    write_owner_only_file_atomic(&claude_oauth_usage_legacy_cache_path(), &body)
+    write_owner_only_file_atomic_if_changed(&claude_oauth_usage_legacy_cache_path(), &body)
 }
 
 fn migrate_legacy_claude_oauth_usage_cache_locked(

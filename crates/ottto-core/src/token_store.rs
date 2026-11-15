@@ -626,16 +626,64 @@ pub fn write_owner_only_file_atomic(path: &Path, bytes: &[u8]) -> std::io::Resul
     write_secret_file_0600(path, bytes)
 }
 
+/// [`write_owner_only_file_atomic`] for often-refreshed status caches. After
+/// the parent is made owner-only, a file that already holds exactly `bytes`
+/// owner-only is left as is (no rewrite, no fsync, same mtime).
+pub fn write_owner_only_file_atomic_if_changed(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+        restrict_secret_dir_to_owner(parent)?;
+    }
+    if holds_owner_only_bytes(path, bytes) {
+        return Ok(());
+    }
+    write_secret_file_0600(path, bytes)
+}
+
 /// Owner-only atomic replacement for disposable local diagnostics/cache data.
 /// Shares the secure temporary-file path with durable writes, but deliberately
-/// skips fsync. A crash may lose this cache; never use it for credentials or a
+/// skips fsync, and skips the write when the file already holds `bytes`. A
+/// crash may lose this cache; never use it for credentials or a
 /// checkpoint/receipt ledger.
 pub fn write_owner_only_cache_file_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
         restrict_secret_dir_to_owner(parent)?;
     }
+    if holds_owner_only_bytes(path, bytes) {
+        return Ok(());
+    }
     write_private_file_0600(path, bytes, false)
+}
+
+/// True only for a regular, euid-owned, mode-0600 file (final symlink not
+/// followed) holding exactly `bytes`. Any doubt or error means rewrite.
+#[cfg(unix)]
+fn holds_owner_only_bytes(path: &Path, bytes: &[u8]) -> bool {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let flags = libc::O_NOFOLLOW | libc::O_NONBLOCK;
+    let Ok(file) = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(flags)
+        .open(path)
+    else {
+        return false;
+    };
+    let same_shape = file.metadata().is_ok_and(|meta| {
+        meta.is_file()
+            && meta.mode() & 0o7777 == 0o600
+            && meta.uid() == unsafe { libc::geteuid() }
+            && meta.len() == bytes.len() as u64
+    });
+    let mut old = Vec::new();
+    let limit = bytes.len() as u64 + 1;
+    same_shape && file.take(limit).read_to_end(&mut old).is_ok() && old == bytes
+}
+
+#[cfg(not(unix))]
+fn holds_owner_only_bytes(_path: &Path, _bytes: &[u8]) -> bool {
+    false
 }
 
 /// Writes `bytes` to `path` so the secret is never exposed through a
@@ -910,6 +958,57 @@ mod tests {
             "no temporary files retained"
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unchanged_owner_only_writes_are_skipped_only_for_exact_private_files() {
+        use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+        let root = std::env::temp_dir().join(format!(
+            "ottto-skip-unchanged-{}",
+            generate_control_token().unwrap()
+        ));
+        let stamp = |path: &Path| {
+            let meta = fs::symlink_metadata(path).unwrap();
+            (meta.ino(), meta.mtime(), meta.mtime_nsec())
+        };
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+        type Writer = fn(&Path, &[u8]) -> std::io::Result<()>;
+        let writers: [Writer; 2] = [
+            write_owner_only_file_atomic_if_changed,
+            write_owner_only_cache_file_atomic,
+        ];
+        for (index, write) in writers.into_iter().enumerate() {
+            let path = root.join(format!("state-{index}.json"));
+            write(&path, b"same").unwrap(); // missing: created
+            assert_eq!(
+                (fs::read(&path).unwrap(), mode(&path)),
+                (b"same".to_vec(), 0o600)
+            );
+            let before = stamp(&path);
+            write(&path, b"same").unwrap(); // identical: untouched
+            assert_eq!(stamp(&path), before);
+            write(&path, b"next").unwrap(); // changed: replaced
+            assert_eq!(fs::read(&path).unwrap(), b"next");
+            assert_ne!(stamp(&path).0, before.0);
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+            write(&path, b"next").unwrap(); // same bytes, wrong mode: repaired
+            assert_eq!(mode(&path), 0o600);
+            // Unreadable through the no-follow open: written as a regular file.
+            let target = root.join(format!("target-{index}"));
+            fs::write(&target, b"next").unwrap();
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+            fs::remove_file(&path).unwrap();
+            symlink(&target, &path).unwrap();
+            write(&path, b"next").unwrap();
+            assert!(fs::symlink_metadata(&path).unwrap().is_file());
+        }
+        // The plain durable writer still rewrites identical bytes.
+        let path = root.join("state-0.json");
+        let before = stamp(&path);
+        write_owner_only_file_atomic(&path, b"next").unwrap();
+        assert_ne!(stamp(&path).0, before.0);
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
