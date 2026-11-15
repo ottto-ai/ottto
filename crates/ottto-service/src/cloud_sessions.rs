@@ -1711,19 +1711,20 @@ fn parse_cloud_page(
         let Some(object) = item.as_object() else {
             continue;
         };
-        // Only the official `id`, read as is: an empty, padded, overlong or
+        // Only the official `id`, read as is. A row without a string id or a
+        // status is malformed. Otherwise an empty, padded, overlong or
         // control-bearing id is skipped and counted, never repaired, so one
         // bad row cannot fail the whole request at the server.
         let Some(provider_id) = object.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(provider_status) = string_field(object, &["status", "state"]) else {
             continue;
         };
         if !valid_session_id(provider_id) {
             invalid_ids += 1;
             continue;
         }
-        let Some(provider_status) = string_field(object, &["status", "state"]) else {
-            continue;
-        };
         let mut coverage = vec!["identity".to_string(), "status".to_string()];
         let mut created_at = timestamp_field(object, &["created_at", "createdAt"], observed_at);
         if created_at.is_some() {

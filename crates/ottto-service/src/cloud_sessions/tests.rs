@@ -2045,25 +2045,41 @@ fn cloud_collection_is_isolated_from_local_delivery() {
 }
 
 /// [behaviour] A nonempty provider page with no valid task is a provider
-/// failure, never an empty healthy page.
+/// failure, never an empty healthy page or a completed crawl, even when its
+/// malformed rows carry an invalid id.
 #[test]
 #[serial_test::serial]
 fn nonempty_page_without_a_valid_task_is_a_provider_failure() {
-    let (_root, checkpoints) = store("invalid-page");
-    let cli = Cli::head(json!({"tasks": [{"status": "running"}, 42], "cursor": null}).to_string());
-    let server = Server::new();
-    let mut collector = CloudCollector::default();
-    assert_eq!(
-        slice(
-            &mut collector,
-            &inputs(&checkpoints, &cli, &server),
-            Instant::now(),
-            Duration::ZERO
+    for (name, tasks) in [
+        ("no-id", json!([{"status": "running"}, 42])),
+        (
+            "invalid-id-no-status",
+            json!([{"id": ""}, {"id": " padded"}]),
         ),
-        CloudSessionCycleOutcome::Failed
-    );
-    assert!(server.requests.borrow().is_empty());
-    assert_eq!(collector.reported, Some("provider_payload_invalid"));
+    ] {
+        let (_root, checkpoints) = store(&format!("invalid-page-{name}"));
+        let cli = Cli::head(json!({"tasks": tasks, "cursor": null}).to_string());
+        let server = Server::new();
+        let mut collector = CloudCollector::default();
+        assert_eq!(
+            slice(
+                &mut collector,
+                &inputs(&checkpoints, &cli, &server),
+                Instant::now(),
+                Duration::ZERO
+            ),
+            CloudSessionCycleOutcome::Failed,
+            "{name}"
+        );
+        assert!(server.requests.borrow().is_empty(), "{name}");
+        assert_eq!(
+            collector.reported,
+            Some("provider_payload_invalid"),
+            "{name}"
+        );
+        assert_eq!(collector.reported_invalid_ids, None, "{name}");
+        assert_eq!(collector.schedule.crawl_completed, None, "{name}");
+    }
 }
 
 /// [regress] A delayed refusal anchors Retry-After to response receipt,
