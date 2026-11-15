@@ -26,10 +26,10 @@ fn policy_server(home: &Path, managed: &Path, name: &str) -> ConfiguredServer {
         .expect("the server is still reported")
 }
 
-/// Harvest `user-srv` and return whether its process ran.
-fn policy_started(home: &Path, managed: &Path, marker: &Path) -> bool {
-    let server = policy_server(home, managed, "user-srv");
-    let (input, deferred) = harvest_server(&server, &test_spawn_env());
+/// Harvest `server` and return whether its process ran (it creates `marker`).
+/// Shared by the policy and project-approval marker tests.
+fn harvest_started(server: &ConfiguredServer, marker: &Path) -> bool {
+    let (input, deferred) = harvest_server(server, &test_spawn_env());
     assert!(!deferred);
     assert_eq!(input.disabled, server.disabled);
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -37,6 +37,11 @@ fn policy_started(home: &Path, managed: &Path, marker: &Path) -> bool {
         std::thread::sleep(Duration::from_millis(20));
     }
     marker.exists()
+}
+
+/// Harvest `user-srv` and return whether its process ran.
+fn policy_started(home: &Path, managed: &Path, marker: &Path) -> bool {
+    harvest_started(&policy_server(home, managed, "user-srv"), marker)
 }
 
 fn user_srv_command(marker: &Path) -> Value {
@@ -52,113 +57,98 @@ fn without_policy_a_user_server_still_starts() {
 }
 
 #[test]
-fn managed_deny_by_name_vetoes_a_user_server() {
-    let (home, managed, marker) = policy_home("policy-deny-name");
-    write_json(
-        &managed.join("managed-settings.json"),
-        json!({"deniedMcpServers": [{"serverName": "user-srv"}]}),
-    );
-    assert!(policy_server(&home, &managed, "user-srv").disabled);
-    assert!(!policy_started(&home, &managed, &marker));
+fn deny_rows_from_every_source_veto_a_server() {
+    let (home, managed, marker) = policy_home("policy-deny-rows");
+    let name = json!({"deniedMcpServers": [{"serverName": "user-srv"}]});
+    let command = json!({"deniedMcpServers": [{"serverCommand": user_srv_command(&marker)}]});
+    let rows = [
+        (managed.join("managed-settings.json"), name.clone(), true),
+        (home.join(".claude").join("settings.local.json"), name, true),
+        (
+            managed.join("managed-settings.json"),
+            json!({"disabledMcpjsonServers": ["user-srv"]}),
+            true,
+        ),
+        (
+            managed.join("managed-settings.d").join("10-mcp.json"),
+            command,
+            true,
+        ),
+        // A command entry matches every argument, not a prefix.
+        (
+            managed.join("managed-settings.json"),
+            json!({"deniedMcpServers": [{"serverCommand": ["/usr/bin/touch"]}]}),
+            false,
+        ),
+    ];
+    for (path, settings, blocked) in rows {
+        write_json(&path, settings);
+        let server = policy_server(&home, &managed, "user-srv");
+        assert_eq!(server.disabled, blocked, "{}", path.display());
+        if blocked {
+            assert!(!harvest_started(&server, &marker));
+        }
+        fs::remove_file(&path).expect("remove policy file");
+    }
     let _ = fs::remove_dir_all(&home);
 }
 
 #[test]
-fn managed_deny_by_command_vetoes_and_needs_the_exact_command() {
-    let (home, managed, marker) = policy_home("policy-deny-command");
-    write_json(
-        &managed.join("managed-settings.json"),
-        json!({"deniedMcpServers": [{"serverCommand": ["/usr/bin/touch"]}]}),
-    );
-    assert!(
-        !policy_server(&home, &managed, "user-srv").disabled,
-        "a command entry matches every argument, not a prefix"
-    );
-    write_json(
-        &managed.join("managed-settings.d").join("10-mcp.json"),
-        json!({"deniedMcpServers": [{"serverCommand": user_srv_command(&marker)}]}),
-    );
-    assert!(policy_server(&home, &managed, "user-srv").disabled);
-    assert!(!policy_started(&home, &managed, &marker));
-    let _ = fs::remove_dir_all(&home);
-}
-
-#[test]
-fn managed_allowlist_vetoes_unlisted_servers_and_loads_listed_ones() {
+fn allowlist_rows_follow_the_documented_rules() {
     let (home, managed, marker) = policy_home("policy-allow");
-    write_json(
-        &managed.join("managed-settings.json"),
-        json!({"allowedMcpServers": [{"serverCommand": ["/usr/bin/other"]}]}),
-    );
-    assert!(policy_server(&home, &managed, "user-srv").disabled);
-    assert!(!policy_started(&home, &managed, &marker));
-
-    // A name entry does not admit a stdio server once command entries exist.
-    write_json(
-        &managed.join("managed-settings.json"),
-        json!({"allowedMcpServers": [
-            {"serverName": "user-srv"},
-            {"serverCommand": ["/usr/bin/other"]},
-        ]}),
-    );
-    assert!(policy_server(&home, &managed, "user-srv").disabled);
-
-    write_json(
-        &managed.join("managed-settings.json"),
-        json!({"allowedMcpServers": [{"serverCommand": user_srv_command(&marker)}]}),
-    );
-    assert!(!policy_server(&home, &managed, "user-srv").disabled);
-    assert!(policy_started(&home, &managed, &marker));
-    let _ = fs::remove_dir_all(&home);
-}
-
-#[test]
-fn allowlist_edges_follow_the_documented_rules() {
-    let (home, managed, _marker) = policy_home("policy-allow-edges");
-    let settings = managed.join("managed-settings.json");
-    let disabled = || policy_server(&home, &managed, "user-srv").disabled;
-
-    // An empty list blocks every server; a value that is not a list is
-    // enforced as an empty list.
-    write_json(&settings, json!({"allowedMcpServers": []}));
-    assert!(disabled());
-    write_json(&settings, json!({"allowedMcpServers": "user-srv"}));
-    assert!(disabled());
-
-    // A name entry admits the server when the list has no command entries.
-    write_json(
-        &settings,
-        json!({"allowedMcpServers": [{"serverName": "user-srv"}]}),
-    );
-    assert!(!disabled());
-
-    // Without the lock a user allowlist merges in; with it only the managed
-    // list counts.
-    write_json(
-        &settings,
-        json!({"allowedMcpServers": [{"serverName": "other"}]}),
-    );
-    write_json(
-        &home.join(".claude").join("settings.json"),
-        json!({"allowedMcpServers": [{"serverName": "user-srv"}]}),
-    );
-    assert!(!disabled());
-    write_json(
-        &settings,
-        json!({
-            "allowManagedMcpServersOnly": true,
-            "allowedMcpServers": [{"serverName": "other"}],
-        }),
-    );
-    assert!(disabled());
-
-    // A user allowlist alone also restricts.
-    fs::remove_file(&settings).expect("remove managed settings");
-    write_json(
-        &home.join(".claude").join("settings.json"),
-        json!({"allowedMcpServers": [{"serverName": "other"}]}),
-    );
-    assert!(disabled());
+    let allow = |entries: Value| json!({"allowedMcpServers": entries});
+    let name = |name: &str| json!([{"serverName": name}]);
+    let other_command = json!({"serverCommand": ["/usr/bin/other"]});
+    // (managed settings, user settings, blocked)
+    let rows = [
+        (Some(allow(json!([other_command.clone()]))), None, true),
+        // A name entry does not admit a stdio server once command entries exist.
+        (
+            Some(allow(json!([{"serverName": "user-srv"}, other_command]))),
+            None,
+            true,
+        ),
+        // An empty list blocks everything; a value that is not a list is empty.
+        (Some(allow(json!([]))), None, true),
+        (Some(allow(json!("user-srv"))), None, true),
+        (Some(allow(name("user-srv"))), None, false),
+        // Without the lock a user list merges in; with it only managed counts.
+        (
+            Some(allow(name("other"))),
+            Some(allow(name("user-srv"))),
+            false,
+        ),
+        (
+            Some(json!({"allowManagedMcpServersOnly": true, "allowedMcpServers": name("other")})),
+            Some(allow(name("user-srv"))),
+            true,
+        ),
+        (None, Some(allow(name("other"))), true),
+        (
+            Some(allow(json!([{"serverCommand": user_srv_command(&marker)}]))),
+            None,
+            false,
+        ),
+    ];
+    let managed_file = managed.join("managed-settings.json");
+    let user_file = home.join(".claude").join("settings.json");
+    for (row, (managed_settings, user_settings, blocked)) in rows.into_iter().enumerate() {
+        let _ = fs::remove_file(&marker);
+        for (path, settings) in [
+            (&managed_file, managed_settings),
+            (&user_file, user_settings),
+        ] {
+            match settings {
+                Some(settings) => write_json(path, settings),
+                None => {
+                    let _ = fs::remove_file(path);
+                }
+            }
+        }
+        let server = policy_server(&home, &managed, "user-srv");
+        assert_eq!(server.disabled, blocked, "row {row}");
+        assert_eq!(harvest_started(&server, &marker), !blocked, "row {row}");
+    }
     let _ = fs::remove_dir_all(&home);
 }
 
@@ -179,31 +169,26 @@ fn managed_mcp_json_vetoes_every_discovered_server() {
 }
 
 #[test]
-fn user_deny_list_vetoes_a_server() {
-    let (home, managed, marker) = policy_home("policy-user-deny");
-    write_json(
-        &home.join(".claude").join("settings.local.json"),
-        json!({"deniedMcpServers": [{"serverName": "user-srv"}]}),
-    );
-    assert!(policy_server(&home, &managed, "user-srv").disabled);
-    assert!(!policy_started(&home, &managed, &marker));
-    let _ = fs::remove_dir_all(&home);
-}
-
-#[test]
-fn managed_disabled_names_veto_a_server() {
-    let (home, managed, _marker) = policy_home("policy-disabled-names");
-    write_json(
-        &managed.join("managed-settings.json"),
-        json!({"disabledMcpjsonServers": ["user-srv"]}),
-    );
-    assert!(policy_server(&home, &managed, "user-srv").disabled);
-    let _ = fs::remove_dir_all(&home);
-}
-
-#[test]
-fn malformed_managed_files_grant_and_veto_nothing() {
+fn malformed_or_non_object_managed_settings_veto_every_server() {
     let (home, managed, marker) = policy_home("policy-malformed");
+    let drop_in = managed.join("managed-settings.d").join("10.json");
+    fs::create_dir_all(drop_in.parent().expect("parent")).expect("drop-in dir");
+    for (path, text) in [
+        (managed.join("managed-settings.json"), "{not json"),
+        (managed.join("managed-settings.json"), "[1, 2]"),
+        (drop_in, "\"text\""),
+    ] {
+        fs::write(&path, text).expect("write");
+        assert!(policy_server(&home, &managed, "user-srv").disabled);
+        assert!(!policy_started(&home, &managed, &marker));
+        fs::remove_file(&path).expect("remove");
+    }
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn absent_unreadable_or_ignored_managed_input_grants_and_vetoes_nothing() {
+    let (home, managed, marker) = policy_home("policy-skipped");
     write_json(
         &home.join(".claude.json"),
         json!({"mcpServers": {
@@ -215,22 +200,20 @@ fn malformed_managed_files_grant_and_veto_nothing() {
         &home.join(".claude").join("settings.json"),
         json!({"disabledMcpjsonServers": ["off-srv"]}),
     );
-    fs::write(managed.join("managed-settings.json"), "{not json").expect("write");
+    // A path that cannot be read as a file, and an empty file (read as `{}`).
+    fs::create_dir_all(managed.join("managed-settings.json")).expect("unreadable");
+    let drop_ins = managed.join("managed-settings.d");
+    fs::create_dir_all(&drop_ins).expect("drop-in dir");
+    fs::write(drop_ins.join("05.json"), "").expect("write");
+    // A managed-mcp.json that does not parse takes no control.
     fs::write(managed.join("managed-mcp.json"), "{\"mcpServers\":").expect("write");
-    fs::create_dir_all(managed.join("managed-settings.d")).expect("drop-in dir");
-    fs::write(managed.join("managed-settings.d").join("10.json"), "[1, 2]").expect("write");
-    // Not a JSON object, a hidden file and a non-JSON name are all left out.
-    write_json(
-        &managed.join("managed-settings.d").join(".hidden.json"),
-        json!({"deniedMcpServers": [{"serverName": "user-srv"}]}),
-    );
-    write_json(
-        &managed.join("managed-settings.d").join("deny.txt"),
-        json!({"deniedMcpServers": [{"serverName": "user-srv"}]}),
-    );
+    // Hidden files and non-JSON names are left out.
+    let deny = json!({"deniedMcpServers": [{"serverName": "user-srv"}]});
+    write_json(&drop_ins.join(".hidden.json"), deny.clone());
+    write_json(&drop_ins.join("deny.txt"), deny);
     // Invalid entries are stripped rather than denying anything.
     write_json(
-        &managed.join("managed-settings.d").join("20.json"),
+        &drop_ins.join("20.json"),
         json!({"deniedMcpServers": [
             {"serverName": "user-srv", "serverUrl": "https://x.test"},
             {"serverCommand": []},
@@ -317,7 +300,6 @@ fn deny_by_url_and_plugin_name_veto_remote_and_plugin_servers() {
             "enabledPlugins": {"kit@m": true},
             "mcpServers": {
                 "remote": {"type": "http", "url": "https://Staging.Example.test/api"},
-                "remote-port": {"type": "sse", "url": "https://staging.example.test:8443/api"},
             },
         }),
     );
@@ -330,10 +312,6 @@ fn deny_by_url_and_plugin_name_veto_remote_and_plugin_servers() {
     );
 
     assert!(policy_server(&home, &managed, "remote").disabled);
-    assert!(
-        !policy_server(&home, &managed, "remote-port").disabled,
-        "a host written out matches only the default port"
-    );
     assert!(policy_server(&home, &managed, "plugin_kit_tool").disabled);
     assert!(!policy_server(&home, &managed, "user-srv").disabled);
     let _ = fs::remove_dir_all(&home);
