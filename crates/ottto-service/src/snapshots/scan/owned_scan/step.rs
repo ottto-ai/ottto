@@ -2621,6 +2621,8 @@ impl OwnedSourceScan {
                                 .flatten()
                         })
                     });
+                    #[cfg(test)]
+                    let diagnostic_path = candidate.path.clone();
                     let mut recorded = candidate;
                     if let Some(fragment) = cursor_fragment
                         .filter(|_| prefix_continued && completed_acquisition.is_some())
@@ -2833,7 +2835,7 @@ impl OwnedSourceScan {
                 // Only classified holds suppress independently valid siblings.
                 if parse_complete {
                     #[cfg(test)]
-                    twin_diagnostics::event(&candidate.path, || {
+                    twin_diagnostics::event(&diagnostic_path, || {
                         format!(
                             "page contribution snapshots={} folds={}",
                             parsed.len(),
