@@ -9458,16 +9458,26 @@ fn setup_reconcile_refused(error: &LocalApiError) -> bool {
     )
 }
 
-/// ` endpoint=<template> status=<n> code=<reason>` for a backend error; empty
-/// otherwise. Never includes body text, ids or credentials.
+/// ` endpoint=<route> status=<n> code=<reason>` for a backend error; empty
+/// otherwise. The route is the endpoint's last path segment (`scan-result`),
+/// or `other` when that segment is not a plain route name, so no id is logged.
 fn setup_reconcile_backend_fields(error: &LocalApiError) -> String {
     let LocalApiError::Backend(details) = error else {
         return String::new();
     };
-    let mut fields = format!(
-        " endpoint={}",
-        setup_reconcile_endpoint_template(&details.endpoint)
-    );
+    let path = details.endpoint.split('?').next().unwrap_or_default();
+    let last = path.rsplit('/').next().unwrap_or_default();
+    let route = if last.len() <= 40
+        && last.starts_with(|character: char| character.is_ascii_lowercase())
+        && last
+            .chars()
+            .all(|character| character.is_ascii_lowercase() || character == '-')
+    {
+        last
+    } else {
+        "other"
+    };
+    let mut fields = format!(" endpoint={route}");
     if let Some(status) = details.status {
         fields.push_str(&format!(" status={status}"));
     }
@@ -9475,37 +9485,6 @@ fn setup_reconcile_backend_fields(error: &LocalApiError) -> String {
         fields.push_str(&format!(" code={code}"));
     }
     fields
-}
-
-/// The API path of `endpoint` with identifier segments replaced by
-/// placeholders, e.g. `/api/v1/setup-runs/{run}/local-client/scan-result`.
-fn setup_reconcile_endpoint_template(endpoint: &str) -> String {
-    let path = endpoint
-        .find("/api/")
-        .map_or(endpoint, |start| &endpoint[start..]);
-    let mut previous = "";
-    path.split('/')
-        .map(|segment| {
-            let fixed = segment.starts_with('[')
-                || segment
-                    .chars()
-                    .all(|character| character.is_ascii_lowercase() || character == '-')
-                || segment
-                    .strip_prefix('v')
-                    .is_some_and(|version| version.chars().all(|c| c.is_ascii_digit()));
-            let templated = match previous {
-                _ if segment.is_empty() => segment,
-                "setup-runs" => "{run}",
-                "setup-claims" if !segment.starts_with('[') => "{claim}",
-                "actions" => "{action}",
-                _ if fixed => segment,
-                _ => "{id}",
-            };
-            previous = segment;
-            templated
-        })
-        .collect::<Vec<_>>()
-        .join("/")
 }
 
 fn setup_reconcile_status_reason(status: Option<&str>) -> String {
@@ -22746,9 +22725,9 @@ for line in sys.stdin:
         assert!(state.next_due.unwrap() - before <= Duration::from_secs(60));
     }
 
-    /// [privacy] The reconcile log names a templated endpoint, status and code only.
+    /// [privacy] The reconcile log names a route label, status and code; refusals are 400/409/410/422.
     #[test]
-    fn setup_reconcile_backend_fields_template_ids_and_skip_body() {
+    fn setup_reconcile_refusal_class_and_log_fields() {
         let error = |endpoint: &str, status, reason_code: Option<&str>| {
             LocalApiError::Backend(BackendErrorDetails {
                 kind: BackendErrorKind::Rejected,
@@ -22758,33 +22737,24 @@ for line in sys.stdin:
                 reason_code: reason_code.map(str::to_string),
             })
         };
-        let refused = error(
-            "https://api.example.test/api/v1/setup-runs/run_ab12/local-client/scan-result?x=1",
-            Some(400),
-            Some("scan_payload_invalid"),
-        );
-        assert_eq!(
-            setup_reconcile_backend_fields(&refused),
-            " endpoint=/api/v1/setup-runs/{run}/local-client/scan-result status=400 code=scan_payload_invalid"
-        );
         assert_eq!(
             setup_reconcile_backend_fields(&error(
-                "http://127.0.0.1:1/api/v1/setup-runs/run_ab12/local-client/actions/act_9/events",
-                None,
-                None,
+                "https://api.example.test/api/v1/setup-runs/run_ab12/local-client/scan-result?x=1",
+                Some(400),
+                Some("scan_payload_invalid"),
             )),
-            " endpoint=/api/v1/setup-runs/{run}/local-client/actions/{action}/events"
+            " endpoint=scan-result status=400 code=scan_payload_invalid"
+        );
+        assert_eq!(
+            setup_reconcile_backend_fields(&error("/api/v1/setup-runs/run_ab12", None, None)),
+            " endpoint=other"
         );
         assert_eq!(
             setup_reconcile_backend_fields(&LocalApiError::NetworkUnavailable),
             ""
         );
         for status in [400, 409, 410, 422] {
-            assert!(setup_reconcile_refused(&error(
-                "/api/v1/x",
-                Some(status),
-                None
-            )));
+            assert!(setup_reconcile_refused(&error("/x", Some(status), None)));
         }
         for status in [
             Some(401),
@@ -22795,7 +22765,7 @@ for line in sys.stdin:
             Some(503),
             None,
         ] {
-            assert!(!setup_reconcile_refused(&error("/api/v1/x", status, None)));
+            assert!(!setup_reconcile_refused(&error("/x", status, None)));
         }
         assert!(!setup_reconcile_refused(&LocalApiError::NetworkUnavailable));
     }
