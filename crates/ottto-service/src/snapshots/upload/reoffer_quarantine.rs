@@ -147,9 +147,6 @@ impl ScanIndex {
         source: SnapshotSource,
         window_days: u64,
     ) -> bool {
-        if source != SnapshotSource::ClaudeCode {
-            return self.snapshot_admission_reoffer_pending();
-        }
         let Some(now) = unix_seconds(SystemTime::now()) else {
             return self.snapshot_admission_reoffer_pending();
         };
@@ -189,7 +186,8 @@ impl ScanIndex {
         }
         if outside + inside > 0 {
             eprintln!(
-                "ottto-service: Claude admission scan window: outside_or_unknown={outside} inside={inside}"
+                "ottto-service: admission scan window source={} outside_or_unknown={outside} inside={inside}",
+                source.api_slug()
             );
         }
         outside > 0
