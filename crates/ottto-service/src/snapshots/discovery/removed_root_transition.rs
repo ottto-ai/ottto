@@ -140,7 +140,7 @@ impl Homes {
                 self.scan(with_removed, index, cache, limit, at)
             });
         assert_eq!(full_decodes(&logs), 0);
-        let (index, posts) = working.checkpoint_with_captured_posts(&scan, &before, "accept");
+        let (index, posts) = working.checkpoint_with_captured_posts(&scan, &before, "complete");
         let reads = delivered
             .0
             .lock()
@@ -270,7 +270,7 @@ fn assert_quiet_restart(
     assert_eq!(full_decodes(&logs), 0);
     assert!(delivery.0.lock().unwrap().is_empty());
     let previous = index.clone();
-    let (index, posts) = index.checkpoint_with_captured_posts(&scan, &previous, "accept");
+    let (index, posts) = index.checkpoint_with_captured_posts(&scan, &previous, "complete");
     assert!(posts.is_empty(), "quiet restart emitted a POST");
     let mut quiet = route(&index, &scan, posts);
     quiet.accepted = accepted.clone();
@@ -445,8 +445,8 @@ fn drain(arm: Arm) -> Drained {
     assert_eq!(
         index
             .codex_counting_tombstones
-            .iter()
-            .map(|(owner, _)| owner.clone())
+            .keys()
+            .cloned()
             .collect::<BTreeSet<_>>(),
         owners.values().cloned().collect::<BTreeSet<_>>(),
         "tombstones under the removed entries' proven owners only"

@@ -117,6 +117,8 @@ impl ScanIndex {
         progress.context_receipt_candidates =
             index.file_upload_context_ack_candidates(&scan.snapshots, &BTreeMap::new());
         progress.save(&progress_path).unwrap();
+        // The service computes census-absent ACKs before the upload.
+        let census_absent = progress.complete_census_ack_retirements(&index, scan.census_complete);
         if outcome != "partial" {
             let result = upload_resumable_batches_with_body_witness(
                 &scan.snapshots,
@@ -148,6 +150,52 @@ impl ScanIndex {
         }
         progress.fresh_context_body_acks = progress.accepted_body_witnesses.clone();
         index.generation = previous.generation;
+        if outcome == "complete" {
+            // A Completed upload with no local hold: the service saves the
+            // whole scanned index (pruning included), as its finish does.
+            let settled = settle_completed_upload(
+                index,
+                previous,
+                &progress,
+                &LocalHoldSettlement {
+                    held_entity_count: 0,
+                    retry_pending_family_count: 0,
+                    held_fingerprints: BTreeSet::new(),
+                    account_deferred_fingerprints: BTreeSet::new(),
+                    progress_blocking: false,
+                },
+            );
+            assert!(settled.fully_settled);
+            let mut index = settled.index;
+            let scan_referenced = progress.ack_retirement_scan_references(previous, &index);
+            settle_index_after_upload(&mut index, previous, &progress);
+            let mut retired = progress
+                .stage_selected_ack_retirement(
+                    previous,
+                    &mut index,
+                    &scan_referenced,
+                    &BTreeSet::new(),
+                    &census_absent,
+                )
+                .unwrap();
+            let _ = index.accept_file_upload_context_acks(
+                &progress.split_context_receipt_candidates(),
+                &progress.fresh_context_body_acks,
+                &progress.covered_stale_bodies(),
+            );
+            index.stamp_entity_upload_context_acks(
+                &progress.destination_namespace_hash,
+                &progress.accepted_body_witnesses,
+                &progress.accepted_body_contexts,
+            );
+            index.finish_legacy_settlement_reconciliation();
+            scan.validate_codex_checkpoint().unwrap();
+            index.save(&index_path).unwrap();
+            progress.add_saved_handoff_retirements(&mut retired, &index);
+            progress.retire_planned_acks_after_index_save(&index, &retired, &BTreeSet::new());
+            progress.finish_cycle(&progress_path).unwrap();
+            return (ScanIndex::load(&index_path).unwrap(), posts);
+        }
         if outcome == "accept" {
             index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
         }
