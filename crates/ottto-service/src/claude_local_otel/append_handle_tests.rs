@@ -195,6 +195,7 @@ fn write_error_evicts_and_preserves_error() {
 fn appended_bytes_match_golden() {
     let dir = ScratchDir::new("append-golden");
     let mut handles = handles(2);
+    append(&mut handles, &dir, "sibling"); // Clear must release both cached paths.
     let internal = crate::internal_session::internal_session_id();
     let one = serde_json::json!({"count": 1, "text": "a\nb"});
     let two = serde_json::json!({"count": 2, "text": "é"});
@@ -208,11 +209,11 @@ fn appended_bytes_match_golden() {
     };
     assert_eq!(append_rows(&mut handles, &dir, rows()).unwrap(), 2);
     assert_eq!(append_rows(&mut handles, &dir, rows()).unwrap(), 2);
-    assert_eq!(handles.opens, 1); // A hit must not reopen the file.
+    assert_eq!(handles.opens, 2); // A hit must not reopen either cached file.
     handles.clear();
     assert!(handles.open.is_empty());
     assert_eq!(append_rows(&mut handles, &dir, rows()).unwrap(), 2);
-    assert_eq!(handles.opens, 2); // Cycle release makes the next request reopen.
+    assert_eq!(handles.opens, 3); // Cycle release makes the next request reopen.
     let golden = "{\"count\":1,\"text\":\"a\\nb\"}\n{\"count\":2,\"text\":\"é\"}\n";
     assert_eq!(fs::read(path).unwrap(), golden.repeat(3).as_bytes());
     assert!(!evidence_path(&dir, &internal).exists());
