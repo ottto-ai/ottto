@@ -438,6 +438,8 @@ pub(super) fn decoded(rows: u64, headers: u64, chunks: u64) {
 struct RetainedHeap {
     census: Option<u64>,
     side_maps: Option<u64>,
+    side_maps_parts: BTreeMap<&'static str, Option<u64>>,
+    side_maps_unsized: usize,
     files: Option<u64>,
     /// Request hashes the census holds, and the one occupancy alarm: at
     /// least 75% of `CLAUDE_REQUEST_CENSUS_HASH_ALARM_BASE`. Nothing is capped.
@@ -465,10 +467,15 @@ pub(super) fn retained(index: &ScanIndex, owner: &'static str) {
 }
 fn retained_heap(index: &ScanIndex) -> RetainedHeap {
     let hashes = index.claude_request_census.hash_total();
+    let side_maps_parts = side_maps(index);
     RetainedHeap {
         census: heap(&index.claude_request_census),
         files: heap(&index.files),
-        side_maps: side_maps(index),
+        side_maps: side_maps_parts
+            .values()
+            .try_fold(0u64, |sum, n| sum.checked_add((*n)?)),
+        side_maps_unsized: side_maps_parts.values().filter(|n| n.is_none()).count(),
+        side_maps_parts,
         census_hashes: hashes as u64,
         census_occupancy_alarm: hashes
             >= super::super::claude_request_census::CLAUDE_REQUEST_CENSUS_HASH_ALARM_BASE / 4 * 3,
@@ -476,20 +483,20 @@ fn retained_heap(index: &ScanIndex) -> RetainedHeap {
 }
 pub(in crate::snapshots) fn retained_breakdown(
     index: &ScanIndex,
-) -> BTreeMap<&'static str, Option<u64>> {
+) -> crate::local_resource_diagnostics::RetainedBytes {
     let retained = retained_heap(index);
     let mut accounts = Some(0u64);
     macro_rules! account {
         ($f:ident, Accounts, $codec:tt, $kinds:tt, $class:ident) => {
             accounts = accounts
-                .zip(heap(&index.$f))
+                .zip(retained.side_maps_parts[stringify!($f)])
                 .and_then(|(a, b)| a.checked_add(b));
         };
         ($($other:tt)*) => {};
     }
     scan_index_fields!(each account);
-    let traversal = heap(&index.traversal);
-    BTreeMap::from([
+    let traversal = retained.side_maps_parts["traversal"];
+    let totals = BTreeMap::from([
         ("files_bytes", retained.files),
         ("census_bytes", retained.census),
         ("accounts_identity_bytes", accounts),
@@ -502,23 +509,31 @@ pub(in crate::snapshots) fn retained_breakdown(
                 .zip(traversal)
                 .and_then(|((s, a), t)| s.checked_sub(a)?.checked_sub(t)),
         ),
-    ])
+    ]);
+    crate::local_resource_diagnostics::RetainedBytes {
+        totals,
+        side_maps_parts: retained.side_maps_parts,
+        side_maps_unsized: retained.side_maps_unsized,
+    }
 }
-fn side_maps(index: &ScanIndex) -> Option<u64> {
-    let mut bytes = if index.v2.is_some() {
+fn side_maps(index: &ScanIndex) -> BTreeMap<&'static str, Option<u64>> {
+    let bytes = if index.v2.is_some() {
         std::mem::size_of::<super::IndexState>() as u64
     } else {
         0
     };
-    bytes = bytes.checked_add(heap(&index.v2().growth_retention)?)?;
+    let mut parts = BTreeMap::from([
+        ("index_state", Some(bytes)),
+        ("growth_retention", heap(&index.v2().growth_retention)),
+    ]);
     macro_rules! side {
         ($f:ident, $g:ident, $store:tt, $kinds:tt, side) => {
-            bytes = bytes.checked_add(heap(&index.$f)?)?;
+            parts.insert(stringify!($f), heap(&index.$f));
         };
         ($($t:tt)*) => {};
     }
     scan_index_fields!(each side);
-    Some(bytes)
+    parts
 }
 
 #[derive(Default, Serialize)]
@@ -1033,6 +1048,43 @@ mod ops_tests {
     }
 
     #[test]
+    fn one_unsized_side_part_preserves_other_measurements_and_unknown_total() {
+        let mut index = ScanIndex::default();
+        let record: SnapshotQuarantineRecord = serde_json::from_value(serde_json::json!({
+            "reconstruction_contract": 1,
+            "contract_retry_claims": 1,
+            "witness": {
+                "contract": "synthetic", "collector_version": "synthetic",
+                "parser_version": "synthetic", "scan_identity_version": "synthetic",
+                "snapshot_schema_version": 1, "entity_ack_contract": "synthetic"
+            },
+            "retry_after_unix_seconds": 0,
+            "failed_reconstruction_count": 1,
+            "disposition": "retry_pending"
+        }))
+        .unwrap();
+        for n in 0..600 {
+            index
+                .quarantined_snapshot_fingerprints
+                .insert(format!("synthetic-{n}"), record.clone());
+        }
+        index.persistence_controls = Some(
+            super::super::super::lenient_decode::persistence_controls(&index, usize::MAX).unwrap(),
+        );
+        let retained = retained_heap(&index);
+        assert_eq!(retained.side_maps_unsized, 1);
+        assert_eq!(retained.side_maps_parts["persistence_controls"], None);
+        assert!(retained.side_maps_parts["quarantined_snapshot_fingerprints"].is_some());
+        assert!(retained.side_maps_parts["growth_retention"].is_some());
+        assert!(retained.side_maps.is_none());
+        let parts = retained_breakdown(&index);
+        assert!(parts.totals["side_maps_bytes"].is_none());
+        assert!(parts.totals["accounts_identity_bytes"].is_some());
+        assert!(parts.totals["traversal_bytes"].is_some());
+        assert_eq!(parts.side_maps_parts, retained.side_maps_parts);
+    }
+
+    #[test]
     fn retained_parts_split_accounts_and_traversal_without_changing_legacy_side_sum() {
         let mut index = ScanIndex::default();
         index.session_account_bindings.insert(
@@ -1043,6 +1095,7 @@ mod ops_tests {
             },
         );
         let parts = retained_breakdown(&index);
+        let parts = parts.totals;
         assert_eq!(parts.len(), 5);
         assert_eq!(parts["files_bytes"], retained_heap(&index).files);
         assert!(parts["accounts_identity_bytes"].is_none_or(|n| n >= 64));

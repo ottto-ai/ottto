@@ -406,13 +406,24 @@ retain only endpoint samples.
 `pass.retained_heap_bytes` records the finishing source's in-memory index just
 before finish consumes it: `files_bytes`, `census_bytes`, `side_maps_bytes`,
 `accounts_identity_bytes`, and `traversal_bytes`. The last three split the
-existing inclusive side-map charge. Its process-wide cache fields are
+existing inclusive side-map charge. `side_maps_parts` reports each fixed
+ScanIndex side-field name separately as bytes or `null`, plus `index_state`
+(the existing conditional IndexState allocation charge) and `growth_retention`.
+`side_maps_unsized` counts the `null` parts. The parts include account/identity
+and traversal fields, matching the inclusive state-v2 `side_maps` total rather
+than the exclusive `side_maps_bytes` split. Both totals remain `null` if any
+included part is unknown; an unknown part never suppresses the other parts.
+State-v2 owning-graph records also include this map and count beside `side_maps`.
+Keys are fixed field names, never record identifiers. The process-wide cache
+fields are
 `codex_sidecar_facts_bytes`, `codex_header_cache_bytes`, and
 `desktop_title_facts_bytes`. These reuse requested-layout charges, exclude
 inline stack storage, and conservatively charge shared buffers per owner.
 Unknown/unsupported charges or busy cache locks are `null`, never invented
-zeros; finishes without the capture omit the object. The existing
-`sample_cost_us` includes the retained-layout capture work. Pass wall/CPU
+zeros; finishes without the capture omit the object. Title facts use completion
+accounting with a separate existing visit counter per cached entry; ordinary
+hot-path sizing keeps its existing visit limit. The existing `sample_cost_us`
+includes the retained-layout capture work. Pass wall/CPU
 include diagnostics work, too. Cache values repeat
 across source rows and must not be summed. CLI metadata and active-session
 reconciliation have no existing heap charge; no new estimator is introduced.

@@ -126,18 +126,18 @@ impl SharedCache {
     pub(crate) fn retained_heap_bytes(
         &self,
         index: &ScanIndex,
-    ) -> BTreeMap<&'static str, Option<u64>> {
+    ) -> crate::local_resource_diagnostics::RetainedBytes {
         use super::state_v2::telemetry::{heap, retained_breakdown};
         let mut bytes = retained_breakdown(index);
-        bytes.insert(
+        bytes.totals.insert(
             "codex_sidecar_facts_bytes",
             self.sidecars.try_lock().ok().and_then(|v| heap(&*v)),
         );
-        bytes.insert(
+        bytes.totals.insert(
             "desktop_title_facts_bytes",
             self.desktop_titles.try_lock().ok().and_then(|v| heap(&*v)),
         );
-        bytes.insert(
+        bytes.totals.insert(
             "codex_header_cache_bytes",
             self.cursor.try_lock().ok().and_then(|v| {
                 let mut c = Counter::new(usize::MAX);
@@ -712,17 +712,24 @@ mod retained_heap_tests {
     fn charged_caches_are_unknown_while_busy_and_available_when_empty() {
         let cache = SharedCache::default();
         let index = ScanIndex::default();
-        let empty = cache.retained_heap_bytes(&index);
+        let empty = cache.retained_heap_bytes(&index).totals;
         assert_eq!(empty.len(), 8);
         assert!(empty["codex_sidecar_facts_bytes"].is_some());
+        let title_guard = cache.desktop_titles.lock().unwrap();
+        assert!(cache.retained_heap_bytes(&index).totals["desktop_title_facts_bytes"].is_none());
+        drop(title_guard);
+        assert_eq!(
+            cache.retained_heap_bytes(&index).totals["desktop_title_facts_bytes"],
+            empty["desktop_title_facts_bytes"]
+        );
         let guard = cache.sidecars.lock().unwrap();
         assert_eq!(
-            cache.retained_heap_bytes(&index)["codex_sidecar_facts_bytes"],
+            cache.retained_heap_bytes(&index).totals["codex_sidecar_facts_bytes"],
             None
         );
         drop(guard);
         assert_eq!(
-            cache.retained_heap_bytes(&index)["codex_sidecar_facts_bytes"],
+            cache.retained_heap_bytes(&index).totals["codex_sidecar_facts_bytes"],
             empty["codex_sidecar_facts_bytes"]
         );
         cache
@@ -731,7 +738,7 @@ mod retained_heap_tests {
             .unwrap()
             .insert("synthetic-scope".into(), Default::default());
         assert!(
-            cache.retained_heap_bytes(&index)["codex_sidecar_facts_bytes"]
+            cache.retained_heap_bytes(&index).totals["codex_sidecar_facts_bytes"]
                 > empty["codex_sidecar_facts_bytes"]
         );
     }
