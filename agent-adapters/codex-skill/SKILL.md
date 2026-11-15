@@ -181,9 +181,11 @@ stop. Do not bypass that boundary with direct file writes or secret handling.
 
 ## Cloud Connectors
 
-Connecting or changing AWS and Google Cloud connectors is web-only: send the
-user to <https://app.ottto.net/apps>. Do not run cloud-provider commands on the
-user's behalf to set one up. To read connector state, use the read-only:
+Connecting or changing an AWS or Google Cloud connector happens at
+<https://app.ottto.net/apps>. That page walks the user through it and gives the
+values, commands and prompt to copy. If the user pastes a prompt they copied
+from that page, follow it as written. Do not invent cloud-provider setup
+commands. To read connector state, use the read-only:
 
 ```bash
 ottto cloud status --source vertex --json
