@@ -9,12 +9,18 @@
 //! session's first request is observed live, and it never names a route by
 //! itself. OAuth needs that session's own Desktop request or a request whose
 //! own telemetry row named a valid account; an API key needs a native
-//! `req_`/`msg_` id pair. A third-party-shaped model or id vetoes a new label.
+//! `req_`/`msg_` id pair. A cloud message or request id (`msg_bdrk_`,
+//! `msg_vrtx_`) or a cloud-shaped model on any owned request vetoes both, so
+//! the session stays unknown whatever its model. Residuals, disclosed: a
+//! gateway that forwards native-looking ids can satisfy either conjunction,
+//! and a same-session account does not prove who paid for the first request;
+//! the annotation is not fail-closed for every proxy.
 //! Codex and Pi read the auth and provider recorded on the session's own rows
 //! (Pi through an allowlist). The first known route never changes; later
 //! routes only join `routes_seen`. Every other case is unknown with a closed
 //! reason, and unknown never means zero cost or permission to hold usage.
 
+use super::scan::lines::selectors::claude_cloud_id_provider;
 use super::*;
 
 /// The exact receiver capability. Missing/null/unknown keeps the object off.
@@ -24,15 +30,6 @@ pub(crate) const SESSION_BILLING_ROUTE_CONTRACT: &str = "session_billing_route:v
 /// the latch record kind keeps it off, so a rollback to that release reads and
 /// keeps every latch a later release saved; the following release turns it on.
 pub(crate) const PRODUCER_ENABLED: bool = false;
-
-/// A first request is observed live when it ended no earlier than this daemon
-/// process started and at most this long before the scan that saw it.
-pub(crate) const LIVE_WINDOW_SECONDS: u64 = 30 * 60;
-/// The login evaluator's result is usable for a first request at most this
-/// far from the request.
-pub(crate) const LOGIN_SNAPSHOT_WINDOW_SECONDS: u64 = 30 * 60;
-/// Allowed clock skew between a request's end and this process's start.
-const PROCESS_START_SKEW_SECONDS: u64 = 5;
 
 /// Shared route vocabulary. Values never name an account, payer or price.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -208,11 +205,7 @@ pub(crate) fn claude_third_party_model(model: &str) -> bool {
     if model.starts_with("arn:aws:bedrock:") || model.starts_with("anthropic.claude") {
         return true;
     }
-    if [
-        "us.", "eu.", "apac.", "global.", "jp.", "au.", "ca.", "us-gov.",
-    ]
-    .iter()
-    .any(|prefix| {
+    if ["us.", "eu.", "apac.", "global."].iter().any(|prefix| {
         model
             .strip_prefix(prefix)
             .is_some_and(|rest| rest.starts_with("anthropic.claude"))
@@ -226,11 +219,6 @@ pub(crate) fn claude_third_party_model(model: &str) -> bool {
             .is_some_and(|(_, date)| date.len() == 8 && date.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// A Claude message id issued by a cloud provider rather than the native API.
-pub(crate) fn claude_third_party_message_id(id: &str) -> bool {
-    id.contains("_bdrk_") || id.contains("_vrtx_")
-}
-
 /// The request ids a Claude response key carries: `(native pair, cloud id)`.
 /// Keys are `p<US>message<US>request`, `m<US>message` or `r<US>request`.
 pub(crate) fn claude_key_route_ids(key: &str) -> (bool, bool) {
@@ -242,8 +230,8 @@ pub(crate) fn claude_key_route_ids(key: &str) -> (bool, bool) {
         "r" => (None, parts.next()),
         _ => (None, None),
     };
-    let third_party = message.is_some_and(claude_third_party_message_id)
-        || request.is_some_and(claude_third_party_message_id);
+    let cloud = |id: &str| claude_cloud_id_provider(id).is_some();
+    let third_party = message.is_some_and(cloud) || request.is_some_and(cloud);
     let native = !third_party
         && message.is_some_and(|id| id.starts_with("msg_"))
         && request.is_some_and(|id| id.starts_with("req_"));
@@ -389,13 +377,13 @@ fn classify_claude(fact: &SessionBillingRouteFact, evidence: &ClaudeRouteEvidenc
     }
 }
 
-/// Every model row of an item, top-level and bucketed.
+/// Every model row of an item in source order: hour buckets as emitted
+/// (earliest first), then the session rows.
 fn rows(item: &SnapshotItem) -> impl Iterator<Item = &SnapshotModelUsage> {
-    item.model_usage.iter().chain(
-        item.usage_buckets
-            .iter()
-            .flat_map(|bucket| bucket.model_usage.iter()),
-    )
+    item.usage_buckets
+        .iter()
+        .flat_map(|bucket| bucket.model_usage.iter())
+        .chain(item.model_usage.iter())
 }
 
 /// Codex: the auth mode recorded on the session's own rows. Explicit
@@ -433,25 +421,18 @@ fn classify_pi_row(row: &SnapshotModelUsage) -> Result<BillingRoute, UnknownRout
     }
 }
 
-/// Codex and Pi rows carry no request order: a first fold whose rows name
-/// more than one route is a conflict rather than a guess.
+/// Codex and Pi: each billable row in source order.
 fn classify_rows(
     item: &SnapshotItem,
     classify: fn(&SnapshotModelUsage) -> Result<BillingRoute, UnknownRouteReason>,
     source: RouteSource,
-    first_known: bool,
 ) -> Classified {
-    let requests = rows(item)
-        .filter(|row| row.request_count > 0)
-        .map(classify)
-        .collect::<Vec<_>>();
-    let distinct = requests
-        .iter()
-        .filter_map(|r| r.as_ref().ok())
-        .collect::<BTreeSet<_>>();
     Classified {
-        veto: !first_known && distinct.len() > 1,
-        requests,
+        requests: rows(item)
+            .filter(|row| row.request_count > 0)
+            .map(classify)
+            .collect(),
+        veto: false,
         source,
     }
 }
@@ -463,36 +444,42 @@ pub(crate) struct RouteContext {
     pub(crate) record: bool,
     /// Also put the object on the wire (the receiver advertised the contract).
     pub(crate) emit: bool,
-    pub(crate) now_unix: u64,
     pub(crate) process_started_unix: u64,
-    /// The latest Claude Code default-login evaluation and when it was taken.
-    pub(crate) claude_login: Option<(LoginCandidate, u64)>,
+    /// The latest Claude Code default-login evaluation.
+    pub(crate) claude_login: Option<LoginCandidate>,
 }
 
 impl RouteContext {
     /// This pass's context from the producer switch, the receiver contract and
-    /// the process-wide login evaluation.
+    /// the process-wide login evaluation. Off, it reads no state or clock.
     pub(crate) fn current(contract: Option<&str>) -> Self {
-        let record = PRODUCER_ENABLED;
+        if !PRODUCER_ENABLED {
+            return Self {
+                record: false,
+                emit: false,
+                process_started_unix: 0,
+                claude_login: None,
+            };
+        }
         let (claude_login, process_started_unix) =
             with_route_state(|state| (state.claude_login, state.process_started_unix()));
         Self {
-            record,
-            emit: record && contract == Some(SESSION_BILLING_ROUTE_CONTRACT),
-            now_unix: unix_now(),
+            record: true,
+            emit: contract == Some(SESSION_BILLING_ROUTE_CONTRACT),
             process_started_unix,
             claude_login,
         }
     }
 
-    /// The login evaluation frozen for a first request ending at `first`:
-    /// only for a request this process observed live.
+    /// The login evaluation frozen for a first owned request ending at
+    /// `first`: only when this process observed it live (it ended after this
+    /// process started). Anything earlier is history.
     fn login_for_first_request(&self, first: Option<u64>) -> Option<LoginCandidate> {
-        let first = first?;
-        let live = first.saturating_add(PROCESS_START_SKEW_SECONDS) >= self.process_started_unix
-            && self.now_unix.saturating_sub(first) <= LIVE_WINDOW_SECONDS;
-        let (candidate, at) = self.claude_login?;
-        (live && at.abs_diff(first) <= LOGIN_SNAPSHOT_WINDOW_SECONDS).then_some(candidate)
+        if first? >= self.process_started_unix {
+            self.claude_login
+        } else {
+            None
+        }
     }
 }
 
@@ -504,7 +491,7 @@ fn unix_now() -> u64 {
 
 #[derive(Debug, Default)]
 pub(crate) struct RouteState {
-    claude_login: Option<(LoginCandidate, u64)>,
+    claude_login: Option<LoginCandidate>,
     process_started_unix: Option<u64>,
 }
 
@@ -527,7 +514,7 @@ process_state! {
 pub(crate) fn publish_claude_login(candidate: LoginCandidate) {
     with_route_state(|state| {
         state.process_started_unix();
-        state.claude_login = Some((candidate, unix_now()));
+        state.claude_login = Some(candidate);
     });
 }
 
@@ -542,14 +529,6 @@ pub(crate) fn route_key(source: SnapshotSource, machine_id: &str, session_id: &s
     ])
 }
 
-/// Per-pass counts, content-free.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
-pub(crate) struct RouteCounts {
-    pub(crate) latched: u64,
-    pub(crate) unknown: u64,
-    pub(crate) emitted: u64,
-}
-
 impl ScanIndex {
     /// Fold this pass's items into their route latches and, when the receiver
     /// advertised the contract, attach the wire object. Touches no money
@@ -561,10 +540,9 @@ impl ScanIndex {
         machine_id: &str,
         snapshots: &mut [SnapshotItem],
         context: &RouteContext,
-    ) -> RouteCounts {
-        let mut counts = RouteCounts::default();
+    ) {
         if !context.record {
-            return counts;
+            return;
         }
         for item in snapshots {
             if source == SnapshotSource::ClaudeCode {
@@ -610,22 +588,15 @@ impl ScanIndex {
                             item,
                             classify_codex_row,
                             RouteSource::CodexAuthSnapshot,
-                            fact.first_route.is_some(),
                         )),
                         SnapshotSource::Pi => Some(classify_rows(
                             item,
                             classify_pi_row,
                             RouteSource::PiProviderAuth,
-                            fact.first_route.is_some(),
                         )),
                     };
                     if let Some(classified) = classified {
                         fold(fact, classified);
-                    }
-                    if fact.first_route.is_some() {
-                        counts.latched += 1;
-                    } else {
-                        counts.unknown += 1;
                     }
                     fact.wire()
                 }
@@ -633,10 +604,8 @@ impl ScanIndex {
             };
             if context.emit {
                 item.session_billing_route = Some(wire);
-                counts.emitted += 1;
             }
         }
-        counts
     }
 }
 

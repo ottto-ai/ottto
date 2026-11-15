@@ -4442,28 +4442,50 @@ fn claude_approved_api_key_suffixes(path: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The default login's evaluator result for billing route classification.
-/// The daemon never knows a session's invocation mode, so interactive and
-/// `-p` evaluation are both taken; a disagreement is `ModeUnknown`. Only
-/// what the daemon can see is read: a session's own shell environment and
-/// project settings stay invisible, so this never names a route alone.
-fn claude_default_login_route_candidate(
-    oauth_usable: bool,
-    interactive: Option<ClaudeAlternativeAuth>,
-) -> crate::snapshots::billing_route::LoginCandidate {
-    let slot = ClaudeConfigDirSlot::Default;
-    let ambient = |key: &str| std::env::var(key).ok();
-    let print = if oauth_usable {
-        claude_alternative_auth_for_slot(&slot, &ambient, oauth_usable, true)
-    } else {
-        interactive
-    };
-    let layers = claude_settings_layers(&claude_settings_paths_for_slot(&slot));
-    claude_login_route_candidate(&layers, &ambient, oauth_usable, interactive, print)
+/// One read of a login's evaluator inputs, as
+/// [`claude_alternative_auth_for_slot`] reads them: settings layers (highest
+/// precedence first), approved API-key suffixes and stored Console key. Only
+/// the billing route producer uses it, to evaluate both modes from one read.
+struct ClaudeLoginInputs {
+    layers: Vec<Value>,
+    approved_api_key_suffixes: Vec<String>,
+    stored_console_key: bool,
 }
 
-/// [`claude_default_login_route_candidate`] over already-read layers
-/// (highest precedence first) and both mode evaluations.
+impl ClaudeLoginInputs {
+    fn read(slot: &ClaudeConfigDirSlot, oauth_usable: bool) -> Self {
+        Self {
+            layers: claude_settings_layers(&claude_settings_paths_for_slot(slot)),
+            approved_api_key_suffixes: claude_approved_api_key_suffixes(
+                &slot.identity_path(&home_dir()),
+            ),
+            stored_console_key: !oauth_usable && claude_stored_console_key_present(slot),
+        }
+    }
+
+    /// [`claude_alternative_auth`] over these inputs.
+    fn alternative(
+        &self,
+        ambient: &dyn Fn(&str) -> Option<String>,
+        oauth_usable: bool,
+        print_mode: bool,
+    ) -> Option<ClaudeAlternativeAuth> {
+        claude_alternative_auth_layers(
+            &self.layers,
+            ambient,
+            // The approval rule applies only while an OAuth login is usable.
+            oauth_usable && !print_mode,
+            &self.approved_api_key_suffixes,
+            self.stored_console_key,
+        )
+    }
+}
+
+/// The billing route evaluator result over already-read layers (highest
+/// precedence first) and both mode evaluations. The daemon never knows a
+/// session's invocation mode, so a disagreement is `ModeUnknown`. Only what
+/// the daemon can see is read: a session's own shell environment and project
+/// settings stay invisible, so this never names a route alone.
 pub(crate) fn claude_login_route_candidate(
     layers: &[Value],
     ambient: &dyn Fn(&str) -> Option<String>,
@@ -4857,14 +4879,25 @@ fn collect_claude_status(
         login_state,
         ClaudeLocalLoginState::AccessValid | ClaudeLocalLoginState::RefreshPending
     );
-    let alternative = claude_default_alternative_auth_now(oauth_usable);
-    // Billing route annotation only: the evaluator result a session's first
-    // live request freezes. No status field, account or money input reads it.
-    if crate::snapshots::billing_route::PRODUCER_ENABLED {
-        crate::snapshots::billing_route::publish_claude_login(
-            claude_default_login_route_candidate(oauth_usable, alternative),
-        );
-    }
+    let alternative = if crate::snapshots::billing_route::PRODUCER_ENABLED {
+        // One read of the inputs serves the status (interactive, as off) and
+        // the billing route annotation, which also needs `-p` mode. No status
+        // field, account or money input reads the annotation.
+        let ambient = |key: &str| std::env::var(key).ok();
+        let inputs = ClaudeLoginInputs::read(&ClaudeConfigDirSlot::Default, oauth_usable);
+        let interactive = inputs.alternative(&ambient, oauth_usable, false);
+        let print = inputs.alternative(&ambient, oauth_usable, true);
+        crate::snapshots::billing_route::publish_claude_login(claude_login_route_candidate(
+            &inputs.layers,
+            &ambient,
+            oauth_usable,
+            interactive,
+            print,
+        ));
+        interactive
+    } else {
+        claude_default_alternative_auth_now(oauth_usable)
+    };
     match login_state {
         ClaudeLocalLoginState::AccessValid | ClaudeLocalLoginState::RefreshPending => {
             snapshot.collection_method = AgentStatusCollectionMethod::CliJson;

@@ -55,6 +55,21 @@ impl ClaudeResponseBook {
         keys
     }
 
+    /// Billing route annotation only: each response's key id shapes
+    /// `(native pair, cloud id)` by response sequence.
+    pub(in crate::snapshots) fn route_ids_by_sequence(&self) -> BTreeMap<u64, (bool, bool)> {
+        self.index
+            .iter()
+            .filter_map(|(key, slot)| {
+                let response = self.responses.get(*slot as usize)?;
+                Some((
+                    response.sequence,
+                    crate::snapshots::billing_route::claude_key_route_ids(key),
+                ))
+            })
+            .collect()
+    }
+
     pub(in crate::snapshots) fn get_mut(
         &mut self,
         key: &str,

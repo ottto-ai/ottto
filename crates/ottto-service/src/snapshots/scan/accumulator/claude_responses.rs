@@ -91,21 +91,11 @@ impl SnapshotAccumulator {
         &mut self,
         money_context: Option<claude_request_money::e2::ReadContext<'_>>,
     ) {
-        // Route evidence only: each retained key's id shapes by sequence, read
-        // before the book is consumed. Money and every other input ignore it.
-        let route_ids = {
-            let book = &self.claude_responses;
-            book.slot_keys()
-                .into_iter()
-                .zip(book.values())
-                .map(|(key, response)| {
-                    (
-                        response.sequence,
-                        crate::snapshots::billing_route::claude_key_route_ids(key),
-                    )
-                })
-                .collect::<std::collections::BTreeMap<_, _>>()
-        };
+        // Route evidence only, producer on: each key's id shapes by sequence,
+        // read before the book is consumed. Money and every other input
+        // ignore it.
+        let route_ids = crate::snapshots::billing_route::PRODUCER_ENABLED
+            .then(|| self.claude_responses.route_ids_by_sequence());
         let (mut responses, selectors) = std::mem::take(&mut self.claude_responses).into_parts();
         responses.sort_by_key(|response| response.sequence);
         // Gate off, the fold keys by hour only: it never reads the selector.
@@ -252,6 +242,10 @@ impl SnapshotAccumulator {
                         shared
                     }
                 };
+                let route_id_flags = route_ids
+                    .as_ref()
+                    .and_then(|ids| ids.get(&response.sequence).copied())
+                    .unwrap_or_default();
                 let prior_occurrence = self.claude_usage_occurrences.insert(
                     request_id.clone(),
                     ClaudeTranscriptUsageOccurrence {
@@ -265,12 +259,8 @@ impl SnapshotAccumulator {
                         event_clock_complete: response.event_clock_complete,
                         desktop_request: response.desktop_request,
                         effective_input_context,
-                        route_native_ids: route_ids
-                            .get(&response.sequence)
-                            .is_some_and(|(native, _)| *native),
-                        route_third_party_id: route_ids
-                            .get(&response.sequence)
-                            .is_some_and(|(_, third_party)| *third_party),
+                        route_native_ids: route_id_flags.0,
+                        route_third_party_id: route_id_flags.1,
                         route_telemetry_account: false,
                     },
                 );

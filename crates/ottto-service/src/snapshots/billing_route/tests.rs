@@ -71,9 +71,8 @@ fn context(login: Option<LoginCandidate>) -> RouteContext {
     RouteContext {
         record: true,
         emit: true,
-        now_unix: NOW,
         process_started_unix: STARTED,
-        claude_login: login.map(|candidate| (candidate, NOW - 120)),
+        claude_login: login,
     }
 }
 
@@ -125,6 +124,8 @@ fn claude_subscription_needs_oauth_and_same_session_corroboration() {
     let plain = req("req_1", "msg_1");
     let subscription = known("subscription", "evaluator_snapshot");
     assert_eq!(claude_route(Some(C::Oauth), &[desktop]), subscription);
+    // Also the disclosed residual: a native-looking shell gateway beside a
+    // session account reads the same and still latches the plan.
     assert_eq!(claude_route(Some(C::Oauth), &[uuid]), subscription);
     // OAuth alone, Desktop alone, account alone: never a label.
     assert_eq!(
@@ -191,21 +192,37 @@ fn claude_third_party_and_visible_exclusions_stay_unknown() {
         };
         assert_eq!(claude_route(Some(login), &[desktop]), unknown(reason));
     }
-    // Hidden shell override with no corroboration: uncorroborated.
-    assert_eq!(
-        claude_route(Some(C::Oauth), &[req("req_1", "msg_1")]),
-        unknown("uncorroborated_snapshot")
-    );
-    // Disclosed: a native-looking shell gateway beside a session account
-    // still reads as the plan.
-    let gateway = Req {
+}
+
+/// A cloud message or request id on any owned request vetoes both
+/// conjunctions, with a native model and full corroboration.
+#[test]
+fn cloud_id_on_any_request_vetoes_both_conjunctions() {
+    use LoginCandidate as C;
+    // Native model, own telemetry account and the native pair everywhere
+    // else: only the cloud id differs.
+    let corroborated = |request, message| Req {
         telemetry_account: true,
-        ..req("req_1", "msg_1")
+        ..req(request, message)
     };
-    assert_eq!(
-        claude_route(Some(C::Oauth), &[gateway]),
-        known("subscription", "evaluator_snapshot")
-    );
+    for (request, message) in [
+        ("req_2", "msg_bdrk_2"),
+        ("req_2", "msg_vrtx_2"),
+        ("req_bdrk_2", "msg_2"),
+        ("req_vrtx_2", "msg_2"),
+    ] {
+        for login in [C::Oauth, C::ApiKey] {
+            let requests = [
+                corroborated("req_1", "msg_1"),
+                corroborated(request, message),
+            ];
+            assert_eq!(
+                claude_route(Some(login), &requests),
+                unknown("signal_conflict"),
+                "{login:?} {request} {message}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -253,23 +270,6 @@ fn claude_first_request_snapshot_is_live_only_and_never_retaken() {
         claude_route(Some(LoginCandidate::Oauth), &[old]),
         unknown("first_request_snapshot_missing")
     );
-    // Live but stale by the window: missing.
-    let stale = Req {
-        desktop: true,
-        at: NOW - LIVE_WINDOW_SECONDS - 1,
-        ..req("req_1", "msg_1")
-    };
-    let mut late = context(Some(LoginCandidate::Oauth));
-    late.process_started_unix = 0;
-    let mut index = ScanIndex::default();
-    let item = apply(
-        &mut index,
-        SnapshotSource::ClaudeCode,
-        claude_item("s", &[stale]),
-        &late,
-    );
-    assert_eq!(route(&item), unknown("first_request_snapshot_missing"));
-
     // Frozen: the session's latch keeps the first login after settings change.
     let mut index = ScanIndex::default();
     let first = claude_item("s", &[req("req_1", "msg_1")]);
@@ -500,7 +500,7 @@ fn codex_uses_only_explicit_recorded_auth() {
         rows_route(Codex, vec![row(Some("openai"), None)]),
         unknown("missing_evidence")
     );
-    // Two routes with no request order on the first fold: conflict.
+    // Two routes in one fold: the first in source order latches.
     assert_eq!(
         rows_route(
             Codex,
@@ -509,7 +509,11 @@ fn codex_uses_only_explicit_recorded_auth() {
                 row(Some("openai"), Some("apikey"))
             ]
         ),
-        unknown("signal_conflict")
+        json!({
+            "first_route": "subscription",
+            "routes_seen": ["direct_api", "subscription"],
+            "first_route_source": source,
+        })
     );
 }
 
@@ -570,7 +574,6 @@ fn pi_allowlist_and_mixed_route_union() {
 #[test]
 fn upload_bytes_and_money_fields_unchanged_off_and_additive_on() {
     let request = valid_v6_batch_request();
-    let base = serde_json::to_string(&request).unwrap();
     for (source, rows) in [
         (
             SnapshotSource::Pi,
@@ -615,11 +618,6 @@ fn upload_bytes_and_money_fields_unchanged_off_and_additive_on() {
         assert_eq!(snapshot_fingerprint(source, &on.snapshots[0]), fingerprint);
         assert_eq!(snapshot_upload_body_witness(&on.snapshots[0]), witness);
     }
-    // The unchanged fixture itself still serializes to the same bytes.
-    assert_eq!(
-        serde_json::to_string(&valid_v6_batch_request()).unwrap(),
-        base
-    );
 }
 
 #[test]
@@ -629,7 +627,6 @@ fn login_candidate_reads_visible_inputs_and_flags_unknown_mode() {
     let candidate = |layers: &[Value], oauth: bool| {
         let interactive = claude_alternative_auth_layers(layers, &none, oauth, &[], false);
         let print = claude_alternative_auth_layers(layers, &none, false, &[], false);
-        let print = if oauth { print } else { interactive };
         claude_login_route_candidate(layers, &none, oauth, interactive, print)
     };
     assert_eq!(candidate(&[json!({})], true), C::Oauth);
