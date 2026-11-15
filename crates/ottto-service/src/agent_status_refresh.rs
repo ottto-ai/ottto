@@ -133,6 +133,18 @@ impl StatusLane {
             self.changed.notify_all();
         }
     }
+    fn request_now(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.stopped {
+            // An active collection may have read the old registry. Keep one
+            // trailing pass rather than sharing that collection.
+            state.manual = true;
+            self.changed.notify_all();
+        }
+    }
     fn wake_if_stale(&self, now: Duration, wall_now: OffsetDateTime) {
         let mut state = self
             .state
@@ -676,6 +688,12 @@ pub fn request(source: &SourceKind) {
         owner.lanes[index(source)].request();
     }
 }
+/// Request a fresh pass without waiting for collection or the event gap.
+pub fn request_now(source: &SourceKind) {
+    if let Some(owner) = owner() {
+        owner.lanes[index(source)].request_now();
+    }
+}
 pub fn request_all() {
     if let Some(owner) = owner() {
         for lane in &owner.lanes {
@@ -908,6 +926,74 @@ mod tests {
         assert!(Arc::ptr_eq(&observed, &again));
         assert_eq!(lane.state.lock().unwrap().generation, 1);
         assert!(!lane.state.lock().unwrap().manual);
+    }
+    /// [regress] Removing a saved account needs a fresh collection before
+    /// the event gap expires, including when automatic refresh is paused.
+    #[test]
+    fn request_now_collects_fresh_before_event_gap_even_when_paused() {
+        for automatic_enabled in [true, false] {
+            let lane = StatusLane::for_source(&SourceKind::Codex);
+            assert!(pass(&lane, 0, 0, true));
+            let old = lane.cached().unwrap();
+            lane.request();
+            assert!(!pass(&lane, 1, 1, true));
+            lane.request_now();
+            assert!(lane.pass(
+                seconds(1),
+                automatic_enabled,
+                || {
+                    let mut fresh = specimen(SourceKind::Codex);
+                    fresh.source_health_snapshot.captured_at = "2026-10-05T00:00:01Z".into();
+                    fresh
+                },
+                |_| true,
+                || seconds(1),
+            ));
+            let fresh = lane.cached().unwrap();
+            assert!(!Arc::ptr_eq(&old, &fresh));
+            assert_eq!(
+                fresh.source_health_snapshot.captured_at,
+                "2026-10-05T00:00:01Z"
+            );
+            assert!(!pass(&lane, 2, 2, true));
+        }
+    }
+    /// [regress] A removal during collection queues exactly one trailing
+    /// collection because the active pass may have read the removed account.
+    #[test]
+    fn request_now_during_collection_queues_one_fresh_trailing_pass() {
+        let lane = StatusLane::for_source(&SourceKind::Codex);
+        assert!(lane.pass(
+            Duration::ZERO,
+            true,
+            || {
+                lane.request_now();
+                lane.request_now();
+                specimen(SourceKind::Codex)
+            },
+            |_| true,
+            || seconds(1),
+        ));
+        let old = lane.cached().unwrap();
+        assert!(lane.pass(
+            seconds(1),
+            true,
+            || {
+                let mut fresh = specimen(SourceKind::Codex);
+                fresh.source_health_snapshot.captured_at = "2026-10-05T00:00:01Z".into();
+                fresh
+            },
+            |_| true,
+            || seconds(2),
+        ));
+        let fresh = lane.cached().unwrap();
+        assert!(!Arc::ptr_eq(&old, &fresh));
+        assert_eq!(
+            fresh.source_health_snapshot.captured_at,
+            "2026-10-05T00:00:01Z"
+        );
+        assert_eq!(lane.state.lock().unwrap().generation, 2);
+        assert!(!pass(&lane, 2, 2, true));
     }
     #[test]
     fn event_storm_is_one_trailing_pass_and_wake_is_interruptible() {
