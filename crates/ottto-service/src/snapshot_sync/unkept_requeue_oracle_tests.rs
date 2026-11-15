@@ -1217,7 +1217,7 @@ fn ack_failure_boundaries_preserve_file_debt_and_accepted_placement() {
 
 /// [money] A Codex body-witness refusal in a file inside the 183-day window
 /// keeps the scan at 183 days across a reload, stays held at its accepted
-/// body, and is still re-read and offered by the 183-day scan when due. It
+/// body, and is still selected and offered by the 183-day scan when due. It
 /// settles only on its own exact ACK, equals cold Full, and the next pass
 /// reads nothing.
 #[test]
@@ -1304,7 +1304,16 @@ fn codex_inside_window_due_retry_is_offered_by_the_narrow_scan() {
         // The fixture scan uses the 183-day collection window.
         let (retry, consumed) =
             fixture::observe_consumed(|| native_page(source, &c, loaded, 100, true));
-        assert!(consumed > 0, "the due retry is re-read");
+        // The census selects the due retry; Codex may serve it from its
+        // cursor without new transcript bytes.
+        assert!(
+            retry
+                .scan
+                .snapshots
+                .iter()
+                .any(|item| item.source_session_id == entity),
+            "the 183-day scan emits the due retry"
+        );
         let mut offered = Vec::new();
         let (status, _) = send(source, &retry, &mut sender, |items| {
             offered.extend(items.iter().map(|item| {
