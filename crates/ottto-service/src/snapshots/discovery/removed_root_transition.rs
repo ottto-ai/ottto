@@ -1016,3 +1016,238 @@ fn present_unconfigured_root_keeps_witnesses() {
     ));
     assert_carried(emitted(&fourth.index, &h.cold(true, NOW)), &actual);
 }
+
+/// `Homes::step` over explicit roots. With `hold`, the header inventory of
+/// the first step that prepares one is forced incomplete, as an unlisted
+/// rollout leaves it, so the page is held.
+fn step_on(
+    h: &Homes,
+    roots: &[PathBuf],
+    mut index: ScanIndex,
+    cache: Arc<sampled_scan::SharedCache>,
+    hold: bool,
+) -> Step {
+    e2_pipeline_scan_fixture::age_listing_for_test(&mut index);
+    let before = index.clone();
+    let mut injected = !hold;
+    let ((working, scan, delivered, _, logs), events) =
+        crate::snapshots::disappearance_diagnostics::observe(|| {
+            page_observed_at(roots, index, cache, 100, &h.slots, NOW, |scan| {
+                if let Some(inventory) = scan.codex_join_inventory.as_mut().filter(|_| !injected) {
+                    inventory.complete = false;
+                    injected = true;
+                }
+            })
+        });
+    assert!(injected, "an inventory to hold");
+    assert_eq!(full_decodes(&logs), 0);
+    let (index, posts) = working.checkpoint_with_captured_posts(&scan, &before, "complete");
+    let reads = delivered
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .copied()
+        .filter(|(mode, _)| *mode != DeliveryMode::Unchanged)
+        .collect::<Vec<_>>();
+    Step {
+        index,
+        scan,
+        posts,
+        reads,
+        unresolved: events[SnapshotSource::Codex.slot()][1],
+    }
+}
+
+fn held_by_inventory(index: &ScanIndex) -> bool {
+    index
+        .traversal
+        .as_ref()
+        .is_some_and(|traversal| traversal.residue.codex_inventory_hold.is_some())
+}
+
+/// [money] C1: the removed root's witnesses drain at the matching start while
+/// an incomplete header inventory holds that page. While the hold is owed the
+/// generation stays red, reconciliation never starts, nothing settles and the
+/// removed entries stay indexed; the held session keeps its accepted body.
+/// The release catches it up cold-equal, leaves the generation healthy and
+/// retires the removed entries through tombstones. A symlinked removed root
+/// (C1b, canonical keys stay witnesses) and a configured missing root (C1c)
+/// keep the generation red after the release.
+#[test]
+fn removed_root_drain_waits_for_the_inventory_hold() {
+    let _lock = DECODER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for arm in ["removed", "symlinked", "configured-missing"] {
+        let h = Homes::new();
+        let link = h.c.sessions.parent().unwrap().join("linked-sessions");
+        let configured = if arm == "symlinked" {
+            std::os::unix::fs::symlink(&h.removed, &link).unwrap();
+            link.clone()
+        } else {
+            h.removed.clone()
+        };
+        let without = h.roots(false);
+        let mut with = without.clone();
+        with.push(configured);
+        let (_session, prior) = StateV2ColdSession::publish(
+            Source::Codex,
+            &ScanIndex::default(),
+            &h.c.scratch.join("state"),
+        );
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let first = step_on(&h, &with, prior, cache.clone(), false);
+        assert!(first.scan.census_complete && first.index.traversal.is_none());
+        let gen1 = route(&first.index, &first.scan, first.posts.clone());
+        assert_positive_control(&gen1, &first.scan);
+        let removed_keys = h.removed_keys();
+        assert!(
+            removed_keys
+                .iter()
+                .all(|key| first.index.files.contains_key(key)),
+            "{arm}: keys under the canonical root"
+        );
+        let owners = [REMOVED_FRESH, REMOVED_OLD]
+            .into_iter()
+            .map(|id| {
+                let entry = &first.index.files[&local_index_key(&h.path(id))];
+                proven_owner(entry).map_or_else(
+                    || crate::snapshots::codex_protected_owner(id),
+                    str::to_owned,
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        let roots = if arm == "configured-missing" {
+            fs::rename(&h.removed, &h.parked).unwrap();
+            &with
+        } else {
+            fs::remove_dir_all(&h.removed).unwrap();
+            if arm == "symlinked" {
+                fs::remove_file(&link).unwrap();
+            }
+            &without
+        };
+        fs::remove_dir(&h.flaky).unwrap();
+        let second = step_on(&h, roots, first.index, cache.clone(), false);
+        assert!(second
+            .index
+            .traversal
+            .as_ref()
+            .is_some_and(|walk| walk.has_retryable_problems()));
+
+        let mut index = second.index;
+        fs::create_dir(&h.flaky).unwrap();
+        index
+            .traversal
+            .as_mut()
+            .unwrap()
+            .unhealthy_retry_not_before_unix_seconds = Some(0);
+        let gap = local_index_key(&h.c.path(GAP));
+        let accepted_witness = index.files[&gap].last_upload_body_witness.clone();
+        let tail = h.tail_of(&h.c.path(GAP));
+        let mut cold = page_observed_at(
+            &without,
+            ScanIndex::default(),
+            Arc::default(),
+            100,
+            &h.slots,
+            NOW,
+            |_| {},
+        )
+        .1;
+        cold.snapshots.retain(|item| item.source_session_id == GAP);
+        let held = step_on(&h, roots, index, cache.clone(), true);
+        assert_eq!(held.unresolved, u64::from(arm != "removed"), "{arm}");
+        if arm == "removed" {
+            assert!(held.index.legacy_unresolved_root_file_witnesses.is_empty());
+        }
+        let walk = held.index.traversal.as_ref().expect("the held generation");
+        assert!(held_by_inventory(&held.index), "{arm}: the page is held");
+        assert!(
+            walk.has_retryable_problems(),
+            "{arm}: red while the hold is owed"
+        );
+        assert!(!walk.reconciliation_started, "{arm}: no reconciliation");
+        assert!(held.scan.snapshots.is_empty() && held.posts.is_empty() && held.reads.is_empty());
+        assert!(removed_keys
+            .iter()
+            .all(|key| held.index.files.contains_key(key)));
+        assert!(held
+            .index
+            .codex_counting_tombstones
+            .values()
+            .next()
+            .is_none());
+        assert_eq!(
+            held.index.files[&gap].last_upload_body_witness,
+            accepted_witness
+        );
+        let mut held_route = emitted(&held.index, &held.scan);
+        held_route.accepted = gen1.accepted.clone();
+        money_oracle::assert_held(GAP, &gen1, &held_route, &emitted(&held.index, &cold));
+
+        let mut index = held.index;
+        let mut released = Vec::new();
+        for _ in 0..8 {
+            let next = step_on(&h, roots, index, cache.clone(), false);
+            let done = next.index.traversal.as_ref().map_or(true, |walk| {
+                !held_by_inventory(&next.index) && walk.has_retryable_problems()
+            });
+            index = next.index.clone();
+            released.push(next);
+            if done {
+                break;
+            }
+        }
+        assert!(!held_by_inventory(&index), "{arm}: released");
+        assert_eq!(
+            released
+                .iter()
+                .flat_map(|step| &step.scan.snapshots)
+                .map(|item| item.source_session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![GAP],
+            "{arm}: the held session catches up once"
+        );
+        assert_eq!(
+            released
+                .iter()
+                .flat_map(|step| step.reads.iter().copied())
+                .collect::<Vec<_>>(),
+            vec![tail]
+        );
+        for step in released
+            .iter()
+            .filter(|step| !step.scan.snapshots.is_empty())
+        {
+            money_oracle::assert_equivalent(
+                &emitted(&step.index, &cold),
+                &route(&step.index, &step.scan, step.posts.clone()),
+            );
+        }
+        if arm == "removed" {
+            assert_eq!(released.iter().map(|step| step.unresolved).sum::<u64>(), 0);
+            assert!(index.traversal.is_none(), "green after the release");
+            assert!(removed_keys
+                .iter()
+                .all(|key| !index.files.contains_key(key)));
+            assert_eq!(
+                index
+                    .codex_counting_tombstones
+                    .keys()
+                    .cloned()
+                    .collect::<BTreeSet<_>>(),
+                owners
+            );
+        } else {
+            let walk = index.traversal.as_ref().expect("still red");
+            assert!(
+                walk.has_retryable_problems(),
+                "{arm}: red after the release"
+            );
+            assert!(removed_keys.iter().all(|key| index.files.contains_key(key)));
+            assert!(index.codex_counting_tombstones.values().next().is_none());
+        }
+    }
+}
