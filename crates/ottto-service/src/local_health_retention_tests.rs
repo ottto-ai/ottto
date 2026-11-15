@@ -53,6 +53,12 @@ fn local_health_retention_preserves_heads_and_sequences_through_key_replacement(
             }
         }
         assert!(state.local_health_events.len() <= 31);
+        // Two family heads, one Verify per source, both ScanIndex polarities
+        // per source/reason: a positional cap must not preserve older duplicates.
+        assert_eq!(
+            state.local_health_events.len(),
+            2 + apps.len() + apps.len() * snapshots::scan_index_health::REASONS.len() * 2
+        );
         assert_eq!(state.command_ledger.len(), 3);
         assert!(state
             .local_health_events
