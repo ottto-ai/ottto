@@ -99,10 +99,6 @@ macro_rules! scan_index_fields {
             claude_usage_authority_quarantine => Accounts (map check_map) ["refusal.authority" => 1] side,
             claude_account_deferred_holds => Accounts (map check_map) ["proof.deferred_account" => 1] side,
             session_account_bindings => Accounts (map check_map) ["setting.binding" => 1] side,
-            // Route latches, registered dormant at the current layout: no row exists
-            // until the producer is on, so no earlier reader meets one. Rollback floor:
-            // the first release that registers this kind.
-            session_billing_routes => Accounts (map check_map) ["setting.billing_route" => 7] side,
             retired_claude_account_family_pending => Accounts (retired none) ["account_window" => 1, "account.current" => 1, "account.absent_members" => 1, "raw_hold.claude_account_family_pending" => 1] side,
             claude_request_census => Census (hook check_field) ["file.census" => 1] own,
             retired_family_requests => Census (retired none) ["family.requests" => 1] side,
@@ -381,12 +377,11 @@ mod tests {
         assert_eq!(introduced("tail.page.session_facts").unwrap(), 5);
         assert_eq!(introduced("proof.upload_context").unwrap(), 6);
         assert!(TAIL_LATER.iter().all(|(k, _)| TAIL_KINDS.contains(k)));
-        // An unversioned store's inventory never names a field of layout 5 or
-        // later, so its inferred layout stays below 5 (Tail kinds are not in
-        // LAYOUTS at all).
+        // An unversioned store's inventory never names a layout-5 field, so its
+        // inferred layout stays below 5 (Tail kinds are not in LAYOUTS at all).
         let presence = super::super::super::lenient_decode::FIELDS
             .iter()
-            .filter(|field| !LAYOUTS.iter().any(|(_, f, l)| f == *field && *l >= 5))
+            .filter(|field| !LAYOUTS.iter().any(|(_, f, l)| f == *field && *l == 5))
             .map(|field| (field.to_string(), true))
             .collect();
         assert!(legacy_layout(&presence) < 5);

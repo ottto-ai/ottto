@@ -8004,17 +8004,14 @@ fn finish_sync_source(
     );
     claude_authority_disposition.defer_sessions(deferred_accounts);
     // Billing route annotation: after ownership is bound, before upload policy.
-    // It reads and writes only its own latch and wire object; off, nothing.
-    if crate::snapshots::billing_route::PRODUCER_ENABLED {
-        index.apply_session_billing_routes(
-            source,
-            machine_id,
-            &mut scan_result.snapshots,
-            &crate::snapshots::billing_route::RouteContext::current(
-                activity_hint.session_billing_route_contract.as_deref(),
-            ),
-        );
-    }
+    // Process memory only; off, nothing runs.
+    crate::snapshots::billing_route::annotate_session_billing_routes(
+        &upload_destination_namespace,
+        source,
+        machine_id,
+        &mut scan_result.snapshots,
+        activity_hint.session_billing_route_contract.as_deref(),
+    );
 
     // The Companion uses machine-local labels before upload policy clears them.
     let reconciliation_status = crate::agent_status_refresh::status_for_reconciliation(

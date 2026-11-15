@@ -5,9 +5,16 @@
 //! semantic component, the content hash and the upload body witness, so it
 //! starts no upload of its own and rides on the session's ordinary uploads.
 //!
-//! Claude Code: the login evaluator's result is frozen once, when the
-//! session's first request is observed live, and it never names a route by
-//! itself. OAuth needs that session's own Desktop request or a request whose
+//! Latches live in this process's memory only; nothing is persisted, so no
+//! release ever reads, refuses or must preserve them. The server keeps the
+//! first known route it accepted for a session and counts, never applies, a
+//! later different one.
+//!
+//! Claude Code: the login evaluator's result is frozen once per process, when
+//! a session's request is first observed live (it ended after this process
+//! started), and it never names a route by itself. Only live requests are
+//! classified: after a restart a session latches again from its next request,
+//! never from today's login applied to earlier requests. OAuth needs that session's own Desktop request or a request whose
 //! own telemetry row named a valid account; an API key needs a native
 //! `req_`/`msg_` id pair. A cloud message or request id (`msg_bdrk_`,
 //! `msg_vrtx_`) or a cloud-shaped model on any owned request vetoes both, so
@@ -26,13 +33,12 @@ use super::*;
 /// The exact receiver capability. Missing/null/unknown keeps the object off.
 pub(crate) const SESSION_BILLING_ROUTE_CONTRACT: &str = "session_billing_route:v1";
 
-/// Whether this build records route latches. The release that first registers
-/// the latch record kind keeps it off, so a rollback to that release reads and
-/// keeps every latch a later release saved; the following release turns it on.
+/// Whether this build latches and annotates routes. Off, no route state, clock
+/// or classification work runs.
 pub(crate) const PRODUCER_ENABLED: bool = false;
 
 /// Shared route vocabulary. Values never name an account, payer or price.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BillingRoute {
     /// Native provider API billing.
@@ -46,7 +52,7 @@ pub enum BillingRoute {
 }
 
 /// Closed reasons, present only while `first_route` is null.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum UnknownRouteReason {
     #[serde(rename = "3p_classifier_pending")]
     ThirdPartyClassifierPending,
@@ -67,7 +73,7 @@ pub enum UnknownRouteReason {
 }
 
 /// What set a known `first_route`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RouteSource {
     /// Claude Code: the frozen login evaluator result plus that session's
@@ -79,7 +85,7 @@ pub enum RouteSource {
 
 /// The Claude Code login evaluator's result for the default login, reduced
 /// to what route classification may use. No credential, key or URL is kept.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum LoginCandidate {
     /// A usable OAuth login and no visible alternative authentication.
@@ -110,25 +116,20 @@ pub struct SessionBillingRoute {
     pub first_route_source: Option<RouteSource>,
 }
 
-/// The durable per-session latch, keyed by source, machine and session in
-/// this destination's index. Local only; never uploaded as is.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// The per-session latch, in this process's memory only, keyed by
+/// destination, source, machine and session. Never persisted or uploaded as
+/// is.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct SessionBillingRouteFact {
-    /// Claude Code: the login evaluator result frozen at the first live
-    /// request; absent when it was not captured then. Never retaken.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Claude Code: the login evaluator result frozen at the session's first
+    /// live request in this process. Never retaken.
     pub(crate) login: Option<LoginCandidate>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) first_route: Option<BillingRoute>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) first_route_source: Option<RouteSource>,
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub(crate) routes_seen: BTreeSet<BillingRoute>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) unknown_reason: Option<UnknownRouteReason>,
-    /// A later request contradicted the committed first route. Recorded,
-    /// never corrected.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    /// A later request contradicted the first route. Recorded, never
+    /// corrected.
     pub(crate) conflict_after_latch: bool,
 }
 
@@ -171,6 +172,8 @@ pub(crate) struct ClaudeRouteRequest {
     pub(crate) third_party: bool,
     /// Every record of the request carried entrypoint `claude-desktop`.
     pub(crate) desktop: bool,
+    /// When the request ended.
+    pub(crate) ended_unix: Option<u64>,
 }
 
 /// A Claude item's route evidence, captured before its native request inputs
@@ -182,8 +185,6 @@ pub(crate) struct ClaudeRouteEvidence {
     /// One of this session's own requests joined a telemetry row, by its
     /// provider request id, that named a valid account.
     pub(crate) telemetry_account: bool,
-    /// When the session's first owned request ended.
-    pub(crate) first_request_unix: Option<u64>,
 }
 
 crate::heap_layout_bound::no_heap!(true;
@@ -191,11 +192,11 @@ crate::heap_layout_bound::no_heap!(true;
     UnknownRouteReason: ThirdPartyClassifierPending | ProxyEndpoint | ModeUnknown | FirstRequestSnapshotMissing | UnsupportedProviderAuth | SignalConflict | MissingEvidence | UncorroboratedSnapshot,
     RouteSource: EvaluatorSnapshot | PiProviderAuth | CodexAuthSnapshot,
     LoginCandidate: Oauth | ApiKey | ThirdPartyPending | ProxyEndpoint | ModeUnknown | Unsupported | NoUsableLogin,
-    ClaudeRouteRequest { native_ids, third_party, desktop },
+    ClaudeRouteRequest { native_ids, third_party, desktop, ended_unix },
 );
 crate::heap_layout_bound::fields!(SessionBillingRouteFact; login, first_route, first_route_source, routes_seen, unknown_reason, conflict_after_latch);
 crate::heap_layout_bound::fields!(SessionBillingRoute; first_route, routes_seen, unknown_reason, first_route_source);
-crate::heap_layout_bound::fields!(ClaudeRouteEvidence; requests, telemetry_account, first_request_unix);
+crate::heap_layout_bound::fields!(ClaudeRouteEvidence; requests, telemetry_account);
 
 /// Third-party-shaped Claude model names: Bedrock inference profiles and
 /// ARNs, Mantle ids and Vertex `@date` versions. A conservative veto only;
@@ -268,13 +269,12 @@ pub(crate) fn capture_claude_route_evidence(item: &mut SnapshotItem) {
         .collect::<Vec<_>>();
     owned.sort_by_key(|(sequence, _, _)| *sequence);
     let evidence = ClaudeRouteEvidence {
-        first_request_unix: own_from.or_else(|| owned.iter().filter_map(|(_, at, _)| *at).min()),
         telemetry_account: owned
             .iter()
             .any(|(_, _, occurrence)| occurrence.route_telemetry_account),
         requests: owned
             .iter()
-            .map(|(_, _, occurrence)| ClaudeRouteRequest {
+            .map(|(_, at, occurrence)| ClaudeRouteRequest {
                 native_ids: occurrence.route_native_ids,
                 third_party: occurrence.route_third_party_id
                     || occurrence
@@ -282,6 +282,7 @@ pub(crate) fn capture_claude_route_evidence(item: &mut SnapshotItem) {
                         .as_deref()
                         .is_some_and(claude_third_party_model),
                 desktop: occurrence.desktop_request,
+                ended_unix: *at,
             })
             .collect(),
     };
@@ -363,11 +364,18 @@ fn fold(fact: &mut SessionBillingRouteFact, classified: Classified) {
     }
 }
 
-fn classify_claude(fact: &SessionBillingRouteFact, evidence: &ClaudeRouteEvidence) -> Classified {
+/// Positive routes come only from live requests; third-party evidence on any
+/// owned request vetoes.
+fn classify_claude(
+    fact: &SessionBillingRouteFact,
+    evidence: &ClaudeRouteEvidence,
+    context: &RouteContext,
+) -> Classified {
     Classified {
         requests: evidence
             .requests
             .iter()
+            .filter(|request| context.live(request))
             .map(|request| {
                 classify_claude_request(fact.login, *request, evidence.telemetry_account)
             })
@@ -440,8 +448,6 @@ fn classify_rows(
 /// Inputs for one pass's route latches.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RouteContext {
-    /// Record latches (the producer switch).
-    pub(crate) record: bool,
     /// Also put the object on the wire (the receiver advertised the contract).
     pub(crate) emit: bool,
     pub(crate) process_started_unix: u64,
@@ -450,36 +456,12 @@ pub(crate) struct RouteContext {
 }
 
 impl RouteContext {
-    /// This pass's context from the producer switch, the receiver contract and
-    /// the process-wide login evaluation. Off, it reads no state or clock.
-    pub(crate) fn current(contract: Option<&str>) -> Self {
-        if !PRODUCER_ENABLED {
-            return Self {
-                record: false,
-                emit: false,
-                process_started_unix: 0,
-                claude_login: None,
-            };
-        }
-        let (claude_login, process_started_unix) =
-            with_route_state(|state| (state.claude_login, state.process_started_unix()));
-        Self {
-            record: true,
-            emit: contract == Some(SESSION_BILLING_ROUTE_CONTRACT),
-            process_started_unix,
-            claude_login,
-        }
-    }
-
-    /// The login evaluation frozen for a first owned request ending at
-    /// `first`: only when this process observed it live (it ended after this
-    /// process started). Anything earlier is history.
-    fn login_for_first_request(&self, first: Option<u64>) -> Option<LoginCandidate> {
-        if first? >= self.process_started_unix {
-            self.claude_login
-        } else {
-            None
-        }
+    /// Observed live: the request ended after this process started. Anything
+    /// earlier is history and never meets today's login.
+    fn live(&self, request: &ClaudeRouteRequest) -> bool {
+        request
+            .ended_unix
+            .is_some_and(|ended| ended >= self.process_started_unix)
     }
 }
 
@@ -493,6 +475,8 @@ fn unix_now() -> u64 {
 pub(crate) struct RouteState {
     claude_login: Option<LoginCandidate>,
     process_started_unix: Option<u64>,
+    /// The process's latches; empty while the producer is off.
+    latches: BTreeMap<String, SessionBillingRouteFact>,
 }
 
 impl RouteState {
@@ -505,12 +489,13 @@ process_state! {
     fn with_route_state: RouteState = RouteState {
         claude_login: None,
         process_started_unix: None,
+        latches: BTreeMap::new(),
     }; clear_poison: true
 }
 
 /// Publish the latest Claude Code default-login evaluation. Its first call
-/// also fixes the process start for the live-first-request rule; a later
-/// start only makes more first requests historical (fail closed).
+/// also fixes the process start for the live rule; a later start only makes
+/// more requests history (fail closed).
 pub(crate) fn publish_claude_login(candidate: LoginCandidate) {
     with_route_state(|state| {
         state.process_started_unix();
@@ -518,93 +503,129 @@ pub(crate) fn publish_claude_login(candidate: LoginCandidate) {
     });
 }
 
-/// The latch key: source, machine and session, inside this destination's
-/// index. Never an account or a path.
-pub(crate) fn route_key(source: SnapshotSource, machine_id: &str, session_id: &str) -> String {
+/// The latch key: destination, source, machine and session. Never an account
+/// or a path.
+pub(crate) fn route_key(
+    destination: &str,
+    source: SnapshotSource,
+    machine_id: &str,
+    session_id: &str,
+) -> String {
     sha256_hex(&[
         "session_billing_route:v1",
+        destination,
         source.api_slug(),
         machine_id,
         session_id,
     ])
 }
 
-impl ScanIndex {
-    /// Fold this pass's items into their route latches and, when the receiver
-    /// advertised the contract, attach the wire object. Touches no money
-    /// field, row, hash or upload decision. A session with no billable
-    /// request yet gets no latch, so its first request can still be live.
-    pub(crate) fn apply_session_billing_routes(
-        &mut self,
-        source: SnapshotSource,
-        machine_id: &str,
-        snapshots: &mut [SnapshotItem],
-        context: &RouteContext,
-    ) {
-        if !context.record {
-            return;
+/// Latch this pass's items and, when the receiver advertised `contract`,
+/// attach the wire object. Producer off, nothing runs.
+pub(crate) fn annotate_session_billing_routes(
+    destination: &str,
+    source: SnapshotSource,
+    machine_id: &str,
+    snapshots: &mut [SnapshotItem],
+    contract: Option<&str>,
+) {
+    if !PRODUCER_ENABLED {
+        return;
+    }
+    with_route_state(|state| {
+        let context = RouteContext {
+            emit: contract == Some(SESSION_BILLING_ROUTE_CONTRACT),
+            process_started_unix: state.process_started_unix(),
+            claude_login: state.claude_login,
+        };
+        apply_session_billing_routes(
+            &mut state.latches,
+            destination,
+            source,
+            machine_id,
+            snapshots,
+            &context,
+        );
+    });
+}
+
+/// Fold `snapshots` into `latches`. Touches no money field, row, hash, upload
+/// decision or persisted state. A session with no billable request gets no
+/// latch; a Claude session gets one only at its first live request.
+pub(crate) fn apply_session_billing_routes(
+    latches: &mut BTreeMap<String, SessionBillingRouteFact>,
+    destination: &str,
+    source: SnapshotSource,
+    machine_id: &str,
+    snapshots: &mut [SnapshotItem],
+    context: &RouteContext,
+) {
+    for item in snapshots {
+        if source == SnapshotSource::ClaudeCode {
+            capture_claude_route_evidence(item);
         }
-        for item in snapshots {
-            if source == SnapshotSource::ClaudeCode {
-                capture_claude_route_evidence(item);
+        let key = route_key(destination, source, machine_id, &item.source_session_id);
+        let evidence = item.claude_route_evidence.as_deref();
+        let billable = match source {
+            SnapshotSource::ClaudeCode => evidence.is_some_and(|e| !e.requests.is_empty()),
+            SnapshotSource::Codex | SnapshotSource::Pi => {
+                rows(item).any(|row| row.request_count > 0)
             }
-            let key = route_key(source, machine_id, &item.source_session_id);
-            let billable = match source {
-                SnapshotSource::ClaudeCode => item
-                    .claude_route_evidence
-                    .as_ref()
-                    .is_some_and(|evidence| !evidence.requests.is_empty()),
-                SnapshotSource::Codex | SnapshotSource::Pi => {
-                    rows(item).any(|row| row.request_count > 0)
-                }
-            };
-            if billable && !self.session_billing_routes.contains_key(&key) {
-                let login = if source == SnapshotSource::ClaudeCode {
-                    context.login_for_first_request(
-                        item.claude_route_evidence
-                            .as_ref()
-                            .and_then(|evidence| evidence.first_request_unix),
-                    )
-                } else {
-                    None
-                };
-                self.session_billing_routes.insert(
-                    key.clone(),
-                    SessionBillingRouteFact {
-                        login,
+        };
+        if billable && !latches.contains_key(&key) {
+            let start = match source {
+                SnapshotSource::ClaudeCode => context
+                    .claude_login
+                    .filter(|_| {
+                        evidence.is_some_and(|e| e.requests.iter().any(|r| context.live(r)))
+                    })
+                    .map(|login| SessionBillingRouteFact {
+                        login: Some(login),
                         ..SessionBillingRouteFact::default()
-                    },
-                );
-            }
-            let fact = self.session_billing_routes.get_mut(&key);
-            let wire = match fact {
-                Some(fact) => {
-                    let classified = match source {
-                        SnapshotSource::ClaudeCode => item
-                            .claude_route_evidence
-                            .as_deref()
-                            .map(|evidence| classify_claude(fact, evidence)),
-                        SnapshotSource::Codex => Some(classify_rows(
-                            item,
-                            classify_codex_row,
-                            RouteSource::CodexAuthSnapshot,
-                        )),
-                        SnapshotSource::Pi => Some(classify_rows(
-                            item,
-                            classify_pi_row,
-                            RouteSource::PiProviderAuth,
-                        )),
-                    };
-                    if let Some(classified) = classified {
-                        fold(fact, classified);
-                    }
-                    fact.wire()
+                    }),
+                SnapshotSource::Codex | SnapshotSource::Pi => {
+                    Some(SessionBillingRouteFact::default())
                 }
-                None => SessionBillingRouteFact::default().wire(),
             };
-            if context.emit {
-                item.session_billing_route = Some(wire);
+            if let Some(fact) = start {
+                latches.insert(key.clone(), fact);
             }
+        }
+        let wire = match latches.get_mut(&key) {
+            Some(fact) => {
+                let classified = match source {
+                    SnapshotSource::ClaudeCode => {
+                        evidence.map(|evidence| classify_claude(fact, evidence, context))
+                    }
+                    SnapshotSource::Codex => Some(classify_rows(
+                        item,
+                        classify_codex_row,
+                        RouteSource::CodexAuthSnapshot,
+                    )),
+                    SnapshotSource::Pi => Some(classify_rows(
+                        item,
+                        classify_pi_row,
+                        RouteSource::PiProviderAuth,
+                    )),
+                };
+                if let Some(classified) = classified {
+                    fold(fact, classified);
+                }
+                fact.wire()
+            }
+            // Billable Claude history with no live request yet.
+            None => SessionBillingRouteFact {
+                unknown_reason: Some(if billable {
+                    UnknownRouteReason::FirstRequestSnapshotMissing
+                } else {
+                    UnknownRouteReason::MissingEvidence
+                }),
+                ..SessionBillingRouteFact::default()
+            }
+            .wire(),
+        };
+        if context.emit {
+            item.session_billing_route = Some(wire);
         }
     }
 }

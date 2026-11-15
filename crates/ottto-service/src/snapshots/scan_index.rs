@@ -520,13 +520,6 @@ pub struct ScanIndex {
     /// Durable debt facts that outlive any one traversal (state layout 5).
     #[serde(default)]
     pub(crate) tail_discovery: TailDiscovery,
-    /// Per-session billing route latches keyed by source, machine and session
-    /// in this destination's index (`billing_route`). Annotation only; never
-    /// read by placement, pricing or upload decisions. A later login or
-    /// setting can never replace a frozen first route. Last in field order,
-    /// as in `lenient_decode::FIELDS`.
-    #[serde(default)]
-    pub(super) session_billing_routes: BTreeMap<String, billing_route::SessionBillingRouteFact>,
 }
 
 /// The production paths that set `bounded_sweep_had_unsettled_upload`.
@@ -631,7 +624,6 @@ impl Default for ScanIndex {
             files: SharedMap::default(),
             retired_reread_guard: serde::de::IgnoredAny,
             session_account_bindings: BTreeMap::new(),
-            session_billing_routes: BTreeMap::new(),
             terminal_jsonl_dispositions: BTreeMap::new(),
             known_configured_scan_roots: BTreeSet::new(),
             legacy_unresolved_root_file_witnesses: BTreeSet::new(),

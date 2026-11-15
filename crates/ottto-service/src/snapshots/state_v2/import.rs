@@ -330,11 +330,6 @@ struct Presence;
 fn claude_original_field(name: &str) -> bool {
     !matches!(name, "archives" | "archive_deferred_alarm_count")
 }
-/// Fields appended after the earliest supported rollback release. The
-/// inventory names one only when the original holds it: an earlier release
-/// refuses an inventory name it does not know, so a store whose original never
-/// had the field stays readable by it.
-const NAMED_WHEN_PRESENT: &[&str] = &["session_billing_routes"];
 impl<'de> serde::de::Visitor<'de> for Presence {
     type Value = std::collections::BTreeMap<String, bool>;
     fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -346,7 +341,7 @@ impl<'de> serde::de::Visitor<'de> for Presence {
     ) -> std::result::Result<Self::Value, A::Error> {
         let mut fields = super::super::lenient_decode::FIELDS
             .iter()
-            .filter(|name| claude_original_field(name) && !NAMED_WHEN_PRESENT.contains(*name))
+            .filter(|name| claude_original_field(name))
             .map(|f| ((*f).into(), false))
             .collect::<Self::Value>();
         while let Some(name) = map.next_key::<String>()? {
@@ -356,13 +351,9 @@ impl<'de> serde::de::Visitor<'de> for Presence {
                 map.next_value::<serde::de::IgnoredAny>()?;
                 continue;
             }
-            let present = if NAMED_WHEN_PRESENT.contains(&name.as_str()) {
-                fields.entry(name).or_insert(false)
-            } else {
-                fields
-                    .get_mut(&name)
-                    .ok_or_else(|| serde::de::Error::custom("unknown original field"))?
-            };
+            let present = fields
+                .get_mut(&name)
+                .ok_or_else(|| serde::de::Error::custom("unknown original field"))?;
             if *present {
                 return Err(serde::de::Error::custom("duplicate original field"));
             }
@@ -380,7 +371,7 @@ impl<'de> serde::de::Visitor<'de> for Presence {
         for name in super::super::lenient_decode::FIELDS {
             let present = !ended && seq.next_element::<serde::de::IgnoredAny>()?.is_some();
             ended |= !present;
-            if claude_original_field(name) && (present || !NAMED_WHEN_PRESENT.contains(name)) {
+            if claude_original_field(name) {
                 fields.insert((*name).into(), present);
             }
         }
@@ -1181,25 +1172,6 @@ mod application_cases {
         fs::write(&c.path, b"changed-original").unwrap();
         assert!(original.unchanged().is_err());
         assert_eq!(fs::read(&c.path).unwrap(), b"changed-original");
-    }
-
-    /// [format] A field appended after the earliest rollback release enters
-    /// the inventory only when the original holds it.
-    #[test]
-    fn appended_field_is_named_only_when_present() {
-        let object = |extra: &str| {
-            let bytes = format!(r#"{{"schema_version":2,"generation":0,"files":{{}}{extra}}}"#);
-            original_presence(bytes.as_bytes()).unwrap()
-        };
-        for absent in [
-            object(""),
-            original_presence(b"[2,0,null,{}]".as_slice()).unwrap(),
-        ] {
-            assert!(!absent.contains_key("session_billing_routes"));
-            assert_eq!(absent.get("tail_discovery"), Some(&false));
-        }
-        let present = object(r#","session_billing_routes":{}"#);
-        assert_eq!(present.get("session_billing_routes"), Some(&true));
     }
 
     mod codex_archive_tests {

@@ -1504,12 +1504,6 @@ fn every_persisted_field_fixture() -> ScanIndex {
             "legacy_settlement_reconcile_after_fingerprint" => serde_json::json!("0".repeat(64)),
             "claude_folder_login_ledger" => serde_json::json!({"folder": {"fresh": true}}),
             "tail_discovery" => serde_json::json!({"deleted_unaccepted_files": 1}),
-            "session_billing_routes" => serde_json::json!({"route": {
-                "login": "oauth",
-                "first_route": "subscription",
-                "first_route_source": "evaluator_snapshot",
-                "routes_seen": ["subscription"]
-            }}),
             "upload_context_fingerprint"
             | "codex_parent_proof_cursor"
             | "codex_parent_side_cursor"
@@ -1687,11 +1681,7 @@ fn main_and_pre_merge_e2_indexes_keep_appended_fields() {
         .as_object_mut()
         .unwrap()
         .remove("copy_prefix_last_accepted_nonce");
-    for appended in [
-        "claude_folder_login_ledger",
-        "tail_discovery",
-        "session_billing_routes",
-    ] {
+    for appended in ["claude_folder_login_ledger", "tail_discovery"] {
         current.as_object_mut().unwrap().remove(appended);
     }
     // Exercise the historical schema, before the appended archive slots.
@@ -1813,11 +1803,7 @@ fn desktop_inventory_keeps_existing_positional_index_slots() {
         .as_object_mut()
         .unwrap()
         .remove("copy_prefix_last_accepted_nonce");
-    for appended in [
-        "claude_folder_login_ledger",
-        "tail_discovery",
-        "session_billing_routes",
-    ] {
+    for appended in ["claude_folder_login_ledger", "tail_discovery"] {
         current.as_object_mut().unwrap().remove(appended);
     }
     // Exercise the historical schema, before the appended archive slots.
@@ -1868,8 +1854,7 @@ fn growth_retention_keeps_existing_positional_index_slots() {
     assert_eq!(fields[91], "copy_prefix_last_accepted_nonce");
     assert_eq!(fields[92], "claude_folder_login_ledger");
     assert_eq!(fields[93], "tail_discovery");
-    assert_eq!(fields[94], "session_billing_routes");
-    assert_eq!(fields.len(), 95);
+    assert_eq!(fields.len(), 94);
     let positional = Value::Array(fields.iter().map(|name| current[*name].clone()).collect());
     let mut unknown = current.clone();
     unknown["growth_retention"] = serde_json::json!({"v2-only": {"owed": true}});
@@ -1898,11 +1883,7 @@ fn copy_removals_keep_existing_positional_index_slots() {
         .as_object_mut()
         .unwrap()
         .remove("copy_prefix_last_accepted_nonce");
-    for appended in [
-        "claude_folder_login_ledger",
-        "tail_discovery",
-        "session_billing_routes",
-    ] {
+    for appended in ["claude_folder_login_ledger", "tail_discovery"] {
         current.as_object_mut().unwrap().remove(appended);
     }
     let mut legacy = current.clone();
@@ -3642,7 +3623,6 @@ fn scan_index_full_positional_field_order_is_pinned() {
             "copy_prefix_last_accepted_nonce",
             "claude_folder_login_ledger", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
             "tail_discovery",
-            "session_billing_routes",
         ]
     );
 }

@@ -390,7 +390,6 @@ impl Serialize for ScanIndex {
         );
         field!(copy_prefix_last_accepted_nonce, Option::is_none);
         field!(tail_discovery, TailDiscovery::is_empty);
-        field!(session_billing_routes, BTreeMap::is_empty);
         map.end()
     }
 }
@@ -490,7 +489,6 @@ pub(super) const FIELDS: &[&str] = &[
     "copy_prefix_last_accepted_nonce",
     "claude_folder_login_ledger", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
     "tail_discovery",
-    "session_billing_routes",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -543,7 +541,6 @@ fn header_field(name: &str) -> bool {
 /// that a malformed fingerprint vouched for nothing.
 pub(super) const IDENTITY_CARRY_FIELDS: &[&str] = &[
     "session_account_bindings",
-    "session_billing_routes",
     "claude_account_deferred_holds",
     "claude_request_identity_contract",
     "accepted_snapshot_fingerprints",
@@ -1897,9 +1894,6 @@ impl<R: BufRead + Seek> Decoder<R> {
                         "archives" | "archive_deferred_alarm_count" => {}
                         "session_account_bindings" => {
                             index.session_account_bindings = self.typed(value)?
-                        }
-                        "session_billing_routes" => {
-                            index.session_billing_routes = self.typed(value)?
                         }
                         "terminal_jsonl_dispositions" => {
                             index.terminal_jsonl_dispositions = self.typed(value)?

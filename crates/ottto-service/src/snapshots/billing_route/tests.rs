@@ -1,10 +1,14 @@
 //! Route annotation oracle rows that live in the daemon: classification,
-//! latch, durability, wire gating and money neutrality.
+//! in-memory latch and restart re-latch, wire gating, no persisted state and
+//! money neutrality.
 use super::*;
 use crate::agent_status::{claude_alternative_auth_layers, claude_login_route_candidate};
 use crate::snapshots::tests::valid_v6_batch_request;
 
 const MACHINE: &str = "machine";
+const DEST: &str = "destination";
+
+type Latches = BTreeMap<String, SessionBillingRouteFact>;
 const NOW: u64 = 1_800_000_000;
 const STARTED: u64 = NOW - 3_600;
 
@@ -69,7 +73,6 @@ fn claude_item(session: &str, requests: &[Req]) -> SnapshotItem {
 
 fn context(login: Option<LoginCandidate>) -> RouteContext {
     RouteContext {
-        record: true,
         emit: true,
         process_started_unix: STARTED,
         claude_login: login,
@@ -77,13 +80,13 @@ fn context(login: Option<LoginCandidate>) -> RouteContext {
 }
 
 fn apply(
-    index: &mut ScanIndex,
+    latches: &mut Latches,
     source: SnapshotSource,
     item: SnapshotItem,
     context: &RouteContext,
 ) -> SnapshotItem {
     let mut items = [item];
-    index.apply_session_billing_routes(source, MACHINE, &mut items, context);
+    apply_session_billing_routes(latches, DEST, source, MACHINE, &mut items, context);
     let [item] = items;
     item
 }
@@ -101,9 +104,9 @@ fn unknown(reason: &str) -> Value {
 }
 
 fn claude_route(login: Option<LoginCandidate>, requests: &[Req]) -> Value {
-    let mut index = ScanIndex::default();
+    let mut latches = Latches::new();
     route(&apply(
-        &mut index,
+        &mut latches,
         SnapshotSource::ClaudeCode,
         claude_item("s", requests),
         &context(login),
@@ -271,10 +274,10 @@ fn claude_first_request_snapshot_is_live_only_and_never_retaken() {
         unknown("first_request_snapshot_missing")
     );
     // Frozen: the session's latch keeps the first login after settings change.
-    let mut index = ScanIndex::default();
+    let mut latches = Latches::new();
     let first = claude_item("s", &[req("req_1", "msg_1")]);
     apply(
-        &mut index,
+        &mut latches,
         SnapshotSource::ClaudeCode,
         first,
         &context(Some(LoginCandidate::ApiKey)),
@@ -284,7 +287,7 @@ fn claude_first_request_snapshot_is_live_only_and_never_retaken() {
         ..req("req_2", "msg_2")
     };
     let item = apply(
-        &mut index,
+        &mut latches,
         SnapshotSource::ClaudeCode,
         claude_item("s", &[req("req_1", "msg_1"), later]),
         &context(Some(LoginCandidate::Oauth)),
@@ -294,10 +297,10 @@ fn claude_first_request_snapshot_is_live_only_and_never_retaken() {
 
 #[test]
 fn claude_unknown_becomes_known_once_then_freezes() {
-    let mut index = ScanIndex::default();
+    let mut latches = Latches::new();
     let oauth = context(Some(LoginCandidate::Oauth));
     let item = apply(
-        &mut index,
+        &mut latches,
         SnapshotSource::ClaudeCode,
         claude_item("s", &[req("req_1", "msg_1")]),
         &oauth,
@@ -310,7 +313,7 @@ fn claude_unknown_becomes_known_once_then_freezes() {
         ..req("req_1", "msg_1")
     };
     let item = apply(
-        &mut index,
+        &mut latches,
         SnapshotSource::ClaudeCode,
         claude_item("s", &[joined]),
         &oauth,
@@ -323,20 +326,20 @@ fn claude_unknown_becomes_known_once_then_freezes() {
         ..req("req_2", "msg_bdrk_2")
     };
     let item = apply(
-        &mut index,
+        &mut latches,
         SnapshotSource::ClaudeCode,
         claude_item("s", &[req("req_1", "msg_1"), bedrock]),
         &oauth,
     );
     assert_eq!(route(&item), subscription);
-    let fact = index.session_billing_routes.values().next().unwrap();
+    let fact = latches.values().next().unwrap();
     assert!(fact.conflict_after_latch);
     assert_eq!(fact.login, Some(LoginCandidate::Oauth));
 }
 
 #[test]
 fn zero_request_and_synthetic_sessions_get_no_latch() {
-    let mut index = ScanIndex::default();
+    let mut latches = Latches::new();
     let oauth = context(Some(LoginCandidate::Oauth));
     let synthetic = Req {
         model: "<synthetic>",
@@ -344,9 +347,9 @@ fn zero_request_and_synthetic_sessions_get_no_latch() {
         ..req("req_0", "msg_0")
     };
     for item in [claude_item("s", &[]), claude_item("s", &[synthetic])] {
-        let item = apply(&mut index, SnapshotSource::ClaudeCode, item, &oauth);
+        let item = apply(&mut latches, SnapshotSource::ClaudeCode, item, &oauth);
         assert_eq!(route(&item), unknown("missing_evidence"));
-        assert!(index.session_billing_routes.is_empty());
+        assert!(latches.is_empty());
     }
     // The first real request is still captured live.
     let desktop = Req {
@@ -354,7 +357,7 @@ fn zero_request_and_synthetic_sessions_get_no_latch() {
         ..req("req_1", "msg_1")
     };
     let item = apply(
-        &mut index,
+        &mut latches,
         SnapshotSource::ClaudeCode,
         claude_item("s", &[desktop]),
         &oauth,
@@ -362,97 +365,160 @@ fn zero_request_and_synthetic_sessions_get_no_latch() {
     assert_eq!(route(&item), known("subscription", "evaluator_snapshot"));
 }
 
+/// Nothing is persisted: a restarted process has no latch. A session whose
+/// requests all ended before the restart is history (missing); its next live
+/// request latches it again, and today's login never meets earlier requests.
 #[test]
-fn latch_survives_crash_after_classification_rollback_and_reupgrade() {
-    let mut index = ScanIndex::default();
-    let desktop = || Req {
+fn restart_relatches_from_the_next_live_request() {
+    let desktop = |at| Req {
         desktop: true,
+        at,
         ..req("req_1", "msg_1")
     };
-    apply(
-        &mut index,
+    let mut first_process = Latches::new();
+    let item = apply(
+        &mut first_process,
         SnapshotSource::ClaudeCode,
-        claude_item("s", &[desktop()]),
+        claude_item("s", &[desktop(NOW - 60)]),
         &context(Some(LoginCandidate::Oauth)),
-    );
-    let saved = index.session_billing_routes.clone();
-    // Crash after the committed save: the reloaded index keeps the exact
-    // latch and its frozen login.
-    let scratch = crate::test_scratch::ScratchDir::new("route-latch");
-    let path = scratch.as_ref().join("index.json");
-    index.save(&path).unwrap();
-    let mut restored = ScanIndex::load(&path).unwrap();
-    assert_eq!(restored.session_billing_routes, saved);
-    // Rollback to the preservation-only release: nothing recorded or sent,
-    // the latch kept as is.
-    let off = RouteContext {
-        record: false,
-        emit: false,
-        ..context(Some(LoginCandidate::ApiKey))
-    };
-    let item = apply(
-        &mut restored,
-        SnapshotSource::ClaudeCode,
-        claude_item("s", &[desktop()]),
-        &off,
-    );
-    assert!(item.session_billing_route.is_none());
-    assert_eq!(restored.session_billing_routes, saved);
-    // Re-upgrade with a changed login: the same first result.
-    let item = apply(
-        &mut restored,
-        SnapshotSource::ClaudeCode,
-        claude_item("s", &[desktop()]),
-        &context(Some(LoginCandidate::ApiKey)),
     );
     assert_eq!(route(&item), known("subscription", "evaluator_snapshot"));
 
-    // Crash before the save: no latch survives and the request is history
-    // for the restarted process; today's login is never applied to it.
-    let mut fresh = ScanIndex::default();
-    let mut restarted = context(Some(LoginCandidate::Oauth));
-    restarted.process_started_unix = NOW;
+    // Restart: a new process, started after that request.
+    let restarted = RouteContext {
+        process_started_unix: NOW,
+        ..context(Some(LoginCandidate::Oauth))
+    };
+    let mut latches = Latches::new();
     let item = apply(
-        &mut fresh,
+        &mut latches,
         SnapshotSource::ClaudeCode,
-        claude_item("s", &[desktop()]),
+        claude_item("s", &[desktop(NOW - 60)]),
         &restarted,
     );
     assert_eq!(route(&item), unknown("first_request_snapshot_missing"));
+    assert!(latches.is_empty());
+    // The next live request latches it again from its own evidence.
+    let next = Req {
+        desktop: true,
+        at: NOW + 10,
+        ..req("req_2", "msg_2")
+    };
+    let item = apply(
+        &mut latches,
+        SnapshotSource::ClaudeCode,
+        claude_item("s", &[desktop(NOW - 60), next]),
+        &restarted,
+    );
+    assert_eq!(route(&item), known("subscription", "evaluator_snapshot"));
+
+    // Today's API key never meets the earlier native pair: only the live
+    // request is classified, and it lacks one.
+    let api = RouteContext {
+        process_started_unix: NOW,
+        ..context(Some(LoginCandidate::ApiKey))
+    };
+    let live = Req {
+        at: NOW + 10,
+        ..req("req_2", "other_2")
+    };
+    let item = apply(
+        &mut Latches::new(),
+        SnapshotSource::ClaudeCode,
+        claude_item("s", &[req("req_1", "msg_1"), live]),
+        &api,
+    );
+    assert_eq!(route(&item), unknown("uncorroborated_snapshot"));
+    // Third-party evidence on an earlier request still vetoes.
+    let cloud = req("req_1", "msg_bdrk_1");
+    let live = Req {
+        at: NOW + 10,
+        ..req("req_2", "msg_2")
+    };
+    let item = apply(
+        &mut Latches::new(),
+        SnapshotSource::ClaudeCode,
+        claude_item("s", &[cloud, live]),
+        &api,
+    );
+    assert_eq!(route(&item), unknown("signal_conflict"));
+
+    // Codex and Pi rows hold the whole session: a restart latches the same.
+    let rows = || vec![row(Some("openai"), Some("chatgpt"))];
+    for latches in [&mut first_process, &mut Latches::new()] {
+        let item = apply(
+            latches,
+            SnapshotSource::Codex,
+            rows_item(rows()),
+            &restarted,
+        );
+        assert_eq!(route(&item), known("subscription", "codex_auth_snapshot"));
+    }
 }
 
 #[test]
-fn latch_is_scoped_by_source_machine_and_session() {
-    let mut index = ScanIndex::default();
+fn latch_is_scoped_by_destination_source_machine_and_session() {
+    let mut latches = Latches::new();
     let desktop = Req {
         desktop: true,
         ..req("req_1", "msg_1")
     };
     apply(
-        &mut index,
+        &mut latches,
         SnapshotSource::ClaudeCode,
         claude_item("a", &[desktop]),
         &context(Some(LoginCandidate::Oauth)),
     );
-    // A new destination namespace starts from its own empty index: no carry,
-    // and its history is not reclassified from the current login.
-    let mut new_destination = ScanIndex::default();
+    // Another destination gets no carry: its history is missing, not the
+    // first destination's latch.
     let old = Req {
         desktop: true,
         at: STARTED - 60,
         ..req("req_1", "msg_1")
     };
-    let item = apply(
-        &mut new_destination,
+    let mut items = [claude_item("a", &[old])];
+    apply_session_billing_routes(
+        &mut latches,
+        "other-destination",
         SnapshotSource::ClaudeCode,
-        claude_item("a", &[old]),
+        MACHINE,
+        &mut items,
         &context(Some(LoginCandidate::Oauth)),
     );
-    assert_eq!(route(&item), unknown("first_request_snapshot_missing"));
-    assert_ne!(
-        route_key(SnapshotSource::ClaudeCode, MACHINE, "a"),
-        route_key(SnapshotSource::Pi, MACHINE, "a")
+    assert_eq!(route(&items[0]), unknown("first_request_snapshot_missing"));
+    assert_eq!(latches.len(), 1);
+    let base = route_key(DEST, SnapshotSource::ClaudeCode, MACHINE, "a");
+    for other in [
+        route_key("other", SnapshotSource::ClaudeCode, MACHINE, "a"),
+        route_key(DEST, SnapshotSource::Pi, MACHINE, "a"),
+        route_key(DEST, SnapshotSource::ClaudeCode, "other", "a"),
+        route_key(DEST, SnapshotSource::ClaudeCode, MACHINE, "b"),
+    ] {
+        assert_ne!(base, other);
+    }
+}
+
+/// The annotation persists nothing: no `ScanIndex` field, so no state_v2
+/// kind, root or presence name.
+#[test]
+fn annotation_persists_nothing() {
+    // Latches live only in the process map `apply` is handed; the state_v2,
+    // lenient-decode and carry code is unchanged from main.
+    assert!(!crate::snapshots::lenient_decode::FIELDS
+        .iter()
+        .any(|field| field.contains("billing") || field.contains("route")));
+    let mut latches = Latches::new();
+    let desktop = Req {
+        desktop: true,
+        ..req("req_1", "msg_1")
+    };
+    apply(
+        &mut latches,
+        SnapshotSource::ClaudeCode,
+        claude_item("s", &[desktop]),
+        &context(Some(LoginCandidate::Oauth)),
     );
+    assert_eq!(latches.len(), 1);
 }
 
 fn row(model_provider: Option<&str>, auth_mode: Option<&str>) -> SnapshotModelUsage {
@@ -471,8 +537,13 @@ fn rows_item(rows: Vec<SnapshotModelUsage>) -> SnapshotItem {
 }
 
 fn rows_route(source: SnapshotSource, rows: Vec<SnapshotModelUsage>) -> Value {
-    let mut index = ScanIndex::default();
-    route(&apply(&mut index, source, rows_item(rows), &context(None)))
+    let mut latches = Latches::new();
+    route(&apply(
+        &mut latches,
+        source,
+        rows_item(rows),
+        &context(None),
+    ))
 }
 
 #[test]
@@ -542,17 +613,17 @@ fn pi_allowlist_and_mixed_route_union() {
         );
     }
     // Mixed: the first route stays; the later one joins routes_seen.
-    let mut index = ScanIndex::default();
+    let mut latches = Latches::new();
     let vertex = row(Some("google-vertex"), Some("service_account"));
     let bedrock = row(Some("amazon-bedrock"), Some("service_account"));
     apply(
-        &mut index,
+        &mut latches,
         Pi,
         rows_item(vec![vertex.clone()]),
         &context(None),
     );
     let item = apply(
-        &mut index,
+        &mut latches,
         Pi,
         rows_item(vec![vertex, bedrock]),
         &context(None),
@@ -591,22 +662,40 @@ fn upload_bytes_and_money_fields_unchanged_off_and_additive_on() {
         let fingerprint = snapshot_fingerprint(source, &off.snapshots[0]);
         let witness = snapshot_upload_body_witness(&off.snapshots[0]);
 
-        let mut index = ScanIndex::default();
-        for context in [
-            RouteContext {
-                record: false,
-                emit: false,
-                ..context(None)
-            },
-            RouteContext {
-                emit: false,
-                ..context(None)
-            },
-        ] {
-            index.apply_session_billing_routes(source, MACHINE, &mut off.snapshots, &context);
+        // Off (this build's switch): nothing runs.
+        if !PRODUCER_ENABLED {
+            annotate_session_billing_routes(
+                DEST,
+                source,
+                MACHINE,
+                &mut off.snapshots,
+                Some(SESSION_BILLING_ROUTE_CONTRACT),
+            );
             assert_eq!(serde_json::to_value(&off).unwrap(), before);
         }
-        index.apply_session_billing_routes(source, MACHINE, &mut on.snapshots, &context(None));
+        // Latching without the receiver's contract adds nothing either.
+        let mut latches = Latches::new();
+        let silent = RouteContext {
+            emit: false,
+            ..context(None)
+        };
+        apply_session_billing_routes(
+            &mut latches,
+            DEST,
+            source,
+            MACHINE,
+            &mut off.snapshots,
+            &silent,
+        );
+        assert_eq!(serde_json::to_value(&off).unwrap(), before);
+        apply_session_billing_routes(
+            &mut latches,
+            DEST,
+            source,
+            MACHINE,
+            &mut on.snapshots,
+            &context(None),
+        );
         let mut after = serde_json::to_value(&on).unwrap();
         let added = after["snapshots"][0]
             .as_object_mut()
