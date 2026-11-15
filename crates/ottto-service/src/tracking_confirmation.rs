@@ -10,6 +10,7 @@ use crate::{source_slug, LocalApiError, LocalDaemon};
 #[derive(Debug, Clone, Default)]
 pub(super) struct TrackingEpisodes {
     next_generation: u64,
+    // Keep stops until a positive hint so Repair cannot arm an unresolvable wait.
     policy_stopped: BTreeSet<String>,
     episodes: BTreeMap<String, (u64, LocalTrackingConfirmation)>,
 }
@@ -89,7 +90,12 @@ impl TrackingEpisodes {
         self.policy_stopped.clear();
     }
 
-    fn record_policy(&mut self, source: &SourceKind, window: u64, enabled: bool) -> bool {
+    pub(super) fn record_policy(
+        &mut self,
+        source: &SourceKind,
+        window: u64,
+        enabled: bool,
+    ) -> bool {
         if window == 0 || !enabled {
             self.policy_stopped.insert(source_slug(source).to_string());
             self.clear(source)
@@ -163,22 +169,6 @@ impl LocalDaemon {
             .tracking_confirmation
             .arm(source, crate::current_rfc3339_timestamp(), eligible);
         state.persist_source_state(source);
-        Ok(())
-    }
-
-    pub(crate) fn record_tracking_policy(
-        &self,
-        source: &SourceKind,
-        window: u64,
-        enabled: bool,
-    ) -> Result<(), LocalApiError> {
-        let mut state = self.state()?;
-        if state
-            .tracking_confirmation
-            .record_policy(source, window, enabled)
-        {
-            state.persist_source_state(source);
-        }
         Ok(())
     }
 

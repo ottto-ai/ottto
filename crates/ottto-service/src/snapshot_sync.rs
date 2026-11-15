@@ -6814,18 +6814,12 @@ fn prepare_sync_source_inner(
             activity_hint.local_usage_reconciliation_enabled,
         )
     });
-    // Cache the workspace reconciliation policy so the daemon can surface it on
-    // SourceHealth.reconciliation_enabled. Best-effort: a poisoned lock is the
-    // only error path and is not worth aborting the sync over.
-    let _ = daemon.record_reconciliation_enabled(
-        source_kind(source),
-        activity_hint.local_usage_reconciliation_enabled,
-    );
+    // Cache the raw workspace policy for status and tracking eligibility together.
     daemon
-        .record_tracking_policy(
-            &source_kind(source),
-            receipt_window_days,
+        .record_reconciliation_enabled(
+            source_kind(source),
             activity_hint.local_usage_reconciliation_enabled,
+            receipt_window_days,
         )
         .map_err(|_| anyhow!("tracking state unavailable"))?;
     if receipt_window_days == 0 {

@@ -596,16 +596,23 @@ impl LocalDaemon {
     /// Record the most recent reconciliation policy for a source, learned by
     /// the snapshot-sync loop's activity hint. This is an internal,
     /// trusted-process call (no control token), mirroring how the local OTLP
-    /// relay updates daemon state. Best-effort: a poisoned lock is ignored.
+    /// relay updates daemon state. Keep the raw enabled flag even for a zero window.
     pub fn record_reconciliation_enabled(
         &self,
         source: SourceKind,
         enabled: bool,
+        receipt_window_days: u64,
     ) -> Result<(), LocalApiError> {
         let mut state = self.state()?;
         state
             .source_reconciliation
             .insert(source_slug(&source).to_string(), enabled);
+        if state
+            .tracking_confirmation
+            .record_policy(&source, receipt_window_days, enabled)
+        {
+            state.persist_source_state(&source);
+        }
         Ok(())
     }
 
@@ -8548,7 +8555,7 @@ mod tests {
         // timestamp, and surfaces the cached reconciliation policy.
         let initial = daemon().with_source_state_dir(dir.clone());
         initial
-            .record_reconciliation_enabled(SourceKind::Codex, true)
+            .record_reconciliation_enabled(SourceKind::Codex, true, 0)
             .expect("record reconciliation");
         initial
             .record_verification_result(&verified_codex("2026-05-05T10:15:00Z"))
@@ -9179,7 +9186,7 @@ mod tests {
     fn personal_meter_local_snapshot_uses_local_evidence_not_totals() {
         let daemon = daemon();
         daemon
-            .record_reconciliation_enabled(SourceKind::Codex, true)
+            .record_reconciliation_enabled(SourceKind::Codex, true, 30)
             .expect("record reconciliation");
         let mut snapshot = available_agent_status(SourceKind::Codex, "2026-05-05T10:20:00Z");
         snapshot.account = Some(ottto_protocol::AgentAccountStatus {
