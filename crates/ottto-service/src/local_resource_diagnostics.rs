@@ -1897,8 +1897,8 @@ pub(crate) fn take_control() -> BTreeMap<&'static str, u64> {
 }
 // Literal source/stage keys only; one pending row per lane and pass overlap,
 // no work-unit history.
-process_static!(fn with_offpass: std::sync::Mutex<BTreeMap<(Source, &'static str, bool), Record<OffpassCounts>>> =
-    std::sync::Mutex::new(BTreeMap::new()));
+type OffpassRows = BTreeMap<(Source, &'static str, bool), Record<OffpassCounts>>;
+process_static!(fn with_offpass: std::sync::Mutex<OffpassRows> = std::sync::Mutex::new(BTreeMap::new()));
 fn aggregate_offpass(mut row: Record<OffpassCounts>) {
     with_offpass(|state| {
         let mut rows = state.lock().unwrap_or_else(|error| error.into_inner());
