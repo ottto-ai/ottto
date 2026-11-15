@@ -85,7 +85,7 @@ pub(super) fn paced_source_qos(
     source: SnapshotSource,
     background: impl FnOnce() -> Option<MacPlatformSignals>,
 ) -> Option<MacPlatformSignals> {
-    if !source_paced_due(source).is_some_and(|due| due <= Instant::now()) {
+    if !source_paced_due(source).is_some_and(|due| due <= crate::scan_clock::now()) {
         return None;
     }
     let qos = background();
@@ -93,6 +93,11 @@ pub(super) fn paced_source_qos(
         with_source_cadence(source, SourceCadence::clear_continuation);
     }
     qos
+}
+/// Shared ordinary-owner entry seam; preserve drop-before-enter ordering.
+pub(super) fn enter_source_qos(slot: &mut Option<MacPlatformSignals>, source: SnapshotSource) {
+    drop(slot.take());
+    *slot = paced_source_qos(source, resident_background);
 }
 /// A spent byte budget asks only during the source's first backfill.
 pub(super) fn resident_scan_requested(scan: &SourceScanResult, first_read_bootstrap: bool) -> bool {
@@ -104,7 +109,7 @@ pub(super) fn resident_scan_requested(scan: &SourceScanResult, first_read_bootst
 pub(super) fn request_resident_scan(source: SnapshotSource) {
     if let Some(pacing) = resident_pacing(MacPlatformSignals::default().power()) {
         with_source_cadence(source, |cadence| {
-            cadence.request_paced_scan(Instant::now(), Duration::ZERO, pacing)
+            cadence.request_paced_scan(crate::scan_clock::now(), Duration::ZERO, pacing)
         });
     }
 }
@@ -308,6 +313,10 @@ impl MacPlatformSignals {
 }
 impl PlatformGates for MacPlatformSignals {
     fn power(&mut self) -> PlatformState {
+        #[cfg(all(test, unix))]
+        if let Some(power) = super::resource_schedule::test_power() {
+            return power;
+        }
         #[cfg(target_os = "macos")]
         let answer = unsafe { ottto_power_state() };
         #[cfg(not(target_os = "macos"))]
@@ -809,7 +818,7 @@ pub(super) fn after_ordinary_codex_page(
         clear(&mut CodexCadence, &TICKET);
         return;
     }
-    let finished = Instant::now();
+    let finished = crate::scan_clock::now();
     let ticket = finished_ok
         .then_some(ticket)
         .flatten()
@@ -891,7 +900,7 @@ impl CadenceAccess for ProductionHost<'_> {
 
 impl Host for ProductionHost<'_> {
     fn now(&mut self) -> Instant {
-        Instant::now()
+        crate::scan_clock::now()
     }
     fn upload_backoff(&mut self) -> bool {
         source_upload_backoff_remaining(SnapshotSource::Codex).is_some()
@@ -1094,7 +1103,7 @@ impl CursorContinuation for CodexContinuation<'_> {
                 qos,
             )
         });
-        page_end(ended, deadline, Instant::now(), self.latch)
+        page_end(ended, deadline, crate::scan_clock::now(), self.latch)
     }
 }
 
@@ -1173,3 +1182,12 @@ fn page_on_worker(
 #[cfg(test)]
 #[path = "continuation_tests.rs"]
 mod tests;
+
+#[cfg(all(test, unix))]
+pub(super) fn resource_qos() -> Option<(u32, i32)> {
+    query_qos()
+}
+#[cfg(all(test, unix))]
+pub(super) fn resource_set_qos(class: u32, relative: i32) -> bool {
+    set_qos(class, relative)
+}
