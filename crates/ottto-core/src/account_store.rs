@@ -435,9 +435,37 @@ json_file_store! {
     }
 }
 
+#[derive(Deserialize, Serialize)]
+struct SetupScanSettlement {
+    #[serde(flatten)]
+    binding: LocalConnectionBinding,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    setup_scan_settled_run_id: Option<String>,
+}
+
 impl FileConnectionStore {
     pub fn load(&self) -> Result<Option<LocalConnectionBinding>> {
         self.file().load_or(|| None)
+    }
+
+    pub fn setup_scan_settled_run_id(&self) -> Result<Option<String>> {
+        let saved: Option<SetupScanSettlement> = self.file().load_or(|| None)?;
+        Ok(saved.and_then(|saved| saved.setup_scan_settled_run_id))
+    }
+
+    /// The caller serializes binding writers; normal saves clear settlement.
+    pub fn settle_setup_scan(&self, expected: &LocalConnectionBinding) -> Result<()> {
+        let saved: Option<SetupScanSettlement> = self.file().load_or(|| None)?;
+        if let Some(mut saved) = saved {
+            if saved.binding.setup_run_id == expected.setup_run_id
+                && saved.binding.api_base_url == expected.api_base_url
+                && saved.setup_scan_settled_run_id.as_deref() != Some(&expected.setup_run_id)
+            {
+                saved.setup_scan_settled_run_id = Some(expected.setup_run_id.clone());
+                self.file().save(&saved)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn reset(&self) -> Result<Option<LocalConnectionBinding>> {

@@ -92,9 +92,10 @@ pub(crate) use usage::cache_observations;
 
 use scan::read_cause as change_reason;
 use sources::claude::context_file_birth as claude_context_file_birth;
+pub(crate) use sources::claude::cross_root_evidence as claude_cross_root_evidence;
 #[cfg(test)]
 pub(crate) use upload::tests::cache_overcap as cache_overcap_tests;
-pub(crate) mod claude_cross_root_evidence;
+
 use upload::context_read as upload_context_read;
 mod upload_context_receipt;
 pub(crate) use upload_context_receipt::Candidate as UploadContextReceiptCandidate;
@@ -140,7 +141,7 @@ mod shared_value_tests;
 pub(crate) use shared_value::{Shared, SharedMap};
 #[path = "snapshots/claude_request_money/birth_store.rs"]
 pub(crate) mod claude_money_birth_store;
-pub(crate) mod claude_request_accounts;
+pub(crate) use sources::claude::request_accounts as claude_request_accounts;
 // These census helpers remain until the separate persisted-format cleanup.
 #[allow(
     dead_code,
@@ -161,7 +162,7 @@ pub(crate) use tests::claude_request_account_mixed_fixture;
 pub(crate) use tests::output as claude_request_account_output;
 mod codex_compressed_input;
 mod codex_rollout_carry;
-pub(crate) mod codex_sqlite_read;
+pub(crate) use sources::codex::sqlite_read as codex_sqlite_read;
 #[cfg(test)]
 mod codex_zst_refusal_tests;
 mod compaction_events;
@@ -219,6 +220,8 @@ mod first_read_order_tests;
 mod held_audit_restore_tests;
 #[cfg(test)]
 mod resident_wave_tests;
+#[cfg(all(test, unix))]
+pub(crate) mod resource_fixture;
 pub(crate) use scan::lines::delivery as line_delivery;
 #[cfg(test)]
 use scan::lines::delivery::tests as line_delivery_tests;
@@ -568,6 +571,8 @@ pub struct SourceScanResult {
     pub(crate) page_file_limit_hit: bool,
     /// This process started the generation after a clean census completion.
     pub(crate) routine_recensus: bool,
+    /// Codex deferred a file because a page byte budget is spent.
+    pub(crate) page_byte_budget_hit: bool,
     pub scanned_file_count: usize,
     pub scanned_session_count: usize,
     pub semantic_noop_count: usize,
@@ -856,6 +861,22 @@ impl SourceScanResult {
             enqueue_watcher_hints(SnapshotSource::ClaudeCode, traversal, hints, false);
         }
     }
+    /// Queue this page's exact late Task-member hints for a later page; clears
+    /// `census_complete` when any hint is queued, so the census stays open
+    /// until those members are read.
+    pub(crate) fn queue_side_call_hints(
+        &mut self,
+        index: &mut ScanIndex,
+        roots: &[PathBuf],
+        lookback_days: u64,
+        disposition: &mut ClaudeUsageAuthorityDisposition,
+    ) {
+        let hints = std::mem::take(&mut disposition.side_call_hints);
+        if !hints.is_empty() {
+            self.enqueue_claude_discovery_hints(index, roots, lookback_days, &hints);
+            self.census_complete = false;
+        }
+    }
 
     /// Index keys this scan read to completion, with their parsed source
     /// fingerprints.
@@ -941,13 +962,13 @@ fn take_throttled_alarm_slot(
 }
 
 use sources::claude::census::usage_ledger::{
-    classify_claude_legacy_request_owners, claude_api_cache_creation,
-    claude_api_evidence_fingerprint_is_valid, claude_api_reasoning_matches,
-    claude_snapshot_request_id_hashes, claude_trace_evidence_fingerprint_is_valid,
-    claude_trace_owner_session_id, reconstruct_claude_usage_family, serialized_json_digest,
+    classify_claude_legacy_request_owners, claude_api_cache_creation, claude_api_reasoning_matches,
+    claude_snapshot_request_id_hashes, claude_trace_owner_session_id,
+    reconstruct_claude_usage_family, serialized_json_digest,
 };
 pub(crate) use sources::claude::census::usage_ledger::{
-    claude_api_cache_creation_rejection_count, claude_api_matches_transcript_occurrence,
+    claude_api_cache_creation_rejection_count, claude_api_evidence_fingerprint_is_valid,
+    claude_api_matches_transcript_occurrence, claude_trace_evidence_fingerprint_is_valid,
     validate_claude_api_row, ClaudeLegacyRequestOwners,
 };
 #[cfg(test)]
@@ -2387,10 +2408,8 @@ pub(crate) fn state_v2_prepare_observed() {
 pub(crate) fn state_v2_finish_window() -> Option<impl Drop> {
     state_v2::telemetry::Window::begin("finish")
 }
-pub(crate) fn state_v2_post_pass_observed(
-    relief: crate::local_resource_diagnostics::AllocatorRelief,
-) {
-    state_v2::telemetry::plateau(relief);
+pub(crate) fn state_v2_post_pass_observed() {
+    state_v2::telemetry::plateau();
 }
 
 pub(crate) fn state_v2_custody_published(path: &Path) -> Result<bool> {

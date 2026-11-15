@@ -3125,10 +3125,10 @@ pub enum ClaudeAccountUpkeepConsentState {
 }
 
 /// Whether the daemon may read Codex usage limits in the background (its
-/// scheduled `codex app-server` reads, which also renew each home's sign-in),
-/// for every Codex home on this Mac. On until the owner chooses. A person's
-/// Refresh and setup checks read regardless. Same wire values as
-/// [`ClaudeAccountUpkeepConsentState`].
+/// scheduled `codex app-server` reads, each of which lets Codex refresh the
+/// home's sign-in when due), for every Codex home on this Mac. On until the
+/// owner chooses. A person's Refresh and setup checks read regardless. Same
+/// wire values as [`ClaudeAccountUpkeepConsentState`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CodexQuotaRefreshConsentState {

@@ -603,7 +603,7 @@ pub(super) fn write_claude_read_schedule(
     schedule: &ClaudeReadSchedule,
 ) -> std::io::Result<()> {
     let body = serde_json::to_vec(schedule).map_err(std::io::Error::other)?;
-    ottto_core::write_owner_only_file_atomic(
+    ottto_core::write_owner_only_file_atomic_if_changed(
         &account_state_dir.join(CLAUDE_READ_SCHEDULE_FILE),
         &body,
     )

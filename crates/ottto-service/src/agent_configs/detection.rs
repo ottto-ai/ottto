@@ -173,6 +173,7 @@ fn claude_desktop_support_dir(home: &Path) -> PathBuf {
 fn capture_version(binary_path: &Path, args: &[&str]) -> Option<String> {
     let start = Instant::now();
     let mut child = Command::new(binary_path)
+        .envs(crate::command_env::path_env().map(|path| ("PATH", path)))
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -222,6 +223,15 @@ mod tests {
         std::env::temp_dir()
             .join("ottto-agent-detection-tests")
             .join(format!("{}-{name}-{counter}", std::process::id()))
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn version_probe_uses_command_path() {
+        let expected = crate::command_env::path_env().expect("command path");
+        let version = capture_version(Path::new("/bin/sh"), &["-c", r#"printf '%s\n' "$PATH""#]);
+        assert_eq!(version.as_deref(), expected.to_str());
     }
 
     #[test]

@@ -436,7 +436,7 @@ pub(in crate::snapshots) fn claude_trace_owner_session_id(
 }
 
 /// Hashed once per row: the first caller fills the row's kept result.
-pub(in crate::snapshots) fn claude_api_evidence_fingerprint_is_valid(
+pub(crate) fn claude_api_evidence_fingerprint_is_valid(
     row: &crate::claude_local_otel::ClaudeLocalOtelEvidence,
 ) -> bool {
     row.fingerprint_check.get_or_check(|| {
@@ -449,7 +449,7 @@ pub(in crate::snapshots) fn claude_api_evidence_fingerprint_is_valid(
     })
 }
 
-pub(in crate::snapshots) fn claude_trace_evidence_fingerprint_is_valid(
+pub(crate) fn claude_trace_evidence_fingerprint_is_valid(
     row: &crate::claude_local_otel::ClaudeTraceOwnershipEvidence,
 ) -> bool {
     let mut canonical = row.clone();

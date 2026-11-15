@@ -188,9 +188,11 @@ same provider-owned reconnect flow for that exact home.
 ## Background limit refresh
 
 The daemon reads each Codex home's limits on its own schedule (every 5 minutes
-for a home in use on this Mac, every 15 minutes otherwise, and once a day for a
+for a home in use on this Mac, every 30 minutes otherwise, and once a day for a
 second home signed into the same login) and every status read serves the saved
-reading. Each scheduled read is one `codex app-server` run, which also lets
+reading. A saved reading older than 60 minutes is shown stale; the account slot
+then shows its limits as unavailable and is not used to start a session until it
+is read again. Each scheduled read is one `codex app-server` run, which also lets
 Codex renew that home's sign-in. The scheduler sleeps until the next home is
 due, and at most a minute, whether or not any app is in front, so a login
 switched outside the daemon is read within a minute (and at least a minute
@@ -212,8 +214,9 @@ While it is off:
   scheduler wake and checked again under the settings lock right before each
   read; switching it back on wakes the scheduler at once;
 - a person's **Refresh limits**, setup and sign-in checks still read;
-- saved readings are still served and age as usual: shown stale after 30
-  minutes, and not shown past the last-known cap;
+- saved readings are still served and age as usual: shown stale after 60
+  minutes (the account slot then shows as unavailable and starts no session),
+  and not shown past the last-known cap;
 - a home with no usable saved reading reports
   `codex_quota_background_refresh_off` instead of `codex_quota_not_read_yet`;
 - an older companion app's status refresh, which cannot be told from its timer,

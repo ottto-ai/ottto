@@ -228,7 +228,7 @@ fn subagent_twin_version_three_converges_once() {
         prior.activate_effective_upload_body_witness_revision(3);
         e2::take_diag();
         e2::apply_money_rules(&mut prior);
-        assert_eq!(prior.claude_money_birth_store.money_rule_version(), 3);
+        assert_eq!(prior.claude_money_birth_store.money_rule_version(), 4);
         assert_eq!(copy_diag(&["money_rule_v3_reowed"]), [2]);
         for path in &paths {
             assert_eq!(

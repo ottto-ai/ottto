@@ -258,6 +258,7 @@ impl Page {
                     &mut self.index,
                     accepted.as_deref(),
                     wire_budget,
+                    None,
                 )
             });
         if let Some(accepted) = accepted.as_deref_mut() {
@@ -937,9 +938,11 @@ pub(in crate::snapshot_sync) fn ack(
 ) -> Result<crate::snapshot_client::SnapshotBatchResponse> {
     let mut response = accepted_batch(0);
     response.entity_ack_contract = Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
-    // Head-CAS covers the whole request once any item carries cache
-    // observations (`validate_entity_ack`): every accepted entity gets a head.
-    let head_cas = batch.iter().any(|item| item.cache_observations.is_some());
+    // Head-CAS covers the whole declaring request (a cache patch, a saved
+    // head or a telemetry-only body, `validate_entity_ack`): every accepted
+    // entity gets a head, including telemetry-only bodies without cache
+    // evidence.
+    let head_cas = batch.iter().any(crate::snapshot_client::declares_head_cas);
     for item in batch {
         let mut reference = entity_ack_ref(&item.snapshot_fingerprint);
         reference.source_session_id = item.source_session_id.clone();
@@ -3503,6 +3506,10 @@ pub(in crate::snapshot_sync) mod money_equivalence_tests {
         include!("root_twin_scope_tests.rs");
     }
     #[cfg(unix)]
+    mod subagent_twin_tail_tests {
+        include!("subagent_twin_tail_tests.rs");
+    }
+    #[cfg(unix)]
     mod lease_touch_oracle_tests {
         include!("lease_touch_oracle_tests.rs");
     }
@@ -3519,6 +3526,10 @@ pub(in crate::snapshot_sync) mod money_equivalence_tests {
     #[cfg(unix)]
     mod codex_creator_slot_oracle_tests {
         include!("../snapshots/sampled_scan/codex_creator_slot_oracle_tests.rs");
+    }
+    #[cfg(unix)]
+    mod codex_login_identity_oracle_tests {
+        include!("../snapshots/sampled_scan/codex_login_identity_oracle_tests.rs");
     }
 }
 

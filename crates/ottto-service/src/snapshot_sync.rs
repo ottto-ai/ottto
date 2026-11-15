@@ -147,7 +147,6 @@ fn bootstrap_cache_heads(
     probes: &[SnapshotItem],
     poison_scope: &str,
     progress: &mut SnapshotUploadProgress,
-    ordinary_bootstrap: bool,
     upload: impl FnMut(Vec<SnapshotItem>, bool) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
     persist: impl FnMut(&mut SnapshotUploadProgress) -> Result<()>,
 ) -> Result<usize> {
@@ -155,7 +154,6 @@ fn bootstrap_cache_heads(
         probes,
         poison_scope,
         progress,
-        ordinary_bootstrap,
         &mut InplaceRetryBudget::default(),
         upload,
         persist,
@@ -169,7 +167,6 @@ fn bootstrap_cache_heads_with_budget(
     probes: &[SnapshotItem],
     poison_scope: &str,
     progress: &mut SnapshotUploadProgress,
-    ordinary_bootstrap: bool,
     inplace_retry: &mut InplaceRetryBudget,
     mut upload: impl FnMut(
         Vec<SnapshotItem>,
@@ -185,12 +182,9 @@ fn bootstrap_cache_heads_with_budget(
     let mut shed = false;
     let result = (|| -> Result<usize> {
         let mut deferred = 0usize;
-        let stages: &[bool] = if ordinary_bootstrap {
-            &[false, true]
-        } else {
-            &[true]
-        };
-        for &enforce_head_cas in stages {
+        // A headless patched body reaches here only when head CAS is optional
+        // and no legacy reconciliation is pending; otherwise prepare strips it.
+        for enforce_head_cas in [false, true] {
             // A prior ordinary body ACK has no head proof. Force the exact probe
             // even when delivery of these bytes was previously acknowledged.
             if enforce_head_cas {
@@ -284,10 +278,57 @@ fn held_cache_head_probe(
     .then_some(probe)
 }
 
+/// Patched bodies of sessions this ledger never settled: no saved head, cache
+/// state or owed challenge for the session, no ACK, hold or refusal for the
+/// body, and the session's only body on the page. Each skips the probe stages
+/// and goes out once, whole, as a token-less head-CAS write: the backend
+/// completes the patch against an empty prior and returns the head and state
+/// echo, or, if it does hold a head, answers a conflict and challenge that
+/// the next page recovers through the ordinary bootstrap.
+fn cas_bootstrap_bodies(
+    progress: &SnapshotUploadProgress,
+    items: &[SnapshotItem],
+) -> BTreeSet<String> {
+    let mut per_session = BTreeMap::<&str, usize>::new();
+    for item in items {
+        *per_session
+            .entry(item.source_session_id.as_str())
+            .or_default() += 1;
+    }
+    items
+        .iter()
+        .filter(|item| {
+            let key = cache_session_key(&item.source_session_id);
+            let fingerprint = &item.snapshot_fingerprint;
+            item.cache_observations.is_some()
+                && item.cache_base_head_etag.is_none()
+                && per_session[item.source_session_id.as_str()] == 1
+                && !progress.accepted_fingerprints.contains(fingerprint)
+                && !progress.quarantined_fingerprints.contains_key(fingerprint)
+                && !progress.permanent_rejections.contains_key(fingerprint)
+                && !progress.accepted_cache_heads.contains_key(&key)
+                && !progress.accepted_cache_states.contains_key(&key)
+                && !progress.head_conflict_challenges.contains_key(&key)
+        })
+        .map(|item| item.snapshot_fingerprint.clone())
+        .collect()
+}
+
+#[cfg(test)]
 fn apply_bootstrapped_cache_heads(
     source: &str,
     snapshots: &mut [SnapshotItem],
     progress: &SnapshotUploadProgress,
+) -> Result<Vec<(String, String, String)>> {
+    apply_bootstrapped_cache_heads_except(source, snapshots, progress, &BTreeSet::new())
+}
+
+/// `cas_bootstrap` bodies (see `cas_bootstrap_bodies`) stay token-less.
+fn apply_bootstrapped_cache_heads_except(
+    source: &str,
+    snapshots: &mut [SnapshotItem],
+    progress: &SnapshotUploadProgress,
+    cas_bootstrap: &BTreeSet<String>,
 ) -> Result<Vec<(String, String, String)>> {
     let mut held = Vec::new();
     for snapshot in snapshots {
@@ -322,7 +363,9 @@ fn apply_bootstrapped_cache_heads(
             .accepted_cache_heads
             .get(&cache_session_key(&snapshot.source_session_id))
             .cloned();
-        if snapshot.cache_base_head_etag.is_none() {
+        if snapshot.cache_base_head_etag.is_none()
+            && !cas_bootstrap.contains(&snapshot.snapshot_fingerprint)
+        {
             return Err(anyhow::Error::new(SnapshotAckRejected {
                 reason: "cache head probe lacks accepted predecessor token",
             }));
@@ -1358,6 +1401,17 @@ fn prepare_snapshot_cache_for_upload(
     head_cas_required: bool,
     legacy_pending: &BTreeSet<String>,
 ) {
+    // Telemetry bodies use head CAS without negotiating cache evidence. Their
+    // predecessor is the exact saved ACK, and they never carry a cache patch.
+    if snapshot.evidence_basis == Some("otel_only") {
+        snapshot.cache_observations = None;
+        snapshot.cache_observations_state = None;
+        snapshot.cache_base_head_etag = progress
+            .accepted_cache_heads
+            .get(&cache_session_key(&snapshot.source_session_id))
+            .cloned();
+        return;
+    }
     if !enabled {
         snapshot.cache_observations = None;
         snapshot.cache_observations_state = None;
@@ -1386,7 +1440,8 @@ fn identity_cache_wire_reserve(
     progress: &SnapshotUploadProgress,
     full_replacement: bool,
 ) -> usize {
-    if snapshot.cache_observations.is_none()
+    if snapshot.evidence_basis != Some("otel_only")
+        && snapshot.cache_observations.is_none()
         && !progress
             .accepted_cache_heads
             .contains_key(&cache_session_key(&snapshot.source_session_id))
@@ -1408,14 +1463,15 @@ fn identity_cache_wire_reserve(
     )
 }
 
-/// Request class of one main-upload body: 2 for a legacy reconciliation,
-/// 1 when it carries a cache patch (admitted, unchanged or partial-empty), 0
-/// otherwise (no patch, birth- or cap-withheld). The client declares head CAS
-/// for a whole request when one body carries a patch, so the packer never
-/// mixes classes: an unpatched body sends no CAS contract and cannot conflict
-/// with a server head it never claimed.
+/// Keep ordinary (0), patched or headed (1), legacy (2), and telemetry-only (3)
+/// requests separate: the head-CAS declaration applies to the entire batch.
+/// Class 1 is a body with a cache patch (admitted, unchanged or partial-empty)
+/// or a saved head; class 0 has neither, sends no CAS contract and cannot
+/// conflict with a server head it never claimed.
 fn snapshot_upload_batch_class(snapshot: &SnapshotItem, legacy: bool) -> u8 {
-    if legacy {
+    if snapshot.evidence_basis == Some("otel_only") {
+        3
+    } else if legacy {
         2
     } else {
         u8::from(crate::snapshot_client::declares_head_cas(snapshot))
@@ -1426,7 +1482,8 @@ fn snapshot_upload_batch_class(snapshot: &SnapshotItem, legacy: bool) -> u8 {
 /// After a validated conflict refuses this exact challenge's answer, only a
 /// re-send of a held conflicted body waits, until that body's own conflict
 /// probe (within one hour); a new revision answers at once. Only a body that
-/// sends the stale base under the head-CAS contract carries the answer; the
+/// declares head CAS carries the answer; telemetry is freshly rebuilt from its
+/// ordinary evidence chunk and needs neither a cache patch nor a saved base. The
 /// body itself, its fingerprint and its witness are unchanged.
 /// `replacement_owed` (negotiated, real-Full session) may also mark the patch
 /// a full replacement when no local cache state exists: that patch already
@@ -1443,9 +1500,10 @@ fn attach_head_conflict_answers(
         if let Some(patch) = snapshot.cache_observations.as_mut() {
             patch.full_replacement = false;
         }
-        // A withheld cache patch keeps its base but sends no CAS contract, so
-        // the request and its ACK validation would not admit a handshake.
-        if snapshot.cache_base_head_etag.is_none() || snapshot.cache_observations.is_none() {
+        // A saved base declares head CAS with or without a patch, and
+        // telemetry declares it with or without a base, so the request and
+        // its ACK validation admit the handshake.
+        if snapshot.evidence_basis != Some("otel_only") && snapshot.cache_base_head_etag.is_none() {
             continue;
         }
         let key = cache_session_key(&snapshot.source_session_id);
@@ -1639,10 +1697,13 @@ struct PermanentSnapshotRejection {
 mod ack_retention;
 mod head_conflict;
 mod progress_rows;
+mod telemetry_only;
 mod upload_context_resend;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SnapshotUploadProgress {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    telemetry_only: Option<Box<telemetry_only::Ledger>>,
     schema_version: u16,
     /// A routed source's progress rows; never serialized into the ledger.
     #[serde(skip)]
@@ -1760,6 +1821,7 @@ impl SnapshotUploadProgress {
     ) -> Self {
         Self {
             schema_version: SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION,
+            telemetry_only: None,
             rows: None,
             generation: 0,
             destination_namespace_hash,
@@ -3613,10 +3675,7 @@ fn current_unix_seconds() -> u64 {
         return now;
     }
 
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or_default()
+    crate::scan_clock::utc_seconds()
 }
 
 pub(crate) fn quarantine_retry_after(fingerprint: &str) -> u64 {
@@ -4145,7 +4204,7 @@ fn paced_scan_due() -> Option<Instant> {
 }
 
 fn source_cadence_wait(source: SnapshotSource) -> Option<Duration> {
-    let now = Instant::now();
+    let now = crate::scan_clock::now();
     let wait = with_source_cadence(source, |cadence| negotiated_wait(cadence, now))
         .unwrap_or(Duration::ZERO);
     (!wait.is_zero()).then_some(wait)
@@ -4297,7 +4356,7 @@ fn source_upload_deadlines() -> &'static Mutex<BTreeMap<&'static str, Instant>> 
 
 fn defer_source_uploads(source: SnapshotSource, retry_after: Duration) {
     if let Ok(mut deadlines) = source_upload_deadlines().lock() {
-        let deadline = Instant::now() + retry_after;
+        let deadline = crate::scan_clock::now() + retry_after;
         deadlines
             .entry(source.api_slug())
             .and_modify(|existing| *existing = (*existing).max(deadline))
@@ -4322,7 +4381,7 @@ pub(crate) fn small_source_upload<T>(
 fn source_upload_backoff_remaining(source: SnapshotSource) -> Option<Duration> {
     let mut deadlines = source_upload_deadlines().lock().ok()?;
     let deadline = *deadlines.get(source.api_slug())?;
-    let now = Instant::now();
+    let now = crate::scan_clock::now();
     if deadline <= now {
         deadlines.remove(source.api_slug());
         return None;
@@ -4599,6 +4658,23 @@ impl SyncCounts {
                     d.rollout_extents.reused_roots, d.rollout_extents.reloaded_roots,
                     d.session_index.reused_roots, d.session_index.reloaded_roots,
                     d.state_titles.absent_roots, d.sidecar_facts_heap_bytes));
+                let or_none = |cause: &'static str| if cause.is_empty() { "none" } else { cause };
+                line.push_str(&format!(
+                    " sidecar_reload_cause={} sidecar_keep_declined={}",
+                    or_none(d.sidecar_reload_cause),
+                    or_none(d.sidecar_keep_declined)
+                ));
+                for (input, homes) in ["state_5", "thread_history_1", "session_index"]
+                    .iter()
+                    .zip(d.sidecar_changed_homes)
+                {
+                    line.push_str(&format!(" {input}_changed={}", homes.count_ones()));
+                    if homes != 0 {
+                        let bits = (0..64u32).filter(|bit| homes & (1 << bit) != 0);
+                        let bits = bits.map(|bit| bit.to_string()).collect::<Vec<_>>();
+                        line.push_str(&format!(" {input}_changed_homes={}", bits.join(",")));
+                    }
+                }
             }
         }
         line
@@ -4984,7 +5060,7 @@ struct ContinuationLoop<'a> {
 
 impl continuation::LoopHost for ContinuationLoop<'_> {
     fn now(&mut self) -> Instant {
-        Instant::now()
+        crate::scan_clock::now()
     }
     fn wait(&mut self, wait: Duration) -> bool {
         collect_file_activity_for(
@@ -5046,15 +5122,15 @@ fn collect_file_activity_with_retry(
     mut retry_boundary: impl FnMut(Instant) -> Instant,
     mut read_account: impl FnMut() -> Option<String>,
 ) -> bool {
-    let deadline = Instant::now() + wait;
+    let deadline = crate::scan_clock::now() + wait;
     let mut watcher = watcher;
     loop {
-        let now = Instant::now();
+        let now = crate::scan_clock::now();
         if now >= deadline {
             return false;
         }
         let wake = retry_boundary(deadline).min(deadline);
-        let now = Instant::now();
+        let now = crate::scan_clock::now();
         if now >= deadline {
             return false;
         }
@@ -5064,7 +5140,7 @@ fn collect_file_activity_with_retry(
             Some(Ok(event)) => {
                 let _stage = StageWindow::begin(event.source.api_slug(), "offpass_hint");
                 with_source_cadence(event.source, |cadence| {
-                    cadence.record_file_event(Instant::now())
+                    cadence.record_file_event(crate::scan_clock::now())
                 });
             }
             Some(Err(std::sync::mpsc::RecvTimeoutError::Timeout)) => {}
@@ -5074,10 +5150,10 @@ fn collect_file_activity_with_retry(
                 watcher = None;
             }
         }
-        if account_switch.observe(Instant::now(), &mut read_account) {
+        if account_switch.observe(crate::scan_clock::now(), &mut read_account) {
             eprintln!("local snapshot sync: Claude account switch detected; refreshing now");
             with_source_cadence(SnapshotSource::ClaudeCode, |cadence| {
-                cadence.record_account_switch(Instant::now())
+                cadence.record_account_switch(crate::scan_clock::now())
             });
             return true;
         }
@@ -5148,6 +5224,7 @@ pub fn spawn_local_health_projection_sync(daemon: LocalDaemon) -> Result<()> {
                     );
                 }
             }
+            crate::control::reconcile_setup_scan_in_background(&daemon);
             std::thread::sleep(LOCAL_HEALTH_PROJECTION_INTERVAL);
         })
         .context("spawn local health projection sync")?;
@@ -5322,7 +5399,7 @@ pub fn spawn_failed_verification_reverify(daemon: LocalDaemon) -> Result<()> {
                 schedules
                     .retain(|schedule| failed.iter().any(|(source, _)| source == &schedule.source));
                 for (source, requires_reauth) in failed {
-                    let now = std::time::Instant::now();
+                    let now = crate::scan_clock::now();
                     let index = schedules
                         .iter()
                         .position(|schedule| schedule.source == source)
@@ -5356,7 +5433,7 @@ pub fn spawn_failed_verification_reverify(daemon: LocalDaemon) -> Result<()> {
                             crate::source_slug(&source)
                         ),
                     }
-                    schedule.record_attempt(Instant::now());
+                    schedule.record_attempt(crate::scan_clock::now());
                 }
             }
         })
@@ -5493,7 +5570,7 @@ fn sync_once_with_retry(
         daemon,
         transport_cycle: &mut transport_cycle,
         failed_sources: &mut failed_sources,
-        started: Instant::now(),
+        started: crate::scan_clock::now(),
         codex_started: None,
         paced_qos: None,
         account_witness,
@@ -5560,6 +5637,7 @@ fn retry_ordinary_owned(item: &SnapshotItem) -> Option<SnapshotItem> {
         return None;
     }
     Some(SnapshotItem {
+        evidence_basis: None,
         request_evidence: Vec::new(),
         request_identity_refusals: 0,
         claude_org_markers: None,
@@ -5732,10 +5810,9 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
         source: SnapshotSource,
         _remaining: Option<usize>,
     ) -> Result<Option<SourcePreparation>> {
-        drop(self.paced_qos.take());
-        self.paced_qos = continuation::paced_source_qos(source, continuation::resident_background);
+        continuation::enter_source_qos(&mut self.paced_qos, source);
         if source == SnapshotSource::Codex {
-            self.codex_started = Some(Instant::now());
+            self.codex_started = Some(crate::scan_clock::now());
             // K2: this prepare's policy replaces any older cached inputs.
             continuation::invalidate_on_ordinary_prepare();
         }
@@ -6231,12 +6308,13 @@ fn upload_local_health_projection_with(
     let mut status = daemon
         .status_for_trusted_client()
         .map_err(|error| anyhow!("read local health status failed: {error}"))?;
+    // Pairing can select a different machine from the durable local identity.
+    // Both heartbeat and health must match the paired identity on the server.
+    // Set it before reprojection, using this owned status copy only.
+    // Keep daemon state, machine store and setup request authority unchanged.
+    // Source-control replies continue to fence on the current device binding.
+    status.machine.machine_id = machine_id.to_owned();
     crate::refresh_canonical_local_health(&mut status);
-    if status.machine.machine_id != machine_id {
-        return Err(anyhow!(
-            "local health machine identity does not match registered device"
-        ));
-    }
     let heartbeat = status
         .runtime_heartbeat
         .as_ref()
@@ -7834,11 +7912,19 @@ fn finish_sync_source(
             &index,
             machine_id,
         );
+        let telemetry_window = upload_progress.seed_telemetry(
+            support_dir,
+            &activity_hint,
+            &mut scan_result,
+            &index,
+            &upload_progress_path,
+        )?;
         upload_progress.load_identity(
             (scan_result.snapshots.iter()).map(|item| item.source_session_id.as_str()),
         )?;
+        let mut telemetry_ledger = upload_progress.telemetry_only.take();
         let reserve_cache_bytes = |item: &SnapshotItem| {
-            if cache_observations_enabled {
+            if cache_observations_enabled || item.evidence_basis == Some("otel_only") {
                 identity_cache_wire_reserve(item, &upload_progress, cache_full_replacement)
             } else {
                 0
@@ -7854,17 +7940,15 @@ fn finish_sync_source(
                     max_item_bytes: identity_item_cap,
                     reservation: Some(&reserve_cache_bytes),
                 },
+                telemetry_window.zip(telemetry_ledger.as_deref_mut()),
             );
-        let hints = std::mem::take(&mut disposition.side_call_hints);
-        if !hints.is_empty() {
-            scan_result.enqueue_claude_discovery_hints(
-                &mut index,
-                claude_scan_roots.as_deref().unwrap_or_default(),
-                receipt_window_days,
-                &hints,
-            );
-            scan_result.census_complete = false;
-        }
+        upload_progress.telemetry_only = telemetry_ledger;
+        scan_result.queue_side_call_hints(
+            &mut index,
+            claude_scan_roots.as_deref().unwrap_or_default(),
+            receipt_window_days,
+            &mut disposition,
+        );
         // Copy-derived rows (#944): the bodies just built treat these
         // rows as never accepted; the ledger records that durably before any
         // upload, so a lost reply or restart cannot restore their proof.
@@ -8030,6 +8114,7 @@ fn finish_sync_source(
     #[cfg(test)]
     tests::permanent_finish_pipeline_tests::reason_reoffer_pipeline_tests::prepare_probe_for_test(
         &mut scan_result.snapshots,
+        &mut upload_progress,
     );
     finalize_scan_after_policy_with_body_witness(
         source,
@@ -8265,10 +8350,15 @@ fn finish_sync_source(
         .context_resend
         .retain_candidates(&upload_progress.context_receipt_candidates);
     crate::local_resource_diagnostics::change_reason::propagate(source.api_slug(), &index);
+    let cas_bootstrap = cas_bootstrap_bodies(&upload_progress, &scan_result.snapshots);
     let probes = scan_result
         .snapshots
         .iter()
-        .filter(|item| item.cache_observations.is_some() && item.cache_base_head_etag.is_none())
+        .filter(|item| {
+            item.cache_observations.is_some()
+                && item.cache_base_head_etag.is_none()
+                && !cas_bootstrap.contains(&item.snapshot_fingerprint)
+        })
         .map(cache_head_probe)
         .collect::<Vec<_>>();
     let mut bootstrap_deferred = 0usize;
@@ -8317,15 +8407,10 @@ fn finish_sync_source(
                 }
             }
         };
-        let ordinary_bootstrap = !activity_hint.snapshot_head_cas_required
-            && probes
-                .iter()
-                .all(|item| !legacy_reconciliation_pending.contains(&item.snapshot_fingerprint));
         let bootstrap_result = bootstrap_cache_heads_with_budget(
             &probes,
             source.api_slug(),
             &mut upload_progress,
-            ordinary_bootstrap,
             &mut inplace_retry,
             |snapshots, enforce_head_cas| {
                 let request = snapshot_batch_request(
@@ -8367,10 +8452,11 @@ fn finish_sync_source(
                     .deferred
                     .contains(&item.snapshot_fingerprint)
             });
-            let held = apply_bootstrapped_cache_heads(
+            let held = apply_bootstrapped_cache_heads_except(
                 source.api_slug(),
                 &mut scan_result.snapshots,
                 &upload_progress,
+                &cas_bootstrap,
             )
             .inspect_err(log_bootstrap_failure("apply"))
             .inspect_err(|_| {
@@ -8410,6 +8496,14 @@ fn finish_sync_source(
             "local snapshot upload answers {head_conflict_answers} head-CAS conflict challenge(s) for {} through the rescan handshake",
             source.api_slug()
         );
+    }
+    upload_progress.bind_telemetry_bodies(support_dir, &mut scan_result.snapshots);
+    if scan_result
+        .snapshots
+        .iter()
+        .any(|item| item.evidence_basis == Some("otel_only"))
+    {
+        upload_progress.save(&upload_progress_path)?;
     }
     let projected_pending_head_file_witnesses =
         upload_progress.pending_cache_head_file_witnesses(&index);
@@ -9061,7 +9155,13 @@ fn finish_sync_source(
     with_source_cadence(source, |cadence| {
         cadence.record_scan_success(Instant::now(), accepted)
     });
-    if continuation::resident_scan_requested(&scan_result) {
+    let first_read_bootstrap = backfill_pending
+        && crate::backfill::bootstrap_pending_for_destination(
+            &backfill_state,
+            source,
+            &upload_destination_namespace,
+        );
+    if continuation::resident_scan_requested(&scan_result, first_read_bootstrap) {
         continuation::request_resident_scan(source);
     }
 
@@ -9152,6 +9252,9 @@ fn finish_sync_source(
     #[cfg(test)]
     tests::permanent_finish_pipeline_tests::ack_post_save_failure("finish_cycle")?;
     upload_progress.finish_cycle(&upload_progress_path)?;
+    crate::local_resource_diagnostics::pass_retained(source.api_slug(), || {
+        daemon.transcript_cache.retained_heap_bytes(&index)
+    });
 
     if let Some(count) = deferred_entity_count {
         let state = refused_entity_state(
@@ -9465,6 +9568,7 @@ pub(crate) fn apply_claude_local_evidence_to_scan(
         index,
         None,
         Default::default(),
+        None,
     )
 }
 
@@ -9486,6 +9590,7 @@ pub(crate) fn apply_claude_local_evidence_to_scan_with_accepted_for_test(
         index,
         accepted_identity_buckets,
         Default::default(),
+        None,
     )
 }
 
@@ -9619,6 +9724,7 @@ fn pack_claude_evidence_families(
 
 /// What the chunks of one page share: its original carriers and the counters.
 struct ClaudeEvidencePage<'p> {
+    telemetry_window: Option<(telemetry_only::Window, &'p mut telemetry_only::Ledger)>,
     originals: &'p BTreeMap<String, crate::snapshots::SessionAccountEvidence>,
     request_owned_originals: &'p crate::snapshots::claude_request_identity::RequestOwnedOriginals,
     stats: ClaudeLocalEvidenceStats,
@@ -9637,6 +9743,7 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
     index: &mut ScanIndex,
     accepted_identity_buckets: Option<&crate::snapshots::claude_request_identity::AcceptedBuckets>,
     wire_budget: crate::snapshots::claude_request_identity::WireBudget<'_>,
+    telemetry_window: Option<(telemetry_only::Window, &mut telemetry_only::Ledger)>,
 ) -> (
     crate::snapshots::ClaudeUsageAuthorityDisposition,
     bool,
@@ -9658,6 +9765,7 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
             &scan_result.snapshots,
         );
     let mut page = ClaudeEvidencePage {
+        telemetry_window,
         originals: &originals,
         request_owned_originals: &request_owned_originals,
         stats: ClaudeLocalEvidenceStats {
@@ -9766,7 +9874,9 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
     disposition
         .copy_invalidated
         .sort_by_key(|row| first_slot.get(row.session()).copied());
-    disposition.side_call_hints = page.side_call_discovery.hints.into_iter().collect();
+    disposition
+        .side_call_hints
+        .extend(page.side_call_discovery.hints);
     let ClaudeEvidencePage { mut stats, .. } = page;
     for item in &scan_result.snapshots {
         if !item.source_session_id.contains("_agent-") {
@@ -9852,6 +9962,13 @@ fn apply_claude_local_evidence_chunk(
         crate::local_resource_diagnostics::EvidenceMem,
     ),
 ) -> crate::snapshots::ClaudeUsageAuthorityDisposition {
+    let synthetic_roots = scan_result
+        .snapshots
+        .iter()
+        .filter(|item| item.evidence_basis == Some("otel_only"))
+        .map(|item| item.source_session_id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut synthetic_healthy = BTreeSet::new();
     let builds_evidence = crate::snapshots::claude_request_identity::builds_evidence();
     let (originals, request_owned_originals) = (page.originals, page.request_owned_originals);
     let stats = &mut page.stats;
@@ -10043,6 +10160,9 @@ fn apply_claude_local_evidence_chunk(
             }
             continue;
         }
+        if synthetic_roots.contains(&root_session_id) && trace.rows_discarded.is_empty() {
+            synthetic_healthy.insert(root_session_id.clone());
+        }
         stats.complete_sidecar_root_count += 1;
         if request_owned(&root_session_id) {
             strict_healthy_roots.insert(root_session_id.clone());
@@ -10114,6 +10234,10 @@ fn apply_claude_local_evidence_chunk(
     let step = |stage: &'static str| {
         crate::local_resource_diagnostics::StageWindow::begin("claude_code", stage)
     };
+    let (synthetic, ordinary): (Vec<_>, Vec<_>) = std::mem::take(&mut scan_result.snapshots)
+        .into_iter()
+        .partition(|item| item.evidence_basis == Some("otel_only"));
+    scan_result.snapshots = ordinary;
     let window = step("evidence_side_calls");
     // `e2` side calls need the trace-named owner, so they follow the trace read.
     let side_calls_unresolved = crate::snapshots::claude_request_money::e2::side_calls_page(
@@ -10275,6 +10399,32 @@ fn apply_claude_local_evidence_chunk(
     drop(window);
     drop(identity_evidence);
     drop(cross);
+    if let Some((window, ledger)) = page.telemetry_window.as_mut() {
+        scan_result.snapshots.extend(
+            synthetic
+                .into_iter()
+                .filter(|item| synthetic_healthy.contains(&item.source_session_id))
+                .filter_map(|item| {
+                    let root = item.source_session_id.clone();
+                    match telemetry_only::build(
+                        item,
+                        &api_report,
+                        &trace_report,
+                        index,
+                        *window,
+                        accepted_identity_buckets,
+                        wire_budget,
+                    ) {
+                        Ok(Some(item)) => Some(item),
+                        Ok(None) => {
+                            ledger.settle(&root);
+                            None
+                        }
+                        Err(()) => None,
+                    }
+                }),
+        );
+    }
     // Qualification above was the last row reader.
     drop(api_report);
     drop(trace_report);
@@ -10677,6 +10827,13 @@ enum SnapshotPageOutcome {
     Disabled(Option<String>),
 }
 
+/// Diagnostics only (`change_reason`): an unchanged ACK without a basis
+/// (the stored body itself) or with `usage_identical` settles identical
+/// usage; an accepted one never does.
+fn ack_usage_identical(unchanged: bool, basis: Option<&str>) -> bool {
+    unchanged && matches!(basis, None | Some("usage_identical"))
+}
+
 // Scratch extraction only: the upload callback remains the existing canonical
 // preflight/token/ACK-validator/client-report boundary. No inventory pruning.
 #[expect(clippy::too_many_arguments, reason = "10 args; no options struct yet")]
@@ -10914,15 +11071,21 @@ where
             .filter(|entity| entity.unchanged_basis.is_none())
             .map(|entity| (entity.snapshot_fingerprint.as_str(), entity))
             .collect::<BTreeMap<_, _>>();
-        for entity in response
+        for (entity, unchanged) in response
             .accepted_entities
             .iter()
-            .chain(&response.unchanged_entities)
+            .map(|entity| (entity, false))
+            .chain(
+                response
+                    .unchanged_entities
+                    .iter()
+                    .map(|entity| (entity, true)),
+            )
         {
             crate::local_resource_diagnostics::change_reason::settled(
                 poison_scope,
                 &entity.snapshot_fingerprint,
-                entity.unchanged_basis.as_deref() == Some("usage_identical"),
+                ack_usage_identical(unchanged, entity.unchanged_basis.as_deref()),
             );
         }
         for index in indices {
@@ -10931,6 +11094,7 @@ where
             if settled.contains(item_fingerprint) {
                 let witness = body_witness(item);
                 progress.record_body(item_fingerprint, &witness);
+
                 if let Some(context) = &progress.context_resend.active {
                     progress
                         .accepted_body_contexts
@@ -10991,6 +11155,7 @@ where
                         rejection.safe_reason(),
                     );
                     progress.note_refused_exposure(item_fingerprint, item);
+                    progress.settle_telemetry_root(&rejection.source_session_id);
                 } else {
                     // Any validated non-permanent answer keeps only this
                     // entity owed. Accepted siblings settle independently.
@@ -11365,8 +11530,8 @@ where
             catchup_units.push((catchup, family_key));
         }
     }
-    // A request declares head CAS when any body in it carries a cache patch,
-    // so every request is class-pure: an unpatched body never travels under
+    // Cache patches and telemetry bodies declare head CAS for the request,
+    // so every request is class-pure: an ordinary body never travels under
     // another body's CAS contract. Stable-sort each lane by family key so
     // single bodies form one run per class, each family's groups stay
     // contiguous and root first, and a single-class page keeps its order.
@@ -13557,7 +13722,6 @@ mod tests {
             &[probe.clone()],
             &unique_poison_scope(),
             &mut progress,
-            true,
             |items, enforce| {
                 let request = SnapshotBatchRequest {
                     schema_version: SNAPSHOT_SCHEMA_VERSION,
@@ -13778,7 +13942,6 @@ mod tests {
             &ordinary,
             &scope,
             &mut progress,
-            true,
             |items, enforce| {
                 let request = SnapshotBatchRequest {
                     schema_version: SNAPSHOT_SCHEMA_VERSION,
@@ -14075,7 +14238,6 @@ mod tests {
             &[probe],
             &unique_poison_scope(),
             &mut progress,
-            true,
             |items, enforce| {
                 let request = SnapshotBatchRequest {
                     schema_version: SNAPSHOT_SCHEMA_VERSION,
@@ -14570,7 +14732,6 @@ mod tests {
             &off.snapshots,
             &unique_poison_scope(),
             &mut progress,
-            true,
             |items, enforce| response(items, enforce, enforce.then(|| "e".repeat(64))),
             |state| state.save(&progress_path),
         )
@@ -14777,7 +14938,6 @@ mod tests {
             &[probe],
             &unique_poison_scope(),
             &mut progress,
-            true,
             |items, enforce| {
                 stages.push(enforce);
                 let request = SnapshotBatchRequest {
@@ -14913,7 +15073,6 @@ mod tests {
             &[current.clone()],
             &unique_poison_scope(),
             &mut progress,
-            true,
             |items, enforce| {
                 assert!(items[0].cache_observations.is_none());
                 let incoming = revision(&items[0]);
@@ -14974,25 +15133,6 @@ mod tests {
             "e".repeat(64)
         );
         assert_eq!(server_revision, current_revision);
-        // Mandatory-CAS policy cannot take the optional ordinary stage.
-        let mut progress = test_upload_progress();
-        let mut attempts = Vec::new();
-        assert!(bootstrap_cache_heads(
-            &[current],
-            &unique_poison_scope(),
-            &mut progress,
-            false,
-            |_, enforce| {
-                attempts.push(enforce);
-                Err(anyhow!(
-                    "server rejects grown body without predecessor authority"
-                ))
-            },
-            |_| Ok(())
-        )
-        .is_err());
-        assert_eq!(attempts, [true]);
-        assert!(progress.accepted_cache_heads.is_empty());
     }
 
     /// An `unchanged` ACK whose
@@ -15259,7 +15399,6 @@ mod tests {
                 &[item.clone()],
                 &unique_poison_scope(),
                 &mut progress,
-                true,
                 |items, enforce| {
                     stages.push(enforce);
                     assert!(enforce, "ordinary exact bytes were already acknowledged");
@@ -17025,7 +17164,7 @@ mod tests {
         include!("snapshot_sync/e2_upload_tests.rs");
     }
 
-    mod class_split_tests {
+    pub(in crate::snapshot_sync) mod class_split_tests {
         use super::*;
         include!("snapshot_sync/class_split_tests.rs");
     }
@@ -20114,7 +20253,7 @@ mod tests {
         }
     }
 
-    /// [behaviour] The heartbeat lists `source_control:v1` and keeps running
+    /// [regress] Paired health identity stays separate while the heartbeat runs
     /// on a granted source's token while every source is paused, so a web ON
     /// still arrives: OFF then ON pauses and resumes the source.
     #[test]
@@ -20125,7 +20264,14 @@ mod tests {
             &[("codex", 1, "disabled"), ("codex", 2, "enabled")],
         );
         let codex = SnapshotSource::Codex;
-        let daemon = test_daemon("otm_test");
+        let daemon = test_daemon("otm_local");
+        FileMachineStore::default()
+            .save(&ottto_core::LocalMachineBinding {
+                machine_id: "otm_local".into(),
+                installation_id: "install_test".into(),
+                hardware_uuid: None,
+            })
+            .unwrap();
         upload_local_health_projection_now(&daemon).expect("heartbeat");
         assert_eq!(
             source_marker(&backend.support_dir, codex).as_deref(),
@@ -20133,7 +20279,12 @@ mod tests {
         );
         assert!(enabled_snapshot_sources(&backend.device).is_empty());
         assert_eq!(heartbeat_source(&backend.device), Some(codex));
+        let mut unpaired = backend.device.clone();
+        unpaired.machine_id = None;
+        FileDeviceStore::default().save(&unpaired).unwrap();
         upload_local_health_projection_now(&daemon).expect("heartbeat while all paused");
+        assert!(snapshot_machine_id(&unpaired).unwrap().as_deref() == Some("otm_local"));
+        assert!(daemon.machine_for_trusted_client().unwrap().machine_id == "otm_local");
         assert_eq!(
             source_marker(&backend.support_dir, codex).as_deref(),
             Some("reconnect")
@@ -20149,6 +20300,16 @@ mod tests {
         assert!(heartbeats
             .iter()
             .all(|request| request.contains("\"source_control:v1\"")));
+        assert_eq!(requests.len(), 6);
+        for (request, id) in requests
+            .iter()
+            .filter(|r| r.contains("/apps/health/"))
+            .zip(["otm_test", "otm_test", "otm_local", "otm_local"])
+        {
+            let body: serde_json::Value =
+                serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+            assert_eq!(body["machine_id"], id);
+        }
         let _ = std::fs::remove_dir_all(&backend.root);
     }
 
@@ -23078,6 +23239,9 @@ mod tests {
     }
     pub(in crate::snapshot_sync) mod claude_money_e2_pipeline_tests {
         include!("snapshot_sync/claude_money_e2_pipeline_tests.rs");
+        mod telemetry_only_oracle_tests {
+            include!("snapshot_sync/telemetry_only/oracle_tests.rs");
+        }
         #[cfg(unix)]
         mod privacy_flip_money_tests {
             include!("snapshot_sync/privacy_flip_money_tests.rs");
@@ -24167,7 +24331,6 @@ mod tests {
                     &f.items[..1],
                     &unique_poison_scope(),
                     &mut f.progress,
-                    false,
                     &mut InplaceRetryBudget::default(),
                     |items, _| {
                         post(items.as_slice());
@@ -25080,7 +25243,7 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, rows, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_body_contexts, context_resend, ack_capacity, retained_stale_ack_count, accepted_cache_states, accepted_identity_buckets, accepted_identity_scope, accepted_cache_heads, pending_cache_heads, head_conflict_challenges, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts, terminal_contract_retry_pending_save, fresh_context_body_acks, context_receipt_candidates);
+crate::heap_layout_bound::fields!(SnapshotUploadProgress; telemetry_only, schema_version, rows, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_body_contexts, context_resend, ack_capacity, retained_stale_ack_count, accepted_cache_states, accepted_identity_buckets, accepted_identity_scope, accepted_cache_heads, pending_cache_heads, head_conflict_challenges, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts, terminal_contract_retry_pending_save, fresh_context_body_acks, context_receipt_candidates);
 
 crate::heap_layout_bound::fields!(PendingCacheHeadFile; source_file_fingerprint, group_fingerprint, entities, reselected_heads, settled_entities);
 
@@ -25117,3 +25280,6 @@ crate::heap_layout_bound::fields!(HeadConflictChallenge; challenge, stale_revisi
 
 #[cfg(test)]
 mod codex_sidecar_reuse_tests;
+
+#[cfg(all(test, unix))]
+pub(crate) mod resource_schedule;

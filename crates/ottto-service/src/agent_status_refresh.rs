@@ -582,6 +582,9 @@ pub(crate) fn collection(
     if let Some(collection) = SCOPED_COLLECTION.with(|slot| slot.borrow().clone()) {
         return Ok(collection);
     }
+    if manual && *source == SourceKind::Pi {
+        crate::command_env::provider_env_with_refresh(true);
+    }
     match owner() {
         Some(owner) => owner.lanes[index(source)].collection(manual),
         None => Ok(Arc::new(collect_agent_status_collection(

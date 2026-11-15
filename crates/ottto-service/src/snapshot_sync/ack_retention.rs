@@ -216,7 +216,7 @@ impl SnapshotUploadProgress {
         // borrows an unused historical incidence allowance. Scratch is bounded
         // by this ledger, not a cloned index census.
         let mut unsettled = self.accepted_fingerprints.clone();
-        for fp in committed.upload_progress_ack_incidence() {
+        for fp in self.ack_incidence(committed) {
             unsettled.remove(fp);
         }
         self.retained_stale_ack_count = unsettled.len();
@@ -253,7 +253,7 @@ impl SnapshotUploadProgress {
         let before = input.len();
         let mut unsettled = self.accepted_fingerprints.clone();
         let mut live_input = BTreeSet::new();
-        for fp in live_index.upload_progress_ack_incidence() {
+        for fp in self.ack_incidence(live_index) {
             unsettled.remove(fp);
             if input.contains(fp) && !self.accepted_fingerprints.contains(fp) {
                 live_input.insert(fp.to_owned());
@@ -423,7 +423,7 @@ impl SnapshotUploadProgress {
             return BTreeSet::new();
         }
         let mut absent = self.accepted_fingerprints.clone();
-        for fp in scanned.upload_progress_ack_incidence() {
+        for fp in self.ack_incidence(scanned) {
             absent.remove(fp);
         }
         absent
@@ -458,7 +458,7 @@ impl SnapshotUploadProgress {
     ) -> AckScanReferences {
         let obligations = self.retirement_obligations(previous);
         let mut referenced = BTreeSet::new();
-        for fp in scanned.upload_progress_ack_incidence() {
+        for fp in self.ack_incidence(scanned) {
             if obligations.contains(fp) {
                 referenced.insert(fp.to_owned());
             }
@@ -514,8 +514,7 @@ impl SnapshotUploadProgress {
             .unwrap_or_default();
         if previous.generation > 0 {
             candidates.extend(
-                previous
-                    .upload_progress_ack_incidence()
+                self.ack_incidence(previous)
                     .filter(|fp| self.accepted_fingerprints.contains(*fp))
                     .map(str::to_owned),
             );
@@ -537,7 +536,7 @@ impl SnapshotUploadProgress {
         let mut candidates = self.retirement_obligations(previous);
         candidates.extend(census_absent.iter().cloned());
         let mut live = BTreeSet::new();
-        for fp in selected.upload_progress_ack_incidence() {
+        for fp in self.ack_incidence(selected) {
             if candidates.contains(fp) {
                 live.insert(fp.to_owned());
             }
@@ -610,7 +609,7 @@ impl SnapshotUploadProgress {
             })
             .map(|(fp, _)| fp.clone())
             .collect::<BTreeSet<_>>();
-        for fp in saved.upload_progress_ack_incidence() {
+        for fp in self.ack_incidence(saved) {
             retired.remove(fp);
         }
         retired
@@ -709,12 +708,12 @@ impl SnapshotUploadProgress {
         }
         // Scratch is bounded by the already admitted ACK ledger (<= 64-byte
         // keys plus tree overhead per ACK), not a second full index census.
-        let mut retired = committed
-            .upload_progress_ack_incidence()
+        let mut retired = self
+            .ack_incidence(committed)
             .filter(|fp| self.accepted_fingerprints.contains(*fp))
             .map(str::to_owned)
             .collect::<BTreeSet<_>>();
-        for fingerprint in selected.upload_progress_ack_incidence() {
+        for fingerprint in self.ack_incidence(selected) {
             retired.remove(fingerprint);
         }
         retired.retain(|fp| !selected.decode_holds_entity(fp));
@@ -756,8 +755,14 @@ impl SnapshotUploadProgress {
             return;
         }
         let adopted = saved.adopted_upload_progress_acks(&self.accepted_body_witnesses);
+        let candidate_refs = self
+            .telemetry_only
+            .iter()
+            .flat_map(|l| l.references())
+            .collect::<BTreeSet<_>>();
         self.accepted_body_witnesses.retain(|fp, _| {
-            locally_held.contains(fp)
+            candidate_refs.contains(fp.as_str())
+                || locally_held.contains(fp)
                 || saved.decode_holds_entity(fp)
                 || !(adopted.contains(fp)
                     || (!saved.upload_progress_ack_incidence_unknown() && retired.contains(fp)))

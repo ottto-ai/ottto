@@ -51,16 +51,13 @@ fn corpus() -> (Corpus, PathBuf) {
 }
 fn enrich(c: &Corpus, page: &mut Page, progress: &mut SnapshotUploadProgress) {
     page.enrich_with(c, Some(&mut progress.accepted_identity_buckets));
-    let hints = std::mem::take(&mut page.disposition.side_call_hints);
-    if !hints.is_empty() {
-        page.scan.enqueue_claude_discovery_hints(
-            &mut page.index,
-            std::slice::from_ref(&c.root),
-            183,
-            &hints,
-        );
-        page.scan.census_complete = false;
-    }
+    // The same hand-off source finish calls, not a copy of it.
+    page.scan.queue_side_call_hints(
+        &mut page.index,
+        std::slice::from_ref(&c.root),
+        183,
+        &mut page.disposition,
+    );
 }
 fn new_progress() -> SnapshotUploadProgress {
     let mut progress = e2_progress();
@@ -257,6 +254,7 @@ fn late_member_native_pages_match_cold_money_and_placement() {
             let mut latest = BTreeMap::from([(ROOT.to_owned(), stable[0].clone())]);
             let mut index = page.index;
             let mut member_read = false;
+            let mut complete = false;
             for _ in 0..8 {
                 let mut next = c.raw(&scanner, index, 1, true, &[]);
                 enrich(&c, &mut next, &mut progress);
@@ -275,13 +273,13 @@ fn late_member_native_pages_match_cold_money_and_placement() {
                     latest.insert(item.source_session_id.clone(), item.clone());
                 }
                 settle_page(&c, &mut next, &mut progress);
-                let complete = next.scan.census_complete;
+                complete = next.scan.census_complete;
                 index = next.index;
                 if member_read && complete {
                     break;
                 }
             }
-            assert!(member_read, "hint eventually reaches native acquisition");
+            assert!(member_read && complete, "member read, census complete");
             let mut cold = c.raw(
                 &E2ScanFixture::capturing_identity(),
                 ScanIndex::default(),

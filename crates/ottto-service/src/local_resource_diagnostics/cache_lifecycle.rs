@@ -21,6 +21,9 @@ sparse_lifetime_counters! {
     llm_request_span_success_false: LlmRequestSpanSuccessFalse,
     llm_request_span_missing_session_id: LlmRequestSpanMissingSessionId,
     llm_request_span_missing_start_time: LlmRequestSpanMissingStartTime,
+    // Local OTLP relay rows and encoded bytes successfully appended (no fsync).
+    otlp_relay_appended_rows: OtlpRelayAppendedRows,
+    otlp_relay_appended_bytes: OtlpRelayAppendedBytes,
     // Local OTLP relay requests refused or acknowledged without storing.
     otlp_relay_busy_503: OtlpRelayBusy503,
     otlp_relay_bad_framing_400: OtlpRelayBadFraming400,

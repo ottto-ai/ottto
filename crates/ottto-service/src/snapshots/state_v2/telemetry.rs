@@ -56,6 +56,12 @@ fn stats() -> &'static Mutex<Stats> {
     static STATS: OnceLock<Mutex<Stats>> = OnceLock::new();
     STATS.get_or_init(|| Mutex::new(Stats::default()))
 }
+pub(super) fn wal_checkpoint_counts(log: u64, done: u64) {
+    if let Ok(mut stats) = stats().lock() {
+        stats.latest.insert("wal_checkpoint_log_frames", log.into());
+        stats.latest.insert("wal_checkpointed_frames", done.into());
+    }
+}
 pub(super) fn event(name: &'static str, value: &impl Serialize) {
     if name == "route" {
         if let Ok(value) = serde_json::to_value(value) {
@@ -377,7 +383,7 @@ pub(in super::super) fn retained_pass_end(index: &ScanIndex) {
         retained(index, "active_graph");
     }
 }
-pub(in super::super) fn plateau(relief: crate::local_resource_diagnostics::AllocatorRelief) {
+pub(in super::super) fn plateau() {
     if !PASS.with(|pass| pass.borrow().active) {
         return;
     }
@@ -385,7 +391,6 @@ pub(in super::super) fn plateau(relief: crate::local_resource_diagnostics::Alloc
         "post_pass_plateau",
         MemoryWindow {
             current: crate::local_resource_diagnostics::state_v2_memory(),
-            allocator_relief: cfg!(target_os = "macos").then_some(relief),
             ..Default::default()
         },
     );
@@ -419,6 +424,8 @@ pub(in super::super) fn plateau(relief: crate::local_resource_diagnostics::Alloc
 /// Successful physical decodes, including repeated reads for checks/encoding.
 /// Thread-local counters never carry record keys and reset at prepare.
 pub(super) fn decoded(rows: u64, headers: u64, chunks: u64) {
+    #[cfg(all(test, unix))]
+    crate::snapshots::resource_fixture::record_hydrated(rows);
     PASS.with(|pass| {
         let mut pass = pass.borrow_mut();
         pass.decoded.rows = pass.decoded.rows.saturating_add(rows);
@@ -440,7 +447,9 @@ struct RetainedHeap {
 /// Existing requested-layout accounting, excluding inline stack slots. Shared
 /// Arc buffers are conservatively charged to each owning graph. No JSON size
 /// is substituted for heap, and opaque/unsupported layouts remain unavailable.
-fn heap<T: crate::heap_layout_bound::HeapLayoutBound>(value: &T) -> Option<u64> {
+pub(in crate::snapshots) fn heap<T: crate::heap_layout_bound::HeapLayoutBound>(
+    value: &T,
+) -> Option<u64> {
     crate::heap_layout_bound::completed_bound(value, usize::MAX)?
         .checked_sub(std::mem::size_of_val(value))?
         .try_into()
@@ -465,6 +474,36 @@ fn retained_heap(index: &ScanIndex) -> RetainedHeap {
             >= super::super::claude_request_census::CLAUDE_REQUEST_CENSUS_HASH_ALARM_BASE / 4 * 3,
     }
 }
+pub(in crate::snapshots) fn retained_breakdown(
+    index: &ScanIndex,
+) -> BTreeMap<&'static str, Option<u64>> {
+    let retained = retained_heap(index);
+    let mut accounts = Some(0u64);
+    macro_rules! account {
+        ($f:ident, Accounts, $codec:tt, $kinds:tt, $class:ident) => {
+            accounts = accounts
+                .zip(heap(&index.$f))
+                .and_then(|(a, b)| a.checked_add(b));
+        };
+        ($($other:tt)*) => {};
+    }
+    scan_index_fields!(each account);
+    let traversal = heap(&index.traversal);
+    BTreeMap::from([
+        ("files_bytes", retained.files),
+        ("census_bytes", retained.census),
+        ("accounts_identity_bytes", accounts),
+        ("traversal_bytes", traversal),
+        (
+            "side_maps_bytes",
+            retained
+                .side_maps
+                .zip(accounts)
+                .zip(traversal)
+                .and_then(|((s, a), t)| s.checked_sub(a)?.checked_sub(t)),
+        ),
+    ])
+}
 fn side_maps(index: &ScanIndex) -> Option<u64> {
     let mut bytes = if index.v2.is_some() {
         std::mem::size_of::<super::IndexState>() as u64
@@ -484,8 +523,6 @@ fn side_maps(index: &ScanIndex) -> Option<u64> {
 
 #[derive(Default, Serialize)]
 struct MemoryWindow {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    allocator_relief: Option<crate::local_resource_diagnostics::AllocatorRelief>,
     current: crate::local_resource_diagnostics::StateV2Memory,
     peak: crate::local_resource_diagnostics::StateV2Memory,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -564,6 +601,8 @@ pub(in super::super) fn acquire_window(index: &ScanIndex) -> Option<Window> {
 /// One bounded sample per save attempt; rejected work is visible too. Gauges
 /// share the claude_state_v2 diagnostic row and contain counts/bytes only.
 pub(super) fn save_work(rows: u64, bytes: u64) {
+    #[cfg(all(test, unix))]
+    crate::snapshots::resource_fixture::record_save(rows, bytes);
     if let Ok(mut stats) = stats().lock() {
         stats.save_dirty_rows.observe(rows);
         stats.save_dirty_bytes.observe(bytes);
@@ -695,7 +734,7 @@ mod ops_tests {
         decoded(13, 0, 0);
         let (_, records) = crate::local_resource_diagnostics::capture(|| {
             ScanIndex::load(&path).unwrap();
-            plateau(Default::default());
+            plateau();
         });
         let record = records
             .iter()
@@ -730,7 +769,7 @@ mod ops_tests {
             save_work(1, 1);
             decoded(5, 0, 0);
             event("hold", &"none");
-            plateau(Default::default());
+            plateau();
         });
         let (_, outside) = crate::local_resource_diagnostics::capture(|| {
             event("hold", &"none");
@@ -800,9 +839,8 @@ mod ops_tests {
             }
             for _ in 0..2 {
                 pass_start();
-                let relief = crate::local_resource_diagnostics::release_memory();
-                plateau(relief);
-                plateau(relief); // A completed pass cannot emit a second end row.
+                plateau();
+                plateau(); // A completed pass cannot emit a second end row.
             }
         });
         PASS.with(|pass| *pass.borrow_mut() = previous);
@@ -814,13 +852,7 @@ mod ops_tests {
         for record in &records[10..] {
             let plateau = &record["counts"]["stage_memory"]["post_pass_plateau"];
             assert!(plateau.is_object());
-            if cfg!(target_os = "macos") {
-                for field in ["before_footprint_bytes", "after_footprint_bytes", "wall_us"] {
-                    assert!(plateau["allocator_relief"][field].is_u64());
-                }
-            } else {
-                assert!(plateau.get("allocator_relief").is_none());
-            }
+            assert!(plateau.get("allocator_relief").is_none());
         }
     }
 
@@ -832,7 +864,7 @@ mod ops_tests {
         let (_, records) = crate::local_resource_diagnostics::capture(|| {
             pass_start();
             baseline(Path::new("/synthetic-missing-baseline/scan-index.json"));
-            plateau(Default::default());
+            plateau();
         });
         PASS.with(|pass| *pass.borrow_mut() = previous);
         assert_eq!(records.len(), 1, "{records:?}");
@@ -863,7 +895,7 @@ mod ops_tests {
             }
             tail_stage(2, 100, 100);
             tail_stage(5, 40, 100);
-            plateau(Default::default());
+            plateau();
         });
         let tail = PASS.with(|pass| std::mem::replace(&mut *pass.borrow_mut(), previous).tail);
         let rows: Vec<_> = records
@@ -931,7 +963,7 @@ mod ops_tests {
                 drop(Stage::new(Kind::Save));
             }
             save_work(1, 1);
-            plateau(Default::default());
+            plateau();
             PASS.with(|pass| *pass.borrow_mut() = previous);
             let mut window = crate::local_resource_diagnostics::StageSum::begin(
                 "claude_code",
@@ -1000,6 +1032,29 @@ mod ops_tests {
         );
     }
 
+    #[test]
+    fn retained_parts_split_accounts_and_traversal_without_changing_legacy_side_sum() {
+        let mut index = ScanIndex::default();
+        index.session_account_bindings.insert(
+            "synthetic".into(),
+            super::super::super::SessionAccountBinding {
+                account_identifier_hash: "a".repeat(64),
+                workspace_identifier_hash: None,
+            },
+        );
+        let parts = retained_breakdown(&index);
+        assert_eq!(parts.len(), 5);
+        assert_eq!(parts["files_bytes"], retained_heap(&index).files);
+        assert!(parts["accounts_identity_bytes"].is_none_or(|n| n >= 64));
+        if let (Some(side), Some(accounts), Some(traversal), Some(legacy)) = (
+            parts["side_maps_bytes"],
+            parts["accounts_identity_bytes"],
+            parts["traversal_bytes"],
+            retained_heap(&index).side_maps,
+        ) {
+            assert_eq!(side + accounts + traversal, legacy);
+        }
+    }
     /// [behaviour] The existing state_v2 line flags census occupancy at 75%
     /// of the alarm base.
     #[test]

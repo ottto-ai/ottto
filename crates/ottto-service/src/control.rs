@@ -3349,10 +3349,15 @@ fn remove_codex_account(
             }
         }
     }
-    store
-        .remove(schema_version, slot_id)
-        .map_err(codex_account_slot_settings_error)
-        .map(crate::agent_status::annotate_codex_accounts_status)
+    // Under the home's read lock: a limits read that may be renewing its login
+    // ends (and drains) before the home is removed, so none writes it back.
+    let remove = || store.remove(schema_version, slot_id);
+    match store.slot_home(slot_id) {
+        Ok(home) => crate::agent_status::with_codex_home_read_lock(&home, remove),
+        Err(_) => remove(),
+    }
+    .map_err(codex_account_slot_settings_error)
+    .map(crate::agent_status::annotate_codex_accounts_status)
 }
 
 fn codex_account_slot_settings_error(error: CodexAccountSlotSettingsError) -> LocalApiError {
@@ -8109,6 +8114,7 @@ fn setup_claim_complete_body(
     json!({
         "nonce": claim.nonce,
         "machine_id": machine.machine_id,
+        "machine_identity_capability": MACHINE_IDENTITY_CAPABILITY,
         "installation_id": machine.installation_id,
         "hardware_uuid": machine.hardware_uuid,
         "account_scope": machine.account_scope,
@@ -9180,6 +9186,142 @@ fn agent_read_timeout_message(error: &LocalApiError) -> Option<String> {
     None
 }
 
+#[derive(Default)]
+struct SetupScanReconcile {
+    binding: Option<(String, String)>,
+    failures: u32,
+    next_due: Option<Instant>,
+}
+static SETUP_SCAN: std::sync::LazyLock<Mutex<SetupScanReconcile>> =
+    std::sync::LazyLock::new(|| Mutex::new(SetupScanReconcile::default()));
+
+fn setup_run_status_is_active(status: &str) -> bool {
+    matches!(
+        status,
+        "scanning" | "waiting_for_companion" | "running_action"
+    )
+}
+
+fn setup_reconcile_status_reason(status: Option<&str>) -> String {
+    format!(
+        "status:{}",
+        bounded_display_text(status.unwrap_or("unknown"), 64)
+    )
+}
+
+pub(crate) fn reconcile_setup_scan_in_background(daemon: &LocalDaemon) {
+    let Ok(mut state) = SETUP_SCAN.try_lock() else {
+        return;
+    };
+    let store = FileConnectionStore::default();
+    let Ok(Some(binding)) = store.load() else {
+        return;
+    };
+    let key = (binding.api_base_url.clone(), binding.setup_run_id.clone());
+    if state.binding.as_ref() != Some(&key) {
+        *state = SetupScanReconcile {
+            binding: Some(key),
+            ..Default::default()
+        };
+    }
+    if state.next_due.is_some_and(|due| Instant::now() < due) {
+        return;
+    }
+    let mut network_attempted = false;
+    let mut actions_processed = 0;
+    let result = (|| {
+        let settled_run = store.setup_scan_settled_run_id().or_state_poisoned()?;
+        if settled_run.as_deref() == Some(binding.setup_run_id.as_str()) {
+            return Ok((true, String::new()));
+        }
+        let device = FileDeviceStore::default()
+            .load()
+            .or_state_poisoned()?
+            .ok_or(LocalApiError::SetupRunConnectionMissing)?;
+        network_attempted = true;
+        let refreshed = refresh_setup_run_token_via_device_secret(&binding.api_base_url, &binding)?;
+        let run = refreshed
+            .run
+            .ok_or(LocalApiError::SetupRunConnectionMissing)?;
+        let mut credentials = SetupRunCredentials {
+            connection: refreshed.connection,
+            setup_run_token: refreshed.setup_run_token,
+        };
+        let machine = daemon.machine_for_trusted_client()?;
+        match run.status.as_str() {
+            "scanning" => {
+                let result = scan_setup_run_with_action_count(
+                    daemon,
+                    &binding.api_base_url,
+                    &mut credentials,
+                    &machine,
+                    Vec::new(),
+                    false,
+                    Some(&device.device_id),
+                    &mut actions_processed,
+                )?;
+                let status = result["status"].as_str();
+                Ok((
+                    !status.is_some_and(setup_run_status_is_active),
+                    setup_reconcile_status_reason(status),
+                ))
+            }
+            "waiting_for_companion" | "running_action" => {
+                let (actions, last_run_status, idle) = process_setup_actions_with_status(
+                    daemon,
+                    &binding.api_base_url,
+                    &mut credentials,
+                    &machine,
+                    &mut actions_processed,
+                )?;
+                request_snapshot_sync_after_setup_actions(daemon, &actions);
+                Ok((
+                    idle && matches!(
+                        last_run_status.as_deref(),
+                        Some("waiting_for_user" | "completed")
+                    ),
+                    setup_reconcile_status_reason(last_run_status.as_deref()),
+                ))
+            }
+            _ => Ok((true, setup_reconcile_status_reason(Some(&run.status)))),
+        }
+    })();
+    let (mut settled, mut reason) = match result {
+        Ok(outcome) => outcome,
+        Err(error) => (
+            terminal_refresh_rejection(&error).is_some(),
+            format!("error:{}", setup_action_execution_error_detail(&error).0),
+        ),
+    };
+    if settled {
+        let _binding_lock = lock_setup_run_binding();
+        if let Err(error) = store.settle_setup_scan(&binding).or_state_poisoned() {
+            settled = false;
+            reason = format!("error:{}", setup_action_execution_error_detail(&error).0);
+        }
+    }
+    let attempt = state.failures.saturating_add(1);
+    let next_in = if settled {
+        state.failures = 0;
+        state.next_due = None;
+        None
+    } else {
+        state.failures = attempt;
+        let delay = crate::snapshot_sync::full_jitter_backoff(state.failures);
+        state.next_due = Some(Instant::now() + delay);
+        Some(delay.as_secs())
+    };
+    if network_attempted {
+        let outcome = if settled { "settled" } else { "retry" };
+        let next_in = next_in
+            .map(|seconds| format!(" next_in={seconds}s"))
+            .unwrap_or_default();
+        eprintln!(
+            "setup reconcile attempt={attempt} outcome={outcome} reason={reason} actions={actions_processed}{next_in}"
+        );
+    }
+}
+
 fn setup_run(
     daemon: &LocalDaemon,
     authorization: &RequestAuthorization,
@@ -9188,6 +9330,7 @@ fn setup_run(
     setup_run_id: Option<String>,
     api_base_url: Option<String>,
 ) -> Result<serde_json::Value, LocalApiError> {
+    let _attempt = SETUP_SCAN.lock().unwrap_or_else(|p| p.into_inner());
     let status = status_for(daemon, authorization)?;
     crate::snapshot_sync::reset_relay_authorization_backoff();
     let mut connection = daemon.connection_for_authorized_client()?;
@@ -9290,8 +9433,40 @@ fn setup_run(
         connection,
     };
 
-    let scan = build_local_scan(&status.machine, sources);
-    let mut detail = match publish_scan_result(&api_base_url, &mut credentials, &scan) {
+    scan_setup_run_with_action_count(
+        daemon,
+        &api_base_url,
+        &mut credentials,
+        &status.machine,
+        sources,
+        claim_code_provided,
+        None,
+        &mut 0,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "preserves scan inputs while reporting partial action progress on errors"
+)]
+fn scan_setup_run_with_action_count(
+    daemon: &LocalDaemon,
+    api_base_url: &str,
+    credentials: &mut SetupRunCredentials,
+    machine: &MachineIdentity,
+    sources: Vec<SourceKind>,
+    claim_code_provided: bool,
+    expected_device: Option<&str>,
+    actions_processed: &mut usize,
+) -> Result<serde_json::Value, LocalApiError> {
+    let scan = build_local_scan(machine, sources);
+    if let Some(expected) = expected_device {
+        let device = FileDeviceStore::default().load().or_state_poisoned()?;
+        if device.as_ref().map(|d| d.device_id.as_str()) != Some(expected) {
+            return Err(LocalApiError::SetupRunConnectionMismatch);
+        }
+    }
+    let mut detail = match publish_scan_result(api_base_url, credentials, &scan) {
         Ok(detail) => detail,
         Err(error) if is_terminal_setup_run_scan_error(&error) => {
             clear_setup_run_connection_if_current(
@@ -9303,8 +9478,13 @@ fn setup_run(
         }
         Err(error) => return Err(error),
     };
-    let action_results =
-        process_setup_actions(daemon, &api_base_url, &mut credentials, &status.machine)?;
+    let (action_results, _, _) = process_setup_actions_with_status(
+        daemon,
+        api_base_url,
+        credentials,
+        machine,
+        actions_processed,
+    )?;
     if let Some(last) = action_results.last() {
         if let Some(refreshed) = &last.detail {
             detail = refreshed.clone();
@@ -9772,6 +9952,7 @@ fn setup_run_attach_body(machine: &MachineIdentity) -> serde_json::Value {
 
 #[derive(Debug, Deserialize)]
 struct SetupRunRefreshResponse {
+    run: Option<SetupRunApiRun>,
     setup_run_id: Option<String>,
     setup_run_token: String,
     expires_at: String,
@@ -9779,6 +9960,7 @@ struct SetupRunRefreshResponse {
 
 #[derive(Debug, Clone)]
 struct RefreshedSetupRunToken {
+    run: Option<SetupRunApiRun>,
     setup_run_token: String,
     connection: LocalConnectionBinding,
 }
@@ -9972,6 +10154,7 @@ fn refresh_setup_run_token_via_device_secret(
         )?
     };
     Ok(RefreshedSetupRunToken {
+        run: response.run,
         setup_run_token: response.setup_run_token,
         connection: committed,
     })
@@ -10370,14 +10553,47 @@ fn process_setup_actions(
     credentials: &mut SetupRunCredentials,
     machine: &MachineIdentity,
 ) -> Result<Vec<SetupActionResult>, LocalApiError> {
+    process_setup_actions_with_status(daemon, api_base_url, credentials, machine, &mut 0)
+        .map(|(results, _, _)| results)
+}
+
+fn process_setup_actions_with_status(
+    daemon: &LocalDaemon,
+    api_base_url: &str,
+    credentials: &mut SetupRunCredentials,
+    machine: &MachineIdentity,
+    actions_processed: &mut usize,
+) -> Result<(Vec<SetupActionResult>, Option<String>, bool), LocalApiError> {
     let mut results = Vec::new();
+    let mut last_run_status = None;
     for _ in 0..8 {
         let next = get_next_setup_action(api_base_url, credentials)?;
+        last_run_status = next.run_status;
         let Some(action) = next.action else {
-            break;
+            return Ok((results, last_run_status, true));
         };
         let source_slug = action.source.clone();
         let source = source_slug.as_deref().and_then(source_from_slug);
+        if source.as_ref().is_some_and(setup_source_paused) {
+            let detail = complete_setup_action(
+                api_base_url,
+                credentials,
+                &action,
+                "cancelled",
+                "source_paused",
+                json!({ "reason": "source_paused" }),
+            )?;
+            results.push(SetupActionResult {
+                action_id: action.id,
+                action_type: action.action_type,
+                source: source_slug,
+                status: "cancelled".to_string(),
+                detail: Some(detail),
+                verification: None,
+            });
+            *actions_processed += 1;
+            continue;
+        }
         if let Err(error) = record_setup_action_event(
             api_base_url,
             credentials,
@@ -10407,6 +10623,7 @@ fn process_setup_actions(
                 detail: Some(detail),
                 verification: None,
             });
+            *actions_processed += 1;
             continue;
         }
         let action_outcome = match action.action_type.as_str() {
@@ -10463,6 +10680,7 @@ fn process_setup_actions(
                     detail: None,
                     verification: None,
                 });
+                *actions_processed += 1;
                 break;
             }
             Err(error) => {
@@ -10487,8 +10705,10 @@ fn process_setup_actions(
             detail: Some(detail),
             verification,
         });
+        *actions_processed += 1;
     }
-    Ok(results)
+    // A response containing an action cannot establish that the run is idle.
+    Ok((results, last_run_status, false))
 }
 
 fn setup_action_execution_error_result(
@@ -10604,6 +10824,8 @@ fn setup_action_execution_error_detail(error: &LocalApiError) -> (&'static str, 
 
 #[derive(Debug, Deserialize)]
 struct SetupRunNextActionResponse {
+    #[serde(default)]
+    run_status: Option<String>,
     action: Option<SetupRunActionApiResponse>,
 }
 
@@ -11123,6 +11345,14 @@ fn source_patch_env_token(source_kind: &SourceKind) -> Option<&'static str> {
         SourceKind::ClaudeCode => Some("CLAUDE_CODE"),
         SourceKind::Pi => None,
     }
+}
+
+fn setup_source_paused(source: &SourceKind) -> bool {
+    source_patch_disabled(source)
+        || crate::snapshot_sync::source_paused(
+            &default_support_dir(),
+            crate::snapshot_sync::snapshot_source_of_kind(source),
+        )
 }
 
 fn source_patch_disabled(source_kind: &SourceKind) -> bool {
@@ -11836,6 +12066,9 @@ fn validate_device_credential_status(
 }
 
 const IDENTITY_CONTINUITY_CAPABILITY: &str = "prior_device_credential_v1";
+// Advertise only with the uploader that reprojects health and heartbeat using
+// the paired machine id. This is compatibility information, not authority.
+const MACHINE_IDENTITY_CAPABILITY: &str = "paired_machine_local_health_v1";
 
 struct PriorDeviceCredential {
     device_id: String,
@@ -11988,6 +12221,7 @@ fn telemetry_device_register_body_with_prior(
         "client_name": OTTTO_CLIENT_NAME,
         "client_version": machine.local_platform_version,
         "machine_id": machine.machine_id,
+        "machine_identity_capability": MACHINE_IDENTITY_CAPABILITY,
         "installation_id": machine.installation_id,
         "hardware_uuid": machine.hardware_uuid,
         "account_scope": machine.account_scope,
@@ -13209,12 +13443,33 @@ struct SmokeResult {
 /// Code for a Verify smoke the quiet window held back: starting Claude Code
 /// now could refresh, and so sign out, the saved login.
 pub(crate) const CLAUDE_LOGIN_REFRESH_PENDING_CODE: &str = "claude_login_refresh_pending";
+pub(crate) const CLAUDE_SMOKE_TIMEOUT_MESSAGE: &str =
+    "The Claude Code test run timed out before Ottto could check it.";
 
 fn run_verification_smoke_prompt(
     daemon: &LocalDaemon,
     source: &SourceKind,
 ) -> Result<SmokeResult, LocalApiError> {
     if *source == SourceKind::ClaudeCode {
+        let connected = daemon
+            .state()?
+            .sources
+            .iter()
+            .find(|health| health.source == *source)
+            .and_then(|health| health.agent_status.as_ref())
+            .is_some_and(crate::agent_status::claude_default_check_skipped);
+        if connected {
+            return Ok(SmokeResult {
+                command_found: true,
+                succeeded: false,
+                exit_status: None,
+                duration_ms: 0,
+                message: "Claude is connected through an account added in Ottto. The live check is skipped because Claude Code isn't signed in on this Mac.".to_string(),
+                diagnostic: None,
+                error_code: Some(crate::agent_status::CLAUDE_OTTTO_SIGNED_IN.to_string()),
+                local_session_observed: None,
+            });
+        }
         daemon.remember_claude_verification_auth_marker(
             crate::agent_status::claude_credential_modified_marker(
                 &ottto_core::ClaudeConfigDirSlot::Default,
@@ -13351,6 +13606,10 @@ fn smoke_command(source: &SourceKind) -> SmokeCommand {
                 SMOKE_PROMPT,
                 "--name",
                 "ottto test",
+                "--settings",
+                r#"{"env":{"OTEL_LOGS_EXPORTER":"none","OTEL_TRACES_EXPORTER":"none","OTEL_METRICS_EXPORTER":"none"}}"#,
+                "--session-id",
+                &crate::internal_session::internal_session_id(),
                 "--disallowedTools",
                 "*",
                 "--no-session-persistence",
@@ -13364,6 +13623,14 @@ fn smoke_command(source: &SourceKind) -> SmokeCommand {
 }
 
 fn pi_smoke_command(route: Option<&PiModelRoute>) -> SmokeCommand {
+    let version = detect_agent_installation(&SourceKind::Pi).version;
+    pi_smoke_command_with_version(route, version.as_deref())
+}
+
+fn pi_smoke_command_with_version(
+    route: Option<&PiModelRoute>,
+    version: Option<&str>,
+) -> SmokeCommand {
     let mut args = vec!["--no-builtin-tools", "--no-context-files", "--print"]
         .into_iter()
         .map(ToString::to_string)
@@ -13378,6 +13645,23 @@ fn pi_smoke_command(route: Option<&PiModelRoute>) -> SmokeCommand {
         if let Some(thinking_level) = route.thinking_level.as_deref() {
             args.extend(["--thinking".to_string(), thinking_level.to_string()]);
         }
+    }
+    // parse_version accepts missing or malformed patch components and extra parts.
+    let version = version.filter(|v| {
+        let core = v.trim();
+        core.split('.').count() == 3
+            && core
+                .split('.')
+                .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+    });
+    if version
+        .and_then(crate::mcp_inventory::parse_version)
+        .is_some_and(|v| v >= (0, 76, 0))
+    {
+        args.extend([
+            "--session-id".to_string(),
+            crate::internal_session::internal_session_id(),
+        ]);
     }
     args.push(SMOKE_PROMPT.to_string());
     SmokeCommand {
@@ -13436,7 +13720,7 @@ fn run_bounded_command(
         command.env("PATH", path_env);
     }
     if program == "pi" {
-        command.envs(crate::command_env::provider_env());
+        command.envs(crate::command_env::provider_env_with_refresh(true));
     }
     // The Claude smoke runs on the default login, the one its gate checked.
     let claude_login = (program == "claude").then_some(ottto_core::ClaudeConfigDirSlot::Default);
@@ -13475,6 +13759,11 @@ fn run_bounded_command(
                         format!("{display_name} smoke session completed.")
                     } else if usage_limited {
                         usage_limited_smoke_message(display_name)
+                    } else if program == "claude" {
+                        match diagnostic.as_deref() {
+                            Some(diagnostic) => format!("The Claude Code test run failed before Ottto could check it: {diagnostic}"),
+                            None => "The Claude Code test run failed before Ottto could check it.".to_string(),
+                        }
                     } else if let Some(diagnostic) = diagnostic.as_deref() {
                         format!(
                             "{display_name} smoke session failed before verification could complete: {diagnostic}"
@@ -13519,6 +13808,8 @@ fn run_bounded_command(
                     duration_ms: start.elapsed().as_millis(),
                     message: if usage_limited {
                         usage_limited_smoke_message(display_name)
+                    } else if program == "claude" {
+                        CLAUDE_SMOKE_TIMEOUT_MESSAGE.to_string()
                     } else {
                         format!(
                         "{display_name} smoke session timed out before verification could complete."
@@ -14373,7 +14664,10 @@ fn smoke_failure_verification_result_with_config(
     verification_result_with_config(
         source,
         config,
-        if usage_limited || refresh_pending {
+        if usage_limited
+            || refresh_pending
+            || smoke.error_code.as_deref() == Some(crate::agent_status::CLAUDE_OTTTO_SIGNED_IN)
+        {
             SourceVerificationStatus::Warning
         } else if provider_reauth_required {
             SourceVerificationStatus::ReconnectRequired
@@ -14492,15 +14786,23 @@ fn pi_route_summary_metadata(result: &SourceVerificationResult) -> serde_json::V
     })
 }
 
-fn build_local_scan(
-    machine: &MachineIdentity,
-    requested_sources: Vec<SourceKind>,
-) -> SetupScanPayload {
+fn setup_scan_sources(requested_sources: Vec<SourceKind>) -> Vec<SourceKind> {
     let source_filter = if requested_sources.is_empty() {
         vec![SourceKind::Codex, SourceKind::ClaudeCode, SourceKind::Pi]
     } else {
         requested_sources
     };
+    source_filter
+        .into_iter()
+        .filter(|source| !setup_source_paused(source))
+        .collect()
+}
+
+fn build_local_scan(
+    machine: &MachineIdentity,
+    requested_sources: Vec<SourceKind>,
+) -> SetupScanPayload {
+    let source_filter = setup_scan_sources(requested_sources);
     let mut machine_json = BTreeMap::new();
     machine_json.insert("id".to_string(), json!(machine.machine_id));
     machine_json.insert("name".to_string(), json!(machine.display_name));
@@ -14541,6 +14843,8 @@ fn build_local_scan(
 }
 
 fn scan_source(source: &SourceKind) -> SetupScanSource {
+    #[cfg(test)]
+    tests::SETUP_SCAN_PROBES.with(|count| count.set(count.get() + 1));
     match source {
         SourceKind::Codex => {
             let command_found = executable_exists("codex");
@@ -21876,6 +22180,251 @@ for line in sys.stdin:
         }
     }
 
+    fn scan_refresh(status: &str) -> &'static str {
+        Box::leak(json!({
+            "setup_run_id":"run_connected_setup", "setup_run_token":"synthetic-token", "expires_at":"2100-01-01T00:00:00Z",
+            "run":{"id":"run_connected_setup", "status":status, "machine_id":null}
+        }).to_string().into_boxed_str())
+    }
+    const SCAN_DETAIL: &str = r#"{"run":{"id":"run_connected_setup","status":"completed","machine_id":null},"sources":[],"next_action":null,"next_question":null}"#;
+    fn scan_fixture(base: String) -> (PathBuf, Vec<EnvVarGuard>, LocalDaemon, LocalDeviceBinding) {
+        *SETUP_SCAN.lock().unwrap() = SetupScanReconcile::default();
+        let (root, mut guards, daemon, device) = connected_binding_fixture("setup-scan", base);
+        guards.push(EnvVarGuard::set_path("HOME", &root));
+        guards.push(EnvVarGuard::set_path(
+            "OTTTO_COMMAND_SEARCH_PATH",
+            &root.join("bin"),
+        ));
+        (root, guards, daemon, device)
+    }
+
+    /// [regress] Missing initial scans recover after connectivity returns, without the app.
+    #[test]
+    #[serial]
+    fn background_setup_scan_repairs_offline_debt_once_without_app() {
+        let _lock = lock_backend_test_env();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let script = Arc::new(Mutex::new(SetupRunReadScript {
+            refresh: (0, ""),
+            read: (200, SCAN_DETAIL),
+        }));
+        let base = expired_setup_run_read_server(calls.clone(), script.clone());
+        let (_root, _guards, daemon, _) = scan_fixture(base);
+        reconcile_setup_scan_in_background(&daemon);
+        assert!(FileConnectionStore::default()
+            .setup_scan_settled_run_id()
+            .unwrap()
+            .is_none());
+        assert_eq!(SETUP_SCAN.lock().unwrap().failures, 1);
+        script.lock().unwrap().refresh = (200, scan_refresh("scanning"));
+        SETUP_SCAN.lock().unwrap().next_due = None;
+        reconcile_setup_scan_in_background(&daemon);
+        reconcile_setup_scan_in_background(&daemon);
+        assert_eq!(SETUP_SCAN.lock().unwrap().failures, 0);
+        assert_eq!(
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|p| p.ends_with("/scan-result"))
+                .count(),
+            1
+        );
+    }
+
+    /// [behaviour] Scan debt posts, action debt polls without scanning, and other statuses settle.
+    #[test]
+    #[serial]
+    fn background_setup_scan_status_decisions() {
+        let _lock = lock_backend_test_env();
+        for status in [
+            "scanning",
+            "completed",
+            "waiting_for_companion",
+            "running_action",
+        ] {
+            let actions = matches!(status, "waiting_for_companion" | "running_action");
+            let mut answers = vec![(200, scan_refresh(status))];
+            if status == "scanning" {
+                answers.push((200, SCAN_DETAIL));
+            }
+            if status == "scanning" || actions {
+                answers.extend([(200, "{}"), (200, r#"{"action":null}"#)]);
+            }
+            let (base, server) = scripted_json_backend(answers);
+            let (_root, _guards, daemon, _) = scan_fixture(base);
+            reconcile_setup_scan_in_background(&daemon);
+            let requests = server.join().unwrap();
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|r| r.contains("/scan-result"))
+                    .count(),
+                usize::from(status == "scanning")
+            );
+            assert_eq!(
+                FileConnectionStore::default()
+                    .setup_scan_settled_run_id()
+                    .unwrap()
+                    .is_some(),
+                !actions
+            );
+            if actions {
+                assert!(SETUP_SCAN.lock().unwrap().next_due.is_some());
+            }
+        }
+    }
+
+    /// [regress] The idle poll's status settles action debt without another refresh.
+    #[test]
+    #[serial]
+    fn background_setup_scan_uses_idle_poll_status() {
+        let _lock = lock_backend_test_env();
+        for status in [
+            Some("completed"),
+            Some("waiting_for_user"),
+            Some("waiting_for_companion"),
+            Some("future_status"),
+            None,
+        ] {
+            let response = match status {
+                Some(status) => json!({"action":null,"run_status":status}),
+                None => json!({"action":null}),
+            };
+            let body = Box::leak(response.to_string().into_boxed_str());
+            let (base, server) = scripted_json_backend(vec![
+                (200, scan_refresh("waiting_for_companion")),
+                (200, "{}"),
+                (200, body),
+            ]);
+            let (_root, _guards, daemon, _) = scan_fixture(base);
+            reconcile_setup_scan_in_background(&daemon);
+            assert_eq!(server.join().unwrap().len(), 3);
+            let settled = matches!(status, Some("completed" | "waiting_for_user"));
+            assert_eq!(
+                FileConnectionStore::default()
+                    .setup_scan_settled_run_id()
+                    .unwrap()
+                    .as_deref(),
+                settled.then_some("run_connected_setup"),
+            );
+            let state = SETUP_SCAN.lock().unwrap();
+            assert_eq!(state.failures, u32::from(!settled));
+            assert_eq!(state.next_due.is_some(), !settled);
+        }
+    }
+
+    /// [behaviour] One completed action and its final idle poll settle in one attempt.
+    #[test]
+    #[serial]
+    fn background_setup_scan_settles_after_one_action() {
+        let _lock = lock_backend_test_env();
+        let (base, server) = scripted_json_backend(vec![
+            (200, scan_refresh("waiting_for_companion")),
+            (200, "{}"),
+            (
+                200,
+                r#"{"run_status":"running_action","action":{"id":"synthetic-action","action_type":"unsupported","source":null}}"#,
+            ),
+            (200, "{}"),
+            (200, SCAN_DETAIL),
+            (200, "{}"),
+            (200, r#"{"run_status":"completed","action":null}"#),
+        ]);
+        let (_root, _guards, daemon, _) = scan_fixture(base);
+        reconcile_setup_scan_in_background(&daemon);
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 7);
+        assert_eq!(
+            requests.iter().filter(|r| r.contains("/complete ")).count(),
+            1
+        );
+        assert_eq!(
+            FileConnectionStore::default()
+                .setup_scan_settled_run_id()
+                .unwrap()
+                .as_deref(),
+            Some("run_connected_setup"),
+        );
+        let state = SETUP_SCAN.lock().unwrap();
+        assert_eq!(state.failures, 0);
+        assert!(state.next_due.is_none());
+    }
+
+    /// [behaviour] Rejected background authority parks; only the existing health hold owns logout.
+    #[test]
+    #[serial]
+    fn terminal_setup_refresh_parks_without_resetting_identity() {
+        let _lock = lock_backend_test_env();
+        for detail in ["Setup run expired", "Telemetry device secret is invalid"] {
+            let body = Box::leak(json!({"detail":detail}).to_string().into_boxed_str());
+            let (base, server) = scripted_json_backend(vec![(401, body)]);
+            let (_root, _guards, daemon, device) = scan_fixture(base);
+            let store = FileConnectionStore::default();
+            let binding = store.load().unwrap();
+            let account = FileAccountStore::default().load().unwrap();
+            let setup_token = KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
+                .load()
+                .unwrap();
+            let device_secret = KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+                .load()
+                .unwrap();
+            reconcile_setup_scan_in_background(&daemon);
+            assert!(store.setup_scan_settled_run_id().unwrap().is_some());
+            assert_eq!(store.load().unwrap(), binding);
+            assert_eq!(FileAccountStore::default().load().unwrap(), account);
+            assert_eq!(FileDeviceStore::default().load().unwrap(), Some(device));
+            assert_eq!(
+                KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
+                    .load()
+                    .unwrap(),
+                setup_token
+            );
+            assert_eq!(
+                KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+                    .load()
+                    .unwrap(),
+                device_secret
+            );
+            reconcile_setup_scan_in_background(&daemon);
+            assert_eq!(server.join().unwrap().len(), 1);
+        }
+    }
+
+    /// [format] Settlement survives restart, remains readable by the old binding type, and clears on save.
+    #[test]
+    #[serial]
+    fn persisted_setup_settlement_skips_restart_refresh_and_is_backward_compatible() {
+        let _lock = lock_backend_test_env();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let script = Arc::new(Mutex::new(SetupRunReadScript {
+            refresh: (200, scan_refresh("completed")),
+            read: (200, "{}"),
+        }));
+        let base = expired_setup_run_read_server(calls.clone(), script);
+        let (_root, _guards, daemon, _) = scan_fixture(base);
+        let store = FileConnectionStore::default();
+        assert!(store.setup_scan_settled_run_id().unwrap().is_none());
+        reconcile_setup_scan_in_background(&daemon);
+        let binding = store.load().unwrap().unwrap();
+        let legacy: LocalConnectionBinding =
+            serde_json::from_slice(&fs::read(store.path()).unwrap()).unwrap();
+        assert_eq!(legacy, binding);
+        assert_eq!(
+            store.setup_scan_settled_run_id().unwrap().as_deref(),
+            Some(binding.setup_run_id.as_str())
+        );
+        *SETUP_SCAN.lock().unwrap() = SetupScanReconcile::default();
+        reconcile_setup_scan_in_background(&daemon);
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        let mut replacement = binding.clone();
+        replacement.setup_run_id = "replacement-run".into();
+        store.save(&replacement).unwrap();
+        assert!(store.setup_scan_settled_run_id().unwrap().is_none());
+        store.settle_setup_scan(&binding).unwrap();
+        assert!(store.setup_scan_settled_run_id().unwrap().is_none());
+    }
+
     #[test]
     #[serial]
     fn setup_on_connected_daemon_is_noop_until_ottto_ends_the_run() {
@@ -22505,6 +23054,8 @@ for line in sys.stdin:
             install_session_token: "install_token_identity".to_string(),
         };
 
+        let body = setup_claim_complete_body(&claim, &machine);
+        assert!(body["machine_identity_capability"] == MACHINE_IDENTITY_CAPABILITY);
         for payload in [
             setup_claim_create_body(&machine, &claim.nonce),
             setup_claim_complete_body(&claim, &machine),
@@ -22532,6 +23083,7 @@ for line in sys.stdin:
             first["identity_continuity_capability"],
             IDENTITY_CONTINUITY_CAPABILITY
         );
+        assert!(first["machine_identity_capability"] == MACHINE_IDENTITY_CAPABILITY);
         assert!(first.get("prior_device_id").is_none());
         assert!(first.get("prior_device_secret").is_none());
 
@@ -22544,6 +23096,7 @@ for line in sys.stdin:
         };
         let repeat =
             telemetry_device_register_body_with_prior(&install_session, &machine, Some(&prior));
+        assert!(repeat["machine_identity_capability"] == MACHINE_IDENTITY_CAPABILITY);
         assert_eq!(repeat["prior_device_id"], "device_prior");
         assert_eq!(repeat["prior_device_secret"], "secret_prior");
     }
@@ -22631,6 +23184,7 @@ for line in sys.stdin:
                 "install_test"
             )
         );
+        assert!(prepare_body["machine_identity_capability"] == MACHINE_IDENTITY_CAPABILITY);
         let confirm_request = &requests[1];
         assert!(confirm_request.starts_with(
             "POST /api/v1/telemetry/device-credential-preparations/preparation-wire/confirm HTTP/1.1"
@@ -22767,6 +23321,7 @@ for line in sys.stdin:
             serde_json::from_str(http_request_body(request)).expect("claim request json");
         let retry_body: serde_json::Value =
             serde_json::from_str(http_request_body(&requests[1])).expect("retry request json");
+        assert!(body["machine_identity_capability"] == MACHINE_IDENTITY_CAPABILITY);
         assert_eq!(
             retry_body, body,
             "retry must reproduce the exact proof body"
@@ -27050,6 +27605,95 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn pi_smoke_session_ids_are_version_gated_for_default_and_route_commands() {
+        let mut live_route = live_pi_route();
+        live_route.thinking_level = Some("low".to_string());
+        for route in [None, Some(&live_route)] {
+            let mut expected = ["--no-builtin-tools", "--no-context-files", "--print"]
+                .map(str::to_string)
+                .to_vec();
+            if let Some(route) = route {
+                expected.extend([
+                    "--provider".to_string(),
+                    route.provider.clone(),
+                    "--model".to_string(),
+                    route.model.clone(),
+                    "--thinking".to_string(),
+                    "low".to_string(),
+                ]);
+            }
+            expected.push(SMOKE_PROMPT.to_string());
+            for version in [
+                None,
+                Some("0.75.9"),
+                Some("unknown"),
+                Some("0.76.bad"),
+                Some("0.76.0.1"),
+                Some("0.76.0-beta"),
+                Some("0.76.0-beta.1"),
+                Some("0.76"),
+                Some("pi 0.76.0"),
+            ] {
+                assert_eq!(pi_smoke_command_with_version(route, version).args, expected);
+            }
+            for version in ["0.76.0", "0.86.0", "1.0.0"] {
+                let mut previous = String::new();
+                for _ in 0..2 {
+                    let mut args = pi_smoke_command_with_version(route, Some(version)).args;
+                    let flag = args.iter().position(|arg| arg == "--session-id").unwrap();
+                    assert_eq!(flag, args.len() - 3);
+                    let id = args.remove(flag + 1);
+                    args.remove(flag);
+                    assert_eq!(args, expected);
+                    assert!(crate::internal_session::is_internal_session_id(&id));
+                    assert_ne!(id, previous);
+                    previous = id;
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn pi_verification_refreshes_and_repopulates_shell_cache() {
+        let root = control_test_root("pi-verify-shell-cache");
+        let fake_pi = fake_binary_path(&root, "pi");
+        fs::write(
+            &fake_pi,
+            "#!/bin/sh\n[ \"$GOOGLE_CLOUD_PROJECT\" = refreshed ]\n",
+        )
+        .expect("fake pi");
+        fs::set_permissions(&fake_pi, fs::Permissions::from_mode(0o755)).unwrap();
+        let _search = EnvVarGuard::set_path("OTTTO_COMMAND_SEARCH_PATH", fake_pi.parent().unwrap());
+        let _project = EnvVarGuard::remove("GOOGLE_CLOUD_PROJECT");
+        let (_, imports) = crate::command_env::test_shell_env::with_output(
+            Some(b"GOOGLE_CLOUD_PROJECT=old\n"),
+            || {
+                let start = Instant::now();
+                crate::command_env::test_shell_env::set_now(start);
+                assert_eq!(
+                    crate::command_env::provider_env()["GOOGLE_CLOUD_PROJECT"],
+                    "old"
+                );
+                crate::command_env::test_shell_env::set_now(start + Duration::from_secs(1));
+                crate::command_env::test_shell_env::set_output(Some(
+                    b"GOOGLE_CLOUD_PROJECT=refreshed\n",
+                ));
+                assert!(
+                    run_bounded_command("pi", &[], Duration::from_secs(5), "Pi", None).succeeded
+                );
+                crate::command_env::test_shell_env::set_output(None);
+                assert_eq!(
+                    crate::command_env::provider_env()["GOOGLE_CLOUD_PROJECT"],
+                    "refreshed"
+                );
+            },
+        );
+        assert_eq!(imports, 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     #[serial]
     fn pi_smoke_timeout_does_not_wait_on_inherited_pipe() {
         let root = control_test_root("pi-smoke-held-pipe");
@@ -27689,6 +28333,10 @@ for line in sys.stdin:
             (
                 SourceVerificationStatus::Warning,
                 CLAUDE_LOGIN_REFRESH_PENDING_CODE,
+            ),
+            (
+                SourceVerificationStatus::Warning,
+                crate::agent_status::CLAUDE_OTTTO_SIGNED_IN,
             ),
             (SourceVerificationStatus::Warning, SOURCE_NOT_INSTALLED_CODE),
             (
@@ -29142,6 +29790,82 @@ X-API-Key = "otel_redacted"
         let _ = fs::remove_dir_all(&root);
     }
 
+    thread_local! {
+        pub(super) static SETUP_SCAN_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[test]
+    #[serial]
+    fn setup_pause_filters_probes_and_cancels_claimed_actions_for_all_sources() {
+        let _lock = lock_backend_test_env();
+        let root = control_test_root("setup-paused-sources");
+        let support = root.join("support");
+        fs::create_dir_all(support.join("snapshots")).unwrap();
+        let _home = EnvVarGuard::set_path("HOME", &root);
+        let _commands = EnvVarGuard::set_path("OTTTO_COMMAND_SEARCH_PATH", &root.join("bin"));
+        let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        for source in [SourceKind::ClaudeCode, SourceKind::Codex, SourceKind::Pi] {
+            let slug = source_slug(&source);
+            let marker = support.join(format!("snapshots/{slug}.source-disabled"));
+            fs::write(&marker, "pending").unwrap();
+            SETUP_SCAN_PROBES.with(|count| count.set(0));
+            assert!(build_local_scan(&test_machine(), vec![source.clone()])
+                .sources
+                .is_empty());
+            fs::remove_file(&marker).unwrap();
+            fs::create_dir(&marker).unwrap();
+            assert!(build_local_scan(&test_machine(), vec![source])
+                .sources
+                .is_empty());
+            assert_eq!(SETUP_SCAN_PROBES.with(|count| count.get()), 0);
+            fs::remove_dir(&marker).unwrap();
+            fs::write(&marker, "pending").unwrap();
+        }
+        assert!(build_local_scan(&test_machine(), vec![]).sources.is_empty());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            for i in 0..11 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_complete_http_request(&mut stream);
+                if request.contains("/complete") {
+                    assert!(request.contains("cancelled") && request.contains("source_paused"));
+                }
+                let source = ["claude_code", "codex", "pi"].get(i / 3).copied();
+                let body = json!({
+                    "action": source.map(|source| json!({"id":"action", "action_type":"verify_source", "source":source})),
+                    "run": {"id":"run", "status":"completed", "machine_id":null},
+                    "sources":[], "next_action":null, "next_question":null,
+                });
+                write_json_response(&mut stream, 200, "OK", &body.to_string());
+            }
+        });
+        let mut credentials = SetupRunCredentials {
+            setup_run_token: "synthetic".into(),
+            connection: LocalConnectionBinding {
+                setup_run_id: "run".into(),
+                api_base_url: base.clone(),
+                setup_run_token_expires_at: "".into(),
+                machine_id: None,
+                claim_code: None,
+            },
+        };
+        let results =
+            process_setup_actions(&daemon(), &base, &mut credentials, &test_machine()).unwrap();
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(|action| action.status == "cancelled"));
+        server.join().unwrap();
+        fs::remove_dir_all(support.join("snapshots")).unwrap();
+        fs::create_dir_all(root.join(".codex")).unwrap();
+        fs::write(root.join(".codex/config.toml"), "model = \"synthetic\"\n").unwrap();
+        let scan = build_local_scan(&test_machine(), vec![SourceKind::Codex]);
+        assert!(scan.sources[0].detected);
+        let _admin = EnvVarGuard::set_str("OTTTO_PATCH_CODEX_DISABLED", "1");
+        assert!(build_local_scan(&test_machine(), vec![SourceKind::Codex])
+            .sources
+            .is_empty());
+    }
+
     #[test]
     #[serial]
     fn source_patch_disabled_parses_per_source_truthy_values() {
@@ -29849,8 +30573,7 @@ X-API-Key = "otel_redacted"
             succeeded: false,
             exit_status: Some(1),
             duration_ms: 12,
-            message: "Claude Code smoke session failed before verification could complete."
-                .to_string(),
+            message: "The Claude Code test run failed before Ottto could check it.".to_string(),
             diagnostic: Some(
                 "Failed to authenticate: OAuth session expired and could not be refreshed"
                     .to_string(),
@@ -29873,7 +30596,21 @@ X-API-Key = "otel_redacted"
     }
 
     #[test]
+    #[serial]
     fn claude_signed_out_smoke_requires_provider_sign_in() {
+        let _lock = lock_backend_test_env();
+        let root = control_test_root("claude-ottto-connected-smoke");
+        let fake_claude = fake_binary_path(&root, "claude");
+        fs::write(&fake_claude, "#!/bin/sh\n: > \"$HOME/spawned\"\necho 'Not logged in · Please run /login' >&2\nexit 1\n").unwrap();
+        let fake_security = fake_binary_path(&root, "security");
+        fs::write(&fake_security, "#!/bin/sh\nexit 44\n").unwrap();
+        for path in [&fake_claude, &fake_security] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _home = EnvVarGuard::set_path("HOME", &root);
+        let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
+        let _search =
+            EnvVarGuard::set_path("OTTTO_COMMAND_SEARCH_PATH", fake_claude.parent().unwrap());
         for diagnostic in [
             "Not logged in · Please run /login",
             "not signed in",
@@ -29916,6 +30653,116 @@ X-API-Key = "otel_redacted"
                 vec![(SourceKind::ClaudeCode, true)]
             );
         }
+        let daemon = daemon().with_account(connected_account());
+        let snapshot: AgentStatusSnapshot = serde_json::from_value(json!({
+            "source": "claude_code", "status": "available", "collection_method": "command_probe",
+            "captured_at": "2026-11-13T00:00:00Z", "expires_at": "2026-11-13T00:15:00Z",
+            "account": {"login_state": "signed_out", "confidence": "low"},
+            "diagnostics": [{"code": crate::agent_status::CLAUDE_OTTTO_SIGNED_IN,
+                "severity": "info", "message": "1 Claude account signed in through Ottto"}]
+        }))
+        .unwrap();
+        let mut initial = verification_result(
+            SourceKind::ClaudeCode,
+            SourceVerificationStatus::Failed,
+            false,
+            0,
+            None,
+            None,
+            None,
+            "smoke_command_failed",
+            "old failed check",
+        );
+        for (code, clears) in [
+            ("smoke_command_failed", false),
+            (CLAUDE_OAUTH_REAUTH_REQUIRED_CODE, true),
+        ] {
+            initial.message.code = code.into();
+            daemon.record_verification_result(&initial).unwrap();
+            daemon.record_agent_status_health(snapshot.clone()).unwrap();
+            let status = daemon.status("token").unwrap();
+            assert_eq!(
+                status.sources[0].state,
+                if clears {
+                    ottto_protocol::SourceState::NeedsConfirmation
+                } else {
+                    ottto_protocol::SourceState::Failed
+                }
+            );
+            if clears {
+                let canonical = status.canonical_health.unwrap();
+                assert_ne!(
+                    canonical.overall.next_action.as_deref(),
+                    Some("finish_source_setup")
+                );
+            }
+        }
+        assert_eq!(daemon.claude_verification_auth_marker().unwrap(), None);
+        assert!(!root.join("spawned").exists());
+        let smoke = run_verification_smoke_prompt(&daemon, &SourceKind::ClaudeCode).unwrap();
+        assert_eq!(smoke.duration_ms, 0);
+        assert_eq!(smoke.exit_status, None);
+        assert!(!root.join("spawned").exists());
+        assert_eq!(daemon.claude_verification_auth_marker().unwrap(), None);
+        initial = smoke_failure_verification_result(SourceKind::ClaudeCode, &smoke, None);
+        attach_verification_check(&mut initial);
+        assert_eq!(initial.status, SourceVerificationStatus::Warning);
+        assert!(!initial.verified);
+        assert_eq!(
+            initial.message.code,
+            crate::agent_status::CLAUDE_OTTTO_SIGNED_IN
+        );
+        assert_eq!(
+            initial.check.as_ref().unwrap().scope,
+            SourceVerificationScope::NotEstablished
+        );
+        daemon.record_verification_result(&initial).unwrap();
+        let status = daemon.status("token").unwrap();
+        let health = &status.sources[0];
+        assert_eq!(health.state, ottto_protocol::SourceState::NeedsConfirmation);
+        assert_eq!(health.grade, ottto_protocol::HealthGrade::Warning);
+        assert_eq!(health.problems.len(), 1);
+        assert_eq!(
+            health.problems[0].code,
+            ottto_protocol::StableProblemCode::AgentCliUnavailable
+        );
+        assert!(health.recommended_actions.is_empty());
+        assert!(daemon
+            .blocking_verification_retry_states()
+            .unwrap()
+            .is_empty());
+        let canonical_health = status.canonical_health.unwrap();
+        assert_ne!(
+            canonical_health.overall.severity,
+            ottto_protocol::LocalHealthSeverity::Blocking
+        );
+        assert_ne!(
+            canonical_health.overall.next_action.as_deref(),
+            Some("finish_source_setup")
+        );
+        let canonical = &canonical_health.sources[0];
+        assert_eq!(
+            canonical.state,
+            ottto_protocol::LocalHealthSourceState::PendingSetup
+        );
+        assert!(canonical.next_action.is_none());
+        for (has_slot, login) in [(false, "signed_out"), (true, "unsupported")] {
+            let mut saved = serde_json::to_value(&snapshot).unwrap();
+            saved["account"]["login_state"] = json!(login);
+            if !has_slot {
+                saved["diagnostics"] = json!([]);
+            }
+            daemon.state().unwrap().sources[0].agent_status =
+                Some(serde_json::from_value(saved).unwrap());
+            let smoke = run_verification_smoke_prompt(&daemon, &SourceKind::ClaudeCode).unwrap();
+            assert!(root.join("spawned").exists());
+            assert_eq!(
+                smoke.error_code.as_deref(),
+                Some(CLAUDE_OAUTH_REAUTH_REQUIRED_CODE)
+            );
+            fs::remove_file(root.join("spawned")).unwrap();
+        }
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -33223,3 +34070,7 @@ X-API-Key = "otel_redacted"
 
     mod claude_settings;
 }
+
+#[cfg(all(test, unix))]
+#[path = "control_smoke_session_tests.rs"]
+mod smoke_session_tests;

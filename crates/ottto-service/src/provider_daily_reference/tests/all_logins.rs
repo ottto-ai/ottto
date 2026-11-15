@@ -597,7 +597,7 @@ fn a_failed_admission_save_makes_no_request() {
     );
 }
 
-/// [money] A2 per login: with the clock passing UTC midnight between two
+/// [money] per login B: with the clock passing UTC midnight between two
 /// logins, each read's `coverage_end` is the last complete day at its own
 /// `collected_at`.
 #[test]

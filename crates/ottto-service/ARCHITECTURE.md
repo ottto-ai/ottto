@@ -105,8 +105,11 @@ file-system hint / periodic listing → select file → read new bytes from save
   The original in-folder census wait still expires on its third decision.
   An all-covered copy-only page drops its items when the session has another
   file; own turns still publish. A selected content twin pulls at most its
-  earliest accepted main holder. Frozen seeds prevent cascading pulls, and
-  ordinary discovery acquires the holder without an extra seed content read.
+  earliest accepted main holder, and a selected holder (not history-held)
+  pulls the content twins it is that holder for, so neither file publishes
+  the session without the other. A holder is never a twin, so pulls never
+  cascade, and ordinary discovery acquires the pulled file without an extra
+  seed content read.
   Money rule three selects content twins, path twins and disclosed main
   files once, using every census hash and one in-memory census walk without
   a deadline. Only a candidate sharing ids with an earlier accepted holder
@@ -129,6 +132,13 @@ file-system hint / periodic listing → select file → read new bytes from save
   exact stamp under the active upload context. Claude records those stamps under its resumed
   mode while unaffected file receipts use the base context. A copy-capability change therefore
   conservatively re-sends unchanged files once.
+
+Telemetry-only Claude uploads require the advertised head-CAS capability and the
+exact telemetry contract and pairing window. They declare head CAS in isolated
+requests, without cache patches or cache-state ACK negotiation. Growth carries
+the saved ACK head etag; an owed conflict challenge replaces that base in the
+semantic envelope after the ordinary evidence chunk rebuilds the telemetry body.
+Normal source requests retain their existing batch classes and ACK contracts.
 
 Stale-older refusals from current servers mean the server already holds the
 newer usage. Earlier refusals stay counted as owed, with their dispositions
@@ -182,8 +192,11 @@ Desktop metadata cache.
 The process-owned transcript cache retains complete Codex home facts in RAM,
 using the shared file stamp for the resolved SQLite main file and its WAL.
 Every pass lists the homes and rebuilds metadata merges, ownership conflicts,
-completeness and path fingerprints. Roster changes, changed inputs and partial
-loads reload the complete title group. Changed thread databases use one
+completeness and path fingerprints. A home whose stamps match is reused; only
+changed or added homes reload, and an unstamped or incomplete home is not kept.
+A pass that reuses a home and ends with an identity conflict, or with changed
+merged title inputs for a reused home's ids, reloads every home cold once.
+Changed thread databases use one
 streaming census with independent staging for title, usage and created rows.
 Raw title equality uses an optional digest; a SHA midstate preserves the exact
 existing fingerprint bytes after the merged title prefix is known.
@@ -210,6 +223,11 @@ Cached login facts contain no account, email, plan or identity. Auth-file and
 provider identity reads and config-model application keep their ordinary freshness.
 Claude version detection uses the same helper with only its binary stamp. Pi
 model listings remain uncached because their output depends on Pi config/auth.
+The allowlisted zsh login-shell provider environment is shared in process memory
+for 30 minutes per effective HOME, including failed imports. Concurrent callers
+share one bounded import; current process values are merged afresh and win.
+Pi verification and explicit status refresh re-import and repopulate it.
+Environment values are never logged or persisted.
 
 The status read of each source's active-session reconciliation uses the same
 helper, keyed by its cache file. Every local request builds status, so the
@@ -316,7 +334,17 @@ flags. This paces work without dropping data or claiming a hard process-memory b
 resident deferral, or a selection that filled its file allowance while source work remains queued,
 requests another ordinary pass after 30 seconds on AC or 180 seconds on battery with Low Power
 Mode off. Unknown power and Low Power Mode retain ordinary cadence.
+A same-process re-walk after completion or a clean-follow-up retirement keeps routine
+cadence. A terminal-unhealthy retry also runs at routine cadence when its problems are
+file-level only: no namespace loss, directory cap, rejected symlink or watcher overflow.
+Retry arming needs no same-process evidence: after a restart or upgrade, a kept
+terminal-unhealthy traversal's first eligible retry walk is routine under those conditions.
+The active routine marker is process-local and binds the scan context and census window;
+resuming an unfinished walk after restart does not restore it. Resident deferral can still
+request pacing.
 Prepare, finish, server minima, upload backoff and background QoS still apply.
+During a first backfill (not a replay revision bump), a Codex page that spent a byte budget with
+work still queued also requests a paced pass.
 
 ## SQLite
 

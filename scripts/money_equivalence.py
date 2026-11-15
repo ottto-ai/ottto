@@ -30,7 +30,7 @@ NATIVE_FIXTURES = frozenset({
     "progressive_response", "duplicate_request_ids", "resolver_conflict",
     "quiet_sidecar_growth", "side_owner", "side_without_owner",
     "side_owner_directory_unlisted", "failed_then_healthy_telemetry",
-    "codex_v2_sticky", "codex_legacy_acked_sticky",
+    "codex_v2_sticky", "codex_legacy_acked_sticky", "subagent_twin_slack_tail",
 })
 # New native fixtures: the head must emit each one; the base may not have it
 # yet. A name the base does not emit is UNCOMPARED (the head's VERIFIED receipt

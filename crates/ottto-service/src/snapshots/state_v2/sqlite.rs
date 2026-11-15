@@ -23,6 +23,10 @@ const MMAP_BYTES: i64 = 2_147_418_112;
 const CACHE_KIB: i64 = -8192;
 const BUSY: Duration = Duration::from_millis(100);
 const PAGE_HEADERS: usize = 128;
+const JOURNAL_LIMIT_BYTES: i64 = 16 * 1024 * 1024;
+const _: () = assert!(
+    (JOURNAL_LIMIT_BYTES as u64) < WAL_PASSIVE_BYTES && WAL_PASSIVE_BYTES < WAL_ALARM_BYTES
+);
 
 impl Table {
     fn name(self) -> &'static str {
@@ -497,14 +501,14 @@ fn pragmas(conn: &Connection, import: bool, checkpoint: Checkpoint) -> Result<()
     };
     conn.set_prepared_statement_cache_capacity(32);
     conn.busy_timeout(BUSY)?;
-    conn.execute_batch(&format!("PRAGMA synchronous=FULL; PRAGMA fullfsync=ON; PRAGMA checkpoint_fullfsync=ON; PRAGMA secure_delete=ON; PRAGMA wal_autocheckpoint={autocheckpoint}; PRAGMA journal_size_limit=16777216; PRAGMA cache_size={CACHE_KIB}; PRAGMA mmap_size={MMAP_BYTES}; PRAGMA temp_store=FILE; PRAGMA soft_heap_limit=50331648;"))?;
+    conn.execute_batch(&format!("PRAGMA synchronous=FULL; PRAGMA fullfsync=ON; PRAGMA checkpoint_fullfsync=ON; PRAGMA secure_delete=ON; PRAGMA wal_autocheckpoint={autocheckpoint}; PRAGMA journal_size_limit={JOURNAL_LIMIT_BYTES}; PRAGMA cache_size={CACHE_KIB}; PRAGMA mmap_size={MMAP_BYTES}; PRAGMA temp_store=FILE; PRAGMA soft_heap_limit=50331648;"))?;
     for (name, expected) in [
         ("synchronous", 2_i64),
         ("fullfsync", 1),
         ("checkpoint_fullfsync", 1),
         ("secure_delete", 1),
         ("wal_autocheckpoint", autocheckpoint),
-        ("journal_size_limit", 16 * 1024 * 1024),
+        ("journal_size_limit", JOURNAL_LIMIT_BYTES),
         ("cache_size", CACHE_KIB),
         ("mmap_size", MMAP_BYTES),
         ("temp_store", 1),
@@ -593,8 +597,12 @@ impl Sqlite {
         }
         Ok(())
     }
+    /// Between passes: commit the clean marker (FULL + fullfsync) unless
+    /// checkpoint debt remains. The WAL is not truncated here; maintenance
+    /// checkpoints it by size. Committed frames behind the marker replay at
+    /// the next open, and any later write first commits `phase` 1.
     pub(super) fn clean_checkpoint(&mut self) -> Result<()> {
-        if self.checkpoint(CheckpointMode::IdleReclaim).state == CheckpointState::Complete {
+        if !self.clean && !self.debt {
             self.control("phase", &0_u8)?;
             self.clean = true;
         }
@@ -972,6 +980,9 @@ impl Sqlite {
             });
         }
         self.stats.checkpoint(mode, state);
+        if let (Some(log), Some(done)) = (log, done) {
+            telemetry::wal_checkpoint_counts(log, done);
+        }
         CheckpointResult {
             state,
             log_frames: log,
@@ -1930,3 +1941,5 @@ mod open_check_tests;
 mod fixtures;
 #[cfg(test)]
 pub(super) use fixtures::*;
+#[cfg(test)]
+mod checkpoint_tests;

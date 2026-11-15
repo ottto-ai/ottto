@@ -1032,7 +1032,8 @@ pub(crate) fn is_request_owned_literal(item: &super::SnapshotItem) -> bool {
 /// The Claude family root a request-owned literal body uploads with; `None`
 /// for every other body. Typed: no serialization.
 pub(crate) fn request_owned_family_root(item: &super::SnapshotItem) -> Option<&str> {
-    is_request_owned_literal(item).then(|| super::claude_snapshot_family_root_ref(item))
+    (item.evidence_basis.is_none() && is_request_owned_literal(item))
+        .then(|| super::claude_snapshot_family_root_ref(item))
 }
 
 /// True when `revision`'s row denies listed families the request-owned

@@ -246,6 +246,7 @@ pub(crate) fn stop_claude_child(
 /// set to that login's config dir (unset for the default login), and no
 /// `CLAUDE_SECURESTORAGE_CONFIG_DIR`, which would select another keychain
 /// item.
+/// Pin the child to its selected configuration directory.
 pub(crate) fn pin_claude_login(command: &mut std::process::Command, slot: &ClaudeConfigDirSlot) {
     match slot.config_dir() {
         Some(config_dir) => command.env("CLAUDE_CONFIG_DIR", config_dir),

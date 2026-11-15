@@ -803,6 +803,11 @@ pub(crate) mod relogin_pipeline_tests {
     include!("relogin_pipeline_tests.rs");
 }
 
+// Same real prepare/finish pipeline; a late Task member's exact hint.
+pub(crate) mod late_member_finish_pipeline_tests {
+    include!("late_member_finish_pipeline_tests.rs");
+}
+
 thread_local! {
     static ACK_POST_SAVE_FAILURE: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
     static ACK_CACHE_PROBE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
