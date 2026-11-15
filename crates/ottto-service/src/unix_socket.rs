@@ -1145,17 +1145,21 @@ mod tests {
     #[serial]
     fn socket_request_counts_its_control_class() {
         let (mut client, server) = UnixStream::pair().expect("socket pair");
+        let command = LocalControlCommand::ClaudeAccountsStatus;
         let request = LocalControlRequest {
             request_id: "req_class".to_string(),
-            protocol_version: LOCAL_CONTROL_PROTOCOL_VERSION,
+            protocol_version: ottto_protocol::expected_local_control_protocol_version(&command),
             token: None,
             client_kind: None,
             client_install_owner: None,
-            command: LocalControlCommand::ClaudeAccountsStatus,
+            command,
         };
         client
             .write_all(&serde_json::to_vec(&request).expect("serialize request"))
             .expect("write request");
+        client
+            .shutdown(std::net::Shutdown::Write)
+            .expect("close request");
         let handler: RequestHandler = Arc::new(|request, _peer| LocalControlResponse {
             request_id: request.request_id,
             ok: true,
