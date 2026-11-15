@@ -3844,8 +3844,17 @@ fn retryable_problem_keeps_the_census_red_and_the_latch_bounded() {
     .expect("first unhealthy generation");
     assert_eq!(first.symlink_rejected_count, 1);
     // The rejected directory prevents proving that either physical file is
-    // the whole logical session, so both remain held before a replacement.
-    assert_eq!(first.ownership_incomplete_file_count, 2);
+    // the whole logical session, so both remain held before a replacement:
+    // the inventory hold owes them, and they add no ownership count.
+    assert_eq!(first.ownership_incomplete_file_count, 0);
+    assert_eq!(
+        index
+            .traversal
+            .as_ref()
+            .and_then(|traversal| traversal.residue.codex_inventory_hold.as_ref())
+            .map(|hold| hold.owed.len()),
+        Some(2)
+    );
     assert!(first.snapshots.is_empty());
     assert!(!first.census_complete);
     assert!(first.scan_cap_hit);
