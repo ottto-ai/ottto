@@ -1244,8 +1244,7 @@ impl Probe {
     ) {
         rearm_cause::completed(self.started, key, mode, bytes);
     }
-    /// `prior` is the bucket frozen at Full selection; `None` (a Codex group
-    /// replay) stays out of the prior-stamp matrix.
+    /// Frozen selection bucket; group replays have none.
     pub(crate) fn full_parse_reason(
         &self,
         mode: crate::transcript_acquisition::ReadMode,
@@ -1254,11 +1253,11 @@ impl Probe {
         count: u64,
         native_bytes: u64,
     ) {
-        if !matches!(mode, crate::transcript_acquisition::ReadMode::Full(_)) {
-            return;
-        }
-        if let Some(prior) = prior {
-            rearm_cause::record_prior_stamp(self.started, reason, prior, count, native_bytes);
+        use crate::transcript_acquisition::ReadMode;
+        if let (ReadMode::Full(_), Some(prior)) = (mode, prior)
+            && (count != 0 || native_bytes != 0)
+        {
+            rearm_cause::record_parse_reason(self.started, reason, prior, count, native_bytes);
         }
     }
     pub(crate) fn full_by_parse_reason(&self) -> claude_reread::FullByParseReason {
@@ -1460,21 +1459,15 @@ impl Probe {
                 counts: Counts { change_reasons },
             });
         }
-        let full_by_prior_stamp = rearm_cause::full_by_prior_stamp(self.started);
+        let full_by_prior_stamp = rearm_cause::take_full_by_prior_stamp(self.started);
         if !full_by_prior_stamp.is_empty() {
-            #[derive(Serialize)]
-            struct Counts {
-                full_by_prior_stamp: claude_reread::FullByPriorStamp,
-            }
             emit(&Record {
                 schema_version: SCHEMA_VERSION,
                 process_id: std::process::id(),
                 stage: "native_full_prior_stamp",
                 source: Source::from_slug(source),
                 observation: Observation::point(),
-                counts: Counts {
-                    full_by_prior_stamp,
-                },
+                counts: BTreeMap::from([("full_by_prior_stamp", full_by_prior_stamp)]),
             });
         }
         jsonl.emit_page_lines(source);
@@ -3681,7 +3674,9 @@ mod tests {
             probe.full_parse_reason(full, Some(Rearmed), unchanged, 1, 0);
             // A group replay carries no frozen stamp and no reason.
             probe.full_parse_reason(full, None, None, 1, 77);
-            for probe in [probe, Probe::start()] {
+            let empty = Probe::start();
+            empty.full_parse_reason(full, Some(Rearmed), unchanged, 0, 0);
+            for probe in [probe, empty] {
                 let mut reads = max_read_counts();
                 reads.page_events.full_by_parse_reason = probe.full_by_parse_reason();
                 collect(&probe, "claude_code", Some(reads));
@@ -3734,7 +3729,9 @@ mod tests {
                     probe.full_parse_reason(full, Some(TranscriptChanged), prior, 1, 0);
                     probe.full_parse_reason(full, Some(TranscriptChanged), prior, 0, 5);
                 }
-                collect(&probe, source, None);
+                let mut reads = max_read_counts();
+                reads.page_events.full_by_parse_reason = probe.full_by_parse_reason();
+                collect(&probe, source, Some(reads));
             }
         });
         let mut expected = serde_json::Map::new();
@@ -3752,6 +3749,15 @@ mod tests {
                 .find(|row| row["stage"] == "native_full_prior_stamp" && row["source"] == source)
                 .unwrap_or_else(|| panic!("{source}"));
             assert_eq!(row["counts"]["full_by_prior_stamp"], expected, "{source}");
+            let page = rows
+                .iter()
+                .find(|row| row["stage"] == "native_collection_page" && row["source"] == source)
+                .unwrap();
+            assert_eq!(
+                page["counts"]["sampled_acquisition"]["page_events"]["full_by_parse_reason"],
+                serde_json::json!({"transcript_changed": {"count": 5, "completed_native_bytes": 25}}),
+                "{source}"
+            );
         }
     }
 
@@ -3817,6 +3823,10 @@ mod tests {
             .values()
             .all(|cells| cells.as_object().unwrap().len() == 4));
         let text = serde_json::to_string(row).unwrap();
+        assert!(
+            text.len() > NATIVE_PAGE_RECORD_TEST_LIMIT,
+            "the full matrix needs a separate record"
+        );
         assert!(
             text.len() < FULL_PRIOR_STAMP_RECORD_TEST_LIMIT,
             "{}",
