@@ -661,6 +661,7 @@ pub(super) fn row_cap_save() {
 #[cfg(test)]
 mod ops_tests {
     use super::*;
+    use crate::snapshots::SnapshotQuarantineRecord;
 
     /// [behaviour] Cold and reused loads emit the hydrate checkpoints in order.
     #[test]
