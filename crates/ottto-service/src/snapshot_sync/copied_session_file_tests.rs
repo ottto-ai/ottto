@@ -520,11 +520,7 @@ fn unrelated_main_and_growing_twin_pull_complete_session() {
                         .get("absent_content_twin"),
                     Some(&1)
                 );
-                assert_eq!(
-                    body(&page, ROOT).is_some(),
-                    !q_pull,
-                    "held items remain until withholding; T alone never emits"
-                );
+                assert_withheld(&page, ROOT, "incomplete content-twin page");
                 if q_pull {
                     assert_eq!(page.disposition.quarantined_entity_count(), 1);
                 }
@@ -738,6 +734,9 @@ fn deferred_main_with_read_content_twin_holds_until_complete() {
             money_oracle::assert_equivalent(&reference, &sent_money(&recovered));
             prior = accept_monotone_page(&c, &prior, recovered, &mut accepted);
             assert_eq!(accepted[ROOT], 7);
+            // Reload drops the runtime context; observe the durable receipts
+            // under the same destination that received this page's exact ACKs.
+            prior.activate_upload_context("e2-synthetic-destination".into());
             assert!(upload_context_receipt_earned_for_test(&prior, &main));
             assert!(upload_context_receipt_earned_for_test(&prior, &twin));
         });
