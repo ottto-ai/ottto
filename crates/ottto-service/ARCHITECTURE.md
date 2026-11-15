@@ -439,10 +439,13 @@ contract. Nothing is persisted. Codex reads the auth mode recorded on its rows a
 allowlisted cloud provider and explicit auth pairs; they keep no latch: each pass takes the first
 route from the earliest hour bucket holding a known route (rows within an hour sort by row key, not
 time), and two known routes there are `signal_conflict`. Claude Code keeps in-memory latches, keyed
-by destination, source, machine and session, only for sessions whose earliest record of any kind is
-strictly after this process started (precise timestamps) and whose first own response is the first
-request classified; any other session, an unstamped start included, is
-`first_request_snapshot_missing` for the whole process and never names a first route. Latches
+by destination, source, machine and session, for known first routes only. Only the session's first
+own response (sequence order, never filtered away) can name one, and only when the session's
+earliest stamped line of any kind (`claude_line_clocks`, inherited and invalid fork lines included)
+is strictly after this process started and that response has a request id, is not synthetic and
+has a complete clock whose start and end are strictly after the start (precise timestamps). Any
+other missing, unstamped or unproven input is `first_request_snapshot_missing`; a later request
+never stands in, and later requests, under the same clock rule, only join `routes_seen`. Latches
 follow one destination at a time, as the source manifests do. The status refresh publishes the
 login evaluator result with when it last changed and when it was last observed; a request is
 classified with it only when it changed at or before the request started (its preceding prompt or

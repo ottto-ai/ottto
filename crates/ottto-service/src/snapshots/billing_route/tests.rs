@@ -31,6 +31,10 @@ struct Req {
     telemetry_account: bool,
     started: i64,
     ended: i64,
+    /// The response's end is stamped.
+    stamped: bool,
+    /// Every record of the response is stamped.
+    complete: bool,
 }
 
 fn req(request: &'static str, message: &'static str) -> Req {
@@ -42,6 +46,8 @@ fn req(request: &'static str, message: &'static str) -> Req {
         telemetry_account: false,
         started: NOW - 90 * SECOND,
         ended: NOW - 60 * SECOND,
+        stamped: true,
+        complete: true,
     }
 }
 
@@ -54,8 +60,8 @@ fn desktop(request: &'static str, message: &'static str, started: i64, ended: i6
     }
 }
 
-/// A Claude item whose earliest record is its first request's preceding
-/// record and whose first response is its first request.
+/// A Claude item whose earliest line is its first request's preceding record
+/// and whose first own response is its first request.
 fn claude_item(session: &str, requests: &[Req]) -> SnapshotItem {
     claude_item_after(session, None, requests)
 }
@@ -65,11 +71,14 @@ fn claude_item(session: &str, requests: &[Req]) -> SnapshotItem {
 fn claude_item_after(session: &str, idless: Option<i64>, requests: &[Req]) -> SnapshotItem {
     let mut item = SnapshotItem {
         source_session_id: session.to_string(),
-        source_started_at: idless
-            .into_iter()
-            .chain(requests.iter().map(|r| r.started))
-            .min()
-            .map(at),
+        // The start witness `start_witness` sets when the producer is on.
+        claude_route_evidence: Some(Box::new(ClaudeRouteEvidence {
+            first_line_ns: idless
+                .into_iter()
+                .chain(requests.iter().map(|r| r.started))
+                .min(),
+            ..ClaudeRouteEvidence::default()
+        })),
         ..SnapshotItem::default()
     };
     if idless.is_some() || !requests.is_empty() {
@@ -88,8 +97,8 @@ fn claude_item_after(session: &str, idless: Option<i64>, requests: &[Req]) -> Sn
                 model: Some(r.model.to_string()),
                 selector: Default::default(),
                 reasoning_effort: None,
-                timestamp: Some(at(r.ended)),
-                event_clock_complete: true,
+                timestamp: r.stamped.then(|| at(r.ended)),
+                event_clock_complete: r.complete,
                 desktop_request: r.desktop,
                 effective_input_context: 0,
                 telemetry_attached: r.telemetry_account,
@@ -433,21 +442,6 @@ fn pre_start_first_request_stays_unknown_across_later_live_requests() {
         assert_eq!(route(&item), unknown("first_request_snapshot_missing"));
         assert!(latches.is_empty());
     }
-    // An earlier `first_own_request_at` closes the session even when the
-    // item's earliest kept request is live.
-    let mut item = claude_item(
-        "s",
-        &[desktop(
-            "req_2",
-            "msg_2",
-            NOW + 10 * SECOND,
-            NOW + 20 * SECOND,
-        )],
-    );
-    item.first_own_request_at = Some(at(NOW - 60 * SECOND));
-    let item = apply(&mut latches, SnapshotSource::ClaudeCode, item, &restarted);
-    assert_eq!(route(&item), unknown("first_request_snapshot_missing"));
-    assert!(latches.is_empty());
 }
 
 /// Precise times: a session whose earliest record falls in the same second
@@ -496,30 +490,49 @@ fn same_second_boundary_is_compared_precisely() {
     assert_eq!(route(&item), known("subscription", "evaluator_snapshot"));
 }
 
-/// Only the session's first request names the first route: an id-less first
-/// response (before or after the start) or an unstamped session start keeps
-/// the session unknown, and a later request never stands in for it.
+/// Only the session's first own response names the first route, and only
+/// with complete, live evidence; a later request never stands in for it.
 #[test]
-fn partial_first_request_evidence_stays_unknown() {
+fn first_request_evidence_must_be_complete() {
     let oauth = context(Some(LoginCandidate::Oauth));
     let later = || desktop("req_1", "msg_1", NOW - 50 * SECOND, NOW - 40 * SECOND);
-    for idless in [STARTED - 60 * SECOND, NOW - 60 * SECOND] {
+    let first = || desktop("req_0", "msg_0", NOW - 90 * SECOND, NOW - 60 * SECOND);
+    let missing = |item: SnapshotItem| {
         let mut latches = Latches::new();
-        let item = apply(
-            &mut latches,
-            SnapshotSource::ClaudeCode,
-            claude_item_after("s", Some(idless), &[later()]),
-            &oauth,
-        );
+        let item = apply(&mut latches, SnapshotSource::ClaudeCode, item, &oauth);
         assert_eq!(route(&item), unknown("first_request_snapshot_missing"));
         assert!(latches.is_empty());
+    };
+    // An id-less first response, before or after the start.
+    for idless in [STARTED - 60 * SECOND, NOW - 60 * SECOND] {
+        missing(claude_item_after("s", Some(idless), &[later()]));
     }
-    let mut item = claude_item("s", &[later()]);
-    item.source_started_at = None;
-    let mut latches = Latches::new();
-    let item = apply(&mut latches, SnapshotSource::ClaudeCode, item, &oauth);
-    assert_eq!(route(&item), unknown("first_request_snapshot_missing"));
-    assert!(latches.is_empty());
+    // An unstamped first response, then a complete later one.
+    let unstamped = Req {
+        stamped: false,
+        ..first()
+    };
+    missing(claude_item("s", &[unstamped, later()]));
+    // An incomplete clock: a stamped partial, then an unstamped terminal.
+    let partial = Req {
+        complete: false,
+        ..first()
+    };
+    missing(claude_item("s", &[partial, later()]));
+    // A fork whose inherited opening predates the start; and no stamped line.
+    for first_line in [Some(STARTED - 60 * SECOND), None] {
+        let mut item = claude_item("s", &[first(), later()]);
+        item.claude_route_evidence = Some(Box::new(ClaudeRouteEvidence {
+            first_line_ns: first_line,
+            ..ClaudeRouteEvidence::default()
+        }));
+        missing(item);
+    }
+    // A clean session that began after the start.
+    assert_eq!(
+        claude_route(Some(LoginCandidate::Oauth), &[first(), later()]),
+        known("subscription", "evaluator_snapshot")
+    );
 }
 
 /// The evaluator changed after the request started: that request has no
@@ -739,6 +752,8 @@ fn off_does_no_route_work() {
             NOW - 60 * SECOND,
         )],
     )];
+    assert!(start_witness(SnapshotSource::ClaudeCode, Some((1, 2))).is_none());
+    let evidence = items[0].claude_route_evidence.clone();
     let before = serde_json::to_value(&items[0]).unwrap();
     annotate_session_billing_routes(
         DEST,
@@ -747,7 +762,7 @@ fn off_does_no_route_work() {
         &mut items,
         Some(SESSION_BILLING_ROUTE_CONTRACT),
     );
-    assert!(items[0].claude_route_evidence.is_none());
+    assert_eq!(items[0].claude_route_evidence, evidence);
     assert_eq!(serde_json::to_value(&items[0]).unwrap(), before);
     with_route_state(|state| {
         assert!(state.process_started_ns.is_none());
