@@ -180,6 +180,20 @@ pub(crate) fn reconcile_observing(
     let activity_ceiling = now + Duration::minutes(5);
     let watermark_cutoff = now - Duration::days(WATERMARK_RETENTION_DAYS);
 
+    // Every witness compares with the persisted baseline, including duplicate
+    // session rows in this batch. The normal watermark updates below stay intact.
+    for snapshot in snapshots {
+        if let Some(activity) = snapshot.source_last_activity_at.as_deref() {
+            observe(
+                activity,
+                cache
+                    .watermarks
+                    .get(&snapshot.source_session_id)
+                    .map(String::as_str),
+            );
+        }
+    }
+
     let mut changed = BTreeMap::<String, ActiveSession>::new();
     let mut selected_snapshots = BTreeMap::new();
     // Recent snapshots this scan re-read without advanced activity. A listed
@@ -193,7 +207,6 @@ pub(crate) fn reconcile_observing(
             continue;
         };
         let previous = cache.watermarks.get(&snapshot.source_session_id).cloned();
-        observe(last_activity, previous.as_deref());
         let advanced = previous
             .as_deref()
             .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
@@ -1693,6 +1706,34 @@ mod tests {
             assert_eq!(
                 read_cache(&active_session_cache_path(&dir, source)).watermarks["existing-session"],
                 "2026-11-16T10:00:00Z"
+            );
+            let mut cache = read_cache(&active_session_cache_path(&dir, source));
+            cache
+                .watermarks
+                .insert("cached-session".into(), "2026-11-15T10:01:00Z".into());
+            write_cache(&active_session_cache_path(&dir, source), &cache).unwrap();
+            let mut witness =
+                ParsedActivityWitness::new(Some("2026-11-15T10:00:00Z"), "2026-11-15T10:01:00Z");
+            reconcile_observing(
+                &dir,
+                source,
+                &[
+                    test_snapshot("cached-session", "2026-11-16T10:00:00Z"),
+                    test_snapshot("cached-session", "2026-11-15T10:01:00Z"),
+                ],
+                None,
+                None,
+                "2026-11-15T10:01:00Z",
+                Some("local"),
+                std::time::Duration::from_secs(300),
+                crate::agent_status::claude_session_registrations,
+                &mut |new, prev| witness.observe(new, prev),
+            )
+            .unwrap();
+            assert_eq!(
+                witness.latest(),
+                None,
+                "a duplicate row must use the original baseline"
             );
             std::fs::remove_dir_all(dir).unwrap();
         }
