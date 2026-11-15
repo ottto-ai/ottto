@@ -270,10 +270,10 @@ pub(crate) fn capture_claude_route_evidence(item: &mut SnapshotItem) {
                 .timestamp
                 .as_deref()
                 .and_then(rfc3339_unix_seconds);
-            if let (Some(from), Some(at)) = (own_from, at) {
-                if at < from {
-                    return None;
-                }
+            if let (Some(from), Some(at)) = (own_from, at)
+                && at < from
+            {
+                return None;
             }
             Some((occurrence.sequence, at, occurrence))
         })
@@ -581,15 +581,15 @@ impl ScanIndex {
                 }
             };
             if billable && !self.session_billing_routes.contains_key(&key) {
-                let login = (source == SnapshotSource::ClaudeCode)
-                    .then(|| {
-                        context.login_for_first_request(
-                            item.claude_route_evidence
-                                .as_ref()
-                                .and_then(|evidence| evidence.first_request_unix),
-                        )
-                    })
-                    .flatten();
+                let login = if source == SnapshotSource::ClaudeCode {
+                    context.login_for_first_request(
+                        item.claude_route_evidence
+                            .as_ref()
+                            .and_then(|evidence| evidence.first_request_unix),
+                    )
+                } else {
+                    None
+                };
                 self.session_billing_routes.insert(
                     key.clone(),
                     SessionBillingRouteFact {

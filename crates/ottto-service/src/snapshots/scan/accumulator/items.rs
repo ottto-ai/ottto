@@ -458,6 +458,8 @@ impl SnapshotAccumulator {
             claude_org_markers: self.claude_org_markers,
             claude_account_withheld_reason: None,
             claude_account_display: None,
+            session_billing_route: None,
+            claude_route_evidence: None,
             session_account_evidence,
             source_session_id: source_session_id.clone(),
             snapshot_fingerprint: String::new(),

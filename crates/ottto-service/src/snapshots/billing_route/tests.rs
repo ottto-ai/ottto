@@ -625,7 +625,7 @@ fn upload_bytes_and_money_fields_unchanged_off_and_additive_on() {
 #[test]
 fn login_candidate_reads_visible_inputs_and_flags_unknown_mode() {
     use LoginCandidate as C;
-    let none = |_: &str| None;
+    let none = |_: &str| -> Option<String> { None };
     let candidate = |layers: &[Value], oauth: bool| {
         let interactive = claude_alternative_auth_layers(layers, &none, oauth, &[], false);
         let print = claude_alternative_auth_layers(layers, &none, false, &[], false);
