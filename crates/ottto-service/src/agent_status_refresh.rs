@@ -594,6 +594,30 @@ pub(crate) fn collection(
         ))),
     }
 }
+/// The setup scan's status row for `source`: the row the upload selected for
+/// the default login in the lane's collection (warm, shared in flight, or one
+/// pass of the existing owner), redacted for the backend. An acquisition error
+/// or no selected row omits it; cached data keeps its own timestamps.
+pub(crate) fn setup_snapshot(
+    source: &SourceKind,
+    captured_at: String,
+    expires_at: String,
+) -> Option<ottto_protocol::AgentStatusSnapshot> {
+    setup_snapshot_of(collection(source, captured_at, expires_at, false))
+}
+
+fn setup_snapshot_of(
+    collection: Result<Arc<AgentStatusCollection>, LocalApiError>,
+) -> Option<ottto_protocol::AgentStatusSnapshot> {
+    Some(
+        collection
+            .ok()?
+            .setup_snapshot()?
+            .clone()
+            .redacted_for_backend(),
+    )
+}
+
 /// Revalidate the existing local auth-file witness immediately before binding
 /// scanned sessions. A cached provider reading cannot attest a later login.
 /// Missing/changed witnesses withhold new ownership; persisted session ownership
@@ -719,6 +743,7 @@ mod tests {
             source_health_snapshot: snapshot,
             codex_scan_homes: Vec::new(),
             codex_home_bindings: Vec::new(),
+            setup_snapshot_index: Some(0),
         }
     }
     fn seconds(n: u64) -> Duration {
@@ -1355,6 +1380,57 @@ mod tests {
         ));
         assert_eq!(lane.state.lock().unwrap().generation, 1);
         assert_eq!(lane.state.lock().unwrap().schedule.next_due, seconds(300));
+    }
+    /// Warm setup scans read the lane's published collection: the same Arc,
+    /// the same captured_at, no new acquisition. A failed or stopped lane,
+    /// or a collection with no selected row, omits the scan's status row.
+    #[test]
+    fn warm_setup_scans_share_the_lane_collection_without_a_new_pass() {
+        let lane = StatusLane::new();
+        let mut acquisitions = 0;
+        assert!(lane.pass(
+            Duration::ZERO,
+            true,
+            || {
+                acquisitions += 1;
+                specimen(SourceKind::Pi)
+            },
+            |_| true,
+            || seconds(7)
+        ));
+        let first = lane.collection_at(seconds(10), false).unwrap();
+        let second = lane.collection_at(seconds(200), false).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        let scans = [seconds(20), seconds(250)].map(|at| {
+            serde_json::to_string(
+                &setup_snapshot_of(lane.collection_at(at, false)).expect("selected row"),
+            )
+            .unwrap()
+        });
+        assert_eq!(scans[0], scans[1]);
+        assert_eq!(
+            scans[0],
+            serde_json::to_string(&first.snapshots[0].clone().redacted_for_backend()).unwrap()
+        );
+        assert!(scans[0].contains("\"captured_at\":\"2026-10-05T00:00:00Z\""));
+        assert_eq!(acquisitions, 1);
+        assert_eq!(lane.state.lock().unwrap().generation, 1);
+
+        let mut unselected = specimen(SourceKind::Pi);
+        unselected.setup_snapshot_index = None;
+        assert!(setup_snapshot_of(Ok(Arc::new(unselected))).is_none());
+        lane.stop();
+        assert!(setup_snapshot_of(lane.collection_at(seconds(260), false)).is_none());
+
+        let failed = StatusLane::new();
+        assert!(failed.pass(
+            Duration::ZERO,
+            true,
+            || panic!("synthetic acquisition panic"),
+            |_| false,
+            || seconds(7)
+        ));
+        assert!(setup_snapshot_of(failed.collection_at(seconds(8), false)).is_none());
     }
     #[test]
     fn explicit_manual_refresh_can_recover_acquisition_during_backoff() {
