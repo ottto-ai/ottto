@@ -3421,11 +3421,18 @@ fn a_raw_only_default_codex_login_is_sent_with_canonical_hashes() {
     assert_eq!(health, unread.snapshot);
 
     // The setup scan's body: the canonical pair, the same bytes when repeated.
-    let setup = collect_agent_status(
+    let setup_collection = collect_agent_status_collection(
         &SourceKind::Codex,
         captured.to_string(),
         expires.to_string(),
     );
+    let setup = setup_collection
+        .setup_snapshot()
+        .expect("setup row")
+        .clone();
+    assert_eq!(setup, setup_collection.snapshots[0]);
+    assert_ne!(setup, setup_collection.source_health_snapshot);
+    assert_eq!(setup_collection.source_health_snapshot, health);
     let mut again = setup.clone();
     codex_canonical_identity_spelling(&mut again);
     assert_eq!(again, setup);
@@ -3734,12 +3741,24 @@ fn a_signed_in_raw_only_codex_row_keeps_is_current_when_filled() {
         );
         assert_eq!(health, candidate.snapshot);
 
-        // The setup body and the main lane's fallback: each fills its own
-        // copy of the source health, which stays as collected.
-        let mut setup = health.clone();
-        codex_canonical_identity_spelling(&mut setup);
-        let mut main = health.clone();
-        codex_canonical_identity_spelling(&mut main);
+        // Setup selects the main lane's filled fallback; source health
+        // stays as collected.
+        let (snapshots, setup_snapshot_index, source_health_snapshot) = codex_status_selection(
+            std::slice::from_ref(&candidate),
+            "2026-08-23T00:00:00Z",
+            "2026-08-23T00:15:00Z",
+        );
+        let collection = AgentStatusCollection {
+            snapshots,
+            source_health_snapshot,
+            codex_scan_homes: Vec::new(),
+            codex_home_bindings: Vec::new(),
+            setup_snapshot_index,
+        };
+        let setup = collection.setup_snapshot().expect("setup row").clone();
+        let main = collection.snapshots[0].clone();
+        assert_ne!(setup, collection.source_health_snapshot);
+        assert_eq!(collection.source_health_snapshot, health);
         assert_eq!(setup, main);
         assert_canonical_fill_of(&health, &setup, &pair);
         assert_eq!(health, candidate.snapshot);
@@ -15610,6 +15629,7 @@ fn claude_status_lane_wakes_for_a_reset_read_behind_the_spacing_gate() {
         source_health_snapshot: snapshot,
         codex_scan_homes: Vec::new(),
         codex_home_bindings: Vec::new(),
+        setup_snapshot_index: None,
     };
     let delay = claude_credit_pools::claude_reset_read_delay_seconds(account, organization);
 
@@ -17844,4 +17864,205 @@ fn binding_mismatch_message_names_plans_only() {
     let unknown = claude_slot_binding_mismatch_message(None, None);
     assert!(unknown.contains("a different Claude account"));
     assert!(unknown.contains("the account it was set up with"));
+}
+
+/// The setup scan sends the row the upload selected for the default login,
+/// byte for byte, read through the refresh lane's `collection`; with no such
+/// row it sends nothing. Never the source-health aggregate.
+#[test]
+fn setup_scan_sends_the_default_logins_selected_row_or_nothing() {
+    let at = "2026-08-23T00:00:00Z";
+    let until = "2026-08-23T00:15:00Z";
+    let scan = |collection: AgentStatusCollection| {
+        let source = collection.source_health_snapshot.source.clone();
+        crate::agent_status_refresh::with_collection(collection, || {
+            serde_json::to_string(&crate::agent_status_refresh::setup_snapshot(
+                &source,
+                at.to_string(),
+                until.to_string(),
+            ))
+            .unwrap()
+        })
+    };
+    let row = |snapshot: &AgentStatusSnapshot| {
+        serde_json::to_string(&Some(snapshot.clone().redacted_for_backend())).unwrap()
+    };
+    let collection =
+        |snapshots: Vec<AgentStatusSnapshot>,
+         source_health_snapshot: AgentStatusSnapshot,
+         setup_snapshot_index: Option<usize>| AgentStatusCollection {
+            snapshots,
+            source_health_snapshot,
+            codex_scan_homes: Vec::new(),
+            codex_home_bindings: Vec::new(),
+            setup_snapshot_index,
+        };
+    // Codex: the scan sends candidate `sent_from`'s row (or nothing), and that
+    // row is the same collection's selected upload row.
+    let codex_case = |candidates: &[CodexSlotCandidate], sent_from: Option<usize>| {
+        let (snapshots, index, health) = codex_status_selection(candidates, at, until);
+        let expected = sent_from.map_or("null".to_string(), |k| row(&candidates[k].snapshot));
+        if let Some(index) = index {
+            assert_eq!(row(&snapshots[index]), expected);
+        }
+        let sent = scan(collection(snapshots, health, index));
+        assert_eq!(sent, expected);
+        sent
+    };
+    let candidate = |slot: &str, account: &str, workspace: &str, quality: u8| {
+        let ownership = if slot == "default" {
+            CodexAccountSlotOwnershipV1::Default
+        } else {
+            CodexAccountSlotOwnershipV1::Managed
+        };
+        codex_candidate_for_test(slot, ownership, account, workspace, quality)
+    };
+    let managed = || candidate("codex_slot_a", "managed_user", "managed_workspace", 5);
+    let signed_out_default = || {
+        let mut default = candidate("default", "unused", "unused", 1);
+        default.binding = None;
+        default.snapshot.status = AgentStatusState::AuthRequired;
+        default.status.state = CodexAccountSlotCollectionStateV1::NeedsLogin;
+        let account = default.snapshot.account.as_mut().expect("account");
+        account.login_state = AgentLoginState::SignedOut;
+        account.account_identifier_hash = None;
+        account.organization_identifier_hash = None;
+        default
+    };
+
+    // Winner: the default binding's own row, not another account's.
+    codex_case(
+        &[
+            candidate("default", "default_user", "default_workspace", 5),
+            managed(),
+        ],
+        Some(0),
+    );
+    // A managed slot that wins the default's binding at equal quality.
+    let mut shadowing = candidate("codex_slot_a", "same_user", "personal_workspace", 5);
+    shadowing.snapshot.status = AgentStatusState::Degraded;
+    codex_case(
+        &[
+            candidate("default", "same_user", "personal_workspace", 5),
+            shadowing,
+        ],
+        Some(1),
+    );
+    // A default marked ShadowedByAnchor that still wins its binding on quality.
+    let mut candidates = vec![
+        candidate("default", "same_user", "personal_workspace", 5),
+        candidate("codex_slot_a", "same_user", "personal_workspace", 4),
+    ];
+    candidates[1].snapshot.status = AgentStatusState::Degraded;
+    canonicalize_codex_candidates(&mut candidates);
+    assert_eq!(
+        candidates[0].status.relationship,
+        Some(CodexAccountSlotRelationshipV1::ShadowedByAnchor)
+    );
+    codex_case(&candidates, Some(0));
+    // Failed-probe default witness at its pushed position, plan words
+    // stripped exactly as the upload strips them.
+    let mut failed = candidate("default", "kept_user", "kept_workspace", 1);
+    failed.binding = None;
+    failed.status.state = CodexAccountSlotCollectionStateV1::IdentityUnknown;
+    failed.snapshot.account.as_mut().expect("account").plan_type = Some("plus".to_string());
+    failed
+        .snapshot
+        .diagnostics
+        .push(AgentStatusDiagnostic::source(
+            "codex_usage_probe_failed",
+            AgentDiagnosticSeverity::Warning,
+            "Codex app-server initialize read timed out.",
+        ));
+    assert!(!codex_case(&[failed, managed()], Some(0)).contains("plus"));
+    // Default unbound beside another selected binding: nothing.
+    codex_case(&[signed_out_default(), managed()], None);
+    // No uploaded row: the existing fallback row at index 0.
+    let (snapshots, index, health) = codex_status_selection(&[signed_out_default()], at, until);
+    assert_eq!((snapshots.len(), index), (1, Some(0)));
+    let expected = row(&snapshots[0]);
+    assert_eq!(scan(collection(snapshots, health, index)), expected);
+
+    // Claude: the default login's aggregate gathers Desktop and registered
+    // account observations past the receiver's 20; the registered slot that
+    // won the default's pair carries one, and only that row is sent.
+    let desktop = |n: u32| {
+        claude_desktop_pair_observation(
+            &(
+                format!("00000000-0000-4000-8000-{n:012}"),
+                format!("00000000-0000-4000-9000-{n:012}"),
+            ),
+            &ClaudeDesktopPairBuilder::default(),
+            1_786_000_000 - i64::from(n),
+            format!("session-{n}"),
+        )
+        .expect("pair")
+    };
+    let claude_row = |binding: &ClaudeStrongBinding| {
+        let mut snapshot = base_snapshot(
+            SourceKind::ClaudeCode,
+            AgentStatusState::Available,
+            AgentStatusCollectionMethod::CliJson,
+            at.to_string(),
+            until.to_string(),
+        );
+        let mut account = unsupported_account("anthropic");
+        account.login_state = AgentLoginState::SignedIn;
+        account.account_identifier_hash = Some(binding.account_identifier_hash.clone());
+        account.organization_identifier_hash = Some(binding.organization_identifier_hash.clone());
+        account.plan_type = Some("max".to_string());
+        snapshot.account = Some(account);
+        snapshot
+    };
+    let own = desktop(100);
+    let mut winner = claude_row(&own.binding);
+    winner.plan_observations = vec![own.observation.clone()];
+    let snapshots = vec![winner, claude_row(&desktop(101).binding)];
+    let mut aggregate = claude_row(&own.binding);
+    append_claude_desktop_plan_observations(
+        &mut aggregate,
+        (0..22).map(|n| desktop(n).observation).collect(),
+    );
+    append_registered_claude_plan_observations(&mut aggregate, &snapshots);
+    assert!(aggregate.plan_observations.len() > CLAUDE_DESKTOP_PAIR_OBSERVATION_MAX);
+    let index = claude_setup_snapshot_index(&snapshots, Some(&own.binding), false);
+    assert_eq!(index, Some(0));
+    let expected = row(&snapshots[0]);
+    let sent = scan(collection(snapshots.clone(), aggregate, index));
+    assert_eq!(sent, expected);
+    let sent: AgentStatusSnapshot = serde_json::from_str(&sent).unwrap();
+    assert_eq!(sent.plan_observations.len(), 1);
+    // Default withheld (no row for its pair) or signed out: never another
+    // account's row.
+    let withheld = ClaudeStrongBinding::new("withheld", "withheld-org").unwrap();
+    assert_eq!(
+        claude_setup_snapshot_index(&snapshots, Some(&withheld), false),
+        None
+    );
+    assert_eq!(claude_setup_snapshot_index(&snapshots, None, false), None);
+    // Desktop only: the sole account-less carrier is the row.
+    let pairs = ClaudeDesktopPairs {
+        pairs: (0..22).map(desktop).collect(),
+        duplicate_sessions: Vec::new(),
+    };
+    let mut carrier = Vec::new();
+    append_claude_desktop_pairs_snapshot(&mut carrier, &pairs, at, until);
+    let index = claude_setup_snapshot_index(&carrier, None, true);
+    assert_eq!((carrier.len(), index), (1, Some(0)));
+    let expected = row(&carrier[0]);
+    assert_eq!(
+        scan(collection(carrier.clone(), carrier[0].clone(), index)),
+        expected
+    );
+
+    // Pi: its singleton.
+    let pi = base_snapshot(
+        SourceKind::Pi,
+        AgentStatusState::Available,
+        AgentStatusCollectionMethod::ConfigFile,
+        at.to_string(),
+        until.to_string(),
+    );
+    let expected = row(&pi);
+    assert_eq!(scan(single_agent_status_collection(pi)), expected);
 }
