@@ -9948,7 +9948,7 @@ fn source_collection(
         if !enabled {
             daemon
                 .clear_tracking_confirmation(&source)
-                .map_err(|_| anyhow!("tracking state unavailable"))?;
+                .map_err(|_| anyhow::anyhow!("tracking state unavailable"))?;
         }
         let (device, secret) = crate::snapshot_client::load_snapshot_device_credentials()?;
         let client = crate::snapshot_client::SnapshotApiClient::new(
