@@ -186,10 +186,12 @@ pub(in crate::snapshots) struct PageBudget {
     /// G1: watcher hints this page's start enqueued as next-generation
     /// evidence, counted in `deferred_next_generation` at the page tick.
     next_generation_hints: u64,
+    /// A file was deferred because a byte budget is spent (`budget_spent`).
+    budget_deferred: bool,
 }
 crate::heap_layout_bound::fields!(PageBudget; cursor_decoded, singleton_decoded,
     disabled_disclosed, page_noted, resume_claimed, window_start, continuation,
-    ordinary_equivalent, deadline, next_generation_hints);
+    ordinary_equivalent, deadline, next_generation_hints, budget_deferred);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::snapshots) enum StartPlan {
@@ -274,6 +276,19 @@ impl PageBudget {
         limits.singleton.saturating_sub(self.singleton_decoded)
     }
 
+    /// The cursor or singleton budget `expected` would be charged to is spent.
+    fn budget_spent(&self, limits: Limits, expected: u64) -> bool {
+        if expected > limits.singleton {
+            self.cursor_exhausted(limits)
+        } else {
+            expected != 0 && self.singleton_decoded.saturating_add(expected) > limits.singleton
+        }
+    }
+
+    pub(in crate::snapshots) fn budget_deferred(&self) -> bool {
+        self.budget_deferred
+    }
+
     /// `expected` is the read this file needs now: its length for a full
     /// read, the appended extent for a tail, zero when unchanged.
     /// `cursor_enabled` is `layout_supported()`.
@@ -287,14 +302,12 @@ impl PageBudget {
         if expected > limits.singleton {
             if !cursor_enabled {
                 StartPlan::Unpaged
-            } else if slot_free && !self.cursor_exhausted(limits) {
+            } else if slot_free && !self.budget_spent(limits, expected) {
                 StartPlan::Cursor
             } else {
                 StartPlan::Defer
             }
-        } else if expected == 0
-            || self.singleton_decoded.saturating_add(expected) <= limits.singleton
-        {
+        } else if !self.budget_spent(limits, expected) {
             StartPlan::Singleton
         } else {
             StartPlan::Defer
@@ -3395,7 +3408,10 @@ impl SharedCache {
         pace: Option<PaceProbe<'_>>,
     ) -> StartPlan {
         let plan = page.plan(limits, expected, slot_free, cursor_enabled);
+        // Only a returned budget Defer counts (not busy, rotation, pace or fence).
+        let spent = plan == StartPlan::Defer && page.budget_spent(limits, expected);
         if !matches!(plan, StartPlan::Cursor | StartPlan::Defer) || expected <= limits.singleton {
+            page.budget_deferred |= spent;
             return plan;
         }
         page.note_page(self);
@@ -3406,7 +3422,7 @@ impl SharedCache {
                 Some((pace_key(&namespace.0, &group_scope(), key), rev))
             });
         let key = rotation_key(&namespace.0, key);
-        self.with_cursor(|cursor| {
+        let planned = self.with_cursor(|cursor| {
             if cursor.rotation.fenced(&key, fence) {
                 cursor.rotation.waiting.remove(&key);
                 cursor.counters.deferred_next_generation += 1;
@@ -3428,8 +3444,10 @@ impl SharedCache {
                 }
             }
             plan
-        })
-        .unwrap_or(plan)
+        });
+        let planned = planned.unwrap_or(plan);
+        page.budget_deferred |= spent && planned == StartPlan::Defer;
+        planned
     }
 
     /// Count a committed attempt once the native finish ran.

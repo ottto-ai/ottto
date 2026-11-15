@@ -162,7 +162,7 @@ pub(crate) use tests::claude_request_account_mixed_fixture;
 pub(crate) use tests::output as claude_request_account_output;
 mod codex_compressed_input;
 mod codex_rollout_carry;
-pub(crate) mod codex_sqlite_read;
+pub(crate) use sources::codex::sqlite_read as codex_sqlite_read;
 #[cfg(test)]
 mod codex_zst_refusal_tests;
 mod compaction_events;
@@ -220,6 +220,8 @@ mod first_read_order_tests;
 mod held_audit_restore_tests;
 #[cfg(test)]
 mod resident_wave_tests;
+#[cfg(all(test, unix))]
+pub(crate) mod resource_fixture;
 pub(crate) use scan::lines::delivery as line_delivery;
 #[cfg(test)]
 use scan::lines::delivery::tests as line_delivery_tests;
@@ -569,6 +571,8 @@ pub struct SourceScanResult {
     pub(crate) page_file_limit_hit: bool,
     /// This process started the generation after a clean census completion.
     pub(crate) routine_recensus: bool,
+    /// Codex deferred a file because a page byte budget is spent.
+    pub(crate) page_byte_budget_hit: bool,
     pub scanned_file_count: usize,
     pub scanned_session_count: usize,
     pub semantic_noop_count: usize,
@@ -2404,10 +2408,8 @@ pub(crate) fn state_v2_prepare_observed() {
 pub(crate) fn state_v2_finish_window() -> Option<impl Drop> {
     state_v2::telemetry::Window::begin("finish")
 }
-pub(crate) fn state_v2_post_pass_observed(
-    relief: crate::local_resource_diagnostics::AllocatorRelief,
-) {
-    state_v2::telemetry::plateau(relief);
+pub(crate) fn state_v2_post_pass_observed() {
+    state_v2::telemetry::plateau();
 }
 
 pub(crate) fn state_v2_custody_published(path: &Path) -> Result<bool> {

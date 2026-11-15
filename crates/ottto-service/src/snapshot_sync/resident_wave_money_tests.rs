@@ -133,7 +133,7 @@ fn drain_from(
             );
         }
         if page.scan.charge_deferred {
-            assert!(continuation::resident_scan_requested(&page.scan));
+            assert!(continuation::resident_scan_requested(&page.scan, false));
         }
         reads += page.scan.scanned_file_count;
         deferred += usize::from(page.scan.charge_deferred);

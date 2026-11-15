@@ -3696,6 +3696,187 @@ fn mixed_class_page_is_equal_and_class_pure_on_every_route() {
     });
 }
 
+/// One head bootstrap of `page` from an empty ledger under optional head CAS
+/// against the backend-shaped head store, which compares and echoes body
+/// witnesses and the cache state. With the fix, each never-settled patched
+/// session is one whole token-less CAS write; without it, every headless
+/// patched body first takes the ordinary probe and its exact CAS repeat.
+/// The route is the main upload only, saved bases removed (head tokens differ
+/// by design), with the post-ACK ledger, the store and the POST count.
+fn cas_bootstrap_route(
+    page: &Page,
+    mode: crate::snapshots::sampled_scan::transition_fixture::Mode,
+    with_fix: bool,
+) -> (
+    crate::snapshots::sampled_scan::transition_fixture::RouteResult,
+    SnapshotUploadProgress,
+    crate::snapshot_sync::tests::class_split_tests::HeadStore,
+    usize,
+) {
+    let mut progress = e2_progress();
+    progress
+        .accepted_identity_buckets
+        .bind_test_key(Some([0x42; 32]));
+    let mut sent = page.scan.snapshots.clone();
+    for item in &mut sent {
+        prepare_snapshot_cache_for_upload(item, &progress, true, false, &BTreeSet::new());
+    }
+    let cas = cas_bootstrap_bodies(&progress, &sent);
+    assert!(
+        sent.iter()
+            .filter(|item| item.cache_observations.is_some())
+            .all(|item| cas.contains(&item.snapshot_fingerprint)),
+        "every patched body is a never-settled session's only body"
+    );
+    let skip = if with_fix { cas } else { BTreeSet::new() };
+    let mut store = crate::snapshot_sync::tests::class_split_tests::HeadStore::default();
+    let mut posts = 0;
+    let probes = sent
+        .iter()
+        .filter(|item| {
+            item.cache_observations.is_some()
+                && item.cache_base_head_etag.is_none()
+                && !skip.contains(&item.snapshot_fingerprint)
+        })
+        .map(cache_head_probe)
+        .collect::<Vec<_>>();
+    assert_eq!(probes.is_empty(), with_fix);
+    if !probes.is_empty() {
+        let deferred = bootstrap_cache_heads(
+            &probes,
+            &unique_poison_scope(),
+            &mut progress,
+            |batch, enforce_head_cas| {
+                posts += 1;
+                let request = request(&batch);
+                let wire = if enforce_head_cas {
+                    serde_json::to_value(request.wire_with_head_cas())?
+                } else {
+                    serde_json::to_value(&request)?
+                };
+                let response = store.post(&request, &wire);
+                response.validate_entity_ack_with_head_cas(&request, enforce_head_cas)?;
+                Ok(response)
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(deferred, 0);
+    }
+    let root_based = |sent: &[SnapshotItem]| {
+        sent.iter()
+            .any(|item| item.source_session_id == ROOT && item.cache_base_head_etag.is_some())
+    };
+    assert!(!root_based(&sent));
+    assert!(apply_bootstrapped_cache_heads_except(
+        SnapshotSource::ClaudeCode.api_slug(),
+        &mut sent,
+        &progress,
+        &skip
+    )
+    .unwrap()
+    .is_empty());
+    assert_eq!(root_based(&sent), !with_fix, "the probe's head");
+    let (status, batches, _) = upload(&sent, &mut progress, |batch| {
+        posts += 1;
+        let request = request(batch);
+        let wire = serde_json::to_value(&request)?;
+        if batch.iter().any(|item| item.source_session_id == ROOT) {
+            assert!(wire["head_cas_contract"].is_string());
+            assert_eq!(wire["cache_state_ack_contract"], "cache_state_ack:v1");
+        }
+        Ok(store.post(&request, &wire))
+    });
+    assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
+    let batches = batches
+        .iter()
+        .map(|bytes| {
+            let mut wire: Value = serde_json::from_slice(bytes).unwrap();
+            for body in wire["snapshots"].as_array_mut().unwrap() {
+                let envelope = body["semantic_envelope"].as_object_mut().unwrap();
+                let base = envelope.remove("base_head_etag");
+                assert!(!with_fix || base.is_none(), "token-less bootstrap");
+            }
+            serde_json::to_vec(&wire).unwrap()
+        })
+        .collect();
+    let unbased = sent
+        .iter()
+        .cloned()
+        .map(|mut item| {
+            item.cache_base_head_etag = None;
+            item
+        })
+        .collect::<Vec<_>>();
+    let mut result = crate::snapshots::sampled_scan::transition_fixture::RouteResult::emitted(
+        mode,
+        SnapshotSource::ClaudeCode,
+        batches,
+        &unbased,
+    );
+    result.modes = page.modes;
+    result.accepted_identity_buckets = Some(
+        serde_json::to_value(
+            sent.iter()
+                .map(|item| {
+                    (
+                        &item.source_session_id,
+                        progress
+                            .accepted_identity_buckets
+                            .get(&item.source_session_id),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>(),
+        )
+        .unwrap(),
+    );
+    (result, progress, store, posts)
+}
+
+/// [money] With and without the one-write head bootstrap, a tagged
+/// multi-account mixed page settles the same accepted usage, placement,
+/// identity buckets, cache states and exact stored bodies; the fix only saves
+/// the two probe POSTs.
+fn assert_cas_bootstrap_parity(page: &Page) {
+    use crate::snapshots::sampled_scan::transition_fixture::{money_oracle, Mode};
+    let (probed, probed_ledger, probed_store, probed_posts) =
+        cas_bootstrap_route(page, Mode::ColdFull, false);
+    let (cas, cas_ledger, cas_store, cas_posts) = cas_bootstrap_route(page, Mode::Restart, true);
+    money_oracle::assert_equivalent(&probed, &cas);
+    assert_eq!(
+        assert_mixed_placement_nonvacuous(&cas),
+        assert_mixed_placement_nonvacuous(&probed),
+        "the gap's placement with and without the fix"
+    );
+    assert_mixed_placement_corruption_detected(&probed, &cas);
+    assert_eq!(
+        cas_ledger.accepted_body_witnesses,
+        probed_ledger.accepted_body_witnesses
+    );
+    assert_eq!(
+        cas_ledger.accepted_cache_states,
+        probed_ledger.accepted_cache_states
+    );
+    assert!(cas_ledger
+        .accepted_cache_states
+        .contains_key(&cache_session_key(ROOT)));
+    assert_eq!(
+        cas_ledger.accepted_identity_buckets,
+        probed_ledger.accepted_identity_buckets
+    );
+    assert_eq!(cas_store.bodies, probed_store.bodies, "same stored bodies");
+    assert!(cas_store.bodies.contains_key(ROOT));
+    assert_eq!(cas_posts, cas.batches.len(), "no probe POST");
+    assert_eq!(probed_posts, cas_posts + 2, "probe and its CAS repeat");
+    assert_eq!(
+        cas_ledger.accepted_cache_heads.keys().collect::<Vec<_>>(),
+        probed_ledger
+            .accepted_cache_heads
+            .keys()
+            .collect::<Vec<_>>()
+    );
+}
+
 /// The mixed page's placement is not vacuous: the patched session's body
 /// holds at least two tagged placements (accounts/organizations) and its
 /// request evidence. A request with no evidence carries, by design, the
@@ -3928,6 +4109,9 @@ fn mixed_class_page_placement_survives_upgrade_and_restarts() {
             other_body.contains(&a) && other_body.contains(&b),
             "two organizations"
         );
+        // The same tagged page from an empty ledger: the head bootstrap with
+        // and without the one-write fix settles equal money and placement.
+        assert_cas_bootstrap_parity(&pages[1]);
 
         // Restart between pages: the upgraded owner's page is accepted and
         // committed; a new owner continues page 2 from that index.
@@ -3974,7 +4158,7 @@ fn mixed_class_page_placement_survives_upgrade_and_restarts() {
         );
         assert_mixed_placement_corruption_detected(&cold_route, &restart_route);
         println!(
-            "MIXED_CLASS_PAGE_PLACEMENT VERIFIED arms=ram_tail,cold_full,upgraded_owner,restart_between_pages"
+            "MIXED_CLASS_PAGE_PLACEMENT VERIFIED arms=ram_tail,cold_full,upgraded_owner,cas_head_bootstrap,restart_between_pages"
         );
     });
 }

@@ -147,7 +147,6 @@ fn bootstrap_cache_heads(
     probes: &[SnapshotItem],
     poison_scope: &str,
     progress: &mut SnapshotUploadProgress,
-    ordinary_bootstrap: bool,
     upload: impl FnMut(Vec<SnapshotItem>, bool) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
     persist: impl FnMut(&mut SnapshotUploadProgress) -> Result<()>,
 ) -> Result<usize> {
@@ -155,7 +154,6 @@ fn bootstrap_cache_heads(
         probes,
         poison_scope,
         progress,
-        ordinary_bootstrap,
         &mut InplaceRetryBudget::default(),
         upload,
         persist,
@@ -169,7 +167,6 @@ fn bootstrap_cache_heads_with_budget(
     probes: &[SnapshotItem],
     poison_scope: &str,
     progress: &mut SnapshotUploadProgress,
-    ordinary_bootstrap: bool,
     inplace_retry: &mut InplaceRetryBudget,
     mut upload: impl FnMut(
         Vec<SnapshotItem>,
@@ -185,12 +182,9 @@ fn bootstrap_cache_heads_with_budget(
     let mut shed = false;
     let result = (|| -> Result<usize> {
         let mut deferred = 0usize;
-        let stages: &[bool] = if ordinary_bootstrap {
-            &[false, true]
-        } else {
-            &[true]
-        };
-        for &enforce_head_cas in stages {
+        // A headless patched body reaches here only when head CAS is optional
+        // and no legacy reconciliation is pending; otherwise prepare strips it.
+        for enforce_head_cas in [false, true] {
             // A prior ordinary body ACK has no head proof. Force the exact probe
             // even when delivery of these bytes was previously acknowledged.
             if enforce_head_cas {
@@ -284,10 +278,57 @@ fn held_cache_head_probe(
     .then_some(probe)
 }
 
+/// Patched bodies of sessions this ledger never settled: no saved head, cache
+/// state or owed challenge for the session, no ACK, hold or refusal for the
+/// body, and the session's only body on the page. Each skips the probe stages
+/// and goes out once, whole, as a token-less head-CAS write: the backend
+/// completes the patch against an empty prior and returns the head and state
+/// echo, or, if it does hold a head, answers a conflict and challenge that
+/// the next page recovers through the ordinary bootstrap.
+fn cas_bootstrap_bodies(
+    progress: &SnapshotUploadProgress,
+    items: &[SnapshotItem],
+) -> BTreeSet<String> {
+    let mut per_session = BTreeMap::<&str, usize>::new();
+    for item in items {
+        *per_session
+            .entry(item.source_session_id.as_str())
+            .or_default() += 1;
+    }
+    items
+        .iter()
+        .filter(|item| {
+            let key = cache_session_key(&item.source_session_id);
+            let fingerprint = &item.snapshot_fingerprint;
+            item.cache_observations.is_some()
+                && item.cache_base_head_etag.is_none()
+                && per_session[item.source_session_id.as_str()] == 1
+                && !progress.accepted_fingerprints.contains(fingerprint)
+                && !progress.quarantined_fingerprints.contains_key(fingerprint)
+                && !progress.permanent_rejections.contains_key(fingerprint)
+                && !progress.accepted_cache_heads.contains_key(&key)
+                && !progress.accepted_cache_states.contains_key(&key)
+                && !progress.head_conflict_challenges.contains_key(&key)
+        })
+        .map(|item| item.snapshot_fingerprint.clone())
+        .collect()
+}
+
+#[cfg(test)]
 fn apply_bootstrapped_cache_heads(
     source: &str,
     snapshots: &mut [SnapshotItem],
     progress: &SnapshotUploadProgress,
+) -> Result<Vec<(String, String, String)>> {
+    apply_bootstrapped_cache_heads_except(source, snapshots, progress, &BTreeSet::new())
+}
+
+/// `cas_bootstrap` bodies (see `cas_bootstrap_bodies`) stay token-less.
+fn apply_bootstrapped_cache_heads_except(
+    source: &str,
+    snapshots: &mut [SnapshotItem],
+    progress: &SnapshotUploadProgress,
+    cas_bootstrap: &BTreeSet<String>,
 ) -> Result<Vec<(String, String, String)>> {
     let mut held = Vec::new();
     for snapshot in snapshots {
@@ -322,7 +363,9 @@ fn apply_bootstrapped_cache_heads(
             .accepted_cache_heads
             .get(&cache_session_key(&snapshot.source_session_id))
             .cloned();
-        if snapshot.cache_base_head_etag.is_none() {
+        if snapshot.cache_base_head_etag.is_none()
+            && !cas_bootstrap.contains(&snapshot.snapshot_fingerprint)
+        {
             return Err(anyhow::Error::new(SnapshotAckRejected {
                 reason: "cache head probe lacks accepted predecessor token",
             }));
@@ -1358,6 +1401,17 @@ fn prepare_snapshot_cache_for_upload(
     head_cas_required: bool,
     legacy_pending: &BTreeSet<String>,
 ) {
+    // Telemetry bodies use head CAS without negotiating cache evidence. Their
+    // predecessor is the exact saved ACK, and they never carry a cache patch.
+    if snapshot.evidence_basis == Some("otel_only") {
+        snapshot.cache_observations = None;
+        snapshot.cache_observations_state = None;
+        snapshot.cache_base_head_etag = progress
+            .accepted_cache_heads
+            .get(&cache_session_key(&snapshot.source_session_id))
+            .cloned();
+        return;
+    }
     if !enabled {
         snapshot.cache_observations = None;
         snapshot.cache_observations_state = None;
@@ -1386,7 +1440,8 @@ fn identity_cache_wire_reserve(
     progress: &SnapshotUploadProgress,
     full_replacement: bool,
 ) -> usize {
-    if snapshot.cache_observations.is_none()
+    if snapshot.evidence_basis != Some("otel_only")
+        && snapshot.cache_observations.is_none()
         && !progress
             .accepted_cache_heads
             .contains_key(&cache_session_key(&snapshot.source_session_id))
@@ -1408,14 +1463,15 @@ fn identity_cache_wire_reserve(
     )
 }
 
-/// Request class of one main-upload body: 2 for a legacy reconciliation,
-/// 1 when it carries a cache patch (admitted, unchanged or partial-empty), 0
-/// otherwise (no patch, birth- or cap-withheld). The client declares head CAS
-/// for a whole request when one body carries a patch, so the packer never
-/// mixes classes: an unpatched body sends no CAS contract and cannot conflict
-/// with a server head it never claimed.
+/// Keep ordinary (0), patched or headed (1), legacy (2), and telemetry-only (3)
+/// requests separate: the head-CAS declaration applies to the entire batch.
+/// Class 1 is a body with a cache patch (admitted, unchanged or partial-empty)
+/// or a saved head; class 0 has neither, sends no CAS contract and cannot
+/// conflict with a server head it never claimed.
 fn snapshot_upload_batch_class(snapshot: &SnapshotItem, legacy: bool) -> u8 {
-    if legacy {
+    if snapshot.evidence_basis == Some("otel_only") {
+        3
+    } else if legacy {
         2
     } else {
         u8::from(crate::snapshot_client::declares_head_cas(snapshot))
@@ -1426,7 +1482,8 @@ fn snapshot_upload_batch_class(snapshot: &SnapshotItem, legacy: bool) -> u8 {
 /// After a validated conflict refuses this exact challenge's answer, only a
 /// re-send of a held conflicted body waits, until that body's own conflict
 /// probe (within one hour); a new revision answers at once. Only a body that
-/// sends the stale base under the head-CAS contract carries the answer; the
+/// declares head CAS carries the answer; telemetry is freshly rebuilt from its
+/// ordinary evidence chunk and needs neither a cache patch nor a saved base. The
 /// body itself, its fingerprint and its witness are unchanged.
 /// `replacement_owed` (negotiated, real-Full session) may also mark the patch
 /// a full replacement when no local cache state exists: that patch already
@@ -1443,9 +1500,10 @@ fn attach_head_conflict_answers(
         if let Some(patch) = snapshot.cache_observations.as_mut() {
             patch.full_replacement = false;
         }
-        // A withheld cache patch keeps its base but sends no CAS contract, so
-        // the request and its ACK validation would not admit a handshake.
-        if snapshot.cache_base_head_etag.is_none() || snapshot.cache_observations.is_none() {
+        // A saved base declares head CAS with or without a patch, and
+        // telemetry declares it with or without a base, so the request and
+        // its ACK validation admit the handshake.
+        if snapshot.evidence_basis != Some("otel_only") && snapshot.cache_base_head_etag.is_none() {
             continue;
         }
         let key = cache_session_key(&snapshot.source_session_id);
@@ -3617,10 +3675,7 @@ fn current_unix_seconds() -> u64 {
         return now;
     }
 
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or_default()
+    crate::scan_clock::utc_seconds()
 }
 
 pub(crate) fn quarantine_retry_after(fingerprint: &str) -> u64 {
@@ -4149,7 +4204,7 @@ fn paced_scan_due() -> Option<Instant> {
 }
 
 fn source_cadence_wait(source: SnapshotSource) -> Option<Duration> {
-    let now = Instant::now();
+    let now = crate::scan_clock::now();
     let wait = with_source_cadence(source, |cadence| negotiated_wait(cadence, now))
         .unwrap_or(Duration::ZERO);
     (!wait.is_zero()).then_some(wait)
@@ -4301,7 +4356,7 @@ fn source_upload_deadlines() -> &'static Mutex<BTreeMap<&'static str, Instant>> 
 
 fn defer_source_uploads(source: SnapshotSource, retry_after: Duration) {
     if let Ok(mut deadlines) = source_upload_deadlines().lock() {
-        let deadline = Instant::now() + retry_after;
+        let deadline = crate::scan_clock::now() + retry_after;
         deadlines
             .entry(source.api_slug())
             .and_modify(|existing| *existing = (*existing).max(deadline))
@@ -4326,7 +4381,7 @@ pub(crate) fn small_source_upload<T>(
 fn source_upload_backoff_remaining(source: SnapshotSource) -> Option<Duration> {
     let mut deadlines = source_upload_deadlines().lock().ok()?;
     let deadline = *deadlines.get(source.api_slug())?;
-    let now = Instant::now();
+    let now = crate::scan_clock::now();
     if deadline <= now {
         deadlines.remove(source.api_slug());
         return None;
@@ -5005,7 +5060,7 @@ struct ContinuationLoop<'a> {
 
 impl continuation::LoopHost for ContinuationLoop<'_> {
     fn now(&mut self) -> Instant {
-        Instant::now()
+        crate::scan_clock::now()
     }
     fn wait(&mut self, wait: Duration) -> bool {
         collect_file_activity_for(
@@ -5067,15 +5122,15 @@ fn collect_file_activity_with_retry(
     mut retry_boundary: impl FnMut(Instant) -> Instant,
     mut read_account: impl FnMut() -> Option<String>,
 ) -> bool {
-    let deadline = Instant::now() + wait;
+    let deadline = crate::scan_clock::now() + wait;
     let mut watcher = watcher;
     loop {
-        let now = Instant::now();
+        let now = crate::scan_clock::now();
         if now >= deadline {
             return false;
         }
         let wake = retry_boundary(deadline).min(deadline);
-        let now = Instant::now();
+        let now = crate::scan_clock::now();
         if now >= deadline {
             return false;
         }
@@ -5085,7 +5140,7 @@ fn collect_file_activity_with_retry(
             Some(Ok(event)) => {
                 let _stage = StageWindow::begin(event.source.api_slug(), "offpass_hint");
                 with_source_cadence(event.source, |cadence| {
-                    cadence.record_file_event(Instant::now())
+                    cadence.record_file_event(crate::scan_clock::now())
                 });
             }
             Some(Err(std::sync::mpsc::RecvTimeoutError::Timeout)) => {}
@@ -5095,10 +5150,10 @@ fn collect_file_activity_with_retry(
                 watcher = None;
             }
         }
-        if account_switch.observe(Instant::now(), &mut read_account) {
+        if account_switch.observe(crate::scan_clock::now(), &mut read_account) {
             eprintln!("local snapshot sync: Claude account switch detected; refreshing now");
             with_source_cadence(SnapshotSource::ClaudeCode, |cadence| {
-                cadence.record_account_switch(Instant::now())
+                cadence.record_account_switch(crate::scan_clock::now())
             });
             return true;
         }
@@ -5344,7 +5399,7 @@ pub fn spawn_failed_verification_reverify(daemon: LocalDaemon) -> Result<()> {
                 schedules
                     .retain(|schedule| failed.iter().any(|(source, _)| source == &schedule.source));
                 for (source, requires_reauth) in failed {
-                    let now = std::time::Instant::now();
+                    let now = crate::scan_clock::now();
                     let index = schedules
                         .iter()
                         .position(|schedule| schedule.source == source)
@@ -5378,7 +5433,7 @@ pub fn spawn_failed_verification_reverify(daemon: LocalDaemon) -> Result<()> {
                             crate::source_slug(&source)
                         ),
                     }
-                    schedule.record_attempt(Instant::now());
+                    schedule.record_attempt(crate::scan_clock::now());
                 }
             }
         })
@@ -5515,7 +5570,7 @@ fn sync_once_with_retry(
         daemon,
         transport_cycle: &mut transport_cycle,
         failed_sources: &mut failed_sources,
-        started: Instant::now(),
+        started: crate::scan_clock::now(),
         codex_started: None,
         paced_qos: None,
         account_witness,
@@ -5755,10 +5810,9 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
         source: SnapshotSource,
         _remaining: Option<usize>,
     ) -> Result<Option<SourcePreparation>> {
-        drop(self.paced_qos.take());
-        self.paced_qos = continuation::paced_source_qos(source, continuation::resident_background);
+        continuation::enter_source_qos(&mut self.paced_qos, source);
         if source == SnapshotSource::Codex {
-            self.codex_started = Some(Instant::now());
+            self.codex_started = Some(crate::scan_clock::now());
             // K2: this prepare's policy replaces any older cached inputs.
             continuation::invalidate_on_ordinary_prepare();
         }
@@ -7870,7 +7924,7 @@ fn finish_sync_source(
         )?;
         let mut telemetry_ledger = upload_progress.telemetry_only.take();
         let reserve_cache_bytes = |item: &SnapshotItem| {
-            if cache_observations_enabled {
+            if cache_observations_enabled || item.evidence_basis == Some("otel_only") {
                 identity_cache_wire_reserve(item, &upload_progress, cache_full_replacement)
             } else {
                 0
@@ -8060,6 +8114,7 @@ fn finish_sync_source(
     #[cfg(test)]
     tests::permanent_finish_pipeline_tests::reason_reoffer_pipeline_tests::prepare_probe_for_test(
         &mut scan_result.snapshots,
+        &mut upload_progress,
     );
     finalize_scan_after_policy_with_body_witness(
         source,
@@ -8295,10 +8350,15 @@ fn finish_sync_source(
         .context_resend
         .retain_candidates(&upload_progress.context_receipt_candidates);
     crate::local_resource_diagnostics::change_reason::propagate(source.api_slug(), &index);
+    let cas_bootstrap = cas_bootstrap_bodies(&upload_progress, &scan_result.snapshots);
     let probes = scan_result
         .snapshots
         .iter()
-        .filter(|item| item.cache_observations.is_some() && item.cache_base_head_etag.is_none())
+        .filter(|item| {
+            item.cache_observations.is_some()
+                && item.cache_base_head_etag.is_none()
+                && !cas_bootstrap.contains(&item.snapshot_fingerprint)
+        })
         .map(cache_head_probe)
         .collect::<Vec<_>>();
     let mut bootstrap_deferred = 0usize;
@@ -8347,15 +8407,10 @@ fn finish_sync_source(
                 }
             }
         };
-        let ordinary_bootstrap = !activity_hint.snapshot_head_cas_required
-            && probes
-                .iter()
-                .all(|item| !legacy_reconciliation_pending.contains(&item.snapshot_fingerprint));
         let bootstrap_result = bootstrap_cache_heads_with_budget(
             &probes,
             source.api_slug(),
             &mut upload_progress,
-            ordinary_bootstrap,
             &mut inplace_retry,
             |snapshots, enforce_head_cas| {
                 let request = snapshot_batch_request(
@@ -8397,10 +8452,11 @@ fn finish_sync_source(
                     .deferred
                     .contains(&item.snapshot_fingerprint)
             });
-            let held = apply_bootstrapped_cache_heads(
+            let held = apply_bootstrapped_cache_heads_except(
                 source.api_slug(),
                 &mut scan_result.snapshots,
                 &upload_progress,
+                &cas_bootstrap,
             )
             .inspect_err(log_bootstrap_failure("apply"))
             .inspect_err(|_| {
@@ -9099,7 +9155,13 @@ fn finish_sync_source(
     with_source_cadence(source, |cadence| {
         cadence.record_scan_success(Instant::now(), accepted)
     });
-    if continuation::resident_scan_requested(&scan_result) {
+    let first_read_bootstrap = backfill_pending
+        && crate::backfill::bootstrap_pending_for_destination(
+            &backfill_state,
+            source,
+            &upload_destination_namespace,
+        );
+    if continuation::resident_scan_requested(&scan_result, first_read_bootstrap) {
         continuation::request_resident_scan(source);
     }
 
@@ -11468,8 +11530,8 @@ where
             catchup_units.push((catchup, family_key));
         }
     }
-    // A request declares head CAS when any body in it carries a cache patch,
-    // so every request is class-pure: an unpatched body never travels under
+    // Cache patches and telemetry bodies declare head CAS for the request,
+    // so every request is class-pure: an ordinary body never travels under
     // another body's CAS contract. Stable-sort each lane by family key so
     // single bodies form one run per class, each family's groups stay
     // contiguous and root first, and a single-class page keeps its order.
@@ -13660,7 +13722,6 @@ mod tests {
             &[probe.clone()],
             &unique_poison_scope(),
             &mut progress,
-            true,
             |items, enforce| {
                 let request = SnapshotBatchRequest {
                     schema_version: SNAPSHOT_SCHEMA_VERSION,
@@ -13881,7 +13942,6 @@ mod tests {
             &ordinary,
             &scope,
             &mut progress,
-            true,
             |items, enforce| {
                 let request = SnapshotBatchRequest {
                     schema_version: SNAPSHOT_SCHEMA_VERSION,
@@ -14178,7 +14238,6 @@ mod tests {
             &[probe],
             &unique_poison_scope(),
             &mut progress,
-            true,
             |items, enforce| {
                 let request = SnapshotBatchRequest {
                     schema_version: SNAPSHOT_SCHEMA_VERSION,
@@ -14673,7 +14732,6 @@ mod tests {
             &off.snapshots,
             &unique_poison_scope(),
             &mut progress,
-            true,
             |items, enforce| response(items, enforce, enforce.then(|| "e".repeat(64))),
             |state| state.save(&progress_path),
         )
@@ -14880,7 +14938,6 @@ mod tests {
             &[probe],
             &unique_poison_scope(),
             &mut progress,
-            true,
             |items, enforce| {
                 stages.push(enforce);
                 let request = SnapshotBatchRequest {
@@ -15016,7 +15073,6 @@ mod tests {
             &[current.clone()],
             &unique_poison_scope(),
             &mut progress,
-            true,
             |items, enforce| {
                 assert!(items[0].cache_observations.is_none());
                 let incoming = revision(&items[0]);
@@ -15077,25 +15133,6 @@ mod tests {
             "e".repeat(64)
         );
         assert_eq!(server_revision, current_revision);
-        // Mandatory-CAS policy cannot take the optional ordinary stage.
-        let mut progress = test_upload_progress();
-        let mut attempts = Vec::new();
-        assert!(bootstrap_cache_heads(
-            &[current],
-            &unique_poison_scope(),
-            &mut progress,
-            false,
-            |_, enforce| {
-                attempts.push(enforce);
-                Err(anyhow!(
-                    "server rejects grown body without predecessor authority"
-                ))
-            },
-            |_| Ok(())
-        )
-        .is_err());
-        assert_eq!(attempts, [true]);
-        assert!(progress.accepted_cache_heads.is_empty());
     }
 
     /// An `unchanged` ACK whose
@@ -15362,7 +15399,6 @@ mod tests {
                 &[item.clone()],
                 &unique_poison_scope(),
                 &mut progress,
-                true,
                 |items, enforce| {
                     stages.push(enforce);
                     assert!(enforce, "ordinary exact bytes were already acknowledged");
@@ -17128,7 +17164,7 @@ mod tests {
         include!("snapshot_sync/e2_upload_tests.rs");
     }
 
-    mod class_split_tests {
+    pub(in crate::snapshot_sync) mod class_split_tests {
         use super::*;
         include!("snapshot_sync/class_split_tests.rs");
     }
@@ -24295,7 +24331,6 @@ mod tests {
                     &f.items[..1],
                     &unique_poison_scope(),
                     &mut f.progress,
-                    false,
                     &mut InplaceRetryBudget::default(),
                     |items, _| {
                         post(items.as_slice());
@@ -25245,3 +25280,6 @@ crate::heap_layout_bound::fields!(HeadConflictChallenge; challenge, stale_revisi
 
 #[cfg(test)]
 mod codex_sidecar_reuse_tests;
+
+#[cfg(all(test, unix))]
+pub(crate) mod resource_schedule;

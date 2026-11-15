@@ -97,6 +97,7 @@ arch = sys.argv[5] or "TODO_arm64_x86_64_or_universal"
 force = sys.argv[6] == "1"
 
 CHECKS = [
+    "resource_soak",
     "release_gate",
     "public_surface_ci",
     "candidate_manifest_download",
@@ -218,6 +219,7 @@ evidence = {
         "verify_via_homebrew_socket": False,
         "owner_prefix_protocol_schema_version_converged": False,
     },
+    "resource_scorecard": {"schema_version": 1, "policy": "resource-stage1-v1", "status": "not_run"},
     "checks": {check: "not_run" for check in CHECKS},
     "operator_notes": [
         "Fill only redacted pass/fail status facts after running stable-candidate RC QA.",
