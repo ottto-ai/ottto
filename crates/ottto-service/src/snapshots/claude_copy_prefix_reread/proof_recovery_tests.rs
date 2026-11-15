@@ -470,6 +470,15 @@ fn chain_counts_shared_ids_once_in_the_accepted_copy() {
             let (mut index, raw) = chain.scan_files(ScanIndex::default());
             let a = local_index_key(&chain.paths[1]);
             fixture::origin_accepted_for_test(&mut index, &a);
+            // This row models an unavailable origin, not an acceptance wait.
+            // A locally counted origin would own the prefix immediately.
+            if chain.paths[0].exists() {
+                let origin_key = local_index_key(&chain.paths[0]);
+                index.file_snapshot_fingerprints.remove(&origin_key);
+                index
+                    .claude_account_deferred_holds
+                    .insert(origin_key, "held".into());
+            }
             let mut scan = raw.clone();
             for _ in 0..3 {
                 scan = raw.clone();

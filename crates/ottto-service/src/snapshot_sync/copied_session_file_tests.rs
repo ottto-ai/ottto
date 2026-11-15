@@ -489,7 +489,21 @@ fn copied_file_version_three_converges_once() {
                 [held_source.clone()],
             ));
             owe(&mut prior);
-            let mut old = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
+            let mut old = c.raw(&E2ScanFixture::default(), prior.clone(), 100, false, &[]);
+            // Model an earlier body whose holder's census could not prove ids.
+            // Rebuild the current census on the later correction read.
+            let holder_census = old
+                .index
+                .claude_request_census_for_test()
+                .get(&holder_key)
+                .unwrap()
+                .clone();
+            e2::pipeline_test_observer::forget_census(&mut old.index, &file(ROOT));
+            old.enrich(&c);
+            old = deliver_page(old);
+            old.index
+                .claude_request_census_mut_for_test()
+                .insert(holder_key.clone(), holder_census);
             old.index
                 .effective_upload_body_witness_revision_exclusions_for_test()
                 .remove(&held_source);

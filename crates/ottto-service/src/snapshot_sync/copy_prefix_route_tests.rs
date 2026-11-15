@@ -143,6 +143,30 @@ fn shared(ledger: &Ledger) -> (u64, u64) {
     (holder, copy)
 }
 
+/// A one-slot census page can visit an unchanged member before the marked
+/// file. Preserve that budget and settle empty pages until the target is read.
+fn next_body_page(
+    c: &Corpus,
+    mut prior: ScanIndex,
+    session: &str,
+    progress: &mut SnapshotUploadProgress,
+) -> Page {
+    let scanner = E2ScanFixture::capturing_identity();
+    for _ in 0..4 {
+        let mut page = c.raw(&scanner, prior.clone(), 1, false, &[]);
+        page.enrich_with(c, Some(&mut progress.accepted_identity_buckets));
+        if body(&page, session).is_some() {
+            return page;
+        }
+        assert!(
+            page.scan.snapshots.is_empty(),
+            "a deferred census slot sends nothing"
+        );
+        prior = settle(c, &prior, page, progress);
+    }
+    panic!("the marked file must be selected after the fixture's census members");
+}
+
 /// Deliver a page as `deliver` does; every exact-ACKed body replaces its
 /// session's ledger entry. Returns the POST count.
 fn deliver_into(page: &mut Page, ledger: &mut Ledger) -> usize {
@@ -614,9 +638,7 @@ fn local_copy_ownership_ack_orders_and_copy_first_restart() {
                             &[ROOT],
                             &[(2, 2)],
                         );
-                        let mut correction =
-                            c.raw(&E2ScanFixture::capturing_identity(), prior, 1, false, &[]);
-                        correction.enrich(&c);
+                        let correction = next_body_page(&c, prior, COPY, &mut progress);
                         prior = acknowledge_ordered(
                             &c,
                             correction,
@@ -761,6 +783,32 @@ fn local_copy_refusal_deletion_and_progress_first_restart() {
                         &page.scan.snapshots,
                         &progress.fresh_context_body_acks,
                     );
+                    // An exact accepted body is suppressed by the uploader.
+                    // Refuse a real newer revision while keeping that ACK.
+                    append(&holder, &resumed(ROOT, &[D]));
+                    let mut grown = c.raw(
+                        &scanner,
+                        page.index.clone(),
+                        100,
+                        false,
+                        std::slice::from_ref(&holder),
+                    );
+                    grown.enrich(&c);
+                    grown.finish();
+                    let newer = body(&grown, ROOT)
+                        .expect("the holder's newer body publishes")
+                        .clone();
+                    assert_ne!(
+                        newer.snapshot_fingerprint,
+                        body(&page, ROOT).unwrap().snapshot_fingerprint
+                    );
+                    page.index = grown.index;
+                    *page
+                        .scan
+                        .snapshots
+                        .iter_mut()
+                        .find(|item| item.source_session_id == ROOT)
+                        .unwrap() = newer;
                 }
                 // A later revision may be refused even after this body earned
                 // its durable file receipt. Neither refusal nor deletion erases it.
@@ -880,14 +928,7 @@ fn copy_first_correction_preserves_native_money_and_placement() {
         source.enrich(&c);
         post(&mut source, &mut progress, 8);
         prior = settle(&c, &prior, source, &mut progress);
-        let mut correction = c.raw(
-            &E2ScanFixture::capturing_identity(),
-            prior.clone(),
-            1,
-            false,
-            &[],
-        );
-        correction.enrich_with(&c, Some(&mut progress.accepted_identity_buckets));
+        let mut correction = next_body_page(&c, prior.clone(), COPY, &mut progress);
         correction.finish();
         assert_eq!(
             body(&correction, COPY).unwrap().removed_request_count,
@@ -917,7 +958,8 @@ fn copy_first_correction_preserves_native_money_and_placement() {
         assert!(accounts(&control) >= 2);
         money_oracle::assert_equivalent(&control, &route(&correction, Mode::Restart));
         post(&mut correction, &mut progress, 6);
-        prior = settle(&c, &prior, correction, &mut progress);
+        let committed = correction.committed.clone();
+        prior = settle(&c, &committed, correction, &mut progress);
         let mut quiet = c.raw(&E2ScanFixture::capturing_identity(), prior, 100, false, &[]);
         quiet.enrich(&c);
         quiet.finish();
@@ -1014,14 +1056,7 @@ fn all_copy_body_replaces_previously_accepted_requests_with_zero() {
         let mut source = c.raw(&scanner, prior.clone(), 1, false, &[holder]);
         source.enrich(&c);
         prior = settle(&c, &prior, source, &mut progress);
-        let mut correction = c.raw(
-            &E2ScanFixture::capturing_identity(),
-            prior.clone(),
-            1,
-            false,
-            &[],
-        );
-        correction.enrich(&c);
+        let mut correction = next_body_page(&c, prior.clone(), COPY, &mut progress);
         correction.finish();
         let zero = body(&correction, COPY).expect("a zero replacement must reach the server");
         assert_eq!(
@@ -1029,7 +1064,8 @@ fn all_copy_body_replaces_previously_accepted_requests_with_zero() {
             (0, Some(2))
         );
         assert_eq!(zero.removed_usage.as_ref().unwrap().input_tokens, 20);
-        prior = settle(&c, &prior, correction, &mut progress);
+        let committed = correction.committed.clone();
+        prior = settle(&c, &committed, correction, &mut progress);
         let quiet = ready(&c, &E2ScanFixture::capturing_identity(), prior, 100, false);
         assert!(body(&quiet, COPY).is_none());
     });
@@ -1231,8 +1267,7 @@ fn refused_holder_mark_survives_progress_only_crash() {
             "refusal and mark publish together after restart"
         );
         assert!(prior.claude_copy_removals.get(copy_key).is_empty());
-        let mut correction = c.raw(&E2ScanFixture::capturing_identity(), prior, 1, false, &[]);
-        correction.enrich(&c);
+        let correction = next_body_page(&c, prior, COPY, &mut progress);
         let copy = body(&correction, COPY).unwrap();
         assert_eq!(
             (copy.request_count, copy.input_tokens, copy.output_tokens),
@@ -1281,8 +1316,7 @@ fn named_parent_with_retired_census_through_pipeline() {
             &(fork_ref(COPY, ROOT) + &resumed(COPY, &[A, B])),
             "2026-08-02T07:03:00Z",
         );
-        let mut branch = c.raw(&E2ScanFixture::capturing_identity(), prior, 1, false, &[]);
-        branch.enrich(&c);
+        let branch = next_body_page(&c, prior, COPY, &mut progress);
         let copy = body(&branch, COPY).expect("the named parent proves the zero replacement");
         assert_eq!(
             (copy.request_count, copy.removed_request_count),
@@ -1337,11 +1371,16 @@ fn held_copy_mark_reads_once_over_ten_pipeline_passes() {
         // Ordinary account-held input, as in the native pipeline hold fixture:
         // an accepted owner binding and a new response without a model.
         crate::snapshots::e2_pipeline_scan_fixture::write_exclusions(&c.support, &[COPY]);
-        append(
-            &path,
-            &line(COPY, "unresolved", "2026-08-02T07:04:00Z", 10)
-                .replace("\"model\":\"claude-haiku-4-5\",", ""),
-        );
+        // Rewrite the native input, as the existing account-hold fixture does.
+        // A Tail continuation inherits its earlier model and cannot model a
+        // missing-model account hold merely by appending an unmodeled line.
+        let mut unresolved: serde_json::Value =
+            serde_json::from_str(&line(COPY, "unresolved", "2026-08-02T07:04:00Z", 10)).unwrap();
+        unresolved["message"]
+            .as_object_mut()
+            .unwrap()
+            .remove("model");
+        std::fs::write(&path, unresolved.to_string() + "\n").unwrap();
         let mut saved = serde_json::to_value(&prior).unwrap();
         let owner = crate::context_footprint::sha256_hex(&[
             "session_owner:v1",

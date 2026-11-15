@@ -142,6 +142,157 @@ fn unscanned_files_do_not_hold_the_copy_prefix() {
     }
 }
 
+/// [regress] A save selects a disagreeing counted copy once. A removal
+/// already decided on this page, and an ordinary overlapping own turn, do
+/// not become new read obligations when their holder commits or is ACKed.
+#[test]
+fn save_marks_only_disagreeing_copy_decisions() {
+    for (removed, disclosed, marked) in [
+        (true, false, false),
+        (false, true, true),
+        (false, false, false),
+    ] {
+        let dir = scratch();
+        let path = copy_at(&dir);
+        let key = local_index_key(&path);
+        let location = location_key(&key);
+        let mut next = index_holding(&dir, &["copy-a"]);
+        let holder = holder_key(&dir);
+        next.files.insert(key.clone(), next.files[&holder].clone());
+        next.file_snapshot_fingerprints
+            .insert(key.clone(), BTreeSet::from(["copy-body".into()]));
+        next.claude_money_birth_store
+            .record_observation(ROOT, &key, t0() + 100_000_000_000);
+        next.claude_money_birth_store.set_money_marks(
+            &key,
+            if removed {
+                money_mark::COPY
+            } else if disclosed {
+                money_mark::DISCLOSED
+            } else {
+                0
+            },
+        );
+        next.claude_request_census_mut_for_test().insert_for_test(
+            &key,
+            ClaudeRequestCensusRecord::synthetic_for_test(
+                &"a".repeat(64),
+                1,
+                ClaudeRequestCensusShape::Exact,
+                vec![claude_request_hash("copy-a")],
+            ),
+        );
+        if removed {
+            next.claude_copy_removals.store(
+                location,
+                BTreeMap::from([(
+                    location_key(&holder),
+                    BTreeSet::from([claude_request_hash("copy-a")]),
+                )]),
+            );
+        }
+        reconcile_copy_ownership(&ScanIndex::default(), &mut next);
+        assert_eq!(next.claude_copy_removals.pending(location), marked);
+        next.claude_copy_removals.clear_hold(location);
+        let previous = CopyOwnership::capture(&next);
+        accepted_receipt(&mut next, &dir);
+        previous.reconcile(&mut next);
+        assert!(
+            !next.claude_copy_removals.pending(location),
+            "an ACK adds no ownership change"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+}
+
+/// [regress] A non-counting in-folder location leads to its session's owner
+/// elsewhere. When that owner commits, the previously counted copy must be
+/// selected even though the local location itself never becomes owned.
+#[test]
+fn save_marks_copy_when_holder_session_gains_an_owner_in_another_folder() {
+    for (different, saved) in [(false, false), (true, false), (false, true), (true, true)] {
+        let dir = scratch();
+        let elsewhere = dir.join("origin");
+        let local = dir.join("local");
+        fs::create_dir_all(&elsewhere).unwrap();
+        fs::create_dir_all(&local).unwrap();
+        let mut next = index_holding(
+            &elsewhere,
+            if different { &["copy-b"] } else { &["copy-a"] },
+        );
+        let holder = holder_key(&elsewhere);
+        let local_holder = local.join(format!("{HOLDER}.jsonl"));
+        let copy = copy_at(&local);
+        for (path, session, birth, counted) in [
+            (local_holder, HOLDER, t0() + 50_000_000_000, false),
+            (copy.clone(), ROOT, t0() + 100_000_000_000, true),
+        ] {
+            let key = local_index_key(&path);
+            next.files.insert(key.clone(), next.files[&holder].clone());
+            next.file_snapshot_fingerprints.insert(
+                key.clone(),
+                if counted {
+                    BTreeSet::from(["copy-body".into()])
+                } else {
+                    BTreeSet::new()
+                },
+            );
+            next.claude_money_birth_store
+                .record_observation(session, &key, birth);
+            next.claude_money_birth_store
+                .set_money_marks(&key, if counted { money_mark::DISCLOSED } else { 0 });
+            let mut hashes = vec![claude_request_hash("copy-a")];
+            if counted && different {
+                hashes.push(claude_request_hash("copy-b"));
+            }
+            hashes.sort_unstable();
+            next.claude_request_census_mut_for_test().insert_for_test(
+                &key,
+                ClaudeRequestCensusRecord::synthetic_for_test(
+                    &"a".repeat(64),
+                    1,
+                    ClaudeRequestCensusShape::Exact,
+                    hashes,
+                ),
+            );
+        }
+        let copy_key = location_key(&local_index_key(&copy));
+        if saved {
+            next.claude_copy_removals.store(
+                copy_key,
+                BTreeMap::from([(
+                    location_key(&local_index_key(&local.join(format!("{HOLDER}.jsonl")))),
+                    BTreeSet::from([claude_request_hash(if different {
+                        "copy-b"
+                    } else {
+                        "copy-a"
+                    })]),
+                )]),
+            );
+        } else if different {
+            // The bridge id's stable historical removal does not hide the new id.
+            next.claude_copy_removals.store(
+                copy_key,
+                BTreeMap::from([(
+                    location_key("historical-holder"),
+                    BTreeSet::from([claude_request_hash("copy-a")]),
+                )]),
+            );
+        }
+        let mut previous = next.clone();
+        previous
+            .file_snapshot_fingerprints
+            .insert(holder.clone(), BTreeSet::new());
+        assert!(!origin_owned(&previous, &[], &holder, true));
+        assert!(origin_owned(&next, &[], &holder, true));
+        reconcile_copy_ownership(&previous, &mut next);
+        assert!(next
+            .claude_copy_removals
+            .pending(location_key(&local_index_key(&copy))));
+        let _ = fs::remove_dir_all(dir);
+    }
+}
+
 /// [money] The grandfather's gates: a resume whose first own response
 /// (provider time) is before `COPY_PROOF_FROM`, settled with its copies
 /// removed and accepted, with no saved removal, keeps that decision with no
