@@ -2212,9 +2212,12 @@ fn codex_source_health_snapshot(
 /// ABSENT hash is set from its raw id with the recipe a provider-validated
 /// binding uses ([`codex_identity_hashes`]); a present hash is never
 /// overwritten, and confidence and billing identity stay as they are. A plan
-/// row filled here leaves its currentness unsaid (`is_current` absent): it is
-/// a weak local reading and must not mark the account's existing profile not
-/// current.
+/// row filled here that said `is_current: false` leaves its currentness
+/// unsaid instead (`is_current` absent): that false only means the local
+/// reading was not confirmed, and sent with the canonical hashes it would mark
+/// the account's existing profile not current. A row that said `true` (a
+/// signed-in High or Medium login, [`append_current_plan_observation`]) is a
+/// correct claim and keeps it, as does a row that said nothing.
 ///
 /// Runs only on the copies that are uploaded: the setup scan's body
 /// ([`collect_agent_status`]) and the main lane's fallback when no home is
@@ -2239,7 +2242,8 @@ fn codex_canonical_identity_spelling(snapshot: &mut AgentStatusSnapshot) {
             observation.organization_id.as_deref(),
             &mut observation.account_identifier_hash,
             &mut observation.organization_identifier_hash,
-        ) {
+        ) && observation.is_current == Some(false)
+        {
             observation.is_current = None;
         }
     }

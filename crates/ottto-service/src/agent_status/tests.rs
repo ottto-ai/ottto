@@ -3356,7 +3356,8 @@ fn codex_row_pair(row: &AgentStatusPlanObservation) -> (Option<String>, Option<S
 }
 
 /// `filled` is `raw` with `pair` added on the account and every plan row,
-/// and those rows' currentness left unsaid; nothing else differs.
+/// and an unconfirmed `is_current: false` on those rows left unsaid; nothing
+/// else differs.
 fn assert_canonical_fill_of(
     raw: &AgentStatusSnapshot,
     filled: &AgentStatusSnapshot,
@@ -3370,7 +3371,9 @@ fn assert_canonical_fill_of(
     for row in &mut expected.plan_observations {
         row.account_identifier_hash = pair.0.clone();
         row.organization_identifier_hash = pair.1.clone();
-        row.is_current = None;
+        if row.is_current == Some(false) {
+            row.is_current = None;
+        }
     }
     assert_eq!(filled, &expected);
 }
@@ -3685,6 +3688,83 @@ fn canonical_codex_identity_fill_adds_only_absent_codex_hashes() {
             row.billing_identity_evidence,
             original.billing_identity_evidence
         );
+    }
+}
+
+/// [money] A signed-in Codex login read with High or Medium confidence and
+/// only raw ids (the `cli_text` row a first pairing can send) keeps its
+/// `is_current: true` when the fill adds its canonical hashes, on the setup
+/// body and on the main lane's fallback copy alike: true is a correct claim
+/// for a signed-in login, and stripping it would never mark the profile
+/// current. Confidence, billing identity and evidence method are kept.
+#[test]
+fn a_signed_in_raw_only_codex_row_keeps_is_current_when_filled() {
+    let pair = (
+        billing_identity_hash("openai", "account", "raw-user"),
+        billing_identity_hash("openai", "workspace", "raw-workspace"),
+    );
+    for confidence in [AgentStatusConfidence::High, AgentStatusConfidence::Medium] {
+        let mut candidate = codex_candidate_for_test(
+            "default",
+            CodexAccountSlotOwnershipV1::Default,
+            "unused",
+            "unused",
+            5,
+        );
+        candidate.binding = None;
+        candidate.status = CodexAccountSlotCollectionStatusV1::default();
+        candidate.snapshot.collection_method = AgentStatusCollectionMethod::CliText;
+        let account = candidate.snapshot.account.as_mut().expect("account");
+        account.account_id = Some("raw-user".to_string());
+        account.organization_id = Some("raw-workspace".to_string());
+        account.account_identifier_hash = None;
+        account.organization_identifier_hash = None;
+        account.confidence = confidence.clone();
+        append_current_plan_observation(&mut candidate.snapshot);
+        assert_eq!(candidate.snapshot.plan_observations.len(), 1);
+        let raw_row = candidate.snapshot.plan_observations[0].clone();
+        assert_eq!(raw_row.is_current, Some(true));
+        assert_eq!(raw_row.evidence_method.as_deref(), Some("cli_text"));
+        assert_eq!(codex_row_pair(&raw_row), (None, None));
+
+        let health = codex_source_health_snapshot(
+            std::slice::from_ref(&candidate),
+            "2026-08-23T00:00:00Z",
+            "2026-08-23T00:15:00Z",
+        );
+        assert_eq!(health, candidate.snapshot);
+
+        // The setup body and the main lane's fallback: each fills its own
+        // copy of the source health, which stays as collected.
+        let mut setup = health.clone();
+        codex_canonical_identity_spelling(&mut setup);
+        let mut main = health.clone();
+        codex_canonical_identity_spelling(&mut main);
+        assert_eq!(setup, main);
+        assert_canonical_fill_of(&health, &setup, &pair);
+        assert_eq!(health, candidate.snapshot);
+
+        for sent in [setup, main] {
+            let uploaded = sent.redacted_for_backend();
+            assert_eq!(
+                codex_account_pair(uploaded.account.as_ref().expect("account")),
+                pair
+            );
+            assert_eq!(uploaded.plan_observations.len(), 1);
+            let row = &uploaded.plan_observations[0];
+            assert_eq!(codex_row_pair(row), pair);
+            assert_eq!(row.is_current, Some(true));
+            assert_eq!(row.confidence, confidence);
+            assert_eq!(row.evidence_method.as_deref(), Some("cli_text"));
+            assert_eq!(
+                row.billing_identity_confidence,
+                raw_row.billing_identity_confidence
+            );
+            assert_eq!(
+                row.billing_identity_evidence,
+                raw_row.billing_identity_evidence
+            );
+        }
     }
 }
 
