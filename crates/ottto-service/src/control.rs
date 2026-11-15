@@ -3399,6 +3399,7 @@ fn remove_codex_account(
     }
     .map_err(codex_account_slot_settings_error)
     .map(crate::agent_status::annotate_codex_accounts_status)
+    .inspect(|_| crate::agent_status_refresh::request_now(&SourceKind::Codex))
 }
 
 fn codex_account_slot_settings_error(error: CodexAccountSlotSettingsError) -> LocalApiError {

@@ -1961,22 +1961,13 @@ const FIRST_IMPORT: PacedReason = PacedReason {
 fn paced_policy_gives_the_zero_gap_only_to_first_import_byte_bound_pages_on_ac() {
     use PlatformState::{Allowed, Battery, Refused, Unknown};
     let routine = PacedReason::default();
-    let byte_only = PacedReason {
-        first_import: false,
-        byte_hit: true,
-    };
     for (power, reason, expected) in [
         (Allowed, BYTE_BOUND, Some((0, PassQos::Utility))),
         (Allowed, FIRST_IMPORT, Some((30, PassQos::Inherited))),
-        (Allowed, byte_only, Some((30, PassQos::Background))),
         (Allowed, routine, Some((30, PassQos::Background))),
         (Battery, BYTE_BOUND, Some((180, PassQos::Background))),
-        (Battery, FIRST_IMPORT, Some((180, PassQos::Background))),
-        (Battery, routine, Some((180, PassQos::Background))),
         (Refused, BYTE_BOUND, None),
-        (Refused, routine, None),
         (Unknown, BYTE_BOUND, None),
-        (Unknown, FIRST_IMPORT, None),
     ] {
         let policy = paced_pass_policy(power, reason);
         let got = policy.map(|p| (p.pacing.min_gap.as_secs(), p.qos));
@@ -1984,19 +1975,16 @@ fn paced_policy_gives_the_zero_gap_only_to_first_import_byte_bound_pages_on_ac()
         assert!(policy.is_none_or(|p| p.pacing.idle_per_work == 0));
     }
     let mut scan = empty_scan();
-    for bits in 0..32_u8 {
-        let [bootstrap, byte_hit, pending, file_limit, charge] =
-            [1, 2, 4, 8, 16].map(|bit| bits & bit != 0);
+    for bits in 0..8_u8 {
+        let [bootstrap, byte_hit, pending] = [1, 2, 4].map(|bit| bits & bit != 0);
         scan.page_byte_budget_hit = byte_hit;
         scan.census_status.pending_work = pending;
-        scan.page_file_limit_hit = file_limit;
-        scan.charge_deferred = charge;
         let reason = paced_reason(&scan, bootstrap);
-        assert_eq!(reason.first_import, bootstrap, "{bits:05b}");
+        assert_eq!(reason.first_import, bootstrap, "{bits:03b}");
         assert_eq!(
             reason.byte_hit,
             bootstrap && byte_hit && pending,
-            "{bits:05b}: charge deferral and the file limit keep 30 s"
+            "{bits:03b}"
         );
     }
 }

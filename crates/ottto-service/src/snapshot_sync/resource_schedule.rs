@@ -110,9 +110,6 @@ pub(crate) fn native_set_qos(class: u32) -> NativeQos {
     assert!(continuation::resource_set_qos(class, 0));
     NativeQos(prior)
 }
-pub(crate) fn native_lowered(class: u32) -> continuation::MacPlatformSignals {
-    continuation::MacPlatformSignals::lowered(class).expect("native QoS set missing")
-}
 pub(crate) fn native_background() -> continuation::MacPlatformSignals {
     continuation::MacPlatformSignals::background()
         .expect("native background QoS observation missing")

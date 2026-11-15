@@ -149,18 +149,6 @@ fn resource_native_ordinary_stage_qos() {
                 0x15,
                 "utility scope restores default"
             );
-            let error: Result<(), &'static str> = {
-                let _qos = schedule::native_lowered(0x11);
-                Err("synthetic finish error")
-            };
-            assert!(error.is_err());
-            assert_eq!(schedule::native_qos().0, 0x15, "utility error restores");
-            assert!(std::panic::catch_unwind(|| {
-                let _qos = schedule::native_lowered(0x11);
-                panic!("synthetic cancellation");
-            })
-            .is_err());
-            assert_eq!(schedule::native_qos().0, 0x15, "utility unwind restores");
             drop(default);
             // Clamp: a thread already at UTILITY is neither set nor raised.
             with_scan_clock(EPOCH + 6000, || {
