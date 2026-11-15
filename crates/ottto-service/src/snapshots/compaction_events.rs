@@ -571,6 +571,9 @@ mod tests {
                     timestamp,
                     event_clock_complete: true,
                     desktop_request: false,
+                    route_native_ids: false,
+                    route_third_party_id: false,
+                    route_telemetry_account: false,
                     effective_input_context: if sequence % 11 == 0 {
                         0
                     } else {

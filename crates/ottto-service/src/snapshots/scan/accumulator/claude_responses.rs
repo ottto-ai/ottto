@@ -91,6 +91,21 @@ impl SnapshotAccumulator {
         &mut self,
         money_context: Option<claude_request_money::e2::ReadContext<'_>>,
     ) {
+        // Route evidence only: each retained key's id shapes by sequence, read
+        // before the book is consumed. Money and every other input ignore it.
+        let route_ids = {
+            let book = &self.claude_responses;
+            book.slot_keys()
+                .into_iter()
+                .zip(book.values())
+                .map(|(key, response)| {
+                    (
+                        response.sequence,
+                        crate::snapshots::billing_route::claude_key_route_ids(key),
+                    )
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
         let (mut responses, selectors) = std::mem::take(&mut self.claude_responses).into_parts();
         responses.sort_by_key(|response| response.sequence);
         // Gate off, the fold keys by hour only: it never reads the selector.
@@ -250,6 +265,13 @@ impl SnapshotAccumulator {
                         event_clock_complete: response.event_clock_complete,
                         desktop_request: response.desktop_request,
                         effective_input_context,
+                        route_native_ids: route_ids
+                            .get(&response.sequence)
+                            .is_some_and(|(native, _)| *native),
+                        route_third_party_id: route_ids
+                            .get(&response.sequence)
+                            .is_some_and(|(_, third_party)| *third_party),
+                        route_telemetry_account: false,
                     },
                 );
                 if self.claude_usage_request_ids.contains(&request_id) || prior_occurrence.is_some()

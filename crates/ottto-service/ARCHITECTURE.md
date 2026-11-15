@@ -430,6 +430,24 @@ context-free, runtime paths and `include!(env!(..))`.
   the same account placement. The money oracle in `snapshots/sampled_scan/transition_fixture.rs`
   and the `money_equivalence` CI job check this.
 
+## Billing route annotation
+
+`snapshots/billing_route.rs` labels each session's billing route (`session_billing_route:v1`).
+It is annotation only: pricing, placement, identity, row keys, hashes, body witnesses and upload
+decisions never read it, and the wire object is sent only when the receiver advertises that exact
+contract. A per-session latch (`setting.billing_route`) sits beside the account bindings in the
+destination's index and is saved with them. Claude Code freezes the login evaluator result once,
+when the session's first request ended after this process started and within the live window;
+otherwise the reason is `first_request_snapshot_missing`, and current settings are never applied
+to history. The evaluator never labels alone: OAuth needs that session's own Desktop request or a
+request whose own telemetry row named a valid account, an API key needs a native `req_`/`msg_`
+pair, and any third-party-shaped model or id keeps a new label unknown. Per-request evidence is
+derived from the response key, model and entrypoint already in the Tail book, so the Tail layout
+is unchanged. Codex reads the auth mode recorded on its rows; Pi accepts only allowlisted cloud
+provider and explicit auth pairs. The first known route never changes; later known routes join
+`routes_seen`. The latch kind is registered before any release writes it, so rolling back to the
+registering release keeps saved latches; `PRODUCER_ENABLED` turns recording on in a later release.
+
 ## One version
 
 - A runtime switch is a support-directory marker, never an environment variable alone, and it is

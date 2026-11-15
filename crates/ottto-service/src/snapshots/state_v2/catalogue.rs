@@ -99,6 +99,8 @@ macro_rules! scan_index_fields {
             claude_usage_authority_quarantine => Accounts (map check_map) ["refusal.authority" => 1] side,
             claude_account_deferred_holds => Accounts (map check_map) ["proof.deferred_account" => 1] side,
             session_account_bindings => Accounts (map check_map) ["setting.binding" => 1] side,
+            // Route latches: registered and preserved even while the producer is off.
+            session_billing_routes => Accounts (map check_map) ["setting.billing_route" => 1] side,
             retired_claude_account_family_pending => Accounts (retired none) ["account_window" => 1, "account.current" => 1, "account.absent_members" => 1, "raw_hold.claude_account_family_pending" => 1] side,
             claude_request_census => Census (hook check_field) ["file.census" => 1] own,
             retired_family_requests => Census (retired none) ["family.requests" => 1] side,

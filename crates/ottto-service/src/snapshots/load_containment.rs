@@ -778,6 +778,7 @@ impl ScanIndex {
         mut carry: ScanIndex,
     ) -> std::result::Result<(), lenient_decode::Error> {
         self.session_account_bindings = carry.session_account_bindings;
+        self.session_billing_routes = carry.session_billing_routes;
         self.claude_account_deferred_holds = carry.claude_account_deferred_holds;
         self.claude_request_identity_contract = carry.claude_request_identity_contract;
         if carry.accepted_snapshot_fingerprint_ledger_version == SNAPSHOT_ACCEPTED_LEDGER_VERSION {

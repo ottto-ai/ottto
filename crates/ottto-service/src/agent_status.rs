@@ -4275,16 +4275,7 @@ fn claude_alternative_auth(
     approved_api_key_suffixes: &[String],
     stored_console_key: bool,
 ) -> Option<ClaudeAlternativeAuth> {
-    // Highest precedence first.
-    let layers = paths
-        .iter()
-        .rev()
-        .filter_map(|(_, path)| {
-            fs::read_to_string(path)
-                .ok()
-                .and_then(|body| serde_json::from_str::<Value>(&body).ok())
-        })
-        .collect::<Vec<_>>();
+    let layers = claude_settings_layers(paths);
     claude_alternative_auth_layers(
         &layers,
         ambient,
@@ -4292,6 +4283,49 @@ fn claude_alternative_auth(
         approved_api_key_suffixes,
         stored_console_key,
     )
+}
+
+/// Readable settings layers, highest precedence first. `paths` are ordered
+/// lowest precedence first.
+fn claude_settings_layers(paths: &[(String, PathBuf)]) -> Vec<Value> {
+    paths
+        .iter()
+        .rev()
+        .filter_map(|(_, path)| {
+            fs::read_to_string(path)
+                .ok()
+                .and_then(|body| serde_json::from_str::<Value>(&body).ok())
+        })
+        .collect()
+}
+
+/// A settings `env` value from the highest layer that defines it, else the
+/// ambient environment (layers highest precedence first).
+fn claude_visible_env(
+    layers: &[Value],
+    ambient: &dyn Fn(&str) -> Option<String>,
+    key: &str,
+) -> Option<String> {
+    layers
+        .iter()
+        .find_map(|layer| {
+            layer
+                .get("env")
+                .and_then(|env| env.get(key))
+                .map(|value| match value {
+                    Value::String(text) => text.clone(),
+                    Value::Null => String::new(),
+                    other => other.to_string(),
+                })
+        })
+        .or_else(|| ambient(key))
+}
+
+fn claude_env_truthy(value: Option<String>) -> bool {
+    value.is_some_and(|text| {
+        let text = text.trim().to_ascii_lowercase();
+        !text.is_empty() && text != "0" && text != "false"
+    })
 }
 
 /// The same precedence evaluator for a caller that has already read and
@@ -4308,27 +4342,8 @@ pub(crate) fn claude_alternative_auth_layers(
         Value::Null => false,
         _ => true,
     };
-    let truthy = |value: Option<String>| {
-        value.is_some_and(|text| {
-            let text = text.trim().to_ascii_lowercase();
-            !text.is_empty() && text != "0" && text != "false"
-        })
-    };
-    let env_value = |key: &str| {
-        layers
-            .iter()
-            .find_map(|layer| {
-                layer
-                    .get("env")
-                    .and_then(|env| env.get(key))
-                    .map(|value| match value {
-                        Value::String(text) => text.clone(),
-                        Value::Null => String::new(),
-                        other => other.to_string(),
-                    })
-            })
-            .or_else(|| ambient(key))
-    };
+    let truthy = claude_env_truthy;
+    let env_value = |key: &str| claude_visible_env(layers, ambient, key);
     if truthy(env_value("CLAUDE_CODE_USE_BEDROCK")) {
         return Some(ClaudeAlternativeAuth::Bedrock);
     }
@@ -4425,6 +4440,59 @@ fn claude_approved_api_key_suffixes(path: &Path) -> Vec<String> {
                 })
         })
         .unwrap_or_default()
+}
+
+/// The default login's evaluator result for billing route classification.
+/// The daemon never knows a session's invocation mode, so interactive and
+/// `-p` evaluation are both taken; a disagreement is `ModeUnknown`. Only
+/// what the daemon can see is read: a session's own shell environment and
+/// project settings stay invisible, so this never names a route alone.
+fn claude_default_login_route_candidate(
+    oauth_usable: bool,
+    interactive: Option<ClaudeAlternativeAuth>,
+) -> crate::snapshots::billing_route::LoginCandidate {
+    let slot = ClaudeConfigDirSlot::Default;
+    let ambient = |key: &str| std::env::var(key).ok();
+    let print = if oauth_usable {
+        claude_alternative_auth_for_slot(&slot, &ambient, oauth_usable, true)
+    } else {
+        interactive
+    };
+    let layers = claude_settings_layers(&claude_settings_paths_for_slot(&slot));
+    claude_login_route_candidate(&layers, &ambient, oauth_usable, interactive, print)
+}
+
+/// [`claude_default_login_route_candidate`] over already-read layers
+/// (highest precedence first) and both mode evaluations.
+pub(crate) fn claude_login_route_candidate(
+    layers: &[Value],
+    ambient: &dyn Fn(&str) -> Option<String>,
+    oauth_usable: bool,
+    interactive: Option<ClaudeAlternativeAuth>,
+    print: Option<ClaudeAlternativeAuth>,
+) -> crate::snapshots::billing_route::LoginCandidate {
+    use crate::snapshots::billing_route::LoginCandidate as C;
+    let base_url_rewritten = claude_visible_env(layers, ambient, "ANTHROPIC_BASE_URL")
+        .map(|url| url.trim().trim_end_matches('/').to_ascii_lowercase())
+        .is_some_and(|url| !url.is_empty() && url != "https://api.anthropic.com");
+    match interactive {
+        Some(ClaudeAlternativeAuth::Bedrock | ClaudeAlternativeAuth::Vertex) => {
+            C::ThirdPartyPending
+        }
+        _ if claude_env_truthy(claude_visible_env(
+            layers,
+            ambient,
+            "CLAUDE_CODE_USE_FOUNDRY",
+        )) =>
+        {
+            C::Unsupported
+        }
+        _ if interactive != print => C::ModeUnknown,
+        _ if base_url_rewritten => C::ProxyEndpoint,
+        Some(ClaudeAlternativeAuth::ApiKey) => C::ApiKey,
+        None if oauth_usable => C::Oauth,
+        None => C::NoUsableLogin,
+    }
 }
 
 fn claude_default_alternative_auth_now(oauth_usable: bool) -> Option<ClaudeAlternativeAuth> {
@@ -4785,10 +4853,18 @@ fn collect_claude_status(
     }
     // Claude Code uses a configured Bedrock/Vertex route or API key ahead of
     // the stored OAuth login, so it is evaluated first.
-    let alternative = claude_default_alternative_auth_now(matches!(
+    let oauth_usable = matches!(
         login_state,
         ClaudeLocalLoginState::AccessValid | ClaudeLocalLoginState::RefreshPending
-    ));
+    );
+    let alternative = claude_default_alternative_auth_now(oauth_usable);
+    // Billing route annotation only: the evaluator result a session's first
+    // live request freezes. No status field, account or money input reads it.
+    if crate::snapshots::billing_route::PRODUCER_ENABLED {
+        crate::snapshots::billing_route::publish_claude_login(
+            claude_default_login_route_candidate(oauth_usable, alternative),
+        );
+    }
     match login_state {
         ClaudeLocalLoginState::AccessValid | ClaudeLocalLoginState::RefreshPending => {
             snapshot.collection_method = AgentStatusCollectionMethod::CliJson;

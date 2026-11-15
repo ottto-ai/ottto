@@ -186,6 +186,7 @@ pub(crate) use codex_file_join::tests::{
     older_build_logs_priority,
 };
 use sources::claude::response_records as claude_response_records;
+pub(crate) mod billing_route;
 #[cfg(test)]
 mod claude_usage_iterations_tests;
 mod codex_usage_occurrence;

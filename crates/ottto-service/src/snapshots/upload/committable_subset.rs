@@ -279,6 +279,7 @@ impl ScanIndex {
             retired_reread_guard: serde::de::IgnoredAny,
             files: files.into(),
             session_account_bindings: self.session_account_bindings.clone(),
+            session_billing_routes: self.session_billing_routes.clone(),
             terminal_jsonl_dispositions: previous.terminal_jsonl_dispositions.clone(),
             known_configured_scan_roots: self.known_configured_scan_roots.clone(),
             legacy_unresolved_root_file_witnesses: self

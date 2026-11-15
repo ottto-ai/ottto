@@ -8001,6 +8001,24 @@ fn finish_sync_source(
         &claude_authority_disposition.mixed_uploads,
     );
     claude_authority_disposition.defer_sessions(deferred_accounts);
+    // Billing route annotation: after ownership is bound, before upload policy.
+    // It reads and writes only its own latch and wire object.
+    let route_counts = index.apply_session_billing_routes(
+        source,
+        machine_id,
+        &mut scan_result.snapshots,
+        &crate::snapshots::billing_route::RouteContext::current(
+            activity_hint.session_billing_route_contract.as_deref(),
+        ),
+    );
+    if route_counts != Default::default() {
+        if let Ok(counts) = serde_json::to_string(&route_counts) {
+            eprintln!(
+                "local snapshot sync: {} billing route counts={counts}",
+                source.api_slug()
+            );
+        }
+    }
 
     // The Companion uses machine-local labels before upload policy clears them.
     let reconciliation_status = crate::agent_status_refresh::status_for_reconciliation(
@@ -9945,6 +9963,10 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
 fn release_emitted(item: &mut SnapshotItem) {
     #[cfg(test)]
     crate::snapshots::claude_request_money::e2::pipeline_test_observer::before_release(item);
+    // Route evidence only; captured before the native request inputs go.
+    if crate::snapshots::billing_route::PRODUCER_ENABLED {
+        crate::snapshots::billing_route::capture_claude_route_evidence(item);
+    }
     crate::snapshots::claude_request_money::e2::release_emitted_fold(item);
 }
 
