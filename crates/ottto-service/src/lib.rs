@@ -9555,7 +9555,7 @@ mod tests {
                     assert!(daemon.tracking_episode(&source).is_none());
                 }
             }
-            let restarted = super::tests::daemon().with_source_state_dir(root.join("sources"));
+            let restarted = super::daemon().with_source_state_dir(root.join("sources"));
             assert!(restarted.tracking_episode(&SourceKind::Pi).is_some());
             assert!(restarted.tracking_episode(&SourceKind::Codex).is_some());
             let state = restarted.state().unwrap();
