@@ -9440,6 +9440,74 @@ fn setup_run_status_is_active(status: &str) -> bool {
     )
 }
 
+/// Background reconcile retry after Ottto refused a request in a way that the
+/// same request cannot change: the body is rebuilt the same way each attempt,
+/// so a validation refusal repeats. Still a retry, not a park: binding changes,
+/// daemon restarts and explicit setup paths do not wait for it.
+const SETUP_RECONCILE_REFUSED_RETRY: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// A deterministic backend refusal. 401/403/404 keep their own handling, and
+/// 408/429/5xx/network failures keep the jittered backoff.
+fn setup_reconcile_refused(error: &LocalApiError) -> bool {
+    matches!(
+        error,
+        LocalApiError::Backend(BackendErrorDetails {
+            status: Some(400 | 409 | 410 | 422),
+            ..
+        })
+    )
+}
+
+/// ` endpoint=<template> status=<n> code=<reason>` for a backend error; empty
+/// otherwise. Never includes body text, ids or credentials.
+fn setup_reconcile_backend_fields(error: &LocalApiError) -> String {
+    let LocalApiError::Backend(details) = error else {
+        return String::new();
+    };
+    let mut fields = format!(
+        " endpoint={}",
+        setup_reconcile_endpoint_template(&details.endpoint)
+    );
+    if let Some(status) = details.status {
+        fields.push_str(&format!(" status={status}"));
+    }
+    if let Some(code) = &details.reason_code {
+        fields.push_str(&format!(" code={code}"));
+    }
+    fields
+}
+
+/// The API path of `endpoint` with identifier segments replaced by
+/// placeholders, e.g. `/api/v1/setup-runs/{run}/local-client/scan-result`.
+fn setup_reconcile_endpoint_template(endpoint: &str) -> String {
+    let path = endpoint
+        .find("/api/")
+        .map_or(endpoint, |start| &endpoint[start..]);
+    let mut previous = "";
+    path.split('/')
+        .map(|segment| {
+            let fixed = segment.starts_with('[')
+                || segment
+                    .chars()
+                    .all(|character| character.is_ascii_lowercase() || character == '-')
+                || segment
+                    .strip_prefix('v')
+                    .is_some_and(|version| version.chars().all(|c| c.is_ascii_digit()));
+            let templated = match previous {
+                _ if segment.is_empty() => segment,
+                "setup-runs" => "{run}",
+                "setup-claims" if !segment.starts_with('[') => "{claim}",
+                "actions" => "{action}",
+                _ if fixed => segment,
+                _ => "{id}",
+            };
+            previous = segment;
+            templated
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 fn setup_reconcile_status_reason(status: Option<&str>) -> String {
     format!(
         "status:{}",
@@ -9524,12 +9592,18 @@ pub(crate) fn reconcile_setup_scan_in_background(daemon: &LocalDaemon) {
             _ => Ok((true, setup_reconcile_status_reason(Some(&run.status)))),
         }
     })();
+    let mut refused = false;
+    let mut backend_fields = String::new();
     let (mut settled, mut reason) = match result {
         Ok(outcome) => outcome,
-        Err(error) => (
-            terminal_refresh_rejection(&error).is_some(),
-            format!("error:{}", setup_action_execution_error_detail(&error).0),
-        ),
+        Err(error) => {
+            refused = setup_reconcile_refused(&error);
+            backend_fields = setup_reconcile_backend_fields(&error);
+            (
+                terminal_refresh_rejection(&error).is_some(),
+                format!("error:{}", setup_action_execution_error_detail(&error).0),
+            )
+        }
     };
     if settled {
         let _binding_lock = lock_setup_run_binding();
@@ -9545,7 +9619,11 @@ pub(crate) fn reconcile_setup_scan_in_background(daemon: &LocalDaemon) {
         None
     } else {
         state.failures = attempt;
-        let delay = crate::snapshot_sync::full_jitter_backoff(state.failures);
+        let delay = if refused {
+            SETUP_RECONCILE_REFUSED_RETRY
+        } else {
+            crate::snapshot_sync::full_jitter_backoff(state.failures)
+        };
         state.next_due = Some(Instant::now() + delay);
         Some(delay.as_secs())
     };
@@ -9555,7 +9633,7 @@ pub(crate) fn reconcile_setup_scan_in_background(daemon: &LocalDaemon) {
             .map(|seconds| format!(" next_in={seconds}s"))
             .unwrap_or_default();
         eprintln!(
-            "setup reconcile attempt={attempt} outcome={outcome} reason={reason} actions={actions_processed}{next_in}"
+            "setup reconcile attempt={attempt} outcome={outcome} reason={reason}{backend_fields} actions={actions_processed}{next_in}"
         );
     }
 }
@@ -22588,6 +22666,138 @@ for line in sys.stdin:
             assert_eq!(state.failures, u32::from(!settled));
             assert_eq!(state.next_due.is_some(), !settled);
         }
+    }
+
+    /// [behaviour] A deterministic scan-result refusal waits a day; transient failures keep jitter.
+    #[test]
+    #[serial]
+    fn background_setup_scan_refusal_backs_off_a_day() {
+        let _lock = lock_backend_test_env();
+        let jitter_ceiling = Duration::from_secs(60);
+        for (status, body) in [
+            (400, r#"{"detail":"scan_payload_invalid"}"#),
+            (422, "{}"),
+            (503, "{}"),
+        ] {
+            let (base, server) =
+                scripted_json_backend(vec![(200, scan_refresh("scanning")), (status, body)]);
+            let (_root, _guards, daemon, _) = scan_fixture(base);
+            let before = Instant::now();
+            reconcile_setup_scan_in_background(&daemon);
+            let requests = server.join().unwrap();
+            assert!(requests[1].contains("/run_connected_setup/local-client/scan-result "));
+            assert!(FileConnectionStore::default()
+                .setup_scan_settled_run_id()
+                .unwrap()
+                .is_none());
+            let state = SETUP_SCAN.lock().unwrap();
+            assert_eq!(state.failures, 1);
+            let wait = state.next_due.unwrap() - before;
+            if status == 503 {
+                assert!(wait <= jitter_ceiling, "{status}: {wait:?}");
+            } else {
+                assert!(wait >= SETUP_RECONCILE_REFUSED_RETRY, "{status}: {wait:?}");
+                assert!(wait < SETUP_RECONCILE_REFUSED_RETRY + jitter_ceiling);
+            }
+        }
+
+        // A network failure keeps the jittered backoff.
+        let closed = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let (_root, _guards, daemon, _) = scan_fixture(format!("http://{closed}"));
+        let before = Instant::now();
+        reconcile_setup_scan_in_background(&daemon);
+        let state = SETUP_SCAN.lock().unwrap();
+        assert_eq!(state.failures, 1);
+        assert!(state.next_due.unwrap() - before <= jitter_ceiling);
+    }
+
+    /// [behaviour] A new setup run is not held behind the old run's refusal backoff.
+    #[test]
+    #[serial]
+    fn background_setup_scan_refusal_resets_on_new_setup_run() {
+        let _lock = lock_backend_test_env();
+        let (base, server) = scripted_json_backend(vec![
+            (200, scan_refresh("scanning")),
+            (400, "{}"),
+            (503, "{}"),
+        ]);
+        let (_root, _guards, daemon, _) = scan_fixture(base);
+        reconcile_setup_scan_in_background(&daemon);
+        // Still inside the refusal window: no request.
+        reconcile_setup_scan_in_background(&daemon);
+        let store = FileConnectionStore::default();
+        let mut replacement = store.load().unwrap().unwrap();
+        replacement.setup_run_id = "replacement-run".into();
+        store.save(&replacement).unwrap();
+        let before = Instant::now();
+        reconcile_setup_scan_in_background(&daemon);
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[2].contains("/replacement-run/local-client/refresh "));
+        let state = SETUP_SCAN.lock().unwrap();
+        assert_eq!(
+            state.binding,
+            Some((replacement.api_base_url, "replacement-run".to_string()))
+        );
+        assert_eq!(state.failures, 1);
+        assert!(state.next_due.unwrap() - before <= Duration::from_secs(60));
+    }
+
+    /// [privacy] The reconcile log names a templated endpoint, status and code only.
+    #[test]
+    fn setup_reconcile_backend_fields_template_ids_and_skip_body() {
+        let error = |endpoint: &str, status, reason_code: Option<&str>| {
+            LocalApiError::Backend(BackendErrorDetails {
+                kind: BackendErrorKind::Rejected,
+                endpoint: safe_backend_endpoint(endpoint),
+                status,
+                body_excerpt: Some("synthetic body text".to_string()),
+                reason_code: reason_code.map(str::to_string),
+            })
+        };
+        let refused = error(
+            "https://api.example.test/api/v1/setup-runs/run_ab12/local-client/scan-result?x=1",
+            Some(400),
+            Some("scan_payload_invalid"),
+        );
+        assert_eq!(
+            setup_reconcile_backend_fields(&refused),
+            " endpoint=/api/v1/setup-runs/{run}/local-client/scan-result status=400 code=scan_payload_invalid"
+        );
+        assert_eq!(
+            setup_reconcile_backend_fields(&error(
+                "http://127.0.0.1:1/api/v1/setup-runs/run_ab12/local-client/actions/act_9/events",
+                None,
+                None,
+            )),
+            " endpoint=/api/v1/setup-runs/{run}/local-client/actions/{action}/events"
+        );
+        assert_eq!(
+            setup_reconcile_backend_fields(&LocalApiError::NetworkUnavailable),
+            ""
+        );
+        for status in [400, 409, 410, 422] {
+            assert!(setup_reconcile_refused(&error(
+                "/api/v1/x",
+                Some(status),
+                None
+            )));
+        }
+        for status in [
+            Some(401),
+            Some(403),
+            Some(404),
+            Some(408),
+            Some(429),
+            Some(503),
+            None,
+        ] {
+            assert!(!setup_reconcile_refused(&error("/api/v1/x", status, None)));
+        }
+        assert!(!setup_reconcile_refused(&LocalApiError::NetworkUnavailable));
     }
 
     /// [behaviour] One completed action and its final idle poll settle in one attempt.
