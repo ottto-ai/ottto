@@ -5608,6 +5608,8 @@ fn collect_claude_status_snapshots(
         &captured_at,
         &expires_at,
     ));
+    // The setup index is read after the degraded and Desktop appends, so it
+    // addresses the final upload rows; keep it after both.
     let desktop_carrier_only = snapshots.is_empty();
     append_claude_desktop_pairs_snapshot(&mut snapshots, &desktop_pairs, &captured_at, &expires_at);
     let setup_snapshot_index =

@@ -17483,6 +17483,16 @@ fn setup_scan_sends_the_default_logins_selected_row_or_nothing() {
         ],
         Some(0),
     );
+    // A managed slot that wins the default's binding at equal quality.
+    let mut shadowing = candidate("codex_slot_a", "same_user", "personal_workspace", 5);
+    shadowing.snapshot.status = AgentStatusState::Degraded;
+    codex_case(
+        &[
+            candidate("default", "same_user", "personal_workspace", 5),
+            shadowing,
+        ],
+        Some(1),
+    );
     // A default marked ShadowedByAnchor that still wins its binding on quality.
     let mut candidates = vec![
         candidate("default", "same_user", "personal_workspace", 5),
