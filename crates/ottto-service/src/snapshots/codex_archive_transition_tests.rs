@@ -1433,6 +1433,260 @@ fn release_0217_archive_manifest_members_and_header_attempts_load_inert() {
     assert!(index.files.is_empty());
 }
 
+/// [money] A page held only because its header inventory was incomplete
+/// owes its candidates to the hold and adds no unreadable or ownership count.
+/// The hold keeps that generation red; its release catches the candidates up
+/// with cold-equal money, reads what an unheld page reads, and leaves the
+/// generation healthy with no further walk. A store an older release wrote
+/// mid-hold, synthetic counts included, ends one red generation, then
+/// catches up without subtracting them.
+#[test]
+fn inventory_held_page_catches_up_and_leaves_the_generation_healthy() {
+    const NEW: &str = "019e5a00-0000-7000-8000-00000000000e";
+    let _lock = DECODER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let hash = |kind: &str, account: &str| {
+        let value = if kind == "account" {
+            "user"
+        } else {
+            "workspace"
+        };
+        ottto_core::billing_identity_hash("openai", kind, &format!("synthetic-{value}-{account}"))
+            .unwrap()
+    };
+    let slots = ["a", "b"].map(|account| {
+        (
+            hash("account", account),
+            hash("workspace", account),
+            crate::codex_scan_diagnostics::CREATOR_NAMED,
+        )
+    });
+    let fresh = || Arc::new(sampled_scan::SharedCache::default());
+    let healthy = |index: &ScanIndex| index.traversal.as_ref().map_or(true, |t| !t.has_errors());
+    let changed = [MAIN, OTHER, NEW];
+    let mut control_reads = None;
+    for arm in ["control", "ram", "restart", "pre-fix"] {
+        let c = Corpus::new();
+        c.write(MAIN, Some("a"));
+        c.write(OTHER, Some("b"));
+        c.write(SIDE, Some("b"));
+        c.write(GAP, None);
+        let (session, prior) = StateV2ColdSession::publish(
+            Source::Codex,
+            &ScanIndex::default(),
+            &c.scratch.join("state"),
+        );
+        let (working, first, _, _, _) =
+            page_observed_with_limit(&c.roots(), prior.clone(), fresh(), 100, &slots, |_| {});
+        let (mut index, posts) = working.checkpoint_with_captured_posts(&first, &prior, "accept");
+        let accepted = route(&index, &first, posts);
+        // A mid-session account switch, a side call, an evidence gap and a
+        // never-accepted rollout.
+        append(&c.path(MAIN), &(turn(3) + &header(MAIN, Some("switched"))));
+        append(&c.path(OTHER), &turn(3));
+        c.write(NEW, Some("a"));
+        e2_pipeline_scan_fixture::age_listing_for_test(&mut index);
+        let (_, cold, _, _, _) = page_observed_with_limit(
+            &c.roots(),
+            ScanIndex::default(),
+            fresh(),
+            100,
+            &slots,
+            |_| {},
+        );
+        assert!(
+            cold.snapshots
+                .iter()
+                .flat_map(|item| &item.model_usage)
+                .any(|row| row.account_identifier_hash.is_some()),
+            "tagged positive control"
+        );
+        let cold_of = |index: &ScanIndex, scan: &SourceScanResult| {
+            let mut page = cold.clone();
+            page.snapshots.retain(|item| {
+                scan.snapshots
+                    .iter()
+                    .any(|own| own.source_session_id == item.source_session_id)
+            });
+            emitted(index, &page)
+        };
+        let keys = changed.map(|id| local_index_key(&c.path(id)));
+        let before = index.clone();
+        let mut injected = arm == "control";
+        let (working, held, delivered, consumed, _) =
+            page_observed_with_limit(&c.roots(), index, fresh(), 100, &slots, |scan| {
+                if let Some(inventory) = scan.codex_join_inventory.as_mut().filter(|_| !injected) {
+                    inventory.complete = false;
+                    injected = true;
+                }
+            });
+        assert!(injected, "{arm}");
+        if arm == "control" {
+            let (index, posts) = working.checkpoint_with_captured_posts(&held, &before, "accept");
+            for id in changed {
+                assert!(held
+                    .snapshots
+                    .iter()
+                    .any(|item| item.source_session_id == id));
+            }
+            money_oracle::assert_equivalent(&cold_of(&index, &held), &route(&index, &held, posts));
+            assert!(
+                healthy(&index),
+                "an unheld page leaves the generation healthy"
+            );
+            control_reads = Some((held.scanned_file_count, consumed));
+            drop(session);
+            continue;
+        }
+        assert!(held.snapshots.is_empty(), "{arm}: {:?}", held.snapshots);
+        assert!(
+            delivered.0.lock().unwrap().is_empty(),
+            "{arm}: no body read"
+        );
+        assert!(!held.census_complete);
+        assert_eq!(
+            held.unreadable_path_count, 0,
+            "{arm}: no synthetic unreadable"
+        );
+        assert_eq!(
+            held.ownership_incomplete_file_count, 0,
+            "{arm}: no synthetic ownership"
+        );
+        let (mut index, posts) = working.checkpoint_with_captured_posts(&held, &before, "accept");
+        assert!(posts.is_empty());
+        {
+            // Recorded before the preparation yield: every held candidate is owed.
+            let traversal = index.traversal.as_ref().expect("the held generation stays");
+            let hold = traversal
+                .residue
+                .codex_inventory_hold
+                .as_ref()
+                .expect("the held candidates are owed");
+            for key in &keys {
+                assert!(hold.owed.contains(key), "{arm}: {key} owed");
+                assert!(!traversal.residue.index_keys.contains(key), "{arm}: {key}");
+            }
+            // The held page drained discovery: red and bounded.
+            assert!(traversal.has_errors() && !traversal.has_unsettled_residue());
+            assert!(traversal.unhealthy_retry_not_before_unix_seconds.is_some());
+        }
+        for key in &keys[..2] {
+            assert_eq!(
+                index.files[key].last_upload_body_witness,
+                before.files[key].last_upload_body_witness,
+                "{arm}: a held accepted witness is unchanged"
+            );
+        }
+        assert!(index
+            .files
+            .get(&keys[2])
+            .is_none_or(|entry| entry.last_upload_body_witness.is_none()));
+        let mut held_route = emitted(&index, &held);
+        held_route.accepted = accepted.accepted.clone();
+        let mut cold_held = cold.clone();
+        cold_held
+            .snapshots
+            .retain(|item| changed.contains(&item.source_session_id.as_str()));
+        money_oracle::assert_held_set(
+            &changed,
+            &accepted,
+            &held_route,
+            &emitted(&index, &cold_held),
+        );
+        cold_held
+            .snapshots
+            .retain(|item| item.source_session_id == MAIN);
+        money_oracle::assert_no_smaller_reemit(
+            MAIN,
+            &accepted,
+            &held_route,
+            &emitted(&index, &cold_held),
+            true,
+        );
+        match arm {
+            "restart" => {
+                let hold = index.traversal.as_ref().unwrap().residue.clone();
+                index = ScanIndex::load(session.path()).unwrap();
+                assert_eq!(
+                    index.traversal.as_ref().unwrap().residue,
+                    hold,
+                    "the durable checkpoint keeps the hold"
+                );
+            }
+            "pre-fix" => {
+                // What an older release folded for the same held page.
+                let traversal = index.traversal.as_mut().unwrap();
+                let owed = traversal
+                    .residue
+                    .codex_inventory_hold
+                    .as_ref()
+                    .unwrap()
+                    .owed
+                    .clone();
+                traversal.counts.ownership_incomplete_file_count += owed.len();
+                traversal
+                    .counts
+                    .causes
+                    .add(ownership::INVENTORY, owed.len());
+                traversal
+                    .counts
+                    .record_unreadable(UnreadableCause::AliasParser, 1);
+                traversal.residue.index_keys.extend(owed);
+                index = session.save_reload(&mut index);
+            }
+            _ => {}
+        }
+        let before = index.clone();
+        let (working, recovered, _, consumed, _) =
+            page_observed_with_limit(&c.roots(), index, fresh(), 100, &slots, |_| {});
+        let (mut index, posts) =
+            working.checkpoint_with_captured_posts(&recovered, &before, "accept");
+        for id in changed {
+            assert!(
+                recovered
+                    .snapshots
+                    .iter()
+                    .any(|item| item.source_session_id == id),
+                "{arm}: {id} caught up"
+            );
+        }
+        let caught_up = route(&index, &recovered, posts);
+        money_oracle::assert_equivalent(&cold_of(&index, &recovered), &caught_up);
+        assert!(index
+            .traversal
+            .as_ref()
+            .is_none_or(|t| t.residue.codex_inventory_hold.is_none()));
+        if arm == "pre-fix" {
+            // Forward-only: the old counts stay until the bounded re-walk.
+            let traversal = index.traversal.as_ref().expect("one red generation");
+            assert!(traversal.has_errors());
+            assert!(traversal.counts.unreadable_path_count > 0);
+            index
+                .traversal
+                .as_mut()
+                .unwrap()
+                .unhealthy_retry_not_before_unix_seconds = Some(0);
+            let before = index.clone();
+            let (working, rewalk, _, _, _) =
+                page_observed_with_limit(&c.roots(), index, fresh(), 100, &slots, |_| {});
+            assert!(rewalk.snapshots.is_empty(), "the re-walk re-emits nothing");
+            let (next, posts) = working.checkpoint_with_captured_posts(&rewalk, &before, "accept");
+            assert!(posts.is_empty());
+            index = next;
+        } else {
+            assert_eq!(
+                Some((recovered.scanned_file_count, consumed)),
+                control_reads,
+                "{arm}: the release reads what an unheld page reads"
+            );
+        }
+        assert!(healthy(&index), "{arm}: the generation is healthy");
+        assert_quiet(&c, index, &caught_up);
+        drop(session);
+    }
+}
+
 /// [regress] Header decoder refusal holds its filename owner, while ordinary
 /// siblings publish exact money; funding the next attempt reaches the same EOF.
 #[test]

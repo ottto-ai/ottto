@@ -336,7 +336,7 @@ pub(super) mod tests {
             let done = index.traversal.as_ref().map_or(true, |traversal| {
                 traversal.pending_directories.is_empty()
                     && traversal.pending_candidates.is_empty()
-                    && traversal.counts.has_errors()
+                    && traversal.has_errors()
             });
             if done {
                 return pages;
@@ -864,7 +864,7 @@ pub(super) mod tests {
             1
         );
         let traversal = index.traversal.as_ref().expect("the loss keeps it red");
-        assert!(traversal.counts.has_errors());
+        assert!(traversal.has_errors());
         assert_eq!(traversal.counts.disappeared_file_count, 1);
         assert!(!index.files.contains_key(&member_key));
     }

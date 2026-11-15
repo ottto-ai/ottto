@@ -4464,7 +4464,7 @@ pub(super) mod tests {
         write_rows(&segment, &member(KNOWN, "r-b", 200, 300));
         let new = root.join("sessions/new.jsonl");
         write_rows(&new, &member(UNRELATED, "n-1", 70, 70));
-        let (_, page) = retained_page(&root, settled, &[segment, new]);
+        let (index, page) = retained_page(&root, settled, &[segment.clone(), new]);
         let known = page
             .snapshots
             .iter()
@@ -4474,7 +4474,12 @@ pub(super) mod tests {
             known.iter().all(|item| item.input_tokens == 300),
             "a known segment cannot be sent alone once its sibling exists: {known:?}"
         );
-        assert!(!known.is_empty() || page.ownership_incomplete_file_count >= 2);
+        assert!(
+            !known.is_empty()
+                || page.ownership_incomplete_file_count >= 2
+                || inventory_hold(&index)
+                    .is_some_and(|hold| hold.owed.contains(&local_index_key(&segment)))
+        );
         assert!(page
             .snapshots
             .iter()
@@ -4495,17 +4500,33 @@ pub(super) mod tests {
         fs::write(&unreadable, "not a header\n").unwrap();
         let new = root.join("sessions/new.jsonl");
         write_rows(&new, &member(UNRELATED, "n-1", 70, 70));
+        let before = settled.traversal.as_ref().unwrap().counts.clone();
         let (held_index, held) = retained_page(&root, settled, &[unreadable.clone(), new.clone()]);
         assert!(held.snapshots.is_empty(), "{:?}", held.snapshots);
-        assert!(held.ownership_incomplete_file_count > 0);
-        let (c, [unknown, _, _]) = held.causes.summary(held.ownership_incomplete_file_count);
-        assert!(c[ownership::INVENTORY] > 0);
+        // The hold owes the held candidates; they add no ownership or
+        // unreadable count. Only the refused header itself is unreadable.
+        assert_eq!(held.ownership_incomplete_file_count, 0);
+        let (c, _) = held.causes.summary(0);
+        assert_eq!(c[ownership::INVENTORY], 0);
+        assert!(held.unreadable_path_count > 0, "the refused header counts");
+        let after = &held_index.traversal.as_ref().unwrap().counts;
         assert_eq!(
-            c[..6].iter().sum::<usize>() + unknown,
-            held.ownership_incomplete_file_count
+            after.ownership_incomplete_file_count,
+            before.ownership_incomplete_file_count
+        );
+        assert_eq!(
+            after.unreadable_path_count,
+            before.unreadable_path_count + held.unreadable_path_count
         );
         let hold = inventory_hold(&held_index).expect("the held page is owed a retry");
         assert!(hold.owed.contains(&local_index_key(&new)));
+        assert!(!held_index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .residue
+            .index_keys
+            .contains(&local_index_key(&new)));
         assert!(hold
             .refused_headers
             .contains_key(&local_index_key(&unreadable)));
@@ -4596,7 +4617,14 @@ pub(super) mod tests {
         let (still_index, still) =
             retained_page(&root, held_index, std::slice::from_ref(&unreadable));
         assert!(still.snapshots.is_empty(), "{:?}", still.snapshots);
-        assert!(still.ownership_incomplete_file_count > 0);
+        // The release does not clear the still-refused header: it counts
+        // again, and the hold keeps the generation red.
+        assert!(still.unreadable_path_count > 0);
+        assert!(still_index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .has_retryable_problems());
         assert!(inventory_hold(&still_index)
             .is_some_and(|hold| hold.owed.contains(&local_index_key(&new))));
         let (idle_index, idle) = retained_page(&root, still_index, &[]);
