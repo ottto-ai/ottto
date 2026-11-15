@@ -1661,13 +1661,14 @@ fn unlink_telemetry_pair_locked(
     }
     for (path, generation) in paths.iter().zip(&pair.generations) {
         if generation.is_some() {
-            let removed = (|| {
-                #[cfg(test)]
-                if FAIL_TELEMETRY_UNLINK.with(|n| n.replace(n.get().saturating_sub(1)) == 1) {
-                    return Err(std::io::Error::other("injected unlink failure"));
-                }
+            #[cfg(test)]
+            let removed = if FAIL_TELEMETRY_UNLINK.with(|n| n.replace(n.get().saturating_sub(1)) == 1) {
+                Err(std::io::Error::other("injected unlink failure"))
+            } else {
                 fs::remove_file(path)
-            })();
+            };
+            #[cfg(not(test))]
+            let removed = fs::remove_file(path);
             handles.evict(path);
             removed?;
         } else {
