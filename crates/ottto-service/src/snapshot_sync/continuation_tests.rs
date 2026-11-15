@@ -1350,7 +1350,7 @@ fn resident_pacing_selects_power_gap_and_preserves_cursor_ac_gate() {
         let mut cadence = SourceCadence::new(CadenceConfig::cost_first(SNAPSHOT_SYNC_INTERVAL));
         cadence.record_scan_success(now, 1);
         if let Some(pacing) = resident_pacing(state) {
-            assert!(cadence.request_paced_scan(now, Duration::from_secs(103), pacing));
+            assert!(cadence.request_paced_scan(now, Duration::from_secs(103), pacing, false));
         }
         assert_eq!(
             cadence.paced_scan_due(),
@@ -1369,8 +1369,8 @@ fn resident_pacing_selects_power_gap_and_preserves_cursor_ac_gate() {
     assert!(resident_pacing(power_state(0)).is_none());
     let mut cadence = SourceCadence::new(CadenceConfig::cost_first(SNAPSHOT_SYNC_INTERVAL));
     cadence.record_scan_success(now, 1);
-    cadence.request_paced_scan(now, Duration::from_secs(103), PACED_AC);
-    cadence.request_paced_scan(now, Duration::from_secs(103), PACED_BATTERY);
+    cadence.request_paced_scan(now, Duration::from_secs(103), PACED_AC, false);
+    cadence.request_paced_scan(now, Duration::from_secs(103), PACED_BATTERY, false);
     assert_eq!(
         cadence.paced_scan_due(),
         Some(now + Duration::from_secs(180))
@@ -1472,7 +1472,7 @@ fn file_limit_full_pages_request_pacing_only_with_queued_work_and_allowed_power(
         if resident_scan_requested(&scan, false)
             && let Some(pacing) = resident_pacing(power)
         {
-            assert!(cadence.request_paced_scan(now, Duration::ZERO, pacing));
+            assert!(cadence.request_paced_scan(now, Duration::ZERO, pacing, false));
         }
         assert_eq!(
             cadence.paced_scan_due(),
@@ -1615,7 +1615,7 @@ fn resident_wake_advances_ordinary_cycle_without_a_cursor_timer() {
         let now = Instant::now();
         let mut cadence = SourceCadence::new(CadenceConfig::cost_first(SNAPSHOT_SYNC_INTERVAL));
         cadence.record_scan_success(now, 1);
-        cadence.request_paced_scan(now, Duration::from_secs(103), pacing);
+        cadence.request_paced_scan(now, Duration::from_secs(103), pacing, false);
         cadence.clear_cursor_continuation(); // ordinary prepare drops only a cursor.
         assert!(cadence.continuation_due(PACING).is_none());
         let mut host = OrdinaryLoop {
@@ -1631,7 +1631,7 @@ fn resident_wake_advances_ordinary_cycle_without_a_cursor_timer() {
         wait_for_ordinary_cycle(&mut host, SNAPSHOT_SYNC_INTERVAL);
         assert_eq!(host.waits, [pacing.min_gap, SNAPSHOT_SYNC_INTERVAL]);
         host.cadence
-            .request_paced_scan(host.now, Duration::from_secs(103), pacing);
+            .request_paced_scan(host.now, Duration::from_secs(103), pacing, false);
         host.cadence.record_scan_failure(host.now);
         assert!(host.cadence.paced_scan_due().is_none());
     }
@@ -1677,6 +1677,7 @@ enum Fault {
 struct PacedOwner {
     fault: Fault,
     background: fn() -> Option<MacPlatformSignals>,
+    power: PlatformState,
     paced_qos: Option<MacPlatformSignals>,
     seen: Vec<(SnapshotSource, &'static str, (u32, i32))>,
 }
@@ -1685,6 +1686,7 @@ impl PacedOwner {
         Self {
             fault,
             background,
+            power: PlatformState::Allowed,
             paced_qos: None,
             seen: Vec::new(),
         }
@@ -1708,7 +1710,7 @@ impl crate::source_rotation::Owner for PacedOwner {
         _: Option<usize>,
     ) -> anyhow::Result<Option<Self::Frame>> {
         drop(self.paced_qos.take());
-        self.paced_qos = paced_source_qos(source, self.background);
+        self.paced_qos = paced_source_qos(source, || self.power, self.background);
         match self.fault(source, "prepare") {
             Fault::PrepareNone => Ok(None),
             Fault::PrepareErr => Err(anyhow!("prepare")),
@@ -1761,6 +1763,10 @@ impl OwnedCadences {
     /// Codex has a due paced request, Claude a pending (not yet due) one and
     /// Pi none.
     fn install() -> Self {
+        Self::install_with(false)
+    }
+    /// As [`OwnedCadences::install`], with each request's first-import reason.
+    fn install_with(first_import: bool) -> Self {
         let mut cadences = super::super::source_cadences().lock().unwrap();
         let saved = ROTATION
             .iter()
@@ -1776,7 +1782,12 @@ impl OwnedCadences {
             let mut cadence = SourceCadence::new(CadenceConfig::cost_first(SNAPSHOT_SYNC_INTERVAL));
             cadence.record_scan_success(last_scan, 1);
             if source != SnapshotSource::Pi {
-                assert!(cadence.request_paced_scan(last_scan, Duration::ZERO, PACED_AC));
+                assert!(cadence.request_paced_scan(
+                    last_scan,
+                    Duration::ZERO,
+                    PACED_AC,
+                    first_import
+                ));
             }
             cadences.insert(source.api_slug(), cadence);
         }
@@ -1901,4 +1912,104 @@ fn refused_paced_qos_clears_only_that_sources_request() {
         "a sibling's pending request survives"
     );
     assert_eq!(fake_qos(), UTILITY);
+}
+
+/// [behaviour] Only a paced request made during the first import, on AC,
+/// runs its whole pass at the thread's default QoS and keeps its request.
+/// Battery stays background; refused or unknown power still clears; a
+/// routine request on AC stays background.
+#[test]
+#[serial_test::serial(source_cadences, source_upload_deadlines)]
+fn first_import_paced_passes_keep_default_qos_only_on_ac() {
+    use PlatformState::{Allowed, Battery, Refused, Unknown};
+    for (power, first_import, expected) in [
+        (Allowed, true, PassQos::Default),
+        (Allowed, false, PassQos::Background),
+        (Battery, true, PassQos::Background),
+        (Battery, false, PassQos::Background),
+        (Refused, true, PassQos::Cleared),
+        (Refused, false, PassQos::Cleared),
+        (Unknown, true, PassQos::Cleared),
+        (Unknown, false, PassQos::Cleared),
+    ] {
+        assert_eq!(paced_pass_qos(power, first_import), expected);
+        let _cadences = OwnedCadences::install_with(first_import);
+        let mut owner = PacedOwner::new(Fault::None, fake_background);
+        owner.power = power;
+        crate::source_rotation::run(&mut owner, &ROTATION, usize::MAX);
+        assert_eq!(fake_qos(), UTILITY, "{power:?} {first_import}: restored");
+        let codex_qos = match expected {
+            PassQos::Background => BACKGROUND,
+            PassQos::Default | PassQos::Cleared => UTILITY,
+        };
+        for (source, stage, qos) in &owner.seen {
+            let want = if *source == SnapshotSource::Codex {
+                codex_qos
+            } else {
+                UTILITY
+            };
+            assert_eq!(*qos, want, "{power:?} {first_import}: {source:?} {stage}");
+        }
+        assert_eq!(
+            OwnedCadences::due(SnapshotSource::Codex).is_some(),
+            expected != PassQos::Cleared,
+            "{power:?} {first_import}: only refused or unknown power clears"
+        );
+        assert!(OwnedCadences::due(SnapshotSource::ClaudeCode).is_some());
+        let qos = paced_source_qos(SnapshotSource::Codex, || power, fake_background);
+        assert_eq!(first_import_default_qos(), expected == PassQos::Default);
+        drop(qos);
+        let mut slot = None;
+        leave_source_qos(&mut slot);
+        assert!(
+            !first_import_default_qos(),
+            "the row flag ends with the pass"
+        );
+    }
+}
+
+/// [behaviour] Through the finish-site request: a paced pass asked for during
+/// the first backfill runs at default QoS on AC; once the backfill state marks
+/// the import complete, the next paced request is background again, and the
+/// earlier first-import reason does not outlive its request.
+#[cfg(unix)]
+#[test]
+#[serial_test::serial(source_cadences, source_upload_deadlines)]
+fn first_import_default_qos_ends_when_backfill_completes() {
+    use super::super::backfill_replay_pending;
+    use crate::backfill::{
+        bootstrap_pending_for_destination, mark_backfill_complete_for_destination, BackfillState,
+    };
+    const DESTINATION: &str = "first-import-qos-destination";
+    let codex = SnapshotSource::Codex;
+    let mut state = BackfillState::default();
+    super::super::source_upload_deadlines()
+        .lock()
+        .unwrap()
+        .clear();
+    super::super::resource_schedule::with_power("ac", || {
+        for (seconds, complete, expected) in [(1000, false, UTILITY), (2000, true, BACKGROUND)] {
+            if complete {
+                mark_backfill_complete_for_destination(&mut state, codex, DESTINATION);
+            }
+            let first_read_bootstrap = backfill_replay_pending(codex, &state, DESTINATION)
+                && bootstrap_pending_for_destination(&state, codex, DESTINATION);
+            assert_eq!(first_read_bootstrap, !complete);
+            crate::scan_clock::with_clock(seconds, || {
+                with_source_cadence(codex, |cadence| {
+                    cadence.record_scan_success(crate::scan_clock::now(), 1)
+                });
+                request_resident_scan(codex, first_read_bootstrap);
+            });
+            crate::scan_clock::with_clock(seconds + 30, || {
+                let power = || MacPlatformSignals::default().power();
+                let qos = paced_source_qos(codex, power, fake_background);
+                assert_eq!(fake_qos(), expected, "complete {complete}");
+                assert_eq!(first_import_default_qos(), !complete);
+                assert!(source_paced_due(codex).is_some(), "the request stands");
+                drop(qos);
+            });
+            assert_eq!(fake_qos(), UTILITY);
+        }
+    });
 }
