@@ -1669,7 +1669,10 @@ pub fn collect_agent_status(
     captured_at: String,
     expires_at: String,
 ) -> AgentStatusSnapshot {
-    collect_agent_status_collection(source, captured_at, expires_at).source_health_snapshot
+    let mut snapshot =
+        collect_agent_status_collection(source, captured_at, expires_at).source_health_snapshot;
+    codex_canonical_identity_spelling(&mut snapshot);
+    snapshot
 }
 
 pub(crate) fn collect_agent_status_collection(
@@ -1843,7 +1846,9 @@ fn collect_codex_status_snapshots(
     let source_health_snapshot =
         codex_source_health_snapshot(&candidates, &captured_at, &expires_at);
     if snapshots.is_empty() {
-        snapshots.push(source_health_snapshot.clone());
+        let mut upload = source_health_snapshot.clone();
+        codex_canonical_identity_spelling(&mut upload);
+        snapshots.push(upload);
     }
     AgentStatusCollection {
         snapshots,
@@ -2195,7 +2200,6 @@ fn codex_source_health_snapshot(
                 "A Codex usage check failed (for example it timed out); it is retried at the next poll, and the last readings are kept, marked stale.",
             ));
     }
-    codex_canonical_identity_spelling(&mut source_health_snapshot);
     source_health_snapshot
 }
 
@@ -2212,8 +2216,11 @@ fn codex_source_health_snapshot(
 /// a weak local reading and must not mark the account's existing profile not
 /// current.
 ///
-/// Runs on the assembled source-health snapshot only, after bindings and
-/// dedup, so it never changes which homes are bound, kept or represented.
+/// Runs only on the copies that are uploaded: the setup scan's body
+/// ([`collect_agent_status`]) and the main lane's fallback when no home is
+/// bound. The collection's own source-health snapshot, which local status and
+/// active-session reconciliation read, keeps what was collected, so bindings,
+/// dedup, representation and local attribution are unchanged.
 fn codex_canonical_identity_spelling(snapshot: &mut AgentStatusSnapshot) {
     if snapshot.source != SourceKind::Codex {
         return;

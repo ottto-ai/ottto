@@ -3377,11 +3377,12 @@ fn assert_canonical_fill_of(
 
 /// [money] A default login read only from its id token (no saved reading
 /// yet: first pairing, setup, a login change) carries raw ids and no
-/// hashes. Source health, which a setup scan posts, and the main lane with
-/// no bound home both send it with the canonical hashes the provider read
-/// then validates as the binding: Low confidence and billing identity kept,
-/// currentness unsaid, nothing bound, no provider read. The bound reading
-/// after that read is sent unchanged.
+/// hashes. The setup scan's body and the main lane with no bound home both
+/// send it with the canonical hashes the provider read then validates as the
+/// binding: Low confidence and billing identity kept, currentness unsaid,
+/// nothing bound, no provider read. The collection's own source health (local
+/// status and active-session reconciliation) is unchanged, and the bound
+/// reading after the provider read is sent unchanged.
 #[cfg(unix)]
 #[test]
 #[serial]
@@ -3412,14 +3413,20 @@ fn a_raw_only_default_codex_login_is_sent_with_canonical_hashes() {
         assert_eq!(row.is_current, Some(false));
     }
 
-    // Source health (the setup scan's body); the same bytes when repeated.
+    // Local source health keeps what was collected.
     let health = codex_source_health_snapshot(std::slice::from_ref(&unread), captured, expires);
-    assert_canonical_fill_of(&unread.snapshot, &health, &pair);
-    assert_eq!(
-        codex_source_health_snapshot(std::slice::from_ref(&unread), captured, expires),
-        health
+    assert_eq!(health, unread.snapshot);
+
+    // The setup scan's body: the canonical pair, the same bytes when repeated.
+    let setup = collect_agent_status(
+        &SourceKind::Codex,
+        captured.to_string(),
+        expires.to_string(),
     );
-    let uploaded = health.redacted_for_backend();
+    let mut again = setup.clone();
+    codex_canonical_identity_spelling(&mut again);
+    assert_eq!(again, setup);
+    let uploaded = setup.redacted_for_backend();
     let account = uploaded.account.as_ref().expect("uploaded account");
     assert_eq!(codex_account_pair(account), pair);
     assert_eq!(account.confidence, AgentStatusConfidence::Low);
@@ -3435,7 +3442,8 @@ fn a_raw_only_default_codex_login_is_sent_with_canonical_hashes() {
         assert_eq!(row.is_current, None);
     }
 
-    // The main lane with no bound home uploads that same source health.
+    // The main lane with no bound home uploads its source health, filled;
+    // the collection's own source health stays as collected.
     let collection = collect_agent_status_collection(
         &SourceKind::Codex,
         captured.to_string(),
@@ -3445,9 +3453,11 @@ fn a_raw_only_default_codex_login_is_sent_with_canonical_hashes() {
         collection.codex_home_bindings.is_empty(),
         "nothing is bound"
     );
-    assert_eq!(
-        collection.snapshots,
-        vec![collection.source_health_snapshot.clone()]
+    assert_eq!(collection.snapshots.len(), 1);
+    assert_canonical_fill_of(
+        &collection.source_health_snapshot,
+        &collection.snapshots[0],
+        &pair,
     );
     let main = collection.snapshots[0].clone().redacted_for_backend();
     assert_eq!(
@@ -3491,9 +3501,10 @@ fn a_raw_only_default_codex_login_is_sent_with_canonical_hashes() {
 }
 
 /// [money] The same login in a bound managed home and an unread default:
-/// whichever reading source health sends names the managed home's binding,
-/// so the backend files both under one identity. The anchor's own reading,
-/// the one the main lane uploads, is unchanged; no provider read.
+/// whichever reading the setup scan sends (source health, filled) names the
+/// managed home's binding, so the backend files both under one identity. The
+/// anchor's own reading, the one the main lane uploads, is unchanged; no
+/// provider read.
 #[cfg(unix)]
 #[test]
 #[serial]
@@ -3559,13 +3570,14 @@ fn a_raw_only_default_names_the_pair_its_managed_home_binds() {
         .map(|candidate| candidate.binding.clone())
         .collect::<Vec<_>>();
 
-    let health = codex_source_health_snapshot(&candidates, captured, expires);
+    let mut setup = codex_source_health_snapshot(&candidates, captured, expires);
+    codex_canonical_identity_spelling(&mut setup);
     assert_eq!(
-        codex_account_pair(health.account.as_ref().expect("account")),
+        codex_account_pair(setup.account.as_ref().expect("account")),
         pair
     );
-    assert!(!health.plan_observations.is_empty());
-    for row in &health.plan_observations {
+    assert!(!setup.plan_observations.is_empty());
+    for row in &setup.plan_observations {
         assert_eq!(codex_row_pair(row), pair);
     }
     let mut sent = anchor.clone();
