@@ -10,9 +10,7 @@ use crate::snapshots::claude_request_census::{
 };
 use crate::snapshots::tests::complete_api_row;
 use crate::snapshots::upload_context_receipt::{EntityStamp, Receipt, RECEIPT_REPLAY_EPOCH};
-use crate::snapshots::{
-    apply_claude_code_line, collector_version, SnapshotAccumulator, SnapshotSource,
-};
+use crate::snapshots::{apply_claude_code_line, SnapshotAccumulator, SnapshotSource};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -73,6 +71,9 @@ fn index_holding(dir: &Path, copied: &[&str]) -> ScanIndex {
             "source_file_fingerprint":fingerprint}))
         .unwrap(),
     );
+    index
+        .file_snapshot_fingerprints
+        .insert(key.clone(), BTreeSet::from(["holder-body".into()]));
     index
         .claude_money_birth_store
         .record_observation(HOLDER, &key, t0());
@@ -366,83 +367,57 @@ fn accepted_receipt(index: &mut ScanIndex, dir: &Path) {
     crate::snapshots::e2_pipeline_scan_fixture::origin_accepted_for_test(index, &holder_key(dir));
 }
 
-/// The copy-prefix proof wait family this thread recorded.
-fn wait_counts() -> Value {
-    serde_json::to_value(take_thread_counts()).unwrap()["copy_prefix_wait"].clone()
-}
-
-/// [regress] A holder with no accepted body in any context (its census alone
-/// proves nothing): the prefix waits at most `HOLD_PASSES`, then counts,
-/// flagged, as one expired wait. A later acceptance removes it once, on the
-/// copy's next read.
+/// [money] A counted committed body owns its requests before an ACK. Later
+/// acceptance changes neither the copy decision nor its read obligation.
 #[test]
-fn copy_keeps_prefix_flagged_until_origin_has_an_accepted_body() {
-    take_thread_counts();
-    let dir = scratch();
-    let path = copy_at(&dir);
-    let mut index = index_holding(&dir, &["copy-a", "copy-b"]);
-    for _ in 1..super::super::copy_removals::HOLD_PASSES {
-        let held = decide_pass(&mut index, &path);
-        assert_eq!(fold(&held).prefix.held_requests, 2);
-        assert_eq!(fold(&held).disclosed, 0);
-    }
-    let kept = decide_pass(&mut index, &path);
-    assert_eq!(fold(&kept).entity.removed_requests, 0);
-    assert_eq!(fold(&kept).prefix.unproven_requests, 2, "flagged");
-    assert_eq!(fold(&kept).prefix.hold_expired, 2);
-    assert_eq!(fold(&kept).entity.totals().1, 3, "nothing counted nowhere");
-    assert_eq!(
-        wait_counts(),
-        json!({"version": collector_version(), "started": 1,
-            "expired": {"episodes": 1, "decisions": 3}})
-    );
-
-    let copy_key = local_index_key(&path);
-    index
-        .claude_money_birth_store
-        .set_money_marks(&copy_key, money_mark::DISCLOSED);
-    accepted_receipt(&mut index, &dir);
-    let removed = decide_pass(&mut index, &path);
-    assert_eq!(fold(&removed).entity.removed_requests, 2);
-    assert_eq!(fold(&removed).entity.totals().1, 1);
-    assert_eq!(fold(&removed).disclosed, 0);
-    let _ = fs::remove_dir_all(dir);
-}
-
-/// [regress] First read: the origin's body is not ACKed yet, so the existing
-/// proof wait holds the prefix (never a double count beside that body). The
-/// pass after the origin's ACK removes it and leaves no debt.
-#[test]
-fn first_read_defers_then_removes_on_the_pass_after_the_origin_ack() {
-    take_thread_counts();
+fn local_holder_removes_prefix_without_an_acceptance_wait() {
     let dir = scratch();
     let path = copy_at(&dir);
     let mut index = index_holding(&dir, &["copy-a", "copy-b"]);
     let first = decide_pass(&mut index, &path);
-    assert_eq!(fold(&first).prefix.held_requests, 2);
-    assert_eq!(fold(&first).entity.totals().1, 1, "own turn emits");
+    assert_eq!(fold(&first).entity.removed_requests, 2);
+    assert_eq!(fold(&first).entity.totals().1, 1);
     let file = fold(&first).copy_order().unwrap().1;
-    assert!(
-        index.claude_copy_removals.pending(file),
-        "debt reselects it"
-    );
-
+    assert!(!index.claude_copy_removals.pending(file));
     accepted_receipt(&mut index, &dir);
     let next = decide_pass(&mut index, &path);
     assert_eq!(fold(&next).entity.removed_requests, 2);
-    assert_eq!(fold(&next).prefix.held_requests, 0);
-    assert_eq!(fold(&next).disclosed, 0);
+    assert_eq!(fold(&next).entity.totals().1, 1);
     assert!(!index.claude_copy_removals.pending(file));
-    assert_eq!(
-        wait_counts()["proof"],
-        json!({"episodes": 1, "decisions": 2})
-    );
     let _ = fs::remove_dir_all(dir);
 }
 
-/// [regress] A saved removal of an indexed holder with no accepted body stays
-/// recorded but removes nothing; each kind of accepted body, in another
-/// context, lets the prefix go.
+/// [money] A holder with no final counted body cannot make a copy wait or
+/// remove requests. A later local body changes the answer without an ACK.
+#[test]
+fn unavailable_holder_counts_prefix_until_a_local_body_exists() {
+    let dir = scratch();
+    let path = copy_at(&dir);
+    let mut index = index_holding(&dir, &["copy-a", "copy-b"]);
+    let key = holder_key(&dir);
+    index
+        .file_snapshot_fingerprints
+        .insert(key.clone(), BTreeSet::new());
+    for _ in 0..10 {
+        let kept = decide_pass(&mut index, &path);
+        assert_eq!(fold(&kept).entity.removed_requests, 0);
+        assert_eq!(fold(&kept).entity.totals().1, 3);
+        assert_eq!(fold(&kept).prefix.unproven_requests, 2);
+        assert!(!index
+            .claude_copy_removals
+            .pending(location_key(&local_index_key(&path))));
+    }
+    index
+        .file_snapshot_fingerprints
+        .insert(key, BTreeSet::from(["holder-body".into()]));
+    let removed = decide_pass(&mut index, &path);
+    assert_eq!(fold(&removed).entity.removed_requests, 2);
+    assert_eq!(fold(&removed).entity.totals().1, 1);
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// [regress] A saved removal of a local owner stays recorded before
+/// acceptance; each kind of accepted body also proves durable ownership.
 #[test]
 fn accepted_body_in_any_context_decides_and_saved_removal_stays_recorded() {
     let dir = scratch();
@@ -457,8 +432,8 @@ fn accepted_body_in_any_context_decides_and_saved_removal_stays_recorded() {
         BTreeMap::from([(location_key(&key), hashes.into_iter().collect())]),
     );
     let saved = decide_pass(&mut index, &path);
-    assert_eq!(fold(&saved).entity.removed_requests, 0);
-    assert_eq!(fold(&saved).prefix.held_requests, 2);
+    assert_eq!(fold(&saved).entity.removed_requests, 2);
+    assert_eq!(fold(&saved).entity.totals().1, 1);
     assert!(!index.claude_copy_removals.get(file).is_empty());
 
     accepted_receipt(&mut index, &dir);
@@ -485,53 +460,182 @@ fn accepted_body_in_any_context_decides_and_saved_removal_stays_recorded() {
     let _ = fs::remove_dir_all(dir);
 }
 
-/// [regress] A below-floor or empty settlement reaches revision 3 with no body
-/// accepted, and only a local empty proof: the prefix waits, then counts.
+/// [money] An empty settlement supplies no counted body even when a census
+/// lists the requests. All requests remain counted immediately.
 #[test]
-fn below_floor_settlement_is_not_an_accepted_origin() {
+fn below_floor_settlement_is_not_a_local_owner() {
     let dir = scratch();
     let path = copy_at(&dir);
     let mut index = index_holding(&dir, &["copy-a", "copy-b"]);
-    let entry = index.files.get_mut(&holder_key(&dir)).unwrap();
-    entry.effective_upload_body_witness_revision = 3;
-    entry.upload_context_receipt = Some(Receipt {
+    let key = holder_key(&dir);
+    index
+        .file_snapshot_fingerprints
+        .insert(key.clone(), BTreeSet::new());
+    index
+        .files
+        .get_mut(&key)
+        .unwrap()
+        .effective_upload_body_witness_revision = 3;
+    index.files.get_mut(&key).unwrap().upload_context_receipt = Some(Receipt {
         context_fingerprint: "another-upload-context".into(),
         replay_generation: RECEIPT_REPLAY_EPOCH,
         source_witness: "a".repeat(64),
         body_witness: String::new(),
     });
-    assert!(!index.file_has_accepted_body(&holder_key(&dir)));
-    take_diag();
-    let held = decide_pass(&mut index, &path);
-    assert_eq!(fold(&held).entity.removed_requests, 0);
-    assert_eq!(fold(&held).prefix.held_requests, 2);
-    let diag = take_diag();
-    assert_eq!(diag.get("copy_prefix_origin_unaccepted_copies"), Some(&1));
-    assert_eq!(diag.get("copy_prefix_origin_unaccepted_passes"), Some(&1));
-    let second = decide_pass(&mut index, &path);
-    assert_eq!(fold(&second).prefix.held_requests, 2);
-    let diag = take_diag();
-    assert_eq!(diag.get("copy_prefix_origin_unaccepted_copies"), None);
-    assert_eq!(diag.get("copy_prefix_origin_unaccepted_passes"), Some(&1));
+    let kept = decide_pass(&mut index, &path);
+    assert_eq!(fold(&kept).entity.removed_requests, 0);
+    assert_eq!(fold(&kept).entity.totals().1, 3);
+    assert_eq!(fold(&kept).prefix.unproven_requests, 2);
     let _ = fs::remove_dir_all(dir);
 }
 
-/// [regress] A protected origin holding an old receipt (the observed case):
+/// [regress] A listed origin without a daemon acceptance:
 /// the copy keeps the prefix, flagged, with no wait for an ACK that cannot come.
 #[test]
 fn protected_origin_keeps_the_prefix_without_a_wait() {
     let dir = scratch();
     let path = copy_at(&dir);
     let mut index = index_holding(&dir, &["copy-a", "copy-b"]);
-    accepted_receipt(&mut index, &dir);
     let support = scratch();
     crate::snapshots::e2_pipeline_scan_fixture::write_exclusions(&support, &[HOLDER]);
     index.load_claude_reemission_exclusions(&support);
     let kept = decide_pass(&mut index, &path);
     assert_eq!(fold(&kept).entity.removed_requests, 0);
-    assert_eq!(fold(&kept).prefix.held_requests, 0);
     assert_eq!(fold(&kept).prefix.unproven_requests, 2, "flagged");
     assert_eq!(fold(&kept).entity.totals().1, 3);
+    let _ = fs::remove_dir_all(dir);
+    let _ = fs::remove_dir_all(support);
+}
+
+/// [money] Named parents use their committed local body even after the
+/// request census retired, with no acceptance or census prerequisite.
+#[test]
+fn committed_parent_proves_with_a_retired_census() {
+    let dir = scratch();
+    let mut index = index_holding(&dir, &["copy-a", "copy-b"]);
+    let key = holder_key(&dir);
+    let mut record = index.claude_request_census.get(&key).unwrap().clone();
+    record.retire();
+    index
+        .claude_request_census_mut_for_test()
+        .insert_for_test(&key, record);
+    assert!(parent_proves(
+        &index,
+        &key,
+        ROOT,
+        (t0() + 100_000_000_000, location_key("copy"))
+    ));
+    index
+        .file_snapshot_fingerprints
+        .insert(key.clone(), BTreeSet::new());
+    assert!(
+        !parent_proves(
+            &index,
+            &key,
+            ROOT,
+            (t0() + 100_000_000_000, location_key("copy"))
+        ),
+        "an empty committed entry supplies no requests"
+    );
+    index
+        .file_snapshot_fingerprints
+        .insert(key.clone(), BTreeSet::from(["holder-body".into()]));
+    index
+        .claude_account_deferred_holds
+        .insert(key.clone(), "held".into());
+    assert!(
+        !parent_proves(
+            &index,
+            &key,
+            ROOT,
+            (t0() + 100_000_000_000, location_key("copy"))
+        ),
+        "an unaccepted held body supplies no requests"
+    );
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// [money] Named-parent removals retain their dependency after its census
+/// retires, so deleting an unaccepted parent restores the surviving copy.
+#[test]
+fn retired_unaccepted_parent_removals_are_recorded_and_invalidated() {
+    let dir = scratch();
+    let path = copy_at(&dir);
+    let mut index = index_holding(&dir, &["copy-a", "copy-b"]);
+    let parent = holder_key(&dir);
+    let mut record = index.claude_request_census.get(&parent).unwrap().clone();
+    record.retire();
+    index
+        .claude_request_census_mut_for_test()
+        .insert_for_test(&parent, record);
+    let key = local_index_key(&path);
+    index.files.insert(
+        key.clone(),
+        serde_json::from_value(json!({"size_bytes":8,
+        "modified_unix_seconds":1,"source_file_fingerprint":"b".repeat(64)}))
+        .unwrap(),
+    );
+    index
+        .claude_money_birth_store
+        .record_observation(ROOT, &key, t0() + 100_000_000_000);
+    let lines = [
+        json!({"type":"fork-context-ref", "sessionId":ROOT,
+        "parentSessionId":HOLDER, "timestamp":at(100)}),
+        line("copy-a", &at(1), 10),
+        line("copy-b", &at(2), 11),
+    ];
+    let mut items = read_file(&path, &index, &lines);
+    decide_page_copies(&mut items, &index, None).apply(&mut index);
+    assert_eq!(fold(&items).entity.removed_requests, 2);
+    let file = location_key(&key);
+    assert_eq!(index.claude_copy_removals.get(file).len(), 1);
+    assert_eq!(
+        index.claude_copy_removals.get(file)[0].0,
+        location_key(&parent)
+    );
+    for _ in 0..10 {
+        let previous = index.clone();
+        reconcile_copy_ownership(&previous, &mut index);
+        assert_eq!(
+            index.claude_copy_removals.get(file).len(),
+            1,
+            "unchanged retired-census ownership keeps its saved proof"
+        );
+        assert!(!index.claude_copy_removals.pending(file));
+        index.claude_copy_removals =
+            serde_json::from_value(serde_json::to_value(&index.claude_copy_removals).unwrap())
+                .unwrap();
+    }
+    let previous = index.clone();
+    index.files.remove(&parent);
+    reconcile_copy_ownership(&previous, &mut index);
+    assert!(index.claude_copy_removals.get(file).is_empty());
+    assert!(index.claude_copy_removals.pending(file));
+    let restored = read_file(&path, &index, &lines);
+    let mut restored = restored;
+    decide_page_copies(&mut restored, &index, None).apply(&mut index);
+    assert_eq!(fold(&restored).entity.totals().1, 2);
+    assert_eq!(fold(&restored).entity.removed_requests, 0);
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// [money] Already accepted coverage survives all later local withholding.
+#[test]
+fn accepted_owner_survives_later_holds_and_listing() {
+    let dir = scratch();
+    let mut index = index_holding(&dir, &["copy-a", "copy-b"]);
+    accepted_receipt(&mut index, &dir);
+    let key = holder_key(&dir);
+    index
+        .claude_account_deferred_holds
+        .insert(key.clone(), "held".into());
+    index
+        .file_snapshot_fingerprints
+        .insert(key.clone(), BTreeSet::new());
+    let support = scratch();
+    crate::snapshots::e2_pipeline_scan_fixture::write_exclusions(&support, &[HOLDER]);
+    index.load_claude_reemission_exclusions(&support);
+    assert!(origin_owned(&index, &[], &key));
     let _ = fs::remove_dir_all(dir);
     let _ = fs::remove_dir_all(support);
 }

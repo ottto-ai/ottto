@@ -1278,11 +1278,10 @@ fn changed_account_evidence_matches_cold_placement() {
     });
 }
 
-/// D62 guard: the census deadline holds past the expired hold's pass too.
-/// That pass's body was the hold's one delivery; the hold never restarts, and
-/// nothing selects afterwards.
+/// [money] An incomplete walk counts the prefix and keeps one durable mark.
+/// A completed follow-up removes it once, then unchanged pages stay quiet.
 #[test]
-fn e2_pipeline_resumed_prefix_hold_expired_under_deadline_never_restarts_the_hold() {
+fn e2_pipeline_deadline_counts_then_completed_walk_removes_once() {
     with_e2(|| {
         let mut c = Corpus::new("e2-pipeline-prefix-expiry-deadline");
         c.root(ROOT, &resumed(ROOT, &[A, B]));
@@ -1307,11 +1306,11 @@ fn e2_pipeline_resumed_prefix_hold_expired_under_deadline_never_restarts_the_hol
             let page = under_deadline(prior.clone());
             prior = settle(&c, &prior, page, &mut progress);
         }
-        let after = under_deadline(prior);
-        assert!(
-            body(&after, COPY).is_none(),
-            "the expired hold never restarts"
-        );
+        let after = ready(&c, &scanner, prior.clone(), 100, true);
+        assert_eq!(body(&after, COPY).unwrap().removed_request_count, Some(2));
+        prior = settle(&c, &prior, after, &mut progress);
+        let quiet = ready(&c, &scanner, prior, 100, true);
+        assert!(body(&quiet, COPY).is_none());
     });
 }
 

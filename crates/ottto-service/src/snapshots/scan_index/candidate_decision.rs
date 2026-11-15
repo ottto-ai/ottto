@@ -163,8 +163,7 @@ impl ScanIndex {
         // A withheld key's audit debt (carried onto its reverted entry) cannot
         // settle while held; an unchanged one defers it to its next counted
         // re-parse, usually the binding read, instead of a Full every pass.
-        // A prefix-only hold must survive settlement of the file's own turns.
-        // Its persisted attempt counter expires on the third decision pass.
+        // A committed ownership change selects one finished copy read.
         if self
             .claude_copy_removals
             .pending(claude_money_birth_store::location_key(&key))
@@ -532,10 +531,10 @@ impl ScanIndex {
             scan_identity_version,
         );
         self.files.insert(key.clone(), entry);
+        self.claude_copy_removals
+            .clear_hold(claude_money_birth_store::location_key(&key));
         match parse_outcome {
             ScanParseOutcome::ConfirmedEmpty | ScanParseOutcome::PolicySuppressed => {
-                self.claude_copy_removals
-                    .clear_hold(claude_money_birth_store::location_key(&key));
                 self.note_empty_file_upload_context(&key);
                 self.confirmed_empty_files.insert(key);
             }
@@ -580,5 +579,65 @@ impl ScanIndex {
                     && disposition.parser_generation == JSONL_TERMINAL_DISPOSITION_GENERATION
             })
             .map(|disposition| &disposition.loss)
+    }
+}
+
+#[cfg(test)]
+mod copy_mark_tests {
+    use super::*;
+
+    /// [behaviour] Every finished read consumes the mark, including a held
+    /// unknown read and outcomes with no emitted body. It cannot cause ten
+    /// unchanged held passes to read the same file again.
+    #[test]
+    fn finished_held_empty_and_suppressed_reads_consume_copy_mark() {
+        for outcome in [
+            ScanParseOutcome::Snapshot,
+            ScanParseOutcome::Unknown,
+            ScanParseOutcome::ConfirmedEmpty,
+            ScanParseOutcome::PolicySuppressed,
+        ] {
+            let candidate = CandidateFile {
+                physical_identity: Some([1, 2]),
+                scan_root: PathBuf::from("/synthetic"),
+                path: PathBuf::from("/synthetic/1338a80a-f36e-4cbc-a5bb-50fc66430ba5.jsonl"),
+                size_bytes: 8,
+                modified_unix_seconds: 1,
+                modified_unix_nanos: 0,
+                source_file_fingerprint: "a".repeat(64),
+                legacy_source_file_fingerprint: String::new(),
+                legacy_config_reconciliation_required: false,
+                opened_object_identity: String::new(),
+                fingerprint_changed_nanos: 0,
+                fingerprint_birth_nanos: 1,
+                withheld_content_stamp: Some("content-and-evidence".into()),
+            };
+            let mut index = ScanIndex::default();
+            let key = local_index_key(&candidate.path);
+            let location = claude_money_birth_store::location_key(&key);
+            index.record(candidate.clone(), None, ScanParseOutcome::Snapshot);
+            index
+                .claude_account_deferred_holds
+                .insert(key.clone(), "held".into());
+            index.withheld_memo.hold_tokens(&key, 3);
+            index
+                .withheld_memo
+                .retain_held(&index.claude_account_deferred_holds);
+            let seen = index.withheld_completed_seen(&candidate).unwrap();
+            index.remember_withheld_content(&key, seen);
+            index.claude_copy_removals.mark(location);
+            assert_eq!(
+                index.candidate_decision_with_reason(&candidate).1,
+                Some(CandidateParseReason::SourceChanged)
+            );
+            index.record(candidate.clone(), None, outcome);
+            for _ in 0..10 {
+                assert!(!index.claude_copy_removals.pending(location));
+                assert_eq!(
+                    index.candidate_decision(&candidate),
+                    CandidateDecision::Skip
+                );
+            }
+        }
     }
 }

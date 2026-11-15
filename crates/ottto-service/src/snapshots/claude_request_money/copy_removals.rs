@@ -1,6 +1,6 @@
 //! Stored copy removals (copy-family fix): per Claude
-//! file, the request hashes it once removed as copies on an earlier holder's
-//! CURRENT census proof, grouped by that holder. A later re-read whose holder
+//! file, the request hashes it once removed as copies under an earlier local
+//! holder, grouped by that holder. A later re-read whose holder
 //! proof list has since retired rebuilds the same deduped body instead of
 //! restoring the prefix. A holder no longer indexed cannot disprove anything:
 //! its group stands, counted (`copy_removal_holder_absent_kept`);
@@ -8,24 +8,23 @@
 //! (class L): never uploaded, never a wire field.
 //!
 //! Every decision is stored whole, whatever its size; recorded decisions are
-//! never evicted and leave only with their file. Prefix retry debt expires on
-//! its third decision pass, across restart.
+//! never evicted and leave only with their file. Ownership changes select one finished read, across restart.
 use crate::snapshots::claude_money_birth_store::LocationKey;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet};
-
-pub(crate) const HOLD_PASSES: u64 = 3;
 
 /// One file's stored removals: (holder, sorted unique hashes), by holder.
 type Groups = Box<[(LocationKey, Box<[u64]>)]>;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CopyRemovals {
-    /// (file, prefix hold attempts, groups), sorted by key. Empty groups are
+    /// (file, re-decision mark, groups), sorted by key. Empty groups are
     /// allowed only for retry debt. Recorded decisions are never evicted.
     files: Vec<(LocationKey, u64, Groups)>,
     metadata_lost: bool,
+    /// Page-only provisional holders; never encoded.
+    pub(super) relied_on: BTreeSet<LocationKey>,
 }
 
 impl CopyRemovals {
@@ -56,30 +55,16 @@ impl CopyRemovals {
         Ok(serde_json::from_value(value).unwrap_or_else(|_| Self::missing()))
     }
     pub(crate) fn pending(&self, file: LocationKey) -> bool {
-        self.hold_age(file) > 0
-    }
-    /// The passes `file`'s prefix has been held so far (0: no wait).
-    pub(crate) fn hold_age(&self, file: LocationKey) -> u64 {
         self.files
             .binary_search_by_key(&file, |f| f.0)
-            .map_or(0, |i| self.files[i].1)
+            .is_ok_and(|i| self.files[i].1 > 0)
     }
-    /// Hold at most two passes; the third emits flagged. No unbounded or
-    /// non-discoverable hold is created.
-    pub(crate) fn advance_hold(&mut self, file: LocationKey) -> bool {
+    /// Re-decide once after committed local ownership facts change. The slot
+    /// retains its CCR2 encoding; legacy ages also select exactly one read.
+    pub(crate) fn mark(&mut self, file: LocationKey) {
         match self.files.binary_search_by_key(&file, |f| f.0) {
-            Ok(i) => {
-                self.files[i].1 = self.files[i].1.saturating_add(1);
-                if self.files[i].1 < HOLD_PASSES {
-                    return true;
-                }
-                self.clear_hold(file);
-                false
-            }
-            Err(i) => {
-                self.files.insert(i, (file, 1, Box::new([])));
-                true
-            }
+            Ok(i) => self.files[i].1 = 1,
+            Err(i) => self.files.insert(i, (file, 1, Box::new([]))),
         }
     }
     pub(crate) fn clear_hold(&mut self, file: LocationKey) {
@@ -127,7 +112,7 @@ impl CopyRemovals {
                     .count() as u64
             })
             .sum::<u64>();
-        let attempts = self.hold_age(file);
+        let attempts = u64::from(self.pending(file));
         self.replace(file, attempts, groups);
         added
     }
@@ -140,7 +125,32 @@ impl CopyRemovals {
         }
     }
 
-    /// A proven physical move preserves removed-copy proofs and retry age.
+    pub(super) fn holders(&self) -> impl Iterator<Item = LocationKey> + '_ {
+        self.files
+            .iter()
+            .flat_map(|(_, _, groups)| groups.iter().map(|(holder, _)| *holder))
+    }
+
+    pub(super) fn drop_holders(&mut self, holders: &BTreeSet<LocationKey>) -> Vec<LocationKey> {
+        let mut changed = Vec::new();
+        for (file, _, groups) in &mut self.files {
+            if groups.iter().any(|(holder, _)| holders.contains(holder)) {
+                *groups = groups
+                    .iter()
+                    .filter(|(holder, _)| !holders.contains(holder))
+                    .cloned()
+                    .collect();
+                changed.push(*file);
+            }
+        }
+        // A held dependent is deliberately not marked. Do not encode an
+        // empty zero-mark row: older and current CCR decoders reject it.
+        self.files
+            .retain(|(_, mark, groups)| *mark > 0 || !groups.is_empty());
+        changed
+    }
+
+    /// A proven physical move preserves removed-copy proofs and re-decision mark.
     pub(in crate::snapshots) fn rekey(&mut self, from: LocationKey, to: LocationKey) {
         if from == to {
             return;
@@ -216,7 +226,8 @@ impl crate::heap_layout_bound::HeapLayoutBound for CopyRemovals {
                 bytes = bytes.checked_add(std::mem::size_of_val(&**hashes))?;
             }
         }
-        c.add(bytes)
+        c.add(bytes)?;
+        crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.relied_on, c)
     }
 }
 
@@ -287,12 +298,13 @@ fn decode(encoded: &str) -> Option<CopyRemovals> {
     let mut removals = CopyRemovals {
         files: Vec::with_capacity(files),
         metadata_lost,
+        relied_on: BTreeSet::new(),
     };
     for _ in 0..files {
         let file = LocationKey::from_bytes(take(&mut input)?);
         let seq = u64::from_le_bytes(take(&mut input)?);
         let seq = if &version == b"CCR1" { 0 } else { seq };
-        if seq >= HOLD_PASSES {
+        if seq > 2 {
             return None;
         }
         let group_count = u32::from_le_bytes(take(&mut input)?) as usize;
@@ -386,37 +398,53 @@ mod tests {
         assert_eq!(state.get(second)[0].1.len(), huge.len());
     }
 
+    /// [behaviour] The existing slot is a durable mark, not an expiring wait.
     #[test]
-    fn prefix_hold_attempts_survive_restart_and_expire_on_third_pass() {
+    fn ownership_mark_survives_restart_until_a_finished_read() {
         let file = location_key("copy");
         let mut state = CopyRemovals::missing();
-        for pass in 1..=HOLD_PASSES {
-            assert_eq!(state.advance_hold(file), pass < HOLD_PASSES);
-            assert_eq!(state.pending(file), pass < HOLD_PASSES);
+        state.mark(file);
+        for _ in 0..10 {
             state = reload(&state);
+            assert!(state.pending(file));
             assert!(state.metadata_lost());
         }
+        state.clear_hold(file);
         assert!(state.is_empty());
     }
 
-    /// [money] A whole-body-held new file's hold debt survives pages and
-    /// restarts until it expires or its source is removed (`forget`).
+    /// [money] Invalidating a provisional holder drops only its groups;
+    /// accepted historical groups under another holder survive.
     #[test]
-    fn held_new_file_debt_survives_pages_and_restart() {
-        let file = location_key("new-held-file");
+    fn provisional_holder_invalidation_preserves_other_groups() {
+        let file = location_key("copy");
         let mut state = CopyRemovals::default();
-        for pass in 1..=HOLD_PASSES {
-            assert_eq!(state.advance_hold(file), pass < HOLD_PASSES);
-            // A page without a settled entry for the whole-body-held new file
-            // does not touch its debt: no sweep exists.
-            state = reload(&state);
-            assert_eq!(state.pending(file), pass < HOLD_PASSES);
-        }
-        assert!(state.is_empty());
-        assert!(state.advance_hold(file));
-        state.forget(file); // ordinary confirmed source-removal path
-        assert!(!state.pending(file));
-        assert!(state.is_empty());
+        state.store(file, groups(&[("failed", &[1]), ("accepted", &[2])]));
+        assert_eq!(
+            state.drop_holders(&BTreeSet::from([location_key("failed")])),
+            vec![file]
+        );
+        state.mark(file);
+        let state = reload(&state);
+        assert!(state.pending(file));
+        assert_eq!(
+            state.get(file),
+            &[(location_key("accepted"), Box::from([2]))]
+        );
+    }
+
+    /// [format] A held dependent needs no mark: dropping its last group
+    /// still leaves a valid empty store for both CCR readers.
+    #[test]
+    fn invalidated_held_dependent_has_no_empty_zero_mark_record() {
+        let file = location_key("held-copy");
+        let mut state = CopyRemovals::default();
+        state.store(file, groups(&[("unaccepted", &[1])]));
+        assert_eq!(
+            state.drop_holders(&BTreeSet::from([location_key("unaccepted")])),
+            vec![file]
+        );
+        assert!(reload(&state).is_empty());
     }
 
     #[test]

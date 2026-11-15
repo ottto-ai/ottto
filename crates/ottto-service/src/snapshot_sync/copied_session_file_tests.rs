@@ -265,7 +265,7 @@ fn held_history_original_does_not_bring_its_copy() {
         let key = holder.to_string_lossy().into_owned();
         prior.activate_effective_upload_body_witness_revision(3);
         assert!(prior.re_owe_effective_upload_body_witness_revision(&key, 2));
-        prior.claude_copy_removals.advance_hold(location_key(&key));
+        prior.claude_copy_removals.mark(location_key(&key));
         std::fs::write(
             c.support
                 .join("snapshots/claude_code-reemission-exclusions.txt"),
@@ -480,14 +480,19 @@ fn copied_file_version_three_converges_once() {
             } else {
                 prefix
             };
-            let path = c.write_at(&relative, &text, BORN);
-            let key = path.to_string_lossy().into_owned();
-            // Model the former completed-but-unaccepted holder wait. It
-            // expires once, producing the over-counted body this upgrade fixes.
-            prior.claude_copy_removals.advance_hold(location_key(&key));
-            prior.claude_copy_removals.advance_hold(location_key(&key));
+            c.write_at(&relative, &text, BORN);
+            // Rebuild the old over-counted body with an unavailable local
+            // holder, rather than manufacturing an expired acceptance wait.
+            let holder_key = c.root.join(file(ROOT)).to_string_lossy().into_owned();
+            let held_source = prior.files[&holder_key].source_file_fingerprint.clone();
+            prior
+                .effective_upload_body_witness_revision_excluded_source_files
+                .insert(held_source.clone());
             owe(&mut prior);
-            let old = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
+            let mut old = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
+            old.index
+                .effective_upload_body_witness_revision_excluded_source_files
+                .remove(&held_source);
             let head = body(&old, session).unwrap().clone();
             let expected = if shape == 2 { 4 } else { requests as u64 };
             let expected_tokens = if shape == 2 { 3_501 } else { tokens };

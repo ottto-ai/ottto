@@ -585,6 +585,21 @@ pub(in super::super) fn save_locked(
     claim_only: bool,
     custody: bool,
 ) -> Result<bool> {
+    if binding(path).is_none()
+        || (index.v2().persistence_v2.is_none() && !route_needed(path, custody)?)
+    {
+        let previous = if path.exists() {
+            super::super::read_scan_index_representation(
+                path,
+                "copy_ownership",
+                "claude_code",
+                None,
+            )?
+        } else {
+            ScanIndex::default()
+        };
+        super::super::claude_request_money::e2::reconcile_copy_ownership(&previous, index);
+    }
     if binding(path).is_none() {
         ensure!(index.v2().persistence_v2.is_none(), Hold::ForeignBinding);
         return Ok(false);

@@ -96,23 +96,36 @@ file-system hint / periodic listing → select file → read new bytes from save
   provider-skill facts merge before their existing projection; changed files stay distinct and artifacts
   use the existing union. Continuous plain groups
   retain their existing replay path; no admitted-key ledger is persisted.
-- **Claude copied history.** Earlier accepted main files prove pre-birth
-  copies within the same session, or through the in-folder holder's session
-  across folders. Same-session proof uses the session's accepted body,
-  regardless of which file carried it; cross-session proof requires that
-  file's acceptance. Stored self-removals never prove another copy. An origin
-  only under an unrelated session elsewhere leaves its copy counted.
-  The original in-folder census wait still expires on its third decision.
+- **Claude copied history.** Earlier main files prove pre-birth copies from
+  destination-local facts: a previously accepted body remains ownership evidence;
+  otherwise a nonempty counted page or committed body needs a current,
+  identity-complete census and no suppression, hold or matching quarantine.
+  Same-session proof can use the session's other locations. A holder that itself
+  removes a request cannot count it for a later copy; chains resolve in birth and
+  location order. Unproven copies count immediately, without an acceptance wait.
+  Stored groups preserve historical removals, including listed holders and accepted
+  holders later deleted locally. Groups relying on an unaccepted page holder are
+  provisional: a save drops them and marks their copies if that holder failed to
+  commit a counted body. Deleting an unaccepted holder also drops its groups.
+  Each index save compares committed local facts and marks later copies whose
+  decisions disagree. The existing removal-record slot is a 0/1 re-decision mark,
+  cleared on every finished read, including held and empty outcomes. Held copies
+  wait for their ordinary release read. An unfinished decision walk sets the mark;
+  save-time census walks have no deadline. Encoding and rollback remain compatible:
+  earlier binaries read the mark as a short prefix wait.
+  Source and copy uploads remain independent. Copy-first discovery and either
+  entity ACK order can leave a temporary overlap or gap until the required bodies
+  are accepted; offline or refused work has no delivery-time bound.
   An all-covered copy-only page drops its items when the session has another
   file; own turns still publish. A selected content twin pulls at most its
-  earliest accepted main holder, and a selected holder (not history-held)
+  earliest locally owned main holder, and a selected holder (not history-held)
   pulls the content twins it is that holder for, so neither file publishes
   the session without the other. A holder is never a twin, so pulls never
   cascade, and ordinary discovery acquires the pulled file without an extra
   seed content read.
   Money rule three selects content twins, path twins and disclosed main
   files once, using every census hash and one in-memory census walk without
-  a deadline. Only a candidate sharing ids with an earlier accepted holder
+  a deadline. Only a candidate sharing ids with an earlier locally owned holder
   and that holder are re-owed, with the rule version stamped in the same save.
   Disclosed main files include cross-session resumes whose own path and
   content identity would otherwise leave their counted prefix unchanged.

@@ -26,19 +26,18 @@ fn pass(index: &mut ScanIndex, path: &Path, lines: &[Value]) -> Vec<SnapshotItem
     items
 }
 /// (removed, counted, held, flagged) requests of the copy.
-fn outcome(items: &[SnapshotItem]) -> (u64, u64, u64, u64) {
+fn outcome(items: &[SnapshotItem]) -> (u64, u64, u64) {
     let fold = fold(items);
     (
         fold.entity.removed_requests,
         fold.entity.totals().1,
-        fold.prefix.held_requests,
         fold.prefix.unproven_requests,
     )
 }
 
 /// [regress] A resume whose own turns a formerly listed version wrote takes
 /// the request-id proof like any other: an accepted holder removes the
-/// prefix, an unaccepted one defers it, and without a holder it counts,
+/// prefix, a local unaccepted one removes it, and without a holder it counts,
 /// flagged, never dropped on timestamps alone.
 #[test]
 fn listed_writer_copy_needs_a_holder() {
@@ -49,9 +48,9 @@ fn listed_writer_copy_needs_a_holder() {
     ];
     // (holder holds the copies, holder accepted, expected outcome)
     for (holds, accepted, expected) in [
-        (true, true, (2, 1, 0, 0)),
-        (true, false, (0, 1, 2, 0)),
-        (false, false, (0, 3, 0, 2)),
+        (true, true, (2, 1, 0)),
+        (true, false, (2, 1, 0)),
+        (false, false, (0, 3, 2)),
     ] {
         let dir = scratch();
         let path = copy_at(&dir);
@@ -101,12 +100,11 @@ fn holder_outside_the_copys_folder_proves_nothing() {
     }
 }
 
-/// [behaviour] A copy waits only for an unscanned main file of another
-/// session in its own folder; one queued in another folder cannot hold
-/// its prefix, so the copy decides now.
+/// [behaviour] Unscanned files provide no positive ownership proof. A copy
+/// counts its prefix immediately, in either folder.
 #[test]
-fn only_an_unscanned_file_in_the_copys_folder_waits() {
-    for (same_folder, held) in [(true, 2), (false, 0)] {
+fn unscanned_files_do_not_hold_the_copy_prefix() {
+    for same_folder in [true, false] {
         let dir = scratch();
         let path = copy_at(&dir);
         let elsewhere = PathBuf::from(format!("{}-elsewhere", dir.display()));
@@ -128,15 +126,18 @@ fn only_an_unscanned_file_in_the_copys_folder_waits() {
             });
         let items = decide_pass(&mut index, &path);
         assert_eq!(
-            fold(&items).prefix.held_requests,
-            held,
+            fold(&items).entity.totals().1,
+            3,
             "same folder {same_folder}"
         );
         assert_eq!(
             fold(&items).prefix.unproven_requests,
-            2 - held,
+            2,
             "same folder {same_folder}"
         );
+        assert!(!index
+            .claude_copy_removals
+            .pending(location_key(&local_index_key(&path))));
         let _ = fs::remove_dir_all(dir);
     }
 }

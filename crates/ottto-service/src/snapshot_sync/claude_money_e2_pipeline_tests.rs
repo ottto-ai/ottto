@@ -4189,7 +4189,7 @@ fn e2_pipeline_file_without_copied_prefix_stores_and_flags_nothing() {
 }
 
 #[test]
-fn e2_pipeline_resumed_prefix_hold_emits_own_turns_and_expires_after_three_decisions() {
+fn e2_pipeline_deadline_counts_prefix_and_marks_one_followup() {
     for sampled in [false, true] {
         with_e2(|| {
             let mut c = Corpus::new("e2-pipeline-prefix-expiry");
@@ -4204,7 +4204,7 @@ fn e2_pipeline_resumed_prefix_hold_emits_own_turns_and_expires_after_three_decis
                 &resumed(COPY, &[A, B, C]),
                 "2026-08-02T07:03:00Z",
             );
-            for pass in 1..=3 {
+            for _ in 1..=3 {
                 let mut page = c.raw(&scanner, prior.clone(), 100, sampled, &[]);
                 e2::take_diag();
                 crate::snapshots::claude_request_census::with_walk_deadline_for_test(|| {
@@ -4215,24 +4215,21 @@ fn e2_pipeline_resumed_prefix_hold_emits_own_turns_and_expires_after_three_decis
                 assert!(crate::snapshots::claude_request_money::is_request_owned_literal(copy));
                 assert_eq!(
                     (copy.request_count, copy.removed_request_count),
-                    (if pass < 3 { 1 } else { 3 }, Some(0))
+                    (3, Some(0))
                 );
-                assert_eq!(
-                    copy_diag(&[
-                        "copy_prefix_held_requests",
-                        "copy_prefix_hold_expired",
-                        "copy_prefix_unproven"
-                    ]),
-                    if pass < 3 { [2, 0, 0] } else { [0, 2, 2] }
-                );
+                assert_eq!(copy_diag(&["copy_prefix_unproven"]), [2]);
                 prior = settle(&c, &prior, page, &mut progress); // save/reload each pass
             }
-            // The expired hold's body went on its own pass, a stored re-fold
-            // sent as an ordinary update (L02); nothing selects afterwards.
+            let completed = ready(&c, &scanner, prior.clone(), 100, sampled);
+            assert_eq!(
+                body(&completed, COPY).unwrap().removed_request_count,
+                Some(2)
+            );
+            let prior = settle(&c, &prior, completed, &mut progress);
             let quiet = ready(&c, &scanner, prior, 100, sampled);
             assert!(
                 body(&quiet, COPY).is_none(),
-                "expired retry debt never selects forever"
+                "a finished decision clears the mark"
             );
         });
     }
@@ -4549,13 +4546,8 @@ fn e2_pipeline_recorded_removals_survive_repeated_walk_deadlines_with_live_proof
                 "a timeout never restores a validated stored removal"
             );
             assert_eq!(
-                copy_diag(&[
-                    "copy_removal_reused",
-                    "copy_prefix_held_requests",
-                    "copy_prefix_hold_expired",
-                    "copy_prefix_unproven"
-                ]),
-                [3, 0, 0, 0]
+                copy_diag(&["copy_removal_reused", "copy_prefix_unproven"]),
+                [3, 0]
             );
             prior = settle(&c, &prior, page, &mut progress);
         }
@@ -5378,11 +5370,10 @@ fn e2_pipeline_copy_derived_row_is_kept_while_own_evidence_is_unreadable() {
     }
 }
 
-/// A prefix hold over buckets #909 accepted defers the whole
-/// session (no shrunken revision, no ledger change) under the same
-/// three-pass bound; a never-accepted session keeps the prefix-only hold.
+/// Declared copied-prefix removals publish through the accepted bucket
+/// reconciliation without holding the whole session.
 #[test]
-fn e2_pipeline_prefix_hold_over_accepted_buckets_defers_the_whole_session() {
+fn e2_pipeline_declared_prefix_removal_over_accepted_buckets_publishes() {
     for accepted in [false, true] {
         with_e2(|| {
             let mut c = Corpus::new("e2-pipeline-accepted-prefix-hold");
@@ -5418,37 +5409,21 @@ fn e2_pipeline_prefix_hold_over_accepted_buckets_defers_the_whole_session() {
                 ));
             }
             let saved = serde_json::to_vec(&ledger).unwrap();
-            let keys = [
-                "copy_prefix_held_requests",
-                "copy_prefix_hold_expired",
-                "copy_prefix_accepted_session_holds",
-            ];
-            for pass in 1..=3 {
-                let mut page = c.raw(&scanner, prior.clone(), 100, false, &[]);
-                e2::take_diag();
-                crate::snapshots::claude_request_census::with_walk_deadline_for_test(|| {
-                    page.enrich_with(&c, Some(&mut ledger));
-                });
-                if pass == 3 {
-                    let copy = body(&page, COPY).expect("the bound expires flagged");
-                    assert_eq!(
-                        (copy.request_count, copy.removed_request_count),
-                        (3, Some(0))
-                    );
-                    assert_eq!(copy_diag(&keys), [0, 2, 0]);
-                } else if accepted {
-                    assert_withheld(&page, COPY, "accepted prefix hold");
-                    assert_eq!(copy_diag(&keys), [2, 0, 1]);
-                } else {
-                    let copy = body(&page, COPY).expect("never-accepted own turns publish");
-                    assert_eq!(
-                        (copy.request_count, copy.removed_request_count),
-                        (1, Some(0))
-                    );
-                    assert_eq!(copy_diag(&keys), [2, 0, 0]);
-                }
-                prior = settle(&c, &prior, page, &mut progress);
-            }
+            let mut page = c.raw(&scanner, prior.clone(), 100, false, &[]);
+            page.enrich_with(&c, Some(&mut ledger));
+            let copy = body(&page, COPY)
+                .expect("declared removals publish without an accepted-prefix hold");
+            assert_eq!(
+                (copy.request_count, copy.removed_request_count),
+                (1, Some(2))
+            );
+            assert_eq!(
+                copy.input_tokens + copy.removed_usage.as_ref().unwrap().input_tokens,
+                30
+            );
+            prior = settle(&c, &prior, page, &mut progress);
+            let quiet = ready(&c, &scanner, prior, 100, false);
+            assert!(body(&quiet, COPY).is_none());
             assert_eq!(serde_json::to_vec(&ledger).unwrap(), saved);
         });
     }
