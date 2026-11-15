@@ -862,6 +862,22 @@ class UseBindingTests(unittest.TestCase):
         self.fails(base, {**moved, 'snapshots.rs': 'mod dest;\n' + root + 'use self::z::v;\n'},
                    'use added beside an item-level macro call: use self::z::v in crate::snapshots')
 
+    def test_audited_import_free_macro_calls_allow_new_explicit_bindings(self):
+        for macro in ('thread_local! { static FLAG: u8 = 0; }\n',
+                      'crate::heap_layout_bound::fields!(Holder; value);\n'):
+            with self.subTest(macro=macro):
+                base, head = self.move_f(macro, macro + 'use crate::snapshots::x::v;\n')
+                self.passes(base, head)
+                base, head = self.move_f(macro, macro + 'use crate::snapshots::x::*;\n')
+                self.fails(base, head, 'new glob import:')
+
+    def test_unknown_macro_paths_still_reject_new_explicit_bindings(self):
+        for macro in ('unknown!();\n', 'fields!(Holder; value);\n',
+                      'other::thread_local! { static FLAG: u8 = 0; }\n'):
+            with self.subTest(macro=macro):
+                base, head = self.move_f(macro, macro + 'use crate::snapshots::x::v;\n')
+                self.fails(base, head, 'use added beside an item-level macro call:')
+
     def test_source_globs_cannot_prove_a_binding_kept_its_identity(self):
         # [regress] A source glob can inherit a newly shadowed value, prelude name or facade.
         for name, body, extra in (
