@@ -38,7 +38,11 @@ impl Homes {
     fn new() -> Self {
         let c = Corpus::new();
         c.write(MAIN, Some("a"));
-        append(&c.path(MAIN), &(turn(3) + &header(MAIN, Some("switched"))));
+        // Usage on both sides of the mid-session account switch.
+        append(
+            &c.path(MAIN),
+            &(turn(3) + &header(MAIN, Some("switched")) + &turn(4)),
+        );
         c.write(OTHER, Some("b"));
         c.write(SIDE, Some("b"));
         c.write(GAP, None);
@@ -164,7 +168,7 @@ impl Homes {
     }
     fn tail_of(&self, path: &Path) -> (DeliveryMode, u64) {
         let start = fs::metadata(path).unwrap().len();
-        append(path, &turn(4));
+        append(path, &turn(5));
         (DeliveryMode::Tail, start)
     }
 }
@@ -288,7 +292,8 @@ enum Arm {
     /// reconciliation page, and resumes in this mode.
     Recover(Mode),
     /// An earlier build left the red store: persisted witnesses for every
-    /// removed entry, saved through the committable checkpoint.
+    /// removed entry, saved through the committable checkpoint. The retry
+    /// then pages, restarting from the durable store between pages.
     Upgrade,
 }
 
@@ -387,21 +392,25 @@ fn drain(arm: Arm) -> Drained {
         .get_mut(&local_index_key(&h.path(REMOVED_FRESH)))
         .unwrap()
         .insert(shared.clone());
-    let grown = match arm {
-        Arm::Recover(_) => vec![GAP, MAIN],
-        _ => vec![GAP],
+    // Recovery and the upgrade checkpoint the durable store between the
+    // start page and the bounded reconciliation pages.
+    let paged = match arm {
+        Arm::Recover(mode) => Some(mode),
+        Arm::Upgrade => Some(Mode::Restart),
+        Arm::Drain => None,
+    };
+    let grown = if paged.is_some() {
+        vec![GAP, MAIN]
+    } else {
+        vec![GAP]
     };
     let mut tails = grown
         .iter()
         .map(|id| h.tail_of(&h.c.path(id)))
         .collect::<Vec<_>>();
-    let limit = if matches!(arm, Arm::Recover(_)) {
-        1
-    } else {
-        100
-    };
+    let limit = if paged.is_some() { 1 } else { 100 };
     let mut steps = vec![h.step(false, index, cache.clone(), limit, NOW)];
-    if let Arm::Recover(mode) = arm {
+    if let Some(mode) = paged {
         let start = &steps[0];
         let walk = start
             .index
@@ -520,7 +529,7 @@ fn drain(arm: Arm) -> Drained {
                 .any(|actual| actual.source_session_id == item.source_session_id)
         });
         let mut actual = route(&step.index, &step.scan, step.posts.clone());
-        if let Arm::Recover(mode) = arm {
+        if let Some(mode) = paged {
             actual.mode = mode;
         }
         money_oracle::assert_equivalent(&emitted(&step.index, &cold_page), &actual);
@@ -623,8 +632,9 @@ fn removed_account_root_recovers_between_pages() {
 
 /// [money] O5: the red store an earlier build left (persisted witnesses for
 /// every removed entry after a finished red matching retry), saved and loaded
-/// through the committable checkpoint, drains and retires on the new build's
-/// first matching retry, with no re-read.
+/// through the committable checkpoint, drains on the new build's first
+/// matching retry and retires across bounded reconciliation pages, each one
+/// restarted from the durable store, with no re-read.
 #[test]
 fn upgraded_removed_root_witnesses_drain_and_retire() {
     let _lock = DECODER_TEST_LOCK
