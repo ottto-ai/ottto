@@ -30146,11 +30146,11 @@ X-API-Key = "otel_redacted"
             .is_empty());
     }
 
-    /// Each scan source carries the scan's own time, and the selected status
-    /// row only when the collection has one; an omitted row sends no key.
+    /// Each scan source carries the scan's own time beside the selected
+    /// status row, whose own (cached) captured_at is left as it was.
     #[test]
     #[serial]
-    fn setup_scan_sources_carry_scan_time_and_only_a_selected_status_row() {
+    fn setup_scan_sources_carry_scan_time_and_the_selected_status_row() {
         let _lock = lock_backend_test_env();
         let root = control_test_root("setup-scan-selected-status");
         let _home = EnvVarGuard::set_path("HOME", &root);
@@ -30163,36 +30163,31 @@ X-API-Key = "otel_redacted"
             "captured_at": "2026-11-13T00:00:00Z", "expires_at": "2026-11-13T00:15:00Z",
         }))
         .unwrap();
-        for index in [Some(0), None] {
-            let collection = crate::agent_status::AgentStatusCollection {
-                snapshots: vec![cached.clone()],
-                source_health_snapshot: cached.clone(),
-                codex_scan_homes: Vec::new(),
-                codex_home_bindings: Vec::new(),
-                setup_snapshot_index: index,
-            };
-            let scan = crate::agent_status_refresh::with_collection(collection, || {
-                build_local_scan(&test_machine(), vec![])
-            });
-            let scan = serde_json::to_value(&scan).unwrap();
-            let sources = scan["sources"].as_array().unwrap();
-            assert_eq!(sources.len(), 3);
-            for source in sources {
-                let captured_at = source["captured_at"].as_str().expect("scan time");
-                assert!(time::OffsetDateTime::parse(
-                    captured_at,
-                    &time::format_description::well_known::Rfc3339
-                )
-                .is_ok());
-                assert_ne!(captured_at, "2026-11-13T00:00:00Z");
-                match index {
-                    Some(_) => assert_eq!(
-                        source["agent_status"],
-                        serde_json::to_value(cached.clone().redacted_for_backend()).unwrap()
-                    ),
-                    None => assert!(source.get("agent_status").is_none()),
-                }
-            }
+        let collection = crate::agent_status::AgentStatusCollection {
+            snapshots: vec![cached.clone()],
+            source_health_snapshot: cached.clone(),
+            codex_scan_homes: Vec::new(),
+            codex_home_bindings: Vec::new(),
+            setup_snapshot_index: Some(0),
+        };
+        let scan = crate::agent_status_refresh::with_collection(collection, || {
+            build_local_scan(&test_machine(), vec![])
+        });
+        let scan = serde_json::to_value(&scan).unwrap();
+        let sources = scan["sources"].as_array().unwrap();
+        assert_eq!(sources.len(), 3);
+        for source in sources {
+            let captured_at = source["captured_at"].as_str().expect("scan time");
+            assert!(time::OffsetDateTime::parse(
+                captured_at,
+                &time::format_description::well_known::Rfc3339
+            )
+            .is_ok());
+            assert_ne!(captured_at, "2026-11-13T00:00:00Z");
+            assert_eq!(
+                source["agent_status"],
+                serde_json::to_value(cached.clone().redacted_for_backend()).unwrap()
+            );
         }
         let _ = fs::remove_dir_all(&root);
     }

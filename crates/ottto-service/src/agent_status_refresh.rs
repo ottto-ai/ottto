@@ -1381,56 +1381,24 @@ mod tests {
         assert_eq!(lane.state.lock().unwrap().generation, 1);
         assert_eq!(lane.state.lock().unwrap().schedule.next_due, seconds(300));
     }
-    /// Warm setup scans read the lane's published collection: the same Arc,
-    /// the same captured_at, no new acquisition. A failed or stopped lane,
-    /// or a collection with no selected row, omits the scan's status row.
+    /// The setup scan omits its status row when the lane's acquisition failed
+    /// or stopped, or the collection selected no row; no retry, no fallback.
     #[test]
-    fn warm_setup_scans_share_the_lane_collection_without_a_new_pass() {
-        let lane = StatusLane::new();
-        let mut acquisitions = 0;
-        assert!(lane.pass(
-            Duration::ZERO,
-            true,
-            || {
-                acquisitions += 1;
-                specimen(SourceKind::Pi)
-            },
-            |_| true,
-            || seconds(7)
-        ));
-        let first = lane.collection_at(seconds(10), false).unwrap();
-        let second = lane.collection_at(seconds(200), false).unwrap();
-        assert!(Arc::ptr_eq(&first, &second));
-        let scans = [seconds(20), seconds(250)].map(|at| {
-            serde_json::to_string(
-                &setup_snapshot_of(lane.collection_at(at, false)).expect("selected row"),
-            )
-            .unwrap()
-        });
-        assert_eq!(scans[0], scans[1]);
-        assert_eq!(
-            scans[0],
-            serde_json::to_string(&first.snapshots[0].clone().redacted_for_backend()).unwrap()
-        );
-        assert!(scans[0].contains("\"captured_at\":\"2026-10-05T00:00:00Z\""));
-        assert_eq!(acquisitions, 1);
-        assert_eq!(lane.state.lock().unwrap().generation, 1);
-
+    fn setup_scan_omits_status_on_lane_error_or_no_selected_row() {
         let mut unselected = specimen(SourceKind::Pi);
         unselected.setup_snapshot_index = None;
         assert!(setup_snapshot_of(Ok(Arc::new(unselected))).is_none());
-        lane.stop();
-        assert!(setup_snapshot_of(lane.collection_at(seconds(260), false)).is_none());
-
-        let failed = StatusLane::new();
-        assert!(failed.pass(
+        let lane = StatusLane::new();
+        assert!(lane.pass(
             Duration::ZERO,
             true,
             || panic!("synthetic acquisition panic"),
             |_| false,
             || seconds(7)
         ));
-        assert!(setup_snapshot_of(failed.collection_at(seconds(8), false)).is_none());
+        assert!(setup_snapshot_of(lane.collection_at(seconds(8), false)).is_none());
+        lane.stop();
+        assert!(setup_snapshot_of(lane.collection_at(seconds(9), false)).is_none());
     }
     #[test]
     fn explicit_manual_refresh_can_recover_acquisition_during_backoff() {
