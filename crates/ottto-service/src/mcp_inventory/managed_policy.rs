@@ -337,8 +337,9 @@ impl ClaudeMcpPolicy {
     /// The daemon's environment stands in for a session's and can differ from
     /// it. An allowlist entry left with an unset variable matches nothing. A
     /// denylist entry is also tried with unset variables filled from the user
-    /// settings `env`, and as written, against the configured value both
-    /// expanded and as written, so a deny never matches less.
+    /// settings `env`, and as written, against the configured value expanded
+    /// from the daemon's environment, from the settings `env` (managed over
+    /// user) and as written, so a deny never matches less.
     fn matches(&self, rule: &Rule, server: &ConfiguredServer, name: &str, allow: bool) -> bool {
         let pinned =
             |var: &str| env_value(&self.managed_env, var).or_else(|| std::env::var(var).ok());
@@ -360,7 +361,14 @@ impl ClaudeMcpPolicy {
             if allow {
                 return vec![expanded.unwrap_or_else(|| text.to_string())];
             }
-            [expanded, Some(text.to_string())]
+            // The client applies the settings `env` (managed over user) before
+            // it expands a configured value.
+            let effective = expand(text, |var| {
+                env_value(&self.managed_env, var)
+                    .or_else(|| env_value(&self.user_env, var))
+                    .or_else(|| std::env::var(var).ok())
+            });
+            [expanded, effective, Some(text.to_string())]
                 .into_iter()
                 .flatten()
                 .collect()

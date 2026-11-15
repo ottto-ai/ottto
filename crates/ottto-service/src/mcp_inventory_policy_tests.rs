@@ -595,6 +595,45 @@ fn local_scope_servers_keep_their_project_and_identity() {
 }
 
 #[test]
+fn a_deny_matches_configured_values_expanded_from_the_settings_env() {
+    let (home, managed, marker) = policy_home("policy-configured-env");
+    // Absent from the daemon's environment; only the settings `env` sets it.
+    let var = "OTTTO_POLICY_TEST_ID1_ARG";
+    write_json(
+        &home.join(".claude.json"),
+        json!({"mcpServers": {"user-srv": {
+            "command": "/usr/bin/touch",
+            "args": [marker.to_string_lossy(), format!("${{{var}}}")],
+        }}}),
+    );
+    let deny = json!([{"serverCommand": ["/usr/bin/touch", marker.to_string_lossy(), "blocked"]}]);
+    let settings = managed.join("managed-settings.json");
+    let user = home.join(".claude").join("settings.local.json");
+    assert!(!policy_server(&home, &managed, "user-srv").disabled);
+    // (managed settings, user settings): the managed `env`, or the user's.
+    let rows = [
+        (
+            json!({"env": {var: "blocked"}, "deniedMcpServers": deny}),
+            json!({}),
+        ),
+        (
+            json!({"deniedMcpServers": deny}),
+            json!({"env": {var: "blocked"}}),
+        ),
+    ];
+    for (row, (managed_settings, user_settings)) in rows.into_iter().enumerate() {
+        write_json(&settings, managed_settings);
+        write_json(&user, user_settings);
+        assert!(
+            policy_server(&home, &managed, "user-srv").disabled,
+            "row {row}"
+        );
+        assert!(!policy_started(&home, &managed, &marker), "row {row}");
+    }
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
 fn server_url_patterns_follow_the_documented_matching() {
     use super::managed_policy::url_matches;
     let cases = [
