@@ -123,10 +123,37 @@ fn assert_metadata(a: &CodexTitleMetadata, b: &CodexTitleMetadata, paths: &[Path
         a.root_sidecars.keys().collect::<Vec<_>>(),
         b.root_sidecars.keys().collect::<Vec<_>>()
     );
+    // Retained raw rows; reused homes have already dropped thread/history.
+    let raw = |home: &codex_root_copies::RootSidecar| {
+        let r = &home.raw;
+        let evidence = r.evidence.iter().map(outcome).collect::<Vec<_>>();
+        (
+            r.titles.clone(),
+            r.created.clone(),
+            r.edges.clone(),
+            r.edges_complete,
+            r.index.clone(),
+            evidence,
+        )
+    };
     for (home, rows) in &a.root_sidecars {
         assert_eq!(rows.threads, b.root_sidecars[home].threads);
         assert_eq!(rows.extents, b.root_sidecars[home].extents);
+        assert_eq!(raw(rows), raw(&b.root_sidecars[home]), "retained raw rows");
     }
+    assert_eq!(prefixes(a), prefixes(b), "compacted title prefixes");
+    let loaders = |m: &CodexTitleMetadata| {
+        let d = &m.local_diagnostics;
+        [
+            &d.state_titles,
+            &d.state_threads,
+            &d.spawn_edges,
+            &d.rollout_extents,
+            &d.session_index,
+        ]
+        .map(outcome)
+    };
+    assert_eq!(loaders(a), loaders(b), "loader outcomes");
     for path in paths {
         assert_eq!(
             a.path_sidecar_fingerprint(path),
@@ -148,6 +175,45 @@ fn assert_metadata(a: &CodexTitleMetadata, b: &CodexTitleMetadata, paths: &[Path
         );
     }
 }
+/// Loader outcome without the acquisition counters that reuse changes.
+fn outcome(evidence: &crate::codex_scan_diagnostics::LoaderEvidence) -> serde_json::Value {
+    let mut value = serde_json::to_value(evidence).unwrap();
+    for counter in [
+        "reused_roots",
+        "reloaded_roots",
+        "transient_retries",
+        "completed_after_retry",
+        "snapshot_fallbacks",
+    ] {
+        value.as_object_mut().unwrap().remove(counter);
+    }
+    value
+}
+type Prefix = (
+    Option<PathBuf>,
+    String,
+    Option<(Option<[u8; 32]>, [u8; 32])>,
+);
+/// Every row's compacted title prefix, which row equality ignores.
+fn prefixes(m: &CodexTitleMetadata) -> Vec<Prefix> {
+    let prefix = |row: &Shared<CodexStateThread>| {
+        let title = row.compact_title.as_ref()?;
+        Some((
+            title.raw_digest,
+            <[u8; 32]>::from(title.prefix.clone().finalize()),
+        ))
+    };
+    let homes = m.root_sidecars.iter().flat_map(|(home, rows)| {
+        rows.threads
+            .iter()
+            .map(move |(id, row)| (Some(home.clone()), id, row))
+    });
+    let merged = m.state_threads.iter().map(|(id, row)| (None, id, row));
+    homes
+        .chain(merged)
+        .map(|(home, id, row)| (home, id.clone(), prefix(row)))
+        .collect()
+}
 fn parity(facts: &mut SidecarFacts, roots: &[PathBuf], paths: &[PathBuf]) -> CodexTitleMetadata {
     for home in roots
         .iter()
@@ -156,6 +222,14 @@ fn parity(facts: &mut SidecarFacts, roots: &[PathBuf], paths: &[PathBuf]) -> Cod
     {
         sync_home(home);
     }
+    parity_in_place(facts, roots, paths)
+}
+/// Per-home reuse against a cold load of the same inputs, as they are now.
+pub(in crate::snapshots) fn parity_in_place(
+    facts: &mut SidecarFacts,
+    roots: &[PathBuf],
+    paths: &[PathBuf],
+) -> CodexTitleMetadata {
     let mut reused = CodexTitleMetadata::load_reused(roots, facts);
     let mut fresh = CodexTitleMetadata::load_from_roots(roots);
     // The emitted gauge is the kept facts' charge, and 0 with nothing kept.
@@ -170,14 +244,12 @@ fn parity(facts: &mut SidecarFacts, roots: &[PathBuf], paths: &[PathBuf]) -> Cod
     assert_metadata(&reused, &fresh, paths);
     reused
 }
-fn seed(fixture: &Fixture) -> (Connection, PathBuf) {
+/// A thread row of `fixture`, with token use, timestamps and its rollout path.
+fn seed(fixture: &Fixture, id: &str, title: Option<&str>) -> (Connection, PathBuf) {
     let db = Connection::open(fixture.0.join("writer/state_5.sqlite")).unwrap();
     db.execute_batch("PRAGMA journal_mode=WAL").unwrap();
-    let path = fixture
-        .0
-        .join("sessions")
-        .join(format!("rollout-{ID}.jsonl"));
-    db.execute("INSERT INTO threads VALUES (?1, 'Base title', 10, 0, 1790000000, 1790000001, 'gpt-5.2', ?2, 'user', NULL)", rusqlite::params![ID, path.to_str().unwrap()]).unwrap();
+    let path = rollout(fixture, id);
+    db.execute("INSERT INTO threads VALUES (?1, ?2, 10, 0, 1790000000, 1790000001, 'gpt-5.2', ?3, 'user', NULL)", rusqlite::params![id, title, path.to_str().unwrap()]).unwrap();
     (db, path)
 }
 
@@ -187,7 +259,7 @@ fn seed(fixture: &Fixture) -> (Connection, PathBuf) {
 fn sidecar_state_transitions_match_fresh() {
     let a = Fixture::new();
     let b = Fixture::new();
-    let (db, path) = seed(&b);
+    let (db, path) = seed(&b, ID, Some("Base title"));
     let mut facts = SidecarFacts::default();
     let mut roots = a.roots();
     roots.extend(b.roots());
@@ -274,10 +346,19 @@ fn sidecar_state_transitions_match_fresh() {
     fs::hard_link(b.0.join("state_5.sqlite"), b.0.join("hardlink")).unwrap();
     assert!(SourceStamp::capture_sqlite(&b.0.join("state_5.sqlite")).is_none());
     assert!(!parity(&mut facts, &roots, std::slice::from_ref(&path)).state_census_incomplete);
-    assert!(facts.homes.kept.is_empty(), "a partial group holds no RAM");
+    assert!(
+        !facts.homes.kept.contains_key(&b.0),
+        "an unstamped home is not kept"
+    );
+    assert_eq!(facts.homes.kept.len(), 1, "the other home stays kept");
     let repeated = parity(&mut facts, &roots, std::slice::from_ref(&path));
-    assert_eq!(repeated.local_diagnostics.state_titles.reloaded_roots, 2);
-    assert!(facts.homes.kept.is_empty());
+    assert_eq!(repeated.local_diagnostics.state_titles.reloaded_roots, 1);
+    // A listed home missing from the kept facts reads as a roster change.
+    assert_eq!(
+        repeated.local_diagnostics.sidecar_reload_cause,
+        "roster_changed"
+    );
+    assert_eq!(facts.homes.kept.len(), 1);
     fs::remove_file(b.0.join("hardlink")).unwrap();
     parity(&mut facts, &roots, std::slice::from_ref(&path));
     assert_eq!(facts.homes.kept.len(), 2);
@@ -387,7 +468,7 @@ fn subcensus_failures_are_isolated() {
         "ALTER TABLE threads RENAME COLUMN first_user_message TO old_message",
     ] {
         let f = Fixture::new();
-        let (db, path) = seed(&f);
+        let (db, path) = seed(&f, ID, Some("Base title"));
         let mut facts = SidecarFacts::default();
         parity(&mut facts, &f.roots(), std::slice::from_ref(&path));
         db.execute_batch(sql).unwrap();
@@ -406,7 +487,7 @@ fn subcensus_failures_are_isolated() {
 #[test]
 fn alias_conflict_keeps_legacy_physical_fingerprint() {
     let f = Fixture::new();
-    let (db, path) = seed(&f);
+    let (db, path) = seed(&f, ID, Some("Base title"));
     db.execute("INSERT INTO threads VALUES (?1, 'Alias title', 0, 0, NULL, NULL, NULL, NULL, 'user', NULL)", [ID.to_uppercase()]).unwrap();
     sync_home(&f.0);
     let metadata = CodexTitleMetadata::load_from_roots(&f.roots());
@@ -472,7 +553,7 @@ fn sqlite_witness_routes_and_refuses_moved_snapshot() {
 #[test]
 fn kept_home_drops_raw_rows() {
     let f = Fixture::new();
-    let (db, path) = seed(&f);
+    let (db, path) = seed(&f, ID, Some("Base title"));
     let upper = "AAAAAAAA-BBBB-4CCC-8DDD-000000000002";
     let other =
         f.0.join("sessions")
@@ -506,7 +587,7 @@ fn kept_home_drops_raw_rows() {
         .collect();
     let merged = CodexTitleMetadata::merge_roots(
         BTreeMap::from([(f.0.clone(), Arc::new(old.clone()))]),
-        false,
+        &BTreeSet::new(),
     );
     assert_metadata(&merged, &second, &paths);
     let size = |home: &codex_root_copies::RootSidecar| {
@@ -517,4 +598,198 @@ fn kept_home_drops_raw_rows() {
         - 2 * std::mem::size_of::<Vec<u8>>();
     assert!(size(&slim) < size(&old));
     assert_eq!(size(&old) - size(&base), raw);
+}
+
+const IDS: [&str; 3] = [
+    ID,
+    "aaaaaaaa-bbbb-4ccc-8ddd-000000000003",
+    "aaaaaaaa-bbbb-4ccc-8ddd-000000000004",
+];
+/// `n` synthetic homes in sorted roster order.
+fn sorted_homes(n: usize) -> Vec<Fixture> {
+    let mut homes = (0..n).map(|_| Fixture::new()).collect::<Vec<_>>();
+    homes.sort_by(|a, b| a.0.cmp(&b.0));
+    homes
+}
+fn roots_of(homes: &[Fixture]) -> Vec<PathBuf> {
+    homes.iter().flat_map(Fixture::roots).collect()
+}
+fn state(home: &Fixture) -> Connection {
+    Connection::open(home.0.join("writer/state_5.sqlite")).unwrap()
+}
+fn rollout(home: &Fixture, id: &str) -> PathBuf {
+    home.0.join("sessions").join(format!("rollout-{id}.jsonl"))
+}
+fn history(home: &Fixture, sql: &str) {
+    Connection::open(home.0.join("writer/thread_history_1.sqlite")).unwrap().execute_batch(&format!("CREATE TABLE IF NOT EXISTS thread_history_projection_state (thread_id TEXT, next_rollout_byte_offset INTEGER, next_rollout_ordinal INTEGER); {sql}")).unwrap();
+}
+/// Each id's rollout path in every home, so every physical view is compared.
+fn all_paths(homes: &[Fixture], ids: &[&str]) -> Vec<PathBuf> {
+    homes
+        .iter()
+        .flat_map(|home| ids.iter().map(|id| rollout(home, id)))
+        .collect()
+}
+/// A parity pass, then its reused home count and recorded cause.
+fn pass(
+    facts: &mut SidecarFacts,
+    roots: &[PathBuf],
+    paths: &[PathBuf],
+    reused: u32,
+    cause: &str,
+) -> CodexTitleMetadata {
+    let metadata = parity(facts, roots, paths);
+    let d = &metadata.local_diagnostics;
+    assert_eq!(
+        (d.state_titles.reused_roots, d.sidecar_reload_cause),
+        (reused, cause)
+    );
+    metadata
+}
+
+/// [money] Only homes whose stamps changed reload; one or two changed homes
+/// and the following unchanged pass each equal a cold load.
+#[test]
+fn per_home_reuse_reloads_only_changed_homes() {
+    let homes = sorted_homes(3);
+    let roots = roots_of(&homes);
+    for (home, id) in homes.iter().zip(IDS) {
+        seed(home, id, Some("Own title"));
+    }
+    let paths = all_paths(&homes, &IDS);
+    let mut facts = SidecarFacts::default();
+    pass(&mut facts, &roots, &paths, 0, "not_kept");
+    pass(&mut facts, &roots, &paths, 3, "");
+    let bump = |home: &Fixture| {
+        state(home)
+            .execute_batch("UPDATE threads SET tokens_used=tokens_used+1")
+            .unwrap()
+    };
+    bump(&homes[1]);
+    pass(&mut facts, &roots, &paths, 2, "stamp_changed");
+    pass(&mut facts, &roots, &paths, 3, "");
+    bump(&homes[0]);
+    bump(&homes[2]);
+    let two = pass(&mut facts, &roots, &paths, 1, "stamp_changed");
+    assert_eq!(two.local_diagnostics.sidecar_changed_homes, [0b101, 0, 0]);
+    pass(&mut facts, &roots, &paths, 3, "");
+}
+
+/// [money] An alias conflict appearing in a changed home sorted before or
+/// after a kept home's null-title row and extent reloads the pass cold;
+/// a changed conflict key set and its disappearance also equal a cold load.
+#[test]
+fn conflict_in_a_changed_home_reloads_cold() {
+    let (x, y) = (IDS[1], IDS[2]);
+    let alias = |id: &str| {
+        format!("DELETE FROM thread_history_projection_state; INSERT INTO thread_history_projection_state VALUES ('{id}', 20, 2), ('{}', 21, 3)", id.to_uppercase())
+    };
+    for changed in [0, 2] {
+        let homes = sorted_homes(3);
+        let roots = roots_of(&homes);
+        seed(&homes[1], x, None);
+        history(
+            &homes[1],
+            &format!("INSERT INTO thread_history_projection_state VALUES ('{x}', 20, 2)"),
+        );
+        seed(&homes[2 - changed], y, None);
+        let paths = all_paths(&homes, &[x, y]);
+        let mut facts = SidecarFacts::default();
+        pass(&mut facts, &roots, &paths, 0, "not_kept");
+        pass(&mut facts, &roots, &paths, 3, "");
+        history(&homes[changed], &alias(x));
+        let conflict = pass(&mut facts, &roots, &paths, 0, "conflict");
+        assert!(conflict.identity_conflicts.contains(x));
+        assert!(facts.homes.kept.is_empty());
+        pass(&mut facts, &roots, &paths, 0, "not_kept");
+        history(&homes[changed], &alias(y));
+        pass(&mut facts, &roots, &paths, 0, "not_kept");
+        pass(&mut facts, &roots, &paths, 0, "not_kept");
+        history(
+            &homes[changed],
+            "DELETE FROM thread_history_projection_state",
+        );
+        pass(&mut facts, &roots, &paths, 0, "not_kept");
+        pass(&mut facts, &roots, &paths, 3, "");
+    }
+}
+
+/// [money] A copy conflict in a changed home sorted between two kept homes
+/// reloads the pass cold, so the later kept home's view drops the key too.
+#[test]
+fn conflict_between_kept_homes_reloads_cold() {
+    let homes = sorted_homes(3);
+    let roots = roots_of(&homes);
+    let copied = rollout(&homes[0], ID);
+    for home in &homes {
+        state(home).execute("INSERT INTO threads VALUES (?1, 'Copied', 10, 0, 1790000000, 1790000001, 'gpt-5.2', ?2, 'user', NULL)", rusqlite::params![ID, copied.to_str().unwrap()]).unwrap();
+    }
+    let paths = all_paths(&homes, &[ID]);
+    let mut facts = SidecarFacts::default();
+    pass(&mut facts, &roots, &paths, 0, "not_kept");
+    assert!(pass(&mut facts, &roots, &paths, 3, "")
+        .identity_conflicts
+        .is_empty());
+    state(&homes[1])
+        .execute_batch("UPDATE threads SET model='other-model'")
+        .unwrap();
+    let conflict = pass(&mut facts, &roots, &paths, 0, "conflict");
+    assert!(conflict.identity_conflicts.contains(ID));
+    pass(&mut facts, &roots, &paths, 0, "not_kept");
+    state(&homes[1])
+        .execute_batch("UPDATE threads SET model='gpt-5.2'")
+        .unwrap();
+    pass(&mut facts, &roots, &paths, 0, "not_kept");
+    pass(&mut facts, &roots, &paths, 3, "");
+}
+
+/// [money] Only another home's session-index title, created classification,
+/// title deletion or created-row removal changes a kept home's title inputs:
+/// that pass reloads cold, and the next unchanged pass reuses every home.
+#[test]
+fn another_homes_title_inputs_reload_cold() {
+    for other in [0, 2] {
+        let homes = sorted_homes(3);
+        let roots = roots_of(&homes);
+        seed(&homes[1], ID, Some("Base title"));
+        let paths = all_paths(&homes, &[ID]);
+        let mut facts = SidecarFacts::default();
+        pass(&mut facts, &roots, &paths, 0, "not_kept");
+        pass(&mut facts, &roots, &paths, 3, "");
+        let index = homes[other].0.join("session_index.jsonl");
+        for change in 0..4 {
+            match change {
+                0 => fs::write(&index, json!({"id": ID, "thread_name": "Winning title"}).to_string() + "\n").unwrap(),
+                1 => state(&homes[other]).execute_batch(&format!("INSERT INTO threads VALUES ('{ID}', NULL, 0, 0, NULL, NULL, NULL, NULL, 'agent_created_thread', '')")).unwrap(),
+                2 => fs::write(&index, "").unwrap(),
+                _ => state(&homes[other]).execute_batch("DELETE FROM threads").unwrap(),
+            }
+            let fallback = pass(&mut facts, &roots, &paths, 0, "title_inputs");
+            assert!(fallback.identity_conflicts.is_empty());
+            pass(&mut facts, &roots, &paths, 3, "");
+        }
+    }
+}
+
+/// [money] An added or removed home leaves the others reused; an added or
+/// removed home that owns a kept id's winning title reloads cold.
+#[test]
+fn roster_changes_reuse_the_remaining_homes() {
+    let homes = sorted_homes(4);
+    let (all, three) = (roots_of(&homes), roots_of(&homes[..3]));
+    seed(&homes[1], ID, Some("Base title"));
+    let paths = all_paths(&homes, &[ID]);
+    let mut facts = SidecarFacts::default();
+    pass(&mut facts, &three, &paths, 0, "not_kept");
+    pass(&mut facts, &three, &paths, 3, "");
+    pass(&mut facts, &all, &paths, 3, "roster_changed");
+    pass(&mut facts, &all, &paths, 4, "");
+    pass(&mut facts, &three, &paths, 3, "roster_changed");
+    pass(&mut facts, &three, &paths, 3, "");
+    let winning = json!({"id": ID, "thread_name": "Winning title"}).to_string() + "\n";
+    fs::write(homes[3].0.join("session_index.jsonl"), winning).unwrap();
+    pass(&mut facts, &all, &paths, 0, "title_inputs");
+    pass(&mut facts, &all, &paths, 4, "");
+    pass(&mut facts, &three, &paths, 0, "title_inputs");
+    pass(&mut facts, &three, &paths, 3, "");
 }

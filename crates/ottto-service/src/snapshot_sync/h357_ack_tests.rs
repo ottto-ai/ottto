@@ -739,7 +739,6 @@ fn h359_refused_cache_probe_settles_without_head_and_healthy_sibling_continues()
         &probes,
         "h359-probes",
         &mut ledger,
-        true,
         |batch, cas| {
             calls.push((batch.len(), cas));
             let rejected = batch
@@ -813,7 +812,6 @@ fn h359_refused_cache_probe_settles_without_head_and_healthy_sibling_continues()
         &probes[1..],
         "h359-probes",
         &mut restarted,
-        true,
         |_, _| panic!("unchanged refused probe cannot resend"),
         |_| Ok(()),
     )
@@ -903,7 +901,6 @@ fn h360_quarantined_probe_carries_exact_held_body_without_request() {
             &probes,
             "h360-held",
             &mut ledger,
-            true,
             |_, _| panic!("an exactly held probe body cannot resend"),
             |_| Ok(()),
         )
@@ -1007,7 +1004,6 @@ fn h360_mixed_siblings_held_probe_does_not_block_healthy_head_or_unrelated_page(
         &probes,
         "h360-mixed",
         &mut ledger,
-        true,
         |batch, cas| {
             assert!(
                 batch
@@ -1188,7 +1184,6 @@ fn h360_preflight_rejected_probe_self_quarantines_then_settles_as_held() {
         &probes,
         "h360-preflight",
         &mut ledger,
-        true,
         |batch, cas| {
             calls.push((batch.len(), cas));
             if let Some(position) = batch
@@ -1248,7 +1243,6 @@ fn h360_preflight_rejected_probe_self_quarantines_then_settles_as_held() {
         &probes[..1],
         "h360-preflight",
         &mut ledger,
-        true,
         |_, _| panic!("a not-yet-due local hold cannot resend"),
         |state| state.save(&path),
     )
@@ -1267,7 +1261,6 @@ fn h360_preflight_rejected_probe_self_quarantines_then_settles_as_held() {
         &probes[..1],
         "h360-preflight",
         &mut ledger,
-        true,
         |_, _| {
             retries += 1;
             Err(anyhow::Error::new(SnapshotBatchPreflightRejected {
@@ -1304,7 +1297,6 @@ fn h360_probe_conflict_defers_without_source_abort_and_merges_count() {
         &probes,
         "h360-conflict",
         &mut ledger,
-        true,
         |batch, cas| {
             calls.push((batch.len(), cas));
             let mut ack = response(&batch, 0);
@@ -1456,7 +1448,6 @@ fn h360_probe_conflict_defers_without_source_abort_and_merges_count() {
         &probes,
         "h360-mixed",
         &mut mixed,
-        true,
         |batch, cas| {
             let mut ack = response(&batch, 0);
             if cas {
@@ -1501,7 +1492,6 @@ fn h360_probe_conflict_defers_without_source_abort_and_merges_count() {
             &probes,
             "h360-conflict",
             &mut ledger,
-            true,
             |_, _| match case {
                 "shed" => Err(anyhow::Error::new(UploadShed {
                     status: 429,
@@ -1628,7 +1618,6 @@ fn h360_legacy_count_only_cas_ack_still_fails_closed_without_head() {
         std::slice::from_ref(&probe),
         "h360-legacy",
         &mut ledger,
-        true,
         |batch, cas| {
             calls.push((batch.len(), cas));
             let mut ack = response(&batch, 0);
@@ -1676,7 +1665,6 @@ fn h360_body_witness_mismatch_in_cas_stage_mints_no_head() {
         &probes,
         "h360-witness",
         &mut ledger,
-        true,
         |batch, cas| {
             let mut ack = response(&batch, 0);
             if cas {
@@ -1742,7 +1730,6 @@ fn h360_persist_failure_after_cas_ack_certifies_nothing_and_resumes_cas_only() {
         &probes,
         "h360-persist",
         &mut ledger,
-        true,
         |batch, cas| {
             cas_stage.set(cas);
             let mut ack = response(&batch, 0);
@@ -1792,7 +1779,6 @@ fn h360_persist_failure_after_cas_ack_certifies_nothing_and_resumes_cas_only() {
         &probes,
         "h360-persist",
         &mut restarted,
-        true,
         |batch, cas| {
             calls.push((batch.len(), cas));
             let mut ack = response(&batch, 0);
@@ -1939,7 +1925,6 @@ fn h360_restart_restores_held_probe_quarantine_from_index_and_retries_when_due()
         &probes,
         "h360-restore",
         &mut restarted,
-        true,
         |_, _| panic!("a restored, not-yet-due hold cannot resend"),
         |_| Ok(()),
     )
@@ -1963,7 +1948,6 @@ fn h360_restart_restores_held_probe_quarantine_from_index_and_retries_when_due()
         &probes,
         "h360-restore",
         &mut retry,
-        true,
         |batch, cas| {
             assert_eq!(batch[0].snapshot_fingerprint, fp);
             calls.push((batch.len(), cas));

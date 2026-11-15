@@ -972,6 +972,9 @@ impl Sqlite {
             });
         }
         self.stats.checkpoint(mode, state);
+        if let (Some(log), Some(done)) = (log, done) {
+            telemetry::wal_checkpoint_counts(log, done);
+        }
         CheckpointResult {
             state,
             log_frames: log,

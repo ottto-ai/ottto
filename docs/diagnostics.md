@@ -91,11 +91,11 @@ memory, CPU and page-fault measurements regardless of `latest` equality.
 | `decoded_per_pass.{rows,headers,chunks}` | Successful physical value/header/chunk decodes since prepare, including repeated reads for validation or encoding. A failed value may still contribute validated chunks. Reset at each prepare, published at the completed pass boundary. |
 | `tail_per_pass.{loads,load_bytes_sum,load_ms_sum,load_ms_max,stage_reports,stage_files_max,stage_bytes_max}` | Completed Tail read transactions since the pass started, their summed decoded reduction-page bytes (excluding heads and revisions), summed and largest wall time in whole milliseconds, and the number of staged-buffer reports with their largest `files` and `bytes`. Reset at each pass end, published at the completed pass boundary. `latest.tail_load_tx_ms` and `latest.tail_stage{files,bytes,peak_bytes}` keep the last values. Outside a pass each load or stage still prints the full snapshot at once. |
 | `cache_hit`, `cache_miss` | Optional connection cache-hit/miss counts since the previous maintenance sample (`SQLITE_DBSTATUS_CACHE_HIT` / `CACHE_MISS`, reset after reading); null when unavailable. The first sample covers the connection lifetime so far. The cache target is 8 MiB per connection; these counts measure the read tradeoff. A write transaction prints one maintenance-stats row, after its commit: the write-begin maintenance still does its work but neither prints nor resets these counts, so each printed row counts every hit and miss since the previous printed row. A write that fails before commit prints no maintenance row. |
-| `stage_memory.post_pass_plateau.allocator_relief.{before_footprint_bytes,after_footprint_bytes,wall_us}` | macOS process footprint immediately before/after one allocator relief call after the consuming finish returns, with wall time in microseconds (including the after-sample); footprint is null if unavailable. Also carried in `source_finish` `counts.allocator_relief` for Claude, Codex and Pi. Fields absent elsewhere. The shared helper is a no-op off macOS, including harvest calls. No new wake; relief can return no pages. |
 | `cache_used_bytes` | SQLite `SQLITE_DBSTATUS_CACHE_USED` current connection bytes, refreshed at maintenance boundaries. |
 | `bytes_written_per_pass` | Process-attributed physical writes from prepare through finish returning, including other concurrent daemon work. No encoded-size estimate is substituted. |
 | `dirty_rows_per_save`, `encoded_bytes_per_save`, `max_value_bytes`, `erasure_pending_marks` | Backend save work and transactional erasure marks; attempts may roll back. |
 | `wal_peak_bytes`, `wal_alarm`, `wal_measurement_unavailable` | Measured WAL peak, alarm at 64 MiB, and unavailable measurements. The alarm is not a cap. |
+| `latest.wal_checkpoint_log_frames`, `latest.wal_checkpointed_frames` | Last available nonnegative WAL-frame and checkpointed-page counts returned together by SQLite, process-wide across state-v2 stores. The checkpointed count is reported in WAL frames, not distinct database pages. Cached in memory and carried by the existing state-v2 save/finish snapshot; no new row type or query. Changing these counts can make existing out-of-pass diagnostic rows print more often. Absent until a pair is available; failure or SQLite's no-applicable-WAL result leaves the last available pair intact. They do not prove the latest attempt succeeded, and reset on process restart. |
 | `import_peak_rss_bytes` | Sampled process RSS peak during the latest import attempt. |
 | `commit_latency_us.{p50,p95,recent_samples}` | Latest 128 measured COMMIT calls, excluding encoding, checkpoint and VACUUM. Pre-COMMIT refusals add no latency sample. |
 | `db_bytes`, `record_rows`, `file_rows`, `progress_rows` | Logical/main-file size and backend owner counts, with existing size alarms. `record_rows` and its alarm count graph records only; `progress_rows` counts upload-progress rows and has no alarm. |
@@ -393,7 +393,7 @@ the same four counters beside disk bytes. All measurements are process-wide:
 never sum overlapping stage or source windows.
 
 After prepare, `source_finish.counts.pass` measures prepare start through
-finish end, after allocator relief: `wall_us`, `cpu_us`, the four counters,
+finish end: `wall_us`, `cpu_us`, the four counters,
 and `qos_utility_us`, `qos_background_us` (maintenance + background), and
 `qos_default_us` (default + legacy + user initiated + user interactive).
 QoS uses a cached Mach timebase. CPU and wall are portable; QoS is macOS-only.
@@ -1494,6 +1494,39 @@ checkpoint. This is distinct from `retiring` and does not count as census comple
 The store census also reports `max_depth_seen` as a diagnostic scalar; depth never
 feeds its error state or an alert.
 
+## Routine census scheduling observations
+
+Claude, Codex and Pi share these local scheduling observations.
+`bounded_traversal_transition` rows with `event: starting` or `event: retiring`
+include `recensus_armed` (boolean) and `context_fingerprint` (only the first
+8 hex characters of the traversal context digest). Equal prefixes suggest a
+matching context, subject to truncated-hash collisions; they are not identity proof.
+On starting rows, `recensus_armed` means the new census window is routine. On
+retiring rows, it means the next walk in that context is armed as routine.
+Complete and clean-follow-up retirements arm that next walk. Terminal-unhealthy
+retry starts become routine only for file-level problems: `walk_loss` must be false
+(no metadata/directory loss or unattributed unreadables), with no directory cap,
+rejected symlink or watcher overflow. Open/read failures and disappeared files remain
+eligible. Retry arming needs no same-process evidence: after a restart or upgrade,
+a kept terminal-unhealthy traversal's first eligible retry walk is routine under those
+conditions. A context-change start stays non-routine. Watcher-overflow,
+parent-resolution and sidecar restarts do not arm a walk. The active marker stays
+process-local and is not restored when resuming an unfinished walk from a checkpoint.
+
+Retry and follow-up walks are estimated to finish census about 25–45 minutes later
+at routine cadence; this is not a bound. Continuous arrivals can extend completion;
+nothing is dropped. Unhealthy retries have no give-up limit and their backoff delay
+is capped at one hour; walk time and the next eligible pass can add further delay.
+Source-generic transition tests cover Claude, Codex and Pi; end-to-end upload tests
+through retry and follow-up walks cover Pi only.
+
+Completed native scan pages carry `routine_recensus`, `page_file_limit_hit` and
+`pending_work` booleans on `native_collection_page`. `pending_work` means queued
+directories or candidates remain. The file-limit pacing decision is
+`page_file_limit_hit && pending_work && !routine_recensus`; a resident deferral
+can still request pacing independently. These observations add no timer or trigger.
+No full fingerprint, path or key is emitted, and none of these fields enters uploads.
+
 ## Prior Held Family Observation
 
 A `bounded_traversal_transition` row with `event: starting` includes
@@ -1861,6 +1894,13 @@ every seed of the root is an identified root copy and its other copies are
 unchanged and verified, so its subagents keep their own decisions). Counted after
 selection since the previous Claude page; counts only, no ids or paths; they
 never affect selection or money.
+
+## Codex byte-budget pacing
+
+The Codex `native_collection_page` line carries `page_byte_budget_hit: 1` in
+`page_selection` when the page put a file back because a page byte budget was
+spent. During a first backfill, such a page with queued work requests a paced
+pass. It never affects selection or money.
 
 ## Claude OTLP spans and relay requests: stored and not stored
 

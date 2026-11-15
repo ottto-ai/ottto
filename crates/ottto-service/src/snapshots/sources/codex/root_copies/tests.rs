@@ -188,6 +188,36 @@ fn five_roots_46_copied_threads_recover_census_and_count_each_once() {
     );
 }
 
+/// [money] Per-home reuse over the five homes equals a cold load when one
+/// home's stamp changes but its facts do not.
+#[test]
+fn five_roots_46_copied_threads_reuse_per_home() {
+    use super::super::sidecar::{reuse_tests::parity_in_place, SidecarFacts};
+    let fixture = Fixture::new(46);
+    let paths = fixture
+        .roots
+        .iter()
+        .flat_map(|root| {
+            let rollout =
+                move |id: &String| root.join(format!("rollout-2026-10-01T10-00-00-{id}.jsonl"));
+            fixture.ids.iter().map(rollout)
+        })
+        .collect::<Vec<_>>();
+    let mut facts = SidecarFacts::default();
+    let mut pass = |reused: u32, cause: &str| {
+        let d = parity_in_place(&mut facts, &fixture.roots, &paths).local_diagnostics;
+        assert_eq!(
+            (d.state_titles.reused_roots, d.sidecar_reload_cause),
+            (reused, cause)
+        );
+    };
+    pass(0, "not_kept");
+    pass(5, "");
+    fixture.update(2, "UPDATE threads SET first_user_message = 'not read'");
+    pass(4, "stamp_changed");
+    pass(5, "");
+}
+
 #[test]
 fn incompatible_copies_stay_scoped_and_cannot_be_resurrected_by_a_third_root() {
     for sql in [

@@ -3449,6 +3449,7 @@ impl OwnedSourceScan {
                     charge_deferred: history_upgrade.charge_deferred > 0,
                     page_file_limit_hit,
                     routine_recensus,
+                    page_byte_budget_hit: codex_page.budget_deferred(),
                     claude_queued_family_deferred_paths: std::mem::take(
                         &mut history_upgrade.queued_family_deferred_paths,
                     ),
@@ -3606,6 +3607,16 @@ impl OwnedSourceScan {
                     resource_probe.line_delivery = Some(delivery.take_page());
                 }
                 let full_causes = std::mem::take(&mut resource_probe.full_causes);
+                crate::local_resource_diagnostics::page_selection(
+                    source.api_slug(),
+                    crate::local_resource_diagnostics::PageSelection::ByteBudgetHit,
+                    u64::from(scan.page_byte_budget_hit),
+                );
+                resource_probe.page_schedule = BTreeMap::from([
+                    ("routine_recensus", scan.routine_recensus),
+                    ("page_file_limit_hit", scan.page_file_limit_hit),
+                    ("pending_work", scan.census_status.pending_work),
+                ]);
                 resource_probe.collection(
                     source.api_slug(),
                     crate::local_resource_diagnostics::CollectionCounts {

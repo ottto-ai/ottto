@@ -682,7 +682,7 @@ pub(crate) enum UnselectedReason {
 const CAP_EVENT_START: usize = 19;
 const UNACKED_LOST_START: usize = CAP_EVENT_START + 5;
 const PAGE_SELECTION_START: usize = UNACKED_LOST_START + 4;
-const CHANGE_REASON_START: usize = PAGE_SELECTION_START + 9;
+const CHANGE_REASON_START: usize = PAGE_SELECTION_START + 10;
 const FILE_READ_START: usize = change_reason::END;
 const HOLD_WAKE_START: usize = FILE_READ_START + 3;
 const USAGE_GAP_START: usize = HOLD_WAKE_START + 2;
@@ -744,6 +744,7 @@ pub(crate) enum PageSelection {
     ChargeEstimate,
     /// Distinct Claude roots whose own seeds read only the root's homes.
     ForcedFamilyMemberScoped,
+    ByteBudgetHit,
 }
 pub(crate) fn page_selection(source: &str, event: PageSelection, amount: u64) {
     source_count(source, PAGE_SELECTION_START + event as usize, |slot| {
@@ -757,7 +758,7 @@ pub(crate) fn tail_loaded(source: &str, bytes: u64) {
         source_count(source, slot, |n| n.fetch_add(amount, Relaxed));
     }
 }
-const PAGE_SELECTION: [(&str, usize); 9] = [
+const PAGE_SELECTION: [(&str, usize); 10] = [
     ("selected", PAGE_SELECTION_START),
     ("owed_selected", PAGE_SELECTION_START + 1),
     ("skipped", PAGE_SELECTION_START + 2),
@@ -767,6 +768,7 @@ const PAGE_SELECTION: [(&str, usize); 9] = [
     ("charge_deferred", PAGE_SELECTION_START + 6),
     ("charge_estimate", PAGE_SELECTION_START + 7),
     ("forced_family_member_scoped", PAGE_SELECTION_START + 8),
+    ("page_byte_budget_hit", PAGE_SELECTION_START + 9),
 ];
 /// Claude twin seeds (one each), by the twin's own `CandidateParseReason`,
 /// `other` for a Parse without one, or `identification_failed`, and again as
@@ -1195,6 +1197,7 @@ crate::heap_layout_bound::fields!(RefusalExposure; owed_entities, held_terminal_
 #[derive(Debug)]
 pub(crate) struct Probe {
     pub(crate) refusal_exposure: Option<RefusalExposure>,
+    pub(crate) page_schedule: BTreeMap<&'static str, bool>,
     withheld_memo: Option<crate::snapshots::withheld_account::Memo>,
     started: Instant,
     process: Option<ProcessSample>,
@@ -1257,6 +1260,7 @@ impl Probe {
     pub(crate) fn start() -> Self {
         Self {
             refusal_exposure: None,
+            page_schedule: BTreeMap::new(),
             withheld_memo: None,
             started: Instant::now(),
             process: process_sample(),
@@ -1292,7 +1296,9 @@ impl Probe {
     }
     pub(crate) fn collection(&self, source: &str, counts: CollectionCounts) {
         #[derive(Serialize)]
-        struct Counts {
+        struct Counts<'a> {
+            #[serde(flatten)]
+            page_schedule: &'a BTreeMap<&'static str, bool>,
             #[serde(skip_serializing_if = "Option::is_none")]
             refusal_exposure: Option<RefusalExposure>,
             #[serde(flatten)]
@@ -1351,6 +1357,7 @@ impl Probe {
         let seeds = seeds.chain(["root_member", "child_member"]);
         let seeds = seeds.zip(FORCED_SEED_START..).collect::<Vec<_>>();
         let counts = Counts {
+            page_schedule: &self.page_schedule,
             forced_family_seeds: drain(source, &seeds),
             line_delivery: self
                 .line_delivery
@@ -1553,40 +1560,6 @@ pub(crate) fn source_prepare<T>(
     result
 }
 
-/// Counts-only endpoint samples; no native footprint measurement off macOS.
-#[derive(Clone, Copy, Default, Serialize)]
-pub(crate) struct AllocatorRelief {
-    #[cfg(target_os = "macos")]
-    before_footprint_bytes: Option<u64>,
-    #[cfg(target_os = "macos")]
-    after_footprint_bytes: Option<u64>,
-    #[cfg(target_os = "macos")]
-    wall_us: u64,
-}
-pub(crate) fn release_memory() -> AllocatorRelief {
-    #[cfg(target_os = "macos")]
-    {
-        let before_footprint_bytes = footprint::current().phys_footprint_bytes;
-        let started = Instant::now();
-        unsafe extern "C" {
-            fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
-        }
-        // SAFETY: a null zone requests relief from all system malloc zones.
-        unsafe {
-            malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
-        }
-        AllocatorRelief {
-            before_footprint_bytes,
-            after_footprint_bytes: footprint::current().phys_footprint_bytes,
-            wall_us: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
-        }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        AllocatorRelief::default()
-    }
-}
-
 /// Observe only a normally returned finish; move its value/error through unchanged.
 /// A panic drops the probe silently. Outcome reporting remains with the caller.
 #[cfg(test)]
@@ -1621,11 +1594,8 @@ fn source_finish_inner<T>(
         .flatten();
     let result = inner();
     drop(v2_window);
-    // The consuming finish has released page inputs and all store locks.
-    let relief = release_memory();
-    window.allocator_relief = Some(relief);
     if v2_active {
-        crate::snapshots::state_v2_post_pass_observed(relief);
+        crate::snapshots::state_v2_post_pass_observed();
     }
     let started = Instant::now();
     let after = process_sample();
@@ -1706,7 +1676,6 @@ pub(crate) struct StageWindow {
     footprint: Option<footprint::Stage>,
     jsonl: Option<jsonl::Scope>,
     evidence_mem: Option<EvidenceMem>,
-    allocator_relief: Option<AllocatorRelief>,
     offpass_cpu: Option<Option<StateV2Cpu>>,
     finish_sample: Option<Option<ProcessSample>>,
     pass: Option<PassSummary>,
@@ -1769,7 +1738,6 @@ impl StageWindow {
             footprint: (!offpass).then(footprint::Stage::begin).flatten(),
             jsonl: None,
             evidence_mem: None,
-            allocator_relief: None,
             finish_sample: None,
             pass: None,
             offpass_cpu: offpass.then(|| process_usage().map(|(_, cpu)| cpu)),
@@ -1818,8 +1786,6 @@ impl Drop for StageWindow {
             #[serde(skip_serializing_if = "Option::is_none")]
             evidence_mem: Option<EvidenceMem>,
             #[serde(skip_serializing_if = "Option::is_none")]
-            allocator_relief: Option<AllocatorRelief>,
-            #[serde(skip_serializing_if = "Option::is_none")]
             pass: Option<PassSummary>,
         }
         let mut observation = match self.finish_sample {
@@ -1849,7 +1815,6 @@ impl Drop for StageWindow {
                 jsonl: self.jsonl.as_ref().map(jsonl::Scope::take),
                 evidence_mem: self.evidence_mem,
                 pass: self.pass.take(),
-                allocator_relief: self.allocator_relief.filter(|_| cfg!(target_os = "macos")),
             },
         });
     }
@@ -1942,6 +1907,11 @@ fn flush_offpass() {
         emit(&row);
     }
 }
+#[cfg(all(test, unix))]
+pub(crate) fn flush_offpass_for_resource_test() {
+    flush_offpass();
+}
+
 /// The page's largest listed or read file size, without paths or read
 /// admission decisions.
 pub(crate) fn observe_file_size(source: crate::snapshots::SnapshotSource, bytes: u64) {
@@ -2644,6 +2614,15 @@ fn emit(record: &impl Serialize) {
         if TEST_OUTPUT.with(|output| {
             if let Some(output) = output.borrow_mut().as_mut() {
                 output.push(json.clone());
+                #[cfg(unix)]
+                crate::snapshots::resource_fixture::record_native_stage(&json);
+                #[cfg(unix)]
+                {
+                    // Count the actual formatter/writer bytes, including prefix/newline.
+                    let mut sink = Vec::new();
+                    write_line(&json, &mut sink);
+                    crate::snapshots::resource_fixture::record_log(sink.len() as u64);
+                }
                 true
             } else {
                 false
@@ -3125,13 +3104,7 @@ mod tests {
         assert_eq!(record["schema_version"], SCHEMA_VERSION);
         assert_eq!(record["stage"], "source_finish");
         assert_eq!(record["source"], source);
-        if cfg!(target_os = "macos") {
-            for field in ["before_footprint_bytes", "after_footprint_bytes", "wall_us"] {
-                assert!(record["counts"]["allocator_relief"][field].is_u64());
-            }
-        } else {
-            assert!(record["counts"].get("allocator_relief").is_none());
-        }
+        assert!(record["counts"].get("allocator_relief").is_none());
         assert!(record.get("result").is_none());
         println!("RESOURCE_V2_FINISH_FIXTURE {record}");
     }
@@ -3338,11 +3311,6 @@ mod tests {
             assert_eq!(records[1]["stage"], "source_prepare");
             for record in records {
                 assert_eq!(record["source"], source);
-                if record["stage"] == "source_finish" && cfg!(target_os = "macos") {
-                    for field in ["before_footprint_bytes", "after_footprint_bytes", "wall_us"] {
-                        assert!(record["counts"]["allocator_relief"][field].is_u64());
-                    }
-                }
                 if record["stage"] == "source_finish" {
                     let pass = &record["counts"]["pass"];
                     assert!(pass["wall_us"].is_u64() && pass["cpu_us"].is_u64());

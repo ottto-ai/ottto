@@ -84,6 +84,77 @@ fn page_budget_plans_cursor_singleton_and_deferral() {
     assert_eq!(disclosed(&cache), 2);
 }
 
+/// [behaviour] Only a returned Defer on a spent byte budget marks the page:
+/// the singleton bytes (also after a small read) or the exhausted cursor
+/// budget. A busy slot, a rotation turn, a pace verdict and a census fence
+/// defer or hold a large file without marking it.
+#[test]
+fn only_a_spent_byte_budget_marks_the_page_deferred() {
+    use StartPlan::{Defer, Fenced, Singleton};
+    struct Page(SharedCache, PageBudget);
+    impl Page {
+        fn new() -> Self {
+            Self(SharedCache::default(), PageBudget::default())
+        }
+        fn plan(&mut self, expected: u64, free: bool, key: &str) -> (StartPlan, bool) {
+            self.paced(expected, free, key, None)
+        }
+        fn paced(
+            &mut self,
+            expected: u64,
+            free: bool,
+            key: &str,
+            pace: Option<PaceProbe<'_>>,
+        ) -> (StartPlan, bool) {
+            let (limits, ns, fence) = (limits(100, 50, 8), Scope("ns".into()), Some("generation"));
+            let page = &mut self.1;
+            let plan = self.0.cursor_plan_paced(
+                page, limits, expected, free, true, &ns, key, fence, true, pace,
+            );
+            (plan, page.budget_deferred())
+        }
+    }
+    let mut p = Page::new();
+    assert_eq!(p.plan(10, true, "/a"), (Singleton, false));
+    p.1.charge(false, 10);
+    assert_eq!(p.plan(0, true, "/same"), (Singleton, false));
+    // A small read, then a file that no longer fits.
+    assert_eq!(p.plan(41, true, "/b"), (Defer, true));
+    // A busy slot alone.
+    assert_eq!(Page::new().plan(60, false, "/busy"), (Defer, false));
+    // A rotation turn.
+    let mut p = Page::new();
+    let ahead = rotation_key("ns", "/ahead");
+    p.0.with_cursor(|cursor| cursor.rotation.wait(&ahead))
+        .unwrap();
+    assert_eq!(p.plan(60, true, "/behind"), (Defer, false));
+    assert_eq!(counter(&p.0, |c| c.deferred_rotation), 1);
+    // A pace verdict.
+    let mut p = Page::new();
+    let temp = Temp::new("budget-pace", b"{}\n");
+    let file = File::open(&temp.0).unwrap();
+    let (t0, stamp) = (
+        std::time::Instant::now(),
+        OpenStamp::capture(&file).unwrap(),
+    );
+    let key = pace_key("ns", &group_scope(), "/paced");
+    p.0.with_cursor(|cursor| paced(&mut cursor.pace, key, &stamp, t0, secs(600), t0))
+        .unwrap();
+    let probe = Some(PaceProbe { file: &file });
+    let verdict = with_pace_clock(Some(t0 + secs(1)), false, || {
+        p.paced(60, true, "/paced", probe)
+    });
+    assert_eq!(verdict, (Defer, false));
+    // A fenced large file is not requeued; the next one waits on the budget.
+    let mut p = Page::new();
+    let fenced = rotation_key("ns", "/fenced");
+    p.0.with_cursor(|cursor| cursor.rotation.complete(&fenced, Some("generation")))
+        .unwrap();
+    p.1.charge(true, 100);
+    assert_eq!(p.plan(60, true, "/fenced"), (Fenced, false));
+    assert_eq!(p.plan(60, true, "/next"), (Defer, true));
+}
+
 #[test]
 fn repeated_invalidations_end_as_member_changed_and_parked_files_wake_on_object_change() {
     let mut state = CursorState::default();

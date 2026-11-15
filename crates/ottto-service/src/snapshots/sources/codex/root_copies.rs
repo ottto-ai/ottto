@@ -6,6 +6,8 @@ pub(in crate::snapshots) struct RootSidecar {
     pub threads: BTreeMap<String, Shared<CodexStateThread>>,
     pub extents: BTreeMap<String, CodexRolloutExtent>,
     pub raw: super::sidecar::facts::RawRows,
+    /// Merged title inputs of the pass that kept this home (`title_inputs`).
+    pub title_inputs: [u8; 32],
 }
 
 // A copied provider row can reconstruct its millisecond creation time from a
@@ -175,7 +177,7 @@ pub(in crate::snapshots) fn merge_extents(
     }
 }
 
-crate::heap_layout_bound::fields!(RootSidecar; threads, extents, raw);
+crate::heap_layout_bound::fields!(RootSidecar; threads, extents, raw, title_inputs);
 
 #[cfg(test)]
 mod tests;

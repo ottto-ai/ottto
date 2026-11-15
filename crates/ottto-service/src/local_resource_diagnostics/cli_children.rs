@@ -33,6 +33,17 @@ pub(super) fn snapshot() -> Vec<Counts> {
         .collect()
 }
 
+/// Fixed-kind counters including observed zeros, without sparse log omission.
+#[cfg(all(test, unix))]
+pub(crate) fn starts_for_test() -> std::collections::BTreeMap<&'static str, u64> {
+    with_totals(|totals| {
+        ARGV.iter()
+            .enumerate()
+            .map(|(i, kind)| (*kind, totals[0][i].load(Relaxed)))
+            .collect()
+    })
+}
+
 /// Preserve Child's cached exit-status behavior while wait4 obtains exact CPU
 /// for this PID, rather than subtracting process-wide RUSAGE_CHILDREN samples.
 /// Ownership, signals, process groups and pipe handling remain with the caller.
