@@ -1006,9 +1006,14 @@ fn default_occurrence_count() -> u64 {
     1
 }
 
-/// Cache patches and telemetry-only bodies declare head CAS for their request.
+/// Cache patches (legal only under CAS), telemetry-only bodies and bodies
+/// whose session has a saved head declare head CAS for their whole request.
+/// An accepted CAS write returns a fresh head with or without a patch, so a
+/// headed session keeps it.
 pub(crate) fn declares_head_cas(item: &crate::snapshots::SnapshotItem) -> bool {
-    item.cache_observations.is_some() || item.evidence_basis == Some("otel_only")
+    item.cache_observations.is_some()
+        || item.cache_base_head_etag.is_some()
+        || item.evidence_basis == Some("otel_only")
 }
 
 /// The existing public ACK version for additive body evidence. Keep synthetic

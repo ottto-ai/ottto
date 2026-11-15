@@ -321,13 +321,17 @@ fn bootstrap_probe_resent_after_server_error_settles_as_conflict() {
     probe.cache_observations = None;
     probe.cache_observations_state = None;
     let mut progress = test_upload_progress();
+    // A prior ordinary ACK: only the exact head-CAS stage posts.
+    progress.record_body(
+        &probe.snapshot_fingerprint,
+        &snapshot_upload_body_witness(&probe),
+    );
     let mut posts = 0;
     let (deferred, waits) = with_inplace_retry_test_clock(None, || {
         bootstrap_cache_heads(
             std::slice::from_ref(&probe),
             &unique_poison_scope(),
             &mut progress,
-            false,
             |items, enforce_head_cas| {
                 assert!(enforce_head_cas);
                 posts += 1;
