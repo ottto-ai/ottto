@@ -569,7 +569,15 @@ fn removed_account_root_drains_and_retires() {
     let other = d.h.c.path(OTHER);
     let key = local_index_key(&other);
     let before = index.clone();
-    fs::write(&other, header(OTHER, Some("b")) + &turn(1)).unwrap();
+    // Genuinely behind: a smaller rewrite whose usage no longer parses. A
+    // well-formed shorter file is a legitimate correction, not a regression.
+    let unreadable = json!({"type":"event_msg", "timestamp":"2026-10-07T10:00:00Z",
+        "payload":{"type":"token_count", "info":{"total_token_usage":{"input_tokens":"invalid"}}}});
+    fs::write(
+        &other,
+        header(OTHER, Some("b")) + &unreadable.to_string() + "\n",
+    )
+    .unwrap();
     assert!(
         fs::metadata(&other).unwrap().len() < before.files[&key].size_bytes,
         "behind its accepted witness"
@@ -669,6 +677,15 @@ fn removed_account_readded_after_retirement_counts_once() {
                 Some(AckEvidence::LegacyAcked)
             );
         }
+        // Aged files are never first reads. A head that absence kept (its
+        // debt never clears by absence) is the noted exception: read once.
+        let mut read = vec![REMOVED_FRESH];
+        if !matches!(
+            state_v2::load_head(&index, &local_index_key(&d.h.path(REMOVED_OLD)), u32::MAX),
+            Ok(None)
+        ) {
+            read.push(REMOVED_OLD);
+        }
         fs::create_dir_all(&d.h.removed).unwrap();
         for (id, bytes) in &d.bytes {
             fs::write(d.h.path(id), bytes).unwrap();
@@ -681,17 +698,18 @@ fn removed_account_readded_after_retirement_counts_once() {
         let readded = d.h.step(true, index, d.cache.clone(), 100, at);
         assert_eq!(
             readded.reads,
-            vec![(DeliveryMode::Full, 0)],
-            "only the in-window file, read once"
+            vec![(DeliveryMode::Full, 0); read.len()],
+            "only {read:?} read, once each (collected: {collected})"
         );
-        assert_eq!(
-            readded
-                .scan
-                .snapshots
-                .iter()
-                .map(|item| item.source_session_id.as_str())
-                .collect::<Vec<_>>(),
-            vec![REMOVED_FRESH]
+        let emitted = readded
+            .scan
+            .snapshots
+            .iter()
+            .map(|item| item.source_session_id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(
+            emitted.contains(REMOVED_FRESH) && emitted.iter().all(|id| read.contains(id)),
+            "emitted {emitted:?}, read {read:?}"
         );
         assert!(readded.index.traversal.is_none(), "healthy");
         if !collected {
@@ -706,7 +724,9 @@ fn removed_account_readded_after_retirement_counts_once() {
             Mode::Ram,
         );
         let mut original = d.gen1_acked.clone();
-        original.snapshots.retain(|id, _| id == REMOVED_FRESH);
+        original
+            .snapshots
+            .retain(|id, _| emitted.contains(id.as_str()));
         assert!(original.accepted_identity_buckets.is_some());
         assert!(replay.accepted_identity_buckets.is_some());
         money_oracle::assert_placement_equivalent(&original, &replay);
@@ -717,14 +737,22 @@ fn removed_account_readded_after_retirement_counts_once() {
             d.gen1.snapshots.len(),
             "stable keys: one latest head per entity"
         );
-        for field in money_oracle::FIELDS {
+        for (id, field) in emitted
+            .iter()
+            .flat_map(|id| money_oracle::FIELDS.iter().map(move |f| (*id, *f)))
+        {
             assert_eq!(
-                destination[REMOVED_FRESH][*field], d.gen1.snapshots[REMOVED_FRESH][*field],
-                "{field}: the original accepted total, never a sum"
+                destination[id][field], d.gen1.snapshots[id][field],
+                "{id} {field}: the original accepted total, never a sum"
             );
         }
         let mut cold = historical.unwrap_or_else(|| d.h.cold(true, at));
         cold.snapshots
+            .retain(|item| item.source_session_id == REMOVED_FRESH);
+        // A cold Full never reads the aged file; it compares the in-window one.
+        let mut fresh = readded.scan.clone();
+        fresh
+            .snapshots
             .retain(|item| item.source_session_id == REMOVED_FRESH);
         money_oracle::assert_equivalent(
             &crate::snapshot_sync::codex_transition_acked_route(
@@ -732,7 +760,7 @@ fn removed_account_readded_after_retirement_counts_once() {
                 &cold,
                 Mode::ColdFull,
             ),
-            &replay,
+            &crate::snapshot_sync::codex_transition_acked_route(&readded.index, &fresh, Mode::Ram),
         );
     }
 }
