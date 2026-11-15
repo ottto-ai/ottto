@@ -2474,7 +2474,7 @@ fn status_from_state_with_relay_finding(
                 .iter()
                 .any(|slug| slug == source.api_slug())
                 && marker.is_none()
-                && health.config.discovered
+                && health.state != SourceState::NotFound
                 && state.reconciliation_enabled(&health.source) != Some(false),
         );
     }
@@ -9508,9 +9508,16 @@ mod tests {
         assert!(
             status_from_state_with_relay_finding(&mut state, None).sources[0]
                 .tracking_confirmation
+                .is_some(),
+            "config discovery is not installation; sources without config still confirm"
+        );
+        state.sources[0].state = SourceState::NotFound;
+        assert!(
+            status_from_state_with_relay_finding(&mut state, None).sources[0]
+                .tracking_confirmation
                 .is_none()
         );
-        state.sources[0].config.discovered = true;
+        state.sources[0].state = SourceState::Healthy;
         crate::snapshot_sync::disable_snapshot_source(&root, snapshots::SnapshotSource::Codex)
             .unwrap();
         assert!(
@@ -9534,6 +9541,8 @@ mod tests {
         let _support = TestEnvVar::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
         let daemon = daemon().with_source_state_dir(root.join("sources"));
         let since = "2026-11-15T10:00:00Z";
+        daemon.state().unwrap().registered_source_grants =
+            vec!["pi".into(), "codex".into(), "claude_code".into()];
         for source in [SourceKind::Pi, SourceKind::Codex, SourceKind::ClaudeCode] {
             daemon
                 .state()
@@ -9542,9 +9551,19 @@ mod tests {
                 .arm(&source, since.into(), true);
             let mut result = verified_codex("2026-11-15T10:01:00Z");
             result.source = source.clone();
+            result.config.discovered = false; // Pi has no telemetry config to discover.
             result.smoke_after = Some(since.into()); // passive paths also populate this
             daemon.record_verification_result(&result).unwrap();
             assert!(daemon.tracking_episode(&source).is_some());
+            assert!(daemon
+                .status(TOKEN)
+                .unwrap()
+                .sources
+                .iter()
+                .find(|health| health.source == source)
+                .unwrap()
+                .tracking_confirmation
+                .is_some());
             if source == SourceKind::ClaudeCode {
                 let (generation, _) = daemon.tracking_episode(&source).unwrap();
                 daemon
