@@ -2,6 +2,7 @@ use crate::snapshots::line_delivery::{
     DeliveryEnd, DeliveryMode, FileView, LineObserver, PhysicalLine, Want,
 };
 use crate::snapshots::scan_index_persistence::Source;
+use crate::transcript_acquisition::FileObject;
 use sampled_scan::transition_fixture::{self as oracle, money_oracle, Accepted, Mode, RouteResult};
 
 const MAIN: &str = "019e5a00-0000-7000-8000-00000000000a";
@@ -10,11 +11,19 @@ const SIDE: &str = "019e5a00-0000-7000-8000-00000000000c";
 const GAP: &str = "019e5a00-0000-7000-8000-00000000000d";
 const REVISION: u32 = <tail_source::codex::Codex as tail_source::TailSource>::REDUCTION_REVISION;
 
+/// Each delivery's (mode, start), and the same with its opened file object.
 #[derive(Clone, Default)]
-struct Delivered(Arc<Mutex<Vec<(DeliveryMode, u64)>>>);
+struct Delivered(
+    Arc<Mutex<Vec<(DeliveryMode, u64)>>>,
+    Arc<Mutex<Vec<(FileObject, DeliveryMode, u64)>>>,
+);
 impl LineObserver for Delivered {
     fn begin(&mut self, view: &FileView) -> Want {
         self.0.lock().unwrap().push((view.mode, view.start));
+        self.1
+            .lock()
+            .unwrap()
+            .push((view.object, view.mode, view.start));
         Want::Lines
     }
     fn line(&mut self, _: &FileView, _: &PhysicalLine<'_>) {}
@@ -120,6 +129,18 @@ fn page_observed_with_limit(
     cache: Arc<sampled_scan::SharedCache>,
     file_limit: usize,
     codex_slots: &[(String, String, usize)],
+    observe: impl FnMut(&mut OwnedSourceScan),
+) -> (ScanIndex, SourceScanResult, Delivered, u64, Vec<Value>) {
+    page_observed_hinted(roots, index, cache, file_limit, codex_slots, &[], observe)
+}
+/// `page_observed_with_limit` with the watcher's path hints.
+fn page_observed_hinted(
+    roots: &[PathBuf],
+    index: ScanIndex,
+    cache: Arc<sampled_scan::SharedCache>,
+    file_limit: usize,
+    codex_slots: &[(String, String, usize)],
+    hints: &[PathBuf],
     mut observe: impl FnMut(&mut OwnedSourceScan),
 ) -> (ScanIndex, SourceScanResult, Delivered, u64, Vec<Value>) {
     let delivered = Delivered::default();
@@ -134,7 +155,7 @@ fn page_observed_with_limit(
                 BACKFILL_WINDOW_DAYS,
                 file_limit,
                 None,
-                &[],
+                hints,
                 false,
                 &mut ListingRequest::default(),
                 false,
@@ -1887,6 +1908,300 @@ fn a_remaining_refused_header_stays_red_after_another_releases_the_hold() {
             .unreadable_path_count,
         3
     );
+    drop(session);
+}
+
+/// [money] A real held page, with no seam: a watcher-hinted rollout created
+/// beside a symlink is selected, but the retained roster refresh refuses the
+/// moved directory, so the roster cannot list it and the inventory is
+/// incomplete. (A pending census-member directory cannot hold a page: while
+/// one is pending the page selects nothing.) The page holds every candidate:
+/// the new rollout, the whole joined group of a grown member, and an
+/// accepted rollout whose file regressed behind its accepted extent. It adds
+/// no synthetic count, arms no retry, emits no body and keeps the accepted
+/// witness through a durable restart. A later page holds a second new
+/// rollout while the first debt is still owed: the hold owes their union.
+/// Once the symlink is gone and the regressed file is restored and grown, the
+/// roster lists both rollouts, the hold releases, every session catches up
+/// cold-equal, the unchanged checkpointed group member is never read again
+/// and the generation retires.
+#[test]
+fn unlisted_hinted_rollout_holds_a_real_page_until_the_roster_lists_it() {
+    use crate::snapshots::codex_file_join::tests::member;
+    const GROUP: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    const BEHIND: &str = "019e5a00-0000-7000-8000-0000000000d7";
+    const QUEUED: [&str; 3] = [
+        "019e5a00-0000-7000-8000-0000000000f1",
+        "019e5a00-0000-7000-8000-0000000000f2",
+        "019e5a00-0000-7000-8000-0000000000f3",
+    ];
+    const NEW1: &str = "019e5a00-0000-7000-8000-0000000000e1";
+    const NEW2: &str = "019e5a00-0000-7000-8000-0000000000e2";
+    let _lock = DECODER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let slots = named_creator_slots();
+    let fresh = || Arc::new(sampled_scan::SharedCache::default());
+    let lines = |rows: &[Value]| {
+        rows.iter()
+            .map(|row| row.to_string() + "\n")
+            .collect::<String>()
+    };
+    let step = |roots: &[PathBuf], index: ScanIndex, limit: usize, hints: &[PathBuf]| {
+        let before = index.clone();
+        let (working, scan, delivered, _, _) =
+            page_observed_hinted(roots, index, fresh(), limit, &slots, hints, |_| {});
+        let (index, posts) = working.checkpoint_with_captured_posts(&scan, &before, "accept");
+        let routed = route(&index, &scan, posts);
+        let reads = delivered.1.lock().unwrap().clone();
+        (index, scan, routed, reads, before)
+    };
+    let hold_of = |index: &ScanIndex| {
+        index
+            .traversal
+            .as_ref()
+            .and_then(|t| t.residue.codex_inventory_hold.clone())
+    };
+    let unarmed = |index: &ScanIndex| {
+        index.traversal.as_ref().map_or(true, |t| {
+            t.unhealthy_retry_attempt == 0 && t.unhealthy_retry_not_before_unix_seconds.is_none()
+        })
+    };
+    let ids = |scan: &SourceScanResult| {
+        scan.snapshots
+            .iter()
+            .map(|item| item.source_session_id.clone())
+            .collect::<BTreeSet<_>>()
+    };
+    let behind_accepted = [rollout(BEHIND, Some("a")), turn(3).into_bytes()].concat();
+    // A two-file joined session, an accepted rollout and a queued census.
+    let corpus = || {
+        let c = Corpus::new();
+        let group = ["a.jsonl", "b.jsonl"].map(|name| c.sessions.join(name));
+        fs::write(&group[0], lines(&member(GROUP, "r-a", 100, 100))).unwrap();
+        fs::write(&group[1], lines(&member(GROUP, "r-b", 200, 300))).unwrap();
+        fs::write(c.path(BEHIND), &behind_accepted).unwrap();
+        for id in QUEUED {
+            c.write(id, Some("b"));
+        }
+        let (session, prior) = StateV2ColdSession::publish(
+            Source::Codex,
+            &ScanIndex::default(),
+            &c.scratch.join("state"),
+        );
+        (c, group, session, prior)
+    };
+    let grow = |path: &Path| {
+        append(path, &lines(&member(GROUP, "r-b2", 150, 450)[1..]));
+    };
+    let reads_of = |reads: &[(FileObject, DeliveryMode, u64)], path: &Path| {
+        let (object, _) = FileObject::of(&fs::File::open(path).unwrap()).unwrap();
+        let mine = reads.iter().filter(|(read, _, _)| *read == object);
+        (
+            mine.clone()
+                .filter(|(_, mode, _)| *mode != DeliveryMode::Unchanged)
+                .count(),
+            mine.filter(|(_, mode, start)| *mode == DeliveryMode::Full && *start == 0)
+                .count(),
+        )
+    };
+
+    // Unheld control for the read bound: the grown member is read at once.
+    let control = {
+        let (c, group, session, prior) = corpus();
+        let (index, ..) = step(&c.roots(), prior, 3, &[]);
+        grow(&group[1]);
+        let (mut index, _, _, mut reads, _) = step(&c.roots(), index, 3, &[group[1].clone()]);
+        for _ in 0..30 {
+            if index.traversal.is_none() {
+                break;
+            }
+            let (next, _, _, more, _) = step(&c.roots(), index, 1, &[]);
+            index = next;
+            reads.extend(more);
+        }
+        let control = reads_of(&reads, &group[0]);
+        drop(session);
+        control
+    };
+
+    let (c, [ga, gb], session, prior) = corpus();
+    let roots = c.roots();
+    let key = |path: &Path| local_index_key(path);
+    let kb = key(&c.path(BEHIND));
+    // The first page reads and accepts the group and the accepted rollout;
+    // the queued census waits.
+    let (index, first, accepted, _, _) = step(&roots, prior, 3, &[]);
+    assert_eq!(
+        ids(&first),
+        BTreeSet::from([GROUP.to_string(), BEHIND.to_string()])
+    );
+    assert!(accepted.accepted.contains_key(GROUP) && accepted.accepted.contains_key(BEHIND));
+    let witness = |index: &ScanIndex| {
+        index
+            .files
+            .get(&kb)
+            .and_then(|entry| entry.last_upload_body_witness.clone())
+    };
+    let accepted_witness = witness(&index);
+    assert!(accepted_witness.is_some());
+    grow(&gb);
+    // The older revision: a strict prefix of the accepted bytes, behind the
+    // indexed extent the accepted body was read to.
+    let older = rollout(BEHIND, Some("a"));
+    assert!(behind_accepted.starts_with(&older) && older.len() < behind_accepted.len());
+    fs::write(c.path(BEHIND), &older).unwrap();
+    assert!(fs::metadata(c.path(BEHIND)).unwrap().len() < index.files[&kb].size_bytes);
+    c.write(NEW1, Some("a"));
+    let link = c.sessions.join("held-link");
+    std::os::unix::fs::symlink(c.scratch.join("absent"), &link).unwrap();
+    let (held_index, held, held_route, mut reads, before) = step(
+        &roots,
+        index,
+        3,
+        &[c.path(NEW1), gb.clone(), c.path(BEHIND)],
+    );
+    assert!(held.snapshots.is_empty(), "{:?}", held.snapshots);
+    assert!(reads.is_empty(), "the held page reads no transcript");
+    let (causes, _) = held.causes.summary(0);
+    assert_eq!(causes[ownership::INVENTORY], 0);
+    let walk = |index: &ScanIndex| index.traversal.clone().expect("the generation stays open");
+    let assert_held_page = |before: &ScanIndex, after: &ScanIndex, owed: &BTreeSet<String>| {
+        let (was, now) = (walk(before), walk(after));
+        assert_eq!(
+            (
+                now.counts.unreadable_path_count,
+                now.counts.ownership_incomplete_file_count
+            ),
+            (
+                was.counts.unreadable_path_count,
+                was.counts.ownership_incomplete_file_count
+            ),
+            "no synthetic count"
+        );
+        assert_eq!(now.residue.index_keys, was.residue.index_keys);
+        assert!(
+            !now.pending_directories.iter().any(|d| d.census_member),
+            "no census directory is pending"
+        );
+        let hold = now
+            .residue
+            .codex_inventory_hold
+            .clone()
+            .expect("the held page is owed");
+        assert_eq!(&hold.owed, owed);
+        assert!(!hold.awaiting_directories && hold.refused_headers.is_empty());
+        assert!(now.has_errors() && !now.has_unsettled_residue());
+        assert!(
+            !now.pending_candidates.is_empty(),
+            "not the drain page: the census still waits"
+        );
+        assert!(unarmed(after), "a held page arms no retry");
+        hold
+    };
+    let mut owed = BTreeSet::from([key(&c.path(NEW1)), key(&ga), key(&gb), kb.clone()]);
+    let hold = assert_held_page(&before, &held_index, &owed);
+    assert_eq!(
+        hold.outside_roster.keys().cloned().collect::<BTreeSet<_>>(),
+        BTreeSet::from([key(&c.path(NEW1))])
+    );
+    assert_eq!(witness(&held_index), accepted_witness);
+    // A durable restart from the committed checkpoint keeps the hold and the
+    // accepted witness.
+    let mut held_index = held_index;
+    let index = session.save_reload(&mut held_index);
+    assert_eq!(hold_of(&index), Some(hold.clone()));
+    assert_eq!(witness(&index), accepted_witness);
+    let restarted = index.clone();
+    // An ordinary census page: the debt is unmoved, so nothing releases.
+    let (index, census, census_route, more, _) = step(&roots, index, 1, &[]);
+    reads.extend(more);
+    assert_eq!(ids(&census), BTreeSet::from([QUEUED[0].to_string()]));
+    assert_eq!(hold_of(&index), Some(hold));
+    let mut pages = vec![(index.clone(), census, census_route)];
+    // A second new rollout holds the next fresh page; the earlier debt,
+    // unselected and outside the roster, is still owed with it.
+    c.write(NEW2, Some("b"));
+    let (index, rehold, _, more, before) = step(&roots, index, 1, &[c.path(NEW2)]);
+    reads.extend(more);
+    assert!(rehold.snapshots.is_empty(), "{:?}", rehold.snapshots);
+    owed.insert(key(&c.path(NEW2)));
+    let hold = assert_held_page(&before, &index, &owed);
+    assert_eq!(
+        hold.outside_roster.keys().cloned().collect::<BTreeSet<_>>(),
+        BTreeSet::from([key(&c.path(NEW1)), key(&c.path(NEW2))])
+    );
+    assert_eq!(witness(&index), accepted_witness);
+    // Restored and grown past the accepted extent; the roster can list again.
+    fs::write(
+        c.path(BEHIND),
+        [behind_accepted.clone(), turn(4).into_bytes()].concat(),
+    )
+    .unwrap();
+    fs::remove_file(&link).unwrap();
+    let mut index = index;
+    let mut caught = BTreeSet::new();
+    for _ in 0..30 {
+        let (next, scan, routed, more, _) = step(&roots, index, 1, &[]);
+        index = next;
+        reads.extend(more);
+        assert!(hold_of(&index).is_none(), "the listed debt is released");
+        assert!(unarmed(&index), "a release arms no retry");
+        caught.extend(ids(&scan));
+        if !scan.snapshots.is_empty() {
+            pages.push((index.clone(), scan, routed));
+        }
+        if index.traversal.is_none() {
+            break;
+        }
+    }
+    assert!(index.traversal.is_none(), "the generation retired");
+    assert_eq!(
+        caught,
+        [GROUP, BEHIND, QUEUED[1], QUEUED[2], NEW1, NEW2]
+            .map(String::from)
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
+        "every held session catches up"
+    );
+    let (_, cold, _, _, _) =
+        page_observed_with_limit(&roots, ScanIndex::default(), fresh(), 100, &slots, |_| {});
+    for (index, scan, routed) in &pages {
+        let mut page_cold = cold.clone();
+        page_cold
+            .snapshots
+            .retain(|item| ids(scan).contains(&item.source_session_id));
+        money_oracle::assert_equivalent(&emitted(index, &page_cold), routed);
+    }
+    // The held page: no body for any held entity, the regressed one included,
+    // and the accepted bodies and witnesses stand.
+    let cold_of = |held: &[&str]| {
+        let mut page = cold.clone();
+        page.snapshots
+            .retain(|item| held.contains(&item.source_session_id.as_str()));
+        emitted(&restarted, &page)
+    };
+    let held_ids = [NEW1, GROUP, BEHIND];
+    let mut held_route = held_route;
+    held_route.accepted = accepted.accepted.clone();
+    money_oracle::assert_no_smaller_reemit(
+        BEHIND,
+        &accepted,
+        &held_route,
+        &cold_of(&[BEHIND]),
+        true,
+    );
+    money_oracle::assert_held_set(&held_ids, &accepted, &held_route, &cold_of(&held_ids));
+    // Read bound: the unchanged, checkpointed member of the held group is
+    // never read again; only never-read members may read from byte zero.
+    assert_eq!(
+        reads_of(&reads, &ga),
+        (0, 0),
+        "unheld control: {control:?}; reads: {reads:?}"
+    );
+    assert_eq!(reads_of(&reads, &c.path(BEHIND)).1, 0, "{reads:?}");
+    let last = pages.last().map(|(_, _, routed)| routed.clone()).unwrap();
+    assert_quiet(&c, index, &last);
     drop(session);
 }
 
