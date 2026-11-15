@@ -2390,8 +2390,8 @@ fn fixture_change(id: char) -> CloudSessionChangeV2 {
 }
 
 /// Shared session-id vectors (the server applies the same rule): code-point
-/// bounds, multibyte text, C0/DEL/C1 controls, boundary whitespace, and the
-/// characters the rule allows.
+/// bounds, multibyte text, C0/DEL/C1 controls, boundary whitespace (U+2028
+/// included), and the characters the rule allows (U+200B included).
 fn session_id_vectors() -> Vec<(String, bool)> {
     let mut vectors = vec![
         (String::new(), false),
@@ -2407,6 +2407,13 @@ fn session_id_vectors() -> Vec<(String, bool)> {
         ("a\\b".to_string(), true),
         (format!("hmac-sha256:{}", "a".repeat(64)), true),
         ("task_e_😀".to_string(), true),
+        // U+2028 LINE SEPARATOR is White_Space but not Cc: allowed inside.
+        ("task_e_1\u{2028}2".to_string(), true),
+        // U+200B ZERO WIDTH SPACE is neither White_Space nor Cc: allowed
+        // anywhere, kept as is.
+        ("task_e_\u{200b}".to_string(), true),
+        ("\u{200b}task_e_1".to_string(), true),
+        ("task_e_\u{200b}1".to_string(), true),
     ];
     for bad in [
         " task",
@@ -2415,6 +2422,8 @@ fn session_id_vectors() -> Vec<(String, bool)> {
         "task\u{a0}",
         "\ttask",
         "task\n",
+        "task_e_1\u{2028}",
+        "\u{2028}task_e_1",
     ] {
         vectors.push((bad.to_string(), false));
     }
