@@ -681,15 +681,6 @@ fn get_disabled_servers(value: &Value) -> Vec<String> {
     names
 }
 
-/// The inventory row of a server name `/mcp` records: it names a plugin server
-/// `plugin:<plugin>:<server>`; its row here is `plugin_<plugin>_<server>`.
-fn claude_row_name(name: &str) -> String {
-    match name.strip_prefix("plugin:") {
-        Some(rest) => format!("plugin_{}", rest.replacen(':', "_", 1)),
-        None => name.to_string(),
-    }
-}
-
 /// Extract `mcpServers` from a JSON object as a name->config map.
 fn mcp_servers_block(value: &Value) -> impl Iterator<Item = (&String, &Value)> {
     value
@@ -875,7 +866,13 @@ fn discover_claude_code(home: &Path) -> Vec<ConfiguredServer> {
     // user can re-enable is information worth reporting. The backend excludes
     // disabled servers from server_count / tool_count / grand_total_tokens.
     for name in disabled_names {
-        if let Some(server) = servers.get_mut(&claude_row_name(&name)) {
+        // `/mcp` names a plugin server `plugin:<plugin>:<server>`; its row here is
+        // `plugin_<plugin>_<server>`.
+        let name = match name.strip_prefix("plugin:") {
+            Some(rest) => format!("plugin_{}", rest.replacen(':', "_", 1)),
+            None => name,
+        };
+        if let Some(server) = servers.get_mut(&name) {
             server.disabled = true;
         }
     }
@@ -1054,7 +1051,12 @@ fn discover_servers_in(
                 .iter()
                 .filter_map(|path| load_json(path))
                 .collect();
-            managed_policy::apply_claude_policy(&mut servers, &user_settings, claude_managed_dir);
+            managed_policy::apply_claude_policy(
+                &mut servers,
+                home,
+                &user_settings,
+                claude_managed_dir,
+            );
             servers
         }
         SnapshotSource::Codex => discover_codex(home),

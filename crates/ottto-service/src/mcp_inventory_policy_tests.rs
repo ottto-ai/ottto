@@ -65,11 +65,6 @@ fn deny_rows_from_every_source_veto_a_server() {
         (managed.join("managed-settings.json"), name.clone(), true),
         (home.join(".claude").join("settings.local.json"), name, true),
         (
-            managed.join("managed-settings.json"),
-            json!({"disabledMcpjsonServers": ["user-srv"]}),
-            true,
-        ),
-        (
             managed.join("managed-settings.d").join("10-mcp.json"),
             command,
             true,
@@ -280,12 +275,54 @@ fn deny_wins_over_every_approval() {
 }
 
 #[test]
-fn deny_by_url_and_plugin_name_veto_remote_and_plugin_servers() {
-    let (home, managed, _marker) = policy_home("policy-url-plugin");
+fn deny_by_url_vetoes_a_remote_server() {
+    let (home, managed, _marker) = policy_home("policy-url");
+    write_json(
+        &home.join(".claude").join("settings.json"),
+        json!({"mcpServers": {
+            "remote": {"type": "http", "url": "https://Staging.Example.test/api"},
+        }}),
+    );
+    write_json(
+        &managed.join("managed-settings.json"),
+        json!({"deniedMcpServers": [{"serverUrl": "https://staging.example.test/*"}]}),
+    );
+    assert!(policy_server(&home, &managed, "remote").disabled);
+    assert!(!policy_server(&home, &managed, "user-srv").disabled);
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// The three servers of [`provenance_home`], each creating `<home>/<name>.started`.
+const PROVENANCE_SERVERS: [&str; 3] = ["user-srv", "plugin_kit_tool", "project-srv"];
+
+/// A home with a user server, the enabled plugin `kit` declaring `tool`, and an
+/// approved server in a trusted project's `.mcp.json`. Returns
+/// `(home, managed_dir, project_dir)`.
+fn provenance_home(name: &str) -> (PathBuf, PathBuf, PathBuf) {
+    let home = test_home(name);
+    let touch = |server: &str| {
+        let marker = home.join(format!("{server}.started"));
+        json!({"command": "/usr/bin/touch", "args": [marker]})
+    };
+    let project = home.join("proj");
     let root = home.join("plugin-root");
     write_json(
+        &home.join(".claude.json"),
+        json!({
+            "mcpServers": {"user-srv": touch("user-srv")},
+            "projects": {project.to_string_lossy(): {
+                "hasTrustDialogAccepted": true,
+                "enabledMcpjsonServers": ["project-srv"],
+            }},
+        }),
+    );
+    write_json(
+        &project.join(".mcp.json"),
+        json!({"mcpServers": {"project-srv": touch("project-srv")}}),
+    );
+    write_json(
         &root.join(".mcp.json"),
-        json!({"mcpServers": {"tool": {"command": "/usr/bin/true"}}}),
+        json!({"mcpServers": {"tool": touch("plugin_kit_tool")}}),
     );
     write_json(
         &home
@@ -296,24 +333,157 @@ fn deny_by_url_and_plugin_name_veto_remote_and_plugin_servers() {
     );
     write_json(
         &home.join(".claude").join("settings.json"),
-        json!({
-            "enabledPlugins": {"kit@m": true},
-            "mcpServers": {
-                "remote": {"type": "http", "url": "https://Staging.Example.test/api"},
-            },
-        }),
+        json!({"enabledPlugins": {"kit@m": true}}),
     );
-    write_json(
-        &managed.join("managed-settings.json"),
-        json!({"deniedMcpServers": [
-            {"serverUrl": "https://staging.example.test/*"},
-            {"serverName": "plugin:kit:tool"},
-        ]}),
-    );
+    let managed = home.join("managed");
+    fs::create_dir_all(&managed).expect("managed dir");
+    (home, managed, project)
+}
 
-    assert!(policy_server(&home, &managed, "remote").disabled);
-    assert!(policy_server(&home, &managed, "plugin_kit_tool").disabled);
-    assert!(!policy_server(&home, &managed, "user-srv").disabled);
+/// Harvest each provenance server; `true` where it is vetoed: reported disabled
+/// and its process never ran. A server that is not vetoed must start.
+fn provenance_vetoes(home: &Path, managed: &Path) -> [bool; 3] {
+    PROVENANCE_SERVERS.map(|name| {
+        let marker = home.join(format!("{name}.started"));
+        let _ = fs::remove_file(&marker);
+        let server = policy_server(home, managed, name);
+        assert_eq!(
+            harvest_started(&server, &marker),
+            !server.disabled,
+            "{name}"
+        );
+        server.disabled
+    })
+}
+
+#[test]
+fn identity_and_scope_rows_veto_only_the_servers_they_name() {
+    let (home, managed, project) = provenance_home("policy-provenance");
+    let user_marker = home.join("user-srv.started");
+    let settings = managed.join("managed-settings.json");
+    let drop_in = managed.join("managed-settings.d").join("10.json");
+    let user = home.join(".claude").join("settings.local.json");
+    let project_local = project.join(".claude").join("settings.local.json");
+    let deny = |entry: Value| json!({"deniedMcpServers": [entry]});
+    let allow = |entries: Value| json!({"allowedMcpServers": entries});
+    let names = |names: &[&str]| -> Value {
+        names
+            .iter()
+            .map(|name| json!({"serverName": name}))
+            .collect()
+    };
+    let unset = "OTTTO_POLICY_TEST_UNSET";
+    let defaulted = json!([format!("${{{unset}:-/usr/bin/touch}}"), &user_marker]);
+    let lock = |on: bool| {
+        let allowed = names(&["project-srv"]);
+        json!({"allowManagedMcpServersOnly": on, "allowedMcpServers": allowed})
+    };
+    // (policy files to write, vetoed [user, plugin, project])
+    let rows: Vec<(Vec<(&PathBuf, Value)>, [bool; 3])> = vec![
+        (vec![], [false, false, false]),
+        // Names match the client identity, never the inventory row name.
+        (
+            vec![(&settings, deny(json!({"serverName": "plugin:kit:tool"})))],
+            [false, true, false],
+        ),
+        (
+            vec![(&settings, deny(json!({"serverName": "plugin_kit_tool"})))],
+            [false, false, false],
+        ),
+        (
+            vec![(
+                &settings,
+                allow(names(&["user-srv", "project-srv", "plugin_kit_tool"])),
+            )],
+            [false, true, false],
+        ),
+        // An allowlist whose names are all invalid is empty and blocks everything.
+        (
+            vec![(&settings, allow(names(&["plugin:kit:tool"])))],
+            [true, true, true],
+        ),
+        // Plugin-only customization keeps plugin servers alone.
+        (
+            vec![(&settings, json!({"strictPluginOnlyCustomization": ["mcp"]}))],
+            [true, false, true],
+        ),
+        (
+            vec![(&settings, json!({"strictPluginOnlyCustomization": true}))],
+            [true, false, true],
+        ),
+        (
+            vec![(
+                &settings,
+                json!({"strictPluginOnlyCustomization": ["skills"]}),
+            )],
+            [false, false, false],
+        ),
+        // `disabledMcpjsonServers` rejects project `.mcp.json` servers only.
+        (
+            vec![(
+                &settings,
+                json!({"disabledMcpjsonServers": ["project-srv", "user-srv"]}),
+            )],
+            [false, false, true],
+        ),
+        // The declaring project's own deny list applies to its servers only.
+        (
+            vec![(
+                &project_local,
+                deny(
+                    json!({"serverCommand": ["/usr/bin/touch", home.join("project-srv.started")]}),
+                ),
+            )],
+            [false, false, true],
+        ),
+        (
+            vec![(&project_local, deny(json!({"serverName": "user-srv"})))],
+            [false, false, false],
+        ),
+        // Command entries expand variables before matching; an allow entry left
+        // with an unset variable matches nothing.
+        (
+            vec![(&user, deny(json!({"serverCommand": defaulted.clone()})))],
+            [true, false, false],
+        ),
+        (
+            vec![(&settings, allow(json!([{"serverCommand": defaulted}])))],
+            [false, true, true],
+        ),
+        (
+            vec![(
+                &settings,
+                allow(json!([{"serverCommand": [format!("${{{unset}}}"), &user_marker]}])),
+            )],
+            [true, true, true],
+        ),
+        // In the managed drop-ins a later single value wins.
+        (
+            vec![
+                (&settings, lock(true)),
+                (&drop_in, json!({"allowManagedMcpServersOnly": false})),
+                (&user, allow(names(&["user-srv"]))),
+            ],
+            [false, true, false],
+        ),
+        (
+            vec![
+                (&settings, lock(false)),
+                (&drop_in, json!({"allowManagedMcpServersOnly": true})),
+                (&user, allow(names(&["user-srv"]))),
+            ],
+            [true, true, false],
+        ),
+    ];
+    for (row, (files, expected)) in rows.into_iter().enumerate() {
+        for path in [&settings, &drop_in, &user, &project_local] {
+            let _ = fs::remove_file(path);
+        }
+        for (path, policy) in files {
+            write_json(path, policy);
+        }
+        assert_eq!(provenance_vetoes(&home, &managed), expected, "row {row}");
+    }
     let _ = fs::remove_dir_all(&home);
 }
 
