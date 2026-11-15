@@ -436,10 +436,12 @@ context-free, runtime paths and `include!(env!(..))`.
 It is annotation only: pricing, placement, identity, row keys, hashes, body witnesses and upload
 decisions never read it, and the wire object is sent only when the receiver advertises that exact
 contract. Nothing is persisted. Codex reads the auth mode recorded on its rows and Pi accepts only
-allowlisted cloud provider and explicit auth pairs; their rows hold the whole session, so each pass
-derives the route again and they keep no latch. Claude Code keeps in-memory latches, keyed by
-destination, source, machine and session, only for sessions whose first own request ended strictly
-after this process started (precise timestamps); any other session is
+allowlisted cloud provider and explicit auth pairs; they keep no latch: each pass takes the first
+route from the earliest hour bucket holding a known route (rows within an hour sort by row key, not
+time), and two known routes there are `signal_conflict`. Claude Code keeps in-memory latches, keyed
+by destination, source, machine and session, only for sessions whose earliest record of any kind is
+strictly after this process started (precise timestamps) and whose first own response is the first
+request classified; any other session, an unstamped start included, is
 `first_request_snapshot_missing` for the whole process and never names a first route. Latches
 follow one destination at a time, as the source manifests do. The status refresh publishes the
 login evaluator result with when it last changed and when it was last observed; a request is
@@ -449,8 +451,9 @@ deferred to a later pass (no object meanwhile); one whose evaluator changed afte
 `first_request_snapshot_missing`. The evaluator never labels alone: OAuth needs that session's own
 Desktop request or a request whose own telemetry row named a valid account, an API key needs a
 native `req_`/`msg_` pair, and a cloud message or request id (`msg_bdrk_`, `msg_vrtx_`) or
-cloud-shaped model on any owned request keeps both unknown. The first known route never changes;
-later proven routes join `routes_seen`. Disclosed residuals: a gateway forwarding native-looking
+cloud-shaped model on any owned request keeps both unknown. A known first route never becomes a
+different known route (Codex/Pi: a second route in its hour turns it to `signal_conflict`); later
+proven routes join `routes_seen`. Disclosed residuals: a gateway forwarding native-looking
 ids can satisfy either conjunction, a same-session account does not prove who paid for the first
 request, and a login switched and switched back between two status refreshes is not seen, so the
 label is not fail-closed for every proxy. `PRODUCER_ENABLED` turns the annotation on in a later

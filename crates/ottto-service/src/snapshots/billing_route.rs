@@ -7,8 +7,8 @@
 //!
 //! Claude Code latches live in this process's memory only; nothing is
 //! persisted, so no release ever reads, refuses or must preserve them. Codex
-//! and Pi hold no latch: their rows hold the whole session, so each pass
-//! derives the same route from them again.
+//! and Pi hold no latch: each pass derives the route from the session's own
+//! rows in time order (hour buckets).
 //!
 //! Claude Code: a request is classified with the published login evaluator
 //! result only when that result is proven to span it: it last changed at or
@@ -19,16 +19,20 @@
 //! itself: OAuth needs that session's own Desktop request or a request whose
 //! own telemetry row named a valid account; an API key needs a native
 //! `req_`/`msg_` id pair. A cloud message or request id (`msg_bdrk_`,
-//! `msg_vrtx_`) or a cloud-shaped model on any owned request vetoes both. A
-//! session whose first own request ended at or before this process started
-//! stays `first_request_snapshot_missing` for the whole process and never
-//! names a first route. Residuals, disclosed: a gateway that forwards
+//! `msg_vrtx_`) or a cloud-shaped model on any owned request vetoes both. Only
+//! the session's first request names the first route, and only when the
+//! session's earliest record of any kind is strictly after this process
+//! started and no id-less or synthetic response came before that request;
+//! otherwise the session stays `first_request_snapshot_missing` for the
+//! whole process. Residuals, disclosed: a gateway that forwards
 //! native-looking ids can satisfy either conjunction; a same-session account
 //! does not prove who paid for the first request; a login switched and
 //! switched back between two status refreshes is not seen. The annotation is
 //! not fail-closed for every proxy.
-//! The first known route never changes; later proven routes only join
-//! `routes_seen`. Every other case is unknown with a closed reason, and
+//! A known first route never becomes a different known route: Claude Code
+//! keeps it in its latch; for Codex and Pi a second route arriving in the
+//! first route's hour turns it to `signal_conflict`. Later proven routes only
+//! join `routes_seen`. Every other case is unknown with a closed reason, and
 //! unknown never means zero cost or permission to hold usage.
 
 use super::scan::lines::selectors::claude_cloud_id_provider;
@@ -193,10 +197,12 @@ pub(crate) struct ClaudeRouteEvidence {
     /// One of this session's own requests joined a telemetry row, by its
     /// provider request id, that named a valid account.
     pub(crate) telemetry_account: bool,
-    /// When the session's first own request ended: the earlier of
-    /// `first_own_request_at` and the first owned request. `None` when
-    /// neither is stamped.
-    pub(crate) first_ended_ns: Option<i64>,
+    /// The session's earliest record of any kind (`source_started_at`, or an
+    /// earlier own request). `None` when the session start is unstamped.
+    pub(crate) session_started_ns: Option<i64>,
+    /// The first owned request is the session's first own response: no
+    /// id-less or synthetic response came before it.
+    pub(crate) first_is_session_first: bool,
 }
 
 crate::heap_layout_bound::no_heap!(true;
@@ -209,7 +215,7 @@ crate::heap_layout_bound::no_heap!(true;
 );
 crate::heap_layout_bound::fields!(SessionBillingRouteFact; first_route, first_route_source, routes_seen, unknown_reason);
 crate::heap_layout_bound::fields!(SessionBillingRoute; first_route, routes_seen, unknown_reason, first_route_source);
-crate::heap_layout_bound::fields!(ClaudeRouteEvidence; requests, telemetry_account, first_ended_ns);
+crate::heap_layout_bound::fields!(ClaudeRouteEvidence; requests, telemetry_account, session_started_ns, first_is_session_first);
 
 /// An RFC 3339 time as unix nanoseconds; `None` when unreadable or outside
 /// `i64`.
@@ -299,16 +305,26 @@ pub(crate) fn capture_claude_route_evidence(item: &mut SnapshotItem) {
             ended_ns: *ended,
         })
         .collect::<Vec<_>>();
-    let first_ended_ns = match (own_from, requests.first().and_then(|r| r.ended_ns)) {
-        (Some(own), Some(first)) => Some(own.min(first)),
-        (own, first) => own.or(first),
-    };
+    // Unstamped session start is unproven, never fresh.
+    let session_started_ns =
+        item.source_started_at
+            .as_deref()
+            .and_then(unix_nanos)
+            .map(|started| {
+                [own_from, requests.first().and_then(|r| r.ended_ns)]
+                    .into_iter()
+                    .flatten()
+                    .fold(started, i64::min)
+            });
+    let first_is_session_first = owned.first().map(|(sequence, _, _)| *sequence)
+        == item.claude_file_birth.first_own_sequence();
     item.claude_route_evidence = Some(Box::new(ClaudeRouteEvidence {
         telemetry_account: owned
             .iter()
             .any(|(_, _, occurrence)| occurrence.route_telemetry_account),
         requests,
-        first_ended_ns,
+        session_started_ns,
+        first_is_session_first,
     }));
 }
 
@@ -365,17 +381,16 @@ fn classify_claude_request(
     })
 }
 
-/// Decided requests in source order, with the source that names them.
+/// A Claude Code session's decided requests in source order.
 struct Classified {
     /// Stops before the first deferred request.
     requests: Vec<Result<BillingRoute, UnknownRouteReason>>,
     /// Any request vetoes a first route (third-party evidence).
     veto: bool,
-    source: RouteSource,
 }
 
 /// Fold one pass's decided requests into `fact`. A null first route becomes
-/// known once, from the first decided known request, unless any request
+/// known once, and only from the session's first request, unless any request
 /// vetoes it; a known one never changes. Later known routes only join
 /// `routes_seen`. Nothing decided keeps the previous reason.
 fn fold(fact: &mut SessionBillingRouteFact, classified: Classified) {
@@ -394,13 +409,15 @@ fn fold(fact: &mut SessionBillingRouteFact, classified: Classified) {
         fact.unknown_reason = Some(UnknownRouteReason::SignalConflict);
         return;
     }
-    if let Some(&first) = classified.requests.iter().find_map(|r| r.as_ref().ok()) {
-        fact.first_route = Some(first);
-        fact.first_route_source = Some(classified.source);
-        fact.unknown_reason = None;
-        fact.routes_seen = known().collect();
-    } else if let Some(reason) = classified.requests.first().and_then(|r| r.err()) {
-        fact.unknown_reason = Some(reason);
+    match classified.requests.first() {
+        Some(Ok(first)) => {
+            fact.first_route = Some(*first);
+            fact.first_route_source = Some(RouteSource::EvaluatorSnapshot);
+            fact.unknown_reason = None;
+            fact.routes_seen = known().collect();
+        }
+        Some(Err(reason)) => fact.unknown_reason = Some(*reason),
+        None => {}
     }
 }
 
@@ -417,7 +434,6 @@ fn classify_claude(evidence: &ClaudeRouteEvidence, context: &RouteContext) -> Cl
             })
             .collect(),
         veto: evidence.requests.iter().any(|request| request.third_party),
-        source: RouteSource::EvaluatorSnapshot,
     }
 }
 
@@ -465,32 +481,60 @@ fn classify_pi_row(row: &SnapshotModelUsage) -> Result<BillingRoute, UnknownRout
     }
 }
 
-/// Codex and Pi: each billable row in source order.
-fn classify_rows(
-    item: &SnapshotItem,
-    classify: fn(&SnapshotModelUsage) -> Result<BillingRoute, UnknownRouteReason>,
-    source: RouteSource,
-) -> Classified {
-    Classified {
-        requests: rows(item)
-            .filter(|row| row.request_count > 0)
-            .map(classify)
-            .collect(),
-        veto: false,
-        source,
-    }
-}
-
-/// Codex and Pi: the route from the item's own rows. Every pass's item holds
-/// the whole session's rows, so no latch is kept: the same rows give the
-/// same first route again.
+/// Codex and Pi: the route from the item's own rows, so no latch is kept.
+/// Rows carry no request time and sort by row key within an hour, so time
+/// order is the hour buckets (emitted from a map keyed by bucket start): the
+/// first route is the one known route of the earliest bucket that has one,
+/// and two different known routes there are `signal_conflict`. Rows that
+/// grow later can only add hours after it or a second route to it, so the
+/// first route never becomes a different known route. Without buckets the
+/// session rows stand in as one group.
 fn rows_route(
     item: &SnapshotItem,
     classify: fn(&SnapshotModelUsage) -> Result<BillingRoute, UnknownRouteReason>,
     source: RouteSource,
 ) -> SessionBillingRoute {
+    let billable = |rows: &[SnapshotModelUsage]| {
+        rows.iter()
+            .filter(|row| row.request_count > 0)
+            .map(classify)
+            .collect::<Vec<_>>()
+    };
+    let mut hours = item
+        .usage_buckets
+        .iter()
+        .map(|bucket| billable(&bucket.model_usage))
+        .collect::<Vec<_>>();
+    if hours.is_empty() {
+        hours.push(billable(&item.model_usage));
+    }
+    let known = |rows: &[Result<BillingRoute, UnknownRouteReason>]| {
+        rows.iter()
+            .filter_map(|row| row.as_ref().ok().copied())
+            .collect::<BTreeSet<_>>()
+    };
     let mut fact = SessionBillingRouteFact::unknown(UnknownRouteReason::MissingEvidence);
-    fold(&mut fact, classify_rows(item, classify, source));
+    match hours
+        .iter()
+        .map(|rows| known(rows))
+        .find(|routes| !routes.is_empty())
+    {
+        Some(first) if first.len() == 1 => {
+            fact.first_route = first.first().copied();
+            fact.first_route_source = Some(source);
+            fact.unknown_reason = None;
+            fact.routes_seen = rows(item)
+                .filter(|row| row.request_count > 0)
+                .filter_map(|row| classify(row).ok())
+                .collect();
+        }
+        Some(_) => fact.unknown_reason = Some(UnknownRouteReason::SignalConflict),
+        None => {
+            if let Some(reason) = hours.iter().flatten().find_map(|row| row.err()) {
+                fact.unknown_reason = Some(reason);
+            }
+        }
+    }
     fact.wire()
 }
 
@@ -702,9 +746,11 @@ fn claude_route(
     else {
         return Some(SessionBillingRouteFact::unknown(R::MissingEvidence).wire());
     };
-    // First own request at or before this process started (or unstamped):
-    // unknown for the whole process, derived again each pass, so no latch.
-    if !context.live(evidence.first_ended_ns) {
+    // The session started (its earliest record of any kind) at or before
+    // this process started, is unstamped, or its first own response is not
+    // the first request here (id-less or synthetic): unknown for the whole
+    // process, derived again each pass, so no latch.
+    if !(evidence.first_is_session_first && context.live(evidence.session_started_ns)) {
         latches.remove(&key);
         return Some(SessionBillingRouteFact::unknown(R::FirstRequestSnapshotMissing).wire());
     }

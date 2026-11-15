@@ -54,12 +54,30 @@ fn desktop(request: &'static str, message: &'static str, started: i64, ended: i6
     }
 }
 
+/// A Claude item whose earliest record is its first request's preceding
+/// record and whose first response is its first request.
 fn claude_item(session: &str, requests: &[Req]) -> SnapshotItem {
+    claude_item_after(session, None, requests)
+}
+
+/// As [`claude_item`], with an id-less response at `idless` (unix
+/// nanoseconds) before the requests.
+fn claude_item_after(session: &str, idless: Option<i64>, requests: &[Req]) -> SnapshotItem {
     let mut item = SnapshotItem {
         source_session_id: session.to_string(),
+        source_started_at: idless
+            .into_iter()
+            .chain(requests.iter().map(|r| r.started))
+            .min()
+            .map(at),
         ..SnapshotItem::default()
     };
-    for (sequence, r) in requests.iter().enumerate() {
+    if idless.is_some() || !requests.is_empty() {
+        item.claude_file_birth.observe_response_at(0, None, 0);
+    }
+    let offset = usize::from(idless.is_some());
+    for (index, r) in requests.iter().enumerate() {
+        let sequence = index + offset;
         let key = format!("p\u{1f}{}\u{1f}{}", r.message, r.request);
         let (native, third_party) = claude_key_route_ids(&key);
         item.claude_usage_occurrences.insert(
@@ -415,8 +433,8 @@ fn pre_start_first_request_stays_unknown_across_later_live_requests() {
         assert_eq!(route(&item), unknown("first_request_snapshot_missing"));
         assert!(latches.is_empty());
     }
-    // `first_own_request_at` before the start closes the session even when
-    // the item's earliest kept request is live.
+    // An earlier `first_own_request_at` closes the session even when the
+    // item's earliest kept request is live.
     let mut item = claude_item(
         "s",
         &[desktop(
@@ -432,8 +450,8 @@ fn pre_start_first_request_stays_unknown_across_later_live_requests() {
     assert!(latches.is_empty());
 }
 
-/// Precise times: a request ending in the same second as the process start
-/// but before it (or exactly at it) is history.
+/// Precise times: a session whose earliest record falls in the same second
+/// as the process start but before it (or exactly at it) is history.
 #[test]
 fn same_second_boundary_is_compared_precisely() {
     let start = NOW + 700_000_000;
@@ -446,12 +464,15 @@ fn same_second_boundary_is_compared_precisely() {
         }),
         ..context(None)
     };
-    for ended in [NOW + 100_000_000, start] {
+    for first_record in [NOW + 100_000_000, start] {
         let mut latches = Latches::new();
         let item = apply(
             &mut latches,
             SnapshotSource::ClaudeCode,
-            claude_item("s", &[desktop("req_1", "msg_1", NOW - SECOND, ended)]),
+            claude_item(
+                "s",
+                &[desktop("req_1", "msg_1", first_record, NOW + 900_000_000)],
+            ),
             &started,
         );
         assert_eq!(route(&item), unknown("first_request_snapshot_missing"));
@@ -463,11 +484,42 @@ fn same_second_boundary_is_compared_precisely() {
         SnapshotSource::ClaudeCode,
         claude_item(
             "s",
-            &[desktop("req_1", "msg_1", NOW - SECOND, NOW + 900_000_000)],
+            &[desktop(
+                "req_1",
+                "msg_1",
+                NOW + 800_000_000,
+                NOW + 900_000_000,
+            )],
         ),
         &started,
     );
     assert_eq!(route(&item), known("subscription", "evaluator_snapshot"));
+}
+
+/// Only the session's first request names the first route: an id-less first
+/// response (before or after the start) or an unstamped session start keeps
+/// the session unknown, and a later request never stands in for it.
+#[test]
+fn partial_first_request_evidence_stays_unknown() {
+    let oauth = context(Some(LoginCandidate::Oauth));
+    let later = || desktop("req_1", "msg_1", NOW - 50 * SECOND, NOW - 40 * SECOND);
+    for idless in [STARTED - 60 * SECOND, NOW - 60 * SECOND] {
+        let mut latches = Latches::new();
+        let item = apply(
+            &mut latches,
+            SnapshotSource::ClaudeCode,
+            claude_item_after("s", Some(idless), &[later()]),
+            &oauth,
+        );
+        assert_eq!(route(&item), unknown("first_request_snapshot_missing"));
+        assert!(latches.is_empty());
+    }
+    let mut item = claude_item("s", &[later()]);
+    item.source_started_at = None;
+    let mut latches = Latches::new();
+    let item = apply(&mut latches, SnapshotSource::ClaudeCode, item, &oauth);
+    assert_eq!(route(&item), unknown("first_request_snapshot_missing"));
+    assert!(latches.is_empty());
 }
 
 /// The evaluator changed after the request started: that request has no
@@ -488,7 +540,7 @@ fn evaluator_changed_after_request_start_never_labels_it() {
         &changed_mid_request,
     );
     assert_eq!(route(&item), unknown("first_request_snapshot_missing"));
-    // A later request the same evaluation spans is proven.
+    // A later request the same evaluation spans never stands in for it.
     let item = apply(
         &mut latches,
         SnapshotSource::ClaudeCode,
@@ -501,7 +553,7 @@ fn evaluator_changed_after_request_start_never_labels_it() {
         ),
         &changed_mid_request,
     );
-    assert_eq!(route(&item), known("subscription", "evaluator_snapshot"));
+    assert_eq!(route(&item), unknown("first_request_snapshot_missing"));
 }
 
 /// An evaluation observed before the request ended defers it: no object and
@@ -597,36 +649,6 @@ fn login_span_extends_while_unchanged_and_restarts_on_change() {
         next_login(Some(switched), LoginCandidate::ApiKey, 500, 700),
         switched
     );
-}
-
-/// Codex and Pi keep no latch: each pass derives the same route from the
-/// session's own rows.
-#[test]
-fn codex_and_pi_hold_no_latch_state() {
-    let mut latches = Latches::new();
-    for (source, rows, expected) in [
-        (
-            SnapshotSource::Codex,
-            vec![row(Some("openai"), Some("chatgpt"))],
-            known("subscription", "codex_auth_snapshot"),
-        ),
-        (
-            SnapshotSource::Pi,
-            vec![row(Some("google-vertex"), Some("service_account"))],
-            known("google_vertex", "pi_provider_auth"),
-        ),
-    ] {
-        for _ in 0..2 {
-            let item = apply(
-                &mut latches,
-                source,
-                rows_item(rows.clone()),
-                &context(None),
-            );
-            assert_eq!(route(&item), expected);
-            assert!(latches.is_empty());
-        }
-    }
 }
 
 /// Latches follow one destination at a time: annotating for another
@@ -768,6 +790,99 @@ fn rows_route(source: SnapshotSource, rows: Vec<SnapshotModelUsage>) -> Value {
     ))
 }
 
+/// A Codex or Pi item in production order: hour buckets in time order, rows
+/// within an hour and the merged session rows in row-key order (auth mode
+/// before provider for these rows).
+fn hours_item(hours: &[&[SnapshotModelUsage]]) -> SnapshotItem {
+    let keyed = |rows: &[SnapshotModelUsage]| {
+        let mut rows = rows.to_vec();
+        rows.sort_by(|a, b| {
+            (&a.auth_mode, &a.model_provider).cmp(&(&b.auth_mode, &b.model_provider))
+        });
+        rows
+    };
+    SnapshotItem {
+        source_session_id: "s".into(),
+        model_usage: keyed(&hours.concat()),
+        usage_buckets: hours
+            .iter()
+            .enumerate()
+            .map(|(hour, rows)| SnapshotUsageBucket {
+                bucket_start: at(NOW + hour as i64 * 3_600 * SECOND),
+                model_usage: keyed(rows),
+                first_activity_at: None,
+                last_activity_at: None,
+            })
+            .collect(),
+        ..SnapshotItem::default()
+    }
+}
+
+fn hours_route(source: SnapshotSource, hours: &[&[SnapshotModelUsage]]) -> Value {
+    route(&apply(
+        &mut Latches::new(),
+        source,
+        hours_item(hours),
+        &context(None),
+    ))
+}
+
+/// The first route comes from time order, not row-key order, and never
+/// becomes a different known route as rows grow; Codex and Pi keep no latch.
+#[test]
+fn codex_and_pi_first_route_holds_as_rows_grow() {
+    use SnapshotSource::{Codex, Pi};
+    let chatgpt = row(Some("openai"), Some("chatgpt"));
+    let apikey = row(Some("openai"), Some("apikey"));
+    let codex = "codex_auth_snapshot";
+    assert_eq!(
+        hours_route(Codex, &[&[chatgpt.clone()]]),
+        known("subscription", codex)
+    );
+    // An API key in the same hour sorts first by row key: the first route is
+    // unknown, never direct_api.
+    assert_eq!(
+        hours_route(Codex, &[&[chatgpt.clone(), apikey.clone()]]),
+        unknown("signal_conflict")
+    );
+    // In a later hour it only joins routes_seen.
+    assert_eq!(
+        hours_route(Codex, &[&[chatgpt], &[apikey]]),
+        json!({
+            "first_route": "subscription",
+            "routes_seen": ["direct_api", "subscription"],
+            "first_route_source": codex,
+        })
+    );
+    // Pi: a later provider that sorts first in the session rows.
+    let vertex = row(Some("google-vertex"), Some("service_account"));
+    let bedrock = row(Some("amazon-bedrock"), Some("service_account"));
+    assert_eq!(
+        hours_route(Pi, &[&[vertex.clone()]]),
+        known("google_vertex", "pi_provider_auth")
+    );
+    let mut latches = Latches::new();
+    let item = apply(
+        &mut latches,
+        Pi,
+        hours_item(&[&[vertex], &[bedrock]]),
+        &context(None),
+    );
+    assert_eq!(
+        item.model_usage[0].model_provider.as_deref(),
+        Some("amazon-bedrock")
+    );
+    assert_eq!(
+        route(&item),
+        json!({
+            "first_route": "google_vertex",
+            "routes_seen": ["amazon_bedrock", "google_vertex"],
+            "first_route_source": "pi_provider_auth",
+        })
+    );
+    assert!(latches.is_empty());
+}
+
 #[test]
 fn codex_uses_only_explicit_recorded_auth() {
     use SnapshotSource::Codex;
@@ -793,20 +908,16 @@ fn codex_uses_only_explicit_recorded_auth() {
         rows_route(Codex, vec![row(Some("openai"), None)]),
         unknown("missing_evidence")
     );
-    // Two routes in one fold: the first in source order latches.
+    // Two routes and no time order between them: unknown.
     assert_eq!(
         rows_route(
             Codex,
             vec![
-                row(Some("openai"), Some("chatgpt")),
-                row(Some("openai"), Some("apikey"))
+                row(Some("openai"), Some("apikey")),
+                row(Some("openai"), Some("chatgpt"))
             ]
         ),
-        json!({
-            "first_route": "subscription",
-            "routes_seen": ["direct_api", "subscription"],
-            "first_route_source": source,
-        })
+        unknown("signal_conflict")
     );
 }
 
@@ -834,12 +945,12 @@ fn pi_allowlist_and_mixed_route_union() {
             "{provider:?} {auth:?}"
         );
     }
-    // Mixed: the first row's route stays first; the later one joins
+    // Mixed: the earlier hour's route stays first; the later one joins
     // routes_seen.
     let vertex = row(Some("google-vertex"), Some("service_account"));
     let bedrock = row(Some("amazon-bedrock"), Some("service_account"));
     assert_eq!(
-        rows_route(Pi, vec![vertex, bedrock]),
+        hours_route(Pi, &[&[vertex], &[bedrock]]),
         json!({
             "first_route": "google_vertex",
             "routes_seen": ["amazon_bedrock", "google_vertex"],
@@ -867,6 +978,7 @@ fn upload_bytes_and_money_fields_unchanged_off_and_additive_on() {
     ] {
         let mut off = request.clone();
         off.snapshots[0].model_usage = rows.clone();
+        off.snapshots[0].usage_buckets[0].model_usage = rows.clone();
         let mut on = off.clone();
         let before = serde_json::to_value(&off).unwrap();
         let fingerprint = snapshot_fingerprint(source, &off.snapshots[0]);
