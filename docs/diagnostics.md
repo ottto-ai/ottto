@@ -1902,7 +1902,7 @@ The Codex `native_collection_page` line carries `page_byte_budget_hit: 1` in
 spent. During a first backfill, such a page with queued work requests a paced
 pass. It never affects selection or money.
 
-## Claude OTLP spans and relay requests not stored
+## Claude OTLP spans and relay requests: stored and not stored
 
 These `process_retained_cache_lifecycle_totals` counters tell a request Claude
 Code never reported apart from one the daemon received and did not keep. A
@@ -1914,8 +1914,11 @@ local relay counts connections refused at its concurrency limit
 (`otlp_relay_busy_503`), malformed HTTP requests (`otlp_relay_bad_framing_400`,
 also one `bad_framing` log line), Claude exports acknowledged while Claude
 collection is off (`otlp_relay_collection_disabled`) and bodies with an
-unsupported content encoding (`otlp_relay_unknown_content_encoding`). Counts
-only: no ids, paths or payload content, and they never affect money.
+unsupported content encoding (`otlp_relay_unknown_content_encoding`). The
+local relay also counts evidence rows appended by successful file writes
+(`otlp_relay_appended_rows`) and their encoded bytes (`otlp_relay_appended_bytes`),
+with one append per evidence file per request and no fsync. Counts only: no ids,
+paths or payload content, and they never affect usage or cost.
 
 ## Compressed Codex reader refusals
 
