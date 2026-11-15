@@ -1026,9 +1026,30 @@ fn toml_edit_value_to_json(value: &toml_edit::Value) -> Option<Value> {
     }
 }
 
+mod managed_policy;
+
 fn discover_servers(home: &Path, source: SnapshotSource) -> Vec<ConfiguredServer> {
+    discover_servers_in(
+        home,
+        source,
+        managed_policy::claude_managed_dir().as_deref(),
+    )
+}
+
+/// Discover `source`'s servers, then veto the Claude Code servers its
+/// managed and deny policy blocks (read from `claude_managed_dir`), so they
+/// are reported disabled and never started.
+fn discover_servers_in(
+    home: &Path,
+    source: SnapshotSource,
+    claude_managed_dir: Option<&Path>,
+) -> Vec<ConfiguredServer> {
     match source {
-        SnapshotSource::ClaudeCode => discover_claude_code(home),
+        SnapshotSource::ClaudeCode => {
+            let mut servers = discover_claude_code(home);
+            managed_policy::apply_claude_policy(&mut servers, home, claude_managed_dir);
+            servers
+        }
         SnapshotSource::Codex => discover_codex(home),
         SnapshotSource::Pi => Vec::new(),
     }
@@ -2546,6 +2567,7 @@ mod tests {
             provider: BTreeMap::new(),
         }
     }
+    include!("mcp_inventory_policy_tests.rs");
 
     #[test]
     fn claude_code_discovers_stdio_http_and_sse_across_sources() {
