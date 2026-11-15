@@ -66,12 +66,6 @@ pub struct ScanIndex {
     /// A later current login can never replace it.
     #[serde(default)]
     pub(super) session_account_bindings: BTreeMap<String, SessionAccountBinding>,
-    /// Per-session billing route latches keyed by source, machine and session
-    /// in this destination's index (`billing_route`). Annotation only; never
-    /// read by placement, pricing or upload decisions. A later login or
-    /// setting can never replace a frozen first route.
-    #[serde(default)]
-    pub(super) session_billing_routes: BTreeMap<String, billing_route::SessionBillingRouteFact>,
     /// Files whose oversized physical lines were skipped once under a bounded
     /// parser generation. The path key plus exact opened-object-derived source
     /// fingerprint prevents both permanent condemnation after replacement and
@@ -526,6 +520,13 @@ pub struct ScanIndex {
     /// Durable debt facts that outlive any one traversal (state layout 5).
     #[serde(default)]
     pub(crate) tail_discovery: TailDiscovery,
+    /// Per-session billing route latches keyed by source, machine and session
+    /// in this destination's index (`billing_route`). Annotation only; never
+    /// read by placement, pricing or upload decisions. A later login or
+    /// setting can never replace a frozen first route. Last in field order,
+    /// as in `lenient_decode::FIELDS`.
+    #[serde(default)]
+    pub(super) session_billing_routes: BTreeMap<String, billing_route::SessionBillingRouteFact>,
 }
 
 /// The production paths that set `bounded_sweep_had_unsettled_upload`.

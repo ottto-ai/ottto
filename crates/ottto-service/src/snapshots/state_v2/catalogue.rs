@@ -100,7 +100,7 @@ macro_rules! scan_index_fields {
             claude_account_deferred_holds => Accounts (map check_map) ["proof.deferred_account" => 1] side,
             session_account_bindings => Accounts (map check_map) ["setting.binding" => 1] side,
             // Route latches: registered and preserved even while the producer is off.
-            session_billing_routes => Accounts (map check_map) ["setting.billing_route" => 1] side,
+            session_billing_routes => Accounts (map check_map) ["setting.billing_route" => 8] side,
             retired_claude_account_family_pending => Accounts (retired none) ["account_window" => 1, "account.current" => 1, "account.absent_members" => 1, "raw_hold.claude_account_family_pending" => 1] side,
             claude_request_census => Census (hook check_field) ["file.census" => 1] own,
             retired_family_requests => Census (retired none) ["family.requests" => 1] side,
@@ -193,6 +193,7 @@ pub(super) const LAYOUTS_HISTORY: &[(u32, &str)] = &[
     (5, "folder login ledger + tail revision + head envelope"),
     (6, "upload context proof stamps one row per entity"),
     (7, "upload progress rows"),
+    (8, "session billing route latches"),
 ];
 pub(super) const LAYOUT: u32 = LAYOUTS_HISTORY[LAYOUTS_HISTORY.len() - 1].0;
 pub(super) const LAYOUTS: &[(&str, &str, u32)] = scan_index_fields!(layouts);

@@ -636,7 +636,7 @@ fn login_candidate_reads_visible_inputs_and_flags_unknown_mode() {
     assert_eq!(candidate(&[json!({})], false), C::NoUsableLogin);
     // A declined key: interactive stays on OAuth, `-p` would use the key.
     let key = json!({"env": {"ANTHROPIC_API_KEY": "sk-test-0000000000000000000000"}});
-    assert_eq!(candidate(&[key.clone()], true), C::ModeUnknown);
+    assert_eq!(candidate(std::slice::from_ref(&key), true), C::ModeUnknown);
     assert_eq!(candidate(&[key], false), C::ApiKey);
     let bedrock = json!({"env": {"CLAUDE_CODE_USE_BEDROCK": "1"}});
     assert_eq!(candidate(&[bedrock], true), C::ThirdPartyPending);

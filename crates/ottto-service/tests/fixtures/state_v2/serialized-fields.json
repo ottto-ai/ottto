@@ -355,6 +355,15 @@
     "unhealthy_retry_not_before_unix_seconds",
     "watcher_hint_seen"
   ],
+  "setting.billing_route": [
+    "conflict_after_latch",
+    "first_route",
+    "first_route_source",
+    "login",
+    "routes_seen",
+    "routes_seen[]",
+    "unknown_reason"
+  ],
   "setting.binding": [
     "account_identifier_hash",
     "workspace_identifier_hash"
