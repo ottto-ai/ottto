@@ -638,6 +638,26 @@ fn upgraded_removed_root_witnesses_drain_and_retire() {
     );
 }
 
+/// The restored file is a new object: its file fingerprint and the revision
+/// hashes derived from it differ from the original upload's. Every other
+/// stored-body field (money, identity, placement) must not; a cold Full of the
+/// restored file pins these three.
+fn without_file_revision(mut route: RouteResult) -> RouteResult {
+    let buckets = route
+        .accepted_identity_buckets
+        .as_mut()
+        .and_then(Value::as_object_mut)
+        .expect("post-ACK buckets");
+    for bucket in buckets.values_mut() {
+        let body = bucket["stored_body"].as_object_mut().unwrap();
+        body.remove("source_file_fingerprint");
+        let envelope = body["semantic_envelope"].as_object_mut().unwrap();
+        envelope.remove("revision_hash");
+        envelope.remove("revision_v2_hash");
+    }
+    route
+}
+
 /// [money] O6b: the same path restored after retirement, while its
 /// tombstones survive and after a later generation collected them. Only the
 /// in-window file is read, once; its body keeps its destination key and
@@ -729,7 +749,10 @@ fn removed_account_readded_after_retirement_counts_once() {
             .retain(|id, _| emitted.contains(id.as_str()));
         assert!(original.accepted_identity_buckets.is_some());
         assert!(replay.accepted_identity_buckets.is_some());
-        money_oracle::assert_placement_equivalent(&original, &replay);
+        money_oracle::assert_placement_equivalent(
+            &without_file_revision(original),
+            &without_file_revision(replay.clone()),
+        );
         let mut destination = d.gen1.snapshots.clone();
         destination.extend(replay.snapshots.clone());
         assert_eq!(
