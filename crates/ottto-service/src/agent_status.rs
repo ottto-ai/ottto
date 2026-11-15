@@ -4817,6 +4817,9 @@ fn collect_claude_status(
     // the stored credential, `.claude.json` (after). `claude auth status`
     // printed exactly these fields but could refresh, and so sign out, the
     // default login on every pass.
+    // Billing route only, producer on: the evaluation below reflects inputs
+    // read from this instant on. Off, no clock is read.
+    let route_read_started = crate::snapshots::billing_route::login_read_started();
     let local = read_claude_slot_locally(&ClaudeConfigDirSlot::Default);
     let mut login_state = local.state;
     let default_live = local.live_login();
@@ -4879,7 +4882,7 @@ fn collect_claude_status(
         login_state,
         ClaudeLocalLoginState::AccessValid | ClaudeLocalLoginState::RefreshPending
     );
-    let alternative = if crate::snapshots::billing_route::PRODUCER_ENABLED {
+    let alternative = if let Some(read_started) = route_read_started {
         // One read of the inputs serves the status (interactive, as off) and
         // the billing route annotation, which also needs `-p` mode. No status
         // field, account or money input reads the annotation.
@@ -4887,13 +4890,16 @@ fn collect_claude_status(
         let inputs = ClaudeLoginInputs::read(&ClaudeConfigDirSlot::Default, oauth_usable);
         let interactive = inputs.alternative(&ambient, oauth_usable, false);
         let print = inputs.alternative(&ambient, oauth_usable, true);
-        crate::snapshots::billing_route::publish_claude_login(claude_login_route_candidate(
-            &inputs.layers,
-            &ambient,
-            oauth_usable,
-            interactive,
-            print,
-        ));
+        crate::snapshots::billing_route::publish_claude_login(
+            claude_login_route_candidate(
+                &inputs.layers,
+                &ambient,
+                oauth_usable,
+                interactive,
+                print,
+            ),
+            read_started,
+        );
         interactive
     } else {
         claude_default_alternative_auth_now(oauth_usable)

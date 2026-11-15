@@ -435,23 +435,26 @@ context-free, runtime paths and `include!(env!(..))`.
 `snapshots/billing_route.rs` labels each session's billing route (`session_billing_route:v1`).
 It is annotation only: pricing, placement, identity, row keys, hashes, body witnesses and upload
 decisions never read it, and the wire object is sent only when the receiver advertises that exact
-contract. Latches live in process memory only, keyed by destination, source, machine and session;
-no `ScanIndex` field, state_v2 kind or file holds them, so no release reads, refuses or must
-preserve them, and the server keeps the first known route it accepted. Claude Code freezes the
-login evaluator result once per process, at a session's first request that ended after this
-process started, and classifies only such live requests; earlier requests are history
-(`first_request_snapshot_missing`), so after a restart a session latches again from its next
-request and current settings never meet earlier requests. The evaluator never labels alone: OAuth
-needs that session's own Desktop request or a request whose own telemetry row named a valid
-account, an API key needs a native `req_`/`msg_` pair, and a cloud message or request id
-(`msg_bdrk_`, `msg_vrtx_`) or cloud-shaped model on any owned request keeps both unknown.
-Disclosed residuals: a gateway forwarding native-looking ids can satisfy either conjunction, and a
-same-session account does not prove who paid for the first request, so the label is not
-fail-closed for every proxy. Per-request evidence is derived from the response key, model and
-entrypoint already in the response book. Codex reads the auth mode recorded on its rows; Pi
-accepts only allowlisted cloud provider and explicit auth pairs. The first known route never
-changes within a process; later known routes join `routes_seen`. `PRODUCER_ENABLED` turns
-latching on in a later release.
+contract. Nothing is persisted. Codex reads the auth mode recorded on its rows and Pi accepts only
+allowlisted cloud provider and explicit auth pairs; their rows hold the whole session, so each pass
+derives the route again and they keep no latch. Claude Code keeps in-memory latches, keyed by
+destination, source, machine and session, only for sessions whose first own request ended strictly
+after this process started (precise timestamps); any other session is
+`first_request_snapshot_missing` for the whole process and never names a first route. Latches
+follow one destination at a time, as the source manifests do. The status refresh publishes the
+login evaluator result with when it last changed and when it was last observed; a request is
+classified with it only when it changed at or before the request started (its preceding prompt or
+tool-result record) and was observed at or after the request ended. A request not yet covered is
+deferred to a later pass (no object meanwhile); one whose evaluator changed after it started is
+`first_request_snapshot_missing`. The evaluator never labels alone: OAuth needs that session's own
+Desktop request or a request whose own telemetry row named a valid account, an API key needs a
+native `req_`/`msg_` pair, and a cloud message or request id (`msg_bdrk_`, `msg_vrtx_`) or
+cloud-shaped model on any owned request keeps both unknown. The first known route never changes;
+later proven routes join `routes_seen`. Disclosed residuals: a gateway forwarding native-looking
+ids can satisfy either conjunction, a same-session account does not prove who paid for the first
+request, and a login switched and switched back between two status refreshes is not seen, so the
+label is not fail-closed for every proxy. `PRODUCER_ENABLED` turns the annotation on in a later
+release; off, no route clock, lock, capability copy or telemetry flag is touched.
 
 ## One version
 

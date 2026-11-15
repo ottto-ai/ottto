@@ -262,6 +262,11 @@ impl SnapshotAccumulator {
                         route_native_ids: route_id_flags.0,
                         route_third_party_id: route_id_flags.1,
                         route_telemetry_account: false,
+                        // Producer off, `route_ids` is `None`: nothing parsed.
+                        route_started_ns: route_ids
+                            .as_ref()
+                            .and(response.preceding_user_timestamp.as_deref())
+                            .and_then(crate::snapshots::billing_route::unix_nanos),
                     },
                 );
                 if self.claude_usage_request_ids.contains(&request_id) || prior_occurrence.is_some()

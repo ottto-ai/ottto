@@ -730,7 +730,7 @@ pub struct SnapshotItem {
     /// semantic component, the content hash and the upload body witness, and
     /// never read by pricing, placement, identity or upload decisions.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub session_billing_route: Option<super::billing_route::SessionBillingRoute>,
+    pub session_billing_route: Option<Box<super::billing_route::SessionBillingRoute>>,
     /// Local-only Claude route evidence captured before the native request
     /// inputs are released. Never serialized or uploaded.
     #[serde(skip)]

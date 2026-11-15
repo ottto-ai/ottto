@@ -804,7 +804,8 @@ pub struct ActivityHintResponse {
     pub session_request_account_source_contract: Option<String>,
     /// Server capability for the `session_billing_route` annotation.
     /// Missing/null/unknown keeps it off, so older servers never receive it.
-    #[serde(default)]
+    /// Producer off, the key is skipped like any unknown one (no copy).
+    #[serde(default, deserialize_with = "deserialize_route_contract")]
     pub session_billing_route_contract: Option<String>,
     /// Receiver item limit; decoded tolerantly by `decode_activity_hint`.
     #[serde(skip)]
@@ -839,6 +840,17 @@ pub struct ActivityHintResponse {
     #[serde(default)]
     pub session_request_identity_contract: Option<String>,
     pub recommended_scan_after: String,
+}
+
+/// `session_billing_route_contract`: producer off, skipped unread.
+pub(crate) fn deserialize_route_contract<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error> {
+    if !crate::snapshots::billing_route::PRODUCER_ENABLED {
+        serde::de::IgnoredAny::deserialize(deserializer)?;
+        return Ok(None);
+    }
+    Option::<String>::deserialize(deserializer)
 }
 
 /// Decodes an activity hint and records whether `workspace_labels_enabled`

@@ -650,6 +650,9 @@ pub(crate) struct ClaudeTranscriptUsageOccurrence {
     /// Route evidence only: this request's own telemetry row, joined by its
     /// provider request id, named a valid account. Local; never sent.
     pub(in crate::snapshots) route_telemetry_account: bool,
+    /// Route evidence only, producer on: the preceding prompt or tool-result
+    /// record's time (unix nanoseconds), no later than the request started.
+    pub(in crate::snapshots) route_started_ns: Option<i64>,
 }
 
 /// Why a retained Claude response has no resolution.
@@ -973,7 +976,7 @@ crate::durable_tail_codec::durable_struct!(ClaudeResponseObservation {
     N desktop_request: bool,
     N rule_epoch: u8,
 });
-crate::heap_layout_bound::fields!(ClaudeTranscriptUsageOccurrence; sequence, usage, model, selector, reasoning_effort, timestamp, event_clock_complete, desktop_request, effective_input_context, telemetry_attached, route_native_ids, route_third_party_id, route_telemetry_account);
+crate::heap_layout_bound::fields!(ClaudeTranscriptUsageOccurrence; sequence, usage, model, selector, reasoning_effort, timestamp, event_clock_complete, desktop_request, effective_input_context, telemetry_attached, route_native_ids, route_third_party_id, route_telemetry_account, route_started_ns);
 
 #[cfg(test)]
 mod output_tests {

@@ -574,6 +574,7 @@ mod tests {
                     route_native_ids: false,
                     route_third_party_id: false,
                     route_telemetry_account: false,
+                    route_started_ns: None,
                     effective_input_context: if sequence % 11 == 0 {
                         0
                     } else {
