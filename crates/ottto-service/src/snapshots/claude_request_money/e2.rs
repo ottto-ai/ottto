@@ -2168,6 +2168,14 @@ fn census_holder(
     .then_some(holder)
 }
 
+#[cfg(test)]
+pub(crate) fn copied_file_holders_for_test<'a>(
+    index: &ScanIndex,
+    keys: impl Iterator<Item = &'a str>,
+) -> BTreeMap<String, String> {
+    copied_file_holders(index, keys)
+}
+
 /// One census-only walk for a fixed seed set. Each seed pulls at most its
 /// earliest accepted main holder; returned holders never become new seeds.
 /// All census hashes participate, so an own turn cannot hide a copied prefix.
