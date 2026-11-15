@@ -1166,7 +1166,19 @@ fn cancelled_outcome_wins_late_worker_completion() {
     })
     .expect("state");
     request_cancel(operation_id).expect("cancel request");
-    finish(operation_id, ClaudeBrowserAuthOutcomeV1::Complete, None);
+    let ((), requested) = crate::agent_status_refresh::with_test_requests_now(|| {
+        finalize_identity(
+            operation_id,
+            crate::agent_status::ClaudeLocalIdentityProof {
+                account_identifier_hash: "a".repeat(64),
+                organization_identifier_hash: "b".repeat(64),
+                collection: Default::default(),
+            },
+        )
+        .expect("cancelled finalize is a no-op");
+        finish(operation_id, ClaudeBrowserAuthOutcomeV1::Complete, None);
+    });
+    assert!(requested.is_empty(), "a cancelled sign-in asks for no pass");
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline
         && read_operation(operation_id).is_some_and(|operation| operation.outcome.is_none())
@@ -2547,7 +2559,11 @@ fn verified_reconnect_replaces_only_an_observed_approval_with_another_account() 
     // Reconnect started for the observed account, signed in as another:
     // the user's explicit choice replaces an observed approval.
     let first = "claude_setup_e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1";
-    finalize_browser_reconnect(&store, first, &slot_id, &external, &observed, &chosen);
+    let ((), requested) = crate::agent_status_refresh::with_test_requests_now(|| {
+        finalize_browser_reconnect(&store, first, &slot_id, &external, &observed, &chosen)
+    });
+    // A completed sign-in asks for one immediate Claude status pass.
+    assert_eq!(requested, vec![ottto_protocol::SourceKind::ClaudeCode]);
     assert_eq!(
         read_operation(first).and_then(|operation| operation.outcome),
         Some(ClaudeBrowserAuthOutcomeV1::Complete)
@@ -2562,7 +2578,13 @@ fn verified_reconnect_replaces_only_an_observed_approval_with_another_account() 
 
     // Now verified: another account through a reconnect is refused.
     let second = "claude_setup_e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2";
-    finalize_browser_reconnect(&store, second, &slot_id, &external, &chosen, &observed);
+    let ((), requested) = crate::agent_status_refresh::with_test_requests_now(|| {
+        finalize_browser_reconnect(&store, second, &slot_id, &external, &chosen, &observed)
+    });
+    assert!(
+        requested.is_empty(),
+        "a mismatch asks for no immediate pass"
+    );
     assert_eq!(
         read_operation(second).and_then(|operation| operation.outcome),
         Some(ClaudeBrowserAuthOutcomeV1::IdentityMismatch)
@@ -3603,13 +3625,15 @@ fn fallback_stop_waiting_terminalizes_before_fresh_retry() {
         .load()
         .expect("registry");
     prepare_generic(status, operation_id).expect("prepare");
-    finish(
-        operation_id,
-        ClaudeBrowserAuthOutcomeV1::BrowserFallbackRequired,
-        None,
-    );
-
-    assert!(request_cancel(operation_id).expect("cancel request"));
+    let ((), requested) = crate::agent_status_refresh::with_test_requests_now(|| {
+        finish(
+            operation_id,
+            ClaudeBrowserAuthOutcomeV1::BrowserFallbackRequired,
+            None,
+        );
+        assert!(request_cancel(operation_id).expect("cancel request"));
+    });
+    assert!(requested.is_empty(), "fallback and cancel ask for no pass");
     let cancelled = read_operation(operation_id).expect("cancelled fallback");
     assert_eq!(
         cancelled.outcome,
