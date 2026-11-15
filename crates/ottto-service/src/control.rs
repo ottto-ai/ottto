@@ -9440,6 +9440,55 @@ fn setup_run_status_is_active(status: &str) -> bool {
     )
 }
 
+/// Background reconcile retry after Ottto refused the scan result with a 400:
+/// the payload is rebuilt the same way each attempt, so the refusal repeats.
+/// Still a retry, not a park: binding changes and daemon restarts reset it.
+const SETUP_RECONCILE_REFUSED_RETRY: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The observed deterministic refusal: a 400 from the scan-result route. Other
+/// statuses and routes keep their own handling or the jittered backoff.
+fn setup_reconcile_refused(error: &LocalApiError) -> bool {
+    matches!(
+        error,
+        LocalApiError::Backend(details)
+            if details.status == Some(400)
+                && setup_reconcile_route(&details.endpoint) == "scan-result"
+    )
+}
+
+/// The endpoint's last path segment (`scan-result`), or `other` when that
+/// segment is not a plain route name, so no id is logged.
+fn setup_reconcile_route(endpoint: &str) -> &str {
+    let path = endpoint.split('?').next().unwrap_or_default();
+    let last = path.rsplit('/').next().unwrap_or_default();
+    if last.len() <= 40
+        && last.starts_with(|character: char| character.is_ascii_lowercase())
+        && last
+            .chars()
+            .all(|character| character.is_ascii_lowercase() || character == '-')
+    {
+        last
+    } else {
+        "other"
+    }
+}
+
+/// ` endpoint=<route> status=<n> code=<reason>` for a backend error; empty
+/// otherwise.
+fn setup_reconcile_backend_fields(error: &LocalApiError) -> String {
+    let LocalApiError::Backend(details) = error else {
+        return String::new();
+    };
+    let mut fields = format!(" endpoint={}", setup_reconcile_route(&details.endpoint));
+    if let Some(status) = details.status {
+        fields.push_str(&format!(" status={status}"));
+    }
+    if let Some(code) = &details.reason_code {
+        fields.push_str(&format!(" code={code}"));
+    }
+    fields
+}
+
 fn setup_reconcile_status_reason(status: Option<&str>) -> String {
     format!(
         "status:{}",
@@ -9524,12 +9573,18 @@ pub(crate) fn reconcile_setup_scan_in_background(daemon: &LocalDaemon) {
             _ => Ok((true, setup_reconcile_status_reason(Some(&run.status)))),
         }
     })();
+    let mut refused = false;
+    let mut backend_fields = String::new();
     let (mut settled, mut reason) = match result {
         Ok(outcome) => outcome,
-        Err(error) => (
-            terminal_refresh_rejection(&error).is_some(),
-            format!("error:{}", setup_action_execution_error_detail(&error).0),
-        ),
+        Err(error) => {
+            refused = setup_reconcile_refused(&error);
+            backend_fields = setup_reconcile_backend_fields(&error);
+            (
+                terminal_refresh_rejection(&error).is_some(),
+                format!("error:{}", setup_action_execution_error_detail(&error).0),
+            )
+        }
     };
     if settled {
         let _binding_lock = lock_setup_run_binding();
@@ -9545,7 +9600,11 @@ pub(crate) fn reconcile_setup_scan_in_background(daemon: &LocalDaemon) {
         None
     } else {
         state.failures = attempt;
-        let delay = crate::snapshot_sync::full_jitter_backoff(state.failures);
+        let delay = if refused {
+            SETUP_RECONCILE_REFUSED_RETRY
+        } else {
+            crate::snapshot_sync::full_jitter_backoff(state.failures)
+        };
         state.next_due = Some(Instant::now() + delay);
         Some(delay.as_secs())
     };
@@ -9555,7 +9614,7 @@ pub(crate) fn reconcile_setup_scan_in_background(daemon: &LocalDaemon) {
             .map(|seconds| format!(" next_in={seconds}s"))
             .unwrap_or_default();
         eprintln!(
-            "setup reconcile attempt={attempt} outcome={outcome} reason={reason} actions={actions_processed}{next_in}"
+            "setup reconcile attempt={attempt} outcome={outcome} reason={reason}{backend_fields} actions={actions_processed}{next_in}"
         );
     }
 }
@@ -10044,6 +10103,9 @@ struct SetupScanPayload {
 #[derive(Debug, Serialize)]
 struct SetupScanSource {
     source: &'static str,
+    /// When this scan observed the source. The backend reads it before the
+    /// status row's own `captured_at`, which may be an earlier cached reading.
+    captured_at: String,
     detected: bool,
     installed: bool,
     telemetry_installed: bool,
@@ -15181,15 +15243,23 @@ fn setup_scan_source(
     local_health: &'static str,
     attribution_guess: BTreeMap<String, serde_json::Value>,
 ) -> SetupScanSource {
+    let captured_at = current_rfc3339();
+    let expires_at = rfc3339_after_minutes(AGENT_STATUS_SNAPSHOT_TTL_MINUTES)
+        .unwrap_or_else(|| captured_at.clone());
     SetupScanSource {
         source,
+        captured_at: captured_at.clone(),
         detected,
         installed,
         telemetry_installed,
         local_health,
         missing_fields: Vec::new(),
         attribution_guess,
-        agent_status: Some(local_agent_status(source_kind).redacted_for_backend()),
+        agent_status: crate::agent_status_refresh::setup_snapshot(
+            source_kind,
+            captured_at,
+            expires_at,
+        ),
         managed_config: None,
         local_import_ready: None,
         live_telemetry_required: None,
@@ -15377,13 +15447,6 @@ fn managed_config_preview(path_label: &str, body: Option<&str>) -> Option<serde_
         "captured_at": current_rfc3339(),
         "lines": redacted,
     }))
-}
-
-fn local_agent_status(source: &SourceKind) -> AgentStatusSnapshot {
-    let captured_at = current_rfc3339();
-    let expires_at = rfc3339_after_minutes(AGENT_STATUS_SNAPSHOT_TTL_MINUTES)
-        .unwrap_or_else(|| captured_at.clone());
-    crate::agent_status::collect_agent_status(source, captured_at, expires_at)
 }
 
 fn read_optional_to_string(path: &PathBuf) -> Option<String> {
@@ -22588,6 +22651,143 @@ for line in sys.stdin:
             assert_eq!(state.failures, u32::from(!settled));
             assert_eq!(state.next_due.is_some(), !settled);
         }
+    }
+
+    /// [behaviour] A scan-result 400 waits a day; other refusals and transient failures keep jitter.
+    #[test]
+    #[serial]
+    fn background_setup_scan_refusal_backs_off_a_day() {
+        let _lock = lock_backend_test_env();
+        let jitter_ceiling = Duration::from_secs(60);
+        let scanning = (200, scan_refresh("scanning"));
+        for (answers, day) in [
+            (
+                vec![scanning, (400, r#"{"detail":"scan_payload_invalid"}"#)],
+                true,
+            ),
+            (vec![scanning, (422, "{}")], false),
+            (vec![scanning, (503, "{}")], false),
+            (vec![(400, "{}")], false),
+        ] {
+            let route = if answers.len() == 2 {
+                "/scan-result "
+            } else {
+                "/refresh "
+            };
+            let (base, server) = scripted_json_backend(answers);
+            let (_root, _guards, daemon, _) = scan_fixture(base);
+            let before = Instant::now();
+            reconcile_setup_scan_in_background(&daemon);
+            let requests = server.join().unwrap();
+            assert!(requests.last().unwrap().contains(route));
+            assert!(FileConnectionStore::default()
+                .setup_scan_settled_run_id()
+                .unwrap()
+                .is_none());
+            let state = SETUP_SCAN.lock().unwrap();
+            assert_eq!(state.failures, 1);
+            let wait = state.next_due.unwrap() - before;
+            if day {
+                assert!(wait >= SETUP_RECONCILE_REFUSED_RETRY, "{route}: {wait:?}");
+                assert!(wait < SETUP_RECONCILE_REFUSED_RETRY + jitter_ceiling);
+            } else {
+                assert!(wait <= jitter_ceiling, "{route}: {wait:?}");
+            }
+        }
+
+        // A network failure keeps the jittered backoff.
+        let closed = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let (_root, _guards, daemon, _) = scan_fixture(format!("http://{closed}"));
+        let before = Instant::now();
+        reconcile_setup_scan_in_background(&daemon);
+        let state = SETUP_SCAN.lock().unwrap();
+        assert_eq!(state.failures, 1);
+        assert!(state.next_due.unwrap() - before <= jitter_ceiling);
+    }
+
+    /// [behaviour] A new setup run is not held behind the old run's refusal backoff.
+    #[test]
+    #[serial]
+    fn background_setup_scan_refusal_resets_on_new_setup_run() {
+        let _lock = lock_backend_test_env();
+        let (base, server) = scripted_json_backend(vec![
+            (200, scan_refresh("scanning")),
+            (400, "{}"),
+            (503, "{}"),
+        ]);
+        let (_root, _guards, daemon, _) = scan_fixture(base);
+        reconcile_setup_scan_in_background(&daemon);
+        // Still inside the refusal window: no request.
+        reconcile_setup_scan_in_background(&daemon);
+        let store = FileConnectionStore::default();
+        let mut replacement = store.load().unwrap().unwrap();
+        replacement.setup_run_id = "replacement-run".into();
+        store.save(&replacement).unwrap();
+        let before = Instant::now();
+        reconcile_setup_scan_in_background(&daemon);
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[2].contains("/replacement-run/local-client/refresh "));
+        let state = SETUP_SCAN.lock().unwrap();
+        assert_eq!(
+            state.binding,
+            Some((replacement.api_base_url, "replacement-run".to_string()))
+        );
+        assert_eq!(state.failures, 1);
+        assert!(state.next_due.unwrap() - before <= Duration::from_secs(60));
+    }
+
+    /// [privacy] The reconcile log names a route label, status and code; only a scan-result 400 is a refusal.
+    #[test]
+    fn setup_reconcile_refusal_class_and_log_fields() {
+        let error = |endpoint: &str, status, reason_code: Option<&str>| {
+            LocalApiError::Backend(BackendErrorDetails {
+                kind: BackendErrorKind::Rejected,
+                endpoint: safe_backend_endpoint(endpoint),
+                status,
+                body_excerpt: Some("synthetic body text".to_string()),
+                reason_code: reason_code.map(str::to_string),
+            })
+        };
+        assert_eq!(
+            setup_reconcile_backend_fields(&error(
+                "https://api.example.test/api/v1/setup-runs/run_ab12/local-client/scan-result?x=1",
+                Some(400),
+                Some("scan_payload_invalid"),
+            )),
+            " endpoint=scan-result status=400 code=scan_payload_invalid"
+        );
+        assert_eq!(
+            setup_reconcile_backend_fields(&error("/api/v1/setup-runs/run_ab12", None, None)),
+            " endpoint=other"
+        );
+        assert_eq!(
+            setup_reconcile_backend_fields(&LocalApiError::NetworkUnavailable),
+            ""
+        );
+        let scan_result = "/api/v1/setup-runs/run_ab12/local-client/scan-result";
+        assert!(setup_reconcile_refused(&error(
+            scan_result,
+            Some(400),
+            None
+        )));
+        for status in [
+            None,
+            Some(401),
+            Some(404),
+            Some(409),
+            Some(410),
+            Some(422),
+            Some(503),
+        ] {
+            assert!(!setup_reconcile_refused(&error(scan_result, status, None)));
+        }
+        let complete = "/api/v1/setup-runs/run_ab12/local-client/actions/act_9/complete";
+        assert!(!setup_reconcile_refused(&error(complete, Some(400), None)));
+        assert!(!setup_reconcile_refused(&LocalApiError::NetworkUnavailable));
     }
 
     /// [behaviour] One completed action and its final idle poll settle in one attempt.
@@ -30140,6 +30340,52 @@ X-API-Key = "otel_redacted"
         assert!(build_local_scan(&test_machine(), vec![SourceKind::Codex])
             .sources
             .is_empty());
+    }
+
+    /// Each scan source carries the scan's own time beside the selected
+    /// status row, whose own (cached) captured_at is left as it was.
+    #[test]
+    #[serial]
+    fn setup_scan_sources_carry_scan_time_and_the_selected_status_row() {
+        let _lock = lock_backend_test_env();
+        let root = control_test_root("setup-scan-selected-status");
+        let _home = EnvVarGuard::set_path("HOME", &root);
+        let _commands = EnvVarGuard::set_path("OTTTO_COMMAND_SEARCH_PATH", &root.join("bin"));
+        let _support =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root.join("support"));
+        let _secret = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &root.join("secrets"));
+        let cached: AgentStatusSnapshot = serde_json::from_value(json!({
+            "source": "pi", "status": "available", "collection_method": "config_file",
+            "captured_at": "2026-11-13T00:00:00Z", "expires_at": "2026-11-13T00:15:00Z",
+        }))
+        .unwrap();
+        let collection = crate::agent_status::AgentStatusCollection {
+            snapshots: vec![cached.clone()],
+            source_health_snapshot: cached.clone(),
+            codex_scan_homes: Vec::new(),
+            codex_home_bindings: Vec::new(),
+            setup_snapshot_index: Some(0),
+        };
+        let scan = crate::agent_status_refresh::with_collection(collection, || {
+            build_local_scan(&test_machine(), vec![])
+        });
+        let scan = serde_json::to_value(&scan).unwrap();
+        let sources = scan["sources"].as_array().unwrap();
+        assert_eq!(sources.len(), 3);
+        for source in sources {
+            let captured_at = source["captured_at"].as_str().expect("scan time");
+            assert!(time::OffsetDateTime::parse(
+                captured_at,
+                &time::format_description::well_known::Rfc3339
+            )
+            .is_ok());
+            assert_ne!(captured_at, "2026-11-13T00:00:00Z");
+            assert_eq!(
+                source["agent_status"],
+                serde_json::to_value(cached.clone().redacted_for_backend()).unwrap()
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

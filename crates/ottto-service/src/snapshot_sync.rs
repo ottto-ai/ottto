@@ -20007,6 +20007,7 @@ mod tests {
             source_health_snapshot: default_health,
             codex_scan_homes: Vec::new(),
             codex_home_bindings: Vec::new(),
+            setup_snapshot_index: None,
         };
 
         let reconciliation = reconciliation_agent_status(&collection);
