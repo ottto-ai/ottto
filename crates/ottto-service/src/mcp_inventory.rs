@@ -691,26 +691,35 @@ fn server_names(value: &Value, key: &str) -> Vec<String> {
 ///
 /// It loads one only after the user trusts the project folder
 /// (`hasTrustDialogAccepted` on the project's `~/.claude.json` entry) and
-/// approves the server, by name in `enabledMcpjsonServers` or for every project
-/// server with `enableAllProjectMcpServers`. `approvals` holds only the scopes
-/// the user controls: the user settings files, the project's `~/.claude.json`
-/// entry and the project's `.claude/settings.local.json`. The project's shared
-/// `.claude/settings.json` is not read for this. A server that is not approved
-/// stays pending in the client and is never started.
+/// approves the server, by name in an `enabledMcpjsonServers` array or for
+/// every project server with `enableAllProjectMcpServers` (an explicit `false`
+/// in any scope keeps it off). `approvals` holds only state kept in the user's
+/// home: the user settings files and the project's `~/.claude.json` entry;
+/// settings files inside the project are not read for this. A server that is
+/// not approved stays pending in the client and is never started.
 fn project_server_approved(name: &str, project_cfg: &Value, approvals: &[&Value]) -> bool {
+    let enable_all = |scope: &&Value| {
+        scope
+            .get("enableAllProjectMcpServers")
+            .and_then(Value::as_bool)
+    };
+    let by_name = approvals.iter().any(|scope| {
+        scope
+            .get("enabledMcpjsonServers")
+            .and_then(Value::as_array)
+            .is_some_and(|list| list.iter().any(|approved| approved.as_str() == Some(name)))
+    });
+    let all = approvals
+        .iter()
+        .any(|scope| enable_all(scope) == Some(true))
+        && !approvals
+            .iter()
+            .any(|scope| enable_all(scope) == Some(false));
     project_cfg
         .get("hasTrustDialogAccepted")
         .and_then(Value::as_bool)
         == Some(true)
-        && approvals.iter().any(|scope| {
-            scope
-                .get("enableAllProjectMcpServers")
-                .and_then(Value::as_bool)
-                == Some(true)
-                || server_names(scope, "enabledMcpjsonServers")
-                    .iter()
-                    .any(|approved| approved == name)
-        })
+        && (by_name || all)
 }
 
 /// Extract `mcpServers` from a JSON object as a name->config map.
@@ -785,6 +794,8 @@ fn codex_plugin_declaration(plugin_dir: &Path) -> Option<(PathBuf, PathBuf)> {
 /// configured server on the machine.
 fn discover_claude_code(home: &Path) -> Vec<ConfiguredServer> {
     let mut servers: BTreeMap<String, ConfiguredServer> = BTreeMap::new();
+    // Project servers awaiting approval; any loaded server of the name replaces one.
+    let mut pending = std::collections::BTreeSet::new();
     let user_settings: Vec<Value> = claude_user_settings(home)
         .iter()
         .filter_map(|path| load_json(path))
@@ -805,33 +816,31 @@ fn discover_claude_code(home: &Path) -> Vec<ConfiguredServer> {
                     if let Some(server) =
                         normalize_claude_server(name, cfg, Some(Path::new(project_dir)))
                     {
+                        pending.remove(name);
                         servers.insert(name.clone(), server);
                     }
                 }
                 if let Some(dot_mcp) = load_json(&Path::new(project_dir).join(".mcp.json")) {
-                    let local_settings = load_json(
-                        &Path::new(project_dir)
-                            .join(".claude")
-                            .join("settings.local.json"),
-                    );
-                    let approvals: Vec<&Value> = user_settings
-                        .iter()
-                        .chain([project_cfg])
-                        .chain(local_settings.as_ref())
-                        .collect();
+                    let approvals: Vec<&Value> =
+                        user_settings.iter().chain([project_cfg]).collect();
                     for (name, cfg) in mcp_servers_block(&dot_mcp) {
                         let Some(mut server) =
                             normalize_claude_server(name, cfg, Some(Path::new(project_dir)))
                         else {
                             continue;
                         };
+                        // A user or local-scope server of the same name wins.
+                        if servers.contains_key(name) && !pending.contains(name) {
+                            continue;
+                        }
                         if project_server_approved(name, project_cfg, &approvals) {
+                            pending.remove(name);
                             servers.insert(name.clone(), server);
-                        } else {
-                            // Pending approval in the client: reported, not
-                            // started, and never in place of a loaded server.
+                        } else if !servers.contains_key(name) {
+                            // Pending approval in the client: reported, not started.
                             server.disabled = true;
-                            servers.entry(name.clone()).or_insert(server);
+                            pending.insert(name.clone());
+                            servers.insert(name.clone(), server);
                         }
                     }
                 }
@@ -899,12 +908,7 @@ fn discover_claude_code(home: &Path) -> Vec<ConfiguredServer> {
             for (project_dir, project_cfg) in projects {
                 // No cwd here: a server off in any project is treated as off.
                 disabled_names.extend(get_disabled_servers(project_cfg));
-                for settings in [
-                    Path::new(project_dir).join(".claude").join("settings.json"),
-                    Path::new(project_dir)
-                        .join(".claude")
-                        .join("settings.local.json"),
-                ] {
+                for settings in claude_project_settings(Path::new(project_dir)) {
                     if let Some(value) = load_json(&settings) {
                         disabled_names.extend(get_disabled_servers(&value));
                     }

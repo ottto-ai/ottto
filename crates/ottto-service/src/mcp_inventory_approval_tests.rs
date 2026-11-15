@@ -84,26 +84,119 @@ fn project_server_approved_for_all_in_user_settings_is_loaded() {
 }
 
 #[test]
-fn project_server_approved_in_the_projects_own_user_scopes_is_loaded() {
-    // The client records approvals on the project's `~/.claude.json` entry or
-    // in the project's local (uncommitted) settings file.
+fn project_server_approved_on_its_claude_json_entry_is_loaded() {
     let (home, _project, _marker) = approval_home(
         "approval-project-entry",
         json!({"hasTrustDialogAccepted": true, "enabledMcpjsonServers": ["project-srv"]}),
     );
     assert!(!project_server(&home).disabled);
     let _ = fs::remove_dir_all(&home);
+}
 
-    let (home, project, _marker) = approval_home(
+#[test]
+fn approval_in_settings_files_inside_the_project_does_not_start_a_server() {
+    let approval =
+        json!({"enabledMcpjsonServers": ["project-srv"], "enableAllProjectMcpServers": true});
+    // A plain local settings file in the project.
+    let (home, project, marker) = approval_home(
         "approval-project-local",
         json!({"hasTrustDialogAccepted": true}),
     );
     write_json(
         &project.join(".claude").join("settings.local.json"),
-        json!({"enabledMcpjsonServers": "project-srv"}),
+        approval.clone(),
+    );
+    assert!(project_server(&home).disabled);
+    assert!(!started(&home, &marker));
+    let _ = fs::remove_dir_all(&home);
+
+    // A `.claude` directory that links elsewhere.
+    let (home, project, marker) = approval_home(
+        "approval-project-linked",
+        json!({"hasTrustDialogAccepted": true}),
+    );
+    let elsewhere = home.join("elsewhere");
+    write_json(&elsewhere.join("settings.local.json"), approval);
+    std::os::unix::fs::symlink(&elsewhere, project.join(".claude")).expect("link .claude");
+    assert!(project_server(&home).disabled);
+    assert!(!started(&home, &marker));
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn explicit_enable_all_false_in_any_scope_keeps_project_servers_pending() {
+    // User settings enable all; the project's entry or the user's local
+    // settings file turns it off.
+    for (name, entry, local) in [
+        (
+            "approval-all-false-entry",
+            json!({"hasTrustDialogAccepted": true, "enableAllProjectMcpServers": false}),
+            None,
+        ),
+        (
+            "approval-all-false-local",
+            json!({"hasTrustDialogAccepted": true}),
+            Some(json!({"enableAllProjectMcpServers": false})),
+        ),
+    ] {
+        let (home, _project, marker) = approval_home(name, entry);
+        write_json(
+            &home.join(".claude").join("settings.json"),
+            json!({"enableAllProjectMcpServers": true}),
+        );
+        if let Some(local) = local {
+            write_json(&home.join(".claude").join("settings.local.json"), local);
+        }
+        assert!(project_server(&home).disabled, "{name}");
+        assert!(!started(&home, &marker), "{name}");
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    // A named approval is separate from enable-all and still loads the server.
+    let (home, _project, _marker) = approval_home(
+        "approval-all-false-named",
+        json!({
+            "hasTrustDialogAccepted": true,
+            "enableAllProjectMcpServers": false,
+            "enabledMcpjsonServers": ["project-srv"],
+        }),
     );
     assert!(!project_server(&home).disabled);
     let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn malformed_or_non_list_approvals_do_not_start_a_server() {
+    for (name, settings) in [
+        // A single name instead of a list.
+        (
+            "approval-string",
+            json!({"enabledMcpjsonServers": "project-srv"}).to_string(),
+        ),
+        // A text flag instead of a boolean.
+        (
+            "approval-text-flag",
+            json!({"enableAllProjectMcpServers": "true"}).to_string(),
+        ),
+        // A name that only differs in case.
+        (
+            "approval-case",
+            json!({"enabledMcpjsonServers": ["Project-Srv"]}).to_string(),
+        ),
+        // A settings file that is not valid JSON.
+        (
+            "approval-malformed",
+            r#"{"enabledMcpjsonServers": ["project-srv"], "enableAllProjectMcpServers": true"#
+                .to_string(),
+        ),
+    ] {
+        let (home, _project, marker) = approval_home(name, json!({"hasTrustDialogAccepted": true}));
+        fs::create_dir_all(home.join(".claude")).expect("create .claude");
+        fs::write(home.join(".claude").join("settings.json"), settings).expect("write settings");
+        assert!(project_server(&home).disabled, "{name}");
+        assert!(!started(&home, &marker), "{name}");
+        let _ = fs::remove_dir_all(&home);
+    }
 }
 
 #[test]
@@ -204,4 +297,60 @@ fn user_and_local_scope_servers_load_without_project_approval() {
     ));
     assert!(by_name("project-only").disabled);
     let _ = fs::remove_dir_all(&home);
+}
+
+/// Write a home where a local-scope server and an approved project server
+/// share the name `same`; each command creates its own marker. Returns the
+/// home and the (local, project) markers.
+fn collision_home(name: &str, local_dir: &str, project_dir: &str) -> (PathBuf, PathBuf, PathBuf) {
+    let home = test_home(name);
+    let (local_marker, project_marker) = (home.join("local-started"), home.join("project-started"));
+    let touch =
+        |marker: &Path| json!({"command": "/usr/bin/touch", "args": [marker.to_string_lossy()]});
+    let local_dir = home.join(local_dir);
+    let project_dir = home.join(project_dir);
+    write_json(
+        &project_dir.join(".mcp.json"),
+        json!({"mcpServers": {"same": touch(&project_marker)}}),
+    );
+    let mut projects = Map::new();
+    projects.insert(
+        project_dir.to_string_lossy().into_owned(),
+        json!({"hasTrustDialogAccepted": true, "enabledMcpjsonServers": ["same"]}),
+    );
+    let local_entry = projects
+        .entry(local_dir.to_string_lossy().into_owned())
+        .or_insert_with(|| json!({}));
+    local_entry["mcpServers"] = json!({"same": touch(&local_marker)});
+    write_json(&home.join(".claude.json"), json!({"projects": projects}));
+    (home, local_marker, project_marker)
+}
+
+#[test]
+fn a_local_scope_server_wins_over_an_approved_project_server_of_the_same_name() {
+    // Same project; then the project dir sorting before and after the local one.
+    for (name, local_dir, project_dir) in [
+        ("collision-same-project", "proj", "proj"),
+        ("collision-project-first", "b-local", "a-project"),
+        ("collision-local-first", "a-local", "b-project"),
+    ] {
+        let (home, local_marker, project_marker) = collision_home(name, local_dir, project_dir);
+        let server = discover_claude_code(&home)
+            .into_iter()
+            .find(|server| server.name == "same")
+            .expect("same");
+        assert!(!server.disabled, "{name}");
+        let (_input, deferred) = harvest_server(&server, &test_spawn_env());
+        assert!(!deferred, "{name}");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !local_marker.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(local_marker.exists(), "{name}: the local command is probed");
+        assert!(
+            !project_marker.exists(),
+            "{name}: the project command is not"
+        );
+        let _ = fs::remove_dir_all(&home);
+    }
 }
