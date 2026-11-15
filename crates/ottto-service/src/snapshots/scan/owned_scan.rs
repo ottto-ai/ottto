@@ -1294,7 +1294,10 @@ impl OwnedSourceScan {
                     .pending
                     .retain(|path| !carry_deferred.contains(&local_index_key(path)));
                 inventory.held_owners.extend(carry_held_owners);
-                inventory.complete &= !codex_census_walk_pending(traversal);
+                inventory.mark_incomplete(
+                    codex_file_join::Incomplete::CensusWalkPending,
+                    usize::from(codex_census_walk_pending(traversal)),
+                );
                 inventory
             });
         resource_probe.page_events.merge(diagnostics.finish());

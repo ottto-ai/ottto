@@ -212,13 +212,20 @@ impl OwnedSourceScan {
                         .iter()
                         .map(|header| local_index_key(&header.candidate.path))
                         .collect::<BTreeSet<_>>();
-                    inventory.complete &= selected.difference(&inventoried).all(|key| {
-                        let owners = codex_session_id_candidates_from_path(Path::new(key));
-                        !owners.is_empty()
-                            && owners
-                                .iter()
-                                .all(|owner| inventory.held_owners.contains(owner))
-                    });
+                    let missing = selected
+                        .difference(&inventoried)
+                        .filter(|key| {
+                            let owners = codex_session_id_candidates_from_path(Path::new(key));
+                            owners.is_empty()
+                                || !owners
+                                    .iter()
+                                    .all(|owner| inventory.held_owners.contains(owner))
+                        })
+                        .count();
+                    inventory.mark_incomplete(
+                        codex_file_join::Incomplete::SelectedNotInventoried,
+                        missing,
+                    );
                     let current_owners = inventory
                         .headers
                         .iter()
@@ -2867,6 +2874,7 @@ impl OwnedSourceScan {
                 if source == SnapshotSource::ClaudeCode {
                     index.probe_absent_claude_account_deferred_holds();
                 }
+                let mut inventory_hold = (0, false, 0);
                 if let Some(traversal) = index.traversal.as_mut() {
                     // A residue file that this page parsed to completion, or that a
                     // watcher hint proved absent, leaves the generation's residue set; a
@@ -2885,7 +2893,8 @@ impl OwnedSourceScan {
                         .as_ref()
                         .filter(|inventory| !inventory.complete)
                     {
-                        record_codex_inventory_hold(traversal, inventory, &residue_index_keys);
+                        inventory_hold =
+                            record_codex_inventory_hold(traversal, inventory, &residue_index_keys);
                     }
                     traversal.residue.index_keys.extend(residue_index_keys);
                     // Exact watcher remove/rename hints must amend the same durable
@@ -2930,8 +2939,16 @@ impl OwnedSourceScan {
                 if source == SnapshotSource::Codex {
                     // Count-only attribution of why Codex files were selected
                     // on this page. No path, session, or identifier is named.
-                    if let Some(line) = census.codex_parse_reasons_line() {
-                        eprintln!("{line}");
+                    // An incomplete header inventory appends why, counts only.
+                    let incomplete = codex_join_inventory
+                        .as_ref()
+                        .and_then(|inventory| inventory.incomplete_fields(inventory_hold));
+                    if let Some(line) = census.codex_parse_reasons_line().or_else(|| {
+                        incomplete
+                            .is_some()
+                            .then(|| "local snapshot census codex parse reasons:".to_owned())
+                    }) {
+                        eprintln!("{line}{}", incomplete.unwrap_or_default());
                     }
                 }
                 if source == SnapshotSource::ClaudeCode

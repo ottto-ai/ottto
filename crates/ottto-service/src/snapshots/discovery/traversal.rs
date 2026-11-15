@@ -881,9 +881,9 @@ pub(in crate::snapshots) fn record_codex_inventory_hold(
     traversal: &mut ScanTraversalCheckpoint,
     inventory: &codex_file_join::HeaderInventory,
     held: &BTreeSet<String>,
-) {
+) -> (usize, bool, usize) {
     if held.is_empty() {
-        return;
+        return (0, false, 0);
     }
     let outside_roster = held
         .iter()
@@ -897,8 +897,9 @@ pub(in crate::snapshots) fn record_codex_inventory_hold(
         .get_or_insert_with(CodexInventoryHold::default);
     // Without a refused record or an unlisted candidate, the walk's open
     // directories were what kept the roster from proving the page.
-    hold.awaiting_directories |=
+    let awaiting =
         census_walk_pending || (inventory.refused.is_empty() && outside_roster.is_empty());
+    hold.awaiting_directories |= awaiting;
     hold.owed.extend(held.iter().cloned());
     // The newest witness is the one a later tick has to see move.
     hold.refused_headers.extend(
@@ -907,7 +908,10 @@ pub(in crate::snapshots) fn record_codex_inventory_hold(
             .iter()
             .map(|(key, witness)| (key.clone(), witness.clone())),
     );
+    let outside = outside_roster.len();
     hold.outside_roster.extend(outside_roster);
+    // Counts only, for the page's census line: held, awaiting, outside roster.
+    (held.len(), awaiting, outside)
 }
 
 /// Queue the candidates of a `CodexInventoryHold` again once its evidence
