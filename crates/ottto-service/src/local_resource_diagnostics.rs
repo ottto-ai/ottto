@@ -548,6 +548,10 @@ pub(crate) fn take_claude_sidecar_reparse_for_test() -> serde_json::Value {
 /// runtime resource caps stay unchanged.
 #[cfg(test)]
 pub(crate) const NATIVE_PAGE_RECORD_TEST_LIMIT: usize = 4320;
+/// Test bound on one `native_full_prior_stamp` record with every cell at
+/// `u64::MAX`; kept off the page line so that line keeps its bound.
+#[cfg(test)]
+const FULL_PRIOR_STAMP_RECORD_TEST_LIMIT: usize = 8192;
 
 /// Nonzero-only counters on the existing native_collection_page line. They
 /// observe a finalized file's retained records and gate nothing.
@@ -1240,15 +1244,20 @@ impl Probe {
     ) {
         rearm_cause::completed(self.started, key, mode, bytes);
     }
+    /// Frozen selection bucket; group replays have none.
     pub(crate) fn full_parse_reason(
         &self,
         mode: crate::transcript_acquisition::ReadMode,
         reason: Option<crate::snapshots::CandidateParseReason>,
+        prior: Option<claude_reread::PriorStamp>,
         count: u64,
         native_bytes: u64,
     ) {
-        if let (crate::transcript_acquisition::ReadMode::Full(_), Some(reason)) = (mode, reason) {
-            rearm_cause::record_parse_reason(self.started, reason, count, native_bytes);
+        use crate::transcript_acquisition::ReadMode;
+        if let (ReadMode::Full(_), Some(prior)) = (mode, prior)
+            && (count != 0 || native_bytes != 0)
+        {
+            rearm_cause::record_parse_reason(self.started, reason, prior, count, native_bytes);
         }
     }
     pub(crate) fn full_by_parse_reason(&self) -> claude_reread::FullByParseReason {
@@ -1448,6 +1457,17 @@ impl Probe {
                 source: Source::from_slug(source),
                 observation: Observation::point(),
                 counts: Counts { change_reasons },
+            });
+        }
+        let full_by_prior_stamp = rearm_cause::take_full_by_prior_stamp(self.started);
+        if !full_by_prior_stamp.is_empty() {
+            emit(&Record {
+                schema_version: SCHEMA_VERSION,
+                process_id: std::process::id(),
+                stage: "native_full_prior_stamp",
+                source: Source::from_slug(source),
+                observation: Observation::point(),
+                counts: BTreeMap::from([("full_by_prior_stamp", full_by_prior_stamp)]),
             });
         }
         jsonl.emit_page_lines(source);
@@ -3633,13 +3653,28 @@ mod tests {
     }
 
     /// [behaviour] Full parse reasons report selections and completed bytes on the existing page event.
+    /// The prior-stamp matrix rides its own record for every source, with an
+    /// unattributed row; a group replay (no frozen stamp) stays out of it.
     #[test]
     fn full_parse_reasons_are_sparse_page_local_counts_and_completed_bytes() {
         use crate::snapshots::CandidateParseReason::{Rearmed, TranscriptChanged};
         use crate::transcript_acquisition::{FullReason, ReadMode};
+        use claude_reread::PriorStamp;
+        let full = ReadMode::Full(FullReason::StateMissing);
+        let unchanged = Some(PriorStamp::ListingUnchanged);
+        let collect = |probe: &Probe, source: &str, reads: Option<ReadCounts>| {
+            probe.collection(
+                source,
+                CollectionCounts {
+                    scanned_files: 6,
+                    semantic_noops: 0,
+                    sampled_acquisition: reads,
+                    full_causes: Default::default(),
+                },
+            )
+        };
         let (_, rows) = capture(|| {
             let probe = Probe::start();
-            let full = ReadMode::Full(FullReason::StateMissing);
             for (mode, reason, bytes) in [
                 (full, Some(Rearmed), 123),
                 (full, Some(TranscriptChanged), 456),
@@ -3647,36 +3682,176 @@ mod tests {
                 (ReadMode::Unchanged, Some(Rearmed), 999),
                 (full, None, 999),
             ] {
-                probe.full_parse_reason(mode, reason, 1, 0);
-                probe.full_parse_reason(mode, reason, 0, bytes);
+                probe.full_parse_reason(mode, reason, unchanged, 1, 0);
+                probe.full_parse_reason(mode, reason, unchanged, 0, bytes);
             }
             // A selected Full that has not completed contributes no bytes.
-            probe.full_parse_reason(full, Some(Rearmed), 1, 0);
-            for probe in [probe, Probe::start()] {
+            probe.full_parse_reason(full, Some(Rearmed), unchanged, 1, 0);
+            // A group replay carries no frozen stamp and no reason.
+            probe.full_parse_reason(full, None, None, 1, 77);
+            let empty = Probe::start();
+            empty.full_parse_reason(full, Some(Rearmed), unchanged, 0, 0);
+            for probe in [probe, empty] {
                 let mut reads = max_read_counts();
                 reads.page_events.full_by_parse_reason = probe.full_by_parse_reason();
-                probe.collection(
-                    "claude_code",
-                    CollectionCounts {
-                        scanned_files: 6,
-                        semantic_noops: 0,
-                        sampled_acquisition: Some(reads),
-                        full_causes: Default::default(),
-                    },
-                );
+                collect(&probe, "claude_code", Some(reads));
             }
         });
-        assert_eq!(rows[0]["stage"], "native_collection_page");
+        let stage = |name: &str| {
+            rows.iter()
+                .filter(|row| row["stage"] == name)
+                .collect::<Vec<_>>()
+        };
+        let pages = stage("native_collection_page");
         assert_eq!(
-            rows[0]["counts"]["sampled_acquisition"]["page_events"]["full_by_parse_reason"],
+            pages[0]["counts"]["sampled_acquisition"]["page_events"]["full_by_parse_reason"],
             serde_json::json!({
                 "rearmed": {"count": 2, "completed_native_bytes": 123},
                 "transcript_changed": {"count": 1, "completed_native_bytes": 456},
             })
         );
-        assert!(rows[1]["counts"]["sampled_acquisition"]["page_events"]
+        assert!(pages[1]["counts"]["sampled_acquisition"]["page_events"]
             .get("full_by_parse_reason")
             .is_none());
+        let cell = |count, bytes| serde_json::json!({"listing_unchanged": {"count": count, "completed_native_bytes": bytes}});
+        let stamps = stage("native_full_prior_stamp");
+        assert_eq!(stamps.len(), 1, "an empty matrix emits no record");
+        assert_eq!(stamps[0]["source"], "claude_code");
+        assert_eq!(
+            stamps[0]["counts"],
+            serde_json::json!({"full_by_prior_stamp": {
+                "rearmed": cell(2, 123),
+                "transcript_changed": cell(1, 456),
+                "unattributed": cell(1, 999),
+            }})
+        );
+
+        // Bucket x source: one shared classification and emission path.
+        let committed = Some((10, Some(7)));
+        let cases = [
+            ((10, 7), committed, "listing_unchanged"),
+            ((10, 8), committed, "same_size_moved_mtime"),
+            ((11, 7), committed, "size_changed"),
+            ((10, 7), Some((10, None)), "no_baseline"),
+            ((10, 7), None, "no_baseline"),
+        ];
+        let sources = ["claude_code", "codex", "pi"];
+        let (_, rows) = capture(|| {
+            for source in sources {
+                let probe = Probe::start();
+                for (listing, committed, _) in cases {
+                    let prior = Some(PriorStamp::classify(listing, committed));
+                    probe.full_parse_reason(full, Some(TranscriptChanged), prior, 1, 0);
+                    probe.full_parse_reason(full, Some(TranscriptChanged), prior, 0, 5);
+                }
+                let mut reads = max_read_counts();
+                reads.page_events.full_by_parse_reason = probe.full_by_parse_reason();
+                collect(&probe, source, Some(reads));
+            }
+        });
+        let mut expected = serde_json::Map::new();
+        for (_, _, bucket) in cases {
+            let n = cases.iter().filter(|case| case.2 == bucket).count() as u64;
+            expected.insert(
+                bucket.into(),
+                serde_json::json!({"count": n, "completed_native_bytes": 5 * n}),
+            );
+        }
+        let expected = serde_json::json!({"transcript_changed": expected});
+        for source in sources {
+            let row = rows
+                .iter()
+                .find(|row| row["stage"] == "native_full_prior_stamp" && row["source"] == source)
+                .unwrap_or_else(|| panic!("{source}"));
+            assert_eq!(row["counts"]["full_by_prior_stamp"], expected, "{source}");
+            let page = rows
+                .iter()
+                .find(|row| row["stage"] == "native_collection_page" && row["source"] == source)
+                .unwrap();
+            assert_eq!(
+                page["counts"]["sampled_acquisition"]["page_events"]["full_by_parse_reason"],
+                serde_json::json!({"transcript_changed": {"count": 5, "completed_native_bytes": 25}}),
+                "{source}"
+            );
+        }
+    }
+
+    /// [behaviour] Every matrix cell at its maximum stays within the record's
+    /// own test bound, off the page line.
+    #[test]
+    fn full_prior_stamp_record_with_every_cell_stays_bounded() {
+        use crate::snapshots::CandidateParseReason::*;
+        use claude_reread::PriorStamp::*;
+        let full = crate::transcript_acquisition::ReadMode::Full(
+            crate::transcript_acquisition::FullReason::StateMissing,
+        );
+        let reasons = [
+            TerminalDisposition,
+            NewFile,
+            AuthorityQuarantine,
+            Audit,
+            BodyWitnessAdoption,
+            UploadContext,
+            ActivityOrQuarantineRetry,
+            TranscriptChanged,
+            CodexCapture,
+            UnknownOutcome,
+            LegacyActivity,
+            LegacyIdentity,
+            Rearmed,
+            SourceChanged,
+            ForcedFamily,
+        ];
+        assert_eq!(
+            reasons.len(),
+            crate::snapshots::CANDIDATE_PARSE_REASON_COUNT
+        );
+        let (_, rows) = capture(|| {
+            let probe = Probe::start();
+            for reason in reasons.map(Some).into_iter().chain([None]) {
+                for stamp in [
+                    ListingUnchanged,
+                    SameSizeMovedMtime,
+                    SizeChanged,
+                    NoBaseline,
+                ] {
+                    probe.full_parse_reason(full, reason, Some(stamp), u64::MAX, u64::MAX);
+                }
+            }
+            probe.collection(
+                "claude_code",
+                CollectionCounts {
+                    scanned_files: usize::MAX,
+                    semantic_noops: usize::MAX,
+                    sampled_acquisition: Some(max_read_counts()),
+                    full_causes: Default::default(),
+                },
+            );
+        });
+        let row = rows
+            .iter()
+            .find(|row| row["stage"] == "native_full_prior_stamp")
+            .unwrap();
+        let matrix = row["counts"]["full_by_prior_stamp"].as_object().unwrap();
+        assert_eq!(matrix.len(), reasons.len() + 1);
+        assert!(matrix
+            .values()
+            .all(|cells| cells.as_object().unwrap().len() == 4));
+        let text = serde_json::to_string(row).unwrap();
+        assert!(
+            text.len() > NATIVE_PAGE_RECORD_TEST_LIMIT,
+            "the full matrix needs a separate record"
+        );
+        assert!(
+            text.len() < FULL_PRIOR_STAMP_RECORD_TEST_LIMIT,
+            "{}",
+            text.len()
+        );
+        let page = rows
+            .iter()
+            .find(|row| row["stage"] == "native_collection_page")
+            .unwrap();
+        assert!(serde_json::to_string(page).unwrap().len() < NATIVE_PAGE_RECORD_TEST_LIMIT);
     }
 
     #[test]

@@ -239,6 +239,9 @@ pub(in crate::snapshots) struct OwnedActiveFile {
     pub(in crate::snapshots) candidate: CandidateFile,
     pub(in crate::snapshots) decision: CandidateDecision,
     pub(in crate::snapshots) parse_reason: Option<CandidateParseReason>,
+    /// Diagnostics only, frozen at selection; `None` for a Codex group replay.
+    pub(in crate::snapshots) prior_stamp:
+        Option<crate::local_resource_diagnostics::claude_reread::PriorStamp>,
     pub(in crate::snapshots) previous_snapshot_fingerprint: Option<String>,
     pub(in crate::snapshots) previous_upload_body_witness: Option<String>,
     pub(in crate::snapshots) projection_adoption_required: bool,
@@ -1372,7 +1375,7 @@ impl OwnedSourceScan {
     }
 }
 
-crate::heap_layout_bound::fields!(OwnedActiveFile; first_read, sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, parse_reason);
+crate::heap_layout_bound::fields!(OwnedActiveFile; first_read, sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, parse_reason, prior_stamp);
 
 /// `requeue` for every member of a group in one pass over the pending
 /// paths (round 4, L2): O(P + n), not O(P) per member, and no pending path

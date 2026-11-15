@@ -1104,6 +1104,14 @@ gate, cap and upload nothing.
 
 Upload counts land on the line after the source's next page line.
 
+`native_full_prior_stamp` reports sparse counts and completed bytes at
+`counts.full_by_prior_stamp.<parse_reason>.<bucket>.{count,completed_native_bytes}`,
+using `unattributed` for no reason.
+Buckets: `listing_unchanged`, `same_size_moved_mtime`, `size_changed`, `no_baseline`
+(new/missing entry or mtime). Frozen at selection, including Codex tier replay;
+group replay is excluded. Equal stamps do not prove equal bytes.
+`full_by_parse_reason` keeps its shape and now covers Codex and Pi.
+
 ## Usage Gap Counters
 
 Each source's `native_collection_page` line can carry four counts of gaps in

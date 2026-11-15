@@ -864,6 +864,7 @@ impl GroupBoot {
             candidate: first,
             decision: CandidateDecision::Parse,
             parse_reason: None,
+            prior_stamp: None,
             parser,
             aliases: members.clone(),
             applied_receipts: BTreeMap::new(),
