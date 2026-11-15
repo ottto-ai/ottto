@@ -165,7 +165,12 @@ fn v2_on(source: super::scan_index_persistence::Source) -> bool {
 const INLINE_BYTES: usize = 512;
 const PART_BYTES: usize = 256 * 1024;
 const VALUE_BYTES: u64 = 64 * 1024 * 1024;
-const WAL_PASSIVE_BYTES: u64 = 8 * 1024 * 1024;
+/// WAL length that triggers a PASSIVE checkpoint. A save rewrites the same
+/// pages each pass, so checkpointing every few passes writes each database
+/// page once for all of them. The WAL file shrinks back to the journal size
+/// limit at the first commit after a checkpoint, so its length tracks live
+/// frames only while that limit stays below this threshold.
+const WAL_PASSIVE_BYTES: u64 = 32 * 1024 * 1024;
 const WAL_ALARM_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Readable closed record catalogue (catalogue.rs). Field-backed kinds inherit

@@ -14,6 +14,8 @@ pub(in super::super) struct PurgePolicy {
     /// Memory for one transaction's old-row string sets; past it, erasure is
     /// required without a diff.
     pub(super) path_diff_budget: usize,
+    /// WAL length at which maintenance runs a PASSIVE checkpoint.
+    pub(super) checkpoint_bytes: u64,
 }
 impl Default for PurgePolicy {
     fn default() -> Self {
@@ -22,6 +24,7 @@ impl Default for PurgePolicy {
             work: ERASURE_WORK_BUDGET,
             space: free_space,
             path_diff_budget: PATH_DIFF_BUDGET_BYTES,
+            checkpoint_bytes: WAL_PASSIVE_BYTES,
         }
     }
 }
@@ -821,12 +824,16 @@ impl Sqlite {
         }
         let bytes = self.wal_bytes();
         self.stats.observe_wal(bytes);
-        let required = self.debt || bytes.map_or(true, |bytes| bytes >= WAL_PASSIVE_BYTES);
+        let required =
+            self.debt || bytes.map_or(true, |bytes| bytes >= self.purge_policy.checkpoint_bytes);
         if required {
             let result = self.checkpoint(CheckpointMode::Passive);
             self.debt = required && result.state != CheckpointState::Complete;
         }
-        if idle {
+        // Between passes, truncate only to clear debt from an incomplete
+        // checkpoint, or while erasure is overdue so old frames do not
+        // outlive its deadline. Erasure itself truncates before its copy.
+        if idle && (self.debt || overdue) {
             let result = self.checkpoint(CheckpointMode::IdleReclaim);
             if result.state == CheckpointState::Complete {
                 self.debt = false;
