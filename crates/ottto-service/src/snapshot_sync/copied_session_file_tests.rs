@@ -279,7 +279,8 @@ fn content_session_closure_ignores_earliest_holder() {
                 twin.to_string_lossy().into_owned(),
             );
             assert_eq!(
-                e2::copied_file_holders(&prior, std::iter::once(twin_key.as_str()))[&twin_key],
+                e2::copied_file_holders_for_test(&prior, std::iter::once(twin_key.as_str()))
+                    [&twin_key],
                 holder.to_string_lossy(),
                 "the twin's earliest accepted holder is in another session and folder"
             );
@@ -358,12 +359,15 @@ fn content_session_closure_ignores_earliest_holder() {
                 if cause == "lossy" {
                     // No extra ids: only the non-Exact shape requires the hold.
                     let mut record = serde_json::to_value(
-                        page.index.claude_request_census.get(&twin_key).unwrap(),
+                        page.index
+                            .claude_request_census_for_test()
+                            .get(&twin_key)
+                            .unwrap(),
                     )
                     .unwrap();
                     record["s"] = json!("lossy");
                     page.index
-                        .claude_request_census
+                        .claude_request_census_mut_for_test()
                         .insert_for_test(&twin_key, serde_json::from_value(record).unwrap());
                     let item = page
                         .scan
@@ -488,7 +492,8 @@ fn unrelated_main_and_growing_twin_pull_complete_session() {
             assert_eq!(accepted[ROOT], 4);
             let twin_key = twin.to_string_lossy().into_owned();
             assert_eq!(
-                e2::copied_file_holders(&prior, std::iter::once(twin_key.as_str()))[&twin_key],
+                e2::copied_file_holders_for_test(&prior, std::iter::once(twin_key.as_str()))
+                    [&twin_key],
                 unrelated.to_string_lossy()
             );
             let mut selected = prior.clone();
