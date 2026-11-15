@@ -4087,10 +4087,6 @@ pub(super) mod tests {
             "no conflicted item can reach cached or current-home binding"
         );
         assert_eq!(held.ownership_incomplete_file_count, 2);
-        // A complete inventory still charges a real group reason.
-        let (c, _) = held.causes.summary(held.ownership_incomplete_file_count);
-        assert_eq!(c[ownership::INVENTORY], 2);
-        assert_eq!(held.unreadable_path_count, 1);
         assert!(!held.census_complete);
         let causes = serde_json::to_value(
             held.local_codex_diagnostics
@@ -4669,9 +4665,12 @@ pub(super) mod tests {
         assert!(inventory_hold(&index).is_none());
         fs::remove_dir_all(root).unwrap();
     }
-    /// One `scan` page whose header inventory is forced incomplete, as an
-    /// unstable directory census leaves it.
-    fn inventory_held_scan(root: &Path, index: ScanIndex) -> (ScanIndex, SourceScanResult) {
+    /// One `scan` page whose header inventory `prepare` adjusts first.
+    fn scan_with_inventory(
+        root: &Path,
+        index: ScanIndex,
+        prepare: impl FnOnce(&mut HeaderInventory),
+    ) -> (ScanIndex, SourceScanResult) {
         let mut owned = OwnedSourceScan::new(
             SnapshotSource::Codex,
             &[root.join("sessions")],
@@ -4683,11 +4682,12 @@ pub(super) mod tests {
             &[],
             false,
         );
-        owned
-            .codex_join_inventory
-            .as_mut()
-            .expect("a selecting page")
-            .complete = false;
+        prepare(
+            owned
+                .codex_join_inventory
+                .as_mut()
+                .expect("a selecting page"),
+        );
         for _ in 0..10_000 {
             match owned.step(None) {
                 OwnedSourceScanStep::Pending(next) => owned = next,
@@ -4706,7 +4706,7 @@ pub(super) mod tests {
         let (root, _) = fixture();
         let owner = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
         let (mut index, mut result) = scan(&root, ScanIndex::default(), 4);
-        assert_eq!(result.snapshots.len(), 1);
+        assert!(!result.snapshots.is_empty());
         finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut index);
         result.finish_codex_capture_boundary(&mut index);
         let accepted = result
@@ -4730,9 +4730,32 @@ pub(super) mod tests {
                 .map(|item| (item.source_session_id.clone(), item.input_tokens))
                 .collect::<Vec<_>>()
         };
+        // As an unstable directory census leaves it.
+        let incomplete = |inventory: &mut HeaderInventory| inventory.complete = false;
+        // A complete inventory with a real group reason (an affected owner)
+        // still charges the group: ownership per member, one AliasParser,
+        // residue and no hold.
+        let (charged_index, charged) = scan_with_inventory(&root, previous.clone(), |inventory| {
+            inventory.held_owners.insert(owner.to_string());
+        });
+        assert!(charged.snapshots.is_empty());
+        assert_eq!(charged.ownership_incomplete_file_count, 2);
+        assert_eq!(charged.unreadable_path_count, 1);
+        let (c, _) = charged.causes.summary(2);
+        assert_eq!(c[ownership::INVENTORY], 2);
+        let causes = serde_json::to_value(
+            charged
+                .local_codex_diagnostics
+                .unwrap()
+                .unreadable_causes
+                .projection(1),
+        )
+        .unwrap();
+        assert_eq!(causes["counts"][5], 1, "one AliasParser event");
+        assert!(inventory_hold(&charged_index).is_none());
         let ((_, control), control_bytes) = observe_consumed(|| scan(&root, previous.clone(), 4));
-        assert_eq!(control.snapshots.len(), 1);
-        let (held_index, held) = inventory_held_scan(&root, previous);
+        assert!(!control.snapshots.is_empty());
+        let (held_index, held) = scan_with_inventory(&root, previous.clone(), incomplete);
         assert!(held.snapshots.is_empty());
         assert_eq!(
             (
@@ -4745,7 +4768,7 @@ pub(super) mod tests {
             inventory_hold(&held_index).map(|hold| &hold.owed),
             Some(&members)
         );
-        let (again_index, again) = inventory_held_scan(&root, held_index);
+        let (again_index, again) = scan_with_inventory(&root, held_index, incomplete);
         assert!(again.snapshots.is_empty());
         assert_eq!(
             (

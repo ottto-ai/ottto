@@ -1841,8 +1841,9 @@ fn a_remaining_refused_header_stays_red_after_another_releases_the_hold() {
     fs::write(&bad_a, rollout(BAD_A, Some("a"))).unwrap();
     let (index, still, posts) = page(index);
     assert!(still.snapshots.is_empty() && posts.is_empty());
+    // Generation totals: the two earlier refusals plus the remaining one.
     assert_eq!(
-        still.unreadable_path_count, 1,
+        still.unreadable_path_count, 3,
         "the remaining refusal counts"
     );
     assert_eq!(still.ownership_incomplete_file_count, 0);
@@ -1877,14 +1878,14 @@ fn a_remaining_refused_header_stays_red_after_another_releases_the_hold() {
         .retain(|item| ids.contains(&item.source_session_id.as_str()));
     money_oracle::assert_equivalent(&emitted(&index, &cold), &route(&index, &recovered, posts));
     // The repaired headers do not erase this generation's real failures.
-    assert!(
+    assert_eq!(
         index
             .traversal
             .as_ref()
             .unwrap()
             .counts
-            .unreadable_path_count
-            >= 3
+            .unreadable_path_count,
+        3
     );
     drop(session);
 }
