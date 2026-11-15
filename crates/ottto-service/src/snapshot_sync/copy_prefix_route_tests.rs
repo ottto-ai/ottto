@@ -397,9 +397,7 @@ fn never_delivered_holder_is_held_and_copy_counts_once() {
         // Committed, never delivered: no receipt.
         let (scanner, mut prior) = warm_claude_undelivered(&c, &disk);
         let key = holder.to_string_lossy().into_owned();
-        prior
-            .claude_account_deferred_holds
-            .insert(key, "held".into());
+        crate::snapshots::e2_pipeline_scan_fixture::hold_claude_account_for_test(&mut prior, &key);
         let path = c.write_at(
             &file(COPY),
             &resumed(COPY, &[A, B, C]),

@@ -4985,10 +4985,6 @@ pub(crate) fn take_counts() -> Counts {
 thread_local! {
     static PAGE_COUNTS: RefCell<Counts> = const { RefCell::new(Counts([0; COUNT_LEN])) };
 }
-#[cfg(test)]
-fn take_thread_counts() -> Counts {
-    PAGE_COUNTS.take()
-}
 #[derive(Debug)]
 pub(crate) struct Counts([u64; COUNT_LEN]);
 impl Default for Counts {

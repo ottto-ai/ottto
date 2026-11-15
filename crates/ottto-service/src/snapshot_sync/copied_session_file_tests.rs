@@ -485,13 +485,13 @@ fn copied_file_version_three_converges_once() {
             // holder, rather than manufacturing an expired acceptance wait.
             let holder_key = c.root.join(file(ROOT)).to_string_lossy().into_owned();
             let held_source = prior.files[&holder_key].source_file_fingerprint.clone();
-            prior
-                .effective_upload_body_witness_revision_excluded_source_files
-                .insert(held_source.clone());
+            prior.exclude_effective_upload_body_witness_revision_for_source_files(&BTreeSet::from(
+                [held_source.clone()],
+            ));
             owe(&mut prior);
             let mut old = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
             old.index
-                .effective_upload_body_witness_revision_excluded_source_files
+                .effective_upload_body_witness_revision_exclusions_for_test()
                 .remove(&held_source);
             let head = body(&old, session).unwrap().clone();
             let expected = if shape == 2 { 4 } else { requests as u64 };

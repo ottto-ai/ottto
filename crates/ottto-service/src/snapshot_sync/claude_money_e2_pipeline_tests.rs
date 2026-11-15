@@ -725,8 +725,8 @@ fn streamed_evidence_equals_whole_corpus() {
         e2_pipeline_trace_named_agent_on_another_page_is_not_published_on_root();
         // A queued, stale copy holder.
         copy_waits_for_queued_holder(true);
-        // A prefix hold expiring.
-        e2_pipeline_resumed_prefix_hold_emits_own_turns_and_expires_after_three_decisions();
+        // A deadline followed by a completed prefix decision.
+        e2_pipeline_deadline_counts_prefix_and_marks_one_followup();
         // Retired and departed holders.
         e2_pipeline_resumed_copy_removal_stays_removed_after_its_proof_retires();
         e2_pipeline_recorded_removal_stands_when_its_holder_leaves_the_index();
