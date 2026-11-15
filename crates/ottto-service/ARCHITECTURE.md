@@ -25,6 +25,10 @@ file-system hint / periodic listing → select file → read new bytes from save
   from the saved offset, is the normal mode, so bytes read track bytes appended. A Full read has a
   named cause (new or replaced file, missing or invalid saved result, a real edit) and is counted
   by cause. Re-reading unchanged content that was already uploaded is treated as a bug.
+  Forced Claude twins with a current, verified, loss-free census may use the same validated Tail
+  loader. They still provide no copy proof or body-binding authority. Without audit capacity or
+  when the loader holds, they read natively on their holder's page. Exact/Empty growth can lose
+  census verification and require a native read on the next force.
 - **Reduction.** One reducer per source turns lines into usage and keeps a running result. Old
   evidence is read only for the session group a change affects.
 - **Codex rollout encodings.** Plain `.jsonl` and compressed `.jsonl.zst` use the same

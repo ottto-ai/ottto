@@ -300,6 +300,20 @@ impl ClaudeRequestCensusRecord {
         !self.unverified && self.not_twin_or_retired()
     }
 
+    /// Acquisition may try validated stored state without granting copy proof.
+    fn verified_loss_free_twin(&self) -> bool {
+        self.twin
+            && !self.unverified
+            && self.current_derivation()
+            && self.retired.is_none()
+            && matches!(
+                self.shape,
+                ClaudeRequestCensusShape::Exact
+                    | ClaudeRequestCensusShape::Empty
+                    | ClaudeRequestCensusShape::IdentityIncomplete
+            )
+    }
+
     /// A current native body can supersede an unverified census record only if
     /// the record describes a complete, loss-free parse of that revision.
     /// Terminal oversized-line settlement is NOT complete proof evidence.
@@ -1906,12 +1920,14 @@ pub(crate) fn record_claude_request_census(
     }
 }
 
-/// A forced family member reads natively only for evidence stored state cannot
-/// supply: no census record, or an unverified or twin record that cannot bind
-/// a recomposed body (an identity-incomplete hold waits for its Full audit).
+/// Acquisition requires native evidence for missing or unbindable records,
+/// except verified loss-free twins may try the validated Tail loader. This
+/// grants no copy proof or body binding; identity-incomplete holds still audit.
 pub(super) fn forced_member_needs_native(index: &ScanIndex, key: &str) -> bool {
     index.claude_request_census.get(key).map_or(true, |record| {
-        record.unverified_or_twin() && !record.can_bind_recomposed_body()
+        record.unverified_or_twin()
+            && !record.can_bind_recomposed_body()
+            && !record.verified_loss_free_twin()
     })
 }
 
@@ -2471,6 +2487,10 @@ impl ClaudeRequestCensusRecord {
     }
     pub(crate) fn with_derivation_for_test(mut self, derivation: u16) -> Self {
         self.derivation = derivation;
+        self
+    }
+    pub(crate) fn with_twin_for_test(mut self, twin: bool) -> Self {
+        self.twin = twin;
         self
     }
     pub(crate) fn with_unverified_for_test(mut self, unverified: bool) -> Self {

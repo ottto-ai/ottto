@@ -4379,9 +4379,20 @@ impl OwnedSourceScan {
                         let forced_native = forced_family
                             && (tail_route.is_none()
                                 || claude_request_census::forced_member_needs_native(index, &key));
+                        let forced_twin = forced_family
+                            && !forced_native
+                            && index
+                                .claude_request_census
+                                .get(&key)
+                                .is_some_and(|r| r.is_twin());
+                        // A pulled twin must finish on its holder's page. Native
+                        // acquisition avoids both cap pacing and unfunded completion.
                         let mut allow_sample = (index.files.contains_key(&key) || e2_held_new_file)
                             && !protected
-                            && !forced_native;
+                            && !forced_native
+                            && !(forced_twin
+                                && (context.audit_slots == 0
+                                    || !index.can_stage_sampled_audit(&key)));
                         context
                             .admission
                             .audit_metadata_supported
@@ -4452,6 +4463,11 @@ impl OwnedSourceScan {
                                         }
                                         retained_offset = Some(retained.checkpoint.sealed_offset());
                                         (Some(retained), debt)
+                                    }
+                                    // A pulled twin falls back to this page's native read.
+                                    tail_source::load::Load::Held if forced_twin => {
+                                        allow_sample = false;
+                                        (None, debt)
                                     }
                                     // A newer build's head: untouched, held as residue.
                                     tail_source::load::Load::Held => {

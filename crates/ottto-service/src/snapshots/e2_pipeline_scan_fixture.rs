@@ -460,10 +460,19 @@ pub(crate) fn save_reload_for_test(index: &mut ScanIndex, path: &Path) -> ScanIn
     loaded
 }
 
+pub(crate) struct Acquisition {
+    pub(crate) path: PathBuf,
+    pub(crate) reason: Option<CandidateParseReason>,
+    pub(crate) mode: crate::transcript_acquisition::ReadMode,
+    pub(crate) start: u64,
+}
+
 #[derive(Default)]
 pub(crate) struct E2ScanFixture {
     pub(crate) cache: Arc<sampled_scan::SharedCache>,
     observed: Mutex<Vec<PathBuf>>,
+    pub(crate) acquisitions: Mutex<Vec<Acquisition>>,
+    audit_slots: Option<usize>,
     full_reasons: Mutex<[usize; 11]>,
     pub(crate) versions: Option<Arc<codex_version::CodexVersionFeed>>,
     capture_claude_identity: bool,
@@ -532,6 +541,10 @@ impl E2ScanFixture {
         *self.attribution.lock().unwrap() = attribution;
     }
 
+    pub(crate) fn set_audit_slots(&mut self, slots: usize) {
+        self.audit_slots = Some(slots);
+    }
+
     pub(crate) fn full_reasons(&self) -> [usize; 11] {
         *self.full_reasons.lock().unwrap()
     }
@@ -586,6 +599,7 @@ impl E2ScanFixture {
         hints: &[PathBuf],
     ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
         self.observed.lock().unwrap().clear();
+        self.acquisitions.lock().unwrap().clear();
         let (scope, _) = scan_binding(SnapshotSource::ClaudeCode);
         let mut scan = OwnedSourceScan::new_with_recovery_priority(
             SnapshotSource::ClaudeCode,
@@ -677,6 +691,11 @@ impl E2ScanFixture {
     ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
         let mut seen = BTreeSet::new();
         for _ in 0..100_000 {
+            if let Some(slots) = self.audit_slots {
+                if let Some(context) = scan.sampling.as_mut() {
+                    context.audit_slots = slots;
+                }
+            }
             // Existing fixture setter changes only physical birth. JSONL still
             // comes from the opened reader, including retained prefix/suffix.
             if let Some(active) = scan.active_file.as_deref_mut() {
@@ -685,6 +704,20 @@ impl E2ScanFixture {
                         .lock()
                         .unwrap()
                         .push(active.candidate.path.clone());
+                    if let Some((plan, sampling)) = active
+                        .parser
+                        .reader
+                        .acquisition
+                        .as_ref()
+                        .zip(active.sampling.as_ref())
+                    {
+                        self.acquisitions.lock().unwrap().push(Acquisition {
+                            path: active.candidate.path.clone(),
+                            reason: active.parse_reason,
+                            mode: sampling.mode,
+                            start: plan.start_offset(),
+                        });
+                    }
                 }
                 if let Some(birth) = births.get(&active.candidate.path) {
                     if self.subagent_births
@@ -1029,4 +1062,67 @@ pub(crate) fn hold_entity_decode_for_test(index: &mut ScanIndex, fingerprint: &s
             4,
         )
         .unwrap();
+}
+
+/// Mutate only real committed fixture state; no manufactured certificate.
+pub(crate) fn damage_tail_for_test(index: &ScanIndex, key: &str, damage: &str) {
+    let route = state_v2::tail_route_path(index).unwrap().unwrap();
+    if damage == "missing" {
+        state_v2::retire_tail(&route, [key.to_owned()]).unwrap();
+        return;
+    }
+    if damage == "metadata" {
+        state_v2::observe_tail(
+            &route,
+            key,
+            state_v2::Observation {
+                representation: state_v2::Representation::NonTail,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        return;
+    }
+    let revision = tail_source::reduction_revision(SnapshotSource::ClaudeCode);
+    let head = state_v2::load_head(index, key, revision).unwrap().unwrap();
+    let mut staged = state_v2::StagedFile {
+        revision: head.revision,
+        head: head.body.clone(),
+        collections: head
+            .table
+            .iter()
+            .filter(|(collection, _)| **collection != state_v2::Collection::Revisions)
+            .map(|(collection, membership)| (*collection, membership.meta))
+            .collect(),
+        ..Default::default()
+    };
+    state_v2::load_tail(index, key, &head, |collection, page, bytes| {
+        staged.pages.insert((collection, page), bytes);
+        Ok(())
+    })
+    .unwrap();
+    match damage {
+        "future" => staged.revision += 1,
+        "corrupt" => staged.head = vec![0],
+        // HeadIdentity starts with its raw 32-byte binding digest.
+        "identity" => staged.head[0] ^= 1,
+        "missing_page" => {
+            staged.pages.clear();
+            staged.change = state_v2::Change::Reset;
+        }
+        _ => panic!("unknown fixture damage"),
+    }
+    state_v2::stage_tail(&route, key, staged).unwrap();
+}
+
+/// The acquisition gate, exposed without widening its production visibility.
+pub(crate) fn forced_needs_native_for_test(index: &ScanIndex, path: &Path) -> bool {
+    claude_request_census::forced_member_needs_native(index, &local_index_key(path))
+}
+
+pub(crate) fn pace_cap_for_test(owner: &E2ScanFixture, path: &Path) {
+    let now = std::time::SystemTime::now();
+    let key = local_index_key(path);
+    assert!(owner.cache.cap_pace_for_test(&key, now).0);
+    assert!(!owner.cache.cap_pace_for_test(&key, now).0);
 }

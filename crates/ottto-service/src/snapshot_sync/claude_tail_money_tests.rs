@@ -4292,3 +4292,7 @@ fn conflict_then_append() {
         answers(&pages[0], &progress, &challenge);
     });
 }
+
+mod forced_twin_tail_tests {
+    include!("forced_twin_tail_tests.rs");
+}

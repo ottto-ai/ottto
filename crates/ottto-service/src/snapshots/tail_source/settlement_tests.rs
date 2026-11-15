@@ -337,8 +337,21 @@ fn the_shipped_selections_reuse_stored_state() {
 #[test]
 fn a_forced_member_reads_natively_only_for_missing_evidence() {
     let fingerprint = "a".repeat(64);
-    let record =
-        |shape| ClaudeRequestCensusRecord::synthetic_for_test(&fingerprint, 7, shape, vec![1]);
+    let record = |shape| {
+        ClaudeRequestCensusRecord::synthetic_for_test(
+            &fingerprint,
+            7,
+            shape,
+            if matches!(
+                shape,
+                ClaudeRequestCensusShape::Empty | ClaudeRequestCensusShape::OverBudget
+            ) {
+                vec![]
+            } else {
+                vec![1]
+            },
+        )
+    };
     let cases = [
         (
             "verified.jsonl",
@@ -363,14 +376,43 @@ fn a_forced_member_reads_natively_only_for_missing_evidence() {
             true,
         ),
     ];
+    let mut cases = cases.to_vec();
+    for shape in [
+        ClaudeRequestCensusShape::Exact,
+        ClaudeRequestCensusShape::Empty,
+        ClaudeRequestCensusShape::IdentityIncomplete,
+        ClaudeRequestCensusShape::Lossy,
+        ClaudeRequestCensusShape::OverBudget,
+    ] {
+        let twin = record(shape).with_twin_for_test(true);
+        let admitted = matches!(
+            shape,
+            ClaudeRequestCensusShape::Exact
+                | ClaudeRequestCensusShape::Empty
+                | ClaudeRequestCensusShape::IdentityIncomplete
+        );
+        cases.push(("twin", twin.clone(), !admitted));
+        cases.push((
+            "unverified twin",
+            twin.clone().with_unverified_for_test(true),
+            true,
+        ));
+        cases.push(("old twin", twin.clone().with_derivation_for_test(0), true));
+        let mut retired = twin;
+        retired.retire();
+        cases.push(("retired twin", retired, true));
+    }
     let mut index = ScanIndex::default();
-    for (key, record, _) in &cases {
+    for (key, record, native) in &cases {
         index
             .claude_request_census_mut_for_test()
             .insert_for_test(key, record.clone());
-    }
-    for (key, _, native) in &cases {
         assert_eq!(forced_member_needs_native(&index, key), *native, "{key}");
+        if record.is_twin() {
+            assert!(!record.can_bind_recomposed_body());
+            assert!(!record.proves_scan());
+            assert!(!record.current_for(&fingerprint));
+        }
     }
     assert!(forced_member_needs_native(&index, "absent.jsonl"));
 }
