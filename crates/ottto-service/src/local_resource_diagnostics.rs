@@ -1257,9 +1257,6 @@ impl Probe {
         if !matches!(mode, crate::transcript_acquisition::ReadMode::Full(_)) {
             return;
         }
-        if let Some(reason) = reason {
-            rearm_cause::record_parse_reason(self.started, reason, count, native_bytes);
-        }
         if let Some(prior) = prior {
             rearm_cause::record_prior_stamp(self.started, reason, prior, count, native_bytes);
         }

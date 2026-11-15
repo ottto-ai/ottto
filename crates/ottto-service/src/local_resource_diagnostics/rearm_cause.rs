@@ -90,7 +90,6 @@ impl Counts {
 #[derive(Default)]
 struct Page {
     causes: Counts,
-    parse_reasons: super::claude_reread::FullByParseReason,
     prior_stamps: super::claude_reread::FullByPriorStamp,
 }
 // Probe::drop releases the page, including early exits.
@@ -118,20 +117,6 @@ pub(crate) fn completed(page: Instant, key: &str, mode: ReadMode, native_bytes: 
         });
     }
 }
-pub(crate) fn record_parse_reason(
-    page: Instant,
-    reason: CandidateParseReason,
-    count: u64,
-    native_bytes: u64,
-) {
-    with_pages(|pages| {
-        pages
-            .entry(page)
-            .or_default()
-            .parse_reasons
-            .record(reason, count, native_bytes)
-    });
-}
 pub(crate) fn record_prior_stamp(
     page: Instant,
     reason: Option<CandidateParseReason>,
@@ -156,12 +141,7 @@ pub(crate) fn page(page: Instant) -> Counts {
     with_pages(|pages| pages.get(&page).map(|page| page.causes).unwrap_or_default())
 }
 pub(crate) fn full_by_parse_reason(page: Instant) -> super::claude_reread::FullByParseReason {
-    with_pages(|pages| {
-        pages
-            .get(&page)
-            .map(|page| page.parse_reasons)
-            .unwrap_or_default()
-    })
+    full_by_prior_stamp(page).by_parse_reason()
 }
 pub(crate) fn finish_page(page: Instant) {
     with_pages(|pages| {

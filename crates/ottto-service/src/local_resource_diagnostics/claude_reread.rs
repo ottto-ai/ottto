@@ -6,7 +6,7 @@ use serde::Serialize;
 use std::cell::Cell;
 
 /// Full selections and completed native bytes, keyed only by the existing
-/// CandidateParseReason labels. Stored in the existing per-probe page registry.
+/// CandidateParseReason labels. Derived from the prior-stamp matrix at emission.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct FullByParseReason(
     [super::rearm_cause::Total; crate::snapshots::CANDIDATE_PARSE_REASON_COUNT],
@@ -16,18 +16,6 @@ impl FullByParseReason {
         self.0
             .iter()
             .all(|n| n.count == 0 && n.completed_native_bytes == 0)
-    }
-    pub(super) fn record(
-        &mut self,
-        reason: crate::snapshots::CandidateParseReason,
-        count: u64,
-        completed_native_bytes: u64,
-    ) {
-        let total = &mut self.0[reason as usize];
-        total.count = total.count.saturating_add(count);
-        total.completed_native_bytes = total
-            .completed_native_bytes
-            .saturating_add(completed_native_bytes);
     }
 }
 impl Serialize for FullByParseReason {
@@ -82,6 +70,19 @@ pub(crate) struct FullByPriorStamp(
     [[super::rearm_cause::Total; 4]; crate::snapshots::CANDIDATE_PARSE_REASON_COUNT + 1],
 );
 impl FullByPriorStamp {
+    pub(super) fn by_parse_reason(&self) -> FullByParseReason {
+        FullByParseReason(std::array::from_fn(|reason| {
+            self.0[reason]
+                .iter()
+                .fold(super::rearm_cause::Total::default(), |mut total, cell| {
+                    total.count = total.count.saturating_add(cell.count);
+                    total.completed_native_bytes = total
+                        .completed_native_bytes
+                        .saturating_add(cell.completed_native_bytes);
+                    total
+                })
+        }))
+    }
     pub(crate) fn is_empty(&self) -> bool {
         self.0
             .iter()
