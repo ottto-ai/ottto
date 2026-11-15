@@ -2,7 +2,6 @@ use crate::snapshots::line_delivery::{
     DeliveryEnd, DeliveryMode, FileView, LineObserver, PhysicalLine, Want,
 };
 use crate::snapshots::scan_index_persistence::Source;
-use crate::transcript_acquisition::FileObject;
 use sampled_scan::transition_fixture::{self as oracle, money_oracle, Accepted, Mode, RouteResult};
 
 const MAIN: &str = "019e5a00-0000-7000-8000-00000000000a";
@@ -11,19 +10,11 @@ const SIDE: &str = "019e5a00-0000-7000-8000-00000000000c";
 const GAP: &str = "019e5a00-0000-7000-8000-00000000000d";
 const REVISION: u32 = <tail_source::codex::Codex as tail_source::TailSource>::REDUCTION_REVISION;
 
-/// Each delivery's (mode, start), and the same with its opened file object.
 #[derive(Clone, Default)]
-struct Delivered(
-    Arc<Mutex<Vec<(DeliveryMode, u64)>>>,
-    Arc<Mutex<Vec<(FileObject, DeliveryMode, u64)>>>,
-);
+struct Delivered(Arc<Mutex<Vec<(DeliveryMode, u64)>>>);
 impl LineObserver for Delivered {
     fn begin(&mut self, view: &FileView) -> Want {
         self.0.lock().unwrap().push((view.mode, view.start));
-        self.1
-            .lock()
-            .unwrap()
-            .push((view.object, view.mode, view.start));
         Want::Lines
     }
     fn line(&mut self, _: &FileView, _: &PhysicalLine<'_>) {}
@@ -1923,8 +1914,11 @@ fn a_remaining_refused_header_stays_red_after_another_releases_the_hold() {
 /// restart. A later page holds a second new rollout while the first debt is
 /// still owed: the hold owes their union. Once the symlink is gone and the
 /// regressed file is restored and grown, the roster lists both rollouts, the
-/// hold releases, every session catches up cold-equal, neither checkpointed
-/// group member is read again and the generation retires.
+/// hold releases, every session catches up cold-equal and the generation
+/// retires. Read bound, measured at the transcript reader for joined members
+/// too: after the restart each checkpointed group member's census visit
+/// consumes no byte and starts no first read, while the first generation's
+/// read of the group is non-zero on the same counters.
 #[test]
 fn unlisted_hinted_rollout_holds_a_real_page_until_the_roster_lists_it() {
     use crate::snapshots::codex_file_join::tests::member;
@@ -1957,15 +1951,26 @@ fn unlisted_hinted_rollout_holds_a_real_page_until_the_roster_lists_it() {
     };
     let c = Corpus::new();
     let roots = c.roots();
+    // A page's FirstRead events: one per file job that is new to the index,
+    // a joined group's job included.
+    let first_reads = |logs: &[Value]| {
+        logs.iter()
+            .filter(|row| row["stage"] == "native_collection_page")
+            .map(|row| row["counts"]["first_read_files"].as_u64().unwrap_or(0))
+            .sum::<u64>()
+    };
+    // Each page also returns (bytes consumed at the transcript reader, which
+    // joined members' reads pass through too, FirstRead events).
     let step = |index: ScanIndex, limit: usize, hints: &[PathBuf]| {
         let before = index.clone();
-        let (working, scan, delivered, _, _) =
+        let (working, scan, delivered, consumed, logs) =
             page_observed_hinted(&roots, index, fresh(), limit, &slots, hints, |_| {});
         let (index, posts) = working.checkpoint_with_captured_posts(&scan, &before, "accept");
         let scan = unique(scan);
         let routed = route(&index, &scan, posts);
-        let reads = delivered.1.lock().unwrap().clone();
-        (index, scan, routed, reads, before)
+        let reads = delivered.0.lock().unwrap().clone();
+        let measured = (consumed, first_reads(&logs));
+        (index, scan, routed, reads, before, measured)
     };
     let hold_of = |index: &ScanIndex| {
         index
@@ -2002,8 +2007,42 @@ fn unlisted_hinted_rollout_holds_a_real_page_until_the_roster_lists_it() {
         &ScanIndex::default(),
         &c.scratch.join("state"),
     );
-    // The first generation reads and accepts everything, then retires.
-    let (mut index, first, accepted, _, _) = step(prior, 100, &[]);
+    let queued_paths = (0..QUEUED.len())
+        .map(|n| c.sessions.join(format!("zz-{n}.jsonl")))
+        .collect::<Vec<_>>();
+    let size = |path: &Path| fs::metadata(path).unwrap().len();
+    let rollout_bytes = size(&behind) + queued_paths.iter().map(|path| size(path)).sum::<u64>();
+    // Positive control on the same member bytes alone: the counters see the
+    // joined group's first read.
+    let alone = Corpus::new();
+    fs::write(
+        alone.sessions.join("zgroup-a.jsonl"),
+        lines(&member(GROUP, "r-a", 100, 100)),
+    )
+    .unwrap();
+    fs::write(
+        alone.sessions.join("zgroup-b.jsonl"),
+        lines(&member(GROUP, "r-b", 200, 300)),
+    )
+    .unwrap();
+    let (_, solo, _, solo_bytes, solo_logs) = page_observed_hinted(
+        &alone.roots(),
+        ScanIndex::default(),
+        fresh(),
+        100,
+        &slots,
+        &[],
+        |_| {},
+    );
+    assert_eq!(ids(&unique(solo)), BTreeSet::from([GROUP.to_string()]));
+    assert!(
+        solo_bytes > 0 && first_reads(&solo_logs) >= 1,
+        "the group's first read is observed: {solo_bytes} bytes, {solo_logs:?}"
+    );
+    // The first generation reads and accepts everything, then retires. It
+    // reads each new file once, so its bytes past the four rollouts and its
+    // fifth FirstRead are the joined group's.
+    let (mut index, first, accepted, _, _, mut measured) = step(prior, 100, &[]);
     let mut everyone = QUEUED.map(String::from).to_vec();
     everyone.extend([GROUP, BEHIND].map(String::from));
     assert_eq!(ids(&first), everyone.into_iter().collect::<BTreeSet<_>>());
@@ -2012,9 +2051,15 @@ fn unlisted_hinted_rollout_holds_a_real_page_until_the_roster_lists_it() {
         if index.traversal.is_none() {
             break;
         }
-        index = step(index, 100, &[]).0;
+        let (next, _, _, _, _, more) = step(index, 100, &[]);
+        index = next;
+        measured = (measured.0 + more.0, measured.1 + more.1);
     }
     assert!(index.traversal.is_none(), "the first generation retired");
+    assert!(
+        measured.0 > rollout_bytes && measured.1 >= 5,
+        "the first generation reads the group: {measured:?}, rollouts {rollout_bytes} bytes"
+    );
     let kb = key(&behind);
     let witness = |index: &ScanIndex| {
         index
@@ -2026,7 +2071,7 @@ fn unlisted_hinted_rollout_holds_a_real_page_until_the_roster_lists_it() {
     assert!(accepted_witness.is_some());
     // The next generation walks everything into its census; its first page
     // revisits the unchanged accepted rollout.
-    let (index, walked, _, _, _) = step(index, 1, &[]);
+    let (index, walked, _, _, _, _) = step(index, 1, &[]);
     assert!(walked.snapshots.is_empty(), "{:?}", walked.snapshots);
     let census = |index: &ScanIndex| {
         index
@@ -2050,7 +2095,7 @@ fn unlisted_hinted_rollout_holds_a_real_page_until_the_roster_lists_it() {
     std::os::unix::fs::symlink(c.scratch.join("absent"), &link).unwrap();
     // The fresh page: both hinted files, then census fill (the group).
     crate::snapshots::state_v2::release_collection_page_limit_for_test(&index);
-    let (held_index, held, held_route, mut reads, before) =
+    let (held_index, held, held_route, reads, before, _) =
         step(index, 3, &[c.path(NEW1), behind.clone()]);
     assert!(held.snapshots.is_empty(), "{:?}", held.snapshots);
     assert!(reads.is_empty(), "the held page reads no transcript");
@@ -2105,16 +2150,49 @@ fn unlisted_hinted_rollout_holds_a_real_page_until_the_roster_lists_it() {
     assert_eq!(hold_of(&index), Some(hold.clone()));
     assert_eq!(witness(&index), accepted_witness);
     let restarted = index.clone();
+    // From here on, a page whose census visits only unchanged files (the
+    // checkpointed group's members, the queued rollouts) must consume no byte
+    // and start no first read, and every group member must be so visited.
+    let group_keys = group.iter().map(|path| key(path)).collect::<BTreeSet<_>>();
+    let mut unchanged = group_keys.clone();
+    unchanged.extend(queued_paths.iter().map(|path| key(path)));
+    let queue = |index: &ScanIndex| {
+        index.traversal.as_ref().map_or_else(BTreeSet::new, |t| {
+            t.pending_candidates
+                .iter()
+                .map(|candidate| key(&candidate.path))
+                .collect::<BTreeSet<_>>()
+        })
+    };
+    let mut unread = BTreeSet::new();
+    let mut zero_read = |before: &ScanIndex, after: &ScanIndex, measured: (u64, u64)| {
+        let visited = queue(before)
+            .difference(&queue(after))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let members = visited
+            .intersection(&group_keys)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if !members.is_empty() && visited.is_subset(&unchanged) {
+            assert_eq!(
+                measured,
+                (0, 0),
+                "{visited:?}: (consumed bytes, first reads)"
+            );
+            unread.extend(members);
+        }
+    };
     // An ordinary census page: the debt is unmoved, so nothing releases.
-    let (index, quiet, _, more, _) = step(index, 1, &[]);
-    reads.extend(more);
+    let (index, quiet, _, _, before, measured) = step(index, 1, &[]);
+    zero_read(&before, &index, measured);
     assert!(quiet.snapshots.is_empty(), "{:?}", quiet.snapshots);
     assert_eq!(hold_of(&index), Some(hold));
     // A second new rollout holds the next fresh page; the earlier debt,
     // unselected and partly outside the roster, is still owed with it.
     c.write(NEW2, Some("b"));
-    let (index, rehold, _, more, before) = step(index, 1, &[c.path(NEW2)]);
-    reads.extend(more);
+    let (index, rehold, _, _, before, measured) = step(index, 1, &[c.path(NEW2)]);
+    zero_read(&before, &index, measured);
     assert!(rehold.snapshots.is_empty(), "{:?}", rehold.snapshots);
     owed.insert(key(&c.path(NEW2)));
     let hold = assert_held_page(&before, &index, &owed);
@@ -2134,9 +2212,9 @@ fn unlisted_hinted_rollout_holds_a_real_page_until_the_roster_lists_it() {
     let mut caught = BTreeSet::new();
     let mut pages = Vec::new();
     for _ in 0..30 {
-        let (next, scan, routed, more, _) = step(index, 1, &[]);
+        let (next, scan, routed, _, before, measured) = step(index, 1, &[]);
+        zero_read(&before, &next, measured);
         index = next;
-        reads.extend(more);
         assert!(hold_of(&index).is_none(), "the listed debt is released");
         assert!(unarmed(&index), "a release arms no retry");
         caught.extend(ids(&scan));
@@ -2185,20 +2263,9 @@ fn unlisted_hinted_rollout_holds_a_real_page_until_the_roster_lists_it() {
         true,
     );
     money_oracle::assert_held_set(&held_ids, &accepted, &held_route, &cold_of(&held_ids));
-    // Read bound: each unchanged, checkpointed member of the held group is
-    // never read again, from byte zero or from its checkpoint.
-    for path in &group {
-        let (object, _) = FileObject::of(&fs::File::open(path).unwrap()).unwrap();
-        let mine = reads.iter().filter(|(read, _, _)| *read == object);
-        let transcript = mine
-            .clone()
-            .filter(|(_, mode, _)| *mode != DeliveryMode::Unchanged)
-            .count();
-        let first = mine
-            .filter(|(_, mode, start)| *mode == DeliveryMode::Full && *start == 0)
-            .count();
-        assert_eq!((transcript, first), (0, 0), "{path:?}: {reads:?}");
-    }
+    // Read bound: after the restart, each unchanged, checkpointed member of
+    // the held group was visited on a page that read nothing.
+    assert_eq!(unread, group_keys, "every group member's visit is measured");
     drop(session);
 }
 
