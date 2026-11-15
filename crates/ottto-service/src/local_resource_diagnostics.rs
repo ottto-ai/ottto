@@ -4252,6 +4252,11 @@ pub(crate) struct StateV2Memory {
 pub(crate) fn state_v2_memory() -> StateV2Memory {
     footprint::current()
 }
+/// Native synthetic gate reuses the same lifetime RSS/getrusage source as rows.
+#[cfg(test)]
+pub(crate) fn resource_gate_usage() -> Option<(u64, u64)> {
+    process_sample().map(|sample| (sample.cpu_us, sample.lifetime_max_rss_bytes))
+}
 pub(crate) fn state_v2_cpu_us() -> Option<u64> {
     process_sample().map(|p| p.cpu_us)
 }

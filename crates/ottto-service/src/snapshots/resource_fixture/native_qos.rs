@@ -181,3 +181,5 @@ fn resource_native_ordinary_stage_qos() {
         println!("resource_native_qos ordinary=utility paced=background cycle_replay=tripped restoration=passed");
     });
 }
+
+mod foreground_gate;

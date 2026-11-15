@@ -134,6 +134,10 @@ fn record(source: SnapshotSource, id: &str, turn: u64) -> Value {
 
 impl Corpus {
     fn generate(counts: [usize; 3]) -> Self {
+        Self::generate_sized(counts, None)
+    }
+
+    fn generate_sized(counts: [usize; 3], file_bytes: Option<usize>) -> Self {
         let temp = TempDir::canonical("resource-corpus");
         let support = temp.join("support");
         fs::create_dir_all(&support).unwrap();
@@ -189,8 +193,27 @@ impl Corpus {
                 digest.update((s as u64).to_le_bytes());
                 digest.update((n as u64).to_le_bytes());
                 digest.update(&body);
-                fs::write(&path, &body).unwrap();
-                bytes[s] += body.len() as u64;
+                let mut output = std::io::BufWriter::new(fs::File::create(&path).unwrap());
+                output.write_all(&body).unwrap();
+                let mut written = body.len();
+                if let Some(target) = file_bytes {
+                    // Bounded, valid ignored records: real JSONL acquisition without
+                    // growing per-session usage state or allocating a file-sized buffer.
+                    let mut padding =
+                        br#"{"type":"event_msg","payload":{"type":"gate_padding","data":""#
+                            .to_vec();
+                    padding.resize(4092, b'x');
+                    padding.extend_from_slice(b"\"}}\n");
+                    assert_eq!(padding.len(), 4096);
+                    assert!(written <= target && (target - written).is_multiple_of(4096));
+                    while written < target {
+                        output.write_all(&padding).unwrap();
+                        digest.update(&padding);
+                        written += padding.len();
+                    }
+                }
+                output.flush().unwrap();
+                bytes[s] += written as u64;
                 births.insert(path.clone(), i128::from(EPOCH - 3600) * 1_000_000_000);
                 files[s].push(path);
             }
@@ -311,6 +334,7 @@ struct Driver<'a> {
     reselect_active: bool,
     page_limit: usize,
     last_codex_diagnostic: Option<crate::codex_scan_diagnostics::CodexScanDiagnostics>,
+    last_byte_bound_first_import: bool,
 }
 impl<'a> Driver<'a> {
     fn new(corpus: &'a Corpus, source: usize) -> Self {
@@ -341,6 +365,7 @@ impl<'a> Driver<'a> {
             reselect_active: false,
             page_limit: 500,
             last_codex_diagnostic: None,
+            last_byte_bound_first_import: false,
         }
     }
     fn page(&mut self, seconds: u64) -> usize {
@@ -456,6 +481,8 @@ impl<'a> Driver<'a> {
                 count[1] += facts.reloaded_roots as u64;
             }
         }
+        self.last_byte_bound_first_import =
+            scan.page_byte_budget_hit && scan.census_status.pending_work && !scan.census_complete;
         self.paced = crate::snapshot_sync::resource_schedule::needs_pacing(&scan);
         finalize_scan_after_policy(source, &mut scan, &mut index);
         let mut ledger = crate::snapshot_sync::tail_ack_ledger::AckLedger::new(source);
