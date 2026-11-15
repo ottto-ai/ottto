@@ -74,6 +74,7 @@ pub mod telemetry_attach;
 mod test_isolation;
 #[cfg(test)]
 mod test_scratch;
+mod tracking_confirmation;
 mod transcript_acquisition;
 mod transcript_cache;
 #[cfg(unix)]
@@ -292,6 +293,8 @@ struct DaemonState {
     /// `SourceHealth.reconciliation_enabled`. In-memory only (cleared on reset
     /// and restart), which the Companion tolerates as "managed by workspace".
     source_reconciliation: BTreeMap<String, bool>,
+    tracking_confirmation: tracking_confirmation::TrackingEpisodes,
+    registered_source_grants: Vec<String>,
     scan_index_health_revisions: [[u64; 3]; 3],
     /// Directory for the persisted per-source state files. `None` keeps
     /// source state purely in-memory (tests); production sets it via
@@ -361,6 +364,7 @@ impl DaemonState {
             if let Err(error) = store.save(&LocalSourceState {
                 first_seen_at: self.first_seen(source),
                 last_health,
+                tracking_confirmation: self.tracking_confirmation.saved(source).cloned(),
             }) {
                 eprintln!("failed to persist source state for {slug}: {error}");
             }
@@ -388,6 +392,8 @@ impl DaemonState {
         }
         self.source_first_seen.clear();
         self.source_reconciliation.clear();
+        self.tracking_confirmation.clear_all();
+        self.registered_source_grants.clear();
     }
 }
 
@@ -509,6 +515,8 @@ impl LocalDaemon {
                 claude_verification_auth_marker: None,
                 source_first_seen: BTreeMap::new(),
                 source_reconciliation: BTreeMap::new(),
+                tracking_confirmation: Default::default(),
+                registered_source_grants: Vec::new(),
                 scan_index_health_revisions: [[0; 3]; 3],
                 source_state_dir: None,
                 local_health_events: Vec::new(),
@@ -580,6 +588,16 @@ impl LocalDaemon {
         let dir = dir.into();
         if let Ok(mut state) = self.inner.lock() {
             state.source_first_seen = load_source_first_seen(&dir);
+            for source in [SourceKind::Codex, SourceKind::ClaudeCode, SourceKind::Pi] {
+                let store = FileSourceStateStore::new(
+                    dir.join(source_state_file_name(source_slug(&source))),
+                );
+                if let Ok(Some(saved)) = store.load() {
+                    if let Some(episode) = saved.tracking_confirmation {
+                        state.tracking_confirmation.restore(&source, episode);
+                    }
+                }
+            }
             state.sources = load_source_health(&state, &dir);
             state.source_state_dir = Some(dir);
         }
@@ -599,6 +617,9 @@ impl LocalDaemon {
         state
             .source_reconciliation
             .insert(source_slug(&source).to_string(), enabled);
+        if !enabled && state.tracking_confirmation.clear(&source) {
+            state.persist_source_state(&source);
+        }
         Ok(())
     }
 
@@ -1194,6 +1215,14 @@ impl LocalDaemon {
         &self,
         result: &SourceVerificationResult,
     ) -> Result<(), LocalApiError> {
+        self.record_verification_result_with_tracking(result, None)
+    }
+
+    pub(crate) fn record_verification_result_with_tracking(
+        &self,
+        result: &SourceVerificationResult,
+        active_smoke: Option<(u64, &str)>,
+    ) -> Result<(), LocalApiError> {
         if matches!(result.status, SourceVerificationStatus::AccountNotConnected) {
             return Ok(());
         }
@@ -1252,6 +1281,11 @@ impl LocalDaemon {
             *existing = health;
         } else {
             state.sources.push(health);
+        }
+        if let Some((generation, smoke_after)) = active_smoke {
+            state
+                .tracking_confirmation
+                .confirm_smoke(result, generation, smoke_after);
         }
         state.persist_source_state(&result.source);
         // Configuration readiness is not an end-to-end verification witness.
@@ -2431,7 +2465,18 @@ fn status_from_state_with_relay_finding(
         health.active_session_reconciliation =
             active_sessions::read_active_session_reconciliation(&default_support_dir(), source);
         // Read here only; row builders leave it false, so no row goes stale.
-        health.source_paused = snapshot_sync::source_paused(&default_support_dir(), source);
+        let marker = snapshot_sync::source_marker(&default_support_dir(), source);
+        health.source_paused = marker.as_deref().is_some_and(|value| value != "reconnect");
+        health.tracking_confirmation = state.tracking_confirmation.project(
+            &health.source,
+            state
+                .registered_source_grants
+                .iter()
+                .any(|slug| slug == source.api_slug())
+                && marker.is_none()
+                && health.config.discovered
+                && state.reconciliation_enabled(&health.source) != Some(false),
+        );
     }
     status.local_health_events = state.local_health_events.clone();
     status.command_ledger = state.command_ledger.clone();
@@ -4055,6 +4100,7 @@ fn seed_registered_sources_with_presence(
     device: Option<&LocalDeviceBinding>,
     present: impl Fn(&SourceKind) -> bool,
 ) {
+    state.registered_source_grants = device.map(|d| d.sources.clone()).unwrap_or_default();
     if state.account.state != LocalAccountState::Connected {
         return;
     }
@@ -4103,6 +4149,7 @@ fn cached_source_health(state: &DaemonState, source: SourceKind) -> SourceHealth
         plan_observations: Vec::new(),
         detected_uses: Vec::new(),
         active_session_reconciliation: None,
+        tracking_confirmation: None,
         last_seen_at: None,
         last_verified_at: None,
         problems: Vec::new(),
@@ -4167,6 +4214,7 @@ fn load_source_health(state: &DaemonState, dir: &Path) -> Vec<SourceHealth> {
 }
 
 fn normalize_persisted_source_health(state: &DaemonState, health: &mut SourceHealth) {
+    health.tracking_confirmation = None;
     health.descriptor = source_descriptor(&health.source);
     health.account_binding.expected_account_id =
         state.account.user.as_ref().map(|user| user.id.clone());
@@ -4507,6 +4555,7 @@ fn source_health_from_verification(
         plan_observations: Vec::new(),
         detected_uses,
         active_session_reconciliation: None,
+        tracking_confirmation: None,
         last_seen_at: result.last_received_at.clone(),
         last_verified_at: if result.source == SourceKind::Codex
             && result.message.code == "codex_local_import"
@@ -5052,6 +5101,7 @@ fn source_health_from_agent_status(
         plan_observations: snapshot.plan_observations.clone(),
         detected_uses,
         active_session_reconciliation: None,
+        tracking_confirmation: None,
         last_seen_at: Some(snapshot.captured_at.clone()),
         last_verified_at: None,
         problems,
@@ -8693,6 +8743,7 @@ mod tests {
             .save(&LocalSourceState {
                 first_seen_at: Some("2026-05-05T10:15:00Z".to_string()),
                 last_health: None,
+                tracking_confirmation: None,
             })
             .expect("seed source state");
 
@@ -8791,6 +8842,7 @@ mod tests {
             .save(&LocalSourceState {
                 first_seen_at: Some("2026-05-05T10:15:00Z".to_string()),
                 last_health: None,
+                tracking_confirmation: None,
             })
             .expect("seed source state");
 
@@ -9418,6 +9470,55 @@ mod tests {
         snapshot
     }
 
+    #[test]
+    #[serial]
+    fn passive_verification_cannot_confirm_but_active_smoke_can_and_episode_restarts() {
+        let root = crate::test_scratch::private_dir("tracking-episode-restart");
+        let _support = TestEnvVar::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
+        let daemon = daemon().with_source_state_dir(root.join("sources"));
+        let since = "2026-11-15T10:00:00Z";
+        for source in [SourceKind::Pi, SourceKind::Codex, SourceKind::ClaudeCode] {
+            daemon
+                .state()
+                .unwrap()
+                .tracking_confirmation
+                .arm(&source, since.into(), true);
+            let mut result = verified_codex("2026-11-15T10:01:00Z");
+            result.source = source.clone();
+            result.smoke_after = Some(since.into()); // passive paths also populate this
+            daemon.record_verification_result(&result).unwrap();
+            assert!(daemon.tracking_episode(&source).is_some());
+            if source == SourceKind::ClaudeCode {
+                let (generation, _) = daemon.tracking_episode(&source).unwrap();
+                daemon
+                    .record_verification_result_with_tracking(&result, Some((generation, since)))
+                    .unwrap();
+                assert!(daemon.tracking_episode(&source).is_none());
+            }
+        }
+        let restarted = super::tests::daemon().with_source_state_dir(root.join("sources"));
+        assert!(restarted.tracking_episode(&SourceKind::Pi).is_some());
+        assert!(restarted.tracking_episode(&SourceKind::Codex).is_some());
+        let state = restarted.state().unwrap();
+        assert_eq!(
+            state
+                .tracking_confirmation
+                .saved(&SourceKind::ClaudeCode)
+                .unwrap()
+                .confirmed_at
+                .as_deref(),
+            Some("2026-11-15T10:01:00Z")
+        );
+        assert!(state
+            .sources
+            .iter()
+            .all(|health| health.tracking_confirmation.is_none()));
+        drop(state);
+        restarted.state().unwrap().clear_source_state();
+        assert!(restarted.tracking_episode(&SourceKind::Pi).is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     fn verified_codex(last_received_at: &str) -> SourceVerificationResult {
         SourceVerificationResult {
             source: SourceKind::Codex,
@@ -9512,6 +9613,7 @@ mod tests {
             plan_observations: Vec::new(),
             detected_uses: Vec::new(),
             active_session_reconciliation: None,
+            tracking_confirmation: None,
             last_seen_at: Some("2026-05-05T09:09:00Z".to_string()),
             last_verified_at: Some("2026-05-05T09:09:30Z".to_string()),
             problems: Vec::new(),

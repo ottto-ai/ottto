@@ -135,6 +135,36 @@ fn reconcile_with_registrations(
     effective_interval: std::time::Duration,
     registrations: impl FnOnce() -> crate::claude_session_registrations::Registrations,
 ) -> Result<ActiveSessionReconciliation> {
+    reconcile_observing(
+        support_dir,
+        source,
+        snapshots,
+        agent_status,
+        scan_started_at,
+        reconciled_at,
+        carry_policy,
+        effective_interval,
+        registrations,
+        &mut |_, _| {},
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "existing reconciliation inputs plus observation"
+)]
+pub(crate) fn reconcile_observing(
+    support_dir: &Path,
+    source: SnapshotSource,
+    snapshots: &[SnapshotItem],
+    agent_status: Option<&AgentStatusSnapshot>,
+    scan_started_at: Option<&str>,
+    reconciled_at: &str,
+    carry_policy: Option<&str>,
+    effective_interval: std::time::Duration,
+    registrations: impl FnOnce() -> crate::claude_session_registrations::Registrations,
+    observe: &mut dyn FnMut(&str, Option<&str>),
+) -> Result<ActiveSessionReconciliation> {
     let path = active_session_cache_path(support_dir, source);
     let mut cache = read_cache(&path);
     let now = OffsetDateTime::parse(reconciled_at, &Rfc3339)
@@ -163,6 +193,7 @@ fn reconcile_with_registrations(
             continue;
         };
         let previous = cache.watermarks.get(&snapshot.source_session_id).cloned();
+        observe(last_activity, previous.as_deref());
         let advanced = previous
             .as_deref()
             .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
@@ -1599,6 +1630,72 @@ mod tests {
 
     fn temp_dir(name: &str) -> PathBuf {
         crate::test_scratch::private_dir(&format!("ottto-active-sessions-{name}"))
+    }
+
+    #[test]
+    fn parsed_pre_repair_session_can_confirm_below_a_future_watermark() {
+        use crate::tracking_confirmation::ParsedActivityWitness;
+        for source in [
+            SnapshotSource::ClaudeCode,
+            SnapshotSource::Codex,
+            SnapshotSource::Pi,
+        ] {
+            let dir = temp_dir("confirmation-parsed");
+            let future = test_snapshot("existing-session", "2026-11-16T10:00:00Z");
+            reconcile_active_sessions(
+                &dir,
+                source,
+                &[future.clone()],
+                None,
+                None,
+                "2026-11-15T09:59:00Z",
+                std::time::Duration::from_secs(300),
+            )
+            .unwrap();
+            let mut witness =
+                ParsedActivityWitness::new(Some("2026-11-15T10:00:00Z"), "2026-11-16T10:00:00Z");
+            reconcile_observing(
+                &dir,
+                source,
+                &[future],
+                None,
+                None,
+                "2026-11-16T10:00:00Z",
+                Some("local"),
+                std::time::Duration::from_secs(300),
+                crate::agent_status::claude_session_registrations,
+                &mut |new, prev| witness.observe(new, prev),
+            )
+            .unwrap();
+            assert_eq!(
+                witness.latest(),
+                None,
+                "unchanged future evidence never matures"
+            );
+            let mut turn = test_snapshot("existing-session", "2026-11-15T10:01:00Z");
+            turn.source_started_at = Some("2026-11-15T09:00:00Z".into());
+            let mut witness =
+                ParsedActivityWitness::new(Some("2026-11-15T10:00:00Z"), "2026-11-15T10:01:00Z");
+            reconcile_observing(
+                &dir,
+                source,
+                &[turn],
+                None,
+                None,
+                "2026-11-15T10:01:00Z",
+                Some("local"),
+                std::time::Duration::from_secs(300),
+                crate::agent_status::claude_session_registrations,
+                &mut |new, prev| witness.observe(new, prev),
+            )
+            .unwrap();
+            assert_eq!(witness.latest().as_deref(), Some("2026-11-15T10:01:00Z"));
+            assert_eq!(
+                read_cache(&active_session_cache_path(&dir, source)).watermarks["existing-session"],
+                "2026-11-16T10:00:00Z"
+            );
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[test]

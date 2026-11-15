@@ -5521,6 +5521,9 @@ fn sync_once_with_retry(
     // Declared after the guard, so it settles before the lock is released.
     let mut continuation_cycle = continuation::CycleSettlement::default();
     let (device, device_secret) = load_snapshot_device_credentials()?;
+    daemon
+        .record_source_grants(&device)
+        .map_err(|_| anyhow!("source grants unavailable"))?;
     let Some(machine_id) = snapshot_machine_id(&device)? else {
         return Err(anyhow!("machine identity is missing"));
     };
@@ -6817,6 +6820,13 @@ fn prepare_sync_source_inner(
         source_kind(source),
         activity_hint.local_usage_reconciliation_enabled,
     );
+    daemon
+        .record_tracking_policy(
+            &source_kind(source),
+            receipt_window_days,
+            activity_hint.local_usage_reconciliation_enabled,
+        )
+        .map_err(|_| anyhow!("tracking state unavailable"))?;
     if receipt_window_days == 0 {
         withdraw_and_report_policy_stop(
             client,
@@ -8010,17 +8020,26 @@ fn finish_sync_source(
     );
     // Claude activity remains recent relative to the scan's observation
     // horizon, while future timestamps are bounded by the reconciliation clock.
-    if crate::active_sessions::reconcile_active_sessions(
+    let tracking_episode = daemon.tracking_episode(&source_kind(source));
+    let reconciled_at = current_rfc3339();
+    let mut witness = crate::tracking_confirmation::ParsedActivityWitness::new(
+        tracking_episode.as_ref().map(|(_, since)| since.as_str()),
+        &reconciled_at,
+    );
+    if crate::active_sessions::reconcile_observing(
         support_dir,
         source,
         &scan_result.snapshots,
         Some(&reconciliation_status),
         (source == SnapshotSource::ClaudeCode).then_some(scan_started_at.as_str()),
-        &current_rfc3339(),
+        &reconciled_at,
+        Some("local"),
         with_source_cadence(source, |cadence| {
             cadence.ordinary_interval().min(MAX_CYCLE_INTERVAL)
         })
         .unwrap_or(SNAPSHOT_SYNC_INTERVAL),
+        crate::agent_status::claude_session_registrations,
+        &mut |new, previous| witness.observe(new, previous),
     )
     .is_err()
     {
@@ -8028,6 +8047,12 @@ fn finish_sync_source(
             "local active-session cache update skipped for {}",
             source.api_slug()
         );
+    }
+
+    if let (Some((generation, _)), Some(at)) = (tracking_episode, witness.latest()) {
+        daemon
+            .confirm_tracking_activity(&source_kind(source), generation, &at)
+            .map_err(|_| anyhow!("tracking state unavailable"))?;
     }
 
     crate::snapshots::apply_upload_policy(source, &mut scan_result.snapshots, upload_policy);

@@ -737,6 +737,9 @@ pub struct SourceHealth {
     /// analysis; older daemons omit the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_session_reconciliation: Option<ActiveSessionReconciliation>,
+    /// Local observation after Repair; independent of backend/config health.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracking_confirmation: Option<TrackingConfirmation>,
     pub last_seen_at: Option<Rfc3339Timestamp>,
     pub last_verified_at: Option<Rfc3339Timestamp>,
     pub problems: Vec<HealthProblem>,
@@ -763,6 +766,22 @@ pub struct SourceHealth {
     /// absent only from daemons that predate per-source pause.
     #[serde(default)]
     pub source_paused: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrackingConfirmation {
+    pub state: TrackingConfirmationState,
+    pub since: Rfc3339Timestamp,
+    pub confirmed_at: Option<Rfc3339Timestamp>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrackingConfirmationState {
+    Waiting,
+    Confirmed,
+    #[serde(other)]
+    Unknown,
 }
 
 /// Bounded machine-local status from the latest completed incremental
