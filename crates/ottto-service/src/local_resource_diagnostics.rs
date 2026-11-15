@@ -3289,7 +3289,7 @@ mod tests {
     }
 
     /// [regress] A pass overlapping an off-pass window marks it `pass_overlap`
-    /// in its own row with its delta kept; clean windows omit the field.
+    /// in its own row with every delta kept; clean windows omit the field.
     #[test]
     fn offpass_pass_overlap_splits_rows_and_keeps_deltas() {
         let quota = || drop(StageWindow::begin("codex", "offpass_codex_quota"));
@@ -3308,17 +3308,18 @@ mod tests {
             source_finish("codex", false, || Ok(())).unwrap();
             drop(window); // a pass started and ended mid-window
             quota(); // clean, same period: its own row
-            for pass_overlap in [true, false] {
+                     // Two fixed windows per flag: same-flag sums, cross-flag separation.
+            for (pass_overlap, d) in [(true, 44), (false, 10), (true, 44), (false, 10)] {
                 aggregate_offpass(Record {
                     schema_version: SCHEMA_VERSION,
                     process_id: std::process::id(),
                     stage: "offpass_cloud_sessions",
                     source: Source::Codex,
-                    observation: Observation::between(7, Some(sample(1)), Some(sample(45))),
+                    observation: Observation::between(7, Some(sample(1)), Some(sample(1 + d))),
                     counts: OffpassCounts {
                         count: 1,
-                        cpu_user_us: None,
-                        cpu_sys_us: None,
+                        cpu_user_us: Some(d),
+                        cpu_sys_us: Some(2 * d),
                         wall_max_us: 7,
                         control: BTreeMap::new(),
                         pass_overlap,
@@ -3327,8 +3328,6 @@ mod tests {
             }
             source_prepare("codex", || (), |_| false); // flushes the period
             quota(); // the pass is open at open and close
-            pass_ended("codex"); // a pass without a finish closes
-            quota(); // clean
             flush_offpass();
         });
         let offpass: Vec<_> = rows
@@ -3338,36 +3337,51 @@ mod tests {
                     .as_str()
                     .is_some_and(|s| s.starts_with("offpass_"))
             })
+            .collect();
+        let flags: Vec<_> = offpass
+            .iter()
             .map(|row| {
-                let counts = &row["counts"];
-                assert_eq!(counts["count"], 1);
-                let disk = row["observation"]["disk_read_bytes"].as_u64();
+                let overlap = row["counts"].get("pass_overlap");
                 (
                     row["stage"].as_str().unwrap(),
-                    counts.get("pass_overlap").cloned(),
-                    disk,
+                    overlap.and_then(serde_json::Value::as_bool),
                 )
             })
             .collect();
-        let t = Some(serde_json::Value::Bool(true));
         let (cloud, quota) = ("offpass_cloud_sessions", "offpass_codex_quota");
         assert_eq!(
-            offpass
-                .iter()
-                .map(|r| (r.0, r.1.clone()))
-                .collect::<Vec<_>>(),
+            flags,
             [
                 (cloud, None),
-                (cloud, t.clone()),
+                (cloud, Some(true)),
                 (quota, None),
-                (quota, t.clone()),
-                (quota, None),
-                (quota, t),
+                (quota, Some(true)),
+                (quota, Some(true)),
             ]
         );
-        assert_eq!((offpass[0].2, offpass[1].2), (Some(44), Some(44)));
+        for (row, d) in offpass[..2].iter().zip([10, 44]) {
+            let mut counts = serde_json::json!(
+                {"count": 2, "cpu_user_us": 2 * d, "cpu_sys_us": 4 * d, "wall_max_us": 7}
+            );
+            if d == 44 {
+                counts["pass_overlap"] = true.into();
+            }
+            assert_eq!(row["counts"], counts);
+            let observation = &row["observation"];
+            assert_eq!(observation["wall_elapsed_us"], 14);
+            let summed = [
+                "shared_process_cpu_delta_us",
+                "disk_read_bytes",
+                "disk_written_bytes",
+            ];
+            for key in summed.iter().chain(&METRIC_KEYS[..4]) {
+                assert_eq!(observation[key], 2 * d, "{key}");
+            }
+        }
         for row in &offpass[2..] {
-            assert_eq!(row.2.is_some(), cfg!(target_os = "macos"));
+            assert_eq!(row["counts"]["count"], 1);
+            let disk = row["observation"].get("disk_read_bytes").is_some();
+            assert_eq!(disk, cfg!(target_os = "macos"));
         }
     }
 

@@ -443,7 +443,7 @@ windows or infer allocation ownership: the finish window contains its batch-call
 windows.
 
 Between-pass owners emit the same version 2 `local_resources` stage records
-as one aggregate per `(source, stage)` of completed work units, including returned
+as one aggregate per `(source, stage, pass_overlap)` of completed work units, including returned
 errors, flushed when the next ordinary source prepare begins. No new timer,
 thread, history or footprint sampler is opened.
 The stable stage names and boundaries are:
@@ -477,6 +477,13 @@ regressing.
 The timestamp and process endpoints describe the latest completion, with the
 RSS-before endpoint from the first completion; child counters remain cumulative.
 Pending aggregates are in memory only and are lost on process exit.
+`counts.pass_overlap` is `true` when a source pass was active at the window's
+open or close, or started during it; such windows aggregate in their own row,
+and an absent field means clean. Disk and CPU are process-wide, so a flagged
+row's deltas are mixed: the flag does not say how much came from the pass.
+A pass here is the ordinary source prepare-to-finish (or outcome) span; Codex
+continuation pages and the narrow prepare/finish edges outside that span are
+not counted, so a window that overlaps only those stays unflagged.
 `offpass_control_xpc` rows also add `counts.control`: requests per decoded
 command class (`status`, `claude_accounts_status`, `codex_accounts_status`,
 `agent_status_refresh`, `other`; undecodable or panicked requests count as
