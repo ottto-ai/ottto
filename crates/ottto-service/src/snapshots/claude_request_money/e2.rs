@@ -1915,10 +1915,10 @@ fn skipped_ids(item: &SnapshotItem) -> impl Iterator<Item = &String> + '_ {
 /// only if its proof file's CURRENT revision holds that request id: that
 /// file's parse on this page, else its census record bound to its index
 /// entry's fingerprint. Requests no current revision holds count and are
-/// disclosed. Unresolved prefixes count immediately; an unfinished census
-/// walk selects another read. All the page's cross-session checks share ONE
-/// census walk. Runs in both gate modes; dark only counts. Returns the
-/// removals to store (gate on only): the caller applies them to the index
+/// disclosed. Unresolved prefixes count immediately. All the page's cross-session
+/// checks share one completing census walk per folder. Runs in both gate modes;
+/// dark only counts. Returns the removals to store (gate on only): the caller
+/// applies them to the index
 /// (`CopyRemovalUpdates::apply`). Removals precede ordinary accepted-share
 /// reconciliation.
 pub(crate) fn decide_page_copies(
@@ -2922,11 +2922,11 @@ fn first_own_turn<'a>(
         .map(|(_, occurrence)| occurrence)
 }
 
-/// One census walk per folder for every copied main file of the page. A
+/// One completing census walk per folder for every copied main file of the page.
 /// Locally owned earlier main files prove copies through positive census ids,
 /// including the copy's own session and the in-folder holder's session
-/// across folders. A copy's own stored removals prove nothing. The original
-/// in-folder walk marks unfinished decisions for one follow-up read.
+/// across folders. A copy's own stored removals prove nothing. The in-folder
+/// walk has no deadline.
 fn decide_holders(
     items: &mut [SnapshotItem],
     folds: &[usize],
@@ -2994,8 +2994,7 @@ fn decide_holders(
             // id list retires. Only a holder whose census disproves it
             // invalidates that saved decision; a holder family on the
             // re-emission list keeps it (listing pauses new removals only).
-            // Positive proof also remains valid if the walk hits its
-            // deadline. A holder no longer indexed (its transcript deleted)
+            // A holder no longer indexed (its transcript deleted)
             // cannot disprove anything; its recorded removals stand,
             // counted, instead of re-adding a proven copy.
             let mut stored = BTreeSet::new();
@@ -3050,17 +3049,14 @@ fn decide_holders(
             .extend(file.hashes.iter().map(|&hash| (hash, at)));
     }
     let store = &index.claude_money_birth_store;
-    let deadline = Instant::now() + SIDE_CALL_DEADLINE;
-    // An unfinished walk counts now and selects one follow-up read.
-    let mut unwalked = BTreeSet::new();
     for (folder, mut wanting) in by_folder {
         wanting.sort_unstable();
         let mut union = wanting.iter().map(|&(hash, _)| hash).collect::<Vec<_>>();
         union.dedup();
-        let walked = index.claude_request_census.main_transcript_holders(
+        let _ = index.claude_request_census.main_transcript_holders(
             Some(folder.as_str()),
             &union,
-            Some(deadline),
+            None,
             |key, root, record, hits| {
                 // Per holder record, each at most once and only when another
                 // session wants one of its ids: evidence, then (birth, location).
@@ -3098,9 +3094,6 @@ fn decide_holders(
                 }
             },
         );
-        if walked.is_none() {
-            unwalked.insert(folder);
-        }
     }
     let on_page = page
         .iter()
@@ -3200,11 +3193,7 @@ fn decide_holders(
             updates.added += state.store(wanted.order.1, groups);
         }
         note_reused(&mut items[wanted.at], reused);
-        if unwalked.contains(&wanted.folder) {
-            updates.state.as_mut().unwrap().mark(wanted.order.1);
-        } else {
-            updates.state.as_mut().unwrap().clear_hold(wanted.order.1);
-        }
+        updates.state.as_mut().unwrap().clear_hold(wanted.order.1);
         // The pre-existing all-copy /branch lineage rule is not request-id
         // proof for a resumed prefix. Missing/retired ids there must emit
         // flagged, even when the transcript names an earlier parent.

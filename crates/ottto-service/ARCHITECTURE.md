@@ -111,8 +111,9 @@ file-system hint / periodic listing → select file → read new bytes from save
   hashes, then marks later unheld holders of the changed hashes. Their next read
   runs the same copy decider. The existing removal-record slot is a 0/1 re-decision mark,
   cleared on every finished read, including held and empty outcomes. Held copies
-  wait for their ordinary release read. An unfinished decision walk sets the mark;
-  save-time census walks have no deadline. The SQLite save baseline retains
+  wait for their ordinary release read. Decision and save-time census walks have
+  no deadline; a decision walks its folder to completion in one pass, which can
+  take a long time for a very large folder. The SQLite save baseline retains
   compact ownership facts with shared census hashes; legacy saves reuse their
   existing CAS image. Neither path hydrates another full index for this check.
   Encoding and rollback remain compatible:
