@@ -4087,6 +4087,10 @@ pub(super) mod tests {
             "no conflicted item can reach cached or current-home binding"
         );
         assert_eq!(held.ownership_incomplete_file_count, 2);
+        // A complete inventory still charges a real group reason.
+        let (c, _) = held.causes.summary(held.ownership_incomplete_file_count);
+        assert_eq!(c[ownership::INVENTORY], 2);
+        assert_eq!(held.unreadable_path_count, 1);
         assert!(!held.census_complete);
         let causes = serde_json::to_value(
             held.local_codex_diagnostics
@@ -4611,6 +4615,7 @@ pub(super) mod tests {
     fn repaired_header_releases_the_held_page_and_a_still_unreadable_one_does_not() {
         let (root, held_index, unreadable, new, witness) = held_behind_unreadable_header();
         let deadline = retry_deadline(&held_index);
+        let owed = inventory_hold(&held_index).unwrap().owed.clone();
         // The blocker changes but still proves no owner: the owed candidates
         // are tried again once, held again, and nothing is emitted.
         fs::write(&unreadable, "still not a header\n").unwrap();
@@ -4625,8 +4630,12 @@ pub(super) mod tests {
             .as_ref()
             .unwrap()
             .has_retryable_problems());
-        assert!(inventory_hold(&still_index)
-            .is_some_and(|hold| hold.owed.contains(&local_index_key(&new))));
+        assert_eq!(still.ownership_incomplete_file_count, 0);
+        assert_eq!(
+            inventory_hold(&still_index).map(|hold| &hold.owed),
+            Some(&owed),
+            "a re-hold owes the same set"
+        );
         let (idle_index, idle) = retained_page(&root, still_index, &[]);
         assert_eq!(
             idle.scanned_file_count, 0,
@@ -4658,6 +4667,106 @@ pub(super) mod tests {
         );
         assert_eq!(retry_deadline(&index), deadline, "no re-walk was forced");
         assert!(inventory_hold(&index).is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+    /// One `scan` page whose header inventory is forced incomplete, as an
+    /// unstable directory census leaves it.
+    fn inventory_held_scan(root: &Path, index: ScanIndex) -> (ScanIndex, SourceScanResult) {
+        let mut owned = OwnedSourceScan::new(
+            SnapshotSource::Codex,
+            &[root.join("sessions")],
+            index,
+            "2026-10-06T23:00:00Z",
+            7,
+            4,
+            None,
+            &[],
+            false,
+        );
+        owned
+            .codex_join_inventory
+            .as_mut()
+            .expect("a selecting page")
+            .complete = false;
+        for _ in 0..10_000 {
+            match owned.step(None) {
+                OwnedSourceScanStep::Pending(next) => owned = next,
+                OwnedSourceScanStep::Complete { index, scan, .. } => return (index, scan),
+            }
+        }
+        panic!("bounded native scan did not finish");
+    }
+    /// [money] An incomplete inventory holds a whole joined group: the changed
+    /// member and its unchanged, checkpointed sibling are both owed. A re-hold
+    /// owes the same set and still adds no count. The release reads exactly
+    /// what an unheld page reads and leaves the generation healthy.
+    #[test]
+    fn held_group_owes_every_member_and_release_reads_like_an_unheld_page() {
+        use sampled_scan::transition_fixture::observe_consumed;
+        let (root, _) = fixture();
+        let owner = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let (mut index, mut result) = scan(&root, ScanIndex::default(), 4);
+        assert_eq!(result.snapshots.len(), 1);
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut index);
+        result.finish_codex_capture_boundary(&mut index);
+        let accepted = result
+            .snapshots
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect();
+        let previous = index.committable_subset(&ScanIndex::default(), &accepted, &BTreeMap::new());
+        let b = root.join("sessions/b.jsonl");
+        let mut text = fs::read_to_string(&b).unwrap();
+        for row in &member(owner, "r-b2", 150, 450)[1..] {
+            text.push_str(&(serde_json::to_string(row).unwrap() + "\n"));
+        }
+        fs::write(&b, text).unwrap();
+        let members = BTreeSet::from(
+            ["a.jsonl", "b.jsonl"].map(|name| local_index_key(&root.join("sessions").join(name))),
+        );
+        let totals = |scan: &SourceScanResult| {
+            scan.snapshots
+                .iter()
+                .map(|item| (item.source_session_id.clone(), item.input_tokens))
+                .collect::<Vec<_>>()
+        };
+        let ((_, control), control_bytes) = observe_consumed(|| scan(&root, previous.clone(), 4));
+        assert_eq!(control.snapshots.len(), 1);
+        let (held_index, held) = inventory_held_scan(&root, previous);
+        assert!(held.snapshots.is_empty());
+        assert_eq!(
+            (
+                held.ownership_incomplete_file_count,
+                held.unreadable_path_count
+            ),
+            (0, 0)
+        );
+        assert_eq!(
+            inventory_hold(&held_index).map(|hold| &hold.owed),
+            Some(&members)
+        );
+        let (again_index, again) = inventory_held_scan(&root, held_index);
+        assert!(again.snapshots.is_empty());
+        assert_eq!(
+            (
+                again.ownership_incomplete_file_count,
+                again.unreadable_path_count
+            ),
+            (0, 0)
+        );
+        assert_eq!(
+            inventory_hold(&again_index).map(|hold| &hold.owed),
+            Some(&members)
+        );
+        let ((index, released), released_bytes) = observe_consumed(|| scan(&root, again_index, 4));
+        assert_eq!(totals(&released), totals(&control));
+        assert_eq!(
+            (released.scanned_file_count, released_bytes),
+            (control.scanned_file_count, control_bytes),
+            "the release reads what an unheld page reads"
+        );
+        assert!(inventory_hold(&index).is_none());
+        assert!(index.traversal.as_ref().is_none_or(|t| !t.has_errors()));
         fs::remove_dir_all(root).unwrap();
     }
     /// [money] Protected history survives retirement; quiet retries acquire,
