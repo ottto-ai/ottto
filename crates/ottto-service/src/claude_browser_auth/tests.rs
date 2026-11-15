@@ -50,6 +50,47 @@ fn with_support(label: &str) -> (PathBuf, PathBuf, EnvGuard) {
     (root, support, guard)
 }
 
+/// Finalize `operation_id` with a proof for the a/b pair and return the
+/// Claude status passes it asked for immediately.
+fn finalize_requests_now(operation_id: &str) -> Vec<ottto_protocol::SourceKind> {
+    let account = "a".repeat(64);
+    let organization = "b".repeat(64);
+    let ((), requested) = crate::agent_status_refresh::with_test_requests_now(|| {
+        finalize_identity(
+            operation_id,
+            crate::agent_status::ClaudeLocalIdentityProof {
+                account_identifier_hash: account.clone(),
+                organization_identifier_hash: organization.clone(),
+                collection: ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
+                    state: ottto_protocol::ClaudeConfigSlotCollectionStateV1::Fresh,
+                    account_identifier_hash: Some(account.clone()),
+                    organization_identifier_hash: Some(organization.clone()),
+                    ..Default::default()
+                },
+            },
+        )
+        .expect("finalize");
+    });
+    requested
+}
+
+/// Only a completed sign-in asks for one immediate Claude status pass; a
+/// replay of the same finalization asks for none.
+fn assert_one_completed_request(operation_id: &str) {
+    assert_eq!(
+        finalize_requests_now(operation_id),
+        vec![ottto_protocol::SourceKind::ClaudeCode]
+    );
+    assert_eq!(
+        read_operation(operation_id).and_then(|operation| operation.outcome),
+        Some(ClaudeBrowserAuthOutcomeV1::Complete)
+    );
+    assert!(
+        finalize_requests_now(operation_id).is_empty(),
+        "a replayed finalization asks for no second pass"
+    );
+}
+
 #[test]
 #[serial]
 fn authorization_code_state_is_typed_ephemeral_and_single_submission() {
@@ -1237,21 +1278,8 @@ fn generic_registry_exposure_already_has_strong_composite_identity() {
         .is_empty());
     let account = "a".repeat(64);
     let organization = "b".repeat(64);
-    let collection = ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
-        state: ottto_protocol::ClaudeConfigSlotCollectionStateV1::Fresh,
-        account_identifier_hash: Some(account.clone()),
-        organization_identifier_hash: Some(organization.clone()),
-        ..Default::default()
-    };
-    finalize_identity(
-        operation_id,
-        crate::agent_status::ClaudeLocalIdentityProof {
-            account_identifier_hash: account.clone(),
-            organization_identifier_hash: organization.clone(),
-            collection,
-        },
-    )
-    .expect("admit");
+    // Generic admission of a new root is a completed sign-in.
+    assert_one_completed_request(operation_id);
     let exposed = crate::agent_status::annotate_claude_accounts_status(
         store.load().expect("registered status"),
     );
@@ -1276,6 +1304,32 @@ fn generic_registry_exposure_already_has_strong_composite_identity() {
             .expect("approval"),
         ottto_core::ClaudeSlotAccountBinding::new(&account, &organization),
         "admission records the verified pair as the slot's approval atomically"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+/// A generic root that is already registered completes on the existing-slot
+/// route and asks for one immediate status pass.
+#[test]
+#[serial]
+fn generic_already_registered_root_completes_with_one_status_request() {
+    let (root, _support_dir, _support) = with_support("generic-existing-complete");
+    let store = FileClaudeConfigSlotSettingsStore::default();
+    let operation_id = "claude_setup_c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3";
+    prepare_generic(store.load().expect("registry"), operation_id).expect("prepare");
+    let operation = read_operation(operation_id).expect("operation");
+    store
+        .register_managed_path_with_slot_id_and_binding(
+            1,
+            operation.slot_id.clone(),
+            operation_config_dir(&operation),
+            ottto_core::ClaudeSlotAccountBinding::new(&"a".repeat(64), &"b".repeat(64)),
+        )
+        .expect("root already registered");
+    assert_one_completed_request(operation_id);
+    assert_eq!(
+        read_operation(operation_id).and_then(|operation| operation.canonical_slot_id),
+        Some(operation.slot_id)
     );
     let _ = fs::remove_dir_all(root);
 }
@@ -1367,20 +1421,14 @@ fn generic_login_for_pair_whose_saved_connection_is_dead_is_admitted() {
         let operation_id = "claude_setup_c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2";
         prepare_generic(store.load().expect("registry"), operation_id).expect("prepare");
         let candidate_slot = read_operation(operation_id).expect("operation").slot_id;
-        finalize_identity(
-            operation_id,
-            crate::agent_status::ClaudeLocalIdentityProof {
-                account_identifier_hash: account.clone(),
-                organization_identifier_hash: organization.clone(),
-                collection: ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
-                    state: State::Fresh,
-                    account_identifier_hash: Some(account.clone()),
-                    organization_identifier_hash: Some(organization.clone()),
-                    ..Default::default()
-                },
-            },
-        )
-        .expect("finalize");
+        // Only the admitted (completed) login asks for an immediate pass;
+        // a duplicate and any replay ask for none.
+        assert_eq!(
+            finalize_requests_now(operation_id).len(),
+            usize::from(admitted),
+            "{existing_state:?} {access:?} {upkeep:?}"
+        );
+        assert!(finalize_requests_now(operation_id).is_empty());
         let operation = read_operation(operation_id).expect("finished operation");
         let registry = store.load().expect("registry after");
         let candidate_registered = registry
@@ -3185,20 +3233,7 @@ fn target_success_consumes_prelaunch_quarantine_claim() {
         collection_suppression(&slot_id),
         Some(ClaudeCollectionSuppression::HideProvisionalTarget)
     );
-    let collection = ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
-        account_identifier_hash: Some(account.clone()),
-        organization_identifier_hash: Some(organization.clone()),
-        ..Default::default()
-    };
-    finalize_identity(
-        operation_id,
-        crate::agent_status::ClaudeLocalIdentityProof {
-            account_identifier_hash: account,
-            organization_identifier_hash: organization,
-            collection,
-        },
-    )
-    .expect("admit target");
+    assert_one_completed_request(operation_id);
     assert_eq!(collection_suppression(&slot_id), None);
     let state = read_state();
     assert!(!state
@@ -3211,6 +3246,93 @@ fn target_success_consumes_prelaunch_quarantine_claim() {
         .managed_slots
         .iter()
         .any(|slot| slot.slot_id == slot_id));
+    let _ = fs::remove_dir_all(root);
+}
+
+/// A target sign-in for a pair another healthy slot already serves ends
+/// AlreadyConnected and asks for no immediate status pass, even on replay.
+#[test]
+#[serial]
+fn target_duplicate_of_a_serving_slot_requests_no_immediate_status() {
+    let (root, _support_dir, _support) = with_support("target-duplicate-no-request");
+    let store = FileClaudeConfigSlotSettingsStore::default();
+    let operation_id = "claude_setup_d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4";
+    let account = "a".repeat(64);
+    let organization = "b".repeat(64);
+    let prepared = store
+        .prepare_managed_account_target(
+            1,
+            operation_id.to_string(),
+            Some("claude_anchor_target_d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4".to_string()),
+            Some(account.clone()),
+            Some(organization.clone()),
+        )
+        .expect("target");
+    let slot_id = prepared.setup_operation.slot_id.clone().expect("slot");
+    let config_dir = prepared
+        .managed_slots
+        .iter()
+        .find(|slot| slot.slot_id == slot_id)
+        .and_then(|slot| slot.config_dir.clone())
+        .expect("config root");
+    let operation = PersistedOperation {
+        operation_id: operation_id.to_string(),
+        slot_id: slot_id.clone(),
+        config_dir,
+        ceremony_baseline: None,
+        mode: PersistedMode::Target,
+        target_id: prepared.setup_operation.target_id.clone(),
+        expected_account_identifier_hash: Some(account.clone()),
+        expected_organization_identifier_hash: Some(organization.clone()),
+        phase: ClaudeBrowserAuthPhaseV1::Validating,
+        outcome: None,
+        canonical_slot_id: None,
+        admission_slot_id: None,
+        identity_mismatch: None,
+        cancel_requested: false,
+        started_unix_seconds: 1,
+        deadline_unix_seconds: u64::MAX,
+        completed_unix_seconds: None,
+        fallback_completed: false,
+    };
+    transact(|state| state.operations.push(operation.clone())).expect("sidecar");
+    reserve_quarantine_root(&operation, false).expect("prelaunch reservation");
+    // Another slot that already serves the same pair with a valid credential.
+    let existing_root = root.join("existing");
+    fs::create_dir_all(&existing_root).expect("existing root");
+    let existing_slot = store
+        .register_path(1, existing_root.to_string_lossy().into_owned())
+        .expect("existing registration")
+        .external_slots[0]
+        .slot_id
+        .clone();
+    let valid = (time::OffsetDateTime::now_utc() + time::Duration::hours(8))
+        .format(&time::format_description::well_known::Rfc3339)
+        .expect("expiry");
+    crate::agent_status::persist_one_claude_slot_collection_state(
+        &existing_slot,
+        &ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
+            state: ottto_protocol::ClaudeConfigSlotCollectionStateV1::Fresh,
+            account_identifier_hash: Some(account),
+            organization_identifier_hash: Some(organization),
+            observed_at: Some("2026-09-24T12:21:06Z".to_string()),
+            access_expires_at: Some(valid),
+            ..Default::default()
+        },
+    )
+    .expect("existing saved state");
+
+    assert!(finalize_requests_now(operation_id).is_empty());
+    let finished = read_operation(operation_id).expect("finished operation");
+    assert_eq!(
+        finished.outcome,
+        Some(ClaudeBrowserAuthOutcomeV1::AlreadyConnected)
+    );
+    assert_eq!(
+        finished.canonical_slot_id.as_deref(),
+        Some(existing_slot.as_str())
+    );
+    assert!(finalize_requests_now(operation_id).is_empty());
     let _ = fs::remove_dir_all(root);
 }
 
