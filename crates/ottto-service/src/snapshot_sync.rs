@@ -5908,6 +5908,7 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
     }
     fn outcome(&mut self, source: SnapshotSource, result: Result<()>) {
         drop(self.paced_qos.take());
+        crate::local_resource_diagnostics::pass_ended(source.api_slug());
         if source == SnapshotSource::Codex && result.is_err() {
             continuation::after_ordinary_codex_failure();
         }
