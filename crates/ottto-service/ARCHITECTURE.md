@@ -416,6 +416,12 @@ unknown Cargo targets, old-path strings after decoding escapes and normalizing s
 case) and print their limits: implicit log targets, panic locations, approved derives assumed
 context-free, runtime paths and `include!(env!(..))`.
 `scripts/check_source_layout.py` reports how far the tree is from the target.
+Public CI also runs `--enforce-new --base <ref>`: production `.rs` files added
+against the base anywhere in the repository must have at most 3,000 lines and
+warn above 1,500. Exact (R100) file moves count as existing files; `*_tests.rs`,
+`tests.rs` and files under `tests/` are excluded. Existing files remain report-only
+unless a rule is explicitly enabled with `--enforce`; a limits-table row cannot
+exempt a new production file from the ceiling.
 
 ## Never drop data
 
