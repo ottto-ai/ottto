@@ -309,6 +309,7 @@ run_step P "test macOS stable release workflow policy" bash scripts/test_macos_s
 run_step B "test macOS attestation binder" bash scripts/test_macos_attestation_bind.sh
 run_step B "test macOS release source check" bash scripts/test_macos_release_source_check.sh
 run_step B "test macOS manifest signature helper" bash scripts/test_macos_manifest_signature.sh
+run_step P "test release evidence placeholders" env PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_release_evidence_placeholders.py
 run_step B "test stable-candidate RC gate" bash scripts/test_macos_public_rc_gate.sh
 run_step B "test stable preflight gate" bash scripts/test_macos_stable_preflight.sh
 run_step B "test stable closeout gate" bash scripts/test_macos_stable_closeout_gate.sh
