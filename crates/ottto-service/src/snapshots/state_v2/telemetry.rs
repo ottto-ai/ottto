@@ -438,8 +438,8 @@ pub(super) fn decoded(rows: u64, headers: u64, chunks: u64) {
 struct RetainedHeap {
     census: Option<u64>,
     side_maps: Option<u64>,
+    #[serde(skip)]
     side_maps_parts: BTreeMap<&'static str, Option<u64>>,
-    side_maps_unsized: usize,
     files: Option<u64>,
     /// Request hashes the census holds, and the one occupancy alarm: at
     /// least 75% of `CLAUDE_REQUEST_CENSUS_HASH_ALARM_BASE`. Nothing is capped.
@@ -467,15 +467,16 @@ pub(super) fn retained(index: &ScanIndex, owner: &'static str) {
 }
 fn retained_heap(index: &ScanIndex) -> RetainedHeap {
     let hashes = index.claude_request_census.hash_total();
-    let side_maps_parts = side_maps(index);
+    let parts = crate::heap_layout_bound::layout_supported().then(|| side_maps(index));
     RetainedHeap {
         census: heap(&index.claude_request_census),
         files: heap(&index.files),
-        side_maps: side_maps_parts
-            .values()
-            .try_fold(0u64, |sum, n| sum.checked_add((*n)?)),
-        side_maps_unsized: side_maps_parts.values().filter(|n| n.is_none()).count(),
-        side_maps_parts,
+        side_maps: parts.as_ref().and_then(|parts| {
+            parts
+                .values()
+                .try_fold(0u64, |sum, n| sum.checked_add((*n)?))
+        }),
+        side_maps_parts: parts.unwrap_or_default(),
         census_hashes: hashes as u64,
         census_occupancy_alarm: hashes
             >= super::super::claude_request_census::CLAUDE_REQUEST_CENSUS_HASH_ALARM_BASE / 4 * 3,
@@ -485,17 +486,18 @@ pub(in crate::snapshots) fn retained_breakdown(
     index: &ScanIndex,
 ) -> crate::local_resource_diagnostics::RetainedBytes {
     let retained = retained_heap(index);
+    let parts = &retained.side_maps_parts;
     let mut accounts = Some(0u64);
     macro_rules! account {
         ($f:ident, Accounts, $codec:tt, $kinds:tt, $class:ident) => {
             accounts = accounts
-                .zip(retained.side_maps_parts[stringify!($f)])
+                .zip(parts.get(stringify!($f)).copied().flatten())
                 .and_then(|(a, b)| a.checked_add(b));
         };
         ($($other:tt)*) => {};
     }
     scan_index_fields!(each account);
-    let traversal = retained.side_maps_parts["traversal"];
+    let traversal = parts.get("traversal").copied().flatten();
     let totals = BTreeMap::from([
         ("files_bytes", retained.files),
         ("census_bytes", retained.census),
@@ -510,10 +512,19 @@ pub(in crate::snapshots) fn retained_breakdown(
                 .and_then(|((s, a), t)| s.checked_sub(a)?.checked_sub(t)),
         ),
     ]);
+    let mut side_maps_parts = retained.side_maps_parts;
+    macro_rules! omit_inline {
+        ($f:ident, $g:ident, $store:tt, $kinds:tt, side) => {
+            if crate::heap_layout_bound::require_inline(&index.$f).is_some() {
+                side_maps_parts.remove(stringify!($f));
+            }
+        };
+        ($($t:tt)*) => {};
+    }
+    scan_index_fields!(each omit_inline);
     crate::local_resource_diagnostics::RetainedBytes {
         totals,
-        side_maps_parts: retained.side_maps_parts,
-        side_maps_unsized: retained.side_maps_unsized,
+        side_maps_parts,
     }
 }
 fn side_maps(index: &ScanIndex) -> BTreeMap<&'static str, Option<u64>> {
@@ -1073,7 +1084,6 @@ mod ops_tests {
             super::super::super::lenient_decode::persistence_controls(&index, usize::MAX).unwrap(),
         );
         let retained = retained_heap(&index);
-        assert_eq!(retained.side_maps_unsized, 1);
         assert_eq!(retained.side_maps_parts["persistence_controls"], None);
         assert!(retained.side_maps_parts["quarantined_snapshot_fingerprints"].is_some());
         assert!(retained.side_maps_parts["growth_retention"].is_some());
@@ -1082,7 +1092,19 @@ mod ops_tests {
         assert!(parts.totals["side_maps_bytes"].is_none());
         assert!(parts.totals["accounts_identity_bytes"].is_some());
         assert!(parts.totals["traversal_bytes"].is_some());
-        assert_eq!(parts.side_maps_parts, retained.side_maps_parts);
+        assert_eq!(parts.side_maps_parts["persistence_controls"], None);
+        assert!(!parts.side_maps_parts.contains_key("generation"));
+        assert!(!parts
+            .side_maps_parts
+            .contains_key("retired_family_requests"));
+        assert_eq!(
+            parts.side_maps_parts["active_upload_context_fingerprint"],
+            Some(0)
+        );
+        assert!(serde_json::to_value(&retained)
+            .unwrap()
+            .get("side_maps_parts")
+            .is_none());
     }
 
     #[test]
@@ -1096,6 +1118,11 @@ mod ops_tests {
             },
         );
         let parts = retained_breakdown(&index);
+        assert!(parts.side_maps_parts.values().all(Option::is_some));
+        assert_eq!(
+            parts.side_maps_parts.values().flatten().sum::<u64>(),
+            retained_heap(&index).side_maps.unwrap()
+        );
         let parts = parts.totals;
         assert_eq!(parts.len(), 5);
         assert_eq!(parts["files_bytes"], retained_heap(&index).files);

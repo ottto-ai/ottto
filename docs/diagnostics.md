@@ -406,14 +406,19 @@ retain only endpoint samples.
 `pass.retained_heap_bytes` records the finishing source's in-memory index just
 before finish consumes it: `files_bytes`, `census_bytes`, `side_maps_bytes`,
 `accounts_identity_bytes`, and `traversal_bytes`. The last three split the
-existing inclusive side-map charge. `side_maps_parts` reports each fixed
-ScanIndex side-field name separately as bytes or `null`, plus `index_state`
-(the existing conditional IndexState allocation charge) and `growth_retention`.
-`side_maps_unsized` counts the `null` parts. The parts include account/identity
-and traversal fields, matching the inclusive state-v2 `side_maps` total rather
-than the exclusive `side_maps_bytes` split. Both totals remain `null` if any
+existing inclusive side-map charge. `side_maps_parts`, emitted only in this
+source-finish pass row, reports each fixed ScanIndex side-field name separately
+as bytes or `null`, plus `index_state` (the existing conditional IndexState
+allocation charge) and `growth_retention`.
+Fields proved `INLINE_ONLY` by the existing layout accounting are omitted by
+type, including scalars and retired `IgnoredAny` fields; other zero charges and
+all unknown parts remain. Unsupported layouts produce an empty parts map.
+The parts include account/identity and traversal fields, matching the inclusive
+state-v2 `side_maps` total rather than the exclusive `side_maps_bytes` split.
+Both totals remain `null` if any
 included part is unknown; an unknown part never suppresses the other parts.
-State-v2 owning-graph records also include this map and count beside `side_maps`.
+Do not add the parts to `accounts_identity_bytes` or `traversal_bytes`: those
+charges are already included and would be counted twice.
 Keys are fixed field names, never record identifiers. The process-wide cache
 fields are
 `codex_sidecar_facts_bytes`, `codex_header_cache_bytes`, and
