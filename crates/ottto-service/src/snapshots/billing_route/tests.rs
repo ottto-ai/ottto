@@ -535,6 +535,128 @@ fn first_request_evidence_must_be_complete() {
     );
 }
 
+const TRANSCRIPT_SESSION: &str = "11111111-1111-4111-8111-111111111111";
+
+fn user_line(at_ns: i64) -> String {
+    json!({
+        "type": "user",
+        "sessionId": TRANSCRIPT_SESSION,
+        "timestamp": at(at_ns),
+        "message": {"role": "user", "content": "x"},
+    })
+    .to_string()
+}
+
+fn assistant_line(at_ns: i64, id: &str, output_tokens: u64) -> String {
+    json!({
+        "type": "assistant",
+        "sessionId": TRANSCRIPT_SESSION,
+        "timestamp": at(at_ns),
+        "entrypoint": "claude-desktop",
+        "requestId": format!("req_{id}"),
+        "message": {
+            "id": format!("msg_{id}"),
+            "role": "assistant",
+            "model": "claude-opus-4-7",
+            "usage": {"input_tokens": 1, "output_tokens": output_tokens},
+        },
+    })
+    .to_string()
+}
+
+/// The route of real transcript bytes through the parser, the resolver and
+/// capture, the parse-path producer on. The process started at `start`; the
+/// OAuth evaluator changed then and was observed 59 s later. Times follow
+/// the wall clock so the fixture file's birth never marks them copied.
+fn transcript_route(name: &str, start: i64, bytes: &[u8]) -> Value {
+    let path = std::env::temp_dir().join(format!(
+        "billing-route-{name}-{}-{start}.jsonl",
+        std::process::id()
+    ));
+    std::fs::write(&path, bytes).unwrap();
+    let parsed = with_test_producer(|| {
+        crate::snapshots::parse_claude_code_jsonl_file(&path, &at(start), "fixture".to_string())
+    });
+    std::fs::remove_file(&path).ok();
+    let mut items = parsed.expect("parse");
+    assert_eq!(items.len(), 1);
+    let context = RouteContext {
+        emit: true,
+        process_started_ns: start,
+        claude_login: Some(ClaudeLogin {
+            candidate: LoginCandidate::Oauth,
+            changed_ns: start,
+            observed_ns: start + 59 * SECOND,
+        }),
+    };
+    let mut latches = Latches::new();
+    apply_session_billing_routes(
+        &mut latches,
+        DEST,
+        SnapshotSource::ClaudeCode,
+        MACHINE,
+        &mut items,
+        &context,
+    );
+    route(&items[0])
+}
+
+/// The process start for a transcript fixture: whole seconds, after now.
+fn transcript_start() -> i64 {
+    (OffsetDateTime::now_utc().unix_timestamp() + 120) * SECOND
+}
+
+/// An opening line that fails to decode (oversized or not) hides the
+/// session's first response and earliest time: the proof is invalid, and
+/// the next request, now response 0, names nothing.
+#[test]
+fn undecodable_opening_line_invalidates_the_route_proof() {
+    let t = transcript_start();
+    let tail = format!(
+        "{}\n{}\n",
+        user_line(t + SECOND),
+        assistant_line(t + 2 * SECOND, "1", 1)
+    );
+    let opening = assistant_line(t - 60 * SECOND, "0", 1);
+    let truncated = &opening[..opening.len() - 1];
+    for padding in [16 * 1024 * 1024 + 1, 0] {
+        let mut bytes = format!("{truncated},\"pad\":\"").into_bytes();
+        bytes.resize(bytes.len() + padding, b'x');
+        bytes.extend_from_slice(b"\"\n");
+        bytes.extend_from_slice(tail.as_bytes());
+        assert_eq!(
+            transcript_route("malformed-opening", t, &bytes),
+            unknown("first_request_snapshot_missing"),
+            "padding {padding}"
+        );
+    }
+    // The same session without the opening names its route.
+    assert_eq!(
+        transcript_route("clean", t, tail.as_bytes()),
+        known("subscription", "evaluator_snapshot")
+    );
+}
+
+/// A first response the resolver cannot settle (its output regresses) is
+/// skipped before the first own response is observed; it still precedes
+/// the next response, so the proof is invalid.
+#[test]
+fn unresolved_earlier_response_invalidates_the_route_proof() {
+    let t = transcript_start();
+    let lines = [
+        user_line(t + SECOND),
+        assistant_line(t + 2 * SECOND, "0", 2),
+        assistant_line(t + 3 * SECOND, "0", 1),
+        user_line(t + 4 * SECOND),
+        assistant_line(t + 5 * SECOND, "1", 1),
+    ];
+    let bytes = lines.map(|line| line + "\n").concat();
+    assert_eq!(
+        transcript_route("unresolved-first", t, bytes.as_bytes()),
+        unknown("first_request_snapshot_missing")
+    );
+}
+
 /// The evaluator changed after the request started: that request has no
 /// proven snapshot, so it never names a route.
 #[test]

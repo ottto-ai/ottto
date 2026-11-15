@@ -12,8 +12,10 @@
 //!
 //! Claude Code: only the session's first own response (in sequence order,
 //! never filtered away) names the first route, and only when all of these
-//! hold: the session's earliest stamped line of any kind, inherited and
-//! invalid fork lines included, is strictly after this process started; that
+//! hold: every physical line of the file decoded and no response, resolved or
+//! not, precedes that one (it is the file's response 0); the session's
+//! earliest stamped line of any kind, inherited and invalid fork lines
+//! included, is strictly after this process started; that
 //! response carries a request id, is not synthetic, and has a complete clock
 //! whose request start (its preceding prompt or tool-result record) and end
 //! are strictly after this process started; and the published login
@@ -47,6 +49,30 @@ pub(crate) const SESSION_BILLING_ROUTE_CONTRACT: &str = "session_billing_route:v
 /// Whether this build latches and annotates routes. Off, no route state, clock
 /// or classification work runs.
 pub(crate) const PRODUCER_ENABLED: bool = false;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_PRODUCER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The producer gate on the parse path: [`PRODUCER_ENABLED`], or a test that
+/// parses real transcripts with the producer on for its own thread.
+pub(crate) fn producer_on() -> bool {
+    #[cfg(test)]
+    if TEST_PRODUCER.with(std::cell::Cell::get) {
+        return true;
+    }
+    PRODUCER_ENABLED
+}
+
+/// Run `f` with the parse-path producer on for this thread.
+#[cfg(test)]
+pub(crate) fn with_test_producer<T>(f: impl FnOnce() -> T) -> T {
+    TEST_PRODUCER.with(|on| on.set(true));
+    let out = f();
+    TEST_PRODUCER.with(|on| on.set(false));
+    out
+}
 
 /// Shared route vocabulary. Values never name an account, payer or price.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -200,6 +226,9 @@ pub(crate) struct ClaudeRouteEvidence {
     /// fork lines included (`claude_line_clocks`), set when the item is
     /// built.
     pub(crate) first_line_ns: Option<i64>,
+    /// The route proof is invalid: a physical line of the file failed to
+    /// decode, or a response (resolved or not) precedes the first own one.
+    pub(crate) proof_invalid: bool,
     /// The session has an own billable response.
     pub(crate) billable: bool,
     /// The session's first own response (`first_own_sequence`); `None` when it
@@ -224,7 +253,7 @@ crate::heap_layout_bound::no_heap!(true;
 );
 crate::heap_layout_bound::fields!(SessionBillingRouteFact; first_route, first_route_source, routes_seen, unknown_reason);
 crate::heap_layout_bound::fields!(SessionBillingRoute; first_route, routes_seen, unknown_reason, first_route_source);
-crate::heap_layout_bound::fields!(ClaudeRouteEvidence; first_line_ns, billable, first, later, third_party, telemetry_account);
+crate::heap_layout_bound::fields!(ClaudeRouteEvidence; first_line_ns, proof_invalid, billable, first, later, third_party, telemetry_account);
 
 /// An RFC 3339 time as unix nanoseconds; `None` when unreadable or outside
 /// `i64`.
@@ -283,12 +312,24 @@ pub(crate) fn start_witness(
     source: SnapshotSource,
     line_clocks: Option<(i128, i128)>,
 ) -> Option<Box<ClaudeRouteEvidence>> {
-    (PRODUCER_ENABLED && source == SnapshotSource::ClaudeCode).then(|| {
+    (producer_on() && source == SnapshotSource::ClaudeCode).then(|| {
         Box::new(ClaudeRouteEvidence {
             first_line_ns: line_clocks.and_then(|(first, _)| i64::try_from(first).ok()),
             ..ClaudeRouteEvidence::default()
         })
     })
+}
+
+/// Invalidate the route proof of `items`, whose file has a physical line that
+/// failed to decode: it may have held the session's first response or its
+/// earliest timestamp. Only evidence boxes (producer on) are touched.
+pub(crate) fn invalidate_route_proof(items: &mut [SnapshotItem]) {
+    for evidence in items
+        .iter_mut()
+        .filter_map(|item| item.claude_route_evidence.as_deref_mut())
+    {
+        evidence.proof_invalid = true;
+    }
 }
 
 /// Capture `item`'s Claude route evidence from its native request inputs,
@@ -331,11 +372,13 @@ pub(crate) fn capture_claude_route_evidence(item: &mut SnapshotItem) {
         .iter()
         .copied()
         .filter(|occurrence| !synthetic(occurrence));
+    let witness = item.claude_route_evidence.as_deref();
     let evidence = ClaudeRouteEvidence {
-        first_line_ns: item
-            .claude_route_evidence
-            .as_ref()
-            .and_then(|evidence| evidence.first_line_ns),
+        first_line_ns: witness.and_then(|evidence| evidence.first_line_ns),
+        // Sequences count every response, resolved or not, from the file's
+        // first: any before the first own one leaves the proof invalid.
+        proof_invalid: witness.is_some_and(|evidence| evidence.proof_invalid)
+            || first_own != Some(0),
         billable: real.clone().next().is_some() || (first_own.is_some() && first_kept.is_none()),
         first: first_kept
             .filter(|occurrence| !synthetic(occurrence))
@@ -733,7 +776,7 @@ fn claude_route(
         return Some(fact.wire());
     }
     let first = match evidence.first {
-        Some(first) if context.live(evidence.first_line_ns) => first,
+        Some(first) if !evidence.proof_invalid && context.live(evidence.first_line_ns) => first,
         _ => return Some(SessionBillingRouteFact::unknown(R::FirstRequestSnapshotMissing).wire()),
     };
     let route = match classify(&first)? {

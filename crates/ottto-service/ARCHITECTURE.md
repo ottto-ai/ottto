@@ -440,8 +440,9 @@ allowlisted cloud provider and explicit auth pairs; they keep no latch: each pas
 route from the earliest hour bucket holding a known route (rows within an hour sort by row key, not
 time), and two known routes there are `signal_conflict`. Claude Code keeps in-memory latches, keyed
 by destination, source, machine and session, for known first routes only. Only the session's first
-own response (sequence order, never filtered away) can name one, and only when the session's
-earliest stamped line of any kind (`claude_line_clocks`, inherited and invalid fork lines included)
+own response (sequence order, never filtered away) can name one, and only when every physical line
+of the file decoded (the read report spans Tail resumes), no response, resolved or not, precedes it,
+the session's earliest stamped line of any kind (`claude_line_clocks`, inherited and invalid fork lines included)
 is strictly after this process started and that response has a request id, is not synthetic and
 has a complete clock whose start and end are strictly after the start (precise timestamps). Any
 other missing, unstamped or unproven input is `first_request_snapshot_missing`; a later request

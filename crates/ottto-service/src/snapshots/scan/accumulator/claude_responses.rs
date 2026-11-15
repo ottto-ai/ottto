@@ -94,7 +94,7 @@ impl SnapshotAccumulator {
         // Route evidence only, producer on: each key's id shapes by sequence,
         // read before the book is consumed. Money and every other input
         // ignore it.
-        let route_ids = crate::snapshots::billing_route::PRODUCER_ENABLED
+        let route_ids = crate::snapshots::billing_route::producer_on()
             .then(|| self.claude_responses.route_ids_by_sequence());
         let (mut responses, selectors) = std::mem::take(&mut self.claude_responses).into_parts();
         responses.sort_by_key(|response| response.sequence);
