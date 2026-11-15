@@ -550,3 +550,18 @@ same `collected_at`, empty batches included. The read's last covered day is alwa
 complete UTC day at that `collected_at`. `provider_daily_reference::tests::accounts` emits the
 producer fixtures in `fixtures/provider-daily-reference/`; the snapshots parity test emits the
 cross-language identity vectors.
+
+## Local health diagnostics
+
+Local health events retain only the latest observation per Upload, SetupRead and
+SnapshotSync family, per Verify source, and per ScanIndex source/reason/polarity.
+The command ledger retains the latest terminal result per action. Both lists keep
+insertion order; they are current diagnostics rather than a lifetime history in
+status/CLI JSON or uploaded health evidence. Usage, upload bodies, receipts and
+placement do not depend on this diagnostic history.
+
+Status keeps its owned snapshot; control serialization happens after the daemon
+state lock is released. Runtime observations belong only to that response;
+reprojection replaces its observation.
+ScanIndex catch-up materializes only the latest set and clear for each pair and
+advances the observed transition high-water marks even across a long polling gap.
