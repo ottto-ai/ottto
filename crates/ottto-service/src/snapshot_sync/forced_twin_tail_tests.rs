@@ -9,10 +9,32 @@ use crate::snapshots::sampled_scan::transition_fixture::upgrade_from_legacy_stor
 use crate::snapshots::sampled_scan::transition_fixture::{money_oracle, observe_consumed, Mode};
 use crate::transcript_acquisition::{capture_sample_reads, FullReason, ReadMode};
 
+use crate::snapshots::e2_pipeline_scan_fixture::twin_diagnostics as diag;
+
+// Keep all existing decisions and comparisons; attach the same compact trace
+// to assertion failures. The guard also dumps it for unwrap/oracle panics.
+macro_rules! assert {
+    ($condition:expr $(,)?) => {
+        std::assert!($condition, "{}", diag::context())
+    };
+    ($condition:expr, $($message:tt)+) => {
+        std::assert!($condition, "{}\n{}", format_args!($($message)+), diag::context())
+    };
+}
+macro_rules! assert_eq {
+    ($left:expr, $right:expr $(,)?) => {
+        std::assert_eq!($left, $right, "{}", diag::context())
+    };
+    ($left:expr, $right:expr, $($message:tt)+) => {
+        std::assert_eq!($left, $right, "{}\n{}", format_args!($($message)+), diag::context())
+    };
+}
+
 const FIRST: &str = "0338a80a-f36e-4cbc-a5bb-50fc66430ba5";
 const BORN: &str = "2026-08-02T07:03:00Z";
 
 struct Twin {
+    _diagnostics: diag::DumpOnPanic,
     c: Corpus,
     disk: Disk,
     owner: E2ScanFixture,
@@ -22,9 +44,12 @@ struct Twin {
     key: String,
 }
 impl Twin {
+    #[track_caller]
     fn new(name: &str, incomplete: bool) -> Self {
+        let diagnostics = diag::begin(name);
         let mut c = corpus(name);
         let holder = c.root(ROOT, &resumed(ROOT, &[A, B]));
+        diag::register(&holder, "holder");
         input_clock(&holder);
         c.evidence(
             &[
@@ -55,6 +80,7 @@ impl Twin {
             contents += &(gap.to_string() + "\n");
         }
         let twin = c.write_at(&file(FIRST), &contents, BORN);
+        diag::register(&twin, "twin");
         input_clock(&twin);
         let mut both = c.raw(&owner, prior, 100, true, &[]);
         both.enrich(&c);
@@ -82,6 +108,7 @@ impl Twin {
         damage_tail_for_test(&both.index, &holder.to_string_lossy(), "missing");
         let prior = disk.commit(&both.cache, SnapshotSource::ClaudeCode, &mut both.index);
         Self {
+            _diagnostics: diagnostics,
             c,
             disk,
             owner,
@@ -99,15 +126,21 @@ impl Twin {
     fn pages(&self, restart: &E2ScanFixture, tail: Page) -> [Page; 3] {
         [
             tail,
-            self.page(&E2ScanFixture::capturing_identity()),
-            self.page(restart),
+            self.page_as(&E2ScanFixture::capturing_identity(), "cold"),
+            self.page_as(restart, "restart"),
         ]
     }
     fn force(&self, request: &str) {
         append(&self.holder, &line(ROOT, request, AT, 10));
         input_clock(&self.holder);
     }
+    #[track_caller]
     fn page(&self, owner: &E2ScanFixture) -> Page {
+        self.page_as(owner, "RAM")
+    }
+    #[track_caller]
+    fn page_as(&self, owner: &E2ScanFixture, label: &'static str) -> Page {
+        diag::owner(label);
         self.c.raw(
             owner,
             self.prior.clone(),
@@ -116,21 +149,28 @@ impl Twin {
             std::slice::from_ref(&self.holder),
         )
     }
-    fn assert_read(&self, owner: &E2ScanFixture, mode: ReadMode, start: u64) {
+    #[track_caller]
+    fn assert_read(&self, owner: &E2ScanFixture, label: &'static str, mode: ReadMode, start: u64) {
+        diag::owner(label);
         let reads = owner.acquisitions.lock().unwrap();
         let read = reads
             .iter()
             .rev()
             .find(|read| read.path == self.twin)
-            .expect("twin is on holder's page");
+            .unwrap_or_else(|| panic!("twin is on holder's page\n{}", diag::context()));
         assert_eq!(
             read.reason,
             Some(crate::snapshots::CandidateParseReason::ForcedFamily)
         );
         assert_eq!((read.mode, read.start), (mode, start));
     }
+    #[track_caller]
     fn compare(&self, pages: &mut [Page; 3]) {
-        finish_claude_pages(&self.c, pages);
+        for (page, label) in pages.iter_mut().zip(["RAM", "cold", "restart"]) {
+            diag::owner(label);
+            page.enrich(&self.c);
+            page.finish();
+        }
         compare_claude_uploads(pages);
         let routes = [Mode::Ram, Mode::ColdFull, Mode::DiskRestore];
         let routes =
@@ -186,6 +226,8 @@ fn forced_verified_twin_reuses_certified_tail_and_restarts() {
         for incomplete in [false, true] {
             let mut f = Twin::new(&format!("forced-verified-twin-{incomplete}"), incomplete);
             for round in 0..3 {
+                diag::round(round);
+                diag::owner("RAM");
                 let sealed = continuation_for_test(
                     SnapshotSource::ClaudeCode,
                     &f.owner.cache,
@@ -217,7 +259,7 @@ fn forced_verified_twin_reuses_certified_tail_and_restarts() {
                     ReadMode::Unchanged
                 };
                 let start = if native { 0 } else { sealed };
-                f.assert_read(&f.owner, mode, start);
+                f.assert_read(&f.owner, "RAM", mode, start);
                 let twin_bytes = if native { sealed } else { suffix.len() as u64 };
                 assert_eq!(
                     consumed,
@@ -242,11 +284,12 @@ fn forced_verified_twin_reuses_certified_tail_and_restarts() {
                     .iter()
                     .all(|read| read.requested <= crate::transcript_acquisition::SAMPLE_BYTES));
                 let mut pages = f.pages(&restart, tail);
-                f.assert_read(&restart, mode, start);
+                f.assert_read(&restart, "restart", mode, start);
                 f.compare(&mut pages);
                 if round == 0 {
                     let legacy =
                         upgrade_from_legacy_store(&f.prior, &f.c.base.join("upgrade.json"));
+                    diag::owner("restart");
                     let mut upgraded = f.c.raw(
                         &E2ScanFixture::capturing_identity(),
                         legacy,
@@ -276,6 +319,8 @@ fn forced_verified_twin_reuses_certified_tail_and_restarts() {
                 let [_, _, page] = pages;
                 f.commit(page);
             }
+            diag::round("quiet");
+            diag::owner("restart");
             let restart = f.restart();
             let ((mut quiet, consumed), samples) = capture_sample_reads(|| {
                 observe_consumed(|| f.c.raw(&restart, f.prior.clone(), 100, true, &[]))
@@ -306,6 +351,7 @@ fn forced_verified_twin_stays_on_its_page_without_tail_capacity() {
     with_e2(|| {
         for arm in ["cap", "completion", "future"] {
             let mut f = Twin::new(&format!("forced-twin-{arm}"), true);
+            diag::round(0);
             append(&f.twin, &line(ROOT, "own-later", AT, 9));
             input_clock(&f.twin);
             if arm == "future" {
@@ -330,8 +376,13 @@ fn forced_verified_twin_stays_on_its_page_without_tail_capacity() {
                 pace_cap_for_test(&restart, &f.twin);
             }
             let mut pages = f.pages(&restart, f.page(&f.owner));
-            f.assert_read(&f.owner, ReadMode::Full(FullReason::StateMissing), 0);
-            f.assert_read(&restart, ReadMode::Full(FullReason::StateMissing), 0);
+            f.assert_read(&f.owner, "RAM", ReadMode::Full(FullReason::StateMissing), 0);
+            f.assert_read(
+                &restart,
+                "restart",
+                ReadMode::Full(FullReason::StateMissing),
+                0,
+            );
             f.compare(&mut pages);
             assert!(!pages[2].index.files[&f.key]
                 .scan_identity_version
@@ -352,6 +403,7 @@ fn forced_verified_twin_falls_back_without_valid_head() {
     }
     with_e2(|| {
         let mut f = Twin::new("forced-twin-fallback-corrupt", false);
+        diag::round(0);
         damage_tail_for_test(&f.prior, &f.key, "corrupt");
         f.prior = f
             .disk
@@ -359,8 +411,13 @@ fn forced_verified_twin_falls_back_without_valid_head() {
         f.force("holder-later");
         let restart = f.restart();
         let mut pages = f.pages(&restart, f.page(&f.owner));
-        f.assert_read(&f.owner, ReadMode::Full(FullReason::StateMissing), 0);
-        f.assert_read(&restart, ReadMode::Full(FullReason::StateMissing), 0);
+        f.assert_read(&f.owner, "RAM", ReadMode::Full(FullReason::StateMissing), 0);
+        f.assert_read(
+            &restart,
+            "restart",
+            ReadMode::Full(FullReason::StateMissing),
+            0,
+        );
         f.compare(&mut pages);
     });
 }

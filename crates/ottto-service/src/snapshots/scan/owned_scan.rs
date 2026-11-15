@@ -938,6 +938,18 @@ impl OwnedSourceScan {
             causes,
             ..ScanCensus::default()
         };
+        #[cfg(test)]
+        for pending in &pending_paths {
+            crate::snapshots::e2_pipeline_scan_fixture::twin_diagnostics::event(
+                &pending.path,
+                || {
+                    format!(
+                        "seed selected census={} hint={}",
+                        pending.census_member, pending.watcher_hint,
+                    )
+                },
+            );
+        }
         let selected_flags = pending_paths
             .iter()
             .map(|pending| {

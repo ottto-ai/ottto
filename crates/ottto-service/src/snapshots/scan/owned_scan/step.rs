@@ -1,6 +1,8 @@
 //! The owned source scan's page step: one call reads the next page of the
 //! selected files, applies it to the index and returns either the scan to
 //! resume or the completed result.
+#[cfg(test)]
+use crate::snapshots::e2_pipeline_scan_fixture::twin_diagnostics;
 use crate::snapshots::*;
 impl OwnedSourceScan {
     pub(crate) fn step(
@@ -2294,6 +2296,12 @@ impl OwnedSourceScan {
                 let terminal_loss = parsed_file.terminal_loss();
                 let index_key = local_index_key(&candidate.path);
                 let non_progressing_residue = parsed_file.non_progressing_residue();
+                #[cfg(test)]
+                twin_diagnostics::event(&candidate.path, || {
+                    format!(
+                    "completion parse_complete={parse_complete} residue={non_progressing_residue}"
+                )
+                });
                 if non_progressing_residue {
                     residue_index_keys.insert(index_key.clone());
                 } else {
@@ -2373,6 +2381,13 @@ impl OwnedSourceScan {
                     && !index.claude_account_deferred_holds.contains_key(&index_key)
                     && (slot_unfunded || !index.can_stage_sampled_audit(&index_key))
                 {
+                    #[cfg(test)]
+                    twin_diagnostics::event(&candidate.path, || {
+                        format!(
+                        "defer completion needs_marker={needs_marker} slot_unfunded={slot_unfunded} can_stage={}",
+                        index.can_stage_sampled_audit(&index_key),
+                    )
+                    });
                     // A refused prefix/lossy completion is a delay, not a Full.
                     if let Some(context) = sampling.as_mut() {
                         context.audit_cap_delay += 1;
@@ -2817,6 +2832,17 @@ impl OwnedSourceScan {
                     .saturating_add(claude_compaction_unlinked_parent_count);
                 // Only classified holds suppress independently valid siblings.
                 if parse_complete {
+                    #[cfg(test)]
+                    twin_diagnostics::event(&candidate.path, || {
+                        format!(
+                            "page contribution snapshots={} folds={}",
+                            parsed.len(),
+                            parsed
+                                .iter()
+                                .filter(|item| item.claude_money.is_some())
+                                .count(),
+                        )
+                    });
                     snapshots.extend(parsed);
                 }
                 pending!();
@@ -3635,6 +3661,8 @@ impl OwnedSourceScan {
                     scan,
                 });
             };
+            #[cfg(test)]
+            twin_diagnostics::event(&candidate.path, || "candidate dequeued".into());
             // Reject budget debt before opening/constructing any body parser.
             // Requeue the original census membership; absence/completion stays owed.
             if index.context_only_read(&candidate)
@@ -3918,6 +3946,12 @@ impl OwnedSourceScan {
                 decision = CandidateDecision::Skip;
                 parse_reason = None;
             }
+            #[cfg(test)]
+            twin_diagnostics::event(&candidate.path, || {
+                format!(
+                "decision={decision:?} reason={parse_reason:?} history_held={history_held} stale_input_held={stale_input_held}"
+            )
+            });
             if source == SnapshotSource::ClaudeCode && decision == CandidateDecision::Parse {
                 if let Some(reason) = parse_reason {
                     let count = &mut census.parse_reasons[reason as usize];
@@ -4011,6 +4045,21 @@ impl OwnedSourceScan {
             );
             for path in pulls.into_iter().map(PathBuf::from) {
                 let key = local_index_key(&path);
+                #[cfg(test)]
+                twin_diagnostics::event(&path, || {
+                    format!(
+                        "pull requested already_scheduled={} fold_present={} queued={}",
+                        claude_twin_schedule.root_homes.contains(&key),
+                        snapshots.iter().any(|item| item
+                            .claude_money
+                            .as_deref()
+                            .and_then(claude_request_money::e2::FileFold::location_key)
+                            == Some(claude_money_birth_store::location_key(&key))),
+                        identified_candidates
+                            .iter()
+                            .any(|queued| queued.path == path),
+                    )
+                });
                 if claude_twin_schedule.root_homes.contains(&key)
                     || snapshots.iter().any(|item| {
                         item.claude_money
@@ -4040,6 +4089,8 @@ impl OwnedSourceScan {
                     backfill_window_days,
                     &mut discovery,
                 ) {
+                    #[cfg(test)]
+                    twin_diagnostics::event(&holder.path, || "pull enqueued".into());
                     identified_candidates.push_back(holder);
                 }
             }
@@ -4283,6 +4334,10 @@ impl OwnedSourceScan {
                 let tail_route = match state_v2::tail_route_path(index) {
                     Ok(route) => route,
                     Err(_) => {
+                        #[cfg(test)]
+                        twin_diagnostics::event(&candidate.path, || {
+                            "defer pre-acquisition tail_route_error residue=true".into()
+                        });
                         tail_source::counters::bump(source, "tail_db_loads", "held");
                         residue_index_keys.insert(key.clone());
                         pending!();
@@ -4466,11 +4521,19 @@ impl OwnedSourceScan {
                                     }
                                     // A pulled twin falls back to this page's native read.
                                     tail_source::load::Load::Held if forced_twin => {
+                                        #[cfg(test)]
+                                        twin_diagnostics::event(&candidate.path, || {
+                                            "Held forced_twin=true native_fallback".into()
+                                        });
                                         allow_sample = false;
                                         (None, debt)
                                     }
                                     // A newer build's head: untouched, held as residue.
                                     tail_source::load::Load::Held => {
+                                        #[cfg(test)]
+                                        twin_diagnostics::event(&candidate.path, || {
+                                            "defer pre-acquisition Held forced_twin=false residue=true".into()
+                                        });
                                         residue_index_keys.insert(key.clone());
                                         pending!();
                                     }
@@ -4517,6 +4580,11 @@ impl OwnedSourceScan {
                             })
                         {
                             if !context.cap_candidate(&key) {
+                                #[cfg(test)]
+                                twin_diagnostics::event(&candidate.path, || {
+                                    "defer pre-acquisition cap_retry cap_candidate=false slots=0"
+                                        .into()
+                                });
                                 sampled_audit::queue_cap_retry(index, &candidate);
                                 census.record_unreadable_file(
                                     UnreadableCause::Reduction,
@@ -4527,6 +4595,13 @@ impl OwnedSourceScan {
                             cap_full = true;
                             allow_sample = false;
                         }
+                        #[cfg(test)]
+                        twin_diagnostics::event(&candidate.path, || {
+                            format!(
+                            "sampling forced_family={forced_family} forced_native={forced_native} forced_twin={forced_twin} allow={allow_sample} cap_full={cap_full} slots={} can_stage={}",
+                            context.audit_slots, index.can_stage_sampled_audit(&key),
+                        )
+                        });
                         context.admission.sampling_allowed.observe(allow_sample);
                         if !allow_sample {
                             drop(retained.take());
@@ -4589,6 +4664,10 @@ impl OwnedSourceScan {
                             _ => mode,
                         };
                         if !sampled_audit::growth_read_admitted(index, &candidate, mode) {
+                            #[cfg(test)]
+                            twin_diagnostics::event(&candidate.path, || {
+                                format!("defer pre-acquisition growth_read_admitted=false mode={mode:?}")
+                            });
                             sampled_audit::defer_growth_read(index, &mut census, &candidate);
                             pending!();
                         }
@@ -4722,6 +4801,11 @@ impl OwnedSourceScan {
                     ),
                 )
             {
+                #[cfg(test)]
+                twin_diagnostics::event(&candidate.path, || {
+                    "defer pre-acquisition growth_read_admitted=false unsampled Full(StateMissing)"
+                        .into()
+                });
                 sampled_audit::defer_growth_read(index, &mut census, &candidate);
                 pending!();
             }

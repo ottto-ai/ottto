@@ -2,6 +2,9 @@
 use crate::snapshots::*;
 use crate::transcript_acquisition::Scope;
 
+#[path = "e2_pipeline_twin_diagnostics.rs"]
+pub(crate) mod twin_diagnostics;
+
 pub(crate) use crate::snapshots::g7_debt::tests::assert_file_receipt_retires_debt;
 
 /// The sampled scope and identity-capture mode this fixture's scans bind.
@@ -690,6 +693,7 @@ impl E2ScanFixture {
         births: &BTreeMap<PathBuf, i128>,
     ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
         let mut seen = BTreeSet::new();
+        let mut recorded_active = false;
         for _ in 0..100_000 {
             if let Some(slots) = self.audit_slots {
                 if let Some(context) = scan.sampling.as_mut() {
@@ -704,20 +708,37 @@ impl E2ScanFixture {
                         .lock()
                         .unwrap()
                         .push(active.candidate.path.clone());
-                    if let Some((plan, sampling)) = active
-                        .parser
-                        .reader
-                        .acquisition
-                        .as_ref()
-                        .zip(active.sampling.as_ref())
-                    {
-                        self.acquisitions.lock().unwrap().push(Acquisition {
-                            path: active.candidate.path.clone(),
-                            reason: active.parse_reason,
-                            mode: sampling.mode,
-                            start: plan.start_offset(),
-                        });
-                    }
+                }
+                // An active file spans multiple steps. Record once per active
+                // lifetime, including repeated paths and unsampled native reads.
+                if !recorded_active {
+                    let plan = active.parser.reader.acquisition.as_ref();
+                    let mode = plan.map_or_else(
+                        || {
+                            active.sampling.as_ref().map_or(
+                                crate::transcript_acquisition::ReadMode::Full(
+                                    crate::transcript_acquisition::FullReason::StateMissing,
+                                ),
+                                |sampling| sampling.mode,
+                            )
+                        },
+                        |plan| plan.mode(),
+                    );
+                    let start = plan.map_or(0, |plan| plan.start_offset());
+                    twin_diagnostics::event(&active.candidate.path, || {
+                        format!(
+                            "acquire mode={mode:?} start={start} reason={:?} sampled={}",
+                            active.parse_reason,
+                            active.sampling.is_some(),
+                        )
+                    });
+                    self.acquisitions.lock().unwrap().push(Acquisition {
+                        path: active.candidate.path.clone(),
+                        reason: active.parse_reason,
+                        mode,
+                        start,
+                    });
+                    recorded_active = true;
                 }
                 if let Some(birth) = births.get(&active.candidate.path) {
                     if self.subagent_births
@@ -735,6 +756,9 @@ impl E2ScanFixture {
                     }
                 }
             }
+            if scan.active_file.is_none() {
+                recorded_active = false;
+            }
             let modes = scan.sampling.as_ref().map_or((0, 0, 0), |s| {
                 (s.full_files, s.tail_files, s.unchanged_files)
             });
@@ -746,6 +770,7 @@ impl E2ScanFixture {
                 OwnedSourceScanStep::Pending(next) => scan = next,
                 OwnedSourceScanStep::Complete { index, scan, .. } => {
                     *self.full_reasons.lock().unwrap() = reasons;
+                    twin_diagnostics::folds(&scan.snapshots);
                     return (index, scan, modes);
                 }
             }
