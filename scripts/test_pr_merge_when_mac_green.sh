@@ -266,11 +266,24 @@ run_guard 6 --timeout 0 7
 expect_output '"Rust tests (Linux)" missing'
 expect_no_log 'gh enqueue'
 
-green_case more-than-one-page-is-not-judged
+# A busy commit lists its check runs over several pages: the guard reads them
+# all (a run repeated on two pages counts once) and judges the whole listing.
+green_case pages-are-judged-together
+jq -c '{total_count, check_runs: .check_runs[0:2]},
+       {total_count, check_runs: .check_runs[1:]}' "$case_dir/checks" > "$case_dir/checks.next"
+mv "$case_dir/checks.next" "$case_dir/checks"
+queue_json queue.1 OPEN "$SHA" QUEUED
+queue_json queue MERGED "$SHA" ""
+run_guard 0 7
+expect_log 'check-runs?filter=all&per_page=100 --paginate'
+expect_count "$ENQUEUE_CALL" 1
+expect_output "merged PR #7 at merge SHA $NEW_SHA"
+
+green_case incomplete-listing-is-not-judged
 jq '.total_count = 150' "$case_dir/checks" > "$case_dir/checks.next"
 mv "$case_dir/checks.next" "$case_dir/checks"
 run_guard 6 --timeout 0 7
-expect_output "more than one page"
+expect_output "commit has 150 check runs, listing returned"
 expect_no_log 'gh enqueue'
 
 green_case removed-from-queue
