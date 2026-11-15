@@ -136,7 +136,8 @@ impl Starting {
             version_inputs_hash: String,
         }
         // Fixed empty roots/window isolate versions using the fingerprint's existing encoding.
-        let versions = super::scan_traversal_context_fingerprint(source, &[], 0);
+        let versions =
+            super::discovery::traversal::scan_traversal_context_fingerprint(source, &[], 0);
         crate::local_resource_diagnostics::traversal_transition(
             source.api_slug(),
             &Scope {
