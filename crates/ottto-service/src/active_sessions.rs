@@ -1645,7 +1645,7 @@ mod tests {
             reconcile_active_sessions(
                 &dir,
                 source,
-                &[future.clone()],
+                std::slice::from_ref(&future),
                 None,
                 None,
                 "2026-11-15T09:59:00Z",

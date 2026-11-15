@@ -9943,10 +9943,13 @@ fn source_collection(
 ) -> Result<serde_json::Value, LocalApiError> {
     require_authorized_local_client(daemon, authorization)?;
     let snapshot_source = crate::snapshot_sync::snapshot_source_of_kind(&source);
-    if !enabled {
-        daemon.clear_tracking_confirmation(&source)?;
-    }
     let reply = save_source_collection(&source, enabled, |body| {
+        // The pause marker is already durable before any observation write.
+        if !enabled {
+            daemon
+                .clear_tracking_confirmation(&source)
+                .map_err(|_| anyhow!("tracking state unavailable"))?;
+        }
         let (device, secret) = crate::snapshot_client::load_snapshot_device_credentials()?;
         let client = crate::snapshot_client::SnapshotApiClient::new(
             crate::snapshot_sync::snapshot_api_base_url()?,

@@ -9472,6 +9472,63 @@ mod tests {
 
     #[test]
     #[serial]
+    fn tracking_status_omits_inapplicable_episodes_without_mutating_saved_state() {
+        let root = crate::test_scratch::private_dir("tracking-status-applicability");
+        let _support = TestEnvVar::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
+        let daemon = daemon();
+        let source = SourceKind::Codex;
+        let mut state = daemon.state().unwrap();
+        state.sources = vec![codex_health()];
+        assert!(serde_json::to_value(&state.sources[0])
+            .unwrap()
+            .get("tracking_confirmation")
+            .is_none());
+        state
+            .tracking_confirmation
+            .arm(&source, "2026-11-15T10:00:00Z".into(), true);
+        assert!(
+            status_from_state_with_relay_finding(&mut state, None).sources[0]
+                .tracking_confirmation
+                .is_none()
+        );
+        state.registered_source_grants = vec!["codex".into()];
+        assert!(
+            status_from_state_with_relay_finding(&mut state, None).sources[0]
+                .tracking_confirmation
+                .is_some()
+        );
+        state.source_reconciliation.insert("codex".into(), false);
+        assert!(
+            status_from_state_with_relay_finding(&mut state, None).sources[0]
+                .tracking_confirmation
+                .is_none()
+        );
+        state.source_reconciliation.clear();
+        state.sources[0].config.discovered = false;
+        assert!(
+            status_from_state_with_relay_finding(&mut state, None).sources[0]
+                .tracking_confirmation
+                .is_none()
+        );
+        state.sources[0].config.discovered = true;
+        crate::snapshot_sync::disable_snapshot_source(&root, snapshots::SnapshotSource::Codex)
+            .unwrap();
+        assert!(
+            status_from_state_with_relay_finding(&mut state, None).sources[0]
+                .tracking_confirmation
+                .is_none()
+        );
+        assert!(
+            state.tracking_confirmation.saved(&source).is_some(),
+            "status is read-only"
+        );
+        assert!(state.sources[0].tracking_confirmation.is_none());
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[serial]
     fn passive_verification_cannot_confirm_but_active_smoke_can_and_episode_restarts() {
         let root = crate::test_scratch::private_dir("tracking-episode-restart");
         let _support = TestEnvVar::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);

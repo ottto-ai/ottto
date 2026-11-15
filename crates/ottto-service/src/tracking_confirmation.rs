@@ -317,6 +317,8 @@ mod tests {
                     .as_deref(),
                 Some(AFTER)
             );
+            episodes.arm(&source, AFTER.into(), true);
+            assert_eq!(episodes.pending(&source).unwrap().1, AFTER);
         }
     }
 
@@ -369,6 +371,8 @@ mod tests {
         let mut quota_warning = verification();
         quota_warning.verified = false;
         quota_warning.records_seen = 0;
+        episodes.confirm_smoke(&quota_warning, generation, SINCE);
+        quota_warning.verified = true; // identity-only / local-only warning
         episodes.confirm_smoke(&quota_warning, generation, SINCE);
         episodes.confirm_smoke(&verification(), generation, "2026-11-15T09:59:59Z");
         assert!(episodes.saved(&source).unwrap().confirmed_at.is_none());

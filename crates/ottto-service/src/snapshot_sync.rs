@@ -6329,6 +6329,7 @@ fn upload_local_health_projection_with(
 
     let reply = client.upload_local_health_heartbeat(&relay_token, heartbeat)?;
     apply_source_control(&default_support_dir(), &reply);
+    let _ = daemon.record_source_grants(device);
     client.upload_local_health_projection(&relay_token, health)?;
     Ok(())
 }
