@@ -6,7 +6,9 @@ use crate::snapshots::e2_pipeline_scan_fixture::{
     continuation_for_test, damage_tail_for_test, forced_needs_native_for_test, pace_cap_for_test,
 };
 use crate::snapshots::sampled_scan::transition_fixture::upgrade_from_legacy_store;
-use crate::snapshots::sampled_scan::transition_fixture::{money_oracle, observe_consumed, Mode};
+use crate::snapshots::sampled_scan::transition_fixture::{
+    money_oracle, observe_consumed, with_scan_clock, Mode, RouteResult,
+};
 use crate::transcript_acquisition::{capture_sample_reads, FullReason, ReadMode};
 
 use crate::snapshots::e2_pipeline_scan_fixture::twin_diagnostics as diag;
@@ -42,6 +44,7 @@ struct Twin {
     holder: PathBuf,
     twin: PathBuf,
     key: String,
+    now: std::cell::Cell<u64>,
 }
 impl Twin {
     #[track_caller]
@@ -116,6 +119,7 @@ impl Twin {
             holder,
             twin,
             key,
+            now: std::cell::Cell::new(crate::scan_clock::utc_seconds()),
         }
     }
     fn restart(&self) -> E2ScanFixture {
@@ -123,14 +127,17 @@ impl Twin {
         self.disk.begin(&owner, SnapshotSource::ClaudeCode);
         owner
     }
-    fn pages(&self, restart: &E2ScanFixture, tail: Page) -> [Page; 3] {
+    fn pages(&self, cold: &E2ScanFixture, restart: &E2ScanFixture, tail: Page) -> [Page; 3] {
         [
             tail,
-            self.page_as(&E2ScanFixture::capturing_identity(), "cold"),
+            self.page_as(cold, "cold"),
             self.page_as(restart, "restart"),
         ]
     }
     fn force(&self, request: &str) {
+        // Each new append is a later visit, beyond any preceding growth
+        // Full claim, including a claim taken while settling the restart.
+        self.now.set(self.now.get() + 7 * 60 * 60);
         append(&self.holder, &line(ROOT, request, AT, 10));
         input_clock(&self.holder);
     }
@@ -144,13 +151,15 @@ impl Twin {
         // Leave room for the reserved census slot beside the holder hint.
         // With one slot an unchanged census twin displaces the hinted holder;
         // with two the holder runs first and forces the queued twin.
-        self.c.raw(
-            owner,
-            self.prior.clone(),
-            2,
-            true,
-            std::slice::from_ref(&self.holder),
-        )
+        with_scan_clock(self.now.get(), || {
+            self.c.raw(
+                owner,
+                self.prior.clone(),
+                2,
+                true,
+                std::slice::from_ref(&self.holder),
+            )
+        })
     }
     #[track_caller]
     fn assert_read(&self, owner: &E2ScanFixture, label: &'static str, mode: ReadMode, start: u64) {
@@ -168,13 +177,83 @@ impl Twin {
         assert_eq!((read.mode, read.start), (mode, start));
     }
     #[track_caller]
-    fn compare(&self, pages: &mut [Page; 3]) {
-        for (page, label) in pages.iter_mut().zip(["RAM", "cold", "restart"]) {
+    fn settle(
+        &self,
+        owner: &E2ScanFixture,
+        label: &'static str,
+        mut page: Page,
+        cold: Option<&RouteResult>,
+    ) -> Page {
+        let mode = match label {
+            "RAM" => Mode::Ram,
+            "cold" => Mode::ColdFull,
+            "restart" => Mode::DiskRestore,
+            _ => unreachable!(),
+        };
+        for attempt in 0..8 {
             diag::owner(label);
-            page.enrich(&self.c);
-            page.finish();
+            with_scan_clock(self.now.get(), || {
+                page.enrich(&self.c);
+                page.finish();
+            });
+            let route = mixed_route(&page, &e2_progress(), mode);
+            let holder_acquired = {
+                let reads = owner.acquisitions.lock().unwrap();
+                let holder = reads.iter().any(|read| read.path == self.holder);
+                if holder {
+                    assert!(
+                        reads.iter().any(|read| read.path == self.twin),
+                        "twin is on holder's page"
+                    );
+                }
+                holder
+            };
+            if route.snapshots.contains_key(ROOT) {
+                // Every replacement, including intermediate pages, must be
+                // the whole session with the cold account placement.
+                if let Some(cold) = cold {
+                    money_oracle::assert_no_smaller_reemit(ROOT, cold, &route, cold, false);
+                }
+                assert!(holder_acquired, "a body waits until its holder is acquired");
+                return page;
+            }
+            assert!(attempt < 7, "{label} did not settle within eight pages");
+            let prior = with_scan_clock(self.now.get(), || {
+                if label == "cold" {
+                    self.c.reload(&mut page.index)
+                } else {
+                    self.disk
+                        .commit(&page.cache, SnapshotSource::ClaudeCode, &mut page.index)
+                }
+            });
+            // A growth Full claim is paced for six hours, not for a number
+            // of pages. Visit after that interval using the existing clock
+            // seam, as the native continuation fixtures do.
+            self.now.set(self.now.get() + 7 * 60 * 60);
+            page = with_scan_clock(self.now.get(), || {
+                diag::owner(label);
+                self.c
+                    .raw(owner, prior, 2, true, std::slice::from_ref(&self.holder))
+            });
         }
-        compare_claude_uploads(pages);
+        unreachable!()
+    }
+    #[track_caller]
+    fn compare(
+        &self,
+        cold: &E2ScanFixture,
+        restart: &E2ScanFixture,
+        pages: [Page; 3],
+    ) -> [Page; 3] {
+        let [ram_page, cold_page, restart_page] = pages;
+        let cold_page = self.settle(cold, "cold", cold_page, None);
+        let reference = mixed_route(&cold_page, &e2_progress(), Mode::ColdFull);
+        let pages = [
+            self.settle(&self.owner, "RAM", ram_page, Some(&reference)),
+            cold_page,
+            self.settle(restart, "restart", restart_page, Some(&reference)),
+        ];
+        compare_claude_uploads(&pages);
         let routes = [Mode::Ram, Mode::ColdFull, Mode::DiskRestore];
         let routes =
             std::array::from_fn::<_, 3, _>(|i| mixed_route(&pages[i], &e2_progress(), routes[i]));
@@ -207,19 +286,22 @@ impl Twin {
             "account switch plus side call"
         );
         assert_mixed_placement_corruption_detected(&routes[1], &routes[2]);
+        pages
     }
     fn commit(&mut self, mut page: Page) {
         accept_page(&mut page);
         damage_tail_for_test(&page.index, &self.holder.to_string_lossy(), "missing");
-        self.prior = self
-            .disk
-            .commit(&page.cache, SnapshotSource::ClaudeCode, &mut page.index);
+        self.prior = with_scan_clock(self.now.get(), || {
+            self.disk
+                .commit(&page.cache, SnapshotSource::ClaudeCode, &mut page.index)
+        });
     }
 }
 
 /// [money] Unchanged first, then append and a second force, across retained
-/// owners and save/reloaded owners. Exact growth deliberately alternates back
-/// to native on the next force; IdentityIncomplete preserves continuation.
+/// owners and save/reloaded owners. Exact growth requires native verification
+/// on the next force; IdentityIncomplete preserves continuation. A paced
+/// restart may pay that verification while settling the current force.
 #[test]
 fn forced_verified_twin_reuses_certified_tail_and_restarts() {
     if !supported("forced_verified_twin") {
@@ -253,7 +335,7 @@ fn forced_verified_twin_reuses_certified_tail_and_restarts() {
                 let restart = f.restart();
                 let ((tail, consumed), samples) =
                     capture_sample_reads(|| observe_consumed(|| f.page(&f.owner)));
-                let native = round == 2 && !incomplete;
+                let native = forced_needs_native_for_test(&f.prior, &f.twin);
                 let mode = if native {
                     ReadMode::Full(FullReason::StateMissing)
                 } else if round == 1 {
@@ -286,20 +368,23 @@ fn forced_verified_twin_reuses_certified_tail_and_restarts() {
                 assert!(samples
                     .iter()
                     .all(|read| read.requested <= crate::transcript_acquisition::SAMPLE_BYTES));
-                let mut pages = f.pages(&restart, tail);
+                let cold = E2ScanFixture::capturing_identity();
+                let pages = f.pages(&cold, &restart, tail);
                 f.assert_read(&restart, "restart", mode, start);
-                f.compare(&mut pages);
+                let pages = f.compare(&cold, &restart, pages);
                 if round == 0 {
                     let legacy =
                         upgrade_from_legacy_store(&f.prior, &f.c.base.join("upgrade.json"));
                     diag::owner("restart");
-                    let mut upgraded = f.c.raw(
-                        &E2ScanFixture::capturing_identity(),
-                        legacy,
-                        2,
-                        true,
-                        std::slice::from_ref(&f.holder),
-                    );
+                    let mut upgraded = with_scan_clock(f.now.get(), || {
+                        f.c.raw(
+                            &E2ScanFixture::capturing_identity(),
+                            legacy,
+                            2,
+                            true,
+                            std::slice::from_ref(&f.holder),
+                        )
+                    });
                     upgraded.enrich(&f.c);
                     upgraded.finish();
                     money_oracle::assert_equivalent(
@@ -307,16 +392,19 @@ fn forced_verified_twin_reuses_certified_tail_and_restarts() {
                         &mixed_route(&upgraded, &e2_progress(), Mode::Restart),
                     );
                 }
-                let record = pages[2]
+                // The RAM page records the initial forced continuation.
+                // Restart settlement can force the Exact twin again and
+                // verify it natively before this round is committed.
+                let record = pages[0]
                     .index
                     .claude_request_census_for_test()
                     .get(&f.key)
                     .unwrap();
                 assert!(record.is_twin() && !record.can_bind_recomposed_body());
                 assert_eq!(record.unverified_for_test(), round == 1 && !incomplete);
-                assert!(!record.current_for(&pages[2].index.files[&f.key].source_file_fingerprint));
+                assert!(!record.current_for(&pages[0].index.files[&f.key].source_file_fingerprint));
                 assert_eq!(
-                    forced_needs_native_for_test(&pages[2].index, &f.twin),
+                    forced_needs_native_for_test(&pages[0].index, &f.twin),
                     round == 1 && !incomplete
                 );
                 let [_, _, page] = pages;
@@ -326,7 +414,11 @@ fn forced_verified_twin_reuses_certified_tail_and_restarts() {
             diag::owner("restart");
             let restart = f.restart();
             let ((mut quiet, consumed), samples) = capture_sample_reads(|| {
-                observe_consumed(|| f.c.raw(&restart, f.prior.clone(), 100, true, &[]))
+                observe_consumed(|| {
+                    with_scan_clock(f.now.get(), || {
+                        f.c.raw(&restart, f.prior.clone(), 100, true, &[])
+                    })
+                })
             });
             quiet.enrich(&f.c);
             quiet.finish();
@@ -379,38 +471,38 @@ fn forced_verified_twin_stays_on_its_page_without_tail_capacity() {
                 pace_cap_for_test(&f.owner, &f.twin);
                 pace_cap_for_test(&restart, &f.twin);
             }
-            let mut pages = f.pages(&restart, f.page(&f.owner));
+            let cold = E2ScanFixture::capturing_identity();
+            let mut pages = f.pages(&cold, &restart, f.page(&f.owner));
             f.assert_read(&f.owner, "RAM", ReadMode::Full(FullReason::StateMissing), 0);
-            f.assert_read(
-                &restart,
-                "restart",
-                ReadMode::Full(FullReason::StateMissing),
-                0,
-            );
             if arm != "future" {
                 // Depends on the content-session co-scheduling fix landing
                 // first: a pre-acquisition holder deferral must hold the whole
                 // session, even when its pulled twin completes natively.
                 let held_page = &mut pages[2];
-                held_page.enrich(&f.c);
-                held_page.finish();
+                with_scan_clock(f.now.get(), || {
+                    held_page.enrich(&f.c);
+                    held_page.finish();
+                });
                 let held = mixed_route(held_page, &e2_progress(), Mode::DiskRestore);
                 assert!(
                     !held.snapshots.contains_key(ROOT),
                     "the deferred holder holds the session; no partial body publishes"
                 );
-                let prior = f.disk.commit(
-                    &held_page.cache,
-                    SnapshotSource::ClaudeCode,
-                    &mut held_page.index,
-                );
+                let prior = with_scan_clock(f.now.get(), || {
+                    f.disk.commit(
+                        &held_page.cache,
+                        SnapshotSource::ClaudeCode,
+                        &mut held_page.index,
+                    )
+                });
                 restart.set_audit_slots(256);
                 diag::round("retry");
                 diag::owner("restart");
-                pages[2] =
-                    f.c.raw(&restart, prior, 2, true, std::slice::from_ref(&f.holder));
+                pages[2] = with_scan_clock(f.now.get(), || {
+                    f.c.raw(&restart, prior, 2, true, std::slice::from_ref(&f.holder))
+                });
             }
-            f.compare(&mut pages);
+            let pages = f.compare(&cold, &restart, pages);
             assert!(!pages[2].index.files[&f.key]
                 .scan_identity_version
                 .as_deref()
@@ -437,7 +529,8 @@ fn forced_verified_twin_falls_back_without_valid_head() {
             .commit(&f.owner.cache, SnapshotSource::ClaudeCode, &mut f.prior);
         f.force("holder-later");
         let restart = f.restart();
-        let mut pages = f.pages(&restart, f.page(&f.owner));
+        let cold = E2ScanFixture::capturing_identity();
+        let pages = f.pages(&cold, &restart, f.page(&f.owner));
         f.assert_read(&f.owner, "RAM", ReadMode::Full(FullReason::StateMissing), 0);
         f.assert_read(
             &restart,
@@ -445,6 +538,6 @@ fn forced_verified_twin_falls_back_without_valid_head() {
             ReadMode::Full(FullReason::StateMissing),
             0,
         );
-        f.compare(&mut pages);
+        f.compare(&cold, &restart, pages);
     });
 }
