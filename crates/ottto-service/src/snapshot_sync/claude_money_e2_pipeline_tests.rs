@@ -666,6 +666,14 @@ fn five_root_sweep_paged(multi_root: bool, limit: usize) {
         accepted.set_account_source_enabled(true);
         for sweep in 0..2 {
             if sweep == 1 {
+                // A packed-page comparison needs every family selected on
+                // both sweeps. Stable local ownership no longer selects the
+                // unchanged copies merely because their holder committed.
+                if limit == 5 {
+                    for session in [COPY, RESUMED, LOGINS, MALFORMED] {
+                        append(&c.root.join(format!("{session}.jsonl")), "\n");
+                    }
+                }
                 append(&a, &line(ROOT, "later", "2026-08-02T07:08:00Z", 6));
                 c.evidence_for(
                     ROOT,
@@ -2717,31 +2725,6 @@ fn body<'a>(page: &'a Page, session: &str) -> Option<&'a SnapshotItem> {
         .iter()
         .find(|s| s.source_session_id == session)
 }
-/// The session's items on the page are withheld: none is a literal body,
-/// and the page quarantines them (delayed, never settled, never counted).
-fn assert_withheld(page: &Page, session: &str, why: &str) {
-    let items = page
-        .scan
-        .snapshots
-        .iter()
-        .filter(|s| s.source_session_id == session)
-        .collect::<Vec<_>>();
-    assert!(!items.is_empty(), "{why}: the held items stay on the page");
-    assert!(
-        items
-            .iter()
-            .all(|s| !crate::snapshots::claude_request_money::is_request_owned_literal(s)),
-        "{why}: no body publishes"
-    );
-    let held = page
-        .disposition
-        .quarantined_fingerprints(&page.scan.snapshots);
-    assert!(
-        items.iter().all(|s| held.contains(&s.snapshot_fingerprint)),
-        "{why}: the session is held"
-    );
-}
-
 /// An earlier twin rewritten IN PLACE
 /// (same inode, size kept) no longer holds H. Its stale identity cannot
 /// remove H from the later twin: H counts once, from the twin.
@@ -3386,7 +3369,16 @@ fn copy_waits_for_queued_holder(stale_record: bool) {
                 copy_body = Some((found.request_count, found.removed_request_count));
             }
             prior = settle(&c, &prior, page, &mut progress);
-            if copy_body.is_some() && original_requests.is_some() {
+            // The holder's save marks a later correction; its own page is
+            // not evidence that the copy has consumed that mark yet.
+            if original_requests.is_some()
+                && copy_body
+                    == Some(if stale_record {
+                        (1, Some(0))
+                    } else {
+                        (0, Some(1))
+                    })
+            {
                 break;
             }
         }

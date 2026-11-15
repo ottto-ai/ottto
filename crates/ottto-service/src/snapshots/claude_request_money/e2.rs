@@ -2123,6 +2123,7 @@ struct CopyOwner {
 }
 impl CopyOwnership {
     pub(in crate::snapshots) fn capture(index: &ScanIndex) -> Self {
+        let live = indexed_main_files(index);
         Self(
             index
                 .files
@@ -2135,7 +2136,7 @@ impl CopyOwnership {
                         CopyOwner {
                             accepted: accepted_origin(index, key),
                             owned: origin_owned(index, &[], key, true),
-                            group_owned: index_group_owned(index, key),
+                            group_owned: index_group_owned(index, &live, key),
                             order: committed_holder_order(
                                 &index.claude_money_birth_store,
                                 member.root,
@@ -2167,7 +2168,7 @@ impl CopyOwnership {
             .filter(|holder| {
                 !live
                     .get(holder)
-                    .is_some_and(|key| index_group_owned(next, key))
+                    .is_some_and(|key| index_group_owned(next, &live, key))
                     && !accepted_absent.contains(holder)
             })
             .copied()
@@ -2193,7 +2194,7 @@ impl CopyOwnership {
             let census = next.claude_request_census.get(key);
             let groups = next.claude_copy_removals.get(location);
             let changed = old.is_some_and(|o| o.owned) != origin_owned(next, &[], key, true)
-                || old.is_some_and(|o| o.group_owned) != index_group_owned(next, key)
+                || old.is_some_and(|o| o.group_owned) != index_group_owned(next, &live, key)
                 || old.map_or(&[][..], |o| o.groups.as_slice()) != groups
                 || old.and_then(|o| o.census.as_ref()).is_some_and(|record| {
                     record
@@ -2404,8 +2405,20 @@ fn committed_holder_order(
         .map(|birth| (birth, location_key(key)))
 }
 
-fn index_group_owned(index: &ScanIndex, key: &str) -> bool {
-    index.claude_family_listed(key) || origin_owned(index, &[], key, true)
+fn index_group_owned(index: &ScanIndex, live: &BTreeMap<LocationKey, &str>, key: &str) -> bool {
+    index.claude_family_listed(key)
+        || origin_owned(index, &[], key, true)
+        // A summed session body can be carried by another physical location.
+        // Its earlier counting location still owns the stored removal.
+        || claude_index_path_member_ref(Path::new(key)).is_some_and(|member| {
+            index
+                .claude_money_birth_store
+                .observations(member.root)
+                .any(|(location, _)| {
+                    live.get(&location)
+                        .is_some_and(|other| origin_owned(index, &[], other, true))
+                })
+        })
 }
 
 fn saved_removal_applies(
@@ -2421,7 +2434,7 @@ fn saved_removal_applies(
         .any(|(holder, hashes)| {
             hashes.binary_search(&hash).is_ok()
                 && live.get(holder).map_or(true, |&key| {
-                    index_group_owned(index, key)
+                    index_group_owned(index, live, key)
                         && stored_holder_answer(index, Some(key), hash) != Some(false)
                 })
         })
@@ -3113,7 +3126,11 @@ fn decide_holders(
                         continue;
                     }
                     if key.is_some_and(|key| {
-                        !index_group_owned(index, key) && !origin_owned(index, page, key, true)
+                        !index_group_owned(
+                            index,
+                            live.get_or_init(|| indexed_main_files(index)),
+                            key,
+                        ) && !origin_owned(index, page, key, true)
                     }) {
                         continue;
                     }
@@ -3363,8 +3380,9 @@ fn stored_groups<'a>(
             .get(holder)
             .copied();
         let kept = hashes.iter().filter(|&&hash| {
-            key.map_or(true, |key| index_group_owned(index, key))
-                && stored_holder_answer(index, key, hash) != Some(false)
+            key.map_or(true, |key| {
+                index_group_owned(index, live.get_or_init(|| indexed_main_files(index)), key)
+            }) && stored_holder_answer(index, key, hash) != Some(false)
         });
         let into = groups.entry(*holder).or_default();
         for &hash in kept {

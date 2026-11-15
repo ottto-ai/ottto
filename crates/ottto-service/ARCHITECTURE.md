@@ -117,8 +117,11 @@ file-system hint / periodic listing → select file → read new bytes from save
   take a long time for a very large folder. The SQLite save baseline retains
   compact ownership facts with shared census hashes; legacy saves reuse their
   existing CAS image. Neither path hydrates another full index for this check.
-  Encoding and rollback remain compatible:
-  earlier binaries read the mark as a short prefix wait.
+  The persisted byte format remains compatible with releases 0.1.239–0.1.251,
+  but rollback is unsafe once a copy is decided under local ownership. An older
+  binary can delete a never-accepted holder while retaining its dependent
+  removals; re-upgrading cannot reconstruct the ownership history needed to
+  invalidate them. Do not roll back below this release; fix forward.
   Source and copy uploads remain independent. Copy-first discovery and either
   entity ACK order can leave a temporary overlap or gap until the required bodies
   are accepted; offline or refused work has no delivery-time bound.

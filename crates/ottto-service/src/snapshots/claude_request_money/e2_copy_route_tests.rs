@@ -147,10 +147,11 @@ fn unscanned_files_do_not_hold_the_copy_prefix() {
 /// not become new read obligations when their holder commits or is ACKed.
 #[test]
 fn save_marks_only_disagreeing_copy_decisions() {
-    for (removed, disclosed, marked) in [
-        (true, false, false),
-        (false, true, true),
-        (false, false, false),
+    for (removed, disclosed, marked, other_carrier) in [
+        (true, false, false, false),
+        (false, true, true, false),
+        (false, false, false, false),
+        (true, false, false, true),
     ] {
         let dir = scratch();
         let path = copy_at(&dir);
@@ -190,6 +191,40 @@ fn save_marks_only_disagreeing_copy_decisions() {
                     BTreeSet::from([claude_request_hash("copy-a")]),
                 )]),
             );
+        }
+        if other_carrier {
+            // Discovery order can put the summed body on a later location.
+            // The earlier location still counts this id for its session.
+            let carrier = local_index_key(&dir.join("other").join(format!("{HOLDER}.jsonl")));
+            next.files
+                .insert(carrier.clone(), next.files[&holder].clone());
+            next.file_snapshot_fingerprints.insert(
+                carrier.clone(),
+                next.file_snapshot_fingerprints[&holder].clone(),
+            );
+            next.file_snapshot_fingerprints
+                .insert(holder.clone(), BTreeSet::new());
+            next.claude_money_birth_store.record_observation(
+                HOLDER,
+                &carrier,
+                t0() + 200_000_000_000,
+            );
+            next.claude_request_census_mut_for_test().insert_for_test(
+                &carrier,
+                ClaudeRequestCensusRecord::synthetic_for_test(
+                    &"a".repeat(64),
+                    1,
+                    ClaudeRequestCensusShape::Exact,
+                    vec![claude_request_hash("copy-a")],
+                ),
+            );
+            assert!(!origin_owned(&next, &[], &holder, true));
+            assert!(saved_removal_applies(
+                &next,
+                &indexed_main_files(&next),
+                &key,
+                claude_request_hash("copy-a"),
+            ));
         }
         reconcile_copy_ownership(&ScanIndex::default(), &mut next);
         assert_eq!(next.claude_copy_removals.pending(location), marked);

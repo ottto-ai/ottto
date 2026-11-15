@@ -158,6 +158,9 @@ fn next_body_page(
         if body(&page, session).is_some() {
             return page;
         }
+        // A visited unchanged member can still have a pre-finalize body.
+        // Apply the normal no-op suppression before calling it an empty slot.
+        page.finish();
         assert!(
             page.scan.snapshots.is_empty(),
             "a deferred census slot sends nothing"
@@ -406,6 +409,60 @@ fn copy_prefix_routes(arm: Settled) {
     );
 }
 
+/// Complete a real native account-held page, including its CONTENT memo.
+/// Keep the request ids, but rewrite the last response without its model:
+/// a Tail append would inherit the preceding model instead.
+fn native_account_held_page(
+    c: &Corpus,
+    scanner: &E2ScanFixture,
+    prior: ScanIndex,
+    session: &str,
+) -> (Page, LocalHoldSettlement) {
+    crate::snapshots::e2_pipeline_scan_fixture::write_exclusions(&c.support, &[session]);
+    let path = c.root.join(file(session));
+    let mut rows = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    rows.last_mut().unwrap()["message"]
+        .as_object_mut()
+        .unwrap()
+        .remove("model");
+    std::fs::write(
+        &path,
+        rows.iter()
+            .map(|row| row.to_string() + "\n")
+            .collect::<String>(),
+    )
+    .unwrap();
+    input_clock(&path);
+    let mut saved = serde_json::to_value(&prior).unwrap();
+    let owner = crate::context_footprint::sha256_hex(&[
+        "session_owner:v1",
+        "e2-synthetic-machine",
+        session,
+    ]);
+    saved["session_account_bindings"][owner] =
+        json!({"account_identifier_hash":"a".repeat(64), "workspace_identifier_hash":null});
+    let mut bound: ScanIndex = serde_json::from_value(saved).unwrap();
+    crate::snapshots::e2_pipeline_scan_fixture::onto_route_for_test(&mut bound, &prior);
+    let mut page = c.raw(scanner, bound, 100, true, &[]);
+    page.enrich(c);
+    assert!(crate::snapshots::e2_pipeline_scan_fixture::explicitly_held(
+        &page.disposition,
+        session
+    ));
+    let holds = page.finish();
+    assert_eq!(
+        page.index.claude_account_deferred_hold_count(),
+        1,
+        "the unresolved native model must really hold the session"
+    );
+    assert!(body(&page, session).is_none(), "the held body cannot POST");
+    (page, holds)
+}
+
 /// [money] A locally held holder supplies no counted body. The copy sends
 /// its prefix once and remains quiet across restarts while the hold lasts.
 #[test]
@@ -420,8 +477,18 @@ fn never_delivered_holder_is_held_and_copy_counts_once() {
         let disk = Disk::new(&c);
         // Committed, never delivered: no receipt.
         let (scanner, mut prior) = warm_claude_undelivered(&c, &disk);
-        let key = holder.to_string_lossy().into_owned();
-        crate::snapshots::e2_pipeline_scan_fixture::hold_claude_account_for_test(&mut prior, &key);
+        disk.begin(&scanner, SnapshotSource::ClaudeCode);
+        let (mut setup, _) = native_account_held_page(&c, &scanner, prior, ROOT);
+        assert!(upload_context_owed_for_test(&setup.index, &holder));
+        let mut setup_progress = e2_progress();
+        upload(&setup.scan.snapshots, &mut setup_progress, |_| {
+            panic!("the never-delivered holder must not POST during setup")
+        })
+        .0
+        .unwrap();
+        prior = disk.commit(&setup.cache, SnapshotSource::ClaudeCode, &mut setup.index);
+        assert_eq!(prior.claude_account_deferred_hold_count(), 1);
+        assert!(upload_context_owed_for_test(&prior, &holder));
         let path = c.write_at(
             &file(COPY),
             &resumed(COPY, &[A, B, C]),
@@ -1052,10 +1119,10 @@ fn all_copy_body_replaces_previously_accepted_requests_with_zero() {
         let first = ready(&c, &scanner, old.clone(), 1, false);
         assert_eq!(body(&first, COPY).unwrap().request_count, 2);
         let mut prior = settle(&c, &old, first, &mut progress);
-        let holder = c.root(ROOT, &resumed(ROOT, &[A, B]));
-        let mut source = c.raw(&scanner, prior.clone(), 1, false, &[holder]);
-        source.enrich(&c);
-        prior = settle(&c, &prior, source, &mut progress);
+        c.root(ROOT, &resumed(ROOT, &[A, B]));
+        let source = next_body_page(&c, prior, ROOT, &mut progress);
+        let committed = source.committed.clone();
+        prior = settle(&c, &committed, source, &mut progress);
         let mut correction = next_body_page(&c, prior.clone(), COPY, &mut progress);
         correction.finish();
         let zero = body(&correction, COPY).expect("a zero replacement must reach the server");
@@ -1325,7 +1392,13 @@ fn named_parent_with_retired_census_through_pipeline() {
         assert_eq!(copy.removed_usage.as_ref().unwrap().input_tokens, 20);
         let prior = acknowledge_ordered(&c, branch, &mut progress, &mut ledger, &[COPY], &[(2, 0)]);
         std::fs::remove_file(parent).unwrap();
-        append(&c.root.join(file(COPY)), "\n");
+        // Change the removed usage, so finalization publishes a new zero
+        // body rather than suppressing a semantic no-op newline edit.
+        std::fs::write(
+            c.root.join(file(COPY)),
+            fork_ref(COPY, ROOT) + &line_by(COPY, A.0, A.1, 20, A.2) + &resumed(COPY, &[B]),
+        )
+        .unwrap();
         let mut reread = c.raw(&E2ScanFixture::capturing_identity(), prior, 100, false, &[]);
         reread.enrich(&c);
         assert_eq!(
@@ -1368,38 +1441,18 @@ fn held_copy_mark_reads_once_over_ten_pipeline_passes() {
             &[ROOT, COPY],
             &[(2, 0), (2, 0)],
         );
-        // Ordinary account-held input, as in the native pipeline hold fixture:
-        // an accepted owner binding and a new response without a model.
-        crate::snapshots::e2_pipeline_scan_fixture::write_exclusions(&c.support, &[COPY]);
-        // Rewrite the native input, as the existing account-hold fixture does.
-        // A Tail continuation inherits its earlier model and cannot model a
-        // missing-model account hold merely by appending an unmodeled line.
-        let mut unresolved: serde_json::Value =
-            serde_json::from_str(&line(COPY, "unresolved", "2026-08-02T07:04:00Z", 10)).unwrap();
-        unresolved["message"]
-            .as_object_mut()
-            .unwrap()
-            .remove("model");
-        std::fs::write(&path, unresolved.to_string() + "\n").unwrap();
-        let mut saved = serde_json::to_value(&prior).unwrap();
-        let owner = crate::context_footprint::sha256_hex(&[
-            "session_owner:v1",
-            "e2-synthetic-machine",
-            COPY,
-        ]);
-        saved["session_account_bindings"][owner] =
-            json!({"account_identifier_hash":"a".repeat(64), "workspace_identifier_hash":null});
-        let baseline = prior;
-        prior = serde_json::from_value(saved).unwrap();
-        crate::snapshots::e2_pipeline_scan_fixture::onto_route_for_test(&mut prior, &baseline);
-        let mut held = c.raw(&scanner, prior.clone(), 100, true, &[]);
-        held.enrich(&c);
-        assert_eq!(
-            held.index.claude_account_deferred_hold_count(),
-            1,
-            "the unresolved native model must really hold B"
+        let (held, holds) = native_account_held_page(&c, &scanner, prior, COPY);
+        assert!(
+            held.scan.snapshots.is_empty(),
+            "the setup has no uploadable body"
         );
-        prior = settle_captured_holds(&c, &held.committed.clone(), held, &mut progress);
+        let mut selected =
+            settle_completed_upload(held.index, &held.committed, &progress, &holds).index;
+        settle_index_after_upload(&mut selected, &held.committed, &progress);
+        prior = crate::snapshots::e2_pipeline_scan_fixture::save_reload_for_test(
+            &mut selected,
+            &c.base.join("scan-index.json"),
+        );
         let key = path.to_string_lossy().into_owned();
         // Only debt is injected; every read/hold/clear decision below is real.
         let location = crate::snapshots::claude_money_birth_store::location_key(&key);
