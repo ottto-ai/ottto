@@ -127,7 +127,7 @@ use ottto_protocol::{
     SourceStateOwner, SourceVerificationResult, SourceVerificationStatus, StableMessage,
     StableProblemCode, DIAGNOSTICS_RETENTION_DISCLOSURE, PROTOCOL_VERSION,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -1284,6 +1284,10 @@ impl LocalDaemon {
                 "current": true
             }),
         });
+        retain_latest_local_health_events(&mut state.local_health_events);
+        state
+            .command_ledger
+            .retain(|command| command.action_id != action_id);
         state.command_ledger.push(LocalHealthCommandResultV1 {
             action_id,
             idempotency_key: format!("verify:{machine_id}:{source_slug}"),
@@ -2344,9 +2348,11 @@ fn observe_scan_index_health_changes(state: &mut DaemonState) {
             if prior == *transitions {
                 continue;
             }
-            for transition in prior.saturating_add(1)..=*transitions {
-                // Real set/clear transitions alternate. Preserve BOTH when a good
-                // load follows a refusal before a client asks for status.
+            // Transitions alternate: only the newest of each polarity can
+            // survive retention. Skip older materializations, but advance the
+            // captured high-water mark below even after a long polling gap.
+            let first = prior.saturating_add(1).max(transitions.saturating_sub(1));
+            for transition in first..=*transitions {
                 let blocked = since.is_some() ^ ((*transitions - transition) % 2 != 0);
                 push_local_health_event(
                     state,
@@ -2512,6 +2518,36 @@ fn push_local_health_event(
         action_id: None,
         payload,
     });
+    retain_latest_local_health_events(&mut state.local_health_events);
+}
+
+/// Keep family heads in their original sequence order. Scan-index diagnostics
+/// retain both set and clear witnesses for each source/reason pair.
+fn retain_latest_local_health_events(events: &mut Vec<LocalHealthEventV1>) {
+    let mut latest = BTreeMap::new();
+    for event in events.iter() {
+        let family = match event.event_type.as_str() {
+            "LocalHealthUploadSucceeded"
+            | "LocalHealthUploadFailed"
+            | "LocalHealthUploadRejectionCleared" => "Upload",
+            "SetupRunReadRejected" | "SetupRunReadRecovered" => "SetupRead",
+            "SnapshotSyncStalled" | "SnapshotSyncRecovered" => "SnapshotSync",
+            "VerifyPassed" | "VerifyFailed" => "Verify",
+            other => other,
+        };
+        let key = (
+            family,
+            (family == "Verify").then_some(event.source_id.as_deref()),
+            (family == "ScanIndexCollectionChanged").then_some((
+                event.payload["source"].as_str(),
+                event.payload["reason"].as_str(),
+                event.payload["blocked_sources"].as_u64(),
+            )),
+        );
+        latest.insert(key, event.sequence);
+    }
+    let sequences = latest.into_values().collect::<BTreeSet<_>>();
+    events.retain(|event| sequences.contains(&event.sequence));
 }
 
 /// Re-project canonical health over a status that already carries a runtime
@@ -2572,8 +2608,6 @@ fn refresh_canonical_local_health_with_started_at(
             "service_owner": status.service_owner,
         }),
     };
-    let mut events = status.local_health_events.clone();
-    events.push(runtime_event.clone());
     let runtime = runtime_identity_for_status(status, started_at, &observed_at);
     let heartbeat = runtime_heartbeat_for_status(status, &runtime, projection_revision);
     let account = local_health_account_for_status(status);
@@ -2618,7 +2652,14 @@ fn refresh_canonical_local_health_with_started_at(
     );
     keep_blocker_first_seen(&mut blockers, &observed_at, first_seen);
     let overall = local_health_overall(&blockers, &runtime, &account, &sources);
-    let evidence = events
+    // All semantic readers above consume the captured real events before
+    // replacing the response-local observation on repeated reprojection.
+    status
+        .local_health_events
+        .retain(|event| event.event_type != "MachineRuntimeObserved");
+    status.local_health_events.push(runtime_event);
+    let evidence = status
+        .local_health_events
         .iter()
         .map(|event| LocalHealthEvidenceRefV1 {
             event_id: event.event_id.clone(),
@@ -2630,7 +2671,6 @@ fn refresh_canonical_local_health_with_started_at(
         .collect::<Vec<_>>();
 
     status.runtime_heartbeat = Some(heartbeat);
-    status.local_health_events = events;
     status.canonical_health = Some(LocalMachineHealthV1 {
         schema_version: 1,
         schema_version_name: "local_machine_health.v1".to_string(),
@@ -2661,6 +2701,9 @@ fn refresh_canonical_local_health_with_started_at(
 }
 
 fn next_local_health_sequence(state: &DaemonState) -> u64 {
+    // Both append paths prune only superseded keys. The just-appended event
+    // is always newest for its key, so the global maximum is always retained.
+    // Nothing else clears these lists; max(retained) never goes backwards.
     state
         .local_health_events
         .iter()
@@ -7123,7 +7166,7 @@ mod tests {
             .record_setup_run_read_accepted(&started_while_rejected)
             .expect("late success from the earlier rejection");
         assert_eq!(setup_run_state(&daemon), LocalSetupRunState::Rejected);
-        assert_eq!(recoveries(&daemon), 1);
+        assert_eq!(recoveries(&daemon), 0);
 
         // A different terminal answer recorded after a read started is also
         // newer than that read.
@@ -7135,7 +7178,7 @@ mod tests {
             .record_setup_run_read_accepted(&before_device_rejection)
             .expect("late success before the device rejection");
         assert_eq!(setup_run_state(&daemon), LocalSetupRunState::Unknown);
-        assert_eq!(recoveries(&daemon), 1);
+        assert_eq!(recoveries(&daemon), 0);
 
         daemon
             .record_setup_run_read_accepted(&read_start(&daemon))
@@ -7153,7 +7196,160 @@ mod tests {
         assert!(!recovered.blockers.iter().any(|blocker| {
             blocker.code == "setup_run_rejected" || blocker.code == "device_credential_rejected"
         }));
-        assert_eq!(recoveries(&daemon), 2);
+        assert_eq!(recoveries(&daemon), 1);
+    }
+
+    #[test]
+    fn local_health_retention_preserves_heads_and_sequences_through_long_churn() {
+        let run = read_binding("retention_run");
+        let daemon = daemon()
+            .with_account(account("fixture_user", "fixture@example.invalid"))
+            .with_connection(Some(run.clone()));
+        let mut max_issued = 0;
+        let mut track = |state: &DaemonState| {
+            let sequence = state.local_health_events.last().unwrap().sequence;
+            assert!(sequence > max_issued);
+            max_issued = sequence;
+        };
+        let apps = [SourceKind::ClaudeCode, SourceKind::Codex, SourceKind::Pi];
+        for cycle in 0..128 {
+            daemon.record_local_health_upload_succeeded().unwrap();
+            track(&daemon.state().unwrap());
+            daemon
+                .record_setup_run_read_rejected(&run, TerminalRefreshRejection::SetupRunEnded)
+                .unwrap();
+            track(&daemon.state().unwrap());
+            daemon
+                .record_setup_run_read_accepted(&read_start(&daemon))
+                .unwrap();
+            track(&daemon.state().unwrap());
+            for app in &apps {
+                let mut result = if cycle % 2 == 0 {
+                    verified_codex("2026-05-05T10:20:00Z")
+                } else {
+                    failed_codex_reconnect()
+                };
+                result.source = app.clone();
+                daemon.record_verification_result(&result).unwrap();
+                track(&daemon.state().unwrap());
+            }
+            let mut state = daemon.state().unwrap();
+            for source in ["claude_code", "codex", "pi"] {
+                for reason in snapshots::scan_index_health::REASONS {
+                    for blocked in [1, 0] {
+                        push_local_health_event(
+                            &mut state,
+                            "ScanIndexCollectionChanged",
+                            "scan_index_collection_changed",
+                            LocalHealthAuthority::Runtime,
+                            serde_json::json!({"source": source, "reason": reason.code(),
+                                "blocked_sources": blocked, "transitions": cycle * 2 + 2 - blocked}),
+                        );
+                        track(&state);
+                    }
+                }
+            }
+            assert!(state.local_health_events.len() <= 31);
+            assert_eq!(state.command_ledger.len(), 3);
+            assert!(state
+                .local_health_events
+                .windows(2)
+                .all(|pair| pair[0].sequence < pair[1].sequence));
+        }
+
+        daemon
+            .record_verification_result(&failed_codex_reconnect())
+            .unwrap();
+        track(&daemon.state().unwrap());
+        // An earlier rejection was evicted by recovery. Its successful read
+        // cannot clear a newer rejection, even after unrelated keys churn.
+        daemon
+            .record_setup_run_read_rejected(&run, TerminalRefreshRejection::SetupRunEnded)
+            .unwrap();
+        track(&daemon.state().unwrap());
+        let stale = read_start(&daemon);
+        daemon
+            .record_setup_run_read_accepted(&read_start(&daemon))
+            .unwrap();
+        track(&daemon.state().unwrap());
+        daemon
+            .record_setup_run_read_rejected(&run, TerminalRefreshRejection::SetupRunEnded)
+            .unwrap();
+        track(&daemon.state().unwrap());
+        daemon
+            .record_local_health_upload_failed(LocalHealthUploadFailureKind::AuthRejected)
+            .unwrap();
+        track(&daemon.state().unwrap());
+        for _ in 0..256 {
+            daemon.record_snapshot_sync_stalled(5, None).unwrap();
+            track(&daemon.state().unwrap());
+            daemon.record_snapshot_sync_recovered().unwrap();
+            track(&daemon.state().unwrap());
+        }
+        daemon.record_setup_run_read_accepted(&stale).unwrap();
+        let mut captured = {
+            let mut state = daemon.state().unwrap();
+            assert!(latest_setup_run_read_rejection(&state.local_health_events).is_some());
+            assert!(matches!(
+                latest_local_health_upload_in(&state.local_health_events),
+                Some(LatestLocalHealthUpload::AuthRejected { .. })
+            ));
+            for command in &state.command_ledger {
+                let event = state
+                    .local_health_events
+                    .iter()
+                    .find(|event| event.action_id.as_ref() == Some(&command.action_id))
+                    .unwrap();
+                assert_eq!(event.sequence, command.completed_projection_revision);
+                assert_eq!(event.event_type, "VerifyFailed");
+                assert_eq!(command.status, LocalHealthCommandStatus::Failed);
+            }
+            assert_eq!(
+                state
+                    .command_ledger
+                    .iter()
+                    .map(|command| command.action_id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["verify_claude_code", "verify_pi", "verify_codex"]
+            );
+            status_from_state_with_relay_finding(&mut state, None)
+        };
+        let captured_len = captured.local_health_events.len();
+        for _ in 0..128 {
+            refresh_canonical_local_health(&mut captured);
+            assert_eq!(captured.local_health_events.len(), captured_len);
+            assert_eq!(
+                captured.canonical_health.as_ref().unwrap().evidence.len(),
+                captured_len
+            );
+            assert_eq!(
+                captured
+                    .local_health_events
+                    .iter()
+                    .filter(|event| event.event_type == "MachineRuntimeObserved")
+                    .count(),
+                1
+            );
+        }
+        daemon
+            .record_setup_run_read_accepted(&read_start(&daemon))
+            .unwrap();
+        track(&daemon.state().unwrap());
+        daemon.record_local_health_upload_succeeded().unwrap();
+        track(&daemon.state().unwrap());
+        let state = daemon.state().unwrap();
+        assert!(latest_setup_run_read_rejection(&state.local_health_events).is_none());
+        assert!(matches!(
+            latest_local_health_upload_in(&state.local_health_events),
+            Some(LatestLocalHealthUpload::Succeeded)
+        ));
+        assert!(state
+            .local_health_events
+            .iter()
+            .all(|event| event.event_type != "MachineRuntimeObserved"));
+        // Track every real append through churn and pruning, including both
+        // producers: the next allocation exceeds every sequence ever issued.
+        assert!(next_local_health_sequence(&state) > max_issued);
     }
 
     #[test]

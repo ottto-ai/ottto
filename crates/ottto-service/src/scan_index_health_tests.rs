@@ -263,7 +263,9 @@ fn unavailable_shards_project_source_health_alarm_once_and_clear_after_restorati
         std::fs::create_dir(&shards).unwrap();
         std::fs::set_permissions(&shards, std::fs::Permissions::from_mode(0o700)).unwrap();
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../tests/fixtures/scan_index/real-shaped-v1.json")).unwrap();
+            "../tests/fixtures/scan_index/real-shaped-v1.json"
+        ))
+        .unwrap();
         for (name, text) in fixture["payloads"].as_object().unwrap() {
             let path = shards.join(name);
             std::fs::write(&path, text.as_str().unwrap()).unwrap();
@@ -274,10 +276,15 @@ fn unavailable_shards_project_source_health_alarm_once_and_clear_after_restorati
         let source = SnapshotSource::ClaudeCode;
         let load = || ScanIndex::load_for_snapshot_source_with_origin(&root, source, &scratch);
         assert!(load().unwrap().0.persistence_available());
-        let manifest: serde_json::Value = serde_json::from_str(fixture["root"].as_str().unwrap()).unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_str(fixture["root"].as_str().unwrap()).unwrap();
         let descriptor = &manifest["objects"][map + 1];
-        let path = shards.join(format!("{}-{:02x}-{}.json", ["account", "usage", "census"][map],
-            descriptor["slot"]["bucket"].as_u64().unwrap(), descriptor["digest"].as_str().unwrap()));
+        let path = shards.join(format!(
+            "{}-{:02x}-{}.json",
+            ["account", "usage", "census"][map],
+            descriptor["slot"]["bucket"].as_u64().unwrap(),
+            descriptor["digest"].as_str().unwrap()
+        ));
         let bytes = std::fs::read(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
         let daemon = daemon().with_account(account("fixture_user", "fixture@example.invalid"));
@@ -289,19 +296,35 @@ fn unavailable_shards_project_source_health_alarm_once_and_clear_after_restorati
             assert!(!load().unwrap().0.persistence_available());
         });
         assert_eq!(health::shard_transitions(source), before + 1);
-        let alarms = records.iter().filter(|r| r["counts"]["index_shard_unavailable_alarm"] == 1).collect::<Vec<_>>();
+        let alarms = records
+            .iter()
+            .filter(|r| r["counts"]["index_shard_unavailable_alarm"] == 1)
+            .collect::<Vec<_>>();
         assert_eq!(alarms.len(), 1);
         assert_eq!(alarms[0]["counts"]["unavailable_maps"], 1);
         assert_eq!(alarms[0]["source"], "claude_code");
-        let counters = records.iter().filter(|r| r["counts"].get("index_shard_unavailable").is_some()).count();
-        assert_eq!(counters, 2, "per-load map/cause counters continue after the first alarm");
+        let counters = records
+            .iter()
+            .filter(|r| r["counts"].get("index_shard_unavailable").is_some())
+            .count();
+        assert_eq!(
+            counters, 2,
+            "per-load map/cause counters continue after the first alarm"
+        );
         let status = daemon.status(TOKEN).unwrap();
         let mut captured = status.clone();
         let projection = status.canonical_health.unwrap();
         assert_eq!(projection.overall.state, LocalHealthOverallState::Degraded);
-        assert!(projection.sources.iter().filter(|s| s.app != SourceKind::ClaudeCode)
+        assert!(projection
+            .sources
+            .iter()
+            .filter(|s| s.app != SourceKind::ClaudeCode)
             .all(|s| s.blocking_reason.as_deref() != Some(health::SHARD_CODE)));
-        let row = projection.sources.iter().find(|s| s.app == SourceKind::ClaudeCode).unwrap();
+        let row = projection
+            .sources
+            .iter()
+            .find(|s| s.app == SourceKind::ClaudeCode)
+            .unwrap();
         assert_eq!(row.state, LocalHealthSourceState::Unknown);
         assert_eq!(row.blocking_reason.as_deref(), Some(health::SHARD_CODE));
         assert_eq!(row.next_action.as_deref(), Some("contact_support"));
@@ -312,32 +335,61 @@ fn unavailable_shards_project_source_health_alarm_once_and_clear_after_restorati
             snapshots::arm_scan_index_rebuild_manual_override(source, std::time::SystemTime::now()),
             snapshots::ScanIndexRebuildOverride::NotPaused
         ));
-        let blocker = projection.blockers.iter().find(|b| b.code == health::SHARD_CODE).unwrap();
+        let blocker = projection
+            .blockers
+            .iter()
+            .find(|b| b.code == health::SHARD_CODE)
+            .unwrap();
         assert_eq!(blocker.source, "claude_code");
         assert_eq!(blocker.severity, LocalHealthSeverity::Warning);
         assert_eq!(blocker.clear_condition, health::SHARD_DETAIL);
         let repeated = daemon.status(TOKEN).unwrap();
-        assert_eq!(repeated.local_health_events.len(), status.local_health_events.len());
+        assert_eq!(
+            repeated.local_health_events.len(),
+            status.local_health_events.len()
+        );
         for event in &repeated.local_health_events {
             if event.payload["reason"] == health::SHARD_CODE {
                 assert_eq!(event.payload.as_object().unwrap().len(), 4);
                 assert!(event.source_id.is_none());
                 let payload = event.payload.to_string();
-                for forbidden in ["fixture_user", "fixture@example.invalid", "scan-index", "digest", "namespace"] {
+                for forbidden in [
+                    "fixture_user",
+                    "fixture@example.invalid",
+                    "scan-index",
+                    "digest",
+                    "namespace",
+                ] {
                     assert!(!payload.contains(forbidden));
                 }
             }
         }
         std::fs::write(&path, bytes).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let (_, records) = crate::local_resource_diagnostics::capture(|| assert!(load().unwrap().0.persistence_available()));
-        assert!(records.iter().all(|r| r["counts"].get("index_shard_unavailable_alarm").is_none()));
+        let (_, records) = crate::local_resource_diagnostics::capture(|| {
+            assert!(load().unwrap().0.persistence_available())
+        });
+        assert!(records
+            .iter()
+            .all(|r| r["counts"].get("index_shard_unavailable_alarm").is_none()));
         assert_eq!(health::shard_transitions(source), before + 2);
         let recovered = daemon.status(TOKEN).unwrap();
-        assert!(recovered.canonical_health.unwrap().blockers.iter().all(|b| b.code != health::SHARD_CODE));
+        assert!(recovered
+            .canonical_health
+            .unwrap()
+            .blockers
+            .iter()
+            .all(|b| b.code != health::SHARD_CODE));
         refresh_canonical_local_health(&mut captured);
-        assert!(captured.canonical_health.unwrap().blockers.iter().any(|b| b.code == health::SHARD_CODE),
-            "captured projections do not borrow later live recovery");
+        assert!(
+            captured
+                .canonical_health
+                .unwrap()
+                .blockers
+                .iter()
+                .any(|b| b.code == health::SHARD_CODE),
+            "captured projections do not borrow later live recovery"
+        );
         // A new episode alarms once again. A set/clear pair between status
         // reads must survive capture as TWO transitions, not vanish together.
         std::fs::remove_file(&path).unwrap();
@@ -345,18 +397,123 @@ fn unavailable_shards_project_source_health_alarm_once_and_clear_after_restorati
             assert!(!load().unwrap().0.persistence_available());
             assert!(!load().unwrap().0.persistence_available());
         });
-        assert_eq!(records.iter().filter(|r| r["counts"]["index_shard_unavailable_alarm"] == 1).count(), 1);
+        assert_eq!(
+            records
+                .iter()
+                .filter(|r| r["counts"]["index_shard_unavailable_alarm"] == 1)
+                .count(),
+            1
+        );
         let payload_name = path.file_name().unwrap().to_str().unwrap();
         std::fs::write(&path, fixture["payloads"][payload_name].as_str().unwrap()).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(load().unwrap().0.persistence_available());
         let coalesced = daemon.status(TOKEN).unwrap();
-        let events = coalesced.local_health_events.iter().filter(|e|
-            e.payload["reason"] == health::SHARD_CODE).collect::<Vec<_>>();
-        assert_eq!(events.len(), before as usize + 4);
+        let events = coalesced
+            .local_health_events
+            .iter()
+            .filter(|e| e.payload["reason"] == health::SHARD_CODE)
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 2);
+        assert!(events[1].sequence > events[0].sequence);
+        assert_eq!(events[0].payload["transitions"], before + 3);
+        assert_eq!(events[1].payload["transitions"], before + 4);
+        assert!(coalesced
+            .canonical_health
+            .as_ref()
+            .unwrap()
+            .blockers
+            .iter()
+            .all(|b| b.code != health::SHARD_CODE));
         assert_eq!(events[events.len() - 2].payload["blocked_sources"], 1);
         assert_eq!(events[events.len() - 1].payload["blocked_sources"], 0);
         assert_eq!(health::shard_transitions(source), before + 4);
         std::fs::remove_dir_all(scratch).unwrap();
     }
+}
+
+#[test]
+fn large_transition_batch_materializes_only_latest_polarities_before_one_status_read() {
+    let scratch = crate::test_scratch::private_dir("index-health-batch");
+    let root = scratch.join("index.json");
+    let daemon = daemon().with_account(account("fixture_user", "fixture@example.invalid"));
+    let sources = [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ];
+    daemon.status(TOKEN).unwrap();
+    let before_sequence = next_local_health_sequence(&daemon.state().unwrap());
+    let before = sources.map(health::transitions);
+    for _ in 0..256 {
+        for source in sources {
+            std::fs::write(
+                &root,
+                br#"{"schema_version":65535,"generation":17,"files":{}}"#,
+            )
+            .unwrap();
+            assert!(
+                ScanIndex::load_for_snapshot_source_with_origin(&root, source, &scratch).is_err()
+            );
+            std::fs::write(&root, serde_json::to_vec(&ScanIndex::default()).unwrap()).unwrap();
+            ScanIndex::load_for_snapshot_source_with_origin(&root, source, &scratch).unwrap();
+        }
+    }
+    // Leave one pair blocked to check final posture in both directions.
+    std::fs::write(
+        &root,
+        br#"{"schema_version":65535,"generation":17,"files":{}}"#,
+    )
+    .unwrap();
+    assert!(
+        ScanIndex::load_for_snapshot_source_with_origin(&root, SnapshotSource::Pi, &scratch)
+            .is_err()
+    );
+    let status = daemon.status(TOKEN).unwrap();
+    let events = status
+        .local_health_events
+        .iter()
+        .filter(|event| event.event_type == "ScanIndexCollectionChanged")
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 6);
+    assert_eq!(
+        next_local_health_sequence(&daemon.state().unwrap()) - before_sequence,
+        6,
+        "skipped transitions must not be materialized then pruned"
+    );
+    for (i, source) in sources.into_iter().enumerate() {
+        let pair = events
+            .iter()
+            .filter(|event| event.payload["source"] == source.api_slug())
+            .collect::<Vec<_>>();
+        assert_eq!(pair.len(), 2);
+        assert_ne!(
+            pair[0].payload["blocked_sources"],
+            pair[1].payload["blocked_sources"]
+        );
+        assert!(pair[1].sequence > pair[0].sequence);
+        let transitions = before[i] + 512 + u64::from(source == SnapshotSource::Pi);
+        assert_eq!(pair[0].payload["transitions"], transitions - 1);
+        assert_eq!(pair[1].payload["transitions"], transitions);
+        assert_eq!(
+            projected_scan_index_refusal(&status.local_health_events, source).is_some(),
+            source == SnapshotSource::Pi
+        );
+    }
+    let unchanged = daemon.status(TOKEN).unwrap();
+    assert_eq!(
+        unchanged.local_health_events.len(),
+        status.local_health_events.len()
+    );
+    assert_eq!(
+        next_local_health_sequence(&daemon.state().unwrap()) - before_sequence,
+        6
+    );
+    assert!(status
+        .canonical_health
+        .unwrap()
+        .blockers
+        .iter()
+        .any(|blocker| blocker.code == health::CODE && blocker.source == "pi"));
+    std::fs::remove_dir_all(scratch).unwrap();
 }
