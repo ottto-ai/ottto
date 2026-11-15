@@ -183,7 +183,7 @@ fn accept_error_means_listener_gone(error: &std::io::Error) -> bool {
 fn handle_stream(path: PathBuf, mut stream: UnixStream, handler: RequestHandler) {
     #[cfg_attr(
         not(any(target_os = "macos", test)),
-        allow(unused_mut, unused_variables)
+        allow(unused_mut, unused_variables, reason = "control counts: macOS only")
     )]
     let mut stage = StageWindow::begin("unknown", "offpass_control_socket");
     // Whether an accepted socket inherits the listener's O_NONBLOCK differs by
