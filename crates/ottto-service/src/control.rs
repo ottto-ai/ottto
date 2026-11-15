@@ -2097,7 +2097,11 @@ fn remove_claude_account(
     let _ = crate::agent_status::prune_claude_slot_collection_state(slot_id);
     let _ = crate::claude_upkeep::prune_slot_upkeep_state(slot_id);
     crate::claude_refresher::prune_slot(slot_id);
-    Ok(complete_claude_registry_mutation(status))
+    let status = complete_claude_registry_mutation(status);
+    // The Companion confirms removal from the next status pass, not after the
+    // event gap. Other registry mutations keep the ordinary request.
+    crate::agent_status_refresh::request_now(&SourceKind::ClaudeCode);
+    Ok(status)
 }
 
 pub(crate) fn remove_claude_registration_with_relay_cleanup(
@@ -30070,9 +30074,17 @@ X-API-Key = "otel_redacted"
         provision_managed_claude_relay_settings(dir).unwrap();
         let path = Path::new(dir).join("settings.json");
         let original = fs::read(&path).unwrap();
-        assert!(remove_claude_account(999, &slot.slot_id).is_err());
+        let (failed, requested) = crate::agent_status_refresh::with_test_requests_now(|| {
+            remove_claude_account(999, &slot.slot_id)
+        });
+        assert!(failed.is_err());
+        assert!(requested.is_empty());
         assert_eq!(fs::read(&path).unwrap(), original);
-        remove_claude_account(1, &slot.slot_id).unwrap();
+        let (removed, requested) = crate::agent_status_refresh::with_test_requests_now(|| {
+            remove_claude_account(1, &slot.slot_id)
+        });
+        removed.unwrap();
+        assert_eq!(requested, vec![SourceKind::ClaudeCode]);
         assert!(Path::new(dir).is_dir());
         let removed: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(removed["env"], json!({}));
