@@ -39,6 +39,7 @@ fn relogin_alias_keeps_accepted_history_without_a_reread() {
         source_health_snapshot: test_agent_status(SourceKind::ClaudeCode),
         codex_scan_homes: Vec::new(),
         codex_home_bindings: Vec::new(),
+        setup_snapshot_index: None,
     };
     let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
     // One cycle in a fresh daemon and client: what it offered and where.

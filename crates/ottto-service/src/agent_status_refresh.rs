@@ -594,6 +594,30 @@ pub(crate) fn collection(
         ))),
     }
 }
+/// The setup scan's status row for `source`: the row the upload selected for
+/// the default login in the lane's collection (warm, shared in flight, or one
+/// pass of the existing owner), redacted for the backend. An acquisition error
+/// or no selected row omits it; cached data keeps its own timestamps.
+pub(crate) fn setup_snapshot(
+    source: &SourceKind,
+    captured_at: String,
+    expires_at: String,
+) -> Option<ottto_protocol::AgentStatusSnapshot> {
+    setup_snapshot_of(collection(source, captured_at, expires_at, false))
+}
+
+fn setup_snapshot_of(
+    collection: Result<Arc<AgentStatusCollection>, LocalApiError>,
+) -> Option<ottto_protocol::AgentStatusSnapshot> {
+    Some(
+        collection
+            .ok()?
+            .setup_snapshot()?
+            .clone()
+            .redacted_for_backend(),
+    )
+}
+
 /// Revalidate the existing local auth-file witness immediately before binding
 /// scanned sessions. A cached provider reading cannot attest a later login.
 /// Missing/changed witnesses withhold new ownership; persisted session ownership
@@ -719,6 +743,7 @@ mod tests {
             source_health_snapshot: snapshot,
             codex_scan_homes: Vec::new(),
             codex_home_bindings: Vec::new(),
+            setup_snapshot_index: Some(0),
         }
     }
     fn seconds(n: u64) -> Duration {
@@ -1355,6 +1380,25 @@ mod tests {
         ));
         assert_eq!(lane.state.lock().unwrap().generation, 1);
         assert_eq!(lane.state.lock().unwrap().schedule.next_due, seconds(300));
+    }
+    /// The setup scan omits its status row when the lane's acquisition failed
+    /// or stopped, or the collection selected no row; no retry, no fallback.
+    #[test]
+    fn setup_scan_omits_status_on_lane_error_or_no_selected_row() {
+        let mut unselected = specimen(SourceKind::Pi);
+        unselected.setup_snapshot_index = None;
+        assert!(setup_snapshot_of(Ok(Arc::new(unselected))).is_none());
+        let lane = StatusLane::new();
+        assert!(lane.pass(
+            Duration::ZERO,
+            true,
+            || panic!("synthetic acquisition panic"),
+            |_| false,
+            || seconds(7)
+        ));
+        assert!(setup_snapshot_of(lane.collection_at(seconds(8), false)).is_none());
+        lane.stop();
+        assert!(setup_snapshot_of(lane.collection_at(seconds(9), false)).is_none());
     }
     #[test]
     fn explicit_manual_refresh_can_recover_acquisition_during_backoff() {
