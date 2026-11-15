@@ -10044,6 +10044,9 @@ struct SetupScanPayload {
 #[derive(Debug, Serialize)]
 struct SetupScanSource {
     source: &'static str,
+    /// When this scan observed the source. The backend reads it before the
+    /// status row's own `captured_at`, which may be an earlier cached reading.
+    captured_at: String,
     detected: bool,
     installed: bool,
     telemetry_installed: bool,
@@ -15181,15 +15184,23 @@ fn setup_scan_source(
     local_health: &'static str,
     attribution_guess: BTreeMap<String, serde_json::Value>,
 ) -> SetupScanSource {
+    let captured_at = current_rfc3339();
+    let expires_at = rfc3339_after_minutes(AGENT_STATUS_SNAPSHOT_TTL_MINUTES)
+        .unwrap_or_else(|| captured_at.clone());
     SetupScanSource {
         source,
+        captured_at: captured_at.clone(),
         detected,
         installed,
         telemetry_installed,
         local_health,
         missing_fields: Vec::new(),
         attribution_guess,
-        agent_status: Some(local_agent_status(source_kind).redacted_for_backend()),
+        agent_status: crate::agent_status_refresh::setup_snapshot(
+            source_kind,
+            captured_at,
+            expires_at,
+        ),
         managed_config: None,
         local_import_ready: None,
         live_telemetry_required: None,
@@ -15377,13 +15388,6 @@ fn managed_config_preview(path_label: &str, body: Option<&str>) -> Option<serde_
         "captured_at": current_rfc3339(),
         "lines": redacted,
     }))
-}
-
-fn local_agent_status(source: &SourceKind) -> AgentStatusSnapshot {
-    let captured_at = current_rfc3339();
-    let expires_at = rfc3339_after_minutes(AGENT_STATUS_SNAPSHOT_TTL_MINUTES)
-        .unwrap_or_else(|| captured_at.clone());
-    crate::agent_status::collect_agent_status(source, captured_at, expires_at)
 }
 
 fn read_optional_to_string(path: &PathBuf) -> Option<String> {
@@ -30140,6 +30144,52 @@ X-API-Key = "otel_redacted"
         assert!(build_local_scan(&test_machine(), vec![SourceKind::Codex])
             .sources
             .is_empty());
+    }
+
+    /// Each scan source carries the scan's own time beside the selected
+    /// status row, whose own (cached) captured_at is left as it was.
+    #[test]
+    #[serial]
+    fn setup_scan_sources_carry_scan_time_and_the_selected_status_row() {
+        let _lock = lock_backend_test_env();
+        let root = control_test_root("setup-scan-selected-status");
+        let _home = EnvVarGuard::set_path("HOME", &root);
+        let _commands = EnvVarGuard::set_path("OTTTO_COMMAND_SEARCH_PATH", &root.join("bin"));
+        let _support =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root.join("support"));
+        let _secret = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &root.join("secrets"));
+        let cached: AgentStatusSnapshot = serde_json::from_value(json!({
+            "source": "pi", "status": "available", "collection_method": "config_file",
+            "captured_at": "2026-11-13T00:00:00Z", "expires_at": "2026-11-13T00:15:00Z",
+        }))
+        .unwrap();
+        let collection = crate::agent_status::AgentStatusCollection {
+            snapshots: vec![cached.clone()],
+            source_health_snapshot: cached.clone(),
+            codex_scan_homes: Vec::new(),
+            codex_home_bindings: Vec::new(),
+            setup_snapshot_index: Some(0),
+        };
+        let scan = crate::agent_status_refresh::with_collection(collection, || {
+            build_local_scan(&test_machine(), vec![])
+        });
+        let scan = serde_json::to_value(&scan).unwrap();
+        let sources = scan["sources"].as_array().unwrap();
+        assert_eq!(sources.len(), 3);
+        for source in sources {
+            let captured_at = source["captured_at"].as_str().expect("scan time");
+            assert!(time::OffsetDateTime::parse(
+                captured_at,
+                &time::format_description::well_known::Rfc3339
+            )
+            .is_ok());
+            assert_ne!(captured_at, "2026-11-13T00:00:00Z");
+            assert_eq!(
+                source["agent_status"],
+                serde_json::to_value(cached.clone().redacted_for_backend()).unwrap()
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

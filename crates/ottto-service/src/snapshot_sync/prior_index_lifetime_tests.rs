@@ -151,6 +151,7 @@ fn e2_real_caller_parity_at_tight_allowances() {
         source_health_snapshot: test_agent_status(SourceKind::ClaudeCode),
         codex_scan_homes: Vec::new(),
         codex_home_bindings: Vec::new(),
+        setup_snapshot_index: None,
     };
     let retry_clock = current_unix_seconds();
     // The budget's first completed input, shared by its arms.
