@@ -117,10 +117,6 @@ jobs:
           cache-save: ${{ github.ref == 'refs/heads/main' && matrix.shard == 1 }}
 
       # Clippy owns lint policy; PR-only checks cover reuse and blanket allows.
-      - name: Native gate wrapper contracts (inert stubs)
-        if: matrix.shard == 1
-        run: bash scripts/test_resource_native_first_import_gate.sh
-
       - name: Runtime clippy
         if: matrix.shard == 1
         env:

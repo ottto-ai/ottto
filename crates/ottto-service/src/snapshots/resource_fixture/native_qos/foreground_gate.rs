@@ -124,6 +124,17 @@ fn ratios(phases: &[[f64; 2]], unit: usize) -> [f64; 3] {
     })
 }
 
+/// Exhaustion is invalid evidence, never a responsiveness PASS/FAIL verdict.
+fn require_byte_bound(driver: &Driver<'_>, pr: &str, head: &str, corpus_gib: f64, pages: u64) {
+    if !driver.last_byte_bound_first_import {
+        println!("resource_native_first_import_gate pr={pr} head={head} corpus_gib={corpus_gib:.3} cpu_p95_ratio=unavailable io_p95_ratio=unavailable rss_max_mib={:.3} importer_cpu_share=unavailable energy_j=unavailable pages={pages} thermal=unavailable->unavailable verdict=invalid", usage().1 as f64 / MIB);
+    }
+    assert!(
+        driver.last_byte_bound_first_import,
+        "INVALID: corpus depleted or page ceased to be byte-bound with pending incomplete census"
+    );
+}
+
 /// [behaviour] Native foreground latency under real byte-bound first-import pages.
 #[test]
 #[ignore = "release operator native macOS PR gate only; never merge_group"]
@@ -142,13 +153,19 @@ fn resource_native_first_import_foreground_gate() {
                 .expect("phase duration must be integer seconds")
         })
         .unwrap_or(120);
-    assert!((1..=3600).contains(&seconds));
+    assert!(
+        (1..=120).contains(&seconds),
+        "phase duration must be 1..=120 seconds"
+    );
     schedule::native_worker(|| {
-        // At default D: 2048 x 16 MiB = 32 GiB, streamed in bounded buffers.
-        // A depleted or otherwise non-byte-bound corpus aborts, never earns PASS.
-        let files = usize::try_from((seconds * 2048).div_ceil(120).max(64)).unwrap();
+        // At default D: 256 x 16 MiB = 4 GiB (64 nominal 64-MiB pages).
+        // Expected 3x120-s on-time consumes ~15 pages at 25-51 s/page;
+        // this leaves >2x headroom plus warm-up without a 32-GiB disk write.
+        // Keep in sync with the wrapper's preflight; smoke scales down to 1 GiB.
+        let files = usize::try_from((seconds * 256).div_ceil(120).max(64)).unwrap();
         let corpus = Corpus::generate_sized([0, files, 0], Some(16 * 1024 * 1024));
-        println!("resource_native_first_import_setup files={files} bytes={} phase_seconds={seconds} samples_per_unit_per_phase={} smoke={}", corpus.manifest.bytes[1], seconds * 20, seconds != 120);
+        let corpus_gib = corpus.manifest.bytes[1] as f64 / (1024.0 * MIB);
+        println!("resource_native_first_import_setup files={files} corpus_gib={corpus_gib:.3} bytes={} phase_seconds={seconds} samples_per_unit_per_phase={} smoke={}", corpus.manifest.bytes[1], seconds * 20, seconds != 120);
         let _default = schedule::native_set_qos(0x15);
         let mut driver = Driver::new(&corpus, 1);
         schedule::with_power("ac", || {
@@ -156,7 +173,7 @@ fn resource_native_first_import_foreground_gate() {
             // the first paced entry. No delivery transport/client exists in Driver:
             // exact_acks_for_test and the in-process ledger settle its outputs.
             driver.page(2000);
-            assert!(driver.last_byte_bound_first_import);
+            require_byte_bound(&driver, &pr, &head, corpus_gib, 0);
             let mut phases = Vec::new();
             let (mut pages, mut cpu, mut wall, mut joules) = (0u64, 0.0, 0.0, Some(0.0));
             let mut rss = usage().1;
@@ -183,10 +200,7 @@ fn resource_native_first_import_foreground_gate() {
                                 matches(&trace, SOURCES[1], 0x11),
                                 "UTILITY entry required: {trace:?}"
                             );
-                            assert!(
-                                driver.last_byte_bound_first_import,
-                                "corpus depleted or page ceased to be byte-bound"
-                            );
+                            require_byte_bound(&driver, &pr, &head, corpus_gib, pages + completed);
                             completed += 1;
                         }
                         if !on {
@@ -225,7 +239,7 @@ fn resource_native_first_import_foreground_gate() {
             let io_ratio = percentile(&mut ratios(&phases, 1), 50);
             let rss_mib = rss.max(usage().1) as f64 / MIB;
             let pass = cpu_ratio <= 1.05 && io_ratio <= 1.05 && rss_mib <= 500.0;
-            println!("resource_native_first_import_gate pr={pr} head={head} cpu_p95_ratio={cpu_ratio:.6} io_p95_ratio={io_ratio:.6} rss_max_mib={rss_mib:.3} importer_cpu_share={:.6} energy_j={} pages={pages} thermal=unavailable->unavailable verdict={}", cpu / wall, display_energy(joules), if pass { "pass" } else { "fail" });
+            println!("resource_native_first_import_gate pr={pr} head={head} corpus_gib={corpus_gib:.3} cpu_p95_ratio={cpu_ratio:.6} io_p95_ratio={io_ratio:.6} rss_max_mib={rss_mib:.3} importer_cpu_share={:.6} energy_j={} pages={pages} thermal=unavailable->unavailable verdict={}", cpu / wall, display_energy(joules), if pass { "pass" } else { "fail" });
             assert!(pass, "paired foreground latency/RSS gate failed");
         });
     });
