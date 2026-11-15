@@ -145,6 +145,7 @@ fn shared(ledger: &Ledger) -> (u64, u64) {
 
 /// A one-slot census page can visit an unchanged member before the marked
 /// file. Preserve that budget and settle empty pages until the target is read.
+#[track_caller]
 fn next_body_page(
     c: &Corpus,
     mut prior: ScanIndex,
@@ -152,7 +153,7 @@ fn next_body_page(
     progress: &mut SnapshotUploadProgress,
 ) -> Page {
     let scanner = E2ScanFixture::capturing_identity();
-    for _ in 0..4 {
+    for attempt in 0..4 {
         let mut page = c.raw(&scanner, prior.clone(), 1, false, &[]);
         page.enrich_with(c, Some(&mut progress.accepted_identity_buckets));
         if body(&page, session).is_some() {
@@ -163,11 +164,28 @@ fn next_body_page(
         page.finish();
         assert!(
             page.scan.snapshots.is_empty(),
-            "a deferred census slot sends nothing"
+            "a deferred census slot sends nothing: target {session}, attempt {attempt}, sent {:?}",
+            sent_bodies(&page)
         );
         prior = settle(c, &prior, page, progress);
     }
     panic!("the marked file must be selected after the fixture's census members");
+}
+
+/// Failure detail for the oracles: each sent body's session, request count and
+/// declared removals.
+fn sent_bodies(page: &Page) -> Vec<(&str, u64, Option<u64>)> {
+    page.scan
+        .snapshots
+        .iter()
+        .map(|s| {
+            (
+                s.source_session_id.as_str(),
+                s.request_count,
+                s.removed_request_count,
+            )
+        })
+        .collect()
 }
 
 /// Deliver a page as `deliver` does; every exact-ACKed body replaces its
@@ -592,6 +610,7 @@ fn server_learned_head_is_not_an_accepted_origin() {
 /// Drive each entity through the real uploader independently, checking the
 /// receiver's latest-body ledger after every ACK, then select and save exactly
 /// the index the production completion path keeps.
+#[track_caller]
 fn acknowledge_ordered(
     c: &Corpus,
     mut page: Page,
@@ -602,8 +621,13 @@ fn acknowledge_ordered(
 ) -> ScanIndex {
     page.finish();
     assert_eq!(sessions.len(), expected.len());
-    for (&session, &shared_expected) in sessions.iter().zip(expected) {
-        let item = body(&page, session).expect("a scheduled body").clone();
+    for (position, (&session, &shared_expected)) in sessions.iter().zip(expected).enumerate() {
+        let Some(item) = body(&page, session).cloned() else {
+            panic!(
+                "a scheduled body: {session} (position {position} of {sessions:?}), sent {:?}",
+                sent_bodies(&page)
+            );
+        };
         let (status, _, _) = upload(std::slice::from_ref(&item), progress, |batch| {
             let response = ack(batch)?;
             assert_eq!(response.accepted_entities.len(), 1);
