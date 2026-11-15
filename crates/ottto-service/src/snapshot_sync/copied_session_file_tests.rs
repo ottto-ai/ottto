@@ -424,49 +424,61 @@ fn content_session_closure_ignores_earliest_holder() {
     }
 }
 
+// Finalize and settle real ACKs, observing each whole-session replacement.
+fn accept_monotone_page(
+    c: &Corpus,
+    committed: &ScanIndex,
+    mut page: Page,
+    accepted: &mut BTreeMap<String, u64>,
+) -> ScanIndex {
+    page.finish();
+    let sent = page.scan.snapshots.clone();
+    let mut progress = e2_progress();
+    let (status, _, _) = upload(&sent, &mut progress, |items| {
+        let response = ack(items);
+        for item in items {
+            let count = accepted.entry(item.source_session_id.clone()).or_default();
+            assert!(
+                item.request_count >= *count,
+                "an ACK must not shrink a session"
+            );
+            *count = item.request_count;
+        }
+        response
+    });
+    assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
+    let holds = LocalHoldSettlement::classify(
+        SnapshotSource::ClaudeCode,
+        &mut page.index,
+        &mut page.scan,
+        &page.disposition,
+    );
+    let mut settled = settle_completed_upload(page.index, committed, &progress, &holds);
+    settle_index_after_upload(&mut settled.index, committed, &progress);
+    accept_upload_context_acks_for_test(
+        &mut settled.index,
+        &sent,
+        &progress.fresh_context_body_acks,
+    );
+    c.reload(&mut settled.index)
+}
+
 /// [money] A twin pulls its unchanged main, including when an unrelated main
 /// first pulls the twin. Incomplete pages hold; every ACK preserves the union.
 #[test]
 fn unrelated_main_and_growing_twin_pull_complete_session() {
+    // Selection order differs between an all-owed page and a Q-seeded page.
+    // Align the cloned oracle inputs; retain every session and wire field.
+    fn ordered_money(page: &Page) -> RouteResult {
+        let mut ordered = twin(page);
+        ordered
+            .scan
+            .snapshots
+            .sort_by(|a, b| a.source_session_id.cmp(&b.source_session_id));
+        sent_money(&ordered)
+    }
     // Use production finalization, upload, ACK settlement and index reload;
     // observe the receiver ledger inside every ACK callback.
-    fn accept(
-        c: &Corpus,
-        committed: &ScanIndex,
-        mut page: Page,
-        accepted: &mut BTreeMap<String, u64>,
-    ) -> ScanIndex {
-        page.finish();
-        let sent = page.scan.snapshots.clone();
-        let mut progress = e2_progress();
-        let (status, _, _) = upload(&sent, &mut progress, |items| {
-            let response = ack(items);
-            for item in items {
-                let count = accepted.entry(item.source_session_id.clone()).or_default();
-                assert!(
-                    item.request_count >= *count,
-                    "an ACK must not shrink a session"
-                );
-                *count = item.request_count;
-            }
-            response
-        });
-        assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
-        let holds = LocalHoldSettlement::classify(
-            SnapshotSource::ClaudeCode,
-            &mut page.index,
-            &mut page.scan,
-            &page.disposition,
-        );
-        let mut settled = settle_completed_upload(page.index, committed, &progress, &holds);
-        settle_index_after_upload(&mut settled.index, committed, &progress);
-        accept_upload_context_acks_for_test(
-            &mut settled.index,
-            &sent,
-            &progress.fresh_context_body_acks,
-        );
-        c.reload(&mut settled.index)
-    }
     for sampled in [false, true] {
         with_e2(|| {
             let mut c = Corpus::new("unrelated-main-pulls-twin");
@@ -480,15 +492,15 @@ fn unrelated_main_and_growing_twin_pull_complete_session() {
             let mut prior = ScanIndex::default();
             let mut initial = c.raw(&E2ScanFixture::default(), prior.clone(), 100, sampled, &[]);
             initial.enrich(&c);
-            prior = accept(&c, &prior, initial, &mut accepted);
+            prior = accept_monotone_page(&c, &prior, initial, &mut accepted);
             let twin = c.write_at(&file(COPY), &resumed(ROOT, &[A, B, C]), BORN);
             append(&main, &resumed(ROOT, &[D]));
             owe(&mut prior);
             let mut complete = c.raw(&E2ScanFixture::default(), prior.clone(), 100, sampled, &[]);
             complete.enrich(&c);
             assert_eq!(body(&complete, ROOT).unwrap().request_count, 4);
-            let reference = sent_money(&complete);
-            prior = accept(&c, &prior, complete, &mut accepted);
+            let reference = ordered_money(&complete);
+            prior = accept_monotone_page(&c, &prior, complete, &mut accepted);
             assert_eq!(accepted[ROOT], 4);
             let twin_key = twin.to_string_lossy().into_owned();
             assert_eq!(
@@ -532,7 +544,7 @@ fn unrelated_main_and_growing_twin_pull_complete_session() {
                 body(&partial, ROOT).is_none(),
                 "T alone is withheld before upload"
             );
-            prior = accept(&c, &prior, partial, &mut accepted);
+            prior = accept_monotone_page(&c, &prior, partial, &mut accepted);
             assert_eq!(accepted[ROOT], 4, "T alone never replaces M+T");
             assert!(prior
                 .re_owe_effective_upload_body_witness_revision(&unrelated.to_string_lossy(), 2));
@@ -552,9 +564,9 @@ fn unrelated_main_and_growing_twin_pull_complete_session() {
                 .disposition
                 .request_owned_hold_reasons
                 .contains_key("absent_content_twin"));
-            money_oracle::assert_equivalent(&reference, &sent_money(&recovered));
+            money_oracle::assert_equivalent(&reference, &ordered_money(&recovered));
             assert!(!recovered.finish().progress_blocking);
-            prior = accept(&c, &prior, recovered, &mut accepted);
+            prior = accept_monotone_page(&c, &prior, recovered, &mut accepted);
             assert_eq!(accepted[ROOT], 4);
 
             // Only T grows. M's stamp and settled revision stay unchanged;
@@ -568,7 +580,7 @@ fn unrelated_main_and_growing_twin_pull_complete_session() {
             let mut full = c.raw(&E2ScanFixture::default(), full_index, 100, sampled, &[]);
             full.enrich(&c);
             assert_eq!(body(&full, ROOT).unwrap().request_count, 5);
-            let reference = sent_money(&full);
+            let reference = ordered_money(&full);
             let scanner = E2ScanFixture::default();
             let mut grown = c.raw(
                 &scanner,
@@ -584,10 +596,163 @@ fn unrelated_main_and_growing_twin_pull_complete_session() {
                 .disposition
                 .request_owned_hold_reasons
                 .contains_key("absent_content_twin"));
-            money_oracle::assert_equivalent(&reference, &sent_money(&grown));
+            money_oracle::assert_equivalent(&reference, &ordered_money(&grown));
             assert!(!grown.finish().progress_blocking);
-            accept(&c, &prior, grown, &mut accepted);
+            accept_monotone_page(&c, &prior, grown, &mut accepted);
             assert_eq!(accepted[ROOT], 5, "T's new turn reaches the receiver");
+        });
+    }
+}
+
+/// [money] A main deferred before acquisition cannot let its pulled content
+/// twin replace the session. Growth pacing, then audit-cap pacing, both hold
+/// until a later complete page matches the native Full union after restart.
+#[test]
+fn deferred_main_with_read_content_twin_holds_until_complete() {
+    use crate::snapshots::e2_pipeline_scan_fixture::{
+        indexed_size, owe_claimed_growth, pace_cap_for_test,
+    };
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for restart in [false, true] {
+        with_e2(|| {
+            let mut c = Corpus::new("deferred-main-content-twin");
+            let main = c.root(ROOT, &resumed(ROOT, &[A, B]));
+            let owner = E2ScanFixture::default();
+            let mut accepted = BTreeMap::new();
+            let mut prior = ScanIndex::default();
+            let mut original = c.raw(&owner, prior.clone(), 100, true, &[]);
+            original.enrich(&c);
+            prior = accept_monotone_page(&c, &prior, original, &mut accepted);
+            let twin = c.write_at(&file(COPY), &resumed(ROOT, &[A, B, C]), BORN);
+            owe(&mut prior);
+            let mut both = c.raw(&owner, prior.clone(), 100, true, &[]);
+            both.enrich(&c);
+            assert_eq!(body(&both, ROOT).unwrap().request_count, 3);
+            prior = accept_monotone_page(&c, &prior, both, &mut accepted);
+            assert_eq!(accepted[ROOT], 3);
+            let main_key = main.to_string_lossy().into_owned();
+            let twin_key = twin.to_string_lossy().into_owned();
+            let size = indexed_size(&prior, &main);
+            append(
+                &main,
+                &resumed(
+                    ROOT,
+                    &[
+                        D,
+                        ("e", "2026-08-02T07:07:10Z", RESUME_WRITER),
+                        ("f", "2026-08-02T07:08:10Z", RESUME_WRITER),
+                        ("g", "2026-08-02T07:09:10Z", RESUME_WRITER),
+                    ],
+                ),
+            );
+            let mut full_index = prior.clone();
+            owe(&mut full_index);
+            let mut full = c.raw(&E2ScanFixture::default(), full_index, 100, false, &[]);
+            full.enrich(&c);
+            let expected = body(&full, ROOT).unwrap();
+            assert_eq!(
+                (expected.request_count, expected.removed_request_count),
+                (7, Some(2))
+            );
+            let mut reference = sent_money(&full);
+            reference.mode = Mode::ColdFull;
+
+            let mut scanner = if restart {
+                E2ScanFixture::default()
+            } else {
+                owner
+            };
+            // These are the same no-capacity controls as the forced-member
+            // fixture. Only M is paced: the content twin still reads natively.
+            for paced in [true, false] {
+                let mut selected = owe_claimed_growth(&prior, &c.base, &main, paced);
+                owe(&mut selected);
+                // Preserve accepted-body ownership; remove delivery receipts
+                // so this held attempt must prove it cannot earn a new one.
+                for key in [&main_key, &twin_key] {
+                    selected.files.get_mut(key).unwrap().upload_context_receipt = None;
+                }
+                if restart {
+                    selected = c.reload(&mut selected);
+                }
+                if !paced {
+                    scanner.set_audit_slots(0);
+                    pace_cap_for_test(&scanner, &main);
+                }
+                let mut held = c.raw(
+                    &scanner,
+                    selected.clone(),
+                    100,
+                    true,
+                    std::slice::from_ref(&main),
+                );
+                assert!(
+                    !scanner.paths().contains(&main),
+                    "M is deferred before acquisition"
+                );
+                assert!(
+                    scanner.paths().contains(&twin),
+                    "M pulled T before its deferral"
+                );
+                assert_eq!(indexed_size(&held.index, &main), size);
+                assert!(
+                    held.scan.snapshots.iter().any(|item| {
+                        item.claude_money
+                            .as_deref()
+                            .and_then(e2::FileFold::location_key)
+                            == Some(location_key(&twin_key))
+                    }),
+                    "the held page has a real T fold"
+                );
+                held.enrich(&c);
+                assert_eq!(
+                    held.disposition
+                        .request_owned_hold_reasons
+                        .get("absent_content_twin"),
+                    Some(&1)
+                );
+                assert!(held.finish().progress_blocking);
+                assert!(body(&held, ROOT).is_none(), "T alone cannot publish S");
+                prior = accept_monotone_page(&c, &selected, held, &mut accepted);
+                assert_eq!(
+                    accepted[ROOT], 3,
+                    "held pages never change the receiver ledger"
+                );
+                for key in [&main_key, &twin_key] {
+                    assert!(
+                        prior.files[key].upload_context_receipt.is_none(),
+                        "held files earn no receipt"
+                    );
+                }
+            }
+            // The durable growth claim is now due. A fresh page has capacity
+            // and must acquire M+T together, without filtering any fold.
+            scanner.set_audit_slots(1);
+            let mut recovered = c.raw(
+                &scanner,
+                prior.clone(),
+                100,
+                true,
+                std::slice::from_ref(&main),
+            );
+            assert!(scanner.paths().contains(&main) && scanner.paths().contains(&twin));
+            recovered.enrich(&c);
+            assert!(!recovered
+                .disposition
+                .request_owned_hold_reasons
+                .contains_key("absent_content_twin"));
+            let expected = body(&recovered, ROOT).unwrap();
+            assert_eq!(
+                (expected.request_count, expected.removed_request_count),
+                (7, Some(2))
+            );
+            money_oracle::assert_equivalent(&reference, &sent_money(&recovered));
+            prior = accept_monotone_page(&c, &prior, recovered, &mut accepted);
+            assert_eq!(accepted[ROOT], 7);
+            assert!(upload_context_receipt_earned_for_test(&prior, &main));
+            assert!(upload_context_receipt_earned_for_test(&prior, &twin));
         });
     }
 }

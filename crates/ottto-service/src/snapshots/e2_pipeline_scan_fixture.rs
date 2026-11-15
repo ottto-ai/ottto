@@ -464,6 +464,7 @@ pub(crate) fn save_reload_for_test(index: &mut ScanIndex, path: &Path) -> ScanIn
 pub(crate) struct E2ScanFixture {
     pub(crate) cache: Arc<sampled_scan::SharedCache>,
     observed: Mutex<Vec<PathBuf>>,
+    audit_slots: Option<usize>,
     full_reasons: Mutex<[usize; 11]>,
     pub(crate) versions: Option<Arc<codex_version::CodexVersionFeed>>,
     capture_claude_identity: bool,
@@ -530,6 +531,10 @@ impl E2ScanFixture {
         attribution: Option<crate::session_attribution::SessionAttributionContext>,
     ) {
         *self.attribution.lock().unwrap() = attribution;
+    }
+
+    pub(crate) fn set_audit_slots(&mut self, slots: usize) {
+        self.audit_slots = Some(slots);
     }
 
     pub(crate) fn full_reasons(&self) -> [usize; 11] {
@@ -677,6 +682,11 @@ impl E2ScanFixture {
     ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
         let mut seen = BTreeSet::new();
         for _ in 0..100_000 {
+            if let Some(slots) = self.audit_slots {
+                if let Some(context) = scan.sampling.as_mut() {
+                    context.audit_slots = slots;
+                }
+            }
             // Existing fixture setter changes only physical birth. JSONL still
             // comes from the opened reader, including retained prefix/suffix.
             if let Some(active) = scan.active_file.as_deref_mut() {
@@ -1029,4 +1039,12 @@ pub(crate) fn hold_entity_decode_for_test(index: &mut ScanIndex, fingerprint: &s
             4,
         )
         .unwrap();
+}
+
+/// Spend the ordinary cap allowance for this path before the fixture page.
+pub(crate) fn pace_cap_for_test(owner: &E2ScanFixture, path: &Path) {
+    let now = std::time::SystemTime::now();
+    let key = local_index_key(path);
+    assert!(owner.cache.cap_pace_for_test(&key, now).0);
+    assert!(!owner.cache.cap_pace_for_test(&key, now).0);
 }
