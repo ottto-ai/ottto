@@ -1,10 +1,11 @@
 //! Stored copy removals (copy-family fix): per Claude
-//! file, the request hashes it once removed as copies under an earlier local
-//! holder, grouped by that holder. A later re-read whose holder
+//! file, the request hashes it once removed as copies on an earlier holder's
+//! CURRENT census proof, grouped by that holder. A later re-read whose holder
 //! proof list has since retired rebuilds the same deduped body instead of
 //! restoring the prefix. A holder no longer indexed cannot disprove anything:
-//! its group stands, counted (`copy_removal_holder_absent_kept`);
-//! only an indexed holder whose census lacks a hash reverts it. Local state
+//! its accepted group stands, counted (`copy_removal_holder_absent_kept`);
+//! an unaccepted holder losing ownership or an indexed holder whose census
+//! lacks a hash reverts it. Local state
 //! (class L): never uploaded, never a wire field.
 //!
 //! Every decision is stored whole, whatever its size; recorded decisions are
@@ -123,12 +124,6 @@ impl CopyRemovals {
             let at = self.files.binary_search_by_key(&file, |f| f.0).unwrap_err();
             self.files.insert(at, (file, attempts, groups));
         }
-    }
-
-    pub(super) fn holders(&self) -> impl Iterator<Item = LocationKey> + '_ {
-        self.files
-            .iter()
-            .flat_map(|(_, _, groups)| groups.iter().map(|(holder, _)| *holder))
     }
 
     pub(super) fn drop_holders(&mut self, holders: &BTreeSet<LocationKey>) -> Vec<LocationKey> {

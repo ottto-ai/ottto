@@ -98,6 +98,7 @@ impl ScanIndex {
                 &mut self.quarantined_snapshot_fingerprints,
                 &current.quarantined_snapshot_fingerprints,
             );
+            claude_request_money::e2::reconcile_copy_ownership(&current, self);
             if !current.decode_holds.same_as(&self.decode_holds)
                 || !current.decode_repairs_match(self)
             {
@@ -107,6 +108,9 @@ impl ScanIndex {
             return Err(anyhow::anyhow!(
                 "local snapshot scan index disappeared concurrently"
             ));
+        }
+        if !path.exists() {
+            claude_request_money::e2::reconcile_copy_ownership(&ScanIndex::default(), self);
         }
         let previous_generation = self.generation;
         self.schema_version = SCAN_INDEX_SCHEMA_VERSION;

@@ -36,6 +36,22 @@ pub(super) struct KindCx {
 pub(super) struct Baseline {
     pub(super) generation: u64,
     pub(super) rows: BTreeMap<RowKey, [u8; 32]>,
+    pub(super) copy_ownership: super::super::claude_request_money::e2::CopyOwnership,
+}
+fn copy_ownership(
+    index: &ScanIndex,
+    cx: &KindCx,
+) -> super::super::claude_request_money::e2::CopyOwnership {
+    if cx.binding.as_ref().is_some_and(|b| {
+        matches!(
+            b.source,
+            super::super::scan_index_persistence::Source::Claude
+        )
+    }) {
+        super::super::claude_request_money::e2::CopyOwnership::capture(index)
+    } else {
+        Default::default()
+    }
 }
 fn enumerate(index: &ScanIndex, rows: &mut mapper::Rows<'_>, cx: &mut KindCx) -> Result<()> {
     rows.raw(
@@ -79,6 +95,7 @@ pub(super) fn baseline(index: &ScanIndex, cx: &mut KindCx) -> Result<Baseline> {
     Ok(Baseline {
         generation: index.generation,
         rows: stored,
+        copy_ownership: copy_ownership(index, cx),
     })
 }
 pub(super) fn populate(index: &ScanIndex, tx: &mut dyn Transaction, cx: &mut KindCx) -> Result<()> {
@@ -265,6 +282,7 @@ pub(super) fn delta(
         Ok(Baseline {
             generation: next.generation,
             rows: digests,
+            copy_ownership: copy_ownership(next, cx),
         })
     })();
     cx.valid = result.is_ok();

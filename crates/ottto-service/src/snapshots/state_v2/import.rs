@@ -112,18 +112,7 @@ pub(super) fn save(
             identity.binding.source,
             super::super::scan_index_persistence::Source::Claude
         ) {
-            // Ownership needs file/census metadata, never account-window or
-            // usage history. Release this read transaction before the write.
-            let mut old = ScanIndex::default();
-            let mut ownership_cx = KindCx::default();
-            kinds_misc::hydrate_txn(&mut tx, &mut old, &mut ownership_cx)?;
-            kinds_files::hydrate_txn(&mut tx, &mut old, &mut ownership_cx)?;
-            kinds_census::hydrate_txn(&mut tx, &mut old, &mut ownership_cx)?;
-            old.claude_usage_authority_quarantine =
-                mapper::read_field_map(&mut tx, "refusal.authority", None, None)?;
-            old.claude_account_deferred_holds =
-                mapper::read_field_map(&mut tx, "proof.deferred_account", None, None)?;
-            super::super::claude_request_money::e2::reconcile_copy_ownership(&old, next);
+            previous.copy_ownership.reconcile(next);
         }
     }
     super::super::sampled_audit::prune_growth_retention(

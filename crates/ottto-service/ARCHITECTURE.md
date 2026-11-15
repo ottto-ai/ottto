@@ -107,11 +107,15 @@ file-system hint / periodic listing → select file → read new bytes from save
   holders later deleted locally. Groups relying on an unaccepted page holder are
   provisional: a save drops them and marks their copies if that holder failed to
   commit a counted body. Deleting an unaccepted holder also drops its groups.
-  Each index save compares committed local facts and marks later copies whose
-  decisions disagree. The existing removal-record slot is a 0/1 re-decision mark,
+  Each index save compares committed ownership, removal groups and lost census
+  hashes, then marks later unheld holders of the changed hashes. Their next read
+  runs the same copy decider. The existing removal-record slot is a 0/1 re-decision mark,
   cleared on every finished read, including held and empty outcomes. Held copies
   wait for their ordinary release read. An unfinished decision walk sets the mark;
-  save-time census walks have no deadline. Encoding and rollback remain compatible:
+  save-time census walks have no deadline. The SQLite save baseline retains
+  compact ownership facts with shared census hashes; legacy saves reuse their
+  existing CAS image. Neither path hydrates another full index for this check.
+  Encoding and rollback remain compatible:
   earlier binaries read the mark as a short prefix wait.
   Source and copy uploads remain independent. Copy-first discovery and either
   entity ACK order can leave a temporary overlap or gap until the required bodies

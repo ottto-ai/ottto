@@ -555,70 +555,6 @@ fn committed_parent_proves_with_a_retired_census() {
     let _ = fs::remove_dir_all(dir);
 }
 
-/// [money] Named-parent removals retain their dependency after its census
-/// retires, so deleting an unaccepted parent restores the surviving copy.
-#[test]
-fn retired_unaccepted_parent_removals_are_recorded_and_invalidated() {
-    let dir = scratch();
-    let path = copy_at(&dir);
-    let mut index = index_holding(&dir, &["copy-a", "copy-b"]);
-    let parent = holder_key(&dir);
-    let mut record = index.claude_request_census.get(&parent).unwrap().clone();
-    record.retire();
-    index
-        .claude_request_census_mut_for_test()
-        .insert_for_test(&parent, record);
-    let key = local_index_key(&path);
-    index.files.insert(
-        key.clone(),
-        serde_json::from_value(json!({"size_bytes":8,
-        "modified_unix_seconds":1,"source_file_fingerprint":"b".repeat(64)}))
-        .unwrap(),
-    );
-    index
-        .claude_money_birth_store
-        .record_observation(ROOT, &key, t0() + 100_000_000_000);
-    let lines = [
-        json!({"type":"fork-context-ref", "sessionId":ROOT,
-        "parentSessionId":HOLDER, "timestamp":at(100)}),
-        line("copy-a", &at(1), 10),
-        line("copy-b", &at(2), 11),
-    ];
-    let mut items = read_file(&path, &index, &lines);
-    decide_page_copies(&mut items, &index, None).apply(&mut index);
-    assert_eq!(fold(&items).entity.removed_requests, 2);
-    let file = location_key(&key);
-    assert_eq!(index.claude_copy_removals.get(file).len(), 1);
-    assert_eq!(
-        index.claude_copy_removals.get(file)[0].0,
-        location_key(&parent)
-    );
-    for _ in 0..10 {
-        let previous = index.clone();
-        reconcile_copy_ownership(&previous, &mut index);
-        assert_eq!(
-            index.claude_copy_removals.get(file).len(),
-            1,
-            "unchanged retired-census ownership keeps its saved proof"
-        );
-        assert!(!index.claude_copy_removals.pending(file));
-        index.claude_copy_removals =
-            serde_json::from_value(serde_json::to_value(&index.claude_copy_removals).unwrap())
-                .unwrap();
-    }
-    let previous = index.clone();
-    index.files.remove(&parent);
-    reconcile_copy_ownership(&previous, &mut index);
-    assert!(index.claude_copy_removals.get(file).is_empty());
-    assert!(index.claude_copy_removals.pending(file));
-    let restored = read_file(&path, &index, &lines);
-    let mut restored = restored;
-    decide_page_copies(&mut restored, &index, None).apply(&mut index);
-    assert_eq!(fold(&restored).entity.totals().1, 2);
-    assert_eq!(fold(&restored).entity.removed_requests, 0);
-    let _ = fs::remove_dir_all(dir);
-}
-
 /// [money] Already accepted coverage survives all later local withholding.
 #[test]
 fn accepted_owner_survives_later_holds_and_listing() {
@@ -635,7 +571,7 @@ fn accepted_owner_survives_later_holds_and_listing() {
     let support = scratch();
     crate::snapshots::e2_pipeline_scan_fixture::write_exclusions(&support, &[HOLDER]);
     index.load_claude_reemission_exclusions(&support);
-    assert!(origin_owned(&index, &[], &key));
+    assert!(origin_owned(&index, &[], &key, true));
     let _ = fs::remove_dir_all(dir);
     let _ = fs::remove_dir_all(support);
 }
