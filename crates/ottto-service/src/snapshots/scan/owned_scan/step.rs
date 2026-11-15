@@ -1846,6 +1846,8 @@ impl OwnedSourceScan {
                     hold_offset: _,
                     mut group,
                 } = *active;
+                #[cfg(test)]
+                let diagnostic_path = candidate.path.clone();
                 let mut independent_contributions = Vec::new();
                 let mut independent_group = false;
                 let group_members = group.as_deref_mut().map_or(0, |group| {
@@ -2621,8 +2623,6 @@ impl OwnedSourceScan {
                                 .flatten()
                         })
                     });
-                    #[cfg(test)]
-                    let diagnostic_path = candidate.path.clone();
                     let mut recorded = candidate;
                     if let Some(fragment) = cursor_fragment
                         .filter(|_| prefix_continued && completed_acquisition.is_some())
