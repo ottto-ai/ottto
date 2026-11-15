@@ -5135,10 +5135,8 @@ fn collect_file_activity_with_retry(
     let deadline = crate::scan_clock::now() + wait;
     let mut watcher = watcher;
     loop {
-        let now = crate::scan_clock::now();
-        if now >= deadline {
-            return false;
-        }
+        // A delivery retry may share the ordinary deadline. Service it before
+        // returning to collection, which can replace its retained checkpoint.
         let wake = retry_boundary(deadline).min(deadline);
         let now = crate::scan_clock::now();
         if now >= deadline {
