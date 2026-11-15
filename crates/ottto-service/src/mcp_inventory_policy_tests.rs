@@ -379,7 +379,7 @@ fn identity_and_scope_rows_veto_only_the_servers_they_name() {
         json!({"allowManagedMcpServersOnly": on, "allowedMcpServers": allowed})
     };
     // (policy files to write, vetoed [user, plugin, project])
-    let rows: Vec<(Vec<(&PathBuf, Value)>, [bool; 3])> = vec![
+    let rows = vec![
         (vec![], [false, false, false]),
         // Names match the client identity, never the inventory row name.
         (
