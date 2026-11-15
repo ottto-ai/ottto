@@ -1436,6 +1436,9 @@ impl<
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.kept, c)
     }
+    fn completed_heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        crate::heap_layout_bound::HeapLayoutBound::completed_heap_bound(&self.kept, c)
+    }
 }
 
 crate::heap_layout_bound::fields!(AuditDebt; due_unix_seconds);

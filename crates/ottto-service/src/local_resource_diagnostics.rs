@@ -1629,7 +1629,13 @@ fn source_finish_inner<T>(
     drop(window);
     result
 }
-type RetainedBytes = BTreeMap<&'static str, Option<u64>>;
+#[derive(Default, Serialize)]
+pub(crate) struct RetainedBytes {
+    #[serde(flatten)]
+    pub(crate) totals: BTreeMap<&'static str, Option<u64>>,
+    pub(crate) side_maps_parts: BTreeMap<&'static str, Option<u64>>,
+}
+crate::heap_layout_bound::fields!(RetainedBytes; totals, side_maps_parts);
 type PassStart = (
     Instant,
     Option<ProcessSample>,
@@ -3281,8 +3287,15 @@ mod tests {
             let (_, records) = capture(|| {
                 source_prepare(source, || (), |_| false);
                 source_finish(source, false, || {
-                    pass_retained(source, || {
-                        BTreeMap::from([("files_bytes", Some(123)), ("side_maps_bytes", None)])
+                    pass_retained(source, || RetainedBytes {
+                        totals: BTreeMap::from([
+                            ("files_bytes", Some(123)),
+                            ("side_maps_bytes", None),
+                        ]),
+                        side_maps_parts: BTreeMap::from([
+                            ("growth_retention", Some(123)),
+                            ("persistence_controls", None),
+                        ]),
                     });
                     Ok(())
                 })
@@ -3291,7 +3304,9 @@ mod tests {
             let retained = &records[1]["counts"]["pass"]["retained_heap_bytes"];
             assert_eq!(retained["files_bytes"], 123);
             assert!(retained["side_maps_bytes"].is_null());
-            assert_eq!(retained.as_object().unwrap().len(), 2);
+            assert_eq!(retained["side_maps_parts"]["growth_retention"], 123);
+            assert!(retained["side_maps_parts"]["persistence_controls"].is_null());
+            assert_eq!(retained.as_object().unwrap().len(), 3);
             assert!(records[0]["counts"].get("pass").is_none());
         }
     }
