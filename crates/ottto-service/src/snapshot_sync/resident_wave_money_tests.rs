@@ -146,6 +146,43 @@ fn drain_from(
         );
         page.finish();
         let sent = under_required_cas(&page.scan.snapshots, &progress);
+        if restart && pages == 2 && !sent.is_empty() {
+            // Refuse one paced page, then retry its unchanged owed bodies at
+            // the upload deadline through the existing exact-ACK uploader.
+            let cadences = std::mem::take(&mut *source_cadences().lock().unwrap());
+            let deadlines = std::mem::take(&mut *source_upload_deadlines().lock().unwrap());
+            crate::scan_clock::with_clock(1000, || {
+                let source = SnapshotSource::ClaudeCode;
+                let now = crate::scan_clock::now();
+                with_source_cadence(source, |cadence| {
+                    cadence.record_scan_success(now, 1);
+                    cadence.request_paced_scan(now, Duration::ZERO, continuation::PACED_AC);
+                });
+                let before = progress.accepted_body_witnesses.clone();
+                let (status, _, _) = upload(&sent, &mut progress, |_| {
+                    Err(anyhow::Error::new(UploadShed {
+                        status: 503,
+                        retry_after: Some(Duration::from_secs(60)),
+                        code: None,
+                    }))
+                });
+                assert_eq!(
+                    status.unwrap(),
+                    ResumableUploadResult::Shed {
+                        retry_after: Some(Duration::from_secs(60)),
+                    }
+                );
+                assert_eq!(progress.accepted_body_witnesses, before, "no shed credit");
+                defer_source_uploads(source, Duration::from_secs(60));
+                assert_eq!(paced_scan_due(), Some(now + Duration::from_secs(60)));
+                crate::scan_clock::with_clock(1060, || {
+                    assert!(source_upload_backoff_remaining(source).is_none());
+                    assert!(source_cadence_wait(source).is_none());
+                });
+            });
+            *source_cadences().lock().unwrap() = cadences;
+            *source_upload_deadlines().lock().unwrap() = deadlines;
+        }
         let (status, batches, _) = upload(&sent, &mut progress, ack);
         assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
         let posted = batches
@@ -250,6 +287,7 @@ fn drain_from(
 /// [money] A resident-deferred page also packs its admitted families into
 /// evidence chunks. Its saved drain equals one wide page enriched as one chunk.
 #[test]
+#[serial_test::serial(client_report, source_cadences, source_upload_deadlines)]
 fn resident_deferred_packed_evidence_matches_one_page_one_chunk() {
     if !supported("resident-packed-evidence") {
         return;
@@ -333,6 +371,7 @@ fn corpus_with_family(name: &str) -> Corpus {
 /// ACKed bodies, receipts, accepted placement buckets and census completion.
 /// Restart-between-pages drains owed files, then a quiet restart reads zero.
 #[test]
+#[serial_test::serial(client_report, source_cadences, source_upload_deadlines)]
 fn resident_wave_final_acked_money_and_saved_deferral_restart_are_equal() {
     if !supported("resident-wave") {
         return;
@@ -427,6 +466,7 @@ fn resident_wave_final_acked_money_and_saved_deferral_restart_are_equal() {
 /// [money] Deferred units retain nonempty accepted proof and never settle an
 /// unaccepted successor; an exact ACK receipt survives a process reopen.
 #[test]
+#[serial_test::serial(client_report, source_cadences, source_upload_deadlines)]
 fn resident_wave_held_money_survives_refusal_not_stored_partial_and_ack_crash() {
     if !supported("resident-wave-held") {
         return;
@@ -571,6 +611,7 @@ fn resident_wave_held_money_survives_refusal_not_stored_partial_and_ack_crash() 
 /// [money] Path twins force their complete family. A tiny allowance still
 /// admits that unit whole and reads each physical member once across pages.
 #[test]
+#[serial_test::serial(client_report, source_cadences, source_upload_deadlines)]
 fn resident_wave_twins_and_forced_family_are_read_once() {
     if !supported("resident-wave-twins") {
         return;
@@ -593,6 +634,7 @@ fn resident_wave_twins_and_forced_family_are_read_once() {
 /// [money] The mass late-evidence wave re-folds committed Tails with no native
 /// transcript read. Page saves and a new owner retain exact final ACK money.
 #[test]
+#[serial_test::serial(client_report, source_cadences, source_upload_deadlines)]
 fn resident_wave_source_changed_tail_refolds_match_one_page() {
     if !supported("resident-wave-refolds") {
         return;
