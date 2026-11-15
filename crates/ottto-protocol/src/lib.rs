@@ -776,6 +776,11 @@ pub struct ActiveSessionReconciliation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scan_started_at: Option<Rfc3339Timestamp>,
     pub reconciled_at: Rfc3339Timestamp,
+    /// Maximum parsed session activity time for this source on this Mac,
+    /// filtered to at most five minutes after reconciliation before taking the
+    /// maximum, then carried forward across scans and cleared active lists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_activity_at: Option<String>,
     /// Recency window used by the daemon; older caches used fifteen minutes.
     #[serde(default = "default_active_window_seconds")]
     pub active_window_seconds: u64,
@@ -8582,10 +8587,12 @@ mod tests {
                 "sessions": []
             }))
             .expect("older reconciliation");
+        assert_eq!(reconciliation.last_activity_at, None);
         assert_eq!(reconciliation.scan_started_at, None);
         assert_eq!(reconciliation.active_window_seconds, 900);
         let value = serde_json::to_value(reconciliation).unwrap();
         assert!(value.get("scan_started_at").is_none());
+        assert!(value.get("last_activity_at").is_none());
     }
 
     #[test]
@@ -8593,6 +8600,7 @@ mod tests {
         let reconciliation = ActiveSessionReconciliation {
             scan_started_at: Some("2026-07-19T17:55:00Z".to_string()),
             reconciled_at: "2026-07-19T18:00:00Z".to_string(),
+            last_activity_at: Some("2026-07-19T17:59:00Z".to_string()),
             active_window_seconds: 900,
             changed_session_count: 1,
             sessions: vec![ActiveSession {
@@ -8690,6 +8698,7 @@ mod tests {
         assert!(value["sessions"][0]
             .as_object()
             .is_some_and(|session| !session.contains_key("provider_route")));
+        assert_eq!(value["last_activity_at"], "2026-07-19T17:59:00Z");
         let round_tripped: ActiveSessionReconciliation =
             serde_json::from_value(value).expect("deserialize reconciliation");
         assert_eq!(round_tripped, reconciliation);
