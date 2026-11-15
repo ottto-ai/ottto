@@ -504,8 +504,12 @@ pub(super) struct HeaderInventory {
     pub(super) unreadable_causes: crate::codex_scan_diagnostics::UnreadableCauses,
     /// How often each `Incomplete` writer turned `complete` false. Counts only,
     /// for the page's census line; never persisted, never a gate.
-    pub(super) incomplete_causes: [usize; INCOMPLETE_CAUSE_NAMES.len()],
+    pub(super) incomplete_causes: IncompleteCauses,
 }
+/// Inline only, so the retained-heap walk visits it zero times.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct IncompleteCauses(pub(super) [usize; INCOMPLETE_CAUSE_NAMES.len()]);
+crate::heap_layout_bound::no_heap!(true; IncompleteCauses);
 
 /// Why `HeaderInventory::complete` went false, in `INCOMPLETE_CAUSE_NAMES` order.
 #[derive(Clone, Copy)]
@@ -583,7 +587,7 @@ impl HeaderInventory {
             cache_pruned: false,
             refused: BTreeMap::new(),
             unreadable_causes: Default::default(),
-            incomplete_causes: [0; INCOMPLETE_CAUSE_NAMES.len()],
+            incomplete_causes: IncompleteCauses::default(),
         };
         let stable = directories.is_some_and(|value| value.stable);
         inventory.mark_incomplete(Incomplete::CensusUnstable, usize::from(!stable));
@@ -593,7 +597,7 @@ impl HeaderInventory {
     pub(super) fn mark_incomplete(&mut self, cause: Incomplete, count: usize) {
         if count > 0 {
             self.complete = false;
-            let slot = &mut self.incomplete_causes[cause as usize];
+            let slot = &mut self.incomplete_causes.0[cause as usize];
             *slot = slot.saturating_add(count);
         }
     }
@@ -607,7 +611,7 @@ impl HeaderInventory {
             format!(
                 " inventory_held={held} inventory_awaiting_directories={} inventory_outside_roster={outside} {}",
                 u8::from(awaiting),
-                census_count_fields(&INCOMPLETE_CAUSE_NAMES, &self.incomplete_causes)
+                census_count_fields(&INCOMPLETE_CAUSE_NAMES, &self.incomplete_causes.0)
             )
         })
     }
@@ -1066,7 +1070,7 @@ impl HeaderInventory {
 }
 crate::heap_layout_bound::fields!(DirectoryCensus; directories, stable);
 crate::heap_layout_bound::fields!(HeaderWitness; candidate, owner, home, created_unix_ms, metadata, stamp);
-crate::heap_layout_bound::fields!(HeaderInventory; roots, pending, headers, directories, complete, held_owners, read_bytes, reuse_hits, reuse_misses, bytes_avoided, reuse_evictions, cache_pruned, refused, unreadable_causes, incomplete_causes);
+crate::heap_layout_bound::fields!(HeaderInventory; roots, pending, headers, directories, complete, held_owners, read_bytes, reuse_hits, reuse_misses, bytes_avoided, reuse_evictions, cache_pruned, refused, unreadable_causes; inline incomplete_causes);
 
 #[derive(Clone, Debug)]
 pub(super) struct Group {
@@ -2437,7 +2441,7 @@ pub(super) mod tests {
             )
         );
         let absent = HeaderInventory::new(&[], &BTreeSet::new(), None);
-        assert_eq!(absent.incomplete_causes, [1, 0, 0, 0, 0, 0]);
+        assert_eq!(absent.incomplete_causes.0, [1, 0, 0, 0, 0, 0]);
     }
 
     #[test]
