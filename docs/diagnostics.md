@@ -1088,6 +1088,22 @@ gate, cap and upload nothing.
 
 Upload counts land on the line after the source's next page line.
 
+## Full Reads By Prior Stamp
+
+After a source's page line, a `native_full_prior_stamp` line carries
+`counts.full_by_prior_stamp.<reason>.<bucket>.{count,completed_native_bytes}`
+for Claude Code, Codex and Pi when any cell is nonzero. `<reason>` is the
+candidate parse reason, or `unattributed` when the selection had none. The
+bucket is fixed once, when the Full is selected, by comparing the file's
+listing with its last committed index entry: `listing_unchanged` (same length
+and mtime_ns), `same_size_moved_mtime`, `size_changed`, or `no_baseline` (no
+entry, a new file, or an entry without mtime_ns). It is best effort: there is
+no inode, so a same-size same-mtime replacement counts as unchanged, and equal
+stamps do not prove equal bytes. A Codex protected-tier replay counts under the
+bucket of its original selection; a Codex group replay is not counted. The
+existing `sampled_acquisition.page_events.full_by_parse_reason` keeps its shape
+and now covers every source. Counts only; nothing reads them to decide anything.
+
 ## Usage Gap Counters
 
 Each source's `native_collection_page` line can carry four counts of gaps in
@@ -1560,6 +1576,9 @@ No paths, identifiers, fingerprints, bodies or content are emitted.
 Two sparse scalars ride the same counts: `link_scrape_bytes`, the text the
 always-on link scrape tokenized, and `links_over_limit`, links left off an
 upload because their value exceeds the receiver's 512-character limit.
+A third, `twin_compare_bytes`, counts the transcript bytes the redundant-twin
+comparison read (both readers, buffered read-ahead included); the comparison's
+result, bounds and read order are unchanged.
 
 Collection counters cover initialization and all cooperative steps of one page,
 including steps before a pause or a move to another worker thread. Additional

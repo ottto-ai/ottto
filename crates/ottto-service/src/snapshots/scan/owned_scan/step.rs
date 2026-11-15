@@ -1498,6 +1498,7 @@ impl OwnedSourceScan {
                         resource_probe.full_parse_reason(
                             plan.mode(),
                             active.parse_reason,
+                            active.prior_stamp,
                             0,
                             plan.metrics().native_bytes,
                         );
@@ -1574,6 +1575,13 @@ impl OwnedSourceScan {
                         context.priority_replays += 1;
                         context.record_mode(mode, acquisition.audit_due);
                     }
+                    resource_probe.full_parse_reason(
+                        mode,
+                        active.parse_reason,
+                        active.prior_stamp,
+                        1,
+                        0,
+                    );
                     active.parser = parser;
                     active.charged_bytes = 0;
                     active.hold_offset = None;
@@ -1832,6 +1840,7 @@ impl OwnedSourceScan {
                     candidate,
                     decision,
                     parse_reason: _,
+                    prior_stamp: _,
                     previous_snapshot_fingerprint,
                     previous_upload_body_witness,
                     projection_adoption_required,
@@ -4706,6 +4715,16 @@ impl OwnedSourceScan {
                 pending!();
             }
             index.note_change_reason_selected(source, &candidate, parse_reason, source_change);
+            // Frozen here, before this read can change the index entry.
+            let prior_stamp =
+                crate::local_resource_diagnostics::claude_reread::PriorStamp::classify(
+                    (candidate.size_bytes, candidate.modified_unix_nanos),
+                    index
+                        .files
+                        .get(&local_index_key(&candidate.path))
+                        .filter(|_| parse_reason != Some(CandidateParseReason::NewFile))
+                        .map(|entry| (entry.size_bytes, entry.modified_unix_nanos)),
+                );
             let mut active = Box::new(OwnedActiveFile {
                 first_read: crate::local_resource_diagnostics::FirstRead::begin(
                     source,
@@ -4715,7 +4734,8 @@ impl OwnedSourceScan {
                 sampling: file_sampling,
                 candidate,
                 decision,
-                parse_reason: parse_reason.filter(|_| source == SnapshotSource::ClaudeCode),
+                parse_reason,
+                prior_stamp: Some(prior_stamp),
                 previous_snapshot_fingerprint,
                 previous_upload_body_witness,
                 projection_adoption_required,
@@ -4848,7 +4868,13 @@ impl OwnedSourceScan {
                     context.record_mode(mode, audit_due);
                     resource_probe
                         .rearm_full_selected(&local_index_key(&active.candidate.path), mode);
-                    resource_probe.full_parse_reason(mode, active.parse_reason, 1, 0);
+                    resource_probe.full_parse_reason(
+                        mode,
+                        active.parse_reason,
+                        active.prior_stamp,
+                        1,
+                        0,
+                    );
                 }
             }
             if let Some(delivery) = line_delivery.as_mut() {

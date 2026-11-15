@@ -91,6 +91,7 @@ impl Counts {
 struct Page {
     causes: Counts,
     parse_reasons: super::claude_reread::FullByParseReason,
+    prior_stamps: super::claude_reread::FullByPriorStamp,
 }
 // Probe::drop releases the page, including early exits.
 fn with_pages<T>(f: impl FnOnce(&mut BTreeMap<Instant, Page>) -> T) -> T {
@@ -130,6 +131,26 @@ pub(crate) fn record_parse_reason(
             .parse_reasons
             .record(reason, count, native_bytes)
     });
+}
+pub(crate) fn record_prior_stamp(
+    page: Instant,
+    reason: Option<CandidateParseReason>,
+    stamp: super::claude_reread::PriorStamp,
+    count: u64,
+    native_bytes: u64,
+) {
+    with_pages(|pages| {
+        let page = pages.entry(page).or_default();
+        page.prior_stamps.record(reason, stamp, count, native_bytes)
+    });
+}
+pub(crate) fn full_by_prior_stamp(page: Instant) -> super::claude_reread::FullByPriorStamp {
+    with_pages(|pages| {
+        pages
+            .get(&page)
+            .map(|page| page.prior_stamps)
+            .unwrap_or_default()
+    })
 }
 pub(crate) fn page(page: Instant) -> Counts {
     with_pages(|pages| pages.get(&page).map(|page| page.causes).unwrap_or_default())

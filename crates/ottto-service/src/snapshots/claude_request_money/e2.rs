@@ -4707,32 +4707,44 @@ fn redundant_twin(key: &str, other: &str, folded: &SnapshotItem, index: &ScanInd
         if metadata.len() > bound {
             return Some(false);
         }
-        let mut p = BufReader::new(std::fs::File::open(key).ok()?.take(bound.saturating_add(1)));
-        let mut q = BufReader::new(std::fs::File::open(other).ok()?.take(bound));
-        let (mut a, mut b) = (Vec::new(), Vec::new());
-        let (mut prefix, mut read) = (true, 0u64);
-        loop {
-            a.clear();
-            let n = p.read_until(b'\n', &mut a).ok()?;
-            if n == 0 {
-                return Some(read == metadata.len());
-            }
-            read = read.saturating_add(n as u64);
-            if prefix {
-                b.clear();
-                q.read_until(b'\n', &mut b).ok()?;
-                if a == b {
-                    continue;
+        let limits = (bound.saturating_add(1), bound);
+        let mut p = BufReader::new(std::fs::File::open(key).ok()?.take(limits.0));
+        let mut q = BufReader::new(std::fs::File::open(other).ok()?.take(limits.1));
+        let mut compare = || -> Option<bool> {
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            let (mut prefix, mut read) = (true, 0u64);
+            loop {
+                a.clear();
+                let n = p.read_until(b'\n', &mut a).ok()?;
+                if n == 0 {
+                    return Some(read == metadata.len());
                 }
-                prefix = false;
+                read = read.saturating_add(n as u64);
+                if prefix {
+                    b.clear();
+                    q.read_until(b'\n', &mut b).ok()?;
+                    if a == b {
+                        continue;
+                    }
+                    prefix = false;
+                }
+                let line: serde_json::Value = serde_json::from_slice(&a).ok()?;
+                if super::super::claude_code_usage_dedup_key(&line).is_some()
+                    || super::super::claude_code_usage_root(&line).is_some()
+                {
+                    return Some(false);
+                }
             }
-            let line: serde_json::Value = serde_json::from_slice(&a).ok()?;
-            if super::super::claude_code_usage_dedup_key(&line).is_some()
-                || super::super::claude_code_usage_root(&line).is_some()
-            {
-                return Some(false);
-            }
-        }
+        };
+        let proven = compare();
+        // Counts only: both readers' consumed bytes, read-ahead and early exits included.
+        crate::local_resource_diagnostics::claude_reread::twin_compare_bytes(
+            limits
+                .0
+                .saturating_sub(p.get_ref().limit())
+                .saturating_add(limits.1.saturating_sub(q.get_ref().limit())),
+        );
+        proven
     };
     proof() == Some(true)
 }

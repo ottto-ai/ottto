@@ -4632,3 +4632,6 @@ mod subagent_twin_tests;
 
 #[path = "e2_subagent_twin_tail_tests.rs"]
 mod subagent_twin_tail_tests;
+
+#[path = "e2_twin_compare_bytes_tests.rs"]
+mod twin_compare_bytes_tests;

@@ -41,6 +41,97 @@ impl Serialize for FullByParseReason {
     }
 }
 
+/// Whether a Full read's file was unchanged since the last committed index
+/// listing (length and mtime_ns). Best effort: no inode, so a same-size
+/// same-mtime replacement counts as unchanged; equal stamps do not prove
+/// equal bytes. Classified once at Full selection; counts only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PriorStamp {
+    ListingUnchanged,
+    SameSizeMovedMtime,
+    SizeChanged,
+    NoBaseline,
+}
+const PRIOR_STAMP_NAMES: [&str; 4] = [
+    "listing_unchanged",
+    "same_size_moved_mtime",
+    "size_changed",
+    "no_baseline",
+];
+crate::heap_layout_bound::unit_enum!(true;
+    PriorStamp: ListingUnchanged | SameSizeMovedMtime | SizeChanged | NoBaseline;
+);
+impl PriorStamp {
+    /// `listing` is the candidate's (length, mtime_ns); `committed` the index
+    /// entry's, if any. A new file or an entry without mtime_ns has no baseline.
+    pub(crate) fn classify(listing: (u64, u64), committed: Option<(u64, Option<u64>)>) -> Self {
+        match committed {
+            Some((length, Some(mtime))) if length == listing.0 && mtime == listing.1 => {
+                Self::ListingUnchanged
+            }
+            Some((length, Some(_))) if length == listing.0 => Self::SameSizeMovedMtime,
+            Some((_, Some(_))) => Self::SizeChanged,
+            _ => Self::NoBaseline,
+        }
+    }
+}
+/// Full selections and completed native bytes by parse reason (plus an
+/// unattributed row) and prior stamp. Nonzero cells only, on its own record.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct FullByPriorStamp(
+    [[super::rearm_cause::Total; 4]; crate::snapshots::CANDIDATE_PARSE_REASON_COUNT + 1],
+);
+impl FullByPriorStamp {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0
+            .iter()
+            .flatten()
+            .all(|n| n.count == 0 && n.completed_native_bytes == 0)
+    }
+    pub(super) fn record(
+        &mut self,
+        reason: Option<crate::snapshots::CandidateParseReason>,
+        stamp: PriorStamp,
+        count: u64,
+        completed_native_bytes: u64,
+    ) {
+        let row = reason.map_or(crate::snapshots::CANDIDATE_PARSE_REASON_COUNT, |r| {
+            r as usize
+        });
+        let total = &mut self.0[row][stamp as usize];
+        total.count = total.count.saturating_add(count);
+        total.completed_native_bytes = total
+            .completed_native_bytes
+            .saturating_add(completed_native_bytes);
+    }
+}
+impl Serialize for FullByPriorStamp {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        struct Row<'a>(&'a [super::rearm_cause::Total; 4]);
+        impl Serialize for Row<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.collect_map(
+                    PRIOR_STAMP_NAMES
+                        .iter()
+                        .zip(self.0)
+                        .filter(|(_, n)| n.count != 0 || n.completed_native_bytes != 0),
+                )
+            }
+        }
+        serializer.collect_map(
+            crate::snapshots::CANDIDATE_PARSE_REASON_NAMES
+                .iter()
+                .chain(&["unattributed"])
+                .zip(&self.0)
+                .filter(|(_, row)| {
+                    row.iter()
+                        .any(|n| n.count != 0 || n.completed_native_bytes != 0)
+                })
+                .map(|(name, row)| (name, Row(row))),
+        )
+    }
+}
+
 /// Closed labels for the existing progress-blocking / restore branches.
 #[derive(Clone, Copy)]
 pub(crate) enum HeldReason {
@@ -170,6 +261,9 @@ pub(crate) struct Counts {
     /// Links left off an upload for the receiver's value length.
     #[serde(skip_serializing_if = "super::is_zero")]
     pub(crate) links_over_limit: u64,
+    /// Transcript bytes the redundant-twin comparison read, read-ahead included.
+    #[serde(skip_serializing_if = "super::is_zero")]
+    pub(crate) twin_compare_bytes: u64,
 }
 /// Finalized file offers, not parses or stored-body acknowledgements.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
@@ -317,6 +411,9 @@ impl Counts {
             .link_scrape_bytes
             .saturating_add(other.link_scrape_bytes);
         self.links_over_limit = self.links_over_limit.saturating_add(other.links_over_limit);
+        self.twin_compare_bytes = self
+            .twin_compare_bytes
+            .saturating_add(other.twin_compare_bytes);
     }
     /// What a non-Claude page emits: the shared retained cache's events only.
     pub(super) fn retained_cache_only(self) -> Self {
@@ -397,6 +494,13 @@ pub(crate) fn link_scrape_bytes(bytes: u64) {
 pub(crate) fn links_over_limit(links: u64) {
     if links > 0 {
         update(|counts| counts.links_over_limit = counts.links_over_limit.saturating_add(links));
+    }
+}
+pub(crate) fn twin_compare_bytes(bytes: u64) {
+    if bytes > 0 {
+        update(|counts| {
+            counts.twin_compare_bytes = counts.twin_compare_bytes.saturating_add(bytes)
+        });
     }
 }
 pub(crate) fn cache_event(event: cache_lifecycle::Event, amount: u64) {

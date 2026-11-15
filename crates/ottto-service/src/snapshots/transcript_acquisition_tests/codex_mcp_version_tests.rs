@@ -261,6 +261,59 @@ fn tier_replay_publishes_twice_without_losing_the_winner() {
     assert_eq!(projection.snapshot().0.unwrap().version(), Some("0.148.9"));
 }
 
+/// [behaviour] The protected-tier replay Full is counted once, with its
+/// re-read bytes, in the stamp bucket frozen when the file was selected.
+#[test]
+#[cfg(unix)]
+fn tier_replay_full_counts_once_under_the_selection_prior_stamp() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let f = fixture();
+    let projection = feed(&f);
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let scan = |index| {
+        production_scan_at_with_setup(
+            &f,
+            SnapshotSource::Codex,
+            index,
+            Some(cache.clone()),
+            "prior-stamp-replay",
+            NOW,
+            |s: &mut OwnedSourceScan| s.codex_versions = Some(projection.clone()),
+        )
+    };
+    let (index, _, _, _) = scan(ScanIndex::default());
+    let mut priority = usage(SnapshotSource::Codex, 140, 1, "fixture-model");
+    priority["payload"]["service_tier"] = json!("priority");
+    f.file.append(&priority);
+    let replays = || {
+        crate::snapshots::tail_source::counters::total(
+            "tail_reconstruct_bytes",
+            "tier_prefix_replay",
+        )
+    };
+    let before = replays();
+    let ((_, _, modes, _), rows) = crate::local_resource_diagnostics::capture(|| scan(index));
+    assert_eq!(modes, (1, 1, 0), "real Tail followed by TierReplay Full");
+    let read = replays() - before;
+    assert!(read > 0);
+    let stamps = rows
+        .iter()
+        .filter(|row| row["stage"] == "native_full_prior_stamp")
+        .collect::<Vec<_>>();
+    assert_eq!(stamps.len(), 1);
+    let matrix = stamps[0]["counts"]["full_by_prior_stamp"]
+        .as_object()
+        .unwrap();
+    assert_eq!(matrix.len(), 1, "{matrix:?}");
+    assert_eq!(
+        matrix.values().next().unwrap(),
+        &json!({"size_changed": {"count": 1, "completed_native_bytes": read}}),
+        "the Tail selection is not a Full; the replay is"
+    );
+}
+
 #[test]
 #[cfg(unix)]
 fn fork_with_invalid_own_version_adopts_copied_parent_version() {
