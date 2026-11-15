@@ -27,6 +27,8 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 #[cfg(unix)]
 pub(crate) mod support_health;
 
+#[cfg(all(test, target_os = "linux"))]
+mod append_handle_tests;
 #[cfg(test)]
 mod decoder_tests;
 #[cfg(test)]
@@ -505,10 +507,11 @@ fn persist_api_evidence(
     if evidence.is_empty() {
         return Ok(0);
     }
-    let _guard = append_lock()
+    let mut handles = append_lock()
         .lock()
         .map_err(|_| anyhow::anyhow!("effort store lock poisoned"))?;
     append_rows(
+        &mut handles,
         support_dir,
         evidence.iter().map(|item| {
             (
@@ -539,10 +542,11 @@ pub fn capture_claude_llm_request_traces(
     if evidence.is_empty() {
         return Ok(0);
     }
-    let _guard = append_lock()
+    let mut handles = append_lock()
         .lock()
         .map_err(|_| anyhow::anyhow!("Claude local OTEL store lock poisoned"))?;
     append_rows(
+        &mut handles,
         support_dir,
         evidence.iter().map(|item| {
             (
@@ -1635,9 +1639,18 @@ pub(crate) fn unlink_telemetry_pair(
     stem: &str,
     pair: &TelemetryPair,
 ) -> std::io::Result<bool> {
-    let _guard = append_lock()
+    let mut handles = append_lock()
         .lock()
         .map_err(|_| std::io::Error::other("Claude local OTEL store lock poisoned"))?;
+    unlink_telemetry_pair_locked(&mut handles, support_dir, stem, pair)
+}
+
+fn unlink_telemetry_pair_locked(
+    handles: &mut AppendHandles,
+    support_dir: &Path,
+    stem: &str,
+    pair: &TelemetryPair,
+) -> std::io::Result<bool> {
     let paths = telemetry_member_paths(support_dir, stem);
     for (path, generation) in paths.iter().zip(&pair.generations) {
         if telemetry_member(path).map_err(|_| std::io::Error::other("member unreadable"))?
@@ -1648,11 +1661,17 @@ pub(crate) fn unlink_telemetry_pair(
     }
     for (path, generation) in paths.iter().zip(&pair.generations) {
         if generation.is_some() {
-            #[cfg(test)]
-            if FAIL_TELEMETRY_UNLINK.with(|n| n.replace(n.get().saturating_sub(1)) == 1) {
-                return Err(std::io::Error::other("injected unlink failure"));
-            }
-            fs::remove_file(path)?;
+            let removed = (|| {
+                #[cfg(test)]
+                if FAIL_TELEMETRY_UNLINK.with(|n| n.replace(n.get().saturating_sub(1)) == 1) {
+                    return Err(std::io::Error::other("injected unlink failure"));
+                }
+                fs::remove_file(path)
+            })();
+            handles.evict(path);
+            removed?;
+        } else {
+            handles.evict(path);
         }
     }
     Ok(true)
@@ -1998,7 +2017,9 @@ fn proto_any_value(value: &otlp_proto::AnyValue) -> Option<String> {
 
 #[cfg(test)]
 fn append_evidence(support_dir: &Path, item: &ClaudeLocalOtelEvidence) -> Result<bool> {
+    let mut handles = append_lock().lock().unwrap();
     append_rows(
+        &mut handles,
         support_dir,
         [(
             item.session_id.as_ref(),
@@ -2014,7 +2035,9 @@ fn append_trace_ownership_evidence(
     support_dir: &Path,
     item: &ClaudeTraceOwnershipEvidence,
 ) -> Result<bool> {
+    let mut handles = append_lock().lock().unwrap();
     append_rows(
+        &mut handles,
         support_dir,
         [(
             item.session_id.as_ref(),
@@ -2026,13 +2049,18 @@ fn append_trace_ownership_evidence(
 }
 
 /// Preserve each file's row order and encoding, with one append per request.
-/// The caller holds `append_lock`; handles remain local and writes do not fsync.
+/// The caller holds `append_lock`; writes remain unbuffered and do not fsync.
 fn append_rows<'a, T: Serialize + 'a>(
+    handles: &mut AppendHandles,
     support_dir: &Path,
     rows: impl IntoIterator<Item = (&'a str, PathBuf, &'a T)>,
 ) -> Result<usize> {
     use crate::local_resource_diagnostics::cache_lifecycle::{self, Event};
 
+    anyhow::ensure!(
+        !handles.disabled,
+        "Claude evidence appends disabled for uninstall"
+    );
     let mut batches = BTreeMap::<PathBuf, (Vec<u8>, usize, BTreeSet<&str>)>::new();
     for (root, path, row) in rows {
         if crate::internal_session::is_internal_session_id(root) {
@@ -2060,17 +2088,7 @@ fn append_rows<'a, T: Serialize + 'a>(
                 }
             }
         }
-        let mut options = OpenOptions::new();
-        options.create(true).append(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options
-            .open(path)
-            .context("open Claude evidence append file")?;
-        append_evidence_bytes(&mut file, &encoded).context("append Claude evidence")?;
+        handles.append(&path, &encoded)?;
         cache_lifecycle::add(Event::OtlpRelayAppendedRows, count as u64);
         cache_lifecycle::add(Event::OtlpRelayAppendedBytes, encoded.len() as u64);
         for root in roots {
@@ -2100,9 +2118,139 @@ fn trace_evidence_path(support_dir: &Path, session_id: &str) -> PathBuf {
     trace
 }
 
-fn append_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+struct OpenAppendFile {
+    path: PathBuf,
+    file: File,
+    dev: u64,
+    ino: u64,
+}
+
+// Owned exclusively by the append guard. FIFO order changes only on insertion.
+#[derive(Default)]
+struct AppendHandles {
+    open: Vec<OpenAppendFile>,
+    cap: usize,
+    disabled: bool,
+    #[cfg(test)]
+    opens: usize,
+    #[cfg(test)]
+    open_error: Option<i32>,
+}
+
+impl AppendHandles {
+    fn evict(&mut self, path: &Path) {
+        self.open.retain(|entry| entry.path != path);
+    }
+
+    fn clear(&mut self) {
+        self.open.clear(); // Never reset the process-lifetime uninstall fence.
+    }
+
+    fn disable(&mut self) {
+        self.disabled = true;
+        self.clear();
+    }
+
+    fn open_file(&mut self, path: &Path) -> std::io::Result<File> {
+        #[cfg(test)]
+        {
+            self.opens += 1;
+            if let Some(code) = self.open_error.take() {
+                return Err(std::io::Error::from_raw_os_error(code));
+            }
+        }
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options.open(path)
+    }
+
+    fn append(&mut self, path: &Path, encoded: &[u8]) -> Result<()> {
+        if let Some(index) = self.open.iter().position(|entry| entry.path == path) {
+            let entry = &self.open[index];
+            let matches = fs::metadata(path)
+                .ok()
+                .and_then(|metadata| api_file_generation(&metadata))
+                .is_some_and(|generation| {
+                    generation.device == entry.dev && generation.inode == entry.ino
+                });
+            if !matches {
+                self.evict(path);
+            }
+        }
+        let index = match self.open.iter().position(|entry| entry.path == path) {
+            Some(index) => index,
+            None => {
+                if !self.open.is_empty() && self.open.len() >= self.cap {
+                    self.open.remove(0); // Release before opening a replacement.
+                }
+                let file = match self.open_file(path) {
+                    #[cfg(unix)]
+                    Err(error)
+                        if matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE)) =>
+                    {
+                        if !self.open.is_empty() {
+                            self.open.remove(0);
+                        }
+                        self.open_file(path)
+                    }
+                    result => result,
+                }
+                .context("open Claude evidence append file")?;
+                // The witness must describe the opened object, not a prior path stat.
+                let generation = api_file_generation(&file.metadata()?);
+                self.open.push(OpenAppendFile {
+                    path: path.to_path_buf(),
+                    file,
+                    dev: generation.as_ref().map_or(0, |g| g.device),
+                    ino: generation.as_ref().map_or(0, |g| g.inode),
+                });
+                self.open.len() - 1
+            }
+        };
+        let result = append_evidence_bytes(&mut self.open[index].file, encoded)
+            .context("append Claude evidence");
+        if result.is_err() || self.cap == 0 {
+            self.evict(path);
+        }
+        result
+    }
+}
+
+fn append_lock() -> &'static Mutex<AppendHandles> {
+    static LOCK: OnceLock<Mutex<AppendHandles>> = OnceLock::new();
+    LOCK.get_or_init(|| {
+        #[cfg(unix)]
+        let cap = crate::control_plane_health::descriptor_limit().map_or(0, |n| (n / 8).min(32));
+        #[cfg(not(unix))]
+        let cap = 0;
+        Mutex::new(AppendHandles {
+            cap,
+            ..AppendHandles::default()
+        })
+    })
+}
+
+/// Periodic handle release initiates write-back; it is not a durability fence.
+pub(crate) fn close_append_handles() {
+    append_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+}
+
+/// Fence admitted relay workers before cleanup, releasing the guard before any
+/// uninstall subprocess runs. Only process exit can reset this fence.
+pub(crate) fn disable_appends_for_uninstall() -> std::io::Result<()> {
+    append_lock()
+        .lock()
+        .map_err(|_| std::io::Error::other("Claude local OTEL store lock poisoned"))?
+        .disable();
+    Ok(())
 }
 
 /// Minimal OTLP log/trace wire surface. Keeping these definitions local avoids

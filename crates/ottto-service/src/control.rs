@@ -1663,6 +1663,7 @@ fn handle_command(
                 &home.join("Library/Application Support/Ottto"),
             )
             .or_state_poisoned()?;
+            crate::claude_local_otel::disable_appends_for_uninstall().or_state_poisoned()?;
             let mut result = execute_local_uninstall(&home, UninstallExecutionOptions::DAEMON);
             sweep_telemetry_keys_for_uninstall(&mut result);
             match &authorization {
