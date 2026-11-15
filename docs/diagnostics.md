@@ -1525,11 +1525,14 @@ Completed native scan pages carry `routine_recensus`, `page_file_limit_hit`,
 `pending_work` means queued directories or candidates remain. The file-limit
 pacing decision is `page_file_limit_hit && pending_work && !routine_recensus`; a
 resident deferral can still request pacing independently. `first_read_progress`
-means the page completed a census-member read or listed census directories and
-left the walk unfinished; during a source's first backfill,
-`first_read_progress && pending_work` also requests the existing paced pass. A
-page that read and listed nothing new does not. These observations add no timer
-or trigger.
+means the page recorded a selected census read of a file new to the index, or a
+listing tick consumed queued directories and left census directories queued.
+During a source's first backfill, `first_read_progress && pending_work` also
+requests the existing paced pass unless the census completed on that page or the
+pass is a routine re-census. A re-read of a recorded file, a failed or deferred
+read and a page that read and listed nothing new do not. A page whose selected
+files are all skipped waits the ordinary cadence. These observations add no
+timer or trigger.
 No full fingerprint, path or key is emitted, and none of these fields enters uploads.
 
 ## Prior Held Family Observation

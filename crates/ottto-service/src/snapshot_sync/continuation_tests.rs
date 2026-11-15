@@ -1582,66 +1582,121 @@ fn first_read_byte_pacing_stops_when_backfill_completes() {
 }
 
 /// [behaviour] First-read progress asks for pacing with queued work only
-/// during a first backfill. The charge, file-limit and byte-budget terms keep
-/// their own rules, and a routine pass ignores progress.
+/// during a first backfill, while the census is unfinished and the pass is not
+/// a routine re-census. The charge, file-limit and byte-budget terms keep their
+/// own rules, and a routine pass ignores progress.
 #[test]
 fn first_read_progress_pages_pace_only_during_a_first_backfill() {
     let mut scan = empty_scan();
-    for bits in 0..128_u8 {
-        let [bootstrap, pending, progress, byte_hit, file_hit, routine, charge] =
-            [1, 2, 4, 8, 16, 32, 64].map(|bit| bits & bit != 0);
+    for bits in 0..=u8::MAX {
+        let [bootstrap, pending, progress, byte_hit, file_hit, routine, charge, complete] =
+            [1, 2, 4, 8, 16, 32, 64, 128].map(|bit| bits & bit != 0);
         scan.census_status.pending_work = pending;
         scan.first_read_progress = progress;
         scan.page_byte_budget_hit = byte_hit;
         scan.page_file_limit_hit = file_hit;
         scan.routine_recensus = routine;
         scan.charge_deferred = charge;
+        scan.census_complete = complete;
         let existing = charge || (pending && ((file_hit && !routine) || (bootstrap && byte_hit)));
+        let progress_term = bootstrap && pending && progress && !routine && !complete;
         let requested = resident_scan_requested(&scan, bootstrap);
-        assert_eq!(
-            requested,
-            existing || (bootstrap && pending && progress),
-            "{bits:07b}"
-        );
+        assert_eq!(requested, existing || progress_term, "{bits:08b}");
         if !bootstrap {
             scan.first_read_progress = !progress;
             assert_eq!(
                 resident_scan_requested(&scan, false),
                 requested,
-                "{bits:07b}"
+                "{bits:08b}"
             );
+        }
+    }
+    // The read that completes the census, with non-member work still queued,
+    // asks for no further paced pass.
+    let mut scan = empty_scan();
+    (scan.census_status.pending_work, scan.first_read_progress) = (true, true);
+    scan.census_complete = true;
+    assert!(!resident_scan_requested(&scan, true));
+}
+
+/// One valid synthetic transcript of `source` in `dir`, numbered `n`.
+fn first_read_file(source: SnapshotSource, dir: &Path, n: u64) -> PathBuf {
+    std::fs::create_dir_all(dir).unwrap();
+    match source {
+        SnapshotSource::Codex => codex_rollouts(dir, n, 1).remove(0),
+        SnapshotSource::ClaudeCode => {
+            let session = format!("a0000000-0000-4000-8000-{n:012}");
+            let path = dir.join(format!("{session}.jsonl"));
+            std::fs::write(&path, claude_line(&session, n)).unwrap();
+            path
+        }
+        SnapshotSource::Pi => {
+            let path = dir.join(format!("session-{n}.jsonl"));
+            std::fs::write(&path, pi_line(n)).unwrap();
+            path
         }
     }
 }
 
-/// Synthetic transcripts under dated day directories: two Codex rollouts in
-/// `2026/10/24` (their file date), or two Pi sessions in each of `2026/10/23`
-/// and `2026/10/24`.
-fn first_read_tree(source: SnapshotSource, root: &Path) {
-    if source == SnapshotSource::Codex {
-        let dir = root.join("2026/10/24");
-        std::fs::create_dir_all(&dir).unwrap();
-        codex_rollouts(&dir, 0, 2);
-        return;
+fn claude_line(session: &str, n: u64) -> String {
+    let line = serde_json::json!({"type": "assistant", "version": "2.1.309",
+        "sessionId": session, "timestamp": "2026-08-02T07:00:00Z",
+        "requestId": format!("request-{n}"), "message": {"id": format!("message-{n}"),
+        "model": "claude-haiku-4-5", "usage": {"input_tokens": 10, "output_tokens": 1}}});
+    format!("{line}\n")
+}
+
+fn pi_line(n: u64) -> String {
+    let line = serde_json::json!({"type": "message_end", "message": {"model": "gpt-5.4",
+        "timestamp": 1_793_088_001_000_u64 + n, "usage": {"input": 1, "output": 1}}});
+    format!("{line}\n")
+}
+
+/// A fresh index; Claude also loads its (empty) re-emission exclusions.
+fn first_read_index(source: SnapshotSource, home: &Path) -> ScanIndex {
+    let mut index = ScanIndex::default();
+    if source == SnapshotSource::ClaudeCode {
+        crate::snapshots::e2_pipeline_scan_fixture::write_exclusions(home, &[]);
+        index.load_claude_reemission_exclusions(home);
     }
-    for day in [23_u64, 24] {
-        let dir = root.join(format!("2026/10/{day}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        for file in 0..2 {
-            std::fs::write(
-                dir.join(format!("session-{day}-{file}.jsonl")),
-                "{\"type\":\"message_end\",\"message\":{\"model\":\"gpt-5.4\",\"timestamp\":1793088001000,\"usage\":{\"input\":1,\"output\":1}}}\n",
-            )
-            .unwrap();
-        }
-    }
+    index
+}
+
+/// The scan root of `source` under `home`.
+fn first_read_root(source: SnapshotSource, home: &Path) -> PathBuf {
+    home.join(match source {
+        SnapshotSource::ClaudeCode => ".claude/projects",
+        SnapshotSource::Codex => ".codex/sessions",
+        SnapshotSource::Pi => ".pi/agent/sessions",
+    })
+}
+
+/// One page of `source` over `root`: Claude through its own scan seam.
+#[expect(clippy::too_many_arguments, reason = "test helper, 8 page inputs")]
+fn first_read_page(
+    scanner: &crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture,
+    source: SnapshotSource,
+    root: &Path,
+    home: &Path,
+    index: ScanIndex,
+    limit: usize,
+    sampled: bool,
+    hints: &[PathBuf],
+) -> (ScanIndex, SourceScanResult) {
+    let roots = [root.to_path_buf()];
+    let (index, scan, _) = if source == SnapshotSource::ClaudeCode {
+        let births = std::collections::BTreeMap::new();
+        scanner.scan(&roots, home, index, limit, sampled, &births, hints)
+    } else {
+        scanner.scan_other_page(source, &roots, home, index, sampled, limit, hints)
+    };
+    (index, scan)
 }
 
 /// [behaviour] During a first backfill, listing ticks and small-file pages
 /// ask for paced passes although they fill no file allowance and spend no
 /// byte budget. A page that reads nothing new and finishes its listing asks
-/// for nothing (a stuck tail cannot spin), and once the backfill is marked
-/// complete no page asks.
+/// for nothing, and once the backfill is marked complete no page asks.
 #[test]
 fn first_read_progress_paces_first_import_listing_and_small_file_pages() {
     use super::super::backfill_replay_pending;
@@ -1651,7 +1706,11 @@ fn first_read_progress_paces_first_import_listing_and_small_file_pages() {
     use crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture;
     use crate::snapshots::with_test_directory_entries;
     const DESTINATION: &str = "first-read-progress-destination";
-    for source in [SnapshotSource::Codex, SnapshotSource::Pi] {
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
         let bootstrap = |state: &BackfillState| {
             backfill_replay_pending(source, state, DESTINATION)
                 && bootstrap_pending_for_destination(state, source, DESTINATION)
@@ -1659,24 +1718,28 @@ fn first_read_progress_paces_first_import_listing_and_small_file_pages() {
         let home = crate::test_scratch::private_dir("first-read-progress")
             .canonicalize()
             .unwrap();
-        let root = home.join(match source {
-            SnapshotSource::Codex => ".codex/sessions",
-            _ => ".pi/agent/sessions",
-        });
-        first_read_tree(source, &root);
-        let scanner = E2ScanFixture::default();
-        let page = |index, limit| {
-            let roots = std::slice::from_ref(&root);
-            let (index, scan, _) =
-                scanner.scan_other_page(source, roots, &home, index, true, limit, &[]);
-            (index, scan)
+        let root = first_read_root(source, &home);
+        // Codex rollouts sit in their file date's day directory.
+        let dirs: &[&str] = match source {
+            SnapshotSource::ClaudeCode => &["project-a", "project-b"],
+            SnapshotSource::Codex => &["2026/10/24"],
+            SnapshotSource::Pi => &["2026/10/23", "2026/10/24"],
         };
+        for (d, dir) in (0_u64..).zip(dirs) {
+            for n in 0..2 {
+                first_read_file(source, &root.join(dir), d * 10 + n);
+            }
+        }
+        let scanner = E2ScanFixture::default();
+        let page =
+            |index, limit| first_read_page(&scanner, source, &root, &home, index, limit, true, &[]);
         let mut state = BackfillState::default();
         assert!(bootstrap(&state), "{source:?}");
         // Walk one directory per tick until the census completes.
         let walk = |state: &BackfillState| {
             with_test_directory_entries(1, || {
-                let (mut index, mut listing, mut reading) = (ScanIndex::default(), 0, 0);
+                let mut index = first_read_index(source, &home);
+                let (mut listing, mut reading) = (0, 0);
                 for _ in 0..32 {
                     let (next, scan) = page(index, 100);
                     index = next;
@@ -1689,7 +1752,11 @@ fn first_read_progress_paces_first_import_listing_and_small_file_pages() {
                     assert!(!resident_scan_requested(&scan, false), "{source:?}");
                     assert_eq!(
                         resident_scan_requested(&scan, bootstrap(state)),
-                        bootstrap(state) && pending && scan.first_read_progress,
+                        bootstrap(state)
+                            && pending
+                            && scan.first_read_progress
+                            && !scan.routine_recensus
+                            && !scan.census_complete,
                         "{source:?}"
                     );
                     if pending && scan.first_read_progress {
@@ -1708,12 +1775,12 @@ fn first_read_progress_paces_first_import_listing_and_small_file_pages() {
         };
         let (listing, reading) = walk(&state);
         assert!(listing > 0, "{source:?}: listing ticks ask");
-        if source == SnapshotSource::Pi {
+        if source != SnapshotSource::Codex {
             assert!(reading > 0, "{source:?}: small-file pages ask");
         }
 
         // One full listing tick and no selection: queued work, no progress.
-        let (index, stuck) = page(ScanIndex::default(), 0);
+        let (index, stuck) = page(first_read_index(source, &home), 0);
         assert!(stuck.census_status.pending_work, "{source:?}");
         assert_eq!(stuck.scanned_file_count, 0, "{source:?}");
         assert!(!stuck.first_read_progress, "{source:?}");
@@ -1729,6 +1796,115 @@ fn first_read_progress_paces_first_import_listing_and_small_file_pages() {
         assert!(!bootstrap(&state), "{source:?}");
         let (listing, _) = walk(&state);
         assert!(listing > 0, "{source:?}: progress without a first backfill");
+        std::fs::remove_dir_all(home).unwrap();
+    }
+}
+
+/// [behaviour] A Codex freshness page reads up to 256 hinted first-read files,
+/// fills no file allowance and spends no byte budget, yet asks for a paced
+/// pass during a first backfill while census work stays queued.
+#[test]
+fn codex_small_file_pages_pace_during_a_first_import() {
+    use crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture;
+    let home = crate::test_scratch::private_dir("codex-small-file-pacing")
+        .canonicalize()
+        .unwrap();
+    let root = first_read_root(SnapshotSource::Codex, &home);
+    std::fs::create_dir_all(&root).unwrap();
+    let hints = codex_rollouts(&root, 0, 300);
+    let scanner = E2ScanFixture::default();
+    let (mut index, mut asked, mut complete) = (ScanIndex::default(), 0, false);
+    for page in 0..8 {
+        let hinted: &[PathBuf] = if page == 0 { &hints } else { &[] };
+        let codex = SnapshotSource::Codex;
+        let (next, scan) = first_read_page(&scanner, codex, &root, &home, index, 280, true, hinted);
+        index = next;
+        if scan.scanned_file_count > 0
+            && scan.census_status.pending_work
+            && !scan.page_file_limit_hit
+            && !scan.page_byte_budget_hit
+            && !scan.charge_deferred
+            && !scan.census_complete
+        {
+            assert!(scan.first_read_progress, "page {page}");
+            assert!(resident_scan_requested(&scan, true), "page {page}");
+            assert!(!resident_scan_requested(&scan, false), "page {page}");
+            asked += 1;
+        }
+        complete = scan.census_complete;
+        if complete {
+            break;
+        }
+    }
+    assert!(complete && asked > 0, "{asked} small-file pages asked");
+    std::fs::remove_dir_all(home).unwrap();
+}
+
+/// [regress] During a first backfill with census work still queued, a page
+/// that only re-reads a recorded live session (a watcher hint), retries an
+/// unreadable file or fails to parse one reports no first-read progress and
+/// asks for nothing. Claude and Pi count every hint as a census member.
+#[cfg(unix)]
+#[test]
+fn first_read_progress_ignores_rereads_and_stuck_tails() {
+    use crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture;
+    use crate::snapshots::with_test_directory_entries;
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Pi] {
+        let home = crate::test_scratch::private_dir("first-read-stuck")
+            .canonicalize()
+            .unwrap();
+        let root = first_read_root(source, &home);
+        let (a, b) = (root.join("a"), root.join("b"));
+        let live = first_read_file(source, &a, 1);
+        let unreadable = first_read_file(source, &a, 2);
+        let broken = first_read_file(source, &a, 3);
+        std::fs::write(&broken, "not json\n").unwrap();
+        first_read_file(source, &b, 4);
+        let mode = |mode| std::fs::Permissions::from_mode(mode);
+        std::fs::set_permissions(&unreadable, mode(0o000)).unwrap();
+        let scanner = E2ScanFixture::default();
+        let page = |index, budget, hints: &[PathBuf]| {
+            with_test_directory_entries(budget, || {
+                first_read_page(&scanner, source, &root, &home, index, 100, false, hints)
+            })
+        };
+        // The root, then `a`: its readable session is a first read.
+        let (index, listed) = page(first_read_index(source, &home), 1, &[]);
+        assert!(listed.census_status.pending_work, "{source:?}");
+        assert!(listed.first_read_progress, "{source:?}");
+        let (index, read) = page(index, 1, &[]);
+        assert!(read.census_status.pending_work, "{source:?}: b is queued");
+        assert!(read.first_read_progress, "{source:?}");
+        assert!(index.files.iter().next().is_some(), "{source:?}");
+        // No listing budget: only the hinted live session and the stuck files.
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&live)
+            .unwrap();
+        let line = match source {
+            SnapshotSource::ClaudeCode => claude_line("a0000000-0000-4000-8000-000000000001", 5),
+            _ => pi_line(5),
+        };
+        file.write_all(line.as_bytes()).unwrap();
+        drop(file);
+        let (index, reread) = page(index, 0, std::slice::from_ref(&live));
+        assert!(
+            reread.scanned_file_count > 0,
+            "{source:?}: the live re-read"
+        );
+        assert!(reread.census_status.pending_work, "{source:?}");
+        assert!(!reread.first_read_progress, "{source:?}: a re-read");
+        assert!(!resident_scan_requested(&reread, true), "{source:?}");
+        let (index, stuck) = page(index, 0, &[]);
+        assert!(stuck.census_status.pending_work, "{source:?}");
+        assert!(!stuck.first_read_progress, "{source:?}: a stuck tail");
+        assert!(!resident_scan_requested(&stuck, true), "{source:?}");
+        // Listing `b` reads its new session again as progress.
+        let (_, other) = page(index, 1, &[]);
+        assert!(other.first_read_progress, "{source:?}");
+        std::fs::set_permissions(&unreadable, mode(0o600)).unwrap();
         std::fs::remove_dir_all(home).unwrap();
     }
 }

@@ -2448,6 +2448,17 @@ impl OwnedSourceScan {
                         );
                     }
                 }
+                // First-read work: a selected census read that records a path
+                // new to the index (any member of a joined group). A re-read of
+                // a recorded file, such as a live session's hint, is not.
+                let paths =
+                    || std::iter::once(&candidate.path).chain(aliases.iter().map(|a| &a.path));
+                first_read_progress |= parse_complete
+                    && sampled_scan::codex_cursor::census_member(
+                        &selected_flags,
+                        paths().map(PathBuf::as_path),
+                    )
+                    && paths().any(|path| !index.files.contains_key(&local_index_key(path)));
                 if parse_complete && !aliases.is_empty() {
                     for alias in &aliases {
                         if alias.path == candidate.path {
@@ -2621,7 +2632,6 @@ impl OwnedSourceScan {
                     if parse_complete && !non_progressing_residue {
                         sampled_audit::settle_growth(index, &index_key);
                     }
-                    first_read_progress |= selected_flags.get(&index_key).is_some_and(|f| f.0);
                     index.record(recorded, last_snapshot_fingerprint, outcome);
                     // The counting version travels in the same entry as the
                     // fingerprint it describes; no separate save can split them.

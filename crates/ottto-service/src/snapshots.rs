@@ -573,8 +573,9 @@ pub struct SourceScanResult {
     pub(crate) routine_recensus: bool,
     /// Codex deferred a file because a page byte budget is spent.
     pub(crate) page_byte_budget_hit: bool,
-    /// The page completed a census-member read, or listed and left the
-    /// census walk unfinished. Paces only a first backfill.
+    /// The page recorded a selected census read of a file new to the index,
+    /// or a listing tick left census directories queued. Paces only a first
+    /// backfill.
     pub(crate) first_read_progress: bool,
     pub scanned_file_count: usize,
     pub scanned_session_count: usize,

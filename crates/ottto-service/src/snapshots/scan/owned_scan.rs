@@ -646,8 +646,8 @@ impl OwnedSourceScan {
                 }
             },
         );
-        // A listing tick with budget consumes at least one directory; one that
-        // leaves the census walk unfinished is first-read progress.
+        // A listing tick with budget consumes at least one queued directory;
+        // one that leaves census directories queued is first-read progress.
         let first_read_progress = walk_was_pending
             && index
                 .traversal
