@@ -141,10 +141,13 @@ impl Twin {
     #[track_caller]
     fn page_as(&self, owner: &E2ScanFixture, label: &'static str) -> Page {
         diag::owner(label);
+        // Leave room for the reserved census slot beside the holder hint.
+        // With one slot an unchanged census twin displaces the hinted holder;
+        // with two the holder runs first and forces the queued twin.
         self.c.raw(
             owner,
             self.prior.clone(),
-            1,
+            2,
             true,
             std::slice::from_ref(&self.holder),
         )
@@ -293,7 +296,7 @@ fn forced_verified_twin_reuses_certified_tail_and_restarts() {
                     let mut upgraded = f.c.raw(
                         &E2ScanFixture::capturing_identity(),
                         legacy,
-                        1,
+                        2,
                         true,
                         std::slice::from_ref(&f.holder),
                     );
@@ -343,6 +346,7 @@ fn forced_verified_twin_reuses_certified_tail_and_restarts() {
 
 /// [money] Each newly reachable delay falls back to native on the same page:
 /// (a) cap pacing, (b) an unfunded completion, (c) a future-head hold.
+/// A restart without audit capacity holds the session until its holder joins.
 #[test]
 fn forced_verified_twin_stays_on_its_page_without_tail_capacity() {
     if !supported("forced_twin_page") {
@@ -383,6 +387,29 @@ fn forced_verified_twin_stays_on_its_page_without_tail_capacity() {
                 ReadMode::Full(FullReason::StateMissing),
                 0,
             );
+            if arm != "future" {
+                // Depends on the content-session co-scheduling fix landing
+                // first: a pre-acquisition holder deferral must hold the whole
+                // session, even when its pulled twin completes natively.
+                let held_page = &mut pages[2];
+                held_page.enrich(&f.c);
+                held_page.finish();
+                let held = mixed_route(held_page, &e2_progress(), Mode::DiskRestore);
+                assert!(
+                    !held.snapshots.contains_key(ROOT),
+                    "the deferred holder holds the session; no partial body publishes"
+                );
+                let prior = f.disk.commit(
+                    &held_page.cache,
+                    SnapshotSource::ClaudeCode,
+                    &mut held_page.index,
+                );
+                restart.set_audit_slots(256);
+                diag::round("retry");
+                diag::owner("restart");
+                pages[2] =
+                    f.c.raw(&restart, prior, 2, true, std::slice::from_ref(&f.holder));
+            }
             f.compare(&mut pages);
             assert!(!pages[2].index.files[&f.key]
                 .scan_identity_version
