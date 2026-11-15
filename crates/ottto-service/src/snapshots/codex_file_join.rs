@@ -502,7 +502,33 @@ pub(super) struct HeaderInventory {
     pub(super) refused: BTreeMap<String, Option<String>>,
     /// File-level diagnostics use the existing sampled cause inventory.
     pub(super) unreadable_causes: crate::codex_scan_diagnostics::UnreadableCauses,
+    /// How often each `Incomplete` writer turned `complete` false. Counts only,
+    /// for the page's census line; never persisted, never a gate.
+    pub(super) incomplete_causes: IncompleteCauses,
 }
+/// Inline only, so the retained-heap walk visits it zero times.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct IncompleteCauses(pub(super) [usize; INCOMPLETE_CAUSE_NAMES.len()]);
+crate::heap_layout_bound::no_heap!(true; IncompleteCauses);
+
+/// Why `HeaderInventory::complete` went false, in `INCOMPLETE_CAUSE_NAMES` order.
+#[derive(Clone, Copy)]
+pub(super) enum Incomplete {
+    CensusUnstable,
+    CensusWalkPending,
+    OutsideRoots,
+    HeaderError,
+    FundingRefused,
+    SelectedNotInventoried,
+}
+const INCOMPLETE_CAUSE_NAMES: [&str; 6] = [
+    "inventory_census_unstable",
+    "inventory_census_walk_pending",
+    "inventory_outside_roots",
+    "inventory_header_error",
+    "inventory_funding_refused",
+    "inventory_selected_not_inventoried",
+];
 
 /// A group's key in `HeaderInventory::groups`, which is also the order the
 /// inventory reads groups in.
@@ -542,7 +568,7 @@ impl HeaderInventory {
         paths: &BTreeSet<String>,
         directories: Option<&DirectoryCensus>,
     ) -> Self {
-        Self {
+        let mut inventory = Self {
             roots: roots.to_vec(),
             pending: paths
                 .iter()
@@ -552,7 +578,7 @@ impl HeaderInventory {
             headers: Vec::new(),
             held_owners: group_job::unsealed_owners(paths),
             directories: directories.cloned().unwrap_or_default(),
-            complete: directories.is_some_and(|value| value.stable),
+            complete: true,
             read_bytes: 0,
             reuse_hits: 0,
             reuse_misses: 0,
@@ -561,7 +587,33 @@ impl HeaderInventory {
             cache_pruned: false,
             refused: BTreeMap::new(),
             unreadable_causes: Default::default(),
+            incomplete_causes: IncompleteCauses::default(),
+        };
+        let stable = directories.is_some_and(|value| value.stable);
+        inventory.mark_incomplete(Incomplete::CensusUnstable, usize::from(!stable));
+        inventory
+    }
+    /// `complete = false` when `count > 0`, counted under `cause`.
+    pub(super) fn mark_incomplete(&mut self, cause: Incomplete, count: usize) {
+        if count > 0 {
+            self.complete = false;
+            let slot = &mut self.incomplete_causes.0[cause as usize];
+            *slot = slot.saturating_add(count);
         }
+    }
+    /// Count-only census-line fields for an incomplete inventory: which
+    /// writers fired, and this page's hold (`record_codex_inventory_hold`).
+    pub(super) fn incomplete_fields(
+        &self,
+        (held, awaiting, outside): (usize, bool, usize),
+    ) -> Option<String> {
+        (!self.complete).then(|| {
+            format!(
+                " inventory_held={held} inventory_awaiting_directories={} inventory_outside_roster={outside} {}",
+                u8::from(awaiting),
+                census_count_fields(&INCOMPLETE_CAUSE_NAMES, &self.incomplete_causes.0)
+            )
+        })
     }
     pub(super) fn content_unchanged(&self) -> bool {
         self.complete
@@ -635,7 +687,7 @@ impl HeaderInventory {
             return false;
         }
         let Some(scan_root) = self.scan_root(&path) else {
-            self.complete = false;
+            self.mark_incomplete(Incomplete::OutsideRoots, 1);
             self.refused
                 .insert(local_index_key(&path), path_witness(&path));
             self.unreadable_causes.record_sampled(
@@ -821,7 +873,8 @@ impl HeaderInventory {
                     // Funding uncertainty holds filename dependants only. An
                     // unknown filename retains the existing wildcard fence.
                     let owners = codex_session_id_candidates_from_path(Path::new(&key));
-                    self.complete &= codex_archive_path(Path::new(&key)) && !owners.is_empty();
+                    let fenced = codex_archive_path(Path::new(&key)) && !owners.is_empty();
+                    self.mark_incomplete(Incomplete::FundingRefused, usize::from(!fenced));
                     self.held_owners.extend(owners);
                     return false;
                 }
@@ -839,7 +892,7 @@ impl HeaderInventory {
                     }
                     return false;
                 }
-                self.complete = false;
+                self.mark_incomplete(Incomplete::HeaderError, 1);
                 let cause = if error.downcast_ref::<std::io::Error>().is_some() {
                     UnreadableCause::OpenRead
                 } else {
@@ -1017,7 +1070,7 @@ impl HeaderInventory {
 }
 crate::heap_layout_bound::fields!(DirectoryCensus; directories, stable);
 crate::heap_layout_bound::fields!(HeaderWitness; candidate, owner, home, created_unix_ms, metadata, stamp);
-crate::heap_layout_bound::fields!(HeaderInventory; roots, pending, headers, directories, complete, held_owners, read_bytes, reuse_hits, reuse_misses, bytes_avoided, reuse_evictions, cache_pruned, refused, unreadable_causes);
+crate::heap_layout_bound::fields!(HeaderInventory; roots, pending, headers, directories, complete, held_owners, read_bytes, reuse_hits, reuse_misses, bytes_avoided, reuse_evictions, cache_pruned, refused, unreadable_causes; inline incomplete_causes);
 
 #[derive(Clone, Debug)]
 pub(super) struct Group {
@@ -2368,6 +2421,27 @@ pub(super) mod tests {
         assert!(inventory.membership_complete("independent", affected.as_ref()));
         inventory.complete = false;
         assert!(inventory.affected_owners().is_none());
+    }
+    /// [regress] The census line names the writer that made the inventory
+    /// incomplete, counts only.
+    #[test]
+    fn incomplete_inventory_counts_the_writer_that_fired() {
+        let paths = BTreeSet::from(["/outside/a.jsonl".to_owned()]);
+        let mut inventory = HeaderInventory::new(&[], &paths, Some(&DirectoryCensus::new()));
+        assert_eq!(inventory.incomplete_fields((0, false, 0)), None);
+        while !inventory.step(&CodexTitleMetadata::default()) {}
+        assert!(!inventory.complete);
+        assert_eq!(
+            inventory.incomplete_fields((1, false, 1)).as_deref(),
+            Some(
+                " inventory_held=1 inventory_awaiting_directories=0 inventory_outside_roster=1 \
+                 inventory_census_unstable=0 inventory_census_walk_pending=0 \
+                 inventory_outside_roots=1 inventory_header_error=0 \
+                 inventory_funding_refused=0 inventory_selected_not_inventoried=0"
+            )
+        );
+        let absent = HeaderInventory::new(&[], &BTreeSet::new(), None);
+        assert_eq!(absent.incomplete_causes.0, [1, 0, 0, 0, 0, 0]);
     }
 
     #[test]
