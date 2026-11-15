@@ -638,10 +638,10 @@ fn upgraded_removed_root_witnesses_drain_and_retire() {
     );
 }
 
-/// The restored file is a new object: its file fingerprint and the revision
-/// hashes derived from it differ from the original upload's. Every other
-/// stored-body field (money, identity, placement) must not; a cold Full of the
-/// restored file pins these three.
+/// The restored file is a new object read in a later pass: its file
+/// fingerprint, the revision hashes derived from it and the pass time differ
+/// from the original upload's. Every other stored-body field (money,
+/// identity, placement) must not; a cold Full of the restored file pins these.
 fn without_file_revision(mut route: RouteResult) -> RouteResult {
     let buckets = route
         .accepted_identity_buckets
@@ -651,6 +651,7 @@ fn without_file_revision(mut route: RouteResult) -> RouteResult {
     for bucket in buckets.values_mut() {
         let body = bucket["stored_body"].as_object_mut().unwrap();
         body.remove("source_file_fingerprint");
+        body.remove("collected_at");
         let envelope = body["semantic_envelope"].as_object_mut().unwrap();
         envelope.remove("revision_hash");
         envelope.remove("revision_v2_hash");
