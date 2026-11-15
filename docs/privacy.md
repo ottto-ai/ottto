@@ -369,6 +369,39 @@ and skill text never leave the Mac. The context-footprint opt-outs (including
 `<support>/context_footprint/disabled`) apply, and
 `OTTTO_CODEX_SESSION_START_HARVEST_DISABLED=1` turns off this collector alone.
 
+MCP inventory: while Readable labels and the **MCP inventory harvesting**
+setting are on (both are on by default), the daemon starts each enabled stdio
+MCP server configured for Claude Code and Codex (including servers from
+enabled plugins) at startup and then every six hours, asks it for its tool list, and uploads
+the result with the machine id, the agent's version and its tool-search
+setting. For each server it sends the configured server name, its
+transport, whether it answered, whether it is disabled, how the agent loads its
+tools, and the character length of the server's instructions (never their
+text). For each tool it sends the tool's name, its **description** and its
+**input schema** as the server reported them, not redacted or shortened. For
+Codex it also reports whether the bundled browser, Chrome and computer-use
+plugins are enabled. Server commands, arguments, working directories,
+environment values and URLs are not sent. HTTP and SSE servers are not
+contacted and upload no tools, and disabled servers are not started. An
+unchanged inventory is uploaded again at most weekly. Setting
+`OTTTO_MCP_HARVEST_DISABLED=1` or creating `<support>/mcp_inventory/disabled`
+turns this off on the Mac; turning either setting off also stops it.
+
+Codex daily usage totals: this reader is off until you approve **Codex daily
+aggregates** in the Ottto app's settings on this Mac. Once approved, about
+every six hours it reads `chatgpt.com/backend-api/wham/analytics/daily-workspace-usage-counts`
+for each Codex login on the Mac (up to the last 120 days, scoped to the
+signed-in user's own usage), using the access token already in that login's
+`auth.json`. Tokens are never refreshed or written. It uploads only per day,
+per Codex surface and per model: credits used, input, cached input, output
+and total tokens, and thread and turn counts, plus the covered dates, the
+collector version, the installation id and hashed grant and account
+identifiers. An answer that counts more than one user is refused. The token, the raw response, prompts, responses, thread
+or task titles, email addresses and account or workspace names are not
+uploaded, and no other ChatGPT endpoint is contacted. Turn it off in the same
+setting, exclude the signed-in account there, or create
+`<support>/codex-daily-aggregates-disabled` to stop reads on this Mac.
+
 ## Readable Labels
 
 The **Readable labels** setting applies only to what is uploaded. Local data stays
@@ -387,7 +420,8 @@ With Readable labels off:
 - Tool activity keeps its call counts, with every MCP tool counted under one
   hidden name. Agent roles outside the providers' built-in set are sent as
   `custom`.
-- The MCP inventory is not collected, so no MCP server is started for it.
+- The MCP inventory (tool names, descriptions and input schemas) is not
+  collected, so no MCP server is started for it.
 
 Workspace and repository path hashes still upload: they are the identity keys that
 group a user's sessions, and an unchanged path always gives the same hash.
