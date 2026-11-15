@@ -466,10 +466,10 @@ applies to bodies from then on, never retroactively.
 `cloud_sessions` runs independently of local transcript collection and upload,
 under the same consent as local Codex sessions. There is no per-Mac grant.
 Each due slice reads the Codex activity hint once through the source-scoped
-relay, under an I/O lease. Listing runs only when the hint turns it on, names
-the `cloud_session_changes.v2` contract and carries the user's 32-byte task
-key; anything else (listing off, an older server, a malformed key) is off and
-the hint is read again in 30 minutes, or six hours when the route is missing.
+relay, under an I/O lease. Listing runs only when the hint turns it on and
+names the `cloud_session_changes.v3` contract; anything else (listing off, an
+older server, another contract) is off and the hint is read again in 30
+minutes, or six hours when the route is missing.
 The same hint's `SnapshotUploadPolicy` decides whether titles and environment
 names are sent, and every body is stamped with it. Any 409 (listing off, a
 policy mismatch) rechecks like listing off, so a policy mismatch waits up to
@@ -485,10 +485,18 @@ when its slice budget ends. It continues across midnight without a total
 page/task ceiling. Only positive task facts are uploaded; missing tasks never
 imply deletion. The supervisor wakes at least every six hours.
 
-The task key is per user, so every Mac of that user sends one head per task.
+Each task is sent as `source_session_id` = its raw Codex task `id` (the
+`task_id` alias is not read); the server keys it by (user, source, id), so
+every Mac of that user sends one head per task. A row whose id breaks the
+shared rule (1..=255 code points, no control character, no boundary
+whitespace) is skipped, never repaired, and counted; one counts-only line per
+changed count is logged, never an id. A page whose rows are all skipped this
+way still follows its cursor. An ACK settles only ids echoed byte for byte.
 The existing graph-independent upload-history SQLite connection stores only
 each task's semantic digest (over its facts and the applied policy) and head
-etag, scoped to destination, organization, user, key digest and contract.
+etag, keyed by a local digest of the task id (so every valid id fits the key
+column and no raw id is written) and scoped to destination, organization, user
+and contract.
 Accepted and noop ACKs store the head; a rejected task or a conflict without a
 head stores none, earns no credit and is not resent until it changes. Fixed
 expiry permits safe re-offering; the server returns no-op for an exact repeat

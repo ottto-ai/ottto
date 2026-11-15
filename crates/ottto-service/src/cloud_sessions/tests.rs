@@ -465,22 +465,18 @@ impl CloudSessionRunner for Cli {
     }
 }
 
-/// The user's fixed task key, and the same 32 bytes as the hint carries
-/// them (unpadded base64url).
-const TASK_KEY: [u8; 32] = [7; 32];
-const TASK_KEY_TEXT: &str = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc";
-
 const OFF: CloudUploadPolicyV2 = CloudUploadPolicyV2 {
     session_titles_enabled: false,
     workspace_labels_enabled: false,
 };
 
 /// The Codex fields of an activity hint. `None` omits a field, as an older
-/// server does.
+/// server does. `stray_key` sends the retired task-key field, which this
+/// build ignores.
 #[derive(Debug, Clone)]
 struct Hint {
     enabled: Option<bool>,
-    key: Option<String>,
+    stray_key: Option<String>,
     contract: Option<String>,
     policy: CloudUploadPolicyV2,
 }
@@ -489,7 +485,7 @@ impl Hint {
     fn on() -> Self {
         Self {
             enabled: Some(true),
-            key: Some(TASK_KEY_TEXT.to_string()),
+            stray_key: None,
             contract: Some(CHANGES_SCHEMA_VERSION.to_string()),
             policy: OFF,
         }
@@ -511,7 +507,7 @@ impl Hint {
         if let Some(enabled) = self.enabled {
             value["codex_cloud_tasks_enabled"] = json!(enabled);
         }
-        if let Some(key) = &self.key {
+        if let Some(key) = &self.stray_key {
             value["codex_cloud_task_key"] = json!(key);
         }
         if let Some(contract) = &self.contract {
@@ -533,6 +529,8 @@ enum AckFault {
     DropOne,
     NoEtag,
     Unsolicited,
+    /// Echo the first id in decomposed Unicode (`e` + U+0301 for `é`).
+    Decomposed,
 }
 
 /// A whole-request refusal as the relay maps it: 410 reads like a missing
@@ -640,21 +638,22 @@ impl CloudSessionTransport for Server {
             .iter()
             .map(|change| {
                 let etag = server_etag(change);
-                let current = heads.get(&change.entity_key).cloned();
-                let (outcome, head_etag) = if self.reject.borrow().contains(&change.entity_key) {
-                    (CloudSessionChangeOutcome::Rejected, None)
-                } else if current.as_deref() == Some(etag.as_str()) {
-                    (CloudSessionChangeOutcome::Noop, Some(etag))
-                } else if change.expected_head_etag == current {
-                    heads.insert(change.entity_key.clone(), etag.clone());
-                    (CloudSessionChangeOutcome::Accepted, Some(etag))
-                } else if self.conflict_reports_head.get() {
-                    (CloudSessionChangeOutcome::Conflict, current)
-                } else {
-                    (CloudSessionChangeOutcome::Conflict, None)
-                };
+                let current = heads.get(&change.source_session_id).cloned();
+                let (outcome, head_etag) =
+                    if self.reject.borrow().contains(&change.source_session_id) {
+                        (CloudSessionChangeOutcome::Rejected, None)
+                    } else if current.as_deref() == Some(etag.as_str()) {
+                        (CloudSessionChangeOutcome::Noop, Some(etag))
+                    } else if change.expected_head_etag == current {
+                        heads.insert(change.source_session_id.clone(), etag.clone());
+                        (CloudSessionChangeOutcome::Accepted, Some(etag))
+                    } else if self.conflict_reports_head.get() {
+                        (CloudSessionChangeOutcome::Conflict, current)
+                    } else {
+                        (CloudSessionChangeOutcome::Conflict, None)
+                    };
                 CloudSessionChangeAckV2 {
-                    entity_key: change.entity_key.clone(),
+                    source_session_id: change.source_session_id.clone(),
                     outcome,
                     head_etag,
                     accepted_seq: None,
@@ -672,7 +671,11 @@ impl CloudSessionTransport for Server {
             }
             Some(AckFault::NoEtag) => entities[0].head_etag = None,
             Some(AckFault::Unsolicited) => {
-                entities[0].entity_key = format!("hmac-sha256:{}", "f".repeat(64))
+                entities[0].source_session_id = "unsolicited-task".to_string()
+            }
+            Some(AckFault::Decomposed) => {
+                entities[0].source_session_id =
+                    entities[0].source_session_id.replace('é', "e\u{301}")
             }
             None => {}
         }
@@ -698,11 +701,6 @@ fn inputs<'a>(
         organization_id: ORG_ID,
         user_id: USER_ID,
     }
-}
-
-/// The key a provider task id becomes on the wire.
-fn entity_key(id: &str) -> String {
-    opaque_key(&TASK_KEY, id)
 }
 
 fn midnight() -> OffsetDateTime {
@@ -783,7 +781,6 @@ fn a_day_of_provider_calls_follows_the_schedule() {
             "day-off",
             &|server| server.set_hint(|hint| {
                 hint.enabled = Some(false);
-                hint.key = None;
             }),
             one()
         ),
@@ -794,7 +791,6 @@ fn a_day_of_provider_calls_follows_the_schedule() {
             "day-older-hint",
             &|server| server.set_hint(|hint| {
                 hint.enabled = None;
-                hint.key = None;
                 hint.contract = None;
             }),
             one()
@@ -968,7 +964,7 @@ fn crawl_beyond_one_hundred_pages_and_two_thousand_tasks_reaches_the_tail() {
             request
                 .observations
                 .iter()
-                .map(|change| change.entity_key.clone())
+                .map(|change| change.source_session_id.clone())
         })
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(keys.len(), 120 * PAGE_LIMIT);
@@ -1098,10 +1094,11 @@ fn cursor_cycle_detector_finds_every_loop_length() {
 /// One way to change the server's hint.
 type HintChange<'a> = &'a dyn Fn(&mut Hint);
 
-/// [behaviour] Only a hint that turns listing on, names exactly this
-/// contract and carries a valid 32-byte key lets a slice call the provider.
-/// Anything else is off: no provider call, no upload, a hint recheck in 30
-/// minutes. Turning listing on later starts collection without a restart.
+/// [behaviour] Only a hint that turns listing on and names exactly this
+/// contract lets a slice call the provider; no key is needed, and a stray
+/// retired key field changes nothing. Anything else (a v2 server included)
+/// is off: no provider call, no upload, a hint recheck in 30 minutes.
+/// Turning listing on later starts collection without a restart.
 #[test]
 #[serial_test::serial]
 fn listing_runs_only_on_an_exact_hint() {
@@ -1109,16 +1106,19 @@ fn listing_runs_only_on_an_exact_hint() {
         ("off", &|hint: &mut Hint| hint.enabled = Some(false)),
         ("older-server", &|hint: &mut Hint| {
             hint.enabled = None;
-            hint.key = None;
             hint.contract = None;
         }),
         ("no-contract", &|hint: &mut Hint| hint.contract = None),
         ("old-contract", &|hint: &mut Hint| {
             hint.contract = Some("cloud_session_changes.v1".to_string())
         }),
-        ("no-key", &|hint: &mut Hint| hint.key = None),
-        ("short-key", &|hint: &mut Hint| {
-            hint.key = Some(TASK_KEY_TEXT[..42].to_string())
+        ("v2-server", &|hint: &mut Hint| {
+            hint.stray_key = Some("BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc".to_string());
+            hint.contract = Some("cloud_session_changes.v2".to_string())
+        }),
+        ("off-with-stray-key", &|hint: &mut Hint| {
+            hint.enabled = Some(false);
+            hint.stray_key = Some("BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc".to_string());
         }),
     ];
     for (name, change) in cases {
@@ -1151,6 +1151,10 @@ fn listing_runs_only_on_an_exact_hint() {
         );
         assert_eq!(cli.calls(), 1, "{name}");
     }
+    let mut stray = Hint::on();
+    stray.stray_key = Some("short".to_string());
+    assert_eq!(codex_cloud_listing(&stray.decoded()), Some(OFF));
+    assert_eq!(codex_cloud_listing(&Hint::on().decoded()), Some(OFF));
 }
 
 /// [behaviour] The kill switch stops everything before the hint read; an
@@ -1291,8 +1295,8 @@ fn request_refusals_recheck_and_settle_nothing() {
         assert!(
             checkpoints
                 .read_acks(
-                    &cache_scope(&inputs, &TASK_KEY),
-                    &[entity_key("refused").as_str()],
+                    &cache_scope(&inputs),
+                    &["refused"],
                     midnight().unix_timestamp()
                 )
                 .unwrap()
@@ -1309,7 +1313,7 @@ fn request_refusals_recheck_and_settle_nothing() {
         let requests = server.requests.borrow();
         assert_eq!(requests.len(), 2, "{name}");
         let (first, second) = (&requests[0].observations[0], &requests[1].observations[0]);
-        assert_eq!(first.entity_key, second.entity_key, "{name}");
+        assert_eq!(first.source_session_id, second.source_session_id, "{name}");
         assert_eq!(second.expected_head_etag, None, "{name}");
         assert_eq!(requests[1].upload_policy.session_titles_enabled, flip);
         assert_eq!(second.title.is_some(), flip, "{name}");
@@ -1381,7 +1385,7 @@ fn policy_flip_reoffers_under_the_new_policy() {
         let requests = server.requests.borrow();
         assert_eq!(requests.len(), 2);
         let second = &requests[1].observations[0];
-        assert_eq!(second.entity_key, first.entity_key);
+        assert_eq!(second.source_session_id, first.source_session_id);
         assert_eq!(second.title.as_deref(), Some("private title"));
         assert_eq!(
             second.environment_label.as_deref(),
@@ -1433,12 +1437,10 @@ fn unchanged_tasks_are_not_uploaded_or_rewritten() {
         slice(&mut collector, &inputs, t0, Duration::ZERO),
         CloudSessionCycleOutcome::Uploaded
     );
-    let scope = cache_scope(&inputs, &TASK_KEY);
-    let keys = ["a", "b", "c"].map(entity_key);
-    let lookup = keys.iter().map(String::as_str).collect::<Vec<_>>();
+    let scope = cache_scope(&inputs);
     assert_eq!(
         checkpoints
-            .read_acks(&scope, &lookup, midnight().unix_timestamp())
+            .read_acks(&scope, &["a", "b", "c"], midnight().unix_timestamp())
             .unwrap()
             .len(),
         3
@@ -1501,7 +1503,7 @@ fn one_changed_sibling_is_the_only_task_offered() {
     );
     let second = server.requests.borrow()[1].clone();
     assert_eq!(second.observations.len(), 1);
-    assert_eq!(second.observations[0].entity_key, entity_key("b"));
+    assert_eq!(second.observations[0].source_session_id, "b");
     assert_eq!(second.observations[0].lifecycle, "completed");
     assert_eq!(
         second.observations[0].expected_head_etag.as_deref(),
@@ -1576,6 +1578,203 @@ fn partial_or_malformed_ack_settles_nothing() {
     }
 }
 
+/// [regress] A provider task id is the raw official `id`, sent byte for
+/// byte; the legacy `task_id` alias is never read, not even as a fallback.
+#[test]
+#[serial_test::serial]
+fn raw_task_id_is_sent_and_task_id_alias_is_not_read() {
+    let (_root, checkpoints) = store("raw-task-id");
+    let mut both = task("task_e_official id é", "applied");
+    both["task_id"] = json!("alias-for-official");
+    let mut alias_only = task("unused", "applied");
+    alias_only.as_object_mut().unwrap().remove("id");
+    alias_only["task_id"] = json!("alias-only");
+    let cli = Cli::head(page_of(vec![both, alias_only], None));
+    let server = Server::new();
+    assert_eq!(
+        slice(
+            &mut CloudCollector::default(),
+            &inputs(&checkpoints, &cli, &server),
+            Instant::now(),
+            Duration::ZERO,
+        ),
+        CloudSessionCycleOutcome::Uploaded
+    );
+    let requests = server.requests.borrow();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0]
+            .observations
+            .iter()
+            .map(|change| change.source_session_id.as_str())
+            .collect::<Vec<_>>(),
+        ["task_e_official id é"]
+    );
+    let text = serde_json::to_string(&requests[0]).unwrap();
+    assert!(!text.contains("alias"));
+}
+
+/// [behaviour] A structurally valid page whose rows all carry invalid task
+/// ids is skipped row by row, counted, and its official cursor still leads
+/// to the next page's valid task.
+#[test]
+#[serial_test::serial]
+fn invalid_only_page_continues_to_a_valid_page() {
+    let (_root, checkpoints) = store("invalid-only-page");
+    let cli = Cli::new(vec![
+        (
+            None,
+            page_of(
+                vec![
+                    task("", "applied"),
+                    task(" padded", "applied"),
+                    task(&"x".repeat(256), "applied"),
+                ],
+                Some("c1"),
+            ),
+        ),
+        (Some("c1".to_string()), page("valid-after-invalid", None)),
+    ]);
+    let server = Server::new();
+    let inputs = inputs(&checkpoints, &cli, &server);
+    let t0 = Instant::now();
+    let mut collector = CloudCollector::default();
+    assert_eq!(
+        slice(&mut collector, &inputs, t0, Duration::ZERO),
+        CloudSessionCycleOutcome::Uploaded
+    );
+    assert_eq!(cli.calls(), 2);
+    assert_eq!(
+        server.requests.borrow()[0]
+            .observations
+            .iter()
+            .map(|change| change.source_session_id.as_str())
+            .collect::<Vec<_>>(),
+        ["valid-after-invalid"]
+    );
+    assert_eq!(collector.schedule.crawl_completed, Some(midnight().date()));
+    assert_eq!(collector.reported, Some("ok"));
+    assert_eq!(collector.reported_invalid_ids, Some(3));
+    // The head alone still lists the invalid rows; the same count logs no
+    // second line and nothing is offered again.
+    assert_eq!(
+        slice(&mut collector, &inputs, t0, 5 * MINUTE),
+        CloudSessionCycleOutcome::Noop
+    );
+    assert_eq!(collector.reported_invalid_ids, Some(3));
+    assert_eq!(server.requests.borrow().len(), 1);
+}
+
+/// [behaviour] The ACK cache keys each task by a local digest of its id: a
+/// 255-code-point non-ASCII id settles, the upload-history files never hold
+/// its bytes, and after the file is reopened the unchanged task is not
+/// offered again while changed facts reuse its head etag.
+#[test]
+#[serial_test::serial]
+fn ack_cache_never_stores_the_raw_id() {
+    let id = "é".repeat(255);
+    let (root, checkpoints) = store("ack-raw-id");
+    let cli = Cli::head(page(&id, None));
+    let server = Server::new();
+    let t0 = Instant::now();
+    {
+        let inputs = inputs(&checkpoints, &cli, &server);
+        assert_eq!(
+            slice(&mut CloudCollector::default(), &inputs, t0, Duration::ZERO),
+            CloudSessionCycleOutcome::Uploaded
+        );
+    }
+    assert_eq!(server.outcomes(), [CloudSessionChangeOutcome::Accepted]);
+    // Touching another support directory closes this history file.
+    let (_other_root, other) = store("ack-raw-id-other");
+    other
+        .read_acks(&[0; 32], &["other"], midnight().unix_timestamp())
+        .unwrap();
+    let mut files = 0;
+    // Not even a 10-character prefix of the id is stored.
+    let prefix = &id.as_bytes()[..20];
+    for entry in fs::read_dir(root.join("snapshots")).unwrap() {
+        let path = entry.unwrap().path();
+        if !path.is_file() {
+            continue;
+        }
+        files += 1;
+        let bytes = fs::read(&path).unwrap();
+        assert!(!bytes.windows(prefix.len()).any(|window| window == prefix));
+    }
+    assert!(files > 0);
+
+    let reopened = CloudSessionCheckpointStore::new(&root);
+    let inputs = inputs(&reopened, &cli, &server);
+    let scope = cache_scope(&inputs);
+    let cached = checkpoints_ack(&reopened, &scope, &id).unwrap();
+    let first = server.requests.borrow()[0].observations[0].clone();
+    assert_eq!(cached.head_etag, Some(server_etag(&first)));
+    let mut restarted = CloudCollector::default();
+    assert_eq!(
+        slice(&mut restarted, &inputs, t0, 6 * HOUR),
+        CloudSessionCycleOutcome::Noop
+    );
+    assert_eq!(
+        server.requests.borrow().len(),
+        1,
+        "no POST for the unchanged task"
+    );
+
+    cli.set(None, page_of(vec![task(&id, "error")], None));
+    assert_eq!(
+        slice(&mut restarted, &inputs, t0, 12 * HOUR),
+        CloudSessionCycleOutcome::Uploaded
+    );
+    let requests = server.requests.borrow();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1].observations[0].source_session_id, id);
+    assert_eq!(
+        requests[1].observations[0].expected_head_etag,
+        Some(server_etag(&first))
+    );
+    assert_eq!(
+        server.outcomes(),
+        [
+            CloudSessionChangeOutcome::Accepted,
+            CloudSessionChangeOutcome::Accepted
+        ]
+    );
+}
+
+/// [behaviour] A non-ASCII id with inner spaces settles on the server's
+/// byte-identical echo; an echo in another Unicode normalization names an
+/// unsolicited task and settles nothing.
+#[test]
+#[serial_test::serial]
+fn non_ascii_id_settles_only_on_an_exact_echo() {
+    let id = "tâche é 1";
+    for decomposed in [false, true] {
+        let (_root, checkpoints) = store(&format!("echo-{decomposed}"));
+        let cli = Cli::head(page(id, None));
+        let server = Server::new();
+        if decomposed {
+            server.fault.set(Some(AckFault::Decomposed));
+        }
+        let inputs = inputs(&checkpoints, &cli, &server);
+        let mut collector = CloudCollector::default();
+        let outcome = slice(&mut collector, &inputs, Instant::now(), Duration::ZERO);
+        assert_eq!(
+            server.requests.borrow()[0].observations[0].source_session_id,
+            id
+        );
+        let cached = checkpoints_ack(&checkpoints, &cache_scope(&inputs), id);
+        if decomposed {
+            assert_eq!(outcome, CloudSessionCycleOutcome::Failed);
+            assert_eq!(collector.reported, Some("ack_invalid"));
+            assert!(cached.is_none());
+        } else {
+            assert_eq!(outcome, CloudSessionCycleOutcome::Uploaded);
+            assert!(cached.unwrap().head_etag.is_some());
+        }
+    }
+}
+
 /// [behaviour] A per-task refusal is remembered for exactly that content,
 /// with no credit, so it is not offered again until the task changes.
 #[test]
@@ -1586,7 +1785,7 @@ fn rejected_task_is_not_reoffered_until_it_changes() {
     let server = Server::new();
     let inputs = inputs(&checkpoints, &cli, &server);
     let t0 = Instant::now();
-    server.reject.borrow_mut().push(entity_key("refused"));
+    server.reject.borrow_mut().push("refused".to_string());
     let mut collector = CloudCollector::default();
     slice(&mut collector, &inputs, t0, Duration::ZERO);
     slice(&mut collector, &inputs, t0, 6 * HOUR);
@@ -1678,9 +1877,8 @@ fn conflict_without_a_head_settles_nothing_and_is_not_resent() {
     );
     assert_eq!(cli_b.calls(), 1, "no re-list without a head");
     assert_eq!(b.unchanged_heads, 1, "a conflict earns no credit");
-    let scope = cache_scope(&b_inputs, &TASK_KEY);
-    let key = entity_key("contended");
-    let cached = checkpoints_ack(&mac_b, &scope, &key);
+    let scope = cache_scope(&b_inputs);
+    let cached = checkpoints_ack(&mac_b, &scope, "contended");
     assert_eq!(cached.map(|ack| ack.head_etag), Some(None));
 
     assert_eq!(
@@ -1700,12 +1898,12 @@ fn conflict_without_a_head_settles_nothing_and_is_not_resent() {
 fn checkpoints_ack(
     checkpoints: &CloudSessionCheckpointStore,
     scope: &[u8; 32],
-    key: &str,
+    id: &str,
 ) -> Option<CloudAck> {
     checkpoints
-        .read_acks(scope, &[key], midnight().unix_timestamp())
+        .read_acks(scope, &[id], midnight().unix_timestamp())
         .unwrap()
-        .remove(key)
+        .remove(id)
 }
 
 /// [behaviour] One ACK with accepted, noop, rejected and conflicting (no
@@ -1726,19 +1924,19 @@ fn mixed_ack_settles_each_task_and_survives_a_restart() {
         None,
     ));
     let server = Server::new();
-    let known = parse_cloud_page(&page("known", None), &TASK_KEY, OFF, now())
+    let known = parse_cloud_page(&page("known", None), OFF, now())
         .unwrap()
         .changes
         .remove(0);
     server
         .heads
         .borrow_mut()
-        .insert(known.entity_key.clone(), server_etag(&known));
-    server.reject.borrow_mut().push(entity_key("refused"));
+        .insert(known.source_session_id.clone(), server_etag(&known));
+    server.reject.borrow_mut().push("refused".to_string());
     server
         .heads
         .borrow_mut()
-        .insert(entity_key("diverged"), "f".repeat(64));
+        .insert("diverged".to_string(), "f".repeat(64));
     let inputs = inputs(&checkpoints, &cli, &server);
     let t0 = Instant::now();
     assert_eq!(
@@ -1755,14 +1953,14 @@ fn mixed_ack_settles_each_task_and_survives_a_restart() {
         ]
     );
     assert_eq!(cli.calls(), 1, "a conflict without a head is not re-listed");
-    let scope = cache_scope(&inputs, &TASK_KEY);
+    let scope = cache_scope(&inputs);
     for (id, etag) in [
         ("new", true),
         ("known", true),
         ("refused", false),
         ("diverged", false),
     ] {
-        let ack = checkpoints_ack(&checkpoints, &scope, &entity_key(id)).unwrap();
+        let ack = checkpoints_ack(&checkpoints, &scope, id).unwrap();
         assert_eq!(ack.head_etag.is_some(), etag, "{id}");
     }
 
@@ -1794,7 +1992,7 @@ fn pack_splits_by_count_and_bytes_keeping_every_task_in_order() {
                 task
             })
             .collect();
-        parse_cloud_page(&page_of(tasks, None), &TASK_KEY, policy, now())
+        parse_cloud_page(&page_of(tasks, None), policy, now())
             .unwrap()
             .changes
     };
@@ -2042,9 +2240,9 @@ fn current_binding_fences_every_io_boundary() {
             usize::from(stop == "after-send"),
             "{stop}"
         );
-        let scope = cache_scope(&inputs, &TASK_KEY);
+        let scope = cache_scope(&inputs);
         assert!(
-            checkpoints_ack(&checkpoints, &scope, &entity_key("identity-fence")).is_none(),
+            checkpoints_ack(&checkpoints, &scope, "identity-fence").is_none(),
             "{stop}"
         );
     }
@@ -2156,9 +2354,9 @@ fn collector_io_drain_times_out_while_a_lease_is_held() {
 // ---------------------------------------------------------------------------
 // Wire format. [format]
 
-fn fixture_change(key: char) -> CloudSessionChangeV2 {
+fn fixture_change(id: char) -> CloudSessionChangeV2 {
     CloudSessionChangeV2 {
-        entity_key: format!("hmac-sha256:{}", key.to_string().repeat(64)),
+        source_session_id: format!("task-{id}"),
         expected_head_etag: None,
         entity_kind: "task".to_string(),
         lifecycle: "completed".to_string(),
@@ -2175,13 +2373,51 @@ fn fixture_change(key: char) -> CloudSessionChangeV2 {
     }
 }
 
+/// Shared session-id vectors (the server applies the same rule): code-point
+/// bounds, multibyte text, C0/DEL/C1 controls, boundary whitespace, and the
+/// characters the rule allows.
+fn session_id_vectors() -> Vec<(String, bool)> {
+    let mut vectors = vec![
+        (String::new(), false),
+        ("a".to_string(), true),
+        ("é".repeat(128), true),
+        ("é".repeat(129), true),
+        ("é".repeat(255), true),
+        ("界".repeat(255), true),
+        ("é".repeat(256), false),
+        ("x".repeat(256), false),
+        ("task id with inner spaces".to_string(), true),
+        ("a|b".to_string(), true),
+        ("a\\b".to_string(), true),
+        (format!("hmac-sha256:{}", "a".repeat(64)), true),
+        ("task_e_😀".to_string(), true),
+    ];
+    for bad in [
+        " task",
+        "task ",
+        "\u{3000}task",
+        "task\u{a0}",
+        "\ttask",
+        "task\n",
+    ] {
+        vectors.push((bad.to_string(), false));
+    }
+    for control in [
+        '\u{0}', '\u{1f}', '\u{7f}', '\u{80}', '\u{85}', '\u{9f}', '\t',
+    ] {
+        vectors.push((format!("ta{control}sk"), false));
+    }
+    vectors
+}
+
 /// [format] The digest vector: SHA-256 over the domain, a zero byte and
-/// sorted compact JSON of the task and the applied policy. The predecessor
-/// etag is not part of it; the policy, a title or a label are.
+/// sorted compact JSON of the task (its raw id included) and the applied
+/// policy. The predecessor etag is not part of it; the policy, a title or a
+/// label are.
 #[test]
 fn semantic_digest_vector_is_stable_and_covers_policy_and_labels() {
     let mut change = CloudSessionChangeV2 {
-        entity_key: format!("hmac-sha256:{}", "ab".repeat(32)),
+        source_session_id: "task_e_6830f1c2 é".to_string(),
         attempt_count: Some(2),
         coverage: ["attempts", "identity", "status", "timing"]
             .map(str::to_string)
@@ -2192,9 +2428,12 @@ fn semantic_digest_vector_is_stable_and_covers_policy_and_labels() {
     };
     assert_eq!(
         hex(&change.semantic_digest(OFF)),
-        "17fdfd6d93e1ebdc135ee435d15d74a51e204e96dccf2c66cf8822a046bcb7ca"
+        "affcbe83bdbb1bc63eb94c51a4169bf849ae86aaf6599c2e0732daea01ebf771"
     );
     let base = change.semantic_digest(OFF);
+    let mut other = change.clone();
+    other.source_session_id = "task_e_6830f1c2 e\u{301}".to_string();
+    assert_ne!(other.semantic_digest(OFF), base);
     change.expected_head_etag = Some("0".repeat(64));
     assert_eq!(change.semantic_digest(OFF), base);
     let titles = CloudUploadPolicyV2 {
@@ -2225,12 +2464,13 @@ fn semantic_digest_vector_is_stable_and_covers_policy_and_labels() {
     assert!(!encoded.contains("environment_label"));
 }
 
-/// [format] The body carries no grant and stamps the policy it applied: a
-/// title and an environment name appear exactly when their setting is on;
-/// provider ids, URLs, summaries, environment ids and cursors never do.
+/// [format] The body names its source, carries the raw task id as the
+/// session id and no grant, and stamps the policy it applied: a title and an
+/// environment name appear exactly when their setting is on; URLs,
+/// summaries, environment ids and cursors never do.
 #[test]
 #[serial_test::serial]
-fn v2_body_has_no_grant_and_stamps_the_policy() {
+fn v3_body_sends_the_raw_task_id_and_stamps_the_policy() {
     for (titles, labels) in [(false, false), (true, false), (false, true), (true, true)] {
         let policy = CloudUploadPolicyV2 {
             session_titles_enabled: titles,
@@ -2249,9 +2489,11 @@ fn v2_body_has_no_grant_and_stamps_the_policy() {
         );
         let request = server.requests.borrow()[0].clone();
         assert!(request.validate().is_ok());
-        assert_eq!(request.schema_version, "cloud_session_changes.v2");
+        assert_eq!(request.schema_version, "cloud_session_changes.v3");
+        assert_eq!(request.source, "codex");
         assert_eq!(request.upload_policy, policy);
         let change = &request.observations[0];
+        assert_eq!(change.source_session_id, "raw-provider-id");
         assert_eq!(change.title.as_deref(), titles.then_some("private title"));
         assert_eq!(
             change.environment_label.as_deref(),
@@ -2272,13 +2514,19 @@ fn v2_body_has_no_grant_and_stamps_the_policy() {
                 "collector_version",
                 "observations",
                 "schema_version",
+                "source",
                 "upload_policy"
             ]
         );
+        assert_eq!(
+            wire["observations"][0]["source_session_id"],
+            json!("raw-provider-id")
+        );
+        assert!(wire["observations"][0].get("entity_key").is_none());
         let text = wire.to_string();
         for private in [
             "grant",
-            "raw-provider-id",
+            "hmac",
             "chatgpt.com",
             "private-cursor",
             "provider-environment-private",
@@ -2292,17 +2540,18 @@ fn v2_body_has_no_grant_and_stamps_the_policy() {
     }
 }
 
-/// [format] Requests validate strictly; a raw or uppercase key, an open
-/// lifecycle, unsorted coverage, a label the policy forbids or too long,
-/// or an oversize batch is refused before I/O.
+/// [format] Requests validate strictly; another source, an invalid session
+/// id, an open lifecycle, unsorted coverage, a label the policy forbids or
+/// too long, or an oversize batch is refused before I/O.
 #[test]
-fn changes_request_rejects_raw_keys_open_values_labels_and_oversize_batches() {
+fn changes_request_rejects_bad_ids_open_values_labels_and_oversize_batches() {
     let titles = CloudUploadPolicyV2 {
         session_titles_enabled: true,
         ..OFF
     };
     let request = CloudSessionChangesV2 {
         schema_version: CHANGES_SCHEMA_VERSION.to_string(),
+        source: "codex".to_string(),
         collector_version: "0.0.0".to_string(),
         collected_at: "2026-07-21T00:00:00Z".to_string(),
         upload_policy: titles,
@@ -2317,16 +2566,19 @@ fn changes_request_rejects_raw_keys_open_values_labels_and_oversize_batches() {
         change(&mut bad);
         bad.validate().is_err()
     };
-    assert!(mutate(
-        &|bad| bad.schema_version = "cloud_session_changes.v1".to_string()
-    ));
+    for schema in ["cloud_session_changes.v1", "cloud_session_changes.v2"] {
+        assert!(mutate(&|bad| bad.schema_version = schema.to_string()));
+    }
+    assert!(mutate(&|bad| bad.source = "claude".to_string()));
     assert!(mutate(&|bad| bad.collector_version = "9".repeat(33)));
-    assert!(mutate(
-        &|bad| bad.observations[0].entity_key = "raw-provider-id".to_string()
-    ));
-    assert!(mutate(&|bad| {
-        bad.observations[0].entity_key = format!("hmac-sha256:{}", "A".repeat(64))
-    }));
+    for (id, valid) in session_id_vectors() {
+        assert_eq!(
+            mutate(&|bad| bad.observations[0].source_session_id = id.clone()),
+            !valid,
+            "{:?}",
+            id.chars().count()
+        );
+    }
     assert!(mutate(
         &|bad| bad.observations[0].lifecycle = "future_state".to_string()
     ));
@@ -2349,7 +2601,7 @@ fn changes_request_rejects_raw_keys_open_values_labels_and_oversize_batches() {
     assert!(mutate(&|bad| {
         bad.observations = (0..=wire::MAX_CHANGES_PER_REQUEST)
             .map(|index| CloudSessionChangeV2 {
-                entity_key: format!("hmac-sha256:{index:064x}"),
+                source_session_id: format!("task-{index}"),
                 ..fixture_change('a')
             })
             .collect();
@@ -2363,6 +2615,7 @@ fn changes_request_rejects_raw_keys_open_values_labels_and_oversize_batches() {
 fn ack_matching_is_exact() {
     let request = CloudSessionChangesV2 {
         schema_version: CHANGES_SCHEMA_VERSION.to_string(),
+        source: "codex".to_string(),
         collector_version: "0.0.0".to_string(),
         collected_at: "2026-07-21T00:00:00Z".to_string(),
         upload_policy: OFF,
@@ -2375,15 +2628,15 @@ fn ack_matching_is_exact() {
         ],
     };
     assert!(request.validate().is_ok());
-    let entry = |key: char, outcome, etag: Option<char>| CloudSessionChangeAckV2 {
-        entity_key: format!("hmac-sha256:{}", key.to_string().repeat(64)),
+    let entry = |id: char, outcome, etag: Option<char>| CloudSessionChangeAckV2 {
+        source_session_id: format!("task-{id}"),
         outcome,
         head_etag: etag.map(|etag| etag.to_string().repeat(64)),
         accepted_seq: None,
         reason: None,
     };
     let ack = |entities| CloudSessionChangesAckV2 {
-        schema_version: "cloud_session_changes_ack.v2".to_string(),
+        schema_version: "cloud_session_changes_ack.v3".to_string(),
         entities,
     };
     let settled = request
@@ -2418,9 +2671,14 @@ fn ack_matching_is_exact() {
             .map(|key| entry(key, CloudSessionChangeOutcome::Noop, Some('d')))
             .to_vec()
     };
-    let mut wrong_schema = ack(good());
-    wrong_schema.schema_version = "cloud_session_changes_ack.v1".to_string();
-    assert!(request.settle(&wrong_schema).is_err());
+    for schema in [
+        "cloud_session_changes_ack.v1",
+        "cloud_session_changes_ack.v2",
+    ] {
+        let mut wrong_schema = ack(good());
+        wrong_schema.schema_version = schema.to_string();
+        assert!(request.settle(&wrong_schema).is_err());
+    }
     let mut duplicate = good();
     duplicate[2] = entry('a', CloudSessionChangeOutcome::Noop, Some('d'));
     assert!(request.settle(&ack(duplicate)).is_err());
@@ -2455,7 +2713,7 @@ fn parser_takes_title_and_environment_name_only_under_policy() {
         session_titles_enabled: true,
         workspace_labels_enabled: true,
     };
-    let parsed = parse_cloud_page(&raw, &TASK_KEY, both, now()).unwrap();
+    let parsed = parse_cloud_page(&raw, both, now()).unwrap();
     assert_eq!(parsed.changes[0].title.as_deref(), Some("private title"));
     assert_eq!(
         parsed.changes[0].environment_label.as_deref(),
@@ -2468,14 +2726,13 @@ fn parser_takes_title_and_environment_name_only_under_policy() {
             .map(|title| title.chars().count()),
         Some(MAX_LABEL_CHARS)
     );
-    let parsed = parse_cloud_page(&raw, &TASK_KEY, OFF, now()).unwrap();
+    let parsed = parse_cloud_page(&raw, OFF, now()).unwrap();
     assert!(parsed
         .changes
         .iter()
         .all(|change| change.title.is_none() && change.environment_label.is_none()));
     let encoded = serde_json::to_string(&parsed.changes).unwrap();
     for private in [
-        "plain",
         "private title",
         "chatgpt.com",
         "provider-environment-private",
@@ -2484,7 +2741,7 @@ fn parser_takes_title_and_environment_name_only_under_policy() {
     ] {
         assert!(!encoded.contains(private), "{private}");
     }
-    assert_eq!(parsed.changes[0].entity_key, entity_key("plain"));
+    assert_eq!(parsed.changes[0].source_session_id, "plain");
 }
 
 #[test]
@@ -2501,7 +2758,7 @@ fn official_cloud_task_statuses_and_attempt_total_are_normalized_truthfully() {
         task
     })
     .to_vec();
-    let parsed = parse_cloud_page(&page_of(tasks, None), b"fixture-key", OFF, now()).unwrap();
+    let parsed = parse_cloud_page(&page_of(tasks, None), OFF, now()).unwrap();
     assert_eq!(
         parsed
             .changes
@@ -2539,7 +2796,7 @@ fn parser_keeps_every_valid_row_and_canonicalizes_times() {
     rows.push(json!({"status": "running"}));
     rows.push(offset);
     rows.push(future);
-    let parsed = parse_cloud_page(&page_of(rows, None), b"fixture-key", OFF, now()).unwrap();
+    let parsed = parse_cloud_page(&page_of(rows, None), OFF, now()).unwrap();
     assert_eq!(parsed.source_item_count, PAGE_LIMIT + 8);
     assert_eq!(parsed.changes.len(), PAGE_LIMIT + 7);
     let offset = &parsed.changes[PAGE_LIMIT + 5];
@@ -2548,9 +2805,55 @@ fn parser_keeps_every_valid_row_and_canonicalizes_times() {
     assert_eq!(future.created_at, None);
 }
 
+/// [format] Only the official `id` is read, as is: valid ids pass byte for
+/// byte, invalid ones are skipped and counted; a conflicting `task_id`, an
+/// alias-only row and a non-string id are not task ids.
+#[test]
+fn parser_reads_only_the_raw_id_and_counts_invalid_ids() {
+    for (id, valid) in session_id_vectors() {
+        let parsed = parse_cloud_page(&page(&id, None), OFF, now()).unwrap();
+        let label = id.chars().count();
+        assert_eq!(parsed.source_item_count, 1, "{label}");
+        if valid {
+            assert_eq!(parsed.changes.len(), 1, "{label}");
+            assert_eq!(parsed.changes[0].source_session_id, id, "{label}");
+            assert_eq!(parsed.invalid_ids, 0, "{label}");
+        } else {
+            assert!(parsed.changes.is_empty(), "{label}");
+            assert_eq!(parsed.invalid_ids, 1, "{label}");
+        }
+    }
+    let mut both = task("official", "applied");
+    both["task_id"] = json!("conflicting-alias");
+    let mut alias_only = task("unused", "applied");
+    alias_only.as_object_mut().unwrap().remove("id");
+    alias_only["task_id"] = json!("alias-only");
+    let mut number = task("unused", "applied");
+    number["id"] = json!(42);
+    let parsed = parse_cloud_page(
+        &page_of(
+            vec![task("id-only", "applied"), both, alias_only, number],
+            None,
+        ),
+        OFF,
+        now(),
+    )
+    .unwrap();
+    assert_eq!(parsed.source_item_count, 4);
+    assert_eq!(parsed.invalid_ids, 0);
+    assert_eq!(
+        parsed
+            .changes
+            .iter()
+            .map(|change| change.source_session_id.as_str())
+            .collect::<Vec<_>>(),
+        ["id-only", "official"]
+    );
+}
+
 #[test]
 fn cursor_contract_separates_official_terminal_pagination_and_ambiguity() {
-    let cursor = |raw: Value| parse_cloud_page(&raw.to_string(), b"fixture-key", OFF, now());
+    let cursor = |raw: Value| parse_cloud_page(&raw.to_string(), OFF, now());
     assert_eq!(
         cursor(json!({"tasks": [], "cursor": "official-next-page"}))
             .unwrap()
@@ -2924,8 +3227,8 @@ fn relay_token_redirect_never_forwards_the_device_secret() {
     ));
 }
 
-/// [format] The relay reads the Codex activity hint and posts the exact v2
-/// body to the changes route, each retried once after a 401 with a fresh
+/// [format] The relay reads the Codex activity hint and posts the exact v3
+/// body, raw task id included, to the changes route, each retried once after a 401 with a fresh
 /// relay token. A 409 is a refusal and a 410 reads like a missing route,
 /// without reading either body; a 404 on the hint reads as an older server.
 #[test]
@@ -2935,7 +3238,7 @@ fn relay_reads_the_hint_and_maps_refusals_on_the_exact_routes() {
     use std::net::TcpListener;
 
     let (_root, checkpoints) = store("relay-http");
-    let cli = Cli::head(page("raw-provider-private-id", None));
+    let cli = Cli::head(page("task_e_raw id é|\\", None));
     let fixture = Server::new();
     slice(
         &mut CloudCollector::default(),
@@ -2957,8 +3260,7 @@ fn relay_reads_the_hint_and_maps_refusals_on_the_exact_routes() {
         "workspace_labels_enabled": false,
         "recommended_scan_after": "2026-07-21T10:05:00Z",
         "codex_cloud_tasks_enabled": true,
-        "codex_cloud_task_key": TASK_KEY_TEXT,
-        "codex_cloud_tasks_contract": "cloud_session_changes.v2"
+        "codex_cloud_tasks_contract": "cloud_session_changes.v3"
     })
     .to_string();
 
@@ -3003,7 +3305,7 @@ fn relay_reads_the_hint_and_maps_refusals_on_the_exact_routes() {
                             .iter()
                             .map(|change| {
                                 json!({
-                                    "entity_key": change["entity_key"],
+                                    "source_session_id": change["source_session_id"],
                                     "outcome": "accepted",
                                     "head_etag": "c".repeat(64),
                                     "accepted_seq": 7,
@@ -3014,7 +3316,7 @@ fn relay_reads_the_hint_and_maps_refusals_on_the_exact_routes() {
                         (
                             "200 OK",
                             json!({
-                                "schema_version": "cloud_session_changes_ack.v2",
+                                "schema_version": "cloud_session_changes_ack.v3",
                                 "entities": entities
                             })
                             .to_string(),
@@ -3054,7 +3356,7 @@ fn relay_reads_the_hint_and_maps_refusals_on_the_exact_routes() {
         "device-secret".to_string(),
     );
     let read = relay.read_hint(Duration::from_secs(5)).unwrap();
-    assert_eq!(codex_cloud_listing(&read), Some((TASK_KEY.to_vec(), OFF)));
+    assert_eq!(codex_cloud_listing(&read), Some(OFF));
     assert_eq!(codex_cloud_listing(&hint), codex_cloud_listing(&read));
     let ack = relay
         .send_changes(&request, Duration::from_secs(5))
@@ -3107,10 +3409,16 @@ fn relay_reads_the_hint_and_maps_refusals_on_the_exact_routes() {
         serde_json::from_str::<CloudSessionChangesV2>(bodies[0]).unwrap(),
         request
     );
+    let sent: Value = serde_json::from_str(bodies[0]).unwrap();
+    assert_eq!(sent["source"], json!("codex"));
+    assert_eq!(
+        sent["observations"][0]["source_session_id"].as_str(),
+        Some("task_e_raw id é|\\")
+    );
     for body in &bodies {
-        assert!(!body.contains("raw-provider-private-id"));
         assert!(!body.contains("cursor"));
         assert!(!body.contains("grant"));
+        assert!(!body.contains("entity_key"));
     }
     let bearer = |request: &str| {
         request

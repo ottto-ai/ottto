@@ -850,14 +850,10 @@ pub struct ActivityHintResponse {
     pub session_request_identity_contract: Option<String>,
     /// Codex only: the user's "List my Codex cloud tasks" setting as this
     /// server resolves it. An older server omits it, which means off. This
-    /// and the next two are set only by `decode_activity_hint`, tolerantly:
+    /// and the next one are set only by `decode_activity_hint`, tolerantly:
     /// a missing or malformed value is off and never fails the hint.
     #[serde(skip)]
     pub codex_cloud_tasks_enabled: bool,
-    /// Codex only: the user's fixed cloud-task key (unpadded base64url of 32
-    /// bytes), present only while listing is on.
-    #[serde(skip)]
-    pub codex_cloud_task_key: Option<String>,
     /// Codex only: the task-list contract the server accepts.
     #[serde(skip)]
     pub codex_cloud_tasks_contract: Option<String>,
@@ -888,7 +884,6 @@ pub(crate) fn decode_activity_hint(value: Value) -> Result<ActivityHintResponse>
         .get("codex_cloud_tasks_enabled")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    hint.codex_cloud_task_key = text("codex_cloud_task_key");
     hint.codex_cloud_tasks_contract = text("codex_cloud_tasks_contract");
     Ok(hint)
 }
@@ -3083,7 +3078,7 @@ impl SnapshotApiClient {
             .set("Accept", "application/json")
             .set("Authorization", &format!("Bearer {relay_token}"))
     }
-    /// Upload one `cloud_session_changes.v2` request with the same
+    /// Upload one `cloud_session_changes.v3` request with the same
     /// source-scoped relay principal as local snapshots. Only the parsed ACK,
     /// or a refusal's typed code, is returned.
     pub fn upload_cloud_session_changes_with_timeout(
@@ -3859,24 +3854,22 @@ mod tests {
         };
         for extra in [
             "",
-            r#", "codex_cloud_tasks_enabled":"yes", "codex_cloud_task_key":42,
-               "codex_cloud_tasks_contract":{"v":2}"#,
+            r#", "codex_cloud_tasks_enabled":"yes", "codex_cloud_tasks_contract":{"v":3}"#,
         ] {
             let hint = decode(extra);
             assert!(!hint.codex_cloud_tasks_enabled);
-            assert_eq!(hint.codex_cloud_task_key, None);
             assert_eq!(hint.codex_cloud_tasks_contract, None);
         }
+        // A stray retired key field is ignored.
         let hint = decode(
             r#", "codex_cloud_tasks_enabled":true,
                "codex_cloud_task_key":"BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc",
-               "codex_cloud_tasks_contract":"cloud_session_changes.v2""#,
+               "codex_cloud_tasks_contract":"cloud_session_changes.v3""#,
         );
         assert!(hint.codex_cloud_tasks_enabled);
-        assert_eq!(hint.codex_cloud_task_key.map(|key| key.len()), Some(43));
         assert_eq!(
             hint.codex_cloud_tasks_contract.as_deref(),
-            Some("cloud_session_changes.v2")
+            Some("cloud_session_changes.v3")
         );
     }
 
@@ -5724,7 +5717,7 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(ActivityHintResponse; claude_otel_only_sessions_contract, claude_otel_only_pairing_floor, claude_otel_only_pairing_ceiling, source, server_time, last_data_at, record_count_15m, record_count_24h, local_usage_reconciliation_enabled, backfill_window_days, session_titles_enabled, workspace_labels_enabled, workspace_labels_explicit, session_artifacts_enabled, mcp_inventory_harvest_enabled, context_footprint_harvest_enabled, context_composition_details_contract, names_withheld_contract, session_attribution_enabled, session_attribution_labels_enabled, session_attribution_hmac_key, session_attribution_hmac_key_version, session_cache_observations_contract, cache_full_replacement_contract, copy_unproven_contract, session_request_identity_retained_contract, session_request_account_source_contract, max_snapshot_item_bytes, snapshot_head_cas_enabled, snapshot_head_cas_required, census_residue_status_contract, session_request_identity_contract, codex_cloud_tasks_enabled, codex_cloud_task_key, codex_cloud_tasks_contract, recommended_scan_after);
+crate::heap_layout_bound::fields!(ActivityHintResponse; claude_otel_only_sessions_contract, claude_otel_only_pairing_floor, claude_otel_only_pairing_ceiling, source, server_time, last_data_at, record_count_15m, record_count_24h, local_usage_reconciliation_enabled, backfill_window_days, session_titles_enabled, workspace_labels_enabled, workspace_labels_explicit, session_artifacts_enabled, mcp_inventory_harvest_enabled, context_footprint_harvest_enabled, context_composition_details_contract, names_withheld_contract, session_attribution_enabled, session_attribution_labels_enabled, session_attribution_hmac_key, session_attribution_hmac_key_version, session_cache_observations_contract, cache_full_replacement_contract, copy_unproven_contract, session_request_identity_retained_contract, session_request_account_source_contract, max_snapshot_item_bytes, snapshot_head_cas_enabled, snapshot_head_cas_required, census_residue_status_contract, session_request_identity_contract, codex_cloud_tasks_enabled, codex_cloud_tasks_contract, recommended_scan_after);
 
 impl crate::heap_layout_bound::HeapLayoutBound for SnapshotApiClient {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {

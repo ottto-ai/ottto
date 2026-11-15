@@ -295,8 +295,14 @@ fn assert_cloud_session_fixture_wire(fixture: &LoadedFixture) {
         let sample = &record.sample;
         assert_eq!(
             sample.get("schema_version").and_then(Value::as_str),
-            Some("cloud_session_changes.v2"),
-            "{} must carry the cloud_session_changes.v2 request schema",
+            Some("cloud_session_changes.v3"),
+            "{} must carry the cloud_session_changes.v3 request schema",
+            fixture.path.display()
+        );
+        assert_eq!(
+            sample.get("source").and_then(Value::as_str),
+            Some("codex"),
+            "{} must name the codex source",
             fixture.path.display()
         );
         for retired in [
@@ -305,6 +311,7 @@ fn assert_cloud_session_fixture_wire(fixture: &LoadedFixture) {
             "grant_scope_fingerprint",
             "account_fingerprint",
             "collector_id",
+            "entity_key",
         ] {
             assert!(
                 sample.get(retired).is_none(),
@@ -338,16 +345,25 @@ fn assert_cloud_session_fixture_wire(fixture: &LoadedFixture) {
             "{} must carry 1..200 observations",
             fixture.path.display()
         );
-        let mut keys = BTreeSet::new();
+        let mut ids = BTreeSet::new();
         for observation in observations {
-            let entity_key = observation
-                .get("entity_key")
-                .and_then(Value::as_str)
-                .unwrap_or_else(|| panic!("{} has no entity_key", fixture.path.display()));
             assert!(
-                valid_prefixed_lower_hex(entity_key, "hmac-sha256:", 64)
-                    && keys.insert(entity_key.to_string()),
-                "{} has a noncanonical or repeated entity_key",
+                observation.get("entity_key").is_none(),
+                "{} carries the retired entity_key",
+                fixture.path.display()
+            );
+            let id = observation
+                .get("source_session_id")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("{} has no source_session_id", fixture.path.display()));
+            // The shared session-id rule: 1..=255 code points, no control
+            // character, no leading or trailing whitespace.
+            assert!(
+                (1..=255).contains(&id.chars().count())
+                    && !id.chars().any(char::is_control)
+                    && id == id.trim()
+                    && ids.insert(id.to_string()),
+                "{} has an invalid or repeated source_session_id",
                 fixture.path.display()
             );
             // The predecessor etag is always present: null or 64 lowercase hex.

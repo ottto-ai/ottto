@@ -161,22 +161,23 @@ per-Mac approval. The collector uses an officially documented,
 upstream-experimental Codex CLI surface and invokes only `codex cloud list
 --json` as the effective user. Each due work slice first reads the Codex
 activity hint once over a short-lived source-scoped relay token; it lists tasks
-only when that hint turns listing on, names the `cloud_session_changes.v2`
-contract and carries the user's task key. Listing off, an older server, a
-malformed key, authentication failure, and network or parse errors stop before
-provider access. `OTTTO_CODEX_CLOUD_SESSIONS_DISABLED=1` is the emergency kill
+only when that hint turns listing on and names the `cloud_session_changes.v3`
+contract. Listing off, an older server, authentication failure, and network or
+parse errors stop before provider access. `OTTTO_CODEX_CLOUD_SESSIONS_DISABLED=1` is the emergency kill
 switch and overrides the server.
 
-From each task the collector derives an opaque HMAC entity key (keyed by one
-random key the server issues per user and shares with every Mac of that user,
-so the server can recompute it for a task id it knows) plus lifecycle,
-timestamps, attempt count, safe environment kind and coverage. The task title
+From each task the collector sends its Codex task id plus lifecycle,
+timestamps, attempt count, safe environment kind and coverage. The task id
+uploads as the session identifier, the same as local session ids; it opens a
+task only within the user's own Codex/ChatGPT access. A task id that is empty,
+longer than 255 characters, padded with whitespace or holding a control
+character is skipped and only counted locally. The task title
 and environment name are sent only while the same title and workspace-label
 settings that govern local session uploads allow them; every request names the
 settings it applied. It never reads `~/.codex/auth.json`, calls private
 provider endpoints, or uploads raw CLI JSON, summaries, URLs, diffs, worklogs,
-prompts, outputs, repository paths, environment ids, raw provider ids, or
-cursors. The task key stays in memory. The collector is isolated from local
+prompts, outputs, repository paths, environment ids, or cursors, and it never
+logs task ids or writes them to disk. The collector is isolated from local
 snapshot delivery: it has its own backoff, never writes upload receipts, and a
 cloud failure never delays a local upload.
 
@@ -184,9 +185,9 @@ The collector uploads a task only when its facts or the applied settings
 changed since that task's last exact server acknowledgement (at most 200 tasks
 and 512 KiB per request). A local digest decides "changed"; the digest itself
 never leaves the machine. Each acknowledged task's digest and the server's head
-etag are cached in the local upload-history file for 30 days, scoped to the
-backend destination, organization, user, task key and contract; the cache holds
-no titles, and unchanged polls never rewrite or extend an entry. A lost
+etag are cached in the local upload-history file for 30 days under a local
+digest of the task id, scoped to the backend destination, organization, user
+and contract; the cache holds no titles or task ids, and unchanged polls never rewrite or extend an entry. A lost
 response or lost cache write only causes the same task to be offered again,
 which the server answers as unchanged. A per-task refusal, or a conflict the
 server answers without its head, is remembered for exactly that content. When

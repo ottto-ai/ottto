@@ -3,15 +3,18 @@
 //! The collector invokes only `codex cloud list --json` as the effective user.
 //! It never opens `auth.json`, reads OpenAI credentials, or calls provider
 //! endpoints directly. It reads only Ottto's relay device credential for
-//! Ottto backend authentication. Raw CLI JSON, URLs, provider ids and cursors
-//! are used only in memory; a task's title and environment name leave the Mac
-//! only while the metadata policy that governs local sessions allows them.
+//! Ottto backend authentication. Raw CLI JSON, URLs and cursors are used only
+//! in memory. A task's id uploads as its session identifier, the same as a
+//! local session id, and is never logged or written to disk; its title and
+//! environment name leave the Mac only while the metadata policy that governs
+//! local sessions allows them.
 //!
-//! Each due work slice reads the Codex activity hint once (listing on or off,
-//! the user's task key and the metadata policy), lists provider pages and
-//! uploads only tasks whose facts changed since their last exact server ACK
-//! (`cloud_session_changes.v2`). When it calls the provider is in
-//! [`schedule`]; the ACK cache lives in the upload-history SQLite file.
+//! Each due work slice reads the Codex activity hint once (listing on or off
+//! and the metadata policy), lists provider pages and uploads only tasks
+//! whose facts changed since their last exact server ACK
+//! (`cloud_session_changes.v3`). When it calls the provider is in
+//! [`schedule`]; the ACK cache lives in the upload-history SQLite file, keyed
+//! by a local digest of each task id.
 
 use crate::hex::{encode as hex, is_uuid};
 use crate::local_resource_diagnostics::StageWindow;
@@ -19,9 +22,7 @@ use crate::locked_state_dir::FileLock;
 use crate::snapshot_client::ActivityHintResponse;
 use crate::snapshots::state_v2::upload_history::{CloudAck, CloudAckWrite};
 use anyhow::{anyhow, Context, Result};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use getrandom::fill as random_fill;
-use hmac::{Hmac, Mac};
 use ottto_core::{
     compiled_release_version, default_support_dir, FileAccountStore, FileConnectionStore,
     FileDeviceStore, LocalDeviceBinding,
@@ -53,7 +54,7 @@ pub use wire::{
     CloudSessionChangeAckV2, CloudSessionChangeOutcome, CloudSessionChangeV2,
     CloudSessionChangesAckV2, CloudSessionChangesV2, CloudUploadPolicyV2,
 };
-use wire::{Settled, CHANGES_SCHEMA_VERSION, MAX_LABEL_CHARS};
+use wire::{Settled, CHANGES_SCHEMA_VERSION, CHANGES_SOURCE, MAX_LABEL_CHARS};
 
 const CONTROL_TOKEN_LEDGER_SCHEMA_VERSION: &str = "cloud_session_control_token_uses.v1";
 const MAX_CONTROL_TOKEN_USES: usize = 64;
@@ -89,8 +90,6 @@ const RETIRED_STATE_FILES: [&str; 5] = [
 ];
 
 static COLLECTOR_SUPERVISOR_STARTED: AtomicBool = AtomicBool::new(false);
-
-type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CloudSessionControlTokenUseLedger {
@@ -310,13 +309,25 @@ impl CloudSessionCheckpointStore {
         Ok(())
     }
 
+    /// Cached ACKs of the offered task ids, keyed by those raw ids. The file
+    /// holds only each id's [`ack_cache_key`].
     fn read_acks(
         &self,
         scope: &[u8; 32],
-        keys: &[&str],
+        ids: &[&str],
         now_unix: i64,
     ) -> Result<HashMap<String, CloudAck>> {
-        crate::upload_receipts::cloud_read_acks(&self.state_dir, scope, keys, now_unix)
+        let mut by_key = ids
+            .iter()
+            .map(|id| (ack_cache_key(id), *id))
+            .collect::<HashMap<_, _>>();
+        let keys = by_key.keys().map(String::as_str).collect::<Vec<_>>();
+        let found =
+            crate::upload_receipts::cloud_read_acks(&self.state_dir, scope, &keys, now_unix)?;
+        Ok(found
+            .into_iter()
+            .filter_map(|(key, ack)| Some((by_key.remove(&key)?.to_string(), ack)))
+            .collect())
     }
 
     fn crawl_completed(&self, scope: &[u8; 32]) -> Result<Option<Date>> {
@@ -343,7 +354,11 @@ impl CloudSessionCheckpointStore {
         let Some(lease) = self.begin_collector_io(transport)? else {
             return Ok(());
         };
-        let acks = settled
+        let keys = settled
+            .iter()
+            .map(|(id, settled)| (ack_cache_key(id), settled))
+            .collect::<Vec<_>>();
+        let acks = keys
             .iter()
             .map(|(entity_key, (digest, head_etag))| CloudAckWrite {
                 entity_key,
@@ -564,8 +579,8 @@ impl CloudSessionTransport for RelayCloudSessionTransport {
                 &self.gzip_enabled,
             )
         })?;
-        serde_json::from_value(value)
-            .map_err(|error| anyhow!("invalid cloud-session changes ACK: {error}"))
+        // The decode error can quote ACK values; keep only its category.
+        serde_json::from_value(value).map_err(|_| anyhow!("invalid cloud-session changes ACK"))
     }
 }
 
@@ -900,6 +915,9 @@ pub struct CloudCollector {
     unchanged_heads: u32,
     /// The last state logged, so each transition logs one line.
     reported: Option<&'static str>,
+    /// The last nonzero invalid-task-id row count logged, deduplicated the
+    /// same way.
+    reported_invalid_ids: Option<usize>,
 }
 
 /// Everything one work slice uses.
@@ -987,8 +1005,6 @@ struct PageFacts {
 /// One slice's working memory: only ACK metadata of tasks it settled.
 struct SliceWork<'a, 'b> {
     inputs: &'a SliceInputs<'b>,
-    /// The user's task key from this slice's hint; memory only.
-    key: Vec<u8>,
     policy: CloudUploadPolicyV2,
     scope: [u8; 32],
     deadline: Instant,
@@ -998,6 +1014,9 @@ struct SliceWork<'a, 'b> {
     /// Tasks the server answered `accepted` (its head moved).
     accepted: usize,
     head_listed: bool,
+    /// Listed rows skipped for an invalid task id, across every listing of
+    /// this slice. Logged as a count only.
+    invalid_ids: usize,
     settled: HashMap<String, ([u8; 32], Option<String>)>,
 }
 
@@ -1025,6 +1044,15 @@ impl CloudCollector {
         if self.reported != Some(state) {
             self.reported = Some(state);
             eprintln!("codex_cloud_tasks state={state}");
+        }
+    }
+
+    /// One counts-only line when a slice skipped rows for invalid task ids,
+    /// deduplicated like [`Self::report`]; never the ids.
+    fn report_invalid_ids(&mut self, rows: usize) {
+        if rows > 0 && self.reported_invalid_ids != Some(rows) {
+            self.reported_invalid_ids = Some(rows);
+            eprintln!("codex_cloud_tasks invalid_task_id rows={rows}");
         }
     }
 
@@ -1060,7 +1088,7 @@ impl CloudCollector {
             return CloudSessionCycleOutcome::NotDue;
         }
         let deadline = Instant::now() + CYCLE_BUDGET;
-        let Some((key, policy)) = (match self.preflight(inputs, deadline, now, started) {
+        let Some(policy) = (match self.preflight(inputs, deadline, now, started) {
             Ok(listing) => listing,
             Err(outcome) => return outcome,
         }) else {
@@ -1068,7 +1096,7 @@ impl CloudCollector {
             self.report("listing_off");
             return CloudSessionCycleOutcome::Unsupported;
         };
-        let scope = cache_scope(inputs, &key);
+        let scope = cache_scope(inputs);
         if !self.schedule.crawl_completed_loaded {
             let lease = match inputs.checkpoints.begin_collector_io(inputs.transport) {
                 Ok(Some(lease)) => lease,
@@ -1096,7 +1124,6 @@ impl CloudCollector {
         }
         let mut work = SliceWork {
             inputs,
-            key,
             policy,
             scope,
             deadline,
@@ -1105,10 +1132,12 @@ impl CloudCollector {
             offered: 0,
             accepted: 0,
             head_listed: false,
+            invalid_ids: 0,
             settled: HashMap::new(),
         };
         let mut crawl_completed = None;
         let failure = self.work(&mut work, due, now, today, &mut crawl_completed);
+        self.report_invalid_ids(work.invalid_ids);
         let cache_unavailable = inputs
             .checkpoints
             .commit(
@@ -1193,15 +1222,15 @@ impl CloudCollector {
         self.schedule.unsupported_until = Some(now + interval);
     }
 
-    /// The one hint read of a due slice: the user's task key and the
-    /// metadata policy when listing is on, `None` when it is off.
+    /// The one hint read of a due slice: the metadata policy when listing is
+    /// on, `None` when it is off.
     fn preflight(
         &mut self,
         inputs: &SliceInputs<'_>,
         deadline: Instant,
         now: Instant,
         started: Instant,
-    ) -> std::result::Result<Option<(Vec<u8>, CloudUploadPolicyV2)>, CloudSessionCycleOutcome> {
+    ) -> std::result::Result<Option<CloudUploadPolicyV2>, CloudSessionCycleOutcome> {
         let Some(timeout) = remaining_relay_budget(deadline) else {
             return Err(CloudSessionCycleOutcome::NotDue);
         };
@@ -1366,13 +1395,17 @@ impl SliceWork<'_, '_> {
         })
     }
 
-    fn parse(&self, raw: &str) -> std::result::Result<ParsedPage, SliceError> {
-        match parse_cloud_page(raw, &self.key, self.policy, self.wall) {
-            // A nonempty page with no valid task is a provider failure, not
-            // an empty healthy page.
-            Ok(page) if page.source_item_count == 0 || !page.changes.is_empty() => Ok(page),
-            _ => Err(SliceError::backoff("provider_payload_invalid")),
+    fn parse(&mut self, raw: &str) -> std::result::Result<ParsedPage, SliceError> {
+        let page = parse_cloud_page(raw, self.policy, self.wall)
+            .map_err(|_| SliceError::backoff("provider_payload_invalid"))?;
+        self.invalid_ids += page.invalid_ids;
+        // A nonempty page with no recognizable task is a provider failure,
+        // not an empty healthy page. Rows skipped only for an invalid task id
+        // are recognizable, so their page's cursor still advances.
+        if page.source_item_count > 0 && page.changes.is_empty() && page.invalid_ids == 0 {
+            return Err(SliceError::backoff("provider_payload_invalid"));
         }
+        Ok(page)
     }
 
     /// List one page, offer its changed tasks, and retry a head conflict
@@ -1400,15 +1433,18 @@ impl SliceWork<'_, '_> {
         }
         // Fresh re-enumeration before replacing a divergent server head. A
         // second conflict is left for the next visit.
-        let fresh = match self.list(cursor).and_then(|raw| self.parse(&raw)) {
-            Ok(fresh) => fresh,
-            Err(_) => return Ok(facts),
+        let Ok(raw) = self.list(cursor) else {
+            return Ok(facts);
         };
+        let Ok(fresh) = self.parse(&raw) else {
+            return Ok(facts);
+        };
+        drop(raw);
         let retry = fresh
             .changes
             .into_iter()
             .filter_map(|mut change| {
-                let hint = conflicts.get(&change.entity_key)?.clone();
+                let hint = conflicts.get(&change.source_session_id)?.clone();
                 change.expected_head_etag = Some(hint);
                 Some(change)
             })
@@ -1425,24 +1461,23 @@ impl SliceWork<'_, '_> {
     ) -> std::result::Result<HashMap<String, String>, SliceError> {
         let mut unique = Vec::with_capacity(changes.len());
         for change in changes {
-            if !unique
-                .iter()
-                .any(|seen: &CloudSessionChangeV2| seen.entity_key == change.entity_key)
-            {
+            if !unique.iter().any(|seen: &CloudSessionChangeV2| {
+                seen.source_session_id == change.source_session_id
+            }) {
                 unique.push(change);
             }
         }
         if unique.is_empty() {
             return Ok(HashMap::new());
         }
-        let keys = unique
+        let ids = unique
             .iter()
-            .map(|change| change.entity_key.as_str())
-            .filter(|key| !self.settled.contains_key(*key))
+            .map(|change| change.source_session_id.as_str())
+            .filter(|id| !self.settled.contains_key(*id))
             .collect::<Vec<_>>();
         // A cache failure defers this page through cloud-only backoff.
         // Retain no unbounded in-memory replacement and do not hammer the server.
-        let cached = if keys.is_empty() {
+        let cached = if ids.is_empty() {
             HashMap::new()
         } else {
             let _lease = self
@@ -1456,7 +1491,7 @@ impl SliceWork<'_, '_> {
                 })?;
             self.inputs
                 .checkpoints
-                .read_acks(&self.scope, &keys, self.wall.unix_timestamp())
+                .read_acks(&self.scope, &ids, self.wall.unix_timestamp())
                 .map_err(|_| SliceError::backoff("ack_cache_unavailable"))?
         };
         let mut offer = Vec::new();
@@ -1464,11 +1499,11 @@ impl SliceWork<'_, '_> {
             let digest = change.semantic_digest(self.policy);
             let known = self
                 .settled
-                .get(&change.entity_key)
+                .get(&change.source_session_id)
                 .map(|(digest, etag)| (*digest, etag.clone()))
                 .or_else(|| {
                     cached
-                        .get(&change.entity_key)
+                        .get(&change.source_session_id)
                         .map(|ack| (ack.digest, ack.head_etag.clone()))
                 });
             match known {
@@ -1492,6 +1527,7 @@ impl SliceWork<'_, '_> {
         for observations in wire::pack(changes) {
             let request = CloudSessionChangesV2 {
                 schema_version: CHANGES_SCHEMA_VERSION.to_string(),
+                source: CHANGES_SOURCE.to_string(),
                 collector_version: compiled_release_version(),
                 collected_at: timestamp(self.wall),
                 upload_policy: self.policy,
@@ -1527,7 +1563,7 @@ impl SliceWork<'_, '_> {
             self.offered += request.observations.len();
             for change in &request.observations {
                 let digest = change.semantic_digest(self.policy);
-                match settled.get(&change.entity_key) {
+                match settled.get(&change.source_session_id) {
                     Some(Settled::Acked {
                         head_etag,
                         accepted,
@@ -1535,15 +1571,17 @@ impl SliceWork<'_, '_> {
                         if *accepted {
                             self.accepted += 1;
                         }
-                        self.settled
-                            .insert(change.entity_key.clone(), (digest, Some(head_etag.clone())));
+                        self.settled.insert(
+                            change.source_session_id.clone(),
+                            (digest, Some(head_etag.clone())),
+                        );
                     }
                     Some(Settled::Refused) => {
                         self.settled
-                            .insert(change.entity_key.clone(), (digest, None));
+                            .insert(change.source_session_id.clone(), (digest, None));
                     }
                     Some(Settled::Conflict { head_etag }) => {
-                        conflicts.insert(change.entity_key.clone(), head_etag.clone());
+                        conflicts.insert(change.source_session_id.clone(), head_etag.clone());
                     }
                     None => {}
                 }
@@ -1553,30 +1591,21 @@ impl SliceWork<'_, '_> {
     }
 }
 
-/// Listing runs only when the hint turns it on, names exactly the contract
-/// this build speaks and carries the user's 32-byte key; anything else (an
-/// older server omits all three) is off. The policy is the one local session
-/// uploads apply, from the same hint.
-fn codex_cloud_listing(hint: &ActivityHintResponse) -> Option<(Vec<u8>, CloudUploadPolicyV2)> {
+/// Listing runs only when the hint turns it on and names exactly the
+/// contract this build speaks; anything else (an older server omits both) is
+/// off. The policy is the one local session uploads apply, from the same
+/// hint.
+fn codex_cloud_listing(hint: &ActivityHintResponse) -> Option<CloudUploadPolicyV2> {
     if !hint.codex_cloud_tasks_enabled
         || hint.codex_cloud_tasks_contract.as_deref() != Some(CODEX_CLOUD_TASKS_CONTRACT)
     {
         return None;
     }
-    let key = hint
-        .codex_cloud_task_key
-        .as_deref()
-        .filter(|key| key.len() == 43)
-        .and_then(|key| URL_SAFE_NO_PAD.decode(key).ok())
-        .filter(|key| key.len() == 32)?;
     let policy = crate::upload_policy::SnapshotUploadPolicy::from_hint(hint);
-    Some((
-        key,
-        CloudUploadPolicyV2 {
-            session_titles_enabled: policy.titles(),
-            workspace_labels_enabled: policy.workspace(),
-        },
-    ))
+    Some(CloudUploadPolicyV2 {
+        session_titles_enabled: policy.titles(),
+        workspace_labels_enabled: policy.workspace(),
+    })
 }
 
 fn remaining_budget(deadline: Instant) -> Option<Duration> {
@@ -1594,20 +1623,29 @@ fn cursor_digest(cursor: &str) -> [u8; 32] {
 }
 
 /// ACK-cache isolation: the destination, the local organization and user,
-/// the user's task key (by digest) and the contract. Never a Results identity.
-fn cache_scope(inputs: &SliceInputs<'_>, key: &[u8]) -> [u8; 32] {
+/// and the contract. Never a Results identity.
+fn cache_scope(inputs: &SliceInputs<'_>) -> [u8; 32] {
     framed_digest(&[
         b"ottto.cloud-session.cache-scope.v2",
         inputs.destination.as_bytes(),
         inputs.organization_id.as_bytes(),
         inputs.user_id.as_bytes(),
-        Sha256::digest(key).as_slice(),
         CHANGES_SCHEMA_VERSION.as_bytes(),
     ])
 }
 
+/// The ACK cache's row key for one task id: 64 lowercase hex characters, so
+/// the upload-history file never holds a raw provider id and every valid id
+/// fits its key column.
+fn ack_cache_key(id: &str) -> String {
+    hex(&framed_digest(&[
+        b"ottto.cloud-session.ack-key.v3",
+        id.as_bytes(),
+    ]))
+}
+
 /// Schedule isolation: the destination and the local organization and user.
-/// Known before the hint is read, so it carries no key.
+/// Known before the hint is read.
 fn schedule_scope(inputs: &SliceInputs<'_>) -> [u8; 32] {
     framed_digest(&[
         b"ottto.cloud-session.schedule-scope.v2",
@@ -1629,6 +1667,8 @@ struct ParsedPage {
     changes: Vec<CloudSessionChangeV2>,
     cursor: CloudPageCursor,
     source_item_count: usize,
+    /// Rows skipped because their `id` is not a valid session id.
+    invalid_ids: usize,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -1650,7 +1690,6 @@ impl std::fmt::Debug for CloudPageCursor {
 
 fn parse_cloud_page(
     raw: &str,
-    key: &[u8],
     policy: CloudUploadPolicyV2,
     observed_at: OffsetDateTime,
 ) -> Result<ParsedPage> {
@@ -1666,14 +1705,22 @@ fn parse_cloud_page(
     // Every returned row is processed, even beyond the requested limit. A
     // malformed row is skipped alone; its valid siblings still count.
     let mut changes = Vec::new();
+    let mut invalid_ids = 0;
     let source_item_count = items.len();
     for item in items {
         let Some(object) = item.as_object() else {
             continue;
         };
-        let Some(provider_id) = string_field(object, &["id", "task_id"]) else {
+        // Only the official `id`, read as is: an empty, padded, overlong or
+        // control-bearing id is skipped and counted, never repaired, so one
+        // bad row cannot fail the whole request at the server.
+        let Some(provider_id) = object.get("id").and_then(Value::as_str) else {
             continue;
         };
+        if !valid_session_id(provider_id) {
+            invalid_ids += 1;
+            continue;
+        }
         let Some(provider_status) = string_field(object, &["status", "state"]) else {
             continue;
         };
@@ -1736,7 +1783,7 @@ fn parse_cloud_page(
                 .map(|value| value.chars().take(MAX_LABEL_CHARS).collect::<String>())
         };
         changes.push(CloudSessionChangeV2 {
-            entity_key: opaque_key(key, provider_id),
+            source_session_id: provider_id.to_string(),
             expected_head_etag: None,
             entity_kind: "task".to_string(),
             lifecycle: lifecycle(Some(provider_status)),
@@ -1769,6 +1816,7 @@ fn parse_cloud_page(
         changes,
         cursor,
         source_item_count,
+        invalid_ids,
     })
 }
 
@@ -1876,12 +1924,13 @@ fn timestamp(value: OffsetDateTime) -> String {
 fn valid_rfc3339(value: &str) -> bool {
     !value.is_empty() && OffsetDateTime::parse(value, &Rfc3339).is_ok()
 }
-fn valid_hmac_fingerprint(value: &str) -> bool {
-    value.len() == 76
-        && value.starts_with("hmac-sha256:")
-        && value[12..]
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+/// The shared session-id rule (the server applies the same one): 1 to 255
+/// code points, no control character, no leading or trailing whitespace.
+/// Any other character, `|` and backslash included, is allowed.
+fn valid_session_id(value: &str) -> bool {
+    (1..=255).contains(&value.chars().count())
+        && !value.chars().any(char::is_control)
+        && value == value.trim()
 }
 fn sha256(bytes: &[u8]) -> String {
     let mut digest = Sha256::new();
@@ -1891,11 +1940,6 @@ fn sha256(bytes: &[u8]) -> String {
 fn push_length_framed(bytes: &mut Vec<u8>, value: &[u8]) {
     bytes.extend_from_slice(&(value.len() as u64).to_be_bytes());
     bytes.extend_from_slice(value);
-}
-fn opaque_key(key: &[u8], raw: &str) -> String {
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
-    mac.update(raw.as_bytes());
-    format!("hmac-sha256:{}", hex(&mac.finalize().into_bytes()))
 }
 fn atomic_json_write<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let parent = path
