@@ -153,7 +153,7 @@ pub(in crate::snapshots) fn ensure_bounded_traversal(
                 .pending_candidates
                 .iter()
                 .any(|candidate| candidate.census_member)
-            && traversal.counts.has_errors();
+            && traversal.has_errors();
         // What clears the latch: a generation that completes drops the
         // traversal, and a changed scan context takes the `else` branch below;
         // both start the next traversal at attempt zero. What bounds it: the

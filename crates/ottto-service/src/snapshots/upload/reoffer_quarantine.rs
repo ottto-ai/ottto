@@ -127,7 +127,7 @@ impl ScanIndex {
             if self.traversal.as_ref().is_some_and(|t| {
                 t.pending_directories.is_empty()
                     && t.pending_candidates.is_empty()
-                    && t.counts.has_errors()
+                    && t.has_errors()
             }) {
                 self.traversal = None;
             }

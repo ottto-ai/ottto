@@ -2110,9 +2110,13 @@ mod census_unreadable_tests {
             traversal.unreadable_path_count += page.unreadable_path_count;
             traversal.unreadable_causes.merge(page.unreadable_causes);
             // Exactly the original predicate; metadata may not settle residue.
-            assert!(traversal.has_retryable_problems());
-            assert!(traversal.has_errors());
-            assert!(!traversal.settle_non_progressing_residue());
+            let mut checkpoint = ScanTraversalCheckpoint {
+                counts: traversal.clone(),
+                ..tests::traversal_checkpoint()
+            };
+            assert!(checkpoint.has_retryable_problems());
+            assert!(checkpoint.has_errors());
+            assert!(!checkpoint.settle_non_progressing_residue());
         }
         assert_eq!(traversal.unreadable_path_count, 36);
         let projected = projection(&traversal);
