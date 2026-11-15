@@ -22,6 +22,8 @@ fn fixture_with(
     ));
     let member = scratch.join("member.jsonl");
     fs::write(&member, b"").unwrap();
+    // Comfortably inside the 183-day window.
+    set_age(&member, 30 * DAY);
     let key = local_index_key(&member);
     let mut index = ScanIndex::default();
     let mut entry = manifest_index_entry(Some(entity));
@@ -49,6 +51,18 @@ fn window_and_context(index: &ScanIndex, source: SnapshotSource) -> (u64, String
         window,
         scan_traversal_context_fingerprint(source, &[], window),
     )
+}
+
+const DAY: u64 = 24 * 60 * 60;
+
+fn set_age(path: &Path, seconds: u64) {
+    fs::File::open(path)
+        .unwrap()
+        .set_times(
+            fs::FileTimes::new()
+                .set_modified(SystemTime::now() - std::time::Duration::from_secs(seconds)),
+        )
+        .unwrap();
 }
 
 fn age_out(path: &Path) {
@@ -115,6 +129,14 @@ fn admission_window_outside_or_unknown_holds_stay_wide() {
         let (support, mut index) = fixture(source);
         let member = support.join("member.jsonl");
         assert_eq!(window_and_context(&index, source).0, 183, "{source:?}");
+        // Within a day of the edge widens: a clock step or the gate-to-walk
+        // gap cannot age it out of a narrow walk.
+        set_age(&member, 183 * DAY - DAY / 2);
+        assert_eq!(
+            window_and_context(&index, source).0,
+            u64::MAX,
+            "{source:?} edge margin"
+        );
         age_out(&member);
         // A recent committed mtime cannot conceal an aged-out current file.
         assert_eq!(window_and_context(&index, source).0, u64::MAX, "{source:?}");

@@ -5,6 +5,11 @@
 
 use crate::snapshots::*;
 
+/// A retry within this many days of the scan window's edge widens the scan, so
+/// a backward clock step or the gate-to-walk time gap under a day cannot age it
+/// out of the narrow walk.
+const REOFFER_WINDOW_EDGE_MARGIN_DAYS: u64 = 1;
+
 impl ScanIndex {
     /// The one writer of a settled file's `effective_upload_body_witness_revision`.
     /// Claude never downgrades (`max(stored, allowed_active)`); Codex and Pi
@@ -142,6 +147,7 @@ impl ScanIndex {
 
     /// Q-W: every current-limit pending retry uses the same outside/unknown
     /// incidence rule, regardless of which operation created or armed it.
+    /// "Inside" leaves `REOFFER_WINDOW_EDGE_MARGIN_DAYS` before the edge.
     pub(crate) fn snapshot_admission_reoffer_pending_for_scan(
         &self,
         source: SnapshotSource,
@@ -150,6 +156,8 @@ impl ScanIndex {
         let Some(now) = unix_seconds(SystemTime::now()) else {
             return self.snapshot_admission_reoffer_pending();
         };
+        let inside_days = effective_backfill_window_days(window_days)
+            .saturating_sub(REOFFER_WINDOW_EDGE_MARGIN_DAYS);
         let (mut outside, mut inside) = (0, 0);
         for (fingerprint, record) in &self.quarantined_snapshot_fingerprints {
             if record.witness.item_wire_byte_limit != MAX_SNAPSHOT_ITEM_WIRE_BYTES
@@ -175,7 +183,7 @@ impl ScanIndex {
                         .and_then(|metadata| metadata.modified().ok())
                         .and_then(unix_seconds)
                         .map_or(true, |modified| {
-                            !is_recent_enough_at(modified, now, window_days)
+                            !is_recent_enough_at(modified, now, inside_days)
                         })
                 });
             if outside_window || !found {
