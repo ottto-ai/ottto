@@ -1902,12 +1902,15 @@ The Codex `native_collection_page` line carries `page_byte_budget_hit: 1` in
 spent. During a first backfill, such a page with queued work requests a paced
 pass. It never affects selection or money.
 
-Completed native pages also carry a `first_import_default_qos` boolean: the
-pass ran a paced request made during the source's first import while on AC
-power, so it kept the thread's default QoS instead of background QoS. Battery,
-Low Power Mode and unknown power behave as before, and paced passes requested
-after the first import stay at background QoS. The reason is held in memory
-only; it changes priority, never selection or money.
+During a first import on AC, a byte-bound page with work queued asks for the
+next paced pass with no gap, run at UTILITY QoS: the thread is lowered to
+UTILITY and never raised. Other first-import paced passes keep the 30 s gap at
+the thread's inherited class. Completed native pages report `first_import_qos`:
+`utility`, `default`, or `background` when the UTILITY set failed. The field is
+absent otherwise. Battery keeps background QoS and the 180 s gap, Low Power
+Mode and unknown power clear the request, and paced passes requested after the
+first import stay at background QoS. The reason is held in memory only; it
+changes timing and priority, never selection or money.
 
 ## Claude OTLP spans and relay requests: stored and not stored
 

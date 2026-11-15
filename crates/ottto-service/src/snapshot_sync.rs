@@ -5124,16 +5124,20 @@ fn collect_file_activity_with_retry(
 ) -> bool {
     let deadline = crate::scan_clock::now() + wait;
     let mut watcher = watcher;
+    // A zero wait (a due paced page) still polls once: delivery retry, the
+    // watcher channel and the account-switch probe, without blocking.
+    let mut poll = wait.is_zero();
     loop {
         let now = crate::scan_clock::now();
-        if now >= deadline {
+        if now >= deadline && !poll {
             return false;
         }
         let wake = retry_boundary(deadline).min(deadline);
         let now = crate::scan_clock::now();
-        if now >= deadline {
+        if now >= deadline && !std::mem::take(&mut poll) {
             return false;
         }
+        poll = false;
         let slice = wake.saturating_duration_since(now).min(CADENCE_WAIT_SLICE);
         match watcher.map(|watcher| watcher.events.recv_timeout(slice)) {
             None => std::thread::sleep(slice),
@@ -5576,6 +5580,7 @@ fn sync_once_with_retry(
         account_witness,
         retry,
     };
+    continuation_cycle.rotating(&enabled_sources);
     crate::source_rotation::run(
         &mut owner,
         &enabled_sources,
@@ -9162,7 +9167,8 @@ fn finish_sync_source(
             &upload_destination_namespace,
         );
     if continuation::resident_scan_requested(&scan_result, first_read_bootstrap) {
-        continuation::request_resident_scan(source, first_read_bootstrap);
+        let reason = continuation::paced_reason(&scan_result, first_read_bootstrap);
+        continuation::request_resident_scan(source, reason);
     }
 
     // Refresh the per-source detected-uses cache the daemon health assembly
@@ -17667,7 +17673,7 @@ mod tests {
                 SNAPSHOT_SYNC_INTERVAL * stretch,
                 "hot"
             );
-            cadence.request_paced_scan(start, Duration::ZERO, PACED_BATTERY, false);
+            cadence.request_paced_scan(start, Duration::ZERO, PACED_BATTERY, Default::default());
             assert_eq!(cadence.paced_scan_due(), Some(start + minutes(3)));
             cadence.request_continuation(start, Duration::from_secs(1));
             assert_eq!(
