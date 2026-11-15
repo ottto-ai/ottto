@@ -356,9 +356,9 @@ SQLite runs in-process, so a query is a function call rather than a round trip.
   No per-row commits.
 - Read transactions stay short and never span parsing, uploads or network waits, so WAL
   checkpoints can run.
-- Between cycles, each state-store connection releases reusable page-cache memory after
-  maintenance and before cache gauges are sampled. The next pass refills the cache with
-  `cache_size=-8192` unchanged; idle retains only small connection and metadata overhead.
+- Each state-store connection releases its own cache after its own pass, after maintenance
+  and before cache gauges are sampled. Release is best effort; `cache_size=-8192` stays
+  unchanged and the next pass refills the cache.
 - Durability stays at `FULL`. Erasing data leaves nothing readable in the database, WAL or SHM
   files.
 - Complete valid saves commit above aggregate charged-work targets. The 32 MiB target sizes the

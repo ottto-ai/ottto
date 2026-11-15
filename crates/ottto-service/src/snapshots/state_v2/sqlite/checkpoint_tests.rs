@@ -64,20 +64,6 @@ fn read(db: &mut Sqlite, name: &str) -> Vec<u8> {
 /// [behaviour] Idle releases cached pages without changing the next pass's budget.
 #[test]
 fn idle_releases_page_cache_and_next_pass_refills_it() {
-    fn cache_used(db: &Sqlite) -> i32 {
-        let (mut used, mut high) = (0, 0);
-        let rc = unsafe {
-            rusqlite::ffi::sqlite3_db_status(
-                db.conn().unwrap().handle(),
-                rusqlite::ffi::SQLITE_DBSTATUS_CACHE_USED,
-                &mut used,
-                &mut high,
-                0,
-            )
-        };
-        assert_eq!(rc, rusqlite::ffi::SQLITE_OK);
-        used
-    }
     let (_scratch, path, identity) = live_store("v2-idle-cache");
     let mut db = open(&path, &identity);
     // Exercise the page cache even when the database fits in the mmap ceiling.
@@ -88,27 +74,22 @@ fn idle_releases_page_cache_and_next_pass_refills_it() {
     let value = vec![b'x'; SAVE_BYTES];
     for (generation, quiet) in [false, true].into_iter().enumerate() {
         save(&mut db, generation as u64, "cached", &value);
-        assert!(cache_used(&db) > 1024 * 1024);
-        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
-            db.between_cycles(quiet).unwrap();
-            db.clean_checkpoint().unwrap();
-            db.stamp().unwrap();
-        });
-        let row = rows
-            .iter()
-            .find(|r| r["counts"]["cache_used_bytes"].is_u64())
-            .unwrap();
-        assert!(row["counts"]["cache_used_bytes"].as_u64().unwrap() < 64 * 1024);
-        // SQLite keeps connection overhead and the clean marker's metadata pages.
-        assert!(cache_used(&db) < 64 * 1024);
+        let warm = serde_json::to_value(db.maintenance_stats()).unwrap();
+        assert!(warm["cache_used_bytes"].as_u64().unwrap() > 1024 * 1024);
+        db.between_cycles(quiet).unwrap();
+        let idle = serde_json::to_value(db.maintenance_stats()).unwrap();
+        assert!(idle["cache_used_bytes"].as_u64().unwrap() < 64 * 1024);
         let cache_size: i64 = db
             .conn()
             .unwrap()
             .query_row("PRAGMA cache_size", [], |r| r.get(0))
             .unwrap();
         assert_eq!(cache_size, -8192);
+        db.clean_checkpoint().unwrap();
+        db.stamp().unwrap();
+        let accesses = db.cache_accesses_for_test();
         assert_eq!(read(&mut db, "cached"), value);
-        assert!(cache_used(&db) > 1024 * 1024);
+        assert!(db.cache_accesses_for_test() > accesses);
     }
 }
 

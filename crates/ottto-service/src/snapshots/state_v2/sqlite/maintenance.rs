@@ -608,9 +608,9 @@ impl Sqlite {
             .map(|(logical, m)| logical.max(m.len()));
         self.stats.db_size_alarm = self.stats.db_bytes.is_some_and(|n| n > 1_000_000_000);
         if release_cache && result.is_ok() {
-            // Maintenance can refill the cache. Release it at the idle boundary,
-            // after its statements/transactions drop and before sampling gauges.
-            self.conn()?.execute_batch("PRAGMA shrink_memory")?;
+            // Release after maintenance reads, before gauges. Release failures
+            // must never replace the privacy/checkpoint maintenance result.
+            let _ = self.conn().map(|c| c.execute_batch("PRAGMA shrink_memory"));
         }
         // Hit/miss reset only where a row prints, so that row counts every
         // access since the previous printed row.
