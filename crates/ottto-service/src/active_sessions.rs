@@ -100,6 +100,7 @@ pub fn reconcile_active_sessions(
         Some("local"),
         effective_interval,
         crate::agent_status::claude_session_registrations,
+        None,
     )
 }
 
@@ -120,32 +121,7 @@ pub fn clear_active_sessions(
         None,
         std::time::Duration::ZERO,
         crate::agent_status::claude_session_registrations,
-    )
-}
-
-#[expect(clippy::too_many_arguments, reason = "9 args; no options struct yet")]
-fn reconcile_with_registrations(
-    support_dir: &Path,
-    source: SnapshotSource,
-    snapshots: &[SnapshotItem],
-    agent_status: Option<&AgentStatusSnapshot>,
-    scan_started_at: Option<&str>,
-    reconciled_at: &str,
-    carry_policy: Option<&str>,
-    effective_interval: std::time::Duration,
-    registrations: impl FnOnce() -> crate::claude_session_registrations::Registrations,
-) -> Result<ActiveSessionReconciliation> {
-    reconcile_observing(
-        support_dir,
-        source,
-        snapshots,
-        agent_status,
-        scan_started_at,
-        reconciled_at,
-        carry_policy,
-        effective_interval,
-        registrations,
-        &mut |_, _| {},
+        None,
     )
 }
 
@@ -153,7 +129,7 @@ fn reconcile_with_registrations(
     clippy::too_many_arguments,
     reason = "existing reconciliation inputs plus observation"
 )]
-pub(crate) fn reconcile_observing(
+pub(crate) fn reconcile_with_registrations(
     support_dir: &Path,
     source: SnapshotSource,
     snapshots: &[SnapshotItem],
@@ -163,7 +139,7 @@ pub(crate) fn reconcile_observing(
     carry_policy: Option<&str>,
     effective_interval: std::time::Duration,
     registrations: impl FnOnce() -> crate::claude_session_registrations::Registrations,
-    observe: &mut dyn FnMut(&str, Option<&str>),
+    mut observe: Option<&mut dyn FnMut(OffsetDateTime, Option<OffsetDateTime>, OffsetDateTime)>,
 ) -> Result<ActiveSessionReconciliation> {
     let path = active_session_cache_path(support_dir, source);
     let mut cache = read_cache(&path);
@@ -180,20 +156,9 @@ pub(crate) fn reconcile_observing(
     let activity_ceiling = now + Duration::minutes(5);
     let watermark_cutoff = now - Duration::days(WATERMARK_RETENTION_DAYS);
 
-    // Every witness compares with the persisted baseline, including duplicate
-    // session rows in this batch. The normal watermark updates below stay intact.
-    for snapshot in snapshots {
-        if let Some(activity) = snapshot.source_last_activity_at.as_deref() {
-            observe(
-                activity,
-                cache
-                    .watermarks
-                    .get(&snapshot.source_session_id)
-                    .map(String::as_str),
-            );
-        }
-    }
-
+    // Only a waiting Repair needs original baselines. Duplicate rows must not
+    // turn a watermark written earlier in this batch into confirmation evidence.
+    let mut baselines = BTreeMap::new();
     let mut changed = BTreeMap::<String, ActiveSession>::new();
     let mut selected_snapshots = BTreeMap::new();
     // Recent snapshots this scan re-read without advanced activity. A listed
@@ -207,10 +172,16 @@ pub(crate) fn reconcile_observing(
             continue;
         };
         let previous = cache.watermarks.get(&snapshot.source_session_id).cloned();
-        let advanced = previous
+        let previous_at = previous
             .as_deref()
-            .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
-            .map_or(true, |value| last_activity_at > value);
+            .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok());
+        if let Some(observe) = observe.as_mut() {
+            let baseline = *baselines
+                .entry(snapshot.source_session_id.as_str())
+                .or_insert(previous_at);
+            observe(last_activity_at, baseline, activity_ceiling);
+        }
+        let advanced = previous_at.map_or(true, |value| last_activity_at > value);
 
         if advanced && last_activity_at >= activity_cutoff && last_activity_at <= activity_ceiling {
             changed.insert(
@@ -1339,6 +1310,7 @@ mod tests {
             Some("policy"),
             std::time::Duration::from_secs(300),
             registrations,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -1380,6 +1352,7 @@ mod tests {
             Some("policy"),
             std::time::Duration::from_secs(300),
             registrations,
+            None,
         )
         .unwrap();
         let row = &result.sessions[0];
@@ -1417,6 +1390,7 @@ mod tests {
             Some("policy"),
             std::time::Duration::from_secs(300),
             || panic!("no registration acquisition without new activity"),
+            None,
         )
         .unwrap();
         assert_eq!(unchanged.changed_session_count, 0);
@@ -1443,6 +1417,7 @@ mod tests {
             Some("policy"),
             std::time::Duration::from_secs(300),
             || panic!("no registration acquisition without new activity"),
+            None,
         )
         .unwrap();
         assert!(expired.sessions.is_empty());
@@ -1472,6 +1447,7 @@ mod tests {
             Some("policy"),
             std::time::Duration::from_secs(300),
             registrations,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -1509,6 +1485,7 @@ mod tests {
                 Some("policy"),
                 std::time::Duration::from_secs(300),
                 registrations,
+                None,
             )
             .unwrap();
             assert_eq!(
@@ -1534,6 +1511,7 @@ mod tests {
             Some("policy"),
             std::time::Duration::from_secs(300),
             registrations,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -1587,6 +1565,7 @@ mod tests {
                 Some("policy"),
                 std::time::Duration::from_secs(300),
                 BTreeMap::new,
+                None,
             )
             .unwrap();
             assert_eq!(result.sessions[0].session_display_name.as_deref(), expected);
@@ -1609,6 +1588,7 @@ mod tests {
             Some("policy"),
             std::time::Duration::from_secs(300),
             BTreeMap::new,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -1625,6 +1605,7 @@ mod tests {
             Some("policy"),
             std::time::Duration::from_secs(300),
             || panic!("no registry scan for empty source"),
+            None,
         )
         .unwrap();
         assert!(empty.sessions.is_empty());
@@ -1645,97 +1626,104 @@ mod tests {
         crate::test_scratch::private_dir(&format!("ottto-active-sessions-{name}"))
     }
 
-    #[test]
-    fn parsed_pre_repair_session_can_confirm_below_a_future_watermark() {
-        use crate::tracking_confirmation::ParsedActivityWitness;
-        for source in [
-            SnapshotSource::ClaudeCode,
-            SnapshotSource::Codex,
-            SnapshotSource::Pi,
-        ] {
-            let dir = temp_dir("confirmation-parsed");
-            let future = test_snapshot("existing-session", "2026-11-16T10:00:00Z");
-            reconcile_active_sessions(
-                &dir,
-                source,
-                std::slice::from_ref(&future),
-                None,
-                None,
-                "2026-11-15T09:59:00Z",
-                std::time::Duration::from_secs(300),
-            )
-            .unwrap();
-            let mut witness =
-                ParsedActivityWitness::new(Some("2026-11-15T10:00:00Z"), "2026-11-16T10:00:00Z");
-            reconcile_observing(
-                &dir,
-                source,
-                &[future],
-                None,
-                None,
-                "2026-11-16T10:00:00Z",
-                Some("local"),
-                std::time::Duration::from_secs(300),
-                crate::agent_status::claude_session_registrations,
-                &mut |new, prev| witness.observe(new, prev),
-            )
-            .unwrap();
-            assert_eq!(
-                witness.latest(),
-                None,
-                "unchanged future evidence never matures"
-            );
-            let mut turn = test_snapshot("existing-session", "2026-11-15T10:01:00Z");
-            turn.source_started_at = Some("2026-11-15T09:00:00Z".into());
-            let mut witness =
-                ParsedActivityWitness::new(Some("2026-11-15T10:00:00Z"), "2026-11-15T10:01:00Z");
-            reconcile_observing(
-                &dir,
-                source,
-                &[turn],
-                None,
-                None,
-                "2026-11-15T10:01:00Z",
-                Some("local"),
-                std::time::Duration::from_secs(300),
-                crate::agent_status::claude_session_registrations,
-                &mut |new, prev| witness.observe(new, prev),
-            )
-            .unwrap();
-            assert_eq!(witness.latest().as_deref(), Some("2026-11-15T10:01:00Z"));
-            assert_eq!(
-                read_cache(&active_session_cache_path(&dir, source)).watermarks["existing-session"],
-                "2026-11-16T10:00:00Z"
-            );
-            let mut cache = read_cache(&active_session_cache_path(&dir, source));
-            cache
-                .watermarks
-                .insert("cached-session".into(), "2026-11-15T10:01:00Z".into());
-            write_cache(&active_session_cache_path(&dir, source), &cache).unwrap();
-            let mut witness =
-                ParsedActivityWitness::new(Some("2026-11-15T10:00:00Z"), "2026-11-15T10:01:00Z");
-            reconcile_observing(
-                &dir,
-                source,
-                &[
-                    test_snapshot("cached-session", "2026-11-16T10:00:00Z"),
-                    test_snapshot("cached-session", "2026-11-15T10:01:00Z"),
-                ],
-                None,
-                None,
-                "2026-11-15T10:01:00Z",
-                Some("local"),
-                std::time::Duration::from_secs(300),
-                crate::agent_status::claude_session_registrations,
-                &mut |new, prev| witness.observe(new, prev),
-            )
-            .unwrap();
-            assert_eq!(
-                witness.latest(),
-                None,
-                "a duplicate row must use the original baseline"
-            );
-            std::fs::remove_dir_all(dir).unwrap();
+    mod tracking_confirmation_tests {
+        use super::*;
+
+        #[test]
+        fn parsed_pre_repair_session_can_confirm_below_a_future_watermark() {
+            use crate::tracking_confirmation::parsed_activity_witness;
+            let since = OffsetDateTime::parse("2026-11-15T10:00:00Z", &Rfc3339).ok();
+            for source in [
+                SnapshotSource::ClaudeCode,
+                SnapshotSource::Codex,
+                SnapshotSource::Pi,
+            ] {
+                let dir = temp_dir("confirmation-parsed");
+                let future = test_snapshot("existing-session", "2026-11-16T10:00:00Z");
+                reconcile_active_sessions(
+                    &dir,
+                    source,
+                    std::slice::from_ref(&future),
+                    None,
+                    None,
+                    "2026-11-15T09:59:00Z",
+                    std::time::Duration::from_secs(300),
+                )
+                .unwrap();
+                let mut witness = None;
+                reconcile_with_registrations(
+                    &dir,
+                    source,
+                    &[future],
+                    None,
+                    None,
+                    "2026-11-16T10:00:00Z",
+                    Some("local"),
+                    std::time::Duration::from_secs(300),
+                    crate::agent_status::claude_session_registrations,
+                    Some(&mut |new, prev, ceiling| {
+                        witness = witness.max(parsed_activity_witness(since, new, prev, ceiling))
+                    }),
+                )
+                .unwrap();
+                assert_eq!(witness, None, "unchanged future evidence never matures");
+                let mut turn = test_snapshot("existing-session", "2026-11-15T10:01:00Z");
+                turn.source_started_at = Some("2026-11-15T09:00:00Z".into());
+                let mut witness = None;
+                reconcile_with_registrations(
+                    &dir,
+                    source,
+                    &[turn],
+                    None,
+                    None,
+                    "2026-11-15T10:01:00Z",
+                    Some("local"),
+                    std::time::Duration::from_secs(300),
+                    crate::agent_status::claude_session_registrations,
+                    Some(&mut |new, prev, ceiling| {
+                        witness = witness.max(parsed_activity_witness(since, new, prev, ceiling))
+                    }),
+                )
+                .unwrap();
+                assert_eq!(
+                    witness.and_then(|at| at.format(&Rfc3339).ok()).as_deref(),
+                    Some("2026-11-15T10:01:00Z")
+                );
+                assert_eq!(
+                    read_cache(&active_session_cache_path(&dir, source)).watermarks
+                        ["existing-session"],
+                    "2026-11-16T10:00:00Z"
+                );
+                let mut cache = read_cache(&active_session_cache_path(&dir, source));
+                cache
+                    .watermarks
+                    .insert("cached-session".into(), "2026-11-15T10:01:00Z".into());
+                write_cache(&active_session_cache_path(&dir, source), &cache).unwrap();
+                let mut witness = None;
+                reconcile_with_registrations(
+                    &dir,
+                    source,
+                    &[
+                        test_snapshot("cached-session", "2026-11-16T10:00:00Z"),
+                        test_snapshot("cached-session", "2026-11-15T10:01:00Z"),
+                    ],
+                    None,
+                    None,
+                    "2026-11-15T10:01:00Z",
+                    Some("local"),
+                    std::time::Duration::from_secs(300),
+                    crate::agent_status::claude_session_registrations,
+                    Some(&mut |new, prev, ceiling| {
+                        witness = witness.max(parsed_activity_witness(since, new, prev, ceiling))
+                    }),
+                )
+                .unwrap();
+                assert_eq!(
+                    witness, None,
+                    "a duplicate row must use the original baseline"
+                );
+                std::fs::remove_dir_all(dir).unwrap();
+            }
         }
     }
 

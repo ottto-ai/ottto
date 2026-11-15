@@ -587,18 +587,7 @@ impl LocalDaemon {
     pub fn with_source_state_dir(self, dir: impl Into<PathBuf>) -> Self {
         let dir = dir.into();
         if let Ok(mut state) = self.inner.lock() {
-            state.source_first_seen = load_source_first_seen(&dir);
-            for source in [SourceKind::Codex, SourceKind::ClaudeCode, SourceKind::Pi] {
-                let store = FileSourceStateStore::new(
-                    dir.join(source_state_file_name(source_slug(&source))),
-                );
-                if let Ok(Some(saved)) = store.load() {
-                    if let Some(episode) = saved.tracking_confirmation {
-                        state.tracking_confirmation.restore(&source, episode);
-                    }
-                }
-            }
-            state.sources = load_source_health(&state, &dir);
+            load_source_state(&mut state, &dir);
             state.source_state_dir = Some(dir);
         }
         self
@@ -617,9 +606,6 @@ impl LocalDaemon {
         state
             .source_reconciliation
             .insert(source_slug(&source).to_string(), enabled);
-        if !enabled && state.tracking_confirmation.clear(&source) {
-            state.persist_source_state(&source);
-        }
         Ok(())
     }
 
@@ -4169,48 +4155,32 @@ fn config_path_hint(source: &SourceKind) -> Option<&'static str> {
     }
 }
 
-/// Boot-load persisted first-seen timestamps for all sources from `dir`, keyed
-/// by source slug. Missing or unreadable files are skipped (graceful empty),
-/// matching the lenient posture of the detected-uses cache.
-fn load_source_first_seen(dir: &Path) -> BTreeMap<String, String> {
-    let mut map = BTreeMap::new();
+/// Boot-load first-seen, health and the optional Repair episode in one pass.
+/// Missing/unreadable files are skipped; mismatched health sources are ignored.
+fn load_source_state(state: &mut DaemonState, dir: &Path) {
+    state.source_first_seen.clear();
+    state.sources.clear();
     for source in [SourceKind::Codex, SourceKind::ClaudeCode, SourceKind::Pi] {
         let slug = source_slug(&source);
         let store = FileSourceStateStore::new(dir.join(source_state_file_name(slug)));
-        if let Ok(Some(LocalSourceState {
-            first_seen_at: Some(first_seen),
-            ..
-        })) = store.load()
-        {
-            map.insert(slug.to_string(), first_seen);
+        let Ok(Some(saved)) = store.load() else {
+            continue;
+        };
+        if let Some(first_seen) = saved.first_seen_at {
+            state.source_first_seen.insert(slug.to_string(), first_seen);
         }
-    }
-    map
-}
-
-/// Boot-load the most recent verification-derived source health rows. Missing
-/// or unreadable files are skipped, and rows whose persisted source does not
-/// match the file slug are ignored so a corrupt file cannot poison another
-/// source.
-fn load_source_health(state: &DaemonState, dir: &Path) -> Vec<SourceHealth> {
-    let mut sources = Vec::new();
-    for source in [SourceKind::Codex, SourceKind::ClaudeCode, SourceKind::Pi] {
-        let slug = source_slug(&source);
-        let store = FileSourceStateStore::new(dir.join(source_state_file_name(slug)));
-        let Ok(Some(LocalSourceState {
-            last_health: Some(mut health),
-            ..
-        })) = store.load()
-        else {
+        if let Some(episode) = saved.tracking_confirmation {
+            state.tracking_confirmation.restore(&source, episode);
+        }
+        let Some(mut health) = saved.last_health else {
             continue;
         };
         if health.source != source {
             continue;
         }
         normalize_persisted_source_health(state, &mut health);
-        sources.push(health);
+        state.sources.push(health);
     }
-    sources
 }
 
 fn normalize_persisted_source_health(state: &DaemonState, health: &mut SourceHealth) {
@@ -9470,129 +9440,143 @@ mod tests {
         snapshot
     }
 
-    #[test]
-    #[serial]
-    fn tracking_status_omits_inapplicable_episodes_without_mutating_saved_state() {
-        let root = crate::test_scratch::private_dir("tracking-status-applicability");
-        let _support = TestEnvVar::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
-        let daemon = daemon();
-        let source = SourceKind::Codex;
-        let mut state = daemon.state().unwrap();
-        state.sources = vec![codex_health()];
-        assert!(serde_json::to_value(&state.sources[0])
-            .unwrap()
-            .get("tracking_confirmation")
-            .is_none());
-        state
-            .tracking_confirmation
-            .arm(&source, "2026-11-15T10:00:00Z".into(), true);
-        assert!(
-            status_from_state_with_relay_finding(&mut state, None).sources[0]
-                .tracking_confirmation
-                .is_none()
-        );
-        state.registered_source_grants = vec!["codex".into()];
-        assert!(
-            status_from_state_with_relay_finding(&mut state, None).sources[0]
-                .tracking_confirmation
-                .is_some()
-        );
-        state.source_reconciliation.insert("codex".into(), false);
-        assert!(
-            status_from_state_with_relay_finding(&mut state, None).sources[0]
-                .tracking_confirmation
-                .is_none()
-        );
-        state.source_reconciliation.clear();
-        state.sources[0].config.discovered = false;
-        assert!(
-            status_from_state_with_relay_finding(&mut state, None).sources[0]
-                .tracking_confirmation
-                .is_some(),
-            "config discovery is not installation; sources without config still confirm"
-        );
-        state.sources[0].state = SourceState::NotFound;
-        assert!(
-            status_from_state_with_relay_finding(&mut state, None).sources[0]
-                .tracking_confirmation
-                .is_none()
-        );
-        state.sources[0].state = SourceState::Healthy;
-        crate::snapshot_sync::disable_snapshot_source(&root, snapshots::SnapshotSource::Codex)
-            .unwrap();
-        assert!(
-            status_from_state_with_relay_finding(&mut state, None).sources[0]
-                .tracking_confirmation
-                .is_none()
-        );
-        assert!(
-            state.tracking_confirmation.saved(&source).is_some(),
-            "status is read-only"
-        );
-        assert!(state.sources[0].tracking_confirmation.is_none());
-        drop(state);
-        std::fs::remove_dir_all(root).unwrap();
-    }
+    mod tracking_confirmation_tests {
+        use super::*;
 
-    #[test]
-    #[serial]
-    fn passive_verification_cannot_confirm_but_active_smoke_can_and_episode_restarts() {
-        let root = crate::test_scratch::private_dir("tracking-episode-restart");
-        let _support = TestEnvVar::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
-        let daemon = daemon().with_source_state_dir(root.join("sources"));
-        let since = "2026-11-15T10:00:00Z";
-        daemon.state().unwrap().registered_source_grants =
-            vec!["pi".into(), "codex".into(), "claude_code".into()];
-        for source in [SourceKind::Pi, SourceKind::Codex, SourceKind::ClaudeCode] {
-            daemon
-                .state()
+        #[test]
+        #[serial]
+        fn tracking_status_omits_inapplicable_episodes_without_mutating_saved_state() {
+            let root = crate::test_scratch::private_dir("tracking-status-applicability");
+            let _support = TestEnvVar::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
+            let daemon = daemon();
+            let source = SourceKind::Codex;
+            let mut state = daemon.state().unwrap();
+            state.sources = vec![codex_health()];
+            assert!(serde_json::to_value(&state.sources[0])
                 .unwrap()
-                .tracking_confirmation
-                .arm(&source, since.into(), true);
-            let mut result = verified_codex("2026-11-15T10:01:00Z");
-            result.source = source.clone();
-            result.config.discovered = false; // Pi has no telemetry config to discover.
-            result.smoke_after = Some(since.into()); // passive paths also populate this
-            daemon.record_verification_result(&result).unwrap();
-            assert!(daemon.tracking_episode(&source).is_some());
-            assert!(daemon
-                .status(TOKEN)
-                .unwrap()
-                .sources
-                .iter()
-                .find(|health| health.source == source)
-                .unwrap()
-                .tracking_confirmation
-                .is_some());
-            if source == SourceKind::ClaudeCode {
-                let (generation, _) = daemon.tracking_episode(&source).unwrap();
-                daemon
-                    .record_verification_result_with_tracking(&result, Some((generation, since)))
-                    .unwrap();
-                assert!(daemon.tracking_episode(&source).is_none());
-            }
-        }
-        let restarted = super::tests::daemon().with_source_state_dir(root.join("sources"));
-        assert!(restarted.tracking_episode(&SourceKind::Pi).is_some());
-        assert!(restarted.tracking_episode(&SourceKind::Codex).is_some());
-        let state = restarted.state().unwrap();
-        assert_eq!(
+                .get("tracking_confirmation")
+                .is_none());
             state
                 .tracking_confirmation
-                .saved(&SourceKind::ClaudeCode)
-                .unwrap()
-                .confirmed_at
-                .as_deref(),
-            Some("2026-11-15T10:01:00Z")
-        );
-        assert!(state
-            .sources
-            .iter()
-            .all(|health| health.tracking_confirmation.is_none()));
-        drop(state);
-        restarted.state().unwrap().clear_source_state();
-        assert!(restarted.tracking_episode(&SourceKind::Pi).is_none());
-        std::fs::remove_dir_all(root).unwrap();
+                .arm(&source, "2026-11-15T10:00:00Z".into(), true);
+            assert!(
+                status_from_state_with_relay_finding(&mut state, None).sources[0]
+                    .tracking_confirmation
+                    .is_none()
+            );
+            state.registered_source_grants = vec!["codex".into()];
+            assert!(
+                status_from_state_with_relay_finding(&mut state, None).sources[0]
+                    .tracking_confirmation
+                    .is_some()
+            );
+            state.source_reconciliation.insert("codex".into(), false);
+            assert!(
+                status_from_state_with_relay_finding(&mut state, None).sources[0]
+                    .tracking_confirmation
+                    .is_none()
+            );
+            state.source_reconciliation.clear();
+            state.sources[0].config.discovered = false;
+            assert!(
+                status_from_state_with_relay_finding(&mut state, None).sources[0]
+                    .tracking_confirmation
+                    .is_some(),
+                "config discovery is not installation; sources without config still confirm"
+            );
+            state.sources[0].config.discovered = true; // historical config is not installation
+            state.sources[0].state = SourceState::NotFound;
+            assert!(
+                status_from_state_with_relay_finding(&mut state, None).sources[0]
+                    .tracking_confirmation
+                    .is_none()
+            );
+            state.sources[0].state = SourceState::Healthy;
+            crate::snapshot_sync::disable_snapshot_source(&root, snapshots::SnapshotSource::Codex)
+                .unwrap();
+            assert!(
+                status_from_state_with_relay_finding(&mut state, None).sources[0]
+                    .tracking_confirmation
+                    .is_none()
+            );
+            assert!(
+                state.tracking_confirmation.saved(&source).is_some(),
+                "status is read-only"
+            );
+            assert!(state.sources[0].tracking_confirmation.is_none());
+            drop(state);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        #[serial]
+        fn passive_verification_cannot_confirm_but_active_smoke_can_and_episode_restarts() {
+            let root = crate::test_scratch::private_dir("tracking-episode-restart");
+            let _support = TestEnvVar::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
+            let daemon = daemon().with_source_state_dir(root.join("sources"));
+            let since = "2026-11-15T10:00:00Z";
+            daemon.state().unwrap().registered_source_grants =
+                vec!["pi".into(), "codex".into(), "claude_code".into()];
+            for source in [SourceKind::Pi, SourceKind::Codex, SourceKind::ClaudeCode] {
+                daemon
+                    .state()
+                    .unwrap()
+                    .tracking_confirmation
+                    .arm(&source, since.into(), true);
+                let mut result = verified_codex("2026-11-15T10:01:00Z");
+                result.source = source.clone();
+                // Same empty config returned by Pi verification, including absent path/fingerprint.
+                result.config = SourceConfigState {
+                    discovered: false,
+                    path_hint: None,
+                    fingerprint: None,
+                    drift: Vec::new(),
+                };
+                result.smoke_after = Some(since.into()); // passive paths also populate this
+                daemon.record_verification_result(&result).unwrap();
+                assert!(daemon.tracking_episode(&source).is_some());
+                assert!(daemon
+                    .status(TOKEN)
+                    .unwrap()
+                    .sources
+                    .iter()
+                    .find(|health| health.source == source)
+                    .unwrap()
+                    .tracking_confirmation
+                    .is_some());
+                if source == SourceKind::ClaudeCode {
+                    let (generation, _) = daemon.tracking_episode(&source).unwrap();
+                    daemon
+                        .record_verification_result_with_tracking(
+                            &result,
+                            Some((generation, since)),
+                        )
+                        .unwrap();
+                    assert!(daemon.tracking_episode(&source).is_none());
+                }
+            }
+            let restarted = super::tests::daemon().with_source_state_dir(root.join("sources"));
+            assert!(restarted.tracking_episode(&SourceKind::Pi).is_some());
+            assert!(restarted.tracking_episode(&SourceKind::Codex).is_some());
+            let state = restarted.state().unwrap();
+            assert_eq!(
+                state
+                    .tracking_confirmation
+                    .saved(&SourceKind::ClaudeCode)
+                    .unwrap()
+                    .confirmed_at
+                    .as_deref(),
+                Some("2026-11-15T10:01:00Z")
+            );
+            assert!(state
+                .sources
+                .iter()
+                .all(|health| health.tracking_confirmation.is_none()));
+            drop(state);
+            restarted.state().unwrap().clear_source_state();
+            assert!(restarted.tracking_episode(&SourceKind::Pi).is_none());
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     fn verified_codex(last_received_at: &str) -> SourceVerificationResult {

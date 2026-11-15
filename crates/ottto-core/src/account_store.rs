@@ -1059,20 +1059,34 @@ mod tracking_rollback_tests {
         }
         let saved = LocalSourceState {
             first_seen_at: Some("2026-11-15T10:00:00Z".into()),
-            last_health: None,
+            last_health: Some(serde_json::from_value(serde_json::json!({
+                "source": "pi", "descriptor": {
+                    "source": "pi", "display_name": "Pi", "operations": [],
+                    "review_tier": "official", "maturity": "stable", "collectors": [],
+                    "local_state_owner": "local_daemon", "telemetry_owner": "backend", "repair_owner": "local_daemon"
+                },
+                "state": "healthy", "grade": "ok",
+                "account_binding": {"expected_account_id": null, "observed_account_id": null, "matched": null},
+                "config": {"discovered": false, "path_hint": null, "fingerprint": null, "drift": []},
+                "collector": null, "agent_status": null,
+                "last_seen_at": "2026-11-15T12:00:00Z", "last_verified_at": "2026-11-15T12:00:00Z",
+                "problems": [], "recommended_actions": []
+            })).unwrap()),
             tracking_confirmation: Some(LocalTrackingConfirmation {
                 since: "2026-11-15T11:00:00Z".into(),
-                confirmed_at: None,
+                confirmed_at: Some("2026-11-15T12:00:00Z".into()),
             }),
         };
         let json = serde_json::to_value(&saved).unwrap();
         let new: LocalSourceState = serde_json::from_value(json.clone()).unwrap();
         assert_eq!(new, saved);
         let legacy: LegacyLocalSourceState = serde_json::from_value(json).unwrap();
+        assert_eq!(legacy.last_health, saved.last_health);
         let rewritten = serde_json::to_value(legacy).unwrap();
         assert!(rewritten.get("tracking_confirmation").is_none());
         let upgraded: LocalSourceState = serde_json::from_value(rewritten).unwrap();
         assert_eq!(upgraded.first_seen_at, saved.first_seen_at);
+        assert_eq!(upgraded.last_health, saved.last_health);
         assert_eq!(upgraded.tracking_confirmation, None);
     }
 }

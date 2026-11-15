@@ -30902,61 +30902,69 @@ X-API-Key = "otel_redacted"
         let _ = fs::remove_dir_all(&root);
     }
 
-    #[test]
-    #[serial]
-    fn repair_confirmation_arms_only_final_eligible_non_dry_run_plans() {
-        let _lock = lock_backend_test_env();
-        let root = control_test_root("repair-confirmation-arm");
-        let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
-        let daemon = daemon();
-        let authorization = RequestAuthorization::TrustedCompanionApp;
-        let mut plan = propose_repair_plan(&daemon, &authorization, SourceKind::Pi, true).unwrap();
-        FileDeviceStore::default()
-            .save(&LocalDeviceBinding {
-                device_id: "device_test".into(),
-                machine_id: None,
-                sources: vec!["claude_code".into(), "codex".into(), "pi".into()],
-            })
+    mod tracking_confirmation_tests {
+        use super::*;
+
+        #[test]
+        #[serial]
+        fn repair_confirmation_arms_only_final_eligible_non_dry_run_plans() {
+            let _lock = lock_backend_test_env();
+            let root = control_test_root("repair-confirmation-arm");
+            let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
+            let daemon = daemon();
+            let authorization = RequestAuthorization::TrustedCompanionApp;
+            let mut plan =
+                propose_repair_plan(&daemon, &authorization, SourceKind::Pi, true).unwrap();
+            FileDeviceStore::default()
+                .save(&LocalDeviceBinding {
+                    device_id: "device_test".into(),
+                    machine_id: None,
+                    sources: vec!["claude_code".into(), "codex".into(), "pi".into()],
+                })
+                .unwrap();
+            for source in [SourceKind::ClaudeCode, SourceKind::Codex, SourceKind::Pi] {
+                for status in [
+                    RepairPlanStatus::Succeeded,
+                    RepairPlanStatus::Running,
+                    RepairPlanStatus::Proposed,
+                ] {
+                    plan.status = status;
+                    plan.dry_run = true;
+                    daemon.arm_tracking_confirmation(&source, &plan).unwrap();
+                    assert!(daemon.tracking_episode(&source).is_none());
+                    plan.dry_run = false;
+                    daemon.arm_tracking_confirmation(&source, &plan).unwrap();
+                    assert!(daemon.tracking_episode(&source).is_some());
+                    daemon.clear_tracking_confirmation(&source).unwrap();
+                }
+                for status in [RepairPlanStatus::Failed, RepairPlanStatus::Blocked] {
+                    plan.status = status;
+                    daemon.arm_tracking_confirmation(&source, &plan).unwrap();
+                    assert!(daemon.tracking_episode(&source).is_none());
+                }
+            }
+            plan.status = RepairPlanStatus::Proposed;
+            crate::snapshot_sync::disable_snapshot_source(
+                &root,
+                crate::snapshots::SnapshotSource::Pi,
+            )
             .unwrap();
-        for source in [SourceKind::ClaudeCode, SourceKind::Codex, SourceKind::Pi] {
-            for status in [
-                RepairPlanStatus::Succeeded,
-                RepairPlanStatus::Running,
-                RepairPlanStatus::Proposed,
-            ] {
-                plan.status = status;
-                plan.dry_run = true;
-                daemon.arm_tracking_confirmation(&source, &plan).unwrap();
-                assert!(daemon.tracking_episode(&source).is_none());
-                plan.dry_run = false;
-                daemon.arm_tracking_confirmation(&source, &plan).unwrap();
-                assert!(daemon.tracking_episode(&source).is_some());
-                daemon.clear_tracking_confirmation(&source).unwrap();
-            }
-            for status in [RepairPlanStatus::Failed, RepairPlanStatus::Blocked] {
-                plan.status = status;
-                daemon.arm_tracking_confirmation(&source, &plan).unwrap();
-                assert!(daemon.tracking_episode(&source).is_none());
-            }
+            daemon
+                .arm_tracking_confirmation(&SourceKind::Pi, &plan)
+                .unwrap();
+            assert!(daemon.tracking_episode(&SourceKind::Pi).is_none());
+            FileDeviceStore::default().reset().unwrap();
+            daemon
+                .arm_tracking_confirmation(&SourceKind::Codex, &plan)
+                .unwrap();
+            assert!(daemon.tracking_episode(&SourceKind::Codex).is_none());
+            fs::write(ottto_core::default_device_path(), b"{").unwrap();
+            daemon
+                .arm_tracking_confirmation(&SourceKind::Codex, &plan)
+                .expect("observation cannot fail a completed Repair");
+            assert!(daemon.tracking_episode(&SourceKind::Codex).is_none());
+            fs::remove_dir_all(root).unwrap();
         }
-        plan.status = RepairPlanStatus::Proposed;
-        crate::snapshot_sync::disable_snapshot_source(&root, crate::snapshots::SnapshotSource::Pi)
-            .unwrap();
-        daemon
-            .arm_tracking_confirmation(&SourceKind::Pi, &plan)
-            .unwrap();
-        assert!(daemon.tracking_episode(&SourceKind::Pi).is_none());
-        FileDeviceStore::default().reset().unwrap();
-        daemon
-            .arm_tracking_confirmation(&SourceKind::Codex, &plan)
-            .unwrap();
-        assert!(daemon.tracking_episode(&SourceKind::Codex).is_none());
-        fs::write(ottto_core::default_device_path(), b"{").unwrap();
-        daemon
-            .arm_tracking_confirmation(&SourceKind::Codex, &plan)
-            .expect("observation cannot fail a completed Repair");
-        assert!(daemon.tracking_episode(&SourceKind::Codex).is_none());
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

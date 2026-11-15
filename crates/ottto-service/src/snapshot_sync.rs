@@ -8023,11 +8023,16 @@ fn finish_sync_source(
     // horizon, while future timestamps are bounded by the reconciliation clock.
     let tracking_episode = daemon.tracking_episode(&source_kind(source));
     let reconciled_at = current_rfc3339();
-    let mut witness = crate::tracking_confirmation::ParsedActivityWitness::new(
-        tracking_episode.as_ref().map(|(_, since)| since.as_str()),
-        &reconciled_at,
-    );
-    if crate::active_sessions::reconcile_observing(
+    let since = tracking_episode
+        .as_ref()
+        .and_then(|(_, since)| OffsetDateTime::parse(since, &Rfc3339).ok());
+    let mut latest = None;
+    let mut observe = |new, previous, ceiling| {
+        latest = latest.max(crate::tracking_confirmation::parsed_activity_witness(
+            since, new, previous, ceiling,
+        ));
+    };
+    if crate::active_sessions::reconcile_with_registrations(
         support_dir,
         source,
         &scan_result.snapshots,
@@ -8040,7 +8045,9 @@ fn finish_sync_source(
         })
         .unwrap_or(SNAPSHOT_SYNC_INTERVAL),
         crate::agent_status::claude_session_registrations,
-        &mut |new, previous| witness.observe(new, previous),
+        tracking_episode
+            .as_ref()
+            .map(|_| &mut observe as &mut dyn FnMut(_, _, _)),
     )
     .is_err()
     {
@@ -8050,7 +8057,10 @@ fn finish_sync_source(
         );
     }
 
-    if let (Some((generation, _)), Some(at)) = (tracking_episode, witness.latest()) {
+    if let (Some((generation, _)), Some(at)) = (
+        tracking_episode,
+        latest.and_then(|at| at.format(&Rfc3339).ok()),
+    ) {
         daemon
             .confirm_tracking_activity(&source_kind(source), generation, &at)
             .map_err(|_| anyhow!("tracking state unavailable"))?;

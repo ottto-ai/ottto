@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ottto_core::account_store::LocalTrackingConfirmation;
 use ottto_protocol::{SourceKind, TrackingConfirmation, TrackingConfirmationState};
-use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::{source_slug, LocalApiError, LocalDaemon};
 
@@ -65,25 +65,19 @@ impl TrackingEpisodes {
         result: &ottto_protocol::SourceVerificationResult,
         generation: u64,
         smoke_after: &str,
-    ) {
-        let Some(saved) = self.saved(&result.source) else {
-            return;
-        };
-        if result.verified
+    ) -> bool {
+        let since = self
+            .saved(&result.source)
+            .and_then(|saved| parse(&saved.since));
+        let at = result.last_received_at.as_deref();
+        let fresh = since
+            .zip(parse(smoke_after))
+            .zip(at.and_then(parse))
+            .is_some_and(|((since, after), at)| after >= since && at > since);
+        result.verified
             && result.records_seen > 0
-            && parse(smoke_after)
-                .zip(parse(&saved.since))
-                .is_some_and(|(after, since)| after >= since)
-        {
-            if let Some(at) = result.last_received_at.as_deref().filter(|at| {
-                parse(at)
-                    .zip(parse(&saved.since))
-                    .is_some_and(|(at, since)| at > since)
-            }) {
-                let at = at.to_string();
-                self.confirm(&result.source, generation, &at);
-            }
-        }
+            && fresh
+            && at.is_some_and(|at| self.confirm(&result.source, generation, at))
     }
 
     pub(super) fn clear(&mut self, source: &SourceKind) -> bool {
@@ -128,37 +122,15 @@ fn parse(at: &str) -> Option<OffsetDateTime> {
     OffsetDateTime::parse(at, &Rfc3339).ok()
 }
 
-/// One scalar per reconcile; never retain per-session confirmation history.
-pub(crate) struct ParsedActivityWitness {
+/// Reuse reconciliation's parsed values; a changed value need not advance its watermark.
+pub(crate) fn parsed_activity_witness(
     since: Option<OffsetDateTime>,
-    ceiling: Option<OffsetDateTime>,
-    latest: Option<OffsetDateTime>,
-}
-
-impl ParsedActivityWitness {
-    pub(crate) fn new(since: Option<&str>, scan_time: &str) -> Self {
-        Self {
-            since: since.and_then(parse),
-            ceiling: parse(scan_time).map(|at| at + Duration::minutes(5)),
-            latest: None,
-        }
-    }
-
-    pub(crate) fn observe(&mut self, new: &str, previous: Option<&str>) {
-        let Some(new) = parse(new) else {
-            return;
-        };
-        if self.since.is_some_and(|since| new > since)
-            && self.ceiling.is_some_and(|ceiling| new <= ceiling)
-            && previous.and_then(parse) != Some(new)
-        {
-            self.latest = Some(self.latest.map_or(new, |latest| latest.max(new)));
-        }
-    }
-
-    pub(crate) fn latest(&self) -> Option<String> {
-        self.latest.and_then(|at| at.format(&Rfc3339).ok())
-    }
+    new: OffsetDateTime,
+    previous: Option<OffsetDateTime>,
+    ceiling: OffsetDateTime,
+) -> Option<OffsetDateTime> {
+    (since.is_some_and(|since| new > since) && new <= ceiling && previous != Some(new))
+        .then_some(new)
 }
 
 impl LocalDaemon {
@@ -234,18 +206,9 @@ impl LocalDaemon {
         smoke_after: &str,
     ) -> Result<(), LocalApiError> {
         let mut state = self.state()?;
-        let was_pending = state
+        if state
             .tracking_confirmation
-            .pending(&result.source)
-            .is_some();
-        state
-            .tracking_confirmation
-            .confirm_smoke(result, generation, smoke_after);
-        if was_pending
-            && state
-                .tracking_confirmation
-                .pending(&result.source)
-                .is_none()
+            .confirm_smoke(result, generation, smoke_after)
         {
             state.persist_source_state(&result.source);
         }
@@ -267,11 +230,11 @@ impl LocalDaemon {
         &self,
         device: &ottto_core::LocalDeviceBinding,
     ) -> Result<(), LocalApiError> {
+        let eligible = crate::snapshot_sync::enabled_snapshot_sources(device);
         let mut state = self.state()?;
         state.registered_source_grants.clone_from(&device.sources);
         for source in [SourceKind::ClaudeCode, SourceKind::Codex, SourceKind::Pi] {
-            if !crate::snapshot_sync::enabled_snapshot_sources(device)
-                .contains(&crate::snapshot_sync::snapshot_source_of_kind(&source))
+            if !eligible.contains(&crate::snapshot_sync::snapshot_source_of_kind(&source))
                 && state.tracking_confirmation.clear(&source)
             {
                 state.persist_source_state(&source);
@@ -300,14 +263,19 @@ mod tests {
         for source in [SourceKind::ClaudeCode, SourceKind::Codex, SourceKind::Pi] {
             let mut episodes = episodes(&source);
             let (generation, _) = episodes.pending(&source).unwrap();
-            let mut witness = ParsedActivityWitness::new(Some(SINCE), AFTER);
-            witness.observe(SINCE, None); // strict-after, including index rebuilds
-            witness.observe("invalid", None);
-            witness.observe("2026-11-16T10:00:00Z", None); // must not mask a valid candidate
-            assert_eq!(witness.latest(), None);
-            witness.observe(AFTER, None);
-            assert_eq!(witness.latest().as_deref(), Some(AFTER));
-            assert!(episodes.confirm(&source, generation, &witness.latest().unwrap()));
+            let since = parse(SINCE);
+            let after = parse(AFTER).unwrap();
+            assert_eq!(
+                parsed_activity_witness(since, since.unwrap(), None, after),
+                None
+            );
+            assert_eq!(
+                parsed_activity_witness(since, parse("2026-11-16T10:00:00Z").unwrap(), None, after),
+                None
+            );
+            let witness = parsed_activity_witness(since, after, None, after).unwrap();
+            assert_eq!(witness, after);
+            assert!(episodes.confirm(&source, generation, &witness.format(&Rfc3339).unwrap()));
             assert!(!episodes.confirm(&source, generation, "2026-11-15T10:02:00Z"));
             assert_eq!(
                 episodes
@@ -320,17 +288,6 @@ mod tests {
             episodes.arm(&source, AFTER.into(), true);
             assert_eq!(episodes.pending(&source).unwrap().1, AFTER);
         }
-    }
-
-    #[test]
-    fn future_previous_value_does_not_poison_a_real_turn_or_mature_unchanged() {
-        let future = "2026-11-16T10:00:00Z";
-        let mut witness = ParsedActivityWitness::new(Some(SINCE), AFTER);
-        witness.observe(AFTER, Some(future)); // same session; stored watermark stays in the future
-        assert_eq!(witness.latest().as_deref(), Some(AFTER));
-        let mut unchanged = ParsedActivityWitness::new(Some(SINCE), future);
-        unchanged.observe(future, Some(future));
-        assert_eq!(unchanged.latest(), None);
     }
 
     #[test]

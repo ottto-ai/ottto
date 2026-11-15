@@ -738,6 +738,9 @@ pub struct SourceHealth {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_session_reconciliation: Option<ActiveSessionReconciliation>,
     /// Local observation after Repair; independent of backend/config health.
+    /// `confirmed` is persisted and terminal until the next Repair (or an eligibility clear).
+    /// Apps read `state`, never derive it from timestamps, and treat confirmation as a
+    /// one-time acknowledgement before falling back to the ordinary source row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tracking_confirmation: Option<TrackingConfirmation>,
     pub last_seen_at: Option<Rfc3339Timestamp>,
