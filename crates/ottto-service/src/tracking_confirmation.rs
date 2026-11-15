@@ -178,9 +178,9 @@ impl LocalDaemon {
         {
             return Ok(());
         }
-        let device = ottto_core::FileDeviceStore::default()
-            .load()
-            .map_err(|_| LocalApiError::StatePoisoned)?;
+        // Observation must not change the outcome of an already completed Repair.
+        // An unreadable grant cannot authorize a waiting episode.
+        let device = ottto_core::FileDeviceStore::default().load().ok().flatten();
         let eligible = device.as_ref().is_some_and(|device| {
             crate::snapshot_sync::enabled_snapshot_sources(device)
                 .contains(&crate::snapshot_sync::snapshot_source_of_kind(source))

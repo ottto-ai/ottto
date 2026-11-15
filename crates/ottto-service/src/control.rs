@@ -30951,6 +30951,11 @@ X-API-Key = "otel_redacted"
             .arm_tracking_confirmation(&SourceKind::Codex, &plan)
             .unwrap();
         assert!(daemon.tracking_episode(&SourceKind::Codex).is_none());
+        fs::write(ottto_core::default_device_path(), b"{").unwrap();
+        daemon
+            .arm_tracking_confirmation(&SourceKind::Codex, &plan)
+            .expect("observation cannot fail a completed Repair");
+        assert!(daemon.tracking_episode(&SourceKind::Codex).is_none());
         fs::remove_dir_all(root).unwrap();
     }
 
