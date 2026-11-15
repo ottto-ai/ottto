@@ -279,6 +279,15 @@ expect_log 'check-runs?filter=all&per_page=100 --paginate'
 expect_count "$ENQUEUE_CALL" 1
 expect_output "merged PR #7 at merge SHA $NEW_SHA"
 
+# A run repeated on two pages must not make an incomplete listing look complete.
+green_case overlap-does-not-fill-listing
+jq -c '{total_count: 7, check_runs: .check_runs[0:2]},
+       {total_count: 7, check_runs: .check_runs[1:]}' "$case_dir/checks" > "$case_dir/checks.next"
+mv "$case_dir/checks.next" "$case_dir/checks"
+run_guard 6 --timeout 0 7
+expect_output "commit has 7 check runs, listing returned 6"
+expect_no_log 'gh enqueue'
+
 green_case incomplete-listing-is-not-judged
 jq '.total_count = 150' "$case_dir/checks" > "$case_dir/checks.next"
 mv "$case_dir/checks.next" "$case_dir/checks"
