@@ -1236,7 +1236,11 @@ pub(in crate::snapshots) mod tests {
             let expected = opened_object_identity(SnapshotSource::Codex, &mut file).unwrap();
             let mut parser = codex_parser(OpenedInput::plain(file), &f.0);
             sampled_scan::configure_tier_replay(&mut parser, &f.candidate(), &old);
-            codex_counting_version::configure_singleton(&mut parser, &f.candidate(), &old);
+            sources::codex::counting::version::configure_singleton(
+                &mut parser,
+                &f.candidate(),
+                &old,
+            );
             while !parser.step().unwrap() {}
             let parsed = parser
                 .finish(
@@ -2298,7 +2302,7 @@ pub(in crate::snapshots) mod tests {
     /// same archive indexed unchanged as confirmed-empty owes nothing, counts
     /// as no upload required and its committed debt resolves.
     fn archive_confirmed_empty_walk_owes_nothing() {
-        use crate::snapshots::g7_debt::tests::{entry, walk, Fixture};
+        use crate::snapshots::upload::freshness_debt::tests::{entry, walk, Fixture};
         let mut g7 = Fixture::new(
             crate::snapshots::scan_index_persistence::Source::Codex,
             "codex-prefix-only-walk",

@@ -1125,7 +1125,7 @@ pub(super) mod tests {
                         super::super::sampled_scan::set_test_now(Some(1_600));
                         // A healthy first generation may have retired its
                         // checkpoint while the account hold still needs F4.
-                        super::super::line_delivery_tests::next_walk(
+                        super::super::scan::lines::delivery::tests::next_walk(
                             &mut index,
                             &[dir.to_path_buf()],
                             LATER,
@@ -1675,7 +1675,7 @@ pub(super) mod tests {
             assert_eq!(held(&index, stem), expected, "first walk: {stem}");
         }
         super::super::sampled_scan::set_test_now(Some(1_600));
-        super::super::line_delivery_tests::next_walk(
+        super::super::scan::lines::delivery::tests::next_walk(
             &mut index,
             std::slice::from_ref(&root),
             LATER,

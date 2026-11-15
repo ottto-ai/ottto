@@ -28,7 +28,7 @@ pub(in crate::snapshots) fn new_group_parser(
     file: File,
     member: &CandidateFile,
     metadata: &CodexTitleMetadata,
-    evidence: codex_counting_version::AckEvidence,
+    evidence: sources::codex::counting::version::AckEvidence,
 ) -> Result<Box<OwnedJsonlParser>> {
     let mut parser = OwnedJsonlParser::new(
         file,
@@ -37,7 +37,7 @@ pub(in crate::snapshots) fn new_group_parser(
         apply_codex_line,
         Some(metadata),
     )?;
-    codex_counting_version::configure_group_once(&mut parser.accumulator, evidence);
+    sources::codex::counting::version::configure_group_once(&mut parser.accumulator, evidence);
     Ok(Box::new(parser))
 }
 
@@ -296,7 +296,7 @@ pub(in crate::snapshots) struct GroupBoot {
     previous_receipts: BTreeMap<String, (Option<AppliedTierReceipt>, bool)>,
     receipt_scope: String,
     legacy_expected: BTreeMap<String, String>,
-    evidence: codex_counting_version::AckEvidence,
+    evidence: sources::codex::counting::version::AckEvidence,
     independent: bool,
 }
 crate::heap_layout_bound::fields!(GroupBoot; group, key, identified, stamps, wake_identities, headers, plan,
@@ -326,7 +326,7 @@ impl GroupBoot {
                 previous_receipts.insert(key, receipt_state(Some(entry)));
             }
         }
-        let evidence = codex_counting_version::members_evidence(&group.members, index);
+        let evidence = sources::codex::counting::version::members_evidence(&group.members, index);
         let independent = independent_group(&group);
         Self {
             independent,

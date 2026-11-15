@@ -3693,12 +3693,12 @@ pub(super) mod tests {
         let (root, keys) = counting_v2_fixture();
         let (legacy_index, legacy) = {
             // The fixture's October 1 headers predate the frozen cutover.
-            let _cutover = codex_counting_version::TestCutover::set(
-                codex_counting_version::CODEX_COUNTING_V2_CUTOVER_UNIX_MS,
+            let _cutover = sources::codex::counting::version::TestCutover::set(
+                sources::codex::counting::version::CODEX_COUNTING_V2_CUTOVER_UNIX_MS,
             );
             scan(&root, ScanIndex::default(), 2)
         };
-        let _cutover = codex_counting_version::TestCutover::set(0);
+        let _cutover = sources::codex::counting::version::TestCutover::set(0);
         let (index, counted) = scan(&root, ScanIndex::default(), 2);
         assert_eq!(counted.snapshots.len(), 2, "one alias per physical member");
         let receipts = counted
@@ -3724,7 +3724,7 @@ pub(super) mod tests {
         assert_eq!(legacy_receipts.tombstone_count, 0);
         assert_eq!(
             legacy_receipts.tombstone_cap,
-            codex_counting_version::MAX_COUNTING_TOMBSTONES as u64
+            sources::codex::counting::version::MAX_COUNTING_TOMBSTONES as u64
         );
         for (counted, legacy) in counted.snapshots.iter().zip(&legacy.snapshots) {
             assert_eq!(counted.input_tokens, legacy.input_tokens);
@@ -3737,7 +3737,7 @@ pub(super) mod tests {
         let (root, keys) = counting_v2_fixture();
         let owner = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
         let previous = {
-            let _cutover = codex_counting_version::TestCutover::set(0);
+            let _cutover = sources::codex::counting::version::TestCutover::set(0);
             let (index, result) = scan(&root, ScanIndex::default(), 2);
             save_selected(&root, "v2.json", index, result, &ScanIndex::default(), None)
         };

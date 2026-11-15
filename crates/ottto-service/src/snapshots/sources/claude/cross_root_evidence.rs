@@ -6,8 +6,10 @@
 //! first refusal.
 
 use crate::claude_local_otel::{ClaudeLocalOtelEvidence, ClaudeTraceOwnershipEvidence};
-use crate::snapshots::claude_context_file_birth::{ClaudeTelemetryTripwire, TelemetryRow};
 use crate::snapshots::claude_request_census::claude_request_hash;
+use crate::snapshots::sources::claude::context_file_birth::{
+    ClaudeTelemetryTripwire, TelemetryRow,
+};
 use crate::snapshots::{ClaudeLegacyRequestOwners, ScanIndex, SnapshotItem};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -310,11 +312,11 @@ fn trace_row_ids(row: &ClaudeTraceOwnershipEvidence) -> (&str, &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::snapshots::claude_context_file_birth::{
+    use crate::snapshots::claude_request_identity::RequestRootIndex;
+    use crate::snapshots::sources::claude::context_file_birth::{
         admit_claude_file_birth_posture, ClaudeContextFileBirthCounts, ClaudeFileBirthVerdict,
         ClaudeRememberedTripwire,
     };
-    use crate::snapshots::claude_request_identity::RequestRootIndex;
 
     /// [behaviour] Exact page joins equal the old index across API/trace
     /// overlap and shared roots, whichever side `add_root` walks; an

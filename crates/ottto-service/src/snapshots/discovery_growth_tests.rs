@@ -1,6 +1,6 @@
 //! R5: real discovery/acquisition, classification and Completed restoration.
 //! Fixtures contain synthetic transcripts only. Existing native Tail assertions
-//! in line_delivery_tests remain exact and unchanged.
+//! in scan::lines::delivery::tests remain exact and unchanged.
 use super::line_delivery::{DeliveryEnd, DeliveryMode, FileView, LineObserver, PhysicalLine, Want};
 use super::*;
 use crate::local_resource_diagnostics::capture;
@@ -468,8 +468,9 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
         .commit_sealed_prefix(&mut file, true, &scope, now, now, false, bytes.len() as u64)
         .unwrap();
     assert_eq!(checkpoint.sealed_offset(), prefix.len() as u64);
-    let fragment = codex_fragment::BoundFragment::bind(&candidate, checkpoint.sealed_offset())
-        .expect("known object birth is required; no length-only witness");
+    let fragment =
+        sources::codex::eof_fragment::BoundFragment::bind(&candidate, checkpoint.sealed_offset())
+            .expect("known object birth is required; no length-only witness");
     let mut recorded = candidate.clone();
     recorded.size_bytes = checkpoint.sealed_offset();
     index.record(
@@ -655,7 +656,7 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
     assert!(entry.codex_fragment.as_ref().unwrap().matches(
         entry.size_bytes,
         metadata_only.size_bytes,
-        codex_fragment::Stamp::candidate(&metadata_only),
+        sources::codex::eof_fragment::Stamp::candidate(&metadata_only),
     ));
     assert_eq!(
         metadata_only.source_file_fingerprint, candidate.source_file_fingerprint,
@@ -675,7 +676,7 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
         &f.path,
         metadata.len(),
         candidate.modified_unix_seconds,
-        codex_fragment::Stamp::metadata(&metadata),
+        sources::codex::eof_fragment::Stamp::metadata(&metadata),
     );
     let (_, rows) = capture(|| {
         assert!(
@@ -683,7 +684,7 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
                 source,
                 &f.path,
                 metadata.len(),
-                codex_fragment::Stamp::metadata(&metadata)
+                sources::codex::eof_fragment::Stamp::metadata(&metadata)
             ),
             "audit still owes it"
         )
@@ -723,10 +724,10 @@ fn certified_codex_fragment_is_not_growth_or_a_recurring_acquisition() {
         assert_eq!(reader.last_complete_line_end(), 0);
         assert_eq!(reader.consumed_bytes(), len);
         let (_, rows) = capture(|| {
-            codex_fragment::note_tail_repeat(
+            sources::codex::eof_fragment::note_tail_repeat(
                 entry,
                 &candidate,
-                codex_fragment::TailRead {
+                sources::codex::eof_fragment::TailRead {
                     mode: reader.acquisition.as_ref().unwrap().mode(),
                     start,
                     end: start + reader.consumed_bytes(),

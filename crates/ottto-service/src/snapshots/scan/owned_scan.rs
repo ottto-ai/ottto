@@ -199,7 +199,7 @@ pub(crate) struct OwnedSourceScan {
     pub(in crate::snapshots) semantic_noop_count: usize,
     /// This page's resident charge, history-upgrade budget and gate diagnostics.
     pub(in crate::snapshots) history_upgrade: HistoryPage,
-    pub(in crate::snapshots) context_read_budget: upload_context_read::Budget,
+    pub(in crate::snapshots) context_read_budget: upload::context_read::Budget,
     pub(in crate::snapshots) residue_index_keys: BTreeSet<String>,
     pub(in crate::snapshots) settled_residue_index_keys: BTreeSet<String>,
     pub(in crate::snapshots) pending_finalization: Vec<PendingIndexFinalization>,
@@ -422,7 +422,7 @@ impl OwnedSourceScan {
             scanned_session_count: 0,
             semantic_noop_count: 0,
             history_upgrade: HistoryPage::with_twin_groups(Default::default(), BTreeSet::new()),
-            context_read_budget: upload_context_read::Budget::new(SnapshotSource::Codex),
+            context_read_budget: upload::context_read::Budget::new(SnapshotSource::Codex),
             residue_index_keys: Default::default(),
             settled_residue_index_keys: Default::default(),
             pending_finalization: Vec::new(),
@@ -1329,7 +1329,7 @@ impl OwnedSourceScan {
                 claude_queued_family_deferred_paths,
             )
             .with_forced_pending(forced_pending_entries),
-            context_read_budget: upload_context_read::Budget::new(source),
+            context_read_budget: upload::context_read::Budget::new(source),
             residue_index_keys,
             settled_residue_index_keys,
             pending_finalization,

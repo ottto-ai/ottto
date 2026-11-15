@@ -147,7 +147,7 @@ fn header_cache_production_wake_output_equivalence_join_fork_counting() {
     }
     // Between the August fork and October join: exercise a legacy user fork
     // and a non-empty V2 group in the same production scan.
-    let _cutover = codex_counting_version::TestCutover::set(1_790_000_000_000);
+    let _cutover = sources::codex::counting::version::TestCutover::set(1_790_000_000_000);
     let paths = fs::read_dir(root.join("sessions"))
         .unwrap()
         .map(|entry| local_index_key(&entry.unwrap().path()))
