@@ -123,6 +123,16 @@ pub fn clear_active_sessions(
     )
 }
 
+/// Returns the parsed activity and ceiling check; future times remain available
+/// to the existing watermark bookkeeping even when excluded from local status.
+pub(crate) fn parse_session_activity(
+    activity: &str,
+    activity_ceiling: OffsetDateTime,
+) -> Option<(OffsetDateTime, bool)> {
+    let at = OffsetDateTime::parse(activity, &Rfc3339).ok()?;
+    Some((at, at <= activity_ceiling))
+}
+
 #[expect(clippy::too_many_arguments, reason = "9 args; no options struct yet")]
 fn reconcile_with_registrations(
     support_dir: &Path,
@@ -175,10 +185,12 @@ fn reconcile_with_registrations(
         let Some(last_activity) = snapshot.source_last_activity_at.as_deref() else {
             continue;
         };
-        let Ok(last_activity_at) = OffsetDateTime::parse(last_activity, &Rfc3339) else {
+        let Some((last_activity_at, within_ceiling)) =
+            parse_session_activity(last_activity, activity_ceiling)
+        else {
             continue;
         };
-        if last_activity_at <= activity_ceiling {
+        if within_ceiling {
             source_last_activity_at = source_last_activity_at.max(Some(last_activity_at));
         }
         let previous = cache.watermarks.get(&snapshot.source_session_id).cloned();
@@ -187,13 +199,13 @@ fn reconcile_with_registrations(
             .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
             .map_or(true, |value| last_activity_at > value);
 
-        if advanced && last_activity_at >= activity_cutoff && last_activity_at <= activity_ceiling {
+        if advanced && last_activity_at >= activity_cutoff && within_ceiling {
             changed.insert(
                 snapshot.source_session_id.clone(),
                 active_session_from_snapshot(source, snapshot, agent_status),
             );
             selected_snapshots.insert(snapshot.source_session_id.clone(), snapshot);
-        } else if last_activity_at >= activity_cutoff && last_activity_at <= activity_ceiling {
+        } else if last_activity_at >= activity_cutoff && within_ceiling {
             let newer = observed
                 .get(snapshot.source_session_id.as_str())
                 .map_or(true, |seen| {
@@ -1677,140 +1689,54 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    fn reconcile_activity(
-        dir: &Path,
-        source: SnapshotSource,
-        snapshots: &[SnapshotItem],
-        now: &str,
-    ) -> ActiveSessionReconciliation {
-        reconcile_active_sessions(
-            dir,
-            source,
-            snapshots,
-            None,
-            None,
-            now,
-            std::time::Duration::from_secs(300),
-        )
-        .unwrap()
-    }
-
     #[test]
-    fn last_activity_filters_before_max_for_every_source() {
-        for source in [
-            SnapshotSource::ClaudeCode,
-            SnapshotSource::Codex,
-            SnapshotSource::Pi,
+    fn last_activity_cache_cases() {
+        const PAST: &str = "2026-07-19T10:04:00Z";
+        const FUTURE: &str = "2026-07-20T10:04:00Z";
+        const NOW: &str = "2026-07-19T10:05:00Z";
+        let legacy = serde_json::json!({
+            "watermarks": {"real": PAST, "future": FUTURE, "invalid": "not-a-time"},
+            "reconciliation": {"reconciled_at": NOW, "changed_session_count": 0, "sessions": []}
+        });
+        let mut carried = legacy.clone();
+        carried["reconciliation"]["last_activity_at"] = PAST.into();
+        carried["watermarks"] = serde_json::json!({});
+        let empty = serde_json::json!({});
+        let candidates = [FUTURE, PAST, "not-a-time"];
+        let older = serde_json::json!({"reconciliation": legacy["reconciliation"]});
+        for (name, cached, activity, expected) in [
+            ("empty-scan-carry", carried, &[][..], Some(PAST)),
+            ("ceiling-before-max", empty, &candidates, Some(PAST)),
+            ("legacy-seed", legacy.clone(), &[][..], Some(PAST)),
+            ("older-cache-decode", older, &[][..], None),
         ] {
-            let dir = temp_dir("last-activity-ceiling");
-            let future = test_snapshot("future", "2026-07-19T10:10:01Z");
-            let invalid = test_snapshot("invalid", "not-a-time");
-            let unknown = reconcile_activity(
+            let dir = temp_dir(name);
+            let source = SnapshotSource::Codex;
+            let cache: ActiveSessionCache = serde_json::from_value(cached).unwrap();
+            write_cache(&active_session_cache_path(&dir, source), &cache).unwrap();
+            let snapshots = activity
+                .iter()
+                .enumerate()
+                .map(|(i, at)| {
+                    let mut snapshot = test_snapshot(&format!("s{i}"), at);
+                    snapshot.model_usage.clear();
+                    snapshot.usage_buckets.clear();
+                    snapshot
+                })
+                .collect::<Vec<_>>();
+            let observed = reconcile_active_sessions(
                 &dir,
                 source,
-                &[future.clone(), invalid.clone()],
-                "2026-07-19T10:05:00Z",
-            );
-            assert_eq!(unknown.last_activity_at, None);
-            let mut real = test_snapshot("real", "2026-07-19T10:10:00Z");
-            real.model_usage.clear();
-            real.usage_buckets.clear();
-            let older = test_snapshot("older", "2026-07-19T11:00:00+01:00");
-            let observed = reconcile_activity(
-                &dir,
-                source,
-                &[future, real, older, invalid],
-                "2026-07-19T10:05:00Z",
-            );
-            assert_eq!(
-                observed.last_activity_at.as_deref(),
-                Some("2026-07-19T10:10:00Z")
-            );
+                &snapshots,
+                None,
+                None,
+                NOW,
+                std::time::Duration::from_secs(300),
+            )
+            .unwrap();
+            assert_eq!(observed.last_activity_at.as_deref(), expected, "{name}");
             std::fs::remove_dir_all(dir).unwrap();
         }
-    }
-
-    #[test]
-    fn last_activity_survives_empty_scans_and_rescans_without_lowering() {
-        let dir = temp_dir("last-activity-carry");
-        let source = SnapshotSource::Codex;
-        let first = reconcile_activity(
-            &dir,
-            source,
-            &[test_snapshot("s1", "2026-07-19T10:04:00Z")],
-            "2026-07-19T10:05:00Z",
-        );
-        let empty = reconcile_activity(&dir, source, &[], "2026-07-20T10:05:00Z");
-        assert!(empty.sessions.is_empty());
-        assert_eq!(empty.last_activity_at, first.last_activity_at);
-        let older = reconcile_activity(
-            &dir,
-            source,
-            &[test_snapshot("s1", "2026-07-19T09:04:00Z")],
-            "2026-07-20T10:05:00Z",
-        );
-        assert_eq!(older.last_activity_at, first.last_activity_at);
-        let newer = reconcile_activity(
-            &dir,
-            source,
-            &[test_snapshot("s1", "2026-07-20T10:04:00Z")],
-            "2026-07-20T10:05:00Z",
-        );
-        assert_eq!(
-            newer.last_activity_at.as_deref(),
-            Some("2026-07-20T10:04:00Z")
-        );
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn last_activity_seeds_legacy_cache_once_with_ceiling_filtered_history() {
-        let dir = temp_dir("last-activity-seed");
-        let source = SnapshotSource::Pi;
-        let path = active_session_cache_path(&dir, source);
-        let legacy: ActiveSessionCache = serde_json::from_value(serde_json::json!({
-            "watermarks": {
-                "real": "2026-07-19T10:04:00Z",
-                "older": "2026-07-19T11:00:00+01:00",
-                "future": "2026-07-20T10:04:00Z",
-                "invalid": "not-a-time"
-            },
-            "reconciliation": {
-                "reconciled_at": "2026-07-19T10:05:00Z",
-                "changed_session_count": 0,
-                "sessions": []
-            }
-        }))
-        .unwrap();
-        assert_eq!(
-            legacy.reconciliation.as_ref().unwrap().last_activity_at,
-            None
-        );
-        write_cache(&path, &legacy).unwrap();
-        let seeded = reconcile_activity(&dir, source, &[], "2026-07-19T10:05:00Z");
-        assert_eq!(
-            seeded.last_activity_at.as_deref(),
-            Some("2026-07-19T10:04:00Z")
-        );
-        assert_eq!(read_cache(&path).reconciliation, Some(seeded.clone()));
-        // A future legacy watermark becoming past is not another seed.
-        let carried = reconcile_activity(&dir, source, &[], "2026-07-20T10:05:00Z");
-        assert_eq!(carried.last_activity_at, seeded.last_activity_at);
-        // Rollback can drop the field; re-upgrade then seeds best-effort
-        // history, even without a new session once that old time is past.
-        let mut rolled_back = read_cache(&path);
-        rolled_back
-            .reconciliation
-            .as_mut()
-            .unwrap()
-            .last_activity_at = None;
-        write_cache(&path, &rolled_back).unwrap();
-        let reseeded = reconcile_activity(&dir, source, &[], "2026-07-20T10:05:00Z");
-        assert_eq!(
-            reseeded.last_activity_at.as_deref(),
-            Some("2026-07-20T10:04:00Z")
-        );
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
