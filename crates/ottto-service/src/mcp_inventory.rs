@@ -150,7 +150,7 @@ enum ServerSource {
 }
 
 impl ConfiguredServer {
-    fn from_source(mut self, source: ServerSource) -> Self {
+    fn with_source(mut self, source: ServerSource) -> Self {
         self.source = source;
         self
     }
@@ -784,7 +784,7 @@ fn discover_claude_code(home: &Path) -> Vec<ConfiguredServer> {
         // Top-level mcpServers.
         for (name, cfg) in mcp_servers_block(root) {
             if let Some(server) = normalize_claude_server(name, cfg, Some(home)) {
-                servers.insert(name.clone(), server.from_source(ServerSource::User));
+                servers.insert(name.clone(), server.with_source(ServerSource::User));
             }
         }
         // Per-project mcpServers and each project's <dir>/.mcp.json.
@@ -793,7 +793,7 @@ fn discover_claude_code(home: &Path) -> Vec<ConfiguredServer> {
                 for (name, cfg) in mcp_servers_block(project_cfg) {
                     if let Some(server) =
                         normalize_claude_server(name, cfg, Some(Path::new(project_dir))).map(
-                            |server| server.from_source(ServerSource::Local(project_dir.into())),
+                            |server| server.with_source(ServerSource::Local(project_dir.into())),
                         )
                     {
                         servers.insert(name.clone(), server);
@@ -884,7 +884,7 @@ fn discover_claude_code(home: &Path) -> Vec<ConfiguredServer> {
                 };
                 servers
                     .entry(server.name.clone())
-                    .or_insert(server.from_source(source));
+                    .or_insert(server.with_source(source));
             }
         }
     }
