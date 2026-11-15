@@ -506,6 +506,9 @@ fn never_delivered_holder_is_held_and_copy_counts_once() {
         .unwrap();
         prior = disk.commit(&setup.cache, SnapshotSource::ClaudeCode, &mut setup.index);
         assert_eq!(prior.claude_account_deferred_hold_count(), 1);
+        // Reload deliberately forgets the runtime destination. Reapply it,
+        // as raw does before a real pass, before asking whether proof is owed.
+        prior.activate_upload_context("e2-synthetic-destination".into());
         assert!(upload_context_owed_for_test(&prior, &holder));
         let path = c.write_at(
             &file(COPY),
@@ -693,8 +696,7 @@ fn local_copy_ownership_ack_orders_and_copy_first_restart() {
                     );
                     let holder = c.root(ROOT, &resumed(ROOT, &[A, B]));
                     input_clock(&holder);
-                    let mut source = c.raw(&scanner, prior, 1, false, &[holder]);
-                    source.enrich(&c);
+                    let mut source = next_body_page(&c, prior, ROOT, &mut progress);
                     source.finish();
                     if reverse {
                         // Retain the first one-file page while the next one
@@ -1015,10 +1017,10 @@ fn copy_first_correction_preserves_native_money_and_placement() {
         let mut prior = settle(&c, &ScanIndex::default(), first, &mut progress);
         let holder = c.root(ROOT, &resumed(ROOT, &[A, B]));
         input_clock(&holder);
-        let mut source = c.raw(&scanner, prior.clone(), 1, false, &[holder]);
-        source.enrich(&c);
+        let mut source = next_body_page(&c, prior, ROOT, &mut progress);
         post(&mut source, &mut progress, 8);
-        prior = settle(&c, &prior, source, &mut progress);
+        let committed = source.committed.clone();
+        prior = settle(&c, &committed, source, &mut progress);
         let mut correction = next_body_page(&c, prior.clone(), COPY, &mut progress);
         correction.finish();
         assert_eq!(

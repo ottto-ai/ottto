@@ -2196,12 +2196,10 @@ impl CopyOwnership {
             let changed = old.is_some_and(|o| o.owned) != origin_owned(next, &[], key, true)
                 || old.is_some_and(|o| o.group_owned) != index_group_owned(next, &live, key)
                 || old.map_or(&[][..], |o| o.groups.as_slice()) != groups
-                || old.and_then(|o| o.census.as_ref()).is_some_and(|record| {
-                    record
-                        .request_hashes()
-                        .iter()
-                        .any(|&hash| !census.is_some_and(|r| r.holds_hash(hash)))
-                });
+                || old
+                    .and_then(|o| o.census.as_ref())
+                    .map_or(&[][..], |record| record.request_hashes())
+                    != census.map_or(&[][..], |record| record.request_hashes());
             if !changed {
                 continue;
             }

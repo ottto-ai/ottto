@@ -107,7 +107,7 @@ file-system hint / periodic listing → select file → read new bytes from save
   holders later deleted locally. Groups relying on an unaccepted page holder are
   provisional: a save drops them and marks their copies if that holder failed to
   commit a counted body. Deleting an unaccepted holder also drops its groups.
-  Each index save compares committed ownership, removal groups and lost census
+  Each index save compares committed ownership, removal groups and changed census
   hashes, then marks later unheld copies whose saved decisions disagree with
   current ownership. Already decided removals and overlapping own turns do not
   gain read debt. A marked copy's next read runs the same copy decider. The existing removal-record slot is a 0/1 re-decision mark,

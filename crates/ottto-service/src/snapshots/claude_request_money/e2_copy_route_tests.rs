@@ -240,6 +240,63 @@ fn save_marks_only_disagreeing_copy_decisions() {
     }
 }
 
+/// [regress] Restored positive census proof changes a counted copy's answer
+/// even when the holder's acceptance already kept ownership true throughout.
+#[test]
+fn restored_census_marks_an_accepted_holders_counted_copy_once() {
+    for missing in [false, true] {
+        let dir = scratch();
+        let key = local_index_key(&copy_at(&dir));
+        let location = location_key(&key);
+        let mut next = index_holding(&dir, &["copy-a"]);
+        let holder = holder_key(&dir);
+        accepted_receipt(&mut next, &dir);
+        next.files.insert(key.clone(), next.files[&holder].clone());
+        next.file_snapshot_fingerprints
+            .insert(key.clone(), BTreeSet::from(["copy-body".into()]));
+        next.claude_money_birth_store
+            .record_observation(ROOT, &key, t0() + 100_000_000_000);
+        next.claude_money_birth_store
+            .set_money_marks(&key, money_mark::DISCLOSED);
+        next.claude_request_census_mut_for_test().insert_for_test(
+            &key,
+            ClaudeRequestCensusRecord::synthetic_for_test(
+                &"a".repeat(64),
+                1,
+                ClaudeRequestCensusShape::Exact,
+                vec![claude_request_hash("copy-a")],
+            ),
+        );
+        let mut previous = next.clone();
+        if missing {
+            previous
+                .claude_request_census_mut_for_test()
+                .remove(&holder);
+        } else {
+            previous
+                .claude_request_census_mut_for_test()
+                .insert_for_test(
+                    &holder,
+                    ClaudeRequestCensusRecord::synthetic_for_test(
+                        &"a".repeat(64),
+                        1,
+                        ClaudeRequestCensusShape::Exact,
+                        vec![],
+                    ),
+                );
+        }
+        assert!(origin_owned(&previous, &[], &holder, true));
+        assert!(origin_owned(&next, &[], &holder, true));
+        reconcile_copy_ownership(&previous, &mut next);
+        assert!(next.claude_copy_removals.pending(location));
+        next.claude_copy_removals.clear_hold(location);
+        let unchanged = CopyOwnership::capture(&next);
+        unchanged.reconcile(&mut next);
+        assert!(!next.claude_copy_removals.pending(location));
+        let _ = fs::remove_dir_all(dir);
+    }
+}
+
 /// [regress] A non-counting in-folder location leads to its session's owner
 /// elsewhere. When that owner commits, the previously counted copy must be
 /// selected even though the local location itself never becomes owned.
@@ -293,10 +350,25 @@ fn save_marks_copy_when_holder_session_gains_an_owner_in_another_folder() {
         }
         let copy_key = location_key(&local_index_key(&copy));
         if saved {
+            // A same-session body elsewhere now validates the bridge location's
+            // stored groups. Use a genuinely disproven holder for the invalid
+            // old-group arms, while preserving the in-folder session bridge.
+            let invalid = local_index_key(&elsewhere.join(format!("{OTHER}.jsonl")));
+            next.files
+                .insert(invalid.clone(), next.files[&holder].clone());
+            next.claude_request_census_mut_for_test().insert_for_test(
+                &invalid,
+                ClaudeRequestCensusRecord::synthetic_for_test(
+                    &"a".repeat(64),
+                    1,
+                    ClaudeRequestCensusShape::Exact,
+                    vec![],
+                ),
+            );
             next.claude_copy_removals.store(
                 copy_key,
                 BTreeMap::from([(
-                    location_key(&local_index_key(&local.join(format!("{HOLDER}.jsonl")))),
+                    location_key(&invalid),
                     BTreeSet::from([claude_request_hash(if different {
                         "copy-b"
                     } else {

@@ -2465,6 +2465,7 @@ fn restored_twins(reverse: bool, equal: bool) {
             },
         );
         let scanner = E2ScanFixture::default();
+        e2::take_diag();
         let mut first = ready(&c, &scanner, ScanIndex::default(), 100, false);
         let opened = scanner.paths();
         assert_eq!(opened.len(), 2);
@@ -2478,10 +2479,13 @@ fn restored_twins(reverse: bool, equal: bool) {
             1,
             "all-prebirth restored twins count once from their earlier local owner"
         );
-        assert!(
-            e2::pipeline_test_observer::disclosed(&first.scan.snapshots) + first.released.disclosed
-                > 0,
-            "the unproven twin copy is disclosed"
+        // The emitted body carries the first discovered path's fold. When
+        // that path is the removed copy, the counting twin's inline counter
+        // leaves with its merged fold. Observe the sum of both decisions.
+        assert_eq!(
+            copy_diag(&["copy_prefix_unproven"]),
+            [1],
+            "the single counted request without an earlier owner is disclosed"
         );
         first.finish();
         let stored = stored_bodies(&first.index);

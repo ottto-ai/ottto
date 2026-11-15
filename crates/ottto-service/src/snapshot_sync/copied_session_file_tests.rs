@@ -498,7 +498,10 @@ fn copied_file_version_three_converges_once() {
                 .get(&holder_key)
                 .unwrap()
                 .clone();
-            e2::pipeline_test_observer::forget_census(&mut old.index, &file(ROOT));
+            // The path-twin arm has two files with this basename.
+            old.index
+                .claude_request_census_mut_for_test()
+                .remove(&holder_key);
             old.enrich(&c);
             old = deliver_page(old);
             old.index
