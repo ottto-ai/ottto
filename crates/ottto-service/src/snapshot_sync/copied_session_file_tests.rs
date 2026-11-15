@@ -255,175 +255,6 @@ fn holder_only_page_brings_its_content_twin() {
     }
 }
 
-/// [money] The earliest copy holder is not the complete session: every main
-/// reselection keeps the union, and incomplete pages never replace that union.
-#[test]
-fn content_session_closure_ignores_earliest_holder() {
-    for sampled in [false, true] {
-        with_e2(|| {
-            let mut c = Corpus::new("content-session-closure");
-            let holder = c.write_at(
-                &format!("earlier/{THIRD}.jsonl"),
-                &resumed(THIRD, &[A]),
-                "2026-08-02T06:59:00Z",
-            );
-            let main = c.root(ROOT, &resumed(ROOT, &[A, B]));
-            let mut prior = warm(&c);
-            let twin = c.write_at(&file(COPY), &resumed(ROOT, &[A, B, C]), BORN);
-            owe(&mut prior);
-            let both = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, sampled);
-            assert_eq!(body(&both, ROOT).unwrap().request_count, 3);
-            prior = settle(&c, &prior, both, &mut e2_progress());
-            let (main_key, twin_key) = (
-                main.to_string_lossy().into_owned(),
-                twin.to_string_lossy().into_owned(),
-            );
-            assert_eq!(
-                e2::copied_file_holders_for_test(&prior, std::iter::once(twin_key.as_str()))
-                    [&twin_key],
-                holder.to_string_lossy(),
-                "the twin's earliest accepted holder is in another session and folder"
-            );
-            append(&main, &resumed(ROOT, &[D]));
-            let scanner = E2ScanFixture::default();
-            let mut complete = c.raw(&scanner, prior.clone(), 100, sampled, &[]);
-            assert!(
-                scanner.paths().contains(&twin),
-                "main-only selection pulls the twin"
-            );
-            let folded = complete
-                .scan
-                .snapshots
-                .iter()
-                .find(|item| {
-                    item.claude_money
-                        .as_deref()
-                        .and_then(e2::FileFold::location_key)
-                        == Some(location_key(&twin_key))
-                })
-                .unwrap();
-            assert_eq!(
-                folded.source_session_id, ROOT,
-                "content session survives the Tail route"
-            );
-            assert_eq!(
-                folded.claude_usage_request_ids,
-                BTreeSet::from(["a".to_owned(), "b".to_owned(), "c".to_owned(),])
-            );
-            complete.enrich(&c);
-            assert_eq!(body(&complete, ROOT).unwrap().request_count, 4);
-            // Observe the receiver's whole-session replacement after every ACK.
-            let mut accepted = BTreeMap::new();
-            let mut acknowledge = |page: &mut Page| {
-                page.finish();
-                let (status, _, _) = upload(&page.scan.snapshots, &mut e2_progress(), |items| {
-                    let response = ack(items);
-                    for item in items {
-                        accepted.insert(item.source_session_id.clone(), item.request_count);
-                    }
-                    assert_eq!(
-                        accepted[ROOT], 4,
-                        "an ACK never replaces four requests with three"
-                    );
-                    response
-                });
-                assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
-            };
-            acknowledge(&mut complete);
-            prior = settle(&c, &prior, complete, &mut e2_progress());
-            for cause in ["absent", "lossy", "bound"] {
-                let mut selected = prior.clone();
-                assert!(selected.re_owe_effective_upload_body_witness_revision(&main_key, 2));
-                let mut page = c.raw(&E2ScanFixture::default(), selected, 100, sampled, &[]);
-                assert!(page.scan.snapshots.iter().any(|item| {
-                    item.claude_money
-                        .as_deref()
-                        .and_then(e2::FileFold::location_key)
-                        == Some(location_key(&twin_key))
-                }));
-                page.scan.snapshots.retain(|item| {
-                    item.claude_money
-                        .as_deref()
-                        .and_then(e2::FileFold::location_key)
-                        != Some(location_key(&twin_key))
-                        && item.source_session_id == ROOT
-                });
-                if cause == "bound" {
-                    // Install the bound failure at the same post-pull seam
-                    // as the missing fold, without committing a corrupt row.
-                    crate::snapshots::e2_pipeline_scan_fixture::hold_file_decode_for_test(
-                        &mut page.index,
-                        &twin_key,
-                    );
-                }
-                if cause == "lossy" {
-                    // No extra ids: only the non-Exact shape requires the hold.
-                    let mut record = serde_json::to_value(
-                        page.index
-                            .claude_request_census_for_test()
-                            .get(&twin_key)
-                            .unwrap(),
-                    )
-                    .unwrap();
-                    record["s"] = json!("lossy");
-                    page.index
-                        .claude_request_census_mut_for_test()
-                        .insert_for_test(&twin_key, serde_json::from_value(record).unwrap());
-                    let item = page
-                        .scan
-                        .snapshots
-                        .iter_mut()
-                        .find(|item| item.source_session_id == ROOT)
-                        .unwrap();
-                    item.claude_usage_request_ids.insert("c".into());
-                }
-                let removals = page.index.claude_copy_removals.clone();
-                page.enrich(&c);
-                assert_eq!(
-                    page.disposition
-                        .request_owned_hold_reasons
-                        .get("absent_content_twin"),
-                    Some(&1)
-                );
-                assert!(
-                    body(&page, ROOT).is_some(),
-                    "held items remain until withholding"
-                );
-                let holds = page.finish();
-                assert!(holds.progress_blocking);
-                assert!(body(&page, ROOT).is_none(), "partial bodies never upload");
-                assert_eq!(
-                    page.index.claude_copy_removals, removals,
-                    "holding creates no removal debt or COPY mark"
-                );
-                assert_eq!(
-                    page.index.files[&main_key].effective_upload_body_witness_revision,
-                    2
-                );
-                acknowledge(&mut page);
-                let mut recover = prior.clone();
-                assert!(recover.re_owe_effective_upload_body_witness_revision(&main_key, 2));
-                let mut recovered = c.raw(&E2ScanFixture::default(), recover, 100, sampled, &[]);
-                recovered.enrich(&c);
-                assert_eq!(body(&recovered, ROOT).unwrap().request_count, 4);
-                acknowledge(&mut recovered);
-                prior = settle(&c, &prior, recovered, &mut e2_progress());
-            }
-            // Positive deletion releases the dependency, matching path twins.
-            std::fs::remove_file(&twin).unwrap();
-            let mut selected = prior.clone();
-            assert!(selected.re_owe_effective_upload_body_witness_revision(&main_key, 2));
-            let mut deleted = c.raw(&E2ScanFixture::default(), selected, 100, sampled, &[]);
-            deleted.enrich(&c);
-            assert_eq!(body(&deleted, ROOT).unwrap().request_count, 3);
-            assert!(!deleted
-                .disposition
-                .request_owned_hold_reasons
-                .contains_key("absent_content_twin"));
-        });
-    }
-}
-
 // Finalize and settle real ACKs, observing each whole-session replacement.
 fn accept_monotone_page(
     c: &Corpus,
@@ -463,12 +294,10 @@ fn accept_monotone_page(
     c.reload(&mut settled.index)
 }
 
-/// [money] A twin pulls its unchanged main, including when an unrelated main
-/// first pulls the twin. Incomplete pages hold; every ACK preserves the union.
+/// [money] Native and Tail pages preserve the complete union, even when the
+/// earliest holder is unrelated. Withholding variants share the same ACK oracle.
 #[test]
 fn unrelated_main_and_growing_twin_pull_complete_session() {
-    // Selection order differs between an all-owed page and a Q-seeded page.
-    // Align the cloned oracle inputs; retain every session and wire field.
     fn ordered_money(page: &Page) -> RouteResult {
         let mut ordered = twin(page);
         ordered
@@ -477,8 +306,6 @@ fn unrelated_main_and_growing_twin_pull_complete_session() {
             .sort_by(|a, b| a.source_session_id.cmp(&b.source_session_id));
         sent_money(&ordered)
     }
-    // Use production finalization, upload, ACK settlement and index reload;
-    // observe the receiver ledger inside every ACK callback.
     for sampled in [false, true] {
         with_e2(|| {
             let mut c = Corpus::new("unrelated-main-pulls-twin");
@@ -494,112 +321,246 @@ fn unrelated_main_and_growing_twin_pull_complete_session() {
             initial.enrich(&c);
             prior = accept_monotone_page(&c, &prior, initial, &mut accepted);
             let twin = c.write_at(&file(COPY), &resumed(ROOT, &[A, B, C]), BORN);
-            append(&main, &resumed(ROOT, &[D]));
             owe(&mut prior);
-            let mut complete = c.raw(&E2ScanFixture::default(), prior.clone(), 100, sampled, &[]);
-            complete.enrich(&c);
-            assert_eq!(body(&complete, ROOT).unwrap().request_count, 4);
-            let reference = ordered_money(&complete);
-            prior = accept_monotone_page(&c, &prior, complete, &mut accepted);
-            assert_eq!(accepted[ROOT], 4);
-            let twin_key = twin.to_string_lossy().into_owned();
+            let both = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, sampled);
+            assert_eq!(body(&both, ROOT).unwrap().request_count, 3);
+            prior = accept_monotone_page(&c, &prior, both, &mut accepted);
+            let (main_key, twin_key) = (
+                main.to_string_lossy().into_owned(),
+                twin.to_string_lossy().into_owned(),
+            );
             assert_eq!(
                 e2::copied_file_holders_for_test(&prior, std::iter::once(twin_key.as_str()))
                     [&twin_key],
-                unrelated.to_string_lossy()
+                unrelated.to_string_lossy(),
+                "the earliest accepted holder is in another session and folder"
             );
-            let mut selected = prior.clone();
-            assert!(selected
-                .re_owe_effective_upload_body_witness_revision(&unrelated.to_string_lossy(), 2));
+            append(&main, &resumed(ROOT, &[D]));
             let scanner = E2ScanFixture::default();
-            let mut partial = c.raw(
-                &scanner,
-                selected,
-                100,
-                sampled,
-                std::slice::from_ref(&unrelated),
-            );
-            assert!(scanner.paths().contains(&unrelated));
-            assert!(scanner.paths().contains(&twin), "Q pulls T through overlap");
-            assert!(scanner.paths().contains(&main), "T pulls unchanged M");
-            // Simulate admission preventing M's fold: Q+T still cannot
-            // replace S until M and T both reach the same page.
-            partial.scan.snapshots.retain(|item| {
-                item.claude_money
-                    .as_deref()
-                    .and_then(e2::FileFold::location_key)
-                    != Some(location_key(&main.to_string_lossy()))
-            });
-            partial.enrich(&c);
-            assert_eq!(
-                partial
-                    .disposition
-                    .request_owned_hold_reasons
-                    .get("absent_content_twin"),
-                Some(&1)
-            );
-            assert_eq!(partial.disposition.quarantined_entity_count(), 1);
-            assert!(partial.finish().progress_blocking);
+            let mut complete = c.raw(&scanner, prior.clone(), 100, sampled, &[]);
             assert!(
-                body(&partial, ROOT).is_none(),
-                "T alone is withheld before upload"
+                scanner.paths().contains(&twin),
+                "main-only selection pulls T"
             );
-            prior = accept_monotone_page(&c, &prior, partial, &mut accepted);
-            assert_eq!(accepted[ROOT], 4, "T alone never replaces M+T");
-            assert!(prior
-                .re_owe_effective_upload_body_witness_revision(&unrelated.to_string_lossy(), 2));
-            let scanner = E2ScanFixture::default();
-            let mut recovered = c.raw(
-                &scanner,
-                prior.clone(),
-                100,
-                sampled,
-                std::slice::from_ref(&unrelated),
+            let folded = complete
+                .scan
+                .snapshots
+                .iter()
+                .find(|item| {
+                    item.claude_money
+                        .as_deref()
+                        .and_then(e2::FileFold::location_key)
+                        == Some(location_key(&twin_key))
+                })
+                .unwrap();
+            assert_eq!(
+                folded.source_session_id, ROOT,
+                "content session survives Tail"
             );
-            assert!(scanner.paths().contains(&unrelated));
-            assert!(scanner.paths().contains(&twin) && scanner.paths().contains(&main));
-            recovered.enrich(&c);
-            assert_eq!(body(&recovered, ROOT).unwrap().request_count, 4);
-            assert!(!recovered
-                .disposition
-                .request_owned_hold_reasons
-                .contains_key("absent_content_twin"));
-            money_oracle::assert_equivalent(&reference, &ordered_money(&recovered));
-            assert!(!recovered.finish().progress_blocking);
-            prior = accept_monotone_page(&c, &prior, recovered, &mut accepted);
+            assert_eq!(
+                folded.claude_usage_request_ids,
+                BTreeSet::from(["a".to_owned(), "b".to_owned(), "c".to_owned()])
+            );
+            complete.enrich(&c);
+            assert_eq!(body(&complete, ROOT).unwrap().request_count, 4);
+            // Q's selected recovery offers both sessions, as does the all-owed oracle.
+            let mut all = prior.clone();
+            owe(&mut all);
+            let full = ready(&c, &E2ScanFixture::default(), all, 100, sampled);
+            assert_eq!(body(&full, ROOT).unwrap().request_count, 4);
+            let reference = ordered_money(&full);
+            prior = accept_monotone_page(&c, &prior, complete, &mut accepted);
             assert_eq!(accepted[ROOT], 4);
 
-            // Only T grows. M's stamp and settled revision stay unchanged;
-            // ordinary T selection must schedule M without manually owing M.
-            append(
-                &twin,
-                &resumed(ROOT, &[("e", "2026-08-02T07:07:10Z", RESUME_WRITER)]),
-            );
-            let mut full_index = prior.clone();
-            owe(&mut full_index);
-            let mut full = c.raw(&E2ScanFixture::default(), full_index, 100, sampled, &[]);
-            full.enrich(&c);
-            assert_eq!(body(&full, ROOT).unwrap().request_count, 5);
-            let reference = ordered_money(&full);
-            let scanner = E2ScanFixture::default();
-            let mut grown = c.raw(
-                &scanner,
-                prior.clone(),
-                100,
-                sampled,
-                std::slice::from_ref(&twin),
-            );
-            assert!(scanner.paths().contains(&twin) && scanner.paths().contains(&main));
-            grown.enrich(&c);
-            assert_eq!(body(&grown, ROOT).unwrap().request_count, 5);
-            assert!(!grown
-                .disposition
-                .request_owned_hold_reasons
-                .contains_key("absent_content_twin"));
-            money_oracle::assert_equivalent(&reference, &ordered_money(&grown));
-            assert!(!grown.finish().progress_blocking);
-            accept_monotone_page(&c, &prior, grown, &mut accepted);
-            assert_eq!(accepted[ROOT], 5, "T's new turn reaches the receiver");
+            for cause in [
+                "strip-T",
+                "non-Exact",
+                "bound hold",
+                "Q-pull",
+                "twin growth",
+                "deletion release",
+            ] {
+                if cause == "twin growth" {
+                    // Only T grows: M keeps its settled stamp and revision.
+                    append(
+                        &twin,
+                        &resumed(ROOT, &[("e", "2026-08-02T07:07:10Z", RESUME_WRITER)]),
+                    );
+                    let mut full_index = prior.clone();
+                    owe(&mut full_index);
+                    let mut full = c.raw(&E2ScanFixture::default(), full_index, 100, sampled, &[]);
+                    full.enrich(&c);
+                    assert_eq!(body(&full, ROOT).unwrap().request_count, 5);
+                    let reference = ordered_money(&full);
+                    let scanner = E2ScanFixture::default();
+                    let mut grown = c.raw(
+                        &scanner,
+                        prior.clone(),
+                        100,
+                        sampled,
+                        std::slice::from_ref(&twin),
+                    );
+                    assert!(scanner.paths().contains(&twin) && scanner.paths().contains(&main));
+                    grown.enrich(&c);
+                    assert_eq!(body(&grown, ROOT).unwrap().request_count, 5);
+                    assert!(!grown
+                        .disposition
+                        .request_owned_hold_reasons
+                        .contains_key("absent_content_twin"));
+                    money_oracle::assert_equivalent(&reference, &ordered_money(&grown));
+                    assert!(!grown.finish().progress_blocking);
+                    prior = accept_monotone_page(&c, &prior, grown, &mut accepted);
+                    assert_eq!(accepted[ROOT], 5, "T's new turn reaches the receiver");
+                    continue;
+                }
+                if cause == "deletion release" {
+                    std::fs::remove_file(&twin).unwrap();
+                }
+                let q_pull = cause == "Q-pull";
+                let mut selected = prior.clone();
+                let seed = if q_pull { &unrelated } else { &main };
+                assert!(selected
+                    .re_owe_effective_upload_body_witness_revision(&seed.to_string_lossy(), 2));
+                let hints = if q_pull {
+                    std::slice::from_ref(seed)
+                } else {
+                    &[]
+                };
+                let scanner = E2ScanFixture::default();
+                let mut page = c.raw(&scanner, selected, 100, sampled, hints);
+                if cause == "deletion release" {
+                    page.enrich(&c);
+                    assert_eq!(body(&page, ROOT).unwrap().request_count, 3);
+                    assert!(!page
+                        .disposition
+                        .request_owned_hold_reasons
+                        .contains_key("absent_content_twin"));
+                    continue;
+                }
+                assert!(scanner.paths().contains(&twin));
+                assert!(page.scan.snapshots.iter().any(|item| {
+                    item.claude_money
+                        .as_deref()
+                        .and_then(e2::FileFold::location_key)
+                        == Some(location_key(&twin_key))
+                }));
+                if q_pull {
+                    assert!(scanner.paths().contains(&unrelated));
+                    assert!(
+                        scanner.paths().contains(&main),
+                        "Q pulls T, T pulls unchanged M"
+                    );
+                }
+                let missing = if q_pull { &main_key } else { &twin_key };
+                page.scan.snapshots.retain(|item| {
+                    item.claude_money
+                        .as_deref()
+                        .and_then(e2::FileFold::location_key)
+                        != Some(location_key(missing))
+                        && (q_pull || item.source_session_id == ROOT)
+                });
+                match cause {
+                    "bound hold" => {
+                        crate::snapshots::e2_pipeline_scan_fixture::hold_file_decode_for_test(
+                            &mut page.index,
+                            &twin_key,
+                        )
+                    }
+                    "non-Exact" => {
+                        let mut record = serde_json::to_value(
+                            page.index
+                                .claude_request_census_for_test()
+                                .get(&twin_key)
+                                .unwrap(),
+                        )
+                        .unwrap();
+                        record["s"] = json!("lossy");
+                        page.index
+                            .claude_request_census_mut_for_test()
+                            .insert_for_test(&twin_key, serde_json::from_value(record).unwrap());
+                        // No missing ids: only the non-Exact shape requires the hold.
+                        page.scan
+                            .snapshots
+                            .iter_mut()
+                            .find(|item| item.source_session_id == ROOT)
+                            .unwrap()
+                            .claude_usage_request_ids
+                            .insert("c".into());
+                    }
+                    _ => {}
+                }
+                let removals = page.index.claude_copy_removals.clone();
+                page.enrich(&c);
+                assert_eq!(
+                    page.disposition
+                        .request_owned_hold_reasons
+                        .get("absent_content_twin"),
+                    Some(&1)
+                );
+                assert_eq!(
+                    body(&page, ROOT).is_some(),
+                    !q_pull,
+                    "held items remain until withholding; T alone never emits"
+                );
+                if q_pull {
+                    assert_eq!(page.disposition.quarantined_entity_count(), 1);
+                }
+                assert!(page.finish().progress_blocking);
+                assert!(body(&page, ROOT).is_none(), "partial bodies never upload");
+                if !q_pull {
+                    assert_eq!(
+                        page.index.claude_copy_removals, removals,
+                        "holding creates no removal debt or COPY mark"
+                    );
+                    assert_eq!(
+                        page.index.files[&main_key].effective_upload_body_witness_revision,
+                        2
+                    );
+                }
+                if q_pull {
+                    prior = accept_monotone_page(&c, &prior, page, &mut accepted);
+                } else {
+                    // The synthetic bound/lossy seam must not be persisted.
+                    assert_eq!(
+                        upload(&page.scan.snapshots, &mut e2_progress(), |items| {
+                            let response = ack(items);
+                            for item in items {
+                                accepted.insert(item.source_session_id.clone(), item.request_count);
+                            }
+                            assert_eq!(
+                                accepted[ROOT], 4,
+                                "an ACK never replaces four requests with three"
+                            );
+                            response
+                        })
+                        .0
+                        .unwrap(),
+                        ResumableUploadResult::Completed
+                    );
+                }
+                assert_eq!(accepted[ROOT], 4, "partial pages never replace M+T");
+                let mut recover = prior.clone();
+                assert!(recover
+                    .re_owe_effective_upload_body_witness_revision(&seed.to_string_lossy(), 2));
+                let scanner = E2ScanFixture::default();
+                let mut recovered = c.raw(&scanner, recover, 100, sampled, hints);
+                if q_pull {
+                    assert!(scanner.paths().contains(&unrelated));
+                    assert!(scanner.paths().contains(&twin) && scanner.paths().contains(&main));
+                }
+                recovered.enrich(&c);
+                assert_eq!(body(&recovered, ROOT).unwrap().request_count, 4);
+                assert!(!recovered
+                    .disposition
+                    .request_owned_hold_reasons
+                    .contains_key("absent_content_twin"));
+                if q_pull {
+                    money_oracle::assert_equivalent(&reference, &ordered_money(&recovered));
+                }
+                assert!(!recovered.finish().progress_blocking);
+                prior = accept_monotone_page(&c, &prior, recovered, &mut accepted);
+                assert_eq!(accepted[ROOT], 4);
+            }
         });
     }
 }
