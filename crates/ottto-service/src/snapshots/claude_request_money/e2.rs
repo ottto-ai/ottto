@@ -4404,13 +4404,22 @@ pub(crate) fn finish_page(
         .iter()
         .map(|(session, state)| (session.as_str(), state.locations.as_slice()))
         .collect::<Vec<_>>();
-    let held = absent_twins(
+    let content_held = locations
+        .iter()
+        .filter(|(session, here)| content_twin_hold(session, here, items, index))
+        .map(|(session, _)| (*session).to_owned())
+        .collect::<BTreeSet<_>>();
+    if !content_held.is_empty() {
+        *hold_reasons.entry("absent_content_twin").or_default() += content_held.len() as u64;
+    }
+    let mut held = absent_twins(
         &locations,
         items,
         index,
         queued_family_deferred_paths,
         hold_reasons,
     );
+    held.extend(content_held.iter().cloned());
     diag("held_absent_twin", held.len() as u64);
     drop(locations);
     let mut decided = Vec::with_capacity(sessions.len());
@@ -4429,7 +4438,9 @@ pub(crate) fn finish_page(
         if item.claude_money.is_none() {
             return true;
         }
-        if drop_copies.get(&item.source_session_id) == Some(&true) {
+        if !content_held.contains(&item.source_session_id)
+            && drop_copies.get(&item.source_session_id) == Some(&true)
+        {
             return false;
         }
         // One body per session: the first item carries the summed entity.
@@ -4735,6 +4746,64 @@ fn redundant_twin(key: &str, other: &str, folded: &SnapshotItem, index: &ScanInd
         }
     };
     proof() == Some(true)
+}
+
+/// Missing overlapping contributors hold the replacement. Deleted files
+/// and retired/missing census hashes release the content dependency.
+fn content_twin_hold(
+    session: &str,
+    here: &[LocationKey],
+    items: &[SnapshotItem],
+    index: &ScanIndex,
+) -> bool {
+    // A pulled twin cannot replace its session's absent filename member,
+    // even when its earliest copy holder belongs to another session.
+    let only_twins = here.iter().all(|location| {
+        index
+            .claude_request_census
+            .records()
+            .any(|(key, record)| record.is_twin() && *location == location_key(key))
+    });
+    if only_twins
+        && claude_path_twin_groups(index, &BTreeSet::from([session.to_owned()]))
+            .get(session)
+            .is_some_and(|keys| {
+                keys.iter()
+                    .any(|(key, _)| Path::new(key).is_file() && !here.contains(&location_key(key)))
+            })
+    {
+        return true;
+    }
+    let hashes = items
+        .iter()
+        .filter(|item| item.source_session_id == session)
+        .flat_map(|item| item.claude_usage_request_ids.iter())
+        .map(|id| claude_request_hash(id))
+        .collect::<BTreeSet<_>>();
+    for (key, twin) in index.claude_request_census.records() {
+        if !twin.is_twin()
+            || !twin
+                .request_hashes()
+                .iter()
+                .any(|hash| hashes.contains(hash))
+            || (twin.is_exact()
+                && twin
+                    .request_hashes()
+                    .iter()
+                    .all(|hash| hashes.contains(hash)))
+            || items.iter().any(|item| {
+                item.claude_money
+                    .as_deref()
+                    .and_then(FileFold::location_key)
+                    == Some(location_key(key))
+            })
+            || !Path::new(key).is_file()
+        {
+            continue;
+        }
+        return true;
+    }
+    false
 }
 
 /// Sessions (roots and subagent members) with a live indexed path that is

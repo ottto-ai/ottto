@@ -3977,26 +3977,28 @@ impl OwnedSourceScan {
                 pending!();
             }
             // After ordinary identity, decision and admission (no seed
-            // pre-open), a content twin pulls its holder and a main holder
-            // pulls the content twins it proves (one relation), so a page
-            // never reads one without the other. A proving holder is never a
-            // census twin: the arms are disjoint and the pulled set closes at
-            // the holder and its twins. A history-held holder (its bodies
-            // vetoed) pulls nothing, so its twins never emit the session alone.
+            // pre-open), content twins and mains pull every overlapping live
+            // member of the opposite kind. Pulled candidates pass the ordinary
+            // history and resident gates; the emission fence withholds incomplete
+            // sessions. History-held mains pull nothing.
             let seed = local_index_key(&candidate.path);
             let record = (source == SnapshotSource::ClaudeCode)
                 .then(|| index.claude_request_census.get(&seed))
                 .flatten();
             let walk = std::time::Instant::now();
             let pulls: Vec<String> = match record {
-                Some(record) if record.is_twin() => claude_request_money::e2::copied_file_holders(
-                    index,
-                    std::iter::once(seed.as_str()),
-                )
-                .into_values()
-                .collect(),
-                // Walk only for a holder sharing a request with some twin;
-                // the walk itself keeps only proving main holders.
+                Some(record) if record.is_twin() => {
+                    let mains = index.claude_request_census.records().filter(|(key, main)| {
+                        !main.is_twin()
+                            && Path::new(key).is_file()
+                            && claude_request_census::held_candidates(main, record.request_hashes())
+                                .next()
+                                .is_some()
+                    });
+                    mains.map(|(key, _)| key.clone()).collect()
+                }
+                // Holder choice for copied history does not define all of a
+                // session's contributors.
                 Some(record)
                     if !history_held
                         && claude_request_census::held_candidates(
@@ -4006,19 +4008,14 @@ impl OwnedSourceScan {
                         .next()
                         .is_some() =>
                 {
-                    let twins = index.claude_request_census.records().filter(|(_, twin)| {
+                    let twins = index.claude_request_census.records().filter(|(key, twin)| {
                         twin.is_twin()
+                            && Path::new(key).is_file()
                             && claude_request_census::held_candidates(twin, record.request_hashes())
                                 .next()
                                 .is_some()
                     });
-                    claude_request_money::e2::copied_file_holders(
-                        index,
-                        twins.map(|(key, _)| key.as_str()),
-                    )
-                    .into_iter()
-                    .filter_map(|(twin, holder)| (holder == seed).then_some(twin))
-                    .collect()
+                    twins.map(|(key, _)| key.clone()).collect()
                 }
                 _ => Vec::new(),
             };
