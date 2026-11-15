@@ -8,8 +8,8 @@ use ottto_core::{
     read_claude_statusline_context_history, write_owner_only_file_atomic_if_changed,
     ClaudeConfigDirSlot, ClaudeSlotAccountBinding, ClaudeStatusLineContextWindowCache,
     ClaudeStatusLineContextWindowHistory, ClaudeStatusLineContextWindowSample,
-    ClaudeStatusLineRateLimitCache, CodexHomeTrust, FileClaudeConfigSlotSettingsStore,
-    FileCodexAccountSlotSettingsStore, MAX_CLAUDE_ACCOUNT_SLOTS,
+    ClaudeStatusLineRateLimitCache, CodexAccountSlotSettingsError, CodexHomeTrust,
+    FileClaudeConfigSlotSettingsStore, FileCodexAccountSlotSettingsStore, MAX_CLAUDE_ACCOUNT_SLOTS,
 };
 use ottto_protocol::{
     AgentAccountStatus, AgentAvailableModelStatus, AgentCapabilityGap, AgentCapabilityStatus,
@@ -1717,13 +1717,41 @@ fn single_agent_status_collection(snapshot: AgentStatusSnapshot) -> AgentStatusC
     }
 }
 
+// One failure latch per read stage, never per account or slot.
+fn note_codex_scope_read(
+    stage: usize,
+    error: Option<&CodexAccountSlotSettingsError>,
+    skipped: usize,
+) {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    static FAILED: [AtomicBool; 3] = [const { AtomicBool::new(false) }; 3];
+    if FAILED[stage].swap(error.is_some(), Relaxed) != error.is_some() {
+        let kind = match error {
+            None => "none",
+            Some(CodexAccountSlotSettingsError::Invalid(_)) => "validation",
+            Some(CodexAccountSlotSettingsError::State(message))
+                if message.starts_with("parse settings:") =>
+            {
+                "parse"
+            }
+            // The core API erases io::ErrorKind into this opaque variant.
+            Some(CodexAccountSlotSettingsError::State(_)) => "state",
+        };
+        eprintln!(
+            "warning: codex_scope_read stage={} failed={} error_kind={kind} skipped={skipped}",
+            ["roster", "registered_bindings", "slot_home"][stage],
+            error.is_some()
+        );
+    }
+}
+
 fn collect_codex_status_snapshots(
     captured_at: String,
     expires_at: String,
 ) -> AgentStatusCollection {
-    let settings = FileCodexAccountSlotSettingsStore::default()
-        .load()
-        .unwrap_or_else(|_| empty_codex_accounts_status());
+    let settings = FileCodexAccountSlotSettingsStore::default().load();
+    note_codex_scope_read(0, settings.as_ref().err(), usize::from(settings.is_err()));
+    let settings = settings.unwrap_or_else(|_| empty_codex_accounts_status());
     let (mut status, mut candidates) =
         collect_codex_slot_candidates(settings, &captured_at, &expires_at);
     canonicalize_codex_candidates(&mut candidates);
@@ -2529,6 +2557,11 @@ fn codex_home_slots_checked(status: &CodexAccountsStatusV1) -> (Vec<CodexHomeSlo
     }];
     let registered = store.registered_bindings();
     let mut complete = registered.is_ok();
+    let skipped_bindings = status.managed_slots.len() * usize::from(!complete);
+    note_codex_scope_read(1, registered.as_ref().err(), skipped_bindings);
+    let bindings_read = complete;
+    let mut home_error = None;
+    let mut skipped = 0;
     let registered = registered
         .unwrap_or_default()
         .into_iter()
@@ -2537,9 +2570,14 @@ fn codex_home_slots_checked(status: &CodexAccountsStatusV1) -> (Vec<CodexHomeSlo
         .collect::<BTreeMap<_, _>>();
     for descriptor in &status.managed_slots {
         if let Some(binding) = registered.get(&descriptor.slot_id) {
-            let Ok(home) = store.slot_home(&descriptor.slot_id) else {
-                complete = false;
-                continue;
+            let home = match store.slot_home(&descriptor.slot_id) {
+                Ok(home) => home,
+                Err(error) => {
+                    complete = false;
+                    skipped += 1;
+                    home_error.get_or_insert(error);
+                    continue;
+                }
             };
             slots.push(CodexHomeSlot {
                 slot_id: descriptor.slot_id.clone(),
@@ -2551,6 +2589,9 @@ fn codex_home_slots_checked(status: &CodexAccountsStatusV1) -> (Vec<CodexHomeSlo
                 )),
             });
         }
+    }
+    if bindings_read {
+        note_codex_scope_read(2, home_error.as_ref(), skipped);
     }
     (slots, complete)
 }
