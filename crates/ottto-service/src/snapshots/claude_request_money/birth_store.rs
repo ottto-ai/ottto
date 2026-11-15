@@ -1,6 +1,6 @@
 //! Claude-only physical births and move cutoffs, independent of upload settlement.
 //! Sorted boxed slices avoid path strings and per-node/spare capacity overhead.
-use crate::snapshots::claude_context_file_birth::ClaudeOpenedBirth;
+use crate::snapshots::sources::claude::context_file_birth::ClaudeOpenedBirth;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
@@ -719,7 +719,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<(LocationKey, u8)>(), 17);
         println!("F1C_COUNT_SIZE birth_identity_bytes={} transient_probe_bytes={} opened_metadata_bytes={} claude_file_birth_bytes={} old_writer_run_bytes={}",
             std::mem::size_of::<BirthIdentity>(), std::mem::size_of::<(LocationKey, u8)>(),
-            std::mem::size_of::<ClaudeOpenedBirth>(), std::mem::size_of::<crate::snapshots::claude_context_file_birth::ClaudeFileBirth>(),
+            std::mem::size_of::<ClaudeOpenedBirth>(), std::mem::size_of::<crate::snapshots::sources::claude::context_file_birth::ClaudeFileBirth>(),
             std::mem::size_of::<Option<(u8, u64)>>());
     }
 

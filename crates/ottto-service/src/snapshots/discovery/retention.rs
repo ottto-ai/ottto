@@ -43,7 +43,7 @@ impl<'a> DiscoveryRetention<'a> {
         path: &Path,
         len: u64,
         modified: u64,
-        stamp: Option<codex_fragment::Stamp>,
+        stamp: Option<sources::codex::eof_fragment::Stamp>,
     ) {
         let key = local_index_key(path);
         if self.account_holds.contains_key(&key) {
@@ -57,7 +57,7 @@ impl<'a> DiscoveryRetention<'a> {
             if self
                 .files
                 .get(&key)
-                .is_some_and(|entry| codex_fragment::grown(entry, len, stamp))
+                .is_some_and(|entry| sources::codex::eof_fragment::grown(entry, len, stamp))
             {
                 page.observe_stamped(key, len, modified, stamp);
             }
@@ -75,12 +75,12 @@ impl<'a> DiscoveryRetention<'a> {
         source: SnapshotSource,
         path: &Path,
         current_len: u64,
-        stamp: Option<codex_fragment::Stamp>,
+        stamp: Option<sources::codex::eof_fragment::Stamp>,
     ) -> bool {
         let grown = self
             .files
             .get(&local_index_key(path))
-            .is_some_and(|entry| codex_fragment::grown(entry, current_len, stamp));
+            .is_some_and(|entry| sources::codex::eof_fragment::grown(entry, current_len, stamp));
         if grown {
             crate::local_resource_diagnostics::discovery_retained_grown(source.api_slug());
         }
