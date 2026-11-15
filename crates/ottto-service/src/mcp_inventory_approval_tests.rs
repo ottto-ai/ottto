@@ -354,3 +354,93 @@ fn a_local_scope_server_wins_over_an_approved_project_server_of_the_same_name() 
         let _ = fs::remove_dir_all(&home);
     }
 }
+
+#[test]
+fn enable_all_false_in_the_projects_settings_keeps_project_servers_pending() {
+    for file in ["settings.local.json", "settings.json"] {
+        // Home settings enable all; the project's own file turns it off.
+        let (home, project, marker) = approval_home(
+            &format!("approval-project-false-{file}"),
+            json!({"hasTrustDialogAccepted": true}),
+        );
+        write_json(
+            &home.join(".claude").join("settings.json"),
+            json!({"enableAllProjectMcpServers": true}),
+        );
+        write_json(
+            &project.join(".claude").join(file),
+            json!({"enableAllProjectMcpServers": false}),
+        );
+        assert!(project_server(&home).disabled, "{file}");
+        assert!(!started(&home, &marker), "{file}");
+
+        // A named approval in home settings still loads the server.
+        write_json(
+            &home.join(".claude").join("settings.json"),
+            json!({"enableAllProjectMcpServers": true, "enabledMcpjsonServers": ["project-srv"]}),
+        );
+        assert!(!project_server(&home).disabled, "{file}");
+        assert!(started(&home, &marker), "{file}");
+        let _ = fs::remove_dir_all(&home);
+    }
+}
+
+#[test]
+fn a_missing_project_directory_declares_no_project_servers() {
+    let home = test_home("approval-missing-project");
+    let gone = home.join("gone");
+    write_json(
+        &home.join(".claude.json"),
+        json!({"projects": {gone.to_string_lossy(): {
+            "hasTrustDialogAccepted": true,
+            "enableAllProjectMcpServers": true,
+            "mcpServers": {"local-srv": {"command": "/user/local"}},
+        }}}),
+    );
+    let servers = discover_claude_code(&home);
+    assert_eq!(
+        servers
+            .iter()
+            .map(|server| (server.name.as_str(), server.disabled))
+            .collect::<Vec<_>>(),
+        [("local-srv", false)]
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn the_first_approved_project_server_keeps_a_shared_name() {
+    let home = test_home("approval-two-projects");
+    let markers = [home.join("a-started"), home.join("b-started")];
+    let mut projects = Map::new();
+    for (dir, marker) in ["a-proj", "b-proj"].into_iter().zip(&markers) {
+        let dir = home.join(dir);
+        write_json(
+            &dir.join(".mcp.json"),
+            json!({"mcpServers": {"dup": {
+                "command": "/usr/bin/touch",
+                "args": [marker.to_string_lossy()],
+            }}}),
+        );
+        projects.insert(
+            dir.to_string_lossy().into_owned(),
+            json!({"hasTrustDialogAccepted": true, "enabledMcpjsonServers": ["dup"]}),
+        );
+    }
+    write_json(&home.join(".claude.json"), json!({"projects": projects}));
+
+    let server = discover_claude_code(&home)
+        .into_iter()
+        .find(|server| server.name == "dup")
+        .expect("dup");
+    assert!(!server.disabled);
+    let (_input, deferred) = harvest_server(&server, &test_spawn_env());
+    assert!(!deferred);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !markers[0].exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(markers[0].exists(), "the first project's command is probed");
+    assert!(!markers[1].exists(), "a later project does not replace it");
+    let _ = fs::remove_dir_all(&home);
+}

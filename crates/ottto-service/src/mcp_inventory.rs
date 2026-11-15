@@ -692,12 +692,19 @@ fn server_names(value: &Value, key: &str) -> Vec<String> {
 /// It loads one only after the user trusts the project folder
 /// (`hasTrustDialogAccepted` on the project's `~/.claude.json` entry) and
 /// approves the server, by name in an `enabledMcpjsonServers` array or for
-/// every project server with `enableAllProjectMcpServers` (an explicit `false`
-/// in any scope keeps it off). `approvals` holds only state kept in the user's
-/// home: the user settings files and the project's `~/.claude.json` entry;
-/// settings files inside the project are not read for this. A server that is
-/// not approved stays pending in the client and is never started.
-fn project_server_approved(name: &str, project_cfg: &Value, approvals: &[&Value]) -> bool {
+/// every project server with `enableAllProjectMcpServers`. `approvals` holds
+/// only state kept in the user's home: the user settings files and the
+/// project's `~/.claude.json` entry. The project's own settings files
+/// (`project_settings`) never approve, but their explicit
+/// `enableAllProjectMcpServers: false`, like one in any scope, keeps
+/// enable-all off. A server that is not approved stays pending in the client
+/// and is never started.
+fn project_server_approved(
+    name: &str,
+    project_cfg: &Value,
+    approvals: &[&Value],
+    project_settings: &[Value],
+) -> bool {
     let enable_all = |scope: &&Value| {
         scope
             .get("enableAllProjectMcpServers")
@@ -714,7 +721,9 @@ fn project_server_approved(name: &str, project_cfg: &Value, approvals: &[&Value]
         .any(|scope| enable_all(scope) == Some(true))
         && !approvals
             .iter()
-            .any(|scope| enable_all(scope) == Some(false));
+            .copied()
+            .chain(project_settings)
+            .any(|scope| enable_all(&scope) == Some(false));
     project_cfg
         .get("hasTrustDialogAccepted")
         .and_then(Value::as_bool)
@@ -823,6 +832,11 @@ fn discover_claude_code(home: &Path) -> Vec<ConfiguredServer> {
                 if let Some(dot_mcp) = load_json(&Path::new(project_dir).join(".mcp.json")) {
                     let approvals: Vec<&Value> =
                         user_settings.iter().chain([project_cfg]).collect();
+                    let project_settings: Vec<Value> =
+                        claude_project_settings(Path::new(project_dir))
+                            .iter()
+                            .filter_map(|path| load_json(path))
+                            .collect();
                     for (name, cfg) in mcp_servers_block(&dot_mcp) {
                         let Some(mut server) =
                             normalize_claude_server(name, cfg, Some(Path::new(project_dir)))
@@ -833,7 +847,8 @@ fn discover_claude_code(home: &Path) -> Vec<ConfiguredServer> {
                         if servers.contains_key(name) && !pending.contains(name) {
                             continue;
                         }
-                        if project_server_approved(name, project_cfg, &approvals) {
+                        if project_server_approved(name, project_cfg, &approvals, &project_settings)
+                        {
                             pending.remove(name);
                             servers.insert(name.clone(), server);
                         } else if !servers.contains_key(name) {
