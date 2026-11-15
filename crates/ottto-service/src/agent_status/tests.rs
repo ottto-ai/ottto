@@ -3332,6 +3332,350 @@ fn codex_status_reads_serve_the_saved_reading_and_never_start_app_server() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// The canonical hashes of the synthetic install's login, spelled out with
+/// the core recipe rather than the collector's helper.
+fn synthetic_codex_canonical_pair() -> (Option<String>, Option<String>) {
+    (
+        billing_identity_hash("openai", "account", "synthetic-user"),
+        billing_identity_hash("openai", "workspace", "synthetic-workspace"),
+    )
+}
+
+fn codex_account_pair(account: &AgentAccountStatus) -> (Option<String>, Option<String>) {
+    (
+        account.account_identifier_hash.clone(),
+        account.organization_identifier_hash.clone(),
+    )
+}
+
+fn codex_row_pair(row: &AgentStatusPlanObservation) -> (Option<String>, Option<String>) {
+    (
+        row.account_identifier_hash.clone(),
+        row.organization_identifier_hash.clone(),
+    )
+}
+
+/// `filled` is `raw` with `pair` added on the account and every plan row,
+/// and those rows' currentness left unsaid; nothing else differs.
+fn assert_canonical_fill_of(
+    raw: &AgentStatusSnapshot,
+    filled: &AgentStatusSnapshot,
+    pair: &(Option<String>, Option<String>),
+) {
+    let mut expected = raw.clone();
+    let account = expected.account.as_mut().expect("account");
+    account.account_identifier_hash = pair.0.clone();
+    account.organization_identifier_hash = pair.1.clone();
+    assert!(!expected.plan_observations.is_empty(), "a plan row");
+    for row in &mut expected.plan_observations {
+        row.account_identifier_hash = pair.0.clone();
+        row.organization_identifier_hash = pair.1.clone();
+        row.is_current = None;
+    }
+    assert_eq!(filled, &expected);
+}
+
+/// [money] A default login read only from its id token (no saved reading
+/// yet: first pairing, setup, a login change) carries raw ids and no
+/// hashes. Source health, which a setup scan posts, and the main lane with
+/// no bound home both send it with the canonical hashes the provider read
+/// then validates as the binding: Low confidence and billing identity kept,
+/// currentness unsaid, nothing bound, no provider read. The bound reading
+/// after that read is sent unchanged.
+#[cfg(unix)]
+#[test]
+#[serial]
+fn a_raw_only_default_codex_login_is_sent_with_canonical_hashes() {
+    let (root, home, _guards) = synthetic_default_codex_install("canonical-default-only");
+    let (captured, expires) = ("2026-08-26T00:00:00Z", "2026-08-26T00:15:00Z");
+    let pair = synthetic_codex_canonical_pair();
+    let before = codex_app_server_runs();
+
+    let unread = collect_codex_home_candidate(
+        default_codex_slot(&home),
+        captured,
+        expires,
+        CodexQuotaRead::Saved,
+    );
+    assert!(unread.binding.is_none());
+    let account = unread.snapshot.account.as_ref().expect("id-token account");
+    assert_eq!(account.account_id.as_deref(), Some("synthetic-user"));
+    assert_eq!(
+        account.organization_id.as_deref(),
+        Some("synthetic-workspace")
+    );
+    assert_eq!(codex_account_pair(account), (None, None));
+    assert_eq!(account.confidence, AgentStatusConfidence::Low);
+    assert!(!unread.snapshot.plan_observations.is_empty());
+    for row in &unread.snapshot.plan_observations {
+        assert_eq!(codex_row_pair(row), (None, None));
+        assert_eq!(row.is_current, Some(false));
+    }
+
+    // Source health (the setup scan's body); the same bytes when repeated.
+    let health = codex_source_health_snapshot(std::slice::from_ref(&unread), captured, expires);
+    assert_canonical_fill_of(&unread.snapshot, &health, &pair);
+    assert_eq!(
+        codex_source_health_snapshot(std::slice::from_ref(&unread), captured, expires),
+        health
+    );
+    let uploaded = health.redacted_for_backend();
+    let account = uploaded.account.as_ref().expect("uploaded account");
+    assert_eq!(codex_account_pair(account), pair);
+    assert_eq!(account.confidence, AgentStatusConfidence::Low);
+    assert_eq!(
+        account.billing_identity_confidence,
+        AgentStatusConfidence::Low
+    );
+    assert!(!uploaded.plan_observations.is_empty());
+    for row in &uploaded.plan_observations {
+        assert_eq!(codex_row_pair(row), pair);
+        assert_eq!(row.confidence, AgentStatusConfidence::Low);
+        assert_eq!(row.billing_identity_confidence, AgentStatusConfidence::Low);
+        assert_eq!(row.is_current, None);
+    }
+
+    // The main lane with no bound home uploads that same source health.
+    let collection = collect_agent_status_collection(
+        &SourceKind::Codex,
+        captured.to_string(),
+        expires.to_string(),
+    );
+    assert!(
+        collection.codex_home_bindings.is_empty(),
+        "nothing is bound"
+    );
+    assert_eq!(
+        collection.snapshots,
+        vec![collection.source_health_snapshot.clone()]
+    );
+    let main = collection.snapshots[0].clone().redacted_for_backend();
+    assert_eq!(
+        codex_account_pair(main.account.as_ref().expect("account")),
+        pair
+    );
+    assert!(!main.plan_observations.is_empty());
+    for row in &main.plan_observations {
+        assert_eq!(codex_row_pair(row), pair);
+        assert_eq!(row.is_current, None);
+    }
+    assert_eq!(codex_app_server_runs(), before, "no provider read");
+
+    // Low, then High: the provider read validates exactly that pair, and its
+    // bound reading is already canonical, so it is sent as it is.
+    let fresh = collect_codex_home_candidate(
+        default_codex_slot(&home),
+        captured,
+        expires,
+        CodexQuotaRead::Provider,
+    );
+    assert_eq!(codex_app_server_runs(), before + 1);
+    assert_eq!(
+        fresh
+            .binding
+            .clone()
+            .map(|(account, workspace)| (Some(account), Some(workspace))),
+        Some(pair.clone())
+    );
+    let mut bound = fresh.snapshot.clone();
+    codex_canonical_identity_spelling(&mut bound);
+    assert_eq!(bound, fresh.snapshot);
+
+    if let Some((account, workspace)) = fresh.binding.as_ref() {
+        codex_credit_grants::forget_binding_cadence(&codex_credit_grants::binding_key(
+            account, workspace,
+        ));
+    }
+    drop(_guards);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// [money] The same login in a bound managed home and an unread default:
+/// whichever reading source health sends names the managed home's binding,
+/// so the backend files both under one identity. The anchor's own reading,
+/// the one the main lane uploads, is unchanged; no provider read.
+#[cfg(unix)]
+#[test]
+#[serial]
+fn a_raw_only_default_names_the_pair_its_managed_home_binds() {
+    use super::codex_login_oracle_support::{save_read, ProviderRead};
+    let (root, home, _guards) = synthetic_default_codex_install("canonical-same-pair");
+    let (captured, expires) = ("2026-08-26T00:00:00Z", "2026-08-26T00:15:00Z");
+    let pair = synthetic_codex_canonical_pair();
+    let managed_home = root.join("managed");
+    crate::test_scratch::create_private_dir(&managed_home).expect("managed home");
+    std::fs::create_dir(managed_home.join("sessions")).expect("sessions");
+    std::fs::copy(home.join("auth.json"), managed_home.join("auth.json")).expect("same login");
+    std::fs::write(managed_home.join("config.toml"), "model = \"gpt-5.2\"\n").expect("config");
+    for name in ["auth.json", "config.toml"] {
+        std::fs::set_permissions(
+            managed_home.join(name),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .expect("owner-only");
+    }
+    save_read(
+        &managed_home,
+        || {},
+        ProviderRead::Bound(pair.0.clone().unwrap(), pair.1.clone().unwrap(), 0),
+    );
+    let before = codex_app_server_runs();
+
+    let managed = collect_codex_home_candidate(
+        CodexHomeSlot {
+            slot_id: "codex_slot_a".to_string(),
+            ownership: CodexAccountSlotOwnershipV1::Managed,
+            home: managed_home.clone(),
+            registered_binding: None,
+        },
+        captured,
+        expires,
+        CodexQuotaRead::Saved,
+    );
+    let default = collect_codex_home_candidate(
+        default_codex_slot(&home),
+        captured,
+        expires,
+        CodexQuotaRead::Saved,
+    );
+    assert_eq!(
+        managed
+            .binding
+            .clone()
+            .map(|(account, workspace)| (Some(account), Some(workspace))),
+        Some(pair.clone())
+    );
+    assert!(default.binding.is_none());
+    let mut candidates = vec![default, managed];
+    canonicalize_codex_candidates(&mut candidates);
+    let anchor = candidates
+        .iter()
+        .find(|candidate| candidate.slot.slot_id == "codex_slot_a")
+        .expect("managed candidate")
+        .snapshot
+        .clone();
+    let bindings = candidates
+        .iter()
+        .map(|candidate| candidate.binding.clone())
+        .collect::<Vec<_>>();
+
+    let health = codex_source_health_snapshot(&candidates, captured, expires);
+    assert_eq!(
+        codex_account_pair(health.account.as_ref().expect("account")),
+        pair
+    );
+    assert!(!health.plan_observations.is_empty());
+    for row in &health.plan_observations {
+        assert_eq!(codex_row_pair(row), pair);
+    }
+    let mut sent = anchor.clone();
+    codex_canonical_identity_spelling(&mut sent);
+    assert_eq!(sent, anchor);
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|candidate| candidate.binding.clone())
+            .collect::<Vec<_>>(),
+        bindings
+    );
+    assert_eq!(codex_app_server_runs(), before, "no provider read");
+
+    drop(_guards);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// [money] The fill only adds what is absent. Bound, failed-default and
+/// configured-unavailable Codex bodies, and Claude and Pi bodies, are
+/// byte-identical; a present hash is never replaced, even one that is not
+/// its raw id's canonical spelling. Account and workspace fill on their own.
+#[test]
+fn canonical_codex_identity_fill_adds_only_absent_codex_hashes() {
+    let unchanged = |snapshot: &AgentStatusSnapshot| {
+        let mut filled = snapshot.clone();
+        codex_canonical_identity_spelling(&mut filled);
+        assert_eq!(&filled, snapshot);
+        assert_eq!(
+            serde_json::to_vec(&filled.redacted_for_backend()).unwrap(),
+            serde_json::to_vec(&snapshot.clone().redacted_for_backend()).unwrap()
+        );
+    };
+    let with_raw_ids = |mut snapshot: AgentStatusSnapshot| {
+        let account = snapshot.account.as_mut().expect("account");
+        account.account_id = Some("raw-user".to_string());
+        account.organization_id = Some("raw-workspace".to_string());
+        append_current_plan_observation(&mut snapshot);
+        snapshot
+    };
+
+    let bound = with_raw_ids(
+        codex_candidate_for_test(
+            "default",
+            CodexAccountSlotOwnershipV1::Default,
+            "kept_user",
+            "kept_workspace",
+            5,
+        )
+        .snapshot,
+    );
+    assert!(!bound.plan_observations.is_empty());
+    unchanged(&bound);
+    unchanged(&with_raw_ids(
+        failed_default_with_kept_hashes("default_user").snapshot,
+    ));
+    let mut unavailable = codex_candidate_for_test(
+        "codex_slot_a",
+        CodexAccountSlotOwnershipV1::Managed,
+        "account-a",
+        "workspace-a",
+        1,
+    );
+    unavailable.binding = None;
+    unavailable.status = CodexAccountSlotCollectionStatusV1::default();
+    unavailable.snapshot.account = None;
+    unchanged(&configured_unavailable_snapshot(unavailable));
+
+    let mut raw_only = bound.clone();
+    let account = raw_only.account.as_mut().expect("account");
+    account.account_identifier_hash = None;
+    account.organization_identifier_hash = None;
+    for row in &mut raw_only.plan_observations {
+        row.account_identifier_hash = None;
+        row.organization_identifier_hash = None;
+    }
+    for source in [SourceKind::ClaudeCode, SourceKind::Pi] {
+        let mut other = raw_only.clone();
+        other.source = source;
+        unchanged(&other);
+    }
+
+    let mut half = bound.clone();
+    half.account
+        .as_mut()
+        .expect("account")
+        .organization_identifier_hash = None;
+    for row in &mut half.plan_observations {
+        row.organization_identifier_hash = None;
+    }
+    codex_canonical_identity_spelling(&mut half);
+    let expected = (
+        Some("kept_user".to_string()),
+        billing_identity_hash("openai", "workspace", "raw-workspace"),
+    );
+    assert_eq!(
+        codex_account_pair(half.account.as_ref().expect("account")),
+        expected
+    );
+    for (row, original) in half.plan_observations.iter().zip(&bound.plan_observations) {
+        assert_eq!(codex_row_pair(row), expected);
+        assert_eq!(row.is_current, None);
+        assert_eq!(row.confidence, original.confidence);
+        assert_eq!(
+            row.billing_identity_evidence,
+            original.billing_identity_evidence
+        );
+    }
+}
+
 /// The explicit refresh reads now, at most once a minute per home; the
 /// schedule reads an unused home again only after the unused interval.
 #[cfg(unix)]

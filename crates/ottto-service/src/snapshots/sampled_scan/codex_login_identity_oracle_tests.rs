@@ -606,6 +606,37 @@ fn codex_login_identity_rows_bind_through_the_status_lane() {
     }
 }
 
+/// The status the lane collected names each account it carries in the
+/// canonical spelling: every raw id travels with its own canonical hash.
+fn assert_canonical_status(collected: &AgentStatusCollection) {
+    let health = &collected.source_health_snapshot;
+    let account = health.account.iter().map(|a| {
+        [
+            ("account", &a.account_id, &a.account_identifier_hash),
+            (
+                "workspace",
+                &a.organization_id,
+                &a.organization_identifier_hash,
+            ),
+        ]
+    });
+    let rows = health.plan_observations.iter().map(|r| {
+        [
+            ("account", &r.account_id, &r.account_identifier_hash),
+            (
+                "workspace",
+                &r.organization_id,
+                &r.organization_identifier_hash,
+            ),
+        ]
+    });
+    for (kind, raw, hashed) in account.chain(rows).flatten() {
+        if let Some(raw) = raw {
+            assert_eq!(hashed.as_deref(), Some(hash(kind, raw).as_str()), "{kind}");
+        }
+    }
+}
+
 /// [money] The positive control: two accounts, one user in two workspaces
 /// (T5), a read gap that recovers on the same file (T9), and a `codex login`
 /// switch in the middle of a session (T10). Its parent spawns side calls in
@@ -643,6 +674,7 @@ fn codex_login_switch_gap_and_twin_workspaces_match_cold_full() {
         side_call(switch, &s5, &s1, "2026-10-27T07:05:00Z"),
     ];
     let collected = status::collection(homes.as_slice());
+    assert_canonical_status(&collected);
     // T5: one user, two workspaces, two homes: two bindings, never shared.
     let bindings = collected
         .codex_home_bindings
@@ -681,6 +713,7 @@ fn codex_login_switch_gap_and_twin_workspaces_match_cold_full() {
     grow(&sessions);
     side_call(switch, &s4, &s1, "2026-10-27T07:45:00Z");
     let collected = status::collection(homes.as_slice());
+    assert_canonical_status(&collected);
     let (routes, owners, ram) = routes(&c, &mut disk, &scanner, &roots, &prior, &collected);
     let expected = BTreeMap::from([
         (s1.clone(), u.clone()),
