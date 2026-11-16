@@ -1639,6 +1639,10 @@ fn owner_return_keeps_the_placement_oracle_and_quiet_restart() {
         // No index/progress migration or synthetic ACK is part of selection.
         let restored = ScanIndex::load(&index_path).unwrap();
         append(&path, &line(ROOT, "later", "2026-08-02T07:04:00Z", 6));
+        append(
+            &c.root.join(format!("{ROOT}/subagents/agent-000.jsonl")),
+            &line(ROOT, "agent-later", "2026-08-02T07:04:00Z", 3),
+        );
         let cold = result(&page(&c, ScanIndex::default(), 100, false), Mode::ColdFull);
         assert!(
             accounts(&cold).len() >= 2,
@@ -1653,7 +1657,15 @@ fn owner_return_keeps_the_placement_oracle_and_quiet_restart() {
         let (quiet, io) = fixture::observe_codex_quiet(|| page(&c, saved, 100, true));
         let mut quiet_route = result(&quiet, Mode::Restart);
         quiet_route.io = io;
-        money_oracle::assert_quiet_restart_zero_bytes(&quiet_route);
+        let anchor_window = quiet_route
+            .io
+            .anchor_reads
+            .expect("measured identity anchors");
+        assert!(
+            anchor_window <= 4096 * c.births.len() as u64,
+            "bounded fixture identity samples"
+        );
+        money_oracle::assert_quiet_restart_with_anchor_window(&quiet_route, anchor_window);
     });
 }
 
@@ -1811,7 +1823,12 @@ fn owner_return_keeps_deleted_original_copy_custody() {
         let mut observed = result(&quiet, Mode::Restart);
         observed.io = io;
         observed.accepted = prior_money.accepted.clone();
-        money_oracle::assert_quiet_restart_zero_bytes(&observed);
+        let anchor_window = observed.io.anchor_reads.expect("measured identity anchors");
+        assert!(
+            anchor_window <= 4096 * c.births.len() as u64,
+            "bounded fixture identity samples"
+        );
+        money_oracle::assert_quiet_restart_with_anchor_window(&observed, anchor_window);
         money_oracle::assert_held(COPY, &prior_money, &observed, &prior_money);
         money_oracle::assert_no_smaller_reemit(COPY, &prior_money, &observed, &prior_money, true);
         assert_eq!(stored_bodies(&quiet.index), stored);

@@ -433,7 +433,7 @@ fn owner_return_preserves_all_source_carry() {
                 })
             })
         };
-        let before = sources.map(|source| {
+        let mut before = sources.map(|source| {
             let (bodies, bytes) = cycle(&device_a, &secret_a, source);
             assert!(bytes > 0);
             assert_eq!(
@@ -466,6 +466,33 @@ fn owner_return_preserves_all_source_carry() {
             .unwrap()
             .set_modified(UNIX_EPOCH + Duration::from_secs(now - 61 * 86400))
             .unwrap();
+        // A timestamp rewrite is a real changed-input cause. Settle that
+        // ordinary A work before the switch, then compare a quiet return.
+        // Aging the file must not masquerade as unchanged input.
+        let (touched, _) = cycle(&device_a, &secret_a, SnapshotSource::ClaudeCode);
+        for body in touched {
+            assert_eq!(
+                body["source_session_id"], OLD,
+                "only the touched old file is owed"
+            );
+            let saved = before[0]
+                .iter_mut()
+                .find(|prior| prior["source_session_id"] == OLD)
+                .unwrap();
+            for field in crate::snapshots::sampled_scan::transition_fixture::money_oracle::FIELDS {
+                assert_eq!(
+                    body[*field], saved[*field],
+                    "metadata touch conserves {field}"
+                );
+            }
+            *saved = body;
+        }
+        let (quiet, bytes) = cycle(&device_a, &secret_a, SnapshotSource::ClaudeCode);
+        assert!(quiet.is_empty());
+        assert_eq!(
+            bytes, 0,
+            "uninterrupted A is quiet after the metadata touch"
+        );
         std::fs::remove_dir_all(&repository).unwrap();
         if replay_bump {
             let source = SnapshotSource::Pi;
