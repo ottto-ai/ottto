@@ -83,7 +83,7 @@ impl Mac {
         Self::with(Collector::new(
             GrantStore::new(dir.join(GRANT_FILE)),
             StateStore::new(dir.join(STATE_FILE)),
-            dir.join(SENTINEL_FILE),
+            support.join(SENTINEL_FILE),
         ))
     }
 
@@ -115,7 +115,13 @@ impl Mac {
     }
 
     fn fold_page(&self, page: &Page<'_>, now: u64) {
-        account_activity::fold(&self.store, self.collector.grants(), page, now);
+        account_activity::fold(
+            &self.store,
+            self.collector.grants(),
+            &self.collector.sentinel,
+            page,
+            now,
+        );
     }
 
     fn fold(&self, now: u64, snapshots: &[SnapshotItem]) {
@@ -466,7 +472,7 @@ fn a_paused_or_resumed_codex_scan_is_never_idle() {
 #[test]
 fn consent_loss_and_a_new_epoch_restart_the_observation() {
     let login = identified(USER, WORKSPACE, false);
-    for case in ["consent lost and back", "new epoch"] {
+    for case in ["consent lost and back", "local off switch", "new epoch"] {
         let mac = Mac::new("idle-consent");
         let discovery = mac.discovery(vec![login.clone()]);
         let start = t0();
@@ -474,9 +480,21 @@ fn consent_loss_and_a_new_epoch_restart_the_observation() {
         mac.observe(start + HOUR, start + 80 * HOUR);
         assert!(mac.idle(&discovery, &login, start + 80 * HOUR), "{case}");
         let back = start + 81 * HOUR;
-        if case == "consent lost and back" {
+        if case != "new epoch" {
+            let off = |on: bool| {
+                if case == "local off switch" {
+                    if on {
+                        fs::write(&mac.collector.sentinel, b"").unwrap();
+                    } else {
+                        fs::remove_file(&mac.collector.sentinel).unwrap();
+                    }
+                }
+            };
             let grant = fs::read(mac.collector.grants().path()).unwrap();
-            fs::remove_file(mac.collector.grants().path()).unwrap();
+            if case == "consent lost and back" {
+                fs::remove_file(mac.collector.grants().path()).unwrap();
+            }
+            off(true);
             mac.fold(back, &[session(SECOND_USER, SECOND_WORKSPACE, Some(back))]);
             let raw = mac.raw();
             assert_eq!(raw["binding"], Value::Null, "{case}: proof dropped");
@@ -484,8 +502,9 @@ fn consent_loss_and_a_new_epoch_restart_the_observation() {
             assert_eq!(
                 raw["activity"].as_object().map(|map| map.len()),
                 Some(1),
-                "kept, none added"
+                "{case}: kept, none added"
             );
+            off(false);
             fs::write(mac.collector.grants().path(), grant).unwrap();
         } else {
             let local = mac.collector.grants().load().unwrap().unwrap();
@@ -877,6 +896,49 @@ fn every_failed_idle_read_is_retried_at_six_hours() {
             SIX_HOUR_DUE
         };
         assert!(band.contains(&due), "{case}: next due in {due}");
+        // Exits that leave the grant and breaker usable: the retry fires at
+        // its deadline, fails again and is re-armed; a later success clears
+        // it and the login is daily again.
+        if ![
+            "provider unavailable",
+            "response shape",
+            "normalize failure",
+            "upload unavailable",
+            "ack invalid",
+        ]
+        .contains(&case)
+        {
+            continue;
+        }
+        let retry = attempt + due;
+        mac.observe(attempt + HOUR, retry);
+        let instant = at(retry);
+        mac.collector.run_tick(
+            &runtime(),
+            &discovery,
+            reader.as_ref(),
+            transport.as_ref(),
+            &move || instant,
+        );
+        let state = mac.entry(ACCOUNT_SCOPE);
+        assert_eq!(state.last_fetch_epoch_seconds, retry, "{case}: retried");
+        let due = next_due_at(&state, &state.identity, true) - retry;
+        assert!(SIX_HOUR_DUE.contains(&due), "{case}: re-armed in {due}");
+        let after = retry + due;
+        mac.observe(retry + HOUR, after);
+        let instant = at(after);
+        let cycle = mac.collector.run_tick(
+            &runtime(),
+            &discovery,
+            &StaticReader::new(poisoned_payload()),
+            &RecordingTransport::default(),
+            &move || instant,
+        );
+        assert_eq!(cycle.accounts[0].reason, Some("ok"), "{case}");
+        let state = mac.entry(ACCOUNT_SCOPE);
+        assert_eq!(state.retry_due_epoch_seconds, 0, "{case}: cleared");
+        let due = next_due_at(&state, &state.identity, true) - after;
+        assert!(DAILY_DUE.contains(&due), "{case}: daily again in {due}");
     }
 
     // Suppressed: no success or proof, the retry is cleared with a save.
@@ -1175,10 +1237,11 @@ impl ProviderDailyUsageReader for ScopedOutcomeReader {
 }
 
 /// [behaviour] A map this process could not replace is distrusted, so every
-/// login is active, also after a restart when the old file survived; the
-/// next write is a full reset that alone restores trust. Folds missed under
-/// an older build leave the disclosed residual: a gap barrier, then idle
-/// again on the next clean generation.
+/// login is active, even while the old file survives; the next write is a
+/// full reset that alone restores trust. Two accepted, disclosed residuals:
+/// folds missed under an older build (a gap barrier, then idle again on the
+/// next clean generation), and an old file that survived a failed write and
+/// a failed removal is trusted again after a restart.
 #[test]
 fn a_failed_map_write_distrusts_it_until_a_full_reset() {
     let login = identified(USER, WORKSPACE, false);
@@ -1193,17 +1256,14 @@ fn a_failed_map_write_distrusts_it_until_a_full_reset() {
     fs::create_dir(mac.store_path()).unwrap();
     mac.fold(start + 81 * HOUR, &[]);
     fs::remove_dir(mac.store_path()).unwrap();
-    assert!(mac.store.load_trusted().is_none(), "distrusted");
-    // The old file survived the failed write, and the daemon restarted.
+    // The old file survived the failed write.
     fs::write(mac.store_path(), &old).unwrap();
-    mac.store.forget_process_distrust();
-    assert!(mac.store.load_trusted().is_none(), "still distrusted");
+    assert!(mac.store.load_trusted().is_none(), "distrusted");
     mac.fold(start + 82 * HOUR, &[]);
     assert!(
         mac.store.load_trusted().is_some(),
         "trusted after the reset write"
     );
-    assert!(!mac.store_path().with_extension("distrusted").exists());
     assert!(
         !mac.idle(&discovery, &login, start + 82 * HOUR),
         "72 h again"
@@ -1218,6 +1278,21 @@ fn a_failed_map_write_distrusts_it_until_a_full_reset() {
     assert!(
         mac.idle(&discovery, &login, start + 165 * HOUR),
         "disclosed residual"
+    );
+
+    // The write and the removal both fail, then the daemon restarts: the old
+    // file is trusted again.
+    let old = fs::read(mac.store_path()).unwrap();
+    fs::remove_file(mac.store_path()).unwrap();
+    fs::create_dir(mac.store_path()).unwrap();
+    mac.fold(start + 166 * HOUR, &[]);
+    fs::remove_dir(mac.store_path()).unwrap();
+    fs::write(mac.store_path(), &old).unwrap();
+    assert!(!mac.idle(&discovery, &login, start + 166 * HOUR));
+    mac.store.forget_process_distrust();
+    assert!(
+        mac.idle(&discovery, &login, start + 166 * HOUR),
+        "accepted residual after a restart"
     );
 }
 

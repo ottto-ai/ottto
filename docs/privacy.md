@@ -371,9 +371,13 @@ setting, exclude the account signed in to Codex's default sign-in there, or
 create `~/Library/Application Support/Ottto/codex-daily-aggregates-disabled` to
 stop reads on this Mac.
 To pick that pace, the Mac keeps a local file of when each Codex account and
-workspace (as SHA-256 hashes) last appeared in its Codex sessions, kept 90 days.
-It is not uploaded and not included in diagnostics. Turning the setting off
-restarts the three-day observation.
+workspace (as SHA-256 hashes) last appeared in its Codex sessions, and which
+Codex folders the latest scans covered (as folder paths). Each entry expires 90
+days after its time and is removed the next time Codex collection runs with the
+setting on. While the setting is off or the off-switch file above exists,
+nothing is added and the file is kept as is, until collection resumes or Ottto
+is uninstalled; turning collection back on restarts the three-day observation.
+The file is not uploaded, logged or included in diagnostics.
 
 Claude Code runs started by the daemon: while **Keep my Claude accounts signed
 in** is on (it is on until you turn it off), when a Claude login's access token

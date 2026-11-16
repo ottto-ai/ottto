@@ -601,7 +601,9 @@ Logins are read most overdue first, each at its own 6 h cadence and breaker; a 4
 grant-wide refusal ends the tick. A login is read about every 22 h instead when
 `account_activity` proves its account unused for 72 h: each ordinary Codex page folds the
 hashed creator pairs and session times into the local `account-activity.json` (bound to the
-grant, 90-day retention, never uploaded or in diagnostics). The proof needs 72 h of unbroken
+grant; never uploaded or in diagnostics). Entries expire 90 days after their time and are
+pruned only by folds with consent; without runtime-ready consent, or with the off-switch
+sentinel present, a page adds nothing and deletes nothing. The proof needs 72 h of unbroken
 observation, a fresh page, a clean loss-free census generation with a 3-day horizon that
 started after the last gap, policy stop or resume, full home coverage with the Codex scan on,
 and no unattributed or unknown-pair activity in 72 h; anything else keeps 6 h. A failed idle

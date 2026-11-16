@@ -22841,6 +22841,100 @@ mod tests {
         }
     }
 
+    /// [behaviour] The activity map's view of a real Codex scan page: it
+    /// proves nothing (not loss-free, not current) when any loss count, an
+    /// incomplete census, a decode hold or an incomplete home list says
+    /// evidence may be missing.
+    #[test]
+    fn an_activity_page_is_loss_free_only_for_a_whole_scan() {
+        use crate::provider_daily_reference::account_activity::Page;
+        let root = test_dir("activity-page-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&root),
+            &mut ScanIndex::default(),
+            "2026-10-24T00:00:00Z",
+            30,
+            10,
+        )
+        .unwrap();
+        scan.state_census_complete = true;
+        scan.sidecar_census_complete = true;
+        let status = test_agent_status(SourceKind::Codex);
+        let mut collection = AgentStatusCollection {
+            snapshots: vec![status.clone()],
+            source_health_snapshot: status,
+            codex_scan_homes: vec![root.clone()],
+            codex_scan_homes_complete: true,
+            codex_home_bindings: vec![],
+            setup_snapshot_index: None,
+        };
+        let page = Page::of_scan(&scan, &collection, true);
+        assert!(page.loss_free);
+        assert_eq!(page.homes, std::slice::from_ref(&root));
+        assert_eq!(page.window_days, scan.backfill_window_days);
+        assert!(
+            !Page::of_scan(&scan, &collection, false).loss_free,
+            "decode hold"
+        );
+        type Loss = fn(&mut SourceScanResult);
+        let losses: [(&str, Loss); 14] = [
+            ("symlink", |scan| scan.symlink_rejected_count = 1),
+            ("entry cap", |scan| {
+                scan.directory_entry_cap_exceeded_count = 1
+            }),
+            ("unreadable", |scan| scan.unreadable_path_count = 1),
+            ("oversized", |scan| scan.oversized_file_count = 1),
+            ("disappeared", |scan| scan.disappeared_file_count = 1),
+            ("malformed", |scan| scan.malformed_json_line_count = 1),
+            ("utf8", |scan| scan.invalid_utf8_line_count = 1),
+            ("line cap", |scan| scan.over_line_cap_count = 1),
+            ("usage drop", |scan| scan.recognized_usage_drop_count = 1),
+            ("ownership", |scan| scan.ownership_incomplete_file_count = 1),
+            ("zero evidence", |scan| {
+                scan.zero_snapshot_usage_evidence_count = 1
+            }),
+            ("dropped records", |scan| {
+                scan.dropped_usage_record_count = 1
+            }),
+            ("state census", |scan| scan.state_census_complete = false),
+            ("sidecar census", |scan| {
+                scan.sidecar_census_complete = false
+            }),
+        ];
+        for (case, loss) in losses {
+            let mut lossy = scan.clone();
+            loss(&mut lossy);
+            assert!(
+                !Page::of_scan(&lossy, &collection, true).loss_free,
+                "{case}"
+            );
+        }
+        type Stale = fn(&mut SourceScanResult);
+        let stale: [(&str, Stale); 4] = [
+            ("scan cap", |scan| scan.scan_cap_hit = true),
+            ("page limit", |scan| scan.page_file_limit_hit = true),
+            ("charge deferred", |scan| scan.charge_deferred = true),
+            ("skipped", |scan| scan.skipped_file_count_due_to_limit = 1),
+        ];
+        for (case, change) in stale {
+            let mut partial = scan.clone();
+            partial.scan_cap_hit = false;
+            partial.page_file_limit_hit = false;
+            partial.charge_deferred = false;
+            partial.skipped_file_count_due_to_limit = 0;
+            assert!(Page::of_scan(&partial, &collection, true).current, "{case}");
+            change(&mut partial);
+            assert!(
+                !Page::of_scan(&partial, &collection, true).current,
+                "{case}"
+            );
+        }
+        collection.codex_scan_homes_complete = false;
+        assert!(!Page::of_scan(&scan, &collection, true).loss_free, "homes");
+    }
+
     fn test_agent_account(account_hash: &str, organization_hash: &str) -> AgentAccountStatus {
         AgentAccountStatus {
             login_state: AgentLoginState::SignedIn,

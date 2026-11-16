@@ -17,7 +17,7 @@
 
 use super::{
     atomic_json_write, logins::LoginDiscovery, runtime_ready_grant, AccountIdentityHashes,
-    GrantStore, StateBinding, GRANT_DIR,
+    GrantStore, StateBinding, GRANT_DIR, SENTINEL_FILE,
 };
 use crate::agent_status::AgentStatusCollection;
 use crate::snapshots::{codex_creator_pair, rfc3339_unix_seconds, SnapshotItem, SourceScanResult};
@@ -42,8 +42,7 @@ const RETENTION_SECONDS: u64 = 90 * 24 * 60 * 60;
 const HORIZON_DAYS: u64 = 3;
 
 /// Map files this process failed to replace. Until a full reset is written,
-/// every account reading one is active. A marker file beside the map keeps
-/// the distrust across a restart when the old file could not be removed.
+/// every account reading one is active.
 static UNTRUSTED: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
 
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,33 +165,22 @@ impl ActivityStore {
     }
 
     fn untrusted(&self) -> bool {
-        untrusted_paths().contains(&self.path) || self.marker().exists()
-    }
-
-    fn marker(&self) -> PathBuf {
-        self.path.with_extension("distrusted")
+        untrusted_paths().contains(&self.path)
     }
 
     /// Replace the file. On failure the old file may survive, so it is
-    /// removed, a marker is left beside it, and the path is distrusted until
-    /// a full reset is written. A directory that refuses the removal and the
-    /// marker alike leaves only this process's distrust; while writes keep
-    /// failing, the old map stops proving idleness two hours after its last
-    /// page. Errors are never formatted: they can name the path.
+    /// removed and this process stops trusting the path until a full reset
+    /// is written. When the removal fails too and the daemon restarts, the
+    /// old map is trusted again (an accepted, disclosed residual). Errors are
+    /// never formatted: they can name the path.
     fn write(&self, map: &ActivityMap, clears_untrusted: bool) {
         if atomic_json_write(&self.path, map).is_ok() {
             if clears_untrusted {
-                let marker = self.marker();
-                let _ = fs::remove_file(&marker);
-                if !marker.exists() {
-                    untrusted_paths().remove(&self.path);
-                }
+                untrusted_paths().remove(&self.path);
             }
             return;
         }
         let _ = fs::remove_file(&self.path);
-        // Synced with its directory, so the removal above is durable too.
-        let _ = atomic_json_write(&self.marker(), &());
         untrusted_paths().insert(self.path.clone());
     }
 
@@ -270,6 +258,7 @@ pub(crate) fn fold_codex_page(support_dir: &Path, page: &Page<'_>) {
     fold(
         &ActivityStore::in_support_dir(support_dir),
         &GrantStore::in_support_dir(support_dir),
+        &support_dir.join(SENTINEL_FILE),
         page,
         now_seconds(),
     );
@@ -297,12 +286,19 @@ fn now_seconds() -> u64 {
     u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp()).unwrap_or_default()
 }
 
-/// Fold one page. Without runtime-ready consent nothing is observed and
-/// nothing is deleted; the binding is dropped once, so the next consented
-/// page starts a full reset.
-pub(super) fn fold(store: &ActivityStore, grants: &GrantStore, page: &Page<'_>, now: u64) {
+/// Fold one page. Without runtime-ready consent, or with the local off
+/// switch present, nothing is observed and nothing is deleted; the binding
+/// is dropped once, so the next consented page starts a full reset.
+pub(super) fn fold(
+    store: &ActivityStore,
+    grants: &GrantStore,
+    sentinel: &Path,
+    page: &Page<'_>,
+    now: u64,
+) {
     let binding = runtime_ready_grant(grants)
         .ok()
+        .filter(|_| !sentinel.is_file())
         .and_then(|grant| grant.backend_binding.as_ref().map(StateBinding::of));
     let Some(binding) = binding else {
         if let Some(mut map) = store.read().filter(|map| map.binding.is_some()) {
