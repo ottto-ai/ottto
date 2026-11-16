@@ -1182,8 +1182,9 @@ fn codex_held_back_fragment_stays_owed_past_the_prefix() {
         .ok()
         .and_then(unix_nanos)
         .expect("known object birth");
-    let fragment = crate::snapshots::codex_fragment::BoundFragment::bind(&candidate, OFFSET)
-        .expect("a bound fragment");
+    let fragment =
+        crate::snapshots::sources::codex::eof_fragment::BoundFragment::bind(&candidate, OFFSET)
+            .expect("a bound fragment");
     f.index.files.get_mut(&key).unwrap().codex_fragment = Some(Box::new(fragment));
     assert!(
         !f.index.listing_stamp_matches(&file, &live),

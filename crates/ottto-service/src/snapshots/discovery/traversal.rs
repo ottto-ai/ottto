@@ -153,7 +153,7 @@ pub(in crate::snapshots) fn ensure_bounded_traversal(
                 .pending_candidates
                 .iter()
                 .any(|candidate| candidate.census_member)
-            && traversal.counts.has_errors();
+            && traversal.has_errors();
         // What clears the latch: a generation that completes drops the
         // traversal, and a changed scan context takes the `else` branch below;
         // both start the next traversal at attempt zero. What bounds it: the
@@ -734,7 +734,7 @@ fn refresh_retained_codex_directories(
                 &path,
                 metadata.len(),
                 modified_unix_seconds,
-                codex_fragment::Stamp::metadata(&metadata),
+                sources::codex::eof_fragment::Stamp::metadata(&metadata),
             );
             let aged = census_unix_seconds.is_some_and(|now| {
                 !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
@@ -744,7 +744,7 @@ fn refresh_retained_codex_directories(
                     source,
                     &path,
                     metadata.len(),
-                    codex_fragment::Stamp::metadata(&metadata),
+                    sources::codex::eof_fragment::Stamp::metadata(&metadata),
                 );
             let requires_recovery = recovery.requires(source, &path, metadata.len());
             if !requires_recovery && aged && !owes_stamped {

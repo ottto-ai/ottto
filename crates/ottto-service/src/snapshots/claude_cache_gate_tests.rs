@@ -102,7 +102,7 @@ fn admitted_file_ships_cache_rows_for_its_own_requests_only() {
         let disposition = if rule_on {
             fold(&mut items, &no_reports(), &mut index)
         } else {
-            claude_context_file_birth::with_file_birth_rule_disabled_for_test(|| {
+            sources::claude::context_file_birth::with_file_birth_rule_disabled_for_test(|| {
                 fold(&mut items, &no_reports(), &mut index)
             })
         };

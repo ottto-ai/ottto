@@ -289,9 +289,14 @@ fn synthetic_reduction_and_alias_failures_are_retryable_not_hidden_by_copy_recov
     counts.record_unreadable(UnreadableCause::Reduction, 1);
     counts.record_unreadable(UnreadableCause::AliasParser, 1);
     assert_eq!(counts.unreadable_path_count, 2);
-    assert!(counts.has_retryable_problems());
-    assert!(!counts.settle_non_progressing_residue());
-    let projection = serde_json::to_value(counts.unreadable_causes.projection(2)).unwrap();
+    let mut traversal = ScanTraversalCheckpoint {
+        counts,
+        ..crate::snapshots::tests::traversal_checkpoint()
+    };
+    assert!(traversal.has_retryable_problems());
+    assert!(!traversal.settle_non_progressing_residue());
+    let projection =
+        serde_json::to_value(traversal.counts.unreadable_causes.projection(2)).unwrap();
     assert_eq!(projection["counts"], json!([0, 0, 0, 0, 1, 1, 0, 0]));
     // Only a genuinely clean subsequent traversal may complete the census.
     let (_, clean) = fixture.scan(ScanIndex::default());

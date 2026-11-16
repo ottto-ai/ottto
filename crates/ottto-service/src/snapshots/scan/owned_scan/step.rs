@@ -237,9 +237,11 @@ impl OwnedSourceScan {
                         })
                         .collect::<BTreeMap<_, _>>();
                     let absence_coverage = inventory.held_owners.is_empty()
-                        && codex_counting_version::absence_coverage_complete(index, inventory);
-                    codex_counting_version::note_inventory_created(index, inventory);
-                    codex_counting_version::prepare_moved_evidence(
+                        && sources::codex::counting::version::absence_coverage_complete(
+                            index, inventory,
+                        );
+                    sources::codex::counting::version::note_inventory_created(index, inventory);
+                    sources::codex::counting::version::prepare_moved_evidence(
                         index,
                         &current_owners,
                         absence_coverage,
@@ -286,6 +288,7 @@ impl OwnedSourceScan {
                     census.unreadable_path_count += inventory.refused.len();
                     census.unreadable_causes.merge(inventory.unreadable_causes);
                     let mut grouped_paths = BTreeSet::new();
+                    let mut inventory_held = BTreeSet::new();
                     let mut used = 0usize;
                     // R2-N6: a group with more members than the page's file
                     // limit is never excluded; it goes first and takes a page
@@ -415,15 +418,20 @@ impl OwnedSourceScan {
                             })
                             || group.members.len() < 2
                         {
+                            let members = group
+                                .members
+                                .iter()
+                                .map(|member| local_index_key(&member.path));
+                            if !inventory.complete {
+                                // Owed to the inventory hold, which keeps the
+                                // generation red until it is released.
+                                inventory_held.extend(members);
+                                continue;
+                            }
                             census.ownership_incomplete_file_count += group.members.len();
                             census.causes.add(ownership::INVENTORY, group.members.len());
                             census.record_unreadable(UnreadableCause::AliasParser, 1);
-                            residue_index_keys.extend(
-                                group
-                                    .members
-                                    .iter()
-                                    .map(|member| local_index_key(&member.path)),
-                            );
+                            residue_index_keys.extend(members);
                             continue;
                         }
                         // G1: a group whose attempt already ended in this
@@ -561,11 +569,23 @@ impl OwnedSourceScan {
                         })
                         .map(|candidate| local_index_key(&candidate.path))
                         .collect::<BTreeSet<_>>();
-                    census.ownership_incomplete_file_count += held.len();
-                    census.causes.add(ownership::INVENTORY, held.len());
-                    residue_index_keys.extend(held.iter().cloned());
                     identified_candidates
                         .retain(|candidate| !held.contains(&local_index_key(&candidate.path)));
+                    if inventory.complete {
+                        census.ownership_incomplete_file_count += held.len();
+                        census.causes.add(ownership::INVENTORY, held.len());
+                        residue_index_keys.extend(held);
+                    } else {
+                        inventory_held.extend(held);
+                    }
+                    // Record the hold now: preparation yields below, and a
+                    // resumed step does not come back here.
+                    if !inventory_held.is_empty() {
+                        if let Some(traversal) = index.traversal.as_mut() {
+                            inventory_held.extend(residue_index_keys.iter().cloned());
+                            record_codex_inventory_hold(traversal, inventory, &inventory_held);
+                        }
+                    }
                     while !identified_candidates.is_empty()
                         && used + identified_candidates.len() > file_limit
                     {
@@ -1505,6 +1525,7 @@ impl OwnedSourceScan {
                         resource_probe.full_parse_reason(
                             plan.mode(),
                             active.parse_reason,
+                            active.prior_stamp,
                             0,
                             plan.metrics().native_bytes,
                         );
@@ -1581,6 +1602,13 @@ impl OwnedSourceScan {
                         context.priority_replays += 1;
                         context.record_mode(mode, acquisition.audit_due);
                     }
+                    resource_probe.full_parse_reason(
+                        mode,
+                        active.parse_reason,
+                        active.prior_stamp,
+                        1,
+                        0,
+                    );
                     active.parser = parser;
                     active.charged_bytes = 0;
                     active.hold_offset = None;
@@ -1619,10 +1647,10 @@ impl OwnedSourceScan {
                         active.parser.reader.acquisition.as_ref(),
                     ) {
                         let start = plan.start_offset();
-                        codex_fragment::note_tail_repeat(
+                        sources::codex::eof_fragment::note_tail_repeat(
                             entry,
                             &active.candidate,
-                            codex_fragment::TailRead {
+                            sources::codex::eof_fragment::TailRead {
                                 mode: plan.mode(),
                                 start,
                                 end: start.saturating_add(active.parser.reader.consumed_bytes()),
@@ -1839,6 +1867,7 @@ impl OwnedSourceScan {
                     candidate,
                     decision,
                     parse_reason: _,
+                    prior_stamp: _,
                     previous_snapshot_fingerprint,
                     previous_upload_body_witness,
                     projection_adoption_required,
@@ -2071,7 +2100,7 @@ impl OwnedSourceScan {
                     .source_session_id
                     .as_deref()
                     .filter(|_| {
-                        codex_counting_version::evicted_legacy_selected_v2(
+                        sources::codex::counting::version::evicted_legacy_selected_v2(
                             &parser.accumulator,
                             index,
                         )
@@ -2243,7 +2272,9 @@ impl OwnedSourceScan {
                 };
                 if let Some(receipts) = codex_counting_receipts {
                     if let Some(owner) = evicted_legacy_v2_owner {
-                        codex_counting_version::note_evicted_legacy_v2_selection(index, &owner);
+                        sources::codex::counting::version::note_evicted_legacy_v2_selection(
+                            index, &owner,
+                        );
                     }
                     census.codex_counting_v2 = Some(receipts);
                 }
@@ -2608,7 +2639,10 @@ impl OwnedSourceScan {
                             (prefix_continued
                                 && completed.checkpoint.sealed_offset() == fragment.offset)
                                 .then(|| {
-                                    codex_fragment::BoundFragment::bind(&candidate, fragment.offset)
+                                    sources::codex::eof_fragment::BoundFragment::bind(
+                                        &candidate,
+                                        fragment.offset,
+                                    )
                                 })
                                 .flatten()
                         })
@@ -3051,7 +3085,9 @@ impl OwnedSourceScan {
                         .get(index_key)
                         .is_some_and(ScanIndexEntry::codex_history_is_protected)
                         && (source != SnapshotSource::Codex
-                            || codex_counting_version::tombstone_before_retire(index, index_key))
+                            || sources::codex::counting::version::tombstone_before_retire(
+                                index, index_key,
+                            ))
                     {
                         // A member that vanished beneath its present parent
                         // also drops its unverified audit debt, proven again
@@ -3143,7 +3179,7 @@ impl OwnedSourceScan {
                     // sweep, the terminal manifest) held behind it. Retryable problems
                     // veto the settlement inside the helper.
                     if let Some(traversal) = index.traversal.as_mut() {
-                        traversal.counts.settle_non_progressing_residue();
+                        traversal.settle_non_progressing_residue();
                     }
                 }
                 if let Some(traversal) = index.traversal.as_mut() {
@@ -3156,7 +3192,7 @@ impl OwnedSourceScan {
                     .expect("traversal remains active");
                 let routine_recensus =
                     traversal_transition::routine_recensus(source, &traversal_snapshot);
-                let traversal_healthy = !traversal_snapshot.counts.has_errors();
+                let traversal_healthy = !traversal_snapshot.has_errors();
                 let clean_frozen_generation = !traversal_snapshot.watcher_hint_seen;
                 let reconciliation_complete = if traversal_discovery_done
                     && traversal_healthy
@@ -3178,7 +3214,7 @@ impl OwnedSourceScan {
                 // Retirements on this page can already have a moved header in
                 // the inventory, even while that file's parse is deferred.
                 if let Some(inventory) = codex_join_inventory.as_ref() {
-                    codex_counting_version::note_inventory_created(index, inventory);
+                    sources::codex::counting::version::note_inventory_created(index, inventory);
                 }
                 let raw_census_complete = traversal_discovery_done
                     && traversal_healthy
@@ -3266,7 +3302,7 @@ impl OwnedSourceScan {
                 let census_status = CensusStatus {
                     pending_work: !traversal.pending_directories.is_empty()
                         || !traversal.pending_candidates.is_empty(),
-                    retryable_problem: traversal.counts.has_retryable_problems(),
+                    retryable_problem: traversal.has_retryable_problems(),
                     transport_reservation_refused: index
                         .context_read_counts
                         .transport_reservation_refused,
@@ -3518,7 +3554,7 @@ impl OwnedSourceScan {
                     codex_join_validation,
                     // Moved, not copied: the box was charged with the census.
                     codex_counting_v2: if source == SnapshotSource::Codex {
-                        codex_counting_version::take_local_receipts(
+                        sources::codex::counting::version::take_local_receipts(
                             index,
                             census.codex_counting_v2.take(),
                         )
@@ -4727,6 +4763,16 @@ impl OwnedSourceScan {
                 pending!();
             }
             index.note_change_reason_selected(source, &candidate, parse_reason, source_change);
+            // Frozen here, before this read can change the index entry.
+            let prior_stamp =
+                crate::local_resource_diagnostics::claude_reread::PriorStamp::classify(
+                    (candidate.size_bytes, candidate.modified_unix_nanos),
+                    index
+                        .files
+                        .get(&local_index_key(&candidate.path))
+                        .filter(|_| parse_reason != Some(CandidateParseReason::NewFile))
+                        .map(|entry| (entry.size_bytes, entry.modified_unix_nanos)),
+                );
             let mut active = Box::new(OwnedActiveFile {
                 first_read: crate::local_resource_diagnostics::FirstRead::begin(
                     source,
@@ -4736,7 +4782,8 @@ impl OwnedSourceScan {
                 sampling: file_sampling,
                 candidate,
                 decision,
-                parse_reason: parse_reason.filter(|_| source == SnapshotSource::ClaudeCode),
+                parse_reason,
+                prior_stamp: Some(prior_stamp),
                 previous_snapshot_fingerprint,
                 previous_upload_body_witness,
                 projection_adoption_required,
@@ -4869,7 +4916,13 @@ impl OwnedSourceScan {
                     context.record_mode(mode, audit_due);
                     resource_probe
                         .rearm_full_selected(&local_index_key(&active.candidate.path), mode);
-                    resource_probe.full_parse_reason(mode, active.parse_reason, 1, 0);
+                    resource_probe.full_parse_reason(
+                        mode,
+                        active.parse_reason,
+                        active.prior_stamp,
+                        1,
+                        0,
+                    );
                 }
             }
             if let Some(delivery) = line_delivery.as_mut() {

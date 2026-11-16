@@ -21,7 +21,7 @@ impl ScanIndex {
         &self,
         candidate: &CandidateFile,
         audit_now: u64,
-        source_change: &mut Option<change_reason::SourceChange>,
+        source_change: &mut Option<scan::read_cause::SourceChange>,
     ) -> (CandidateDecision, Option<CandidateParseReason>) {
         self.candidate_decision_refined(candidate, audit_now, true, source_change)
     }
@@ -103,7 +103,7 @@ impl ScanIndex {
         candidate: &CandidateFile,
         now: u64,
         body_witness_adoption: bool,
-        source_change: &mut Option<change_reason::SourceChange>,
+        source_change: &mut Option<scan::read_cause::SourceChange>,
     ) -> (CandidateDecision, Option<CandidateParseReason>) {
         let key = local_index_key(&candidate.path);
         if self.decode_holds_file(&key) {
@@ -169,7 +169,7 @@ impl ScanIndex {
             .claude_copy_removals
             .pending(claude_money_birth_store::location_key(&key))
         {
-            *source_change = Some(change_reason::SourceChange::CopyRemoval);
+            *source_change = Some(scan::read_cause::SourceChange::CopyRemoval);
             return (
                 CandidateDecision::Parse,
                 Some(CandidateParseReason::SourceChanged),
@@ -227,7 +227,7 @@ impl ScanIndex {
             fragment.matches(
                 entry.size_bytes,
                 candidate.size_bytes,
-                codex_fragment::Stamp::candidate(candidate),
+                sources::codex::eof_fragment::Stamp::candidate(candidate),
             ) && entry.source_file_fingerprint == candidate.source_file_fingerprint
         });
         let transcript_changed = !known_fragment
@@ -327,7 +327,7 @@ impl ScanIndex {
             let reason = if entry.source_file_fingerprint.is_empty() {
                 CandidateParseReason::Rearmed
             } else {
-                *source_change = Some(change_reason::SourceChange::Fingerprint);
+                *source_change = Some(scan::read_cause::SourceChange::Fingerprint);
                 CandidateParseReason::SourceChanged
             };
             (CandidateDecision::Parse, Some(reason))

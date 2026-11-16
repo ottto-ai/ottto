@@ -3767,12 +3767,12 @@ pub(super) mod tests {
         let (root, keys) = counting_v2_fixture();
         let (legacy_index, legacy) = {
             // The fixture's October 1 headers predate the frozen cutover.
-            let _cutover = codex_counting_version::TestCutover::set(
-                codex_counting_version::CODEX_COUNTING_V2_CUTOVER_UNIX_MS,
+            let _cutover = sources::codex::counting::version::TestCutover::set(
+                sources::codex::counting::version::CODEX_COUNTING_V2_CUTOVER_UNIX_MS,
             );
             scan(&root, ScanIndex::default(), 2)
         };
-        let _cutover = codex_counting_version::TestCutover::set(0);
+        let _cutover = sources::codex::counting::version::TestCutover::set(0);
         let (index, counted) = scan(&root, ScanIndex::default(), 2);
         assert_eq!(counted.snapshots.len(), 2, "one alias per physical member");
         let receipts = counted
@@ -3798,7 +3798,7 @@ pub(super) mod tests {
         assert_eq!(legacy_receipts.tombstone_count, 0);
         assert_eq!(
             legacy_receipts.tombstone_cap,
-            codex_counting_version::MAX_COUNTING_TOMBSTONES as u64
+            sources::codex::counting::version::MAX_COUNTING_TOMBSTONES as u64
         );
         for (counted, legacy) in counted.snapshots.iter().zip(&legacy.snapshots) {
             assert_eq!(counted.input_tokens, legacy.input_tokens);
@@ -3811,7 +3811,7 @@ pub(super) mod tests {
         let (root, keys) = counting_v2_fixture();
         let owner = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
         let previous = {
-            let _cutover = codex_counting_version::TestCutover::set(0);
+            let _cutover = sources::codex::counting::version::TestCutover::set(0);
             let (index, result) = scan(&root, ScanIndex::default(), 2);
             save_selected(&root, "v2.json", index, result, &ScanIndex::default(), None)
         };
@@ -4538,7 +4538,7 @@ pub(super) mod tests {
         write_rows(&segment, &member(KNOWN, "r-b", 200, 300));
         let new = root.join("sessions/new.jsonl");
         write_rows(&new, &member(UNRELATED, "n-1", 70, 70));
-        let (_, page) = retained_page(&root, settled, &[segment, new]);
+        let (index, page) = retained_page(&root, settled, &[segment.clone(), new]);
         let known = page
             .snapshots
             .iter()
@@ -4548,7 +4548,12 @@ pub(super) mod tests {
             known.iter().all(|item| item.input_tokens == 300),
             "a known segment cannot be sent alone once its sibling exists: {known:?}"
         );
-        assert!(!known.is_empty() || page.ownership_incomplete_file_count >= 2);
+        assert!(
+            !known.is_empty()
+                || page.ownership_incomplete_file_count >= 2
+                || inventory_hold(&index)
+                    .is_some_and(|hold| hold.owed.contains(&local_index_key(&segment)))
+        );
         assert!(page
             .snapshots
             .iter()
@@ -4569,17 +4574,33 @@ pub(super) mod tests {
         fs::write(&unreadable, "not a header\n").unwrap();
         let new = root.join("sessions/new.jsonl");
         write_rows(&new, &member(UNRELATED, "n-1", 70, 70));
+        let before = settled.traversal.as_ref().unwrap().counts.clone();
         let (held_index, held) = retained_page(&root, settled, &[unreadable.clone(), new.clone()]);
         assert!(held.snapshots.is_empty(), "{:?}", held.snapshots);
-        assert!(held.ownership_incomplete_file_count > 0);
-        let (c, [unknown, _, _]) = held.causes.summary(held.ownership_incomplete_file_count);
-        assert!(c[ownership::INVENTORY] > 0);
+        // The hold owes the held candidates; they add no ownership or
+        // unreadable count. Only the refused header itself is unreadable.
+        assert_eq!(held.ownership_incomplete_file_count, 0);
+        let (c, _) = held.causes.summary(0);
+        assert_eq!(c[ownership::INVENTORY], 0);
+        assert!(held.unreadable_path_count > 0, "the refused header counts");
+        let after = &held_index.traversal.as_ref().unwrap().counts;
         assert_eq!(
-            c[..6].iter().sum::<usize>() + unknown,
-            held.ownership_incomplete_file_count
+            after.ownership_incomplete_file_count,
+            before.ownership_incomplete_file_count
+        );
+        assert_eq!(
+            after.unreadable_path_count,
+            before.unreadable_path_count + held.unreadable_path_count
         );
         let hold = inventory_hold(&held_index).expect("the held page is owed a retry");
         assert!(hold.owed.contains(&local_index_key(&new)));
+        assert!(!held_index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .residue
+            .index_keys
+            .contains(&local_index_key(&new)));
         assert!(hold
             .refused_headers
             .contains_key(&local_index_key(&unreadable)));
@@ -4664,15 +4685,27 @@ pub(super) mod tests {
     fn repaired_header_releases_the_held_page_and_a_still_unreadable_one_does_not() {
         let (root, held_index, unreadable, new, witness) = held_behind_unreadable_header();
         let deadline = retry_deadline(&held_index);
+        let owed = inventory_hold(&held_index).unwrap().owed.clone();
         // The blocker changes but still proves no owner: the owed candidates
         // are tried again once, held again, and nothing is emitted.
         fs::write(&unreadable, "still not a header\n").unwrap();
         let (still_index, still) =
             retained_page(&root, held_index, std::slice::from_ref(&unreadable));
         assert!(still.snapshots.is_empty(), "{:?}", still.snapshots);
-        assert!(still.ownership_incomplete_file_count > 0);
-        assert!(inventory_hold(&still_index)
-            .is_some_and(|hold| hold.owed.contains(&local_index_key(&new))));
+        // The release does not clear the still-refused header: it counts
+        // again, and the hold keeps the generation red.
+        assert!(still.unreadable_path_count > 0);
+        assert!(still_index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .has_retryable_problems());
+        assert_eq!(still.ownership_incomplete_file_count, 0);
+        assert_eq!(
+            inventory_hold(&still_index).map(|hold| &hold.owed),
+            Some(&owed),
+            "a re-hold owes the same set"
+        );
         let (idle_index, idle) = retained_page(&root, still_index, &[]);
         assert_eq!(
             idle.scanned_file_count, 0,
@@ -4704,6 +4737,133 @@ pub(super) mod tests {
         );
         assert_eq!(retry_deadline(&index), deadline, "no re-walk was forced");
         assert!(inventory_hold(&index).is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+    /// One `scan` page whose header inventory `prepare` adjusts first.
+    fn scan_with_inventory(
+        root: &Path,
+        index: ScanIndex,
+        prepare: impl FnOnce(&mut HeaderInventory),
+    ) -> (ScanIndex, SourceScanResult) {
+        let mut owned = OwnedSourceScan::new(
+            SnapshotSource::Codex,
+            &[root.join("sessions")],
+            index,
+            "2026-10-06T23:00:00Z",
+            7,
+            4,
+            None,
+            &[],
+            false,
+        );
+        prepare(
+            owned
+                .codex_join_inventory
+                .as_mut()
+                .expect("a selecting page"),
+        );
+        for _ in 0..10_000 {
+            match owned.step(None) {
+                OwnedSourceScanStep::Pending(next) => owned = next,
+                OwnedSourceScanStep::Complete { index, scan, .. } => return (index, scan),
+            }
+        }
+        panic!("bounded native scan did not finish");
+    }
+    /// [money] An incomplete inventory holds a whole joined group: the changed
+    /// member and its unchanged, checkpointed sibling are both owed. A re-hold
+    /// owes the same set and still adds no count. The release reads exactly
+    /// what an unheld page reads and leaves the generation healthy.
+    #[test]
+    fn held_group_owes_every_member_and_release_reads_like_an_unheld_page() {
+        use sampled_scan::transition_fixture::observe_consumed;
+        let (root, _) = fixture();
+        let owner = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let (mut index, mut result) = scan(&root, ScanIndex::default(), 4);
+        assert!(!result.snapshots.is_empty());
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut index);
+        result.finish_codex_capture_boundary(&mut index);
+        let accepted = result
+            .snapshots
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect();
+        let previous = index.committable_subset(&ScanIndex::default(), &accepted, &BTreeMap::new());
+        let b = root.join("sessions/b.jsonl");
+        let mut text = fs::read_to_string(&b).unwrap();
+        for row in &member(owner, "r-b2", 150, 450)[1..] {
+            text.push_str(&(serde_json::to_string(row).unwrap() + "\n"));
+        }
+        fs::write(&b, text).unwrap();
+        let members = BTreeSet::from(
+            ["a.jsonl", "b.jsonl"].map(|name| local_index_key(&root.join("sessions").join(name))),
+        );
+        let totals = |scan: &SourceScanResult| {
+            scan.snapshots
+                .iter()
+                .map(|item| (item.source_session_id.clone(), item.input_tokens))
+                .collect::<Vec<_>>()
+        };
+        // As an unstable directory census leaves it.
+        let incomplete = |inventory: &mut HeaderInventory| inventory.complete = false;
+        // A complete inventory with a real group reason (an affected owner)
+        // still charges the group: ownership per member, one AliasParser,
+        // residue and no hold.
+        let (charged_index, charged) = scan_with_inventory(&root, previous.clone(), |inventory| {
+            inventory.held_owners.insert(owner.to_string());
+        });
+        assert!(charged.snapshots.is_empty());
+        assert_eq!(charged.ownership_incomplete_file_count, 2);
+        assert_eq!(charged.unreadable_path_count, 1);
+        let (c, _) = charged.causes.summary(2);
+        assert_eq!(c[ownership::INVENTORY], 2);
+        let causes = serde_json::to_value(
+            charged
+                .local_codex_diagnostics
+                .unwrap()
+                .unreadable_causes
+                .projection(1),
+        )
+        .unwrap();
+        assert_eq!(causes["counts"][5], 1, "one AliasParser event");
+        assert!(inventory_hold(&charged_index).is_none());
+        let ((_, control), control_bytes) = observe_consumed(|| scan(&root, previous.clone(), 4));
+        assert!(!control.snapshots.is_empty());
+        let (held_index, held) = scan_with_inventory(&root, previous.clone(), incomplete);
+        assert!(held.snapshots.is_empty());
+        assert_eq!(
+            (
+                held.ownership_incomplete_file_count,
+                held.unreadable_path_count
+            ),
+            (0, 0)
+        );
+        assert_eq!(
+            inventory_hold(&held_index).map(|hold| &hold.owed),
+            Some(&members)
+        );
+        let (again_index, again) = scan_with_inventory(&root, held_index, incomplete);
+        assert!(again.snapshots.is_empty());
+        assert_eq!(
+            (
+                again.ownership_incomplete_file_count,
+                again.unreadable_path_count
+            ),
+            (0, 0)
+        );
+        assert_eq!(
+            inventory_hold(&again_index).map(|hold| &hold.owed),
+            Some(&members)
+        );
+        let ((index, released), released_bytes) = observe_consumed(|| scan(&root, again_index, 4));
+        assert_eq!(totals(&released), totals(&control));
+        assert_eq!(
+            (released.scanned_file_count, released_bytes),
+            (control.scanned_file_count, control_bytes),
+            "the release reads what an unheld page reads"
+        );
+        assert!(inventory_hold(&index).is_none());
+        assert!(index.traversal.as_ref().is_none_or(|t| !t.has_errors()));
         fs::remove_dir_all(root).unwrap();
     }
     /// [money] Protected history survives retirement; quiet retries acquire,
