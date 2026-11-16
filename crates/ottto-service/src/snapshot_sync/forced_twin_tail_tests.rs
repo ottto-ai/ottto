@@ -152,8 +152,8 @@ impl Twin {
         );
         assert!(!forced_needs_native_for_test(&prior, &twin));
         owner.acquisitions.lock().unwrap().clear();
-        // Keep the holder native so the page byte budget attributes every
-        // other consumed byte to the twin, including the unchanged row.
+        // Retire the holder's head to exercise native reconstruction too.
+        // A route save can publish a staged head, so budget its actual range.
         damage_tail_for_test(&prior, &holder.to_string_lossy(), "missing");
         Self {
             _diagnostics: diagnostics,
@@ -237,6 +237,15 @@ impl Twin {
         };
         for attempt in 0..8 {
             diag::owner(label);
+            // Recomposition keeps the first file's physical witness. A retry
+            // can discover the twin first; give every synthetic arm the same
+            // carrier before comparing their exact envelopes. Acquisition
+            // order and all money/placement comparisons remain observable.
+            let holder_witness =
+                &page.index.files[self.holder.to_string_lossy().as_ref()].source_file_fingerprint;
+            page.scan
+                .snapshots
+                .sort_by_key(|item| item.source_file_fingerprint.as_ref() != Some(holder_witness));
             with_scan_clock(self.now.get(), || {
                 page.enrich(&self.c);
                 page.finish();
@@ -390,18 +399,33 @@ fn forced_verified_twin_reuses_certified_tail_and_restarts() {
                 };
                 let start = if native { 0 } else { sealed };
                 f.assert_read(&f.owner, "RAM", mode, start);
-                let twin_bytes = if native { sealed } else { suffix.len() as u64 };
+                let holder_start = f
+                    .owner
+                    .acquisitions
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .rev()
+                    .find(|read| read.path == f.holder)
+                    .unwrap()
+                    .start;
+                let twin_bytes = match mode {
+                    ReadMode::Full(_) => std::fs::metadata(&f.twin).unwrap().len(),
+                    ReadMode::Tail => suffix.len() as u64,
+                    ReadMode::Unchanged => 0,
+                };
                 assert_eq!(
                     consumed,
-                    std::fs::metadata(&f.holder).unwrap().len() + twin_bytes,
+                    std::fs::metadata(&f.holder).unwrap().len() - holder_start + twin_bytes,
                     "exact page budget: unchanged twin consumes zero parser bytes"
                 );
                 let sample_bytes: usize = samples
                     .iter()
                     .map(|r| r.result.as_ref().copied().unwrap())
                     .sum();
-                let restored_samples =
-                    2 * sealed.min(crate::transcript_acquisition::SAMPLE_BYTES as u64);
+                let restored_samples = 2
+                    * (sealed.min(crate::transcript_acquisition::SAMPLE_BYTES as u64)
+                        + holder_start.min(crate::transcript_acquisition::SAMPLE_BYTES as u64));
                 if round == 0 {
                     assert_eq!(
                         sample_bytes as u64, restored_samples,
