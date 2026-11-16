@@ -2109,6 +2109,198 @@ fn schedule_accepts(source: SnapshotSource, cycle: &Cycle, latest: &mut BTreeMap
     }
 }
 
+// Sort the actual full-path keys, then assign growth to each end in turn. Fixed
+// relative names alone cannot pin a hash order under a unique temporary root.
+fn equal_birth_twins(home: &OracleHome) -> [PathBuf; 2] {
+    use crate::snapshots::claude_money_birth_store::location_key;
+    let root = home.source.default_roots(&home.fixture.home)[0].clone();
+    let mut paths = ["a-copy", "z-original"].map(|dir| {
+        root.join(dir)
+            .join(format!("{IDENTITY_PIPELINE_ROOT}.jsonl"))
+    });
+    paths.sort_by_key(|path| location_key(&path.to_string_lossy()));
+    assert!(
+        location_key(&paths[0].to_string_lossy()) < location_key(&paths[1].to_string_lossy()),
+        "equal-birth twins must have distinct, explicitly ordered full-path keys"
+    );
+    paths
+}
+
+fn assert_twin_request_survives(index: &ScanIndex, request: &str, locations: &[PathBuf]) {
+    use crate::snapshots::claude_money_birth_store::location_key;
+    use crate::snapshots::claude_request_census::claude_request_hash;
+    let hash = claude_request_hash(request);
+    let removed = locations
+        .iter()
+        .filter(|path| {
+            index
+                .claude_copy_removals
+                .get(location_key(&path.to_string_lossy()))
+                .iter()
+                .any(|(_, hashes)| hashes.binary_search(&hash).is_ok())
+        })
+        .count();
+    assert!(
+        removed < locations.len(),
+        "request {request} removed at every location of its session: {removed}/{}",
+        locations.len()
+    );
+}
+
+// Seed a positive r1 ACK, then put that same pre-birth request at both homes.
+// The twins' first page must still count r1 once. Grow the earlier and later
+// location in separate arms, crossing discovery, finish and restart schedules.
+fn scheduling_equal_birth_twins() {
+    let source = SnapshotSource::ClaudeCode;
+    let birth = OffsetDateTime::parse("2026-11-06T07:02:00Z", &Rfc3339)
+        .unwrap()
+        .unix_timestamp_nanos() as u64;
+    let response = |request: &str, at: &str, tokens: u64| {
+        json!({"type":"assistant","sessionId":IDENTITY_PIPELINE_ROOT,
+            "version":"2.1.309","timestamp":at,"requestId":request,
+            "message":{"id":format!("msg-{request}"),"model":"claude-haiku-4-5",
+                "usage":{"input_tokens":tokens,"output_tokens":tokens}}})
+    };
+    // The own turn is after the copy-proof activation boundary; this row must
+    // exercise current page proofs, rather than grandfathered copy decisions.
+    let r1 = response("r1", "2026-11-06T07:00:10Z", 10);
+    let r2 = response("r2", "2026-11-06T07:04:00Z", 20);
+    let mut baseline = None;
+    let mut run = 0;
+    let mut tie_orders = BTreeSet::new();
+    for growing in [0, 1] {
+        for one_chunk in [true, false] {
+            for limit in [3, 2] {
+                for reverse in [false, true] {
+                    for restart in [false, true] {
+                        let recording = Recording::start();
+                        let server = OracleServer::new(source, recording.handle());
+                        let mut home = OracleHome::new(source, &server);
+                        home.now = OffsetDateTime::parse("2026-11-06T10:00:00Z", &Rfc3339)
+                            .unwrap()
+                            .unix_timestamp() as u64;
+                        home.row = "schedule_equal_birth_twins";
+                        home.cycle_number = run * 128;
+                        home.schedule = Some(Schedule {
+                            one_chunk,
+                            limit,
+                            reverse,
+                        });
+                        let paths = equal_birth_twins(&home);
+                        let other = 1 - growing;
+                        use crate::snapshots::claude_money_birth_store::location_key;
+                        let growth_first = location_key(&paths[growing].to_string_lossy())
+                            < location_key(&paths[other].to_string_lossy());
+                        assert_eq!(growth_first, growing == 0, "pin both birth tie orders");
+                        tie_orders.insert(growth_first);
+                        home.births = paths
+                            .iter()
+                            .map(|path| (path.to_string_lossy().into_owned(), birth))
+                            .collect();
+                        std::fs::remove_file(home.transcript()).unwrap();
+                        write_jsonl(&paths[0], std::slice::from_ref(&r1));
+                        let mut accepted = BTreeMap::new();
+                        let seed = home.cycle(&server, &recording);
+                        assert!(seed.finish.is_ok());
+                        schedule_accepts(source, &seed, &mut accepted);
+                        assert_eq!(accepted.len(), 1);
+                        assert_eq!(accepted[IDENTITY_PIPELINE_ROOT]["body"]["request_count"], 1);
+                        drop(seed);
+
+                        write_jsonl(&paths[1], std::slice::from_ref(&r1));
+                        home.age_listing();
+                        home.now += 3600;
+                        let first = home.cycle(&server, &recording);
+                        assert!(first.finish.is_ok());
+                        schedule_accepts(source, &first, &mut accepted);
+                        assert_eq!(
+                            first.finalized.len(),
+                            1,
+                            "first twin page emits its removal"
+                        );
+                        assert_eq!(
+                            (
+                                first.finalized[0].request_count,
+                                first.finalized[0].removed_request_count
+                            ),
+                            (1, Some(1)),
+                            "first twin page counts r1 once"
+                        );
+                        assert_eq!(first.finalized[0].input_tokens, 10);
+                        for path in &paths {
+                            let key = path.to_string_lossy();
+                            assert!(first.index.files.contains_key(key.as_ref()));
+                            assert_eq!(
+                                first
+                                    .index
+                                    .claude_money_birth_store
+                                    .observed_birth(IDENTITY_PIPELINE_ROOT, &key),
+                                Some(i128::from(birth)),
+                                "both physical births remain equal"
+                            );
+                        }
+                        assert_twin_request_survives(&first.index, "r1", &paths);
+                        let first_body = accepted.clone();
+                        drop(first);
+                        if restart {
+                            home.cold_restart();
+                        }
+                        writeln!(
+                            std::fs::OpenOptions::new()
+                                .append(true)
+                                .open(&paths[growing])
+                                .unwrap(),
+                            "{r2}"
+                        )
+                        .unwrap();
+                        std::fs::File::options()
+                            .write(true)
+                            .open(&paths[growing])
+                            .unwrap()
+                            .set_modified(
+                                std::time::UNIX_EPOCH + Duration::from_secs(home.now - 1800),
+                            )
+                            .unwrap();
+                        home.age_listing();
+                        home.now += 3600;
+                        let changed = home.cycle(&server, &recording);
+                        assert!(changed.finish.is_ok());
+                        assert_eq!(changed.finalized.len(), 1, "growth emits the twin session");
+                        let body = &changed.finalized[0];
+                        assert_eq!(
+                            (body.request_count, body.removed_request_count),
+                            (2, Some(1)),
+                            "equal-birth twin growth must retain r1: growth_first={growth_first} reverse={reverse} restart={restart} limit={limit} one_chunk={one_chunk}"
+                        );
+                        assert_eq!((body.input_tokens, body.output_tokens), (30, 30));
+                        assert_twin_request_survives(&changed.index, "r1", &paths);
+                        assert_twin_request_survives(
+                            &changed.index,
+                            "r2",
+                            &paths[growing..=growing],
+                        );
+                        schedule_accepts(source, &changed, &mut accepted);
+                        assert_eq!(accepted.len(), 1);
+                        assert!(schedule_debt_is_clear(&changed.debt));
+                        let bodies = json!({"first":first_body,"grown":accepted});
+                        if let Some(expected) = &baseline {
+                            assert_eq!(
+                                &bodies, expected,
+                                "equal-birth full bodies, totals, removals and placement converge"
+                            );
+                        } else {
+                            baseline = Some(bodies);
+                        }
+                        run += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(tie_orders, BTreeSet::from([false, true]));
+    assert_eq!(run, 32);
+}
+
 /// [money] Real prepare pages, evidence chunks and cold restarts change scheduling
 /// only. Distinct sidecar ids exclude the separately documented context-tripwire
 /// counterexample. This base predates the named copy-first correction (#1730);
@@ -2117,6 +2309,7 @@ fn schedule_accepts(source: SnapshotSource, cycle: &Cycle, latest: &mut BTreeMap
 #[serial]
 #[serial(source_cadences, source_manifests, client_report)]
 fn scheduling_permutations_converge_to_the_same_bodies() {
+    scheduling_equal_birth_twins();
     for source in [
         SnapshotSource::ClaudeCode,
         SnapshotSource::Codex,
