@@ -316,9 +316,9 @@ fn owner_return_preserves_all_source_carry() {
         };
         let cx_path = index_path(&namespace_a, SnapshotSource::Codex);
         let mut legacy = ScanIndex::default();
-        // Model a completed current-release bootstrap, including its replay
-        // generation in both durable stores. Dropping only the completion map
-        // must not also simulate losing the independently saved generation.
+        // Keep the Legacy entry inside the current index replay generation.
+        // The first ordinary pass completes that generation in upload progress
+        // and destination completion through the production writers.
         let generation = cycle_replay_generation(SnapshotSource::Codex, &namespace_a);
         legacy.prepare_historical_replay(generation.clone());
         legacy.files.insert(
@@ -342,18 +342,6 @@ fn owner_return_preserves_all_source_carry() {
             )
             .unwrap()
         };
-        let (_, _, mut progress) = codex_checkpoints();
-        progress.prepare_historical_replay(&generation);
-        progress.save(&progress_path).unwrap();
-        // Like install_legacy_active: A already completed its initial Codex backfill.
-        crate::backfill::update_backfill_state(&support, |state| {
-            crate::backfill::mark_backfill_complete_for_destination(
-                state,
-                SnapshotSource::Codex,
-                &namespace_a,
-            );
-        })
-        .unwrap();
         crate::snapshots::older_build_logs_priority("return-turn");
         let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
         // A claim switch keeps the daemon alive. Keep its physical-header cache
