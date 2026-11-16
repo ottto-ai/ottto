@@ -55,19 +55,24 @@ pub(super) fn permute_candidates(walk: &mut ScanTraversalCheckpoint) {
 impl OwnedSourceScan {
     /// Count identity/acquisition anchors independently from parser/decoder work.
     /// The archive observer treats any identity sample as wholly unmeasured;
-    /// this driver also captures the actual acquisition sample-read seam.
+    /// this driver also captures the actual acquisition sample-read seam and
+    /// bounded Codex header activity without inventing a header byte receipt.
     pub(crate) fn observe_oracle_io<T>(
         run: impl FnOnce() -> T,
     ) -> (T, sampled_scan::transition_fixture::IoBytes) {
         let identity_before = START_IDENTITY_SAMPLE_FOR_TEST.with(std::cell::Cell::get);
         let activity_before = codex_zst_refusal_tests::activity();
+        let headers_before =
+            codex_file_join::header_cache_tests::READ_CALLS.with(std::cell::Cell::get);
         let ((result, consumed), anchors) =
             crate::transcript_acquisition::capture_sample_reads(|| {
                 sampled_scan::transition_fixture::observe_consumed(run)
             });
         let identity_after = START_IDENTITY_SAMPLE_FOR_TEST.with(std::cell::Cell::get);
-        let measured =
-            (activity_before == codex_zst_refusal_tests::activity() && consumed == 0).then_some(0);
+        let activity_after = codex_zst_refusal_tests::activity();
+        let headers_after =
+            codex_file_join::header_cache_tests::READ_CALLS.with(std::cell::Cell::get);
+        let measured = (activity_before == activity_after && consumed == 0).then_some(0);
         let anchor_bytes = anchors
             .iter()
             .map(|read| read.result.expect("synthetic anchor read succeeds") as u64)
@@ -81,6 +86,11 @@ impl OwnedSourceScan {
                 cheap_checks: measured,
                 anchor_reads: Some(anchor_bytes),
                 other_reads: measured,
+                parse_activity: Some(sampled_scan::transition_fixture::ParseActivity {
+                    header_reads: (headers_after - headers_before) as u64,
+                    jsonl_parses: (activity_after.1 - activity_before.1) as u64,
+                    decoders: (activity_after.0 - activity_before.0) as u64,
+                }),
                 ..Default::default()
             },
         )

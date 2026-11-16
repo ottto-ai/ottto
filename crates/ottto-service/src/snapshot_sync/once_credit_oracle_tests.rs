@@ -729,6 +729,13 @@ impl OracleHome {
             io.cheap_checks = io.cheap_checks.zip(part.cheap_checks).map(|(a, b)| a + b);
             io.anchor_reads = io.anchor_reads.zip(part.anchor_reads).map(|(a, b)| a + b);
             io.other_reads = io.other_reads.zip(part.other_reads).map(|(a, b)| a + b);
+            io.parse_activity = io.parse_activity.zip(part.parse_activity).map(|(a, b)| {
+                transition::ParseActivity {
+                    header_reads: a.header_reads + b.header_reads,
+                    jsonl_parses: a.jsonl_parses + b.jsonl_parses,
+                    decoders: a.decoders + b.decoders,
+                }
+            });
         }
         let mut finalized = capture.take();
         // The PF probe precedes the real uploader's cache-contract projection.
@@ -2908,16 +2915,37 @@ fn scheduling_permutations_converge_to_the_same_bodies() {
                                 route.io.rederive_named, 0,
                                 "quiet named re-derive: {context}"
                             );
-                            assert_eq!(
-                                route.io.cheap_checks,
-                                Some(0),
-                                "quiet cheap checks: {context}"
-                            );
-                            assert_eq!(
-                                route.io.other_reads,
-                                Some(0),
-                                "quiet other reads: {context}"
-                            );
+                            let activity = route.io.parse_activity.unwrap_or_else(|| {
+                                panic!("quiet parse activity unmeasured: {context}")
+                            });
+                            if source == SnapshotSource::Codex {
+                                // Inventory covers the whole roster, including peers
+                                // outside this page's selection. Uncached identities
+                                // decode only the bounded session_meta first record.
+                                assert_eq!(activity.decoders, 0, "quiet decoder: {context}");
+                                assert_eq!(
+                                    activity.jsonl_parses, activity.header_reads,
+                                    "quiet non-header parse: {activity:?}: {context}"
+                                );
+                                assert!(
+                                    activity.header_reads <= files as u64,
+                                    "quiet repeated header read: {activity:?}: {context}"
+                                );
+                            }
+                            // Header byte totals remain unmeasured. The activity
+                            // invariant above bounds that identity work separately.
+                            if source != SnapshotSource::Codex || activity.header_reads == 0 {
+                                assert_eq!(
+                                    route.io.cheap_checks,
+                                    Some(0),
+                                    "quiet cheap checks: {context}"
+                                );
+                                assert_eq!(
+                                    route.io.other_reads,
+                                    Some(0),
+                                    "quiet other reads: {context}"
+                                );
+                            }
                             let sampled = route.io.anchor_reads.unwrap_or_else(|| {
                                 panic!("identity sampling unmeasured: {context}")
                             });
@@ -3037,7 +3065,8 @@ mod money_equivalence_tests {
                 "accepted_body_witnesses":cycle.progress.accepted_body_witnesses},
             "finish_ok":cycle.finish.is_ok(),"parser_bytes":cycle.consumed,
             "io":{"cheap_checks":cycle.io.cheap_checks,"anchor_reads":cycle.io.anchor_reads,
-                "other_reads":cycle.io.other_reads,"quiet_anchor_window":cycle.quiet_anchor_window},
+                "other_reads":cycle.io.other_reads,"parse_activity":cycle.io.parse_activity,
+                "quiet_anchor_window":cycle.quiet_anchor_window},
             "schedule":cycle.schedule,"evidence_chunks":cycle.evidence_chunks,"debt":cycle.debt});
         emit_trace(&out, &format!("{row}-{number}"), &receipt);
     }

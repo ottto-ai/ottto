@@ -299,6 +299,15 @@ pub(crate) fn observe_codex_quiet_with_bytes<T>(run: impl FnOnce() -> (T, u64)) 
     )
 }
 
+/// Activity counts are independent of byte receipts. Header reads decode only
+/// the bounded first record; JSONL attempts also include body lines and probes.
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+pub(crate) struct ParseActivity {
+    pub(crate) header_reads: u64,
+    pub(crate) jsonl_parses: u64,
+    pub(crate) decoders: u64,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct IoBytes {
     pub(crate) consumed: u64,
@@ -312,6 +321,8 @@ pub(crate) struct IoBytes {
     /// None is unmeasured, not zero. Quiet callers must supply the exact window.
     pub(crate) anchor_reads: Option<u64>,
     pub(crate) other_reads: Option<u64>,
+    /// None means this driver did not capture the existing activity counters.
+    pub(crate) parse_activity: Option<ParseActivity>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
