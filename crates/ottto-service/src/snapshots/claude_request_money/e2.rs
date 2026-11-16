@@ -3105,17 +3105,20 @@ fn decide_holders(
     // session id alone: path twins live under different folders and roots.
     let page: &[SnapshotItem] = items;
     // A page body the page will withhold proves nothing yet.
+    let held_here = page
+        .iter()
+        .filter(|item| late_held.contains(&item.source_session_id))
+        .filter_map(|item| {
+            item.claude_money
+                .as_deref()
+                .and_then(FileFold::location_key)
+        })
+        .collect::<BTreeSet<_>>();
     let owned = |key: &str| {
         origin_owned(index, page, key, true)
-            && (accepted_origin(index, key)
-                || !page.iter().any(|item| {
-                    late_held.contains(&item.source_session_id)
-                        && item
-                            .claude_money
-                            .as_deref()
-                            .and_then(FileFold::location_key)
-                            == Some(location_key(key))
-                }))
+            && (held_here.is_empty()
+                || !held_here.contains(&location_key(key))
+                || accepted_origin(index, key))
     };
     let mut page_folds = BTreeMap::<&str, Vec<usize>>::new();
     for (at, item) in page.iter().enumerate() {
