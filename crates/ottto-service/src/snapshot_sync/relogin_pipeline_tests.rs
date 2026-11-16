@@ -354,6 +354,7 @@ fn account_return_today_reinterprets_orphaned_history() {
                 auth_modified_at: UNIX_EPOCH,
             }],
             setup_snapshot_index: None,
+            codex_scan_homes_complete: false,
         };
         let client = SnapshotApiClient::new(server.url.clone());
         let daemon = test_daemon("machine_test");
