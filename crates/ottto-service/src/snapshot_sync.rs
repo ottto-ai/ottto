@@ -5521,6 +5521,9 @@ fn sync_once_with_retry(
     // Declared after the guard, so it settles before the lock is released.
     let mut continuation_cycle = continuation::CycleSettlement::default();
     let (device, device_secret) = load_snapshot_device_credentials()?;
+    daemon
+        .record_source_grants(&device)
+        .map_err(|_| anyhow!("source grants unavailable"))?;
     let Some(machine_id) = snapshot_machine_id(&device)? else {
         return Err(anyhow!("machine identity is missing"));
     };
@@ -6326,6 +6329,7 @@ fn upload_local_health_projection_with(
 
     let reply = client.upload_local_health_heartbeat(&relay_token, heartbeat)?;
     apply_source_control(&default_support_dir(), &reply);
+    let _ = daemon.record_source_grants(device);
     client.upload_local_health_projection(&relay_token, health)?;
     Ok(())
 }
@@ -6810,13 +6814,14 @@ fn prepare_sync_source_inner(
             activity_hint.local_usage_reconciliation_enabled,
         )
     });
-    // Cache the workspace reconciliation policy so the daemon can surface it on
-    // SourceHealth.reconciliation_enabled. Best-effort: a poisoned lock is the
-    // only error path and is not worth aborting the sync over.
-    let _ = daemon.record_reconciliation_enabled(
-        source_kind(source),
-        activity_hint.local_usage_reconciliation_enabled,
-    );
+    // Cache the raw workspace policy for status and tracking eligibility together.
+    daemon
+        .record_reconciliation_enabled(
+            source_kind(source),
+            activity_hint.local_usage_reconciliation_enabled,
+            receipt_window_days,
+        )
+        .map_err(|_| anyhow!("tracking state unavailable"))?;
     if receipt_window_days == 0 {
         withdraw_and_report_policy_stop(
             client,
@@ -8010,17 +8015,36 @@ fn finish_sync_source(
     );
     // Claude activity remains recent relative to the scan's observation
     // horizon, while future timestamps are bounded by the reconciliation clock.
-    if crate::active_sessions::reconcile_active_sessions(
+    let tracking_episode = daemon.tracking_episode(&source_kind(source));
+    let reconciled_at = current_rfc3339();
+    let since = tracking_episode
+        .as_ref()
+        .and_then(|(_, since)| OffsetDateTime::parse(since, &Rfc3339).ok());
+    let mut latest = None;
+    let mut observe = |new, previous, within_ceiling| {
+        latest = latest.max(crate::tracking_confirmation::parsed_activity_witness(
+            since,
+            new,
+            previous,
+            within_ceiling,
+        ));
+    };
+    if crate::active_sessions::reconcile_with_registrations(
         support_dir,
         source,
         &scan_result.snapshots,
         Some(&reconciliation_status),
         (source == SnapshotSource::ClaudeCode).then_some(scan_started_at.as_str()),
-        &current_rfc3339(),
+        &reconciled_at,
+        Some("local"),
         with_source_cadence(source, |cadence| {
             cadence.ordinary_interval().min(MAX_CYCLE_INTERVAL)
         })
         .unwrap_or(SNAPSHOT_SYNC_INTERVAL),
+        crate::agent_status::claude_session_registrations,
+        tracking_episode
+            .as_ref()
+            .map(|_| &mut observe as &mut dyn FnMut(_, _, _)),
     )
     .is_err()
     {
@@ -8028,6 +8052,15 @@ fn finish_sync_source(
             "local active-session cache update skipped for {}",
             source.api_slug()
         );
+    }
+
+    if let (Some((generation, _)), Some(at)) = (
+        tracking_episode,
+        latest.and_then(|at| at.format(&Rfc3339).ok()),
+    ) {
+        daemon
+            .confirm_tracking_activity(&source_kind(source), generation, &at)
+            .map_err(|_| anyhow!("tracking state unavailable"))?;
     }
 
     crate::snapshots::apply_upload_policy(source, &mut scan_result.snapshots, upload_policy);

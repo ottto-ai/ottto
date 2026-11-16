@@ -276,6 +276,15 @@ pub struct LocalSourceState {
     pub first_seen_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_health: Option<SourceHealth>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracking_confirmation: Option<LocalTrackingConfirmation>,
+}
+
+/// Repair observation episode. Generations are process-local, never persisted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalTrackingConfirmation {
+    pub since: String,
+    pub confirmed_at: Option<String>,
 }
 
 /// How a store reads its file: stores differ in whether the read is capped and in
@@ -881,6 +890,7 @@ mod tests {
         let state = LocalSourceState {
             first_seen_at: Some("2026-05-05T09:09:00Z".to_string()),
             last_health: None,
+            tracking_confirmation: None,
         };
 
         assert_eq!(store.load().expect("load missing"), None);
@@ -1030,5 +1040,53 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&dir);
         dir.join(ACCOUNT_FILE_NAME)
+    }
+}
+
+#[cfg(test)]
+mod tracking_rollback_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_rewrite_drops_only_optional_tracking_episode() {
+        // v0.1.239 LocalSourceState shape: unknown fields are intentionally ignored.
+        #[derive(Serialize, Deserialize)]
+        struct LegacyLocalSourceState {
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            first_seen_at: Option<String>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            last_health: Option<SourceHealth>,
+        }
+        let saved = LocalSourceState {
+            first_seen_at: Some("2026-11-15T10:00:00Z".into()),
+            last_health: Some(serde_json::from_value(serde_json::json!({
+                "source": "pi", "descriptor": {
+                    "source": "pi", "display_name": "Pi", "operations": [],
+                    "review_tier": "official", "maturity": "stable", "collectors": [],
+                    "local_state_owner": "local_daemon", "telemetry_owner": "backend", "repair_owner": "local_daemon"
+                },
+                "state": "healthy", "grade": "ok",
+                "account_binding": {"expected_account_id": null, "observed_account_id": null, "matched": null},
+                "config": {"discovered": false, "path_hint": null, "fingerprint": null, "drift": []},
+                "collector": null, "agent_status": null,
+                "last_seen_at": "2026-11-15T12:00:00Z", "last_verified_at": "2026-11-15T12:00:00Z",
+                "problems": [], "recommended_actions": []
+            })).unwrap()),
+            tracking_confirmation: Some(LocalTrackingConfirmation {
+                since: "2026-11-15T11:00:00Z".into(),
+                confirmed_at: Some("2026-11-15T12:00:00Z".into()),
+            }),
+        };
+        let json = serde_json::to_value(&saved).unwrap();
+        let new: LocalSourceState = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(new, saved);
+        let legacy: LegacyLocalSourceState = serde_json::from_value(json).unwrap();
+        assert_eq!(legacy.last_health, saved.last_health);
+        let rewritten = serde_json::to_value(legacy).unwrap();
+        assert!(rewritten.get("tracking_confirmation").is_none());
+        let upgraded: LocalSourceState = serde_json::from_value(rewritten).unwrap();
+        assert_eq!(upgraded.first_seen_at, saved.first_seen_at);
+        assert_eq!(upgraded.last_health, saved.last_health);
+        assert_eq!(upgraded.tracking_confirmation, None);
     }
 }

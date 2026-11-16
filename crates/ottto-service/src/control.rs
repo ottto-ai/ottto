@@ -4174,6 +4174,7 @@ fn repair_source(
     }
     crate::snapshot_sync::reset_relay_authorization_backoff();
     if let Some(plan) = scan_index_rebuild_override_repair(daemon, authorization, &source, &plan) {
+        daemon.arm_tracking_confirmation(&source, &plan)?;
         return Ok(plan);
     }
 
@@ -4183,7 +4184,9 @@ fn repair_source(
     // recovery instead of a dead "blocked, no actions" response. Build the plan
     // before the WriteConfig-only retain below would strip everything.
     if matches!(source, SourceKind::Pi) {
-        return Ok(build_pi_reauth_repair_plan(plan));
+        let plan = build_pi_reauth_repair_plan(plan);
+        daemon.arm_tracking_confirmation(&source, &plan)?;
+        return Ok(plan);
     }
 
     let mut plan = plan;
@@ -4248,6 +4251,7 @@ fn repair_source(
             )
         };
     }
+    daemon.arm_tracking_confirmation(&source, &plan)?;
     Ok(plan)
 }
 
@@ -4336,14 +4340,14 @@ fn scan_index_rebuild_override_repair(
 
 /// Build an actionable Pi recovery plan: a manual provider re-sign-in (which the
 /// daemon cannot perform — it can't re-mint a provider's rotating OAuth token)
-/// plus a follow-up re-verify, instead of the dead `config_repair_not_supported`
+/// plus next-session confirmation, instead of the dead `config_repair_not_supported`
 /// "blocked, no actions" response. Reuses the authority already computed by
 /// `propose_repair_plan` so terminal/browser approval semantics are preserved.
 fn build_pi_reauth_repair_plan(mut plan: RepairPlan) -> RepairPlan {
     plan.status = RepairPlanStatus::Proposed;
     plan.authority.message = StableMessage {
         code: "pi_provider_reauth_required".to_string(),
-        text: "Pi reported an expired provider sign-in. Re-sign in to the failing provider in Pi, then re-run Verify.".to_string(),
+        text: "Pi reported an expired provider sign-in. Re-sign in to the failing provider in Pi, then start a session so Ottto can confirm tracking. Test tracking is optional.".to_string(),
     };
     let approval = RepairActionApproval {
         surface: RepairApprovalSurface::None,
@@ -4357,7 +4361,7 @@ fn build_pi_reauth_repair_plan(mut plan: RepairPlan) -> RepairPlan {
         RepairAction {
             action: RepairActionKind::ReauthProvider,
             title: "Re-sign in to the Pi provider".to_string(),
-            detail: "Run `pi` and re-authenticate the failing provider (e.g. openai-codex), then retry Verify. Ottto can't re-mint the provider's rotating OAuth token for you.".to_string(),
+            detail: "Run `pi` and re-authenticate the failing provider (e.g. openai-codex), then start a session so Ottto can confirm tracking. Ottto can't re-mint the provider's rotating OAuth token for you.".to_string(),
             requires_approval: false,
             destructive: false,
             approval: approval.clone(),
@@ -4365,8 +4369,8 @@ fn build_pi_reauth_repair_plan(mut plan: RepairPlan) -> RepairPlan {
         },
         RepairAction {
             action: RepairActionKind::VerifyTelemetry,
-            title: "Re-run Pi verification".to_string(),
-            detail: "After re-signing in, run Verify again to confirm Pi is connected.".to_string(),
+            title: "Test Pi tracking (optional)".to_string(),
+            detail: "Ottto confirms tracking after it collects your next session. You can also run Test tracking; this optional check may use recent activity.".to_string(),
             requires_approval: false,
             destructive: false,
             approval,
@@ -9676,6 +9680,7 @@ fn setup_answer(
     // Before any connection or POST: collection stops even if the run is gone.
     if answer_type.trim() == "disable_source" {
         set_source_marker(crate::snapshot_sync::disable_snapshot_source, &source)?;
+        daemon.clear_tracking_confirmation(&source)?;
     }
     let mut connection = daemon.connection_for_authorized_client()?;
     let api_base_url = validated_api_base_url(api_base_url.as_deref().or_else(|| {
@@ -9714,6 +9719,12 @@ fn source_collection(
     require_authorized_local_client(daemon, authorization)?;
     let snapshot_source = crate::snapshot_sync::snapshot_source_of_kind(&source);
     let reply = save_source_collection(&source, enabled, |body| {
+        // The pause marker is already durable before any observation write.
+        if !enabled {
+            daemon
+                .clear_tracking_confirmation(&source)
+                .map_err(|_| anyhow::anyhow!("tracking state unavailable"))?;
+        }
         let (device, secret) = crate::snapshot_client::load_snapshot_device_credentials()?;
         let client = crate::snapshot_client::SnapshotApiClient::new(
             crate::snapshot_sync::snapshot_api_base_url()?,
@@ -13446,7 +13457,7 @@ fn run_pi_verify_source_action(
     credentials: &mut SetupRunCredentials,
     action: &SetupRunActionApiResponse,
 ) -> Result<SetupVerifyActionOutcome, LocalApiError> {
-    let mut result = run_pi_route_verification_with_credentials(api_base_url, credentials)?;
+    let mut result = run_pi_route_verification_with_credentials(api_base_url, credentials, None)?;
     record_setup_action_event(
         api_base_url,
         credentials,
@@ -15621,6 +15632,9 @@ fn verify_source_unchecked(
     source: SourceKind,
     repair: bool,
 ) -> Result<SourceVerificationResult, LocalApiError> {
+    let tracking_generation = daemon
+        .tracking_episode(&source)
+        .map(|(generation, _)| generation);
     let mut config = source_config_state_for_daemon(daemon, &source)?;
     if source_requires_config_patch(&source) && source_patch_disabled(&source) {
         let message = patch_disabled_message(&source);
@@ -15755,7 +15769,12 @@ fn verify_source_unchecked(
     if source == SourceKind::Pi {
         let connection = setup_credentials.connection.clone();
         let pi_token = setup_credentials.setup_run_token.clone();
-        let result = match run_pi_route_verification(&api_base_url, &connection, &pi_token) {
+        let result = match run_pi_route_verification(
+            &api_base_url,
+            &connection,
+            &pi_token,
+            tracking_generation.map(|generation| (daemon, generation)),
+        ) {
             Ok(result) => result,
             Err(LocalApiError::Backend(details)) if details.status == Some(401) => {
                 // Token expired mid-Pi-verify. Try a single refresh + retry.
@@ -15764,6 +15783,7 @@ fn verify_source_unchecked(
                         &api_base_url,
                         &refreshed.connection,
                         &refreshed.setup_run_token,
+                        tracking_generation.map(|generation| (daemon, generation)),
                     ) {
                         Ok(retry) => retry,
                         Err(err) => verification_result_for_backend_error_with_config(
@@ -15830,7 +15850,7 @@ fn verify_source_unchecked(
             source.clone(),
             config,
             &smoke,
-            Some(smoke_after),
+            Some(smoke_after.clone()),
         )
     } else if !config.drift.is_empty() {
         // Claude auth is a higher-priority source blocker than telemetry config
@@ -15843,7 +15863,7 @@ fn verify_source_unchecked(
             source.clone(),
             config,
             &smoke,
-            Some(smoke_after),
+            Some(smoke_after.clone()),
         )
     } else {
         let _ = emit_setup_run_fast_verification_marker_with_refresh_mut(
@@ -15896,13 +15916,16 @@ fn verify_source_unchecked(
                 verification_result_for_backend_error_with_config(
                     source,
                     config,
-                    Some(smoke_after),
+                    Some(smoke_after.clone()),
                     &error,
                 )
             }
         }
     };
-    daemon.record_verification_result(&result)?;
+    daemon.record_verification_result_with_tracking(
+        &result,
+        tracking_generation.map(|generation| (generation, smoke_after.as_str())),
+    )?;
     Ok(result)
 }
 
@@ -15973,17 +15996,19 @@ fn run_pi_route_verification(
     api_base_url: &str,
     connection: &LocalConnectionBinding,
     setup_run_token: &str,
+    tracking: Option<(&LocalDaemon, u64)>,
 ) -> Result<SourceVerificationResult, LocalApiError> {
     let mut credentials = SetupRunCredentials {
         setup_run_token: setup_run_token.to_string(),
         connection: connection.clone(),
     };
-    run_pi_route_verification_with_credentials(api_base_url, &mut credentials)
+    run_pi_route_verification_with_credentials(api_base_url, &mut credentials, tracking)
 }
 
 fn run_pi_route_verification_with_credentials(
     api_base_url: &str,
     credentials: &mut SetupRunCredentials,
+    tracking: Option<(&LocalDaemon, u64)>,
 ) -> Result<SourceVerificationResult, LocalApiError> {
     let mut routes = read_pi_smoke_routes();
     if routes.is_empty() {
@@ -16009,6 +16034,7 @@ fn run_pi_route_verification_with_credentials(
             api_base_url,
             credentials,
             route,
+            tracking,
         ));
     }
     Ok(pi_route_aggregate_result(route_results))
@@ -16018,6 +16044,7 @@ fn run_one_pi_route_verification(
     api_base_url: &str,
     credentials: &mut SetupRunCredentials,
     route: &PiModelRoute,
+    tracking: Option<(&LocalDaemon, u64)>,
 ) -> SourceRouteVerificationResult {
     // A subscription-OAuth route (openai-codex / anthropic / github-copilot)
     // authenticates via a single-use *rotating* refresh token that Ottto must not
@@ -16052,7 +16079,7 @@ fn run_one_pi_route_verification(
             billing_provider: route.classification.billing_provider.clone(),
         })
     };
-    match wait_for_setup_run_verification_with_refresh_mut_timeout(
+    let result = match wait_for_setup_run_verification_with_refresh_mut_timeout(
         api_base_url,
         credentials,
         &SourceKind::Pi,
@@ -16064,8 +16091,17 @@ fn run_one_pi_route_verification(
         },
     ) {
         Ok(verification) => pi_route_result_from_verification(route, &smoke, verification),
-        Err(error) => pi_route_result_from_backend_error(route, &smoke, Some(smoke_after), &error),
+        Err(error) => {
+            pi_route_result_from_backend_error(route, &smoke, Some(smoke_after.clone()), &error)
+        }
+    };
+    // Only this execution path ran a smoke and polled its own records. Passive
+    // routes return above, even though they also populate smoke_after.
+    if let Some((daemon, generation)) = tracking {
+        let evidence = pi_route_aggregate_result(vec![result.clone()]);
+        let _ = daemon.confirm_tracking_smoke(&evidence, generation, &smoke_after);
     }
+    result
 }
 
 fn run_pi_route_pre_smoke(
@@ -28051,7 +28087,7 @@ for line in sys.stdin:
         };
 
         let route =
-            run_one_pi_route_verification(&api_base_url, &mut credentials, &live_pi_route());
+            run_one_pi_route_verification(&api_base_url, &mut credentials, &live_pi_route(), None);
 
         let requests = requests.lock().expect("read requests").clone();
         assert!(
@@ -30609,6 +30645,71 @@ X-API-Key = "otel_redacted"
             original
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    mod tracking_confirmation_tests {
+        use super::*;
+
+        #[test]
+        #[serial]
+        fn repair_confirmation_arms_only_final_eligible_non_dry_run_plans() {
+            let _lock = lock_backend_test_env();
+            let root = control_test_root("repair-confirmation-arm");
+            let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
+            let daemon = daemon();
+            let authorization = RequestAuthorization::TrustedCompanionApp;
+            let mut plan =
+                propose_repair_plan(&daemon, &authorization, SourceKind::Pi, true).unwrap();
+            FileDeviceStore::default()
+                .save(&LocalDeviceBinding {
+                    device_id: "device_test".into(),
+                    machine_id: None,
+                    sources: vec!["claude_code".into(), "codex".into(), "pi".into()],
+                })
+                .unwrap();
+            for source in [SourceKind::ClaudeCode, SourceKind::Codex, SourceKind::Pi] {
+                for status in [
+                    RepairPlanStatus::Succeeded,
+                    RepairPlanStatus::Running,
+                    RepairPlanStatus::Proposed,
+                ] {
+                    plan.status = status;
+                    plan.dry_run = true;
+                    daemon.arm_tracking_confirmation(&source, &plan).unwrap();
+                    assert!(daemon.tracking_episode(&source).is_none());
+                    plan.dry_run = false;
+                    daemon.arm_tracking_confirmation(&source, &plan).unwrap();
+                    assert!(daemon.tracking_episode(&source).is_some());
+                    daemon.clear_tracking_confirmation(&source).unwrap();
+                }
+                for status in [RepairPlanStatus::Failed, RepairPlanStatus::Blocked] {
+                    plan.status = status;
+                    daemon.arm_tracking_confirmation(&source, &plan).unwrap();
+                    assert!(daemon.tracking_episode(&source).is_none());
+                }
+            }
+            plan.status = RepairPlanStatus::Proposed;
+            crate::snapshot_sync::disable_snapshot_source(
+                &root,
+                crate::snapshots::SnapshotSource::Pi,
+            )
+            .unwrap();
+            daemon
+                .arm_tracking_confirmation(&SourceKind::Pi, &plan)
+                .unwrap();
+            assert!(daemon.tracking_episode(&SourceKind::Pi).is_none());
+            FileDeviceStore::default().reset().unwrap();
+            daemon
+                .arm_tracking_confirmation(&SourceKind::Codex, &plan)
+                .unwrap();
+            assert!(daemon.tracking_episode(&SourceKind::Codex).is_none());
+            fs::write(ottto_core::default_device_path(), b"{").unwrap();
+            daemon
+                .arm_tracking_confirmation(&SourceKind::Codex, &plan)
+                .expect("observation cannot fail a completed Repair");
+            assert!(daemon.tracking_episode(&SourceKind::Codex).is_none());
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
