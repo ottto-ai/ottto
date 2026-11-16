@@ -335,10 +335,16 @@ pub fn render_launch_agent_plist(config: &LaunchAgentConfig) -> Result<Vec<u8>> 
     );
 
     let mut env = Dictionary::new();
-    // libmalloc reads this at process start, before daemon initialization.
+    // libmalloc reads these at process start, before daemon initialization.
+    // Space-efficient mode returns free memory in smaller pieces and sooner; it
+    // also turns off the default per-thread allocation cache.
     env.insert(
         "MallocLargeCache".to_string(),
         Value::String("0".to_string()),
+    );
+    env.insert(
+        "MallocSpaceEfficient".to_string(),
+        Value::String("1".to_string()),
     );
     env.insert(
         OTTTO_SOCKET_ENV.to_string(),
@@ -446,15 +452,19 @@ mod tests {
         Err(owner_conflict_error(&state))
     }
 
-    /// [behaviour] Generated service jobs disable libmalloc large-cache retention.
+    /// [behaviour] Generated service jobs disable libmalloc large-cache retention
+    /// and enable space-efficient mode.
     #[test]
     fn renders_valid_launch_agent_plist() {
         let config = config();
+        let env = plist_environment(&config);
         assert_eq!(
-            plist_environment(&config)
-                .get("MallocLargeCache")
-                .and_then(Value::as_string),
+            env.get("MallocLargeCache").and_then(Value::as_string),
             Some("0")
+        );
+        assert_eq!(
+            env.get("MallocSpaceEfficient").and_then(Value::as_string),
+            Some("1")
         );
         let bytes = render_launch_agent_plist(&config).expect("plist should render");
         let parsed = Value::from_reader_xml(bytes.as_slice()).expect("plist should parse");
