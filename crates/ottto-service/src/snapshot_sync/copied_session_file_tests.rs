@@ -861,7 +861,10 @@ fn held_content_twin_holder_proves_no_copy_until_released() {
         let mut saw_root = false;
         let mut saw_copy = false;
         let mut stable = false;
+        // Releasing the pace only makes T's growth read due; owe the files
+        // once so the first released page reads T, as the reference does.
         prior = released;
+        owe(&mut prior);
         for _ in 0..6 {
             let mut page = c.raw(&scanner, prior.clone(), 100, true, &[]);
             acquired_twin |= scanner.paths().contains(&twin);
