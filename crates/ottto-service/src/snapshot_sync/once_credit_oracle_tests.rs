@@ -2700,14 +2700,16 @@ fn scheduling_permutations_converge_to_the_same_bodies() {
                             let visited = paths
                                 .iter()
                                 .all(|(p, _)| first_page.contains_key(&relative(p)));
-                            if !pending && visited {
-                                if !released {
+                            // A joined Codex peer can finish without appearing in selected.
+                            // Require per-path selection only before changing fixture inputs.
+                            if !pending {
+                                if !released && visited {
                                     for (path, bytes) in &delayed {
                                         std::fs::write(path, bytes).unwrap();
                                     }
                                     released = true;
                                     home.now += 3600; // one COMPLETE source pass without this pair
-                                } else if !grown {
+                                } else if !grown && visited {
                                     let mut rows = pi_rows(false);
                                     rows[0]["id"] = json!(IDENTITY_PIPELINE_ROOT);
                                     let mut growth = rows[1].clone();
@@ -2719,7 +2721,9 @@ fn scheduling_permutations_converge_to_the_same_bodies() {
                                     write_jsonl(&paths[0].0, &rows);
                                     grown = true;
                                     home.now += 3600;
-                                } else if cycle.gate["census_complete"] == true
+                                } else if released
+                                    && grown
+                                    && cycle.gate["census_complete"] == true
                                     && schedule_debt_is_clear(&cycle.debt)
                                 {
                                     assert_eq!(cycle.gate["residue_count"], 0);
@@ -2734,7 +2738,7 @@ fn scheduling_permutations_converge_to_the_same_bodies() {
                                     }
                                     finished = true;
                                     break;
-                                } else {
+                                } else if visited {
                                     home.now += 3600;
                                 }
                             }
