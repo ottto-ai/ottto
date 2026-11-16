@@ -3771,6 +3771,7 @@ fn save_index_and_publish_manifest(
     // durable; a failed CAS/save or manifest derivation must not let a
     // concurrent heartbeat repeat stale agreement.
     withdraw_source_manifest(destination_namespace, source);
+    crate::local_resource_diagnostics::state_save_start(source.api_slug());
     index.save(index_path)?;
     if census_complete {
         publish_source_manifest(
@@ -7220,6 +7221,7 @@ fn prepare_sync_source_inner(
     } else {
         Vec::new()
     };
+    crate::local_resource_diagnostics::index_clone_start(source.api_slug());
     let mut committed_index = index.clone();
     let reoffer_paths =
         index.activate_reason_reoffer_retries(upload_progress.active_reason_reoffers.clone());
@@ -7652,6 +7654,7 @@ fn prepare_continuation_source(
     index.activate_effective_upload_body_witness_revision(cycle_body_witness_revision(source));
     // K3: as the ordinary prepare, before the scan advances it. It is dropped
     // here unless the page commits, and crosses to the parent only by move.
+    crate::local_resource_diagnostics::index_clone_start(source.api_slug());
     let committed_index = index.clone();
     // No lease is active (refused above), so this only installs the empty
     // set, as the ordinary prepare does; there are no hint paths to take.
