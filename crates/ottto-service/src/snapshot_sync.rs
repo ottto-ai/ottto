@@ -19141,22 +19141,22 @@ mod tests {
             assert_eq!(item.cache_creation_5m_tokens, hours as u64 * 20);
             items.push(item);
         }
-        let request = |snapshots| SnapshotBatchRequest {
-            schema_version: SNAPSHOT_SCHEMA_VERSION,
-            source: source.api_slug().into(),
-            machine_id: "otm_synthetic".into(),
-            collector_version: Some(collector_version()),
-            snapshots,
-            upload_policy: SnapshotUploadPolicy::default(),
-            client_report: crate::client_report::ClientReport::empty(),
-        };
+        fn request<T>(source: SnapshotSource, snapshots: Vec<T>) -> SnapshotBatchRequest<T> {
+            snapshot_batch_request(
+                source,
+                "otm_synthetic",
+                snapshots,
+                SnapshotUploadPolicy::default(),
+                crate::client_report::ClientReport::empty(),
+            )
+        }
         let large = &items[1];
         let oversized = &items[2];
-        let wire = serde_json::to_value(request(items.iter().collect::<Vec<_>>())).unwrap();
+        let wire = serde_json::to_value(request(source, items.iter().collect::<Vec<_>>())).unwrap();
         let large_bytes = serde_json::to_vec(&wire["snapshots"][1]).unwrap().len();
         assert!(large_bytes > 128 * 1024 && large_bytes <= 640 * 1024);
         assert!(serde_json::to_vec(&wire["snapshots"][2]).unwrap().len() > 640 * 1024);
-        validate_snapshot_batch_request(&request(vec![&large])).unwrap();
+        validate_snapshot_batch_request(&request(source, vec![large])).unwrap();
         let mut progress = test_upload_progress();
         progress
             .active_quarantine_witness
@@ -19191,7 +19191,7 @@ mod tests {
             |item| item.snapshot_fingerprint.as_str(),
             snapshot_upload_body_witness,
             |batch| {
-                let req = request(batch.to_vec());
+                let req = request(source, batch.to_vec());
                 validate_snapshot_batch_request(&req).map_err(|reason| {
                     anyhow::Error::new(SnapshotBatchPreflightRejected { reason })
                 })?;
