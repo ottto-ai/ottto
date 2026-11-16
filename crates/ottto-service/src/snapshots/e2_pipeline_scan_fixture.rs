@@ -886,6 +886,19 @@ pub(crate) fn upload_context_receipt_earned_for_test(index: &ScanIndex, path: &P
         })
 }
 
+/// `path`'s stored proof is bound to the active context and current replay epoch.
+pub(crate) fn upload_context_proof_is_current_for_test(index: &ScanIndex, path: &Path) -> bool {
+    index
+        .files
+        .get(&local_index_key(path))
+        .and_then(|entry| entry.upload_context_receipt.as_ref())
+        .is_some_and(|proof| {
+            index.active_upload_context_fingerprint.as_ref() == Some(&proof.context_fingerprint)
+                && proof.replay_generation
+                    == crate::snapshots::upload_context_receipt::RECEIPT_REPLAY_EPOCH
+        })
+}
+
 /// `path` still owes its own upload-context proof under the active context.
 pub(crate) fn upload_context_owed_for_test(index: &ScanIndex, path: &Path) -> bool {
     index.file_upload_context_requires_adoption(&local_index_key(path))

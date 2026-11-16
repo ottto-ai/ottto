@@ -1,7 +1,9 @@
 //! Copied files use accepted origins, across sessions and folders.
 use super::*;
 use crate::snapshots::claude_money_birth_store::location_key;
-use crate::snapshots::e2_pipeline_scan_fixture::origin_accepted_for_test;
+use crate::snapshots::e2_pipeline_scan_fixture::{
+    origin_accepted_for_test, upload_context_proof_is_current_for_test,
+};
 use crate::snapshots::sampled_scan::transition_fixture::{
     money_oracle, observe_consumed, Mode, RouteResult,
 };
@@ -754,14 +756,7 @@ fn deferred_main_with_read_content_twin_holds_until_complete() {
             assert!(proof.body_witness.is_empty());
             assert!(!entry.source_file_fingerprint.is_empty());
             assert_eq!(proof.source_witness, entry.source_file_fingerprint);
-            assert_eq!(
-                proof.context_fingerprint,
-                prior.active_upload_context_fingerprint.as_deref().unwrap()
-            );
-            assert_eq!(
-                proof.replay_generation,
-                crate::snapshots::upload_context_receipt::RECEIPT_REPLAY_EPOCH
-            );
+            assert!(upload_context_proof_is_current_for_test(&prior, &twin));
             assert!(!upload_context_receipt_earned_for_test(&prior, &twin));
             assert!(!upload_context_owed_for_test(&prior, &twin));
         });
