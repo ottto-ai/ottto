@@ -152,6 +152,7 @@ impl OwnedSourceScan {
             active_file: active_frame,
             mut codex_join_inventory,
             mut codex_join_prepared,
+            mut codex_inventory_hold_counts,
             mut codex_join_groups,
             mut codex_join_active,
             mut codex_join_completed,
@@ -586,7 +587,19 @@ impl OwnedSourceScan {
                     if !inventory_held.is_empty() {
                         if let Some(traversal) = index.traversal.as_mut() {
                             inventory_held.extend(residue_index_keys.iter().cloned());
-                            record_codex_inventory_hold(traversal, inventory, &inventory_held);
+                            let (held, awaiting, outside) =
+                                record_codex_inventory_hold(traversal, inventory, &inventory_held);
+                            // The fold records and counts the residue keys
+                            // again, so its census line carries only the rest.
+                            let residue_outside = residue_index_keys
+                                .iter()
+                                .filter(|key| !traversal.codex_rollout_paths.contains(*key))
+                                .count();
+                            codex_inventory_hold_counts = (
+                                held.saturating_sub(residue_index_keys.len()),
+                                awaiting,
+                                outside.saturating_sub(residue_outside),
+                            );
                         }
                     }
                     while !identified_candidates.is_empty()
@@ -2948,7 +2961,9 @@ impl OwnedSourceScan {
                 if source == SnapshotSource::ClaudeCode {
                     index.probe_absent_claude_account_deferred_holds();
                 }
-                let mut inventory_hold = (0, false, 0);
+                // Preparation recorded this page's held candidates; the fold
+                // adds the residue it records now.
+                let mut inventory_hold = codex_inventory_hold_counts;
                 if let Some(traversal) = index.traversal.as_mut() {
                     // A residue file that this page parsed to completion, or that a
                     // watcher hint proved absent, leaves the generation's residue set; a
@@ -2967,8 +2982,13 @@ impl OwnedSourceScan {
                         .as_ref()
                         .filter(|inventory| !inventory.complete)
                     {
-                        inventory_hold =
+                        let (held, awaiting, outside) =
                             record_codex_inventory_hold(traversal, inventory, &residue_index_keys);
+                        inventory_hold = (
+                            inventory_hold.0 + held,
+                            inventory_hold.1 || awaiting,
+                            inventory_hold.2 + outside,
+                        );
                     }
                     traversal.residue.index_keys.extend(residue_index_keys);
                     // Exact watcher remove/rename hints must amend the same durable
@@ -5089,6 +5109,7 @@ impl OwnedSourceScan {
             ),
             codex_join_inventory,
             codex_join_prepared,
+            codex_inventory_hold_counts,
             codex_join_groups,
             codex_join_active,
             codex_join_completed,
