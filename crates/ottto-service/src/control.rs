@@ -33205,7 +33205,7 @@ X-API-Key = "otel_redacted"
             KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
                 .save("synthetic-return-secret-a")
                 .unwrap();
-            return (device, "synthetic-return-secret-a".into());
+            return crate::snapshot_client::load_snapshot_device_credentials().unwrap();
         }
         let prior = prior_device_credential_for_registration().unwrap();
         let (mut pending, secret) = owner_return_pending(user, org, device_id);
@@ -33233,7 +33233,9 @@ X-API-Key = "otel_redacted"
         .unwrap();
         promote_relogin(&pending, &secret, "setup");
         clear_prior_device_credential().unwrap();
-        (device, secret)
+        let active = crate::snapshot_client::load_snapshot_device_credentials().unwrap();
+        assert_eq!(active, (device, secret));
+        active
     }
 
     fn journaled_namespace(pending: &PendingDeviceCredentialPreparation) -> Option<String> {
