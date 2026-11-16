@@ -212,6 +212,11 @@ pub(crate) struct OwnedSourceScan {
     pub(in crate::snapshots) active_file: sampled_scan::codex_cursor::ActiveFrame,
     pub(in crate::snapshots) codex_join_inventory: Option<codex_file_join::HeaderInventory>,
     pub(in crate::snapshots) codex_join_prepared: bool,
+    /// This page's inventory hold counts recorded at preparation, for its
+    /// census line only: held, awaiting directories, outside the roster.
+    /// Residue keys are left out; the fold records and counts them. In
+    /// memory only, so they survive preparation's yield.
+    pub(in crate::snapshots) codex_inventory_hold_counts: (usize, bool, usize),
     pub(in crate::snapshots) codex_join_groups: VecDeque<codex_file_join::Group>,
     pub(in crate::snapshots) codex_join_active: Option<Box<codex_file_join::GroupBoot>>,
     pub(in crate::snapshots) codex_join_completed: Vec<codex_file_join::Group>,
@@ -436,6 +441,7 @@ impl OwnedSourceScan {
             active_file: Default::default(),
             codex_join_inventory: evidence.map(|e| e.inventory),
             codex_join_prepared: true,
+            codex_inventory_hold_counts: (0, false, 0),
             codex_join_groups: Default::default(),
             codex_join_active: None,
             codex_join_completed: Vec::new(),
@@ -1346,6 +1352,7 @@ impl OwnedSourceScan {
             active_file: Default::default(),
             codex_join_inventory,
             codex_join_prepared: false,
+            codex_inventory_hold_counts: (0, false, 0),
             codex_join_groups: VecDeque::new(),
             codex_join_active: None,
             codex_join_completed: Vec::new(),
