@@ -109,12 +109,11 @@ fn integrated_post(
     Ok(())
 }
 fn integrated_ack(
-    request: &SnapshotBatchRequest,
+    request: &SnapshotBatchRequest<impl std::borrow::Borrow<SnapshotItem>>,
 ) -> Result<crate::snapshot_client::SnapshotBatchResponse> {
     // Synthetic bounded fixture response, not a proposed production response limit.
     let entities = request
-        .snapshots
-        .iter()
+        .items()
         .map(|item| {
             let version = crate::snapshot_client::snapshot_ack_body_witness_version(item)?;
             if version.is_none() {
@@ -213,7 +212,7 @@ fn integrated_send(
                         source: source.api_slug().into(),
                         machine_id: "a".repeat(64),
                         collector_version: Some(collector_version()),
-                        snapshots: items,
+                        snapshots: items.to_vec(),
                         upload_policy: SnapshotUploadPolicy::default(),
                         client_report: lease.report().clone(),
                     };

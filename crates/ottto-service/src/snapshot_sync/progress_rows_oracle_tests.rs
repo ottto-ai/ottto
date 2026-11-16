@@ -101,7 +101,7 @@ struct Receiver {
 impl Receiver {
     fn respond(
         &mut self,
-        batch: &[SnapshotItem],
+        batch: &[&SnapshotItem],
     ) -> Result<crate::snapshot_client::SnapshotBatchResponse> {
         for item in batch {
             let witness = snapshot_upload_body_witness(item);

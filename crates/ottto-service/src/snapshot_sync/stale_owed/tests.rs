@@ -47,13 +47,13 @@ fn offer(
         snapshot_upload_body_witness,
         |batch| {
             calls += 1;
-            let reply = response(&batch[0], reason);
+            let reply = response(batch[0], reason);
             reply.validate_entity_ack(&SnapshotBatchRequest {
                 schema_version: SNAPSHOT_SCHEMA_VERSION,
                 source: source.api_slug().into(),
                 machine_id: "synthetic".into(),
                 collector_version: None,
-                snapshots: batch,
+                snapshots: batch.to_vec(),
                 upload_policy: SnapshotUploadPolicy::default(),
                 client_report: crate::client_report::ClientReport::empty(),
             })?;

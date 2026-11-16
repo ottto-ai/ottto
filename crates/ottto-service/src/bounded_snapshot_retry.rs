@@ -356,7 +356,7 @@ impl PreparedRetry {
                     let request = snapshot_batch_request(
                         source,
                         machine_id,
-                        snapshots,
+                        snapshots.to_vec(),
                         policy,
                         lease.report().clone(),
                     );

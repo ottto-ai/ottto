@@ -18,7 +18,10 @@ fn item(i: usize, literal: bool) -> SnapshotItem {
     item
 }
 
-fn request(source: SnapshotSource, items: Vec<SnapshotItem>) -> SnapshotBatchRequest {
+fn request<T: std::borrow::Borrow<SnapshotItem>>(
+    source: SnapshotSource,
+    items: Vec<T>,
+) -> SnapshotBatchRequest<T> {
     SnapshotBatchRequest {
         schema_version: SNAPSHOT_SCHEMA_VERSION,
         source: source.api_slug().into(),
@@ -31,19 +34,26 @@ fn request(source: SnapshotSource, items: Vec<SnapshotItem>) -> SnapshotBatchReq
 }
 
 /// Accept every item except `rejected`'s, which get `(reason, permanent)`.
-fn ack(items: &[SnapshotItem], rejected: &[(usize, &str, bool)]) -> SnapshotBatchResponse {
+fn ack(
+    items: &[impl std::borrow::Borrow<SnapshotItem>],
+    rejected: &[(usize, &str, bool)],
+) -> SnapshotBatchResponse {
+    let items = items
+        .iter()
+        .map(std::borrow::Borrow::borrow)
+        .collect::<Vec<&SnapshotItem>>();
     let refused = |i: usize| rejected.iter().find(|(at, _, _)| *at == i);
     let accepted = (0..items.len())
         .filter(|i| refused(*i).is_none())
         .map(|i| {
             let version =
-                crate::snapshot_client::snapshot_ack_body_witness_version(&items[i]).unwrap();
+                crate::snapshot_client::snapshot_ack_body_witness_version(items[i]).unwrap();
             SnapshotEntityRef {
                 source_session_id: items[i].source_session_id.clone(),
                 snapshot_fingerprint: items[i].snapshot_fingerprint.clone(),
                 occurrence_count: 1,
                 body_witness_version: version,
-                body_witness_digest: version.map(|_| snapshot_upload_body_witness(&items[i])),
+                body_witness_digest: version.map(|_| snapshot_upload_body_witness(items[i])),
                 head_etag: None,
                 head_challenge: None,
                 unchanged_basis: None,
@@ -79,10 +89,10 @@ fn ack(items: &[SnapshotItem], rejected: &[(usize, &str, bool)]) -> SnapshotBatc
 
 /// The batch position of `fingerprint`: the uploader packs by fingerprint,
 /// not by input order.
-fn at(batch: &[SnapshotItem], fingerprint: &str) -> usize {
+fn at(batch: &[impl std::borrow::Borrow<SnapshotItem>], fingerprint: &str) -> usize {
     batch
         .iter()
-        .position(|item| item.snapshot_fingerprint == fingerprint)
+        .position(|item| std::borrow::Borrow::borrow(item).snapshot_fingerprint == fingerprint)
         .unwrap()
 }
 
@@ -98,7 +108,7 @@ fn upload(
     scope: &str,
     ledger: &mut SnapshotUploadProgress,
     accepted: &mut u64,
-    mut respond: impl FnMut(&[SnapshotItem]) -> SnapshotBatchResponse,
+    mut respond: impl FnMut(&[&SnapshotItem]) -> SnapshotBatchResponse,
 ) -> Result<ResumableUploadResult> {
     upload_resumable_batches_with_body_witness(
         items,
@@ -108,8 +118,8 @@ fn upload(
         |i| i.snapshot_fingerprint.as_str(),
         snapshot_upload_body_witness,
         |batch| {
-            let response = respond(&batch);
-            response.validate_entity_ack(&request(SnapshotSource::ClaudeCode, batch))?;
+            let response = respond(batch);
+            response.validate_entity_ack(&request(SnapshotSource::ClaudeCode, batch.to_vec()))?;
             Ok(response)
         },
         |_| Ok(()),
@@ -392,8 +402,8 @@ fn non_literal_hold_is_an_invalid_ack_and_checkpoints_nothing() {
         |i| i.snapshot_fingerprint.as_str(),
         snapshot_upload_body_witness,
         |batch| {
-            let response = ack(&batch, &[(0, HELD, false)]);
-            response.validate_entity_ack(&request(SnapshotSource::ClaudeCode, batch))?;
+            let response = ack(batch, &[(0, HELD, false)]);
+            response.validate_entity_ack(&request(SnapshotSource::ClaudeCode, batch.to_vec()))?;
             Ok(response)
         },
         |_| panic!("an invalid ACK must not checkpoint"),
