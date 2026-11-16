@@ -649,6 +649,23 @@ fn accumulate(target: &mut BTreeMap<String, u64>, page: BTreeMap<String, u64>) {
 fn within_bound(actual: u64, baseline: u64) -> bool {
     u128::from(actual) * 5 <= u128::from(baseline) * 6
 }
+/// Sidecar reuse is judged by rate, not count: fewer passes reuse fewer homes
+/// at the same rate. Each kind's reused / (reused + reloaded) must stay at
+/// least the baseline rate / 1.20, as the RC scorecard floors its reuse ratio;
+/// reload counts keep the cost ceiling. Both denominators must be positive.
+fn reuse_rate_within(reused: u64, reloaded: u64, base_reused: u64, base_reloaded: u64) -> bool {
+    let total = u128::from(reused) + u128::from(reloaded);
+    let base_total = u128::from(base_reused) + u128::from(base_reloaded);
+    if total == 0 || base_total == 0 {
+        return false;
+    }
+    let product = |a: u128, b: u128, k: u128| {
+        a.checked_mul(b)
+            .and_then(|v| v.checked_mul(k))
+            .expect("reuse counts fit the exact comparison")
+    };
+    product(u128::from(reused), base_total, 6) >= product(u128::from(base_reused), total, 5)
+}
 pub(crate) fn companion_bound(key: &str, observed: u64) {
     if std::env::var("OTTTO_RESOURCE_RECORD_BASELINE").as_deref() == Ok("1") {
         return;
@@ -722,10 +739,25 @@ fn check_baseline(actual: &BTreeMap<String, BTreeMap<String, u64>>, baseline: &V
                 .get(key)
                 .and_then(Value::as_u64)
                 .expect("reviewed counter baseline required");
-            assert!(
-                within_bound(*value, bound),
-                "resource bound tripped: {phase}/{key}: {value} > 1.20 * {bound}"
-            );
+            if let Some(kind) = key.strip_prefix("reused.") {
+                let reload = format!("reloaded.{kind}");
+                let reloaded = *observed.get(&reload).expect("reuse needs its reload count");
+                let base_reloaded = expected
+                    .get(&reload)
+                    .and_then(Value::as_u64)
+                    .expect("reviewed reload baseline required");
+                assert!(
+                    reuse_rate_within(*value, reloaded, bound, base_reloaded),
+                    "resource reuse rate tripped: {phase}/{kind}: {value}/{} < ({bound}/{}) / 1.20",
+                    value + reloaded,
+                    bound + base_reloaded
+                );
+            } else {
+                assert!(
+                    within_bound(*value, bound),
+                    "resource bound tripped: {phase}/{key}: {value} > 1.20 * {bound}"
+                );
+            }
         }
     }
 }
@@ -1054,6 +1086,16 @@ fn resource_observation_contract() {
     assert!(within_bound(120, 100));
     assert!(!within_bound(121, 100));
     assert!(!within_bound(1, 0));
+    // Reuse is a rate floor: fewer passes at the same rate pass, and the rate
+    // may fall to the baseline rate / 1.20 but no further.
+    assert!(reuse_rate_within(40, 0, 56, 0));
+    assert!(reuse_rate_within(77, 11, 77, 11));
+    assert!(reuse_rate_within(84, 16, 100, 0));
+    assert!(!reuse_rate_within(83, 17, 100, 0));
+    assert!(!reuse_rate_within(0, 88, 77, 11));
+    // A rate needs loads on both sides.
+    assert!(!reuse_rate_within(0, 0, 56, 0));
+    assert!(!reuse_rate_within(5, 0, 0, 0));
 }
 
 /// [regress] Test-only option-A replay asks the native cadence for another

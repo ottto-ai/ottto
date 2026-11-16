@@ -562,6 +562,20 @@ fn swapped_archive_sibling(error: &anyhow::Error, path: &Path) -> Option<PathBuf
     .then_some(archive)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The hold counts each incomplete census line on this test thread
+    /// reported, oldest first.
+    static REPORTED_HOLD_COUNTS: std::cell::RefCell<Vec<(usize, bool, usize)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+/// Run `f` and return the hold counts its census lines reported.
+#[cfg(test)]
+fn observe_reported_hold_counts<T>(f: impl FnOnce() -> T) -> (Vec<(usize, bool, usize)>, T) {
+    REPORTED_HOLD_COUNTS.with(|seen| seen.borrow_mut().clear());
+    let value = f();
+    (REPORTED_HOLD_COUNTS.with(|seen| seen.take()), value)
+}
 impl HeaderInventory {
     pub(super) fn new(
         roots: &[PathBuf],
@@ -608,6 +622,8 @@ impl HeaderInventory {
         (held, awaiting, outside): (usize, bool, usize),
     ) -> Option<String> {
         (!self.complete).then(|| {
+            #[cfg(test)]
+            REPORTED_HOLD_COUNTS.with(|seen| seen.borrow_mut().push((held, awaiting, outside)));
             format!(
                 " inventory_held={held} inventory_awaiting_directories={} inventory_outside_roster={outside} {}",
                 u8::from(awaiting),
@@ -4606,6 +4622,21 @@ pub(super) mod tests {
             .contains_key(&local_index_key(&unreadable)));
         let witness = path_witness(&new).unwrap();
         (root, held_index, unreadable, new, witness)
+    }
+    #[test]
+    fn held_page_reports_its_prepared_hold_on_the_census_line() {
+        // Preparation records the hold and yields before the fold, which
+        // writes the census line. The line still counts the held page, once.
+        let (counts, (root, index, _, _, _)) =
+            observe_reported_hold_counts(held_behind_unreadable_header);
+        let hold = inventory_hold(&index).unwrap();
+        let &(held, _, outside) = counts
+            .last()
+            .expect("the held page writes an incomplete census line");
+        assert!(held > 0, "{counts:?}");
+        assert_eq!(held, hold.owed.len(), "{counts:?}");
+        assert_eq!(outside, hold.outside_roster.len(), "{counts:?}");
+        fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn unreadable_new_header_holds_the_page_only_while_it_is_unreadable() {

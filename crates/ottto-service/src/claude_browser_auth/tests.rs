@@ -2881,11 +2881,10 @@ fn target_registry_exposure_is_fenced_before_sidecar_binding_is_sealed() {
         br#"{"oauthAccount":{"accountUuid":"wrong-account","organizationUuid":"wrong-org","emailAddress":"wrong@example.invalid"}}"#,
     )
     .expect("wrong identity");
-    fs::write(
+    crate::test_scratch::write_private_file(
         reusable.join(".credentials.json"),
         br#"{"claudeAiOauth":{"accessToken":"fixture-wrong-token","refreshToken":"fixture-wrong-token-refresh","expiresAt":4102444800000,"scopes":["user:inference"]}}"#,
-    )
-    .expect("wrong credential");
+    );
     let store = FileClaudeConfigSlotSettingsStore::default();
     let prepared = store
         .prepare_managed_account_target_in_reusable_root(
@@ -2980,11 +2979,10 @@ fn reconnect_core_refresh_is_fenced_before_sidecar_start() {
         br#"{"oauthAccount":{"accountUuid":"wrong-account","organizationUuid":"wrong-org","emailAddress":"wrong@example.invalid"}}"#,
     )
     .expect("wrong identity");
-    fs::write(
+    crate::test_scratch::write_private_file(
         managed.join(".credentials.json"),
         br#"{"claudeAiOauth":{"accessToken":"fixture-wrong-token","refreshToken":"fixture-wrong-token-refresh","expiresAt":4102444800000,"scopes":["user:inference"]}}"#,
-    )
-    .expect("wrong credential");
+    );
     let operation_id = "claude_setup_82828282828282828282828282828282";
     let target_id = "claude_anchor_target_82828282828282828282828282828282";
     claim_ceremony(operation_id).expect("claim");
@@ -3650,11 +3648,10 @@ exit 1
         .expect("identity"),
     )
     .expect("identity write");
-    fs::write(
+    crate::test_scratch::write_private_file(
         Path::new(&operation.config_dir).join(".credentials.json"),
         br#"{"claudeAiOauth":{"accessToken":"fixture-fallback-token","refreshToken":"fixture-fallback-token-refresh","expiresAt":4102444800000,"scopes":["user:inference"]}}"#,
-    )
-    .expect("credential write");
+    );
     for _ in 0..80 {
         if read_operation(operation_id).is_some_and(|current| current.fallback_completed) {
             break;

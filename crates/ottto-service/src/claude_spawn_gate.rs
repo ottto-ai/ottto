@@ -825,7 +825,8 @@ pub(crate) mod probe {
 /// Shared fixture for spawn-site tests in other modules: throwaway HOME and
 /// support dirs, a fake `claude` that logs every spawn as
 /// `<CLAUDE_CONFIG_DIR>|<args>`, and a fake `security` that serves only the
-/// default login item this fixture writes. Never the real CLI or keychain.
+/// default login item this fixture writes (also written as the native
+/// credentials file non-macOS platforms read). Never the real CLI or keychain.
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::{ClaudeConfigDirSlot, ClaudeGateCredential};
@@ -1063,6 +1064,13 @@ pub(crate) mod test_support {
                 }
             });
             std::fs::write(&self.item, item.to_string()).expect("write item");
+            // The native credentials file, which non-macOS platforms read.
+            let native = self.root.join("home").join(".claude");
+            std::fs::create_dir_all(&native).expect("credentials dir");
+            crate::test_scratch::write_private_file(
+                native.join(".credentials.json"),
+                item.to_string(),
+            );
         }
 
         /// Every logged spawn except `--version` probes, which a detached

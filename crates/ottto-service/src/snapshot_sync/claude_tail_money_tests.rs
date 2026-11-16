@@ -401,25 +401,41 @@ fn compare_claude_pages(c: &Corpus, mut pages: [Page; 3]) -> ReceiptBody {
     compare_claude_uploads(&pages)
 }
 
+#[track_caller]
 pub(super) fn compare_claude_uploads(pages: &[Page; 3]) -> ReceiptBody {
+    use crate::snapshots::e2_pipeline_scan_fixture::twin_diagnostics as diag;
     let [tail, full, disk] = pages;
+    diag::owner("RAM");
     let (a, wire_a, _) = upload(&tail.scan.snapshots, &mut e2_progress(), ack);
+    diag::emitted("RAM", &wire_a);
+    diag::owner("cold");
     let (b, wire_b, _) = upload(&full.scan.snapshots, &mut e2_progress(), ack);
+    diag::emitted("cold", &wire_b);
+    diag::owner("restart");
     let (d, wire_d, _) = upload(&disk.scan.snapshots, &mut e2_progress(), ack);
-    assert_eq!(a.unwrap(), ResumableUploadResult::Completed);
-    assert_eq!(b.unwrap(), ResumableUploadResult::Completed);
-    assert_eq!(d.unwrap(), ResumableUploadResult::Completed);
-    assert!(!wire_a.is_empty(), "fixture must reach real upload");
-    assert_eq!(wire_a, wire_b, "emitted full envelopes differ");
+    diag::emitted("restart", &wire_d);
+    let context = diag::context();
+    assert_eq!(a.unwrap(), ResumableUploadResult::Completed, "{context}");
+    assert_eq!(b.unwrap(), ResumableUploadResult::Completed, "{context}");
+    assert_eq!(d.unwrap(), ResumableUploadResult::Completed, "{context}");
+    assert!(
+        !wire_a.is_empty(),
+        "fixture must reach real upload\n{context}"
+    );
+    assert_eq!(wire_a, wire_b, "emitted full envelopes differ\n{context}");
     assert_eq!(
         wire_d, wire_b,
-        "disk-restored envelopes differ from cold Full"
+        "disk-restored envelopes differ from cold Full\n{context}"
     );
     assert_eq!(
         wire_d, wire_a,
-        "disk-restored envelopes differ from the RAM arm"
+        "disk-restored envelopes differ from the RAM arm\n{context}"
     );
-    assert_eq!(disk.scan.snapshots.len(), full.scan.snapshots.len());
+    assert_eq!(
+        disk.scan.snapshots.len(),
+        full.scan.snapshots.len(),
+        "{context}"
+    );
     for ((a, b), d) in tail
         .scan
         .snapshots
@@ -429,20 +445,24 @@ pub(super) fn compare_claude_uploads(pages: &[Page; 3]) -> ReceiptBody {
     {
         assert_eq!(
             snapshot_upload_body_witness(a),
-            snapshot_upload_body_witness(b)
+            snapshot_upload_body_witness(b),
+            "{context}"
         );
         assert_eq!(
             snapshot_upload_body_witness(d),
-            snapshot_upload_body_witness(b)
+            snapshot_upload_body_witness(b),
+            "{context}"
         );
     }
     assert_eq!(
         Sha256::digest(canonical(&wire_a)),
-        Sha256::digest(canonical(&wire_b))
+        Sha256::digest(canonical(&wire_b)),
+        "{context}"
     );
     assert_eq!(
         Sha256::digest(canonical(&wire_d)),
-        Sha256::digest(canonical(&wire_b))
+        Sha256::digest(canonical(&wire_b)),
+        "{context}"
     );
     ReceiptBody {
         raw: canonical(&wire_a),
@@ -4300,4 +4320,8 @@ fn conflict_then_append() {
         assert_eq!(wire_a, wire_b, "the RAM arm's Full equals the cold Full");
         answers(&pages[0], &progress, &challenge);
     });
+}
+
+mod forced_twin_tail_tests {
+    include!("forced_twin_tail_tests.rs");
 }
