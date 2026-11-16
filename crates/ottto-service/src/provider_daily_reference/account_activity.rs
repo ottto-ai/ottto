@@ -175,8 +175,10 @@ impl ActivityStore {
 
     /// Replace the file. On failure the old file may survive, so it is
     /// removed, a marker is left beside it, and the path is distrusted until
-    /// a full reset is written. Errors are never formatted: they can name
-    /// the path.
+    /// a full reset is written. A directory that refuses the removal and the
+    /// marker alike leaves only this process's distrust; while writes keep
+    /// failing, the old map stops proving idleness two hours after its last
+    /// page. Errors are never formatted: they can name the path.
     fn write(&self, map: &ActivityMap, clears_untrusted: bool) {
         if atomic_json_write(&self.path, map).is_ok() {
             if clears_untrusted {
@@ -189,7 +191,8 @@ impl ActivityStore {
             return;
         }
         let _ = fs::remove_file(&self.path);
-        let _ = fs::write(self.marker(), b"");
+        // Synced with its directory, so the removal above is durable too.
+        let _ = atomic_json_write(&self.marker(), &());
         untrusted_paths().insert(self.path.clone());
     }
 
