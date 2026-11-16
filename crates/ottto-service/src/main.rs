@@ -35,6 +35,11 @@ enum Command {
         config_dir: String,
         #[arg(long)]
         control_fd: i32,
+        /// Ignored. Kept only for daemons released before 2026-11 that still
+        /// pass their retired code pipe; remove in the first release after the
+        /// app-side code-entry removal ships.
+        #[arg(long, hide = true)]
+        code_fd: Option<i32>,
         #[arg(long)]
         ready_fd: i32,
     },
@@ -244,8 +249,12 @@ fn main() -> Result<()> {
             operation_id,
             config_dir,
             control_fd,
+            code_fd,
             ready_fd,
         } => {
+            if let Some(fd) = code_fd.filter(|fd| *fd != control_fd && *fd != ready_fd) {
+                ottto_service::claude_browser_auth::close_legacy_code_fd(fd);
+            }
             let code = ottto_service::claude_browser_auth::run_auth_supervisor(
                 &operation_id,
                 &config_dir,
@@ -1078,6 +1087,36 @@ mod tests {
     use clap::CommandFactory;
     use std::ffi::OsString;
     use std::fs;
+
+    #[test]
+    fn auth_supervisor_accepts_and_ignores_a_legacy_code_fd() {
+        let parse = |extra: &[&str]| {
+            let mut args = vec![
+                "ottto-service",
+                "claude-auth-supervisor",
+                "--operation-id",
+                "claude_setup_0123456789abcdef0123456789abcdef",
+                "--config-dir",
+                "/x",
+                "--control-fd",
+                "3",
+            ];
+            args.extend_from_slice(extra);
+            args.extend_from_slice(&["--ready-fd", "5"]);
+            Cli::try_parse_from(args).map(|cli| cli.command)
+        };
+        for (extra, expected) in [(&["--code-fd", "4"][..], Some(4)), (&[][..], None)] {
+            assert!(matches!(
+                parse(extra),
+                Ok(Some(Command::ClaudeAuthSupervisor {
+                    control_fd: 3,
+                    ready_fd: 5,
+                    code_fd,
+                    ..
+                })) if code_fd == expected
+            ));
+        }
+    }
 
     #[test]
     fn local_state_sweep_needs_exactly_one_of_plan_and_apply() {

@@ -303,6 +303,8 @@ pub(crate) fn annotate_status(mut status: ClaudeAccountsStatusV1) -> ClaudeAccou
     status.browser_auth_supported = Some(true);
     // Legacy capability: older apps gate browser reopen/retry on it. No code
     // is accepted; the retired submit command only gets a structured reply.
+    // Kept only so apps released before 2026-11 keep their reopen button;
+    // remove in the first release after the app-side code-entry removal ships.
     status.auth_code_entry_supported = Some(cfg!(unix));
     let state = read_state();
     let retained = state
@@ -2144,6 +2146,37 @@ fn spawn_supervised_login(
         child,
         control: None,
     })
+}
+
+/// Closes the code pipe that a daemon from before the code relay was retired
+/// still passes as `--code-fd` when it launches this binary's supervisor. The
+/// descriptor is never read. Only a live read-only pipe above the standard
+/// streams is closed, so a stray number cannot close anything else.
+/// Kept only for daemons released before 2026-11; remove in the first release
+/// after the app-side code-entry removal ships.
+#[doc(hidden)]
+pub fn close_legacy_code_fd(fd: i32) {
+    #[cfg(unix)]
+    {
+        if fd <= libc::STDERR_FILENO {
+            return;
+        }
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || flags & libc::O_ACCMODE != libc::O_RDONLY {
+            return;
+        }
+        let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe { libc::fstat(fd, metadata.as_mut_ptr()) } != 0 {
+            return;
+        }
+        // SAFETY: fstat initialized the structure on success.
+        let metadata = unsafe { metadata.assume_init() };
+        if metadata.st_mode & libc::S_IFMT == libc::S_IFIFO {
+            unsafe { libc::close(fd) };
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = fd;
 }
 
 /// Hidden child-process entry point. It acquires durable lifetime evidence

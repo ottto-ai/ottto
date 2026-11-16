@@ -194,7 +194,9 @@ Any fields such a request carries are ignored: they are not retained,
 logged, reported in diagnostics, echoed, or passed to Claude. An unauthorized
 caller gets the ordinary authorization error instead. Status still reports
 `auth_code_entry_supported` because older apps gate their browser reopen and
-retry controls on it; it no longer means that a code is accepted.
+retry controls on it; it no longer means that a code is accepted. It is kept
+only so apps released before 2026-11 keep their reopen button and will be
+removed in the first release after the app-side code-entry removal ships.
 
 Browser setup is idempotent by opaque operation id, including across daemon
 restarts. The daemon persists lifecycle and exact-root identity, never adopts a

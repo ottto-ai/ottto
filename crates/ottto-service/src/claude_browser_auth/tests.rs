@@ -239,6 +239,32 @@ fn private_provider_pty_is_interactive_and_does_not_echo_secrets() {
     assert_eq!(attributes.c_lflag & (libc::ECHO | libc::ECHONL), 0);
 }
 
+/// A legacy `--code-fd` is closed without being read, and only when it is a
+/// live read-only pipe: a write end or a standard stream is left alone.
+#[test]
+#[cfg(unix)]
+fn legacy_code_fd_closes_only_a_read_only_pipe() {
+    let mut fds = [-1; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    let [read_fd, write_fd] = fds;
+    let write_byte = || unsafe { libc::write(write_fd, b"x".as_ptr().cast(), 1) };
+
+    close_legacy_code_fd(-1);
+    close_legacy_code_fd(libc::STDIN_FILENO);
+    close_legacy_code_fd(write_fd);
+    assert_eq!(write_byte(), 1, "the write end and its reader stay open");
+
+    close_legacy_code_fd(read_fd);
+    // With the only reader closed, a write fails with EPIPE even if another
+    // thread has since reused the closed descriptor number.
+    assert_eq!(write_byte(), -1);
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::EPIPE)
+    );
+    unsafe { libc::close(write_fd) };
+}
+
 #[test]
 #[cfg(unix)]
 fn provider_output_drain_consumes_unbounded_output_until_eof() {
