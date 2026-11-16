@@ -24,13 +24,15 @@ use ottto_core::{
     redact_inline, release_channel_from_str, ClaudeConfigSlotSettingsError,
     CodexAccountSlotSettingsError, ControlTokenStore, DeviceCredentialContinuity, FileAccountStore,
     FileClaudeConfigSlotSettingsStore, FileCodexAccountSlotSettingsStore, FileConnectionStore,
-    FileDeviceStore, FileMachineStore, FilePendingDeviceCredentialStore, KeychainSecretStore,
-    LocalConnectionBinding, LocalCredentialOwner, LocalDeviceBinding, LocalDeviceCredentialBinding,
-    LocalDeviceEnvelope, PendingClaimCredentialCommit, PendingDeviceCredentialPreparation,
-    PendingDeviceCredentialRequestAuthority, SnapshotNamespaceAlias, TokenStoreError,
-    UninstallExecutionOptions, OTTTO_CLIENT_NAME, OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT,
-    OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT, OTTTO_PRIOR_RELAY_DEVICE_SECRET_ACCOUNT,
-    OTTTO_RELAY_DEVICE_SECRET_ACCOUNT, OTTTO_SERVICE_BINARY_NAME, OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
+    FileDeviceStore, FileMachineStore, FileOwnerSnapshotNamespaceStore,
+    FilePendingDeviceCredentialStore, KeychainSecretStore, LocalConnectionBinding,
+    LocalCredentialOwner, LocalDeviceBinding, LocalDeviceCredentialBinding, LocalDeviceEnvelope,
+    OwnerSnapshotKey, OwnerSnapshotNamespace, PendingClaimCredentialCommit,
+    PendingDeviceCredentialPreparation, PendingDeviceCredentialRequestAuthority,
+    SnapshotNamespaceAlias, TokenStoreError, UninstallExecutionOptions, OTTTO_CLIENT_NAME,
+    OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT, OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT,
+    OTTTO_PRIOR_RELAY_DEVICE_SECRET_ACCOUNT, OTTTO_RELAY_DEVICE_SECRET_ACCOUNT,
+    OTTTO_SERVICE_BINARY_NAME, OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
 };
 use ottto_protocol::{
     validate_local_control_protocol_version, AgentContextQuery, AgentCostsQuery,
@@ -89,6 +91,15 @@ const DEVICE_CREDENTIAL_PREPARATION_CAPABILITY: &str = "device_credential_prepar
 const DEVICE_CREDENTIAL_PREPARATION_SECRET_HEADER: &str =
     "X-Ottto-Device-Credential-Preparation-Secret";
 const PENDING_DEVICE_CREDENTIAL_SCHEMA_VERSION: u16 = 2;
+// v2 is already released. History-bearing ceremonies must reject downgrade.
+const OWNER_RETURN_CREDENTIAL_SCHEMA_VERSION: u16 = 3;
+
+fn supported_pending_credential_schema(version: u16) -> bool {
+    matches!(
+        version,
+        PENDING_DEVICE_CREDENTIAL_SCHEMA_VERSION | OWNER_RETURN_CREDENTIAL_SCHEMA_VERSION
+    )
+}
 // Legacy apex proxy base persisted by daemons installed before the marketing
 // cutover. Still trusted/recognized so existing installs keep ingesting until
 // they re-onboard onto the direct api.ottto.net base.
@@ -5299,7 +5310,7 @@ fn discard_abandoned_unconfirmed_claim_credential() -> Result<(), LocalApiError>
     let Some(pending) = pending_store.load().or_state_poisoned()? else {
         return Ok(());
     };
-    if pending.schema_version != PENDING_DEVICE_CREDENTIAL_SCHEMA_VERSION
+    if !supported_pending_credential_schema(pending.schema_version)
         || pending.capability != DEVICE_CREDENTIAL_PREPARATION_CAPABILITY
         || pending.confirmed_at.is_some()
         || pending.confirmation_authorized
@@ -5426,10 +5437,18 @@ fn complete_pending_auth_claim(
                 Some(claim_commit),
                 completion.request_authority.clone(),
             )?;
-            continue_prior_snapshot_namespace(
-                &mut pending,
-                completion.prior_device_credential.as_ref(),
-            );
+            {
+                let _binding_lock = lock_setup_run_binding();
+                identity_reservation.validate_locked()?;
+                select_owner_snapshot_namespace(
+                    &mut pending,
+                    &prepared.candidate_secret,
+                    completion.prior_device_credential.as_ref(),
+                    &FileOwnerSnapshotNamespaceStore::default(),
+                    &default_support_dir(),
+                    &owner_snapshot_machine_matches,
+                )?;
+            }
             stage_pending_device_credential(&pending, &prepared.candidate_secret)?;
             stage_pending_setup_run_token(&pending, &completed.setup_run_token)?;
             let staged = FilePendingDeviceCredentialStore::default()
@@ -6104,6 +6123,12 @@ fn mark_pending_device_credential_guards_passed(
     pending: &PendingDeviceCredentialPreparation,
     pending_store: &FilePendingDeviceCredentialStore,
 ) -> Result<PendingDeviceCredentialPreparation, LocalApiError> {
+    if pending.schema_version == OWNER_RETURN_CREDENTIAL_SCHEMA_VERSION {
+        let key = pending_owner_snapshot_key(pending)?;
+        if !owner_snapshot_machine_matches(&key)? {
+            return Err(LocalApiError::StatePoisoned);
+        }
+    }
     if pending.confirmed_at.is_some() {
         return if pending.confirmation_authorized && pending.preconfirm_guards_passed {
             Ok(pending.clone())
@@ -6148,7 +6173,7 @@ fn stage_pending_device_credential_with_stores(
     pending_store: &FilePendingDeviceCredentialStore,
     pending_secret_store: &impl ControlTokenStore,
 ) -> Result<(), LocalApiError> {
-    if pending.schema_version != PENDING_DEVICE_CREDENTIAL_SCHEMA_VERSION
+    if !supported_pending_credential_schema(pending.schema_version)
         || pending.capability != DEVICE_CREDENTIAL_PREPARATION_CAPABILITY
         || pending.preparation_id.trim().is_empty()
         || pending.credential_generation == 0
@@ -6157,6 +6182,12 @@ fn stage_pending_device_credential_with_stores(
     {
         return Err(LocalApiError::StatePoisoned);
     }
+    validate_owner_snapshot_selection(
+        pending,
+        candidate_secret,
+        &FileOwnerSnapshotNamespaceStore::default(),
+        &owner_snapshot_machine_matches,
+    )?;
     let existing = pending_store.load().or_state_poisoned()?;
     let effective_pending = if let Some(current) = existing.as_ref() {
         // An idempotent server retry must reproduce the entire immutable
@@ -6284,7 +6315,11 @@ fn validate_pending_prior_credential_binding(
 ) -> Result<(), LocalApiError> {
     let Some(authority) = pending.request_authority.as_ref() else {
         // Additive compatibility for a v2 journal created by an older binary.
-        return Ok(());
+        return if pending.schema_version == OWNER_RETURN_CREDENTIAL_SCHEMA_VERSION {
+            Err(LocalApiError::StatePoisoned)
+        } else {
+            Ok(())
+        };
     };
     if !matches!(authority.flow.as_str(), "register" | "setup_claim")
         || !valid_secret_commitment(&authority.credential_preparation_idempotency_key)
@@ -6299,11 +6334,39 @@ fn validate_pending_prior_credential_binding(
             .as_deref()
             .is_some_and(|namespace| {
                 authority.flow != "setup_claim"
-                    || authority.prior_device_id.is_none()
+                    || (pending.schema_version == PENDING_DEVICE_CREDENTIAL_SCHEMA_VERSION
+                        && authority.prior_device_id.is_none())
                     || !crate::hex::is_sha256_lower(namespace)
             })
     {
         return Err(LocalApiError::StatePoisoned);
+    }
+    if authority.incoming_snapshot_namespace.is_some()
+        || authority.outgoing_snapshot_namespace.is_some()
+    {
+        if pending.schema_version != OWNER_RETURN_CREDENTIAL_SCHEMA_VERSION
+            || authority.flow != "setup_claim"
+        {
+            return Err(LocalApiError::StatePoisoned);
+        }
+        for entry in [
+            &authority.incoming_snapshot_namespace,
+            &authority.outgoing_snapshot_namespace,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            entry.validate().or_state_poisoned()?;
+        }
+    }
+    if pending.schema_version == OWNER_RETURN_CREDENTIAL_SCHEMA_VERSION {
+        let incoming = authority
+            .incoming_snapshot_namespace
+            .as_ref()
+            .ok_or(LocalApiError::StatePoisoned)?;
+        if incoming.key != pending_owner_snapshot_key(pending)? {
+            return Err(LocalApiError::StatePoisoned);
+        }
     }
     match (
         authority.prior_device_id.as_deref(),
@@ -6568,6 +6631,12 @@ fn write_and_verify_pending_claim_commit(
         return Err(LocalApiError::StatePoisoned);
     }
 
+    validate_owner_snapshot_selection(
+        pending,
+        candidate_secret,
+        &FileOwnerSnapshotNamespaceStore::default(),
+        &owner_snapshot_machine_matches,
+    )?;
     // The attribution boundary must become durable before any credential or
     // account binding from the new claim. This operation is idempotent.
     persist_claim_backfill_policy(
@@ -6607,6 +6676,7 @@ fn write_and_verify_pending_claim_commit(
     {
         return Err(LocalApiError::StatePoisoned);
     }
+    publish_owner_snapshot_history(pending, &FileOwnerSnapshotNamespaceStore::default())?;
     Ok(())
 }
 
@@ -6619,7 +6689,7 @@ pub fn recover_pending_device_credential_at_startup() -> Result<bool, LocalApiEr
     let Some(pending) = pending_store.load().or_state_poisoned()? else {
         return Ok(false);
     };
-    if pending.schema_version != PENDING_DEVICE_CREDENTIAL_SCHEMA_VERSION
+    if !supported_pending_credential_schema(pending.schema_version)
         || pending.capability != DEVICE_CREDENTIAL_PREPARATION_CAPABILITY
         || pending.preparation_id.trim().is_empty()
         || pending.credential_generation == 0
@@ -6843,6 +6913,7 @@ fn auth_reset(
         let _identity_lifecycle_lock = lock_setup_run_binding();
         identity_reservation.validate_locked()?;
         require_setup_run_still_bound(daemon, only_if_bound)?;
+        seed_owner_snapshot_history_for_logout()?;
         if local_only {
             retain_prior_device_credential_for_logout()?;
         }
@@ -11550,9 +11621,284 @@ fn device_credential_request_authority(
         prior_device_sources: prior.map(|value| value.device_sources.clone()),
         prior_secret_commitment_sha256: prior.map(|value| secret_sha256(&value.device_secret)),
         canonical_snapshot_namespace: None,
+        outgoing_snapshot_namespace: None,
+        incoming_snapshot_namespace: None,
     }
 }
 
+/// Exact claim identity; the historical namespace never supplies authentication.
+fn pending_owner_snapshot_key(
+    pending: &PendingDeviceCredentialPreparation,
+) -> Result<OwnerSnapshotKey, LocalApiError> {
+    let claim = pending
+        .claim_commit
+        .as_ref()
+        .ok_or(LocalApiError::StatePoisoned)?;
+    let authority = pending
+        .request_authority
+        .as_ref()
+        .ok_or(LocalApiError::StatePoisoned)?;
+    let user = claim
+        .account
+        .user
+        .as_ref()
+        .ok_or(LocalApiError::StatePoisoned)?;
+    let org = claim
+        .account
+        .organization
+        .as_ref()
+        .ok_or(LocalApiError::StatePoisoned)?;
+    let base = validated_api_base_url(Some(&claim.connection.api_base_url))?;
+    if authority.flow != "setup_claim"
+        || user.id != claim.target_user_id
+        || pending.api_base_url != base
+        || pending.device.machine_id.as_deref() != Some(authority.machine_id.as_str())
+        || claim.connection.machine_id.as_deref() != Some(authority.machine_id.as_str())
+    {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    Ok(OwnerSnapshotKey {
+        user_id: user.id.clone(),
+        organization_id: org.id.clone(),
+        api_base_url: base,
+        machine_id: authority.machine_id.clone(),
+        installation_id: authority.installation_id.clone(),
+        account_scope: authority
+            .account_scope
+            .clone()
+            .filter(|v| !v.is_empty())
+            .ok_or(LocalApiError::StatePoisoned)?,
+    })
+}
+
+fn owner_snapshot_machine_matches(key: &OwnerSnapshotKey) -> Result<bool, LocalApiError> {
+    let Some(machine) = FileMachineStore::default().load().or_state_poisoned()? else {
+        return Ok(false);
+    };
+    let scope = owner_snapshot_account_scope(&machine.machine_id);
+    Ok(machine.machine_id == key.machine_id
+        && machine.installation_id == key.installation_id
+        && scope.as_deref() == Some(key.account_scope.as_str())
+        && crate::grant_rebind::verified_live_hardware().is_ok())
+}
+
+fn owner_snapshot_account_scope(machine_id: &str) -> Option<String> {
+    #[cfg(unix)]
+    {
+        Some(ottto_core::prefixed_sha256_id(
+            "otu",
+            &format!("account:{machine_id}:{}", unsafe { libc::getuid() }),
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = machine_id;
+        None
+    }
+}
+
+fn outgoing_owner_snapshot_namespace(
+    prior: Option<&PriorDeviceCredential>,
+    key: &OwnerSnapshotKey,
+) -> Result<Option<OwnerSnapshotNamespace>, LocalApiError> {
+    let Some(prior) = prior else {
+        return Ok(None);
+    };
+    let Some(owner) = prior.owner.as_ref() else {
+        return Ok(None);
+    };
+    if prior.machine_id.as_deref() != Some(key.machine_id.as_str()) {
+        return Ok(None);
+    }
+    Ok(Some(OwnerSnapshotNamespace {
+        key: OwnerSnapshotKey {
+            user_id: owner.user_id.clone(),
+            organization_id: owner.organization_id.clone(),
+            api_base_url: validated_api_base_url(Some(&owner.api_base_url))?,
+            ..key.clone()
+        },
+        namespace: prior.snapshot_namespace.clone(),
+    }))
+}
+
+fn select_owner_snapshot_namespace(
+    pending: &mut PendingDeviceCredentialPreparation,
+    candidate: &str,
+    prior: Option<&PriorDeviceCredential>,
+    store: &FileOwnerSnapshotNamespaceStore,
+    support: &Path,
+    machine_matches: &dyn Fn(&OwnerSnapshotKey) -> Result<bool, LocalApiError>,
+) -> Result<(), LocalApiError> {
+    // An idempotent retry keeps the exact frozen choice, even after independent
+    // store deletion. Immutable journal equality remains the final staging gate.
+    if let Some(existing) =
+        FilePendingDeviceCredentialStore::new(support.join("pending-device-credential.json"))
+            .load()
+            .or_state_poisoned()?
+    {
+        if existing.preparation_id == pending.preparation_id {
+            if let (Some(saved), Some(authority)) = (
+                existing.request_authority.as_ref(),
+                pending.request_authority.as_mut(),
+            ) {
+                pending.schema_version = existing.schema_version;
+                authority.canonical_snapshot_namespace = saved.canonical_snapshot_namespace.clone();
+                authority.outgoing_snapshot_namespace = saved.outgoing_snapshot_namespace.clone();
+                authority.incoming_snapshot_namespace = saved.incoming_snapshot_namespace.clone();
+                return validate_owner_snapshot_selection(
+                    pending,
+                    candidate,
+                    store,
+                    machine_matches,
+                );
+            }
+        }
+    }
+    let key = match pending_owner_snapshot_key(pending) {
+        Ok(key) => key,
+        Err(_) => return Ok(()),
+    };
+    if !machine_matches(&key)? {
+        return Ok(());
+    }
+    let history = store.load().or_state_poisoned()?;
+    let seed = outgoing_owner_snapshot_namespace(prior, &key)?;
+    let recorded = history
+        .iter()
+        .find(|row| row.key == key)
+        .or_else(|| seed.as_ref().filter(|row| row.key == key));
+    let selected = match recorded {
+        Some(row)
+            if crate::snapshot_sync::snapshot_namespace_has_store(support, &row.namespace)
+                .or_state_poisoned()? =>
+        {
+            Some(row.namespace.clone())
+        }
+        _ => None,
+    };
+    let namespace = selected.clone().unwrap_or_else(|| {
+        crate::snapshot_sync::snapshot_destination_namespace(&pending.device, candidate, None)
+    });
+    let authority = pending
+        .request_authority
+        .as_mut()
+        .ok_or(LocalApiError::StatePoisoned)?;
+    authority.canonical_snapshot_namespace = selected;
+    authority.outgoing_snapshot_namespace = seed;
+    authority.incoming_snapshot_namespace = Some(OwnerSnapshotNamespace { key, namespace });
+    pending.schema_version = OWNER_RETURN_CREDENTIAL_SCHEMA_VERSION;
+    validate_owner_snapshot_selection(pending, candidate, store, machine_matches)
+}
+
+fn validate_owner_snapshot_selection(
+    pending: &PendingDeviceCredentialPreparation,
+    candidate: &str,
+    store: &FileOwnerSnapshotNamespaceStore,
+    machine_matches: &dyn Fn(&OwnerSnapshotKey) -> Result<bool, LocalApiError>,
+) -> Result<(), LocalApiError> {
+    validate_pending_prior_credential_binding(pending)?;
+    if pending.schema_version != OWNER_RETURN_CREDENTIAL_SCHEMA_VERSION {
+        return Ok(());
+    }
+    let authority = pending
+        .request_authority
+        .as_ref()
+        .ok_or(LocalApiError::StatePoisoned)?;
+    let incoming = authority
+        .incoming_snapshot_namespace
+        .as_ref()
+        .ok_or(LocalApiError::StatePoisoned)?;
+    if !machine_matches(&incoming.key)? {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    let seed = authority.outgoing_snapshot_namespace.as_ref();
+    if seed.is_some_and(|row| {
+        row.key.machine_id != incoming.key.machine_id
+            || row.key.installation_id != incoming.key.installation_id
+            || row.key.account_scope != incoming.key.account_scope
+    }) {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    let history = store.load().or_state_poisoned()?;
+    if let Some(namespace) = authority.canonical_snapshot_namespace.as_ref() {
+        if incoming.namespace != *namespace
+            || !history
+                .iter()
+                .chain(seed)
+                .any(|row| row.key == incoming.key && row.namespace == *namespace)
+        {
+            return Err(LocalApiError::StatePoisoned);
+        }
+    } else if incoming.namespace
+        != crate::snapshot_sync::snapshot_destination_namespace(&pending.device, candidate, None)
+    {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    Ok(())
+}
+
+fn publish_owner_snapshot_history(
+    pending: &PendingDeviceCredentialPreparation,
+    store: &FileOwnerSnapshotNamespaceStore,
+) -> Result<(), LocalApiError> {
+    if pending.schema_version != OWNER_RETURN_CREDENTIAL_SCHEMA_VERSION {
+        return Ok(());
+    }
+    if pending.confirmed_at.is_none()
+        || !pending.confirmation_authorized
+        || !pending.preconfirm_guards_passed
+    {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    let authority = pending
+        .request_authority
+        .as_ref()
+        .ok_or(LocalApiError::StatePoisoned)?;
+    let entries = authority
+        .outgoing_snapshot_namespace
+        .iter()
+        .chain(authority.incoming_snapshot_namespace.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    store.upsert(&entries).or_state_poisoned()
+}
+
+fn seed_owner_snapshot_history_for_logout() -> Result<(), LocalApiError> {
+    let Some(machine) = FileMachineStore::default().load().or_state_poisoned()? else {
+        return Ok(());
+    };
+    let Some(scope) = owner_snapshot_account_scope(&machine.machine_id) else {
+        return Ok(());
+    };
+    let key = OwnerSnapshotKey {
+        user_id: String::new(),
+        organization_id: String::new(),
+        api_base_url: String::new(),
+        machine_id: machine.machine_id,
+        installation_id: machine.installation_id,
+        account_scope: scope,
+    };
+    if owner_snapshot_machine_matches(&key)? {
+        // An incomplete outgoing credential grants no migration proof. Missing
+        // bytes must not make ordinary local logout less available.
+        match KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT).load() {
+            Err(TokenStoreError::Missing) => return Ok(()),
+            Err(_) => return Err(LocalApiError::StatePoisoned),
+            Ok(_) => {}
+        }
+        let Some(prior) = prior_device_credential_for_registration()? else {
+            return Ok(());
+        };
+        if let Some(seed) = outgoing_owner_snapshot_namespace(Some(&prior), &key)? {
+            FileOwnerSnapshotNamespaceStore::default()
+                .upsert(&[seed])
+                .or_state_poisoned()?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 /// Journal the prior device's snapshot namespace when this setup claim is the
 /// prior owner's user and organization on the same API and machine. Any other
 /// claim (or the register route) starts its own namespace, as before.
@@ -11591,7 +11937,8 @@ fn same_prior_device_authority(
         (Some(expected), Some(actual)) => {
             let expected_secret_commitment = secret_sha256(&expected.device_secret);
             let actual_secret_commitment = secret_sha256(&actual.device_secret);
-            expected.device_id == actual.device_id
+            expected.machine_id == actual.machine_id
+                && expected.device_id == actual.device_id
                 && expected.device_sources == actual.device_sources
                 && expected.owner == actual.owner
                 && expected.snapshot_namespace == actual.snapshot_namespace
@@ -11741,6 +12088,7 @@ const IDENTITY_CONTINUITY_CAPABILITY: &str = "prior_device_credential_v1";
 const MACHINE_IDENTITY_CAPABILITY: &str = "paired_machine_local_health_v1";
 
 struct PriorDeviceCredential {
+    machine_id: Option<String>,
     device_id: String,
     device_sources: Vec<String>,
     device_secret: String,
@@ -11862,6 +12210,7 @@ fn prior_device_credential_with_stores(
         continuity.snapshot_namespace.as_ref(),
     );
     Ok(Some(PriorDeviceCredential {
+        machine_id: device.machine_id,
         device_id: device.device_id,
         device_sources: device.sources,
         device_secret,
@@ -18973,6 +19322,7 @@ for line in sys.stdin:
             ..test_machine()
         };
         let prior = PriorDeviceCredential {
+            machine_id: Some("machine_test".to_string()),
             device_id: "device-prior".to_string(),
             device_sources: vec!["codex".to_string(), "pi".to_string()],
             device_secret: prior_secret.to_string(),
@@ -19475,6 +19825,7 @@ for line in sys.stdin:
             "install-regular-rotation",
             &test_machine(),
             Some(&PriorDeviceCredential {
+                machine_id: Some("machine_test".to_string()),
                 device_id: old_device.device_id.clone(),
                 device_sources: old_device.sources.clone(),
                 device_secret: old_secret.clone(),
@@ -22671,6 +23022,7 @@ for line in sys.stdin:
         assert!(first.get("prior_device_secret").is_none());
 
         let prior = PriorDeviceCredential {
+            machine_id: Some("machine_test".to_string()),
             device_id: "device_prior".to_string(),
             device_sources: vec!["codex".to_string()],
             device_secret: "secret_prior".to_string(),
@@ -32450,6 +32802,302 @@ X-API-Key = "otel_redacted"
         let state = crate::backfill::load_backfill_state(&default_support_dir());
         assert_eq!(state.backfill_cutoff_at.as_deref(), Some(RELOGIN_CUTOFF));
         state.backfill_cutoff_destination_namespace
+    }
+
+    fn owner_return_pending(
+        user: &str,
+        org: &str,
+        id: &str,
+    ) -> (PendingDeviceCredentialPreparation, String) {
+        let mut pending = test_pending_device_credential(id, true);
+        let candidate = format!("candidate-{id}");
+        pending.secret_commitment_sha256 = secret_sha256(&candidate);
+        pending.device = relogin_device(id, &["claude_code", "codex", "pi"]);
+        pending.request_authority = Some(device_credential_request_authority(
+            "setup_claim",
+            id,
+            &test_machine(),
+            None,
+            None,
+        ));
+        let (account, connection) = relogin_account(user, org);
+        pending.claim_commit = Some(PendingClaimCredentialCommit {
+            account,
+            connection,
+            target_user_id: user.into(),
+            setup_run_token_sha256: secret_sha256("setup"),
+            backfill_policy: Some("from".into()),
+            backfill_cutoff_at: Some(RELOGIN_CUTOFF.into()),
+        });
+        (pending, candidate)
+    }
+
+    fn owner_return_test_machine(key: &OwnerSnapshotKey) -> Result<bool, LocalApiError> {
+        Ok(key.machine_id == "machine_test"
+            && key.installation_id == "install_test"
+            && key.account_scope == TEST_ACCOUNT_SCOPE)
+    }
+
+    #[test]
+    /// [behaviour] Exact matching, long owner chains, rotation, frozen selection,
+    /// positive deletion and idempotent confirmed-history publication.
+    fn owner_return_claims_reuse_only_their_exact_recorded_destination() {
+        let root = crate::test_scratch::ScratchDir::canonical("owner-return-claims");
+        let store = FileOwnerSnapshotNamespaceStore::new(root.join("history.json"));
+        let mut first = None;
+        for (i, user) in ["a", "b", "c", "a", "a"].iter().enumerate() {
+            let (mut pending, candidate) = owner_return_pending(user, "org", &format!("claim-{i}"));
+            select_owner_snapshot_namespace(
+                &mut pending,
+                &candidate,
+                None,
+                &store,
+                &root,
+                &owner_return_test_machine,
+            )
+            .unwrap();
+            let incoming = pending
+                .request_authority
+                .as_ref()
+                .unwrap()
+                .incoming_snapshot_namespace
+                .as_ref()
+                .unwrap()
+                .clone();
+            if i == 0 {
+                first = Some(incoming.clone());
+            }
+            if i >= 3 {
+                assert_eq!(incoming, first.clone().unwrap());
+            } else if i > 0 {
+                assert_ne!(incoming.namespace, first.as_ref().unwrap().namespace);
+            }
+            assert_eq!(
+                pending.schema_version,
+                OWNER_RETURN_CREDENTIAL_SCHEMA_VERSION
+            );
+            assert_eq!(
+                publish_owner_snapshot_history(&pending, &store),
+                Err(LocalApiError::StatePoisoned),
+                "unconfirmed cannot publish"
+            );
+            pending.confirmed_at = Some("confirmed".into());
+            publish_owner_snapshot_history(&pending, &store).unwrap();
+            publish_owner_snapshot_history(&pending, &store).unwrap();
+            validate_owner_snapshot_selection(
+                &pending,
+                &candidate,
+                &store,
+                &owner_return_test_machine,
+            )
+            .unwrap();
+            let dir = root
+                .join("snapshots/destinations")
+                .join(&incoming.namespace);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("codex-scan-index-v3.json"), b"{}").unwrap();
+        }
+        assert_eq!(store.load().unwrap().len(), 3, "rotation replaces the row");
+        let a = first.unwrap();
+        // Organization and endpoint are independent destinations. A changed
+        // installation/OS account/physical machine has no authority to reuse.
+        for changed in ["org", "api", "install", "scope", "machine", "hardware"] {
+            let (mut pending, candidate) = owner_return_pending("a", "org", changed);
+            match changed {
+                "org" => {
+                    pending
+                        .claim_commit
+                        .as_mut()
+                        .unwrap()
+                        .account
+                        .organization
+                        .as_mut()
+                        .unwrap()
+                        .id += "-other"
+                }
+                "api" => {
+                    let base = format!("{DEFAULT_API_BASE_URL}/other");
+                    pending.api_base_url = base.clone();
+                    pending
+                        .claim_commit
+                        .as_mut()
+                        .unwrap()
+                        .connection
+                        .api_base_url = base;
+                }
+                "install" => pending.request_authority.as_mut().unwrap().installation_id += "-new",
+                "scope" => {
+                    pending.request_authority.as_mut().unwrap().account_scope = Some("other".into())
+                }
+                "machine" => pending.device.machine_id = Some("second-mac".into()),
+                _ => {}
+            }
+            let verify = |key: &OwnerSnapshotKey| {
+                if changed == "hardware" {
+                    Ok(false)
+                } else {
+                    owner_return_test_machine(key)
+                }
+            };
+            select_owner_snapshot_namespace(&mut pending, &candidate, None, &store, &root, &verify)
+                .unwrap();
+            assert!(pending_snapshot_alias(&pending).is_none(), "{changed}");
+        }
+        let (mut pending, candidate) = owner_return_pending("a", "org", "frozen");
+        select_owner_snapshot_namespace(
+            &mut pending,
+            &candidate,
+            None,
+            &store,
+            &root,
+            &owner_return_test_machine,
+        )
+        .unwrap();
+        let journal =
+            FilePendingDeviceCredentialStore::new(root.join("pending-device-credential.json"));
+        journal.save(&pending).unwrap();
+        fs::remove_dir_all(root.join("snapshots/destinations").join(&a.namespace)).unwrap();
+        let (mut retry, _) = owner_return_pending("a", "org", "frozen");
+        select_owner_snapshot_namespace(
+            &mut retry,
+            &candidate,
+            None,
+            &store,
+            &root,
+            &owner_return_test_machine,
+        )
+        .unwrap();
+        assert_eq!(
+            retry, pending,
+            "independent deletion cannot mutate a frozen choice"
+        );
+        journal.reset().unwrap();
+        let (mut deleted, secret) = owner_return_pending("a", "org", "deleted");
+        select_owner_snapshot_namespace(
+            &mut deleted,
+            &secret,
+            None,
+            &store,
+            &root,
+            &owner_return_test_machine,
+        )
+        .unwrap();
+        assert!(pending_snapshot_alias(&deleted).is_none());
+        assert_ne!(
+            deleted
+                .request_authority
+                .as_ref()
+                .unwrap()
+                .incoming_snapshot_namespace
+                .as_ref()
+                .unwrap()
+                .namespace,
+            a.namespace
+        );
+        deleted.confirmed_at = Some("confirmed".into());
+        publish_owner_snapshot_history(&deleted, &store).unwrap();
+        assert_eq!(store.load().unwrap().len(), 3);
+    }
+
+    #[test]
+    /// [behaviour] A rollout seed can preserve an existing same-owner store,
+    /// without borrowing its predecessor credential as return authority.
+    fn owner_return_seed_and_downgrade_journal_rows() {
+        for has_prior in [false, true] {
+            for confirmed in [false, true] {
+                let root = crate::test_scratch::ScratchDir::canonical("owner-return-journal");
+                let store = FileOwnerSnapshotNamespaceStore::new(root.join("history.json"));
+                let (mut pending, candidate) = owner_return_pending("a", "org", "seed");
+                let key = pending_owner_snapshot_key(&pending).unwrap();
+                let seed = OwnerSnapshotNamespace {
+                    key,
+                    namespace: "a".repeat(64),
+                };
+                let dir = root.join("snapshots/destinations").join(&seed.namespace);
+                fs::create_dir_all(&dir).unwrap();
+                fs::write(dir.join("pi-scan-index-v3.json"), b"{}").unwrap();
+                let prior = PriorDeviceCredential {
+                    machine_id: Some("machine_test".into()),
+                    device_id: "prior".into(),
+                    device_sources: vec!["pi".into()],
+                    device_secret: "old-secret".into(),
+                    owner: Some(LocalCredentialOwner {
+                        user_id: "a".into(),
+                        organization_id: "org".into(),
+                        api_base_url: DEFAULT_API_BASE_URL.into(),
+                    }),
+                    snapshot_namespace: seed.namespace.clone(),
+                };
+                if has_prior {
+                    pending.request_authority = Some(device_credential_request_authority(
+                        "setup_claim",
+                        "seed",
+                        &test_machine(),
+                        Some(&prior),
+                        Some(IDENTITY_CONTINUITY_CAPABILITY),
+                    ));
+                } else {
+                    store.upsert(&[seed]).unwrap();
+                }
+                select_owner_snapshot_namespace(
+                    &mut pending,
+                    &candidate,
+                    has_prior.then_some(&prior),
+                    &store,
+                    &root,
+                    &owner_return_test_machine,
+                )
+                .unwrap();
+                pending.confirmed_at = confirmed.then(|| "confirmed".into());
+                let decoded: PendingDeviceCredentialPreparation =
+                    serde_json::from_slice(&serde_json::to_vec(&pending).unwrap()).unwrap();
+                validate_owner_snapshot_selection(
+                    &decoded,
+                    &candidate,
+                    &store,
+                    &owner_return_test_machine,
+                )
+                .unwrap();
+                assert_ne!(
+                    decoded.schema_version, PENDING_DEVICE_CREDENTIAL_SCHEMA_VERSION,
+                    "old reader rejects before promotion, with or without rotation tuple"
+                );
+                assert_eq!(
+                    pending_snapshot_alias(&decoded)
+                        .unwrap()
+                        .secret_commitment_sha256,
+                    secret_sha256(&candidate)
+                );
+                let mut downgraded = decoded.clone();
+                downgraded.schema_version = PENDING_DEVICE_CREDENTIAL_SCHEMA_VERSION;
+                assert_eq!(
+                    validate_pending_prior_credential_binding(&downgraded),
+                    Err(LocalApiError::StatePoisoned)
+                );
+                if confirmed {
+                    publish_owner_snapshot_history(&decoded, &store).unwrap();
+                } else {
+                    assert_eq!(
+                        publish_owner_snapshot_history(&decoded, &store),
+                        Err(LocalApiError::StatePoisoned)
+                    );
+                }
+                let mut corrupt = decoded;
+                corrupt
+                    .request_authority
+                    .as_mut()
+                    .unwrap()
+                    .incoming_snapshot_namespace
+                    .as_mut()
+                    .unwrap()
+                    .key
+                    .organization_id += "-changed";
+                assert_eq!(
+                    validate_pending_prior_credential_binding(&corrupt),
+                    Err(LocalApiError::StatePoisoned)
+                );
+            }
+        }
     }
 
     #[test]

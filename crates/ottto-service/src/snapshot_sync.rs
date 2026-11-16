@@ -575,8 +575,11 @@ fn claude_prior_history(
     // Claude's own entries only: `last_completed_at` is stamped by any
     // source's bootstrap, so a Codex or Pi completion is not Claude history.
     let earlier_bootstrap = backfill_state
-        .completed_destination_namespaces
+        .completed_destination_replays
         .contains_key(slug)
+        || backfill_state
+            .completed_destination_namespaces
+            .contains_key(slug)
         || backfill_state.completed_parser_versions.contains_key(slug)
         || backfill_state.completed_replay_revisions.contains_key(slug);
     // A pre-scoping daemon's unscoped index.
@@ -603,11 +606,7 @@ fn claude_destination_history_here(
     index_path: &Path,
 ) -> bool {
     let slug = SnapshotSource::ClaudeCode.api_slug();
-    let here = backfill_state
-        .completed_destination_namespaces
-        .get(slug)
-        .map(String::as_str)
-        == Some(destination_namespace);
+    let here = backfill_state.destination_completed(slug, destination_namespace);
     // A quarantined copy of this index, of a legacy index or of this
     // destination's ledger. An unreadable directory fails closed; a missing
     // one is empty.
@@ -12863,10 +12862,61 @@ fn snapshot_upload_context_fingerprint(
     format!("{:x}", digest.finalize())
 }
 
-/// One destination-scoped index is shared by every privacy policy. A policy
-/// change reads nothing: it applies to bodies acquired from then on, and the
-/// per-entity proofs inside the index keep each delivery bound to the context
-/// it was sent under.
+/// Evidence probe only: decoding, migration and custody checks remain with the
+/// locked source loaders. Never inspect a different destination for ownership.
+pub(crate) fn snapshot_namespace_has_store(support: &Path, namespace: &str) -> Result<bool> {
+    anyhow::ensure!(
+        crate::hex::is_sha256_lower(namespace),
+        "invalid snapshot namespace"
+    );
+    let dir = support.join("snapshots/destinations").join(namespace);
+    match std::fs::symlink_metadata(&dir) {
+        Ok(metadata) => {
+            anyhow::ensure!(metadata.is_dir(), "uncertain snapshot namespace directory")
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => anyhow::bail!("inspect snapshot namespace directory"),
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => anyhow::bail!("inspect snapshot namespace"),
+    };
+    let mut present = false;
+    for entry in entries {
+        let entry = entry.context("inspect snapshot namespace entry")?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let relevant = [
+            SnapshotSource::ClaudeCode,
+            SnapshotSource::Codex,
+            SnapshotSource::Pi,
+        ]
+        .iter()
+        .any(|source| name.starts_with(&format!("{}-scan-index", source.api_slug())));
+        if !relevant {
+            continue;
+        }
+        let checkpoint = name
+            .strip_suffix(".v2.sqlite.import")
+            .or_else(|| name.strip_suffix(".v2.sqlite"))
+            .unwrap_or(name);
+        if checkpoint.ends_with(".json")
+            && !checkpoint.contains("-upload-progress")
+            && !checkpoint.contains(".tmp")
+            && !checkpoint.contains(".backup")
+        {
+            let metadata = std::fs::symlink_metadata(entry.path())
+                .context("inspect snapshot namespace custody")?;
+            anyhow::ensure!(metadata.is_file(), "uncertain snapshot namespace custody");
+            present = true;
+        }
+    }
+    Ok(present)
+}
+
 fn snapshot_index_path(support_dir: &Path, source: SnapshotSource) -> PathBuf {
     support_dir
         .join("snapshots")
@@ -13440,6 +13490,55 @@ pub(crate) use tests::codex_archive_tests::{
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn owner_return_presence_uses_only_selected_source_custody() {
+        let root = crate::test_scratch::ScratchDir::canonical("owner-return-presence");
+        let ns = "a".repeat(64);
+        let selected = root.join("snapshots/destinations").join(&ns);
+        let other = root.join("snapshots/destinations").join("b".repeat(64));
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("codex-scan-index-v3.json"), b"{}").unwrap();
+        assert!(!snapshot_namespace_has_store(&root, &ns).unwrap());
+        std::fs::create_dir_all(&selected).unwrap();
+        for (name, expected) in [
+            ("codex-scan-index-v3.json", true),
+            ("codex-scan-index-v3.json.v2.sqlite", true),
+            ("codex-scan-index-v3.json.v2.sqlite.import", true),
+            (
+                "claude_code-scan-index-no-titles-attribution-epoch-v2.json",
+                true,
+            ),
+            ("pi-scan-index.json", true),
+            ("codex-scan-index-v3-upload-progress.json", false),
+            ("codex-scan-index-v3.json.lock", false),
+            ("codex-scan-index-v3.json.tmp", false),
+            ("codex-scan-index-v3.json.v2.sqlite.migration-backup", false),
+        ] {
+            let path = selected.join(name);
+            std::fs::write(&path, b"{}").unwrap();
+            assert_eq!(
+                snapshot_namespace_has_store(&root, &ns).unwrap(),
+                expected,
+                "{name}"
+            );
+            std::fs::remove_file(path).unwrap();
+        }
+        std::fs::write(selected.join("pi-scan-index-v3.json"), b"{}").unwrap();
+        assert!(
+            snapshot_namespace_has_store(&root, &ns).unwrap(),
+            "one surviving source is sufficient"
+        );
+        #[cfg(unix)]
+        {
+            let link = selected.join("codex-scan-index-v3.json");
+            std::os::unix::fs::symlink(root.join("missing"), &link).unwrap();
+            assert!(
+                snapshot_namespace_has_store(&root, &ns).is_err(),
+                "unknown sibling holds even with Pi present"
+            );
+        }
+    }
+
     #[test]
     fn provider_reauth_retries_once_per_default_login_marker_change() {
         for initial in [None, Some("original".to_string())] {

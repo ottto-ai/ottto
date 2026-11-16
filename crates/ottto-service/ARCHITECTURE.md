@@ -330,6 +330,30 @@ backfill-state save, so re-upgrade omits the cutoff for existing destinations.
 - A parser or scan-identity version bump invalidates every saved record. A change that bumps one
   also migrates saved state forward, or it explicitly accepts the full re-read.
 
+## Returning to an account
+
+A successful claim records the exact user, organization, normalized API base,
+physical machine, installation and OS account scope's canonical snapshot namespace
+in owner-only local history. A fresh matching claim can reuse that namespace only
+with live hardware proof and surviving source custody. Another account never borrows
+its ACKs, accepted shares or completion. Local history is trusted local state, not
+an authentication credential. Pre-existing orphan stores cannot be rediscovered.
+Logout preserves a claim-proven outgoing association; forgetting the installation
+makes its old rows ineligible. Uninstall removes history with the support directory.
+
+Claim selection is frozen in a version-3 pending credential journal. Policy is
+persisted for the selected destination before credential activation; the outgoing
+migration seed and incoming association are synced and read back before pending
+clear. Released version-2 readers reject an interrupted history-bearing ceremony.
+After completion, older alias-aware binaries can read active credentials and ignore
+the separate history file. An older backfill writer drops destination replay history;
+re-upgrade can then do one bounded re-walk. Completion is recorded only by settled
+source delivery, per destination and replay revision. A quiet return preserves its
+index and progress without rearming historical work. A server switch cutoff still
+excludes even the returning owner's pre-cutoff owed items; spanning sessions keep
+the existing whole-session rule. Positive store deletion selects a fresh namespace,
+with today's first-read and cutoff gates and no manufactured acceptance.
+
 ## Hot and cold state
 
 Resident state stays small: what is needed to decide what to do with a file (identity, offset,
