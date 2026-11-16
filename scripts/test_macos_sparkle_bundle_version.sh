@@ -267,11 +267,17 @@ if [[ "$(plutil -extract EnvironmentVariables.MallocLargeCache raw -o - "$servic
   echo "Packaged daemon must disable libmalloc large-cache retention" >&2
   exit 1
 fi
-info_plist="$output_dir/Ottto.app/Contents/Info.plist"
-if plutil -extract LSEnvironment.MallocLargeCache raw -o - "$info_plist" >/dev/null 2>&1; then
-  echo "Companion app must not carry the daemon allocator setting" >&2
+if [[ "$(plutil -extract EnvironmentVariables.MallocSpaceEfficient raw -o - "$service_plist")" != "1" ]]; then
+  echo "Packaged daemon must enable libmalloc space-efficient mode" >&2
   exit 1
 fi
+info_plist="$output_dir/Ottto.app/Contents/Info.plist"
+for allocator_key in MallocLargeCache MallocSpaceEfficient; do
+  if plutil -extract "LSEnvironment.$allocator_key" raw -o - "$info_plist" >/dev/null 2>&1; then
+    echo "Companion app must not carry the daemon allocator setting $allocator_key" >&2
+    exit 1
+  fi
+done
 bundle_short_version="$(plutil -extract CFBundleShortVersionString raw -o - "$info_plist")"
 bundle_version="$(plutil -extract CFBundleVersion raw -o - "$info_plist")"
 if [[ "$bundle_short_version" != "0.1.92-rc2" ]]; then
