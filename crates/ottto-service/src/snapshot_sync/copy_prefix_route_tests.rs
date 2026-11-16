@@ -1001,7 +1001,7 @@ fn copy_first_correction_preserves_native_money_and_placement() {
                         .iter()
                         .find(|s| s.snapshot_fingerprint == entity.snapshot_fingerprint)
                         .unwrap();
-                    accepted.insert(item.source_session_id.clone(), item.clone());
+                    accepted.insert(item.source_session_id.clone(), (*item).clone());
                     assert_eq!(
                         accepted.values().map(|s| s.request_count).sum::<u64>(),
                         expected
