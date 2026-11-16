@@ -1733,3 +1733,87 @@ fn owner_return_cutoff_keeps_prior_heads_and_whole_spanning_sessions() {
         );
     });
 }
+
+/// [money] Accepted original/copy state remains in its original custody after
+/// the original disappears and another owner is installed. Selection grants no
+/// new acceptance and the unchanged survivor keeps its saved body and proofs.
+#[test]
+#[serial]
+fn owner_return_keeps_deleted_original_copy_custody() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    with_e2(|| {
+        let mut c = corpus("owner-return-copy");
+        let original = c.root(ROOT, &line(ROOT, "r1", AT, 10));
+        let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &c.support);
+        let secrets = c.base.join("synthetic-secrets");
+        std::fs::create_dir_all(&secrets).unwrap();
+        let _secrets = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secrets);
+        let _api = EnvVarGuard::set_str("OTTTO_API_BASE_URL", "https://api.ottto.net");
+        let namespace = "a".repeat(64);
+        let index_path = c
+            .support
+            .join("snapshots/destinations")
+            .join(&namespace)
+            .join("claude_code-scan-index-v3.json");
+        let progress =
+            serde_json::to_vec(&json!({"schema_version":3,"destination_namespace_hash":namespace}))
+                .unwrap();
+        let (session, index) =
+            StateV2ColdSession::publish_at(&ScanIndex::default(), &index_path, &progress);
+        let scanner = E2ScanFixture::default();
+        let first = ready(&c, &scanner, index, 100, true);
+        let prior = commit(&session, first);
+        c.write_at(
+            &format!("{COPY}.jsonl"),
+            &(line(COPY, "r1", AT, 10) + &line(COPY, "branch-own", "2026-08-02T07:03:10Z", 0)),
+            "2026-08-02T07:03:00Z",
+        );
+        let copied = ready(&c, &scanner, prior, 100, true);
+        assert_eq!(
+            body(&copied, COPY).unwrap().removed_request_count,
+            Some(1),
+            "accepted original proves the removal"
+        );
+        let mut prior_money = result(&copied, Mode::ColdFull);
+        accepted(&mut prior_money, &copied.scan.snapshots);
+        let prior = commit(&session, copied);
+        std::fs::remove_file(original).unwrap();
+        let left = ready(&c, &scanner, prior, 100, true);
+        assert!(
+            left.scan.snapshots.is_empty(),
+            "unchanged survivor emits nothing new"
+        );
+        let prior = commit(&session, left);
+        let stored = stored_bodies(&prior);
+        crate::control::owner_return_seed_for_test(&namespace, "owner-a");
+        for (user, id) in [("owner-b", "copy-b"), ("owner-a", "copy-a-return")] {
+            let device = LocalDeviceBinding {
+                device_id: id.into(),
+                machine_id: Some("machine_test".into()),
+                sources: vec!["claude_code".into()],
+            };
+            let selected = crate::control::owner_return_credential_for_test(
+                &device,
+                &format!("secret-{id}"),
+                user,
+            );
+            if user == "owner-a" {
+                assert_eq!(selected, namespace);
+            }
+        }
+        let restored = ScanIndex::load(&index_path).unwrap();
+        assert_eq!(stored_bodies(&restored), stored);
+        let (quiet, io) = fixture::observe_codex_quiet(|| {
+            ready(&c, &E2ScanFixture::default(), restored, 100, true)
+        });
+        let mut observed = result(&quiet, Mode::Restart);
+        observed.io = io;
+        observed.accepted = prior_money.accepted.clone();
+        money_oracle::assert_quiet_restart_zero_bytes(&observed);
+        money_oracle::assert_held(COPY, &prior_money, &observed, &prior_money);
+        money_oracle::assert_no_smaller_reemit(COPY, &prior_money, &observed, &prior_money, true);
+        assert_eq!(stored_bodies(&quiet.index), stored);
+    });
+}

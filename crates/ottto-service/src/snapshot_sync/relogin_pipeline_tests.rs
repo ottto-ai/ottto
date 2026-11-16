@@ -205,7 +205,12 @@ fn owner_return_preserves_all_source_carry() {
     let now = OffsetDateTime::parse(AT, &Rfc3339)
         .unwrap()
         .unix_timestamp() as u64;
-    for third_owner in [false, true] {
+    for (third_owner, replay_bump, rollback) in [
+        (false, false, false),
+        (true, false, false),
+        (true, true, false),
+        (false, false, true),
+    ] {
         forget_carried_namespaces_for_test(&["return-a", "return-b", "return-a-again"]);
         let fixture = IdentityPipelineHome::new();
         let cadence = IdentityPipelineCadence::new();
@@ -460,6 +465,21 @@ fn owner_return_preserves_all_source_carry() {
             .set_modified(UNIX_EPOCH + Duration::from_secs(now - 61 * 86400))
             .unwrap();
         std::fs::remove_dir_all(&repository).unwrap();
+        if replay_bump {
+            let source = SnapshotSource::Pi;
+            let mut old = ScanIndex::load(&index_path(&namespace_a, source)).unwrap();
+            old.prepare_historical_replay(format!("pi:old-revision:{namespace_a}"));
+            old.save(&index_path(&namespace_a, source)).unwrap();
+            crate::backfill::update_backfill_state(&support, |state| {
+                state
+                    .completed_destination_replays
+                    .get_mut("pi")
+                    .unwrap()
+                    .insert(namespace_a.clone(), "old-revision".into());
+            })
+            .unwrap();
+        }
+
         // Each destination completes independently; returning A must keep its
         // Legacy decision, tier receipt, old accepted file and repository binding.
         for (user, id) in [
@@ -475,6 +495,12 @@ fn owner_return_preserves_all_source_carry() {
                 ..device_a.clone()
             };
             let secret = format!("secret-{id}");
+            if rollback && user == "owner-a" {
+                crate::backfill::update_backfill_state(&support, |state| {
+                    state.completed_destination_replays.clear()
+                })
+                .unwrap();
+            }
             let selected = crate::control::owner_return_credential_for_test(&device, &secret, user);
             let (device, secret) =
                 crate::snapshot_client::load_snapshot_device_credentials().unwrap();
@@ -484,12 +510,59 @@ fn owner_return_preserves_all_source_carry() {
             );
             if user != "owner-a" {
                 assert_ne!(selected, namespace_a);
+                assert!(
+                    sources
+                        .iter()
+                        .all(|&source| !index_path(&selected, source).exists()),
+                    "no previous owner's custody inherited"
+                );
                 for source in sources {
                     let _ = cycle(&device, &secret, source);
                 }
                 continue;
             }
             assert_eq!(selected, namespace_a);
+            if replay_bump {
+                let source = SnapshotSource::Pi;
+                let generation = cycle_replay_generation(source, &selected);
+                assert_eq!(
+                    generation,
+                    format!(
+                        "pi:{}:{selected}",
+                        current_historical_replay(source).revision
+                    )
+                );
+                let (replayed, _) = cycle(&device, &secret, source);
+                assert_eq!(
+                    replayed.len(),
+                    1,
+                    "the returning destination pays its own owed revision"
+                );
+                for field in
+                    crate::snapshots::sampled_scan::transition_fixture::money_oracle::FIELDS
+                {
+                    assert_eq!(
+                        replayed[0][*field], before[2][0][*field],
+                        "Pi replay {field}"
+                    );
+                }
+                let state = crate::backfill::load_backfill_state(&support);
+                assert!(!crate::backfill::pending_backfill_sources_for_destination(
+                    &state, &selected
+                )
+                .contains(&source));
+                let saved = ScanIndex::load(&index_path(&selected, source)).unwrap();
+                assert!(saved.historical_replay_generation_matches(&generation));
+            }
+            if rollback {
+                for source in sources {
+                    let (bodies, _) = cycle(&device, &secret, source);
+                    assert!(
+                        bodies.is_empty(),
+                        "rollback re-walk never creates a new ACK for accepted history"
+                    );
+                }
+            }
             for source in sources {
                 let (bodies, io) =
                 crate::snapshots::sampled_scan::transition_fixture::observe_codex_quiet_with_bytes(
