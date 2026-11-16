@@ -1966,7 +1966,23 @@ pub(crate) fn decide_page_copies(
     let mut updates = if holders.is_empty() {
         CopyRemovalUpdates::default()
     } else {
-        decide_holders(items, &holders, index)
+        // finish_page's content-twin hold, known before any copy relies on
+        // a held holder's page body.
+        let late_held = {
+            let mut sessions = BTreeMap::<&str, Vec<LocationKey>>::new();
+            for item in items.iter() {
+                if let Some(fold) = item.claude_money.as_deref() {
+                    let here = sessions.entry(item.source_session_id.as_str()).or_default();
+                    here.extend(fold.location.map(|located| located.0));
+                }
+            }
+            let sessions = sessions
+                .iter()
+                .map(|(s, l)| (*s, l.as_slice()))
+                .collect::<Vec<_>>();
+            content_twin_holds(&sessions, items, index)
+        };
+        decide_holders(items, &holders, index, &late_held)
     };
     if !resolved_holds.is_empty() {
         let state = updates
@@ -3052,6 +3068,7 @@ fn decide_holders(
     items: &mut [SnapshotItem],
     folds: &[usize],
     index: &ScanIndex,
+    late_held: &BTreeSet<String>,
 ) -> CopyRemovalUpdates {
     if !index.persistence_available() {
         for at in folds {
@@ -3087,6 +3104,19 @@ fn decide_holders(
     // The page's folds by session, for the same-session page proof. By
     // session id alone: path twins live under different folders and roots.
     let page: &[SnapshotItem] = items;
+    // A page body the page will withhold proves nothing yet.
+    let owned = |key: &str| {
+        origin_owned(index, page, key, true)
+            && (accepted_origin(index, key)
+                || !page.iter().any(|item| {
+                    late_held.contains(&item.source_session_id)
+                        && item
+                            .claude_money
+                            .as_deref()
+                            .and_then(FileFold::location_key)
+                            == Some(location_key(key))
+                }))
+    };
     let mut page_folds = BTreeMap::<&str, Vec<usize>>::new();
     for (at, item) in page.iter().enumerate() {
         if item.claude_money.is_some() {
@@ -3136,7 +3166,7 @@ fn decide_holders(
                             index,
                             live.get_or_init(|| indexed_main_files(index)),
                             key,
-                        ) && !origin_owned(index, page, key, true)
+                        ) && !owned(key)
                     }) {
                         continue;
                     }
@@ -3190,7 +3220,7 @@ fn decide_holders(
                 } else {
                     Evidence::None
                 };
-                let proven = origin_owned(index, page, key, true);
+                let proven = owned(key);
                 let holder = holder_order(store, root, key).map(|order| (evidence, order, proven));
                 for &hash in hits {
                     let from = wanting.partition_point(|&(wanted, _)| wanted < hash);
@@ -3235,7 +3265,7 @@ fn decide_holders(
         let session_accepted = store.observations(&file.session).any(|(location, _)| {
             live.get_or_init(|| indexed_main_files(index))
                 .get(&location)
-                .is_some_and(|key| origin_owned(index, page, key, true))
+                .is_some_and(|key| owned(key))
         });
         for session in std::iter::once(&file.session).chain(file.holder_sessions.iter()) {
             for (location, _) in store.observations(session) {
@@ -3252,7 +3282,7 @@ fn decide_holders(
                     let accepted = if session == &file.session {
                         session_accepted
                     } else {
-                        origin_owned(index, page, key, true)
+                        owned(key)
                     };
                     if !accepted {
                         continue;
