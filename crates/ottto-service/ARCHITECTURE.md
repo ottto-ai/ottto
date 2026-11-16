@@ -590,10 +590,12 @@ cross-language identity vectors.
 Verification authorizes before source reads or result writes; setup authorizes
 before acquiring the process-wide scan lock. Telemetry controls require the
 validated user and organization to match the connected local account, under the
-identity lifecycle lock. Browser control requires an allowed Origin and loopback
-Host with the listener's port. Probes return their existing identity and detailed
-health replies with that same Origin/Host boundary, without a token. Other probe
-callers receive only liveness/version. Duplicate Host, Origin and Authorization
+identity lifecycle lock, and refuse work while an identity change is reserved.
+Codex daily-reference controls build their complete returned status from local
+stores before releasing that lock. Browser control requires an allowed Origin
+and loopback Host with the listener's port. Probes return their existing identity
+and detailed health replies with that same Origin/Host boundary, without a token.
+Other probe callers receive only liveness/version. Duplicate Host, Origin and Authorization
 headers are refused.
 
 Local health events retain only the latest observation per Upload, SetupRead and
