@@ -10,14 +10,12 @@ use std::time::Duration;
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum GrantKind {
     DailyReference,
-    CloudSessions,
 }
 
 impl GrantKind {
     pub(crate) fn route(self) -> &'static str {
         match self {
             Self::DailyReference => "provider-daily-reference",
-            Self::CloudSessions => "cloud-sessions",
         }
     }
 }
@@ -285,7 +283,6 @@ mod tests {
             GrantKind::DailyReference.route(),
             "provider-daily-reference"
         );
-        assert_eq!(GrantKind::CloudSessions.route(), "cloud-sessions");
     }
 
     fn request(scope: &str) -> RebindRequest {

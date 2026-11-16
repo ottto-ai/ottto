@@ -14,7 +14,6 @@ pub const LOCAL_CONTROL_PROTOCOL_VERSION: u16 = PROTOCOL_VERSION;
 fn is_false(value: &bool) -> bool {
     !*value
 }
-pub const CLOUD_SESSIONS_CONTROL_PROTOCOL_VERSION: u16 = 16;
 /// Command-scoped version for `provider_daily_reference_control`. Older daemons
 /// reject it outright, so a UI that can drive this consent is told to update
 /// rather than silently doing nothing. Every unrelated command stays on the
@@ -737,6 +736,12 @@ pub struct SourceHealth {
     /// analysis; older daemons omit the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_session_reconciliation: Option<ActiveSessionReconciliation>,
+    /// Local observation after Repair; independent of backend/config health.
+    /// `confirmed` is persisted and terminal until the next Repair (or an eligibility clear).
+    /// Apps read `state`, never derive it from timestamps, and treat confirmation as a
+    /// one-time acknowledgement before falling back to the ordinary source row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracking_confirmation: Option<TrackingConfirmation>,
     pub last_seen_at: Option<Rfc3339Timestamp>,
     pub last_verified_at: Option<Rfc3339Timestamp>,
     pub problems: Vec<HealthProblem>,
@@ -763,6 +768,22 @@ pub struct SourceHealth {
     /// absent only from daemons that predate per-source pause.
     #[serde(default)]
     pub source_paused: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrackingConfirmation {
+    pub state: TrackingConfirmationState,
+    pub since: Rfc3339Timestamp,
+    pub confirmed_at: Option<Rfc3339Timestamp>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrackingConfirmationState {
+    Waiting,
+    Confirmed,
+    #[serde(other)]
+    Unknown,
 }
 
 /// Bounded machine-local status from the latest completed incremental
@@ -3048,7 +3069,6 @@ pub fn expected_local_control_protocol_version(command: &LocalControlCommand) ->
         | LocalControlCommand::SessionLaunchRecentFolders { .. }
         | LocalControlCommand::AccountNicknames
         | LocalControlCommand::AccountNicknameSet { .. } => SESSION_LAUNCH_CONTROL_PROTOCOL_VERSION,
-        LocalControlCommand::CloudSessionsControl { .. } => CLOUD_SESSIONS_CONTROL_PROTOCOL_VERSION,
         LocalControlCommand::ProviderDailyReferenceControl { .. } => {
             PROVIDER_DAILY_REFERENCE_CONTROL_PROTOCOL_VERSION
         }
@@ -4448,16 +4468,6 @@ pub enum LocalControlCommand {
         ingest_key: Option<SecretString>,
     },
     /// One short-lived, backend-authorized mutation/read of the local Codex
-    /// cloud-session consent state. Browser JWTs never cross this boundary.
-    CloudSessionsControl {
-        action: CloudSessionsControlAction,
-        control_token: SecretString,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        api_base_url: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        backend_grant: Option<CloudSessionBackendGrantResponseV1>,
-    },
-    /// One short-lived, backend-authorized mutation/read of the local Codex
     /// daily-aggregates (`provider_daily_reference.v1`) consent state.
     ///
     /// It packages consent the operator explicitly asked for in the UI; it
@@ -4572,25 +4582,6 @@ pub enum TelemetryControlAction {
     Status,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CloudSessionsControlAction {
-    Prepare,
-    Bind,
-    Pause,
-    Revoke,
-    ConfirmRevoked,
-    Status,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CloudSessionServerPolicyState {
-    Approved,
-    #[default]
-    Disabled,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderDailyReferenceControlAction {
@@ -4635,39 +4626,6 @@ pub struct ProviderDailyReferenceBackendGrantResponseV1 {
     pub grant_version: u64,
     #[serde(default)]
     pub server_policy_state: ProviderDailyReferenceServerPolicyState,
-}
-
-/// Strict identity-bearing subset needed to bind an ordinary-browser grant
-/// response locally. Provider content and credentials are never represented.
-///
-/// `cloud_session_changes.v1` grants carry `status` `enabled`, `paused` or
-/// `revoked` and `can_collect`; a missing `can_collect` never authorizes
-/// collection. `collector_version`, `release_lane` and `server_policy_state`
-/// are optional diagnostics of older responses.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CloudSessionBackendGrantResponseV1 {
-    pub id: String,
-    pub installation_id: String,
-    pub source: String,
-    pub collector_id: String,
-    pub schema_version: String,
-    #[serde(default)]
-    pub collector_version: String,
-    #[serde(default)]
-    pub release_lane: String,
-    pub disclosure_version: String,
-    pub grant_scope_fingerprint: String,
-    pub account_fingerprint: String,
-    pub status: String,
-    pub grant_version: u64,
-    #[serde(default)]
-    pub server_policy_state: CloudSessionServerPolicyState,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub can_collect: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub can_read_cloud_sessions: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub paused_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -7130,71 +7088,6 @@ mod tests {
     }
 
     #[test]
-    fn cloud_sessions_control_command_round_trips_without_browser_credentials() {
-        let request: LocalControlRequest = serde_json::from_value(serde_json::json!({
-            "request_id": "req_cloud_bind",
-            "protocol_version": CLOUD_SESSIONS_CONTROL_PROTOCOL_VERSION,
-            "client_kind": "web_ui",
-            "command": "cloud_sessions_control",
-            "action": "bind",
-            "control_token": "header.payload.signature",
-            "api_base_url": "https://api.ottto.net",
-            "backend_grant": {
-                "id": "00000000-0000-4000-8000-000000000002",
-                "installation_id": "00000000-0000-4000-8000-000000000001",
-                "source": "codex",
-                "collector_id": "cloud_sessions",
-                "schema_version": "cloud_session_changes.v1",
-                "collector_version": "0.1.90",
-                "disclosure_version": "cloud_sessions_disclosure.v1",
-                "grant_scope_fingerprint": format!("hmac-sha256:{}", "a".repeat(64)),
-                "account_fingerprint": format!("hmac-sha256:{}", "b".repeat(64)),
-                "status": "enabled",
-                "grant_version": 1,
-                "can_collect": true,
-                "can_read_cloud_sessions": true,
-                "paused_at": null
-            }
-        }))
-        .expect("cloud-session bind control request");
-
-        assert!(matches!(
-            request.command,
-            LocalControlCommand::CloudSessionsControl {
-                action: CloudSessionsControlAction::Bind,
-                backend_grant: Some(CloudSessionBackendGrantResponseV1 {
-                    grant_version: 1,
-                    ..
-                }),
-                ..
-            }
-        ));
-        let debug = format!("{request:?}");
-        assert!(!debug.contains("header.payload.signature"));
-        assert!(debug.contains("<redacted>"));
-        let wire = serde_json::to_string(&request).unwrap();
-        assert!(!wire.contains("browser_jwt"));
-        assert!(!wire.contains("device_secret"));
-        assert!(!wire.contains("provider"));
-
-        let mut cleanup_wire: serde_json::Value = serde_json::from_str(&wire).unwrap();
-        cleanup_wire["request_id"] = serde_json::json!("req_cloud_revoke_cleanup");
-        cleanup_wire["action"] = serde_json::json!("revoke");
-        let cleanup: LocalControlRequest = serde_json::from_value(cleanup_wire).unwrap();
-        assert!(matches!(
-            cleanup.command,
-            LocalControlCommand::CloudSessionsControl {
-                action: CloudSessionsControlAction::Revoke,
-                backend_grant: Some(CloudSessionBackendGrantResponseV1 {
-                    grant_version: 1,
-                    ..
-                }),
-                ..
-            }
-        ));
-    }
-
-    #[test]
     fn agent_status_backend_redaction_preserves_display_plan_fields() {
         let snapshot = AgentStatusSnapshot {
             source: SourceKind::Codex,
@@ -8257,24 +8150,6 @@ mod tests {
     }
 
     #[test]
-    fn cloud_sessions_control_rejects_base_protocol_version() {
-        let error = serde_json::from_str::<LocalControlRequest>(
-            r#"{"request_id":"req_cloud_v15","protocol_version":15,"command":"cloud_sessions_control","action":"status","control_token":"header.payload.signature"}"#,
-        )
-        .expect_err("cloud-session control must reject the base protocol version");
-
-        assert!(error
-            .to_string()
-            .contains("unsupported local control protocol_version 15"));
-        assert!(error.to_string().contains(&format!(
-            "expected {CLOUD_SESSIONS_CONTROL_PROTOCOL_VERSION}"
-        )));
-        assert_eq!(PROTOCOL_VERSION, 15);
-        assert_eq!(LOCAL_CONTROL_PROTOCOL_VERSION, 15);
-        assert_eq!(CLOUD_SESSIONS_CONTROL_PROTOCOL_VERSION, 16);
-    }
-
-    #[test]
     fn provider_daily_reference_control_command_round_trips_without_credentials() {
         let request: LocalControlRequest = serde_json::from_value(serde_json::json!({
             "request_id": "req_pdr_bind",
@@ -8429,40 +8304,6 @@ mod tests {
             PROVIDER_DAILY_REFERENCE_CONTROL_PROTOCOL_VERSION
         );
         assert_eq!(PROVIDER_DAILY_REFERENCE_CONTROL_PROTOCOL_VERSION, 18);
-    }
-
-    #[test]
-    fn cloud_sessions_control_accepts_command_protocol_version() {
-        let request = serde_json::from_value::<LocalControlRequest>(serde_json::json!({
-            "request_id": "req_cloud_v16",
-            "protocol_version": CLOUD_SESSIONS_CONTROL_PROTOCOL_VERSION,
-            "command": "cloud_sessions_control",
-            "action": "status",
-            "control_token": "header.payload.signature"
-        }))
-        .expect("cloud-session command protocol version should be accepted");
-
-        assert_eq!(
-            request.protocol_version,
-            CLOUD_SESSIONS_CONTROL_PROTOCOL_VERSION
-        );
-    }
-
-    #[test]
-    fn local_control_status_rejects_cloud_sessions_protocol_version() {
-        let error = serde_json::from_value::<LocalControlRequest>(serde_json::json!({
-            "request_id": "req_status_v16",
-            "protocol_version": CLOUD_SESSIONS_CONTROL_PROTOCOL_VERSION,
-            "command": "status"
-        }))
-        .expect_err("ordinary status must reject the cloud-session protocol version");
-
-        assert!(error
-            .to_string()
-            .contains("unsupported local control protocol_version 16"));
-        assert!(error
-            .to_string()
-            .contains(&format!("expected {LOCAL_CONTROL_PROTOCOL_VERSION}")));
     }
 
     #[test]

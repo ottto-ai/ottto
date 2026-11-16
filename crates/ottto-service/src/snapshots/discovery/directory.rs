@@ -99,10 +99,7 @@ thread_local! {
 
 /// Scaled per-tick directory budget for tests only, so a walk spans pages.
 #[cfg(test)]
-pub(in crate::snapshots) fn with_test_directory_entries<T>(
-    budget: usize,
-    run: impl FnOnce() -> T,
-) -> T {
+pub(crate) fn with_test_directory_entries<T>(budget: usize, run: impl FnOnce() -> T) -> T {
     struct Reset;
     impl Drop for Reset {
         fn drop(&mut self) {

@@ -464,8 +464,22 @@ impl std::fmt::Display for CloudSessionContractRejected {
 
 impl std::error::Error for CloudSessionContractRejected {}
 
-/// The server answered that this cloud-session route or grant epoch is not
-/// available: an older server, or a grant this installation must re-consent.
+/// The server refused a cloud-task request as a whole (HTTP 409: listing
+/// off, a policy mismatch, an unavailable predecessor). No body is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CloudTaskRefused {
+    pub status: u16,
+}
+
+impl std::fmt::Display for CloudTaskRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "backend refused cloud tasks: HTTP {}", self.status)
+    }
+}
+
+impl std::error::Error for CloudTaskRefused {}
+
+/// The server does not offer this cloud-task route (an older server).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CloudSessionRouteUnsupported {
     pub status: u16,
@@ -475,7 +489,7 @@ impl std::fmt::Display for CloudSessionRouteUnsupported {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "backend does not offer this cloud-session route or grant: HTTP {}",
+            "backend does not offer this cloud-session route: HTTP {}",
             self.status
         )
     }
@@ -839,6 +853,15 @@ pub struct ActivityHintResponse {
     /// it for permit-era daemons.
     #[serde(default)]
     pub session_request_identity_contract: Option<String>,
+    /// Codex only: the user's "List my Codex cloud tasks" setting as this
+    /// server resolves it. An older server omits it, which means off. This
+    /// and the next one are set only by `decode_activity_hint`, tolerantly:
+    /// a missing or malformed value is off and never fails the hint.
+    #[serde(skip)]
+    pub codex_cloud_tasks_enabled: bool,
+    /// Codex only: the task-list contract the server accepts.
+    #[serde(skip)]
+    pub codex_cloud_tasks_contract: Option<String>,
     pub recommended_scan_after: String,
 }
 
@@ -873,6 +896,11 @@ pub(crate) fn decode_activity_hint(value: Value) -> Result<ActivityHintResponse>
     hint.workspace_labels_explicit = value
         .get("workspace_labels_enabled")
         .and_then(Value::as_bool);
+    hint.codex_cloud_tasks_enabled = value
+        .get("codex_cloud_tasks_enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    hint.codex_cloud_tasks_contract = text("codex_cloud_tasks_contract");
     Ok(hint)
 }
 
@@ -2114,10 +2142,10 @@ fn relay_token_upload_response(
 }
 
 /// A failed cloud-session request: 401/403 is an authorization rejection;
-/// 404/405/409/410 means this server does not offer the route or this grant
-/// epoch; 400/415/422 a contract rejection; 408/429/503 a shed with its
-/// `Retry-After`; any other status or a transport failure carries upload
-/// diagnostics. Response bodies are never kept.
+/// 404/405/410 means this server does not offer the route (410: not this
+/// contract any more); 409 a refusal; 400/415/422 a contract rejection; 408/429/503 a
+/// shed with its `Retry-After`; any other status or a transport failure
+/// carries upload diagnostics. No other response body is read.
 fn cloud_session_request_error(
     error: ureq::Error,
     operation: &'static str,
@@ -2127,9 +2155,10 @@ fn cloud_session_request_error(
         ureq::Error::Status(code @ (401 | 403), _response) => {
             anyhow::Error::new(CloudSessionAuthorizationRejected { status: code })
         }
-        ureq::Error::Status(code @ (404 | 405 | 409 | 410), _response) => {
+        ureq::Error::Status(code @ (404 | 405 | 410), _response) => {
             anyhow::Error::new(CloudSessionRouteUnsupported { status: code })
         }
+        ureq::Error::Status(409, _response) => anyhow::Error::new(CloudTaskRefused { status: 409 }),
         ureq::Error::Status(code @ (400 | 415 | 422), _response) => {
             anyhow::Error::new(CloudSessionContractRejected { status: code })
         }
@@ -2456,11 +2485,8 @@ impl SnapshotApiClient {
         let (agent, timeout) = bounded_snapshot_deadline_agent(budget.deadline()?)?;
         let response = relay_sent(
             relay_token,
-            agent
-                .get(&self.api_url("/api/v1/agent-session-snapshots/activity-hints"))
+            self.activity_hint_request(&agent, relay_token)
                 .timeout(timeout)
-                .set("Accept", "application/json")
-                .set("Authorization", &format!("Bearer {relay_token}"))
                 .call(),
         )
         .map_err(|error| small_upload_error(error, "activity hint request", "activity_hint"))?;
@@ -2472,14 +2498,18 @@ impl SnapshotApiClient {
         Ok(hint)
     }
 
+    /// The one activity-hint GET every caller sends.
+    fn activity_hint_request(&self, agent: &ureq::Agent, relay_token: &str) -> ureq::Request {
+        agent
+            .get(&self.api_url("/api/v1/agent-session-snapshots/activity-hints"))
+            .set("Accept", "application/json")
+            .set("Authorization", &format!("Bearer {relay_token}"))
+    }
+
     pub fn get_activity_hint(&self, relay_token: &str) -> Result<ActivityHintResponse> {
         relay_sent(
             relay_token,
-            self.agent
-                .get(&self.api_url("/api/v1/agent-session-snapshots/activity-hints"))
-                .set("Accept", "application/json")
-                .set("Authorization", &format!("Bearer {relay_token}"))
-                .call(),
+            self.activity_hint_request(&self.agent, relay_token).call(),
         )
         // Typed diagnostics (not a plain string) so a transport-layer
         // failure on this early per-source call feeds the outage streak.
@@ -3064,9 +3094,9 @@ impl SnapshotApiClient {
             .set("Accept", "application/json")
             .set("Authorization", &format!("Bearer {relay_token}"))
     }
-    /// Upload one `cloud_session_changes.v1` request with the same
-    /// source-scoped relay principal as local snapshots. Only the parsed ACK
-    /// is returned; response bodies of refusals are never kept.
+    /// Upload one `cloud_session_changes.v3` request with the same
+    /// source-scoped relay principal as local snapshots. Only the parsed ACK,
+    /// or a refusal's typed code, is returned.
     pub fn upload_cloud_session_changes_with_timeout(
         &self,
         relay_token: &str,
@@ -3137,42 +3167,30 @@ impl SnapshotApiClient {
         }
     }
 
-    /// Read one exact, relay-device-bound cloud grant epoch on the
-    /// `cloud_session_changes.v1` authority. Not a list; never browser auth.
-    pub fn get_cloud_session_authority_with_timeout(
+    /// Read the activity hint for the cloud-task collector within its slice
+    /// deadline. Errors map like the other cloud-task requests, so a 401/403
+    /// refreshes the relay token once.
+    pub(crate) fn get_activity_hint_with_timeout(
         &self,
         relay_token: &str,
-        grant_id: &str,
-        grant_version: u64,
         timeout: Duration,
-    ) -> Result<Value> {
-        if !crate::hex::is_uuid(grant_id) || grant_version == 0 {
-            return Err(anyhow!("cloud-session authority identity is invalid"));
-        }
+    ) -> Result<ActivityHintResponse> {
         let (agent, request_timeout) = cloud_session_deadline_agent(timeout)?;
-        let path = format!(
-            "/api/v1/cloud-sessions/grants/{grant_id}/authority?grant_version={grant_version}"
-        );
         match relay_sent(
             relay_token,
-            agent
-                .get(&self.api_url(&path))
+            self.activity_hint_request(&agent, relay_token)
                 .timeout(request_timeout)
-                .set("Accept", "application/json")
-                .set("Authorization", &format!("Bearer {relay_token}"))
                 .call(),
         ) {
-            Ok(response) => require_cloud_session_success(
-                response,
-                "cloud-session authority read",
-                "cloud_session_authority",
-            )?
-            .into_json()
-            .map_err(|error| anyhow!("parse cloud-session authority response failed: {error}")),
+            Ok(response) => bounded_response_json::<Value>(
+                require_cloud_session_success(response, "activity hint request", "activity_hint")?,
+                crate::snapshot_retry::TOKEN_RESPONSE_BYTES,
+            )
+            .and_then(decode_activity_hint),
             Err(error) => Err(cloud_session_request_error(
                 error,
-                "cloud-session authority read",
-                "cloud_session_authority",
+                "activity hint request",
+                "activity_hint",
             )),
         }
     }
@@ -3843,6 +3861,32 @@ mod tests {
             }
         }
         String::from_utf8_lossy(&request).to_string()
+    }
+
+    #[test]
+    fn codex_cloud_task_fields_default_off_and_never_fail_the_hint() {
+        let decode = |extra: &str| {
+            decode_activity_hint(serde_json::from_str(&activity_hint_json(extra)).unwrap()).unwrap()
+        };
+        for extra in [
+            "",
+            r#", "codex_cloud_tasks_enabled":"yes", "codex_cloud_tasks_contract":{"v":3}"#,
+        ] {
+            let hint = decode(extra);
+            assert!(!hint.codex_cloud_tasks_enabled);
+            assert_eq!(hint.codex_cloud_tasks_contract, None);
+        }
+        // A stray retired key field is ignored.
+        let hint = decode(
+            r#", "codex_cloud_tasks_enabled":true,
+               "codex_cloud_task_key":"BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc",
+               "codex_cloud_tasks_contract":"cloud_session_changes.v3""#,
+        );
+        assert!(hint.codex_cloud_tasks_enabled);
+        assert_eq!(
+            hint.codex_cloud_tasks_contract.as_deref(),
+            Some("cloud_session_changes.v3")
+        );
     }
 
     #[test]
@@ -5689,7 +5733,7 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(ActivityHintResponse; claude_otel_only_sessions_contract, claude_otel_only_pairing_floor, claude_otel_only_pairing_ceiling, source, server_time, last_data_at, record_count_15m, record_count_24h, local_usage_reconciliation_enabled, backfill_window_days, session_titles_enabled, workspace_labels_enabled, workspace_labels_explicit, session_artifacts_enabled, mcp_inventory_harvest_enabled, context_footprint_harvest_enabled, context_composition_details_contract, names_withheld_contract, session_attribution_enabled, session_attribution_labels_enabled, session_attribution_hmac_key, session_attribution_hmac_key_version, session_cache_observations_contract, cache_full_replacement_contract, copy_unproven_contract, session_request_identity_retained_contract, session_request_account_source_contract, session_billing_route_contract, max_snapshot_item_bytes, snapshot_head_cas_enabled, snapshot_head_cas_required, census_residue_status_contract, session_request_identity_contract, recommended_scan_after);
+crate::heap_layout_bound::fields!(ActivityHintResponse; claude_otel_only_sessions_contract, claude_otel_only_pairing_floor, claude_otel_only_pairing_ceiling, source, server_time, last_data_at, record_count_15m, record_count_24h, local_usage_reconciliation_enabled, backfill_window_days, session_titles_enabled, workspace_labels_enabled, workspace_labels_explicit, session_artifacts_enabled, mcp_inventory_harvest_enabled, context_footprint_harvest_enabled, context_composition_details_contract, names_withheld_contract, session_attribution_enabled, session_attribution_labels_enabled, session_attribution_hmac_key, session_attribution_hmac_key_version, session_cache_observations_contract, cache_full_replacement_contract, copy_unproven_contract, session_request_identity_retained_contract, session_request_account_source_contract, session_billing_route_contract, max_snapshot_item_bytes, snapshot_head_cas_enabled, snapshot_head_cas_required, census_residue_status_contract, session_request_identity_contract, codex_cloud_tasks_enabled, codex_cloud_tasks_contract, recommended_scan_after);
 
 impl crate::heap_layout_bound::HeapLayoutBound for SnapshotApiClient {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {

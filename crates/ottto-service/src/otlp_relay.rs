@@ -1067,7 +1067,6 @@ fn handle_control_request(
     if !matches!(
         &control_request.command,
         LocalControlCommand::TelemetryControl { .. }
-            | LocalControlCommand::CloudSessionsControl { .. }
             | LocalControlCommand::ProviderDailyReferenceControl { .. }
     ) {
         return write_json_response_with_headers(

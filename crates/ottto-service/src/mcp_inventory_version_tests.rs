@@ -63,6 +63,7 @@ fn codex_wire_loading_pins_and_version_independent_hash() {
         disabled: false,
         always_load: false,
         config_dir: None,
+        source: ServerSource::UserSettings,
     };
     for (version, mode, basis) in [
         (Some("0.148.9"), "unknown", "legacy_client"),
