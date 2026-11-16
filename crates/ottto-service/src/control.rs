@@ -32436,12 +32436,15 @@ X-API-Key = "otel_redacted"
             );
             let prior = prior_device_credential_for_registration().unwrap().unwrap();
             let (mut pending, candidate, token) = relogin_claim(&prior, user, org, device.clone());
-            pending
-                .claim_commit
-                .as_mut()
-                .unwrap()
-                .connection
-                .api_base_url = api;
+            let commit = pending.claim_commit.as_mut().unwrap();
+            commit.connection.api_base_url = api;
+            assert_eq!(
+                commit.connection.api_base_url,
+                prior.owner.as_ref().unwrap().api_base_url,
+                "the owner changes on the same receiver"
+            );
+            // Re-decide after replacing the shared helper's default endpoint.
+            continue_prior_snapshot_namespace(&mut pending, Some(&prior));
             assert_eq!(journaled_namespace(&pending), None, "different prior owner");
             promote_relogin(&pending, &candidate, &token);
             assert!(
