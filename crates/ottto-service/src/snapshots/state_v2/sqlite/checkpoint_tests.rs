@@ -81,7 +81,9 @@ fn idle_releases_page_cache_and_next_pass_refills_it() {
     for (generation, quiet) in [false, true].into_iter().enumerate() {
         save(&mut db, generation as u64, "cached", &value);
         assert_eq!(read(&mut db, "cached"), value);
-        db.maintenance(false).unwrap();
+        // Prime daily idle work without releasing, so the comparison isolates
+        // release from maintenance's own cache activity.
+        db.maintenance(true).unwrap();
         let warm = serde_json::to_value(db.maintenance_stats()).unwrap();
         let warm_bytes = warm["cache_used_bytes"].as_u64().unwrap();
         // Cache retention depends on SQLite's process-wide soft heap pressure,
