@@ -719,6 +719,9 @@ pub struct SourceHealth {
     pub config: SourceConfigState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collector: Option<LocalCollectorHealth>,
+    /// This run's local scan health. Absent means unknown, never healthy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collection: Option<SourceCollectionHealth>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_status: Option<AgentStatusSnapshot>,
     #[serde(default)]
@@ -768,6 +771,29 @@ pub struct SourceHealth {
     /// absent only from daemons that predate per-source pause.
     #[serde(default)]
     pub source_paused: bool,
+}
+
+/// RAM-only local collection observation; independent of upload settlement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceCollectionHealth {
+    pub state: SourceCollectionState,
+    /// Last completed scan observed by this daemon run, including empty scans.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_scan_at: Option<Rfc3339Timestamp>,
+    /// Present only for server_backoff; wall time projected from its awake deadline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<Rfc3339Timestamp>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceCollectionState {
+    Collecting,
+    Stalled,
+    ServerBackoff,
+    Offline,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -7620,6 +7646,46 @@ mod tests {
         let decoded = serde_json::from_value::<MachineIdentity>(value).expect("decode identity");
         assert_eq!(decoded, identity);
         assert_eq!(decoded.account_scope.as_deref(), Some(scope));
+    }
+
+    #[test]
+    fn source_collection_is_additive_and_round_trips() {
+        let mut health: SourceHealth = serde_json::from_str(include_str!(
+            "../../../fixtures/source-health/codex-needs-repair.json"
+        ))
+        .unwrap();
+        assert!(health.collection.is_none());
+        assert!(serde_json::to_value(&health)
+            .unwrap()
+            .get("collection")
+            .is_none());
+        for state in [
+            "collecting",
+            "stalled",
+            "server_backoff",
+            "offline",
+            "future",
+        ] {
+            let mut value =
+                serde_json::json!({"state": state, "last_scan_at": "2026-11-15T10:00:00Z"});
+            if state == "server_backoff" {
+                value["until"] = serde_json::json!("2026-11-15T10:30:00Z");
+            }
+            health.collection = Some(serde_json::from_value(value).unwrap());
+            let encoded = serde_json::to_value(&health).unwrap();
+            assert_eq!(
+                encoded["collection"].get("until").is_some(),
+                state == "server_backoff"
+            );
+            assert_eq!(
+                serde_json::from_value::<SourceHealth>(encoded).unwrap(),
+                health
+            );
+        }
+        assert_eq!(
+            health.collection.unwrap().state,
+            SourceCollectionState::Unknown
+        );
     }
 
     #[test]

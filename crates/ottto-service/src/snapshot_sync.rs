@@ -4162,12 +4162,62 @@ fn with_source_cadence<T>(
     apply: impl FnOnce(&mut SourceCadence) -> T,
 ) -> Option<T> {
     let power = continuation::MacPlatformSignals::default().power();
+    with_source_cadence_state(source, |cadence| {
+        cadence.set_power_stretch(continuation::session_power_stretch(power));
+        apply(cadence)
+    })
+}
+
+// Collection observations must not refresh power inputs or change scheduling.
+fn with_source_cadence_state<T>(
+    source: SnapshotSource,
+    apply: impl FnOnce(&mut SourceCadence) -> T,
+) -> Option<T> {
     let mut cadences = source_cadences().lock().ok()?;
     let cadence = cadences
         .entry(source.api_slug())
         .or_insert_with(|| SourceCadence::new(CadenceConfig::cost_first(SNAPSHOT_SYNC_INTERVAL)));
-    cadence.set_power_stretch(continuation::session_power_stretch(power));
     Some(apply(cadence))
+}
+
+pub(crate) fn start_collection_health(source: SnapshotSource) {
+    // A small-route shed may predate the first offered scan of this run.
+    let deadline = source_upload_deadlines()
+        .lock()
+        .ok()
+        .and_then(|deadlines| deadlines.get(source.api_slug()).copied());
+    with_source_cadence_state(source, |cadence| {
+        let pulse = cadence
+            .collection
+            .get_or_insert_with(crate::collection_health::Pulse::start);
+        if let Some(deadline) = deadline {
+            pulse.defer(deadline);
+        }
+    });
+}
+
+pub(crate) fn reset_collection_health(source: SnapshotSource) {
+    if let Ok(mut cadences) = source_cadences().lock() {
+        if let Some(cadence) = cadences.get_mut(source.api_slug()) {
+            cadence.collection = None;
+        }
+    }
+}
+
+pub(crate) fn collection_health(
+    source: SnapshotSource,
+    applicable: bool,
+    wall: &str,
+) -> Option<ottto_protocol::SourceCollectionHealth> {
+    let mut cadences = source_cadences().lock().ok()?;
+    let cadence = cadences.get_mut(source.api_slug())?;
+    if !applicable {
+        cadence.collection = None;
+    }
+    cadence
+        .collection
+        .as_ref()
+        .map(|pulse| pulse.project(cadence.ordinary_interval(), wall))
 }
 
 /// The negotiated wait for one source: `clamp(directive, floor, ceiling)`.
@@ -4366,12 +4416,20 @@ fn source_upload_deadlines() -> &'static Mutex<BTreeMap<&'static str, Instant>> 
 }
 
 fn defer_source_uploads(source: SnapshotSource, retry_after: Duration) {
-    if let Ok(mut deadlines) = source_upload_deadlines().lock() {
+    let deadline = source_upload_deadlines().lock().ok().map(|mut deadlines| {
         let deadline = crate::scan_clock::now() + retry_after;
-        deadlines
+        *deadlines
             .entry(source.api_slug())
             .and_modify(|existing| *existing = (*existing).max(deadline))
-            .or_insert(deadline);
+            .or_insert(deadline)
+    });
+    // Release the deadline lock before the collector lock. All shed routes latch here.
+    if let Some(deadline) = deadline {
+        with_source_cadence_state(source, |cadence| {
+            if let Some(pulse) = cadence.collection.as_mut() {
+                pulse.defer(deadline);
+            }
+        });
     }
 }
 
@@ -5542,6 +5600,9 @@ fn sync_once_with_retry(
         .map_err(|_| anyhow!("snapshot account authority unavailable"))?;
     let client = snapshot_cycle_client(support_dir, daemon)?;
     let enabled_sources = cycle_heartbeat(&client, &device, &device_secret, &machine_id, daemon);
+    for source in enabled_sources.iter().copied() {
+        start_collection_health(source);
+    }
 
     // Cycle-start scan receipts: one cheap non-terminal status per enabled
     // source before any scanning. Sources late in the sequential cycle would
@@ -6724,6 +6785,11 @@ fn prepare_sync_source(
                 })
         },
     );
+    with_source_cadence_state(source, |cadence| {
+        if let Some(pulse) = cadence.collection.as_mut() {
+            pulse.prepare_outcome(result.as_ref().err());
+        }
+    });
     let counts = diagnostics.finish();
     if source == SnapshotSource::ClaudeCode {
         crate::local_resource_diagnostics::claude_reread::emit_without_lease(counts);
@@ -8076,6 +8142,13 @@ fn finish_sync_source(
             source.api_slug()
         );
     }
+
+    // A scan completed even if the optional cache write failed or upload later fails.
+    with_source_cadence_state(source, |cadence| {
+        if let Some(pulse) = cadence.collection.as_mut() {
+            pulse.complete(&reconciled_at);
+        }
+    });
 
     if let (Some((generation, _)), Some(at)) = (
         tracking_episode,
@@ -12730,6 +12803,7 @@ pub(crate) fn disable_snapshot_source(support_dir: &Path, source: SnapshotSource
     {
         let _turn = source_erasure_turn();
         write_source_marker(&source_marker_path(support_dir, source), "pending")?;
+        reset_collection_health(source);
     }
     if source == SnapshotSource::ClaudeCode {
         crate::otlp_relay::legacy::revoke_now();

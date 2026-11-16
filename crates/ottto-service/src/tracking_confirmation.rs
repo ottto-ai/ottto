@@ -26,7 +26,7 @@ impl TrackingEpisodes {
 
     pub(super) fn arm(&mut self, source: &SourceKind, since: String, eligible: bool) {
         self.clear(source);
-        if eligible && !self.policy_stopped.contains(source_slug(source)) {
+        if eligible && self.policy_allows(source) {
             self.restore(
                 source,
                 LocalTrackingConfirmation {
@@ -105,13 +105,17 @@ impl TrackingEpisodes {
         }
     }
 
+    pub(super) fn policy_allows(&self, source: &SourceKind) -> bool {
+        !self.policy_stopped.contains(source_slug(source))
+    }
+
     pub(super) fn project(
         &self,
         source: &SourceKind,
         applicable: bool,
     ) -> Option<TrackingConfirmation> {
         self.saved(source)
-            .filter(|_| applicable && !self.policy_stopped.contains(source_slug(source)))
+            .filter(|_| applicable && self.policy_allows(source))
             .map(|saved| TrackingConfirmation {
                 state: if saved.confirmed_at.is_some() {
                     TrackingConfirmationState::Confirmed
@@ -224,10 +228,13 @@ impl LocalDaemon {
         let mut state = self.state()?;
         state.registered_source_grants.clone_from(&device.sources);
         for source in [SourceKind::ClaudeCode, SourceKind::Codex, SourceKind::Pi] {
-            if !eligible.contains(&crate::snapshot_sync::snapshot_source_of_kind(&source))
-                && state.tracking_confirmation.clear(&source)
-            {
-                state.persist_source_state(&source);
+            if !eligible.contains(&crate::snapshot_sync::snapshot_source_of_kind(&source)) {
+                crate::snapshot_sync::reset_collection_health(
+                    crate::snapshot_sync::snapshot_source_of_kind(&source),
+                );
+                if state.tracking_confirmation.clear(&source) {
+                    state.persist_source_state(&source);
+                }
             }
         }
         Ok(())

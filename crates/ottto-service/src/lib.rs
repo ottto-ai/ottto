@@ -21,6 +21,7 @@ pub mod codex_prelude_footprint;
 mod codex_process_homes;
 mod codex_scan_diagnostics;
 pub mod codex_sign_in;
+mod collection_health;
 pub(crate) mod command_env;
 mod composition_kinds;
 pub mod context_composition;
@@ -393,6 +394,13 @@ impl DaemonState {
         self.source_first_seen.clear();
         self.source_reconciliation.clear();
         self.tracking_confirmation.clear_all();
+        for source in [
+            snapshots::SnapshotSource::ClaudeCode,
+            snapshots::SnapshotSource::Codex,
+            snapshots::SnapshotSource::Pi,
+        ] {
+            snapshot_sync::reset_collection_health(source);
+        }
         self.registered_source_grants.clear();
     }
 }
@@ -591,6 +599,12 @@ impl LocalDaemon {
         state
             .source_reconciliation
             .insert(source_slug(&source).to_string(), enabled);
+        if receipt_window_days == 0 || !enabled {
+            snapshot_sync::reset_collection_health(snapshot_sync::snapshot_source_of_kind(&source));
+        } else {
+            // A positive prepare hint resumes the pulse before reconciliation.
+            snapshot_sync::start_collection_health(snapshot_sync::snapshot_source_of_kind(&source));
+        }
         if state
             .tracking_confirmation
             .record_policy(&source, receipt_window_days, enabled)
@@ -2424,15 +2438,20 @@ fn status_from_state_with_relay_finding(
         // Read here only; row builders leave it false, so no row goes stale.
         let marker = snapshot_sync::source_marker(&default_support_dir(), source);
         health.source_paused = marker.as_deref().is_some_and(|value| value != "reconnect");
-        health.tracking_confirmation = state.tracking_confirmation.project(
-            &health.source,
-            state
-                .registered_source_grants
-                .iter()
-                .any(|slug| slug == source.api_slug())
-                && marker.is_none()
-                && health.state != SourceState::NotFound
-                && state.reconciliation_enabled(&health.source) != Some(false),
+        let applicable = state
+            .registered_source_grants
+            .iter()
+            .any(|slug| slug == source.api_slug())
+            && marker.is_none()
+            && health.state != SourceState::NotFound
+            && state.reconciliation_enabled(&health.source) != Some(false);
+        health.tracking_confirmation = state
+            .tracking_confirmation
+            .project(&health.source, applicable);
+        health.collection = snapshot_sync::collection_health(
+            source,
+            applicable && state.tracking_confirmation.policy_allows(&health.source),
+            &status.generated_at,
         );
     }
     status.local_health_events = state.local_health_events.clone();
@@ -4143,6 +4162,7 @@ fn cached_source_health(state: &DaemonState, source: SourceKind) -> SourceHealth
         plan_observations: Vec::new(),
         detected_uses: Vec::new(),
         active_session_reconciliation: None,
+        collection: None,
         tracking_confirmation: None,
         last_seen_at: None,
         last_verified_at: None,
@@ -4193,6 +4213,7 @@ fn load_source_state(state: &mut DaemonState, dir: &Path) {
 
 fn normalize_persisted_source_health(state: &DaemonState, health: &mut SourceHealth) {
     health.tracking_confirmation = None;
+    health.collection = None;
     health.descriptor = source_descriptor(&health.source);
     health.account_binding.expected_account_id =
         state.account.user.as_ref().map(|user| user.id.clone());
@@ -4533,6 +4554,7 @@ fn source_health_from_verification(
         plan_observations: Vec::new(),
         detected_uses,
         active_session_reconciliation: None,
+        collection: None,
         tracking_confirmation: None,
         last_seen_at: result.last_received_at.clone(),
         last_verified_at: if result.source == SourceKind::Codex
@@ -5079,6 +5101,7 @@ fn source_health_from_agent_status(
         plan_observations: snapshot.plan_observations.clone(),
         detected_uses,
         active_session_reconciliation: None,
+        collection: None,
         tracking_confirmation: None,
         last_seen_at: Some(snapshot.captured_at.clone()),
         last_verified_at: None,
