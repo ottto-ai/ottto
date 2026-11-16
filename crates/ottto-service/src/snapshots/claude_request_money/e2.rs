@@ -1956,7 +1956,21 @@ pub(crate) fn decide_page_copies(
     let _spent = PageSpent::start("page.copies");
     let mut holders = Vec::new();
     let mut resolved_holds = Vec::new();
+    let mut uncopied = BTreeMap::<&str, usize>::new();
+    for item in items.iter() {
+        if item.claude_money.as_deref().is_some_and(|fold| {
+            fold.copied == 0 && fold.proof.is_none() && fold.copy_order().is_some()
+        }) {
+            *uncopied.entry(&item.source_session_id).or_default() += 1;
+        }
+    }
+    let uncopied = uncopied
+        .into_iter()
+        .filter(|(_, count)| *count > 1)
+        .map(|(session, _)| session.to_owned())
+        .collect::<BTreeSet<_>>();
     for at in 0..items.len() {
+        let page_twin = uncopied.contains(&items[at].source_session_id);
         let Some(fold) = items[at].claude_money.as_deref_mut() else {
             continue;
         };
@@ -1986,6 +2000,9 @@ pub(crate) fn decide_page_copies(
                         Some(CopyProof::Family(root.clone()));
                 }
                 decide_family(items, at, &root, index);
+            }
+            None if page_twin && fold.copied == 0 && fold.copy_order().is_some() => {
+                decide_subagent_twins(items, at)
             }
             None => {}
         }
@@ -2328,16 +2345,25 @@ const SUBAGENT_TWIN_FROM: i128 = 1_793_836_800_000_000_000;
 /// response it would count (a copy within the slack before its birth) is
 /// dropped. A grandfathered home keeps its accepted skips and only drops. A
 /// zero-usage or untimed response is never dropped.
+/// Uncopied main path twins instead use usage dominance, with equal native
+/// accounts and copy-order ties, drop-only and without a birth/cutoff gate.
 fn decide_subagent_twins(items: &mut [SnapshotItem], at: usize) {
     let item = &items[at];
     let Some(fold) = item.claude_money.as_deref() else {
         return;
     };
-    let drop_only = fold.grandfathered;
+    let uncopied = fold.copied == 0 && fold.proof.is_none();
+    let drop_only = fold.grandfathered || uncopied;
     let group = items
         .iter()
         .enumerate()
         .filter(|(_, other)| other.source_session_id == item.source_session_id)
+        .filter(|(_, other)| {
+            !uncopied
+                || other.claude_money.as_deref().is_some_and(|other| {
+                    other.copied == 0 && other.proof.is_none() && other.copy_order().is_some()
+                })
+        })
         .map(|(other, _)| other)
         .collect::<Vec<_>>();
     let earlier = fold
@@ -2348,12 +2374,55 @@ fn decide_subagent_twins(items: &mut [SnapshotItem], at: usize) {
             })
         })
         .unwrap_or_default();
-    if drop_only && earlier.is_empty() {
+    if fold.grandfathered && !uncopied && earlier.is_empty() {
         return;
     }
     let first_own = first_own_turn(item, 0, &earlier).map(|o| o.sequence);
     let (mut kept, mut uncovered, mut drops) = (0, Vec::new(), Vec::new());
+    let mut overcount = 0;
     for (id, occurrence) in &item.claude_usage_occurrences {
+        let beaten = if uncopied {
+            let peers = group
+                .iter()
+                .filter_map(|other| {
+                    let peer = &items[*other];
+                    Some((
+                        *other,
+                        peer.claude_money.as_deref()?,
+                        peer.claude_usage_occurrences.get(id)?,
+                    ))
+                })
+                .collect::<Vec<_>>();
+            let account = |fold: &FileFold, sequence| {
+                fold.accounts
+                    .as_ref()
+                    .and_then(|accounts| accounts.account(sequence))
+            };
+            let conflict = peers.iter().any(|(_, a, x)| {
+                peers.iter().any(|(_, b, y)| {
+                    account(a, x.sequence) != account(b, y.sequence)
+                        || (!x.usage.is_monotonic_after(&y.usage)
+                            && !y.usage.is_monotonic_after(&x.usage))
+                })
+            });
+            // Disclose once per request id, on its first page fold. A
+            // disagreement anywhere in the group prevents every drop of it.
+            if conflict && peers.first().is_some_and(|(other, _, _)| *other == at) {
+                overcount += 1;
+            }
+            !conflict
+                && peers.iter().any(|(other, keeper, candidate)| {
+                    *other != at
+                        && !keeper.is_skipped(candidate.sequence)
+                        && !candidate.usage.is_zero()
+                        && !keeper.is_ambiguous(id)
+                        && candidate.usage.is_monotonic_after(&occurrence.usage)
+                        && (candidate.usage != occurrence.usage
+                            || keeper.copy_order() < fold.copy_order())
+                })
+        } else {
+            false
+        };
         let held = || earlier.iter().any(|ids| ids.contains(id));
         let before_own = first_own.is_none_or(|own| occurrence.sequence < own);
         if fold.is_skipped(occurrence.sequence) {
@@ -2373,9 +2442,8 @@ fn decide_subagent_twins(items: &mut [SnapshotItem], at: usize) {
                 uncovered.push(id.clone());
             }
         } else if !occurrence.usage.is_zero()
-            && held()
+            && (if uncopied { beaten } else { held() && before_own })
             && !fold.is_ambiguous(id)
-            && before_own
             // An unknown time is never newly dropped: it stays counted.
             && occurrence
                 .timestamp
@@ -2395,6 +2463,7 @@ fn decide_subagent_twins(items: &mut [SnapshotItem], at: usize) {
         ..
     } = &mut items[at]
     {
+        fold.disclose("twin_overcount_kept", overcount);
         for id in &drops {
             let occurrence = &claude_usage_occurrences[id];
             let time = occurrence.timestamp.as_deref().and_then(rfc3339_unix_nanos);
