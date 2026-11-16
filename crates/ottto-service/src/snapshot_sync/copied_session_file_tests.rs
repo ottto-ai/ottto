@@ -384,7 +384,11 @@ fn old_ack_does_not_own_new_request_after_holder_loss() {
                 // Only A={a} has ever been accepted. T's census knows d, not b.
                 let mut known = c.raw(&E2ScanFixture::default(), prior.clone(), 100, false, &[]);
                 let key = twin.to_string_lossy();
-                let census = known.index.claude_request_census.get(&key).unwrap();
+                let census = known
+                    .index
+                    .claude_request_census_for_test()
+                    .get(&key)
+                    .unwrap();
                 assert!(census.is_twin());
                 assert!(census.request_hashes().contains(&claude_request_hash("d")));
                 assert!(!census.request_hashes().contains(&claude_request_hash("b")));
@@ -425,7 +429,11 @@ fn old_ack_does_not_own_new_request_after_holder_loss() {
                     "T's growth stays unacquired"
                 );
             }
-            let census = page.index.claude_request_census.get(&holder_key).unwrap();
+            let census = page
+                .index
+                .claude_request_census_for_test()
+                .get(&holder_key)
+                .unwrap();
             assert!(census.current_for(&page.index.files[&holder_key].source_file_fingerprint));
             assert!(census.request_hashes().contains(&claude_request_hash("b")));
             if arm != Arm::Accepted {
