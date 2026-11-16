@@ -389,6 +389,7 @@ pub(crate) fn release_emitted_fold(item: &mut SnapshotItem) {
         proof,
         prefix_inherited,
         copied: _,
+        native_copied: _,
         first_own,
         first_own_at: _,
         grandfathered: _,
@@ -987,6 +988,8 @@ pub(crate) struct FileFold {
     #[expect(clippy::box_collection, reason = "one pointer when the map is absent")]
     prefix_inherited: Option<Box<BTreeMap<u64, ClaudeEntityBody>>>,
     copied: u64,
+    /// Parse-time copy presence, before any restoration; transient, never stored.
+    native_copied: bool,
     first_own: Option<u64>,
     /// The provider time of the `first_own` response (RAM only).
     first_own_at: Option<i128>,
@@ -1010,7 +1013,7 @@ pub(crate) struct FileFold {
     /// copy route the page takes: the page's evidence scope reads its pair.
     fork_parent: Option<String>,
 }
-money_heap_fields!(FileFold; inline: [own_requests, copy_unproven_wire, money_birth, role, copied, grandfathered, twin_pending, disclosed, e2_nanos, responses, root_fallbacks, side, prefix]; heap: [entity, physical, location, first_own, first_own_at, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, idless_inherited, first_idless, proof, prefix_inherited, ambiguous, telemetry, accounts, fork_parent]);
+money_heap_fields!(FileFold; inline: [own_requests, copy_unproven_wire, money_birth, role, copied, native_copied, grandfathered, twin_pending, disclosed, e2_nanos, responses, root_fallbacks, side, prefix]; heap: [entity, physical, location, first_own, first_own_at, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, idless_inherited, first_idless, proof, prefix_inherited, ambiguous, telemetry, accounts, fork_parent]);
 
 impl FileFold {
     pub(in crate::snapshots) fn new(
@@ -1102,6 +1105,7 @@ impl FileFold {
             proof: None,
             prefix_inherited: None,
             copied: 0,
+            native_copied: false,
             first_own: None,
             first_own_at: None,
             grandfathered: false,
@@ -1357,6 +1361,7 @@ impl FileFold {
         self.fork_parent = fork_parent
             .filter(|parent| !parent.is_empty())
             .map(str::to_owned);
+        self.native_copied = self.copied > 0;
         self.decide_native(context, markers);
         if self.proof.is_none() {
             self.proof = context
@@ -1959,7 +1964,7 @@ pub(crate) fn decide_page_copies(
     let mut uncopied = BTreeMap::<&str, usize>::new();
     for item in items.iter() {
         if item.claude_money.as_deref().is_some_and(|fold| {
-            fold.copied == 0 && fold.proof.is_none() && fold.copy_order().is_some()
+            !fold.native_copied && fold.proof.is_none() && fold.copy_order().is_some()
         }) {
             *uncopied.entry(&item.source_session_id).or_default() += 1;
         }
@@ -2001,7 +2006,7 @@ pub(crate) fn decide_page_copies(
                 }
                 decide_family(items, at, &root, index);
             }
-            None if page_twin && fold.copied == 0 && fold.copy_order().is_some() => {
+            None if page_twin && !fold.native_copied && fold.copy_order().is_some() => {
                 decide_subagent_twins(items, at)
             }
             None => {}
@@ -2345,14 +2350,15 @@ const SUBAGENT_TWIN_FROM: i128 = 1_793_836_800_000_000_000;
 /// response it would count (a copy within the slack before its birth) is
 /// dropped. A grandfathered home keeps its accepted skips and only drops. A
 /// zero-usage or untimed response is never dropped.
-/// Uncopied main path twins instead use usage dominance, with equal native
-/// accounts and copy-order ties, drop-only and without a birth/cutoff gate.
+/// Main path twins with no copies at parse time instead use usage dominance,
+/// with equal native accounts and copy-order ties, drop-only and without a
+/// birth/cutoff gate.
 fn decide_subagent_twins(items: &mut [SnapshotItem], at: usize) {
     let item = &items[at];
     let Some(fold) = item.claude_money.as_deref() else {
         return;
     };
-    let uncopied = fold.copied == 0 && fold.proof.is_none();
+    let uncopied = !fold.native_copied && fold.proof.is_none();
     let drop_only = fold.grandfathered || uncopied;
     let group = items
         .iter()
@@ -2361,7 +2367,7 @@ fn decide_subagent_twins(items: &mut [SnapshotItem], at: usize) {
         .filter(|(_, other)| {
             !uncopied
                 || other.claude_money.as_deref().is_some_and(|other| {
-                    other.copied == 0 && other.proof.is_none() && other.copy_order().is_some()
+                    !other.native_copied && other.proof.is_none() && other.copy_order().is_some()
                 })
         })
         .map(|(other, _)| other)

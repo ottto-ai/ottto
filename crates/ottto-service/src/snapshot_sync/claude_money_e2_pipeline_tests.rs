@@ -2659,7 +2659,7 @@ fn e2_pipeline_uncopied_t_disjoint() {
 
 #[test]
 fn e2_pipeline_uncopied_t_markers() {
-    // Guard for totals on main; the new diagnostic counts conflicts per id.
+    // Expected RED on main only for the new per-id diagnostic; totals are a guard.
     for a_first in [true, false] {
         with_e2(|| {
             let marker = |org: &str| {
@@ -2700,20 +2700,47 @@ fn e2_pipeline_uncopied_t_untimed() {
             let mut a: serde_json::Value =
                 serde_json::from_str(&uncopied_rows(&[("R", 5)])).unwrap();
             a.as_object_mut().unwrap().remove("timestamp");
+            // Give the untimed response a bucket without giving it a provider time.
+            let clock = json!({"type":"user","sessionId":ROOT,"timestamp":AT,
+                "message":{"role":"user","content":[]}})
+            .to_string()
+                + "\n";
             let (c, _) = uncopied_pair(
                 "untimed",
                 a_first,
-                &(a.to_string() + "\n"),
+                &(clock + &a.to_string() + "\n"),
                 &uncopied_rows(&[("R", 10)]),
             );
-            e2::take_diag();
-            let page = ready(
-                &c,
+            let mut page = c.raw(
                 &E2ScanFixture::default(),
                 ScanIndex::default(),
                 100,
                 false,
+                &[],
             );
+            assert_eq!(
+                page.scan
+                    .snapshots
+                    .iter()
+                    .map(|item| item.input_tokens)
+                    .sum::<u64>(),
+                15
+            );
+            assert_eq!(
+                total(&page),
+                2,
+                "both occurrences count before the decision"
+            );
+            assert!(
+                page.scan.snapshots.iter().any(|item| item
+                    .claude_usage_occurrences
+                    .get("R")
+                    .is_some_and(|occurrence| occurrence.timestamp.is_none())),
+                "the fallback did not time the target"
+            );
+            e2::take_diag();
+            page.enrich(&c);
+            literal(&page);
             assert_eq!(copy_diag(&["copy_prefix_twin_page_removed"]), [0]);
             assert_eq!(
                 (body(&page, ROOT).unwrap().input_tokens, total(&page)),
@@ -2773,7 +2800,7 @@ fn e2_pipeline_uncopied_t_ambiguous() {
 
 #[test]
 fn e2_pipeline_uncopied_t_incomparable() {
-    // Guard for totals on main: incomparable token components stay counted.
+    // Expected RED on main only for the new per-id diagnostic; totals are a guard.
     for a_first in [true, false] {
         with_e2(|| {
             let a = uncopied_rows(&[("R", 10)]);
@@ -2877,8 +2904,8 @@ fn e2_pipeline_uncopied_guard_absent_complete() {
 
 #[test]
 fn e2_pipeline_uncopied_guard_carried_accounts() {
-    // Guard for placement policy: accepted residual B2; equal native None
-    // markers can carry different accounts later. The copy-order keeper wins.
+    // Expected RED on main (22/4 vs 12/3); guards accepted residual B2 after dedup.
+    // Equal native None markers can carry different accounts; the copy-order keeper wins.
     for a_first in [true, false] {
         with_e2(|| {
             let (c, _) = uncopied_pair(
