@@ -321,15 +321,6 @@ fn owner_return_preserves_all_source_carry() {
         // must not also simulate losing the independently saved generation.
         let generation = cycle_replay_generation(SnapshotSource::Codex, &namespace_a);
         legacy.prepare_historical_replay(generation.clone());
-        let progress_path = snapshot_upload_progress_path(&cx_path);
-        let mut progress = SnapshotUploadProgress::load(
-            &progress_path,
-            &namespace_a,
-            snapshot_quarantine_witness(SnapshotSource::Codex),
-        )
-        .unwrap();
-        progress.prepare_historical_replay(&generation);
-        progress.save(&progress_path).unwrap();
         legacy.files.insert(
             codex.to_string_lossy().into_owned(),
             serde_json::from_value(json!({
@@ -339,6 +330,15 @@ fn owner_return_preserves_all_source_carry() {
             .unwrap(),
         );
         legacy.save(&cx_path).unwrap();
+        let progress_path = snapshot_upload_progress_path(&cx_path);
+        let mut progress = SnapshotUploadProgress::load(
+            &progress_path,
+            &namespace_a,
+            snapshot_quarantine_witness(SnapshotSource::Codex),
+        )
+        .unwrap();
+        progress.prepare_historical_replay(&generation);
+        progress.save(&progress_path).unwrap();
         // Like install_legacy_active: A already completed its initial Codex backfill.
         crate::backfill::update_backfill_state(&support, |state| {
             crate::backfill::mark_backfill_complete_for_destination(
