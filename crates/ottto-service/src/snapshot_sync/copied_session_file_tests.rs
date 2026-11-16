@@ -921,6 +921,177 @@ fn held_content_twin_holder_proves_no_copy_until_released() {
     });
 }
 
+/// [money] A content twin acquired in another evidence chunk cannot hold
+/// its overlapping holder or re-arm an ACKed copy on unchanged saves.
+#[test]
+fn content_twin_in_another_chunk_counts_and_settles() {
+    fn removed(index: &ScanIndex, key: &str) -> BTreeSet<u64> {
+        index
+            .claude_copy_removals
+            .get(location_key(key))
+            .iter()
+            .flat_map(|(_, ids)| ids.iter().copied())
+            .collect()
+    }
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    with_e2(|| {
+        const TWIN: &str = "5338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+        let mut c = Corpus::new("content-twin-another-chunk");
+        let main = c.write_at(
+            &format!("p/{ROOT}.jsonl"),
+            &resumed(ROOT, &[A]),
+            "2026-08-02T07:00:00Z",
+        );
+        let copy = c.write_at(&format!("p/{COPY}.jsonl"), &resumed(COPY, &[A, B, D]), BORN);
+        let other = c.write_at(
+            &format!("q/{THIRD}.jsonl"),
+            &resumed(THIRD, &[B]),
+            "2026-08-02T07:00:00Z",
+        );
+        // A real in-folder ROOT path twin gives Q the Rule B route to H:
+        // T's A is a copy too, so only ROOT counts A across all three sessions.
+        let bridge = c.write_at(
+            &format!("q/{ROOT}.jsonl"),
+            &resumed(ROOT, &[A]),
+            "2026-08-02T07:01:00Z",
+        );
+        let content_twin = c.write_at(&format!("q/{TWIN}.jsonl"), &resumed(THIRD, &[A, B]), BORN);
+        // Nonempty trace sidecars make ROOT and THIRD separate next-fit
+        // chunks, without adding API usage or another ownership source.
+        c.evidence_for(ROOT, &[], &[trace("a", "")]);
+        c.evidence_for(THIRD, &[], &[trace_for(THIRD, "b", "")]);
+        let main_key = main.to_string_lossy().into_owned();
+        let copy_key = copy.to_string_lossy().into_owned();
+        let twin_key = content_twin.to_string_lossy().into_owned();
+        let a = crate::snapshots::claude_request_census::claude_request_hash("a");
+        let b = crate::snapshots::claude_request_census::claude_request_hash("b");
+        let scanner = E2ScanFixture::default();
+        let mut prior = ScanIndex::default();
+        let mut first = c.raw(&scanner, prior.clone(), 100, true, &[]);
+        for path in [&main, &copy, &other, &bridge, &content_twin] {
+            assert!(
+                scanner.paths().contains(path),
+                "the first page acquires every file"
+            );
+        }
+        let census = first.index.claude_request_census_for_test();
+        let twin_census = census.get(&twin_key).unwrap();
+        assert!(twin_census.is_twin());
+        assert_eq!(
+            twin_census
+                .request_hashes()
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([a, b])
+        );
+        let families = e2::page_families(&first.scan.snapshots);
+        for (session, key) in [(ROOT, &main_key), (THIRD, &twin_key)] {
+            assert!(families[session].iter().any(|&slot| {
+                first.scan.snapshots[slot]
+                    .claude_money
+                    .as_deref()
+                    .and_then(e2::FileFold::location_key)
+                    == Some(location_key(key))
+            }));
+        }
+        assert!(prior.files.is_empty(), "H has no previously committed body");
+
+        // Enrich the same acquisition page through the existing one-chunk
+        // reference seam, preserving the packed arm's process-local state.
+        let reference = unobserved(|| {
+            evidence_chunk_tests::isolated(|| {
+                let mut reference = twin(&first);
+                crate::snapshot_sync::ONE_EVIDENCE_CHUNK.with(|one| {
+                    let was = one.replace(true);
+                    let before = crate::snapshot_sync::evidence_chunks_for_test();
+                    reference.enrich(&c);
+                    one.set(was);
+                    assert_eq!(crate::snapshot_sync::evidence_chunks_for_test() - before, 1);
+                });
+                reference
+            })
+        });
+        let before = crate::snapshot_sync::evidence_chunks_for_test();
+        first.enrich(&c);
+        assert!(
+            crate::snapshot_sync::evidence_chunks_for_test() - before >= 2,
+            "ROOT and THIRD's nonzero sidecars force different evidence chunks"
+        );
+        assert_eq!(
+            first
+                .disposition
+                .request_owned_hold_reasons
+                .get("absent_content_twin")
+                .copied()
+                .unwrap_or(0),
+            0,
+            "T is present on this page even outside H's chunk"
+        );
+        let root = body(&first, ROOT).unwrap();
+        assert!(crate::snapshots::claude_request_money::is_request_owned_literal(root));
+        assert!(!first
+            .disposition
+            .quarantined_fingerprints(&first.scan.snapshots)
+            .contains(&root.snapshot_fingerprint));
+        assert_eq!(root.request_count, 1, "H counts A");
+        assert_eq!(
+            body(&first, COPY).unwrap().request_count,
+            2,
+            "C counts B and D"
+        );
+        assert_eq!(body(&first, THIRD).unwrap().request_count, 1, "S counts B");
+        assert_eq!(removed(&first.index, &copy_key), BTreeSet::from([a]));
+        assert_eq!(removed(&first.index, &twin_key), BTreeSet::from([a, b]));
+        assert!(first
+            .index
+            .claude_copy_removals
+            .get(location_key(&copy_key))
+            .iter()
+            .any(|(holder, ids)| *holder == location_key(&main_key) && ids.contains(&a)));
+        money_oracle::assert_equivalent(&sent_money(&reference), &sent_money(&first));
+
+        let mut accepted = BTreeMap::new();
+        prior = accept_monotone_page(&c, &prior, first, &mut accepted);
+        assert_eq!((accepted[ROOT], accepted[COPY], accepted[THIRD]), (1, 2, 1));
+        assert_eq!(
+            accepted.values().sum::<u64>(),
+            4,
+            "A once, B in P and Q, D once"
+        );
+        assert!(
+            prior.files[&main_key].upload_context_receipt.is_some(),
+            "H's counted body was ACKed"
+        );
+        assert_eq!(removed(&prior, &copy_key), BTreeSet::from([a]));
+        assert_eq!(removed(&prior, &twin_key), BTreeSet::from([a, b]));
+        assert!(!prior.claude_copy_removals.pending(location_key(&copy_key)));
+        let accepted_first = accepted.clone();
+        for _ in 0..3 {
+            let mut unchanged = c.raw(&scanner, prior.clone(), 100, true, &[]);
+            assert!(
+                !scanner.paths().contains(&copy),
+                "C must stay settled after ACK"
+            );
+            unchanged.enrich(&c);
+            assert!(!unchanged
+                .index
+                .claude_copy_removals
+                .pending(location_key(&copy_key)));
+            assert_eq!(removed(&unchanged.index, &copy_key), BTreeSet::from([a]));
+            prior = accept_monotone_page(&c, &prior, unchanged, &mut accepted);
+            assert!(!prior.claude_copy_removals.pending(location_key(&copy_key)));
+            assert_eq!(removed(&prior, &copy_key), BTreeSet::from([a]));
+            assert_eq!(
+                accepted, accepted_first,
+                "unchanged saves preserve accepted money"
+            );
+        }
+    });
+}
+
 /// [money] An unchanged original read for local work while its owed history
 /// is held emits nothing and does not bring its copy, so the session never
 /// goes out at the copy's composition alone. Its history stays owed.
