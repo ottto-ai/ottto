@@ -3771,6 +3771,7 @@ fn save_index_and_publish_manifest(
     // durable; a failed CAS/save or manifest derivation must not let a
     // concurrent heartbeat repeat stale agreement.
     withdraw_source_manifest(destination_namespace, source);
+    crate::local_resource_diagnostics::state_save_start(source.api_slug());
     index.save(index_path)?;
     if census_complete {
         publish_source_manifest(

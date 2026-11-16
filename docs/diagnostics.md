@@ -367,6 +367,23 @@ transport activity; they do not prove successful delivery or ACK settlement.
 Encoding settings, packing and delivery semantics are unchanged. Upload timing
 covers serialization, compression, request/response handling and existing local
 receipt processing, including failures.
+The row also carries macOS `counts.malloc_in_use_bytes_start` at call entry and
+`observation.malloc_in_use_bytes` at call exit, using the same allocator-zone
+`size_in_use` counter as the pass summary; both are absent when unavailable.
+Its footprint window uses the same shared sampler and fields as native pages,
+including `observation.stage_peak_footprint_bytes`. This adds one bounded
+counter allocation per call, as for a page, and endpoint reads; periodic reads
+share the existing 50 ms sampler thread. No separate thread or sample history
+is created for a call. Concurrent work contributes to these process-wide values.
+
+`native_collection_page.observation.malloc_in_use_bytes` samples that same
+counter at page completion. A `state_save_start` row samples it immediately
+before the finished pass's index save (after withdrawing the cached manifest),
+including a save that later fails. It has an empty `counts` object, zero elapsed
+time and no CPU or footprint window. Each boundary adds one allocator-zone
+statistics call on macOS and no allocation beyond the existing row formatter.
+The malloc field is absent on other platforms. Neither measurement changes
+state, upload bodies or settlement.
 
 `shared_process_cpu_delta_us` samples self-process CPU across the observation
 window, including concurrent stages; it excludes child processes. It must not

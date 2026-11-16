@@ -1209,8 +1209,8 @@ pub(crate) struct Probe {
     pub(crate) full_causes: FullCauses,
     pub(crate) line_delivery: Option<(&'static str, LineDeliveryCounts)>,
     pub(crate) discovery_growth: crate::snapshots::discovery_growth::Page,
-    /// Page window only (`Probe::page`): `Some(None)` is a refused sampler
-    /// slot, reported as one sample failure. Other probes carry `None`.
+    /// Sampled page/upload window: `Some(None)` is a refused sampler slot,
+    /// reported as one sample failure. Other probes carry `None`.
     footprint: Option<Option<footprint::Stage>>,
 }
 impl Drop for Probe {
@@ -1441,7 +1441,10 @@ impl Probe {
             process_id: std::process::id(),
             stage: "native_collection_page",
             source: Source::from_slug(source),
-            observation: self.page_observation(),
+            observation: Observation {
+                malloc_in_use_bytes: footprint::malloc_in_use(),
+                ..self.page_observation()
+            },
             counts,
         });
         // Own records, so the page line stays under its size bound (§13).
@@ -2334,6 +2337,15 @@ pub(crate) fn traversal_point(stage: &'static str, source: &str, counts: &impl S
     });
 }
 
+pub(crate) fn state_save_start(source: &str) {
+    emit_stage("state_save_start", Source::from_slug(source), None, || {
+        Observation {
+            malloc_in_use_bytes: footprint::malloc_in_use(),
+            ..Observation::point()
+        }
+    });
+}
+
 /// Per-page restore attempts. A miss class never authorizes a body read.
 #[derive(Debug, Default, Serialize)]
 pub(crate) struct FullCauses {
@@ -2571,6 +2583,8 @@ impl Serialize for FullReasons {
 
 #[derive(Debug, Default, Serialize)]
 struct UploadCounts {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    malloc_in_use_bytes_start: Option<u64>,
     serialized_body_bytes: Option<u64>,
     gzip_attempts: u64,
     identity_attempts: u64,
@@ -2585,9 +2599,12 @@ pub(crate) struct UploadCall {
 impl UploadCall {
     pub(crate) fn start(source: &str) -> Self {
         Self {
-            probe: Probe::start(),
+            probe: Probe::page(),
             source: Source::from_slug(source),
-            counts: UploadCounts::default(),
+            counts: UploadCounts {
+                malloc_in_use_bytes_start: footprint::malloc_in_use(),
+                ..UploadCounts::default()
+            },
         }
     }
     pub(crate) fn serialized(&mut self, bytes: usize) {
@@ -2619,7 +2636,10 @@ impl Drop for UploadCall {
             process_id: std::process::id(),
             stage: "snapshot_batch_call",
             source: self.source,
-            observation: self.probe.observation().slim(),
+            observation: Observation {
+                malloc_in_use_bytes: footprint::malloc_in_use(),
+                ..self.probe.page_observation().slim()
+            },
             counts: &self.counts,
         });
     }
@@ -3376,7 +3396,6 @@ mod tests {
             }
         }
         let (_, records) = capture(|| {
-            drop(UploadCall::start("codex"));
             traversal_point("synthetic", "pi", &BTreeMap::<&str, u64>::new());
         });
         let page = serde_json::to_value(Probe::start().observation()).unwrap();
@@ -3391,6 +3410,105 @@ mod tests {
             ] {
                 assert!(row.get(field).is_none());
             }
+        }
+    }
+
+    #[test]
+    fn page_end_row_carries_malloc_in_use_when_available() {
+        for source in ["claude_code", "codex", "pi"] {
+            let (_, records) = capture(|| {
+                Probe::page().collection(
+                    source,
+                    CollectionCounts {
+                        scanned_files: 0,
+                        semantic_noops: 0,
+                        sampled_acquisition: None,
+                        full_causes: Default::default(),
+                    },
+                );
+            });
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0]["stage"], "native_collection_page");
+            assert_eq!(records[0]["source"], source);
+            assert_eq!(
+                records[0]["observation"]
+                    .get("malloc_in_use_bytes")
+                    .is_some(),
+                cfg!(target_os = "macos")
+            );
+            if cfg!(target_os = "macos") {
+                assert!(records[0]["observation"]["malloc_in_use_bytes"].is_u64());
+            }
+        }
+    }
+
+    #[test]
+    fn upload_row_carries_malloc_endpoints_when_available() {
+        let (_, records) = capture(|| drop(UploadCall::start("claude_code")));
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["stage"], "snapshot_batch_call");
+        assert_eq!(records[0]["source"], "claude_code");
+        for (section, field) in [
+            ("counts", "malloc_in_use_bytes_start"),
+            ("observation", "malloc_in_use_bytes"),
+        ] {
+            let value = records[0][section].get(field);
+            assert_eq!(value.is_some(), cfg!(target_os = "macos"));
+            if let Some(value) = value {
+                assert!(value.is_u64());
+            }
+        }
+    }
+
+    #[test]
+    fn upload_row_carries_sampled_footprint_window() {
+        for source in ["claude_code", "codex", "pi"] {
+            let (_, records) = capture(|| drop(UploadCall::start(source)));
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0]["stage"], "snapshot_batch_call");
+            assert_eq!(records[0]["source"], source);
+            let row = &records[0]["observation"];
+            assert!(row["footprint_sample_failures"].is_u64());
+            if let Some(peak) = row["stage_peak_footprint_bytes"].as_u64() {
+                for endpoint in ["stage_start_footprint_bytes", "stage_end_footprint_bytes"] {
+                    if let Some(bytes) = row[endpoint].as_u64() {
+                        assert!(peak >= bytes);
+                    }
+                }
+                assert!(row["footprint_samples"].as_u64().unwrap() >= 1);
+            } else {
+                assert!(row["footprint_sample_failures"].as_u64().unwrap() >= 1);
+            }
+        }
+    }
+
+    #[test]
+    fn state_save_start_is_a_content_free_malloc_point() {
+        for (source, expected) in [
+            ("claude_code", "claude_code"),
+            ("codex", "codex"),
+            ("pi", "pi"),
+            ("secret/path/provider", "unknown"),
+        ] {
+            let (_, records) = capture(|| state_save_start(source));
+            assert_eq!(records.len(), 1);
+            let row = &records[0];
+            assert_eq!(row["stage"], "state_save_start");
+            assert_eq!(row["source"], expected);
+            assert_eq!(row["counts"], serde_json::json!({}));
+            assert_eq!(row["observation"]["wall_elapsed_us"], 0);
+            assert_eq!(
+                row["observation"].get("malloc_in_use_bytes").is_some(),
+                cfg!(target_os = "macos")
+            );
+            if cfg!(target_os = "macos") {
+                assert!(row["observation"]["malloc_in_use_bytes"].is_u64());
+            }
+            assert!(row["observation"]
+                .get("stage_peak_footprint_bytes")
+                .is_none());
+            assert!(row["observation"]["shared_process_cpu_delta_us"].is_null());
+            assert!(!serde_json::to_string(row).unwrap().contains("secret/path"));
         }
     }
 
