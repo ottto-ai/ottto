@@ -42,7 +42,8 @@ const RETENTION_SECONDS: u64 = 90 * 24 * 60 * 60;
 const HORIZON_DAYS: u64 = 3;
 
 /// Map files this process failed to replace. Until a full reset is written,
-/// every account reading one is active.
+/// every account reading one is active. A marker file beside the map keeps
+/// the distrust across a restart when the old file could not be removed.
 static UNTRUSTED: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
 
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -165,21 +166,37 @@ impl ActivityStore {
     }
 
     fn untrusted(&self) -> bool {
-        untrusted_paths().contains(&self.path)
+        untrusted_paths().contains(&self.path) || self.marker().exists()
+    }
+
+    fn marker(&self) -> PathBuf {
+        self.path.with_extension("distrusted")
     }
 
     /// Replace the file. On failure the old file may survive, so it is
-    /// removed and this process stops trusting the path until a full reset
-    /// is written. Errors are never formatted: they can name the path.
+    /// removed, a marker is left beside it, and the path is distrusted until
+    /// a full reset is written. Errors are never formatted: they can name
+    /// the path.
     fn write(&self, map: &ActivityMap, clears_untrusted: bool) {
         if atomic_json_write(&self.path, map).is_ok() {
             if clears_untrusted {
-                untrusted_paths().remove(&self.path);
+                let marker = self.marker();
+                let _ = fs::remove_file(&marker);
+                if !marker.exists() {
+                    untrusted_paths().remove(&self.path);
+                }
             }
             return;
         }
         let _ = fs::remove_file(&self.path);
+        let _ = fs::write(self.marker(), b"");
         untrusted_paths().insert(self.path.clone());
+    }
+
+    /// A restart: this process forgets the paths it distrusted.
+    #[cfg(test)]
+    pub(super) fn forget_process_distrust(&self) {
+        untrusted_paths().remove(&self.path);
     }
 }
 

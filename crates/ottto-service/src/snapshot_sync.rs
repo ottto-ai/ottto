@@ -12842,12 +12842,14 @@ pub(crate) fn resume_reconnected_sources(support_dir: &Path) {
             continue;
         }
         let marker = source_marker_path(support_dir, source);
+        // The barrier lands before the source runs again, so a crash or a
+        // failed removal can only leave an extra barrier.
+        if source == SnapshotSource::Codex {
+            crate::provider_daily_reference::account_activity::note_resume(support_dir);
+        }
         let resumed = std::fs::remove_file(&marker)
             .map_err(anyhow::Error::from)
             .and_then(|()| sync_progress_parent(&marker));
-        if resumed.is_ok() && source == SnapshotSource::Codex {
-            crate::provider_daily_reference::account_activity::note_resume(support_dir);
-        }
         let failures = turn.entry(marker).or_default();
         *failures = if resumed.is_ok() { 0 } else { *failures + 1 };
         if *failures > 3 {

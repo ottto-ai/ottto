@@ -1175,9 +1175,10 @@ impl ProviderDailyUsageReader for ScopedOutcomeReader {
 }
 
 /// [behaviour] A map this process could not replace is distrusted, so every
-/// login is active; the next write is a full reset that alone restores
-/// trust. Folds missed under an older build leave the disclosed residual: a
-/// gap barrier, then idle again on the next clean generation.
+/// login is active, also after a restart when the old file survived; the
+/// next write is a full reset that alone restores trust. Folds missed under
+/// an older build leave the disclosed residual: a gap barrier, then idle
+/// again on the next clean generation.
 #[test]
 fn a_failed_map_write_distrusts_it_until_a_full_reset() {
     let login = identified(USER, WORKSPACE, false);
@@ -1187,16 +1188,22 @@ fn a_failed_map_write_distrusts_it_until_a_full_reset() {
     mac.observe(start, start + 80 * HOUR);
     assert!(mac.idle(&discovery, &login, start + 80 * HOUR));
 
+    let old = fs::read(mac.store_path()).unwrap();
     fs::remove_file(mac.store_path()).unwrap();
     fs::create_dir(mac.store_path()).unwrap();
     mac.fold(start + 81 * HOUR, &[]);
     fs::remove_dir(mac.store_path()).unwrap();
     assert!(mac.store.load_trusted().is_none(), "distrusted");
+    // The old file survived the failed write, and the daemon restarted.
+    fs::write(mac.store_path(), &old).unwrap();
+    mac.store.forget_process_distrust();
+    assert!(mac.store.load_trusted().is_none(), "still distrusted");
     mac.fold(start + 82 * HOUR, &[]);
     assert!(
         mac.store.load_trusted().is_some(),
         "trusted after the reset write"
     );
+    assert!(!mac.store_path().with_extension("distrusted").exists());
     assert!(
         !mac.idle(&discovery, &login, start + 82 * HOUR),
         "72 h again"
