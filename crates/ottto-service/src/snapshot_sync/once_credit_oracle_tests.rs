@@ -2098,10 +2098,13 @@ fn scheduling_corpus(home: &OracleHome, seed_only: bool) -> Vec<(PathBuf, String
 }
 
 fn schedule_debt_is_clear(debt: &Value) -> bool {
+    schedule_money_debt_is_clear(debt) && debt["pending"] == 0
+}
+
+fn schedule_money_debt_is_clear(debt: &Value) -> bool {
     debt["holds"].as_object().unwrap().is_empty()
         && debt["owed"].as_array().unwrap().is_empty()
         && debt["copy_wait"].as_array().unwrap().is_empty()
-        && debt["pending"] == 0
         && ["debt", "progress"].into_iter().all(|part| {
             debt[part]
                 .as_object()
@@ -2720,24 +2723,62 @@ fn scheduling_permutations_converge_to_the_same_bodies() {
                         }
                         // No old Cycle/index/progress Arc survives into the cold-close seam.
                         home.cold_restart();
-                        let quiet = home.cycle(&server, &recording);
-                        assert!(quiet.finish.is_ok());
-                        assert!(
-                            schedule_debt_is_clear(&quiet.debt),
-                            "quiet restart left debt: {source:?} {one_chunk} {limit} {reverse} {restart} {late}: {}",
-                            quiet.debt
-                        );
-                        assert!(quiet.batches.is_empty());
-                        assert_eq!(quiet.consumed, 0);
-                        let prior = accepted.clone();
-                        schedule_accepts(source, &quiet, &mut accepted);
-                        assert_eq!(accepted, prior);
-                        let mut route = emitted_route(&quiet, source, &server);
-                        route.mode = transition::Mode::Restart;
-                        transition::money_oracle::assert_quiet_restart_with_anchor_window(
-                            &route,
-                            quiet.quiet_anchor_window,
-                        );
+                        // A completed census starts a fresh walk of every physical file.
+                        // one_chunk only changes evidence packing at finish, not selection.
+                        let files = paths.len();
+                        let quiet_limit = home.schedule.unwrap().limit;
+                        let quiet_cycles = files.div_ceil(quiet_limit);
+                        let mut previous_pending = files;
+                        for quiet_page in 0..quiet_cycles {
+                            let quiet = home.cycle(&server, &recording);
+                            let context = format!(
+                                "quiet restart: {source:?} {one_chunk} {limit} {reverse} {restart} {late}, page {quiet_page}, files {files}, file limit {quiet_limit}, debt: {}",
+                                quiet.debt
+                            );
+                            assert!(quiet.finish.is_ok(), "{context}");
+                            assert!(quiet.batches.is_empty(), "quiet POST: {context}");
+                            assert_eq!(quiet.consumed, 0, "quiet body read: {context}");
+                            let prior = accepted.clone();
+                            schedule_accepts(source, &quiet, &mut accepted);
+                            assert_eq!(accepted, prior, "quiet accepted changed: {context}");
+                            let mut route = emitted_route(&quiet, source, &server);
+                            route.mode = transition::Mode::Restart;
+                            assert!(
+                                std::panic::catch_unwind(|| {
+                                    transition::money_oracle::assert_quiet_restart_with_anchor_window(
+                                        &route,
+                                        quiet.quiet_anchor_window,
+                                    );
+                                })
+                                .is_ok(),
+                                "quiet identity/anchor check failed: {context}"
+                            );
+                            assert!(
+                                schedule_money_debt_is_clear(&quiet.debt),
+                                "quiet restart left money/debt: {context}"
+                            );
+                            let expected_pending =
+                                files.saturating_sub((quiet_page + 1) * quiet_limit);
+                            assert_eq!(
+                                quiet.debt["pending"], expected_pending,
+                                "quiet census pending must match the file allowance: {context}"
+                            );
+                            let pending = quiet.debt["pending"].as_u64().unwrap() as usize;
+                            assert!(
+                                pending < previous_pending,
+                                "quiet census must strictly drain from {previous_pending}: {context}"
+                            );
+                            if quiet_page + 1 == quiet_cycles {
+                                assert_eq!(
+                                    pending, 0,
+                                    "quiet census exceeded its bound: {context}"
+                                );
+                            }
+                            if pending == 0 {
+                                break;
+                            }
+                            previous_pending = pending;
+                        }
                         if let Some(out) = std::env::var_os("OTTTO_MONEY_EQUIVALENCE_OUTPUT") {
                             money_equivalence_tests::emit_trace(
                                 &out,
