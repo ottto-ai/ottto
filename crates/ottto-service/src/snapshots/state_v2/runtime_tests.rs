@@ -450,8 +450,11 @@ fn claim_only_save_retains_the_committed_ownership_baseline() {
     assert!(save_with_mode(&f.path, &mut index, true).unwrap());
     with_state(&f.path, |state| {
         assert_eq!(
-            state.save_digests.as_ref().map(|b| b.generation),
-            Some(G + 1)
+            state
+                .save_digests
+                .as_ref()
+                .map(|b| (b.generation, b.links_only, b.rows.is_empty())),
+            Some((G + 1, true, true))
         );
         Ok(())
     })

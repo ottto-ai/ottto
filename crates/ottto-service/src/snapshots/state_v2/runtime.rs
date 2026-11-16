@@ -598,8 +598,8 @@ pub(in super::super) fn save_locked(
     let expected = claim_generation.unwrap_or(index.generation);
     let result = with_save_session(path, runtime, expected, |state, session, id| {
         let previous = match state.save_digests.take() {
-            Some(previous) => previous,
-            None => {
+            Some(previous) if !previous.links_only => previous,
+            _ => {
                 // A pass may save more than once (including claim-only saves).
                 // The preceding save dropped its baseline; read committed state.
                 ensure!(session.db.stamp()? == session.stamp, Hold::ReloadRequired);
@@ -626,8 +626,14 @@ pub(in super::super) fn save_locked(
             let digests = saved?;
             session.stamp = session.db.stamp()?;
             state.saved_page(session.db.save_over_target(), claim_only);
+            // A claim-only save keeps only its carrier links: later saves
+            // read the committed rows again.
             if !session.reload {
-                state.save_digests = Some(digests);
+                state.save_digests = Some(if claim_only {
+                    digests.links_only()
+                } else {
+                    digests
+                });
             }
             Ok(true)
         })

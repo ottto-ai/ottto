@@ -37,6 +37,19 @@ pub(super) struct Baseline {
     pub(super) generation: u64,
     pub(super) rows: BTreeMap<RowKey, [u8; 32]>,
     pub(super) copy_ownership: super::super::claude_request_money::e2::CopyOwnership,
+    /// Kept by a claim-only save for its carrier links alone: its rows do not
+    /// describe the committed graph, so no save diffs against them.
+    pub(super) links_only: bool,
+}
+impl Baseline {
+    pub(super) fn links_only(self) -> Self {
+        Baseline {
+            generation: self.generation,
+            rows: BTreeMap::new(),
+            copy_ownership: self.copy_ownership,
+            links_only: true,
+        }
+    }
 }
 fn copy_ownership(
     index: &ScanIndex,
@@ -96,6 +109,7 @@ pub(super) fn baseline(index: &ScanIndex, cx: &mut KindCx) -> Result<Baseline> {
         generation: index.generation,
         rows: stored,
         copy_ownership: copy_ownership(index, cx),
+        links_only: false,
     })
 }
 pub(super) fn populate(index: &ScanIndex, tx: &mut dyn Transaction, cx: &mut KindCx) -> Result<()> {
@@ -283,6 +297,7 @@ pub(super) fn delta(
             generation: next.generation,
             rows: digests,
             copy_ownership: copy_ownership(next, cx),
+            links_only: false,
         })
     })();
     cx.valid = result.is_ok();

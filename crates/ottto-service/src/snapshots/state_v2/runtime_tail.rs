@@ -21,8 +21,8 @@ pub(in crate::snapshots) fn carry_tail(
         index.generation,
         |state, session, id| {
             let previous = match state.save_digests.take() {
-                Some(previous) => previous,
-                None => {
+                Some(previous) if !previous.links_only => previous,
+                _ => {
                     let (committed, mut cx) = import::hydrate_context(&mut session.db)?;
                     let previous = import::baseline(&mut session.db, &committed, &mut cx)?;
                     session.cx = cx;
