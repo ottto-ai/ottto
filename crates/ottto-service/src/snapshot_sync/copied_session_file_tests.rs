@@ -763,6 +763,164 @@ fn deferred_main_with_read_content_twin_holds_until_complete() {
     }
 }
 
+/// [money] A holder withheld for its absent content twin cannot remove a
+/// later copy's prefix or repeatedly re-arm that unchanged copy after ACK.
+#[test]
+fn held_content_twin_holder_proves_no_copy_until_released() {
+    use crate::snapshots::e2_pipeline_scan_fixture::{indexed_size, owe_claimed_growth};
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    with_e2(|| {
+        // Read T alone first: its content census knows ROOT's distinct X/Y.
+        let mut c = Corpus::new("held-content-twin-holder");
+        let twin = c.write_at(
+            &file(THIRD),
+            &resumed(ROOT, &[B, C]),
+            "2026-08-02T07:02:00Z",
+        );
+        let scanner = E2ScanFixture::default();
+        let mut accepted = BTreeMap::new();
+        let mut prior = ScanIndex::default();
+        let mut initial = c.raw(&scanner, prior.clone(), 100, true, &[]);
+        assert_eq!(scanner.paths(), vec![twin.clone()]);
+        initial.enrich(&c);
+        assert_eq!(body(&initial, ROOT).unwrap().request_count, 2);
+        prior = accept_monotone_page(&c, &prior, initial, &mut accepted);
+        let twin_key = twin.to_string_lossy().into_owned();
+        assert!(prior
+            .claude_request_census_for_test()
+            .get(&twin_key)
+            .unwrap()
+            .is_twin());
+        let size = indexed_size(&prior, &twin);
+
+        // H and C arrive while T's grown, usage-free suffix is growth-paced.
+        append(&twin, &"\n".repeat(8192));
+        let main = c.root(ROOT, &resumed(ROOT, &[A, B]));
+        let copy = c.write_at(&file(COPY), &resumed(COPY, &[A, D]), BORN);
+        let main_key = main.to_string_lossy().into_owned();
+        let copy_key = copy.to_string_lossy().into_owned();
+        owe(&mut prior);
+        let selected = owe_claimed_growth(&prior, &c.base, &twin, true);
+        let mut held = c.raw(&scanner, selected.clone(), 100, true, &[]);
+        assert!(scanner.paths().contains(&main) && scanner.paths().contains(&copy));
+        assert!(!scanner.paths().contains(&twin));
+        assert_eq!(indexed_size(&held.index, &twin), size);
+        held.enrich(&c);
+        assert_eq!(
+            held.disposition
+                .request_owned_hold_reasons
+                .get("absent_content_twin"),
+            Some(&1)
+        );
+        assert_withheld(&held, ROOT, "H cannot replace ROOT without T's Y");
+        let counted_copy = body(&held, COPY).unwrap();
+        assert_eq!(
+            counted_copy.request_count, 2,
+            "C still counts A and its own D"
+        );
+        assert_eq!(counted_copy.removed_request_count.unwrap_or(0), 0);
+        prior = accept_monotone_page(&c, &selected, held, &mut accepted);
+        assert!(prior.files[&main_key].upload_context_receipt.is_none());
+        assert!(!prior.claude_copy_removals.pending(location_key(&copy_key)));
+        assert_eq!((accepted[ROOT], accepted[COPY]), (2, 2));
+        let before_release = accepted.clone();
+
+        // Real ACKs and unchanged passes leave A counted once in C, without a retry.
+        for _ in 0..3 {
+            let mut unchanged = c.raw(&scanner, prior.clone(), 100, true, &[]);
+            assert!(!scanner.paths().contains(&twin), "T remains unacquired");
+            assert!(
+                !scanner.paths().contains(&copy),
+                "C must not loop on H's hold"
+            );
+            assert_eq!(indexed_size(&unchanged.index, &twin), size);
+            unchanged.enrich(&c);
+            assert!(!unchanged
+                .index
+                .claude_copy_removals
+                .pending(location_key(&copy_key)));
+            prior = accept_monotone_page(&c, &prior, unchanged, &mut accepted);
+            assert!(!prior.claude_copy_removals.pending(location_key(&copy_key)));
+            assert_eq!(accepted, before_release);
+            assert_eq!(accepted.values().sum::<u64>(), 4, "only C counts A");
+        }
+
+        // Release T: the complete ROOT union takes A and C replaces its prefix.
+        let released = owe_claimed_growth(&prior, &c.base, &twin, false);
+        let mut all = released.clone();
+        owe(&mut all);
+        let full = ready(&c, &E2ScanFixture::default(), all, 100, false);
+        let reference = sent_money(&full);
+        let mut acquired_twin = false;
+        let mut saw_root = false;
+        let mut saw_copy = false;
+        let mut stable = false;
+        prior = released;
+        for _ in 0..6 {
+            let mut page = c.raw(&scanner, prior.clone(), 100, true, &[]);
+            acquired_twin |= scanner.paths().contains(&twin);
+            let quiet = !scanner.paths().contains(&main) && !scanner.paths().contains(&copy);
+            page.enrich(&c);
+            if let Some(root) = body(&page, ROOT) {
+                assert_eq!(root.request_count, 3, "ROOT counts A/X/Y");
+                saw_root = true;
+            }
+            if let Some(copy_body) = body(&page, COPY) {
+                assert_eq!(copy_body.request_count, 1, "C counts only its own D");
+                assert_eq!(copy_body.removed_request_count, Some(1), "C removes A");
+                saw_copy = true;
+            }
+            // A transfer shrinks C: ACK exact replacements, then update the receiver ledger.
+            let mut replacements = BTreeMap::new();
+            prior = accept_monotone_page(&c, &prior, page, &mut replacements);
+            accepted.extend(replacements);
+            if quiet && saw_root && saw_copy {
+                stable = true;
+                break;
+            }
+        }
+        assert!(acquired_twin, "the released page must acquire T");
+        assert!(stable, "released ownership must settle without a read loop");
+        assert_eq!((accepted[ROOT], accepted[COPY]), (3, 1));
+        assert_eq!(
+            accepted.values().sum::<u64>(),
+            4,
+            "A is counted exactly once"
+        );
+        assert!(!prior.claude_copy_removals.pending(location_key(&copy_key)));
+        assert_eq!(
+            prior
+                .claude_copy_removals
+                .get(location_key(&copy_key))
+                .iter()
+                .flat_map(|(_, ids)| ids.iter().copied())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([crate::snapshots::claude_request_census::claude_request_hash("a")])
+        );
+
+        // An explicitly owed sampled page matches the native complete-money oracle.
+        let mut verify = prior.clone();
+        owe(&mut verify);
+        let mut complete = c.raw(&scanner, verify, 100, true, &[]);
+        complete.enrich(&c);
+        money_oracle::assert_equivalent(&reference, &sent_money(&complete));
+        prior = accept_monotone_page(&c, &prior, complete, &mut accepted);
+
+        // Two more unchanged passes read neither H nor C after the transfer settles.
+        let after_release = accepted.clone();
+        for _ in 0..2 {
+            let mut unchanged = c.raw(&scanner, prior.clone(), 100, true, &[]);
+            assert!(!scanner.paths().contains(&main) && !scanner.paths().contains(&copy));
+            unchanged.enrich(&c);
+            prior = accept_monotone_page(&c, &prior, unchanged, &mut accepted);
+            assert_eq!(accepted, after_release);
+            assert!(!prior.claude_copy_removals.pending(location_key(&copy_key)));
+        }
+    });
+}
+
 /// [money] An unchanged original read for local work while its owed history
 /// is held emits nothing and does not bring its copy, so the session never
 /// goes out at the copy's composition alone. Its history stays owed.
