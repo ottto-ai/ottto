@@ -50,7 +50,7 @@ fn drive(
             |batch| {
                 let attempt = posts.len();
                 posts.push(batch.iter().copied().cloned().collect());
-                respond(attempt, &batch)
+                respond(attempt, batch)
             },
             |_| Ok(()),
         )

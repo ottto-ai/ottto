@@ -14053,7 +14053,7 @@ mod tests {
                         snapshot_fingerprint: item.snapshot_fingerprint.clone(),
                         occurrence_count: 1,
                         body_witness_version: Some(14),
-                        body_witness_digest: Some(snapshot_upload_body_witness(&item)),
+                        body_witness_digest: Some(snapshot_upload_body_witness(item)),
                         head_etag: (item.snapshot_fingerprint != sibling.snapshot_fingerprint)
                             .then(|| "e".repeat(64)),
                         head_challenge: (item.snapshot_fingerprint == sibling.snapshot_fingerprint)
@@ -15119,7 +15119,7 @@ mod tests {
             &mut progress,
             |items, enforce| {
                 assert!(items[0].cache_observations.is_none());
-                let incoming = revision(&items[0]);
+                let incoming = revision(items[0]);
                 calls.push(enforce);
                 if enforce && incoming != server_revision {
                     return Err(anyhow!(
@@ -18000,9 +18000,9 @@ mod tests {
                         true,
                     )));
                 }
-                for fingerprint in batch.iter().copied() {
+                for fingerprint in batch {
                     assert!(
-                        !remotely_held.insert(fingerprint.clone()),
+                        !remotely_held.insert((*fingerprint).clone()),
                         "a smaller retry may revisit a held entity but cannot mint a second one"
                     );
                 }
@@ -23461,7 +23461,7 @@ mod tests {
                 .iter()
                 .find(|item| item.source_session_id == healthy_owner)
                 .unwrap();
-            let accepted = same_source_fixture_ack(&[&healthy]).unwrap();
+            let accepted = same_source_fixture_ack(&[healthy]).unwrap();
             let entity = &accepted.accepted_entities[0];
             let ack = serde_json::json!({"accepted":1,"sessions_reconciled":1,"session_ids":[],
             "disabled":false,"disabled_reason":null,"entity_ack_contract":"snapshot_entity_ack:v1",
@@ -23721,7 +23721,7 @@ mod tests {
             |item: &SnapshotItem| item.snapshot_fingerprint.as_str(),
             snapshot_upload_body_witness,
             |snapshots| {
-                validator.validate(&snapshots)?;
+                validator.validate(snapshots)?;
                 let request = SnapshotBatchRequest {
                     schema_version: SNAPSHOT_SCHEMA_VERSION,
                     source: "codex".into(),
@@ -25237,7 +25237,7 @@ mod tests {
             snapshot_upload_body_witness,
             |items| {
                 assert_eq!(serde_json::to_vec(&items[0]).unwrap(), expected);
-                assert_eq!(snapshot_upload_body_witness(&items[0]), body);
+                assert_eq!(snapshot_upload_body_witness(items[0]), body);
                 let mut response = accepted_batch(1);
                 response.entity_ack_contract =
                     Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());

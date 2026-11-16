@@ -126,7 +126,7 @@ fn cycle(
         now,
         |_| 0,
         |_| true,
-        |request, _| Ok(server(&request.snapshots[0])),
+        |request, _| Ok(server(request.snapshots[0])),
     );
     (result, wires.pop().unwrap_or(Value::Null))
 }
@@ -979,7 +979,7 @@ fn plain_conflict_is_probed_within_an_hour() {
             let mut response = empty_ack();
             response
                 .conflict_entities
-                .push(reference(&request.snapshots[0]));
+                .push(reference(request.snapshots[0]));
             response.validate_entity_ack(&request)?;
             Ok(response)
         },
@@ -1433,7 +1433,7 @@ fn replacing_cycle(
         now,
         |_| 0,
         |_| true,
-        |request, _| server(&request.snapshots[0]),
+        |request, _| server(request.snapshots[0]),
         true,
     );
     progress.active_quarantine_retries.clear();

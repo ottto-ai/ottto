@@ -688,7 +688,7 @@ fn bounded_retry_live_wait_sends_without_scan_and_preserves_ordinary_deadline_an
             &|item: &SnapshotItem| Some(item.source_session_id.as_str()),
             &mut |items| {
                 assert_eq!(
-                    serde_json::to_value(&items).unwrap(),
+                    serde_json::to_value(items).unwrap(),
                     serde_json::to_value(&f.items).unwrap()
                 );
                 Err(anyhow::Error::new(UploadShed {
