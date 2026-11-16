@@ -29177,6 +29177,10 @@ X-API-Key = "otel_redacted"
                 assert_eq!(cli_error(error).code, expected);
                 let state = daemon.inner.lock().unwrap();
                 assert!(
+                    !state.repair_locked,
+                    "refused verification kept the repair lock"
+                );
+                assert!(
                     state.sources.is_empty(),
                     "refused verification changed health"
                 );

@@ -587,6 +587,13 @@ cross-language identity vectors.
 
 ## Local health diagnostics
 
+Verification authorizes before source reads or result writes; setup authorizes
+before acquiring the process-wide scan lock. Telemetry controls require the
+validated user and organization to match the connected local account, under the
+identity lifecycle lock. Browser control and probe routes require an allowed
+Origin and loopback Host with the listener's port. Probe identity and detailed
+health require the local control token; other callers receive liveness/version.
+
 Local health events retain only the latest observation per Upload, SetupRead and
 SnapshotSync family, per Verify source, and per ScanIndex source/reason/polarity.
 The command ledger retains the latest terminal result per action. Both lists keep

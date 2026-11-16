@@ -25,13 +25,13 @@ which contains local session titles, prompts and workspace paths. Keep the
 backup private; the CLI writes its files as 0600 and its folders as 0700. The
 local state folder is not excluded from Time Machine or iCloud backups.
 
-The loopback `/local-health` endpoint may return the current pseudonymous
-relay-device id to an allowlisted Ottto browser origin so the web app can
-distinguish two macOS users on one physical Mac. Both `/whoami` and `/local-health`
-require an allowlisted Origin; requests without Origin are refused. The origin
-allowlist enforces browser CORS; it is not authentication for native loopback
-clients, so the id is treated only as a non-secret binding label. The endpoint
-never returns the relay secret, account ids, or hardware UUID.
+The loopback `/control`, `/whoami` and `/local-health` endpoints require an
+allowlisted Origin and a loopback Host naming the listener's port. Identity and
+health probes return only liveness and version without the local control token.
+An `Authorization: Bearer` local control token enables machine id/name and
+detailed health, including the pseudonymous relay-device id. The health endpoint
+never returns the relay secret, account ids, or hardware UUID. Origin and Host
+checks are browser boundaries; they do not replace token authorization.
 
 ## Device Details
 
