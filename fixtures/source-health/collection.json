@@ -1,0 +1,27 @@
+{
+  "absent": {},
+  "collecting": {
+    "collection": {
+      "state": "collecting"
+    }
+  },
+  "stalled": {
+    "collection": {
+      "state": "stalled",
+      "last_scan_at": "2026-11-15T10:00:00Z"
+    }
+  },
+  "server_backoff": {
+    "collection": {
+      "state": "server_backoff",
+      "last_scan_at": "2026-11-15T10:00:00Z",
+      "until": "2026-11-15T10:30:00Z"
+    }
+  },
+  "offline": {
+    "collection": {
+      "state": "offline",
+      "last_scan_at": "2026-11-15T10:00:00Z"
+    }
+  }
+}

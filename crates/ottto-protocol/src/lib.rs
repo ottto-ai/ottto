@@ -7650,42 +7650,47 @@ mod tests {
 
     #[test]
     fn source_collection_is_additive_and_round_trips() {
-        let mut health: SourceHealth = serde_json::from_str(include_str!(
+        let base: serde_json::Value = serde_json::from_str(include_str!(
             "../../../fixtures/source-health/codex-needs-repair.json"
         ))
         .unwrap();
-        assert!(health.collection.is_none());
-        assert!(serde_json::to_value(&health)
-            .unwrap()
-            .get("collection")
-            .is_none());
-        for state in [
-            "collecting",
-            "stalled",
-            "server_backoff",
-            "offline",
-            "future",
-        ] {
-            let mut value =
-                serde_json::json!({"state": state, "last_scan_at": "2026-11-15T10:00:00Z"});
-            if state == "server_backoff" {
-                value["until"] = serde_json::json!("2026-11-15T10:30:00Z");
-            }
-            health.collection = Some(serde_json::from_value(value).unwrap());
+        // Shared with consumers: each named case contains SourceHealth fields.
+        let cases: BTreeMap<String, serde_json::Value> = serde_json::from_str(include_str!(
+            "../../../fixtures/source-health/collection.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            cases.keys().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "absent",
+                "collecting",
+                "offline",
+                "server_backoff",
+                "stalled"
+            ]
+        );
+        for (case, fields) in cases {
+            let mut value = base.clone();
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            let health: SourceHealth = serde_json::from_value(value).unwrap();
             let encoded = serde_json::to_value(&health).unwrap();
             assert_eq!(
-                encoded["collection"].get("until").is_some(),
-                state == "server_backoff"
+                encoded.get("collection"),
+                fields.get("collection"),
+                "{case}"
             );
             assert_eq!(
                 serde_json::from_value::<SourceHealth>(encoded).unwrap(),
-                health
+                health,
+                "{case}"
             );
         }
-        assert_eq!(
-            health.collection.unwrap().state,
-            SourceCollectionState::Unknown
-        );
+        let unknown: SourceCollectionHealth =
+            serde_json::from_value(serde_json::json!({"state": "future"})).unwrap();
+        assert_eq!(unknown.state, SourceCollectionState::Unknown);
     }
 
     #[test]
