@@ -175,7 +175,8 @@ them: an operation saved by an older version in either phase is reported as
 The former v25 `claude_account_submit_auth_code` command is retired. A request
 still sent by an older client is answered, after the normal local-client
 authorization, with a structured rejection that keeps the original
-`request_id`:
+`request_id`. Older apps show its message as is, so it repeats the browser
+guidance:
 
 ```json
 {
@@ -183,7 +184,7 @@ authorization, with a structured rejection that keeps the original
   "payload": null,
   "error": {
     "code": "invalid_request",
-    "message": "Claude code submission is unsupported. Cancel and try again.",
+    "message": "Finish signing in to Claude in your browser. Nothing happening? Cancel and try again.",
     "retryable": false,
     "details": {}
   }

@@ -44,9 +44,10 @@ const TERM_GRACE: Duration = Duration::from_millis(500);
 const SUPERVISOR_READY_TIMEOUT: Duration = Duration::from_secs(2);
 const PROVIDER_EVENT_READY: u8 = 1;
 /// The reply to an authorized request from an older client that still sends
-/// the retired authorization-code command. It must never echo request fields.
+/// the retired authorization-code command. Older apps show it as is, so it is
+/// plain user-facing copy; it must never echo request fields.
 pub(crate) const RETIRED_CODE_SUBMISSION_MESSAGE: &str =
-    "Claude code submission is unsupported. Cancel and try again.";
+    "Finish signing in to Claude in your browser. Nothing happening? Cancel and try again.";
 
 static STATE_TRANSACTION: OnceLock<Mutex<()>> = OnceLock::new();
 static ADMISSION_TRANSACTION: OnceLock<Mutex<()>> = OnceLock::new();

@@ -21388,16 +21388,24 @@ for line in sys.stdin:
                     error.message,
                     crate::claude_browser_auth::RETIRED_CODE_SUBMISSION_MESSAGE
                 );
+                // Approved user-facing copy; older apps display it verbatim.
+                assert_eq!(
+                    error.message,
+                    "Finish signing in to Claude in your browser. \
+                     Nothing happening? Cancel and try again."
+                );
                 assert!(!error.retryable);
                 assert!(error.details.is_empty());
                 let message = error.message.to_lowercase();
-                for compatibility_marker in [
+                for forbidden in [
                     "unknown variant",
                     "unknown command",
                     "protocol_version",
                     "schema_version",
+                    "code",
+                    "terminal",
                 ] {
-                    assert!(!message.contains(compatibility_marker));
+                    assert!(!message.contains(forbidden), "{forbidden}");
                 }
             }
             assert!(
