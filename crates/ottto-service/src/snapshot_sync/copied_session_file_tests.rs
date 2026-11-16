@@ -2398,3 +2398,7 @@ fn committed_content_carrier_requires_bound_receipt_after_reload() {
         }
     });
 }
+
+mod accepted_holder_row_tests {
+    include!("accepted_holder_row_tests.rs");
+}

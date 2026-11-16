@@ -2163,3 +2163,86 @@ mod progress_rows {
         });
     }
 }
+
+/// Accepted request membership has its own native rows, independent of stamps.
+/// These membership assertions are expected red on main.
+#[test]
+fn accepted_request_rows_round_trip_replace_and_reject_future_layouts() {
+    use super::super::claude_money_birth_store::location_key;
+    use super::super::upload_context_receipt::{ProofState, SlotRows};
+    use std::sync::Arc;
+    let f = Fixture::new();
+    f.published();
+    let mut index = load_with(&f.path, false).unwrap().unwrap();
+    let slot = "a".repeat(32);
+    let row = SlotRows {
+        fingerprint: "b".repeat(64),
+        body_witness: "c".repeat(64),
+        rows: vec![(location_key("synthetic-holder"), Arc::from([1_u64, 7, 99]))]
+            .into_boxed_slice(),
+    };
+    index
+        .upload_context_proof
+        .request_contributions
+        .insert(slot.clone(), row.clone());
+    assert!(save_with(&f.path, &mut index).unwrap());
+    with_session_db(&index, |db| {
+        assert_eq!(db.read_control::<u32>("catalogue_layout").unwrap(), Some(8));
+    });
+    index = load_with(&f.path, false).unwrap().unwrap();
+    assert_eq!(index.upload_context_proof.request_contributions[&slot], row);
+    assert!(index
+        .upload_context_proof
+        .header()
+        .request_contributions
+        .is_empty());
+    assert!(index.upload_context_proof.entity_stamps.is_empty());
+    index
+        .upload_context_proof
+        .request_contributions
+        .get_mut(&slot)
+        .unwrap()
+        .rows = Box::new([]);
+    assert!(save_with(&f.path, &mut index).unwrap());
+    index = load_with(&f.path, false).unwrap().unwrap();
+    assert!(index.upload_context_proof.request_contributions[&slot]
+        .rows
+        .is_empty());
+    let legacy: ProofState = serde_json::from_str("{}").unwrap();
+    assert!(legacy.request_contributions.is_empty());
+    assert!(legacy.is_empty());
+    // The current reader exercises the same refusal used by an older reader
+    // when its supported layout is below the stored layout.
+    with_session_db(&index, |db| db.control("catalogue_layout", &9_u32).unwrap());
+    let error = load_with(&f.path, false).unwrap_err();
+    assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::Future));
+}
+
+#[test]
+fn malformed_accepted_request_rows_refuse_the_native_store() {
+    use super::super::upload_context_receipt::SlotRows;
+    for hashes in [
+        "",
+        "AA==",
+        "AAAAAAAAAAEAAAAAAAAAAQ==",
+        "AAAAAAAAAAIAAAAAAAAAAQ==",
+    ] {
+        let location = [0_u8; 16];
+        let raw = serde_json::json!({
+            "fingerprint": "a".repeat(64), "body_witness": "b".repeat(64),
+            "rows": [[location, hashes]],
+        });
+        assert!(codec::exact_json::<SlotRows>(&serde_json::to_vec(&raw).unwrap()).is_err());
+    }
+    let f = Fixture::new();
+    f.published();
+    let index = load_with(&f.path, false).unwrap().unwrap();
+    with_session_db(&index, |db| {
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        let key = RowKey::record("proof.request_contribution", b"slot".to_vec(), 1).unwrap();
+        tx.put(RowInput { key: &key, fixed: &Fixed::None, value_version: 1,
+            value: br#"{"fingerprint":"bad","body_witness":"bad","rows":[[[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"AA=="]]}"# }).unwrap();
+        assert_eq!(tx.commit(G, G + 1), DurableCommitOutcome::Committed(G + 1));
+    });
+    assert!(load_with(&f.path, false).is_err());
+}

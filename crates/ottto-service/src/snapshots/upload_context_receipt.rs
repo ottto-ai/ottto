@@ -1,5 +1,57 @@
 //! Per-file delivery evidence, independent of source census authority.
+use super::claude_money_birth_store::LocationKey;
 use super::*;
+use std::sync::Arc;
+
+pub(crate) type RequestRows = Box<[(LocationKey, Arc<[u64]>)]>;
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SlotRows {
+    pub fingerprint: String,
+    pub body_witness: String,
+    #[serde(with = "contribution_rows")]
+    pub rows: RequestRows,
+}
+impl SlotRows {
+    pub(crate) fn capture(item: &SnapshotItem) -> (String, Self) {
+        let mut hash = Sha256::new();
+        hash.update(SnapshotSource::ClaudeCode.api_slug().as_bytes());
+        hash.update([0]);
+        hash.update(item.source_session_id.as_bytes());
+        (
+            crate::hex::encode(&hash.finalize()[..16]),
+            Self {
+                fingerprint: item.snapshot_fingerprint.clone(),
+                body_witness: snapshot_upload_body_witness(item),
+                rows: item.request_contributions.clone(),
+            },
+        )
+    }
+}
+mod contribution_rows {
+    use super::*;
+    pub(super) fn serialize<S: serde::Serializer>(
+        rows: &RequestRows,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        rows.iter()
+            .map(|(loc, h)| (loc.to_bytes(), claude_request_census::HashBase64(h)))
+            .collect::<Vec<_>>()
+            .serialize(s)
+    }
+    pub(super) fn deserialize<'de, D: serde::Deserializer<'de>>(
+        d: D,
+    ) -> Result<RequestRows, D::Error> {
+        Vec::<([u8; 16], String)>::deserialize(d)?
+            .into_iter()
+            .map(|(loc, text)| {
+                claude_request_census::decode_base64_hashes(&text)
+                    .map(|h| (LocationKey::from_bytes(loc), Arc::from(h)))
+                    .ok_or_else(|| serde::de::Error::custom("invalid contribution hashes"))
+            })
+            .collect()
+    }
+}
+crate::heap_layout_bound::fields!(SlotRows; fingerprint, body_witness, rows);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Receipt {
@@ -60,8 +112,8 @@ impl ContextInputs {
 }
 
 /// Per-item upload-context proof kept with the index. Old decoders drop it.
-/// Stamps are bound as a set to one destination and replay generation, and
-/// bounded by live entities.
+/// Stamps bind delivery to one destination and replay generation. Request
+/// contributions track receiver membership independently of delivery proof.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ProofState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -72,6 +124,8 @@ pub(crate) struct ProofState {
     replay_generation: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(super) entity_stamps: BTreeMap<String, EntityStamp>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) request_contributions: BTreeMap<String, SlotRows>,
     /// retired_<old>: the change-reason policy direction. Decode-only, so
     /// state written with it still loads; never written.
     #[serde(
@@ -101,11 +155,44 @@ fn drop_retired_direction<'de, D: serde::Deserializer<'de>>(
     Retired::deserialize(de).map(drop)
 }
 
+impl ScanIndex {
+    pub(in crate::snapshots) fn prune_request_contributions(&mut self) {
+        if self.deleted_holders.is_empty() {
+            return;
+        }
+        let live = self
+            .files
+            .keys()
+            .map(|key| claude_money_birth_store::location_key(key))
+            .collect::<BTreeSet<_>>();
+        let named = self.claude_copy_removals.referenced_hashes();
+        for slot in self.upload_context_proof.request_contributions.values_mut() {
+            slot.rows = slot
+                .rows
+                .iter()
+                .filter_map(|(loc, hashes)| {
+                    if !self.deleted_holders.contains(loc) || live.contains(loc) {
+                        return Some((*loc, Arc::clone(hashes)));
+                    }
+                    let kept = hashes
+                        .iter()
+                        .copied()
+                        .filter(|h| named.get(loc).is_some_and(|ids| ids.contains(h)))
+                        .collect::<Vec<_>>();
+                    (!kept.is_empty()).then(|| (*loc, Arc::from(kept)))
+                })
+                .collect();
+        }
+    }
+}
+
 impl ProofState {
     pub(crate) fn is_empty(&self) -> bool {
-        self.inputs.is_none() && self.entity_stamps.is_empty()
+        self.inputs.is_none()
+            && self.entity_stamps.is_empty()
+            && self.request_contributions.is_empty()
     }
-    /// Every field but the stamps, which state v2 stores one row per entity.
+    /// Scalar header; state v2 stores stamps and contributions as separate rows.
     pub(crate) fn header(&self) -> Self {
         Self {
             inputs: self.inputs.clone(),
@@ -953,6 +1040,14 @@ impl ScanIndex {
         bodies: &BTreeMap<String, String>,
         contexts: &BTreeMap<String, String>,
     ) {
+        if self
+            .upload_context_proof
+            .destination_namespace_hash
+            .as_deref()
+            .is_some_and(|old| old != destination)
+        {
+            self.upload_context_proof.request_contributions.clear();
+        }
         if contexts.is_empty() && self.upload_context_proof.entity_stamps.is_empty() {
             return;
         }
@@ -1156,6 +1251,6 @@ impl ScanIndex {
 crate::heap_layout_bound::fields!(Receipt; context_fingerprint, replay_generation, source_witness, body_witness);
 crate::heap_layout_bound::fields!(EntityStamp; context_fingerprint, body_witness);
 crate::heap_layout_bound::fields!(ContextInputs; policy, namespace, cache_observations, copy_contract, resumed_prefix);
-crate::heap_layout_bound::fields!(ProofState; inputs, destination_namespace_hash, replay_generation, entity_stamps, retired_direction);
+crate::heap_layout_bound::fields!(ProofState; inputs, destination_namespace_hash, replay_generation, entity_stamps, request_contributions, retired_direction);
 
 crate::heap_layout_bound::fields!(Candidate; key, receipt, mode_context, historical_replay_generation, bodies, wire_bytes, prior_acks, split, joined_marker);

@@ -493,6 +493,8 @@ pub struct ScanIndex {
         deserialize_with = "claude_request_money::copy_removals::CopyRemovals::deserialize_lenient"
     )]
     pub(crate) claude_copy_removals: claude_request_money::copy_removals::CopyRemovals,
+    #[serde(skip)]
+    pub(crate) deleted_holders: BTreeSet<claude_money_birth_store::LocationKey>,
     /// Per-item upload-context proof. Appended for old readers, which drop it;
     /// missing means owed. Gates no decision yet.
     #[serde(
@@ -669,6 +671,7 @@ impl Default for ScanIndex {
             retired_claude_request_identity_contract_changed: serde::de::IgnoredAny,
             claude_desktop_store_inventory: None,
             claude_copy_removals: Default::default(),
+            deleted_holders: Default::default(),
             upload_context_proof: Default::default(),
             copy_unproven_enabled: false,
             copy_prefix_base_upload_context: None,

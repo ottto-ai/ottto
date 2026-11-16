@@ -912,6 +912,7 @@ pub(crate) fn accept_upload_context_acks_for_test(
         })
         .unwrap_or_default();
     index.stamp_entity_upload_context_acks("e2-fixture-destination", acks, &contexts);
+    crate::snapshot_sync::accept_request_contributions_for_test(index, items, acks);
 }
 
 /// `path` holds a receipt for its current body under the active context
@@ -1199,4 +1200,17 @@ pub(crate) fn non_tail_carrier_observation_for_test(index: &ScanIndex, path: &Pa
         },
     )
     .unwrap();
+}
+
+pub(crate) fn delete_holder_for_test(index: &mut ScanIndex, key: &str) {
+    index.drop_file_entry(key);
+}
+pub(crate) fn invalidate_holder_for_test(index: &mut ScanIndex, key: &str) {
+    index.claude_request_census.invalidate_keeping_birth(key);
+}
+pub(crate) fn accepted_file_for_test(index: &ScanIndex, key: &str) -> bool {
+    index.file_has_accepted_body_unheld(key)
+}
+pub(crate) fn unhold_claude_account_for_test(index: &mut ScanIndex, key: &str) {
+    index.claude_account_deferred_holds.remove(key);
 }

@@ -1785,6 +1785,9 @@ struct SnapshotUploadProgress {
     fresh_context_body_acks: BTreeMap<String, String>,
     #[serde(skip)]
     context_receipt_candidates: Vec<crate::snapshots::UploadContextReceiptCandidate>,
+    #[serde(skip)]
+    request_contributions:
+        BTreeMap<String, (String, crate::snapshots::upload_context_receipt::SlotRows)>,
 }
 /// What a save's compare-and-swap reads from the on-disk progress: the writer
 /// stamp and the quarantine claims to merge. Other fields are skipped, not kept.
@@ -1846,6 +1849,7 @@ impl SnapshotUploadProgress {
             terminal_contract_retry_pending_save: false,
             fresh_context_body_acks: BTreeMap::new(),
             context_receipt_candidates: Vec::new(),
+            request_contributions: BTreeMap::new(),
         }
     }
 
@@ -4096,6 +4100,7 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
         &durable.accepted_body_witnesses,
         &durable.accepted_body_contexts,
     );
+    committable.accept_request_contributions(progress);
     validate_destination().context(CHECKPOINT_VALIDATE_DESTINATION)?;
     committable
         .save_with_progress_owner(index_path, read_limit, &progress_owner)
@@ -4105,6 +4110,52 @@ fn checkpoint_partial_snapshot_index_with_audit_release(
         context_rearms.emit(scan.source);
     }
     Ok(committable)
+}
+
+impl ScanIndex {
+    fn accept_request_contributions(&mut self, progress: &SnapshotUploadProgress) {
+        let covered = progress.covered_stale_bodies();
+        let mut seen = BTreeSet::new();
+        for (fp, (slot, rows)) in &progress.request_contributions {
+            if progress.fresh_context_body_acks.get(fp) != Some(&rows.body_witness)
+                || progress.quarantined_fingerprints.contains_key(fp)
+                || covered.get(fp) == Some(&rows.body_witness)
+            {
+                continue;
+            }
+            if seen.insert(slot) {
+                self.upload_context_proof
+                    .request_contributions
+                    .insert(slot.clone(), rows.clone());
+            } else {
+                self.upload_context_proof.request_contributions.remove(slot);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn accept_request_contributions_for_test(
+    index: &mut ScanIndex,
+    items: &[SnapshotItem],
+    acks: &BTreeMap<String, String>,
+) {
+    let mut progress = SnapshotUploadProgress::new(
+        "test".into(),
+        snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+    );
+    progress.fresh_context_body_acks = acks.clone();
+    progress.request_contributions = items
+        .iter()
+        .filter(|item| item.claude_money.is_some())
+        .map(|item| {
+            (
+                item.snapshot_fingerprint.clone(),
+                crate::snapshots::upload_context_receipt::SlotRows::capture(item),
+            )
+        })
+        .collect();
+    index.accept_request_contributions(&progress);
 }
 
 fn cached_source_manifest(
@@ -8463,6 +8514,18 @@ fn finish_sync_source(
     {
         upload_progress.save(&upload_progress_path)?;
     }
+    upload_progress.request_contributions.extend(
+        scan_result
+            .snapshots
+            .iter()
+            .filter(|item| item.claude_money.is_some())
+            .map(|item| {
+                (
+                    item.snapshot_fingerprint.clone(),
+                    crate::snapshots::upload_context_receipt::SlotRows::capture(item),
+                )
+            }),
+    );
     upload_progress.context_receipt_candidates = index.file_upload_context_ack_candidates(
         &scan_result.snapshots,
         &upload_progress.covered_stale_bodies(),
@@ -9178,6 +9241,7 @@ fn finish_sync_source(
         &upload_progress.accepted_body_witnesses,
         &upload_progress.accepted_body_contexts,
     );
+    index.accept_request_contributions(&upload_progress);
     let telemetry_removed = claude_scan_roots.as_ref().map(|_| {
         crate::snapshots::claude_telemetry_retention::removed_index_keys(&committed_index, &index)
     });
@@ -9548,6 +9612,7 @@ fn activate_source_upload_context(
     );
     progress.fresh_context_body_acks.clear();
     progress.context_receipt_candidates.clear();
+    progress.request_contributions.clear();
     progress.context_resend = upload_context_resend::Cycle::new(context);
 }
 
@@ -25586,7 +25651,7 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(SnapshotUploadProgress; telemetry_only, schema_version, rows, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_body_contexts, context_resend, ack_capacity, retained_stale_ack_count, accepted_cache_states, accepted_identity_buckets, accepted_identity_scope, accepted_cache_heads, pending_cache_heads, head_conflict_challenges, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts, terminal_contract_retry_pending_save, fresh_context_body_acks, context_receipt_candidates);
+crate::heap_layout_bound::fields!(SnapshotUploadProgress; telemetry_only, schema_version, rows, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_body_contexts, context_resend, ack_capacity, retained_stale_ack_count, accepted_cache_states, accepted_identity_buckets, accepted_identity_scope, accepted_cache_heads, pending_cache_heads, head_conflict_challenges, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts, terminal_contract_retry_pending_save, fresh_context_body_acks, context_receipt_candidates, request_contributions);
 
 crate::heap_layout_bound::fields!(PendingCacheHeadFile; source_file_fingerprint, group_fingerprint, entities, reselected_heads, settled_entities);
 
