@@ -310,6 +310,15 @@ fn account_return_today_reinterprets_orphaned_history() {
         .unwrap(),
     );
     legacy.save(&cx_path).unwrap();
+    // Like install_legacy_active: A already completed its initial Codex backfill.
+    crate::backfill::update_backfill_state(&support, |state| {
+        crate::backfill::mark_backfill_complete_for_destination(
+            state,
+            SnapshotSource::Codex,
+            &namespace_a,
+        );
+    })
+    .unwrap();
     crate::snapshots::older_build_logs_priority("return-turn");
     let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
     // Existing prepare/finish scaffold, now table-driven across the three sources.
@@ -562,11 +571,14 @@ fn account_return_today_reinterprets_orphaned_history() {
                 );
             } else {
                 assert_eq!(counts(prior), expected);
-                assert_eq!(
-                    after["model_usage"], prior["model_usage"],
-                    "priced rows/cost inputs"
-                );
-                assert_eq!(after["cost"], prior["cost"]);
+                for field in
+                    crate::snapshots::sampled_scan::transition_fixture::money_oracle::FIELDS
+                {
+                    assert_eq!(
+                        after[*field], prior[*field],
+                        "{field}: priced rows and hourly cost inputs"
+                    );
+                }
                 if source == 2 {
                     assert_eq!(after["cost"]["total_cost_usd"], "0.001");
                 }
