@@ -7,13 +7,30 @@ several coding agents on your Mac, such as Claude Code, Codex and Pi.
 - **What should you optimize:** where your cost goes and which setup problems may hold your agents
   back, based on your own sessions and setup, so you fix what matters first.
 
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/overview-dark.png">
-    <img alt="The Ottto dashboard Overview page for a demo account, last 7 days: cards for API usage, subscriptions, cloud providers and daily run-rate; pay-as-you-go cost drivers by agent for Claude Code, Codex and Pi; and token, session and hourly activity summaries." src="docs/assets/readme/overview-light.png" width="860">
-  </picture><br>
-  <sub>The Overview page of the Ottto dashboard, showing a demo account's data.</sub>
-</p>
+<!-- Product visual: coming soon -->
+
+## What Ottto does on your Mac
+
+- **Reads** the session files that Claude Code, Codex and Pi write (`~/.claude/projects`,
+  `~/.codex/sessions`, `~/.pi/agent/sessions`) and a few named settings from their config.
+- **Uploads nothing about your usage until you connect** this Mac to an Ottto account. Then it
+  sends usage metadata, never your transcripts, code, tool output or sign-in tokens
+  ([what is sent](#privacy)).
+- **Sends session titles, repository names and MCP tool details by default.** Every 6 hours it
+  starts your local stdio MCP servers for Claude Code and Codex to list their tools, and sends each
+  tool's name, description and input schema. In the web dashboard, **Readable labels** turns all
+  of these off, and **MCP inventory harvesting** only the MCP part.
+- **Reads your plan limits** from Anthropic with Claude Code's sign-in, and through the Codex CLI
+  for Codex. Each can be turned off.
+- **Runs short `claude`, `codex` and `pi` commands** to check your setup (including test prompts),
+  read limits and keep Claude sign-ins fresh.
+- **Edits agent settings** on setup and repair: Claude Code's `~/.claude/settings.json` (telemetry
+  and status line) and a marked line in `~/.zshrc`. Later checks put its status line back. At
+  start it removes only its own old entries from `~/.codex/config.toml`.
+- **Receives Claude Code's telemetry** on 127.0.0.1 and keeps only content-free counters, which feed
+  the usage it uploads.
+
+Details: [docs/privacy.md](docs/privacy.md).
 
 ## Get started
 
