@@ -84,7 +84,8 @@ explicitly, serially, without retries. The advisory build uses the ordinary
 service test profile with the workspace's existing optimized dependencies, debug assertions and overflow checks. Two
 Cargo jobs limit compile concurrency. That profile is pinned in B. It changes neither native
 Mac nor money builds. Command wall time is CI overhead evidence. Calibration exceeded the initial
-40-minute total estimate, so the single advisory job allows 75 minutes. This
+40-minute total estimate. The job takes 47-63 minutes on a normal runner and
+one slow runner needed about 80, so the single advisory job allows 100 minutes. This
 adds no resource-test execution or timeout change to required shards; it does
 consume a Linux slot for substantially longer than the original estimate.
 Keep the check advisory and review duration drift before promotion.

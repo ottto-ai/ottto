@@ -4407,9 +4407,9 @@ pub(crate) fn claude_alternative_auth_layers(
 }
 
 /// Whether a Console API key saved by `/login` is present for this login:
-/// its `Claude Code` keychain item (`Claude Code-<hash>` for a registered
-/// config dir, the same suffix as the OAuth item; presence only, read
-/// without `-w`) or `.claude.json` `primaryApiKey`. No key value is kept.
+/// `.claude.json` `primaryApiKey` or, on macOS, its `Claude Code` keychain
+/// item (`Claude Code-<hash>` for a registered config dir, the same suffix as
+/// the OAuth item; presence only, read without `-w`). No key value is kept.
 fn claude_stored_console_key_present(slot: &ClaudeConfigDirSlot) -> bool {
     let in_config = fs::read_to_string(slot.identity_path(&home_dir()))
         .ok()
@@ -4424,7 +4424,9 @@ fn claude_stored_console_key_present(slot: &ClaudeConfigDirSlot) -> bool {
     if in_config {
         return true;
     }
-    if crate::command_env::executable_path("security").is_none() {
+    if !claude_credentials_in_keychain()
+        || crate::command_env::executable_path("security").is_none()
+    {
         return false;
     }
     let Some(account) = effective_user_account_name() else {
@@ -14589,17 +14591,38 @@ pub(crate) fn read_claude_oauth_credential_metadata_for_slot(
     read_claude_oauth_credential_state_for_slot(slot).metadata()
 }
 
-/// Read one exact slot's stored Claude login: the keychain item first, then
-/// the credentials-file fallback. Only `security` exit 44 (item not found)
-/// falls through to the file; every other keychain outcome (no `security`
-/// tool on the search path, locked keychain, timeout, spawn failure,
-/// unparseable JSON) is `Unreadable`: the login cannot be confirmed either
-/// way, never "signed out".
+/// Read one exact slot's stored Claude login from where Claude Code keeps it
+/// on this OS (see [`claude_credentials_in_keychain`]).
+fn read_claude_oauth_credential_state_for_slot(slot: &ClaudeConfigDirSlot) -> ClaudeCredentialRead {
+    read_claude_oauth_credential_state_from_store(slot, claude_credentials_in_keychain())
+}
+
+/// Claude Code keeps its login in the keychain on macOS and in the native
+/// credentials file (`<config dir>/.credentials.json`) everywhere else. Off
+/// macOS the keychain tool is never run, even when some program named
+/// `security` is on the search path.
+const fn claude_credentials_in_keychain() -> bool {
+    cfg!(target_os = "macos")
+}
+
+/// With `keychain`, the keychain item first, then the credentials-file
+/// fallback. Only `security` exit 44 (item not found) falls through to the
+/// file; every other keychain outcome (no `security` tool on the search path,
+/// locked keychain, timeout, spawn failure, unparseable JSON) is
+/// `Unreadable`: the login cannot be confirmed either way, never "signed
+/// out". Without `keychain`, the credentials file alone. Both read the file
+/// through [`read_claude_credentials_file`].
 ///
 /// The item is read with `security find-generic-password -w`, so the secret
 /// passes through a pipe into daemon memory. It is parsed here and dropped;
 /// only the access token travels on, to the usage request.
-fn read_claude_oauth_credential_state_for_slot(slot: &ClaudeConfigDirSlot) -> ClaudeCredentialRead {
+fn read_claude_oauth_credential_state_from_store(
+    slot: &ClaudeConfigDirSlot,
+    keychain: bool,
+) -> ClaudeCredentialRead {
+    if !keychain {
+        return read_claude_oauth_credential_from_credentials_file(slot);
+    }
     match read_claude_oauth_credential_from_keychain(slot) {
         ClaudeKeychainRead::Found(payload) => parse_claude_oauth_credential_read(&payload),
         ClaudeKeychainRead::NotFound => read_claude_oauth_credential_from_credentials_file(slot),
@@ -14616,11 +14639,12 @@ pub(crate) fn read_claude_live_login_for_slot(slot: &ClaudeConfigDirSlot) -> Cla
     }
 }
 
-/// The stored credential's modification marker, for the refresher's log: the
-/// keychain item's `mdat` attribute (read without `-w`, so no secret is
-/// printed), or the credentials file's mtime. Never the item's contents.
+/// The stored credential's modification marker, for the refresher's log: on
+/// macOS the keychain item's `mdat` attribute (read without `-w`, so no secret
+/// is printed), otherwise the credentials file's mtime. Never the contents.
 pub(crate) fn claude_credential_modified_marker(slot: &ClaudeConfigDirSlot) -> Option<String> {
-    if crate::command_env::executable_path("security").is_some() {
+    if claude_credentials_in_keychain() && crate::command_env::executable_path("security").is_some()
+    {
         if let Some(account) = effective_user_account_name() {
             let service = slot.service_name();
             let output = run_command_capture(
@@ -14825,11 +14849,96 @@ fn claude_oauth_keychain_lookup_arguments(
 fn read_claude_oauth_credential_from_credentials_file(
     slot: &ClaudeConfigDirSlot,
 ) -> ClaudeCredentialRead {
-    let path = slot.credentials_path(&home_dir());
-    match fs::read_to_string(path) {
-        Ok(body) => parse_claude_oauth_credential_read(&body),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ClaudeCredentialRead::Absent,
-        Err(_) => ClaudeCredentialRead::Unreadable,
+    read_claude_credentials_file(&slot.credentials_path(&home_dir()))
+}
+
+/// The one reader for Claude Code's native credentials file, used by the
+/// status read on every OS (directly off macOS, after keychain "not found" on
+/// macOS) and by the session-launch check. A missing file is `Absent`. A file
+/// that cannot be opened without following a final symlink, is not a regular
+/// file, is not owned by the effective user or grants any group/other
+/// permission is `Unreadable`, as is any other I/O failure. The whole file is
+/// read from the checked handle and never modified. Unit-test reads are
+/// scratch-only.
+#[cfg(unix)]
+fn read_claude_credentials_file(path: &Path) -> ClaudeCredentialRead {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    if !crate::provider_calls::readable_for_account(path) {
+        return ClaudeCredentialRead::Unreadable;
+    }
+    #[cfg(test)]
+    claude_credentials_file_test_hooks::before_read(path);
+    let mut file = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return ClaudeCredentialRead::Absent
+        }
+        Err(_) => return ClaudeCredentialRead::Unreadable,
+    };
+    let Ok(metadata) = file.metadata() else {
+        return ClaudeCredentialRead::Unreadable;
+    };
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o077 != 0
+    {
+        return ClaudeCredentialRead::Unreadable;
+    }
+    let mut body = String::new();
+    if file.read_to_string(&mut body).is_err() {
+        return ClaudeCredentialRead::Unreadable;
+    }
+    parse_claude_oauth_credential_read(&body)
+}
+
+/// Without owner, mode and no-follow checks the file cannot be trusted:
+/// fail closed.
+#[cfg(not(unix))]
+fn read_claude_credentials_file(_path: &Path) -> ClaudeCredentialRead {
+    ClaudeCredentialRead::Unreadable
+}
+
+/// Lets a unit test change the slot's identity files while its stored login
+/// is being read, as another Claude Code process could.
+#[cfg(test)]
+pub(crate) mod claude_credentials_file_test_hooks {
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    type Hook = Box<dyn Fn(&Path) + Send>;
+
+    static BEFORE_READ: Mutex<Option<Hook>> = Mutex::new(None);
+
+    pub(crate) fn before_read(path: &Path) {
+        if let Some(hook) = BEFORE_READ
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
+            hook(path);
+        }
+    }
+
+    /// Installs `hook` until the returned guard drops.
+    pub(crate) fn install(hook: impl Fn(&Path) + Send + 'static) -> Installed {
+        *BEFORE_READ
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(hook));
+        Installed
+    }
+
+    pub(crate) struct Installed;
+
+    impl Drop for Installed {
+        fn drop(&mut self) {
+            *BEFORE_READ
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        }
     }
 }
 
@@ -18459,44 +18568,7 @@ pub(crate) fn session_launch_claude_login_state(
     slot: &ClaudeConfigDirSlot,
     home: &Path,
 ) -> ClaudeLocalLoginState {
-    let read_file = || {
-        let path = slot.credentials_path(home);
-        if !crate::provider_calls::readable_for_account(&path) {
-            return ClaudeCredentialRead::Unreadable;
-        }
-        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-        let file = match fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-            .open(path)
-        {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return ClaudeCredentialRead::Absent
-            }
-            Err(_) => return ClaudeCredentialRead::Unreadable,
-        };
-        let Ok(metadata) = file.metadata() else {
-            return ClaudeCredentialRead::Unreadable;
-        };
-        if !metadata.is_file()
-            || metadata.len() > 1024 * 1024
-            || metadata.uid() != unsafe { libc::geteuid() }
-            || metadata.mode() & 0o077 != 0
-        {
-            return ClaudeCredentialRead::Unreadable;
-        }
-        let mut body = String::new();
-        if file
-            .take(1024 * 1024 + 1)
-            .read_to_string(&mut body)
-            .is_err()
-            || body.len() > 1024 * 1024
-        {
-            return ClaudeCredentialRead::Unreadable;
-        }
-        parse_claude_oauth_credential_read(&body)
-    };
+    let read_file = || read_claude_credentials_file(&slot.credentials_path(home));
     #[cfg(all(target_os = "macos", not(test)))]
     let read =
         match read_claude_oauth_credential_from_keychain_with_timeout(slot, Duration::from_secs(2))
@@ -21122,11 +21194,22 @@ exit 44
                     "subscriptionType": "max"
                 }
             });
+            self.write_login(slot, &credential);
+        }
+
+        /// Stores `credential` where Claude Code keeps this slot's login: the
+        /// fake keychain item macOS reads and the native credentials file
+        /// (mode `0o600`) other platforms read.
+        fn write_login(&self, slot: &ClaudeConfigDirSlot, credential: &Value) {
+            let body = serde_json::to_vec(credential).expect("item");
             fs::write(
                 self.items.join(format!("{}.json", slot.service_name())),
-                serde_json::to_vec(&credential).expect("item"),
+                &body,
             )
             .expect("write item");
+            let native = slot.credentials_path(&self.root.join("home"));
+            fs::create_dir_all(native.parent().expect("credentials dir")).expect("credentials dir");
+            crate::test_scratch::write_private_file(native, body);
         }
 
         fn slot(&self, index: usize) -> ClaudeConfigDirSlot {
@@ -21209,7 +21292,8 @@ exit 44
 
     /// T3: full status passes for the default login plus three slots across
     /// the expiry boundary spawn nothing but `--version`, and read each
-    /// login's keychain item once per pass.
+    /// login's keychain item once per pass on macOS (its native credentials
+    /// file elsewhere, never running `security`).
     #[test]
     #[serial]
     fn status_passes_spawn_only_version_probes_across_the_expiry_boundary() {
@@ -21235,17 +21319,23 @@ exit 44
                 "{label}: zero slot spawns"
             );
             let reads = fixture.security_reads();
-            for slot in std::iter::once(ClaudeConfigDirSlot::Default)
-                .chain((0..3).map(|index| fixture.slot(index)))
-            {
-                assert_eq!(
-                    reads
-                        .iter()
-                        .filter(|service| **service == slot.service_name())
-                        .count(),
-                    1,
-                    "{label}: one keychain read per login per pass: {reads:?}"
-                );
+            if claude_credentials_in_keychain() {
+                for slot in std::iter::once(ClaudeConfigDirSlot::Default)
+                    .chain((0..3).map(|index| fixture.slot(index)))
+                {
+                    assert_eq!(
+                        reads
+                            .iter()
+                            .filter(|service| **service == slot.service_name())
+                            .count(),
+                        1,
+                        "{label}: one keychain read per login per pass: {reads:?}"
+                    );
+                }
+            } else {
+                // Off macOS each login comes from its native credentials
+                // file; the `security` on the search path never runs.
+                assert!(reads.is_empty(), "{label}: no keychain tool: {reads:?}");
             }
             let expired = expires_in <= TimeDuration::seconds(CLAUDE_ACCESS_EXPIRY_MARGIN_SECONDS);
             for index in 0..3 {
@@ -22095,6 +22185,64 @@ exit 44
         assert_only_version_probes(&fixture.spawns(), "takeover");
     }
 
+    /// The default login off macOS, end to end with no `security` on the
+    /// search path: `~/.claude/.credentials.json` (0600, Max) and
+    /// `~/.claude.json` (Max organization, 20x tier) give one status pass a
+    /// `max_20x` plan row for exactly that account and organization.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    #[serial]
+    fn default_home_plan_row_comes_from_the_native_credentials_file() {
+        let fixture = Phase0Fixture::new("native-default-plan", false);
+        fs::remove_file(fixture.root.join("bin").join("security")).expect("no keychain tool");
+        let home = fixture.root.join("home");
+        fs::write(
+            home.join(".claude.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "oauthAccount": {
+                    "accountUuid": DEFAULT_ACCOUNT.0,
+                    "organizationUuid": DEFAULT_ACCOUNT.1,
+                    "emailAddress": format!("{}@example.invalid", DEFAULT_ACCOUNT.0),
+                    "organizationType": "claude_max",
+                    "organizationRateLimitTier": "default_claude_max_20x"
+                }
+            }))
+            .expect("identity"),
+        )
+        .expect("write identity");
+        // Native file mode 0600 with `subscriptionType` "max".
+        fixture.item(&ClaudeConfigDirSlot::Default, TimeDuration::hours(3));
+        let native = home.join(".claude").join(".credentials.json");
+        assert_eq!(
+            fs::metadata(&native)
+                .expect("native file")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        let collection = fixture.collect();
+        let (account_hash, organization_hash) = Phase0Fixture::hashes(DEFAULT_ACCOUNT);
+        let rows: Vec<_> = collection
+            .source_health_snapshot
+            .plan_observations
+            .iter()
+            .filter(|row| row.account_identifier_hash.as_deref() == Some(account_hash.as_str()))
+            .collect();
+        assert!(!rows.is_empty(), "a plan row for the default login");
+        for row in rows {
+            assert_eq!(row.plan_type.as_deref(), Some("max_20x"), "{row:?}");
+            assert_eq!(
+                row.organization_identifier_hash.as_deref(),
+                Some(organization_hash.as_str()),
+                "{row:?}"
+            );
+        }
+        assert!(fixture.security_reads().is_empty());
+        assert_only_version_probes(&fixture.spawns(), "native-default-plan");
+    }
+
     /// An API-key-only installation (settings `apiKeyHelper`, no OAuth login)
     /// is still reported as signed in with the API-key method, not as a
     /// missing login.
@@ -22133,19 +22281,17 @@ exit 44
     fn api_key_or_bedrock_outranks_a_cleared_oauth_login() {
         let fixture = Phase0Fixture::new("api-key-over-cleared", false);
         let home = fixture.root.join("home");
-        fs::write(
-            fixture.items.join("Claude Code-credentials.json"),
-            serde_json::json!({
+        fixture.write_login(
+            &ClaudeConfigDirSlot::Default,
+            &serde_json::json!({
                 "claudeAiOauth": {
                     "accessToken": "",
                     "refreshToken": "",
                     "expiresAt": 0,
                     "scopes": ["user:inference"]
                 }
-            })
-            .to_string(),
-        )
-        .expect("cleared item");
+            }),
+        );
         for (settings, method) in [
             (r#"{"apiKeyHelper":"/usr/local/bin/print-key"}"#, "api_key"),
             (r#"{"env":{"CLAUDE_CODE_USE_BEDROCK":"1"}}"#, "bedrock"),
