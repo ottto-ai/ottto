@@ -145,6 +145,9 @@ pub(crate) struct Store {
 }
 
 impl Store {
+    pub(crate) fn sample_pager_writes(&self) {
+        super::sample_pager_writes(&self.conn, super::Event::HistoryPagerBytes);
+    }
     pub(crate) fn path(snapshots_dir: &Path) -> PathBuf {
         snapshots_dir.join(FILE_NAME)
     }
@@ -327,6 +330,12 @@ impl Store {
     #[cfg(test)]
     pub(crate) fn conn_for_test(&self) -> &Connection {
         &self.conn
+    }
+}
+
+impl Drop for Store {
+    fn drop(&mut self) {
+        self.sample_pager_writes();
     }
 }
 
