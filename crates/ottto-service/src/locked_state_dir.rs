@@ -15,6 +15,7 @@
 //! exclusive `flock` guard and the temp-then-rename writers. Each caller
 //! keeps its own lock order, transaction and error text.
 
+use crate::local_resource_diagnostics::cache_lifecycle::{add, Event};
 use crate::state_dir_lock::{StateDirLock, StateDirLockError};
 use anyhow::Context;
 use serde::Serialize;
@@ -127,6 +128,7 @@ pub(crate) fn write_json_atomic(path: &Path, value: &impl Serialize) {
     };
     let temp = path.with_extension("json.tmp");
     if fs::write(&temp, &payload).is_ok() {
+        add(Event::SharedCacheBytes, payload.len() as u64);
         let _ = fs::rename(&temp, path);
     }
 }
@@ -147,6 +149,7 @@ pub(crate) fn replace_json_cache(
         .with_context(|| format!("create {temp_label} temp {}", temp_path.display()))?;
     temp.write_all(payload)
         .with_context(|| format!("write {temp_label} temp {}", temp_path.display()))?;
+    add(Event::SharedCacheBytes, payload.len() as u64);
     temp.sync_all().ok();
     fs::rename(&temp_path, path)
         .with_context(|| format!("rename {cache_label} into place {}", path.display()))

@@ -348,6 +348,20 @@ terms do not allow it to train models on data sent to its API. Setting
 `~/Library/Application Support/Ottto/mcp_inventory/disabled` turns this off on
 the Mac; turning either setting off also stops it.
 
+Claude Code context read: while Claude is on for this Mac and unless the server
+has turned it off, about every six hours (30 minutes after a pass skipped near a sign-in
+expiry) the daemon runs `claude -p /context --no-session-persistence
+--output-format json` on Claude Code's default sign-in, in each of up to 12
+workspaces used in the last 14 days; `/context` is a local command that sends
+no prompt (Claude Code may still contact Anthropic while starting), no session
+is saved, and `--strict-mcp-config` keeps MCP servers from starting except in
+the most recently used workspace. Its upload includes the model, token totals per
+context category and, while Readable labels is on, the memory files, skills,
+custom agents and MCP tools it lists with their token counts, when the result
+changes (an unchanged result at most weekly); setting
+`OTTTO_CONTEXT_FOOTPRINT_HARVEST_DISABLED=1` or creating
+`~/Library/Application Support/Ottto/context_footprint/disabled` turns it off.
+
 Codex daily usage totals: this reader is off until you turn on **Compare with
 OpenAI's reported usage** in Ottto's web Settings > Data & privacy and this Mac
 confirms it. Approval covers one Ottto user on this Mac and every Codex account
@@ -369,6 +383,20 @@ uploaded, and no other ChatGPT endpoint is contacted. Turn it off in the same
 setting, exclude the account signed in to Codex's default sign-in there, or
 create `~/Library/Application Support/Ottto/codex-daily-aggregates-disabled` to
 stop reads on this Mac.
+
+Claude Code runs started by the daemon: while **Keep my Claude accounts signed
+in** is on (it is on until you turn it off), when a Claude login's access token
+is within five minutes of expiring or has expired, the daemon runs
+`claude -p /usage --no-session-persistence --strict-mcp-config` once for that
+login, pinned to that login's Claude configuration folder; it sends no prompt
+and saves no session, Claude Code only refreshes the sign-in and reads plan
+usage, and turning the setting off stops it. Verify (in the Ottto app, during
+setup, or `ottto verify`) runs `claude -p "Reply with exactly: ottto smoke
+test"` on Claude Code's default sign-in, with every tool disallowed and no
+session saved, never from 15 minutes before that login's access expiry until
+it is refreshed; while a verification stays failed, the daemon repeats it after
+2, 4, 8 and 16 minutes and then every 30 minutes, and after a sign-in failure
+it waits until the Claude sign-in changes.
 
 ## Readable Labels
 

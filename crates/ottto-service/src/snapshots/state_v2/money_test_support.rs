@@ -121,10 +121,19 @@ impl ColdSession {
             .join("snapshots/destinations")
             .join("a".repeat(64))
             .join(synthetic_file(source, ".json"));
+        Self::publish_at(index, &path, progress)
+    }
+    /// Publish at a real destination's checkpoint name for lifecycle fixtures.
+    pub(crate) fn publish_at(index: &ScanIndex, path: &Path, progress: &[u8]) -> (Self, ScanIndex) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let cold = publish(index, &path, progress);
+        let cold = publish(index, path, progress);
         assert!(cold.v2().persistence_v2.is_some(), "a live session");
-        (Self { path }, cold)
+        (
+            Self {
+                path: path.to_owned(),
+            },
+            cold,
+        )
     }
     /// The published index path.
     pub(crate) fn path(&self) -> &Path {

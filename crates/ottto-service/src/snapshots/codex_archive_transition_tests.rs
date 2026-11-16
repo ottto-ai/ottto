@@ -2590,8 +2590,7 @@ fn different_stem_compressed_member_keeps_plain_singleton_publication() {
 /// it does not keep, so the next page reads that file: a new rollout Full, an
 /// appended one by Tail from its kept head. [money] Two accounts, a side call,
 /// an evidence gap and (appended) a mid-session switch: the owed page's bodies
-/// and placement equal a cold Full's. The Claude rows are
-/// `shed_save_keeps_held_custody_and_drops_unkept_heads` and
+/// and placement equal a cold Full's. The appended Claude row is
 /// `shed_save_keeps_an_appended_turn_owed_once`.
 #[test]
 fn shed_save_commits_heads_only_for_kept_entries() {

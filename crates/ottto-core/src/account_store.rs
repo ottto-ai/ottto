@@ -126,7 +126,7 @@ pub struct DeviceCredentialContinuity {
     pub snapshot_namespace: Option<SnapshotNamespaceAlias>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct LocalCredentialOwner {
     pub user_id: String,
     pub organization_id: String,
@@ -139,6 +139,58 @@ pub struct LocalCredentialOwner {
 pub struct SnapshotNamespaceAlias {
     pub namespace: String,
     pub secret_commitment_sha256: String,
+}
+
+/// Local-only destination history. This is not credential authority; a fresh
+/// claim and the live installation must authorize its use. Never log its keys.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct OwnerSnapshotKey {
+    pub owner: LocalCredentialOwner,
+    pub machine_id: String,
+    pub installation_id: String,
+    pub account_scope: String,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerSnapshotNamespace {
+    pub key: OwnerSnapshotKey,
+    pub namespace: String,
+}
+
+impl std::fmt::Debug for OwnerSnapshotNamespace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OwnerSnapshotNamespace([redacted])")
+    }
+}
+
+impl OwnerSnapshotNamespace {
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            [
+                &self.key.owner.user_id,
+                &self.key.owner.organization_id,
+                &self.key.owner.api_base_url,
+                &self.key.machine_id,
+                &self.key.installation_id,
+                &self.key.account_scope
+            ]
+            .iter()
+            .all(|v| !v.trim().is_empty())
+                && self.namespace.len() == 64
+                && self
+                    .namespace
+                    .bytes()
+                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+            "invalid owner snapshot history entry"
+        );
+        Ok(())
+    }
+}
+
+#[derive(PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerSnapshotHistory {
+    schema_version: u16,
+    entries: Vec<OwnerSnapshotNamespace>,
 }
 
 /// Exact non-secret authority inputs used to request a prepared relay-device
@@ -168,6 +220,10 @@ pub struct PendingDeviceCredentialRequestAuthority {
     /// claim is the prior owner's account on the same API and machine.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub canonical_snapshot_namespace: Option<String>,
+    /// Frozen incoming publication. History-bearing journals
+    /// use a newer schema so released validators cannot silently discard them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incoming_snapshot_namespace: Option<OwnerSnapshotNamespace>,
 }
 
 /// Non-secret half of a prepared relay-device credential. The candidate
@@ -416,6 +472,86 @@ macro_rules! json_file_store {
     };
 }
 
+fn default_owner_snapshot_history_path() -> PathBuf {
+    default_support_dir().join("owner-snapshot-namespaces.json")
+}
+
+json_file_store! {
+    /// Uncapped owner-only history. Its loader distinguishes missing from Unknown.
+    pub struct FileOwnerSnapshotNamespaceStore {
+        noun: "owner snapshot history",
+        read: BodyRead::Uncapped,
+        saves: OwnerSnapshotHistory,
+        default_path: default_owner_snapshot_history_path,
+    }
+}
+
+impl FileOwnerSnapshotNamespaceStore {
+    pub fn load(&self) -> Result<Vec<OwnerSnapshotNamespace>> {
+        use std::io::Read;
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let mut file = match options.open(&self.path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(_) => anyhow::bail!("open owner snapshot history"),
+        };
+        anyhow::ensure!(
+            file.metadata()?.is_file(),
+            "nonregular owner snapshot history"
+        );
+        let mut body = Vec::new();
+        file.read_to_end(&mut body)
+            .context("read owner snapshot history")?;
+        // Do not include serde errors: they can expose identity-bearing values.
+        let mut history: OwnerSnapshotHistory = serde_json::from_slice(&body)
+            .map_err(|_| anyhow::anyhow!("decode owner snapshot history"))?;
+        anyhow::ensure!(
+            history.schema_version == 1,
+            "unsupported owner snapshot history"
+        );
+        history.entries.sort_by(|a, b| a.key.cmp(&b.key));
+        for entry in &history.entries {
+            entry.validate()?;
+        }
+        anyhow::ensure!(
+            history.entries.windows(2).all(|w| w[0].key != w[1].key),
+            "duplicate owner snapshot history key"
+        );
+        Ok(history.entries)
+    }
+
+    /// Caller owns the identity lifecycle lock. Read before writing so Unknown
+    /// can never be overwritten as an empty history. Incoming wins over seed.
+    pub fn upsert(&self, entries: &[OwnerSnapshotNamespace]) -> Result<()> {
+        let mut current = self.load()?;
+        for entry in entries {
+            entry.validate()?;
+            current.retain(|old| old.key != entry.key);
+            current.push(entry.clone());
+        }
+        current.sort_by(|a, b| a.key.cmp(&b.key));
+        let expected = OwnerSnapshotHistory {
+            schema_version: 1,
+            entries: current,
+        };
+        self.save(&expected)?;
+        fs::File::open(self.path.parent().context("owner history parent")?)?
+            .sync_all()
+            .context("sync owner snapshot history directory")?;
+        anyhow::ensure!(
+            self.load()? == expected.entries,
+            "verify owner snapshot history"
+        );
+        Ok(())
+    }
+}
+
 json_file_store! {
     pub struct FileAccountStore {
         noun: "account binding",
@@ -637,6 +773,108 @@ mod tests {
         LocalAccountOrganization, LocalAccountState, LocalAccountUser, StableMessage,
     };
 
+    fn owner_history_row(user: &str) -> OwnerSnapshotNamespace {
+        OwnerSnapshotNamespace {
+            key: OwnerSnapshotKey {
+                owner: LocalCredentialOwner {
+                    user_id: user.into(),
+                    organization_id: "org".into(),
+                    api_base_url: DEFAULT_API_BASE_URL.into(),
+                },
+                machine_id: "machine".into(),
+                installation_id: "install".into(),
+                account_scope: "scope".into(),
+            },
+            namespace: "a".repeat(64),
+        }
+    }
+
+    #[test]
+    fn owner_history_is_exact_uncapped_and_replaces_only_its_key() {
+        let dir = std::env::temp_dir().join(format!(
+            "ottto-owner-history-{}",
+            crate::generate_control_token().unwrap()
+        ));
+        let path = dir.join("history.json");
+        let store = FileOwnerSnapshotNamespaceStore::new(&path);
+        assert!(store.load().unwrap().is_empty());
+        let rows: Vec<_> = (0..800)
+            .map(|i| owner_history_row(&format!("user-{i}")))
+            .collect();
+        store.upsert(&rows).unwrap();
+        assert!(fs::metadata(&path).unwrap().len() > 64 * 1024);
+        assert_eq!(store.load().unwrap().len(), 800);
+        let mut updated = rows[0].clone();
+        updated.namespace = "b".repeat(64);
+        store.upsert(std::slice::from_ref(&updated)).unwrap();
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.len(), 800);
+        assert!(loaded.contains(&updated));
+        // Distinct organization, installation, API path and OS scope never alias.
+        for i in 0..5 {
+            let mut row = updated.clone();
+            match i {
+                0 => row.key.owner.organization_id += "-other",
+                1 => row.key.installation_id += "-other",
+                2 => row.key.owner.api_base_url += "/other",
+                3 => row.key.account_scope += "-other",
+                _ => row.key.machine_id += "-other",
+            }
+            store.upsert(&[row]).unwrap();
+        }
+        assert_eq!(store.load().unwrap().len(), 805);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn owner_history_unknown_is_never_overwritten_as_empty() {
+        let dir = std::env::temp_dir().join(format!(
+            "ottto-owner-unknown-{}",
+            crate::generate_control_token().unwrap()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.json");
+        let store = FileOwnerSnapshotNamespaceStore::new(&path);
+        let row = owner_history_row("user");
+        let bad = [
+            b"{".to_vec(),
+            serde_json::to_vec(&serde_json::json!({"schema_version":2,"entries":[]})).unwrap(),
+            serde_json::to_vec(
+                &serde_json::json!({"schema_version":1,"entries":[row.clone(),row.clone()]}),
+            )
+            .unwrap(),
+        ];
+        for body in bad {
+            fs::write(&path, &body).unwrap();
+            assert!(store.load().is_err());
+            assert!(store.upsert(std::slice::from_ref(&row)).is_err());
+            assert_eq!(fs::read(&path).unwrap(), body);
+        }
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(store.load().is_err());
+        fs::remove_dir(&path).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(dir.join("absent"), &path).unwrap();
+            assert!(store.load().is_err(), "dangling symlink is Unknown");
+            assert!(store.upsert(&[row]).is_err());
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn missing_account_loads_as_not_connected() {
         let store = FileAccountStore::new(temp_path("missing"));
@@ -848,6 +1086,7 @@ mod tests {
                 prior_device_sources: Some(vec!["codex".to_string()]),
                 prior_secret_commitment_sha256: Some(format!("sha256:{}", "c".repeat(64))),
                 canonical_snapshot_namespace: Some("d".repeat(64)),
+                incoming_snapshot_namespace: None,
             }),
             device: LocalDeviceBinding {
                 device_id: "device-next".to_string(),

@@ -283,16 +283,19 @@ pub(crate) fn observe_codex_quiet_with_bytes<T>(run: impl FnOnce() -> (T, u64)) 
     let samples = START_IDENTITY_SAMPLE_FOR_TEST.with(Cell::get);
     let activity = codex_zst_refusal_tests::activity();
     let (value, consumed) = run();
-    let measured = (samples == START_IDENTITY_SAMPLE_FOR_TEST.with(Cell::get)
-        && activity == codex_zst_refusal_tests::activity()
-        && consumed == 0)
-        .then_some(0);
+    let after = START_IDENTITY_SAMPLE_FOR_TEST.with(Cell::get);
+    let anchor_bytes = after.1.checked_sub(samples.1);
+    // Identity samples have their own byte counter. Report those bytes even
+    // when nonzero: the zero-byte assertion still rejects them, while the
+    // explicit anchor-window assertion can check its independently bounded
+    // allowance. Decoder activity or parser bytes remain unmeasured/refused.
+    let measured = (activity == codex_zst_refusal_tests::activity() && consumed == 0).then_some(0);
     (
         value,
         IoBytes {
             consumed,
             cheap_checks: measured,
-            anchor_reads: measured,
+            anchor_reads: measured.and(anchor_bytes),
             other_reads: measured,
             ..Default::default()
         },

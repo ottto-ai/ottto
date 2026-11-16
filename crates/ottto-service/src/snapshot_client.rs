@@ -1,6 +1,6 @@
 use crate::snapshots::{
     snapshot_upload_body_witness, snapshot_upload_body_witness_version, SnapshotBatchRequest,
-    SnapshotSource, SnapshotSourceManifest,
+    SnapshotItem, SnapshotSource, SnapshotSourceManifest,
     SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_SESSION_ACCOUNT_VERSION,
     SNAPSHOT_BODY_WITNESS_ENVELOPE_SESSION_ACCOUNT_VERSION, SNAPSHOT_ENTITY_ACK_CONTRACT,
 };
@@ -14,6 +14,7 @@ use ottto_core::{
 use ottto_protocol::{AgentStatusSnapshot, LocalMachineHealthV1, MachineRuntimeHeartbeatV1};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::borrow::Borrow;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1106,7 +1107,10 @@ impl SnapshotBatchResponse {
     /// request body carried, recomputed with the same envelope function the
     /// serializer used. A later upload answers the challenge through the
     /// backend's existing rescan handshake. Call after ACK validation.
-    pub(crate) fn bind_conflict_rescans(&mut self, request: &SnapshotBatchRequest) {
+    pub(crate) fn bind_conflict_rescans(
+        &mut self,
+        request: &SnapshotBatchRequest<impl Borrow<SnapshotItem>>,
+    ) {
         let Some(source) = crate::snapshots::snapshot_source_from_api_slug(&request.source) else {
             return;
         };
@@ -1114,7 +1118,7 @@ impl SnapshotBatchResponse {
             if !valid_snapshot_head_token(reference.head_challenge.as_deref()) {
                 continue;
             }
-            let Some(item) = request.snapshots.iter().find(|item| {
+            let Some(item) = request.items().find(|item| {
                 item.source_session_id == reference.source_session_id
                     && item.snapshot_fingerprint == reference.snapshot_fingerprint
             }) else {
@@ -1134,13 +1138,16 @@ impl SnapshotBatchResponse {
 
     /// Reject malformed, short, duplicated, foreign, overlapping, or partial
     /// ACKs before any local checkpoint can advance.
-    pub fn validate_entity_ack(&self, request: &SnapshotBatchRequest) -> Result<()> {
+    pub fn validate_entity_ack(
+        &self,
+        request: &SnapshotBatchRequest<impl Borrow<SnapshotItem>>,
+    ) -> Result<()> {
         self.validate_entity_ack_with_head_cas(request, false)
     }
 
     pub fn validate_entity_ack_with_head_cas(
         &self,
-        request: &SnapshotBatchRequest,
+        request: &SnapshotBatchRequest<impl Borrow<SnapshotItem>>,
         enforce_head_cas: bool,
     ) -> Result<()> {
         self.validate_entity_ack_with_head_cas_inner(request, enforce_head_cas)
@@ -1155,10 +1162,10 @@ impl SnapshotBatchResponse {
 
     fn validate_entity_ack_with_head_cas_inner(
         &self,
-        request: &SnapshotBatchRequest,
+        request: &SnapshotBatchRequest<impl Borrow<SnapshotItem>>,
         enforce_head_cas: bool,
     ) -> Result<()> {
-        let enforce_head_cas = enforce_head_cas || request.snapshots.iter().any(declares_head_cas);
+        let enforce_head_cas = enforce_head_cas || request.items().any(declares_head_cas);
         if self.disabled {
             if self.accepted != 0
                 || !self.accepted_entities.is_empty()
@@ -1177,7 +1184,7 @@ impl SnapshotBatchResponse {
                 if self.accepted != request.snapshots.len() as u64 {
                     return Err(anyhow!("legacy snapshot response accepted count mismatch"));
                 }
-                if request.snapshots.iter().any(|item| {
+                if request.items().any(|item| {
                     crate::snapshots::claude_request_money::is_request_owned_literal(item)
                         || item.session_account_evidence.is_some()
                         || item.cache_observations.is_some()
@@ -1195,7 +1202,7 @@ impl SnapshotBatchResponse {
                 ));
             }
         }
-        self.validate_entity_ack_identities(request.snapshots.iter().map(|item| {
+        self.validate_entity_ack_identities(request.items().map(|item| {
             (
                 item.source_session_id.as_str(),
                 item.snapshot_fingerprint.as_str(),
@@ -1208,7 +1215,10 @@ impl SnapshotBatchResponse {
 
     /// A retryable hold names a request-owned literal body of a batch that
     /// declared `usage_decrease_hold_ack:v1`; any other one is foreign.
-    fn validate_usage_decrease_holds(&self, request: &SnapshotBatchRequest) -> Result<()> {
+    fn validate_usage_decrease_holds(
+        &self,
+        request: &SnapshotBatchRequest<impl Borrow<SnapshotItem>>,
+    ) -> Result<()> {
         let declared = crate::snapshots::declares_usage_decrease_hold_ack(request);
         for rejection in self
             .rejected_entities
@@ -1216,7 +1226,7 @@ impl SnapshotBatchResponse {
             .filter(|r| !r.permanent && r.usage_decrease_hold())
         {
             let held_literal = declared
-                && request.snapshots.iter().any(|item| {
+                && request.items().any(|item| {
                     item.source_session_id == rejection.source_session_id
                         && item.snapshot_fingerprint == rejection.snapshot_fingerprint
                         && crate::snapshots::claude_request_money::is_request_owned_literal(item)
@@ -1271,10 +1281,13 @@ impl SnapshotBatchResponse {
         Ok(())
     }
 
-    fn validate_body_witness_ack(&self, request: &SnapshotBatchRequest) -> Result<()> {
+    fn validate_body_witness_ack(
+        &self,
+        request: &SnapshotBatchRequest<impl Borrow<SnapshotItem>>,
+    ) -> Result<()> {
         let mut expected = std::collections::BTreeMap::new();
         let mut answered = std::collections::BTreeSet::new();
-        for item in &request.snapshots {
+        for item in request.items() {
             let Some(public_version) = snapshot_ack_body_witness_version(item)? else {
                 continue;
             };
@@ -1355,8 +1368,7 @@ impl SnapshotBatchResponse {
         );
         Err(anyhow::Error::new(RefusedSnapshotIndexes(
             request
-                .snapshots
-                .iter()
+                .items()
                 .enumerate()
                 .filter(|(_, item)| {
                     named.contains(&(
@@ -2523,7 +2535,7 @@ impl SnapshotApiClient {
     pub fn upload_batch(
         &self,
         relay_token: &str,
-        request: &SnapshotBatchRequest,
+        request: &SnapshotBatchRequest<impl Borrow<SnapshotItem>>,
         enforce_head_cas: bool,
     ) -> Result<SnapshotBatchResponse> {
         self.upload_batch_with_item_cap(
@@ -2538,7 +2550,7 @@ impl SnapshotApiClient {
     pub(crate) fn upload_batch_with_item_cap(
         &self,
         relay_token: &str,
-        request: &SnapshotBatchRequest,
+        request: &SnapshotBatchRequest<impl Borrow<SnapshotItem>>,
         enforce_head_cas: bool,
         item_cap: usize,
     ) -> Result<SnapshotBatchResponse> {
@@ -2550,7 +2562,7 @@ impl SnapshotApiClient {
     pub(crate) fn upload_batch_bounded(
         &self,
         relay_token: &str,
-        request: &SnapshotBatchRequest,
+        request: &SnapshotBatchRequest<impl Borrow<SnapshotItem>>,
         enforce_head_cas: bool,
         budget: &mut crate::snapshot_retry::RetryBudget,
         validate: &mut dyn FnMut() -> Result<()>,
@@ -2570,7 +2582,7 @@ impl SnapshotApiClient {
     fn upload_batch_inner(
         &self,
         relay_token: &str,
-        request: &SnapshotBatchRequest,
+        request: &SnapshotBatchRequest<impl Borrow<SnapshotItem>>,
         enforce_head_cas: bool,
         item_cap: usize,
         mut retry: Option<(
@@ -2579,7 +2591,7 @@ impl SnapshotApiClient {
         )>,
     ) -> Result<SnapshotBatchResponse> {
         let mut resources = crate::local_resource_diagnostics::UploadCall::start(&request.source);
-        let enforce_head_cas = enforce_head_cas || request.snapshots.iter().any(declares_head_cas);
+        let enforce_head_cas = enforce_head_cas || request.items().any(declares_head_cas);
         let body = if retry.is_some() && enforce_head_cas {
             crate::snapshot_retry::encode_json(
                 &request.wire_with_head_cas(),
@@ -2605,8 +2617,7 @@ impl SnapshotApiClient {
         let reasons = crate::local_resource_diagnostics::change_reason::request_header(
             &request.source,
             request
-                .snapshots
-                .iter()
+                .items()
                 .map(|item| item.snapshot_fingerprint.as_str()),
         );
         let mut request_builder = || -> Result<ureq::Request> {
@@ -2785,7 +2796,7 @@ impl SnapshotApiClient {
 
     fn record_composition_start_verdicts(
         &self,
-        request: &SnapshotBatchRequest,
+        request: &SnapshotBatchRequest<impl Borrow<SnapshotItem>>,
         response: &SnapshotBatchResponse,
         enforce_head_cas: bool,
     ) {
@@ -2821,7 +2832,7 @@ impl SnapshotApiClient {
                 )
             })
             .collect();
-        let items = request.snapshots.iter().filter(|item| {
+        let items = request.items().filter(|item| {
             response.entity_ack_contract.is_none()
                 || acknowledged.contains(&(
                     item.source_session_id.as_str(),
@@ -2845,7 +2856,7 @@ impl SnapshotApiClient {
 
     fn record_batch_success(
         &self,
-        request: &SnapshotBatchRequest,
+        request: &SnapshotBatchRequest<impl Borrow<SnapshotItem>>,
         status: u16,
         server_request_id: Option<&str>,
         response: &SnapshotBatchResponse,
@@ -2885,7 +2896,7 @@ impl SnapshotApiClient {
 
     fn record_batch_http_failure(
         &self,
-        request: &SnapshotBatchRequest,
+        request: &SnapshotBatchRequest<impl Borrow<SnapshotItem>>,
         outcome: ottto_protocol::UploadReceiptOutcomeV1,
         status: u16,
         server_request_id: Option<&str>,
@@ -2910,7 +2921,10 @@ impl SnapshotApiClient {
         }
     }
 
-    fn record_batch_transport_error(&self, request: &SnapshotBatchRequest) {
+    fn record_batch_transport_error(
+        &self,
+        request: &SnapshotBatchRequest<impl Borrow<SnapshotItem>>,
+    ) {
         let Some(state_dir) = self.receipt_state_dir.as_deref() else {
             return;
         };
@@ -4190,7 +4204,7 @@ mod tests {
             write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
             request
         });
-        let request = SnapshotBatchRequest {
+        let request: SnapshotBatchRequest = SnapshotBatchRequest {
             schema_version: SNAPSHOT_SCHEMA_VERSION,
             source: "codex".into(),
             machine_id: "synthetic-machine".into(),
@@ -5395,7 +5409,7 @@ mod tests {
             }
         });
 
-        let request = SnapshotBatchRequest {
+        let request: SnapshotBatchRequest = SnapshotBatchRequest {
             schema_version: SNAPSHOT_SCHEMA_VERSION,
             source: "codex".to_string(),
             machine_id: "machine".to_string(),
@@ -5513,7 +5527,7 @@ mod tests {
 
     #[test]
     fn disabled_batch_response_is_not_mistaken_for_a_partial_ack() {
-        let request = SnapshotBatchRequest {
+        let request: SnapshotBatchRequest = SnapshotBatchRequest {
             schema_version: SNAPSHOT_SCHEMA_VERSION,
             source: "codex".to_string(),
             machine_id: "machine".to_string(),
@@ -5537,7 +5551,7 @@ mod tests {
 
     #[test]
     fn unknown_entity_ack_contract_never_falls_back_to_legacy_count_only_ack() {
-        let request = SnapshotBatchRequest {
+        let request: SnapshotBatchRequest = SnapshotBatchRequest {
             schema_version: SNAPSHOT_SCHEMA_VERSION,
             source: "codex".to_string(),
             machine_id: "machine".to_string(),

@@ -483,7 +483,7 @@ fn hydrate_image(
     };
     // Digest the exact persisted image: a save then also persists whatever
     // normalization changes.
-    let digests = kinds::baseline(&index, &mut cx)?;
+    let digests = import::baseline(db, &index, &mut cx)?;
     telemetry::hydrate_checkpoint("hydrate_after_baseline", digests.rows.len(), Some(&cx));
     normalize_hydrated(&mut index, source).context("state_v2_open_normalize")?;
     Ok(Some((index, cx, digests, stamp)))
@@ -590,7 +590,7 @@ pub(in super::super) fn after_v1_locked(path: &Path, index: &mut ScanIndex) -> R
         let stamp = db.stamp()?;
         ensure!(stamp.0 == identity.fence_generation, Hold::DbUnavailable);
         index.generation = stamp.0;
-        let digests = kinds::baseline(index, &mut cx)?;
+        let digests = import::baseline(&mut db, index, &mut cx)?;
         index.v2_mut().persistence_v2 = Some(active(db, cx, identity, path, stamp));
         telemetry::pass_start();
         register(state, index)?;
@@ -622,14 +622,14 @@ pub(in super::super) fn save_locked(
     let expected = claim_generation.unwrap_or(index.generation);
     let result = with_save_session(path, runtime, expected, |state, session, id| {
         let previous = match state.save_digests.take() {
-            Some(previous) => previous,
-            None => {
+            Some(previous) if !previous.links_only => previous,
+            _ => {
                 // A pass may save more than once (including claim-only saves).
                 // The preceding save dropped its baseline; read committed state.
                 ensure!(session.db.stamp()? == session.stamp, Hold::ReloadRequired);
                 let (previous, mut cx) = import::hydrate_context(&mut session.db)?;
                 ensure!(session.db.stamp()? == session.stamp, Hold::ReloadRequired);
-                let digests = kinds::baseline(&previous, &mut cx)?;
+                let digests = import::baseline(&mut session.db, &previous, &mut cx)?;
                 session.cx = cx;
                 digests
             }
@@ -650,8 +650,15 @@ pub(in super::super) fn save_locked(
             let digests = saved?;
             session.stamp = session.db.stamp()?;
             state.saved_page(session.db.save_over_target(), claim_only);
-            if !claim_only && !session.reload {
-                state.save_digests = Some(digests);
+            // A claim-only save keeps its carrier links for decide; row
+            // diffs re-read the committed rows (it writes no tail stage, so
+            // committed heads still match those links).
+            if !session.reload {
+                state.save_digests = Some(if claim_only {
+                    digests.links_only()
+                } else {
+                    digests
+                });
             }
             Ok(true)
         })

@@ -23,9 +23,10 @@ pub use account_store::{
     default_prior_device_path, default_sources_dir, default_support_dir, hashed_hardware_id,
     is_hashed_hardware_id, is_persistent_installation_id, is_persistent_machine_id,
     prefixed_sha256_id, source_state_file_name, DeviceCredentialContinuity, FileAccountStore,
-    FileConnectionStore, FileDeviceStore, FileMachineStore, FilePendingDeviceCredentialStore,
-    FileSourceStateStore, LocalConnectionBinding, LocalCredentialOwner, LocalDeviceBinding,
-    LocalDeviceCredentialBinding, LocalDeviceEnvelope, LocalMachineBinding, LocalSourceState,
+    FileConnectionStore, FileDeviceStore, FileMachineStore, FileOwnerSnapshotNamespaceStore,
+    FilePendingDeviceCredentialStore, FileSourceStateStore, LocalConnectionBinding,
+    LocalCredentialOwner, LocalDeviceBinding, LocalDeviceCredentialBinding, LocalDeviceEnvelope,
+    LocalMachineBinding, LocalSourceState, OwnerSnapshotKey, OwnerSnapshotNamespace,
     PendingClaimCredentialCommit, PendingDeviceCredentialPreparation,
     PendingDeviceCredentialRequestAuthority, SnapshotNamespaceAlias,
 };

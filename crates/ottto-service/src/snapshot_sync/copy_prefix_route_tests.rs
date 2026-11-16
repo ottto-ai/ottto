@@ -143,6 +143,51 @@ fn shared(ledger: &Ledger) -> (u64, u64) {
     (holder, copy)
 }
 
+/// A one-slot census page can visit an unchanged member before the marked
+/// file. Preserve that budget and settle empty pages until the target is read.
+#[track_caller]
+fn next_body_page(
+    c: &Corpus,
+    mut prior: ScanIndex,
+    session: &str,
+    progress: &mut SnapshotUploadProgress,
+) -> Page {
+    let scanner = E2ScanFixture::capturing_identity();
+    for attempt in 0..4 {
+        let mut page = c.raw(&scanner, prior.clone(), 1, false, &[]);
+        page.enrich_with(c, Some(&mut progress.accepted_identity_buckets));
+        if body(&page, session).is_some() {
+            return page;
+        }
+        // A visited unchanged member can still have a pre-finalize body.
+        // Apply the normal no-op suppression before calling it an empty slot.
+        page.finish();
+        assert!(
+            page.scan.snapshots.is_empty(),
+            "a deferred census slot sends nothing: target {session}, attempt {attempt}, sent {:?}",
+            sent_bodies(&page)
+        );
+        prior = settle(c, &prior, page, progress);
+    }
+    panic!("the marked file must be selected after the fixture's census members");
+}
+
+/// Failure detail for the oracles: each sent body's session, request count and
+/// declared removals.
+fn sent_bodies(page: &Page) -> Vec<(&str, u64, Option<u64>)> {
+    page.scan
+        .snapshots
+        .iter()
+        .map(|s| {
+            (
+                s.source_session_id.as_str(),
+                s.request_count,
+                s.removed_request_count,
+            )
+        })
+        .collect()
+}
+
 /// Deliver a page as `deliver` does; every exact-ACKed body replaces its
 /// session's ledger entry. Returns the POST count.
 fn deliver_into(page: &mut Page, ledger: &mut Ledger) -> usize {
@@ -169,20 +214,6 @@ fn deliver_into(page: &mut Page, ledger: &mut Ledger) -> usize {
     let acks = std::mem::take(&mut progress.fresh_context_body_acks);
     accept_upload_context_acks_for_test(&mut page.index, &page.scan.snapshots, &acks);
     sent.len()
-}
-
-/// #1253 at ACK granularity: a copy's prefix removal is decided only on
-/// holder acceptance already ACKed on an EARLIER page (`before`, the ledger
-/// before this page's POSTs), never on the page's own pending holder POST.
-fn assert_removal_follows_acceptance(page: usize, removed: bool, before: &Ledger) {
-    if removed {
-        assert_eq!(
-            shared(before).0,
-            2,
-            "page {page}: the copy removed its prefix before the holder's body \
-             was accepted (ledger {before:?})"
-        );
-    }
 }
 
 /// The warm owner reads Full, is delivered as the service delivers every
@@ -396,19 +427,64 @@ fn copy_prefix_routes(arm: Settled) {
     );
 }
 
-/// [regress] A holder whose page was never delivered owes its upload-context
-/// proof, as a production file without a receipt does. That proof alone
-/// selects no read: the holder is never read, stays owed and never becomes an
-/// accepted origin (e2.rs `origin_accepted`). A copy's prefix goes only once
-/// its origin's body is accepted (#1253), so the new copy holds its copied
-/// prefix for the bounded prefix hold (copy_removals.rs `advance_hold`,
-/// `HOLD_PASSES` = 3): page 1 emits only its own turn, page 2 re-parses it
-/// from the pending hold (snapshots.rs `claude_copy_removals.pending`) with
-/// an identical body and no POST, page 3 expires the hold and emits the
-/// restored prefix once (e2.rs `defer_prefix`), and page 4 is quiet. The
-/// never-delivered holder's requests are counted once, in the copy.
+/// Complete a real native account-held page, including its CONTENT memo.
+/// Keep the request ids, but rewrite the last response without its model:
+/// a Tail append would inherit the preceding model instead.
+fn native_account_held_page(
+    c: &Corpus,
+    scanner: &E2ScanFixture,
+    prior: ScanIndex,
+    session: &str,
+) -> (Page, LocalHoldSettlement) {
+    crate::snapshots::e2_pipeline_scan_fixture::write_exclusions(&c.support, &[session]);
+    let path = c.root.join(file(session));
+    let mut rows = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    rows.last_mut().unwrap()["message"]
+        .as_object_mut()
+        .unwrap()
+        .remove("model");
+    std::fs::write(
+        &path,
+        rows.iter()
+            .map(|row| row.to_string() + "\n")
+            .collect::<String>(),
+    )
+    .unwrap();
+    input_clock(&path);
+    let mut saved = serde_json::to_value(&prior).unwrap();
+    let owner = crate::context_footprint::sha256_hex(&[
+        "session_owner:v1",
+        "e2-synthetic-machine",
+        session,
+    ]);
+    saved["session_account_bindings"][owner] =
+        json!({"account_identifier_hash":"a".repeat(64), "workspace_identifier_hash":null});
+    let mut bound: ScanIndex = serde_json::from_value(saved).unwrap();
+    crate::snapshots::e2_pipeline_scan_fixture::onto_route_for_test(&mut bound, &prior);
+    let mut page = c.raw(scanner, bound, 100, true, &[]);
+    page.enrich(c);
+    assert!(crate::snapshots::e2_pipeline_scan_fixture::explicitly_held(
+        &page.disposition,
+        session
+    ));
+    let holds = page.finish();
+    assert_eq!(
+        page.index.claude_account_deferred_hold_count(),
+        1,
+        "the unresolved native model must really hold the session"
+    );
+    assert!(body(&page, session).is_none(), "the held body cannot POST");
+    (page, holds)
+}
+
+/// [money] A locally held holder supplies no counted body. The copy sends
+/// its prefix once and remains quiet across restarts while the hold lasts.
 #[test]
-fn never_delivered_holder_is_never_read_and_the_copy_hold_expires_once() {
+fn never_delivered_holder_is_held_and_copy_counts_once() {
     if !supported("never_delivered_holder_reread_bound") {
         return;
     }
@@ -419,6 +495,21 @@ fn never_delivered_holder_is_never_read_and_the_copy_hold_expires_once() {
         let disk = Disk::new(&c);
         // Committed, never delivered: no receipt.
         let (scanner, mut prior) = warm_claude_undelivered(&c, &disk);
+        disk.begin(&scanner, SnapshotSource::ClaudeCode);
+        let (mut setup, _) = native_account_held_page(&c, &scanner, prior, ROOT);
+        assert!(upload_context_owed_for_test(&setup.index, &holder));
+        let mut setup_progress = e2_progress();
+        upload(&setup.scan.snapshots, &mut setup_progress, |_| {
+            panic!("the never-delivered holder must not POST during setup")
+        })
+        .0
+        .unwrap();
+        prior = disk.commit(&setup.cache, SnapshotSource::ClaudeCode, &mut setup.index);
+        assert_eq!(prior.claude_account_deferred_hold_count(), 1);
+        // Reload deliberately forgets the runtime destination. Reapply it,
+        // as raw does before a real pass, before asking whether proof is owed.
+        prior.activate_upload_context("e2-synthetic-destination".into());
+        assert!(upload_context_owed_for_test(&prior, &holder));
         let path = c.write_at(
             &file(COPY),
             &resumed(COPY, &[A, B, C]),
@@ -437,11 +528,6 @@ fn never_delivered_holder_is_never_read_and_the_copy_hold_expires_once() {
             reads.push(opened(&scanner, &holder));
             let copy = body(&p, COPY).map(|copy| (copy.request_count, copy.removed_request_count));
             copy_requests.push(copy.map(|(requests, _)| requests));
-            assert_removal_follows_acceptance(
-                page,
-                copy.is_some_and(|(_, removed)| removed.unwrap_or(0) > 0),
-                &ledger,
-            );
             posts.push(deliver_into(&mut p, &mut ledger));
             assert!(
                 upload_context_owed_for_test(&p.index, &holder),
@@ -452,8 +538,8 @@ fn never_delivered_holder_is_never_read_and_the_copy_hold_expires_once() {
         assert_eq!(reads, [false; 4], "the owed holder is never read");
         assert_eq!(
             (posts.as_slice(), copy_requests.as_slice()),
-            (&[1_usize, 0, 1, 0][..], &[Some(1), None, Some(3), None][..]),
-            "own turn, held, expired prefix once, quiet"
+            (&[1_usize, 0, 0, 0][..], &[Some(3), None, None, None][..]),
+            "prefix counted once, then quiet"
         );
         assert_eq!(
             shared(&ledger),
@@ -504,6 +590,7 @@ fn server_learned_head_is_not_an_accepted_origin() {
         ));
         let prior = disk.commit(&warm.cache, SnapshotSource::ClaudeCode, &mut warm.index);
 
+        crate::snapshots::e2_pipeline_scan_fixture::write_exclusions(&c.support, &[ROOT]);
         let path = c.write_at(
             &file(COPY),
             &resumed(COPY, &[A, B, C]),
@@ -516,9 +603,911 @@ fn server_learned_head_is_not_an_accepted_origin() {
         page.finish();
         let copy = body(&page, COPY).expect("the copy's own turn publishes");
         assert_eq!(
-            copy.request_count, 1,
-            "only its own turn, while the prefix waits"
+            copy.request_count, 3,
+            "the listed holder supplies no local ownership"
         );
         assert_eq!(copy.removed_request_count.unwrap_or(0), 0);
+    });
+}
+
+/// Drive each entity through the real uploader independently, checking the
+/// receiver's latest-body ledger after every ACK, then select and save exactly
+/// the index the production completion path keeps.
+#[track_caller]
+fn acknowledge_ordered(
+    c: &Corpus,
+    mut page: Page,
+    progress: &mut SnapshotUploadProgress,
+    ledger: &mut Ledger,
+    sessions: &[&str],
+    expected: &[(u64, u64)],
+) -> ScanIndex {
+    page.finish();
+    assert_eq!(sessions.len(), expected.len());
+    for (position, (&session, &shared_expected)) in sessions.iter().zip(expected).enumerate() {
+        let Some(item) = body(&page, session).cloned() else {
+            panic!(
+                "a scheduled body: {session} (position {position} of {sessions:?}), sent {:?}",
+                sent_bodies(&page)
+            );
+        };
+        let (status, _, _) = upload(std::slice::from_ref(&item), progress, |batch| {
+            let response = ack(batch)?;
+            assert_eq!(response.accepted_entities.len(), 1);
+            ledger.insert(
+                session.into(),
+                (item.request_count, item.removed_request_count.unwrap_or(0)),
+            );
+            assert_eq!(shared(ledger), shared_expected, "after {session} ACK");
+            Ok(response)
+        });
+        assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
+    }
+    let holds = LocalHoldSettlement::classify(
+        SnapshotSource::ClaudeCode,
+        &mut page.index,
+        &mut page.scan,
+        &page.disposition,
+    );
+    let mut selected = settle_completed_upload(page.index, &page.committed, progress, &holds);
+    settle_index_after_upload(&mut selected.index, &page.committed, progress);
+    accept_upload_context_acks_for_test(
+        &mut selected.index,
+        &page.scan.snapshots,
+        &progress.fresh_context_body_acks,
+    );
+    c.reload(&mut selected.index)
+}
+
+/// [money] The same locally decided bodies converge in both ACK orders. A
+/// copy found first sends its prefix once, then one smaller replacement after
+/// source discovery. Restart preserves that correction and the next pass is
+/// quiet. The route comparison includes accounts, hours and accepted shares.
+#[test]
+fn local_copy_ownership_ack_orders_and_copy_first_restart() {
+    for copy_first in [false, true] {
+        for reverse in [false, true] {
+            with_e2(|| {
+                let mut c = corpus("local-copy-ownership-orders");
+                if !copy_first {
+                    c.root(ROOT, &resumed(ROOT, &[A, B]));
+                }
+                let path = c.write_at(
+                    &file(COPY),
+                    &resumed(COPY, &[A, B, C]),
+                    "2026-08-02T07:03:00Z",
+                );
+                input_clock(&path);
+                let scanner = E2ScanFixture::capturing_identity();
+                let mut progress = e2_progress();
+                let mut ledger = Ledger::new();
+                let mut prior = ScanIndex::default();
+                if copy_first {
+                    let mut first = c.raw(&scanner, prior, 1, false, &[]);
+                    first.enrich(&c);
+                    assert_eq!(body(&first, COPY).unwrap().request_count, 3);
+                    prior = acknowledge_ordered(
+                        &c,
+                        first,
+                        &mut progress,
+                        &mut ledger,
+                        &[COPY],
+                        &[(0, 2)],
+                    );
+                    let holder = c.root(ROOT, &resumed(ROOT, &[A, B]));
+                    input_clock(&holder);
+                    let mut source = next_body_page(&c, prior, ROOT, &mut progress);
+                    source.finish();
+                    if reverse {
+                        // Retain the first one-file page while the next one
+                        // decides B from A's locally built body. Independent
+                        // entity delivery can ACK B before A reaches the server.
+                        // A provider progress write selects B's unchanged money
+                        // through the ordinary scanner, with no selector seam.
+                        append(&path, "\n");
+                        let mut correction = c.raw(&scanner, source.index.clone(), 1, false, &[]);
+                        assert_eq!(
+                            scanner.paths(),
+                            vec![path.clone()],
+                            "one file in the correction page"
+                        );
+                        correction.enrich(&c);
+                        correction.committed = source.committed;
+                        correction.scan.snapshots.extend(source.scan.snapshots);
+                        prior = acknowledge_ordered(
+                            &c,
+                            correction,
+                            &mut progress,
+                            &mut ledger,
+                            &[COPY, ROOT],
+                            &[(0, 0), (2, 0)],
+                        );
+                    } else {
+                        prior = acknowledge_ordered(
+                            &c,
+                            source,
+                            &mut progress,
+                            &mut ledger,
+                            &[ROOT],
+                            &[(2, 2)],
+                        );
+                        let correction = next_body_page(&c, prior, COPY, &mut progress);
+                        prior = acknowledge_ordered(
+                            &c,
+                            correction,
+                            &mut progress,
+                            &mut ledger,
+                            &[COPY],
+                            &[(2, 0)],
+                        );
+                    }
+                } else {
+                    let mut both = c.raw(&scanner, prior, 100, false, &[]);
+                    both.enrich(&c);
+                    assert_eq!(body(&both, COPY).unwrap().request_count, 1);
+                    prior = if reverse {
+                        acknowledge_ordered(
+                            &c,
+                            both,
+                            &mut progress,
+                            &mut ledger,
+                            &[COPY, ROOT],
+                            &[(0, 0), (2, 0)],
+                        )
+                    } else {
+                        acknowledge_ordered(
+                            &c,
+                            both,
+                            &mut progress,
+                            &mut ledger,
+                            &[ROOT, COPY],
+                            &[(2, 0), (2, 0)],
+                        )
+                    };
+                }
+                assert_eq!(shared(&ledger), (2, 0));
+                let mut followup =
+                    c.raw(&E2ScanFixture::capturing_identity(), prior, 100, false, &[]);
+                followup.enrich(&c);
+                assert!(followup
+                    .scan
+                    .snapshots
+                    .iter()
+                    .all(|item| item.source_session_id == COPY));
+                let sessions = if body(&followup, COPY).is_some() {
+                    vec![COPY]
+                } else {
+                    vec![]
+                };
+                prior = acknowledge_ordered(
+                    &c,
+                    followup,
+                    &mut progress,
+                    &mut ledger,
+                    &sessions,
+                    &vec![(2, 0); sessions.len()],
+                );
+                let mut quiet = c.raw(&E2ScanFixture::capturing_identity(), prior, 100, false, &[]);
+                quiet.enrich(&c);
+                quiet.finish();
+                assert!(quiet.scan.snapshots.is_empty());
+                assert_eq!(quiet.modes.0, 0);
+            });
+        }
+    }
+}
+
+fn refuse_original(items: &[SnapshotItem], progress: &mut SnapshotUploadProgress) {
+    let original = items
+        .iter()
+        .find(|item| item.source_session_id == ROOT)
+        .unwrap();
+    let (result, _, _) = upload(std::slice::from_ref(original), progress, |batch| {
+        let mut response = ack(batch)?;
+        response.accepted = 0;
+        response.sessions_reconciled = 0;
+        response.accepted_entities.clear();
+        response.rejected_entities = vec![serde_json::from_value(json!({
+            "source_session_id": ROOT, "snapshot_fingerprint": original.snapshot_fingerprint,
+            "reason": "accepted_log_stale_older_upload", "detail": "synthetic refusal",
+            "permanent": true, "occurrence_count": 1
+        }))
+        .unwrap()];
+        Ok(response)
+    });
+    assert!(matches!(
+        result.unwrap(),
+        ResumableUploadResult::Rejected { .. }
+    ));
+}
+
+/// [money] A provisional promise that fails cannot strand a reduced copy.
+/// A refusal of a newer original preserves its earlier accepted coverage.
+/// Progress may reach disk before the index; restart must still publish the
+/// dependent mark with the refusal. Deleting a holder preserves only accepted
+/// coverage. Every copy replacement is checked after its entity ACK.
+#[test]
+fn local_copy_refusal_deletion_and_progress_first_restart() {
+    for accepted_before in [false, true] {
+        for deleted in [false, true] {
+            with_e2(|| {
+                let mut c = corpus("local-copy-refusal-delete");
+                let holder = c.root(ROOT, &resumed(ROOT, &[A, B]));
+                let path = c.write_at(
+                    &file(COPY),
+                    &resumed(COPY, &[A, B, C]),
+                    "2026-08-02T07:03:00Z",
+                );
+                let scanner = E2ScanFixture::capturing_identity();
+                let mut progress = e2_progress();
+                let mut ledger = Ledger::new();
+                let mut page = c.raw(&scanner, ScanIndex::default(), 100, false, &[]);
+                page.enrich(&c);
+                page.finish();
+                let (status, _, _) = upload(
+                    std::slice::from_ref(body(&page, COPY).unwrap()),
+                    &mut progress,
+                    |batch| {
+                        let response = ack(batch)?;
+                        ledger.insert(
+                            COPY.into(),
+                            (
+                                batch[0].request_count,
+                                batch[0].removed_request_count.unwrap_or(0),
+                            ),
+                        );
+                        assert_eq!(shared(&ledger), (0, 0));
+                        Ok(response)
+                    },
+                );
+                assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
+                if accepted_before {
+                    let original = body(&page, ROOT).unwrap();
+                    upload(std::slice::from_ref(original), &mut progress, |batch| {
+                        let response = ack(batch)?;
+                        ledger.insert(ROOT.into(), (batch[0].request_count, 0));
+                        assert_eq!(shared(&ledger), (2, 0));
+                        Ok(response)
+                    })
+                    .0
+                    .unwrap();
+                    accept_upload_context_acks_for_test(
+                        &mut page.index,
+                        &page.scan.snapshots,
+                        &progress.fresh_context_body_acks,
+                    );
+                    // An exact accepted body is suppressed by the uploader.
+                    // Refuse a real newer revision while keeping that ACK.
+                    append(&holder, &resumed(ROOT, &[D]));
+                    let mut grown = c.raw(
+                        &scanner,
+                        page.index.clone(),
+                        100,
+                        false,
+                        std::slice::from_ref(&holder),
+                    );
+                    grown.enrich(&c);
+                    grown.finish();
+                    let newer = body(&grown, ROOT)
+                        .expect("the holder's newer body publishes")
+                        .clone();
+                    assert_ne!(
+                        newer.snapshot_fingerprint,
+                        body(&page, ROOT).unwrap().snapshot_fingerprint
+                    );
+                    page.index = grown.index;
+                    *page
+                        .scan
+                        .snapshots
+                        .iter_mut()
+                        .find(|item| item.source_session_id == ROOT)
+                        .unwrap() = newer;
+                }
+                // A later revision may be refused even after this body earned
+                // its durable file receipt. Neither refusal nor deletion erases it.
+                refuse_original(&page.scan.snapshots, &mut progress);
+                progress.save(&c.base.join("progress.json")).unwrap();
+                assert_eq!(shared(&ledger), (if accepted_before { 2 } else { 0 }, 0));
+                let holds = LocalHoldSettlement::classify(
+                    SnapshotSource::ClaudeCode,
+                    &mut page.index,
+                    &mut page.scan,
+                    &page.disposition,
+                );
+                let mut selected = settle_checkpointed_upload(
+                    page.index,
+                    &page.committed,
+                    &progress,
+                    &holds,
+                    true,
+                )
+                .index;
+                settle_index_after_upload(&mut selected, &page.committed, &progress);
+                accept_upload_context_acks_for_test(
+                    &mut selected,
+                    &page.scan.snapshots,
+                    &progress.fresh_context_body_acks,
+                );
+                let prior = c.reload(&mut selected);
+                if deleted {
+                    std::fs::remove_file(&holder).unwrap();
+                }
+                let mut correction = c.raw(
+                    &E2ScanFixture::capturing_identity(),
+                    prior,
+                    100,
+                    false,
+                    &[path],
+                );
+                correction.enrich(&c);
+                correction.finish();
+                if accepted_before {
+                    assert!(
+                        body(&correction, COPY).is_none(),
+                        "accepted ownership stays stable"
+                    );
+                    assert_eq!(shared(&ledger), (2, 0));
+                } else {
+                    let item =
+                        body(&correction, COPY).expect("restoration remains owed after reload");
+                    assert_eq!(
+                        (item.request_count, item.removed_request_count),
+                        (3, Some(0))
+                    );
+                    let prior = acknowledge_ordered(
+                        &c,
+                        correction,
+                        &mut progress,
+                        &mut ledger,
+                        &[COPY],
+                        &[(0, 2)],
+                    );
+                    let mut quiet =
+                        c.raw(&E2ScanFixture::capturing_identity(), prior, 100, false, &[]);
+                    quiet.enrich(&c);
+                    quiet.finish();
+                    assert!(body(&quiet, COPY).is_none());
+                }
+            });
+        }
+    }
+}
+
+/// [money] A previously accepted copied prefix is removed with its declared
+/// tokens and accepted identity shares. Distinct models/hours, two accounts,
+/// a switch, a side call and an evidence gap exercise placement as well as totals.
+#[test]
+fn copy_first_correction_preserves_native_money_and_placement() {
+    with_e2(|| {
+        let mut c = corpus("copy-first-placement");
+        let late = line_by(COPY, "e", "2026-08-02T08:09:10Z", 10, RESUME_WRITER)
+            .replace("claude-haiku-4-5", "claude-sonnet-4-5");
+        let path = c.write_at(
+            &file(COPY),
+            &(resumed(COPY, &[A, B, C, D]) + &late),
+            "2026-08-02T07:03:00Z",
+        );
+        input_clock(&path);
+        copy_evidence(&c, true);
+        let scanner = E2ScanFixture::capturing_identity();
+        let mut progress = e2_progress();
+        let mut accepted = BTreeMap::<String, SnapshotItem>::new();
+        let mut post = |page: &mut Page, progress: &mut SnapshotUploadProgress, expected: u64| {
+            page.finish();
+            let (status, _, _) = upload(&page.scan.snapshots, progress, |batch| {
+                let response = ack(batch)?;
+                for entity in &response.accepted_entities {
+                    let item = batch
+                        .iter()
+                        .find(|s| s.snapshot_fingerprint == entity.snapshot_fingerprint)
+                        .unwrap();
+                    accepted.insert(item.source_session_id.clone(), (*item).clone());
+                    assert_eq!(
+                        accepted.values().map(|s| s.request_count).sum::<u64>(),
+                        expected
+                    );
+                }
+                Ok(response)
+            });
+            assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
+        };
+        let mut first = c.raw(&scanner, ScanIndex::default(), 1, false, &[]);
+        first.enrich(&c);
+        post(&mut first, &mut progress, 6);
+        let mut prior = settle(&c, &ScanIndex::default(), first, &mut progress);
+        let holder = c.root(ROOT, &resumed(ROOT, &[A, B]));
+        input_clock(&holder);
+        let mut source = next_body_page(&c, prior, ROOT, &mut progress);
+        post(&mut source, &mut progress, 8);
+        let committed = source.committed.clone();
+        prior = settle(&c, &committed, source, &mut progress);
+        let mut correction = next_body_page(&c, prior.clone(), COPY, &mut progress);
+        correction.finish();
+        assert_eq!(
+            body(&correction, COPY).unwrap().removed_request_count,
+            Some(2)
+        );
+        let mut cold = c.raw(
+            &E2ScanFixture::capturing_identity(),
+            ScanIndex::default(),
+            100,
+            false,
+            &[],
+        );
+        cold.enrich(&c);
+        cold.finish();
+        let route = |page: &Page, mode| {
+            let item = body(page, COPY).unwrap();
+            let (status, wire, _) = upload(std::slice::from_ref(item), &mut e2_progress(), ack);
+            assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
+            RouteResult::emitted(
+                mode,
+                SnapshotSource::ClaudeCode,
+                wire,
+                std::slice::from_ref(item),
+            )
+        };
+        let control = route(&cold, Mode::ColdFull);
+        assert!(accounts(&control) >= 2);
+        money_oracle::assert_equivalent(&control, &route(&correction, Mode::Restart));
+        post(&mut correction, &mut progress, 6);
+        let committed = correction.committed.clone();
+        prior = settle(&c, &committed, correction, &mut progress);
+        let mut quiet = c.raw(&E2ScanFixture::capturing_identity(), prior, 100, false, &[]);
+        quiet.enrich(&c);
+        quiet.finish();
+        assert!(quiet.scan.snapshots.is_empty());
+        assert_eq!(quiet.modes.0, 0);
+    });
+}
+
+/// [money] A failed same-page holder's provisional groups cannot outlive its
+/// retry custody or local deletion. Its already accepted copy is re-offered
+/// with the prefix, even after restart.
+#[test]
+fn failed_same_page_holder_drops_provisional_groups_before_deletion() {
+    with_e2(|| {
+        let mut c = corpus("provisional-copy-holder");
+        let holder = c.root(ROOT, &resumed(ROOT, &[A, B]));
+        c.write_at(
+            &file(COPY),
+            &resumed(COPY, &[A, B, C]),
+            "2026-08-02T07:03:00Z",
+        );
+        let scanner = E2ScanFixture::capturing_identity();
+        let mut progress = e2_progress();
+        let mut ledger = Ledger::new();
+        let mut page = c.raw(&scanner, ScanIndex::default(), 100, false, &[]);
+        page.enrich(&c);
+        page.finish();
+        let copy = body(&page, COPY).unwrap();
+        upload(std::slice::from_ref(copy), &mut progress, |batch| {
+            let response = ack(batch)?;
+            ledger.insert(
+                COPY.into(),
+                (copy.request_count, copy.removed_request_count.unwrap_or(0)),
+            );
+            assert_eq!(shared(&ledger), (0, 0));
+            Ok(response)
+        })
+        .0
+        .unwrap();
+        let original = body(&page, ROOT).unwrap();
+        assert!(upload(std::slice::from_ref(original), &mut progress, |_| {
+            Err(anyhow!("synthetic transport outage"))
+        })
+        .0
+        .is_err());
+        progress.hold_outage_bodies(&page.scan.snapshots, u64::MAX);
+        progress.save(&c.base.join("progress.json")).unwrap();
+        let mut selected = page.index.committable_subset_for_upload(
+            &page.committed,
+            &progress.accepted_fingerprints,
+            &progress.quarantined_fingerprints,
+            &BTreeSet::new(),
+            false,
+        );
+        accept_upload_context_acks_for_test(
+            &mut selected,
+            &page.scan.snapshots,
+            &progress.fresh_context_body_acks,
+        );
+        let prior = c.reload(&mut selected);
+        let copy_key = crate::snapshots::claude_money_birth_store::location_key(
+            &c.root.join(file(COPY)).to_string_lossy(),
+        );
+        assert!(prior.claude_copy_removals.get(copy_key).is_empty());
+        assert!(prior.claude_copy_removals.pending(copy_key));
+        std::fs::remove_file(holder).unwrap();
+        let mut correction = c.raw(&E2ScanFixture::capturing_identity(), prior, 100, false, &[]);
+        correction.enrich(&c);
+        let _ = acknowledge_ordered(
+            &c,
+            correction,
+            &mut progress,
+            &mut ledger,
+            &[COPY],
+            &[(0, 2)],
+        );
+    });
+}
+
+/// [money] A copy consisting entirely of the shared prefix can replace a
+/// previously accepted nonzero body with a declared zero body.
+#[test]
+fn all_copy_body_replaces_previously_accepted_requests_with_zero() {
+    with_e2(|| {
+        let mut c = corpus("all-copy-local-owner");
+        c.write_at(&file(COPY), &resumed(COPY, &[A, B]), "2026-08-02T07:03:00Z");
+        let scanner = E2ScanFixture::capturing_identity();
+        let mut progress = e2_progress();
+        let old = ScanIndex::default();
+        let first = ready(&c, &scanner, old.clone(), 1, false);
+        assert_eq!(body(&first, COPY).unwrap().request_count, 2);
+        let mut prior = settle(&c, &old, first, &mut progress);
+        c.root(ROOT, &resumed(ROOT, &[A, B]));
+        let source = next_body_page(&c, prior, ROOT, &mut progress);
+        let committed = source.committed.clone();
+        prior = settle(&c, &committed, source, &mut progress);
+        let mut correction = next_body_page(&c, prior.clone(), COPY, &mut progress);
+        correction.finish();
+        let zero = body(&correction, COPY).expect("a zero replacement must reach the server");
+        assert_eq!(
+            (zero.request_count, zero.removed_request_count),
+            (0, Some(2))
+        );
+        assert_eq!(zero.removed_usage.as_ref().unwrap().input_tokens, 20);
+        let committed = correction.committed.clone();
+        prior = settle(&c, &committed, correction, &mut progress);
+        let quiet = ready(&c, &E2ScanFixture::capturing_identity(), prior, 100, false);
+        assert!(body(&quiet, COPY).is_none());
+    });
+}
+
+/// [money] A refused first holder leaves one fallback owner in an ordered
+/// chain, even when corrections are read one file per page and restarted.
+#[test]
+fn refused_origin_chain_converges_with_one_file_pages() {
+    with_e2(|| {
+        let mut c = corpus("local-copy-chain");
+        c.root(ROOT, &resumed(ROOT, &[A, B]));
+        c.write_at(
+            &file(COPY),
+            &resumed(COPY, &[A, B, C]),
+            "2026-08-02T07:03:00Z",
+        );
+        c.write_at(
+            &file(THIRD),
+            &resumed(THIRD, &[A, B, C, D]),
+            "2026-08-02T07:06:00Z",
+        );
+        let mut progress = e2_progress();
+        let mut ledger = Ledger::new();
+        let mut page = c.raw(
+            &E2ScanFixture::capturing_identity(),
+            ScanIndex::default(),
+            100,
+            false,
+            &[],
+        );
+        page.enrich(&c);
+        page.finish();
+        for session in [THIRD, COPY] {
+            let item = body(&page, session).unwrap();
+            upload(std::slice::from_ref(item), &mut progress, |batch| {
+                let response = ack(batch)?;
+                ledger.insert(
+                    session.into(),
+                    (item.request_count, item.removed_request_count.unwrap_or(0)),
+                );
+                assert_eq!(shared(&ledger), (0, 0));
+                assert_eq!(item.request_count, 1);
+                Ok(response)
+            })
+            .0
+            .unwrap();
+        }
+        refuse_original(&page.scan.snapshots, &mut progress);
+        let holds = LocalHoldSettlement::classify(
+            SnapshotSource::ClaudeCode,
+            &mut page.index,
+            &mut page.scan,
+            &page.disposition,
+        );
+        let mut selected =
+            settle_checkpointed_upload(page.index, &page.committed, &progress, &holds, true).index;
+        settle_index_after_upload(&mut selected, &page.committed, &progress);
+        accept_upload_context_acks_for_test(
+            &mut selected,
+            &page.scan.snapshots,
+            &progress.fresh_context_body_acks,
+        );
+        let mut prior = c.reload(&mut selected);
+        for _ in 0..3 {
+            let mut correction = c.raw(
+                &E2ScanFixture::capturing_identity(),
+                prior.clone(),
+                1,
+                false,
+                &[],
+            );
+            correction.enrich(&c);
+            correction.finish();
+            upload(&correction.scan.snapshots, &mut progress, |batch| {
+                let response = ack(batch)?;
+                for entity in &response.accepted_entities {
+                    let item = batch
+                        .iter()
+                        .find(|s| s.snapshot_fingerprint == entity.snapshot_fingerprint)
+                        .unwrap();
+                    assert_ne!(item.source_session_id, ROOT);
+                    ledger.insert(
+                        item.source_session_id.clone(),
+                        (item.request_count, item.removed_request_count.unwrap_or(0)),
+                    );
+                    assert_eq!(ledger[THIRD].0, 1);
+                    assert!(ledger.values().map(|(n, _)| *n).sum::<u64>() <= 4);
+                }
+                Ok(response)
+            })
+            .0
+            .unwrap();
+            prior = settle(&c, &prior, correction, &mut progress);
+        }
+        assert_eq!(ledger[COPY].0, 3);
+        assert_eq!(ledger[THIRD].0, 1);
+        assert_eq!(ledger.values().map(|(n, _)| *n).sum::<u64>(), 4);
+    });
+}
+
+/// [money] A real progress/index crash discards the refused page, its pending
+/// dependencies and the upload object. Recovery must republish B's correction
+/// mark from the old disk index and the durable refusal, then restore B once.
+#[test]
+fn refused_holder_mark_survives_progress_only_crash() {
+    with_e2(|| {
+        let mut c = corpus("copy-progress-only-crash");
+        c.root(ROOT, &resumed(ROOT, &[A, B]));
+        c.write_at(
+            &file(COPY),
+            &resumed(COPY, &[A, B, C]),
+            "2026-08-02T07:03:00Z",
+        );
+        let index_path = c.base.join("scan-index.json");
+        ScanIndex::default().save(&index_path).unwrap();
+        let mut ledger = Ledger::new();
+        let progress_path = c.base.join("progress.json");
+        {
+            let scanner = E2ScanFixture::capturing_identity();
+            let mut page = c.raw(
+                &scanner,
+                ScanIndex::load(&index_path).unwrap(),
+                100,
+                false,
+                &[],
+            );
+            page.enrich(&c);
+            page.finish();
+            let mut progress = e2_progress();
+            let copy = body(&page, COPY).unwrap();
+            upload(std::slice::from_ref(copy), &mut progress, |batch| {
+                let response = ack(batch)?;
+                ledger.insert(
+                    COPY.into(),
+                    (
+                        batch[0].request_count,
+                        batch[0].removed_request_count.unwrap_or(0),
+                    ),
+                );
+                assert_eq!(shared(&ledger), (0, 0));
+                Ok(response)
+            })
+            .0
+            .unwrap();
+            refuse_original(&page.scan.snapshots, &mut progress);
+            progress.save(&progress_path).unwrap();
+            // Crash here: page, committed baseline, scanner and progress drop.
+            // No index save or settlement occurs after the progress publication.
+        }
+        let template = e2_progress();
+        let mut progress = SnapshotUploadProgress::load(
+            &progress_path,
+            &template.destination_namespace_hash,
+            template.active_quarantine_witness.unwrap(),
+        )
+        .unwrap();
+        let prior = ScanIndex::load(&index_path).unwrap();
+        assert!(prior.files.is_empty());
+        assert!(prior.quarantined_snapshot_fingerprints.is_empty());
+        assert!(!progress.permanent_rejections.is_empty());
+        let scanner = E2ScanFixture::capturing_identity();
+        let mut recovered = c.raw(&scanner, prior, 100, false, &[]);
+        recovered.enrich(&c);
+        recovered.finish();
+        let (result, _, _) = upload(&recovered.scan.snapshots, &mut progress, |_| {
+            panic!("the exact ACK and refusal already reached durable progress")
+        });
+        assert!(matches!(
+            result.unwrap(),
+            ResumableUploadResult::Rejected { .. }
+        ));
+        let holds = LocalHoldSettlement::classify(
+            SnapshotSource::ClaudeCode,
+            &mut recovered.index,
+            &mut recovered.scan,
+            &recovered.disposition,
+        );
+        let mut selected = settle_checkpointed_upload(
+            recovered.index,
+            &recovered.committed,
+            &progress,
+            &holds,
+            true,
+        )
+        .index;
+        settle_index_after_upload(&mut selected, &recovered.committed, &progress);
+        accept_upload_context_acks_for_test(
+            &mut selected,
+            &recovered.scan.snapshots,
+            &progress.fresh_context_body_acks,
+        );
+        let prior = c.reload(&mut selected);
+        let copy_key = crate::snapshots::claude_money_birth_store::location_key(
+            &c.root.join(file(COPY)).to_string_lossy(),
+        );
+        assert!(
+            prior.claude_copy_removals.pending(copy_key),
+            "refusal and mark publish together after restart"
+        );
+        assert!(prior.claude_copy_removals.get(copy_key).is_empty());
+        let correction = next_body_page(&c, prior, COPY, &mut progress);
+        let copy = body(&correction, COPY).unwrap();
+        assert_eq!(
+            (copy.request_count, copy.input_tokens, copy.output_tokens),
+            (3, 30, 30)
+        );
+        let prior = acknowledge_ordered(
+            &c,
+            correction,
+            &mut progress,
+            &mut ledger,
+            &[COPY],
+            &[(0, 2)],
+        );
+        let mut quiet = c.raw(&E2ScanFixture::capturing_identity(), prior, 100, false, &[]);
+        quiet.enrich(&c);
+        quiet.finish();
+        assert!(body(&quiet, COPY).is_none());
+        assert_eq!(shared(&ledger), (0, 2));
+    });
+}
+
+/// [money] The named-parent rule still removes an all-copy branch after the
+/// parent's accepted census retires. Both bodies reach the real uploader and
+/// settlement, and a disk restart keeps the accepted ledger quiet.
+#[test]
+fn named_parent_with_retired_census_through_pipeline() {
+    with_e2(|| {
+        let mut c = corpus("copy-retired-parent-pipeline");
+        let parent = c.root(ROOT, &resumed(ROOT, &[A, B]));
+        let mut progress = e2_progress();
+        let mut ledger = Ledger::new();
+        let mut source = c.raw(
+            &E2ScanFixture::capturing_identity(),
+            ScanIndex::default(),
+            1,
+            false,
+            &[],
+        );
+        source.enrich(&c);
+        let mut prior =
+            acknowledge_ordered(&c, source, &mut progress, &mut ledger, &[ROOT], &[(2, 0)]);
+        e2::pipeline_test_observer::retire_census(&mut prior, &file(ROOT));
+        prior = c.reload(&mut prior);
+        c.write_at(
+            &file(COPY),
+            &(fork_ref(COPY, ROOT) + &resumed(COPY, &[A, B])),
+            "2026-08-02T07:03:00Z",
+        );
+        let branch = next_body_page(&c, prior, COPY, &mut progress);
+        let copy = body(&branch, COPY).expect("the named parent proves the zero replacement");
+        assert_eq!(
+            (copy.request_count, copy.removed_request_count),
+            (0, Some(2))
+        );
+        assert_eq!(copy.removed_usage.as_ref().unwrap().input_tokens, 20);
+        let prior = acknowledge_ordered(&c, branch, &mut progress, &mut ledger, &[COPY], &[(2, 0)]);
+        std::fs::remove_file(parent).unwrap();
+        // Change the removed usage, so finalization publishes a new zero
+        // body rather than suppressing a semantic no-op newline edit.
+        std::fs::write(
+            c.root.join(file(COPY)),
+            fork_ref(COPY, ROOT) + &line_by(COPY, A.0, A.1, 20, A.2) + &resumed(COPY, &[B]),
+        )
+        .unwrap();
+        let mut reread = c.raw(&E2ScanFixture::capturing_identity(), prior, 100, false, &[]);
+        reread.enrich(&c);
+        assert_eq!(
+            body(&reread, COPY).unwrap().request_count,
+            0,
+            "the accepted parent's coverage survives local deletion"
+        );
+        let prior = acknowledge_ordered(&c, reread, &mut progress, &mut ledger, &[COPY], &[(2, 0)]);
+        let mut quiet = c.raw(&E2ScanFixture::capturing_identity(), prior, 100, false, &[]);
+        quiet.enrich(&c);
+        quiet.finish();
+        assert!(quiet.scan.snapshots.is_empty());
+        assert_eq!(shared(&ledger), (2, 0));
+    });
+}
+
+/// [money] A real native account hold consumes one marked read. Ten unchanged
+/// passes through scan, enrichment, finalization, upload and settlement cannot
+/// turn that mark into a busy reread loop or alter the accepted copy's money.
+#[test]
+fn held_copy_mark_reads_once_over_ten_pipeline_passes() {
+    with_e2(|| {
+        let mut c = corpus("held-copy-mark-pipeline");
+        c.root(ROOT, &resumed(ROOT, &[A, B]));
+        let path = c.write_at(
+            &file(COPY),
+            &resumed(COPY, &[A, B, C]),
+            "2026-08-02T07:03:00Z",
+        );
+        let scanner = E2ScanFixture::capturing_identity();
+        let mut progress = e2_progress();
+        let mut ledger = Ledger::new();
+        let mut first = c.raw(&scanner, ScanIndex::default(), 100, true, &[]);
+        first.enrich(&c);
+        let mut prior = acknowledge_ordered(
+            &c,
+            first,
+            &mut progress,
+            &mut ledger,
+            &[ROOT, COPY],
+            &[(2, 0), (2, 0)],
+        );
+        let (held, holds) = native_account_held_page(&c, &scanner, prior, COPY);
+        assert!(
+            held.scan.snapshots.is_empty(),
+            "the setup has no uploadable body"
+        );
+        let mut selected =
+            settle_completed_upload(held.index, &held.committed, &progress, &holds).index;
+        settle_index_after_upload(&mut selected, &held.committed, &progress);
+        prior = crate::snapshots::e2_pipeline_scan_fixture::save_reload_for_test(
+            &mut selected,
+            &c.base.join("scan-index.json"),
+        );
+        let key = path.to_string_lossy().into_owned();
+        // Only debt is injected; every read/hold/clear decision below is real.
+        let location = crate::snapshots::claude_money_birth_store::location_key(&key);
+        prior.claude_copy_removals.mark(location);
+        let mut reads = 0;
+        for pass in 0..10 {
+            let mut page = c.raw(&scanner, prior.clone(), 100, true, &[]);
+            reads += usize::from(scanner.paths().contains(&path));
+            page.enrich(&c);
+            let holds = page.finish();
+            upload(&page.scan.snapshots, &mut progress, |_| {
+                panic!("held B must never POST")
+            })
+            .0
+            .unwrap();
+            assert_eq!(shared(&ledger), (2, 0), "after pass {pass}");
+            let mut selected =
+                settle_completed_upload(page.index, &page.committed, &progress, &holds).index;
+            settle_index_after_upload(&mut selected, &page.committed, &progress);
+            prior = crate::snapshots::e2_pipeline_scan_fixture::save_reload_for_test(
+                &mut selected,
+                &c.base.join("scan-index.json"),
+            );
+            assert!(!prior.claude_copy_removals.pending(location));
+        }
+        assert_eq!(
+            reads, 1,
+            "one marked read, then unchanged held passes skip B"
+        );
+        assert_eq!(shared(&ledger), (2, 0));
     });
 }

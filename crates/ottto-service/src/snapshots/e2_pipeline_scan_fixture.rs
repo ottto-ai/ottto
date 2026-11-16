@@ -1136,3 +1136,67 @@ pub(crate) fn pace_cap_for_test(owner: &E2ScanFixture, path: &Path) {
     assert!(owner.cache.cap_pace_for_test(&key, now).0);
     assert!(!owner.cache.cap_pace_for_test(&key, now).0);
 }
+
+/// Resolve actual discovery revisions without staging a file reduction: this
+/// exercises the debt-only Tail save with the caller's exact-ACKed carrier.
+pub(crate) fn resolve_carrier_discovery_debt_for_test(
+    index: &mut ScanIndex,
+    path: &Path,
+) -> (usize, usize) {
+    fn revisions(index: &ScanIndex, key: &str) -> (usize, Vec<u8>) {
+        let head = state_v2::load_head(index, key, 1).unwrap().unwrap();
+        let mut count = 0;
+        state_v2::load_revisions(index, key, &head, |_, _| {
+            count += 1;
+            Ok(())
+        })
+        .unwrap();
+        (count, head.body)
+    }
+    let key = local_index_key(path);
+    let (before, body) = revisions(index, &key);
+    index.activate_upload_context("e2-synthetic-destination".into());
+    ensure_bounded_traversal(
+        SnapshotSource::ClaudeCode,
+        &[path.parent().unwrap().to_path_buf()],
+        index,
+        "2026-08-02T08:00:00Z",
+        BACKFILL_WINDOW_DAYS,
+    );
+    let traversal = index.traversal.clone().unwrap();
+    let mut fold = money_freshness::WalkFold::EMPTY;
+    let mut page = upload::freshness_debt::Page::begin(
+        SnapshotSource::ClaudeCode,
+        index,
+        &traversal,
+        false,
+        &mut fold,
+    );
+    let metadata = fs::metadata(path).unwrap();
+    page.listed(
+        index,
+        upload::freshness_debt::Listing {
+            path,
+            metadata: &metadata,
+            in_window: true,
+        },
+    );
+    let _ = page.end(index, false, |_| {});
+    let route = route_of(index).unwrap();
+    index.save(&route).unwrap();
+    let (after, kept) = revisions(index, &key);
+    assert_eq!(body, kept, "debt-only save retains the committed reduction");
+    (before, after)
+}
+
+pub(crate) fn non_tail_carrier_observation_for_test(index: &ScanIndex, path: &Path) {
+    state_v2::observe_tail(
+        &route_of(index).unwrap(),
+        &local_index_key(path),
+        state_v2::Observation {
+            representation: state_v2::Representation::NonTail,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+}

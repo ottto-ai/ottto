@@ -346,6 +346,13 @@ impl ScanIndex {
             .extend(source_files.iter().cloned());
     }
 
+    #[cfg(test)]
+    pub(crate) fn effective_upload_body_witness_revision_exclusions_for_test(
+        &mut self,
+    ) -> &mut BTreeSet<String> {
+        &mut self.effective_upload_body_witness_revision_excluded_source_files
+    }
+
     /// Claude only, before scanning: read the local list of sessions the
     /// adoption re-read must not re-emit. A list that was installed once and
     /// is now missing pauses adoption and raises the local alarm.

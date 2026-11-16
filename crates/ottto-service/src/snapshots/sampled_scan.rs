@@ -73,6 +73,8 @@ impl CapPace {
 }
 
 pub(crate) struct SharedCache {
+    /// Reusable Codex home facts for the active cycle scope only. Cycles are
+    /// serialized; returning facts replace every idle scope's entry.
     sidecars: Mutex<BTreeMap<String, crate::snapshots::sources::codex::sidecar::SidecarFacts>>,
     desktop_titles: Mutex<super::sources::claude::desktop_titles::DesktopTitleFacts>,
     pub(crate) withheld_memo: withheld_account::Memo,
@@ -160,10 +162,9 @@ impl SharedCache {
             .remove(&scope.0)
             .unwrap_or_default();
         let result = load(&mut facts);
-        self.sidecars
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(scope.0.clone(), facts);
+        let mut sidecars = self.sidecars.lock().unwrap_or_else(|e| e.into_inner());
+        sidecars.clear();
+        sidecars.insert(scope.0.clone(), facts);
         result
     }
 
@@ -708,6 +709,54 @@ pub(in crate::snapshots) fn ram_miss_class(
 #[cfg(test)]
 mod retained_heap_tests {
     use super::*;
+
+    #[test]
+    fn codex_sidecars_keep_only_active_scope_and_reuse_its_facts() {
+        use crate::snapshots::sources::codex::sidecar::SidecarFacts;
+        use crate::snapshots::state_v2::telemetry::heap;
+
+        let cache = SharedCache::default();
+        let index = ScanIndex::default();
+        let home = std::env::temp_dir().join(format!(
+            "ottto-sidecar-scope-{}",
+            ottto_core::generate_control_token().unwrap()
+        ));
+        let roots = [home.join("sessions")];
+        let first = Scope("first-scope".into());
+        let second = Scope("second-scope".into());
+        let empty = cache.retained_heap_bytes(&index).totals["codex_sidecar_facts_bytes"];
+
+        let kept = cache.with_codex_sidecars(&first, |facts| {
+            facts.load(&roots);
+            facts.homes.kept[&home].1.clone()
+        });
+        cache.with_codex_sidecars(&first, |facts| {
+            assert!(Arc::ptr_eq(&facts.homes.kept[&home].1, &kept));
+            let metadata = facts.load(&roots);
+            assert_eq!(metadata.local_diagnostics.state_titles.reused_roots, 1);
+            assert!(Arc::ptr_eq(&facts.homes.kept[&home].1, &kept));
+        });
+        drop(kept);
+
+        cache.with_codex_sidecars(&second, |facts| {
+            assert!(facts.homes.kept.is_empty());
+            facts.load(&roots);
+        });
+        {
+            let sidecars = cache.sidecars.lock().unwrap();
+            assert_eq!(sidecars.len(), 1);
+            assert!(!sidecars.contains_key(&first.0));
+            assert!(sidecars.contains_key(&second.0));
+        }
+        let mut expected = BTreeMap::new();
+        let mut facts = SidecarFacts::default();
+        facts.load(&roots);
+        expected.insert(second.0.clone(), facts);
+        let retained = cache.retained_heap_bytes(&index).totals["codex_sidecar_facts_bytes"];
+        assert!(retained > empty);
+        assert_eq!(retained, heap(&expected));
+    }
+
     #[test]
     fn charged_caches_are_unknown_while_busy_and_available_when_empty() {
         let cache = SharedCache::default();

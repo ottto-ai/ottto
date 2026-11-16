@@ -100,13 +100,19 @@ file-system hint / periodic listing → select file → read new bytes from save
   provider-skill facts merge before their existing projection; changed files stay distinct and artifacts
   use the existing union. Continuous plain groups
   retain their existing replay path; no admitted-key ledger is persisted.
-- **Claude copied history.** Earlier accepted main files prove pre-birth
-  copies within the same session, or through the in-folder holder's session
-  across folders. Same-session proof uses the session's accepted body,
-  regardless of which file carried it; cross-session proof requires that
-  file's acceptance. Stored self-removals never prove another copy. An origin
-  only under an unrelated session elsewhere leaves its copy counted.
-  The original in-folder census wait still expires on its third decision.
+- **Claude copied history.** An earlier main file proves a later copy's
+  pre-birth requests from local facts: an accepted body, or a counted,
+  identity-complete body committed here or on the same page, with a current
+  census and no hold, quarantine or content-twin hold on that page. Unproven
+  copies count at once, with no acceptance wait. Removals relying on a holder
+  not yet accepted are provisional: an index save drops them and marks the copy
+  for one re-decision when that holder failed to commit or was deleted. Saves
+  re-mark only copies whose saved decision disagrees with current ownership,
+  groups or census; census walks run to completion. Stored groups keep
+  historical removals, including accepted holders deleted later. The byte
+  format stays compatible with 0.1.239–0.1.251, but rolling back below this
+  release is unsafe once a copy is decided locally; fix forward. Source and
+  copy uploads stay independent, so ACK order can leave a temporary gap.
   An all-covered copy-only page drops its items when the session has another
   file; own turns still publish. A selected content twin pulls every live
   overlapping census main, and a selected main file (not history-held)
@@ -124,7 +130,7 @@ file-system hint / periodic listing → select file → read new bytes from save
   independently selected. Twin pulls can read extra overlapping copy sources.
   Money rule three selects content twins, path twins and disclosed main
   files once, using every census hash and one in-memory census walk without
-  a deadline. Only a candidate sharing ids with an earlier accepted holder
+  a deadline. Only a candidate sharing ids with an earlier locally owned holder
   and that holder are re-owed, with the rule version stamped in the same save.
   Disclosed main files include cross-session resumes whose own path and
   content identity would otherwise leave their counted prefix unchanged.
@@ -135,6 +141,17 @@ file-system hint / periodic listing → select file → read new bytes from save
   its first own response, regardless of the subagent cutoff or file birth.
   Unmatched responses are own turns, including those before birth. Shared
   responses after the first own turn keep the existing cutoff decision.
+  Same-session main files with no copied requests at parse time on one page
+  drop timed, nonzero duplicate requests by usage dominance and equal native
+  accounts, with equal usage tied by birth and location. Zero, ambiguous and
+  untimed occurrences never drop.
+  Marker disagreements or incomparable usage keep every occurrence and disclose
+  once per request id as `twin_overcount_kept`. This is drop-only, without a
+  cutoff or persisted decision; restoring copies never makes a file eligible.
+  Accepted residuals: an absent complete twin can be deemed redundant by id
+  inclusion in a partial twin, and equal native accounts can later carry
+  different telemetry accounts; the keeper's placement
+  follows the existing reconciliation policy.
 
 - **Upload.** A session is uploaded as a whole-session replacement, idempotent at the receiver. It
   settles only on an exact acknowledgement of the exact bytes sent to that destination. A local
@@ -203,6 +220,8 @@ Desktop metadata cache.
 
 The process-owned transcript cache retains complete Codex home facts in RAM,
 using the shared file stamp for the resolved SQLite main file and its WAL.
+Only the active cycle scope's facts are kept; returning facts discard idle
+entries from previous scopes. Cycle serialization excludes overlapping loads.
 Every pass lists the homes and rebuilds metadata merges, ownership conflicts,
 completeness and path fingerprints. A home whose stamps match is reused; only
 changed or added homes reload, and an unstamped or incomplete home is not kept.
@@ -252,6 +271,22 @@ rescans and policy-stop clears preserve it. Older caches seed it from existing
 ceiling-filtered watermarks as best-effort history: a legacy future timestamp
 can surface after the clock passes it. A rollback can drop the field and cause
 re-seeding on upgrade. This local status fact is independent of uploads.
+
+Each source's optional `collection` status is a RAM-only pulse in its existing cadence state.
+Absence means unknown: no collection offered this run, missing installation/grant, paused,
+admin-disabled or policy-stopped. Pause, grant loss and either policy stop clear the pulse;
+a new eligible collection attempt starts its awake clock again. The shared active-session
+reconciliation path stamps completion, including empty scans and failed cache writes, before
+upload work. Status reports `collecting`, `server_backoff`, `offline` or `stalled`, with the
+last completed scan's `last_scan_at` when known. A transport prepare error is offline until a
+completion or non-transport outcome. Stalled takes precedence after more than the larger of
+60 awake minutes or the current planned interval (including the failure ladder) plus 30 minutes.
+Honoured sheds latch the effective deadline at its setter, after releasing the deadline lock.
+Scan completion preserves any unexpired deadline from an independent upload lane.
+That deadline also extends the pulse baseline; `until` is emitted only during server backoff,
+projected from wall time plus the remaining awake duration. All elapsed decisions use
+`scan_clock::now()`, so sleep does not age the pulse. This observation never changes cadence,
+canonical health, upload decisions or persisted state.
 
 Existing resource records carry fixed command classes, child starts and per-PID
 child CPU totals; arguments, paths and command output are never included.
@@ -329,6 +364,23 @@ backfill-state save, so re-upgrade omits the cutoff for existing destinations.
   Compatibility with older binaries is decode-only; older scheduling may replay retained work.
 - A parser or scan-identity version bump invalidates every saved record. A change that bumps one
   also migrates saved state forward, or it explicitly accepts the full re-read.
+
+## Returning to an account
+
+Claims record exact owner/API/machine/installation/OS-scope namespaces in trusted
+owner-only history. Returning claims require live hardware and surviving custody;
+same-owner rotation keeps the existing prior-credential policy. No orphan discovery.
+Logout seeds proven outgoing history best effort; history I/O failures count a
+skipped seed and allow logout/reset. Claim-time Unknown history still holds.
+Forget invalidates old installation rows.
+History-bearing journals use v3, rejected by released v2 readers. The selected
+cutoff precedes activation; history is synced/read back before pending clear.
+Existing aliases, loaders and exact destination ACKs retain all source custody.
+Completion belongs to settled delivery, per destination/replay revision. Older
+writers may drop that map, causing one bounded re-walk after upgrade. Quiet return
+reads no bodies or parser bytes and sends no historical bodies; identity samples
+follow uninterrupted census behavior. Server cutoffs still exclude pre-cutoff debt.
+Deleted custody selects fresh, under existing first-read/cutoff gates, with no ACKs.
 
 ## Hot and cold state
 

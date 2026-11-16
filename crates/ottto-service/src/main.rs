@@ -35,8 +35,11 @@ enum Command {
         config_dir: String,
         #[arg(long)]
         control_fd: i32,
-        #[arg(long)]
-        code_fd: i32,
+        /// Ignored. Kept only for daemons released before 2026-11 that still
+        /// pass their retired code pipe; remove in the first release after the
+        /// app-side code-entry removal ships.
+        #[arg(long, hide = true)]
+        code_fd: Option<i32>,
         #[arg(long)]
         ready_fd: i32,
     },
@@ -249,11 +252,13 @@ fn main() -> Result<()> {
             code_fd,
             ready_fd,
         } => {
+            if let Some(fd) = code_fd.filter(|fd| *fd != control_fd && *fd != ready_fd) {
+                ottto_service::claude_browser_auth::close_legacy_code_fd(fd);
+            }
             let code = ottto_service::claude_browser_auth::run_auth_supervisor(
                 &operation_id,
                 &config_dir,
                 control_fd,
-                code_fd,
                 ready_fd,
             )
             .map_err(anyhow::Error::msg)?;
@@ -958,40 +963,9 @@ fn stable_machine_id_from_seed(seed: &str) -> String {
     ottto_core::prefixed_sha256_id("otm", seed)
 }
 
-/// Privacy-safe discriminator for the OS account this install runs under; see
-/// `MachineIdentity::account_scope` for the contract. Derived from the POSIX
-/// uid on every call, so it survives daemon restarts and reinstalls without
-/// persisting anything about the account.
-fn local_account_scope(machine_id: &str) -> Option<String> {
-    account_scope_from_uid(machine_id, current_account_uid())
-}
-
-/// Hash-only half of `local_account_scope`, split out so tests can pin the
-/// stability and distinctness guarantees without depending on whichever account
-/// runs them. The uid is digest input only; it never appears in the output, and
-/// neither does the username, the home directory, nor any path.
-fn account_scope_from_uid(machine_id: &str, uid: Option<u32>) -> Option<String> {
-    let uid = uid?;
-    Some(ottto_core::prefixed_sha256_id(
-        "otu",
-        &format!("account:{machine_id}:{uid}"),
-    ))
-}
-
-/// The POSIX uid the daemon runs as. `getuid` cannot fail on unix. Non-unix
-/// targets have no POSIX uid, so they report `None` instead of a placeholder
-/// that would collapse distinct accounts onto one scope.
-fn current_account_uid() -> Option<u32> {
-    #[cfg(unix)]
-    {
-        // `libc::uid_t` is `u32` on every supported unix target.
-        Some(unsafe { libc::getuid() })
-    }
-    #[cfg(not(unix))]
-    {
-        None
-    }
-}
+use ottto_service::local_account_scope;
+#[cfg(test)]
+use ottto_service::{account_scope_from_uid, current_account_uid};
 
 /// Derived from the raw `IOPlatformUUID`, never the hashed hardware id, so
 /// `machine_id` stays the value every earlier daemon on this Mac reported.
@@ -1082,6 +1056,36 @@ mod tests {
     use clap::CommandFactory;
     use std::ffi::OsString;
     use std::fs;
+
+    #[test]
+    fn auth_supervisor_accepts_and_ignores_a_legacy_code_fd() {
+        let parse = |extra: &[&str]| {
+            let mut args = vec![
+                "ottto-service",
+                "claude-auth-supervisor",
+                "--operation-id",
+                "claude_setup_0123456789abcdef0123456789abcdef",
+                "--config-dir",
+                "/x",
+                "--control-fd",
+                "3",
+            ];
+            args.extend_from_slice(extra);
+            args.extend_from_slice(&["--ready-fd", "5"]);
+            Cli::try_parse_from(args).map(|cli| cli.command)
+        };
+        for (extra, expected) in [(&["--code-fd", "4"][..], Some(4)), (&[][..], None)] {
+            assert!(matches!(
+                parse(extra),
+                Ok(Some(Command::ClaudeAuthSupervisor {
+                    control_fd: 3,
+                    ready_fd: 5,
+                    code_fd,
+                    ..
+                })) if code_fd == expected
+            ));
+        }
+    }
 
     #[test]
     fn local_state_sweep_needs_exactly_one_of_plan_and_apply() {

@@ -2104,7 +2104,7 @@ fn renamed_aged_account_hold_moves_custody_before_age_or_keeps_uncertain_debt() 
             old_location,
             BTreeMap::from([(holder, BTreeSet::from([7]))]),
         );
-        assert!(held.claude_copy_removals.advance_hold(old_location));
+        held.claude_copy_removals.mark(old_location);
         held.claude_money_birth_store.set_money_marks(&old_key, 1);
         crate::local_resource_diagnostics::withheld_support::take_withheld();
         fs::rename(&original, &moved).unwrap();

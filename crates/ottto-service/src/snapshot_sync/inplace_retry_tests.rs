@@ -34,7 +34,7 @@ struct Driven {
 fn drive(
     count: usize,
     failed_after: Option<Duration>,
-    mut respond: impl FnMut(usize, &[String]) -> Result<BatchResponse>,
+    mut respond: impl FnMut(usize, &[&String]) -> Result<BatchResponse>,
 ) -> Driven {
     let items = test_fingerprints(count);
     let mut progress = test_upload_progress();
@@ -49,8 +49,8 @@ fn drive(
             String::as_str,
             |batch| {
                 let attempt = posts.len();
-                posts.push(batch.clone());
-                respond(attempt, &batch)
+                posts.push(batch.iter().copied().cloned().collect());
+                respond(attempt, batch)
             },
             |_| Ok(()),
         )
@@ -472,7 +472,7 @@ fn drive_through_client(
 ) -> (Driven, usize, UploadShed) {
     let server = EnvelopeShedServer::new(status, retry_after_seconds, code);
     let client = SnapshotApiClient::new(server.url.clone());
-    let request = SnapshotBatchRequest {
+    let request: SnapshotBatchRequest = SnapshotBatchRequest {
         schema_version: SNAPSHOT_SCHEMA_VERSION,
         source: "claude_code".into(),
         machine_id: "otm_test".into(),

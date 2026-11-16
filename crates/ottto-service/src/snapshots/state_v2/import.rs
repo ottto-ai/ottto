@@ -104,17 +104,67 @@ pub(super) fn save(
     next: &mut ScanIndex,
     cx: &mut KindCx,
 ) -> Result<kinds::Baseline> {
-    {
+    let carried = {
         let mut tx = db.begin(TxnMode::Read)?;
         kinds_misc::merge_cas_at(&mut tx, next, previous.generation)?;
         kinds_files::merge_growth_cas(&mut tx, next)?;
-    }
+        if matches!(
+            identity.binding.source,
+            super::super::scan_index_persistence::Source::Claude
+        ) {
+            previous.copy_ownership.reconcile(next, &mut |keys| {
+                session_links(&mut tx, keys, previous.generation, cx.tail.as_ref())
+            })
+        } else {
+            BTreeMap::new()
+        }
+    };
     super::super::sampled_audit::prune_growth_retention(
         next,
         super::super::sampled_scan::now_seconds(),
     );
     super::super::lenient_decode::check_held_output(next)?;
-    kinds::save_graph(db, identity, previous, next, cx)
+    let mut saved = kinds::save_graph(db, identity, previous, next, cx)?;
+    saved.copy_ownership.1 = carried;
+    Ok(saved)
+}
+pub(super) fn baseline(
+    db: &mut sqlite::Sqlite,
+    index: &ScanIndex,
+    cx: &mut KindCx,
+) -> Result<kinds::Baseline> {
+    let mut baseline = kinds::baseline(index, cx)?;
+    let mut tx = db.begin(TxnMode::Read)?;
+    baseline
+        .copy_ownership
+        .seed(&mut |keys| session_links(&mut tx, keys, index.generation, None));
+    Ok(baseline)
+}
+pub(super) fn session_links(
+    tx: &mut dyn Transaction,
+    keys: &[&str],
+    generation: u64,
+    stage: Option<&tail::TailStage>,
+) -> Links {
+    use super::super::tail_source::{self, claude::Claude, TailSource};
+    use tail::EffectiveHead;
+    keys.iter()
+        .filter_map(|&key| {
+            let session = match stage.map_or(EffectiveHead::Committed, |s| s.effective(key)) {
+                EffectiveHead::Removed => None,
+                EffectiveHead::Staged(revision, head) => {
+                    tail_source::claude_head_session(revision, &head)
+                }
+                EffectiveHead::Committed => {
+                    tail::load_head(tx, key.as_bytes(), Claude::REDUCTION_REVISION, generation)
+                        .ok()
+                        .flatten()
+                        .and_then(|h| tail_source::claude_head_session(h.revision, &h.body))
+                }
+            }?;
+            Some((key.to_owned(), session))
+        })
+        .collect()
 }
 
 fn identity(tx: &mut dyn Transaction) -> Result<Identity> {

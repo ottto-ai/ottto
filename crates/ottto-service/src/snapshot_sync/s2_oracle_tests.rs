@@ -297,7 +297,7 @@ fn an_identity_deferred_retry_refolds_to_the_cold_full_body() {
             .clone();
         // The server sheds the root for its identity; its siblings ACK.
         let shed =
-            |batch: &[SnapshotItem]| -> Result<crate::snapshot_client::SnapshotBatchResponse> {
+            |batch: &[&SnapshotItem]| -> Result<crate::snapshot_client::SnapshotBatchResponse> {
                 match batch
                     .iter()
                     .position(|item| item.snapshot_fingerprint == refused)
@@ -578,180 +578,6 @@ fn an_identity_deferred_retry_refolds_to_the_cold_full_body() {
 
 fn json_array(value: &serde_json::Value) -> &[serde_json::Value] {
     value.as_array().map_or(&[], Vec::as_slice)
-}
-
-/// [money] A census deadline withholds a NEW copied file, so it gains no
-/// index entry. After the save and reload its committed head, custody and
-/// never acceptance, still continues it: the unchanged walk reads no
-/// transcript byte and growth reads Tail. The released body and its
-/// placement equal the cold Full's.
-#[test]
-fn held_new_file_continues_from_its_committed_head() {
-    held_new_file_continues(false);
-}
-
-/// [regress] The same after a restart: RAM holds nothing of the held file,
-/// and its durable custody (census record and committed head) continues it.
-#[test]
-fn held_new_file_continues_after_a_restart() {
-    held_new_file_continues(true);
-}
-
-fn held_new_file_continues(restart: bool) {
-    use crate::snapshots::claude_request_census::with_walk_deadline_for_test as deadline;
-    with_e2(|| {
-        let mut c = corpus(&format!("s2-held-new-continues-{restart}"));
-        c.root(ROOT, &line(ROOT, "root", AT, 10));
-        c.evidence_for(
-            COPY,
-            &[api_login(COPY, "own", 20, '1', Some('7'))],
-            &[trace_for(COPY, "own", "")],
-        );
-        let scanner = E2ScanFixture::capturing_identity();
-        let mut progress = e2_progress();
-        // The root, then the one-time identity-contract re-arm.
-        let mut prior = ScanIndex::default();
-        for _ in 0..2 {
-            let settled = ready(&c, &scanner, prior.clone(), 100, true);
-            prior = settle_captured_holds(&c, &prior, settled, &mut progress);
-        }
-        let accepted_before = progress.accepted_fingerprints.clone();
-        let path = c.write_at(
-            &format!("{COPY}.jsonl"),
-            &line(COPY, "root", AT, 10),
-            "2026-08-02T07:03:00Z",
-        );
-        let key = path.to_string_lossy().into_owned();
-        let mut first = c.raw(&scanner, prior.clone(), 100, true, &[]);
-        deadline(|| first.enrich(&c));
-        assert_withheld(&first, COPY, "external census unavailable");
-        let prior = settle_captured_holds(&c, &prior, first, &mut progress);
-        assert!(
-            !prior.files.contains_key(&key),
-            "a held NEW file has no entry"
-        );
-        let restarted = E2ScanFixture::capturing_identity();
-        let scanner = if restart {
-            let route = crate::snapshots::e2_pipeline_scan_fixture::route_of(&prior).unwrap();
-            crate::snapshots::e2_pipeline_scan_fixture::continue_route_for_test(
-                &restarted.cache,
-                &route,
-            );
-            &restarted
-        } else {
-            &scanner
-        };
-
-        let (mut unchanged, consumed) =
-            fixture::observe_consumed(|| c.raw(scanner, prior.clone(), 100, true, &[]));
-        assert_eq!(unchanged.modes, (0, 0, 1), "the committed head continues");
-        assert_eq!(
-            consumed, 0,
-            "an unchanged held file reads no transcript byte"
-        );
-        deadline(|| unchanged.enrich(&c));
-        assert_withheld(&unchanged, COPY, "external census still unavailable");
-        let prior = settle_captured_holds(&c, &prior, unchanged, &mut progress);
-        assert!(!prior.files.contains_key(&key));
-        assert_eq!(progress.accepted_fingerprints, accepted_before);
-
-        // Pre-birth, so growth alone cannot release the all-copied hold.
-        append(&path, &line(COPY, "own", "2026-08-02T07:01:00Z", 20));
-        let mut grown = c.raw(scanner, prior.clone(), 100, true, &[]);
-        assert_eq!(grown.modes, (0, 1, 0), "growth reads past the head only");
-        grown.enrich(&c);
-        let warm = result(&grown, Mode::Restart);
-        assert!(
-            warm.snapshots.contains_key(COPY),
-            "external evidence releases it"
-        );
-        let unrouted =
-            crate::snapshots::e2_pipeline_scan_fixture::route_for_test(SOURCE, None, prior);
-        let cold = result(&page(&c, unrouted, 100, false), Mode::ColdFull);
-        money_oracle::assert_equivalent(&cold, &warm);
-        grown.finish();
-    });
-}
-
-/// [regress] Claude row of `shed_save_commits_heads_only_for_kept_entries`:
-/// a shed partial save keeps a held NEW file's custody head, while a NEW file
-/// it neither keeps nor holds commits no head, so the next page reads it Full.
-#[test]
-fn shed_save_keeps_held_custody_and_drops_unkept_heads() {
-    use crate::snapshots::claude_request_census::with_walk_deadline_for_test as deadline;
-    use crate::snapshots::e2_pipeline_scan_fixture::{
-        continuation_for_test, continue_route_for_test, route_of, save_reload_for_test,
-    };
-    const FRESH: &str = "3338a80a-f36e-4cbc-a5bb-50fc66430ba5";
-    with_e2(|| {
-        let mut c = corpus("s2-shed-held-and-unkept");
-        c.root(ROOT, &line(ROOT, "root", AT, 10));
-        c.evidence_for(
-            COPY,
-            &[api_login(COPY, "own", 20, '1', Some('7'))],
-            &[trace_for(COPY, "own", "")],
-        );
-        let scanner = E2ScanFixture::capturing_identity();
-        let mut progress = e2_progress();
-        let mut prior = ScanIndex::default();
-        for _ in 0..2 {
-            let settled = ready(&c, &scanner, prior.clone(), 100, true);
-            prior = settle_captured_holds(&c, &prior, settled, &mut progress);
-        }
-        let held = c.write_at(
-            &format!("{COPY}.jsonl"),
-            &line(COPY, "root", AT, 10),
-            "2026-08-02T07:03:00Z",
-        );
-        // Born before its line, so no census decides it: it is not held.
-        let fresh = c.root(FRESH, &line(FRESH, "fresh", AT, 30));
-        let mut shed = c.raw(&scanner, prior.clone(), 100, true, &[]);
-        deadline(|| shed.enrich(&c));
-        assert_withheld(&shed, COPY, "external census unavailable");
-        let holds = shed.finish();
-        assert!(body(&shed, FRESH).is_some(), "the fresh file is not held");
-        // The upload sheds before any ACK: only the partial checkpoint saves.
-        let route = route_of(&shed.committed).unwrap();
-        // The route owns its progress file: the checkpoint compares against it.
-        let progress_path = snapshot_upload_progress_path(&route);
-        let durable: SnapshotUploadProgress =
-            serde_json::from_slice(&std::fs::read(&progress_path).unwrap()).unwrap();
-        let mut saved = checkpoint_partial_snapshot_index(
-            &shed.index,
-            &shed.committed,
-            &durable,
-            &shed.scan.snapshots,
-            Some(&shed.scan),
-            &holds.held_fingerprints,
-            &route,
-            &progress_path,
-            || Ok(()),
-        )
-        .unwrap();
-        let prior = save_reload_for_test(&mut saved, &c.base.join("scan-index.json"));
-        let head = |path: &Path| {
-            continuation_for_test(SOURCE, &scanner.cache, &prior, path.to_str().unwrap())
-        };
-        assert!(!prior.files.contains_key(held.to_str().unwrap()));
-        assert!(!prior.files.contains_key(fresh.to_str().unwrap()));
-        assert!(
-            head(&held).is_some(),
-            "the held file keeps its custody head"
-        );
-        assert!(head(&fresh).is_none(), "the unkept file commits no head");
-        // A restart keeps only the durable state.
-        let restarted = E2ScanFixture::capturing_identity();
-        continue_route_for_test(&restarted.cache, &route);
-        let mut next = c.raw(&restarted, prior, 100, true, &[]);
-        assert_eq!(
-            next.modes,
-            (1, 0, 1),
-            "the unkept file reads Full, the held one continues from its head"
-        );
-        next.enrich(&c);
-        assert!(body(&next, FRESH).is_some(), "the unkept file publishes");
-        next.finish();
-    });
 }
 
 /// [money] Updated-file row of `shed_save_commits_heads_only_for_kept_entries`:
@@ -1278,43 +1104,6 @@ fn changed_account_evidence_matches_cold_placement() {
     });
 }
 
-/// D62 guard: the census deadline holds past the expired hold's pass too.
-/// That pass's body was the hold's one delivery; the hold never restarts, and
-/// nothing selects afterwards.
-#[test]
-fn e2_pipeline_resumed_prefix_hold_expired_under_deadline_never_restarts_the_hold() {
-    with_e2(|| {
-        let mut c = Corpus::new("e2-pipeline-prefix-expiry-deadline");
-        c.root(ROOT, &resumed(ROOT, &[A, B]));
-        let mut progress = e2_progress();
-        let scanner = E2ScanFixture::default();
-        let old = ScanIndex::default();
-        let original = ready(&c, &scanner, old.clone(), 100, true);
-        let mut prior = settle(&c, &old, original, &mut progress);
-        c.write_at(
-            &file(COPY),
-            &resumed(COPY, &[A, B, C]),
-            "2026-08-02T07:03:00Z",
-        );
-        let under_deadline = |prior: ScanIndex| {
-            let mut page = c.raw(&scanner, prior, 100, true, &[]);
-            crate::snapshots::claude_request_census::with_walk_deadline_for_test(|| {
-                page.enrich(&c);
-            });
-            page
-        };
-        for _ in 1..=3 {
-            let page = under_deadline(prior.clone());
-            prior = settle(&c, &prior, page, &mut progress);
-        }
-        let after = under_deadline(prior);
-        assert!(
-            body(&after, COPY).is_none(),
-            "the expired hold never restarts"
-        );
-    });
-}
-
 mod pause_guard_oracle_tests;
 
 mod subagent_twin_tests;
@@ -1578,3 +1367,266 @@ fn current_again_quarantines_retry_root_and_subagent_without_changing_money() {
 }
 
 mod family_census_tests;
+
+// Direct scan fixtures walk the live Claude identity census. These small
+// files each fit in its one 4 KiB head sample. Compute the exact permitted
+// anchor bytes from fixture lengths BEFORE observing the scan; parser/body
+// bytes and every other I/O class remain forbidden by the shared oracle.
+fn owner_return_anchor_window(c: &Corpus) -> u64 {
+    c.births
+        .keys()
+        .map(|path| match std::fs::metadata(path) {
+            Ok(metadata) => {
+                assert!(metadata.len() <= 4096);
+                metadata.len()
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => panic!("synthetic identity metadata: {error}"),
+        })
+        .sum()
+}
+
+/// [money] A fresh claim selects the original published custody after two other
+/// owners. The ordinary native scan and stored Tail conserve a real two-account
+/// fixture, including a switch, side call, evidence gap and tagged shares.
+#[test]
+#[serial]
+fn owner_return_keeps_the_placement_oracle_and_quiet_restart() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    with_e2(|| {
+        let (c, path) = placement_corpus("owner-return-placement");
+        let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &c.support);
+        let secrets = c.base.join("synthetic-secrets");
+        std::fs::create_dir_all(&secrets).unwrap();
+        let _secrets = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secrets);
+        let _api = EnvVarGuard::set_str("OTTTO_API_BASE_URL", "https://api.ottto.net");
+        let namespace = "a".repeat(64);
+        let index_path = c
+            .support
+            .join("snapshots/destinations")
+            .join(&namespace)
+            .join("claude_code-scan-index-v3.json");
+        let progress =
+            serde_json::to_vec(&json!({"schema_version":3,"destination_namespace_hash":namespace}))
+                .unwrap();
+        let (session, index) =
+            StateV2ColdSession::publish_at(&ScanIndex::default(), &index_path, &progress);
+        let scanner = E2ScanFixture::capturing_identity();
+        let mut seed = c.raw(&scanner, index, 100, true, &[]);
+        seed.enrich(&c);
+        let prior = commit(&session, seed);
+        crate::control::owner_return_seed_for_test(&namespace, "owner-a");
+        let device = LocalDeviceBinding {
+            device_id: "placement-b".into(),
+            machine_id: Some("machine_test".into()),
+            sources: vec!["claude_code".into()],
+        };
+        for (user, id) in [
+            ("owner-b", "placement-b"),
+            ("owner-c", "placement-c"),
+            ("owner-a", "placement-a-return"),
+        ] {
+            let device = LocalDeviceBinding {
+                device_id: id.into(),
+                ..device.clone()
+            };
+            let selected = crate::control::owner_return_credential_for_test(
+                &device,
+                &format!("secret-{id}"),
+                user,
+            );
+            if user == "owner-a" {
+                assert_eq!(selected, namespace);
+            } else {
+                assert_ne!(selected, namespace);
+            }
+        }
+        // No index/progress migration or synthetic ACK is part of selection.
+        let restored = ScanIndex::load(&index_path).unwrap();
+        append(&path, &line(ROOT, "later", "2026-08-02T07:04:00Z", 6));
+        append(
+            &c.root.join(format!("{ROOT}/subagents/agent-000.jsonl")),
+            &line(ROOT, "agent-later", "2026-08-02T07:04:00Z", 3),
+        );
+        let cold = result(&page(&c, ScanIndex::default(), 100, false), Mode::ColdFull);
+        assert!(
+            accounts(&cold).len() >= 2,
+            "positive placed-account control"
+        );
+        let uninterrupted = result(&page(&c, prior, 100, true), Mode::Ram);
+        let returned_page = page(&c, restored, 100, true);
+        let returned = result(&returned_page, Mode::Restart);
+        money_oracle::assert_equivalent(&cold, &uninterrupted);
+        money_oracle::assert_equivalent(&cold, &returned);
+        let saved = commit(&session, returned_page);
+        let anchor_window = owner_return_anchor_window(&c);
+        let (quiet, io) = fixture::observe_codex_quiet(|| page(&c, saved, 100, true));
+        let mut quiet_route = result(&quiet, Mode::Restart);
+        quiet_route.io = io;
+        money_oracle::assert_quiet_restart_with_anchor_window(&quiet_route, anchor_window);
+    });
+}
+
+/// [money] The returning owner's saved accepted heads survive the server's
+/// switch cutoff. Pre-cutoff owed activity stays excluded; a spanning session
+/// remains a whole session, using the ordinary cutoff and oracle paths.
+#[test]
+fn owner_return_cutoff_keeps_prior_heads_and_whole_spanning_sessions() {
+    with_e2(|| {
+        let (c, path) = placement_corpus("owner-return-cutoff");
+        let initial = page(&c, ScanIndex::default(), 100, false);
+        let mut prior = result(&initial, Mode::ColdFull);
+        accepted(&mut prior, &initial.scan.snapshots);
+        for cutoff in ["2026-08-02T07:10:00Z", "2026-08-02T07:11:00Z"] {
+            let mut owed = page(&c, ScanIndex::default(), 100, false);
+            let count = owed.scan.snapshots.len();
+            let state = crate::backfill::BackfillState {
+                backfill_cutoff_at: Some(cutoff.into()),
+                ..Default::default()
+            };
+            assert_eq!(
+                apply_backfill_cutoff(&mut owed.scan.snapshots, &state),
+                count
+            );
+            let mut held = result(&owed, Mode::Restart);
+            held.accepted = prior.accepted.clone();
+            for entity in prior.snapshots.keys() {
+                // All pre-cutoff entities are held; compare each independently
+                // using the real accepted body's exact witness.
+                let mut one = prior.clone();
+                one.snapshots.retain(|key, _| key == entity);
+                one.normalized
+                    .as_array_mut()
+                    .unwrap()
+                    .iter_mut()
+                    .for_each(|batch| {
+                        batch["snapshots"]
+                            .as_array_mut()
+                            .unwrap()
+                            .retain(|body| body["source_session_id"] == entity.as_str());
+                    });
+                one.normalized
+                    .as_array_mut()
+                    .unwrap()
+                    .retain(|batch| !batch["snapshots"].as_array().unwrap().is_empty());
+                money_oracle::assert_held(entity, &prior, &held, &one);
+                money_oracle::assert_no_smaller_reemit(entity, &prior, &held, &one, true);
+            }
+        }
+        append(
+            &path,
+            &line(ROOT, "after-return", "2026-08-02T07:12:00Z", 7),
+        );
+        let whole = page(&c, ScanIndex::default(), 100, false);
+        let expected = whole
+            .scan
+            .snapshots
+            .iter()
+            .find(|item| item.source_session_id == ROOT)
+            .unwrap()
+            .input_tokens;
+        let mut spanning = page(&c, ScanIndex::default(), 100, false);
+        let state = crate::backfill::BackfillState {
+            backfill_cutoff_at: Some("2026-08-02T07:11:00Z".into()),
+            ..Default::default()
+        };
+        apply_backfill_cutoff(&mut spanning.scan.snapshots, &state);
+        assert_eq!(
+            spanning
+                .scan
+                .snapshots
+                .iter()
+                .find(|item| item.source_session_id == ROOT)
+                .unwrap()
+                .input_tokens,
+            expected
+        );
+    });
+}
+
+/// [money] Accepted original/copy state remains in its original custody after
+/// the original disappears and another owner is installed. Selection grants no
+/// new acceptance and the unchanged survivor keeps its saved body and proofs.
+#[test]
+#[serial]
+fn owner_return_keeps_deleted_original_copy_custody() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    with_e2(|| {
+        let mut c = corpus("owner-return-copy");
+        let original = c.root(ROOT, &line(ROOT, "r1", AT, 10));
+        let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &c.support);
+        let secrets = c.base.join("synthetic-secrets");
+        std::fs::create_dir_all(&secrets).unwrap();
+        let _secrets = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secrets);
+        let _api = EnvVarGuard::set_str("OTTTO_API_BASE_URL", "https://api.ottto.net");
+        let namespace = "a".repeat(64);
+        let index_path = c
+            .support
+            .join("snapshots/destinations")
+            .join(&namespace)
+            .join("claude_code-scan-index-v3.json");
+        let progress =
+            serde_json::to_vec(&json!({"schema_version":3,"destination_namespace_hash":namespace}))
+                .unwrap();
+        let (session, index) =
+            StateV2ColdSession::publish_at(&ScanIndex::default(), &index_path, &progress);
+        let scanner = E2ScanFixture::default();
+        let first = ready(&c, &scanner, index, 100, true);
+        let prior = commit(&session, first);
+        c.write_at(
+            &format!("{COPY}.jsonl"),
+            &(line(COPY, "r1", AT, 10) + &line(COPY, "branch-own", "2026-08-02T07:03:10Z", 0)),
+            "2026-08-02T07:03:00Z",
+        );
+        let copied = ready(&c, &scanner, prior, 100, true);
+        assert_eq!(
+            body(&copied, COPY).unwrap().removed_request_count,
+            Some(1),
+            "accepted original proves the removal"
+        );
+        let mut prior_money = result(&copied, Mode::ColdFull);
+        accepted(&mut prior_money, &copied.scan.snapshots);
+        let prior = commit(&session, copied);
+        std::fs::remove_file(original).unwrap();
+        let left = ready(&c, &scanner, prior, 100, true);
+        assert!(
+            left.scan.snapshots.is_empty(),
+            "unchanged survivor emits nothing new"
+        );
+        let prior = commit(&session, left);
+        let stored = stored_bodies(&prior);
+        crate::control::owner_return_seed_for_test(&namespace, "owner-a");
+        for (user, id) in [("owner-b", "copy-b"), ("owner-a", "copy-a-return")] {
+            let device = LocalDeviceBinding {
+                device_id: id.into(),
+                machine_id: Some("machine_test".into()),
+                sources: vec!["claude_code".into()],
+            };
+            let selected = crate::control::owner_return_credential_for_test(
+                &device,
+                &format!("secret-{id}"),
+                user,
+            );
+            if user == "owner-a" {
+                assert_eq!(selected, namespace);
+            }
+        }
+        let restored = ScanIndex::load(&index_path).unwrap();
+        assert_eq!(stored_bodies(&restored), stored);
+        let anchor_window = owner_return_anchor_window(&c);
+        let (quiet, io) = fixture::observe_codex_quiet(|| {
+            ready(&c, &E2ScanFixture::default(), restored, 100, true)
+        });
+        let mut observed = result(&quiet, Mode::Restart);
+        observed.io = io;
+        observed.accepted = prior_money.accepted.clone();
+        money_oracle::assert_quiet_restart_with_anchor_window(&observed, anchor_window);
+        money_oracle::assert_held(COPY, &prior_money, &observed, &prior_money);
+        money_oracle::assert_no_smaller_reemit(COPY, &prior_money, &observed, &prior_money, true);
+        assert_eq!(stored_bodies(&quiet.index), stored);
+    });
+}

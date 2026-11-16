@@ -334,7 +334,8 @@ fn real_claim_save_authenticates_old_clone_and_ordinary_save_ends_its_authority(
         .insert(f.key.clone(), debt(Some(NOW)));
     claim.save_growth_claim(&f.path).unwrap();
     with_state(&f.path, |state| {
-        assert!(state.save_digests.is_none());
+        // Only carrier links survive a claim-only save; no row baseline.
+        assert!(state.save_digests.as_ref().is_none_or(|b| b.links_only));
         Ok(())
     })
     .unwrap();
