@@ -18,6 +18,64 @@ pub(crate) fn disclosed(items: &[SnapshotItem]) -> u64 {
         .sum()
 }
 
+/// Observe the saved premise before growth, including after a cold restart.
+/// The private cutoff and acceptance predicate are the production ones. The
+/// holder witness is exactly what the counting-twin correction must reject.
+pub(crate) fn assert_counting_twin_grandfather_premise(
+    index: &ScanIndex,
+    carrier: &Path,
+    twin: &Path,
+    copied_at: &str,
+    own_at: &str,
+) {
+    let carrier = local_index_key(carrier);
+    let twin = local_index_key(twin);
+    let here = location_key(&carrier);
+    let other = location_key(&twin);
+    assert!(
+        here < other,
+        "the counting carrier wins the equal-birth tie"
+    );
+    let member = session_member(Path::new(&carrier)).unwrap();
+    assert_eq!(session_member(Path::new(&twin)).as_ref(), Some(&member));
+    let store = &index.claude_money_birth_store;
+    let birth = store.observed_birth(&member, &carrier).unwrap();
+    assert_eq!(store.observed_birth(&member, &twin), Some(birth));
+    let effective = store.effective_cutoff(&member, &carrier).unwrap();
+    assert_eq!(effective, birth, "the carrier retains the pinned cutoff");
+    let copied_at = rfc3339_unix_nanos(copied_at).unwrap();
+    let own_at = rfc3339_unix_nanos(own_at).unwrap();
+    assert!(
+        copied_at + SLACK < effective,
+        "r1 is a native copied prefix"
+    );
+    assert!(own_at > birth, "r2 is the first native own response");
+    assert!(
+        !from_copy_proof_cutoff(own_at),
+        "r2 must precede the real cutoff"
+    );
+    assert_ne!(store.money_marks(here) & money_mark::COPY, 0);
+    assert!(
+        index.file_has_accepted_body(&carrier),
+        "carrier has a real ACK"
+    );
+    assert!(index.claude_copy_removals.get(here).is_empty());
+    assert!(
+        index.files.contains_key(&twin),
+        "the saved witness is indexed"
+    );
+    assert!(store.observations(&member).any(|(key, _)| key == other));
+    let hash = claude_request_hash("r1");
+    assert!(
+        index
+            .claude_copy_removals
+            .get(other)
+            .iter()
+            .any(|(holder, hashes)| { *holder == here && hashes.binary_search(&hash).is_ok() }),
+        "the twin must retain its saved r1 removal naming the carrier"
+    );
+}
+
 /// The census key of the one indexed file named `file_name`.
 fn census_key(index: &ScanIndex, file_name: &str) -> String {
     let mut keys = index

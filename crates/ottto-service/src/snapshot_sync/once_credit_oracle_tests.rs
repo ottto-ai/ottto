@@ -2150,9 +2150,22 @@ fn assert_twin_request_survives(index: &ScanIndex, request: &str, locations: &[P
 // Seed a positive r1 ACK, then put that same pre-birth request at both homes.
 // The twins' first page must still count r1 once. Grow the earlier and later
 // location in separate arms, crossing discovery, finish and restart schedules.
-fn scheduling_equal_birth_twins() {
+fn scheduling_equal_birth_twins(before_cutoff: bool) {
     let source = SnapshotSource::ClaudeCode;
-    let birth = OffsetDateTime::parse("2026-11-06T07:02:00Z", &Rfc3339)
+    let (copied_at, born_at, own_at) = if before_cutoff {
+        (
+            "2026-11-03T07:00:10Z",
+            "2026-11-03T07:02:00Z",
+            "2026-11-03T07:04:00Z",
+        )
+    } else {
+        (
+            "2026-11-06T07:00:10Z",
+            "2026-11-06T07:02:00Z",
+            "2026-11-06T07:04:00Z",
+        )
+    };
+    let birth = OffsetDateTime::parse(born_at, &Rfc3339)
         .unwrap()
         .unix_timestamp_nanos() as u64;
     let response = |request: &str, at: &str, tokens: u64| {
@@ -2161,10 +2174,10 @@ fn scheduling_equal_birth_twins() {
             "message":{"id":format!("msg-{request}"),"model":"claude-haiku-4-5",
                 "usage":{"input_tokens":tokens,"output_tokens":tokens}}})
     };
-    // The own turn is after the copy-proof activation boundary; this row must
-    // exercise current page proofs, rather than grandfathered copy decisions.
-    let r1 = response("r1", "2026-11-06T07:00:10Z", 10);
-    let r2 = response("r2", "2026-11-06T07:04:00Z", 20);
+    // r1 is copied; r2 is the first own response. Both must move with birth
+    // to cross COPY_PROOF_FROM without making the growth an all-copy file.
+    let r1 = response("r1", copied_at, 10);
+    let r2 = response("r2", own_at, 20);
     let mut baseline = None;
     let mut run = 0;
     let mut tie_orders = BTreeSet::new();
@@ -2179,7 +2192,11 @@ fn scheduling_equal_birth_twins() {
                         home.now = OffsetDateTime::parse("2026-11-06T10:00:00Z", &Rfc3339)
                             .unwrap()
                             .unix_timestamp() as u64;
-                        home.row = "schedule_equal_birth_twins";
+                        home.row = if before_cutoff {
+                            "schedule_equal_birth_twins_before_cutoff"
+                        } else {
+                            "schedule_equal_birth_twins"
+                        };
                         home.cycle_number = run * 128;
                         home.schedule = Some(Schedule {
                             one_chunk,
@@ -2242,8 +2259,45 @@ fn scheduling_equal_birth_twins() {
                         assert_twin_request_survives(&first.index, "r1", &paths);
                         let first_body = accepted.clone();
                         drop(first);
+                        if before_cutoff {
+                            // Re-read the counting path as the changed file so
+                            // it carries the summed body's COPY mark as well
+                            // as its positive ACK. Blank JSONL changes no usage.
+                            writeln!(std::fs::OpenOptions::new()
+                                .append(true)
+                                .open(&paths[0])
+                                .unwrap())
+                            .unwrap();
+                            std::fs::File::options()
+                                .write(true)
+                                .open(&paths[0])
+                                .unwrap()
+                                .set_modified(
+                                    std::time::UNIX_EPOCH + Duration::from_secs(home.now - 1800),
+                                )
+                                .unwrap();
+                            home.age_listing();
+                            home.now += 3600;
+                            let carrier = home.cycle(&server, &recording);
+                            assert!(carrier.finish.is_ok());
+                            schedule_accepts(source, &carrier, &mut accepted);
+                            assert_eq!(accepted, first_body, "carrier refresh changes no body");
+                            assert!(schedule_debt_is_clear(&carrier.debt));
+                            assert_twin_request_survives(&carrier.index, "r1", &paths);
+                            drop(carrier);
+                        }
                         if restart {
                             home.cold_restart();
+                        }
+                        if before_cutoff {
+                            let index = ScanIndex::load(&home.index_path()).unwrap();
+                            crate::snapshots::claude_request_money::e2::pipeline_test_observer::assert_counting_twin_grandfather_premise(
+                                &index,
+                                &paths[0],
+                                &paths[1],
+                                copied_at,
+                                own_at,
+                            );
                         }
                         writeln!(
                             std::fs::OpenOptions::new()
@@ -2270,7 +2324,7 @@ fn scheduling_equal_birth_twins() {
                         assert_eq!(
                             (body.request_count, body.removed_request_count),
                             (2, Some(1)),
-                            "equal-birth twin growth must retain r1: growth_first={growth_first} reverse={reverse} restart={restart} limit={limit} one_chunk={one_chunk}"
+                            "equal-birth twin growth must retain r1: before_cutoff={before_cutoff} growth_first={growth_first} reverse={reverse} restart={restart} limit={limit} one_chunk={one_chunk}"
                         );
                         assert_eq!((body.input_tokens, body.output_tokens), (30, 30));
                         assert_twin_request_survives(&changed.index, "r1", &paths);
@@ -2309,7 +2363,8 @@ fn scheduling_equal_birth_twins() {
 #[serial]
 #[serial(source_cadences, source_manifests, client_report)]
 fn scheduling_permutations_converge_to_the_same_bodies() {
-    scheduling_equal_birth_twins();
+    scheduling_equal_birth_twins(false);
+    scheduling_equal_birth_twins(true);
     for source in [
         SnapshotSource::ClaudeCode,
         SnapshotSource::Codex,
