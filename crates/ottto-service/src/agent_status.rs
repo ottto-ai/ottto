@@ -20741,7 +20741,6 @@ pub(crate) fn claude_session_registrations() -> crate::claude_session_registrati
 pub(crate) mod tests;
 
 #[cfg(test)]
-#[rustfmt::skip]
 mod usage_checks_paused_tests;
 
 /// Phase 0 of the durable Claude login fix: status passes never spawn a
@@ -20750,7 +20749,6 @@ mod usage_checks_paused_tests;
 /// support dirs with a logging fake `claude`, a fixture-emitting fake
 /// `security`, fresh usage caches and provider requests forbidden.
 #[cfg(test)]
-#[rustfmt::skip]
 mod claude_login_phase0_tests;
 
 crate::heap_layout_bound::fields!(AgentStatusCollection; snapshots, source_health_snapshot, codex_scan_homes, codex_home_bindings, setup_snapshot_index);

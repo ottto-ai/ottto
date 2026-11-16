@@ -208,8 +208,8 @@ exit 44
         let now = current_unix_seconds();
         // Distinct meters per account: identical readings on two accounts
         // are quarantined as a cross-account collision.
-        let percent = u8::try_from(account.0.bytes().map(u32::from).sum::<u32>() % 90 + 5)
-            .expect("percent");
+        let percent =
+            u8::try_from(account.0.bytes().map(u32::from).sum::<u32>() % 90 + 5).expect("percent");
         let mut usage = ClaudeOAuthUsage {
             windows: ["session", "weekly"]
                 .into_iter()
@@ -235,11 +235,7 @@ exit 44
             account_weekly_not_offered: false,
             account_session_not_offered: false,
         };
-        claude_oauth_stamp_account_identity(
-            &mut usage,
-            &account_hash,
-            Some(&organization_hash),
-        );
+        claude_oauth_stamp_account_identity(&mut usage, &account_hash, Some(&organization_hash));
         write_claude_oauth_usage_cache(&ClaudeOAuthUsageCache {
             schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
             account_identifier_hash: account_hash,
@@ -701,12 +697,7 @@ fn a_refresher_never_starts_after_keep_signed_in_is_turned_off() {
     // The pass read "on"; the user has turned it off since (the fixture
     // stores off).
     assert_eq!(
-        crate::claude_refresher::maybe_refresh(
-            &fixture.slot_ids[0],
-            &fixture.slot(0),
-            &live,
-            true
-        ),
+        crate::claude_refresher::maybe_refresh(&fixture.slot_ids[0], &fixture.slot(0), &live, true),
         crate::claude_refresher::RefreshDecision::NotNeeded
     );
     crate::claude_refresher::wait_until_idle(&fixture.slot_ids[0]);
@@ -1132,9 +1123,8 @@ fn slot_with_another_accounts_cached_login_collects_on_its_proven_token() {
     );
 
     let now = OffsetDateTime::now_utc().format(&Rfc3339).expect("time");
-    let proof =
-        verify_claude_local_identity(&fixture.slot_ids[0], &dir.to_string_lossy(), &now)
-            .expect("Reconnect's identity check");
+    let proof = verify_claude_local_identity(&fixture.slot_ids[0], &dir.to_string_lossy(), &now)
+        .expect("Reconnect's identity check");
     assert_eq!(
         (
             proof.account_identifier_hash,
@@ -1258,8 +1248,7 @@ fn default_login_takes_over_reads_when_the_owning_slot_is_paused() {
             .source_health_snapshot
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.code
-                == "claude_oauth_usage_deferred_to_registered_slot"),
+            .any(|diagnostic| diagnostic.code == "claude_oauth_usage_deferred_to_registered_slot"),
         "a paused slot no longer owns the account's reads"
     );
     assert_eq!(provider_calls(), before + 1, "the default login asks once");
@@ -1417,8 +1406,7 @@ fn token_that_lapses_during_collection_is_never_sent() {
     fn wait_past_the_margin() {
         std::thread::sleep(Duration::from_millis(3_100));
     }
-    let (account_hash, organization_hash) =
-        Phase0Fixture::hashes(("account-lapse", "org-lapse"));
+    let (account_hash, organization_hash) = Phase0Fixture::hashes(("account-lapse", "org-lapse"));
     let expires_at = OffsetDateTime::from_unix_timestamp(
         i64::try_from(current_unix_seconds()).expect("time") + 62,
     )
@@ -1488,8 +1476,7 @@ fn settings_api_key_presence_is_reported_without_reading_values() {
         Some(ClaudeAlternativeAuth::Bedrock)
     );
     // Settings env outranks the ambient environment.
-    let ambient_bedrock =
-        |key: &str| (key == "CLAUDE_CODE_USE_BEDROCK").then(|| "1".to_string());
+    let ambient_bedrock = |key: &str| (key == "CLAUDE_CODE_USE_BEDROCK").then(|| "1".to_string());
     assert_eq!(
         claude_alternative_auth(&paths(&managed_off), &ambient_bedrock, false, &[], false),
         None
@@ -1541,8 +1528,7 @@ fn refresher_runs_only_for_logins_whose_usage_refreshes() {
         OffsetDateTime::now_utc().unix_timestamp_nanos()
     ));
     fs::create_dir_all(&dir).expect("dir");
-    let slot =
-        ClaudeConfigDirSlot::registered(dir.to_string_lossy().to_string()).expect("slot");
+    let slot = ClaudeConfigDirSlot::registered(dir.to_string_lossy().to_string()).expect("slot");
     let now = OffsetDateTime::now_utc();
     let now_ms = i64::try_from(now.unix_timestamp_nanos() / 1_000_000).expect("ms");
     let login = |has_profile_scope: bool| ClaudeLiveLogin {
