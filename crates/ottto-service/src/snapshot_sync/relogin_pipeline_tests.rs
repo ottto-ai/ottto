@@ -711,20 +711,26 @@ fn owner_return_preserves_all_source_carry() {
     } // two- and three-owner return rows
 }
 
-/// Characterization of today's fresh destination on A -> B -> A. The receiver
-/// accepts replacements; this proves offered bodies and exact local ACK custody,
-/// not the separate receiver's pricing or predecessor repository carry-forward.
+/// [money] Recorded owners retain their namespace and receipts on A -> B -> A.
+/// No-row owners keep the disclosed fresh-store limit; the receiver is synthetic.
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
-fn account_return_today_reinterprets_orphaned_history() {
-    use crate::snapshots::sampled_scan::transition_fixture::{observe_consumed, with_scan_clock};
-    use serde_json::{json, Value};
-    use std::time::UNIX_EPOCH;
+fn account_return_preserves_recorded_history_and_bounds_unrecorded_owners() {
     if !crate::heap_layout_bound::layout_supported() || !crate::test_isolation::run_here() {
         return;
     }
+    // No-row pre-existing owners are not adopted by direct switches.
+    for recorded_a in [true, false] {
+        account_return_history_row(recorded_a);
+    }
+}
+
+fn account_return_history_row(recorded_a: bool) {
+    use crate::snapshots::sampled_scan::transition_fixture::{observe_consumed, with_scan_clock};
+    use serde_json::{json, Value};
+    use std::time::UNIX_EPOCH;
     const CX: &str = "0199f7a0-0000-7000-8000-00000000c0de";
     const OLD: &str = "1338a80a-f36e-4cbc-a5bb-50fc66430ba6";
     let post_cutover = OffsetDateTime::parse("2026-11-16T08:00:00Z", &Rfc3339)
@@ -821,7 +827,7 @@ fn account_return_today_reinterprets_orphaned_history() {
         SnapshotSource::Pi,
     ];
     let (device_a, secret_a) =
-        crate::control::account_return_claim_for_test("owner-a", "org-a", "return-a");
+        crate::control::account_return_claim_for_test("owner-a", "org-a", "return-a", recorded_a);
     let namespace_a = snapshot_upload_destination_namespace(&device_a, &secret_a);
     let index_path = |namespace: &str, source| {
         snapshot_v3_index_path(&snapshot_destination_scoped_index_path(
@@ -971,7 +977,8 @@ fn account_return_today_reinterprets_orphaned_history() {
     let entry = &saved.files[&codex.to_string_lossy().into_owned()];
     assert!(!entry.codex_counting_v2, "Legacy ACK keeps the UI counter");
     assert!(!serde_json::to_value(entry).unwrap()["codex_applied_tier_receipt"].is_null());
-    let orphan = std::fs::read(&cx_path).unwrap();
+    let original_store = std::fs::read(&cx_path).unwrap();
+    let tier = serde_json::to_value(entry).unwrap()["codex_applied_tier_receipt"].clone();
     crate::snapshots::older_build_logs_expired();
     std::fs::File::options()
         .write(true)
@@ -986,22 +993,53 @@ fn account_return_today_reinterprets_orphaned_history() {
         ("owner-b", "org-b", "return-b"),
         ("owner-a", "org-a", "return-a-again"),
     ] {
-        let (device, secret) = crate::control::account_return_claim_for_test(user, org, id);
+        let (device, secret) =
+            crate::control::account_return_claim_for_test(user, org, id, recorded_a);
         let namespace = snapshot_upload_destination_namespace(&device, &secret);
-        // CHANGED-ON-RETURN: only the prior owner is considered; durable re-attach decision pending.
-        assert_ne!(namespace, namespace_a);
+        let reattached = recorded_a && user == "owner-a";
+        assert_eq!(namespace == namespace_a, reattached);
+        if reattached {
+            // A zero-money continuation proves the saved Git binding after removal.
+            let mut rows = claude_rows(IDENTITY_PIPELINE_ROOT);
+            let continuation_at =
+                OffsetDateTime::from_unix_timestamp((now + 1).try_into().unwrap())
+                    .unwrap()
+                    .format(&Rfc3339)
+                    .unwrap();
+            rows.push(
+                json!({"type":"user","timestamp":continuation_at,"sessionId":IDENTITY_PIPELINE_ROOT,
+                "cwd":repository,"message":{"role":"user","content":"synthetic continuation"}}),
+            );
+            write(&claude, rows);
+        }
         assert_ne!(namespace, previous_namespace);
         previous_namespace = namespace.clone();
         assert!(sources
             .iter()
-            .all(|&source| !index_path(&namespace, source).exists()));
+            .all(|&source| index_path(&namespace, source).exists() == reattached));
         returned = sources
             .map(|source| cycle(&device, &secret, source).0)
             .to_vec();
-        assert!(
-            returned.iter().all(|bodies| bodies.len() == 1),
-            "only existing recent session keys return"
-        );
+        if reattached {
+            assert!(
+                returned[1].is_empty(),
+                "accepted Legacy Codex is not re-offered"
+            );
+            assert!(returned[2].is_empty(), "accepted Pi is not re-offered");
+            let saved =
+                ScanIndex::load(&index_path(&namespace, SnapshotSource::ClaudeCode)).unwrap();
+            assert!(
+                saved
+                    .files
+                    .contains_key(&old.to_string_lossy().into_owned()),
+                "old accepted Claude coverage survives"
+            );
+        } else {
+            assert!(
+                returned.iter().all(|bodies| bodies.len() == 1),
+                "a fresh destination keeps only existing recent session keys"
+            );
+        }
         for source in sources {
             let (bodies, bytes) = cycle(&device, &secret, source);
             assert!(
@@ -1011,16 +1049,22 @@ fn account_return_today_reinterprets_orphaned_history() {
             assert_eq!(bytes, 0, "quiet destination reads no transcript");
         }
         let returned_cx = ScanIndex::load(&index_path(&namespace, SnapshotSource::Codex)).unwrap();
-        assert!(
-            returned_cx.files[&codex.to_string_lossy().into_owned()].codex_counting_v2,
-            "empty destination selects V2"
+        let entry = &returned_cx.files[&codex.to_string_lossy().into_owned()];
+        assert_eq!(entry.codex_counting_v2, !reattached);
+        if reattached {
+            assert_eq!(
+                serde_json::to_value(entry).unwrap()["codex_applied_tier_receipt"],
+                tier
+            );
+        }
+    }
+    if !recorded_a {
+        assert_eq!(
+            std::fs::read(&cx_path).unwrap(),
+            original_store,
+            "no-row pre-existing stores remain orphaned rather than being adopted"
         );
     }
-    assert_eq!(
-        std::fs::read(&cx_path).unwrap(),
-        orphan,
-        "A's original store remains orphaned"
-    );
     let counts = |body: &Value| {
         [
             "input_tokens",
@@ -1040,26 +1084,19 @@ fn account_return_today_reinterprets_orphaned_history() {
             }
         })
     };
-    // Each row names its current outcome; subsequent owner re-attach changes flip these deliberately.
-    for (source, session, outcome, expected) in [
-        // CHANGED-ON-RETURN: Legacy ACK and priority receipt are orphaned; durable re-attach decision pending.
+    for (source, session, expected) in [
         (
             1,
             CX,
-            "CHANGED-ON-RETURN",
-            Some([1000, 100, 0, 0, 0, 0, 0, 1]),
+            Some(if recorded_a {
+                [2000, 200, 0, 0, 0, 0, 0, 1]
+            } else {
+                [1000, 100, 0, 0, 0, 0, 0, 1]
+            }),
         ),
-        // CHANGED-ON-RETURN: the first-read mtime gate loses correction coverage; durable re-attach decision pending.
-        (0, OLD, "CHANGED-ON-RETURN", None),
-        // CHANGED-ON-RETURN: the saved Git pin is orphaned; durable re-attach decision pending.
-        (
-            0,
-            IDENTITY_PIPELINE_ROOT,
-            "CHANGED-ON-RETURN",
-            Some([30, 3, 0, 0, 0, 0, 0, 1]),
-        ),
-        // PRESERVED: Pi's reported counters and costs reconstruct from native bytes.
-        (2, "return-pi", "PRESERVED", Some([12, 4, 0, 0, 0, 0, 0, 1])),
+        (0, OLD, recorded_a.then_some([30, 3, 0, 0, 0, 0, 0, 1])),
+        (0, IDENTITY_PIPELINE_ROOT, Some([30, 3, 0, 0, 0, 0, 0, 1])),
+        (2, "return-pi", Some([12, 4, 0, 0, 0, 0, 0, 1])),
     ] {
         let prior = before[source]
             .iter()
@@ -1069,8 +1106,19 @@ fn account_return_today_reinterprets_orphaned_history() {
             .iter()
             .find(|b| b["source_session_id"] == session);
         if let Some(expected) = expected {
-            let after = after.expect("re-read and re-offered once in fresh A destination");
-            assert_eq!(counts(after), expected, "{session}: {outcome}");
+            let after = if recorded_a && session != IDENTITY_PIPELINE_ROOT {
+                if after.is_none() {
+                    let saved =
+                        ScanIndex::load(&index_path(&namespace_a, sources[source])).unwrap();
+                    assert!(saved.accepted_snapshot_fingerprint_recorded(
+                        prior["snapshot_fingerprint"].as_str().unwrap()
+                    ));
+                }
+                after.unwrap_or(prior)
+            } else {
+                after.expect("the changed transcript or fresh destination offers its body")
+            };
+            assert_eq!(counts(after), expected, "{session}: recorded={recorded_a}");
             assert_eq!(
                 after["session_account_evidence"], prior["session_account_evidence"],
                 "starting account binding"
@@ -1095,9 +1143,9 @@ fn account_return_today_reinterprets_orphaned_history() {
                     prior["model_usage"][0]["selector_context"]["service_tier"],
                     "priority"
                 );
-                assert_ne!(
-                    after["model_usage"][0]["selector_context"]["service_tier"],
-                    "priority"
+                assert_eq!(
+                    after["model_usage"][0]["selector_context"]["service_tier"] == "priority",
+                    recorded_a
                 );
             } else {
                 assert_eq!(counts(prior), expected);
@@ -1113,7 +1161,7 @@ fn account_return_today_reinterprets_orphaned_history() {
                     assert_eq!(after["cost"]["total_cost_usd"], "0.001");
                 }
             }
-            if source == 0 {
+            if source == 0 && !recorded_a {
                 assert!(prior["repository_hash"].is_string());
                 assert!(
                     after["repository_hash"].is_null(),
@@ -1131,6 +1179,6 @@ fn account_return_today_reinterprets_orphaned_history() {
             );
             assert_eq!(counts(prior), [30, 3, 0, 0, 0, 0, 0, 1]);
         }
-        eprintln!("ACCOUNT_RETURN_ROW {session} {outcome}");
+        eprintln!("ACCOUNT_RETURN_ROW {session} recorded={recorded_a}");
     }
 }

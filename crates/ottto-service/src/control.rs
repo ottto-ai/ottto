@@ -33174,43 +33174,29 @@ X-API-Key = "otel_redacted"
         (pending, candidate, setup_token)
     }
 
-    /// Synthetic account-return driver; shares the claim and promotion seams above.
+    /// Synthetic direct-switch driver through current selection and recovery.
     pub(crate) fn account_return_claim_for_test(
         user: &str,
         org: &str,
         device_id: &str,
+        record_initial: bool,
     ) -> (LocalDeviceBinding, String) {
+        let machine = test_machine();
+        FileMachineStore::default()
+            .save(&LocalMachineBinding {
+                machine_id: machine.machine_id.clone(),
+                installation_id: machine.installation_id.clone(),
+                hardware_uuid: machine.hardware_uuid.clone(),
+            })
+            .unwrap();
         let device = relogin_device(device_id, &["claude_code", "codex", "pi"]);
         let api = std::env::var("OTTTO_API_BASE_URL").expect("synthetic receiver URL");
-        let secret = if let Some(prior) = prior_device_credential_for_registration().unwrap() {
+        if let Some(prior) = prior_device_credential_for_registration().unwrap() {
             assert_ne!(prior.owner.as_ref().unwrap().user_id, user);
+            // Direct switching retains predecessor proof without a logout seed.
             relogin_local_logout();
-            assert!(
-                default_prior_device_path().exists(),
-                "logout retained the selector"
-            );
-            let prior = prior_device_credential_for_registration().unwrap().unwrap();
-            let (mut pending, candidate, token) = relogin_claim(&prior, user, org, device.clone());
-            pending.api_base_url = api.clone();
-            let commit = pending.claim_commit.as_mut().unwrap();
-            commit.connection.api_base_url = api;
-            assert_eq!(
-                commit.connection.api_base_url,
-                prior.owner.as_ref().unwrap().api_base_url,
-                "the owner changes on the same receiver"
-            );
-            // Re-decide after replacing the shared helper's default endpoint.
-            continue_prior_snapshot_namespace(&mut pending, Some(&prior));
-            assert_eq!(journaled_namespace(&pending), None, "different prior owner");
-            promote_relogin(&pending, &candidate, &token);
-            // The normal claim-completion handler cleans up after promotion.
-            clear_prior_device_credential().unwrap();
-            assert!(
-                !default_prior_device_path().exists(),
-                "prior selector cleared"
-            );
-            candidate
-        } else {
+        } else if !record_initial {
+            // Pre-existing owners without a row are not adopted by this fix.
             let (account, mut connection) = relogin_account(user, org);
             connection.api_base_url = api;
             FileAccountStore::default().save(&account).unwrap();
@@ -33219,8 +33205,34 @@ X-API-Key = "otel_redacted"
             KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
                 .save("synthetic-return-secret-a")
                 .unwrap();
-            "synthetic-return-secret-a".into()
-        };
+            return (device, "synthetic-return-secret-a".into());
+        }
+        let prior = prior_device_credential_for_registration().unwrap();
+        let (mut pending, secret) = owner_return_pending(user, org, device_id);
+        pending.api_base_url = api.clone();
+        pending
+            .claim_commit
+            .as_mut()
+            .unwrap()
+            .connection
+            .api_base_url = api;
+        pending.request_authority = Some(device_credential_request_authority(
+            "setup_claim",
+            device_id,
+            &machine,
+            prior.as_ref(),
+            Some(IDENTITY_CONTINUITY_CAPABILITY),
+        ));
+        select_owner_snapshot_namespace(
+            &mut pending,
+            &secret,
+            prior.as_ref(),
+            &FileOwnerSnapshotNamespaceStore::default(),
+            &default_support_dir(),
+        )
+        .unwrap();
+        promote_relogin(&pending, &secret, "setup");
+        clear_prior_device_credential().unwrap();
         (device, secret)
     }
 
