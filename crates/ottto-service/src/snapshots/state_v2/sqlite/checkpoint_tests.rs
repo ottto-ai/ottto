@@ -71,14 +71,31 @@ fn idle_releases_page_cache_and_next_pass_refills_it() {
         .unwrap()
         .execute_batch("PRAGMA mmap_size=0")
         .unwrap();
+    let mmap_size: i64 = db
+        .conn()
+        .unwrap()
+        .query_row("PRAGMA mmap_size", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(mmap_size, 0);
     let value = vec![b'x'; SAVE_BYTES];
     for (generation, quiet) in [false, true].into_iter().enumerate() {
         save(&mut db, generation as u64, "cached", &value);
+        assert_eq!(read(&mut db, "cached"), value);
+        db.maintenance(false).unwrap();
         let warm = serde_json::to_value(db.maintenance_stats()).unwrap();
-        assert!(warm["cache_used_bytes"].as_u64().unwrap() > 1024 * 1024);
+        let warm_bytes = warm["cache_used_bytes"].as_u64().unwrap();
+        // Cache retention depends on SQLite's process-wide soft heap pressure,
+        // not the payload size. Require a measurable release on either OS.
+        assert!(warm_bytes > 16 * 1024, "warm cache: {warm_bytes}");
+        let sqlite_heap = unsafe { rusqlite::ffi::sqlite3_memory_used() };
         db.between_cycles(quiet).unwrap();
         let idle = serde_json::to_value(db.maintenance_stats()).unwrap();
-        assert!(idle["cache_used_bytes"].as_u64().unwrap() < 64 * 1024);
+        let idle_bytes = idle["cache_used_bytes"].as_u64().unwrap();
+        eprintln!("idle cache quiet={quiet}: warm={warm_bytes} idle={idle_bytes} sqlite_heap={sqlite_heap}");
+        assert!(
+            idle_bytes < 64 * 1024 && idle_bytes < warm_bytes / 2,
+            "warm cache: {warm_bytes}, idle cache: {idle_bytes}"
+        );
         let cache_size: i64 = db
             .conn()
             .unwrap()
