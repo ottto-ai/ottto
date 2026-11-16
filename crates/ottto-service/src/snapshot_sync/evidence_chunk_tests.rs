@@ -431,6 +431,74 @@ fn twins_beside_another_family() {
     });
 }
 
+/// [money] A live cross-session content twin on the same page cannot hold
+/// ROOT merely because its family is packed into another evidence chunk.
+#[test]
+fn cross_session_content_twin_in_another_chunk_does_not_hold() {
+    with_e2(|| {
+        let mut c = Corpus::new("e2-cross-session-content-twin-chunks");
+        let twin = c.root(THIRD, &resumed(COPY, &[A, B, C]));
+        // Distinct sidecar request ids avoid the multi-root context-posture case.
+        c.evidence_for(
+            COPY,
+            &[api_for(COPY, C.0, 10, 100)],
+            &[trace_for(COPY, C.0, "")],
+        );
+        let old = ScanIndex::default();
+        let first = ready(&c, &E2ScanFixture::default(), old.clone(), 100, false);
+        assert_eq!(body(&first, COPY).unwrap().request_count, 3);
+        let mut prior = settle(&c, &old, first, &mut e2_progress());
+        let record = prior
+            .claude_request_census_for_test()
+            .get(&twin.to_string_lossy())
+            .expect("the settled twin is known to the census");
+        assert!(record.is_twin() && record.is_exact());
+        assert_eq!(record.request_hashes().len(), 3, "C extends ROOT's A, B");
+
+        let main = c.root(ROOT, &resumed(ROOT, &[A, B]));
+        c.evidence_for(
+            ROOT,
+            &[api(A.0, 10, 100), api(B.0, 10, 100)],
+            &[trace(A.0, ""), trace(B.0, "")],
+        );
+        assert!(prior.re_owe_effective_upload_body_witness_revision(&twin.to_string_lossy(), 2));
+        let scanner = E2ScanFixture::default();
+        let mut page = c.raw(&scanner, prior, 100, false, &[]);
+        assert!(scanner.paths().contains(&main) && scanner.paths().contains(&twin));
+        assert!(body(&page, ROOT).is_some() && body(&page, COPY).is_some());
+
+        let checks = streamed_checks(|| {
+            let before = crate::snapshot_sync::evidence_chunks_for_test();
+            page.enrich(&c);
+            assert!(
+                crate::snapshot_sync::evidence_chunks_for_test() - before >= 2,
+                "both nonzero family sidecars must force separate chunks"
+            );
+        });
+        assert_eq!(
+            checks.chunked, 1,
+            "the target page compared both references"
+        );
+        assert!(checks.terminal + checks.non_terminal > 0);
+        assert_eq!(
+            page.disposition
+                .request_owned_hold_reasons
+                .get("absent_content_twin")
+                .copied()
+                .unwrap_or(0),
+            0
+        );
+        // Before the fix ROOT was withheld here because T sat in another chunk.
+        let root = body(&page, ROOT).expect("ROOT publishes its body");
+        assert!(crate::snapshots::claude_request_money::is_request_owned_literal(root));
+        assert_eq!(root.request_count, 2);
+        assert!(!page
+            .disposition
+            .quarantined_fingerprints(&page.scan.snapshots)
+            .contains(&root.snapshot_fingerprint));
+    });
+}
+
 /// [money] Packing a page's families into evidence chunks emits exactly what
 /// the page as one chunk emits, and what a fold keeping every root's rows
 /// emits (all `StreamedChecks`), on non-terminal and terminal passes: a real
