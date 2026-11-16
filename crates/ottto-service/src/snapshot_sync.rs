@@ -17478,7 +17478,7 @@ mod tests {
                     source: SnapshotSource::Pi.api_slug().to_string(),
                     machine_id: "machine-preflight-test".to_string(),
                     collector_version: Some(collector_version()),
-                    snapshots,
+                    snapshots: snapshots.to_vec(),
                     upload_policy: SnapshotUploadPolicy::default(),
                     client_report: crate::client_report::ClientReport::empty(),
                 };
@@ -18138,7 +18138,7 @@ mod tests {
         let result = upload_resumable_batches(
             &items, poison_scope, &mut progress, &mut accepted, String::as_str,
             move |batch| {
-                if let Some(index) = batch.iter().position(|item| item == &poison) {
+                if let Some(index) = batch.iter().position(|item| *item == &poison) {
                     return Err(anyhow::Error::new(BatchRejected::from_response(422,
                         serde_json::json!({"errors":[{"loc":["body","snapshots",index,"compaction_timestamps"]}]}).to_string().as_bytes(), batch.len())));
                 }
@@ -18234,7 +18234,7 @@ mod tests {
                 String::as_str,
                 |batch| {
                     if batch.contains(&&poison) {
-                        let index = batch.iter().position(|item| item == &poison).unwrap();
+                        let index = batch.iter().position(|item| *item == &poison).unwrap();
                         Err(anyhow::Error::new(BatchRejected::from_response(422,
                             serde_json::json!({"errors":[{"loc":["body","snapshots",index,"field"]}]}).to_string().as_bytes(), batch.len())))
                     } else {
@@ -19051,12 +19051,12 @@ mod tests {
             |batch| {
                 let is_reconcile = batch
                     .iter()
-                    .all(|fingerprint| reconcile_class.contains(fingerprint));
+                    .all(|fingerprint| reconcile_class.contains(*fingerprint));
                 assert!(
                     is_reconcile
                         || batch
                             .iter()
-                            .all(|fingerprint| !reconcile_class.contains(fingerprint)),
+                            .all(|fingerprint| !reconcile_class.contains(*fingerprint)),
                     "ordinary and CAS-bootstrap reconciliation must never share one request"
                 );
                 observed_classes.push(is_reconcile);
@@ -19152,7 +19152,7 @@ mod tests {
         };
         let large = &items[1];
         let oversized = &items[2];
-        let wire = serde_json::to_value(request(items.clone())).unwrap();
+        let wire = serde_json::to_value(request(items.iter().collect::<Vec<_>>())).unwrap();
         let large_bytes = serde_json::to_vec(&wire["snapshots"][1]).unwrap().len();
         assert!(large_bytes > 128 * 1024 && large_bytes <= 640 * 1024);
         assert!(serde_json::to_vec(&wire["snapshots"][2]).unwrap().len() > 640 * 1024);
@@ -19191,7 +19191,7 @@ mod tests {
             |item| item.snapshot_fingerprint.as_str(),
             snapshot_upload_body_witness,
             |batch| {
-                let req = request(batch);
+                let req = request(batch.to_vec());
                 validate_snapshot_batch_request(&req).map_err(|reason| {
                     anyhow::Error::new(SnapshotBatchPreflightRejected { reason })
                 })?;
@@ -23498,7 +23498,7 @@ mod tests {
                             source: "codex".into(),
                             machine_id: "machine".into(),
                             collector_version: Some(collector_version()),
-                            snapshots,
+                            snapshots: snapshots.to_vec(),
                             upload_policy: SnapshotUploadPolicy::default(),
                             client_report: crate::client_report::ClientReport::empty(),
                         },
@@ -23727,7 +23727,7 @@ mod tests {
                     source: "codex".into(),
                     machine_id: "machine".into(),
                     collector_version: Some(collector_version()),
-                    snapshots,
+                    snapshots: snapshots.to_vec(),
                     upload_policy: SnapshotUploadPolicy::default(),
                     client_report: crate::client_report::ClientReport::empty(),
                 };

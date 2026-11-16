@@ -71,7 +71,7 @@ pub(super) fn upload_families(
         &mut InplaceRetryBudget::default(),
         |batch| {
             batches.push(batch.iter().map(|item| item.session.clone()).collect());
-            respond(&batch)
+            respond(batch)
         },
         |_| Ok(()),
     );

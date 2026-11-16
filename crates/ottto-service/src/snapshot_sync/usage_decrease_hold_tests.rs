@@ -118,7 +118,7 @@ fn upload(
         |i| i.snapshot_fingerprint.as_str(),
         snapshot_upload_body_witness,
         |batch| {
-            let response = respond(&batch);
+            let response = respond(batch);
             response.validate_entity_ack(&request(SnapshotSource::ClaudeCode, batch.to_vec()))?;
             Ok(response)
         },
@@ -402,7 +402,7 @@ fn non_literal_hold_is_an_invalid_ack_and_checkpoints_nothing() {
         |i| i.snapshot_fingerprint.as_str(),
         snapshot_upload_body_witness,
         |batch| {
-            let response = ack(&batch, &[(0, HELD, false)]);
+            let response = ack(batch, &[(0, HELD, false)]);
             response.validate_entity_ack(&request(SnapshotSource::ClaudeCode, batch.to_vec()))?;
             Ok(response)
         },

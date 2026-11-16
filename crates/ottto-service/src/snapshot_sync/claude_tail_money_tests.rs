@@ -1359,11 +1359,11 @@ fn deleted_sibling_lost_ack_settles_once() {
         );
         let items = page.scan.snapshots.clone();
         assert!(!items.is_empty(), "the live growth emits");
-        let lost = |_: &[SnapshotItem]| -> Result<crate::snapshot_client::SnapshotBatchResponse> {
+        let lost = |_: &[&SnapshotItem]| -> Result<crate::snapshot_client::SnapshotBatchResponse> {
             Err(anyhow::anyhow!("response lost after durable remote write"))
         };
         let refused =
-            |batch: &[SnapshotItem]| -> Result<crate::snapshot_client::SnapshotBatchResponse> {
+            |batch: &[&SnapshotItem]| -> Result<crate::snapshot_client::SnapshotBatchResponse> {
                 let mut response = ack(batch)?;
                 response.rejected_entities = std::mem::take(&mut response.accepted_entities)
                     .into_iter()
@@ -3174,7 +3174,7 @@ fn refused_or_not_stored_successor_cold_reopen_preserves_money() {
 }
 
 fn ack_with_disposition(
-    batch: &[SnapshotItem],
+    batch: &[&SnapshotItem],
     disposition: &str,
 ) -> Result<crate::snapshot_client::SnapshotBatchResponse> {
     let mut response = ack(batch)?;
@@ -3399,7 +3399,7 @@ fn under_cas(items: &[SnapshotItem], progress: &SnapshotUploadProgress) -> Vec<S
 /// The server's CAS check refuses ROOT's stale base and mints `challenge`;
 /// every other entity is accepted.
 fn refuse_root(
-    batch: &[SnapshotItem],
+    batch: &[&SnapshotItem],
     challenge: &str,
 ) -> Result<crate::snapshot_client::SnapshotBatchResponse> {
     let mut response = ack(batch)?;
@@ -3523,7 +3523,7 @@ fn mixed_route_acked(
 /// ACKs the daemon refused): each digest covers that union, and the ref
 /// echoes it.
 fn stray_row_echo_ack(
-    batch: &[SnapshotItem],
+    batch: &[&SnapshotItem],
 ) -> Result<crate::snapshot_client::SnapshotBatchResponse> {
     let asked =
         serde_json::to_value(request(batch))?["cache_state_ack_contract"] == "cache_state_ack:v1";

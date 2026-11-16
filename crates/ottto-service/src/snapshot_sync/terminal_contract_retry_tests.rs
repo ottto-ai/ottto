@@ -405,7 +405,7 @@ fn successful_contract_retry(restart_after_selection: bool) {
             |batch| {
                 assert_eq!(
                     batch,
-                    vec![held_fingerprint()],
+                    &[&held_fingerprint()],
                     "pre-existing ACK and refusal must not be uploaded"
                 );
                 offered.extend(batch.iter().copied().cloned());
@@ -676,7 +676,7 @@ fn contract_read_cap(outcome: InterruptedOutcome) {
                         |batch| {
                             assert_eq!(
                                 batch,
-                                vec![fixture.fingerprint.clone()],
+                                &[&fixture.fingerprint],
                                 "the retained exact ACK must never be offered again"
                             );
                             Ok(entity_ack_batch(&[], &[], &batch))

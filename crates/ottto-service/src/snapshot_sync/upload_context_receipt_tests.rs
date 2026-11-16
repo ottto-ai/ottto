@@ -60,7 +60,7 @@ pub(crate) fn exact_acks(
                     source: source.api_slug().into(),
                     machine_id: "synthetic".into(),
                     collector_version: None,
-                    snapshots: batch,
+                    snapshots: batch.to_vec(),
                     upload_policy: SnapshotUploadPolicy::default(),
                     client_report: crate::client_report::ClientReport::empty(),
                 })
@@ -538,7 +538,7 @@ impl Uploader {
                     source: source.api_slug().into(),
                     machine_id: "synthetic".into(),
                     collector_version: None,
-                    snapshots: batch,
+                    snapshots: batch.to_vec(),
                     upload_policy: SnapshotUploadPolicy::default(),
                     client_report: crate::client_report::ClientReport::empty(),
                 })?;

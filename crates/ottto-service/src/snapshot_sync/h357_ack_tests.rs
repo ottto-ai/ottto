@@ -160,7 +160,7 @@ fn h357_mixed_50_43_exact_ack_restart_holds_only_rejected_bodies() {
         |i| i.snapshot_fingerprint.as_str(),
         snapshot_upload_body_witness,
         |batch| {
-            let ack = response(&batch, 7);
+            let ack = response(batch, 7);
             ack.validate_entity_ack(&request(batch.to_vec()))?;
             Ok(ack)
         },
@@ -220,7 +220,7 @@ fn h357_missing_malformed_unknown_or_wrong_body_ack_never_certifies_a_page() {
             |i| i.snapshot_fingerprint.as_str(),
             snapshot_upload_body_witness,
             |batch| {
-                let mut ack = response(&batch, 1);
+                let mut ack = response(batch, 1);
                 match case {
                     "missing" => {
                         ack.rejected_entities.clear();
@@ -271,7 +271,7 @@ fn h357_missing_malformed_unknown_or_wrong_body_ack_never_certifies_a_page() {
         snapshot_upload_body_witness,
         |batch| {
             sends += 1;
-            let mut ack = response(&batch, 0);
+            let mut ack = response(batch, 0);
             if sends == 1 {
                 // `response` reverses order: accepted_entities[0] is batch[1].
                 ack.accepted_entities[0].body_witness_digest = Some("0".repeat(64));
@@ -332,7 +332,7 @@ fn h357_exact_ack_survives_later_timeout_and_changed_body_stays_owed() {
             if pages == 2 {
                 return Err(anyhow!("synthetic timeout before ACK"));
             }
-            let ack = response(&batch, 0);
+            let ack = response(batch, 0);
             ack.validate_entity_ack(&request(batch.to_vec()))?;
             Ok(ack)
         },
@@ -510,7 +510,7 @@ fn h359_permanent_exact_body_survives_retirement_epoch_restart_and_premature_tim
         |i| i.snapshot_fingerprint.as_str(),
         snapshot_upload_body_witness,
         |batch| {
-            let ack = response(&batch, 0);
+            let ack = response(batch, 0);
             ack.validate_entity_ack(&request(batch.to_vec()))?;
             Ok(ack)
         },
@@ -539,7 +539,7 @@ fn h359_all_rejected(reason: &str) -> (SnapshotUploadProgress, ResumableUploadRe
         |i| i.snapshot_fingerprint.as_str(),
         snapshot_upload_body_witness,
         |batch| {
-            let ack = response_with_reason(&batch, 2, reason);
+            let ack = response_with_reason(batch, 2, reason);
             ack.validate_entity_ack(&request(batch.to_vec()))?;
             Ok(ack)
         },
@@ -644,7 +644,7 @@ fn h359_unrelated_refusal_never_blocks_a_healthy_exact_probe_page() {
         |i| i.snapshot_fingerprint.as_str(),
         snapshot_upload_body_witness,
         |batch| {
-            let ack = response(&batch, 0);
+            let ack = response(batch, 0);
             ack.validate_entity_ack(&request(batch.to_vec()))?;
             Ok(ack)
         },
@@ -796,7 +796,7 @@ fn h359_refused_cache_probe_settles_without_head_and_healthy_sibling_continues()
         |batch| {
             assert_eq!(batch.len(), 1);
             assert_ne!(batch[0].snapshot_fingerprint, rejected_fp);
-            let mut ack = response(&batch, 0);
+            let mut ack = response(batch, 0);
             for reference in ack
                 .accepted_entities
                 .iter_mut()
@@ -1019,7 +1019,7 @@ fn h360_mixed_siblings_held_probe_does_not_block_healthy_head_or_unrelated_page(
                 "held probe bytes never resend"
             );
             calls.push((batch.len(), cas));
-            let mut ack = response(&batch, 0);
+            let mut ack = response(batch, 0);
             if cas {
                 for reference in ack
                     .accepted_entities
@@ -1082,7 +1082,7 @@ fn h360_mixed_siblings_held_probe_does_not_block_healthy_head_or_unrelated_page(
                     Some(head_for(item.source_session_id.as_str()))
                 );
             }
-            let mut ack = response(&batch, 0);
+            let mut ack = response(batch, 0);
             for reference in ack
                 .accepted_entities
                 .iter_mut()
@@ -1201,7 +1201,7 @@ fn h360_preflight_rejected_probe_self_quarantines_then_settles_as_held() {
                     reason: format!("snapshot[{position}] wire body exceeds the item byte limit"),
                 }));
             }
-            let mut ack = response(&batch, 0);
+            let mut ack = response(batch, 0);
             if cas {
                 for reference in ack
                     .accepted_entities
@@ -1306,7 +1306,7 @@ fn h360_probe_conflict_defers_without_source_abort_and_merges_count() {
         &mut ledger,
         |batch, cas| {
             calls.push((batch.len(), cas));
-            let mut ack = response(&batch, 0);
+            let mut ack = response(batch, 0);
             if cas {
                 for reference in ack
                     .accepted_entities
@@ -1370,7 +1370,7 @@ fn h360_probe_conflict_defers_without_source_abort_and_merges_count() {
         |batch| {
             assert_eq!(batch.len(), 1);
             assert_ne!(batch[0].snapshot_fingerprint, conflict_fp);
-            let mut ack = response(&batch, 0);
+            let mut ack = response(batch, 0);
             for reference in ack
                 .accepted_entities
                 .iter_mut()
@@ -1456,7 +1456,7 @@ fn h360_probe_conflict_defers_without_source_abort_and_merges_count() {
         "h360-mixed",
         &mut mixed,
         |batch, cas| {
-            let mut ack = response(&batch, 0);
+            let mut ack = response(batch, 0);
             if cas {
                 for reference in ack
                     .accepted_entities
@@ -1627,7 +1627,7 @@ fn h360_legacy_count_only_cas_ack_still_fails_closed_without_head() {
         &mut ledger,
         |batch, cas| {
             calls.push((batch.len(), cas));
-            let mut ack = response(&batch, 0);
+            let mut ack = response(batch, 0);
             if cas {
                 ack.entity_ack_contract = None;
                 ack.accepted_entities.clear();
@@ -1673,7 +1673,7 @@ fn h360_body_witness_mismatch_in_cas_stage_mints_no_head() {
         "h360-witness",
         &mut ledger,
         |batch, cas| {
-            let mut ack = response(&batch, 0);
+            let mut ack = response(batch, 0);
             if cas {
                 saves_before_cas.set(Some(saves.get()));
                 for reference in ack
@@ -1739,7 +1739,7 @@ fn h360_persist_failure_after_cas_ack_certifies_nothing_and_resumes_cas_only() {
         &mut ledger,
         |batch, cas| {
             cas_stage.set(cas);
-            let mut ack = response(&batch, 0);
+            let mut ack = response(batch, 0);
             if cas {
                 for reference in ack
                     .accepted_entities
@@ -1788,7 +1788,7 @@ fn h360_persist_failure_after_cas_ack_certifies_nothing_and_resumes_cas_only() {
         &mut restarted,
         |batch, cas| {
             calls.push((batch.len(), cas));
-            let mut ack = response(&batch, 0);
+            let mut ack = response(batch, 0);
             for reference in ack
                 .accepted_entities
                 .iter_mut()
@@ -1958,7 +1958,7 @@ fn h360_restart_restores_held_probe_quarantine_from_index_and_retries_when_due()
         |batch, cas| {
             assert_eq!(batch[0].snapshot_fingerprint, fp);
             calls.push((batch.len(), cas));
-            let mut ack = response(&batch, 0);
+            let mut ack = response(batch, 0);
             if cas {
                 for reference in ack
                     .accepted_entities

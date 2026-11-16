@@ -578,7 +578,7 @@ fn lost_ack_retry_preserves_receiver_money_and_account_switches() {
                 }
                 // The receiver records the stored identity shares; this exact
                 // response is lost before the sender can validate it.
-                let (status, _, _) = upload(items, &mut receiver, ack);
+                let (status, _, _) = upload(&owned_batch(items), &mut receiver, ack);
                 assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
                 Err(anyhow!("synthetic lost ACK"))
             });
@@ -667,7 +667,7 @@ fn lost_ack_retry_preserves_receiver_money_and_account_switches() {
                     }
                     destination.insert(item.source_session_id.clone(), item.clone());
                 }
-                let (status, _, _) = upload(items, &mut receiver, ack);
+                let (status, _, _) = upload(&owned_batch(items), &mut receiver, ack);
                 assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
                 ack(items)
             });
@@ -1364,3 +1364,7 @@ fn codex_inside_window_due_retry_is_offered_by_the_narrow_scan() {
 
 #[path = "progress_rows_oracle_tests.rs"]
 mod progress_rows_oracle_tests;
+
+fn owned_batch(items: &[&SnapshotItem]) -> Vec<SnapshotItem> {
+    items.iter().copied().cloned().collect()
+}

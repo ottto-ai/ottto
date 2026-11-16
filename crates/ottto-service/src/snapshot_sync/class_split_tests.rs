@@ -1079,7 +1079,7 @@ fn assert_lost_class_request_resends_only_unsettled(items: &[FamilyItem], first:
             &mut InplaceRetryBudget::default(),
             |batch| {
                 sent.push(batch[0].class);
-                let response = serve(&batch);
+                let response = serve(batch);
                 if batch[0].class == lost && !save_fails {
                     return Err(anyhow!("synthetic lost reply"));
                 }
