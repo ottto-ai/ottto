@@ -173,8 +173,13 @@ Two settings in the web dashboard (app.ottto.net → **Settings → Data & priva
   session has no title, and, for prompts you repeat, a short start of that prompt (96 bytes at
   most, with paths removed), so you can recognize sessions. It also sends project
   folder and repository names, the names of skills, custom agents, MCP servers and MCP tools, and
-  the repository paths of files in a session's context. Turning it off stops those. Built-in tool
-  names, counts and account metadata are still sent.
+  the repository paths of files in a session's context. With the **MCP inventory harvesting**
+  setting also on (the default), it sends each local MCP server's configured name, transport kind,
+  whether it answered, whether it is disabled and the character length of its instructions (never
+  their text), and each tool's name, description and full input schema as the server reported them.
+  Server commands, arguments, environment values, working directories and URLs are not sent
+  ([details](docs/privacy.md)). Turning Readable labels off stops all of those. Built-in tool names,
+  counts and account metadata are still sent.
 - **Session links** (off by default; a workspace admin setting). With it on, Ottto also sends pull
   request, issue and commit links found in a session. They name their repository even with
   Readable labels off.

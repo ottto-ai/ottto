@@ -57,7 +57,10 @@ removed.
 
 The local platform must not upload raw prompts, raw responses, tool output,
 command output, browser cookies, OAuth credentials, API keys, passwords,
-absolute local paths.
+absolute local paths. MCP tool descriptions and input schemas are the exception:
+they are sent verbatim as the MCP server reported them, so they can contain
+whatever text the server put there, including paths. Ottto does not add paths to
+them.
 
 Raw provider account and organization ids are identifiers, not credentials.
 Agent status uploads carry them on the account block and on plan observations,
