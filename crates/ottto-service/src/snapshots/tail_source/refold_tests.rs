@@ -180,6 +180,21 @@ fn a_conflict_owed_session_reads_native_full() {
         .wire_source_session_id(&path)
         .unwrap();
     let owed = crate::snapshot_sync::cache_session_key(&session);
+    let twin =
+        crate::snapshots::claude_request_census::ClaudeRequestCensusRecord::synthetic_for_test(
+            &"a".repeat(64),
+            7,
+            crate::snapshots::claude_request_census::ClaudeRequestCensusShape::Exact,
+            vec![1],
+        )
+        .with_twin_for_test(true);
+    route
+        .index
+        .claude_request_census_mut_for_test()
+        .insert_for_test(&key, twin);
+    assert!(
+        !crate::snapshots::claude_request_census::forced_member_needs_native(&route.index, &key)
+    );
     // Another session's challenge is not this file's.
     route
         .index

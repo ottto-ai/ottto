@@ -1920,7 +1920,9 @@ fn skipped_ids(item: &SnapshotItem) -> impl Iterator<Item = &String> + '_ {
 /// dark only counts. Returns the removals to store (gate on only): the caller
 /// applies them to the index
 /// (`CopyRemovalUpdates::apply`). Removals precede ordinary accepted-share
-/// reconciliation.
+/// reconciliation. Single-page callers (tests) plan the content-twin holds
+/// over `items`.
+#[cfg(test)]
 pub(crate) fn decide_page_copies(
     items: &mut [SnapshotItem],
     index: &ScanIndex,
@@ -4452,6 +4454,8 @@ pub(crate) enum TelemetryRead {
 /// identity already tagged, overflow). Their items stay on the page
 /// unchanged so the caller holds them (`hold_request_owned`): a removed item
 /// would let the page settle its file without a body. Gate off: empty.
+/// Single-chunk callers (tests) plan the content-twin holds over `items`.
+#[cfg(test)]
 pub(crate) fn finish_page(
     items: &mut Vec<SnapshotItem>,
     index: &ScanIndex,

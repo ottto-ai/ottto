@@ -879,10 +879,12 @@ pub(super) fn after_ordinary_codex_page(
     clear(&mut CodexCadence, &TICKET);
 }
 
-/// An ordinary Codex pass failed: no continuation follows it.
-pub(super) fn after_ordinary_codex_failure() {
-    with_source_cadence(SnapshotSource::Codex, SourceCadence::clear_continuation);
-    clear(&mut CodexCadence, &TICKET);
+/// A failed source pass leaves no paced request or cursor continuation.
+pub(super) fn after_ordinary_source_failure(source: SnapshotSource) {
+    with_source_cadence(source, SourceCadence::clear_continuation);
+    if source == SnapshotSource::Codex {
+        clear(&mut CodexCadence, &TICKET);
+    }
 }
 
 /// How an ordinary cycle ended, for the continuation it leaves behind. A cycle

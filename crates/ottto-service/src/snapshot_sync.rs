@@ -4199,7 +4199,15 @@ fn paced_scan_due() -> Option<Instant> {
         SnapshotSource::Pi,
     ]
     .into_iter()
-    .filter_map(source_paced_due)
+    .filter_map(|source| {
+        let paced = with_source_cadence(source, |cadence| cadence.paced_scan_due()).flatten()?;
+        let deadlines = source_upload_deadlines().lock().ok()?;
+        Some(
+            deadlines
+                .get(source.api_slug())
+                .map_or(paced, |due| paced.max(*due)),
+        )
+    })
     .min()
 }
 
@@ -4237,8 +4245,7 @@ fn clear_cadence_state_for_test() {
     }
 }
 
-/// Base of the local backoff ladder used when the server sheds without saying
-/// for how long.
+/// Base of the local backoff ladder for missing headers and repeated sheds.
 const SHED_BACKOFF_BASE: Duration = Duration::from_secs(30);
 
 /// Uniform random in `[0, span]`, from the OS entropy source already used for
@@ -4310,7 +4317,7 @@ fn cadence_phase_offset(client_id: &str, interval: Duration) -> Duration {
     Duration::from_secs(u64::from_be_bytes(bytes) % seconds)
 }
 
-/// Consecutive sheds per source, so the no-`Retry-After` ladder actually climbs.
+/// Consecutive sheds per source, so persistent refusal climbs the ladder.
 ///
 /// Without it every shed draws from `random(0, 30s)`, which the five-minute cycle
 /// has already outlived by the next tick — a ladder that never leaves its first
@@ -4334,8 +4341,11 @@ fn note_shed_and_backoff(source: SnapshotSource, retry_after: Option<Duration>) 
         Err(_) => 0,
     };
     match retry_after {
-        // The server named a time. Its number wins over our ladder — it knows
-        // when it will be ready and we do not.
+        // The server's time is always the floor; repeated sheds also draw
+        // from the existing ladder to ease sustained refusal.
+        Some(retry_after) if attempt > 0 => {
+            shed_backoff(Some(retry_after)).max(full_jitter_backoff(attempt))
+        }
         Some(retry_after) => shed_backoff(Some(retry_after)),
         None => full_jitter_backoff(attempt),
     }
@@ -5125,10 +5135,8 @@ fn collect_file_activity_with_retry(
     let deadline = crate::scan_clock::now() + wait;
     let mut watcher = watcher;
     loop {
-        let now = crate::scan_clock::now();
-        if now >= deadline {
-            return false;
-        }
+        // A delivery retry may share the ordinary deadline. Service it before
+        // returning to collection, which can replace its retained checkpoint.
         let wake = retry_boundary(deadline).min(deadline);
         let now = crate::scan_clock::now();
         if now >= deadline {
@@ -5911,8 +5919,8 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
     }
     fn outcome(&mut self, source: SnapshotSource, result: Result<()>) {
         continuation::leave_source_qos(&mut self.paced_qos);
-        if source == SnapshotSource::Codex && result.is_err() {
-            continuation::after_ordinary_codex_failure();
+        if result.is_err() {
+            continuation::after_ordinary_source_failure(source);
         }
         match result {
             Ok(()) => self.transport_cycle.note_success(),
@@ -17617,7 +17625,7 @@ mod tests {
     }
 
     #[test]
-    #[serial(client_report)]
+    #[serial(client_report, source_cadences, source_upload_deadlines)]
     fn a_shed_page_stops_the_pass_and_keeps_earlier_pages_checkpointed() {
         let poison_scope = &unique_poison_scope();
         use crate::client_report::{observe, reset_for_test, ClientReportReason};
@@ -17660,11 +17668,13 @@ mod tests {
                 // The pass reports the server's own number; turning it into a
                 // wait belongs to the caller, which owns the shed history.
                 assert_eq!(retry_after, Some(Duration::from_secs(60)));
+                clear_shed_streak(SnapshotSource::Pi);
                 let honoured = note_shed_and_backoff(SnapshotSource::Pi, retry_after);
                 // Retry-After x uniform(1.0, 1.2): never before the server's 60s,
                 // never more than 20% late.
                 assert!(honoured >= Duration::from_secs(60));
                 assert!(honoured <= Duration::from_secs(72));
+                clear_shed_streak(SnapshotSource::Pi);
             }
             other => panic!("expected a shed result, got {other:?}"),
         }
