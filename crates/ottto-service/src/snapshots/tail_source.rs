@@ -22,7 +22,7 @@ pub(in crate::snapshots) mod seam;
 
 /// Decode only Claude's reduction head; metadata-only/corrupt heads prove nothing.
 pub(in crate::snapshots) fn claude_head_session(revision: u32, head: &[u8]) -> Option<String> {
-    let mut acc = SnapshotAccumulator::default();
+    let mut acc = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
     claude::Claude::decode_head(revision, head, &mut acc).ok()?;
     acc.source_session_id
 }
