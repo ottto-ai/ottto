@@ -122,7 +122,9 @@ impl ScanTraversalCounts {
     /// could not enter or finish, an object it could not open or read, a root
     /// that vanished, or a line the parser rejected. These keep their retry
     /// semantics: the census stays red and the bounded retry latch re-walks.
-    pub(in crate::snapshots) fn has_retryable_problems(&self) -> bool {
+    /// Callers outside the traversal ask `ScanTraversalCheckpoint`, which also
+    /// counts an unreleased Codex inventory hold.
+    pub(super) fn has_retryable_problems(&self) -> bool {
         self.symlink_rejected_count > 0
             || self.directory_entry_cap_exceeded_count > 0
             || self.unreadable_path_count > 0
@@ -134,16 +136,12 @@ impl ScanTraversalCounts {
 
     /// Non-progressing residue this generation has not yet disclosed as
     /// terminal.
-    pub(in crate::snapshots) fn has_unsettled_residue(&self) -> bool {
+    pub(super) fn has_unsettled_residue(&self) -> bool {
         self.ownership_incomplete_file_count > self.terminal_ownership_incomplete_file_count
             || self.zero_snapshot_usage_evidence_count
                 > self.terminal_zero_snapshot_usage_evidence_count
             || self.recognized_usage_drop_count > self.terminal_recognized_usage_drop_count
             || self.dropped_usage_record_count > self.terminal_dropped_usage_record_count
-    }
-
-    pub(in crate::snapshots) fn has_errors(&self) -> bool {
-        self.has_retryable_problems() || self.has_unsettled_residue()
     }
 
     /// Promote the non-progressing residue to terminal for this generation.
@@ -155,7 +153,7 @@ impl ScanTraversalCounts {
     /// assignment, not an accumulation, so a retained traversal that parses
     /// further pages settles again from the counts it actually re-derived.
     /// Returns true when something was newly settled.
-    pub(in crate::snapshots) fn settle_non_progressing_residue(&mut self) -> bool {
+    pub(super) fn settle_non_progressing_residue(&mut self) -> bool {
         if self.has_retryable_problems() || !self.has_unsettled_residue() {
             return false;
         }
@@ -285,6 +283,27 @@ impl ScanTraversalCheckpoint {
             .iter()
             .filter(|root| path.starts_with(root))
             .max_by_key(|root| root.components().count())
+    }
+
+    /// The counts' retryable loss, or a Codex inventory hold that still owes
+    /// its candidates a page with a complete inventory. The hold is the gate,
+    /// so it clears when the hold is released, not when counts are retracted.
+    pub(in crate::snapshots) fn has_retryable_problems(&self) -> bool {
+        self.counts.has_retryable_problems() || self.residue.codex_inventory_hold.is_some()
+    }
+
+    pub(in crate::snapshots) fn has_unsettled_residue(&self) -> bool {
+        self.counts.has_unsettled_residue()
+    }
+
+    pub(in crate::snapshots) fn has_errors(&self) -> bool {
+        self.has_retryable_problems() || self.has_unsettled_residue()
+    }
+
+    /// `ScanTraversalCounts::settle_non_progressing_residue`, vetoed while a
+    /// retryable problem, including an inventory hold, remains.
+    pub(in crate::snapshots) fn settle_non_progressing_residue(&mut self) -> bool {
+        !self.has_retryable_problems() && self.counts.settle_non_progressing_residue()
     }
 }
 
@@ -501,3 +520,51 @@ crate::heap_layout_bound::fields!(CodexInventoryHold; owed, refused_headers, out
 crate::heap_layout_bound::fields!(TerminalJsonlDisposition; source_file_fingerprint, parser_generation, loss);
 crate::heap_layout_bound::fields!(TerminalJsonlLoss; malformed_json_line_count, invalid_utf8_line_count, recognized_usage_drop_count, dropped_usage_record_count);
 crate::heap_layout_bound::fields!(UploadAckRetirementHandoff; destination_namespace_hash, committed_generation, bodies, pending_bodies);
+
+#[cfg(test)]
+mod hold_gate_tests {
+    use super::*;
+
+    /// Claude and Pi never record an inventory hold. Without one, every
+    /// checkpoint predicate and the settlement equal the counts' own.
+    #[test]
+    fn checkpoint_predicates_equal_the_counts_without_a_hold() {
+        let shapes: [fn(&mut ScanTraversalCounts); 9] = [
+            |_| {},
+            |counts| counts.symlink_rejected_count = 1,
+            |counts| counts.directory_entry_cap_exceeded_count = 1,
+            |counts| counts.unreadable_path_count = 1,
+            |counts| counts.disappeared_file_count = 1,
+            |counts| counts.malformed_json_line_count = 1,
+            |counts| counts.invalid_utf8_line_count = 1,
+            |counts| counts.over_line_cap_count = 1,
+            |counts| counts.ownership_incomplete_file_count = 1,
+        ];
+        for residue in [false, true] {
+            for shape in shapes {
+                let mut counts = ScanTraversalCounts {
+                    zero_snapshot_usage_evidence_count: usize::from(residue),
+                    ..ScanTraversalCounts::default()
+                };
+                shape(&mut counts);
+                let mut checkpoint = ScanTraversalCheckpoint {
+                    counts: counts.clone(),
+                    ..crate::snapshots::tests::traversal_checkpoint()
+                };
+                let retryable = counts.has_retryable_problems();
+                let unsettled = counts.has_unsettled_residue();
+                assert_eq!(checkpoint.has_retryable_problems(), retryable);
+                assert_eq!(checkpoint.has_unsettled_residue(), unsettled);
+                assert_eq!(checkpoint.has_errors(), retryable || unsettled);
+                assert_eq!(
+                    checkpoint.settle_non_progressing_residue(),
+                    counts.settle_non_progressing_residue()
+                );
+                assert_eq!(
+                    serde_json::to_value(&checkpoint.counts).unwrap(),
+                    serde_json::to_value(&counts).unwrap()
+                );
+            }
+        }
+    }
+}

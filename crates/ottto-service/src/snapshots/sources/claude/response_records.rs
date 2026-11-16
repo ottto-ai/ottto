@@ -569,7 +569,7 @@ crate::durable_tail_codec::durable_struct!(CompactClaudeResponseRecord {
 /// can append an earlier progressive content-block observation after a later
 /// one, so response-local observations are retained until the file is complete
 /// and then ordered by their provider timestamps. They are retained in the
-/// compact form of `claude_response_records` and decoded back to this form
+/// compact form of `response_records` and decoded back to this form
 /// before resolution.
 #[derive(Debug, Clone, PartialEq)]
 pub(in crate::snapshots) struct ClaudeResponseRecord {
@@ -749,9 +749,8 @@ impl ClaudeResponseObservation {
         if self.record_limit_exceeded {
             return Err(ClaudeResolveFailure::Decode);
         }
-        let mut records =
-            claude_response_records::decode_records(self.records.into_vec(), selectors)
-                .ok_or(ClaudeResolveFailure::Decode)?;
+        let mut records = decode_records(self.records.into_vec(), selectors)
+            .ok_or(ClaudeResolveFailure::Decode)?;
         // Provider time is authoritative only when it proves a complete order
         // for this response. Mixed valid/missing timestamps retain physical
         // append order, preserving the conservative legacy behavior instead

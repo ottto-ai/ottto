@@ -123,6 +123,16 @@ pub fn clear_active_sessions(
     )
 }
 
+/// Returns the parsed activity and ceiling check; future times remain available
+/// to the existing watermark bookkeeping even when excluded from local status.
+pub(crate) fn parse_session_activity(
+    activity: &str,
+    activity_ceiling: OffsetDateTime,
+) -> Option<(OffsetDateTime, bool)> {
+    let at = OffsetDateTime::parse(activity, &Rfc3339).ok()?;
+    Some((at, at <= activity_ceiling))
+}
+
 #[expect(clippy::too_many_arguments, reason = "9 args; no options struct yet")]
 fn reconcile_with_registrations(
     support_dir: &Path,
@@ -150,6 +160,22 @@ fn reconcile_with_registrations(
     let activity_ceiling = now + Duration::minutes(5);
     let watermark_cutoff = now - Duration::days(WATERMARK_RETENTION_DAYS);
 
+    // Incremental scans can omit every session. Carry the historical maximum;
+    // seed older caches once from ceiling-filtered, best-effort watermarks.
+    let mut source_last_activity_at = cache
+        .reconciliation
+        .as_ref()
+        .and_then(|previous| previous.last_activity_at.as_deref())
+        .and_then(|at| OffsetDateTime::parse(at, &Rfc3339).ok())
+        .or_else(|| {
+            cache
+                .watermarks
+                .values()
+                .filter_map(|at| OffsetDateTime::parse(at, &Rfc3339).ok())
+                .filter(|at| *at <= activity_ceiling)
+                .max()
+        });
+
     let mut changed = BTreeMap::<String, ActiveSession>::new();
     let mut selected_snapshots = BTreeMap::new();
     // Recent snapshots this scan re-read without advanced activity. A listed
@@ -159,22 +185,27 @@ fn reconcile_with_registrations(
         let Some(last_activity) = snapshot.source_last_activity_at.as_deref() else {
             continue;
         };
-        let Ok(last_activity_at) = OffsetDateTime::parse(last_activity, &Rfc3339) else {
+        let Some((last_activity_at, within_ceiling)) =
+            parse_session_activity(last_activity, activity_ceiling)
+        else {
             continue;
         };
+        if within_ceiling {
+            source_last_activity_at = source_last_activity_at.max(Some(last_activity_at));
+        }
         let previous = cache.watermarks.get(&snapshot.source_session_id).cloned();
         let advanced = previous
             .as_deref()
             .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
             .map_or(true, |value| last_activity_at > value);
 
-        if advanced && last_activity_at >= activity_cutoff && last_activity_at <= activity_ceiling {
+        if advanced && last_activity_at >= activity_cutoff && within_ceiling {
             changed.insert(
                 snapshot.source_session_id.clone(),
                 active_session_from_snapshot(source, snapshot, agent_status),
             );
             selected_snapshots.insert(snapshot.source_session_id.clone(), snapshot);
-        } else if last_activity_at >= activity_cutoff && last_activity_at <= activity_ceiling {
+        } else if last_activity_at >= activity_cutoff && within_ceiling {
             let newer = observed
                 .get(snapshot.source_session_id.as_str())
                 .map_or(true, |seen| {
@@ -316,6 +347,9 @@ fn reconcile_with_registrations(
     let reconciliation = ActiveSessionReconciliation {
         scan_started_at: scan_started_at.map(str::to_string),
         reconciled_at: reconciled_at.to_string(),
+        last_activity_at: source_last_activity_at
+            .map(|at| at.format(&Rfc3339))
+            .transpose()?,
         active_window_seconds: activity_window.whole_seconds() as u64,
         changed_session_count,
         sessions,
@@ -1656,6 +1690,56 @@ mod tests {
     }
 
     #[test]
+    fn last_activity_cache_cases() {
+        const PAST: &str = "2026-07-19T10:04:00Z";
+        const FUTURE: &str = "2026-07-20T10:04:00Z";
+        const NOW: &str = "2026-07-19T10:05:00Z";
+        let legacy = serde_json::json!({
+            "watermarks": {"real": PAST, "future": FUTURE, "invalid": "not-a-time"},
+            "reconciliation": {"reconciled_at": NOW, "changed_session_count": 0, "sessions": []}
+        });
+        let mut carried = legacy.clone();
+        carried["reconciliation"]["last_activity_at"] = PAST.into();
+        carried["watermarks"] = serde_json::json!({});
+        let empty = serde_json::json!({});
+        let candidates = [FUTURE, PAST, "not-a-time"];
+        let older = serde_json::json!({"reconciliation": legacy["reconciliation"]});
+        for (name, cached, activity, expected) in [
+            ("empty-scan-carry", carried, &[][..], Some(PAST)),
+            ("ceiling-before-max", empty, &candidates, Some(PAST)),
+            ("legacy-seed", legacy.clone(), &[][..], Some(PAST)),
+            ("older-cache-decode", older, &[][..], None),
+        ] {
+            let dir = temp_dir(name);
+            let source = SnapshotSource::Codex;
+            let cache: ActiveSessionCache = serde_json::from_value(cached).unwrap();
+            write_cache(&active_session_cache_path(&dir, source), &cache).unwrap();
+            let snapshots = activity
+                .iter()
+                .enumerate()
+                .map(|(i, at)| {
+                    let mut snapshot = test_snapshot(&format!("s{i}"), at);
+                    snapshot.model_usage.clear();
+                    snapshot.usage_buckets.clear();
+                    snapshot
+                })
+                .collect::<Vec<_>>();
+            let observed = reconcile_active_sessions(
+                &dir,
+                source,
+                &snapshots,
+                None,
+                None,
+                NOW,
+                std::time::Duration::from_secs(300),
+            )
+            .unwrap();
+            assert_eq!(observed.last_activity_at.as_deref(), expected, "{name}");
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
     fn watermarks_expire_by_age_only() {
         let dir = temp_dir("watermark-age");
         let path = active_session_cache_path(&dir, SnapshotSource::ClaudeCode);
@@ -2208,6 +2292,10 @@ mod tests {
         let cleared = clear_active_sessions(&dir, SnapshotSource::Codex, "2026-07-19T10:06:00Z")
             .expect("cleared reconciliation");
         assert!(cleared.sessions.is_empty());
+        assert_eq!(
+            cleared.last_activity_at.as_deref(),
+            Some("2026-07-19T10:04:00Z")
+        );
         let after = reconcile_active_sessions(
             &dir,
             SnapshotSource::Codex,

@@ -204,15 +204,19 @@ refuse_denied_title() {
 # name the newest check run that belongs to a pull_request workflow run for
 # this PR and base in that check's workflow. <verdict> is success (all passed), red (at least one
 # finished without success; <detail> names them) or wait (<detail> lists the
-# others as missing, pending or notready:<skipped|neutral>). A check-runs reply
-# that does not hold every run of the commit is "wait", never a verdict.
+# others as missing, pending or notready:<skipped|neutral>). Check runs are read
+# page by page (a busy commit can have more than 100); a listing that still does
+# not hold every run of the commit is "wait", never a verdict.
 # Returns non-zero on API errors. GitHub leaves pull_requests empty on runs for
 # fork PRs, so for a cross-repository PR a run with no PR links counts when its
 # head repository and branch match the PR's.
 checks_status() {
   local sha="$1" checks runs
-  checks="$(gh api "repos/{owner}/{repo}/commits/$sha/check-runs?filter=all&per_page=100")" \
-    || return 1
+  checks="$(gh api "repos/{owner}/{repo}/commits/$sha/check-runs?filter=all&per_page=100" \
+    --paginate --jq '{total_count, check_runs}')" || return 1
+  checks="$(printf '%s\n' "$checks" | jq -s '{
+    total_count: (map(.total_count // 0) | max // 0),
+    check_runs: (map(.check_runs // []) | add // [] | unique_by(.id))}')" || return 1
   runs="$(gh api "repos/{owner}/{repo}/actions/runs?head_sha=$sha&event=pull_request&per_page=100")" \
     || return 1
   jq -nr \
@@ -253,7 +257,7 @@ checks_status() {
                 end) } ] as $states
       | [ $states[] | select(.state | startswith("red:")) ] as $red
       | if ($checks.total_count // 0) > ($checks.check_runs // [] | length) then
-          "wait|commit has \($checks.total_count) check runs, more than one page; not judged"
+          "wait|commit has \($checks.total_count) check runs, listing returned \($checks.check_runs | length); not judged"
         elif ($red | length) > 0 then
           "red|" + ([ $red[] | "\"\(.name)\" concluded \(.state | ltrimstr("red:"))" ]
                     | join(", "))

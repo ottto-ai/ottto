@@ -26,7 +26,8 @@ impl std::fmt::Debug for RawRows {
 
 #[derive(Default)]
 pub(in crate::snapshots) struct SidecarFacts {
-    pub homes: StampedFacts<PathBuf, Arc<codex_root_copies::RootSidecar>, [SourceStamp; 3]>,
+    pub homes:
+        StampedFacts<PathBuf, Arc<sources::codex::root_copies::RootSidecar>, [SourceStamp; 3]>,
     heap_bytes: usize,
 }
 impl HeapLayoutBound for SidecarFacts {
@@ -179,7 +180,10 @@ impl SidecarFacts {
                     .saturating_add(
                         crate::heap_layout_bound::tree_node_bytes::<
                             PathBuf,
-                            ([SourceStamp; 3], Arc<codex_root_copies::RootSidecar>),
+                            (
+                                [SourceStamp; 3],
+                                Arc<sources::codex::root_copies::RootSidecar>,
+                            ),
                         >()
                         .unwrap_or(usize::MAX),
                     )
@@ -251,8 +255,11 @@ fn finish<T: Default>(result: Result<T>, counts: SidecarOpenCounts) -> (T, Loade
 fn load_home(
     home: &Path,
     before: &[Option<SourceStamp>; 3],
-) -> (codex_root_copies::RootSidecar, Option<[SourceStamp; 3]>) {
-    let mut facts = codex_root_copies::RootSidecar::default();
+) -> (
+    sources::codex::root_copies::RootSidecar,
+    Option<[SourceStamp; 3]>,
+) {
+    let mut facts = sources::codex::root_copies::RootSidecar::default();
     let raw = &mut facts.raw;
     let mut after: [Option<SourceStamp>; 3] = [None, None, None];
     let state_path = home.join("state_5.sqlite");

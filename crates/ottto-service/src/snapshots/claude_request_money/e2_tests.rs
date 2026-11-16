@@ -1394,7 +1394,7 @@ fn stage_twins(index: &mut ScanIndex, paths: &[(&Path, i128)]) {
         };
         let opened = fs::metadata(path).ok().map(|m| {
             let mut opened =
-                crate::snapshots::claude_context_file_birth::ClaudeOpenedBirth::from_metadata(&m);
+                crate::snapshots::sources::claude::context_file_birth::ClaudeOpenedBirth::from_metadata(&m);
             opened.birth = u64::try_from(*birth).unwrap();
             opened
         });

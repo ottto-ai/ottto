@@ -232,7 +232,14 @@ Environment values are never logged or persisted.
 The status read of each source's active-session reconciliation uses the same
 helper, keyed by its cache file. Every local request builds status, so the
 parsed reconciliation is reused while the file stamp is unchanged; a reconcile
-always replaces the file, and the next read parses it again.
+always replaces the file, and the next read parses it again. Its optional
+`last_activity_at` carries the maximum parsed session activity time per source,
+including sessions without usage rows. Each new observation is filtered to at
+most five minutes after reconciliation before taking the maximum. Empty scans,
+rescans and policy-stop clears preserve it. Older caches seed it from existing
+ceiling-filtered watermarks as best-effort history: a legacy future timestamp
+can surface after the clock passes it. A rollback can drop the field and cause
+re-seeding on upgrade. This local status fact is independent of uploads.
 
 Existing resource records carry fixed command classes, child starts and per-PID
 child CPU totals; arguments, paths and command output are never included.
@@ -416,6 +423,12 @@ unknown Cargo targets, old-path strings after decoding escapes and normalizing s
 case) and print their limits: implicit log targets, panic locations, approved derives assumed
 context-free, runtime paths and `include!(env!(..))`.
 `scripts/check_source_layout.py` reports how far the tree is from the target.
+Public CI also runs `--enforce-new --base <ref>`: production `.rs` files added
+against the base anywhere in the repository must have at most 3,000 lines and
+warn above 1,500. Exact (R100) file moves count as existing files; `*_tests.rs`,
+`tests.rs` and files under `tests/` are excluded. Existing files remain report-only
+unless a rule is explicitly enabled with `--enforce`; a limits-table row cannot
+exempt a new production file from the ceiling.
 
 ## Never drop data
 
@@ -583,3 +596,18 @@ same `collected_at`, empty batches included. The read's last covered day is alwa
 complete UTC day at that `collected_at`. `provider_daily_reference::tests::accounts` emits the
 producer fixtures in `fixtures/provider-daily-reference/`; the snapshots parity test emits the
 cross-language identity vectors.
+
+## Local health diagnostics
+
+Local health events retain only the latest observation per Upload, SetupRead and
+SnapshotSync family, per Verify source, and per ScanIndex source/reason/polarity.
+The command ledger retains the latest terminal result per action. Both lists keep
+insertion order; they are current diagnostics rather than a lifetime history in
+status/CLI JSON or uploaded health evidence. Usage, upload bodies, receipts and
+placement do not depend on this diagnostic history.
+
+Status keeps its owned snapshot; control serialization happens after the daemon
+state lock is released. Runtime observations belong only to that response;
+reprojection replaces its observation.
+ScanIndex catch-up materializes only the latest set and clear for each pair and
+advances the observed transition high-water marks even across a long polling gap.

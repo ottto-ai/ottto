@@ -2680,7 +2680,7 @@ fn wide_single_directory_lists_in_full_on_a_fresh_tick() {
             traversal.counts.directory_entry_cap_exceeded_count, 0,
             "{source:?}"
         );
-        assert!(!traversal.counts.has_errors(), "{source:?}");
+        assert!(!traversal.has_errors(), "{source:?}");
         let _ = fs::remove_dir_all(root);
     }
 }
@@ -2724,7 +2724,7 @@ fn wide_directory_defers_on_a_partly_spent_tick_then_lists_in_full() {
             traversal.counts.directory_entry_cap_exceeded_count, 0,
             "{source:?}"
         );
-        assert!(!traversal.counts.has_errors(), "{source:?}");
+        assert!(!traversal.has_errors(), "{source:?}");
         let _ = fs::remove_dir_all(root);
     }
 }
@@ -2752,7 +2752,7 @@ fn subdirectory_inside_a_wide_directory_is_discovered() {
             traversal.counts.directory_entry_cap_exceeded_count, 0,
             "{source:?}"
         );
-        assert!(!traversal.counts.has_errors(), "{source:?}");
+        assert!(!traversal.has_errors(), "{source:?}");
         let paths = candidate_paths(&index);
         assert_eq!(paths.len(), 5, "{source:?}");
         assert!(paths.contains(&deep), "{source:?}: nested file discovered");
@@ -3642,13 +3642,17 @@ fn cycle_clock(cycle: u64) -> String {
 
 #[test]
 fn non_progressing_residue_settles_only_without_retryable_problems() {
-    let residue = ScanTraversalCounts {
+    let checkpoint = |counts: ScanTraversalCounts| ScanTraversalCheckpoint {
+        counts,
+        ..traversal_checkpoint()
+    };
+    let residue = checkpoint(ScanTraversalCounts {
         ownership_incomplete_file_count: 1,
         zero_snapshot_usage_evidence_count: 1,
         recognized_usage_drop_count: 1_105,
         dropped_usage_record_count: 1_105,
         ..ScanTraversalCounts::default()
-    };
+    });
     assert!(residue.has_errors());
     assert!(!residue.has_retryable_problems());
     assert!(residue.has_unsettled_residue());
@@ -3667,19 +3671,32 @@ fn non_progressing_residue_settles_only_without_retryable_problems() {
     ];
     for veto in vetoes {
         let mut red = residue.clone();
-        veto(&mut red);
+        veto(&mut red.counts);
         assert!(!red.settle_non_progressing_residue());
         assert!(red.has_errors());
         assert!(red.has_unsettled_residue());
-        assert_eq!(red.terminal_ownership_incomplete_file_count, 0);
-        assert!(red.settled_residue().is_none());
+        assert_eq!(red.counts.terminal_ownership_incomplete_file_count, 0);
+        assert!(red.counts.settled_residue().is_none());
     }
+    // An unreleased Codex inventory hold vetoes settlement the same way,
+    // though it adds no count; alone it still keeps the generation red.
+    let hold = Some(CodexInventoryHold::default());
+    let mut held = residue.clone();
+    held.residue.codex_inventory_hold = hold.clone();
+    assert!(held.has_retryable_problems());
+    assert!(!held.settle_non_progressing_residue());
+    assert!(held.has_errors());
+    assert!(held.counts.settled_residue().is_none());
+    let mut held_only = checkpoint(ScanTraversalCounts::default());
+    held_only.residue.codex_inventory_hold = hold;
+    assert!(held_only.has_errors());
+    assert!(!held_only.has_unsettled_residue());
 
     let mut settled = residue.clone();
     assert!(settled.settle_non_progressing_residue());
     assert!(!settled.has_errors());
     assert_eq!(
-        settled.settled_residue(),
+        settled.counts.settled_residue(),
         Some(SettledScanResidue {
             ownership_incomplete_file_count: 1,
             zero_snapshot_usage_evidence_count: 1,
@@ -3692,7 +3709,7 @@ fn non_progressing_residue_settles_only_without_retryable_problems() {
     );
 
     // Legacy cap fields no longer subtract from the terminal drop residue.
-    let mut with_cap_loss = ScanTraversalCounts {
+    let mut with_cap_loss = checkpoint(ScanTraversalCounts {
         over_line_cap_count: 11,
         terminal_over_line_cap_count: 11,
         recognized_usage_drop_count: 11 + 577,
@@ -3702,11 +3719,11 @@ fn non_progressing_residue_settles_only_without_retryable_problems() {
         ownership_incomplete_file_count: 2,
         zero_snapshot_usage_evidence_count: 1,
         ..ScanTraversalCounts::default()
-    };
+    });
     assert!(with_cap_loss.settle_non_progressing_residue());
     assert!(!with_cap_loss.has_errors());
     assert_eq!(
-        with_cap_loss.settled_residue(),
+        with_cap_loss.counts.settled_residue(),
         Some(SettledScanResidue {
             ownership_incomplete_file_count: 2,
             zero_snapshot_usage_evidence_count: 1,
@@ -3714,9 +3731,9 @@ fn non_progressing_residue_settles_only_without_retryable_problems() {
         })
     );
 
-    let clean = ScanTraversalCounts::default();
+    let clean = checkpoint(ScanTraversalCounts::default());
     assert!(!clean.has_errors());
-    assert!(clean.settled_residue().is_none());
+    assert!(clean.counts.settled_residue().is_none());
 }
 
 /// Residue is settled only once discovery has finished: a page that still
@@ -3760,7 +3777,7 @@ fn residue_is_not_settled_while_candidates_are_still_pending() {
         .expect("bounded traversal continues");
     assert!(!traversal.pending_candidates.is_empty());
     assert_eq!(traversal.counts.terminal_ownership_incomplete_file_count, 0);
-    assert!(traversal.counts.has_unsettled_residue());
+    assert!(traversal.has_unsettled_residue());
     assert_eq!(
         traversal.unhealthy_retry_attempt, 0,
         "not a retry, just paging"
@@ -3827,8 +3844,17 @@ fn retryable_problem_keeps_the_census_red_and_the_latch_bounded() {
     .expect("first unhealthy generation");
     assert_eq!(first.symlink_rejected_count, 1);
     // The rejected directory prevents proving that either physical file is
-    // the whole logical session, so both remain held before a replacement.
-    assert_eq!(first.ownership_incomplete_file_count, 2);
+    // the whole logical session, so both remain held before a replacement:
+    // the inventory hold owes them, and they add no ownership count.
+    assert_eq!(first.ownership_incomplete_file_count, 0);
+    assert_eq!(
+        index
+            .traversal
+            .as_ref()
+            .and_then(|traversal| traversal.residue.codex_inventory_hold.as_ref())
+            .map(|hold| hold.owed.len()),
+        Some(2)
+    );
     assert!(first.snapshots.is_empty());
     assert!(!first.census_complete);
     assert!(first.scan_cap_hit);
@@ -3843,7 +3869,7 @@ fn retryable_problem_keeps_the_census_red_and_the_latch_bounded() {
     {
         let traversal = index.traversal.as_ref().expect("red witness stays durable");
         assert_eq!(traversal.counts.terminal_ownership_incomplete_file_count, 0);
-        assert!(traversal.counts.has_retryable_problems());
+        assert!(traversal.has_retryable_problems());
         assert_eq!(traversal.unhealthy_retry_attempt, 1);
         assert_eq!(
             traversal.unhealthy_retry_not_before_unix_seconds,
@@ -18150,7 +18176,7 @@ fn codex_created_thread_parentless_production_lineage_controls() {
     fs::create_dir_all(&sessions_dir).expect("create sessions");
     let clock = ParentlessClock::now();
     // Keep birth-time proof real while the owning header predates the test epoch.
-    let _cutover = codex_counting_version::TestCutover::set(clock.base_ms + 1);
+    let _cutover = sources::codex::counting::version::TestCutover::set(clock.base_ms + 1);
     let parent = "01a02589-5e24-7f10-8a93-a0c1968d8a3a";
     let admitted = "01a04e11-49cf-7460-9fd7-f7dbfd2f05e4";
     let wrapped = "01a04e12-49cf-7460-9fd7-f7dbfd2f05e4";

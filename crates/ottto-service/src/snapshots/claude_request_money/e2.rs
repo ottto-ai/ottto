@@ -3,7 +3,6 @@
 //! reported telemetry cost and side calls, and emits one literal body per
 //! session. The upload gate is ON; DARK test arms never change an item, a
 //! scan identity, parser scope or body witness.
-use super::super::claude_context_file_birth::ClaudeFileBirth;
 use super::super::claude_history_upgrade::{
     claude_path_twin_groups, path_twins, probe_opened_birth, ClaudeTwinGroups,
     REQUEST_OWNED_USAGE_CONTRACT,
@@ -13,6 +12,7 @@ use super::super::claude_request_census::claude_request_hash;
 use super::super::claude_request_identity::{
     self, AcceptedBuckets, AccountPartition, LentSlot, RequestAccounts,
 };
+use super::super::sources::claude::context_file_birth::ClaudeFileBirth;
 use super::super::{
     claude_api_cache_creation, claude_api_matches_transcript_occurrence, claude_family_root_path,
     claude_index_path_family_member, claude_index_path_member_ref, claude_row_placement,

@@ -10,14 +10,15 @@ use crate::snapshots::scan_index::source_fingerprint::{
     local_index_key, scan_file_fingerprint_with_opened_identity,
 };
 use crate::snapshots::shared_value::SharedMap;
+use crate::snapshots::sources::codex::eof_fragment;
 #[cfg(test)]
 use crate::snapshots::transcript_io_allowed;
 use crate::snapshots::{
     candidate_scan_identity, claude_absence_is_removal, claude_history_upgrade, codex_archive_path,
-    codex_fragment, disappearance_diagnostics, opened_candidate_is_within_frozen_window,
-    sampled_audit, sampled_scan, withheld_account, CandidateFile, CandidateWindow,
-    DiscoveryRecovery, OpenedObjectStat, ScanCensus, ScanIndexEntry, SnapshotSource,
-    FILE_CONTENT_SAMPLE_BYTES, OPENED_OBJECT_IDENTITY_VERSION,
+    disappearance_diagnostics, opened_candidate_is_within_frozen_window, sampled_audit,
+    sampled_scan, withheld_account, CandidateFile, CandidateWindow, DiscoveryRecovery,
+    OpenedObjectStat, ScanCensus, ScanIndexEntry, SnapshotSource, FILE_CONTENT_SAMPLE_BYTES,
+    OPENED_OBJECT_IDENTITY_VERSION,
 };
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
@@ -231,7 +232,7 @@ pub(in crate::snapshots) fn open_and_identify_scan_candidate_with_rescue_at(
         &candidate.path,
         candidate.size_bytes,
         candidate.modified_unix_seconds,
-        codex_fragment::Stamp::candidate(&candidate),
+        eof_fragment::Stamp::candidate(&candidate),
     );
     let aged = !opened_candidate_is_within_frozen_window(
         &candidate,
@@ -244,7 +245,7 @@ pub(in crate::snapshots) fn open_and_identify_scan_candidate_with_rescue_at(
             source,
             &candidate.path,
             candidate.size_bytes,
-            codex_fragment::Stamp::candidate(&candidate),
+            eof_fragment::Stamp::candidate(&candidate),
         );
     let recovery = DiscoveryRecovery::from(retention);
     let requires_recovery = recovery.requires(source, &candidate.path, candidate.size_bytes);
@@ -548,7 +549,7 @@ pub(in crate::snapshots) fn adopt_stored_changed_time(
             candidate.size_bytes,
             Some(candidate.modified_unix_nanos),
             live.birth_nanos,
-            codex_fragment::Stamp::candidate(candidate),
+            eof_fragment::Stamp::candidate(candidate),
         )
         || !live.same_birth(entry.opened_birth_nanos)
     {

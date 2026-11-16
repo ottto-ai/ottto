@@ -653,23 +653,29 @@ impl OwnedJsonlParser {
             Some(reader)
         };
         // Resolve before PRE stages the session facts, outside the store's
-        // transactions. Only positive repository evidence is permanent;
-        // non-Git and unavailable lookups retry on ordinary selected work.
-        let repository_identity = accumulator
+        // transactions. A saved Git binding is permanent. Otherwise live Git
+        // or non-Git evidence is pinned (Git replaces a saved non-Git); an
+        // unavailable lookup keeps the saved non-Git and retries on ordinary
+        // selected work.
+        let saved_git = accumulator
             .repository_binding
-            .clone()
-            .or(repository_identity)
-            .or_else(|| {
+            .as_ref()
+            .filter(|saved| saved.is_repository())
+            .cloned();
+        let repository_identity = saved_git.or_else(|| {
+            let live = repository_identity.or_else(|| {
                 accumulator
                     .workspace_path
                     .as_deref()
                     .map(cached_repository_identity)
             });
-        if let Some(identity) = &repository_identity {
-            if identity.is_repository() {
-                accumulator.repository_binding = Some(identity.clone());
+            if live.as_ref().is_some_and(|identity| {
+                identity.is_repository() || identity.workspace_kind.as_deref() == Some("non_git")
+            }) {
+                accumulator.repository_binding = live.clone();
             }
-        }
+            accumulator.repository_binding.clone().or(live)
+        });
         // PRE-finalization seam: the accumulator before any finalization
         // reads it; no early exit lies between.
         if let Some(pre) = pre {

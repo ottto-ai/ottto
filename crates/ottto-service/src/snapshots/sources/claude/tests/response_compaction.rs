@@ -589,8 +589,10 @@ fn claude_compact_records_decode_exactly() {
             }
         }
         let observation = observation.expect("at least one record");
-        let decoded =
-            claude_response_records::decode_records(observation.records.into_vec(), &table);
+        let decoded = sources::claude::response_records::decode_records(
+            observation.records.into_vec(),
+            &table,
+        );
         assert_eq!(decoded, Some(expected), "response {response}");
     }
     assert!(inline > 0, "no selector overflowed the interned table");

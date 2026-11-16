@@ -652,7 +652,7 @@ fn install_live_waits_on_missing_evidence_and_rebuilds_on_changed() {
 
     let mut stored = continuable();
     stored.codex_counting = Some(Box::new(codex_usage_occurrence::CodexCounting::new(
-        codex_counting_version::AckEvidence::None,
+        sources::codex::counting::version::AckEvidence::None,
         Some(1),
     )));
     assert_eq!(
@@ -698,7 +698,7 @@ fn install_live_labels_each_incompatible_check() {
         }),
         ("incompatible_counting_version", |stored, _| {
             stored.codex_counting = Some(Box::new(codex_usage_occurrence::CodexCounting::new(
-                codex_counting_version::AckEvidence::None,
+                sources::codex::counting::version::AckEvidence::None,
                 Some(1),
             )));
         }),
