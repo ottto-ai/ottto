@@ -1,4 +1,5 @@
 use super::*;
+use crate::snapshots::claude_request_money::e2;
 
 fn payloads(request: &SnapshotBatchRequest) -> [Vec<u8>; 2] {
     [
@@ -17,35 +18,38 @@ fn upload_attempt_matches_cloned_batch_bytes() {
         include_str!("../../../../fixtures/snapshot-audit/claude-request-owned-root.jsonl"),
     )
     .unwrap();
-    let raw = crate::snapshots::parse_claude_code_jsonl_file(
-        &path,
-        "2026-08-02T07:01:00Z",
-        "a".repeat(64),
-    )
-    .unwrap()
-    .remove(0);
+    let raw = e2::with_fixture_birth(1, || {
+        crate::snapshots::parse_claude_code_jsonl_file(
+            &path,
+            "2026-08-02T07:01:00Z",
+            "a".repeat(64),
+        )
+        .unwrap()
+        .remove(0)
+    });
     assert!(raw.claude_money.is_some());
     assert!(!raw.claude_usage_occurrences.is_empty());
     assert!(!raw.claude_usage_request_ids.is_empty());
-    let mut index = ScanIndex::default();
-    let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
-        SnapshotSource::ClaudeCode,
-        std::slice::from_ref(&root),
-        &mut index,
-        "2026-08-02T07:01:00Z",
-        crate::snapshots::BACKFILL_WINDOW_DAYS,
-        MAX_BACKFILL_FILES_PER_SOURCE,
+    let index = ScanIndex::default();
+    let mut emitted = vec![raw.clone()];
+    e2::decide_page_copies(&mut emitted, &index, None);
+    assert!(e2::finish_page(
+        &mut emitted,
+        &index,
+        e2::TelemetryRead::Failed,
+        &mut BTreeMap::new(),
+        &BTreeSet::new(),
     )
-    .unwrap();
-    crate::snapshots::finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, &mut index);
-    assert!(!scan.snapshots.is_empty());
-    assert!(scan.snapshots.iter().all(|item| {
-        crate::snapshots::claude_request_money::is_request_owned_literal(item)
-            && item.claude_usage_occurrences.is_empty()
-            && item.claude_usage_request_ids.is_empty()
-    }));
+    .is_empty());
+    assert!(!emitted.is_empty());
+    for item in &mut emitted {
+        assert!(crate::snapshots::claude_request_money::is_request_owned_literal(item));
+        e2::release_emitted_fold(item);
+        assert!(item.claude_usage_occurrences.is_empty());
+        assert!(item.claude_usage_request_ids.is_empty());
+    }
     let mut claude = vec![raw];
-    claude.extend(scan.snapshots);
+    claude.extend(emitted);
     let cache = crate::snapshots::cache_adapter_tests::cache_fixture_item();
     assert!(cache.cache_observations_state.is_some());
     for (source, items) in [
