@@ -26491,6 +26491,7 @@ for line in sys.stdin:
     }
 
     fn assert_telemetry_control_requires_matching_device_and_key() {
+        const UNREADABLE_DEVICE: &str = "<unreadable device file>";
         let device = Some("device_local");
         let key = Some("key_local");
         for (claim_device, local_device, request_key, claim_key, allowed) in [
@@ -26509,6 +26510,7 @@ for line in sys.stdin:
             (device, device, None, Some(""), false),
             (device, device, None, Some(" \t"), false),
             (device, device, key, Some(" key_local "), false),
+            (device, Some(UNREADABLE_DEVICE), key, key, false),
         ] {
             for source in [SourceKind::Codex, SourceKind::ClaudeCode] {
                 for action in [
@@ -26518,7 +26520,10 @@ for line in sys.stdin:
                     let files = bind_telemetry_control_account();
                     let devices = FileDeviceStore::default();
                     devices.reset().unwrap();
-                    if let Some(device_id) = local_device {
+                    if local_device == Some(UNREADABLE_DEVICE) {
+                        fs::create_dir_all(devices.path().parent().unwrap()).unwrap();
+                        fs::write(devices.path(), b"{not json").unwrap();
+                    } else if let Some(device_id) = local_device {
                         devices
                             .save(&LocalDeviceBinding {
                                 device_id: device_id.into(),
