@@ -32436,6 +32436,7 @@ X-API-Key = "otel_redacted"
             );
             let prior = prior_device_credential_for_registration().unwrap().unwrap();
             let (mut pending, candidate, token) = relogin_claim(&prior, user, org, device.clone());
+            pending.api_base_url = api.clone();
             let commit = pending.claim_commit.as_mut().unwrap();
             commit.connection.api_base_url = api;
             assert_eq!(
@@ -32447,6 +32448,8 @@ X-API-Key = "otel_redacted"
             continue_prior_snapshot_namespace(&mut pending, Some(&prior));
             assert_eq!(journaled_namespace(&pending), None, "different prior owner");
             promote_relogin(&pending, &candidate, &token);
+            // The normal claim-completion handler cleans up after promotion.
+            clear_prior_device_credential().unwrap();
             assert!(
                 !default_prior_device_path().exists(),
                 "prior selector cleared"
