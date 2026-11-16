@@ -104,12 +104,20 @@ file-system hint / periodic listing → select file → read new bytes from save
   only under an unrelated session elsewhere leaves its copy counted.
   The original in-folder census wait still expires on its third decision.
   An all-covered copy-only page drops its items when the session has another
-  file; own turns still publish. A selected content twin pulls at most its
-  earliest accepted main holder, and a selected holder (not history-held)
-  pulls the content twins it is that holder for, so neither file publishes
-  the session without the other. A holder is never a twin, so pulls never
-  cascade, and ordinary discovery acquires the pulled file without an extra
-  seed content read.
+  file; own turns still publish. A selected content twin pulls every live
+  overlapping census main, and a selected main file (not history-held)
+  pulls every live census content twin sharing a request hash. Ordinary discovery
+  acquires pulled files through the existing history and resident admission gates.
+  A missing overlapping twin with additional hashes or a non-Exact census holds
+  the replacement before all-copy suppression; the items stay owed without receipts.
+  A page containing only census twins also waits for every live filename
+  member of that session. The `absent_content_twin` diagnostic counts held
+  sessions; even a bound contributor hold keeps the session progress-blocking.
+  Deletion or retirement of the contributor's census hashes releases the content
+  dependency. Disjoint and missing-census twins remain outside this fence;
+  unrelated sessions sharing hashes may conservatively wait together. A twin
+  whose session main shares no request with it can wait until that main is
+  independently selected. Twin pulls can read extra overlapping copy sources.
   Money rule three selects content twins, path twins and disclosed main
   files once, using every census hash and one in-memory census walk without
   a deadline. Only a candidate sharing ids with an earlier accepted holder
