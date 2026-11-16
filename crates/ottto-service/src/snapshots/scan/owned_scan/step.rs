@@ -121,6 +121,7 @@ impl OwnedSourceScan {
             audit_now,
             backfill_window_days,
             file_limit,
+            mut first_read_progress,
             page_file_limit_hit,
             claude_request_identity_capture,
             claude_effort_support_dir,
@@ -2485,6 +2486,17 @@ impl OwnedSourceScan {
                         );
                     }
                 }
+                // First-read work: a selected census read that records a path
+                // new to the index (any member of a joined group). A re-read of
+                // a recorded file, such as a live session's hint, is not.
+                let paths =
+                    || std::iter::once(&candidate.path).chain(aliases.iter().map(|a| &a.path));
+                first_read_progress |= parse_complete
+                    && sampled_scan::codex_cursor::census_member(
+                        &selected_flags,
+                        paths().map(PathBuf::as_path),
+                    )
+                    && paths().any(|path| !index.files.contains_key(&local_index_key(path)));
                 if parse_complete && !aliases.is_empty() {
                     for alias in &aliases {
                         if alias.path == candidate.path {
@@ -3503,6 +3515,7 @@ impl OwnedSourceScan {
                     page_file_limit_hit,
                     routine_recensus,
                     page_byte_budget_hit: codex_page.budget_deferred(),
+                    first_read_progress,
                     claude_queued_family_deferred_paths: std::mem::take(
                         &mut history_upgrade.queued_family_deferred_paths,
                     ),
@@ -3669,6 +3682,7 @@ impl OwnedSourceScan {
                     ("routine_recensus", scan.routine_recensus),
                     ("page_file_limit_hit", scan.page_file_limit_hit),
                     ("pending_work", scan.census_status.pending_work),
+                    ("first_read_progress", scan.first_read_progress),
                     (
                         "first_import_default_qos",
                         crate::snapshot_sync::continuation::first_import_default_qos(),
@@ -4941,6 +4955,7 @@ impl OwnedSourceScan {
             audit_now,
             backfill_window_days,
             file_limit,
+            first_read_progress,
             page_file_limit_hit,
             claude_request_identity_capture,
             claude_effort_support_dir,
