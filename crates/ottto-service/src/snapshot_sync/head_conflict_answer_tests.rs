@@ -874,10 +874,12 @@ fn refused_answers_hold_only_the_identical_answer_for_at_most_an_hour() {
             isolated: 1
         }
     );
-    assert_eq!(progress.head_conflict_challenges.len(), cap);
-    assert!(!progress
-        .head_conflict_challenges
-        .contains_key(&cache_session_key(&overflow.source_session_id)));
+    assert_eq!(progress.head_conflict_challenges.len(), cap + 1);
+    assert_eq!(
+        progress.head_conflict_challenges[&cache_session_key(&overflow.source_session_id)]
+            .challenge,
+        challenge(0xa)
+    );
     assert!(progress
         .quarantined_fingerprints
         .contains_key(&overflow.snapshot_fingerprint));
@@ -885,8 +887,18 @@ fn refused_answers_hold_only_the_identical_answer_for_at_most_an_hour() {
         progress.quarantined_fingerprints[&item.snapshot_fingerprint],
         held[&item.snapshot_fingerprint]
     );
-    head_conflict::REFUSALS.with(|counts| assert_eq!(&*counts.borrow(), &["capacity_hold"]));
-    // Existing keys still update at the cap, including their pacing count.
+    head_conflict::REFUSALS.with(|counts| assert!(counts.borrow().is_empty()));
+    // The challenge beyond the old limit is answered and retired on its ACK.
+    let (result, wire) = cycle(&mut progress, &overflow, 2_001, |item| {
+        accepted(item, &"4".repeat(64))
+    });
+    assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+    assert_eq!(envelope(&wire)["conflict_head_challenge"], challenge(0xa));
+    assert!(!progress
+        .head_conflict_challenges
+        .contains_key(&cache_session_key(&overflow.source_session_id)));
+    assert_eq!(progress.head_conflict_challenges.len(), cap);
+    // Existing keys still update, including their pacing count.
     let (result, _) = cycle(
         &mut progress,
         &item,
