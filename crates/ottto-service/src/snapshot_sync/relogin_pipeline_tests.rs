@@ -647,6 +647,13 @@ fn owner_return_preserves_all_source_carry() {
                 .iter()
                 .all(|body| body["repository_hash"].is_string()));
         }
+        // Deleted-store return is from a different owner. A same-owner rotation
+        // must preserve main's namespace even when its store has disappeared.
+        let away = LocalDeviceBinding {
+            device_id: "return-b-before-loss".into(),
+            ..device_a.clone()
+        };
+        crate::control::owner_return_credential_for_test(&away, "away-secret", "owner-b");
         // Deleted-store fallback cannot borrow ACKs or recreate the old namespace.
         std::fs::remove_dir_all(support.join("snapshots/destinations").join(&namespace_a)).unwrap();
         let fresh = LocalDeviceBinding {

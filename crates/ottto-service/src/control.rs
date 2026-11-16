@@ -32827,8 +32827,15 @@ X-API-Key = "otel_redacted"
         commit.connection.api_base_url = pending.api_base_url.clone();
         commit.backfill_cutoff_at = Some("2026-08-01T00:00:00Z".into());
         commit.connection.machine_id = device.machine_id.clone();
-        pending.request_authority.as_mut().unwrap().machine_id = device.machine_id.clone().unwrap();
         let prior = prior_device_credential_for_registration().unwrap();
+        pending.request_authority = Some(device_credential_request_authority(
+            "setup_claim",
+            &device.device_id,
+            &test_machine(),
+            prior.as_ref(),
+            Some(IDENTITY_CONTINUITY_CAPABILITY),
+        ));
+        pending.request_authority.as_mut().unwrap().machine_id = device.machine_id.clone().unwrap();
         let store = FileOwnerSnapshotNamespaceStore::default();
         select_owner_snapshot_namespace(
             &mut pending,
