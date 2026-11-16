@@ -2207,6 +2207,70 @@ fn schedule_accepts(source: SnapshotSource, cycle: &Cycle, latest: &mut BTreeMap
     }
 }
 
+fn assert_schedule_root_placement_stable(
+    cycle: &Cycle,
+    accepted: &BTreeMap<String, Value>,
+    root_locations: &[(String, String)],
+    first_split: &mut Option<(usize, Value)>,
+    cycle_index: usize,
+    context: &str,
+) {
+    if root_locations.len() != 2 {
+        return; // Pi has distinct sessions at these locations, not ROOT twins.
+    }
+    if first_split.is_none() {
+        // Reuse the saved index and the existing per-path debt projection:
+        // an all-copy twin may be decided empty rather than carry an ACK.
+        let both_decided = root_locations.iter().all(|(key, relative)| {
+            cycle.index.files.contains_key(key)
+                && ["owed", "copy_wait"].into_iter().all(|part| {
+                    !cycle.debt[part]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|path| path.as_str() == Some(relative.as_str()))
+                })
+        }) && cycle.debt["holds"].get(IDENTITY_PIPELINE_ROOT).is_none();
+        if !both_decided || !accepted.contains_key(IDENTITY_PIPELINE_ROOT) {
+            return;
+        }
+    }
+    let mut split = accepted[IDENTITY_PIPELINE_ROOT]["body"]["model_usage"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            let shares = row["identity_parts"]
+                .as_array()
+                .map(|parts| parts.iter().collect::<Vec<_>>())
+                .unwrap_or_else(|| vec![row]);
+            let mut accounts = shares
+                .into_iter()
+                .map(|share| {
+                    (
+                        share["account_identifier_hash"].as_str().map(str::to_owned),
+                        share["input_tokens"].as_u64().unwrap(),
+                        share["output_tokens"].as_u64().unwrap(),
+                        share["request_count"].as_u64().unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            accounts.sort();
+            (row["model"].as_str().unwrap().to_owned(), accounts)
+        })
+        .collect::<Vec<_>>();
+    split.sort();
+    let split = json!(split);
+    if let Some((first_cycle, expected)) = first_split.as_ref() {
+        assert_eq!(
+            &split, expected,
+            "BUG: ROOT same-machine placement moved: {context}, cycle {cycle_index}, first cycle {first_cycle}, first split {expected}, current split {split}"
+        );
+    } else {
+        *first_split = Some((cycle_index, split));
+    }
+}
+
 // Sort the actual full-path keys, then assign growth to each end in turn. Fixed
 // relative names alone cannot pin a hash order under a unique temporary root.
 fn equal_birth_twins(home: &OracleHome) -> [PathBuf; 2] {
@@ -2562,6 +2626,15 @@ fn scheduling_permutations_converge_to_the_same_bodies() {
                                 path.strip_prefix(&roots[0]).unwrap().to_string_lossy()
                             )
                         };
+                        let root_locations = paths
+                            .iter()
+                            .filter(|(_, session)| session == IDENTITY_PIPELINE_ROOT)
+                            .map(|(path, _)| (path.to_string_lossy().into_owned(), relative(path)))
+                            .collect::<Vec<_>>();
+                        let placement_context = format!(
+                            "{source:?}, arm (one_chunk={one_chunk}, limit={limit}, reverse={reverse}, restart={restart}, late={late})"
+                        );
+                        let mut first_root_split = None;
                         let mut history = Vec::new();
                         let mut effective = Vec::new();
                         let mut first_page = BTreeMap::new();
@@ -2602,6 +2675,14 @@ fn scheduling_permutations_converge_to_the_same_bodies() {
                                 assert_eq!(cycle.evidence_chunks, 0);
                             }
                             schedule_accepts(source, &cycle, &mut accepted);
+                            assert_schedule_root_placement_stable(
+                                &cycle,
+                                &accepted,
+                                &root_locations,
+                                &mut first_root_split,
+                                home.cycle_number - 1,
+                                &placement_context,
+                            );
                             let pending = cycle.debt["pending"].as_u64().unwrap() > 0
                                 || cycle.gate["continuation_pending"] == true;
                             nonterminal |= cycle.debt["pending"].as_u64().unwrap() > 0;
@@ -2658,6 +2739,13 @@ fn scheduling_permutations_converge_to_the_same_bodies() {
                             }
                         }
                         assert!(finished, "bounded drain left debt: {history:?}");
+                        if source != SnapshotSource::Pi {
+                            assert!(
+                                first_root_split.is_some(),
+                                "ROOT twins must reach the placement stability guard: {placement_context}, cycle {}",
+                                home.cycle_number - 1
+                            );
+                        }
                         assert!(released && grown);
                         assert!(
                             nonterminal,
@@ -2756,6 +2844,14 @@ fn scheduling_permutations_converge_to_the_same_bodies() {
                             assert_eq!(quiet.consumed, 0, "quiet body read: {context}");
                             let prior = accepted.clone();
                             schedule_accepts(source, &quiet, &mut accepted);
+                            assert_schedule_root_placement_stable(
+                                &quiet,
+                                &accepted,
+                                &root_locations,
+                                &mut first_root_split,
+                                home.cycle_number - 1,
+                                &placement_context,
+                            );
                             assert_eq!(accepted, prior, "quiet accepted changed: {context}");
                             let route = emitted_route(&quiet, source, &server);
                             // A quiet census page reads no transcript body; identity
