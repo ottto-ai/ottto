@@ -612,15 +612,13 @@ fn owner_return_preserves_all_source_carry() {
                         &[],
                     );
                 quiet.io = io;
-                // Keep the strict zero-byte oracle. Independent observation of
-                // uninterrupted A distinguishes ordinary census identity reads
-                // from extra reads caused by the account-return transition.
-                eprintln!(
-                    "quiet return {source:?}: uninterrupted={:?}, returned={:?}",
-                    uninterrupted_io[sources.iter().position(|s| *s == source).unwrap()],
-                    quiet.io,
-                );
-                crate::snapshots::sampled_scan::transition_fixture::money_oracle::assert_quiet_restart_zero_bytes(&quiet);
+                // Restarted censuses sample identity in uninterrupted A too.
+                // The allowance is the independently observed control, never a
+                // constant or the return's own reading; all other I/O stays zero.
+                let anchors = uninterrupted_io[sources.iter().position(|s| *s == source).unwrap()]
+                    .anchor_reads
+                    .expect("uninterrupted anchors must be measured");
+                crate::snapshots::sampled_scan::transition_fixture::money_oracle::assert_quiet_restart_with_anchor_window(&quiet, anchors);
                 for prior in &before[sources.iter().position(|s| *s == source).unwrap()] {
                     assert!(saved.accepted_snapshot_fingerprint_recorded(
                         prior["snapshot_fingerprint"].as_str().unwrap()

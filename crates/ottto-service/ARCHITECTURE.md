@@ -332,27 +332,18 @@ backfill-state save, so re-upgrade omits the cutoff for existing destinations.
 
 ## Returning to an account
 
-A successful claim records the exact user, organization, normalized API base,
-physical machine, installation and OS account scope's canonical snapshot namespace
-in owner-only local history. A fresh matching claim can reuse that namespace only
-with live hardware proof and surviving source custody. Another account never borrows
-its ACKs, accepted shares or completion. Local history is trusted local state, not
-an authentication credential. Pre-existing orphan stores cannot be rediscovered.
-Logout preserves a claim-proven outgoing association; forgetting the installation
-makes its old rows ineligible. Uninstall removes history with the support directory.
-
-Claim selection is frozen in a version-3 pending credential journal. Policy is
-persisted for the selected destination before credential activation; the outgoing
-migration seed and incoming association are synced and read back before pending
-clear. Released version-2 readers reject an interrupted history-bearing ceremony.
-After completion, older alias-aware binaries can read active credentials and ignore
-the separate history file. An older backfill writer drops destination replay history;
-re-upgrade can then do one bounded re-walk. Completion is recorded only by settled
-source delivery, per destination and replay revision. A quiet return preserves its
-index and progress without rearming historical work. A server switch cutoff still
-excludes even the returning owner's pre-cutoff owed items; spanning sessions keep
-the existing whole-session rule. Positive store deletion selects a fresh namespace,
-with today's first-read and cutoff gates and no manufactured acceptance.
+Claims record exact owner/API/machine/installation/OS-scope namespaces in trusted
+owner-only history. Returning claims require live hardware and surviving custody;
+same-owner rotation keeps the existing prior-credential policy. No orphan discovery.
+Logout seeds proven outgoing history; forget invalidates old installation rows.
+History-bearing journals use v3, rejected by released v2 readers. The selected
+cutoff precedes activation; history is synced/read back before pending clear.
+Existing aliases, loaders and exact destination ACKs retain all source custody.
+Completion belongs to settled delivery, per destination/replay revision. Older
+writers may drop that map, causing one bounded re-walk after upgrade. Quiet return
+reads no bodies or parser bytes and sends no historical bodies; identity samples
+follow uninterrupted census behavior. Server cutoffs still exclude pre-cutoff debt.
+Deleted custody selects fresh, under existing first-read/cutoff gates, with no ACKs.
 
 ## Hot and cold state
 

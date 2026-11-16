@@ -296,16 +296,7 @@ pub(crate) fn record_first_census(
     update_backfill_state(state_dir, |state| {
         let slug = source.api_slug();
         let key = format!("{destination}:{slug}");
-        let completed = state.completed_destination_replays.get(slug).map_or_else(
-            || {
-                state.completed_destination_namespaces.get(slug).map_or(
-                    state.completed_parser_versions.contains_key(slug)
-                        || state.completed_replay_revisions.contains_key(slug),
-                    |recorded| recorded == destination,
-                )
-            },
-            |destinations| destinations.contains_key(destination),
-        );
+        let completed = state.has_completed_destination(slug, destination, true);
         if missing_index && !completed && !state.prior_history_unverified {
             state
                 .first_census_ends
@@ -532,15 +523,9 @@ pub fn bootstrap_pending_for_destination(
     destination_namespace_hash: &str,
 ) -> bool {
     let slug = source.api_slug();
-    if let Some(destinations) = state.completed_destination_replays.get(slug) {
-        return !destinations.contains_key(destination_namespace_hash);
-    }
-    !has_bootstrapped(state, slug)
-        || state
-            .completed_destination_namespaces
-            .get(slug)
-            .map(String::as_str)
-            != Some(destination_namespace_hash)
+    !state.destination_completed(slug, destination_namespace_hash)
+        || (!state.completed_destination_replays.contains_key(slug)
+            && !has_bootstrapped(state, slug))
 }
 
 /// Returns sources that need their first historical bootstrap or an explicit
@@ -602,16 +587,25 @@ fn destination_needs_backfill(
 }
 
 impl BackfillState {
-    pub(crate) fn destination_completed(&self, source: &str, destination: &str) -> bool {
+    fn has_completed_destination(
+        &self,
+        source: &str,
+        destination: &str,
+        legacy_unknown: bool,
+    ) -> bool {
         self.completed_destination_replays.get(source).map_or_else(
             || {
-                self.completed_destination_namespaces
-                    .get(source)
-                    .map(String::as_str)
-                    == Some(destination)
+                self.completed_destination_namespaces.get(source).map_or(
+                    legacy_unknown && has_bootstrapped(self, source),
+                    |recorded| recorded == destination,
+                )
             },
             |destinations| destinations.contains_key(destination),
         )
+    }
+
+    pub(crate) fn destination_completed(&self, source: &str, destination: &str) -> bool {
+        self.has_completed_destination(source, destination, false)
     }
 }
 
@@ -635,20 +629,10 @@ pub fn mark_backfill_complete_for_destination(
     destination_namespace_hash: &str,
 ) {
     let slug = source.api_slug();
-    // Preserve only the positively recorded legacy pair before replacing its
-    // single slot. Unknown destinations inherit no completion.
     let destinations = state
         .completed_destination_replays
         .entry(slug.to_string())
         .or_default();
-    if let (Some(namespace), Some(revision)) = (
-        state.completed_destination_namespaces.get(slug),
-        state.completed_replay_revisions.get(slug),
-    ) {
-        destinations
-            .entry(namespace.clone())
-            .or_insert_with(|| revision.clone());
-    }
     destinations.insert(
         destination_namespace_hash.to_string(),
         current_historical_replay(source).revision.to_string(),
@@ -784,13 +768,13 @@ mod tests {
             assert!(pending_backfill_sources_for_destination(&restored, "b").contains(&source));
             mark_backfill_complete_for_destination(&mut restored, source, "b");
             assert!(!pending_backfill_sources_for_destination(&restored, "b").contains(&source));
-            assert!(!pending_backfill_sources_for_destination(&restored, "a").contains(&source));
+            assert!(pending_backfill_sources_for_destination(&restored, "a").contains(&source));
             assert!(pending_backfill_sources_for_destination(&restored, "c").contains(&source));
         }
     }
 
     #[test]
-    fn destination_completion_migrates_only_the_positive_legacy_pair() {
+    fn destination_completion_writes_only_the_settled_forward_destination() {
         for source in [
             SnapshotSource::ClaudeCode,
             SnapshotSource::Codex,
@@ -804,9 +788,10 @@ mod tests {
             mark_backfill_complete_for_destination(&mut state, source, "b");
             assert_eq!(
                 state.completed_destination_replays[source.api_slug()].len(),
-                2
+                1
             );
-            assert!(state.destination_completed(source.api_slug(), "a"));
+            assert!(!state.destination_completed(source.api_slug(), "a"));
+            assert!(state.destination_completed(source.api_slug(), "b"));
             assert!(!state.destination_completed(source.api_slug(), "c"));
         }
     }

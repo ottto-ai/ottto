@@ -12878,18 +12878,20 @@ pub(crate) fn snapshot_namespace_has_store(support: &Path, namespace: &str) -> R
         "invalid snapshot namespace"
     );
     let dir = support.join("snapshots/destinations").join(namespace);
-    match std::fs::symlink_metadata(&dir) {
-        Ok(metadata) => {
-            anyhow::ensure!(metadata.is_dir(), "uncertain snapshot namespace directory")
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(_) => anyhow::bail!("inspect snapshot namespace directory"),
-    }
-    let entries = match std::fs::read_dir(dir) {
+    let entries = match std::fs::read_dir(&dir) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return match std::fs::symlink_metadata(&dir) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                _ => anyhow::bail!("uncertain snapshot namespace directory"),
+            };
+        }
         Err(_) => anyhow::bail!("inspect snapshot namespace"),
     };
+    anyhow::ensure!(
+        std::fs::symlink_metadata(&dir)?.is_dir(),
+        "uncertain snapshot namespace directory"
+    );
     let mut present = false;
     for entry in entries {
         let entry = entry.context("inspect snapshot namespace entry")?;
@@ -12908,14 +12910,17 @@ pub(crate) fn snapshot_namespace_has_store(support: &Path, namespace: &str) -> R
             continue;
         }
         let sharded = name.ends_with(".json.shards") || name.ends_with(".json.v1-readonly.shards");
-        let checkpoint = name
-            .strip_suffix(".v1-readonly.shards")
-            .or_else(|| name.strip_suffix(".shards"))
-            .or_else(|| name.strip_suffix(".v1-readonly"))
-            .or_else(|| name.strip_suffix(".v2-ack-receipt"))
-            .or_else(|| name.strip_suffix(".v2.sqlite.import"))
-            .or_else(|| name.strip_suffix(".v2.sqlite"))
-            .unwrap_or(name);
+        let checkpoint = [
+            ".v1-readonly.shards",
+            ".shards",
+            ".v1-readonly",
+            ".v2-ack-receipt",
+            ".v2.sqlite.import",
+            ".v2.sqlite",
+        ]
+        .iter()
+        .find_map(|suffix| name.strip_suffix(suffix))
+        .unwrap_or(name);
         if checkpoint.ends_with(".json")
             && !checkpoint.contains("-upload-progress")
             && !checkpoint.contains(".tmp")

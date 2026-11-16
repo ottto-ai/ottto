@@ -958,40 +958,11 @@ fn stable_machine_id_from_seed(seed: &str) -> String {
     ottto_core::prefixed_sha256_id("otm", seed)
 }
 
-/// Privacy-safe discriminator for the OS account this install runs under; see
-/// `MachineIdentity::account_scope` for the contract. Derived from the POSIX
-/// uid on every call, so it survives daemon restarts and reinstalls without
-/// persisting anything about the account.
-fn local_account_scope(machine_id: &str) -> Option<String> {
-    account_scope_from_uid(machine_id, current_account_uid())
-}
-
-/// Hash-only half of `local_account_scope`, split out so tests can pin the
-/// stability and distinctness guarantees without depending on whichever account
-/// runs them. The uid is digest input only; it never appears in the output, and
-/// neither does the username, the home directory, nor any path.
-fn account_scope_from_uid(machine_id: &str, uid: Option<u32>) -> Option<String> {
-    let uid = uid?;
-    Some(ottto_core::prefixed_sha256_id(
-        "otu",
-        &format!("account:{machine_id}:{uid}"),
-    ))
-}
-
-/// The POSIX uid the daemon runs as. `getuid` cannot fail on unix. Non-unix
-/// targets have no POSIX uid, so they report `None` instead of a placeholder
-/// that would collapse distinct accounts onto one scope.
-fn current_account_uid() -> Option<u32> {
-    #[cfg(unix)]
-    {
-        // `libc::uid_t` is `u32` on every supported unix target.
-        Some(unsafe { libc::getuid() })
-    }
-    #[cfg(not(unix))]
-    {
-        None
-    }
-}
+#[cfg(test)]
+use ottto_service::account_scope_from_uid;
+#[cfg(all(test, not(unix)))]
+use ottto_service::current_account_uid;
+use ottto_service::local_account_scope;
 
 /// Derived from the raw `IOPlatformUUID`, never the hashed hardware id, so
 /// `machine_id` stays the value every earlier daemon on this Mac reported.
