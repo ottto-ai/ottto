@@ -1091,7 +1091,7 @@ fn handle_whoami_request(
     request: HttpRequest,
 ) -> Result<()> {
     let origin = request.headers.get("origin").map(String::as_str);
-    if let Some(forbidden) = forbidden_origin_body(origin, "identity") {
+    if let Some(forbidden) = forbidden_probe_origin_body(origin, "identity") {
         return write_json_response(stream, 403, forbidden);
     }
     let cors_headers = cors_headers(origin, "GET, OPTIONS");
@@ -1144,7 +1144,7 @@ fn handle_local_health_request(
     request: HttpRequest,
 ) -> Result<()> {
     let origin = request.headers.get("origin").map(String::as_str);
-    if let Some(forbidden) = forbidden_origin_body(origin, "health") {
+    if let Some(forbidden) = forbidden_probe_origin_body(origin, "health") {
         return write_json_response(stream, 403, forbidden);
     }
     let cors_headers = cors_headers(origin, "GET, OPTIONS");
@@ -1168,10 +1168,10 @@ fn handle_local_health_request(
         );
     }
 
-    // Exact installation identity is useful to the Ottto web app, but it
-    // should not be exposed to ordinary origin-less loopback probes. The
-    // validated Origin is a browser CORS boundary, not caller authentication,
-    // so this response must contain only the non-secret pseudonymous device id.
+    // Exact installation identity is exposed to the Ottto web app only after
+    // the Origin gate above. A validated Origin is a browser CORS boundary,
+    // not caller authentication, so this response must contain only the
+    // non-secret pseudonymous device id.
     let device_id = local_health_browser_device_id(origin, || {
         FileDeviceStore::default()
             .load()
@@ -1221,7 +1221,12 @@ fn local_health_response_payload(
 /// endpoint in the message ("control", "identity", "health").
 fn forbidden_origin_body(origin: Option<&str>, noun: &str) -> Option<serde_json::Value> {
     let origin = origin?;
-    if is_allowed_control_origin(origin) {
+    forbidden_probe_origin_body(Some(origin), noun)
+}
+
+/// Browser identity and health probes require an Origin from the control allowlist.
+fn forbidden_probe_origin_body(origin: Option<&str>, noun: &str) -> Option<serde_json::Value> {
+    if origin.is_some_and(is_allowed_control_origin) {
         return None;
     }
     Some(json!({
@@ -1757,6 +1762,58 @@ pub(crate) mod tests {
                 forbidden_origin_body(Some("https://ottto.net.evil"), noun),
                 Some(json!({"error": "origin_forbidden", "message": message}))
             );
+            assert_eq!(forbidden_origin_body(None, noun), None);
+            if noun != "control" {
+                for (origin, forbidden) in [
+                    (Some("https://app.ottto.net"), false),
+                    (Some("https://ottto.net.evil"), true),
+                    (None, true),
+                ] {
+                    let expected =
+                        forbidden.then(|| json!({"error": "origin_forbidden", "message": message}));
+                    assert_eq!(forbidden_probe_origin_body(origin, noun), expected);
+                    // OPTIONS exercises both handlers without reading device state.
+                    // Refused GETs must also stop before any identity/health read.
+                    for method in ["OPTIONS", "GET"] {
+                        if method == "GET" && !forbidden {
+                            continue;
+                        }
+                        let request = HttpRequest {
+                            method: method.into(),
+                            path: if noun == "identity" {
+                                "/whoami"
+                            } else {
+                                "/local-health"
+                            }
+                            .into(),
+                            headers: origin
+                                .map(|origin| ("origin".into(), origin.into()))
+                                .into_iter()
+                                .collect(),
+                            body: vec![],
+                        };
+                        let (mut client, mut server) = loopback_pair();
+                        let daemon = test_daemon();
+                        if noun == "identity" {
+                            handle_whoami_request(&mut server, &daemon, request).unwrap();
+                        } else {
+                            handle_local_health_request(&mut server, &daemon, request).unwrap();
+                        }
+                        drop(server);
+                        let mut response = String::new();
+                        client.read_to_string(&mut response).unwrap();
+                        let status = if forbidden { 403 } else { 204 };
+                        assert!(response.starts_with(&format!("HTTP/1.1 {status}")));
+                        if let Some(expected) = expected.as_ref() {
+                            let (_, body) = response.split_once("\r\n\r\n").unwrap();
+                            assert_eq!(
+                                serde_json::from_str::<serde_json::Value>(body).unwrap(),
+                                *expected
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 

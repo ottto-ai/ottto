@@ -8993,6 +8993,7 @@ fn setup_run(
     setup_run_id: Option<String>,
     api_base_url: Option<String>,
 ) -> Result<serde_json::Value, LocalApiError> {
+    require_authorized_local_client(daemon, authorization)?;
     let _attempt = SETUP_SCAN.lock().unwrap_or_else(|p| p.into_inner());
     let status = status_for(daemon, authorization)?;
     crate::snapshot_sync::reset_relay_authorization_backoff();
@@ -15215,6 +15216,7 @@ fn verify_source_unchecked(
     source: SourceKind,
     repair: bool,
 ) -> Result<SourceVerificationResult, LocalApiError> {
+    require_authorized_local_client(daemon, authorization)?;
     let tracking_generation = daemon
         .tracking_episode(&source)
         .map(|(generation, _)| generation);
@@ -22012,6 +22014,7 @@ for line in sys.stdin:
     #[serial]
     fn setup_on_connected_daemon_is_noop_until_ottto_ends_the_run() {
         let _lock = lock_backend_test_env();
+        assert_setup_denies_unauthorized_callers_before_scan_lock();
         let (api_base_url, server) = scripted_json_backend(vec![
             (401, r#"{"detail":"Setup run not found for this device"}"#),
             (401, r#"{"detail":"Setup run expired"}"#),
@@ -28982,6 +28985,73 @@ X-API-Key = "otel_redacted"
         let _ = fs::remove_dir_all(&root);
     }
 
+    fn assert_setup_denies_unauthorized_callers_before_scan_lock() {
+        let daemon = daemon();
+        for (authorization, expected) in [
+            (
+                RequestAuthorization::Untrusted,
+                CliErrorCode::LocalClientNotTrusted,
+            ),
+            (
+                RequestAuthorization::Token("wrong-token".into()),
+                CliErrorCode::LocalAuthFailed,
+            ),
+        ] {
+            thread::scope(|scope| {
+                let held = SETUP_SCAN.lock().unwrap();
+                let (send, receive) = std::sync::mpsc::channel();
+                let daemon = &daemon;
+                scope.spawn(move || {
+                    let result = setup_run(daemon, &authorization, vec![], None, None, None)
+                        .map_err(|error| cli_error(error).code);
+                    send.send(result).unwrap();
+                });
+                // The caller must be refused while another setup still owns the lock.
+                let result = receive.recv_timeout(Duration::from_secs(5));
+                drop(held); // Release before asserting so a regression cannot deadlock the test.
+                assert_eq!(
+                    result.expect("authorization waited for setup scan"),
+                    Err(expected)
+                );
+            });
+            assert!(SETUP_SCAN.try_lock().is_ok(), "refused setup kept the lock");
+        }
+        let state = daemon.inner.lock().unwrap();
+        assert!(state.sources.is_empty());
+        assert!(state.local_health_events.is_empty());
+        assert!(state.command_ledger.is_empty());
+    }
+
+    fn assert_verification_denies_unauthorized_callers() {
+        let daemon = daemon();
+        for (authorization, expected) in [
+            (
+                RequestAuthorization::Untrusted,
+                CliErrorCode::LocalClientNotTrusted,
+            ),
+            (
+                RequestAuthorization::Token("wrong-token".into()),
+                CliErrorCode::LocalAuthFailed,
+            ),
+        ] {
+            for repair in [false, true] {
+                let error = verify_source(&daemon, &authorization, SourceKind::Codex, repair)
+                    .expect_err("verification must authorize before any result write");
+                assert_eq!(cli_error(error).code, expected);
+                let state = daemon.inner.lock().unwrap();
+                assert!(
+                    state.sources.is_empty(),
+                    "refused verification changed health"
+                );
+                assert!(state.local_health_events.is_empty());
+                assert!(
+                    state.command_ledger.is_empty(),
+                    "refused verification recorded a result"
+                );
+            }
+        }
+    }
+
     #[test]
     #[serial]
     fn verify_json_exposes_canonical_health_failure() {
@@ -28989,12 +29059,13 @@ X-API-Key = "otel_redacted"
         let root = control_test_root("verify-canonical-health");
         create_control_test_dir(&root.join(".codex"));
         let _home_guard = EnvVarGuard::set_path("HOME", &root);
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root.join("support"));
         let config_path = root.join(".codex/config.toml");
-        fs::write(
-            &config_path,
-            render_codex_relay_toml_block_for_base("http://127.0.0.1:44621"),
-        )
-        .expect("legacy config");
+        let original = render_codex_relay_toml_block_for_base("http://127.0.0.1:44621");
+        fs::write(&config_path, &original).expect("legacy config");
+        assert_verification_denies_unauthorized_callers();
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), original);
 
         let response = handle_request(
             &daemon().with_account(connected_account()),
@@ -29054,10 +29125,13 @@ X-API-Key = "otel_redacted"
         let root = control_test_root("verify-patch-disabled");
         create_control_test_dir(&root.join(".codex"));
         let _home_guard = EnvVarGuard::set_path("HOME", &root);
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root.join("support"));
         let _disabled_guard = EnvVarGuard::set_str("OTTTO_PATCH_CODEX_DISABLED", "1");
         let config_path = root.join(".codex/config.toml");
         let original = "[otel\n";
         fs::write(&config_path, original).expect("write invalid config");
+        assert_verification_denies_unauthorized_callers();
 
         let response = handle_request(
             &daemon(),

@@ -27,11 +27,11 @@ local state folder is not excluded from Time Machine or iCloud backups.
 
 The loopback `/local-health` endpoint may return the current pseudonymous
 relay-device id to an allowlisted Ottto browser origin so the web app can
-distinguish two macOS users on one physical Mac. Origin-less callers do not
-receive that id. The origin allowlist enforces browser CORS; it is not
-authentication for native loopback clients, so the id is treated only as a
-non-secret binding label. The endpoint never returns the relay secret, account
-ids, or hardware UUID.
+distinguish two macOS users on one physical Mac. Both `/whoami` and `/local-health`
+require an allowlisted Origin; requests without Origin are refused. The origin
+allowlist enforces browser CORS; it is not authentication for native loopback
+clients, so the id is treated only as a non-secret binding label. The endpoint
+never returns the relay secret, account ids, or hardware UUID.
 
 ## Device Details
 
