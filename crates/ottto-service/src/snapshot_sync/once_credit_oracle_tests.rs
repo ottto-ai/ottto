@@ -156,6 +156,7 @@ impl OracleServer {
                         "unchanged_entities":[],"rejected_entities":[],"conflict_entities":[]});
                     let mut accepted = 0;
                     let mut accepted_rows = Vec::new();
+                    let mut lost_ack = false;
                     for (item, answer) in items.iter().zip(answers) {
                         let mut reference = exact_ack(item);
                         match answer {
@@ -163,10 +164,11 @@ impl OracleServer {
                                 let mut body = item.clone();
                                 body.as_object_mut().unwrap().remove("collected_at");
                                 body.as_object_mut().unwrap().remove("semantic_envelope");
-                                let key = item["snapshot_fingerprint"].as_str().unwrap().to_owned();
+                                let key = item["source_session_id"].as_str().unwrap().to_owned();
                                 let mut stored = placed.lock().unwrap();
                                 let unchanged = stored.get(&key) == Some(&body);
                                 stored.insert(key, body);
+                                lost_ack |= matches!(answer, Answer::LostAck);
                                 if matches!(answer, Answer::Accept) {
                                     let kind = if unchanged {
                                         "unchanged_entities"
@@ -201,6 +203,12 @@ impl OracleServer {
                             }
                             Answer::Dropped | Answer::Shed => unreachable!("handled per POST"),
                         }
+                    }
+                    if lost_ack {
+                        // The write reached custody, but no response reaches the client.
+                        // A malformed 200 instead creates a real validation quarantine.
+                        drop(stream);
+                        continue;
                     }
                     proved.lock().unwrap().push(accepted_rows);
                     reply["accepted"] = accepted.into();
@@ -297,7 +305,7 @@ struct OracleHome {
     daemon: LocalDaemon,
     transport: crate::net_resilience::TransportCycleOutcome,
     retry: live_snapshot_retry::LiveRetryOwner,
-    _env: [EnvVarGuard; 4],
+    _env: [EnvVarGuard; 3],
 }
 
 struct Cycle {
@@ -317,6 +325,31 @@ struct Cycle {
     schedule: Option<Value>,
     evidence_chunks: usize,
     debt: Value,
+}
+
+impl Cycle {
+    fn accepted_body(&self, item: &SnapshotItem) -> bool {
+        let bodies = self
+            .finalized
+            .iter()
+            .map(|s| {
+                (
+                    s.snapshot_fingerprint.clone(),
+                    snapshot_upload_body_witness(s),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let witness = snapshot_upload_body_witness(item);
+        // contains_body also includes quarantine, which is suppression, NOT ACK proof.
+        self.progress
+            .accepted_body_witnesses
+            .get(&item.snapshot_fingerprint)
+            == Some(&witness)
+            || self
+                .index
+                .adopted_upload_progress_acks(&bodies)
+                .contains(&item.snapshot_fingerprint)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -376,7 +409,6 @@ impl OracleHome {
             EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support),
             EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secrets),
             EnvVarGuard::set_str("OTTTO_API_BASE_URL", &server.url),
-            EnvVarGuard::set_path("PI_CODING_AGENT_DIR", &fixture.home.join(".pi/agent")),
         ];
         #[cfg(unix)]
         crate::locked_state_dir::test_locks::hold(&support);
@@ -650,6 +682,7 @@ impl OracleHome {
             vec![("snapshots", Scalar::U64(scan.snapshots.len() as u64))],
         );
         let before = scan.snapshots.clone();
+        let wire_progress = preparation.upload_progress.clone();
         let capture = FinalizedCapture::start();
         let _evidence = self.schedule.map(|schedule| {
             EvidenceSchedule(ONE_EVIDENCE_CHUNK.with(|slot| slot.replace(schedule.one_chunk)))
@@ -675,7 +708,14 @@ impl OracleHome {
                 )
             })
         });
-        let finalized = capture.take();
+        let mut finalized = capture.take();
+        // The PF probe precedes the real uploader's cache-contract projection.
+        // Our hint leaves cache negotiation disabled; apply that SAME function
+        // to the captured types, then require exact typed/wire correspondence.
+        for item in &mut finalized {
+            prepare_snapshot_cache_for_upload(item, &wire_progress, false, false, &BTreeSet::new());
+        }
+        drop(wire_progress);
         let evidence_chunks = evidence_chunks_for_test() - chunks_before;
         let (index, _, progress) = load_source_checkpoints(
             &index_path,
@@ -771,7 +811,7 @@ fn c00_real_runner_collects_finishes_and_reloads() {
     let mut home = OracleHome::new(SnapshotSource::ClaudeCode, &server);
     home.row = "c00";
     let cycle = home.cycle(&server, &recording);
-    cycle.finish.unwrap();
+    assert!(cycle.finish.is_ok());
     assert_eq!(cycle.before.len(), 1);
     assert_eq!(cycle.gate["snapshots"], 1);
     assert_eq!(cycle.finalized.len(), 1);
@@ -781,10 +821,7 @@ fn c00_real_runner_collects_finishes_and_reloads() {
     assert_eq!(cycle.batches.len(), 1);
     assert!(cycle.index.generation > 0);
     let item = &cycle.finalized[0];
-    assert!(cycle.progress.contains_body(
-        &item.snapshot_fingerprint,
-        &snapshot_upload_body_witness(item)
-    ));
+    assert!(cycle.accepted_body(item));
     assert_eq!(server.placement.lock().unwrap().len(), 1);
     assert!(cycle.effects.iter().any(|e| e.label == "post"));
 }
@@ -815,7 +852,7 @@ fn script_answers_are_per_post_and_per_entity() {
         write!(stream, "POST /synthetic HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
         let mut response = String::new();
         stream.read_to_string(&mut response).unwrap();
-        if matches!(answer, Answer::Dropped) {
+        if matches!(answer, Answer::Dropped | Answer::LostAck) {
             assert!(response.is_empty());
         } else if matches!(answer, Answer::Shed) {
             assert!(response.contains("503 Service Unavailable"));
@@ -843,10 +880,11 @@ impl Drop for SaveFailure {
 fn assert_durable(cycle: &Cycle) {
     assert!(!cycle.finalized.is_empty(), "positive finalized body");
     for item in &cycle.finalized {
-        assert!(cycle.progress.contains_body(
-            &item.snapshot_fingerprint,
-            &snapshot_upload_body_witness(item)
-        ));
+        assert!(
+            cycle.accepted_body(item),
+            "exact ACK absent from progress and saved file-body adoption for {}",
+            item.source_session_id
+        );
     }
 }
 
@@ -858,9 +896,15 @@ fn c02_durable_ack_suppresses_replay_of_the_prior_index() {
     let server = OracleServer::new(SnapshotSource::ClaudeCode, recording.handle());
     let mut home = OracleHome::new(SnapshotSource::ClaudeCode, &server);
     home.row = "c02";
+    let failure = SaveFailure::at("selected_save");
     let first = home.cycle(&server, &recording);
-    assert!(first.finish.is_ok());
+    drop(failure);
+    assert!(
+        first.finish.is_err(),
+        "crash before progress retires its adopted ACK"
+    );
     assert_durable(&first);
+    assert_eq!(first.progress.accepted_body_witnesses.len(), 1);
     let placement = server.placement.lock().unwrap().clone();
     home.restore_pre_cycle_index(&first);
     let replay = home.cycle(&server, &recording);
@@ -1006,14 +1050,44 @@ fn c05_fresh_destination_requires_its_own_exact_ack() {
     assert_eq!(unstored.finalized.len(), 1);
     let item = &unstored.finalized[0];
     assert_eq!(item.snapshot_fingerprint, fingerprint);
-    assert!(!unstored
-        .progress
-        .contains_body(&fingerprint, &snapshot_upload_body_witness(item)));
+    assert!(!unstored.accepted_body(item));
+    let held = &unstored.index.quarantined_snapshot_fingerprints[&fingerprint];
+    assert_eq!(
+        held.disposition,
+        SnapshotQuarantineDisposition::UnprovenTerminal
+    );
+    assert_eq!(
+        held.upload_body_witness.as_deref(),
+        Some(snapshot_upload_body_witness(item).as_str())
+    );
     *server.fallback.lock().unwrap() = Answer::Accept;
-    home.restore_pre_cycle_index(&unstored);
+    home.restart();
+    let quiet = home.cycle(&server, &recording);
+    assert!(
+        quiet.batches.is_empty(),
+        "an unstored exact body remains held until a real change"
+    );
+    assert!(!quiet
+        .progress
+        .accepted_body_witnesses
+        .contains_key(&fingerprint));
+    let growth = json!({"type":"assistant","sessionId":IDENTITY_PIPELINE_ROOT,
+        "requestId":"fresh-destination-growth","timestamp":"2026-11-01T07:03:00Z",
+        "message":{"id":"fresh-destination-growth","model":"claude-haiku-4-5",
+        "usage":{"input_tokens":13,"output_tokens":1}}});
+    writeln!(
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(home.transcript())
+            .unwrap(),
+        "{growth}"
+    )
+    .unwrap();
     let accepted = home.cycle(&server, &recording);
     assert!(accepted.finish.is_ok());
     assert_eq!(accepted.batches.len(), 1);
+    assert_eq!(accepted.finalized[0].input_tokens, 43);
+    assert_ne!(accepted.finalized[0].snapshot_fingerprint, fingerprint);
     assert_durable(&accepted);
     assert_eq!(
         server.placement.lock().unwrap().len(),
@@ -1040,20 +1114,12 @@ fn c06_crash_windows_preserve_placement_and_durable_suppression() {
         let failure = matches!(answer, Answer::Accept).then(|| SaveFailure::at("selected_save"));
         let first = home.cycle(&server, &recording);
         drop(failure);
-        if !matches!(answer, Answer::LostAck) {
-            assert!(first.finish.is_err());
-        }
-        // A proofless successful reply need not be a transport error; the
-        // durable body ledger, below, decides whether replay is permitted.
+        assert!(first.finish.is_err());
+        // Dropped-before-store and stored-with-lost-ACK are both transport
+        // failures; only the selected-save crash has durable exact ACK proof.
         let durable = matches!(answer, Answer::Accept);
         let item = &first.finalized[0];
-        assert_eq!(
-            first.progress.contains_body(
-                &item.snapshot_fingerprint,
-                &snapshot_upload_body_witness(item)
-            ),
-            durable
-        );
+        assert_eq!(first.accepted_body(item), durable);
         assert_eq!(
             server.placement.lock().unwrap().len(),
             usize::from(!matches!(answer, Answer::Dropped))
@@ -1970,10 +2036,7 @@ fn schedule_accepts(source: SnapshotSource, cycle: &Cycle, latest: &mut BTreeMap
                     && raw["source_file_fingerprint"] == json!(s.source_file_fingerprint)
             })
             .unwrap();
-        assert!(cycle.progress.contains_body(
-            &item.snapshot_fingerprint,
-            &snapshot_upload_body_witness(item)
-        ));
+        assert!(cycle.accepted_body(item));
     }
 }
 
