@@ -6,6 +6,7 @@ use std::collections::VecDeque;
 mod accounts;
 mod all_logins;
 mod guards;
+mod idle;
 
 const INSTALLATION_ID: &str = "00000000-0000-4000-8000-000000000001";
 const GRANT_ID: &str = "00000000-0000-4000-8000-000000000002";
@@ -66,6 +67,8 @@ fn discovered(collector: &Collector, logins: Vec<CodexLogin>) -> logins::LoginDi
         complete: true,
         skipped: BTreeMap::new(),
         default_home,
+        coverage_homes: logins::CoverageHomes::default(),
+        codex_scan_enabled: false,
     }
 }
 

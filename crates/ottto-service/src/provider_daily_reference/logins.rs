@@ -16,7 +16,7 @@ use ottto_core::{billing_identity_hash, read_codex_auth_file_secure, CodexHomeTr
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// A token that lapses within this margin is not used for a request.
 pub(crate) const LAPSE_MARGIN_SECONDS: u64 = 300;
@@ -274,6 +274,24 @@ pub(crate) struct LoginDiscovery {
     /// Closed skip reason to count. No identifiers.
     pub(crate) skipped: BTreeMap<String, u32>,
     pub(crate) default_home: DefaultHomeState,
+    /// Every home discovery was given, before any read, skip or dedupe.
+    pub(crate) coverage_homes: CoverageHomes,
+    /// Whether the Codex scan is enabled on this Mac; set by the composed
+    /// tick, false everywhere else.
+    pub(crate) codex_scan_enabled: bool,
+}
+
+/// The homes an idle proof must cover. Paths stay out of formatted output.
+#[derive(Default)]
+pub(crate) struct CoverageHomes(pub(crate) Vec<PathBuf>);
+
+impl std::fmt::Debug for CoverageHomes {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CoverageHomes")
+            .field("homes", &self.0.len())
+            .finish()
+    }
 }
 
 /// Read every home once and select one login per opaque account: an
@@ -285,6 +303,7 @@ pub(crate) fn discover(
     grant_key: &[u8],
     now: u64,
 ) -> LoginDiscovery {
+    let coverage_homes = CoverageHomes(homes.iter().map(|home| home.home.clone()).collect());
     let mut complete = homes_complete;
     let mut skipped = BTreeMap::new();
     let mut default_home = DefaultHomeState::default();
@@ -342,6 +361,8 @@ pub(crate) fn discover(
         complete,
         skipped,
         default_home,
+        coverage_homes,
+        codex_scan_enabled: false,
     }
 }
 

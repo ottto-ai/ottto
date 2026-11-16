@@ -8021,6 +8021,18 @@ fn finish_sync_source(
         &claude_authority_disposition.mixed_uploads,
     );
     claude_authority_disposition.defer_sessions(deferred_accounts);
+    // Account activity is folded before anything below can save this page's
+    // progress, so no evidence the page consumed is lost to it.
+    if source == SnapshotSource::Codex {
+        crate::provider_daily_reference::account_activity::fold_codex_page(
+            support_dir,
+            &crate::provider_daily_reference::account_activity::Page::of_scan(
+                &scan_result,
+                &scan_agent_status_collection,
+                index.decode_holds_empty(),
+            ),
+        );
+    }
     // Billing route annotation: after ownership is bound, before upload policy.
     // Process memory only; off, nothing runs.
     crate::snapshots::billing_route::annotate_session_billing_routes(
@@ -12409,6 +12421,9 @@ fn withdraw_and_report_policy_stop(
     status: CollectorStatus<'_>,
 ) -> Result<()> {
     let source = status.source;
+    if source == SnapshotSource::Codex {
+        crate::provider_daily_reference::account_activity::note_policy_stop(support_dir);
+    }
     withdraw_source_manifest(
         &snapshot_upload_destination_namespace(device, device_secret),
         source,
@@ -12830,6 +12845,9 @@ pub(crate) fn resume_reconnected_sources(support_dir: &Path) {
         let resumed = std::fs::remove_file(&marker)
             .map_err(anyhow::Error::from)
             .and_then(|()| sync_progress_parent(&marker));
+        if resumed.is_ok() && source == SnapshotSource::Codex {
+            crate::provider_daily_reference::account_activity::note_resume(support_dir);
+        }
         let failures = turn.entry(marker).or_default();
         *failures = if resumed.is_ok() { 0 } else { *failures + 1 };
         if *failures > 3 {
@@ -20071,6 +20089,7 @@ mod tests {
             snapshots: vec![custom_upload],
             source_health_snapshot: default_health,
             codex_scan_homes: Vec::new(),
+            codex_scan_homes_complete: false,
             codex_home_bindings: Vec::new(),
             setup_snapshot_index: None,
         };

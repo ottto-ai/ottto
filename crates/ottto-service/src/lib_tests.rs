@@ -370,11 +370,29 @@ mod tests {
         assert!(!debug.contains(&retained_hash));
         // Derived array Debug would leak decimal bytes rather than hex.
         assert!(!debug.contains("[1, 35, 69, 103, 137, 171, 205, 239"));
+        // The local Codex account activity map (pair hashes, home paths) stays
+        // out of the bundle.
+        let activity_pair = "fedcba9876543210".repeat(4);
+        let activity_home = "synthetic-activity-home";
+        let activity_path = support.join("codex-daily-aggregates/account-activity.json");
+        std::fs::create_dir_all(activity_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &activity_path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "activity": {format!("{activity_pair}:{activity_pair}"): 1},
+                "anchor": {"window_end": 1, "homes": [activity_home]}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         let daemon = daemon();
         let bundle = daemon
             .diagnostics_stub(TOKEN)
             .expect("diagnostics should succeed");
         let encoded = serde_json::to_string(&bundle).expect("diagnostics serialize");
+        assert!(!encoded.contains(&activity_pair));
+        assert!(!encoded.contains(activity_home));
 
         assert_eq!(
             diagnostic_item(&bundle, "security", "keychain_item_count"),

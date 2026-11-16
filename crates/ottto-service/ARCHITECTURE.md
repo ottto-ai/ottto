@@ -598,7 +598,15 @@ home and every accepted slot home once (never a home seen only through a running
 keeps one login per opaque account (identified first, then the default home, then the lowest
 slot id) and uses a slot only while its live token proves the pair it was registered with.
 Logins are read most overdue first, each at its own 6 h cadence and breaker; a 429 or a
-grant-wide refusal ends the tick. The attempt time is saved before every request, and a
+grant-wide refusal ends the tick. A login is read about every 22 h instead when
+`account_activity` proves its account unused for 72 h: each ordinary Codex page folds the
+hashed creator pairs and session times into the local `account-activity.json` (bound to the
+grant, 90-day retention, never uploaded or in diagnostics). The proof needs 72 h of unbroken
+observation, a fresh page, a clean loss-free census generation with a 3-day horizon that
+started after the last gap, policy stop or resume, full home coverage with the Codex scan on,
+and no unattributed or unknown-pair activity in 72 h; anything else keeps 6 h. A failed idle
+read is retried at the 6 h cadence, and a failed map write distrusts the map until a full
+reset. The attempt time is saved before every request, and a
 request is never made when that save fails. `state.json` (schema 2) keeps one entry per
 account and the latest discovery summary; status reads that summary and never a credential.
 An answer with a `users` count above one anywhere is refused as workspace-wide. A batch counts

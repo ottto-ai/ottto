@@ -791,6 +791,7 @@ mod tests {
             snapshots: vec![snapshot.clone()],
             source_health_snapshot: snapshot,
             codex_scan_homes: Vec::new(),
+            codex_scan_homes_complete: false,
             codex_home_bindings: Vec::new(),
             setup_snapshot_index: Some(0),
         }

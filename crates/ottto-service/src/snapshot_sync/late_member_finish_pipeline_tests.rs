@@ -186,6 +186,7 @@ impl LateMemberPipeline {
             snapshots: vec![test_agent_status(SourceKind::ClaudeCode)],
             source_health_snapshot: test_agent_status(SourceKind::ClaudeCode),
             codex_scan_homes: Vec::new(),
+            codex_scan_homes_complete: false,
             codex_home_bindings: Vec::new(),
             setup_snapshot_index: None,
         };

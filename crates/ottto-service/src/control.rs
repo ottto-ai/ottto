@@ -28942,6 +28942,7 @@ X-API-Key = "otel_redacted"
             snapshots: vec![cached.clone()],
             source_health_snapshot: cached.clone(),
             codex_scan_homes: Vec::new(),
+            codex_scan_homes_complete: false,
             codex_home_bindings: Vec::new(),
             setup_snapshot_index: Some(0),
         };

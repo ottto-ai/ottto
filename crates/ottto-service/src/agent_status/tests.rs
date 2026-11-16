@@ -3777,6 +3777,7 @@ fn a_signed_in_raw_only_codex_row_keeps_is_current_when_filled() {
             snapshots,
             source_health_snapshot,
             codex_scan_homes: Vec::new(),
+            codex_scan_homes_complete: false,
             codex_home_bindings: Vec::new(),
             setup_snapshot_index,
         };
@@ -15870,6 +15871,7 @@ fn claude_status_lane_wakes_for_a_reset_read_behind_the_spacing_gate() {
         snapshots: vec![snapshot.clone()],
         source_health_snapshot: snapshot,
         codex_scan_homes: Vec::new(),
+        codex_scan_homes_complete: false,
         codex_home_bindings: Vec::new(),
         setup_snapshot_index: None,
     };
@@ -18135,6 +18137,7 @@ fn setup_scan_sends_the_default_logins_selected_row_or_nothing() {
             snapshots,
             source_health_snapshot,
             codex_scan_homes: Vec::new(),
+            codex_scan_homes_complete: false,
             codex_home_bindings: Vec::new(),
             setup_snapshot_index,
         };

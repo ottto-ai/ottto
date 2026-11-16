@@ -184,6 +184,7 @@ impl crate::source_rotation::Owner for OwnedRotationProof {
                 snapshots: vec![status.clone()],
                 source_health_snapshot: status,
                 codex_scan_homes: vec![],
+                codex_scan_homes_complete: false,
                 codex_home_bindings: vec![],
                 setup_snapshot_index: None,
             })),

@@ -2365,6 +2365,10 @@ impl ScanIndex {
             .iter()
             .any(|field| self.decode_holds.contains(field, root))
     }
+    /// Whether the index loaded whole: available, with nothing held back.
+    pub(crate) fn decode_holds_empty(&self) -> bool {
+        self.persistence_available() && self.decode_holds.is_empty()
+    }
     pub(crate) fn decode_holds_file(&self, key: &str) -> bool {
         self.decode_holds.contains("files", key)
             || claude_index_path_member_ref(Path::new(key))

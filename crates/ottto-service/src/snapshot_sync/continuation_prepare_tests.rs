@@ -147,6 +147,7 @@ impl ContinuationFixture {
                 snapshots: vec![status.clone()],
                 source_health_snapshot: status,
                 codex_scan_homes: vec![],
+                codex_scan_homes_complete: false,
                 codex_home_bindings: vec![],
                 setup_snapshot_index: None,
             })),
@@ -251,6 +252,7 @@ pub(super) fn continuation_realistic_preparation_for_test() -> SourcePreparation
         codex_scan_homes: (0..5)
             .map(|n| fixture.home.join(format!("scan-home-{n}")))
             .collect(),
+        codex_scan_homes_complete: false,
         codex_home_bindings: vec![],
         setup_snapshot_index: None,
     }));

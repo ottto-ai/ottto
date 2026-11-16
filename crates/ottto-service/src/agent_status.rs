@@ -410,6 +410,10 @@ pub(crate) struct AgentStatusCollection {
     pub snapshots: Vec<AgentStatusSnapshot>,
     pub source_health_snapshot: AgentStatusSnapshot,
     pub codex_scan_homes: Vec<PathBuf>,
+    /// True only when the slot settings, every registered binding and slot
+    /// home, and every home's candidate read succeeded, so no home is
+    /// missing from `codex_scan_homes` for a reason that can pass.
+    pub codex_scan_homes_complete: bool,
     pub codex_home_bindings: Vec<CodexHomeBinding>,
     /// Position in `snapshots` of the row the upload selected for the
     /// source's default login, recorded where the collector selects it. The
@@ -1712,6 +1716,7 @@ fn single_agent_status_collection(snapshot: AgentStatusSnapshot) -> AgentStatusC
         snapshots: vec![snapshot.clone()],
         source_health_snapshot: snapshot,
         codex_scan_homes: Vec::new(),
+        codex_scan_homes_complete: false,
         codex_home_bindings: Vec::new(),
         setup_snapshot_index: Some(0),
     }
@@ -1751,8 +1756,9 @@ fn collect_codex_status_snapshots(
 ) -> AgentStatusCollection {
     let settings = FileCodexAccountSlotSettingsStore::default().load();
     note_codex_scope_read(0, settings.as_ref().err(), usize::from(settings.is_err()));
+    let settings_read = settings.is_ok();
     let settings = settings.unwrap_or_else(|_| empty_codex_accounts_status());
-    let (mut status, mut candidates) =
+    let (mut status, mut candidates, candidates_complete) =
         collect_codex_slot_candidates(settings, &captured_at, &expires_at);
     canonicalize_codex_candidates(&mut candidates);
     apply_codex_candidate_statuses(&mut status, &candidates);
@@ -1854,6 +1860,7 @@ fn collect_codex_status_snapshots(
         snapshots,
         source_health_snapshot,
         codex_scan_homes,
+        codex_scan_homes_complete: settings_read && candidates_complete,
         codex_home_bindings,
         setup_snapshot_index,
     }
@@ -2407,7 +2414,7 @@ pub(crate) fn annotate_codex_accounts_status(
 ) -> CodexAccountsStatusV1 {
     let captured_at = crate::current_rfc3339_timestamp();
     let expires_at = captured_at.clone();
-    let (mut status, mut candidates) =
+    let (mut status, mut candidates, _) =
         collect_codex_slot_candidates(status, &captured_at, &expires_at);
     canonicalize_codex_candidates(&mut candidates);
     apply_codex_candidate_statuses(&mut status, &candidates);
@@ -2511,13 +2518,16 @@ fn read_registered_codex_home_for_setup(
     Ok((identity, status))
 }
 
+/// Every home's candidate, and whether every settings read succeeded and
+/// every candidate read joined.
 fn collect_codex_slot_candidates(
     status: CodexAccountsStatusV1,
     captured_at: &str,
     expires_at: &str,
-) -> (CodexAccountsStatusV1, Vec<CodexSlotCandidate>) {
-    let slots = codex_home_slots(&status);
-    let candidates = thread::scope(|scope| {
+) -> (CodexAccountsStatusV1, Vec<CodexSlotCandidate>, bool) {
+    let (slots, slots_complete) = codex_home_slots_checked(&status);
+    let expected = slots.len();
+    let candidates: Vec<CodexSlotCandidate> = thread::scope(|scope| {
         let handles = slots
             .into_iter()
             .map(|slot| {
@@ -2536,7 +2546,8 @@ fn collect_codex_slot_candidates(
             .filter_map(|handle| handle.join().ok())
             .collect()
     });
-    (status, candidates)
+    let complete = slots_complete && candidates.len() == expected;
+    (status, candidates, complete)
 }
 
 /// The default Codex home and every accepted managed slot home.
@@ -5941,6 +5952,7 @@ fn collect_claude_status_snapshots(
         snapshots,
         source_health_snapshot,
         codex_scan_homes: Vec::new(),
+        codex_scan_homes_complete: false,
         codex_home_bindings: Vec::new(),
         setup_snapshot_index,
     }
@@ -20751,6 +20763,6 @@ mod usage_checks_paused_tests;
 #[cfg(test)]
 mod claude_login_phase0_tests;
 
-crate::heap_layout_bound::fields!(AgentStatusCollection; snapshots, source_health_snapshot, codex_scan_homes, codex_home_bindings, setup_snapshot_index);
+crate::heap_layout_bound::fields!(AgentStatusCollection; snapshots, source_health_snapshot, codex_scan_homes, codex_home_bindings, setup_snapshot_index; inline codex_scan_homes_complete);
 
 crate::heap_layout_bound::fields!(CodexHomeBinding; home, account_identifier_hash, workspace_identifier_hash, auth_modified_at);

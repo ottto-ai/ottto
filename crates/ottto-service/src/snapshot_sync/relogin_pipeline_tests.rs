@@ -38,6 +38,7 @@ fn relogin_alias_keeps_accepted_history_without_a_reread() {
         snapshots: vec![test_agent_status(SourceKind::ClaudeCode)],
         source_health_snapshot: test_agent_status(SourceKind::ClaudeCode),
         codex_scan_homes: Vec::new(),
+        codex_scan_homes_complete: false,
         codex_home_bindings: Vec::new(),
         setup_snapshot_index: None,
     };

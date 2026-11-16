@@ -351,7 +351,8 @@ the Mac; turning either setting off also stops it.
 Codex daily usage totals: this reader is off until you turn on **Compare with
 OpenAI's reported usage** in Ottto's web Settings > Data & privacy and this Mac
 confirms it. Approval covers one Ottto user on this Mac and every Codex account
-signed in here. Once on, about every six hours it reads
+signed in here. Once on, about every six hours (about once a day for an account
+this Mac's Codex sessions show unused for three days) it reads
 `chatgpt.com/backend-api/wham/analytics/daily-workspace-usage-counts` once per
 Codex account signed in on this Mac (the default Codex sign-in and Ottto's Codex
 account slots). It covers the last 120 complete UTC days, scoped to the
@@ -369,6 +370,10 @@ uploaded, and no other ChatGPT endpoint is contacted. Turn it off in the same
 setting, exclude the account signed in to Codex's default sign-in there, or
 create `~/Library/Application Support/Ottto/codex-daily-aggregates-disabled` to
 stop reads on this Mac.
+To pick that pace, the Mac keeps a local file of when each Codex account and
+workspace (as SHA-256 hashes) last appeared in its Codex sessions, kept 90 days.
+It is not uploaded and not included in diagnostics. Turning the setting off
+restarts the three-day observation.
 
 Claude Code runs started by the daemon: while **Keep my Claude accounts signed
 in** is on (it is on until you turn it off), when a Claude login's access token

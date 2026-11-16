@@ -995,12 +995,12 @@ fn state_entries_are_pruned_only_after_a_complete_discovery() {
     };
     collector
         .state
-        .record_tick(summary(false), &[], "2026-07-27")
+        .record_tick(summary(false), &[], "2026-07-27", 0)
         .expect("incomplete");
     assert_eq!(collector.state.load_file().entries.len(), 2);
     collector
         .state
-        .record_tick(summary(true), &[], "2026-07-27")
+        .record_tick(summary(true), &[], "2026-07-27", 0)
         .expect("complete");
     assert_eq!(
         collector

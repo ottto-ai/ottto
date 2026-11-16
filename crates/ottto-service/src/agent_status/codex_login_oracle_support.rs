@@ -154,6 +154,7 @@ pub(crate) fn collection(homes: &[PathBuf]) -> AgentStatusCollection {
         snapshots: vec![source_health_snapshot.clone()],
         source_health_snapshot,
         codex_scan_homes: homes.to_vec(),
+        codex_scan_homes_complete: false,
         codex_home_bindings,
         setup_snapshot_index: None,
     }

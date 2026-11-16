@@ -106,6 +106,8 @@ const PROVIDER_ENDPOINT: &str =
 /// Day-grain data does not reward frequent polling. Six hours with a modest
 /// deterministic spread across our own installs.
 const FETCH_INTERVAL_SECONDS: u64 = 6 * 60 * 60;
+/// An account proven unused on this Mac for 72 hours is read about daily.
+const IDLE_FETCH_INTERVAL_SECONDS: u64 = 22 * 60 * 60;
 const FETCH_INTERVAL_JITTER_SECONDS: u64 = 15 * 60;
 /// Supervisor tick. The cadence gate above does the real limiting; the short
 /// tick only means a grant created after boot activates without a restart.
@@ -495,6 +497,11 @@ impl Default for GrantStore {
 impl GrantStore {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self { path: path.into() }
+    }
+
+    /// The consent file under `support_dir`, laid out as [`Default`] does.
+    pub(crate) fn in_support_dir(support_dir: &Path) -> Self {
+        Self::new(support_dir.join(GRANT_DIR).join(GRANT_FILE))
     }
 
     pub fn path(&self) -> &Path {
@@ -1554,6 +1561,14 @@ struct CollectorState {
     /// save of every newer attempt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     proof: Option<SeriesProof>,
+    /// When this entry was first admitted or seen. An idle proof must come
+    /// from a scan generation that started after it.
+    #[serde(default)]
+    first_seen_epoch_seconds: u64,
+    /// Armed at admission and cleared only by a full success or a
+    /// suppression, so a failed read is retried at the 6 h band. 0: none.
+    #[serde(default)]
+    retry_due_epoch_seconds: u64,
 }
 
 /// One account's proof that the backend stored its whole series as current.
@@ -1630,6 +1645,8 @@ impl fmt::Debug for CollectorState {
             .field("home_kind", &self.home_kind)
             .field("last_reason", &self.last_reason)
             .field("proof", &self.proof)
+            .field("first_seen_epoch_seconds", &self.first_seen_epoch_seconds)
+            .field("retry_due_epoch_seconds", &self.retry_due_epoch_seconds)
             .finish_non_exhaustive()
     }
 }
@@ -1742,13 +1759,14 @@ impl StateStore {
     }
 
     /// End-of-tick bookkeeping: the discovery summary, each selected entry's
-    /// last-seen day and reason, and (after a complete discovery) pruning.
-    /// Writes only when something changed.
+    /// last-seen day, first-seen time and reason, and (after a complete
+    /// discovery) pruning. Writes only when something changed.
     fn record_tick(
         &self,
         summary: DiscoverySummary,
         seen: &[SeenAccount],
         today: &str,
+        now: u64,
     ) -> Result<()> {
         let before = self.load_file();
         let mut file = before.clone();
@@ -1760,6 +1778,9 @@ impl StateStore {
             entry.home_kind = Some(account.home_kind.to_string());
             entry.binding = Some(summary.binding.clone());
             entry.last_seen_day = Some(today.to_string());
+            if entry.first_seen_epoch_seconds == 0 {
+                entry.first_seen_epoch_seconds = now;
+            }
             if let Some(reason) = account.reason {
                 entry.last_reason = Some(reason.to_string());
             }
@@ -1876,14 +1897,14 @@ fn state_after_success(
     state
 }
 
-/// Deterministic 5h45m-6h15m gate.
+/// Deterministic gate: 5h45m-6h15m, or 21h45m-22h15m for an idle account.
 ///
 /// The spread is load-spreading across our own installs so every Ottto machine
 /// does not wake on the same wall-clock minute. It is derived from the grant
 /// identity rather than redrawn per tick, so a machine holds one steady phase,
 /// and it hides nothing: the request identifies itself honestly and a
 /// timer-driven daemon is recognizable from its behaviour regardless of phase.
-fn fetch_interval_seconds(identity: &str) -> u64 {
+fn fetch_interval_seconds(identity: &str, idle: bool) -> u64 {
     let mut hasher = Sha256::new();
     hasher.update(b"ottto:codex-daily-aggregates-cadence:");
     hasher.update(identity.as_bytes());
@@ -1892,11 +1913,28 @@ fn fetch_interval_seconds(identity: &str) -> u64 {
     bytes.copy_from_slice(&digest[..8]);
     let span = FETCH_INTERVAL_JITTER_SECONDS * 2 + 1;
     let offset = u64::from_be_bytes(bytes) % span;
-    FETCH_INTERVAL_SECONDS + offset - FETCH_INTERVAL_JITTER_SECONDS
+    let interval = if idle {
+        IDLE_FETCH_INTERVAL_SECONDS
+    } else {
+        FETCH_INTERVAL_SECONDS
+    };
+    interval + offset - FETCH_INTERVAL_JITTER_SECONDS
 }
 
-fn fetch_due(state: &CollectorState, identity: &str, now: u64) -> bool {
-    now.saturating_sub(state.last_fetch_epoch_seconds) >= fetch_interval_seconds(identity)
+/// When this account is next due: at once if never read, else its cadence
+/// band after the last attempt, or an armed retry if that comes first. The
+/// tick orders by and gates on this one function.
+fn next_due_at(state: &CollectorState, identity: &str, idle: bool) -> u64 {
+    if state.last_fetch_epoch_seconds == 0 {
+        return 0;
+    }
+    let due = state
+        .last_fetch_epoch_seconds
+        .saturating_add(fetch_interval_seconds(identity, idle));
+    match state.retry_due_epoch_seconds {
+        0 => due,
+        retry => due.min(retry),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3344,23 +3382,34 @@ impl Collector {
                 }
             })
             .collect::<Vec<_>>();
+        // The activity map is read once per tick; each login's gate below
+        // uses the same view.
+        let activity = account_activity::ActivityStore::beside(self.state.path()).load_trusted();
+        let binding = StateBinding::of(&expected);
         // Most overdue first; ties (every never-read login is due since the
         // epoch) keep discovery order: default home, then slot id. No caps:
         // every selected login is evaluated.
         let state_file = self.state.load_file();
+        let never_read = CollectorState::default();
+        let mut last_now = clock();
+        let order_now = unix_seconds(last_now);
         let mut order = seen
             .iter()
             .enumerate()
             .map(|(index, account)| {
-                let due_at = state_file
+                let state = state_file
                     .entries
                     .get(&account.identity)
-                    .map(|state| state.last_fetch_epoch_seconds)
-                    .filter(|last_fetch| *last_fetch > 0)
-                    .map_or(0, |last_fetch| {
-                        last_fetch.saturating_add(fetch_interval_seconds(&account.identity))
-                    });
-                (due_at, index)
+                    .unwrap_or(&never_read);
+                let idle = account_activity::idle(
+                    activity.as_ref(),
+                    discovery,
+                    &binding,
+                    state.first_seen_epoch_seconds,
+                    discovery.logins[index].identity.as_ref(),
+                    order_now,
+                );
+                (next_due_at(state, &account.identity, idle), index)
             })
             .collect::<Vec<_>>();
 
@@ -3378,8 +3427,9 @@ impl Collector {
         let tick = TickContext {
             expected: &expected,
             selected: &selected,
+            activity: activity.as_ref(),
+            discovery,
         };
-        let mut last_now = clock();
         for (_, index) in order {
             let login = &discovery.logins[index];
             last_now = clock();
@@ -3424,9 +3474,12 @@ impl Collector {
                 skipped: discovery.skipped.clone(),
                 default_home: discovery.default_home.clone(),
             };
-            let _ = self
-                .state
-                .record_tick(summary, &seen, &date_string(last_now));
+            let _ = self.state.record_tick(
+                summary,
+                &seen,
+                &date_string(last_now),
+                unix_seconds(last_now),
+            );
         }
 
         // No live login: nothing was read, and the saved summary now says so.
@@ -3701,7 +3754,15 @@ fn collect_account_once(
             "circuit_open",
         );
     }
-    if !fetch_due(&state, &identity, now_seconds) {
+    let idle = account_activity::idle(
+        tick.activity,
+        tick.discovery,
+        &StateBinding::of(expected),
+        state.first_seen_epoch_seconds,
+        login.identity.as_ref(),
+        now_seconds,
+    );
+    if now_seconds < next_due_at(&state, &identity, idle) {
         return AccountAttempt {
             cycle: Cycle::new(CycleOutcome::Noop),
             reason: None,
@@ -3717,12 +3778,18 @@ fn collect_account_once(
         );
     }
 
-    // Admission: the attempt time is durable before the request, so every
-    // outcome below is next due at the ordinary cadence. The same save clears
-    // this account's series proof, so no older proof can outlive a newer
-    // attempt. A failed save makes no request at all.
+    // Admission: the attempt time is durable before the request, with a
+    // retry at the ordinary 6 h band that only a full success or a
+    // suppression clears. The same save clears this account's series proof,
+    // so no older proof can outlive a newer attempt. A failed save makes no
+    // request at all.
     let (window_start, window_end) = collection_window(now);
     state.last_fetch_epoch_seconds = now_seconds;
+    state.retry_due_epoch_seconds =
+        now_seconds.saturating_add(fetch_interval_seconds(&identity, false));
+    if state.first_seen_epoch_seconds == 0 {
+        state.first_seen_epoch_seconds = now_seconds;
+    }
     state.schema_version = STATE_FILE_SCHEMA_VERSION;
     state.identity = identity.clone();
     state.last_seen_day = Some(date_string(now));
@@ -3834,6 +3901,10 @@ fn collect_account_once(
                 "codex_daily_aggregates_identical_series",
                 "This Codex account returned the same series another account already uploaded this tick; it was not uploaded again.",
             ));
+            // Not a failure to retry: due again at its cadence. Success,
+            // proof and freshness are unchanged.
+            state.retry_due_epoch_seconds = 0;
+            let _ = state_store.save(&state);
             return AccountAttempt::next(
                 failed(diagnostics, CycleOutcome::Deferred),
                 "identical_series",
@@ -4026,6 +4097,7 @@ fn collect_account_once(
             window_end: window_end.clone(),
             digest,
         });
+    state.retry_due_epoch_seconds = 0;
     let _ = state_store.save(&state);
     let _ = grants.record_health_for(expected, Some(&collected_at), None);
     AccountAttempt::next(failed(diagnostics, CycleOutcome::Uploaded), "ok")
@@ -4038,6 +4110,9 @@ struct TickContext<'a> {
     expected: &'a BackendGrantBinding,
     /// State keys of every login this tick's discovery selected.
     selected: &'a BTreeSet<String>,
+    /// The activity map read once for this tick.
+    activity: Option<&'a account_activity::ActivityMap>,
+    discovery: &'a logins::LoginDiscovery,
 }
 
 /// The largest `users` count anywhere in a provider answer: day totals,
@@ -4521,11 +4596,16 @@ pub fn collect_composed_once(now: OffsetDateTime) -> Cycle {
         return attribution_unavailable_cycle();
     };
     let (homes, homes_complete) = crate::agent_status::daily_reference_homes();
-    let discovery = logins::discover(homes, homes_complete, &grant_key, unix_seconds(now));
+    let mut discovery = logins::discover(homes, homes_complete, &grant_key, unix_seconds(now));
     let Ok((device, device_secret)) = crate::snapshot_client::load_snapshot_device_credentials()
     else {
         return deferred("device_credentials_unavailable");
     };
+    // A paused, ungranted or not yet resumed Codex scan never proves an
+    // account idle.
+    discovery.codex_scan_enabled =
+        crate::snapshot_sync::enabled_snapshot_sources_in(&device, &default_support_dir())
+            .contains(&crate::snapshots::SnapshotSource::Codex);
     let hardware = match grant_rebind::verified_live_hardware() {
         Ok(hardware) => hardware,
         Err(reason) => {
@@ -4925,6 +5005,7 @@ fn atomic_json_write<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 // Tests
 // ---------------------------------------------------------------------------
 
+pub(crate) mod account_activity;
 pub(crate) mod logins;
 
 #[cfg(test)]
