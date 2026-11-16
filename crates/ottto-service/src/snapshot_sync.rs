@@ -4252,6 +4252,14 @@ const SHED_BACKOFF_BASE: Duration = Duration::from_secs(30);
 /// Uniform random in `[0, span]`, from the OS entropy source already used for
 /// token material. Jitter that is not random is not jitter.
 fn uniform_duration(span: Duration) -> Duration {
+    #[cfg(test)]
+    if let Some(sample) =
+        tests::permanent_finish_pipeline_tests::once_credit_oracle_tests::backoff_sample_for_test(
+            span,
+        )
+    {
+        return sample;
+    }
     if span.is_zero() {
         return Duration::ZERO;
     }

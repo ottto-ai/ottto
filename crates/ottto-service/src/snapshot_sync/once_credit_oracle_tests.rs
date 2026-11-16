@@ -12,6 +12,23 @@ const NOW: u64 = 1_793_527_200;
 
 thread_local! {
     static FINALIZED: RefCell<Option<Vec<SnapshotItem>>> = const { RefCell::new(None) };
+    static BACKOFF_MIDPOINT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(in crate::snapshot_sync) fn backoff_sample_for_test(span: Duration) -> Option<Duration> {
+    BACKOFF_MIDPOINT.with(|slot| slot.get().then_some(span / 2))
+}
+
+struct BackoffMidpoint(bool);
+impl BackoffMidpoint {
+    fn start() -> Self {
+        Self(BACKOFF_MIDPOINT.with(|slot| slot.replace(true)))
+    }
+}
+impl Drop for BackoffMidpoint {
+    fn drop(&mut self) {
+        BACKOFF_MIDPOINT.with(|slot| slot.set(self.0));
+    }
 }
 
 pub(super) fn observe_finalized_items(items: &[SnapshotItem]) {
@@ -1169,7 +1186,13 @@ fn c06_crash_windows_preserve_placement_and_durable_suppression() {
         };
         *server.fallback.lock().unwrap() = answer;
         let failure = matches!(answer, Answer::Accept).then(|| SaveFailure::at("selected_save"));
-        let first = home.cycle(&server, &recording);
+        // Full jitter may sample less than one second and round down to zero
+        // in persisted custody. This row needs a positive timed hold, so fix
+        // the random sample within its valid range on this thread only.
+        let first = {
+            let _backoff = BackoffMidpoint::start();
+            home.cycle(&server, &recording)
+        };
         drop(failure);
         assert!(first.finish.is_err());
         // Dropped-before-store and stored-with-lost-ACK are both transport
@@ -1177,13 +1200,25 @@ fn c06_crash_windows_preserve_placement_and_durable_suppression() {
         let durable = matches!(answer, Answer::Accept);
         let item = &first.finalized[0];
         assert_eq!(first.accepted_body(item), durable);
+        let mut replay_at = home.now + 3600;
         if !durable {
             let custody = &first.progress.quarantined_fingerprints[&item.snapshot_fingerprint];
             assert_eq!(
                 custody.disposition,
                 SnapshotQuarantineDisposition::RetryPending
             );
-            assert!(custody.retry_after_unix_seconds > home.now);
+            assert!(
+                custody.retry_after_unix_seconds > home.now,
+                "{}: retry deadline {} must follow fixture clock {}",
+                home.row,
+                custody.retry_after_unix_seconds,
+                home.now
+            );
+            assert_eq!(
+                custody.upload_body_witness.as_deref(),
+                Some(snapshot_upload_body_witness(item).as_str())
+            );
+            replay_at = custody.retry_after_unix_seconds + 1;
         }
         assert_eq!(
             server.placement.lock().unwrap().len(),
@@ -1193,7 +1228,7 @@ fn c06_crash_windows_preserve_placement_and_durable_suppression() {
         home.restore_pre_cycle_index(&first);
         // Transport failure keeps the exact unACKed body in retryable custody.
         // A restart alone does not make that custody's deadline due.
-        home.now += 3600;
+        home.now = replay_at;
         let replay = home.cycle(&server, &recording);
         assert!(replay.finish.is_ok());
         assert_eq!(
