@@ -2691,8 +2691,14 @@ fn scheduling_permutations_converge_to_the_same_bodies() {
                                     }
                                 }
                             };
-                            assert_eq!(value["body"]["input_tokens"], input);
-                            assert_eq!(value["body"]["request_count"], requests);
+                            assert_eq!(
+                                value["body"]["input_tokens"], input,
+                                "{source:?} entity {entity} input"
+                            );
+                            assert_eq!(
+                                value["body"]["request_count"], requests,
+                                "{source:?} entity {entity} requests"
+                            );
                             assert_eq!(
                                 value["placement"],
                                 json!({"source":source.api_slug(),"machine_id":"otm_test"})
