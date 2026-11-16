@@ -71,6 +71,8 @@ pub mod snapshots;
 mod source_rotation;
 pub mod telemetry_attach;
 #[cfg(test)]
+mod test_effects;
+#[cfg(test)]
 mod test_isolation;
 #[cfg(test)]
 mod test_scratch;
