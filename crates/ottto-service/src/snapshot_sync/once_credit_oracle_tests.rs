@@ -278,6 +278,10 @@ struct OracleHome {
     small_page: bool,
     state_budget: Option<usize>,
     legacy_counting: bool,
+    row: &'static str,
+    cycle_number: usize,
+    current_codex_account: &'static str,
+    restarted: bool,
     support: PathBuf,
     device: LocalDeviceBinding,
     client: SnapshotApiClient,
@@ -299,6 +303,7 @@ struct Cycle {
     index: ScanIndex,
     progress: SnapshotUploadProgress,
     finish: Result<()>,
+    effects: Vec<test_effects::Effect>,
 }
 
 impl OracleHome {
@@ -346,6 +351,8 @@ impl OracleHome {
             EnvVarGuard::set_str("OTTTO_API_BASE_URL", &server.url),
             EnvVarGuard::set_path("PI_CODING_AGENT_DIR", &fixture.home.join(".pi/agent")),
         ];
+        #[cfg(unix)]
+        crate::locked_state_dir::test_locks::hold(&support);
         let device = LocalDeviceBinding {
             device_id: "oracle-device".into(),
             machine_id: Some("otm_test".into()),
@@ -367,6 +374,10 @@ impl OracleHome {
             small_page: false,
             state_budget: None,
             legacy_counting: false,
+            row: "c00",
+            cycle_number: 0,
+            current_codex_account: "a",
+            restarted: false,
             support,
             device,
             client: SnapshotApiClient::new(server.url.clone()),
@@ -377,11 +388,31 @@ impl OracleHome {
         }
     }
     fn collection(&self) -> AgentStatusCollection {
+        let (codex_scan_homes, codex_home_bindings) = if self.source == SnapshotSource::Codex {
+            let home = self.fixture.home.join(".codex");
+            std::fs::create_dir_all(&home).unwrap();
+            let auth = home.join("auth.json");
+            if !auth.exists() {
+                std::fs::write(&auth, b"{}").unwrap();
+            }
+            let at = std::fs::metadata(auth).unwrap().modified().unwrap();
+            (
+                vec![home.clone()],
+                vec![crate::agent_status::CodexHomeBinding {
+                    home,
+                    account_identifier_hash: self.current_codex_account.repeat(64),
+                    workspace_identifier_hash: "f".repeat(64),
+                    auth_modified_at: at,
+                }],
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
         AgentStatusCollection {
             snapshots: vec![test_agent_status(source_kind(self.source))],
             source_health_snapshot: test_agent_status(source_kind(self.source)),
-            codex_scan_homes: Vec::new(),
-            codex_home_bindings: Vec::new(),
+            codex_scan_homes,
+            codex_home_bindings,
             setup_snapshot_index: None,
         }
     }
@@ -421,6 +452,7 @@ impl OracleHome {
     fn restart(&mut self) {
         drop(std::mem::replace(&mut self.daemon, test_daemon("otm_test")));
         self.retry = live_snapshot_retry::LiveRetryOwner::closed();
+        self.restarted = true;
         test_effects::record("restart", Vec::new());
     }
     fn restore_pre_cycle_index(&mut self, cycle: &Cycle) {
@@ -450,25 +482,26 @@ impl OracleHome {
             .unwrap();
         let start = server.batches.lock().unwrap().len();
         let collection = self.collection();
-        let mut frame = with_scan_clock(now, || {
-            crate::agent_status_refresh::with_test_collection(collection, || {
-                prepare_sync_source(
-                    &self.client,
-                    &self.device,
-                    "device-secret",
-                    self.source,
-                    "otm_test",
-                    &self.fixture.home,
-                    &self.support,
-                    &self.daemon,
-                    &mut self.transport,
-                    self.daemon.snapshot_scan_account_witness().unwrap(),
-                    false,
-                )
+        let (prepared, prepare_io) = transition::observe_codex_quiet(|| {
+            with_scan_clock(now, || {
+                crate::agent_status_refresh::with_test_collection(collection, || {
+                    prepare_sync_source(
+                        &self.client,
+                        &self.device,
+                        "device-secret",
+                        self.source,
+                        "otm_test",
+                        &self.fixture.home,
+                        &self.support,
+                        &self.daemon,
+                        &mut self.transport,
+                        self.daemon.snapshot_scan_account_witness().unwrap(),
+                        false,
+                    )
+                })
             })
-        })
-        .unwrap()
-        .expect("due real preparation");
+        });
+        let mut frame = prepared.unwrap().expect("due real preparation");
         frame.scan.as_mut().unwrap().set_oracle_collection_time(&at);
         frame.scan_started_at = at;
         let roots = self.source.default_roots(&self.fixture.home);
@@ -482,7 +515,7 @@ impl OracleHome {
             .unwrap();
         let pre_index_bytes = serde_json::to_vec(&frame.committed_index).unwrap();
         let handle = recording.handle();
-        let (preparation, index, scan, steps, io) = run_on_scan_worker_stack(move || {
+        let (preparation, index, scan, steps, mut io) = run_on_scan_worker_stack(move || {
             let _entered = handle.enter();
             let _cutover = legacy.then(|| crate::snapshots::TestCutover::set(i64::MAX));
             let read = move || {
@@ -533,6 +566,21 @@ impl OracleHome {
                 read()
             }
         });
+        io.consumed += prepare_io.consumed;
+        io.rederive_head += prepare_io.rederive_head;
+        io.rederive_named += prepare_io.rederive_named;
+        io.cheap_checks = io
+            .cheap_checks
+            .zip(prepare_io.cheap_checks)
+            .map(|(a, b)| a + b);
+        io.anchor_reads = io
+            .anchor_reads
+            .zip(prepare_io.anchor_reads)
+            .map(|(a, b)| a + b);
+        io.other_reads = io
+            .other_reads
+            .zip(prepare_io.other_reads)
+            .map(|(a, b)| a + b);
         let gate = scan.trace_projection(&roots);
         test_effects::record(
             "gate_c",
@@ -575,7 +623,7 @@ impl OracleHome {
             vec![("finish_ok", Scalar::Bool(finish.is_ok()))],
         );
         let batches = server.batches.lock().unwrap()[start..].to_vec();
-        Cycle {
+        let cycle = Cycle {
             pre_index_bytes,
             before,
             gate,
@@ -587,7 +635,26 @@ impl OracleHome {
             index,
             progress,
             finish,
+            effects: recording.take(),
+        };
+        let mut expected = Vec::new();
+        if self.restarted {
+            expected.push("restart");
         }
+        expected.extend(std::iter::repeat_n("step", cycle.steps.len()));
+        expected.push("gate_c");
+        expected.extend(std::iter::repeat_n("finalized", cycle.finalized.len()));
+        expected.extend(std::iter::repeat_n("post", cycle.batches.len()));
+        expected.push("reloaded");
+        assert_eq!(
+            cycle.effects.iter().map(|e| e.label).collect::<Vec<_>>(),
+            expected,
+            "ordered native steps, gate c, gate b items, gate a POSTs, reload"
+        );
+        self.restarted = false;
+        money_equivalence_tests::emit_cycle(self.row, self.cycle_number, self.source, &cycle);
+        self.cycle_number += 1;
+        cycle
     }
 }
 
@@ -598,6 +665,7 @@ fn c00_real_runner_collects_finishes_and_reloads() {
     let recording = Recording::start();
     let server = OracleServer::new(SnapshotSource::ClaudeCode, recording.handle());
     let mut home = OracleHome::new(SnapshotSource::ClaudeCode, &server);
+    home.row = "c00";
     let cycle = home.cycle(&server, &recording);
     cycle.finish.unwrap();
     assert_eq!(cycle.before.len(), 1);
@@ -614,7 +682,7 @@ fn c00_real_runner_collects_finishes_and_reloads() {
         &snapshot_upload_body_witness(item)
     ));
     assert_eq!(server.placement.lock().unwrap().len(), 1);
-    assert!(recording.take().iter().any(|e| e.label == "post"));
+    assert!(cycle.effects.iter().any(|e| e.label == "post"));
 }
 
 #[test]
@@ -685,6 +753,7 @@ fn c02_durable_ack_suppresses_replay_of_the_prior_index() {
     let recording = Recording::start();
     let server = OracleServer::new(SnapshotSource::ClaudeCode, recording.handle());
     let mut home = OracleHome::new(SnapshotSource::ClaudeCode, &server);
+    home.row = "c02";
     let first = home.cycle(&server, &recording);
     assert!(first.finish.is_ok());
     assert_durable(&first);
@@ -710,6 +779,7 @@ fn c03_complete_same_body_reread_drops_at_the_finalizer() {
     let recording = Recording::start();
     let server = OracleServer::new(SnapshotSource::ClaudeCode, recording.handle());
     let mut home = OracleHome::new(SnapshotSource::ClaudeCode, &server);
+    home.row = "c03";
     let first = home.cycle(&server, &recording);
     assert!(first.finish.is_ok());
     assert_durable(&first);
@@ -766,6 +836,7 @@ fn c04_pi_positive_conflicted_result_cannot_publish() {
     let recording = Recording::start();
     let server = OracleServer::new(SnapshotSource::Pi, recording.handle());
     let mut home = OracleHome::new(SnapshotSource::Pi, &server);
+    home.row = "c04";
     home.write_rows(&pi_rows(true));
     let held = home.cycle(&server, &recording);
     assert_eq!(held.gate["ownership_incomplete_file_count"], 1);
@@ -793,6 +864,7 @@ fn c04_pi_positive_conflicted_result_cannot_publish() {
     assert_durable(&complete);
     let completed_route = emitted_route(&complete, SnapshotSource::Pi, &server);
     let mut cold_home = OracleHome::new(SnapshotSource::Pi, &server);
+    cold_home.row = "c04_cold";
     cold_home.write_rows(&pi_rows(false));
     let cold = cold_home.cycle(&server, &recording);
     assert!(cold.finish.is_ok());
@@ -814,6 +886,7 @@ fn c05_fresh_destination_requires_its_own_exact_ack() {
     let recording = Recording::start();
     let server = OracleServer::new(SnapshotSource::ClaudeCode, recording.handle());
     let mut home = OracleHome::new(SnapshotSource::ClaudeCode, &server);
+    home.row = "c05";
     let first = home.cycle(&server, &recording);
     assert!(first.finish.is_ok());
     assert_durable(&first);
@@ -853,11 +926,21 @@ fn c06_crash_windows_preserve_placement_and_durable_suppression() {
         let recording = Recording::start();
         let server = OracleServer::new(SnapshotSource::ClaudeCode, recording.handle());
         let mut home = OracleHome::new(SnapshotSource::ClaudeCode, &server);
+        home.row = match answer {
+            Answer::Dropped => "c06_dropped",
+            Answer::LostAck => "c06_lost_ack",
+            Answer::Accept => "c06_selected_save",
+            _ => unreachable!("fixed crash table"),
+        };
         *server.fallback.lock().unwrap() = answer;
         let failure = matches!(answer, Answer::Accept).then(|| SaveFailure::at("selected_save"));
         let first = home.cycle(&server, &recording);
         drop(failure);
-        assert!(first.finish.is_err());
+        if !matches!(answer, Answer::LostAck) {
+            assert!(first.finish.is_err());
+        }
+        // A proofless successful reply need not be a transport error; the
+        // durable body ledger, below, decides whether replay is permitted.
         let durable = matches!(answer, Answer::Accept);
         let item = &first.finalized[0];
         assert_eq!(
@@ -973,6 +1056,7 @@ fn install_claude_control(home: &OracleHome) {
             query_source: "user".into(),
             app_version: "2.1.309".into(),
             event_sequence: Some(sequence as u64 + 1),
+            cost_usd_micros: Some(tokens * 10),
             input_tokens: tokens,
             output_tokens: tokens,
             request_count: 1,
@@ -1037,7 +1121,9 @@ fn c01_claude_cold_control_preserves_accounts_side_call_gap_and_tags() {
     let recording = Recording::start();
     let server = OracleServer::new(SnapshotSource::ClaudeCode, recording.handle());
     let mut home = OracleHome::new(SnapshotSource::ClaudeCode, &server);
+    home.row = "c01_claude";
     install_claude_control(&home);
+    let inputs = money_equivalence_tests::inputs(&home);
     let cold = home.cycle(&server, &recording);
     assert!(cold.finish.is_ok());
     assert_durable(&cold);
@@ -1080,6 +1166,11 @@ fn c01_claude_cold_control_preserves_accounts_side_call_gap_and_tags() {
         BTreeMap::from([("a".repeat(64), 10), ("b".repeat(64), 32)])
     );
     assert!(tagged);
+    money_equivalence_tests::emit_money(
+        "once_credit_claude",
+        money_equivalence_tests::bodies(SnapshotSource::ClaudeCode, &cold),
+        inputs,
+    );
     let placement = server.placement.lock().unwrap().clone();
     home.restart();
     let quiet = home.cycle(&server, &recording);
@@ -1209,6 +1300,7 @@ fn c07_codex_group_memo_rediscloses_without_session_credit() {
     let recording = Recording::start();
     let server = OracleServer::new(SnapshotSource::Codex, recording.handle());
     let mut home = OracleHome::new(SnapshotSource::Codex, &server);
+    home.row = "c07";
     home.legacy_counting = true;
     install_group(&home, true);
     let first = home.cycle(&server, &recording);
@@ -1232,6 +1324,7 @@ fn c08_codex_group_park_rediscloses_without_reading() {
     let recording = Recording::start();
     let server = OracleServer::new(SnapshotSource::Codex, recording.handle());
     let mut home = OracleHome::new(SnapshotSource::Codex, &server);
+    home.row = "c08";
     home.legacy_counting = true;
     install_group(&home, false);
     home.small_page = true;
@@ -1251,9 +1344,9 @@ fn c08_codex_group_park_rediscloses_without_reading() {
     assert!(server.placement.lock().unwrap().is_empty());
 }
 
-fn install_created_thread(home: &OracleHome, fork: bool) {
+fn install_created_thread(home: &OracleHome, fork: bool, session: &str) {
     let root = home.source.default_roots(&home.fixture.home)[0].clone();
-    let path = root.join(format!("rollout-{IDENTITY_PIPELINE_ROOT}.jsonl"));
+    let path = root.join(format!("rollout-{session}.jsonl"));
     let turn = |n| format!("1338a80a-5000-7000-8000-{n:012}");
     let usage = |(input, cached, output, reasoning)| {
         json!({"input_tokens":input,
@@ -1263,9 +1356,9 @@ fn install_created_thread(home: &OracleHome, fork: bool) {
         json!({"timestamp":at,"type":"event_msg","payload":{"type":"token_count",
         "info":{"total_token_usage":usage(total),"last_token_usage":usage(last),"model":"gpt-5.6-sol"}}})
     };
-    let mut meta = json!({"id":IDENTITY_PIPELINE_ROOT,"session_id":IDENTITY_PIPELINE_ROOT,
+    let mut meta = json!({"id":session,"session_id":session,
         "timestamp":"2026-11-01T07:00:00Z","history_mode":"paginated","thread_source":"agent_created_thread",
-        "source":"vscode","originator":"Codex Desktop","creator_user_id":"synthetic-user","creator_account_id":"synthetic-workspace"});
+        "source":"vscode","originator":"Codex Desktop","creator_user_id":format!("synthetic-user-{session}"),"creator_account_id":format!("synthetic-workspace-{session}")});
     if fork {
         meta["forked_from_id"] = "2338a80a-f36e-4cbc-a5bb-50fc66430ba5".into();
     }
@@ -1273,12 +1366,12 @@ fn install_created_thread(home: &OracleHome, fork: bool) {
         json!({"timestamp":"2026-11-01T07:00:00.500Z","type":"session_meta","payload":meta}),
         json!({"timestamp":"2026-11-01T07:00:00.501Z","type":"event_msg","payload":{"type":"task_started",
             "turn_id":turn(1),"started_at":NOW-10800,"trace_id":"0123456789abcdef0123456789abcdef"}}),
-        json!({"timestamp":"2026-11-01T07:00:01Z","type":"turn_context","payload":{"turn_id":turn(1),"model":"gpt-5.6-sol"}}),
+        json!({"timestamp":"2026-11-01T07:00:01Z","type":"turn_context","payload":{"turn_id":turn(1),"model":"gpt-5.6-sol","service_tier":"priority"}}),
         tokens("2026-11-01T07:00:02Z", (120, 100, 6, 2), (120, 100, 6, 2)),
         json!({"timestamp":"2026-11-01T07:00:03Z","type":"compacted","payload":{"replacement_history":[]}}),
         json!({"timestamp":"2026-11-01T07:00:03.500Z","type":"event_msg","payload":{"type":"task_complete","turn_id":turn(1)}}),
         json!({"timestamp":"2026-11-01T07:00:04Z","type":"event_msg","payload":{"type":"task_started","turn_id":turn(2),"started_at":NOW-10796}}),
-        json!({"timestamp":"2026-11-01T07:00:04.100Z","type":"turn_context","payload":{"turn_id":turn(2),"model":"gpt-5.6-sol"}}),
+        json!({"timestamp":"2026-11-01T07:00:04.100Z","type":"turn_context","payload":{"turn_id":turn(2),"model":"gpt-5.6-sol","service_tier":"priority"}}),
         tokens("2026-11-01T07:00:05Z", (50, 40, 3, 1), (50, 40, 3, 1)),
         tokens("2026-11-01T07:00:06Z", (80, 60, 5, 1), (30, 20, 2, 0)),
     ];
@@ -1287,11 +1380,13 @@ fn install_created_thread(home: &OracleHome, fork: bool) {
     }
     write_jsonl(&path, &rows);
     let db = rusqlite::Connection::open(root.parent().unwrap().join("state_5.sqlite")).unwrap();
-    db.execute_batch("CREATE TABLE IF NOT EXISTS threads (id TEXT NOT NULL,title TEXT,tokens_used INTEGER NOT NULL,thread_source TEXT,first_user_message TEXT,created_at_ms INTEGER,rollout_path TEXT); CREATE TABLE IF NOT EXISTS thread_spawn_edges(parent_thread_id TEXT NOT NULL,child_thread_id TEXT NOT NULL); DELETE FROM threads;").unwrap();
+    db.execute_batch("CREATE TABLE IF NOT EXISTS threads (id TEXT NOT NULL,title TEXT,tokens_used INTEGER NOT NULL,thread_source TEXT,first_user_message TEXT,created_at_ms INTEGER,rollout_path TEXT); CREATE TABLE IF NOT EXISTS thread_spawn_edges(parent_thread_id TEXT NOT NULL,child_thread_id TEXT NOT NULL);").unwrap();
+    db.execute("DELETE FROM threads WHERE id=?1", [session])
+        .unwrap();
     db.execute(
         "INSERT INTO threads VALUES (?1,'Thread',1,'agent_created_thread','Synthetic task',?2,?3)",
         rusqlite::params![
-            IDENTITY_PIPELINE_ROOT,
+            session,
             ((NOW - 10800) * 1000) as i64,
             path.to_string_lossy().into_owned()
         ],
@@ -1299,12 +1394,18 @@ fn install_created_thread(home: &OracleHome, fork: bool) {
     .unwrap();
     let history =
         rusqlite::Connection::open(root.parent().unwrap().join("thread_history_1.sqlite")).unwrap();
-    history.execute_batch("CREATE TABLE IF NOT EXISTS thread_history_projection_state(thread_id TEXT NOT NULL,next_rollout_byte_offset INTEGER NOT NULL,next_rollout_ordinal INTEGER NOT NULL); DELETE FROM thread_history_projection_state;").unwrap();
+    history.execute_batch("CREATE TABLE IF NOT EXISTS thread_history_projection_state(thread_id TEXT NOT NULL,next_rollout_byte_offset INTEGER NOT NULL,next_rollout_ordinal INTEGER NOT NULL);").unwrap();
+    history
+        .execute(
+            "DELETE FROM thread_history_projection_state WHERE thread_id=?1",
+            [session],
+        )
+        .unwrap();
     history
         .execute(
             "INSERT INTO thread_history_projection_state VALUES (?1,?2,?3)",
             rusqlite::params![
-                IDENTITY_PIPELINE_ROOT,
+                session,
                 std::fs::metadata(path).unwrap().len() as i64,
                 rows.len() as i64
             ],
@@ -1319,14 +1420,15 @@ fn c09_codex_singleton_memo_keeps_the_previous_body() {
     let recording = Recording::start();
     let server = OracleServer::new(SnapshotSource::Codex, recording.handle());
     let mut home = OracleHome::new(SnapshotSource::Codex, &server);
+    home.row = "c09";
     home.legacy_counting = true;
-    install_created_thread(&home, false);
+    install_created_thread(&home, false, IDENTITY_PIPELINE_ROOT);
     let cold = home.cycle(&server, &recording);
     assert!(cold.finish.is_ok());
     assert_durable(&cold);
     assert_eq!(cold.finalized[0].input_tokens, 200);
     let placement = server.placement.lock().unwrap().clone();
-    install_created_thread(&home, true);
+    install_created_thread(&home, true, IDENTITY_PIPELINE_ROOT);
     let held = home.cycle(&server, &recording);
     assert_eq!(last_counter(&held, "memo_records"), 1);
     assert!(held.gate["pending_finalization"][0]["previous_snapshot"]
@@ -1355,6 +1457,7 @@ fn c10_codex_singleton_park_keeps_the_previous_body() {
     let recording = Recording::start();
     let server = OracleServer::new(SnapshotSource::Codex, recording.handle());
     let mut home = OracleHome::new(SnapshotSource::Codex, &server);
+    home.row = "c10";
     home.legacy_counting = true;
     let mut rows = codex_member(
         IDENTITY_PIPELINE_ROOT,
@@ -1478,6 +1581,7 @@ fn c11_fragment_and_obligation_charge_one_slot_and_existing_marker_charges_none(
         let recording = Recording::start();
         let server = OracleServer::new(SnapshotSource::Codex, recording.handle());
         let mut home = OracleHome::new(SnapshotSource::Codex, &server);
+        home.row = if outlive { "c11_both" } else { "c11_marker" };
         home.legacy_counting = true;
         home.small_page = true;
         fragment_corpus(&home);
@@ -1509,5 +1613,326 @@ fn c11_fragment_and_obligation_charge_one_slot_and_existing_marker_charges_none(
                 "an existing marker reserves no second slot"
             );
         }
+    }
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn c11_account_hold_bypasses_the_full_audit_cap_without_staging_a_marker() {
+    let recording = Recording::start();
+    let server = OracleServer::new(SnapshotSource::ClaudeCode, recording.handle());
+    let mut home = OracleHome::new(SnapshotSource::ClaudeCode, &server);
+    home.row = "c11_account_hold";
+    let cold = home.cycle(&server, &recording);
+    assert!(cold.finish.is_ok());
+    assert_durable(&cold);
+    let deferred = cold
+        .finalized
+        .iter()
+        .map(|item| (item.snapshot_fingerprint.clone(), item.input_tokens))
+        .collect::<BTreeMap<_, _>>();
+    let mut index = cold.index.clone();
+    index.oracle_hold_at_audit_cap(
+        &home.transcript(),
+        &deferred,
+        NOW + crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS,
+    );
+    crate::snapshots::e2_pipeline_scan_fixture::age_listing_for_test(&mut index);
+    index.save(&home.index_path()).unwrap();
+    let row = json!({"type":"assistant","sessionId":IDENTITY_PIPELINE_ROOT,
+        "version":"2.1.309","timestamp":"2026-11-01T07:03:00Z","requestId":"held-growth",
+        "message":{"id":"held-growth-message","model":"claude-haiku-4-5",
+            "usage":{"input_tokens":130,"output_tokens":13}}});
+    writeln!(
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(home.transcript())
+            .unwrap(),
+        "{row}"
+    )
+    .unwrap();
+    let held = home.cycle(&server, &recording);
+    assert_eq!(held.steps[0]["before"]["audit_slots"], 0);
+    assert_eq!(last_counter(&held, "full_files"), 0);
+    assert_eq!(last_counter(&held, "tail_files"), 1);
+    assert_eq!(
+        last_counter(&held, "audit_cap_delay"),
+        0,
+        "account custody bypasses the refusal despite an unfunded new marker"
+    );
+    assert_eq!(
+        last_counter(&held, "audit_marker_count"),
+        crate::transcript_cache::CACHE_ENTRIES as u64,
+        "the held retry cannot stage another marker"
+    );
+    assert_eq!(
+        held.before.len(),
+        1,
+        "held retry reaches complete native publication"
+    );
+    assert_eq!(held.before[0].input_tokens, 160);
+}
+
+mod money_equivalence_tests {
+    use super::*;
+    use crate::snapshot_sync::tests::claude_money_e2_pipeline_tests::money_equivalence_tests::{
+        receipt_with_output, ReceiptBody,
+    };
+
+    pub(super) fn emit_cycle(row: &str, number: usize, source: SnapshotSource, cycle: &Cycle) {
+        let Some(out) = std::env::var_os("OTTTO_MONEY_EQUIVALENCE_OUTPUT") else {
+            return;
+        };
+        let mut normalized_posts = Vec::new();
+        for batch in &cycle.batches {
+            let wire: Value = serde_json::from_slice(batch).unwrap();
+            let sent = cycle
+                .finalized
+                .iter()
+                .filter(|item| {
+                    wire["snapshots"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|raw| raw["snapshot_fingerprint"] == item.snapshot_fingerprint)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let route = transition::RouteResult::emitted(
+                transition::Mode::ColdFull,
+                source,
+                vec![batch.clone()],
+                &sent,
+            );
+            normalized_posts.push(route.normalized);
+        }
+        let finalized = cycle
+            .finalized
+            .iter()
+            .map(|item| {
+                let mut value = serde_json::to_value(item).unwrap();
+                value["source_file_fingerprint"] = json!("physical-identity:excluded");
+                value
+            })
+            .collect::<Vec<_>>();
+        let effects: Value =
+            serde_json::from_slice(&test_effects::canonical(&cycle.effects)).unwrap();
+        let receipt = json!({"row":row,"cycle":number,"source":source.api_slug(),
+            "steps":cycle.steps,"gate_c":cycle.gate,"finalized":finalized,"posts":normalized_posts,
+            "effects":effects,"saved":{"generation":cycle.index.generation,
+                "fingerprints":cycle.index.current_snapshot_fingerprints(),
+                "accepted_body_witnesses":cycle.progress.accepted_body_witnesses},
+            "finish_ok":cycle.finish.is_ok(),"parser_bytes":cycle.consumed});
+        let bytes = crate::canonical_json::canonicalize(&receipt).unwrap();
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let dir = PathBuf::from(out).join("step-trace");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{row}-{number}.json")), bytes).unwrap();
+        println!("STEP_TRACE {row}-{number} sha256={digest}");
+    }
+
+    pub(super) fn bodies(source: SnapshotSource, cycle: &Cycle) -> Vec<ReceiptBody> {
+        assert!(!cycle.batches.is_empty());
+        if source == SnapshotSource::ClaudeCode {
+            vec![ReceiptBody::new(
+                serde_json::to_vec(&cycle.batches).unwrap(),
+                source,
+                cycle.finalized.clone(),
+            )]
+        } else {
+            cycle
+                .batches
+                .iter()
+                .map(|batch| ReceiptBody::new(batch.clone(), source, cycle.finalized.clone()))
+                .collect()
+        }
+    }
+
+    pub(super) fn inputs(home: &OracleHome) -> BTreeMap<String, Vec<u8>> {
+        fn walk(prefix: &str, base: &Path, dir: &Path, rows: &mut BTreeMap<String, Vec<u8>>) {
+            if !dir.exists() {
+                return;
+            }
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(prefix, base, &path, rows);
+                } else if path.extension().is_some_and(|ext| ext == "jsonl") {
+                    rows.insert(
+                        format!(
+                            "{prefix}/{}",
+                            path.strip_prefix(base).unwrap().to_string_lossy()
+                        ),
+                        std::fs::read(path).unwrap(),
+                    );
+                }
+            }
+        }
+        let mut rows = BTreeMap::new();
+        for (i, root) in home
+            .source
+            .default_roots(&home.fixture.home)
+            .iter()
+            .enumerate()
+        {
+            walk(
+                &format!("{}/root-{i}", home.source.api_slug()),
+                root,
+                root,
+                &mut rows,
+            );
+        }
+        let sidecars = home.support.join("local-otel");
+        walk(
+            &format!("{}/sidecars", home.source.api_slug()),
+            &sidecars,
+            &sidecars,
+            &mut rows,
+        );
+        assert!(!rows.is_empty());
+        rows
+    }
+
+    pub(super) fn emit_money(
+        name: &str,
+        bodies: Vec<ReceiptBody>,
+        inputs: BTreeMap<String, Vec<u8>>,
+    ) {
+        if let Some(out) = std::env::var_os("OTTTO_MONEY_EQUIVALENCE_OUTPUT") {
+            std::fs::create_dir_all(&out).unwrap();
+            std::fs::write(
+                PathBuf::from(out).join(format!("{name}.inputs")),
+                crate::canonical_json::canonicalize(&serde_json::to_value(inputs).unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
+        }
+        receipt_with_output(
+            name,
+            &bodies,
+            "OTTTO_MONEY_EQUIVALENCE_OUTPUT",
+            "MONEY_EQUIVALENCE",
+        );
+    }
+
+    // The wrappers below own their existing serial guards individually.
+    // Calling them here makes the filtered money lane execute every gate row.
+    #[test]
+    fn once_credit_claude() {
+        c01_claude_cold_control_preserves_accounts_side_call_gap_and_tags();
+        c02_durable_ack_suppresses_replay_of_the_prior_index();
+        c03_complete_same_body_reread_drops_at_the_finalizer();
+        c04_pi_positive_conflicted_result_cannot_publish();
+        c05_fresh_destination_requires_its_own_exact_ack();
+        c06_crash_windows_preserve_placement_and_durable_suppression();
+        c07_codex_group_memo_rediscloses_without_session_credit();
+        c08_codex_group_park_rediscloses_without_reading();
+        c09_codex_singleton_memo_keeps_the_previous_body();
+        c10_codex_singleton_park_keeps_the_previous_body();
+        c11_fragment_and_obligation_charge_one_slot_and_existing_marker_charges_none();
+        c11_account_hold_bypasses_the_full_audit_cap_without_staging_a_marker();
+    }
+
+    #[test]
+    #[serial]
+    #[serial(source_cadences, source_manifests, client_report)]
+    fn once_credit_native() {
+        let recording = Recording::start();
+        let mut receipt_bodies = Vec::new();
+        let mut fixture_inputs = BTreeMap::new();
+        {
+            let server = OracleServer::new(SnapshotSource::Codex, recording.handle());
+            let mut home = OracleHome::new(SnapshotSource::Codex, &server);
+            home.row = "c01_codex";
+            home.legacy_counting = true;
+            install_created_thread(&home, false, IDENTITY_PIPELINE_ROOT);
+            install_created_thread(&home, false, "3338a80a-f36e-4cbc-a5bb-50fc66430ba5");
+            fixture_inputs.extend(inputs(&home));
+            let cold = home.cycle(&server, &recording);
+            assert!(cold.finish.is_ok());
+            assert_eq!(cold.finalized.len(), 2);
+            assert_eq!(
+                cold.finalized.iter().map(|s| s.input_tokens).sum::<u64>(),
+                400
+            );
+            let accounts = cold
+                .finalized
+                .iter()
+                .map(|s| {
+                    s.session_account_evidence
+                        .as_ref()
+                        .unwrap()
+                        .account_identifier_hash
+                        .clone()
+                        .unwrap()
+                })
+                .collect::<BTreeSet<_>>();
+            assert_eq!(accounts.len(), 2);
+            assert!(cold
+                .finalized
+                .iter()
+                .all(|item| item.model_usage.iter().any(|row| row
+                    .selector_context
+                    .get("service_tier")
+                    .map(String::as_str)
+                    == Some("priority"))));
+            assert_durable(&cold);
+            receipt_bodies.extend(bodies(SnapshotSource::Codex, &cold));
+            let placement = server.placement.lock().unwrap().clone();
+            home.current_codex_account = "b";
+            std::fs::write(
+                home.fixture.home.join(".codex/auth.json"),
+                br#"{"synthetic_account":"b"}"#,
+            )
+            .unwrap();
+            home.restart();
+            let quiet = home.cycle(&server, &recording);
+            assert!(quiet.finish.is_ok());
+            assert!(quiet.batches.is_empty());
+            assert_eq!(*server.placement.lock().unwrap(), placement);
+            let mut route = emitted_route(&quiet, SnapshotSource::Codex, &server);
+            route.mode = transition::Mode::Restart;
+            transition::money_oracle::assert_quiet_restart_zero_bytes(&route);
+        }
+        {
+            let server = OracleServer::new(SnapshotSource::Pi, recording.handle());
+            let mut home = OracleHome::new(SnapshotSource::Pi, &server);
+            home.row = "c01_pi";
+            let mut rows = pi_rows(false);
+            rows.insert(
+                1,
+                json!({"type":"custom","customType":"ottto-selector",
+                "timestamp":"2026-11-01T07:00:01Z","data":{"service_tier":"priority"}}),
+            );
+            rows.push(json!({"type":"usage","timestamp":"2026-11-01T07:03:00Z",
+                "model":"gpt-5","usage":{"input":3,"output":1}}));
+            home.write_rows(&rows);
+            fixture_inputs.extend(inputs(&home));
+            let cold = home.cycle(&server, &recording);
+            assert!(cold.finish.is_ok());
+            assert_eq!(cold.finalized.len(), 1);
+            assert_eq!(cold.finalized[0].input_tokens, 16);
+            assert_eq!(cold.finalized[0].request_count, 3);
+            assert!(cold.finalized[0].model_usage.iter().any(|row| row
+                .selector_context
+                .get("service_tier")
+                .map(String::as_str)
+                == Some("priority")));
+            // Pi has no provider account-creation witness; absence is explicit.
+            assert!(cold.finalized[0].session_account_evidence.is_none());
+            assert_durable(&cold);
+            receipt_bodies.extend(bodies(SnapshotSource::Pi, &cold));
+            let placement = server.placement.lock().unwrap().clone();
+            home.restart();
+            let quiet = home.cycle(&server, &recording);
+            assert!(quiet.finish.is_ok());
+            assert!(quiet.batches.is_empty());
+            assert_eq!(*server.placement.lock().unwrap(), placement);
+            let mut route = emitted_route(&quiet, SnapshotSource::Pi, &server);
+            route.mode = transition::Mode::Restart;
+            transition::money_oracle::assert_quiet_restart_zero_bytes(&route);
+        }
+        emit_money("once_credit_native", receipt_bodies, fixture_inputs);
     }
 }

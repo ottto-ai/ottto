@@ -37,6 +37,8 @@ NATIVE_FIXTURES = frozenset({
 # only, never a match or a diff). Once the base emits it, it is compared like
 # any other fixture and can be removed here.
 HEAD_ONLY_FIXTURES = (
+    "once_credit_claude",
+    "once_credit_native",
     "claude_bad_record_sibling", "claude_paused_suffix", "codex_bad_record_sibling",
     "resumed_prefix_sidecar_receipt", "root_twin_scoped_family",
 )

@@ -1,6 +1,6 @@
-//! Read-only projections for the scan oracle's per-call and publication receipts.
-//! OwnedSourceScan owns every projected field; the pipeline owns the recording.
-//! Relative keys exclude fixture roots; no clocks, tickets or epochs are exposed.
+//! Test-only scan projections and clock/budget inputs for the pipeline oracle.
+//! The pipeline installs fixture inputs before stepping; projections only read.
+//! Relative keys exclude fixture roots; clocks, tickets and epochs stay private.
 
 use super::*;
 use serde_json::{json, Value};
@@ -23,8 +23,8 @@ fn pending(rows: &[PendingIndexFinalization], roots: &[PathBuf]) -> Value {
             "key": relative(&row.index_key, roots),
             "parse_complete": row.parse_complete,
             "parsed_snapshot_count": row.parsed_snapshot_count,
-        "previous_snapshot": row.previous_snapshot_fingerprint.is_some(),
-        "previous_witness": row.previous_upload_body_witness.is_some(),
+            "previous_snapshot": row.previous_snapshot_fingerprint.is_some(),
+            "previous_witness": row.previous_upload_body_witness.is_some(),
         }))
         .collect::<Vec<_>>())
 }
@@ -69,6 +69,7 @@ impl OwnedSourceScan {
             "memo_hits": self.sampling.as_ref().map(|s| s.cache.counters_for_test().memo_hits),
             "parked_hits": self.sampling.as_ref().map(|s| s.cache.counters_for_test().parked_hits),
             "jobs_state_bound": self.sampling.as_ref().map(|s| s.cache.counters_for_test().jobs_state_bound),
+            "audit_marker_count": self.index.files.values().filter(|e| e.has_unverified_source()).count(),
             "audit_slots": self.sampling.as_ref().map(|s| s.audit_slots),
             "audits_started": self.sampling.as_ref().map(|s| s.audits_started),
             "audits_completed": self.sampling.as_ref().map(|s| s.audits_completed),
@@ -109,7 +110,7 @@ fn empty_scan_projection_is_read_only() {
         "traversal_pending": 0, "scanned_file_count": 0, "scanned_session_count": 0,
         "snapshots": 0, "pending_finalization": [], "sampled_read_bytes": null,
         "memo_records": null, "memo_hits": null, "parked_hits": null, "jobs_state_bound": null, "lease_held": false, "full_files": null, "tail_files": null, "unchanged_files": null, "audit_slots": null, "audits_started": null,
-        "audits_completed": null, "audit_cap_delay": null,
+        "audits_completed": null, "audit_cap_delay": null, "audit_marker_count": 0,
     });
     assert_eq!(scan.trace_projection(), expected);
     assert_eq!(scan.trace_projection(), expected);
@@ -138,4 +139,37 @@ fn trace_keys_choose_the_most_specific_root() {
         relative("/fixture/sessions/session.jsonl", &roots),
         "root-1/session.jsonl"
     );
+}
+
+impl ScanIndex {
+    /// Seed the same held-at-cap state used by quiet-retirement controls.
+    /// These are index-only unavailable keys; no file is created or opened.
+    pub(crate) fn oracle_hold_at_audit_cap(
+        &mut self,
+        path: &Path,
+        deferred: &BTreeMap<String, u64>,
+        due: u64,
+    ) {
+        let key = local_index_key(path);
+        let fingerprint = self.files[&key].source_file_fingerprint.clone();
+        assert!(self.record_claude_account_deferred_holds(
+            [(key.as_str(), fingerprint.as_str())],
+            deferred
+        ));
+        assert!(self.claude_account_deferred_holds.contains_key(&key));
+        for n in 0..crate::transcript_cache::CACHE_ENTRIES {
+            let synthetic = format!("/synthetic-held-unavailable/{n}.jsonl");
+            let mut entry = self.files[&key].clone();
+            entry.scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
+            self.files.insert(synthetic.clone(), entry);
+            assert!(self.stage_sampled_audit(
+                &synthetic,
+                &fingerprint,
+                crate::transcript_acquisition::AuditDebt {
+                    due_unix_seconds: due
+                }
+            ));
+        }
+        self.files.get_mut(&key).unwrap().last_snapshot_fingerprint = None;
+    }
 }
