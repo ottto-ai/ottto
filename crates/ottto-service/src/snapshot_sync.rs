@@ -5907,7 +5907,7 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
         finished
     }
     fn outcome(&mut self, source: SnapshotSource, result: Result<()>) {
-        drop(self.paced_qos.take());
+        continuation::leave_source_qos(&mut self.paced_qos);
         crate::local_resource_diagnostics::pass_ended(source.api_slug());
         if source == SnapshotSource::Codex && result.is_err() {
             continuation::after_ordinary_codex_failure();
@@ -9163,7 +9163,7 @@ fn finish_sync_source(
             &upload_destination_namespace,
         );
     if continuation::resident_scan_requested(&scan_result, first_read_bootstrap) {
-        continuation::request_resident_scan(source);
+        continuation::request_resident_scan(source, first_read_bootstrap);
     }
 
     // Refresh the per-source detected-uses cache the daemon health assembly
@@ -17668,7 +17668,7 @@ mod tests {
                 SNAPSHOT_SYNC_INTERVAL * stretch,
                 "hot"
             );
-            cadence.request_paced_scan(start, Duration::ZERO, PACED_BATTERY);
+            cadence.request_paced_scan(start, Duration::ZERO, PACED_BATTERY, false);
             assert_eq!(cadence.paced_scan_due(), Some(start + minutes(3)));
             cadence.request_continuation(start, Duration::from_secs(1));
             assert_eq!(
@@ -20002,6 +20002,7 @@ mod tests {
             source_health_snapshot: default_health,
             codex_scan_homes: Vec::new(),
             codex_home_bindings: Vec::new(),
+            setup_snapshot_index: None,
         };
 
         let reconciliation = reconciliation_agent_status(&collection);

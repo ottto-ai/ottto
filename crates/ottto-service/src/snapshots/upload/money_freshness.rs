@@ -1,7 +1,7 @@
 //! Freshness diagnostics; none grants a read, alters a hold or adds a read.
-//! `freshness_alarm` is each source's persisted per-file debt (`g7_debt`) under
+//! `freshness_alarm` is each source's persisted per-file debt (`freshness_debt`) under
 //! `debt`, aggregated at each root walk's end, so it survives restarts.
-use crate::snapshots::g7_debt::{Report, Roster, Walk};
+use crate::snapshots::upload::freshness_debt::{Report, Roster, Walk};
 use crate::snapshots::SnapshotSource;
 
 pub(in crate::snapshots) const ALARM_AFTER: u64 = 6 * 60 * 60;
@@ -108,7 +108,7 @@ fn with_walks<T>(body: impl FnOnce(&mut Walks) -> T) -> T {
 }
 
 #[cfg(test)]
-pub(crate) use crate::snapshots::g7_debt::walk_ended_for_test;
+pub(crate) use crate::snapshots::upload::freshness_debt::walk_ended_for_test;
 
 /// A restart forgets every walk in progress and every aggregate.
 #[cfg(test)]

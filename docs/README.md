@@ -17,8 +17,8 @@ CLI and `ottto-service` daemon, not private development scripts.
   and closeout support-readiness checks.
 - [Connector Contribution](connectors.md): source package and collector
   manifest expectations.
-- [Cloud Connectors](cloud-connectors.md): safe planning, keyless registration,
-  testing, status, and explicit sync through the local daemon.
+- [Cloud Connectors](cloud-connectors.md): connecting clouds in the web app and
+  read-only `ottto cloud status`.
 - [Agent Adapters](agent-adapters.md): Codex and Claude Code lifecycle adapter
   boundaries, Pi CLI usage, and the public-v1 MCP deferral.
 - [Active Session Surfaces](session-surfaces.md): canonical Desktop, CLI,

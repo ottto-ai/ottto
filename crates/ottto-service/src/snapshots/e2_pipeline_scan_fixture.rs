@@ -2,7 +2,7 @@
 use crate::snapshots::*;
 use crate::transcript_acquisition::Scope;
 
-pub(crate) use crate::snapshots::g7_debt::tests::assert_file_receipt_retires_debt;
+pub(crate) use crate::snapshots::upload::freshness_debt::tests::assert_file_receipt_retires_debt;
 
 /// The sampled scope and identity-capture mode this fixture's scans bind.
 fn scan_binding(source: SnapshotSource) -> (Scope, bool) {

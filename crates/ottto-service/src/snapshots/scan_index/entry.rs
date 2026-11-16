@@ -3,14 +3,14 @@
 
 use super::serde_lenient::{deserialize_codex_counting_owner, deserialize_codex_protected_owner};
 use crate::snapshots::*;
-use crate::snapshots::{codex_file_join, codex_fragment};
+use crate::snapshots::{codex_file_join, sources::codex::eof_fragment};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ScanIndexEntry {
     /// RAM-only custody of a certified, already-observed Codex EOF fragment.
     /// Never serialized; missing evidence fails open to the existing read path.
     #[serde(skip)]
-    pub(crate) codex_fragment: Option<Box<codex_fragment::BoundFragment>>,
+    pub(crate) codex_fragment: Option<Box<eof_fragment::BoundFragment>>,
     pub size_bytes: u64,
     pub modified_unix_seconds: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -114,7 +114,7 @@ impl ScanIndexEntry {
         len: u64,
         modified_nanos: Option<u64>,
         birth_nanos: Option<u64>,
-        fragment: Option<codex_fragment::Stamp>,
+        fragment: Option<eof_fragment::Stamp>,
     ) -> bool {
         self.same_stamp_with_mtime(
             self.modified_unix_nanos,
@@ -131,7 +131,7 @@ impl ScanIndexEntry {
         len: u64,
         modified_nanos: Option<u64>,
         birth_nanos: Option<u64>,
-        fragment: Option<codex_fragment::Stamp>,
+        fragment: Option<eof_fragment::Stamp>,
     ) -> bool {
         (self.size_bytes == len
             || self
@@ -154,7 +154,7 @@ impl ScanIndexEntry {
             metadata.len(),
             modified,
             metadata.created().ok().and_then(unix_nanos),
-            codex_fragment::Stamp::metadata(metadata),
+            eof_fragment::Stamp::metadata(metadata),
         )
     }
 

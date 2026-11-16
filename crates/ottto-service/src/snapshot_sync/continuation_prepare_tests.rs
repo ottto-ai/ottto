@@ -148,6 +148,7 @@ impl ContinuationFixture {
                 source_health_snapshot: status,
                 codex_scan_homes: vec![],
                 codex_home_bindings: vec![],
+                setup_snapshot_index: None,
             })),
             attribution_context: attribution.then(|| {
                 SessionAttributionContext::from_activity_hint(
@@ -251,6 +252,7 @@ pub(super) fn continuation_realistic_preparation_for_test() -> SourcePreparation
             .map(|n| fixture.home.join(format!("scan-home-{n}")))
             .collect(),
         codex_home_bindings: vec![],
+        setup_snapshot_index: None,
     }));
     preparation
 }

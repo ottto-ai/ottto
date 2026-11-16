@@ -411,6 +411,17 @@ pub(crate) struct AgentStatusCollection {
     pub source_health_snapshot: AgentStatusSnapshot,
     pub codex_scan_homes: Vec<PathBuf>,
     pub codex_home_bindings: Vec<CodexHomeBinding>,
+    /// Position in `snapshots` of the row the upload selected for the
+    /// source's default login, recorded where the collector selects it. The
+    /// setup scan sends that row; process-local, never serialized.
+    pub setup_snapshot_index: Option<usize>,
+}
+
+impl AgentStatusCollection {
+    /// The uploaded row the setup scan reports for this source, if any.
+    pub(crate) fn setup_snapshot(&self) -> Option<&AgentStatusSnapshot> {
+        self.snapshots.get(self.setup_snapshot_index?)
+    }
 }
 
 /// The next time, strictly after `now` (unix seconds), that a Claude binding
@@ -1664,14 +1675,6 @@ impl PiModelRoute {
     }
 }
 
-pub fn collect_agent_status(
-    source: &SourceKind,
-    captured_at: String,
-    expires_at: String,
-) -> AgentStatusSnapshot {
-    collect_agent_status_collection(source, captured_at, expires_at).source_health_snapshot
-}
-
 pub(crate) fn collect_agent_status_collection(
     source: &SourceKind,
     captured_at: String,
@@ -1710,6 +1713,7 @@ fn single_agent_status_collection(snapshot: AgentStatusSnapshot) -> AgentStatusC
         source_health_snapshot: snapshot,
         codex_scan_homes: Vec::new(),
         codex_home_bindings: Vec::new(),
+        setup_snapshot_index: Some(0),
     }
 }
 
@@ -1816,6 +1820,25 @@ fn collect_codex_status_snapshots(
         .unwrap_or_else(|e| e.into_inner())
         .retain_listed(&codex_scan_homes.iter().cloned().collect());
 
+    let (snapshots, setup_snapshot_index, source_health_snapshot) =
+        codex_status_selection(&candidates, &captured_at, &expires_at);
+    AgentStatusCollection {
+        snapshots,
+        source_health_snapshot,
+        codex_scan_homes,
+        codex_home_bindings,
+        setup_snapshot_index,
+    }
+}
+
+/// The uploaded Codex rows, the position among them of the default home's
+/// row (its binding's winner, else its failed-probe witness, else the
+/// no-row fallback), and the source-health aggregate.
+fn codex_status_selection(
+    candidates: &[CodexSlotCandidate],
+    captured_at: &str,
+    expires_at: &str,
+) -> (Vec<AgentStatusSnapshot>, Option<usize>, AgentStatusSnapshot) {
     let mut snapshots = Vec::new();
     let mut winning_by_binding = BTreeMap::<(String, String), usize>::new();
     for (index, candidate) in candidates.iter().enumerate() {
@@ -1829,28 +1852,34 @@ fn collect_codex_status_snapshots(
             winning_by_binding.insert(binding, index);
         }
     }
-    for index in winning_by_binding.into_values() {
+    let default_binding = candidates
+        .iter()
+        .find(|candidate| candidate.slot.ownership == CodexAccountSlotOwnershipV1::Default)
+        .and_then(|candidate| candidate.binding.as_ref());
+    let mut setup_snapshot_index = None;
+    for (binding, index) in winning_by_binding {
+        if default_binding == Some(&binding) {
+            setup_snapshot_index = Some(snapshots.len());
+        }
         snapshots.push(candidates[index].snapshot.clone());
     }
-    append_failed_default_codex_snapshot(&mut snapshots, &candidates);
+    let failed_default = append_failed_default_codex_snapshot(&mut snapshots, candidates);
+    setup_snapshot_index = setup_snapshot_index.or(failed_default);
     append_configured_codex_unavailable_snapshots(
         &mut snapshots,
-        &candidates,
-        &captured_at,
-        &expires_at,
+        candidates,
+        captured_at,
+        expires_at,
     );
 
-    let source_health_snapshot =
-        codex_source_health_snapshot(&candidates, &captured_at, &expires_at);
+    let source_health_snapshot = codex_source_health_snapshot(candidates, captured_at, expires_at);
     if snapshots.is_empty() {
-        snapshots.push(source_health_snapshot.clone());
+        let mut upload = source_health_snapshot.clone();
+        codex_canonical_identity_spelling(&mut upload);
+        snapshots.push(upload);
+        setup_snapshot_index = Some(0);
     }
-    AgentStatusCollection {
-        snapshots,
-        source_health_snapshot,
-        codex_scan_homes,
-        codex_home_bindings,
-    }
+    (snapshots, setup_snapshot_index, source_health_snapshot)
 }
 
 fn append_configured_codex_unavailable_snapshots(
@@ -1948,10 +1977,12 @@ fn append_configured_codex_unavailable_snapshots(
 /// other snapshot already represents that account. Without this, a batch that
 /// has any other row never carried the default account's degraded reading.
 /// The candidate's binding stays empty, so transcript attribution is unchanged.
+/// Returns the position of the row it pushed.
 fn append_failed_default_codex_snapshot(
     snapshots: &mut Vec<AgentStatusSnapshot>,
     candidates: &[CodexSlotCandidate],
-) {
+) -> Option<usize> {
+    let mut pushed = None;
     for candidate in candidates {
         if candidate.slot.ownership != CodexAccountSlotOwnershipV1::Default
             || candidate.binding.is_some()
@@ -1974,9 +2005,11 @@ fn append_failed_default_codex_snapshot(
             })
         });
         if !represented {
+            pushed = pushed.or(Some(snapshots.len()));
             snapshots.push(candidate.snapshot.clone());
         }
     }
+    pushed
 }
 
 /// Whether a slot's only problem is a failed usage probe: the app-server read
@@ -2196,6 +2229,71 @@ fn codex_source_health_snapshot(
             ));
     }
     source_health_snapshot
+}
+
+/// Name every raw-only Codex identity on `snapshot` in its canonical spelling.
+///
+/// A login read only from the local id token (no saved reading with identity
+/// yet: first pairing, setup, a login change) carries raw user and workspace
+/// ids and no hashes. Sent like that, the backend hashes them with its own
+/// fallback recipe and files the same account under a second identity. Each
+/// ABSENT hash is set from its raw id with the recipe a provider-validated
+/// binding uses ([`codex_identity_hashes`]); a present hash is never
+/// overwritten, and confidence and billing identity stay as they are. A plan
+/// row filled here that said `is_current: false` leaves its currentness
+/// unsaid instead (`is_current` absent): that false only means the local
+/// reading was not confirmed, and sent with the canonical hashes it would mark
+/// the account's existing profile not current. A row that said `true` (a
+/// signed-in High or Medium login, [`append_current_plan_observation`]) is a
+/// correct claim and keeps it, as does a row that said nothing.
+///
+/// Runs on the main lane's fallback copy when no home is bound
+/// ([`codex_status_selection`]), also selected for the setup scan by
+/// [`AgentStatusCollection::setup_snapshot`]. The collection's own source-health
+/// snapshot, which local status and active-session reconciliation read, keeps
+/// what was collected, so bindings,
+/// dedup, representation and local attribution are unchanged.
+fn codex_canonical_identity_spelling(snapshot: &mut AgentStatusSnapshot) {
+    if snapshot.source != SourceKind::Codex {
+        return;
+    }
+    if let Some(account) = snapshot.account.as_mut() {
+        fill_absent_codex_identity_hashes(
+            account.account_id.as_deref(),
+            account.organization_id.as_deref(),
+            &mut account.account_identifier_hash,
+            &mut account.organization_identifier_hash,
+        );
+    }
+    for observation in &mut snapshot.plan_observations {
+        if fill_absent_codex_identity_hashes(
+            observation.account_id.as_deref(),
+            observation.organization_id.as_deref(),
+            &mut observation.account_identifier_hash,
+            &mut observation.organization_identifier_hash,
+        ) && observation.is_current == Some(false)
+        {
+            observation.is_current = None;
+        }
+    }
+}
+
+/// Set each absent hash from its raw id, per field. Returns whether any was set.
+fn fill_absent_codex_identity_hashes(
+    account_id: Option<&str>,
+    workspace_id: Option<&str>,
+    account_hash: &mut Option<String>,
+    workspace_hash: &mut Option<String>,
+) -> bool {
+    let (account, workspace) = codex_identity_hashes(account_id, workspace_id);
+    let mut filled = false;
+    for (slot, hash) in [(account_hash, account), (workspace_hash, workspace)] {
+        if slot.is_none() && hash.is_some() {
+            *slot = hash;
+            filled = true;
+        }
+    }
+    filled
 }
 
 /// Read-only launch projection: only saved provider-verified evidence and
@@ -5577,7 +5675,12 @@ fn collect_claude_status_snapshots(
         &captured_at,
         &expires_at,
     ));
+    // The setup index is read after the degraded and Desktop appends, so it
+    // addresses the final upload rows; keep it after both.
+    let desktop_carrier_only = snapshots.is_empty();
     append_claude_desktop_pairs_snapshot(&mut snapshots, &desktop_pairs, &captured_at, &expires_at);
+    let setup_snapshot_index =
+        claude_setup_snapshot_index(&snapshots, default_binding.as_ref(), desktop_carrier_only);
     let unresolved_accounts = derive_unresolved_claude_accounts(
         &default_snapshot,
         &desktop_pairs,
@@ -5681,7 +5784,31 @@ fn collect_claude_status_snapshots(
         source_health_snapshot,
         codex_scan_homes: Vec::new(),
         codex_home_bindings: Vec::new(),
+        setup_snapshot_index,
     }
+}
+
+/// Position of the final uploaded row for the default login's strong pair:
+/// its own winner, the registered slot that won it, or its degraded witness.
+/// With no such row, the account-less Desktop carrier when it is the only
+/// row (`desktop_carrier_only`: no row existed before it was appended).
+fn claude_setup_snapshot_index(
+    snapshots: &[AgentStatusSnapshot],
+    default_binding: Option<&ClaudeStrongBinding>,
+    desktop_carrier_only: bool,
+) -> Option<usize> {
+    default_binding
+        .and_then(|default| {
+            snapshots.iter().position(|snapshot| {
+                snapshot.account.as_ref().is_some_and(|account| {
+                    account.account_identifier_hash.as_deref()
+                        == Some(default.account_identifier_hash.as_str())
+                        && account.organization_identifier_hash.as_deref()
+                            == Some(default.organization_identifier_hash.as_str())
+                })
+            })
+        })
+        .or_else(|| (desktop_carrier_only && snapshots.len() == 1).then_some(0))
 }
 
 pub(crate) const CLAUDE_OTTTO_SIGNED_IN: &str = "claude_ottto_account_signed_in";
@@ -16470,10 +16597,24 @@ fn codex_credential_claimed_binding(
     live_access: bool,
 ) -> Option<String> {
     let (account_id, raw_workspace_id) = codex_credential_claimed_ids(credentials, live_access)?;
-    Some(codex_credit_grants::binding_key(
-        &billing_identity_hash("openai", "account", &account_id)?,
-        &billing_identity_hash("openai", "workspace", &raw_workspace_id)?,
-    ))
+    let (account, workspace) =
+        codex_identity_hashes(Some(account_id.as_str()), Some(raw_workspace_id.as_str()));
+    Some(codex_credit_grants::binding_key(&account?, &workspace?))
+}
+
+/// The canonical hashes of a Codex user id and workspace id, each on its own:
+/// the user (`chatgpt_user_id`, else `user_id`, else `sub`) in the "account"
+/// role and the selected ChatGPT workspace (`chatgpt_account_id`) in the
+/// "workspace" role. Shared so a claimed binding and a raw-only status row
+/// cannot spell the same login two ways.
+fn codex_identity_hashes(
+    account_id: Option<&str>,
+    workspace_id: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    (
+        account_id.and_then(|id| billing_identity_hash("openai", "account", id)),
+        workspace_id.and_then(|id| billing_identity_hash("openai", "workspace", id)),
+    )
 }
 
 fn validated_codex_identity(
@@ -22342,6 +22483,6 @@ exit 44
     }
 }
 
-crate::heap_layout_bound::fields!(AgentStatusCollection; snapshots, source_health_snapshot, codex_scan_homes, codex_home_bindings);
+crate::heap_layout_bound::fields!(AgentStatusCollection; snapshots, source_health_snapshot, codex_scan_homes, codex_home_bindings, setup_snapshot_index);
 
 crate::heap_layout_bound::fields!(CodexHomeBinding; home, account_identifier_hash, workspace_identifier_hash, auth_modified_at);

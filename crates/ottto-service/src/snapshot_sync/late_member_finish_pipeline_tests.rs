@@ -187,6 +187,7 @@ impl LateMemberPipeline {
             source_health_snapshot: test_agent_status(SourceKind::ClaudeCode),
             codex_scan_homes: Vec::new(),
             codex_home_bindings: Vec::new(),
+            setup_snapshot_index: None,
         };
         self.cadence.next_due_cycle();
         self.server.offered.lock().unwrap().clear();

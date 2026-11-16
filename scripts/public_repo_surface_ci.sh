@@ -255,12 +255,12 @@ file_move_check() {
   fi
 }
 
-# Report only for now; later changes pass --enforce <rule,...>.
+# Existing files report only; new production Rust files have a hard line ceiling.
 source_layout_report() {
   local base
   base="$(move_check_base)"
   if [[ -n "$base" ]]; then
-    env PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_source_layout.py --base "$base"
+    env PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_source_layout.py --enforce-new --base "$base"
   else
     env PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_source_layout.py
   fi
@@ -286,7 +286,7 @@ run_step P "check that an absolutize change only makes super paths absolute" fil
 # their labels also make the test-ID map blocking.
 run_step P "check test IDs and never-retry decisions" \
   move_check scripts/check_test_id_map.py 'Move-only:|File-move:|Absolutize:'
-run_step P "report the snapshots source layout" source_layout_report
+run_step P "report source layout and enforce new file ceilings" source_layout_report
 
 run_step P "test public manifest derivation" bash scripts/test_public_repo_manifest.sh
 # PUBLIC_EXPORT_MANIFEST.json is derived from the commit tree
@@ -309,6 +309,7 @@ run_step P "test macOS stable release workflow policy" bash scripts/test_macos_s
 run_step B "test macOS attestation binder" bash scripts/test_macos_attestation_bind.sh
 run_step B "test macOS release source check" bash scripts/test_macos_release_source_check.sh
 run_step B "test macOS manifest signature helper" bash scripts/test_macos_manifest_signature.sh
+run_step P "test release evidence placeholders" env PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_release_evidence_placeholders.py
 run_step B "test stable-candidate RC gate" bash scripts/test_macos_public_rc_gate.sh
 run_step B "test stable preflight gate" bash scripts/test_macos_stable_preflight.sh
 run_step B "test stable closeout gate" bash scripts/test_macos_stable_closeout_gate.sh

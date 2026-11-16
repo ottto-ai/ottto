@@ -1,6 +1,6 @@
-use crate::control::{handle_request_with_peer, LocalClientPeer};
+use crate::control::{control_command_class, handle_request_with_peer, LocalClientPeer};
 use crate::control_plane_health::{self, PublishedListener};
-use crate::local_resource_diagnostics::StageWindow;
+use crate::local_resource_diagnostics::{control_class, StageWindow};
 use crate::LocalDaemon;
 use anyhow::{Context, Result};
 use ottto_protocol::{CliError, CliErrorCode, LocalControlRequest, LocalControlResponse};
@@ -181,7 +181,11 @@ fn accept_error_means_listener_gone(error: &std::io::Error) -> bool {
 }
 
 fn handle_stream(path: PathBuf, mut stream: UnixStream, handler: RequestHandler) {
-    let _stage = StageWindow::begin("unknown", "offpass_control_socket");
+    #[cfg_attr(
+        not(any(target_os = "macos", test)),
+        allow(unused_mut, unused_variables, reason = "control counts: macOS only")
+    )]
+    let mut stage = StageWindow::begin("unknown", "offpass_control_socket");
     // Whether an accepted socket inherits the listener's O_NONBLOCK differs by
     // platform; the poll-driven I/O below requires it, so set it explicitly.
     if let Err(error) = stream.set_nonblocking(true) {
@@ -193,10 +197,21 @@ fn handle_stream(path: PathBuf, mut stream: UnixStream, handler: RequestHandler)
         return;
     }
     let peer = local_client_peer(&stream);
+    // Same command classes as the XPC row; an unreadable request counts as other.
     let (response, read_failed) = match read_request(&mut stream) {
-        Ok(request) => (handler(request, peer), false),
-        Err(error) => (invalid_request_response(&error.to_string()), true),
+        Ok(request) => {
+            control_class(control_command_class(&request.command));
+            (handler(request, peer), false)
+        }
+        Err(error) => {
+            control_class("other");
+            (invalid_request_response(&error.to_string()), true)
+        }
     };
+    #[cfg(any(target_os = "macos", test))]
+    {
+        stage.control = crate::local_resource_diagnostics::take_control();
+    }
     match write_response(&mut stream, &response) {
         Ok(()) if !read_failed => control_plane_health::record_request_served(),
         Ok(()) => control_plane_health::record_request_error(),
@@ -1122,6 +1137,45 @@ mod tests {
             (-1, Some(libc::ECONNABORTED)),
             "the listener must now be draining for this test to mean anything"
         );
+    }
+
+    /// [behaviour] A socket request lands its command class in the
+    /// `offpass_control_socket` diagnostic row, as XPC requests do in theirs.
+    #[test]
+    #[serial]
+    fn socket_request_counts_its_control_class() {
+        let (mut client, server) = UnixStream::pair().expect("socket pair");
+        let command = LocalControlCommand::ClaudeAccountsStatus;
+        let request = LocalControlRequest {
+            request_id: "req_class".to_string(),
+            protocol_version: ottto_protocol::expected_local_control_protocol_version(&command),
+            token: None,
+            client_kind: None,
+            client_install_owner: None,
+            command,
+        };
+        client
+            .write_all(&serde_json::to_vec(&request).expect("serialize request"))
+            .expect("write request");
+        client
+            .shutdown(std::net::Shutdown::Write)
+            .expect("close request");
+        let handler: RequestHandler = Arc::new(|request, _peer| LocalControlResponse {
+            request_id: request.request_id,
+            ok: true,
+            payload: None,
+            error: None,
+        });
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            handle_stream(PathBuf::from("pair"), server, handler);
+            crate::local_resource_diagnostics::flush_offpass_for_resource_test();
+        });
+        let row = rows
+            .iter()
+            .find(|row| row["stage"] == "offpass_control_socket")
+            .expect("socket row");
+        let class = row["counts"]["control"]["claude_accounts_status"].as_u64();
+        assert!(class >= Some(1), "{row}");
     }
 
     fn wait_for_socket(path: &Path) {

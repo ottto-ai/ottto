@@ -311,7 +311,8 @@ pub struct ScanIndex {
     /// Scan-local moved-session evidence from the existing bounded header
     /// inventory. Never serialized or used as file/body settlement evidence.
     #[serde(skip)]
-    pub(super) codex_counting_moved_evidence: BTreeMap<String, codex_counting_version::AckEvidence>,
+    pub(super) codex_counting_moved_evidence:
+        BTreeMap<String, sources::codex::counting::version::AckEvidence>,
     /// Final post-policy entity fingerprints produced by each transcript.
     /// Most files contain one session; the set preserves exact entity grain
     /// for split/provider files instead of hiding all but an arbitrary last.
@@ -349,7 +350,7 @@ pub struct ScanIndex {
     #[serde(skip)]
     pub(super) active_upload_context_fingerprint: Option<String>,
     #[serde(skip)]
-    pub(crate) context_read_counts: upload_context_read::LocalCounts,
+    pub(crate) context_read_counts: upload::context_read::LocalCounts,
     /// Runtime-only revision of the effective additive upload projection.
     /// Adoption is recorded per complete, settled file rather than per census.
     #[serde(skip)]
@@ -437,19 +438,20 @@ pub struct ScanIndex {
     /// Hash-only counting evidence of retired, unprotected Codex entries, by
     /// owner, so a moved session's evidence outlives its old entry being
     /// pruned on an earlier page. Written whatever the cutover, bounded by
-    /// `codex_counting_version::MAX_COUNTING_TOMBSTONES`. Never file/body
+    /// `sources::codex::counting::version::MAX_COUNTING_TOMBSTONES`. Never file/body
     /// settlement evidence. Type damage decodes as empty, like a lost index.
     /// Appended serialized slot, so older positional indexes keep their slots.
     #[serde(default, deserialize_with = "deserialize_lenient_map")]
     pub(super) codex_counting_tombstones:
-        BTreeMap<String, codex_counting_version::CountingTombstone>,
+        BTreeMap<String, sources::codex::counting::version::CountingTombstone>,
     /// Retired replay slot: drain old values without retaining authority.
     #[serde(rename = "reread_guard", default, skip_serializing)]
     pub(super) retired_reread_guard: serde::de::IgnoredAny,
     /// Diagnostic-only bounded FIFO of evicted Legacy tombstones. Appended
     /// serialized slot; old indexes default empty, damaged values are dropped.
     #[serde(default, deserialize_with = "deserialize_lenient_default")]
-    pub(super) codex_counting_evicted_legacy: codex_counting_version::EvictedLegacyOwners,
+    pub(super) codex_counting_evicted_legacy:
+        sources::codex::counting::version::EvictedLegacyOwners,
     /// Scan-local cap eviction events by safety class; drained into receipts.
     #[serde(skip)]
     pub(super) codex_counting_evictions: [u64; 3],

@@ -406,13 +406,29 @@ retain only endpoint samples.
 `pass.retained_heap_bytes` records the finishing source's in-memory index just
 before finish consumes it: `files_bytes`, `census_bytes`, `side_maps_bytes`,
 `accounts_identity_bytes`, and `traversal_bytes`. The last three split the
-existing inclusive side-map charge. Its process-wide cache fields are
+existing inclusive side-map charge. `side_maps_parts`, emitted only in this
+source-finish pass row, reports each fixed ScanIndex side-field name separately
+as bytes or `null`, plus `index_state` (the existing conditional IndexState
+allocation charge) and `growth_retention`.
+Fields proved `INLINE_ONLY` by the existing layout accounting are omitted by
+type, including scalars and retired `IgnoredAny` fields; other zero charges and
+all unknown parts remain. Unsupported layouts produce an empty parts map.
+The parts include account/identity and traversal fields, matching the inclusive
+state-v2 `side_maps` total rather than the exclusive `side_maps_bytes` split.
+Both totals remain `null` if any
+included part is unknown; an unknown part never suppresses the other parts.
+Do not add the parts to `accounts_identity_bytes` or `traversal_bytes`: those
+charges are already included and would be counted twice.
+Keys are fixed field names, never record identifiers. The process-wide cache
+fields are
 `codex_sidecar_facts_bytes`, `codex_header_cache_bytes`, and
 `desktop_title_facts_bytes`. These reuse requested-layout charges, exclude
 inline stack storage, and conservatively charge shared buffers per owner.
 Unknown/unsupported charges or busy cache locks are `null`, never invented
-zeros; finishes without the capture omit the object. The existing
-`sample_cost_us` includes the retained-layout capture work. Pass wall/CPU
+zeros; finishes without the capture omit the object. Title facts use completion
+accounting with a separate existing visit counter per cached entry; ordinary
+hot-path sizing keeps its existing visit limit. The existing `sample_cost_us`
+includes the retained-layout capture work. Pass wall/CPU
 include diagnostics work, too. Cache values repeat
 across source rows and must not be summed. CLI metadata and active-session
 reconciliation have no existing heap charge; no new estimator is introduced.
@@ -1094,6 +1110,14 @@ gate, cap and upload nothing.
   cannot see: money-only reveals and late external evidence.
 
 Upload counts land on the line after the source's next page line.
+
+`native_full_prior_stamp` reports sparse counts and completed bytes at
+`counts.full_by_prior_stamp.<parse_reason>.<bucket>.{count,completed_native_bytes}`,
+using `unattributed` for no reason.
+Buckets: `listing_unchanged`, `same_size_moved_mtime`, `size_changed`, `no_baseline`
+(new/missing entry or mtime). Frozen at selection, including Codex tier replay;
+group replay is excluded. Equal stamps do not prove equal bytes.
+`full_by_parse_reason` keeps its shape and now covers Codex and Pi.
 
 ## Usage Gap Counters
 
@@ -1909,7 +1933,14 @@ The Codex `native_collection_page` line carries `page_byte_budget_hit: 1` in
 spent. During a first backfill, such a page with queued work requests a paced
 pass. It never affects selection or money.
 
-## Claude OTLP spans and relay requests not stored
+Completed native pages also carry a `first_import_default_qos` boolean: the
+pass ran a paced request made during the source's first import while on AC
+power, so it kept the thread's default QoS instead of background QoS. Battery,
+Low Power Mode and unknown power behave as before, and paced passes requested
+after the first import stay at background QoS. The reason is held in memory
+only; it changes priority, never selection or money.
+
+## Claude OTLP spans and relay requests: stored and not stored
 
 These `process_retained_cache_lifecycle_totals` counters tell a request Claude
 Code never reported apart from one the daemon received and did not keep. A
@@ -1921,8 +1952,11 @@ local relay counts connections refused at its concurrency limit
 (`otlp_relay_busy_503`), malformed HTTP requests (`otlp_relay_bad_framing_400`,
 also one `bad_framing` log line), Claude exports acknowledged while Claude
 collection is off (`otlp_relay_collection_disabled`) and bodies with an
-unsupported content encoding (`otlp_relay_unknown_content_encoding`). Counts
-only: no ids, paths or payload content, and they never affect money.
+unsupported content encoding (`otlp_relay_unknown_content_encoding`). The
+local relay also counts evidence rows appended by successful file writes
+(`otlp_relay_appended_rows`) and their encoded bytes (`otlp_relay_appended_bytes`),
+with one append per evidence file per request and no fsync. Counts only: no ids,
+paths or payload content, and they never affect usage or cost.
 
 ## Compressed Codex reader refusals
 

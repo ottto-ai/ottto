@@ -75,7 +75,7 @@ require_command python3
 
 "$RELEASE_GATE" --manifest "$CANDIDATE_MANIFEST" >/dev/null
 
-python3 - "$CANDIDATE_MANIFEST" "$EVIDENCE" "$STABLE_MANIFEST" <<'PY'
+python3 - "$CANDIDATE_MANIFEST" "$EVIDENCE" "$STABLE_MANIFEST" "$ROOT/scripts" <<'PY'
 from __future__ import annotations
 
 import hashlib
@@ -84,6 +84,9 @@ import re
 import sys
 from pathlib import Path
 from typing import Any
+
+sys.path.insert(0, sys.argv[-1])
+from release_evidence_placeholders import contains_placeholder, strip_optional_not_run
 
 candidate_manifest_path = Path(sys.argv[1]).resolve()
 evidence_path = Path(sys.argv[2]).resolve()
@@ -165,34 +168,13 @@ def app_source_commit(manifest: dict[str, Any], label: str) -> str:
     return require_string(commits[0], f"{label} app source commit")
 
 
-def contains_placeholder(value: Any) -> bool:
-    if isinstance(value, str):
-        return value == "not_run" or value.startswith("TODO")
-    if isinstance(value, list):
-        return any(contains_placeholder(item) for item in value)
-    if isinstance(value, dict):
-        return any(contains_placeholder(item) for item in value.values())
-    return False
-
-
 candidate_manifest = load_json(candidate_manifest_path, "stable-candidate manifest")
 evidence = load_json(evidence_path, "stable-candidate RC evidence")
 candidate_sha = hashlib.sha256(candidate_manifest_path.read_bytes()).hexdigest()
 
 if SECRET_PATTERN.search(evidence_path.read_text(encoding="utf-8")):
     die(f"evidence contains private path or secret-like material: {evidence_path}")
-# Optional, unfilled resource evidence must not become a release requirement.
-placeholder_evidence = dict(evidence)
-if evidence.get("resource_scorecard") == {
-    "schema_version": 1, "policy": "resource-stage1-v1", "status": "not_run"
-}:
-    placeholder_evidence.pop("resource_scorecard")
-if isinstance(evidence.get("checks"), dict):
-    placeholder_evidence["checks"] = {
-        key: value for key, value in evidence["checks"].items()
-        if not (key == "resource_soak" and value == "not_run")
-    }
-if contains_placeholder(placeholder_evidence):
+if contains_placeholder(strip_optional_not_run(evidence)):
     die("evidence still contains template placeholders")
 
 if candidate_manifest.get("product") != "ottto-local-platform":

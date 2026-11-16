@@ -414,11 +414,11 @@ pub(super) fn claude_read_closure<'a>(
 /// the test seam that stands in for creation time on Linux.
 pub(super) fn probe_opened_birth(
     key: &str,
-) -> Option<super::claude_context_file_birth::ClaudeOpenedBirth> {
+) -> Option<super::sources::claude::context_file_birth::ClaudeOpenedBirth> {
     let opened = std::fs::metadata(key)
         .ok()
         .filter(|m| m.is_file())
-        .map(|m| super::claude_context_file_birth::ClaudeOpenedBirth::from_metadata(&m));
+        .map(|m| super::sources::claude::context_file_birth::ClaudeOpenedBirth::from_metadata(&m));
     #[cfg(test)]
     let opened = opened.map(|mut opened| {
         if let Some(birth) = STAGED_BIRTHS_FOR_TEST

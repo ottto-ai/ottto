@@ -145,6 +145,7 @@ fn identity_pipeline_cycle(
             source_health_snapshot: test_agent_status(SourceKind::ClaudeCode),
             codex_scan_homes: Vec::new(),
             codex_home_bindings: Vec::new(),
+            setup_snapshot_index: None,
         },
         || {
             prepare_sync_source(
@@ -562,6 +563,7 @@ fn preparation_error_preserves_normalization_counts_on_scan_worker() {
                 source_health_snapshot: test_agent_status(SourceKind::ClaudeCode),
                 codex_scan_homes: Vec::new(),
                 codex_home_bindings: Vec::new(),
+                setup_snapshot_index: None,
             },
             || {
                 prepare_sync_source(

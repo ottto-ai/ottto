@@ -806,8 +806,7 @@ pub(crate) fn resolve_repository_identity(
             Some(raw) => absolutize_git_path(workspace, raw.trim()),
             None => return unresolved_repository_identity("unknown"),
         },
-        Err(GitOutputError::Failed) => return unresolved_repository_identity("non_git"),
-        Err(_) => return unresolved_repository_identity("unknown"),
+        Err(error) => return unresolved_repository_identity(unresolved_git_kind(&error)),
     };
     let Some(common_dir_raw) = git_stdout(workspace, &["rev-parse", "--git-common-dir"]) else {
         return unresolved_repository_identity("unknown");
@@ -858,6 +857,15 @@ pub(crate) fn resolve_repository_identity(
     }
 }
 
+/// Git's own fatal exit (128) on a readable folder is `non_git`; a spawn,
+/// pipe, timeout, oversize or any other exit is `unknown`.
+fn unresolved_git_kind(error: &GitOutputError) -> &'static str {
+    match error {
+        GitOutputError::Exit(128) => "non_git",
+        _ => "unknown",
+    }
+}
+
 fn unresolved_repository_identity(kind: &str) -> RepositoryIdentity {
     RepositoryIdentity {
         repository_hash: None,
@@ -902,7 +910,10 @@ fn git_stdout(workspace: &Path, args: &[&str]) -> Option<String> {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum GitOutputError {
+    /// Git could not be spawned or read, or a signal ended it.
     Failed,
+    /// Git ran and exited with this non-zero code.
+    Exit(i32),
     TooLarge,
     TimedOut,
 }
@@ -967,7 +978,9 @@ pub(crate) fn git_stdout_capped(
         return Err(GitOutputError::TooLarge);
     }
     if !status.success() {
-        return Err(GitOutputError::Failed);
+        return Err(status
+            .code()
+            .map_or(GitOutputError::Failed, GitOutputError::Exit));
     }
     Ok(bytes)
 }
@@ -2324,6 +2337,10 @@ mod tests {
         fs::write(dir.join(".git"), "gitdir: missing-metadata\n").unwrap();
         let broken = resolve_repository_identity(&dir, true);
         assert_eq!(broken.workspace_kind.as_deref(), Some("non_git"));
+        // Only Git's own exit 128 is non-Git evidence.
+        for error in [GitOutputError::Exit(1), GitOutputError::Failed] {
+            assert_eq!(unresolved_git_kind(&error), "unknown");
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -3166,7 +3183,7 @@ mod tests {
         );
         assert_eq!(
             git_stdout_capped(&repo, &["cat-file", "-p", "missing"], 1024),
-            Err(GitOutputError::Failed)
+            Err(GitOutputError::Exit(128))
         );
         // A descendant still holding stdout cannot hold the caller past the
         // timeout; the reader thread finishes once the pipe closes.
