@@ -1,47 +1,3 @@
-impl LocalDaemon {
-    /// Test-only variant of [`Self::with_registered_device_sources`] that injects
-    /// the local-presence probe so each state (present / not-present) is
-    /// deterministic regardless of what is installed on the machine running the
-    /// tests.
-    #[cfg(test)]
-    fn with_registered_device_sources_presence(
-        self,
-        device: Option<LocalDeviceBinding>,
-        present: impl Fn(&SourceKind) -> bool,
-    ) -> Self {
-        if let Ok(mut state) = self.inner.lock() {
-            seed_registered_sources_with_presence(&mut state, device.as_ref(), present);
-        }
-        self
-    }
-
-    #[cfg(test)]
-    pub fn reset_account_for_trusted_client(&self) -> Result<AuthResetResponse, LocalApiError> {
-        self.reset_account_for_authorized_client()
-    }
-
-    #[cfg(test)]
-    pub fn update_sources(
-        &self,
-        token: &str,
-        mut sources: Vec<SourceHealth>,
-    ) -> Result<(), LocalApiError> {
-        self.control_token.authorize(token)?;
-        let mut state = self.state()?;
-        for refreshed in &mut sources {
-            if let Some(existing) = state
-                .sources
-                .iter()
-                .find(|health| health.source == refreshed.source)
-            {
-                preserve_blocking_verification_state(refreshed, existing);
-            }
-        }
-        state.sources = sources;
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     //! Daemon integration tests for authentication and source status.
@@ -49,6 +5,58 @@ mod tests {
     //! Loaded by the crate root under the existing `tests` module.
 
     use super::*;
+    use crate::control::TerminalRefreshRejection;
+    use ottto_core::source_state_file_name;
+    use ottto_core::FileSourceStateStore;
+    use ottto_core::LocalConnectionBinding;
+    use ottto_core::LocalDeviceBinding;
+    use ottto_core::LocalSourceState;
+    use ottto_core::OTTTO_KEYCHAIN_ACCOUNT;
+    use ottto_core::OTTTO_RELAY_DEVICE_SECRET_ACCOUNT;
+    use ottto_protocol::AgentQuotaWindow;
+    use ottto_protocol::AgentQuotaWindowFreshness;
+    use ottto_protocol::AgentQuotaWindowStatus;
+    use ottto_protocol::AgentStatusSnapshot;
+    use ottto_protocol::AgentStatusState;
+    use ottto_protocol::DaemonRuntimeState;
+    use ottto_protocol::DaemonStatus;
+    use ottto_protocol::DetectedUse;
+    use ottto_protocol::DetectedUseQuotaWindowState;
+    use ottto_protocol::DiagnosticsBundle;
+    use ottto_protocol::DiagnosticsUploadAuthorization;
+    use ottto_protocol::DiagnosticsUploadStatus;
+    use ottto_protocol::HealthProblem;
+    use ottto_protocol::InstallOwner;
+    use ottto_protocol::LocalAccountBinding;
+    use ottto_protocol::LocalAccountState;
+    use ottto_protocol::LocalAccountUser;
+    use ottto_protocol::LocalDeviceState;
+    use ottto_protocol::LocalHealthAccountState;
+    use ottto_protocol::LocalHealthAuthority;
+    use ottto_protocol::LocalHealthCommandStatus;
+    use ottto_protocol::LocalHealthSeverity;
+    use ottto_protocol::LocalSetupRunState;
+    use ottto_protocol::LocalSetupTokenState;
+    use ottto_protocol::MachineIdentity;
+    use ottto_protocol::PersonalMeterLocalCollectorStatus;
+    use ottto_protocol::PersonalMeterLocalFreshnessStatus;
+    use ottto_protocol::PersonalMeterLocalSnapshot;
+    use ottto_protocol::PersonalMeterLocalValueStatus;
+    use ottto_protocol::RedactedValue;
+    use ottto_protocol::RedactionCategory;
+    use ottto_protocol::RedactionSurface;
+    use ottto_protocol::RepairAction;
+    use ottto_protocol::RepairActionApproval;
+    use ottto_protocol::RepairActionKind;
+    use ottto_protocol::RepairApprovalSurface;
+    use ottto_protocol::RepairAuthorityMode;
+    use ottto_protocol::SourceHealth;
+    use ottto_protocol::SourceKind;
+    use ottto_protocol::SourceVerificationResult;
+    use ottto_protocol::SourceVerificationStatus;
+    use ottto_protocol::StableMessage;
+    use ottto_protocol::StableProblemCode;
+    use ottto_protocol::PROTOCOL_VERSION;
     use ottto_protocol::{
         AccountBindingState, AgentDiagnosticSeverity, AgentStatusDiagnostic,
         DetectedUseTokenSample, HealthGrade, LocalAccountOrganization, LocalHealthContractFixture,
@@ -56,6 +64,9 @@ mod tests {
         SourceState,
     };
     use serial_test::serial;
+    use std::path::Path;
+    use time::format_description::well_known::Rfc3339;
+    use time::OffsetDateTime;
 
     const TOKEN: &str = "local_control_token";
 

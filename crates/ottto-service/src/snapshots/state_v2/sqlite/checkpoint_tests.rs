@@ -6,6 +6,15 @@ const PASSES: u64 = 12;
 
 /// A published synthetic store: its scratch directory, path and identity.
 fn live_store(prefix: &str) -> (crate::test_scratch::ScratchDir, PathBuf, Identity) {
+    live_store_for_source(
+        prefix,
+        super::super::super::scan_index_persistence::Source::Claude,
+    )
+}
+fn live_store_for_source(
+    prefix: &str,
+    source: super::super::super::scan_index_persistence::Source,
+) -> (crate::test_scratch::ScratchDir, PathBuf, Identity) {
     let scratch = crate::test_scratch::ScratchDir::canonical(prefix);
     let path = scratch.join("index.v2.sqlite.import");
     let mut db = Sqlite::create_import(&path).unwrap();
@@ -14,7 +23,7 @@ fn live_store(prefix: &str) -> (crate::test_scratch::ScratchDir, PathBuf, Identi
         db_id: "synthetic-checkpoint".into(),
         fence_generation: 0,
         binding: super::super::super::scan_index_persistence::Binding {
-            source: super::super::super::scan_index_persistence::Source::Claude,
+            source,
             namespace_hash: "b".repeat(64),
         },
     };
@@ -22,6 +31,98 @@ fn live_store(prefix: &str) -> (crate::test_scratch::ScratchDir, PathBuf, Identi
     db.control("generation", &0_u64).unwrap();
     db.finish_import().unwrap();
     (scratch, path, identity)
+}
+
+/// [regress] Verified sources accumulate pager writes across sampling, VACUUM and reopen.
+#[test]
+fn pager_bytes_follow_verified_store_identity_and_survive_replacement() {
+    use super::super::super::scan_index_persistence::Source;
+    use crate::local_resource_diagnostics::{cache_lifecycle, cache_lifecycle_totals, capture};
+    let fields = [
+        (
+            Source::Claude,
+            "claude_sqlite_pager_wal_page_bytes_cumulative",
+        ),
+        (
+            Source::Codex,
+            "codex_sqlite_pager_wal_page_bytes_cumulative",
+        ),
+        (Source::Pi, "pi_sqlite_pager_wal_page_bytes_cumulative"),
+    ];
+    for (source, field) in fields {
+        let (_scratch, path, identity) = live_store_for_source("pager-source", source);
+        let (_, counts) = cache_lifecycle::observe(|| {
+            let mut db = open(&path, &identity);
+            let row = || capture(cache_lifecycle_totals).1.remove(0);
+            let before = row()["counts"][field].as_u64().unwrap();
+            db.control("phase", &0_u8).unwrap();
+            db.between_cycles(false).unwrap();
+            let after = row()["counts"][field].as_u64().unwrap();
+            assert!(after > before, "{field}");
+            let (_, repeated) = cache_lifecycle::observe(|| {
+                db.sample_pager_writes();
+                db.sample_pager_writes();
+            });
+            assert_eq!(serde_json::to_value(repeated).unwrap()[field], 0);
+            db.control("phase", &1_u8).unwrap();
+            let (_, replaced) = cache_lifecycle::observe(|| {
+                assert_eq!(db.vacuum().unwrap().state, CheckpointState::Complete);
+            });
+            assert!(
+                serde_json::to_value(replaced).unwrap()[field]
+                    .as_u64()
+                    .unwrap()
+                    > 0
+            );
+            assert!(row()["counts"][field].as_u64().unwrap() >= after);
+            db.control("phase", &0_u8).unwrap();
+            let (_, closed) = cache_lifecycle::observe(|| drop(db));
+            assert!(
+                serde_json::to_value(closed).unwrap()[field]
+                    .as_u64()
+                    .unwrap()
+                    > 0
+            );
+            let before_reopen = row()["counts"][field].as_u64().unwrap();
+            let _db = open(&path, &identity);
+            assert!(row()["counts"][field].as_u64().unwrap() >= before_reopen);
+        });
+        let counts = serde_json::to_value(counts).unwrap();
+        assert!(counts[field].as_u64().unwrap() > 0);
+        for (_, other) in fields {
+            if other != field {
+                assert_eq!(counts[other], 0, "{other}");
+            }
+        }
+    }
+}
+
+/// [regress] History WAL pages are sampled once and carried across connection closes.
+#[test]
+fn upload_history_pager_bytes_are_cumulative() {
+    use crate::local_resource_diagnostics::cache_lifecycle;
+    let scratch = crate::test_scratch::ScratchDir::canonical("history-pager");
+    let path = history::Store::path(&scratch);
+    let (_, counts) = cache_lifecycle::observe(|| {
+        let store = history::Store::open(&path).unwrap();
+        store.sample_pager_writes();
+        let (_, repeated) = cache_lifecycle::observe(|| store.sample_pager_writes());
+        assert_eq!(
+            repeated.upload_history_sqlite_pager_wal_page_bytes_cumulative,
+            0
+        );
+        store
+            .conn_for_test()
+            .execute_batch("PRAGMA application_id=1")
+            .unwrap();
+        let (_, closed) = cache_lifecycle::observe(|| drop(store));
+        assert!(closed.upload_history_sqlite_pager_wal_page_bytes_cumulative >= 4096);
+        let _store = history::Store::open(&path).unwrap();
+    });
+    assert!(counts.upload_history_sqlite_pager_wal_page_bytes_cumulative >= 4096);
+    assert_eq!(counts.claude_sqlite_pager_wal_page_bytes_cumulative, 0);
+    assert_eq!(counts.codex_sqlite_pager_wal_page_bytes_cumulative, 0);
+    assert_eq!(counts.pi_sqlite_pager_wal_page_bytes_cumulative, 0);
 }
 fn open(path: &Path, identity: &Identity) -> Sqlite {
     let mut db = Sqlite::open(path, identity).unwrap();

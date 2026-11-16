@@ -24,6 +24,11 @@ sparse_lifetime_counters! {
     // Local OTLP relay rows and encoded bytes successfully appended (no fsync).
     otlp_relay_appended_rows: OtlpRelayAppendedRows,
     otlp_relay_appended_bytes: OtlpRelayAppendedBytes,
+    claude_sqlite_pager_wal_page_bytes_cumulative: ClaudePagerBytes,
+    codex_sqlite_pager_wal_page_bytes_cumulative: CodexPagerBytes,
+    pi_sqlite_pager_wal_page_bytes_cumulative: PiPagerBytes,
+    upload_history_sqlite_pager_wal_page_bytes_cumulative: HistoryPagerBytes,
+    shared_cache_helper_write_bytes_cumulative: SharedCacheBytes,
     // Local OTLP relay requests refused or acknowledged without storing.
     otlp_relay_busy_503: OtlpRelayBusy503,
     otlp_relay_bad_framing_400: OtlpRelayBadFraming400,
