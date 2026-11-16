@@ -69,47 +69,51 @@ impl Drop for IdentityPipelineHome {
 /// Own this synthetic Claude cadence and upload backoff slot. The named serial key below
 /// excludes cadence tests; the default key excludes environment fixtures.
 /// Restore pre-test state on every exit, including panic.
-struct IdentityPipelineCadence(Option<SourceCadence>, Option<Instant>, Option<u32>);
+struct IdentityPipelineCadence(
+    Option<SourceCadence>,
+    Option<Instant>,
+    Option<u32>,
+    &'static str,
+);
 
 impl IdentityPipelineCadence {
     fn new() -> Self {
+        Self::for_source("claude_code")
+    }
+
+    fn for_source(source: &'static str) -> Self {
         Self(
-            source_cadences().lock().unwrap().remove("claude_code"),
-            source_upload_deadlines()
-                .lock()
-                .unwrap()
-                .remove("claude_code"),
-            source_shed_streaks().lock().unwrap().remove("claude_code"),
+            source_cadences().lock().unwrap().remove(source),
+            source_upload_deadlines().lock().unwrap().remove(source),
+            source_shed_streaks().lock().unwrap().remove(source),
+            source,
         )
     }
 
     fn next_due_cycle(&self) {
         // Test-only fresh cadence represents the next already-due cycle. The
         // real prepare gate and all index/ACK/lifecycle state remain unchanged.
-        source_cadences().lock().unwrap().remove("claude_code");
-        source_upload_deadlines()
-            .lock()
-            .unwrap()
-            .remove("claude_code");
+        source_cadences().lock().unwrap().remove(self.3);
+        source_upload_deadlines().lock().unwrap().remove(self.3);
     }
 }
 
 impl Drop for IdentityPipelineCadence {
     fn drop(&mut self) {
         let mut cadences = source_cadences().lock().unwrap();
-        cadences.remove("claude_code");
+        cadences.remove(self.3);
         if let Some(previous) = self.0.take() {
-            cadences.insert("claude_code", previous);
+            cadences.insert(self.3, previous);
         }
         let mut deadlines = source_upload_deadlines().lock().unwrap();
-        deadlines.remove("claude_code");
+        deadlines.remove(self.3);
         if let Some(previous) = self.1.take() {
-            deadlines.insert("claude_code", previous);
+            deadlines.insert(self.3, previous);
         }
         let mut streaks = source_shed_streaks().lock().unwrap();
-        streaks.remove("claude_code");
+        streaks.remove(self.3);
         if let Some(previous) = self.2.take() {
-            streaks.insert("claude_code", previous);
+            streaks.insert(self.3, previous);
         }
     }
 }

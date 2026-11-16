@@ -87,6 +87,9 @@ pub struct BackfillState {
     /// one bootstrap before it can become destination-complete.
     #[serde(default)]
     pub completed_destination_namespaces: BTreeMap<String, String>,
+    /// Exact destination's settled replay, never inferred from another owner.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub completed_destination_replays: BTreeMap<String, BTreeMap<String, String>>,
     #[serde(default)]
     pub last_completed_at: Option<String>,
     /// Immutable first census ends, keyed by destination namespace + ":" + source.
@@ -293,11 +296,7 @@ pub(crate) fn record_first_census(
     update_backfill_state(state_dir, |state| {
         let slug = source.api_slug();
         let key = format!("{destination}:{slug}");
-        let completed = state.completed_destination_namespaces.get(slug).map_or(
-            state.completed_parser_versions.contains_key(slug)
-                || state.completed_replay_revisions.contains_key(slug),
-            |recorded| recorded == destination,
-        );
+        let completed = state.has_completed_destination(slug, destination, true);
         if missing_index && !completed && !state.prior_history_unverified {
             state
                 .first_census_ends
@@ -524,12 +523,9 @@ pub fn bootstrap_pending_for_destination(
     destination_namespace_hash: &str,
 ) -> bool {
     let slug = source.api_slug();
-    !has_bootstrapped(state, slug)
-        || state
-            .completed_destination_namespaces
-            .get(slug)
-            .map(String::as_str)
-            != Some(destination_namespace_hash)
+    !state.destination_completed(slug, destination_namespace_hash)
+        || (!state.completed_destination_replays.contains_key(slug)
+            && !has_bootstrapped(state, slug))
 }
 
 /// Returns sources that need their first historical bootstrap or an explicit
@@ -565,10 +561,52 @@ pub fn pending_backfill_sources_for_destination(
     .into_iter()
     .filter(|source| !(state.prior_history_unverified && *source == SnapshotSource::ClaudeCode))
     .filter(|source| {
-        source_needs_backfill(state, *source, current_historical_replay(*source))
-            || bootstrap_pending_for_destination(state, *source, destination_namespace_hash)
+        destination_needs_backfill(
+            state,
+            *source,
+            destination_namespace_hash,
+            current_historical_replay(*source),
+        )
     })
     .collect()
+}
+
+fn destination_needs_backfill(
+    state: &BackfillState,
+    source: SnapshotSource,
+    destination: &str,
+    directive: HistoricalReplayDirective,
+) -> bool {
+    if let Some(destinations) = state.completed_destination_replays.get(source.api_slug()) {
+        return destinations.get(destination).is_none_or(|revision| {
+            directive.policy == HistoricalReplayPolicy::Full && revision != directive.revision
+        });
+    }
+    source_needs_backfill(state, source, directive)
+        || bootstrap_pending_for_destination(state, source, destination)
+}
+
+impl BackfillState {
+    fn has_completed_destination(
+        &self,
+        source: &str,
+        destination: &str,
+        legacy_unknown: bool,
+    ) -> bool {
+        self.completed_destination_replays.get(source).map_or_else(
+            || {
+                self.completed_destination_namespaces.get(source).map_or(
+                    legacy_unknown && has_bootstrapped(self, source),
+                    |recorded| recorded == destination,
+                )
+            },
+            |destinations| destinations.contains_key(destination),
+        )
+    }
+
+    pub(crate) fn destination_completed(&self, source: &str, destination: &str) -> bool {
+        self.has_completed_destination(source, destination, false)
+    }
 }
 
 pub fn mark_backfill_complete(state: &mut BackfillState, source: SnapshotSource) {
@@ -590,6 +628,15 @@ pub fn mark_backfill_complete_for_destination(
     source: SnapshotSource,
     destination_namespace_hash: &str,
 ) {
+    let slug = source.api_slug();
+    let destinations = state
+        .completed_destination_replays
+        .entry(slug.to_string())
+        .or_default();
+    destinations.insert(
+        destination_namespace_hash.to_string(),
+        current_historical_replay(source).revision.to_string(),
+    );
     mark_backfill_complete(state, source);
     state.completed_destination_namespaces.insert(
         source.api_slug().to_string(),
@@ -664,6 +711,90 @@ pub fn now_rfc3339() -> String {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn destination_completion_survives_returns_and_replay_is_owed_per_destination() {
+        for source in [
+            SnapshotSource::ClaudeCode,
+            SnapshotSource::Codex,
+            SnapshotSource::Pi,
+        ] {
+            let mut state = BackfillState::default();
+            for destination in ["a", "b", "c"] {
+                assert!(bootstrap_pending_for_destination(
+                    &state,
+                    source,
+                    destination
+                ));
+                mark_backfill_complete_for_destination(&mut state, source, destination);
+            }
+            state = serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+            for destination in ["a", "b", "c"] {
+                assert!(
+                    !pending_backfill_sources_for_destination(&state, destination)
+                        .contains(&source)
+                );
+            }
+            assert!(pending_backfill_sources_for_destination(&state, "new").contains(&source));
+            // A completed R1, B completed today's R2. B's global revision cannot
+            // pay A's replay; only settled A/R2 does so, exactly once.
+            let revision = current_historical_replay(source).revision;
+            state
+                .completed_destination_replays
+                .get_mut(source.api_slug())
+                .unwrap()
+                .insert("a".into(), "old-revision".into());
+            assert!(pending_backfill_sources_for_destination(&state, "a").contains(&source));
+            assert!(!bootstrap_pending_for_destination(&state, source, "a"));
+            let interrupted = serde_json::to_vec(&state).unwrap();
+            assert!(pending_backfill_sources_for_destination(
+                &serde_json::from_slice(&interrupted).unwrap(),
+                "a"
+            )
+            .contains(&source));
+            mark_backfill_complete_for_destination(&mut state, source, "a");
+            assert_eq!(
+                state.completed_destination_replays[source.api_slug()]["a"],
+                revision
+            );
+            assert!(!pending_backfill_sources_for_destination(&state, "a").contains(&source));
+            // An older writer drops the additive map. Re-upgrade fails toward
+            // one bounded re-walk for the destination absent from its last slot.
+            let mut old = serde_json::to_value(&state).unwrap();
+            old.as_object_mut()
+                .unwrap()
+                .remove("completed_destination_replays");
+            let mut restored: BackfillState = serde_json::from_value(old).unwrap();
+            assert!(pending_backfill_sources_for_destination(&restored, "b").contains(&source));
+            mark_backfill_complete_for_destination(&mut restored, source, "b");
+            assert!(!pending_backfill_sources_for_destination(&restored, "b").contains(&source));
+            assert!(pending_backfill_sources_for_destination(&restored, "a").contains(&source));
+            assert!(pending_backfill_sources_for_destination(&restored, "c").contains(&source));
+        }
+    }
+
+    #[test]
+    fn destination_completion_writes_only_the_settled_forward_destination() {
+        for source in [
+            SnapshotSource::ClaudeCode,
+            SnapshotSource::Codex,
+            SnapshotSource::Pi,
+        ] {
+            let mut state = BackfillState::default();
+            mark_backfill_complete(&mut state, source);
+            state
+                .completed_destination_namespaces
+                .insert(source.api_slug().into(), "a".into());
+            mark_backfill_complete_for_destination(&mut state, source, "b");
+            assert_eq!(
+                state.completed_destination_replays[source.api_slug()].len(),
+                1
+            );
+            assert!(!state.destination_completed(source.api_slug(), "a"));
+            assert!(state.destination_completed(source.api_slug(), "b"));
+            assert!(!state.destination_completed(source.api_slug(), "c"));
+        }
+    }
 
     #[test]
     fn empty_first_census_map_preserves_legacy_bytes() {
@@ -757,6 +888,7 @@ mod tests {
             // A legacy completion with no destination binding is conservative too.
             update_backfill_state(&dir, |state| {
                 state.completed_destination_namespaces.clear();
+                state.completed_destination_replays.clear();
             })
             .unwrap();
             assert_eq!(
@@ -1605,6 +1737,6 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(BackfillState; first_census_ends, completed_parser_versions, completed_replay_revisions, completed_destination_namespaces, last_completed_at, last_report, backfill_cutoff_at, backfill_cutoff_user_id, backfill_cutoff_destination_namespace, prior_history_unverified, claim_backfill_policy_full, claude_history_list_intent);
+crate::heap_layout_bound::fields!(BackfillState; completed_destination_replays, first_census_ends, completed_parser_versions, completed_replay_revisions, completed_destination_namespaces, last_completed_at, last_report, backfill_cutoff_at, backfill_cutoff_user_id, backfill_cutoff_destination_namespace, prior_history_unverified, claim_backfill_policy_full, claude_history_list_intent);
 
 crate::heap_layout_bound::fields!(BackfillReport; claude_code_session_count, codex_session_count, pi_session_count, claude_code_snapshot_count, codex_snapshot_count, pi_snapshot_count, completed_at);

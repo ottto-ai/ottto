@@ -348,6 +348,23 @@ backfill-state save, so re-upgrade omits the cutoff for existing destinations.
 - A parser or scan-identity version bump invalidates every saved record. A change that bumps one
   also migrates saved state forward, or it explicitly accepts the full re-read.
 
+## Returning to an account
+
+Claims record exact owner/API/machine/installation/OS-scope namespaces in trusted
+owner-only history. Returning claims require live hardware and surviving custody;
+same-owner rotation keeps the existing prior-credential policy. No orphan discovery.
+Logout seeds proven outgoing history best effort; history I/O failures count a
+skipped seed and allow logout/reset. Claim-time Unknown history still holds.
+Forget invalidates old installation rows.
+History-bearing journals use v3, rejected by released v2 readers. The selected
+cutoff precedes activation; history is synced/read back before pending clear.
+Existing aliases, loaders and exact destination ACKs retain all source custody.
+Completion belongs to settled delivery, per destination/replay revision. Older
+writers may drop that map, causing one bounded re-walk after upgrade. Quiet return
+reads no bodies or parser bytes and sends no historical bodies; identity samples
+follow uninterrupted census behavior. Server cutoffs still exclude pre-cutoff debt.
+Deleted custody selects fresh, under existing first-read/cutoff gates, with no ACKs.
+
 ## Hot and cold state
 
 Resident state stays small: what is needed to decide what to do with a file (identity, offset,

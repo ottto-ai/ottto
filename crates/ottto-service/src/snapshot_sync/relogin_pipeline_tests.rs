@@ -186,20 +186,551 @@ fn relogin_alias_keeps_accepted_history_without_a_reread() {
     assert_eq!(suffix, [30, 3, 0], "exactly the appended request's money");
 }
 
-/// Characterization of today's fresh destination on A -> B -> A. The receiver
-/// accepts replacements; this proves offered bodies and exact local ACK custody,
-/// not the separate receiver's pricing or predecessor repository carry-forward.
+/// [money] Destination completion and durable namespace selection conserve the
+/// three sources after a quiet account roundtrip; synthetic fixture only.
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
-fn account_return_today_reinterprets_orphaned_history() {
+fn owner_return_preserves_all_source_carry() {
     use crate::snapshots::sampled_scan::transition_fixture::{observe_consumed, with_scan_clock};
     use serde_json::{json, Value};
     use std::time::UNIX_EPOCH;
     if !crate::heap_layout_bound::layout_supported() || !crate::test_isolation::run_here() {
         return;
     }
+    const AT: &str = "2026-11-16T08:00:00Z";
+    const CX: &str = "0199f7a0-0000-7000-8000-00000000c0de";
+    const OLD: &str = "1338a80a-f36e-4cbc-a5bb-50fc66430ba6";
+    let now = OffsetDateTime::parse(AT, &Rfc3339)
+        .unwrap()
+        .unix_timestamp() as u64;
+    for (third_owner, replay_bump, rollback) in [
+        (false, false, false),
+        (true, false, false),
+        (true, true, false),
+        (false, false, true),
+    ] {
+        forget_carried_namespaces_for_test(&["return-a", "return-b", "return-a-again"]);
+        let fixture = IdentityPipelineHome::new();
+        let cadence = IdentityPipelineCadence::new();
+        let _codex_cadence = IdentityPipelineCadence::for_source("codex");
+        let _pi_cadence = IdentityPipelineCadence::for_source("pi");
+        let support = fixture.base.join("return-support");
+        let secrets = fixture.base.join("return-secrets");
+        std::fs::create_dir_all(&secrets).unwrap();
+        let _home = EnvVarGuard::set_path("HOME", &fixture.home);
+        let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+        let _secrets = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secrets);
+        let _pi = EnvVarGuard::set_path("PI_CODING_AGENT_DIR", &fixture.home.join(".pi/agent"));
+        let server = FinishServer::new(FinishOutcome::Accept);
+        let _api = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &server.url);
+        let project = fixture.home.join(".claude/projects/-synthetic-repo");
+        let claude = project.join(format!("{IDENTITY_PIPELINE_ROOT}.jsonl"));
+        let old = project.join(format!("{OLD}.jsonl"));
+        let repository = fixture.home.join("vanished-repository");
+        std::fs::create_dir_all(&repository).unwrap();
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success());
+        let write = |path: &Path, rows: Vec<Value>| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(
+                path,
+                rows.iter()
+                    .map(|v| v.to_string() + "\n")
+                    .collect::<String>(),
+            )
+            .unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(UNIX_EPOCH + Duration::from_secs(now - 60))
+                .unwrap();
+        };
+        let claude_rows = |session: &str| {
+            vec![
+                json!({"type":"assistant","timestamp":AT,"sessionId":session,"cwd":repository,
+            "requestId":format!("{session}-request"),"message":{"id":format!("{session}-response"),
+                "model":"claude-haiku-4-5","usage":{"input_tokens":30,"output_tokens":3}}}),
+            ]
+        };
+        write(&claude, claude_rows(IDENTITY_PIPELINE_ROOT));
+        write(&old, claude_rows(OLD));
+        write_native_bootstrap_sidecars(&fixture, &support);
+        let codex = fixture
+            .home
+            .join(".codex/sessions")
+            .join(format!("rollout-2026-11-16T08-00-00-{CX}.jsonl"));
+        let usage = |input, output| {
+            json!({"input_tokens":input,"output_tokens":output,
+        "cached_input_tokens":0,"cache_write_input_tokens":0,"reasoning_output_tokens":0,"total_tokens":input+output})
+        };
+        write(
+            &codex,
+            vec![
+                json!({"type":"session_meta","timestamp":AT,"payload":{"id":CX,"timestamp":AT,"source":"cli"}}),
+                json!({"type":"event_msg","timestamp":AT,"payload":{"type":"task_started","turn_id":"return-turn"}}),
+                json!({"type":"turn_context","timestamp":AT,"payload":{"turn_id":"return-turn","model":"gpt-5.2"}}),
+                json!({"type":"token_usage_record","timestamp":AT,"payload":{"thread_id":CX,"turn_id":"return-turn",
+            "response_id":"return-response","usage":usage(1000,100),"thread_token_usage":usage(1000,100)}}),
+                json!({"type":"event_msg","timestamp":AT,"payload":{"type":"token_count","info":{
+            "last_token_usage":usage(2000,200),"total_token_usage":usage(2000,200)}}}),
+                json!({"type":"event_msg","timestamp":AT,"payload":{"type":"task_complete","turn_id":"return-turn"}}),
+            ],
+        );
+        let pi = fixture.home.join(".pi/agent/sessions/return-pi.jsonl");
+        write(
+            &pi,
+            vec![
+                json!({"type":"session","id":"return-pi","timestamp":AT}),
+                json!({"type":"message","message":{"role":"assistant","model":"gpt-5.4","provider":"openai",
+            "timestamp":AT,"responseId":"pi-response","usage":{"input":12,"output":4,"cost":{"total":0.001}}}}),
+            ],
+        );
+        let sources = [
+            SnapshotSource::ClaudeCode,
+            SnapshotSource::Codex,
+            SnapshotSource::Pi,
+        ];
+        let (device_a, secret_a) = {
+            let device = LocalDeviceBinding {
+                device_id: "return-a".into(),
+                machine_id: Some("machine_test".into()),
+                sources: vec!["claude_code".into(), "codex".into(), "pi".into()],
+            };
+            let secret = "synthetic-return-secret-a".to_string();
+            crate::control::owner_return_credential_for_test(&device, &secret, "owner-a");
+            (device, secret)
+        };
+        let namespace_a = snapshot_upload_destination_namespace(&device_a, &secret_a);
+        let index_path = |namespace: &str, source| {
+            snapshot_v3_index_path(&snapshot_destination_scoped_index_path(
+                &snapshot_index_path(&support, source),
+                namespace,
+            ))
+        };
+        let cx_path = index_path(&namespace_a, SnapshotSource::Codex);
+        let mut legacy = ScanIndex::default();
+        // Keep the Legacy entry inside the current index replay generation.
+        // The first ordinary pass completes that generation in upload progress
+        // and destination completion through the production writers.
+        let generation = cycle_replay_generation(SnapshotSource::Codex, &namespace_a);
+        legacy.prepare_historical_replay(generation.clone());
+        legacy.files.insert(
+            codex.to_string_lossy().into_owned(),
+            serde_json::from_value(json!({
+                "size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":"old",
+                "last_snapshot_fingerprint":"old-ack","codex_counting_v2":false
+            }))
+            .unwrap(),
+        );
+        legacy.save(&cx_path).unwrap();
+        crate::snapshots::older_build_logs_priority("return-turn");
+        let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
+        // A claim switch keeps the daemon alive. Keep its physical-header cache
+        // while reloading account/index state on each ordinary source pass.
+        let daemon_owner = test_daemon("machine_test");
+        let mut cycle = |device: &LocalDeviceBinding, secret: &str, source: SnapshotSource| {
+            cadence.next_due_cycle();
+            source_cadences().lock().unwrap().remove(source.api_slug());
+            source_upload_deadlines()
+                .lock()
+                .unwrap()
+                .remove(source.api_slug());
+            server.offered.lock().unwrap().clear();
+            let namespace = snapshot_upload_destination_namespace(device, secret);
+            crate::backfill::update_backfill_state(&support, |state| {
+                state
+                    .first_census_ends
+                    .insert(format!("{namespace}:{}", source.api_slug()), AT.into());
+            })
+            .unwrap();
+            let collection = || AgentStatusCollection {
+                snapshots: vec![test_agent_status(source_kind(source))],
+                source_health_snapshot: test_agent_status(source_kind(source)),
+                codex_scan_homes: vec![fixture.home.join(".codex")],
+                codex_home_bindings: vec![crate::agent_status::CodexHomeBinding {
+                    home: fixture.home.join(".codex"),
+                    account_identifier_hash: "a".repeat(64),
+                    workspace_identifier_hash: "b".repeat(64),
+                    auth_modified_at: UNIX_EPOCH,
+                }],
+                setup_snapshot_index: None,
+            };
+            let client = SnapshotApiClient::new(server.url.clone());
+            let daemon = daemon_owner
+                .clone()
+                .with_account(ottto_core::FileAccountStore::default().load().unwrap());
+            let mut transport = crate::net_resilience::TransportCycleOutcome::default();
+            with_scan_clock(now, || {
+                observe_consumed(|| {
+                    let frame =
+                        crate::agent_status_refresh::with_test_collection(collection(), || {
+                            prepare_sync_source(
+                                &client,
+                                device,
+                                secret,
+                                source,
+                                "machine_test",
+                                &fixture.home,
+                                &support,
+                                &daemon,
+                                &mut transport,
+                                daemon.snapshot_scan_account_witness().unwrap(),
+                                false,
+                            )
+                        })
+                        .unwrap()
+                        .expect("due preparation");
+                    let (preparation, index, scan) = collect_preparation_with_rotation(frame);
+                    if namespace != namespace_a && source == SnapshotSource::ClaudeCode {
+                        if !scan.snapshots.is_empty() {
+                            assert_eq!(
+                                scan.scanned_file_count, 1,
+                                "only the recent transcript is read"
+                            );
+                        }
+                        assert!(!index
+                            .files
+                            .contains_key(&old.to_string_lossy().into_owned()));
+                    }
+                    let path = preparation.index_path.clone();
+                    crate::agent_status_refresh::with_test_collection(collection(), || {
+                        finish_sync_source(
+                            preparation,
+                            index,
+                            scan,
+                            &client,
+                            device,
+                            secret,
+                            source,
+                            "machine_test",
+                            &fixture.home,
+                            &support,
+                            &daemon,
+                            &mut transport,
+                            &mut retry,
+                        )
+                    })
+                    .unwrap();
+                    let bodies = server.offered.lock().unwrap().clone();
+                    let saved = ScanIndex::load(&path).unwrap();
+                    for body in &bodies {
+                        assert!(
+                            saved.accepted_snapshot_fingerprint_recorded(
+                                body["snapshot_fingerprint"].as_str().unwrap()
+                            ),
+                            "only exact ACKs credit this destination"
+                        );
+                    }
+                    bodies
+                })
+            })
+        };
+        let mut before = sources.map(|source| {
+            let (bodies, bytes) = cycle(&device_a, &secret_a, source);
+            assert!(bytes > 0);
+            assert_eq!(
+                bodies.len(),
+                if source == SnapshotSource::ClaudeCode {
+                    2
+                } else {
+                    1
+                }
+            );
+            bodies
+        });
+        let uninterrupted_io = sources.map(|source| {
+            let (bodies, io) =
+                crate::snapshots::sampled_scan::transition_fixture::observe_codex_quiet_with_bytes(
+                    || cycle(&device_a, &secret_a, source),
+                );
+            assert!(
+                bodies.is_empty(),
+                "intact A does not re-offer accepted money"
+            );
+            assert_eq!(io.consumed, 0, "intact A reads no unchanged transcript");
+            io
+        });
+        let saved = ScanIndex::load(&cx_path).unwrap();
+        let entry = &saved.files[&codex.to_string_lossy().into_owned()];
+        assert!(!entry.codex_counting_v2, "Legacy ACK keeps the UI counter");
+        assert!(saved.historical_replay_generation_matches(&generation));
+        // The disposable progress ledger can clear after ACK handoff. Its
+        // destination/replay proof survives in the authoritative index.
+        assert_eq!(
+            serde_json::to_value(&saved.upload_context_proof).unwrap()["replay_generation"]
+                .as_str(),
+            Some(generation.as_str()),
+            "accepted-body proof belongs to the completed replay"
+        );
+        assert!(!crate::backfill::pending_backfill_sources_for_destination(
+            &crate::backfill::load_backfill_state(&support),
+            &namespace_a,
+        )
+        .contains(&SnapshotSource::Codex));
+        assert!(!serde_json::to_value(entry).unwrap()["codex_applied_tier_receipt"].is_null());
+        let tier = serde_json::to_value(entry).unwrap()["codex_applied_tier_receipt"].clone();
+        crate::snapshots::older_build_logs_expired();
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(UNIX_EPOCH + Duration::from_secs(now - 61 * 86400))
+            .unwrap();
+        // A timestamp rewrite is a real changed-input cause. Settle that
+        // ordinary A work before the switch, then compare a quiet return.
+        // Aging the file must not masquerade as unchanged input.
+        let (touched, _) = cycle(&device_a, &secret_a, SnapshotSource::ClaudeCode);
+        for body in touched {
+            assert_eq!(
+                body["source_session_id"], OLD,
+                "only the touched old file is owed"
+            );
+            let saved = before[0]
+                .iter_mut()
+                .find(|prior| prior["source_session_id"] == OLD)
+                .unwrap();
+            for field in crate::snapshots::sampled_scan::transition_fixture::money_oracle::FIELDS {
+                assert_eq!(
+                    body[*field], saved[*field],
+                    "metadata touch conserves {field}"
+                );
+            }
+            *saved = body;
+        }
+        let (quiet, bytes) = cycle(&device_a, &secret_a, SnapshotSource::ClaudeCode);
+        assert!(quiet.is_empty());
+        assert_eq!(
+            bytes, 0,
+            "uninterrupted A is quiet after the metadata touch"
+        );
+        std::fs::remove_dir_all(&repository).unwrap();
+        if replay_bump {
+            let source = SnapshotSource::Pi;
+            let mut old = ScanIndex::load(&index_path(&namespace_a, source)).unwrap();
+            old.prepare_historical_replay(format!("pi:old-revision:{namespace_a}"));
+            old.save(&index_path(&namespace_a, source)).unwrap();
+            crate::backfill::update_backfill_state(&support, |state| {
+                state
+                    .completed_destination_replays
+                    .get_mut("pi")
+                    .unwrap()
+                    .insert(namespace_a.clone(), "old-revision".into());
+            })
+            .unwrap();
+        }
+
+        // Each destination completes independently; returning A must keep its
+        // Legacy decision, tier receipt, old accepted file and repository binding.
+        for (user, id) in [
+            ("owner-b", "return-b"),
+            ("owner-c", "return-c"),
+            ("owner-a", "return-a-again"),
+        ] {
+            if user == "owner-c" && !third_owner {
+                continue;
+            }
+            let device = LocalDeviceBinding {
+                device_id: id.into(),
+                ..device_a.clone()
+            };
+            let secret = format!("secret-{id}");
+            if rollback && user == "owner-a" {
+                crate::backfill::update_backfill_state(&support, |state| {
+                    state.completed_destination_replays.clear()
+                })
+                .unwrap();
+            }
+            let selected = crate::control::owner_return_credential_for_test(&device, &secret, user);
+            let (device, secret) =
+                crate::snapshot_client::load_snapshot_device_credentials().unwrap();
+            assert_eq!(
+                snapshot_upload_destination_namespace(&device, &secret),
+                selected
+            );
+            if user != "owner-a" {
+                assert_ne!(selected, namespace_a);
+                assert!(
+                    sources
+                        .iter()
+                        .all(|&source| !index_path(&selected, source).exists()),
+                    "no previous owner's custody inherited"
+                );
+                for source in sources {
+                    let _ = cycle(&device, &secret, source);
+                }
+                continue;
+            }
+            assert_eq!(selected, namespace_a);
+            if replay_bump {
+                let source = SnapshotSource::Pi;
+                let generation = cycle_replay_generation(source, &selected);
+                assert_eq!(
+                    generation,
+                    format!(
+                        "pi:{}:{selected}",
+                        current_historical_replay(source).revision
+                    )
+                );
+                let (replayed, _) = cycle(&device, &secret, source);
+                assert_eq!(
+                    replayed.len(),
+                    1,
+                    "the returning destination pays its own owed revision"
+                );
+                for field in
+                    crate::snapshots::sampled_scan::transition_fixture::money_oracle::FIELDS
+                {
+                    assert_eq!(
+                        replayed[0][*field], before[2][0][*field],
+                        "Pi replay {field}"
+                    );
+                }
+                let state = crate::backfill::load_backfill_state(&support);
+                assert!(!crate::backfill::pending_backfill_sources_for_destination(
+                    &state, &selected
+                )
+                .contains(&source));
+                let saved = ScanIndex::load(&index_path(&selected, source)).unwrap();
+                assert!(saved.historical_replay_generation_matches(&generation));
+            }
+            if rollback {
+                for source in sources {
+                    let (bodies, _) = cycle(&device, &secret, source);
+                    assert!(
+                        bodies.is_empty(),
+                        "rollback re-walk never creates a new ACK for accepted history"
+                    );
+                }
+            }
+            for source in sources {
+                let (bodies, io) =
+                crate::snapshots::sampled_scan::transition_fixture::observe_codex_quiet_with_bytes(
+                    || cycle(&device, &secret, source),
+                );
+                assert!(bodies.is_empty(), "quiet return re-offered {source:?}");
+                assert_eq!(io.consumed, 0, "quiet return read {source:?}");
+                let saved = ScanIndex::load(&index_path(&selected, source)).unwrap();
+                let mut quiet =
+                    crate::snapshots::sampled_scan::transition_fixture::RouteResult::emitted(
+                        // The scan index is restored from disk on each cycle;
+                        // the live daemon retains its physical header cache.
+                        crate::snapshots::sampled_scan::transition_fixture::Mode::DiskRestore,
+                        source,
+                        Vec::new(),
+                        &[],
+                    );
+                quiet.io = io;
+                // Restarted censuses sample identity in uninterrupted A too.
+                // The allowance is the independently observed control, never a
+                // constant or the return's own reading; all other I/O stays zero.
+                let anchors = uninterrupted_io[sources.iter().position(|s| *s == source).unwrap()]
+                    .anchor_reads
+                    .expect("uninterrupted anchors must be measured");
+                crate::snapshots::sampled_scan::transition_fixture::money_oracle::assert_quiet_restart_with_anchor_window(&quiet, anchors);
+                for prior in &before[sources.iter().position(|s| *s == source).unwrap()] {
+                    assert!(saved.accepted_snapshot_fingerprint_recorded(
+                        prior["snapshot_fingerprint"].as_str().unwrap()
+                    ));
+                }
+            }
+            let saved = ScanIndex::load(&cx_path).unwrap();
+            let entry = &saved.files[&codex.to_string_lossy().into_owned()];
+            assert!(!entry.codex_counting_v2);
+            assert_eq!(
+                serde_json::to_value(entry).unwrap()["codex_applied_tier_receipt"],
+                tier
+            );
+            let claude_saved =
+                ScanIndex::load(&index_path(&selected, SnapshotSource::ClaudeCode)).unwrap();
+            assert!(
+                claude_saved
+                    .files
+                    .contains_key(&old.to_string_lossy().into_owned()),
+                "old accepted coverage survives"
+            );
+            assert!(before[0]
+                .iter()
+                .all(|body| body["repository_hash"].is_string()));
+        }
+        // Deleted-store return is from a different owner. A same-owner rotation
+        // must preserve main's namespace even when its store has disappeared.
+        let away = LocalDeviceBinding {
+            device_id: "return-b-before-loss".into(),
+            ..device_a.clone()
+        };
+        crate::control::owner_return_credential_for_test(&away, "away-secret", "owner-b");
+        // Deleted-store fallback cannot borrow ACKs or recreate the old namespace.
+        std::fs::remove_dir_all(support.join("snapshots/destinations").join(&namespace_a)).unwrap();
+        let fresh = LocalDeviceBinding {
+            device_id: "return-a-deleted".into(),
+            ..device_a.clone()
+        };
+        let selected =
+            crate::control::owner_return_credential_for_test(&fresh, "deleted-secret", "owner-a");
+        assert_ne!(selected, namespace_a);
+        crate::backfill::apply_claim_backfill_policy_for_destination(
+            &support,
+            Some("from"),
+            Some("2026-11-17T00:00:00Z"),
+            "owner-a",
+            Some(&selected),
+        )
+        .unwrap();
+        let (device, secret) = crate::snapshot_client::load_snapshot_device_credentials().unwrap();
+        for source in sources {
+            let (bodies, _) = cycle(&device, &secret, source);
+            assert!(
+                bodies.is_empty(),
+                "pre-cutoff store-loss fallback cannot shrink the server head"
+            );
+            let lost = ScanIndex::load(&index_path(&selected, source)).unwrap();
+            if source == SnapshotSource::Codex {
+                assert!(
+                    lost.files
+                        .get(&codex.to_string_lossy().into_owned())
+                        .is_some_and(|entry| entry.codex_counting_v2),
+                    "deleted-store fallback records the V2 interpretation residual"
+                );
+            }
+            for prior in &before[sources.iter().position(|s| *s == source).unwrap()] {
+                assert!(
+                    !lost.accepted_snapshot_fingerprint_recorded(
+                        prior["snapshot_fingerprint"].as_str().unwrap()
+                    ),
+                    "no acceptance inherited after deletion"
+                );
+            }
+        }
+    } // two- and three-owner return rows
+}
+
+/// [money] Recorded owners retain their namespace and receipts on A -> B -> A.
+/// No-row owners keep the disclosed fresh-store limit; the receiver is synthetic.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests)]
+#[serial(client_report)]
+fn account_return_preserves_recorded_history_and_bounds_unrecorded_owners() {
+    if !crate::heap_layout_bound::layout_supported() || !crate::test_isolation::run_here() {
+        return;
+    }
+    // No-row pre-existing owners are not adopted by direct switches.
+    for recorded_a in [true, false] {
+        account_return_history_row(recorded_a);
+    }
+}
+
+fn account_return_history_row(recorded_a: bool) {
+    use crate::snapshots::sampled_scan::transition_fixture::{observe_consumed, with_scan_clock};
+    use serde_json::{json, Value};
+    use std::time::UNIX_EPOCH;
     const CX: &str = "0199f7a0-0000-7000-8000-00000000c0de";
     const OLD: &str = "1338a80a-f36e-4cbc-a5bb-50fc66430ba6";
     let post_cutover = OffsetDateTime::parse("2026-11-16T08:00:00Z", &Rfc3339)
@@ -296,7 +827,7 @@ fn account_return_today_reinterprets_orphaned_history() {
         SnapshotSource::Pi,
     ];
     let (device_a, secret_a) =
-        crate::control::account_return_claim_for_test("owner-a", "org-a", "return-a");
+        crate::control::account_return_claim_for_test("owner-a", "org-a", "return-a", recorded_a);
     let namespace_a = snapshot_upload_destination_namespace(&device_a, &secret_a);
     let index_path = |namespace: &str, source| {
         snapshot_v3_index_path(&snapshot_destination_scoped_index_path(
@@ -326,6 +857,7 @@ fn account_return_today_reinterprets_orphaned_history() {
     .unwrap();
     crate::snapshots::older_build_logs_priority("return-turn");
     let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
+    let daemon_owner = test_daemon("machine_test");
     // Existing prepare/finish scaffold, now table-driven across the three sources.
     let mut cycle = |device: &LocalDeviceBinding, secret: &str, source: SnapshotSource| {
         cadence.next_due_cycle();
@@ -355,7 +887,9 @@ fn account_return_today_reinterprets_orphaned_history() {
             setup_snapshot_index: None,
         };
         let client = SnapshotApiClient::new(server.url.clone());
-        let daemon = test_daemon("machine_test");
+        let daemon = daemon_owner
+            .clone()
+            .with_account(ottto_core::FileAccountStore::default().load().unwrap());
         let mut transport = crate::net_resilience::TransportCycleOutcome::default();
         with_scan_clock(now, || {
             observe_consumed(|| {
@@ -421,7 +955,7 @@ fn account_return_today_reinterprets_orphaned_history() {
             })
         })
     };
-    let before = sources.map(|source| {
+    let mut before = sources.map(|source| {
         let (bodies, bytes) = cycle(&device_a, &secret_a, source);
         assert!(bytes > 0);
         assert_eq!(
@@ -446,7 +980,8 @@ fn account_return_today_reinterprets_orphaned_history() {
     let entry = &saved.files[&codex.to_string_lossy().into_owned()];
     assert!(!entry.codex_counting_v2, "Legacy ACK keeps the UI counter");
     assert!(!serde_json::to_value(entry).unwrap()["codex_applied_tier_receipt"].is_null());
-    let orphan = std::fs::read(&cx_path).unwrap();
+    let original_store = std::fs::read(&cx_path).unwrap();
+    let tier = serde_json::to_value(entry).unwrap()["codex_applied_tier_receipt"].clone();
     crate::snapshots::older_build_logs_expired();
     std::fs::File::options()
         .write(true)
@@ -454,6 +989,27 @@ fn account_return_today_reinterprets_orphaned_history() {
         .unwrap()
         .set_modified(UNIX_EPOCH + Duration::from_secs(now - 61 * 86400))
         .unwrap();
+    if recorded_a {
+        // Settle the real timestamp edit before measuring an unchanged return.
+        let (touched, _) = cycle(&device_a, &secret_a, SnapshotSource::ClaudeCode);
+        for body in touched {
+            assert_eq!(body["source_session_id"], OLD);
+            let prior = before[0]
+                .iter_mut()
+                .find(|prior| prior["source_session_id"] == OLD)
+                .unwrap();
+            for field in crate::snapshots::sampled_scan::transition_fixture::money_oracle::FIELDS {
+                assert_eq!(
+                    body[*field], prior[*field],
+                    "metadata touch conserves {field}"
+                );
+            }
+            *prior = body;
+        }
+        let (bodies, bytes) = cycle(&device_a, &secret_a, SnapshotSource::ClaudeCode);
+        assert!(bodies.is_empty());
+        assert_eq!(bytes, 0);
+    }
     std::fs::remove_dir_all(&repository).unwrap();
     let mut returned = Vec::new();
     let mut previous_namespace = namespace_a.clone();
@@ -461,22 +1017,38 @@ fn account_return_today_reinterprets_orphaned_history() {
         ("owner-b", "org-b", "return-b"),
         ("owner-a", "org-a", "return-a-again"),
     ] {
-        let (device, secret) = crate::control::account_return_claim_for_test(user, org, id);
+        let (device, secret) =
+            crate::control::account_return_claim_for_test(user, org, id, recorded_a);
         let namespace = snapshot_upload_destination_namespace(&device, &secret);
-        // CHANGED-ON-RETURN: only the prior owner is considered; durable re-attach decision pending.
-        assert_ne!(namespace, namespace_a);
+        let reattached = recorded_a && user == "owner-a";
+        assert_eq!(namespace == namespace_a, reattached);
         assert_ne!(namespace, previous_namespace);
         previous_namespace = namespace.clone();
         assert!(sources
             .iter()
-            .all(|&source| !index_path(&namespace, source).exists()));
+            .all(|&source| index_path(&namespace, source).exists() == reattached));
         returned = sources
             .map(|source| cycle(&device, &secret, source).0)
             .to_vec();
-        assert!(
-            returned.iter().all(|bodies| bodies.len() == 1),
-            "only existing recent session keys return"
-        );
+        if reattached {
+            assert!(
+                returned.iter().all(|bodies| bodies.is_empty()),
+                "no accepted history or saved Git binding is replaced on return"
+            );
+            let saved =
+                ScanIndex::load(&index_path(&namespace, SnapshotSource::ClaudeCode)).unwrap();
+            assert!(
+                saved
+                    .files
+                    .contains_key(&old.to_string_lossy().into_owned()),
+                "old accepted Claude coverage survives"
+            );
+        } else {
+            assert!(
+                returned.iter().all(|bodies| bodies.len() == 1),
+                "a fresh destination keeps only existing recent session keys"
+            );
+        }
         for source in sources {
             let (bodies, bytes) = cycle(&device, &secret, source);
             assert!(
@@ -486,16 +1058,22 @@ fn account_return_today_reinterprets_orphaned_history() {
             assert_eq!(bytes, 0, "quiet destination reads no transcript");
         }
         let returned_cx = ScanIndex::load(&index_path(&namespace, SnapshotSource::Codex)).unwrap();
-        assert!(
-            returned_cx.files[&codex.to_string_lossy().into_owned()].codex_counting_v2,
-            "empty destination selects V2"
+        let entry = &returned_cx.files[&codex.to_string_lossy().into_owned()];
+        assert_eq!(entry.codex_counting_v2, !reattached);
+        if reattached {
+            assert_eq!(
+                serde_json::to_value(entry).unwrap()["codex_applied_tier_receipt"],
+                tier
+            );
+        }
+    }
+    if !recorded_a {
+        assert_eq!(
+            std::fs::read(&cx_path).unwrap(),
+            original_store,
+            "no-row pre-existing stores remain orphaned rather than being adopted"
         );
     }
-    assert_eq!(
-        std::fs::read(&cx_path).unwrap(),
-        orphan,
-        "A's original store remains orphaned"
-    );
     let counts = |body: &Value| {
         [
             "input_tokens",
@@ -515,26 +1093,19 @@ fn account_return_today_reinterprets_orphaned_history() {
             }
         })
     };
-    // Each row names its current outcome; subsequent owner re-attach changes flip these deliberately.
-    for (source, session, outcome, expected) in [
-        // CHANGED-ON-RETURN: Legacy ACK and priority receipt are orphaned; durable re-attach decision pending.
+    for (source, session, expected) in [
         (
             1,
             CX,
-            "CHANGED-ON-RETURN",
-            Some([1000, 100, 0, 0, 0, 0, 0, 1]),
+            Some(if recorded_a {
+                [2000, 200, 0, 0, 0, 0, 0, 1]
+            } else {
+                [1000, 100, 0, 0, 0, 0, 0, 1]
+            }),
         ),
-        // CHANGED-ON-RETURN: the first-read mtime gate loses correction coverage; durable re-attach decision pending.
-        (0, OLD, "CHANGED-ON-RETURN", None),
-        // CHANGED-ON-RETURN: the saved Git pin is orphaned; durable re-attach decision pending.
-        (
-            0,
-            IDENTITY_PIPELINE_ROOT,
-            "CHANGED-ON-RETURN",
-            Some([30, 3, 0, 0, 0, 0, 0, 1]),
-        ),
-        // PRESERVED: Pi's reported counters and costs reconstruct from native bytes.
-        (2, "return-pi", "PRESERVED", Some([12, 4, 0, 0, 0, 0, 0, 1])),
+        (0, OLD, recorded_a.then_some([30, 3, 0, 0, 0, 0, 0, 1])),
+        (0, IDENTITY_PIPELINE_ROOT, Some([30, 3, 0, 0, 0, 0, 0, 1])),
+        (2, "return-pi", Some([12, 4, 0, 0, 0, 0, 0, 1])),
     ] {
         let prior = before[source]
             .iter()
@@ -544,8 +1115,19 @@ fn account_return_today_reinterprets_orphaned_history() {
             .iter()
             .find(|b| b["source_session_id"] == session);
         if let Some(expected) = expected {
-            let after = after.expect("re-read and re-offered once in fresh A destination");
-            assert_eq!(counts(after), expected, "{session}: {outcome}");
+            let after = if recorded_a {
+                assert!(after.is_none(), "unchanged accepted body is not replaced");
+                let saved = ScanIndex::load(&index_path(&namespace_a, sources[source])).unwrap();
+                assert!(saved.accepted_snapshot_fingerprint_recorded(
+                    prior["snapshot_fingerprint"].as_str().unwrap()
+                ));
+                // No replacement and the exact ACK keep this body effective.
+                // The fingerprint includes repository identity and all money fields.
+                prior
+            } else {
+                after.expect("the fresh destination offers its body")
+            };
+            assert_eq!(counts(after), expected, "{session}: recorded={recorded_a}");
             assert_eq!(
                 after["session_account_evidence"], prior["session_account_evidence"],
                 "starting account binding"
@@ -570,9 +1152,9 @@ fn account_return_today_reinterprets_orphaned_history() {
                     prior["model_usage"][0]["selector_context"]["service_tier"],
                     "priority"
                 );
-                assert_ne!(
-                    after["model_usage"][0]["selector_context"]["service_tier"],
-                    "priority"
+                assert_eq!(
+                    after["model_usage"][0]["selector_context"]["service_tier"] == "priority",
+                    recorded_a
                 );
             } else {
                 assert_eq!(counts(prior), expected);
@@ -588,7 +1170,7 @@ fn account_return_today_reinterprets_orphaned_history() {
                     assert_eq!(after["cost"]["total_cost_usd"], "0.001");
                 }
             }
-            if source == 0 {
+            if source == 0 && !recorded_a {
                 assert!(prior["repository_hash"].is_string());
                 assert!(
                     after["repository_hash"].is_null(),
@@ -596,6 +1178,12 @@ fn account_return_today_reinterprets_orphaned_history() {
                 );
                 assert_eq!(after["workspace_kind"], "unknown");
             } else {
+                if source == 0 {
+                    assert!(
+                        after["repository_hash"].is_string(),
+                        "the accepted Git pin survives"
+                    );
+                }
                 assert_eq!(after["repository_hash"], prior["repository_hash"]);
                 assert_eq!(after["workspace_kind"], prior["workspace_kind"]);
             }
@@ -606,6 +1194,6 @@ fn account_return_today_reinterprets_orphaned_history() {
             );
             assert_eq!(counts(prior), [30, 3, 0, 0, 0, 0, 0, 1]);
         }
-        eprintln!("ACCOUNT_RETURN_ROW {session} {outcome}");
+        eprintln!("ACCOUNT_RETURN_ROW {session} recorded={recorded_a}");
     }
 }
