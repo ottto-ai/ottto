@@ -1924,7 +1924,35 @@ fn skipped_ids(item: &SnapshotItem) -> impl Iterator<Item = &String> + '_ {
 pub(crate) fn decide_page_copies(
     items: &mut [SnapshotItem],
     index: &ScanIndex,
+    accepted: Option<&AcceptedBuckets>,
+) -> CopyRemovalUpdates {
+    let content_held = page_content_holds(items, index);
+    decide_page_copies_planned(items, index, accepted, &content_held)
+}
+
+/// Sessions the page withholds for an absent content twin, decided once over
+/// the whole acquisition page: copy decisions and every evidence chunk's
+/// finish share it, so a twin read in another chunk is present.
+pub(crate) fn page_content_holds(items: &[SnapshotItem], index: &ScanIndex) -> BTreeSet<String> {
+    let mut sessions = BTreeMap::<&str, Vec<LocationKey>>::new();
+    for item in items {
+        if let Some(fold) = item.claude_money.as_deref() {
+            let here = sessions.entry(item.source_session_id.as_str()).or_default();
+            here.extend(fold.location.map(|located| located.0));
+        }
+    }
+    let sessions = sessions
+        .iter()
+        .map(|(s, l)| (*s, l.as_slice()))
+        .collect::<Vec<_>>();
+    content_twin_holds(&sessions, items, index)
+}
+
+pub(crate) fn decide_page_copies_planned(
+    items: &mut [SnapshotItem],
+    index: &ScanIndex,
     _accepted: Option<&AcceptedBuckets>,
+    content_held: &BTreeSet<String>,
 ) -> CopyRemovalUpdates {
     let _spent = PageSpent::start("page.copies");
     let mut holders = Vec::new();
@@ -1966,23 +1994,7 @@ pub(crate) fn decide_page_copies(
     let mut updates = if holders.is_empty() {
         CopyRemovalUpdates::default()
     } else {
-        // finish_page's content-twin hold, known before any copy relies on
-        // a held holder's page body.
-        let late_held = {
-            let mut sessions = BTreeMap::<&str, Vec<LocationKey>>::new();
-            for item in items.iter() {
-                if let Some(fold) = item.claude_money.as_deref() {
-                    let here = sessions.entry(item.source_session_id.as_str()).or_default();
-                    here.extend(fold.location.map(|located| located.0));
-                }
-            }
-            let sessions = sessions
-                .iter()
-                .map(|(s, l)| (*s, l.as_slice()))
-                .collect::<Vec<_>>();
-            content_twin_holds(&sessions, items, index)
-        };
-        decide_holders(items, &holders, index, &late_held)
+        decide_holders(items, &holders, index, content_held)
     };
     if !resolved_holds.is_empty() {
         let state = updates
@@ -4447,6 +4459,27 @@ pub(crate) fn finish_page(
     hold_reasons: &mut BTreeMap<&'static str, u64>,
     queued_family_deferred_paths: &BTreeSet<LocationKey>,
 ) -> BTreeSet<String> {
+    let content_held = page_content_holds(items, index);
+    finish_page_planned(
+        items,
+        index,
+        telemetry,
+        hold_reasons,
+        queued_family_deferred_paths,
+        &content_held,
+    )
+}
+
+/// `finish_page` for one evidence chunk of a page whose content-twin holds
+/// were decided once over the whole page.
+pub(crate) fn finish_page_planned(
+    items: &mut Vec<SnapshotItem>,
+    index: &ScanIndex,
+    telemetry: TelemetryRead,
+    hold_reasons: &mut BTreeMap<&'static str, u64>,
+    queued_family_deferred_paths: &BTreeSet<LocationKey>,
+    page_content_held: &BTreeSet<String>,
+) -> BTreeSet<String> {
     if !index.persistence_available() {
         let held: BTreeSet<_> = items.iter().map(|i| i.source_session_id.clone()).collect();
         if !held.is_empty() {
@@ -4622,7 +4655,11 @@ pub(crate) fn finish_page(
         .iter()
         .map(|(session, state)| (session.as_str(), state.locations.as_slice()))
         .collect::<Vec<_>>();
-    let content_held = content_twin_holds(&locations, items, index);
+    let content_held = locations
+        .iter()
+        .filter(|(session, _)| page_content_held.contains(*session))
+        .map(|(session, _)| (*session).to_owned())
+        .collect::<BTreeSet<_>>();
     if !content_held.is_empty() {
         *hold_reasons.entry("absent_content_twin").or_default() += content_held.len() as u64;
     }
