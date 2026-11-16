@@ -853,7 +853,9 @@ fn held_content_twin_holder_proves_no_copy_until_released() {
 
         // Release T: the complete ROOT union takes A and C replaces its prefix.
         let released = owe_claimed_growth(&prior, &c.base, &twin, false);
-        let mut all = released.clone();
+        // The reference reads T through its own store, so it cannot spend the
+        // released growth claim the measured pages need.
+        let mut all = owe_claimed_growth(&prior, &c.base.join("native-reference"), &twin, false);
         owe(&mut all);
         let full = ready(&c, &E2ScanFixture::default(), all, 100, false);
         let reference = sent_money(&full);
@@ -866,7 +868,12 @@ fn held_content_twin_holder_proves_no_copy_until_released() {
         prior = released;
         owe(&mut prior);
         for _ in 0..6 {
-            let mut page = c.raw(&scanner, prior.clone(), 100, true, &[]);
+            let hints = if acquired_twin {
+                &[][..]
+            } else {
+                std::slice::from_ref(&twin)
+            };
+            let mut page = c.raw(&scanner, prior.clone(), 100, true, hints);
             acquired_twin |= scanner.paths().contains(&twin);
             let quiet = !scanner.paths().contains(&main) && !scanner.paths().contains(&copy);
             page.enrich(&c);
