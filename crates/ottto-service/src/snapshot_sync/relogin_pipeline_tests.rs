@@ -200,12 +200,17 @@ fn account_return_today_reinterprets_orphaned_history() {
     if !crate::heap_layout_bound::layout_supported() || !crate::test_isolation::run_here() {
         return;
     }
-    const AT: &str = "2026-11-16T08:00:00Z";
     const CX: &str = "0199f7a0-0000-7000-8000-00000000c0de";
     const OLD: &str = "1338a80a-f36e-4cbc-a5bb-50fc66430ba6";
-    let now = OffsetDateTime::parse(AT, &Rfc3339)
+    let post_cutover = OffsetDateTime::parse("2026-11-16T08:00:00Z", &Rfc3339)
         .unwrap()
         .unix_timestamp() as u64;
+    // Freeze the cadence's clock once; later real collection dates stay recent.
+    let now = crate::scan_clock::utc_seconds().max(post_cutover);
+    let at = OffsetDateTime::from_unix_timestamp(now.try_into().unwrap())
+        .unwrap()
+        .format(&Rfc3339)
+        .unwrap();
     forget_carried_namespaces_for_test(&["return-a", "return-b", "return-a-again"]);
     let fixture = IdentityPipelineHome::new();
     let cadence = IdentityPipelineCadence::new();
@@ -247,7 +252,7 @@ fn account_return_today_reinterprets_orphaned_history() {
     };
     let claude_rows = |session: &str| {
         vec![
-            json!({"type":"assistant","timestamp":AT,"sessionId":session,"cwd":repository,
+            json!({"type":"assistant","timestamp":at,"sessionId":session,"cwd":repository,
             "requestId":format!("{session}-request"),"message":{"id":format!("{session}-response"),
                 "model":"claude-haiku-4-5","usage":{"input_tokens":30,"output_tokens":3}}}),
         ]
@@ -266,23 +271,23 @@ fn account_return_today_reinterprets_orphaned_history() {
     write(
         &codex,
         vec![
-            json!({"type":"session_meta","timestamp":AT,"payload":{"id":CX,"timestamp":AT,"source":"cli"}}),
-            json!({"type":"event_msg","timestamp":AT,"payload":{"type":"task_started","turn_id":"return-turn"}}),
-            json!({"type":"turn_context","timestamp":AT,"payload":{"turn_id":"return-turn","model":"gpt-5.2"}}),
-            json!({"type":"token_usage_record","timestamp":AT,"payload":{"thread_id":CX,"turn_id":"return-turn",
+            json!({"type":"session_meta","timestamp":at,"payload":{"id":CX,"timestamp":at,"source":"cli"}}),
+            json!({"type":"event_msg","timestamp":at,"payload":{"type":"task_started","turn_id":"return-turn"}}),
+            json!({"type":"turn_context","timestamp":at,"payload":{"turn_id":"return-turn","model":"gpt-5.2"}}),
+            json!({"type":"token_usage_record","timestamp":at,"payload":{"thread_id":CX,"turn_id":"return-turn",
             "response_id":"return-response","usage":usage(1000,100),"thread_token_usage":usage(1000,100)}}),
-            json!({"type":"event_msg","timestamp":AT,"payload":{"type":"token_count","info":{
+            json!({"type":"event_msg","timestamp":at,"payload":{"type":"token_count","info":{
             "last_token_usage":usage(2000,200),"total_token_usage":usage(2000,200)}}}),
-            json!({"type":"event_msg","timestamp":AT,"payload":{"type":"task_complete","turn_id":"return-turn"}}),
+            json!({"type":"event_msg","timestamp":at,"payload":{"type":"task_complete","turn_id":"return-turn"}}),
         ],
     );
     let pi = fixture.home.join(".pi/agent/sessions/return-pi.jsonl");
     write(
         &pi,
         vec![
-            json!({"type":"session","id":"return-pi","timestamp":AT}),
+            json!({"type":"session","id":"return-pi","timestamp":at}),
             json!({"type":"message","message":{"role":"assistant","model":"gpt-5.4","provider":"openai",
-            "timestamp":AT,"responseId":"pi-response","usage":{"input":12,"output":4,"cost":{"total":0.001}}}}),
+            "timestamp":at,"responseId":"pi-response","usage":{"input":12,"output":4,"cost":{"total":0.001}}}}),
         ],
     );
     let sources = [
@@ -334,7 +339,7 @@ fn account_return_today_reinterprets_orphaned_history() {
         crate::backfill::update_backfill_state(&support, |state| {
             state
                 .first_census_ends
-                .insert(format!("{namespace}:{}", source.api_slug()), AT.into());
+                .insert(format!("{namespace}:{}", source.api_slug()), at.clone());
         })
         .unwrap();
         let collection = || AgentStatusCollection {
