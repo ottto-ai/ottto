@@ -9770,6 +9770,9 @@ struct ClaudeEvidencePage<'p> {
     stats: ClaudeLocalEvidenceStats,
     /// Roots already counted: a scope root two chunks read counts once.
     counted_roots: BTreeSet<String>,
+    /// Sessions withheld for an absent content twin, decided once over the
+    /// whole page; every chunk's finish uses it.
+    content_held: BTreeSet<String>,
     side_call_discovery: crate::snapshots::claude_request_money::e2::SideCallDiscovery,
 }
 
@@ -9813,6 +9816,10 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
             ..Default::default()
         },
         counted_roots: BTreeSet::new(),
+        content_held: crate::snapshots::claude_request_money::e2::page_content_holds(
+            &scan_result.snapshots,
+            index,
+        ),
         side_call_discovery: crate::snapshots::claude_request_money::e2::SideCallDiscovery::new(
             scan_result
                 .completed_parses()
@@ -10361,7 +10368,7 @@ fn apply_claude_local_evidence_chunk(
     // the account hash then tag the rows that upload.
     // Gate off this only counts, so the page is unchanged.
     // Withheld entities stay on the page and owed: delayed, never settled.
-    let mut withheld = crate::snapshots::claude_request_money::e2::finish_page(
+    let mut withheld = crate::snapshots::claude_request_money::e2::finish_page_planned(
         &mut scan_result.snapshots,
         index,
         if telemetry_read_failed {
@@ -10371,6 +10378,7 @@ fn apply_claude_local_evidence_chunk(
         },
         &mut disposition.request_owned_hold_reasons,
         &scan_result.claude_queued_family_deferred_paths,
+        &page.content_held,
     );
     if !trace_discard_unfolded.is_empty() {
         *disposition
