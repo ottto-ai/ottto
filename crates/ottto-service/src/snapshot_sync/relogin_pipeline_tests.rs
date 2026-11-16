@@ -316,6 +316,20 @@ fn owner_return_preserves_all_source_carry() {
         };
         let cx_path = index_path(&namespace_a, SnapshotSource::Codex);
         let mut legacy = ScanIndex::default();
+        // Model a completed current-release bootstrap, including its replay
+        // generation in both durable stores. Dropping only the completion map
+        // must not also simulate losing the independently saved generation.
+        let generation = cycle_replay_generation(SnapshotSource::Codex, &namespace_a);
+        legacy.prepare_historical_replay(generation.clone());
+        let progress_path = snapshot_upload_progress_path(&cx_path);
+        let mut progress = SnapshotUploadProgress::load(
+            &progress_path,
+            &namespace_a,
+            snapshot_quarantine_witness(SnapshotSource::Codex),
+        )
+        .unwrap();
+        progress.prepare_historical_replay(&generation);
+        progress.save(&progress_path).unwrap();
         legacy.files.insert(
             codex.to_string_lossy().into_owned(),
             serde_json::from_value(json!({
@@ -464,6 +478,19 @@ fn owner_return_preserves_all_source_carry() {
         let saved = ScanIndex::load(&cx_path).unwrap();
         let entry = &saved.files[&codex.to_string_lossy().into_owned()];
         assert!(!entry.codex_counting_v2, "Legacy ACK keeps the UI counter");
+        assert!(saved.historical_replay_generation_matches(&generation));
+        assert_eq!(
+            SnapshotUploadProgress::load(
+                &progress_path,
+                &namespace_a,
+                snapshot_quarantine_witness(SnapshotSource::Codex),
+            )
+            .unwrap()
+            .historical_replay_generation
+            .as_deref(),
+            Some(generation.as_str()),
+            "the accepted baseline really completed the current replay"
+        );
         assert!(!serde_json::to_value(entry).unwrap()["codex_applied_tier_receipt"].is_null());
         let tier = serde_json::to_value(entry).unwrap()["codex_applied_tier_receipt"].clone();
         crate::snapshots::older_build_logs_expired();
