@@ -719,6 +719,9 @@ pub struct SourceHealth {
     pub config: SourceConfigState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collector: Option<LocalCollectorHealth>,
+    /// This run's local scan health. Absent means unknown, never healthy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collection: Option<SourceCollectionHealth>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_status: Option<AgentStatusSnapshot>,
     #[serde(default)]
@@ -768,6 +771,29 @@ pub struct SourceHealth {
     /// absent only from daemons that predate per-source pause.
     #[serde(default)]
     pub source_paused: bool,
+}
+
+/// RAM-only local collection observation; independent of upload settlement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceCollectionHealth {
+    pub state: SourceCollectionState,
+    /// Last completed scan observed by this daemon run, including empty scans.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_scan_at: Option<Rfc3339Timestamp>,
+    /// Present only for server_backoff; wall time projected from its awake deadline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<Rfc3339Timestamp>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceCollectionState {
+    Collecting,
+    Stalled,
+    ServerBackoff,
+    Offline,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -7620,6 +7646,51 @@ mod tests {
         let decoded = serde_json::from_value::<MachineIdentity>(value).expect("decode identity");
         assert_eq!(decoded, identity);
         assert_eq!(decoded.account_scope.as_deref(), Some(scope));
+    }
+
+    #[test]
+    fn source_collection_is_additive_and_round_trips() {
+        let base: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/source-health/codex-needs-repair.json"
+        ))
+        .unwrap();
+        // Shared with consumers: each named case contains SourceHealth fields.
+        let cases: BTreeMap<String, serde_json::Value> = serde_json::from_str(include_str!(
+            "../../../fixtures/source-health/collection.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            cases.keys().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "absent",
+                "collecting",
+                "offline",
+                "server_backoff",
+                "stalled"
+            ]
+        );
+        for (case, fields) in cases {
+            let mut value = base.clone();
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            let health: SourceHealth = serde_json::from_value(value).unwrap();
+            let encoded = serde_json::to_value(&health).unwrap();
+            assert_eq!(
+                encoded.get("collection"),
+                fields.get("collection"),
+                "{case}"
+            );
+            assert_eq!(
+                serde_json::from_value::<SourceHealth>(encoded).unwrap(),
+                health,
+                "{case}"
+            );
+        }
+        let unknown: SourceCollectionHealth =
+            serde_json::from_value(serde_json::json!({"state": "future"})).unwrap();
+        assert_eq!(unknown.state, SourceCollectionState::Unknown);
     }
 
     #[test]

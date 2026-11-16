@@ -836,13 +836,13 @@ fn e2_progress() -> SnapshotUploadProgress {
         snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
     )
 }
-fn request(items: &[SnapshotItem]) -> SnapshotBatchRequest {
-    request_under(SnapshotUploadPolicy::default(), items)
+fn request(items: &[impl std::borrow::Borrow<SnapshotItem>]) -> SnapshotBatchRequest<&SnapshotItem> {
+    request_under(SnapshotUploadPolicy::default(), &items.iter().map(std::borrow::Borrow::borrow).collect::<Vec<_>>())
 }
-fn request_under(
+fn request_under<'a>(
     upload_policy: SnapshotUploadPolicy,
-    items: &[SnapshotItem],
-) -> SnapshotBatchRequest {
+    items: &[&'a SnapshotItem],
+) -> SnapshotBatchRequest<&'a SnapshotItem> {
     SnapshotBatchRequest {
         schema_version: SNAPSHOT_SCHEMA_VERSION,
         source: SnapshotSource::ClaudeCode.api_slug().into(),
@@ -856,7 +856,7 @@ fn request_under(
 fn upload(
     items: &[SnapshotItem],
     progress: &mut SnapshotUploadProgress,
-    respond: impl FnMut(&[SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
+    respond: impl FnMut(&[&SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
 ) -> (
     Result<ResumableUploadResult>,
     Vec<Vec<u8>>,
@@ -868,7 +868,7 @@ fn upload_under(
     upload_policy: SnapshotUploadPolicy,
     items: &[SnapshotItem],
     progress: &mut SnapshotUploadProgress,
-    respond: impl FnMut(&[SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
+    respond: impl FnMut(&[&SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
 ) -> (
     Result<ResumableUploadResult>,
     Vec<Vec<u8>>,
@@ -887,7 +887,7 @@ pub(in crate::snapshot_sync) fn upload_source_under(
     upload_policy: SnapshotUploadPolicy,
     items: &[SnapshotItem],
     progress: &mut SnapshotUploadProgress,
-    respond: impl FnMut(&[SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
+    respond: impl FnMut(&[&SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
 ) -> (
     Result<ResumableUploadResult>,
     Vec<Vec<u8>>,
@@ -902,7 +902,7 @@ pub(in crate::snapshot_sync) fn upload_source_persisting(
     upload_policy: SnapshotUploadPolicy,
     items: &[SnapshotItem],
     progress: &mut SnapshotUploadProgress,
-    mut respond: impl FnMut(&[SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
+    mut respond: impl FnMut(&[&SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
     persist: impl FnMut(&mut SnapshotUploadProgress) -> Result<()>,
 ) -> (
     Result<ResumableUploadResult>,
@@ -926,14 +926,13 @@ pub(in crate::snapshot_sync) fn upload_source_persisting(
         crate::snapshots::claude_request_money::request_owned_family_root,
         &mut InplaceRetryBudget::default(),
         |batch| {
-            let mut wire = request_under(upload_policy, &batch);
+            let mut wire = request_under(upload_policy, batch);
             wire.source = source.api_slug().into();
             validate_snapshot_batch_request(&wire)
                 .expect("scan-generated fixture passes real wire preflight");
             sent.push(canonical(&wire));
             order.push(batch.iter().map(|s| s.source_session_id.clone()).collect());
-            let owned = batch.iter().map(|s| (*s).clone()).collect::<Vec<_>>();
-            let response = respond(&owned)?;
+            let response = respond(batch)?;
             response.validate_entity_ack(&wire)?;
             Ok(response)
         },
@@ -942,7 +941,7 @@ pub(in crate::snapshot_sync) fn upload_source_persisting(
     (result, sent, order)
 }
 pub(in crate::snapshot_sync) fn ack(
-    batch: &[SnapshotItem],
+    batch: &[&SnapshotItem],
 ) -> Result<crate::snapshot_client::SnapshotBatchResponse> {
     let mut response = accepted_batch(0);
     response.entity_ack_contract = Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
@@ -950,7 +949,7 @@ pub(in crate::snapshot_sync) fn ack(
     // head or a telemetry-only body, `validate_entity_ack`): every accepted
     // entity gets a head, including telemetry-only bodies without cache
     // evidence.
-    let head_cas = batch.iter().any(crate::snapshot_client::declares_head_cas);
+    let head_cas = batch.iter().any(|item| crate::snapshot_client::declares_head_cas(item));
     for item in batch {
         let mut reference = entity_ack_ref(&item.snapshot_fingerprint);
         reference.source_session_id = item.source_session_id.clone();

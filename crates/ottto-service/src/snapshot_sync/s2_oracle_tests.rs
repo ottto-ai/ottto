@@ -297,7 +297,7 @@ fn an_identity_deferred_retry_refolds_to_the_cold_full_body() {
             .clone();
         // The server sheds the root for its identity; its siblings ACK.
         let shed =
-            |batch: &[SnapshotItem]| -> Result<crate::snapshot_client::SnapshotBatchResponse> {
+            |batch: &[&SnapshotItem]| -> Result<crate::snapshot_client::SnapshotBatchResponse> {
                 match batch
                     .iter()
                     .position(|item| item.snapshot_fingerprint == refused)

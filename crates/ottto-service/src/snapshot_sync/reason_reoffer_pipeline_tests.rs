@@ -1371,7 +1371,7 @@ fn reoffer_fast_503_resend_keeps_one_claim_until_validated_final_answer() {
             |_| None,
             &mut budget,
             |items| {
-                assert_eq!(items, vec![fingerprint.clone()]);
+                assert_eq!(items, &[&fingerprint]);
                 let disk = saved.borrow();
                 let state = &disk["permanent_rejections"][&fingerprint]["reoffer"];
                 assert_eq!(state["reason"], "legacy_other_reclassification");

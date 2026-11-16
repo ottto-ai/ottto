@@ -111,7 +111,7 @@ impl AckFixture {
         &self,
         progress: &mut SnapshotUploadProgress,
         items: &[SnapshotItem],
-        upload: impl FnMut(Vec<SnapshotItem>) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
+        upload: impl FnMut(&[&SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
     ) -> Result<ResumableUploadResult> {
         upload_resumable_batches_with_body_witness(
             items,
@@ -127,14 +127,14 @@ impl AckFixture {
 }
 
 pub(super) fn exact_ack(
-    items: Vec<SnapshotItem>,
+    items: &[&SnapshotItem],
 ) -> Result<crate::snapshot_client::SnapshotBatchResponse> {
     let request = SnapshotBatchRequest {
         schema_version: SNAPSHOT_SCHEMA_VERSION,
         source: "claude_code".into(),
         machine_id: "a".repeat(64),
         collector_version: Some(collector_version()),
-        snapshots: items,
+        snapshots: items.to_vec(),
         upload_policy: SnapshotUploadPolicy::default(),
         client_report: crate::client_report::ClientReport::empty(),
     };
@@ -2208,7 +2208,7 @@ fn published_v2_partial_checkpoint_reuses_progress_owner_through_atomic_save() {
             let upload = |items: &[SnapshotItem],
                           progress: &mut SnapshotUploadProgress,
                           response: &mut dyn FnMut(
-                Vec<SnapshotItem>,
+                &[&SnapshotItem],
             ) -> Result<
                 crate::snapshot_client::SnapshotBatchResponse,
             >| {

@@ -430,7 +430,7 @@ fn cas_takeover(page: &Page, p: &mut Progress, mode: Mode) -> RouteResult {
             |_| 0,
             |_| true,
             |request, _| {
-                offered = request.snapshots.clone();
+                offered = request.items().cloned().collect();
                 assert_eq!(offered.len(), 1);
                 Ok(if accepted {
                     cas::accepted(&offered[0], &"2".repeat(64))

@@ -8,6 +8,7 @@ use content_hash::snapshot_semantic_envelope;
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -95,12 +96,12 @@ impl SnapshotSource {
 }
 
 #[derive(Debug, Clone)]
-pub struct SnapshotBatchRequest {
+pub struct SnapshotBatchRequest<T = SnapshotItem> {
     pub schema_version: u16,
     pub source: String,
     pub machine_id: String,
     pub collector_version: Option<String>,
-    pub snapshots: Vec<SnapshotItem>,
+    pub snapshots: Vec<T>,
     pub upload_policy: SnapshotUploadPolicy,
     /// Daemon-side loss accounting since the last acknowledged batch. Always
     /// present, including its zeros: an absent counter cannot distinguish "no
@@ -219,13 +220,17 @@ const TELEMETRY_ONLY_FIELDS: &[&str] = &[
 /// uses the same write endpoint and entity ACKs as every upload; this wrapper
 /// only activates the backend's existing CAS discipline for an isolated legacy
 /// page.
-pub(crate) struct SnapshotBatchWireRequest<'a> {
-    request: &'a SnapshotBatchRequest,
+pub(crate) struct SnapshotBatchWireRequest<'a, T> {
+    request: &'a SnapshotBatchRequest<T>,
     enforce_head_cas: bool,
 }
 
-impl SnapshotBatchRequest {
-    pub(crate) fn wire_with_head_cas(&self) -> SnapshotBatchWireRequest<'_> {
+impl<T: Borrow<SnapshotItem>> SnapshotBatchRequest<T> {
+    pub(crate) fn items(&self) -> impl Iterator<Item = &SnapshotItem> {
+        self.snapshots.iter().map(Borrow::borrow)
+    }
+
+    pub(crate) fn wire_with_head_cas(&self) -> SnapshotBatchWireRequest<'_, T> {
         SnapshotBatchWireRequest {
             request: self,
             enforce_head_cas: true,
@@ -235,24 +240,24 @@ impl SnapshotBatchRequest {
 
 /// The batch declares `usage_decrease_hold_ack:v1`: a Claude batch carrying
 /// at least one request-owned literal body.
-pub(crate) fn declares_usage_decrease_hold_ack(request: &SnapshotBatchRequest) -> bool {
+pub(crate) fn declares_usage_decrease_hold_ack(
+    request: &SnapshotBatchRequest<impl Borrow<SnapshotItem>>,
+) -> bool {
     snapshot_source_from_api_slug(&request.source) == Some(SnapshotSource::ClaudeCode)
         && request
-            .snapshots
-            .iter()
+            .items()
             .any(claude_history_upgrade::is_request_owned_literal)
 }
 
 fn serialize_snapshot_batch<S: Serializer>(
-    request: &SnapshotBatchRequest,
+    request: &SnapshotBatchRequest<impl Borrow<SnapshotItem>>,
     enforce_head_cas: bool,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
     let source = snapshot_source_from_api_slug(&request.source)
         .ok_or_else(|| serde::ser::Error::custom("unsupported snapshot source"))?;
     let snapshots = request
-        .snapshots
-        .iter()
+        .items()
         .map(|snapshot| {
             let semantic_envelope =
                 snapshot_semantic_envelope(source, snapshot, request.upload_policy);
@@ -291,8 +296,7 @@ fn serialize_snapshot_batch<S: Serializer>(
     }
     // Only cache-bearing batches opt in; every other batch keeps its bytes.
     if request
-        .snapshots
-        .iter()
+        .items()
         .any(|item| item.cache_observations.is_some())
     {
         state.serialize_field("cache_state_ack_contract", CACHE_STATE_ACK_CONTRACT)?;
@@ -302,19 +306,17 @@ fn serialize_snapshot_batch<S: Serializer>(
     state.end()
 }
 
-impl Serialize for SnapshotBatchRequest {
+impl<T: Borrow<SnapshotItem>> Serialize for SnapshotBatchRequest<T> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serialize_snapshot_batch(
             self,
-            self.snapshots
-                .iter()
-                .any(crate::snapshot_client::declares_head_cas),
+            self.items().any(crate::snapshot_client::declares_head_cas),
             serializer,
         )
     }
 }
 
-impl Serialize for SnapshotBatchWireRequest<'_> {
+impl<T: Borrow<SnapshotItem>> Serialize for SnapshotBatchWireRequest<'_, T> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serialize_snapshot_batch(self.request, self.enforce_head_cas, serializer)
     }

@@ -34,13 +34,16 @@ fn progress_with_stale_head(item: &SnapshotItem) -> SnapshotUploadProgress {
     progress
 }
 
-pub(super) fn request(items: Vec<SnapshotItem>) -> SnapshotBatchRequest {
+pub(super) fn request<T: std::borrow::Borrow<SnapshotItem>>(
+    items: Vec<T>,
+) -> SnapshotBatchRequest<T> {
     SnapshotBatchRequest {
         schema_version: SNAPSHOT_SCHEMA_VERSION,
-        source: if items
-            .iter()
-            .all(crate::snapshots::claude_request_money::is_request_owned_literal)
-        {
+        source: if items.iter().all(|item| {
+            crate::snapshots::claude_request_money::is_request_owned_literal(
+                std::borrow::Borrow::borrow(item),
+            )
+        }) {
             SnapshotSource::ClaudeCode.api_slug()
         } else {
             SnapshotSource::Codex.api_slug()
@@ -123,7 +126,7 @@ fn cycle(
         now,
         |_| 0,
         |_| true,
-        |request, _| Ok(server(&request.snapshots[0])),
+        |request, _| Ok(server(request.snapshots[0])),
     );
     (result, wires.pop().unwrap_or(Value::Null))
 }
@@ -142,8 +145,8 @@ pub(super) fn cycle_with_transport(
     items: &[SnapshotItem],
     now: u64,
     class: impl Fn(&SnapshotItem) -> u8,
-    enforce: impl Fn(&[SnapshotItem]) -> bool,
-    server: impl FnMut(&SnapshotBatchRequest, &Value) -> Result<SnapshotBatchResponse>,
+    enforce: impl Fn(&[&SnapshotItem]) -> bool,
+    server: impl FnMut(&SnapshotBatchRequest<&SnapshotItem>, &Value) -> Result<SnapshotBatchResponse>,
 ) -> (Result<ResumableUploadResult>, Vec<Value>) {
     for item in items {
         progress
@@ -162,8 +165,11 @@ fn selected_page(
     items: &[SnapshotItem],
     now: u64,
     class: impl Fn(&SnapshotItem) -> u8,
-    enforce: impl Fn(&[SnapshotItem]) -> bool,
-    mut server: impl FnMut(&SnapshotBatchRequest, &Value) -> Result<SnapshotBatchResponse>,
+    enforce: impl Fn(&[&SnapshotItem]) -> bool,
+    mut server: impl FnMut(
+        &SnapshotBatchRequest<&SnapshotItem>,
+        &Value,
+    ) -> Result<SnapshotBatchResponse>,
     replacement: bool,
 ) -> (Result<ResumableUploadResult>, Vec<Value>) {
     let root = crate::test_scratch::ScratchDir::new("head-conflict-cycle");
@@ -195,7 +201,7 @@ fn selected_page(
         |_| None,
         &mut InplaceRetryBudget::default(),
         |batch| {
-            let request = request(batch);
+            let request = request(batch.to_vec());
             let cas = enforce(request.snapshots.as_slice());
             let wire = if cas {
                 serde_json::to_value(request.wire_with_head_cas())?
@@ -969,11 +975,11 @@ fn plain_conflict_is_probed_within_an_hour() {
         |item| item.snapshot_fingerprint.as_str(),
         snapshot_upload_body_witness,
         |batch| {
-            let request = request(batch);
+            let request = request(batch.to_vec());
             let mut response = empty_ack();
             response
                 .conflict_entities
-                .push(reference(&request.snapshots[0]));
+                .push(reference(request.snapshots[0]));
             response.validate_entity_ack(&request)?;
             Ok(response)
         },
@@ -1427,7 +1433,7 @@ fn replacing_cycle(
         now,
         |_| 0,
         |_| true,
-        |request, _| server(&request.snapshots[0]),
+        |request, _| server(request.snapshots[0]),
         true,
     );
     progress.active_quarantine_retries.clear();
@@ -1762,10 +1768,10 @@ pub(crate) fn with_stray_cache_row(state: &Value) -> Value {
 fn storing_server(
     stored: &std::cell::RefCell<Value>,
     echo: bool,
-    request: &SnapshotBatchRequest,
+    request: &SnapshotBatchRequest<impl std::borrow::Borrow<SnapshotItem>>,
     wire: &Value,
 ) -> Result<SnapshotBatchResponse> {
-    let item = &request.snapshots[0];
+    let item = request.items().next().unwrap();
     let patch = item.cache_observations.as_ref().unwrap();
     let prior = stored.borrow().clone();
     let completed = crate::snapshots::cache_state_from_patch(Some(&prior), patch).unwrap();

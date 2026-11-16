@@ -563,8 +563,13 @@ fn bounded_retry_live_ack_lost_resends_same_revision_without_second_contribution
             client.upload_batch(
                 "ordinary-retry",
                 &SnapshotBatchRequest {
-                    snapshots,
-                    ..initial.clone()
+                    schema_version: initial.schema_version,
+                    source: initial.source.clone(),
+                    machine_id: initial.machine_id.clone(),
+                    collector_version: initial.collector_version.clone(),
+                    snapshots: snapshots.to_vec(),
+                    upload_policy: initial.upload_policy,
+                    client_report: initial.client_report.clone(),
                 },
                 false,
             )
@@ -683,7 +688,7 @@ fn bounded_retry_live_wait_sends_without_scan_and_preserves_ordinary_deadline_an
             &|item: &SnapshotItem| Some(item.source_session_id.as_str()),
             &mut |items| {
                 assert_eq!(
-                    serde_json::to_value(&items).unwrap(),
+                    serde_json::to_value(items).unwrap(),
                     serde_json::to_value(&f.items).unwrap()
                 );
                 Err(anyhow::Error::new(UploadShed {

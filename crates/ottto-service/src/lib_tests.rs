@@ -1,47 +1,3 @@
-impl LocalDaemon {
-    /// Test-only variant of [`Self::with_registered_device_sources`] that injects
-    /// the local-presence probe so each state (present / not-present) is
-    /// deterministic regardless of what is installed on the machine running the
-    /// tests.
-    #[cfg(test)]
-    fn with_registered_device_sources_presence(
-        self,
-        device: Option<LocalDeviceBinding>,
-        present: impl Fn(&SourceKind) -> bool,
-    ) -> Self {
-        if let Ok(mut state) = self.inner.lock() {
-            seed_registered_sources_with_presence(&mut state, device.as_ref(), present);
-        }
-        self
-    }
-
-    #[cfg(test)]
-    pub fn reset_account_for_trusted_client(&self) -> Result<AuthResetResponse, LocalApiError> {
-        self.reset_account_for_authorized_client()
-    }
-
-    #[cfg(test)]
-    pub fn update_sources(
-        &self,
-        token: &str,
-        mut sources: Vec<SourceHealth>,
-    ) -> Result<(), LocalApiError> {
-        self.control_token.authorize(token)?;
-        let mut state = self.state()?;
-        for refreshed in &mut sources {
-            if let Some(existing) = state
-                .sources
-                .iter()
-                .find(|health| health.source == refreshed.source)
-            {
-                preserve_blocking_verification_state(refreshed, existing);
-            }
-        }
-        state.sources = sources;
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     //! Daemon integration tests for authentication and source status.
@@ -49,6 +5,58 @@ mod tests {
     //! Loaded by the crate root under the existing `tests` module.
 
     use super::*;
+    use crate::control::TerminalRefreshRejection;
+    use ottto_core::source_state_file_name;
+    use ottto_core::FileSourceStateStore;
+    use ottto_core::LocalConnectionBinding;
+    use ottto_core::LocalDeviceBinding;
+    use ottto_core::LocalSourceState;
+    use ottto_core::OTTTO_KEYCHAIN_ACCOUNT;
+    use ottto_core::OTTTO_RELAY_DEVICE_SECRET_ACCOUNT;
+    use ottto_protocol::AgentQuotaWindow;
+    use ottto_protocol::AgentQuotaWindowFreshness;
+    use ottto_protocol::AgentQuotaWindowStatus;
+    use ottto_protocol::AgentStatusSnapshot;
+    use ottto_protocol::AgentStatusState;
+    use ottto_protocol::DaemonRuntimeState;
+    use ottto_protocol::DaemonStatus;
+    use ottto_protocol::DetectedUse;
+    use ottto_protocol::DetectedUseQuotaWindowState;
+    use ottto_protocol::DiagnosticsBundle;
+    use ottto_protocol::DiagnosticsUploadAuthorization;
+    use ottto_protocol::DiagnosticsUploadStatus;
+    use ottto_protocol::HealthProblem;
+    use ottto_protocol::InstallOwner;
+    use ottto_protocol::LocalAccountBinding;
+    use ottto_protocol::LocalAccountState;
+    use ottto_protocol::LocalAccountUser;
+    use ottto_protocol::LocalDeviceState;
+    use ottto_protocol::LocalHealthAccountState;
+    use ottto_protocol::LocalHealthAuthority;
+    use ottto_protocol::LocalHealthCommandStatus;
+    use ottto_protocol::LocalHealthSeverity;
+    use ottto_protocol::LocalSetupRunState;
+    use ottto_protocol::LocalSetupTokenState;
+    use ottto_protocol::MachineIdentity;
+    use ottto_protocol::PersonalMeterLocalCollectorStatus;
+    use ottto_protocol::PersonalMeterLocalFreshnessStatus;
+    use ottto_protocol::PersonalMeterLocalSnapshot;
+    use ottto_protocol::PersonalMeterLocalValueStatus;
+    use ottto_protocol::RedactedValue;
+    use ottto_protocol::RedactionCategory;
+    use ottto_protocol::RedactionSurface;
+    use ottto_protocol::RepairAction;
+    use ottto_protocol::RepairActionApproval;
+    use ottto_protocol::RepairActionKind;
+    use ottto_protocol::RepairApprovalSurface;
+    use ottto_protocol::RepairAuthorityMode;
+    use ottto_protocol::SourceHealth;
+    use ottto_protocol::SourceKind;
+    use ottto_protocol::SourceVerificationResult;
+    use ottto_protocol::SourceVerificationStatus;
+    use ottto_protocol::StableMessage;
+    use ottto_protocol::StableProblemCode;
+    use ottto_protocol::PROTOCOL_VERSION;
     use ottto_protocol::{
         AccountBindingState, AgentDiagnosticSeverity, AgentStatusDiagnostic,
         DetectedUseTokenSample, HealthGrade, LocalAccountOrganization, LocalHealthContractFixture,
@@ -56,6 +64,9 @@ mod tests {
         SourceState,
     };
     use serial_test::serial;
+    use std::path::Path;
+    use time::format_description::well_known::Rfc3339;
+    use time::OffsetDateTime;
 
     const TOKEN: &str = "local_control_token";
 
@@ -4035,6 +4046,93 @@ mod tests {
         use super::*;
 
         #[test]
+        fn collection_status_requires_eligibility_and_resets_after_pause_and_both_policy_stops() {
+            if !crate::test_isolation::run_here() {
+                return;
+            }
+            use crate::scan_clock::with_clock;
+            use ottto_protocol::SourceCollectionState::{Collecting, Stalled};
+            let root = crate::test_scratch::private_dir("collection-status");
+            let _support = TestEnvVar::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
+            let daemon = daemon();
+            for source in [SourceKind::ClaudeCode, SourceKind::Codex, SourceKind::Pi] {
+                let scan_source = snapshot_sync::snapshot_source_of_kind(&source);
+                let slug = source_slug(&source).to_string();
+                {
+                    let mut state = daemon.state().unwrap();
+                    let mut health = codex_health();
+                    health.source = source.clone();
+                    health.state = SourceState::Healthy;
+                    health.config.discovered = false; // Installation is distinct from config.
+                    state.sources = vec![health];
+                    state.registered_source_grants = vec![slug.clone()];
+                }
+                let status = || {
+                    status_from_state_with_relay_finding(&mut daemon.state().unwrap(), None)
+                        .sources
+                        .remove(0)
+                };
+                with_clock(0, || {
+                    snapshot_sync::reset_collection_health(scan_source);
+                    assert!(
+                        status().collection.is_none(),
+                        "eligible but no scan offered"
+                    );
+                    snapshot_sync::start_collection_health(scan_source);
+                    assert_eq!(status().collection.unwrap().state, Collecting);
+                    assert!(
+                        daemon.state().unwrap().sources[0].collection.is_none(),
+                        "response only"
+                    );
+                    daemon.state().unwrap().registered_source_grants.clear();
+                    assert!(status().collection.is_none());
+                    daemon.state().unwrap().registered_source_grants = vec![slug.clone()];
+                    snapshot_sync::start_collection_health(scan_source);
+                    daemon.state().unwrap().sources[0].state = SourceState::NotFound;
+                    assert!(status().collection.is_none());
+                    daemon.state().unwrap().sources[0].state = SourceState::Healthy;
+                    snapshot_sync::start_collection_health(scan_source);
+                    snapshot_sync::disable_snapshot_source(&root, scan_source).unwrap();
+                    assert!(status().collection.is_none());
+                    // Model a positive prepare hint that was already in flight at pause.
+                    daemon
+                        .record_reconciliation_enabled(source.clone(), true, 30)
+                        .unwrap();
+                });
+                with_clock(7200, || {
+                    snapshot_sync::reconnect_snapshot_source(&root, scan_source).unwrap();
+                    snapshot_sync::resume_reconnected_sources(&root);
+                    assert!(status().collection.is_none());
+                    snapshot_sync::start_collection_health(scan_source);
+                    assert_eq!(status().collection.unwrap().state, Collecting);
+                });
+                for (window, enabled) in [(0, true), (30, false)] {
+                    with_clock(11000, || {
+                        assert_eq!(status().collection.unwrap().state, Stalled)
+                    });
+                    daemon
+                        .record_reconciliation_enabled(source.clone(), enabled, window)
+                        .unwrap();
+                    assert!(status().collection.is_none());
+                    // A later cycle can offer a source before learning its positive hint.
+                    snapshot_sync::start_collection_health(scan_source);
+                    with_clock(20000, || {
+                        daemon
+                            .record_reconciliation_enabled(source.clone(), true, 30)
+                            .unwrap();
+                        assert_eq!(status().collection.unwrap().state, Collecting);
+                    });
+                    // Start the next scenario from the same epoch without intentional stop time.
+                    with_clock(7200, || {
+                        snapshot_sync::reset_collection_health(scan_source);
+                        snapshot_sync::start_collection_health(scan_source);
+                    });
+                }
+            }
+            std::fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
         #[serial]
         fn tracking_status_omits_inapplicable_episodes_without_mutating_saved_state() {
             let root = crate::test_scratch::private_dir("tracking-status-applicability");
@@ -4264,6 +4362,7 @@ mod tests {
             plan_observations: Vec::new(),
             detected_uses: Vec::new(),
             active_session_reconciliation: None,
+            collection: None,
             tracking_confirmation: None,
             last_seen_at: Some("2026-05-05T09:09:00Z".to_string()),
             last_verified_at: Some("2026-05-05T09:09:30Z".to_string()),

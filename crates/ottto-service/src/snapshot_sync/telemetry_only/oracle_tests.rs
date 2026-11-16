@@ -696,7 +696,7 @@ fn head_page(
             if request
                 .snapshots
                 .iter()
-                .any(crate::snapshot_client::declares_head_cas)
+                .any(|item| crate::snapshot_client::declares_head_cas(item))
             {
                 assert_eq!(
                     wire,
