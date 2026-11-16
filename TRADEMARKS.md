@@ -1,5 +1,9 @@
 # Trademark Policy
 
+"Ottto"™ and the Ottto logo are trademarks of Ron Shub. They are not
+registered. The owner intends to assign them to a company that will operate
+Ottto; this policy will then apply to that company's marks.
+
 The Apache License, Version 2.0 grants copyright and patent permissions for the
 Ottto code. It does not grant trademark rights.
 
@@ -26,3 +30,7 @@ does not imply sponsorship, endorsement, or official status without permission.
 
 Modified distributions should use a distinct name and clearly state that they
 are based on Ottto or compatible with Ottto.
+
+## Permission and Questions
+
+For uses not covered above, or to report misuse, email support@ottto.net.
