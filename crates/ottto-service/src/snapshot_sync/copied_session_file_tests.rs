@@ -853,11 +853,19 @@ fn held_content_twin_holder_proves_no_copy_until_released() {
 
         // Release T: the complete ROOT union takes A and C replaces its prefix.
         let released = owe_claimed_growth(&prior, &c.base, &twin, false);
-        // The reference reads T through its own store, so it cannot spend the
-        // released growth claim the measured pages need.
-        let mut all = owe_claimed_growth(&prior, &c.base.join("native-reference"), &twin, false);
-        owe(&mut all);
-        let full = ready(&c, &E2ScanFixture::default(), all, 100, false);
+        // The native reference is a cold read of every file with no prior
+        // state: no store to share the released growth claim, and no accepted
+        // body left unread. (An owed copy of the held state leaves unchanged C
+        // owing adoption only, so C would be missing from it.)
+        let full = ready(
+            &c,
+            &E2ScanFixture::default(),
+            ScanIndex::default(),
+            100,
+            false,
+        );
+        assert_eq!(body(&full, ROOT).unwrap().request_count, 3);
+        assert_eq!(body(&full, COPY).unwrap().request_count, 1);
         let reference = sent_money(&full);
         let mut acquired_twin = false;
         let mut saw_root = false;
