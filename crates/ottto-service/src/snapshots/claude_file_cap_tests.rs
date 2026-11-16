@@ -407,7 +407,7 @@ fn retired_file_size_debt_decodes_and_clears_without_a_state_migration() {
     index.clear_retired_file_size_debt();
     let decoded = index.traversal.unwrap();
     assert_eq!(decoded.counts.oversized_file_count, 0);
-    assert!(!decoded.counts.has_errors());
+    assert!(!decoded.has_errors());
     let saved = serde_json::to_value(decoded).unwrap();
     assert!(saved.get("oversized_discovery").is_none());
     assert_eq!(saved["counts"]["oversized_file_count"], 0);

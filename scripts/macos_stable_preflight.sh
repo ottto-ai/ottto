@@ -252,7 +252,7 @@ if [[ -n "$verified_installer_path" ]]; then
   fi
 fi
 
-if ! python3 - "$MANIFEST" <<'PY'
+if ! python3 - "$MANIFEST" "$ROOT/scripts" <<'PY'
 from __future__ import annotations
 
 import json
@@ -260,6 +260,9 @@ import re
 import sys
 from pathlib import Path
 from typing import Any
+
+sys.path.insert(0, sys.argv[-1])
+from release_evidence_placeholders import contains_placeholder, strip_optional_not_run
 
 manifest_path = Path(sys.argv[1]).resolve()
 manifest_dir = manifest_path.parent
@@ -325,16 +328,6 @@ def app_source_commit(manifest: dict[str, Any], label: str) -> str:
     return require_string(commits[0], f"{label} app source commit")
 
 
-def contains_placeholder(value: Any) -> bool:
-    if isinstance(value, str):
-        return value == "not_run" or value.startswith("TODO")
-    if isinstance(value, list):
-        return any(contains_placeholder(item) for item in value)
-    if isinstance(value, dict):
-        return any(contains_placeholder(item) for item in value.values())
-    return False
-
-
 def resolve_reference(reference: str) -> Path:
     path = Path(reference)
     if path.is_absolute():
@@ -387,7 +380,7 @@ except json.JSONDecodeError as error:
     die(f"stable-candidate RC evidence has invalid JSON: {error}")
 
 evidence = require_object(evidence, "stable-candidate RC evidence")
-if contains_placeholder(evidence):
+if contains_placeholder(strip_optional_not_run(evidence)):
     die("stable-candidate RC evidence still contains template placeholders")
 if evidence.get("schema_version") != 1:
     die("stable-candidate RC evidence schema_version must be 1")

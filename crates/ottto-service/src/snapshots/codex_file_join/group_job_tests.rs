@@ -1805,7 +1805,7 @@ fn memoized_large_group_takes_no_slot_and_leaves_no_waiter() {
 fn counting_v2_decision_reaches_the_group_proof() {
     let (root, _) = counting_v2_unbound_fixture();
     assert!(replay_group(group_of(&root), &ScanIndex::default()).is_ok());
-    let _cutover = codex_counting_version::TestCutover::set(0);
+    let _cutover = sources::codex::counting::version::TestCutover::set(0);
     assert_eq!(
         refused(replay_group(group_of(&root), &ScanIndex::default())),
         Some((JoinRefusal::V2UnboundUi, 1))
@@ -1826,7 +1826,7 @@ fn active_cutover_resume_follows_every_member_ack() {
     for legacy_ack in [false, true] {
         let root = paged_corpus(if legacy_ack { "ack-legacy" } else { "ack-v2" });
         let cache = Arc::new(SharedCache::default());
-        let _cutover = codex_counting_version::TestCutover::set(0);
+        let _cutover = sources::codex::counting::version::TestCutover::set(0);
         let invalidated = with_test_limits(2048, 1024, 64, || {
             let (mut index, _, _) = pages(&root, ScanIndex::default(), &cache, || {
                 counters(&cache).jobs_paused > 0

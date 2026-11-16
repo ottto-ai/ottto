@@ -9,8 +9,8 @@ use super::super::seam::tests::{route, Route};
 use super::tests::{counted, loaded};
 use super::*;
 use crate::durable_tail_codec::{Durable, Enc, Shape};
-use crate::snapshots::claude_context_file_birth::retired_writer_bytes_for_test;
 use crate::snapshots::session_start::SessionStartState;
+use crate::snapshots::sources::claude::context_file_birth::retired_writer_bytes_for_test;
 use sha2::{Digest, Sha256};
 
 /// Slots in the retired writer array.

@@ -457,7 +457,7 @@ pub(in crate::snapshots) fn candidate_from_traversal_path_at(
             .ok()
             .and_then(unix_seconds)
             .unwrap_or_default(),
-        codex_fragment::Stamp::metadata(&metadata),
+        sources::codex::eof_fragment::Stamp::metadata(&metadata),
     );
 
     let modified_unix_seconds = metadata
@@ -472,7 +472,7 @@ pub(in crate::snapshots) fn candidate_from_traversal_path_at(
             source,
             &pending.path,
             metadata.len(),
-            codex_fragment::Stamp::metadata(&metadata),
+            sources::codex::eof_fragment::Stamp::metadata(&metadata),
         );
     let requires_recovery = recovery.requires(source, &pending.path, metadata.len());
     if !requires_recovery

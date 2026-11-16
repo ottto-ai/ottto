@@ -245,7 +245,7 @@ fn rewind_copy_counts_only_own_records() {
         let disposition = if rule_on {
             fold(&mut items, &no_reports(), &mut index)
         } else {
-            claude_context_file_birth::with_file_birth_rule_disabled_for_test(|| {
+            sources::claude::context_file_birth::with_file_birth_rule_disabled_for_test(|| {
                 fold(&mut items, &no_reports(), &mut index)
             })
         };
@@ -376,7 +376,7 @@ fn compaction_pairs_across_the_copy_line_count_once() {
     let item = items.remove(0);
     let mut control = vec![parsed.clone()];
     let mut control_index = indexed(&[&path]);
-    let _ = claude_context_file_birth::with_file_birth_rule_disabled_for_test(|| {
+    let _ = sources::claude::context_file_birth::with_file_birth_rule_disabled_for_test(|| {
         fold(&mut control, &no_reports(), &mut control_index)
     });
 
@@ -779,9 +779,10 @@ fn evidence_bound_withholds_only_that_root() {
     let mut items = vec![large, small];
     let mut index = indexed(&[&path_a, &path_b]);
 
-    let disposition = claude_context_file_birth::with_claude_evidence_bound_for_test(2, || {
-        fold(&mut items, &no_reports(), &mut index)
-    });
+    let disposition =
+        sources::claude::context_file_birth::with_claude_evidence_bound_for_test(2, || {
+            fold(&mut items, &no_reports(), &mut index)
+        });
 
     assert_eq!(
         disposition.posture_admission(ROOT),
@@ -869,7 +870,7 @@ fn admit_with_slice_cap(
     bound: usize,
 ) -> (BTreeMap<String, &'static str>, ClaudeContextFileBirthCounts) {
     let (api, trace) = row_reports(rows);
-    let tripwire = claude_context_file_birth::ClaudeTelemetryTripwire::build(
+    let tripwire = sources::claude::context_file_birth::ClaudeTelemetryTripwire::build(
         items,
         bound,
         &api,
@@ -880,11 +881,11 @@ fn admit_with_slice_cap(
     let mut admissions = BTreeMap::new();
     for item in items.iter_mut() {
         let root = claude_snapshot_family_root(item);
-        let verdict = claude_context_file_birth::admit_claude_file_birth_posture(
+        let verdict = sources::claude::context_file_birth::admit_claude_file_birth_posture(
             item,
             &root,
             &tripwire,
-            &mut claude_context_file_birth::remembered_tripwire(),
+            &mut sources::claude::context_file_birth::remembered_tripwire(),
             false,
             &mut counts,
         );
@@ -928,7 +929,9 @@ fn contradiction_in_a_later_slice_vetoes_the_root() {
                 .flat_map(|(_, request)| [request.as_str(), request.as_str()])
                 .collect::<Vec<_>>();
             let slice = |request: &str| {
-                claude_context_file_birth::telemetry_slice_for_test(&loaded, bound, request)
+                sources::claude::context_file_birth::telemetry_slice_for_test(
+                    &loaded, bound, request,
+                )
             };
             let (partitions, late_slice) = slice(late.as_str())?;
             let earliest_own = own
@@ -1078,7 +1081,7 @@ fn remembered_tripwire_fails_closed_when_full() {
         .1
     };
     let (first, second, third) = (file(ROOT), file(SECOND), file(OTHER_ROOT));
-    let mut memory = claude_context_file_birth::ClaudeRememberedTripwire::new(1);
+    let mut memory = sources::claude::context_file_birth::ClaudeRememberedTripwire::new(1);
     assert!(!memory.holds(&first));
     memory.remember(&first);
     assert!(memory.holds(&first));
@@ -1096,7 +1099,7 @@ fn remembered_tripwire_fails_closed_when_full() {
     // N3: the full list shows on the local counts line.
     let reports = no_reports();
     let veto_rows = ClaudeVetoApiRows::new();
-    let tripwire = claude_context_file_birth::ClaudeTelemetryTripwire::build(
+    let tripwire = sources::claude::context_file_birth::ClaudeTelemetryTripwire::build(
         std::slice::from_ref(&third),
         1_000,
         &reports.0,
@@ -1105,7 +1108,7 @@ fn remembered_tripwire_fails_closed_when_full() {
     );
     let mut counts = ClaudeContextFileBirthCounts::default();
     let mut held = third.clone();
-    let verdict = claude_context_file_birth::admit_claude_file_birth_posture(
+    let verdict = sources::claude::context_file_birth::admit_claude_file_birth_posture(
         &mut held,
         OTHER_ROOT,
         &tripwire,
@@ -1121,8 +1124,8 @@ fn remembered_tripwire_fails_closed_when_full() {
     assert!(!ClaudeContextFileBirthCounts::default().resource_withheld());
     assert!(counts.resource_withheld());
     let ((), alarms) = crate::local_resource_diagnostics::capture(|| {
-        claude_context_file_birth::alarm_first_resource_withhold(&counts);
-        claude_context_file_birth::alarm_first_resource_withhold(&counts);
+        sources::claude::context_file_birth::alarm_first_resource_withhold(&counts);
+        sources::claude::context_file_birth::alarm_first_resource_withhold(&counts);
     });
     assert_eq!(alarms.len(), 1);
     assert_eq!(alarms[0]["stage"], "claude_context_resource_withhold");
@@ -1432,7 +1435,7 @@ fn capture_on_bodies_match_the_clear_outside_context_scalars() {
         let (_, _, stats) = if rule_on {
             apply(&mut scan, &mut index)
         } else {
-            claude_context_file_birth::with_file_birth_rule_disabled_for_test(|| {
+            sources::claude::context_file_birth::with_file_birth_rule_disabled_for_test(|| {
                 apply(&mut scan, &mut index)
             })
         };
@@ -1724,7 +1727,7 @@ fn claude_backfill_stop_latches_until_restart() {
 
     // Evidence bound: the seam puts ROOT's five requests over a bound of 4.
     let (withheld, alarms) =
-        claude_context_file_birth::with_claude_evidence_bound_for_test(4, fold_pass);
+        sources::claude::context_file_birth::with_claude_evidence_bound_for_test(4, fold_pass);
     assert_eq!(
         withheld.posture_admission(ROOT),
         Some("withheld_evidence_bound")
@@ -1760,12 +1763,12 @@ fn claude_backfill_stop_latches_until_restart() {
     // A full remembered-veto table latches it too: a capacity-1 table that
     // already holds another file overflows on the next veto.
     let item = files[0].1.clone();
-    let mut memory = claude_context_file_birth::ClaudeRememberedTripwire::new(1);
+    let mut memory = sources::claude::context_file_birth::ClaudeRememberedTripwire::new(1);
     memory.remember(&files[1].1);
     memory.remember(&item);
     let reports = no_reports();
     let veto_rows = ClaudeVetoApiRows::new();
-    let tripwire = claude_context_file_birth::ClaudeTelemetryTripwire::build(
+    let tripwire = sources::claude::context_file_birth::ClaudeTelemetryTripwire::build(
         std::slice::from_ref(&item),
         1_000,
         &reports.0,
@@ -1773,7 +1776,7 @@ fn claude_backfill_stop_latches_until_restart() {
         &veto_rows,
     );
     let mut counts = ClaudeContextFileBirthCounts::default();
-    let verdict = claude_context_file_birth::admit_claude_file_birth_posture(
+    let verdict = sources::claude::context_file_birth::admit_claude_file_birth_posture(
         &mut item.clone(),
         ROOT,
         &tripwire,
@@ -2326,7 +2329,7 @@ fn points_work_refusal_preserves_every_other_snapshot_field() {
     assert!(!expected.local_context_points.is_empty());
     assert!(!expected.compaction_events.is_empty());
     let mut counts = ClaudeContextFileBirthCounts::default();
-    claude_context_file_birth::apply_own_context_scalars(&mut item, &mut counts);
+    sources::claude::context_file_birth::apply_own_context_scalars(&mut item, &mut counts);
     assert_eq!(counts.local_context_points_work_refused_session_count, 1);
     assert!(
         !counts.resource_withheld(),

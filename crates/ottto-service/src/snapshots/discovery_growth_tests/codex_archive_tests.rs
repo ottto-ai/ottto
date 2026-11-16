@@ -11,7 +11,7 @@ fn archive_relisting_preserves_custody_and_owed_pacing() {
         fs::write(&path, b"synthetic").unwrap();
         let key = local_index_key(&path);
         // A settled entry carries its final group.
-        let mut entry = crate::snapshots::g7_debt::tests::entry(&path);
+        let mut entry = crate::snapshots::upload::freshness_debt::tests::entry(&path);
         entry.last_snapshot_fingerprint = Some("final".into());
         index.files.insert(key.clone(), entry);
         if owed {
@@ -21,7 +21,11 @@ fn archive_relisting_preserves_custody_and_owed_pacing() {
                 .unwrap()
                 .set_unverified_deadline(11);
         } else {
-            crate::snapshots::g7_debt::tests::accept(SnapshotSource::Codex, &mut index, &path);
+            crate::snapshots::upload::freshness_debt::tests::accept(
+                SnapshotSource::Codex,
+                &mut index,
+                &path,
+            );
         }
         index
             .traversal

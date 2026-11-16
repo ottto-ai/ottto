@@ -809,10 +809,10 @@ fn read_shared_page(
 /// The session facts (D168-1): content the head never carries, one element
 /// per page at the kind's position, `[kind][version][value]`. A slot is
 /// rewritten when its fact changes. An unknown kind or version holds its file
-/// as future state. Workspace accepts path-only v1 and bound v2 independently
-/// of the other v1 facts; the head reduction revision stays unchanged. Kinds
-/// are shared by every codec; a kind its source never sets is never stored (the
-/// Codex agent label and prelude on Claude).
+/// as future state. Workspace accepts path-only v1 and v2 with a Git or non-Git
+/// binding independently of the other v1 facts; the head reduction revision
+/// stays unchanged. Kinds are shared by every codec; a kind its source never
+/// sets is never stored (the Codex agent label and prelude on Claude).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Fact {
     Title = 0,

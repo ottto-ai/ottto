@@ -1418,7 +1418,7 @@ fn paced_growth_read_defers_at_both_admission_sites() {
         );
         assert!(
             index.traversal.as_ref().map_or(true, |walk| {
-                !walk.counts.has_errors() && walk.unhealthy_retry_not_before_unix_seconds.is_none()
+                !walk.has_errors() && walk.unhealthy_retry_not_before_unix_seconds.is_none()
             }),
             "sampled={sampled}: healthy, no unhealthy retry armed"
         );

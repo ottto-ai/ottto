@@ -1874,7 +1874,9 @@ fn codex_status_selection(
 
     let source_health_snapshot = codex_source_health_snapshot(candidates, captured_at, expires_at);
     if snapshots.is_empty() {
-        snapshots.push(source_health_snapshot.clone());
+        let mut upload = source_health_snapshot.clone();
+        codex_canonical_identity_spelling(&mut upload);
+        snapshots.push(upload);
         setup_snapshot_index = Some(0);
     }
     (snapshots, setup_snapshot_index, source_health_snapshot)
@@ -2227,6 +2229,71 @@ fn codex_source_health_snapshot(
             ));
     }
     source_health_snapshot
+}
+
+/// Name every raw-only Codex identity on `snapshot` in its canonical spelling.
+///
+/// A login read only from the local id token (no saved reading with identity
+/// yet: first pairing, setup, a login change) carries raw user and workspace
+/// ids and no hashes. Sent like that, the backend hashes them with its own
+/// fallback recipe and files the same account under a second identity. Each
+/// ABSENT hash is set from its raw id with the recipe a provider-validated
+/// binding uses ([`codex_identity_hashes`]); a present hash is never
+/// overwritten, and confidence and billing identity stay as they are. A plan
+/// row filled here that said `is_current: false` leaves its currentness
+/// unsaid instead (`is_current` absent): that false only means the local
+/// reading was not confirmed, and sent with the canonical hashes it would mark
+/// the account's existing profile not current. A row that said `true` (a
+/// signed-in High or Medium login, [`append_current_plan_observation`]) is a
+/// correct claim and keeps it, as does a row that said nothing.
+///
+/// Runs on the main lane's fallback copy when no home is bound
+/// ([`codex_status_selection`]), also selected for the setup scan by
+/// [`AgentStatusCollection::setup_snapshot`]. The collection's own source-health
+/// snapshot, which local status and active-session reconciliation read, keeps
+/// what was collected, so bindings,
+/// dedup, representation and local attribution are unchanged.
+fn codex_canonical_identity_spelling(snapshot: &mut AgentStatusSnapshot) {
+    if snapshot.source != SourceKind::Codex {
+        return;
+    }
+    if let Some(account) = snapshot.account.as_mut() {
+        fill_absent_codex_identity_hashes(
+            account.account_id.as_deref(),
+            account.organization_id.as_deref(),
+            &mut account.account_identifier_hash,
+            &mut account.organization_identifier_hash,
+        );
+    }
+    for observation in &mut snapshot.plan_observations {
+        if fill_absent_codex_identity_hashes(
+            observation.account_id.as_deref(),
+            observation.organization_id.as_deref(),
+            &mut observation.account_identifier_hash,
+            &mut observation.organization_identifier_hash,
+        ) && observation.is_current == Some(false)
+        {
+            observation.is_current = None;
+        }
+    }
+}
+
+/// Set each absent hash from its raw id, per field. Returns whether any was set.
+fn fill_absent_codex_identity_hashes(
+    account_id: Option<&str>,
+    workspace_id: Option<&str>,
+    account_hash: &mut Option<String>,
+    workspace_hash: &mut Option<String>,
+) -> bool {
+    let (account, workspace) = codex_identity_hashes(account_id, workspace_id);
+    let mut filled = false;
+    for (slot, hash) in [(account_hash, account), (workspace_hash, workspace)] {
+        if slot.is_none() && hash.is_some() {
+            *slot = hash;
+            filled = true;
+        }
+    }
+    filled
 }
 
 /// Read-only launch projection: only saved provider-verified evidence and
@@ -16530,10 +16597,24 @@ fn codex_credential_claimed_binding(
     live_access: bool,
 ) -> Option<String> {
     let (account_id, raw_workspace_id) = codex_credential_claimed_ids(credentials, live_access)?;
-    Some(codex_credit_grants::binding_key(
-        &billing_identity_hash("openai", "account", &account_id)?,
-        &billing_identity_hash("openai", "workspace", &raw_workspace_id)?,
-    ))
+    let (account, workspace) =
+        codex_identity_hashes(Some(account_id.as_str()), Some(raw_workspace_id.as_str()));
+    Some(codex_credit_grants::binding_key(&account?, &workspace?))
+}
+
+/// The canonical hashes of a Codex user id and workspace id, each on its own:
+/// the user (`chatgpt_user_id`, else `user_id`, else `sub`) in the "account"
+/// role and the selected ChatGPT workspace (`chatgpt_account_id`) in the
+/// "workspace" role. Shared so a claimed binding and a raw-only status row
+/// cannot spell the same login two ways.
+fn codex_identity_hashes(
+    account_id: Option<&str>,
+    workspace_id: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    (
+        account_id.and_then(|id| billing_identity_hash("openai", "account", id)),
+        workspace_id.and_then(|id| billing_identity_hash("openai", "workspace", id)),
+    )
 }
 
 fn validated_codex_identity(
