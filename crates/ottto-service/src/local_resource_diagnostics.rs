@@ -3,7 +3,10 @@
 use serde::{ser::SerializeMap, Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::Write;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{
+    AtomicU64,
+    Ordering::{Relaxed, SeqCst},
+};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) mod cli_children;
@@ -1566,6 +1569,9 @@ pub(crate) fn source_prepare<T>(
                 MallocCheckpoints::default(),
             ))
         });
+        // Bumped after the slot is set: a window that read the count before
+        // this bump reads the open slot next.
+        with_pass_starts(|n| n.fetch_add(1, SeqCst));
     }
     let footprint = footprint::Stage::begin();
     let result = inner();
@@ -1706,6 +1712,26 @@ pub(crate) fn pass_retained(source: &str, measure: impl FnOnce() -> RetainedByte
     }
 }
 process_static!(fn with_passes: std::sync::Mutex<[Option<PassStart>; 3]> = std::sync::Mutex::new([const { None }; 3]));
+process_static!(fn with_pass_starts: AtomicU64 = AtomicU64::new(0));
+/// Passes started so far, then whether one is open. Read at an off-pass
+/// window's open and close; any change or open pass marks the window.
+fn pass_state() -> (u64, bool) {
+    let started = with_pass_starts(|n| n.load(SeqCst));
+    let open = with_passes(|p| {
+        p.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(Option::is_some)
+    });
+    (started, open)
+}
+/// A pass that ended without a finish (none to do, refused, failed) is no
+/// longer open; a finished pass already took its slot.
+pub(crate) fn pass_ended(source: &str) {
+    if let Some(slot) = source_slot(source) {
+        with_passes(|p| p.lock().unwrap_or_else(|e| e.into_inner())[slot] = None);
+    }
+}
 #[derive(Serialize)]
 struct PassSummary {
     wall_us: u64,
@@ -1734,6 +1760,7 @@ pub(crate) struct StageWindow {
     jsonl: Option<jsonl::Scope>,
     evidence_mem: Option<EvidenceMem>,
     offpass_cpu: Option<Option<StateV2Cpu>>,
+    offpass_passes: Option<(u64, bool)>,
     finish_sample: Option<Option<ProcessSample>>,
     pass: Option<PassSummary>,
     /// Off-pass control request counts from `take_control` (no ids or args).
@@ -1788,6 +1815,7 @@ impl StageWindow {
     }
     pub(crate) fn begin(source: &str, stage: &'static str) -> Self {
         let offpass = stage.starts_with("offpass_");
+        let offpass_passes = offpass.then(pass_state);
         Self {
             stage,
             source: Source::from_slug(source),
@@ -1798,6 +1826,7 @@ impl StageWindow {
             finish_sample: None,
             pass: None,
             offpass_cpu: offpass.then(|| process_usage().map(|(_, cpu)| cpu)),
+            offpass_passes,
             control: BTreeMap::new(),
         }
     }
@@ -1816,6 +1845,11 @@ impl Drop for StageWindow {
         if let Some(before) = self.offpass_cpu {
             let samples = before.zip(process_usage().map(|(_, cpu)| cpu));
             let observation = self.probe.observation();
+            let (started, open) = pass_state();
+            let pass_overlap = open
+                || self
+                    .offpass_passes
+                    .is_some_and(|(before, open)| open || before != started);
             aggregate_offpass(Record {
                 schema_version: SCHEMA_VERSION,
                 process_id: std::process::id(),
@@ -1828,6 +1862,7 @@ impl Drop for StageWindow {
                         .and_then(|(a, b)| b.cpu_user_us.checked_sub(a.cpu_user_us)),
                     cpu_sys_us: samples.and_then(|(a, b)| b.cpu_sys_us.checked_sub(a.cpu_sys_us)),
                     control: std::mem::take(&mut self.control),
+                    pass_overlap,
                 },
                 observation,
             });
@@ -1884,6 +1919,10 @@ struct OffpassCounts {
     wall_max_us: u64,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     control: BTreeMap<&'static str, u64>,
+    /// A source pass ran at some point in the window; absent means none did.
+    /// Kept in its own row so clean windows stay clean.
+    #[serde(skip_serializing_if = "is_zero")]
+    pass_overlap: bool,
 }
 std::thread_local! {
     static CONTROL: std::cell::RefCell<BTreeMap<&'static str, u64>> = const {
@@ -1913,13 +1952,14 @@ pub(crate) fn trust_check(check: impl FnOnce() -> bool) -> bool {
 pub(crate) fn take_control() -> BTreeMap<&'static str, u64> {
     CONTROL.take()
 }
-// Literal source/stage keys only; one pending row per lane, no work-unit history.
-process_static!(fn with_offpass: std::sync::Mutex<BTreeMap<(Source, &'static str), Record<OffpassCounts>>> =
-    std::sync::Mutex::new(BTreeMap::new()));
+// Literal source/stage keys only; one pending row per lane and pass overlap,
+// no work-unit history.
+type OffpassRows = BTreeMap<(Source, &'static str, bool), Record<OffpassCounts>>;
+process_static!(fn with_offpass: std::sync::Mutex<OffpassRows> = std::sync::Mutex::new(BTreeMap::new()));
 fn aggregate_offpass(mut row: Record<OffpassCounts>) {
     with_offpass(|state| {
         let mut rows = state.lock().unwrap_or_else(|error| error.into_inner());
-        let key = (row.source, row.stage);
+        let key = (row.source, row.stage, row.counts.pass_overlap);
         if let Some(previous) = rows.remove(&key) {
             row.counts.count += previous.counts.count;
             row.counts.wall_max_us = row.counts.wall_max_us.max(previous.counts.wall_max_us);
@@ -3335,6 +3375,7 @@ mod tests {
                         cpu_sys_us: Some(5),
                         wall_max_us: 7,
                         control: BTreeMap::new(),
+                        pass_overlap: false,
                     },
                 });
             }
@@ -3351,6 +3392,103 @@ mod tests {
             assert_eq!(rows[0]["observation"][key], 3);
         }
         assert_eq!(rows[1]["stage"], "source_prepare");
+    }
+
+    /// [regress] A pass overlapping an off-pass window marks it `pass_overlap`
+    /// in its own row with every delta kept; clean windows omit the field.
+    #[test]
+    fn offpass_pass_overlap_splits_rows_and_keeps_deltas() {
+        let quota = || drop(StageWindow::begin("codex", "offpass_codex_quota"));
+        let sample = |n| ProcessSample {
+            cpu_us: n,
+            lifetime_max_rss_bytes: 1,
+            disk: Some(DiskBytes {
+                disk_read_bytes: n,
+                disk_written_bytes: n,
+                counters: Metrics([Some(n); 7]),
+            }),
+        };
+        let (_, rows) = capture(|| {
+            let window = StageWindow::begin("codex", "offpass_codex_quota");
+            source_prepare("codex", || (), |_| false);
+            source_finish("codex", false, || Ok(())).unwrap();
+            drop(window); // a pass started and ended mid-window
+            quota(); // clean, same period: its own row
+                     // Two fixed windows per flag: same-flag sums, cross-flag separation.
+            for (pass_overlap, d) in [(true, 44), (false, 10), (true, 44), (false, 10)] {
+                aggregate_offpass(Record {
+                    schema_version: SCHEMA_VERSION,
+                    process_id: std::process::id(),
+                    stage: "offpass_cloud_sessions",
+                    source: Source::Codex,
+                    observation: Observation::between(7, Some(sample(1)), Some(sample(1 + d))),
+                    counts: OffpassCounts {
+                        count: 1,
+                        cpu_user_us: Some(d),
+                        cpu_sys_us: Some(2 * d),
+                        wall_max_us: 7,
+                        control: BTreeMap::new(),
+                        pass_overlap,
+                    },
+                });
+            }
+            source_prepare("codex", || (), |_| false); // flushes the period
+            quota(); // the pass is open at open and close
+            flush_offpass();
+        });
+        let offpass: Vec<_> = rows
+            .iter()
+            .filter(|row| {
+                row["stage"]
+                    .as_str()
+                    .is_some_and(|s| s.starts_with("offpass_"))
+            })
+            .collect();
+        let flags: Vec<_> = offpass
+            .iter()
+            .map(|row| {
+                let overlap = row["counts"].get("pass_overlap");
+                (
+                    row["stage"].as_str().unwrap(),
+                    overlap.and_then(serde_json::Value::as_bool),
+                )
+            })
+            .collect();
+        let (cloud, quota) = ("offpass_cloud_sessions", "offpass_codex_quota");
+        assert_eq!(
+            flags,
+            [
+                (cloud, None),
+                (cloud, Some(true)),
+                (quota, None),
+                (quota, Some(true)),
+                (quota, Some(true)),
+            ]
+        );
+        for (row, d) in offpass[..2].iter().zip([10, 44]) {
+            let mut counts = serde_json::json!(
+                {"count": 2, "cpu_user_us": 2 * d, "cpu_sys_us": 4 * d, "wall_max_us": 7}
+            );
+            if d == 44 {
+                counts["pass_overlap"] = true.into();
+            }
+            assert_eq!(row["counts"], counts);
+            let observation = &row["observation"];
+            assert_eq!(observation["wall_elapsed_us"], 14);
+            let summed = [
+                "shared_process_cpu_delta_us",
+                "disk_read_bytes",
+                "disk_written_bytes",
+            ];
+            for key in summed.iter().chain(&METRIC_KEYS[..4]) {
+                assert_eq!(observation[key], 2 * d, "{key}");
+            }
+        }
+        for row in &offpass[2..] {
+            assert_eq!(row["counts"]["count"], 1);
+            let disk = row["observation"].get("disk_read_bytes").is_some();
+            assert_eq!(disk, cfg!(target_os = "macos"));
+        }
     }
 
     /// [behaviour] Control requests sum per class; the trust timer sums, maxes
