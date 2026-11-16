@@ -17551,7 +17551,6 @@ pub(crate) use tests::{owner_return_credential_for_test, owner_return_seed_for_t
 pub(crate) use tests::account_return_claim_for_test;
 
 #[cfg(test)]
-#[rustfmt::skip]
 pub(crate) mod tests;
 
 #[cfg(all(test, unix))]

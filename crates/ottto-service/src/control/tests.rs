@@ -119,9 +119,7 @@ fn codex_prepare_target_resolves_only_daemon_authored_exact_composite() {
             .expect("exact target binding"),
         (account_hash, workspace_hash)
     );
-    assert!(
-        super::codex_account_target_binding(&status, "codex_account_target_forged").is_err()
-    );
+    assert!(super::codex_account_target_binding(&status, "codex_account_target_forged").is_err());
 }
 
 #[test]
@@ -240,8 +238,9 @@ fn claude_managed_config_preview_renders_managed_env_keys() {
         .collect();
     let joined = lines.join("\n");
     assert!(joined.contains("CLAUDE_CODE_ENABLE_TELEMETRY = \"1\""));
-    assert!(joined
-        .contains("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT = \"http://127.0.0.1:43119/v1/logs\""));
+    assert!(
+        joined.contains("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT = \"http://127.0.0.1:43119/v1/logs\"")
+    );
     // Secret-bearing header values are masked; unmanaged keys never leak.
     assert!(!joined.contains(&fake_secret));
     assert!(!joined.contains("UNRELATED_KEY"));
@@ -322,8 +321,7 @@ for line in sys.stdin:
         ),
     )
     .expect("fake Codex executable");
-    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
-        .expect("fake Codex mode");
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).expect("fake Codex mode");
 }
 
 #[cfg(unix)]
@@ -345,10 +343,8 @@ fn setup_rpc_error_call_lines(support: &Path) -> usize {
         .flat_map(|body| {
             body.lines()
                 .filter_map(|line| {
-                    serde_json::from_str::<ottto_core::provider_call_log::ProviderCallLine>(
-                        line,
-                    )
-                    .ok()
+                    serde_json::from_str::<ottto_core::provider_call_log::ProviderCallLine>(line)
+                        .ok()
                 })
                 .collect::<Vec<_>>()
         })
@@ -372,8 +368,7 @@ fn write_synthetic_codex_auth(home: &Path, body: &str) {
 /// Opens a Codex setup that waits for sign-in and returns its managed home.
 #[cfg(unix)]
 fn open_waiting_codex_setup(operation_id: &str) -> PathBuf {
-    let prepared =
-        prepare_open_codex_account(1, operation_id.to_string()).expect("prepare open");
+    let prepared = prepare_open_codex_account(1, operation_id.to_string()).expect("prepare open");
     let slot_id = prepared
         .setup_operation
         .slot_id
@@ -602,8 +597,7 @@ for line in sys.stdin:
     );
     let executable = bin.join("codex");
     fs::write(&executable, script).expect("fake Codex executable");
-    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
-        .expect("fake Codex mode");
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).expect("fake Codex mode");
 }
 
 /// One test's daemon-run sign-in setup: a support dir, the fake `codex`,
@@ -650,11 +644,7 @@ impl SignInFixture {
             + 24 * 60 * 60;
         fs::write(
             bin.join("auth-body"),
-            synthetic_codex_auth_with_claims(
-                "synthetic-user",
-                "synthetic-workspace",
-                expires_at,
-            ),
+            synthetic_codex_auth_with_claims("synthetic-user", "synthetic-workspace", expires_at),
         )
         .expect("auth body");
         Self {
@@ -896,10 +886,8 @@ fn setup_call_lines(support: &Path) -> Vec<ottto_core::provider_call_log::Provid
         .flat_map(|body| {
             body.lines()
                 .filter_map(|line| {
-                    serde_json::from_str::<ottto_core::provider_call_log::ProviderCallLine>(
-                        line,
-                    )
-                    .ok()
+                    serde_json::from_str::<ottto_core::provider_call_log::ProviderCallLine>(line)
+                        .ok()
                 })
                 .collect::<Vec<_>>()
         })
@@ -1593,9 +1581,7 @@ fn pi_admin_disabled_import_rejection_stays_typed_and_non_blocking() {
     );
 }
 
-use crate::keychain::{
-    TelemetryKeyStore, TelemetryKeychainError, TELEMETRY_KEY_FILE_STORE_ENV,
-};
+use crate::keychain::{TelemetryKeyStore, TelemetryKeychainError, TELEMETRY_KEY_FILE_STORE_ENV};
 use crate::{ControlToken, LocalDaemon};
 use ottto_core::OTTTO_SECRET_FALLBACK_DIR_ENV;
 use ottto_protocol::{LocalClientKind, MachineIdentity, OperatingSystem, SecretString};
@@ -1901,22 +1887,21 @@ fn confirmation_receipt_must_match_journaled_prior_device() {
     )
     .is_err());
 
-    let wrong_generation: DeviceCredentialConfirmationApiResponse =
-        serde_json::from_value(json!({
-            "preparation_id": pending.preparation_id,
-            "status": "confirmed",
-            "confirmed_at": "2026-07-31T20:00:00Z",
-            "credential_generation": pending.credential_generation + 1,
-            "device": {
-                "id": pending.device.device_id,
-                "machine_id": pending.device.machine_id,
-                "sources": pending.device.sources,
-            },
-            "identity_continuity_capability": IDENTITY_CONTINUITY_CAPABILITY,
-            "credential_rotation_performed": true,
-            "rotated_prior_device_id": "device-prior",
-        }))
-        .expect("parse wrong-generation confirmation");
+    let wrong_generation: DeviceCredentialConfirmationApiResponse = serde_json::from_value(json!({
+        "preparation_id": pending.preparation_id,
+        "status": "confirmed",
+        "confirmed_at": "2026-07-31T20:00:00Z",
+        "credential_generation": pending.credential_generation + 1,
+        "device": {
+            "id": pending.device.device_id,
+            "machine_id": pending.device.machine_id,
+            "sources": pending.device.sources,
+        },
+        "identity_continuity_capability": IDENTITY_CONTINUITY_CAPABILITY,
+        "credential_rotation_performed": true,
+        "rotated_prior_device_id": "device-prior",
+    }))
+    .expect("parse wrong-generation confirmation");
     assert!(validate_device_credential_confirmation(
         "https://api.test/confirm",
         &pending,
@@ -2160,12 +2145,9 @@ fn post_confirm_device_file_failure_keeps_candidate_restart_recoverable() {
         &pending_secret,
     )
     .expect("stage candidate");
-    let confirmed = mark_pending_device_credential_confirmed(
-        &pending,
-        "2026-07-31T20:00:00Z",
-        &pending_store,
-    )
-    .expect("mark confirmed");
+    let confirmed =
+        mark_pending_device_credential_confirmed(&pending, "2026-07-31T20:00:00Z", &pending_store)
+            .expect("mark confirmed");
 
     assert_eq!(
         promote_pending_device_credential_with_stores(
@@ -2247,12 +2229,9 @@ fn confirmed_journal_rejects_a_replaced_candidate_secret_before_promotion() {
         &pending_secret,
     )
     .expect("stage candidate");
-    let confirmed = mark_pending_device_credential_confirmed(
-        &pending,
-        "2026-07-31T20:00:00Z",
-        &pending_store,
-    )
-    .expect("mark confirmed");
+    let confirmed =
+        mark_pending_device_credential_confirmed(&pending, "2026-07-31T20:00:00Z", &pending_store)
+            .expect("mark confirmed");
 
     // Mutation oracle: simulate a stale/corrupted Keychain value after the
     // server confirmation receipt became durable.
@@ -2290,8 +2269,7 @@ fn confirmed_regular_rotation_fences_old_authority_until_restart_promotion() {
     let support_root = telemetry_key_store_root("credential-rotation-recovery");
     let secret_root = telemetry_key_store_root("credential-rotation-recovery-secret");
     fs::create_dir_all(&secret_root).expect("secret root");
-    let _support_guard =
-        EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+    let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
     let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
 
     let old_device = LocalDeviceBinding {
@@ -2345,16 +2323,11 @@ fn confirmed_regular_rotation_fences_old_authority_until_restart_promotion() {
     // Once the confirm request can be sent, a lost response is ambiguous:
     // the server may already have revoked the prior generation.
     assert!(crate::snapshot_client::load_snapshot_device_credentials().is_err());
-    assert!(
-        crate::snapshot_client::ensure_no_incomplete_device_credential_promotion().is_err()
-    );
+    assert!(crate::snapshot_client::ensure_no_incomplete_device_credential_promotion().is_err());
 
-    let confirmed = mark_pending_device_credential_confirmed(
-        &pending,
-        "2026-07-31T20:00:00Z",
-        &pending_store,
-    )
-    .expect("mark rotation confirmed");
+    let confirmed =
+        mark_pending_device_credential_confirmed(&pending, "2026-07-31T20:00:00Z", &pending_store)
+            .expect("mark rotation confirmed");
     let blocked_parent = support_root.join("blocked-rotation-parent");
     fs::write(&blocked_parent, b"not-a-directory").expect("create promotion blocker");
     let blocked_device_store = FileDeviceStore::new(blocked_parent.join("device.json"));
@@ -2380,9 +2353,7 @@ fn confirmed_regular_rotation_fences_old_authority_until_restart_promotion() {
     // local files still exist, neither snapshots nor cached OTLP admission
     // may use it across this crash cut.
     assert!(crate::snapshot_client::load_snapshot_device_credentials().is_err());
-    assert!(
-        crate::snapshot_client::ensure_no_incomplete_device_credential_promotion().is_err()
-    );
+    assert!(crate::snapshot_client::ensure_no_incomplete_device_credential_promotion().is_err());
 
     assert_eq!(recover_pending_device_credential_at_startup(), Ok(true));
     assert!(pending_store.load().expect("pending cleared").is_none());
@@ -2403,8 +2374,7 @@ fn post_confirm_claim_commit_failure_fences_live_admission_then_rolls_forward() 
     let support_root = telemetry_key_store_root("credential-claim-commit-recovery");
     let secret_root = telemetry_key_store_root("credential-claim-commit-recovery-secret");
     fs::create_dir_all(&secret_root).expect("secret root");
-    let _support_guard =
-        EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+    let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
     let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
     let account = connected_account();
     let connection = LocalConnectionBinding {
@@ -2448,9 +2418,7 @@ fn post_confirm_claim_commit_failure_fences_live_admission_then_rolls_forward() 
         Some(pending.clone())
     );
     assert!(crate::snapshot_client::load_snapshot_device_credentials().is_err());
-    assert!(
-        crate::snapshot_client::ensure_no_incomplete_device_credential_promotion().is_err()
-    );
+    assert!(crate::snapshot_client::ensure_no_incomplete_device_credential_promotion().is_err());
     assert!(matches!(
         setup_run_token_for_connection(DEFAULT_API_BASE_URL, &connection),
         Err(LocalApiError::IdentityMutationInProgress)
@@ -2561,8 +2529,7 @@ fn confirmed_pruned_preparation_recovers_via_normal_device_auth() {
     let support_root = telemetry_key_store_root("credential-pruned-confirmed");
     let secret_root = telemetry_key_store_root("credential-pruned-confirmed-secret");
     fs::create_dir_all(&secret_root).expect("secret root");
-    let _support_guard =
-        EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+    let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
     let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind recovery backend");
     let address = listener.local_addr().expect("recovery backend address");
@@ -2601,8 +2568,7 @@ fn expired_pruned_preparation_clears_only_after_normal_auth_rejection() {
     let support_root = telemetry_key_store_root("credential-pruned-expired");
     let secret_root = telemetry_key_store_root("credential-pruned-expired-secret");
     fs::create_dir_all(&secret_root).expect("secret root");
-    let _support_guard =
-        EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+    let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
     let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind recovery backend");
     let address = listener.local_addr().expect("recovery backend address");
@@ -2726,10 +2692,8 @@ fn handles_authenticated_status_request() {
 #[serial]
 fn handles_authenticated_receipts_request_from_private_ring() {
     let support_root = control_test_root("receipts-control");
-    let _support_guard =
-        EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
-    crate::upload_receipts::append_transport_error(&support_root, SourceKind::Codex, 3)
-        .unwrap();
+    let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+    crate::upload_receipts::append_transport_error(&support_root, SourceKind::Codex, 3).unwrap();
     let response = handle_request(
         &daemon(),
         LocalControlRequest {
@@ -2937,8 +2901,9 @@ fn claude_accounts_require_auth_and_apply_operation_specific_mutations() {
     );
     assert!(prepared_payload["setup_operation"]["launch_command"]
         .as_str()
-        .is_some_and(|command| command.starts_with("CLAUDE_CONFIG_DIR='")
-            && command.ends_with("' claude")));
+        .is_some_and(
+            |command| command.starts_with("CLAUDE_CONFIG_DIR='") && command.ends_with("' claude")
+        ));
 
     let stopped = handle_request(
         &test_daemon,
@@ -3004,8 +2969,7 @@ fn forget_installation_fails_closed_when_prior_selector_cannot_be_removed() {
     let secret_root = root.join("secrets");
     fs::create_dir_all(&support_root).unwrap();
     fs::create_dir_all(&secret_root).unwrap();
-    let _support_guard =
-        EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+    let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
     let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
     FileMachineStore::default()
         .save(&LocalMachineBinding {
@@ -3428,21 +3392,20 @@ fn claude_account_check_orchestrates_full_partial_pause_and_rotation_without_fan
         .prepare_managed_account(1, operation_a.to_string(), Some(account_a.clone()))
         .expect("prepare exact account");
 
-    let full =
-        check_claude_account_with_collector(1, operation_a, Some(&account_a), |_, _, _| {
-            ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
-                state: ClaudeConfigSlotCollectionStateV1::Fresh,
-                account_identifier_hash: Some(account_a.clone()),
-                organization_identifier_hash: Some(organization_a.clone()),
-                observed_at: Some("2026-08-04T10:00:00Z".to_string()),
-                last_full_quota_read_at: Some("2026-08-04T10:00:00Z".to_string()),
-                has_account_windows: true,
-                has_scoped_limits: true,
-                has_credit_balances: false,
-                ..Default::default()
-            }
-        })
-        .expect("one synchronous full check");
+    let full = check_claude_account_with_collector(1, operation_a, Some(&account_a), |_, _, _| {
+        ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
+            state: ClaudeConfigSlotCollectionStateV1::Fresh,
+            account_identifier_hash: Some(account_a.clone()),
+            organization_identifier_hash: Some(organization_a.clone()),
+            observed_at: Some("2026-08-04T10:00:00Z".to_string()),
+            last_full_quota_read_at: Some("2026-08-04T10:00:00Z".to_string()),
+            has_account_windows: true,
+            has_scoped_limits: true,
+            has_credit_balances: false,
+            ..Default::default()
+        }
+    })
+    .expect("one synchronous full check");
     assert_eq!(
         full.setup_operation.state,
         ClaudeAccountSetupOperationState::Complete
@@ -3492,39 +3455,35 @@ fn claude_account_check_orchestrates_full_partial_pause_and_rotation_without_fan
     store
         .prepare_managed_account(1, operation_partial.to_string(), Some(account_c.clone()))
         .expect("prepare partial account");
-    let partial = check_claude_account_with_collector(
-        1,
-        operation_partial,
-        Some(&account_c),
-        |_, _, _| ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
-            state: ClaudeConfigSlotCollectionStateV1::Fresh,
-            account_identifier_hash: Some(account_c.clone()),
-            organization_identifier_hash: Some(organization_c.clone()),
-            observed_at: Some("2026-08-04T10:02:00Z".to_string()),
-            has_account_windows: true,
-            has_scoped_limits: false,
-            ..Default::default()
-        },
-    )
-    .expect("partial check");
+    let partial =
+        check_claude_account_with_collector(1, operation_partial, Some(&account_c), |_, _, _| {
+            ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
+                state: ClaudeConfigSlotCollectionStateV1::Fresh,
+                account_identifier_hash: Some(account_c.clone()),
+                organization_identifier_hash: Some(organization_c.clone()),
+                observed_at: Some("2026-08-04T10:02:00Z".to_string()),
+                has_account_windows: true,
+                has_scoped_limits: false,
+                ..Default::default()
+            }
+        })
+        .expect("partial check");
     assert_eq!(
         partial.setup_operation.state,
         ClaudeAccountSetupOperationState::Reading
     );
 
-    let paused = check_claude_account_with_collector(
-        1,
-        operation_partial,
-        Some(&account_c),
-        |_, _, _| ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
-            state: ClaudeConfigSlotCollectionStateV1::CollectionPaused,
-            account_identifier_hash: Some(account_c.clone()),
-            organization_identifier_hash: Some(organization_c.clone()),
-            observed_at: Some("2026-08-04T10:03:00Z".to_string()),
-            ..Default::default()
-        },
-    )
-    .expect("paused check remains active");
+    let paused =
+        check_claude_account_with_collector(1, operation_partial, Some(&account_c), |_, _, _| {
+            ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
+                state: ClaudeConfigSlotCollectionStateV1::CollectionPaused,
+                account_identifier_hash: Some(account_c.clone()),
+                organization_identifier_hash: Some(organization_c.clone()),
+                observed_at: Some("2026-08-04T10:03:00Z".to_string()),
+                ..Default::default()
+            }
+        })
+        .expect("paused check remains active");
     assert_eq!(
         paused.setup_operation.state,
         ClaudeAccountSetupOperationState::Reading
@@ -3656,15 +3615,14 @@ fn claude_account_check_sees_a_race_to_another_account_as_mismatch() {
     };
     // [regress] A race with no verified account (approval lookup failed,
     // no prior binding) keeps setup waiting without a /login prompt.
-    let unbound =
-        check_claude_account_with_collector(1, operation, Some(&account_a), |_, _, _| {
-            ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
-                state: ClaudeConfigSlotCollectionStateV1::ConcurrentMutation,
-                observed_at: Some("2026-08-04T09:59:00Z".to_string()),
-                ..Default::default()
-            }
-        })
-        .expect("unbound race");
+    let unbound = check_claude_account_with_collector(1, operation, Some(&account_a), |_, _, _| {
+        ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
+            state: ClaudeConfigSlotCollectionStateV1::ConcurrentMutation,
+            observed_at: Some("2026-08-04T09:59:00Z".to_string()),
+            ..Default::default()
+        }
+    })
+    .expect("unbound race");
     assert_eq!(
         unbound.setup_operation.state,
         ClaudeAccountSetupOperationState::WaitingForUserLogin
@@ -3677,20 +3635,19 @@ fn claude_account_check_sees_a_race_to_another_account_as_mismatch() {
         .contains("/login"));
 
     write_identity("account-a");
-    let full =
-        check_claude_account_with_collector(1, operation, Some(&account_a), |_, _, _| {
-            ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
-                state: ClaudeConfigSlotCollectionStateV1::Fresh,
-                account_identifier_hash: Some(account_a.clone()),
-                organization_identifier_hash: Some(hash("organization", "organization-race")),
-                observed_at: Some("2026-08-04T10:00:00Z".to_string()),
-                last_full_quota_read_at: Some("2026-08-04T10:00:00Z".to_string()),
-                has_account_windows: true,
-                has_scoped_limits: true,
-                ..Default::default()
-            }
-        })
-        .expect("verified full check");
+    let full = check_claude_account_with_collector(1, operation, Some(&account_a), |_, _, _| {
+        ottto_protocol::ClaudeConfigSlotCollectionStatusV1 {
+            state: ClaudeConfigSlotCollectionStateV1::Fresh,
+            account_identifier_hash: Some(account_a.clone()),
+            organization_identifier_hash: Some(hash("organization", "organization-race")),
+            observed_at: Some("2026-08-04T10:00:00Z".to_string()),
+            last_full_quota_read_at: Some("2026-08-04T10:00:00Z".to_string()),
+            has_account_windows: true,
+            has_scoped_limits: true,
+            ..Default::default()
+        }
+    })
+    .expect("verified full check");
     assert_eq!(
         full.setup_operation.state,
         ClaudeAccountSetupOperationState::Complete
@@ -3860,8 +3817,7 @@ fn transient_core_lookup_failure_preserves_exact_reusable_claim_for_recovery() {
 #[serial]
 fn concurrent_same_id_target_replay_uses_one_exact_root_without_ledger_leak() {
     for reusable_count in [1usize, 2] {
-        let root =
-            control_test_root(&format!("claude-target-concurrent-replay-{reusable_count}"));
+        let root = control_test_root(&format!("claude-target-concurrent-replay-{reusable_count}"));
         let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
         let store = FileClaudeConfigSlotSettingsStore::default();
         for index in 0..reusable_count {
@@ -3872,11 +3828,8 @@ fn concurrent_same_id_target_replay_uses_one_exact_root_without_ledger_leak() {
                     .is_some());
             }
             let seed_id = format!("claude_setup_{:032x}", 0x200usize + index);
-            crate::claude_browser_auth::prepare_generic(
-                store.load().expect("registry"),
-                &seed_id,
-            )
-            .expect("seed reusable root");
+            crate::claude_browser_auth::prepare_generic(store.load().expect("registry"), &seed_id)
+                .expect("seed reusable root");
             assert!(crate::claude_browser_auth::request_cancel(&seed_id).expect("cancel seed"));
             if index > 0 {
                 crate::claude_browser_auth::release_reusable_root_claim(&blocker_id);
@@ -3903,8 +3856,7 @@ fn concurrent_same_id_target_replay_uses_one_exact_root_without_ledger_leak() {
             .accounts
             .iter()
             .find(|account| {
-                account.durability
-                    == ottto_protocol::ClaudeAccountAnchorDurabilityV1::DefaultOnly
+                account.durability == ottto_protocol::ClaudeAccountAnchorDurabilityV1::DefaultOnly
             })
             .and_then(|account| account.target_id.clone())
             .expect("target");
@@ -3944,9 +3896,7 @@ fn concurrent_same_id_target_replay_uses_one_exact_root_without_ledger_leak() {
         assert_eq!(first_root, second_root);
         assert_eq!(
             crate::claude_browser_auth::collection_suppression(&slot_id),
-            Some(
-                crate::claude_browser_auth::ClaudeCollectionSuppression::HideProvisionalTarget
-            )
+            Some(crate::claude_browser_auth::ClaudeCollectionSuppression::HideProvisionalTarget)
         );
         let during = crate::claude_browser_auth::annotate_status(
             store.load().expect("status during target"),
@@ -3955,9 +3905,7 @@ fn concurrent_same_id_target_replay_uses_one_exact_root_without_ledger_leak() {
             during.retained_provisional_login_count.unwrap_or(0) as usize,
             reusable_count - 1
         );
-        assert!(
-            crate::claude_browser_auth::request_cancel(&operation_id).expect("cancel target")
-        );
+        assert!(crate::claude_browser_auth::request_cancel(&operation_id).expect("cancel target"));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         while std::time::Instant::now() < deadline
             && crate::claude_browser_auth::has_browser_operation(&operation_id)
@@ -3970,9 +3918,8 @@ fn concurrent_same_id_target_replay_uses_one_exact_root_without_ledger_leak() {
         {
             thread::sleep(std::time::Duration::from_millis(25));
         }
-        let after = crate::claude_browser_auth::annotate_status(
-            store.load().expect("status after target"),
-        );
+        let after =
+            crate::claude_browser_auth::annotate_status(store.load().expect("status after target"));
         assert_eq!(
             after.retained_provisional_login_count.unwrap_or(0) as usize,
             reusable_count
@@ -4078,9 +4025,7 @@ fn browser_claim_commands_accept_cli_token_authorization_boundary() {
             &daemon(),
             LocalControlRequest {
                 request_id: "req_cli_browser_claim".to_string(),
-                protocol_version: ottto_protocol::expected_local_control_protocol_version(
-                    &command,
-                ),
+                protocol_version: ottto_protocol::expected_local_control_protocol_version(&command),
                 token: Some("bad-token".to_string()),
                 client_kind: Some(LocalClientKind::Cli),
                 client_install_owner: None,
@@ -4389,8 +4334,8 @@ fn verify_of_ended_setup_run_lets_sign_in_reconnect_the_connected_mac() {
 
     // While Ottto has said nothing terminal, a connected Mac refuses a
     // competing claim.
-    let error = auth_start(&daemon, &authorization)
-        .expect_err("healthy connected Mac refuses a new claim");
+    let error =
+        auth_start(&daemon, &authorization).expect_err("healthy connected Mac refuses a new claim");
     assert!(matches!(
         error,
         LocalApiError::InvalidRequest(message) if message.contains("already connected")
@@ -4534,9 +4479,7 @@ fn explicit_login_claim_repairs_unreadable_binding_and_clears_doctor_finding() {
         assert!(!has_finding(&daemon));
         let requests = server.join().unwrap();
         assert_eq!(requests.len(), 4);
-        assert!(
-            requests[0].starts_with("POST /api/v1/setup-claims/synthetic-fresh-claim/attach ")
-        );
+        assert!(requests[0].starts_with("POST /api/v1/setup-claims/synthetic-fresh-claim/attach "));
         assert!(requests[1].contains("/run_repaired/local-client/scan-result "));
         assert!(requests[2].contains("/run_repaired/local-client/heartbeat "));
         assert!(requests[3].contains("/run_repaired/local-client/next-action "));
@@ -5025,8 +4968,7 @@ fn logout_fails_before_active_reset_when_recovery_journal_cannot_be_invalidated(
     let support_root = telemetry_key_store_root("logout-pending-invalidation");
     let secret_root = telemetry_key_store_root("logout-pending-invalidation-secret");
     fs::create_dir_all(&secret_root).expect("secret root");
-    let _support_guard =
-        EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+    let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
     let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
     let account = connected_account();
     let device = LocalDeviceBinding {
@@ -5084,8 +5026,7 @@ fn local_only_logout_retains_prior_proof_and_rejection_becomes_reattach_required
     let support_root = root.join("support");
     let secret_root = root.join("secrets");
     fs::create_dir_all(&secret_root).expect("secret root");
-    let _support_guard =
-        EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+    let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
     let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
     let account = connected_account();
     let device = LocalDeviceBinding {
@@ -5205,8 +5146,7 @@ fn forget_installation_clears_identity_and_credentials_and_keeps_collected_state
         }
     }
     fs::create_dir_all(&secret_root).unwrap();
-    let _support_guard =
-        EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+    let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
     let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
     FileMachineStore::default()
         .save(&LocalMachineBinding {
@@ -5357,8 +5297,7 @@ fn forget_installation_clears_identity_and_credentials_and_keeps_collected_state
 #[serial]
 fn local_reset_file_cleanup_clears_relay_device_binding() {
     let support_root = telemetry_key_store_root("local-reset-device-binding");
-    let _support_guard =
-        EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+    let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
     FileAccountStore::default()
         .save(&connected_account())
         .expect("save account");
@@ -5408,8 +5347,7 @@ fn claim_completion_persists_rotated_relay_device_credentials() {
     let support_root = telemetry_key_store_root("claim-complete-relay-device");
     let secret_root = telemetry_key_store_root("claim-complete-relay-device-secret");
     fs::create_dir_all(&secret_root).expect("secret root");
-    let _support_guard =
-        EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+    let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
     let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
 
     let credentials = relay_device_credentials_from_claim_completion(
@@ -5478,8 +5416,7 @@ fn claim_completion_accepts_only_the_modern_prepared_credential_shape() {
     let support_root = telemetry_key_store_root("claim-complete-prepared-device");
     let secret_root = telemetry_key_store_root("claim-complete-prepared-device-secret");
     fs::create_dir_all(&secret_root).expect("secret root");
-    let _support_guard =
-        EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+    let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
     let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
     let candidate = format!("candidate-{}", "value".repeat(4));
     let completed: SetupClaimCompleteResponse = serde_json::from_value(json!({
@@ -5610,8 +5547,7 @@ fn modern_registration_prepare_and_confirm_use_the_additive_contract() {
     let support_root = telemetry_key_store_root("device-prepare-wire");
     let secret_root = telemetry_key_store_root("device-prepare-wire-secret");
     fs::create_dir_all(&secret_root).expect("secret root");
-    let _support_guard =
-        EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+    let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
     let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind prepare backend");
     let address = listener.local_addr().expect("prepare backend address");
@@ -5738,8 +5674,7 @@ fn claim_completion_request_sends_existing_keychain_proof_stably_across_retries(
     let support_root = telemetry_key_store_root("claim-complete-request-device");
     let secret_root = telemetry_key_store_root("claim-complete-request-device-secret");
     fs::create_dir_all(&secret_root).expect("secret root");
-    let _support_guard =
-        EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+    let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
     let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
     FileDeviceStore::default()
         .save(&LocalDeviceBinding {
@@ -5963,8 +5898,7 @@ fn rejected_prior_proof_preserves_active_authority_and_no_pending_candidate() {
     let support_root = telemetry_key_store_root("claim-prior-proof-rejected");
     let secret_root = telemetry_key_store_root("claim-prior-proof-rejected-secret");
     fs::create_dir_all(&secret_root).expect("secret root");
-    let _support_guard =
-        EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+    let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
     let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
     let active_device = LocalDeviceBinding {
         device_id: "device-rejected-proof".to_string(),
@@ -6033,8 +5967,7 @@ fn prior_secret_rotation_during_claim_http_is_detected_before_journaling() {
     let support_root = telemetry_key_store_root("claim-prior-proof-race");
     let secret_root = telemetry_key_store_root("claim-prior-proof-race-secret");
     fs::create_dir_all(&secret_root).expect("secret root");
-    let _support_guard =
-        EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+    let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
     let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
     FileDeviceStore::default()
         .save(&LocalDeviceBinding {
@@ -6328,9 +6261,8 @@ fn ended_run_release_refuses_a_device_id_that_is_not_a_plain_path_segment() {
 
 #[test]
 fn disconnect_body_carries_release_proof_only_when_both_halves_exist() {
-    let proof =
-        device_release_proof("device_release".to_string(), "secret-release".to_string())
-            .expect("complete proof");
+    let proof = device_release_proof("device_release".to_string(), "secret-release".to_string())
+        .expect("complete proof");
     assert_eq!(
         setup_run_disconnect_body(Some(&proof)),
         json!({
@@ -6367,8 +6299,7 @@ fn revocation_receipt_release_responses_are_optional_and_debug_redacted() {
         if let Some(receipt) = receipt {
             body["revocation_receipt"] = receipt;
         }
-        let disconnect: SetupRunDisconnectResponse =
-            serde_json::from_value(body.clone()).unwrap();
+        let disconnect: SetupRunDisconnectResponse = serde_json::from_value(body.clone()).unwrap();
         let release: DeviceSelfReleaseResponse = serde_json::from_value(body).unwrap();
         assert_eq!(
             disconnect
@@ -6616,9 +6547,7 @@ fn history_choice_ordinary_sign_in_works_without_optional_keychain() {
             .claim_code,
         "claim"
     );
-    assert!(
-        retire_refused_registration_after_browser_answer_with_stores("claim", &stores).is_ok()
-    );
+    assert!(retire_refused_registration_after_browser_answer_with_stores("claim", &stores).is_ok());
     assert!(history_choice_request_body(&server.join().unwrap()[0])
         .get("revocation_receipt")
         .is_none());
@@ -6925,8 +6854,7 @@ fn history_choice_receipt_marker_survives_reload_and_expires_at_24h() {
     assert_eq!(marker.device_id, "released-device");
     assert_eq!(marker.released_at, 100);
     assert!(
-        history_choice_create(&base, &reloaded, 100 + REVOCATION_RECEIPT_MAX_AGE_SECONDS)
-            .is_ok()
+        history_choice_create(&base, &reloaded, 100 + REVOCATION_RECEIPT_MAX_AGE_SECONDS).is_ok()
     );
     assert!(history_choice_request_body(&server.join().unwrap()[0])
         .get("revocation_receipt")
@@ -7019,8 +6947,7 @@ fn history_choice_registration_action_reoffers_browser_without_failed_completion
         setup_run_token: "synthetic-setup-token".into(),
         connection: connection.clone(),
     };
-    let results =
-        process_setup_actions(&daemon, &base, &mut credentials, &test_machine()).unwrap();
+    let results = process_setup_actions(&daemon, &base, &mut credentials, &test_machine()).unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].status, "running");
     let requests = server.join().unwrap();
@@ -7155,8 +7082,7 @@ fn cloud_forget_installation_releases_device_before_forgetting() {
     let secret_root = root.join("secrets");
     fs::create_dir_all(support_root.join("snapshots/destinations/old")).unwrap();
     fs::create_dir_all(&secret_root).unwrap();
-    let _support_guard =
-        EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+    let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
     let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
     FileMachineStore::default()
         .save(&LocalMachineBinding {
@@ -7229,8 +7155,9 @@ fn cloud_forget_installation_releases_device_before_forgetting() {
     let request = server.join().expect("release backend");
 
     assert!(response.ok, "{response:?}");
-    assert!(request
-        .starts_with("POST /api/v1/setup-runs/run_cloud_forget/local-client/disconnect "));
+    assert!(
+        request.starts_with("POST /api/v1/setup-runs/run_cloud_forget/local-client/disconnect ")
+    );
     let body: serde_json::Value =
         serde_json::from_str(http_request_body(&request)).expect("disconnect body");
     assert_eq!(
@@ -7376,8 +7303,7 @@ fn refresh_setup_run_token_refuses_untrusted_api_base() {
         claim_code: None,
         api_base_url: "https://attacker.example".to_string(),
     };
-    let result =
-        refresh_setup_run_token_via_device_secret("https://attacker.example", &connection);
+    let result = refresh_setup_run_token_via_device_secret("https://attacker.example", &connection);
     assert!(matches!(result, Err(LocalApiError::NetworkUnavailable)));
 }
 
@@ -8033,8 +7959,7 @@ fn diagnostics_collect_is_local_only_without_upload() {
     let _env_lock = lock_backend_test_env();
     let support = crate::test_scratch::ScratchDir::new("pl-diagnostics-export");
     let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
-    let _secrets =
-        EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &support.join("secrets"));
+    let _secrets = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &support.join("secrets"));
     let _keys = EnvVarGuard::set_path(
         TELEMETRY_KEY_FILE_STORE_ENV,
         &support.join("telemetry-keys"),
@@ -8136,8 +8061,7 @@ fn diagnostics_upload_with_support_claim_posts_redacted_bundle() {
     let _env_lock = lock_backend_test_env();
     let support = crate::test_scratch::ScratchDir::new("pl-support-bundle");
     let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
-    let _secrets =
-        EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &support.join("secrets"));
+    let _secrets = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &support.join("secrets"));
     let _keys = EnvVarGuard::set_path(
         TELEMETRY_KEY_FILE_STORE_ENV,
         &support.join("telemetry-keys"),
@@ -8330,8 +8254,8 @@ fn telemetry_control_accepts_fresh_enable_request_without_leaking_key() {
             .expect("stored key"),
         "transit_secret_for_tests"
     );
-    let config = fs::read_to_string(install_root.join(".ottto/claude-telemetry.env"))
-        .expect("Claude env");
+    let config =
+        fs::read_to_string(install_root.join(".ottto/claude-telemetry.env")).expect("Claude env");
     assert!(config.contains("# ottto:start"));
     assert!(config.contains("# ottto:end"));
     assert!(config.contains("CLAUDE_CODE_ENABLE_TELEMETRY"));
@@ -9002,8 +8926,7 @@ fn provider_daily_reference_control_refuses_to_create_consent_without_authority(
                 schema_version: crate::provider_daily_reference::SCHEMA_VERSION.to_string(),
                 collector_version: compiled_release_version(),
                 release_lane: crate::provider_daily_reference::RELEASE_LANE.to_string(),
-                disclosure_version: crate::provider_daily_reference::DISCLOSURE_VERSION
-                    .to_string(),
+                disclosure_version: crate::provider_daily_reference::DISCLOSURE_VERSION.to_string(),
                 grant_scope_fingerprint: format!("hmac-sha256:{}", "a".repeat(64)),
                 account_fingerprint: format!("hmac-sha256:{}", "b".repeat(64)),
                 status: "enabled".to_string(),
@@ -9392,9 +9315,7 @@ fn assert_telemetry_control_requires_matching_device_and_key() {
                         usize::from(action == TelemetryControlAction::Status)
                     );
                     let key = TelemetryKeyStore::production().load(&source, "key_local");
-                    if action == TelemetryControlAction::DisableTelemetry
-                        && request_key.is_some()
-                    {
+                    if action == TelemetryControlAction::DisableTelemetry && request_key.is_some() {
                         assert!(matches!(key, Err(TelemetryKeychainError::Missing)));
                     } else {
                         assert_eq!(key.unwrap(), "synthetic-key");
@@ -9696,9 +9617,7 @@ fn pi_verification_refreshes_and_repopulates_shell_cache() {
             crate::command_env::test_shell_env::set_output(Some(
                 b"GOOGLE_CLOUD_PROJECT=refreshed\n",
             ));
-            assert!(
-                run_bounded_command("pi", &[], Duration::from_secs(5), "Pi", None).succeeded
-            );
+            assert!(run_bounded_command("pi", &[], Duration::from_secs(5), "Pi", None).succeeded);
             crate::command_env::test_shell_env::set_output(None);
             assert_eq!(
                 crate::command_env::provider_env()["GOOGLE_CLOUD_PROJECT"],
@@ -9864,8 +9783,7 @@ fn live_pi_verify_makes_no_retired_import_request_and_settles_local_only() {
     for request in &requests {
         assert!(
             request.starts_with("GET ")
-                && request
-                    .contains("/api/v1/setup-runs/setup_pi_verify/local-client/verification"),
+                && request.contains("/api/v1/setup-runs/setup_pi_verify/local-client/verification"),
             "Verify must only poll setup verification, saw {request}"
         );
         assert!(!request.contains("/api/v1/pi/"));
@@ -9950,11 +9868,10 @@ fn live_pi_root_establishment_refuses_symlink_without_creating_beyond_it() {
     let outside = control_test_root("pi-live-root-symlink-outside");
     symlink(&outside, home.join(".pi")).expect("symlink .pi outside HOME");
 
-    assert!(open_or_create_pi_session_root_from_home_io(
-        &home,
-        &home.join(".pi/agent/sessions")
-    )
-    .is_err());
+    assert!(
+        open_or_create_pi_session_root_from_home_io(&home, &home.join(".pi/agent/sessions"))
+            .is_err()
+    );
     assert!(!outside.join("agent").exists());
     let _ = fs::remove_dir_all(home);
     let _ = fs::remove_dir_all(outside);
@@ -9969,14 +9886,11 @@ fn live_pi_root_establishment_refuses_a_symlink_eexist_race_winner() {
     let outside = control_test_root("pi-live-root-eexist-symlink-outside");
     let held_home = open_pi_session_root_direct_io(&home).expect("hold test HOME");
 
-    let result = open_or_create_pi_directory_component_with(
-        &held_home.directory,
-        ".pi".as_ref(),
-        |_, _| {
+    let result =
+        open_or_create_pi_directory_component_with(&held_home.directory, ".pi".as_ref(), |_, _| {
             symlink(&outside, home.join(".pi")).expect("race winner creates symlink");
             Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists))
-        },
-    );
+        });
 
     assert!(result.is_err());
     assert!(!outside.join("agent").exists());
@@ -10102,8 +10016,7 @@ fn pi_session_discovery_refuses_root_replacement_after_open() {
 
     fs::rename(&root, &original).expect("move opened session root");
     fs::create_dir(&root).expect("create replacement session root");
-    fs::write(root.join("outside.jsonl"), b"outside-secret\n")
-        .expect("write replacement session");
+    fs::write(root.join("outside.jsonl"), b"outside-secret\n").expect("write replacement session");
 
     let error = pi_session_files_for_root(&opened_root)
         .expect_err("count/selection must refuse a replaced root");
@@ -10479,9 +10392,7 @@ fn claude_smoke_waits_inside_the_quiet_window() {
     let result = smoke_failure_verification_result(SourceKind::ClaudeCode, &smoke, None);
     assert_eq!(result.status, SourceVerificationStatus::Warning);
 
-    assert!(
-        crate::provider_calls::test_lines(CallKind::ClaudeSmokePrompt, &account).is_empty()
-    );
+    assert!(crate::provider_calls::test_lines(CallKind::ClaudeSmokePrompt, &account).is_empty());
 
     fake.default_login_expires_in(time::Duration::hours(2));
     let smoke = run_smoke_prompt(&SourceKind::ClaudeCode);
@@ -10520,8 +10431,7 @@ fn pi_default_route_smoke_is_one_unknown_provider_line() {
     fs::set_permissions(&pi, fs::Permissions::from_mode(0o755)).expect("executable");
     let _home = EnvVarGuard::set_path("HOME", &root);
     let _search = EnvVarGuard::set_path("OTTTO_COMMAND_SEARCH_PATH", &bin);
-    let _support =
-        EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root.join("support"));
+    let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root.join("support"));
 
     let _ = run_smoke_prompt(&SourceKind::Pi);
 
@@ -10716,8 +10626,7 @@ fn codex_source_off_orphan_refuses_unknown_ownership_without_backup_or_write() {
 
 #[test]
 fn patch_claude_code_env_writes_fenced_env_and_shell_source_line() {
-    let root =
-        std::env::temp_dir().join(format!("ottto-claude-env-test-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("ottto-claude-env-test-{}", std::process::id()));
     let env_path = root.join(".ottto/claude-telemetry.env");
     let shell_path = root.join(".zshrc");
     let _ = fs::remove_dir_all(&root);
@@ -10914,9 +10823,8 @@ fn startup_relay_busy_preferred_port_uses_default_then_fallbacks() {
     );
     // Plan the candidate binds: any real candidate number can be held by a
     // parallel test's ephemeral port, so the free one is a held listener.
-    let busy = || -> std::io::Result<std::net::TcpListener> {
-        Err(std::io::ErrorKind::AddrInUse.into())
-    };
+    let busy =
+        || -> std::io::Result<std::net::TcpListener> { Err(std::io::ErrorKind::AddrInUse.into()) };
     let held = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let addr = held.local_addr().unwrap();
     let default_listener = with_bind_plan([(ports[1], busy()), (ports[0], Ok(held))], || {
@@ -11003,8 +10911,7 @@ fn rebind_busy_approved_port_falls_back_after_three_attempts_and_serves() {
         crate::otlp_relay::rebind_relay_listener(old, &mut |port, attempt| {
             attempts += 1;
             assert!(attempt <= 3, "approved retry must be bounded");
-            let result =
-                crate::otlp_relay::bind_replacement_local_relay_listener(port, attempt);
+            let result = crate::otlp_relay::bind_replacement_local_relay_listener(port, attempt);
             if attempt < 3 {
                 assert!(result.is_err(), "approved port gets its retry budget first");
             }
@@ -11066,8 +10973,7 @@ fn rebind_busy_approved_port_falls_back_after_three_attempts_and_serves() {
         let (stream, _) = listener.accept().unwrap();
         crate::otlp_relay::serve_test_connection(stream, daemon);
     });
-    let mut client =
-        std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2)).unwrap();
+    let mut client = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2)).unwrap();
     client
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
@@ -11273,9 +11179,8 @@ fn relay_endpoint_mismatch_is_response_only_and_clears_with_settings_or_consent(
     crate::refresh_canonical_local_health(&mut uploaded);
     // One projection per status: a raised blocker never takes a revision
     // above the cleared status that follows it.
-    let revision = |status: &ottto_protocol::DaemonStatus| {
-        status.canonical_health.as_ref().unwrap().revision
-    };
+    let revision =
+        |status: &ottto_protocol::DaemonStatus| status.canonical_health.as_ref().unwrap().revision;
     let raised_revision = revision(&daemon.status_for_trusted_client().unwrap());
     for status in [daemon.status_for_trusted_client().unwrap(), uploaded] {
         let (codes, overall) = mismatch_blockers(&status);
@@ -11288,10 +11193,8 @@ fn relay_endpoint_mismatch_is_response_only_and_clears_with_settings_or_consent(
         );
         assert_ne!(overall, ottto_protocol::LocalHealthOverallState::Healthy);
     }
-    let diagnostics = crate::claude_local_otel::support_health::diagnostics_items(
-        &root.join("support"),
-        &live,
-    );
+    let diagnostics =
+        crate::claude_local_otel::support_health::diagnostics_items(&root.join("support"), &live);
     assert_eq!(
         diagnostics[&finding.code],
         ottto_protocol::RedactedValue::String(finding.text.clone())
@@ -11330,11 +11233,8 @@ fn relay_endpoint_mismatch_is_response_only_and_clears_with_settings_or_consent(
         "blocker clears on match"
     );
     assert!(
-        !crate::claude_local_otel::support_health::diagnostics_items(
-            &root.join("support"),
-            &live
-        )
-        .contains_key(&finding.code)
+        !crate::claude_local_otel::support_health::diagnostics_items(&root.join("support"), &live)
+            .contains_key(&finding.code)
     );
     write_startup_relay_settings(&root, "http://127.0.0.1:48123");
     assert!(
@@ -11368,11 +11268,8 @@ fn relay_endpoint_mismatch_is_response_only_and_clears_with_settings_or_consent(
         .last_error
         .is_none());
     assert!(
-        !crate::claude_local_otel::support_health::diagnostics_items(
-            &root.join("support"),
-            &live
-        )
-        .contains_key(&finding.code)
+        !crate::claude_local_otel::support_health::diagnostics_items(&root.join("support"), &live)
+            .contains_key(&finding.code)
     );
     fs::remove_dir_all(root).unwrap();
 }
@@ -11498,8 +11395,7 @@ fn managed_claude_relay_disable_survives_automatic_repair_and_preserves_root_opt
     settings["env"]["USER_FLAG"] = json!("keep");
     fs::write(&path, serde_json::to_vec(&settings).unwrap()).unwrap();
     assert!(disable_managed_claude_relay_settings().unwrap());
-    let disabled: serde_json::Value =
-        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let disabled: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     assert_eq!(disabled["env"], json!({"USER_FLAG":"keep"}));
     let default = root.join(".claude/settings.json");
     let default_body = fs::read(&default).unwrap();
@@ -11523,8 +11419,7 @@ fn managed_claude_relay_disable_survives_automatic_repair_and_preserves_root_opt
     patch_claude_code_settings_with_relay_base(&test_machine(), "http://127.0.0.1:48123", true)
         .unwrap();
     assert!(!repair_registered_managed_claude_relay_settings().unwrap());
-    let settings: serde_json::Value =
-        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let settings: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     assert_eq!(settings["env"]["CLAUDE_CODE_ENABLE_TELEMETRY"], "0");
     assert_eq!(settings["env"]["USER_FLAG"], "keep");
     fs::remove_dir_all(root).unwrap();
@@ -11900,8 +11795,7 @@ fn setup_scan_sources_carry_scan_time_and_the_selected_status_row() {
     let root = control_test_root("setup-scan-selected-status");
     let _home = EnvVarGuard::set_path("HOME", &root);
     let _commands = EnvVarGuard::set_path("OTTTO_COMMAND_SEARCH_PATH", &root.join("bin"));
-    let _support =
-        EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root.join("support"));
+    let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root.join("support"));
     let _secret = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &root.join("secrets"));
     let cached: AgentStatusSnapshot = serde_json::from_value(json!({
         "source": "pi", "status": "available", "collection_method": "config_file",
@@ -11964,8 +11858,7 @@ fn codex_source_off_setup_and_manual_verification_do_not_probe_provider_or_backe
     fs::write(root.join(".codex/config.toml"), "model = \"test-model\"\n").unwrap();
     let _commands = EnvVarGuard::set_path("OTTTO_COMMAND_SEARCH_PATH", &root.join("empty-bin"));
     let _home = EnvVarGuard::set_path("HOME", &root);
-    let _support =
-        EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root.join("support"));
+    let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root.join("support"));
     let secret_root = root.join("secrets");
     fs::create_dir_all(&secret_root).unwrap();
     let _secret = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
@@ -12091,8 +11984,7 @@ fn codex_source_off_respects_no_touch_override_at_startup() {
     let root = control_test_root("codex-source-off-no-touch");
     fs::create_dir_all(root.join(".codex")).unwrap();
     let _home = EnvVarGuard::set_path("HOME", &root);
-    let _support =
-        EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root.join("support"));
+    let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root.join("support"));
     let _disabled = EnvVarGuard::set_str("OTTTO_PATCH_CODEX_DISABLED", "1");
     let path = root.join(".codex/config.toml");
     let body = render_codex_relay_toml_block_for_base("http://127.0.0.1:44621");
@@ -12298,8 +12190,7 @@ fn verify_repair_repairs_codex_config_before_account_check() {
 
     assert!(response.ok, "{response:?}");
     let result: SourceVerificationResult =
-        serde_json::from_value(response.payload.expect("payload"))
-            .expect("verification result");
+        serde_json::from_value(response.payload.expect("payload")).expect("verification result");
     assert_eq!(result.message.code, "account_not_connected");
     assert!(result.config.drift.is_empty());
     let body = fs::read_to_string(&config_path).expect("read repaired config");
@@ -12487,8 +12378,7 @@ fn verify_patch_disabled_skips_repair_writes() {
 
     assert!(response.ok);
     let result: SourceVerificationResult =
-        serde_json::from_value(response.payload.expect("payload"))
-            .expect("verification result");
+        serde_json::from_value(response.payload.expect("payload")).expect("verification result");
     assert_eq!(result.message.code, "patch_disabled");
     assert!(result.config.drift.is_empty());
     assert_eq!(
@@ -12509,8 +12399,7 @@ mod tracking_confirmation_tests {
         let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
         let daemon = daemon();
         let authorization = RequestAuthorization::TrustedCompanionApp;
-        let mut plan =
-            propose_repair_plan(&daemon, &authorization, SourceKind::Pi, true).unwrap();
+        let mut plan = propose_repair_plan(&daemon, &authorization, SourceKind::Pi, true).unwrap();
         FileDeviceStore::default()
             .save(&LocalDeviceBinding {
                 device_id: "device_test".into(),
@@ -12540,11 +12429,8 @@ mod tracking_confirmation_tests {
             }
         }
         plan.status = RepairPlanStatus::Proposed;
-        crate::snapshot_sync::disable_snapshot_source(
-            &root,
-            crate::snapshots::SnapshotSource::Pi,
-        )
-        .unwrap();
+        crate::snapshot_sync::disable_snapshot_source(&root, crate::snapshots::SnapshotSource::Pi)
+            .unwrap();
         daemon
             .arm_tracking_confirmation(&SourceKind::Pi, &plan)
             .unwrap();
@@ -12573,8 +12459,7 @@ fn fix_non_dry_run_executes_claude_write_config_repair() {
     let _support_guard =
         EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root.join("support"));
     let settings_path = root.join(".claude/settings.json");
-    fs::write(&settings_path, r#"{"env":{"EXISTING":"keep"}}"#)
-        .expect("write drifted settings");
+    fs::write(&settings_path, r#"{"env":{"EXISTING":"keep"}}"#).expect("write drifted settings");
 
     let response = handle_request(
         &daemon(),
@@ -12795,8 +12680,7 @@ fn claude_expired_oauth_maps_to_source_reconnect_required() {
         duration_ms: 12,
         message: "The Claude Code test run failed before Ottto could check it.".to_string(),
         diagnostic: Some(
-            "Failed to authenticate: OAuth session expired and could not be refreshed"
-                .to_string(),
+            "Failed to authenticate: OAuth session expired and could not be refreshed".to_string(),
         ),
         error_code: Some("smoke_command_failed".to_string()),
         local_session_observed: None,
@@ -12821,7 +12705,11 @@ fn claude_signed_out_smoke_requires_provider_sign_in() {
     let _lock = lock_backend_test_env();
     let root = control_test_root("claude-ottto-connected-smoke");
     let fake_claude = fake_binary_path(&root, "claude");
-    fs::write(&fake_claude, "#!/bin/sh\n: > \"$HOME/spawned\"\necho 'Not logged in · Please run /login' >&2\nexit 1\n").unwrap();
+    fs::write(
+        &fake_claude,
+        "#!/bin/sh\n: > \"$HOME/spawned\"\necho 'Not logged in · Please run /login' >&2\nexit 1\n",
+    )
+    .unwrap();
     let fake_security = fake_binary_path(&root, "security");
     fs::write(&fake_security, "#!/bin/sh\nexit 44\n").unwrap();
     for path in [&fake_claude, &fake_security] {
@@ -12829,8 +12717,7 @@ fn claude_signed_out_smoke_requires_provider_sign_in() {
     }
     let _home = EnvVarGuard::set_path("HOME", &root);
     let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
-    let _search =
-        EnvVarGuard::set_path("OTTTO_COMMAND_SEARCH_PATH", fake_claude.parent().unwrap());
+    let _search = EnvVarGuard::set_path("OTTTO_COMMAND_SEARCH_PATH", fake_claude.parent().unwrap());
     for diagnostic in [
         "Not logged in · Please run /login",
         "not signed in",
@@ -13147,8 +13034,7 @@ fn only_the_companion_repair_press_overrides_a_rebuild_loop_pause() {
     // Hold-budget damage: valid JSON whose session-identity fields an
     // override can strictly recover; syntax damage cannot.
     let mut damage = serde_json::to_value(ScanIndex::default()).expect("index value");
-    damage["files"]["excess-held"] =
-        serde_json::json!({"unknown": "x".repeat(2 * 1024 * 1024)});
+    damage["files"]["excess-held"] = serde_json::json!({"unknown": "x".repeat(2 * 1024 * 1024)});
     let damage = serde_json::to_vec(&damage).expect("damaged index bytes");
     // A second whole-index incident inside 24 hours pauses the source.
     let pause = |source: SnapshotSource| {
@@ -13299,12 +13185,10 @@ fn only_the_companion_repair_press_overrides_a_rebuild_loop_pause() {
         ),
         crate::snapshots::ScanIndexRebuildOverride::Armed
     );
-    assert!(ScanIndex::load_for_snapshot_source_with_origin(
-        &codex,
-        SnapshotSource::Codex,
-        &root
-    )
-    .is_err());
+    assert!(
+        ScanIndex::load_for_snapshot_source_with_origin(&codex, SnapshotSource::Codex, &root)
+            .is_err()
+    );
     let plan = propose_repair_plan(
         &daemon,
         &RequestAuthorization::TrustedCompanionApp,
@@ -13449,8 +13333,8 @@ fn revoked_cross_account_predecessor_gets_plain_replace_it_guidance() {
     assert!(message.contains("Replace it"));
     assert!(!message.contains("predecessor"));
 
-    let state = reattach_required_state(&backend_rejection(endpoint, 409, body))
-        .expect("reattach state");
+    let state =
+        reattach_required_state(&backend_rejection(endpoint, 409, body)).expect("reattach state");
     assert_eq!(
         state.message.code,
         "reattach_required:revoked_cross_account_predecessor"
@@ -13492,8 +13376,7 @@ fn setup_clears_cancelled_binding_before_requiring_fresh_claim() {
         "otsr_stale",
     )
     .expect("setup-run token");
-    let _support_guard =
-        EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+    let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
     let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
     let connection = LocalConnectionBinding {
         setup_run_id: "setup_cancelled".to_string(),
@@ -13559,8 +13442,7 @@ fn setup_cancelled_cleanup_preserves_newer_binding_and_token() {
     let support_root = control_test_root("setup-cancelled-race");
     let secret_root = telemetry_key_store_root("setup-cancelled-race-secret");
     fs::create_dir_all(&secret_root).expect("secret root");
-    let _support_guard =
-        EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+    let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
     let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
     let stale = LocalConnectionBinding {
         setup_run_id: "setup_cancelled".to_string(),
@@ -14241,8 +14123,7 @@ fn expired_setup_run_read_refreshes_once_and_reports_reconnect_required() {
     let read = || {
         let result = agent_costs(&daemon, &authorization, AgentCostsQuery::default());
         let paths = std::mem::take(&mut *calls.lock().expect("calls lock"));
-        let count =
-            |endpoint: &str| paths.iter().filter(|path| path.contains(endpoint)).count();
+        let count = |endpoint: &str| paths.iter().filter(|path| path.contains(endpoint)).count();
         (
             result,
             count("/local-client/costs"),
@@ -14696,8 +14577,7 @@ fn setup_answer_revokes_claude_once_and_disable_stays_paused_on_failed_post() {
     fs::create_dir_all(&support_root).expect("support root");
     fs::create_dir_all(&secret_root).expect("secret root");
     let _home_guard = EnvVarGuard::set_path("HOME", &root);
-    let _support_guard =
-        EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+    let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
     let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
     KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
         .save("otsr_answer")
@@ -14741,8 +14621,7 @@ fn setup_answer_revokes_claude_once_and_disable_stays_paused_on_failed_post() {
             Some(api_base_url.clone()),
         )
     };
-    let marker =
-        || crate::snapshot_sync::source_marker(&support_root, SnapshotSource::ClaudeCode);
+    let marker = || crate::snapshot_sync::source_marker(&support_root, SnapshotSource::ClaudeCode);
 
     let revokes = count_revokes(|| {
         answer("disable_source").expect_err("the backend refuses the disable");
@@ -14773,8 +14652,7 @@ fn setup_action_refreshes_token_across_queue_and_verification() {
     fs::set_permissions(&fake_claude, fs::Permissions::from_mode(0o755))
         .expect("mark fake claude executable");
     let _home_guard = EnvVarGuard::set_path("HOME", &root);
-    let _support_guard =
-        EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+    let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
     let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
     let _path_guard = EnvVarGuard::set_os(
         "OTTTO_COMMAND_SEARCH_PATH",
@@ -14881,10 +14759,8 @@ fn setup_action_refreshes_token_across_queue_and_verification() {
 
 #[test]
 fn setup_verification_request_honors_custom_timeout() {
-    let api_base_url = delayed_setup_verification_server(
-        "setup_slow_verification",
-        Duration::from_millis(250),
-    );
+    let api_base_url =
+        delayed_setup_verification_server("setup_slow_verification", Duration::from_millis(250));
     let connection = LocalConnectionBinding {
         setup_run_id: "setup_slow_verification".to_string(),
         setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
@@ -14917,8 +14793,7 @@ fn install_source_action_uses_rebound_credentials_for_install_session_and_comple
     let secret_root = telemetry_key_store_root("install-source-rebound-secret");
     fs::create_dir_all(&secret_root).expect("secret root");
     let _home_guard = EnvVarGuard::set_path("HOME", &root);
-    let _support_guard =
-        EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+    let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
     let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
     FileDeviceStore::default()
         .save(&LocalDeviceBinding {
@@ -14935,10 +14810,8 @@ fn install_source_action_uses_rebound_credentials_for_install_session_and_comple
         .expect("persist stale setup token");
     let install_session_request = Arc::new(Mutex::new(None));
     let completed_body = Arc::new(Mutex::new(None));
-    let api_base_url = setup_install_source_rebind_server(
-        install_session_request.clone(),
-        completed_body.clone(),
-    );
+    let api_base_url =
+        setup_install_source_rebind_server(install_session_request.clone(), completed_body.clone());
     let connection = LocalConnectionBinding {
         setup_run_id: "setup_install_stale".to_string(),
         setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
@@ -14957,9 +14830,8 @@ fn install_source_action_uses_rebound_credentials_for_install_session_and_comple
         .with_account(connected_account())
         .with_connection(Some(connection));
 
-    let results =
-        process_setup_actions(&daemon, &api_base_url, &mut credentials, &test_machine())
-            .expect("install_source should refresh, rebind, and complete");
+    let results = process_setup_actions(&daemon, &api_base_url, &mut credentials, &test_machine())
+        .expect("install_source should refresh, rebind, and complete");
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].action_type, "install_source");
@@ -15288,8 +15160,7 @@ fn setup_verify_action_token_refresh_server(
                 } else if request.contains("X-Ottto-Setup-Run-Token: otsr_fresh_complete") {
                     complete_calls += 1;
                     let body: serde_json::Value =
-                        serde_json::from_str(http_request_body(&request))
-                            .expect("complete json");
+                        serde_json::from_str(http_request_body(&request)).expect("complete json");
                     *completed_body.lock().expect("completed body lock") = Some(body);
                     write_json_response(
                         &mut stream,
@@ -15347,9 +15218,8 @@ fn setup_run_terminal_scan_server(setup_run_id: &'static str, detail: &'static s
         assert!(request.contains(&format!(
             "/api/v1/setup-runs/{setup_run_id}/local-client/scan-result"
         )));
-        let body = format!(
-            r#"{{"error":"HTTPException","detail":"{detail}","request_id":"req_test"}}"#
-        );
+        let body =
+            format!(r#"{{"error":"HTTPException","detail":"{detail}","request_id":"req_test"}}"#);
         let response = format!(
             "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
@@ -15684,12 +15554,7 @@ fn scripted_json_backend(
     (format!("http://{address}"), server)
 }
 
-fn write_json_response(
-    stream: &mut std::net::TcpStream,
-    status: u16,
-    reason: &str,
-    body: &str,
-) {
+fn write_json_response(stream: &mut std::net::TcpStream, status: u16, reason: &str, body: &str) {
     let response = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
@@ -16037,12 +15902,9 @@ pub(crate) fn owner_return_credential_for_test(
     )
     .unwrap();
     stage_pending_setup_run_token(&pending, "setup").unwrap();
-    let confirmed = mark_pending_device_credential_confirmed(
-        &pending,
-        "2026-11-16T08:00:00Z",
-        &pending_store,
-    )
-    .unwrap();
+    let confirmed =
+        mark_pending_device_credential_confirmed(&pending, "2026-11-16T08:00:00Z", &pending_store)
+            .unwrap();
     // Restart boundary: reload the staged journal and candidate through
     // the real startup recovery owner, including account/connection/cutoff.
     assert_eq!(pending_store.load().unwrap().as_ref(), Some(&confirmed));
@@ -16088,8 +15950,7 @@ fn owner_return_logout_preserves_history_at_promotion_failure_cuts() {
             );
             let key = pending_owner_snapshot_key(&pending).unwrap();
             let authority = pending.request_authority.as_mut().unwrap();
-            authority.incoming_snapshot_namespace =
-                Some(OwnerSnapshotNamespace { key, namespace });
+            authority.incoming_snapshot_namespace = Some(OwnerSnapshotNamespace { key, namespace });
             pending.schema_version = OWNER_RETURN_CREDENTIAL_SCHEMA_VERSION;
             pending.confirmed_at = Some("confirmed".into());
             assert!(
@@ -16211,17 +16072,12 @@ fn owner_return_logout_skips_unreadable_history_and_counts_the_diagnostic() {
                 let daemon = daemon()
                     .with_account(FileAccountStore::default().load().unwrap())
                     .with_connection(Some(connection));
-                let (response, diagnostics) =
-                    crate::local_resource_diagnostics::capture(|| {
-                        handle_request(
-                            &daemon,
-                            auth_reset_request(
-                                "logout-history-error",
-                                local_only,
-                                forget_installation,
-                            ),
-                        )
-                    });
+                let (response, diagnostics) = crate::local_resource_diagnostics::capture(|| {
+                    handle_request(
+                        &daemon,
+                        auth_reset_request("logout-history-error", local_only, forget_installation),
+                    )
+                });
                 if let Some(server) = server {
                     server.join().unwrap();
                 }
@@ -16270,8 +16126,7 @@ fn owner_return_logout_skips_unreadable_history_and_counts_the_diagnostic() {
 fn owner_return_logout_with_unconfirmed_switch_retains_the_active_pair() {
     use ottto_core::token_store::MemoryTokenStore;
     for authorized in [false, true] {
-        let root =
-            crate::test_scratch::ScratchDir::canonical("owner-return-unconfirmed-logout");
+        let root = crate::test_scratch::ScratchDir::canonical("owner-return-unconfirmed-logout");
         let store = FileOwnerSnapshotNamespaceStore::new(root.join("history.json"));
         let (mut pending, _) = owner_return_pending("b", "org", "unconfirmed");
         let key = pending_owner_snapshot_key(&pending).unwrap();
@@ -16751,8 +16606,7 @@ fn relogin_refusals_start_a_fresh_namespace() {
         let canonical = install_legacy_active("device-refuse-a", &["codex"], "user_test");
         let mut prior = prior_device_credential_for_registration().unwrap().unwrap();
         let next = relogin_device("device-refuse-b", &["codex"]);
-        let (mut pending, candidate, token) =
-            relogin_claim(&prior, "user_test", "org_test", next);
+        let (mut pending, candidate, token) = relogin_claim(&prior, "user_test", "org_test", next);
         let original = pending.claim_commit.clone().unwrap();
         authority(&mut pending).canonical_snapshot_namespace = None;
         edit(&mut pending, &mut prior);
@@ -16905,8 +16759,7 @@ fn relogin_crash_cuts_keep_the_journaled_namespace() {
         let canonical = install_legacy_active("device-cut-a", &["codex"], "user_test");
         let prior = prior_device_credential_for_registration().unwrap().unwrap();
         let next = relogin_device("device-cut-b", &["codex"]);
-        let (mut pending, candidate, token) =
-            relogin_claim(&prior, "user_test", "org_test", next);
+        let (mut pending, candidate, token) = relogin_claim(&prior, "user_test", "org_test", next);
         pending.preconfirm_guards_passed = false;
         stage_pending_device_credential(&pending, &candidate).unwrap();
         stage_pending_setup_run_token(&pending, &token).unwrap();
