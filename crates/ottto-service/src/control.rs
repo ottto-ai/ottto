@@ -191,6 +191,7 @@ use toml_edit::Item;
 
 mod backend_http;
 mod diagnostics;
+mod protocol;
 use backend_http::api_url_with_base;
 use backend_http::backend_error_from_ureq;
 use backend_http::backend_get_agent_read_json;
@@ -220,6 +221,53 @@ use backend_http::MAC_DISCONNECTED_FROM_EARLIER_ACCOUNT_MESSAGE;
 #[cfg(test)]
 use backend_http::MAC_DISCONNECTED_MESSAGE;
 use diagnostics::diagnostics_collect;
+use protocol::api_url;
+use protocol::append_nonce_to_claim_url;
+use protocol::to_value;
+use protocol::BackendControlTokenClaims;
+use protocol::BackendControlTokenValidationRequest;
+use protocol::BackendControlTokenValidationResponse;
+use protocol::DeviceCredentialConfirmationApiResponse;
+use protocol::DeviceCredentialPreparationApiResponse;
+use protocol::DeviceCredentialPreparationStatusApiResponse;
+use protocol::DeviceReleaseProof;
+use protocol::DeviceSelfReleaseResponse;
+use protocol::DiagnosticsUploadApprovalSummary;
+use protocol::DiagnosticsUploadBody;
+use protocol::DiagnosticsUploadClient;
+use protocol::DiagnosticsUploadResponse;
+use protocol::InstallSessionApiResponse;
+use protocol::InstallSessionEvent;
+use protocol::OrStatePoisoned;
+use protocol::RefreshedSetupRunToken;
+#[cfg(test)]
+use protocol::ReleaseArtifact;
+use protocol::ReleaseManifest;
+#[cfg(test)]
+use protocol::ReleaseRollback;
+use protocol::SetupActionEvent;
+use protocol::SetupActionResult;
+#[cfg(test)]
+use protocol::SetupClaimCompleteOrganization;
+#[cfg(test)]
+use protocol::SetupClaimCompleteRelayDevice;
+use protocol::SetupClaimCompleteResponse;
+#[cfg(test)]
+use protocol::SetupClaimCompleteUser;
+use protocol::SetupClaimCompletion;
+use protocol::SetupClaimCreateResponse;
+use protocol::SetupRunActionApiResponse;
+use protocol::SetupRunAttachResponse;
+use protocol::SetupRunCredentials;
+use protocol::SetupRunDetailApiResponse;
+use protocol::SetupRunDisconnectResponse;
+use protocol::SetupRunNextActionResponse;
+use protocol::SetupRunRefreshResponse;
+use protocol::SetupRunVerificationFilters;
+use protocol::SetupRunVerificationResponse;
+use protocol::SetupScanPayload;
+use protocol::SetupScanSource;
+use protocol::SetupVerificationTimeouts;
 
 // Direct API host (was the apex `ottto.net/backend` proxy, retired in the
 // marketing-site cutover). Matches DIRECT_API_BASE_URL below.
@@ -3761,60 +3809,6 @@ fn require_authorized_local_client(
     }
 }
 
-#[derive(Debug, Serialize)]
-struct DiagnosticsUploadBody<'a> {
-    bundle: &'a DiagnosticsBundle,
-    approval: DiagnosticsUploadApprovalSummary,
-    client: DiagnosticsUploadClient,
-}
-
-#[derive(Debug, Serialize)]
-struct DiagnosticsUploadApprovalSummary {
-    approved: bool,
-    retention_disclosure_accepted: bool,
-    retention_disclosure: &'static str,
-    authorization: DiagnosticsUploadAuthorization,
-    support_claim_provided: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct DiagnosticsUploadClient {
-    protocol_version: u16,
-    local_platform_version: String,
-    machine_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct DiagnosticsUploadResponse {
-    upload_id: Option<String>,
-    uploaded_at: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct BackendControlTokenClaims {
-    organization_id: Option<String>,
-    user_id: Option<String>,
-    device_id: Option<String>,
-    key_id: Option<String>,
-    token_id: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct BackendControlTokenValidationRequest {
-    token: String,
-    source: String,
-    action: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct BackendControlTokenValidationResponse {
-    organization_id: Option<String>,
-    user_id: Option<String>,
-    device_id: Option<String>,
-    key_id: Option<String>,
-    token_id: Option<String>,
-}
-
 #[expect(clippy::too_many_arguments, reason = "9 args; no options struct yet")]
 fn telemetry_control(
     daemon: &LocalDaemon,
@@ -7004,73 +6998,6 @@ fn cloud_logout_requires_connection_error(forget_installation: bool) -> LocalApi
     })
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-struct SetupClaimCreateResponse {
-    #[serde(default)]
-    client_nonce: Option<String>,
-    claim_code: String,
-    claim_token: String,
-    claim_url: String,
-    expires_at: String,
-}
-
-impl std::fmt::Debug for SetupClaimCreateResponse {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("SetupClaimCreateResponse([redacted])")
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct SetupClaimCompleteResponse {
-    setup_run_id: String,
-    setup_run_token: String,
-    setup_run_token_expires_at: String,
-    machine_id: Option<String>,
-    relay_device: Option<SetupClaimCompleteRelayDevice>,
-    relay_device_secret: Option<String>,
-    #[serde(default)]
-    relay_device_credential_preparation: Option<DeviceCredentialPreparationApiResponse>,
-    connected_at: String,
-    user: SetupClaimCompleteUser,
-    organization: SetupClaimCompleteOrganization,
-    /// Additive local-history backfill policy ("full" | "from"); absent on old
-    /// backends, which means full-backfill behavior (same as "full").
-    #[serde(default)]
-    backfill_policy: Option<String>,
-    /// Server-UTC takeover moment accompanying `backfill_policy: "from"`.
-    #[serde(default)]
-    backfill_cutoff_at: Option<String>,
-}
-
-/// Claim completion plus the exact prior authority snapshot used to authorize
-/// it. Deliberately has no `Debug` implementation because it owns a Keychain
-/// secret until the non-secret recovery journal is staged.
-struct SetupClaimCompletion {
-    response: SetupClaimCompleteResponse,
-    prior_device_credential: Option<PriorDeviceCredential>,
-    request_authority: PendingDeviceCredentialRequestAuthority,
-}
-
-#[derive(Debug, Deserialize)]
-struct SetupClaimCompleteRelayDevice {
-    id: String,
-    machine_id: Option<String>,
-    sources: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SetupClaimCompleteUser {
-    id: String,
-    email: String,
-    display_name: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SetupClaimCompleteOrganization {
-    id: String,
-    name: String,
-}
-
 fn create_setup_claim(
     machine: &MachineIdentity,
     nonce: &str,
@@ -7735,66 +7662,6 @@ fn setup_claim_complete_body(
         "machine_name": machine.display_name,
         "platform": "macos",
     })
-}
-
-fn api_url(path: &str) -> String {
-    let base =
-        std::env::var("OTTTO_API_BASE_URL").unwrap_or_else(|_| DEFAULT_API_BASE_URL.to_string());
-    format!("{}{}", base.trim_end_matches('/'), path)
-}
-
-fn append_nonce_to_claim_url(claim_url: &str, nonce: &str) -> String {
-    let separator = if claim_url.contains('?') { '&' } else { '?' };
-    format!("{claim_url}{separator}nonce={nonce}")
-}
-
-fn to_value(value: impl Serialize) -> Result<serde_json::Value, LocalApiError> {
-    serde_json::to_value(value).or_state_poisoned()
-}
-
-/// Maps any failure of a local state read or write to `StatePoisoned`; the
-/// cause is not reported.
-trait OrStatePoisoned<T> {
-    fn or_state_poisoned(self) -> Result<T, LocalApiError>;
-}
-
-impl<T, E> OrStatePoisoned<T> for Result<T, E> {
-    fn or_state_poisoned(self) -> Result<T, LocalApiError> {
-        self.map_err(|_| LocalApiError::StatePoisoned)
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct ReleaseManifest {
-    schema_version: u16,
-    product: String,
-    version: String,
-    channel: ReleaseChannel,
-    commit: String,
-    min_supported_version: String,
-    min_protocol_version: u16,
-    supported_install_owners: Vec<InstallOwner>,
-    #[serde(default)]
-    release_notes: Option<String>,
-    rollback: ReleaseRollback,
-    #[serde(default)]
-    artifacts: Vec<ReleaseArtifact>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ReleaseRollback {
-    strategy: String,
-    immutable_prefix: String,
-    latest_manifest_url: String,
-    preserve_failed_version: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct ReleaseArtifact {
-    kind: String,
-    platform: String,
-    arch: String,
-    url: String,
 }
 
 fn check_update_state() -> UpdateState {
@@ -8995,105 +8862,6 @@ fn setup_action(
     Ok(result)
 }
 
-#[derive(Debug, Deserialize)]
-struct SetupRunAttachResponse {
-    setup_run_id: String,
-    setup_run_token: String,
-    expires_at: String,
-    run: SetupRunApiRun,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct SetupRunDetailApiResponse {
-    run: SetupRunApiRun,
-    #[serde(default)]
-    sources: Vec<SetupRunSourceApiResponse>,
-    next_action: Option<SetupRunActionApiResponse>,
-    next_question: Option<serde_json::Value>,
-    // Web claim URL the app opens when a setup run waits on browser approval
-    // (e.g. a verify_source that found no fresh telemetry transitions to
-    // waiting_for_user). Surfaced to the Swift app so it can open the re-claim
-    // tab instead of leaving the user stuck on "waiting for approval".
-    #[serde(default)]
-    setup_claim_url: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct SetupRunApiRun {
-    id: String,
-    status: String,
-    machine_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct SetupRunSourceApiResponse {
-    source: String,
-    detected: bool,
-    readiness_percent: u64,
-    state: String,
-    #[serde(default)]
-    missing_fields: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    local_import_ready: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    live_telemetry_required: Option<bool>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct SetupRunActionApiResponse {
-    id: String,
-    action_type: String,
-    source: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct SetupScanPayload {
-    machine: BTreeMap<String, serde_json::Value>,
-    companion: BTreeMap<String, serde_json::Value>,
-    relay_runtime: BTreeMap<String, serde_json::Value>,
-    service: BTreeMap<String, serde_json::Value>,
-    sources: Vec<SetupScanSource>,
-    missing_fields: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct SetupScanSource {
-    source: &'static str,
-    /// When this scan observed the source. The backend reads it before the
-    /// status row's own `captured_at`, which may be an earlier cached reading.
-    captured_at: String,
-    detected: bool,
-    installed: bool,
-    telemetry_installed: bool,
-    local_health: &'static str,
-    missing_fields: Vec<String>,
-    attribution_guess: BTreeMap<String, serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    agent_status: Option<AgentStatusSnapshot>,
-    /// Redacted preview of the on-disk Ottto-managed fence region, so the
-    /// dashboard's "View managed config" modal shows what is really
-    /// configured on this machine instead of a canned template.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    managed_config: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    local_import_ready: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    live_telemetry_required: Option<bool>,
-}
-
-#[derive(Debug, Serialize)]
-struct SetupActionResult {
-    action_id: String,
-    action_type: String,
-    source: Option<String>,
-    status: String,
-    detail: Option<SetupRunDetailApiResponse>,
-    /// The result a verify_source action computed; it appears only in the
-    /// response of the call that ran the action.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    verification: Option<SourceVerificationResult>,
-}
-
 fn request_snapshot_sync_after_setup_actions(
     daemon: &LocalDaemon,
     action_results: &[SetupActionResult],
@@ -9206,60 +8974,6 @@ fn setup_run_attach_body(machine: &MachineIdentity) -> serde_json::Value {
     })
 }
 
-#[derive(Debug, Deserialize)]
-struct SetupRunRefreshResponse {
-    run: Option<SetupRunApiRun>,
-    setup_run_id: Option<String>,
-    setup_run_token: String,
-    expires_at: String,
-}
-
-#[derive(Debug, Clone)]
-struct RefreshedSetupRunToken {
-    run: Option<SetupRunApiRun>,
-    setup_run_token: String,
-    connection: LocalConnectionBinding,
-}
-
-#[derive(Debug, Clone)]
-struct SetupRunCredentials {
-    setup_run_token: String,
-    connection: LocalConnectionBinding,
-}
-
-#[derive(Debug, Deserialize)]
-struct SetupRunDisconnectResponse {
-    setup_run_id: String,
-    #[allow(dead_code, reason = "part of the server response shape; not read")]
-    run_status: String,
-    #[allow(dead_code, reason = "part of the server response shape; not read")]
-    client_disconnected: bool,
-    disconnected_at: String,
-    /// True only when the server authenticated the release proof and revoked
-    /// this Mac's device registration. Older servers omit the field.
-    #[serde(default)]
-    device_released: bool,
-    #[serde(default)]
-    revocation_receipt: Option<SecretString>,
-}
-
-/// This Mac's active relay-device id and secret, presented on a cloud
-/// disconnect so the server can release the device registration. Read before
-/// any local deletion. Secret; redacted from `Debug` and never logged.
-struct DeviceReleaseProof {
-    device_id: String,
-    device_secret: String,
-}
-
-impl std::fmt::Debug for DeviceReleaseProof {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DeviceReleaseProof")
-            .field("device_id", &self.device_id)
-            .field("device_secret", &"[redacted]")
-            .finish()
-    }
-}
-
 /// Load the active device id and secret together. The server rejects one
 /// without the other, so a missing or unreadable half yields no proof.
 fn load_device_release_proof() -> Option<DeviceReleaseProof> {
@@ -9278,13 +8992,6 @@ fn device_release_proof(device_id: String, device_secret: String) -> Option<Devi
         device_id,
         device_secret,
     })
-}
-
-#[derive(Debug, Deserialize)]
-struct DeviceSelfReleaseResponse {
-    device_released: bool,
-    #[serde(default)]
-    revocation_receipt: Option<SecretString>,
 }
 
 /// Ask Ottto to release this Mac's registration with the device's own
@@ -10078,13 +9785,6 @@ fn setup_action_execution_error_detail(error: &LocalApiError) -> (&'static str, 
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct SetupRunNextActionResponse {
-    #[serde(default)]
-    run_status: Option<String>,
-    action: Option<SetupRunActionApiResponse>,
-}
-
 fn get_next_setup_action(
     api_base_url: &str,
     credentials: &mut SetupRunCredentials,
@@ -10156,13 +9856,6 @@ fn record_setup_action_event(
             backend_post_json(&url, &body, &[("X-Ottto-Setup-Run-Token", token)])
         })?;
     Ok(())
-}
-
-struct SetupActionEvent<'a> {
-    event_type: &'a str,
-    status: &'a str,
-    message: &'a str,
-    metadata: Option<serde_json::Value>,
 }
 
 fn complete_setup_action(
@@ -10907,91 +10600,6 @@ fn install_source_patch_disabled_result(
         "relay_required": true,
         "message": message,
     })
-}
-
-#[derive(Debug, Deserialize)]
-struct InstallSessionApiResponse {
-    install_session_id: String,
-    install_session_token: String,
-}
-
-#[derive(Clone, Deserialize)]
-struct DeviceCredentialPreparationApiResponse {
-    preparation_id: String,
-    capability: String,
-    expires_at: String,
-    credential_generation: u64,
-    device: TelemetryDeviceApiResponse,
-    candidate_secret: String,
-    #[serde(default)]
-    identity_continuity_capability: Option<String>,
-    credential_rotation_planned: bool,
-    #[serde(default)]
-    prior_device_id: Option<String>,
-}
-
-impl std::fmt::Debug for DeviceCredentialPreparationApiResponse {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("DeviceCredentialPreparationApiResponse")
-            .field("preparation_id", &"[redacted]")
-            .field("capability", &self.capability)
-            .field("expires_at", &self.expires_at)
-            .field("credential_generation", &self.credential_generation)
-            .field("device", &"[redacted]")
-            .field("candidate_secret", &"[redacted]")
-            .field(
-                "identity_continuity_capability",
-                &self.identity_continuity_capability,
-            )
-            .field(
-                "credential_rotation_planned",
-                &self.credential_rotation_planned,
-            )
-            .field("prior_device_id", &self.prior_device_id)
-            .finish()
-    }
-}
-
-#[derive(Deserialize)]
-struct DeviceCredentialConfirmationApiResponse {
-    preparation_id: String,
-    status: String,
-    confirmed_at: String,
-    credential_generation: u64,
-    device: TelemetryDeviceApiResponse,
-    #[serde(default)]
-    identity_continuity_capability: Option<String>,
-    credential_rotation_performed: bool,
-    #[serde(default)]
-    rotated_prior_device_id: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct DeviceCredentialPreparationStatusApiResponse {
-    preparation_id: String,
-    status: String,
-    expires_at: String,
-    credential_generation: u64,
-    device: TelemetryDeviceApiResponse,
-    #[serde(default)]
-    confirmed_at: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct TelemetryDeviceApiResponse {
-    id: String,
-    machine_id: Option<String>,
-    #[serde(default)]
-    sources: Vec<String>,
-}
-
-struct InstallSessionEvent<'a> {
-    event_type: &'a str,
-    status: &'a str,
-    message: &'a str,
-    metadata: Option<serde_json::Value>,
-    device_id: Option<&'a str>,
 }
 
 fn prepare_telemetry_device_registration(
@@ -16253,32 +15861,6 @@ fn no_fresh_telemetry_message(source: &SourceKind, smoke: &SmokeResult) -> Strin
         source_display_name(source),
         source_display_name(source),
     )
-}
-
-#[derive(Debug, Deserialize)]
-struct SetupRunVerificationResponse {
-    verified: bool,
-    records_seen: u64,
-    last_record_id: Option<String>,
-    last_received_at: Option<String>,
-    smoke_after: String,
-    #[serde(default)]
-    error_code: Option<String>,
-    #[serde(default)]
-    clear_condition: Option<String>,
-}
-
-#[derive(Debug, Clone, Default)]
-struct SetupRunVerificationFilters {
-    model: Option<String>,
-    model_provider: Option<String>,
-    billing_provider: Option<String>,
-}
-
-#[derive(Clone, Copy)]
-struct SetupVerificationTimeouts {
-    wait: Duration,
-    request: Duration,
 }
 
 fn get_setup_run_verification_with_base(
