@@ -420,6 +420,7 @@ impl Sqlite {
     /// The point of no return: close the store, then rename the copy over it.
     fn vacuum_publish(&mut self, tmp: &Path, id: &Identity, generation: u64) -> Result<()> {
         swap_point("close", tmp)?;
+        self.sample_pager_writes();
         let live = self.conn.take().map(Connection::close).transpose();
         live.map_err(|(_, error)| error)?;
         ensure!(self.wal_bytes() == Some(0), "state_v2_vacuum_wal");
@@ -615,6 +616,7 @@ impl Sqlite {
         // Hit/miss reset only where a row prints, so that row counts every
         // access since the previous printed row.
         let reset = i32::from(print);
+        self.sample_pager_writes();
         let [cache_used_bytes, cache_hit, cache_miss] = [
             (rusqlite::ffi::SQLITE_DBSTATUS_CACHE_USED, 0),
             (rusqlite::ffi::SQLITE_DBSTATUS_CACHE_HIT, reset),

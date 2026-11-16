@@ -1471,7 +1471,9 @@ impl FileFold {
     /// time) is before `COPY_PROOF_FROM`, whose body was settled with copies
     /// removed and accepted, and that has no saved removal, keeps that
     /// decision. A later copy, an all-copy file or an unaccepted one takes
-    /// the request-id proof.
+    /// the request-id proof. A path that a same-session twin's saved removal
+    /// names as its holder counted those requests: a summed body's COPY mark
+    /// on it never authorizes dropping them.
     fn grandfathered(&self, context: Option<&ReadContext<'_>>) -> bool {
         let (Some(context), Some(at), Some(Located(location))) =
             (context, self.first_own_at, self.location)
@@ -1479,10 +1481,27 @@ impl FileFold {
             return false;
         };
         let index = context.index;
+        let witness = || {
+            session_member(context.path).is_some_and(|member| {
+                index
+                    .claude_money_birth_store
+                    .observations(&member)
+                    .any(|(other, _)| {
+                        other != location
+                            && context.indexed(&member, other)
+                            && index
+                                .claude_copy_removals
+                                .get(other)
+                                .iter()
+                                .any(|(holder, _)| *holder == location)
+                    })
+            })
+        };
         !from_copy_proof_cutoff(at)
             && index.claude_money_birth_store.money_marks(location) & money_mark::COPY != 0
             && index.file_has_accepted_body(&local_index_key(context.path))
             && index.claude_copy_removals.get(location).is_empty()
+            && !witness()
     }
 
     /// /branch and --fork-session (an all-pre-birth MAIN file) and resume
@@ -3311,6 +3330,12 @@ fn attach_one(
     let Some(occurrence) = claude_usage_occurrences.get_mut(row.request_id.as_str()) else {
         return false;
     };
+    // Route evidence only (local, never sent), producer on: this request's own
+    // row, joined by its provider request id, named a valid account. No money
+    // input.
+    if crate::snapshots::billing_route::PRODUCER_ENABLED {
+        occurrence.route_telemetry_account |= row.account_identifier_hash.is_some();
+    }
 
     // The hour the estimated key is placed in (`occurrence_key`): its clock,
     // else the file's fallback; none or unreadable places no key.

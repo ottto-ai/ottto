@@ -3771,6 +3771,7 @@ fn save_index_and_publish_manifest(
     // durable; a failed CAS/save or manifest derivation must not let a
     // concurrent heartbeat repeat stale agreement.
     withdraw_source_manifest(destination_namespace, source);
+    crate::local_resource_diagnostics::state_save_start(source.api_slug());
     index.save(index_path)?;
     if census_complete {
         publish_source_manifest(
@@ -5526,6 +5527,7 @@ fn sync_once_with_retry(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     // Before credentials: a re-enabled source resumes even with no live device.
     resume_reconnected_sources(support_dir);
+    crate::claude_local_otel::close_append_handles();
     // Declared after the guard, so it settles before the lock is released.
     let mut continuation_cycle = continuation::CycleSettlement::default();
     let (device, device_secret) = load_snapshot_device_credentials()?;
@@ -5654,6 +5656,8 @@ fn retry_ordinary_owned(item: &SnapshotItem) -> Option<SnapshotItem> {
         claude_org_markers: None,
         claude_account_withheld_reason: None,
         claude_account_display: None,
+        session_billing_route: item.session_billing_route.clone(),
+        claude_route_evidence: None,
         session_account_evidence: item.session_account_evidence.clone(),
         source_session_id: item.source_session_id.clone(),
         snapshot_fingerprint: item.snapshot_fingerprint.clone(),
@@ -5919,6 +5923,7 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
     }
     fn outcome(&mut self, source: SnapshotSource, result: Result<()>) {
         continuation::leave_source_qos(&mut self.paced_qos);
+        crate::local_resource_diagnostics::pass_ended(source.api_slug());
         if result.is_err() {
             continuation::after_ordinary_source_failure(source);
         }
@@ -7217,6 +7222,7 @@ fn prepare_sync_source_inner(
     } else {
         Vec::new()
     };
+    crate::local_resource_diagnostics::index_clone_start(source.api_slug());
     let mut committed_index = index.clone();
     let reoffer_paths =
         index.activate_reason_reoffer_retries(upload_progress.active_reason_reoffers.clone());
@@ -7649,6 +7655,7 @@ fn prepare_continuation_source(
     index.activate_effective_upload_body_witness_revision(cycle_body_witness_revision(source));
     // K3: as the ordinary prepare, before the scan advances it. It is dropped
     // here unless the page commits, and crosses to the parent only by move.
+    crate::local_resource_diagnostics::index_clone_start(source.api_slug());
     let committed_index = index.clone();
     // No lease is active (refused above), so this only installs the empty
     // set, as the ordinary prepare does; there are no hint paths to take.
@@ -8014,6 +8021,15 @@ fn finish_sync_source(
         &claude_authority_disposition.mixed_uploads,
     );
     claude_authority_disposition.defer_sessions(deferred_accounts);
+    // Billing route annotation: after ownership is bound, before upload policy.
+    // Process memory only; off, nothing runs.
+    crate::snapshots::billing_route::annotate_session_billing_routes(
+        &upload_destination_namespace,
+        source,
+        machine_id,
+        &mut scan_result.snapshots,
+        activity_hint.session_billing_route_contract.as_deref(),
+    );
 
     // The Companion uses machine-local labels before upload policy clears them.
     let reconciliation_status = crate::agent_status_refresh::status_for_reconciliation(
@@ -9993,6 +10009,10 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
 fn release_emitted(item: &mut SnapshotItem) {
     #[cfg(test)]
     crate::snapshots::claude_request_money::e2::pipeline_test_observer::before_release(item);
+    // Route evidence only; captured before the native request inputs go.
+    if crate::snapshots::billing_route::PRODUCER_ENABLED {
+        crate::snapshots::billing_route::capture_claude_route_evidence(item);
+    }
     crate::snapshots::claude_request_money::e2::release_emitted_fold(item);
 }
 
@@ -22866,6 +22886,59 @@ mod tests {
             ControlToken::new("token").expect("valid token"),
             "2026-06-16T10:00:00Z",
         )
+    }
+
+    /// [regress] A pass that ends without a finish (prepare had nothing to
+    /// do) closes at the cycle owner's outcome: a later off-pass window is clean.
+    #[test]
+    fn cycle_outcome_closes_unfinished_pass_for_offpass_overlap() {
+        use crate::local_resource_diagnostics::{capture, source_prepare, StageWindow};
+        use crate::source_rotation::Owner as _;
+        let client = SnapshotApiClient::new("http://127.0.0.1:9");
+        let device = LocalDeviceBinding {
+            device_id: "device".into(),
+            machine_id: Some("otm_test".into()),
+            sources: vec!["codex".into()],
+        };
+        let daemon = test_daemon("otm_test");
+        let mut transport_cycle = crate::net_resilience::TransportCycleOutcome::default();
+        let mut failed_sources = Vec::new();
+        let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
+        let mut owner = SnapshotCycleOwner {
+            retry: &mut retry,
+            account_witness: [0; 32],
+            client: &client,
+            device: &device,
+            device_secret: "secret",
+            machine_id: "otm_test",
+            home: Path::new("/nonexistent-home"),
+            support_dir: Path::new("/nonexistent-support"),
+            daemon: &daemon,
+            transport_cycle: &mut transport_cycle,
+            failed_sources: &mut failed_sources,
+            started: Instant::now(),
+            codex_started: None,
+            paced_qos: None,
+        };
+        let quota = || drop(StageWindow::begin("codex", "offpass_codex_quota"));
+        let (_, rows) = capture(|| {
+            source_prepare("codex", || None::<()>, |_| false);
+            quota(); // the pass is open
+            owner.outcome(SnapshotSource::Codex, Ok(()));
+            quota(); // clean once the outcome closed it
+            source_prepare("unknown", || (), |_| false); // flushes
+        });
+        let flags: Vec<_> = rows
+            .iter()
+            .filter(|row| row["stage"] == "offpass_codex_quota")
+            .map(|row| {
+                (
+                    row["counts"]["count"].as_u64(),
+                    row["counts"].get("pass_overlap").cloned(),
+                )
+            })
+            .collect();
+        assert_eq!(flags, [(Some(1), None), (Some(1), Some(true.into()))]);
     }
 
     fn agent_status_upload_server(captured: Arc<Mutex<Vec<String>>>) -> String {
