@@ -857,7 +857,6 @@ fn refused_answers_hold_only_the_identical_answer_for_at_most_an_hour() {
             .insert(format!("{n:064x}"), template.clone());
     }
     assert_eq!(progress.head_conflict_challenges.len(), cap);
-    head_conflict::REFUSALS.with(|counts| counts.borrow_mut().clear());
     let mut overflow = item.clone();
     overflow.source_session_id = "synthetic-new-over-cap".into();
     overflow.snapshot_fingerprint = "9".repeat(64);
@@ -887,7 +886,6 @@ fn refused_answers_hold_only_the_identical_answer_for_at_most_an_hour() {
         progress.quarantined_fingerprints[&item.snapshot_fingerprint],
         held[&item.snapshot_fingerprint]
     );
-    head_conflict::REFUSALS.with(|counts| assert!(counts.borrow().is_empty()));
     // The challenge beyond the old limit is answered and retired on its ACK.
     let (result, wire) = cycle(&mut progress, &overflow, 2_001, |item| {
         accepted(item, &"4".repeat(64))

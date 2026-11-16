@@ -1695,7 +1695,6 @@ struct PermanentSnapshotRejection {
 }
 
 mod ack_retention;
-mod head_conflict;
 mod progress_rows;
 mod telemetry_only;
 mod upload_context_resend;
