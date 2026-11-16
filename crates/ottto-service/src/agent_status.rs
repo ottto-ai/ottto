@@ -14812,22 +14812,29 @@ fn read_claude_oauth_credential_from_credentials_file(
 }
 
 /// Largest stored-login file read; anything bigger is `Unreadable`.
+#[cfg(unix)]
 const CLAUDE_CREDENTIALS_FILE_MAX_BYTES: u64 = 1024 * 1024;
 
 /// The one reader for Claude Code's native credentials file, used by the
 /// status read on every OS (directly off macOS, after keychain "not found" on
 /// macOS) and by the session-launch check. A missing file is `Absent`. A file
 /// that cannot be opened without following a final symlink, is not a regular
-/// file, is larger than the limit, or (on Unix) is not owned by the effective
-/// user or grants any group/other permission is `Unreadable`, as is any other
-/// I/O failure. The file is never modified. Unit-test reads are scratch-only.
+/// file, is larger than the limit, is not owned by the effective user or
+/// grants any group/other permission is `Unreadable`, as is any other I/O
+/// failure. The file is never modified. Unit-test reads are scratch-only.
+#[cfg(unix)]
 fn read_claude_credentials_file(path: &Path) -> ClaudeCredentialRead {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     if !crate::provider_calls::readable_for_account(path) {
         return ClaudeCredentialRead::Unreadable;
     }
     #[cfg(test)]
     claude_credentials_file_test_hooks::before_read(path);
-    let file = match open_claude_credentials_file(path) {
+    let file = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+    {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return ClaudeCredentialRead::Absent
@@ -14839,7 +14846,8 @@ fn read_claude_credentials_file(path: &Path) -> ClaudeCredentialRead {
     };
     if !metadata.is_file()
         || metadata.len() > CLAUDE_CREDENTIALS_FILE_MAX_BYTES
-        || !claude_credentials_file_is_private(&metadata)
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o077 != 0
     {
         return ClaudeCredentialRead::Unreadable;
     }
@@ -14855,35 +14863,11 @@ fn read_claude_credentials_file(path: &Path) -> ClaudeCredentialRead {
     parse_claude_oauth_credential_read(&body)
 }
 
-#[cfg(unix)]
-fn open_claude_credentials_file(path: &Path) -> std::io::Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(path)
-}
-
-/// No `O_NOFOLLOW` here: refuse a final symlink before opening.
+/// Without owner, mode and no-follow checks the file cannot be trusted:
+/// fail closed.
 #[cfg(not(unix))]
-fn open_claude_credentials_file(path: &Path) -> std::io::Result<File> {
-    if fs::symlink_metadata(path)?.file_type().is_symlink() {
-        return Err(std::io::Error::other("credentials file is a symlink"));
-    }
-    File::open(path)
-}
-
-#[cfg(unix)]
-fn claude_credentials_file_is_private(metadata: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o077 == 0
-}
-
-/// Owner and mode bits are Unix concepts; elsewhere the user profile's
-/// access control protects the file.
-#[cfg(not(unix))]
-fn claude_credentials_file_is_private(_metadata: &fs::Metadata) -> bool {
-    true
+fn read_claude_credentials_file(_path: &Path) -> ClaudeCredentialRead {
+    ClaudeCredentialRead::Unreadable
 }
 
 /// Lets a unit test change the slot's identity files while its stored login
@@ -22167,6 +22151,64 @@ exit 44
         );
         assert_eq!(provider_calls(), before + 1, "the default login asks once");
         assert_only_version_probes(&fixture.spawns(), "takeover");
+    }
+
+    /// The default login off macOS, end to end with no `security` on the
+    /// search path: `~/.claude/.credentials.json` (0600, Max) and
+    /// `~/.claude.json` (Max organization, 20x tier) give one status pass a
+    /// `max_20x` plan row for exactly that account and organization.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    #[serial]
+    fn default_home_plan_row_comes_from_the_native_credentials_file() {
+        let fixture = Phase0Fixture::new("native-default-plan", false);
+        fs::remove_file(fixture.root.join("bin").join("security")).expect("no keychain tool");
+        let home = fixture.root.join("home");
+        fs::write(
+            home.join(".claude.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "oauthAccount": {
+                    "accountUuid": DEFAULT_ACCOUNT.0,
+                    "organizationUuid": DEFAULT_ACCOUNT.1,
+                    "emailAddress": format!("{}@example.invalid", DEFAULT_ACCOUNT.0),
+                    "organizationType": "claude_max",
+                    "organizationRateLimitTier": "default_claude_max_20x"
+                }
+            }))
+            .expect("identity"),
+        )
+        .expect("write identity");
+        // Native file mode 0600 with `subscriptionType` "max".
+        fixture.item(&ClaudeConfigDirSlot::Default, TimeDuration::hours(3));
+        let native = home.join(".claude").join(".credentials.json");
+        assert_eq!(
+            fs::metadata(&native)
+                .expect("native file")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        let collection = fixture.collect();
+        let (account_hash, organization_hash) = Phase0Fixture::hashes(DEFAULT_ACCOUNT);
+        let rows: Vec<_> = collection
+            .source_health_snapshot
+            .plan_observations
+            .iter()
+            .filter(|row| row.account_identifier_hash.as_deref() == Some(account_hash.as_str()))
+            .collect();
+        assert!(!rows.is_empty(), "a plan row for the default login");
+        for row in rows {
+            assert_eq!(row.plan_type.as_deref(), Some("max_20x"), "{row:?}");
+            assert_eq!(
+                row.organization_identifier_hash.as_deref(),
+                Some(organization_hash.as_str()),
+                "{row:?}"
+            );
+        }
+        assert!(fixture.security_reads().is_empty());
+        assert_only_version_probes(&fixture.spawns(), "native-default-plan");
     }
 
     /// An API-key-only installation (settings `apiKeyHelper`, no OAuth login)

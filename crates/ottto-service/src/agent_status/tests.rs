@@ -9393,6 +9393,62 @@ fn native_credentials_file_store_never_runs_the_keychain_tool() {
     }
 }
 
+/// Off macOS the production dispatch reads the native credentials file for
+/// the default login and a registered config dir and never runs `security`:
+/// first with one on the search path, then with none.
+#[cfg(not(target_os = "macos"))]
+#[test]
+#[serial]
+fn production_dispatch_off_macos_reads_the_native_file_without_security() {
+    // A `security` that would hand back a different login if it ran.
+    let item = claude_credential_fixture("item-token", TimeDuration::hours(2), Some("pro"));
+    let trap = format!(
+        "#!/bin/sh\n/usr/bin/touch \"$(/usr/bin/dirname \"$0\")/security-ran\"\necho '{item}'\n"
+    );
+    let fixture = LocalSlotFixture::new("linux-dispatch", &trap);
+    let default_dir = fixture.root.join("home").join(".claude");
+    fs::create_dir_all(&default_dir).expect("default config dir");
+    crate::test_scratch::write_private_file(
+        default_dir.join(".credentials.json"),
+        serde_json::to_vec(&claude_credential_fixture(
+            "default-token",
+            TimeDuration::hours(2),
+            Some("team"),
+        ))
+        .expect("serialize credential"),
+    );
+    fixture.write_credential(&claude_credential_fixture(
+        "slot-token",
+        TimeDuration::hours(2),
+        Some("max"),
+    ));
+    let read = |slot: &ClaudeConfigDirSlot| {
+        let ClaudeCredentialRead::Present(credential) =
+            read_claude_oauth_credential_state_for_slot(slot)
+        else {
+            panic!("the native credentials file holds the login");
+        };
+        (credential.access_token, credential.subscription_type)
+    };
+    for search_path in ["trap security", "no security"] {
+        assert_eq!(
+            read(&ClaudeConfigDirSlot::Default),
+            (Some("default-token".to_string()), Some("team".to_string())),
+            "{search_path}"
+        );
+        assert_eq!(
+            read(&fixture.slot()),
+            (Some("slot-token".to_string()), Some("max".to_string())),
+            "{search_path}"
+        );
+        assert!(
+            !fixture.security_ran(),
+            "{search_path}: security never runs"
+        );
+        let _ = fs::remove_file(fixture.root.join("bin").join("security"));
+    }
+}
+
 /// The one credentials-file reader: a missing file carries no login; an
 /// unsafe, oversized or malformed file is unreadable, never adopted, and
 /// never modified.
