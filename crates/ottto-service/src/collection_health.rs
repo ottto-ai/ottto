@@ -23,8 +23,10 @@ impl Pulse {
     }
 
     pub(crate) fn complete(&mut self, at: &str) {
-        self.completed = Some((crate::scan_clock::now(), at.to_owned()));
-        self.backoff_until = None;
+        let now = crate::scan_clock::now();
+        self.completed = Some((now, at.to_owned()));
+        // An independent upload lane may have shed while this scan was running.
+        self.backoff_until = self.backoff_until.filter(|end| *end > now);
         self.offline = false;
     }
 
@@ -170,6 +172,14 @@ mod tests {
                 let after_sleep = pulse.project(Duration::ZERO, "2026-11-16T10:00:00Z");
                 assert_eq!(after_sleep.state, ServerBackoff);
                 assert_eq!(after_sleep.until.as_deref(), Some("2026-11-16T10:30:00Z"));
+                with_clock(60, || {
+                    let completed_at = "2026-11-15T10:01:00Z";
+                    pulse.complete(completed_at);
+                    let status = pulse.project(Duration::ZERO, completed_at);
+                    assert_eq!(status.state, ServerBackoff, "{source:?}: concurrent shed");
+                    assert_eq!(status.until.as_deref(), Some("2026-11-15T10:30:00Z"));
+                    assert_eq!(status.last_scan_at.as_deref(), Some(completed_at));
+                });
                 with_clock(1800, || {
                     assert_eq!(pulse.project(Duration::ZERO, WALL).state, Collecting);
                     assert!(pulse.project(Duration::ZERO, WALL).until.is_none());

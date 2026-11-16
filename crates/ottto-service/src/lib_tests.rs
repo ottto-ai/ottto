@@ -4083,6 +4083,10 @@ mod tests {
                     snapshot_sync::start_collection_health(scan_source);
                     snapshot_sync::disable_snapshot_source(&root, scan_source).unwrap();
                     assert!(status().collection.is_none());
+                    // Model a positive prepare hint that was already in flight at pause.
+                    daemon
+                        .record_reconciliation_enabled(source.clone(), true, 30)
+                        .unwrap();
                 });
                 with_clock(7200, || {
                     snapshot_sync::reconnect_snapshot_source(&root, scan_source).unwrap();

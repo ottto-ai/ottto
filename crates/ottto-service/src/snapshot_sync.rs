@@ -12904,6 +12904,10 @@ pub(crate) fn resume_reconnected_sources(support_dir: &Path) {
         let resumed = std::fs::remove_file(&marker)
             .map_err(anyhow::Error::from)
             .and_then(|()| sync_progress_parent(&marker));
+        if resumed.is_ok() {
+            // A prepare hint already in flight at pause can have re-armed the pulse.
+            reset_collection_health(source);
+        }
         let failures = turn.entry(marker).or_default();
         *failures = if resumed.is_ok() { 0 } else { *failures + 1 };
         if *failures > 3 {

@@ -263,6 +263,7 @@ last completed scan's `last_scan_at` when known. A transport prepare error is of
 completion or non-transport outcome. Stalled takes precedence after more than the larger of
 60 awake minutes or the current planned interval (including the failure ladder) plus 30 minutes.
 Honoured sheds latch the effective deadline at its setter, after releasing the deadline lock.
+Scan completion preserves any unexpired deadline from an independent upload lane.
 That deadline also extends the pulse baseline; `until` is emitted only during server backoff,
 projected from wall time plus the remaining awake duration. All elapsed decisions use
 `scan_clock::now()`, so sleep does not age the pulse. This observation never changes cadence,
