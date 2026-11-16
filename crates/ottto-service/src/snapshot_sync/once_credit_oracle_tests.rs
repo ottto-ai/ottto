@@ -2722,7 +2722,11 @@ fn scheduling_permutations_converge_to_the_same_bodies() {
                         home.cold_restart();
                         let quiet = home.cycle(&server, &recording);
                         assert!(quiet.finish.is_ok());
-                        assert!(schedule_debt_is_clear(&quiet.debt));
+                        assert!(
+                            schedule_debt_is_clear(&quiet.debt),
+                            "quiet restart left debt: {source:?} {one_chunk} {limit} {reverse} {restart} {late}: {}",
+                            quiet.debt
+                        );
                         assert!(quiet.batches.is_empty());
                         assert_eq!(quiet.consumed, 0);
                         let prior = accepted.clone();
