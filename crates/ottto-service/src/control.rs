@@ -11832,8 +11832,9 @@ fn seed_owner_snapshot_history_for_logout() -> Result<bool, LocalApiError> {
     if let Some(pending) = FilePendingDeviceCredentialStore::default()
         .load()
         .or_state_poisoned()?
+        && !owner_snapshot_logout_can_retain_active(&pending)?
     {
-        return owner_snapshot_logout_can_retain_active(&pending);
+        return Ok(false);
     }
     let Some(machine) = FileMachineStore::default().load().or_state_poisoned()? else {
         return Ok(true);
@@ -32929,6 +32930,39 @@ X-API-Key = "otel_redacted"
     }
 
     #[test]
+    #[serial]
+    /// [regress] Before the confirm guard the active pair is intact: ordinary
+    /// logout still seeds it even when a pending unconfirmed switch exists.
+    fn owner_return_pre_guard_logout_seeds_the_intact_active_owner() {
+        if !crate::test_isolation::run_here() {
+            return;
+        }
+        let _env = relogin_env("return-logout-intact-seed");
+        FileMachineStore::default().save(&test_machine()).unwrap();
+        let device = relogin_device("logout-owner-a", &["codex"]);
+        let namespace = owner_return_credential_for_test(&device, "logout-a-secret", "a");
+        let history = FileOwnerSnapshotNamespaceStore::default();
+        fs::remove_file(history.path()).unwrap();
+        let (mut pending, _) = owner_return_pending("b", "org", "logout-b-pending");
+        pending.preconfirm_guards_passed = false;
+        FilePendingDeviceCredentialStore::default()
+            .save(&pending)
+            .unwrap();
+        assert!(seed_owner_snapshot_history_for_logout().unwrap());
+        let rows = history.load().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].key.owner.user_id, "a");
+        assert_eq!(rows[0].namespace, namespace);
+        assert_eq!(
+            FilePendingDeviceCredentialStore::default()
+                .load()
+                .unwrap()
+                .as_ref(),
+            Some(&pending)
+        );
+    }
+
+    #[test]
     /// [regress] Canceling an unconfirmed switch during local logout retains
     /// the intact predecessor pair; the candidate grants no incoming history.
     fn owner_return_logout_with_unconfirmed_switch_retains_the_active_pair() {
@@ -32990,7 +33024,9 @@ X-API-Key = "otel_redacted"
     pub(super) fn owner_return_test_machine(key: &OwnerSnapshotKey) -> Result<bool, LocalApiError> {
         Ok(key.machine_id == "machine_test"
             && key.installation_id == "install_test"
-            && key.account_scope == TEST_ACCOUNT_SCOPE)
+            && (key.account_scope == TEST_ACCOUNT_SCOPE
+                || crate::local_account_scope("machine_test").as_deref()
+                    == Some(key.account_scope.as_str())))
     }
 
     #[test]
