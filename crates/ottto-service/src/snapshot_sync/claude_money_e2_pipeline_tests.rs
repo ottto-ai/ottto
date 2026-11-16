@@ -2517,6 +2517,134 @@ fn e2_pipeline_restored_twins_equal_birth_reverse() {
     restored_twins(true, true);
 }
 
+/// [money] A summed body's COPY mark never lets its counting carrier drop r1.
+#[test]
+fn equal_birth_carrier_never_grandfathers_its_counted_request() {
+    use crate::snapshots::claude_money_birth_store::location_key;
+    use crate::snapshots::claude_request_census::claude_request_hash;
+
+    with_e2(|| {
+        let copied_at = "2026-11-03T07:00:10Z";
+        let born_at = "2026-11-03T07:02:00Z";
+        let own_at = "2026-11-03T07:04:00Z";
+        assert!(nanos(copied_at) + 2_000_000_000 < nanos(born_at));
+        assert!(nanos(born_at) < nanos(own_at));
+        assert!(nanos(own_at) < nanos("2026-11-04T00:00:00Z"));
+        let r1 = line(ROOT, "r1", copied_at, 10);
+        let r1_hash = claude_request_hash("r1");
+        for carrier_first in [true, false] {
+            let mut c = Corpus::new(&format!("e2-pipeline-counting-carrier-{carrier_first}"));
+            // Sort actual full-path hashes: a unique scratch root must not
+            // choose which equal-birth tie order this arm exercises.
+            let mut paths = ["home-a", "home-b"]
+                .map(|folder| c.root.join(folder).join(format!("{ROOT}.jsonl")));
+            paths.sort_by_key(|path| location_key(&path.to_string_lossy()));
+            let [carrier, other] = if carrier_first {
+                paths
+            } else {
+                let [a, b] = paths;
+                [b, a]
+            };
+            let carrier_key = location_key(&carrier.to_string_lossy());
+            let other_key = location_key(&other.to_string_lossy());
+            assert_ne!(carrier_key, other_key);
+            assert_eq!(carrier_key < other_key, carrier_first);
+            let carrier_relative = carrier
+                .strip_prefix(&c.root)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            let other_relative = other
+                .strip_prefix(&c.root)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            c.write_at(&carrier_relative, &r1, born_at);
+            let scanner = E2ScanFixture::default();
+            let mut seed = ready(&c, &scanner, ScanIndex::default(), 100, false);
+            assert_eq!(
+                scanner.paths(),
+                vec![carrier.clone()],
+                "C is discovered first"
+            );
+            literal(&seed);
+            assert_eq!(total(&seed), 1);
+            seed.finish();
+            let mut prior = c.reload(&mut seed.index);
+            assert!(upload_context_receipt_earned_for_test(&prior, &carrier));
+
+            c.write_at(&other_relative, &r1, born_at);
+            if !carrier_first {
+                // The ordinary proof creates the earlier-holder order. Seed
+                // the saved O -> C decision for the reverse order; stored
+                // removals retain their holder independently of today's tie.
+                prior.claude_copy_removals.store(
+                    other_key,
+                    BTreeMap::from([(carrier_key, BTreeSet::from([r1_hash]))]),
+                );
+            }
+            let mut twins = ready(&c, &scanner, prior, 100, false);
+            literal(&twins);
+            assert_eq!(total(&twins), 1);
+            assert_eq!(body(&twins, ROOT).unwrap().removed_request_count, Some(1));
+            let accepted_body = snapshot_upload_body_witness(body(&twins, ROOT).unwrap());
+            twins.finish();
+            let prior = c.reload(&mut twins.index);
+
+            // CS1 refreshes the ACK carrier with blank JSONL: unchanged usage
+            // acquires the summed body's COPY mark before the own turn grows.
+            append(&carrier, "\n");
+            let mut refreshed = ready(&c, &scanner, prior, 100, false);
+            literal(&refreshed);
+            assert_eq!(
+                snapshot_upload_body_witness(body(&refreshed, ROOT).unwrap()),
+                accepted_body,
+                "carrier refresh changes no accepted body"
+            );
+            refreshed.finish();
+            let prior = c.reload(&mut refreshed.index);
+            let store = &prior.claude_money_birth_store;
+            for path in [&carrier, &other] {
+                let key = path.to_string_lossy();
+                assert!(prior.files.contains_key(key.as_ref()));
+                assert_eq!(store.observed_birth(ROOT, &key), Some(nanos(born_at)));
+                assert_eq!(store.effective_cutoff(ROOT, &key), Some(nanos(born_at)));
+            }
+            assert_ne!(store.money_marks(carrier_key) & e2::money_mark::COPY, 0);
+            assert!(upload_context_receipt_earned_for_test(&prior, &carrier));
+            assert!(prior.claude_copy_removals.get(carrier_key).is_empty());
+            assert!(prior
+                .claude_copy_removals
+                .get(other_key)
+                .iter()
+                .any(|(holder, hashes)| *holder == carrier_key
+                    && hashes.binary_search(&r1_hash).is_ok()));
+
+            // Red on main without the counting-holder guard (CS1 run 43868949339).
+            append(&carrier, &line(ROOT, "r2", own_at, 20));
+            let mut grown = ready(&c, &scanner, prior, 100, false);
+            literal(&grown);
+            assert_eq!(total(&grown), 2);
+            let root = body(&grown, ROOT).expect("growth emits ROOT");
+            assert_eq!(
+                (root.request_count, root.removed_request_count),
+                (2, Some(1)),
+                "equal-birth carrier growth must retain r1: carrier_first={carrier_first}"
+            );
+            grown.finish();
+            let settled = c.reload(&mut grown.index);
+            assert!(
+                [carrier_key, other_key].iter().any(|&location| !settled
+                    .claude_copy_removals
+                    .get(location)
+                    .iter()
+                    .any(|(_, hashes)| hashes.binary_search(&r1_hash).is_ok())),
+                "r1 must not be removed at every location: carrier_first={carrier_first}"
+            );
+        }
+    });
+}
+
 #[test]
 fn e2_pipeline_deletion_reload_then_later_move_keeps_birth() {
     with_e2(|| {
