@@ -2304,14 +2304,24 @@ pub(crate) fn rotate_service_log_if_due() {
 
 /// Content-free allocator launch configuration, called once before serving.
 pub fn log_startup_resources() {
-    let value = std::env::var_os("MallocLargeCache");
+    let setting = |name: &str| {
+        let value = std::env::var_os(name);
+        let number = value
+            .as_deref()
+            .and_then(|value| value.to_str())
+            .and_then(|value| value.parse::<u64>().ok());
+        (value.is_some(), number)
+    };
+    let (large_cache_set, large_cache) = setting("MallocLargeCache");
+    let (space_efficient_set, space_efficient) = setting("MallocSpaceEfficient");
     traversal_point(
         "startup",
         "unknown",
         &serde_json::json!({
-            "malloc_large_cache_set": value.is_some(),
-            "malloc_large_cache": value.as_deref().and_then(|value| value.to_str())
-                .and_then(|value| value.parse::<u64>().ok()),
+            "malloc_large_cache_set": large_cache_set,
+            "malloc_large_cache": large_cache,
+            "malloc_space_efficient_set": space_efficient_set,
+            "malloc_space_efficient": space_efficient,
         }),
     );
     // The shutdown row is process-wide; a captured unit test only checks startup.
@@ -2706,10 +2716,12 @@ mod tests {
         assert_eq!(row["stage"], "startup");
         assert_eq!(row["source"], "unknown");
         let counts = row["counts"].as_object().unwrap();
-        assert_eq!(counts.len(), 2);
-        assert!(counts["malloc_large_cache_set"].is_boolean());
-        let value = &counts["malloc_large_cache"];
-        assert!(value.is_null() || value.is_u64());
+        assert_eq!(counts.len(), 4);
+        for prefix in ["malloc_large_cache", "malloc_space_efficient"] {
+            assert!(counts[&format!("{prefix}_set")].is_boolean());
+            let value = &counts[prefix];
+            assert!(value.is_null() || value.is_u64());
+        }
     }
 
     #[cfg(unix)]
