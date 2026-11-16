@@ -2168,8 +2168,8 @@ mod progress_rows {
 /// These membership assertions are expected red on main.
 #[test]
 fn accepted_request_rows_round_trip_replace_and_reject_future_layouts() {
-    use super::super::claude_money_birth_store::location_key;
-    use super::super::upload_context_receipt::{ProofState, SlotRows};
+    use crate::snapshots::claude_money_birth_store::location_key;
+    use crate::snapshots::upload_context_receipt::{ProofState, SlotRows};
     use std::sync::Arc;
     let f = Fixture::new();
     f.published();
@@ -2220,7 +2220,7 @@ fn accepted_request_rows_round_trip_replace_and_reject_future_layouts() {
 
 #[test]
 fn malformed_accepted_request_rows_refuse_the_native_store() {
-    use super::super::upload_context_receipt::SlotRows;
+    use crate::snapshots::upload_context_receipt::SlotRows;
     for hashes in [
         "",
         "AA==",

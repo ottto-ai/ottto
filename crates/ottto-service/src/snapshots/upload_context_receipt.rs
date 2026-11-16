@@ -1,9 +1,20 @@
 //! Per-file delivery evidence, independent of source census authority.
 use super::claude_money_birth_store::LocationKey;
 use super::*;
+use std::mem::{size_of, size_of_val};
 use std::sync::Arc;
 
 pub(crate) type RequestRows = Box<[(LocationKey, Arc<[u64]>)]>;
+impl crate::heap_layout_bound::HeapLayoutBound for RequestRows {
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        c.add(size_of_val(self.as_ref()))?;
+        for (_, hashes) in self.iter() {
+            c.add(size_of_val(hashes.as_ref()).checked_add(2 * size_of::<usize>())?)?;
+        }
+        Some(())
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SlotRows {
     pub fingerprint: String,

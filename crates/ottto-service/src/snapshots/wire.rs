@@ -508,7 +508,7 @@ pub struct SnapshotItem {
     #[serde(skip)]
     pub(crate) claude_usage_occurrences: BTreeMap<String, ClaudeTranscriptUsageOccurrence>,
     #[serde(skip)]
-    pub(crate) request_contributions: upload_context_receipt::RequestRows,
+    pub(crate) request_contributions: super::upload_context_receipt::RequestRows,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_observations: Option<CacheObservations>,
     #[serde(skip)]
