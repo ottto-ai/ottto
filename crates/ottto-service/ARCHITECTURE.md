@@ -203,6 +203,8 @@ Desktop metadata cache.
 
 The process-owned transcript cache retains complete Codex home facts in RAM,
 using the shared file stamp for the resolved SQLite main file and its WAL.
+Only the active cycle scope's facts are kept; returning facts discard idle
+entries from previous scopes. Cycle serialization excludes overlapping loads.
 Every pass lists the homes and rebuilds metadata merges, ownership conflicts,
 completeness and path fingerprints. A home whose stamps match is reused; only
 changed or added homes reload, and an unstamped or incomplete home is not kept.
