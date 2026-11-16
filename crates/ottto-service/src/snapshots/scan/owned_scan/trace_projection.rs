@@ -53,6 +53,57 @@ pub(super) fn permute_candidates(walk: &mut ScanTraversalCheckpoint) {
 }
 
 impl OwnedSourceScan {
+    /// Count identity/acquisition anchors independently from parser/decoder work.
+    /// The archive observer treats any identity sample as wholly unmeasured;
+    /// this driver also captures the actual acquisition sample-read seam.
+    pub(crate) fn observe_oracle_io<T>(
+        run: impl FnOnce() -> T,
+    ) -> (T, sampled_scan::transition_fixture::IoBytes) {
+        let identity_before = START_IDENTITY_SAMPLE_FOR_TEST.with(std::cell::Cell::get);
+        let activity_before = codex_zst_refusal_tests::activity();
+        let ((result, consumed), anchors) =
+            crate::transcript_acquisition::capture_sample_reads(|| {
+                sampled_scan::transition_fixture::observe_consumed(run)
+            });
+        let identity_after = START_IDENTITY_SAMPLE_FOR_TEST.with(std::cell::Cell::get);
+        let measured =
+            (activity_before == codex_zst_refusal_tests::activity() && consumed == 0).then_some(0);
+        let anchor_bytes = anchors
+            .iter()
+            .map(|read| read.result.expect("synthetic anchor read succeeds") as u64)
+            .sum::<u64>()
+            + identity_after.1
+            - identity_before.1;
+        (
+            result,
+            sampled_scan::transition_fixture::IoBytes {
+                consumed,
+                cheap_checks: measured,
+                anchor_reads: Some(anchor_bytes),
+                other_reads: measured,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Independent expected window for a settled page: Claude/Pi take one
+    /// opened-object head/tail sample per selected file before Skip. Codex
+    /// uses its certified physical match without samples. No parser or
+    /// acquisition-anchor allowance is granted by this metadata calculation.
+    pub(crate) fn oracle_quiet_anchor_window(&self) -> u64 {
+        if self.source == SnapshotSource::Codex {
+            return 0;
+        }
+        self.identified_candidates
+            .iter()
+            .map(|candidate| {
+                let size = std::fs::metadata(&candidate.path).unwrap().len();
+                let sample = FILE_CONTENT_SAMPLE_BYTES as u64;
+                size.min(sample) + if size > sample { sample } else { 0 }
+            })
+            .sum()
+    }
+
     /// Install fixture scheduling before real prepare performs selection.
     pub(crate) fn with_oracle_schedule<T>(
         schedule: Option<(usize, bool)>,

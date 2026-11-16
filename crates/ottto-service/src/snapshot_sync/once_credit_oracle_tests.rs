@@ -316,6 +316,7 @@ struct Cycle {
     steps: Vec<Value>,
     consumed: u64,
     io: transition::IoBytes,
+    quiet_anchor_window: u64,
     batches: Vec<Vec<u8>>,
     acknowledged: Vec<Vec<Value>>,
     index: ScanIndex,
@@ -535,6 +536,11 @@ impl OracleHome {
         );
         self.restart();
     }
+    fn age_listing(&self) {
+        let mut index = ScanIndex::load(&self.index_path()).unwrap();
+        crate::snapshots::e2_pipeline_scan_fixture::age_listing_for_test(&mut index);
+        index.save(&self.index_path()).unwrap();
+    }
     fn cycle(&mut self, server: &OracleServer, recording: &Recording) -> Cycle {
         let schedule = self.schedule.map(|s| (s.limit, s.reverse));
         crate::snapshots::OwnedSourceScan::with_oracle_schedule(schedule, || {
@@ -557,7 +563,7 @@ impl OracleHome {
         let start = server.batches.lock().unwrap().len();
         let ack_start = server.acknowledged.lock().unwrap().len();
         let collection = self.collection();
-        let (prepared, prepare_io) = transition::observe_codex_quiet(|| {
+        let (prepared, prepare_io) = crate::snapshots::OwnedSourceScan::observe_oracle_io(|| {
             with_scan_clock(now, || {
                 crate::agent_status_refresh::with_test_collection(collection, || {
                     prepare_sync_source(
@@ -577,6 +583,7 @@ impl OracleHome {
             })
         });
         let mut frame = prepared.unwrap().expect("due real preparation");
+        let quiet_anchor_window = frame.scan.as_ref().unwrap().oracle_quiet_anchor_window();
         frame.scan.as_mut().unwrap().set_oracle_collection_time(&at);
         frame.scan_started_at = at;
         let schedule = self.schedule.map(|schedule| {
@@ -614,7 +621,7 @@ impl OracleHome {
             let read = move || {
                 with_scan_clock(now, || {
                     let ((preparation, index, scan, steps), io) =
-                        transition::observe_codex_quiet(|| {
+                        crate::snapshots::OwnedSourceScan::observe_oracle_io(|| {
                             let mut steps = Vec::new();
                             for _ in 0..1024 {
                                 let before = frame.scan.as_ref().unwrap().trace_projection();
@@ -661,21 +668,6 @@ impl OracleHome {
                 read()
             }
         });
-        io.consumed += prepare_io.consumed;
-        io.rederive_head += prepare_io.rederive_head;
-        io.rederive_named += prepare_io.rederive_named;
-        io.cheap_checks = io
-            .cheap_checks
-            .zip(prepare_io.cheap_checks)
-            .map(|(a, b)| a + b);
-        io.anchor_reads = io
-            .anchor_reads
-            .zip(prepare_io.anchor_reads)
-            .map(|(a, b)| a + b);
-        io.other_reads = io
-            .other_reads
-            .zip(prepare_io.other_reads)
-            .map(|(a, b)| a + b);
         let gate = scan.trace_projection(&roots);
         test_effects::record(
             "gate_c",
@@ -689,25 +681,35 @@ impl OracleHome {
         });
         let chunks_before = evidence_chunks_for_test();
         let collection = self.collection();
-        let finish = with_scan_clock(now, || {
-            crate::agent_status_refresh::with_test_collection(collection, || {
-                finish_sync_source(
-                    preparation,
-                    index,
-                    scan,
-                    &self.client,
-                    &self.device,
-                    "device-secret",
-                    self.source,
-                    "otm_test",
-                    &self.fixture.home,
-                    &self.support,
-                    &self.daemon,
-                    &mut self.transport,
-                    &mut self.retry,
-                )
+        let (finish, finish_io) = crate::snapshots::OwnedSourceScan::observe_oracle_io(|| {
+            with_scan_clock(now, || {
+                crate::agent_status_refresh::with_test_collection(collection, || {
+                    finish_sync_source(
+                        preparation,
+                        index,
+                        scan,
+                        &self.client,
+                        &self.device,
+                        "device-secret",
+                        self.source,
+                        "otm_test",
+                        &self.fixture.home,
+                        &self.support,
+                        &self.daemon,
+                        &mut self.transport,
+                        &mut self.retry,
+                    )
+                })
             })
         });
+        for part in [prepare_io, finish_io] {
+            io.consumed += part.consumed;
+            io.rederive_head += part.rederive_head;
+            io.rederive_named += part.rederive_named;
+            io.cheap_checks = io.cheap_checks.zip(part.cheap_checks).map(|(a, b)| a + b);
+            io.anchor_reads = io.anchor_reads.zip(part.anchor_reads).map(|(a, b)| a + b);
+            io.other_reads = io.other_reads.zip(part.other_reads).map(|(a, b)| a + b);
+        }
         let mut finalized = capture.take();
         // The PF probe precedes the real uploader's cache-contract projection.
         // Our hint leaves cache negotiation disabled; apply that SAME function
@@ -765,6 +767,7 @@ impl OracleHome {
             steps,
             consumed: io.consumed,
             io,
+            quiet_anchor_window,
             batches,
             acknowledged: server.acknowledged.lock().unwrap()[ack_start..].to_vec(),
             index,
@@ -1042,11 +1045,23 @@ fn c05_fresh_destination_requires_its_own_exact_ack() {
     home.device.device_id = "other-oracle-device".into();
     FileDeviceStore::default().save(&home.device).unwrap();
     let destination = snapshot_upload_destination_namespace(&home.device, "device-secret");
+    // A different destination with history on this Mac is a move. Authorize
+    // that history through the real claim policy before testing its ACK gate.
+    crate::backfill::apply_claim_backfill_policy_for_destination(
+        &home.support,
+        Some("full"),
+        None,
+        "synthetic-oracle-user",
+        Some(&destination),
+    )
+    .unwrap();
     crate::backfill::record_first_census(&home.support, home.source, &destination, AT, true)
         .unwrap();
     home.restart();
     *server.fallback.lock().unwrap() = Answer::Unstored;
     let unstored = home.cycle(&server, &recording);
+    assert!(unstored.finish.is_ok());
+    assert_eq!(unstored.batches.len(), 1);
     assert_eq!(unstored.finalized.len(), 1);
     let item = &unstored.finalized[0];
     assert_eq!(item.snapshot_fingerprint, fingerprint);
@@ -1120,12 +1135,23 @@ fn c06_crash_windows_preserve_placement_and_durable_suppression() {
         let durable = matches!(answer, Answer::Accept);
         let item = &first.finalized[0];
         assert_eq!(first.accepted_body(item), durable);
+        if !durable {
+            let custody = &first.progress.quarantined_fingerprints[&item.snapshot_fingerprint];
+            assert_eq!(
+                custody.disposition,
+                SnapshotQuarantineDisposition::RetryPending
+            );
+            assert!(custody.retry_after_unix_seconds > home.now);
+        }
         assert_eq!(
             server.placement.lock().unwrap().len(),
             usize::from(!matches!(answer, Answer::Dropped))
         );
         *server.fallback.lock().unwrap() = Answer::Accept;
         home.restore_pre_cycle_index(&first);
+        // Transport failure keeps the exact unACKed body in retryable custody.
+        // A restart alone does not make that custody's deadline due.
+        home.now += 3600;
         let replay = home.cycle(&server, &recording);
         assert!(replay.finish.is_ok());
         assert_eq!(
@@ -1332,7 +1358,7 @@ fn c01_claude_cold_control_preserves_accounts_side_call_gap_and_tags() {
     for item in &cold.finalized {
         let value = serde_json::to_value(item).unwrap();
         for row in value["model_usage"].as_array().unwrap() {
-            tagged |= row["selector_context"]["effort"] == "high";
+            tagged |= row["reasoning_effort"] == "high";
             let shares = row["identity_parts"]
                 .as_array()
                 .map(|v| v.iter().collect::<Vec<_>>())
@@ -1369,7 +1395,10 @@ fn c01_claude_cold_control_preserves_accounts_side_call_gap_and_tags() {
     assert_eq!(*server.placement.lock().unwrap(), placement);
     let mut quiet_route = emitted_route(&quiet, SnapshotSource::ClaudeCode, &server);
     quiet_route.mode = transition::Mode::Restart;
-    transition::money_oracle::assert_quiet_restart_zero_bytes(&quiet_route);
+    transition::money_oracle::assert_quiet_restart_with_anchor_window(
+        &quiet_route,
+        quiet.quiet_anchor_window,
+    );
 }
 
 fn codex_member(
@@ -1617,7 +1646,25 @@ fn c09_codex_singleton_memo_keeps_the_previous_body() {
     assert_eq!(cold.finalized[0].input_tokens, 200);
     let placement = server.placement.lock().unwrap().clone();
     install_created_thread(&home, true, IDENTITY_PIPELINE_ROOT);
+    // This is a header rewrite, not an append. Change its listing stamp and
+    // make the retained listing due so the real path takes a fresh Full read.
+    std::fs::File::options()
+        .write(true)
+        .open(
+            home.source.default_roots(&home.fixture.home)[0]
+                .join(format!("rollout-{IDENTITY_PIPELINE_ROOT}.jsonl")),
+        )
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(NOW - 1800))
+        .unwrap();
+    home.age_listing();
     let held = home.cycle(&server, &recording);
+    assert!(
+        held.consumed > 0,
+        "the rewritten header must actually be parsed"
+    );
+    assert_eq!(held.gate["ownership_incomplete_file_count"], 1);
+    assert_eq!(last_counter(&held, "full_files"), 1);
     assert_eq!(last_counter(&held, "memo_records"), 1);
     assert!(held.gate["pending_finalization"][0]["previous_snapshot"]
         .as_bool()
@@ -1626,6 +1673,7 @@ fn c09_codex_singleton_memo_keeps_the_previous_body() {
         .as_bool()
         .unwrap());
     home.now += 86_400;
+    home.age_listing();
     let quiet = home.cycle(&server, &recording);
     assert_eq!(
         last_counter(&quiet, "memo_hits"),
@@ -1863,7 +1911,8 @@ fn c11_account_hold_bypasses_the_full_audit_cap_without_staging_a_marker() {
 }
 
 // Distinct telemetry ids per root; native copied ids retain their original bytes.
-// Four locations keep both real file allowances (2/3) nonterminal initially.
+// The fifth, independent location stays queued when related-file pulls bring
+// all four original locations onto a page. Both allowances (2/3) stay real.
 fn scheduling_corpus(home: &OracleHome, seed_only: bool) -> Vec<(PathBuf, String)> {
     let root = home.source.default_roots(&home.fixture.home)[0].clone();
     let sessions = [
@@ -1871,10 +1920,11 @@ fn scheduling_corpus(home: &OracleHome, seed_only: bool) -> Vec<(PathBuf, String
         "3338a80a-f36e-4cbc-a5bb-50fc66430ba5",
         "4338a80a-f36e-4cbc-a5bb-50fc66430ba5",
         "5338a80a-f36e-4cbc-a5bb-50fc66430ba5",
+        "6338a80a-f36e-4cbc-a5bb-50fc66430ba5",
     ];
     let mut paths = Vec::new();
     let mut parent = Vec::<Value>::new();
-    for n in 0..4 {
+    for n in 0..5 {
         let session = if n == 3 && home.source != SnapshotSource::Pi {
             sessions[0]
         } else {
@@ -1936,7 +1986,7 @@ fn scheduling_corpus(home: &OracleHome, seed_only: bool) -> Vec<(PathBuf, String
         } else {
             session
         };
-        let path = root.join(format!("{}-member/{filename}.jsonl", [0, 2, 1, 3][n]));
+        let path = root.join(format!("{}-member/{filename}.jsonl", [0, 2, 1, 3, 4][n]));
         write_jsonl(&path, &rows);
         paths.push((path, session.into()));
         if seed_only {
@@ -2275,7 +2325,7 @@ fn scheduling_permutations_converge_to_the_same_bodies() {
                                 assert!(multi_chunk, "at least two real evidence chunks");
                             }
                         }
-                        let expected_sessions = if source == SnapshotSource::Pi { 4 } else { 3 };
+                        let expected_sessions = if source == SnapshotSource::Pi { 5 } else { 4 };
                         assert_eq!(accepted.len(), expected_sessions);
                         for (entity, value) in &accepted {
                             let parent = entity == IDENTITY_PIPELINE_ROOT;
@@ -2328,7 +2378,10 @@ fn scheduling_permutations_converge_to_the_same_bodies() {
                         assert_eq!(accepted, prior);
                         let mut route = emitted_route(&quiet, source, &server);
                         route.mode = transition::Mode::Restart;
-                        transition::money_oracle::assert_quiet_restart_zero_bytes(&route);
+                        transition::money_oracle::assert_quiet_restart_with_anchor_window(
+                            &route,
+                            quiet.quiet_anchor_window,
+                        );
                         if let Some(out) = std::env::var_os("OTTTO_MONEY_EQUIVALENCE_OUTPUT") {
                             money_equivalence_tests::emit_trace(
                                 &out,
@@ -2414,6 +2467,8 @@ mod money_equivalence_tests {
                 "fingerprints":cycle.index.current_snapshot_fingerprints(),
                 "accepted_body_witnesses":cycle.progress.accepted_body_witnesses},
             "finish_ok":cycle.finish.is_ok(),"parser_bytes":cycle.consumed,
+            "io":{"cheap_checks":cycle.io.cheap_checks,"anchor_reads":cycle.io.anchor_reads,
+                "other_reads":cycle.io.other_reads,"quiet_anchor_window":cycle.quiet_anchor_window},
             "schedule":cycle.schedule,"evidence_chunks":cycle.evidence_chunks,"debt":cycle.debt});
         emit_trace(&out, &format!("{row}-{number}"), &receipt);
     }
@@ -2589,7 +2644,10 @@ mod money_equivalence_tests {
             assert_eq!(*server.placement.lock().unwrap(), placement);
             let mut route = emitted_route(&quiet, SnapshotSource::Codex, &server);
             route.mode = transition::Mode::Restart;
-            transition::money_oracle::assert_quiet_restart_zero_bytes(&route);
+            transition::money_oracle::assert_quiet_restart_with_anchor_window(
+                &route,
+                quiet.quiet_anchor_window,
+            );
         }
         {
             let server = OracleServer::new(SnapshotSource::Pi, recording.handle());
@@ -2627,7 +2685,10 @@ mod money_equivalence_tests {
             assert_eq!(*server.placement.lock().unwrap(), placement);
             let mut route = emitted_route(&quiet, SnapshotSource::Pi, &server);
             route.mode = transition::Mode::Restart;
-            transition::money_oracle::assert_quiet_restart_zero_bytes(&route);
+            transition::money_oracle::assert_quiet_restart_with_anchor_window(
+                &route,
+                quiet.quiet_anchor_window,
+            );
         }
         emit_money("once_credit_native", receipt_bodies, fixture_inputs);
     }
