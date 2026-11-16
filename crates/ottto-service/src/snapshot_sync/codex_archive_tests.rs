@@ -11,7 +11,7 @@ pub(crate) fn archive_upload_checkpoint(
         .0
 }
 
-fn codex_transition_batch(items: Vec<SnapshotItem>) -> Vec<u8> {
+fn codex_transition_batch<T: std::borrow::Borrow<SnapshotItem>>(items: Vec<T>) -> Vec<u8> {
     let request = snapshot_batch_request(
         SnapshotSource::Codex,
         "synthetic-machine",
@@ -39,7 +39,7 @@ fn codex_transition_upload(items: &[SnapshotItem]) -> (Vec<Vec<u8>>, SnapshotUpl
         |item: &SnapshotItem| item.snapshot_fingerprint.as_str(),
         snapshot_upload_body_witness,
         |items| {
-            posts.push(codex_transition_batch(items.clone()));
+            posts.push(codex_transition_batch(items.to_vec()));
             ack_retention_tests::exact_ack(items)
         },
         |_| Ok(()),

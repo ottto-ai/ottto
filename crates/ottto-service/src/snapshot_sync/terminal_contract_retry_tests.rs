@@ -408,7 +408,7 @@ fn successful_contract_retry(restart_after_selection: bool) {
                     vec![held_fingerprint()],
                     "pre-existing ACK and refusal must not be uploaded"
                 );
-                offered.extend(batch.clone());
+                offered.extend(batch.iter().copied().cloned());
                 let response = entity_ack_batch(&batch, &[], &[]);
                 response.validate_entity_ack_identities(
                     batch
@@ -861,7 +861,7 @@ fn contract_ack_saved_before_index_restart(unrelated: bool) {
             String::as_str,
             |_| fixture.body.clone(),
             |batch| {
-                assert_eq!(batch, vec![fixture.fingerprint.clone()]);
+                assert_eq!(batch, &[&fixture.fingerprint]);
                 let response = entity_ack_batch(&batch, &[], &[]);
                 let identities: Vec<_> = batch
                     .iter()
@@ -951,7 +951,7 @@ fn contract_ack_saved_before_index_restart(unrelated: bool) {
             |fp| bodies[fp].clone(),
             |batch| {
                 assert!(unrelated, "empty delta must not POST");
-                assert_eq!(batch, delta);
+                assert_eq!(batch, delta.iter().collect::<Vec<_>>());
                 posts += 1;
                 Ok(entity_ack_batch(&batch, &[], &[]))
             },

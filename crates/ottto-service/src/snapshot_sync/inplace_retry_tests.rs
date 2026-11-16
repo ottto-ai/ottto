@@ -34,7 +34,7 @@ struct Driven {
 fn drive(
     count: usize,
     failed_after: Option<Duration>,
-    mut respond: impl FnMut(usize, &[String]) -> Result<BatchResponse>,
+    mut respond: impl FnMut(usize, &[&String]) -> Result<BatchResponse>,
 ) -> Driven {
     let items = test_fingerprints(count);
     let mut progress = test_upload_progress();
@@ -49,7 +49,7 @@ fn drive(
             String::as_str,
             |batch| {
                 let attempt = posts.len();
-                posts.push(batch.clone());
+                posts.push(batch.iter().copied().cloned().collect());
                 respond(attempt, &batch)
             },
             |_| Ok(()),

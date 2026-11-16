@@ -64,8 +64,6 @@ mod identity_bucket_progress_tests;
 mod reason_reoffer;
 mod rejection_log;
 mod stale_owed;
-#[cfg(test)]
-mod upload_owned_test_adapters;
 
 // Direct API host; the apex `ottto.net/backend` proxy is retired in the marketing cutover.
 const DEFAULT_API_BASE_URL: &str = "https://api.ottto.net";
@@ -149,10 +147,7 @@ fn bootstrap_cache_heads(
     probes: &[SnapshotItem],
     poison_scope: &str,
     progress: &mut SnapshotUploadProgress,
-    mut upload: impl FnMut(
-        Vec<SnapshotItem>,
-        bool,
-    ) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
+    upload: impl FnMut(&[&SnapshotItem], bool) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
     persist: impl FnMut(&mut SnapshotUploadProgress) -> Result<()>,
 ) -> Result<usize> {
     bootstrap_cache_heads_with_budget(
@@ -160,7 +155,7 @@ fn bootstrap_cache_heads(
         poison_scope,
         progress,
         &mut InplaceRetryBudget::default(),
-        |items, enforce| upload(items.iter().copied().cloned().collect(), enforce),
+        upload,
         persist,
     )
 }
@@ -10815,9 +10810,9 @@ fn upload_resumable_batches<T, Fingerprint, Upload, Persist>(
     persist: Persist,
 ) -> Result<ResumableUploadResult>
 where
-    T: Clone + Serialize,
+    T: Serialize,
     Fingerprint: Fn(&T) -> &str + Copy,
-    Upload: FnMut(Vec<T>) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
+    Upload: FnMut(&[&T]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
     Persist: FnMut(&mut SnapshotUploadProgress) -> Result<()>,
 {
     upload_resumable_batches_with_body_witness(
@@ -10841,14 +10836,14 @@ fn upload_resumable_batches_with_body_witness<T, Fingerprint, BodyWitness, Uploa
     accepted: &mut u64,
     fingerprint: Fingerprint,
     body_witness: BodyWitness,
-    mut upload: Upload,
+    upload: Upload,
     persist: Persist,
 ) -> Result<ResumableUploadResult>
 where
-    T: Clone + Serialize,
+    T: Serialize,
     Fingerprint: Fn(&T) -> &str,
     BodyWitness: Fn(&T) -> String,
-    Upload: FnMut(Vec<T>) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
+    Upload: FnMut(&[&T]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
     Persist: FnMut(&mut SnapshotUploadProgress) -> Result<()>,
 {
     upload_resumable_batches_with_literal_families(
@@ -10862,7 +10857,7 @@ where
         |_| 0,
         |_| None,
         &mut InplaceRetryBudget::default(),
-        |items| upload(items.iter().copied().cloned().collect()),
+        upload,
         persist,
     )
 }
@@ -13444,10 +13439,6 @@ pub(crate) use tests::codex_archive_tests::{
 
 #[cfg(test)]
 mod tests {
-    use super::upload_owned_test_adapters::{
-        attempt_snapshot_page, bootstrap_cache_heads_with_budget,
-        upload_resumable_batches_with_literal_families,
-    };
     use super::*;
     mod upload_borrowed_tests {
         include!("snapshot_sync/upload_borrowed_tests.rs");
@@ -13781,7 +13772,7 @@ mod tests {
                     source: "codex".into(),
                     machine_id: "a".repeat(64),
                     collector_version: Some(collector_version()),
-                    snapshots: items,
+                    snapshots: items.to_vec(),
                     upload_policy: SnapshotUploadPolicy::default(),
                     client_report: crate::client_report::ClientReport::empty(),
                 };
@@ -14001,7 +13992,7 @@ mod tests {
                     source: "codex".into(),
                     machine_id: "a".repeat(64),
                     collector_version: Some(collector_version()),
-                    snapshots: items.clone(),
+                    snapshots: items.to_vec(),
                     upload_policy: SnapshotUploadPolicy::default(),
                     client_report: crate::client_report::ClientReport::empty(),
                 };
@@ -14049,7 +14040,7 @@ mod tests {
                     source: "codex".into(),
                     machine_id: "a".repeat(64),
                     collector_version: Some(collector_version()),
-                    snapshots: batch.clone(),
+                    snapshots: batch.to_vec(),
                     upload_policy: SnapshotUploadPolicy::default(),
                     client_report: crate::client_report::ClientReport::empty(),
                 };
@@ -14183,7 +14174,7 @@ mod tests {
                     source: "codex".into(),
                     machine_id: "a".repeat(64),
                     collector_version: Some(collector_version()),
-                    snapshots: batch,
+                    snapshots: batch.to_vec(),
                     upload_policy: SnapshotUploadPolicy::default(),
                     client_report: crate::client_report::ClientReport::empty(),
                 };
@@ -14297,7 +14288,7 @@ mod tests {
                     source: "codex".into(),
                     machine_id: "a".repeat(64),
                     collector_version: Some(collector_version()),
-                    snapshots: items,
+                    snapshots: items.to_vec(),
                     upload_policy: SnapshotUploadPolicy::default(),
                     client_report: crate::client_report::ClientReport::empty(),
                 };
@@ -14406,7 +14397,7 @@ mod tests {
                     source: "codex".into(),
                     machine_id: "a".repeat(64),
                     collector_version: Some(collector_version()),
-                    snapshots: items,
+                    snapshots: items.to_vec(),
                     upload_policy: SnapshotUploadPolicy::default(),
                     client_report: crate::client_report::ClientReport::empty(),
                 };
@@ -14570,13 +14561,13 @@ mod tests {
             )
             .unwrap()
         };
-        let response = |items: Vec<SnapshotItem>, enforce: bool, head: Option<String>| {
+        let response = |items: &[&SnapshotItem], enforce: bool, head: Option<String>| {
             let request = SnapshotBatchRequest {
                 schema_version: SNAPSHOT_SCHEMA_VERSION,
                 source: "codex".into(),
                 machine_id: "a".repeat(64),
                 collector_version: Some(collector_version()),
-                snapshots: items,
+                snapshots: items.to_vec(),
                 upload_policy: SnapshotUploadPolicy::default(),
                 client_report: crate::client_report::ClientReport::empty(),
             };
@@ -14913,7 +14904,7 @@ mod tests {
                     source: "codex".into(),
                     machine_id: "a".repeat(64),
                     collector_version: Some(collector_version()),
-                    snapshots: items,
+                    snapshots: items.to_vec(),
                     upload_policy: SnapshotUploadPolicy::default(),
                     client_report: crate::client_report::ClientReport::empty(),
                 };
@@ -14998,7 +14989,7 @@ mod tests {
                     source: "codex".into(),
                     machine_id: "a".repeat(64),
                     collector_version: Some(collector_version()),
-                    snapshots: items,
+                    snapshots: items.to_vec(),
                     upload_policy: SnapshotUploadPolicy::default(),
                     client_report: crate::client_report::ClientReport::empty(),
                 };
@@ -15050,7 +15041,7 @@ mod tests {
                     source: "codex".into(),
                     machine_id: "a".repeat(64),
                     collector_version: Some(collector_version()),
-                    snapshots: items,
+                    snapshots: items.to_vec(),
                     upload_policy: SnapshotUploadPolicy::default(),
                     client_report: crate::client_report::ClientReport::empty(),
                 };
@@ -15143,7 +15134,7 @@ mod tests {
                     source: "codex".into(),
                     machine_id: "a".repeat(64),
                     collector_version: Some(collector_version()),
-                    snapshots: items,
+                    snapshots: items.to_vec(),
                     upload_policy: policy,
                     client_report: crate::client_report::ClientReport::empty(),
                 };
@@ -15324,7 +15315,7 @@ mod tests {
                         &mut accepted,
                         |item| item.snapshot_fingerprint.as_str(),
                         snapshot_upload_body_witness,
-                        |items: Vec<SnapshotItem>| {
+                        |items: &[&SnapshotItem]| {
                             offered
                                 .extend(items.iter().map(|item| item.snapshot_fingerprint.clone()));
                             Ok(response.clone())
@@ -15472,8 +15463,15 @@ mod tests {
                             retained_proof_missing: Vec::new(),
                             cache_observations_state: None,
                         });
-                    let mut request = request.clone();
-                    request.snapshots = items;
+                    let request = SnapshotBatchRequest {
+                        schema_version: request.schema_version,
+                        source: request.source.clone(),
+                        machine_id: request.machine_id.clone(),
+                        collector_version: request.collector_version.clone(),
+                        snapshots: items.to_vec(),
+                        upload_policy: request.upload_policy,
+                        client_report: request.client_report.clone(),
+                    };
                     response.validate_entity_ack_with_head_cas(&request, enforce)?;
                     Ok(response)
                 },
@@ -16142,13 +16140,13 @@ mod tests {
         let digest = snapshot_upload_body_witness(&items[0]);
         let mut progress = test_upload_progress();
         let mut accepted = 0;
-        let checked_response = |batch: Vec<SnapshotItem>, version, proof, unchanged| {
+        let checked_response = |batch: &[&SnapshotItem], version, proof, unchanged| {
             let request = SnapshotBatchRequest {
                 schema_version: SNAPSHOT_SCHEMA_VERSION,
                 source: "claude_code".to_string(),
                 machine_id: "machine".to_string(),
                 collector_version: None,
-                snapshots: batch,
+                snapshots: batch.to_vec(),
                 upload_policy: SnapshotUploadPolicy::default(),
                 client_report: crate::client_report::ClientReport::empty(),
             };
@@ -16187,8 +16185,13 @@ mod tests {
             response.validate_entity_ack(&request)?;
             Ok(response)
         };
-        checked_response(items.clone(), Some(7), Some(digest.clone()), false)
-            .expect("exact first-admission ACK validates in its declared domain");
+        checked_response(
+            &items.iter().collect::<Vec<_>>(),
+            Some(7),
+            Some(digest.clone()),
+            false,
+        )
+        .expect("exact first-admission ACK validates in its declared domain");
         let first = upload_resumable_batches_with_body_witness(
             &items,
             &unique_poison_scope(),
@@ -16349,7 +16352,7 @@ mod tests {
             String::as_str,
             |batch| {
                 upload_calls += 1;
-                assert_eq!(batch, items);
+                assert_eq!(batch, items.iter().collect::<Vec<_>>());
                 Ok(accepted_batch(batch.len()))
             },
             |state| state.save(&path),
@@ -16808,10 +16811,10 @@ mod tests {
         }
     }
 
-    fn entity_ack_batch(
-        accepted: &[String],
-        unchanged: &[String],
-        conflicted: &[String],
+    fn entity_ack_batch<T: AsRef<str>>(
+        accepted: &[T],
+        unchanged: &[T],
+        conflicted: &[T],
     ) -> crate::snapshot_client::SnapshotBatchResponse {
         crate::snapshot_client::SnapshotBatchResponse {
             conflict_rescans: Default::default(),
@@ -16823,16 +16826,16 @@ mod tests {
             entity_ack_contract: Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.to_string()),
             accepted_entities: accepted
                 .iter()
-                .map(|fingerprint| entity_ack_ref(fingerprint))
+                .map(|fingerprint| entity_ack_ref(fingerprint.as_ref()))
                 .collect(),
             unchanged_entities: unchanged
                 .iter()
-                .map(|fingerprint| entity_ack_ref(fingerprint))
+                .map(|fingerprint| entity_ack_ref(fingerprint.as_ref()))
                 .collect(),
             rejected_entities: Vec::new(),
             conflict_entities: conflicted
                 .iter()
-                .map(|fingerprint| entity_ack_ref(fingerprint))
+                .map(|fingerprint| entity_ack_ref(fingerprint.as_ref()))
                 .collect(),
         }
     }
@@ -16971,7 +16974,7 @@ mod tests {
             &mut accepted,
             String::as_str,
             |batch| {
-                uploaded_batches.push(batch.clone());
+                uploaded_batches.push(batch.iter().copied().cloned().collect::<Vec<_>>());
                 if uploaded_batches.len() == 1 {
                     Ok(entity_ack_batch(
                         &first_accepted,
@@ -17046,7 +17049,7 @@ mod tests {
             &mut revision_accepted,
             String::as_str,
             |batch| {
-                revision_uploads.push(batch.clone());
+                revision_uploads.push(batch.iter().copied().cloned().collect::<Vec<_>>());
                 Ok(entity_ack_batch(&batch, &[], &[]))
             },
             |_| Ok(()),
@@ -17561,7 +17564,7 @@ mod tests {
             String::as_str,
             |batch| {
                 attempts += 1;
-                assert_eq!(batch, vec![fingerprint.clone()]);
+                assert_eq!(batch, &[&fingerprint]);
                 Ok(accepted_batch(expected_occurrences as usize))
             },
             |_| Ok(()),
@@ -17581,8 +17584,8 @@ mod tests {
         reset_for_test();
         let items = test_fingerprints(1);
         let poison = items[0].clone();
-        let upload = |batch: Vec<String>| {
-            assert!(batch.contains(&poison));
+        let upload = |batch: &[&String]| {
+            assert!(batch.contains(&&poison));
             Err(anyhow::Error::new(SnapshotBatchPreflightRejected {
                 reason: "snapshot[0] exceeds local wire limit".into(),
             }))
@@ -17647,7 +17650,7 @@ mod tests {
             String::as_str,
             |batch| {
                 attempts += 1;
-                if batch == first_page {
+                if batch == first_page.iter().collect::<Vec<_>>() {
                     Ok(accepted_batch(batch.len()))
                 } else {
                     Err(anyhow::Error::new(UploadShed {
@@ -17915,7 +17918,7 @@ mod tests {
             &mut accepted,
             String::as_str,
             |batch| {
-                if batch == first_page {
+                if batch == first_page.iter().collect::<Vec<_>>() {
                     Ok(accepted_batch(batch.len()))
                 } else {
                     Err(anyhow::Error::new(UploadFailureDiagnostics::for_test(
@@ -17950,7 +17953,7 @@ mod tests {
             &mut resumed_accepted,
             String::as_str,
             |batch| {
-                resumed_items.extend(batch.iter().cloned());
+                resumed_items.extend(batch.iter().copied().cloned());
                 Ok(accepted_batch(batch.len()))
             },
             |state| state.save(&path),
@@ -17989,7 +17992,7 @@ mod tests {
                     // A gateway timeout does not prove whether the backend
                     // committed. Model the ambiguous side as committed: the
                     // smaller retries must remain idempotent at entity grain.
-                    remotely_held.extend(batch);
+                    remotely_held.extend(batch.iter().copied().cloned());
                     return Err(anyhow::Error::new(UploadFailureDiagnostics::for_http_test(
                         "local snapshot upload",
                         "snapshot_batch",
@@ -17997,7 +18000,7 @@ mod tests {
                         true,
                     )));
                 }
-                for fingerprint in &batch {
+                for fingerprint in batch.iter().copied() {
                     assert!(
                         !remotely_held.insert(fingerprint.clone()),
                         "a smaller retry may revisit a held entity but cannot mint a second one"
@@ -18139,7 +18142,7 @@ mod tests {
                     return Err(anyhow::Error::new(BatchRejected::from_response(422,
                         serde_json::json!({"errors":[{"loc":["body","snapshots",index,"compaction_timestamps"]}]}).to_string().as_bytes(), batch.len())));
                 }
-                uploaded_capture.lock().expect("capture lock").extend(batch.iter().cloned());
+                uploaded_capture.lock().expect("capture lock").extend(batch.iter().copied().cloned());
                 Ok(accepted_batch(batch.len()))
             }, |_| Ok(()),
         ).expect("indexed rejection holds only the refused entity");
@@ -18230,7 +18233,7 @@ mod tests {
                 &mut accepted,
                 String::as_str,
                 |batch| {
-                    if batch.contains(&poison) {
+                    if batch.contains(&&poison) {
                         let index = batch.iter().position(|item| item == &poison).unwrap();
                         Err(anyhow::Error::new(BatchRejected::from_response(422,
                             serde_json::json!({"errors":[{"loc":["body","snapshots",index,"field"]}]}).to_string().as_bytes(), batch.len())))
@@ -19003,7 +19006,7 @@ mod tests {
             &mut accepted,
             String::as_str,
             |batch| {
-                uploaded.push(batch.clone());
+                uploaded.push(batch.iter().copied().cloned().collect::<Vec<_>>());
                 Ok(entity_ack_batch(&batch, &[], &[]))
             },
             |_| Ok(()),
@@ -19272,11 +19275,11 @@ mod tests {
             &mut accepted,
             String::as_str,
             |batch| {
-                sent.extend(batch.clone());
+                sent.extend(batch.iter().copied().cloned());
                 let response = entity_ack_batch(&[], &batch, &[]);
                 let identities = batch
                     .iter()
-                    .map(|fp| (format!("session-{fp}"), fp.clone()))
+                    .map(|fp| (format!("session-{fp}"), (*fp).clone()))
                     .collect::<Vec<_>>();
                 response.validate_entity_ack_identities(
                     identities.iter().map(|(id, fp)| (id.as_str(), fp.as_str())),
@@ -19487,7 +19490,7 @@ mod tests {
         )
         .is_err());
 
-        let partial = entity_ack_batch(&[], &[], &[]);
+        let partial = entity_ack_batch::<String>(&[], &[], &[]);
         assert!(partial
             .validate_entity_ack_identities(std::iter::once((
                 format!("session-{fingerprint}").as_str(),
@@ -23458,7 +23461,7 @@ mod tests {
                 .iter()
                 .find(|item| item.source_session_id == healthy_owner)
                 .unwrap();
-            let accepted = same_source_fixture_ack(vec![healthy.clone()]).unwrap();
+            let accepted = same_source_fixture_ack(&[&healthy]).unwrap();
             let entity = &accepted.accepted_entities[0];
             let ack = serde_json::json!({"accepted":1,"sessions_reconciled":1,"session_ids":[],
             "disabled":false,"disabled_reason":null,"entity_ack_contract":"snapshot_entity_ack:v1",
@@ -23847,14 +23850,14 @@ mod tests {
     }
 
     fn same_source_fixture_ack(
-        items: Vec<SnapshotItem>,
+        items: &[&SnapshotItem],
     ) -> Result<crate::snapshot_client::SnapshotBatchResponse> {
         integrated_ack(&SnapshotBatchRequest {
             schema_version: SNAPSHOT_SCHEMA_VERSION,
             source: "codex".into(),
             machine_id: "a".repeat(64),
             collector_version: Some(collector_version()),
-            snapshots: items,
+            snapshots: items.to_vec(),
             upload_policy: SnapshotUploadPolicy::default(),
             client_report: crate::client_report::ClientReport::empty(),
         })
@@ -23864,7 +23867,7 @@ mod tests {
     /// body or a CAS stage is acknowledged with `head` under its public body
     /// witness version, and validated as the source upload validates it.
     fn head_cas_fixture_ack(
-        items: Vec<SnapshotItem>,
+        items: &[&SnapshotItem],
         enforce_head_cas: bool,
         head: &str,
     ) -> Result<crate::snapshot_client::SnapshotBatchResponse> {
@@ -23873,7 +23876,7 @@ mod tests {
             source: "codex".into(),
             machine_id: "a".repeat(64),
             collector_version: Some(collector_version()),
-            snapshots: items,
+            snapshots: items.to_vec(),
             upload_policy: SnapshotUploadPolicy::default(),
             client_report: crate::client_report::ClientReport::empty(),
         };
@@ -24031,7 +24034,7 @@ mod tests {
             &mut self,
             slot: usize,
             upload: impl FnMut(
-                Vec<SnapshotItem>,
+                &[&SnapshotItem],
             ) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
         ) -> Result<SnapshotPageOutcome> {
             // Preserve the caller's canonical pending-page selection predicate.
@@ -24239,7 +24242,7 @@ mod tests {
             }
         };
         let headed =
-            |items: Vec<SnapshotItem>| -> Result<crate::snapshot_client::SnapshotBatchResponse> {
+            |items: &[&SnapshotItem]| -> Result<crate::snapshot_client::SnapshotBatchResponse> {
                 let mut response = same_source_fixture_ack(items)?;
                 for entity in &mut response.accepted_entities {
                     entity.head_etag = Some("e".repeat(64));
@@ -24372,9 +24375,11 @@ mod tests {
             let posts = std::cell::Cell::new(0);
             let sent = std::cell::RefCell::new(Vec::new());
             let sent_items = std::cell::RefCell::new(Vec::new());
-            let post = |items: &[SnapshotItem]| {
+            let post = |items: &[&SnapshotItem]| {
                 posts.set(posts.get() + 1);
-                sent_items.borrow_mut().extend(items.iter().cloned());
+                sent_items
+                    .borrow_mut()
+                    .extend(items.iter().copied().cloned());
                 sent.borrow_mut().extend(items.iter().map(|item| {
                     (
                         item.snapshot_fingerprint.clone(),
@@ -24389,7 +24394,7 @@ mod tests {
                     &mut f.progress,
                     &mut InplaceRetryBudget::default(),
                     |items, _| {
-                        post(items.as_slice());
+                        post(items);
                         headed(items)
                     },
                     |progress| progress.save(&f.progress_path),
@@ -24402,7 +24407,7 @@ mod tests {
                 );
             } else {
                 f.send(0, |items| {
-                    post(items.as_slice());
+                    post(items);
                     same_source_fixture_ack(items)
                 })
                 .unwrap();
@@ -24436,12 +24441,12 @@ mod tests {
             // Later transport batches of the same page settle; T's body is
             // already acknowledged by its probe in the bootstrap arm.
             f.send(0, |items| {
-                post(items.as_slice());
+                post(items);
                 same_source_fixture_ack(items)
             })
             .unwrap();
             f.send(1, |items| {
-                post(items.as_slice());
+                post(items);
                 same_source_fixture_ack(items)
             })
             .unwrap();
@@ -24561,7 +24566,7 @@ mod tests {
             assert!(f.items[0].cache_observations.is_some());
             let reopened = f.items[0].clone();
             f.send(0, |items| {
-                post(items.as_slice());
+                post(items);
                 head_cas_fixture_ack(items, false, &"a".repeat(64))
             })
             .unwrap();
@@ -25259,7 +25264,7 @@ mod tests {
                     source: "claude_code".into(),
                     machine_id: "a".repeat(64),
                     collector_version: Some(collector_version()),
-                    snapshots: items,
+                    snapshots: items.to_vec(),
                     upload_policy: SnapshotUploadPolicy::default(),
                     client_report: crate::client_report::ClientReport::empty(),
                 };

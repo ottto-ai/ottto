@@ -54,7 +54,7 @@ pub(super) fn family(root: &str, members: usize, payload: usize) -> Vec<FamilyIt
 pub(super) fn upload_families(
     items: &[FamilyItem],
     progress: &mut SnapshotUploadProgress,
-    mut respond: impl FnMut(&[FamilyItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
+    mut respond: impl FnMut(&[&FamilyItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
 ) -> (Result<ResumableUploadResult>, Vec<Vec<String>>) {
     let mut batches = Vec::new();
     let mut accepted = 0;
@@ -79,7 +79,7 @@ pub(super) fn upload_families(
 }
 
 pub(super) fn accept_all(
-    batch: &[FamilyItem],
+    batch: &[&FamilyItem],
 ) -> Result<crate::snapshot_client::SnapshotBatchResponse> {
     Ok(accepted_batch(batch.len()))
 }

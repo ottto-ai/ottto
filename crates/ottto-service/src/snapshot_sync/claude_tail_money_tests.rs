@@ -3481,7 +3481,7 @@ fn mixed_route_acked(
     page: &Page,
     progress: &SnapshotUploadProgress,
     mode: crate::snapshots::sampled_scan::transition_fixture::Mode,
-    respond: impl FnMut(&[SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
+    respond: impl FnMut(&[&SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
 ) -> (
     crate::snapshots::sampled_scan::transition_fixture::RouteResult,
     SnapshotUploadProgress,

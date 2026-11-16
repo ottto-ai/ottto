@@ -462,7 +462,7 @@ impl Uploader {
                 if fail_after == Some(posts.len()) {
                     return Err(anyhow!("synthetic transport failure"));
                 }
-                for item in &batch {
+                for item in batch.iter().copied() {
                     let bytes = serde_json::to_vec(item).unwrap().len() as u64;
                     *received_item_bytes += bytes;
                     if catchup.contains(&item.snapshot_fingerprint) {

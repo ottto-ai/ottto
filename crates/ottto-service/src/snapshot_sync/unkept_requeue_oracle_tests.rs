@@ -130,7 +130,7 @@ fn send(
     source: SnapshotSource,
     page: &Page,
     progress: &mut SnapshotUploadProgress,
-    respond: impl FnMut(&[SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
+    respond: impl FnMut(&[&SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
 ) -> (Result<ResumableUploadResult>, RouteResult) {
     send_with(source, page, progress, respond, |_| Ok(()))
 }
@@ -140,7 +140,7 @@ fn send_with(
     source: SnapshotSource,
     page: &Page,
     progress: &mut SnapshotUploadProgress,
-    respond: impl FnMut(&[SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
+    respond: impl FnMut(&[&SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
     persist: impl FnMut(&mut SnapshotUploadProgress) -> Result<()>,
 ) -> (Result<ResumableUploadResult>, RouteResult) {
     let (status, batches, _) = upload_source_persisting(
@@ -573,7 +573,7 @@ fn lost_ack_retry_preserves_receiver_money_and_account_switches() {
             let mut receiver = progress(SOURCE);
             let mut sender = progress(SOURCE);
             let (status, _) = send(SOURCE, &first, &mut sender, |items| {
-                for item in items {
+                for item in items.iter().copied() {
                     destination.insert(item.source_session_id.clone(), item.clone());
                 }
                 // The receiver records the stored identity shares; this exact
@@ -655,7 +655,7 @@ fn lost_ack_retry_preserves_receiver_money_and_account_switches() {
                 "native side call"
             );
             let (status, route) = send(SOURCE, &retry, &mut sender, |items| {
-                for item in items {
+                for item in items.iter().copied() {
                     if !grows {
                         if let Some(stored) = destination.get(&item.source_session_id) {
                             assert_eq!(
@@ -853,7 +853,7 @@ fn ack_failure_boundaries_preserve_file_debt_and_accepted_placement() {
                                 faulted = Some(entity.snapshot_fingerprint.clone());
                                 entity.body_witness_digest = Some("0".repeat(64));
                             }
-                            for item in items {
+                            for item in items.iter().copied() {
                                 if faulted.as_ref() != Some(&item.snapshot_fingerprint) {
                                     destination
                                         .insert(item.source_session_id.clone(), item.clone());
@@ -872,7 +872,7 @@ fn ack_failure_boundaries_preserve_file_debt_and_accepted_placement() {
                             }
                         }
                         _ => {
-                            for item in items {
+                            for item in items.iter().copied() {
                                 destination.insert(item.source_session_id.clone(), item.clone());
                             }
                         }
@@ -1056,14 +1056,14 @@ fn ack_failure_boundaries_preserve_file_debt_and_accepted_placement() {
                     )
                 }));
                 if fault == "mixed_file" {
-                    for item in items {
+                    for item in items.iter().copied() {
                         assert!(
                             !already_acked.contains(&item.snapshot_fingerprint),
                             "stored sibling filtered before POST"
                         );
                     }
                 }
-                for item in items {
+                for item in items.iter().copied() {
                     destination.insert(item.source_session_id.clone(), item.clone());
                 }
                 ack(items)
