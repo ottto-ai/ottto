@@ -1083,7 +1083,7 @@ fn handle_control_request(
     write_json_response_with_headers(stream, 200, serde_json::to_value(response)?, &cors_headers)
 }
 
-/// Loopback identity probe. Local control authorization enables identity details;
+/// Loopback identity probe. Allowed Origin and Host enable identity details;
 /// other callers receive liveness and version only.
 fn handle_whoami_request(
     stream: &mut TcpStream,
@@ -1091,10 +1091,8 @@ fn handle_whoami_request(
     request: HttpRequest,
 ) -> Result<()> {
     let origin = request.headers.get("origin").map(String::as_str);
-    if let Some(forbidden) =
-        forbidden_local_request_body(&request, stream.local_addr()?.port(), "identity")
-    {
-        return write_json_response(stream, 403, forbidden);
+    if forbidden_local_request_body(&request, stream.local_addr()?.port(), "identity").is_some() {
+        return write_json_response(stream, 200, probe_liveness_payload());
     }
     let cors_headers = cors_headers(origin, "GET, OPTIONS");
 
@@ -1117,14 +1115,6 @@ fn handle_whoami_request(
         );
     }
 
-    if !probe_has_control_token(daemon, &request) {
-        return write_json_response_with_headers(
-            stream,
-            200,
-            probe_liveness_payload(),
-            &cors_headers,
-        );
-    }
     match daemon.machine_for_trusted_client() {
         Ok(machine) => write_json_response_with_headers(
             stream,
@@ -1144,7 +1134,7 @@ fn handle_whoami_request(
     }
 }
 
-/// Loopback health probe. Local control authorization enables canonical health;
+/// Loopback health probe. Allowed Origin and Host enable canonical health;
 /// other callers receive liveness and version only. Account ids are omitted.
 fn handle_local_health_request(
     stream: &mut TcpStream,
@@ -1152,10 +1142,8 @@ fn handle_local_health_request(
     request: HttpRequest,
 ) -> Result<()> {
     let origin = request.headers.get("origin").map(String::as_str);
-    if let Some(forbidden) =
-        forbidden_local_request_body(&request, stream.local_addr()?.port(), "health")
-    {
-        return write_json_response(stream, 403, forbidden);
+    if forbidden_local_request_body(&request, stream.local_addr()?.port(), "health").is_some() {
+        return write_json_response(stream, 200, probe_liveness_payload());
     }
     let cors_headers = cors_headers(origin, "GET, OPTIONS");
 
@@ -1178,14 +1166,6 @@ fn handle_local_health_request(
         );
     }
 
-    if !probe_has_control_token(daemon, &request) {
-        return write_json_response_with_headers(
-            stream,
-            200,
-            probe_liveness_payload(),
-            &cors_headers,
-        );
-    }
     let device_id = local_health_browser_device_id(origin, || {
         FileDeviceStore::default()
             .load()
@@ -1228,14 +1208,6 @@ fn local_health_response_payload(
         "machine_name": status.machine.display_name,
         "health": health,
     }))
-}
-
-fn probe_has_control_token(daemon: &LocalDaemon, request: &HttpRequest) -> bool {
-    request
-        .headers
-        .get("authorization")
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .is_some_and(|token| daemon.control_token.authorize(token).is_ok())
 }
 
 fn probe_liveness_payload() -> serde_json::Value {
@@ -1796,7 +1768,24 @@ pub(crate) mod tests {
     #[test]
     #[serial_test::serial]
     fn forbidden_origin_body_keeps_each_message_verbatim() {
+        fn keys(value: &serde_json::Value) -> Vec<&str> {
+            let mut keys = value
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            keys.sort_unstable();
+            keys
+        }
         let files = crate::control::tests::ControlFilesFixture::new();
+        FileDeviceStore::default()
+            .save(&ottto_core::LocalDeviceBinding {
+                device_id: "device_probe".into(),
+                machine_id: None,
+                sources: vec![],
+            })
+            .unwrap();
         for noun in ["control", "identity", "health"] {
             for (origin, host_kind, error) in [
                 (None, "loopback", Some("origin_forbidden")),
@@ -1882,8 +1871,10 @@ pub(crate) mod tests {
                         drop(server);
                         let mut response = String::new();
                         client.read_to_string(&mut response).unwrap();
-                        let status = if error.is_some() {
+                        let status = if error.is_some() && noun == "control" {
                             403
+                        } else if error.is_some() {
+                            200
                         } else if method == "OPTIONS" {
                             204
                         } else {
@@ -1898,7 +1889,7 @@ pub(crate) mod tests {
                         }
                         let (_, body) = response.split_once("\r\n\r\n").unwrap();
                         let payload: serde_json::Value = serde_json::from_str(body).unwrap();
-                        if let Some(error) = error {
+                        if let Some(error) = error.filter(|_| noun == "control") {
                             assert_eq!(payload["error"], error);
                             if error == "origin_forbidden" {
                                 assert_eq!(
@@ -1906,7 +1897,7 @@ pub(crate) mod tests {
                                     format!("Origin is not allowed for local Ottto {noun}")
                                 );
                             }
-                        } else if token != Some(TOKEN) {
+                        } else if error.is_some() {
                             assert_eq!(
                                 payload,
                                 json!({"ok":true, "version":crate::compiled_release_version()})
@@ -1915,7 +1906,38 @@ pub(crate) mod tests {
                             assert_eq!(payload["machine_id"], "machine_test");
                             assert_eq!(payload["machine_name"], "Test Mac");
                             if noun == "health" {
-                                assert!(payload["health"].is_object());
+                                assert_eq!(
+                                    keys(&payload),
+                                    ["health", "machine_id", "machine_name"]
+                                );
+                                assert_eq!(
+                                    keys(&payload["health"]),
+                                    [
+                                        "account",
+                                        "blockers",
+                                        "capabilities",
+                                        "computed_at",
+                                        "device_id",
+                                        "event_schema_version",
+                                        "evidence",
+                                        "fresh_until",
+                                        "machine_id",
+                                        "observed_at",
+                                        "overall",
+                                        "projection_revision",
+                                        "projection_version",
+                                        "protocol_version",
+                                        "revision",
+                                        "runtime",
+                                        "schema_version",
+                                        "schema_version_name",
+                                        "sources",
+                                    ]
+                                );
+                                assert_eq!(payload["health"]["device_id"], "device_probe");
+                                assert_eq!(payload["health"]["machine_id"], "machine_test");
+                            } else {
+                                assert_eq!(keys(&payload), ["machine_id", "machine_name"]);
                             }
                         }
                     }

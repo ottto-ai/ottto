@@ -25,13 +25,14 @@ which contains local session titles, prompts and workspace paths. Keep the
 backup private; the CLI writes its files as 0600 and its folders as 0700. The
 local state folder is not excluded from Time Machine or iCloud backups.
 
-The loopback `/control`, `/whoami` and `/local-health` endpoints require an
-allowlisted Origin and a loopback Host naming the listener's port. Identity and
-health probes return only liveness and version without the local control token.
-An `Authorization: Bearer` local control token enables machine id/name and
-detailed health, including the pseudonymous relay-device id. The health endpoint
-never returns the relay secret, account ids, or hardware UUID. Origin and Host
-checks are browser boundaries; they do not replace token authorization.
+The loopback `/control` endpoint requires an allowlisted Origin and a loopback
+Host naming the listener's port. With that same Origin/Host boundary, `/whoami`
+and `/local-health` return their existing machine identity and detailed health
+replies without a token, including the pseudonymous relay-device id in health.
+Other probe callers receive only liveness and version. The health endpoint never
+returns the relay secret, account ids, or hardware UUID. Duplicate Host, Origin
+and Authorization headers are refused. Origin and Host checks are browser
+boundaries; they do not replace control-command token authorization.
 
 ## Device Details
 
