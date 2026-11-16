@@ -2561,7 +2561,8 @@ fn equal_birth_carrier_never_grandfathers_its_counted_request() {
                 .into_owned();
             c.write_at(&carrier_relative, &r1, born_at);
             let scanner = E2ScanFixture::default();
-            let mut seed = ready(&c, &scanner, ScanIndex::default(), 100, false);
+            let committed = ScanIndex::default();
+            let seed = ready(&c, &scanner, committed.clone(), 100, false);
             assert_eq!(
                 scanner.paths(),
                 vec![carrier.clone()],
@@ -2569,8 +2570,11 @@ fn equal_birth_carrier_never_grandfathers_its_counted_request() {
             );
             literal(&seed);
             assert_eq!(total(&seed), 1);
-            seed.finish();
-            let mut prior = c.reload(&mut seed.index);
+            // Complete upload settlement records acceptance and exact ACK
+            // stamps. Reload clears the runtime context; restore it to inspect
+            // the durable receipt under the destination that earned it.
+            let mut prior = settle(&c, &committed, seed, &mut e2_progress());
+            prior.activate_upload_context("e2-synthetic-destination".into());
             assert!(upload_context_receipt_earned_for_test(&prior, &carrier));
 
             c.write_at(&other_relative, &r1, born_at);
@@ -2583,26 +2587,25 @@ fn equal_birth_carrier_never_grandfathers_its_counted_request() {
                     BTreeMap::from([(carrier_key, BTreeSet::from([r1_hash]))]),
                 );
             }
-            let mut twins = ready(&c, &scanner, prior, 100, false);
+            let twins = ready(&c, &scanner, prior.clone(), 100, false);
             literal(&twins);
             assert_eq!(total(&twins), 1);
             assert_eq!(body(&twins, ROOT).unwrap().removed_request_count, Some(1));
             let accepted_body = snapshot_upload_body_witness(body(&twins, ROOT).unwrap());
-            twins.finish();
-            let prior = c.reload(&mut twins.index);
+            let prior = settle(&c, &prior, twins, &mut e2_progress());
 
             // CS1 refreshes the ACK carrier with blank JSONL: unchanged usage
             // acquires the summed body's COPY mark before the own turn grows.
             append(&carrier, "\n");
-            let mut refreshed = ready(&c, &scanner, prior, 100, false);
+            let refreshed = ready(&c, &scanner, prior.clone(), 100, false);
             literal(&refreshed);
             assert_eq!(
                 snapshot_upload_body_witness(body(&refreshed, ROOT).unwrap()),
                 accepted_body,
                 "carrier refresh changes no accepted body"
             );
-            refreshed.finish();
-            let prior = c.reload(&mut refreshed.index);
+            let mut prior = settle(&c, &prior, refreshed, &mut e2_progress());
+            prior.activate_upload_context("e2-synthetic-destination".into());
             let store = &prior.claude_money_birth_store;
             for path in [&carrier, &other] {
                 let key = path.to_string_lossy();
@@ -2622,17 +2625,16 @@ fn equal_birth_carrier_never_grandfathers_its_counted_request() {
 
             // Red on main without the counting-holder guard (CS1 run 43868949339).
             append(&carrier, &line(ROOT, "r2", own_at, 20));
-            let mut grown = ready(&c, &scanner, prior, 100, false);
+            let grown = ready(&c, &scanner, prior.clone(), 100, false);
             literal(&grown);
-            assert_eq!(total(&grown), 2);
             let root = body(&grown, ROOT).expect("growth emits ROOT");
             assert_eq!(
                 (root.request_count, root.removed_request_count),
                 (2, Some(1)),
                 "equal-birth carrier growth must retain r1: carrier_first={carrier_first}"
             );
-            grown.finish();
-            let settled = c.reload(&mut grown.index);
+            assert_eq!(total(&grown), 2);
+            let settled = settle(&c, &prior, grown, &mut e2_progress());
             assert!(
                 [carrier_key, other_key].iter().any(|&location| !settled
                     .claude_copy_removals
