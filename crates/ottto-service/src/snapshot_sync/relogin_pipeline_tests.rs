@@ -999,18 +999,21 @@ fn account_return_history_row(recorded_a: bool) {
         let reattached = recorded_a && user == "owner-a";
         assert_eq!(namespace == namespace_a, reattached);
         if reattached {
-            // A zero-money continuation proves the saved Git binding after removal.
-            let mut rows = claude_rows(IDENTITY_PIPELINE_ROOT);
+            // Append in place so the retained Tail proves the saved Git binding.
+            use std::io::Write as _;
             let continuation_at =
                 OffsetDateTime::from_unix_timestamp((now + 1).try_into().unwrap())
                     .unwrap()
                     .format(&Rfc3339)
                     .unwrap();
-            rows.push(
-                json!({"type":"user","timestamp":continuation_at,"sessionId":IDENTITY_PIPELINE_ROOT,
-                "cwd":repository,"message":{"role":"user","content":"synthetic continuation"}}),
-            );
-            write(&claude, rows);
+            let row = json!({"type":"user","timestamp":continuation_at,"sessionId":IDENTITY_PIPELINE_ROOT,
+                "cwd":repository,"message":{"role":"user","content":"synthetic continuation"}});
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&claude)
+                .unwrap()
+                .write_all(format!("{row}\n").as_bytes())
+                .unwrap();
         }
         assert_ne!(namespace, previous_namespace);
         previous_namespace = namespace.clone();
