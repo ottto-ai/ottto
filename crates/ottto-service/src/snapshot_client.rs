@@ -816,6 +816,11 @@ pub struct ActivityHintResponse {
     /// so older servers never receive the field.
     #[serde(default)]
     pub session_request_account_source_contract: Option<String>,
+    /// Server capability for the `session_billing_route` annotation.
+    /// Missing/null/unknown keeps it off, so older servers never receive it.
+    /// Producer off, the key is skipped like any unknown one (no copy).
+    #[serde(default, deserialize_with = "deserialize_route_contract")]
+    pub session_billing_route_contract: Option<String>,
     /// Receiver item limit; decoded tolerantly by `decode_activity_hint`.
     #[serde(skip)]
     pub max_snapshot_item_bytes: Option<u64>,
@@ -858,6 +863,17 @@ pub struct ActivityHintResponse {
     #[serde(skip)]
     pub codex_cloud_tasks_contract: Option<String>,
     pub recommended_scan_after: String,
+}
+
+/// `session_billing_route_contract`: producer off, skipped unread.
+pub(crate) fn deserialize_route_contract<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error> {
+    if !crate::snapshots::billing_route::PRODUCER_ENABLED {
+        serde::de::IgnoredAny::deserialize(deserializer)?;
+        return Ok(None);
+    }
+    Option::<String>::deserialize(deserializer)
 }
 
 /// Decodes an activity hint and records whether `workspace_labels_enabled`
@@ -5717,7 +5733,7 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(ActivityHintResponse; claude_otel_only_sessions_contract, claude_otel_only_pairing_floor, claude_otel_only_pairing_ceiling, source, server_time, last_data_at, record_count_15m, record_count_24h, local_usage_reconciliation_enabled, backfill_window_days, session_titles_enabled, workspace_labels_enabled, workspace_labels_explicit, session_artifacts_enabled, mcp_inventory_harvest_enabled, context_footprint_harvest_enabled, context_composition_details_contract, names_withheld_contract, session_attribution_enabled, session_attribution_labels_enabled, session_attribution_hmac_key, session_attribution_hmac_key_version, session_cache_observations_contract, cache_full_replacement_contract, copy_unproven_contract, session_request_identity_retained_contract, session_request_account_source_contract, max_snapshot_item_bytes, snapshot_head_cas_enabled, snapshot_head_cas_required, census_residue_status_contract, session_request_identity_contract, codex_cloud_tasks_enabled, codex_cloud_tasks_contract, recommended_scan_after);
+crate::heap_layout_bound::fields!(ActivityHintResponse; claude_otel_only_sessions_contract, claude_otel_only_pairing_floor, claude_otel_only_pairing_ceiling, source, server_time, last_data_at, record_count_15m, record_count_24h, local_usage_reconciliation_enabled, backfill_window_days, session_titles_enabled, workspace_labels_enabled, workspace_labels_explicit, session_artifacts_enabled, mcp_inventory_harvest_enabled, context_footprint_harvest_enabled, context_composition_details_contract, names_withheld_contract, session_attribution_enabled, session_attribution_labels_enabled, session_attribution_hmac_key, session_attribution_hmac_key_version, session_cache_observations_contract, cache_full_replacement_contract, copy_unproven_contract, session_request_identity_retained_contract, session_request_account_source_contract, session_billing_route_contract, max_snapshot_item_bytes, snapshot_head_cas_enabled, snapshot_head_cas_required, census_residue_status_contract, session_request_identity_contract, codex_cloud_tasks_enabled, codex_cloud_tasks_contract, recommended_scan_after);
 
 impl crate::heap_layout_bound::HeapLayoutBound for SnapshotApiClient {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
