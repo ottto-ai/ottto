@@ -918,7 +918,7 @@ pub(in crate::snapshot_sync) fn upload_source_persisting(
         crate::snapshots::claude_request_money::request_owned_family_root,
         &mut InplaceRetryBudget::default(),
         |batch| {
-            let mut wire = request_under(upload_policy, &batch);
+            let mut wire = request_under(upload_policy, batch);
             wire.source = source.api_slug().into();
             validate_snapshot_batch_request(&wire)
                 .expect("scan-generated fixture passes real wire preflight");

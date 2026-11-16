@@ -16982,7 +16982,7 @@ mod tests {
                         std::slice::from_ref(&conflicted_fingerprint),
                     ))
                 } else {
-                    Ok(entity_ack_batch(&batch, &[], &[]))
+                    Ok(entity_ack_batch(batch, &[], &[]))
                 }
             },
             |state| {
@@ -17050,7 +17050,7 @@ mod tests {
             String::as_str,
             |batch| {
                 revision_uploads.push(batch.iter().copied().cloned().collect::<Vec<_>>());
-                Ok(entity_ack_batch(&batch, &[], &[]))
+                Ok(entity_ack_batch(batch, &[], &[]))
             },
             |_| Ok(()),
         )
@@ -17088,7 +17088,7 @@ mod tests {
             &mut progress,
             &mut accepted,
             String::as_str,
-            |batch| Ok(entity_ack_batch(&[], &[], &batch)),
+            |batch| Ok(entity_ack_batch(&[], &[], batch)),
             |state| {
                 persisted.push(state.clone());
                 Ok(())
@@ -17302,7 +17302,7 @@ mod tests {
             &mut accepted,
             |item| item.fingerprint.as_str(),
             |batch| {
-                observed_batches.push((batch.len(), serde_json::to_vec(&batch).unwrap().len()));
+                observed_batches.push((batch.len(), serde_json::to_vec(batch).unwrap().len()));
                 Ok(accepted_batch(batch.len()))
             },
             |_| Ok(()),
@@ -17344,7 +17344,7 @@ mod tests {
             &mut accepted,
             |item| item.fingerprint.as_str(),
             |batch| {
-                observed_batches.push((batch.len(), serde_json::to_vec(&batch).unwrap().len()));
+                observed_batches.push((batch.len(), serde_json::to_vec(batch).unwrap().len()));
                 Ok(accepted_batch(batch.len()))
             },
             |_| Ok(()),
@@ -19007,7 +19007,7 @@ mod tests {
             String::as_str,
             |batch| {
                 uploaded.push(batch.iter().copied().cloned().collect::<Vec<_>>());
-                Ok(entity_ack_batch(&batch, &[], &[]))
+                Ok(entity_ack_batch(batch, &[], &[]))
             },
             |_| Ok(()),
         )
@@ -19061,13 +19061,13 @@ mod tests {
                 );
                 observed_classes.push(is_reconcile);
                 if is_reconcile {
-                    let mut response = entity_ack_batch(&[], &[], &batch);
+                    let mut response = entity_ack_batch(&[], &[], batch);
                     for entity in &mut response.conflict_entities {
                         entity.head_challenge = Some("c".repeat(64));
                     }
                     Ok(response)
                 } else {
-                    Ok(entity_ack_batch(&batch, &[], &[]))
+                    Ok(entity_ack_batch(batch, &[], &[]))
                 }
             },
             |_| Ok(()),
@@ -19156,7 +19156,7 @@ mod tests {
         let large_bytes = serde_json::to_vec(&wire["snapshots"][1]).unwrap().len();
         assert!(large_bytes > 128 * 1024 && large_bytes <= 640 * 1024);
         assert!(serde_json::to_vec(&wire["snapshots"][2]).unwrap().len() > 640 * 1024);
-        validate_snapshot_batch_request(&request(vec![large.clone()])).unwrap();
+        validate_snapshot_batch_request(&request(vec![&large])).unwrap();
         let mut progress = test_upload_progress();
         progress
             .active_quarantine_witness
@@ -19276,7 +19276,7 @@ mod tests {
             String::as_str,
             |batch| {
                 sent.extend(batch.iter().copied().cloned());
-                let response = entity_ack_batch(&[], &batch, &[]);
+                let response = entity_ack_batch(&[], batch, &[]);
                 let identities = batch
                     .iter()
                     .map(|fp| (format!("session-{fp}"), (*fp).clone()))

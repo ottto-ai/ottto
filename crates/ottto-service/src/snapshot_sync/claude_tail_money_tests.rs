@@ -3528,7 +3528,7 @@ fn stray_row_echo_ack(
     let asked =
         serde_json::to_value(request(batch))?["cache_state_ack_contract"] == "cache_state_ack:v1";
     let mut response = ack(batch)?;
-    for (reference, item) in response.accepted_entities.iter_mut().zip(batch) {
+    for (reference, item) in response.accepted_entities.iter_mut().zip(batch.iter().copied()) {
         let Some(state) = item.cache_observations_state.as_ref() else {
             continue;
         };
@@ -3748,7 +3748,7 @@ fn cas_bootstrap_route(
             &mut progress,
             |batch, enforce_head_cas| {
                 posts += 1;
-                let request = request(&batch);
+                let request = request(batch);
                 let wire = if enforce_head_cas {
                     serde_json::to_value(request.wire_with_head_cas())?
                 } else {

@@ -337,7 +337,7 @@ fn e2_transient_failure_resends_the_exact_literal_bytes() {
             crate::snapshots::claude_request_money::request_owned_family_root,
             &mut InplaceRetryBudget::default(),
             |batch| {
-                sent.push(serde_json::to_vec(&batch).unwrap());
+                sent.push(serde_json::to_vec(batch).unwrap());
                 if attempt == 0 {
                     Err(anyhow!("transient transport failure"))
                 } else {
