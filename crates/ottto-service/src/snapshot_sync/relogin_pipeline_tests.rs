@@ -480,7 +480,9 @@ fn owner_return_preserves_all_source_carry() {
         assert!(!entry.codex_counting_v2, "Legacy ACK keeps the UI counter");
         assert!(saved.historical_replay_generation_matches(&generation));
         assert_eq!(
-            SnapshotUploadProgress::load(
+            SnapshotUploadProgress::load_for_index(
+                &saved,
+                &cx_path,
                 &progress_path,
                 &namespace_a,
                 snapshot_quarantine_witness(SnapshotSource::Codex),
