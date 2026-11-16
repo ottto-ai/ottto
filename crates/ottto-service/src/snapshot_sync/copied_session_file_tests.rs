@@ -870,21 +870,28 @@ fn held_content_twin_holder_proves_no_copy_until_released() {
             acquired_twin |= scanner.paths().contains(&twin);
             let quiet = !scanner.paths().contains(&main) && !scanner.paths().contains(&copy);
             page.enrich(&c);
-            // A page that has not acquired T yet still holds ROOT: its held
-            // items stay on the page but are never sent.
+            // Per page, A is sent exactly once: while ROOT is held (T not
+            // read yet) C keeps counting A; once ROOT is sent with A, C
+            // removes it.
             let held = page
                 .disposition
                 .quarantined_fingerprints(&page.scan.snapshots);
-            if let Some(root) =
-                body(&page, ROOT).filter(|root| !held.contains(&root.snapshot_fingerprint))
-            {
+            let root_sent =
+                body(&page, ROOT).filter(|root| !held.contains(&root.snapshot_fingerprint));
+            if let Some(root) = root_sent {
                 assert_eq!(root.request_count, 3, "ROOT counts A/X/Y");
                 saw_root = true;
             }
-            if let Some(copy_body) = body(&page, COPY) {
-                assert_eq!(copy_body.request_count, 1, "C counts only its own D");
-                assert_eq!(copy_body.removed_request_count, Some(1), "C removes A");
-                saw_copy = true;
+            if let Some(copy_body) =
+                body(&page, COPY).filter(|copy| !held.contains(&copy.snapshot_fingerprint))
+            {
+                if root_sent.is_some() {
+                    assert_eq!(copy_body.request_count, 1, "C counts only its own D");
+                    assert_eq!(copy_body.removed_request_count, Some(1), "C removes A");
+                    saw_copy = true;
+                } else {
+                    assert_eq!(copy_body.request_count, 2, "C keeps A while ROOT is held");
+                }
             }
             // A transfer shrinks C: ACK exact replacements, then update the receiver ledger.
             let mut replacements = BTreeMap::new();
