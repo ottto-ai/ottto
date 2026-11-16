@@ -4663,6 +4663,8 @@ pub(crate) fn finish_page_planned(
     if !content_held.is_empty() {
         *hold_reasons.entry("absent_content_twin").or_default() += content_held.len() as u64;
     }
+    // Presence here is this chunk's only: complete because evidence chunk
+    // packing never splits a family, and a session's path twins share it.
     let mut held = absent_twins(
         &locations,
         items,

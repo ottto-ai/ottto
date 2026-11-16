@@ -96,35 +96,19 @@ file-system hint / periodic listing → select file → read new bytes from save
   provider-skill facts merge before their existing projection; changed files stay distinct and artifacts
   use the existing union. Continuous plain groups
   retain their existing replay path; no admitted-key ledger is persisted.
-- **Claude copied history.** Earlier main files prove pre-birth copies from
-  destination-local facts: a previously accepted body remains ownership evidence;
-  otherwise a nonempty counted page or committed body needs a current,
-  identity-complete census and no suppression, hold or matching quarantine.
-  Same-session proof can use the session's other locations. A holder that itself
-  removes a request cannot count it for a later copy; chains resolve in birth and
-  location order. Unproven copies count immediately, without an acceptance wait.
-  Stored groups preserve historical removals, including listed holders and accepted
-  holders later deleted locally. Groups relying on an unaccepted page holder are
-  provisional: a save drops them and marks their copies if that holder failed to
-  commit a counted body. Deleting an unaccepted holder also drops its groups.
-  Each index save compares committed ownership, removal groups and changed census
-  hashes, then marks later unheld copies whose saved decisions disagree with
-  current ownership. Already decided removals and overlapping own turns do not
-  gain read debt. A marked copy's next read runs the same copy decider. The existing removal-record slot is a 0/1 re-decision mark,
-  cleared on every finished read, including held and empty outcomes. Held copies
-  wait for their ordinary release read. Decision and save-time census walks have
-  no deadline; a decision walks its folder to completion in one pass, which can
-  take a long time for a very large folder. The SQLite save baseline retains
-  compact ownership facts with shared census hashes; legacy saves reuse their
-  existing CAS image. Neither path hydrates another full index for this check.
-  The persisted byte format remains compatible with releases 0.1.239–0.1.251,
-  but rollback is unsafe once a copy is decided under local ownership. An older
-  binary can delete a never-accepted holder while retaining its dependent
-  removals; re-upgrading cannot reconstruct the ownership history needed to
-  invalidate them. Do not roll back below this release; fix forward.
-  Source and copy uploads remain independent. Copy-first discovery and either
-  entity ACK order can leave a temporary overlap or gap until the required bodies
-  are accepted; offline or refused work has no delivery-time bound.
+- **Claude copied history.** An earlier main file proves a later copy's
+  pre-birth requests from local facts: an accepted body, or a counted,
+  identity-complete body committed here or on the same page, with a current
+  census and no hold, quarantine or content-twin hold on that page. Unproven
+  copies count at once, with no acceptance wait. Removals relying on a holder
+  not yet accepted are provisional: an index save drops them and marks the copy
+  for one re-decision when that holder failed to commit or was deleted. Saves
+  re-mark only copies whose saved decision disagrees with current ownership,
+  groups or census; census walks run to completion. Stored groups keep
+  historical removals, including accepted holders deleted later. The byte
+  format stays compatible with 0.1.239–0.1.251, but rolling back below this
+  release is unsafe once a copy is decided locally; fix forward. Source and
+  copy uploads stay independent, so ACK order can leave a temporary gap.
   An all-covered copy-only page drops its items when the session has another
   file; own turns still publish. A selected content twin pulls every live
   overlapping census main, and a selected main file (not history-held)
