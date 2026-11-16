@@ -4197,10 +4197,11 @@ pub(crate) fn start_collection_health(source: SnapshotSource) {
 }
 
 pub(crate) fn reset_collection_health(source: SnapshotSource) {
-    if let Ok(mut cadences) = source_cadences().lock() {
-        if let Some(cadence) = cadences.get_mut(source.api_slug()) {
-            cadence.collection = None;
-        }
+    let Ok(mut cadences) = source_cadences().lock() else {
+        return;
+    };
+    if let Some(cadence) = cadences.get_mut(source.api_slug()) {
+        cadence.collection = None;
     }
 }
 
