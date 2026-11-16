@@ -2807,11 +2807,11 @@ fn scheduling_permutations_converge_to_the_same_bodies() {
                             };
                             assert_eq!(
                                 value["body"]["input_tokens"], input,
-                                "{source:?} entity {entity} input"
+                                "{source:?} entity {entity} input (one_chunk {one_chunk} limit {limit} reverse {reverse} restart {restart} late {late})"
                             );
                             assert_eq!(
                                 value["body"]["request_count"], requests,
-                                "{source:?} entity {entity} requests"
+                                "{source:?} entity {entity} requests (one_chunk {one_chunk} limit {limit} reverse {reverse} restart {restart} late {late})"
                             );
                             assert_eq!(
                                 value["placement"],
