@@ -1695,7 +1695,6 @@ struct PermanentSnapshotRejection {
 }
 
 mod ack_retention;
-mod head_conflict;
 mod progress_rows;
 mod telemetry_only;
 mod upload_context_resend;
@@ -2678,14 +2677,6 @@ impl SnapshotUploadProgress {
         }
         let key = cache_session_key(session_id);
         let previous = self.head_conflict_challenges.get(&key);
-        if previous.is_none()
-            && self.head_conflict_challenges.len() >= ack_retention::default_ack_capacity()
-        {
-            // Recovery metadata is optional. Keep every existing entry and
-            // the refused body's ordinary quarantine/debt on overflow.
-            head_conflict::note("capacity_hold");
-            return None;
-        }
         let identical = previous.filter(|record| {
             record.challenge == challenge
                 && record.stale_revision_v2_hash == rescan.revision_v2_hash
