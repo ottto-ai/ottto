@@ -446,14 +446,18 @@ fn owner_return_preserves_all_source_carry() {
             );
             bodies
         });
-        for source in sources {
-            let (bodies, bytes) = cycle(&device_a, &secret_a, source);
+        let uninterrupted_io = sources.map(|source| {
+            let (bodies, io) =
+                crate::snapshots::sampled_scan::transition_fixture::observe_codex_quiet_with_bytes(
+                    || cycle(&device_a, &secret_a, source),
+                );
             assert!(
                 bodies.is_empty(),
                 "intact A does not re-offer accepted money"
             );
-            assert_eq!(bytes, 0, "intact A reads no unchanged transcript");
-        }
+            assert_eq!(io.consumed, 0, "intact A reads no unchanged transcript");
+            io
+        });
         let saved = ScanIndex::load(&cx_path).unwrap();
         let entry = &saved.files[&codex.to_string_lossy().into_owned()];
         assert!(!entry.codex_counting_v2, "Legacy ACK keeps the UI counter");
@@ -608,6 +612,14 @@ fn owner_return_preserves_all_source_carry() {
                         &[],
                     );
                 quiet.io = io;
+                // Keep the strict zero-byte oracle. Independent observation of
+                // uninterrupted A distinguishes ordinary census identity reads
+                // from extra reads caused by the account-return transition.
+                eprintln!(
+                    "quiet return {source:?}: uninterrupted={:?}, returned={:?}",
+                    uninterrupted_io[sources.iter().position(|s| *s == source).unwrap()],
+                    quiet.io,
+                );
                 crate::snapshots::sampled_scan::transition_fixture::money_oracle::assert_quiet_restart_zero_bytes(&quiet);
                 for prior in &before[sources.iter().position(|s| *s == source).unwrap()] {
                     assert!(saved.accepted_snapshot_fingerprint_recorded(
