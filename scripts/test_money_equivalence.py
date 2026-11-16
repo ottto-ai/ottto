@@ -55,6 +55,100 @@ def receipt(*bodies, claude=True, **kwargs):
     ]).encode()
 
 
+class PlainJsonReceiptTests(unittest.TestCase):
+    """Full status receipts retain every cell and have no envelope exemptions."""
+
+    @staticmethod
+    def encode(value):
+        return json.dumps({"kind": "plain_json_v1", "value": value}).encode()
+
+    def setUp(self):
+        self.status = {
+            "local": {"account": "synthetic-a", "organization": "synthetic-x",
+                      "auth_mode": "oauth", "billing_channel": "subscription",
+                      "windows": [{"used_percent": 12, "observed_at": "2026-08-05T01:00:00Z"}],
+                      "credits": "1.250001", "nullable": None},
+            "uploads": [{"account": "synthetic-a"}, {"account": "synthetic-b"}],
+            "withheld": [], "bytes": [65, 66],
+        }
+
+    def test_equal_full_status_and_byte_shaped_data(self):
+        data = self.encode(self.status)
+        tree, envelopes = decode_receipt(data)
+        self.assertEqual(envelopes, set())
+        self.assertEqual(tree["kind"], "plain_json_v1")
+        self.assertEqual([str(n) for n in tree["value"]["bytes"]], ["65", "66"])
+        self.assertFalse(has_forbidden_diff(receipt_diff(data, data)))
+
+    def test_identity_money_clocks_order_and_cell_presence_are_strict(self):
+        mutations = [
+            lambda v: v["local"].update(account="synthetic-b"),
+            lambda v: v["local"].update(organization="synthetic-y"),
+            lambda v: v["local"].update(auth_mode="api_key"),
+            lambda v: v["local"].update(billing_channel="api"),
+            lambda v: v["local"].update(credits="1.250002"),
+            lambda v: v["local"]["windows"][0].update(used_percent=13),
+            lambda v: v["local"]["windows"][0].update(observed_at="2026-08-05T01:00:01Z"),
+            lambda v: v["uploads"].reverse(),
+            lambda v: v["local"].pop("nullable"),
+            lambda v: v["local"].update(added=[]),
+            lambda v: v["bytes"].reverse(),
+        ]
+        for index, mutate in enumerate(mutations):
+            with self.subTest(index=index):
+                head = copy.deepcopy(self.status)
+                mutate(head)
+                self.assertTrue(has_forbidden_diff(receipt_diff(
+                    self.encode(self.status), self.encode(head))))
+
+    def test_exact_number_text_and_types(self):
+        base = b'{"kind":"plain_json_v1","value":{"n":1}}'
+        for value in (b'1.0', b'1e0', b'"1"', b'true', b'null'):
+            with self.subTest(value=value):
+                head = b'{"kind":"plain_json_v1","value":{"n":' + value + b'}}'
+                self.assertTrue(has_forbidden_diff(receipt_diff(base, head)))
+
+    def test_invalid_tags_wrappers_duplicate_keys_and_nonfinite_fail(self):
+        for data in (
+            b'{"kind":"plain_json_v2","value":{}}',
+            b'{"kind":"plain_json_v1"}', b'{"value":{}}',
+            b'{"kind":"plain_json_v1","value":{},"extra":0}',
+            b'{"kind":"plain_json_v1","value":null}',
+            b'{"kind":"plain_json_v1","value":"[]"}',
+            b'{"kind":"plain_json_v1","value":{"n":1,"n":2}}',
+            b'{"kind":"plain_json_v1","kind":"plain_json_v1","value":{}}',
+            b'{"kind":"plain_json_v1","value":[NaN]}',
+            b'{"kind":"plain_json_v1","value":[Infinity]}',
+            b'{"kind":"plain_json_v1","value":[-Infinity]}',
+            b'{"kind":"plain_json_v1","value":',
+            b'[{"kind":"plain_json_v1","value":{}}]',
+        ):
+            with self.subTest(data=data), self.assertRaises(ValueError):
+                decode_receipt(data)
+
+    def test_plain_value_cannot_use_envelope_or_snapshot_additions(self):
+        base = envelope()
+        for field, value in ((CONTRACT, CONTRACT_VALUE), ("new_contract", "new:v1")):
+            head = copy.deepcopy(base)
+            head[field] = value
+            diff = receipt_diff(self.encode(base), self.encode(head),
+                                {"envelope": {field: value}})
+            self.assertTrue(has_forbidden_diff(diff))
+            self.assertEqual(diff["allowed_additions"], [])
+        head = copy.deepcopy(base)
+        head["snapshots"][0]["empty"] = []
+        self.assertTrue(has_forbidden_diff(receipt_diff(
+            self.encode(base), self.encode(head), {"snapshot": {"empty": []}})))
+
+    def test_legacy_encoded_bodies_keep_validation_and_comparison(self):
+        for claude, body in ((True, [envelope()]), (False, envelope())):
+            data = receipt(body, claude=claude)
+            self.assertFalse(has_forbidden_diff(receipt_diff(data, data)))
+        for data in (b'[]', b'[[999]]', b'[[true]]', b'[[123]]', b'[{}]'):
+            with self.subTest(data=data), self.assertRaises(ValueError):
+                decode_receipt(data)
+
+
 class MoneyEquivalenceTests(unittest.TestCase):
     def setUp(self):
         self.base = envelope()
@@ -1000,6 +1094,127 @@ class HeadOnlyFixtureTests(unittest.TestCase):
                     require_disjoint_head_only()
                 with self.assertRaisesRegex(RuntimeError, "overlap"):
                     native_coverage("head", arm_log("head", sorted(NATIVE_FIXTURES)))
+
+
+STATUS_FIXTURE_NAMES = (
+    "claude_status_s01_default_only",
+    "claude_status_s02_lexical_tie",
+    "claude_status_s03_health_first",
+    "claude_status_s04_anchor_receipt",
+    "claude_status_s05_exact_pairs",
+    "claude_status_s06_slot_owned_without_anchor",
+    "claude_status_s07_failure_bounds",
+    "claude_status_s08_plan_ownership",
+    "claude_status_s09_deferred_absent",
+    "claude_status_s09_deferred_stale",
+    "claude_status_s09_deferred_fresh",
+    "claude_status_s10_managed",
+    "claude_status_s10_external",
+    "claude_status_s10_unproven",
+    "claude_status_s10_not_fresh",
+    "claude_status_s10_needs_login",
+    "claude_status_s10_noncanonical",
+    "claude_status_s10_changed",
+    "claude_status_s10_missing",
+    "claude_status_s10_suppressed",
+    "claude_status_s10_auth_held",
+    "claude_status_s11_attempt_runs",
+    "claude_status_s12_independent_holds",
+    "claude_status_s12_auth_other_caller",
+    "claude_status_s12_transient",
+    "claude_status_s12_rate_limited",
+    "claude_status_s13_one_registered",
+    "claude_status_s13_two_registered",
+    "claude_status_s13_same_pair",
+    "claude_status_s13_incomplete",
+    "claude_status_s14_stale_quarantine",
+    "claude_status_s17_source_inputs",
+    "claude_status_s18_newer",
+    "claude_status_s18_older",
+    "claude_status_s18_equal",
+    "claude_status_s18_future",
+    "claude_status_s18_other_account",
+    "claude_status_s18_other_org",
+    "claude_status_s18_weak_account",
+    "claude_status_s18_weak_org",
+    "claude_status_s18_scope",
+    "claude_status_s18_model",
+    "claude_status_s18_group",
+    "claude_status_s18_limit_id",
+    "claude_status_s18_duration",
+    "claude_status_s18_invalid_reset",
+    "claude_status_s18_ended_reset",
+    "claude_status_s18_rollover",
+    "claude_status_s18_invalid_rollover",
+    "claude_status_s18_tolerance",
+    "claude_status_s18_money_limit",
+    "claude_status_s18_money_used",
+    "claude_status_s18_money_remaining",
+    "claude_status_s18_quota",
+    "claude_status_s18_remaining",
+    "claude_status_s18_start_conflict",
+    "claude_status_s19_same_config",
+    "claude_status_s19_different_config",
+    "claude_status_s19_different_session_store",
+    "claude_status_s19_empty_sample",
+    "claude_status_s19_empty_current",
+    "claude_status_s19_unknown",
+    "claude_status_s19_ambiguous",
+    "claude_status_s19_legacy_method",
+    "claude_status_s21_carriers",
+    "claude_status_s24_boundaries",
+)
+
+
+class StatusFixtureCatalogTests(unittest.TestCase):
+    def test_exact_status_catalog_preserves_existing_fixtures(self):
+        registered = money_equivalence.HEAD_ONLY_FIXTURES
+        self.assertEqual(tuple(n for n in registered if n.startswith("claude_status_")),
+                         STATUS_FIXTURE_NAMES)
+        self.assertEqual(tuple(n for n in registered if not n.startswith("claude_status_")), (
+            "claude_bad_record_sibling", "claude_paused_suffix", "codex_bad_record_sibling",
+            "resumed_prefix_sidecar_receipt", "root_twin_scoped_family"))
+        self.assertEqual(len(require_disjoint_head_only()), len(registered))
+
+    def test_status_catalog_rejects_missing_duplicate_extra_and_unexecuted(self):
+        names = sorted(NATIVE_FIXTURES | set(money_equivalence.HEAD_ONLY_FIXTURES))
+        native_coverage("head", arm_log("head", names))
+        for fixture in STATUS_FIXTURE_NAMES:
+            with self.subTest(fixture=fixture):
+                short = [n for n in names if n != fixture]
+                logs = [arm_log("head", short), arm_log("head", names + [fixture]),
+                        arm_log("head", names + [fixture + "_alias"]),
+                        arm_log("head", names).replace(f"{fixture} VERIFIED ",
+                                                       f"{fixture} UNEXECUTED ")]
+                for log in logs:
+                    with self.assertRaisesRegex(RuntimeError, "incomplete native coverage"):
+                        native_coverage("head", log)
+
+    def test_status_receipts_absent_on_base_remain_uncompared(self):
+        base = sorted(NATIVE_FIXTURES)
+        head = sorted(NATIVE_FIXTURES | set(money_equivalence.HEAD_ONLY_FIXTURES))
+        left, right = receipt_dirs(self, base, head)
+        compared, uncompared = receipt_names(
+            left, right, native_coverage("head", arm_log("head", head)),
+            native_coverage("base", arm_log("base", base)))
+        self.assertEqual(compared, sorted(n + ".json" for n in base))
+        self.assertEqual(uncompared,
+                         sorted(n + ".json" for n in money_equivalence.HEAD_ONLY_FIXTURES))
+        for fixture in STATUS_FIXTURE_NAMES:
+            # Complete status receipts use the same saved-digest gate as all
+            # other new fixtures. This is VERIFIED-only, never base equality.
+            data = PlainJsonReceiptTests.encode({"uploads": [], "reason": "synthetic-hold"})
+            for stem in (fixture, fixture + ".cross-build"):
+                (right / (stem + ".json")).write_bytes(data)
+                (right / (stem + ".sha256")).write_text(hashlib.sha256(data).hexdigest())
+        with contextlib.redirect_stdout(io.StringIO()):
+            records, failures = uncompared_receipts(right, uncompared, None)
+        self.assertFalse(failures)
+        self.assertEqual(set(records), set(uncompared))
+        missing = right / (STATUS_FIXTURE_NAMES[0] + ".json")
+        missing.unlink()
+        with self.assertRaisesRegex(RuntimeError, "missing or extra fixture receipts"):
+            receipt_names(left, right, set(head), set(base))
 
 
 if __name__ == "__main__":

@@ -1,5 +1,8 @@
 use super::*;
 
+#[cfg(unix)]
+mod claude_selection_oracle_tests;
+
 /// The account resolution `collect_claude_status` performs, for tests that
 /// exercise the OAuth path directly.
 fn claude_oauth_account_identifier_hash() -> String {
@@ -2253,7 +2256,7 @@ exit 1
         .expect("write identity");
     };
     let write_credential_with_plan = |dir: &Path, plan: &str| {
-        fs::write(
+        crate::test_scratch::write_private_file(
             dir.join(".credentials.json"),
             serde_json::to_vec(&claude_credential_fixture(
                 "fixture",
@@ -2261,8 +2264,7 @@ exit 1
                 Some(plan),
             ))
             .expect("serialize credential fixture"),
-        )
-        .expect("write credential fixture");
+        );
     };
     let write_credential = |dir: &Path| write_credential_with_plan(dir, "max");
 
@@ -2880,7 +2882,7 @@ fn claude_default_and_custom_rotation_during_auth_fail_closed() {
             .expect("serialize rotation identity"),
         )
         .expect("write rotation identity");
-        fs::write(
+        crate::test_scratch::write_private_file(
             credential_dir.join(".credentials.json"),
             serde_json::to_vec(&claude_credential_fixture(
                 "test-captured-value",
@@ -2888,8 +2890,7 @@ fn claude_default_and_custom_rotation_during_auth_fail_closed() {
                 Some("max"),
             ))
             .expect("serialize rotation credential"),
-        )
-        .expect("write rotation credential");
+        );
     };
     write_slot(&home, &home.join(".claude"), "default");
     write_slot(&custom, &custom, "custom");
@@ -2926,6 +2927,30 @@ exit 44
         permissions.set_mode(0o755);
         fs::set_permissions(executable, permissions).expect("chmod executable");
     }
+    // Off macOS the keychain tool never runs: the same rotation happens while
+    // the native credentials file is being read.
+    let _rotate_during_file_read = (!claude_credentials_in_keychain()).then(|| {
+        let identity_files = [home.join(".claude.json"), custom.join(".claude.json")];
+        let scratch = root.clone();
+        claude_credentials_file_test_hooks::install(move |path| {
+            if !path.starts_with(&scratch) {
+                return;
+            }
+            for identity_file in &identity_files {
+                let mut value: Value =
+                    serde_json::from_slice(&fs::read(identity_file).expect("read identity"))
+                        .expect("parse identity");
+                let account = &mut value["oauthAccount"];
+                for field in ["accountUuid", "organizationUuid"] {
+                    let rotated = format!("{}-rotated", account[field].as_str().expect(field));
+                    account[field] = Value::String(rotated);
+                }
+                account["emailAddress"] = Value::String("rotated@example.invalid".to_string());
+                fs::write(identity_file, serde_json::to_vec(&value).expect("identity"))
+                    .expect("rotate identity");
+            }
+        })
+    });
 
     let _home = EnvVarGuard::set_os("HOME", home.as_os_str().to_os_string());
     let _support = EnvVarGuard::set_os(
@@ -8904,19 +8929,18 @@ impl LocalSlotFixture {
         for dir in [&home, &bin, &support, &slot_dir] {
             fs::create_dir_all(dir).expect("create fixture dir");
         }
-        let claude = bin.join("claude");
-        fs::write(
-            &claude,
-            "#!/bin/sh\n/usr/bin/touch \"$(/usr/bin/dirname \"$0\")/claude-spawned\"\nexit 0\n",
-        )
-        .expect("write fake claude");
-        let security = bin.join("security");
-        fs::write(&security, security_script).expect("write fake security");
-        for executable in [&claude, &security] {
-            let mut permissions = fs::metadata(executable).expect("metadata").permissions();
-            permissions.set_mode(0o755);
-            fs::set_permissions(executable, permissions).expect("chmod executable");
-        }
+        // Written out of process: a test that runs these fakes never holds
+        // a write descriptor for them (no ETXTBSY on Linux).
+        crate::test_scratch::write_executable(
+            &bin.join("claude"),
+            b"#!/bin/sh\n/usr/bin/touch \"$(/usr/bin/dirname \"$0\")/claude-spawned\"\nexit 0\n",
+            0o755,
+        );
+        crate::test_scratch::write_executable(
+            &bin.join("security"),
+            security_script.as_bytes(),
+            0o755,
+        );
         let guards = vec![
             EnvVarGuard::set_os("HOME", home.as_os_str().to_os_string()),
             EnvVarGuard::set_os(
@@ -8949,11 +8973,10 @@ impl LocalSlotFixture {
     }
 
     fn write_credential(&self, credential: &Value) {
-        fs::write(
+        crate::test_scratch::write_private_file(
             self.slot_dir.join(".credentials.json"),
             serde_json::to_vec(credential).expect("serialize credential"),
-        )
-        .expect("write slot credential");
+        );
     }
 
     fn slot(&self) -> ClaudeConfigDirSlot {
@@ -8963,6 +8986,10 @@ impl LocalSlotFixture {
     fn claude_spawned(&self) -> bool {
         self.root.join("bin").join("claude-spawned").exists()
     }
+
+    fn security_ran(&self) -> bool {
+        self.root.join("bin").join("security-ran").exists()
+    }
 }
 
 impl Drop for LocalSlotFixture {
@@ -8971,7 +8998,13 @@ impl Drop for LocalSlotFixture {
     }
 }
 
-const SECURITY_ITEM_NOT_FOUND: &str = "#!/bin/sh\nexit 44\n";
+/// Keychain item not found (exit 44). Leaves `bin/security-ran` behind, so a
+/// test can prove whether the keychain tool was consulted at all.
+const SECURITY_ITEM_NOT_FOUND: &str =
+    "#!/bin/sh\n/usr/bin/touch \"$(/usr/bin/dirname \"$0\")/security-ran\"\nexit 44\n";
+/// Keychain locked (exit 36), recording that it ran.
+const SECURITY_LOCKED: &str =
+    "#!/bin/sh\n/usr/bin/touch \"$(/usr/bin/dirname \"$0\")/security-ran\"\nexit 36\n";
 
 /// What `claude auth status --json` printed for a slot, rebuilt through
 /// the same parse + identity + refinement path the old resolver used, so
@@ -9070,6 +9103,13 @@ fn local_metadata_resolution_matches_the_auth_status_account() {
         );
         assert_eq!(resolved.account.account_id, legacy.account_id);
         assert!(!fixture.claude_spawned(), "no Claude command ran");
+        // The keychain is consulted on macOS only; elsewhere the plan comes
+        // from the native credentials file alone.
+        assert_eq!(
+            fixture.security_ran(),
+            claude_credentials_in_keychain(),
+            "{label}"
+        );
     }
 }
 
@@ -9162,52 +9202,116 @@ fn local_login_state_follows_the_stored_credential_fields() {
     }
 }
 
+fn credential_read_label(read: &ClaudeCredentialRead) -> &'static str {
+    match read {
+        ClaudeCredentialRead::Absent => "absent",
+        ClaudeCredentialRead::Unreadable => "unreadable",
+        ClaudeCredentialRead::Present(_) => "present",
+    }
+}
+
+fn set_mode(path: &Path, mode: u32) {
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("chmod");
+}
+
+/// The macOS store (keychain first), exercised on every OS: only keychain
+/// "not found" falls back to the credentials file. Every other keychain
+/// outcome fails closed even next to a valid file, and a found item wins
+/// over a contradicting file.
 #[test]
 #[serial]
 fn keychain_read_failures_fail_closed_and_only_not_found_falls_back_to_the_file() {
-    for (label, script, expected) in [
-        ("not-found", SECURITY_ITEM_NOT_FOUND, "absent"),
-        ("locked", "#!/bin/sh\nexit 36\n", "unreadable"),
-        ("garbage", "#!/bin/sh\necho not-json\n", "unreadable"),
+    let keychain_first = |fixture: &LocalSlotFixture| {
+        credential_read_label(&read_claude_oauth_credential_state_from_store(
+            &fixture.slot(),
+            true,
+        ))
+    };
+    let valid_file = claude_credential_fixture("file-token", TimeDuration::hours(2), Some("pro"));
+    for (label, script, without_file, with_valid_file) in [
+        ("not-found", SECURITY_ITEM_NOT_FOUND, "absent", "present"),
+        ("locked", SECURITY_LOCKED, "unreadable", "unreadable"),
+        (
+            "garbage",
+            "#!/bin/sh\necho not-json\n",
+            "unreadable",
+            "unreadable",
+        ),
         (
             "mcp-only",
             "#!/bin/sh\necho '{\"mcpOAuth\":{}}'\n",
+            "absent",
             "absent",
         ),
         (
             "oauth-not-object",
             "#!/bin/sh\necho '{\"claudeAiOauth\":\"x\"}'\n",
             "unreadable",
+            "unreadable",
         ),
     ] {
         let fixture = LocalSlotFixture::new(label, script);
-        let read = read_claude_oauth_credential_state_for_slot(&fixture.slot());
-        let observed = match read {
-            ClaudeCredentialRead::Absent => "absent",
-            ClaudeCredentialRead::Unreadable => "unreadable",
-            ClaudeCredentialRead::Present(_) => "present",
-        };
-        assert_eq!(observed, expected, "{label}");
+        assert_eq!(keychain_first(&fixture), without_file, "{label}");
+        fixture.write_credential(&valid_file);
+        assert_eq!(
+            keychain_first(&fixture),
+            with_valid_file,
+            "{label} next to a valid credentials file"
+        );
     }
-    // Not found in the keychain: the credentials file decides; a corrupt
-    // file is unreadable, not absent.
-    let fixture = LocalSlotFixture::new("file-fallback", SECURITY_ITEM_NOT_FOUND);
-    fs::write(fixture.slot_dir.join(".credentials.json"), "{").expect("corrupt file");
+    // No keychain tool on the search path: fail closed, even next to a
+    // valid credentials file.
+    let missing = LocalSlotFixture::new("no-security", SECURITY_ITEM_NOT_FOUND);
+    fs::remove_file(missing.root.join("bin").join("security")).expect("remove security");
+    missing.write_credential(&valid_file);
+    assert_eq!(keychain_first(&missing), "unreadable");
+    // A keychain read that does not finish in time fails closed.
+    let slow = LocalSlotFixture::new("slow-security", "#!/bin/sh\nexec /bin/sleep 5\n");
+    slow.write_credential(&valid_file);
     assert!(matches!(
-        read_claude_oauth_credential_state_for_slot(&fixture.slot()),
-        ClaudeCredentialRead::Unreadable
+        read_claude_oauth_credential_from_keychain_with_timeout(
+            &slow.slot(),
+            Duration::from_millis(200)
+        ),
+        ClaudeKeychainRead::Failed
     ));
+    // A found item wins over a contradicting credentials file.
+    let item = claude_credential_fixture("item-token", TimeDuration::hours(2), Some("max"));
+    let found = LocalSlotFixture::new("found-wins", &format!("#!/bin/sh\necho '{item}'\n"));
+    found.write_credential(&valid_file);
+    let ClaudeCredentialRead::Present(credential) =
+        read_claude_oauth_credential_state_from_store(&found.slot(), true)
+    else {
+        panic!("a found keychain item is the stored login");
+    };
+    assert_eq!(credential.access_token.as_deref(), Some("item-token"));
+    assert_eq!(credential.subscription_type.as_deref(), Some("max"));
+
+    // Not found in the keychain: the credentials file decides, through the
+    // same checked reader as the native store. A corrupt file is unreadable,
+    // not absent; so is a file other users may read.
+    let fixture = LocalSlotFixture::new("file-fallback", SECURITY_ITEM_NOT_FOUND);
+    let file = fixture.slot_dir.join(".credentials.json");
+    crate::test_scratch::write_private_file(&file, "{");
+    assert_eq!(keychain_first(&fixture), "unreadable");
     fixture.write_credential(&claude_credential_fixture(
         "fixture",
         TimeDuration::hours(2),
         None,
     ));
-    assert!(matches!(
-        read_claude_oauth_credential_state_for_slot(&fixture.slot()),
-        ClaudeCredentialRead::Present(_)
-    ));
-    // A failed keychain read never resolves the slot, and never spawns.
-    let locked = LocalSlotFixture::new("locked-resolve", "#!/bin/sh\nexit 36\n");
+    assert_eq!(keychain_first(&fixture), "present");
+    set_mode(&file, 0o644);
+    assert_eq!(keychain_first(&fixture), "unreadable");
+    assert_eq!(
+        fs::metadata(&file).expect("metadata").permissions().mode() & 0o777,
+        0o644,
+        "the provider's file is never chmodded"
+    );
+
+    // Through the platform store: on macOS a failed keychain read never
+    // resolves the slot; elsewhere the keychain tool is never consulted and
+    // the native file resolves it. Neither spawns `claude`.
+    let locked = LocalSlotFixture::new("locked-resolve", SECURITY_LOCKED);
     locked.write_identity(serde_json::json!({
         "accountUuid": "account-locked",
         "organizationUuid": "organization-locked",
@@ -9218,11 +9322,148 @@ fn keychain_read_failures_fail_closed_and_only_not_found_falls_back_to_the_file(
         TimeDuration::hours(2),
         None,
     ));
-    assert_eq!(
-        resolve_registered_claude_slot(locked.descriptor.clone()).err(),
-        Some(ClaudeSlotProbeFailure::ProbeFailed)
-    );
+    let resolved = resolve_registered_claude_slot(locked.descriptor.clone());
+    if claude_credentials_in_keychain() {
+        assert_eq!(resolved.err(), Some(ClaudeSlotProbeFailure::ProbeFailed));
+        assert!(locked.security_ran());
+    } else {
+        assert_eq!(
+            resolved
+                .expect("native file resolves")
+                .account_identifier_hash,
+            billing_identity_hash("anthropic", "account", "account-locked").expect("hash")
+        );
+        assert!(!locked.security_ran(), "keychain tool never runs");
+    }
     assert!(!locked.claude_spawned());
+}
+
+/// The native store reads the default login's and a registered config
+/// dir's credentials file and never runs `security`: first with one on the
+/// search path, then with none. Off macOS this is the production dispatch;
+/// on macOS (keychain first) the same store is reached through the seam.
+#[test]
+#[serial]
+fn native_credentials_file_store_never_runs_the_keychain_tool() {
+    // A `security` that would hand back a different login if it ran.
+    let item = claude_credential_fixture("item-token", TimeDuration::hours(2), Some("pro"));
+    let trap = format!(
+        "#!/bin/sh\n/usr/bin/touch \"$(/usr/bin/dirname \"$0\")/security-ran\"\necho '{item}'\n"
+    );
+    let fixture = LocalSlotFixture::new("native-store", &trap);
+    let default_dir = fixture.root.join("home").join(".claude");
+    fs::create_dir_all(&default_dir).expect("default config dir");
+    crate::test_scratch::write_private_file(
+        default_dir.join(".credentials.json"),
+        serde_json::to_vec(&claude_credential_fixture(
+            "default-token",
+            TimeDuration::hours(2),
+            Some("team"),
+        ))
+        .expect("serialize credential"),
+    );
+    fixture.write_credential(&claude_credential_fixture(
+        "slot-token",
+        TimeDuration::hours(2),
+        Some("max"),
+    ));
+    let read = |slot: &ClaudeConfigDirSlot| {
+        #[cfg(not(target_os = "macos"))]
+        let read = read_claude_oauth_credential_state_for_slot(slot);
+        #[cfg(target_os = "macos")]
+        let read = read_claude_oauth_credential_state_from_store(slot, false);
+        let ClaudeCredentialRead::Present(credential) = read else {
+            panic!("the native credentials file holds the login");
+        };
+        (credential.access_token, credential.subscription_type)
+    };
+    for search_path in ["trap security", "no security"] {
+        assert_eq!(
+            read(&ClaudeConfigDirSlot::Default),
+            (Some("default-token".to_string()), Some("team".to_string())),
+            "{search_path}"
+        );
+        assert_eq!(
+            read(&fixture.slot()),
+            (Some("slot-token".to_string()), Some("max".to_string())),
+            "{search_path}"
+        );
+        assert!(
+            !fixture.security_ran(),
+            "{search_path}: security never runs"
+        );
+        let _ = fs::remove_file(fixture.root.join("bin").join("security"));
+    }
+}
+
+/// The one credentials-file reader: a missing file carries no login; an
+/// unsafe or malformed file is unreadable, never adopted, and never
+/// modified.
+#[test]
+#[serial]
+fn credentials_file_reader_rejects_unsafe_files() {
+    let scratch = crate::test_scratch::ScratchDir::new("ottto-claude-credentials-file");
+    let dir = scratch.to_path_buf();
+    let valid = serde_json::to_vec(&claude_credential_fixture(
+        "fixture",
+        TimeDuration::hours(2),
+        Some("max"),
+    ))
+    .expect("serialize credential");
+    let read = |path: &Path| credential_read_label(&read_claude_credentials_file(path));
+
+    let file = dir.join("valid.json");
+    assert_eq!(read(&file), "absent", "missing file");
+    crate::test_scratch::write_private_file(&file, &valid);
+    assert_eq!(read(&file), "present");
+    for mode in [0o644, 0o640, 0o604, 0o620, 0o602, 0o610] {
+        set_mode(&file, mode);
+        assert_eq!(read(&file), "unreadable", "mode {mode:o}");
+        assert_eq!(
+            fs::metadata(&file).expect("metadata").permissions().mode() & 0o777,
+            mode,
+            "never chmodded"
+        );
+    }
+    set_mode(&file, 0o600);
+
+    let link = dir.join("link.json");
+    std::os::unix::fs::symlink(&file, &link).expect("symlink");
+    assert_eq!(read(&link), "unreadable", "symlink");
+
+    let directory = dir.join("directory.json");
+    fs::create_dir(&directory).expect("directory");
+    set_mode(&directory, 0o700);
+    assert_eq!(read(&directory), "unreadable", "directory");
+
+    let fifo = dir.join("fifo.json");
+    let fifo_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).expect("path");
+    assert_eq!(
+        unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) },
+        0,
+        "mkfifo"
+    );
+    assert_eq!(read(&fifo), "unreadable", "fifo");
+
+    for (label, body, expected) in [
+        ("malformed", "{", "unreadable"),
+        ("not-object", "[]", "unreadable"),
+        ("null-oauth", r#"{"claudeAiOauth":null}"#, "absent"),
+        ("mcp-only", r#"{"mcpOAuth":{}}"#, "absent"),
+        ("oauth-not-object", r#"{"claudeAiOauth":"x"}"#, "unreadable"),
+    ] {
+        let path = dir.join(format!("{label}.json"));
+        crate::test_scratch::write_private_file(&path, body);
+        assert_eq!(read(&path), expected, "{label}");
+    }
+
+    // Not readable by its owner (root reads it anyway).
+    if unsafe { libc::geteuid() } != 0 {
+        let unreadable = dir.join("write-only.json");
+        crate::test_scratch::write_private_file(&unreadable, &valid);
+        set_mode(&unreadable, 0o200);
+        assert_eq!(read(&unreadable), "unreadable", "no read permission");
+    }
 }
 
 #[test]
@@ -9256,6 +9497,7 @@ fn expired_login_still_proves_identity_and_a_lapsed_grant_needs_login() {
         Some(ClaudeSlotProbeFailure::CredentialUnavailable)
     );
     assert!(!fixture.claude_spawned());
+    assert_eq!(fixture.security_ran(), claude_credentials_in_keychain());
 }
 
 #[test]
@@ -16999,7 +17241,7 @@ fn sign_in_slot_dir(slot_dir: &Path, which: (&str, &str)) {
             .expect("serialize identity"),
     )
     .expect("write identity");
-    fs::write(
+    crate::test_scratch::write_private_file(
         slot_dir.join(".credentials.json"),
         serde_json::to_vec(&claude_credential_fixture(
             &format!("fixture-secret-token-{}", which.0),
@@ -17007,8 +17249,7 @@ fn sign_in_slot_dir(slot_dir: &Path, which: (&str, &str)) {
             Some(if team { "team" } else { "max" }),
         ))
         .expect("serialize credential"),
-    )
-    .expect("write credential");
+    );
 }
 
 impl Drop for ClaudeBindingFixture {
