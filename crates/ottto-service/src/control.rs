@@ -17223,6 +17223,9 @@ fn source_display_name(source: &SourceKind) -> &'static str {
 }
 
 #[cfg(test)]
+pub(crate) use tests::account_return_claim_for_test;
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn session_exec_commands_require_cli_kind_and_authorized_token() {
@@ -32414,6 +32417,36 @@ X-API-Key = "otel_redacted"
         });
         continue_prior_snapshot_namespace(&mut pending, Some(prior));
         (pending, candidate, setup_token)
+    }
+
+    /// Synthetic account-return driver; shares the claim and promotion seams above.
+    pub(crate) fn account_return_claim_for_test(
+        user: &str,
+        org: &str,
+        device_id: &str,
+    ) -> (LocalDeviceBinding, String) {
+        let device = relogin_device(device_id, &["claude_code", "codex", "pi"]);
+        let secret = if let Some(prior) = prior_device_credential_for_registration().unwrap() {
+            assert_ne!(prior.owner.as_ref().unwrap().user_id, user);
+            let (pending, candidate, token) = relogin_claim(&prior, user, org, device.clone());
+            assert_eq!(journaled_namespace(&pending), None, "different prior owner");
+            promote_relogin(&pending, &candidate, &token);
+            assert!(
+                !default_prior_device_path().exists(),
+                "prior selector cleared"
+            );
+            candidate
+        } else {
+            let (account, connection) = relogin_account(user, org);
+            FileAccountStore::default().save(&account).unwrap();
+            FileConnectionStore::default().save(&connection).unwrap();
+            FileDeviceStore::default().save(&device).unwrap();
+            KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+                .save("synthetic-return-secret-a")
+                .unwrap();
+            "synthetic-return-secret-a".into()
+        };
+        (device, secret)
     }
 
     fn journaled_namespace(pending: &PendingDeviceCredentialPreparation) -> Option<String> {
