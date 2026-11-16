@@ -336,7 +336,7 @@ pub(super) mod tests {
             let done = index.traversal.as_ref().map_or(true, |traversal| {
                 traversal.pending_directories.is_empty()
                     && traversal.pending_candidates.is_empty()
-                    && traversal.counts.has_errors()
+                    && traversal.has_errors()
             });
             if done {
                 return pages;
@@ -573,7 +573,7 @@ pub(super) mod tests {
             let (witness, unresolved, drained) =
                 removed_root_retry(source, &roots, &removed, &key, true);
             assert_eq!((witness, unresolved), (false, 0), "{source:?}");
-            assert!(!drained.traversal.as_ref().unwrap().counts.has_errors());
+            assert!(!drained.traversal.as_ref().unwrap().has_errors());
 
             // U3: known, unconfigured, still present.
             fs::create_dir(&removed).unwrap();
@@ -1015,7 +1015,7 @@ pub(super) mod tests {
             1
         );
         let traversal = index.traversal.as_ref().expect("the loss keeps it red");
-        assert!(traversal.counts.has_errors());
+        assert!(traversal.has_errors());
         assert_eq!(traversal.counts.disappeared_file_count, 1);
         assert!(!index.files.contains_key(&member_key));
     }
@@ -1276,7 +1276,7 @@ pub(super) mod tests {
                         super::super::sampled_scan::set_test_now(Some(1_600));
                         // A healthy first generation may have retired its
                         // checkpoint while the account hold still needs F4.
-                        super::super::line_delivery_tests::next_walk(
+                        super::super::scan::lines::delivery::tests::next_walk(
                             &mut index,
                             &[dir.to_path_buf()],
                             LATER,
@@ -1826,7 +1826,7 @@ pub(super) mod tests {
             assert_eq!(held(&index, stem), expected, "first walk: {stem}");
         }
         super::super::sampled_scan::set_test_now(Some(1_600));
-        super::super::line_delivery_tests::next_walk(
+        super::super::scan::lines::delivery::tests::next_walk(
             &mut index,
             std::slice::from_ref(&root),
             LATER,

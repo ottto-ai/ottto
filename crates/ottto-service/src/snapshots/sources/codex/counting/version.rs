@@ -389,7 +389,7 @@ pub(in crate::snapshots) fn absence_coverage_complete(
     inventory.complete
         && index.legacy_unresolved_root_file_witnesses.is_empty()
         && index.traversal.as_ref().is_some_and(|traversal| {
-            !traversal.counts.has_errors()
+            !traversal.has_errors()
                 && !traversal.watcher_hint_seen
                 && traversal.pending_directories.is_empty()
                 && !traversal.scan_roots.is_empty()

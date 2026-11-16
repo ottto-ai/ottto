@@ -107,7 +107,7 @@ impl ScanIndex {
             };
             let mut predecessors = BTreeMap::<String, Vec<(String, PathBuf)>>::new();
             for (from, entry) in &self.files {
-                if let Some(owner) = codex_counting_version::proven_owner(entry) {
+                if let Some(owner) = sources::codex::counting::version::proven_owner(entry) {
                     if let Some(root) = walk.owning_scan_root(Path::new(from)) {
                         predecessors
                             .entry(owner.to_owned())

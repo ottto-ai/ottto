@@ -133,7 +133,7 @@ impl OwnedJsonlParser {
             old.state.accumulator.source == self.source
             // A retained reduction continues only under the counting rule
             // this parse's own evidence selects. Both unset while inactive.
-            && codex_counting_version::reusable(
+            && sources::codex::counting::version::reusable(
                 old.state.accumulator.codex_counting.as_deref(),
                 self.accumulator.codex_counting.as_deref(),
             )

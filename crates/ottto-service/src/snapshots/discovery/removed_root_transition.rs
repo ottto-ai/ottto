@@ -353,7 +353,7 @@ fn drain(arm: Arm) -> Drained {
     assert_eq!(second.unresolved, 1, "the unrelated missing root only");
     assert!(second.posts.is_empty() && second.reads.is_empty());
     let walk = second.index.traversal.as_ref().expect("red walk kept");
-    assert!(walk.pending_directories.is_empty() && walk.counts.has_errors());
+    assert!(walk.pending_directories.is_empty() && walk.has_errors());
     assert!(second
         .index
         .legacy_unresolved_root_file_witnesses
@@ -830,7 +830,7 @@ fn removed_account_readded_before_retirement_skips() {
         .index
         .traversal
         .as_ref()
-        .is_some_and(|walk| walk.counts.has_errors()));
+        .is_some_and(|walk| walk.has_errors()));
     fs::rename(&h.parked, &h.removed).unwrap();
     fs::create_dir(&h.flaky).unwrap();
     let tail = h.tail_of(&h.c.path(GAP));
@@ -891,7 +891,7 @@ fn configured_missing_root_stays_red_and_held() {
         .index
         .traversal
         .as_ref()
-        .is_some_and(|walk| walk.counts.has_errors()));
+        .is_some_and(|walk| walk.has_errors()));
     assert!(h
         .removed_keys()
         .iter()
@@ -980,7 +980,7 @@ fn present_unconfigured_root_keeps_witnesses() {
         .index
         .traversal
         .as_ref()
-        .is_some_and(|walk| walk.counts.has_errors()));
+        .is_some_and(|walk| walk.has_errors()));
     assert!(h
         .removed_keys()
         .iter()

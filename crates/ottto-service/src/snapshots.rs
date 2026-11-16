@@ -90,13 +90,10 @@ macro_rules! process_state {
 
 pub(crate) use usage::cache_observations;
 
-use scan::read_cause as change_reason;
-use sources::claude::context_file_birth as claude_context_file_birth;
 pub(crate) use sources::claude::cross_root_evidence as claude_cross_root_evidence;
 #[cfg(test)]
 pub(crate) use upload::tests::cache_overcap as cache_overcap_tests;
 
-use upload::context_read as upload_context_read;
 mod upload_context_receipt;
 pub(crate) use upload_context_receipt::Candidate as UploadContextReceiptCandidate;
 pub(crate) use upload_context_receipt::ContextInputs as UploadContextInputs;
@@ -105,14 +102,15 @@ pub(crate) mod privacy_flip_modes;
 #[cfg(test)]
 mod upload_context_receipt_tests;
 #[cfg(test)]
-pub(crate) use claude_context_file_birth::with_remembered_tripwire_restored_for_test;
-pub use claude_context_file_birth::{ClaudeContextBasisCounts, ClaudeContextFileBirthCounts};
-pub(crate) use claude_context_file_birth::{
+pub(crate) use sources::claude::context_file_birth::with_remembered_tripwire_restored_for_test;
+pub use sources::claude::context_file_birth::{
+    ClaudeContextBasisCounts, ClaudeContextFileBirthCounts,
+};
+pub(crate) use sources::claude::context_file_birth::{
     ClaudeFileBirth, ClaudeFileBirthVerdict, ClaudeVetoApiRows,
 };
 pub mod claude_copy_prefix_reread;
 mod claude_history_upgrade;
-use sources::codex::root_copies as codex_root_copies;
 
 #[cfg(test)]
 pub(crate) use claude_history_upgrade::{
@@ -130,7 +128,6 @@ mod claude_reemission_exclusions;
 mod claude_terminal_e2_retry_tests;
 #[cfg(test)]
 mod contract5_cutover_tests;
-use upload::freshness_debt as g7_debt;
 pub(crate) use upload::money_freshness;
 
 #[cfg(test)]
@@ -171,13 +168,10 @@ pub use compaction_events::SnapshotCompactionEvent;
 use compaction_events::{ClaudeCompactionTrigger, CodexCompactionSizes};
 #[cfg(test)]
 mod codex_counting_v2_tests;
-use sources::codex::counting::version as codex_counting_version;
 use sources::codex::dictionary_slots as codex_dictionary_slots;
 mod codex_file_join;
 pub(crate) use codex_file_join::CODEX_JOIN_VALIDATION_FAILURES;
 
-#[cfg(test)]
-pub(crate) use codex_counting_version::TestCutover;
 #[cfg(test)]
 pub(in crate::snapshots) use codex_file_join::tests::older_build_logs_tier;
 #[cfg(test)]
@@ -185,7 +179,8 @@ pub(crate) use codex_file_join::tests::{
     counting_v2_fixture, native_join_fixture_root, older_build_logs_expired,
     older_build_logs_priority,
 };
-use sources::claude::response_records as claude_response_records;
+#[cfg(test)]
+pub(crate) use sources::codex::counting::version::TestCutover;
 #[cfg(test)]
 mod claude_usage_iterations_tests;
 mod codex_usage_occurrence;
@@ -205,7 +200,6 @@ mod launcher_recognition_tests;
 mod local_context_points;
 pub(crate) use local_context_points::LocalContextPoint;
 use local_context_points::LocalContextPoints;
-use sources::codex::eof_fragment as codex_fragment;
 pub(crate) use sources::codex::mcp_version as codex_version;
 pub(crate) mod discovery_growth;
 #[cfg(test)]
@@ -223,8 +217,6 @@ mod resident_wave_tests;
 #[cfg(all(test, unix))]
 pub(crate) mod resource_fixture;
 pub(crate) use scan::lines::delivery as line_delivery;
-#[cfg(test)]
-use scan::lines::delivery::tests as line_delivery_tests;
 mod oversized_discovery;
 #[path = "pi_retry_inputs.rs"]
 mod pi_retry_inputs;
@@ -249,18 +241,18 @@ use claude_history_upgrade::{
 };
 use claude_reemission_exclusions::ReemissionExclusions;
 use claude_request_census::{ClaudeRequestCensus, ClaudeRequestCensusShadowState};
-pub(crate) use claude_response_records::ClaudeTranscriptUsageOccurrence;
-use claude_response_records::{
-    ClaudeResolveFailure, ClaudeResponseBook, ClaudeResponseObservation, ClaudeSelectorTable,
-    CLAUDE_RECORDS_PER_FILE_ALARM,
-};
-#[cfg(test)]
-use claude_response_records::{ClaudeResponseRecord, CompactClaudeSelector};
 use codex_compressed_input::{is_compressed_codex_rollout, refuse_compressed_codex, OpenedInput};
 pub(crate) use pi_retry_inputs::PiRetryInputs;
 #[cfg(test)]
 pub(crate) use sampled_scan::codex_cursor::{cursor_limit_for_test, with_test_limits_for_test};
 pub(crate) use sampled_scan::codex_cursor::{CodexCursorPort, CodexCursorTicket};
+pub(crate) use sources::claude::response_records::ClaudeTranscriptUsageOccurrence;
+use sources::claude::response_records::{
+    ClaudeResolveFailure, ClaudeResponseBook, ClaudeResponseObservation, ClaudeSelectorTable,
+    CLAUDE_RECORDS_PER_FILE_ALARM,
+};
+#[cfg(test)]
+use sources::claude::response_records::{ClaudeResponseRecord, CompactClaudeSelector};
 
 #[cfg(test)]
 pub(crate) use context_curve::v1::CONTEXT_CURVE_CONTRACT_VERSION;
@@ -495,7 +487,7 @@ use sources::claude::census::authority::{sha256_hex_is_well_formed, ClaudePostur
 
 // Coverage requires a non-quarantined body ACK, not a refusal checkpoint.
 fn codex_index_file_body_accepted(index: &ScanIndex, key: &str, entry: &ScanIndexEntry) -> bool {
-    codex_counting_version::proven_owner(entry).is_some()
+    sources::codex::counting::version::proven_owner(entry).is_some()
         && claude_index_file_body_accepted(index, key, entry)
 }
 
@@ -2118,9 +2110,13 @@ mod census_unreadable_tests {
             traversal.unreadable_path_count += page.unreadable_path_count;
             traversal.unreadable_causes.merge(page.unreadable_causes);
             // Exactly the original predicate; metadata may not settle residue.
-            assert!(traversal.has_retryable_problems());
-            assert!(traversal.has_errors());
-            assert!(!traversal.settle_non_progressing_residue());
+            let mut checkpoint = ScanTraversalCheckpoint {
+                counts: traversal.clone(),
+                ..tests::traversal_checkpoint()
+            };
+            assert!(checkpoint.has_retryable_problems());
+            assert!(checkpoint.has_errors());
+            assert!(!checkpoint.settle_non_progressing_residue());
         }
         assert_eq!(traversal.unreadable_path_count, 36);
         let projected = projection(&traversal);

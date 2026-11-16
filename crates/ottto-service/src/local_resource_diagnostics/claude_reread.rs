@@ -41,6 +41,34 @@ impl Serialize for FullByParseReason {
     }
 }
 
+/// Best-effort listing comparison, frozen at selection; equal stamps do not prove equal bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PriorStamp {
+    ListingUnchanged,
+    SameSizeMovedMtime,
+    SizeChanged,
+    NoBaseline,
+}
+pub(super) const PRIOR_STAMP_NAMES: [&str; 4] = [
+    "listing_unchanged",
+    "same_size_moved_mtime",
+    "size_changed",
+    "no_baseline",
+];
+crate::heap_layout_bound::unit_enum!(true;
+    PriorStamp: ListingUnchanged | SameSizeMovedMtime | SizeChanged | NoBaseline;
+);
+impl PriorStamp {
+    pub(crate) fn classify(listing: (u64, u64), committed: Option<(u64, Option<u64>)>) -> Self {
+        match committed {
+            Some((length, Some(mtime))) if (length, mtime) == listing => Self::ListingUnchanged,
+            Some((length, Some(_))) if length == listing.0 => Self::SameSizeMovedMtime,
+            Some((_, Some(_))) => Self::SizeChanged,
+            _ => Self::NoBaseline,
+        }
+    }
+}
+
 /// Closed labels for the existing progress-blocking / restore branches.
 #[derive(Clone, Copy)]
 pub(crate) enum HeldReason {
