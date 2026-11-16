@@ -1345,11 +1345,10 @@ mod tests {
 
         // Expiring in 2 minutes; the refresh works.
         std::fs::write(root.join("refresh-works"), "").expect("flag");
-        std::fs::write(
+        crate::test_scratch::write_private_file(
             slot_dir.join(".credentials.json"),
             credential(now + TimeDuration::minutes(2)),
-        )
-        .expect("credential");
+        );
         let due = crate::agent_status::read_claude_live_login_for_slot(&slot);
         assert_eq!(
             maybe_refresh_with(
@@ -1382,7 +1381,10 @@ mod tests {
         // Expired; the refresh does not advance the expiry.
         std::fs::remove_file(root.join("refresh-works")).expect("flag");
         let expired = now - TimeDuration::minutes(30);
-        std::fs::write(slot_dir.join(".credentials.json"), credential(expired)).expect("cred");
+        crate::test_scratch::write_private_file(
+            slot_dir.join(".credentials.json"),
+            credential(expired),
+        );
         let due = crate::agent_status::read_claude_live_login_for_slot(&slot);
         assert_eq!(
             maybe_refresh_with(
@@ -1481,11 +1483,10 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 3);
 
         // A new credential (the user signed in again) clears the failure.
-        std::fs::write(
+        crate::test_scratch::write_private_file(
             slot_dir.join(".credentials.json"),
             credential(now + TimeDuration::hours(8)),
-        )
-        .expect("cred");
+        );
         let signed_in = crate::agent_status::read_claude_live_login_for_slot(&slot);
         assert_eq!(
             maybe_refresh_with(
