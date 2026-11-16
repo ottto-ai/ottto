@@ -13,6 +13,7 @@ use super::super::claude_request_identity::{
     self, AcceptedBuckets, AccountPartition, LentSlot, RequestAccounts,
 };
 use super::super::sources::claude::context_file_birth::ClaudeFileBirth;
+use super::super::upload_context_receipt::receipt_binds_bytes;
 use super::super::{
     claude_api_cache_creation, claude_api_matches_transcript_occurrence, claude_family_root_path,
     claude_index_path_family_member, claude_index_path_member_ref, claude_row_placement,
@@ -2166,13 +2167,19 @@ struct CopyOwner {
     accepted: bool,
     owned: bool,
     group_owned: bool,
+    carrier: bool,
     order: Option<(i128, LocationKey)>,
     census: Option<super::super::claude_request_census::ClaudeRequestCensusRecord>,
     groups: Vec<(LocationKey, Box<[u64]>)>,
 }
+#[derive(Clone, Copy)]
+pub(in crate::snapshots) enum Image {
+    Committed,
+    Effective,
+}
 impl CopyOwnership {
     pub(in crate::snapshots) fn capture(index: &ScanIndex) -> Self {
-        let live = indexed_main_files(index);
+        let live = main_files_with(index, |_| BTreeMap::new());
         Self(
             index
                 .files
@@ -2186,6 +2193,7 @@ impl CopyOwnership {
                             accepted: accepted_origin(index, key),
                             owned: origin_owned(index, &[], key, true),
                             group_owned: index_group_owned(index, &live, key),
+                            carrier: committed_twin_carrier(index, key),
                             order: committed_holder_order(
                                 &index.claude_money_birth_store,
                                 member.root,
@@ -2202,9 +2210,20 @@ impl CopyOwnership {
 
     /// Publish marks with the facts that invalidate them. Progress may already
     /// be ahead after a crash; only the two committed index images matter here.
-    pub(in crate::snapshots) fn reconcile(&self, next: &mut ScanIndex) {
+    pub(in crate::snapshots) fn reconcile(
+        &self,
+        next: &mut ScanIndex,
+        heads: &mut dyn FnMut(&[&str], Image) -> BTreeMap<String, String>,
+    ) {
         let before = &self.0;
-        let live = indexed_main_files(next);
+        let old_keys = before
+            .iter()
+            .filter_map(|(key, old)| old.carrier.then_some(key.as_str()))
+            .collect::<Vec<_>>();
+        let old_carried = heads(&old_keys, Image::Committed)
+            .into_values()
+            .collect::<BTreeSet<_>>();
+        let live = main_files_with(next, |keys| heads(keys, Image::Effective));
         let accepted_absent = before
             .iter()
             .filter(|(key, old)| old.accepted && !next.files.contains_key(*key))
@@ -2230,7 +2249,14 @@ impl CopyOwnership {
         drop(live);
         let mut marks = next.claude_copy_removals.drop_holders(&invalid);
         let invalidated = marks.iter().copied().collect::<BTreeSet<_>>();
-        let live = indexed_main_files(next);
+        let live = main_files_with(next, |keys| heads(keys, Image::Effective));
+        // Recover the surviving filename mains together with their dependents;
+        // a deleted carrier cannot supply a new body or copy proof.
+        marks.extend(live.iter().filter_map(|(&location, &key)| {
+            let member = claude_index_path_member_ref(Path::new(key))?;
+            (old_carried.contains(member.root) && !live.carried.contains(member.root))
+                .then_some(location)
+        }));
         let keys = before
             .keys()
             .map(String::as_str)
@@ -2243,7 +2269,10 @@ impl CopyOwnership {
             let census = next.claude_request_census.get(key);
             let groups = next.claude_copy_removals.get(location);
             let changed = old.is_some_and(|o| o.owned) != origin_owned(next, &[], key, true)
-                || old.is_some_and(|o| o.group_owned) != index_group_owned(next, &live, key)
+                || (old.is_some_and(|o| o.group_owned)
+                    || claude_index_path_member_ref(Path::new(key))
+                        .is_some_and(|m| old_carried.contains(m.root)))
+                    != index_group_owned(next, &live, key)
                 || old.map_or(&[][..], |o| o.groups.as_slice()) != groups
                 || old
                     .and_then(|o| o.census.as_ref())
@@ -2439,7 +2468,7 @@ impl CopyOwnership {
 }
 
 pub(in crate::snapshots) fn reconcile_copy_ownership(previous: &ScanIndex, next: &mut ScanIndex) {
-    CopyOwnership::capture(previous).reconcile(next);
+    CopyOwnership::capture(previous).reconcile(next, &mut |_, _| BTreeMap::new());
 }
 
 fn committed_holder_order(
@@ -2452,7 +2481,7 @@ fn committed_holder_order(
         .map(|birth| (birth, location_key(key)))
 }
 
-fn index_group_owned(index: &ScanIndex, live: &BTreeMap<LocationKey, &str>, key: &str) -> bool {
+fn index_group_owned(index: &ScanIndex, live: &Live<'_>, key: &str) -> bool {
     index.claude_family_listed(key)
         || origin_owned(index, &[], key, true)
         // A summed session body can be carried by another physical location.
@@ -2465,15 +2494,11 @@ fn index_group_owned(index: &ScanIndex, live: &BTreeMap<LocationKey, &str>, key:
                     live.get(&location)
                         .is_some_and(|other| origin_owned(index, &[], other, true))
                 })
+                || live.carried.contains(member.root)
         })
 }
 
-fn saved_removal_applies(
-    index: &ScanIndex,
-    live: &BTreeMap<LocationKey, &str>,
-    key: &str,
-    hash: u64,
-) -> bool {
+fn saved_removal_applies(index: &ScanIndex, live: &Live<'_>, key: &str, hash: u64) -> bool {
     index
         .claude_copy_removals
         .get(location_key(key))
@@ -2487,10 +2512,23 @@ fn saved_removal_applies(
         })
 }
 
-/// Location keys of every indexed MAIN Claude file: a stored removal's
-/// holder proves only while it is still indexed.
-fn indexed_main_files(index: &ScanIndex) -> BTreeMap<LocationKey, &str> {
-    index
+struct Live<'a> {
+    files: BTreeMap<LocationKey, &'a str>,
+    /// Decoded session ids: one carrier proves every indexed main of that
+    /// session, across folders and path twins. Names and hash overlap do not.
+    carried: BTreeSet<String>,
+}
+impl<'a> std::ops::Deref for Live<'a> {
+    type Target = BTreeMap<LocationKey, &'a str>;
+    fn deref(&self) -> &Self::Target {
+        &self.files
+    }
+}
+fn main_files_with(
+    index: &ScanIndex,
+    mut read: impl FnMut(&[&str]) -> BTreeMap<String, String>,
+) -> Live<'_> {
+    let files = index
         .files
         .keys()
         .filter(|key| {
@@ -2498,14 +2536,29 @@ fn indexed_main_files(index: &ScanIndex) -> BTreeMap<LocationKey, &str> {
                 .is_some_and(|member| member.subagent_stem.is_none())
         })
         .map(|key| (location_key(key), key.as_str()))
-        .collect()
+        .collect::<BTreeMap<_, _>>();
+    let keys = files
+        .values()
+        .copied()
+        .filter(|key| twin_carrier(index, key))
+        .collect::<Vec<_>>();
+    Live {
+        files,
+        carried: read(&keys).into_values().collect(),
+    }
+}
+/// Scan only: never call under a save session (`read_txn_at` relocks it).
+fn indexed_main_files(index: &ScanIndex) -> Live<'_> {
+    main_files_with(index, |keys| {
+        super::super::state_v2::claude_head_sessions(index, keys)
+    })
 }
 
 /// Earliest owned positive holder before this file. Rule A supplies
 /// session acceptance; other callers supply each file's own acceptance.
 fn earliest_accepted_holder<'a>(
     index: &ScanIndex,
-    live: &BTreeMap<LocationKey, &str>,
+    live: &Live<'_>,
     hash: u64,
     before: (i128, LocationKey),
     candidates: impl Iterator<Item = (&'a str, &'a str, bool)>,
@@ -2522,7 +2575,7 @@ fn earliest_accepted_holder<'a>(
 /// per-file acceptance when selecting candidates.
 fn census_holder(
     index: &ScanIndex,
-    live: &BTreeMap<LocationKey, &str>,
+    live: &Live<'_>,
     key: &str,
     root: &str,
     hash: u64,
@@ -2906,9 +2959,10 @@ fn origin_owned(index: &ScanIndex, page: &[SnapshotItem], key: &str, need_census
     if !need_census && index.claude_family_listed(key) {
         return false;
     }
-    if accepted_origin(index, key) {
-        return true;
-    }
+    accepted_origin(index, key) || local_owned(index, page, key, need_census)
+}
+
+fn local_owned(index: &ScanIndex, page: &[SnapshotItem], key: &str, need_census: bool) -> bool {
     let Some(entry) = index.files.get(key) else {
         return false;
     };
@@ -2954,6 +3008,30 @@ fn origin_owned(index: &ScanIndex, page: &[SnapshotItem], key: &str, need_census
                 .claude_request_census
                 .get(key)
                 .is_some_and(|record| record.current_for(&entry.source_file_fingerprint)))
+}
+
+fn twin_carrier(index: &ScanIndex, key: &str) -> bool {
+    index.file_upload_context_enabled()
+        && !index.file_upload_context_requires_adoption(key)
+        && accepted_origin(index, key)
+        && committed_twin_carrier(index, key)
+}
+
+fn committed_twin_carrier(index: &ScanIndex, key: &str) -> bool {
+    let Some(entry) = index.files.get(key) else {
+        return false;
+    };
+    claude_index_path_member_ref(Path::new(key)).is_some_and(|m| m.subagent_stem.is_none())
+        && index
+            .claude_request_census
+            .get(key)
+            .is_some_and(|r| r.current_twin_for(&entry.source_file_fingerprint))
+        && !index.confirmed_empty_files.contains(key)
+        && entry
+            .upload_context_receipt
+            .as_ref()
+            .is_some_and(|r| !r.body_witness.is_empty() && receipt_binds_bytes(entry, r, false))
+        && local_owned(index, &[], key, false)
 }
 
 fn copy_held(index: &ScanIndex, key: &str) -> bool {
@@ -3133,7 +3211,7 @@ fn decide_holders(
         twin_held: BTreeSet<u64>,
         holder_sessions: BTreeSet<String>,
     }
-    let live = std::cell::OnceCell::<BTreeMap<LocationKey, &str>>::new();
+    let live = std::cell::OnceCell::<Live<'_>>::new();
     // The page's folds by session, for the same-session page proof. By
     // session id alone: path twins live under different folders and roots.
     let page: &[SnapshotItem] = items;
@@ -3440,7 +3518,7 @@ fn decide_holders(
 /// current holder.
 fn stored_groups<'a>(
     index: &'a ScanIndex,
-    live: &std::cell::OnceCell<BTreeMap<LocationKey, &'a str>>,
+    live: &std::cell::OnceCell<Live<'a>>,
     mut covered: BTreeMap<u64, (i128, LocationKey)>,
     file: LocationKey,
 ) -> BTreeMap<LocationKey, BTreeSet<u64>> {
@@ -5393,3 +5471,19 @@ pub(in crate::snapshots) fn selected_twin_roots<'a>(
 #[cfg(test)]
 #[path = "e2_pipeline_observer_tests.rs"]
 pub(crate) mod pipeline_test_observer;
+
+#[cfg(test)]
+pub(crate) fn carrier_group_owned_for_test(index: &ScanIndex, key: &str) -> bool {
+    index_group_owned(index, &indexed_main_files(index), key)
+}
+
+#[cfg(test)]
+pub(crate) fn reconcile_carrier_images_for_test(
+    previous: &ScanIndex,
+    next: &mut ScanIndex,
+    mut heads: impl FnMut(&[&str], bool) -> BTreeMap<String, String>,
+) {
+    CopyOwnership::capture(previous).reconcile(next, &mut |keys, image| {
+        heads(keys, matches!(image, Image::Committed))
+    });
+}

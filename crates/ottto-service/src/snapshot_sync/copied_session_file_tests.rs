@@ -910,32 +910,23 @@ fn held_content_twin_holder_proves_no_copy_until_released() {
             }
         }
         assert!(acquired_twin, "the released page must acquire T");
-        // Known residual, disclosed: when the content twin T carries ROOT's
-        // accepted body, the filename main H holds no receipt of its own, so
-        // the save-time ownership check cannot see H as owned and C's and T's
-        // decisions are refolded from stored state on each pass. Money stays
-        // correct on every page (asserted above) and in the totals below; no
-        // transcript bytes are re-read. A follow-up gives the check the
-        // carrier's session link.
-        let _ = stable;
+        assert!(stable, "released ownership must settle without a read loop");
         assert_eq!((accepted[ROOT], accepted[COPY]), (3, 1));
         assert_eq!(
             accepted.values().sum::<u64>(),
             4,
             "A is counted exactly once"
         );
-        if stable {
-            assert!(!prior.claude_copy_removals.pending(location_key(&copy_key)));
-            assert_eq!(
-                prior
-                    .claude_copy_removals
-                    .get(location_key(&copy_key))
-                    .iter()
-                    .flat_map(|(_, ids)| ids.iter().copied())
-                    .collect::<BTreeSet<_>>(),
-                BTreeSet::from([crate::snapshots::claude_request_census::claude_request_hash("a")])
-            );
-        }
+        assert!(!prior.claude_copy_removals.pending(location_key(&copy_key)));
+        assert_eq!(
+            prior
+                .claude_copy_removals
+                .get(location_key(&copy_key))
+                .iter()
+                .flat_map(|(_, ids)| ids.iter().copied())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([crate::snapshots::claude_request_census::claude_request_hash("a")])
+        );
 
         // An explicitly owed sampled page matches the native complete-money oracle.
         let mut verify = prior.clone();
@@ -945,18 +936,15 @@ fn held_content_twin_holder_proves_no_copy_until_released() {
         money_oracle::assert_equivalent(&reference, &sent_money(&complete));
         prior = accept_monotone_page(&c, &prior, complete, &mut accepted);
 
-        // Two more unchanged passes keep the accepted totals unchanged. While
-        // the residual above lasts they may refold H and C; when it settles
-        // they read neither.
+        // Two more unchanged passes read neither H nor C after the transfer settles.
         let after_release = accepted.clone();
         for _ in 0..2 {
             let mut unchanged = c.raw(&scanner, prior.clone(), 100, true, &[]);
-            if stable {
-                assert!(!scanner.paths().contains(&main) && !scanner.paths().contains(&copy));
-            }
+            assert!(!scanner.paths().contains(&main) && !scanner.paths().contains(&copy));
             unchanged.enrich(&c);
             prior = accept_monotone_page(&c, &prior, unchanged, &mut accepted);
             assert_eq!(accepted, after_release);
+            assert!(!prior.claude_copy_removals.pending(location_key(&copy_key)));
         }
     });
 }
@@ -1491,4 +1479,586 @@ mod subagent_twins {
     include!("subagent_copy_twin_tests.rs");
     include!("subagent_copy_twin_replace_tests.rs");
     include!("subagent_twin_tail_route_tests.rs");
+}
+
+const CARRIER: &str = "0338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+
+// Real discovery, body finalization, exact ACKs, save and reload. T sorts
+// first and carries ROOT; H retains only its local empty suppression proof.
+fn settled_content_carrier(sampled: bool) -> (Corpus, ScanIndex, [PathBuf; 3]) {
+    let mut c = Corpus::new("settled-content-carrier");
+    let t = c.write_at(&file(CARRIER), &resumed(ROOT, &[B, C]), BORN);
+    let h = c.root(ROOT, &resumed(ROOT, &[A, B]));
+    let copy = c.write_at(&file(COPY), &resumed(COPY, &[A, D]), BORN);
+    let prior = ScanIndex::default();
+    let page = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, sampled);
+    assert_eq!(body(&page, ROOT).unwrap().request_count, 3);
+    assert_eq!(body(&page, COPY).unwrap().request_count, 1);
+    let mut index = settle(&c, &prior, page, &mut e2_progress());
+    index.activate_upload_context("e2-synthetic-destination".into());
+    assert!(upload_context_receipt_earned_for_test(&index, &t));
+    assert!(index
+        .confirmed_empty_files
+        .contains(&h.to_string_lossy().into_owned()));
+    assert!(index.files[&h.to_string_lossy().into_owned()]
+        .upload_context_receipt
+        .as_ref()
+        .unwrap()
+        .body_witness
+        .is_empty());
+    if sampled {
+        assert!(!index
+            .claude_copy_removals
+            .pending(location_key(&copy.to_string_lossy())));
+    }
+    (c, index, [h, copy, t])
+}
+
+fn carrier_scanner(index: &ScanIndex) -> E2ScanFixture {
+    let scanner = E2ScanFixture::default();
+    if let Some(route) = crate::snapshots::e2_pipeline_scan_fixture::route_of(index) {
+        scanner.on_committed_route(&route);
+    }
+    scanner
+}
+
+fn removed_hashes(index: &ScanIndex, path: &Path) -> BTreeSet<u64> {
+    index
+        .claude_copy_removals
+        .get(location_key(&path.to_string_lossy()))
+        .iter()
+        .flat_map(|(_, ids)| ids.iter().copied())
+        .collect()
+}
+
+fn quiet_carrier_pass(c: &Corpus, index: ScanIndex, paths: &[PathBuf; 3]) -> ScanIndex {
+    let scanner = carrier_scanner(&index);
+    let page = ready(c, &scanner, index.clone(), 100, true);
+    assert!(
+        paths.iter().all(|path| !scanner.paths().contains(path)),
+        "unchanged H/COPY/T are not read"
+    );
+    let mut sent = twin(&page);
+    sent.finish();
+    assert!(sent.scan.snapshots.is_empty(), "no unchanged offers");
+    let next = settle(c, &index, page, &mut e2_progress());
+    assert!(!next
+        .claude_copy_removals
+        .pending(location_key(&paths[1].to_string_lossy())));
+    assert_eq!(
+        removed_hashes(&next, &paths[1]),
+        BTreeSet::from([crate::snapshots::claude_request_census::claude_request_hash("a")])
+    );
+    next
+}
+
+/// [money] An exact-ACKed content carrier survives reload without another
+/// offer, receipt rewrite, acquisition or copy-removal re-decision.
+#[test]
+fn settled_content_carrier_is_quiet_after_reload_and_legacy_hold_age() {
+    use base64::Engine;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for legacy_age in [false, true] {
+        with_e2(|| {
+            let (c, mut index, paths) = settled_content_carrier(true);
+            let receipt = serde_json::to_vec(
+                &index.files[&paths[2].to_string_lossy().into_owned()].upload_context_receipt,
+            )
+            .unwrap();
+            if legacy_age {
+                // Main's prefix-hold age occupied the same CCR2 slot. Import a
+                // real encoded age=2 instead of manufacturing a new debt kind.
+                let encoded: String = serde_json::from_value(
+                    serde_json::to_value(&index.claude_copy_removals).unwrap(),
+                )
+                .unwrap();
+                let mut bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(encoded)
+                    .unwrap();
+                let count = u32::from_le_bytes(bytes[5..9].try_into().unwrap()) as usize;
+                let mut offset = 9;
+                let wanted = location_key(&paths[1].to_string_lossy()).to_bytes();
+                let mut changed = false;
+                for _ in 0..count {
+                    if bytes[offset..offset + 16] == wanted {
+                        bytes[offset + 16..offset + 24].copy_from_slice(&2_u64.to_le_bytes());
+                        changed = true;
+                    }
+                    let groups =
+                        u32::from_le_bytes(bytes[offset + 24..offset + 28].try_into().unwrap())
+                            as usize;
+                    offset += 28;
+                    for _ in 0..groups {
+                        let hashes =
+                            u32::from_le_bytes(bytes[offset + 16..offset + 20].try_into().unwrap())
+                                as usize;
+                        offset += 20 + 8 * hashes;
+                    }
+                }
+                assert!(changed);
+                index.claude_copy_removals = serde_json::from_value(json!(
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+                ))
+                .unwrap();
+                index = c.reload(&mut index);
+                let scanner = carrier_scanner(&index);
+                let page = ready(&c, &scanner, index.clone(), 100, true);
+                assert!(
+                    scanner.paths().contains(&paths[1]),
+                    "one legacy-age re-decision"
+                );
+                index = settle(&c, &index, page, &mut e2_progress());
+            }
+            for _ in 0..3 {
+                index = quiet_carrier_pass(&c, index, &paths);
+            }
+            assert_eq!(
+                serde_json::to_vec(
+                    &index.files[&paths[2].to_string_lossy().into_owned()].upload_context_receipt
+                )
+                .unwrap(),
+                receipt
+            );
+            assert!(index
+                .confirmed_empty_files
+                .contains(&paths[0].to_string_lossy().into_owned()));
+        });
+    }
+}
+
+/// [money] Deleting the carrier re-arms H together with COPY. The next page
+/// has neither owe-all nor hints: COPY can rely on H's freshly read A.
+#[test]
+fn deleted_content_carrier_recovers_main_with_its_dependents() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    with_e2(|| {
+        let (c, mut index, [h, copy, t]) = settled_content_carrier(true);
+        // Hydration captures the committed baseline before a new pass installs
+        // its runtime-only context. This must retain old carrier eligibility.
+        index = c.reload(&mut index);
+        assert!(!index.file_upload_context_enabled());
+        assert!(!e2::carrier_group_owned_for_test(
+            &index,
+            &h.to_string_lossy()
+        ));
+        std::fs::remove_file(&t).unwrap();
+        let scanner = carrier_scanner(&index);
+        // Ordinary discovery commits positive absence; the save publishes
+        // both recovery marks, without borrowing any proof from deleted T.
+        let discovery = ready(&c, &scanner, index.clone(), 100, true);
+        index = settle(&c, &index, discovery, &mut e2_progress());
+        assert!(!index.files.contains_key(&t.to_string_lossy().into_owned()));
+        assert!(index
+            .claude_copy_removals
+            .pending(location_key(&h.to_string_lossy())));
+        assert!(index
+            .claude_copy_removals
+            .pending(location_key(&copy.to_string_lossy())));
+        let mut native = index.clone();
+        owe(&mut native);
+        let reference = ready(&c, &E2ScanFixture::default(), native, 100, false);
+        let page = ready(&c, &scanner, index.clone(), 100, true);
+        assert!(scanner.paths().contains(&h) && scanner.paths().contains(&copy));
+        assert!(!scanner.paths().contains(&t));
+        assert_eq!(
+            body(&page, ROOT).unwrap().request_count,
+            2,
+            "ROOT keeps A and B"
+        );
+        assert_eq!(
+            body(&page, COPY).unwrap().request_count,
+            1,
+            "COPY keeps only D"
+        );
+        assert_eq!(body(&page, COPY).unwrap().removed_request_count, Some(1));
+        money_oracle::assert_equivalent(&sent_money(&reference), &sent_money(&page));
+        index = settle(&c, &index, page, &mut e2_progress());
+        for _ in 0..3 {
+            let page = ready(&c, &scanner, index.clone(), 100, true);
+            assert!(!scanner.paths().contains(&h) && !scanner.paths().contains(&copy));
+            let mut sent = twin(&page);
+            sent.finish();
+            assert!(sent.scan.snapshots.is_empty());
+            index = settle(&c, &index, page, &mut e2_progress());
+            assert!(!index
+                .claude_copy_removals
+                .pending(location_key(&copy.to_string_lossy())));
+        }
+    });
+}
+
+/// [regress] A held or refused T, and an ACK under an old context, lose
+/// authority. Unchanged saves invalidate H's dependents only once.
+#[test]
+fn content_carrier_hold_refusal_and_context_change_invalidate_once() {
+    use crate::snapshots::e2_pipeline_scan_fixture::hold_claude_account_for_test;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for reason in ["held", "refused", "context"] {
+        with_e2(|| {
+            let (c, mut index, [h, copy, t]) = settled_content_carrier(true);
+            let key = t.to_string_lossy().into_owned();
+            match reason {
+                "held" => hold_claude_account_for_test(&mut index, &key),
+                "refused" => {
+                    let fp = index.file_snapshot_fingerprints[&key]
+                        .iter()
+                        .next()
+                        .unwrap()
+                        .clone();
+                    let mut progress = e2_progress();
+                    progress.quarantine_permanent_body(&fp, "refused-body", "synthetic refusal");
+                    index
+                        .quarantined_snapshot_fingerprints
+                        .insert(fp.clone(), progress.quarantined_fingerprints[&fp].clone());
+                }
+                "context" => index.activate_upload_context("changed-destination".into()),
+                _ => unreachable!(),
+            }
+            assert!(
+                !e2::carrier_group_owned_for_test(&index, &h.to_string_lossy()),
+                "{reason} must not own H"
+            );
+            index = c.reload(&mut index);
+            assert!(
+                index
+                    .claude_copy_removals
+                    .pending(location_key(&copy.to_string_lossy())),
+                "{reason}"
+            );
+            if reason == "context" {
+                // Resolve adoption with a real read and ACK before requiring
+                // quiet saves; discarding a mark does not settle context debt.
+                let mut owed = index.clone();
+                owe(&mut owed);
+                let scanner = carrier_scanner(&index);
+                let mut page = c.raw(&scanner, owed, 100, true, &[]);
+                page.index
+                    .activate_upload_context("changed-destination".into());
+                page.committed
+                    .activate_upload_context("changed-destination".into());
+                page.enrich(&c);
+                index = settle(&c, &index, deliver_page(page), &mut e2_progress());
+                index.activate_upload_context("changed-destination".into());
+                assert!(upload_context_receipt_earned_for_test(&index, &t));
+            } else {
+                index
+                    .claude_copy_removals
+                    .clear_hold(location_key(&copy.to_string_lossy()));
+                index
+                    .claude_copy_removals
+                    .clear_hold(location_key(&h.to_string_lossy()));
+            }
+            index = c.reload(&mut index);
+            assert!(
+                !index
+                    .claude_copy_removals
+                    .pending(location_key(&copy.to_string_lossy())),
+                "{reason} re-marked"
+            );
+        });
+    }
+}
+
+/// [regress] Exact acceptance and overlapping hashes in the same folder
+/// cannot carry a different session's empty-proof-only filename main.
+#[test]
+fn different_session_content_carrier_does_not_own_main() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    with_e2(|| {
+        let (mut c, mut index, [h, copy, t]) = settled_content_carrier(true);
+        c.write_at(&file(CARRIER), &resumed(THIRD, &[B, C]), BORN);
+        let mut owed = index.clone();
+        owe(&mut owed);
+        let scanner = carrier_scanner(&index);
+        let mut page = c.raw(&scanner, owed, 100, true, &[]);
+        let fingerprint = page.index.files[&t.to_string_lossy().into_owned()]
+            .source_file_fingerprint
+            .clone();
+        page.scan
+            .snapshots
+            .retain(|item| item.source_file_fingerprint.as_ref() == Some(&fingerprint));
+        page.enrich(&c);
+        let page = deliver_page(page);
+        index = settle(&c, &index, page, &mut e2_progress());
+        index.activate_upload_context("e2-synthetic-destination".into());
+        assert!(upload_context_receipt_earned_for_test(&index, &t));
+        assert!(!e2::carrier_group_owned_for_test(
+            &index,
+            &h.to_string_lossy()
+        ));
+        // Exercise lost ROOT in the committed image versus staged THIRD in
+        // the effective image; same hash incidence is not a session link.
+        assert!(index
+            .claude_copy_removals
+            .pending(location_key(&h.to_string_lossy())));
+        assert!(index
+            .claude_copy_removals
+            .pending(location_key(&copy.to_string_lossy())));
+    });
+}
+
+/// [regress] This save runs reconcile while v2 owns its session mutex. A
+/// scan-time reader inside capture/reconcile would recursively lock it.
+#[test]
+fn content_carrier_reconcile_under_open_v2_save_does_not_deadlock() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let (send, receive) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        with_e2(|| {
+            let (c, mut index, _) = settled_content_carrier(true);
+            index = c.reload(&mut index);
+            send.send(index.generation).unwrap();
+        });
+    });
+    assert!(
+        receive
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .is_ok(),
+        "v2 carrier reconcile deadlocked"
+    );
+    worker.join().unwrap();
+}
+
+/// [regress] An unrouted JSON save grants no new head-backed authority and
+/// keeps its existing residual behavior without relocking a v2 session.
+#[test]
+fn legacy_content_carrier_save_stays_unrouted() {
+    with_e2(|| {
+        let (c, mut index, _) = settled_content_carrier(false);
+        assert!(crate::snapshots::e2_pipeline_scan_fixture::route_of(&index).is_none());
+        for _ in 0..3 {
+            let page = ready(&c, &E2ScanFixture::default(), index.clone(), 100, false);
+            index = settle(&c, &index, page, &mut e2_progress());
+            assert!(crate::snapshots::e2_pipeline_scan_fixture::route_of(&index).is_none());
+            assert!(
+                index
+                    .claude_copy_removals
+                    .pending(location_key(&c.root.join(file(COPY)).to_string_lossy())),
+                "legacy ownership behavior is unchanged"
+            );
+        }
+    });
+}
+
+/// [regress] Carrier freshness admits verified Exact/Empty twins only and
+/// does not broaden any census predicate used to prove copied requests.
+#[test]
+fn content_carrier_freshness_rejects_each_unknown_revision() {
+    use crate::snapshots::claude_request_census::{
+        ClaudeRequestCensusRecord as Record, ClaudeRequestCensusShape as Shape,
+    };
+    let fp = "a".repeat(64);
+    let record = Record::synthetic_for_test(&fp, 1, Shape::Exact, vec![1]).with_twin_for_test(true);
+    assert!(record.current_twin_for(&fp));
+    assert!(!record.current_for(&fp));
+    assert!(!record.proves_scan());
+    assert!(!record.current_twin_for(&"b".repeat(64)));
+    let mut retired = record.clone();
+    retired.retire();
+    for bad in [
+        record.clone().with_unverified_for_test(true),
+        record.clone().with_derivation_for_test(0),
+        record.clone().with_twin_for_test(false),
+        retired,
+    ] {
+        assert!(!bad.current_twin_for(&fp));
+    }
+    for (shape, expected) in [
+        (Shape::Empty, true),
+        (Shape::IdentityIncomplete, false),
+        (Shape::Lossy, false),
+        (Shape::OverBudget, false),
+    ] {
+        let record = Record::synthetic_for_test(&fp, 1, shape, vec![]).with_twin_for_test(true);
+        assert_eq!(record.current_twin_for(&fp), expected, "{shape:?}");
+    }
+}
+
+/// [regress] Freshness discovery resolves a real persisted T revision by a
+/// Tail-only observation. Saving that observation must retain T's session.
+#[test]
+fn discovery_debt_only_save_keeps_content_carrier() {
+    use crate::snapshots::e2_pipeline_scan_fixture::resolve_carrier_discovery_debt_for_test;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    with_e2(|| {
+        let (c, mut index, paths) = settled_content_carrier(true);
+        let (before, after) = resolve_carrier_discovery_debt_for_test(&mut index, &paths[2]);
+        assert!(
+            before > 0,
+            "a real discovery revision must have been persisted"
+        );
+        assert_eq!(after, 0, "exact ACK resolves the discovery revision");
+        assert!(!index
+            .claude_copy_removals
+            .pending(location_key(&paths[1].to_string_lossy())));
+        index = c.reload(&mut index);
+        for _ in 0..3 {
+            index = quiet_carrier_pass(&c, index, &paths);
+        }
+    });
+}
+
+/// [regress] Reconcile compares different head images. A staged session
+/// reset invalidates ROOT even though T retains identical request hashes.
+#[test]
+fn content_carrier_committed_and_effective_sessions_are_distinct() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    with_e2(|| {
+        let (_c, index, [h, copy, t]) = settled_content_carrier(true);
+        let mut next = index.clone();
+        let key = t.to_string_lossy().into_owned();
+        e2::reconcile_carrier_images_for_test(&index, &mut next, |keys, committed| {
+            assert!(keys.contains(&key.as_str()));
+            BTreeMap::from([(key.clone(), if committed { ROOT } else { THIRD }.to_owned())])
+        });
+        assert!(next
+            .claude_copy_removals
+            .pending(location_key(&h.to_string_lossy())));
+        assert!(next
+            .claude_copy_removals
+            .pending(location_key(&copy.to_string_lossy())));
+    });
+}
+
+/// [regress] Re-ACKing T under the new upload context restores authority;
+/// an old-context receipt alone never makes H owned.
+#[test]
+fn content_carrier_requires_exact_ack_under_the_active_context() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    with_e2(|| {
+        let (c, mut index, [h, _, t]) = settled_content_carrier(true);
+        index.activate_upload_context("replacement-context".into());
+        assert!(!e2::carrier_group_owned_for_test(
+            &index,
+            &h.to_string_lossy()
+        ));
+        let mut owed = index.clone();
+        owe(&mut owed);
+        let scanner = carrier_scanner(&index);
+        let mut page = c.raw(&scanner, owed, 100, true, &[]);
+        page.index
+            .activate_upload_context("replacement-context".into());
+        page.committed
+            .activate_upload_context("replacement-context".into());
+        page.enrich(&c);
+        index = settle(&c, &index, deliver_page(page), &mut e2_progress());
+        index.activate_upload_context("replacement-context".into());
+        assert!(upload_context_receipt_earned_for_test(&index, &t));
+        assert!(e2::carrier_group_owned_for_test(
+            &index,
+            &h.to_string_lossy()
+        ));
+    });
+}
+
+/// [regress] A non-Tail debt observation drops T's reduction, so its still
+/// exact receipt no longer supplies a session link for H's saved groups.
+#[test]
+fn non_tail_debt_observation_invalidates_content_carrier_once() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    with_e2(|| {
+        let (c, mut index, [h, copy, t]) = settled_content_carrier(true);
+        crate::snapshots::e2_pipeline_scan_fixture::non_tail_carrier_observation_for_test(
+            &index, &t,
+        );
+        index = c.reload(&mut index);
+        index.activate_upload_context("e2-synthetic-destination".into());
+        assert!(!e2::carrier_group_owned_for_test(
+            &index,
+            &h.to_string_lossy()
+        ));
+        assert!(index
+            .claude_copy_removals
+            .pending(location_key(&h.to_string_lossy())));
+        assert!(index
+            .claude_copy_removals
+            .pending(location_key(&copy.to_string_lossy())));
+        index
+            .claude_copy_removals
+            .clear_hold(location_key(&h.to_string_lossy()));
+        index
+            .claude_copy_removals
+            .clear_hold(location_key(&copy.to_string_lossy()));
+        index = c.reload(&mut index);
+        assert!(!index
+            .claude_copy_removals
+            .pending(location_key(&copy.to_string_lossy())));
+    });
+}
+
+/// [regress] A context-free baseline remembers only byte-bound carriers.
+/// Even a valid committed receipt grants no effective ownership by itself.
+#[test]
+fn committed_content_carrier_requires_bound_receipt_after_reload() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    with_e2(|| {
+        let (c, mut index, [h, _, t]) = settled_content_carrier(true);
+        index = c.reload(&mut index);
+        assert!(!index.file_upload_context_enabled());
+        let key = t.to_string_lossy().into_owned();
+        for case in [
+            "valid",
+            "source",
+            "body",
+            "empty",
+            "replay",
+            "confirmed-empty",
+            "missing",
+        ] {
+            let mut previous = index.clone();
+            let receipt = previous
+                .files
+                .get_mut(&key)
+                .unwrap()
+                .upload_context_receipt
+                .as_mut()
+                .unwrap();
+            match case {
+                "source" => receipt.source_witness.push('x'),
+                "body" => receipt.body_witness.push('x'),
+                "empty" => receipt.body_witness.clear(),
+                "replay" => receipt.replay_generation += 1,
+                "confirmed-empty" => {
+                    previous.confirmed_empty_files.insert(key.clone());
+                }
+                "missing" => previous.files.get_mut(&key).unwrap().upload_context_receipt = None,
+                "valid" => {}
+                _ => unreachable!(),
+            }
+            assert!(!e2::carrier_group_owned_for_test(
+                &previous,
+                &h.to_string_lossy()
+            ));
+            let mut next = previous.clone();
+            next.files.remove(&key);
+            let mut eligible = false;
+            e2::reconcile_carrier_images_for_test(&previous, &mut next, |keys, committed| {
+                if committed {
+                    eligible = keys.contains(&key.as_str());
+                }
+                BTreeMap::new()
+            });
+            assert_eq!(eligible, case == "valid", "{case}");
+        }
+    });
 }

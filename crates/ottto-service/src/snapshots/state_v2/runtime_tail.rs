@@ -172,6 +172,32 @@ pub(in crate::snapshots) fn load_head(
         super::super::tail::load_head(tx, key.as_bytes(), revision, stamp.0)
     })
 }
+/// Batch scan-time session links; never called while a save owns the session.
+pub(in crate::snapshots) fn claude_head_sessions(
+    index: &ScanIndex,
+    keys: &[&str],
+) -> BTreeMap<String, String> {
+    use super::super::super::tail_source::{self, claude::Claude, TailSource};
+    if keys.is_empty() {
+        return BTreeMap::new();
+    }
+    read_txn_at(index, |tx, stamp| {
+        let mut sessions = BTreeMap::new();
+        for &key in keys {
+            if let Some(head) = super::super::tail::load_head(
+                tx,
+                key.as_bytes(),
+                Claude::REDUCTION_REVISION,
+                stamp.0,
+            )? && let Some(session) = tail_source::claude_head_session(head.revision, &head.body)
+            {
+                sessions.insert(key.to_owned(), session);
+            }
+        }
+        Ok(sessions)
+    })
+    .unwrap_or_default()
+}
 /// Files whose committed head a commit may have changed since `consumer`'s
 /// last call, for the Codex header inventory's durable facts. `None` (its
 /// first call, another consumer's since, or a new session): any head may have.

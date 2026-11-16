@@ -271,7 +271,30 @@ pub(in crate::snapshots) struct PathCarry {
     pub(in crate::snapshots) head: Vec<u8>,
     pub(in crate::snapshots) inventory: InventoryFacts,
 }
+pub(super) enum EffectiveHead {
+    Removed,
+    Staged(u32, Vec<u8>),
+    Committed,
+}
 impl TailStage {
+    pub(super) fn effective(&self, key: &str) -> EffectiveHead {
+        let bytes = key.as_bytes();
+        if self.retire.contains(bytes)
+            || self.erase.contains(bytes)
+            || matches!(self.files.get(bytes), Some(Entry::Failed(_)))
+            || self
+                .debt
+                .get(bytes)
+                .is_some_and(|o| o.representation != Representation::Tail)
+        {
+            EffectiveHead::Removed
+        } else if let Some((revision, head)) = self.staged_head(key) {
+            EffectiveHead::Staged(revision, head)
+        } else {
+            EffectiveHead::Committed
+        }
+    }
+
     /// Every file whose head a commit of this stage may write or remove.
     pub(super) fn touched(&self) -> impl Iterator<Item = &Vec<u8>> {
         self.files
@@ -303,7 +326,6 @@ impl TailStage {
         Ok(moved)
     }
     /// The head this pass staged for `key`, if any: (revision, head bytes).
-    #[cfg(test)]
     pub(super) fn staged_head(&self, key: &str) -> Option<(u32, Vec<u8>)> {
         match self.files.get(key.as_bytes()) {
             Some(Entry::File(file)) => Some((file.revision, file.head.clone())),

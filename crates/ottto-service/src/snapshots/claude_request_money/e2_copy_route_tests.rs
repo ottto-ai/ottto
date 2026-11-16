@@ -231,7 +231,7 @@ fn save_marks_only_disagreeing_copy_decisions() {
         next.claude_copy_removals.clear_hold(location);
         let previous = CopyOwnership::capture(&next);
         accepted_receipt(&mut next, &dir);
-        previous.reconcile(&mut next);
+        previous.reconcile(&mut next, &mut |_, _| BTreeMap::new());
         assert!(
             !next.claude_copy_removals.pending(location),
             "an ACK adds no ownership change"
@@ -291,7 +291,7 @@ fn restored_census_marks_an_accepted_holders_counted_copy_once() {
         assert!(next.claude_copy_removals.pending(location));
         next.claude_copy_removals.clear_hold(location);
         let unchanged = CopyOwnership::capture(&next);
-        unchanged.reconcile(&mut next);
+        unchanged.reconcile(&mut next, &mut |_, _| BTreeMap::new());
         assert!(!next.claude_copy_removals.pending(location));
         let _ = fs::remove_dir_all(dir);
     }

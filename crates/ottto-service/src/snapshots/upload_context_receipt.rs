@@ -137,7 +137,7 @@ fn same_mode_family(left: &str, right: &str) -> bool {
 
 /// The receipt proves this entry's exact bytes at this replay epoch: its source
 /// bytes and, unless the file is confirmed empty, the body set it delivered.
-fn receipt_binds_bytes(entry: &ScanIndexEntry, receipt: &Receipt, empty: bool) -> bool {
+pub(super) fn receipt_binds_bytes(entry: &ScanIndexEntry, receipt: &Receipt, empty: bool) -> bool {
     receipt.replay_generation == RECEIPT_REPLAY_EPOCH
         && receipt.source_witness == entry.source_file_fingerprint
         && (empty || entry.last_upload_body_witness.as_ref() == Some(&receipt.body_witness))

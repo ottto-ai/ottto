@@ -112,7 +112,42 @@ pub(super) fn save(
             identity.binding.source,
             super::super::scan_index_persistence::Source::Claude
         ) {
-            previous.copy_ownership.reconcile(next);
+            use super::super::claude_request_money::e2::Image;
+            use super::super::tail_source::{self, claude::Claude, TailSource};
+            use tail::EffectiveHead;
+            previous.copy_ownership.reconcile(next, &mut |keys, image| {
+                let mut sessions = BTreeMap::new();
+                for &key in keys {
+                    let effective = match image {
+                        Image::Committed => EffectiveHead::Committed,
+                        Image::Effective => cx
+                            .tail
+                            .as_ref()
+                            .map_or(EffectiveHead::Committed, |stage| stage.effective(key)),
+                    };
+                    let session = match effective {
+                        EffectiveHead::Removed => None,
+                        EffectiveHead::Staged(revision, head) => {
+                            tail_source::claude_head_session(revision, &head)
+                        }
+                        EffectiveHead::Committed => tail::load_head(
+                            &mut tx,
+                            key.as_bytes(),
+                            Claude::REDUCTION_REVISION,
+                            previous.generation,
+                        )
+                        .ok()
+                        .flatten()
+                        .and_then(|head| {
+                            tail_source::claude_head_session(head.revision, &head.body)
+                        }),
+                    };
+                    if let Some(session) = session {
+                        sessions.insert(key.to_owned(), session);
+                    }
+                }
+                sessions
+            });
         }
     }
     super::super::sampled_audit::prune_growth_retention(
