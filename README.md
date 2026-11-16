@@ -7,13 +7,30 @@ several coding agents on your Mac, such as Claude Code, Codex and Pi.
 - **What should you optimize:** where your cost goes and which setup problems may hold your agents
   back, based on your own sessions and setup, so you fix what matters first.
 
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/overview-dark.png">
-    <img alt="The Ottto dashboard Overview page for a demo account, last 7 days: cards for API usage, subscriptions, cloud providers and daily run-rate; pay-as-you-go cost drivers by agent for Claude Code, Codex and Pi; and token, session and hourly activity summaries." src="docs/assets/readme/overview-light.png" width="860">
-  </picture><br>
-  <sub>The Overview page of the Ottto dashboard, showing a demo account's data.</sub>
-</p>
+<!-- Product visual: coming soon -->
+
+## What Ottto does on your Mac
+
+- **Reads** the session files that Claude Code, Codex and Pi write (`~/.claude/projects`,
+  `~/.codex/sessions`, `~/.pi/agent/sessions`) and a few named settings from their config.
+- **Uploads nothing about your usage until you connect** this Mac to an Ottto account. Then it
+  sends usage metadata, never your transcripts, code, tool output or sign-in tokens
+  ([what is sent](#privacy)).
+- **Sends session titles, repository names and MCP tool details by default.** Every 6 hours it
+  starts your local stdio MCP servers for Claude Code and Codex to list their tools, and sends each
+  tool's name, description and input schema. In the web dashboard, **Readable labels** turns all
+  of these off, and **MCP inventory harvesting** only the MCP part.
+- **Reads your plan limits** from Anthropic with Claude Code's sign-in, and through the Codex CLI
+  for Codex. Each can be turned off.
+- **Runs short `claude`, `codex` and `pi` commands** to check your setup (including test prompts),
+  read limits and keep Claude sign-ins fresh.
+- **Edits agent settings** on setup and repair: Claude Code's `~/.claude/settings.json` (telemetry
+  and status line) and a marked line in `~/.zshrc`. Later checks put its status line back. At
+  start it removes only its own old entries from `~/.codex/config.toml`.
+- **Receives Claude Code's telemetry** on 127.0.0.1 and keeps only content-free counters, which feed
+  the usage it uploads.
+
+Details: [docs/privacy.md](docs/privacy.md).
 
 ## Get started
 
@@ -153,7 +170,8 @@ ottto costs --json --days 7   # the last 7 days of cost across your account, as 
 - Your transcripts and full conversations, including your agents' responses
 - Code, file contents, and tool and command output
 - Your agents' sign-in tokens, API keys, cookies and passwords
-- Instruction, memory and skill text, and absolute file paths
+- Instruction, memory and skill text, and absolute file paths (except text an MCP server itself
+  puts in a tool description or input schema)
 
 To show your Claude plan limits, Ottto uses your Claude Code sign-in only to ask Anthropic for your
 usage, and never sends it to Ottto. Turn this off in Ottto.app settings: **Read subscription usage**.
@@ -173,8 +191,13 @@ Two settings in the web dashboard (app.ottto.net → **Settings → Data & priva
   session has no title, and, for prompts you repeat, a short start of that prompt (96 bytes at
   most, with paths removed), so you can recognize sessions. It also sends project
   folder and repository names, the names of skills, custom agents, MCP servers and MCP tools, and
-  the repository paths of files in a session's context. Turning it off stops those. Built-in tool
-  names, counts and account metadata are still sent.
+  the repository paths of files in a session's context. With the **MCP inventory harvesting**
+  setting also on (the default), it sends each local MCP server's configured name, transport kind,
+  whether it answered, whether it is disabled and the character length of its instructions (never
+  their text), and each tool's name, description and full input schema as the server reported them.
+  Server commands, arguments, environment values, working directories and URLs are not sent
+  ([details](docs/privacy.md)). Turning Readable labels off stops all of those. Built-in tool names,
+  counts and account metadata are still sent.
 - **Session links** (off by default; a workspace admin setting). With it on, Ottto also sends pull
   request, issue and commit links found in a session. They name their repository even with
   Readable labels off.

@@ -57,7 +57,10 @@ removed.
 
 The local platform must not upload raw prompts, raw responses, tool output,
 command output, browser cookies, OAuth credentials, API keys, passwords,
-absolute local paths.
+absolute local paths. MCP tool descriptions and input schemas are the exception:
+they are sent verbatim as the MCP server reported them, so they can contain
+whatever text the server put there, including paths. Ottto does not add paths to
+them.
 
 Raw provider account and organization ids are identifiers, not credentials.
 Agent status uploads carry them on the account block and on plan observations,
@@ -336,7 +339,11 @@ Codex it also reports whether the bundled browser, Chrome and computer-use
 plugins are enabled. Server commands, arguments, working directories,
 environment values and URLs are not sent. HTTP and SSE servers are not
 contacted and upload no tools, and disabled servers are not started. An
-unchanged inventory is uploaded again at most weekly. Setting
+unchanged inventory is uploaded again at most weekly. Each time the Ottto server
+accepts an inventory upload, it sends the name, description and input schema of
+each Claude Code tool in it to Anthropic's token-count API, only to count how
+many tokens those tool definitions add to every session. Anthropic's commercial
+terms do not allow it to train models on data sent to its API. Setting
 `OTTTO_MCP_HARVEST_DISABLED=1` or creating
 `~/Library/Application Support/Ottto/mcp_inventory/disabled` turns this off on
 the Mac; turning either setting off also stops it.
