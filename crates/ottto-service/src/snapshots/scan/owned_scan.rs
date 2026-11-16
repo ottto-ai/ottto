@@ -3,6 +3,8 @@
 //! constructors that decide what a page selects.
 
 mod step;
+#[cfg(test)]
+mod trace_projection;
 
 use crate::snapshots::discovery::traversal::scan_traversal_context_fingerprint;
 use crate::snapshots::*;

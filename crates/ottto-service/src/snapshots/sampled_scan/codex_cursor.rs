@@ -1683,6 +1683,11 @@ pub(in crate::snapshots) struct ActiveFrame {
 crate::heap_layout_bound::fields!(ActiveFrame; file, lease);
 
 impl ActiveFrame {
+    #[cfg(test)]
+    pub(crate) fn holds_lease_for_test(&self) -> bool {
+        self.lease.is_some()
+    }
+
     pub(in crate::snapshots) fn new(
         file: Option<Box<OwnedActiveFile>>,
         lease: Option<CursorLease>,
