@@ -1838,8 +1838,11 @@ fn inventory_held_page_catches_up_and_leaves_the_generation_healthy() {
             assert!(traversal.has_errors());
             assert!(traversal.counts.unreadable_path_count > 0);
             retry_due(&mut index);
-            let (next, rewalk, posts, _) = accepted_page(&c.roots(), index, limit, &slots);
+            let before = index.clone();
+            let (working, rewalk, _, _, _) =
+                page_observed_with_limit(&c.roots(), index, Arc::default(), limit, &slots, |_| {});
             assert!(rewalk.snapshots.is_empty(), "the re-walk re-emits nothing");
+            let (next, posts) = working.checkpoint_with_captured_posts(&rewalk, &before, "accept");
             assert!(posts.is_empty());
             index = next;
         } else if arm != "unlisted" {
