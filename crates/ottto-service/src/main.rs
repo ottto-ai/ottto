@@ -958,11 +958,9 @@ fn stable_machine_id_from_seed(seed: &str) -> String {
     ottto_core::prefixed_sha256_id("otm", seed)
 }
 
-#[cfg(test)]
-use ottto_service::account_scope_from_uid;
-#[cfg(all(test, not(unix)))]
-use ottto_service::current_account_uid;
 use ottto_service::local_account_scope;
+#[cfg(test)]
+use ottto_service::{account_scope_from_uid, current_account_uid};
 
 /// Derived from the raw `IOPlatformUUID`, never the hashed hardware id, so
 /// `machine_id` stays the value every earlier daemon on this Mac reported.

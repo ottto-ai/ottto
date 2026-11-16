@@ -32938,7 +32938,14 @@ X-API-Key = "otel_redacted"
             return;
         }
         let _env = relogin_env("return-logout-intact-seed");
-        FileMachineStore::default().save(&test_machine()).unwrap();
+        let machine = test_machine();
+        FileMachineStore::default()
+            .save(&ottto_core::LocalMachineBinding {
+                machine_id: machine.machine_id,
+                installation_id: machine.installation_id,
+                hardware_uuid: machine.hardware_uuid,
+            })
+            .unwrap();
         let device = relogin_device("logout-owner-a", &["codex"]);
         let namespace = owner_return_credential_for_test(&device, "logout-a-secret", "a");
         let history = FileOwnerSnapshotNamespaceStore::default();
