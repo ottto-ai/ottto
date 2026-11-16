@@ -242,15 +242,17 @@ fn tier_replay_publishes_twice_without_losing_the_winner() {
         replays("tail_reconstruct"),
         replays("tail_reconstruct_bytes"),
     );
-    let (_, _, modes, _) = production_scan_at_with_setup(
-        &f,
-        SnapshotSource::Codex,
-        index,
-        Some(cache),
-        "mcp-replay",
-        NOW,
-        setup,
-    );
+    let ((_, _, modes, _), rows) = crate::local_resource_diagnostics::capture(|| {
+        production_scan_at_with_setup(
+            &f,
+            SnapshotSource::Codex,
+            index,
+            Some(cache),
+            "mcp-replay",
+            NOW,
+            setup,
+        )
+    });
     assert_eq!(modes, (1, 1, 0), "real Tail followed by TierReplay Full");
     // The Full is the protected-tier replay: counted once, with the bytes it
     // re-read from the file's start (D168 `tier_prefix_replay`).
@@ -259,6 +261,21 @@ fn tier_replay_publishes_twice_without_losing_the_winner() {
     assert!(read > 0 && read <= fs::metadata(&f.file.0).unwrap().len());
     assert_eq!(projection.snapshot().1, 3, "both EOF edges published");
     assert_eq!(projection.snapshot().0.unwrap().version(), Some("0.148.9"));
+    // The replay's count and bytes use the stamp frozen at selection.
+    let stamps = rows
+        .iter()
+        .filter(|row| row["stage"] == "native_full_prior_stamp")
+        .collect::<Vec<_>>();
+    assert_eq!(stamps.len(), 1);
+    let matrix = stamps[0]["counts"]["full_by_prior_stamp"]
+        .as_object()
+        .unwrap();
+    assert_eq!(matrix.len(), 1, "{matrix:?}");
+    assert_eq!(
+        matrix.values().next().unwrap(),
+        &json!({"size_changed": {"count": 1, "completed_native_bytes": read}}),
+        "the Tail selection is not a Full; the replay is"
+    );
 }
 
 #[test]

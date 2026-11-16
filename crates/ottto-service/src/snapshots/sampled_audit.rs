@@ -1225,7 +1225,7 @@ pub(super) fn growth_active(index: &ScanIndex) -> bool {
 }
 
 /// Owed native growth debt. Fresh growth (`len > size_bytes`) is main's
-/// owes_stamped/codex_fragment::grown, which every age gate checks first.
+/// owes_stamped/sources::codex::eof_fragment::grown, which every age gate checks first.
 pub(super) fn growth_selectable(
     source: SnapshotSource,
     path: &Path,
@@ -2064,7 +2064,7 @@ mod growth_tests {
         let mut census = ScanCensus::default();
         let now = unix_seconds(SystemTime::now()).unwrap() + 40 * 86400;
         // Main's #876 retains an indexed grown file across the window
-        // (DiscoveryRetention::owes_stamped / codex_fragment::grown); OFF
+        // (DiscoveryRetention::owes_stamped / sources::codex::eof_fragment::grown); OFF
         // selects it exactly as main does, without any v2 growth custody.
         assert!(candidate_from_traversal_path(
             SnapshotSource::ClaudeCode,

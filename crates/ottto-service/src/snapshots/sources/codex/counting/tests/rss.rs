@@ -208,10 +208,10 @@ fn grown_unretained_history_is_read_in_the_next_rss_round() {
     }
     for case in ["legacy", "v2"] {
         // AT predates the frozen cutover: Legacy is a real history decision.
-        let _cutover = codex_counting_version::TestCutover::set(if case == "v2" {
+        let _cutover = sources::codex::counting::version::TestCutover::set(if case == "v2" {
             0
         } else {
-            codex_counting_version::CODEX_COUNTING_V2_CUTOVER_UNIX_MS
+            sources::codex::counting::version::CODEX_COUNTING_V2_CUTOVER_UNIX_MS
         });
         let fixture = Fixture(std::env::temp_dir().join(format!(
             "ottto-rss-tail-regression-{}-{}-{case}",

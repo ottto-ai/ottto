@@ -244,6 +244,72 @@ class LayoutTests(unittest.TestCase):
         status, out = self.run_check('--enforce', 'sizes')
         self.assertEqual(status, 2)
 
+    def test_new_production_file_line_ceiling_and_warning(self):
+        base = self.commit()
+        for lines in (1400, 1500, 1501, 2000, 3000, 3001, 3100):
+            with self.subTest(lines=lines):
+                # Also cover additions outside the snapshots report's scope.
+                path = f'crates/demo/src/file_{lines}.rs'
+                self.write({path: '//! Module.\n' + '// Line.\n' * (lines - 1)})
+                self.commit()
+                status, out = self.run_check('--enforce-new', '--base', base)
+                self.assertEqual(status, 1 if lines > 3000 else 0, out)
+                if 1500 < lines <= 3000:
+                    self.assertIn(f'warning: {path}: new file: {lines} lines, over 1500', out)
+                elif lines <= 1500:
+                    self.assertNotIn(f'warning: {path}:', out)
+                else:
+                    self.assertIn(f'size: {path}: new file: {lines} lines, over 3000', out)
+
+    def test_new_file_cannot_use_a_limits_row_to_exempt_it(self):
+        base = self.commit()
+        path = f'{SRC}/snapshots/large.rs'
+        self.write({path: '//! Module.\n' * 3100,
+                    'scripts/source_layout_limits.tsv': f'{path}\t4000\n'})
+        self.commit()
+        status, out = self.run_check('--enforce-new', '--base', base)
+        self.assertEqual(status, 1, out)
+        self.assertIn(f'{path}: new file: 3100 lines, over 3000', out)
+
+    def test_existing_large_file_stays_report_only(self):
+        path = f'{SRC}/snapshots/wire/frame.rs'
+        self.write({path: '//! Module.\n' * 3100})
+        base = self.commit()
+        self.write({path: '//! Module.\n' * 3200})
+        self.commit()
+        status, out = self.run_check('--enforce-new', '--base', base)
+        self.assertEqual(status, 0, out)
+        self.assertIn(f'size: {path}: 3200 lines, over 3000', out)
+
+    def test_exact_move_of_large_file_stays_report_only(self):
+        old, moved = 'crates/demo/src/large.rs', f'{SRC}/snapshots/large.rs'
+        text = '//! Module.\n' * 3100
+        self.write({old: text})
+        base = self.commit()
+        self.write({old: None, moved: text})
+        self.commit()
+        self.assertIn('R100', self.git('diff', '--find-renames=100%', '--name-status', base, 'HEAD'))
+        status, out = self.run_check('--enforce-new', '--base', base)
+        self.assertEqual(status, 0, out)
+        self.assertIn(f'size: {moved}: 3100 lines, over 3000', out)
+
+    def test_new_test_files_are_excluded_from_the_ceiling(self):
+        base = self.commit()
+        paths = [f'{SRC}/snapshots/large_tests.rs', f'{SRC}/snapshots/wire/tests.rs',
+                 f'{SRC}/snapshots/tests/large.rs', 'crates/demo/tests/large.rs']
+        self.write({path: f'//! {path}.\n' * 3100 for path in paths})
+        self.commit()
+        status, out = self.run_check('--enforce-new', '--base', base)
+        self.assertEqual(status, 0, out)
+        self.assertNotIn('new file:', out)
+
+    def test_new_file_enforcement_requires_a_valid_base(self):
+        self.commit()
+        for extra in ((), ('--base', 'missing-ref')):
+            with self.subTest(extra=extra):
+                status, out = self.run_check('--enforce-new', *extra)
+                self.assertEqual(status, 2, out)
+
 
 if __name__ == '__main__':
     unittest.main()

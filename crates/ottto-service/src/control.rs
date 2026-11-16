@@ -397,19 +397,28 @@ pub fn handle_request_with_peer(
     }
 }
 
+/// The diagnostic class of a control command; counts only, no ids or args.
+pub(crate) fn control_command_class(command: &LocalControlCommand) -> &'static str {
+    match command {
+        LocalControlCommand::Status { .. } => "status",
+        LocalControlCommand::ClaudeAccountsStatus => "claude_accounts_status",
+        LocalControlCommand::CodexAccountsStatus => "codex_accounts_status",
+        LocalControlCommand::AgentStatusRefresh { .. } => "agent_status_refresh",
+        _ => "other",
+    }
+}
+
 pub fn handle_request_json_with_peer(
     daemon: &LocalDaemon,
     request_json: &str,
     peer: Option<LocalClientPeer>,
 ) -> String {
     let request = serde_json::from_str::<LocalControlRequest>(request_json);
-    crate::local_resource_diagnostics::control_class(match request.as_ref().map(|r| &r.command) {
-        Ok(LocalControlCommand::Status { .. }) => "status",
-        Ok(LocalControlCommand::ClaudeAccountsStatus) => "claude_accounts_status",
-        Ok(LocalControlCommand::CodexAccountsStatus) => "codex_accounts_status",
-        Ok(LocalControlCommand::AgentStatusRefresh { .. }) => "agent_status_refresh",
-        _ => "other",
-    });
+    crate::local_resource_diagnostics::control_class(
+        request
+            .as_ref()
+            .map_or("other", |request| control_command_class(&request.command)),
+    );
     let response = match request {
         Ok(request) => handle_request_with_peer(daemon, request, peer),
         Err(error) => LocalControlResponse {
@@ -1160,48 +1169,7 @@ fn handle_command(
         LocalControlCommand::AgentProviderImpact { query } => {
             agent_provider_impact(daemon, &authorization, query)
         }
-        LocalControlCommand::CloudMaterials { source } => {
-            cloud_command(daemon, &authorization, CloudOperation::Materials { source })
-        }
-        LocalControlCommand::CloudPlan { source, manifest } => cloud_command(
-            daemon,
-            &authorization,
-            CloudOperation::Plan { source, manifest },
-        ),
-        LocalControlCommand::CloudRegister {
-            source,
-            manifest,
-            approved,
-        } => cloud_command(
-            daemon,
-            &authorization,
-            CloudOperation::Register {
-                source,
-                manifest,
-                approved,
-            },
-        ),
-        LocalControlCommand::CloudTest { source, manifest } => cloud_command(
-            daemon,
-            &authorization,
-            CloudOperation::Test { source, manifest },
-        ),
-        LocalControlCommand::CloudSync {
-            source,
-            days,
-            approved,
-        } => cloud_command(
-            daemon,
-            &authorization,
-            CloudOperation::Sync {
-                source,
-                days,
-                approved,
-            },
-        ),
-        LocalControlCommand::CloudStatus { source } => {
-            cloud_command(daemon, &authorization, CloudOperation::Status { source })
-        }
+        LocalControlCommand::CloudStatus { source } => cloud_status(daemon, &authorization, source),
         LocalControlCommand::AuthStart => to_value(auth_start(daemon, &authorization)?),
         LocalControlCommand::AuthComplete { claim_code, nonce } => {
             to_value(auth_complete(daemon, &authorization, &claim_code, &nonce)?)
@@ -2097,7 +2065,11 @@ fn remove_claude_account(
     let _ = crate::agent_status::prune_claude_slot_collection_state(slot_id);
     let _ = crate::claude_upkeep::prune_slot_upkeep_state(slot_id);
     crate::claude_refresher::prune_slot(slot_id);
-    Ok(complete_claude_registry_mutation(status))
+    let status = complete_claude_registry_mutation(status);
+    // The Companion confirms removal from the next status pass, not after the
+    // event gap. Other registry mutations keep the ordinary request.
+    crate::agent_status_refresh::request_now(&SourceKind::ClaudeCode);
+    Ok(status)
 }
 
 pub(crate) fn remove_claude_registration_with_relay_cleanup(
@@ -3399,6 +3371,7 @@ fn remove_codex_account(
     }
     .map_err(codex_account_slot_settings_error)
     .map(crate::agent_status::annotate_codex_accounts_status)
+    .inspect(|_| crate::agent_status_refresh::request_now(&SourceKind::Codex))
 }
 
 fn codex_account_slot_settings_error(error: CodexAccountSlotSettingsError) -> LocalApiError {
@@ -3550,59 +3523,33 @@ fn observe_setup_run_read<T>(
     result
 }
 
-#[derive(Debug, Clone)]
-enum CloudOperation {
-    Materials {
-        source: String,
-    },
-    Plan {
-        source: String,
-        manifest: serde_json::Value,
-    },
-    Register {
-        source: String,
-        manifest: serde_json::Value,
-        approved: bool,
-    },
-    Test {
-        source: String,
-        manifest: Option<serde_json::Value>,
-    },
-    Sync {
-        source: String,
-        days: u8,
-        approved: bool,
-    },
-    Status {
-        source: Option<String>,
-    },
-}
-
-fn cloud_command(
+/// `ottto cloud status`: read-only connector status through the setup-run
+/// bridge. Connecting or changing a cloud connector happens in the web app.
+fn cloud_status(
     daemon: &LocalDaemon,
     authorization: &RequestAuthorization,
-    operation: CloudOperation,
+    source: Option<String>,
 ) -> Result<serde_json::Value, LocalApiError> {
-    validate_cloud_operation(&operation)?;
+    validate_cloud_status_source(source.as_deref())?;
     observe_setup_run_read(
         daemon,
         authorization,
         "ottto cloud",
-        |api_base_url, connection, setup_run_token| match cloud_request_with_base(
+        |api_base_url, connection, setup_run_token| match cloud_status_with_base(
             api_base_url,
             connection,
             setup_run_token,
-            &operation,
+            source.as_deref(),
         ) {
             Ok(value) => Ok(value),
             Err(LocalApiError::Backend(ref details)) if details.status == Some(401) => {
                 let refreshed =
                     refresh_setup_run_token_via_device_secret(api_base_url, connection)?;
-                cloud_request_with_base(
+                cloud_status_with_base(
                     api_base_url,
                     &refreshed.connection,
                     &refreshed.setup_run_token,
-                    &operation,
+                    source.as_deref(),
                 )
             }
             Err(error) => Err(error),
@@ -3610,204 +3557,33 @@ fn cloud_command(
     )
 }
 
-fn validate_cloud_operation(operation: &CloudOperation) -> Result<(), LocalApiError> {
-    let source = match operation {
-        CloudOperation::Materials { source }
-        | CloudOperation::Plan { source, .. }
-        | CloudOperation::Register { source, .. }
-        | CloudOperation::Test { source, .. }
-        | CloudOperation::Sync { source, .. } => Some(source.as_str()),
-        CloudOperation::Status { source } => source.as_deref(),
-    };
+fn validate_cloud_status_source(source: Option<&str>) -> Result<(), LocalApiError> {
     if source.is_some_and(|source| !matches!(source, "bedrock" | "vertex")) {
         return Err(LocalApiError::InvalidRequest(
             "cloud source must be bedrock or vertex".to_string(),
         ));
     }
-    match operation {
-        CloudOperation::Plan { manifest, .. } | CloudOperation::Register { manifest, .. } => {
-            validate_cloud_manifest(manifest)?
-        }
-        CloudOperation::Test {
-            manifest: Some(manifest),
-            ..
-        } => validate_cloud_manifest(manifest)?,
-        _ => {}
-    }
-    if matches!(
-        operation,
-        CloudOperation::Register {
-            approved: false,
-            ..
-        }
-    ) {
-        return Err(LocalApiError::InvalidRequest(
-            "cloud register requires explicit approval".to_string(),
-        ));
-    }
-    if let CloudOperation::Sync { days, approved, .. } = operation {
-        if !approved {
-            return Err(LocalApiError::InvalidRequest(
-                "cloud sync requires explicit approval".to_string(),
-            ));
-        }
-        if !(1..=31).contains(days) {
-            return Err(LocalApiError::InvalidRequest(
-                "cloud sync days must be between 1 and 31".to_string(),
-            ));
-        }
-    }
     Ok(())
 }
 
-fn validate_cloud_manifest(value: &serde_json::Value) -> Result<(), LocalApiError> {
-    fn is_forbidden(key: &str) -> bool {
-        let normalized = key
-            .chars()
-            .filter(|character| character.is_ascii_alphanumeric())
-            .flat_map(char::to_lowercase)
-            .collect::<String>();
-        matches!(
-            normalized.as_str(),
-            "accesskeyid"
-                | "awsaccesskeyid"
-                | "secretaccesskey"
-                | "awssecretaccesskey"
-                | "sessiontoken"
-                | "awssessiontoken"
-                | "privatekey"
-                | "clientemail"
-        )
-    }
-    fn walk(value: &serde_json::Value) -> Result<(), LocalApiError> {
-        match value {
-            serde_json::Value::Object(object) => {
-                for (key, child) in object {
-                    if is_forbidden(key) {
-                        return Err(LocalApiError::InvalidRequest(format!(
-                            "cloud manifests cannot contain secret credential field '{key}'"
-                        )));
-                    }
-                    walk(child)?;
-                }
-            }
-            serde_json::Value::Array(items) => {
-                for item in items {
-                    walk(item)?;
-                }
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-    if !value.is_object() {
-        return Err(LocalApiError::InvalidRequest(
-            "cloud manifest must contain one JSON object".to_string(),
-        ));
-    }
-    walk(value)
-}
-
-fn normalized_cloud_manifest(manifest: &serde_json::Value, registering: bool) -> serde_json::Value {
-    let mut normalized = manifest.clone();
-    if let Some(object) = normalized.as_object_mut() {
-        object.insert(
-            "scope".to_string(),
-            serde_json::Value::String("organization".to_string()),
-        );
-        if registering && !object.contains_key("is_active") {
-            object.insert("is_active".to_string(), serde_json::Value::Bool(true));
-        }
-    }
-    normalized
-}
-
-fn cloud_manifest_summary(manifest: &serde_json::Value) -> serde_json::Value {
-    let keys = |field: &str| {
-        manifest
-            .get(field)
-            .and_then(serde_json::Value::as_object)
-            .map(|object| object.keys().cloned().collect::<Vec<_>>())
-            .unwrap_or_default()
-    };
-    serde_json::json!({
-        "scope": "organization",
-        "credential_fields": keys("credentials"),
-        "config_fields": keys("config"),
-        "secret_fields_present": false,
-    })
-}
-
-fn cloud_request_with_base(
+fn cloud_status_with_base(
     api_base_url: &str,
     connection: &LocalConnectionBinding,
     setup_run_token: &str,
-    operation: &CloudOperation,
+    source: Option<&str>,
 ) -> Result<serde_json::Value, LocalApiError> {
     let header = [("X-Ottto-Setup-Run-Token", setup_run_token)];
-    let root = format!(
-        "/api/v1/setup-runs/{}/local-client/cloud",
-        connection.setup_run_id
+    let suffix = source
+        .map(|source| format!("?source={}", form_url_encode(source)))
+        .unwrap_or_default();
+    let url = api_url_with_base(
+        api_base_url,
+        &format!(
+            "/api/v1/setup-runs/{}/local-client/cloud/status{suffix}",
+            connection.setup_run_id
+        ),
     );
-    match operation {
-        CloudOperation::Materials { source } => {
-            let url = api_url_with_base(
-                api_base_url,
-                &format!("{root}/materials?source={}", form_url_encode(source)),
-            );
-            backend_get_agent_read_json(&url, &header)
-        }
-        CloudOperation::Plan { source, manifest } => {
-            let url = api_url_with_base(
-                api_base_url,
-                &format!("{root}/materials?source={}", form_url_encode(source)),
-            );
-            let materials: serde_json::Value = backend_get_agent_read_json(&url, &header)?;
-            Ok(serde_json::json!({
-                "source": source,
-                "mutation": false,
-                "approval_required_for_register": true,
-                "manifest": cloud_manifest_summary(manifest),
-                "materials": materials,
-            }))
-        }
-        CloudOperation::Register {
-            source, manifest, ..
-        } => {
-            let url = api_url_with_base(api_base_url, &format!("{root}/register/{source}"));
-            backend_post_json(&url, &normalized_cloud_manifest(manifest, true), &header)
-        }
-        CloudOperation::Test { source, manifest } => {
-            let url = api_url_with_base(api_base_url, &format!("{root}/test/{source}"));
-            let body = manifest
-                .as_ref()
-                .map(|manifest| normalized_cloud_manifest(manifest, false))
-                .unwrap_or_else(|| {
-                    serde_json::json!({
-                        "scope": "organization",
-                        "credentials": null,
-                        "config": null,
-                    })
-                });
-            backend_post_json(&url, &body, &header)
-        }
-        CloudOperation::Sync { source, days, .. } => {
-            let url = api_url_with_base(api_base_url, &format!("{root}/sync"));
-            backend_post_json(
-                &url,
-                &serde_json::json!({"source": source, "days": days}),
-                &header,
-            )
-        }
-        CloudOperation::Status { source } => {
-            let suffix = source
-                .as_ref()
-                .map(|source| format!("?source={}", form_url_encode(source)))
-                .unwrap_or_default();
-            let url = api_url_with_base(api_base_url, &format!("{root}/status{suffix}"));
-            backend_get_agent_read_json(&url, &header)
-        }
-    }
+    backend_get_agent_read_json(&url, &header)
 }
 
 fn setup_run_agent_read_binding(
@@ -9440,6 +9216,55 @@ fn setup_run_status_is_active(status: &str) -> bool {
     )
 }
 
+/// Background reconcile retry after Ottto refused the scan result with a 400:
+/// the payload is rebuilt the same way each attempt, so the refusal repeats.
+/// Still a retry, not a park: binding changes and daemon restarts reset it.
+const SETUP_RECONCILE_REFUSED_RETRY: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The observed deterministic refusal: a 400 from the scan-result route. Other
+/// statuses and routes keep their own handling or the jittered backoff.
+fn setup_reconcile_refused(error: &LocalApiError) -> bool {
+    matches!(
+        error,
+        LocalApiError::Backend(details)
+            if details.status == Some(400)
+                && setup_reconcile_route(&details.endpoint) == "scan-result"
+    )
+}
+
+/// The endpoint's last path segment (`scan-result`), or `other` when that
+/// segment is not a plain route name, so no id is logged.
+fn setup_reconcile_route(endpoint: &str) -> &str {
+    let path = endpoint.split('?').next().unwrap_or_default();
+    let last = path.rsplit('/').next().unwrap_or_default();
+    if last.len() <= 40
+        && last.starts_with(|character: char| character.is_ascii_lowercase())
+        && last
+            .chars()
+            .all(|character| character.is_ascii_lowercase() || character == '-')
+    {
+        last
+    } else {
+        "other"
+    }
+}
+
+/// ` endpoint=<route> status=<n> code=<reason>` for a backend error; empty
+/// otherwise.
+fn setup_reconcile_backend_fields(error: &LocalApiError) -> String {
+    let LocalApiError::Backend(details) = error else {
+        return String::new();
+    };
+    let mut fields = format!(" endpoint={}", setup_reconcile_route(&details.endpoint));
+    if let Some(status) = details.status {
+        fields.push_str(&format!(" status={status}"));
+    }
+    if let Some(code) = &details.reason_code {
+        fields.push_str(&format!(" code={code}"));
+    }
+    fields
+}
+
 fn setup_reconcile_status_reason(status: Option<&str>) -> String {
     format!(
         "status:{}",
@@ -9524,12 +9349,18 @@ pub(crate) fn reconcile_setup_scan_in_background(daemon: &LocalDaemon) {
             _ => Ok((true, setup_reconcile_status_reason(Some(&run.status)))),
         }
     })();
+    let mut refused = false;
+    let mut backend_fields = String::new();
     let (mut settled, mut reason) = match result {
         Ok(outcome) => outcome,
-        Err(error) => (
-            terminal_refresh_rejection(&error).is_some(),
-            format!("error:{}", setup_action_execution_error_detail(&error).0),
-        ),
+        Err(error) => {
+            refused = setup_reconcile_refused(&error);
+            backend_fields = setup_reconcile_backend_fields(&error);
+            (
+                terminal_refresh_rejection(&error).is_some(),
+                format!("error:{}", setup_action_execution_error_detail(&error).0),
+            )
+        }
     };
     if settled {
         let _binding_lock = lock_setup_run_binding();
@@ -9545,7 +9376,11 @@ pub(crate) fn reconcile_setup_scan_in_background(daemon: &LocalDaemon) {
         None
     } else {
         state.failures = attempt;
-        let delay = crate::snapshot_sync::full_jitter_backoff(state.failures);
+        let delay = if refused {
+            SETUP_RECONCILE_REFUSED_RETRY
+        } else {
+            crate::snapshot_sync::full_jitter_backoff(state.failures)
+        };
         state.next_due = Some(Instant::now() + delay);
         Some(delay.as_secs())
     };
@@ -9555,7 +9390,7 @@ pub(crate) fn reconcile_setup_scan_in_background(daemon: &LocalDaemon) {
             .map(|seconds| format!(" next_in={seconds}s"))
             .unwrap_or_default();
         eprintln!(
-            "setup reconcile attempt={attempt} outcome={outcome} reason={reason} actions={actions_processed}{next_in}"
+            "setup reconcile attempt={attempt} outcome={outcome} reason={reason}{backend_fields} actions={actions_processed}{next_in}"
         );
     }
 }
@@ -10044,6 +9879,9 @@ struct SetupScanPayload {
 #[derive(Debug, Serialize)]
 struct SetupScanSource {
     source: &'static str,
+    /// When this scan observed the source. The backend reads it before the
+    /// status row's own `captured_at`, which may be an earlier cached reading.
+    captured_at: String,
     detected: bool,
     installed: bool,
     telemetry_installed: bool,
@@ -15181,15 +15019,23 @@ fn setup_scan_source(
     local_health: &'static str,
     attribution_guess: BTreeMap<String, serde_json::Value>,
 ) -> SetupScanSource {
+    let captured_at = current_rfc3339();
+    let expires_at = rfc3339_after_minutes(AGENT_STATUS_SNAPSHOT_TTL_MINUTES)
+        .unwrap_or_else(|| captured_at.clone());
     SetupScanSource {
         source,
+        captured_at: captured_at.clone(),
         detected,
         installed,
         telemetry_installed,
         local_health,
         missing_fields: Vec::new(),
         attribution_guess,
-        agent_status: Some(local_agent_status(source_kind).redacted_for_backend()),
+        agent_status: crate::agent_status_refresh::setup_snapshot(
+            source_kind,
+            captured_at,
+            expires_at,
+        ),
         managed_config: None,
         local_import_ready: None,
         live_telemetry_required: None,
@@ -15377,13 +15223,6 @@ fn managed_config_preview(path_label: &str, body: Option<&str>) -> Option<serde_
         "captured_at": current_rfc3339(),
         "lines": redacted,
     }))
-}
-
-fn local_agent_status(source: &SourceKind) -> AgentStatusSnapshot {
-    let captured_at = current_rfc3339();
-    let expires_at = rfc3339_after_minutes(AGENT_STATUS_SNAPSHOT_TTL_MINUTES)
-        .unwrap_or_else(|| captured_at.clone());
-    crate::agent_status::collect_agent_status(source, captured_at, expires_at)
 }
 
 fn read_optional_to_string(path: &PathBuf) -> Option<String> {
@@ -19209,52 +19048,14 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn cloud_operation_rejects_secrets_and_unapproved_mutations() {
-        let secret = CloudOperation::Plan {
-            source: "vertex".to_string(),
-            manifest: serde_json::json!({"credentials": {"private_key": "nope"}}),
-        };
+    fn cloud_status_accepts_only_known_sources() {
+        assert!(validate_cloud_status_source(None).is_ok());
+        assert!(validate_cloud_status_source(Some("bedrock")).is_ok());
+        assert!(validate_cloud_status_source(Some("vertex")).is_ok());
         assert!(matches!(
-            validate_cloud_operation(&secret),
-            Err(LocalApiError::InvalidRequest(message)) if message.contains("private_key")
+            validate_cloud_status_source(Some("../register/vertex")),
+            Err(LocalApiError::InvalidRequest(message)) if message.contains("bedrock or vertex")
         ));
-        let standard_aws_secret = CloudOperation::Test {
-            source: "bedrock".to_string(),
-            manifest: Some(serde_json::json!({
-                "credentials": {"AccessKeyId": "must-not-cross"}
-            })),
-        };
-        assert!(matches!(
-            validate_cloud_operation(&standard_aws_secret),
-            Err(LocalApiError::InvalidRequest(message)) if message.contains("AccessKeyId")
-        ));
-
-        let unapproved = CloudOperation::Register {
-            source: "vertex".to_string(),
-            manifest: serde_json::json!({"credentials": {
-                "service_account_email": "reader@example.iam.gserviceaccount.com",
-                "workload_identity_provider": "projects/123/locations/global/workloadIdentityPools/ottto-cloud/providers/ottto-production"
-            }}),
-            approved: false,
-        };
-        assert!(matches!(
-            validate_cloud_operation(&unapproved),
-            Err(LocalApiError::InvalidRequest(message)) if message.contains("approval")
-        ));
-    }
-
-    #[test]
-    fn cloud_plan_summary_never_echoes_manifest_values() {
-        let manifest = serde_json::json!({
-            "credentials": {"role_arn": "arn:aws:iam::123456789012:role/OtttoRead"},
-            "config": {"region": "us-east-1"}
-        });
-        let summary = cloud_manifest_summary(&manifest);
-        let rendered = summary.to_string();
-        assert!(rendered.contains("role_arn"));
-        assert!(!rendered.contains("123456789012"));
-        assert!(!rendered.contains("us-east-1"));
-        assert_eq!(summary["secret_fields_present"], false);
     }
     use crate::agent_status::PiRouteClassification;
 
@@ -22588,6 +22389,143 @@ for line in sys.stdin:
             assert_eq!(state.failures, u32::from(!settled));
             assert_eq!(state.next_due.is_some(), !settled);
         }
+    }
+
+    /// [behaviour] A scan-result 400 waits a day; other refusals and transient failures keep jitter.
+    #[test]
+    #[serial]
+    fn background_setup_scan_refusal_backs_off_a_day() {
+        let _lock = lock_backend_test_env();
+        let jitter_ceiling = Duration::from_secs(60);
+        let scanning = (200, scan_refresh("scanning"));
+        for (answers, day) in [
+            (
+                vec![scanning, (400, r#"{"detail":"scan_payload_invalid"}"#)],
+                true,
+            ),
+            (vec![scanning, (422, "{}")], false),
+            (vec![scanning, (503, "{}")], false),
+            (vec![(400, "{}")], false),
+        ] {
+            let route = if answers.len() == 2 {
+                "/scan-result "
+            } else {
+                "/refresh "
+            };
+            let (base, server) = scripted_json_backend(answers);
+            let (_root, _guards, daemon, _) = scan_fixture(base);
+            let before = Instant::now();
+            reconcile_setup_scan_in_background(&daemon);
+            let requests = server.join().unwrap();
+            assert!(requests.last().unwrap().contains(route));
+            assert!(FileConnectionStore::default()
+                .setup_scan_settled_run_id()
+                .unwrap()
+                .is_none());
+            let state = SETUP_SCAN.lock().unwrap();
+            assert_eq!(state.failures, 1);
+            let wait = state.next_due.unwrap() - before;
+            if day {
+                assert!(wait >= SETUP_RECONCILE_REFUSED_RETRY, "{route}: {wait:?}");
+                assert!(wait < SETUP_RECONCILE_REFUSED_RETRY + jitter_ceiling);
+            } else {
+                assert!(wait <= jitter_ceiling, "{route}: {wait:?}");
+            }
+        }
+
+        // A network failure keeps the jittered backoff.
+        let closed = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let (_root, _guards, daemon, _) = scan_fixture(format!("http://{closed}"));
+        let before = Instant::now();
+        reconcile_setup_scan_in_background(&daemon);
+        let state = SETUP_SCAN.lock().unwrap();
+        assert_eq!(state.failures, 1);
+        assert!(state.next_due.unwrap() - before <= jitter_ceiling);
+    }
+
+    /// [behaviour] A new setup run is not held behind the old run's refusal backoff.
+    #[test]
+    #[serial]
+    fn background_setup_scan_refusal_resets_on_new_setup_run() {
+        let _lock = lock_backend_test_env();
+        let (base, server) = scripted_json_backend(vec![
+            (200, scan_refresh("scanning")),
+            (400, "{}"),
+            (503, "{}"),
+        ]);
+        let (_root, _guards, daemon, _) = scan_fixture(base);
+        reconcile_setup_scan_in_background(&daemon);
+        // Still inside the refusal window: no request.
+        reconcile_setup_scan_in_background(&daemon);
+        let store = FileConnectionStore::default();
+        let mut replacement = store.load().unwrap().unwrap();
+        replacement.setup_run_id = "replacement-run".into();
+        store.save(&replacement).unwrap();
+        let before = Instant::now();
+        reconcile_setup_scan_in_background(&daemon);
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[2].contains("/replacement-run/local-client/refresh "));
+        let state = SETUP_SCAN.lock().unwrap();
+        assert_eq!(
+            state.binding,
+            Some((replacement.api_base_url, "replacement-run".to_string()))
+        );
+        assert_eq!(state.failures, 1);
+        assert!(state.next_due.unwrap() - before <= Duration::from_secs(60));
+    }
+
+    /// [privacy] The reconcile log names a route label, status and code; only a scan-result 400 is a refusal.
+    #[test]
+    fn setup_reconcile_refusal_class_and_log_fields() {
+        let error = |endpoint: &str, status, reason_code: Option<&str>| {
+            LocalApiError::Backend(BackendErrorDetails {
+                kind: BackendErrorKind::Rejected,
+                endpoint: safe_backend_endpoint(endpoint),
+                status,
+                body_excerpt: Some("synthetic body text".to_string()),
+                reason_code: reason_code.map(str::to_string),
+            })
+        };
+        assert_eq!(
+            setup_reconcile_backend_fields(&error(
+                "https://api.example.test/api/v1/setup-runs/run_ab12/local-client/scan-result?x=1",
+                Some(400),
+                Some("scan_payload_invalid"),
+            )),
+            " endpoint=scan-result status=400 code=scan_payload_invalid"
+        );
+        assert_eq!(
+            setup_reconcile_backend_fields(&error("/api/v1/setup-runs/run_ab12", None, None)),
+            " endpoint=other"
+        );
+        assert_eq!(
+            setup_reconcile_backend_fields(&LocalApiError::NetworkUnavailable),
+            ""
+        );
+        let scan_result = "/api/v1/setup-runs/run_ab12/local-client/scan-result";
+        assert!(setup_reconcile_refused(&error(
+            scan_result,
+            Some(400),
+            None
+        )));
+        for status in [
+            None,
+            Some(401),
+            Some(404),
+            Some(409),
+            Some(410),
+            Some(422),
+            Some(503),
+        ] {
+            assert!(!setup_reconcile_refused(&error(scan_result, status, None)));
+        }
+        let complete = "/api/v1/setup-runs/run_ab12/local-client/actions/act_9/complete";
+        assert!(!setup_reconcile_refused(&error(complete, Some(400), None)));
+        assert!(!setup_reconcile_refused(&LocalApiError::NetworkUnavailable));
     }
 
     /// [behaviour] One completed action and its final idle poll settle in one attempt.
@@ -29869,9 +29807,17 @@ X-API-Key = "otel_redacted"
         provision_managed_claude_relay_settings(dir).unwrap();
         let path = Path::new(dir).join("settings.json");
         let original = fs::read(&path).unwrap();
-        assert!(remove_claude_account(999, &slot.slot_id).is_err());
+        let (failed, requested) = crate::agent_status_refresh::with_test_requests_now(|| {
+            remove_claude_account(999, &slot.slot_id)
+        });
+        assert!(failed.is_err());
+        assert!(requested.is_empty());
         assert_eq!(fs::read(&path).unwrap(), original);
-        remove_claude_account(1, &slot.slot_id).unwrap();
+        let (removed, requested) = crate::agent_status_refresh::with_test_requests_now(|| {
+            remove_claude_account(1, &slot.slot_id)
+        });
+        removed.unwrap();
+        assert_eq!(requested, vec![SourceKind::ClaudeCode]);
         assert!(Path::new(dir).is_dir());
         let removed: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(removed["env"], json!({}));
@@ -30140,6 +30086,52 @@ X-API-Key = "otel_redacted"
         assert!(build_local_scan(&test_machine(), vec![SourceKind::Codex])
             .sources
             .is_empty());
+    }
+
+    /// Each scan source carries the scan's own time beside the selected
+    /// status row, whose own (cached) captured_at is left as it was.
+    #[test]
+    #[serial]
+    fn setup_scan_sources_carry_scan_time_and_the_selected_status_row() {
+        let _lock = lock_backend_test_env();
+        let root = control_test_root("setup-scan-selected-status");
+        let _home = EnvVarGuard::set_path("HOME", &root);
+        let _commands = EnvVarGuard::set_path("OTTTO_COMMAND_SEARCH_PATH", &root.join("bin"));
+        let _support =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root.join("support"));
+        let _secret = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &root.join("secrets"));
+        let cached: AgentStatusSnapshot = serde_json::from_value(json!({
+            "source": "pi", "status": "available", "collection_method": "config_file",
+            "captured_at": "2026-11-13T00:00:00Z", "expires_at": "2026-11-13T00:15:00Z",
+        }))
+        .unwrap();
+        let collection = crate::agent_status::AgentStatusCollection {
+            snapshots: vec![cached.clone()],
+            source_health_snapshot: cached.clone(),
+            codex_scan_homes: Vec::new(),
+            codex_home_bindings: Vec::new(),
+            setup_snapshot_index: Some(0),
+        };
+        let scan = crate::agent_status_refresh::with_collection(collection, || {
+            build_local_scan(&test_machine(), vec![])
+        });
+        let scan = serde_json::to_value(&scan).unwrap();
+        let sources = scan["sources"].as_array().unwrap();
+        assert_eq!(sources.len(), 3);
+        for source in sources {
+            let captured_at = source["captured_at"].as_str().expect("scan time");
+            assert!(time::OffsetDateTime::parse(
+                captured_at,
+                &time::format_description::well_known::Rfc3339
+            )
+            .is_ok());
+            assert_ne!(captured_at, "2026-11-13T00:00:00Z");
+            assert_eq!(
+                source["agent_status"],
+                serde_json::to_value(cached.clone().redacted_for_backend()).unwrap()
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

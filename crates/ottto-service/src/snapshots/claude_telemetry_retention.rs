@@ -38,7 +38,7 @@ fn root_of(key: &str) -> Option<&str> {
 
 /// The keys the roster's walk listed, less this pass's removed keys.
 fn listed_keys<'a>(
-    roster: &'a g7_debt::Roster,
+    roster: &'a upload::freshness_debt::Roster,
     removed: &'a BTreeSet<String>,
 ) -> impl Iterator<Item = &'a String> {
     roster.listed.keys().filter(|key| !removed.contains(*key))
@@ -161,7 +161,7 @@ fn retire(
     scan_roots: &[PathBuf],
     removed: &BTreeSet<String>,
     named: &[String],
-    roster: &g7_debt::Roster,
+    roster: &upload::freshness_debt::Roster,
     stems: BTreeSet<String>,
 ) -> Counts {
     let mut run = Counts::default();
@@ -217,7 +217,7 @@ fn protected_stems(
     scan_roots: &[PathBuf],
     removed: &BTreeSet<String>,
     named: &[String],
-    roster: &g7_debt::Roster,
+    roster: &upload::freshness_debt::Roster,
 ) -> Option<BTreeSet<String>> {
     let heads = state_v2::tail_head_keys(index).ok()?;
     // Witnessed families with their legacy owners.
@@ -263,7 +263,7 @@ fn protected_stems(
 fn copied_candidates(
     index: &ScanIndex,
     removed: &BTreeSet<String>,
-    roster: &g7_debt::Roster,
+    roster: &upload::freshness_debt::Roster,
     candidates: &[(String, crate::claude_local_otel::TelemetryPair)],
 ) -> Vec<bool> {
     if candidates.is_empty() {

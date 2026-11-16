@@ -133,6 +133,18 @@ impl StatusLane {
             self.changed.notify_all();
         }
     }
+    fn request_now(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.stopped {
+            // An active collection may have read the old registry. Keep one
+            // trailing pass rather than sharing that collection.
+            state.manual = true;
+            self.changed.notify_all();
+        }
+    }
     fn wake_if_stale(&self, now: Duration, wall_now: OffsetDateTime) {
         let mut state = self
             .state
@@ -594,6 +606,30 @@ pub(crate) fn collection(
         ))),
     }
 }
+/// The setup scan's status row for `source`: the row the upload selected for
+/// the default login in the lane's collection (warm, shared in flight, or one
+/// pass of the existing owner), redacted for the backend. An acquisition error
+/// or no selected row omits it; cached data keeps its own timestamps.
+pub(crate) fn setup_snapshot(
+    source: &SourceKind,
+    captured_at: String,
+    expires_at: String,
+) -> Option<ottto_protocol::AgentStatusSnapshot> {
+    setup_snapshot_of(collection(source, captured_at, expires_at, false))
+}
+
+fn setup_snapshot_of(
+    collection: Result<Arc<AgentStatusCollection>, LocalApiError>,
+) -> Option<ottto_protocol::AgentStatusSnapshot> {
+    Some(
+        collection
+            .ok()?
+            .setup_snapshot()?
+            .clone()
+            .redacted_for_backend(),
+    )
+}
+
 /// Revalidate the existing local auth-file witness immediately before binding
 /// scanned sessions. A cached provider reading cannot attest a later login.
 /// Missing/changed witnesses withhold new ownership; persisted session ownership
@@ -646,6 +682,28 @@ pub(crate) fn active() -> bool {
 
 #[cfg(test)]
 thread_local! {
+    static TEST_REQUESTS_NOW: std::cell::RefCell<Option<Vec<SourceKind>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Record this thread's `request_now` sources instead of reaching the owner.
+#[cfg(test)]
+pub(crate) fn with_test_requests_now<T>(run: impl FnOnce() -> T) -> (T, Vec<SourceKind>) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_REQUESTS_NOW.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+    TEST_REQUESTS_NOW.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+    let _reset = Reset;
+    let value = run();
+    let requested = TEST_REQUESTS_NOW.with(|slot| slot.borrow_mut().take().unwrap_or_default());
+    (value, requested)
+}
+
+#[cfg(test)]
+thread_local! {
     static SCOPED_COLLECTION: std::cell::RefCell<Option<Arc<AgentStatusCollection>>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -674,6 +732,21 @@ pub(crate) fn with_test_collection<T>(
 pub fn request(source: &SourceKind) {
     if let Some(owner) = owner() {
         owner.lanes[index(source)].request();
+    }
+}
+/// Request a fresh pass without waiting for collection or the event gap.
+pub fn request_now(source: &SourceKind) {
+    #[cfg(test)]
+    if TEST_REQUESTS_NOW.with(|slot| {
+        slot.borrow_mut()
+            .as_mut()
+            .map(|requests| requests.push(source.clone()))
+            .is_some()
+    }) {
+        return;
+    }
+    if let Some(owner) = owner() {
+        owner.lanes[index(source)].request_now();
     }
 }
 pub fn request_all() {
@@ -719,6 +792,7 @@ mod tests {
             source_health_snapshot: snapshot,
             codex_scan_homes: Vec::new(),
             codex_home_bindings: Vec::new(),
+            setup_snapshot_index: Some(0),
         }
     }
     fn seconds(n: u64) -> Duration {
@@ -908,6 +982,111 @@ mod tests {
         assert!(Arc::ptr_eq(&observed, &again));
         assert_eq!(lane.state.lock().unwrap().generation, 1);
         assert!(!lane.state.lock().unwrap().manual);
+    }
+    /// [regress] Removing a saved account needs a fresh collection before
+    /// the event gap expires, including when automatic refresh is paused.
+    #[test]
+    fn request_now_collects_fresh_before_event_gap_even_when_paused() {
+        for automatic_enabled in [true, false] {
+            let lane = StatusLane::for_source(&SourceKind::Codex);
+            assert!(pass(&lane, 0, 0, true));
+            let old = lane.cached().unwrap();
+            lane.request();
+            assert!(!pass(&lane, 1, 1, true));
+            lane.request_now();
+            assert!(lane.pass(
+                seconds(1),
+                automatic_enabled,
+                || {
+                    let mut fresh = specimen(SourceKind::Codex);
+                    fresh.source_health_snapshot.captured_at = "2026-10-05T00:00:01Z".into();
+                    fresh
+                },
+                |_| true,
+                || seconds(1),
+            ));
+            let fresh = lane.cached().unwrap();
+            assert!(!Arc::ptr_eq(&old, &fresh));
+            assert_eq!(
+                fresh.source_health_snapshot.captured_at,
+                "2026-10-05T00:00:01Z"
+            );
+            assert!(!pass(&lane, 2, 2, true));
+        }
+    }
+    /// [regress] A removal during collection queues exactly one trailing
+    /// collection because the active pass may have read the removed account.
+    #[test]
+    fn request_now_during_collection_queues_one_fresh_trailing_pass() {
+        let lane = StatusLane::for_source(&SourceKind::Codex);
+        assert!(lane.pass(
+            Duration::ZERO,
+            true,
+            || {
+                lane.request_now();
+                lane.request_now();
+                specimen(SourceKind::Codex)
+            },
+            |_| true,
+            || seconds(1),
+        ));
+        let old = lane.cached().unwrap();
+        assert!(lane.pass(
+            seconds(1),
+            true,
+            || {
+                let mut fresh = specimen(SourceKind::Codex);
+                fresh.source_health_snapshot.captured_at = "2026-10-05T00:00:01Z".into();
+                fresh
+            },
+            |_| true,
+            || seconds(2),
+        ));
+        let fresh = lane.cached().unwrap();
+        assert!(!Arc::ptr_eq(&old, &fresh));
+        assert_eq!(
+            fresh.source_health_snapshot.captured_at,
+            "2026-10-05T00:00:01Z"
+        );
+        assert_eq!(lane.state.lock().unwrap().generation, 2);
+        assert!(!pass(&lane, 2, 2, true));
+    }
+    /// [regress] A Claude removal during a timer pass queues one trailing
+    /// pass that serves saved readings, uploads nothing and keeps the timer.
+    #[test]
+    fn claude_request_now_during_collection_queues_one_saved_only_pass() {
+        let lane = StatusLane::for_source(&SourceKind::ClaudeCode);
+        let uploads = std::cell::Cell::new(0);
+        let run = |at: u64, saved_only: bool, removal: bool| {
+            lane.pass(
+                seconds(at),
+                true,
+                || {
+                    assert_eq!(
+                        crate::agent_status::claude_pass_saved_only(),
+                        saved_only,
+                        "pass at {at}"
+                    );
+                    if removal {
+                        lane.request_now();
+                        lane.request_now();
+                    }
+                    specimen(SourceKind::ClaudeCode)
+                },
+                |_| {
+                    uploads.set(uploads.get() + 1);
+                    true
+                },
+                || seconds(at + 1),
+            )
+        };
+        assert!(run(0, false, true));
+        assert_eq!(uploads.get(), 1);
+        assert!(run(1, true, false));
+        assert_eq!(uploads.get(), 1, "the trailing pass uploads nothing");
+        assert_eq!(lane.state.lock().unwrap().generation, 2);
+        assert_eq!(lane.state.lock().unwrap().schedule.next_due, seconds(300));
+        assert!(!run(2, true, false));
     }
     #[test]
     fn event_storm_is_one_trailing_pass_and_wake_is_interruptible() {
@@ -1355,6 +1534,25 @@ mod tests {
         ));
         assert_eq!(lane.state.lock().unwrap().generation, 1);
         assert_eq!(lane.state.lock().unwrap().schedule.next_due, seconds(300));
+    }
+    /// The setup scan omits its status row when the lane's acquisition failed
+    /// or stopped, or the collection selected no row; no retry, no fallback.
+    #[test]
+    fn setup_scan_omits_status_on_lane_error_or_no_selected_row() {
+        let mut unselected = specimen(SourceKind::Pi);
+        unselected.setup_snapshot_index = None;
+        assert!(setup_snapshot_of(Ok(Arc::new(unselected))).is_none());
+        let lane = StatusLane::new();
+        assert!(lane.pass(
+            Duration::ZERO,
+            true,
+            || panic!("synthetic acquisition panic"),
+            |_| false,
+            || seconds(7)
+        ));
+        assert!(setup_snapshot_of(lane.collection_at(seconds(8), false)).is_none());
+        lane.stop();
+        assert!(setup_snapshot_of(lane.collection_at(seconds(9), false)).is_none());
     }
     #[test]
     fn explicit_manual_refresh_can_recover_acquisition_during_backoff() {

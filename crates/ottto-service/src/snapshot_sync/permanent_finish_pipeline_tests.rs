@@ -306,6 +306,7 @@ fn permanent_finish_pipeline(outcome: FinishOutcome) {
         source_health_snapshot: test_agent_status(SourceKind::ClaudeCode),
         codex_scan_homes: Vec::new(),
         codex_home_bindings: Vec::new(),
+        setup_snapshot_index: None,
     };
     let cycles = if outcome.retains_refusal_across_quiet_cycles() {
         3
@@ -689,6 +690,7 @@ fn permanent_finish_dominated_refusal_with_pending_newer_body_is_not_success() {
         source_health_snapshot: test_agent_status(SourceKind::ClaudeCode),
         codex_scan_homes: Vec::new(),
         codex_home_bindings: Vec::new(),
+        setup_snapshot_index: None,
     };
     for cycle in 0..3 {
         cadence.next_due_cycle();
@@ -1024,6 +1026,7 @@ impl AckFinishHome {
             source_health_snapshot: test_agent_status(SourceKind::ClaudeCode),
             codex_scan_homes: Vec::new(),
             codex_home_bindings: Vec::new(),
+            setup_snapshot_index: None,
         }
     }
 

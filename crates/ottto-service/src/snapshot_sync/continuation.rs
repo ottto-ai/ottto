@@ -75,20 +75,50 @@ fn resident_pacing(power: PlatformState) -> Option<ContinuationPacing> {
         PlatformState::Refused | PlatformState::Unknown => None,
     }
 }
-pub(super) fn resident_background() -> Option<MacPlatformSignals> {
-    resident_pacing(MacPlatformSignals::default().power())?;
-    MacPlatformSignals::background()
+/// The QoS a due paced pass runs at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PassQos {
+    Background,
+    /// The thread's default QoS: a first-import pass on AC.
+    Default,
+    /// Refused or unknown power: the source's paced request is cleared.
+    Cleared,
+}
+/// The one rule: only a first-import request on AC skips background QoS.
+pub(super) fn paced_pass_qos(power: PlatformState, first_import: bool) -> PassQos {
+    match power {
+        PlatformState::Allowed if first_import => PassQos::Default,
+        PlatformState::Allowed | PlatformState::Battery => PassQos::Background,
+        PlatformState::Refused | PlatformState::Unknown => PassQos::Cleared,
+    }
+}
+thread_local! {
+    /// This owner thread's current pass took [`PassQos::Default`]; diagnostics only.
+    static FIRST_IMPORT_DEFAULT_QOS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+pub(crate) fn first_import_default_qos() -> bool {
+    FIRST_IMPORT_DEFAULT_QOS.get()
 }
 /// Background QoS for one source's ordinary pass, only while THAT source's
 /// paced scan is due; a refused entry clears only that source's request.
 pub(super) fn paced_source_qos(
     source: SnapshotSource,
+    power: impl FnOnce() -> PlatformState,
     background: impl FnOnce() -> Option<MacPlatformSignals>,
 ) -> Option<MacPlatformSignals> {
+    FIRST_IMPORT_DEFAULT_QOS.set(false);
     if !source_paced_due(source).is_some_and(|due| due <= crate::scan_clock::now()) {
         return None;
     }
-    let qos = background();
+    let first_import = with_source_cadence(source, |c| c.paced_first_import()) == Some(true);
+    let qos = match paced_pass_qos(power(), first_import) {
+        PassQos::Default => {
+            FIRST_IMPORT_DEFAULT_QOS.set(true);
+            return None;
+        }
+        PassQos::Background => background(),
+        PassQos::Cleared => None,
+    };
     if qos.is_none() {
         with_source_cadence(source, SourceCadence::clear_continuation);
     }
@@ -97,7 +127,13 @@ pub(super) fn paced_source_qos(
 /// Shared ordinary-owner entry seam; preserve drop-before-enter ordering.
 pub(super) fn enter_source_qos(slot: &mut Option<MacPlatformSignals>, source: SnapshotSource) {
     drop(slot.take());
-    *slot = paced_source_qos(source, resident_background);
+    let power = || MacPlatformSignals::default().power();
+    *slot = paced_source_qos(source, power, MacPlatformSignals::background);
+}
+/// The ordinary-owner exit seam: drop the pass's QoS and its row flag.
+pub(super) fn leave_source_qos(slot: &mut Option<MacPlatformSignals>) {
+    drop(slot.take());
+    FIRST_IMPORT_DEFAULT_QOS.set(false);
 }
 /// A spent byte budget asks only during the source's first backfill.
 pub(super) fn resident_scan_requested(scan: &SourceScanResult, first_read_bootstrap: bool) -> bool {
@@ -106,10 +142,11 @@ pub(super) fn resident_scan_requested(scan: &SourceScanResult, first_read_bootst
             && ((scan.page_file_limit_hit && !scan.routine_recensus)
                 || (first_read_bootstrap && scan.page_byte_budget_hit)))
 }
-pub(super) fn request_resident_scan(source: SnapshotSource) {
+pub(super) fn request_resident_scan(source: SnapshotSource, first_import: bool) {
     if let Some(pacing) = resident_pacing(MacPlatformSignals::default().power()) {
         with_source_cadence(source, |cadence| {
-            cadence.request_paced_scan(crate::scan_clock::now(), Duration::ZERO, pacing)
+            let now = crate::scan_clock::now();
+            cadence.request_paced_scan(now, Duration::ZERO, pacing, first_import)
         });
     }
 }
