@@ -214,6 +214,8 @@ fn owner_return_preserves_all_source_carry() {
         forget_carried_namespaces_for_test(&["return-a", "return-b", "return-a-again"]);
         let fixture = IdentityPipelineHome::new();
         let cadence = IdentityPipelineCadence::new();
+        let _codex_cadence = IdentityPipelineCadence::for_source("codex");
+        let _pi_cadence = IdentityPipelineCadence::for_source("pi");
         let support = fixture.base.join("return-support");
         let secrets = fixture.base.join("return-secrets");
         std::fs::create_dir_all(&secrets).unwrap();
