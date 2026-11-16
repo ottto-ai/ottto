@@ -30,9 +30,9 @@ pub const CLAUDE_ANCHOR_TARGET_CONTROL_PROTOCOL_VERSION: u16 = 19;
 /// The v18/v19 prepare and reconnect commands retain their terminal-only side
 /// effects; only explicit v23 commands may start `claude auth login`.
 pub const CLAUDE_BROWSER_AUTH_CONTROL_PROTOCOL_VERSION: u16 = 23;
-/// Command-scoped version for submitting a one-time Claude authorization code
-/// to an already-running provider-owned browser ceremony. The code is accepted
-/// only for the exact active operation that explicitly requested it.
+/// Retired command-scoped version of the former Claude authorization-code
+/// submission. It is recognized only so a request from an older client gets a
+/// structured, authorized rejection; no command at this version is accepted.
 pub const CLAUDE_AUTH_CODE_CONTROL_PROTOCOL_VERSION: u16 = 25;
 /// Command-scoped version for the machine-local Codex durable-account registry.
 /// v21 adds daemon-authored workspace targets and target-bound setup. v24 makes
@@ -3116,7 +3116,7 @@ pub fn expected_local_control_protocol_version(command: &LocalControlCommand) ->
         | LocalControlCommand::ClaudeAccountStartBrowserReconnect { .. } => {
             CLAUDE_BROWSER_AUTH_CONTROL_PROTOCOL_VERSION
         }
-        LocalControlCommand::ClaudeAccountSubmitAuthCode { .. } => {
+        LocalControlCommand::RetiredClaudeAccountSubmitAuthCode {} => {
             CLAUDE_AUTH_CODE_CONTROL_PROTOCOL_VERSION
         }
         LocalControlCommand::CodexAccountsStatus
@@ -3226,15 +3226,19 @@ pub enum ClaudeBrowserAuthPhaseV1 {
     Prepared,
     Launching,
     WaitingForProvider,
+    /// Legacy value from the retired in-app code entry. Still decoded from
+    /// persisted operations and older daemons; never emitted.
     WaitingForCode,
+    /// Legacy value from the retired in-app code entry. Still decoded from
+    /// persisted operations and older daemons; never emitted.
     SubmittingCode,
     Validating,
     Reading,
     Complete,
 }
 
-/// Safe UI feedback from the provider's explicit authorization-code prompt.
-/// The submitted value and raw provider output never enter this contract.
+/// Legacy UI feedback from the retired in-app code entry. Kept so older daemon
+/// payloads still decode; current daemons never emit it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClaudeBrowserAuthCodeErrorV1 {
@@ -3698,8 +3702,9 @@ pub struct ClaudeAccountsStatusV1 {
     /// Older daemons omit it; older clients ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser_auth_supported: Option<bool>,
-    /// Presence is the capability bit for v25 in-app authorization-code entry.
-    /// The code itself is accepted only by authenticated local control.
+    /// Legacy capability bit for the retired v25 in-app authorization-code
+    /// entry. Older clients still gate browser reopen/retry on it, so daemons
+    /// keep reporting it; current clients ignore it and no code is accepted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_code_entry_supported: Option<bool>,
     /// Identifier-free count of unclaimed provisional roots retained for safe
@@ -4373,13 +4378,11 @@ pub enum LocalControlCommand {
         slot_id: String,
         target_id: String,
     },
-    /// v25 one-time authorization code for the exact active Claude ceremony.
-    /// `SecretString` redacts debug output and zeroizes its allocation on drop.
-    ClaudeAccountSubmitAuthCode {
-        schema_version: u16,
-        operation_id: String,
-        code: SecretString,
-    },
+    /// Retired v25 authorization-code submission. It carries no fields: any
+    /// fields an older client still sends are ignored, never retained. The
+    /// daemon answers an authorized request with a structured rejection.
+    #[serde(rename = "claude_account_submit_auth_code")]
+    RetiredClaudeAccountSubmitAuthCode {},
     /// Read machine-local Codex durable-account state.
     CodexAccountsStatus,
     /// Create one opaque Codex home and return its official CLI login command.
@@ -6521,7 +6524,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_auth_code_submission_is_exactly_scoped_to_protocol_v25_and_redacted() {
+    fn retired_claude_auth_code_command_is_fieldless_and_v25_only() {
         let wire = serde_json::json!({
             "request_id": "req_claude_code",
             "protocol_version": CLAUDE_AUTH_CODE_CONTROL_PROTOCOL_VERSION,
@@ -6531,23 +6534,29 @@ mod tests {
             "code": "fixture-one-time-code"
         });
         let request = serde_json::from_value::<LocalControlRequest>(wire.clone())
-            .expect("authorization code accepts v25");
-        match &request.command {
-            LocalControlCommand::ClaudeAccountSubmitAuthCode {
-                schema_version,
-                operation_id,
-                code,
-            } => {
-                assert_eq!(*schema_version, 1);
-                assert_eq!(
-                    operation_id,
-                    "claude_setup_0123456789abcdef0123456789abcdef"
-                );
-                assert_eq!(code.expose_secret(), "fixture-one-time-code");
-            }
-            _ => panic!("wrong command"),
-        }
+            .expect("an older client's v25 request still decodes");
+        assert_eq!(
+            request.command,
+            LocalControlCommand::RetiredClaudeAccountSubmitAuthCode {}
+        );
         assert!(!format!("{request:?}").contains("fixture-one-time-code"));
+        let reserialized = serde_json::to_value(&request).expect("serialize");
+        assert_eq!(reserialized["command"], "claude_account_submit_auth_code");
+        for dropped in ["code", "operation_id", "schema_version"] {
+            assert!(reserialized.get(dropped).is_none(), "kept {dropped}");
+        }
+        assert!(!reserialized.to_string().contains("fixture-one-time-code"));
+
+        let mut fieldless = wire.clone();
+        for field in ["code", "operation_id", "schema_version"] {
+            fieldless.as_object_mut().expect("object").remove(field);
+        }
+        assert_eq!(
+            serde_json::from_value::<LocalControlRequest>(fieldless)
+                .expect("fieldless retired request")
+                .command,
+            LocalControlCommand::RetiredClaudeAccountSubmitAuthCode {}
+        );
 
         for wrong in [
             LOCAL_CONTROL_PROTOCOL_VERSION,
@@ -6559,8 +6568,9 @@ mod tests {
             let mut stale = wire.clone();
             stale["protocol_version"] = serde_json::json!(wrong);
             let error = serde_json::from_value::<LocalControlRequest>(stale)
-                .expect_err("authorization code must reject every other protocol");
+                .expect_err("the retired command keeps its exact v25 scope");
             assert!(error.to_string().contains("expected 25"));
+            assert!(!error.to_string().contains("fixture-one-time-code"));
         }
     }
 
