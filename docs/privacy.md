@@ -363,6 +363,20 @@ setting, exclude the account signed in to Codex's default sign-in there, or
 create `~/Library/Application Support/Ottto/codex-daily-aggregates-disabled` to
 stop reads on this Mac.
 
+Claude Code runs started by the daemon: while **Keep my Claude accounts signed
+in** is on (it is on until you turn it off), when a Claude login's access token
+is within five minutes of expiring or has expired, the daemon runs
+`claude -p /usage --no-session-persistence --strict-mcp-config` once for that
+login, pinned to that login's Claude configuration folder; it sends no prompt
+and saves no session, Claude Code only refreshes the sign-in and reads plan
+usage, and turning the setting off stops it. Verify (in the Ottto app, during
+setup, or `ottto verify`) runs `claude -p "Reply with exactly: ottto smoke
+test"` on Claude Code's default sign-in, with every tool disallowed and no
+session saved, never from 15 minutes before that login's access expiry until
+it is refreshed; while a verification stays failed, the daemon repeats it after
+2, 4, 8 and 16 minutes and then every 30 minutes, and after a sign-in failure
+it waits until the Claude sign-in changes.
+
 ## Readable Labels
 
 The **Readable labels** setting applies only to what is uploaded. Local data stays
