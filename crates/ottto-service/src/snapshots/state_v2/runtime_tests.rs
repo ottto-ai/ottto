@@ -442,6 +442,24 @@ fn another_graph_save_cannot_advance_a_stale_external_guard() {
     crate::snapshots::state_v2_side_effect_guard(&f.path, &first)().unwrap();
 }
 
+#[test]
+fn claim_only_save_retains_the_committed_ownership_baseline() {
+    let f = Fixture::new();
+    f.published();
+    let mut index = load_with(&f.path, false).unwrap().unwrap();
+    assert!(save_with_mode(&f.path, &mut index, true).unwrap());
+    with_state(&f.path, |state| {
+        assert_eq!(
+            state.save_digests.as_ref().map(|b| b.generation),
+            Some(G + 1)
+        );
+        Ok(())
+    })
+    .unwrap();
+    assert!(save_with(&f.path, &mut index).unwrap());
+    assert_eq!(index.generation, G + 2);
+}
+
 /// [format] real mapper runtime saves admitted state and keeps runtime policy.
 #[test]
 fn real_mapper_runtime_saves_admitted_state_and_keeps_runtime_policy() {

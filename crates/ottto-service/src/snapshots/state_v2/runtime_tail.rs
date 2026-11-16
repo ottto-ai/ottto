@@ -24,7 +24,7 @@ pub(in crate::snapshots) fn carry_tail(
                 Some(previous) => previous,
                 None => {
                     let (committed, mut cx) = import::hydrate_context(&mut session.db)?;
-                    let previous = kinds::baseline(&committed, &mut cx)?;
+                    let previous = import::baseline(&mut session.db, &committed, &mut cx)?;
                     session.cx = cx;
                     previous
                 }
@@ -172,31 +172,13 @@ pub(in crate::snapshots) fn load_head(
         super::super::tail::load_head(tx, key.as_bytes(), revision, stamp.0)
     })
 }
-/// Batch scan-time session links; never called while a save owns the session.
-pub(in crate::snapshots) fn claude_head_sessions(
-    index: &ScanIndex,
-    keys: &[&str],
-) -> BTreeMap<String, String> {
-    use super::super::super::tail_source::{self, claude::Claude, TailSource};
-    if keys.is_empty() {
-        return BTreeMap::new();
-    }
-    read_txn_at(index, |tx, stamp| {
-        let mut sessions = BTreeMap::new();
-        for &key in keys {
-            if let Some(head) = super::super::tail::load_head(
-                tx,
-                key.as_bytes(),
-                Claude::REDUCTION_REVISION,
-                stamp.0,
-            )? && let Some(session) = tail_source::claude_head_session(head.revision, &head.body)
-            {
-                sessions.insert(key.to_owned(), session);
-            }
-        }
-        Ok(sessions)
+pub(in crate::snapshots) fn carried_sessions(index: &ScanIndex, keys: &[&str]) -> Option<Links> {
+    let path = runtime_path(index).ok()??;
+    with_state(&path, |s| {
+        let baseline = s.save_digests.as_ref();
+        Ok(baseline.map(|b| b.copy_ownership.sessions(index, keys)))
     })
-    .unwrap_or_default()
+    .ok()?
 }
 /// Files whose committed head a commit may have changed since `consumer`'s
 /// last call, for the Codex header inventory's durable facts. `None` (its

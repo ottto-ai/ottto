@@ -1552,6 +1552,32 @@ fn quiet_carrier_pass(c: &Corpus, index: ScanIndex, paths: &[PathBuf; 3]) -> Sca
     next
 }
 
+/// Scan decisions reuse the hydrated carrier even when claim-only work has
+/// advanced the store beyond the scan image's generation.
+#[test]
+fn hydrated_content_carrier_survives_a_lagging_scan_generation() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    with_e2(|| {
+        let (c, mut index, paths) = settled_content_carrier(true);
+        index = c.reload(&mut index);
+        let holder = paths[0].to_string_lossy();
+        assert!(!index.file_upload_context_enabled());
+        assert!(!e2::carrier_group_owned_for_test(&index, &holder));
+        index.activate_upload_context("e2-synthetic-destination".into());
+        assert!(e2::carrier_group_owned_for_test(&index, &holder));
+        let mut lagging = index.clone();
+        lagging.generation = index.generation.checked_sub(1).unwrap();
+        assert!(e2::carrier_group_owned_for_test(&lagging, &holder));
+        lagging.activate_upload_context("another-destination".into());
+        assert!(!e2::carrier_group_owned_for_test(&lagging, &holder));
+        for _ in 0..3 {
+            index = quiet_carrier_pass(&c, index, &paths);
+        }
+    });
+}
+
 /// [money] An exact-ACKed content carrier survives reload without another
 /// offer, receipt rewrite, acquisition or copy-removal re-decision.
 #[test]

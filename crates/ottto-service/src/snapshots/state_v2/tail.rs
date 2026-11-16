@@ -282,10 +282,7 @@ impl TailStage {
         if self.retire.contains(bytes)
             || self.erase.contains(bytes)
             || matches!(self.files.get(bytes), Some(Entry::Failed(_)))
-            || self
-                .debt
-                .get(bytes)
-                .is_some_and(|o| o.representation != Representation::Tail)
+            || matches!(self.debt.get(bytes), Some(o) if o.representation != Representation::Tail)
         {
             EffectiveHead::Removed
         } else if let Some((revision, head)) = self.staged_head(key) {
@@ -294,7 +291,6 @@ impl TailStage {
             EffectiveHead::Committed
         }
     }
-
     /// Every file whose head a commit of this stage may write or remove.
     pub(super) fn touched(&self) -> impl Iterator<Item = &Vec<u8>> {
         self.files

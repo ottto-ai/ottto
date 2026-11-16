@@ -397,7 +397,6 @@ impl ClaudeRequestCensusRecord {
         }
     }
 
-    /// Carrier freshness only; grants no copy proof.
     pub(crate) fn current_twin_for(&self, fp: &str) -> bool {
         self.verified_reusable_twin()
             && matches!(
@@ -406,7 +405,6 @@ impl ClaudeRequestCensusRecord {
             )
             && fingerprint_matches(self, fp)
     }
-
     /// Strict freshness (Sol N6): this record is the current census of the
     /// entry whose fingerprint is `entry_fingerprint`. Lossy, identity
     /// incomplete, unverified, over-budget, retired or other-derivation
