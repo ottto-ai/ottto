@@ -946,6 +946,7 @@ pub(crate) fn credential_file_read<T>(result: anyhow::Result<T>) -> anyhow::Resu
 /// Cumulative shared-process totals, NOT events attributed to the finishing
 /// page/source. No CPU/RSS probe, lookup, new collection trigger or wire event.
 pub(crate) fn cache_lifecycle_totals() {
+    crate::upload_receipts::sample_pager_writes();
     traversal_point(
         "process_retained_cache_lifecycle_totals",
         "unknown",
@@ -3929,6 +3930,34 @@ mod tests {
         assert!(rows.is_empty());
     }
 
+    /// [regress] Both shared helpers count completed writes, including temp files.
+    #[test]
+    fn shared_cache_helpers_raise_cumulative_bytes_in_captured_row() {
+        let scratch = crate::test_scratch::ScratchDir::canonical("cache-write-bytes");
+        let field = "shared_cache_helper_write_bytes_cumulative";
+        let before = capture(cache_lifecycle_totals).1[0]["counts"][field]
+            .as_u64()
+            .unwrap();
+        let value = serde_json::json!({"count": 3});
+        let payload = b"{\"count\":4}";
+        let (_, counts) = cache_lifecycle::observe(|| {
+            crate::locked_state_dir::write_json_atomic(&scratch.join("first.json"), &value);
+            crate::locked_state_dir::replace_json_cache(
+                &scratch.join("second.json"),
+                payload,
+                "cache",
+                "cache",
+            )
+            .unwrap();
+        });
+        let expected = serde_json::to_vec(&value).unwrap().len() as u64 + payload.len() as u64;
+        assert_eq!(counts.shared_cache_helper_write_bytes_cumulative, expected);
+        let (_, rows) = capture(cache_lifecycle_totals);
+        assert_eq!(rows[0]["stage"], "process_retained_cache_lifecycle_totals");
+        assert!(rows[0]["counts"][field].as_u64().unwrap() >= before + expected);
+        assert_eq!(std::fs::read(scratch.join("second.json")).unwrap(), payload);
+    }
+
     #[test]
     fn cache_lifecycle_record_is_bounded_and_explicitly_process_global() {
         let (_, records) = capture(|| {
@@ -3943,6 +3972,15 @@ mod tests {
         assert_eq!(record["stage"], "process_retained_cache_lifecycle_totals");
         assert_eq!(record["source"], "unknown");
         assert_eq!(record["counts"]["prefix_excluded_bodies"], u64::MAX);
+        for field in [
+            "claude_sqlite_pager_wal_page_bytes_cumulative",
+            "codex_sqlite_pager_wal_page_bytes_cumulative",
+            "pi_sqlite_pager_wal_page_bytes_cumulative",
+            "upload_history_sqlite_pager_wal_page_bytes_cumulative",
+            "shared_cache_helper_write_bytes_cumulative",
+        ] {
+            assert_eq!(record["counts"][field], u64::MAX);
+        }
         assert!(record["observation"]["shared_process_cpu_delta_us"].is_null());
         assert!(record["observation"]["process_lifetime_max_rss_bytes"].is_null());
         // The four Pi fields, the Codex tier field, the two Claude usage

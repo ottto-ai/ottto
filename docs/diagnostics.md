@@ -1959,6 +1959,40 @@ local relay also counts evidence rows appended by successful file writes
 with one append per evidence file per request and no fsync. Counts only: no ids,
 paths or payload content, and they never affect usage or cost.
 
+The same `process_retained_cache_lifecycle_totals` row carries these cumulative
+writer byte counters in `counts` (all sources; the row's `source` is `unknown`):
+
+| Field | Measurement |
+| --- | --- |
+| `{claude,codex,pi}_sqlite_pager_wal_page_bytes_cumulative` | Per verified state-store source: SQLite `SQLITE_DBSTATUS_CACHE_WRITE` pages multiplied by the 4096-byte page size already verified at connection setup. In WAL mode these are pager writes to the WAL, not checkpoint writes to the main database. |
+| `upload_history_sqlite_pager_wal_page_bytes_cumulative` | The same pager/WAL page measurement for the upload-history connection, including its cloud ACK cache. |
+| `shared_cache_helper_write_bytes_cumulative` | Payload bytes from successful complete writes through `write_json_atomic` and `replace_json_cache`. Counts temp-file writes before rename, even if rename later fails; does not mean all status persistence. |
+| `otlp_relay_appended_bytes` | Existing cumulative encoded bytes from successful local OTLP evidence appends; reused unchanged. |
+
+State-store pager counts are read and reset at the existing maintenance cache
+sampling boundary and before connection replacement or drop. Fixed field names
+come from the verified store identity, independent of the legacy maintenance
+row's blanket source label. Relaxed, saturating process totals carry sampled
+bytes across VACUUM publication, COMMIT reconciliation and later opens, so a new
+connection never resets a field. Upload history is sampled before this existing
+per-page row under a nonblocking try-lock (busy means retain the last sample),
+and on drop. Sampling uses `sqlite3_db_status64`, with no additional SQL.
+File writes add one relaxed saturating atomic update through the existing
+counter helper, without allocation; pager sampling adds one status read and
+atomic update per connection boundary, without new threads or timers. The
+existing counter helper also feeds active page diagnostics. Each total is a
+separate relaxed observation, not an atomic snapshot of all writers.
+
+These are payload attribution diagnostics, not process logical-write totals.
+Uncovered: cumulative checkpoint bytes (including WAL epochs and TRUNCATE),
+VACUUM output, stderr/log writes (measure log-file growth separately),
+account-store writes, unpublished imports, failed opens, recovery/rollback,
+headers, shm and metadata. Failed partial file writes are not counted; SQLite
+defines its page-write counter as unspecified after write errors. Compute the
+residual against process `logical_writes` offline, without assuming a disjoint
+or exact sum. Difference only observations from the same process lifetime;
+all cumulative counters restart at zero with the process.
+
 ## Compressed Codex reader refusals
 
 The existing `local_resources` carrier emits stage `codex_zst_refused` with

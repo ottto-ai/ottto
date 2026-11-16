@@ -29,6 +29,11 @@ const MAX_SERVER_REQUEST_ID_LEN: usize = 128;
 /// The process's one history writer. A failed open or write drops it; the
 /// next attempt opens it again.
 static HISTORY: Mutex<Option<Store>> = Mutex::new(None);
+pub(crate) fn sample_pager_writes() {
+    if let Ok(history) = HISTORY.try_lock() {
+        history.iter().for_each(Store::sample_pager_writes);
+    }
+}
 static CORRUPTION_LOGGED: AtomicBool = AtomicBool::new(false);
 static APPEND_FAILURE_LOGGED: AtomicBool = AtomicBool::new(false);
 /// History rows this process could not write (open, lock or write failure),
