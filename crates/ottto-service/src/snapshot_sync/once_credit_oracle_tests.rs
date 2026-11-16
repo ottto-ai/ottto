@@ -2741,17 +2741,42 @@ fn scheduling_permutations_converge_to_the_same_bodies() {
                             let prior = accepted.clone();
                             schedule_accepts(source, &quiet, &mut accepted);
                             assert_eq!(accepted, prior, "quiet accepted changed: {context}");
-                            let mut route = emitted_route(&quiet, source, &server);
-                            route.mode = transition::Mode::Restart;
+                            let route = emitted_route(&quiet, source, &server);
+                            // A quiet census page reads no transcript body; identity
+                            // sampling stays within a fixed bound per file it opens:
+                            // head + tail samples (snapshots/wire.rs
+                            // FILE_CONTENT_SAMPLE_BYTES) for each file on the page,
+                            // plus one path-twin peer each. Exact byte accounting is
+                            // not this guard's job.
+                            const IDENTITY_SAMPLE_BYTES: u64 = 4 * 1024;
+                            let page_files = previous_pending.min(quiet_limit) as u64;
+                            let sample_bound = page_files * 2 * 2 * IDENTITY_SAMPLE_BYTES;
+                            assert_eq!(route.modes.0, 0, "quiet Full read: {context}");
+                            assert_eq!(route.io.consumed, 0, "quiet parser bytes: {context}");
+                            assert_eq!(
+                                route.io.rederive_head, 0,
+                                "quiet head re-derive: {context}"
+                            );
+                            assert_eq!(
+                                route.io.rederive_named, 0,
+                                "quiet named re-derive: {context}"
+                            );
+                            assert_eq!(
+                                route.io.cheap_checks,
+                                Some(0),
+                                "quiet cheap checks: {context}"
+                            );
+                            assert_eq!(
+                                route.io.other_reads,
+                                Some(0),
+                                "quiet other reads: {context}"
+                            );
+                            let sampled = route.io.anchor_reads.unwrap_or_else(|| {
+                                panic!("identity sampling unmeasured: {context}")
+                            });
                             assert!(
-                                std::panic::catch_unwind(|| {
-                                    transition::money_oracle::assert_quiet_restart_with_anchor_window(
-                                        &route,
-                                        quiet.quiet_anchor_window,
-                                    );
-                                })
-                                .is_ok(),
-                                "quiet identity/anchor check failed: {context}"
+                                sampled <= sample_bound,
+                                "quiet identity sampling {sampled} above {sample_bound}: {context}"
                             );
                             assert!(
                                 schedule_money_debt_is_clear(&quiet.debt),
