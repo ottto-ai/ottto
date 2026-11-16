@@ -3771,6 +3771,7 @@ fn save_index_and_publish_manifest(
     // durable; a failed CAS/save or manifest derivation must not let a
     // concurrent heartbeat repeat stale agreement.
     withdraw_source_manifest(destination_namespace, source);
+    crate::local_resource_diagnostics::state_save_start(source.api_slug());
     index.save(index_path)?;
     if census_complete {
         publish_source_manifest(
@@ -5526,6 +5527,7 @@ fn sync_once_with_retry(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     // Before credentials: a re-enabled source resumes even with no live device.
     resume_reconnected_sources(support_dir);
+    crate::claude_local_otel::close_append_handles();
     // Declared after the guard, so it settles before the lock is released.
     let mut continuation_cycle = continuation::CycleSettlement::default();
     let (device, device_secret) = load_snapshot_device_credentials()?;
@@ -5654,6 +5656,8 @@ fn retry_ordinary_owned(item: &SnapshotItem) -> Option<SnapshotItem> {
         claude_org_markers: None,
         claude_account_withheld_reason: None,
         claude_account_display: None,
+        session_billing_route: item.session_billing_route.clone(),
+        claude_route_evidence: None,
         session_account_evidence: item.session_account_evidence.clone(),
         source_session_id: item.source_session_id.clone(),
         snapshot_fingerprint: item.snapshot_fingerprint.clone(),
@@ -7217,6 +7221,7 @@ fn prepare_sync_source_inner(
     } else {
         Vec::new()
     };
+    crate::local_resource_diagnostics::index_clone_start(source.api_slug());
     let mut committed_index = index.clone();
     let reoffer_paths =
         index.activate_reason_reoffer_retries(upload_progress.active_reason_reoffers.clone());
@@ -7649,6 +7654,7 @@ fn prepare_continuation_source(
     index.activate_effective_upload_body_witness_revision(cycle_body_witness_revision(source));
     // K3: as the ordinary prepare, before the scan advances it. It is dropped
     // here unless the page commits, and crosses to the parent only by move.
+    crate::local_resource_diagnostics::index_clone_start(source.api_slug());
     let committed_index = index.clone();
     // No lease is active (refused above), so this only installs the empty
     // set, as the ordinary prepare does; there are no hint paths to take.
@@ -8014,6 +8020,15 @@ fn finish_sync_source(
         &claude_authority_disposition.mixed_uploads,
     );
     claude_authority_disposition.defer_sessions(deferred_accounts);
+    // Billing route annotation: after ownership is bound, before upload policy.
+    // Process memory only; off, nothing runs.
+    crate::snapshots::billing_route::annotate_session_billing_routes(
+        &upload_destination_namespace,
+        source,
+        machine_id,
+        &mut scan_result.snapshots,
+        activity_hint.session_billing_route_contract.as_deref(),
+    );
 
     // The Companion uses machine-local labels before upload policy clears them.
     let reconciliation_status = crate::agent_status_refresh::status_for_reconciliation(
@@ -9993,6 +10008,10 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
 fn release_emitted(item: &mut SnapshotItem) {
     #[cfg(test)]
     crate::snapshots::claude_request_money::e2::pipeline_test_observer::before_release(item);
+    // Route evidence only; captured before the native request inputs go.
+    if crate::snapshots::billing_route::PRODUCER_ENABLED {
+        crate::snapshots::billing_route::capture_claude_route_evidence(item);
+    }
     crate::snapshots::claude_request_money::e2::release_emitted_fold(item);
 }
 
