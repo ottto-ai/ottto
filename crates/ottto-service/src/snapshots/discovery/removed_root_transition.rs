@@ -6,7 +6,7 @@
 // legacy witness inference, as an absent `archived_sessions` does, and a
 // known root that goes missing for one generation forces an unrelated red
 // walk.
-use crate::snapshots::codex_counting_version::{proven_owner, AckEvidence};
+use crate::snapshots::sources::codex::counting::version::{proven_owner, AckEvidence};
 
 const REMOVED_FRESH: &str = "019e5a00-0000-7000-8000-00000000000e";
 const REMOVED_OLD: &str = "019e5a00-0000-7000-8000-00000000000f";
