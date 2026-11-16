@@ -17572,6 +17572,9 @@ fn source_display_name(source: &SourceKind) -> &'static str {
 }
 
 #[cfg(test)]
+pub(crate) use tests::owner_return_credential_for_test;
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn session_exec_commands_require_cli_kind_and_authorized_token() {
@@ -32830,6 +32833,49 @@ X-API-Key = "otel_redacted"
             backfill_cutoff_at: Some(RELOGIN_CUTOFF.into()),
         });
         (pending, candidate)
+    }
+
+    /// Synthetic driver of the production selection, validation, publication and
+    /// active-envelope seams. Only physical hardware observation is injected.
+    pub(crate) fn owner_return_credential_for_test(
+        device: &LocalDeviceBinding,
+        candidate: &str,
+        user: &str,
+    ) -> String {
+        let (mut pending, _) = owner_return_pending(user, "org", &device.device_id);
+        pending.device = device.clone();
+        pending.secret_commitment_sha256 = secret_sha256(candidate);
+        pending.api_base_url = validated_api_base_url(None).unwrap();
+        let commit = pending.claim_commit.as_mut().unwrap();
+        commit.connection.api_base_url = pending.api_base_url.clone();
+        commit.connection.machine_id = device.machine_id.clone();
+        pending.request_authority.as_mut().unwrap().machine_id = device.machine_id.clone().unwrap();
+        let prior = prior_device_credential_for_registration().unwrap();
+        let store = FileOwnerSnapshotNamespaceStore::default();
+        select_owner_snapshot_namespace(
+            &mut pending,
+            candidate,
+            prior.as_ref(),
+            &store,
+            &default_support_dir(),
+            &|_| Ok(true),
+        )
+        .unwrap();
+        pending.confirmed_at = Some("confirmed".into());
+        validate_owner_snapshot_selection(&pending, candidate, &store, &|_| Ok(true)).unwrap();
+        write_and_verify_active_device_credential(
+            &pending,
+            candidate,
+            &FileDeviceStore::default(),
+            &KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
+        )
+        .unwrap();
+        publish_owner_snapshot_history(&pending, &store).unwrap();
+        crate::snapshot_sync::snapshot_destination_namespace(
+            device,
+            candidate,
+            pending_snapshot_alias(&pending).as_ref(),
+        )
     }
 
     fn owner_return_test_machine(key: &OwnerSnapshotKey) -> Result<bool, LocalApiError> {

@@ -815,7 +815,7 @@ mod tests {
         assert_eq!(store.load().unwrap().len(), 800);
         let mut updated = rows[0].clone();
         updated.namespace = "b".repeat(64);
-        store.upsert(&[updated.clone()]).unwrap();
+        store.upsert(std::slice::from_ref(&updated)).unwrap();
         let loaded = store.load().unwrap();
         assert_eq!(loaded.len(), 800);
         assert!(loaded.contains(&updated));
@@ -868,7 +868,7 @@ mod tests {
         for body in bad {
             fs::write(&path, &body).unwrap();
             assert!(store.load().is_err());
-            assert!(store.upsert(&[row.clone()]).is_err());
+            assert!(store.upsert(std::slice::from_ref(&row)).is_err());
             assert_eq!(fs::read(&path).unwrap(), body);
         }
         fs::remove_file(&path).unwrap();
