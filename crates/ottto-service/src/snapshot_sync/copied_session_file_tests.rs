@@ -822,7 +822,11 @@ fn held_content_twin_holder_proves_no_copy_until_released() {
         );
         assert_eq!(counted_copy.removed_request_count.unwrap_or(0), 0);
         prior = accept_monotone_page(&c, &selected, held, &mut accepted);
-        assert!(prior.files[&main_key].upload_context_receipt.is_none());
+        // H never committed a body, so it may have no index entry at all.
+        assert!(prior
+            .files
+            .get(&main_key)
+            .is_none_or(|entry| entry.upload_context_receipt.is_none()));
         assert!(!prior.claude_copy_removals.pending(location_key(&copy_key)));
         assert_eq!((accepted[ROOT], accepted[COPY]), (2, 2));
         let before_release = accepted.clone();
@@ -1009,7 +1013,8 @@ fn content_twin_in_another_chunk_counts_and_settles() {
                     let before = crate::snapshot_sync::evidence_chunks_for_test();
                     reference.enrich(&c);
                     one.set(was);
-                    assert_eq!(crate::snapshot_sync::evidence_chunks_for_test() - before, 1);
+                    // Reference arms are not counted (snapshot_sync.rs, one_evidence_chunk).
+                    assert_eq!(crate::snapshot_sync::evidence_chunks_for_test() - before, 0);
                 });
                 reference
             })
