@@ -3718,15 +3718,16 @@ fn mixed_class_page_is_equal_and_class_pure_on_every_route() {
 
 /// One head bootstrap of `page` from an empty ledger under optional head CAS
 /// against the backend-shaped head store, which compares and echoes body
-/// witnesses and the cache state. With the fix, each never-settled patched
-/// session is one whole token-less CAS write; without it, every headless
-/// patched body first takes the ordinary probe and its exact CAS repeat.
-/// The route is the main upload only, saved bases removed (head tokens differ
-/// by design), with the post-ACK ledger, the store and the POST count.
-fn cas_bootstrap_route(
+/// witnesses and the cache state. Every headless patched body first takes the
+/// ordinary probe and its exact CAS repeat. `adopted`: the server already
+/// holds each patched session's base, as after an ordinary write whose ledger
+/// ACK the index adopted and pruned. The route is the main upload only, saved
+/// bases removed (head tokens differ by design), with the post-ACK ledger, the
+/// store and the POST count.
+fn head_first_route(
     page: &Page,
     mode: crate::snapshots::sampled_scan::transition_fixture::Mode,
-    with_fix: bool,
+    adopted: bool,
 ) -> (
     crate::snapshots::sampled_scan::transition_fixture::RouteResult,
     SnapshotUploadProgress,
@@ -3741,27 +3742,20 @@ fn cas_bootstrap_route(
     for item in &mut sent {
         prepare_snapshot_cache_for_upload(item, &progress, true, false, &BTreeSet::new());
     }
-    let cas = cas_bootstrap_bodies(&progress, &sent);
-    assert!(
-        sent.iter()
-            .filter(|item| item.cache_observations.is_some())
-            .all(|item| cas.contains(&item.snapshot_fingerprint)),
-        "every patched body is a never-settled session's only body"
-    );
-    let skip = if with_fix { cas } else { BTreeSet::new() };
     let mut store = crate::snapshot_sync::tests::class_split_tests::HeadStore::default();
     let mut posts = 0;
     let probes = sent
         .iter()
-        .filter(|item| {
-            item.cache_observations.is_some()
-                && item.cache_base_head_etag.is_none()
-                && !skip.contains(&item.snapshot_fingerprint)
-        })
+        .filter(|item| item.cache_observations.is_some() && item.cache_base_head_etag.is_none())
         .map(cache_head_probe)
         .collect::<Vec<_>>();
-    assert_eq!(probes.is_empty(), with_fix);
-    if !probes.is_empty() {
+    assert!(!probes.is_empty());
+    if adopted {
+        let request = request(&probes);
+        store.post(&request, &serde_json::to_value(&request).unwrap());
+        assert_eq!(store.stored.len(), probes.len(), "the adopted bases");
+    }
+    {
         let deferred = bootstrap_cache_heads(
             &probes,
             &unique_poison_scope(),
@@ -3788,15 +3782,14 @@ fn cas_bootstrap_route(
             .any(|item| item.source_session_id == ROOT && item.cache_base_head_etag.is_some())
     };
     assert!(!root_based(&sent));
-    assert!(apply_bootstrapped_cache_heads_except(
+    assert!(apply_bootstrapped_cache_heads(
         SnapshotSource::ClaudeCode.api_slug(),
         &mut sent,
         &progress,
-        &skip
     )
     .unwrap()
     .is_empty());
-    assert_eq!(root_based(&sent), !with_fix, "the probe's head");
+    assert!(root_based(&sent), "the probe's head");
     let (status, batches, _) = upload(&sent, &mut progress, |batch| {
         posts += 1;
         let request = request(batch);
@@ -3807,7 +3800,11 @@ fn cas_bootstrap_route(
         }
         Ok(store.post(&request, &wire))
     });
-    assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
+    assert_eq!(
+        status.unwrap(),
+        ResumableUploadResult::Completed,
+        "zero conflicts"
+    );
     let batches = batches
         .iter()
         .map(|bytes| {
@@ -3815,7 +3812,11 @@ fn cas_bootstrap_route(
             for body in wire["snapshots"].as_array_mut().unwrap() {
                 let envelope = body["semantic_envelope"].as_object_mut().unwrap();
                 let base = envelope.remove("base_head_etag");
-                assert!(!with_fix || base.is_none(), "token-less bootstrap");
+                assert_eq!(
+                    base.is_some(),
+                    !body["cache_observations"].is_null(),
+                    "every patch rides a head"
+                );
             }
             serde_json::to_vec(&wire).unwrap()
         })
@@ -3853,15 +3854,17 @@ fn cas_bootstrap_route(
     (result, progress, store, posts)
 }
 
-/// [money] With and without the one-write head bootstrap, a tagged
-/// multi-account mixed page settles the same accepted usage, placement,
-/// identity buckets, cache states and exact stored bodies; the fix only saves
-/// the two probe POSTs.
-fn assert_cas_bootstrap_parity(page: &Page) {
+/// [money] source_and_money_equivalence (Claude): a tagged multi-account
+/// mixed page whose patched sessions the server already holds (adopted) takes
+/// the head first and settles the same accepted usage, placement, identity
+/// buckets, cache states and exact stored bodies as a cold session, in the
+/// same POSTs, with zero conflicts.
+fn assert_head_first_parity(page: &Page) {
     use crate::snapshots::sampled_scan::transition_fixture::{money_oracle, Mode};
     let (probed, probed_ledger, probed_store, probed_posts) =
-        cas_bootstrap_route(page, Mode::ColdFull, false);
-    let (cas, cas_ledger, cas_store, cas_posts) = cas_bootstrap_route(page, Mode::Restart, true);
+        head_first_route(page, Mode::ColdFull, false);
+    let (cas, cas_ledger, cas_store, cas_posts) = head_first_route(page, Mode::Restart, true);
+    money_oracle::assert_class_pure_requests(&cas);
     money_oracle::assert_equivalent(&probed, &cas);
     assert_eq!(
         assert_mixed_placement_nonvacuous(&cas),
@@ -3886,8 +3889,7 @@ fn assert_cas_bootstrap_parity(page: &Page) {
     );
     assert_eq!(cas_store.bodies, probed_store.bodies, "same stored bodies");
     assert!(cas_store.bodies.contains_key(ROOT));
-    assert_eq!(cas_posts, cas.batches.len(), "no probe POST");
-    assert_eq!(probed_posts, cas_posts + 2, "probe and its CAS repeat");
+    assert_eq!(cas_posts, probed_posts, "probe, its CAS repeat, main");
     assert_eq!(
         cas_ledger.accepted_cache_heads.keys().collect::<Vec<_>>(),
         probed_ledger
@@ -4129,9 +4131,9 @@ fn mixed_class_page_placement_survives_upgrade_and_restarts() {
             other_body.contains(&a) && other_body.contains(&b),
             "two organizations"
         );
-        // The same tagged page from an empty ledger: the head bootstrap with
-        // and without the one-write fix settles equal money and placement.
-        assert_cas_bootstrap_parity(&pages[1]);
+        // The same tagged page from an empty ledger: an adopted and a cold
+        // head bootstrap settle equal money and placement.
+        assert_head_first_parity(&pages[1]);
 
         // Restart between pages: the upgraded owner's page is accepted and
         // committed; a new owner continues page 2 from that index.

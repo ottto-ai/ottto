@@ -66,9 +66,10 @@ struct ReofferServer {
     cache_enabled: Arc<std::sync::atomic::AtomicBool>,
     /// Each snapshot request's (head_cas_contract, cache_state_ack_contract).
     contracts: Arc<Mutex<Vec<(serde_json::Value, serde_json::Value)>>>,
-    /// Another writer saves this upload ledger during the next snapshot POST,
-    /// so the daemon's own post-ACK save loses its compare-and-swap.
-    rival_save: Arc<Mutex<Option<PathBuf>>>,
+    /// `Some(conflicts)`: head CAS as the backend checks it. A changed body of
+    /// a held entity, sent under the contract without the head as its base,
+    /// conflicts with a challenge; the count is kept.
+    head_cas_conflicts: Arc<Mutex<Option<usize>>>,
 }
 
 /// The cache state a server holding no prior state completes `item`'s patch
@@ -137,8 +138,8 @@ impl ReofferServer {
         let cache = cache_enabled.clone();
         let contracts = Arc::new(Mutex::new(Vec::new()));
         let requests = contracts.clone();
-        let rival_save = Arc::new(Mutex::new(None::<PathBuf>));
-        let rival = rival_save.clone();
+        let head_cas_conflicts = Arc::new(Mutex::new(None::<usize>));
+        let head_cas = head_cas_conflicts.clone();
         let worker = std::thread::spawn(move || {
             while !done.load(Ordering::Relaxed) {
                 let (mut stream, _) = match listener.accept() {
@@ -184,17 +185,6 @@ impl ReofferServer {
                         value["head_cas_contract"].clone(),
                         value["cache_state_ack_contract"].clone(),
                     ));
-                    let rival_ledger = rival
-                        .lock()
-                        .unwrap()
-                        .clone()
-                        .and_then(|path| std::fs::read(&path).ok().map(|bytes| (path, bytes)));
-                    if let Some((path, bytes)) = rival_ledger {
-                        let mut ledger: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-                        ledger["generation"] = (ledger["generation"].as_u64().unwrap() + 1).into();
-                        std::fs::write(&path, serde_json::to_vec(&ledger).unwrap()).unwrap();
-                        *rival.lock().unwrap() = None;
-                    }
                     let outage = match *current.lock().unwrap() {
                         Answer::Shed => Some("503 Service Unavailable"),
                         Answer::ServerError => Some("500 Internal Server Error"),
@@ -247,6 +237,24 @@ impl ReofferServer {
                                 body.as_object_mut().unwrap().remove("collected_at");
                                 let mut stored = saved_bodies.lock().unwrap();
                                 let unchanged = stored.get(&fingerprint) == Some(&body);
+                                if let Some(conflicts) =
+                                    head_cas.lock().unwrap().as_mut().filter(|_| {
+                                        cas && !unchanged
+                                            && stored.contains_key(&fingerprint)
+                                            && item["semantic_envelope"]["base_head_etag"]
+                                                != "e".repeat(64)
+                                    })
+                                {
+                                    *conflicts += 1;
+                                    outcome["conflict_entities"].as_array_mut().unwrap().push(
+                                        serde_json::json!({
+                                            "source_session_id":item["source_session_id"],
+                                            "snapshot_fingerprint":item["snapshot_fingerprint"],
+                                            "occurrence_count":1,"head_challenge":"c".repeat(64)
+                                        }),
+                                    );
+                                    continue;
+                                }
                                 stored.insert(fingerprint.clone(), body);
                                 // Lost replies retain the stored body without
                                 // acknowledging it; the retry echoes stored proof.
@@ -269,8 +277,10 @@ impl ReofferServer {
                                 outcome[kind].as_array_mut().unwrap().push(reference);
                             }
                             if answer == Answer::Accept {
-                                outcome["accepted"] = items.len().into();
-                                outcome["sessions_reconciled"] = items.len().into();
+                                let settled = items.len()
+                                    - outcome["conflict_entities"].as_array().unwrap().len();
+                                outcome["accepted"] = settled.into();
+                                outcome["sessions_reconciled"] = settled.into();
                             }
                         }
                         Answer::Unstored => {
@@ -311,7 +321,7 @@ impl ReofferServer {
             stored,
             cache_enabled,
             contracts,
-            rival_save,
+            head_cas_conflicts,
         }
     }
 
@@ -2467,8 +2477,7 @@ thread_local! {
 // Supply the producer patch before real finalization, only for these scoped
 // probe cycles. The ordinary synthetic Claude session has no cache evidence.
 // Each probe session also owes a base-less challenge, as one an older writer
-// left: that keeps it on the probe path (`cas_bootstrap_bodies`) and changes
-// no wire. A new patched session owes nothing.
+// left; it changes no wire. A new patched session owes nothing.
 pub(in crate::snapshot_sync) fn prepare_probe_for_test(
     items: &mut [SnapshotItem],
     progress: &mut SnapshotUploadProgress,
@@ -3003,147 +3012,113 @@ mod held_probe_listing_tests {
     include!("held_probe_listing_tests.rs");
 }
 
-/// [money] [regress] A new patched session on the real prepare/finish route.
-/// Its first delivery is one whole token-less head-CAS write (no probe). Its
-/// debt survives a lost ACK (the server stored the body) and a lost post-ACK
-/// save (another writer saved the ledger first): each later cycle re-offers
-/// the same whole body. Only the exact ACK, saved, settles the receipt, head
-/// and cache state, once; a quiet cycle then sends nothing.
+/// [money] [regress] adopted_W0_head_first_W1 on the real prepare/finish
+/// route. The server holds the ordinary base W0 (no head) and the index adopted
+/// and pruned its ACK; the session's same-fingerprint body then gains a cache
+/// patch (W1). W1 is owed durably, the stripped W0 probe takes the head (CAS
+/// off, then on), and W1 goes out with that head: zero conflicts against a
+/// server that checks head CAS. A failed post-save step keeps the debt; the
+/// next cycle retires it on the exact W1 ACK with its head; a quiet cycle
+/// sends nothing. Every offer carries the same counters.
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
-fn a_new_patched_session_keeps_its_whole_cas_debt_until_an_exact_ack_is_saved() {
-    if !supported("a_new_patched_session_keeps_its_whole_cas_debt_until_an_exact_ack_is_saved") {
+fn adopted_w0_head_first_w1() {
+    if !supported("adopted_w0_head_first_w1") {
         return;
     }
-    struct NewSession;
-    impl Drop for NewSession {
+    struct Patched;
+    impl Drop for Patched {
         fn drop(&mut self) {
             NEW_PATCHED_SESSION.with(|slot| slot.set(false));
+            super::ACK_POST_SAVE_FAILURE.with(|slot| slot.set(None));
         }
     }
-    NEW_PATCHED_SESSION.with(|slot| slot.set(true));
-    let _new_session = NewSession;
     let t0 = current_unix_seconds();
-    let mut pipeline = ReofferPipeline::new("cas-bootstrap-first-delivery", Answer::Lost, t0);
+    let mut pipeline = ReofferPipeline::new("adopted-head-first", Answer::Accept, t0);
     pipeline
         .server
         .cache_enabled
         .store(true, std::sync::atomic::Ordering::Relaxed);
-    let unsettled = |cycle: &CycleResult, fingerprint: &str| {
-        assert!(cycle.cache_enabled);
-        assert!(!cycle
-            .progress
-            .accepted_body_witnesses
-            .contains_key(fingerprint));
-        assert!(!cycle
-            .progress
-            .permanent_rejections
-            .contains_key(fingerprint));
-        assert!(cycle.progress.accepted_cache_heads.is_empty());
-        assert!(cycle.progress.accepted_cache_states.is_empty());
-        assert!(!cycle
-            .index
-            .accepted_snapshot_fingerprint_recorded(fingerprint));
-        assert!(cycle
-            .index
-            .files
-            .values()
-            .all(|entry| entry.upload_context_receipt.is_none()));
-    };
-    // Every offer is the same whole token-less CAS body.
-    let whole = |offer: &serde_json::Value, first: &serde_json::Value| {
-        assert_eq!(fingerprint_of(offer), fingerprint_of(first));
-        assert_eq!(usage_of(offer), usage_of(first));
-        let stable = |value: &serde_json::Value| {
-            let mut value = value.clone();
-            // Per-pass collection time is metadata, outside the semantic
-            // fingerprint and body witness; compare every other wire field.
-            value.as_object_mut().unwrap().remove("collected_at");
-            value
-        };
-        assert_eq!(
-            stable(offer),
-            stable(first),
-            "same complete usage, placement and patch bytes"
-        );
-        assert!(offer["cache_observations"].is_object(), "the whole patch");
-        assert_ne!(offer["cache_observations"]["full_replacement"], true);
-        assert!(offer["semantic_envelope"].get("base_head_etag").is_none());
-    };
+    *pipeline.server.head_cas_conflicts.lock().unwrap() = Some(0);
 
-    let lost = pipeline.cycle(t0);
+    let mut adopted = pipeline.cycle(t0);
+    assert!(adopted.result.is_ok(), "{:?}", adopted.result);
+    assert!(adopted.cache_enabled);
     let offered = pipeline.server.offered();
-    assert_eq!(offered.len(), 1, "one whole write, no probe stages");
-    let first = offered[0].clone();
-    whole(&first, &first);
-    let fingerprint = fingerprint_of(&first);
-    unsettled(&lost, &fingerprint);
-    assert_eq!(
-        pipeline.server.stored.lock().unwrap().len(),
-        1,
-        "lost ACK kept the body"
-    );
-    assert!(lost.progress_path.exists());
-
-    pipeline.server.answer(Answer::Accept);
-    *pipeline.server.rival_save.lock().unwrap() = Some(lost.progress_path.clone());
-    let unsaved = pipeline.cycle(t0 + 600);
-    assert!(unsaved.result.is_err(), "the post-ACK save lost its swap");
+    assert_eq!(offered.len(), 1);
+    let base = offered[0].clone();
+    assert!(base["cache_observations"].is_null(), "an ordinary W0");
+    let fingerprint = fingerprint_of(&base);
+    let key = cache_session_key(base["source_session_id"].as_str().unwrap());
+    assert!(adopted
+        .index
+        .accepted_snapshot_fingerprint_recorded(&fingerprint));
     assert!(
-        pipeline.server.rival_save.lock().unwrap().is_none(),
-        "the rival saved during the POST"
-    );
-    let offered = pipeline.server.offered();
-    assert_eq!(offered.len(), 2, "re-offered after the lost ACK");
-    whole(&offered[1], &first);
-    unsettled(&unsaved, &fingerprint);
-
-    let saved = pipeline.cycle(t0 + 1200);
-    assert!(saved.result.is_ok(), "{:?}", saved.result);
-    let offered = pipeline.server.offered();
-    assert_eq!(offered.len(), 3, "re-offered after the lost save");
-    whole(&offered[2], &first);
-    let key = cache_session_key(first["source_session_id"].as_str().unwrap());
-    // Successful finish retires the transient upload ACK after the index
-    // adopts its exact proof. Check that durable destination-bound stamp.
-    let proof = serde_json::to_value(&saved.index.upload_context_proof).unwrap();
-    assert_eq!(
-        proof["entity_stamps"][&fingerprint]["body_witness"],
-        entity_ack(&first)["body_witness_digest"],
-        "the durable index owns the exact stored-body proof"
-    );
-    assert!(
-        !saved
+        !adopted
             .progress
             .accepted_body_witnesses
             .contains_key(&fingerprint),
-        "the adopted ACK retires only after the index save"
+        "the index adopted and pruned the ACK"
     );
-    assert_eq!(saved.progress.accepted_cache_heads[&key], "e".repeat(64));
+    assert!(adopted.progress.accepted_cache_heads.is_empty());
+
+    // The same session now carries a patch; a failed step after the index
+    // save stops this cycle before retirement.
+    force_held_file_parse(&mut adopted);
+    NEW_PATCHED_SESSION.with(|slot| slot.set(true));
+    let _patched = Patched;
+    super::ACK_POST_SAVE_FAILURE.with(|slot| slot.set(Some("selected_save")));
+    let unsaved = pipeline.cycle(t0 + 600);
+    assert!(unsaved.result.is_err(), "the post-save step failed");
+    let offered = pipeline.server.offered();
+    let contracts = pipeline.server.contracts.lock().unwrap().clone();
+    assert_eq!(offered.len(), 4, "probe, its CAS repeat, W1");
+    for probe in &offered[1..3] {
+        assert_eq!(fingerprint_of(probe), fingerprint);
+        assert!(probe["cache_observations"].is_null(), "stripped W0");
+    }
+    assert!(contracts[1].0.is_null(), "stage 1 without CAS");
+    assert!(contracts[2].0.is_string(), "stage 2 under CAS");
+    let patched = &offered[3];
+    assert_eq!(fingerprint_of(patched), fingerprint, "same fingerprint");
+    assert!(patched["cache_observations"].is_object(), "the whole patch");
+    assert_eq!(
+        patched["semantic_envelope"]["base_head_etag"],
+        "e".repeat(64),
+        "W1 rides the head"
+    );
+    assert!(contracts[3].0.is_string());
+    assert_eq!(contracts[3].1, "cache_state_ack:v1");
+    assert_eq!(*pipeline.server.head_cas_conflicts.lock().unwrap(), Some(0));
+    assert_eq!(unsaved.progress.accepted_cache_heads[&key], "e".repeat(64));
+    assert!(
+        !unsaved.progress.pending_cache_heads.is_empty(),
+        "W1 stays owed until retirement after the save"
+    );
+
+    let saved = pipeline.cycle(t0 + 1200);
+    assert!(saved.result.is_ok(), "{:?}", saved.result);
+    assert!(
+        saved.progress.pending_cache_heads.is_empty(),
+        "exact W1 ACK"
+    );
     assert!(saved.progress.accepted_cache_states.contains_key(&key));
     assert!(saved.progress.head_conflict_challenges.is_empty());
-    assert!(saved
-        .index
-        .accepted_snapshot_fingerprint_recorded(&fingerprint));
-    assert!(saved
-        .index
-        .files
-        .values()
-        .any(|entry| entry.upload_context_receipt.is_some()));
-    assert_eq!(
-        pipeline.server.stored.lock().unwrap().len(),
-        1,
-        "one stored whole body"
-    );
-    let contracts = pipeline.server.contracts.lock().unwrap().clone();
-    assert_eq!(contracts.len(), 3);
-    assert!(contracts
-        .iter()
-        .all(|(cas, ack)| cas.is_string() && ack == "cache_state_ack:v1"));
+    let stored = pipeline.server.stored.lock().unwrap()[&fingerprint].clone();
+    assert!(stored["cache_observations"].is_object(), "W1 stored");
+    assert_eq!(*pipeline.server.head_cas_conflicts.lock().unwrap(), Some(0));
+    let offered = pipeline.server.offered();
+    for offer in &offered {
+        assert_eq!(usage_of(offer), usage_of(&base), "counters unchanged");
+    }
 
     let quiet = pipeline.cycle(t0 + 1800);
     assert!(quiet.result.is_ok(), "{:?}", quiet.result);
-    assert_eq!(pipeline.server.offered().len(), 3, "nothing owed");
+    assert_eq!(
+        pipeline.server.offered().len(),
+        offered.len(),
+        "nothing owed"
+    );
 }

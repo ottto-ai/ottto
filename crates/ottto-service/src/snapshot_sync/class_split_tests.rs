@@ -14,7 +14,7 @@ use crate::snapshot_sync::head_conflict_answer_tests::{
 use crate::snapshots::cache_observations::CacheObservations;
 use serde_json::Value;
 
-fn fresh_progress() -> SnapshotUploadProgress {
+pub(in crate::snapshot_sync) fn fresh_progress() -> SnapshotUploadProgress {
     SnapshotUploadProgress::new(
         "a".repeat(64),
         snapshot_quarantine_witness(SnapshotSource::Codex),
@@ -409,10 +409,11 @@ fn mixed_page_sends_each_patch_class_in_its_own_request() {
 /// [money] The observed seed (challenge, no base or state, no attempt)
 /// with a no-patch offer beside a patched sibling. With no saved base the
 /// owed session can carry no answer, so it is not mirrored and its files may
-/// re-fold. It goes out in an ordinary request, is accepted, and its exact
-/// ACK clears the challenge without an answer. A restart keeps it clear.
+/// re-fold. It goes out in an ordinary request and is accepted, but its
+/// headless ACK proves no head: the challenge stays owed, across a restart,
+/// until an ACK with a head.
 #[test]
-fn observed_unanswered_challenge_clears_through_an_ordinary_accept() {
+fn observed_unanswered_challenge_survives_a_headless_ordinary_accept() {
     let none = BTreeSet::new();
     let mut store = HeadStore::default();
     let mut progress = fresh_progress();
@@ -450,8 +451,8 @@ fn observed_unanswered_challenge_clears_through_an_ordinary_accept() {
         assert!(envelope.get(field).is_none(), "{field}");
     }
     assert!(
-        progress.head_conflict_challenges.is_empty(),
-        "cleared by the accept, never answered"
+        progress.head_conflict_challenges.contains_key(&key),
+        "a headless accept clears nothing"
     );
     assert_eq!(
         progress.accepted_body_witnesses[&owed.snapshot_fingerprint],
@@ -472,7 +473,10 @@ fn observed_unanswered_challenge_clears_through_an_ordinary_accept() {
         snapshot_quarantine_witness(SnapshotSource::Codex),
     )
     .unwrap();
-    assert!(restarted.head_conflict_challenges.is_empty());
+    assert_eq!(
+        restarted.head_conflict_challenges,
+        progress.head_conflict_challenges
+    );
     assert_eq!(
         restarted.accepted_body_witnesses,
         progress.accepted_body_witnesses
@@ -481,8 +485,8 @@ fn observed_unanswered_challenge_clears_through_an_ordinary_accept() {
 }
 
 /// [money] The observed seed when the session regains a patch, including a
-/// partial-empty one. The existing ordinary bootstrap probe's ACK clears the
-/// challenge, its exact CAS repeat saves the head, and the patched main offer
+/// partial-empty one. The existing ordinary bootstrap probe's headless ACK
+/// keeps the challenge; its exact CAS repeat clears it and saves the head; the patched main offer
 /// declares CAS with that base and carries its whole patch. With no saved
 /// base the session is never mirrored, and no POST carries the rescan claim.
 #[test]
@@ -576,8 +580,8 @@ fn a_session_that_regains_a_patch_clears_through_the_ordinary_bootstrap() {
 /// Requests are class-pure. Only the base-holding session is mirrored (its
 /// body is a native Full) and only its body carries the answer and the
 /// rescan claim. The base-less session is not mirrored, travels alone in a
-/// class-0 request with no claim, and its ordinary accept clears its
-/// challenge. Every body settles by its exact ACK, stored once.
+/// class-0 request with no claim; its headless accept keeps its challenge.
+/// Every body settles by its exact ACK, stored once.
 #[test]
 fn a_mixed_owed_page_answers_only_the_base_holding_patched_body() {
     let none = BTreeSet::new();
@@ -663,9 +667,10 @@ fn a_mixed_owed_page_answers_only_the_base_holding_patched_body() {
         assert!(envelope.get(field).is_none(), "{field}");
     }
 
-    assert!(
-        progress.head_conflict_challenges.is_empty(),
-        "the answer and the ordinary accept clear both"
+    assert_eq!(
+        progress.head_conflict_challenges.keys().collect::<Vec<_>>(),
+        [&baseless_key],
+        "the answer clears its challenge; the headless accept clears none"
     );
     for item in [&based, &baseless, &sibling] {
         assert_eq!(
@@ -679,12 +684,13 @@ fn a_mixed_owed_page_answers_only_the_base_holding_patched_body() {
     assert_eq!(stored, ["owed-based", "owed-baseless", "patched-sibling"]);
     assert!(!progress.accepted_cache_heads.contains_key(&baseless_key));
     for key in [&based_key, &baseless_key, &sibling_key] {
-        assert!(!mirrored(&progress, key), "nothing owed: may re-fold");
+        assert!(!mirrored(&progress, key), "no answer can ride: may re-fold");
     }
 }
 
 /// [money] A lost ACK keeps the debt; the replay is an exact repeat
-/// (unchanged, no second store); a repeat pass sends no POST; a fresh
+/// (unchanged, no second store) whose headless ACK keeps the challenge; a
+/// repeat pass sends no POST; a fresh
 /// challenge from a later CAS conflict is recorded and answered by the next
 /// revision, which keeps the stale saved base and so declares head CAS.
 #[test]
@@ -719,7 +725,7 @@ fn lost_ack_replays_unchanged_and_a_fresh_challenge_clears_again() {
         |request, wire| Ok(store.post(request, wire)),
     );
     assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
-    assert!(progress.head_conflict_challenges.is_empty());
+    assert!(progress.head_conflict_challenges.contains_key(&key));
     assert_eq!(store.stored, ["owed"], "no double credit");
 
     // A repeat pass sends no POST: the packer skips an exact settled body.
@@ -774,8 +780,8 @@ fn lost_ack_replays_unchanged_and_a_fresh_challenge_clears_again() {
 /// older or other authority downgrade is a permanent rejection: the
 /// challenge clears and the body is held with no receipt. Mixed usage is
 /// retryable: the challenge stays and the page is Deferred. A dominated
-/// re-offer is unchanged with a basis: the challenge clears, the body is
-/// held, no receipt. No saved head is created or lowered.
+/// re-offer is unchanged with a basis and no head: the challenge stays, the
+/// body is held, no receipt. No saved head is created or lowered.
 #[test]
 fn ordinary_fence_outcomes_settle_the_owed_challenge_by_their_own_rules() {
     let none = BTreeSet::new();
@@ -831,7 +837,7 @@ fn ordinary_fence_outcomes_settle_the_owed_challenge_by_their_own_rules() {
         let retryable = permanent == Some(false);
         assert_eq!(
             progress.head_conflict_challenges.contains_key(&key),
-            retryable,
+            permanent != Some(true),
             "{outcome}"
         );
         if retryable {
@@ -1152,7 +1158,7 @@ fn assert_lost_class_request_resends_only_unsettled(items: &[FamilyItem], first:
 
 /// Today's probe stages on `items` through the fake server: the ordinary
 /// probe, then its exact CAS repeat. Returns each request's wire.
-fn probe_stages(
+pub(in crate::snapshot_sync) fn probe_stages(
     progress: &mut SnapshotUploadProgress,
     store: &mut HeadStore,
     items: &[SnapshotItem],
@@ -1210,7 +1216,7 @@ fn bare(sent: &Value) -> Value {
 }
 
 /// [money] Every POSTed body carries the session's full usage.
-fn assert_no_smaller_body(wires: &[Value], item: &SnapshotItem) {
+pub(in crate::snapshot_sync) fn assert_no_smaller_body(wires: &[Value], item: &SnapshotItem) {
     let expected = serde_json::to_value(item).unwrap();
     for wire in wires {
         for sent in wire["snapshots"].as_array().unwrap() {
@@ -1227,138 +1233,6 @@ fn assert_no_smaller_body(wires: &[Value], item: &SnapshotItem) {
             }
         }
     }
-}
-
-/// [money] [regress] A session this ledger never settled sends its whole
-/// patched body once, as a token-less head-CAS write (1 POST, was 3: probe,
-/// probe repeat, body). The empty server completes the patch, stores it and
-/// returns the head. Oracle: the same accepted usage, cache state, placement
-/// and stored body as today's probe stages on the same session.
-#[test]
-fn a_new_session_bootstraps_its_head_with_one_whole_cas_write() {
-    let none = BTreeSet::new();
-    let new = body("new", Some(item().cache_observations.unwrap()));
-    let key = cache_session_key("new");
-    let mut store = HeadStore::default();
-    let mut progress = fresh_progress();
-    assert_eq!(
-        cas_bootstrap_bodies(&progress, std::slice::from_ref(&new)),
-        BTreeSet::from([new.snapshot_fingerprint.clone()])
-    );
-    let (result, wires) = page(
-        &mut progress,
-        std::slice::from_ref(&new),
-        &none,
-        |request, wire| Ok(store.post(request, wire)),
-    );
-    assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
-    assert_eq!(wires.len(), 1, "one POST");
-    assert!(wires[0]["head_cas_contract"].is_string());
-    assert!(wires[0]["cache_state_ack_contract"].is_string());
-    let sent = &wires[0]["snapshots"][0];
-    assert!(
-        sent["semantic_envelope"].get("base_head_etag").is_none(),
-        "token-less bootstrap"
-    );
-    assert_eq!(
-        sent["cache_observations"],
-        serde_json::to_value(new.cache_observations.as_ref().unwrap()).unwrap(),
-        "the whole patch"
-    );
-    assert_ne!(sent["cache_observations"]["full_replacement"], true);
-    assert_eq!(progress.accepted_cache_heads[&key], store.heads["new"].0);
-    assert_eq!(store.stored, ["new"]);
-
-    // Control: today's probe stages on the same session and an empty server.
-    let mut old_store = HeadStore::default();
-    let mut old = fresh_progress();
-    let probe_wires = probe_stages(&mut old, &mut old_store, std::slice::from_ref(&new));
-    let mut items = vec![new.clone()];
-    assert!(apply_bootstrapped_cache_heads("codex", &mut items, &old)
-        .unwrap()
-        .is_empty());
-    let (result, old_wires) = page(&mut old, &items, &none, |request, wire| {
-        Ok(old_store.post(request, wire))
-    });
-    assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
-    assert_eq!(probe_wires.len() + old_wires.len(), 3);
-    assert_eq!(settled(&progress, &store), settled(&old, &old_store));
-    assert_eq!(
-        bare(&wires[0]["snapshots"][0]),
-        bare(&old_wires[0]["snapshots"][0]),
-        "same body bytes"
-    );
-    assert_no_smaller_body(&wires, &new);
-}
-
-/// [money] The same write against a server that already holds the session's
-/// head (a local reset, another writer): it conflicts and owes a challenge,
-/// nothing is settled, stored or dropped, and the next page recovers through
-/// the ordinary bootstrap. Oracle: the same settled view as a clean new
-/// session; no POST carries a smaller body.
-#[test]
-fn a_cas_bootstrap_against_an_existing_head_recovers_next_page() {
-    let none = BTreeSet::new();
-    let new = body("reset", Some(item().cache_observations.unwrap()));
-    let key = cache_session_key("reset");
-    let mut store = HeadStore::default();
-    store.seed("reset");
-    let mut progress = fresh_progress();
-    let (result, wires) = page(
-        &mut progress,
-        std::slice::from_ref(&new),
-        &none,
-        |request, wire| Ok(store.post(request, wire)),
-    );
-    assert_eq!(
-        result.unwrap(),
-        ResumableUploadResult::Deferred {
-            count: 1,
-            isolated: 1
-        }
-    );
-    assert_eq!(wires.len(), 1);
-    assert!(wires[0]["head_cas_contract"].is_string());
-    assert!(progress.head_conflict_challenges.contains_key(&key));
-    assert!(progress
-        .quarantined_fingerprints
-        .contains_key(&new.snapshot_fingerprint));
-    assert!(progress.accepted_body_witnesses.is_empty());
-    assert!(!progress.accepted_cache_heads.contains_key(&key));
-    assert!(store.stored.is_empty(), "a conflict stores nothing");
-
-    // Next page: the owed challenge routes the session through the probes.
-    assert!(cas_bootstrap_bodies(&progress, std::slice::from_ref(&new)).is_empty());
-    progress.prepare_quarantine_retries(&BTreeMap::new());
-    let probe_wires = probe_stages(&mut progress, &mut store, std::slice::from_ref(&new));
-    assert_eq!(probe_wires.len(), 2);
-    let mut items = vec![new.clone()];
-    assert!(
-        apply_bootstrapped_cache_heads("codex", &mut items, &progress)
-            .unwrap()
-            .is_empty()
-    );
-    let (result, main) = page(&mut progress, &items, &none, |request, wire| {
-        Ok(store.post(request, wire))
-    });
-    assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
-    assert!(progress.head_conflict_challenges.is_empty());
-    assert!(progress.quarantined_fingerprints.is_empty());
-    assert_eq!(progress.accepted_cache_heads[&key], store.heads["reset"].0);
-
-    let mut clean_store = HeadStore::default();
-    let mut clean = fresh_progress();
-    let (result, _) = page(
-        &mut clean,
-        std::slice::from_ref(&new),
-        &none,
-        |request, wire| Ok(clean_store.post(request, wire)),
-    );
-    assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
-    assert_eq!(settled(&progress, &store), settled(&clean, &clean_store));
-    assert_no_smaller_body(&wires, &new);
-    assert_no_smaller_body(&probe_wires, &new);
-    assert_no_smaller_body(&main, &new);
 }
 
 /// [money] [regress] A headed session's update without a cache patch goes
@@ -1403,7 +1277,6 @@ fn a_headed_update_without_a_patch_keeps_its_head() {
     );
     let fresh = progress.accepted_cache_heads[&key].clone();
     let mut next = vec![patched.clone()];
-    assert!(cas_bootstrap_bodies(&progress, &next).is_empty());
     assert!(
         apply_bootstrapped_cache_heads("codex", &mut next, &progress)
             .unwrap()
@@ -1426,7 +1299,6 @@ fn a_headed_update_without_a_patch_keeps_its_head() {
     );
     assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
     assert!(ordinary[0].get("head_cas_contract").is_none());
-    assert!(cas_bootstrap_bodies(&old, std::slice::from_ref(&patched)).is_empty());
     assert_eq!(
         probe_stages(&mut old, &mut old_store, std::slice::from_ref(&patched)).len(),
         2
@@ -1536,102 +1408,10 @@ fn copies_of_a_headed_session_wait_one_page_and_drop_nothing() {
     assert_eq!(old_store.bodies["copied"].0, store.bodies["copied"].0);
 }
 
-/// A 503 route-unavailable shed (head CAS lacks accepted-log admission,
-/// Retry-After 60): the page sheds with the server's wait, nothing settles
-/// or is held, and the next page sends the same token-less CAS write again,
-/// never the ordinary probe stages.
+/// Unchanged control: a settled session's next unpatched revision keeps its
+/// ordinary request, with no contract, base or saved head.
 #[test]
-fn a_route_unavailable_shed_retries_the_cas_write_later() {
-    let none = BTreeSet::new();
-    let new = body("shed", Some(item().cache_observations.unwrap()));
-    let wait = std::time::Duration::from_secs(60);
-    let mut progress = fresh_progress();
-    let (result, wires) = page(&mut progress, std::slice::from_ref(&new), &none, |_, _| {
-        Err(anyhow::Error::new(crate::snapshot_client::UploadShed {
-            status: 503,
-            retry_after: Some(wait),
-            code: None,
-        }))
-    });
-    assert_eq!(
-        result.unwrap(),
-        ResumableUploadResult::Shed {
-            retry_after: Some(wait)
-        }
-    );
-    assert_eq!(wires.len(), 1, "no resend in place, no fallback");
-    assert!(wires[0]["head_cas_contract"].is_string());
-    assert!(progress.accepted_body_witnesses.is_empty());
-    assert!(progress.quarantined_fingerprints.is_empty());
-    assert!(progress.head_conflict_challenges.is_empty());
-    assert_eq!(
-        cas_bootstrap_bodies(&progress, std::slice::from_ref(&new)),
-        BTreeSet::from([new.snapshot_fingerprint.clone()])
-    );
-    let mut store = HeadStore::default();
-    let (result, retried) = page(
-        &mut progress,
-        std::slice::from_ref(&new),
-        &none,
-        |request, wire| Ok(store.post(request, wire)),
-    );
-    assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
-    assert_eq!(retried, wires, "the same token-less CAS write");
-}
-
-/// Unchanged control: only never-settled patched sessions skip the probes.
-/// An accepted fingerprint, a saved head, cache state, an owed challenge, a
-/// held body, a session sibling on the page or no patch keeps today's path,
-/// and a base-less unpatched body still goes in an ordinary request.
-#[test]
-fn only_never_settled_patched_sessions_skip_the_probe_stages() {
-    let patch = item().cache_observations.unwrap();
-    let named = |name: &str| body(name, Some(patch.clone()));
-    let (new, acked, headed, stated, owed, held) = (
-        named("new"),
-        named("acked"),
-        named("headed"),
-        named("stated"),
-        named("owed"),
-        named("held"),
-    );
-    let twin = named("twin");
-    let twin_revision = revised(&twin, 1);
-    let unpatched = body("unpatched", None);
-    let mut progress = fresh_progress();
-    progress.record_body(
-        &acked.snapshot_fingerprint,
-        &snapshot_upload_body_witness(&acked),
-    );
-    progress
-        .accepted_cache_heads
-        .insert(cache_session_key("headed"), stale_head());
-    progress.accepted_cache_states.insert(
-        cache_session_key("stated"),
-        serde_json::json!({"observations": []}),
-    );
-    owe(&mut progress, &owed, challenge(0xc));
-    progress.quarantine_body(
-        &held.snapshot_fingerprint,
-        &snapshot_upload_body_witness(&held),
-    );
-    let items = [
-        new.clone(),
-        acked,
-        headed,
-        stated,
-        owed,
-        held,
-        twin,
-        twin_revision,
-        unpatched,
-    ];
-    assert_eq!(
-        cas_bootstrap_bodies(&progress, &items),
-        BTreeSet::from([new.snapshot_fingerprint.clone()])
-    );
-
-    // A settled session's next unpatched revision keeps its ordinary request.
+fn a_settled_unpatched_revision_keeps_its_ordinary_request() {
     let plain = body("plain", None);
     let mut store = HeadStore::default();
     let mut progress = fresh_progress();
