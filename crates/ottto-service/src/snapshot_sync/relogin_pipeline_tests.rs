@@ -331,12 +331,18 @@ fn owner_return_preserves_all_source_carry() {
         );
         legacy.save(&cx_path).unwrap();
         let progress_path = snapshot_upload_progress_path(&cx_path);
-        let mut progress = SnapshotUploadProgress::load(
-            &progress_path,
-            &namespace_a,
-            snapshot_quarantine_witness(SnapshotSource::Codex),
-        )
-        .unwrap();
+        let codex_checkpoints = || {
+            load_source_checkpoints(
+                &cx_path,
+                &progress_path,
+                SnapshotSource::Codex,
+                &support,
+                &namespace_a,
+                snapshot_quarantine_witness(SnapshotSource::Codex),
+            )
+            .unwrap()
+        };
+        let (_, _, mut progress) = codex_checkpoints();
         progress.prepare_historical_replay(&generation);
         progress.save(&progress_path).unwrap();
         // Like install_legacy_active: A already completed its initial Codex backfill.
@@ -480,16 +486,10 @@ fn owner_return_preserves_all_source_carry() {
         assert!(!entry.codex_counting_v2, "Legacy ACK keeps the UI counter");
         assert!(saved.historical_replay_generation_matches(&generation));
         assert_eq!(
-            SnapshotUploadProgress::load_for_index(
-                &saved,
-                &cx_path,
-                &progress_path,
-                &namespace_a,
-                snapshot_quarantine_witness(SnapshotSource::Codex),
-            )
-            .unwrap()
-            .historical_replay_generation
-            .as_deref(),
+            codex_checkpoints()
+                .2
+                .historical_replay_generation
+                .as_deref(),
             Some(generation.as_str()),
             "the accepted baseline really completed the current replay"
         );
