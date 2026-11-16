@@ -624,6 +624,9 @@ Verification authorizes before source reads or result writes; setup authorizes
 before acquiring the process-wide scan lock. Telemetry controls require the
 validated user and organization to match the connected local account, under the
 identity lifecycle lock, and refuse work while an identity change is reserved.
+Telemetry status and disable also require the validated device to match the
+local health device binding and the request key id to equal the validated key id
+(including both absent), before any local reads or effects for the action.
 Codex daily-reference controls build their complete returned status from local
 stores before releasing that lock. Browser control requires an allowed Origin
 and loopback Host with the listener's port. Probes return their existing identity
