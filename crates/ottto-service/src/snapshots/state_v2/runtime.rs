@@ -626,8 +626,9 @@ pub(in super::super) fn save_locked(
             let digests = saved?;
             session.stamp = session.db.stamp()?;
             state.saved_page(session.db.save_over_target(), claim_only);
-            // A claim-only save keeps only its carrier links: later saves
-            // read the committed rows again.
+            // A claim-only save keeps its carrier links for decide; row
+            // diffs re-read the committed rows (it writes no tail stage, so
+            // committed heads still match those links).
             if !session.reload {
                 state.save_digests = Some(if claim_only {
                     digests.links_only()

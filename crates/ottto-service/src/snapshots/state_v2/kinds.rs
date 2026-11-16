@@ -37,8 +37,9 @@ pub(super) struct Baseline {
     pub(super) generation: u64,
     pub(super) rows: BTreeMap<RowKey, [u8; 32]>,
     pub(super) copy_ownership: super::super::claude_request_money::e2::CopyOwnership,
-    /// Kept by a claim-only save for its carrier links alone: its rows do not
-    /// describe the committed graph, so no save diffs against them.
+    /// Kept by a claim-only save: decide still reads its carrier links
+    /// (`runtime_tail::carried_sessions`), but its rows do not describe the
+    /// committed graph, so every save re-reads committed rows instead.
     pub(super) links_only: bool,
 }
 impl Baseline {
