@@ -3,7 +3,10 @@
 use serde::{ser::SerializeMap, Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::Write;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{
+    AtomicU64,
+    Ordering::{Relaxed, SeqCst},
+};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) mod cli_children;
@@ -946,6 +949,7 @@ pub(crate) fn credential_file_read<T>(result: anyhow::Result<T>) -> anyhow::Resu
 /// Cumulative shared-process totals, NOT events attributed to the finishing
 /// page/source. No CPU/RSS probe, lookup, new collection trigger or wire event.
 pub(crate) fn cache_lifecycle_totals() {
+    crate::upload_receipts::sample_pager_writes();
     traversal_point(
         "process_retained_cache_lifecycle_totals",
         "unknown",
@@ -1209,8 +1213,8 @@ pub(crate) struct Probe {
     pub(crate) full_causes: FullCauses,
     pub(crate) line_delivery: Option<(&'static str, LineDeliveryCounts)>,
     pub(crate) discovery_growth: crate::snapshots::discovery_growth::Page,
-    /// Page window only (`Probe::page`): `Some(None)` is a refused sampler
-    /// slot, reported as one sample failure. Other probes carry `None`.
+    /// Sampled page/upload window: `Some(None)` is a refused sampler slot,
+    /// reported as one sample failure. Other probes carry `None`.
     footprint: Option<Option<footprint::Stage>>,
 }
 impl Drop for Probe {
@@ -1436,12 +1440,17 @@ impl Probe {
                 Default::default()
             },
         };
+        let malloc_in_use_bytes = footprint::malloc_in_use();
+        pass_malloc(source, |points| points.page_end = malloc_in_use_bytes);
         emit(&Record {
             schema_version: SCHEMA_VERSION,
             process_id: std::process::id(),
             stage: "native_collection_page",
             source: Source::from_slug(source),
-            observation: self.page_observation(),
+            observation: Observation {
+                malloc_in_use_bytes,
+                ..self.page_observation()
+            },
             counts,
         });
         // Own records, so the page line stays under its size bound (§13).
@@ -1492,6 +1501,8 @@ struct Observation {
     #[serde(skip_serializing_if = "Option::is_none")]
     malloc_in_use_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    malloc_in_use_bytes_delta: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     malloc_allocated_bytes: Option<u64>,
     shared_process_cpu_delta_us: Option<u64>,
     #[serde(flatten)]
@@ -1522,6 +1533,7 @@ impl Observation {
                 .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok()),
             wall_elapsed_us: wall,
             malloc_in_use_bytes: None,
+            malloc_in_use_bytes_delta: None,
             malloc_allocated_bytes: None,
             footprint: Default::default(),
             cli_children: Vec::new(),
@@ -1555,8 +1567,12 @@ pub(crate) fn source_prepare<T>(
                 probe.process,
                 [malloc_in_use_bytes, malloc_allocated_bytes],
                 None,
+                MallocCheckpoints::default(),
             ))
         });
+        // Bumped after the slot is set: a window that read the count before
+        // this bump reads the open slot next.
+        with_pass_starts(|n| n.fetch_add(1, SeqCst));
     }
     let footprint = footprint::Stage::begin();
     let result = inner();
@@ -1623,7 +1639,7 @@ fn source_finish_inner<T>(
     window.finish_sample = Some(after);
     window.pass = source_slot(source)
         .and_then(|slot| with_passes(|p| p.lock().unwrap_or_else(|e| e.into_inner())[slot].take()))
-        .map(|(start, before, zone_start, retained)| {
+        .map(|(start, before, zone_start, retained, _)| {
             let (retained_heap_bytes, retained_cost_us) = retained
                 .map(|(bytes, cost)| (Some(bytes), cost))
                 .unwrap_or_default();
@@ -1661,7 +1677,29 @@ type PassStart = (
     Option<ProcessSample>,
     [Option<u64>; 2],
     Option<(RetainedBytes, u64)>,
+    MallocCheckpoints,
 );
+#[derive(Default)]
+struct MallocCheckpoints {
+    // Outer None: no window; Some(None): active with an unavailable sample.
+    index_clone: Option<Option<u64>>,
+    page_end: Option<u64>,
+}
+fn pass_malloc<T>(source: &str, f: impl FnOnce(&mut MallocCheckpoints) -> T) -> Option<T> {
+    let slot = source_slot(source)?;
+    with_passes(|p| {
+        p.lock().unwrap_or_else(|e| e.into_inner())[slot]
+            .as_mut()
+            .map(|pass| f(&mut pass.4))
+    })
+}
+pub(crate) fn index_clone_start(source: &str) {
+    let sample = footprint::malloc_in_use();
+    pass_malloc(source, |points| {
+        points.index_clone = Some(sample);
+        points.page_end = None;
+    });
+}
 pub(crate) fn pass_retained(source: &str, measure: impl FnOnce() -> RetainedBytes) {
     let started = Instant::now();
     let bytes = measure();
@@ -1675,6 +1713,26 @@ pub(crate) fn pass_retained(source: &str, measure: impl FnOnce() -> RetainedByte
     }
 }
 process_static!(fn with_passes: std::sync::Mutex<[Option<PassStart>; 3]> = std::sync::Mutex::new([const { None }; 3]));
+process_static!(fn with_pass_starts: AtomicU64 = AtomicU64::new(0));
+/// Passes started so far, then whether one is open. Read at an off-pass
+/// window's open and close; any change or open pass marks the window.
+fn pass_state() -> (u64, bool) {
+    let started = with_pass_starts(|n| n.load(SeqCst));
+    let open = with_passes(|p| {
+        p.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(Option::is_some)
+    });
+    (started, open)
+}
+/// A pass that ended without a finish (none to do, refused, failed) is no
+/// longer open; a finished pass already took its slot.
+pub(crate) fn pass_ended(source: &str) {
+    if let Some(slot) = source_slot(source) {
+        with_passes(|p| p.lock().unwrap_or_else(|e| e.into_inner())[slot] = None);
+    }
+}
 #[derive(Serialize)]
 struct PassSummary {
     wall_us: u64,
@@ -1703,6 +1761,7 @@ pub(crate) struct StageWindow {
     jsonl: Option<jsonl::Scope>,
     evidence_mem: Option<EvidenceMem>,
     offpass_cpu: Option<Option<StateV2Cpu>>,
+    offpass_passes: Option<(u64, bool)>,
     finish_sample: Option<Option<ProcessSample>>,
     pass: Option<PassSummary>,
     /// Off-pass control request counts from `take_control` (no ids or args).
@@ -1757,6 +1816,7 @@ impl StageWindow {
     }
     pub(crate) fn begin(source: &str, stage: &'static str) -> Self {
         let offpass = stage.starts_with("offpass_");
+        let offpass_passes = offpass.then(pass_state);
         Self {
             stage,
             source: Source::from_slug(source),
@@ -1767,6 +1827,7 @@ impl StageWindow {
             finish_sample: None,
             pass: None,
             offpass_cpu: offpass.then(|| process_usage().map(|(_, cpu)| cpu)),
+            offpass_passes,
             control: BTreeMap::new(),
         }
     }
@@ -1785,6 +1846,11 @@ impl Drop for StageWindow {
         if let Some(before) = self.offpass_cpu {
             let samples = before.zip(process_usage().map(|(_, cpu)| cpu));
             let observation = self.probe.observation();
+            let (started, open) = pass_state();
+            let pass_overlap = open
+                || self
+                    .offpass_passes
+                    .is_some_and(|(before, open)| open || before != started);
             aggregate_offpass(Record {
                 schema_version: SCHEMA_VERSION,
                 process_id: std::process::id(),
@@ -1797,6 +1863,7 @@ impl Drop for StageWindow {
                         .and_then(|(a, b)| b.cpu_user_us.checked_sub(a.cpu_user_us)),
                     cpu_sys_us: samples.and_then(|(a, b)| b.cpu_sys_us.checked_sub(a.cpu_sys_us)),
                     control: std::mem::take(&mut self.control),
+                    pass_overlap,
                 },
                 observation,
             });
@@ -1853,6 +1920,10 @@ struct OffpassCounts {
     wall_max_us: u64,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     control: BTreeMap<&'static str, u64>,
+    /// A source pass ran at some point in the window; absent means none did.
+    /// Kept in its own row so clean windows stay clean.
+    #[serde(skip_serializing_if = "is_zero")]
+    pass_overlap: bool,
 }
 std::thread_local! {
     static CONTROL: std::cell::RefCell<BTreeMap<&'static str, u64>> = const {
@@ -1882,13 +1953,14 @@ pub(crate) fn trust_check(check: impl FnOnce() -> bool) -> bool {
 pub(crate) fn take_control() -> BTreeMap<&'static str, u64> {
     CONTROL.take()
 }
-// Literal source/stage keys only; one pending row per lane, no work-unit history.
-process_static!(fn with_offpass: std::sync::Mutex<BTreeMap<(Source, &'static str), Record<OffpassCounts>>> =
-    std::sync::Mutex::new(BTreeMap::new()));
+// Literal source/stage keys only; one pending row per lane and pass overlap,
+// no work-unit history.
+type OffpassRows = BTreeMap<(Source, &'static str, bool), Record<OffpassCounts>>;
+process_static!(fn with_offpass: std::sync::Mutex<OffpassRows> = std::sync::Mutex::new(BTreeMap::new()));
 fn aggregate_offpass(mut row: Record<OffpassCounts>) {
     with_offpass(|state| {
         let mut rows = state.lock().unwrap_or_else(|error| error.into_inner());
-        let key = (row.source, row.stage);
+        let key = (row.source, row.stage, row.counts.pass_overlap);
         if let Some(previous) = rows.remove(&key) {
             row.counts.count += previous.counts.count;
             row.counts.wall_max_us = row.counts.wall_max_us.max(previous.counts.wall_max_us);
@@ -2344,6 +2416,25 @@ pub(crate) fn traversal_point(stage: &'static str, source: &str, counts: &impl S
     });
 }
 
+pub(crate) fn state_save_start(source: &str) {
+    let before = pass_malloc(source, |points| points.page_end).flatten();
+    malloc_delta_point(
+        "state_save_start",
+        source,
+        before,
+        footprint::malloc_in_use(),
+    );
+}
+fn malloc_delta_point(stage: &'static str, source: &str, before: Option<u64>, after: Option<u64>) {
+    emit_stage(stage, Source::from_slug(source), None, || Observation {
+        malloc_in_use_bytes: after,
+        malloc_in_use_bytes_delta: before
+            .zip(after)
+            .and_then(|(a, b)| i64::try_from(i128::from(b) - i128::from(a)).ok()),
+        ..Observation::point()
+    });
+}
+
 /// Per-page restore attempts. A miss class never authorizes a body read.
 #[derive(Debug, Default, Serialize)]
 pub(crate) struct FullCauses {
@@ -2581,6 +2672,8 @@ impl Serialize for FullReasons {
 
 #[derive(Debug, Default, Serialize)]
 struct UploadCounts {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    malloc_in_use_bytes_start: Option<u64>,
     serialized_body_bytes: Option<u64>,
     gzip_attempts: u64,
     identity_attempts: u64,
@@ -2594,10 +2687,23 @@ pub(crate) struct UploadCall {
 }
 impl UploadCall {
     pub(crate) fn start(source: &str) -> Self {
+        let probe = Probe::page();
+        let malloc_in_use_bytes_start = footprint::malloc_in_use();
+        if let Some(before) = pass_malloc(source, |points| points.index_clone.take()).flatten() {
+            malloc_delta_point(
+                "index_clone_to_upload",
+                source,
+                before,
+                malloc_in_use_bytes_start,
+            );
+        }
         Self {
-            probe: Probe::start(),
+            probe,
             source: Source::from_slug(source),
-            counts: UploadCounts::default(),
+            counts: UploadCounts {
+                malloc_in_use_bytes_start,
+                ..UploadCounts::default()
+            },
         }
     }
     pub(crate) fn serialized(&mut self, bytes: usize) {
@@ -2629,7 +2735,10 @@ impl Drop for UploadCall {
             process_id: std::process::id(),
             stage: "snapshot_batch_call",
             source: self.source,
-            observation: self.probe.observation().slim(),
+            observation: Observation {
+                malloc_in_use_bytes: footprint::malloc_in_use(),
+                ..self.probe.page_observation().slim()
+            },
             counts: &self.counts,
         });
     }
@@ -3267,6 +3376,7 @@ mod tests {
                         cpu_sys_us: Some(5),
                         wall_max_us: 7,
                         control: BTreeMap::new(),
+                        pass_overlap: false,
                     },
                 });
             }
@@ -3283,6 +3393,103 @@ mod tests {
             assert_eq!(rows[0]["observation"][key], 3);
         }
         assert_eq!(rows[1]["stage"], "source_prepare");
+    }
+
+    /// [regress] A pass overlapping an off-pass window marks it `pass_overlap`
+    /// in its own row with every delta kept; clean windows omit the field.
+    #[test]
+    fn offpass_pass_overlap_splits_rows_and_keeps_deltas() {
+        let quota = || drop(StageWindow::begin("codex", "offpass_codex_quota"));
+        let sample = |n| ProcessSample {
+            cpu_us: n,
+            lifetime_max_rss_bytes: 1,
+            disk: Some(DiskBytes {
+                disk_read_bytes: n,
+                disk_written_bytes: n,
+                counters: Metrics([Some(n); 7]),
+            }),
+        };
+        let (_, rows) = capture(|| {
+            let window = StageWindow::begin("codex", "offpass_codex_quota");
+            source_prepare("codex", || (), |_| false);
+            source_finish("codex", false, || Ok(())).unwrap();
+            drop(window); // a pass started and ended mid-window
+            quota(); // clean, same period: its own row
+                     // Two fixed windows per flag: same-flag sums, cross-flag separation.
+            for (pass_overlap, d) in [(true, 44), (false, 10), (true, 44), (false, 10)] {
+                aggregate_offpass(Record {
+                    schema_version: SCHEMA_VERSION,
+                    process_id: std::process::id(),
+                    stage: "offpass_cloud_sessions",
+                    source: Source::Codex,
+                    observation: Observation::between(7, Some(sample(1)), Some(sample(1 + d))),
+                    counts: OffpassCounts {
+                        count: 1,
+                        cpu_user_us: Some(d),
+                        cpu_sys_us: Some(2 * d),
+                        wall_max_us: 7,
+                        control: BTreeMap::new(),
+                        pass_overlap,
+                    },
+                });
+            }
+            source_prepare("codex", || (), |_| false); // flushes the period
+            quota(); // the pass is open at open and close
+            flush_offpass();
+        });
+        let offpass: Vec<_> = rows
+            .iter()
+            .filter(|row| {
+                row["stage"]
+                    .as_str()
+                    .is_some_and(|s| s.starts_with("offpass_"))
+            })
+            .collect();
+        let flags: Vec<_> = offpass
+            .iter()
+            .map(|row| {
+                let overlap = row["counts"].get("pass_overlap");
+                (
+                    row["stage"].as_str().unwrap(),
+                    overlap.and_then(serde_json::Value::as_bool),
+                )
+            })
+            .collect();
+        let (cloud, quota) = ("offpass_cloud_sessions", "offpass_codex_quota");
+        assert_eq!(
+            flags,
+            [
+                (cloud, None),
+                (cloud, Some(true)),
+                (quota, None),
+                (quota, Some(true)),
+                (quota, Some(true)),
+            ]
+        );
+        for (row, d) in offpass[..2].iter().zip([10, 44]) {
+            let mut counts = serde_json::json!(
+                {"count": 2, "cpu_user_us": 2 * d, "cpu_sys_us": 4 * d, "wall_max_us": 7}
+            );
+            if d == 44 {
+                counts["pass_overlap"] = true.into();
+            }
+            assert_eq!(row["counts"], counts);
+            let observation = &row["observation"];
+            assert_eq!(observation["wall_elapsed_us"], 14);
+            let summed = [
+                "shared_process_cpu_delta_us",
+                "disk_read_bytes",
+                "disk_written_bytes",
+            ];
+            for key in summed.iter().chain(&METRIC_KEYS[..4]) {
+                assert_eq!(observation[key], 2 * d, "{key}");
+            }
+        }
+        for row in &offpass[2..] {
+            assert_eq!(row["counts"]["count"], 1);
+            let disk = row["observation"].get("disk_read_bytes").is_some();
+            assert_eq!(disk, cfg!(target_os = "macos"));
+        }
     }
 
     /// [behaviour] Control requests sum per class; the trust timer sums, maxes
@@ -3388,7 +3595,6 @@ mod tests {
             }
         }
         let (_, records) = capture(|| {
-            drop(UploadCall::start("codex"));
             traversal_point("synthetic", "pi", &BTreeMap::<&str, u64>::new());
         });
         let page = serde_json::to_value(Probe::start().observation()).unwrap();
@@ -3403,6 +3609,211 @@ mod tests {
             ] {
                 assert!(row.get(field).is_none());
             }
+        }
+    }
+
+    #[test]
+    fn page_end_row_carries_malloc_in_use_when_available() {
+        for source in ["claude_code", "codex", "pi"] {
+            let (_, records) = capture(|| {
+                Probe::page().collection(
+                    source,
+                    CollectionCounts {
+                        scanned_files: 0,
+                        semantic_noops: 0,
+                        sampled_acquisition: None,
+                        full_causes: Default::default(),
+                    },
+                );
+            });
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0]["stage"], "native_collection_page");
+            assert_eq!(records[0]["source"], source);
+            assert_eq!(
+                records[0]["observation"]
+                    .get("malloc_in_use_bytes")
+                    .is_some(),
+                cfg!(target_os = "macos")
+            );
+            if cfg!(target_os = "macos") {
+                assert!(records[0]["observation"]["malloc_in_use_bytes"].is_u64());
+            }
+        }
+    }
+
+    #[test]
+    fn upload_row_carries_malloc_endpoints_when_available() {
+        let (_, records) = capture(|| drop(UploadCall::start("claude_code")));
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["stage"], "snapshot_batch_call");
+        assert_eq!(records[0]["source"], "claude_code");
+        for (section, field) in [
+            ("counts", "malloc_in_use_bytes_start"),
+            ("observation", "malloc_in_use_bytes"),
+        ] {
+            let value = records[0][section].get(field);
+            assert_eq!(value.is_some(), cfg!(target_os = "macos"));
+            if let Some(value) = value {
+                assert!(value.is_u64());
+            }
+        }
+    }
+
+    #[test]
+    fn upload_row_carries_sampled_footprint_window() {
+        for source in ["claude_code", "codex", "pi"] {
+            let (_, records) = capture(|| drop(UploadCall::start(source)));
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0]["stage"], "snapshot_batch_call");
+            assert_eq!(records[0]["source"], source);
+            let row = &records[0]["observation"];
+            assert!(row["footprint_sample_failures"].is_u64());
+            if let Some(peak) = row["stage_peak_footprint_bytes"].as_u64() {
+                for endpoint in ["stage_start_footprint_bytes", "stage_end_footprint_bytes"] {
+                    if let Some(bytes) = row[endpoint].as_u64() {
+                        assert!(peak >= bytes);
+                    }
+                }
+                assert!(row["footprint_samples"].as_u64().unwrap() >= 1);
+            } else {
+                assert!(row["footprint_sample_failures"].as_u64().unwrap() >= 1);
+            }
+        }
+    }
+
+    #[test]
+    fn state_save_start_is_a_content_free_malloc_point() {
+        for (source, expected) in [
+            ("claude_code", "claude_code"),
+            ("codex", "codex"),
+            ("pi", "pi"),
+            ("secret/path/provider", "unknown"),
+        ] {
+            let (_, records) = capture(|| state_save_start(source));
+            assert_eq!(records.len(), 1);
+            let row = &records[0];
+            assert_eq!(row["stage"], "state_save_start");
+            assert_eq!(row["source"], expected);
+            assert_eq!(row["counts"], serde_json::json!({}));
+            assert_eq!(row["observation"]["wall_elapsed_us"], 0);
+            assert_eq!(
+                row["observation"].get("malloc_in_use_bytes").is_some(),
+                cfg!(target_os = "macos")
+            );
+            if cfg!(target_os = "macos") {
+                assert!(row["observation"]["malloc_in_use_bytes"].is_u64());
+            }
+            assert!(row["observation"]
+                .get("stage_peak_footprint_bytes")
+                .is_none());
+            assert!(row["observation"]["shared_process_cpu_delta_us"].is_null());
+            assert!(!serde_json::to_string(row).unwrap().contains("secret/path"));
+        }
+    }
+
+    #[test]
+    fn malloc_delta_point_rows_preserve_signed_net_bytes_and_missing_samples() {
+        for stage in ["index_clone_to_upload", "state_save_start"] {
+            for (before, after, expected) in [
+                (Some(100), Some(130), Some(30)),
+                (Some(100), Some(70), Some(-30)),
+                (Some(100), Some(100), Some(0)),
+                (None, Some(70), None),
+                (Some(100), None, None),
+                (Some(u64::MAX), Some(0), None),
+            ] {
+                let (_, records) = capture(|| {
+                    malloc_delta_point(stage, "secret/path/provider", before, after);
+                });
+                assert_eq!(records.len(), 1);
+                let row = &records[0];
+                assert_eq!(row["stage"], stage);
+                assert_eq!(row["source"], "unknown");
+                assert_eq!(row["counts"], serde_json::json!({}));
+                let observation = &row["observation"];
+                assert_eq!(observation["malloc_in_use_bytes"].as_u64(), after);
+                assert_eq!(observation["malloc_in_use_bytes_delta"].as_i64(), expected);
+                assert_eq!(
+                    observation.get("malloc_in_use_bytes_delta").is_some(),
+                    expected.is_some()
+                );
+                assert_eq!(observation["wall_elapsed_us"], 0);
+                assert!(observation.get("stage_peak_footprint_bytes").is_none());
+                assert!(!serde_json::to_string(row).unwrap().contains("secret/path"));
+            }
+        }
+    }
+
+    #[test]
+    fn pass_malloc_windows_end_at_first_batch_and_save_after_page() {
+        for source in ["claude_code", "codex", "pi"] {
+            let (_, records) = capture(|| {
+                source_prepare(
+                    source,
+                    || {
+                        index_clone_start(source);
+                        Probe::page().collection(
+                            source,
+                            CollectionCounts {
+                                scanned_files: 0,
+                                semantic_noops: 0,
+                                sampled_acquisition: None,
+                                full_causes: Default::default(),
+                            },
+                        );
+                        source_finish(source, false, || {
+                            drop(UploadCall::start(source));
+                            drop(UploadCall::start(source));
+                            state_save_start(source);
+                            Ok(())
+                        })
+                        .unwrap();
+                    },
+                    |_| false,
+                );
+            });
+            assert_eq!(
+                records
+                    .iter()
+                    .map(|row| row["stage"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                [
+                    "native_collection_page",
+                    "index_clone_to_upload",
+                    "snapshot_batch_call",
+                    "snapshot_batch_call",
+                    "state_save_start",
+                    "source_finish",
+                    "source_prepare",
+                ]
+            );
+            for row in [&records[1], &records[4]] {
+                assert_eq!(row["source"], source);
+                assert_eq!(
+                    row["observation"]
+                        .get("malloc_in_use_bytes_delta")
+                        .is_some(),
+                    cfg!(target_os = "macos")
+                );
+                if cfg!(target_os = "macos") {
+                    assert!(row["observation"]["malloc_in_use_bytes_delta"].is_i64());
+                }
+            }
+            let page_end = records[0]["observation"]["malloc_in_use_bytes"].as_u64();
+            let save_start = records[4]["observation"]["malloc_in_use_bytes"].as_u64();
+            assert_eq!(
+                records[4]["observation"]["malloc_in_use_bytes_delta"].as_i64(),
+                page_end
+                    .zip(save_start)
+                    .and_then(|(a, b)| i64::try_from(i128::from(b) - i128::from(a)).ok())
+            );
+            let (_, rows) = capture(|| drop(UploadCall::start(source)));
+            assert_eq!(
+                rows.len(),
+                1,
+                "a finished pass cannot supply another clone baseline"
+            );
+            assert_eq!(rows[0]["stage"], "snapshot_batch_call");
         }
     }
 
@@ -3941,6 +4352,34 @@ mod tests {
         assert!(rows.is_empty());
     }
 
+    /// [regress] Both shared helpers count completed writes, including temp files.
+    #[test]
+    fn shared_cache_helpers_raise_cumulative_bytes_in_captured_row() {
+        let scratch = crate::test_scratch::ScratchDir::canonical("cache-write-bytes");
+        let field = "shared_cache_helper_write_bytes_cumulative";
+        let before = capture(cache_lifecycle_totals).1[0]["counts"][field]
+            .as_u64()
+            .unwrap();
+        let value = serde_json::json!({"count": 3});
+        let payload = b"{\"count\":4}";
+        let (_, counts) = cache_lifecycle::observe(|| {
+            crate::locked_state_dir::write_json_atomic(&scratch.join("first.json"), &value);
+            crate::locked_state_dir::replace_json_cache(
+                &scratch.join("second.json"),
+                payload,
+                "cache",
+                "cache",
+            )
+            .unwrap();
+        });
+        let expected = serde_json::to_vec(&value).unwrap().len() as u64 + payload.len() as u64;
+        assert_eq!(counts.shared_cache_helper_write_bytes_cumulative, expected);
+        let (_, rows) = capture(cache_lifecycle_totals);
+        assert_eq!(rows[0]["stage"], "process_retained_cache_lifecycle_totals");
+        assert!(rows[0]["counts"][field].as_u64().unwrap() >= before + expected);
+        assert_eq!(std::fs::read(scratch.join("second.json")).unwrap(), payload);
+    }
+
     #[test]
     fn cache_lifecycle_record_is_bounded_and_explicitly_process_global() {
         let (_, records) = capture(|| {
@@ -3955,6 +4394,15 @@ mod tests {
         assert_eq!(record["stage"], "process_retained_cache_lifecycle_totals");
         assert_eq!(record["source"], "unknown");
         assert_eq!(record["counts"]["prefix_excluded_bodies"], u64::MAX);
+        for field in [
+            "claude_sqlite_pager_wal_page_bytes_cumulative",
+            "codex_sqlite_pager_wal_page_bytes_cumulative",
+            "pi_sqlite_pager_wal_page_bytes_cumulative",
+            "upload_history_sqlite_pager_wal_page_bytes_cumulative",
+            "shared_cache_helper_write_bytes_cumulative",
+        ] {
+            assert_eq!(record["counts"][field], u64::MAX);
+        }
         assert!(record["observation"]["shared_process_cpu_delta_us"].is_null());
         assert!(record["observation"]["process_lifetime_max_rss_bytes"].is_null());
         // The four Pi fields, the Codex tier field, the two Claude usage

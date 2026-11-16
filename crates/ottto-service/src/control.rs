@@ -17245,6 +17245,9 @@ fn source_display_name(source: &SourceKind) -> &'static str {
 }
 
 #[cfg(test)]
+pub(crate) use tests::account_return_claim_for_test;
+
+#[cfg(test)]
 pub(crate) mod tests {
     #[test]
     fn session_exec_commands_require_cli_kind_and_authorized_token() {
@@ -32856,6 +32859,56 @@ X-API-Key = "otel_redacted"
         });
         continue_prior_snapshot_namespace(&mut pending, Some(prior));
         (pending, candidate, setup_token)
+    }
+
+    /// Synthetic account-return driver; shares the claim and promotion seams above.
+    pub(crate) fn account_return_claim_for_test(
+        user: &str,
+        org: &str,
+        device_id: &str,
+    ) -> (LocalDeviceBinding, String) {
+        let device = relogin_device(device_id, &["claude_code", "codex", "pi"]);
+        let api = std::env::var("OTTTO_API_BASE_URL").expect("synthetic receiver URL");
+        let secret = if let Some(prior) = prior_device_credential_for_registration().unwrap() {
+            assert_ne!(prior.owner.as_ref().unwrap().user_id, user);
+            relogin_local_logout();
+            assert!(
+                default_prior_device_path().exists(),
+                "logout retained the selector"
+            );
+            let prior = prior_device_credential_for_registration().unwrap().unwrap();
+            let (mut pending, candidate, token) = relogin_claim(&prior, user, org, device.clone());
+            pending.api_base_url = api.clone();
+            let commit = pending.claim_commit.as_mut().unwrap();
+            commit.connection.api_base_url = api;
+            assert_eq!(
+                commit.connection.api_base_url,
+                prior.owner.as_ref().unwrap().api_base_url,
+                "the owner changes on the same receiver"
+            );
+            // Re-decide after replacing the shared helper's default endpoint.
+            continue_prior_snapshot_namespace(&mut pending, Some(&prior));
+            assert_eq!(journaled_namespace(&pending), None, "different prior owner");
+            promote_relogin(&pending, &candidate, &token);
+            // The normal claim-completion handler cleans up after promotion.
+            clear_prior_device_credential().unwrap();
+            assert!(
+                !default_prior_device_path().exists(),
+                "prior selector cleared"
+            );
+            candidate
+        } else {
+            let (account, mut connection) = relogin_account(user, org);
+            connection.api_base_url = api;
+            FileAccountStore::default().save(&account).unwrap();
+            FileConnectionStore::default().save(&connection).unwrap();
+            FileDeviceStore::default().save(&device).unwrap();
+            KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+                .save("synthetic-return-secret-a")
+                .unwrap();
+            "synthetic-return-secret-a".into()
+        };
+        (device, secret)
     }
 
     fn journaled_namespace(pending: &PendingDeviceCredentialPreparation) -> Option<String> {
