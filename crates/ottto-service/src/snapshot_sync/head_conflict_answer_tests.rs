@@ -1999,7 +1999,7 @@ fn w0_page(
         2_000,
         |_| 0,
         |_| cas,
-        |request, _| Ok(ack(&request.snapshots[0])),
+        |request, _| Ok(ack(request.snapshots[0])),
     );
     assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
     assert!(wires[0]["snapshots"][0]["cache_observations"].is_null());
