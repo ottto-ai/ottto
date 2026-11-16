@@ -857,6 +857,7 @@ fn account_return_history_row(recorded_a: bool) {
     .unwrap();
     crate::snapshots::older_build_logs_priority("return-turn");
     let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
+    let daemon_owner = test_daemon("machine_test");
     // Existing prepare/finish scaffold, now table-driven across the three sources.
     let mut cycle = |device: &LocalDeviceBinding, secret: &str, source: SnapshotSource| {
         cadence.next_due_cycle();
@@ -886,7 +887,9 @@ fn account_return_history_row(recorded_a: bool) {
             setup_snapshot_index: None,
         };
         let client = SnapshotApiClient::new(server.url.clone());
-        let daemon = test_daemon("machine_test");
+        let daemon = daemon_owner
+            .clone()
+            .with_account(ottto_core::FileAccountStore::default().load().unwrap());
         let mut transport = crate::net_resilience::TransportCycleOutcome::default();
         with_scan_clock(now, || {
             observe_consumed(|| {
