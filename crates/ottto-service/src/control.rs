@@ -3971,6 +3971,8 @@ fn telemetry_control_with_detector(
         &action,
         &source,
     )?;
+    let _binding_lock = lock_setup_run_binding();
+    require_local_control_account(&claims, &FileAccountStore::default(), "telemetry control")?;
     if let (Some(expected), Some(observed)) = (
         claims.organization_id.as_deref(),
         organization_id
@@ -4545,6 +4547,37 @@ struct CodexControlTokenAuthority {
     local_organization_id: String,
 }
 
+fn require_local_control_account(
+    claims: &BackendControlTokenClaims,
+    accounts: &FileAccountStore,
+    binding_label: &str,
+) -> Result<(String, String), LocalApiError> {
+    let account = accounts.load().map_err(|_| {
+        LocalApiError::LocalOperationFailed(format!(
+            "{binding_label} account binding is unavailable"
+        ))
+    })?;
+    let local_user_id = account
+        .user
+        .as_ref()
+        .map(|user| user.id.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(LocalApiError::LocalClientNotTrusted)?;
+    let local_organization_id = account
+        .organization
+        .as_ref()
+        .map(|organization| organization.id.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(LocalApiError::LocalClientNotTrusted)?;
+    if account.state != LocalAccountState::Connected
+        || claims.user_id.as_deref() != Some(local_user_id)
+        || claims.organization_id.as_deref() != Some(local_organization_id)
+    {
+        return Err(LocalApiError::LocalClientNotTrusted);
+    }
+    Ok((local_user_id.to_string(), local_organization_id.to_string()))
+}
+
 /// Prelude of the provider-daily-reference bridge. Check order is part of the
 /// contract. `binding_label` names the bridge in the binding-load errors.
 fn authorize_codex_control_token(
@@ -4572,11 +4605,8 @@ fn authorize_codex_control_token(
         require_identity_mutation_reservation(None)?;
     }
 
-    let account = accounts.load().map_err(|_| {
-        LocalApiError::LocalOperationFailed(format!(
-            "{binding_label} account binding is unavailable"
-        ))
-    })?;
+    let (local_user_id, local_organization_id) =
+        require_local_control_account(&claims, accounts, binding_label)?;
     let device = devices
         .load()
         .map_err(|_| {
@@ -4585,22 +4615,7 @@ fn authorize_codex_control_token(
             ))
         })?
         .ok_or(LocalApiError::LocalClientNotTrusted)?;
-    let local_user_id = account
-        .user
-        .as_ref()
-        .map(|user| user.id.as_str())
-        .filter(|value| !value.trim().is_empty())
-        .ok_or(LocalApiError::LocalClientNotTrusted)?;
-    let local_organization_id = account
-        .organization
-        .as_ref()
-        .map(|organization| organization.id.as_str())
-        .filter(|value| !value.trim().is_empty())
-        .ok_or(LocalApiError::LocalClientNotTrusted)?;
-    if account.state != LocalAccountState::Connected
-        || claims.user_id.as_deref() != Some(local_user_id)
-        || claims.organization_id.as_deref() != Some(local_organization_id)
-        || claims.device_id.as_deref() != Some(device.device_id.as_str())
+    if claims.device_id.as_deref() != Some(device.device_id.as_str())
         || !device.sources.iter().any(|source| source == "codex")
     {
         return Err(LocalApiError::LocalClientNotTrusted);
@@ -4613,8 +4628,8 @@ fn authorize_codex_control_token(
         identity_lifecycle_lock,
         expires_at_unix,
         token_id: token_id.to_string(),
-        local_user_id: local_user_id.to_string(),
-        local_organization_id: local_organization_id.to_string(),
+        local_user_id,
+        local_organization_id,
         device,
     })
 }
@@ -15205,6 +15220,7 @@ fn verify_source(
     source: SourceKind,
     repair: bool,
 ) -> Result<SourceVerificationResult, LocalApiError> {
+    require_authorized_local_client(daemon, authorization)?;
     let mut result = verify_source_unchecked(daemon, authorization, source, repair)?;
     attach_verification_check(&mut result);
     Ok(result)
@@ -15216,7 +15232,6 @@ fn verify_source_unchecked(
     source: SourceKind,
     repair: bool,
 ) -> Result<SourceVerificationResult, LocalApiError> {
-    require_authorized_local_client(daemon, authorization)?;
     let tracking_generation = daemon
         .tracking_episode(&source)
         .map(|(generation, _)| generation);
@@ -17225,7 +17240,7 @@ fn source_display_name(source: &SourceKind) -> &'static str {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #[test]
     fn session_exec_commands_require_cli_kind_and_authorized_token() {
         let daemon = daemon();
@@ -18911,6 +18926,70 @@ for line in sys.stdin:
                 unsafe { std::env::remove_var(self.key) };
             }
         }
+    }
+
+    pub(crate) struct ControlFilesFixture {
+        root: PathBuf,
+        _guards: [EnvVarGuard; 3],
+    }
+
+    impl ControlFilesFixture {
+        pub(crate) fn new() -> Self {
+            let root = control_test_root("local-control-files");
+            fs::create_dir_all(root.join(".codex")).unwrap();
+            fs::write(
+                root.join(".codex/config.toml"),
+                render_codex_relay_toml_block_for_base("http://127.0.0.1:43119"),
+            )
+            .unwrap();
+            let keys = root.join("keys");
+            TelemetryKeyStore::file_only(&keys)
+                .save(&SourceKind::Codex, "key_local", "synthetic-key")
+                .unwrap();
+            let guards = [
+                EnvVarGuard::set_path("HOME", &root),
+                EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root.join("support")),
+                EnvVarGuard::set_path(TELEMETRY_KEY_FILE_STORE_ENV, &keys),
+            ];
+            Self {
+                root,
+                _guards: guards,
+            }
+        }
+
+        pub(crate) fn assert_unchanged<T>(&self, run: impl FnOnce() -> T) -> T {
+            fn files(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+                let mut result = std::collections::BTreeMap::new();
+                for entry in fs::read_dir(root).unwrap() {
+                    let path = entry.unwrap().path();
+                    if path.is_dir() {
+                        result.extend(files(&path));
+                    } else {
+                        result.insert(path.clone(), fs::read(path).unwrap());
+                    }
+                }
+                result
+            }
+            let before = files(&self.root);
+            let result = run();
+            assert_eq!(files(&self.root), before, "local files changed");
+            result
+        }
+    }
+
+    impl Drop for ControlFilesFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn bind_telemetry_control_account() -> ControlFilesFixture {
+        let files = ControlFilesFixture::new();
+        let mut account = connected_account();
+        account.user.as_mut().unwrap().id = "user_123".into();
+        account.organization.as_mut().unwrap().id = "org_123".into();
+        FileAccountStore::default().save(&account).unwrap();
+        files
     }
 
     fn telemetry_key_store_root(name: &str) -> PathBuf {
@@ -25345,6 +25424,7 @@ for line in sys.stdin:
     #[serial]
     fn telemetry_control_accepts_fresh_enable_request_without_leaking_key() {
         let _guard = lock_backend_test_env();
+        let _binding = bind_telemetry_control_account();
         let store_root = telemetry_key_store_root("enable");
         let _env_guard = EnvVarGuard::set_path(TELEMETRY_KEY_FILE_STORE_ENV, &store_root);
         let install_root = telemetry_key_store_root("enable-install");
@@ -26034,6 +26114,8 @@ for line in sys.stdin:
     #[serial]
     fn telemetry_control_disable_removes_stored_key() {
         let _guard = lock_backend_test_env();
+        assert_telemetry_control_requires_local_binding();
+        let _binding = bind_telemetry_control_account();
         let store_root = telemetry_key_store_root("disable");
         let _env_guard = EnvVarGuard::set_path(TELEMETRY_KEY_FILE_STORE_ENV, &store_root);
         let install_root = telemetry_key_store_root("disable-install");
@@ -26095,10 +26177,56 @@ for line in sys.stdin:
         assert!(!codex_config_has_relay_otel(&config));
     }
 
+    fn assert_telemetry_control_requires_local_binding() {
+        for (user, organization, bound, allowed) in [
+            (Some("user_123"), Some("org_other"), true, false),
+            (Some("user_other"), Some("org_123"), true, false),
+            (Some("user_123"), Some("org_123"), false, false),
+            (None, Some("org_123"), true, false),
+            (Some("user_123"), None, true, false),
+            (Some("user_123"), Some("org_123"), true, true),
+        ] {
+            let files = ControlFilesFixture::new();
+            let mut account = connected_account();
+            account.user.as_mut().unwrap().id = "user_123".into();
+            account.organization.as_mut().unwrap().id = "org_123".into();
+            if bound {
+                FileAccountStore::default().save(&account).unwrap();
+            }
+            let claims = json!({"user_id": user, "organization_id": organization}).to_string();
+            let base = control_token_validation_server_with_claims(200, claims);
+            let _base = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &base);
+            let run = || {
+                telemetry_control(
+                    &daemon(),
+                    TelemetryControlAction::DisableTelemetry,
+                    SourceKind::Codex,
+                    test_control_token("disable_telemetry", "codex", 300),
+                    None,
+                    Some("key_local".into()),
+                    None,
+                    None,
+                    None,
+                )
+            };
+            if allowed {
+                run().expect("matching local binding");
+                assert!(matches!(
+                    TelemetryKeyStore::production().load(&SourceKind::Codex, "key_local"),
+                    Err(TelemetryKeychainError::Missing)
+                ));
+            } else {
+                let result = files.assert_unchanged(run);
+                assert!(matches!(result, Err(LocalApiError::LocalClientNotTrusted)));
+            }
+        }
+    }
+
     #[test]
     #[serial]
     fn telemetry_control_disable_preserves_key_when_fence_needs_review() {
         let _guard = lock_backend_test_env();
+        let _binding = bind_telemetry_control_account();
         let store_root = telemetry_key_store_root("disable-manual-fence");
         let _env_guard = EnvVarGuard::set_path(TELEMETRY_KEY_FILE_STORE_ENV, &store_root);
         let install_root = telemetry_key_store_root("disable-manual-fence-install");
@@ -28986,6 +29114,7 @@ X-API-Key = "otel_redacted"
     }
 
     fn assert_setup_denies_unauthorized_callers_before_scan_lock() {
+        let files = ControlFilesFixture::new();
         let daemon = daemon();
         for (authorization, expected) in [
             (
@@ -29001,8 +29130,12 @@ X-API-Key = "otel_redacted"
                 let held = SETUP_SCAN.lock().unwrap();
                 let (send, receive) = std::sync::mpsc::channel();
                 let daemon = &daemon;
+                let files = &files;
                 scope.spawn(move || {
-                    let result = setup_run(daemon, &authorization, vec![], None, None, None)
+                    let result = files
+                        .assert_unchanged(|| {
+                            setup_run(daemon, &authorization, vec![], None, None, None)
+                        })
                         .map_err(|error| cli_error(error).code);
                     send.send(result).unwrap();
                 });
@@ -29023,6 +29156,7 @@ X-API-Key = "otel_redacted"
     }
 
     fn assert_verification_denies_unauthorized_callers() {
+        let files = ControlFilesFixture::new();
         let daemon = daemon();
         for (authorization, expected) in [
             (
@@ -29035,7 +29169,10 @@ X-API-Key = "otel_redacted"
             ),
         ] {
             for repair in [false, true] {
-                let error = verify_source(&daemon, &authorization, SourceKind::Codex, repair)
+                let error = files
+                    .assert_unchanged(|| {
+                        verify_source(&daemon, &authorization, SourceKind::Codex, repair)
+                    })
                     .expect_err("verification must authorize before any result write");
                 assert_eq!(cli_error(error).code, expected);
                 let state = daemon.inner.lock().unwrap();
@@ -32025,18 +32162,22 @@ X-API-Key = "otel_redacted"
     }
 
     fn control_token_validation_server(status: u16) -> String {
+        control_token_validation_server_with_claims(status, r#"{"source":"codex","action":"enable_telemetry","organization_id":"org_123","user_id":"user_123","expires_at":"2026-05-17T00:00:00Z"}"#.into())
+    }
+
+    fn control_token_validation_server_with_claims(status: u16, claims: String) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test backend");
         let address = listener.local_addr().expect("local address");
         thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept validation request");
             read_complete_http_request(&mut stream);
             let (reason, body) = if status == 200 {
-                (
-                    "OK",
-                    r#"{"source":"codex","action":"enable_telemetry","organization_id":"org_123","user_id":"user_123","expires_at":"2026-05-17T00:00:00Z"}"#,
-                )
+                ("OK", claims)
             } else {
-                ("Unauthorized", r#"{"detail":"Invalid app control token"}"#)
+                (
+                    "Unauthorized",
+                    r#"{"detail":"Invalid app control token"}"#.to_string(),
+                )
             };
             let response = format!(
                 "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
