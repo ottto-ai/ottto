@@ -11882,12 +11882,21 @@ fn seed_owner_snapshot_history_for_logout() -> Result<bool, LocalApiError> {
         if prior.machine_id.as_deref() == Some(key.machine_id.as_str())
             && owner_snapshot_live_machine(&key, machine.hardware_uuid.as_deref())?
         {
-            store
+            // History is optional retention during logout, not authority to
+            // complete a user-requested reset. Claim-time errors still hold.
+            if store
                 .upsert(&[OwnerSnapshotNamespace {
                     key,
                     namespace: prior.snapshot_namespace,
                 }])
-                .or_state_poisoned()?;
+                .is_err()
+            {
+                crate::local_resource_diagnostics::traversal_point(
+                    "owner_history_seed_skipped",
+                    "control",
+                    &json!({"skipped_seeds": 1}),
+                );
+            }
         }
     }
     Ok(true)
@@ -33416,6 +33425,119 @@ X-API-Key = "otel_redacted"
                 .as_ref(),
             Some(&pending)
         );
+    }
+
+    #[test]
+    #[serial]
+    /// [regress] History retention failures never block local/cloud logout or
+    /// installation reset; the existing Unknown-history claim fence survives.
+    fn owner_return_logout_skips_unreadable_history_and_counts_the_diagnostic() {
+        if !crate::test_isolation::run_here() {
+            return;
+        }
+        for local_only in [true, false] {
+            for forget_installation in [false, true] {
+                for unreadable in [true, false] {
+                    let _env = relogin_env(&format!(
+                        "return-logout-history-{local_only}-{forget_installation}-{unreadable}"
+                    ));
+                    let machine = test_machine();
+                    FileMachineStore::default()
+                        .save(&LocalMachineBinding {
+                            machine_id: machine.machine_id,
+                            installation_id: machine.installation_id,
+                            hardware_uuid: machine.hardware_uuid,
+                        })
+                        .unwrap();
+                    let device = relogin_device("history-error-device", &["codex"]);
+                    owner_return_credential_for_test(&device, "history-error-secret", "a");
+                    let history = FileOwnerSnapshotNamespaceStore::default();
+                    fs::remove_file(history.path()).unwrap();
+                    if unreadable {
+                        // Nonregular input fails deterministically, even as root.
+                        fs::create_dir(history.path()).unwrap();
+                    } else {
+                        fs::write(history.path(), b"invalid history").unwrap();
+                    }
+                    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                    let address = listener.local_addr().unwrap();
+                    let mut connection = FileConnectionStore::default().load().unwrap().unwrap();
+                    connection.api_base_url = format!("http://{address}");
+                    FileConnectionStore::default().save(&connection).unwrap();
+                    let server = (!local_only).then(|| {
+                        thread::spawn(move || {
+                            let (mut stream, _) = listener.accept().unwrap();
+                            let request = read_complete_http_request(&mut stream);
+                            assert!(request.starts_with("POST /api/v1/setup-runs/"));
+                            write_json_response(
+                                &mut stream,
+                                200,
+                                "OK",
+                                r#"{"setup_run_id":"setup-a","run_status":"disconnected","client_disconnected":true,"disconnected_at":"2026-10-18T12:00:00Z","device_released":true}"#,
+                            );
+                        })
+                    });
+                    let daemon = daemon()
+                        .with_account(FileAccountStore::default().load().unwrap())
+                        .with_connection(Some(connection));
+                    let (response, diagnostics) =
+                        crate::local_resource_diagnostics::capture(|| {
+                            handle_request(
+                                &daemon,
+                                LocalControlRequest {
+                                    request_id: "logout-history-error".into(),
+                                    protocol_version:
+                                        ottto_protocol::INSTALLATION_RESET_CONTROL_PROTOCOL_VERSION,
+                                    token: Some("token".into()),
+                                    client_kind: Some(LocalClientKind::Cli),
+                                    client_install_owner: None,
+                                    command: LocalControlCommand::AuthReset {
+                                        local_only,
+                                        forget_installation,
+                                    },
+                                },
+                            )
+                        });
+                    if let Some(server) = server {
+                        server.join().unwrap();
+                    }
+                    assert!(response.ok, "{response:?}");
+                    assert_eq!(
+                        daemon.status("token").unwrap().account.state,
+                        LocalAccountState::NotConnected
+                    );
+                    assert!(FileDeviceStore::default().load().unwrap().is_none());
+                    assert_eq!(
+                        FileMachineStore::default().load().unwrap().is_none(),
+                        forget_installation
+                    );
+                    assert!(
+                        history.load().is_err(),
+                        "Unknown was not replaced with a seed"
+                    );
+                    if unreadable {
+                        assert_eq!(fs::read_dir(history.path()).unwrap().count(), 0);
+                    } else {
+                        assert_eq!(fs::read(history.path()).unwrap(), b"invalid history");
+                    }
+                    let skipped: Vec<_> = diagnostics
+                        .iter()
+                        .filter(|row| row["stage"] == "owner_history_seed_skipped")
+                        .collect();
+                    assert_eq!(skipped.len(), 1, "one counted skip per logout");
+                    assert_eq!(skipped[0]["counts"], json!({"skipped_seeds": 1}));
+                    let encoded = serde_json::to_string(&skipped).unwrap();
+                    for private in [
+                        "history-error-device",
+                        "history-error-secret",
+                        "invalid history",
+                        history.path().to_str().unwrap(),
+                    ] {
+                        assert!(!encoded.contains(private));
+                    }
+                }
+            }
+        }
     }
 
     #[test]

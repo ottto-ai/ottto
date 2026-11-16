@@ -335,7 +335,9 @@ backfill-state save, so re-upgrade omits the cutoff for existing destinations.
 Claims record exact owner/API/machine/installation/OS-scope namespaces in trusted
 owner-only history. Returning claims require live hardware and surviving custody;
 same-owner rotation keeps the existing prior-credential policy. No orphan discovery.
-Logout seeds proven outgoing history; forget invalidates old installation rows.
+Logout seeds proven outgoing history best effort; history I/O failures count a
+skipped seed and allow logout/reset. Claim-time Unknown history still holds.
+Forget invalidates old installation rows.
 History-bearing journals use v3, rejected by released v2 readers. The selected
 cutoff precedes activation; history is synced/read back before pending clear.
 Existing aliases, loaders and exact destination ACKs retain all source custody.
