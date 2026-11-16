@@ -77,6 +77,7 @@ struct OracleServer {
     stop: Arc<std::sync::atomic::AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
     script: Arc<Mutex<VecDeque<Vec<Answer>>>>,
+    fallback: Arc<Mutex<Answer>>,
     batches: Arc<Mutex<Vec<Vec<u8>>>>,
     placement: Arc<Mutex<BTreeMap<String, Value>>>,
 }
@@ -90,6 +91,8 @@ impl OracleServer {
         let done = stop.clone();
         let script = Arc::new(Mutex::new(VecDeque::<Vec<Answer>>::new()));
         let script_worker = script.clone();
+        let fallback = Arc::new(Mutex::new(Answer::Accept));
+        let fallback_worker = fallback.clone();
         let batches = Arc::new(Mutex::new(Vec::new()));
         let batches_worker = batches.clone();
         let placement = Arc::new(Mutex::new(BTreeMap::new()));
@@ -134,7 +137,7 @@ impl OracleServer {
                         .lock()
                         .unwrap()
                         .pop_front()
-                        .unwrap_or_else(|| vec![Answer::Accept; items.len()]);
+                        .unwrap_or_else(|| vec![*fallback_worker.lock().unwrap(); items.len()]);
                     assert_eq!(answers.len(), items.len(), "one answer per offered entity");
                     if answers.iter().any(|a| matches!(a, Answer::Dropped)) {
                         drop(stream);
@@ -208,6 +211,7 @@ impl OracleServer {
             stop,
             worker: Some(worker),
             script,
+            fallback,
             batches,
             placement,
         }
@@ -276,15 +280,17 @@ struct OracleHome {
     daemon: LocalDaemon,
     transport: crate::net_resilience::TransportCycleOutcome,
     retry: live_snapshot_retry::LiveRetryOwner,
-    _env: [EnvVarGuard; 3],
+    _env: [EnvVarGuard; 4],
 }
 
 struct Cycle {
+    pre_index_bytes: Vec<u8>,
     before: Vec<SnapshotItem>,
     gate: Value,
     finalized: Vec<SnapshotItem>,
     steps: Vec<Value>,
     consumed: u64,
+    io: transition::IoBytes,
     batches: Vec<Vec<u8>>,
     index: ScanIndex,
     progress: SnapshotUploadProgress,
@@ -334,6 +340,7 @@ impl OracleHome {
             EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support),
             EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secrets),
             EnvVarGuard::set_str("OTTTO_API_BASE_URL", &server.url),
+            EnvVarGuard::set_path("PI_CODING_AGENT_DIR", &fixture.home.join(".pi/agent")),
         ];
         let device = LocalDeviceBinding {
             device_id: "oracle-device".into(),
@@ -370,6 +377,58 @@ impl OracleHome {
             setup_snapshot_index: None,
         }
     }
+    fn index_path(&self) -> PathBuf {
+        snapshot_v3_index_path(&snapshot_destination_scoped_index_path(
+            &snapshot_index_path(&self.support, self.source),
+            &snapshot_upload_destination_namespace(&self.device, "device-secret"),
+        ))
+    }
+    fn transcript(&self) -> PathBuf {
+        if self.source == SnapshotSource::ClaudeCode {
+            self.fixture
+                .home
+                .join(".claude/projects/-synthetic-repo")
+                .join(format!("{IDENTITY_PIPELINE_ROOT}.jsonl"))
+        } else {
+            self.source.default_roots(&self.fixture.home)[0].join("oracle.jsonl")
+        }
+    }
+    fn write_rows(&self, rows: &[Value]) {
+        let path = self.transcript();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            rows.iter()
+                .map(|r| r.to_string() + "\n")
+                .collect::<String>(),
+        )
+        .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(NOW - 3600))
+            .unwrap();
+    }
+    fn restart(&mut self) {
+        drop(std::mem::replace(&mut self.daemon, test_daemon("otm_test")));
+        self.retry = live_snapshot_retry::LiveRetryOwner::closed();
+        test_effects::record("restart", Vec::new());
+    }
+    fn restore_pre_cycle_index(&mut self, cycle: &Cycle) {
+        let mut previous: ScanIndex = serde_json::from_slice(&cycle.pre_index_bytes).unwrap();
+        let current = ScanIndex::load(&self.index_path()).unwrap();
+        // Restore the old logical graph through the real writer, retaining
+        // the current CAS/root binding. Progress rows remain authoritative.
+        previous.retain_persistence_baseline_from(&current);
+        previous.generation = current.generation;
+        previous.save(&self.index_path()).unwrap();
+        crate::snapshots::e2_pipeline_scan_fixture::forget_continuations_for_test(
+            &self.daemon.transcript_cache,
+            &current,
+        );
+        self.restart();
+    }
     fn cycle(&mut self, server: &OracleServer, recording: &Recording) -> Cycle {
         self.cadence.due();
         let start = server.batches.lock().unwrap().len();
@@ -393,6 +452,8 @@ impl OracleHome {
         })
         .unwrap()
         .expect("due real preparation");
+        frame.scan.as_mut().unwrap().set_oracle_collection_time(AT);
+        frame.scan_started_at = AT.to_owned();
         let roots = self.source.default_roots(&self.fixture.home);
         let index_path = frame.index_path.clone();
         let progress_path = frame.upload_progress_path.clone();
@@ -402,12 +463,13 @@ impl OracleHome {
             .active_quarantine_witness
             .clone()
             .unwrap();
+        let pre_index_bytes = serde_json::to_vec(&frame.committed_index).unwrap();
         let handle = recording.handle();
-        let (preparation, index, scan, steps, consumed) = run_on_scan_worker_stack(move || {
+        let (preparation, index, scan, steps, io) = run_on_scan_worker_stack(move || {
             let _entered = handle.enter();
             with_scan_clock(NOW, || {
-                let ((preparation, index, scan, steps), consumed) =
-                    transition::observe_consumed(|| {
+                let ((preparation, index, scan, steps), io) =
+                    transition::observe_codex_quiet(|| {
                         let mut steps = Vec::new();
                         for _ in 0..1024 {
                             let before = frame.scan.as_ref().unwrap().trace_projection();
@@ -441,7 +503,7 @@ impl OracleHome {
                         }
                         panic!("scan exceeded 1024 steps");
                     });
-                (preparation, index, scan, steps, consumed)
+                (preparation, index, scan, steps, io)
             })
         });
         let gate = scan.trace_projection(&roots);
@@ -487,11 +549,13 @@ impl OracleHome {
         );
         let batches = server.batches.lock().unwrap()[start..].to_vec();
         Cycle {
+            pre_index_bytes,
             before,
             gate,
             finalized,
             steps,
-            consumed,
+            consumed: io.consumed,
+            io,
             batches,
             index,
             progress,
@@ -563,4 +627,441 @@ fn script_answers_are_per_post_and_per_entity() {
     assert!(server.script.lock().unwrap().is_empty());
     assert_eq!(server.placement.lock().unwrap().len(), 1);
     assert_eq!(server.batches.lock().unwrap().len(), 7);
+}
+
+struct SaveFailure(Option<&'static str>);
+impl SaveFailure {
+    fn at(stage: &'static str) -> Self {
+        Self(ACK_POST_SAVE_FAILURE.with(|slot| slot.replace(Some(stage))))
+    }
+}
+impl Drop for SaveFailure {
+    fn drop(&mut self) {
+        ACK_POST_SAVE_FAILURE.with(|slot| slot.set(self.0));
+    }
+}
+
+fn assert_durable(cycle: &Cycle) {
+    assert!(!cycle.finalized.is_empty(), "positive finalized body");
+    for item in &cycle.finalized {
+        assert!(cycle.progress.contains_body(
+            &item.snapshot_fingerprint,
+            &snapshot_upload_body_witness(item)
+        ));
+    }
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn c02_durable_ack_suppresses_replay_of_the_prior_index() {
+    let recording = Recording::start();
+    let server = OracleServer::new(SnapshotSource::ClaudeCode, recording.handle());
+    let mut home = OracleHome::new(SnapshotSource::ClaudeCode, &server);
+    let first = home.cycle(&server, &recording);
+    assert!(first.finish.is_ok());
+    assert_durable(&first);
+    let placement = server.placement.lock().unwrap().clone();
+    home.restore_pre_cycle_index(&first);
+    let replay = home.cycle(&server, &recording);
+    assert!(replay.finish.is_ok());
+    assert_eq!(replay.before.len(), 1, "gate c passed positively");
+    assert_eq!(replay.finalized.len(), 1, "gate b passed positively");
+    assert!(
+        replay.batches.is_empty(),
+        "gate a suppressed durable exact ACK"
+    );
+    assert_durable(&replay);
+    assert!(!replay.index.current_snapshot_fingerprints().is_empty());
+    assert_eq!(*server.placement.lock().unwrap(), placement);
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn c03_complete_same_body_reread_drops_at_the_finalizer() {
+    let recording = Recording::start();
+    let server = OracleServer::new(SnapshotSource::ClaudeCode, recording.handle());
+    let mut home = OracleHome::new(SnapshotSource::ClaudeCode, &server);
+    let first = home.cycle(&server, &recording);
+    assert!(first.finish.is_ok());
+    assert_durable(&first);
+    let placement = server.placement.lock().unwrap().clone();
+    let file = std::fs::File::options()
+        .write(true)
+        .open(home.transcript())
+        .unwrap();
+    file.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(NOW - 1800))
+        .unwrap();
+    let replay = home.cycle(&server, &recording);
+    assert!(replay.finish.is_ok());
+    assert_eq!(
+        replay.before.len(),
+        1,
+        "positive complete reread before gate b"
+    );
+    assert!(replay.gate["pending_finalization"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|row| row["parse_complete"] == true));
+    assert!(
+        replay.finalized.is_empty(),
+        "gate b removes the carried no-op"
+    );
+    assert!(replay.batches.is_empty());
+    assert_eq!(*server.placement.lock().unwrap(), placement);
+}
+
+fn pi_rows(conflict: bool) -> Vec<Value> {
+    let message = |shape: &str, id: &str, tokens: u64, at: &str| {
+        json!({
+        "type":shape,"timestamp":at,"message":{"role":"assistant","model":"gpt-5",
+        "provider":"openai","responseId":id,"timestamp":at,"usage":{"input":tokens,"output":1}}})
+    };
+    vec![
+        json!({"type":"session","id":"oracle-pi","timestamp":"2026-11-01T07:00:00Z"}),
+        message("message", "good", 10, "2026-11-01T07:01:00Z"),
+        message("message", "paired", 3, "2026-11-01T07:02:00Z"),
+        message(
+            "message_end",
+            "paired",
+            if conflict { 7 } else { 3 },
+            "2026-11-01T07:02:00Z",
+        ),
+    ]
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn c04_pi_positive_conflicted_result_cannot_publish() {
+    let recording = Recording::start();
+    let server = OracleServer::new(SnapshotSource::Pi, recording.handle());
+    let mut home = OracleHome::new(SnapshotSource::Pi, &server);
+    home.write_rows(&pi_rows(true));
+    let held = home.cycle(&server, &recording);
+    assert_eq!(held.gate["ownership_incomplete_file_count"], 1);
+    let pending = held.gate["pending_finalization"].as_array().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0]["parse_complete"], false);
+    assert_eq!(
+        pending[0]["parsed_snapshot_count"], 1,
+        "positive native vector, not just raw evidence"
+    );
+    assert!(
+        held.before.is_empty(),
+        "gate c alone withholds the positive native vector"
+    );
+    assert!(held.finalized.is_empty());
+    assert!(held.batches.is_empty());
+    assert!(server.placement.lock().unwrap().is_empty());
+    crate::client_report::reset_for_test();
+    home.write_rows(&pi_rows(false));
+    let complete = home.cycle(&server, &recording);
+    assert!(complete.finish.is_ok());
+    assert_eq!(complete.finalized.len(), 1);
+    assert_eq!(complete.finalized[0].input_tokens, 13);
+    assert_eq!(complete.finalized[0].request_count, 2);
+    assert_durable(&complete);
+    let completed_route = emitted_route(&complete, SnapshotSource::Pi, &server);
+    let mut cold_home = OracleHome::new(SnapshotSource::Pi, &server);
+    cold_home.write_rows(&pi_rows(false));
+    let cold = cold_home.cycle(&server, &recording);
+    assert!(cold.finish.is_ok());
+    let cold_route = emitted_route(&cold, SnapshotSource::Pi, &server);
+    transition::money_oracle::assert_equivalent(&cold_route, &completed_route);
+    transition::money_oracle::assert_no_smaller_reemit(
+        "oracle-pi",
+        &cold_route,
+        &completed_route,
+        &cold_route,
+        false,
+    );
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn c05_fresh_destination_requires_its_own_exact_ack() {
+    let recording = Recording::start();
+    let server = OracleServer::new(SnapshotSource::ClaudeCode, recording.handle());
+    let mut home = OracleHome::new(SnapshotSource::ClaudeCode, &server);
+    let first = home.cycle(&server, &recording);
+    assert!(first.finish.is_ok());
+    assert_durable(&first);
+    let fingerprint = first.finalized[0].snapshot_fingerprint.clone();
+    home.device.device_id = "other-oracle-device".into();
+    FileDeviceStore::default().save(&home.device).unwrap();
+    let destination = snapshot_upload_destination_namespace(&home.device, "device-secret");
+    crate::backfill::record_first_census(&home.support, home.source, &destination, AT, true)
+        .unwrap();
+    home.restart();
+    *server.fallback.lock().unwrap() = Answer::Unstored;
+    let unstored = home.cycle(&server, &recording);
+    assert_eq!(unstored.finalized.len(), 1);
+    let item = &unstored.finalized[0];
+    assert_eq!(item.snapshot_fingerprint, fingerprint);
+    assert!(!unstored
+        .progress
+        .contains_body(&fingerprint, &snapshot_upload_body_witness(item)));
+    *server.fallback.lock().unwrap() = Answer::Accept;
+    home.restore_pre_cycle_index(&unstored);
+    let accepted = home.cycle(&server, &recording);
+    assert!(accepted.finish.is_ok());
+    assert_eq!(accepted.batches.len(), 1);
+    assert_durable(&accepted);
+    assert_eq!(
+        server.placement.lock().unwrap().len(),
+        1,
+        "replacement never adds the same entity twice"
+    );
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn c06_crash_windows_preserve_placement_and_durable_suppression() {
+    for answer in [Answer::Dropped, Answer::LostAck, Answer::Accept] {
+        let recording = Recording::start();
+        let server = OracleServer::new(SnapshotSource::ClaudeCode, recording.handle());
+        let mut home = OracleHome::new(SnapshotSource::ClaudeCode, &server);
+        *server.fallback.lock().unwrap() = answer;
+        let failure = matches!(answer, Answer::Accept).then(|| SaveFailure::at("selected_save"));
+        let first = home.cycle(&server, &recording);
+        drop(failure);
+        assert!(first.finish.is_err());
+        let durable = matches!(answer, Answer::Accept);
+        let item = &first.finalized[0];
+        assert_eq!(
+            first.progress.contains_body(
+                &item.snapshot_fingerprint,
+                &snapshot_upload_body_witness(item)
+            ),
+            durable
+        );
+        assert_eq!(
+            server.placement.lock().unwrap().len(),
+            usize::from(!matches!(answer, Answer::Dropped))
+        );
+        *server.fallback.lock().unwrap() = Answer::Accept;
+        home.restore_pre_cycle_index(&first);
+        let replay = home.cycle(&server, &recording);
+        assert!(replay.finish.is_ok());
+        assert_eq!(
+            replay.finalized.len(),
+            1,
+            "replay reaches the ACK gate positively"
+        );
+        assert_eq!(replay.batches.len(), usize::from(!durable));
+        assert_durable(&replay);
+        assert_eq!(server.placement.lock().unwrap().len(), 1);
+        assert_eq!(
+            server.placement.lock().unwrap().values().next().unwrap()["input_tokens"],
+            30
+        );
+    }
+}
+
+fn emitted_route(
+    cycle: &Cycle,
+    source: SnapshotSource,
+    server: &OracleServer,
+) -> transition::RouteResult {
+    let mut route = transition::RouteResult::emitted(
+        transition::Mode::ColdFull,
+        source,
+        cycle.batches.clone(),
+        &cycle.finalized,
+    );
+    let placed = server.placement.lock().unwrap();
+    let mut buckets = serde_json::Map::new();
+    for body in placed.values() {
+        let entity = body["source_session_id"].as_str().unwrap().to_owned();
+        route.accepted.insert(
+            entity.clone(),
+            transition::Accepted {
+                body: body.clone(),
+                witness: finish_wire_body_witness(body),
+            },
+        );
+        buckets.insert(
+            entity,
+            json!({"request_evidence":body["request_evidence"],
+            "session_account_evidence":body["session_account_evidence"],
+            "model_usage":body["model_usage"], "usage_buckets":body["usage_buckets"]}),
+        );
+    }
+    route.accepted_identity_buckets = Some(Value::Object(buckets));
+    route.io = cycle.io.clone();
+    let last = &cycle.steps.last().unwrap()["before"];
+    route.modes = (
+        last["full_files"].as_u64().unwrap_or(0) as usize,
+        last["tail_files"].as_u64().unwrap_or(0) as usize,
+        last["unchanged_files"].as_u64().unwrap_or(0) as usize,
+    );
+    route
+}
+
+fn install_claude_control(home: &OracleHome) {
+    use crate::claude_local_otel::{
+        ClaudeIdentityAttributeEvidence, ClaudeIdentityAttributeOrigin, ClaudeIdentityDisposition,
+        ClaudeLocalOtelEvidence, ClaudeRequestIdentityEvidence, ClaudeTraceOwnershipEvidence,
+    };
+    let transcript = |id: &str, tokens: u64, at: &str| {
+        json!({"type":"assistant",
+        "sessionId":IDENTITY_PIPELINE_ROOT,"version":"2.1.309","timestamp":at,"requestId":id,
+        "message":{"id":format!("msg-{id}"),"model":"claude-haiku-4-5",
+        "usage":{"input_tokens":tokens,"output_tokens":tokens}}})
+    };
+    home.write_rows(&[
+        transcript("account-a", 10, "2026-11-01T07:01:00Z"),
+        transcript("account-b", 20, "2026-11-01T07:02:00Z"),
+        transcript("gap", 5, "2026-11-01T07:04:00Z"),
+    ]);
+    let attribute = |hash: String| ClaudeIdentityAttributeEvidence {
+        origin: ClaudeIdentityAttributeOrigin::LogRecord,
+        disposition: ClaudeIdentityDisposition::Complete,
+        resource_hash: None,
+        log_record_hash: Some(hash),
+    };
+    let mut rows = Vec::new();
+    let mut traces = Vec::new();
+    for (sequence, (request, tokens, account, org, at)) in [
+        ("account-a", 10, 'a', '8', "2026-11-01T07:01:00Z"),
+        ("account-b", 20, 'b', '9', "2026-11-01T07:02:00Z"),
+        ("side", 7, 'b', '9', "2026-11-01T07:03:00Z"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut row = ClaudeLocalOtelEvidence {
+            capture_revision: "claude_api_request:v2".into(),
+            session_id: IDENTITY_PIPELINE_ROOT.into(),
+            request_id: request.into(),
+            client_request_id: format!("client-{request}"),
+            observed_at: at.into(),
+            model: "claude-haiku-4-5".into(),
+            effort: "high".into(),
+            query_source: "user".into(),
+            app_version: "2.1.309".into(),
+            event_sequence: Some(sequence as u64 + 1),
+            input_tokens: tokens,
+            output_tokens: tokens,
+            request_count: 1,
+            account_identity_checked: true,
+            account_identifier_hash: Some(account.to_string().repeat(64).into()),
+            request_identity: Some(Arc::new(ClaudeRequestIdentityEvidence {
+                identity_hash_scheme: "provider-sha256:v1".into(),
+                account: attribute(account.to_string().repeat(64)),
+                organization: attribute(org.to_string().repeat(64)),
+                disposition: ClaudeIdentityDisposition::Complete,
+            })),
+            ..Default::default()
+        };
+        row.fingerprint = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(&row).unwrap())
+        );
+        rows.push(serde_json::to_value(row).unwrap());
+        let mut trace = ClaudeTraceOwnershipEvidence {
+            capture_revision: "claude_llm_request_ownership:v1".into(),
+            session_id: IDENTITY_PIPELINE_ROOT.into(),
+            request_id: request.into(),
+            client_request_id: format!("client-{request}"),
+            agent_id: String::new(),
+            observed_at: at.into(),
+            ..Default::default()
+        };
+        trace.fingerprint = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(&trace).unwrap())
+        );
+        traces.push(serde_json::to_value(trace).unwrap());
+    }
+    for (directory, values) in [
+        ("claude-code-effort", rows),
+        ("claude-code-trace-ownership", traces),
+    ] {
+        let path = home
+            .support
+            .join("local-otel")
+            .join(directory)
+            .join(format!(
+                "{:x}.jsonl",
+                Sha256::digest(IDENTITY_PIPELINE_ROOT.as_bytes())
+            ));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            values
+                .iter()
+                .map(|v| v.to_string() + "\n")
+                .collect::<String>(),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn c01_claude_cold_control_preserves_accounts_side_call_gap_and_tags() {
+    let recording = Recording::start();
+    let server = OracleServer::new(SnapshotSource::ClaudeCode, recording.handle());
+    let mut home = OracleHome::new(SnapshotSource::ClaudeCode, &server);
+    install_claude_control(&home);
+    let cold = home.cycle(&server, &recording);
+    assert!(cold.finish.is_ok());
+    assert_durable(&cold);
+    assert_eq!(
+        cold.finalized.iter().map(|s| s.input_tokens).sum::<u64>(),
+        42
+    );
+    assert_eq!(
+        cold.finalized.iter().map(|s| s.output_tokens).sum::<u64>(),
+        42
+    );
+    assert_eq!(
+        cold.finalized.iter().map(|s| s.request_count).sum::<u64>(),
+        4
+    );
+    let mut accounts = BTreeMap::<String, u64>::new();
+    let mut tagged = false;
+    for item in &cold.finalized {
+        let value = serde_json::to_value(item).unwrap();
+        for row in value["model_usage"].as_array().unwrap() {
+            tagged |= row["selector_context"]["effort"] == "high";
+            let shares = row["identity_parts"]
+                .as_array()
+                .map(|v| v.iter().collect::<Vec<_>>())
+                .unwrap_or_else(|| vec![row]);
+            for share in shares {
+                *accounts
+                    .entry(
+                        share["account_identifier_hash"]
+                            .as_str()
+                            .unwrap()
+                            .to_owned(),
+                    )
+                    .or_default() += share["input_tokens"].as_u64().unwrap();
+            }
+        }
+    }
+    assert_eq!(
+        accounts,
+        BTreeMap::from([("a".repeat(64), 10), ("b".repeat(64), 32)])
+    );
+    assert!(tagged);
+    let placement = server.placement.lock().unwrap().clone();
+    home.restart();
+    let quiet = home.cycle(&server, &recording);
+    assert!(quiet.finish.is_ok());
+    assert!(quiet.before.is_empty());
+    assert!(quiet.finalized.is_empty());
+    assert!(quiet.batches.is_empty());
+    assert_eq!(*server.placement.lock().unwrap(), placement);
+    let mut quiet_route = emitted_route(&quiet, SnapshotSource::ClaudeCode, &server);
+    quiet_route.mode = transition::Mode::Restart;
+    transition::money_oracle::assert_quiet_restart_zero_bytes(&quiet_route);
 }

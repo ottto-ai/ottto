@@ -28,6 +28,17 @@ fn pending(rows: &[PendingIndexFinalization], roots: &[PathBuf]) -> Value {
 }
 
 impl OwnedSourceScan {
+    /// Fixture input after real prepare: its legacy shell clock is not the
+    /// acquisition clock. Keep the page and walk observation horizon equal.
+    pub(crate) fn set_oracle_collection_time(&mut self, at: &str) {
+        self.collected_at = at.to_owned();
+        self.census_window_end = at.to_owned();
+        self.census_unix_seconds = rfc3339_unix_seconds(at);
+        if let Some(walk) = self.index.traversal.as_mut() {
+            walk.census_window_end = at.to_owned();
+        }
+    }
+
     pub(crate) fn trace_projection(&self) -> Value {
         json!({
             "active_key": self.active_file.as_ref()
@@ -42,6 +53,9 @@ impl OwnedSourceScan {
             "pending_finalization": pending(&self.pending_finalization, &self.roots),
             "sampled_read_bytes": self.sampling.as_ref().map(|s| (s.native_bytes, s.sample_bytes)),
             "lease_held": self.active_file.holds_lease_for_test(),
+            "full_files": self.sampling.as_ref().map(|s| s.full_files),
+            "tail_files": self.sampling.as_ref().map(|s| s.tail_files),
+            "unchanged_files": self.sampling.as_ref().map(|s| s.unchanged_files),
             "audit_slots": self.sampling.as_ref().map(|s| s.audit_slots),
             "audits_started": self.sampling.as_ref().map(|s| s.audits_started),
             "audits_completed": self.sampling.as_ref().map(|s| s.audits_completed),
@@ -81,7 +95,7 @@ fn empty_scan_projection_is_read_only() {
         "active_key": null, "join_active": false, "candidates": 0,
         "traversal_pending": 0, "scanned_file_count": 0, "scanned_session_count": 0,
         "snapshots": 0, "pending_finalization": [], "sampled_read_bytes": null,
-        "lease_held": false, "audit_slots": null, "audits_started": null,
+        "lease_held": false, "full_files": null, "tail_files": null, "unchanged_files": null, "audit_slots": null, "audits_started": null,
         "audits_completed": null, "audit_cap_delay": null,
     });
     assert_eq!(scan.trace_projection(), expected);
