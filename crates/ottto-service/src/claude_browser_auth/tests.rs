@@ -2008,15 +2008,29 @@ fn supervisor_parent_eof_kills_provider_before_releasing_lifetime_lock() {
     let control_write = unsafe { File::from_raw_fd(control_fds[1]) };
     let mut ready_read = unsafe { File::from_raw_fd(ready_fds[0]) };
     let ready_write = unsafe { File::from_raw_fd(ready_fds[1]) };
+    // Like the daemon, keep this side's ends out of every exec'd child. The
+    // provider is spawned inside this process; an inherited control write end
+    // would keep the pipe open so parent EOF could never be observed.
+    for fd in [control_write.as_raw_fd(), ready_read.as_raw_fd()] {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) },
+            0
+        );
+    }
     let operation = operation_id.to_string();
     let supervisor_root = config_dir.clone();
+    let (finished_tx, finished_rx) = std::sync::mpsc::channel();
     let supervisor = thread::spawn(move || {
-        run_auth_supervisor(
+        let result = run_auth_supervisor(
             &operation,
             &supervisor_root,
             control_read.into_raw_fd(),
             ready_write.into_raw_fd(),
-        )
+        );
+        let _ = finished_tx.send(());
+        result
     });
     let mut ready = [0_u8; 1];
     ready_read.read_exact(&mut ready).expect("ready");
@@ -2054,6 +2068,9 @@ fn supervisor_parent_eof_kills_provider_before_releasing_lifetime_lock() {
     );
     assert!(provider_process_active(operation_id).expect("lock state"));
     drop(control_write);
+    finished_rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("parent EOF must kill the provider and end the supervisor");
     let result = supervisor.join().expect("supervisor thread");
     assert!(result.is_ok(), "supervisor result: {result:?}");
     assert!(!provider_process_active(operation_id).expect("released lock"));
