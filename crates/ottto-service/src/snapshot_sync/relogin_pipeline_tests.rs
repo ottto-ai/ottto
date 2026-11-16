@@ -955,7 +955,7 @@ fn account_return_history_row(recorded_a: bool) {
             })
         })
     };
-    let before = sources.map(|source| {
+    let mut before = sources.map(|source| {
         let (bodies, bytes) = cycle(&device_a, &secret_a, source);
         assert!(bytes > 0);
         assert_eq!(
@@ -989,6 +989,27 @@ fn account_return_history_row(recorded_a: bool) {
         .unwrap()
         .set_modified(UNIX_EPOCH + Duration::from_secs(now - 61 * 86400))
         .unwrap();
+    if recorded_a {
+        // Settle the real timestamp edit before measuring an unchanged return.
+        let (touched, _) = cycle(&device_a, &secret_a, SnapshotSource::ClaudeCode);
+        for body in touched {
+            assert_eq!(body["source_session_id"], OLD);
+            let prior = before[0]
+                .iter_mut()
+                .find(|prior| prior["source_session_id"] == OLD)
+                .unwrap();
+            for field in crate::snapshots::sampled_scan::transition_fixture::money_oracle::FIELDS {
+                assert_eq!(
+                    body[*field], prior[*field],
+                    "metadata touch conserves {field}"
+                );
+            }
+            *prior = body;
+        }
+        let (bodies, bytes) = cycle(&device_a, &secret_a, SnapshotSource::ClaudeCode);
+        assert!(bodies.is_empty());
+        assert_eq!(bytes, 0);
+    }
     std::fs::remove_dir_all(&repository).unwrap();
     let mut returned = Vec::new();
     let mut previous_namespace = namespace_a.clone();
@@ -1001,23 +1022,6 @@ fn account_return_history_row(recorded_a: bool) {
         let namespace = snapshot_upload_destination_namespace(&device, &secret);
         let reattached = recorded_a && user == "owner-a";
         assert_eq!(namespace == namespace_a, reattached);
-        if reattached {
-            // Append in place so the retained Tail proves the saved Git binding.
-            use std::io::Write as _;
-            let continuation_at =
-                OffsetDateTime::from_unix_timestamp((now + 1).try_into().unwrap())
-                    .unwrap()
-                    .format(&Rfc3339)
-                    .unwrap();
-            let row = json!({"type":"user","timestamp":continuation_at,"sessionId":IDENTITY_PIPELINE_ROOT,
-                "cwd":repository,"message":{"role":"user","content":"synthetic continuation"}});
-            std::fs::OpenOptions::new()
-                .append(true)
-                .open(&claude)
-                .unwrap()
-                .write_all(format!("{row}\n").as_bytes())
-                .unwrap();
-        }
         assert_ne!(namespace, previous_namespace);
         previous_namespace = namespace.clone();
         assert!(sources
@@ -1028,10 +1032,9 @@ fn account_return_history_row(recorded_a: bool) {
             .to_vec();
         if reattached {
             assert!(
-                returned[1].is_empty(),
-                "accepted Legacy Codex is not re-offered"
+                returned.iter().all(|bodies| bodies.is_empty()),
+                "no accepted history or saved Git binding is replaced on return"
             );
-            assert!(returned[2].is_empty(), "accepted Pi is not re-offered");
             let saved =
                 ScanIndex::load(&index_path(&namespace, SnapshotSource::ClaudeCode)).unwrap();
             assert!(
@@ -1112,17 +1115,17 @@ fn account_return_history_row(recorded_a: bool) {
             .iter()
             .find(|b| b["source_session_id"] == session);
         if let Some(expected) = expected {
-            let after = if recorded_a && session != IDENTITY_PIPELINE_ROOT {
-                if after.is_none() {
-                    let saved =
-                        ScanIndex::load(&index_path(&namespace_a, sources[source])).unwrap();
-                    assert!(saved.accepted_snapshot_fingerprint_recorded(
-                        prior["snapshot_fingerprint"].as_str().unwrap()
-                    ));
-                }
-                after.unwrap_or(prior)
+            let after = if recorded_a {
+                assert!(after.is_none(), "unchanged accepted body is not replaced");
+                let saved = ScanIndex::load(&index_path(&namespace_a, sources[source])).unwrap();
+                assert!(saved.accepted_snapshot_fingerprint_recorded(
+                    prior["snapshot_fingerprint"].as_str().unwrap()
+                ));
+                // No replacement and the exact ACK keep this body effective.
+                // The fingerprint includes repository identity and all money fields.
+                prior
             } else {
-                after.expect("the changed transcript or fresh destination offers its body")
+                after.expect("the fresh destination offers its body")
             };
             assert_eq!(counts(after), expected, "{session}: recorded={recorded_a}");
             assert_eq!(
@@ -1175,6 +1178,12 @@ fn account_return_history_row(recorded_a: bool) {
                 );
                 assert_eq!(after["workspace_kind"], "unknown");
             } else {
+                if source == 0 {
+                    assert!(
+                        after["repository_hash"].is_string(),
+                        "the accepted Git pin survives"
+                    );
+                }
                 assert_eq!(after["repository_hash"], prior["repository_hash"]);
                 assert_eq!(after["workspace_kind"], prior["workspace_kind"]);
             }
