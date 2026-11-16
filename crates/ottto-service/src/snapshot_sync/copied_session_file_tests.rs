@@ -877,9 +877,9 @@ fn held_content_twin_holder_proves_no_copy_until_released() {
             acquired_twin |= scanner.paths().contains(&twin);
             let quiet = !scanner.paths().contains(&main) && !scanner.paths().contains(&copy);
             page.enrich(&c);
-            // Per page, A is sent exactly once: while ROOT is held (T not
-            // read yet) C keeps counting A; once ROOT is sent with A, C
-            // removes it.
+            // A is counted exactly once: until ROOT with A is sent (here or
+            // on an earlier page), C keeps counting A; from then on C removes
+            // it.
             let held = page
                 .disposition
                 .quarantined_fingerprints(&page.scan.snapshots);
@@ -892,12 +892,12 @@ fn held_content_twin_holder_proves_no_copy_until_released() {
             if let Some(copy_body) =
                 body(&page, COPY).filter(|copy| !held.contains(&copy.snapshot_fingerprint))
             {
-                if root_sent.is_some() {
+                if saw_root {
                     assert_eq!(copy_body.request_count, 1, "C counts only its own D");
                     assert_eq!(copy_body.removed_request_count, Some(1), "C removes A");
                     saw_copy = true;
                 } else {
-                    assert_eq!(copy_body.request_count, 2, "C keeps A while ROOT is held");
+                    assert_eq!(copy_body.request_count, 2, "C keeps A until ROOT is sent");
                 }
             }
             // A transfer shrinks C: ACK exact replacements, then update the receiver ledger.
