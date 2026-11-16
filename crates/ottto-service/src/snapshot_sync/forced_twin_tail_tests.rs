@@ -90,11 +90,56 @@ impl Twin {
         both.finish();
         accept_page(&mut both);
         let key = twin.to_string_lossy().into_owned();
-        let record = both
-            .index
-            .claude_request_census_for_test()
-            .get(&key)
-            .unwrap();
+        let mut prior = disk.commit(&both.cache, SnapshotSource::ClaudeCode, &mut both.index);
+        let mut now = crate::scan_clock::utc_seconds();
+        let revision = effective_upload_body_witness_revision(SnapshotSource::ClaudeCode);
+        // Discovery can hold a twin-only page until its holder joins. Pay
+        // that adoption debt through real pages before measuring forced reads.
+        for attempt in 0..8 {
+            // A previous native growth claim may need its six-hour interval.
+            now += 7 * 60 * 60;
+            let (next, complete, progress_blocking) = with_scan_clock(now, || {
+                let mut page = c.raw(&owner, prior, 100, true, std::slice::from_ref(&holder));
+                page.enrich(&c);
+                let holds = page.finish();
+                let complete = mixed_route(&page, &e2_progress(), Mode::Ram)
+                    .snapshots
+                    .contains_key(ROOT);
+                accept_page(&mut page);
+                (
+                    disk.commit(&page.cache, SnapshotSource::ClaudeCode, &mut page.index),
+                    complete,
+                    holds.progress_blocking,
+                )
+            });
+            prior = next;
+            // Reload drops the runtime destination; check the durable proof
+            // against the context that received the setup page's exact ACKs.
+            prior.activate_upload_context("e2-synthetic-destination".into());
+            let settled = [&holder, &twin].iter().all(|path| {
+                prior.files[path.to_string_lossy().as_ref()].effective_upload_body_witness_revision
+                    == revision
+                    && !upload_context_owed_for_test(&prior, path)
+            });
+            if complete && settled {
+                assert!(!progress_blocking, "setup leaves no held session");
+                let paths = owner.paths();
+                assert!(paths.contains(&holder) && paths.contains(&twin));
+                break;
+            }
+            assert!(attempt < 7, "twin setup did not settle within eight pages");
+        }
+        for path in [&holder, &twin] {
+            assert_eq!(
+                prior.files[path.to_string_lossy().as_ref()].effective_upload_body_witness_revision,
+                revision,
+                "setup adopts the active body revision"
+            );
+            // A folded twin may have a local suppression proof, not an ACK
+            // receipt for the holder's body. Either must settle its context.
+            assert!(!upload_context_owed_for_test(&prior, path));
+        }
+        let record = prior.claude_request_census_for_test().get(&key).unwrap();
         assert!(record.is_twin() && !record.can_bind_recomposed_body());
         assert!(!record.unverified_for_test());
         assert_eq!(
@@ -105,11 +150,11 @@ impl Twin {
                 ClaudeRequestCensusShape::Exact
             }
         );
-        assert!(!forced_needs_native_for_test(&both.index, &twin));
+        assert!(!forced_needs_native_for_test(&prior, &twin));
+        owner.acquisitions.lock().unwrap().clear();
         // Keep the holder native so the page byte budget attributes every
         // other consumed byte to the twin, including the unchanged row.
-        damage_tail_for_test(&both.index, &holder.to_string_lossy(), "missing");
-        let prior = disk.commit(&both.cache, SnapshotSource::ClaudeCode, &mut both.index);
+        damage_tail_for_test(&prior, &holder.to_string_lossy(), "missing");
         Self {
             _diagnostics: diagnostics,
             c,
@@ -119,7 +164,7 @@ impl Twin {
             holder,
             twin,
             key,
-            now: std::cell::Cell::new(crate::scan_clock::utc_seconds()),
+            now: std::cell::Cell::new(now),
         }
     }
     fn restart(&self) -> E2ScanFixture {
