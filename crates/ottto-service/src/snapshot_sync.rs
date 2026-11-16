@@ -13440,6 +13440,9 @@ pub(crate) use tests::codex_archive_tests::{
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod upload_borrowed_tests {
+        include!("snapshot_sync/upload_borrowed_tests.rs");
+    }
     #[test]
     fn provider_reauth_retries_once_per_default_login_marker_change() {
         for initial in [None, Some("original".to_string())] {
