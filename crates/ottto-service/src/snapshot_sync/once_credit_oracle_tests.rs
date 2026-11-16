@@ -2078,7 +2078,13 @@ fn scheduling_corpus(home: &OracleHome, seed_only: bool) -> Vec<(PathBuf, String
         } else {
             session
         };
-        let path = root.join(format!("{}-member/{filename}.jsonl", [0, 2, 1, 3, 4][n]));
+        let folder = if n == 1 && home.source == SnapshotSource::ClaudeCode {
+            // Claude resumes share their parent's cwd-derived project folder.
+            0
+        } else {
+            [0, 2, 1, 3, 4][n]
+        };
+        let path = root.join(format!("{folder}-member/{filename}.jsonl"));
         write_jsonl(&path, &rows);
         paths.push((path, session.into()));
         if seed_only {
@@ -2654,10 +2660,11 @@ fn scheduling_permutations_converge_to_the_same_bodies() {
                             // This corpus cannot witness a split of that pair;
                             // independent files still prove nonterminal pages.
                             if limit == 2 {
+                                // CHILD now shares ROOT's folder; use independent n=2 for the split.
                                 assert_ne!(
                                     first_page[&relative(&paths[0].0)],
-                                    first_page[&relative(&paths[1].0)],
-                                    "main and content twin cross real pages"
+                                    first_page[&relative(&paths[2].0)],
+                                    "main and independent session cross real pages"
                                 );
                             }
                             if !one_chunk {
