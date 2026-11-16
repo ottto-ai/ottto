@@ -472,7 +472,7 @@ fn drive_through_client(
 ) -> (Driven, usize, UploadShed) {
     let server = EnvelopeShedServer::new(status, retry_after_seconds, code);
     let client = SnapshotApiClient::new(server.url.clone());
-    let request = SnapshotBatchRequest {
+    let request: SnapshotBatchRequest = SnapshotBatchRequest {
         schema_version: SNAPSHOT_SCHEMA_VERSION,
         source: "claude_code".into(),
         machine_id: "otm_test".into(),

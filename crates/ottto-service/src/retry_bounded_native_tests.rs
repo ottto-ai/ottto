@@ -191,7 +191,7 @@ fn bounded_retry_plain_http_is_declined_before_token_or_batch_io() {
     let mut budget =
         crate::snapshot_retry::RetryBudget::after_shed(Instant::now(), Duration::ZERO).unwrap();
     budget.enter(Instant::now()).unwrap();
-    let request = SnapshotBatchRequest {
+    let request: SnapshotBatchRequest = SnapshotBatchRequest {
         schema_version: SNAPSHOT_SCHEMA_VERSION,
         source: SnapshotSource::Codex.api_slug().into(),
         machine_id: "a".repeat(64),

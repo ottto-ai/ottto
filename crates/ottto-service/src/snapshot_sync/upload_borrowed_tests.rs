@@ -1,7 +1,7 @@
 use super::*;
 use crate::snapshots::claude_request_money::e2;
 
-fn payloads(request: &SnapshotBatchRequest) -> [Vec<u8>; 2] {
+fn payloads(request: &SnapshotBatchRequest<impl std::borrow::Borrow<SnapshotItem>>) -> [Vec<u8>; 2] {
     [
         serde_json::to_vec(request).unwrap(),
         serde_json::to_vec(&request.wire_with_head_cas()).unwrap(),
@@ -79,12 +79,15 @@ fn upload_attempt_matches_cloned_batch_bytes() {
             &|item: &SnapshotItem| item.snapshot_fingerprint.as_str(),
             &snapshot_upload_body_witness,
             &|item: &SnapshotItem| Some(item.source_session_id.as_str()),
-            &mut |batch: Vec<SnapshotItem>| {
+            &mut |batch: &[&SnapshotItem]| {
+                for (item, index) in batch.iter().zip(&indices) {
+                    assert!(std::ptr::eq(*item, &items[*index]));
+                }
                 calls += 1;
                 let request = snapshot_batch_request(
                     source,
                     "b".repeat(64).as_str(),
-                    batch,
+                    batch.to_vec(),
                     SnapshotUploadPolicy::default(),
                     crate::client_report::ClientReport::empty(),
                 );

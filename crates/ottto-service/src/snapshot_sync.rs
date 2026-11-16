@@ -147,7 +147,10 @@ fn bootstrap_cache_heads(
     probes: &[SnapshotItem],
     poison_scope: &str,
     progress: &mut SnapshotUploadProgress,
-    upload: impl FnMut(Vec<SnapshotItem>, bool) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
+    mut upload: impl FnMut(
+        Vec<SnapshotItem>,
+        bool,
+    ) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
     persist: impl FnMut(&mut SnapshotUploadProgress) -> Result<()>,
 ) -> Result<usize> {
     bootstrap_cache_heads_with_budget(
@@ -155,7 +158,7 @@ fn bootstrap_cache_heads(
         poison_scope,
         progress,
         &mut InplaceRetryBudget::default(),
-        upload,
+        |items, enforce| upload(items.iter().copied().cloned().collect(), enforce),
         persist,
     )
 }
@@ -169,7 +172,7 @@ fn bootstrap_cache_heads_with_budget(
     progress: &mut SnapshotUploadProgress,
     inplace_retry: &mut InplaceRetryBudget,
     mut upload: impl FnMut(
-        Vec<SnapshotItem>,
+        &[&SnapshotItem],
         bool,
     ) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
     mut persist: impl FnMut(&mut SnapshotUploadProgress) -> Result<()>,
@@ -7765,13 +7768,13 @@ fn capture_codex_recovery_evidence(
 
 /// The batch request around `snapshots` for this collector's source,
 /// machine, version and upload policy.
-pub(crate) fn snapshot_batch_request(
+pub(crate) fn snapshot_batch_request<T>(
     source: SnapshotSource,
     machine_id: &str,
-    snapshots: Vec<SnapshotItem>,
+    snapshots: Vec<T>,
     upload_policy: SnapshotUploadPolicy,
     client_report: crate::client_report::ClientReport,
-) -> SnapshotBatchRequest {
+) -> SnapshotBatchRequest<T> {
     SnapshotBatchRequest {
         schema_version: SNAPSHOT_SCHEMA_VERSION,
         source: source.api_slug().to_string(),
@@ -7865,7 +7868,7 @@ fn finish_sync_source(
     let mut census_wait = ack_retention::CapacityStopCensusCount::begin(source);
     let client = &receipt_client;
     let codex_join_validator = scan_result.codex_joining_validator();
-    let validate_joined = |snapshots: &[SnapshotItem]| -> Result<()> {
+    let validate_joined = |snapshots: &[&SnapshotItem]| -> Result<()> {
         if let Some(validator) = &codex_join_validator {
             validator.validate(snapshots)?;
         }
@@ -8410,7 +8413,7 @@ fn finish_sync_source(
     let mut inplace_retry = InplaceRetryBudget::default();
     // One page upload, probe or main: preflight at the identity item cap,
     // authority around a fresh relay token, Codex joins, then the exact ACK.
-    let upload_checked = |request: &SnapshotBatchRequest,
+    let upload_checked = |request: &SnapshotBatchRequest<&SnapshotItem>,
                           enforce_head_cas: bool|
      -> Result<crate::snapshot_client::SnapshotBatchResponse> {
         if let Err(reason) = crate::snapshots::validate_snapshot_batch_request_with_item_limit(
@@ -8457,7 +8460,7 @@ fn finish_sync_source(
                 let request = snapshot_batch_request(
                     source,
                     machine_id,
-                    snapshots,
+                    snapshots.to_vec(),
                     upload_policy,
                     crate::client_report::ClientReport::empty(),
                 );
@@ -8581,7 +8584,7 @@ fn finish_sync_source(
                 let request = snapshot_batch_request(
                     source,
                     machine_id,
-                    snapshots,
+                    snapshots.to_vec(),
                     upload_policy,
                     client_report.report().clone(),
                 );
@@ -10836,7 +10839,7 @@ fn upload_resumable_batches_with_body_witness<T, Fingerprint, BodyWitness, Uploa
     accepted: &mut u64,
     fingerprint: Fingerprint,
     body_witness: BodyWitness,
-    upload: Upload,
+    mut upload: Upload,
     persist: Persist,
 ) -> Result<ResumableUploadResult>
 where
@@ -10857,7 +10860,7 @@ where
         |_| 0,
         |_| None,
         &mut InplaceRetryBudget::default(),
-        upload,
+        |items| upload(items.iter().copied().cloned().collect()),
         persist,
     )
 }
@@ -10891,11 +10894,11 @@ fn attempt_snapshot_page<T, Fingerprint, BodyWitness, SessionId, Upload, Persist
     persist: &mut Persist,
 ) -> Result<SnapshotPageOutcome>
 where
-    T: Clone + Serialize,
+    T: Serialize,
     Fingerprint: Fn(&T) -> &str,
     BodyWitness: Fn(&T) -> String,
     SessionId: Fn(&T) -> Option<&str>,
-    Upload: FnMut(Vec<T>) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
+    Upload: FnMut(&[&T]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
     Persist: FnMut(&mut SnapshotUploadProgress) -> Result<()>,
 {
     // Reserve every possible ACK before any remote side effect, including the
@@ -10911,7 +10914,7 @@ where
     progress.admit_ack_batch(new_acks)?;
     let batch = indices
         .iter()
-        .map(|index| items[*index].clone())
+        .map(|index| &items[*index])
         .collect::<Vec<_>>();
     for index in indices {
         let item = &items[*index];
@@ -10944,7 +10947,7 @@ where
     }
     let mut replaced_retained_proof = false;
     if !progress.accepted_identity_scope.is_unset() {
-        progress.load_identity(batch.iter().filter_map(session_id))?;
+        progress.load_identity(batch.iter().copied().filter_map(session_id))?;
     }
     // Only proof the ledger holds can be replaced, whatever the capability.
     if progress.accepted_identity_buckets.has_retained() {
@@ -10963,7 +10966,7 @@ where
     }
     // This page's attempt rows are written once its progress save returns.
     let attempt_history = crate::upload_receipts::defer();
-    let response = upload(batch);
+    let response = upload(&batch);
     // The callback includes local preflight and authority checks. Only a reply
     // or a typed batch response proves this ordinary retry reached a send.
     if response.is_ok()
@@ -11398,13 +11401,13 @@ fn upload_resumable_batches_with_literal_families<
     mut persist: Persist,
 ) -> Result<ResumableUploadResult>
 where
-    T: Clone + Serialize,
+    T: Serialize,
     Fingerprint: Fn(&T) -> &str,
     BodyWitness: Fn(&T) -> String,
     SessionId: Fn(&T) -> Option<&str>,
     BatchClass: Fn(&T) -> u8,
     LiteralFamily: Fn(&T) -> Option<&str>,
-    Upload: FnMut(Vec<T>) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
+    Upload: FnMut(&[&T]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
     Persist: FnMut(&mut SnapshotUploadProgress) -> Result<()>,
 {
     // Input is a page/delta, not a census. Only an explicitly changed body
@@ -19037,6 +19040,7 @@ mod tests {
             |_| None,
             &mut InplaceRetryBudget::default(),
             |batch| {
+                let batch = batch.iter().copied().cloned().collect::<Vec<_>>();
                 let is_reconcile = batch
                     .iter()
                     .all(|fingerprint| reconcile_class.contains(fingerprint));
@@ -24021,7 +24025,7 @@ mod tests {
         fn send(
             &mut self,
             slot: usize,
-            upload: impl FnMut(
+            mut upload: impl FnMut(
                 Vec<SnapshotItem>,
             ) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
         ) -> Result<SnapshotPageOutcome> {
@@ -24048,7 +24052,7 @@ mod tests {
                 &|i: &SnapshotItem| i.snapshot_fingerprint.as_str(),
                 &snapshot_upload_body_witness,
                 &|item: &SnapshotItem| Some(item.source_session_id.as_str()),
-                &mut { upload },
+                &mut |items| upload(items.iter().copied().cloned().collect()),
                 &mut |p: &mut SnapshotUploadProgress| p.save(&self.progress_path),
             )
         }
@@ -24380,6 +24384,7 @@ mod tests {
                     &mut f.progress,
                     &mut InplaceRetryBudget::default(),
                     |items, _| {
+                        let items = items.iter().copied().cloned().collect::<Vec<_>>();
                         post(items.as_slice());
                         headed(items)
                     },
@@ -24798,7 +24803,7 @@ mod tests {
             &|item: &SnapshotItem| Some(item.source_session_id.as_str()),
             &mut |items| {
                 physical += 1;
-                same_source_fixture_ack(items)
+                same_source_fixture_ack(items.iter().copied().cloned().collect())
             },
             &mut |_| Err(anyhow!("synthetic crash before ledger save")),
         );

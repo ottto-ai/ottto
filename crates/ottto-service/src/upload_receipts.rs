@@ -8,6 +8,7 @@ use ottto_protocol::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::borrow::Borrow;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -16,7 +17,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::snapshot_client::{SnapshotBatchResponse, SnapshotEntityRef, SnapshotEntityRejection};
 use crate::snapshots::state_v2::upload_history::{CloudAck, CloudAckWrite, Encoded, Filter, Store};
-use crate::snapshots::SnapshotBatchRequest;
+use crate::snapshots::{SnapshotBatchRequest, SnapshotItem};
 
 /// Most receipts one `ottto receipts` page returns.
 pub const UPLOAD_RECEIPT_PAGE_SIZE: usize = 500;
@@ -191,7 +192,7 @@ impl RejectedUsageReason {
 }
 
 fn rejected_usage_evidence(
-    request: &SnapshotBatchRequest,
+    request: &SnapshotBatchRequest<impl Borrow<SnapshotItem>>,
     item: &crate::snapshots::SnapshotItem,
     rejection: &SnapshotEntityRejection,
 ) -> RejectedUsageEvidence {
@@ -292,7 +293,7 @@ fn valid_digest(value: &str) -> bool {
 }
 
 fn validated_evidence(
-    request: &SnapshotBatchRequest,
+    request: &SnapshotBatchRequest<impl Borrow<SnapshotItem>>,
     response: &SnapshotBatchResponse,
     destination: &str,
     api_destination: &str,
@@ -302,8 +303,7 @@ fn validated_evidence(
 ) -> Option<ValidatedReceiptEvidence> {
     let head_cas = head_cas
         || request
-            .snapshots
-            .iter()
+            .items()
             .any(|item| item.cache_observations.is_some());
     if !valid_digest(destination)
         || !valid_digest(api_destination)
@@ -317,7 +317,7 @@ fn validated_evidence(
         return None;
     }
     let mut requested = std::collections::BTreeMap::new();
-    for item in &request.snapshots {
+    for item in request.items() {
         if !valid_digest(&item.snapshot_fingerprint) {
             return None;
         }
@@ -555,7 +555,7 @@ pub fn append_success_with_context(
         server_request_id,
         response,
         context,
-        None,
+        None::<(&SnapshotBatchRequest, &str, &str, bool)>,
     )
 }
 
@@ -568,7 +568,12 @@ pub(crate) fn append_success_with_evidence_context(
     server_request_id: Option<&str>,
     response: &SnapshotBatchResponse,
     context: &UploadReceiptContext,
-    evidence_request: Option<(&SnapshotBatchRequest, &str, &str, bool)>,
+    evidence_request: Option<(
+        &SnapshotBatchRequest<impl Borrow<SnapshotItem>>,
+        &str,
+        &str,
+        bool,
+    )>,
 ) -> Result<()> {
     let outcome = if response.disabled {
         UploadReceiptOutcomeV1::Rejected
