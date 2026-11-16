@@ -9852,7 +9852,7 @@ struct ClaudeEvidencePage<'p> {
     /// Roots already counted: a scope root two chunks read counts once.
     counted_roots: BTreeSet<String>,
     /// Sessions withheld for an absent content twin, decided once over the
-    /// whole page; every chunk's finish uses it.
+    /// whole page before copy decisions; every chunk's finish uses it.
     content_held: BTreeSet<String>,
     side_call_discovery: crate::snapshots::claude_request_money::e2::SideCallDiscovery,
 }
@@ -9913,10 +9913,11 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
     );
     // `e2`: every held copy skip is decided (or the session held) before
     // telemetry attaches, so a copy that counts after all can be matched.
-    crate::snapshots::claude_request_money::e2::decide_page_copies(
+    crate::snapshots::claude_request_money::e2::decide_page_copies_planned(
         &mut scan_result.snapshots,
         index,
         accepted_identity_buckets,
+        &page.content_held,
     )
     .apply(index);
     // Footprint window of the whole stage, once per page; each chunk's read,

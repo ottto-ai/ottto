@@ -666,6 +666,14 @@ fn five_root_sweep_paged(multi_root: bool, limit: usize) {
         accepted.set_account_source_enabled(true);
         for sweep in 0..2 {
             if sweep == 1 {
+                // A packed-page comparison needs every family selected on
+                // both sweeps. Stable local ownership no longer selects the
+                // unchanged copies merely because their holder committed.
+                if limit == 5 {
+                    for session in [COPY, RESUMED, LOGINS, MALFORMED] {
+                        append(&c.root.join(format!("{session}.jsonl")), "\n");
+                    }
+                }
                 append(&a, &line(ROOT, "later", "2026-08-02T07:08:00Z", 6));
                 c.evidence_for(
                     ROOT,
@@ -725,8 +733,8 @@ fn streamed_evidence_equals_whole_corpus() {
         e2_pipeline_trace_named_agent_on_another_page_is_not_published_on_root();
         // A queued, stale copy holder.
         copy_waits_for_queued_holder(true);
-        // A prefix hold expiring.
-        e2_pipeline_resumed_prefix_hold_emits_own_turns_and_expires_after_three_decisions();
+        // A completing census decision followed by ten unchanged passes.
+        e2_pipeline_copy_census_completes_once_over_ten_unchanged_passes();
         // Retired and departed holders.
         e2_pipeline_resumed_copy_removal_stays_removed_after_its_proof_retires();
         e2_pipeline_recorded_removal_stands_when_its_holder_leaves_the_index();
@@ -1455,7 +1463,8 @@ fn e2_pipeline_unlisted_twin_resume_counts_copied_requests_once() {
                 (counted, Some(removed)),
                 "{name}: each copied request counts once"
             );
-            assert_eq!(copy_diag(&["copy_prefix_twin_page_removed"]), [removed]);
+            assert_eq!(copy_diag(&["copy_prefix_twin_page_removed"]), [0]);
+            assert!(!first.index.claude_copy_removals.is_empty());
             let prior = settle(&c, &ScanIndex::default(), first, &mut e2_progress());
             append(&latest, &line("late", "2026-11-04T09:00:00Z", 40));
             let tail = ready(&c, &scanner, prior.clone(), 100, true);
@@ -1506,7 +1515,7 @@ fn e2_pipeline_unlisted_twin_resume_before_cutoff_keeps_its_count() {
         literal(&first);
         assert_eq!(
             (total(&first), first.scan.snapshots[0].removed_request_count),
-            (3, Some(0))
+            (2, Some(1))
         );
         let prior = settle(&c, &ScanIndex::default(), first, &mut e2_progress());
         append(&copy, &line("r3", "2026-11-04T09:00:00Z", 30));
@@ -1567,7 +1576,8 @@ fn e2_pipeline_unlisted_twin_resume_counts_copied_request_once_with_holder_off_p
         );
         literal(&together);
         assert_eq!(total(&together), 2, "r1 once (from the holder) and r2");
-        assert_eq!(copy_diag(&["copy_prefix_twin_page_removed"]), [1]);
+        assert_eq!(copy_diag(&["copy_prefix_twin_page_removed"]), [0]);
+        assert!(!together.index.claude_copy_removals.is_empty());
         // Alone the resume restores and discloses r1, beside its holder it removes it
         // (removed_request_count, copy_unproven): compare counted totals only.
         let counted = |page: &Page| {
@@ -1803,8 +1813,8 @@ fn e2_pipeline_paced_twin_does_not_force_its_family() {
 }
 
 /// [money] An all-pre-birth path twin has no own turn, so nothing proves
-/// its copy: both paths count r1 (flagged) on the first page. After the
-/// original is deleted, the survivor keeps its stored body and, once it
+/// locally owned earlier path proves the copy on the first page. After the
+/// accepted original is deleted, the survivor keeps its stored body and, once it
 /// changes, still counts r1 once and its own new turn.
 #[test]
 fn e2_pipeline_deleted_original_leaves_one_count_after_restart() {
@@ -1825,12 +1835,13 @@ fn e2_pipeline_deleted_original_leaves_one_count_after_restart() {
         let mut first = ready(&c, &scanner, ScanIndex::default(), 100, false);
         assert_eq!(
             total(&first),
-            2,
-            "an unproven twin copy counts on both paths"
+            1,
+            "the locally owned earlier twin counts r1 once"
         );
+        assert_eq!(copy_diag(&["copy_prefix_unproven"]), [0]);
         assert!(
-            copy_diag(&["copy_prefix_unproven"])[0] > 0,
-            "the unproven twin copy is flagged"
+            !first.index.claude_copy_removals.is_empty(),
+            "the local removal is recorded"
         );
         first.finish();
         let prior = c.reload(&mut first.index);
@@ -2426,18 +2437,40 @@ fn e2_pipeline_orphan_branch_copy_counts_once_and_discloses() {
 }
 
 /// [money] Restored same-session path twins, every line pre-birth: no own
-/// turn or accepted session yet, so both initially count r1 and disclose
-/// it. Once the summed body is accepted, the earlier file proves the copy
+/// turn or accepted session yet, but the earlier counted local body proves
+/// the copy immediately. After the summed body is accepted it stays proven
 /// regardless of the ACK carrier, discovery order or equal-birth tie break.
 /// An unchanged page emits nothing; growth declares the prior removal.
 fn restored_twins(reverse: bool, equal: bool) {
+    restored_twins_pinned(reverse, equal, None);
+}
+
+/// `copy_key_first`: pin the equal-birth tie (the location key order of the
+/// two paths) instead of leaving it to the scratch directory's hash.
+fn restored_twins_pinned(reverse: bool, equal: bool, copy_key_first: Option<bool>) {
     with_e2(|| {
-        let mut c = Corpus::new(&format!("e2-pipeline-restored-{reverse}-{equal}"));
+        let mut c = Corpus::new(&format!(
+            "e2-pipeline-restored-{reverse}-{equal}-{copy_key_first:?}"
+        ));
         let (a, b) = if reverse {
             ("z-original", "a-copy")
         } else {
             ("a-original", "z-copy")
         };
+        let (a, b) = match copy_key_first {
+            None => (a.to_string(), b.to_string()),
+            Some(want) => {
+                use crate::snapshots::claude_money_birth_store::location_key;
+                let key = |dir: &str| {
+                    location_key(&c.root.join(format!("{dir}/{ROOT}.jsonl")).to_string_lossy())
+                };
+                (0..256)
+                    .map(|n| (format!("{a}-{n}"), format!("{b}-{n}")))
+                    .find(|(a, b)| (key(b) < key(a)) == want)
+                    .expect("both key orders occur among 256 suffixes")
+            }
+        };
+        let (a, b) = (a.as_str(), b.as_str());
         c.write_at(
             &format!("{a}/{ROOT}.jsonl"),
             &line(ROOT, "r1", AT, 10),
@@ -2453,6 +2486,7 @@ fn restored_twins(reverse: bool, equal: bool) {
             },
         );
         let scanner = E2ScanFixture::default();
+        e2::take_diag();
         let mut first = ready(&c, &scanner, ScanIndex::default(), 100, false);
         let opened = scanner.paths();
         assert_eq!(opened.len(), 2);
@@ -2463,13 +2497,16 @@ fn restored_twins(reverse: bool, equal: bool) {
         literal(&first);
         assert_eq!(
             total(&first),
-            2,
-            "unproven all-prebirth restored twins count on both paths"
+            1,
+            "all-prebirth restored twins count once from their earlier local owner"
         );
-        assert!(
-            e2::pipeline_test_observer::disclosed(&first.scan.snapshots) + first.released.disclosed
-                > 0,
-            "the unproven twin copy is disclosed"
+        // The emitted body carries the first discovered path's fold. When
+        // that path is the removed copy, the counting twin's inline counter
+        // leaves with its merged fold. Observe the sum of both decisions.
+        assert_eq!(
+            copy_diag(&["copy_prefix_unproven"]),
+            [1],
+            "the single counted request without an earlier owner is disclosed"
         );
         first.finish();
         let stored = stored_bodies(&first.index);
@@ -2514,6 +2551,13 @@ fn e2_pipeline_restored_twins_equal_birth_forward() {
 #[test]
 fn e2_pipeline_restored_twins_equal_birth_reverse() {
     restored_twins(true, true);
+}
+/// [money] Equal births break the tie by location key: both orders count
+/// every request exactly once, whichever path carries the session.
+#[test]
+fn e2_pipeline_restored_twins_equal_birth_reverse_pinned_ties() {
+    restored_twins_pinned(true, true, Some(true));
+    restored_twins_pinned(true, true, Some(false));
 }
 
 /// [money] A summed body's COPY mark never lets its counting carrier drop r1.
@@ -2867,7 +2911,6 @@ fn assert_withheld(page: &Page, session: &str, why: &str) {
         "{why}: the session is held"
     );
 }
-
 /// An earlier twin rewritten IN PLACE
 /// (same inode, size kept) no longer holds H. Its stale identity cannot
 /// remove H from the later twin: H counts once, from the twin.
@@ -3043,8 +3086,8 @@ fn e2_pipeline_branch_written_by_the_current_m4_claude_code_is_skipped() {
 }
 
 /// A /branch read before its original on a fresh index
-/// cannot decide: it is held (never counted), and a later page that reads
-/// the original skips it. Both discovery orders.
+/// counts immediately; after the original commits, the marked correction
+/// removes it. Both discovery orders.
 fn branch_before_original(copy_first: bool) {
     with_e2(|| {
         let original = if copy_first { LATE } else { ROOT };
@@ -3064,11 +3107,10 @@ fn branch_before_original(copy_first: bool) {
         assert_eq!(opened.len(), 1, "one file per page");
         let read_first = if copy_first { COPY } else { original };
         assert!(opened[0].ends_with(format!("{read_first}.jsonl")));
+        literal(&first);
+        assert_eq!(total(&first), 1);
         if copy_first {
-            assert_withheld(&first, COPY, "copy before its original");
-        } else {
-            literal(&first);
-            assert_eq!(total(&first), 1);
+            assert_eq!(body(&first, COPY).unwrap().removed_request_count, Some(0));
         }
         let mut prior = settle(&c, &old, first, &mut progress);
         let mut copy_body = None;
@@ -3111,8 +3153,8 @@ fn e2_pipeline_branch_read_after_its_original_on_a_fresh_index_is_skipped() {
 
 /// An indexed original rewritten in place to drop H, then a new all-pre-birth
 /// branch holding H, read before the original's next page: the original's
-/// census record no longer describes its file, so the branch waits for that
-/// read instead of skipping H. H then counts once, from the branch.
+/// accepted body still owns H until the replacement commits. The marked
+/// branch then restores H, which counts once from the branch.
 #[test]
 fn e2_pipeline_branch_waits_for_an_original_modified_since_its_read() {
     with_e2(|| {
@@ -3145,7 +3187,12 @@ fn e2_pipeline_branch_waits_for_an_original_modified_since_its_read() {
             opened[0].ends_with(format!("{COPY}.jsonl")),
             "fixture reads the branch before the modified original"
         );
-        assert_withheld(&page, COPY, "the original changed since its read");
+        literal(&page);
+        assert_eq!(
+            body(&page, COPY).map(|copy| (copy.request_count, copy.removed_request_count)),
+            Some((0, Some(1))),
+            "the accepted original still owns h until its replacement commits"
+        );
         prior = settle(&c, &prior, page, &mut progress);
         let mut original_body = None;
         let mut copy_body = None;
@@ -3175,8 +3222,8 @@ fn e2_pipeline_branch_waits_for_an_original_modified_since_its_read() {
 /// Owner rule (P2): holding a session withholds its upload only; its scan
 /// state stays evidence. All-copied main files of four sessions share
 /// request ids (the Linux probe shape: every root a cross-session copy
-/// candidate), read one per page. A file waits only for files no page has
-/// read yet, never for one that is merely held, so every session publishes
+/// candidate), read one per page. Each file counts unproven requests or
+/// removes them against an earlier local owner, so every session publishes
 /// within two traversal passes, each request counts exactly once, and
 /// nothing is re-read after.
 #[test]
@@ -3244,7 +3291,7 @@ fn e2_pipeline_held_copies_never_wait_on_each_other() {
             }
             prior = settle(&c, &prior, page, &mut progress);
         }
-        assert!(held > 0, "the shape makes sessions wait: {published:?}");
+        assert_eq!(held, 0, "local ownership never waits: {published:?}");
         assert!(
             reads.values().all(|&count| count <= 2),
             "settled within two traversal passes: no file read more than twice, {reads:?}"
@@ -3279,39 +3326,6 @@ fn e2_pipeline_held_copies_never_wait_on_each_other() {
             }
             prior = settle(&c, &prior, page, &mut progress);
         }
-    });
-}
-
-/// The census walk deadline decides nothing: the /branch is
-/// held, then the next page's walk skips it.
-#[test]
-fn e2_pipeline_branch_census_deadline_holds_then_a_later_walk_skips() {
-    with_e2(|| {
-        let mut c = Corpus::new("e2-pipeline-branch-deadline");
-        c.root(ROOT, &line(ROOT, "original", AT, 10));
-        let scanner = E2ScanFixture::default();
-        let mut progress = e2_progress();
-        let old = ScanIndex::default();
-        let original = ready(&c, &scanner, old.clone(), 100, false);
-        let prior = settle(&c, &old, original, &mut progress);
-        c.write_at(
-            &format!("{COPY}.jsonl"),
-            &line(COPY, "original", AT, 10),
-            "2026-08-02T07:03:00Z",
-        );
-        let mut held = c.raw(&E2ScanFixture::default(), prior.clone(), 100, false, &[]);
-        crate::snapshots::claude_request_census::with_walk_deadline_for_test(|| {
-            held.enrich(&c);
-        });
-        assert_withheld(&held, COPY, "walk deadline");
-        let prior = settle(&c, &prior, held, &mut progress);
-        let decided = ready(&c, &E2ScanFixture::default(), prior, 100, false);
-        let copy = body(&decided, COPY).expect("the held copy is read again");
-        assert!(crate::snapshots::claude_request_money::is_request_owned_literal(copy));
-        assert_eq!(
-            (copy.request_count, copy.removed_request_count),
-            (0, Some(1))
-        );
     });
 }
 
@@ -3482,8 +3496,8 @@ fn e2_pipeline_aged_original_sharing_ids_with_its_copy_keeps_the_copy_proven() {
 /// since its last read, is still queued by the traversal. `stale_record`:
 /// the holder keeps a census record of its old content (rewritten in place
 /// without the request); else it has none (indexed, record lost) and grew.
-/// The copy waits for the holder's re-read instead of deciding on what the
-/// stale (or absent) record says, then each request counts exactly once.
+/// The copy decides immediately from existing positive proof. Committing
+/// the holder's re-read marks a correction, so each request counts once.
 fn copy_waits_for_queued_holder(stale_record: bool) {
     with_e2(|| {
         let mut c = Corpus::new(&format!("e2-pipeline-queued-holder-{stale_record}"));
@@ -3516,9 +3530,20 @@ fn copy_waits_for_queued_holder(stale_record: bool) {
             opened[0].ends_with(format!("{COPY}.jsonl")),
             "the copy is read while its changed holder is still queued"
         );
-        assert_withheld(&held, COPY, "the holder's re-read decides");
+        literal(&held);
+        let first_copy = body(&held, COPY).unwrap();
+        let first_decision = (first_copy.request_count, first_copy.removed_request_count);
+        assert_eq!(
+            first_decision,
+            if stale_record {
+                (0, Some(1))
+            } else {
+                (1, Some(0))
+            },
+            "positive accepted census removes immediately; missing census counts immediately"
+        );
         prior = settle(&c, &prior, held, &mut progress);
-        let (mut copy_body, mut original_requests) = (None, None);
+        let (mut copy_body, mut original_requests) = (Some(first_decision), None);
         for _ in 0..4 {
             let page = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
             if let Some(found) = body(&page, LATE) {
@@ -3530,7 +3555,16 @@ fn copy_waits_for_queued_holder(stale_record: bool) {
                 copy_body = Some((found.request_count, found.removed_request_count));
             }
             prior = settle(&c, &prior, page, &mut progress);
-            if copy_body.is_some() && original_requests.is_some() {
+            // The holder's save marks a later correction; its own page is
+            // not evidence that the copy has consumed that mark yet.
+            if original_requests.is_some()
+                && copy_body
+                    == Some(if stale_record {
+                        (1, Some(0))
+                    } else {
+                        (0, Some(1))
+                    })
+            {
                 break;
             }
         }
@@ -3726,154 +3760,6 @@ fn settle_captured_holds(
         &c.base.join("scan-index.json"),
     )
 }
-/// A census deadline withholds a NEW copy. Every walk re-decides the hold;
-/// a healthy external census releases it without any transcript change.
-fn withheld_new_file_retries_from_retained_read(grow: bool, sampled: bool, loss: u8) {
-    with_e2(|| {
-        let mut c = Corpus::new(&format!("e2-held-new-tail-{grow}-{sampled}-{loss}"));
-        c.root(ROOT, &line(ROOT, "root", AT, 10));
-        let scanner = E2ScanFixture::default();
-        let mut progress = e2_progress();
-        let empty = ScanIndex::default();
-        let original = ready(&c, &scanner, empty.clone(), 100, sampled);
-        let prior = settle_captured_holds(&c, &empty, original, &mut progress);
-        // Consume the existing one-time identity-contract re-arm.
-        let warm = ready(&c, &scanner, prior.clone(), 100, sampled);
-        let prior = settle_captured_holds(&c, &prior, warm, &mut progress);
-        let accepted_before = progress.accepted_fingerprints.clone();
-        let path = c.write_at(
-            &format!("{COPY}.jsonl"),
-            &line(COPY, "root", AT, 10),
-            "2026-08-02T07:03:00Z",
-        );
-        let mut first = c.raw(&scanner, prior.clone(), 100, sampled, &[]);
-        crate::snapshots::claude_request_census::with_walk_deadline_for_test(|| {
-            first.enrich(&c);
-        });
-        assert_withheld(&first, COPY, "external census unavailable");
-        let prior = settle_captured_holds(&c, &prior, first, &mut progress);
-        assert_eq!(progress.accepted_fingerprints, accepted_before);
-        assert_eq!(prior.current_snapshot_fingerprints(), accepted_before);
-        if grow {
-            // Keep every response pre-birth, so growth cannot itself resolve
-            // the all-copied main-file hold before external evidence arrives.
-            append(&path, &line(COPY, "own", "2026-08-02T07:01:00Z", 20));
-        }
-        assert!(
-            !prior.files.contains_key(path.to_string_lossy().as_ref()),
-            "held NEW keys must never gain money authority after real save/load"
-        );
-        let restarted = E2ScanFixture::default();
-        if let Some(route) = crate::snapshots::e2_pipeline_scan_fixture::route_of(&prior) {
-            // A restart keeps the state database: only RAM is lost.
-            crate::snapshots::e2_pipeline_scan_fixture::continue_route_for_test(
-                &restarted.cache,
-                &route,
-            );
-        }
-        if loss == 1 {
-            scanner.evict(&prior);
-        }
-        let scanner = if loss == 3 { &restarted } else { &scanner };
-        let mut retry = c.raw(scanner, prior.clone(), 100, sampled, &[]);
-        crate::snapshots::claude_request_census::with_walk_deadline_for_test(|| {
-            retry.enrich(&c);
-        });
-        assert_withheld(&retry, COPY, "external census still unavailable");
-        if sampled {
-            // On the database route the held-new custody is durable (the
-            // withheld read's census record and committed head): an
-            // eviction or restart still continues it.
-            assert_eq!(
-                retry.modes,
-                if grow { (0, 1, 0) } else { (0, 0, 1) },
-                "retry, loss={loss}"
-            );
-        }
-        let prior = settle_captured_holds(&c, &prior, retry, &mut progress);
-        assert_eq!(progress.accepted_fingerprints, accepted_before);
-        let before = std::fs::metadata(&path).unwrap();
-        let restored = ready(&c, scanner, prior.clone(), 100, sampled);
-        if sampled {
-            assert_eq!(restored.modes, (0, 0, 1), "restored, loss={loss}");
-        }
-        literal(&restored);
-        // Cold Full is only the fixture's reference oracle. Production keeps
-        // the retained read when the external census becomes available.
-        // A routed prior reads unrouted here, as every cold oracle does.
-        let full_prior = crate::snapshots::e2_pipeline_scan_fixture::route_for_test(
-            SnapshotSource::ClaudeCode,
-            None,
-            prior.clone(),
-        );
-        assert!(!full_prior
-            .files
-            .contains_key(path.to_string_lossy().as_ref()));
-        // Today's settlement omits this NEW held key. Keep its other census
-        // evidence, and compare the resulting published body byte for byte.
-        let full = ready(&c, &E2ScanFixture::default(), full_prior, 100, false);
-        assert_eq!(
-            canonical(&request(&restored.scan.snapshots)),
-            canonical(&request(&full.scan.snapshots))
-        );
-        let copy = body(&restored, COPY).expect("external evidence releases the copy");
-        assert_eq!(copy.removed_request_count, Some(1));
-        assert_eq!(copy.request_count, u64::from(grow));
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), before.len());
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().modified().unwrap(),
-            before.modified().unwrap()
-        );
-        // Check the two rejected placeholder authority paths using the real
-        // held settlement; modes/body checks above finish before disappearance.
-        std::fs::remove_file(&path).unwrap();
-        e2::pipeline_test_observer::assert_held_new_file_has_no_money_authority(&prior, &path);
-        let settled = settle_captured_holds(&c, &prior, restored, &mut progress);
-        assert_eq!(
-            progress.accepted_fingerprints.len(),
-            accepted_before.len() + 1
-        );
-        assert_eq!(
-            settled.current_snapshot_fingerprints().len(),
-            accepted_before.len() + 1
-        );
-    });
-}
-
-#[test]
-fn e2_pipeline_withheld_new_file_retries_external_evidence_unchanged() {
-    withheld_new_file_retries_from_retained_read(false, false, 0);
-}
-
-#[test]
-fn e2_pipeline_withheld_new_file_retries_external_evidence_after_growth() {
-    withheld_new_file_retries_from_retained_read(true, false, 0);
-}
-
-#[test]
-fn e2_pipeline_withheld_new_file_unchanged_acquisition_is_unchanged() {
-    withheld_new_file_retries_from_retained_read(false, true, 0);
-}
-
-#[test]
-fn e2_pipeline_withheld_new_file_growth_acquisition_is_tail() {
-    withheld_new_file_retries_from_retained_read(true, true, 0);
-}
-
-#[test]
-fn e2_pipeline_held_new_file_cache_clear_eviction_restart_read_full() {
-    for loss in [1, 3] {
-        withheld_new_file_retries_from_retained_read(false, true, loss);
-    }
-}
-
-#[test]
-fn e2_pipeline_held_new_file_lifetime_losses_preserve_main_body() {
-    for loss in [1, 3] {
-        withheld_new_file_retries_from_retained_read(false, false, loss);
-    }
-}
-
 // Copy-family fix: resumed
 // files of any Claude Code version, with turns of their own after the
 // copied prefix (the demo 2026-08-12 shape).
@@ -4157,6 +4043,14 @@ fn e2_pipeline_stored_copy_removal_is_dropped_when_its_holder_no_longer_holds_it
         let rewrite = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
         assert_eq!(body(&rewrite, ROOT).map(|s| s.request_count), Some(1));
         let mut prior = settle(&c, &prior, rewrite, &mut progress);
+        // Commit the marked corrections before retiring their new holder proof.
+        let repair = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
+        let fallback = body(&repair, COPY).expect("the marked intermediate holder restores a");
+        assert_eq!(
+            (fallback.request_count, fallback.removed_request_count),
+            (2, Some(1))
+        );
+        prior = settle(&c, &prior, repair, &mut progress);
         // The first resume's id list retires; the second resume grows.
         e2::pipeline_test_observer::retire_census(&mut prior, &file(COPY));
         append(
@@ -4167,14 +4061,17 @@ fn e2_pipeline_stored_copy_removal_is_dropped_when_its_holder_no_longer_holds_it
         let page = ready(&c, &E2ScanFixture::default(), prior, 100, false);
         literal(&page);
         let third = body(&page, THIRD).expect("the grown resume publishes");
-        // a: its stored holder disproves it and no other holder answers, so
-        // it counts here once (flagged); b: the original still proves it;
-        // c: the retired first resume's stored removal stands.
+        // The changed original re-arms COPY too. Its corrected body owns a;
+        // THIRD keeps a removed under that holder even after its census retires.
         assert_eq!(
             (third.request_count, third.removed_request_count),
-            (3, Some(2))
+            (2, Some(3))
         );
-        assert_eq!(copy_diag(&PREFIX_KEYS), [1, 1, 0, 1, 0]);
+        assert_eq!(
+            third.input_tokens + third.removed_usage.as_ref().unwrap().input_tokens,
+            50
+        );
+        assert_eq!(copy_diag(&PREFIX_KEYS), [0, 0, 0, 2, 0]);
     });
 }
 
@@ -4317,52 +4214,48 @@ fn e2_pipeline_file_without_copied_prefix_stores_and_flags_nothing() {
     });
 }
 
+/// A copy decision completes even when a deadline-bearing census walk would
+/// time out. The unchanged copy is read once and stays unmarked for ten passes.
 #[test]
-fn e2_pipeline_resumed_prefix_hold_emits_own_turns_and_expires_after_three_decisions() {
+fn e2_pipeline_copy_census_completes_once_over_ten_unchanged_passes() {
     for sampled in [false, true] {
         with_e2(|| {
-            let mut c = Corpus::new("e2-pipeline-prefix-expiry");
+            let mut c = Corpus::new("e2-pipeline-copy-census-completes");
             c.root(ROOT, &resumed(ROOT, &[A, B]));
             let mut progress = e2_progress();
             let scanner = E2ScanFixture::default();
             let old = ScanIndex::default();
             let original = ready(&c, &scanner, old.clone(), 100, sampled);
             let mut prior = settle(&c, &old, original, &mut progress);
-            c.write_at(
+            let path = c.write_at(
                 &file(COPY),
                 &resumed(COPY, &[A, B, C]),
                 "2026-08-02T07:03:00Z",
             );
-            for pass in 1..=3 {
+            let location =
+                crate::snapshots::claude_money_birth_store::location_key(&path.to_string_lossy());
+            let mut reads = 0;
+            for pass in 0..=10 {
                 let mut page = c.raw(&scanner, prior.clone(), 100, sampled, &[]);
-                e2::take_diag();
+                reads += usize::from(scanner.paths().contains(&path));
                 crate::snapshots::claude_request_census::with_walk_deadline_for_test(|| {
                     page.enrich(&c);
                 });
-                let copy =
-                    body(&page, COPY).expect("held prefix stays discoverable after own-turn ACK");
-                assert!(crate::snapshots::claude_request_money::is_request_owned_literal(copy));
-                assert_eq!(
-                    (copy.request_count, copy.removed_request_count),
-                    (if pass < 3 { 1 } else { 3 }, Some(0))
-                );
-                assert_eq!(
-                    copy_diag(&[
-                        "copy_prefix_held_requests",
-                        "copy_prefix_hold_expired",
-                        "copy_prefix_unproven"
-                    ]),
-                    if pass < 3 { [2, 0, 0] } else { [0, 2, 2] }
-                );
-                prior = settle(&c, &prior, page, &mut progress); // save/reload each pass
+                if pass == 0 {
+                    let copy = body(&page, COPY).expect("the copy is decided on its first pass");
+                    assert!(crate::snapshots::claude_request_money::is_request_owned_literal(copy));
+                    assert_eq!(
+                        (copy.request_count, copy.removed_request_count),
+                        (1, Some(2))
+                    );
+                } else {
+                    assert!(body(&page, COPY).is_none(), "unchanged copy on pass {pass}");
+                }
+                assert!(!page.index.claude_copy_removals.pending(location));
+                prior = settle(&c, &prior, page, &mut progress);
+                assert!(!prior.claude_copy_removals.pending(location));
             }
-            // The expired hold's body went on its own pass, a stored re-fold
-            // sent as an ordinary update (L02); nothing selects afterwards.
-            let quiet = ready(&c, &scanner, prior, 100, sampled);
-            assert!(
-                body(&quiet, COPY).is_none(),
-                "expired retry debt never selects forever"
-            );
+            assert_eq!(reads, 1, "one decision read, then ten unchanged passes");
         });
     }
 }
@@ -4649,49 +4542,6 @@ fn e2_pipeline_proven_prefix_markers_never_lend_identity_to_retained_requests() 
 }
 
 #[test]
-fn e2_pipeline_recorded_removals_survive_repeated_walk_deadlines_with_live_proof() {
-    with_e2(|| {
-        let mut c = Corpus::new("e2-pipeline-stored-copy-deadline");
-        let scanner = E2ScanFixture::default();
-        let mut progress = e2_progress();
-        let mut prior = demo_family(&mut c, &mut progress);
-        for pass in 1..=3 {
-            append(
-                &c.root.join(file(THIRD)),
-                &line_by(
-                    THIRD,
-                    &format!("own-{pass}"),
-                    &format!("2026-08-02T07:06:2{pass}Z"),
-                    10,
-                    RESUME_WRITER,
-                ),
-            );
-            let mut page = c.raw(&scanner, prior.clone(), 100, false, &[]);
-            e2::take_diag();
-            crate::snapshots::claude_request_census::with_walk_deadline_for_test(|| {
-                page.enrich(&c);
-            });
-            let third = body(&page, THIRD).unwrap();
-            assert_eq!(
-                (third.request_count, third.removed_request_count),
-                (1 + pass, Some(3)),
-                "a timeout never restores a validated stored removal"
-            );
-            assert_eq!(
-                copy_diag(&[
-                    "copy_removal_reused",
-                    "copy_prefix_held_requests",
-                    "copy_prefix_hold_expired",
-                    "copy_prefix_unproven"
-                ]),
-                [3, 0, 0, 0]
-            );
-            prior = settle(&c, &prior, page, &mut progress);
-        }
-    });
-}
-
-#[test]
 fn e2_pipeline_zero_usage_prefix_responses_neither_lend_markers_nor_hold_own_turns() {
     for zero_before_proven in [false, true] {
         with_e2(|| {
@@ -4771,15 +4621,14 @@ fn e2_pipeline_rewritten_prefix_clears_retry_debt_but_preserves_recorded_removal
                 ),
                 "2026-08-02T07:06:00Z",
             );
-            let mut held = c.raw(&scanner, prior.clone(), 100, false, &[]);
-            crate::snapshots::claude_request_census::with_walk_deadline_for_test(|| {
-                held.enrich(&c);
-            });
+            let decided = ready(&c, &scanner, prior.clone(), 100, false);
             assert_eq!(
-                body(&held, THIRD).map(|b| (b.request_count, b.removed_request_count)),
-                Some((1, Some(3)))
+                body(&decided, THIRD).map(|b| (b.request_count, b.removed_request_count)),
+                Some((2, Some(3)))
             );
-            prior = settle(&c, &prior, held, &mut progress);
+            prior = settle(&c, &prior, decided, &mut progress);
+            // Ownership reconciliation can mark a decided copy for another read.
+            prior.claude_copy_removals.mark(key);
             assert!(prior.claude_copy_removals.pending(key));
             c.write_at(
                 &file(THIRD),
@@ -5507,11 +5356,10 @@ fn e2_pipeline_copy_derived_row_is_kept_while_own_evidence_is_unreadable() {
     }
 }
 
-/// A prefix hold over buckets #909 accepted defers the whole
-/// session (no shrunken revision, no ledger change) under the same
-/// three-pass bound; a never-accepted session keeps the prefix-only hold.
+/// Declared copied-prefix removals publish through the accepted bucket
+/// reconciliation without holding the whole session.
 #[test]
-fn e2_pipeline_prefix_hold_over_accepted_buckets_defers_the_whole_session() {
+fn e2_pipeline_declared_prefix_removal_over_accepted_buckets_publishes() {
     for accepted in [false, true] {
         with_e2(|| {
             let mut c = Corpus::new("e2-pipeline-accepted-prefix-hold");
@@ -5546,39 +5394,32 @@ fn e2_pipeline_prefix_hold_over_accepted_buckets_defers_the_whole_session() {
                     stored["usage_buckets"][0]["bucket_start"].as_str().unwrap()
                 ));
             }
-            let saved = serde_json::to_vec(&ledger).unwrap();
-            let keys = [
-                "copy_prefix_held_requests",
-                "copy_prefix_hold_expired",
-                "copy_prefix_accepted_session_holds",
-            ];
-            for pass in 1..=3 {
-                let mut page = c.raw(&scanner, prior.clone(), 100, false, &[]);
-                e2::take_diag();
-                crate::snapshots::claude_request_census::with_walk_deadline_for_test(|| {
-                    page.enrich_with(&c, Some(&mut ledger));
-                });
-                if pass == 3 {
-                    let copy = body(&page, COPY).expect("the bound expires flagged");
-                    assert_eq!(
-                        (copy.request_count, copy.removed_request_count),
-                        (3, Some(0))
-                    );
-                    assert_eq!(copy_diag(&keys), [0, 2, 0]);
-                } else if accepted {
-                    assert_withheld(&page, COPY, "accepted prefix hold");
-                    assert_eq!(copy_diag(&keys), [2, 0, 1]);
-                } else {
-                    let copy = body(&page, COPY).expect("never-accepted own turns publish");
-                    assert_eq!(
-                        (copy.request_count, copy.removed_request_count),
-                        (1, Some(0))
-                    );
-                    assert_eq!(copy_diag(&keys), [2, 0, 0]);
-                }
-                prior = settle(&c, &prior, page, &mut progress);
+            let mut expected = serde_json::to_value(&ledger).unwrap();
+            if accepted {
+                let sessions = expected.as_object_mut().unwrap();
+                assert_eq!(sessions.len(), 1, "one accepted copy session");
+                let session = sessions.values_mut().next().unwrap();
+                assert_eq!(session["shares"].as_array().unwrap().len(), 1);
+                // The declared replacement invalidates this old copy-derived
+                // share. Every other accepted-ledger field stays identical.
+                session["shares"] = json!([]);
             }
-            assert_eq!(serde_json::to_vec(&ledger).unwrap(), saved);
+            let mut page = c.raw(&scanner, prior.clone(), 100, false, &[]);
+            page.enrich_with(&c, Some(&mut ledger));
+            let copy = body(&page, COPY)
+                .expect("declared removals publish without an accepted-prefix hold");
+            assert_eq!(
+                (copy.request_count, copy.removed_request_count),
+                (1, Some(2))
+            );
+            assert_eq!(
+                copy.input_tokens + copy.removed_usage.as_ref().unwrap().input_tokens,
+                30
+            );
+            prior = settle(&c, &prior, page, &mut progress);
+            let quiet = ready(&c, &scanner, prior, 100, false);
+            assert!(body(&quiet, COPY).is_none());
+            assert_eq!(serde_json::to_value(&ledger).unwrap(), expected);
         });
     }
 }

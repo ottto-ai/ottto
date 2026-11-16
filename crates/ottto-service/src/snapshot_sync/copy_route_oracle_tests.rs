@@ -101,14 +101,14 @@ fn grown_copy(arm: Earlier) -> ((u64, u64), Vec<u64>) {
 /// its removed prefix as it grows, with no holder to prove it and without
 /// counting as a newly corrected family; the same copy proven by a saved
 /// removal is a corrected family; after the cutoff the request-id proof
-/// alone decides, so the unproven prefix counts, flagged.
+/// alone decides, including the holder's earlier accepted body after listing.
 #[test]
 fn accepted_pre_cutoff_copy_keeps_its_decision_through_growth() {
     with_e2(|| {
         for (arm, tuple, counters) in [
             (Earlier::Grandfathered, (2, 2), [0, 0]),
             (Earlier::Saved, (2, 2), [1, 0]),
-            (Earlier::AfterCutoff, (4, 0), [0, 2]),
+            (Earlier::AfterCutoff, (2, 2), [1, 0]),
         ] {
             let (got, diag) = grown_copy(arm);
             assert_eq!(got, tuple, "{arm:?}");

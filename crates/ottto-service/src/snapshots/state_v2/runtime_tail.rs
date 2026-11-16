@@ -21,10 +21,10 @@ pub(in crate::snapshots) fn carry_tail(
         index.generation,
         |state, session, id| {
             let previous = match state.save_digests.take() {
-                Some(previous) => previous,
-                None => {
+                Some(previous) if !previous.links_only => previous,
+                _ => {
                     let (committed, mut cx) = import::hydrate_context(&mut session.db)?;
-                    let previous = kinds::baseline(&committed, &mut cx)?;
+                    let previous = import::baseline(&mut session.db, &committed, &mut cx)?;
                     session.cx = cx;
                     previous
                 }
@@ -171,6 +171,14 @@ pub(in crate::snapshots) fn load_head(
     read_txn_at(index, |tx, stamp| {
         super::super::tail::load_head(tx, key.as_bytes(), revision, stamp.0)
     })
+}
+pub(in crate::snapshots) fn carried_sessions(index: &ScanIndex, keys: &[&str]) -> Option<Links> {
+    let path = runtime_path(index).ok()??;
+    with_state(&path, |s| {
+        let baseline = s.save_digests.as_ref();
+        Ok(baseline.map(|b| b.copy_ownership.sessions(index, keys)))
+    })
+    .ok()?
 }
 /// Files whose committed head a commit may have changed since `consumer`'s
 /// last call, for the Codex header inventory's durable facts. `None` (its
