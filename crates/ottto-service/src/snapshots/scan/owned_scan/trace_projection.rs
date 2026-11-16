@@ -1,4 +1,4 @@
-//! Test-only scan projections and clock/budget inputs for the pipeline oracle.
+//! Test-only scan projections and fixture inputs for the pipeline oracle.
 //! The pipeline installs fixture inputs before stepping; projections only read.
 //! Relative keys exclude fixture roots; clocks, tickets and epochs stay private.
 
@@ -30,6 +30,78 @@ fn pending(rows: &[PendingIndexFinalization], roots: &[PathBuf]) -> Value {
 }
 
 impl OwnedSourceScan {
+    /// Re-select the unstepped fixture page through the ordinary constructor.
+    /// Return its original candidates to the real walk before changing order
+    /// and allowance; keep acquisition, sidecars and settlement unchanged.
+    pub(crate) fn with_oracle_schedule(self, limit: usize, reverse: bool) -> (Self, Value) {
+        assert!(self.active_file.is_none() && self.snapshots.is_empty());
+        let Self {
+            source,
+            roots,
+            mut index,
+            collected_at,
+            backfill_window_days,
+            claude_effort_support_dir,
+            claude_request_identity_capture,
+            identified_candidates,
+            selected_flags,
+            sampling,
+            launch_events,
+            codex_versions,
+            line_delivery,
+            ..
+        } = self;
+        requeue_members(&mut index, &selected_flags, &identified_candidates);
+        let walk = index.traversal.as_mut().expect("prepared fixture walk");
+        assert!(
+            walk.pending_directories.is_empty(),
+            "fixture fits one directory tick"
+        );
+        let queue = walk.pending_candidates.make_contiguous();
+        queue.sort_by(|a, b| a.path.cmp(&b.path));
+        if reverse {
+            queue.reverse();
+        }
+        let order = queue
+            .iter()
+            .map(|p| relative(&p.path.to_string_lossy(), &roots))
+            .collect::<Vec<_>>();
+        let context = sampling.expect("synthetic sampled acquisition");
+        let mut next = Self::new_with_recovery_priority(
+            source,
+            &roots,
+            index,
+            &collected_at,
+            backfill_window_days,
+            limit,
+            claude_effort_support_dir.as_deref(),
+            &[],
+            false,
+            &mut ListingRequest::default(),
+            claude_request_identity_capture,
+            &[],
+            Some((context.cache.as_ref(), &context.namespace)),
+        )
+        .with_sampled_acquisition(context.cache, context.namespace);
+        next.launch_events = launch_events;
+        next.codex_versions = codex_versions;
+        next.line_delivery = line_delivery;
+        let selected = next
+            .identified_candidates
+            .iter()
+            .map(|p| relative(&p.path.to_string_lossy(), &roots))
+            .collect::<Vec<_>>();
+        let plan = json!({"limit":limit,"reverse":reverse,"discovery":order,"selected":selected});
+        (next, plan)
+    }
+
+    pub(crate) fn with_oracle_births<T>(
+        births: BTreeMap<String, u64>,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        claude_history_upgrade::with_staged_births_for_test(births, run)
+    }
+
     pub(crate) fn with_oracle_state_budget<T>(bytes: Option<usize>, read: impl FnOnce() -> T) -> T {
         match bytes {
             Some(bytes) => sampled_scan::codex_cursor::with_test_state_budget(bytes, read),
@@ -88,6 +160,7 @@ impl SourceScanResult {
             "census_complete": self.census_complete,
             "ownership_incomplete_file_count": self.ownership_incomplete_file_count,
             "residue_count": self.census_residue_index_key_count,
+            "continuation_pending": self.continuation_ticket.is_some(),
         })
     }
 }
@@ -142,6 +215,41 @@ fn trace_keys_choose_the_most_specific_root() {
 }
 
 impl ScanIndex {
+    pub(crate) fn oracle_schedule_debt(&self, roots: &[PathBuf]) -> Value {
+        let mut holds = BTreeMap::<String, Vec<&str>>::new();
+        for root in self.claude_usage_authority_quarantine.keys() {
+            holds
+                .entry(root.clone())
+                .or_default()
+                .push("usage_authority");
+        }
+        for key in self.claude_account_deferred_holds.keys() {
+            let (root, _) = claude_index_path_family_member(Path::new(key)).expect("Claude hold");
+            holds.entry(root).or_default().push("account_ownership");
+        }
+        if !self.decode_holds.is_empty() {
+            holds.insert("unknown_entity".into(), vec!["decode"]);
+        }
+        let owed = self
+            .files
+            .keys()
+            .filter(|key| self.file_upload_context_requires_adoption(key))
+            .map(|key| relative(key, roots))
+            .collect::<Vec<_>>();
+        let copy_wait = self
+            .claude_request_census
+            .records()
+            .filter(|(key, _)| {
+                self.claude_copy_removals
+                    .pending(claude_money_birth_store::location_key(key))
+            })
+            .map(|(key, _)| relative(key, roots))
+            .collect::<Vec<_>>();
+        json!({"holds":holds,"owed":owed,
+            "copy_wait":copy_wait,
+            "content_twins":self.claude_request_census.records().filter(|(_, r)| r.is_twin()).count()})
+    }
+
     /// Seed the same held-at-cap state used by quiet-retirement controls.
     /// These are index-only unavailable keys; no file is created or opened.
     pub(crate) fn oracle_hold_at_audit_cap(

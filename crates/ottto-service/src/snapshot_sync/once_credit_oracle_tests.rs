@@ -282,6 +282,8 @@ struct OracleHome {
     cycle_number: usize,
     current_codex_account: &'static str,
     restarted: bool,
+    schedule: Option<Schedule>,
+    births: BTreeMap<String, u64>,
     support: PathBuf,
     device: LocalDeviceBinding,
     client: SnapshotApiClient,
@@ -304,6 +306,23 @@ struct Cycle {
     progress: SnapshotUploadProgress,
     finish: Result<()>,
     effects: Vec<test_effects::Effect>,
+    schedule: Option<Value>,
+    evidence_chunks: usize,
+    debt: Value,
+}
+
+#[derive(Clone, Copy)]
+struct Schedule {
+    one_chunk: bool,
+    limit: usize,
+    reverse: bool,
+}
+
+struct EvidenceSchedule(bool);
+impl Drop for EvidenceSchedule {
+    fn drop(&mut self) {
+        ONE_EVIDENCE_CHUNK.with(|slot| slot.set(self.0));
+    }
 }
 
 impl OracleHome {
@@ -378,6 +397,8 @@ impl OracleHome {
             cycle_number: 0,
             current_codex_account: "a",
             restarted: false,
+            schedule: None,
+            births: BTreeMap::new(),
             support,
             device,
             client: SnapshotApiClient::new(server.url.clone()),
@@ -470,6 +491,11 @@ impl OracleHome {
         self.restart();
     }
     fn cycle(&mut self, server: &OracleServer, recording: &Recording) -> Cycle {
+        crate::snapshots::OwnedSourceScan::with_oracle_births(self.births.clone(), || {
+            self.cycle_inner(server, recording)
+        })
+    }
+    fn cycle_inner(&mut self, server: &OracleServer, recording: &Recording) -> Cycle {
         self.cadence.due();
         let now = self.now;
         let small_page = self.small_page;
@@ -504,6 +530,30 @@ impl OracleHome {
         let mut frame = prepared.unwrap().expect("due real preparation");
         frame.scan.as_mut().unwrap().set_oracle_collection_time(&at);
         frame.scan_started_at = at;
+        let schedule = self.schedule.map(|schedule| {
+            let (scan, plan) = with_scan_clock(now, || {
+                frame.scan.take().unwrap().with_oracle_schedule(
+                    schedule.limit,
+                    schedule.reverse,
+                    now,
+                )
+            });
+            frame.scan = Some(scan);
+            test_effects::record(
+                "schedule",
+                vec![
+                    ("one_chunk", Scalar::Bool(schedule.one_chunk)),
+                    (
+                        "plan",
+                        Scalar::Text(
+                            String::from_utf8(crate::canonical_json::canonicalize(&plan).unwrap())
+                                .unwrap(),
+                        ),
+                    ),
+                ],
+            );
+            plan
+        });
         let roots = self.source.default_roots(&self.fixture.home);
         let index_path = frame.index_path.clone();
         let progress_path = frame.upload_progress_path.clone();
@@ -515,6 +565,7 @@ impl OracleHome {
             .unwrap();
         let pre_index_bytes = serde_json::to_vec(&frame.committed_index).unwrap();
         let handle = recording.handle();
+        let worker_births = self.births.clone();
         let (preparation, index, scan, steps, mut io) = run_on_scan_worker_stack(move || {
             let _entered = handle.enter();
             let _cutover = legacy.then(|| crate::snapshots::TestCutover::set(i64::MAX));
@@ -558,6 +609,8 @@ impl OracleHome {
                     (preparation, index, scan, steps, io)
                 })
             };
+            let read =
+                || crate::snapshots::OwnedSourceScan::with_oracle_births(worker_births, read);
             if small_page {
                 crate::snapshots::with_test_limits_for_test(2048, 1024, 64, || {
                     crate::snapshots::OwnedSourceScan::with_oracle_state_budget(budget, read)
@@ -588,6 +641,10 @@ impl OracleHome {
         );
         let before = scan.snapshots.clone();
         let capture = FinalizedCapture::start();
+        let _evidence = self.schedule.map(|schedule| {
+            EvidenceSchedule(ONE_EVIDENCE_CHUNK.with(|slot| slot.replace(schedule.one_chunk)))
+        });
+        let chunks_before = evidence_chunks_for_test();
         let collection = self.collection();
         let finish = with_scan_clock(now, || {
             crate::agent_status_refresh::with_test_collection(collection, || {
@@ -609,6 +666,7 @@ impl OracleHome {
             })
         });
         let finalized = capture.take();
+        let evidence_chunks = evidence_chunks_for_test() - chunks_before;
         let (index, _, progress) = load_source_checkpoints(
             &index_path,
             &progress_path,
@@ -622,6 +680,22 @@ impl OracleHome {
             "reloaded",
             vec![("finish_ok", Scalar::Bool(finish.is_ok()))],
         );
+        let debt = if schedule.is_some() {
+            let debt = index.oracle_schedule_debt(&roots);
+            test_effects::record(
+                "page_debt",
+                vec![(
+                    "state",
+                    Scalar::Text(
+                        String::from_utf8(crate::canonical_json::canonicalize(&debt).unwrap())
+                            .unwrap(),
+                    ),
+                )],
+            );
+            debt
+        } else {
+            Value::Null
+        };
         let batches = server.batches.lock().unwrap()[start..].to_vec();
         let cycle = Cycle {
             pre_index_bytes,
@@ -636,16 +710,25 @@ impl OracleHome {
             progress,
             finish,
             effects: recording.take(),
+            schedule,
+            evidence_chunks,
+            debt,
         };
         let mut expected = Vec::new();
         if self.restarted {
             expected.push("restart");
+        }
+        if self.schedule.is_some() {
+            expected.push("schedule");
         }
         expected.extend(std::iter::repeat_n("step", cycle.steps.len()));
         expected.push("gate_c");
         expected.extend(std::iter::repeat_n("finalized", cycle.finalized.len()));
         expected.extend(std::iter::repeat_n("post", cycle.batches.len()));
         expected.push("reloaded");
+        if self.schedule.is_some() {
+            expected.push("page_debt");
+        }
         assert_eq!(
             cycle.effects.iter().map(|e| e.label).collect::<Vec<_>>(),
             expected,
@@ -1014,13 +1097,18 @@ fn emitted_route(
 }
 
 fn install_claude_control(home: &OracleHome) {
+    install_claude_control_for(home, IDENTITY_PIPELINE_ROOT, "");
+}
+
+fn install_claude_control_for(home: &OracleHome, session: &str, prefix: &str) {
     use crate::claude_local_otel::{
         ClaudeIdentityAttributeEvidence, ClaudeIdentityAttributeOrigin, ClaudeIdentityDisposition,
         ClaudeLocalOtelEvidence, ClaudeRequestIdentityEvidence, ClaudeTraceOwnershipEvidence,
     };
     let transcript = |id: &str, tokens: u64, at: &str| {
+        let id = format!("{prefix}{id}");
         json!({"type":"assistant",
-        "sessionId":IDENTITY_PIPELINE_ROOT,"version":"2.1.309","timestamp":at,"requestId":id,
+        "sessionId":session,"version":"2.1.309","timestamp":at,"requestId":id,
         "message":{"id":format!("msg-{id}"),"model":"claude-haiku-4-5",
         "usage":{"input_tokens":tokens,"output_tokens":tokens}}})
     };
@@ -1045,10 +1133,11 @@ fn install_claude_control(home: &OracleHome) {
     .into_iter()
     .enumerate()
     {
+        let request = format!("{prefix}{request}");
         let mut row = ClaudeLocalOtelEvidence {
             capture_revision: "claude_api_request:v2".into(),
-            session_id: IDENTITY_PIPELINE_ROOT.into(),
-            request_id: request.into(),
+            session_id: session.into(),
+            request_id: request.clone(),
             client_request_id: format!("client-{request}"),
             observed_at: at.into(),
             model: "claude-haiku-4-5".into(),
@@ -1077,8 +1166,8 @@ fn install_claude_control(home: &OracleHome) {
         rows.push(serde_json::to_value(row).unwrap());
         let mut trace = ClaudeTraceOwnershipEvidence {
             capture_revision: "claude_llm_request_ownership:v1".into(),
-            session_id: IDENTITY_PIPELINE_ROOT.into(),
-            request_id: request.into(),
+            session_id: session.into(),
+            request_id: request.clone(),
             client_request_id: format!("client-{request}"),
             agent_id: String::new(),
             observed_at: at.into(),
@@ -1098,10 +1187,7 @@ fn install_claude_control(home: &OracleHome) {
             .support
             .join("local-otel")
             .join(directory)
-            .join(format!(
-                "{:x}.jsonl",
-                Sha256::digest(IDENTITY_PIPELINE_ROOT.as_bytes())
-            ));
+            .join(format!("{:x}.jsonl", Sha256::digest(session.as_bytes())));
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
             path,
@@ -1674,30 +1760,327 @@ fn c11_account_hold_bypasses_the_full_audit_cap_without_staging_a_marker() {
     assert_eq!(held.before[0].input_tokens, 160);
 }
 
+// One immutable corpus per source. The Claude copy is a content twin:
+// its in-file id is ROOT, while its filename names a different session.
+// Pi has the same logical session observed at two physical locations.
+fn scheduling_corpus(home: &OracleHome) -> Vec<(PathBuf, String)> {
+    let root = home.source.default_roots(&home.fixture.home)[0].clone();
+    let sessions = [
+        IDENTITY_PIPELINE_ROOT,
+        "3338a80a-f36e-4cbc-a5bb-50fc66430ba5",
+        "4338a80a-f36e-4cbc-a5bb-50fc66430ba5",
+    ];
+    let mut paths = Vec::new();
+    for (n, session) in sessions.into_iter().enumerate() {
+        let rows = match home.source {
+            SnapshotSource::ClaudeCode => {
+                install_claude_control_for(home, session, &format!("family-{n}:"));
+                std::fs::read_to_string(home.transcript())
+                    .unwrap()
+                    .lines()
+                    .map(|line| {
+                        let mut row: Value = serde_json::from_str(line).unwrap();
+                        row["cwd"] = json!("/synthetic/workspace");
+                        row
+                    })
+                    .collect::<Vec<_>>()
+            }
+            SnapshotSource::Codex => {
+                let mut rows = Vec::new();
+                for k in 0..30 {
+                    let mut pair = codex_member(
+                        session,
+                        &format!("{session}-{k}"),
+                        10,
+                        10 * (k + 1),
+                        "2026-11-01T07:00:00Z",
+                    );
+                    if k > 0 {
+                        pair.remove(0);
+                    }
+                    rows.extend(pair);
+                }
+                rows
+            }
+            SnapshotSource::Pi => {
+                let mut rows = pi_rows(false);
+                rows[0]["id"] = json!(session);
+                rows
+            }
+        };
+        let path = root.join(format!("{n}-main/{session}.jsonl"));
+        write_jsonl(&path, &rows);
+        paths.push((path, session.into()));
+        if n == 0 && home.source != SnapshotSource::Codex {
+            let copy = root.join("z-copy/5338a80a-f36e-4cbc-a5bb-50fc66430ba5.jsonl");
+            write_jsonl(&copy, &rows);
+            paths.push((copy, session.into()));
+        }
+    }
+    if home.source == SnapshotSource::ClaudeCode {
+        std::fs::remove_file(home.transcript()).unwrap();
+    }
+    paths
+}
+
+/// [money] Page and evidence-chunk boundaries change scheduling only. Compare
+/// every full normalized wire row, not just additive token totals. No expected
+/// receipt is learned or blessed: the reference is another schedule of the
+/// identical input bytes in this same test invocation.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn scheduling_permutations_converge_to_the_same_bodies() {
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        let mut baseline = None;
+        let mut baseline_inputs = None;
+        let mut run = 0;
+        for one_chunk in [true, false] {
+            for limit in [64, 2] {
+                for reverse in [false, true] {
+                    let recording = Recording::start();
+                    let server = OracleServer::new(source, recording.handle());
+                    let mut home = OracleHome::new(source, &server);
+                    home.row = match source {
+                        SnapshotSource::ClaudeCode => "schedule_claude",
+                        SnapshotSource::Codex => "schedule_codex",
+                        SnapshotSource::Pi => "schedule_pi",
+                    };
+                    home.cycle_number = run * 128;
+                    home.legacy_counting = source == SnapshotSource::Codex;
+                    home.small_page = limit == 2 && source == SnapshotSource::Codex;
+                    home.schedule = Some(Schedule {
+                        one_chunk,
+                        limit,
+                        reverse,
+                    });
+                    let paths = scheduling_corpus(&home);
+                    if source == SnapshotSource::ClaudeCode {
+                        home.births = paths
+                            .iter()
+                            .map(|(path, _)| {
+                                let age = if path.to_string_lossy().contains("z-copy") {
+                                    10620
+                                } else {
+                                    14400
+                                };
+                                (
+                                    path.to_string_lossy().into_owned(),
+                                    (NOW - age) * 1_000_000_000,
+                                )
+                            })
+                            .collect();
+                    }
+                    let inputs = money_equivalence_tests::inputs(&home);
+                    if let Some(expected) = &baseline_inputs {
+                        assert_eq!(&inputs, expected);
+                    } else {
+                        baseline_inputs = Some(inputs);
+                    }
+                    let roots = source.default_roots(&home.fixture.home);
+                    let relative = |path: &Path| {
+                        format!(
+                            "root-0/{}",
+                            path.strip_prefix(&roots[0]).unwrap().to_string_lossy()
+                        )
+                    };
+                    let mut accepted = BTreeMap::<String, Value>::new();
+                    let mut previous = BTreeMap::<String, u64>::new();
+                    let mut previous_holds = BTreeMap::<String, Value>::new();
+                    let mut history = Vec::new();
+                    let mut first_page = BTreeMap::new();
+                    let mut multi_chunk = false;
+                    let mut cursor_spanned_pages = false;
+                    let mut finished = false;
+                    for page in 0..64 {
+                        let cycle = home.cycle(&server, &recording);
+                        assert!(cycle.finish.is_ok());
+                        let plan = cycle.schedule.as_ref().unwrap();
+                        let order = plan["discovery"].as_array().unwrap();
+                        assert!(
+                            order.windows(2).all(|pair| {
+                                if reverse {
+                                    pair[0].as_str() >= pair[1].as_str()
+                                } else {
+                                    pair[0].as_str() <= pair[1].as_str()
+                                }
+                            }),
+                            "the real re-selection queue uses the requested discovery order"
+                        );
+                        for path in plan["selected"].as_array().unwrap() {
+                            first_page
+                                .entry(path.as_str().unwrap().to_owned())
+                                .or_insert(page);
+                        }
+                        multi_chunk |= cycle.evidence_chunks > 1;
+                        cursor_spanned_pages |= cycle.gate["continuation_pending"] == true
+                            || (cycle.consumed > 0 && cycle.before.is_empty());
+                        if one_chunk {
+                            assert_eq!(
+                                cycle.evidence_chunks, 0,
+                                "reference chunks are excluded by the existing counter"
+                            );
+                        }
+                        for batches in money_equivalence_tests::normalized_posts(source, &cycle) {
+                            for batch in batches.as_array().unwrap() {
+                                for row in batch["snapshots"].as_array().unwrap() {
+                                    assert!(cycle.finalized.iter().any(|item|
+                                        row["snapshot_fingerprint"] == item.snapshot_fingerprint
+                                        && cycle.progress.contains_body(&item.snapshot_fingerprint,
+                                            &snapshot_upload_body_witness(item))),
+                                        "count only an actual offered body with reloaded exact ACK proof");
+                                    accepted.insert(
+                                        row["source_session_id"].as_str().unwrap().into(),
+                                        row.clone(),
+                                    );
+                                }
+                            }
+                        }
+                        let mut holds = cycle.debt["holds"]
+                            .as_object()
+                            .unwrap()
+                            .iter()
+                            .map(|(entity, reason)| (entity.clone(), reason.clone()))
+                            .collect::<BTreeMap<_, _>>();
+                        for key in cycle.debt["copy_wait"].as_array().unwrap() {
+                            let (_, entity) = paths
+                                .iter()
+                                .find(|(path, _)| relative(path) == key.as_str().unwrap())
+                                .unwrap();
+                            holds.insert(entity.clone(), json!(["copy_prefix_wait"]));
+                        }
+                        let counts = accepted
+                            .iter()
+                            .map(|(entity, row)| {
+                                (entity.clone(), row["request_count"].as_u64().unwrap())
+                            })
+                            .collect::<BTreeMap<_, _>>();
+                        for (entity, before) in &previous {
+                            let after = counts.get(entity).copied().unwrap_or(0);
+                            assert!(after >= *before || holds.contains_key(entity) || previous_holds.contains_key(entity),
+                                "unexplained accepted request dip for {entity}: {before} -> {after}");
+                        }
+                        history.push(json!({"page":page,"request_counts":counts,"holds":holds,
+                            "owed":cycle.debt["owed"],"evidence_chunks":cycle.evidence_chunks}));
+                        previous = counts;
+                        previous_holds = holds;
+                        let all_seen = paths.iter().all(|(path, _)| {
+                            cycle.index.files.keys().any(|key| Path::new(key) == path)
+                        });
+                        if cycle.gate["census_complete"] == true
+                            && all_seen
+                            && accepted.len() == 3
+                            && previous_holds.is_empty()
+                            && cycle.debt["owed"].as_array().unwrap().is_empty()
+                        {
+                            assert_eq!(cycle.gate["residue_count"], 0);
+                            assert_eq!(cycle.gate["ownership_incomplete_file_count"], 0);
+                            assert!(cycle.gate["pending_finalization"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .all(|p| p["parse_complete"] == true));
+                            if source == SnapshotSource::ClaudeCode {
+                                assert!(
+                                    cycle.debt["content_twins"].as_u64().unwrap() > 0,
+                                    "a native content-twin census witness"
+                                );
+                            }
+                            finished = true;
+                            break;
+                        }
+                    }
+                    assert!(
+                        finished,
+                        "all holds, copy waits and owed keys must be released within 64 pages"
+                    );
+                    assert_eq!(
+                        accepted.len(),
+                        3,
+                        "three logical sessions, including duplicate-location sessions only once"
+                    );
+                    assert!(accepted
+                        .values()
+                        .all(|row| row["input_tokens"].as_u64().unwrap() > 0
+                            && row["request_count"].as_u64().unwrap() > 0));
+                    if limit == 2 {
+                        assert!(
+                            history.len() > 1,
+                            "small allowance must cross a page boundary"
+                        );
+                        if source != SnapshotSource::Codex {
+                            assert_ne!(
+                                first_page[&relative(&paths[0].0)],
+                                first_page[&relative(&paths[1].0)],
+                                "main and content/session copy cross pages"
+                            );
+                        } else {
+                            assert!(
+                                cursor_spanned_pages,
+                                "a native session must pause across acquisition pages"
+                            );
+                        }
+                    }
+                    if source == SnapshotSource::ClaudeCode && !one_chunk {
+                        assert!(
+                            multi_chunk,
+                            "positive side-file bytes must actually force several evidence chunks"
+                        );
+                    }
+                    let canonical = crate::canonical_json::canonicalize(
+                        &serde_json::to_value(&accepted).unwrap(),
+                    )
+                    .unwrap();
+                    if let Some(expected) = &baseline {
+                        assert_eq!(&canonical, expected, "canonical full rows converge for {source:?}, chunks={one_chunk}, limit={limit}, reverse={reverse}");
+                    } else {
+                        baseline = Some(canonical);
+                    }
+                    if let Some(out) = std::env::var_os("OTTTO_MONEY_EQUIVALENCE_OUTPUT") {
+                        money_equivalence_tests::emit_trace(
+                            &out,
+                            &format!("{}-result-{run}", home.row),
+                            &json!({"rows":accepted,"pages":history,"one_chunk":one_chunk,"limit":limit,"reverse":reverse}),
+                        );
+                    }
+                    run += 1;
+                }
+            }
+        }
+        assert_eq!(run, 8, "the full 2 × 2 × 2 schedule product");
+    }
+}
+
 mod money_equivalence_tests {
     use super::*;
     use crate::snapshot_sync::tests::claude_money_e2_pipeline_tests::money_equivalence_tests::{
         receipt_with_output, ReceiptBody,
     };
 
-    pub(super) fn emit_cycle(row: &str, number: usize, source: SnapshotSource, cycle: &Cycle) {
-        let Some(out) = std::env::var_os("OTTTO_MONEY_EQUIVALENCE_OUTPUT") else {
-            return;
-        };
+    pub(super) fn normalized_posts(source: SnapshotSource, cycle: &Cycle) -> Vec<Value> {
         let mut normalized_posts = Vec::new();
         for batch in &cycle.batches {
             let wire: Value = serde_json::from_slice(batch).unwrap();
-            let sent = cycle
-                .finalized
+            let sent = wire["snapshots"]
+                .as_array()
+                .unwrap()
                 .iter()
-                .filter(|item| {
-                    wire["snapshots"]
-                        .as_array()
-                        .unwrap()
+                .map(|raw| {
+                    cycle
+                        .finalized
                         .iter()
-                        .any(|raw| raw["snapshot_fingerprint"] == item.snapshot_fingerprint)
+                        .find(|item| {
+                            raw["snapshot_fingerprint"] == item.snapshot_fingerprint
+                                && raw["source_file_fingerprint"]
+                                    == json!(item.source_file_fingerprint)
+                        })
+                        .expect("actual offered item, including coalesced twins")
+                        .clone()
                 })
-                .cloned()
                 .collect::<Vec<_>>();
             let route = transition::RouteResult::emitted(
                 transition::Mode::ColdFull,
@@ -1707,6 +2090,14 @@ mod money_equivalence_tests {
             );
             normalized_posts.push(route.normalized);
         }
+        normalized_posts
+    }
+
+    pub(super) fn emit_cycle(row: &str, number: usize, source: SnapshotSource, cycle: &Cycle) {
+        let Some(out) = std::env::var_os("OTTTO_MONEY_EQUIVALENCE_OUTPUT") else {
+            return;
+        };
+        let normalized_posts = normalized_posts(source, cycle);
         let finalized = cycle
             .finalized
             .iter()
@@ -1723,13 +2114,18 @@ mod money_equivalence_tests {
             "effects":effects,"saved":{"generation":cycle.index.generation,
                 "fingerprints":cycle.index.current_snapshot_fingerprints(),
                 "accepted_body_witnesses":cycle.progress.accepted_body_witnesses},
-            "finish_ok":cycle.finish.is_ok(),"parser_bytes":cycle.consumed});
-        let bytes = crate::canonical_json::canonicalize(&receipt).unwrap();
+            "finish_ok":cycle.finish.is_ok(),"parser_bytes":cycle.consumed,
+            "schedule":cycle.schedule,"evidence_chunks":cycle.evidence_chunks,"debt":cycle.debt});
+        emit_trace(&out, &format!("{row}-{number}"), &receipt);
+    }
+
+    pub(super) fn emit_trace(out: &std::ffi::OsStr, name: &str, receipt: &Value) {
+        let bytes = crate::canonical_json::canonicalize(receipt).unwrap();
         let digest = format!("{:x}", Sha256::digest(&bytes));
         let dir = PathBuf::from(out).join("step-trace");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(format!("{row}-{number}.json")), bytes).unwrap();
-        println!("STEP_TRACE {row}-{number} sha256={digest}");
+        std::fs::write(dir.join(format!("{name}.json")), bytes).unwrap();
+        println!("STEP_TRACE {name} sha256={digest}");
     }
 
     pub(super) fn bodies(source: SnapshotSource, cycle: &Cycle) -> Vec<ReceiptBody> {
@@ -1832,6 +2228,7 @@ mod money_equivalence_tests {
         c10_codex_singleton_park_keeps_the_previous_body();
         c11_fragment_and_obligation_charge_one_slot_and_existing_marker_charges_none();
         c11_account_hold_bypasses_the_full_audit_cap_without_staging_a_marker();
+        scheduling_permutations_converge_to_the_same_bodies();
     }
 
     #[test]
