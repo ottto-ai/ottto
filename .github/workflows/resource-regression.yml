@@ -27,9 +27,10 @@ jobs:
   resource-linux:
     name: Resource regression (advisory)
     runs-on: ubuntu-latest
-    # Full native 18k corpus work exceeds the initial 40m estimate. Advisory
-    # only; report duration drift, never increase a required job's timeout.
-    timeout-minutes: 75
+    # Full native 18k corpus work takes 47-63 minutes on a normal runner; one
+    # slow runner needed about 80. Advisory only; report duration drift,
+    # never increase a required job's timeout.
+    timeout-minutes: 100
     env:
       CARGO_BUILD_JOBS: '2'
     steps:
