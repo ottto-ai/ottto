@@ -339,7 +339,12 @@ contacted and upload no tools, and disabled servers are not started. An
 unchanged inventory is uploaded again at most weekly. Setting
 `OTTTO_MCP_HARVEST_DISABLED=1` or creating
 `~/Library/Application Support/Ottto/mcp_inventory/disabled` turns this off on
-the Mac; turning either setting off also stops it.
+the Mac; turning either setting off also stops it. Each time the Ottto server
+accepts an inventory upload, it sends the name, description and input schema of
+each Codex tool in it to OpenAI's input-token count API, only to count how many
+tokens those tool definitions add to every session. OpenAI's
+[API data guide](https://developers.openai.com/api/docs/guides/your-data) says
+data sent to its API is not used to train models unless you opt in.
 
 Codex daily usage totals: this reader is off until you turn on **Compare with
 OpenAI's reported usage** in Ottto's web Settings > Data & privacy and this Mac
