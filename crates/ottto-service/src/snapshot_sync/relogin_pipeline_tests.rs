@@ -330,18 +330,6 @@ fn owner_return_preserves_all_source_carry() {
             .unwrap(),
         );
         legacy.save(&cx_path).unwrap();
-        let progress_path = snapshot_upload_progress_path(&cx_path);
-        let codex_checkpoints = || {
-            load_source_checkpoints(
-                &cx_path,
-                &progress_path,
-                SnapshotSource::Codex,
-                &support,
-                &namespace_a,
-                snapshot_quarantine_witness(SnapshotSource::Codex),
-            )
-            .unwrap()
-        };
         crate::snapshots::older_build_logs_priority("return-turn");
         let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
         // A claim switch keeps the daemon alive. Keep its physical-header cache
@@ -473,14 +461,19 @@ fn owner_return_preserves_all_source_carry() {
         let entry = &saved.files[&codex.to_string_lossy().into_owned()];
         assert!(!entry.codex_counting_v2, "Legacy ACK keeps the UI counter");
         assert!(saved.historical_replay_generation_matches(&generation));
+        // The disposable progress ledger can clear after ACK handoff. Its
+        // destination/replay proof survives in the authoritative index.
         assert_eq!(
-            codex_checkpoints()
-                .2
-                .historical_replay_generation
-                .as_deref(),
+            serde_json::to_value(&saved.upload_context_proof).unwrap()["replay_generation"]
+                .as_str(),
             Some(generation.as_str()),
-            "the accepted baseline really completed the current replay"
+            "accepted-body proof belongs to the completed replay"
         );
+        assert!(!crate::backfill::pending_backfill_sources_for_destination(
+            &crate::backfill::load_backfill_state(&support),
+            &namespace_a,
+        )
+        .contains(&SnapshotSource::Codex));
         assert!(!serde_json::to_value(entry).unwrap()["codex_applied_tier_receipt"].is_null());
         let tier = serde_json::to_value(entry).unwrap()["codex_applied_tier_receipt"].clone();
         crate::snapshots::older_build_logs_expired();
