@@ -60,26 +60,6 @@ impl Homes {
             )
             .unwrap();
         }
-        let hash = |kind: &str, account: &str| {
-            let value = if kind == "account" {
-                "user"
-            } else {
-                "workspace"
-            };
-            ottto_core::billing_identity_hash(
-                "openai",
-                kind,
-                &format!("synthetic-{value}-{account}"),
-            )
-            .unwrap()
-        };
-        let slots = ["a", "b"].map(|account| {
-            (
-                hash("account", account),
-                hash("workspace", account),
-                crate::codex_scan_diagnostics::CREATOR_NAMED,
-            )
-        });
         Self {
             c,
             _removed_home: removed_home,
@@ -87,7 +67,7 @@ impl Homes {
             parked: removed_parent.join("parked-sessions"),
             flaky,
             absent: home.join("absent-home").join("archived_sessions"),
-            slots,
+            slots: named_creator_slots(),
         }
     }
     fn roots(&self, with_removed: bool) -> Vec<PathBuf> {
@@ -111,6 +91,26 @@ impl Homes {
             .map(|id| local_index_key(&self.path(id)))
             .collect()
     }
+    /// Whether every removed entry is still indexed.
+    fn removed_indexed(&self, index: &ScanIndex) -> bool {
+        self.removed_keys()
+            .iter()
+            .all(|key| index.files.contains_key(key))
+    }
+    /// Each removed session's proven owner, else its protected owner.
+    fn removed_owners(&self, index: &ScanIndex) -> BTreeMap<&'static str, String> {
+        [REMOVED_FRESH, REMOVED_OLD]
+            .into_iter()
+            .map(|id| {
+                let entry = &index.files[&local_index_key(&self.path(id))];
+                let owner = proven_owner(entry).map_or_else(
+                    || crate::snapshots::codex_protected_owner(id),
+                    str::to_owned,
+                );
+                (id, owner)
+            })
+            .collect()
+    }
     fn scan(
         &self,
         with_removed: bool,
@@ -132,17 +132,40 @@ impl Homes {
     fn step(
         &self,
         with_removed: bool,
-        mut index: ScanIndex,
+        index: ScanIndex,
         cache: Arc<sampled_scan::SharedCache>,
         limit: usize,
         at: &str,
     ) -> Step {
+        self.step_on(&self.roots(with_removed), index, cache, limit, at, false)
+    }
+    /// `step` over explicit roots. With `hold`, the header inventory of the
+    /// first step that prepares one is forced incomplete, as an unlisted
+    /// rollout leaves it, so the page is held.
+    fn step_on(
+        &self,
+        roots: &[PathBuf],
+        mut index: ScanIndex,
+        cache: Arc<sampled_scan::SharedCache>,
+        limit: usize,
+        at: &str,
+        hold: bool,
+    ) -> Step {
         e2_pipeline_scan_fixture::age_listing_for_test(&mut index);
         let before = index.clone();
+        let mut injected = !hold;
         let ((working, scan, delivered, _, logs), events) =
             crate::snapshots::disappearance_diagnostics::observe(|| {
-                self.scan(with_removed, index, cache, limit, at)
+                page_observed_at(roots, index, cache, limit, &self.slots, at, |scan| {
+                    if let Some(inventory) =
+                        scan.codex_join_inventory.as_mut().filter(|_| !injected)
+                    {
+                        inventory.complete = false;
+                        injected = true;
+                    }
+                })
             });
+        assert!(injected, "an inventory to hold");
         assert_eq!(full_decodes(&logs), 0);
         let (index, posts) = working.checkpoint_with_captured_posts(&scan, &before, "complete");
         let reads = delivered
@@ -173,49 +196,81 @@ impl Homes {
     }
 }
 
-fn assert_positive_control(accepted: &RouteResult, scan: &SourceScanResult) {
+/// No Codex counting tombstone is kept.
+fn no_tombstones(index: &ScanIndex) -> bool {
+    index.codex_counting_tombstones.values().next().is_none()
+}
+
+/// No legacy unresolved-root witness is persisted.
+fn no_witnesses(index: &ScanIndex) -> bool {
+    index.legacy_unresolved_root_file_witnesses.is_empty()
+}
+
+/// The generation's walk is kept and red.
+fn red(index: &ScanIndex) -> bool {
+    index
+        .traversal
+        .as_ref()
+        .is_some_and(|walk| walk.has_errors())
+}
+
+fn assert_positive_control(row: &str, accepted: &RouteResult, scan: &SourceScanResult) {
     assert_ne!(
         accepted.snapshots[MAIN]["session_account_evidence"],
         accepted.snapshots[OTHER]["session_account_evidence"],
-        "two accounts; MAIN switched mid-session"
+        "{row}: two accounts; MAIN switched mid-session"
     );
-    assert!(accepted.snapshots[OTHER]["session_account_evidence"].is_object());
+    assert!(
+        accepted.snapshots[OTHER]["session_account_evidence"].is_object(),
+        "{row}"
+    );
     assert!(
         accepted.snapshots[GAP]["session_account_evidence"].is_null(),
-        "evidence gap"
+        "{row}: evidence gap"
     );
-    assert!(accepted.snapshots.contains_key(SIDE), "side call");
+    assert!(accepted.snapshots.contains_key(SIDE), "{row}: side call");
     assert!(
         scan.snapshots
             .iter()
             .flat_map(|item| &item.model_usage)
-            .any(|row| row.account_identifier_hash.is_some()),
-        "tagged positive control"
+            .any(|usage| usage.account_identifier_hash.is_some()),
+        "{row}: tagged positive control"
     );
 }
 
 /// Generation 1: homes A and B read, uploaded, accepted and healthy. Returns
 /// the page, its accepted route and its post-ACK ledger route.
 fn accepted_generation(
+    row: &str,
     h: &Homes,
     prior: ScanIndex,
     cache: &Arc<sampled_scan::SharedCache>,
 ) -> (Step, RouteResult, RouteResult) {
     let first = h.step(true, prior, cache.clone(), 100, NOW);
-    assert!(first.scan.census_complete && first.index.traversal.is_none());
-    assert_eq!(first.unresolved, 0);
+    assert!(
+        first.scan.census_complete && first.index.traversal.is_none(),
+        "{row}"
+    );
+    assert_eq!(first.unresolved, 0, "{row}");
     let acked = crate::snapshot_sync::codex_transition_acked_route(
         &first.index,
         &first.scan,
         Mode::ColdFull,
     );
     let accepted = route(&first.index, &first.scan, first.posts.clone());
-    assert_positive_control(&accepted, &first.scan);
-    assert_eq!(accepted.accepted.len(), 6, "every entity accepted");
+    assert_positive_control(row, &accepted, &first.scan);
+    assert_eq!(accepted.accepted.len(), 6, "{row}: every entity accepted");
     for key in h.removed_keys() {
         let entry = &first.index.files[&key];
-        assert!(!entry.codex_history_is_protected(), "an ordinary entry");
-        assert_ne!(AckEvidence::of_view(Some(entry)), AckEvidence::None);
+        assert!(
+            !entry.codex_history_is_protected(),
+            "{row}: an ordinary entry"
+        );
+        assert_ne!(
+            AckEvidence::of_view(Some(entry)),
+            AckEvidence::None,
+            "{row}"
+        );
     }
     (first, accepted, acked)
 }
@@ -223,6 +278,7 @@ fn accepted_generation(
 /// The accepted bodies of `entities`, still carried: each accepted
 /// fingerprint is still in the local ledger.
 fn carried(
+    row: &str,
     index: &ScanIndex,
     accepted: &RouteResult,
     entities: &[&str],
@@ -235,7 +291,7 @@ fn carried(
                 .unwrap();
             assert!(
                 index.accepted_snapshot_fingerprints.contains(fingerprint),
-                "{entity} carried"
+                "{row}: {entity} carried"
             );
             ((*entity).to_owned(), accepted.accepted[*entity].clone())
         })
@@ -262,6 +318,7 @@ fn assert_carried(mut cold: RouteResult, actual: &RouteResult) {
 /// A separate restart over the kept roots reads and sends nothing. Returns
 /// the store it leaves.
 fn assert_quiet_restart(
+    row: &str,
     h: &Homes,
     prior: ScanIndex,
     accepted: &BTreeMap<String, Accepted>,
@@ -271,11 +328,11 @@ fn assert_quiet_restart(
             h.scan(false, prior, Arc::default(), 100, NOW);
         ((index, scan, delivery, logs), consumed)
     });
-    assert_eq!(full_decodes(&logs), 0);
-    assert!(delivery.0.lock().unwrap().is_empty());
+    assert_eq!(full_decodes(&logs), 0, "{row}");
+    assert!(delivery.0.lock().unwrap().is_empty(), "{row}");
     let previous = index.clone();
     let (index, posts) = index.checkpoint_with_captured_posts(&scan, &previous, "complete");
-    assert!(posts.is_empty(), "quiet restart emitted a POST");
+    assert!(posts.is_empty(), "{row}: quiet restart emitted a POST");
     let mut quiet = route(&index, &scan, posts);
     quiet.accepted = accepted.clone();
     quiet.mode = Mode::Restart;
@@ -312,27 +369,13 @@ struct Drained {
 /// Generations 1-3 of the removed-root row: accepted, then the account's home
 /// leaves the roster and is deleted while an unrelated known root is missing
 /// (a changed context, red for that root alone), then the matching retry.
-fn drain(arm: Arm) -> Drained {
+fn drain(row: &str, arm: Arm) -> Drained {
     let h = Homes::new();
-    let (session, prior) = StateV2ColdSession::publish(
-        Source::Codex,
-        &ScanIndex::default(),
-        &h.c.scratch.join("state"),
-    );
+    let (session, prior) = h.c.publish();
     let mut cache = Arc::new(sampled_scan::SharedCache::default());
-    let (first, gen1, gen1_acked) = accepted_generation(&h, prior, &cache);
+    let (first, gen1, gen1_acked) = accepted_generation(row, &h, prior, &cache);
     let removed_keys = h.removed_keys();
-    let owners = [REMOVED_FRESH, REMOVED_OLD]
-        .into_iter()
-        .map(|id| {
-            let entry = &first.index.files[&local_index_key(&h.path(id))];
-            let owner = proven_owner(entry).map_or_else(
-                || crate::snapshots::codex_protected_owner(id),
-                str::to_owned,
-            );
-            (id, owner)
-        })
-        .collect::<BTreeMap<_, _>>();
+    let owners = h.removed_owners(&first.index);
     let kept_owners = [MAIN, OTHER, SIDE, GAP]
         .map(|id| local_index_key(&h.c.path(id)))
         .into_iter()
@@ -350,17 +393,18 @@ fn drain(arm: Arm) -> Drained {
     fs::remove_dir_all(&h.removed).unwrap();
     fs::remove_dir(&h.flaky).unwrap();
     let second = h.step(false, first.index, cache.clone(), 100, NOW);
-    assert_eq!(second.unresolved, 1, "the unrelated missing root only");
-    assert!(second.posts.is_empty() && second.reads.is_empty());
+    assert_eq!(
+        second.unresolved, 1,
+        "{row}: the unrelated missing root only"
+    );
+    assert!(second.posts.is_empty() && second.reads.is_empty(), "{row}");
     let walk = second.index.traversal.as_ref().expect("red walk kept");
-    assert!(walk.pending_directories.is_empty() && walk.has_errors());
-    assert!(second
-        .index
-        .legacy_unresolved_root_file_witnesses
-        .is_empty());
-    assert!(removed_keys
-        .iter()
-        .all(|key| second.index.files.contains_key(key)));
+    assert!(
+        walk.pending_directories.is_empty() && walk.has_errors(),
+        "{row}"
+    );
+    assert!(no_witnesses(&second.index), "{row}");
+    assert!(h.removed_indexed(&second.index), "{row}");
 
     let mut index = second.index;
     fs::create_dir(&h.flaky).unwrap();
@@ -371,15 +415,17 @@ fn drain(arm: Arm) -> Drained {
         let mut committed = index.committable_subset(&index, &BTreeSet::new(), &BTreeMap::new());
         committed.save(session.path()).unwrap();
         index = ScanIndex::load(session.path()).unwrap();
-        assert_eq!(index.legacy_unresolved_root_file_witnesses, removed_keys);
-        assert!(index.traversal_namespace_loss(index.traversal.as_ref().unwrap()));
+        assert_eq!(
+            index.legacy_unresolved_root_file_witnesses, removed_keys,
+            "{row}"
+        );
+        assert!(
+            index.traversal_namespace_loss(index.traversal.as_ref().unwrap()),
+            "{row}"
+        );
         cache = Arc::default();
     }
-    index
-        .traversal
-        .as_mut()
-        .unwrap()
-        .unhealthy_retry_not_before_unix_seconds = Some(0);
+    retry_due(&mut index);
     // A removed key also carries a kept entity's fingerprint.
     let side_key = local_index_key(&h.c.path(SIDE));
     let shared = index.file_snapshot_fingerprints[&side_key]
@@ -417,11 +463,9 @@ fn drain(arm: Arm) -> Drained {
             .traversal
             .as_ref()
             .expect("stopped between the start and the reconciliation page");
-        assert!(!walk.reconciliation_started);
-        assert!(start.index.legacy_unresolved_root_file_witnesses.is_empty());
-        assert!(removed_keys
-            .iter()
-            .all(|key| start.index.files.contains_key(key)));
+        assert!(!walk.reconciliation_started, "{row}");
+        assert!(no_witnesses(&start.index), "{row}");
+        assert!(h.removed_indexed(&start.index), "{row}");
         let (mut index, resumed) = match mode {
             Mode::Restart => (ScanIndex::load(session.path()).unwrap(), Arc::default()),
             Mode::DiskRestore => (ScanIndex::load(session.path()).unwrap(), cache.clone()),
@@ -439,17 +483,21 @@ fn drain(arm: Arm) -> Drained {
         }
     }
 
-    assert_eq!(steps.iter().map(|step| step.unresolved).sum::<u64>(), 0);
+    assert_eq!(
+        steps.iter().map(|step| step.unresolved).sum::<u64>(),
+        0,
+        "{row}"
+    );
     let last = steps.last().unwrap();
     let index = &last.index;
     assert!(
         last.scan.census_complete && index.traversal.is_none(),
-        "healthy"
+        "{row}: healthy"
     );
-    assert!(index.legacy_unresolved_root_file_witnesses.is_empty());
+    assert!(no_witnesses(index), "{row}");
     for key in &removed_keys {
-        assert!(!index.files.contains_key(key), "retired");
-        assert!(index.file_snapshot_fingerprints.get(key).is_none());
+        assert!(!index.files.contains_key(key), "{row}: retired");
+        assert!(index.file_snapshot_fingerprints.get(key).is_none(), "{row}");
     }
     assert_eq!(
         index
@@ -458,20 +506,20 @@ fn drain(arm: Arm) -> Drained {
             .cloned()
             .collect::<BTreeSet<_>>(),
         owners.values().cloned().collect::<BTreeSet<_>>(),
-        "tombstones under the removed entries' proven owners only"
+        "{row}: tombstones under the removed entries' proven owners only"
     );
     assert!(
         index
             .codex_counting_tombstones
             .values()
             .all(|tombstone| tombstone.retired_in == NOW),
-        "same-generation tombstones kept"
+        "{row}: same-generation tombstones kept"
     );
     for (key, owner) in &kept_owners {
         assert_eq!(
             &proven_owner(&index.files[key]).map(str::to_owned),
             owner,
-            "moved-evidence folding and the sidecar census leave kept owners"
+            "{row}: moved-evidence folding and the sidecar census leave kept owners"
         );
     }
     // Local pruning only: the removed entries' own fingerprints leave the
@@ -481,18 +529,27 @@ fn drain(arm: Arm) -> Drained {
         .iter()
         .filter(|fingerprint| **fingerprint != shared)
         .collect::<Vec<_>>();
-    assert!(!removed_only.is_empty());
-    assert!(removed_only.iter().all(|fingerprint| !index
-        .accepted_snapshot_fingerprints
-        .contains(fingerprint.as_str())));
-    assert!(index.accepted_snapshot_fingerprints.contains(&shared));
+    assert!(!removed_only.is_empty(), "{row}");
+    assert!(
+        removed_only.iter().all(|fingerprint| !index
+            .accepted_snapshot_fingerprints
+            .contains(fingerprint.as_str())),
+        "{row}"
+    );
+    assert!(
+        index.accepted_snapshot_fingerprints.contains(&shared),
+        "{row}"
+    );
     for fingerprint in index
         .file_snapshot_fingerprints
         .values()
         .flatten()
         .chain(index.accepted_rebuild_incidence.values().flatten())
     {
-        assert!(index.accepted_snapshot_fingerprints.contains(fingerprint));
+        assert!(
+            index.accepted_snapshot_fingerprints.contains(fingerprint),
+            "{row}"
+        );
     }
     let emitted_ids = steps
         .iter()
@@ -505,7 +562,7 @@ fn drain(arm: Arm) -> Drained {
             .iter()
             .map(|id| id.to_string())
             .collect::<BTreeSet<_>>(),
-        "removed entities send nothing; unchanged kept entities no new body"
+        "{row}: removed entities send nothing; unchanged kept entities no new body"
     );
     let mut reads = steps
         .iter()
@@ -513,7 +570,7 @@ fn drain(arm: Arm) -> Drained {
         .collect::<Vec<_>>();
     reads.sort_by_key(|(_, start)| *start);
     tails.sort_by_key(|(_, start)| *start);
-    assert_eq!(reads, tails, "one Tail per grown file; no re-read");
+    assert_eq!(reads, tails, "{row}: one Tail per grown file; no re-read");
 
     let cold = h.cold(false, NOW);
     let mut accepted = gen1.accepted.clone();
@@ -539,7 +596,7 @@ fn drain(arm: Arm) -> Drained {
         let mut actual = route(&step.index, &step.scan, step.posts.clone());
         actual
             .accepted
-            .extend(carried(&step.index, &gen1, &[MAIN, OTHER, SIDE]));
+            .extend(carried(row, &step.index, &gen1, &[MAIN, OTHER, SIDE]));
         assert_carried(emitted(&step.index, &cold), &actual);
     }
     let index = steps.pop().unwrap().index;
@@ -556,96 +613,84 @@ fn drain(arm: Arm) -> Drained {
     }
 }
 
-/// [money] O1: a removed and deleted account home stops keeping generations
-/// red. Its persisted witnesses drain at the first matching retry, which
-/// counts no RootResolutionUnresolved, ends healthy and retires the removed
-/// entries through the ordinary guarded reconciliation: tombstones under
-/// their proven owners, local ledger pruning only, no body and no read. The
-/// kept home's money stays equal to a cold Full, and a genuinely truncated
-/// kept file never re-emits smaller money.
+/// [money] A removed and deleted account home stops keeping generations red,
+/// whatever happens between the matching retry's pages. Every row's witnesses
+/// drain at the first matching retry, which counts no
+/// RootResolutionUnresolved, ends healthy and retires the removed entries
+/// through the ordinary guarded reconciliation: tombstones under their proven
+/// owners, local ledger pruning only, no body and no read. Each page's money
+/// equals a cold Full, and a separate quiet restart then reads and sends
+/// nothing.
+/// - "O1 drain": one warm page. The kept home's money stays equal to a cold
+///   Full, and a genuinely truncated kept file never re-emits smaller money.
+/// - "O4 restart" / "O4 disk restore" / "O4 evicted cache": a restart, a
+///   durable restore or an evicted cache between the start page and its
+///   reconciliation page resumes without re-inference and retires exactly as
+///   one warm page does.
+/// - "O5 upgrade": the red store an earlier build left (persisted witnesses
+///   for every removed entry after a finished red matching retry), saved and
+///   loaded through the committable checkpoint, drains on the new build's
+///   first matching retry and retires across bounded reconciliation pages,
+///   each one restarted from the durable store, with no re-read.
 #[test]
-fn removed_account_root_drains_and_retires() {
+fn removed_account_root_drains_and_retires_on_every_resume_path() {
     let _lock = DECODER_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let d = drain(Arm::Drain);
-    let index = assert_quiet_restart(
-        &d.h,
-        ScanIndex::load(d.session.path()).unwrap(),
-        &d.accepted,
-    );
-
-    let other = d.h.c.path(OTHER);
-    let key = local_index_key(&other);
-    let before = index.clone();
-    // Genuinely behind: a smaller rewrite whose usage no longer parses. A
-    // well-formed shorter file is a legitimate correction, not a regression.
-    let unreadable = json!({"type":"event_msg", "timestamp":"2026-10-07T10:00:00Z",
-        "payload":{"type":"token_count", "info":{"total_token_usage":{"input_tokens":"invalid"}}}});
-    fs::write(
-        &other,
-        header(OTHER, Some("b")) + &unreadable.to_string() + "\n",
-    )
-    .unwrap();
-    assert!(
-        fs::metadata(&other).unwrap().len() < before.files[&key].size_bytes,
-        "behind its accepted witness"
-    );
-    let behind = d.h.step(false, index, d.cache.clone(), 100, LATER);
-    assert!(behind.scan.snapshots.is_empty(), "no smaller body");
-    assert_eq!(
-        behind.index.files[&key].last_upload_body_witness,
-        before.files[&key].last_upload_body_witness
-    );
-    let mut cold = d.h.cold(false, LATER);
-    cold.snapshots
-        .retain(|item| item.source_session_id == OTHER);
-    let mut held = emitted(&behind.index, &behind.scan);
-    held.accepted = d.accepted.clone();
-    money_oracle::assert_no_smaller_reemit(
-        OTHER,
-        &d.gen1,
-        &held,
-        &emitted(&behind.index, &cold),
-        true,
-    );
-}
-
-/// [money] O4: a restart, a durable restore or an evicted cache between the
-/// matching retry's start page and its reconciliation page resumes without
-/// re-inference and retires exactly as one warm page does; each page's money
-/// equals a cold Full. A separate quiet restart then reads and sends nothing.
-#[test]
-fn removed_account_root_recovers_between_pages() {
-    let _lock = DECODER_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    for mode in [Mode::Restart, Mode::DiskRestore, Mode::EvictRetry] {
-        let d = drain(Arm::Recover(mode));
-        assert_quiet_restart(
+    for (row, arm) in [
+        ("O1 drain", Arm::Drain),
+        ("O4 restart", Arm::Recover(Mode::Restart)),
+        ("O4 disk restore", Arm::Recover(Mode::DiskRestore)),
+        ("O4 evicted cache", Arm::Recover(Mode::EvictRetry)),
+        ("O5 upgrade", Arm::Upgrade),
+    ] {
+        let d = drain(row, arm);
+        let index = assert_quiet_restart(
+            row,
             &d.h,
             ScanIndex::load(d.session.path()).unwrap(),
             &d.accepted,
         );
+        if !matches!(arm, Arm::Drain) {
+            continue;
+        }
+        let other = d.h.c.path(OTHER);
+        let key = local_index_key(&other);
+        let before = index.clone();
+        // Genuinely behind: a smaller rewrite whose usage no longer parses. A
+        // well-formed shorter file is a legitimate correction, not a
+        // regression.
+        let unreadable = json!({"type":"event_msg", "timestamp":"2026-10-07T10:00:00Z",
+            "payload":{"type":"token_count", "info":{"total_token_usage":{"input_tokens":"invalid"}}}});
+        fs::write(
+            &other,
+            header(OTHER, Some("b")) + &unreadable.to_string() + "\n",
+        )
+        .unwrap();
+        assert!(
+            fs::metadata(&other).unwrap().len() < before.files[&key].size_bytes,
+            "{row}: behind its accepted witness"
+        );
+        let behind = d.h.step(false, index, d.cache.clone(), 100, LATER);
+        assert!(behind.scan.snapshots.is_empty(), "{row}: no smaller body");
+        assert_eq!(
+            behind.index.files[&key].last_upload_body_witness,
+            before.files[&key].last_upload_body_witness,
+            "{row}"
+        );
+        let mut cold = d.h.cold(false, LATER);
+        cold.snapshots
+            .retain(|item| item.source_session_id == OTHER);
+        let mut held = emitted(&behind.index, &behind.scan);
+        held.accepted = d.accepted.clone();
+        money_oracle::assert_no_smaller_reemit(
+            OTHER,
+            &d.gen1,
+            &held,
+            &emitted(&behind.index, &cold),
+            true,
+        );
     }
-}
-
-/// [money] O5: the red store an earlier build left (persisted witnesses for
-/// every removed entry after a finished red matching retry), saved and loaded
-/// through the committable checkpoint, drains on the new build's first
-/// matching retry and retires across bounded reconciliation pages, each one
-/// restarted from the durable store, with no re-read.
-#[test]
-fn upgraded_removed_root_witnesses_drain_and_retire() {
-    let _lock = DECODER_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let d = drain(Arm::Upgrade);
-    assert_quiet_restart(
-        &d.h,
-        ScanIndex::load(d.session.path()).unwrap(),
-        &d.accepted,
-    );
 }
 
 /// The restored file is a new object read in a later pass: its file
@@ -680,22 +725,20 @@ fn removed_account_readded_after_retirement_counts_once() {
     let _lock = DECODER_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    for collected in [false, true] {
-        let d = drain(Arm::Drain);
+    for (row, collected) in [
+        ("O6b tombstones kept", false),
+        ("O6b tombstones collected", true),
+    ] {
+        let d = drain(row, Arm::Drain);
         let mut index = d.index;
         let mut at = NOW;
         if collected {
             let later = d.h.step(false, index, d.cache.clone(), 100, LATER);
-            assert!(later.posts.is_empty() && later.reads.is_empty());
-            assert!(later.index.traversal.is_none());
+            assert!(later.posts.is_empty() && later.reads.is_empty(), "{row}");
+            assert!(later.index.traversal.is_none(), "{row}");
             assert!(
-                later
-                    .index
-                    .codex_counting_tombstones
-                    .values()
-                    .next()
-                    .is_none(),
-                "a later complete generation collects absent owners"
+                no_tombstones(&later.index),
+                "{row}: a later complete generation collects absent owners"
             );
             index = later.index;
             at = LATEST;
@@ -705,7 +748,8 @@ fn removed_account_readded_after_retirement_counts_once() {
                     .codex_counting_tombstones
                     .get(&d.owners[REMOVED_FRESH])
                     .map(|tombstone| tombstone.evidence),
-                Some(AckEvidence::LegacyAcked)
+                Some(AckEvidence::LegacyAcked),
+                "{row}"
             );
         }
         // Aged files are never first reads. A head that absence kept (its
@@ -730,7 +774,7 @@ fn removed_account_readded_after_retirement_counts_once() {
         assert_eq!(
             readded.reads,
             vec![(DeliveryMode::Full, 0); read.len()],
-            "only {read:?} read, once each (collected: {collected})"
+            "{row}: only {read:?} read, once each"
         );
         let emitted = readded
             .scan
@@ -740,13 +784,13 @@ fn removed_account_readded_after_retirement_counts_once() {
             .collect::<BTreeSet<_>>();
         assert!(
             emitted.contains(REMOVED_FRESH) && emitted.iter().all(|id| read.contains(id)),
-            "emitted {emitted:?}, read {read:?}"
+            "{row}: emitted {emitted:?}, read {read:?}"
         );
-        assert!(readded.index.traversal.is_none(), "healthy");
+        assert!(readded.index.traversal.is_none(), "{row}: healthy");
         if !collected {
             assert!(
                 !readded.index.files[&local_index_key(&d.h.path(REMOVED_FRESH))].codex_counting_v2,
-                "the surviving tombstone keeps Legacy counting"
+                "{row}: the surviving tombstone keeps Legacy counting"
             );
         }
         let replay = crate::snapshot_sync::codex_transition_acked_route(
@@ -758,8 +802,8 @@ fn removed_account_readded_after_retirement_counts_once() {
         original
             .snapshots
             .retain(|id, _| emitted.contains(id.as_str()));
-        assert!(original.accepted_identity_buckets.is_some());
-        assert!(replay.accepted_identity_buckets.is_some());
+        assert!(original.accepted_identity_buckets.is_some(), "{row}");
+        assert!(replay.accepted_identity_buckets.is_some(), "{row}");
         money_oracle::assert_placement_equivalent(
             &without_file_revision(original),
             &without_file_revision(replay.clone()),
@@ -769,7 +813,7 @@ fn removed_account_readded_after_retirement_counts_once() {
         assert_eq!(
             destination.len(),
             d.gen1.snapshots.len(),
-            "stable keys: one latest head per entity"
+            "{row}: stable keys: one latest head per entity"
         );
         for (id, field) in emitted
             .iter()
@@ -777,7 +821,7 @@ fn removed_account_readded_after_retirement_counts_once() {
         {
             assert_eq!(
                 destination[id][field], d.gen1.snapshots[id][field],
-                "{id} {field}: the original accepted total, never a sum"
+                "{row}: {id} {field}: the original accepted total, never a sum"
             );
         }
         let mut cold = historical.unwrap_or_else(|| d.h.cold(true, at));
@@ -799,271 +843,148 @@ fn removed_account_readded_after_retirement_counts_once() {
     }
 }
 
-/// [money] O6a: the home re-added (and its folder back) before any healthy
-/// generation reconciled: its unchanged files Skip, with no read and no
-/// body, and nothing retires.
+/// [money] Without proof of removal the generation stays red and nothing
+/// retires; once the roster is restored, the removed home's unchanged files
+/// Skip with no first read and no re-read, and money equals a cold Full.
+/// - "O2 configured missing": a configured root that is missing (unmounted)
+///   keeps today's red: one RootResolutionUnresolved, its keys never
+///   witnesses, its entities held with their accepted bodies.
+/// - "O3 present unconfigured": the roster drops a home whose folder is still
+///   present: no proof, so its entries stay witnesses and the retry stays red.
+/// - "O6a re-added before retirement": the home re-added (and its folder
+///   back) before any healthy generation reconciled: its unchanged files
+///   Skip, with no read and no body.
 #[test]
-fn removed_account_readded_before_retirement_skips() {
+fn unproven_root_removal_stays_red_and_restored_files_skip() {
+    const O2: &str = "O2 configured missing";
+    const O3: &str = "O3 present unconfigured";
+    const O6A: &str = "O6a re-added before retirement";
     let _lock = DECODER_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let h = Homes::new();
-    let (_session, prior) = StateV2ColdSession::publish(
-        Source::Codex,
-        &ScanIndex::default(),
-        &h.c.scratch.join("state"),
-    );
-    let cache = Arc::new(sampled_scan::SharedCache::default());
-    let (first, gen1, _) = accepted_generation(&h, prior, &cache);
-    let witnesses = |index: &ScanIndex| {
-        h.removed_keys()
-            .iter()
-            .map(|key| index.files[key].last_upload_body_witness.clone())
-            .collect::<Vec<_>>()
-    };
-    let accepted_witnesses = witnesses(&first.index);
-    fs::rename(&h.removed, &h.parked).unwrap();
-    fs::remove_dir(&h.flaky).unwrap();
-    let second = h.step(false, first.index, cache.clone(), 100, NOW);
-    assert_eq!(second.unresolved, 1);
-    assert!(second
-        .index
-        .traversal
-        .as_ref()
-        .is_some_and(|walk| walk.has_errors()));
-    fs::rename(&h.parked, &h.removed).unwrap();
-    fs::create_dir(&h.flaky).unwrap();
-    let tail = h.tail_of(&h.c.path(GAP));
-    let third = h.step(true, second.index, cache.clone(), 100, NOW);
-    assert_eq!(third.unresolved, 0);
-    assert_eq!(third.reads, vec![tail], "the removed home's files Skip");
-    assert!(third.scan.census_complete && third.index.traversal.is_none());
-    assert_eq!(witnesses(&third.index), accepted_witnesses);
-    assert!(third
-        .index
-        .codex_counting_tombstones
-        .values()
-        .next()
-        .is_none());
-    let mut actual = route(&third.index, &third.scan, third.posts.clone());
-    assert_eq!(
-        actual
-            .snapshots
-            .keys()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
-        vec![GAP]
-    );
-    actual.accepted.extend(carried(
-        &third.index,
-        &gen1,
-        &[MAIN, OTHER, SIDE, REMOVED_FRESH, REMOVED_OLD],
-    ));
-    assert_carried(emitted(&third.index, &h.cold(true, NOW)), &actual);
-}
-
-/// [money] O2: a configured root that is missing (unmounted) keeps today's
-/// red: one RootResolutionUnresolved, its keys never witnesses, its entities
-/// held with their accepted bodies, nothing retired. Back in place, its files
-/// Skip with no first read and no re-read.
-#[test]
-fn configured_missing_root_stays_red_and_held() {
-    let _lock = DECODER_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let h = Homes::new();
-    let (_session, prior) = StateV2ColdSession::publish(
-        Source::Codex,
-        &ScanIndex::default(),
-        &h.c.scratch.join("state"),
-    );
-    let cache = Arc::new(sampled_scan::SharedCache::default());
-    let (first, gen1, _) = accepted_generation(&h, prior, &cache);
-    fs::rename(&h.removed, &h.parked).unwrap();
-    let tail = h.tail_of(&h.c.path(GAP));
-    let second = h.step(true, first.index, cache.clone(), 100, NOW);
-    assert_eq!(second.unresolved, 1, "the configured missing root");
-    assert!(second
-        .index
-        .legacy_unresolved_root_file_witnesses
-        .is_empty());
-    assert!(second
-        .index
-        .traversal
-        .as_ref()
-        .is_some_and(|walk| walk.has_errors()));
-    assert!(h
-        .removed_keys()
-        .iter()
-        .all(|key| second.index.files.contains_key(key)));
-    assert!(second
-        .index
-        .codex_counting_tombstones
-        .values()
-        .next()
-        .is_none());
-    assert_eq!(second.reads, vec![tail]);
-    let mut cold = h.cold(true, NOW);
-    cold.snapshots.retain(|item| item.source_session_id == GAP);
-    let cold = emitted(&second.index, &cold);
-    let grown = route(&second.index, &second.scan, second.posts.clone());
-    let mut held = grown.clone();
-    held.accepted
-        .extend(carried(&second.index, &gen1, &[REMOVED_FRESH, REMOVED_OLD]));
-    for id in [REMOVED_FRESH, REMOVED_OLD] {
-        money_oracle::assert_held(id, &gen1, &held, &cold);
-    }
-
-    fs::rename(&h.parked, &h.removed).unwrap();
-    let mut index = second.index;
-    index
-        .traversal
-        .as_mut()
-        .unwrap()
-        .unhealthy_retry_not_before_unix_seconds = Some(0);
-    let tail = h.tail_of(&h.c.path(MAIN));
-    let third = h.step(true, index, cache.clone(), 100, NOW);
-    assert_eq!(third.unresolved, 0);
-    assert_eq!(third.reads, vec![tail], "Skip: no first read, no re-read");
-    assert!(third.scan.census_complete && third.index.traversal.is_none());
-    assert!(third
-        .index
-        .codex_counting_tombstones
-        .values()
-        .next()
-        .is_none());
-    let mut actual = route(&third.index, &third.scan, third.posts.clone());
-    actual
-        .accepted
-        .extend(carried(&third.index, &grown, &[GAP]));
-    actual.accepted.extend(carried(
-        &third.index,
-        &gen1,
-        &[OTHER, SIDE, REMOVED_FRESH, REMOVED_OLD],
-    ));
-    assert_carried(emitted(&third.index, &h.cold(true, NOW)), &actual);
-}
-
-/// [money] O3: the roster drops a home whose folder is still present: no
-/// proof, so its entries stay witnesses, the retry stays red and nothing
-/// retires. When the roster recovers, the files Skip with no re-read.
-#[test]
-fn present_unconfigured_root_keeps_witnesses() {
-    let _lock = DECODER_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let h = Homes::new();
-    let (_session, prior) = StateV2ColdSession::publish(
-        Source::Codex,
-        &ScanIndex::default(),
-        &h.c.scratch.join("state"),
-    );
-    let cache = Arc::new(sampled_scan::SharedCache::default());
-    let (first, gen1, _) = accepted_generation(&h, prior, &cache);
-    fs::remove_dir(&h.flaky).unwrap();
-    let second = h.step(false, first.index, cache.clone(), 100, NOW);
-    assert_eq!(second.unresolved, 1);
-    let mut index = second.index;
-    fs::create_dir(&h.flaky).unwrap();
-    index
-        .traversal
-        .as_mut()
-        .unwrap()
-        .unhealthy_retry_not_before_unix_seconds = Some(0);
-    let third = h.step(false, index, cache.clone(), 100, NOW);
-    assert_eq!(third.unresolved, 1, "a present home is no proof of removal");
-    assert_eq!(
-        third.index.legacy_unresolved_root_file_witnesses,
-        h.removed_keys()
-    );
-    assert!(third
-        .index
-        .traversal
-        .as_ref()
-        .is_some_and(|walk| walk.has_errors()));
-    assert!(h
-        .removed_keys()
-        .iter()
-        .all(|key| third.index.files.contains_key(key)));
-    assert!(third
-        .index
-        .codex_counting_tombstones
-        .values()
-        .next()
-        .is_none());
-    assert!(third.posts.is_empty() && third.reads.is_empty());
-
-    let tail = h.tail_of(&h.c.path(GAP));
-    let fourth = h.step(true, third.index, cache.clone(), 100, NOW);
-    assert_eq!(fourth.unresolved, 0);
-    assert_eq!(fourth.reads, vec![tail], "the restored roster's files Skip");
-    assert!(fourth.scan.census_complete && fourth.index.traversal.is_none());
-    assert!(fourth
-        .index
-        .legacy_unresolved_root_file_witnesses
-        .is_empty());
-    assert!(fourth
-        .index
-        .codex_counting_tombstones
-        .values()
-        .next()
-        .is_none());
-    let mut actual = route(&fourth.index, &fourth.scan, fourth.posts.clone());
-    actual.accepted.extend(carried(
-        &fourth.index,
-        &gen1,
-        &[MAIN, OTHER, SIDE, REMOVED_FRESH, REMOVED_OLD],
-    ));
-    assert_carried(emitted(&fourth.index, &h.cold(true, NOW)), &actual);
-}
-
-/// `Homes::step` over explicit roots. With `hold`, the header inventory of
-/// the first step that prepares one is forced incomplete, as an unlisted
-/// rollout leaves it, so the page is held.
-fn step_on(
-    h: &Homes,
-    roots: &[PathBuf],
-    mut index: ScanIndex,
-    cache: Arc<sampled_scan::SharedCache>,
-    hold: bool,
-) -> Step {
-    e2_pipeline_scan_fixture::age_listing_for_test(&mut index);
-    let before = index.clone();
-    let mut injected = !hold;
-    let ((working, scan, delivered, _, logs), events) =
-        crate::snapshots::disappearance_diagnostics::observe(|| {
-            page_observed_at(roots, index, cache, 100, &h.slots, NOW, |scan| {
-                if let Some(inventory) = scan.codex_join_inventory.as_mut().filter(|_| !injected) {
-                    inventory.complete = false;
-                    injected = true;
+    for row in [O2, O3, O6A] {
+        let h = Homes::new();
+        let (_session, prior) = h.c.publish();
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let (first, gen1, _) = accepted_generation(row, &h, prior, &cache);
+        let witnesses = |index: &ScanIndex| {
+            h.removed_keys()
+                .iter()
+                .map(|key| index.files[key].last_upload_body_witness.clone())
+                .collect::<Vec<_>>()
+        };
+        let accepted_witnesses = witnesses(&first.index);
+        // The red generations, ending with the roster restored. Returns the
+        // red store, the kept file the restored generation grows and, for O2,
+        // the route that accepted GAP's grown body.
+        let (index, grows, grown) = match row {
+            O2 => {
+                fs::rename(&h.removed, &h.parked).unwrap();
+                let tail = h.tail_of(&h.c.path(GAP));
+                let second = h.step(true, first.index, cache.clone(), 100, NOW);
+                assert_eq!(second.unresolved, 1, "{row}: the configured missing root");
+                assert!(no_witnesses(&second.index), "{row}");
+                assert!(red(&second.index), "{row}");
+                assert!(h.removed_indexed(&second.index), "{row}");
+                assert!(no_tombstones(&second.index), "{row}");
+                assert_eq!(second.reads, vec![tail], "{row}");
+                let mut cold = h.cold(true, NOW);
+                cold.snapshots.retain(|item| item.source_session_id == GAP);
+                let cold = emitted(&second.index, &cold);
+                let grown = route(&second.index, &second.scan, second.posts.clone());
+                let mut held = grown.clone();
+                held.accepted.extend(carried(
+                    row,
+                    &second.index,
+                    &gen1,
+                    &[REMOVED_FRESH, REMOVED_OLD],
+                ));
+                for id in [REMOVED_FRESH, REMOVED_OLD] {
+                    money_oracle::assert_held(id, &gen1, &held, &cold);
                 }
-            })
-        });
-    assert!(injected, "an inventory to hold");
-    assert_eq!(full_decodes(&logs), 0);
-    let (index, posts) = working.checkpoint_with_captured_posts(&scan, &before, "complete");
-    let reads = delivered
-        .0
-        .lock()
-        .unwrap()
-        .iter()
-        .copied()
-        .filter(|(mode, _)| *mode != DeliveryMode::Unchanged)
-        .collect::<Vec<_>>();
-    Step {
-        index,
-        scan,
-        posts,
-        reads,
-        unresolved: events[SnapshotSource::Codex.slot()][1],
+                fs::rename(&h.parked, &h.removed).unwrap();
+                let mut index = second.index;
+                retry_due(&mut index);
+                (index, MAIN, Some(grown))
+            }
+            O3 => {
+                fs::remove_dir(&h.flaky).unwrap();
+                let second = h.step(false, first.index, cache.clone(), 100, NOW);
+                assert_eq!(second.unresolved, 1, "{row}");
+                let mut index = second.index;
+                fs::create_dir(&h.flaky).unwrap();
+                retry_due(&mut index);
+                let third = h.step(false, index, cache.clone(), 100, NOW);
+                assert_eq!(
+                    third.unresolved, 1,
+                    "{row}: a present home is no proof of removal"
+                );
+                assert_eq!(
+                    third.index.legacy_unresolved_root_file_witnesses,
+                    h.removed_keys(),
+                    "{row}"
+                );
+                assert!(red(&third.index), "{row}");
+                assert!(h.removed_indexed(&third.index), "{row}");
+                assert!(no_tombstones(&third.index), "{row}");
+                assert!(third.posts.is_empty() && third.reads.is_empty(), "{row}");
+                (third.index, GAP, None)
+            }
+            O6A => {
+                fs::rename(&h.removed, &h.parked).unwrap();
+                fs::remove_dir(&h.flaky).unwrap();
+                let second = h.step(false, first.index, cache.clone(), 100, NOW);
+                assert_eq!(second.unresolved, 1, "{row}");
+                assert!(red(&second.index), "{row}");
+                fs::rename(&h.parked, &h.removed).unwrap();
+                fs::create_dir(&h.flaky).unwrap();
+                (second.index, GAP, None)
+            }
+            other => unreachable!("{other}"),
+        };
+        let tail = h.tail_of(&h.c.path(grows));
+        let back = h.step(true, index, cache.clone(), 100, NOW);
+        assert_eq!(back.unresolved, 0, "{row}");
+        assert_eq!(
+            back.reads,
+            vec![tail],
+            "{row}: the restored roster's files Skip: no first read, no re-read"
+        );
+        assert!(
+            back.scan.census_complete && back.index.traversal.is_none(),
+            "{row}"
+        );
+        if row == O3 {
+            assert!(no_witnesses(&back.index), "{row}");
+        }
+        if row == O6A {
+            assert_eq!(witnesses(&back.index), accepted_witnesses, "{row}");
+        }
+        assert!(no_tombstones(&back.index), "{row}");
+        let mut actual = route(&back.index, &back.scan, back.posts.clone());
+        if row == O6A {
+            assert_eq!(
+                actual
+                    .snapshots
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                vec![GAP],
+                "{row}"
+            );
+        }
+        let mut from_gen1 = vec![MAIN, OTHER, SIDE, REMOVED_FRESH, REMOVED_OLD];
+        if let Some(grown) = &grown {
+            actual
+                .accepted
+                .extend(carried(row, &back.index, grown, &[GAP]));
+            from_gen1.retain(|id| *id != grows);
+        }
+        actual
+            .accepted
+            .extend(carried(row, &back.index, &gen1, &from_gen1));
+        assert_carried(emitted(&back.index, &h.cold(true, NOW)), &actual);
     }
-}
-
-fn held_by_inventory(index: &ScanIndex) -> bool {
-    index
-        .traversal
-        .as_ref()
-        .is_some_and(|traversal| traversal.residue.codex_inventory_hold.is_some())
 }
 
 /// [money] C1: the removed root's witnesses drain at the matching start while
@@ -1079,6 +1000,7 @@ fn removed_root_drain_waits_for_the_inventory_hold() {
     let _lock = DECODER_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let held_by_inventory = |index: &ScanIndex| inventory_hold_of(index).is_some();
     for arm in ["removed", "symlinked", "configured-missing"] {
         let h = Homes::new();
         let link = h.c.sessions.parent().unwrap().join("linked-sessions");
@@ -1091,32 +1013,23 @@ fn removed_root_drain_waits_for_the_inventory_hold() {
         let without = h.roots(false);
         let mut with = without.clone();
         with.push(configured);
-        let (_session, prior) = StateV2ColdSession::publish(
-            Source::Codex,
-            &ScanIndex::default(),
-            &h.c.scratch.join("state"),
-        );
+        let (_session, prior) = h.c.publish();
         let cache = Arc::new(sampled_scan::SharedCache::default());
-        let first = step_on(&h, &with, prior, cache.clone(), false);
-        assert!(first.scan.census_complete && first.index.traversal.is_none());
+        let first = h.step_on(&with, prior, cache.clone(), 100, NOW, false);
+        assert!(
+            first.scan.census_complete && first.index.traversal.is_none(),
+            "{arm}"
+        );
         let gen1 = route(&first.index, &first.scan, first.posts.clone());
-        assert_positive_control(&gen1, &first.scan);
+        assert_positive_control(arm, &gen1, &first.scan);
         let removed_keys = h.removed_keys();
         assert!(
-            removed_keys
-                .iter()
-                .all(|key| first.index.files.contains_key(key)),
+            h.removed_indexed(&first.index),
             "{arm}: keys under the canonical root"
         );
-        let owners = [REMOVED_FRESH, REMOVED_OLD]
-            .into_iter()
-            .map(|id| {
-                let entry = &first.index.files[&local_index_key(&h.path(id))];
-                proven_owner(entry).map_or_else(
-                    || crate::snapshots::codex_protected_owner(id),
-                    str::to_owned,
-                )
-            })
+        let owners = h
+            .removed_owners(&first.index)
+            .into_values()
             .collect::<BTreeSet<_>>();
         let roots = if arm == "configured-missing" {
             fs::rename(&h.removed, &h.parked).unwrap();
@@ -1129,20 +1042,19 @@ fn removed_root_drain_waits_for_the_inventory_hold() {
             &without
         };
         fs::remove_dir(&h.flaky).unwrap();
-        let second = step_on(&h, roots, first.index, cache.clone(), false);
-        assert!(second
-            .index
-            .traversal
-            .as_ref()
-            .is_some_and(|walk| walk.has_retryable_problems()));
+        let second = h.step_on(roots, first.index, cache.clone(), 100, NOW, false);
+        assert!(
+            second
+                .index
+                .traversal
+                .as_ref()
+                .is_some_and(|walk| walk.has_retryable_problems()),
+            "{arm}"
+        );
 
         let mut index = second.index;
         fs::create_dir(&h.flaky).unwrap();
-        index
-            .traversal
-            .as_mut()
-            .unwrap()
-            .unhealthy_retry_not_before_unix_seconds = Some(0);
+        retry_due(&mut index);
         let gap = local_index_key(&h.c.path(GAP));
         let accepted_witness = index.files[&gap].last_upload_body_witness.clone();
         let tail = h.tail_of(&h.c.path(GAP));
@@ -1157,10 +1069,10 @@ fn removed_root_drain_waits_for_the_inventory_hold() {
         )
         .1;
         cold.snapshots.retain(|item| item.source_session_id == GAP);
-        let held = step_on(&h, roots, index, cache.clone(), true);
+        let held = h.step_on(roots, index, cache.clone(), 100, NOW, true);
         assert_eq!(held.unresolved, u64::from(arm != "removed"), "{arm}");
         if arm == "removed" {
-            assert!(held.index.legacy_unresolved_root_file_witnesses.is_empty());
+            assert!(no_witnesses(&held.index), "{arm}");
         }
         let walk = held.index.traversal.as_ref().expect("the held generation");
         assert!(held_by_inventory(&held.index), "{arm}: the page is held");
@@ -1169,19 +1081,15 @@ fn removed_root_drain_waits_for_the_inventory_hold() {
             "{arm}: red while the hold is owed"
         );
         assert!(!walk.reconciliation_started, "{arm}: no reconciliation");
-        assert!(held.scan.snapshots.is_empty() && held.posts.is_empty() && held.reads.is_empty());
-        assert!(removed_keys
-            .iter()
-            .all(|key| held.index.files.contains_key(key)));
-        assert!(held
-            .index
-            .codex_counting_tombstones
-            .values()
-            .next()
-            .is_none());
+        assert!(
+            held.scan.snapshots.is_empty() && held.posts.is_empty() && held.reads.is_empty(),
+            "{arm}"
+        );
+        assert!(h.removed_indexed(&held.index), "{arm}");
+        assert!(no_tombstones(&held.index), "{arm}");
         assert_eq!(
-            held.index.files[&gap].last_upload_body_witness,
-            accepted_witness
+            held.index.files[&gap].last_upload_body_witness, accepted_witness,
+            "{arm}"
         );
         let mut held_route = emitted(&held.index, &held.scan);
         held_route.accepted = gen1.accepted.clone();
@@ -1190,7 +1098,7 @@ fn removed_root_drain_waits_for_the_inventory_hold() {
         let mut index = held.index;
         let mut released = Vec::new();
         for _ in 0..8 {
-            let next = step_on(&h, roots, index, cache.clone(), false);
+            let next = h.step_on(roots, index, cache.clone(), 100, NOW, false);
             let done = next.index.traversal.as_ref().map_or(true, |walk| {
                 !held_by_inventory(&next.index) && walk.has_retryable_problems()
             });
@@ -1215,7 +1123,8 @@ fn removed_root_drain_waits_for_the_inventory_hold() {
                 .iter()
                 .flat_map(|step| step.reads.iter().copied())
                 .collect::<Vec<_>>(),
-            vec![tail]
+            vec![tail],
+            "{arm}"
         );
         for step in released
             .iter()
@@ -1227,18 +1136,26 @@ fn removed_root_drain_waits_for_the_inventory_hold() {
             );
         }
         if arm == "removed" {
-            assert_eq!(released.iter().map(|step| step.unresolved).sum::<u64>(), 0);
-            assert!(index.traversal.is_none(), "green after the release");
-            assert!(removed_keys
-                .iter()
-                .all(|key| !index.files.contains_key(key)));
+            assert_eq!(
+                released.iter().map(|step| step.unresolved).sum::<u64>(),
+                0,
+                "{arm}"
+            );
+            assert!(index.traversal.is_none(), "{arm}: green after the release");
+            assert!(
+                removed_keys
+                    .iter()
+                    .all(|key| !index.files.contains_key(key)),
+                "{arm}"
+            );
             assert_eq!(
                 index
                     .codex_counting_tombstones
                     .keys()
                     .cloned()
                     .collect::<BTreeSet<_>>(),
-                owners
+                owners,
+                "{arm}"
             );
         } else {
             let walk = index.traversal.as_ref().expect("still red");
@@ -1246,8 +1163,8 @@ fn removed_root_drain_waits_for_the_inventory_hold() {
                 walk.has_retryable_problems(),
                 "{arm}: red after the release"
             );
-            assert!(removed_keys.iter().all(|key| index.files.contains_key(key)));
-            assert!(index.codex_counting_tombstones.values().next().is_none());
+            assert!(h.removed_indexed(&index), "{arm}");
+            assert!(no_tombstones(&index), "{arm}");
         }
     }
 }

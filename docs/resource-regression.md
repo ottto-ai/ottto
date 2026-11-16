@@ -33,9 +33,14 @@ context debt. Metadata companions cover successful stderr login and the native
 B. Its header pins the current-main production revision, generator seed and exact corpus manifest, and
 explicitly lists Linux counters, source-specific counters, exclusions and the
 separate macOS RC metric set. Each observed scenario/source/phase/hour count must
-be at most `1.20 * B`, using exact integer comparison. Baseline increases require
-a reviewed PR. A missing defined-platform counter, phase or source fails; an
-observed zero remains zero. Source-specific sidecar fields apply to Codex only.
+be at most `1.20 * B`, using exact integer comparison. Sidecar reuse is judged
+by rate in the inverse direction, as the RC scorecard floors its reuse ratio: for
+each Codex loader kind, `reused / (reused + reloaded)` must stay at least the
+baseline rate `/ 1.20`, with both denominators positive. Fewer passes at the
+same rate therefore pass; `reloaded.*` keeps the `1.20 * B` ceiling.
+Baseline changes that loosen a bound require a reviewed PR. A missing
+defined-platform counter, phase or source fails; an observed zero of a capped
+counter remains zero. Source-specific sidecar fields apply to Codex only.
 Quiet sidecar reuse additionally requires >=95% with a positive denominator for
 each native loader kind.
 
@@ -79,7 +84,8 @@ explicitly, serially, without retries. The advisory build uses the ordinary
 service test profile with the workspace's existing optimized dependencies, debug assertions and overflow checks. Two
 Cargo jobs limit compile concurrency. That profile is pinned in B. It changes neither native
 Mac nor money builds. Command wall time is CI overhead evidence. Calibration exceeded the initial
-40-minute total estimate, so the single advisory job allows 75 minutes. This
+40-minute total estimate. The job takes 47-63 minutes on a normal runner and
+one slow runner needed about 80, so the single advisory job allows 100 minutes. This
 adds no resource-test execution or timeout change to required shards; it does
 consume a Linux slot for substantially longer than the original estimate.
 Keep the check advisory and review duration drift before promotion.

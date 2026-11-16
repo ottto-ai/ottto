@@ -200,7 +200,7 @@ accepting version 1 binaries; there is no version negotiation.
 
 | Stage | Local fields | Meaning |
 | --- | --- | --- |
-| `startup` | `counts.malloc_large_cache_set`, `counts.malloc_large_cache` | Once before serving: allocator setting presence and numeric value (null if absent or nonnumeric); `source` is `unknown` because this is process-wide. Confirms launch configuration, not allocator support. |
+| `startup` | `counts.malloc_large_cache_set`, `counts.malloc_large_cache`, `counts.malloc_space_efficient_set`, `counts.malloc_space_efficient` | Once before serving: each allocator setting's presence and numeric value (null if absent or nonnumeric); `source` is `unknown` because this is process-wide. Confirms launch configuration, not allocator support. |
 | `shutdown` | none (`counts` is `{}`) | Once when the process receives SIGTERM, after startup diagnostics. Unix only. Records that the stop signal arrived; it does not detect hangs or say who sent it. The process still dies by SIGTERM. A missing row proves nothing: SIGKILL, a crash, a signal before startup or a failed write leave none. |
 | `claude_request_identity_over_cap` | `counts.claude_request_identity_over_cap`: `evidence_entries`, `authority_keys`, `parts_per_row`, `parts_per_item`, `rows`, `bytes`, `near_cap`, `identity_over_cap_held`; `counts.claude_request_identity_last_over_cap_item_bytes` | Cumulative, saturating process counters per cap reason, plus the attempted tagged item's last budgeted compact wire byte size, including semantic framing. One attempt can increment several reasons; retries count separately. `near_cap` counts tagged bodies above half the negotiated increased Claude cap, including bodies that fit; it is a warning, never a refusal. Missing/invalid receiver hints preserve the existing six-label output. `identity_over_cap_held` alarms from the first increased-cap body still over a cap after display shedding; its prior ACK remains and usage stays owed until a higher receiver cap or settled-history segments permit sending. Both additive labels are omitted while zero. The last size also includes these warning attempts. Recorded before budget recovery or full-strip fallback. Labels are append-only. No row content or identity is logged or uploaded. |
 
@@ -367,6 +367,48 @@ transport activity; they do not prove successful delivery or ACK settlement.
 Encoding settings, packing and delivery semantics are unchanged. Upload timing
 covers serialization, compression, request/response handling and existing local
 receipt processing, including failures.
+The row also carries macOS `counts.malloc_in_use_bytes_start` at call entry and
+`observation.malloc_in_use_bytes` at call exit, using the same allocator-zone
+`size_in_use` counter as the pass summary; both are absent when unavailable.
+Its footprint window uses the same shared sampler and fields as native pages,
+including `observation.stage_peak_footprint_bytes`. This adds one bounded
+counter allocation per call, as for a page, and endpoint reads; periodic reads
+share the existing 50 ms sampler thread. No separate thread or sample history
+is created for a call. Concurrent work contributes to these process-wide values.
+
+`native_collection_page.observation.malloc_in_use_bytes` samples that same
+counter at page completion and retains the sample for the pass. Immediately
+before `committed_index = index.clone()`, a second checkpoint starts a window
+that ends at the first `snapshot_batch_call` entry. One `index_clone_to_upload`
+point row reports that entry's `observation.malloc_in_use_bytes` and signed
+`observation.malloc_in_use_bytes_delta` (entry minus pre-clone sample). It
+includes the clone, subsequent index mutations, collection and request
+preparation up to that call; a pass without a batch call emits no such row.
+The first call consumes this baseline; later batches retain their own endpoints.
+
+A `state_save_start` point row samples `observation.malloc_in_use_bytes`
+immediately before the finished pass's index save (after withdrawing the cached
+manifest), including a save that later fails. Its signed
+`observation.malloc_in_use_bytes_delta` is save entry minus the last native
+page-end sample of the pass. Both point rows have an empty `counts` object,
+zero elapsed time and no CPU or footprint window.
+
+These deltas measure net process malloc allocation (allocated minus freed),
+including concurrent work and diagnostics. Negative values report net frees;
+they are not clamped. They do not measure allocation traffic, reachable layout,
+exclusive clone cost or ownership. Shared graph storage may appear in more
+than one reachable-layout bound without another allocation. A delta is absent
+if either endpoint is unavailable or its difference cannot fit in signed 64-bit
+bytes; malloc fields are absent outside macOS. Missing pass/page baselines also
+omit the corresponding delta.
+
+The clone checkpoint, page end and save entry each add one allocator-zone
+statistics call on macOS; the clone-to-upload endpoint reuses the batch's start
+sample. Baselines are inline scalars in the existing three source slots, reset
+at prepare; a short existing diagnostic mutex acquisition stores or reads them
+at each boundary and consumes the clone baseline at batch entry. Neither delta
+needs a heap allocation beyond formatting its point row. No measurement changes
+state, upload bodies or settlement.
 
 `shared_process_cpu_delta_us` samples self-process CPU across the observation
 window, including concurrent stages; it excludes child processes. It must not

@@ -1994,6 +1994,132 @@ fn resident_wake_advances_ordinary_cycle_without_a_cursor_timer() {
     }
 }
 
+/// [behaviour] An upload shed delays only an existing paced request. Planner
+/// peeks preserve both deadlines; at the wake the ordinary source gate admits it.
+#[test]
+#[serial_test::serial(source_cadences, source_upload_deadlines)]
+fn paced_shed_wake_obeys_both_deadlines_and_source_errors_do_not_spin() {
+    use super::super::{
+        defer_source_uploads, paced_scan_due, source_cadence_wait, source_upload_deadlines,
+    };
+    struct ShedLoop {
+        seconds: u64,
+        waits: Vec<Duration>,
+    }
+    impl LoopHost for ShedLoop {
+        fn now(&mut self) -> Instant {
+            crate::scan_clock::with_clock(self.seconds, crate::scan_clock::now)
+        }
+        fn wait(&mut self, wait: Duration) -> bool {
+            self.waits.push(wait);
+            self.seconds += wait.as_secs();
+            false
+        }
+        fn pending(&mut self) -> Option<(Instant, Duration)> {
+            None
+        }
+        fn paced_due(&mut self) -> Option<Instant> {
+            crate::scan_clock::with_clock(self.seconds, paced_scan_due)
+        }
+        fn page(&mut self, _: Instant) -> Outcome {
+            panic!("an ordinary paced wake must not run a cursor page")
+        }
+    }
+    let _saved = OwnedCadences::install();
+    for source in ROTATION {
+        for (gap, backoff) in [(0, 60), (30, 60), (60, 60), (180, 60), (30, 180)] {
+            super::super::clear_cadence_state_for_test();
+            super::super::clear_source_upload_deadlines_for_test();
+            let mut host = ShedLoop {
+                seconds: 1000,
+                waits: Vec::new(),
+            };
+            let start = host.now();
+            with_source_cadence(source, |cadence| {
+                cadence.record_scan_success(start, 1);
+                assert!(cadence.request_paced_scan(
+                    start,
+                    Duration::ZERO,
+                    crate::adaptive_collector::ContinuationPacing {
+                        min_gap: Duration::from_secs(gap),
+                        idle_per_work: 0,
+                    },
+                    PacedReason::default(),
+                ));
+            });
+            crate::scan_clock::with_clock(1000, || {
+                defer_source_uploads(source, Duration::from_secs(backoff));
+                let due = start + Duration::from_secs(gap.max(backoff));
+                assert_eq!(paced_scan_due(), Some(due));
+                assert_eq!(paced_scan_due(), Some(due), "a peek consumes nothing");
+                assert_eq!(source_upload_deadlines().lock().unwrap().len(), 1);
+                assert!(
+                    source_paced_due(source).is_none(),
+                    "QoS still obeys backoff"
+                );
+            });
+            wait_for_ordinary_cycle(&mut host, SNAPSHOT_SYNC_INTERVAL);
+            assert_eq!(host.waits, [Duration::from_secs(gap.max(backoff))]);
+            crate::scan_clock::with_clock(host.seconds, || {
+                assert!(super::super::source_upload_backoff_remaining(source).is_none());
+                assert_eq!(source_cadence_wait(source), None);
+                // Prepare, scan or finish can fail after the shed deadline.
+                // This is the same boundary used by the rotation's outcome.
+                after_ordinary_source_failure(source);
+                assert_eq!(paced_scan_due(), None);
+            });
+            wait_for_ordinary_cycle(&mut host, SNAPSHOT_SYNC_INTERVAL);
+            assert_eq!(host.waits[1], SNAPSHOT_SYNC_INTERVAL, "no Wake(0) on error");
+        }
+    }
+    super::super::clear_cadence_state_for_test();
+    super::super::clear_source_upload_deadlines_for_test();
+    crate::scan_clock::with_clock(1000, || {
+        let start = crate::scan_clock::now();
+        defer_source_uploads(SnapshotSource::Codex, Duration::from_secs(60));
+        assert_eq!(
+            paced_scan_due(),
+            None,
+            "no request is manufactured by a shed"
+        );
+        let mut host = ShedLoop {
+            seconds: 1000,
+            waits: Vec::new(),
+        };
+        wait_for_ordinary_cycle(&mut host, SNAPSHOT_SYNC_INTERVAL);
+        assert_eq!(host.waits, [SNAPSHOT_SYNC_INTERVAL]);
+        for (source, gap, backoff) in [
+            (SnapshotSource::Codex, 30, 120),
+            (SnapshotSource::ClaudeCode, 180, 60),
+            (SnapshotSource::Pi, 30, 60),
+        ] {
+            with_source_cadence(source, |cadence| {
+                cadence.record_scan_success(start, 1);
+                cadence.request_paced_scan(
+                    start,
+                    Duration::ZERO,
+                    crate::adaptive_collector::ContinuationPacing {
+                        min_gap: Duration::from_secs(gap),
+                        idle_per_work: 0,
+                    },
+                    PacedReason::default(),
+                );
+            });
+            defer_source_uploads(source, Duration::from_secs(backoff));
+        }
+        assert_eq!(paced_scan_due(), Some(start + Duration::from_secs(60)));
+        // A Codex hint shed during prepare is still an error: its paced
+        // request clears even while the newly supplied deadline stands.
+        after_ordinary_source_failure(SnapshotSource::Codex);
+        assert!(OwnedCadences::due(SnapshotSource::Codex).is_none());
+        assert!(source_upload_deadlines()
+            .lock()
+            .unwrap()
+            .contains_key("codex"));
+        assert!(OwnedCadences::due(SnapshotSource::ClaudeCode).is_some());
+    });
+}
+
 const UTILITY: (u32, i32) = (0x11, 0);
 const BACKGROUND: (u32, i32) = (0x09, 0);
 thread_local! {

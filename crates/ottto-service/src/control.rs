@@ -1608,6 +1608,7 @@ fn handle_command(
                 &home.join("Library/Application Support/Ottto"),
             )
             .or_state_poisoned()?;
+            crate::claude_local_otel::disable_appends_for_uninstall().or_state_poisoned()?;
             let mut result = execute_local_uninstall(&home, UninstallExecutionOptions::DAEMON);
             sweep_telemetry_keys_for_uninstall(&mut result);
             match &authorization {
@@ -3971,6 +3972,9 @@ fn telemetry_control_with_detector(
         &action,
         &source,
     )?;
+    let _binding_lock = lock_setup_run_binding();
+    require_identity_mutation_reservation(None)?;
+    require_local_control_account(&claims, &FileAccountStore::default(), "telemetry control")?;
     if let (Some(expected), Some(observed)) = (
         claims.organization_id.as_deref(),
         organization_id
@@ -4545,6 +4549,37 @@ struct CodexControlTokenAuthority {
     local_organization_id: String,
 }
 
+fn require_local_control_account(
+    claims: &BackendControlTokenClaims,
+    accounts: &FileAccountStore,
+    binding_label: &str,
+) -> Result<(String, String), LocalApiError> {
+    let account = accounts.load().map_err(|_| {
+        LocalApiError::LocalOperationFailed(format!(
+            "{binding_label} account binding is unavailable"
+        ))
+    })?;
+    let local_user_id = account
+        .user
+        .as_ref()
+        .map(|user| user.id.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(LocalApiError::LocalClientNotTrusted)?;
+    let local_organization_id = account
+        .organization
+        .as_ref()
+        .map(|organization| organization.id.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(LocalApiError::LocalClientNotTrusted)?;
+    if account.state != LocalAccountState::Connected
+        || claims.user_id.as_deref() != Some(local_user_id)
+        || claims.organization_id.as_deref() != Some(local_organization_id)
+    {
+        return Err(LocalApiError::LocalClientNotTrusted);
+    }
+    Ok((local_user_id.to_string(), local_organization_id.to_string()))
+}
+
 /// Prelude of the provider-daily-reference bridge. Check order is part of the
 /// contract. `binding_label` names the bridge in the binding-load errors.
 fn authorize_codex_control_token(
@@ -4572,11 +4607,8 @@ fn authorize_codex_control_token(
         require_identity_mutation_reservation(None)?;
     }
 
-    let account = accounts.load().map_err(|_| {
-        LocalApiError::LocalOperationFailed(format!(
-            "{binding_label} account binding is unavailable"
-        ))
-    })?;
+    let (local_user_id, local_organization_id) =
+        require_local_control_account(&claims, accounts, binding_label)?;
     let device = devices
         .load()
         .map_err(|_| {
@@ -4585,22 +4617,7 @@ fn authorize_codex_control_token(
             ))
         })?
         .ok_or(LocalApiError::LocalClientNotTrusted)?;
-    let local_user_id = account
-        .user
-        .as_ref()
-        .map(|user| user.id.as_str())
-        .filter(|value| !value.trim().is_empty())
-        .ok_or(LocalApiError::LocalClientNotTrusted)?;
-    let local_organization_id = account
-        .organization
-        .as_ref()
-        .map(|organization| organization.id.as_str())
-        .filter(|value| !value.trim().is_empty())
-        .ok_or(LocalApiError::LocalClientNotTrusted)?;
-    if account.state != LocalAccountState::Connected
-        || claims.user_id.as_deref() != Some(local_user_id)
-        || claims.organization_id.as_deref() != Some(local_organization_id)
-        || claims.device_id.as_deref() != Some(device.device_id.as_str())
+    if claims.device_id.as_deref() != Some(device.device_id.as_str())
         || !device.sources.iter().any(|source| source == "codex")
     {
         return Err(LocalApiError::LocalClientNotTrusted);
@@ -4613,8 +4630,8 @@ fn authorize_codex_control_token(
         identity_lifecycle_lock,
         expires_at_unix,
         token_id: token_id.to_string(),
-        local_user_id: local_user_id.to_string(),
-        local_organization_id: local_organization_id.to_string(),
+        local_user_id,
+        local_organization_id,
         device,
     })
 }
@@ -4883,11 +4900,11 @@ fn provider_daily_reference_control_with_stores(
         // local stop already happened and already blocks collection.
         backend_revoke_target = grants.grant_revoke_target().ok();
     }
-    drop(identity_lifecycle_lock);
-
+    #[cfg(test)]
+    tests::before_daily_reference_status();
     let installation_id = devices.load().ok().flatten().map(|device| device.device_id);
 
-    Ok(ProviderDailyReferenceControlResult {
+    let response = ProviderDailyReferenceControlResult {
         action,
         // Built from the stores this call was handed, not from process-wide
         // state, so the reported status belongs to this installation and the
@@ -4901,7 +4918,9 @@ fn provider_daily_reference_control_with_stores(
 
         backend_create_request,
         backend_revoke_target,
-    })
+    };
+    drop(identity_lifecycle_lock);
+    Ok(response)
 }
 
 fn decode_control_token_payload(token: &str) -> Result<serde_json::Value, LocalApiError> {
@@ -5366,6 +5385,7 @@ fn complete_pending_auth_claim(
         Err(error) => {
             log_auth_complete_backend_failure(&error);
             if let Some(reattach) = reattach_required_state(&error) {
+                let _binding_lock = lock_setup_run_binding();
                 daemon.mark_reattach_required(reattach.message.clone(), reattach.can_reconnect)?;
                 let account = daemon.account_for_trusted_client()?;
                 FileAccountStore::default()
@@ -8993,6 +9013,7 @@ fn setup_run(
     setup_run_id: Option<String>,
     api_base_url: Option<String>,
 ) -> Result<serde_json::Value, LocalApiError> {
+    require_authorized_local_client(daemon, authorization)?;
     let _attempt = SETUP_SCAN.lock().unwrap_or_else(|p| p.into_inner());
     let status = status_for(daemon, authorization)?;
     crate::snapshot_sync::reset_relay_authorization_backoff();
@@ -15204,6 +15225,7 @@ fn verify_source(
     source: SourceKind,
     repair: bool,
 ) -> Result<SourceVerificationResult, LocalApiError> {
+    require_authorized_local_client(daemon, authorization)?;
     let mut result = verify_source_unchecked(daemon, authorization, source, repair)?;
     attach_verification_check(&mut result);
     Ok(result)
@@ -17223,7 +17245,7 @@ fn source_display_name(source: &SourceKind) -> &'static str {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #[test]
     fn session_exec_commands_require_cli_kind_and_authorized_token() {
         let daemon = daemon();
@@ -18909,6 +18931,70 @@ for line in sys.stdin:
                 unsafe { std::env::remove_var(self.key) };
             }
         }
+    }
+
+    pub(crate) struct ControlFilesFixture {
+        root: PathBuf,
+        _guards: [EnvVarGuard; 3],
+    }
+
+    impl ControlFilesFixture {
+        pub(crate) fn new() -> Self {
+            let root = control_test_root("local-control-files");
+            fs::create_dir_all(root.join(".codex")).unwrap();
+            fs::write(
+                root.join(".codex/config.toml"),
+                render_codex_relay_toml_block_for_base("http://127.0.0.1:43119"),
+            )
+            .unwrap();
+            let keys = root.join("keys");
+            TelemetryKeyStore::file_only(&keys)
+                .save(&SourceKind::Codex, "key_local", "synthetic-key")
+                .unwrap();
+            let guards = [
+                EnvVarGuard::set_path("HOME", &root),
+                EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root.join("support")),
+                EnvVarGuard::set_path(TELEMETRY_KEY_FILE_STORE_ENV, &keys),
+            ];
+            Self {
+                root,
+                _guards: guards,
+            }
+        }
+
+        pub(crate) fn assert_unchanged<T>(&self, run: impl FnOnce() -> T) -> T {
+            fn files(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+                let mut result = std::collections::BTreeMap::new();
+                for entry in fs::read_dir(root).unwrap() {
+                    let path = entry.unwrap().path();
+                    if path.is_dir() {
+                        result.extend(files(&path));
+                    } else {
+                        result.insert(path.clone(), fs::read(path).unwrap());
+                    }
+                }
+                result
+            }
+            let before = files(&self.root);
+            let result = run();
+            assert_eq!(files(&self.root), before, "local files changed");
+            result
+        }
+    }
+
+    impl Drop for ControlFilesFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn bind_telemetry_control_account() -> ControlFilesFixture {
+        let files = ControlFilesFixture::new();
+        let mut account = connected_account();
+        account.user.as_mut().unwrap().id = "user_123".into();
+        account.organization.as_mut().unwrap().id = "org_123".into();
+        FileAccountStore::default().save(&account).unwrap();
+        files
     }
 
     fn telemetry_key_store_root(name: &str) -> PathBuf {
@@ -22012,6 +22098,7 @@ for line in sys.stdin:
     #[serial]
     fn setup_on_connected_daemon_is_noop_until_ottto_ends_the_run() {
         let _lock = lock_backend_test_env();
+        assert_setup_denies_unauthorized_callers_before_scan_lock();
         let (api_base_url, server) = scripted_json_backend(vec![
             (401, r#"{"detail":"Setup run not found for this device"}"#),
             (401, r#"{"detail":"Setup run expired"}"#),
@@ -25342,6 +25429,7 @@ for line in sys.stdin:
     #[serial]
     fn telemetry_control_accepts_fresh_enable_request_without_leaking_key() {
         let _guard = lock_backend_test_env();
+        let _binding = bind_telemetry_control_account();
         let store_root = telemetry_key_store_root("enable");
         let _env_guard = EnvVarGuard::set_path(TELEMETRY_KEY_FILE_STORE_ENV, &store_root);
         let install_root = telemetry_key_store_root("enable-install");
@@ -25422,7 +25510,8 @@ for line in sys.stdin:
     #[serial]
     fn claim_completion_reservation_blocks_identity_writers_until_install() {
         let _guard = lock_backend_test_env();
-        let root = telemetry_key_store_root("claim-reservation-clean-race");
+        let files = ControlFilesFixture::new();
+        let root = files.root.clone();
         let secret_root = telemetry_key_store_root("claim-reservation-clean-race-secret");
         fs::create_dir_all(&secret_root).unwrap();
         let _support_guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
@@ -25478,6 +25567,30 @@ for line in sys.stdin:
             FileDeviceStore::default().load().unwrap(),
             Some(old_device.clone())
         );
+        {
+            let base = control_token_validation_server_with_claims(
+                200,
+                json!({"user_id":"user_test", "organization_id":"org_test"}).to_string(),
+            );
+            let _api = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &base);
+            let result = files.assert_unchanged(|| {
+                telemetry_control(
+                    daemon.as_ref(),
+                    TelemetryControlAction::DisableTelemetry,
+                    SourceKind::Codex,
+                    test_control_token("disable_telemetry", "codex", 300),
+                    None,
+                    Some("key_local".into()),
+                    None,
+                    None,
+                    None,
+                )
+            });
+            assert!(matches!(
+                result,
+                Err(LocalApiError::IdentityMutationInProgress)
+            ));
+        }
 
         allow_response.send(()).unwrap();
         let completed = worker
@@ -25537,6 +25650,115 @@ for line in sys.stdin:
             grant_version,
             server_policy_state: ottto_protocol::ProviderDailyReferenceServerPolicyState::Approved,
         }
+    }
+
+    thread_local! {
+        static DAILY_REFERENCE_STATUS_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn before_daily_reference_status() {
+        let hook = DAILY_REFERENCE_STATUS_HOOK.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    fn assert_daily_reference_status_keeps_binding(
+        accounts: &FileAccountStore,
+        devices: &FileDeviceStore,
+        grants: &crate::provider_daily_reference::GrantStore,
+        token_uses: &crate::cloud_sessions::CloudSessionControlTokenUseStore,
+        device_id: &str,
+    ) {
+        struct ResetStatusHook;
+        impl Drop for ResetStatusHook {
+            fn drop(&mut self) {
+                DAILY_REFERENCE_STATUS_HOOK.with(|slot| {
+                    let _ = slot.borrow_mut().take();
+                });
+            }
+        }
+        let _hook_reset = ResetStatusHook;
+        let expected = crate::provider_daily_reference::status_with_live_binding(
+            grants,
+            crate::provider_daily_reference::collector_status(grants, false),
+            Some(device_id),
+        );
+        assert_eq!(
+            expected.runtime_state,
+            crate::provider_daily_reference::RuntimeState::Enabled
+        );
+        let writer = Arc::new(Mutex::new(None));
+        let blocked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer_slot = Arc::clone(&writer);
+        let observed_block = Arc::clone(&blocked);
+        let switched_accounts = accounts.clone();
+        let switched_devices = devices.clone();
+        let switched_grants = grants.clone();
+        DAILY_REFERENCE_STATUS_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let (send, receive) = mpsc::channel();
+                let worker = thread::spawn(move || {
+                    let immediate = try_lock_setup_run_binding();
+                    send.send(immediate.is_none()).unwrap();
+                    let _binding_lock = immediate.unwrap_or_else(lock_setup_run_binding);
+                    let mut account = connected_account();
+                    account.user.as_mut().unwrap().id = "user_next".into();
+                    account.organization.as_mut().unwrap().id = "org_next".into();
+                    switched_accounts.save(&account).unwrap();
+                    switched_devices
+                        .save(&LocalDeviceBinding {
+                            device_id: "device_next".into(),
+                            machine_id: None,
+                            sources: vec!["codex".into()],
+                        })
+                        .unwrap();
+                    switched_grants
+                        .revoke(time::OffsetDateTime::now_utc())
+                        .unwrap();
+                });
+                let waited = receive
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("binding writer reached status boundary");
+                observed_block.store(waited, Ordering::SeqCst);
+                if waited {
+                    *writer_slot.lock().unwrap() = Some(worker);
+                } else {
+                    worker.join().unwrap();
+                }
+            }));
+        });
+        let action = ProviderDailyReferenceControlAction::Status;
+        let slug = provider_daily_reference_action_slug(&action);
+        let base = cloud_control_validation_server(slug, "pdr-status-binding", device_id);
+        let _api = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &base);
+        let response = provider_daily_reference_control_with_stores(
+            action,
+            SecretString::new(test_control_token(slug, "codex", 240)),
+            None,
+            None,
+            None,
+            accounts,
+            devices,
+            grants,
+            token_uses,
+            &|_| panic!("status must not read a login"),
+            false,
+        );
+        if let Some(worker) = writer.lock().unwrap().take() {
+            worker.join().unwrap();
+        }
+        assert!(
+            blocked.load(Ordering::SeqCst),
+            "status released the binding before its reads"
+        );
+        assert_eq!(response.unwrap().status, expected);
+        assert_eq!(accounts.load().unwrap().user.unwrap().id, "user_next");
+        assert_eq!(devices.load().unwrap().unwrap().device_id, "device_next");
+        assert_eq!(
+            crate::provider_daily_reference::collector_status(grants, false).runtime_state,
+            crate::provider_daily_reference::RuntimeState::Revoked
+        );
     }
 
     #[test]
@@ -25851,6 +26073,30 @@ for line in sys.stdin:
             assert!(!persisted.contains(raw_id));
         }
         assert!(!persisted.contains("header."));
+        run(
+            ProviderDailyReferenceControlAction::Prepare,
+            "pdr-status-prepare",
+            None,
+            false,
+        )
+        .unwrap();
+        let local = grants.load().unwrap().unwrap();
+        run(
+            ProviderDailyReferenceControlAction::Bind,
+            "pdr-status-bind",
+            Some(provider_daily_reference_backend_grant(
+                &local, device_id, "enabled", 3,
+            )),
+            false,
+        )
+        .unwrap();
+        assert_daily_reference_status_keeps_binding(
+            &accounts,
+            &devices,
+            &grants,
+            &token_uses,
+            device_id,
+        );
     }
 
     #[test]
@@ -26031,6 +26277,8 @@ for line in sys.stdin:
     #[serial]
     fn telemetry_control_disable_removes_stored_key() {
         let _guard = lock_backend_test_env();
+        assert_telemetry_control_requires_local_binding();
+        let _binding = bind_telemetry_control_account();
         let store_root = telemetry_key_store_root("disable");
         let _env_guard = EnvVarGuard::set_path(TELEMETRY_KEY_FILE_STORE_ENV, &store_root);
         let install_root = telemetry_key_store_root("disable-install");
@@ -26092,10 +26340,116 @@ for line in sys.stdin:
         assert!(!codex_config_has_relay_otel(&config));
     }
 
+    fn assert_telemetry_control_requires_local_binding() {
+        for (user, organization, bound, matches_binding) in [
+            (Some("user_123"), Some("org_other"), true, false),
+            (Some("user_other"), Some("org_123"), true, false),
+            (Some("user_123"), Some("org_123"), false, false),
+            (None, Some("org_123"), true, false),
+            (Some("user_123"), None, true, false),
+            (Some(""), Some("org_123"), true, false),
+            (Some(" \t"), Some("org_123"), true, false),
+            (Some("user_123"), Some(""), true, false),
+            (Some("user_123"), Some(" \t"), true, false),
+            (Some("user_123"), Some("org_123"), true, true),
+        ] {
+            for (source, action) in [
+                (SourceKind::Codex, TelemetryControlAction::DisableTelemetry),
+                (SourceKind::Codex, TelemetryControlAction::Status),
+                (
+                    SourceKind::ClaudeCode,
+                    TelemetryControlAction::EnableTelemetry,
+                ),
+                (
+                    SourceKind::ClaudeCode,
+                    TelemetryControlAction::DisableTelemetry,
+                ),
+                (SourceKind::ClaudeCode, TelemetryControlAction::Status),
+            ] {
+                for reserved in [false, true] {
+                    let files = ControlFilesFixture::new();
+                    TelemetryKeyStore::production()
+                        .save(&SourceKind::ClaudeCode, "key_local", "synthetic-key")
+                        .unwrap();
+                    let mut account = connected_account();
+                    account.user.as_mut().unwrap().id = "user_123".into();
+                    account.organization.as_mut().unwrap().id = "org_123".into();
+                    if bound {
+                        FileAccountStore::default().save(&account).unwrap();
+                    }
+                    let _reservation = reserved.then(|| reserve_identity_mutation().unwrap());
+                    let allowed = matches_binding && !reserved;
+                    let enable = action == TelemetryControlAction::EnableTelemetry;
+                    let base = if allowed && enable {
+                        control_token_validation_server_with_marker(200)
+                    } else {
+                        control_token_validation_server_with_claims(
+                            200,
+                            json!({"user_id":user,"organization_id":organization}).to_string(),
+                        )
+                    };
+                    let _api = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &base);
+                    let detections = std::cell::Cell::new(0);
+                    let detector = |source: &SourceKind| {
+                        assert!(allowed, "refused control reached installation detection");
+                        detections.set(detections.get() + 1);
+                        AgentInstallationDetection {
+                            source: source.clone(),
+                            installed: true,
+                            version: None,
+                            config_path: None,
+                            binary_path: None,
+                            install_docs_url: None,
+                        }
+                    };
+                    let run = || {
+                        telemetry_control_with_detector(
+                            &daemon(),
+                            action.clone(),
+                            source.clone(),
+                            test_control_token(action_slug(&action), source_slug(&source), 300),
+                            None,
+                            Some("key_local".into()),
+                            enable.then(|| "org_123".into()),
+                            enable.then(|| base.clone()),
+                            enable.then(|| SecretString::new("synthetic-key")),
+                            &detector,
+                        )
+                    };
+                    if allowed {
+                        run().expect("matching unreserved local binding");
+                        assert_eq!(
+                            detections.get(),
+                            usize::from(action != TelemetryControlAction::DisableTelemetry)
+                        );
+                        if action == TelemetryControlAction::DisableTelemetry {
+                            assert!(matches!(
+                                TelemetryKeyStore::production().load(&source, "key_local"),
+                                Err(TelemetryKeychainError::Missing)
+                            ));
+                        }
+                    } else {
+                        let result = files.assert_unchanged(run);
+                        assert_eq!(detections.get(), 0);
+                        if reserved {
+                            assert!(matches!(
+                                result,
+                                Err(LocalApiError::IdentityMutationInProgress)
+                            ));
+                        } else {
+                            assert!(matches!(result, Err(LocalApiError::LocalClientNotTrusted)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     #[serial]
     fn telemetry_control_disable_preserves_key_when_fence_needs_review() {
         let _guard = lock_backend_test_env();
+        let _binding = bind_telemetry_control_account();
         let store_root = telemetry_key_store_root("disable-manual-fence");
         let _env_guard = EnvVarGuard::set_path(TELEMETRY_KEY_FILE_STORE_ENV, &store_root);
         let install_root = telemetry_key_store_root("disable-manual-fence-install");
@@ -28982,6 +29336,86 @@ X-API-Key = "otel_redacted"
         let _ = fs::remove_dir_all(&root);
     }
 
+    fn assert_setup_denies_unauthorized_callers_before_scan_lock() {
+        let files = ControlFilesFixture::new();
+        let daemon = daemon();
+        for (authorization, expected) in [
+            (
+                RequestAuthorization::Untrusted,
+                CliErrorCode::LocalClientNotTrusted,
+            ),
+            (
+                RequestAuthorization::Token("wrong-token".into()),
+                CliErrorCode::LocalAuthFailed,
+            ),
+        ] {
+            thread::scope(|scope| {
+                let held = SETUP_SCAN.lock().unwrap();
+                let (send, receive) = std::sync::mpsc::channel();
+                let daemon = &daemon;
+                let files = &files;
+                scope.spawn(move || {
+                    let result = files
+                        .assert_unchanged(|| {
+                            setup_run(daemon, &authorization, vec![], None, None, None)
+                        })
+                        .map_err(|error| cli_error(error).code);
+                    send.send(result).unwrap();
+                });
+                // The caller must be refused while another setup still owns the lock.
+                let result = receive.recv_timeout(Duration::from_secs(5));
+                drop(held); // Release before asserting so a regression cannot deadlock the test.
+                assert_eq!(
+                    result.expect("authorization waited for setup scan"),
+                    Err(expected)
+                );
+            });
+            assert!(SETUP_SCAN.try_lock().is_ok(), "refused setup kept the lock");
+        }
+        let state = daemon.inner.lock().unwrap();
+        assert!(state.sources.is_empty());
+        assert!(state.local_health_events.is_empty());
+        assert!(state.command_ledger.is_empty());
+    }
+
+    fn assert_verification_denies_unauthorized_callers() {
+        let files = ControlFilesFixture::new();
+        let daemon = daemon();
+        for (authorization, expected) in [
+            (
+                RequestAuthorization::Untrusted,
+                CliErrorCode::LocalClientNotTrusted,
+            ),
+            (
+                RequestAuthorization::Token("wrong-token".into()),
+                CliErrorCode::LocalAuthFailed,
+            ),
+        ] {
+            for repair in [false, true] {
+                let error = files
+                    .assert_unchanged(|| {
+                        verify_source(&daemon, &authorization, SourceKind::Codex, repair)
+                    })
+                    .expect_err("verification must authorize before any result write");
+                assert_eq!(cli_error(error).code, expected);
+                let state = daemon.inner.lock().unwrap();
+                assert!(
+                    !state.repair_locked,
+                    "refused verification kept the repair lock"
+                );
+                assert!(
+                    state.sources.is_empty(),
+                    "refused verification changed health"
+                );
+                assert!(state.local_health_events.is_empty());
+                assert!(
+                    state.command_ledger.is_empty(),
+                    "refused verification recorded a result"
+                );
+            }
+        }
+    }
+
     #[test]
     #[serial]
     fn verify_json_exposes_canonical_health_failure() {
@@ -28989,12 +29423,13 @@ X-API-Key = "otel_redacted"
         let root = control_test_root("verify-canonical-health");
         create_control_test_dir(&root.join(".codex"));
         let _home_guard = EnvVarGuard::set_path("HOME", &root);
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root.join("support"));
         let config_path = root.join(".codex/config.toml");
-        fs::write(
-            &config_path,
-            render_codex_relay_toml_block_for_base("http://127.0.0.1:44621"),
-        )
-        .expect("legacy config");
+        let original = render_codex_relay_toml_block_for_base("http://127.0.0.1:44621");
+        fs::write(&config_path, &original).expect("legacy config");
+        assert_verification_denies_unauthorized_callers();
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), original);
 
         let response = handle_request(
             &daemon().with_account(connected_account()),
@@ -29054,10 +29489,13 @@ X-API-Key = "otel_redacted"
         let root = control_test_root("verify-patch-disabled");
         create_control_test_dir(&root.join(".codex"));
         let _home_guard = EnvVarGuard::set_path("HOME", &root);
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root.join("support"));
         let _disabled_guard = EnvVarGuard::set_str("OTTTO_PATCH_CODEX_DISABLED", "1");
         let config_path = root.join(".codex/config.toml");
         let original = "[otel\n";
         fs::write(&config_path, original).expect("write invalid config");
+        assert_verification_denies_unauthorized_callers();
 
         let response = handle_request(
             &daemon(),
@@ -31951,18 +32389,22 @@ X-API-Key = "otel_redacted"
     }
 
     fn control_token_validation_server(status: u16) -> String {
+        control_token_validation_server_with_claims(status, r#"{"source":"codex","action":"enable_telemetry","organization_id":"org_123","user_id":"user_123","expires_at":"2026-05-17T00:00:00Z"}"#.into())
+    }
+
+    fn control_token_validation_server_with_claims(status: u16, claims: String) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test backend");
         let address = listener.local_addr().expect("local address");
         thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept validation request");
             read_complete_http_request(&mut stream);
             let (reason, body) = if status == 200 {
-                (
-                    "OK",
-                    r#"{"source":"codex","action":"enable_telemetry","organization_id":"org_123","user_id":"user_123","expires_at":"2026-05-17T00:00:00Z"}"#,
-                )
+                ("OK", claims)
             } else {
-                ("Unauthorized", r#"{"detail":"Invalid app control token"}"#)
+                (
+                    "Unauthorized",
+                    r#"{"detail":"Invalid app control token"}"#.to_string(),
+                )
             };
             let response = format!(
                 "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",

@@ -632,7 +632,7 @@ fn bounded_retry_live_ack_lost_resends_same_revision_without_second_contribution
 
 #[test]
 // The bounded turn leases the shared client_report counters across its token/batch I/O.
-#[serial(client_report)]
+#[serial(client_report, source_cadences, source_upload_deadlines)]
 fn bounded_retry_live_wait_sends_without_scan_and_preserves_ordinary_deadline_and_ack() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
@@ -745,18 +745,28 @@ fn bounded_retry_live_wait_sends_without_scan_and_preserves_ordinary_deadline_an
         let daemon = &f.daemon;
         let mut turns = 0;
         let mut anchored = None;
-        // Synchronize fixture eligibility before starting the ordinary wait.
-        // A 30ms sleep inside that 150ms wait can resume after its deadline;
-        // the production loop then correctly returns without entering a turn.
-        // Due/wake ordering is tested above with explicit Instants, independent
-        // of scheduler latency. This native test retains the real idle boundary,
-        // transport, exact ACK and unchanged ordinary wait/anchor assertions.
+        // Resume at the shared deadline: even a zero remaining ordinary wait
+        // must service due delivery before the next pass can change its index.
         let due = owner.wake_before(Instant::now() + Duration::from_secs(1));
+        // The paced ordinary pass and delivery-only retry may share a wake.
+        // Keep the ordinary request intact while delivery earns its exact ACK.
+        let previous_cadences = std::mem::take(&mut *source_cadences().lock().unwrap());
+        let previous_deadlines = std::mem::take(&mut *source_upload_deadlines().lock().unwrap());
+        with_source_cadence(SnapshotSource::Pi, |cadence| {
+            cadence.record_scan_success(due - Duration::from_secs(30), 1);
+            cadence.request_paced_scan(
+                due - Duration::from_secs(30),
+                Duration::ZERO,
+                continuation::PACED_AC,
+                Default::default(),
+            );
+        });
+        source_upload_deadlines().lock().unwrap().insert("pi", due);
+        assert_eq!(paced_scan_due(), Some(due));
         bounded_native_wait_until(due);
         assert!(Instant::now() >= due);
-        let started = Instant::now();
         collect_file_activity_with_retry(
-            Duration::from_millis(150),
+            Duration::ZERO,
             None,
             &mut ClaudeAccountSwitchProbe::default(),
             |ordinary| {
@@ -800,6 +810,17 @@ fn bounded_retry_live_wait_sends_without_scan_and_preserves_ordinary_deadline_an
             || None,
         );
         assert_eq!(turns, 1);
+        let started = Instant::now();
+        collect_file_activity_with_retry(
+            Duration::from_millis(150),
+            None,
+            &mut ClaudeAccountSwitchProbe::default(),
+            |ordinary| {
+                owner.isolated_boundary(|_| panic!("the exact ACK settled this page once"));
+                owner.wake_before(ordinary)
+            },
+            || None,
+        );
         assert!(started.elapsed() >= Duration::from_millis(150));
         let trace = server.join().unwrap();
         assert!(trace[0].starts_with("POST ") && trace[0].contains("/relay-token "));
@@ -850,6 +871,20 @@ fn bounded_retry_live_wait_sends_without_scan_and_preserves_ordinary_deadline_an
             opens_before_retry
         );
         assert!(scan.snapshots.is_empty());
+        assert_eq!(
+            paced_scan_due(),
+            Some(due),
+            "delivery leaves the ordinary request"
+        );
+        with_source_cadence(SnapshotSource::Pi, |cadence| {
+            cadence.record_scan_success(crate::scan_clock::now(), 0)
+        });
+        assert_eq!(
+            with_source_cadence(SnapshotSource::Pi, |cadence| cadence.paced_scan_due()),
+            Some(None)
+        );
+        *source_cadences().lock().unwrap() = previous_cadences;
+        *source_upload_deadlines().lock().unwrap() = previous_deadlines;
         assert!(serde_json::to_value(checkpoint)
             .unwrap()
             .get("completed_historical_replay_generation")

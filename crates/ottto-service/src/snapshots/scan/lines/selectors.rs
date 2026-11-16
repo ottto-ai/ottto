@@ -342,13 +342,22 @@ pub(in crate::snapshots) fn claude_code_selector_from_line(value: &Value) -> Sel
     selector
 }
 
-pub(in crate::snapshots) fn detect_claude_gateway_provider(value: &Value) -> Option<String> {
-    let id = string_at(value, &["message", "id"]).or_else(|| string_at(value, &["requestId"]))?;
+/// The cloud provider a Claude message or request id names: Vertex
+/// (`_vrtx_`) before Bedrock (`_bdrk_`); a native or unknown id names none.
+pub(in crate::snapshots) fn claude_cloud_id_provider(id: &str) -> Option<&'static str> {
     if id.contains("_vrtx_") {
-        return Some("vertex".into());
+        return Some("vertex");
     }
     if id.contains("_bdrk_") {
-        return Some("bedrock".into());
+        return Some("bedrock");
+    }
+    None
+}
+
+pub(in crate::snapshots) fn detect_claude_gateway_provider(value: &Value) -> Option<String> {
+    let id = string_at(value, &["message", "id"]).or_else(|| string_at(value, &["requestId"]))?;
+    if let Some(cloud) = claude_cloud_id_provider(&id) {
+        return Some(cloud.into());
     }
     if id.starts_with("msg_") || id.starts_with("req_") {
         return Some("anthropic".into());
