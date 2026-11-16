@@ -336,7 +336,9 @@ fn owner_return_preserves_all_source_carry() {
         .unwrap();
         crate::snapshots::older_build_logs_priority("return-turn");
         let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
-        // Existing prepare/finish scaffold, now table-driven across the three sources.
+        // A claim switch keeps the daemon alive. Keep its physical-header cache
+        // while reloading account/index state on each ordinary source pass.
+        let daemon_owner = test_daemon("machine_test");
         let mut cycle = |device: &LocalDeviceBinding, secret: &str, source: SnapshotSource| {
             cadence.next_due_cycle();
             source_cadences().lock().unwrap().remove(source.api_slug());
@@ -365,7 +367,8 @@ fn owner_return_preserves_all_source_carry() {
                 setup_snapshot_index: None,
             };
             let client = SnapshotApiClient::new(server.url.clone());
-            let daemon = test_daemon("machine_test")
+            let daemon = daemon_owner
+                .clone()
                 .with_account(ottto_core::FileAccountStore::default().load().unwrap());
             let mut transport = crate::net_resilience::TransportCycleOutcome::default();
             with_scan_clock(now, || {
@@ -606,7 +609,7 @@ fn owner_return_preserves_all_source_carry() {
                 let saved = ScanIndex::load(&index_path(&selected, source)).unwrap();
                 let mut quiet =
                     crate::snapshots::sampled_scan::transition_fixture::RouteResult::emitted(
-                        crate::snapshots::sampled_scan::transition_fixture::Mode::Restart,
+                        crate::snapshots::sampled_scan::transition_fixture::Mode::Ram,
                         source,
                         Vec::new(),
                         &[],
