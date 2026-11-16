@@ -16,7 +16,25 @@ pub(crate) mod history;
 mod maintenance;
 mod migrations;
 mod references;
+use crate::local_resource_diagnostics::cache_lifecycle::{add, Event};
 use maintenance::{MaintenanceStats, PurgePolicy};
+
+fn sample_pager_writes(conn: &Connection, counter: Event) {
+    let (mut pages, mut high) = (0, 0);
+    // SAFETY: the connection owns this live handle; page size is verified at open.
+    let rc = unsafe {
+        rusqlite::ffi::sqlite3_db_status64(
+            conn.handle(),
+            rusqlite::ffi::SQLITE_DBSTATUS_CACHE_WRITE,
+            &mut pages,
+            &mut high,
+            1,
+        )
+    };
+    if rc == rusqlite::ffi::SQLITE_OK && pages >= 0 {
+        add(counter, (pages as u64).saturating_mul(4096));
+    }
+}
 
 // Default SQLite mmap ceiling: an optimisation ceiling, not a data limit.
 const MMAP_BYTES: i64 = 2_147_418_112;
@@ -305,6 +323,7 @@ fn read_piece(conn: &Connection, h: &Header, part: u64) -> Result<Vec<u8>> {
 
 pub(super) struct Sqlite {
     conn: Option<Connection>,
+    pager_counter: Option<Event>,
     path: PathBuf,
     import: bool,
     debt: bool,
@@ -534,10 +553,16 @@ fn pragmas(conn: &Connection, import: bool, checkpoint: Checkpoint) -> Result<()
 }
 
 impl Sqlite {
+    fn sample_pager_writes(&self) {
+        if let (Some(conn), Some(counter)) = (&self.conn, self.pager_counter) {
+            sample_pager_writes(conn, counter);
+        }
+    }
     /// A store over a just-opened connection; only `import` differs by route.
     fn fresh(conn: Connection, path: &Path, import: bool, owner: File, owner_lock: File) -> Self {
         Self {
             conn: Some(conn),
+            pager_counter: None,
             path: path.into(),
             import,
             debt: false,
@@ -716,6 +741,12 @@ impl Sqlite {
         let (conn, file) = Self::open_locked(path, identity, None, false)?;
         super::telemetry::event("schema_layout", &"four_tables");
         let mut store = Self::fresh(conn, path, false, file, owner_lock);
+        use super::super::scan_index_persistence::Source;
+        store.pager_counter = Some(match identity.binding.source {
+            Source::Claude => Event::ClaudePagerBytes,
+            Source::Codex => Event::CodexPagerBytes,
+            Source::Pi => Event::PiPagerBytes,
+        });
         // Hydrate reads through read_value, which verifies each checksum once.
         // Reconstruct required maintenance from durable purge metadata/size;
         // a nonzero allocated WAL by itself is not a checkpoint debt.
@@ -1863,6 +1894,7 @@ impl Txn<'_> {
         // COMMIT errors may have published. Close and reopen before inspecting
         // the durable generation, still under the caller's checkpoint lock.
         let store = &mut self.store;
+        store.sample_pager_writes();
         if let Some(conn) = store.conn.take() {
             let _ = conn.close();
         }
@@ -1891,6 +1923,12 @@ impl Txn<'_> {
         };
         store.stats.commit(&outcome, Some(latency));
         outcome
+    }
+}
+
+impl Drop for Sqlite {
+    fn drop(&mut self) {
+        self.sample_pager_writes();
     }
 }
 
