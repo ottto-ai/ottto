@@ -632,6 +632,14 @@ fn owner_return_preserves_all_source_carry() {
                 "pre-cutoff store-loss fallback cannot shrink the server head"
             );
             let lost = ScanIndex::load(&index_path(&selected, source)).unwrap();
+            if source == SnapshotSource::Codex {
+                assert!(
+                    lost.files
+                        .get(&codex.to_string_lossy().into_owned())
+                        .is_some_and(|entry| entry.codex_counting_v2),
+                    "deleted-store fallback records the V2 interpretation residual"
+                );
+            }
             for prior in &before[sources.iter().position(|s| *s == source).unwrap()] {
                 assert!(
                     !lost.accepted_snapshot_fingerprint_recorded(

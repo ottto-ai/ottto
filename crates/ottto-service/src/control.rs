@@ -11936,9 +11936,10 @@ fn seed_pending_owner_snapshot_for_logout(
             .upsert(std::slice::from_ref(seed))
             .or_state_poisoned()?;
     }
-    // Even a legacy journal can straddle the two active writes. It has no
-    // frozen seed to invent; existing history remains untouched.
-    Ok(false)
+    // Before the durable pre-confirm guard, no confirm/promotion could have
+    // touched active halves. Keep ordinary local logout's rotation authority.
+    // Past that cut even a legacy journal can straddle the active writes.
+    Ok(pending.confirmed_at.is_none() && !pending.preconfirm_guards_passed)
 }
 
 fn seed_owner_snapshot_history_for_logout() -> Result<bool, LocalApiError> {
@@ -33060,6 +33061,70 @@ X-API-Key = "otel_redacted"
                 .unwrap());
                 assert_eq!(store.load().unwrap(), vec![seed]);
             }
+        }
+    }
+
+    #[test]
+    /// [regress] Canceling an unconfirmed switch during local logout retains
+    /// the intact predecessor pair; the candidate grants no incoming history.
+    fn owner_return_logout_with_unconfirmed_switch_retains_the_active_pair() {
+        use ottto_core::token_store::MemoryTokenStore;
+        for authorized in [false, true] {
+            let root =
+                crate::test_scratch::ScratchDir::canonical("owner-return-unconfirmed-logout");
+            let store = FileOwnerSnapshotNamespaceStore::new(root.join("history.json"));
+            let (mut pending, _) = owner_return_pending("b", "org", "unconfirmed");
+            let key = pending_owner_snapshot_key(&pending).unwrap();
+            let mut seed = OwnerSnapshotNamespace {
+                key: key.clone(),
+                namespace: "a".repeat(64),
+            };
+            seed.key.user_id = "a".into();
+            let authority = pending.request_authority.as_mut().unwrap();
+            authority.outgoing_snapshot_namespace = Some(seed.clone());
+            authority.incoming_snapshot_namespace = Some(OwnerSnapshotNamespace {
+                key,
+                namespace: "b".repeat(64),
+            });
+            pending.schema_version = OWNER_RETURN_CREDENTIAL_SCHEMA_VERSION;
+            pending.confirmation_authorized = authorized;
+            pending.preconfirm_guards_passed = false;
+            let active = FileDeviceStore::new(root.join("active.json"));
+            let device = relogin_device("original-a", &["codex"]);
+            active.save(&device).unwrap();
+            let secret = MemoryTokenStore::new();
+            secret.save("original-a-secret").unwrap();
+            let prior = FileDeviceStore::new(root.join("prior.json"));
+            let prior_secret = MemoryTokenStore::new();
+            assert!(seed_pending_owner_snapshot_for_logout(
+                &pending,
+                &store,
+                &owner_return_test_machine
+            )
+            .unwrap());
+            retain_prior_device_credential_with_stores(
+                &active,
+                &secret,
+                &prior,
+                &prior_secret,
+                Some(LocalCredentialOwner {
+                    user_id: "a".into(),
+                    organization_id: "org".into(),
+                    api_base_url: DEFAULT_API_BASE_URL.into(),
+                }),
+            )
+            .unwrap();
+            assert_eq!(prior.load().unwrap(), Some(device));
+            assert_eq!(prior_secret.load().unwrap(), "original-a-secret");
+            let journal = FilePendingDeviceCredentialStore::new(root.join("pending.json"));
+            journal.save(&pending).unwrap();
+            journal.reset().unwrap();
+            assert!(journal.load().unwrap().is_none());
+            assert_eq!(
+                store.load().unwrap(),
+                vec![seed],
+                "incoming B is never published by logout"
+            );
         }
     }
 
