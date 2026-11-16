@@ -225,6 +225,10 @@ pub enum LocalApiError {
     IdentityMutationInProgress,
     #[error("invalid local control request: {0}")]
     InvalidRequest(String),
+    /// A retired command, answered with a fixed message only after the
+    /// caller is authorized. The message must never echo request fields.
+    #[error("{0}")]
+    RetiredCommand(&'static str),
     #[error("Ottto left the configuration unchanged. Review the Ottto telemetry entries and fence markers in the source config, then retry.")]
     ManualFenceReviewRequired,
     #[error("local operation failed: {0}")]

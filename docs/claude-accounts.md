@@ -158,35 +158,43 @@ usage rows. Authenticated v23 local status exposes only an identifier-free
 count for the app's Advanced section; it exposes no root id, path, service
 alias, account hash, organization hash, logout, or delete action.
 
-Current local-service versions do not return a Terminal fallback. The daemon
-privately drains the official CLI's output and recognizes only its explicit
-authorization-code prompt. Authenticated local status then reports
-`waiting_for_code`; after a v25 in-app submission it reports `submitting_code`.
-If the provider emits its exact rejection sentence after submission, status
-returns to `waiting_for_code` with `code_error: invalid_code`. A terminal
-`timed_out` outcome tells the app that the ceremony expired. Browser completion
-remains automatic when the provider finishes without asking for a code.
+Current local-service versions do not return a Terminal fallback. Ottto
+provides no code-entry control and never forwards a code to Claude; Claude
+completes sign-in in the browser. The daemon gives the official CLI a private
+terminal whose output it drains and discards without inspection, and nothing
+is ever typed into it. If Claude prints a prompt to paste a code, nothing
+answers it: the daemon keeps waiting for the provider to finish, for **Stop
+waiting**, or for the sign-in deadline. Status reports `waiting_for_provider` until the provider
+exits; a terminal `timed_out` outcome tells the app that the sign-in expired.
 
-The v25 request is exact-operation-bound:
+Older daemons could report `waiting_for_code` or `submitting_code` and a
+`code_error`. Clients keep decoding those values. A current daemon never emits
+them: an operation saved by an older version in either phase is reported as
+`waiting_for_provider` and recovers like any other interrupted sign-in.
+
+The former v25 `claude_account_submit_auth_code` command is retired. A request
+still sent by an older client is answered, after the normal local-client
+authorization, with a structured rejection that keeps the original
+`request_id`:
 
 ```json
 {
-  "request_id": "req_opaque",
-  "protocol_version": 25,
-  "command": "claude_account_submit_auth_code",
-  "schema_version": 1,
-  "operation_id": "claude_setup_<opaque>",
-  "code": "<one-time code>"
+  "ok": false,
+  "payload": null,
+  "error": {
+    "code": "invalid_request",
+    "message": "Claude code submission is unsupported. Cancel and try again.",
+    "retryable": false,
+    "details": {}
+  }
 }
 ```
 
-`auth_code_entry_supported: true` is the additive status capability. The code
-must be one non-empty printable line of at most 2,048 bytes and is accepted only
-while that exact active operation is `waiting_for_code`. It is carried as a
-redacted, zeroizing secret, forwarded through anonymous pipes, and never written
-to state, logs, diagnostics, backend payloads, provider-output fields, or the
-local-control response. Raw provider output is likewise discarded after a
-bounded private prompt scan.
+Any fields such a request carries are ignored: they are not retained,
+logged, reported in diagnostics, echoed, or passed to Claude. An unauthorized
+caller gets the ordinary authorization error instead. Status still reports
+`auth_code_entry_supported` because older apps gate their browser reopen and
+retry controls on it; it no longer means that a code is accepted.
 
 Browser setup is idempotent by opaque operation id, including across daemon
 restarts. The daemon persists lifecycle and exact-root identity, never adopts a
@@ -203,9 +211,9 @@ directory; customers remain in control of credential deletion.
 
 When an already registered custom slot reaches `needs_login`, **Sign in again**
 starts browser authentication for that exact opaque slot on a v23 daemon. It
-does not create another config directory or registration. A v25-capable app
-submits an explicitly requested authorization code to that exact operation;
-current daemons never substitute a Terminal ceremony or sibling slot.
+does not create another config directory or registration, and Claude completes
+it in the browser; current daemons never substitute a Terminal ceremony or
+sibling slot.
 Reconnect refuses
 the default slot, an unknown or removed registration, a weak/missing account
 binding, and a login that resolves to a different strong account. Stop Waiting

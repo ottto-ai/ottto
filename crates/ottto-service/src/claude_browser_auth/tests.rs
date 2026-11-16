@@ -91,105 +91,101 @@ fn assert_one_completed_request(operation_id: &str) {
     );
 }
 
+/// A journal written before code entry was retired may hold a code phase and
+/// an invalid-code marker. Status shows the passive browser wait with no code
+/// error, the legacy capability bit stays for older apps, projection never
+/// rewrites the journal, and the next save drops the marker.
 #[test]
 #[serial]
-fn authorization_code_state_is_typed_ephemeral_and_single_submission() {
-    let (root, _support_dir, _support) = with_support("auth-code-state");
+fn legacy_code_phases_project_as_browser_wait_and_marker_is_dropped_on_save() {
+    let (root, _support_dir, _support) = with_support("legacy-code-projection");
     let operation_id = "claude_setup_c0dec0dec0dec0dec0dec0dec0dec0de";
     let store = FileClaudeConfigSlotSettingsStore::default();
     let status =
         prepare_generic(store.load().expect("registry"), operation_id).expect("prepare generic");
-    set_phase(operation_id, ClaudeBrowserAuthPhaseV1::WaitingForProvider);
-    let (_registration, submissions) =
-        register_code_submissions(operation_id).expect("submission channel");
+    for phase in [
+        ClaudeBrowserAuthPhaseV1::WaitingForCode,
+        ClaudeBrowserAuthPhaseV1::SubmittingCode,
+    ] {
+        set_phase(operation_id, phase);
+        let mut journal: serde_json::Value =
+            serde_json::from_slice(&fs::read(state_path()).expect("journal")).expect("json");
+        journal["invalid_code_operation_id"] = serde_json::json!(operation_id);
+        fs::write(
+            state_path(),
+            serde_json::to_vec_pretty(&journal).expect("legacy journal"),
+        )
+        .expect("write legacy journal");
 
-    apply_provider_event(operation_id, PROVIDER_EVENT_CODE_PROMPT);
-    let waiting = annotate_status(status.clone());
-    let waiting_auth = waiting
-        .setup_operation
-        .browser_auth
-        .as_ref()
-        .expect("browser auth");
-    assert_eq!(waiting_auth.phase, ClaudeBrowserAuthPhaseV1::WaitingForCode);
-    assert_eq!(waiting.auth_code_entry_supported, Some(cfg!(unix)));
-
-    let fixture_code = "fixture-ephemeral-code";
-    submit_authorization_code(operation_id, SecretString::new(fixture_code))
-        .expect("first submission");
-    let submitting = annotate_status(status.clone());
-    assert_eq!(
-        submitting
+        let annotated = annotate_status(status.clone());
+        assert_eq!(annotated.browser_auth_supported, Some(true));
+        assert_eq!(annotated.auth_code_entry_supported, Some(cfg!(unix)));
+        let auth = annotated
             .setup_operation
             .browser_auth
-            .as_ref()
-            .expect("browser auth")
-            .phase,
-        ClaudeBrowserAuthPhaseV1::SubmittingCode
-    );
-    assert!(submit_authorization_code(operation_id, SecretString::new("duplicate")).is_err());
+            .expect("browser auth");
+        assert_eq!(auth.phase, ClaudeBrowserAuthPhaseV1::WaitingForProvider);
+        assert_eq!(auth.code_error, None);
+        assert!(!auth.terminal_fallback_available);
+        let persisted = read_operation(operation_id).expect("operation");
+        assert_eq!(
+            persisted.phase, phase,
+            "projection never rewrites the journal"
+        );
+        assert_eq!(
+            synthetic_operation(&persisted).state,
+            ClaudeAccountSetupOperationState::WaitingForUserLogin
+        );
 
-    let persisted = serde_json::to_string(&read_state()).expect("persisted state");
-    let public = serde_json::to_string(&submitting).expect("public status");
-    assert!(!persisted.contains(fixture_code));
-    assert!(!public.contains(fixture_code));
-    assert!(!public.contains("provider_output"));
-    let submitted = submissions.recv().expect("ephemeral submission");
-    assert_eq!(submitted.expose_secret(), fixture_code);
-    drop(submitted);
-
-    apply_provider_event(operation_id, PROVIDER_EVENT_CODE_INVALID);
-    let invalid = annotate_status(status);
-    let invalid_auth = invalid.setup_operation.browser_auth.expect("browser auth");
-    assert_eq!(invalid_auth.phase, ClaudeBrowserAuthPhaseV1::WaitingForCode);
-    assert_eq!(
-        invalid_auth.code_error,
-        Some(ClaudeBrowserAuthCodeErrorV1::InvalidCode)
-    );
+        set_phase(operation_id, phase);
+        let saved = fs::read_to_string(state_path()).expect("saved journal");
+        assert!(!saved.contains("invalid_code_operation_id"));
+    }
     finish(operation_id, ClaudeBrowserAuthOutcomeV1::Cancelled, None);
     let _ = fs::remove_dir_all(root);
 }
 
+/// After a restart, a nonterminal legacy `submitting_code` operation takes the
+/// ordinary recovery path: nothing is relaunched, it moves to Validating with
+/// its original deadline and root, and an identity proof finalizes it.
 #[test]
 #[serial]
-fn authorization_code_rejects_wrong_operation_and_unbounded_or_multiline_input() {
-    let (root, _support_dir, _support) = with_support("auth-code-validation");
+fn restart_with_legacy_submitting_code_recovers_through_validating_to_complete() {
+    let (root, _support_dir, _support) = with_support("legacy-submitting-code-restart");
+    let empty_bin = root.join("empty-bin");
+    fs::create_dir_all(&empty_bin).expect("empty command dir");
+    // No CLI or keychain tool is reachable: recovery can never prove the
+    // identity on its own or spawn anything real.
+    let _commands = EnvGuard::set("OTTTO_COMMAND_SEARCH_PATH", &empty_bin);
     let operation_id = "claude_setup_c1dec1dec1dec1dec1dec1dec1dec1de";
-    let wrong_id = "claude_setup_c2dec2dec2dec2dec2dec2dec2dec2de";
     let store = FileClaudeConfigSlotSettingsStore::default();
     prepare_generic(store.load().expect("registry"), operation_id).expect("prepare generic");
-    set_phase(operation_id, ClaudeBrowserAuthPhaseV1::WaitingForCode);
-    let (_wrong_registration, _wrong_rx) =
-        register_code_submissions(wrong_id).expect("wrong operation channel");
-    assert!(
-        submit_authorization_code(wrong_id, SecretString::new("bounded-code"))
-            .expect_err("wrong operation")
-            .contains("active operation")
-    );
-    let (_registration, _rx) = register_code_submissions(operation_id).expect("submission channel");
+    set_phase(operation_id, ClaudeBrowserAuthPhaseV1::SubmittingCode);
+    let before = read_operation(operation_id).expect("legacy operation");
 
-    for invalid in [
-        "",
-        "two\nlines",
-        "carriage\rreturn",
-        "control\u{7}character",
-        " surrounding-space",
-    ] {
-        assert!(submit_authorization_code(operation_id, SecretString::new(invalid)).is_err());
-        assert_eq!(
-            read_operation(operation_id).expect("operation").phase,
-            ClaudeBrowserAuthPhaseV1::WaitingForCode
+    let operation = operation_id.to_string();
+    let recovery = thread::spawn(move || recover_operation(&operation));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let current = read_operation(operation_id).expect("operation");
+        if current.phase == ClaudeBrowserAuthPhaseV1::Validating {
+            assert!(current.outcome.is_none());
+            assert_eq!(current.deadline_unix_seconds, before.deadline_unix_seconds);
+            assert_eq!(current.config_dir, before.config_dir);
+            assert_eq!(current.slot_id, before.slot_id);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the legacy phase never entered recovery validation"
         );
+        thread::sleep(Duration::from_millis(25));
     }
-    assert!(submit_authorization_code(
-        operation_id,
-        SecretString::new("x".repeat(MAX_AUTH_CODE_BYTES + 1))
-    )
-    .is_err());
-    assert_eq!(
-        read_operation(operation_id).expect("operation").phase,
-        ClaudeBrowserAuthPhaseV1::WaitingForCode
-    );
-    finish(operation_id, ClaudeBrowserAuthOutcomeV1::Cancelled, None);
+    assert!(!provider_process_active(operation_id).expect("lock state"));
+
+    assert_one_completed_request(operation_id);
+    recovery.join().expect("recovery");
+    assert!(read_state().active_operation_id.is_none());
     let _ = fs::remove_dir_all(root);
 }
 
@@ -245,39 +241,33 @@ fn private_provider_pty_is_interactive_and_does_not_echo_secrets() {
 
 #[test]
 #[cfg(unix)]
-fn provider_scanner_emits_only_exact_generic_auth_events() {
-    use std::io::{Cursor, Seek, SeekFrom};
+fn provider_output_drain_consumes_unbounded_output_until_eof() {
+    use std::sync::mpsc;
 
-    let path = temp_dir("provider-events").with_extension("bin");
-    let mut event_file = fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .read(true)
-        .write(true)
-        .open(&path)
-        .expect("event file");
-    let writer = event_file.try_clone().expect("event writer");
-    scan_provider_output(
-        Cursor::new(
-            b"private-provider-output\npaste code here if prompted but this is prose\nInvalid code. Please make certain the full code was copied.\nPaste code here if prompted >\nInvalid code. Please make sure the full code was copied\nInvalid code. Please make sure the full code was copied.\nprivate-tail\nPaste code here if prompted >",
-        ),
-        Arc::new(Mutex::new(writer)),
-    );
-    event_file.seek(SeekFrom::Start(0)).expect("seek events");
-    let mut events = Vec::new();
-    event_file.read_to_end(&mut events).expect("read events");
-    assert_eq!(
-        events,
-        vec![
-            PROVIDER_EVENT_CODE_PROMPT,
-            PROVIDER_EVENT_CODE_INVALID,
-            PROVIDER_EVENT_CODE_PROMPT
-        ]
-    );
-    assert!(!events
-        .windows(b"private-provider-output".len())
-        .any(|window| window == b"private-provider-output"));
-    let _ = fs::remove_file(path);
+    let (provider_io, provider_tty) = private_provider_pty().expect("private provider PTY");
+    let (drained_tx, drained_rx) = mpsc::channel();
+    let drain = thread::spawn(move || {
+        drain_provider_output(provider_io);
+        let _ = drained_tx.send(());
+    });
+    let (written_tx, written_rx) = mpsc::channel();
+    let writer = thread::spawn(move || {
+        let mut provider_tty = provider_tty;
+        // Far more than any PTY buffer: a stalled drain blocks this writer.
+        let chunk = [b'x'; 4096];
+        for _ in 0..64 {
+            provider_tty.write_all(&chunk).expect("provider write");
+        }
+        let _ = written_tx.send(());
+    });
+    written_rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("256 KiB of provider output drained without a consumer");
+    writer.join().expect("writer thread");
+    drained_rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("drain ends once the provider side closes");
+    drain.join().expect("drain thread");
 }
 
 #[test]
@@ -841,8 +831,8 @@ fn pre_core_reconnect_without_core_operation_aborts_fence_and_preserves_slot() {
 }
 
 /// A sign-in run is one provider-call line for setup: one that completed
-/// or was given a code sent at least the token exchange; one given up on
-/// is still logged.
+/// sent at least the token exchange; one that timed out, was cancelled or was
+/// given up on claims no request but is still logged.
 #[test]
 #[serial]
 fn each_sign_in_run_is_one_provider_call_line() {
@@ -864,9 +854,7 @@ fn each_sign_in_run_is_one_provider_call_line() {
     cancelled.finish(CallResult::Error("cancelled"));
     cancelled.finish(CallResult::Ok);
     drop(SignInCall::started(config));
-    let mut submitted = SignInCall::started(config);
-    submitted.code_submitted = true;
-    submitted.finish(CallResult::Timeout);
+    SignInCall::started(config).finish(CallResult::Timeout);
     let lines = crate::provider_calls::test_lines(CallKind::ClaudeSignIn, &account);
     assert_eq!(
         lines
@@ -882,7 +870,7 @@ fn each_sign_in_run_is_one_provider_call_line() {
             ("anthropic", "setup", "ok", 1),
             ("anthropic", "setup", "cancelled", 0),
             ("anthropic", "setup", "abandoned", 0),
-            ("anthropic", "setup", "timeout", 1),
+            ("anthropic", "setup", "timeout", 0),
         ]
     );
     let _ = fs::remove_dir_all(root);
@@ -1867,8 +1855,6 @@ fn failed_provider_reap_keeps_operation_and_ceremony_nonterminal() {
     let mut supervised = SupervisedChild {
         child,
         control: None,
-        code: None,
-        events: None,
         process_group_id,
     };
 
@@ -1894,11 +1880,10 @@ fn supervisor_entry_rejects_unbound_or_terminal_requests_before_fd_use() {
     let support = root.join("support");
     fs::create_dir_all(&support).expect("support");
     let _support = EnvGuard::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
-    assert!(run_auth_supervisor("../escape", "/tmp/arbitrary", -1, -1, -1).is_err());
+    assert!(run_auth_supervisor("../escape", "/tmp/arbitrary", -1, -1).is_err());
     assert!(run_auth_supervisor(
         "claude_setup_a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6",
         "/tmp/arbitrary",
-        -1,
         -1,
         -1,
     )
@@ -1911,8 +1896,8 @@ fn supervisor_entry_rejects_unbound_or_terminal_requests_before_fd_use() {
     prepare_generic(status, operation_id).expect("prepare");
     set_phase(operation_id, ClaudeBrowserAuthPhaseV1::Launching);
     let exact = read_operation(operation_id).expect("operation").config_dir;
-    assert!(run_auth_supervisor(operation_id, "/tmp/wrong", -1, -1, -1).is_err());
-    assert!(run_auth_supervisor(operation_id, &exact, -1, -1, -1).is_err());
+    assert!(run_auth_supervisor(operation_id, "/tmp/wrong", -1, -1).is_err());
+    assert!(run_auth_supervisor(operation_id, &exact, -1, -1).is_err());
     let mut pipe_fds = [-1; 2];
     assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
     // SAFETY: successful pipe returned newly-owned descriptors.
@@ -1923,6 +1908,12 @@ fn supervisor_entry_rejects_unbound_or_terminal_requests_before_fd_use() {
         &exact,
         pipe_read.as_raw_fd(),
         pipe_read.as_raw_fd(),
+    )
+    .is_err());
+    assert!(run_auth_supervisor(
+        operation_id,
+        &exact,
+        pipe_write.as_raw_fd(),
         pipe_read.as_raw_fd(),
     )
     .is_err());
@@ -1931,15 +1922,18 @@ fn supervisor_entry_rejects_unbound_or_terminal_requests_before_fd_use() {
         operation_id,
         &exact,
         unrelated.as_raw_fd(),
-        pipe_read.as_raw_fd(),
         pipe_write.as_raw_fd(),
     )
     .is_err());
     finish(operation_id, ClaudeBrowserAuthOutcomeV1::LoginFailed, None);
-    assert!(run_auth_supervisor(operation_id, &exact, -1, -1, -1).is_err());
+    assert!(run_auth_supervisor(operation_id, &exact, -1, -1).is_err());
     let _ = fs::remove_dir_all(root);
 }
 
+/// The provider prints far more than a PTY buffer holds and then shows its
+/// paste prompt. The supervisor drains without a consumer, never answers the
+/// prompt, and parent-pipe EOF still kills the provider before the lifetime
+/// lock is released.
 #[test]
 #[serial]
 #[cfg(unix)]
@@ -1950,6 +1944,8 @@ fn supervisor_parent_eof_kills_provider_before_releasing_lifetime_lock() {
     let support = root.join("support");
     let bin = root.join("bin");
     let home = root.join("home");
+    let prompted = root.join("prompted");
+    let answered = root.join("answered");
     fs::create_dir_all(&support).expect("support");
     fs::create_dir_all(&bin).expect("bin");
     fs::create_dir_all(&home).expect("home");
@@ -1957,7 +1953,11 @@ fn supervisor_parent_eof_kills_provider_before_releasing_lifetime_lock() {
     let executable = bin.join("claude");
     fs::write(
         &executable,
-        "#!/bin/sh\nfor fd in 0 1 2; do test -t \"$fd\" || exit 42; done\nprintf 'Paste code here if prompted >' >&2\nIFS= read -r code\nunset code\nexec sleep 30\n",
+        format!(
+            "#!/bin/sh\nfor fd in 0 1 2; do test -t \"$fd\" || exit 42; done\ns=xxxxxxxxxxxxxxxx; i=0; while [ $i -lt 14 ]; do s=\"$s$s\"; i=$((i + 1)); done; printf '%s' \"$s\" >&2\nprintf 'Paste code here if prompted >' >&2\n: > '{}'\nIFS= read -r code\n: > '{}'\nexec sleep 30\n",
+            prompted.display(),
+            answered.display()
+        ),
     )
     .expect("fake claude");
     fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
@@ -1974,16 +1974,12 @@ fn supervisor_parent_eof_kills_provider_before_releasing_lifetime_lock() {
     let config_dir = read_operation(operation_id).expect("operation").config_dir;
 
     let mut control_fds = [-1; 2];
-    let mut code_fds = [-1; 2];
     let mut ready_fds = [-1; 2];
     assert_eq!(unsafe { libc::pipe(control_fds.as_mut_ptr()) }, 0);
-    assert_eq!(unsafe { libc::pipe(code_fds.as_mut_ptr()) }, 0);
     assert_eq!(unsafe { libc::pipe(ready_fds.as_mut_ptr()) }, 0);
     // SAFETY: successful pipe calls returned newly-owned descriptors.
     let control_read = unsafe { File::from_raw_fd(control_fds[0]) };
     let control_write = unsafe { File::from_raw_fd(control_fds[1]) };
-    let code_read = unsafe { File::from_raw_fd(code_fds[0]) };
-    let code_write = unsafe { File::from_raw_fd(code_fds[1]) };
     let mut ready_read = unsafe { File::from_raw_fd(ready_fds[0]) };
     let ready_write = unsafe { File::from_raw_fd(ready_fds[1]) };
     let operation = operation_id.to_string();
@@ -1993,26 +1989,52 @@ fn supervisor_parent_eof_kills_provider_before_releasing_lifetime_lock() {
             &operation,
             &supervisor_root,
             control_read.into_raw_fd(),
-            code_read.into_raw_fd(),
             ready_write.into_raw_fd(),
         )
     });
     let mut ready = [0_u8; 1];
     ready_read.read_exact(&mut ready).expect("ready");
     assert_eq!(ready, [PROVIDER_EVENT_READY]);
-    let mut prompt = [0_u8; 1];
-    ready_read.read_exact(&mut prompt).expect("prompt event");
-    assert_eq!(prompt, [PROVIDER_EVENT_CODE_PROMPT]);
-    (&code_write)
-        .write_all(b"fixture-forwarded-code\n")
-        .expect("forward code");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !prompted.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "provider output was not drained without a consumer"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+    thread::sleep(Duration::from_millis(200));
+    assert!(
+        !answered.exists(),
+        "the paste prompt must never be answered"
+    );
+    // Readiness is the only event: the prompt produces nothing on the pipe.
+    let flags = unsafe { libc::fcntl(ready_read.as_raw_fd(), libc::F_GETFL) };
+    assert!(flags >= 0);
+    assert_eq!(
+        unsafe {
+            libc::fcntl(
+                ready_read.as_raw_fd(),
+                libc::F_SETFL,
+                flags | libc::O_NONBLOCK,
+            )
+        },
+        0
+    );
+    let mut extra = [0_u8; 1];
+    assert!(
+        !matches!(ready_read.read(&mut extra), Ok(count) if count > 0),
+        "no event follows readiness"
+    );
     assert!(provider_process_active(operation_id).expect("lock state"));
     drop(control_write);
-    drop(code_write);
     let result = supervisor.join().expect("supervisor thread");
     assert!(result.is_ok(), "supervisor result: {result:?}");
     assert!(!provider_process_active(operation_id).expect("released lock"));
-    assert!(ready_read.as_raw_fd() >= 0);
+    assert!(
+        !answered.exists(),
+        "the paste prompt must never be answered"
+    );
     let _ = fs::remove_dir_all(root);
 }
 

@@ -36,8 +36,6 @@ enum Command {
         #[arg(long)]
         control_fd: i32,
         #[arg(long)]
-        code_fd: i32,
-        #[arg(long)]
         ready_fd: i32,
     },
     /// Plan or queue a scoped Claude copy-prefix history re-read. Never enables collection.
@@ -246,14 +244,12 @@ fn main() -> Result<()> {
             operation_id,
             config_dir,
             control_fd,
-            code_fd,
             ready_fd,
         } => {
             let code = ottto_service::claude_browser_auth::run_auth_supervisor(
                 &operation_id,
                 &config_dir,
                 control_fd,
-                code_fd,
                 ready_fd,
             )
             .map_err(anyhow::Error::msg)?;
