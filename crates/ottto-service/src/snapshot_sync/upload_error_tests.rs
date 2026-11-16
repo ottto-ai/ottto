@@ -128,3 +128,34 @@ fn batch_413_splits_and_preserves_cutoffs() {
         }
     }
 }
+
+/// All shed callers latch collection status immediately, without waiting for a prepare skip.
+#[test]
+fn source_collection_latches_the_effective_shed_deadline_at_the_setter() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    use ottto_protocol::SourceCollectionState::ServerBackoff;
+    crate::scan_clock::with_clock(0, || {
+        for source in SNAPSHOT_SOURCES {
+            let wall = "2026-11-15T10:00:00Z";
+            defer_source_uploads(source, Duration::from_secs(600));
+            assert!(
+                collection_health(source, true, wall).is_none(),
+                "no collection yet"
+            );
+            start_collection_health(source);
+            assert_eq!(
+                collection_health(source, true, wall).unwrap().state,
+                ServerBackoff
+            );
+            defer_source_uploads(source, Duration::from_secs(1800));
+            defer_source_uploads(source, Duration::from_secs(60));
+            let status = collection_health(source, true, wall).unwrap();
+            assert_eq!(status.state, ServerBackoff);
+            assert_eq!(status.until.as_deref(), Some("2026-11-15T10:30:00Z"));
+            assert!(status.last_scan_at.is_none());
+            assert!(collection_health(source, false, wall).is_none());
+        }
+    });
+}

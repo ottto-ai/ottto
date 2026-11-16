@@ -203,6 +203,8 @@ Desktop metadata cache.
 
 The process-owned transcript cache retains complete Codex home facts in RAM,
 using the shared file stamp for the resolved SQLite main file and its WAL.
+Only the active cycle scope's facts are kept; returning facts discard idle
+entries from previous scopes. Cycle serialization excludes overlapping loads.
 Every pass lists the homes and rebuilds metadata merges, ownership conflicts,
 completeness and path fingerprints. A home whose stamps match is reused; only
 changed or added homes reload, and an unstamped or incomplete home is not kept.
@@ -252,6 +254,22 @@ rescans and policy-stop clears preserve it. Older caches seed it from existing
 ceiling-filtered watermarks as best-effort history: a legacy future timestamp
 can surface after the clock passes it. A rollback can drop the field and cause
 re-seeding on upgrade. This local status fact is independent of uploads.
+
+Each source's optional `collection` status is a RAM-only pulse in its existing cadence state.
+Absence means unknown: no collection offered this run, missing installation/grant, paused,
+admin-disabled or policy-stopped. Pause, grant loss and either policy stop clear the pulse;
+a new eligible collection attempt starts its awake clock again. The shared active-session
+reconciliation path stamps completion, including empty scans and failed cache writes, before
+upload work. Status reports `collecting`, `server_backoff`, `offline` or `stalled`, with the
+last completed scan's `last_scan_at` when known. A transport prepare error is offline until a
+completion or non-transport outcome. Stalled takes precedence after more than the larger of
+60 awake minutes or the current planned interval (including the failure ladder) plus 30 minutes.
+Honoured sheds latch the effective deadline at its setter, after releasing the deadline lock.
+Scan completion preserves any unexpired deadline from an independent upload lane.
+That deadline also extends the pulse baseline; `until` is emitted only during server backoff,
+projected from wall time plus the remaining awake duration. All elapsed decisions use
+`scan_clock::now()`, so sleep does not age the pulse. This observation never changes cadence,
+canonical health, upload decisions or persisted state.
 
 Existing resource records carry fixed command classes, child starts and per-PID
 child CPU totals; arguments, paths and command output are never included.

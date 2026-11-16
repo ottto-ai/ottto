@@ -257,11 +257,6 @@ pub(in crate::snapshot_sync) fn assert_mixed_retryable_holds() {
             let mut fresh = poison.clone();
             fresh.source_session_id = "synthetic-fresh".into();
             fresh.snapshot_fingerprint = crate::snapshots::snapshot_fingerprint(source, &fresh);
-            let wire = |items: &[SnapshotItem]| {
-                let mut request = request(items);
-                request.source = source.api_slug().into();
-                request
-            };
             let route = |mode,
                          emitted: Vec<SnapshotItem>,
                          backend: &BTreeMap<String, SnapshotItem>,
@@ -271,7 +266,7 @@ pub(in crate::snapshot_sync) fn assert_mixed_retryable_holds() {
                 let batches = if emitted.is_empty() {
                     vec![]
                 } else {
-                    vec![canonical(&wire(&emitted))]
+                    vec![canonical(&source_wire(source, &emitted.iter().collect::<Vec<_>>()))]
                 };
                 let mut result = RouteResult::emitted(mode, source, batches, &emitted);
                 result.codex_evidence = oracle::codex_evidence(&page.index, &page.scan);
@@ -336,20 +331,20 @@ pub(in crate::snapshot_sync) fn assert_mixed_retryable_holds() {
                                 if named == "witness" {
                                     // A valid HTTP reply whose ACK ref for this
                                     // item alone echoes another body witness.
-                                    let mut response = ack(&batch)?;
+                                    let mut response = ack(batch)?;
                                     for entity in &mut response.accepted_entities {
                                         if entity.snapshot_fingerprint == fp {
                                             entity.body_witness_digest = Some("0".repeat(64));
                                         }
                                     }
                                     return response
-                                        .validate_entity_ack(&wire(&batch))
+                                        .validate_entity_ack(&source_wire(source, batch))
                                         .map(|()| response);
                                 }
                                 if matches!(named, "mixed" | "conflict") {
                                     // A valid entity ACK refusing this item
                                     // alone as a conflict or non-permanent mixed usage.
-                                    let mut response = ack(&batch)?;
+                                    let mut response = ack(batch)?;
                                     let mut conflict = response
                                         .accepted_entities
                                         .iter()
@@ -379,14 +374,14 @@ pub(in crate::snapshot_sync) fn assert_mixed_retryable_holds() {
                                             },
                                         );
                                     }
-                                    response.validate_entity_ack(&wire(&batch))?;
+                                    response.validate_entity_ack(&source_wire(source, batch))?;
                                     for item in batch
-                                        .into_iter()
+                                        .iter().copied()
                                         .filter(|item| item.snapshot_fingerprint != fp)
                                     {
                                         backend
                                             .insert(item.source_session_id.clone(), item.clone());
-                                        emitted.push(item);
+                                        emitted.push(item.clone());
                                     }
                                     return Ok(response);
                                 }
@@ -410,12 +405,12 @@ pub(in crate::snapshot_sync) fn assert_mixed_retryable_holds() {
                                 )));
                             }
                         }
-                        let response = ack(&batch)?;
-                        response.validate_entity_ack(&wire(&batch))?;
-                        for item in &batch {
+                        let response = ack(batch)?;
+                        response.validate_entity_ack(&source_wire(source, batch))?;
+                        for item in batch.iter().copied() {
                             backend.insert(item.source_session_id.clone(), item.clone());
                         }
-                        emitted.extend(batch);
+                        emitted.extend(batch.iter().copied().cloned());
                         Ok(response)
                     },
                     |state| state.save(&progress_path),
@@ -526,10 +521,10 @@ pub(in crate::snapshot_sync) fn assert_mixed_retryable_holds() {
                 |s| s.snapshot_fingerprint.as_str(),
                 snapshot_upload_body_witness,
                 |batch| {
-                    for item in &batch {
+                    for item in batch.iter().copied() {
                         cold_backend.insert(item.source_session_id.clone(), item.clone());
                     }
-                    ack(&batch)
+                    ack(batch)
                 },
                 |_| Ok(()),
             )
@@ -667,10 +662,10 @@ pub(in crate::snapshot_sync) fn assert_mixed_retryable_holds() {
                 |s| s.snapshot_fingerprint.as_str(),
                 snapshot_upload_body_witness,
                 |batch| {
-                    for item in &batch {
+                    for item in batch.iter().copied() {
                         cold_backend.insert(item.source_session_id.clone(), item.clone());
                     }
-                    ack(&batch)
+                    ack(batch)
                 },
                 |_| Ok(()),
             )
@@ -749,7 +744,7 @@ pub(in crate::snapshot_sync) fn indexed_refusal_fixture() -> IndexedRefusalFixtu
         &mut progress,
         &mut accepted,
         String::as_str,
-        |batch| match batch.iter().position(|item| item == &refused) {
+        |batch| match batch.iter().position(|item| *item == &refused) {
             Some(index) => Err(anyhow::Error::new(BatchRejected::from_response(
                 422,
                 json!({"errors":[{"loc":["body","snapshots",index,"field"]}]})
@@ -931,4 +926,10 @@ fn local_hold_settles_unsent_siblings_without_a_reread() {
             "{outcome}: exact ACKs and prior credit only; the held revision gets none"
         );
     }
+}
+
+fn source_wire<'a>(source: SnapshotSource, items: &[&'a SnapshotItem]) -> SnapshotBatchRequest<&'a SnapshotItem> {
+    let mut request = request_under(SnapshotUploadPolicy::default(), items);
+    request.source = source.api_slug().into();
+    request
 }

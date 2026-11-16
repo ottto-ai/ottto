@@ -1,5 +1,6 @@
 //! Validation of a snapshot batch request before upload: schema version,
 //! source, fingerprints, and the per-item and per-batch wire sizes.
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::content_hash::{
@@ -14,12 +15,14 @@ use crate::snapshots::{
     MAX_SNAPSHOT_BATCH_WIRE_BYTES, MAX_SNAPSHOT_ITEM_WIRE_BYTES, SNAPSHOT_SCHEMA_VERSION,
 };
 
-pub fn validate_snapshot_batch_request(request: &SnapshotBatchRequest) -> Result<(), String> {
+pub fn validate_snapshot_batch_request(
+    request: &SnapshotBatchRequest<impl Borrow<SnapshotItem>>,
+) -> Result<(), String> {
     validate_snapshot_batch_request_with_item_limit(request, MAX_SNAPSHOT_ITEM_WIRE_BYTES)
 }
 
 pub(crate) fn validate_snapshot_batch_request_with_item_limit(
-    request: &SnapshotBatchRequest,
+    request: &SnapshotBatchRequest<impl Borrow<SnapshotItem>>,
     item_limit: usize,
 ) -> Result<(), String> {
     if request.schema_version != SNAPSHOT_SCHEMA_VERSION {
@@ -33,7 +36,7 @@ pub(crate) fn validate_snapshot_batch_request_with_item_limit(
     }
     let source = snapshot_source_from_api_slug(&request.source)
         .ok_or_else(|| "unsupported snapshot source".to_string())?;
-    for (index, item) in request.snapshots.iter().enumerate() {
+    for (index, item) in request.items().enumerate() {
         validate_snapshot_item(index, item)?;
         let component_hashes = snapshot_semantic_component_hashes(source, item);
         let expected_fingerprint = snapshot_fingerprint_from_component_hashes(

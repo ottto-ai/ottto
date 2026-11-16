@@ -405,15 +405,15 @@ fn successful_contract_retry(restart_after_selection: bool) {
             |batch| {
                 assert_eq!(
                     batch,
-                    vec![held_fingerprint()],
+                    &[&held_fingerprint()],
                     "pre-existing ACK and refusal must not be uploaded"
                 );
-                offered.extend(batch.clone());
-                let response = entity_ack_batch(&batch, &[], &[]);
+                offered.extend(batch.iter().copied().cloned());
+                let response = entity_ack_batch(batch, &[], &[]);
                 response.validate_entity_ack_identities(
                     batch
                         .iter()
-                        .map(|fp| (format!("session-{fp}"), fp.clone()))
+                        .map(|fp| (format!("session-{fp}"), (*fp).clone()))
                         .collect::<Vec<_>>()
                         .iter()
                         .map(|(id, fp)| (id.as_str(), fp.as_str())),
@@ -460,7 +460,7 @@ fn successful_contract_retry(restart_after_selection: bool) {
             |fp| retained_body(fp),
             |batch| {
                 duplicate_uploads += 1;
-                Ok(entity_ack_batch(&batch, &[], &[]))
+                Ok(entity_ack_batch(batch, &[], &[]))
             },
             |state| state.save(&fixture.progress_path),
         )
@@ -676,10 +676,10 @@ fn contract_read_cap(outcome: InterruptedOutcome) {
                         |batch| {
                             assert_eq!(
                                 batch,
-                                vec![fixture.fingerprint.clone()],
+                                &[&fixture.fingerprint],
                                 "the retained exact ACK must never be offered again"
                             );
-                            Ok(entity_ack_batch(&[], &[], &batch))
+                            Ok(entity_ack_batch(&[], &[], batch))
                         },
                         |state| state.save(&fixture.retained.progress_path),
                     );
@@ -861,11 +861,11 @@ fn contract_ack_saved_before_index_restart(unrelated: bool) {
             String::as_str,
             |_| fixture.body.clone(),
             |batch| {
-                assert_eq!(batch, vec![fixture.fingerprint.clone()]);
-                let response = entity_ack_batch(&batch, &[], &[]);
+                assert_eq!(batch, &[&fixture.fingerprint]);
+                let response = entity_ack_batch(batch, &[], &[]);
                 let identities: Vec<_> = batch
                     .iter()
-                    .map(|fp| (format!("session-{fp}"), fp.clone()))
+                    .map(|fp| (format!("session-{fp}"), (*fp).clone()))
                     .collect();
                 response.validate_entity_ack_identities(
                     identities.iter().map(|(id, fp)| (id.as_str(), fp.as_str())),
@@ -951,9 +951,9 @@ fn contract_ack_saved_before_index_restart(unrelated: bool) {
             |fp| bodies[fp].clone(),
             |batch| {
                 assert!(unrelated, "empty delta must not POST");
-                assert_eq!(batch, delta);
+                assert_eq!(batch, delta.iter().collect::<Vec<_>>());
                 posts += 1;
-                Ok(entity_ack_batch(&batch, &[], &[]))
+                Ok(entity_ack_batch(batch, &[], &[]))
             },
             |state| state.save(&fixture.retained.progress_path),
         )

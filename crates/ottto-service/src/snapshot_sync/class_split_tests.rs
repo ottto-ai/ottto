@@ -116,15 +116,14 @@ impl HeadStore {
 
     pub(in crate::snapshot_sync) fn post(
         &mut self,
-        request: &SnapshotBatchRequest,
+        request: &SnapshotBatchRequest<impl std::borrow::Borrow<SnapshotItem>>,
         wire: &Value,
     ) -> SnapshotBatchResponse {
         let cas = wire["head_cas_contract"].is_string();
         let echo_state = wire["cache_state_ack_contract"].as_str() == Some("cache_state_ack:v1");
         let mut ack = empty_ack();
         for (item, sent) in request
-            .snapshots
-            .iter()
+            .items()
             .zip(wire["snapshots"].as_array().unwrap())
         {
             let envelope = &sent["semantic_envelope"];
@@ -199,7 +198,7 @@ fn page(
     progress: &mut SnapshotUploadProgress,
     items: &[SnapshotItem],
     legacy: &BTreeSet<String>,
-    server: impl FnMut(&SnapshotBatchRequest, &Value) -> Result<SnapshotBatchResponse>,
+    server: impl FnMut(&SnapshotBatchRequest<&SnapshotItem>, &Value) -> Result<SnapshotBatchResponse>,
 ) -> (Result<ResumableUploadResult>, Vec<Value>) {
     cycle_with_transport(
         progress,
@@ -219,7 +218,7 @@ fn page(
 fn single_class_page(
     progress: &mut SnapshotUploadProgress,
     items: &[SnapshotItem],
-    server: impl FnMut(&SnapshotBatchRequest, &Value) -> Result<SnapshotBatchResponse>,
+    server: impl FnMut(&SnapshotBatchRequest<&SnapshotItem>, &Value) -> Result<SnapshotBatchResponse>,
 ) -> (Result<ResumableUploadResult>, Vec<Value>) {
     cycle_with_transport(
         progress,
@@ -511,7 +510,7 @@ fn a_session_that_regains_a_patch_clears_through_the_ordinary_bootstrap() {
             SCOPE,
             &mut progress,
             |batch, enforce_head_cas| {
-                let request = request(batch);
+                let request = request(batch.to_vec());
                 let wire = if enforce_head_cas {
                     serde_json::to_value(request.wire_with_head_cas())?
                 } else {
@@ -1058,7 +1057,7 @@ fn assert_lost_class_request_resends_only_unsettled(items: &[FamilyItem], first:
         progress.save(&path).unwrap();
         // The server stores each new body once; a stored body is unchanged.
         let stored = std::cell::RefCell::new(BTreeMap::<String, usize>::new());
-        let serve = |batch: &[FamilyItem]| {
+        let serve = |batch: &[&FamilyItem]| {
             let mut stored = stored.borrow_mut();
             let (mut accepted, mut unchanged) = (Vec::new(), Vec::new());
             for item in batch {
@@ -1086,7 +1085,7 @@ fn assert_lost_class_request_resends_only_unsettled(items: &[FamilyItem], first:
             &mut InplaceRetryBudget::default(),
             |batch| {
                 sent.push(batch[0].class);
-                let response = serve(&batch);
+                let response = serve(batch);
                 if batch[0].class == lost && !save_fails {
                     return Err(anyhow!("synthetic lost reply"));
                 }
@@ -1170,7 +1169,7 @@ pub(in crate::snapshot_sync) fn probe_stages(
         SCOPE,
         progress,
         |batch, enforce_head_cas| {
-            let request = request(batch);
+            let request = request(batch.to_vec());
             let wire = if enforce_head_cas {
                 serde_json::to_value(request.wire_with_head_cas())?
             } else {

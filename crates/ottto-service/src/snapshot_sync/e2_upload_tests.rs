@@ -54,7 +54,7 @@ pub(super) fn family(root: &str, members: usize, payload: usize) -> Vec<FamilyIt
 pub(super) fn upload_families(
     items: &[FamilyItem],
     progress: &mut SnapshotUploadProgress,
-    mut respond: impl FnMut(&[FamilyItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
+    mut respond: impl FnMut(&[&FamilyItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
 ) -> (Result<ResumableUploadResult>, Vec<Vec<String>>) {
     let mut batches = Vec::new();
     let mut accepted = 0;
@@ -71,7 +71,7 @@ pub(super) fn upload_families(
         &mut InplaceRetryBudget::default(),
         |batch| {
             batches.push(batch.iter().map(|item| item.session.clone()).collect());
-            respond(&batch)
+            respond(batch)
         },
         |_| Ok(()),
     );
@@ -79,7 +79,7 @@ pub(super) fn upload_families(
 }
 
 pub(super) fn accept_all(
-    batch: &[FamilyItem],
+    batch: &[&FamilyItem],
 ) -> Result<crate::snapshot_client::SnapshotBatchResponse> {
     Ok(accepted_batch(batch.len()))
 }
@@ -337,7 +337,7 @@ fn e2_transient_failure_resends_the_exact_literal_bytes() {
             crate::snapshots::claude_request_money::request_owned_family_root,
             &mut InplaceRetryBudget::default(),
             |batch| {
-                sent.push(serde_json::to_vec(&batch).unwrap());
+                sent.push(serde_json::to_vec(batch).unwrap());
                 if attempt == 0 {
                     Err(anyhow!("transient transport failure"))
                 } else {

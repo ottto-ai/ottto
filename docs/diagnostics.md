@@ -466,6 +466,8 @@ fields are
 `codex_sidecar_facts_bytes`, `codex_header_cache_bytes`, and
 `desktop_title_facts_bytes`. These reuse requested-layout charges, exclude
 inline stack storage, and conservatively charge shared buffers per owner.
+Codex sidecar facts retain only the active cycle scope; a scope change drops
+the previous scope's idle facts when the new pass returns its facts.
 Unknown/unsupported charges or busy cache locks are `null`, never invented
 zeros; finishes without the capture omit the object. Title facts use completion
 accounting with a separate existing visit counter per cached entry; ordinary
