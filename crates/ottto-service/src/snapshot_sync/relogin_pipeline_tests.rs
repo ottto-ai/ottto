@@ -609,7 +609,9 @@ fn owner_return_preserves_all_source_carry() {
                 let saved = ScanIndex::load(&index_path(&selected, source)).unwrap();
                 let mut quiet =
                     crate::snapshots::sampled_scan::transition_fixture::RouteResult::emitted(
-                        crate::snapshots::sampled_scan::transition_fixture::Mode::Ram,
+                        // The scan index is restored from disk on each cycle;
+                        // the live daemon retains its physical header cache.
+                        crate::snapshots::sampled_scan::transition_fixture::Mode::DiskRestore,
                         source,
                         Vec::new(),
                         &[],
