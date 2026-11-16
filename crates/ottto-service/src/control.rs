@@ -11882,8 +11882,6 @@ fn seed_owner_snapshot_history_for_logout() -> Result<bool, LocalApiError> {
         if prior.machine_id.as_deref() == Some(key.machine_id.as_str())
             && owner_snapshot_live_machine(&key, machine.hardware_uuid.as_deref())?
         {
-            // History is optional retention during logout, not authority to
-            // complete a user-requested reset. Claim-time errors still hold.
             if store
                 .upsert(&[OwnerSnapshotNamespace {
                     key,
