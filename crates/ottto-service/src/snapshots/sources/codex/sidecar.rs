@@ -20,7 +20,8 @@ pub(in crate::snapshots) struct CodexTitleMetadata {
     pub(in crate::snapshots) rollout_extents: BTreeMap<String, CodexRolloutExtent>,
     /// File-binding evidence stays with the home that supplied it. A merged
     /// usage high-water mark must never seed another copy's creation proof.
-    pub(in crate::snapshots) root_sidecars: BTreeMap<PathBuf, Arc<codex_root_copies::RootSidecar>>,
+    pub(in crate::snapshots) root_sidecars:
+        BTreeMap<PathBuf, Arc<sources::codex::root_copies::RootSidecar>>,
     /// Canonical session ids whose trusted Codex state row declares
     /// `thread_source=agent_created_thread`. This is deliberately separate
     /// from generic spawn edges: the state declaration is an ownership
@@ -132,7 +133,7 @@ impl Eq for CodexStateThread {}
 fn title_inputs(
     titles: &BTreeMap<String, CodexTitleCandidate>,
     created: &BTreeSet<String>,
-    home: &codex_root_copies::RootSidecar,
+    home: &sources::codex::root_copies::RootSidecar,
 ) -> [u8; 32] {
     let mut digest = Sha256::new();
     for id in home.threads.keys() {
@@ -290,10 +291,12 @@ impl CodexTitleMetadata {
             .chain(edges.values())
             .cloned()
             .collect::<BTreeSet<_>>();
-        let sidecar = |sidecar: &codex_root_copies::RootSidecar| codex_root_copies::RootSidecar {
-            threads: rows(&sidecar.threads, &ids),
-            extents: rows(&sidecar.extents, &ids),
-            ..Default::default()
+        let sidecar = |sidecar: &sources::codex::root_copies::RootSidecar| {
+            sources::codex::root_copies::RootSidecar {
+                threads: rows(&sidecar.threads, &ids),
+                extents: rows(&sidecar.extents, &ids),
+                ..Default::default()
+            }
         };
         Self {
             local_diagnostics: Default::default(),
@@ -527,7 +530,7 @@ impl CodexTitleMetadata {
     }
 
     fn merge_roots(
-        homes: BTreeMap<PathBuf, Arc<codex_root_copies::RootSidecar>>,
+        homes: BTreeMap<PathBuf, Arc<sources::codex::root_copies::RootSidecar>>,
         reused: &BTreeSet<PathBuf>,
     ) -> Self {
         let mut metadata = Self::default();
@@ -583,7 +586,7 @@ impl CodexTitleMetadata {
                 &mut metadata.identity_conflicts,
                 &mut metadata.local_diagnostics.identity_conflict_taxonomy,
             );
-            codex_root_copies::merge_threads(&mut metadata, &codex_dir, &threads);
+            sources::codex::root_copies::merge_threads(&mut metadata, &codex_dir, &threads);
             metadata.local_diagnostics.state_threads.merge_root(
                 &raw.evidence[1],
                 metadata.identity_conflicts.len() != conflicts_before,
@@ -635,7 +638,7 @@ impl CodexTitleMetadata {
                 Box::new(history_extents(&raw.history))
             };
             let _ = apply_extents(rows, &mut extents, &mut metadata.identity_conflicts);
-            codex_root_copies::merge_extents(&mut metadata, &extents);
+            sources::codex::root_copies::merge_extents(&mut metadata, &extents);
             metadata.local_diagnostics.rollout_extents.merge_root(
                 &raw.evidence[3],
                 metadata.identity_conflicts.len() != conflicts_before,
@@ -803,7 +806,7 @@ impl CodexTitleMetadata {
                     .count()
                     == 1;
                 if single_home
-                    && codex_root_copies::copy_locator(home, identity, thread).is_some()
+                    && sources::codex::root_copies::copy_locator(home, identity, thread).is_some()
                     && !in_failed_homes.contains(identity)
                     && !self.identity_conflicts.contains(identity)
                 {

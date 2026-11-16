@@ -223,6 +223,7 @@ crate::durable_tail_codec::durable_enum!(CodexParentUnresolvable {
 });
 crate::heap_layout_bound::no_heap!(true; CodexParentUnresolvable);
 
+/// Source-generic despite its name: any census-member directory still queued.
 pub(in crate::snapshots) fn codex_census_walk_pending(traversal: &ScanTraversalCheckpoint) -> bool {
     traversal
         .pending_directories

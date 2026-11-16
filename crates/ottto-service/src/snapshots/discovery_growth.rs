@@ -11,7 +11,7 @@ const MAX_OBSERVATIONS: usize = 4_096;
 struct Observation {
     len: u64,
     modified: u64,
-    stamp: Option<codex_fragment::Stamp>,
+    stamp: Option<sources::codex::eof_fragment::Stamp>,
 }
 crate::heap_layout_bound::fields!(Observation; len, modified, stamp);
 
@@ -77,7 +77,7 @@ impl Page {
         key: String,
         len: u64,
         modified: u64,
-        stamp: Option<codex_fragment::Stamp>,
+        stamp: Option<sources::codex::eof_fragment::Stamp>,
     ) {
         let mut state = self.state();
         if !state.observations.contains_key(&key) {

@@ -315,6 +315,23 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(status, 1)
         self.assertIn('order changed in crates/demo/src/snapshots.rs', out)
 
+    def test_method_moves_into_an_existing_impl_with_the_same_header(self):
+        destination = 'use super::Holder;\n\nimpl Holder {\n    fn three(&self) {}\n}\n'
+        root = ROOT.replace('use std::fmt;\n', 'use std::fmt;\nmod extra;\n')
+        self.base = self.repo.commit({src('snapshots.rs'): root,
+                                      src('snapshots/extra.rs'): destination})
+        method = '    fn two(&self) -> u32 {\n        self.inner\n    }\n'
+        root = root.replace('\n' + method, '')
+        moved = destination.removesuffix('}\n') + '\n' + method + '}\n'
+        status, out = self.move(root, {src('snapshots/extra.rs'): moved})
+        self.assertEqual(status, 0, out)
+        self.assertIn('impl Holder :: fn two', out)
+        self.assertIn('-> crates/demo/src/snapshots/extra.rs:', out)
+        # Matching wrappers do not excuse an edit to the moved method's body.
+        status, out = self.move(root, {src('snapshots/extra.rs'): moved.replace('self.inner', 'self.inner + 1')})
+        self.assertEqual(status, 1, out)
+        self.assertIn('changed: impl Holder :: fn two', out)
+
     def test_inline_module_becomes_a_file_with_its_cfg_and_indentation(self):
         base = self.repo.commit({src('snapshots.rs'): ROOT + code('''
 
@@ -861,6 +878,22 @@ class UseBindingTests(unittest.TestCase):
                    'use added beside an item-level macro call:')
         self.fails(base, {**moved, 'snapshots.rs': 'mod dest;\n' + root + 'use self::z::v;\n'},
                    'use added beside an item-level macro call: use self::z::v in crate::snapshots')
+
+    def test_audited_import_free_macro_calls_allow_new_explicit_bindings(self):
+        for macro in ('thread_local! { static FLAG: u8 = 0; }\n',
+                      'crate::heap_layout_bound::fields!(Holder; value);\n'):
+            with self.subTest(macro=macro):
+                base, head = self.move_f(macro, macro + 'use crate::snapshots::x::v;\n')
+                self.passes(base, head)
+                base, head = self.move_f(macro, macro + 'use crate::snapshots::x::*;\n')
+                self.fails(base, head, 'new glob import:')
+
+    def test_unknown_macro_paths_still_reject_new_explicit_bindings(self):
+        for macro in ('unknown!();\n', 'fields!(Holder; value);\n',
+                      'other::thread_local! { static FLAG: u8 = 0; }\n'):
+            with self.subTest(macro=macro):
+                base, head = self.move_f(macro, macro + 'use crate::snapshots::x::v;\n')
+                self.fails(base, head, 'use added beside an item-level macro call:')
 
     def test_source_globs_cannot_prove_a_binding_kept_its_identity(self):
         # [regress] A source glob can inherit a newly shadowed value, prelude name or facade.

@@ -166,12 +166,18 @@ pub(super) fn leave_source_qos(slot: &mut Option<MacPlatformSignals>) {
     drop(slot.take());
     FIRST_IMPORT_QOS.set(None);
 }
-/// A spent byte budget asks only during the source's first backfill.
+/// A spent byte budget or first-read progress asks only during the source's
+/// first backfill. Progress asks only while the census is unfinished and not
+/// a routine re-census; a page that read and listed nothing new never asks.
 pub(super) fn resident_scan_requested(scan: &SourceScanResult, first_read_bootstrap: bool) -> bool {
     scan.charge_deferred
         || (scan.census_status.pending_work
             && ((scan.page_file_limit_hit && !scan.routine_recensus)
-                || (first_read_bootstrap && scan.page_byte_budget_hit)))
+                || (first_read_bootstrap && scan.page_byte_budget_hit)
+                || (first_read_bootstrap
+                    && scan.first_read_progress
+                    && !scan.routine_recensus
+                    && !scan.census_complete)))
 }
 /// Only the first-import byte-budget term earns the zero gap.
 pub(super) fn paced_reason(scan: &SourceScanResult, first_read_bootstrap: bool) -> PacedReason {

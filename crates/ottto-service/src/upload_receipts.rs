@@ -966,13 +966,6 @@ pub(crate) fn cloud_crawl_completed_date(
     .flatten())
 }
 
-/// Erase the whole cloud cache after a local revoke. An absent history file
-/// has nothing to erase and is not created.
-pub(crate) fn cloud_erase_all(state_dir: &Path) -> Result<()> {
-    with_history(state_dir, false, Store::cloud_erase_all)?;
-    Ok(())
-}
-
 fn open_history(state_dir: &Path) -> Result<Store> {
     use std::os::unix::fs::DirBuilderExt;
     let snapshots = state_dir.join("snapshots");

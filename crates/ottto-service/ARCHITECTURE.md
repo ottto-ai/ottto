@@ -104,12 +104,20 @@ file-system hint / periodic listing → select file → read new bytes from save
   only under an unrelated session elsewhere leaves its copy counted.
   The original in-folder census wait still expires on its third decision.
   An all-covered copy-only page drops its items when the session has another
-  file; own turns still publish. A selected content twin pulls at most its
-  earliest accepted main holder, and a selected holder (not history-held)
-  pulls the content twins it is that holder for, so neither file publishes
-  the session without the other. A holder is never a twin, so pulls never
-  cascade, and ordinary discovery acquires the pulled file without an extra
-  seed content read.
+  file; own turns still publish. A selected content twin pulls every live
+  overlapping census main, and a selected main file (not history-held)
+  pulls every live census content twin sharing a request hash. Ordinary discovery
+  acquires pulled files through the existing history and resident admission gates.
+  A missing overlapping twin with additional hashes or a non-Exact census holds
+  the replacement before all-copy suppression; the items stay owed without receipts.
+  A page containing only census twins also waits for every live filename
+  member of that session. The `absent_content_twin` diagnostic counts held
+  sessions; even a bound contributor hold keeps the session progress-blocking.
+  Deletion or retirement of the contributor's census hashes releases the content
+  dependency. Disjoint and missing-census twins remain outside this fence;
+  unrelated sessions sharing hashes may conservatively wait together. A twin
+  whose session main shares no request with it can wait until that main is
+  independently selected. Twin pulls can read extra overlapping copy sources.
   Money rule three selects content twins, path twins and disclosed main
   files once, using every census hash and one in-memory census walk without
   a deadline. Only a candidate sharing ids with an earlier accepted holder
@@ -232,7 +240,14 @@ Environment values are never logged or persisted.
 The status read of each source's active-session reconciliation uses the same
 helper, keyed by its cache file. Every local request builds status, so the
 parsed reconciliation is reused while the file stamp is unchanged; a reconcile
-always replaces the file, and the next read parses it again.
+always replaces the file, and the next read parses it again. Its optional
+`last_activity_at` carries the maximum parsed session activity time per source,
+including sessions without usage rows. Each new observation is filtered to at
+most five minutes after reconciliation before taking the maximum. Empty scans,
+rescans and policy-stop clears preserve it. Older caches seed it from existing
+ceiling-filtered watermarks as best-effort history: a legacy future timestamp
+can surface after the clock passes it. A rollback can drop the field and cause
+re-seeding on upgrade. This local status fact is independent of uploads.
 
 Existing resource records carry fixed command classes, child starts and per-PID
 child CPU totals; arguments, paths and command output are never included.
@@ -416,6 +431,12 @@ unknown Cargo targets, old-path strings after decoding escapes and normalizing s
 case) and print their limits: implicit log targets, panic locations, approved derives assumed
 context-free, runtime paths and `include!(env!(..))`.
 `scripts/check_source_layout.py` reports how far the tree is from the target.
+Public CI also runs `--enforce-new --base <ref>`: production `.rs` files added
+against the base anywhere in the repository must have at most 3,000 lines and
+warn above 1,500. Exact (R100) file moves count as existing files; `*_tests.rs`,
+`tests.rs` and files under `tests/` are excluded. Existing files remain report-only
+unless a rule is explicitly enabled with `--enforce`; a limits-table row cannot
+exempt a new production file from the ceiling.
 
 ## Never drop data
 
@@ -463,41 +484,63 @@ applies to bodies from then on, never retroactively.
 
 ## Codex cloud task collection
 
-`cloud_sessions` runs independently of local transcript collection and upload.
-Explicit consent binds one installation/user/organization and the
-`cloud_session_changes.v1` contract. Each due slice reads the exact grant's
-authority once through the source-scoped relay. An older backend leaves the
-collector idle; uploads never fall back to the retired protocol. Backend
-authority is checked again when accepting changes, so a remote pause during a
-slice cannot admit later uploads. Local pause/revoke closes the I/O fence and
-waits for admitted work to finish.
+`cloud_sessions` runs independently of local transcript collection and upload,
+under the same consent as local Codex sessions. There is no per-Mac grant.
+Each due slice reads the Codex activity hint once through the source-scoped
+relay, under an I/O lease. Listing runs only when the hint turns it on and
+names the `cloud_session_changes.v3` contract; anything else (listing off, an
+older server, another contract) is off and the hint is read again in 30
+minutes, or six hours when the route is missing.
+The same hint's `SnapshotUploadPolicy` decides whether titles and environment
+names are sent, and every body is stamped with it. Any 409 (listing off, a
+policy mismatch) rechecks like listing off, so a policy mismatch waits up to
+30 minutes; a 410 (contract retired) rechecks like a missing route, every six
+hours. Refusals settle nothing.
 
-The latest provider page controls head polling: five minutes for queued,
-running or unknown tasks, 30 minutes during recent local Codex filesystem
-activity, six hours otherwise. A daily crawl streams pages and retains only
-its next cursor in memory, continuing five minutes later when its slice
-budget ends. It continues across midnight without a total page/task ceiling.
-Only positive task facts are uploaded; missing tasks never imply deletion.
+The head interval lives in the collector, outside the schedule: five minutes,
+doubling after each successful head listing from which the server accepted
+nothing new, up to 24 hours. Only an `accepted` outcome resets it; a `noop`
+(another Mac already sent it, or an expired ACK) does not. A daily crawl streams
+pages and retains only its next cursor in memory, continuing five minutes later
+when its slice budget ends. It continues across midnight without a total
+page/task ceiling. Only positive task facts are uploaded; missing tasks never
+imply deletion. The supervisor wakes at least every six hours.
 
+Each task is sent as `source_session_id` = its raw Codex task `id` (the
+`task_id` alias is not read); the server keys it by (user, source, id), so
+every Mac of that user sends one head per task. A row whose id breaks the
+shared rule (1..=255 code points, no control character, no boundary
+whitespace) is skipped, never repaired, and counted; one counts-only line per
+changed count is logged, never an id. A page whose rows are all skipped this
+way still follows its cursor. An ACK settles only ids echoed byte for byte.
 The existing graph-independent upload-history SQLite connection stores only
-each task's semantic digest and acknowledged head etag, scoped to destination
-and consent epoch. Fixed expiry permits safe re-offering; the server returns
-no-op for an exact repeat even after ACK loss or restart. The cache contains no
-task payloads or raw IDs and never enters local graph load/save or receipt
-settlement. The file stays at `user_version` 1: its cloud tables are created
-if missing at open, and older builds open the file and ignore them. Cloud
-failures and retry deadlines do not change local delivery.
+each task's semantic digest (over its facts and the applied policy) and head
+etag, keyed by a local digest of the task id (so every valid id fits the key
+column and no raw id is written) and scoped to destination, organization, user
+and contract.
+Accepted and noop ACKs store the head; a rejected task or a conflict without a
+head stores none, earns no credit and is not resent until it changes. Fixed
+expiry permits safe re-offering; the server returns no-op for an exact repeat
+even after ACK loss or restart. Requests are packed under 200 tasks and the
+server's 512 KiB body ceiling. The cache contains no task payloads, titles or
+raw IDs and never enters local graph load/save or receipt settlement. The file
+stays at `user_version` 1: its cloud tables are created if missing at open, and
+older builds open the file and ignore them. Cloud failures and retry deadlines
+do not change local delivery. Every hint, provider, send and cache admission
+validates current local identity; identity changes close admission and drain
+admitted I/O before replacing account or device state. Startup removes the
+retired per-Mac grant files under `cloud_sessions/` and nothing else.
 
 ### Collector approval continuity
 
-Daily provider reporting and cloud-session approvals survive daemon updates and
-sign-ins to the same Ottto account on the same physical Mac. An enabled bound
-approval can rebind to the current relay device through its collector-specific
-`grants/{id}/rebind` endpoint, authenticated with that target device's relay token.
-The request sends the stored grant version, new scope fingerprint, live hardware
-hash and original disclosure; the server resolves the previous device. Successful
-rebind preserves the grant epoch, consent-time build, account fingerprint and
-exclusions. The local grant is replaced atomically. It never replays transcripts.
+Daily provider reporting approvals survive daemon updates and sign-ins to the
+same Ottto account on the same physical Mac. An enabled bound approval can rebind
+to the current relay device through its `grants/{id}/rebind` endpoint,
+authenticated with that target device's relay token. The request sends the
+stored grant version, new scope fingerprint, live hardware hash and original
+disclosure; the server resolves the previous device. Successful rebind preserves
+the grant epoch, consent-time build, account fingerprint and exclusions. The
+local grant is replaced atomically. It never replays transcripts.
 
 Live hardware must match the saved identity before collection and rebind. Missing
 hardware proof stops collection. A copied saved hardware identity requires an explicit
@@ -506,22 +549,6 @@ alone cannot override the hardware check. A revoked or disabled approval is neve
 Terminal refusals stop retries for that binding until the binding changes or the
 service restarts. HTTP 404 retains the stopped-binding behavior for servers that
 have not deployed rebind yet. Transport, 429 and server errors use normal polling.
-
-Cloud changes report the running build for diagnostics; approval binds the
-collection contract independently of the binary version. Each due slice reads
-`cloud-sessions/grants/{id}/authority?grant_version=N` once. Rebind accepts the
-same-epoch management DTO using `can_collect`, preserving the bound collection
-contract and provider-creation cutoff. It drops transient traversal and transport
-state, retaining the original consent's cache namespace through optional opaque
-origin fingerprints in the binding. The grant file update preserves that namespace
-atomically with the rebound identity, so unchanged tasks stay suppressed after a
-restart. Destination, owner, grant epoch, account and contract still isolate cache
-entries. A lost rebind reply does not require another rebind after revoke: trusted
-local control can reconcile the exact authenticated DELETE response against the
-current same-owner HMAC scope, leaving consent revoked. Every authority, provider,
-send and cache admission validates current local identity; identity changes close admission
-and drain admitted I/O before replacing account or device state. Older daemons
-receive disabled legacy authority and cannot upload through retired routes.
 
 ## Codex daily provider reference
 
@@ -550,3 +577,18 @@ same `collected_at`, empty batches included. The read's last covered day is alwa
 complete UTC day at that `collected_at`. `provider_daily_reference::tests::accounts` emits the
 producer fixtures in `fixtures/provider-daily-reference/`; the snapshots parity test emits the
 cross-language identity vectors.
+
+## Local health diagnostics
+
+Local health events retain only the latest observation per Upload, SetupRead and
+SnapshotSync family, per Verify source, and per ScanIndex source/reason/polarity.
+The command ledger retains the latest terminal result per action. Both lists keep
+insertion order; they are current diagnostics rather than a lifetime history in
+status/CLI JSON or uploaded health evidence. Usage, upload bodies, receipts and
+placement do not depend on this diagnostic history.
+
+Status keeps its owned snapshot; control serialization happens after the daemon
+state lock is released. Runtime observations belong only to that response;
+reprojection replaces its observation.
+ScanIndex catch-up materializes only the latest set and clear for each pair and
+advances the observed transition high-water marks even across a long polling gap.

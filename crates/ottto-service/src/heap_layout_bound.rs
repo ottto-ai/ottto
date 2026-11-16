@@ -586,6 +586,29 @@ crate::heap_layout_bound::fields!(ottto_protocol::AgentQuotaWindow; name, scope,
 mod sampled_scalar_buffer_tests {
     use super::*;
     #[test]
+    fn unsupported_layout_omits_side_parts_and_keeps_totals_unknown() {
+        struct Reset(bool);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                FORCE_UNSUPPORTED_LAYOUT.with(|flag| flag.set(self.0));
+            }
+        }
+        let _reset = Reset(FORCE_UNSUPPORTED_LAYOUT.with(|flag| flag.replace(true)));
+        let bytes = crate::snapshots::sampled_scan::SharedCache::default()
+            .retained_heap_bytes(&crate::snapshots::ScanIndex::default());
+        assert!(bytes.side_maps_parts.is_empty());
+        for field in [
+            "files_bytes",
+            "census_bytes",
+            "side_maps_bytes",
+            "accounts_identity_bytes",
+            "traversal_bytes",
+        ] {
+            assert!(bytes.totals[field].is_none(), "{field}");
+        }
+    }
+
+    #[test]
     fn sampled_completed_accounting_composes_one_diminishing_byte_budget() {
         if !layout_supported() {
             return;

@@ -369,7 +369,7 @@ impl Serialize for ScanIndex {
         field!(codex_counting_tombstones, BTreeMap::is_empty);
         field!(
             codex_counting_evicted_legacy,
-            codex_counting_version::EvictedLegacyOwners::is_empty
+            sources::codex::counting::version::EvictedLegacyOwners::is_empty
         );
         field!(upload_ack_retirement_handoff, Option::is_none);
         field!(

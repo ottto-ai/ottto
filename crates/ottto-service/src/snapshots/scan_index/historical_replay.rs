@@ -274,7 +274,7 @@ impl ScanIndex {
             let traversal_is_terminal_unhealthy = self.traversal.as_ref().is_some_and(|t| {
                 t.pending_directories.is_empty()
                     && t.pending_candidates.is_empty()
-                    && t.counts.has_errors()
+                    && t.has_errors()
             });
             if traversal_is_terminal_unhealthy {
                 self.traversal = None;

@@ -5,6 +5,41 @@ use crate::snapshots::sampled_scan::SharedCache;
 use std::time::Duration;
 
 struct Store(crate::test_scratch::ScratchDir);
+
+#[test]
+fn completed_title_facts_size_small_and_large_populated_caches() {
+    let store = Store::new();
+    let path = store.write(
+        "session.json",
+        serde_json::json!({
+            "cliSessionId": "synthetic", "title": "retained title"
+        }),
+    );
+    let stamp = SourceStamp::capture_file(&path).unwrap();
+    let fact = load_desktop_session_file_facts(&path).unwrap();
+    let owner = SharedCache::default();
+    let index = ScanIndex::default();
+    let empty = owner.retained_heap_bytes(&index).totals["desktop_title_facts_bytes"].unwrap();
+    owner.with_desktop_titles(|facts| {
+        for n in 0..1000 {
+            facts
+                .kept
+                .insert(format!("synthetic-{n}"), (stamp.clone(), fact.clone()));
+        }
+        let mut c = crate::heap_layout_bound::Counter::new(usize::MAX);
+        assert!(
+            facts.heap_bound(&mut c).is_none(),
+            "ordinary visit guard stays unchanged"
+        );
+    });
+    assert!(owner.retained_heap_bytes(&index).totals["desktop_title_facts_bytes"].unwrap() > empty);
+    owner.with_desktop_titles(|facts| {
+        facts.kept.clear();
+        facts.kept.insert("synthetic".into(), (stamp, fact));
+    });
+    assert!(owner.retained_heap_bytes(&index).totals["desktop_title_facts_bytes"].unwrap() > empty);
+}
+
 impl Store {
     fn new() -> Self {
         Self(crate::test_scratch::ScratchDir::new("desktop-reuse"))

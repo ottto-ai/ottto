@@ -337,7 +337,7 @@ fn apply_claude_reported_usage_with_index_and_rows(
     // Loaded telemetry only vetoes them.
     let file_birth_tripwire = match evidence_rows {
         ClaudeEvidenceRows::Whole(veto_api_rows) => {
-            claude_context_file_birth::ClaudeTelemetryTripwire::build(
+            sources::claude::context_file_birth::ClaudeTelemetryTripwire::build(
                 snapshots,
                 MAX_CLAUDE_TRIPWIRE_REQUESTS,
                 api_report,
@@ -350,11 +350,12 @@ fn apply_claude_reported_usage_with_index_and_rows(
         }
     };
 
-    let multi_file_members = claude_context_file_birth::claude_multi_file_members(snapshots, index);
+    let multi_file_members =
+        sources::claude::context_file_birth::claude_multi_file_members(snapshots, index);
     let mut context_file_birth = ClaudeContextFileBirthCounts::default();
     #[cfg(test)]
     let mut posture_admissions = BTreeMap::new();
-    let cache_births = claude_context_file_birth::cache_content_births(snapshots);
+    let cache_births = sources::claude::context_file_birth::cache_content_births(snapshots);
     for (item, cache_birth) in snapshots.iter_mut().zip(cache_births) {
         let root_session_id = claude_snapshot_family_root(item);
         if posture_uncertified_roots.contains(&root_session_id) {
@@ -362,11 +363,11 @@ fn apply_claude_reported_usage_with_index_and_rows(
             item.claude_file_birth_verdict = Some(ClaudeFileBirthVerdict::UnknownBirth);
         } else {
             let multi_file = multi_file_members.contains(&item.source_session_id);
-            let verdict = claude_context_file_birth::admit_claude_file_birth_posture(
+            let verdict = sources::claude::context_file_birth::admit_claude_file_birth_posture(
                 item,
                 &root_session_id,
                 &file_birth_tripwire,
-                &mut claude_context_file_birth::remembered_tripwire(),
+                &mut sources::claude::context_file_birth::remembered_tripwire(),
                 multi_file,
                 &mut context_file_birth,
             );
@@ -391,7 +392,10 @@ fn apply_claude_reported_usage_with_index_and_rows(
                 cache_wire(
                     &item.source_session_id,
                     item.cache_requests.iter().filter(|request| {
-                        claude_context_file_birth::cache_owns(birth, &request.slot.occurred_at)
+                        sources::claude::context_file_birth::cache_owns(
+                            birth,
+                            &request.slot.occurred_at,
+                        )
                     }),
                     item.cache_requests_complete,
                 )
@@ -400,7 +404,7 @@ fn apply_claude_reported_usage_with_index_and_rows(
         // the ownership fold.
         item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
     }
-    claude_context_file_birth::alarm_first_resource_withhold(&context_file_birth);
+    sources::claude::context_file_birth::alarm_first_resource_withhold(&context_file_birth);
     note_claude_reemission_stop(&context_file_birth, file_birth_tripwire.over_bound_roots());
 
     let mut disposition = ClaudeUsageAuthorityDisposition {
