@@ -2443,13 +2443,35 @@ fn e2_pipeline_orphan_branch_copy_counts_once_and_discloses() {
 /// regardless of the ACK carrier, discovery order or equal-birth tie break.
 /// An unchanged page emits nothing; growth declares the prior removal.
 fn restored_twins(reverse: bool, equal: bool) {
+    restored_twins_pinned(reverse, equal, None);
+}
+
+/// `copy_key_first`: pin the equal-birth tie (the location key order of the
+/// two paths) instead of leaving it to the scratch directory's hash.
+fn restored_twins_pinned(reverse: bool, equal: bool, copy_key_first: Option<bool>) {
     with_e2(|| {
-        let mut c = Corpus::new(&format!("e2-pipeline-restored-{reverse}-{equal}"));
+        let mut c = Corpus::new(&format!(
+            "e2-pipeline-restored-{reverse}-{equal}-{copy_key_first:?}"
+        ));
         let (a, b) = if reverse {
             ("z-original", "a-copy")
         } else {
             ("a-original", "z-copy")
         };
+        let (a, b) = match copy_key_first {
+            None => (a.to_string(), b.to_string()),
+            Some(want) => {
+                use crate::snapshots::claude_money_birth_store::location_key;
+                let key = |dir: &str| {
+                    location_key(&c.root.join(format!("{dir}/{ROOT}.jsonl")).to_string_lossy())
+                };
+                (0..256)
+                    .map(|n| (format!("{a}-{n}"), format!("{b}-{n}")))
+                    .find(|(a, b)| (key(b) < key(a)) == want)
+                    .expect("both key orders occur among 256 suffixes")
+            }
+        };
+        let (a, b) = (a.as_str(), b.as_str());
         c.write_at(
             &format!("{a}/{ROOT}.jsonl"),
             &line(ROOT, "r1", AT, 10),
@@ -2530,6 +2552,13 @@ fn e2_pipeline_restored_twins_equal_birth_forward() {
 #[test]
 fn e2_pipeline_restored_twins_equal_birth_reverse() {
     restored_twins(true, true);
+}
+/// [money] Equal births break the tie by location key: both orders count
+/// every request exactly once, whichever path carries the session.
+#[test]
+fn e2_pipeline_restored_twins_equal_birth_reverse_pinned_ties() {
+    restored_twins_pinned(true, true, Some(true));
+    restored_twins_pinned(true, true, Some(false));
 }
 
 #[test]
