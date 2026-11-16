@@ -559,7 +559,8 @@ impl ScanIndex {
             return;
         };
         self.withheld_memo.reset_absence(old);
-        let opened = claude_context_file_birth::ClaudeOpenedBirth::from_metadata(metadata);
+        let opened =
+            sources::claude::context_file_birth::ClaudeOpenedBirth::from_metadata(metadata);
         if walk.observed_index_keys.contains(old)
             || self.decode_holds_file(old)
             || self.decode_holds_file(&key)

@@ -6,6 +6,11 @@ crates/ottto-service/src/snapshots/. Each finding belongs to one rule. The
 check reports and exits 0; `--enforce <rule,...>` makes findings of those rules
 fail (exit 1). Notes never fail.
 
+`--enforce-new --base <ref>` additionally checks added production .rs files
+throughout the repository against HEAD: over 3,000 lines fails, over 1,500 warns.
+Exact (R100) renames and test files are excluded. Existing files stay report-only
+unless their rules are explicitly enforced with --enforce.
+
   size          a .rs file over 3,000 lines needs a row in
                 scripts/source_layout_limits.tsv and must stay under it. The
                 ceilings are a ratchet: against the base commit no row may rise
@@ -76,6 +81,7 @@ class Finding:
     path: str
     message: str
     note: bool = False
+    new_file: bool = False
 
 
 def line_count(data: bytes) -> int:
@@ -133,7 +139,14 @@ def is_fixture(path: str) -> bool:
 
 def is_test_file(path: str) -> bool:
     stem = posixpath.basename(path)[:-3]
-    return stem == "tests" or stem.endswith("_tests") or "tests" in inside(path).split("/")[:-1]
+    return stem == "tests" or stem.endswith("_tests") or "tests" in path.split("/")[:-1]
+
+
+def added_production_files(root: Path, base: str) -> set[str]:
+    # Detect renames before filtering paths, including moves into the snapshots tree.
+    added = rst.git(root, "diff", "--find-renames=100%", "--diff-filter=A", "--name-only", "-z",
+                    base, "HEAD", "--")
+    return {path for path in added.split("\0") if path.endswith(".rs") and not is_test_file(path)}
 
 
 def module_depth(path: str) -> int:
@@ -142,11 +155,18 @@ def module_depth(path: str) -> int:
 
 
 def check_size(root: Path, files: list[str], limits: dict[str, int], base_limits: dict[str, int] | None,
-               out: list[Finding]) -> None:
+               out: list[Finding], new_files: set[str] = frozenset()) -> None:
     for path in files:
         if not path.endswith(".rs"):
             continue
         lines = line_count((root / path).read_bytes())
+        if path in new_files:
+            if lines > MAX_LINES:
+                out.append(Finding("size", path, f"new file: {lines} lines, over {MAX_LINES}", new_file=True))
+            elif lines > NOTE_LINES:
+                out.append(Finding("size", path, f"new file: {lines} lines, over {NOTE_LINES}",
+                                   note=True, new_file=True))
+            continue
         ceiling = limits.get(path)
         if ceiling is not None:
             if lines > ceiling:
@@ -350,6 +370,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--base", help="base commit for the ratchets (default: merge-base of origin/main and HEAD, "
                                        "skipped when there is none)")
     parser.add_argument("--enforce", default="", metavar="RULE,...", help=f"fail on these rules: {', '.join(RULES)}")
+    parser.add_argument("--enforce-new", action="store_true",
+                        help="fail on added production .rs files over 3,000 lines; warn over 1,500")
     args = parser.parse_args(argv)
     root = Path(args.root)
     enforce = {rule for rule in args.enforce.split(",") if rule}
@@ -364,6 +386,9 @@ def main(argv: list[str] | None = None) -> int:
                 base = rst.default_base(root)
             except rst.SourceError:
                 base = None
+        if args.enforce_new and not base:
+            raise rst.SourceError("--enforce-new needs --base or a merge-base with origin/main")
+        new_files = added_production_files(root, base) if args.enforce_new else set()
         source = rst.DirSource(root)
         limits = limits_table((root / LIMITS).read_text(encoding="utf-8"), LIMITS)
         allowed = read_table((root / INCLUDES).read_text(encoding="utf-8"), 3, INCLUDES)
@@ -377,9 +402,9 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, rst.SourceError) as error:
         print(f"source-layout: {error}", file=sys.stderr)
         # A report never blocks a change; an enforced check does.
-        return 2 if enforce else 0
+        return 2 if enforce or args.enforce_new else 0
     findings: list[Finding] = []
-    check_size(root, files, limits, base_limits, findings)
+    check_size(root, sorted(set(files) | new_files), limits, base_limits, findings, new_files)
     check_tree(root, files, dirs, tree, findings)
     check_budget(root, files, dirs, findings)
     check_path_include(link_rows(tree, files), allowed, base_allowed, findings)
@@ -391,7 +416,7 @@ def main(argv: list[str] | None = None) -> int:
     check_isolation(files, source, findings)
     check_test_stem(named, findings)
     for finding in findings:
-        kind = "note" if finding.note else finding.rule
+        kind = ("warning" if finding.new_file else "note") if finding.note else finding.rule
         print(f"source-layout: {kind}: {finding.path}: {finding.message}")
     counts = {rule: sum(1 for f in findings if f.rule == rule and not f.note) for rule in RULES}
     notes = sum(1 for f in findings if f.note)
@@ -400,10 +425,14 @@ def main(argv: list[str] | None = None) -> int:
           + ", ".join(f"{rule} {count}" for rule, count in counts.items()) + f"; {notes} notes"
           + ("" if base else "; ratchets not compared (no base)"))
     failing = {rule: counts[rule] for rule in sorted(enforce) if counts[rule]}
+    if any(f.new_file and not f.note for f in findings):
+        print("source-layout: new production files exceed the line ceiling", file=sys.stderr)
+        return 1
     if failing:
         print(f"source-layout: enforced rules with findings: {', '.join(failing)}", file=sys.stderr)
         return 1
-    print(f"source-layout: {'enforced: ' + ', '.join(sorted(enforce)) if enforce else 'report only'}")
+    mode = 'enforced: ' + ', '.join(sorted(enforce)) if enforce else 'report only'
+    print(f"source-layout: {mode}" + ("; new production file ceiling enforced" if args.enforce_new else ""))
     return 0
 
 

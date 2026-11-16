@@ -99,10 +99,7 @@ thread_local! {
 
 /// Scaled per-tick directory budget for tests only, so a walk spans pages.
 #[cfg(test)]
-pub(in crate::snapshots) fn with_test_directory_entries<T>(
-    budget: usize,
-    run: impl FnOnce() -> T,
-) -> T {
+pub(crate) fn with_test_directory_entries<T>(budget: usize, run: impl FnOnce() -> T) -> T {
     struct Reset;
     impl Drop for Reset {
         fn drop(&mut self) {
@@ -206,7 +203,8 @@ pub(in crate::snapshots) fn advance_bounded_directory_traversal_with_budget(
         .iter()
         .any(|directory| !directory.watcher_hint);
     let mut freshness = money_freshness::WalkFold::resume(source);
-    let mut debt = g7_debt::Page::begin(source, index, &traversal, root_walk, &mut freshness);
+    let mut debt =
+        upload::freshness_debt::Page::begin(source, index, &traversal, root_walk, &mut freshness);
     // A re-listing pass (directories without census membership) only queues
     // files that need a read. Its walk problems and counts belong to the next
     // generation's first walk: it never turns this generation red or green,
@@ -410,14 +408,14 @@ pub(in crate::snapshots) fn advance_bounded_directory_traversal_with_budget(
                 &path,
                 metadata.len(),
                 modified_unix_seconds,
-                codex_fragment::Stamp::metadata(&metadata),
+                sources::codex::eof_fragment::Stamp::metadata(&metadata),
             );
             let aged = census_unix_seconds.is_some_and(|now| {
                 !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
             });
             let first_read_aged = !pending.contains_key(&path)
                 && first_read_aged(index, &path, modified_unix_seconds, census_unix_seconds);
-            let listing = g7_debt::Listing {
+            let listing = upload::freshness_debt::Listing {
                 path: &path,
                 metadata: &metadata,
                 in_window: !(aged || first_read_aged),
@@ -428,7 +426,7 @@ pub(in crate::snapshots) fn advance_bounded_directory_traversal_with_budget(
                     source,
                     &path,
                     metadata.len(),
-                    codex_fragment::Stamp::metadata(&metadata),
+                    sources::codex::eof_fragment::Stamp::metadata(&metadata),
                 );
             let requires_recovery = recovery.requires(source, &path, metadata.len());
             if !requires_recovery
@@ -701,7 +699,7 @@ pub(in crate::snapshots) fn reconcile_missing_index_entries_with_side(
                 .get(key)
                 .is_some_and(ScanIndexEntry::codex_history_is_protected)
                 || (source == SnapshotSource::Codex
-                    && !codex_counting_version::tombstone_before_retire(index, key))
+                    && !sources::codex::counting::version::tombstone_before_retire(index, key))
             {
                 index
                     .files
@@ -720,7 +718,7 @@ pub(in crate::snapshots) fn reconcile_missing_index_entries_with_side(
                 .files
                 .get(key)
                 .is_some_and(ScanIndexEntry::retain_history_evidence)
-            && codex_counting_version::tombstone_before_retire(index, key)
+            && sources::codex::counting::version::tombstone_before_retire(index, key)
         {
             index.drop_file_entry(key);
             index.file_snapshot_fingerprints.remove(key);

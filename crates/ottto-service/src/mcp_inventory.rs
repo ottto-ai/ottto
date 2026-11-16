@@ -129,6 +129,31 @@ struct ConfiguredServer {
     /// against THIS, exactly as the agent resolves them — never against the
     /// daemon's working directory, which under launchd is `/`.
     config_dir: Option<PathBuf>,
+    /// Where the agent reads the server from; policy scopes depend on it.
+    source: ServerSource,
+}
+
+/// Where Claude Code reads a configured server from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ServerSource {
+    /// A home settings file (and every non-Claude source).
+    UserSettings,
+    /// `~/.claude.json` top-level `mcpServers` (user scope).
+    User,
+    /// `~/.claude.json` `projects[<dir>].mcpServers` (local scope).
+    Local(PathBuf),
+    /// `<dir>/.mcp.json` (project scope).
+    Project(PathBuf),
+    /// Declared by the installed plugin `plugin`; the client names it
+    /// `plugin:<plugin>:<server>`.
+    Plugin { plugin: String, server: String },
+}
+
+impl ConfiguredServer {
+    fn with_source(mut self, source: ServerSource) -> Self {
+        self.source = source;
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -602,6 +627,7 @@ fn normalize_claude_server(
         transport,
         disabled: false,
         always_load: cfg.get("alwaysLoad").and_then(Value::as_bool) == Some(true),
+        source: ServerSource::UserSettings,
     })
 }
 
@@ -635,6 +661,7 @@ fn normalize_codex_server(
         transport,
         disabled: cfg.get("enabled").and_then(Value::as_bool) == Some(false),
         always_load: false,
+        source: ServerSource::UserSettings,
     })
 }
 
@@ -668,17 +695,67 @@ fn string_env(value: Option<&Value>) -> BTreeMap<String, String> {
 /// entry, where `/mcp` records its toggle (legacy key until Claude Code migrates
 /// it). Each list is an array of names or a single name.
 fn get_disabled_servers(value: &Value) -> Vec<String> {
-    let mut names = Vec::new();
-    for key in ["disabledMcpjsonServers", "disabledMcpServers"] {
-        match value.get(key) {
-            Some(Value::Array(list)) => {
-                names.extend(list.iter().filter_map(Value::as_str).map(str::to_string));
-            }
-            Some(Value::String(name)) => names.push(name.clone()),
-            _ => {}
-        }
+    ["disabledMcpjsonServers", "disabledMcpServers"]
+        .into_iter()
+        .flat_map(|key| server_names(value, key))
+        .collect()
+}
+
+/// The server names under `key`: an array of names or a single name.
+fn server_names(value: &Value, key: &str) -> Vec<String> {
+    match value.get(key) {
+        Some(Value::Array(list)) => list
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect(),
+        Some(Value::String(name)) => vec![name.clone()],
+        _ => Vec::new(),
     }
-    names
+}
+
+/// Whether Claude Code loads the server `name` from a project's `.mcp.json`.
+///
+/// It loads one only after the user trusts the project folder
+/// (`hasTrustDialogAccepted` on the project's `~/.claude.json` entry) and
+/// approves the server, by name in an `enabledMcpjsonServers` array or for
+/// every project server with `enableAllProjectMcpServers`. `approvals` holds
+/// only state kept in the user's home: the user settings files and the
+/// project's `~/.claude.json` entry. The project's own settings files
+/// (`project_settings`) never approve, but their explicit
+/// `enableAllProjectMcpServers: false`, like one in any scope, keeps
+/// enable-all off. A server that is not approved stays pending in the client
+/// and is never started.
+fn project_server_approved(
+    name: &str,
+    project_cfg: &Value,
+    approvals: &[&Value],
+    project_settings: &[Value],
+) -> bool {
+    let enable_all = |scope: &&Value| {
+        scope
+            .get("enableAllProjectMcpServers")
+            .and_then(Value::as_bool)
+    };
+    let by_name = approvals.iter().any(|scope| {
+        scope
+            .get("enabledMcpjsonServers")
+            .and_then(Value::as_array)
+            .is_some_and(|list| list.iter().any(|approved| approved.as_str() == Some(name)))
+    });
+    let all = approvals
+        .iter()
+        .any(|scope| enable_all(scope) == Some(true))
+        && !approvals
+            .iter()
+            .copied()
+            .chain(project_settings)
+            .any(|scope| enable_all(&scope) == Some(false));
+    project_cfg
+        .get("hasTrustDialogAccepted")
+        .and_then(Value::as_bool)
+        == Some(true)
+        && (by_name || all)
 }
 
 /// Extract `mcpServers` from a JSON object as a name->config map.
@@ -739,7 +816,9 @@ fn codex_plugin_declaration(plugin_dir: &Path) -> Option<(PathBuf, PathBuf)> {
 /// Reads, in precedence order (later wins, matching harvest.py):
 ///   * `~/.claude.json` top-level `mcpServers`
 ///   * `~/.claude.json` `projects[<dir>].mcpServers` for every project dir
-///   * `<project dir>/.mcp.json` `mcpServers` for every project dir
+///   * `<project dir>/.mcp.json` `mcpServers` for every project dir; a server
+///     the client has not approved for that project (see
+///     [`project_server_approved`]) is reported disabled and never started
 ///   * `~/.claude/settings.json` `mcpServers`
 ///   * `~/.claude/settings.local.json` `mcpServers`
 ///   * then servers of plugins installed in `~/.claude/plugins/installed_plugins.json`
@@ -751,13 +830,19 @@ fn codex_plugin_declaration(plugin_dir: &Path) -> Option<(PathBuf, PathBuf)> {
 /// configured server on the machine.
 fn discover_claude_code(home: &Path) -> Vec<ConfiguredServer> {
     let mut servers: BTreeMap<String, ConfiguredServer> = BTreeMap::new();
+    // Project servers awaiting approval; any loaded server of the name replaces one.
+    let mut pending = std::collections::BTreeSet::new();
+    let user_settings: Vec<Value> = claude_user_settings(home)
+        .iter()
+        .filter_map(|path| load_json(path))
+        .collect();
 
     let claude_json = load_json(&home.join(".claude.json"));
     if let Some(root) = claude_json.as_ref() {
         // Top-level mcpServers.
         for (name, cfg) in mcp_servers_block(root) {
             if let Some(server) = normalize_claude_server(name, cfg, Some(home)) {
-                servers.insert(name.clone(), server);
+                servers.insert(name.clone(), server.with_source(ServerSource::User));
             }
         }
         // Per-project mcpServers and each project's <dir>/.mcp.json.
@@ -765,18 +850,51 @@ fn discover_claude_code(home: &Path) -> Vec<ConfiguredServer> {
             for (project_dir, project_cfg) in projects {
                 for (name, cfg) in mcp_servers_block(project_cfg) {
                     if let Some(server) =
-                        normalize_claude_server(name, cfg, Some(Path::new(project_dir)))
+                        normalize_claude_server(name, cfg, Some(Path::new(project_dir))).map(
+                            |server| server.with_source(ServerSource::Local(project_dir.into())),
+                        )
                     {
+                        pending.remove(name);
                         servers.insert(name.clone(), server);
                     }
                 }
                 if let Some(dot_mcp) = load_json(&Path::new(project_dir).join(".mcp.json")) {
+                    let approvals: Vec<&Value> =
+                        user_settings.iter().chain([project_cfg]).collect();
+                    let project_settings: Vec<Value> =
+                        claude_project_settings(Path::new(project_dir))
+                            .iter()
+                            .filter_map(|path| load_json(path))
+                            .collect();
                     for (name, cfg) in mcp_servers_block(&dot_mcp) {
-                        if let Some(server) =
+                        let Some(mut server) =
                             normalize_claude_server(name, cfg, Some(Path::new(project_dir)))
+                        else {
+                            continue;
+                        };
+                        // A user or local-scope server of the same name wins.
+                        if servers.contains_key(name) && !pending.contains(name) {
+                            continue;
+                        }
+                        if project_server_approved(name, project_cfg, &approvals, &project_settings)
                         {
+                            pending.remove(name);
+                            servers.insert(name.clone(), server);
+                        } else if !servers.contains_key(name) {
+                            // Pending approval in the client: reported, not started.
+                            server.disabled = true;
+                            pending.insert(name.clone());
                             servers.insert(name.clone(), server);
                         }
+                    }
+                }
+                // Rows this project's `.mcp.json` just added are project scope.
+                let dir = Path::new(project_dir);
+                for server in servers.values_mut() {
+                    if server.source == ServerSource::UserSettings
+                        && server.config_dir.as_deref() == Some(dir)
+                    {
+                        server.source = ServerSource::Project(dir.to_path_buf());
                     }
                 }
             }
@@ -789,24 +907,19 @@ fn discover_claude_code(home: &Path) -> Vec<ConfiguredServer> {
     // counted as context cost the user is paying.
     let mut disabled_names: Vec<String> = Vec::new();
     let mut enabled_plugins: BTreeMap<String, bool> = BTreeMap::new();
-    for settings in [
-        home.join(".claude").join("settings.json"),
-        home.join(".claude").join("settings.local.json"),
-    ] {
-        if let Some(value) = load_json(&settings) {
-            for (name, cfg) in mcp_servers_block(&value) {
-                if let Some(server) = normalize_claude_server(name, cfg, Some(home)) {
-                    servers.insert(name.clone(), server);
-                }
+    for value in &user_settings {
+        for (name, cfg) in mcp_servers_block(value) {
+            if let Some(server) = normalize_claude_server(name, cfg, Some(home)) {
+                servers.insert(name.clone(), server);
             }
-            disabled_names.extend(get_disabled_servers(&value));
-            if let Some(plugins) = value.get("enabledPlugins").and_then(Value::as_object) {
-                enabled_plugins.extend(
-                    plugins
-                        .iter()
-                        .filter_map(|(id, on)| Some((id.clone(), on.as_bool()?))),
-                );
-            }
+        }
+        disabled_names.extend(get_disabled_servers(value));
+        if let Some(plugins) = value.get("enabledPlugins").and_then(Value::as_object) {
+            enabled_plugins.extend(
+                plugins
+                    .iter()
+                    .filter_map(|(id, on)| Some((id.clone(), on.as_bool()?))),
+            );
         }
     }
     // Plugin servers count only when the plugin is installed AND enabled; a
@@ -825,7 +938,8 @@ fn discover_claude_code(home: &Path) -> Vec<ConfiguredServer> {
         if enabled_plugins.get(id) != Some(&true) {
             continue;
         }
-        let prefix = format!("plugin_{}_", id.split('@').next().unwrap_or(id));
+        let plugin = id.split('@').next().unwrap_or(id);
+        let prefix = format!("plugin_{plugin}_");
         let roots = installs
             .as_array()
             .into_iter()
@@ -839,7 +953,13 @@ fn discover_claude_code(home: &Path) -> Vec<ConfiguredServer> {
                 &prefix,
                 normalize_claude_server,
             ) {
-                servers.entry(server.name.clone()).or_insert(server);
+                let source = ServerSource::Plugin {
+                    plugin: plugin.to_string(),
+                    server: server.name[prefix.len()..].to_string(),
+                };
+                servers
+                    .entry(server.name.clone())
+                    .or_insert(server.with_source(source));
             }
         }
     }
@@ -848,12 +968,7 @@ fn discover_claude_code(home: &Path) -> Vec<ConfiguredServer> {
             for (project_dir, project_cfg) in projects {
                 // No cwd here: a server off in any project is treated as off.
                 disabled_names.extend(get_disabled_servers(project_cfg));
-                for settings in [
-                    Path::new(project_dir).join(".claude").join("settings.json"),
-                    Path::new(project_dir)
-                        .join(".claude")
-                        .join("settings.local.json"),
-                ] {
+                for settings in claude_project_settings(Path::new(project_dir)) {
                     if let Some(value) = load_json(&settings) {
                         disabled_names.extend(get_disabled_servers(&value));
                     }
@@ -1026,9 +1141,34 @@ fn toml_edit_value_to_json(value: &toml_edit::Value) -> Option<Value> {
     }
 }
 
+mod managed_policy;
+
 fn discover_servers(home: &Path, source: SnapshotSource) -> Vec<ConfiguredServer> {
+    discover_servers_in(
+        home,
+        source,
+        managed_policy::claude_managed_dir().as_deref(),
+    )
+}
+
+/// Discover `source`'s servers, then veto the Claude Code servers its
+/// managed and deny policy blocks (read from `claude_managed_dir`), so they
+/// are reported disabled and never started.
+fn discover_servers_in(
+    home: &Path,
+    source: SnapshotSource,
+    claude_managed_dir: Option<&Path>,
+) -> Vec<ConfiguredServer> {
     match source {
-        SnapshotSource::ClaudeCode => discover_claude_code(home),
+        SnapshotSource::ClaudeCode => {
+            let mut servers = discover_claude_code(home);
+            let user_settings: Vec<Value> = claude_user_settings(home)
+                .iter()
+                .filter_map(|path| load_json(path))
+                .collect();
+            managed_policy::apply_claude_policy(&mut servers, &user_settings, claude_managed_dir);
+            servers
+        }
         SnapshotSource::Codex => discover_codex(home),
         SnapshotSource::Pi => Vec::new(),
     }
@@ -2388,6 +2528,7 @@ mod tests {
                 disabled: false,
                 always_load: false,
                 config_dir: None,
+                source: ServerSource::UserSettings,
                 transport: Transport::Stdio {
                     command: fixture.script.to_string_lossy().into_owned(),
                     args: Vec::new(),
@@ -2485,6 +2626,7 @@ mod tests {
             disabled: false,
             always_load: false,
             config_dir: None,
+            source: ServerSource::UserSettings,
             transport: Transport::Stdio {
                 command: fixture.script.to_string_lossy().into_owned(),
                 args: Vec::new(),
@@ -2546,6 +2688,7 @@ mod tests {
             provider: BTreeMap::new(),
         }
     }
+    include!("mcp_inventory_policy_tests.rs");
 
     #[test]
     fn claude_code_discovers_stdio_http_and_sse_across_sources() {
@@ -2759,6 +2902,7 @@ url = "https://unset.test/mcp"
     fn network_transports_are_reported_unreachable_with_no_tools() {
         let http = ConfiguredServer {
             config_dir: None,
+            source: ServerSource::UserSettings,
             name: "remote".to_string(),
             transport: Transport::Http {
                 url: "https://remote.test/mcp".to_string(),
@@ -2780,6 +2924,7 @@ url = "https://unset.test/mcp"
     fn unreachable_stdio_server_is_marked_unreachable() {
         let server = ConfiguredServer {
             config_dir: None,
+            source: ServerSource::UserSettings,
             name: "broken".to_string(),
             transport: Transport::Stdio {
                 command: "/nonexistent/ottto-mcp-binary-xyz".to_string(),
@@ -3928,6 +4073,7 @@ done
             disabled: false,
             always_load: false,
             config_dir: None,
+            source: ServerSource::UserSettings,
         };
         let env = SpawnEnv {
             path: None,
@@ -4022,4 +4168,5 @@ done
     }
     include!("mcp_inventory_version_tests.rs");
     include!("mcp_inventory_plugin_tests.rs");
+    include!("mcp_inventory_approval_tests.rs");
 }

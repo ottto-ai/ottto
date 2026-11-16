@@ -74,6 +74,7 @@ pub mod telemetry_attach;
 mod test_isolation;
 #[cfg(test)]
 mod test_scratch;
+mod tracking_confirmation;
 mod transcript_acquisition;
 mod transcript_cache;
 #[cfg(unix)]
@@ -127,7 +128,7 @@ use ottto_protocol::{
     SourceStateOwner, SourceVerificationResult, SourceVerificationStatus, StableMessage,
     StableProblemCode, DIAGNOSTICS_RETENTION_DISCLOSURE, PROTOCOL_VERSION,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -215,7 +216,7 @@ pub enum LocalApiError {
     #[error("this Mac is attached to a different setup run; open the Ottto app from Ottto")]
     SetupRunConnectionMismatch,
     #[error(
-        "cloud-session cleanup is required before changing this Mac's Ottto account or device; revoke Cloud sessions in the Ottto app and wait for confirmation, then retry"
+        "Codex cloud task listing did not stop in time to change this Mac's Ottto account or device; wait a minute, then retry"
     )]
     CloudSessionCleanupRequired,
     #[error(
@@ -292,6 +293,8 @@ struct DaemonState {
     /// `SourceHealth.reconciliation_enabled`. In-memory only (cleared on reset
     /// and restart), which the Companion tolerates as "managed by workspace".
     source_reconciliation: BTreeMap<String, bool>,
+    tracking_confirmation: tracking_confirmation::TrackingEpisodes,
+    registered_source_grants: Vec<String>,
     scan_index_health_revisions: [[u64; 3]; 3],
     /// Directory for the persisted per-source state files. `None` keeps
     /// source state purely in-memory (tests); production sets it via
@@ -361,6 +364,7 @@ impl DaemonState {
             if let Err(error) = store.save(&LocalSourceState {
                 first_seen_at: self.first_seen(source),
                 last_health,
+                tracking_confirmation: self.tracking_confirmation.saved(source).cloned(),
             }) {
                 eprintln!("failed to persist source state for {slug}: {error}");
             }
@@ -388,6 +392,8 @@ impl DaemonState {
         }
         self.source_first_seen.clear();
         self.source_reconciliation.clear();
+        self.tracking_confirmation.clear_all();
+        self.registered_source_grants.clear();
     }
 }
 
@@ -509,6 +515,8 @@ impl LocalDaemon {
                 claude_verification_auth_marker: None,
                 source_first_seen: BTreeMap::new(),
                 source_reconciliation: BTreeMap::new(),
+                tracking_confirmation: Default::default(),
+                registered_source_grants: Vec::new(),
                 scan_index_health_revisions: [[0; 3]; 3],
                 source_state_dir: None,
                 local_health_events: Vec::new(),
@@ -579,8 +587,7 @@ impl LocalDaemon {
     pub fn with_source_state_dir(self, dir: impl Into<PathBuf>) -> Self {
         let dir = dir.into();
         if let Ok(mut state) = self.inner.lock() {
-            state.source_first_seen = load_source_first_seen(&dir);
-            state.sources = load_source_health(&state, &dir);
+            load_source_state(&mut state, &dir);
             state.source_state_dir = Some(dir);
         }
         self
@@ -589,16 +596,23 @@ impl LocalDaemon {
     /// Record the most recent reconciliation policy for a source, learned by
     /// the snapshot-sync loop's activity hint. This is an internal,
     /// trusted-process call (no control token), mirroring how the local OTLP
-    /// relay updates daemon state. Best-effort: a poisoned lock is ignored.
+    /// relay updates daemon state. Keep the raw enabled flag even for a zero window.
     pub fn record_reconciliation_enabled(
         &self,
         source: SourceKind,
         enabled: bool,
+        receipt_window_days: u64,
     ) -> Result<(), LocalApiError> {
         let mut state = self.state()?;
         state
             .source_reconciliation
             .insert(source_slug(&source).to_string(), enabled);
+        if state
+            .tracking_confirmation
+            .record_policy(&source, receipt_window_days, enabled)
+        {
+            state.persist_source_state(&source);
+        }
         Ok(())
     }
 
@@ -1194,6 +1208,14 @@ impl LocalDaemon {
         &self,
         result: &SourceVerificationResult,
     ) -> Result<(), LocalApiError> {
+        self.record_verification_result_with_tracking(result, None)
+    }
+
+    pub(crate) fn record_verification_result_with_tracking(
+        &self,
+        result: &SourceVerificationResult,
+        active_smoke: Option<(u64, &str)>,
+    ) -> Result<(), LocalApiError> {
         if matches!(result.status, SourceVerificationStatus::AccountNotConnected) {
             return Ok(());
         }
@@ -1253,6 +1275,11 @@ impl LocalDaemon {
         } else {
             state.sources.push(health);
         }
+        if let Some((generation, smoke_after)) = active_smoke {
+            state
+                .tracking_confirmation
+                .confirm_smoke(result, generation, smoke_after);
+        }
         state.persist_source_state(&result.source);
         // Configuration readiness is not an end-to-end verification witness.
         // Do not append VerifyPassed/VerifyFailed for an intentionally absent transport.
@@ -1284,6 +1311,10 @@ impl LocalDaemon {
                 "current": true
             }),
         });
+        retain_latest_local_health_events(&mut state.local_health_events);
+        state
+            .command_ledger
+            .retain(|command| command.action_id != action_id);
         state.command_ledger.push(LocalHealthCommandResultV1 {
             action_id,
             idempotency_key: format!("verify:{machine_id}:{source_slug}"),
@@ -2344,9 +2375,11 @@ fn observe_scan_index_health_changes(state: &mut DaemonState) {
             if prior == *transitions {
                 continue;
             }
-            for transition in prior.saturating_add(1)..=*transitions {
-                // Real set/clear transitions alternate. Preserve BOTH when a good
-                // load follows a refusal before a client asks for status.
+            // Transitions alternate: only the newest of each polarity can
+            // survive retention. Skip older materializations, but advance the
+            // captured high-water mark below even after a long polling gap.
+            let first = prior.saturating_add(1).max(transitions.saturating_sub(1));
+            for transition in first..=*transitions {
                 let blocked = since.is_some() ^ ((*transitions - transition) % 2 != 0);
                 push_local_health_event(
                     state,
@@ -2431,7 +2464,18 @@ fn status_from_state_with_relay_finding(
         health.active_session_reconciliation =
             active_sessions::read_active_session_reconciliation(&default_support_dir(), source);
         // Read here only; row builders leave it false, so no row goes stale.
-        health.source_paused = snapshot_sync::source_paused(&default_support_dir(), source);
+        let marker = snapshot_sync::source_marker(&default_support_dir(), source);
+        health.source_paused = marker.as_deref().is_some_and(|value| value != "reconnect");
+        health.tracking_confirmation = state.tracking_confirmation.project(
+            &health.source,
+            state
+                .registered_source_grants
+                .iter()
+                .any(|slug| slug == source.api_slug())
+                && marker.is_none()
+                && health.state != SourceState::NotFound
+                && state.reconciliation_enabled(&health.source) != Some(false),
+        );
     }
     status.local_health_events = state.local_health_events.clone();
     status.command_ledger = state.command_ledger.clone();
@@ -2512,6 +2556,36 @@ fn push_local_health_event(
         action_id: None,
         payload,
     });
+    retain_latest_local_health_events(&mut state.local_health_events);
+}
+
+/// Keep family heads in their original sequence order. Scan-index diagnostics
+/// retain both set and clear witnesses for each source/reason pair.
+fn retain_latest_local_health_events(events: &mut Vec<LocalHealthEventV1>) {
+    let mut latest = BTreeMap::new();
+    for event in events.iter() {
+        let family = match event.event_type.as_str() {
+            "LocalHealthUploadSucceeded"
+            | "LocalHealthUploadFailed"
+            | "LocalHealthUploadRejectionCleared" => "Upload",
+            "SetupRunReadRejected" | "SetupRunReadRecovered" => "SetupRead",
+            "SnapshotSyncStalled" | "SnapshotSyncRecovered" => "SnapshotSync",
+            "VerifyPassed" | "VerifyFailed" => "Verify",
+            other => other,
+        };
+        let key = (
+            family,
+            (family == "Verify").then_some(event.source_id.as_deref()),
+            (family == "ScanIndexCollectionChanged").then_some((
+                event.payload["source"].as_str(),
+                event.payload["reason"].as_str(),
+                event.payload["blocked_sources"].as_u64(),
+            )),
+        );
+        latest.insert(key, event.sequence);
+    }
+    let sequences = latest.into_values().collect::<BTreeSet<_>>();
+    events.retain(|event| sequences.contains(&event.sequence));
 }
 
 /// Re-project canonical health over a status that already carries a runtime
@@ -2572,8 +2646,6 @@ fn refresh_canonical_local_health_with_started_at(
             "service_owner": status.service_owner,
         }),
     };
-    let mut events = status.local_health_events.clone();
-    events.push(runtime_event.clone());
     let runtime = runtime_identity_for_status(status, started_at, &observed_at);
     let heartbeat = runtime_heartbeat_for_status(status, &runtime, projection_revision);
     let account = local_health_account_for_status(status);
@@ -2618,7 +2690,14 @@ fn refresh_canonical_local_health_with_started_at(
     );
     keep_blocker_first_seen(&mut blockers, &observed_at, first_seen);
     let overall = local_health_overall(&blockers, &runtime, &account, &sources);
-    let evidence = events
+    // All semantic readers above consume the captured real events before
+    // replacing the response-local observation on repeated reprojection.
+    status
+        .local_health_events
+        .retain(|event| event.event_type != "MachineRuntimeObserved");
+    status.local_health_events.push(runtime_event);
+    let evidence = status
+        .local_health_events
         .iter()
         .map(|event| LocalHealthEvidenceRefV1 {
             event_id: event.event_id.clone(),
@@ -2630,7 +2709,6 @@ fn refresh_canonical_local_health_with_started_at(
         .collect::<Vec<_>>();
 
     status.runtime_heartbeat = Some(heartbeat);
-    status.local_health_events = events;
     status.canonical_health = Some(LocalMachineHealthV1 {
         schema_version: 1,
         schema_version_name: "local_machine_health.v1".to_string(),
@@ -2661,6 +2739,9 @@ fn refresh_canonical_local_health_with_started_at(
 }
 
 fn next_local_health_sequence(state: &DaemonState) -> u64 {
+    // Both append paths prune only superseded keys. The just-appended event
+    // is always newest for its key, so the global maximum is always retained.
+    // Nothing else clears these lists; max(retained) never goes backwards.
     state
         .local_health_events
         .iter()
@@ -4055,6 +4136,7 @@ fn seed_registered_sources_with_presence(
     device: Option<&LocalDeviceBinding>,
     present: impl Fn(&SourceKind) -> bool,
 ) {
+    state.registered_source_grants = device.map(|d| d.sources.clone()).unwrap_or_default();
     if state.account.state != LocalAccountState::Connected {
         return;
     }
@@ -4103,6 +4185,7 @@ fn cached_source_health(state: &DaemonState, source: SourceKind) -> SourceHealth
         plan_observations: Vec::new(),
         detected_uses: Vec::new(),
         active_session_reconciliation: None,
+        tracking_confirmation: None,
         last_seen_at: None,
         last_verified_at: None,
         problems: Vec::new(),
@@ -4122,51 +4205,36 @@ fn config_path_hint(source: &SourceKind) -> Option<&'static str> {
     }
 }
 
-/// Boot-load persisted first-seen timestamps for all sources from `dir`, keyed
-/// by source slug. Missing or unreadable files are skipped (graceful empty),
-/// matching the lenient posture of the detected-uses cache.
-fn load_source_first_seen(dir: &Path) -> BTreeMap<String, String> {
-    let mut map = BTreeMap::new();
+/// Boot-load first-seen, health and the optional Repair episode in one pass.
+/// Missing/unreadable files are skipped; mismatched health sources are ignored.
+fn load_source_state(state: &mut DaemonState, dir: &Path) {
+    state.source_first_seen.clear();
+    state.sources.clear();
     for source in [SourceKind::Codex, SourceKind::ClaudeCode, SourceKind::Pi] {
         let slug = source_slug(&source);
         let store = FileSourceStateStore::new(dir.join(source_state_file_name(slug)));
-        if let Ok(Some(LocalSourceState {
-            first_seen_at: Some(first_seen),
-            ..
-        })) = store.load()
-        {
-            map.insert(slug.to_string(), first_seen);
+        let Ok(Some(saved)) = store.load() else {
+            continue;
+        };
+        if let Some(first_seen) = saved.first_seen_at {
+            state.source_first_seen.insert(slug.to_string(), first_seen);
         }
-    }
-    map
-}
-
-/// Boot-load the most recent verification-derived source health rows. Missing
-/// or unreadable files are skipped, and rows whose persisted source does not
-/// match the file slug are ignored so a corrupt file cannot poison another
-/// source.
-fn load_source_health(state: &DaemonState, dir: &Path) -> Vec<SourceHealth> {
-    let mut sources = Vec::new();
-    for source in [SourceKind::Codex, SourceKind::ClaudeCode, SourceKind::Pi] {
-        let slug = source_slug(&source);
-        let store = FileSourceStateStore::new(dir.join(source_state_file_name(slug)));
-        let Ok(Some(LocalSourceState {
-            last_health: Some(mut health),
-            ..
-        })) = store.load()
-        else {
+        if let Some(episode) = saved.tracking_confirmation {
+            state.tracking_confirmation.restore(&source, episode);
+        }
+        let Some(mut health) = saved.last_health else {
             continue;
         };
         if health.source != source {
             continue;
         }
         normalize_persisted_source_health(state, &mut health);
-        sources.push(health);
+        state.sources.push(health);
     }
-    sources
 }
 
 fn normalize_persisted_source_health(state: &DaemonState, health: &mut SourceHealth) {
+    health.tracking_confirmation = None;
     health.descriptor = source_descriptor(&health.source);
     health.account_binding.expected_account_id =
         state.account.user.as_ref().map(|user| user.id.clone());
@@ -4507,6 +4575,7 @@ fn source_health_from_verification(
         plan_observations: Vec::new(),
         detected_uses,
         active_session_reconciliation: None,
+        tracking_confirmation: None,
         last_seen_at: result.last_received_at.clone(),
         last_verified_at: if result.source == SourceKind::Codex
             && result.message.code == "codex_local_import"
@@ -5052,6 +5121,7 @@ fn source_health_from_agent_status(
         plan_observations: snapshot.plan_observations.clone(),
         detected_uses,
         active_session_reconciliation: None,
+        tracking_confirmation: None,
         last_seen_at: Some(snapshot.captured_at.clone()),
         last_verified_at: None,
         problems,
@@ -7123,7 +7193,7 @@ mod tests {
             .record_setup_run_read_accepted(&started_while_rejected)
             .expect("late success from the earlier rejection");
         assert_eq!(setup_run_state(&daemon), LocalSetupRunState::Rejected);
-        assert_eq!(recoveries(&daemon), 1);
+        assert_eq!(recoveries(&daemon), 0);
 
         // A different terminal answer recorded after a read started is also
         // newer than that read.
@@ -7135,7 +7205,7 @@ mod tests {
             .record_setup_run_read_accepted(&before_device_rejection)
             .expect("late success before the device rejection");
         assert_eq!(setup_run_state(&daemon), LocalSetupRunState::Unknown);
-        assert_eq!(recoveries(&daemon), 1);
+        assert_eq!(recoveries(&daemon), 0);
 
         daemon
             .record_setup_run_read_accepted(&read_start(&daemon))
@@ -7153,7 +7223,7 @@ mod tests {
         assert!(!recovered.blockers.iter().any(|blocker| {
             blocker.code == "setup_run_rejected" || blocker.code == "device_credential_rejected"
         }));
-        assert_eq!(recoveries(&daemon), 2);
+        assert_eq!(recoveries(&daemon), 1);
     }
 
     #[test]
@@ -8286,6 +8356,10 @@ mod tests {
         );
     }
 
+    mod local_health_retention_tests {
+        include!("local_health_retention_tests.rs");
+    }
+
     mod scan_index_health_tests {
         use super::*;
         include!("scan_index_health_tests.rs");
@@ -8528,7 +8602,7 @@ mod tests {
         // timestamp, and surfaces the cached reconciliation policy.
         let initial = daemon().with_source_state_dir(dir.clone());
         initial
-            .record_reconciliation_enabled(SourceKind::Codex, true)
+            .record_reconciliation_enabled(SourceKind::Codex, true, 0)
             .expect("record reconciliation");
         initial
             .record_verification_result(&verified_codex("2026-05-05T10:15:00Z"))
@@ -8693,6 +8767,7 @@ mod tests {
             .save(&LocalSourceState {
                 first_seen_at: Some("2026-05-05T10:15:00Z".to_string()),
                 last_health: None,
+                tracking_confirmation: None,
             })
             .expect("seed source state");
 
@@ -8791,6 +8866,7 @@ mod tests {
             .save(&LocalSourceState {
                 first_seen_at: Some("2026-05-05T10:15:00Z".to_string()),
                 last_health: None,
+                tracking_confirmation: None,
             })
             .expect("seed source state");
 
@@ -9157,7 +9233,7 @@ mod tests {
     fn personal_meter_local_snapshot_uses_local_evidence_not_totals() {
         let daemon = daemon();
         daemon
-            .record_reconciliation_enabled(SourceKind::Codex, true)
+            .record_reconciliation_enabled(SourceKind::Codex, true, 30)
             .expect("record reconciliation");
         let mut snapshot = available_agent_status(SourceKind::Codex, "2026-05-05T10:20:00Z");
         snapshot.account = Some(ottto_protocol::AgentAccountStatus {
@@ -9418,6 +9494,145 @@ mod tests {
         snapshot
     }
 
+    mod tracking_confirmation_tests {
+        use super::*;
+
+        #[test]
+        #[serial]
+        fn tracking_status_omits_inapplicable_episodes_without_mutating_saved_state() {
+            let root = crate::test_scratch::private_dir("tracking-status-applicability");
+            let _support = TestEnvVar::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
+            let daemon = daemon();
+            let source = SourceKind::Codex;
+            let mut state = daemon.state().unwrap();
+            state.sources = vec![codex_health()];
+            assert!(serde_json::to_value(&state.sources[0])
+                .unwrap()
+                .get("tracking_confirmation")
+                .is_none());
+            state
+                .tracking_confirmation
+                .arm(&source, "2026-11-15T10:00:00Z".into(), true);
+            assert!(
+                status_from_state_with_relay_finding(&mut state, None).sources[0]
+                    .tracking_confirmation
+                    .is_none()
+            );
+            state.registered_source_grants = vec!["codex".into()];
+            assert!(
+                status_from_state_with_relay_finding(&mut state, None).sources[0]
+                    .tracking_confirmation
+                    .is_some()
+            );
+            state.source_reconciliation.insert("codex".into(), false);
+            assert!(
+                status_from_state_with_relay_finding(&mut state, None).sources[0]
+                    .tracking_confirmation
+                    .is_none()
+            );
+            state.source_reconciliation.clear();
+            state.sources[0].config.discovered = false;
+            assert!(
+                status_from_state_with_relay_finding(&mut state, None).sources[0]
+                    .tracking_confirmation
+                    .is_some(),
+                "config discovery is not installation; sources without config still confirm"
+            );
+            state.sources[0].config.discovered = true; // historical config is not installation
+            state.sources[0].state = SourceState::NotFound;
+            assert!(
+                status_from_state_with_relay_finding(&mut state, None).sources[0]
+                    .tracking_confirmation
+                    .is_none()
+            );
+            state.sources[0].state = SourceState::Healthy;
+            crate::snapshot_sync::disable_snapshot_source(&root, snapshots::SnapshotSource::Codex)
+                .unwrap();
+            assert!(
+                status_from_state_with_relay_finding(&mut state, None).sources[0]
+                    .tracking_confirmation
+                    .is_none()
+            );
+            assert!(
+                state.tracking_confirmation.saved(&source).is_some(),
+                "status is read-only"
+            );
+            assert!(state.sources[0].tracking_confirmation.is_none());
+            drop(state);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        #[serial]
+        fn passive_verification_cannot_confirm_but_active_smoke_can_and_episode_restarts() {
+            let root = crate::test_scratch::private_dir("tracking-episode-restart");
+            let _support = TestEnvVar::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
+            let daemon = daemon().with_source_state_dir(root.join("sources"));
+            let since = "2026-11-15T10:00:00Z";
+            daemon.state().unwrap().registered_source_grants =
+                vec!["pi".into(), "codex".into(), "claude_code".into()];
+            for source in [SourceKind::Pi, SourceKind::Codex, SourceKind::ClaudeCode] {
+                daemon
+                    .state()
+                    .unwrap()
+                    .tracking_confirmation
+                    .arm(&source, since.into(), true);
+                let mut result = verified_codex("2026-11-15T10:01:00Z");
+                result.source = source.clone();
+                // Same empty config returned by Pi verification, including absent path/fingerprint.
+                result.config = SourceConfigState {
+                    discovered: false,
+                    path_hint: None,
+                    fingerprint: None,
+                    drift: Vec::new(),
+                };
+                result.smoke_after = Some(since.into()); // passive paths also populate this
+                daemon.record_verification_result(&result).unwrap();
+                assert!(daemon.tracking_episode(&source).is_some());
+                assert!(daemon
+                    .status(TOKEN)
+                    .unwrap()
+                    .sources
+                    .iter()
+                    .find(|health| health.source == source)
+                    .unwrap()
+                    .tracking_confirmation
+                    .is_some());
+                if source == SourceKind::ClaudeCode {
+                    let (generation, _) = daemon.tracking_episode(&source).unwrap();
+                    daemon
+                        .record_verification_result_with_tracking(
+                            &result,
+                            Some((generation, since)),
+                        )
+                        .unwrap();
+                    assert!(daemon.tracking_episode(&source).is_none());
+                }
+            }
+            let restarted = super::daemon().with_source_state_dir(root.join("sources"));
+            assert!(restarted.tracking_episode(&SourceKind::Pi).is_some());
+            assert!(restarted.tracking_episode(&SourceKind::Codex).is_some());
+            let state = restarted.state().unwrap();
+            assert_eq!(
+                state
+                    .tracking_confirmation
+                    .saved(&SourceKind::ClaudeCode)
+                    .unwrap()
+                    .confirmed_at
+                    .as_deref(),
+                Some("2026-11-15T10:01:00Z")
+            );
+            assert!(state
+                .sources
+                .iter()
+                .all(|health| health.tracking_confirmation.is_none()));
+            drop(state);
+            restarted.state().unwrap().clear_source_state();
+            assert!(restarted.tracking_episode(&SourceKind::Pi).is_none());
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
     fn verified_codex(last_received_at: &str) -> SourceVerificationResult {
         SourceVerificationResult {
             source: SourceKind::Codex,
@@ -9512,6 +9727,7 @@ mod tests {
             plan_observations: Vec::new(),
             detected_uses: Vec::new(),
             active_session_reconciliation: None,
+            tracking_confirmation: None,
             last_seen_at: Some("2026-05-05T09:09:00Z".to_string()),
             last_verified_at: Some("2026-05-05T09:09:30Z".to_string()),
             problems: Vec::new(),

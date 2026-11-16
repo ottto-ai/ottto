@@ -43,7 +43,7 @@ pub(crate) fn finished(source: SnapshotSource, uploaded: u64, paced: bool) {
     })
     .unwrap();
     if paced {
-        continuation::request_resident_scan(source);
+        continuation::request_resident_scan(source, false);
     }
 }
 pub(crate) struct Switch(ClaudeAccountSwitchProbe);

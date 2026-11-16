@@ -4482,7 +4482,7 @@ const SPAWN_PARENT: &str = "01a0c0de-5e24-7f10-8a93-a0c1968d8a3a";
 /// `forked_from_id` (copied-history evidence that keeps it held).
 struct CreatedThreadHome {
     // These lineage controls count Legacy: their owning header predates this epoch.
-    _cutover: codex_counting_version::TestCutover,
+    _cutover: sources::codex::counting::version::TestCutover,
     fixture: ScanRoot,
     path: PathBuf,
     body: Vec<Vec<u8>>,
@@ -4573,7 +4573,7 @@ impl CreatedThreadHome {
         let path = fixture.root.join(format!("rollout-{CREATED}.jsonl"));
         fs::write(&path, body[..written].concat()).unwrap();
         let home = Self {
-            _cutover: codex_counting_version::TestCutover::set(base_ms + 1),
+            _cutover: sources::codex::counting::version::TestCutover::set(base_ms + 1),
             fixture,
             path,
             body,
@@ -6928,6 +6928,42 @@ fn paced_defer_is_pending_not_waiter_not_fenced() {
             })
             .flatten();
         assert_eq!(accelerated, Some(true), "{now:?}");
+    });
+}
+
+/// [regress] A census member deferred behind another rotation waiter stays
+/// owed page after page and is never first-read progress (a stuck tail).
+#[test]
+fn rotation_deferred_member_is_not_first_read_progress() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(80);
+    let path = fixture.file(SESSION);
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 1024, 64, || {
+        let ahead = rotation_key("cursor-fixture", "/ahead");
+        cache
+            .with_cursor(|cursor| cursor.rotation.wait(&ahead))
+            .unwrap();
+        let mut index = ScanIndex::default();
+        for page_number in 0..2 {
+            let (next, scan) = page(&fixture, index, Some(Arc::clone(&cache)));
+            index = next;
+            assert!(
+                pending_hint(&index, &path).is_some(),
+                "{}",
+                counters(&cache)
+            );
+            assert!(scan.census_status.pending_work, "page {page_number}");
+            assert!(!scan.first_read_progress, "page {page_number}");
+            assert!(!scan.page_byte_budget_hit, "page {page_number}");
+        }
+        assert!(
+            counter(&cache, |c| c.deferred_rotation) >= 2,
+            "{}",
+            counters(&cache)
+        );
     });
 }
 

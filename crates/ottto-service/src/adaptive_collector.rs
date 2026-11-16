@@ -77,6 +77,8 @@ pub struct ContinuationPacing {
 struct ContinuationRequest {
     finished_at: Instant,
     work: Duration,
+    /// A paced request made during the source's first import (RAM-only).
+    first_import: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -241,25 +243,39 @@ impl SourceCadence {
     /// Returns whether the request stands; a disabled source takes none.
     pub fn request_continuation(&mut self, finished_at: Instant, work: Duration) -> bool {
         self.ordinary_pacing = None;
-        self.continuation = (!self.disabled).then_some(ContinuationRequest { finished_at, work });
+        self.continuation = (!self.disabled).then_some(ContinuationRequest {
+            finished_at,
+            work,
+            first_import: false,
+        });
         self.continuation.is_some()
     }
 
     /// Reuse the continuation request to bring the next ordinary scan forward.
     /// It still prepares, saves and moves the ordinary clock on success.
+    /// `first_import` rides on this request only and ends with it.
     pub fn request_paced_scan(
         &mut self,
         finished_at: Instant,
         work: Duration,
         pacing: ContinuationPacing,
+        first_import: bool,
     ) -> bool {
         let requested = self.request_continuation(finished_at, work);
         self.ordinary_pacing = requested.then_some(pacing);
+        if let Some(request) = self.continuation.as_mut() {
+            request.first_import = first_import;
+        }
         requested
     }
 
     pub fn paced_scan_due(&self) -> Option<Instant> {
         self.due_with_pacing(self.ordinary_pacing?)
+    }
+
+    /// Whether the pending paced request was made during the first import.
+    pub fn paced_first_import(&self) -> bool {
+        self.ordinary_pacing.is_some() && self.continuation.is_some_and(|r| r.first_import)
     }
 
     pub fn clear_cursor_continuation(&mut self) {

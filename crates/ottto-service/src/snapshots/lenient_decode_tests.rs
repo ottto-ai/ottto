@@ -3511,7 +3511,10 @@ fn legacy_nested_positional_traversal_counts_keep_their_original_slots() {
         let counts = &loaded.traversal.as_ref().unwrap().counts;
         assert_eq!(serde_json::to_value(counts).unwrap(), expected);
         assert_eq!(counts.discovered_file_count, 7);
-        assert_eq!(counts.has_retryable_problems(), full);
+        assert_eq!(
+            loaded.traversal.as_ref().unwrap().has_retryable_problems(),
+            full
+        );
         loaded
             .save(&path)
             .expect("legacy checkpoint can still CAS-save");
