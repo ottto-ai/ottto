@@ -132,6 +132,52 @@ fn page_observed_hinted(
     file_limit: usize,
     codex_slots: &[(String, String, usize)],
     hints: &[PathBuf],
+    observe: impl FnMut(&mut OwnedSourceScan),
+) -> (ScanIndex, SourceScanResult, Delivered, u64, Vec<Value>) {
+    page_observed_hinted_at(
+        roots,
+        index,
+        cache,
+        file_limit,
+        codex_slots,
+        hints,
+        NOW,
+        observe,
+    )
+}
+/// `page_observed_with_limit` collected at `at`, e.g. a later generation.
+fn page_observed_at(
+    roots: &[PathBuf],
+    index: ScanIndex,
+    cache: Arc<sampled_scan::SharedCache>,
+    file_limit: usize,
+    codex_slots: &[(String, String, usize)],
+    at: &str,
+    observe: impl FnMut(&mut OwnedSourceScan),
+) -> (ScanIndex, SourceScanResult, Delivered, u64, Vec<Value>) {
+    page_observed_hinted_at(
+        roots,
+        index,
+        cache,
+        file_limit,
+        codex_slots,
+        &[],
+        at,
+        observe,
+    )
+}
+#[expect(
+    clippy::too_many_arguments,
+    reason = "roots, store, cache, page limit, slots, hints, clock and observer"
+)]
+fn page_observed_hinted_at(
+    roots: &[PathBuf],
+    index: ScanIndex,
+    cache: Arc<sampled_scan::SharedCache>,
+    file_limit: usize,
+    codex_slots: &[(String, String, usize)],
+    hints: &[PathBuf],
+    at: &str,
     mut observe: impl FnMut(&mut OwnedSourceScan),
 ) -> (ScanIndex, SourceScanResult, Delivered, u64, Vec<Value>) {
     let delivered = Delivered::default();
@@ -142,7 +188,7 @@ fn page_observed_hinted(
                 SnapshotSource::Codex,
                 roots,
                 index,
-                NOW,
+                at,
                 BACKFILL_WINDOW_DAYS,
                 file_limit,
                 None,
@@ -2840,4 +2886,9 @@ fn spare_fresh_page_capacity_preserves_money_and_quiet_restart() {
 mod sidecar_reuse_transition {
     use super::*;
     include!("sources/codex/sidecar/reuse_transition.rs");
+}
+
+mod removed_root_transition {
+    use super::*;
+    include!("discovery/removed_root_transition.rs");
 }
