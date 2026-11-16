@@ -399,7 +399,7 @@ fn forced_verified_twin_reuses_certified_tail_and_restarts() {
                 };
                 let start = if native { 0 } else { sealed };
                 f.assert_read(&f.owner, "RAM", mode, start);
-                let holder_start = f
+                let (holder_mode, holder_start) = f
                     .owner
                     .acquisitions
                     .lock()
@@ -407,8 +407,8 @@ fn forced_verified_twin_reuses_certified_tail_and_restarts() {
                     .iter()
                     .rev()
                     .find(|read| read.path == f.holder)
-                    .unwrap()
-                    .start;
+                    .map(|read| (read.mode, read.start))
+                    .unwrap();
                 let twin_bytes = match mode {
                     ReadMode::Full(_) => std::fs::metadata(&f.twin).unwrap().len(),
                     ReadMode::Tail => suffix.len() as u64,
@@ -427,8 +427,17 @@ fn forced_verified_twin_reuses_certified_tail_and_restarts() {
                     * (sealed.min(crate::transcript_acquisition::SAMPLE_BYTES as u64)
                         + holder_start.min(crate::transcript_acquisition::SAMPLE_BYTES as u64));
                 if round == 0 {
+                    // Restoring both heads probes their certificates. The grown
+                    // holder's Tail acquisition then checks its two windows again;
+                    // the Unchanged twin needs no additional acquisition samples.
+                    let holder_guards = if holder_mode == ReadMode::Tail {
+                        2 * holder_start.min(crate::transcript_acquisition::SAMPLE_BYTES as u64)
+                    } else {
+                        0
+                    };
                     assert_eq!(
-                        sample_bytes as u64, restored_samples,
+                        sample_bytes as u64,
+                        restored_samples + holder_guards,
                         "unchanged certificate probes"
                     );
                 } else if !native {
