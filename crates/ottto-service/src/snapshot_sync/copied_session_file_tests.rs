@@ -867,7 +867,14 @@ fn held_content_twin_holder_proves_no_copy_until_released() {
             acquired_twin |= scanner.paths().contains(&twin);
             let quiet = !scanner.paths().contains(&main) && !scanner.paths().contains(&copy);
             page.enrich(&c);
-            if let Some(root) = body(&page, ROOT) {
+            // A page that has not acquired T yet still holds ROOT: its held
+            // items stay on the page but are never sent.
+            let held = page
+                .disposition
+                .quarantined_fingerprints(&page.scan.snapshots);
+            if let Some(root) =
+                body(&page, ROOT).filter(|root| !held.contains(&root.snapshot_fingerprint))
+            {
                 assert_eq!(root.request_count, 3, "ROOT counts A/X/Y");
                 saw_root = true;
             }
