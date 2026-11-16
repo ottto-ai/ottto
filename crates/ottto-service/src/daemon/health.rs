@@ -664,7 +664,7 @@ pub(crate) enum LatestLocalHealthUpload {
     ContractRejected { observed_at: String },
 }
 
-fn latest_local_health_upload(status: &DaemonStatus) -> Option<LatestLocalHealthUpload> {
+pub(crate) fn latest_local_health_upload(status: &DaemonStatus) -> Option<LatestLocalHealthUpload> {
     latest_local_health_upload_in(&status.local_health_events)
 }
 
@@ -1063,7 +1063,7 @@ fn stable_problem_code_slug(code: &StableProblemCode) -> &'static str {
     }
 }
 
-fn local_health_problem_code_slug(problem: &HealthProblem) -> &'static str {
+pub(crate) fn local_health_problem_code_slug(problem: &HealthProblem) -> &'static str {
     if claude_shell_telemetry::is_problem(problem) {
         return claude_shell_telemetry::CODE;
     }

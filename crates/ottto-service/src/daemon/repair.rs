@@ -22,6 +22,7 @@ use ottto_core::KeychainSecretStore;
 use ottto_core::RedactionPolicy;
 use ottto_core::OTTTO_KEYCHAIN_ACCOUNT;
 use ottto_core::OTTTO_RELAY_DEVICE_SECRET_ACCOUNT;
+use ottto_core::OTTTO_SERVICE_BINARY_NAME;
 use ottto_core::OTTTO_SETUP_RUN_TOKEN_ACCOUNT;
 use ottto_protocol::DaemonRuntimeState;
 use ottto_protocol::DiagnosticsBundle;

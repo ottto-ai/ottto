@@ -89,20 +89,23 @@ pub use local_resource_diagnostics::{log_startup_resources, rotate_service_log_a
 
 #[cfg(unix)]
 pub use local_state_sweep::{run_local_state_sweep_command, sweep_local_state_at_startup};
+use ottto_core::compiled_release_version;
 #[cfg(unix)]
 pub use ottto_core::state_dir_lock;
 mod daemon;
 mod source_health;
 
-#[cfg(test)]
-use daemon::health::blocker;
 use daemon::health::clear_local_health_upload_auth_rejection;
 use daemon::health::clear_setup_run_read_rejection;
 pub use daemon::health::current_rfc3339_timestamp;
 #[cfg(test)]
+pub(crate) use daemon::health::latest_local_health_upload;
+#[cfg(test)]
 use daemon::health::latest_local_health_upload_in;
 #[cfg(test)]
 use daemon::health::latest_setup_run_read_rejection;
+#[cfg(test)]
+pub(crate) use daemon::health::local_health_problem_code_slug;
 use daemon::health::next_local_health_sequence;
 use daemon::health::problem_detail_is_usage_limited;
 use daemon::health::push_local_health_event;
@@ -141,6 +144,7 @@ pub use daemon::status::personal_meter_local_snapshot_from_status;
 use daemon::status::projected_scan_index_refusal;
 #[cfg(test)]
 use daemon::status::status_from_state_with_relay_finding;
+#[cfg(test)]
 pub(crate) use daemon::status::ACCOUNT_RECONNECT_REQUIRED_MESSAGE_CODE;
 use daemon::verification::claude_connected_health;
 use daemon::verification::has_verification_failure_problem;
