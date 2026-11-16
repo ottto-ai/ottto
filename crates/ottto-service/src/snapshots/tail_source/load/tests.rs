@@ -196,7 +196,18 @@ fn a_quiet_restart_is_unchanged() {
 fn damaged_or_missing_state_is_a_counted_reconstruction() {
     let mut route = route();
     type Damage = fn(&mut StagedFile);
-    let cases: [(&str, Damage, &str); 3] = [
+    let cases: [(&str, Damage, &str); 5] = [
+        (
+            "corrupt-head.jsonl",
+            |staged| staged.head = vec![0],
+            "corrupt",
+        ),
+        // HeadIdentity starts with its raw 32-byte binding digest.
+        (
+            "wrong-identity.jsonl",
+            |staged| staged.head[0] ^= 1,
+            "identity",
+        ),
         (
             "corrupt.jsonl",
             |staged| {

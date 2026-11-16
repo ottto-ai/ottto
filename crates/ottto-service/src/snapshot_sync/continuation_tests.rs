@@ -1581,6 +1581,334 @@ fn first_read_byte_pacing_stops_when_backfill_completes() {
     std::fs::remove_dir_all(home).unwrap();
 }
 
+/// [behaviour] First-read progress asks for pacing with queued work only
+/// during a first backfill, while the census is unfinished and the pass is not
+/// a routine re-census. The charge, file-limit and byte-budget terms keep their
+/// own rules, and a routine pass ignores progress.
+#[test]
+fn first_read_progress_pages_pace_only_during_a_first_backfill() {
+    let mut scan = empty_scan();
+    for bits in 0..=u8::MAX {
+        let [bootstrap, pending, progress, byte_hit, file_hit, routine, charge, complete] =
+            [1, 2, 4, 8, 16, 32, 64, 128].map(|bit| bits & bit != 0);
+        scan.census_status.pending_work = pending;
+        scan.first_read_progress = progress;
+        scan.page_byte_budget_hit = byte_hit;
+        scan.page_file_limit_hit = file_hit;
+        scan.routine_recensus = routine;
+        scan.charge_deferred = charge;
+        scan.census_complete = complete;
+        let existing = charge || (pending && ((file_hit && !routine) || (bootstrap && byte_hit)));
+        let progress_term = bootstrap && pending && progress && !routine && !complete;
+        let requested = resident_scan_requested(&scan, bootstrap);
+        assert_eq!(requested, existing || progress_term, "{bits:08b}");
+        if !bootstrap {
+            scan.first_read_progress = !progress;
+            assert_eq!(
+                resident_scan_requested(&scan, false),
+                requested,
+                "{bits:08b}"
+            );
+        }
+    }
+    // The read that completes the census, with non-member work still queued,
+    // asks for no further paced pass.
+    let mut scan = empty_scan();
+    (scan.census_status.pending_work, scan.first_read_progress) = (true, true);
+    scan.census_complete = true;
+    assert!(!resident_scan_requested(&scan, true));
+}
+
+/// One valid synthetic transcript of `source` in `dir`, numbered `n`.
+fn first_read_file(source: SnapshotSource, dir: &Path, n: u64) -> PathBuf {
+    std::fs::create_dir_all(dir).unwrap();
+    match source {
+        SnapshotSource::Codex => codex_rollouts(dir, n, 1).remove(0),
+        SnapshotSource::ClaudeCode => {
+            let session = format!("a0000000-0000-4000-8000-{n:012}");
+            let path = dir.join(format!("{session}.jsonl"));
+            std::fs::write(&path, claude_line(&session, n)).unwrap();
+            path
+        }
+        SnapshotSource::Pi => {
+            let path = dir.join(format!("session-{n}.jsonl"));
+            std::fs::write(&path, pi_line(n)).unwrap();
+            path
+        }
+    }
+}
+
+fn claude_line(session: &str, n: u64) -> String {
+    let line = serde_json::json!({"type": "assistant", "version": "2.1.309",
+        "sessionId": session, "timestamp": "2026-08-02T07:00:00Z",
+        "requestId": format!("request-{n}"), "message": {"id": format!("message-{n}"),
+        "model": "claude-haiku-4-5", "usage": {"input_tokens": 10, "output_tokens": 1}}});
+    format!("{line}\n")
+}
+
+fn pi_line(n: u64) -> String {
+    let line = serde_json::json!({"type": "message_end", "message": {"model": "gpt-5.4",
+        "timestamp": 1_793_088_001_000_u64 + n, "usage": {"input": 1, "output": 1}}});
+    format!("{line}\n")
+}
+
+/// A fresh index; Claude also loads its (empty) re-emission exclusions.
+fn first_read_index(source: SnapshotSource, home: &Path) -> ScanIndex {
+    let mut index = ScanIndex::default();
+    if source == SnapshotSource::ClaudeCode {
+        crate::snapshots::e2_pipeline_scan_fixture::write_exclusions(home, &[]);
+        index.load_claude_reemission_exclusions(home);
+    }
+    index
+}
+
+/// The scan root of `source` under `home`.
+fn first_read_root(source: SnapshotSource, home: &Path) -> PathBuf {
+    home.join(match source {
+        SnapshotSource::ClaudeCode => ".claude/projects",
+        SnapshotSource::Codex => ".codex/sessions",
+        SnapshotSource::Pi => ".pi/agent/sessions",
+    })
+}
+
+/// One page of `source` over `root`: Claude through its own scan seam.
+#[expect(clippy::too_many_arguments, reason = "test helper, 8 page inputs")]
+fn first_read_page(
+    scanner: &crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture,
+    source: SnapshotSource,
+    root: &Path,
+    home: &Path,
+    index: ScanIndex,
+    limit: usize,
+    sampled: bool,
+    hints: &[PathBuf],
+) -> (ScanIndex, SourceScanResult) {
+    let roots = [root.to_path_buf()];
+    let (index, scan, _) = if source == SnapshotSource::ClaudeCode {
+        let births = std::collections::BTreeMap::new();
+        scanner.scan(&roots, home, index, limit, sampled, &births, hints)
+    } else {
+        scanner.scan_other_page(source, &roots, home, index, sampled, limit, hints)
+    };
+    (index, scan)
+}
+
+/// [behaviour] During a first backfill, listing ticks and small-file pages
+/// ask for paced passes although they fill no file allowance and spend no
+/// byte budget. A page that reads nothing new and finishes its listing asks
+/// for nothing, and once the backfill is marked complete no page asks.
+#[test]
+fn first_read_progress_paces_first_import_listing_and_small_file_pages() {
+    use super::super::backfill_replay_pending;
+    use crate::backfill::{
+        bootstrap_pending_for_destination, mark_backfill_complete_for_destination, BackfillState,
+    };
+    use crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture;
+    use crate::snapshots::with_test_directory_entries;
+    const DESTINATION: &str = "first-read-progress-destination";
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        let bootstrap = |state: &BackfillState| {
+            backfill_replay_pending(source, state, DESTINATION)
+                && bootstrap_pending_for_destination(state, source, DESTINATION)
+        };
+        let home = crate::test_scratch::private_dir("first-read-progress")
+            .canonicalize()
+            .unwrap();
+        let root = first_read_root(source, &home);
+        // Codex rollouts sit in their file date's day directory.
+        let dirs: &[&str] = match source {
+            SnapshotSource::ClaudeCode => &["project-a", "project-b"],
+            SnapshotSource::Codex => &["2026/10/24"],
+            SnapshotSource::Pi => &["2026/10/23", "2026/10/24"],
+        };
+        for (d, dir) in (0_u64..).zip(dirs) {
+            for n in 0..2 {
+                first_read_file(source, &root.join(dir), d * 10 + n);
+            }
+        }
+        let scanner = E2ScanFixture::default();
+        let page =
+            |index, limit| first_read_page(&scanner, source, &root, &home, index, limit, true, &[]);
+        let mut state = BackfillState::default();
+        assert!(bootstrap(&state), "{source:?}");
+        // Walk one directory per tick until the census completes.
+        let walk = |state: &BackfillState| {
+            with_test_directory_entries(1, || {
+                let mut index = first_read_index(source, &home);
+                let (mut listing, mut reading) = (0, 0);
+                for _ in 0..32 {
+                    let (next, scan) = page(index, 100);
+                    index = next;
+                    let pending = scan.census_status.pending_work;
+                    assert!(
+                        !scan.page_file_limit_hit && !scan.page_byte_budget_hit,
+                        "{source:?}"
+                    );
+                    assert!(!scan.charge_deferred, "{source:?}");
+                    assert!(!resident_scan_requested(&scan, false), "{source:?}");
+                    assert_eq!(
+                        resident_scan_requested(&scan, bootstrap(state)),
+                        bootstrap(state)
+                            && pending
+                            && scan.first_read_progress
+                            && !scan.routine_recensus
+                            && !scan.census_complete,
+                        "{source:?}"
+                    );
+                    if pending && scan.first_read_progress {
+                        if scan.scanned_file_count == 0 {
+                            listing += 1;
+                        } else {
+                            reading += 1;
+                        }
+                    }
+                    if scan.census_complete {
+                        return (listing, reading);
+                    }
+                }
+                panic!("{source:?} census did not complete");
+            })
+        };
+        let (listing, reading) = walk(&state);
+        assert!(listing > 0, "{source:?}: listing ticks ask");
+        if source != SnapshotSource::Codex {
+            assert!(reading > 0, "{source:?}: small-file pages ask");
+        }
+
+        // One full listing tick and no selection: queued work, no progress.
+        let (index, stuck) = page(first_read_index(source, &home), 0);
+        assert!(stuck.census_status.pending_work, "{source:?}");
+        assert_eq!(stuck.scanned_file_count, 0, "{source:?}");
+        assert!(!stuck.first_read_progress, "{source:?}");
+        assert!(!resident_scan_requested(&stuck, bootstrap(&state)));
+        let (index, stuck) = page(index, 0);
+        assert!(stuck.census_status.pending_work && !stuck.first_read_progress);
+        assert!(!resident_scan_requested(&stuck, bootstrap(&state)));
+        // Reading the new census members is progress, even after listing ends.
+        let (_, read) = page(index, 100);
+        assert!(read.scanned_file_count > 0 && read.first_read_progress);
+
+        mark_backfill_complete_for_destination(&mut state, source, DESTINATION);
+        assert!(!bootstrap(&state), "{source:?}");
+        let (listing, _) = walk(&state);
+        assert!(listing > 0, "{source:?}: progress without a first backfill");
+        std::fs::remove_dir_all(home).unwrap();
+    }
+}
+
+/// [behaviour] A Codex freshness page reads up to 256 hinted first-read files,
+/// fills no file allowance and spends no byte budget, yet asks for a paced
+/// pass during a first backfill while census work stays queued.
+#[test]
+fn codex_small_file_pages_pace_during_a_first_import() {
+    use crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture;
+    let home = crate::test_scratch::private_dir("codex-small-file-pacing")
+        .canonicalize()
+        .unwrap();
+    let root = first_read_root(SnapshotSource::Codex, &home);
+    std::fs::create_dir_all(&root).unwrap();
+    let hints = codex_rollouts(&root, 0, 300);
+    let scanner = E2ScanFixture::default();
+    let (mut index, mut asked, mut complete) = (ScanIndex::default(), 0, false);
+    for page in 0..8 {
+        let hinted: &[PathBuf] = if page == 0 { &hints } else { &[] };
+        let codex = SnapshotSource::Codex;
+        let (next, scan) = first_read_page(&scanner, codex, &root, &home, index, 280, true, hinted);
+        index = next;
+        if scan.scanned_file_count > 0
+            && scan.census_status.pending_work
+            && !scan.page_file_limit_hit
+            && !scan.page_byte_budget_hit
+            && !scan.charge_deferred
+            && !scan.census_complete
+        {
+            assert!(scan.first_read_progress, "page {page}");
+            assert!(resident_scan_requested(&scan, true), "page {page}");
+            assert!(!resident_scan_requested(&scan, false), "page {page}");
+            asked += 1;
+        }
+        complete = scan.census_complete;
+        if complete {
+            break;
+        }
+    }
+    assert!(complete && asked > 0, "{asked} small-file pages asked");
+    std::fs::remove_dir_all(home).unwrap();
+}
+
+/// [regress] During a first backfill with census work still queued, a page
+/// that only re-reads a recorded live session (a watcher hint), retries an
+/// unreadable file or fails to parse one reports no first-read progress and
+/// asks for nothing. Claude and Pi count every hint as a census member.
+#[cfg(unix)]
+#[test]
+fn first_read_progress_ignores_rereads_and_stuck_tails() {
+    use crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture;
+    use crate::snapshots::with_test_directory_entries;
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Pi] {
+        let home = crate::test_scratch::private_dir("first-read-stuck")
+            .canonicalize()
+            .unwrap();
+        let root = first_read_root(source, &home);
+        let (a, b) = (root.join("a"), root.join("b"));
+        let live = first_read_file(source, &a, 1);
+        let unreadable = first_read_file(source, &a, 2);
+        let broken = first_read_file(source, &a, 3);
+        std::fs::write(&broken, "not json\n").unwrap();
+        first_read_file(source, &b, 4);
+        let mode = |mode| std::fs::Permissions::from_mode(mode);
+        std::fs::set_permissions(&unreadable, mode(0o000)).unwrap();
+        let scanner = E2ScanFixture::default();
+        let page = |index, budget, hints: &[PathBuf]| {
+            with_test_directory_entries(budget, || {
+                first_read_page(&scanner, source, &root, &home, index, 100, false, hints)
+            })
+        };
+        // The root, then `a`: its readable session is a first read.
+        let (index, listed) = page(first_read_index(source, &home), 1, &[]);
+        assert!(listed.census_status.pending_work, "{source:?}");
+        assert!(listed.first_read_progress, "{source:?}");
+        let (index, read) = page(index, 1, &[]);
+        assert!(read.census_status.pending_work, "{source:?}: b is queued");
+        assert!(read.first_read_progress, "{source:?}");
+        assert!(index.files.iter().next().is_some(), "{source:?}");
+        // No listing budget: only the hinted live session and the stuck files.
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&live)
+            .unwrap();
+        let line = match source {
+            SnapshotSource::ClaudeCode => claude_line("a0000000-0000-4000-8000-000000000001", 5),
+            _ => pi_line(5),
+        };
+        file.write_all(line.as_bytes()).unwrap();
+        drop(file);
+        let (index, reread) = page(index, 0, std::slice::from_ref(&live));
+        assert!(
+            reread.scanned_file_count > 0,
+            "{source:?}: the live re-read"
+        );
+        assert!(reread.census_status.pending_work, "{source:?}");
+        assert!(!reread.first_read_progress, "{source:?}: a re-read");
+        assert!(!resident_scan_requested(&reread, true), "{source:?}");
+        let (index, stuck) = page(index, 0, &[]);
+        assert!(stuck.census_status.pending_work, "{source:?}");
+        assert!(!stuck.first_read_progress, "{source:?}: a stuck tail");
+        assert!(!resident_scan_requested(&stuck, true), "{source:?}");
+        // Listing `b` reads its new session again as progress.
+        let (_, other) = page(index, 1, &[]);
+        assert!(other.first_read_progress, "{source:?}");
+        std::fs::set_permissions(&unreadable, mode(0o600)).unwrap();
+        std::fs::remove_dir_all(home).unwrap();
+    }
+}
+
 /// [behaviour] A resident wake starts another ordinary pass, releases the
 /// sync lock while waiting, and adds no wake after a quiet successful drain.
 #[test]
@@ -1635,6 +1963,132 @@ fn resident_wake_advances_ordinary_cycle_without_a_cursor_timer() {
         host.cadence.record_scan_failure(host.now);
         assert!(host.cadence.paced_scan_due().is_none());
     }
+}
+
+/// [behaviour] An upload shed delays only an existing paced request. Planner
+/// peeks preserve both deadlines; at the wake the ordinary source gate admits it.
+#[test]
+#[serial_test::serial(source_cadences, source_upload_deadlines)]
+fn paced_shed_wake_obeys_both_deadlines_and_source_errors_do_not_spin() {
+    use super::super::{
+        defer_source_uploads, paced_scan_due, source_cadence_wait, source_upload_deadlines,
+    };
+    struct ShedLoop {
+        seconds: u64,
+        waits: Vec<Duration>,
+    }
+    impl LoopHost for ShedLoop {
+        fn now(&mut self) -> Instant {
+            crate::scan_clock::with_clock(self.seconds, crate::scan_clock::now)
+        }
+        fn wait(&mut self, wait: Duration) -> bool {
+            self.waits.push(wait);
+            self.seconds += wait.as_secs();
+            false
+        }
+        fn pending(&mut self) -> Option<(Instant, Duration)> {
+            None
+        }
+        fn paced_due(&mut self) -> Option<Instant> {
+            crate::scan_clock::with_clock(self.seconds, paced_scan_due)
+        }
+        fn page(&mut self, _: Instant) -> Outcome {
+            panic!("an ordinary paced wake must not run a cursor page")
+        }
+    }
+    let _saved = OwnedCadences::install();
+    for source in ROTATION {
+        for (gap, backoff) in [(0, 60), (30, 60), (60, 60), (180, 60), (30, 180)] {
+            super::super::clear_cadence_state_for_test();
+            super::super::clear_source_upload_deadlines_for_test();
+            let mut host = ShedLoop {
+                seconds: 1000,
+                waits: Vec::new(),
+            };
+            let start = host.now();
+            with_source_cadence(source, |cadence| {
+                cadence.record_scan_success(start, 1);
+                assert!(cadence.request_paced_scan(
+                    start,
+                    Duration::ZERO,
+                    crate::adaptive_collector::ContinuationPacing {
+                        min_gap: Duration::from_secs(gap),
+                        idle_per_work: 0,
+                    },
+                    false,
+                ));
+            });
+            crate::scan_clock::with_clock(1000, || {
+                defer_source_uploads(source, Duration::from_secs(backoff));
+                let due = start + Duration::from_secs(gap.max(backoff));
+                assert_eq!(paced_scan_due(), Some(due));
+                assert_eq!(paced_scan_due(), Some(due), "a peek consumes nothing");
+                assert_eq!(source_upload_deadlines().lock().unwrap().len(), 1);
+                assert!(
+                    source_paced_due(source).is_none(),
+                    "QoS still obeys backoff"
+                );
+            });
+            wait_for_ordinary_cycle(&mut host, SNAPSHOT_SYNC_INTERVAL);
+            assert_eq!(host.waits, [Duration::from_secs(gap.max(backoff))]);
+            crate::scan_clock::with_clock(host.seconds, || {
+                assert!(super::super::source_upload_backoff_remaining(source).is_none());
+                assert_eq!(source_cadence_wait(source), None);
+                // Prepare, scan or finish can fail after the shed deadline.
+                // This is the same boundary used by the rotation's outcome.
+                after_ordinary_source_failure(source);
+                assert_eq!(paced_scan_due(), None);
+            });
+            wait_for_ordinary_cycle(&mut host, SNAPSHOT_SYNC_INTERVAL);
+            assert_eq!(host.waits[1], SNAPSHOT_SYNC_INTERVAL, "no Wake(0) on error");
+        }
+    }
+    super::super::clear_cadence_state_for_test();
+    super::super::clear_source_upload_deadlines_for_test();
+    crate::scan_clock::with_clock(1000, || {
+        let start = crate::scan_clock::now();
+        defer_source_uploads(SnapshotSource::Codex, Duration::from_secs(60));
+        assert_eq!(
+            paced_scan_due(),
+            None,
+            "no request is manufactured by a shed"
+        );
+        let mut host = ShedLoop {
+            seconds: 1000,
+            waits: Vec::new(),
+        };
+        wait_for_ordinary_cycle(&mut host, SNAPSHOT_SYNC_INTERVAL);
+        assert_eq!(host.waits, [SNAPSHOT_SYNC_INTERVAL]);
+        for (source, gap, backoff) in [
+            (SnapshotSource::Codex, 30, 120),
+            (SnapshotSource::ClaudeCode, 180, 60),
+            (SnapshotSource::Pi, 30, 60),
+        ] {
+            with_source_cadence(source, |cadence| {
+                cadence.record_scan_success(start, 1);
+                cadence.request_paced_scan(
+                    start,
+                    Duration::ZERO,
+                    crate::adaptive_collector::ContinuationPacing {
+                        min_gap: Duration::from_secs(gap),
+                        idle_per_work: 0,
+                    },
+                    false,
+                );
+            });
+            defer_source_uploads(source, Duration::from_secs(backoff));
+        }
+        assert_eq!(paced_scan_due(), Some(start + Duration::from_secs(60)));
+        // A Codex hint shed during prepare is still an error: its paced
+        // request clears even while the newly supplied deadline stands.
+        after_ordinary_source_failure(SnapshotSource::Codex);
+        assert!(OwnedCadences::due(SnapshotSource::Codex).is_none());
+        assert!(source_upload_deadlines()
+            .lock()
+            .unwrap()
+            .contains_key("codex"));
+        assert!(OwnedCadences::due(SnapshotSource::ClaudeCode).is_some());
+    });
 }
 
 const UTILITY: (u32, i32) = (0x11, 0);

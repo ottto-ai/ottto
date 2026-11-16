@@ -1,5 +1,38 @@
 use super::*;
 
+/// [behaviour] Header sheds keep the server floor while sustained refusal
+/// uses the existing randomized ladder. A successful upload resets the streak.
+#[test]
+#[serial(source_cadences, source_upload_deadlines)]
+fn repeated_header_sheds_climb_the_ladder_without_retrying_early() {
+    clear_source_upload_deadlines_for_test();
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        let header = Duration::from_secs(60);
+        let first = note_shed_and_backoff(source, Some(header));
+        assert!((header..=Duration::from_secs(72)).contains(&first));
+        for attempt in 1..=6 {
+            let wait = note_shed_and_backoff(source, Some(header));
+            let ceiling = (SHED_BACKOFF_BASE * (1 << attempt))
+                .min(crate::snapshot_client::MAX_HONOURED_RETRY_AFTER);
+            assert!((header..=ceiling.max(Duration::from_secs(72))).contains(&wait));
+        }
+        // A saturated ladder draw must sometimes exceed header-only jitter.
+        // 64 draws also pass with the documented entropy-failure midpoint.
+        assert!(
+            (0..64).any(|_| note_shed_and_backoff(source, Some(header)) > Duration::from_secs(72))
+        );
+        let cap = crate::snapshot_client::MAX_HONOURED_RETRY_AFTER;
+        assert_eq!(note_shed_and_backoff(source, Some(cap)), cap);
+        clear_shed_streak(source);
+        assert!(note_shed_and_backoff(source, Some(header)) <= Duration::from_secs(72));
+    }
+    clear_source_upload_deadlines_for_test();
+}
+
 /// [behaviour] Small-route sheds preserve Retry-After seconds, dates and absence.
 #[test]
 #[serial(env, source_cadences)]

@@ -135,12 +135,18 @@ pub(super) fn leave_source_qos(slot: &mut Option<MacPlatformSignals>) {
     drop(slot.take());
     FIRST_IMPORT_DEFAULT_QOS.set(false);
 }
-/// A spent byte budget asks only during the source's first backfill.
+/// A spent byte budget or first-read progress asks only during the source's
+/// first backfill. Progress asks only while the census is unfinished and not
+/// a routine re-census; a page that read and listed nothing new never asks.
 pub(super) fn resident_scan_requested(scan: &SourceScanResult, first_read_bootstrap: bool) -> bool {
     scan.charge_deferred
         || (scan.census_status.pending_work
             && ((scan.page_file_limit_hit && !scan.routine_recensus)
-                || (first_read_bootstrap && scan.page_byte_budget_hit)))
+                || (first_read_bootstrap && scan.page_byte_budget_hit)
+                || (first_read_bootstrap
+                    && scan.first_read_progress
+                    && !scan.routine_recensus
+                    && !scan.census_complete)))
 }
 pub(super) fn request_resident_scan(source: SnapshotSource, first_import: bool) {
     if let Some(pacing) = resident_pacing(MacPlatformSignals::default().power()) {
@@ -873,10 +879,12 @@ pub(super) fn after_ordinary_codex_page(
     clear(&mut CodexCadence, &TICKET);
 }
 
-/// An ordinary Codex pass failed: no continuation follows it.
-pub(super) fn after_ordinary_codex_failure() {
-    with_source_cadence(SnapshotSource::Codex, SourceCadence::clear_continuation);
-    clear(&mut CodexCadence, &TICKET);
+/// A failed source pass leaves no paced request or cursor continuation.
+pub(super) fn after_ordinary_source_failure(source: SnapshotSource) {
+    with_source_cadence(source, SourceCadence::clear_continuation);
+    if source == SnapshotSource::Codex {
+        clear(&mut CodexCadence, &TICKET);
+    }
 }
 
 /// How an ordinary cycle ended, for the continuation it leaves behind. A cycle

@@ -210,8 +210,6 @@ pub(in crate::snapshots) fn ensure_bounded_traversal(
     index.bounded_sweep_had_unsettled_upload = false;
     index.bounded_sweep_unsettled_causes = 0;
 
-    transition.emit(source);
-
     let mut census = ScanCensus::default();
     let resolved_roots = roots
         .iter()
@@ -230,6 +228,12 @@ pub(in crate::snapshots) fn ensure_bounded_traversal(
         .iter()
         .filter_map(|(_, resolved, _)| resolved.as_ref())
         .collect::<Vec<_>>();
+    transition.emit(
+        source,
+        roots.len(),
+        currently_resolved.len(),
+        backfill_window_days,
+    );
     let missing_roots = resolved_roots
         .iter()
         .filter(|(_, resolved, _)| resolved.is_none())
@@ -244,12 +248,37 @@ pub(in crate::snapshots) fn ensure_bounded_traversal(
     // configured symlink has no recoverable canonical target, so retain the
     // exact prior index paths until a future resolved root covers them. This
     // avoids falsely promoting every unrelated optional root to required.
+    //
+    // A root configured once, no longer configured and gone from disk was
+    // removed on purpose (a deleted account home). Keys under it, and under no
+    // configured root, are out of scope rather than unresolved: ordinary
+    // reconciliation retires them once the walk is healthy. Any other lstat
+    // error, or a root still present, is no proof.
+    let deconfigured_roots = index
+        .known_configured_scan_roots
+        .iter()
+        .filter(|known| {
+            prior_traversal_context_matches
+                && !roots.iter().any(|root| local_index_key(root) == **known)
+        })
+        .map(PathBuf::from)
+        .filter(|known| {
+            fs::symlink_metadata(known)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        })
+        .collect::<Vec<_>>();
+    let out_of_scope = |key: &str| {
+        let key = Path::new(key);
+        deconfigured_roots.iter().any(|root| key.starts_with(root))
+            && !roots.iter().any(|root| key.starts_with(root))
+    };
     if prior_traversal_context_matches {
         index.legacy_unresolved_root_file_witnesses.retain(|key| {
             index.files.contains_key(key)
                 && !currently_resolved
                     .iter()
                     .any(|root| Path::new(key).starts_with(root))
+                && !out_of_scope(key)
         });
     } else {
         // A changed root set is an explicit new census scope, not evidence that
@@ -268,6 +297,7 @@ pub(in crate::snapshots) fn ensure_bounded_traversal(
                         && !missing_roots
                             .iter()
                             .any(|root| Path::new(key).starts_with(root))
+                        && !out_of_scope(key.as_str())
                 })
                 .cloned(),
         );

@@ -4199,7 +4199,15 @@ fn paced_scan_due() -> Option<Instant> {
         SnapshotSource::Pi,
     ]
     .into_iter()
-    .filter_map(source_paced_due)
+    .filter_map(|source| {
+        let paced = with_source_cadence(source, |cadence| cadence.paced_scan_due()).flatten()?;
+        let deadlines = source_upload_deadlines().lock().ok()?;
+        Some(
+            deadlines
+                .get(source.api_slug())
+                .map_or(paced, |due| paced.max(*due)),
+        )
+    })
     .min()
 }
 
@@ -4237,8 +4245,7 @@ fn clear_cadence_state_for_test() {
     }
 }
 
-/// Base of the local backoff ladder used when the server sheds without saying
-/// for how long.
+/// Base of the local backoff ladder for missing headers and repeated sheds.
 const SHED_BACKOFF_BASE: Duration = Duration::from_secs(30);
 
 /// Uniform random in `[0, span]`, from the OS entropy source already used for
@@ -4310,7 +4317,7 @@ fn cadence_phase_offset(client_id: &str, interval: Duration) -> Duration {
     Duration::from_secs(u64::from_be_bytes(bytes) % seconds)
 }
 
-/// Consecutive sheds per source, so the no-`Retry-After` ladder actually climbs.
+/// Consecutive sheds per source, so persistent refusal climbs the ladder.
 ///
 /// Without it every shed draws from `random(0, 30s)`, which the five-minute cycle
 /// has already outlived by the next tick — a ladder that never leaves its first
@@ -4334,8 +4341,11 @@ fn note_shed_and_backoff(source: SnapshotSource, retry_after: Option<Duration>) 
         Err(_) => 0,
     };
     match retry_after {
-        // The server named a time. Its number wins over our ladder — it knows
-        // when it will be ready and we do not.
+        // The server's time is always the floor; repeated sheds also draw
+        // from the existing ladder to ease sustained refusal.
+        Some(retry_after) if attempt > 0 => {
+            shed_backoff(Some(retry_after)).max(full_jitter_backoff(attempt))
+        }
         Some(retry_after) => shed_backoff(Some(retry_after)),
         None => full_jitter_backoff(attempt),
     }
@@ -5125,10 +5135,8 @@ fn collect_file_activity_with_retry(
     let deadline = crate::scan_clock::now() + wait;
     let mut watcher = watcher;
     loop {
-        let now = crate::scan_clock::now();
-        if now >= deadline {
-            return false;
-        }
+        // A delivery retry may share the ordinary deadline. Service it before
+        // returning to collection, which can replace its retained checkpoint.
         let wake = retry_boundary(deadline).min(deadline);
         let now = crate::scan_clock::now();
         if now >= deadline {
@@ -5521,6 +5529,9 @@ fn sync_once_with_retry(
     // Declared after the guard, so it settles before the lock is released.
     let mut continuation_cycle = continuation::CycleSettlement::default();
     let (device, device_secret) = load_snapshot_device_credentials()?;
+    daemon
+        .record_source_grants(&device)
+        .map_err(|_| anyhow!("source grants unavailable"))?;
     let Some(machine_id) = snapshot_machine_id(&device)? else {
         return Err(anyhow!("machine identity is missing"));
     };
@@ -5643,6 +5654,8 @@ fn retry_ordinary_owned(item: &SnapshotItem) -> Option<SnapshotItem> {
         claude_org_markers: None,
         claude_account_withheld_reason: None,
         claude_account_display: None,
+        session_billing_route: item.session_billing_route.clone(),
+        claude_route_evidence: None,
         session_account_evidence: item.session_account_evidence.clone(),
         source_session_id: item.source_session_id.clone(),
         snapshot_fingerprint: item.snapshot_fingerprint.clone(),
@@ -5909,8 +5922,8 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
     fn outcome(&mut self, source: SnapshotSource, result: Result<()>) {
         continuation::leave_source_qos(&mut self.paced_qos);
         crate::local_resource_diagnostics::pass_ended(source.api_slug());
-        if source == SnapshotSource::Codex && result.is_err() {
-            continuation::after_ordinary_codex_failure();
+        if result.is_err() {
+            continuation::after_ordinary_source_failure(source);
         }
         match result {
             Ok(()) => self.transport_cycle.note_success(),
@@ -6327,6 +6340,7 @@ fn upload_local_health_projection_with(
 
     let reply = client.upload_local_health_heartbeat(&relay_token, heartbeat)?;
     apply_source_control(&default_support_dir(), &reply);
+    let _ = daemon.record_source_grants(device);
     client.upload_local_health_projection(&relay_token, health)?;
     Ok(())
 }
@@ -6811,13 +6825,14 @@ fn prepare_sync_source_inner(
             activity_hint.local_usage_reconciliation_enabled,
         )
     });
-    // Cache the workspace reconciliation policy so the daemon can surface it on
-    // SourceHealth.reconciliation_enabled. Best-effort: a poisoned lock is the
-    // only error path and is not worth aborting the sync over.
-    let _ = daemon.record_reconciliation_enabled(
-        source_kind(source),
-        activity_hint.local_usage_reconciliation_enabled,
-    );
+    // Cache the raw workspace policy for status and tracking eligibility together.
+    daemon
+        .record_reconciliation_enabled(
+            source_kind(source),
+            activity_hint.local_usage_reconciliation_enabled,
+            receipt_window_days,
+        )
+        .map_err(|_| anyhow!("tracking state unavailable"))?;
     if receipt_window_days == 0 {
         withdraw_and_report_policy_stop(
             client,
@@ -8002,6 +8017,15 @@ fn finish_sync_source(
         &claude_authority_disposition.mixed_uploads,
     );
     claude_authority_disposition.defer_sessions(deferred_accounts);
+    // Billing route annotation: after ownership is bound, before upload policy.
+    // Process memory only; off, nothing runs.
+    crate::snapshots::billing_route::annotate_session_billing_routes(
+        &upload_destination_namespace,
+        source,
+        machine_id,
+        &mut scan_result.snapshots,
+        activity_hint.session_billing_route_contract.as_deref(),
+    );
 
     // The Companion uses machine-local labels before upload policy clears them.
     let reconciliation_status = crate::agent_status_refresh::status_for_reconciliation(
@@ -8011,17 +8035,36 @@ fn finish_sync_source(
     );
     // Claude activity remains recent relative to the scan's observation
     // horizon, while future timestamps are bounded by the reconciliation clock.
-    if crate::active_sessions::reconcile_active_sessions(
+    let tracking_episode = daemon.tracking_episode(&source_kind(source));
+    let reconciled_at = current_rfc3339();
+    let since = tracking_episode
+        .as_ref()
+        .and_then(|(_, since)| OffsetDateTime::parse(since, &Rfc3339).ok());
+    let mut latest = None;
+    let mut observe = |new, previous, within_ceiling| {
+        latest = latest.max(crate::tracking_confirmation::parsed_activity_witness(
+            since,
+            new,
+            previous,
+            within_ceiling,
+        ));
+    };
+    if crate::active_sessions::reconcile_with_registrations(
         support_dir,
         source,
         &scan_result.snapshots,
         Some(&reconciliation_status),
         (source == SnapshotSource::ClaudeCode).then_some(scan_started_at.as_str()),
-        &current_rfc3339(),
+        &reconciled_at,
+        Some("local"),
         with_source_cadence(source, |cadence| {
             cadence.ordinary_interval().min(MAX_CYCLE_INTERVAL)
         })
         .unwrap_or(SNAPSHOT_SYNC_INTERVAL),
+        crate::agent_status::claude_session_registrations,
+        tracking_episode
+            .as_ref()
+            .map(|_| &mut observe as &mut dyn FnMut(_, _, _)),
     )
     .is_err()
     {
@@ -8029,6 +8072,15 @@ fn finish_sync_source(
             "local active-session cache update skipped for {}",
             source.api_slug()
         );
+    }
+
+    if let (Some((generation, _)), Some(at)) = (
+        tracking_episode,
+        latest.and_then(|at| at.format(&Rfc3339).ok()),
+    ) {
+        daemon
+            .confirm_tracking_activity(&source_kind(source), generation, &at)
+            .map_err(|_| anyhow!("tracking state unavailable"))?;
     }
 
     crate::snapshots::apply_upload_policy(source, &mut scan_result.snapshots, upload_policy);
@@ -9731,6 +9783,9 @@ struct ClaudeEvidencePage<'p> {
     stats: ClaudeLocalEvidenceStats,
     /// Roots already counted: a scope root two chunks read counts once.
     counted_roots: BTreeSet<String>,
+    /// Sessions withheld for an absent content twin, decided once over the
+    /// whole page; every chunk's finish uses it.
+    content_held: BTreeSet<String>,
     side_call_discovery: crate::snapshots::claude_request_money::e2::SideCallDiscovery,
 }
 
@@ -9774,6 +9829,10 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
             ..Default::default()
         },
         counted_roots: BTreeSet::new(),
+        content_held: crate::snapshots::claude_request_money::e2::page_content_holds(
+            &scan_result.snapshots,
+            index,
+        ),
         side_call_discovery: crate::snapshots::claude_request_money::e2::SideCallDiscovery::new(
             scan_result
                 .completed_parses()
@@ -9946,6 +10005,10 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
 fn release_emitted(item: &mut SnapshotItem) {
     #[cfg(test)]
     crate::snapshots::claude_request_money::e2::pipeline_test_observer::before_release(item);
+    // Route evidence only; captured before the native request inputs go.
+    if crate::snapshots::billing_route::PRODUCER_ENABLED {
+        crate::snapshots::billing_route::capture_claude_route_evidence(item);
+    }
     crate::snapshots::claude_request_money::e2::release_emitted_fold(item);
 }
 
@@ -10322,7 +10385,7 @@ fn apply_claude_local_evidence_chunk(
     // the account hash then tag the rows that upload.
     // Gate off this only counts, so the page is unchanged.
     // Withheld entities stay on the page and owed: delayed, never settled.
-    let mut withheld = crate::snapshots::claude_request_money::e2::finish_page(
+    let mut withheld = crate::snapshots::claude_request_money::e2::finish_page_planned(
         &mut scan_result.snapshots,
         index,
         if telemetry_read_failed {
@@ -10332,6 +10395,7 @@ fn apply_claude_local_evidence_chunk(
         },
         &mut disposition.request_owned_hold_reasons,
         &scan_result.claude_queued_family_deferred_paths,
+        &page.content_held,
     );
     if !trace_discard_unfolded.is_empty() {
         *disposition
@@ -17576,7 +17640,7 @@ mod tests {
     }
 
     #[test]
-    #[serial(client_report)]
+    #[serial(client_report, source_cadences, source_upload_deadlines)]
     fn a_shed_page_stops_the_pass_and_keeps_earlier_pages_checkpointed() {
         let poison_scope = &unique_poison_scope();
         use crate::client_report::{observe, reset_for_test, ClientReportReason};
@@ -17619,11 +17683,13 @@ mod tests {
                 // The pass reports the server's own number; turning it into a
                 // wait belongs to the caller, which owns the shed history.
                 assert_eq!(retry_after, Some(Duration::from_secs(60)));
+                clear_shed_streak(SnapshotSource::Pi);
                 let honoured = note_shed_and_backoff(SnapshotSource::Pi, retry_after);
                 // Retry-After x uniform(1.0, 1.2): never before the server's 60s,
                 // never more than 20% late.
                 assert!(honoured >= Duration::from_secs(60));
                 assert!(honoured <= Duration::from_secs(72));
+                clear_shed_streak(SnapshotSource::Pi);
             }
             other => panic!("expected a shed result, got {other:?}"),
         }

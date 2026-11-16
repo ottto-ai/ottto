@@ -506,6 +506,157 @@ pub(super) mod tests {
         assert!(index.files.is_empty());
     }
 
+    /// One matching retry start over `roots` after a finished red traversal.
+    /// `known` was configured once and `key`, under it, is indexed (and, when
+    /// `persisted`, already a legacy witness). Returns whether `key` is a
+    /// witness after the start and this source's RootResolutionUnresolved.
+    fn removed_root_retry(
+        source: SnapshotSource,
+        roots: &[PathBuf],
+        known: &Path,
+        key: &Path,
+        persisted: bool,
+    ) -> (bool, u64, ScanIndex) {
+        let mut index = ScanIndex::default();
+        ensure_bounded_traversal(source, roots, &mut index, NOW, BACKFILL_WINDOW_DAYS);
+        let traversal = index.traversal.as_mut().unwrap();
+        traversal.pending_directories.clear();
+        traversal.counts.disappeared_file_count = 1;
+        traversal.unhealthy_retry_not_before_unix_seconds = Some(0);
+        index
+            .known_configured_scan_roots
+            .insert(local_index_key(known));
+        let key = local_index_key(key);
+        index.files.insert(
+            key.clone(),
+            super::super::tests::manifest_index_entry(Some("removed-root-body")),
+        );
+        if persisted {
+            index
+                .legacy_unresolved_root_file_witnesses
+                .insert(key.clone());
+        }
+        let ((), events) = observe(|| {
+            ensure_bounded_traversal(source, roots, &mut index, RETRY, BACKFILL_WINDOW_DAYS);
+        });
+        let traversal = index.traversal.as_ref().unwrap();
+        assert_eq!(traversal.census_window_end, RETRY, "a matching retry start");
+        assert!(index.files.contains_key(&key), "a start never retires");
+        let witness = index.legacy_unresolved_root_file_witnesses.contains(&key);
+        assert_eq!(
+            index.traversal_namespace_loss(traversal),
+            !index.legacy_unresolved_root_file_witnesses.is_empty()
+        );
+        (witness, events[source.slot()][1], index)
+    }
+
+    /// [behaviour] A root configured once, now unconfigured and absent, drains
+    /// its persisted witnesses at a matching start and is not re-extended by
+    /// the absent optional root: no RootResolutionUnresolved, no namespace
+    /// loss. Present, non-NotFound and symlink-canonical cases stay red.
+    /// Codex, Claude and Pi share the predicate.
+    #[test]
+    fn removed_root_witnesses_drain_only_with_proof() {
+        for source in [
+            SnapshotSource::Codex,
+            SnapshotSource::ClaudeCode,
+            SnapshotSource::Pi,
+        ] {
+            let dir = crate::test_scratch::ScratchDir::new("removed-root-scope");
+            let kept = dir.join("kept");
+            fs::create_dir(&kept).unwrap();
+            let roots = [kept.clone(), dir.join("optional-absent")];
+            let removed = dir.join("removed");
+            let key = removed.join("rollout.jsonl");
+
+            // U1: known, unconfigured, absent.
+            let (witness, unresolved, drained) =
+                removed_root_retry(source, &roots, &removed, &key, true);
+            assert_eq!((witness, unresolved), (false, 0), "{source:?}");
+            assert!(!drained.traversal.as_ref().unwrap().has_errors());
+
+            // U3: known, unconfigured, still present.
+            fs::create_dir(&removed).unwrap();
+            for persisted in [true, false] {
+                let (witness, unresolved, _) =
+                    removed_root_retry(source, &roots, &removed, &key, persisted);
+                assert_eq!((witness, unresolved), (true, 1), "{source:?}");
+            }
+            fs::remove_dir(&removed).unwrap();
+
+            // U2: configured but missing keeps today's +1 and never a witness.
+            let configured = [kept.clone(), dir.join("optional-absent"), removed.clone()];
+            let (witness, unresolved, _) =
+                removed_root_retry(source, &configured, &removed, &key, false);
+            assert_eq!((witness, unresolved), (false, 1), "{source:?}");
+
+            // U5: a key also under a configured (missing) root is kept, with
+            // today's two counts: that root, inferred known from its old key,
+            // and the witness.
+            let nested = [kept.clone(), removed.join("nested")];
+            let nested_key = removed.join("nested").join("rollout.jsonl");
+            let (witness, unresolved, _) =
+                removed_root_retry(source, &nested, &removed, &nested_key, true);
+            assert_eq!((witness, unresolved), (true, 2), "{source:?}");
+
+            // U6: a non-NotFound lstat error (not a directory) is no proof.
+            let file = dir.join("plain-file");
+            fs::write(&file, b"synthetic").unwrap();
+            let blocked = file.join("home");
+            let (witness, unresolved, _) =
+                removed_root_retry(source, &roots, &blocked, &blocked.join("a.jsonl"), true);
+            assert_eq!((witness, unresolved), (true, 1), "{source:?}");
+
+            // U4: a removed symlinked root indexed its keys under the canonical
+            // target, which is not lexically under the removed link.
+            let link = dir.join("removed-link");
+            let target_key = dir.join("canonical-target").join("rollout.jsonl");
+            let (witness, unresolved, _) =
+                removed_root_retry(source, &roots, &link, &target_key, true);
+            assert_eq!((witness, unresolved), (true, 1), "{source:?}");
+        }
+    }
+
+    /// [behaviour] U8: a changed root set still clears the witness set at its
+    /// start, whatever the root's state, and adds nothing.
+    #[test]
+    fn removed_root_context_change_still_clears_witnesses() {
+        let dir = crate::test_scratch::ScratchDir::new("removed-root-context");
+        let kept = dir.join("kept");
+        let present = dir.join("present-unconfigured");
+        fs::create_dir(&kept).unwrap();
+        fs::create_dir(&present).unwrap();
+        let mut index = ScanIndex::default();
+        let roots = [kept.clone(), dir.join("optional-absent")];
+        ensure_bounded_traversal(
+            SnapshotSource::Codex,
+            &roots,
+            &mut index,
+            NOW,
+            BACKFILL_WINDOW_DAYS,
+        );
+        index
+            .known_configured_scan_roots
+            .insert(local_index_key(&present));
+        let key = local_index_key(&present.join("rollout.jsonl"));
+        index.files.insert(
+            key.clone(),
+            super::super::tests::manifest_index_entry(Some("present-body")),
+        );
+        index.legacy_unresolved_root_file_witnesses.insert(key);
+        let ((), events) = observe(|| {
+            ensure_bounded_traversal(
+                SnapshotSource::Codex,
+                std::slice::from_ref(&kept),
+                &mut index,
+                RETRY,
+                BACKFILL_WINDOW_DAYS,
+            );
+        });
+        assert!(index.legacy_unresolved_root_file_witnesses.is_empty());
+        assert_eq!(events, [[0; 4]; 3]);
+    }
+
     #[test]
     fn real_selected_file_removed_before_open_records_only_not_found() {
         let dir = crate::test_scratch::ScratchDir::new("disappearance-open");

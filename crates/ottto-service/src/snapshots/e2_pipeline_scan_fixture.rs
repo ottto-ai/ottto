@@ -2,6 +2,9 @@
 use crate::snapshots::*;
 use crate::transcript_acquisition::Scope;
 
+#[path = "e2_pipeline_twin_diagnostics.rs"]
+pub(crate) mod twin_diagnostics;
+
 pub(crate) use crate::snapshots::upload::freshness_debt::tests::assert_file_receipt_retires_debt;
 
 /// The sampled scope and identity-capture mode this fixture's scans bind.
@@ -460,10 +463,19 @@ pub(crate) fn save_reload_for_test(index: &mut ScanIndex, path: &Path) -> ScanIn
     loaded
 }
 
+pub(crate) struct Acquisition {
+    pub(crate) path: PathBuf,
+    pub(crate) reason: Option<CandidateParseReason>,
+    pub(crate) mode: crate::transcript_acquisition::ReadMode,
+    pub(crate) start: u64,
+}
+
 #[derive(Default)]
 pub(crate) struct E2ScanFixture {
     pub(crate) cache: Arc<sampled_scan::SharedCache>,
     observed: Mutex<Vec<PathBuf>>,
+    pub(crate) acquisitions: Mutex<Vec<Acquisition>>,
+    audit_slots: Option<usize>,
     full_reasons: Mutex<[usize; 11]>,
     pub(crate) versions: Option<Arc<codex_version::CodexVersionFeed>>,
     capture_claude_identity: bool,
@@ -532,6 +544,10 @@ impl E2ScanFixture {
         *self.attribution.lock().unwrap() = attribution;
     }
 
+    pub(crate) fn set_audit_slots(&mut self, slots: usize) {
+        self.audit_slots = Some(slots);
+    }
+
     pub(crate) fn full_reasons(&self) -> [usize; 11] {
         *self.full_reasons.lock().unwrap()
     }
@@ -586,6 +602,7 @@ impl E2ScanFixture {
         hints: &[PathBuf],
     ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
         self.observed.lock().unwrap().clear();
+        self.acquisitions.lock().unwrap().clear();
         let (scope, _) = scan_binding(SnapshotSource::ClaudeCode);
         let mut scan = OwnedSourceScan::new_with_recovery_priority(
             SnapshotSource::ClaudeCode,
@@ -676,7 +693,13 @@ impl E2ScanFixture {
         births: &BTreeMap<PathBuf, i128>,
     ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
         let mut seen = BTreeSet::new();
+        let mut recorded_active = false;
         for _ in 0..100_000 {
+            if let Some(slots) = self.audit_slots {
+                if let Some(context) = scan.sampling.as_mut() {
+                    context.audit_slots = slots;
+                }
+            }
             // Existing fixture setter changes only physical birth. JSONL still
             // comes from the opened reader, including retained prefix/suffix.
             if let Some(active) = scan.active_file.as_deref_mut() {
@@ -685,6 +708,37 @@ impl E2ScanFixture {
                         .lock()
                         .unwrap()
                         .push(active.candidate.path.clone());
+                }
+                // An active file spans multiple steps. Record once per active
+                // lifetime, including repeated paths and unsampled native reads.
+                if !recorded_active {
+                    let plan = active.parser.reader.acquisition.as_ref();
+                    let mode = plan.map_or_else(
+                        || {
+                            active.sampling.as_ref().map_or(
+                                crate::transcript_acquisition::ReadMode::Full(
+                                    crate::transcript_acquisition::FullReason::StateMissing,
+                                ),
+                                |sampling| sampling.mode,
+                            )
+                        },
+                        |plan| plan.mode(),
+                    );
+                    let start = plan.map_or(0, |plan| plan.start_offset());
+                    twin_diagnostics::event(&active.candidate.path, || {
+                        format!(
+                            "acquire mode={mode:?} start={start} reason={:?} sampled={}",
+                            active.parse_reason,
+                            active.sampling.is_some(),
+                        )
+                    });
+                    self.acquisitions.lock().unwrap().push(Acquisition {
+                        path: active.candidate.path.clone(),
+                        reason: active.parse_reason,
+                        mode,
+                        start,
+                    });
+                    recorded_active = true;
                 }
                 if let Some(birth) = births.get(&active.candidate.path) {
                     if self.subagent_births
@@ -702,6 +756,9 @@ impl E2ScanFixture {
                     }
                 }
             }
+            if scan.active_file.is_none() {
+                recorded_active = false;
+            }
             let modes = scan.sampling.as_ref().map_or((0, 0, 0), |s| {
                 (s.full_files, s.tail_files, s.unchanged_files)
             });
@@ -713,6 +770,7 @@ impl E2ScanFixture {
                 OwnedSourceScanStep::Pending(next) => scan = next,
                 OwnedSourceScanStep::Complete { index, scan, .. } => {
                     *self.full_reasons.lock().unwrap() = reasons;
+                    twin_diagnostics::folds(&scan.snapshots);
                     return (index, scan, modes);
                 }
             }
@@ -876,6 +934,19 @@ pub(crate) fn upload_context_receipt_earned_for_test(index: &ScanIndex, path: &P
         })
 }
 
+/// `path`'s stored proof is bound to the active context and current replay epoch.
+pub(crate) fn upload_context_proof_is_current_for_test(index: &ScanIndex, path: &Path) -> bool {
+    index
+        .files
+        .get(&local_index_key(path))
+        .and_then(|entry| entry.upload_context_receipt.as_ref())
+        .is_some_and(|proof| {
+            index.active_upload_context_fingerprint.as_ref() == Some(&proof.context_fingerprint)
+                && proof.replay_generation
+                    == crate::snapshots::upload_context_receipt::RECEIPT_REPLAY_EPOCH
+        })
+}
+
 /// `path` still owes its own upload-context proof under the active context.
 pub(crate) fn upload_context_owed_for_test(index: &ScanIndex, path: &Path) -> bool {
     index.file_upload_context_requires_adoption(&local_index_key(path))
@@ -1029,4 +1100,39 @@ pub(crate) fn hold_entity_decode_for_test(index: &mut ScanIndex, fingerprint: &s
             4,
         )
         .unwrap();
+}
+
+/// Mutate only real committed fixture state; no manufactured certificate.
+pub(crate) fn damage_tail_for_test(index: &ScanIndex, key: &str, damage: &str) {
+    let route = route_of(index).unwrap();
+    if damage == "missing" {
+        state_v2::retire_tail(&route, [key.to_owned()]).unwrap();
+        return;
+    }
+    let revision = tail_source::reduction_revision(SnapshotSource::ClaudeCode);
+    let head = state_v2::load_head(index, key, revision).unwrap().unwrap();
+    let mut staged = state_v2::StagedFile {
+        revision: head.revision,
+        head: head.body.clone(),
+        ..Default::default()
+    };
+    // Ordinary stages keep the committed collection metadata and pages.
+    match damage {
+        "future" => staged.revision += 1,
+        "corrupt" => staged.head = vec![0],
+        _ => panic!("unknown fixture damage"),
+    }
+    state_v2::stage_tail(&route, key, staged).unwrap();
+}
+
+/// The acquisition gate, exposed without widening its production visibility.
+pub(crate) fn forced_needs_native_for_test(index: &ScanIndex, path: &Path) -> bool {
+    claude_request_census::forced_member_needs_native(index, &local_index_key(path))
+}
+
+pub(crate) fn pace_cap_for_test(owner: &E2ScanFixture, path: &Path) {
+    let now = std::time::SystemTime::now();
+    let key = local_index_key(path);
+    assert!(owner.cache.cap_pace_for_test(&key, now).0);
+    assert!(!owner.cache.cap_pace_for_test(&key, now).0);
 }

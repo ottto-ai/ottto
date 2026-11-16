@@ -25,13 +25,14 @@ which contains local session titles, prompts and workspace paths. Keep the
 backup private; the CLI writes its files as 0600 and its folders as 0700. The
 local state folder is not excluded from Time Machine or iCloud backups.
 
-The loopback `/local-health` endpoint may return the current pseudonymous
-relay-device id to an allowlisted Ottto browser origin so the web app can
-distinguish two macOS users on one physical Mac. Origin-less callers do not
-receive that id. The origin allowlist enforces browser CORS; it is not
-authentication for native loopback clients, so the id is treated only as a
-non-secret binding label. The endpoint never returns the relay secret, account
-ids, or hardware UUID.
+The loopback `/control` endpoint requires an allowlisted Origin and a loopback
+Host naming the listener's port. With that same Origin/Host boundary, `/whoami`
+and `/local-health` return their existing machine identity and detailed health
+replies without a token, including the pseudonymous relay-device id in health.
+Other probe callers receive only liveness and version. The health endpoint never
+returns the relay secret, account ids, or hardware UUID. Duplicate Host, Origin
+and Authorization headers are refused. Origin and Host checks are browser
+boundaries; they do not replace control-command token authorization.
 
 ## Device Details
 
@@ -154,124 +155,76 @@ head tokens, request bodies, local paths and credentials are not retained.
 Public receipt responses keep their existing abbreviated identifiers, and
 private annotations are excluded from diagnostics and uploaded payloads.
 
-The optional Codex Cloud Sessions collector requires explicit consent. It uses an officially documented, upstream-experimental Codex CLI
-surface. Its single daemon supervisor starts normally but stays idle until the
-user grants the exact local device/user/organization scope and the server
-authorizes collection for that same versioned grant. New consent wakes the
-supervisor at once without a daemon restart. The collector invokes only
-`codex cloud list --json` as the effective user and
-derives opaque HMAC entity/account keys plus lifecycle, timestamps, attempt
-count, safe environment kind and coverage. It never reads
-`~/.codex/auth.json`, calls private provider endpoints, or uploads raw CLI JSON,
-titles, summaries, URLs, diffs, worklogs, prompts, outputs, repository paths,
-raw provider ids, or cursors. Its local grant is versioned and can be paused or
-revoked immediately; `OTTTO_CODEX_CLOUD_SESSIONS_DISABLED=1` is the emergency
-kill switch and overrides consent and server authority. The collector is
-isolated from local snapshot delivery: it has its own backoff, never writes
-upload receipts, and a cloud failure never delays a local upload.
+Codex cloud tasks are listed under the same consent as local Codex sessions:
+the workspace's "Usage check from your Mac" switch and the user's "List my
+Codex cloud tasks" setting, both resolved by the server. There is no separate
+per-Mac approval. The collector uses an officially documented,
+upstream-experimental Codex CLI surface and invokes only `codex cloud list
+--json` as the effective user. Each due work slice first reads the Codex
+activity hint once over a short-lived source-scoped relay token; it lists tasks
+only when that hint turns listing on and names the `cloud_session_changes.v3`
+contract. Listing off, an older server, authentication failure, and network or
+parse errors stop before provider access. `OTTTO_CODEX_CLOUD_SESSIONS_DISABLED=1` is the emergency kill
+switch and overrides the server.
 
-The collector uploads a task only when it changed since that task's last exact
-server acknowledgement (`cloud_session_changes.v1`, at most 200 tasks per
-request). A local digest over the task's content-free facts decides "changed";
-the digest itself never leaves the machine. Each acknowledged task's digest and
-the server's head etag are cached in the local upload-history file for 30 days,
-scoped to the backend destination, local identity, grant epoch and contract;
-unchanged polls never rewrite or extend an entry. A lost response or lost cache
-write only causes the same task to be offered again, which the server answers
-as unchanged. A per-task refusal is remembered for exactly that content. When
+From each task the collector sends its Codex task id plus lifecycle,
+timestamps, attempt count, safe environment kind and coverage. The task id
+uploads as the session identifier, the same as local session ids; it opens a
+task only within the user's own Codex/ChatGPT access. A task id that is empty,
+longer than 255 characters, padded with whitespace or holding a control
+character is skipped and only counted locally. The task title
+and environment name are sent only while the same title and workspace-label
+settings that govern local session uploads allow them; every request names the
+settings it applied. It never reads `~/.codex/auth.json`, calls private
+provider endpoints, or uploads raw CLI JSON, summaries, URLs, diffs, worklogs,
+prompts, outputs, repository paths, environment ids, or cursors, and it never
+logs task ids or writes them to disk. The collector is isolated from local
+snapshot delivery: it has its own backoff, never writes upload receipts, and a
+cloud failure never delays a local upload.
+
+The collector uploads a task only when its facts or the applied settings
+changed since that task's last exact server acknowledgement (at most 200 tasks
+and 512 KiB per request). A local digest decides "changed"; the digest itself
+never leaves the machine. Each acknowledged task's digest and the server's head
+etag are cached in the local upload-history file for 30 days under a local
+digest of the task id, scoped to the backend destination, organization, user
+and contract; the cache holds no titles or task ids, and unchanged polls never rewrite or extend an entry. A lost
+response or lost cache write only causes the same task to be offered again,
+which the server answers as unchanged. A per-task refusal, or a conflict the
+server answers without its head, is remembered for exactly that content. When
 the server reports a different head, the collector lists the page again once
-and offers the fresh facts against that head. A local revoke, and a revoke the
-server reports, erase this cache.
+and offers the fresh facts against that head.
 
-Timing: the newest provider page is read every five minutes while it holds a
-queued, running or unknown task, every 30 minutes while local Codex is active,
-and otherwise every six hours. One daily crawl walks every page, ten pages per
-work slice and continuing five minutes later where it stopped, across UTC
-midnight, until it reaches an explicit official `cursor: null`. There is no
-page or task ceiling. A cursor chain that repeats or cycles (detected in
-constant memory), or a response without terminal proof, ends that day's
-traversal without claiming completion. The raw cursor lives only in process
-memory; after a restart the crawl starts again from the newest page and the
-cache suppresses tasks already acknowledged. Without consent, while paused, or
-against a server that does not offer this contract, the collector makes no
-provider call and rechecks only every six hours or on a local consent change.
+Timing: the newest provider page is read every five minutes; after each listing
+from which the server accepted nothing new the wait doubles, up to a day, and a
+task the server accepts brings it back to five minutes. One daily crawl walks
+every page, ten pages per work slice and continuing five minutes later where it
+stopped, across UTC midnight, until it reaches an explicit official
+`cursor: null`. There is no page or task ceiling. A cursor chain that repeats
+or cycles (detected in constant memory), or a response without terminal proof,
+ends that day's traversal without claiming completion. The raw cursor lives
+only in process memory; after a restart the crawl starts again from the newest
+page and the cache suppresses tasks already acknowledged. While listing is off
+the hint is read again every 30 minutes, so the first listing can follow up to
+30 minutes after it is turned on; a server without the hint route is rechecked
+every six hours. Any HTTP 409 refusal is treated like listing off; a retired
+contract (HTTP 410) is treated like a missing route. A nonempty CLI page
+with no valid task identity and status is classified locally as
+`provider_payload_invalid`; it never becomes an empty healthy page. A malformed
+row is skipped alone and its valid siblings are still processed. The Codex
+subprocess receives no provider API keys and does not start an interactive
+shell.
 
-Each due work slice first makes one bounded authority read of the exact bound
-grant UUID/version over a short-lived source-scoped relay token; it never lists
-another grant or carries the browser JWT. Only `status: "enabled"` with
-`can_collect: true` on this contract permits that slice to invoke Codex. A
-remote pause leaves local consent untouched; a remote revoke revokes locally.
-After an erasure, only tasks whose provider creation time is after the server's
-cutoff are offered. Authentication failure, network or parse errors stop before
-provider access and back off with jitter. A nonempty CLI page with no valid
-task identity and status is classified locally as `provider_payload_invalid`;
-it never becomes an empty healthy page. A malformed row is skipped alone and
-its valid siblings are still processed. The raw installation id is discarded
-after deriving grant-local HMAC fingerprints. Grant state is stored with
-private-directory and exclusive 0600 atomic-write semantics. Earlier v1 grants
-migrate on first read, removing their raw installation id while preserving
-pause and revoke controls. A grant bound before this contract does not collect
-until consent is given again. The Codex subprocess receives no provider API
-keys and does not start an interactive shell.
-
-The uploaded `account_fingerprint` is an opaque local Ottto organization/user
-collector scope, not an OpenAI or Codex provider-account identity. The
-documented upstream-experimental CLI path currently exposes no sanctioned safe
-account discriminator; Ottto does
-not infer one or merge histories across a user-known provider-account switch.
-Such a switch requires explicit local stop, exact backend deletion, and setup
-again. Ottto also refuses logout, account replacement, relay-device rotation,
-or removal of the Codex device source while a local cloud-session record is not
-fully backend-revoked. The rejected identity-change attempt pauses an enabled
-grant before returning the stable `cloud_session_cleanup_required` reason, but
-retains the old account/device and exact grant id so the ordinary browser can
-retry DELETE and confirm its monotonic revocation epoch. `--local-only` logout
-does not bypass this reachability guard.
-
-Claim completion and setup-driven relay-device registration can rotate or
-revoke backend credentials, so the daemon checks this reachability guard before
-sending either request. It then holds a process-local, panic-safe identity
-reservation—not the lifecycle mutex—across the bounded network request and
-exact local install. Concurrent Cloud-session admission and account/device
-writes fail retryably; the old backend device is never rotated while cleanup is
-pending, and no provider or backend call runs under the lifecycle mutex.
-
-The changes relay, exact relay authority read, and backend DTOs are composed
-only for that explicitly consented scope. Before touching Keychain,
-the daemon requires a current enabled or policy-disabled grant and exact HMAC
-matches for the connected local device, organization, and user. It also
-requires the device and persisted connection to share the same machine binding
-and validates the backend destination before reading the relay device secret.
-A loopback destination is accepted only when the daemon process carries the
-exact same developer override. The transport is then kept only in process and
-cannot invoke Codex until the backend authority read confirms the exact grant
-UUID/version as enabled and collecting. No browser JWT crosses this boundary.
-
-Authenticated companion/UI code owns backend grant create/delete. Before a
-create handoff the daemon persists only a content-free exact-scope descriptor,
-never the raw installation id. A timeout or restart retries that same
-idempotent create until the backend grant UUID is bound; one intervening list
-absence cannot clear the tombstone or permit replacement while the original
-POST may still commit. The daemon stores only the opaque grant
-UUID/version/authority state and rejects stale pre-revoke epochs.
-
-Browser consent controls use one short-lived backend-signed token bound to the
-action, organization, effective user, Codex relay device, and source. The daemon
-validates it only against a trusted Ottto backend, compares every binding with
-the connected local account/device, and atomically consumes it before a side
-effect. Its bounded 0600 replay ledger stores only SHA-256(token id) and expiry;
-the JWT and raw token id are never persisted. Pause/revoke persists stopped
-state to close the shared provider/relay admission fence, then waits for every
-already admitted bounded provider subprocess, changes upload or cache write to
-finish before returning the exact backend DELETE target. Exact bind-response retries
-are local no-ops and cannot change timestamps or resurrect pause/revoke. If an
-authenticated grant POST commits immediately before rollout removal blocks
-bind, the independently permitted revoke action may carry that exact
-credential-free response: local revoke happens first, then only its grant UUID
-and epoch are retained for compensating DELETE. This path cannot enable
-collection. Runtime authority must return the exact requested/local epoch;
-higher as well as lower epochs fail closed without changing the binding or
-invoking the provider.
+The relay transport is composed only for the connected Codex Mac. Before
+touching Keychain the daemon requires a connected local account, a Codex relay
+device and a persisted connection sharing the same machine binding, and
+validates the backend destination before reading the relay device secret. A
+loopback destination is accepted only when the daemon process carries the exact
+same developer override. No browser JWT crosses this boundary. Every hint,
+provider, send and cache admission validates the current local identity; a
+sign-out, account replacement or device rotation closes admission and waits for
+already admitted bounded provider or relay I/O before replacing identity.
+Startup removes the files of the retired per-Mac approval and nothing else.
 
 Session attribution follows the same boundary. The daemon may use bounded
 first-prompt material, provider-native skill metadata, and local scheduled-task

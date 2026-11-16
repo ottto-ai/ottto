@@ -1029,7 +1029,9 @@ fn handle_control_request(
     request: HttpRequest,
 ) -> Result<()> {
     let origin = request.headers.get("origin").map(String::as_str);
-    if let Some(forbidden) = forbidden_origin_body(origin, "control") {
+    if let Some(forbidden) =
+        forbidden_local_request_body(&request, stream.local_addr()?.port(), "control")
+    {
         return write_json_response(stream, 403, forbidden);
     }
     let cors_headers = control_cors_headers(origin);
@@ -1067,7 +1069,6 @@ fn handle_control_request(
     if !matches!(
         &control_request.command,
         LocalControlCommand::TelemetryControl { .. }
-            | LocalControlCommand::CloudSessionsControl { .. }
             | LocalControlCommand::ProviderDailyReferenceControl { .. }
     ) {
         return write_json_response_with_headers(
@@ -1082,18 +1083,16 @@ fn handle_control_request(
     write_json_response_with_headers(stream, 200, serde_json::to_value(response)?, &cors_headers)
 }
 
-/// CORS-gated loopback identity probe. Lets an ottto.net page running on THIS
-/// machine learn which workspace machine it is on (stable, per-browser), instead
-/// of inferring it from workspace-wide "most recent companion" heuristics.
-/// Returns identity only (machine_id + display_name); never `hardware_uuid`.
+/// Loopback identity probe. Allowed Origin and Host enable identity details;
+/// other callers receive liveness and version only.
 fn handle_whoami_request(
     stream: &mut TcpStream,
     daemon: &LocalDaemon,
     request: HttpRequest,
 ) -> Result<()> {
     let origin = request.headers.get("origin").map(String::as_str);
-    if let Some(forbidden) = forbidden_origin_body(origin, "identity") {
-        return write_json_response(stream, 403, forbidden);
+    if forbidden_local_request_body(&request, stream.local_addr()?.port(), "identity").is_some() {
+        return write_json_response(stream, 200, probe_liveness_payload());
     }
     let cors_headers = cors_headers(origin, "GET, OPTIONS");
 
@@ -1135,18 +1134,16 @@ fn handle_whoami_request(
     }
 }
 
-/// CORS-gated loopback local-health probe for ottto.net running on the same Mac.
-/// This mirrors `/whoami`'s origin gate, then exposes only the canonical health
-/// projection needed for current-machine UI. Hardware UUID and secrets are never
-/// present in `DaemonStatus`; user/org ids are stripped before returning.
+/// Loopback health probe. Allowed Origin and Host enable canonical health;
+/// other callers receive liveness and version only. Account ids are omitted.
 fn handle_local_health_request(
     stream: &mut TcpStream,
     daemon: &LocalDaemon,
     request: HttpRequest,
 ) -> Result<()> {
     let origin = request.headers.get("origin").map(String::as_str);
-    if let Some(forbidden) = forbidden_origin_body(origin, "health") {
-        return write_json_response(stream, 403, forbidden);
+    if forbidden_local_request_body(&request, stream.local_addr()?.port(), "health").is_some() {
+        return write_json_response(stream, 200, probe_liveness_payload());
     }
     let cors_headers = cors_headers(origin, "GET, OPTIONS");
 
@@ -1169,10 +1166,6 @@ fn handle_local_health_request(
         );
     }
 
-    // Exact installation identity is useful to the Ottto web app, but it
-    // should not be exposed to ordinary origin-less loopback probes. The
-    // validated Origin is a browser CORS boundary, not caller authentication,
-    // so this response must contain only the non-secret pseudonymous device id.
     let device_id = local_health_browser_device_id(origin, || {
         FileDeviceStore::default()
             .load()
@@ -1217,12 +1210,35 @@ fn local_health_response_payload(
     }))
 }
 
-/// The 403 body for a browser `Origin` outside the control allowlist, or `None`
-/// when the request has no `Origin` or an allowed one. `noun` names the
-/// endpoint in the message ("control", "identity", "health").
+fn probe_liveness_payload() -> serde_json::Value {
+    json!({"ok": true, "version": crate::compiled_release_version()})
+}
+
+fn forbidden_local_request_body(
+    request: &HttpRequest,
+    port: u16,
+    noun: &str,
+) -> Option<serde_json::Value> {
+    if let Some(body) =
+        forbidden_origin_body(request.headers.get("origin").map(String::as_str), noun)
+    {
+        return Some(body);
+    }
+    if request.headers.get("host").is_some_and(|host| {
+        ["localhost", "127.0.0.1", "[::1]"]
+            .iter()
+            .any(|name| host.eq_ignore_ascii_case(&format!("{name}:{port}")))
+    }) {
+        return None;
+    }
+    Some(
+        json!({"error": "host_forbidden", "message": "Host is not allowed for local Ottto control"}),
+    )
+}
+
+/// Browser routes require an Origin from the control allowlist.
 fn forbidden_origin_body(origin: Option<&str>, noun: &str) -> Option<serde_json::Value> {
-    let origin = origin?;
-    if is_allowed_control_origin(origin) {
+    if origin.is_some_and(is_allowed_control_origin) {
         return None;
     }
     Some(json!({
@@ -1243,7 +1259,7 @@ fn cors_headers(origin: Option<&str>, allow_methods: &str) -> Vec<(String, Strin
         ),
         (
             "Access-Control-Allow-Headers".to_string(),
-            "Content-Type".to_string(),
+            "Content-Type, Authorization".to_string(),
         ),
         (
             "Access-Control-Allow-Private-Network".to_string(),
@@ -1388,8 +1404,10 @@ fn read_http_request_from<R: BufRead>(reader: &mut R) -> Result<HttpRequest> {
         }
         if let Some((name, value)) = trimmed.split_once(':') {
             let name = name.trim().to_ascii_lowercase();
-            if matches!(name.as_str(), "content-length" | "transfer-encoding")
-                && headers.contains_key(&name)
+            if matches!(
+                name.as_str(),
+                "content-length" | "transfer-encoding" | "host" | "origin" | "authorization"
+            ) && headers.contains_key(&name)
             {
                 return Err(anyhow!("duplicate HTTP message framing header"));
             }
@@ -1748,16 +1766,183 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn forbidden_origin_body_keeps_each_message_verbatim() {
-        for (noun, message) in [
-            ("control", "Origin is not allowed for local Ottto control"),
-            ("identity", "Origin is not allowed for local Ottto identity"),
-            ("health", "Origin is not allowed for local Ottto health"),
-        ] {
-            assert_eq!(
-                forbidden_origin_body(Some("https://ottto.net.evil"), noun),
-                Some(json!({"error": "origin_forbidden", "message": message}))
-            );
+        fn keys(value: &serde_json::Value) -> Vec<&str> {
+            let mut keys = value
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            keys.sort_unstable();
+            keys
+        }
+        let files = crate::control::tests::ControlFilesFixture::new();
+        FileDeviceStore::default()
+            .save(&ottto_core::LocalDeviceBinding {
+                device_id: "device_probe".into(),
+                machine_id: None,
+                sources: vec![],
+            })
+            .unwrap();
+        for noun in ["control", "identity", "health"] {
+            for (origin, host_kind, error) in [
+                (None, "loopback", Some("origin_forbidden")),
+                (Some("null"), "loopback", Some("origin_forbidden")),
+                (
+                    Some("https://ottto.net.evil"),
+                    "loopback",
+                    Some("origin_forbidden"),
+                ),
+                (
+                    Some("https://app.ottto.net"),
+                    "remote",
+                    Some("host_forbidden"),
+                ),
+                (
+                    Some("https://app.ottto.net"),
+                    "missing",
+                    Some("host_forbidden"),
+                ),
+                (
+                    Some("https://app.ottto.net"),
+                    "wrong_port",
+                    Some("host_forbidden"),
+                ),
+                (Some("https://app.ottto.net"), "loopback", None),
+                (Some("https://app.ottto.net"), "localhost", None),
+                (Some("https://app.ottto.net"), "ipv6", None),
+            ] {
+                for method in ["OPTIONS", "GET", "POST"] {
+                    if method == "GET" && noun == "control" {
+                        continue;
+                    }
+                    if method == "POST" && (noun != "control" || error.is_none()) {
+                        continue;
+                    }
+                    for token in [None, Some("wrong-token"), Some(TOKEN)] {
+                        let (mut client, mut server) = loopback_pair();
+                        let port = server.local_addr().unwrap().port();
+                        let mut headers = BTreeMap::new();
+                        if let Some(origin) = origin {
+                            headers.insert("origin".into(), origin.into());
+                        }
+                        let host = match host_kind {
+                            "missing" => None,
+                            "remote" => Some(format!("example.test:{port}")),
+                            "wrong_port" => Some(format!("127.0.0.1:{}", port.saturating_sub(1))),
+                            "localhost" => Some(format!("localhost:{port}")),
+                            "ipv6" => Some(format!("[::1]:{port}")),
+                            _ => Some(format!("127.0.0.1:{port}")),
+                        };
+                        if let Some(host) = host {
+                            headers.insert("host".into(), host);
+                        }
+                        if let Some(token) = token {
+                            headers.insert("authorization".into(), format!("Bearer {token}"));
+                        }
+                        let request = HttpRequest {
+                            method: method.into(),
+                            path: match noun {
+                                "control" => "/control",
+                                "identity" => "/whoami",
+                                _ => "/local-health",
+                            }
+                            .into(),
+                            headers,
+                            body: vec![],
+                        };
+                        files
+                            .assert_unchanged(|| match noun {
+                                "control" => {
+                                    handle_control_request(&mut server, &test_daemon(), request)
+                                }
+                                "identity" => {
+                                    handle_whoami_request(&mut server, &test_daemon(), request)
+                                }
+                                _ => handle_local_health_request(
+                                    &mut server,
+                                    &test_daemon(),
+                                    request,
+                                ),
+                            })
+                            .unwrap();
+                        drop(server);
+                        let mut response = String::new();
+                        client.read_to_string(&mut response).unwrap();
+                        let status = if error.is_some() && noun == "control" {
+                            403
+                        } else if error.is_some() {
+                            200
+                        } else if method == "OPTIONS" {
+                            204
+                        } else {
+                            200
+                        };
+                        assert!(
+                            response.starts_with(&format!("HTTP/1.1 {status}")),
+                            "{response}"
+                        );
+                        if status == 204 {
+                            continue;
+                        }
+                        let (_, body) = response.split_once("\r\n\r\n").unwrap();
+                        let payload: serde_json::Value = serde_json::from_str(body).unwrap();
+                        if let Some(error) = error.filter(|_| noun == "control") {
+                            assert_eq!(payload["error"], error);
+                            if error == "origin_forbidden" {
+                                assert_eq!(
+                                    payload["message"],
+                                    format!("Origin is not allowed for local Ottto {noun}")
+                                );
+                            }
+                        } else if error.is_some() {
+                            assert_eq!(
+                                payload,
+                                json!({"ok":true, "version":crate::compiled_release_version()})
+                            );
+                        } else {
+                            assert_eq!(payload["machine_id"], "machine_test");
+                            assert_eq!(payload["machine_name"], "Test Mac");
+                            if noun == "health" {
+                                assert_eq!(
+                                    keys(&payload),
+                                    ["health", "machine_id", "machine_name"]
+                                );
+                                assert_eq!(
+                                    keys(&payload["health"]),
+                                    [
+                                        "account",
+                                        "blockers",
+                                        "capabilities",
+                                        "computed_at",
+                                        "device_id",
+                                        "event_schema_version",
+                                        "evidence",
+                                        "fresh_until",
+                                        "machine_id",
+                                        "observed_at",
+                                        "overall",
+                                        "projection_revision",
+                                        "projection_version",
+                                        "protocol_version",
+                                        "revision",
+                                        "runtime",
+                                        "schema_version",
+                                        "schema_version_name",
+                                        "sources",
+                                    ]
+                                );
+                                assert_eq!(payload["health"]["device_id"], "device_probe");
+                                assert_eq!(payload["health"]["machine_id"], "machine_test");
+                            } else {
+                                assert_eq!(keys(&payload), ["machine_id", "machine_name"]);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1954,6 +2139,16 @@ pub(crate) mod tests {
 
     #[test]
     fn read_http_request_rejects_ambiguous_or_unsupported_transfer_framing() {
+        for (header, value) in [
+            ("Host", "127.0.0.1:43119"),
+            ("Origin", "https://app.ottto.net"),
+            ("Authorization", "Bearer synthetic-token"),
+        ] {
+            let raw =
+                format!("GET /whoami HTTP/1.1\r\n{header}: {value}\r\n{header}: {value}\r\n\r\n");
+            let mut reader = BufReader::new(raw.as_bytes());
+            read_http_request_from(&mut reader).expect_err("duplicate request header");
+        }
         for raw in [
             concat!(
                 "POST /v1/logs HTTP/1.1\r\n",

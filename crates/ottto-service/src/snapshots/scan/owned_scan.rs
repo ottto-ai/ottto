@@ -180,6 +180,8 @@ pub(crate) struct OwnedSourceScan {
     pub(in crate::snapshots) audit_now: u64,
     pub(in crate::snapshots) backfill_window_days: u64,
     pub(in crate::snapshots) file_limit: usize,
+    /// See `SourceScanResult::first_read_progress`.
+    pub(in crate::snapshots) first_read_progress: bool,
     pub(in crate::snapshots) page_file_limit_hit: bool,
     /// This scan's sync cycle holds a contract-5 permit.
     pub(in crate::snapshots) claude_request_identity_capture: bool,
@@ -212,6 +214,11 @@ pub(crate) struct OwnedSourceScan {
     pub(in crate::snapshots) active_file: sampled_scan::codex_cursor::ActiveFrame,
     pub(in crate::snapshots) codex_join_inventory: Option<codex_file_join::HeaderInventory>,
     pub(in crate::snapshots) codex_join_prepared: bool,
+    /// This page's inventory hold counts recorded at preparation, for its
+    /// census line only: held, awaiting directories, outside the roster.
+    /// Residue keys are left out; the fold records and counts them. In
+    /// memory only, so they survive preparation's yield.
+    pub(in crate::snapshots) codex_inventory_hold_counts: (usize, bool, usize),
     pub(in crate::snapshots) codex_join_groups: VecDeque<codex_file_join::Group>,
     pub(in crate::snapshots) codex_join_active: Option<Box<codex_file_join::GroupBoot>>,
     pub(in crate::snapshots) codex_join_completed: Vec<codex_file_join::Group>,
@@ -408,6 +415,7 @@ impl OwnedSourceScan {
             audit_now: sampled_scan::now_seconds(),
             backfill_window_days: effective_backfill_window_days(requested_backfill_window_days),
             file_limit,
+            first_read_progress: false,
             page_file_limit_hit: false,
             claude_request_identity_capture: false,
             claude_effort_support_dir: None,
@@ -436,6 +444,7 @@ impl OwnedSourceScan {
             active_file: Default::default(),
             codex_join_inventory: evidence.map(|e| e.inventory),
             codex_join_prepared: true,
+            codex_inventory_hold_counts: (0, false, 0),
             codex_join_groups: Default::default(),
             codex_join_active: None,
             codex_join_completed: Vec::new(),
@@ -624,13 +633,19 @@ impl OwnedSourceScan {
             next_generation_hints =
                 enqueue_watcher_hints(source, traversal, &hinted_paths, watcher_overflowed);
         }
+        let listing_budget = directory_entries_per_tick();
+        let walk_was_pending = listing_budget > 0
+            && index
+                .traversal
+                .as_ref()
+                .is_some_and(codex_census_walk_pending);
         // Carries run inside the listing, before the walk counts its debt.
         let mut carries: (BTreeSet<String>, BTreeSet<String>) = Default::default();
         let unlisted = advance_bounded_directory_traversal_with_budget(
             source,
             index,
             backfill_window_days,
-            directory_entries_per_tick(),
+            listing_budget,
             Some(&resource_probe.discovery_growth),
             |index| {
                 if source == SnapshotSource::Codex {
@@ -640,6 +655,13 @@ impl OwnedSourceScan {
                 }
             },
         );
+        // A listing tick with budget consumes at least one queued directory;
+        // one that leaves census directories queued is first-read progress.
+        let first_read_progress = walk_was_pending
+            && index
+                .traversal
+                .as_ref()
+                .is_some_and(codex_census_walk_pending);
         let (carry_deferred, carry_held_owners) = carries;
         release_codex_inventory_hold(source, index.traversal.as_mut().expect("traversal"));
         let codex_census_valid = source == SnapshotSource::Codex
@@ -941,6 +963,18 @@ impl OwnedSourceScan {
             causes,
             ..ScanCensus::default()
         };
+        #[cfg(test)]
+        for pending in &pending_paths {
+            crate::snapshots::e2_pipeline_scan_fixture::twin_diagnostics::event(
+                &pending.path,
+                || {
+                    format!(
+                        "seed selected census={} hint={}",
+                        pending.census_member, pending.watcher_hint,
+                    )
+                },
+            );
+        }
         let selected_flags = pending_paths
             .iter()
             .map(|pending| {
@@ -1314,6 +1348,7 @@ impl OwnedSourceScan {
             audit_now,
             backfill_window_days,
             file_limit,
+            first_read_progress,
             page_file_limit_hit,
             claude_request_identity_capture,
             claude_effort_support_dir: claude_effort_support_dir.map(Path::to_path_buf),
@@ -1346,6 +1381,7 @@ impl OwnedSourceScan {
             active_file: Default::default(),
             codex_join_inventory,
             codex_join_prepared: false,
+            codex_inventory_hold_counts: (0, false, 0),
             codex_join_groups: VecDeque::new(),
             codex_join_active: None,
             codex_join_completed: Vec::new(),

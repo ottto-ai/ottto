@@ -150,3 +150,14 @@ pub(crate) fn write_executable(path: &Path, contents: &[u8], mode: u32) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
         .expect("chmod executable");
 }
+
+/// Writes `contents` to `path` with mode `0o600`, the mode Claude Code gives
+/// its native credentials file, which the daemon requires before reading one.
+pub(crate) fn write_private_file(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = path.as_ref();
+    std::fs::write(path, contents).expect("write private file");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .expect("chmod private file");
+}

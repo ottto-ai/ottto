@@ -200,7 +200,7 @@ accepting version 1 binaries; there is no version negotiation.
 
 | Stage | Local fields | Meaning |
 | --- | --- | --- |
-| `startup` | `counts.malloc_large_cache_set`, `counts.malloc_large_cache` | Once before serving: allocator setting presence and numeric value (null if absent or nonnumeric); `source` is `unknown` because this is process-wide. Confirms launch configuration, not allocator support. |
+| `startup` | `counts.malloc_large_cache_set`, `counts.malloc_large_cache`, `counts.malloc_space_efficient_set`, `counts.malloc_space_efficient` | Once before serving: each allocator setting's presence and numeric value (null if absent or nonnumeric); `source` is `unknown` because this is process-wide. Confirms launch configuration, not allocator support. |
 | `shutdown` | none (`counts` is `{}`) | Once when the process receives SIGTERM, after startup diagnostics. Unix only. Records that the stop signal arrived; it does not detect hangs or say who sent it. The process still dies by SIGTERM. A missing row proves nothing: SIGKILL, a crash, a signal before startup or a failed write leave none. |
 | `claude_request_identity_over_cap` | `counts.claude_request_identity_over_cap`: `evidence_entries`, `authority_keys`, `parts_per_row`, `parts_per_item`, `rows`, `bytes`, `near_cap`, `identity_over_cap_held`; `counts.claude_request_identity_last_over_cap_item_bytes` | Cumulative, saturating process counters per cap reason, plus the attempted tagged item's last budgeted compact wire byte size, including semantic framing. One attempt can increment several reasons; retries count separately. `near_cap` counts tagged bodies above half the negotiated increased Claude cap, including bodies that fit; it is a warning, never a refusal. Missing/invalid receiver hints preserve the existing six-label output. `identity_over_cap_held` alarms from the first increased-cap body still over a cap after display shedding; its prior ACK remains and usage stays owed until a higher receiver cap or settled-history segments permit sending. Both additive labels are omitted while zero. The last size also includes these warning attempts. Recorded before budget recovery or full-strip fallback. Labels are append-only. No row content or identity is logged or uploaded. |
 
@@ -1551,11 +1551,19 @@ is capped at one hour; walk time and the next eligible pass can add further dela
 Source-generic transition tests cover Claude, Codex and Pi; end-to-end upload tests
 through retry and follow-up walks cover Pi only.
 
-Completed native scan pages carry `routine_recensus`, `page_file_limit_hit` and
-`pending_work` booleans on `native_collection_page`. `pending_work` means queued
-directories or candidates remain. The file-limit pacing decision is
-`page_file_limit_hit && pending_work && !routine_recensus`; a resident deferral
-can still request pacing independently. These observations add no timer or trigger.
+Completed native scan pages carry `routine_recensus`, `page_file_limit_hit`,
+`pending_work` and `first_read_progress` booleans on `native_collection_page`.
+`pending_work` means queued directories or candidates remain. The file-limit
+pacing decision is `page_file_limit_hit && pending_work && !routine_recensus`; a
+resident deferral can still request pacing independently. `first_read_progress`
+means the page recorded a selected census read of a file new to the index, or a
+listing tick consumed queued directories and left census directories queued.
+During a source's first backfill, `first_read_progress && pending_work` also
+requests the existing paced pass unless the census completed on that page or the
+pass is a routine re-census. A re-read of a recorded file, a failed or deferred
+read and a page that read and listed nothing new do not. A page whose selected
+files are all skipped waits the ordinary cadence. These observations add no
+timer or trigger.
 No full fingerprint, path or key is emitted, and none of these fields enters uploads.
 
 ## Prior Held Family Observation

@@ -179,6 +179,7 @@ pub(crate) use codex_file_join::tests::{
     counting_v2_fixture, native_join_fixture_root, older_build_logs_expired,
     older_build_logs_priority,
 };
+pub(crate) mod billing_route;
 #[cfg(test)]
 pub(crate) use sources::codex::counting::version::TestCutover;
 #[cfg(test)]
@@ -565,6 +566,10 @@ pub struct SourceScanResult {
     pub(crate) routine_recensus: bool,
     /// Codex deferred a file because a page byte budget is spent.
     pub(crate) page_byte_budget_hit: bool,
+    /// The page recorded a selected census read of a file new to the index,
+    /// or a listing tick left census directories queued. Paces only a first
+    /// backfill.
+    pub(crate) first_read_progress: bool,
     pub scanned_file_count: usize,
     pub scanned_session_count: usize,
     pub semantic_noop_count: usize,
@@ -1479,10 +1484,12 @@ fn transcript_path_admitted(source: SnapshotSource, path: &Path) -> bool {
 pub(crate) use discovery::directory::FIRST_READ_WINDOW_DAYS;
 
 #[cfg(test)]
+pub(crate) use discovery::directory::with_test_directory_entries;
+#[cfg(test)]
 use discovery::directory::{
     advance_bounded_directory_traversal, collect_recent_jsonl_files,
     reconcile_missing_index_entries_with_limit, reconcile_missing_index_entries_with_side,
-    with_directory_read_fault, with_test_directory_entries,
+    with_directory_read_fault,
 };
 use discovery::directory::{
     advance_bounded_directory_traversal_with_budget, claude_absence_is_removal,

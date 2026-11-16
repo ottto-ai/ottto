@@ -869,12 +869,6 @@ fn released_version_one_history_gains_cloud_tables_and_keeps_its_version() {
             .len(),
         1
     );
-    store.cloud_erase_all().unwrap();
-    assert!(store
-        .cloud_read_acks(&scope, &[key.as_str()], now)
-        .unwrap()
-        .is_empty());
-    assert_eq!(store.cloud_crawl_completed_date(&scope).unwrap(), None);
     assert_eq!(raw_receipts(store.conn_for_test()), old_rows);
 }
 

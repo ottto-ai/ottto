@@ -5,8 +5,10 @@ use std::cell::{Cell, RefCell};
 // the default serial_test key shared by control's identity-mutation tests;
 // separate temporary stores alone do not isolate that global reservation.
 
-const INSTALLATION_ID: &str = "00000000-0000-4000-8000-000000000001";
-const GRANT_ID: &str = "00000000-0000-4000-8000-000000000002";
+const DEVICE_ID: &str = "00000000-0000-4000-8000-000000000001";
+const ORG_ID: &str = "org_fixture";
+const USER_ID: &str = "user_fixture";
+
 fn temp_dir(name: &str) -> PathBuf {
     crate::test_scratch::canonical_private_dir(&format!("ottto-cloud-sessions-{name}"))
 }
@@ -235,32 +237,25 @@ fn cloud_cli_escaped_writer_cannot_hold_deadline_or_kill_other_groups() {
     fixture.wait_gone("descendant");
 }
 
-/// [regress] Pause while a `codex cloud list` page lingers past its deadline
-/// (it may be refreshing its login) completes within the stop wait: after the
-/// page's deadline and the child's drain, with no SIGTERM, never before the
-/// child is gone. An account change waits the same way, so its CLI call must
-/// not time out first.
+/// [regress] An identity change while a `codex cloud list` page lingers past
+/// its deadline (it may be refreshing its login) completes within the stop
+/// wait: after the page's deadline and the child's drain, with no SIGTERM,
+/// never before the child is gone. An account change waits the same way, so
+/// its CLI call must not time out first.
 #[cfg(unix)]
 #[test]
 #[serial_test::serial]
-fn pause_during_a_lingering_cloud_child_completes_within_the_stop_wait() {
+fn identity_change_during_a_lingering_cloud_child_completes_within_the_stop_wait() {
     let fixture = CloudCliFixture::new("ignore-term", &[], 0);
-    let (_root, grants, checkpoints) = stores("lingering-child-pause");
-    enabled(&grants);
+    let (_root, checkpoints) = store("lingering-child-stop");
     let checkpoints = Arc::new(checkpoints);
-    let collector_grants = grants.clone();
     let collector_checkpoints = Arc::clone(&checkpoints);
     let drain = Duration::from_secs(1);
     let run = thread::spawn(move || {
         crate::agent_status::with_codex_app_server_test_timeouts(drain, drain, drain, drain, || {
             let server = Server::new();
             CloudCollector::default().run_slice(
-                &inputs(
-                    &collector_grants,
-                    &collector_checkpoints,
-                    &CodexCloudCliRunner,
-                    &server,
-                ),
+                &inputs(&collector_checkpoints, &CodexCloudCliRunner, &server),
                 Instant::now(),
                 midnight(),
             )
@@ -271,7 +266,6 @@ fn pause_during_a_lingering_cloud_child_completes_within_the_stop_wait() {
         assert!(Instant::now() < deadline, "the page's child started");
         thread::sleep(Duration::from_millis(5));
     }
-    grants.pause(now()).unwrap();
     let waited = Instant::now();
     checkpoints
         .wait_for_collector_io_idle(COLLECTOR_IO_STOP_TIMEOUT)
@@ -316,72 +310,14 @@ fn cloud_cli_completion_stops_redirected_descendants() {
     }
 }
 
-fn stores(name: &str) -> (PathBuf, CloudSessionGrantStore, CloudSessionCheckpointStore) {
+fn store(name: &str) -> (PathBuf, CloudSessionCheckpointStore) {
     let root = temp_dir(name);
-    (
-        root.clone(),
-        CloudSessionGrantStore::new(root.join("grant.json")),
-        CloudSessionCheckpointStore::new(&root),
-    )
-}
-
-fn authority(grant: &CloudSessionGrant, status: &str) -> CloudSessionGrantAuthorityV1 {
-    let binding = grant.backend_binding.as_ref().unwrap();
-    CloudSessionGrantAuthorityV1 {
-        schema_version: "cloud_collector_grant_authority.v1".to_string(),
-        grant_id: binding.grant_id.clone(),
-        grant_version: binding.grant_version,
-        status: status.to_string(),
-        can_collect: status == "enabled",
-        can_read_cloud_sessions: status != "revoked",
-        paused_at: None,
-        collect_not_before: None,
-        contract_version: "cloud_session_changes.v1".to_string(),
-        disclosure_version: "cloud_sessions_disclosure.v1".to_string(),
-    }
-}
-
-fn setup() -> CloudSessionGrantSetup {
-    CloudSessionGrantSetup {
-        installation_id: INSTALLATION_ID.to_string(),
-        organization_scope: "org_fixture".to_string(),
-        effective_user_scope: "user_fixture".to_string(),
-    }
-}
-
-fn enabled(store: &CloudSessionGrantStore) {
-    let local = store.enable(&setup(), now()).unwrap();
-    store.grant_create_request(INSTALLATION_ID).unwrap();
-    store
-        .bind_backend_grant(&backend_grant(&local, "enabled", 1), INSTALLATION_ID)
-        .unwrap();
-}
-
-fn backend_grant(
-    local: &CloudSessionGrant,
-    status: &str,
-    grant_version: u64,
-) -> CloudSessionBackendGrantResponseV1 {
-    CloudSessionBackendGrantResponseV1 {
-        id: GRANT_ID.to_string(),
-        installation_id: INSTALLATION_ID.to_string(),
-        source: "codex".to_string(),
-        collector_id: COLLECTOR_ID.to_string(),
-        schema_version: CHANGES_SCHEMA_VERSION.to_string(),
-        disclosure_version: DISCLOSURE_VERSION.to_string(),
-        grant_scope_fingerprint: local.grant_scope_id.clone(),
-        account_fingerprint: local.account_fingerprint.clone(),
-        status: status.to_string(),
-        grant_version,
-        can_collect: Some(status == "enabled"),
-        ..Default::default()
-    }
+    let checkpoints = CloudSessionCheckpointStore::new(&root);
+    (root, checkpoints)
 }
 
 fn runtime_identity_stores(
     root: &Path,
-    user_id: &str,
-    organization_id: &str,
     api_base_url: &str,
 ) -> (FileAccountStore, FileDeviceStore, FileConnectionStore) {
     let accounts = FileAccountStore::new(root.join("account.json"));
@@ -389,12 +325,12 @@ fn runtime_identity_stores(
         .save(&ottto_protocol::LocalAccountBinding {
             state: LocalAccountState::Connected,
             user: Some(ottto_protocol::LocalAccountUser {
-                id: user_id.to_string(),
+                id: USER_ID.to_string(),
                 email: "runtime@example.com".to_string(),
                 display_name: None,
             }),
             organization: Some(ottto_protocol::LocalAccountOrganization {
-                id: organization_id.to_string(),
+                id: ORG_ID.to_string(),
                 name: "Runtime Org".to_string(),
             }),
             connected_at: None,
@@ -406,7 +342,7 @@ fn runtime_identity_stores(
     let devices = FileDeviceStore::new(root.join("device.json"));
     devices
         .save(&LocalDeviceBinding {
-            device_id: INSTALLATION_ID.to_string(),
+            device_id: DEVICE_ID.to_string(),
             machine_id: Some("machine-runtime".to_string()),
             sources: vec!["codex".to_string()],
         })
@@ -424,11 +360,29 @@ fn runtime_identity_stores(
     (accounts, devices, connections)
 }
 
+/// Sets the kill switch for one test and clears it on drop.
+struct KillSwitch;
+
+impl KillSwitch {
+    fn on() -> Self {
+        // SAFETY: serial tests; no other thread reads the environment here.
+        unsafe { std::env::set_var(KILL_SWITCH_ENV, "1") };
+        Self
+    }
+}
+
+impl Drop for KillSwitch {
+    fn drop(&mut self) {
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(KILL_SWITCH_ENV) };
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Provider and server fakes.
 
 /// One provider task as the official `codex cloud list --json` prints it,
-/// with private fields the collector must never upload.
+/// with fields the collector must never upload.
 fn task(id: &str, status: &str) -> Value {
     json!({
         "id": id,
@@ -511,12 +465,61 @@ impl CloudSessionRunner for Cli {
     }
 }
 
+const OFF: CloudUploadPolicyV2 = CloudUploadPolicyV2 {
+    session_titles_enabled: false,
+    workspace_labels_enabled: false,
+};
+
+/// The Codex fields of an activity hint. `None` omits a field, as an older
+/// server does. `stray_key` sends the retired task-key field, which this
+/// build ignores.
+#[derive(Debug, Clone)]
+struct Hint {
+    enabled: Option<bool>,
+    stray_key: Option<String>,
+    contract: Option<String>,
+    policy: CloudUploadPolicyV2,
+}
+
+impl Hint {
+    fn on() -> Self {
+        Self {
+            enabled: Some(true),
+            stray_key: None,
+            contract: Some(CHANGES_SCHEMA_VERSION.to_string()),
+            policy: OFF,
+        }
+    }
+
+    fn decoded(&self) -> ActivityHintResponse {
+        let mut value = json!({
+            "source": "codex",
+            "server_time": "2026-07-21T10:00:00Z",
+            "last_data_at": null,
+            "record_count_15m": 0,
+            "record_count_24h": 0,
+            "local_usage_reconciliation_enabled": true,
+            "backfill_window_days": 183,
+            "session_titles_enabled": self.policy.session_titles_enabled,
+            "workspace_labels_enabled": self.policy.workspace_labels_enabled,
+            "recommended_scan_after": "2026-07-21T10:05:00Z"
+        });
+        if let Some(enabled) = self.enabled {
+            value["codex_cloud_tasks_enabled"] = json!(enabled);
+        }
+        if let Some(key) = &self.stray_key {
+            value["codex_cloud_task_key"] = json!(key);
+        }
+        if let Some(contract) = &self.contract {
+            value["codex_cloud_tasks_contract"] = json!(contract);
+        }
+        crate::snapshot_client::decode_activity_hint(value).unwrap()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Authority {
-    Enabled,
-    Paused,
-    Revoked,
-    /// An older server: the authority route does not exist.
+enum HintFault {
+    /// An older server: the route answers 404.
     Missing,
     Offline,
 }
@@ -526,19 +529,36 @@ enum AckFault {
     DropOne,
     NoEtag,
     Unsolicited,
+    /// Echo the first id in decomposed Unicode (`e` + U+0301 for `é`).
+    Decomposed,
 }
 
-/// A fake server holding one head etag per task. It answers `noop` for the
-/// same content, `accepted` when the predecessor etag matches, and `conflict`
-/// with its head as the hint otherwise.
+/// A whole-request refusal as the relay maps it: 410 reads like a missing
+/// route, 409 like listing off.
+fn refusal(status: u16) -> anyhow::Error {
+    if status == 410 {
+        anyhow::Error::new(crate::snapshot_client::CloudSessionRouteUnsupported { status })
+    } else {
+        anyhow::Error::new(crate::snapshot_client::CloudTaskRefused { status })
+    }
+}
+
+/// A fake server holding one head etag per task for one user. It answers
+/// `noop` for the same content, `accepted` when the predecessor etag matches,
+/// and `conflict` otherwise: like the live server with a null head etag,
+/// unless `conflict_reports_head` is set.
+/// Like the real server it refuses a body whose policy stamp differs from
+/// the policy its hint currently reports.
 struct Server {
-    authority: Cell<Authority>,
-    collect_not_before: RefCell<Option<String>>,
-    authority_calls: Cell<usize>,
-    requests: RefCell<Vec<CloudSessionChangesV1>>,
-    acks: RefCell<Vec<CloudSessionChangesAckV1>>,
+    hint: RefCell<Hint>,
+    hint_fault: Cell<Option<HintFault>>,
+    hint_calls: Cell<usize>,
+    refuse: Cell<Option<u16>>,
+    requests: RefCell<Vec<CloudSessionChangesV2>>,
+    acks: RefCell<Vec<CloudSessionChangesAckV2>>,
     heads: RefCell<HashMap<String, String>>,
     reject: RefCell<Vec<String>>,
+    conflict_reports_head: Cell<bool>,
     lose_acks: Cell<usize>,
     fault: Cell<Option<AckFault>>,
 }
@@ -546,16 +566,22 @@ struct Server {
 impl Server {
     fn new() -> Self {
         Self {
-            authority: Cell::new(Authority::Enabled),
-            collect_not_before: RefCell::new(None),
-            authority_calls: Cell::new(0),
+            hint: RefCell::new(Hint::on()),
+            hint_fault: Cell::new(None),
+            hint_calls: Cell::new(0),
+            refuse: Cell::new(None),
             requests: RefCell::new(Vec::new()),
             acks: RefCell::new(Vec::new()),
             heads: RefCell::new(HashMap::new()),
             reject: RefCell::new(Vec::new()),
+            conflict_reports_head: Cell::new(false),
             lose_acks: Cell::new(0),
             fault: Cell::new(None),
         }
+    }
+
+    fn set_hint(&self, change: impl FnOnce(&mut Hint)) {
+        change(&mut self.hint.borrow_mut());
     }
 
     fn offered(&self) -> usize {
@@ -575,61 +601,59 @@ impl Server {
     }
 }
 
-fn server_etag(change: &CloudSessionChangeV1) -> String {
+fn server_etag(change: &CloudSessionChangeV2) -> String {
     let mut content = change.clone();
     content.expected_head_etag = None;
     hex(Sha256::digest(serde_json::to_vec(&content).unwrap()).as_slice())
 }
 
 impl CloudSessionTransport for Server {
-    fn read_authority(
-        &self,
-        grant: &CloudSessionGrant,
-        _timeout: Duration,
-    ) -> Result<CloudSessionGrantAuthorityV1> {
-        self.authority_calls.set(self.authority_calls.get() + 1);
-        let status = match self.authority.get() {
-            Authority::Enabled => "enabled",
-            Authority::Paused => "paused",
-            Authority::Revoked => "revoked",
-            Authority::Missing => {
-                return Err(anyhow::Error::new(
-                    crate::snapshot_client::CloudSessionRouteUnsupported { status: 404 },
-                ))
-            }
-            Authority::Offline => return Err(anyhow!("offline")),
-        };
-        let mut response = authority(grant, status);
-        response.collect_not_before = self.collect_not_before.borrow().clone();
-        Ok(response)
+    fn read_hint(&self, _timeout: Duration) -> Result<ActivityHintResponse> {
+        self.hint_calls.set(self.hint_calls.get() + 1);
+        match self.hint_fault.get() {
+            Some(HintFault::Missing) => Err(anyhow::Error::new(
+                crate::snapshot_client::CloudSessionRouteUnsupported { status: 404 },
+            )),
+            Some(HintFault::Offline) => Err(anyhow!("offline")),
+            None => Ok(self.hint.borrow().decoded()),
+        }
     }
 
     fn send_changes(
         &self,
-        request: &CloudSessionChangesV1,
+        request: &CloudSessionChangesV2,
         _timeout: Duration,
-    ) -> Result<CloudSessionChangesAckV1> {
+    ) -> Result<CloudSessionChangesAckV2> {
         request.validate().unwrap();
         self.requests.borrow_mut().push(request.clone());
+        if let Some(status) = self.refuse.get() {
+            return Err(refusal(status));
+        }
+        if request.upload_policy != self.hint.borrow().policy {
+            return Err(refusal(409));
+        }
         let mut heads = self.heads.borrow_mut();
         let mut entities = request
             .observations
             .iter()
             .map(|change| {
                 let etag = server_etag(change);
-                let current = heads.get(&change.entity_key).cloned();
-                let (outcome, head_etag) = if self.reject.borrow().contains(&change.entity_key) {
-                    (CloudSessionChangeOutcome::Rejected, None)
-                } else if current.as_deref() == Some(etag.as_str()) {
-                    (CloudSessionChangeOutcome::Noop, Some(etag))
-                } else if change.expected_head_etag == current {
-                    heads.insert(change.entity_key.clone(), etag.clone());
-                    (CloudSessionChangeOutcome::Accepted, Some(etag))
-                } else {
-                    (CloudSessionChangeOutcome::Conflict, current)
-                };
-                CloudSessionChangeAckV1 {
-                    entity_key: change.entity_key.clone(),
+                let current = heads.get(&change.source_session_id).cloned();
+                let (outcome, head_etag) =
+                    if self.reject.borrow().contains(&change.source_session_id) {
+                        (CloudSessionChangeOutcome::Rejected, None)
+                    } else if current.as_deref() == Some(etag.as_str()) {
+                        (CloudSessionChangeOutcome::Noop, Some(etag))
+                    } else if change.expected_head_etag == current {
+                        heads.insert(change.source_session_id.clone(), etag.clone());
+                        (CloudSessionChangeOutcome::Accepted, Some(etag))
+                    } else if self.conflict_reports_head.get() {
+                        (CloudSessionChangeOutcome::Conflict, current)
+                    } else {
+                        (CloudSessionChangeOutcome::Conflict, None)
+                    };
+                CloudSessionChangeAckV2 {
+                    source_session_id: change.source_session_id.clone(),
                     outcome,
                     head_etag,
                     accepted_seq: None,
@@ -647,14 +671,16 @@ impl CloudSessionTransport for Server {
             }
             Some(AckFault::NoEtag) => entities[0].head_etag = None,
             Some(AckFault::Unsolicited) => {
-                entities[0].entity_key = format!("hmac-sha256:{}", "f".repeat(64))
+                entities[0].source_session_id = "unsolicited-task".to_string()
+            }
+            Some(AckFault::Decomposed) => {
+                entities[0].source_session_id =
+                    entities[0].source_session_id.replace('é', "e\u{301}")
             }
             None => {}
         }
-        let ack = CloudSessionChangesAckV1 {
-            schema_version: "cloud_session_changes_ack.v1".to_string(),
-            grant_id: request.grant_id.clone(),
-            grant_version: request.grant_version,
+        let ack = CloudSessionChangesAckV2 {
+            schema_version: wire::CHANGES_ACK_SCHEMA_VERSION.to_string(),
             entities,
         };
         self.acks.borrow_mut().push(ack.clone());
@@ -663,18 +689,17 @@ impl CloudSessionTransport for Server {
 }
 
 fn inputs<'a>(
-    grants: &'a CloudSessionGrantStore,
     checkpoints: &'a CloudSessionCheckpointStore,
     cli: &'a dyn CloudSessionRunner,
     server: &'a dyn CloudSessionTransport,
 ) -> SliceInputs<'a> {
     SliceInputs {
-        grants,
         checkpoints,
         runner: cli,
         transport: server,
         destination: DEFAULT_API_BASE_URL,
-        last_activity: None,
+        organization_id: ORG_ID,
+        user_id: USER_ID,
     }
 }
 
@@ -686,28 +711,21 @@ const MINUTE: Duration = Duration::from_secs(60);
 const HOUR: Duration = Duration::from_secs(60 * 60);
 
 /// Drive the collector the way the supervisor does, on a fake clock from
-/// `wall0`, for `horizon`: run a slice, then sleep until `next_wake`. With
-/// `warm`, local Codex is active throughout.
+/// `wall0`, for `horizon`: run a slice, then sleep until `next_wake`.
 fn drive(
     collector: &mut CloudCollector,
     inputs: &SliceInputs<'_>,
     t0: Instant,
     wall0: OffsetDateTime,
     horizon: Duration,
-    warm: bool,
 ) -> Vec<(Duration, CloudSessionCycleOutcome)> {
     let mut offset = Duration::ZERO;
     let mut outcomes = Vec::new();
     while offset < horizon {
         let now = t0 + offset;
         let wall = wall0 + offset;
-        let last_activity = warm.then_some(now);
-        let slice = SliceInputs {
-            last_activity,
-            ..*inputs
-        };
-        outcomes.push((offset, collector.run_slice(&slice, now, wall)));
-        let Some(next) = collector.next_wake(now, wall, last_activity) else {
+        outcomes.push((offset, collector.run_slice(inputs, now, wall)));
+        let Some(next) = collector.next_wake(now, wall) else {
             break;
         };
         offset = next
@@ -729,120 +747,163 @@ fn slice(
 // ---------------------------------------------------------------------------
 // Schedule: provider and backend calls per day. [behaviour]
 
-/// [behaviour] 24 hours from 00:00 UTC on a fake clock: no consent, a pause
-/// or an older server make no provider call; an idle account costs four
-/// heads, active local Codex 48, a running head task 288. A deep unfinished
-/// task does not speed up the head.
+/// [behaviour] 24 hours from 00:00 UTC on a fake clock. Listing off, an
+/// older server's hint or a missing route make no provider call; an
+/// unchanged account's head slows from five minutes towards a day (nine
+/// heads, one upload); a deep task adds one crawl page.
 #[test]
 #[serial_test::serial]
 fn a_day_of_provider_calls_follows_the_schedule() {
     let day = 24 * HOUR;
-    let run = |name: &str,
-               prepare: &dyn Fn(&CloudSessionGrantStore, &Server),
-               pages: Vec<(Option<String>, String)>,
-               warm: bool| {
-        let (_root, grants, checkpoints) = stores(name);
+    let run = |name: &str, prepare: &dyn Fn(&Server), pages: Vec<(Option<String>, String)>| {
+        let (_root, checkpoints) = store(name);
         let server = Server::new();
-        prepare(&grants, &server);
+        prepare(&server);
         let cli = Cli::new(pages);
         let mut collector = CloudCollector::default();
         drive(
             &mut collector,
-            &inputs(&grants, &checkpoints, &cli, &server),
+            &inputs(&checkpoints, &cli, &server),
             Instant::now(),
             midnight(),
             day,
-            warm,
         );
         (
             cli.calls(),
-            server.authority_calls.get(),
+            server.hint_calls.get(),
             server.requests.borrow().len(),
         )
     };
     let one = || vec![(None, page("idle-task", None))];
 
-    assert_eq!(run("day-no-consent", &|_, _| {}, one(), true), (0, 0, 0));
     assert_eq!(
         run(
-            "day-paused",
-            &|grants, _| {
-                enabled(grants);
-                grants.pause(now()).unwrap();
-            },
-            one(),
-            true
+            "day-off",
+            &|server| server.set_hint(|hint| {
+                hint.enabled = Some(false);
+            }),
+            one()
         ),
-        (0, 0, 0)
+        (0, 48, 0)
     );
     assert_eq!(
         run(
-            "day-older-server",
-            &|grants, server| {
-                enabled(grants);
-                server.authority.set(Authority::Missing);
-            },
-            one(),
-            true
+            "day-older-hint",
+            &|server| server.set_hint(|hint| {
+                hint.enabled = None;
+                hint.contract = None;
+            }),
+            one()
         ),
-        (0, 4, 0)
+        (0, 48, 0)
     );
     assert_eq!(
         run(
-            "day-remote-pause",
-            &|grants, server| {
-                enabled(grants);
-                server.authority.set(Authority::Paused);
-            },
-            one(),
-            false
+            "day-route-missing",
+            &|server| server.hint_fault.set(Some(HintFault::Missing)),
+            one()
         ),
         (0, 4, 0)
     );
-    assert_eq!(
-        run("day-idle", &|grants, _| enabled(grants), one(), false),
-        (4, 4, 1)
-    );
-    assert_eq!(
-        run("day-active", &|grants, _| enabled(grants), one(), true),
-        (48, 48, 1)
-    );
+    assert_eq!(run("day-unchanged", &|_| {}, one()), (9, 9, 1));
     assert_eq!(
         run(
-            "day-running",
-            &|grants, _| enabled(grants),
-            vec![(None, page_of(vec![task("running-task", "running")], None))],
-            false
-        ),
-        (288, 288, 1)
-    );
-    assert_eq!(
-        run(
-            "day-deep-unknown",
-            &|grants, _| enabled(grants),
+            "day-deep",
+            &|_| {},
             vec![
                 (None, page("head-task", Some("c1"))),
                 (
                     Some("c1".to_string()),
                     page_of(vec![task("deep-task", "pending")], None)
                 ),
-            ],
-            false
+            ]
         ),
-        (5, 4, 2)
+        (10, 9, 2)
+    );
+}
+
+/// [behaviour] The head interval doubles after each successful head listing
+/// that the server accepted nothing new from, up to a day. Only an accepted
+/// task resets it to five minutes: a second Mac whose upload the server
+/// answers `noop` keeps slowing down.
+#[test]
+#[serial_test::serial]
+fn head_interval_doubles_to_a_day_and_resets_only_on_accepted() {
+    assert_eq!(head_interval(0), 5 * MINUTE);
+    assert_eq!(head_interval(1), 10 * MINUTE);
+    assert_eq!(head_interval(8), 1280 * MINUTE);
+    for unchanged in [9, 31, 32, 40, u32::MAX] {
+        assert_eq!(head_interval(unchanged), 24 * HOUR, "{unchanged}");
+    }
+
+    let cli = Cli::head(page("steady", None));
+    let server = Server::new();
+    let (_root, mac_a) = store("interval-mac-a");
+    let a_inputs = inputs(&mac_a, &cli, &server);
+    let t0 = Instant::now();
+    let mut a = CloudCollector::default();
+    assert_eq!(
+        slice(&mut a, &a_inputs, t0, Duration::ZERO),
+        CloudSessionCycleOutcome::Uploaded
+    );
+    assert_eq!(a.next_wake(t0, midnight()), Some(t0 + 5 * MINUTE));
+    let mut at = 5 * MINUTE;
+    let mut wait = 10 * MINUTE;
+    for _ in 0..8 {
+        assert_eq!(
+            slice(&mut a, &a_inputs, t0, at),
+            CloudSessionCycleOutcome::Noop
+        );
+        assert_eq!(a.next_wake(t0 + at, midnight() + at), Some(t0 + at + wait));
+        at += wait;
+        wait *= 2;
+    }
+    assert_eq!(server.requests.borrow().len(), 1);
+
+    // A second Mac of the same user lists the same task: one head at the
+    // server, a noop, and no reset.
+    let (_root, mac_b) = store("interval-mac-b");
+    let b_inputs = inputs(&mac_b, &cli, &server);
+    let mut b = CloudCollector::default();
+    assert_eq!(
+        slice(&mut b, &b_inputs, t0, HOUR),
+        CloudSessionCycleOutcome::Uploaded
+    );
+    assert_eq!(
+        server.outcomes().last(),
+        Some(&CloudSessionChangeOutcome::Noop)
+    );
+    assert_eq!(server.heads.borrow().len(), 1);
+    assert_eq!(
+        b.next_wake(t0 + HOUR, midnight() + HOUR),
+        Some(t0 + HOUR + 10 * MINUTE)
+    );
+
+    // A changed task is accepted and the head is fast again.
+    cli.set(None, page_of(vec![task("steady", "error")], None));
+    assert_eq!(
+        slice(&mut a, &a_inputs, t0, at),
+        CloudSessionCycleOutcome::Uploaded
+    );
+    assert_eq!(
+        server.outcomes().last(),
+        Some(&CloudSessionChangeOutcome::Accepted)
+    );
+    assert_eq!(
+        a.next_wake(t0 + at, midnight() + at),
+        Some(t0 + at + 5 * MINUTE)
     );
 }
 
 /// [behaviour] A deep crawl is paced, not truncated: ten pages per slice,
-/// continuing five minutes later where it stopped.
+/// continuing five minutes later where it stopped (with the due head).
 #[test]
 #[serial_test::serial]
 fn daily_crawl_takes_ten_pages_then_continues_five_minutes_later() {
-    let (_root, grants, checkpoints) = stores("crawl-paced");
-    enabled(&grants);
+    let (_root, checkpoints) = store("crawl-paced");
     let cli = Cli::new(chain(18, 1, "applied"));
     let server = Server::new();
-    let inputs = inputs(&grants, &checkpoints, &cli, &server);
+    let inputs = inputs(&checkpoints, &cli, &server);
     let mut collector = CloudCollector::default();
     let t0 = Instant::now();
 
@@ -851,25 +912,24 @@ fn daily_crawl_takes_ten_pages_then_continues_five_minutes_later() {
         CloudSessionCycleOutcome::Uploaded
     );
     assert_eq!(cli.calls(), 10);
-    assert_eq!(
-        collector.next_wake(t0, midnight(), None),
-        Some(t0 + 5 * MINUTE)
-    );
+    assert_eq!(collector.next_wake(t0, midnight()), Some(t0 + 5 * MINUTE));
     assert_eq!(
         slice(&mut collector, &inputs, t0, 5 * MINUTE),
         CloudSessionCycleOutcome::Uploaded
     );
     let expected = std::iter::once(None)
-        .chain((1..18).map(|index| Some(format!("c{index}"))))
+        .chain((1..10).map(|index| Some(format!("c{index}"))))
+        .chain(std::iter::once(None))
+        .chain((10..18).map(|index| Some(format!("c{index}"))))
         .collect::<Vec<_>>();
     assert_eq!(*cli.calls.borrow(), expected);
     assert_eq!(server.offered(), 18);
-    assert_eq!(server.authority_calls.get(), 2);
+    assert_eq!(server.hint_calls.get(), 2);
     assert_eq!(collector.schedule.crawl_completed, Some(midnight().date()));
-    // The crawl is done for the day; only the idle head remains.
+    // The crawl is done for the day; only the head remains.
     assert_eq!(
-        collector.next_wake(t0 + 5 * MINUTE, midnight() + 5 * MINUTE, None),
-        Some(t0 + 6 * HOUR)
+        collector.next_wake(t0 + 5 * MINUTE, midnight() + 5 * MINUTE),
+        Some(t0 + 10 * MINUTE)
     );
 }
 
@@ -878,20 +938,24 @@ fn daily_crawl_takes_ten_pages_then_continues_five_minutes_later() {
 #[test]
 #[serial_test::serial]
 fn crawl_beyond_one_hundred_pages_and_two_thousand_tasks_reaches_the_tail() {
-    let (_root, grants, checkpoints) = stores("crawl-deep");
-    enabled(&grants);
+    let (_root, checkpoints) = store("crawl-deep");
     let cli = Cli::new(chain(120, PAGE_LIMIT, "applied"));
     let server = Server::new();
     let mut collector = CloudCollector::default();
     let outcomes = drive(
         &mut collector,
-        &inputs(&grants, &checkpoints, &cli, &server),
+        &inputs(&checkpoints, &cli, &server),
         Instant::now(),
         midnight(),
         2 * HOUR,
-        false,
     );
-    assert_eq!(cli.calls(), 120, "slice outcomes: {outcomes:?}");
+    let crawled = cli
+        .calls
+        .borrow()
+        .iter()
+        .filter(|cursor| cursor.is_some())
+        .count();
+    assert_eq!(crawled, 119, "slice outcomes: {outcomes:?}");
     let keys = server
         .requests
         .borrow()
@@ -900,7 +964,7 @@ fn crawl_beyond_one_hundred_pages_and_two_thousand_tasks_reaches_the_tail() {
             request
                 .observations
                 .iter()
-                .map(|change| change.entity_key.clone())
+                .map(|change| change.source_session_id.clone())
         })
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(keys.len(), 120 * PAGE_LIMIT);
@@ -914,19 +978,18 @@ fn crawl_beyond_one_hundred_pages_and_two_thousand_tasks_reaches_the_tail() {
 #[test]
 #[serial_test::serial]
 fn crawl_survives_midnight_and_a_restart_reoffers_nothing_settled() {
-    let (_root, grants, checkpoints) = stores("crawl-midnight");
-    enabled(&grants);
+    let (_root, checkpoints) = store("crawl-midnight");
     let cli = Cli::new(chain(18, 1, "applied"));
     let server = Server::new();
-    let inputs = inputs(&grants, &checkpoints, &cli, &server);
+    let inputs = inputs(&checkpoints, &cli, &server);
     let late = OffsetDateTime::parse("2026-07-21T23:55:00Z", &Rfc3339).unwrap();
     let t0 = Instant::now();
     let mut collector = CloudCollector::default();
     collector.run_slice(&inputs, t0, late);
     assert_eq!(cli.calls(), 10);
     collector.run_slice(&inputs, t0 + 5 * MINUTE, late + 5 * MINUTE);
-    assert_eq!(cli.calls(), 18);
-    assert_eq!(cli.calls.borrow()[10].as_deref(), Some("c10"));
+    assert_eq!(cli.calls(), 19);
+    assert_eq!(cli.calls.borrow()[11].as_deref(), Some("c10"));
     let next_day = (late + 5 * MINUTE).date();
     assert_eq!(collector.schedule.crawl_completed, Some(next_day));
 
@@ -936,17 +999,15 @@ fn crawl_survives_midnight_and_a_restart_reoffers_nothing_settled() {
         restarted.run_slice(&inputs, t0 + 10 * MINUTE, late + 10 * MINUTE),
         CloudSessionCycleOutcome::Noop
     );
-    assert_eq!(cli.calls(), 19);
+    assert_eq!(cli.calls(), 20);
     assert_eq!(server.offered(), 18);
 
     // A restart mid-crawl starts a new crawl from the head; settled pages
     // are listed again but nothing settled is offered again.
-    let (_root, grants, checkpoints) = stores("crawl-restart");
-    enabled(&grants);
+    let (_root, checkpoints) = store("crawl-restart");
     let cli = Cli::new(chain(18, 1, "applied"));
     let server = Server::new();
     let inputs = SliceInputs {
-        grants: &grants,
         checkpoints: &checkpoints,
         runner: &cli,
         transport: &server,
@@ -961,14 +1022,13 @@ fn crawl_survives_midnight_and_a_restart_reoffers_nothing_settled() {
         t0 + MINUTE,
         midnight() + MINUTE,
         HOUR,
-        false,
     );
-    assert_eq!(cli.calls(), 10 + 18);
     assert_eq!(server.offered(), 18);
     assert!(server
         .outcomes()
         .iter()
         .all(|outcome| *outcome == CloudSessionChangeOutcome::Accepted));
+    assert_eq!(restarted.schedule.crawl_completed, Some(midnight().date()));
 }
 
 /// [regress] A cursor chain that loops ends the day's traversal without
@@ -976,8 +1036,7 @@ fn crawl_survives_midnight_and_a_restart_reoffers_nothing_settled() {
 #[test]
 #[serial_test::serial]
 fn cycling_cursor_chain_ends_the_day_without_completion() {
-    let (_root, grants, checkpoints) = stores("crawl-cycle");
-    enabled(&grants);
+    let (_root, checkpoints) = store("crawl-cycle");
     let cli = Cli::new(vec![
         (None, page("cycle-0", Some("c1"))),
         (Some("c1".to_string()), page("cycle-1", Some("c2"))),
@@ -988,14 +1047,19 @@ fn cycling_cursor_chain_ends_the_day_without_completion() {
     let mut collector = CloudCollector::default();
     drive(
         &mut collector,
-        &inputs(&grants, &checkpoints, &cli, &server),
+        &inputs(&checkpoints, &cli, &server),
         Instant::now(),
         midnight(),
         24 * HOUR,
-        false,
     );
-    // One bounded traversal, then the three remaining idle heads.
-    assert!(cli.calls() <= MAX_SLICE_PAGES + 3, "{}", cli.calls());
+    // One bounded traversal; every later call is a head.
+    let crawled = cli
+        .calls
+        .borrow()
+        .iter()
+        .filter(|cursor| cursor.is_some())
+        .count();
+    assert!(crawled < MAX_SLICE_PAGES * 2, "{crawled}");
     assert_eq!(collector.schedule.crawl_completed, None);
     assert_eq!(collector.schedule.crawl_ended, Some(midnight().date()));
     assert_eq!(server.offered(), 4);
@@ -1024,6 +1088,327 @@ fn cursor_cycle_detector_finds_every_loop_length() {
         !cycle.repeats(cursor)
     }));
 }
+// ---------------------------------------------------------------------------
+// Listing on/off and server refusals. [behaviour]
+
+/// One way to change the server's hint.
+type HintChange<'a> = &'a dyn Fn(&mut Hint);
+
+/// [behaviour] Only a hint that turns listing on and names exactly this
+/// contract lets a slice call the provider; no key is needed, and a stray
+/// retired key field changes nothing. Anything else (a v2 server included)
+/// is off: no provider call, no upload, a hint recheck in 30 minutes.
+/// Turning listing on later starts collection without a restart.
+#[test]
+#[serial_test::serial]
+fn listing_runs_only_on_an_exact_hint() {
+    let cases: [(&str, HintChange); 6] = [
+        ("off", &|hint: &mut Hint| hint.enabled = Some(false)),
+        ("older-server", &|hint: &mut Hint| {
+            hint.enabled = None;
+            hint.contract = None;
+        }),
+        ("no-contract", &|hint: &mut Hint| hint.contract = None),
+        ("old-contract", &|hint: &mut Hint| {
+            hint.contract = Some("cloud_session_changes.v1".to_string())
+        }),
+        ("v2-server", &|hint: &mut Hint| {
+            hint.stray_key = Some("BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc".to_string());
+            hint.contract = Some("cloud_session_changes.v2".to_string())
+        }),
+        ("off-with-stray-key", &|hint: &mut Hint| {
+            hint.enabled = Some(false);
+            hint.stray_key = Some("BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc".to_string());
+        }),
+    ];
+    for (name, change) in cases {
+        let (_root, checkpoints) = store(&format!("hint-{name}"));
+        let cli = Cli::head(page("never-listed", None));
+        let server = Server::new();
+        server.set_hint(change);
+        let inputs = inputs(&checkpoints, &cli, &server);
+        let t0 = Instant::now();
+        let mut collector = CloudCollector::default();
+        assert_eq!(
+            slice(&mut collector, &inputs, t0, Duration::ZERO),
+            CloudSessionCycleOutcome::Unsupported,
+            "{name}"
+        );
+        assert_eq!(cli.calls(), 0, "{name}");
+        assert!(server.requests.borrow().is_empty(), "{name}");
+        assert_eq!(
+            collector.next_wake(t0, midnight()),
+            Some(t0 + 30 * MINUTE),
+            "{name}"
+        );
+        assert_eq!(collector.reported, Some("listing_off"), "{name}");
+
+        *server.hint.borrow_mut() = Hint::on();
+        assert_eq!(
+            slice(&mut collector, &inputs, t0, 30 * MINUTE),
+            CloudSessionCycleOutcome::Uploaded,
+            "{name}"
+        );
+        assert_eq!(cli.calls(), 1, "{name}");
+    }
+    let mut stray = Hint::on();
+    stray.stray_key = Some("short".to_string());
+    assert_eq!(codex_cloud_listing(&stray.decoded()), Some(OFF));
+    assert_eq!(codex_cloud_listing(&Hint::on().decoded()), Some(OFF));
+}
+
+/// [behaviour] The kill switch stops everything before the hint read; an
+/// unconfigured transport does too.
+#[test]
+#[serial_test::serial]
+fn kill_switch_and_unconfigured_transport_make_no_call() {
+    struct Unconfigured(Server);
+    impl CloudSessionTransport for Unconfigured {
+        fn is_configured(&self) -> bool {
+            false
+        }
+        fn read_hint(&self, timeout: Duration) -> Result<ActivityHintResponse> {
+            self.0.read_hint(timeout)
+        }
+        fn send_changes(
+            &self,
+            request: &CloudSessionChangesV2,
+            timeout: Duration,
+        ) -> Result<CloudSessionChangesAckV2> {
+            self.0.send_changes(request, timeout)
+        }
+    }
+    let (_root, checkpoints) = store("kill-switch");
+    let cli = Cli::head(page("never-listed", None));
+    let server = Server::new();
+    let t0 = Instant::now();
+    let mut collector = CloudCollector::default();
+    {
+        let _kill = KillSwitch::on();
+        assert_eq!(
+            slice(
+                &mut collector,
+                &inputs(&checkpoints, &cli, &server),
+                t0,
+                Duration::ZERO
+            ),
+            CloudSessionCycleOutcome::Disabled
+        );
+        assert_eq!(collector.next_wake(t0, midnight()), None);
+    }
+    assert_eq!((cli.calls(), server.hint_calls.get()), (0, 0));
+
+    let unconfigured = Unconfigured(Server::new());
+    assert_eq!(
+        slice(
+            &mut collector,
+            &inputs(&checkpoints, &cli, &unconfigured),
+            t0,
+            Duration::ZERO
+        ),
+        CloudSessionCycleOutcome::Disabled
+    );
+    assert_eq!((cli.calls(), unconfigured.0.hint_calls.get()), (0, 0));
+}
+
+/// [behaviour] An older server without the hint route: the collector is
+/// idle and quiet and reads the hint again in six hours.
+#[test]
+#[serial_test::serial]
+fn missing_hint_route_rechecks_in_six_hours() {
+    let (_root, checkpoints) = store("route-missing");
+    let cli = Cli::head(page("never-listed", None));
+    let server = Server::new();
+    server.hint_fault.set(Some(HintFault::Missing));
+    let inputs = inputs(&checkpoints, &cli, &server);
+    let t0 = Instant::now();
+    let mut collector = CloudCollector::default();
+    assert_eq!(
+        slice(&mut collector, &inputs, t0, Duration::ZERO),
+        CloudSessionCycleOutcome::Unsupported
+    );
+    assert_eq!(cli.calls(), 0);
+    assert_eq!(collector.next_wake(t0, midnight()), Some(t0 + 6 * HOUR));
+    server.hint_fault.set(None);
+    assert_eq!(
+        slice(&mut collector, &inputs, t0, 6 * HOUR),
+        CloudSessionCycleOutcome::Uploaded
+    );
+}
+
+/// [behaviour] A whole-request refusal settles nothing and rechecks: any 409
+/// (listing turned off since the hint, or a policy mismatch) in 30 minutes,
+/// a 410 (contract retired) in six hours like a missing route. The recheck
+/// reads the hint again and offers the task again under its policy. A long
+/// head interval cannot postpone the 30-minute recheck.
+#[test]
+#[serial_test::serial]
+fn request_refusals_recheck_and_settle_nothing() {
+    /// Turns titles on at the server between the hint and the upload.
+    struct FlipOnList<'a> {
+        cli: Cli,
+        server: &'a Server,
+        flip: Cell<bool>,
+    }
+    impl CloudSessionRunner for FlipOnList<'_> {
+        fn list_page(&self, cursor: Option<&str>, limit: usize) -> Result<String> {
+            if self.flip.replace(false) {
+                self.server
+                    .set_hint(|hint| hint.policy.session_titles_enabled = true);
+            }
+            self.cli.list_page(cursor, limit)
+        }
+    }
+    let t0 = Instant::now();
+    for (name, refuse, flip, recheck, state) in [
+        (
+            "listing-off",
+            Some(409),
+            false,
+            30 * MINUTE,
+            "server_refused",
+        ),
+        ("policy-mismatch", None, true, 30 * MINUTE, "server_refused"),
+        ("retired", Some(410), false, 6 * HOUR, "server_unsupported"),
+    ] {
+        let (_root, checkpoints) = store(&format!("refused-{name}"));
+        let server = Server::new();
+        server.refuse.set(refuse);
+        let runner = FlipOnList {
+            cli: Cli::head(page("refused", None)),
+            server: &server,
+            flip: Cell::new(flip),
+        };
+        let inputs = inputs(&checkpoints, &runner, &server);
+        let mut collector = CloudCollector::default();
+        assert_eq!(
+            slice(&mut collector, &inputs, t0, Duration::ZERO),
+            CloudSessionCycleOutcome::Unsupported,
+            "{name}"
+        );
+        assert_eq!(
+            collector.next_wake(t0, midnight()),
+            Some(t0 + recheck),
+            "{name}"
+        );
+        assert_eq!(collector.reported, Some(state), "{name}");
+        assert!(
+            checkpoints
+                .read_acks(
+                    &cache_scope(&inputs),
+                    &["refused"],
+                    midnight().unix_timestamp()
+                )
+                .unwrap()
+                .is_empty(),
+            "{name}"
+        );
+        server.refuse.set(None);
+        assert_eq!(
+            slice(&mut collector, &inputs, t0, recheck),
+            CloudSessionCycleOutcome::Uploaded,
+            "{name}"
+        );
+        assert_eq!(server.hint_calls.get(), 2, "{name}");
+        let requests = server.requests.borrow();
+        assert_eq!(requests.len(), 2, "{name}");
+        let (first, second) = (&requests[0].observations[0], &requests[1].observations[0]);
+        assert_eq!(first.source_session_id, second.source_session_id, "{name}");
+        assert_eq!(second.expected_head_etag, None, "{name}");
+        assert_eq!(requests[1].upload_policy.session_titles_enabled, flip);
+        assert_eq!(second.title.is_some(), flip, "{name}");
+        assert_eq!(server.outcomes(), [CloudSessionChangeOutcome::Accepted]);
+    }
+
+    // After five unchanged heads (next head 160 minutes away) and a
+    // completed crawl, a refusal still reads the hint again 30 minutes later.
+    let (_root, checkpoints) = store("refused-mature");
+    let cli = Cli::head(page("mature", None));
+    let server = Server::new();
+    let inputs = inputs(&checkpoints, &cli, &server);
+    let mut collector = CloudCollector::default();
+    for at in [0, 5, 15, 35, 75, 155] {
+        slice(&mut collector, &inputs, t0, at * MINUTE);
+    }
+    assert_eq!(
+        collector.next_wake(t0 + 155 * MINUTE, midnight() + 155 * MINUTE),
+        Some(t0 + 315 * MINUTE)
+    );
+    cli.set(None, page_of(vec![task("mature", "error")], None));
+    server.refuse.set(Some(409));
+    assert_eq!(
+        slice(&mut collector, &inputs, t0, 315 * MINUTE),
+        CloudSessionCycleOutcome::Unsupported
+    );
+    assert_eq!(
+        collector.next_wake(t0 + 315 * MINUTE, midnight() + 315 * MINUTE),
+        Some(t0 + 345 * MINUTE)
+    );
+    server.refuse.set(None);
+    let hint_calls = server.hint_calls.get();
+    assert_eq!(
+        slice(&mut collector, &inputs, t0, 345 * MINUTE),
+        CloudSessionCycleOutcome::Uploaded
+    );
+    assert_eq!(server.hint_calls.get(), hint_calls + 1);
+    assert_eq!(
+        server.outcomes().last(),
+        Some(&CloudSessionChangeOutcome::Accepted)
+    );
+}
+
+/// [behaviour] Turning titles or workspace labels on or off offers every
+/// listed task again under the new policy, with its last head as the
+/// predecessor; the unchanged next head offers nothing.
+#[test]
+#[serial_test::serial]
+fn policy_flip_reoffers_under_the_new_policy() {
+    let (_root, checkpoints) = store("policy-flip");
+    let cli = Cli::head(page("flip", None));
+    let server = Server::new();
+    let inputs = inputs(&checkpoints, &cli, &server);
+    let t0 = Instant::now();
+    let mut collector = CloudCollector::default();
+    slice(&mut collector, &inputs, t0, Duration::ZERO);
+    let first = server.requests.borrow()[0].observations[0].clone();
+    server.set_hint(|hint| {
+        hint.policy = CloudUploadPolicyV2 {
+            session_titles_enabled: true,
+            workspace_labels_enabled: true,
+        }
+    });
+    assert_eq!(
+        slice(&mut collector, &inputs, t0, 5 * MINUTE),
+        CloudSessionCycleOutcome::Uploaded
+    );
+    {
+        let requests = server.requests.borrow();
+        assert_eq!(requests.len(), 2);
+        let second = &requests[1].observations[0];
+        assert_eq!(second.source_session_id, first.source_session_id);
+        assert_eq!(second.title.as_deref(), Some("private title"));
+        assert_eq!(
+            second.environment_label.as_deref(),
+            Some("Private environment")
+        );
+        assert_eq!(
+            second.expected_head_etag.as_deref(),
+            Some(server_etag(&first).as_str())
+        );
+    }
+    assert_eq!(
+        server.outcomes(),
+        [
+            CloudSessionChangeOutcome::Accepted,
+            CloudSessionChangeOutcome::Accepted
+        ]
+    );
+    assert_eq!(
+        slice(&mut collector, &inputs, t0, 6 * HOUR),
+        CloudSessionCycleOutcome::Noop
+    );
+    assert_eq!(server.requests.borrow().len(), 2);
+}
 
 // ---------------------------------------------------------------------------
 // ACK cache. [behaviour]
@@ -1034,8 +1419,7 @@ fn cursor_cycle_detector_finds_every_loop_length() {
 #[test]
 #[serial_test::serial]
 fn unchanged_tasks_are_not_uploaded_or_rewritten() {
-    let (_root, grants, checkpoints) = stores("cache-noop");
-    enabled(&grants);
+    let (_root, checkpoints) = store("cache-noop");
     let cli = Cli::head(page_of(
         vec![
             task("a", "applied"),
@@ -1045,7 +1429,7 @@ fn unchanged_tasks_are_not_uploaded_or_rewritten() {
         None,
     ));
     let server = Server::new();
-    let inputs = inputs(&grants, &checkpoints, &cli, &server);
+    let inputs = inputs(&checkpoints, &cli, &server);
     let t0 = Instant::now();
     let mut collector = CloudCollector::default();
     let day = 24 * HOUR;
@@ -1053,21 +1437,10 @@ fn unchanged_tasks_are_not_uploaded_or_rewritten() {
         slice(&mut collector, &inputs, t0, Duration::ZERO),
         CloudSessionCycleOutcome::Uploaded
     );
-    let grant = grants.load().unwrap().unwrap();
-    let scope = cache_scope(
-        DEFAULT_API_BASE_URL,
-        &grant,
-        grant.backend_binding.as_ref().unwrap(),
-    );
-    let keys = server.requests.borrow()[0]
-        .observations
-        .iter()
-        .map(|item| item.entity_key.clone())
-        .collect::<Vec<_>>();
-    let lookup = keys.iter().map(String::as_str).collect::<Vec<_>>();
+    let scope = cache_scope(&inputs);
     assert_eq!(
         checkpoints
-            .read_acks(&scope, &lookup, midnight().unix_timestamp())
+            .read_acks(&scope, &["a", "b", "c"], midnight().unix_timestamp())
             .unwrap()
             .len(),
         3
@@ -1092,8 +1465,7 @@ fn unchanged_tasks_are_not_uploaded_or_rewritten() {
 #[test]
 #[serial_test::serial]
 fn one_changed_sibling_is_the_only_task_offered() {
-    let (_root, grants, checkpoints) = stores("cache-sibling");
-    enabled(&grants);
+    let (_root, checkpoints) = store("cache-sibling");
     let cli = Cli::head(page_of(
         vec![
             task("a", "applied"),
@@ -1103,7 +1475,7 @@ fn one_changed_sibling_is_the_only_task_offered() {
         None,
     ));
     let server = Server::new();
-    let inputs = inputs(&grants, &checkpoints, &cli, &server);
+    let inputs = inputs(&checkpoints, &cli, &server);
     let t0 = Instant::now();
     let mut collector = CloudCollector::default();
     slice(&mut collector, &inputs, t0, Duration::ZERO);
@@ -1131,10 +1503,7 @@ fn one_changed_sibling_is_the_only_task_offered() {
     );
     let second = server.requests.borrow()[1].clone();
     assert_eq!(second.observations.len(), 1);
-    assert_eq!(
-        second.observations[0].entity_key,
-        first.observations[1].entity_key
-    );
+    assert_eq!(second.observations[0].source_session_id, "b");
     assert_eq!(second.observations[0].lifecycle, "completed");
     assert_eq!(
         second.observations[0].expected_head_etag.as_deref(),
@@ -1143,34 +1512,25 @@ fn one_changed_sibling_is_the_only_task_offered() {
     assert_eq!(server.outcomes()[3], CloudSessionChangeOutcome::Accepted);
 }
 
-/// [behaviour] A lost response or a lost cache commit is resent and settles
-/// as noop; nothing is double-counted and the cache then holds.
+/// [behaviour] A lost response is resent and settles as noop; nothing is
+/// double-counted and the cache then holds.
 #[test]
 #[serial_test::serial]
-fn lost_ack_or_lost_commit_is_resent_and_settles_noop() {
-    let (_root, grants, checkpoints) = stores("cache-lost-ack");
-    enabled(&grants);
+fn lost_ack_is_resent_and_settles_noop() {
+    let (_root, checkpoints) = store("cache-lost-ack");
     let cli = Cli::head(page("lost-ack", None));
     let server = Server::new();
     server.lose_acks.set(1);
-    let inputs = inputs(&grants, &checkpoints, &cli, &server);
+    let inputs = inputs(&checkpoints, &cli, &server);
     let t0 = Instant::now();
     let mut collector = CloudCollector::default();
     assert_eq!(
         slice(&mut collector, &inputs, t0, Duration::ZERO),
         CloudSessionCycleOutcome::Failed
     );
-    assert_eq!(
-        grants
-            .load()
-            .unwrap()
-            .unwrap()
-            .last_error_category
-            .as_deref(),
-        Some("transport_unavailable")
-    );
-    // The backoff, not the idle cadence, decides the retry.
-    let retry = collector.next_wake(t0, midnight(), None).unwrap();
+    assert_eq!(collector.reported, Some("transport_unavailable"));
+    // The backoff, not the head interval, decides the retry.
+    let retry = collector.next_wake(t0, midnight()).unwrap();
     assert!(retry < t0 + HOUR);
     let offset = retry.saturating_duration_since(t0);
     assert_eq!(
@@ -1183,20 +1543,6 @@ fn lost_ack_or_lost_commit_is_resent_and_settles_noop() {
         CloudSessionCycleOutcome::Noop
     );
     assert_eq!(server.requests.borrow().len(), 2);
-
-    // A cache that lost its commit forgets; the server answers noop again.
-    checkpoints.erase_cache().unwrap();
-    assert_eq!(
-        slice(&mut collector, &inputs, t0, offset + 12 * HOUR),
-        CloudSessionCycleOutcome::Uploaded
-    );
-    assert_eq!(
-        server.outcomes(),
-        [
-            CloudSessionChangeOutcome::Noop,
-            CloudSessionChangeOutcome::Noop
-        ]
-    );
     assert_eq!(server.heads.borrow().len(), 1);
 }
 
@@ -1206,15 +1552,14 @@ fn lost_ack_or_lost_commit_is_resent_and_settles_noop() {
 #[serial_test::serial]
 fn partial_or_malformed_ack_settles_nothing() {
     for fault in [AckFault::DropOne, AckFault::NoEtag, AckFault::Unsolicited] {
-        let (_root, grants, checkpoints) = stores("cache-bad-ack");
-        enabled(&grants);
+        let (_root, checkpoints) = store("cache-bad-ack");
         let cli = Cli::head(page_of(
             vec![task("a", "applied"), task("b", "applied")],
             None,
         ));
         let server = Server::new();
         server.fault.set(Some(fault));
-        let inputs = inputs(&grants, &checkpoints, &cli, &server);
+        let inputs = inputs(&checkpoints, &cli, &server);
         let t0 = Instant::now();
         let mut collector = CloudCollector::default();
         assert_eq!(
@@ -1223,7 +1568,7 @@ fn partial_or_malformed_ack_settles_nothing() {
             "{fault:?}"
         );
         let offset = collector
-            .next_wake(t0, midnight(), None)
+            .next_wake(t0, midnight())
             .unwrap()
             .saturating_duration_since(t0);
         slice(&mut collector, &inputs, t0, offset);
@@ -1233,22 +1578,214 @@ fn partial_or_malformed_ack_settles_nothing() {
     }
 }
 
-/// [behaviour] A per-task refusal is remembered for exactly that content, so
-/// it is not offered again until the task changes.
+/// [regress] A provider task id is the raw official `id`, sent byte for
+/// byte; the legacy `task_id` alias is never read, not even as a fallback.
+#[test]
+#[serial_test::serial]
+fn raw_task_id_is_sent_and_task_id_alias_is_not_read() {
+    let (_root, checkpoints) = store("raw-task-id");
+    let mut both = task("task_e_official id é", "applied");
+    both["task_id"] = json!("alias-for-official");
+    let mut alias_only = task("unused", "applied");
+    alias_only.as_object_mut().unwrap().remove("id");
+    alias_only["task_id"] = json!("alias-only");
+    let cli = Cli::head(page_of(vec![both, alias_only], None));
+    let server = Server::new();
+    assert_eq!(
+        slice(
+            &mut CloudCollector::default(),
+            &inputs(&checkpoints, &cli, &server),
+            Instant::now(),
+            Duration::ZERO,
+        ),
+        CloudSessionCycleOutcome::Uploaded
+    );
+    let requests = server.requests.borrow();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0]
+            .observations
+            .iter()
+            .map(|change| change.source_session_id.as_str())
+            .collect::<Vec<_>>(),
+        ["task_e_official id é"]
+    );
+    let text = serde_json::to_string(&requests[0]).unwrap();
+    assert!(!text.contains("alias"));
+}
+
+/// [behaviour] A structurally valid page whose rows all carry invalid task
+/// ids is skipped row by row, counted, and its official cursor still leads
+/// to the next page's valid task.
+#[test]
+#[serial_test::serial]
+fn invalid_only_page_continues_to_a_valid_page() {
+    let (_root, checkpoints) = store("invalid-only-page");
+    let cli = Cli::new(vec![
+        (
+            None,
+            page_of(
+                vec![
+                    task("", "applied"),
+                    task(" padded", "applied"),
+                    task(&"x".repeat(256), "applied"),
+                ],
+                Some("c1"),
+            ),
+        ),
+        (Some("c1".to_string()), page("valid-after-invalid", None)),
+    ]);
+    let server = Server::new();
+    let inputs = inputs(&checkpoints, &cli, &server);
+    let t0 = Instant::now();
+    let mut collector = CloudCollector::default();
+    assert_eq!(
+        slice(&mut collector, &inputs, t0, Duration::ZERO),
+        CloudSessionCycleOutcome::Uploaded
+    );
+    assert_eq!(cli.calls(), 2);
+    assert_eq!(
+        server.requests.borrow()[0]
+            .observations
+            .iter()
+            .map(|change| change.source_session_id.as_str())
+            .collect::<Vec<_>>(),
+        ["valid-after-invalid"]
+    );
+    assert_eq!(collector.schedule.crawl_completed, Some(midnight().date()));
+    assert_eq!(collector.reported, Some("ok"));
+    assert_eq!(collector.reported_invalid_ids, Some(3));
+    // The head alone still lists the invalid rows; the same count logs no
+    // second line and nothing is offered again.
+    assert_eq!(
+        slice(&mut collector, &inputs, t0, 5 * MINUTE),
+        CloudSessionCycleOutcome::Noop
+    );
+    assert_eq!(collector.reported_invalid_ids, Some(3));
+    assert_eq!(server.requests.borrow().len(), 1);
+}
+
+/// [behaviour] The ACK cache keys each task by a local digest of its id: a
+/// 255-code-point non-ASCII id settles, the upload-history files never hold
+/// its bytes, and after the file is reopened the unchanged task is not
+/// offered again while changed facts reuse its head etag.
+#[test]
+#[serial_test::serial]
+fn ack_cache_never_stores_the_raw_id() {
+    let id = "é".repeat(255);
+    let (root, checkpoints) = store("ack-raw-id");
+    let cli = Cli::head(page(&id, None));
+    let server = Server::new();
+    let t0 = Instant::now();
+    {
+        let inputs = inputs(&checkpoints, &cli, &server);
+        assert_eq!(
+            slice(&mut CloudCollector::default(), &inputs, t0, Duration::ZERO),
+            CloudSessionCycleOutcome::Uploaded
+        );
+    }
+    assert_eq!(server.outcomes(), [CloudSessionChangeOutcome::Accepted]);
+    // Touching another support directory closes this history file.
+    let (_other_root, other) = store("ack-raw-id-other");
+    other
+        .read_acks(&[0; 32], &["other"], midnight().unix_timestamp())
+        .unwrap();
+    let mut files = 0;
+    // Not even a 10-character prefix of the id is stored.
+    let prefix = &id.as_bytes()[..20];
+    for entry in fs::read_dir(root.join("snapshots")).unwrap() {
+        let path = entry.unwrap().path();
+        if !path.is_file() {
+            continue;
+        }
+        files += 1;
+        let bytes = fs::read(&path).unwrap();
+        assert!(!bytes.windows(prefix.len()).any(|window| window == prefix));
+    }
+    assert!(files > 0);
+
+    let reopened = CloudSessionCheckpointStore::new(&root);
+    let inputs = inputs(&reopened, &cli, &server);
+    let scope = cache_scope(&inputs);
+    let cached = checkpoints_ack(&reopened, &scope, &id).unwrap();
+    let first = server.requests.borrow()[0].observations[0].clone();
+    assert_eq!(cached.head_etag, Some(server_etag(&first)));
+    let mut restarted = CloudCollector::default();
+    assert_eq!(
+        slice(&mut restarted, &inputs, t0, 6 * HOUR),
+        CloudSessionCycleOutcome::Noop
+    );
+    assert_eq!(
+        server.requests.borrow().len(),
+        1,
+        "no POST for the unchanged task"
+    );
+
+    cli.set(None, page_of(vec![task(&id, "error")], None));
+    assert_eq!(
+        slice(&mut restarted, &inputs, t0, 12 * HOUR),
+        CloudSessionCycleOutcome::Uploaded
+    );
+    let requests = server.requests.borrow();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1].observations[0].source_session_id, id);
+    assert_eq!(
+        requests[1].observations[0].expected_head_etag,
+        Some(server_etag(&first))
+    );
+    assert_eq!(
+        server.outcomes(),
+        [
+            CloudSessionChangeOutcome::Accepted,
+            CloudSessionChangeOutcome::Accepted
+        ]
+    );
+}
+
+/// [behaviour] A non-ASCII id with inner spaces settles on the server's
+/// byte-identical echo; an echo in another Unicode normalization names an
+/// unsolicited task and settles nothing.
+#[test]
+#[serial_test::serial]
+fn non_ascii_id_settles_only_on_an_exact_echo() {
+    let id = "tâche é 1";
+    for decomposed in [false, true] {
+        let (_root, checkpoints) = store(&format!("echo-{decomposed}"));
+        let cli = Cli::head(page(id, None));
+        let server = Server::new();
+        if decomposed {
+            server.fault.set(Some(AckFault::Decomposed));
+        }
+        let inputs = inputs(&checkpoints, &cli, &server);
+        let mut collector = CloudCollector::default();
+        let outcome = slice(&mut collector, &inputs, Instant::now(), Duration::ZERO);
+        assert_eq!(
+            server.requests.borrow()[0].observations[0].source_session_id,
+            id
+        );
+        let cached = checkpoints_ack(&checkpoints, &cache_scope(&inputs), id);
+        if decomposed {
+            assert_eq!(outcome, CloudSessionCycleOutcome::Failed);
+            assert_eq!(collector.reported, Some("ack_invalid"));
+            assert!(cached.is_none());
+        } else {
+            assert_eq!(outcome, CloudSessionCycleOutcome::Uploaded);
+            assert!(cached.unwrap().head_etag.is_some());
+        }
+    }
+}
+
+/// [behaviour] A per-task refusal is remembered for exactly that content,
+/// with no credit, so it is not offered again until the task changes.
 #[test]
 #[serial_test::serial]
 fn rejected_task_is_not_reoffered_until_it_changes() {
-    let (_root, grants, checkpoints) = stores("cache-rejected");
-    enabled(&grants);
+    let (_root, checkpoints) = store("cache-rejected");
     let cli = Cli::head(page("refused", None));
     let server = Server::new();
-    let inputs = inputs(&grants, &checkpoints, &cli, &server);
+    let inputs = inputs(&checkpoints, &cli, &server);
     let t0 = Instant::now();
-    let parsed = parse_cloud_page(&page("refused", None), &grant_key(&grants), midnight()).unwrap();
-    server
-        .reject
-        .borrow_mut()
-        .push(parsed.changes[0].entity_key.clone());
+    server.reject.borrow_mut().push("refused".to_string());
     let mut collector = CloudCollector::default();
     slice(&mut collector, &inputs, t0, Duration::ZERO);
     slice(&mut collector, &inputs, t0, 6 * HOUR);
@@ -1261,265 +1798,217 @@ fn rejected_task_is_not_reoffered_until_it_changes() {
     assert_eq!(requests[1].observations[0].expected_head_etag, None);
 }
 
-fn grant_key(grants: &CloudSessionGrantStore) -> Vec<u8> {
-    decode_hex(&grants.read().unwrap().unwrap().hmac_key_hex).unwrap()
-}
-
-/// [behaviour] A conflict re-lists the same page once and retries with the
-/// server's head as the predecessor.
+/// [behaviour] Two Macs list one task in different states. A conflict that
+/// names the server head re-lists the page once and retries with that head
+/// as the predecessor; the next head offers nothing.
 #[test]
 #[serial_test::serial]
-fn conflict_relists_once_and_retries_with_the_server_head() {
-    let (_root, grants, checkpoints) = stores("conflict");
-    enabled(&grants);
-    let cli = Cli::head(page_of(vec![task("conflict", "running")], None));
+fn conflict_with_a_head_relists_once_and_retries_with_it() {
     let server = Server::new();
-    let inputs = inputs(&grants, &checkpoints, &cli, &server);
+    server.conflict_reports_head.set(true);
+    let (_root, mac_a) = store("conflict-mac-a");
+    let cli_a = Cli::head(page_of(vec![task("conflict", "running")], None));
     let t0 = Instant::now();
-    let mut collector = CloudCollector::default();
-    slice(&mut collector, &inputs, t0, Duration::ZERO);
+    slice(
+        &mut CloudCollector::default(),
+        &inputs(&mac_a, &cli_a, &server),
+        t0,
+        Duration::ZERO,
+    );
     let head = server.heads.borrow().values().next().unwrap().clone();
-    // The cache is lost and the task moved on: the offer has no predecessor.
-    checkpoints.erase_cache().unwrap();
-    cli.set(None, page_of(vec![task("conflict", "applied")], None));
+
+    let (_root, mac_b) = store("conflict-mac-b");
+    let cli_b = Cli::head(page_of(vec![task("conflict", "applied")], None));
+    let b_inputs = inputs(&mac_b, &cli_b, &server);
+    let mut b = CloudCollector::default();
     assert_eq!(
-        slice(&mut collector, &inputs, t0, 5 * MINUTE),
+        slice(&mut b, &b_inputs, t0, MINUTE),
         CloudSessionCycleOutcome::Uploaded
     );
-    assert_eq!(cli.calls(), 3);
-    let requests = server.requests.borrow();
-    assert_eq!(requests.len(), 3);
-    assert_eq!(requests[1].observations[0].expected_head_etag, None);
+    assert_eq!(cli_b.calls(), 2);
+    {
+        let requests = server.requests.borrow();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[1].observations[0].expected_head_etag, None);
+        assert_eq!(
+            requests[2].observations[0].expected_head_etag.as_deref(),
+            Some(head.as_str())
+        );
+    }
     assert_eq!(
-        requests[2].observations[0].expected_head_etag.as_deref(),
-        Some(head.as_str())
-    );
-    assert_eq!(
-        server.outcomes()[1..],
+        server.outcomes(),
         [
+            CloudSessionChangeOutcome::Accepted,
             CloudSessionChangeOutcome::Conflict,
             CloudSessionChangeOutcome::Accepted
         ]
     );
-    // Settled: the next head offers nothing.
-    drop(requests);
     assert_eq!(
-        slice(&mut collector, &inputs, t0, 7 * HOUR),
+        slice(&mut b, &b_inputs, t0, 7 * HOUR),
         CloudSessionCycleOutcome::Noop
     );
     assert_eq!(server.requests.borrow().len(), 3);
 }
 
-/// [behaviour] After an erasure the server's cutoff applies: only tasks the
-/// provider created after it are offered.
+/// [behaviour] A conflict without a server head settles nothing and earns
+/// no credit, but the same content is not sent again; changed content is
+/// offered again with no predecessor.
 #[test]
 #[serial_test::serial]
-fn erasure_cutoff_filters_older_and_undated_tasks() {
-    let (_root, grants, checkpoints) = stores("cutoff");
-    enabled(&grants);
-    let mut newer = task("newer", "applied");
-    newer["created_at"] = json!("2026-07-20T13:00:00Z");
-    let mut undated = task("undated", "applied");
-    undated.as_object_mut().unwrap().remove("created_at");
+fn conflict_without_a_head_settles_nothing_and_is_not_resent() {
+    let server = Server::new();
+    let (_root, mac_a) = store("conflict-null-mac-a");
+    let cli_a = Cli::head(page_of(vec![task("contended", "running")], None));
+    let t0 = Instant::now();
+    slice(
+        &mut CloudCollector::default(),
+        &inputs(&mac_a, &cli_a, &server),
+        t0,
+        Duration::ZERO,
+    );
+
+    let (_root, mac_b) = store("conflict-null-mac-b");
+    let cli_b = Cli::head(page_of(vec![task("contended", "applied")], None));
+    let b_inputs = inputs(&mac_b, &cli_b, &server);
+    let mut b = CloudCollector::default();
+    assert_eq!(
+        slice(&mut b, &b_inputs, t0, MINUTE),
+        CloudSessionCycleOutcome::Uploaded
+    );
+    assert_eq!(cli_b.calls(), 1, "no re-list without a head");
+    assert_eq!(b.unchanged_heads, 1, "a conflict earns no credit");
+    let scope = cache_scope(&b_inputs);
+    let cached = checkpoints_ack(&mac_b, &scope, "contended");
+    assert_eq!(cached.map(|ack| ack.head_etag), Some(None));
+
+    assert_eq!(
+        slice(&mut b, &b_inputs, t0, 6 * HOUR),
+        CloudSessionCycleOutcome::Noop
+    );
+    assert_eq!(server.requests.borrow().len(), 2);
+
+    cli_b.set(None, page_of(vec![task("contended", "error")], None));
+    slice(&mut b, &b_inputs, t0, 12 * HOUR);
+    let requests = server.requests.borrow();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[2].observations[0].expected_head_etag, None);
+    assert_eq!(server.heads.borrow().len(), 1);
+}
+
+fn checkpoints_ack(
+    checkpoints: &CloudSessionCheckpointStore,
+    scope: &[u8; 32],
+    id: &str,
+) -> Option<CloudAck> {
+    checkpoints
+        .read_acks(scope, &[id], midnight().unix_timestamp())
+        .unwrap()
+        .remove(id)
+}
+
+/// [behaviour] One ACK with accepted, noop, rejected and conflicting (no
+/// head) entries settles each exactly: only accepted and noop carry a head;
+/// the refusal and the conflict are remembered with none and earn no credit.
+/// After a restart the same page offers nothing.
+#[test]
+#[serial_test::serial]
+fn mixed_ack_settles_each_task_and_survives_a_restart() {
+    let (_root, checkpoints) = store("mixed-ack");
     let cli = Cli::head(page_of(
-        vec![task("older", "applied"), newer, undated],
+        vec![
+            task("new", "applied"),
+            task("known", "applied"),
+            task("refused", "applied"),
+            task("diverged", "applied"),
+        ],
         None,
     ));
     let server = Server::new();
-    *server.collect_not_before.borrow_mut() = Some("2026-07-20T12:00:00Z".to_string());
-    let inputs = inputs(&grants, &checkpoints, &cli, &server);
-    let mut collector = CloudCollector::default();
-    slice(&mut collector, &inputs, Instant::now(), Duration::ZERO);
-    let requests = server.requests.borrow();
-    assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].observations.len(), 1);
-    assert_eq!(
-        requests[0].observations[0].created_at.as_deref(),
-        Some("2026-07-20T13:00:00Z")
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Consent, authority and older servers. [behaviour]
-
-/// [behaviour] A remote revoke revokes locally, erases the cache and stops
-/// all provider calls; a local revoke stops them before any call.
-#[test]
-#[serial_test::serial]
-fn revoke_erases_the_cache_and_stops_collection() {
-    let (_root, grants, checkpoints) = stores("revoke-remote");
-    enabled(&grants);
-    let cli = Cli::head(page("revoked", None));
-    let server = Server::new();
-    let inputs = inputs(&grants, &checkpoints, &cli, &server);
-    let t0 = Instant::now();
-    let mut collector = CloudCollector::default();
-    slice(&mut collector, &inputs, t0, Duration::ZERO);
-    let scope = collector.schedule.scope.unwrap();
-    let key = server.requests.borrow()[0].observations[0]
-        .entity_key
-        .clone();
-    assert_eq!(
-        checkpoints
-            .read_acks(&scope, &[key.as_str()], midnight().unix_timestamp())
-            .unwrap()
-            .len(),
-        1
-    );
-    server.authority.set(Authority::Revoked);
-    assert_eq!(
-        slice(&mut collector, &inputs, t0, 6 * HOUR),
-        CloudSessionCycleOutcome::Disabled
-    );
-    assert_eq!(cli.calls(), 1);
-    assert_eq!(
-        grants.load().unwrap().unwrap().status,
-        CloudSessionGrantStatus::Revoked
-    );
-    assert!(checkpoints
-        .read_acks(&scope, &[key.as_str()], midnight().unix_timestamp())
+    let known = parse_cloud_page(&page("known", None), OFF, now())
         .unwrap()
-        .is_empty());
-    assert_eq!(collector.next_wake(t0 + 6 * HOUR, midnight(), None), None);
-    assert_eq!(
-        slice(&mut collector, &inputs, t0, 12 * HOUR),
-        CloudSessionCycleOutcome::Disabled
-    );
-    assert_eq!(server.authority_calls.get(), 2);
-
-    let (_root, grants, checkpoints) = stores("revoke-local");
-    enabled(&grants);
-    grants.revoke(now()).unwrap();
-    checkpoints.erase_cache().unwrap();
-    let cli = Cli::head(page("revoked", None));
-    let server = Server::new();
-    let mut collector = CloudCollector::default();
-    assert_eq!(
-        collector.run_slice(
-            &SliceInputs {
-                grants: &grants,
-                checkpoints: &checkpoints,
-                runner: &cli,
-                transport: &server,
-                destination: DEFAULT_API_BASE_URL,
-                last_activity: None,
-            },
-            t0,
-            midnight()
-        ),
-        CloudSessionCycleOutcome::Disabled
-    );
-    assert_eq!((cli.calls(), server.authority_calls.get()), (0, 0));
-}
-
-/// [behaviour] An older server without this contract: the feature is absent,
-/// the collector is idle and quiet, and a local consent change rechecks now.
-#[test]
-#[serial_test::serial]
-fn older_server_leaves_the_collector_idle_without_errors() {
-    let (_root, grants, checkpoints) = stores("older-server");
-    enabled(&grants);
-    let cli = Cli::head(page("never-listed", None));
-    let server = Server::new();
-    server.authority.set(Authority::Missing);
-    let inputs = inputs(&grants, &checkpoints, &cli, &server);
+        .changes
+        .remove(0);
+    server
+        .heads
+        .borrow_mut()
+        .insert(known.source_session_id.clone(), server_etag(&known));
+    server.reject.borrow_mut().push("refused".to_string());
+    server
+        .heads
+        .borrow_mut()
+        .insert("diverged".to_string(), "f".repeat(64));
+    let inputs = inputs(&checkpoints, &cli, &server);
     let t0 = Instant::now();
-    let mut collector = CloudCollector::default();
     assert_eq!(
-        slice(&mut collector, &inputs, t0, Duration::ZERO),
-        CloudSessionCycleOutcome::Unsupported
-    );
-    assert_eq!(cli.calls(), 0);
-    assert!(server.requests.borrow().is_empty());
-    assert_eq!(
-        collector.next_wake(t0, midnight(), None),
-        Some(t0 + 6 * HOUR)
-    );
-    let grant = grants.load().unwrap().unwrap();
-    assert_eq!(grant.status, CloudSessionGrantStatus::Enabled);
-    assert_ne!(grant.last_collector_health.as_deref(), Some("failing"));
-    collector.reset();
-    assert_eq!(collector.next_wake(t0, midnight(), None), None);
-    server.authority.set(Authority::Enabled);
-    assert_eq!(
-        slice(&mut collector, &inputs, t0, MINUTE),
+        slice(&mut CloudCollector::default(), &inputs, t0, Duration::ZERO),
         CloudSessionCycleOutcome::Uploaded
     );
-
-    // A grant response on another contract is equally unsupported.
-    let (_root, grants, checkpoints) = stores("older-contract");
-    enabled(&grants);
-    struct OldContract(Server);
-    impl CloudSessionTransport for OldContract {
-        fn read_authority(
-            &self,
-            grant: &CloudSessionGrant,
-            timeout: Duration,
-        ) -> Result<CloudSessionGrantAuthorityV1> {
-            let mut response = self.0.read_authority(grant, timeout)?;
-            response.contract_version = "cloud_session_observations.v1".to_string();
-            Ok(response)
-        }
-        fn send_changes(
-            &self,
-            request: &CloudSessionChangesV1,
-            timeout: Duration,
-        ) -> Result<CloudSessionChangesAckV1> {
-            self.0.send_changes(request, timeout)
-        }
+    assert_eq!(
+        server.outcomes(),
+        [
+            CloudSessionChangeOutcome::Accepted,
+            CloudSessionChangeOutcome::Noop,
+            CloudSessionChangeOutcome::Rejected,
+            CloudSessionChangeOutcome::Conflict
+        ]
+    );
+    assert_eq!(cli.calls(), 1, "a conflict without a head is not re-listed");
+    let scope = cache_scope(&inputs);
+    for (id, etag) in [
+        ("new", true),
+        ("known", true),
+        ("refused", false),
+        ("diverged", false),
+    ] {
+        let ack = checkpoints_ack(&checkpoints, &scope, id).unwrap();
+        assert_eq!(ack.head_etag.is_some(), etag, "{id}");
     }
-    let old = OldContract(Server::new());
-    let cli = Cli::head(page("never-listed", None));
-    let mut collector = CloudCollector::default();
+
+    let mut restarted = CloudCollector::default();
     assert_eq!(
-        collector.run_slice(
-            &SliceInputs {
-                grants: &grants,
-                checkpoints: &checkpoints,
-                runner: &cli,
-                transport: &old,
-                destination: DEFAULT_API_BASE_URL,
-                last_activity: None,
-            },
-            t0,
-            midnight()
-        ),
-        CloudSessionCycleOutcome::Unsupported
+        slice(&mut restarted, &inputs, t0, 6 * HOUR),
+        CloudSessionCycleOutcome::Noop
     );
-    assert_eq!(cli.calls(), 0);
+    assert_eq!(server.requests.borrow().len(), 1);
+    assert_eq!(restarted.unchanged_heads, 1);
 }
 
-/// [behaviour] A remote pause or policy-disabled answer stops provider calls
-/// without touching local consent; an enabled answer resumes collection.
+/// [behaviour] Requests are packed by count and bytes, keeping every task
+/// once and in order: 450 small tasks become 200, 200 and 50; tasks with
+/// full-length labels split under the server's body ceiling.
 #[test]
-#[serial_test::serial]
-fn remote_pause_gates_collection_until_enabled_again() {
-    let (_root, grants, checkpoints) = stores("remote-pause");
-    enabled(&grants);
-    let cli = Cli::head(page("paused", None));
-    let server = Server::new();
-    server.authority.set(Authority::Paused);
-    let inputs = inputs(&grants, &checkpoints, &cli, &server);
-    let t0 = Instant::now();
-    let mut collector = CloudCollector::default();
+fn pack_splits_by_count_and_bytes_keeping_every_task_in_order() {
+    let labelled = CloudUploadPolicyV2 {
+        session_titles_enabled: true,
+        workspace_labels_enabled: true,
+    };
+    let changes = |count: usize, policy| {
+        let long = "é".repeat(MAX_LABEL_CHARS);
+        let tasks = (0..count)
+            .map(|index| {
+                let mut task = task(&format!("task-{index:03}"), "applied");
+                task["title"] = json!(long);
+                task["environment_label"] = json!(long);
+                task
+            })
+            .collect();
+        parse_cloud_page(&page_of(tasks, None), policy, now())
+            .unwrap()
+            .changes
+    };
+    let small = wire::pack(changes(450, OFF));
     assert_eq!(
-        slice(&mut collector, &inputs, t0, Duration::ZERO),
-        CloudSessionCycleOutcome::Unsupported
+        small.iter().map(Vec::len).collect::<Vec<_>>(),
+        [200, 200, 50]
     );
-    assert_eq!(cli.calls(), 0);
-    assert_eq!(
-        grants.load().unwrap().unwrap().status,
-        CloudSessionGrantStatus::PolicyDisabled
-    );
-    server.authority.set(Authority::Enabled);
-    assert_eq!(
-        slice(&mut collector, &inputs, t0, 6 * HOUR),
-        CloudSessionCycleOutcome::Uploaded
-    );
-    assert_eq!(
-        grants.load().unwrap().unwrap().status,
-        CloudSessionGrantStatus::Enabled
-    );
+    let long = changes(100, labelled);
+    let requests = wire::pack(long.clone());
+    assert!(requests.len() >= 2, "{}", requests.len());
+    for request in &requests {
+        // The tasks plus a 3 KiB envelope still fit the server's ceiling.
+        assert!(serde_json::to_vec(request).unwrap().len() + 3 * 1024 <= wire::MAX_REQUEST_BYTES);
+    }
+    assert_eq!(requests.concat(), long);
 }
 
 /// [behaviour] Cloud failures back off on their own clock; nothing of the
@@ -1527,12 +2016,11 @@ fn remote_pause_gates_collection_until_enabled_again() {
 #[test]
 #[serial_test::serial]
 fn cloud_collection_is_isolated_from_local_delivery() {
-    let (root, grants, checkpoints) = stores("isolation");
-    enabled(&grants);
+    let (root, checkpoints) = store("isolation");
     let cli = Cli::head(page("isolated", None));
     let server = Server::new();
-    server.authority.set(Authority::Offline);
-    let inputs = inputs(&grants, &checkpoints, &cli, &server);
+    server.hint_fault.set(Some(HintFault::Offline));
+    let inputs = inputs(&checkpoints, &cli, &server);
     let t0 = Instant::now();
     let mut collector = CloudCollector::default();
     assert_eq!(
@@ -1541,9 +2029,9 @@ fn cloud_collection_is_isolated_from_local_delivery() {
     );
     assert_eq!(cli.calls(), 0);
     assert!(collector.schedule.retry_not_before.is_some());
-    server.authority.set(Authority::Enabled);
+    server.hint_fault.set(None);
     let offset = collector
-        .next_wake(t0, midnight(), None)
+        .next_wake(t0, midnight())
         .unwrap()
         .saturating_duration_since(t0);
     assert_eq!(
@@ -1557,55 +2045,231 @@ fn cloud_collection_is_isolated_from_local_delivery() {
 }
 
 /// [behaviour] A nonempty provider page with no valid task is a provider
-/// failure, never an empty healthy page.
+/// failure, never an empty healthy page or a completed crawl, even when its
+/// malformed rows carry an invalid id.
 #[test]
 #[serial_test::serial]
 fn nonempty_page_without_a_valid_task_is_a_provider_failure() {
-    let (_root, grants, checkpoints) = stores("invalid-page");
-    enabled(&grants);
-    let cli = Cli::head(json!({"tasks": [{"status": "running"}, 42], "cursor": null}).to_string());
-    let server = Server::new();
-    let mut collector = CloudCollector::default();
-    assert_eq!(
-        slice(
-            &mut collector,
-            &inputs(&grants, &checkpoints, &cli, &server),
-            Instant::now(),
-            Duration::ZERO
+    for (name, tasks) in [
+        ("no-id", json!([{"status": "running"}, 42])),
+        (
+            "invalid-id-no-status",
+            json!([{"id": ""}, {"id": " padded"}]),
         ),
-        CloudSessionCycleOutcome::Failed
-    );
-    assert!(server.requests.borrow().is_empty());
-    let grant = grants.load().unwrap().unwrap();
-    assert_eq!(grant.last_collector_health.as_deref(), Some("failing"));
-    assert_eq!(
-        grant.last_error_category.as_deref(),
-        Some("provider_payload_invalid")
-    );
+    ] {
+        let (_root, checkpoints) = store(&format!("invalid-page-{name}"));
+        let cli = Cli::head(json!({"tasks": tasks, "cursor": null}).to_string());
+        let server = Server::new();
+        let mut collector = CloudCollector::default();
+        assert_eq!(
+            slice(
+                &mut collector,
+                &inputs(&checkpoints, &cli, &server),
+                Instant::now(),
+                Duration::ZERO
+            ),
+            CloudSessionCycleOutcome::Failed,
+            "{name}"
+        );
+        assert!(server.requests.borrow().is_empty(), "{name}");
+        assert_eq!(
+            collector.reported,
+            Some("provider_payload_invalid"),
+            "{name}"
+        );
+        assert_eq!(collector.reported_invalid_ids, None, "{name}");
+        assert_eq!(collector.schedule.crawl_completed, None, "{name}");
+    }
 }
 
+/// [regress] A delayed refusal anchors Retry-After to response receipt,
+/// even when the injected slice clock is older than the real test clock.
 #[test]
 #[serial_test::serial]
-fn deferred_transport_never_calls_the_provider() {
-    let (_root, grants, checkpoints) = stores("deferred");
-    enabled(&grants);
-    let cli = Cli::head(page("deferred", None));
+fn cloud_retry_after_starts_when_the_hint_request_finishes() {
+    struct Shed;
+    impl CloudSessionTransport for Shed {
+        fn read_hint(&self, _: Duration) -> Result<ActivityHintResponse> {
+            Err(crate::snapshot_client::UploadShed {
+                status: 503,
+                retry_after: Some(Duration::ZERO),
+                code: None,
+            }
+            .into())
+        }
+        fn send_changes(
+            &self,
+            _: &CloudSessionChangesV2,
+            _: Duration,
+        ) -> Result<CloudSessionChangesAckV2> {
+            unreachable!()
+        }
+    }
+    let (_root, checkpoints) = store("retry-after-receipt");
+    let cli = Cli::head(page("must-not-collect", None));
     let mut collector = CloudCollector::default();
-    assert_eq!(
-        slice(
-            &mut collector,
-            &inputs(&grants, &checkpoints, &cli, &DeferredCloudSessionTransport),
-            Instant::now(),
-            Duration::ZERO
-        ),
-        CloudSessionCycleOutcome::Disabled
-    );
+    let inputs = inputs(&checkpoints, &cli, &Shed);
+    let now = Instant::now();
+    // An explicitly old deadline models time spent composing credentials.
+    let slice_start = now - Duration::from_secs(5);
+    let outcome = collector.run_slice(&inputs, slice_start, midnight());
+    assert_eq!(outcome, CloudSessionCycleOutcome::Failed);
+    let retry = collector.schedule.retry_not_before.unwrap();
+    assert!(retry > slice_start);
     assert_eq!(cli.calls(), 0);
 }
 
+/// [behaviour] Backoff defers planned work; it never accelerates head
+/// polling. A failed first crawl page is owed at the continuation cadence.
 #[test]
 #[serial_test::serial]
-fn revoke_prevents_new_provider_admission_and_waits_for_inflight_io() {
+fn failed_provider_pages_keep_their_planned_work_opportunity() {
+    struct Offline;
+    impl CloudSessionRunner for Offline {
+        fn list_page(&self, _: Option<&str>, _: usize) -> Result<String> {
+            Err(anyhow!("offline"))
+        }
+    }
+    let (_root, checkpoints) = store("failure-cadence");
+    let server = Server::new();
+    let t0 = Instant::now();
+    let mut collector = CloudCollector::default();
+    let cli = Cli::head(page("terminal", None));
+    assert_eq!(
+        slice(
+            &mut collector,
+            &inputs(&checkpoints, &cli, &server),
+            t0,
+            Duration::ZERO
+        ),
+        CloudSessionCycleOutcome::Uploaded
+    );
+    let offline = inputs(&checkpoints, &Offline, &server);
+    assert_eq!(
+        slice(&mut collector, &offline, t0, 6 * HOUR),
+        CloudSessionCycleOutcome::Failed
+    );
+    assert!(
+        collector
+            .next_wake(t0 + 6 * HOUR, midnight() + 6 * HOUR)
+            .unwrap()
+            >= t0 + 6 * HOUR + 5 * MINUTE
+    );
+    let mut startup = CloudCollector::default();
+    assert_eq!(
+        slice(&mut startup, &offline, t0, Duration::ZERO),
+        CloudSessionCycleOutcome::Failed
+    );
+    assert!(startup.next_wake(t0, midnight()).unwrap() >= t0 + 5 * MINUTE);
+}
+
+// ---------------------------------------------------------------------------
+// Identity fence. [regress]
+
+/// A transport whose local binding can stop being current mid-slice.
+struct Fenced {
+    server: Server,
+    current: Arc<AtomicBool>,
+    stop_after_send: bool,
+}
+
+impl Fenced {
+    fn new(current: Arc<AtomicBool>) -> Self {
+        Self {
+            server: Server::new(),
+            current,
+            stop_after_send: false,
+        }
+    }
+}
+
+impl CloudSessionTransport for Fenced {
+    fn local_binding_current(&self) -> bool {
+        self.current.load(AtomicOrdering::SeqCst)
+    }
+    fn read_hint(&self, timeout: Duration) -> Result<ActivityHintResponse> {
+        self.server.read_hint(timeout)
+    }
+    fn send_changes(
+        &self,
+        request: &CloudSessionChangesV2,
+        timeout: Duration,
+    ) -> Result<CloudSessionChangesAckV2> {
+        let ack = self.server.send_changes(request, timeout);
+        if self.stop_after_send {
+            self.current.store(false, AtomicOrdering::SeqCst);
+        }
+        ack
+    }
+}
+
+/// [regress] An identity change stops the hint, page, send and cache paths;
+/// an ACK admitted before a change cannot repopulate its cache afterwards.
+#[test]
+#[serial_test::serial]
+fn current_binding_fences_every_io_boundary() {
+    struct ChangingCli {
+        cli: Cli,
+        current: Arc<AtomicBool>,
+        stop_after_list: bool,
+    }
+    impl CloudSessionRunner for ChangingCli {
+        fn list_page(&self, cursor: Option<&str>, limit: usize) -> Result<String> {
+            let page = self.cli.list_page(cursor, limit);
+            if self.stop_after_list {
+                self.current.store(false, AtomicOrdering::SeqCst);
+            }
+            page
+        }
+    }
+    for stop in ["before-slice", "after-provider", "after-send"] {
+        let (_root, checkpoints) = store(&format!("binding-fence-{stop}"));
+        let current = Arc::new(AtomicBool::new(stop != "before-slice"));
+        let cli = ChangingCli {
+            cli: Cli::head(page("identity-fence", None)),
+            current: Arc::clone(&current),
+            stop_after_list: stop == "after-provider",
+        };
+        let mut server = Fenced::new(Arc::clone(&current));
+        server.stop_after_send = stop == "after-send";
+        let inputs = inputs(&checkpoints, &cli, &server);
+        let outcome = CloudCollector::default().run_slice(&inputs, Instant::now(), midnight());
+        // A send already admitted completes; only its cache write is refused.
+        let expected = if stop == "after-send" {
+            CloudSessionCycleOutcome::Uploaded
+        } else {
+            CloudSessionCycleOutcome::Disabled
+        };
+        assert_eq!(outcome, expected, "{stop}");
+        assert_eq!(
+            server.server.hint_calls.get(),
+            usize::from(stop != "before-slice"),
+            "{stop}"
+        );
+        assert_eq!(
+            cli.cli.calls(),
+            usize::from(stop != "before-slice"),
+            "{stop}"
+        );
+        assert_eq!(
+            server.server.offered(),
+            usize::from(stop == "after-send"),
+            "{stop}"
+        );
+        let scope = cache_scope(&inputs);
+        assert!(
+            checkpoints_ack(&checkpoints, &scope, "identity-fence").is_none(),
+            "{stop}"
+        );
+    }
+}
+
+/// [regress] An identity change while a provider call runs: no new I/O is
+/// admitted, the change's drain waits for the call, and the page it returned
+/// is never uploaded.
+#[test]
+#[serial_test::serial]
+fn identity_change_waits_for_an_inflight_provider_call_and_uploads_nothing() {
     use std::sync::mpsc;
 
     struct BlockingRunner {
@@ -1620,29 +2284,29 @@ fn revoke_prevents_new_provider_admission_and_waits_for_inflight_io() {
         }
     }
 
-    let (_root, grants, checkpoints) = stores("provider-call-fence");
-    enabled(&grants);
+    let (_root, checkpoints) = store("provider-call-fence");
     let checkpoints = Arc::new(checkpoints);
+    let current = Arc::new(AtomicBool::new(true));
     let (entered_tx, entered_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
-    let collector_grants = grants.clone();
     let collector_checkpoints = Arc::clone(&checkpoints);
+    let collector_current = Arc::clone(&current);
     let run = thread::spawn(move || {
-        let server = Server::new();
+        let server = Fenced::new(collector_current);
         let runner = BlockingRunner {
             entered: entered_tx,
             release: release_rx,
         };
         let outcome = CloudCollector::default().run_slice(
-            &inputs(&collector_grants, &collector_checkpoints, &runner, &server),
+            &inputs(&collector_checkpoints, &runner, &server),
             Instant::now(),
             midnight(),
         );
-        (outcome, server.requests.borrow().len())
+        (outcome, server.server.requests.borrow().len())
     });
     entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
 
-    grants.revoke(now()).unwrap();
+    current.store(false, AtomicOrdering::SeqCst);
     let waiter_checkpoints = Arc::clone(&checkpoints);
     let (stopped_tx, stopped_rx) = mpsc::channel();
     let waiter = thread::spawn(move || {
@@ -1656,164 +2320,59 @@ fn revoke_prevents_new_provider_admission_and_waits_for_inflight_io() {
         .unwrap()
         .unwrap();
     waiter.join().unwrap();
-    // The page that was in flight is never uploaded.
     assert_eq!(run.join().unwrap(), (CloudSessionCycleOutcome::Disabled, 0));
 }
 
+/// [regress] An identity change at relay admission stops the upload.
 #[test]
 #[serial_test::serial]
-fn revocation_at_relay_admission_stops_the_upload() {
-    let (_root, grants, checkpoints) = stores("relay-admission-race");
-    enabled(&grants);
+fn identity_change_at_relay_admission_stops_the_upload() {
+    let (_root, checkpoints) = store("relay-admission-race");
     let checkpoints = Arc::new(checkpoints);
     let entered = Arc::new(std::sync::Barrier::new(2));
     let release = Arc::new(std::sync::Barrier::new(2));
     checkpoints.set_relay_admission_barrier_for_test(0, Arc::clone(&entered), Arc::clone(&release));
-    let collector_grants = grants.clone();
+    let current = Arc::new(AtomicBool::new(true));
     let collector_checkpoints = Arc::clone(&checkpoints);
+    let collector_current = Arc::clone(&current);
     let run = thread::spawn(move || {
-        let server = Server::new();
+        let server = Fenced::new(collector_current);
         let cli = Cli::head(page("admission-race", None));
         let outcome = CloudCollector::default().run_slice(
-            &inputs(&collector_grants, &collector_checkpoints, &cli, &server),
+            &inputs(&collector_checkpoints, &cli, &server),
             Instant::now(),
             midnight(),
         );
-        (outcome, server.requests.borrow().len())
+        (outcome, server.server.requests.borrow().len())
     });
     entered.wait();
-    grants.revoke(now()).unwrap();
+    current.store(false, AtomicOrdering::SeqCst);
     release.wait();
     assert_eq!(run.join().unwrap(), (CloudSessionCycleOutcome::Disabled, 0));
+}
+
+/// [regress] An identity reservation drains admitted collector I/O; the test
+/// hook models one lease still held.
+#[test]
+#[serial_test::serial]
+fn collector_io_drain_times_out_while_a_lease_is_held() {
+    let (_root, checkpoints) = store("io-drain");
+    checkpoints.set_collector_io_active_for_test(1);
+    assert!(checkpoints
+        .wait_for_collector_io_idle(Duration::from_millis(20))
+        .is_err());
+    checkpoints.set_collector_io_active_for_test(0);
+    checkpoints
+        .wait_for_collector_io_idle(Duration::from_millis(20))
+        .unwrap();
 }
 
 // ---------------------------------------------------------------------------
 // Wire format. [format]
 
-/// [format] The digest vector the server and other clients can reproduce:
-/// SHA-256 over the domain, a zero byte and sorted compact JSON. The
-/// predecessor etag is not part of it.
-#[test]
-fn semantic_digest_vector_is_stable_and_excludes_the_predecessor() {
-    let mut change = CloudSessionChangeV1 {
-        entity_key: format!("hmac-sha256:{}", "ab".repeat(32)),
-        expected_head_etag: None,
-        entity_kind: "task".to_string(),
-        lifecycle: "completed".to_string(),
-        attempt_count: Some(2),
-        environment_kind: "unknown".to_string(),
-        measurement_basis: "not_itemized".to_string(),
-        coverage: ["attempts", "identity", "status", "timing"]
-            .map(str::to_string)
-            .to_vec(),
-        created_at: Some("2026-07-20T11:00:00Z".to_string()),
-        started_at: None,
-        updated_at: Some("2026-07-20T11:30:00Z".to_string()),
-        completed_at: None,
-    };
-    assert_eq!(
-        hex(&change.semantic_digest()),
-        "2118614c9f001c46ad16b9be2426e59f2121a4e65332c9fde3fb58877d2311e8"
-    );
-    let base = change.semantic_digest();
-    change.expected_head_etag = Some("0".repeat(64));
-    assert_eq!(change.semantic_digest(), base);
-    change.lifecycle = "failed".to_string();
-    assert_ne!(change.semantic_digest(), base);
-    // The predecessor is always serialized, as null when unknown.
-    change.expected_head_etag = None;
-    assert!(serde_json::to_string(&change)
-        .unwrap()
-        .contains("\"expected_head_etag\":null"));
-}
-
-#[test]
-fn emitted_wire_is_content_free_and_opaque() {
-    let parsed = parse_cloud_page(
-        &page("provider-task-123", Some("private-cursor")),
-        b"fixture-key",
-        now(),
-    )
-    .unwrap();
-    let encoded = serde_json::to_string(&parsed.changes).unwrap();
-    for private in [
-        "provider-task-123",
-        "private title",
-        "chatgpt.com",
-        "private-cursor",
-        "provider-environment-private",
-        "Private environment",
-        "private summary",
-    ] {
-        assert!(!encoded.contains(private), "{private}");
-    }
-    assert!(encoded.contains("hmac-sha256:"));
-}
-
-/// [format] Requests validate strictly; a raw or uppercase key, an open
-/// lifecycle, unsorted coverage or an oversize batch is refused before I/O.
-#[test]
-#[serial_test::serial]
-fn changes_request_rejects_raw_keys_open_values_and_oversize_batches() {
-    let (_root, grants, checkpoints) = stores("wire-validate");
-    enabled(&grants);
-    let cli = Cli::head(page("raw-provider-id", None));
-    let server = Server::new();
-    let mut collector = CloudCollector::default();
-    slice(
-        &mut collector,
-        &inputs(&grants, &checkpoints, &cli, &server),
-        Instant::now(),
-        Duration::ZERO,
-    );
-    let request = server.requests.borrow()[0].clone();
-    assert!(request.validate().is_ok());
-    assert_eq!(request.schema_version, "cloud_session_changes.v1");
-    assert_eq!(request.collector_id, "cloud_sessions");
-    let wire = serde_json::to_string(&request).unwrap();
-    assert!(!wire.contains("raw-provider-id"));
-    assert!(!wire.contains("semantic_digest"));
-
-    let mutate = |change: &dyn Fn(&mut CloudSessionChangesV1)| {
-        let mut bad = request.clone();
-        change(&mut bad);
-        bad.validate().is_err()
-    };
-    assert!(mutate(
-        &|bad| bad.observations[0].entity_key = "raw-provider-id".to_string()
-    ));
-    assert!(mutate(&|bad| {
-        bad.observations[0].entity_key = format!("hmac-sha256:{}", "A".repeat(64))
-    }));
-    assert!(mutate(
-        &|bad| bad.observations[0].lifecycle = "future_state".to_string()
-    ));
-    assert!(mutate(&|bad| bad.observations[0].coverage.reverse()));
-    assert!(mutate(
-        &|bad| bad.observations[0].expected_head_etag = Some("x".to_string())
-    ));
-    assert!(mutate(&|bad| bad.observations.clear()));
-    assert!(mutate(&|bad| {
-        let first = bad.observations[0].clone();
-        bad.observations.push(first);
-    }));
-    assert!(mutate(&|bad| {
-        bad.observations = (0..=MAX_CHANGES_PER_REQUEST)
-            .map(|index| {
-                let mut change = request.observations[0].clone();
-                change.entity_key = format!("hmac-sha256:{index:064x}");
-                change
-            })
-            .collect();
-    }));
-}
-
-/// [format] ACK matching: refused and conflicting entries are distinct, and
-/// a wrong epoch, duplicate or unsolicited entry settles nothing.
-#[test]
-fn ack_matching_is_exact() {
-    let change = |key: char| CloudSessionChangeV1 {
-        entity_key: format!("hmac-sha256:{}", key.to_string().repeat(64)),
+fn fixture_change(id: char) -> CloudSessionChangeV2 {
+    CloudSessionChangeV2 {
+        source_session_id: format!("task-{id}"),
         expected_head_etag: None,
         entity_kind: "task".to_string(),
         lifecycle: "completed".to_string(),
@@ -1825,30 +2384,284 @@ fn ack_matching_is_exact() {
         started_at: None,
         updated_at: None,
         completed_at: None,
+        title: None,
+        environment_label: None,
+    }
+}
+
+/// Shared session-id vectors (the server applies the same rule): code-point
+/// bounds, multibyte text, C0/DEL/C1 controls, boundary whitespace (U+2028
+/// included), and the characters the rule allows (U+200B included).
+fn session_id_vectors() -> Vec<(String, bool)> {
+    let mut vectors = vec![
+        (String::new(), false),
+        ("a".to_string(), true),
+        ("é".repeat(128), true),
+        ("é".repeat(129), true),
+        ("é".repeat(255), true),
+        ("界".repeat(255), true),
+        ("é".repeat(256), false),
+        ("x".repeat(256), false),
+        ("task id with inner spaces".to_string(), true),
+        ("a|b".to_string(), true),
+        ("a\\b".to_string(), true),
+        (format!("hmac-sha256:{}", "a".repeat(64)), true),
+        ("task_e_😀".to_string(), true),
+        // U+2028 LINE SEPARATOR is White_Space but not Cc: allowed inside.
+        ("task_e_1\u{2028}2".to_string(), true),
+        // U+200B ZERO WIDTH SPACE is neither White_Space nor Cc: allowed
+        // anywhere, kept as is.
+        ("task_e_\u{200b}".to_string(), true),
+        ("\u{200b}task_e_1".to_string(), true),
+        ("task_e_\u{200b}1".to_string(), true),
+    ];
+    for bad in [
+        " task",
+        "task ",
+        "\u{3000}task",
+        "task\u{a0}",
+        "\ttask",
+        "task\n",
+        "task_e_1\u{2028}",
+        "\u{2028}task_e_1",
+    ] {
+        vectors.push((bad.to_string(), false));
+    }
+    for control in [
+        '\u{0}', '\u{1f}', '\u{7f}', '\u{80}', '\u{85}', '\u{9f}', '\t',
+    ] {
+        vectors.push((format!("ta{control}sk"), false));
+    }
+    vectors
+}
+
+/// [format] The digest vector: SHA-256 over the domain, a zero byte and
+/// sorted compact JSON of the task (its raw id included) and the applied
+/// policy. The predecessor etag is not part of it; the policy, a title or a
+/// label are.
+#[test]
+fn semantic_digest_vector_is_stable_and_covers_policy_and_labels() {
+    let mut change = CloudSessionChangeV2 {
+        source_session_id: "task_e_6830f1c2 é".to_string(),
+        attempt_count: Some(2),
+        coverage: ["attempts", "identity", "status", "timing"]
+            .map(str::to_string)
+            .to_vec(),
+        created_at: Some("2026-07-20T11:00:00Z".to_string()),
+        updated_at: Some("2026-07-20T11:30:00Z".to_string()),
+        ..fixture_change('a')
     };
-    let request = CloudSessionChangesV1 {
+    assert_eq!(
+        hex(&change.semantic_digest(OFF)),
+        "affcbe83bdbb1bc63eb94c51a4169bf849ae86aaf6599c2e0732daea01ebf771"
+    );
+    let base = change.semantic_digest(OFF);
+    let mut other = change.clone();
+    other.source_session_id = "task_e_6830f1c2 e\u{301}".to_string();
+    assert_ne!(other.semantic_digest(OFF), base);
+    change.expected_head_etag = Some("0".repeat(64));
+    assert_eq!(change.semantic_digest(OFF), base);
+    let titles = CloudUploadPolicyV2 {
+        session_titles_enabled: true,
+        ..OFF
+    };
+    let labels = CloudUploadPolicyV2 {
+        workspace_labels_enabled: true,
+        ..OFF
+    };
+    assert_ne!(change.semantic_digest(titles), base);
+    assert_ne!(change.semantic_digest(labels), base);
+    assert_ne!(
+        change.semantic_digest(titles),
+        change.semantic_digest(labels)
+    );
+    change.title = Some("A title".to_string());
+    assert_ne!(change.semantic_digest(titles), base);
+    change.title = None;
+    change.lifecycle = "failed".to_string();
+    assert_ne!(change.semantic_digest(OFF), base);
+    // The predecessor is always serialized, as null when unknown; absent
+    // labels are omitted.
+    change.expected_head_etag = None;
+    let encoded = serde_json::to_string(&change).unwrap();
+    assert!(encoded.contains("\"expected_head_etag\":null"));
+    assert!(!encoded.contains("title"));
+    assert!(!encoded.contains("environment_label"));
+}
+
+/// [format] The body names its source, carries the raw task id as the
+/// session id and no grant, and stamps the policy it applied: a title and an
+/// environment name appear exactly when their setting is on; URLs,
+/// summaries, environment ids and cursors never do.
+#[test]
+#[serial_test::serial]
+fn v3_body_sends_the_raw_task_id_and_stamps_the_policy() {
+    for (titles, labels) in [(false, false), (true, false), (false, true), (true, true)] {
+        let policy = CloudUploadPolicyV2 {
+            session_titles_enabled: titles,
+            workspace_labels_enabled: labels,
+        };
+        let (_root, checkpoints) = store(&format!("wire-policy-{titles}-{labels}"));
+        let cli = Cli::head(page("raw-provider-id", Some("private-cursor")));
+        cli.set(Some("private-cursor"), page_of(Vec::new(), None));
+        let server = Server::new();
+        server.set_hint(|hint| hint.policy = policy);
+        slice(
+            &mut CloudCollector::default(),
+            &inputs(&checkpoints, &cli, &server),
+            Instant::now(),
+            Duration::ZERO,
+        );
+        let request = server.requests.borrow()[0].clone();
+        assert!(request.validate().is_ok());
+        assert_eq!(request.schema_version, "cloud_session_changes.v3");
+        assert_eq!(request.source, "codex");
+        assert_eq!(request.upload_policy, policy);
+        let change = &request.observations[0];
+        assert_eq!(change.source_session_id, "raw-provider-id");
+        assert_eq!(change.title.as_deref(), titles.then_some("private title"));
+        assert_eq!(
+            change.environment_label.as_deref(),
+            labels.then_some("Private environment")
+        );
+        let wire = serde_json::to_value(&request).unwrap();
+        let mut fields = wire
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        fields.sort_unstable();
+        assert_eq!(
+            fields,
+            [
+                "collected_at",
+                "collector_version",
+                "observations",
+                "schema_version",
+                "source",
+                "upload_policy"
+            ]
+        );
+        assert_eq!(
+            wire["observations"][0]["source_session_id"],
+            json!("raw-provider-id")
+        );
+        assert!(wire["observations"][0].get("entity_key").is_none());
+        let text = wire.to_string();
+        for private in [
+            "grant",
+            "hmac",
+            "chatgpt.com",
+            "private-cursor",
+            "provider-environment-private",
+            "private summary",
+            "semantic_digest",
+        ] {
+            assert!(!text.contains(private), "{private}");
+        }
+        assert_eq!(text.contains("private title"), titles);
+        assert_eq!(text.contains("Private environment"), labels);
+    }
+}
+
+/// [format] Requests validate strictly; another source, an invalid session
+/// id, an open lifecycle, unsorted coverage, a label the policy forbids or
+/// too long, or an oversize batch is refused before I/O.
+#[test]
+fn changes_request_rejects_bad_ids_open_values_labels_and_oversize_batches() {
+    let titles = CloudUploadPolicyV2 {
+        session_titles_enabled: true,
+        ..OFF
+    };
+    let request = CloudSessionChangesV2 {
         schema_version: CHANGES_SCHEMA_VERSION.to_string(),
-        grant_id: GRANT_ID.to_string(),
-        grant_version: 3,
-        grant_scope_fingerprint: format!("hmac-sha256:{}", "1".repeat(64)),
-        account_fingerprint: format!("hmac-sha256:{}", "2".repeat(64)),
-        collector_id: COLLECTOR_ID.to_string(),
+        source: "codex".to_string(),
         collector_version: "0.0.0".to_string(),
         collected_at: "2026-07-21T00:00:00Z".to_string(),
-        observations: vec![change('a'), change('b'), change('c')],
+        upload_policy: titles,
+        observations: vec![CloudSessionChangeV2 {
+            title: Some("t".repeat(MAX_LABEL_CHARS)),
+            ..fixture_change('a')
+        }],
     };
     assert!(request.validate().is_ok());
-    let entry = |key: char, outcome, etag: Option<char>| CloudSessionChangeAckV1 {
-        entity_key: format!("hmac-sha256:{}", key.to_string().repeat(64)),
+    let mutate = |change: &dyn Fn(&mut CloudSessionChangesV2)| {
+        let mut bad = request.clone();
+        change(&mut bad);
+        bad.validate().is_err()
+    };
+    for schema in ["cloud_session_changes.v1", "cloud_session_changes.v2"] {
+        assert!(mutate(&|bad| bad.schema_version = schema.to_string()));
+    }
+    assert!(mutate(&|bad| bad.source = "claude".to_string()));
+    assert!(mutate(&|bad| bad.collector_version = "9".repeat(33)));
+    for (id, valid) in session_id_vectors() {
+        assert_eq!(
+            mutate(&|bad| bad.observations[0].source_session_id = id.clone()),
+            !valid,
+            "{:?}",
+            id.chars().count()
+        );
+    }
+    assert!(mutate(
+        &|bad| bad.observations[0].lifecycle = "future_state".to_string()
+    ));
+    assert!(mutate(&|bad| bad.observations[0].coverage.reverse()));
+    assert!(mutate(
+        &|bad| bad.observations[0].expected_head_etag = Some("x".to_string())
+    ));
+    assert!(mutate(&|bad| bad.upload_policy = OFF));
+    assert!(mutate(
+        &|bad| bad.observations[0].title = Some("t".repeat(MAX_LABEL_CHARS + 1))
+    ));
+    assert!(mutate(
+        &|bad| bad.observations[0].environment_label = Some("label".to_string())
+    ));
+    assert!(mutate(&|bad| bad.observations.clear()));
+    assert!(mutate(&|bad| {
+        let first = bad.observations[0].clone();
+        bad.observations.push(first);
+    }));
+    assert!(mutate(&|bad| {
+        bad.observations = (0..=wire::MAX_CHANGES_PER_REQUEST)
+            .map(|index| CloudSessionChangeV2 {
+                source_session_id: format!("task-{index}"),
+                ..fixture_change('a')
+            })
+            .collect();
+    }));
+}
+
+/// [format] ACK matching: accepted, refused and conflicting entries are
+/// distinct; a conflict without a head is a refusal; a wrong schema,
+/// duplicate, unsolicited, missing or etag-less entry settles nothing.
+#[test]
+fn ack_matching_is_exact() {
+    let request = CloudSessionChangesV2 {
+        schema_version: CHANGES_SCHEMA_VERSION.to_string(),
+        source: "codex".to_string(),
+        collector_version: "0.0.0".to_string(),
+        collected_at: "2026-07-21T00:00:00Z".to_string(),
+        upload_policy: OFF,
+        observations: vec![
+            fixture_change('a'),
+            fixture_change('b'),
+            fixture_change('c'),
+            fixture_change('d'),
+            fixture_change('e'),
+        ],
+    };
+    assert!(request.validate().is_ok());
+    let entry = |id: char, outcome, etag: Option<char>| CloudSessionChangeAckV2 {
+        source_session_id: format!("task-{id}"),
         outcome,
         head_etag: etag.map(|etag| etag.to_string().repeat(64)),
         accepted_seq: None,
         reason: None,
     };
-    let ack = |entities| CloudSessionChangesAckV1 {
-        schema_version: "cloud_session_changes_ack.v1".to_string(),
-        grant_id: GRANT_ID.to_uppercase(),
-        grant_version: 3,
+    let ack = |entities| CloudSessionChangesAckV2 {
+        schema_version: "cloud_session_changes_ack.v3".to_string(),
         entities,
     };
     let settled = request
@@ -1856,38 +2669,46 @@ fn ack_matching_is_exact() {
             entry('c', CloudSessionChangeOutcome::Conflict, Some('e')),
             entry('a', CloudSessionChangeOutcome::Accepted, Some('d')),
             entry('b', CloudSessionChangeOutcome::Rejected, None),
+            entry('d', CloudSessionChangeOutcome::Conflict, None),
+            entry('e', CloudSessionChangeOutcome::Noop, Some('f')),
         ]))
         .unwrap();
     assert_eq!(
         settled.values().cloned().collect::<Vec<_>>(),
         [
             Settled::Acked {
-                head_etag: "d".repeat(64)
+                head_etag: "d".repeat(64),
+                accepted: true
             },
             Settled::Refused,
             Settled::Conflict {
-                head_etag: Some("e".repeat(64))
+                head_etag: "e".repeat(64)
+            },
+            Settled::Refused,
+            Settled::Acked {
+                head_etag: "f".repeat(64),
+                accepted: false
             },
         ]
     );
     let good = || {
-        vec![
-            entry('a', CloudSessionChangeOutcome::Noop, Some('d')),
-            entry('b', CloudSessionChangeOutcome::Noop, Some('d')),
-            entry('c', CloudSessionChangeOutcome::Noop, Some('d')),
-        ]
+        ['a', 'b', 'c', 'd', 'e']
+            .map(|key| entry(key, CloudSessionChangeOutcome::Noop, Some('d')))
+            .to_vec()
     };
-    let mut wrong_epoch = ack(good());
-    wrong_epoch.grant_version = 2;
-    assert!(request.settle(&wrong_epoch).is_err());
-    let mut wrong_schema = ack(good());
-    wrong_schema.schema_version = "cloud_session_changes_ack.v2".to_string();
-    assert!(request.settle(&wrong_schema).is_err());
+    for schema in [
+        "cloud_session_changes_ack.v1",
+        "cloud_session_changes_ack.v2",
+    ] {
+        let mut wrong_schema = ack(good());
+        wrong_schema.schema_version = schema.to_string();
+        assert!(request.settle(&wrong_schema).is_err());
+    }
     let mut duplicate = good();
     duplicate[2] = entry('a', CloudSessionChangeOutcome::Noop, Some('d'));
     assert!(request.settle(&ack(duplicate)).is_err());
     let mut unsolicited = good();
-    unsolicited[2] = entry('f', CloudSessionChangeOutcome::Noop, Some('d'));
+    unsolicited[2] = entry('9', CloudSessionChangeOutcome::Noop, Some('d'));
     assert!(request.settle(&ack(unsolicited)).is_err());
     let mut short = good();
     short.pop();
@@ -1898,6 +2719,54 @@ fn ack_matching_is_exact() {
     let mut bad_etag = good();
     bad_etag[0].head_etag = Some("D".repeat(64));
     assert!(request.settle(&ack(bad_etag)).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Provider parsing. [behaviour]
+
+/// [format] The field names are those the official `codex cloud list --json`
+/// prints (`id`, `title`, `status`, `updated_at`, `environment_id`,
+/// `environment_label`, `summary`, `is_review`, `attempt_total`, and a
+/// top-level `tasks` and `cursor`); only the title and environment name may
+/// leave, under policy, cut to the wire bound.
+#[test]
+fn parser_takes_title_and_environment_name_only_under_policy() {
+    let mut long = task("long", "applied");
+    long["title"] = json!("x".repeat(MAX_LABEL_CHARS + 5));
+    let raw = page_of(vec![task("plain", "applied"), long], None);
+    let both = CloudUploadPolicyV2 {
+        session_titles_enabled: true,
+        workspace_labels_enabled: true,
+    };
+    let parsed = parse_cloud_page(&raw, both, now()).unwrap();
+    assert_eq!(parsed.changes[0].title.as_deref(), Some("private title"));
+    assert_eq!(
+        parsed.changes[0].environment_label.as_deref(),
+        Some("Private environment")
+    );
+    assert_eq!(
+        parsed.changes[1]
+            .title
+            .as_deref()
+            .map(|title| title.chars().count()),
+        Some(MAX_LABEL_CHARS)
+    );
+    let parsed = parse_cloud_page(&raw, OFF, now()).unwrap();
+    assert!(parsed
+        .changes
+        .iter()
+        .all(|change| change.title.is_none() && change.environment_label.is_none()));
+    let encoded = serde_json::to_string(&parsed.changes).unwrap();
+    for private in [
+        "private title",
+        "chatgpt.com",
+        "provider-environment-private",
+        "Private environment",
+        "private summary",
+    ] {
+        assert!(!encoded.contains(private), "{private}");
+    }
+    assert_eq!(parsed.changes[0].source_session_id, "plain");
 }
 
 #[test]
@@ -1914,7 +2783,7 @@ fn official_cloud_task_statuses_and_attempt_total_are_normalized_truthfully() {
         task
     })
     .to_vec();
-    let parsed = parse_cloud_page(&page_of(tasks, None), b"fixture-key", now()).unwrap();
+    let parsed = parse_cloud_page(&page_of(tasks, None), OFF, now()).unwrap();
     assert_eq!(
         parsed
             .changes
@@ -1952,7 +2821,7 @@ fn parser_keeps_every_valid_row_and_canonicalizes_times() {
     rows.push(json!({"status": "running"}));
     rows.push(offset);
     rows.push(future);
-    let parsed = parse_cloud_page(&page_of(rows, None), b"fixture-key", now()).unwrap();
+    let parsed = parse_cloud_page(&page_of(rows, None), OFF, now()).unwrap();
     assert_eq!(parsed.source_item_count, PAGE_LIMIT + 8);
     assert_eq!(parsed.changes.len(), PAGE_LIMIT + 7);
     let offset = &parsed.changes[PAGE_LIMIT + 5];
@@ -1961,9 +2830,55 @@ fn parser_keeps_every_valid_row_and_canonicalizes_times() {
     assert_eq!(future.created_at, None);
 }
 
+/// [format] Only the official `id` is read, as is: valid ids pass byte for
+/// byte, invalid ones are skipped and counted; a conflicting `task_id`, an
+/// alias-only row and a non-string id are not task ids.
+#[test]
+fn parser_reads_only_the_raw_id_and_counts_invalid_ids() {
+    for (id, valid) in session_id_vectors() {
+        let parsed = parse_cloud_page(&page(&id, None), OFF, now()).unwrap();
+        let label = id.chars().count();
+        assert_eq!(parsed.source_item_count, 1, "{label}");
+        if valid {
+            assert_eq!(parsed.changes.len(), 1, "{label}");
+            assert_eq!(parsed.changes[0].source_session_id, id, "{label}");
+            assert_eq!(parsed.invalid_ids, 0, "{label}");
+        } else {
+            assert!(parsed.changes.is_empty(), "{label}");
+            assert_eq!(parsed.invalid_ids, 1, "{label}");
+        }
+    }
+    let mut both = task("official", "applied");
+    both["task_id"] = json!("conflicting-alias");
+    let mut alias_only = task("unused", "applied");
+    alias_only.as_object_mut().unwrap().remove("id");
+    alias_only["task_id"] = json!("alias-only");
+    let mut number = task("unused", "applied");
+    number["id"] = json!(42);
+    let parsed = parse_cloud_page(
+        &page_of(
+            vec![task("id-only", "applied"), both, alias_only, number],
+            None,
+        ),
+        OFF,
+        now(),
+    )
+    .unwrap();
+    assert_eq!(parsed.source_item_count, 4);
+    assert_eq!(parsed.invalid_ids, 0);
+    assert_eq!(
+        parsed
+            .changes
+            .iter()
+            .map(|change| change.source_session_id.as_str())
+            .collect::<Vec<_>>(),
+        ["id-only", "official"]
+    );
+}
+
 #[test]
 fn cursor_contract_separates_official_terminal_pagination_and_ambiguity() {
-    let cursor = |raw: Value| parse_cloud_page(&raw.to_string(), b"fixture-key", now());
+    let cursor = |raw: Value| parse_cloud_page(&raw.to_string(), OFF, now());
     assert_eq!(
         cursor(json!({"tasks": [], "cursor": "official-next-page"}))
             .unwrap()
@@ -2008,302 +2923,6 @@ fn cursor_contract_separates_official_terminal_pagination_and_ambiguity() {
         "nextCursor": "same"
     }))
     .is_ok());
-}
-
-// ---------------------------------------------------------------------------
-// Grants.
-
-#[test]
-fn persisted_grant_discards_raw_scope_and_uses_private_atomic_state() {
-    let (_root, grants, _checkpoints) = stores("private-grant-state");
-    enabled(&grants);
-
-    let encoded = String::from_utf8(fs::read(grants.path()).unwrap()).unwrap();
-    assert!(!encoded.contains(INSTALLATION_ID));
-    assert!(!encoded.contains("org_fixture"));
-    assert!(!encoded.contains("user_fixture"));
-    assert!(encoded.contains("installation_fingerprint"));
-    assert!(encoded.contains("grant_scope_id"));
-
-    let parent = grants.path().parent().unwrap();
-    assert!(fs::read_dir(parent).unwrap().all(|entry| {
-        !entry
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .ends_with(".tmp")
-    }));
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        assert_eq!(
-            fs::metadata(parent).unwrap().permissions().mode() & 0o777,
-            0o700
-        );
-        assert_eq!(
-            fs::metadata(grants.path()).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-    }
-}
-
-#[test]
-fn legacy_v1_grant_is_privately_migrated_and_remains_revocable() {
-    let (_root, grants, _checkpoints) = stores("legacy-grant-migration");
-    fs::create_dir_all(grants.path().parent().unwrap()).unwrap();
-    let legacy = json!({
-        "schema_version": GRANT_SCHEMA_VERSION,
-        "hmac_key_hex": "11".repeat(32),
-        "grant": {
-            "schema_version": GRANT_SCHEMA_VERSION,
-            "collector_id": COLLECTOR_ID,
-            "collector_version": "cloud_session_observations.v1",
-            "release_lane": "supported",
-            "disclosure_version": DISCLOSURE_VERSION,
-            "status": CloudSessionGrantStatus::Enabled,
-            "installation_id": "legacy-installation-raw",
-            "organization_fingerprint": "hmac-sha256:legacy-org",
-            "effective_user_fingerprint": "hmac-sha256:legacy-user",
-            "account_fingerprint": "hmac-sha256:legacy-account",
-            "granted_at": "2026-07-20T12:00:00Z",
-            "paused_at": null,
-            "revoked_at": null,
-            "last_collector_health": "enabled",
-            "last_freshness": "unavailable",
-            "last_error_category": null
-        }
-    });
-    fs::write(grants.path(), serde_json::to_vec(&legacy).unwrap()).unwrap();
-
-    let migrated = grants.load().unwrap().unwrap();
-    assert_eq!(migrated.status, CloudSessionGrantStatus::Enabled);
-    assert!(migrated.backend_binding.is_none());
-    assert!(migrated
-        .installation_fingerprint
-        .starts_with("hmac-sha256:"));
-    let encoded = String::from_utf8(fs::read(grants.path()).unwrap()).unwrap();
-    assert!(!encoded.contains("legacy-installation-raw"));
-    assert!(!encoded.contains("installation_id"));
-
-    grants.pause(now()).unwrap();
-    assert_eq!(
-        grants.load().unwrap().unwrap().status,
-        CloudSessionGrantStatus::Paused
-    );
-    grants.revoke(now()).unwrap();
-    assert_eq!(
-        grants.load().unwrap().unwrap().status,
-        CloudSessionGrantStatus::Revoked
-    );
-}
-
-/// [regress] A grant bound before this contract does not collect; consent
-/// on the new grants API re-binds the same epoch onto it.
-#[test]
-#[serial_test::serial]
-fn grant_bound_on_the_previous_contract_needs_fresh_consent() {
-    let (_root, grants, checkpoints) = stores("contract-upgrade");
-    enabled(&grants);
-    let mut state = grants.read().unwrap().unwrap();
-    state
-        .grant
-        .backend_binding
-        .as_mut()
-        .unwrap()
-        .collection_contract = None;
-    grants.write(&state).unwrap();
-    assert_eq!(
-        cloud_session_collector_status(&grants, &RuntimeAvailabilityTransport(true)).grant_status,
-        CloudSessionGrantStatus::ConsentRequired
-    );
-    let cli = Cli::head(page("upgrade", None));
-    let server = Server::new();
-    let inputs = inputs(&grants, &checkpoints, &cli, &server);
-    let t0 = Instant::now();
-    let mut collector = CloudCollector::default();
-    slice(&mut collector, &inputs, t0, Duration::ZERO);
-    assert_eq!(cli.calls(), 0);
-
-    let local = grants.enable(&setup(), now()).unwrap();
-    assert_eq!(local.status, CloudSessionGrantStatus::ConsentRequired);
-    let create = grants.grant_create_request(INSTALLATION_ID).unwrap();
-    assert_eq!(create.schema_version, "cloud_session_changes.v1");
-    let bound = grants
-        .bind_backend_grant(&backend_grant(&local, "enabled", 1), INSTALLATION_ID)
-        .unwrap();
-    assert_eq!(bound.status, CloudSessionGrantStatus::Enabled);
-    assert!(binding_contract_current(&bound));
-    collector.reset();
-    assert_eq!(
-        slice(&mut collector, &inputs, t0, MINUTE),
-        CloudSessionCycleOutcome::Uploaded
-    );
-}
-
-#[test]
-#[serial_test::serial]
-fn backend_binding_requires_exact_scope_and_monotonic_reconsent_epoch() {
-    let (_root, grants, checkpoints) = stores("grant-epoch");
-    let local = grants.enable(&setup(), now()).unwrap();
-    assert_eq!(local.status, CloudSessionGrantStatus::ConsentRequired);
-    assert_eq!(local.granted_at, None);
-    assert!(grants
-        .bind_backend_grant(&backend_grant(&local, "enabled", 1), INSTALLATION_ID)
-        .is_err());
-    let request = grants.grant_create_request(INSTALLATION_ID).unwrap();
-    assert_eq!(request.grant_scope_fingerprint, local.grant_scope_id);
-    assert_eq!(request.schema_version, CHANGES_SCHEMA_VERSION);
-    assert_eq!(
-        grants.grant_create_request(INSTALLATION_ID).unwrap(),
-        request
-    );
-    assert!(grants
-        .grant_create_request("00000000-0000-4000-8000-000000000099")
-        .is_err());
-    let mut wrong_installation = backend_grant(&local, "enabled", 1);
-    wrong_installation.installation_id = "00000000-0000-4000-8000-000000000099".to_string();
-    assert!(grants
-        .bind_backend_grant(&wrong_installation, "00000000-0000-4000-8000-000000000099")
-        .is_err());
-    let mut wrong_contract = backend_grant(&local, "enabled", 1);
-    wrong_contract.schema_version = "cloud_session_observations.v1".to_string();
-    assert!(grants
-        .bind_backend_grant(&wrong_contract, INSTALLATION_ID)
-        .is_err());
-
-    let first_response = backend_grant(&local, "enabled", 1);
-    let first_bound = grants
-        .bind_backend_grant(&first_response, INSTALLATION_ID)
-        .unwrap();
-    let bound_bytes = fs::read(grants.path()).unwrap();
-    assert_eq!(
-        grants
-            .bind_backend_grant(&first_response, INSTALLATION_ID)
-            .unwrap(),
-        first_bound
-    );
-    assert_eq!(fs::read(grants.path()).unwrap(), bound_bytes);
-    let mut different_id = first_response.clone();
-    different_id.id = "00000000-0000-4000-8000-000000000099".to_string();
-    assert!(grants
-        .bind_backend_grant(&different_id, INSTALLATION_ID)
-        .is_err());
-    let mut different_epoch = first_response.clone();
-    different_epoch.grant_version += 1;
-    assert!(grants
-        .bind_backend_grant(&different_epoch, INSTALLATION_ID)
-        .is_err());
-    let mut different_policy = first_response;
-    different_policy.can_collect = Some(false);
-    assert_eq!(
-        grants
-            .bind_backend_grant(&different_policy, INSTALLATION_ID)
-            .unwrap(),
-        first_bound
-    );
-    assert_eq!(fs::read(grants.path()).unwrap(), bound_bytes);
-
-    let cli = Cli::head(page("one", None));
-    let server = Server::new();
-    let t0 = Instant::now();
-    let mut collector = CloudCollector::default();
-    slice(
-        &mut collector,
-        &inputs(&grants, &checkpoints, &cli, &server),
-        t0,
-        Duration::ZERO,
-    );
-    grants.revoke(now()).unwrap();
-    grants
-        .apply_backend_revocation(&backend_grant(&local, "revoked", 2), INSTALLATION_ID)
-        .unwrap();
-    let pending = grants.enable(&setup(), now()).unwrap();
-    assert_eq!(pending.status, CloudSessionGrantStatus::ConsentRequired);
-    grants.grant_create_request(INSTALLATION_ID).unwrap();
-    assert!(grants
-        .bind_backend_grant(&backend_grant(&local, "enabled", 1), INSTALLATION_ID)
-        .is_err());
-    grants
-        .bind_backend_grant(&backend_grant(&local, "enabled", 3), INSTALLATION_ID)
-        .unwrap();
-    collector.reset();
-    slice(
-        &mut collector,
-        &inputs(&grants, &checkpoints, &cli, &server),
-        t0,
-        MINUTE,
-    );
-    let requests = server.requests.borrow();
-    assert_eq!(requests.len(), 2);
-    assert_eq!(requests[0].grant_version, 1);
-    // A new epoch is a new cache scope: the same task is offered again.
-    assert_eq!(requests[1].grant_version, 3);
-    assert_eq!(requests[1].observations.len(), 1);
-}
-
-#[test]
-fn ambiguous_backend_create_retries_exact_request_until_late_grant_is_deleted() {
-    let (_root, grants, _checkpoints) = stores("bind-create-reconcile");
-    let local = grants.enable(&setup(), now()).unwrap();
-    let first = grants.grant_create_request(INSTALLATION_ID).unwrap();
-    let restarted = CloudSessionGrantStore::new(grants.path().to_path_buf());
-    assert_eq!(
-        restarted.grant_create_request(INSTALLATION_ID).unwrap(),
-        first
-    );
-    restarted.revoke(now()).unwrap();
-
-    let replacement = CloudSessionGrantSetup {
-        installation_id: INSTALLATION_ID.to_string(),
-        organization_scope: "replacement_org".to_string(),
-        effective_user_scope: "replacement_user".to_string(),
-    };
-    assert!(restarted.enable(&replacement, now()).is_err());
-    let pending = restarted.load().unwrap().unwrap();
-    assert!(pending.backend_create_pending);
-    assert!(pending.pending_backend_create.is_some());
-    assert!(pending.backend_binding.is_none());
-    assert_eq!(
-        cloud_session_collector_status(&restarted, &DeferredCloudSessionTransport).reason_code,
-        "backend_grant_reconciliation_required"
-    );
-
-    assert!(restarted
-        .confirm_backend_grant_absent_after_reconciliation()
-        .is_err());
-    assert_eq!(
-        restarted.grant_create_request(INSTALLATION_ID).unwrap(),
-        first
-    );
-    assert_eq!(
-        restarted
-            .bind_backend_grant(&backend_grant(&local, "enabled", 1), INSTALLATION_ID)
-            .unwrap()
-            .status,
-        CloudSessionGrantStatus::Revoked
-    );
-    let late = restarted.load().unwrap().unwrap();
-    assert_eq!(late.status, CloudSessionGrantStatus::Revoked);
-    assert!(!late.backend_create_pending);
-    assert_eq!(late.backend_binding.as_ref().unwrap().grant_id, GRANT_ID);
-    restarted
-        .apply_backend_revocation(&backend_grant(&late, "revoked", 2), INSTALLATION_ID)
-        .unwrap();
-    let prepared = restarted.enable(&replacement, now()).unwrap();
-    assert_eq!(prepared.status, CloudSessionGrantStatus::ConsentRequired);
-    assert!(!prepared.backend_create_pending);
-    assert!(prepared.backend_binding.is_none());
-}
-
-#[test]
-fn health_update_cannot_restore_a_revoked_grant() {
-    let (_root, grants, _checkpoints) = stores("grant-lock");
-    enabled(&grants);
-    grants.revoke(now()).unwrap();
-    grants.record_health("ok", "fresh", None).unwrap();
-    let grant = grants.load().unwrap().unwrap();
-    assert_eq!(grant.status, CloudSessionGrantStatus::Revoked);
-    assert_eq!(grant.last_collector_health.as_deref(), Some("revoked"));
 }
 
 #[test]
@@ -2379,15 +2998,17 @@ fn collector_supervisor_has_one_process_owner_under_concurrency() {
     );
 }
 
-/// [behaviour] No consent touches nothing beyond the local grant read: no
-/// credentials, relay, provider call or cache file.
+/// [behaviour] A Mac with no connected Codex account touches nothing: no
+/// credential, relay, provider call or cache file. Connecting it activates
+/// collection on the next slice, without a restart.
 #[test]
 #[serial_test::serial]
-fn no_grant_is_zero_touch_and_later_consent_activates_without_restart() {
-    let (root, grants, checkpoints) = stores("runtime-consent");
-    let (accounts, devices, connections) =
-        runtime_identity_stores(&root, "user_fixture", "org_fixture", DEFAULT_API_BASE_URL);
-    let cli = Cli::head(page("after-consent", None));
+fn not_connected_is_zero_touch_and_connecting_activates_without_restart() {
+    let (root, checkpoints) = store("runtime-connect");
+    let accounts = FileAccountStore::new(root.join("account.json"));
+    let devices = FileDeviceStore::new(root.join("device.json"));
+    let connections = FileConnectionStore::new(root.join("connection.json"));
+    let cli = Cli::head(page("after-connect", None));
     let mut collector = CloudCollector::default();
     let mut active_transport: ActiveCloudSessionTransport = None;
     let t0 = Instant::now();
@@ -2396,15 +3017,13 @@ fn no_grant_is_zero_touch_and_later_consent_activates_without_restart() {
             &mut collector,
             &mut active_transport,
             ComposedSliceInputs {
-                grants: &grants,
                 checkpoints: &checkpoints,
                 runner: &cli,
                 accounts: &accounts,
                 devices: &devices,
                 connections: &connections,
-                load_credentials: || panic!("no grant must not read relay credentials"),
-                compose_transport: |_, _, _| panic!("no grant must not compose a relay"),
-                last_activity: None,
+                load_credentials: || panic!("not connected must not read relay credentials"),
+                compose_transport: |_, _| panic!("not connected must not compose a relay"),
             },
             t0,
             midnight(),
@@ -2413,18 +3032,16 @@ fn no_grant_is_zero_touch_and_later_consent_activates_without_restart() {
     );
     assert_eq!(cli.calls(), 0);
     assert!(active_transport.is_none());
-    assert!(!grants.path().exists());
     assert!(!root.join("snapshots").exists());
-    assert_eq!(collector.next_wake(t0, midnight(), None), None);
+    assert_eq!(collector.next_wake(t0, midnight()), None);
 
-    enabled(&grants);
+    let (accounts, devices, connections) = runtime_identity_stores(&root, DEFAULT_API_BASE_URL);
     let compositions = Cell::new(0);
     assert_eq!(
         collect_composed_cloud_sessions_once_with(
             &mut collector,
             &mut active_transport,
             ComposedSliceInputs {
-                grants: &grants,
                 checkpoints: &checkpoints,
                 runner: &cli,
                 accounts: &accounts,
@@ -2436,11 +3053,14 @@ fn no_grant_is_zero_touch_and_later_consent_activates_without_restart() {
                         "device-secret".to_string(),
                     ))
                 },
-                compose_transport: |_, _, _| {
+                compose_transport: |binding: CloudSessionRuntimeBinding, _: String| {
+                    assert_eq!(
+                        (binding.organization_id.as_str(), binding.user_id.as_str()),
+                        (ORG_ID, USER_ID)
+                    );
                     compositions.set(compositions.get() + 1);
                     Box::new(Server::new()) as Box<dyn CloudSessionTransport + Send>
                 },
-                last_activity: None,
             },
             t0 + MINUTE,
             midnight() + MINUTE,
@@ -2452,23 +3072,77 @@ fn no_grant_is_zero_touch_and_later_consent_activates_without_restart() {
     assert!(active_transport.is_some());
 }
 
+/// [behaviour] The binding is refused, before any secret is read, for an
+/// untrusted destination or a connection that does not match the device.
 #[test]
-fn runtime_rejects_untrusted_destination_without_mutating_grant() {
-    let (root, grants, _checkpoints) = stores("runtime-untrusted-destination");
-    enabled(&grants);
-    let (accounts, devices, connections) = runtime_identity_stores(
-        &root,
-        "user_fixture",
-        "org_fixture",
-        "https://attacker.example",
-    );
-    let before_grant = fs::read(grants.path()).unwrap();
-    assert!(
-        load_cloud_session_runtime_binding(&grants, &accounts, &devices, &connections).is_err()
-    );
-    assert_eq!(fs::read(grants.path()).unwrap(), before_grant);
+#[serial_test::serial]
+fn runtime_rejects_untrusted_destination_and_mismatched_connection() {
+    let root = temp_dir("runtime-untrusted-destination");
+    let (accounts, devices, connections) =
+        runtime_identity_stores(&root, "https://attacker.example");
+    assert!(load_cloud_session_runtime_binding(&accounts, &devices, &connections).is_err());
     assert!(validated_cloud_session_api_base_url("http://localhost.evil").is_err());
     assert!(validated_cloud_session_api_base_url("https://api.ottto.net@evil").is_err());
+
+    let root = temp_dir("runtime-mismatched-connection");
+    let (accounts, devices, connections) = runtime_identity_stores(&root, DEFAULT_API_BASE_URL);
+    let binding = load_cloud_session_runtime_binding(&accounts, &devices, &connections)
+        .unwrap()
+        .unwrap();
+    assert_eq!(binding.api_base_url, DEFAULT_API_BASE_URL);
+    let mut connection = connections.load().unwrap().unwrap();
+    connection.machine_id = Some("another-machine".to_string());
+    connections.save(&connection).unwrap();
+    assert!(load_cloud_session_runtime_binding(&accounts, &devices, &connections).is_err());
+
+    // A device without the Codex source is not a Codex Mac: idle, no error.
+    devices
+        .save(&LocalDeviceBinding {
+            device_id: DEVICE_ID.to_string(),
+            machine_id: Some("machine-runtime".to_string()),
+            sources: vec!["claude_code".to_string()],
+        })
+        .unwrap();
+    assert!(
+        load_cloud_session_runtime_binding(&accounts, &devices, &connections)
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// [behaviour] Startup removes the retired per-Mac consent files and nothing
+/// else; a missing file is fine.
+#[test]
+fn startup_removes_only_the_retired_consent_files() {
+    let root = temp_dir("retired-consent-files");
+    let directory = root.join("cloud_sessions");
+    fs::create_dir_all(&directory).unwrap();
+    for name in RETIRED_STATE_FILES {
+        fs::write(directory.join(name), b"{}").unwrap();
+    }
+    fs::write(directory.join("unrelated.json"), b"{}").unwrap();
+    let daily_reference = root.join("codex-daily-aggregates");
+    fs::create_dir_all(&daily_reference).unwrap();
+    fs::write(daily_reference.join("control-token-uses.json"), b"{}").unwrap();
+
+    remove_retired_consent_state(&root);
+    for name in RETIRED_STATE_FILES {
+        assert!(!directory.join(name).exists(), "{name}");
+    }
+    assert!(directory.join("unrelated.json").exists());
+    assert!(daily_reference.join("control-token-uses.json").exists());
+    remove_retired_consent_state(&root);
+    remove_retired_consent_state(&root.join("absent"));
+    assert_eq!(
+        RETIRED_STATE_FILES,
+        [
+            "grant.json",
+            "grant.lock",
+            "control-token-uses.json",
+            "control-token-uses.lock",
+            "checkpoint.json"
+        ]
+    );
 }
 
 fn read_http_request(stream: &mut std::net::TcpStream) -> String {
@@ -2521,6 +3195,19 @@ fn read_http_request(stream: &mut std::net::TcpStream) -> String {
     }
 }
 
+fn relay_binding(api_base_url: String) -> CloudSessionRuntimeBinding {
+    CloudSessionRuntimeBinding {
+        api_base_url,
+        device: LocalDeviceBinding {
+            device_id: DEVICE_ID.to_string(),
+            machine_id: None,
+            sources: vec!["codex".to_string()],
+        },
+        organization_id: ORG_ID.to_string(),
+        user_id: USER_ID.to_string(),
+    }
+}
+
 #[test]
 fn relay_token_redirect_never_forwards_the_device_secret() {
     use std::io::{ErrorKind, Write};
@@ -2544,12 +3231,7 @@ fn relay_token_redirect_never_forwards_the_device_secret() {
     });
 
     let transport = RelayCloudSessionTransport::new(
-        format!("http://{relay_address}"),
-        LocalDeviceBinding {
-            device_id: INSTALLATION_ID.to_string(),
-            machine_id: None,
-            sources: vec!["codex".to_string()],
-        },
+        relay_binding(format!("http://{relay_address}")),
         "redirect-guard-secret".to_string(),
     );
     let error = transport
@@ -2570,29 +3252,42 @@ fn relay_token_redirect_never_forwards_the_device_secret() {
     ));
 }
 
-/// [format] The relay uses the exact authority and changes routes, sends
-/// the exact validated body, and retries it once after a 401 with a fresh
-/// relay token. A 404 on the authority route reads as an older server.
+/// [format] The relay reads the Codex activity hint and posts the exact v3
+/// body, raw task id included, to the changes route, each retried once after a 401 with a fresh
+/// relay token. A 409 is a refusal and a 410 reads like a missing route,
+/// without reading either body; a 404 on the hint reads as an older server.
 #[test]
 #[serial_test::serial]
-fn relay_uses_exact_routes_and_retries_the_exact_body_after_auth_refresh() {
+fn relay_reads_the_hint_and_maps_refusals_on_the_exact_routes() {
     use std::io::Write;
     use std::net::TcpListener;
 
-    let (_root, grants, checkpoints) = stores("relay-http");
-    enabled(&grants);
-    let cli = Cli::head(page("raw-provider-private-id", None));
+    let (_root, checkpoints) = store("relay-http");
+    let cli = Cli::head(page("task_e_raw id é|\\", None));
     let fixture = Server::new();
-    let mut collector = CloudCollector::default();
     slice(
-        &mut collector,
-        &inputs(&grants, &checkpoints, &cli, &fixture),
+        &mut CloudCollector::default(),
+        &inputs(&checkpoints, &cli, &fixture),
         Instant::now(),
         Duration::ZERO,
     );
     let request = fixture.requests.borrow()[0].clone();
-    let grant = grants.load().unwrap().unwrap();
-    let authority = serde_json::to_string(&authority(&grant, "enabled")).unwrap();
+    let hint = Hint::on().decoded();
+    let hint_body = json!({
+        "source": "codex",
+        "server_time": "2026-07-21T10:00:00Z",
+        "last_data_at": null,
+        "record_count_15m": 0,
+        "record_count_24h": 0,
+        "local_usage_reconciliation_enabled": true,
+        "backfill_window_days": 183,
+        "session_titles_enabled": false,
+        "workspace_labels_enabled": false,
+        "recommended_scan_after": "2026-07-21T10:05:00Z",
+        "codex_cloud_tasks_enabled": true,
+        "codex_cloud_tasks_contract": "cloud_session_changes.v3"
+    })
+    .to_string();
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
@@ -2600,9 +3295,9 @@ fn relay_uses_exact_routes_and_retries_the_exact_body_after_auth_refresh() {
     let server_captured = Arc::clone(&captured);
     let server = thread::spawn(move || {
         let mut tokens = 0;
+        let mut hints = 0;
         let mut changes = 0;
-        let mut authorities = 0;
-        while changes < 2 || authorities < 2 {
+        while hints < 3 || changes < 4 {
             let (mut stream, _) = listener.accept().unwrap();
             let request = read_http_request(&mut stream);
             server_captured.lock().unwrap().push(request.clone());
@@ -2614,44 +3309,61 @@ fn relay_uses_exact_routes_and_retries_the_exact_body_after_auth_refresh() {
                         r#"{{"token":"relay-token-{tokens}","expires_at":"2099-01-01T00:00:00Z"}}"#
                     ),
                 )
-            } else if request.contains("/authority?") {
-                authorities += 1;
-                if authorities == 1 {
-                    ("200 OK", authority.clone())
-                } else {
-                    ("404 Not Found", r#"{"detail":"not found"}"#.to_string())
+            } else if request.contains("/activity-hints") {
+                hints += 1;
+                match hints {
+                    1 => ("401 Unauthorized", r#"{"detail":"expired"}"#.to_string()),
+                    2 => ("200 OK", hint_body.clone()),
+                    _ => ("404 Not Found", r#"{"detail":"not found"}"#.to_string()),
                 }
             } else {
                 changes += 1;
-                if changes == 1 {
-                    ("401 Unauthorized", r#"{"detail":"expired"}"#.to_string())
-                } else {
-                    let body: Value =
-                        serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
-                    let entities = body["observations"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .map(|change| {
-                            json!({
-                                "entity_key": change["entity_key"],
-                                "outcome": "accepted",
-                                "head_etag": "c".repeat(64),
-                                "accepted_seq": 7,
-                                "reason": null
+                match changes {
+                    1 => ("401 Unauthorized", r#"{"detail":"expired"}"#.to_string()),
+                    2 => {
+                        let body: Value =
+                            serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1)
+                                .unwrap();
+                        let entities = body["observations"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|change| {
+                                json!({
+                                    "source_session_id": change["source_session_id"],
+                                    "outcome": "accepted",
+                                    "head_etag": "c".repeat(64),
+                                    "accepted_seq": 7,
+                                    "reason": null
+                                })
                             })
-                        })
-                        .collect::<Vec<_>>();
-                    (
-                        "200 OK",
-                        json!({
-                            "schema_version": "cloud_session_changes_ack.v1",
-                            "grant_id": body["grant_id"],
-                            "grant_version": body["grant_version"],
-                            "entities": entities
-                        })
+                            .collect::<Vec<_>>();
+                        (
+                            "200 OK",
+                            json!({
+                                "schema_version": "cloud_session_changes_ack.v3",
+                                "entities": entities
+                            })
+                            .to_string(),
+                        )
+                    }
+                    3 => (
+                        "409 Conflict",
+                        json!({"detail": {
+                            "message": "The upload policy changed; read it again.",
+                            "code": "cloud_upload_policy_mismatch",
+                            "retryable": true
+                        }})
                         .to_string(),
-                    )
+                    ),
+                    _ => (
+                        "410 Gone",
+                        json!({"detail": {
+                            "message": "This contract is retired.",
+                            "code": "cloud_sessions_contract_retired"
+                        }})
+                        .to_string(),
+                    ),
                 }
             };
             write!(
@@ -2665,40 +3377,46 @@ fn relay_uses_exact_routes_and_retries_the_exact_body_after_auth_refresh() {
     });
 
     let relay = RelayCloudSessionTransport::new(
-        format!("http://{address}"),
-        LocalDeviceBinding {
-            device_id: INSTALLATION_ID.to_string(),
-            machine_id: None,
-            sources: vec!["codex".to_string()],
-        },
+        relay_binding(format!("http://{address}")),
         "device-secret".to_string(),
     );
-    let response = relay
-        .read_authority(&grant, Duration::from_secs(5))
-        .unwrap();
-    assert!(response.can_collect);
-    assert_eq!(grants.apply_backend_authority(&response).unwrap(), grant);
+    let read = relay.read_hint(Duration::from_secs(5)).unwrap();
+    assert_eq!(codex_cloud_listing(&read), Some(OFF));
+    assert_eq!(codex_cloud_listing(&hint), codex_cloud_listing(&read));
     let ack = relay
         .send_changes(&request, Duration::from_secs(5))
         .unwrap();
     assert!(request.settle(&ack).is_ok());
-    let missing = relay
-        .read_authority(&grant, Duration::from_secs(5))
-        .unwrap_err();
+    let Err(conflict) = relay.send_changes(&request, Duration::from_secs(5)) else {
+        panic!("a 409 must fail");
+    };
+    assert_eq!(
+        conflict.downcast_ref::<crate::snapshot_client::CloudTaskRefused>(),
+        Some(&crate::snapshot_client::CloudTaskRefused { status: 409 })
+    );
+    let Err(gone) = relay.send_changes(&request, Duration::from_secs(5)) else {
+        panic!("a 410 must fail");
+    };
+    assert_eq!(
+        gone.downcast_ref::<crate::snapshot_client::CloudSessionRouteUnsupported>(),
+        Some(&crate::snapshot_client::CloudSessionRouteUnsupported { status: 410 })
+    );
+    let Err(missing) = relay.read_hint(Duration::from_secs(5)) else {
+        panic!("a missing hint route must fail");
+    };
     assert!(missing
         .downcast_ref::<crate::snapshot_client::CloudSessionRouteUnsupported>()
         .is_some());
     server.join().unwrap();
 
     let requests = captured.lock().unwrap();
-    let authority_line =
-        format!("GET /api/v1/cloud-sessions/grants/{GRANT_ID}/authority?grant_version=1 HTTP/1.1");
     assert_eq!(
         requests
             .iter()
-            .filter(|request| request.starts_with(&authority_line))
+            .filter(|request| request
+                .starts_with("GET /api/v1/agent-session-snapshots/activity-hints HTTP/1.1"))
             .count(),
-        2
+        3
     );
     let changes = requests
         .iter()
@@ -2706,19 +3424,26 @@ fn relay_uses_exact_routes_and_retries_the_exact_body_after_auth_refresh() {
             request.starts_with("POST /api/v1/cloud-session-observations/changes HTTP/1.1")
         })
         .collect::<Vec<_>>();
-    assert_eq!(changes.len(), 2);
+    assert_eq!(changes.len(), 4);
     let bodies = changes
         .iter()
         .map(|request| request.split_once("\r\n\r\n").unwrap().1)
         .collect::<Vec<_>>();
-    assert_eq!(bodies[0], bodies[1]);
+    assert!(bodies.iter().all(|body| *body == bodies[0]));
     assert_eq!(
-        serde_json::from_str::<CloudSessionChangesV1>(bodies[0]).unwrap(),
+        serde_json::from_str::<CloudSessionChangesV2>(bodies[0]).unwrap(),
         request
     );
+    let sent: Value = serde_json::from_str(bodies[0]).unwrap();
+    assert_eq!(sent["source"], json!("codex"));
+    assert_eq!(
+        sent["observations"][0]["source_session_id"].as_str(),
+        Some("task_e_raw id é|\\")
+    );
     for body in &bodies {
-        assert!(!body.contains("raw-provider-private-id"));
         assert!(!body.contains("cursor"));
+        assert!(!body.contains("grant"));
+        assert!(!body.contains("entity_key"));
     }
     let bearer = |request: &str| {
         request
@@ -2730,896 +3455,4 @@ fn relay_uses_exact_routes_and_retries_the_exact_body_after_auth_refresh() {
     assert!(requests
         .iter()
         .all(|request| !request.contains("device-secret") || request.contains("/relay-token")));
-}
-
-/// [regress] Upgrade preserves exact old pending creates, with or without
-/// an explicit descriptor, and permits compensation without legacy collection.
-#[test]
-#[serial_test::serial]
-fn legacy_pending_create_survives_upgrade_until_compensating_revoke() {
-    for descriptor in [true, false] {
-        let (_root, grants, checkpoints) = stores("legacy-pending-create");
-        let local = grants.enable(&setup(), now()).unwrap();
-        grants.grant_create_request(INSTALLATION_ID).unwrap();
-        let mut saved = grants.read().unwrap().unwrap();
-        saved
-            .grant
-            .pending_backend_create
-            .as_mut()
-            .unwrap()
-            .schema_version = LEGACY_COLLECTION_SCHEMA_VERSION.to_string();
-        let old = saved.grant.pending_backend_create.clone().unwrap();
-        if !descriptor {
-            saved.grant.pending_backend_create = None;
-        }
-        grants.write(&saved).unwrap();
-        let restarted = CloudSessionGrantStore::new(grants.path());
-        assert!(restarted.enable(&setup(), now()).is_ok());
-        let original = backend_create_request(INSTALLATION_ID, &old);
-        assert_eq!(
-            restarted.grant_create_request(INSTALLATION_ID).unwrap(),
-            original
-        );
-        restarted.revoke(now()).unwrap();
-        assert_eq!(
-            restarted.grant_create_request(INSTALLATION_ID).unwrap(),
-            original
-        );
-        let mut response = backend_grant(&local, "enabled", 1);
-        response.schema_version = LEGACY_COLLECTION_SCHEMA_VERSION.to_string();
-        response.can_collect = None;
-        assert_eq!(
-            restarted
-                .bind_backend_grant(&response, INSTALLATION_ID)
-                .unwrap()
-                .status,
-            CloudSessionGrantStatus::Revoked
-        );
-        let cli = Cli::head(page("must-not-collect", None));
-        let server = Server::new();
-        assert_eq!(
-            slice(
-                &mut CloudCollector::default(),
-                &inputs(&restarted, &checkpoints, &cli, &server),
-                Instant::now(),
-                Duration::ZERO
-            ),
-            CloudSessionCycleOutcome::Disabled
-        );
-        assert_eq!(cli.calls(), 0);
-        assert_eq!(server.authority_calls.get(), 0);
-        response.status = "revoked".to_string();
-        response.grant_version = 2;
-        restarted
-            .apply_backend_revocation(&response, INSTALLATION_ID)
-            .unwrap();
-        restarted.enable(&setup(), now()).unwrap();
-        assert_eq!(
-            restarted
-                .grant_create_request(INSTALLATION_ID)
-                .unwrap()
-                .schema_version,
-            CHANGES_SCHEMA_VERSION
-        );
-    }
-}
-
-/// [regress] A delayed refusal anchors Retry-After to response receipt,
-/// even when the injected slice clock is older than the real test clock.
-#[test]
-#[serial_test::serial]
-fn cloud_retry_after_starts_when_the_authority_request_finishes() {
-    struct Shed;
-    impl CloudSessionTransport for Shed {
-        fn read_authority(
-            &self,
-            _: &CloudSessionGrant,
-            _: Duration,
-        ) -> Result<CloudSessionGrantAuthorityV1> {
-            Err(crate::snapshot_client::UploadShed {
-                status: 503,
-                retry_after: Some(Duration::ZERO),
-                code: None,
-            }
-            .into())
-        }
-        fn send_changes(
-            &self,
-            _: &CloudSessionChangesV1,
-            _: Duration,
-        ) -> Result<CloudSessionChangesAckV1> {
-            unreachable!()
-        }
-    }
-    let (_root, grants, checkpoints) = stores("retry-after-receipt");
-    enabled(&grants);
-    let cli = Cli::head(page("must-not-collect", None));
-    let mut collector = CloudCollector::default();
-    let inputs = inputs(&grants, &checkpoints, &cli, &Shed);
-    let now = Instant::now();
-    // An explicitly old deadline models time spent composing credentials.
-    let slice_start = now - Duration::from_secs(5);
-    let outcome = collector.run_slice(&inputs, slice_start, midnight());
-    assert_eq!(outcome, CloudSessionCycleOutcome::Failed);
-    let retry = collector.schedule.retry_not_before.unwrap();
-    // A zero server delay still begins at receipt, after request execution.
-    // The old code anchored it to slice_start, before that execution.
-    assert!(retry > slice_start);
-    assert_eq!(cli.calls(), 0);
-}
-
-/// [behaviour] Backoff defers planned work; it never accelerates head
-/// polling. A failed first crawl page is owed at the continuation cadence.
-#[test]
-#[serial_test::serial]
-fn failed_provider_pages_keep_their_planned_work_opportunity() {
-    struct Offline;
-    impl CloudSessionRunner for Offline {
-        fn list_page(&self, _: Option<&str>, _: usize) -> Result<String> {
-            Err(anyhow!("offline"))
-        }
-    }
-    let (_root, grants, checkpoints) = stores("failure-cadence");
-    enabled(&grants);
-    let server = Server::new();
-    let t0 = Instant::now();
-    let mut collector = CloudCollector::default();
-    let cli = Cli::head(page("terminal", None));
-    assert_eq!(
-        slice(
-            &mut collector,
-            &inputs(&grants, &checkpoints, &cli, &server),
-            t0,
-            Duration::ZERO
-        ),
-        CloudSessionCycleOutcome::Uploaded
-    );
-    let offline = inputs(&grants, &checkpoints, &Offline, &server);
-    assert_eq!(
-        slice(&mut collector, &offline, t0, 6 * HOUR),
-        CloudSessionCycleOutcome::Failed
-    );
-    assert!(
-        collector
-            .next_wake(t0 + 6 * HOUR, midnight() + 6 * HOUR, None)
-            .unwrap()
-            >= t0 + 12 * HOUR
-    );
-    let mut startup = CloudCollector::default();
-    assert_eq!(
-        slice(&mut startup, &offline, t0, Duration::ZERO),
-        CloudSessionCycleOutcome::Failed
-    );
-    assert!(startup.next_wake(t0, midnight(), None).unwrap() >= t0 + 5 * MINUTE);
-}
-
-/// [behaviour] A successfully listed running head keeps fast polling even
-/// when its upload loses an ACK. Delivery failure cannot erase provider facts.
-#[test]
-#[serial_test::serial]
-fn head_status_controls_cadence_independently_of_delivery() {
-    let (_root, grants, checkpoints) = stores("head-delivery-isolation");
-    enabled(&grants);
-    let cli = Cli::head(page("changing", None));
-    let server = Server::new();
-    let inputs = inputs(&grants, &checkpoints, &cli, &server);
-    let t0 = Instant::now();
-    let mut collector = CloudCollector::default();
-    assert_eq!(
-        slice(&mut collector, &inputs, t0, Duration::ZERO),
-        CloudSessionCycleOutcome::Uploaded
-    );
-    cli.set(None, page_of(vec![task("changing", "running")], None));
-    server.lose_acks.set(1);
-    assert_eq!(
-        slice(&mut collector, &inputs, t0, 6 * HOUR),
-        CloudSessionCycleOutcome::Failed
-    );
-    assert!(collector.schedule.head_nonterminal);
-    assert_eq!(
-        collector.next_wake(t0 + 6 * HOUR, midnight() + 6 * HOUR, None),
-        Some(t0 + 6 * HOUR + 5 * MINUTE)
-    );
-    // A later valid terminal head slows the schedule even if its ACK is lost.
-    cli.set(None, page_of(vec![task("changing", "error")], None));
-    server.lose_acks.set(1);
-    assert_eq!(
-        slice(&mut collector, &inputs, t0, 6 * HOUR + 5 * MINUTE),
-        CloudSessionCycleOutcome::Failed
-    );
-    assert!(!collector.schedule.head_nonterminal);
-}
-
-/// [behaviour] Idempotent create may return a paused row. It binds without
-/// collecting and remains compensatable if local revoke raced the response.
-#[test]
-#[serial_test::serial]
-fn paused_create_responses_reconcile_without_resurrecting_collection() {
-    for revoked in [false, true] {
-        let (_root, grants, checkpoints) = stores("paused-create");
-        let local = grants.enable(&setup(), now()).unwrap();
-        grants.grant_create_request(INSTALLATION_ID).unwrap();
-        if revoked {
-            grants.revoke(now()).unwrap();
-        }
-        let paused = backend_grant(&local, "paused", 1);
-        let bound = grants.bind_backend_grant(&paused, INSTALLATION_ID).unwrap();
-        assert_eq!(
-            bound.status,
-            if revoked {
-                CloudSessionGrantStatus::Revoked
-            } else {
-                CloudSessionGrantStatus::PolicyDisabled
-            }
-        );
-        assert_eq!(
-            grants.bind_backend_grant(&paused, INSTALLATION_ID).unwrap(),
-            bound
-        );
-        let cli = Cli::head(page("must-not-collect", None));
-        let server = Server::new();
-        server.authority.set(Authority::Paused);
-        slice(
-            &mut CloudCollector::default(),
-            &inputs(&grants, &checkpoints, &cli, &server),
-            Instant::now(),
-            Duration::ZERO,
-        );
-        assert_eq!(cli.calls(), 0);
-        if revoked {
-            assert_eq!(grants.grant_revoke_target().unwrap().grant_id, GRANT_ID);
-        } else {
-            let current = grants
-                .apply_backend_authority(&authority(&bound, "enabled"))
-                .unwrap();
-            assert_eq!(current.status, CloudSessionGrantStatus::Enabled);
-            // An old bind response never overwrites fresher authority state.
-            assert_eq!(
-                grants.bind_backend_grant(&paused, INSTALLATION_ID).unwrap(),
-                current
-            );
-        }
-    }
-}
-
-/// [format] A sign-in rebind repeats safely after server commit and before local save.
-#[test]
-#[serial_test::serial]
-fn sign_in_rebind_recovers_without_a_new_epoch() {
-    let (_root, store, checkpoints) = stores("rebind-crash");
-    enabled(&store);
-    store.record_health("healthy", "current", None).unwrap();
-    let local = store.load().unwrap().unwrap();
-    let mut proof = authority(&local, "enabled");
-    proof.collect_not_before = Some("2026-01-01T00:00:00Z".to_owned());
-    store.apply_backend_authority(&proof).unwrap();
-    let cli = Cli::head(page("cached-before-rebind", None));
-    let server = Server::new();
-    server
-        .collect_not_before
-        .replace(proof.collect_not_before.clone());
-    slice(
-        &mut CloudCollector::default(),
-        &inputs(&store, &checkpoints, &cli, &server),
-        Instant::now(),
-        Duration::ZERO,
-    );
-    let original = store.read().unwrap().unwrap();
-    let scope = cache_scope(
-        DEFAULT_API_BASE_URL,
-        &original.grant,
-        original.grant.backend_binding.as_ref().unwrap(),
-    );
-    let entity = server.requests.borrow()[0].observations[0]
-        .entity_key
-        .clone();
-    let saved_ack = checkpoints
-        .read_acks(&scope, &[&entity], midnight().unix_timestamp())
-        .unwrap();
-    assert_eq!(saved_ack.len(), 1);
-    let target = CloudSessionGrantSetup {
-        installation_id: "00000000-0000-4000-8000-000000000084".to_owned(),
-        organization_scope: "org_fixture".to_owned(),
-        effective_user_scope: "user_fixture".to_owned(),
-    };
-    let proposal = store
-        .prepare_rebind(&target, "hardware-fixture".to_owned())
-        .unwrap()
-        .unwrap();
-    let mut response = backend_grant(&original.grant, "enabled", 1);
-    response.installation_id = target.installation_id.clone();
-    response.grant_scope_fingerprint = proposal.request.grant_scope_fingerprint.clone();
-    let value = serde_json::to_value(&response).unwrap();
-    let mut value = value.as_object().unwrap().clone();
-    for key in ["server_policy_state", "release_lane"] {
-        value.remove(key);
-    }
-    value.insert("can_read_cloud_sessions".into(), json!(true));
-    let response =
-        serde_json::from_value::<CloudSessionBackendGrantResponseV1>(Value::Object(value)).unwrap();
-    let reopened = CloudSessionGrantStore::new(store.path());
-    let recovered = reopened
-        .prepare_rebind(&target, "hardware-fixture".to_owned())
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        serde_json::to_value(&proposal.request).unwrap(),
-        serde_json::to_value(&recovered.request).unwrap()
-    );
-    let before = fs::read(reopened.path()).unwrap();
-    let mut legacy = response.clone();
-    legacy.schema_version = LEGACY_COLLECTION_SCHEMA_VERSION.to_owned();
-    assert!(reopened
-        .bind_backend_grant_with_rebind(&legacy, &target.installation_id, Some(&recovered))
-        .is_err());
-    assert_eq!(fs::read(reopened.path()).unwrap(), before);
-    let rebound = reopened
-        .bind_backend_grant_with_rebind(&response, &target.installation_id, Some(&recovered))
-        .unwrap();
-    let mut expected_binding = original.grant.backend_binding.clone().unwrap();
-    expected_binding.cache_origin = Some(CloudSessionCacheOrigin {
-        installation_fingerprint: original.grant.installation_fingerprint.clone(),
-        grant_scope_id: original.grant.grant_scope_id.clone(),
-    });
-    assert_eq!(rebound.backend_binding.as_ref(), Some(&expected_binding));
-    assert_eq!(
-        cache_scope(DEFAULT_API_BASE_URL, &rebound, &expected_binding),
-        scope
-    );
-    assert_eq!(
-        checkpoints
-            .read_acks(&scope, &[&entity], midnight().unix_timestamp())
-            .unwrap()
-            .len(),
-        1
-    );
-    assert!(store
-        .prepare_rebind(
-            &CloudSessionGrantSetup {
-                effective_user_scope: "foreign-owner".to_owned(),
-                ..target.clone()
-            },
-            "fixture".to_owned()
-        )
-        .is_err());
-    assert_eq!(
-        rebound.account_fingerprint,
-        original.grant.account_fingerprint
-    );
-    assert_eq!(rebound.granted_at, original.grant.granted_at);
-    assert_eq!(
-        rebound.last_collector_health,
-        original.grant.last_collector_health
-    );
-    assert_eq!(
-        reopened.read().unwrap().unwrap().hmac_key_hex,
-        original.hmac_key_hex
-    );
-    let bytes = fs::read(reopened.path()).unwrap();
-    reopened
-        .bind_backend_grant(&response, &target.installation_id)
-        .unwrap();
-    assert_eq!(fs::read(reopened.path()).unwrap(), bytes);
-    assert!(reopened.runtime_candidate_for(&target).unwrap().is_some());
-    // Reopen with the rebound identity and poll unchanged facts: the accepted
-    // cache remains accessible, so no second upload is sent.
-    assert_eq!(
-        slice(
-            &mut CloudCollector::default(),
-            &inputs(&reopened, &checkpoints, &cli, &server),
-            Instant::now(),
-            Duration::ZERO
-        ),
-        CloudSessionCycleOutcome::Noop
-    );
-    assert_eq!(server.offered(), 1);
-    let mut next_target = target.clone();
-    next_target.installation_id = "00000000-0000-4000-8000-000000000094".to_owned();
-    let next = reopened
-        .prepare_rebind(&next_target, "fixture".to_owned())
-        .unwrap()
-        .unwrap();
-    let mut next_response = response.clone();
-    next_response.installation_id = next_target.installation_id.clone();
-    next_response.grant_scope_fingerprint = next.request.grant_scope_fingerprint.clone();
-    let twice = reopened
-        .bind_backend_grant_with_rebind(&next_response, &next_target.installation_id, Some(&next))
-        .unwrap();
-    assert_eq!(
-        cache_scope(
-            DEFAULT_API_BASE_URL,
-            &twice,
-            twice.backend_binding.as_ref().unwrap()
-        ),
-        scope
-    );
-    reopened.revoke(now()).unwrap();
-    assert!(reopened
-        .prepare_rebind(&target, "fixture".to_owned())
-        .unwrap()
-        .is_none());
-    assert!(reopened
-        .bind_backend_grant_with_rebind(&response, &target.installation_id, Some(&recovered))
-        .is_err());
-}
-
-/// [regress] Updating the producer preserves approval and reports the current build.
-#[test]
-#[serial_test::serial]
-fn update_preserves_consent_time_build_and_uses_current_payload_build() {
-    let (_root, store, checkpoints) = stores("update-approval");
-    enabled(&store);
-    let mut state = store.read().unwrap().unwrap();
-    state.grant.collector_version = "0.0.1".to_owned();
-    store.write(&state).unwrap();
-    assert!(cloud_grant_runtime_ready(&state.grant));
-    assert!(cloud_grant_preflight_eligible(&state.grant));
-    let cli = Cli::head(page("current-build", None));
-    let server = Server::new();
-    assert_eq!(
-        slice(
-            &mut CloudCollector::default(),
-            &inputs(&store, &checkpoints, &cli, &server),
-            Instant::now(),
-            Duration::ZERO
-        ),
-        CloudSessionCycleOutcome::Uploaded
-    );
-    assert_eq!(
-        server.requests.borrow()[0].collector_version,
-        compiled_release_version()
-    );
-    assert_eq!(store.load().unwrap().unwrap().collector_version, "0.0.1");
-}
-
-/// [behaviour] The shared HTTP client dispatches both grant kinds and omits predecessor UUIDs.
-#[test]
-fn collector_rebind_http_and_authority_send_exact_current_identity() {
-    use std::io::Write;
-    use std::net::TcpListener;
-    for kind in [GrantKind::DailyReference, GrantKind::CloudSessions] {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = thread::spawn(move || {
-            let mut captured = Vec::new();
-            for (status, body) in [
-                ("200 OK", "{}"),
-                (
-                    "409 Conflict",
-                    r#"{"detail":{"code":"hardware_changed","message":"refused","retryable":false}}"#,
-                ),
-                ("200 OK", "{}"),
-            ] {
-                let (mut stream, _) = listener.accept().unwrap();
-                captured.push(read_http_request(&mut stream));
-                write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
-            }
-            captured
-        });
-        let client = crate::snapshot_client::SnapshotApiClient::new(format!("http://{address}"));
-        let request = RebindRequest {
-            installation_id: INSTALLATION_ID.to_owned(),
-            grant_version: 1,
-            grant_scope_fingerprint: format!("hmac-sha256:{}", "a".repeat(64)),
-            hardware_id: Some(format!("oth_{}", "a".repeat(32))),
-            disclosure_version: match kind {
-                GrantKind::DailyReference => "provider_daily_reference_disclosure.v2",
-                GrantKind::CloudSessions => "cloud_sessions_disclosure.v1",
-            }
-            .to_owned(),
-        };
-        assert_eq!(
-            client
-                .rebind_collector_grant(
-                    kind,
-                    GRANT_ID,
-                    "fixture-relay-token",
-                    &request,
-                    Duration::from_secs(2)
-                )
-                .unwrap(),
-            json!({})
-        );
-        let refusal = client
-            .rebind_collector_grant(
-                kind,
-                GRANT_ID,
-                "fixture-relay-token",
-                &request,
-                Duration::from_secs(2),
-            )
-            .unwrap_err();
-        assert_eq!(refusal.code, "hardware_changed");
-        assert!(!refusal.retryable);
-        client
-            .get_cloud_session_authority_with_timeout(
-                "fixture-relay-token",
-                GRANT_ID,
-                1,
-                Duration::from_secs(2),
-            )
-            .unwrap();
-        let captured = server.join().unwrap();
-        for raw in &captured[..2] {
-            assert!(raw.starts_with(&format!(
-                "POST /api/v1/{}/grants/{GRANT_ID}/rebind ",
-                kind.route()
-            )));
-            assert!(raw
-                .to_ascii_lowercase()
-                .contains("authorization: bearer fixture-relay-token"));
-            let (_, body) = raw.split_once("\r\n\r\n").unwrap();
-            let body: Value = serde_json::from_str(body).unwrap();
-            assert_eq!(body, serde_json::to_value(&request).unwrap());
-            assert!(body.get("previous_installation_id").is_none());
-        }
-        assert!(captured[2].starts_with(&format!(
-            "GET /api/v1/cloud-sessions/grants/{GRANT_ID}/authority?grant_version=1 HTTP/1.1"
-        )));
-    }
-}
-
-/// [behaviour] A valid same-epoch rebind can deny collection without enabling it.
-#[test]
-fn successful_rebind_retains_a_disabled_server_policy() {
-    let (_root, store, _) = stores("rebind-disabled-policy");
-    enabled(&store);
-    let original = store.load().unwrap().unwrap();
-    let target = CloudSessionGrantSetup {
-        installation_id: "00000000-0000-4000-8000-000000000085".to_owned(),
-        organization_scope: "org_fixture".to_owned(),
-        effective_user_scope: "user_fixture".to_owned(),
-    };
-    let proposal = store
-        .prepare_rebind(&target, "fixture".to_owned())
-        .unwrap()
-        .unwrap();
-    let mut response = backend_grant(&original, "enabled", 1);
-    response.installation_id = target.installation_id.clone();
-    response.grant_scope_fingerprint = proposal.request.grant_scope_fingerprint.clone();
-    response.can_collect = Some(false);
-    let rebound = store
-        .bind_backend_grant_with_rebind(&response, &target.installation_id, Some(&proposal))
-        .unwrap();
-    assert_eq!(rebound.status, CloudSessionGrantStatus::PolicyDisabled);
-    assert!(!cloud_grant_runtime_ready(&rebound));
-    assert!(store
-        .prepare_rebind(&target, "fixture".to_owned())
-        .unwrap()
-        .is_none());
-    assert_eq!(rebound.backend_binding.as_ref().unwrap().grant_version, 1);
-}
-
-/// [regress] Paused same-owner consent resumes after sign-in without a new browser approval.
-#[test]
-fn paused_approval_resumes_via_rebind_and_account_switch_requires_new_consent() {
-    let (_root, store, _) = stores("rebind-resume-account-switch");
-    enabled(&store);
-    let original = store.read().unwrap().unwrap();
-    store.pause(now()).unwrap();
-    let mut target = CloudSessionGrantSetup {
-        installation_id: "00000000-0000-4000-8000-000000000086".to_owned(),
-        organization_scope: "org_fixture".to_owned(),
-        effective_user_scope: "user_fixture".to_owned(),
-    };
-    let resumed = store.enable(&target, now()).unwrap();
-    assert_eq!(resumed.status, CloudSessionGrantStatus::Enabled);
-    assert_eq!(resumed.backend_binding, original.grant.backend_binding);
-    assert!(!resumed.backend_create_pending);
-    let proposal = store
-        .prepare_rebind(&target, "fixture".to_owned())
-        .unwrap()
-        .unwrap();
-    let mut response = backend_grant(&original.grant, "enabled", 1);
-    response.installation_id = target.installation_id.clone();
-    response.grant_scope_fingerprint = proposal.request.grant_scope_fingerprint.clone();
-    store
-        .bind_backend_grant_with_rebind(&response, &target.installation_id, Some(&proposal))
-        .unwrap();
-    assert_eq!(
-        store.read().unwrap().unwrap().hmac_key_hex,
-        original.hmac_key_hex
-    );
-    target.installation_id = "00000000-0000-4000-8000-000000000087".to_owned();
-    target.effective_user_scope = "another-user".to_owned();
-    let new_owner = store.enable(&target, now()).unwrap();
-    assert_eq!(new_owner.status, CloudSessionGrantStatus::ConsentRequired);
-    assert!(new_owner.backend_binding.is_none());
-    assert!(!cloud_grant_runtime_ready(&new_owner));
-    assert_ne!(
-        new_owner.account_fingerprint,
-        original.grant.account_fingerprint
-    );
-    store.grant_create_request(&target.installation_id).unwrap();
-    let mut approved = backend_grant(&new_owner, "enabled", 1);
-    approved.installation_id = target.installation_id.clone();
-    store
-        .bind_backend_grant(&approved, &target.installation_id)
-        .unwrap();
-    target.effective_user_scope = "user_fixture".to_owned();
-    let returned = store.enable(&target, now()).unwrap();
-    assert_eq!(returned.status, CloudSessionGrantStatus::ConsentRequired);
-    assert!(
-        returned.backend_binding.is_none(),
-        "returning to the former owner requires approval"
-    );
-}
-
-/// [regress] A terminal rebind refusal permits explicit replacement; a raced revoke still reconciles exactly.
-#[test]
-fn refused_approval_can_be_replaced_and_old_device_revocation_can_be_confirmed() {
-    let (_root, store, _) = stores("rebind-refusal-new-consent");
-    enabled(&store);
-    let mut target = CloudSessionGrantSetup {
-        installation_id: "00000000-0000-4000-8000-000000000088".to_owned(),
-        organization_scope: "org_fixture".to_owned(),
-        effective_user_scope: "user_fixture".to_owned(),
-    };
-    store
-        .record_health("unavailable", "unavailable", Some("installation_reset"))
-        .unwrap();
-    let pending = store.enable(&target, now()).unwrap();
-    assert_eq!(pending.status, CloudSessionGrantStatus::ConsentRequired);
-    assert!(pending.backend_binding.is_none());
-    store.grant_create_request(&target.installation_id).unwrap();
-    let mut response = backend_grant(&pending, "enabled", 1);
-    response.installation_id = target.installation_id.clone();
-    store
-        .bind_backend_grant(&response, &target.installation_id)
-        .unwrap();
-    store.revoke(now()).unwrap();
-    let mut revoked = response;
-    revoked.status = "revoked".to_owned();
-    revoked.grant_version = 2;
-    target.installation_id = "00000000-0000-4000-8000-000000000089".to_owned();
-    assert!(
-        store.enable(&target, now()).is_err(),
-        "unconfirmed revoke remains protected"
-    );
-    store
-        .apply_backend_revocation(&revoked, &target.installation_id)
-        .unwrap();
-    assert_eq!(
-        store.load().unwrap().unwrap().status,
-        CloudSessionGrantStatus::Revoked
-    );
-    assert_eq!(
-        store.enable(&target, now()).unwrap().status,
-        CloudSessionGrantStatus::ConsentRequired
-    );
-}
-
-/// [regress] A committed in-flight rebind updates cleanup identity while a local stop remains final.
-#[test]
-fn a_stop_racing_rebind_completion_preserves_cleanup_without_resurrection() {
-    for stop in [
-        CloudSessionGrantStatus::Paused,
-        CloudSessionGrantStatus::Revoked,
-    ] {
-        let (_root, store, _) = stores("rebind-raced-stop");
-        enabled(&store);
-        let original = store.load().unwrap().unwrap();
-        let target = CloudSessionGrantSetup {
-            installation_id: "00000000-0000-4000-8000-000000000090".to_owned(),
-            organization_scope: "org_fixture".to_owned(),
-            effective_user_scope: "user_fixture".to_owned(),
-        };
-        let proposal = store
-            .prepare_rebind(&target, "fixture".to_owned())
-            .unwrap()
-            .unwrap();
-        let mut response = backend_grant(&original, "enabled", 1);
-        response.installation_id = target.installation_id.clone();
-        response.grant_scope_fingerprint = proposal.request.grant_scope_fingerprint.clone();
-        store.change_status(stop.clone(), now()).unwrap();
-        assert!(store
-            .prepare_rebind(&target, "fixture".to_owned())
-            .unwrap()
-            .is_none());
-        let retained = store
-            .bind_backend_grant_with_rebind(&response, &target.installation_id, Some(&proposal))
-            .unwrap();
-        assert_eq!(retained.status, stop);
-        assert!(!cloud_grant_runtime_ready(&retained));
-        assert!(store
-            .prepare_rebind(&target, "fixture".to_owned())
-            .unwrap()
-            .is_none());
-        if stop == CloudSessionGrantStatus::Revoked {
-            assert_eq!(retained.revoked_at, Some(timestamp(now())));
-            response.status = "revoked".to_owned();
-            response.grant_version = 2;
-            store
-                .apply_backend_revocation(&response, &target.installation_id)
-                .unwrap();
-            assert!(
-                store
-                    .load()
-                    .unwrap()
-                    .unwrap()
-                    .backend_binding
-                    .unwrap()
-                    .backend_revoked
-            );
-        } else {
-            assert_eq!(
-                store.enable(&target, now()).unwrap().status,
-                CloudSessionGrantStatus::Enabled
-            );
-        }
-    }
-}
-
-/// [regress] Identity changes stop the new authority/page/send/cache paths;
-/// an ACK admitted before a change cannot repopulate its cache afterwards.
-#[test]
-#[serial_test::serial]
-fn current_binding_fences_every_results_io_boundary() {
-    struct Fenced<'a> {
-        server: Server,
-        current: &'a Cell<bool>,
-        stop_after_send: bool,
-    }
-    impl CloudSessionTransport for Fenced<'_> {
-        fn local_binding_current(&self, _grant: &CloudSessionGrant) -> bool {
-            self.current.get()
-        }
-        fn read_authority(
-            &self,
-            grant: &CloudSessionGrant,
-            timeout: Duration,
-        ) -> Result<CloudSessionGrantAuthorityV1> {
-            self.server.read_authority(grant, timeout)
-        }
-        fn send_changes(
-            &self,
-            request: &CloudSessionChangesV1,
-            timeout: Duration,
-        ) -> Result<CloudSessionChangesAckV1> {
-            let ack = self.server.send_changes(request, timeout);
-            if self.stop_after_send {
-                self.current.set(false);
-            }
-            ack
-        }
-    }
-    struct ChangingCli<'a> {
-        cli: Cli,
-        current: &'a Cell<bool>,
-        stop_after_list: bool,
-    }
-    impl CloudSessionRunner for ChangingCli<'_> {
-        fn list_page(&self, cursor: Option<&str>, limit: usize) -> Result<String> {
-            let page = self.cli.list_page(cursor, limit);
-            if self.stop_after_list {
-                self.current.set(false);
-            }
-            page
-        }
-    }
-    for stop in ["before-slice", "after-provider", "after-send"] {
-        let (_root, grants, checkpoints) = stores("binding-fence");
-        enabled(&grants);
-        let current = Cell::new(stop != "before-slice");
-        let cli = ChangingCli {
-            cli: Cli::head(page("identity-fence", None)),
-            current: &current,
-            stop_after_list: stop == "after-provider",
-        };
-        let server = Fenced {
-            server: Server::new(),
-            current: &current,
-            stop_after_send: stop == "after-send",
-        };
-        let grant = grants.load().unwrap().unwrap();
-        let scope = cache_scope(
-            DEFAULT_API_BASE_URL,
-            &grant,
-            grant.backend_binding.as_ref().unwrap(),
-        );
-        let key = parse_cloud_page(
-            &page("identity-fence", None),
-            &decode_hex(&grants.read().unwrap().unwrap().hmac_key_hex).unwrap(),
-            now(),
-        )
-        .unwrap()
-        .changes[0]
-            .entity_key
-            .clone();
-        CloudCollector::default().run_slice(
-            &SliceInputs {
-                grants: &grants,
-                checkpoints: &checkpoints,
-                runner: &cli,
-                transport: &server,
-                destination: DEFAULT_API_BASE_URL,
-                last_activity: None,
-            },
-            Instant::now(),
-            midnight(),
-        );
-        assert_eq!(
-            server.server.authority_calls.get(),
-            usize::from(stop != "before-slice")
-        );
-        assert_eq!(cli.cli.calls(), usize::from(stop != "before-slice"));
-        assert_eq!(server.server.offered(), usize::from(stop == "after-send"));
-        assert!(checkpoints
-            .read_acks(&scope, &[&key], midnight().unix_timestamp())
-            .unwrap()
-            .is_empty());
-        assert_eq!(
-            grants.load().unwrap().unwrap().status,
-            CloudSessionGrantStatus::Enabled
-        );
-    }
-}
-
-/// [regress] A lost rebind reply followed by local revoke reconciles the exact
-/// DELETE response, without re-enabling consent or retrying a revoked rebind.
-#[test]
-fn lost_rebind_reply_can_be_revoked_using_the_current_owner_proof() {
-    let (_root, grants, _) = stores("lost-rebind-revoke");
-    enabled(&grants);
-    let original = grants.load().unwrap().unwrap();
-    let target = CloudSessionGrantSetup {
-        installation_id: "00000000-0000-4000-8000-000000000095".to_owned(),
-        ..setup()
-    };
-    let proposal = grants
-        .prepare_rebind(&target, "fixture".to_owned())
-        .unwrap()
-        .unwrap();
-    // Server commits target binding; its response never reaches local bind.
-    let mut deleted = backend_grant(&original, "revoked", 2);
-    deleted.installation_id = target.installation_id.clone();
-    deleted.grant_scope_fingerprint = proposal.request.grant_scope_fingerprint.clone();
-    grants.revoke(now()).unwrap();
-    assert!(grants
-        .prepare_rebind(&target, "fixture".to_owned())
-        .unwrap()
-        .is_none());
-    let bytes = fs::read(grants.path()).unwrap();
-    let foreign = CloudSessionGrantSetup {
-        effective_user_scope: "foreign".to_owned(),
-        ..target.clone()
-    };
-    assert!(grants
-        .reconcile_backend_revocation(&deleted, &foreign)
-        .is_err());
-    for field in ["id", "scope", "status", "epoch"] {
-        let mut invalid = deleted.clone();
-        match field {
-            "id" => invalid.id = "00000000-0000-4000-8000-000000000096".to_owned(),
-            "scope" => invalid.grant_scope_fingerprint = original.grant_scope_id.clone(),
-            "status" => invalid.status = "enabled".to_owned(),
-            "epoch" => invalid.grant_version = 0,
-            _ => unreachable!(),
-        }
-        assert!(grants
-            .reconcile_backend_revocation(&invalid, &target)
-            .is_err());
-        assert_eq!(fs::read(grants.path()).unwrap(), bytes);
-    }
-    // Another sign-in can replace the relay device again before cleanup.
-    // Prove the DELETE target using its returned UUID and the current owner.
-    let current = CloudSessionGrantSetup {
-        installation_id: "00000000-0000-4000-8000-000000000097".to_owned(),
-        ..target.clone()
-    };
-    let stopped = grants
-        .reconcile_backend_revocation(&deleted, &current)
-        .unwrap();
-    assert_eq!(stopped.status, CloudSessionGrantStatus::Revoked);
-    assert_eq!(stopped.revoked_at, Some(timestamp(now())));
-    assert!(stopped.backend_binding.as_ref().unwrap().backend_revoked);
-    assert!(!cloud_grant_runtime_ready(&stopped));
-    assert!(grants
-        .prepare_rebind(&target, "fixture".to_owned())
-        .unwrap()
-        .is_none());
-    assert_eq!(
-        grants.enable(&target, now()).unwrap().status,
-        CloudSessionGrantStatus::ConsentRequired
-    );
 }

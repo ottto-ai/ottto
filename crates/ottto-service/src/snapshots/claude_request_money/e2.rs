@@ -2168,6 +2168,14 @@ fn census_holder(
     .then_some(holder)
 }
 
+#[cfg(test)]
+pub(crate) fn copied_file_holders_for_test<'a>(
+    index: &ScanIndex,
+    keys: impl Iterator<Item = &'a str>,
+) -> BTreeMap<String, String> {
+    copied_file_holders(index, keys)
+}
+
 /// One census-only walk for a fixed seed set. Each seed pulls at most its
 /// earliest accepted main holder; returned holders never become new seeds.
 /// All census hashes participate, so an own turn cannot hide a copied prefix.
@@ -3303,6 +3311,12 @@ fn attach_one(
     let Some(occurrence) = claude_usage_occurrences.get_mut(row.request_id.as_str()) else {
         return false;
     };
+    // Route evidence only (local, never sent), producer on: this request's own
+    // row, joined by its provider request id, named a valid account. No money
+    // input.
+    if crate::snapshots::billing_route::PRODUCER_ENABLED {
+        occurrence.route_telemetry_account |= row.account_identifier_hash.is_some();
+    }
 
     // The hour the estimated key is placed in (`occurrence_key`): its clock,
     // else the file's fallback; none or unreadable places no key.
@@ -4215,12 +4229,53 @@ pub(crate) enum TelemetryRead {
 /// identity already tagged, overflow). Their items stay on the page
 /// unchanged so the caller holds them (`hold_request_owned`): a removed item
 /// would let the page settle its file without a body. Gate off: empty.
+/// Single-chunk callers (tests) plan the content-twin holds over `items`.
+#[cfg(test)]
 pub(crate) fn finish_page(
     items: &mut Vec<SnapshotItem>,
     index: &ScanIndex,
     telemetry: TelemetryRead,
     hold_reasons: &mut BTreeMap<&'static str, u64>,
     queued_family_deferred_paths: &BTreeSet<LocationKey>,
+) -> BTreeSet<String> {
+    let content_held = page_content_holds(items, index);
+    finish_page_planned(
+        items,
+        index,
+        telemetry,
+        hold_reasons,
+        queued_family_deferred_paths,
+        &content_held,
+    )
+}
+
+/// Sessions the page withholds for an absent content twin, decided once over
+/// the whole acquisition page: every evidence chunk's finish shares it, so a
+/// twin finished in another chunk of the same page is present.
+pub(crate) fn page_content_holds(items: &[SnapshotItem], index: &ScanIndex) -> BTreeSet<String> {
+    let mut sessions = BTreeMap::<&str, Vec<LocationKey>>::new();
+    for item in items {
+        if let Some(fold) = item.claude_money.as_deref() {
+            let here = sessions.entry(item.source_session_id.as_str()).or_default();
+            here.extend(fold.location.map(|located| located.0));
+        }
+    }
+    let sessions = sessions
+        .iter()
+        .map(|(s, l)| (*s, l.as_slice()))
+        .collect::<Vec<_>>();
+    content_twin_holds(&sessions, items, index)
+}
+
+/// `finish_page` for one evidence chunk of a page whose content-twin holds
+/// were decided once over the whole page.
+pub(crate) fn finish_page_planned(
+    items: &mut Vec<SnapshotItem>,
+    index: &ScanIndex,
+    telemetry: TelemetryRead,
+    hold_reasons: &mut BTreeMap<&'static str, u64>,
+    queued_family_deferred_paths: &BTreeSet<LocationKey>,
+    page_content_held: &BTreeSet<String>,
 ) -> BTreeSet<String> {
     if !index.persistence_available() {
         let held: BTreeSet<_> = items.iter().map(|i| i.source_session_id.clone()).collect();
@@ -4404,13 +4459,22 @@ pub(crate) fn finish_page(
         .iter()
         .map(|(session, state)| (session.as_str(), state.locations.as_slice()))
         .collect::<Vec<_>>();
-    let held = absent_twins(
+    let content_held = locations
+        .iter()
+        .filter(|(session, _)| page_content_held.contains(*session))
+        .map(|(session, _)| (*session).to_owned())
+        .collect::<BTreeSet<_>>();
+    if !content_held.is_empty() {
+        *hold_reasons.entry("absent_content_twin").or_default() += content_held.len() as u64;
+    }
+    let mut held = absent_twins(
         &locations,
         items,
         index,
         queued_family_deferred_paths,
         hold_reasons,
     );
+    held.extend(content_held.iter().cloned());
     diag("held_absent_twin", held.len() as u64);
     drop(locations);
     let mut decided = Vec::with_capacity(sessions.len());
@@ -4429,7 +4493,9 @@ pub(crate) fn finish_page(
         if item.claude_money.is_none() {
             return true;
         }
-        if drop_copies.get(&item.source_session_id) == Some(&true) {
+        if !content_held.contains(&item.source_session_id)
+            && drop_copies.get(&item.source_session_id) == Some(&true)
+        {
             return false;
         }
         // One body per session: the first item carries the summed entity.
@@ -4735,6 +4801,92 @@ fn redundant_twin(key: &str, other: &str, folded: &SnapshotItem, index: &ScanInd
         }
     };
     proof() == Some(true)
+}
+
+/// Missing overlapping contributors hold the replacement. Deleted files
+/// and retired/missing census hashes release the content dependency.
+fn content_twin_holds(
+    sessions: &[(&str, &[LocationKey])],
+    items: &[SnapshotItem],
+    index: &ScanIndex,
+) -> BTreeSet<String> {
+    if sessions.is_empty() {
+        return BTreeSet::new();
+    }
+    let mut twin_locations = BTreeSet::new();
+    let mut twins_by_hash = BTreeMap::<u64, BTreeSet<&str>>::new();
+    for (key, twin) in index
+        .claude_request_census
+        .records()
+        .filter(|(_, r)| r.is_twin())
+    {
+        twin_locations.insert(location_key(key));
+        for &hash in twin.request_hashes() {
+            twins_by_hash.entry(hash).or_default().insert(key);
+        }
+    }
+    let mut page_locations = BTreeSet::new();
+    let mut session_hashes = BTreeMap::<&str, BTreeSet<u64>>::new();
+    for item in items {
+        page_locations.extend(
+            item.claude_money
+                .as_deref()
+                .and_then(FileFold::location_key),
+        );
+        session_hashes
+            .entry(&item.source_session_id)
+            .or_default()
+            .extend(
+                item.claude_usage_request_ids
+                    .iter()
+                    .map(|id| claude_request_hash(id)),
+            );
+    }
+    // Build filename groups once for the same twin-only sessions, including
+    // empty location lists (all() was vacuously true for those too).
+    let only_twins = sessions
+        .iter()
+        .filter(|(_, here)| here.iter().all(|key| twin_locations.contains(key)))
+        .map(|(session, _)| (*session).to_owned())
+        .collect::<BTreeSet<_>>();
+    let groups = (!only_twins.is_empty()).then(|| claude_path_twin_groups(index, &only_twins));
+    sessions
+        .iter()
+        .filter(|(session, here)| {
+            // Filename absence still takes precedence over content overlap.
+            if only_twins.contains(*session)
+                && groups
+                    .as_ref()
+                    .and_then(|groups| groups.get(*session))
+                    .is_some_and(|keys| {
+                        keys.iter().any(|(key, _)| {
+                            Path::new(key).is_file() && !here.contains(&location_key(key))
+                        })
+                    })
+            {
+                return true;
+            }
+            let hashes = &session_hashes[*session];
+            // Keep census key order and check each overlapping twin only once.
+            let overlapping = hashes
+                .iter()
+                .filter_map(|hash| twins_by_hash.get(hash))
+                .flatten()
+                .copied()
+                .collect::<BTreeSet<_>>();
+            overlapping.into_iter().any(|key| {
+                let twin = index.claude_request_census.get(key).unwrap();
+                !(twin.is_exact()
+                    && twin
+                        .request_hashes()
+                        .iter()
+                        .all(|hash| hashes.contains(hash)))
+                    && !page_locations.contains(&location_key(key))
+                    && Path::new(key).is_file()
+            })
+        })
+        .map(|(session, _)| (*session).to_owned())
+        .collect()
 }
 
 /// Sessions (roots and subagent members) with a live indexed path that is

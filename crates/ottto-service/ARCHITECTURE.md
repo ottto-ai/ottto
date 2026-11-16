@@ -25,6 +25,10 @@ file-system hint / periodic listing → select file → read new bytes from save
   from the saved offset, is the normal mode, so bytes read track bytes appended. A Full read has a
   named cause (new or replaced file, missing or invalid saved result, a real edit) and is counted
   by cause. Re-reading unchanged content that was already uploaded is treated as a bug.
+  Forced Claude twins with a current, verified, loss-free census may use the same validated Tail
+  loader. They still provide no copy proof or body-binding authority. Without audit capacity or
+  when the loader holds, they read natively on their holder's page. Exact/Empty growth can lose
+  census verification and require a native read on the next force.
 - **Reduction.** One reducer per source turns lines into usage and keeps a running result. Old
   evidence is read only for the session group a change affects.
 - **Codex rollout encodings.** Plain `.jsonl` and compressed `.jsonl.zst` use the same
@@ -104,12 +108,20 @@ file-system hint / periodic listing → select file → read new bytes from save
   only under an unrelated session elsewhere leaves its copy counted.
   The original in-folder census wait still expires on its third decision.
   An all-covered copy-only page drops its items when the session has another
-  file; own turns still publish. A selected content twin pulls at most its
-  earliest accepted main holder, and a selected holder (not history-held)
-  pulls the content twins it is that holder for, so neither file publishes
-  the session without the other. A holder is never a twin, so pulls never
-  cascade, and ordinary discovery acquires the pulled file without an extra
-  seed content read.
+  file; own turns still publish. A selected content twin pulls every live
+  overlapping census main, and a selected main file (not history-held)
+  pulls every live census content twin sharing a request hash. Ordinary discovery
+  acquires pulled files through the existing history and resident admission gates.
+  A missing overlapping twin with additional hashes or a non-Exact census holds
+  the replacement before all-copy suppression; the items stay owed without receipts.
+  A page containing only census twins also waits for every live filename
+  member of that session. The `absent_content_twin` diagnostic counts held
+  sessions; even a bound contributor hold keeps the session progress-blocking.
+  Deletion or retirement of the contributor's census hashes releases the content
+  dependency. Disjoint and missing-census twins remain outside this fence;
+  unrelated sessions sharing hashes may conservatively wait together. A twin
+  whose session main shares no request with it can wait until that main is
+  independently selected. Twin pulls can read extra overlapping copy sources.
   Money rule three selects content twins, path twins and disclosed main
   files once, using every census hash and one in-memory census walk without
   a deadline. Only a candidate sharing ids with an earlier accepted holder
@@ -363,6 +375,9 @@ SQLite runs in-process, so a query is a function call rather than a round trip.
   No per-row commits.
 - Read transactions stay short and never span parsing, uploads or network waits, so WAL
   checkpoints can run.
+- Each state-store connection releases its own cache after its own pass, after maintenance
+  and before cache gauges are sampled. Release is best effort; `cache_size=-8192` stays
+  unchanged and the next pass refills the cache.
 - Durability stays at `FULL`. Erasing data leaves nothing readable in the database, WAL or SHM
   files.
 - Complete valid saves commit above aggregate charged-work targets. The 32 MiB target sizes the
@@ -443,6 +458,39 @@ exempt a new production file from the ceiling.
   the same account placement. The money oracle in `snapshots/sampled_scan/transition_fixture.rs`
   and the `money_equivalence` CI job check this.
 
+## Billing route annotation
+
+`snapshots/billing_route.rs` labels each session's billing route (`session_billing_route:v1`).
+It is annotation only: pricing, placement, identity, row keys, hashes, body witnesses and upload
+decisions never read it, and the wire object is sent only when the receiver advertises that exact
+contract. Nothing is persisted. Codex reads the auth mode recorded on its rows and Pi accepts only
+allowlisted cloud provider and explicit auth pairs; they keep no latch: each pass takes the first
+route from the earliest hour bucket holding a known route (rows within an hour sort by row key, not
+time), and two known routes there are `signal_conflict`. Claude Code keeps in-memory latches, keyed
+by destination, source, machine and session, for known first routes only. Only the session's first
+own response (sequence order, never filtered away) can name one, and only when every physical line
+of the file decoded (the read report spans Tail resumes), no response, resolved or not, precedes it,
+the session's earliest stamped line of any kind (`claude_line_clocks`, inherited and invalid fork lines included)
+is strictly after this process started and that response has a request id, is not synthetic and
+has a complete clock whose start and end are strictly after the start (precise timestamps). Any
+other missing, unstamped or unproven input is `first_request_snapshot_missing`; a later request
+never stands in, and later requests, under the same clock rule, only join `routes_seen`. Latches
+follow one destination at a time, as the source manifests do. The status refresh publishes the
+login evaluator result with when it last changed and when it was last observed; a request is
+classified with it only when it changed at or before the request started (its preceding prompt or
+tool-result record) and was observed at or after the request ended. A request not yet covered is
+deferred to a later pass (no object meanwhile); one whose evaluator changed after it started is
+`first_request_snapshot_missing`. The evaluator never labels alone: OAuth needs that session's own
+Desktop request or a request whose own telemetry row named a valid account, an API key needs a
+native `req_`/`msg_` pair, and a cloud message or request id (`msg_bdrk_`, `msg_vrtx_`) or
+cloud-shaped model on any owned request keeps both unknown. A known first route never becomes a
+different known route (Codex/Pi: a second route in its hour turns it to `signal_conflict`); later
+proven routes join `routes_seen`. Disclosed residuals: a gateway forwarding native-looking
+ids can satisfy either conjunction, a same-session account does not prove who paid for the first
+request, and a login switched and switched back between two status refreshes is not seen, so the
+label is not fail-closed for every proxy. `PRODUCER_ENABLED` turns the annotation on in a later
+release; off, no route clock, lock, capability copy or telemetry flag is touched.
+
 ## One version
 
 - A runtime switch is a support-directory marker, never an environment variable alone, and it is
@@ -476,41 +524,63 @@ applies to bodies from then on, never retroactively.
 
 ## Codex cloud task collection
 
-`cloud_sessions` runs independently of local transcript collection and upload.
-Explicit consent binds one installation/user/organization and the
-`cloud_session_changes.v1` contract. Each due slice reads the exact grant's
-authority once through the source-scoped relay. An older backend leaves the
-collector idle; uploads never fall back to the retired protocol. Backend
-authority is checked again when accepting changes, so a remote pause during a
-slice cannot admit later uploads. Local pause/revoke closes the I/O fence and
-waits for admitted work to finish.
+`cloud_sessions` runs independently of local transcript collection and upload,
+under the same consent as local Codex sessions. There is no per-Mac grant.
+Each due slice reads the Codex activity hint once through the source-scoped
+relay, under an I/O lease. Listing runs only when the hint turns it on and
+names the `cloud_session_changes.v3` contract; anything else (listing off, an
+older server, another contract) is off and the hint is read again in 30
+minutes, or six hours when the route is missing.
+The same hint's `SnapshotUploadPolicy` decides whether titles and environment
+names are sent, and every body is stamped with it. Any 409 (listing off, a
+policy mismatch) rechecks like listing off, so a policy mismatch waits up to
+30 minutes; a 410 (contract retired) rechecks like a missing route, every six
+hours. Refusals settle nothing.
 
-The latest provider page controls head polling: five minutes for queued,
-running or unknown tasks, 30 minutes during recent local Codex filesystem
-activity, six hours otherwise. A daily crawl streams pages and retains only
-its next cursor in memory, continuing five minutes later when its slice
-budget ends. It continues across midnight without a total page/task ceiling.
-Only positive task facts are uploaded; missing tasks never imply deletion.
+The head interval lives in the collector, outside the schedule: five minutes,
+doubling after each successful head listing from which the server accepted
+nothing new, up to 24 hours. Only an `accepted` outcome resets it; a `noop`
+(another Mac already sent it, or an expired ACK) does not. A daily crawl streams
+pages and retains only its next cursor in memory, continuing five minutes later
+when its slice budget ends. It continues across midnight without a total
+page/task ceiling. Only positive task facts are uploaded; missing tasks never
+imply deletion. The supervisor wakes at least every six hours.
 
+Each task is sent as `source_session_id` = its raw Codex task `id` (the
+`task_id` alias is not read); the server keys it by (user, source, id), so
+every Mac of that user sends one head per task. A row whose id breaks the
+shared rule (1..=255 code points, no control character, no boundary
+whitespace) is skipped, never repaired, and counted; one counts-only line per
+changed count is logged, never an id. A page whose rows are all skipped this
+way still follows its cursor. An ACK settles only ids echoed byte for byte.
 The existing graph-independent upload-history SQLite connection stores only
-each task's semantic digest and acknowledged head etag, scoped to destination
-and consent epoch. Fixed expiry permits safe re-offering; the server returns
-no-op for an exact repeat even after ACK loss or restart. The cache contains no
-task payloads or raw IDs and never enters local graph load/save or receipt
-settlement. The file stays at `user_version` 1: its cloud tables are created
-if missing at open, and older builds open the file and ignore them. Cloud
-failures and retry deadlines do not change local delivery.
+each task's semantic digest (over its facts and the applied policy) and head
+etag, keyed by a local digest of the task id (so every valid id fits the key
+column and no raw id is written) and scoped to destination, organization, user
+and contract.
+Accepted and noop ACKs store the head; a rejected task or a conflict without a
+head stores none, earns no credit and is not resent until it changes. Fixed
+expiry permits safe re-offering; the server returns no-op for an exact repeat
+even after ACK loss or restart. Requests are packed under 200 tasks and the
+server's 512 KiB body ceiling. The cache contains no task payloads, titles or
+raw IDs and never enters local graph load/save or receipt settlement. The file
+stays at `user_version` 1: its cloud tables are created if missing at open, and
+older builds open the file and ignore them. Cloud failures and retry deadlines
+do not change local delivery. Every hint, provider, send and cache admission
+validates current local identity; identity changes close admission and drain
+admitted I/O before replacing account or device state. Startup removes the
+retired per-Mac grant files under `cloud_sessions/` and nothing else.
 
 ### Collector approval continuity
 
-Daily provider reporting and cloud-session approvals survive daemon updates and
-sign-ins to the same Ottto account on the same physical Mac. An enabled bound
-approval can rebind to the current relay device through its collector-specific
-`grants/{id}/rebind` endpoint, authenticated with that target device's relay token.
-The request sends the stored grant version, new scope fingerprint, live hardware
-hash and original disclosure; the server resolves the previous device. Successful
-rebind preserves the grant epoch, consent-time build, account fingerprint and
-exclusions. The local grant is replaced atomically. It never replays transcripts.
+Daily provider reporting approvals survive daemon updates and sign-ins to the
+same Ottto account on the same physical Mac. An enabled bound approval can rebind
+to the current relay device through its `grants/{id}/rebind` endpoint,
+authenticated with that target device's relay token. The request sends the
+stored grant version, new scope fingerprint, live hardware hash and original
+disclosure; the server resolves the previous device. Successful rebind preserves
+the grant epoch, consent-time build, account fingerprint and exclusions. The
+local grant is replaced atomically. It never replays transcripts.
 
 Live hardware must match the saved identity before collection and rebind. Missing
 hardware proof stops collection. A copied saved hardware identity requires an explicit
@@ -519,22 +589,6 @@ alone cannot override the hardware check. A revoked or disabled approval is neve
 Terminal refusals stop retries for that binding until the binding changes or the
 service restarts. HTTP 404 retains the stopped-binding behavior for servers that
 have not deployed rebind yet. Transport, 429 and server errors use normal polling.
-
-Cloud changes report the running build for diagnostics; approval binds the
-collection contract independently of the binary version. Each due slice reads
-`cloud-sessions/grants/{id}/authority?grant_version=N` once. Rebind accepts the
-same-epoch management DTO using `can_collect`, preserving the bound collection
-contract and provider-creation cutoff. It drops transient traversal and transport
-state, retaining the original consent's cache namespace through optional opaque
-origin fingerprints in the binding. The grant file update preserves that namespace
-atomically with the rebound identity, so unchanged tasks stay suppressed after a
-restart. Destination, owner, grant epoch, account and contract still isolate cache
-entries. A lost rebind reply does not require another rebind after revoke: trusted
-local control can reconcile the exact authenticated DELETE response against the
-current same-owner HMAC scope, leaving consent revoked. Every authority, provider,
-send and cache admission validates current local identity; identity changes close admission
-and drain admitted I/O before replacing account or device state. Older daemons
-receive disabled legacy authority and cannot upload through retired routes.
 
 ## Codex daily provider reference
 
@@ -565,6 +619,17 @@ producer fixtures in `fixtures/provider-daily-reference/`; the snapshots parity 
 cross-language identity vectors.
 
 ## Local health diagnostics
+
+Verification authorizes before source reads or result writes; setup authorizes
+before acquiring the process-wide scan lock. Telemetry controls require the
+validated user and organization to match the connected local account, under the
+identity lifecycle lock, and refuse work while an identity change is reserved.
+Codex daily-reference controls build their complete returned status from local
+stores before releasing that lock. Browser control requires an allowed Origin
+and loopback Host with the listener's port. Probes return their existing identity
+and detailed health replies with that same Origin/Host boundary, without a token.
+Other probe callers receive only liveness/version. Duplicate Host, Origin and Authorization
+headers are refused.
 
 Local health events retain only the latest observation per Upload, SetupRead and
 SnapshotSync family, per Verify source, and per ScanIndex source/reason/polarity.

@@ -365,6 +365,19 @@ fn reread_group_never_starves_a_waiting_census_singleton() {
     }
 }
 
+/// [regress] A joined group admitted through its first member, the only one
+/// this one-file page selected, is first-read progress once its last
+/// member's read completes the group.
+#[test]
+fn group_read_through_a_selected_non_final_member_is_first_read_progress() {
+    let (root, _) = fixture();
+    let cache = Arc::new(SharedCache::default());
+    let (_, scan) = sampled(&root, ScanIndex::default(), 1, &cache);
+    assert!(!scan.snapshots.is_empty(), "{:?}", counters(&cache));
+    assert!(scan.first_read_progress, "{:?}", counters(&cache));
+    fs::remove_dir_all(root).unwrap();
+}
+
 /// `count` native/UI pairs continuing the counter from `start`.
 fn chain_rows(owner: &str, prefix: &str, created: &str, start: u64, count: u64) -> Vec<Value> {
     let mut rows = vec![meta(owner, created, json!({}))];
