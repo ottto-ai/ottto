@@ -5526,6 +5526,7 @@ fn sync_once_with_retry(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     // Before credentials: a re-enabled source resumes even with no live device.
     resume_reconnected_sources(support_dir);
+    crate::claude_local_otel::close_append_handles();
     // Declared after the guard, so it settles before the lock is released.
     let mut continuation_cycle = continuation::CycleSettlement::default();
     let (device, device_secret) = load_snapshot_device_credentials()?;
