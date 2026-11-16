@@ -5654,6 +5654,8 @@ fn retry_ordinary_owned(item: &SnapshotItem) -> Option<SnapshotItem> {
         claude_org_markers: None,
         claude_account_withheld_reason: None,
         claude_account_display: None,
+        session_billing_route: item.session_billing_route.clone(),
+        claude_route_evidence: None,
         session_account_evidence: item.session_account_evidence.clone(),
         source_session_id: item.source_session_id.clone(),
         snapshot_fingerprint: item.snapshot_fingerprint.clone(),
@@ -8014,6 +8016,15 @@ fn finish_sync_source(
         &claude_authority_disposition.mixed_uploads,
     );
     claude_authority_disposition.defer_sessions(deferred_accounts);
+    // Billing route annotation: after ownership is bound, before upload policy.
+    // Process memory only; off, nothing runs.
+    crate::snapshots::billing_route::annotate_session_billing_routes(
+        &upload_destination_namespace,
+        source,
+        machine_id,
+        &mut scan_result.snapshots,
+        activity_hint.session_billing_route_contract.as_deref(),
+    );
 
     // The Companion uses machine-local labels before upload policy clears them.
     let reconciliation_status = crate::agent_status_refresh::status_for_reconciliation(
@@ -9771,6 +9782,9 @@ struct ClaudeEvidencePage<'p> {
     stats: ClaudeLocalEvidenceStats,
     /// Roots already counted: a scope root two chunks read counts once.
     counted_roots: BTreeSet<String>,
+    /// Sessions withheld for an absent content twin, decided once over the
+    /// whole page; every chunk's finish uses it.
+    content_held: BTreeSet<String>,
     side_call_discovery: crate::snapshots::claude_request_money::e2::SideCallDiscovery,
 }
 
@@ -9814,6 +9828,10 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
             ..Default::default()
         },
         counted_roots: BTreeSet::new(),
+        content_held: crate::snapshots::claude_request_money::e2::page_content_holds(
+            &scan_result.snapshots,
+            index,
+        ),
         side_call_discovery: crate::snapshots::claude_request_money::e2::SideCallDiscovery::new(
             scan_result
                 .completed_parses()
@@ -9986,6 +10004,10 @@ fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
 fn release_emitted(item: &mut SnapshotItem) {
     #[cfg(test)]
     crate::snapshots::claude_request_money::e2::pipeline_test_observer::before_release(item);
+    // Route evidence only; captured before the native request inputs go.
+    if crate::snapshots::billing_route::PRODUCER_ENABLED {
+        crate::snapshots::billing_route::capture_claude_route_evidence(item);
+    }
     crate::snapshots::claude_request_money::e2::release_emitted_fold(item);
 }
 
@@ -10362,7 +10384,7 @@ fn apply_claude_local_evidence_chunk(
     // the account hash then tag the rows that upload.
     // Gate off this only counts, so the page is unchanged.
     // Withheld entities stay on the page and owed: delayed, never settled.
-    let mut withheld = crate::snapshots::claude_request_money::e2::finish_page(
+    let mut withheld = crate::snapshots::claude_request_money::e2::finish_page_planned(
         &mut scan_result.snapshots,
         index,
         if telemetry_read_failed {
@@ -10372,6 +10394,7 @@ fn apply_claude_local_evidence_chunk(
         },
         &mut disposition.request_owned_hold_reasons,
         &scan_result.claude_queued_family_deferred_paths,
+        &page.content_held,
     );
     if !trace_discard_unfolded.is_empty() {
         *disposition

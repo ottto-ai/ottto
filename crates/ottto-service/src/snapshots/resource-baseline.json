@@ -4,7 +4,7 @@
       "receipt_window_days": 183,
       "replay_window": "native scan_request_window_days(receipt_window_days, true), until census completion"
     },
-    "limit": "Each measured count <= 1.20 * B; quiet sidecar reuse >=95% with positive denominator; observed zero remains zero, missing defined-platform observations fail.",
+    "limit": "Each measured count <= 1.20 * B, except sidecar reuse (reused.*), judged by rate: each kind's reused / (reused + reloaded) >= baseline rate / 1.20, both denominators positive; quiet sidecar reuse >=95% with positive denominator; observed zero of a capped counter remains zero, missing defined-platform observations fail.",
     "linux": {
       "build_profile": {
         "cargo_build_jobs": 2,

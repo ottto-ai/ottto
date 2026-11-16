@@ -210,8 +210,6 @@ pub(in crate::snapshots) fn ensure_bounded_traversal(
     index.bounded_sweep_had_unsettled_upload = false;
     index.bounded_sweep_unsettled_causes = 0;
 
-    transition.emit(source);
-
     let mut census = ScanCensus::default();
     let resolved_roots = roots
         .iter()
@@ -230,6 +228,12 @@ pub(in crate::snapshots) fn ensure_bounded_traversal(
         .iter()
         .filter_map(|(_, resolved, _)| resolved.as_ref())
         .collect::<Vec<_>>();
+    transition.emit(
+        source,
+        roots.len(),
+        currently_resolved.len(),
+        backfill_window_days,
+    );
     let missing_roots = resolved_roots
         .iter()
         .filter(|(_, resolved, _)| resolved.is_none())

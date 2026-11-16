@@ -458,6 +458,12 @@ impl SnapshotAccumulator {
             claude_org_markers: self.claude_org_markers,
             claude_account_withheld_reason: None,
             claude_account_display: None,
+            session_billing_route: None,
+            // Producer on: the all-line start witness, before the lines go.
+            claude_route_evidence: crate::snapshots::billing_route::start_witness(
+                self.source,
+                self.claude_line_clocks,
+            ),
             session_account_evidence,
             source_session_id: source_session_id.clone(),
             snapshot_fingerprint: String::new(),

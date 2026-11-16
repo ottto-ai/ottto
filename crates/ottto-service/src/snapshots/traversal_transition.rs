@@ -119,8 +119,35 @@ impl Starting {
         }
     }
 
-    pub(super) fn emit(&self, source: SnapshotSource) {
-        crate::local_resource_diagnostics::traversal_transition(source.api_slug(), self);
+    pub(super) fn emit(
+        &self,
+        source: SnapshotSource,
+        configured_root_count: usize,
+        resolved_root_count: usize,
+        window_days: u64,
+    ) {
+        #[derive(Serialize)]
+        struct Scope<'a> {
+            #[serde(flatten)]
+            transition: &'a Starting,
+            configured_root_count: usize,
+            resolved_root_count: usize,
+            window_days: u64,
+            version_inputs_hash: String,
+        }
+        // Fixed empty roots/window isolate versions using the fingerprint's existing encoding.
+        let versions =
+            super::discovery::traversal::scan_traversal_context_fingerprint(source, &[], 0);
+        crate::local_resource_diagnostics::traversal_transition(
+            source.api_slug(),
+            &Scope {
+                transition: self,
+                configured_root_count,
+                resolved_root_count,
+                window_days,
+                version_inputs_hash: versions[..8].to_owned(),
+            },
+        );
     }
 
     pub(super) fn start_recensus(&mut self, source: SnapshotSource, context: &str, window: &str) {
@@ -280,6 +307,12 @@ mod tests {
             index.traversal.as_ref().unwrap()
         ));
         assert_eq!(first[0]["counts"]["reason"], "no_retained_traversal");
+        assert_eq!(first[0]["counts"]["configured_root_count"], 1);
+        assert_eq!(first[0]["counts"]["resolved_root_count"], 1);
+        assert_eq!(first[0]["counts"]["window_days"], BACKFILL_WINDOW_DAYS);
+        let versions = first[0]["counts"]["version_inputs_hash"].as_str().unwrap();
+        assert_eq!(versions.len(), 8);
+        assert!(versions.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert_eq!(first[0]["counts"]["index_generation"], 37);
         assert_eq!(
             first[0]["counts"]["disappearance_process_totals_v1"]["version"],
@@ -326,6 +359,11 @@ mod tests {
         ));
         assert_eq!(changed[0]["counts"]["reason"], "context_changed");
         assert_eq!(
+            changed[0]["counts"]["window_days"],
+            BACKFILL_WINDOW_DAYS + 1
+        );
+        assert_eq!(changed[0]["counts"]["version_inputs_hash"], versions);
+        assert_eq!(
             changed[0]["counts"]["previous"]["window_unix_seconds"],
             rfc3339_unix_seconds(T0).unwrap()
         );
@@ -346,6 +384,9 @@ mod tests {
             index.traversal.as_ref().unwrap()
         ));
         assert_eq!(retried[0]["counts"]["reason"], "terminal_unhealthy_retry");
+        assert_eq!(retried[0]["counts"]["configured_root_count"], 1);
+        assert_eq!(retried[0]["counts"]["resolved_root_count"], 1);
+        assert_eq!(retried[0]["counts"]["version_inputs_hash"], versions);
         assert_eq!(retried[0]["counts"]["retry_due"], true);
         assert_eq!(
             retried[0]["counts"]["previous"]["counts"]["malformed_json_line_count"],
@@ -965,7 +1006,7 @@ mod tests {
         let ((starting, rows), events) = disappearance_diagnostics::observe(|| {
             capture(|| {
                 let starting = Starting::capture(SnapshotSource::Pi, &restored, T1, true, 1);
-                starting.emit(SnapshotSource::Pi);
+                starting.emit(SnapshotSource::Pi, 0, 0, BACKFILL_WINDOW_DAYS);
                 starting
             })
         });
@@ -1109,7 +1150,7 @@ mod tests {
             previous.watcher_overflow = false;
             previous.retryable_problems = false;
             previous.unsettled_residue = false;
-            let (_, rows) = capture(|| starting.emit(source));
+            let (_, rows) = capture(|| starting.emit(source, usize::MAX, usize::MAX, u64::MAX));
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0]["source"], source.api_slug());
             assert_complete_max_row(rows[0].clone());
