@@ -1,5 +1,8 @@
 use super::*;
 
+#[cfg(unix)]
+mod claude_selection_oracle_tests;
+
 /// The account resolution `collect_claude_status` performs, for tests that
 /// exercise the OAuth path directly.
 fn claude_oauth_account_identifier_hash() -> String {

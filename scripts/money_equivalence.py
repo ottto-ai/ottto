@@ -41,6 +41,72 @@ HEAD_ONLY_FIXTURES = (
     "once_credit_native",
     "claude_bad_record_sibling", "claude_paused_suffix", "codex_bad_record_sibling",
     "resumed_prefix_sidecar_receipt", "root_twin_scoped_family",
+    "claude_status_s01_default_only",
+    "claude_status_s02_lexical_tie",
+    "claude_status_s03_health_first",
+    "claude_status_s04_anchor_receipt",
+    "claude_status_s05_exact_pairs",
+    "claude_status_s06_slot_owned_without_anchor",
+    "claude_status_s07_failure_bounds",
+    "claude_status_s08_plan_ownership",
+    "claude_status_s09_deferred_absent",
+    "claude_status_s09_deferred_stale",
+    "claude_status_s09_deferred_fresh",
+    "claude_status_s10_managed",
+    "claude_status_s10_external",
+    "claude_status_s10_unproven",
+    "claude_status_s10_not_fresh",
+    "claude_status_s10_needs_login",
+    "claude_status_s10_noncanonical",
+    "claude_status_s10_changed",
+    "claude_status_s10_missing",
+    "claude_status_s10_suppressed",
+    "claude_status_s10_auth_held",
+    "claude_status_s11_attempt_runs",
+    "claude_status_s12_independent_holds",
+    "claude_status_s12_auth_other_caller",
+    "claude_status_s12_transient",
+    "claude_status_s12_rate_limited",
+    "claude_status_s13_one_registered",
+    "claude_status_s13_two_registered",
+    "claude_status_s13_same_pair",
+    "claude_status_s13_incomplete",
+    "claude_status_s14_stale_quarantine",
+    "claude_status_s17_source_inputs",
+    "claude_status_s18_newer",
+    "claude_status_s18_older",
+    "claude_status_s18_equal",
+    "claude_status_s18_future",
+    "claude_status_s18_other_account",
+    "claude_status_s18_other_org",
+    "claude_status_s18_weak_account",
+    "claude_status_s18_weak_org",
+    "claude_status_s18_scope",
+    "claude_status_s18_model",
+    "claude_status_s18_group",
+    "claude_status_s18_limit_id",
+    "claude_status_s18_duration",
+    "claude_status_s18_invalid_reset",
+    "claude_status_s18_ended_reset",
+    "claude_status_s18_rollover",
+    "claude_status_s18_invalid_rollover",
+    "claude_status_s18_tolerance",
+    "claude_status_s18_money_limit",
+    "claude_status_s18_money_used",
+    "claude_status_s18_money_remaining",
+    "claude_status_s18_quota",
+    "claude_status_s18_remaining",
+    "claude_status_s18_start_conflict",
+    "claude_status_s19_same_config",
+    "claude_status_s19_different_config",
+    "claude_status_s19_different_session_store",
+    "claude_status_s19_empty_sample",
+    "claude_status_s19_empty_current",
+    "claude_status_s19_unknown",
+    "claude_status_s19_ambiguous",
+    "claude_status_s19_legacy_method",
+    "claude_status_s21_carriers",
+    "claude_status_s24_boundaries",
 )
 
 
@@ -294,12 +360,21 @@ def _load_json(data, path, exact_numbers=False):
 
 
 def decode_receipt(data):
-    """Unwrap receipt Vec<Vec<u8>> and Claude's extra encoded-batch layer.
+    """Decode tagged full JSON or unwrap the existing encoded batch receipts.
 
     Return the decoded tree and the exact paths of its batch envelopes. Never
     recursively decode payload arrays: they are content, even if byte-shaped.
     """
     receipt = _load_json(data, "")
+    if isinstance(receipt, dict):
+        # A separate, versioned representation: no batch envelope paths, no
+        # recursive byte decoding and no declared-addition exemptions. Reload
+        # with exact numeric text, just as for an encoded legacy body.
+        if (set(receipt) != {"kind", "value"}
+                or receipt["kind"] != "plain_json_v1"
+                or not isinstance(receipt["value"], (dict, list))):
+            raise ValueError("invalid plain JSON receipt at /")
+        return _load_json(data, "", exact_numbers=True), set()
     if not isinstance(receipt, list) or not receipt:
         raise ValueError("expected nonempty receipt array at /")
 
