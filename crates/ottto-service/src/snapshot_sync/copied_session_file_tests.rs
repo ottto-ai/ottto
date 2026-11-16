@@ -731,14 +731,39 @@ fn deferred_main_with_read_content_twin_holds_until_complete() {
                 (expected.request_count, expected.removed_request_count),
                 (7, Some(2))
             );
+            assert_eq!(
+                expected.source_file_fingerprint.as_ref(),
+                Some(&recovered.index.files[&main_key].source_file_fingerprint),
+                "M carries the complete union; T has no separate wire item"
+            );
             money_oracle::assert_equivalent(&reference, &sent_money(&recovered));
             prior = accept_monotone_page(&c, &prior, recovered, &mut accepted);
             assert_eq!(accepted[ROOT], 7);
-            // Reload drops the runtime context; observe the durable receipts
+            // Reload drops the runtime context; observe the durable proofs
             // under the same destination that received this page's exact ACKs.
             prior.activate_upload_context("e2-synthetic-destination".into());
             assert!(upload_context_receipt_earned_for_test(&prior, &main));
-            assert!(upload_context_receipt_earned_for_test(&prior, &twin));
+            // T folded into M: its own revision gets a local suppression
+            // proof, never an ACK receipt for M's body. It must owe no read.
+            let entry = &prior.files[&twin_key];
+            let proof = entry.upload_context_receipt.as_ref().unwrap();
+            assert!(prior.confirmed_empty_files.contains(&twin_key));
+            assert!(!prior.file_snapshot_fingerprints.contains_key(&twin_key));
+            assert!(entry.last_snapshot_fingerprint.is_none());
+            assert!(entry.last_upload_body_witness.is_none());
+            assert!(proof.body_witness.is_empty());
+            assert!(!entry.source_file_fingerprint.is_empty());
+            assert_eq!(proof.source_witness, entry.source_file_fingerprint);
+            assert_eq!(
+                proof.context_fingerprint,
+                prior.active_upload_context_fingerprint.as_deref().unwrap()
+            );
+            assert_eq!(
+                proof.replay_generation,
+                crate::snapshots::upload_context_receipt::RECEIPT_REPLAY_EPOCH
+            );
+            assert!(!upload_context_receipt_earned_for_test(&prior, &twin));
+            assert!(!upload_context_owed_for_test(&prior, &twin));
         });
     }
 }
