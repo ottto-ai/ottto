@@ -153,7 +153,8 @@ ottto costs --json --days 7   # the last 7 days of cost across your account, as 
 - Your transcripts and full conversations, including your agents' responses
 - Code, file contents, and tool and command output
 - Your agents' sign-in tokens, API keys, cookies and passwords
-- Instruction, memory and skill text, and absolute file paths
+- Instruction, memory and skill text, and absolute file paths (except text an MCP server itself
+  puts in a tool description or input schema)
 
 To show your Claude plan limits, Ottto uses your Claude Code sign-in only to ask Anthropic for your
 usage, and never sends it to Ottto. Turn this off in Ottto.app settings: **Read subscription usage**.
