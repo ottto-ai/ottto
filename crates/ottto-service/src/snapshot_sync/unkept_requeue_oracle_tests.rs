@@ -1215,5 +1215,152 @@ fn ack_failure_boundaries_preserve_file_debt_and_accepted_placement() {
     });
 }
 
+/// [money] A Codex body-witness refusal in a file inside the 183-day window
+/// keeps the scan at 183 days across a reload, stays held at its accepted
+/// body, and is still selected and offered by the 183-day scan when due. It
+/// settles only on its own exact ACK, equals cold Full, and the next pass
+/// reads nothing.
+#[test]
+#[serial]
+fn codex_inside_window_due_retry_is_offered_by_the_narrow_scan() {
+    let source = SnapshotSource::Codex;
+    with_e2(|| {
+        let (c, paths) = native_corpus_of(source, &SESSIONS[..1]);
+        let (session, prior) = StateV2ColdSession::publish(
+            Source::Codex,
+            &ScanIndex::default(),
+            &c.base.join("state"),
+        );
+        let initial = native_page(source, &c, prior, 100, true);
+        let mut prior_route = accept(source, &initial);
+        accepted(&mut prior_route, &initial.scan.snapshots);
+        let (prior, mut sender) = commit_native_with_progress(source, &session, initial);
+        append(&paths[0], &response_line(source, SESSIONS[0], 2));
+        let current = native_page(source, &c, prior, 100, true);
+        assert_eq!(current.scan.snapshots.len(), 1, "the updated revision");
+        let entity = current.scan.snapshots[0].source_session_id.clone();
+        let mut faulted: Option<String> = None;
+        let (status, _) = send(source, &current, &mut sender, |items| {
+            let mut response = ack(items)?;
+            if faulted.is_none() {
+                let refused = &mut response.accepted_entities[0];
+                faulted = Some(refused.snapshot_fingerprint.clone());
+                refused.body_witness_digest = Some("0".repeat(64));
+            }
+            Ok(response)
+        });
+        assert!(status.is_ok());
+        let faulted = faulted.expect("one ref refused");
+        assert_eq!(
+            sender.quarantined_fingerprints[&faulted].disposition,
+            SnapshotQuarantineDisposition::RetryPending
+        );
+        assert!(!sender.accepted_fingerprints.contains(&faulted));
+        // Held: the destination keeps the prior accepted body; nothing emitted.
+        let cold = accept(
+            source,
+            &native_page(source, &c, ScanIndex::default(), 100, false),
+        );
+        assert_eq!(cold.snapshots.len(), 1, "nonempty cold control");
+        let mut held = RouteResult::emitted(Mode::Restart, source, vec![], &[]);
+        held.accepted = prior_route.accepted.clone();
+        money_oracle::assert_held(&entity, &prior_route, &held, &cold);
+        let owed = checkpoint(
+            &current,
+            &mut sender,
+            session.path(),
+            Some(crate::snapshots::UnsettledUploadCause::UploadError),
+        );
+        let mut loaded = ScanIndex::load(session.path()).unwrap();
+        for index in [&owed, &loaded] {
+            assert_eq!(
+                index.quarantined_snapshot_fingerprints[&faulted].disposition,
+                SnapshotQuarantineDisposition::RetryPending
+            );
+            assert!(index
+                .file_snapshot_fingerprints
+                .values()
+                .any(|entities| entities.contains(&faulted)));
+            // A current-limit retry is pending, but its file is inside the
+            // window: the scan keeps 183 days and its walk context.
+            assert!(index.snapshot_admission_reoffer_pending());
+            assert!(!index.snapshot_admission_reoffer_pending_for_scan(source, 183));
+        }
+        // Due hours later: release the clock and the walk's listing clocks.
+        for record in [
+            loaded
+                .quarantined_snapshot_fingerprints
+                .get_mut(&faulted)
+                .unwrap(),
+            sender.quarantined_fingerprints.get_mut(&faulted).unwrap(),
+        ] {
+            record.retry_after_unix_seconds = 0;
+        }
+        crate::snapshots::e2_pipeline_scan_fixture::age_listing_for_test(&mut loaded);
+        assert!(sender.prepare_quarantine_retries(&loaded.quarantined_snapshot_fingerprints));
+        assert!(!loaded.snapshot_admission_reoffer_pending_for_scan(source, 183));
+        assert!(!sender.accepted_fingerprints.contains(&faulted));
+        crate::snapshots::state_v2::release_collection_page_limit_for_test(&loaded);
+        // The fixture scan uses the 183-day collection window.
+        let (retry, consumed) =
+            fixture::observe_consumed(|| native_page(source, &c, loaded, 100, true));
+        // The census selects the due retry; Codex may serve it from its
+        // cursor without new transcript bytes.
+        assert!(
+            retry
+                .scan
+                .snapshots
+                .iter()
+                .any(|item| item.source_session_id == entity),
+            "the 183-day scan emits the due retry"
+        );
+        let mut offered = Vec::new();
+        let (status, _) = send(source, &retry, &mut sender, |items| {
+            offered.extend(items.iter().map(|item| {
+                (
+                    item.source_session_id.clone(),
+                    item.snapshot_fingerprint.clone(),
+                    snapshot_upload_body_witness(item),
+                )
+            }));
+            ack(items)
+        });
+        assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
+        let (_, fp, witness) = offered
+            .iter()
+            .find(|(id, _, _)| *id == entity)
+            .cloned()
+            .expect("the due retry's POST carries the refused entity");
+        assert_eq!(
+            sender.accepted_body_witnesses.get(&fp),
+            Some(&witness),
+            "settles on its own exact ACK"
+        );
+        assert!(!sender.quarantined_fingerprints.contains_key(&fp));
+        let mut route = accept(source, &retry);
+        route.mode = Mode::Restart;
+        route.io.consumed = consumed;
+        money_oracle::assert_equivalent(&cold, &route);
+        money_oracle::assert_no_smaller_reemit(&entity, &prior_route, &route, &cold, false);
+        checkpoint(&retry, &mut sender, session.path(), None);
+        let settled = ScanIndex::load(session.path()).unwrap();
+        for key in [&faulted, &fp] {
+            assert!(
+                !matches!(
+                    settled.quarantined_snapshot_fingerprints.get(key),
+                    Some(record) if record.disposition
+                        == SnapshotQuarantineDisposition::RetryPending
+                ),
+                "no RetryPending left for the refused entity"
+            );
+        }
+        assert!(!settled.snapshot_admission_reoffer_pending());
+        let (quiet, quiet_bytes) =
+            fixture::observe_consumed(|| native_page(source, &c, settled, 100, true));
+        assert!(quiet.scan.snapshots.is_empty());
+        assert_eq!(quiet_bytes, 0, "settled pass consumes no transcript");
+    });
+}
+
 #[path = "progress_rows_oracle_tests.rs"]
 mod progress_rows_oracle_tests;

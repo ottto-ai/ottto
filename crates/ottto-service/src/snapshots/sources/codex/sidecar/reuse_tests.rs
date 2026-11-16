@@ -124,7 +124,7 @@ fn assert_metadata(a: &CodexTitleMetadata, b: &CodexTitleMetadata, paths: &[Path
         b.root_sidecars.keys().collect::<Vec<_>>()
     );
     // Retained raw rows; reused homes have already dropped thread/history.
-    let raw = |home: &codex_root_copies::RootSidecar| {
+    let raw = |home: &sources::codex::root_copies::RootSidecar| {
         let r = &home.raw;
         let evidence = r.evidence.iter().map(outcome).collect::<Vec<_>>();
         (
@@ -431,7 +431,7 @@ fn compact_title_keeps_legacy_fingerprints_and_raw_equality() {
         m.state_threads.insert(ID.into(), row.clone());
         m.root_sidecars.insert(
             PathBuf::from("/synthetic"),
-            Arc::new(codex_root_copies::RootSidecar {
+            Arc::new(sources::codex::root_copies::RootSidecar {
                 threads: BTreeMap::from([(ID.into(), row.clone())]),
                 raw: facts::RawRows {
                     threads: vec![(ID.into(), row.clone())],
@@ -590,7 +590,7 @@ fn kept_home_drops_raw_rows() {
         &BTreeSet::new(),
     );
     assert_metadata(&merged, &second, &paths);
-    let size = |home: &codex_root_copies::RootSidecar| {
+    let size = |home: &sources::codex::root_copies::RootSidecar| {
         crate::heap_layout_bound::completed_bound(home, usize::MAX).unwrap()
     };
     let raw = crate::heap_layout_bound::completed_bound(&old.raw.threads, usize::MAX).unwrap()

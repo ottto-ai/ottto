@@ -199,7 +199,7 @@ pub(crate) struct OwnedSourceScan {
     pub(in crate::snapshots) semantic_noop_count: usize,
     /// This page's resident charge, history-upgrade budget and gate diagnostics.
     pub(in crate::snapshots) history_upgrade: HistoryPage,
-    pub(in crate::snapshots) context_read_budget: upload_context_read::Budget,
+    pub(in crate::snapshots) context_read_budget: upload::context_read::Budget,
     pub(in crate::snapshots) residue_index_keys: BTreeSet<String>,
     pub(in crate::snapshots) settled_residue_index_keys: BTreeSet<String>,
     pub(in crate::snapshots) pending_finalization: Vec<PendingIndexFinalization>,
@@ -239,6 +239,9 @@ pub(in crate::snapshots) struct OwnedActiveFile {
     pub(in crate::snapshots) candidate: CandidateFile,
     pub(in crate::snapshots) decision: CandidateDecision,
     pub(in crate::snapshots) parse_reason: Option<CandidateParseReason>,
+    /// Diagnostics only, frozen at selection; `None` for a Codex group replay.
+    pub(in crate::snapshots) prior_stamp:
+        Option<crate::local_resource_diagnostics::claude_reread::PriorStamp>,
     pub(in crate::snapshots) previous_snapshot_fingerprint: Option<String>,
     pub(in crate::snapshots) previous_upload_body_witness: Option<String>,
     pub(in crate::snapshots) projection_adoption_required: bool,
@@ -422,7 +425,7 @@ impl OwnedSourceScan {
             scanned_session_count: 0,
             semantic_noop_count: 0,
             history_upgrade: HistoryPage::with_twin_groups(Default::default(), BTreeSet::new()),
-            context_read_budget: upload_context_read::Budget::new(SnapshotSource::Codex),
+            context_read_budget: upload::context_read::Budget::new(SnapshotSource::Codex),
             residue_index_keys: Default::default(),
             settled_residue_index_keys: Default::default(),
             pending_finalization: Vec::new(),
@@ -1306,7 +1309,10 @@ impl OwnedSourceScan {
                     .pending
                     .retain(|path| !carry_deferred.contains(&local_index_key(path)));
                 inventory.held_owners.extend(carry_held_owners);
-                inventory.complete &= !codex_census_walk_pending(traversal);
+                inventory.mark_incomplete(
+                    codex_file_join::Incomplete::CensusWalkPending,
+                    usize::from(codex_census_walk_pending(traversal)),
+                );
                 inventory
             });
         resource_probe.page_events.merge(diagnostics.finish());
@@ -1341,7 +1347,7 @@ impl OwnedSourceScan {
                 claude_queued_family_deferred_paths,
             )
             .with_forced_pending(forced_pending_entries),
-            context_read_budget: upload_context_read::Budget::new(source),
+            context_read_budget: upload::context_read::Budget::new(source),
             residue_index_keys,
             settled_residue_index_keys,
             pending_finalization,
@@ -1381,7 +1387,7 @@ impl OwnedSourceScan {
     }
 }
 
-crate::heap_layout_bound::fields!(OwnedActiveFile; first_read, sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, parse_reason);
+crate::heap_layout_bound::fields!(OwnedActiveFile; first_read, sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, parse_reason, prior_stamp);
 
 /// `requeue` for every member of a group in one pass over the pending
 /// paths (round 4, L2): O(P + n), not O(P) per member, and no pending path

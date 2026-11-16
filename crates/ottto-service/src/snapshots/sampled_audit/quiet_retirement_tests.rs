@@ -1663,7 +1663,7 @@ fn proven_absence_retires_missing_intermediate_but_keeps_unsafe_ancestor_debt() 
                 assert!(retired.claude_account_deferred_holds.contains_key(&key));
                 assert!(retired.files[&key].has_unverified_source());
                 sampled_scan::set_test_now(Some(sampled_scan::now_seconds() + 600));
-                crate::snapshots::line_delivery_tests::next_walk(
+                crate::snapshots::scan::lines::delivery::tests::next_walk(
                     &mut retired,
                     std::slice::from_ref(&fixture.root),
                     NOW,
@@ -1807,8 +1807,8 @@ fn protected_codex_absence_retires_only_the_audit_obligation() {
 
 #[test]
 fn audit_absence_preserves_legacy_counting_evidence_or_retains_its_entry() {
-    use codex_counting_version::{AckEvidence, CountingTombstone};
-    let _cutover = codex_counting_version::TestCutover::set(1_790_000_000_000);
+    use sources::codex::counting::version::{AckEvidence, CountingTombstone};
+    let _cutover = sources::codex::counting::version::TestCutover::set(1_790_000_000_000);
     for full_tombstones in [false, true] {
         let fixture = ScanFixture::new(SnapshotSource::Codex);
         let key = local_index_key(&fixture.file.0);
@@ -1835,7 +1835,8 @@ fn audit_absence_preserves_legacy_counting_evidence_or_retains_its_entry() {
         traversal.reconciliation_upper_bound = Some(key.clone());
         let generation = traversal.census_window_end.clone();
         if full_tombstones {
-            index.codex_counting_tombstones = (0..codex_counting_version::MAX_COUNTING_TOMBSTONES)
+            index.codex_counting_tombstones = (0
+                ..sources::codex::counting::version::MAX_COUNTING_TOMBSTONES)
                 .map(|n| {
                     (
                         format!("{n:064x}"),
@@ -1919,7 +1920,7 @@ fn hold_only_inventory_requires_two_secure_absence_observations() {
             NOW,
             BACKFILL_WINDOW_DAYS,
         );
-        crate::snapshots::line_delivery_tests::walk_all(&mut index, BACKFILL_WINDOW_DAYS);
+        crate::snapshots::scan::lines::delivery::tests::walk_all(&mut index, BACKFILL_WINDOW_DAYS);
         assert!(index.files.is_empty(), "held-new has no committed entry");
         withheld_account::support::clock(&index.withheld_memo);
         sampled_scan::set_test_now(Some(1_000));
@@ -1929,7 +1930,7 @@ fn hold_only_inventory_requires_two_secure_absence_observations() {
             index.claude_account_deferred_holds.contains_key(&key),
             "one observation keeps custody"
         );
-        crate::snapshots::line_delivery_tests::next_walk(
+        crate::snapshots::scan::lines::delivery::tests::next_walk(
             &mut index,
             std::slice::from_ref(&fixture.root),
             NOW,
@@ -1982,7 +1983,7 @@ fn hold_only_absence_inventory_never_exceeds_existing_4096_bound() {
         NOW,
         BACKFILL_WINDOW_DAYS,
     );
-    crate::snapshots::line_delivery_tests::walk_all(&mut index, BACKFILL_WINDOW_DAYS);
+    crate::snapshots::scan::lines::delivery::tests::walk_all(&mut index, BACKFILL_WINDOW_DAYS);
     withheld_account::support::clock(&index.withheld_memo);
     index.probe_absent_claude_account_deferred_holds();
     assert_eq!(
@@ -2007,7 +2008,7 @@ fn hold_only_absence_inventory_never_exceeds_existing_4096_bound() {
     withheld_account::support::clock(&index.withheld_memo);
     index.probe_absent_claude_account_deferred_holds();
     assert_eq!(index.claude_account_deferred_hold_count(), 1);
-    crate::snapshots::line_delivery_tests::next_walk(
+    crate::snapshots::scan::lines::delivery::tests::next_walk(
         &mut index,
         std::slice::from_ref(&fixture.root),
         NOW,
@@ -2032,7 +2033,7 @@ fn hold_only_absence_inventory_never_exceeds_existing_4096_bound() {
     sampled_scan::set_test_now(Some(1_000));
     withheld_account::support::clock(&index.withheld_memo);
     index.probe_absent_claude_account_deferred_holds();
-    crate::snapshots::line_delivery_tests::next_walk(
+    crate::snapshots::scan::lines::delivery::tests::next_walk(
         &mut index,
         std::slice::from_ref(&fixture.root),
         NOW,
@@ -2047,7 +2048,7 @@ fn hold_only_absence_inventory_never_exceeds_existing_4096_bound() {
         "descriptor admission keeps debt and makes progress"
     );
     for step in 2..=80 {
-        crate::snapshots::line_delivery_tests::next_walk(
+        crate::snapshots::scan::lines::delivery::tests::next_walk(
             &mut index,
             std::slice::from_ref(&fixture.root),
             NOW,

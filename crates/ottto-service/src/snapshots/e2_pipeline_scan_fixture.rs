@@ -5,7 +5,7 @@ use crate::transcript_acquisition::Scope;
 #[path = "e2_pipeline_twin_diagnostics.rs"]
 pub(crate) mod twin_diagnostics;
 
-pub(crate) use crate::snapshots::g7_debt::tests::assert_file_receipt_retires_debt;
+pub(crate) use crate::snapshots::upload::freshness_debt::tests::assert_file_receipt_retires_debt;
 
 /// The sampled scope and identity-capture mode this fixture's scans bind.
 fn scan_binding(source: SnapshotSource) -> (Scope, bool) {
@@ -931,6 +931,19 @@ pub(crate) fn upload_context_receipt_earned_for_test(index: &ScanIndex, path: &P
                             == crate::snapshots::upload_context_receipt::RECEIPT_REPLAY_EPOCH
                         && entry.last_upload_body_witness.as_ref() == Some(&receipt.body_witness)
                 })
+        })
+}
+
+/// `path`'s stored proof is bound to the active context and current replay epoch.
+pub(crate) fn upload_context_proof_is_current_for_test(index: &ScanIndex, path: &Path) -> bool {
+    index
+        .files
+        .get(&local_index_key(path))
+        .and_then(|entry| entry.upload_context_receipt.as_ref())
+        .is_some_and(|proof| {
+            index.active_upload_context_fingerprint.as_ref() == Some(&proof.context_fingerprint)
+                && proof.replay_generation
+                    == crate::snapshots::upload_context_receipt::RECEIPT_REPLAY_EPOCH
         })
 }
 

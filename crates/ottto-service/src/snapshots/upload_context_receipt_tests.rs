@@ -1918,7 +1918,7 @@ fn real_scan_context_change_reads_only_the_grown_file() {
 #[test]
 fn real_scan_joined_codex_context_change_reads_no_alias() {
     let (root, _) = codex_file_join::tests::counting_v2_fixture();
-    let _cutover = codex_counting_version::TestCutover::set(0);
+    let _cutover = sources::codex::counting::version::TestCutover::set(0);
     let mut f = Fixture::new(SnapshotSource::Codex);
     fs::remove_file(&f.path).unwrap();
     for name in ["a", "b"] {
@@ -1961,7 +1961,7 @@ fn real_scan_joined_codex_context_change_reads_no_alias() {
 #[test]
 fn real_scan_ordinary_codex_group_precedes_context_group_under_read_cap() {
     let (root, _) = codex_file_join::tests::counting_v2_fixture();
-    let _cutover = codex_counting_version::TestCutover::set(0);
+    let _cutover = sources::codex::counting::version::TestCutover::set(0);
     let mut f = Fixture::new(SnapshotSource::Codex);
     fs::remove_file(&f.path).unwrap();
     for (name, original, other) in [
@@ -2010,7 +2010,7 @@ fn real_scan_ordinary_codex_group_precedes_context_group_under_read_cap() {
     // Select both groups on an ordinary page; the byte cap still fits only
     // the changed unit. Fewer slots would exercise freshness/fill admission.
     let ((scan, _), order) =
-        upload_context_read::with_read_limit(limit, || f.walk_with_file_limit(true, 4, false));
+        upload::context_read::with_read_limit(limit, || f.walk_with_file_limit(true, 4, false));
     assert!(
         order
             .first()
@@ -2043,7 +2043,7 @@ fn real_scan_ordinary_codex_group_precedes_context_group_under_read_cap() {
 fn ordinary_singleton_precedes_context_group(same_size_rewrite: bool) {
     for members in [2, 3] {
         let (root, _) = codex_file_join::tests::counting_v2_fixture();
-        let _cutover = codex_counting_version::TestCutover::set(0);
+        let _cutover = sources::codex::counting::version::TestCutover::set(0);
         let mut f = Fixture::new(SnapshotSource::Codex);
         let singleton = f.root.join("z.jsonl");
         fs::rename(&f.path, &singleton).unwrap();
@@ -2214,7 +2214,7 @@ fn real_scan_same_size_rewrite_precedes_context_group_at_file_limit_two() {
 #[test]
 fn real_scan_settled_alias_cannot_evict_an_ordinary_singleton_beside_ordinary_group() {
     let (root, _) = codex_file_join::tests::counting_v2_fixture();
-    let _cutover = codex_counting_version::TestCutover::set(0);
+    let _cutover = sources::codex::counting::version::TestCutover::set(0);
     let mut f = Fixture::new(SnapshotSource::Codex);
     let singleton = f.root.join("z.jsonl");
     let body = fs::read(&f.path).unwrap();

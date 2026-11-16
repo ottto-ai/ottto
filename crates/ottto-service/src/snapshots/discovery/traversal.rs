@@ -153,7 +153,7 @@ pub(in crate::snapshots) fn ensure_bounded_traversal(
                 .pending_candidates
                 .iter()
                 .any(|candidate| candidate.census_member)
-            && traversal.counts.has_errors();
+            && traversal.has_errors();
         // What clears the latch: a generation that completes drops the
         // traversal, and a changed scan context takes the `else` branch below;
         // both start the next traversal at attempt zero. What bounds it: the
@@ -734,7 +734,7 @@ fn refresh_retained_codex_directories(
                 &path,
                 metadata.len(),
                 modified_unix_seconds,
-                codex_fragment::Stamp::metadata(&metadata),
+                sources::codex::eof_fragment::Stamp::metadata(&metadata),
             );
             let aged = census_unix_seconds.is_some_and(|now| {
                 !is_recent_enough_at(modified_unix_seconds, now, backfill_window_days)
@@ -744,7 +744,7 @@ fn refresh_retained_codex_directories(
                     source,
                     &path,
                     metadata.len(),
-                    codex_fragment::Stamp::metadata(&metadata),
+                    sources::codex::eof_fragment::Stamp::metadata(&metadata),
                 );
             let requires_recovery = recovery.requires(source, &path, metadata.len());
             if !requires_recovery && aged && !owes_stamped {
@@ -881,9 +881,9 @@ pub(in crate::snapshots) fn record_codex_inventory_hold(
     traversal: &mut ScanTraversalCheckpoint,
     inventory: &codex_file_join::HeaderInventory,
     held: &BTreeSet<String>,
-) {
+) -> (usize, bool, usize) {
     if held.is_empty() {
-        return;
+        return (0, false, 0);
     }
     let outside_roster = held
         .iter()
@@ -897,8 +897,9 @@ pub(in crate::snapshots) fn record_codex_inventory_hold(
         .get_or_insert_with(CodexInventoryHold::default);
     // Without a refused record or an unlisted candidate, the walk's open
     // directories were what kept the roster from proving the page.
-    hold.awaiting_directories |=
+    let awaiting =
         census_walk_pending || (inventory.refused.is_empty() && outside_roster.is_empty());
+    hold.awaiting_directories |= awaiting;
     hold.owed.extend(held.iter().cloned());
     // The newest witness is the one a later tick has to see move.
     hold.refused_headers.extend(
@@ -907,7 +908,10 @@ pub(in crate::snapshots) fn record_codex_inventory_hold(
             .iter()
             .map(|(key, witness)| (key.clone(), witness.clone())),
     );
+    let outside = outside_roster.len();
     hold.outside_roster.extend(outside_roster);
+    // Counts only, for the page's census line: held, awaiting, outside roster.
+    (held.len(), awaiting, outside)
 }
 
 /// Queue the candidates of a `CodexInventoryHold` again once its evidence

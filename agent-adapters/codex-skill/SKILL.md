@@ -181,23 +181,15 @@ stop. Do not bypass that boundary with direct file writes or secret handling.
 
 ## Cloud Connectors
 
-Use the daemon bridge for cloud connector setup and operations:
+Connecting or changing an AWS or Google Cloud connector happens at
+<https://app.ottto.net/apps>. That page walks the user through it and gives the
+values, commands and prompt to copy. If the user pastes a prompt they copied
+from that page, follow it as written. Do not invent cloud-provider setup
+commands. To read connector state, use the read-only:
 
 ```bash
-ottto cloud materials --source vertex --json
-ottto cloud plan --source vertex --config-file connector.json --json
-ottto cloud test --source vertex --config-file connector.json --json
-ottto cloud register --source vertex --config-file connector.json --approve --json
 ottto cloud status --source vertex --json
-ottto cloud sync --source vertex --days 30 --approve --json
 ```
-
-Read `materials` and run `plan` before requesting mutation approval. Never put
-AWS access keys, session tokens, Google service-account keys, or `client_email`
-legacy key credentials in a manifest; the CLI and daemon reject those fields.
-Vertex manifests use `service_account_email` plus
-`workload_identity_provider`. That federation trusts Ottto's production AWS
-backend role and does not require the customer to configure an AWS connector.
 
 ## Diagnostics
 

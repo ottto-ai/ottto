@@ -267,6 +267,10 @@ impl ClaudeRequestCensusRecord {
         self.modified
     }
 
+    pub(crate) fn is_exact(&self) -> bool {
+        self.shape == ClaudeRequestCensusShape::Exact
+    }
+
     /// Missing ids in a lossy scan cannot disprove an earlier removal.
     pub(crate) fn is_lossy(&self) -> bool {
         self.shape == ClaudeRequestCensusShape::Lossy

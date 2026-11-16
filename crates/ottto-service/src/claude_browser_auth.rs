@@ -1926,7 +1926,7 @@ fn finalize_identity_mode(
                 Some(canonical),
                 allow_terminal_fallback,
             )?;
-            spawn_status_refresh("browser_auth_complete");
+            request_completed_status();
             return Ok(());
         }
         if let Some(canonical) = serving_slot_for_binding(
@@ -2056,8 +2056,15 @@ fn finalize_identity_mode(
         )?;
         collect_allowed_quota(&store, &operation.slot_id);
     }
-    spawn_status_refresh("browser_auth_complete");
+    request_completed_status();
     Ok(())
+}
+
+/// A completed sign-in replaces the previous sign-in deadline on the very next
+/// status pass instead of after the event gap. Other outcomes keep the
+/// ordinary gap-bound request.
+fn request_completed_status() {
+    crate::agent_status_refresh::request_now(&ottto_protocol::SourceKind::ClaudeCode);
 }
 
 fn spawn_status_refresh(reason: &'static str) {

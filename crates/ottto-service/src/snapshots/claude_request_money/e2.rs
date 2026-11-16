@@ -3,7 +3,6 @@
 //! reported telemetry cost and side calls, and emits one literal body per
 //! session. The upload gate is ON; DARK test arms never change an item, a
 //! scan identity, parser scope or body witness.
-use super::super::claude_context_file_birth::ClaudeFileBirth;
 use super::super::claude_history_upgrade::{
     claude_path_twin_groups, path_twins, probe_opened_birth, ClaudeTwinGroups,
     REQUEST_OWNED_USAGE_CONTRACT,
@@ -13,6 +12,7 @@ use super::super::claude_request_census::claude_request_hash;
 use super::super::claude_request_identity::{
     self, AcceptedBuckets, AccountPartition, LentSlot, RequestAccounts,
 };
+use super::super::sources::claude::context_file_birth::ClaudeFileBirth;
 use super::super::{
     claude_api_cache_creation, claude_api_matches_transcript_occurrence, claude_family_root_path,
     claude_index_path_family_member, claude_index_path_member_ref, claude_row_placement,
@@ -2166,6 +2166,14 @@ fn census_holder(
         .iter()
         .any(|(_, hashes)| hashes.binary_search(&hash).is_ok()))
     .then_some(holder)
+}
+
+#[cfg(test)]
+pub(crate) fn copied_file_holders_for_test<'a>(
+    index: &ScanIndex,
+    keys: impl Iterator<Item = &'a str>,
+) -> BTreeMap<String, String> {
+    copied_file_holders(index, keys)
 }
 
 /// One census-only walk for a fixed seed set. Each seed pulls at most its
@@ -4404,13 +4412,18 @@ pub(crate) fn finish_page(
         .iter()
         .map(|(session, state)| (session.as_str(), state.locations.as_slice()))
         .collect::<Vec<_>>();
-    let held = absent_twins(
+    let content_held = content_twin_holds(&locations, items, index);
+    if !content_held.is_empty() {
+        *hold_reasons.entry("absent_content_twin").or_default() += content_held.len() as u64;
+    }
+    let mut held = absent_twins(
         &locations,
         items,
         index,
         queued_family_deferred_paths,
         hold_reasons,
     );
+    held.extend(content_held.iter().cloned());
     diag("held_absent_twin", held.len() as u64);
     drop(locations);
     let mut decided = Vec::with_capacity(sessions.len());
@@ -4429,7 +4442,9 @@ pub(crate) fn finish_page(
         if item.claude_money.is_none() {
             return true;
         }
-        if drop_copies.get(&item.source_session_id) == Some(&true) {
+        if !content_held.contains(&item.source_session_id)
+            && drop_copies.get(&item.source_session_id) == Some(&true)
+        {
             return false;
         }
         // One body per session: the first item carries the summed entity.
@@ -4735,6 +4750,92 @@ fn redundant_twin(key: &str, other: &str, folded: &SnapshotItem, index: &ScanInd
         }
     };
     proof() == Some(true)
+}
+
+/// Missing overlapping contributors hold the replacement. Deleted files
+/// and retired/missing census hashes release the content dependency.
+fn content_twin_holds(
+    sessions: &[(&str, &[LocationKey])],
+    items: &[SnapshotItem],
+    index: &ScanIndex,
+) -> BTreeSet<String> {
+    if sessions.is_empty() {
+        return BTreeSet::new();
+    }
+    let mut twin_locations = BTreeSet::new();
+    let mut twins_by_hash = BTreeMap::<u64, BTreeSet<&str>>::new();
+    for (key, twin) in index
+        .claude_request_census
+        .records()
+        .filter(|(_, r)| r.is_twin())
+    {
+        twin_locations.insert(location_key(key));
+        for &hash in twin.request_hashes() {
+            twins_by_hash.entry(hash).or_default().insert(key);
+        }
+    }
+    let mut page_locations = BTreeSet::new();
+    let mut session_hashes = BTreeMap::<&str, BTreeSet<u64>>::new();
+    for item in items {
+        page_locations.extend(
+            item.claude_money
+                .as_deref()
+                .and_then(FileFold::location_key),
+        );
+        session_hashes
+            .entry(&item.source_session_id)
+            .or_default()
+            .extend(
+                item.claude_usage_request_ids
+                    .iter()
+                    .map(|id| claude_request_hash(id)),
+            );
+    }
+    // Build filename groups once for the same twin-only sessions, including
+    // empty location lists (all() was vacuously true for those too).
+    let only_twins = sessions
+        .iter()
+        .filter(|(_, here)| here.iter().all(|key| twin_locations.contains(key)))
+        .map(|(session, _)| (*session).to_owned())
+        .collect::<BTreeSet<_>>();
+    let groups = (!only_twins.is_empty()).then(|| claude_path_twin_groups(index, &only_twins));
+    sessions
+        .iter()
+        .filter(|(session, here)| {
+            // Filename absence still takes precedence over content overlap.
+            if only_twins.contains(*session)
+                && groups
+                    .as_ref()
+                    .and_then(|groups| groups.get(*session))
+                    .is_some_and(|keys| {
+                        keys.iter().any(|(key, _)| {
+                            Path::new(key).is_file() && !here.contains(&location_key(key))
+                        })
+                    })
+            {
+                return true;
+            }
+            let hashes = &session_hashes[*session];
+            // Keep census key order and check each overlapping twin only once.
+            let overlapping = hashes
+                .iter()
+                .filter_map(|hash| twins_by_hash.get(hash))
+                .flatten()
+                .copied()
+                .collect::<BTreeSet<_>>();
+            overlapping.into_iter().any(|key| {
+                let twin = index.claude_request_census.get(key).unwrap();
+                !(twin.is_exact()
+                    && twin
+                        .request_hashes()
+                        .iter()
+                        .all(|hash| hashes.contains(hash)))
+                    && !page_locations.contains(&location_key(key))
+                    && Path::new(key).is_file()
+            })
+        })
+        .map(|(session, _)| (*session).to_owned())
+        .collect()
 }
 
 /// Sessions (roots and subagent members) with a live indexed path that is
