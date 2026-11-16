@@ -944,8 +944,20 @@ fn held_content_twin_holder_proves_no_copy_until_released() {
         money_oracle::assert_equivalent(&reference, &sent_money(&complete));
         prior = accept_monotone_page(&c, &prior, complete, &mut accepted);
 
-        // Two more unchanged passes read neither H nor C after the transfer settles.
+        // The owed page re-reads every file, so T stops carrying ROOT's ACK
+        // at its save; that carrier loss marks H once. One recovery pass
+        // re-reads H (never C) and changes no accepted body.
         let after_release = accepted.clone();
+        assert!(prior.claude_copy_removals.pending(location_key(&main_key)));
+        let mut recovery = c.raw(&scanner, prior.clone(), 100, true, &[]);
+        assert!(!scanner.paths().contains(&copy));
+        recovery.enrich(&c);
+        prior = accept_monotone_page(&c, &prior, recovery, &mut accepted);
+        assert_eq!(accepted, after_release);
+        assert!(!prior.claude_copy_removals.pending(location_key(&main_key)));
+        assert!(!prior.claude_copy_removals.pending(location_key(&copy_key)));
+
+        // Two more unchanged passes read neither H nor C after the transfer settles.
         for _ in 0..2 {
             let mut unchanged = c.raw(&scanner, prior.clone(), 100, true, &[]);
             assert!(!scanner.paths().contains(&main) && !scanner.paths().contains(&copy));
