@@ -5440,13 +5440,14 @@ fn complete_pending_auth_claim(
             {
                 let _binding_lock = lock_setup_run_binding();
                 identity_reservation.validate_locked()?;
+                let hardware_matches = owner_snapshot_claim_hardware_matches(&pending);
                 select_owner_snapshot_namespace(
                     &mut pending,
                     &prepared.candidate_secret,
                     completion.prior_device_credential.as_ref(),
                     &FileOwnerSnapshotNamespaceStore::default(),
                     &default_support_dir(),
-                    &owner_snapshot_machine_matches,
+                    &|key| Ok(hardware_matches && owner_snapshot_machine_matches(key)?),
                 )?;
             }
             stage_pending_device_credential(&pending, &prepared.candidate_secret)?;
@@ -6124,6 +6125,9 @@ fn mark_pending_device_credential_guards_passed(
     pending_store: &FilePendingDeviceCredentialStore,
 ) -> Result<PendingDeviceCredentialPreparation, LocalApiError> {
     if pending.schema_version == OWNER_RETURN_CREDENTIAL_SCHEMA_VERSION {
+        if !owner_snapshot_claim_hardware_matches(pending) {
+            return Err(LocalApiError::StatePoisoned);
+        }
         let key = pending_owner_snapshot_key(pending)?;
         if !owner_snapshot_machine_matches(&key)? {
             return Err(LocalApiError::StatePoisoned);
@@ -6179,6 +6183,11 @@ fn stage_pending_device_credential_with_stores(
         || pending.credential_generation == 0
         || validate_pending_prior_credential_binding(pending).is_err()
         || validate_pending_candidate_secret(pending, candidate_secret).is_err()
+    {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    if pending.schema_version == OWNER_RETURN_CREDENTIAL_SCHEMA_VERSION
+        && !owner_snapshot_claim_hardware_matches(pending)
     {
         return Err(LocalApiError::StatePoisoned);
     }
@@ -6631,6 +6640,11 @@ fn write_and_verify_pending_claim_commit(
         return Err(LocalApiError::StatePoisoned);
     }
 
+    if pending.schema_version == OWNER_RETURN_CREDENTIAL_SCHEMA_VERSION
+        && !owner_snapshot_claim_hardware_matches(pending)
+    {
+        return Err(LocalApiError::StatePoisoned);
+    }
     validate_owner_snapshot_selection(
         pending,
         candidate_secret,
@@ -11669,6 +11683,17 @@ fn pending_owner_snapshot_key(
             .filter(|v| !v.is_empty())
             .ok_or(LocalApiError::StatePoisoned)?,
     })
+}
+
+fn owner_snapshot_claim_hardware_matches(pending: &PendingDeviceCredentialPreparation) -> bool {
+    let Some(authority) = pending.request_authority.as_ref() else {
+        return false;
+    };
+    crate::grant_rebind::verify_hardware(
+        authority.hardware_uuid.as_deref(),
+        crate::grant_rebind::live_hardware_id().as_deref(),
+    )
+    .is_ok()
 }
 
 fn owner_snapshot_machine_matches(key: &OwnerSnapshotKey) -> Result<bool, LocalApiError> {
@@ -17572,7 +17597,7 @@ fn source_display_name(source: &SourceKind) -> &'static str {
 }
 
 #[cfg(test)]
-pub(crate) use tests::owner_return_credential_for_test;
+pub(crate) use tests::{owner_return_credential_for_test, owner_return_seed_for_test};
 
 #[cfg(test)]
 mod tests {
@@ -32833,6 +32858,24 @@ X-API-Key = "otel_redacted"
             backfill_cutoff_at: Some(RELOGIN_CUTOFF.into()),
         });
         (pending, candidate)
+    }
+
+    pub(crate) fn owner_return_seed_for_test(namespace: &str, user: &str) {
+        let (mut pending, _) = owner_return_pending(user, "org", "initial");
+        pending.api_base_url = validated_api_base_url(None).unwrap();
+        pending
+            .claim_commit
+            .as_mut()
+            .unwrap()
+            .connection
+            .api_base_url = pending.api_base_url.clone();
+        let row = OwnerSnapshotNamespace {
+            key: pending_owner_snapshot_key(&pending).unwrap(),
+            namespace: namespace.into(),
+        };
+        FileOwnerSnapshotNamespaceStore::default()
+            .upsert(&[row])
+            .unwrap();
     }
 
     /// Synthetic driver of the production selection, validation, publication and

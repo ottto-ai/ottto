@@ -1578,3 +1578,158 @@ fn current_again_quarantines_retry_root_and_subagent_without_changing_money() {
 }
 
 mod family_census_tests;
+
+/// [money] A fresh claim selects the original published custody after two other
+/// owners. The ordinary native scan and stored Tail conserve a real two-account
+/// fixture, including a switch, side call, evidence gap and tagged shares.
+#[test]
+#[serial]
+fn owner_return_keeps_the_placement_oracle_and_quiet_restart() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    with_e2(|| {
+        let (c, path) = placement_corpus("owner-return-placement");
+        let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &c.support);
+        let secrets = c.base.join("synthetic-secrets");
+        std::fs::create_dir_all(&secrets).unwrap();
+        let _secrets = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secrets);
+        let _api = EnvVarGuard::set_str("OTTTO_API_BASE_URL", "https://api.ottto.net");
+        let namespace = "a".repeat(64);
+        let index_path = c
+            .support
+            .join("snapshots/destinations")
+            .join(&namespace)
+            .join("claude_code-scan-index-v3.json");
+        let progress =
+            serde_json::to_vec(&json!({"schema_version":3,"destination_namespace_hash":namespace}))
+                .unwrap();
+        let (session, index) =
+            StateV2ColdSession::publish_at(&ScanIndex::default(), &index_path, &progress);
+        let scanner = E2ScanFixture::capturing_identity();
+        let mut seed = c.raw(&scanner, index, 100, true, &[]);
+        seed.enrich(&c);
+        let prior = commit(&session, seed);
+        crate::control::owner_return_seed_for_test(&namespace, "owner-a");
+        let device = LocalDeviceBinding {
+            device_id: "placement-b".into(),
+            machine_id: Some("machine_test".into()),
+            sources: vec!["claude_code".into()],
+        };
+        for (user, id) in [
+            ("owner-b", "placement-b"),
+            ("owner-c", "placement-c"),
+            ("owner-a", "placement-a-return"),
+        ] {
+            let device = LocalDeviceBinding {
+                device_id: id.into(),
+                ..device.clone()
+            };
+            let selected = crate::control::owner_return_credential_for_test(
+                &device,
+                &format!("secret-{id}"),
+                user,
+            );
+            if user == "owner-a" {
+                assert_eq!(selected, namespace);
+            } else {
+                assert_ne!(selected, namespace);
+            }
+        }
+        // No index/progress migration or synthetic ACK is part of selection.
+        let restored = ScanIndex::load(&index_path).unwrap();
+        append(&path, &line(ROOT, "later", "2026-08-02T07:04:00Z", 6));
+        let cold = result(&page(&c, ScanIndex::default(), 100, false), Mode::ColdFull);
+        assert!(
+            accounts(&cold).len() >= 2,
+            "positive placed-account control"
+        );
+        let uninterrupted = result(&page(&c, prior, 100, true), Mode::Ram);
+        let returned_page = page(&c, restored, 100, true);
+        let returned = result(&returned_page, Mode::Restart);
+        money_oracle::assert_equivalent(&cold, &uninterrupted);
+        money_oracle::assert_equivalent(&cold, &returned);
+        let saved = commit(&session, returned_page);
+        let (quiet, io) = fixture::observe_codex_quiet(|| page(&c, saved, 100, true));
+        let mut quiet_route = result(&quiet, Mode::Restart);
+        quiet_route.io = io;
+        money_oracle::assert_quiet_restart_zero_bytes(&quiet_route);
+    });
+}
+
+/// [money] The returning owner's saved accepted heads survive the server's
+/// switch cutoff. Pre-cutoff owed activity stays excluded; a spanning session
+/// remains a whole session, using the ordinary cutoff and oracle paths.
+#[test]
+fn owner_return_cutoff_keeps_prior_heads_and_whole_spanning_sessions() {
+    with_e2(|| {
+        let (c, path) = placement_corpus("owner-return-cutoff");
+        let initial = page(&c, ScanIndex::default(), 100, false);
+        let mut prior = result(&initial, Mode::ColdFull);
+        accepted(&mut prior, &initial.scan.snapshots);
+        for cutoff in ["2026-08-02T07:10:00Z", "2026-08-02T07:11:00Z"] {
+            let mut owed = page(&c, ScanIndex::default(), 100, false);
+            let count = owed.scan.snapshots.len();
+            let state = crate::backfill::BackfillState {
+                backfill_cutoff_at: Some(cutoff.into()),
+                ..Default::default()
+            };
+            assert_eq!(
+                apply_backfill_cutoff(&mut owed.scan.snapshots, &state),
+                count
+            );
+            let mut held = result(&owed, Mode::Restart);
+            held.accepted = prior.accepted.clone();
+            for entity in prior.snapshots.keys() {
+                // All pre-cutoff entities are held; compare each independently
+                // using the real accepted body's exact witness.
+                let mut one = prior.clone();
+                one.snapshots.retain(|key, _| key == entity);
+                one.normalized
+                    .as_array_mut()
+                    .unwrap()
+                    .iter_mut()
+                    .for_each(|batch| {
+                        batch["snapshots"]
+                            .as_array_mut()
+                            .unwrap()
+                            .retain(|body| body["source_session_id"] == entity.as_str());
+                    });
+                one.normalized
+                    .as_array_mut()
+                    .unwrap()
+                    .retain(|batch| !batch["snapshots"].as_array().unwrap().is_empty());
+                money_oracle::assert_held(entity, &prior, &held, &one);
+                money_oracle::assert_no_smaller_reemit(entity, &prior, &held, &one, true);
+            }
+        }
+        append(
+            &path,
+            &line(ROOT, "after-return", "2026-08-02T07:12:00Z", 7),
+        );
+        let whole = page(&c, ScanIndex::default(), 100, false);
+        let expected = whole
+            .scan
+            .snapshots
+            .iter()
+            .find(|item| item.source_session_id == ROOT)
+            .unwrap()
+            .input_tokens;
+        let mut spanning = page(&c, ScanIndex::default(), 100, false);
+        let state = crate::backfill::BackfillState {
+            backfill_cutoff_at: Some("2026-08-02T07:11:00Z".into()),
+            ..Default::default()
+        };
+        apply_backfill_cutoff(&mut spanning.scan.snapshots, &state);
+        assert_eq!(
+            spanning
+                .scan
+                .snapshots
+                .iter()
+                .find(|item| item.source_session_id == ROOT)
+                .unwrap()
+                .input_tokens,
+            expected
+        );
+    });
+}
