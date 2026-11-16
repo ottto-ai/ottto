@@ -1287,10 +1287,15 @@ fn emitted_route(
 }
 
 fn install_claude_control(home: &OracleHome) {
-    install_claude_control_for(home, IDENTITY_PIPELINE_ROOT, "");
+    install_claude_control_for(home, IDENTITY_PIPELINE_ROOT, "", false);
 }
 
-fn install_claude_control_for(home: &OracleHome, session: &str, prefix: &str) {
+fn install_claude_control_for(
+    home: &OracleHome,
+    session: &str,
+    prefix: &str,
+    with_parent_growth: bool,
+) {
     use crate::claude_local_otel::{
         ClaudeIdentityAttributeEvidence, ClaudeIdentityAttributeOrigin, ClaudeIdentityDisposition,
         ClaudeLocalOtelEvidence, ClaudeRequestIdentityEvidence, ClaudeTraceOwnershipEvidence,
@@ -1329,16 +1334,22 @@ fn install_claude_control_for(home: &OracleHome, session: &str, prefix: &str) {
     };
     let mut rows = Vec::new();
     let mut traces = Vec::new();
-    for (sequence, (request, tokens, account, org, at)) in [
+    let mut requests = [
         ("account-a", 10, 'a', '8', "2026-11-01T07:01:00Z"),
         ("account-b", 20, 'b', '9', "2026-11-01T07:02:00Z"),
         ("side", 7, 'b', '9', "2026-11-01T07:03:00Z"),
     ]
     .into_iter()
-    .enumerate()
-    {
-        let at = time(at);
-        let request = format!("{prefix}{request}");
+    .map(|(request, tokens, account, org, at)| {
+        (format!("{prefix}{request}"), tokens, account, org, time(at))
+    })
+    .collect::<Vec<_>>();
+    if with_parent_growth {
+        // D574/B2: an account only carried from a deduplicated row may follow
+        // the keeper (accepted/disclosed); pin direct evidence for convergence.
+        requests.push(("parent-growth".into(), 13, 'b', '9', "2026-11-01T07:05:00Z"));
+    }
+    for (sequence, (request, tokens, account, org, at)) in requests.into_iter().enumerate() {
         let mut row = ClaudeLocalOtelEvidence {
             capture_revision: "claude_api_request:v2".into(),
             session_id: session.into(),
@@ -2034,7 +2045,12 @@ fn scheduling_corpus(home: &OracleHome, seed_only: bool) -> Vec<(PathBuf, String
                 rows
             }
             SnapshotSource::ClaudeCode => {
-                install_claude_control_for(home, session, &format!("family-{n}:"));
+                install_claude_control_for(
+                    home,
+                    session,
+                    &format!("family-{n}:"),
+                    n == 0 && !seed_only,
+                );
                 std::fs::read_to_string(home.transcript())
                     .unwrap()
                     .lines()
