@@ -216,7 +216,7 @@ pub enum LocalApiError {
     #[error("this Mac is attached to a different setup run; open the Ottto app from Ottto")]
     SetupRunConnectionMismatch,
     #[error(
-        "cloud-session cleanup is required before changing this Mac's Ottto account or device; revoke Cloud sessions in the Ottto app and wait for confirmation, then retry"
+        "Codex cloud task listing did not stop in time to change this Mac's Ottto account or device; wait a minute, then retry"
     )]
     CloudSessionCleanupRequired,
     #[error(

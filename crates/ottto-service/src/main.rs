@@ -96,11 +96,6 @@ enum Command {
         #[arg(long)]
         agent: Option<String>,
     },
-    /// Print the Codex cloud-session collector state without invoking Codex.
-    CloudSessionsStatus {
-        #[arg(long)]
-        json: bool,
-    },
     /// Run the production local-session scanner and print a privacy-safe audit.
     SnapshotAudit {
         /// `codex`, `claude_code`, or `pi`.
@@ -270,20 +265,6 @@ fn main() -> Result<()> {
                 None => ottto_service::mcp_inventory::dump_all_inventories()?,
             };
             println!("{}", serde_json::to_string_pretty(&value)?);
-        }
-        Command::CloudSessionsStatus { json } => {
-            let status = ottto_service::cloud_sessions::default_cloud_session_collector_status();
-            if json {
-                println!("{}", serde_json::to_string_pretty(&status)?);
-            } else {
-                println!(
-                    "cloud_sessions {} ({})",
-                    serde_json::to_value(&status.runtime_state)?
-                        .as_str()
-                        .unwrap_or("unknown"),
-                    status.reason_code
-                );
-            }
         }
         Command::SnapshotAudit {
             source,
