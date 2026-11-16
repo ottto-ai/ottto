@@ -41,7 +41,8 @@ const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const RECOVERY_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const TERMINAL_STATUS_RETENTION: u64 = 5 * 60;
 const TERM_GRACE: Duration = Duration::from_millis(500);
-const SUPERVISOR_READY_TIMEOUT: Duration = Duration::from_secs(2);
+// Tests re-execute the much larger test binary as the supervisor.
+const SUPERVISOR_READY_TIMEOUT: Duration = Duration::from_secs(if cfg!(test) { 10 } else { 2 });
 const PROVIDER_EVENT_READY: u8 = 1;
 /// The reply to an authorized request from an older client that still sends
 /// the retired authorization-code command. Older apps show it as is, so it is
@@ -2058,6 +2059,10 @@ fn spawn_supervised_login(
         .arg("--ready-fd")
         .arg(event_write.as_raw_fd().to_string());
     configure_auth_supervisor_environment(&mut command);
+    // The unit-test binary has no supervisor subcommand; a test that opts in
+    // re-executes it through a test entry that runs the same supervisor.
+    #[cfg(test)]
+    tests::route_supervisor_to_test_entry(&mut command);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())

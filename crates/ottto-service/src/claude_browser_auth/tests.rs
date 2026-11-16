@@ -239,6 +239,196 @@ fn private_provider_pty_is_interactive_and_does_not_echo_secrets() {
     assert_eq!(attributes.c_lflag & (libc::ECHO | libc::ECHONL), 0);
 }
 
+static SUPERVISOR_TEST_ENTRY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+const SUPERVISOR_TEST_ARGS_ENV: &str = "OTTTO_TEST_AUTH_SUPERVISOR_ARGS";
+const SUPERVISOR_TEST_ENTRY_NAME: &str = "claude_browser_auth::tests::auth_supervisor_test_entry";
+
+/// Opts one test into launching the real supervisor; every other test keeps
+/// the unrouted launch, which the test binary rejects before any provider runs.
+struct SupervisorTestEntry;
+
+impl SupervisorTestEntry {
+    fn enable() -> Self {
+        SUPERVISOR_TEST_ENTRY.store(true, std::sync::atomic::Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for SupervisorTestEntry {
+    fn drop(&mut self) {
+        SUPERVISOR_TEST_ENTRY.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Rebuilds the worker's supervisor launch as this test binary running only
+/// [`auth_supervisor_test_entry`], with the unchanged supervisor arguments,
+/// environment and inherited pipe descriptors.
+#[cfg(unix)]
+pub(super) fn route_supervisor_to_test_entry(command: &mut std::process::Command) {
+    if !SUPERVISOR_TEST_ENTRY.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let args = command
+        .get_args()
+        .map(|arg| arg.to_str().expect("utf8 supervisor argument"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut routed = std::process::Command::new(command.get_program());
+    routed.env_clear();
+    for (key, value) in command.get_envs() {
+        if let Some(value) = value {
+            routed.env(key, value);
+        }
+    }
+    routed.env(SUPERVISOR_TEST_ARGS_ENV, args).args([
+        "--exact",
+        SUPERVISOR_TEST_ENTRY_NAME,
+        "--nocapture",
+        "--test-threads=1",
+        "--quiet",
+    ]);
+    *command = routed;
+}
+
+/// The supervisor half of a routed launch. In an ordinary test run the
+/// variable is absent and this returns at once.
+#[test]
+#[cfg(unix)]
+fn auth_supervisor_test_entry() {
+    let Ok(args) = std::env::var(SUPERVISOR_TEST_ARGS_ENV) else {
+        return;
+    };
+    let args = args.split('\n').collect::<Vec<_>>();
+    assert_eq!(args.first(), Some(&"claude-auth-supervisor"));
+    let value = |flag: &str| {
+        args.iter()
+            .position(|arg| *arg == flag)
+            .and_then(|index| args.get(index + 1))
+            .copied()
+            .expect("supervisor flag")
+    };
+    let code = run_auth_supervisor(
+        value("--operation-id"),
+        value("--config-dir"),
+        value("--control-fd").parse().expect("control fd"),
+        value("--ready-fd").parse().expect("ready fd"),
+    )
+    .unwrap_or(1);
+    std::process::exit(code);
+}
+
+/// Passive browser completion across the whole boundary: the worker launches
+/// the real supervisor, the provider shows its paste prompt, nothing answers
+/// it, and the provider then finishes the way a browser callback does (it
+/// writes the login and identity) and exits 0. The worker sees the witness
+/// change, proves the identity and admits it: one completed sign-in.
+#[test]
+#[serial]
+#[cfg(unix)]
+fn passive_browser_completion_reaches_witness_identity_and_admission() {
+    let (root, _support_dir, _support) = with_support("passive-browser-completion");
+    let bin = root.join("bin");
+    let home = root.join("home");
+    fs::create_dir_all(&bin).expect("bin");
+    fs::create_dir_all(&home).expect("home");
+    let _path = EnvGuard::set("OTTTO_COMMAND_SEARCH_PATH", &bin);
+    let _home = EnvGuard::set("OTTTO_EFFECTIVE_USER_HOME_FOR_TESTS", &home);
+    // No keychain item: the stored login is read from the slot's own
+    // credentials file on every platform.
+    let security = bin.join("security");
+    fs::write(&security, "#!/bin/sh\nexit 44\n").expect("fake security");
+    fs::set_permissions(&security, fs::Permissions::from_mode(0o755)).expect("security mode");
+
+    let operation_id = "claude_setup_b0b1b0b1b0b1b0b1b0b1b0b1b0b1b0b1";
+    let store = FileClaudeConfigSlotSettingsStore::default();
+    let prepared =
+        prepare_generic(store.load().expect("registry"), operation_id).expect("prepare generic");
+    let config_dir = read_operation(operation_id).expect("operation").config_dir;
+    let prompted = root.join("prompted");
+    let identity = serde_json::json!({
+        "oauthAccount": {
+            "accountUuid": "passive-account",
+            "organizationUuid": "passive-organization",
+            "emailAddress": "passive@example.invalid",
+            "organizationType": "claude_max"
+        }
+    });
+    let expires_at = (unix_seconds() + 3 * 60 * 60) * 1_000;
+    let credential = serde_json::json!({
+        "claudeAiOauth": {
+            "accessToken": "fixture-passive-access",
+            "refreshToken": "fixture-passive-refresh",
+            "expiresAt": expires_at,
+            "refreshTokenExpiresAt": expires_at + 25 * 24 * 60 * 60 * 1_000,
+            "scopes": ["user:inference", "user:profile"],
+            "subscriptionType": "max"
+        }
+    });
+    let claude = bin.join("claude");
+    fs::write(
+        &claude,
+        format!(
+            "#!/bin/sh\nfor fd in 0 1 2; do test -t \"$fd\" || exit 42; done\nprintf 'Paste code here if prompted >' >&2\n: > '{prompted}'\numask 077\nprintf '%s' '{identity}' > '{config}/.claude.json'\nprintf '%s' '{credential}' > '{config}/.credentials.json'\nexit 0\n",
+            prompted = prompted.display(),
+            config = config_dir,
+        ),
+    )
+    .expect("fake claude");
+    fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).expect("claude mode");
+
+    let _entry = SupervisorTestEntry::enable();
+    start(prepared, BrowserLoginMode::Generic).expect("start browser sign-in");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut phases = Vec::new();
+    let completed = loop {
+        let operation = read_operation(operation_id).expect("operation");
+        if phases.last() != Some(&operation.phase) {
+            phases.push(operation.phase);
+        }
+        if operation.outcome.is_some() && read_state().active_operation_id.is_none() {
+            break operation;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "passive completion did not finish: {phases:?}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    };
+
+    assert!(prompted.exists(), "the provider showed its paste prompt");
+    assert_eq!(
+        completed.outcome,
+        Some(ClaudeBrowserAuthOutcomeV1::Complete),
+        "{phases:?}"
+    );
+    assert!(phases.iter().all(|phase| !matches!(
+        phase,
+        ClaudeBrowserAuthPhaseV1::WaitingForCode | ClaudeBrowserAuthPhaseV1::SubmittingCode
+    )));
+    let canonical = completed.canonical_slot_id.expect("admitted slot");
+    assert!(store
+        .load()
+        .expect("registry after admission")
+        .managed_slots
+        .iter()
+        .any(|slot| slot.slot_id == canonical));
+    assert!(!provider_process_active(operation_id).expect("provider lock released"));
+    let account = ottto_core::claude_cli_account_identifier_hash_at(
+        &Path::new(&config_dir).join(".claude.json"),
+    );
+    let lines =
+        crate::provider_calls::test_lines(crate::provider_calls::CallKind::ClaudeSignIn, &account);
+    assert_eq!(
+        lines
+            .iter()
+            .map(|line| (line.result.as_str(), line.requests_at_least))
+            .collect::<Vec<_>>(),
+        [("ok", 1)]
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
 /// A legacy `--code-fd` is closed without being read, and only when it is a
 /// live read-only pipe: a write end or a standard stream is left alone.
 #[test]
