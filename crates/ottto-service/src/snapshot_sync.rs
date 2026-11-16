@@ -64,6 +64,8 @@ mod identity_bucket_progress_tests;
 mod reason_reoffer;
 mod rejection_log;
 mod stale_owed;
+#[cfg(test)]
+mod upload_owned_test_adapters;
 
 // Direct API host; the apex `ottto.net/backend` proxy is retired in the marketing cutover.
 const DEFAULT_API_BASE_URL: &str = "https://api.ottto.net";
@@ -13442,6 +13444,10 @@ pub(crate) use tests::codex_archive_tests::{
 
 #[cfg(test)]
 mod tests {
+    use super::upload_owned_test_adapters::{
+        attempt_snapshot_page, bootstrap_cache_heads_with_budget,
+        upload_resumable_batches_with_literal_families,
+    };
     use super::*;
     mod upload_borrowed_tests {
         include!("snapshot_sync/upload_borrowed_tests.rs");
@@ -19040,7 +19046,6 @@ mod tests {
             |_| None,
             &mut InplaceRetryBudget::default(),
             |batch| {
-                let batch = batch.iter().copied().cloned().collect::<Vec<_>>();
                 let is_reconcile = batch
                     .iter()
                     .all(|fingerprint| reconcile_class.contains(fingerprint));
@@ -24025,7 +24030,7 @@ mod tests {
         fn send(
             &mut self,
             slot: usize,
-            mut upload: impl FnMut(
+            upload: impl FnMut(
                 Vec<SnapshotItem>,
             ) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
         ) -> Result<SnapshotPageOutcome> {
@@ -24052,7 +24057,7 @@ mod tests {
                 &|i: &SnapshotItem| i.snapshot_fingerprint.as_str(),
                 &snapshot_upload_body_witness,
                 &|item: &SnapshotItem| Some(item.source_session_id.as_str()),
-                &mut |items| upload(items.iter().copied().cloned().collect()),
+                &mut { upload },
                 &mut |p: &mut SnapshotUploadProgress| p.save(&self.progress_path),
             )
         }
@@ -24384,7 +24389,6 @@ mod tests {
                     &mut f.progress,
                     &mut InplaceRetryBudget::default(),
                     |items, _| {
-                        let items = items.iter().copied().cloned().collect::<Vec<_>>();
                         post(items.as_slice());
                         headed(items)
                     },
@@ -24803,7 +24807,7 @@ mod tests {
             &|item: &SnapshotItem| Some(item.source_session_id.as_str()),
             &mut |items| {
                 physical += 1;
-                same_source_fixture_ack(items.iter().copied().cloned().collect())
+                same_source_fixture_ack(items)
             },
             &mut |_| Err(anyhow!("synthetic crash before ledger save")),
         );

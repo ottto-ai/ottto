@@ -1,5 +1,6 @@
 //! Offline head-CAS conflict-recovery fixtures. Synthetic items and a fake
 //! server only; no installed state, transcripts or providers.
+use super::upload_owned_test_adapters::upload_resumable_batches_with_literal_families;
 use super::*;
 use crate::snapshot_client::{SnapshotBatchResponse, SnapshotEntityRef};
 use serde_json::Value;

@@ -19,7 +19,6 @@ use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
@@ -645,10 +644,13 @@ pub struct SourceScanResult {
 #[derive(Clone, Debug)]
 pub(crate) struct CodexJoinValidator(codex_file_join::Validation);
 impl CodexJoinValidator {
-    pub(crate) fn validate(&self, snapshots: &[impl Borrow<SnapshotItem>]) -> Result<()> {
+    pub(crate) fn validate(
+        &self,
+        snapshots: &[impl std::borrow::Borrow<SnapshotItem>],
+    ) -> Result<()> {
         let owners = snapshots
             .iter()
-            .map(Borrow::<SnapshotItem>::borrow)
+            .map(std::borrow::Borrow::<SnapshotItem>::borrow)
             .map(|item| resolve_codex_identity(&item.source_session_id))
             .collect();
         self.0.validate(&owners).map(|_| ())

@@ -70,7 +70,7 @@ fn upload_attempt_matches_cloned_batch_bytes() {
         let mut progress = test_upload_progress();
         let mut accepted = 0;
         let mut calls = 0;
-        attempt_snapshot_page(
+        crate::snapshot_sync::attempt_snapshot_page(
             &items,
             &indices,
             &unique_poison_scope(),
