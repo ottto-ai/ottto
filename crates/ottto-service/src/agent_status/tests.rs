@@ -9335,10 +9335,10 @@ fn keychain_read_failures_fail_closed_and_only_not_found_falls_back_to_the_file(
     assert!(!locked.claude_spawned());
 }
 
-/// The native store (every platform except macOS) reads the slot's
-/// credentials file directly, never running `security`, whether or not a
-/// program by that name is on the search path, for the default login and a
-/// registered config dir alike.
+/// The native store reads the default login's and a registered config
+/// dir's credentials file and never runs `security`: first with one on the
+/// search path, then with none. Off macOS this is the production dispatch;
+/// on macOS (keychain first) the same store is reached through the seam.
 #[test]
 #[serial]
 fn native_credentials_file_store_never_runs_the_keychain_tool() {
@@ -9364,68 +9364,12 @@ fn native_credentials_file_store_never_runs_the_keychain_tool() {
         TimeDuration::hours(2),
         Some("max"),
     ));
-    let native = |slot: &ClaudeConfigDirSlot| {
-        let ClaudeCredentialRead::Present(credential) =
-            read_claude_oauth_credential_state_from_store(slot, false)
-        else {
-            panic!("the native credentials file holds the login");
-        };
-        (credential.access_token, credential.subscription_type)
-    };
-    for _ in 0..2 {
-        assert_eq!(
-            native(&ClaudeConfigDirSlot::Default),
-            (Some("default-token".to_string()), Some("team".to_string()))
-        );
-        assert_eq!(
-            native(&fixture.slot()),
-            (Some("slot-token".to_string()), Some("max".to_string()))
-        );
-        assert!(!fixture.security_ran(), "keychain tool never runs");
-        // Same result with no `security` on the search path at all.
-        let _ = fs::remove_file(fixture.root.join("bin").join("security"));
-    }
-    if !claude_credentials_in_keychain() {
-        assert_eq!(
-            read_claude_live_login_for_slot(&fixture.slot()).state,
-            ClaudeLocalLoginState::AccessValid
-        );
-    }
-}
-
-/// Off macOS the production dispatch reads the native credentials file for
-/// the default login and a registered config dir and never runs `security`:
-/// first with one on the search path, then with none.
-#[cfg(not(target_os = "macos"))]
-#[test]
-#[serial]
-fn production_dispatch_off_macos_reads_the_native_file_without_security() {
-    // A `security` that would hand back a different login if it ran.
-    let item = claude_credential_fixture("item-token", TimeDuration::hours(2), Some("pro"));
-    let trap = format!(
-        "#!/bin/sh\n/usr/bin/touch \"$(/usr/bin/dirname \"$0\")/security-ran\"\necho '{item}'\n"
-    );
-    let fixture = LocalSlotFixture::new("linux-dispatch", &trap);
-    let default_dir = fixture.root.join("home").join(".claude");
-    fs::create_dir_all(&default_dir).expect("default config dir");
-    crate::test_scratch::write_private_file(
-        default_dir.join(".credentials.json"),
-        serde_json::to_vec(&claude_credential_fixture(
-            "default-token",
-            TimeDuration::hours(2),
-            Some("team"),
-        ))
-        .expect("serialize credential"),
-    );
-    fixture.write_credential(&claude_credential_fixture(
-        "slot-token",
-        TimeDuration::hours(2),
-        Some("max"),
-    ));
     let read = |slot: &ClaudeConfigDirSlot| {
-        let ClaudeCredentialRead::Present(credential) =
-            read_claude_oauth_credential_state_for_slot(slot)
-        else {
+        #[cfg(not(target_os = "macos"))]
+        let read = read_claude_oauth_credential_state_for_slot(slot);
+        #[cfg(target_os = "macos")]
+        let read = read_claude_oauth_credential_state_from_store(slot, false);
+        let ClaudeCredentialRead::Present(credential) = read else {
             panic!("the native credentials file holds the login");
         };
         (credential.access_token, credential.subscription_type)
@@ -9450,8 +9394,8 @@ fn production_dispatch_off_macos_reads_the_native_file_without_security() {
 }
 
 /// The one credentials-file reader: a missing file carries no login; an
-/// unsafe, oversized or malformed file is unreadable, never adopted, and
-/// never modified.
+/// unsafe or malformed file is unreadable, never adopted, and never
+/// modified.
 #[test]
 #[serial]
 fn credentials_file_reader_rejects_unsafe_files() {
@@ -9497,15 +9441,6 @@ fn credentials_file_reader_rejects_unsafe_files() {
         "mkfifo"
     );
     assert_eq!(read(&fifo), "unreadable", "fifo");
-
-    let oversize = dir.join("oversize.json");
-    let mut padded = valid.clone();
-    padded.resize(CLAUDE_CREDENTIALS_FILE_MAX_BYTES as usize + 1, b' ');
-    crate::test_scratch::write_private_file(&oversize, &padded);
-    assert_eq!(read(&oversize), "unreadable", "oversize");
-    padded.truncate(CLAUDE_CREDENTIALS_FILE_MAX_BYTES as usize);
-    crate::test_scratch::write_private_file(&oversize, &padded);
-    assert_eq!(read(&oversize), "present", "at the size limit");
 
     for (label, body, expected) in [
         ("malformed", "{", "unreadable"),

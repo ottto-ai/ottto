@@ -14811,17 +14811,14 @@ fn read_claude_oauth_credential_from_credentials_file(
     read_claude_credentials_file(&slot.credentials_path(&home_dir()))
 }
 
-/// Largest stored-login file read; anything bigger is `Unreadable`.
-#[cfg(unix)]
-const CLAUDE_CREDENTIALS_FILE_MAX_BYTES: u64 = 1024 * 1024;
-
 /// The one reader for Claude Code's native credentials file, used by the
 /// status read on every OS (directly off macOS, after keychain "not found" on
 /// macOS) and by the session-launch check. A missing file is `Absent`. A file
 /// that cannot be opened without following a final symlink, is not a regular
-/// file, is larger than the limit, is not owned by the effective user or
-/// grants any group/other permission is `Unreadable`, as is any other I/O
-/// failure. The file is never modified. Unit-test reads are scratch-only.
+/// file, is not owned by the effective user or grants any group/other
+/// permission is `Unreadable`, as is any other I/O failure. The whole file is
+/// read from the checked handle and never modified. Unit-test reads are
+/// scratch-only.
 #[cfg(unix)]
 fn read_claude_credentials_file(path: &Path) -> ClaudeCredentialRead {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -14830,7 +14827,7 @@ fn read_claude_credentials_file(path: &Path) -> ClaudeCredentialRead {
     }
     #[cfg(test)]
     claude_credentials_file_test_hooks::before_read(path);
-    let file = match fs::OpenOptions::new()
+    let mut file = match fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)
@@ -14845,19 +14842,13 @@ fn read_claude_credentials_file(path: &Path) -> ClaudeCredentialRead {
         return ClaudeCredentialRead::Unreadable;
     };
     if !metadata.is_file()
-        || metadata.len() > CLAUDE_CREDENTIALS_FILE_MAX_BYTES
         || metadata.uid() != unsafe { libc::geteuid() }
         || metadata.mode() & 0o077 != 0
     {
         return ClaudeCredentialRead::Unreadable;
     }
     let mut body = String::new();
-    if file
-        .take(CLAUDE_CREDENTIALS_FILE_MAX_BYTES + 1)
-        .read_to_string(&mut body)
-        .is_err()
-        || body.len() as u64 > CLAUDE_CREDENTIALS_FILE_MAX_BYTES
-    {
+    if file.read_to_string(&mut body).is_err() {
         return ClaudeCredentialRead::Unreadable;
     }
     parse_claude_oauth_credential_read(&body)
