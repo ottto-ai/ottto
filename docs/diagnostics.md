@@ -377,12 +377,37 @@ share the existing 50 ms sampler thread. No separate thread or sample history
 is created for a call. Concurrent work contributes to these process-wide values.
 
 `native_collection_page.observation.malloc_in_use_bytes` samples that same
-counter at page completion. A `state_save_start` row samples it immediately
-before the finished pass's index save (after withdrawing the cached manifest),
-including a save that later fails. It has an empty `counts` object, zero elapsed
-time and no CPU or footprint window. Each boundary adds one allocator-zone
-statistics call on macOS and no allocation beyond the existing row formatter.
-The malloc field is absent on other platforms. Neither measurement changes
+counter at page completion and retains the sample for the pass. Immediately
+before `committed_index = index.clone()`, a second checkpoint starts a window
+that ends at the first `snapshot_batch_call` entry. One `index_clone_to_upload`
+point row reports that entry's `observation.malloc_in_use_bytes` and signed
+`observation.malloc_in_use_bytes_delta` (entry minus pre-clone sample). It
+includes the clone, subsequent index mutations, collection and request
+preparation up to that call; a pass without a batch call emits no such row.
+The first call consumes this baseline; later batches retain their own endpoints.
+
+A `state_save_start` point row samples `observation.malloc_in_use_bytes`
+immediately before the finished pass's index save (after withdrawing the cached
+manifest), including a save that later fails. Its signed
+`observation.malloc_in_use_bytes_delta` is save entry minus the last native
+page-end sample of the pass. Both point rows have an empty `counts` object,
+zero elapsed time and no CPU or footprint window.
+
+These deltas measure net process malloc allocation (allocated minus freed),
+including concurrent work and diagnostics. Negative values report net frees;
+they are not clamped. They do not measure allocation traffic, reachable layout,
+exclusive clone cost or ownership. Shared graph storage may appear in more
+than one reachable-layout bound without another allocation. A delta is absent
+if either endpoint is unavailable or its difference cannot fit in signed 64-bit
+bytes; malloc fields are absent outside macOS. Missing pass/page baselines also
+omit the corresponding delta.
+
+The clone checkpoint, page end and save entry each add one allocator-zone
+statistics call on macOS; the clone-to-upload endpoint reuses the batch's start
+sample. Baselines are inline scalars in the existing three source slots, reset
+at prepare; a short existing diagnostic mutex acquisition stores or reads them
+at each boundary and consumes the clone baseline at batch entry. Neither delta
+needs a heap allocation beyond formatting its point row. No measurement changes
 state, upload bodies or settlement.
 
 `shared_process_cpu_delta_us` samples self-process CPU across the observation
