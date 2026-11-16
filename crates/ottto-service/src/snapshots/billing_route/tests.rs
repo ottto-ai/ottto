@@ -973,7 +973,7 @@ fn codex_and_pi_first_route_holds_as_rows_grow() {
     let apikey = row(Some("openai"), Some("apikey"));
     let codex = "codex_auth_snapshot";
     assert_eq!(
-        hours_route(Codex, &[&[chatgpt.clone()]]),
+        hours_route(Codex, &[std::slice::from_ref(&chatgpt)]),
         known("subscription", codex)
     );
     // An API key in the same hour sorts first by row key: the first route is
@@ -995,7 +995,7 @@ fn codex_and_pi_first_route_holds_as_rows_grow() {
     let vertex = row(Some("google-vertex"), Some("service_account"));
     let bedrock = row(Some("amazon-bedrock"), Some("service_account"));
     assert_eq!(
-        hours_route(Pi, &[&[vertex.clone()]]),
+        hours_route(Pi, &[std::slice::from_ref(&vertex)]),
         known("google_vertex", "pi_provider_auth")
     );
     let mut latches = Latches::new();
