@@ -1686,7 +1686,8 @@ fn paced_shed_wake_obeys_both_deadlines_and_source_errors_do_not_spin() {
                     crate::adaptive_collector::ContinuationPacing {
                         min_gap: Duration::from_secs(gap),
                         idle_per_work: 0,
-                    }
+                    },
+                    false,
                 ));
             });
             crate::scan_clock::with_clock(1000, || {
@@ -1744,6 +1745,7 @@ fn paced_shed_wake_obeys_both_deadlines_and_source_errors_do_not_spin() {
                         min_gap: Duration::from_secs(gap),
                         idle_per_work: 0,
                     },
+                    false,
                 );
             });
             defer_source_uploads(source, Duration::from_secs(backoff));

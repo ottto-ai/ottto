@@ -156,7 +156,7 @@ fn drain_from(
                 let now = crate::scan_clock::now();
                 with_source_cadence(source, |cadence| {
                     cadence.record_scan_success(now, 1);
-                    cadence.request_paced_scan(now, Duration::ZERO, continuation::PACED_AC);
+                    cadence.request_paced_scan(now, Duration::ZERO, continuation::PACED_AC, false);
                 });
                 let before = progress.accepted_body_witnesses.clone();
                 let (status, _, _) = upload(&sent, &mut progress, |_| {

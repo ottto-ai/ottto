@@ -758,6 +758,7 @@ fn bounded_retry_live_wait_sends_without_scan_and_preserves_ordinary_deadline_an
                 due - Duration::from_secs(30),
                 Duration::ZERO,
                 continuation::PACED_AC,
+                false,
             );
         });
         source_upload_deadlines().lock().unwrap().insert("pi", due);
