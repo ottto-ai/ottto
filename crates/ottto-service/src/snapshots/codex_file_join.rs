@@ -4829,33 +4829,28 @@ pub(super) mod tests {
         assert!(inventory_hold(&charged_index).is_none());
         let ((_, control), control_bytes) = observe_consumed(|| scan(&root, previous.clone(), 4));
         assert!(!control.snapshots.is_empty());
-        let (held_index, held) = scan_with_inventory(&root, previous.clone(), incomplete);
-        assert!(held.snapshots.is_empty());
-        assert_eq!(
-            (
-                held.ownership_incomplete_file_count,
-                held.unreadable_path_count
-            ),
-            (0, 0)
-        );
-        assert_eq!(
-            inventory_hold(&held_index).map(|hold| &hold.owed),
-            Some(&members)
-        );
-        let (again_index, again) = scan_with_inventory(&root, held_index, incomplete);
-        assert!(again.snapshots.is_empty());
-        assert_eq!(
-            (
-                again.ownership_incomplete_file_count,
-                again.unreadable_path_count
-            ),
-            (0, 0)
-        );
-        assert_eq!(
-            inventory_hold(&again_index).map(|hold| &hold.owed),
-            Some(&members)
-        );
-        let ((index, released), released_bytes) = observe_consumed(|| scan(&root, again_index, 4));
+        // The hold, then a re-hold of the held store: each owes every member
+        // and adds no count.
+        let mut held_index = previous.clone();
+        for round in ["held", "re-held"] {
+            let (index, held) = scan_with_inventory(&root, held_index, incomplete);
+            assert!(held.snapshots.is_empty(), "{round}");
+            assert_eq!(
+                (
+                    held.ownership_incomplete_file_count,
+                    held.unreadable_path_count
+                ),
+                (0, 0),
+                "{round}"
+            );
+            assert_eq!(
+                inventory_hold(&index).map(|hold| &hold.owed),
+                Some(&members),
+                "{round}"
+            );
+            held_index = index;
+        }
+        let ((index, released), released_bytes) = observe_consumed(|| scan(&root, held_index, 4));
         assert_eq!(totals(&released), totals(&control));
         assert_eq!(
             (released.scanned_file_count, released_bytes),
