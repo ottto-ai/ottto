@@ -143,6 +143,7 @@ fn cached_source_health(state: &DaemonState, source: SourceKind) -> SourceHealth
         plan_observations: Vec::new(),
         detected_uses: Vec::new(),
         active_session_reconciliation: None,
+        collection: None,
         tracking_confirmation: None,
         last_seen_at: None,
         last_verified_at: None,
@@ -193,6 +194,7 @@ pub(crate) fn load_source_state(state: &mut DaemonState, dir: &Path) {
 
 fn normalize_persisted_source_health(state: &DaemonState, health: &mut SourceHealth) {
     health.tracking_confirmation = None;
+    health.collection = None;
     health.descriptor = source_descriptor(&health.source);
     health.account_binding.expected_account_id =
         state.account.user.as_ref().map(|user| user.id.clone());
@@ -481,6 +483,7 @@ pub(crate) fn source_health_from_agent_status(
         plan_observations: snapshot.plan_observations.clone(),
         detected_uses,
         active_session_reconciliation: None,
+        collection: None,
         tracking_confirmation: None,
         last_seen_at: Some(snapshot.captured_at.clone()),
         last_verified_at: None,

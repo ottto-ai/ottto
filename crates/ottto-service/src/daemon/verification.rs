@@ -724,6 +724,7 @@ fn source_health_from_verification(
         plan_observations: Vec::new(),
         detected_uses,
         active_session_reconciliation: None,
+        collection: None,
         tracking_confirmation: None,
         last_seen_at: result.last_received_at.clone(),
         last_verified_at: if result.source == SourceKind::Codex

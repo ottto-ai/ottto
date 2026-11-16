@@ -232,15 +232,20 @@ pub(crate) fn status_from_state_with_relay_finding(
         // Read here only; row builders leave it false, so no row goes stale.
         let marker = snapshot_sync::source_marker(&default_support_dir(), source);
         health.source_paused = marker.as_deref().is_some_and(|value| value != "reconnect");
-        health.tracking_confirmation = state.tracking_confirmation.project(
-            &health.source,
-            state
-                .registered_source_grants
-                .iter()
-                .any(|slug| slug == source.api_slug())
-                && marker.is_none()
-                && health.state != SourceState::NotFound
-                && state.reconciliation_enabled(&health.source) != Some(false),
+        let applicable = state
+            .registered_source_grants
+            .iter()
+            .any(|slug| slug == source.api_slug())
+            && marker.is_none()
+            && health.state != SourceState::NotFound
+            && state.reconciliation_enabled(&health.source) != Some(false);
+        health.tracking_confirmation = state
+            .tracking_confirmation
+            .project(&health.source, applicable);
+        health.collection = snapshot_sync::collection_health(
+            source,
+            applicable && state.tracking_confirmation.policy_allows(&health.source),
+            &status.generated_at,
         );
     }
     status.local_health_events = state.local_health_events.clone();

@@ -275,6 +275,13 @@ impl DaemonState {
         self.source_first_seen.clear();
         self.source_reconciliation.clear();
         self.tracking_confirmation.clear_all();
+        for source in [
+            snapshots::SnapshotSource::ClaudeCode,
+            snapshots::SnapshotSource::Codex,
+            snapshots::SnapshotSource::Pi,
+        ] {
+            snapshot_sync::reset_collection_health(source);
+        }
         self.registered_source_grants.clear();
     }
 }
@@ -473,6 +480,15 @@ impl LocalDaemon {
         state
             .source_reconciliation
             .insert(source_slug(&source).to_string(), enabled);
+        let policy_enabled = enabled && receipt_window_days > 0;
+        let snapshot_source = snapshot_sync::snapshot_source_of_kind(&source);
+        if !policy_enabled || !state.tracking_confirmation.policy_allows(&source) {
+            // A cycle offered while policy-stopped cannot supply the resume baseline.
+            snapshot_sync::reset_collection_health(snapshot_source);
+        }
+        if policy_enabled {
+            snapshot_sync::start_collection_health(snapshot_source);
+        }
         if state
             .tracking_confirmation
             .record_policy(&source, receipt_window_days, enabled)

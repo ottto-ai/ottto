@@ -21,6 +21,7 @@ pub mod codex_prelude_footprint;
 mod codex_process_homes;
 mod codex_scan_diagnostics;
 pub mod codex_sign_in;
+mod collection_health;
 pub(crate) mod command_env;
 mod composition_kinds;
 pub mod context_composition;

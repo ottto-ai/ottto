@@ -83,6 +83,7 @@ struct ContinuationRequest {
 
 #[derive(Debug, Clone)]
 pub struct SourceCadence {
+    pub(crate) collection: Option<crate::collection_health::Pulse>,
     config: CadenceConfig,
     state: LocalCollectorState,
     last_activity_at: Option<Instant>,
@@ -98,6 +99,7 @@ pub struct SourceCadence {
 impl SourceCadence {
     pub fn new(config: CadenceConfig) -> Self {
         Self {
+            collection: None,
             config,
             state: LocalCollectorState::Cold,
             last_activity_at: None,

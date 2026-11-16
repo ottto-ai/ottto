@@ -4046,6 +4046,93 @@ mod tests {
         use super::*;
 
         #[test]
+        fn collection_status_requires_eligibility_and_resets_after_pause_and_both_policy_stops() {
+            if !crate::test_isolation::run_here() {
+                return;
+            }
+            use crate::scan_clock::with_clock;
+            use ottto_protocol::SourceCollectionState::{Collecting, Stalled};
+            let root = crate::test_scratch::private_dir("collection-status");
+            let _support = TestEnvVar::set("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
+            let daemon = daemon();
+            for source in [SourceKind::ClaudeCode, SourceKind::Codex, SourceKind::Pi] {
+                let scan_source = snapshot_sync::snapshot_source_of_kind(&source);
+                let slug = source_slug(&source).to_string();
+                {
+                    let mut state = daemon.state().unwrap();
+                    let mut health = codex_health();
+                    health.source = source.clone();
+                    health.state = SourceState::Healthy;
+                    health.config.discovered = false; // Installation is distinct from config.
+                    state.sources = vec![health];
+                    state.registered_source_grants = vec![slug.clone()];
+                }
+                let status = || {
+                    status_from_state_with_relay_finding(&mut daemon.state().unwrap(), None)
+                        .sources
+                        .remove(0)
+                };
+                with_clock(0, || {
+                    snapshot_sync::reset_collection_health(scan_source);
+                    assert!(
+                        status().collection.is_none(),
+                        "eligible but no scan offered"
+                    );
+                    snapshot_sync::start_collection_health(scan_source);
+                    assert_eq!(status().collection.unwrap().state, Collecting);
+                    assert!(
+                        daemon.state().unwrap().sources[0].collection.is_none(),
+                        "response only"
+                    );
+                    daemon.state().unwrap().registered_source_grants.clear();
+                    assert!(status().collection.is_none());
+                    daemon.state().unwrap().registered_source_grants = vec![slug.clone()];
+                    snapshot_sync::start_collection_health(scan_source);
+                    daemon.state().unwrap().sources[0].state = SourceState::NotFound;
+                    assert!(status().collection.is_none());
+                    daemon.state().unwrap().sources[0].state = SourceState::Healthy;
+                    snapshot_sync::start_collection_health(scan_source);
+                    snapshot_sync::disable_snapshot_source(&root, scan_source).unwrap();
+                    assert!(status().collection.is_none());
+                    // Model a positive prepare hint that was already in flight at pause.
+                    daemon
+                        .record_reconciliation_enabled(source.clone(), true, 30)
+                        .unwrap();
+                });
+                with_clock(7200, || {
+                    snapshot_sync::reconnect_snapshot_source(&root, scan_source).unwrap();
+                    snapshot_sync::resume_reconnected_sources(&root);
+                    assert!(status().collection.is_none());
+                    snapshot_sync::start_collection_health(scan_source);
+                    assert_eq!(status().collection.unwrap().state, Collecting);
+                });
+                for (window, enabled) in [(0, true), (30, false)] {
+                    with_clock(11000, || {
+                        assert_eq!(status().collection.unwrap().state, Stalled)
+                    });
+                    daemon
+                        .record_reconciliation_enabled(source.clone(), enabled, window)
+                        .unwrap();
+                    assert!(status().collection.is_none());
+                    // A later cycle can offer a source before learning its positive hint.
+                    snapshot_sync::start_collection_health(scan_source);
+                    with_clock(20000, || {
+                        daemon
+                            .record_reconciliation_enabled(source.clone(), true, 30)
+                            .unwrap();
+                        assert_eq!(status().collection.unwrap().state, Collecting);
+                    });
+                    // Start the next scenario from the same epoch without intentional stop time.
+                    with_clock(7200, || {
+                        snapshot_sync::reset_collection_health(scan_source);
+                        snapshot_sync::start_collection_health(scan_source);
+                    });
+                }
+            }
+            std::fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
         #[serial]
         fn tracking_status_omits_inapplicable_episodes_without_mutating_saved_state() {
             let root = crate::test_scratch::private_dir("tracking-status-applicability");
@@ -4275,6 +4362,7 @@ mod tests {
             plan_observations: Vec::new(),
             detected_uses: Vec::new(),
             active_session_reconciliation: None,
+            collection: None,
             tracking_confirmation: None,
             last_seen_at: Some("2026-05-05T09:09:00Z".to_string()),
             last_verified_at: Some("2026-05-05T09:09:30Z".to_string()),
