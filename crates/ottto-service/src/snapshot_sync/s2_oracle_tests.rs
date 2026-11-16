@@ -1579,6 +1579,24 @@ fn current_again_quarantines_retry_root_and_subagent_without_changing_money() {
 
 mod family_census_tests;
 
+// Direct scan fixtures walk the live Claude identity census. These small
+// files each fit in its one 4 KiB head sample. Compute the exact permitted
+// anchor bytes from fixture lengths BEFORE observing the scan; parser/body
+// bytes and every other I/O class remain forbidden by the shared oracle.
+fn owner_return_anchor_window(c: &Corpus) -> u64 {
+    c.births
+        .keys()
+        .map(|path| match std::fs::metadata(path) {
+            Ok(metadata) => {
+                assert!(metadata.len() <= 4096);
+                metadata.len()
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => panic!("synthetic identity metadata: {error}"),
+        })
+        .sum()
+}
+
 /// [money] A fresh claim selects the original published custody after two other
 /// owners. The ordinary native scan and stored Tail conserve a real two-account
 /// fixture, including a switch, side call, evidence gap and tagged shares.
@@ -1654,17 +1672,10 @@ fn owner_return_keeps_the_placement_oracle_and_quiet_restart() {
         money_oracle::assert_equivalent(&cold, &uninterrupted);
         money_oracle::assert_equivalent(&cold, &returned);
         let saved = commit(&session, returned_page);
+        let anchor_window = owner_return_anchor_window(&c);
         let (quiet, io) = fixture::observe_codex_quiet(|| page(&c, saved, 100, true));
         let mut quiet_route = result(&quiet, Mode::Restart);
         quiet_route.io = io;
-        let anchor_window = quiet_route
-            .io
-            .anchor_reads
-            .expect("measured identity anchors");
-        assert!(
-            anchor_window <= 4096 * c.births.len() as u64,
-            "bounded fixture identity samples"
-        );
         money_oracle::assert_quiet_restart_with_anchor_window(&quiet_route, anchor_window);
     });
 }
@@ -1817,17 +1828,13 @@ fn owner_return_keeps_deleted_original_copy_custody() {
         }
         let restored = ScanIndex::load(&index_path).unwrap();
         assert_eq!(stored_bodies(&restored), stored);
+        let anchor_window = owner_return_anchor_window(&c);
         let (quiet, io) = fixture::observe_codex_quiet(|| {
             ready(&c, &E2ScanFixture::default(), restored, 100, true)
         });
         let mut observed = result(&quiet, Mode::Restart);
         observed.io = io;
         observed.accepted = prior_money.accepted.clone();
-        let anchor_window = observed.io.anchor_reads.expect("measured identity anchors");
-        assert!(
-            anchor_window <= 4096 * c.births.len() as u64,
-            "bounded fixture identity samples"
-        );
         money_oracle::assert_quiet_restart_with_anchor_window(&observed, anchor_window);
         money_oracle::assert_held(COPY, &prior_money, &observed, &prior_money);
         money_oracle::assert_no_smaller_reemit(COPY, &prior_money, &observed, &prior_money, true);
