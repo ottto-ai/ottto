@@ -12899,8 +12899,16 @@ pub(crate) fn snapshot_namespace_has_store(support: &Path, namespace: &str) -> R
         if !relevant {
             continue;
         }
+        if name.contains(".json.corrupt") {
+            anyhow::bail!("uncertain snapshot namespace custody");
+        }
+        let sharded = name.ends_with(".json.shards") || name.ends_with(".json.v1-readonly.shards");
         let checkpoint = name
-            .strip_suffix(".v2.sqlite.import")
+            .strip_suffix(".v1-readonly.shards")
+            .or_else(|| name.strip_suffix(".shards"))
+            .or_else(|| name.strip_suffix(".v1-readonly"))
+            .or_else(|| name.strip_suffix(".v2-ack-receipt"))
+            .or_else(|| name.strip_suffix(".v2.sqlite.import"))
             .or_else(|| name.strip_suffix(".v2.sqlite"))
             .unwrap_or(name);
         if checkpoint.ends_with(".json")
@@ -12910,13 +12918,19 @@ pub(crate) fn snapshot_namespace_has_store(support: &Path, namespace: &str) -> R
         {
             let metadata = std::fs::symlink_metadata(entry.path())
                 .context("inspect snapshot namespace custody")?;
-            anyhow::ensure!(metadata.is_file(), "uncertain snapshot namespace custody");
+            anyhow::ensure!(
+                (sharded && metadata.is_dir()) || (!sharded && metadata.is_file()),
+                "uncertain snapshot namespace custody"
+            );
             present = true;
         }
     }
     Ok(present)
 }
 
+/// One destination-scoped index is shared by every privacy policy. A policy
+/// change applies to bodies acquired from then on; exact entity proofs retain
+/// their original upload context.
 fn snapshot_index_path(support_dir: &Path, source: SnapshotSource) -> PathBuf {
     support_dir
         .join("snapshots")
@@ -13500,6 +13514,10 @@ mod tests {
         std::fs::write(other.join("codex-scan-index-v3.json"), b"{}").unwrap();
         assert!(!snapshot_namespace_has_store(&root, &ns).unwrap());
         std::fs::create_dir_all(&selected).unwrap();
+        assert!(
+            !snapshot_namespace_has_store(&root, &ns).unwrap(),
+            "empty directory"
+        );
         for (name, expected) in [
             ("codex-scan-index-v3.json", true),
             ("codex-scan-index-v3.json.v2.sqlite", true),
@@ -13523,6 +13541,13 @@ mod tests {
             );
             std::fs::remove_file(path).unwrap();
         }
+        let shards = selected.join("codex-scan-index-v3.json.shards");
+        std::fs::create_dir(&shards).unwrap();
+        assert!(
+            snapshot_namespace_has_store(&root, &ns).unwrap(),
+            "root-lost shards retain custody"
+        );
+        std::fs::remove_dir(shards).unwrap();
         std::fs::write(selected.join("pi-scan-index-v3.json"), b"{}").unwrap();
         assert!(
             snapshot_namespace_has_store(&root, &ns).unwrap(),

@@ -1574,8 +1574,10 @@ fn first_read_byte_pacing_stops_when_backfill_completes() {
         );
     });
     state
-        .completed_replay_revisions
-        .insert("codex".into(), "codex_replay:v0".into());
+        .completed_destination_replays
+        .get_mut("codex")
+        .unwrap()
+        .insert(DESTINATION.into(), "codex_replay:v0".into());
     assert!(backfill_replay_pending(codex, &state, DESTINATION));
     assert!(!bootstrap(&state), "a pending replay revision");
     std::fs::remove_dir_all(home).unwrap();

@@ -903,6 +903,7 @@ mod tests {
             // A legacy completion with no destination binding is conservative too.
             update_backfill_state(&dir, |state| {
                 state.completed_destination_namespaces.clear();
+                state.completed_destination_replays.clear();
             })
             .unwrap();
             assert_eq!(

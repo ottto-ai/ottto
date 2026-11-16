@@ -358,7 +358,8 @@ fn owner_return_preserves_all_source_carry() {
                 setup_snapshot_index: None,
             };
             let client = SnapshotApiClient::new(server.url.clone());
-            let daemon = test_daemon("machine_test");
+            let daemon = test_daemon("machine_test")
+                .with_account(ottto_core::FileAccountStore::default().load().unwrap());
             let mut transport = crate::net_resilience::TransportCycleOutcome::default();
             with_scan_clock(now, || {
                 observe_consumed(|| {
