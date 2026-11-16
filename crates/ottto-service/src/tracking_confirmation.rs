@@ -133,9 +133,9 @@ pub(crate) fn parsed_activity_witness(
     since: Option<OffsetDateTime>,
     new: OffsetDateTime,
     previous: Option<OffsetDateTime>,
-    ceiling: OffsetDateTime,
+    within_ceiling: bool,
 ) -> Option<OffsetDateTime> {
-    (since.is_some_and(|since| new > since) && new <= ceiling && previous != Some(new))
+    (since.is_some_and(|since| new > since) && within_ceiling && previous != Some(new))
         .then_some(new)
 }
 
@@ -256,14 +256,14 @@ mod tests {
             let since = parse(SINCE);
             let after = parse(AFTER).unwrap();
             assert_eq!(
-                parsed_activity_witness(since, since.unwrap(), None, after),
+                parsed_activity_witness(since, since.unwrap(), None, true),
                 None
             );
             assert_eq!(
-                parsed_activity_witness(since, parse("2026-11-16T10:00:00Z").unwrap(), None, after),
+                parsed_activity_witness(since, parse("2026-11-16T10:00:00Z").unwrap(), None, false),
                 None
             );
-            let witness = parsed_activity_witness(since, after, None, after).unwrap();
+            let witness = parsed_activity_witness(since, after, None, true).unwrap();
             assert_eq!(witness, after);
             assert!(episodes.confirm(&source, generation, &witness.format(&Rfc3339).unwrap()));
             assert!(!episodes.confirm(&source, generation, "2026-11-15T10:02:00Z"));

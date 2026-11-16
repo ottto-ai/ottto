@@ -1,5 +1,5 @@
 //! Synthetic counting transitions at the selected local ACK boundary.
-use crate::snapshots::codex_counting_version::{self, AckEvidence, CountingVersion};
+use crate::snapshots::sources::codex::counting::version::{self, AckEvidence, CountingVersion};
 use crate::snapshots::*;
 use serde_json::json;
 
@@ -80,7 +80,7 @@ fn acked_original(v2: bool, old_binding: bool) -> Acked {
             acked_entry(false, Some(codex_protected_owner(SESSION))),
         );
     }
-    let _cutover = codex_counting_version::TestCutover::set(CUTOVER);
+    let _cutover = version::TestCutover::set(CUTOVER);
     let mut result = scan(&root, &mut previous);
     assert_eq!(result.snapshots.len(), 1);
     finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut previous);
@@ -129,7 +129,7 @@ fn parse_archived_at(
         .join("archived_sessions")
         .join(acked.original.file_name().unwrap());
     write(&archived, &rows(200));
-    let _cutover = codex_counting_version::TestCutover::set(CUTOVER);
+    let _cutover = version::TestCutover::set(CUTOVER);
     let mut working = previous.clone();
     let mut result = scan_at(&acked.root, &mut working, collected_at);
     assert_eq!(result.snapshots.len(), 1, "archive is fully parsed");
@@ -235,7 +235,7 @@ fn pruned_moved_session(v2: bool, old_binding: bool) {
             .join(acked.original.file_name().unwrap()),
     );
     assert!(loaded.codex_counting_tombstones.contains_key(&owner));
-    codex_counting_version::prepare_moved_evidence(
+    version::prepare_moved_evidence(
         &mut loaded,
         &BTreeMap::from([(archived_key, owner.clone())]),
         true,
@@ -261,14 +261,14 @@ fn moved_bound_legacy_ack_survives_archive_changed_body_and_reload() {
 
 #[test]
 fn cutover_equality_and_marked_pre_cutover_root() {
-    let _cutover = codex_counting_version::TestCutover::set(CUTOVER);
+    let _cutover = version::TestCutover::set(CUTOVER);
     for evidence in [AckEvidence::None, AckEvidence::V2Marked] {
         assert_eq!(
-            codex_counting_version::decide(&header("2026-09-21T14:13:20Z"), evidence, CUTOVER),
+            version::decide(&header("2026-09-21T14:13:20Z"), evidence, CUTOVER),
             CountingVersion::V2
         );
         assert_eq!(
-            codex_counting_version::decide(&header("2026-09-21T14:13:19.999Z"), evidence, CUTOVER),
+            version::decide(&header("2026-09-21T14:13:19.999Z"), evidence, CUTOVER),
             CountingVersion::Legacy
         );
     }
@@ -276,17 +276,17 @@ fn cutover_equality_and_marked_pre_cutover_root() {
 
 #[test]
 fn fork_marker_selection_is_separate_from_owned_header_admission() {
-    let _cutover = codex_counting_version::TestCutover::set(CUTOVER);
+    let _cutover = version::TestCutover::set(CUTOVER);
     let mut fork = header(POST);
     fork["payload"]["forked_from_id"] = json!("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee");
     // The selector alone ignores forked_from_id; history_base is its explicit
     // continuation fence. Legacy user forks admit that header through AllLocal.
     assert_eq!(
-        codex_counting_version::decide(&fork, AckEvidence::None, CUTOVER),
+        version::decide(&fork, AckEvidence::None, CUTOVER),
         CountingVersion::V2
     );
     let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
-    codex_counting_version::configure(&mut accumulator, AckEvidence::None, Some(CUTOVER));
+    version::configure(&mut accumulator, AckEvidence::None, Some(CUTOVER));
     apply_codex_line(&fork, &mut accumulator);
     assert!(
         accumulator.codex_counting_v2(),
@@ -294,11 +294,11 @@ fn fork_marker_selection_is_separate_from_owned_header_admission() {
     );
     fork["payload"]["history_base"] = json!({"id":"parent"});
     assert_eq!(
-        codex_counting_version::decide(&fork, AckEvidence::V2Marked, CUTOVER),
+        version::decide(&fork, AckEvidence::V2Marked, CUTOVER),
         CountingVersion::Legacy
     );
     let mut paginated = SnapshotAccumulator::new(SnapshotSource::Codex);
-    codex_counting_version::configure(&mut paginated, AckEvidence::None, Some(CUTOVER));
+    version::configure(&mut paginated, AckEvidence::None, Some(CUTOVER));
     apply_codex_line(&fork, &mut paginated);
     assert!(
         !paginated.codex_counting_v2(),
@@ -308,7 +308,7 @@ fn fork_marker_selection_is_separate_from_owned_header_admission() {
 
 #[test]
 fn moved_evidence_is_shared_by_group_cursor_and_retained_restore() {
-    let _cutover = codex_counting_version::TestCutover::set(CUTOVER);
+    let _cutover = version::TestCutover::set(CUTOVER);
     let path = PathBuf::from("/synthetic/archived_sessions/current.jsonl");
     let candidate = CandidateFile {
         physical_identity: None,
@@ -336,9 +336,9 @@ fn moved_evidence_is_shared_by_group_cursor_and_retained_restore() {
     }))
     .unwrap();
     index.files.insert(old_key.clone(), old.clone());
-    codex_counting_version::prepare_moved_evidence(&mut index, &owners, false);
+    version::prepare_moved_evidence(&mut index, &owners, false);
     assert_eq!(
-        codex_counting_version::members_evidence([&candidate], &index),
+        version::members_evidence([&candidate], &index),
         AckEvidence::None,
         "a filename cannot transfer a different proven owner's mark"
     );
@@ -346,43 +346,30 @@ fn moved_evidence_is_shared_by_group_cursor_and_retained_restore() {
     // conservative Legacy hint, including when a V2 mark survives there.
     old.codex_counting_owner = None;
     index.files.insert(old_key.clone(), old.clone());
-    codex_counting_version::prepare_moved_evidence(&mut index, &owners, false);
-    let singleton = codex_counting_version::singleton_view(&candidate, &index);
-    assert_eq!(
-        singleton,
-        codex_counting_version::group_view([&candidate], &index)
-    );
-    assert_eq!(
-        singleton,
-        codex_counting_version::view(AckEvidence::LegacyAcked, CUTOVER)
-    );
+    version::prepare_moved_evidence(&mut index, &owners, false);
+    let singleton = version::singleton_view(&candidate, &index);
+    assert_eq!(singleton, version::group_view([&candidate], &index));
+    assert_eq!(singleton, version::view(AckEvidence::LegacyAcked, CUTOVER));
     let mut restored = SnapshotAccumulator::new(SnapshotSource::Codex);
-    codex_counting_version::configure(&mut restored, AckEvidence::None, Some(CUTOVER));
+    version::configure(&mut restored, AckEvidence::None, Some(CUTOVER));
     apply_codex_line(&header(POST), &mut restored);
     assert!(restored.codex_counting_v2());
-    assert!(!codex_counting_version::reusable_under_view(
-        &restored, &singleton
-    ));
+    assert!(!version::reusable_under_view(&restored, &singleton));
     old.codex_counting_owner = Some(codex_protected_owner(SESSION).into_boxed_str());
     index.files.insert(old_key, old);
-    codex_counting_version::prepare_moved_evidence(&mut index, &owners, false);
-    let singleton = codex_counting_version::singleton_view(&candidate, &index);
-    assert_eq!(
-        singleton,
-        codex_counting_version::group_view([&candidate], &index)
-    );
-    assert!(codex_counting_version::reusable_under_view(
-        &restored, &singleton
-    ));
+    version::prepare_moved_evidence(&mut index, &owners, false);
+    let singleton = version::singleton_view(&candidate, &index);
+    assert_eq!(singleton, version::group_view([&candidate], &index));
+    assert!(version::reusable_under_view(&restored, &singleton));
     // A second, proven same-session Legacy ACK outranks the V2 mark.
     let mut legacy = index.files.values().next().unwrap().clone();
     legacy.codex_counting_v2 = false;
     index
         .files
         .insert("/synthetic/missing/member.jsonl".into(), legacy);
-    codex_counting_version::prepare_moved_evidence(&mut index, &owners, false);
+    version::prepare_moved_evidence(&mut index, &owners, false);
     assert_eq!(
-        codex_counting_version::members_evidence([&candidate], &index),
+        version::members_evidence([&candidate], &index),
         AckEvidence::LegacyAcked
     );
 }
@@ -420,7 +407,7 @@ fn acked_entry(v2: bool, owner: Option<String>) -> ScanIndexEntry {
 
 #[test]
 fn pruned_old_entry_keeps_cursor_and_group_counting_views() {
-    let _cutover = codex_counting_version::TestCutover::set(CUTOVER);
+    let _cutover = version::TestCutover::set(CUTOVER);
     let candidate = archived_candidate();
     let owners = BTreeMap::from([(
         local_index_key(&candidate.path),
@@ -435,25 +422,17 @@ fn pruned_old_entry_keeps_cursor_and_group_counting_views() {
         let mut index = ScanIndex::default();
         let owner = bound.then(|| codex_protected_owner(SESSION));
         index.files.insert(old_key.clone(), acked_entry(v2, owner));
-        codex_counting_version::prepare_moved_evidence(&mut index, &owners, true);
-        let singleton = codex_counting_version::singleton_view(&candidate, &index);
-        let group = codex_counting_version::group_view([&candidate], &index);
-        assert_eq!(singleton, codex_counting_version::view(expected, CUTOVER));
-        assert!(codex_counting_version::tombstone_before_retire(
-            &mut index, &old_key
-        ));
+        version::prepare_moved_evidence(&mut index, &owners, true);
+        let singleton = version::singleton_view(&candidate, &index);
+        let group = version::group_view([&candidate], &index);
+        assert_eq!(singleton, version::view(expected, CUTOVER));
+        assert!(version::tombstone_before_retire(&mut index, &old_key));
         index.remove_file_entry(&old_key);
         assert!(index.files.is_empty());
         // The paused job's next page sees the same view, so reuse holds.
-        codex_counting_version::prepare_moved_evidence(&mut index, &owners, true);
-        assert_eq!(
-            codex_counting_version::singleton_view(&candidate, &index),
-            singleton
-        );
-        assert_eq!(
-            codex_counting_version::group_view([&candidate], &index),
-            group
-        );
+        version::prepare_moved_evidence(&mut index, &owners, true);
+        assert_eq!(version::singleton_view(&candidate, &index), singleton);
+        assert_eq!(version::group_view([&candidate], &index), group);
     }
 }
 
@@ -461,7 +440,7 @@ fn pruned_old_entry_keeps_cursor_and_group_counting_views() {
 fn counting_tombstones_are_bounded_and_protect_current_generation_legacy_evidence() {
     // Written and collected whatever the cutover.
     let legacy = |n: usize| (format!("{n:064x}"), AckEvidence::LegacyAcked);
-    let tombstone = |evidence| codex_counting_version::CountingTombstone {
+    let tombstone = |evidence| version::CountingTombstone {
         evidence,
         retired_in: "g1".into(),
         created_unix_ms: None,
@@ -476,7 +455,7 @@ fn counting_tombstones_are_bounded_and_protect_current_generation_legacy_evidenc
             }))
             .unwrap(),
         ),
-        codex_counting_tombstones: (0..codex_counting_version::MAX_COUNTING_TOMBSTONES)
+        codex_counting_tombstones: (0..version::MAX_COUNTING_TOMBSTONES)
             .map(legacy)
             .map(|(owner, evidence)| (owner, tombstone(evidence)))
             .collect(),
@@ -488,17 +467,13 @@ fn counting_tombstones_are_bounded_and_protect_current_generation_legacy_evidenc
     index
         .files
         .insert(key.clone(), acked_entry(false, Some(owner.clone())));
-    assert!(!codex_counting_version::tombstone_before_retire(
-        &mut index, &key
-    ));
+    assert!(!version::tombstone_before_retire(&mut index, &key));
     assert!(!index.codex_counting_tombstones.contains_key(&owner));
     // V2-only evidence retires without a slot; it never selects a version.
     index
         .files
         .insert(key.clone(), acked_entry(true, Some(owner.clone())));
-    assert!(codex_counting_version::tombstone_before_retire(
-        &mut index, &key
-    ));
+    assert!(version::tombstone_before_retire(&mut index, &key));
     assert!(!index.codex_counting_tombstones.contains_key(&owner));
     // A V2-only tombstone gives its slot to Legacy evidence.
     let v2_owner = legacy(0).0;
@@ -510,9 +485,7 @@ fn counting_tombstones_are_bounded_and_protect_current_generation_legacy_evidenc
     index
         .files
         .insert(key.clone(), acked_entry(false, Some(owner.clone())));
-    assert!(codex_counting_version::tombstone_before_retire(
-        &mut index, &key
-    ));
+    assert!(version::tombstone_before_retire(&mut index, &key));
     assert!(!index.codex_counting_tombstones.contains_key(&v2_owner));
     assert_eq!(
         index.codex_counting_tombstones[&owner].evidence,
@@ -520,7 +493,7 @@ fn counting_tombstones_are_bounded_and_protect_current_generation_legacy_evidenc
     );
     assert_eq!(
         index.codex_counting_tombstones.len(),
-        codex_counting_version::MAX_COUNTING_TOMBSTONES
+        version::MAX_COUNTING_TOMBSTONES
     );
     // In a later generation, the oldest earlier-generation Legacy evidence
     // gives its slot; this generation's never does.
@@ -529,9 +502,7 @@ fn counting_tombstones_are_bounded_and_protect_current_generation_legacy_evidenc
     index
         .files
         .insert(key.clone(), acked_entry(false, Some(later_owner.clone())));
-    assert!(codex_counting_version::tombstone_before_retire(
-        &mut index, &key
-    ));
+    assert!(version::tombstone_before_retire(&mut index, &key));
     assert!(!index.codex_counting_tombstones.contains_key(&legacy(1).0));
     assert_eq!(
         index.codex_counting_tombstones[&later_owner].retired_in,
@@ -539,20 +510,20 @@ fn counting_tombstones_are_bounded_and_protect_current_generation_legacy_evidenc
     );
     assert_eq!(
         index.codex_counting_tombstones.len(),
-        codex_counting_version::MAX_COUNTING_TOMBSTONES
+        version::MAX_COUNTING_TOMBSTONES
     );
     index.files.clear();
 
     // Absence frees a slot only in a complete inventory of a later traversal
     // generation than the retiring one.
     let present = BTreeMap::from([("/synthetic/p.jsonl".to_owned(), legacy(2).0)]);
-    codex_counting_version::prepare_moved_evidence(&mut index, &present, false);
+    version::prepare_moved_evidence(&mut index, &present, false);
     assert_eq!(
         index.codex_counting_tombstones.len(),
-        codex_counting_version::MAX_COUNTING_TOMBSTONES,
+        version::MAX_COUNTING_TOMBSTONES,
         "an incomplete inventory proves nothing absent"
     );
-    codex_counting_version::prepare_moved_evidence(&mut index, &present, true);
+    version::prepare_moved_evidence(&mut index, &present, true);
     assert_eq!(
         index
             .codex_counting_tombstones
@@ -566,7 +537,7 @@ fn counting_tombstones_are_bounded_and_protect_current_generation_legacy_evidenc
     index
         .files
         .insert(key.clone(), acked_entry(true, Some(legacy(2).0)));
-    codex_counting_version::prepare_moved_evidence(&mut index, &present, true);
+    version::prepare_moved_evidence(&mut index, &present, true);
     assert_eq!(
         index.codex_counting_tombstones.len(),
         2,
@@ -579,7 +550,7 @@ fn counting_tombstones_are_bounded_and_protect_current_generation_legacy_evidenc
         "/synthetic/l.jsonl".into(),
         acked_entry(false, Some(later_owner)),
     );
-    codex_counting_version::prepare_moved_evidence(&mut index, &present, true);
+    version::prepare_moved_evidence(&mut index, &present, true);
     assert!(index.codex_counting_tombstones.is_empty());
     // Persisted beside the entries; absent when empty.
     index
@@ -594,7 +565,7 @@ fn counting_tombstones_are_bounded_and_protect_current_generation_legacy_evidenc
 
 #[test]
 fn invalid_counting_binding_never_masks_a_valid_owner() {
-    let _cutover = codex_counting_version::TestCutover::set(CUTOVER);
+    let _cutover = version::TestCutover::set(CUTOVER);
     let candidate = archived_candidate();
     let owners = BTreeMap::from([(
         local_index_key(&candidate.path),
@@ -608,9 +579,9 @@ fn invalid_counting_binding_never_masks_a_valid_owner() {
     index
         .files
         .insert("/synthetic/sessions/a.jsonl".into(), member);
-    codex_counting_version::prepare_moved_evidence(&mut index, &owners, false);
+    version::prepare_moved_evidence(&mut index, &owners, false);
     assert_eq!(
-        codex_counting_version::members_evidence([&candidate], &index),
+        version::members_evidence([&candidate], &index),
         AckEvidence::LegacyAcked
     );
 }
@@ -621,13 +592,13 @@ fn full_map_never_evicts_an_owner_the_retirement_rewrites() {
     let ids = codex_session_id_candidates_from_path(Path::new(&key));
     assert_eq!(ids.len(), 2, "legacy and modern filename identities");
     let rewritten = codex_protected_owner(&ids[0]);
-    let tombstone = |evidence| codex_counting_version::CountingTombstone {
+    let tombstone = |evidence| version::CountingTombstone {
         evidence,
         retired_in: String::new(),
         created_unix_ms: None,
     };
     let mut index = ScanIndex {
-        codex_counting_tombstones: (1..codex_counting_version::MAX_COUNTING_TOMBSTONES)
+        codex_counting_tombstones: (1..version::MAX_COUNTING_TOMBSTONES)
             .map(|n| (format!("{n:064x}"), tombstone(AckEvidence::LegacyAcked)))
             .chain([(rewritten.clone(), tombstone(AckEvidence::V2Marked))])
             .collect(),
@@ -636,12 +607,10 @@ fn full_map_never_evicts_an_owner_the_retirement_rewrites() {
     // Unbound: both identities become Legacy hints and one needs a slot. The
     // only V2-only slot belongs to an identity being rewritten, so none frees.
     index.files.insert(key.clone(), acked_entry(false, None));
-    assert!(!codex_counting_version::tombstone_before_retire(
-        &mut index, &key
-    ));
+    assert!(!version::tombstone_before_retire(&mut index, &key));
     assert_eq!(
         index.codex_counting_tombstones.len(),
-        codex_counting_version::MAX_COUNTING_TOMBSTONES
+        version::MAX_COUNTING_TOMBSTONES
     );
     assert_eq!(
         index.codex_counting_tombstones[&rewritten].evidence,
@@ -707,7 +676,7 @@ fn unavailable_known_root_cannot_collect_retired_owner_before_archive_reload() {
         write(&control, &control_rows);
         let mut working = retired.clone();
         let mut result = {
-            let _cutover = codex_counting_version::TestCutover::set(CUTOVER);
+            let _cutover = version::TestCutover::set(CUTOVER);
             scan(&acked.root, &mut working)
         };
         assert_eq!(result.snapshots.len(), 1, "available-root inventory ran");
@@ -734,15 +703,15 @@ fn unavailable_known_root_cannot_collect_retired_owner_before_archive_reload() {
 
 #[test]
 fn tombstone_overflow_prefers_safe_classes_then_oldest_known_creation() {
-    let _cutover = codex_counting_version::TestCutover::set(CUTOVER);
+    let _cutover = version::TestCutover::set(CUTOVER);
     let mut index = ScanIndex::default();
     retirement_generation(&mut index, "g2");
     let owner_at = |n: usize| format!("{n:064x}");
-    index.codex_counting_tombstones = (0..codex_counting_version::MAX_COUNTING_TOMBSTONES)
+    index.codex_counting_tombstones = (0..version::MAX_COUNTING_TOMBSTONES)
         .map(|n| {
             (
                 owner_at(n),
-                codex_counting_version::CountingTombstone {
+                version::CountingTombstone {
                     evidence: AckEvidence::LegacyAcked,
                     retired_in: "g1".into(),
                     created_unix_ms: None,
@@ -773,20 +742,18 @@ fn tombstone_overflow_prefers_safe_classes_then_oldest_known_creation() {
         index
             .files
             .insert(key.into(), acked_entry(false, Some(owner_at(n))));
-        assert!(codex_counting_version::tombstone_before_retire(
-            &mut index, key
-        ));
+        assert!(version::tombstone_before_retire(&mut index, key));
         assert!(!index.codex_counting_tombstones.contains_key(&evicted));
         assert_eq!(
             index.codex_counting_tombstones.len(),
-            codex_counting_version::MAX_COUNTING_TOMBSTONES
+            version::MAX_COUNTING_TOMBSTONES
         );
     }
     assert!(
         index.codex_counting_tombstones.contains_key(&owner_at(1)),
         "unknown creation retains Legacy evidence"
     );
-    let receipts = codex_counting_version::take_local_receipts(&mut index, None).unwrap();
+    let receipts = version::take_local_receipts(&mut index, None).unwrap();
     assert_eq!(receipts.tombstone_evictions_v2_only, 1);
     assert_eq!(receipts.tombstone_evictions_pre_cutover_legacy, 1);
     assert_eq!(
@@ -818,18 +785,14 @@ fn absence_collection_requires_healthy_scope_and_fresh_directory_witnesses() {
         &BTreeSet::new(),
         Some(&directories),
     );
-    assert!(codex_counting_version::absence_coverage_complete(
-        &index, &inventory
-    ));
+    assert!(version::absence_coverage_complete(&index, &inventory));
     index
         .traversal
         .as_mut()
         .unwrap()
         .counts
         .disappeared_file_count = 1;
-    assert!(!codex_counting_version::absence_coverage_complete(
-        &index, &inventory
-    ));
+    assert!(!version::absence_coverage_complete(&index, &inventory));
     index
         .traversal
         .as_mut()
@@ -837,14 +800,10 @@ fn absence_collection_requires_healthy_scope_and_fresh_directory_witnesses() {
         .counts
         .disappeared_file_count = 0;
     index.traversal.as_mut().unwrap().watcher_hint_seen = true;
-    assert!(!codex_counting_version::absence_coverage_complete(
-        &index, &inventory
-    ));
+    assert!(!version::absence_coverage_complete(&index, &inventory));
     index.traversal.as_mut().unwrap().watcher_hint_seen = false;
     fs::create_dir(acked.root.join("sessions/changed-membership")).unwrap();
-    assert!(!codex_counting_version::absence_coverage_complete(
-        &index, &inventory
-    ));
+    assert!(!version::absence_coverage_complete(&index, &inventory));
     fs::remove_dir_all(acked.root).unwrap();
 }
 
@@ -853,9 +812,7 @@ fn inventory_creation_timestamp_survives_tombstone_reload() {
     let acked = acked_original(false, true);
     let mut index = acked.previous.clone();
     let key = local_index_key(&acked.original);
-    assert!(codex_counting_version::tombstone_before_retire(
-        &mut index, &key
-    ));
+    assert!(version::tombstone_before_retire(&mut index, &key));
     index.remove_file_entry(&key);
     let owner = codex_protected_owner(SESSION);
     assert_eq!(
@@ -873,7 +830,7 @@ fn inventory_creation_timestamp_survives_tombstone_reload() {
     }
     let mut inventory = codex_file_join::HeaderInventory::new(&roots, &paths, Some(&directories));
     while !inventory.step(&CodexTitleMetadata::default()) {}
-    codex_counting_version::note_inventory_created(&mut index, &inventory);
+    version::note_inventory_created(&mut index, &inventory);
     index.save(&acked.index_path).unwrap();
     let loaded = ScanIndex::load(&acked.index_path).unwrap();
     assert_eq!(
@@ -886,11 +843,11 @@ fn inventory_creation_timestamp_survives_tombstone_reload() {
 /// Fill the cap while making only the selected owner eligible for eviction.
 fn evict_counting_owner(index: &mut ScanIndex, owner: &str, created: Option<i64>) {
     retirement_generation(index, "g2");
-    index.codex_counting_tombstones = (0..codex_counting_version::MAX_COUNTING_TOMBSTONES - 1)
+    index.codex_counting_tombstones = (0..version::MAX_COUNTING_TOMBSTONES - 1)
         .map(|n| {
             (
                 format!("{n:064x}"),
-                codex_counting_version::CountingTombstone {
+                version::CountingTombstone {
                     evidence: AckEvidence::LegacyAcked,
                     retired_in: "g2".into(),
                     created_unix_ms: None,
@@ -900,7 +857,7 @@ fn evict_counting_owner(index: &mut ScanIndex, owner: &str, created: Option<i64>
         .collect();
     index.codex_counting_tombstones.insert(
         owner.into(),
-        codex_counting_version::CountingTombstone {
+        version::CountingTombstone {
             evidence: AckEvidence::LegacyAcked,
             retired_in: "g1".into(),
             created_unix_ms: created,
@@ -910,7 +867,7 @@ fn evict_counting_owner(index: &mut ScanIndex, owner: &str, created: Option<i64>
     index
         .files
         .insert(key.into(), acked_entry(false, Some("f".repeat(64))));
-    assert!(codex_counting_version::tombstone_before_retire(index, key));
+    assert!(version::tombstone_before_retire(index, key));
     index.files.remove(key);
     assert!(!index.codex_counting_tombstones.contains_key(owner));
 }
@@ -924,13 +881,13 @@ fn cap_eviction_receipts_correlate_a_later_v2_selection_after_selected_reload() 
         Some(CUTOVER - 1),
     ] {
         let acked = acked_original(false, true);
-        let _cutover = codex_counting_version::TestCutover::set(CUTOVER);
+        let _cutover = version::TestCutover::set(CUTOVER);
         let owner = codex_protected_owner(SESSION);
         let mut index = acked.previous.clone();
         index.files.clear();
         evict_counting_owner(&mut index, &owner, created);
         let pre_cutover = created.is_some_and(|created| created < CUTOVER);
-        let receipts = codex_counting_version::take_local_receipts(&mut index, None).unwrap();
+        let receipts = version::take_local_receipts(&mut index, None).unwrap();
         assert_eq!(receipts.tombstone_evictions_v2_only, 0);
         assert_eq!(
             receipts.tombstone_evictions_pre_cutover_legacy,
@@ -983,7 +940,7 @@ fn cap_eviction_receipts_correlate_a_later_v2_selection_after_selected_reload() 
         );
         finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut reloaded);
         let owners = BTreeMap::from([(local_index_key(&moved), owner)]);
-        codex_counting_version::prepare_moved_evidence(&mut reloaded, &owners, false);
+        version::prepare_moved_evidence(&mut reloaded, &owners, false);
         assert!(
             reloaded.codex_counting_evicted_legacy.is_empty(),
             "committed ACK absorbs correlation"
@@ -996,7 +953,7 @@ fn cap_eviction_receipts_correlate_a_later_v2_selection_after_selected_reload() 
 fn cap_eviction_with_a_live_legacy_carrier_does_not_report_a_flip() {
     for bound in [true, false] {
         let acked = acked_original(false, bound);
-        let _cutover = codex_counting_version::TestCutover::set(CUTOVER);
+        let _cutover = version::TestCutover::set(CUTOVER);
         let owner = codex_protected_owner(SESSION);
         let mut index = acked.previous.clone();
         evict_counting_owner(&mut index, &owner, None);
@@ -1030,7 +987,7 @@ fn cap_eviction_with_a_live_legacy_carrier_does_not_report_a_flip() {
 #[test]
 fn evicted_legacy_diagnostic_history_is_bounded_lenient_and_charged() {
     let acked = acked_original(false, true);
-    let limit = codex_counting_version::MAX_EVICTED_LEGACY_OWNERS;
+    let limit = version::MAX_EVICTED_LEGACY_OWNERS;
     let mut owners = (0..limit + 10)
         .map(|n| format!("{n:064x}"))
         .collect::<Vec<_>>();
@@ -1077,7 +1034,7 @@ fn evicted_legacy_diagnostic_history_is_bounded_lenient_and_charged() {
 
 #[test]
 fn restored_tombstone_absorbs_old_eviction_correlation_before_absence_gc() {
-    let _cutover = codex_counting_version::TestCutover::set(CUTOVER);
+    let _cutover = version::TestCutover::set(CUTOVER);
     let owner = codex_protected_owner(SESSION);
     let mut index = ScanIndex::default();
     evict_counting_owner(&mut index, &owner, None);
@@ -1087,13 +1044,13 @@ fn restored_tombstone_absorbs_old_eviction_correlation_before_absence_gc() {
     index.codex_counting_tombstones.pop_first();
     index.codex_counting_tombstones.insert(
         owner.clone(),
-        codex_counting_version::CountingTombstone {
+        version::CountingTombstone {
             evidence: AckEvidence::LegacyAcked,
             retired_in: "g1".into(),
             created_unix_ms: None,
         },
     );
-    codex_counting_version::prepare_moved_evidence(&mut index, &BTreeMap::new(), true);
+    version::prepare_moved_evidence(&mut index, &BTreeMap::new(), true);
     assert!(
         !index.codex_counting_tombstones.contains_key(&owner),
         "absence GC ran"
@@ -1103,19 +1060,16 @@ fn restored_tombstone_absorbs_old_eviction_correlation_before_absence_gc() {
         "restored carrier absorbed old loss before GC"
     );
     let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
-    codex_counting_version::configure(&mut accumulator, AckEvidence::None, Some(CUTOVER));
+    version::configure(&mut accumulator, AckEvidence::None, Some(CUTOVER));
     apply_codex_line(&header(POST), &mut accumulator);
     assert!(accumulator.codex_counting_v2());
-    assert!(!codex_counting_version::evicted_legacy_selected_v2(
-        &accumulator,
-        &index
-    ));
+    assert!(!version::evicted_legacy_selected_v2(&accumulator, &index));
 }
 
 #[test]
 fn preexisting_v2_ack_does_not_absorb_an_unobserved_legacy_eviction_flip() {
     let acked = acked_original(true, true);
-    let _cutover = codex_counting_version::TestCutover::set(CUTOVER);
+    let _cutover = version::TestCutover::set(CUTOVER);
     let owner = codex_protected_owner(SESSION);
     let mut index = acked.previous.clone();
     // A mixed owner view has a V2-marked live entry and a Legacy tombstone.
@@ -1139,7 +1093,7 @@ fn preexisting_v2_ack_does_not_absorb_an_unobserved_legacy_eviction_flip() {
         record
     );
     let owners = BTreeMap::from([(local_index_key(&acked.original), owner)]);
-    codex_counting_version::prepare_moved_evidence(&mut loaded, &owners, false);
+    version::prepare_moved_evidence(&mut loaded, &owners, false);
     assert!(loaded.codex_counting_evicted_legacy.is_empty());
     fs::remove_dir_all(acked.root).unwrap();
 }
@@ -1180,9 +1134,9 @@ fn directory_proof_tombstones_before_the_audit_exit_or_keeps_custody() {
             .codex_protected_owner = Some(protected.1.clone());
         assert!(index.files[&protected.0].codex_history_is_protected());
         if full {
-            index.codex_counting_tombstones = (0..codex_counting_version::MAX_COUNTING_TOMBSTONES)
+            index.codex_counting_tombstones = (0..version::MAX_COUNTING_TOMBSTONES)
                 .map(|n| {
-                    let tombstone = codex_counting_version::CountingTombstone {
+                    let tombstone = version::CountingTombstone {
                         evidence: AckEvidence::LegacyAcked,
                         retired_in: AT.into(),
                         created_unix_ms: None,
@@ -1192,7 +1146,7 @@ fn directory_proof_tombstones_before_the_audit_exit_or_keeps_custody() {
                 .collect();
         }
         {
-            let _cutover = codex_counting_version::TestCutover::set(CUTOVER);
+            let _cutover = version::TestCutover::set(CUTOVER);
             let _ = scan_at(&acked.root, &mut index, AT);
         }
         for (key, owner) in [&plain, &audit] {

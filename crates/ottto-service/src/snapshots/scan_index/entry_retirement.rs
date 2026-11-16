@@ -326,7 +326,7 @@ impl ScanIndex {
                     candidate.size_bytes,
                     modified,
                     Some(candidate.fingerprint_birth_nanos),
-                    codex_fragment::Stamp::candidate(candidate),
+                    sources::codex::eof_fragment::Stamp::candidate(candidate),
                 )
             })
     }

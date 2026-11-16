@@ -1,6 +1,6 @@
 //! Session-owned repository observations: compatible facts, shared native
 //! capture, restart without a cwd, and display-only folder labels.
-use super::seam::tests::{route_for, scope, NOW};
+use super::seam::tests::{route_for, scope, Route, NOW};
 use super::*;
 use crate::context_footprint::{resolve_repository_identity, workspace_label};
 use crate::snapshots::sampled_scan::transition_fixture::native_cold;
@@ -8,7 +8,8 @@ use crate::snapshots::scan_index_persistence::Source;
 use serde_json::json;
 
 /// [format] Workspace bytes written by v0.1.221 hydrate without reconstruction;
-/// only Workspace accepts v2, and an unbound Workspace still writes v1.
+/// only Workspace accepts v2, an unbound Workspace still writes v1, and a
+/// non-Git v2 binding round-trips byte for byte.
 #[test]
 fn previous_release_workspace_fact_and_per_kind_versions() {
     // v0.1.221 Fact::Workspace: kind, version, Some, byte length, UTF-8 cwd.
@@ -16,6 +17,8 @@ fn previous_release_workspace_fact_and_per_kind_versions() {
     // Bound v2 bytes from the original field-by-field writer: same UTF-8
     // options and field order after replacing it with durable_struct!.
     const BOUND: &[u8] = b"\x02\x02\x01\x12/tmp/prior-release\x01\x04hash\x01\x0egit_common_dir\x01\x0frepository_root\x01\x09workspace\x01\x08git_root";
+    // Non-Git v2: no hash, source or labels; only the workspace kind.
+    const NON_GIT: &[u8] = b"\x02\x02\x01\x12/tmp/prior-release\x00\x00\x01\x07non_git\x00\x00";
     for source in [
         SnapshotSource::ClaudeCode,
         SnapshotSource::Codex,
@@ -41,6 +44,18 @@ fn previous_release_workspace_fact_and_per_kind_versions() {
             })
         );
         assert_eq!(fact_pages(&acc).unwrap(), [(2, BOUND.to_vec())]);
+        read_fact_page(2, NON_GIT, &mut acc).unwrap();
+        assert_eq!(
+            acc.repository_binding,
+            Some(crate::context_footprint::RepositoryIdentity {
+                repository_hash: None,
+                repository_identity_source: None,
+                workspace_kind: Some("non_git".into()),
+                repository_label: None,
+                repository_label_source: None,
+            })
+        );
+        assert_eq!(fact_pages(&acc).unwrap(), [(2, NON_GIT.to_vec())]);
         assert_eq!(
             read_fact_page(0, &[0, 2, 1, 1, b'x'], &mut acc),
             Err(ReconstructCause::INCOMPATIBLE)
@@ -52,20 +67,69 @@ fn previous_release_workspace_fact_and_per_kind_versions() {
     }
 }
 
+fn git_init(cwd: &Path) {
+    fs::create_dir(cwd).unwrap();
+    assert!(std::process::Command::new("git")
+        .args(["init", "-q"])
+        .arg(cwd)
+        .status()
+        .unwrap()
+        .success());
+}
+
+/// Restore `path` from the committed database pages and run the production
+/// Unchanged finish, which reads no transcript bytes.
+fn unchanged_finish<S: TailSource>(
+    route: &Route,
+    path: &Path,
+    apply: fn(&Value, &mut SnapshotAccumulator),
+) -> (seam::PendingTail, Result<ParsedJsonlFile>) {
+    let mut parser = native_cold::parser(S::SOURCE, path, File::open(path).unwrap(), apply);
+    let load::Load::Reused(taken, base) = load::load::<S>(
+        &route.index,
+        &route.path,
+        &local_index_key(path),
+        &HeadIdentity::new(&route.path, S::SOURCE, &route.dir, path, false),
+        &mut File::open(path).unwrap(),
+        &scope(),
+        &codex::tests::candidate(path),
+        &parser.accumulator,
+    ) else {
+        panic!("the committed reduction restores");
+    };
+    assert!(matches!(
+        parser
+            .prepare_acquisition(Some(taken), &scope(), None, NOW)
+            .unwrap(),
+        crate::transcript_acquisition::ReadMode::Unchanged
+    ));
+    assert_eq!(parser.reader.consumed_bytes(), 0);
+    route.finish_under::<S>(path, parser, base, |_| {}, &scope())
+}
+
+/// The staged Workspace fact version, `None` when the finish left it as committed.
+fn staged_workspace_version(tail: &seam::PendingTail) -> Option<u8> {
+    tail.staged_for_test()?
+        .pages
+        .get(&(Collection::SessionFacts, 2))
+        .map(|bytes| bytes[1])
+}
+
+/// With `git`, the cwd is a repository at the first read. Without it, the cwd
+/// is absent at the first read, so the session keeps a path-only v1 fact (what
+/// earlier releases saved for every non-Git folder); the folder then appears,
+/// not under Git, before an Unchanged finish.
 fn capture_restore<S: TailSource>(
     source: Source,
     lines: Vec<String>,
     apply: fn(&Value, &mut SnapshotAccumulator),
+    git: bool,
 ) {
     let mut route = route_for(source);
     let cwd = route.dir.join("workspace");
-    fs::create_dir(&cwd).unwrap();
-    assert!(std::process::Command::new("git")
-        .args(["init", "-q"])
-        .arg(&cwd)
-        .status()
-        .unwrap()
-        .success());
+    if git {
+        git_init(&cwd);
+    }
     let path = route.dir.join("session.jsonl");
     let lines: Vec<_> = lines
         .into_iter()
@@ -91,12 +155,29 @@ fn capture_restore<S: TailSource>(
         Some(cwd.as_path())
     );
     let (tail, native) = route.finish_under::<S>(&path, parser, None, |_| {}, &scope());
-    let initial = native.as_ref().unwrap().snapshots.first().unwrap();
-    let expected = resolve_repository_identity(&cwd, true);
-    assert_eq!(initial.repository_hash, expected.repository_hash);
+    let mut first = native.as_ref().unwrap().snapshots[0].clone();
+    if git {
+        assert_eq!(staged_workspace_version(&tail), Some(2));
+    } else {
+        assert_eq!(first.workspace_kind.as_deref(), Some("unknown"));
+        assert_eq!(staged_workspace_version(&tail), Some(1));
+    }
     assert!(tail.publish(&native));
     route.save(false);
     route.index = ScanIndex::load(&route.path).unwrap();
+    if !git {
+        fs::create_dir(&cwd).unwrap();
+        let (tail, native) = unchanged_finish::<S>(&route, &path, apply);
+        assert_eq!(staged_workspace_version(&tail), Some(2));
+        first = native.as_ref().unwrap().snapshots[0].clone();
+        assert_eq!(first.workspace_kind.as_deref(), Some("non_git"));
+        assert_eq!(first.workspace_display_label.as_deref(), Some("workspace"));
+        assert!(tail.publish(&native));
+        route.save(false);
+        route.index = ScanIndex::load(&route.path).unwrap();
+    }
+    let expected = resolve_repository_identity(&cwd, true);
+    assert_eq!(first.repository_hash, expected.repository_hash);
     fs::remove_dir_all(&cwd).unwrap();
     let head = route.head(&local_index_key(&path)).unwrap();
     let mut restored = SnapshotAccumulator::new(S::SOURCE);
@@ -145,32 +226,33 @@ fn capture_restore<S: TailSource>(
     assert_eq!(missing.workspace_kind.as_deref(), Some("unknown"));
     // Exercise the production load and native finish, including forwarding
     // the restored binding to into_items, without reading transcript bytes.
-    let mut parser = native_cold::parser(S::SOURCE, &path, File::open(&path).unwrap(), apply);
-    let load::Load::Reused(taken, base) = load::load::<S>(
-        &route.index,
-        &route.path,
-        &local_index_key(&path),
-        &HeadIdentity::new(&route.path, S::SOURCE, &route.dir, &path, false),
-        &mut File::open(&path).unwrap(),
-        &scope(),
-        &codex::tests::candidate(&path),
-        &parser.accumulator,
-    ) else {
-        panic!("the committed reduction restores");
-    };
-    assert!(matches!(
-        parser
-            .prepare_acquisition(Some(taken), &scope(), None, NOW)
-            .unwrap(),
-        crate::transcript_acquisition::ReadMode::Unchanged
-    ));
-    assert_eq!(parser.reader.consumed_bytes(), 0);
-    let (_, native) = route.finish_under::<S>(&path, parser, base, |_| {}, &scope());
-    let native = native.unwrap();
-    let items = native.snapshots;
+    let (tail, native) = unchanged_finish::<S>(&route, &path, apply);
+    let items = &native.as_ref().unwrap().snapshots;
     assert_eq!(items[0].repository_hash, expected.repository_hash);
     assert_eq!(items[0].repository_label, expected.repository_label);
     assert_eq!(items[0].workspace_kind, expected.workspace_kind);
+    assert_eq!(items[0].workspace_hash, first.workspace_hash);
+    assert_eq!(
+        items[0].workspace_display_label,
+        first.workspace_display_label
+    );
+    if git {
+        return;
+    }
+    // Live Git evidence replaces a saved non-Git binding.
+    assert!(tail.publish(&native));
+    route.save(false);
+    route.index = ScanIndex::load(&route.path).unwrap();
+    git_init(&cwd);
+    let (tail, native) = unchanged_finish::<S>(&route, &path, apply);
+    assert_eq!(staged_workspace_version(&tail), Some(2));
+    let item = &native.as_ref().unwrap().snapshots[0];
+    assert_eq!(item.workspace_kind.as_deref(), Some("repository_root"));
+    assert_eq!(
+        item.repository_hash,
+        resolve_repository_identity(&cwd, true).repository_hash
+    );
+    assert!(item.repository_hash.is_some());
 }
 
 /// [behaviour] Each source's native PRE captures the same binding; a committed
@@ -178,27 +260,43 @@ fn capture_restore<S: TailSource>(
 /// reads or dependency on the process cache.
 #[test]
 fn every_source_pins_the_native_observation_before_staging() {
+    every_source(true);
+}
+
+/// [regress] A non-Git folder's v1 fact (all saved before this fix) gains its
+/// non-Git binding on an Unchanged finish; after a restart and the folder's
+/// deletion, every source keeps `non_git`, its workspace hash and its folder
+/// label instead of falling back to `unknown`. [behaviour] Live Git evidence
+/// later replaces the saved non-Git binding in the same flow.
+#[test]
+fn every_source_keeps_a_non_git_folder_after_deletion() {
+    every_source(false);
+}
+
+fn every_source(git: bool) {
     capture_restore::<claude::Claude>(
         Source::Claude,
         claude::tests::lines(2),
         apply_claude_code_line,
+        git,
     );
-    capture_restore::<codex::Codex>(Source::Codex, codex::tests::lines(2), apply_codex_line);
+    capture_restore::<codex::Codex>(Source::Codex, codex::tests::lines(2), apply_codex_line, git);
     capture_restore::<pi::Pi>(Source::Pi, vec![
         json!({"type":"session","version":3,"id":"synthetic-folder-session","timestamp":"2026-10-20T16:00:00Z","cwd":"/tmp/pi-folder"}).to_string(),
         json!({"type":"message","id":"a1","timestamp":"2026-10-20T16:01:00Z","message":{"role":"assistant","provider":"openai","model":"gpt-5","responseId":"r1","usage":{"input":10,"output":2,"cacheRead":3,"cacheWrite":4,"totalTokens":19,"cost":{"total":0.001}}}}).to_string(),
-    ], apply_pi_line);
+    ], apply_pi_line, git);
 }
 
 /// [behaviour] Folder labels use the shared sanitizer and current upload policy.
-/// Missing cwd evidence stays retryable, so ordinary selected work can bind later.
+/// Missing cwd evidence stays retryable, so ordinary selected work can bind later;
+/// a non-Git folder is pinned like a repository.
 #[test]
 fn folder_labels_and_failed_lookup_recovery() {
     let route = route_for(Source::Claude);
     let cwd = route.dir.join("new-folder");
     for (exists, init, kind, version) in [
         (false, false, "unknown", 1),
-        (true, false, "non_git", 1),
+        (true, false, "non_git", 2),
         (true, true, "repository_root", 2),
         (false, false, "unknown", 1),
     ] {

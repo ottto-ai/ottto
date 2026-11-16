@@ -85,12 +85,15 @@ impl Counts {
             .all(|n| n.count == 0 && n.completed_native_bytes == 0)
     }
 }
-// Both fixed aggregates share the existing page registry. Keep them outside
+// Bounded aggregates share the existing page registry. Keep them outside
 // Probe/OwnedSourceScan so diagnostic growth does not alter admission layout.
+pub(super) type FullByPriorStamp = BTreeMap<&'static str, BTreeMap<&'static str, Total>>;
+
 #[derive(Default)]
 struct Page {
     causes: Counts,
     parse_reasons: super::claude_reread::FullByParseReason,
+    prior_stamps: FullByPriorStamp,
 }
 // Probe::drop releases the page, including early exits.
 fn with_pages<T>(f: impl FnOnce(&mut BTreeMap<Instant, Page>) -> T) -> T {
@@ -119,17 +122,28 @@ pub(crate) fn completed(page: Instant, key: &str, mode: ReadMode, native_bytes: 
 }
 pub(crate) fn record_parse_reason(
     page: Instant,
-    reason: CandidateParseReason,
+    reason: Option<CandidateParseReason>,
+    stamp: super::claude_reread::PriorStamp,
     count: u64,
     native_bytes: u64,
 ) {
     with_pages(|pages| {
-        pages
-            .entry(page)
-            .or_default()
-            .parse_reasons
-            .record(reason, count, native_bytes)
+        let page = pages.entry(page).or_default();
+        if let Some(reason) = reason {
+            page.parse_reasons.record(reason, count, native_bytes);
+        }
+        let reason = reason.map_or("unattributed", |r| {
+            crate::snapshots::CANDIDATE_PARSE_REASON_NAMES[r as usize]
+        });
+        let stamp = super::claude_reread::PRIOR_STAMP_NAMES[stamp as usize];
+        let row = page.prior_stamps.entry(reason).or_default();
+        let total = row.entry(stamp).or_default();
+        total.count = total.count.saturating_add(count);
+        total.completed_native_bytes = total.completed_native_bytes.saturating_add(native_bytes);
     });
+}
+pub(super) fn take_full_by_prior_stamp(page: Instant) -> FullByPriorStamp {
+    with_pages(|pages| std::mem::take(&mut pages.entry(page).or_default().prior_stamps))
 }
 pub(crate) fn page(page: Instant) -> Counts {
     with_pages(|pages| pages.get(&page).map(|page| page.causes).unwrap_or_default())

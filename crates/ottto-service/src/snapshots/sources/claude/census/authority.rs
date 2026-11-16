@@ -8,9 +8,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[cfg(test)]
-use crate::snapshots::claude_context_file_birth::ClaudeFileBirthVerdict;
 use crate::snapshots::scan_index::file_set_digest::update_length_prefixed;
+#[cfg(test)]
+use crate::snapshots::sources::claude::context_file_birth::ClaudeFileBirthVerdict;
 use crate::snapshots::wire::SnapshotItem;
 use crate::snapshots::{
     claude_authority_record_contract_is_valid, claude_request_accounts, claude_request_identity,

@@ -1,9 +1,9 @@
 //! The first-read bound: a file never read whose mtime is more than 60 days
 //! before the census time is not admitted for a first read. Read evidence,
 //! committed debt and queued work keep the walk window. Synthetic fixtures.
-use crate::snapshots::g7_debt::tests::{accept, entry, Fixture};
-use crate::snapshots::line_delivery_tests::{candidates, unselected_page};
+use crate::snapshots::scan::lines::delivery::tests::{candidates, unselected_page};
 use crate::snapshots::scan_index_persistence::Source;
+use crate::snapshots::upload::freshness_debt::tests::{accept, entry, Fixture};
 use crate::snapshots::*;
 use std::time::Duration;
 

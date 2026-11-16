@@ -8021,9 +8021,12 @@ fn finish_sync_source(
         .as_ref()
         .and_then(|(_, since)| OffsetDateTime::parse(since, &Rfc3339).ok());
     let mut latest = None;
-    let mut observe = |new, previous, ceiling| {
+    let mut observe = |new, previous, within_ceiling| {
         latest = latest.max(crate::tracking_confirmation::parsed_activity_witness(
-            since, new, previous, ceiling,
+            since,
+            new,
+            previous,
+            within_ceiling,
         ));
     };
     if crate::active_sessions::reconcile_with_registrations(

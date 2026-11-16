@@ -1024,33 +1024,60 @@ pub(crate) mod money_oracle {
         other: &RouteResult,
         cold: &RouteResult,
     ) {
+        assert_held_set(&[entity], prior, other, cold);
+    }
+
+    /// `entities` are held together in `other`, as on a page an incomplete
+    /// inventory held: none emits a body (including $0), each previously
+    /// accepted one keeps its accepted body and witness, a never-accepted one
+    /// stays unaccepted, and every emitted sibling still equals cold.
+    pub(crate) fn assert_held_set(
+        entities: &[&str],
+        prior: &RouteResult,
+        other: &RouteResult,
+        cold: &RouteResult,
+    ) {
+        let held = |id: &Value| entities.iter().any(|entity| id == *entity);
         assert!(
-            !other.snapshots.contains_key(entity),
-            "held entity emitted a body (including $0)"
+            entities
+                .iter()
+                .any(|entity| prior.accepted.contains_key(*entity)),
+            "prior accepted body + witness"
         );
-        let before = prior
-            .accepted
-            .get(entity)
-            .expect("prior accepted body + witness");
-        assert!(
-            before.body["request_count"].as_u64().unwrap_or(0) > 0,
-            "fixture must start with nonempty accepted money"
-        );
-        assert!(
-            !before.witness.is_empty(),
-            "fixture must have accepted witness"
-        );
-        assert_eq!(
-            other.accepted.get(entity),
-            Some(before),
-            "held accepted body/witness changed"
-        );
+        for entity in entities {
+            assert!(
+                !other.snapshots.contains_key(*entity),
+                "held entity emitted a body (including $0)"
+            );
+            let Some(before) = prior.accepted.get(*entity) else {
+                assert!(
+                    !other.accepted.contains_key(*entity),
+                    "a never-accepted held entity was accepted"
+                );
+                continue;
+            };
+            assert!(
+                before.body["request_count"].as_u64().unwrap_or(0) > 0,
+                "fixture must start with nonempty accepted money"
+            );
+            assert!(
+                !before.witness.is_empty(),
+                "fixture must have accepted witness"
+            );
+            assert_eq!(
+                other.accepted.get(*entity),
+                Some(before),
+                "held accepted body/witness changed"
+            );
+        }
         let mut expected = cold.clone();
-        expected.snapshots.remove(entity);
+        expected
+            .snapshots
+            .retain(|entity, _| !entities.contains(&entity.as_str()));
         let mut actual = other.clone();
         // Filter whole envelopes, preserving every field of each emitted sibling.
         for result in [&mut expected, &mut actual] {
-            retain_envelope_entities(&mut result.normalized, |s| s["source_session_id"] != entity);
+            retain_envelope_entities(&mut result.normalized, |s| !held(&s["source_session_id"]));
         }
         if !expected.snapshots.is_empty() {
             assert_equivalent(&expected, &actual);

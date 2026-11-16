@@ -484,7 +484,7 @@ impl TailSource for Codex {
         if stored.codex_sidecar_binding != live.codex_sidecar_binding {
             return Err(incompatible(INCOMPATIBLE_SIDECAR_BINDING));
         }
-        if !codex_counting_version::reusable(
+        if !sources::codex::counting::version::reusable(
             stored.codex_counting.as_deref(),
             live.codex_counting.as_deref(),
         ) {

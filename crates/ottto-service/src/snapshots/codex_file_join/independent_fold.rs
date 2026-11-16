@@ -17,7 +17,7 @@ pub(super) fn parser(
         Some(metadata),
     )
     .map_err(|_| GroupEnd::Strict)?;
-    codex_counting_version::configure_singleton(&mut parser, member, index);
+    sources::codex::counting::version::configure_singleton(&mut parser, member, index);
     Ok(Box::new(parser))
 }
 

@@ -1,8 +1,8 @@
 //! Codex usage counting V2: the eight counting regressions, the counting-version
 //! decision and its acknowledgement-evidence transitions. Token numbers mirror
 //! the saved minimal sequences S1-S3; every fixture is synthetic.
-use super::codex_counting_version::{self, AckEvidence, CountingVersion};
 use super::codex_usage_occurrence::{OccurrenceCounters, T6};
+use super::sources::codex::counting::version::{self, AckEvidence, CountingVersion};
 use super::*;
 use serde_json::json;
 
@@ -126,7 +126,7 @@ fn five(t: T6) -> [u64; 5] {
 fn run(values: &[Value], evidence: Option<AckEvidence>) -> Run {
     let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
     if let Some(evidence) = evidence {
-        codex_counting_version::configure(&mut accumulator, evidence, Some(CUTOVER));
+        version::configure(&mut accumulator, evidence, Some(CUTOVER));
     }
     for value in values {
         apply_codex_line(value, &mut accumulator);
@@ -163,10 +163,10 @@ fn legacy(values: &[Value]) -> Run {
 /// Exercise the production source factory and physical JSONL reader, with the
 /// fixture header predating the frozen cutover for the Legacy price control.
 fn run_price_source(values: &[Value], active: bool) -> Run {
-    let _cutover = codex_counting_version::TestCutover::set(if active {
+    let _cutover = version::TestCutover::set(if active {
         0
     } else {
-        codex_counting_version::CODEX_COUNTING_V2_CUTOVER_UNIX_MS
+        version::CODEX_COUNTING_V2_CUTOVER_UNIX_MS
     });
     let root = crate::test_scratch::unique_path("ottto-v2-price");
     fs::create_dir_all(&root).unwrap();
@@ -595,7 +595,7 @@ fn codex_thread_tier_yields_to_the_protected_replay() {
                 keyless: bool| {
         let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
         if v2 {
-            codex_counting_version::configure(&mut accumulator, AckEvidence::None, Some(CUTOVER));
+            version::configure(&mut accumulator, AckEvidence::None, Some(CUTOVER));
         }
         if older_logs {
             crate::snapshots::older_build_logs_priority("fast-turn");
@@ -791,7 +791,7 @@ fn legacy_on_both_routes(lines: &[Value], tail_from: usize) -> Run {
 
     use crate::durable_tail_codec::{Dec, Durable, Enc};
     let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
-    codex_counting_version::configure(&mut accumulator, AckEvidence::None, Some(CUTOVER));
+    version::configure(&mut accumulator, AckEvidence::None, Some(CUTOVER));
     for value in &lines[..tail_from] {
         apply_codex_line(value, &mut accumulator);
     }
@@ -804,10 +804,7 @@ fn legacy_on_both_routes(lines: &[Value], tail_from: usize) -> Run {
     let restored =
         codex_usage_occurrence::CodexCounting::take(&mut Dec::new(&body)).expect("decode");
     let fresh = codex_usage_occurrence::CodexCounting::new(AckEvidence::None, Some(CUTOVER));
-    assert!(codex_counting_version::reusable(
-        Some(&restored),
-        Some(&fresh)
-    ));
+    assert!(version::reusable(Some(&restored), Some(&fresh)));
     accumulator.codex_counting = Some(Box::new(restored));
     assert!(
         !accumulator.codex_counting_v2(),
@@ -1261,8 +1258,7 @@ fn entry(fingerprint: Option<&str>, v2: bool) -> ScanIndexEntry {
 
 #[test]
 fn codex_counting_version_decision_is_stable() {
-    let decide =
-        |record: &Value, evidence| codex_counting_version::decide(record, evidence, CUTOVER);
+    let decide = |record: &Value, evidence| version::decide(record, evidence, CUTOVER);
     let post = header(POST);
     assert_eq!(decide(&post, AckEvidence::None), CountingVersion::V2);
     assert_eq!(decide(&post, AckEvidence::V2Marked), CountingVersion::V2);
@@ -1292,11 +1288,8 @@ fn codex_counting_version_decision_is_stable() {
         CountingVersion::Legacy
     );
     let marked = entry(Some("body"), true);
-    let _cutover = codex_counting_version::TestCutover::set(CUTOVER);
-    assert_eq!(
-        codex_counting_version::group_evidence([&marked]),
-        AckEvidence::V2Marked
-    );
+    let _cutover = version::TestCutover::set(CUTOVER);
+    assert_eq!(version::group_evidence([&marked]), AckEvidence::V2Marked);
 }
 
 #[test]
@@ -1396,7 +1389,7 @@ fn codex_counting_destination_loss_rederives_only_from_its_own_index() {
     let post = header(POST);
     let decide = |index: &ScanIndex| {
         let evidence = AckEvidence::of_view(index.files.get("/synthetic/sessions/rollout.jsonl"));
-        codex_counting_version::decide(&post, evidence, CUTOVER)
+        version::decide(&post, evidence, CUTOVER)
     };
     let mut marked = ScanIndex::default();
     marked.files.insert(
@@ -1419,7 +1412,7 @@ fn codex_counting_destination_loss_rederives_only_from_its_own_index() {
 fn codex_counting_retained_reduction_reuse_requires_the_same_rule() {
     let decided = |values: &[Value], evidence| {
         let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
-        codex_counting_version::configure(&mut accumulator, evidence, Some(CUTOVER));
+        version::configure(&mut accumulator, evidence, Some(CUTOVER));
         for value in values {
             apply_codex_line(value, &mut accumulator);
         }
@@ -1442,31 +1435,21 @@ fn codex_counting_retained_reduction_reuse_requires_the_same_rule() {
     ];
     for decided_under in evidences {
         let mut paused = SnapshotAccumulator::new(SnapshotSource::Codex);
-        codex_counting_version::configure(&mut paused, decided_under, Some(CUTOVER));
+        version::configure(&mut paused, decided_under, Some(CUTOVER));
         apply_codex_line(&header(POST), &mut paused);
         for now in evidences {
             assert_eq!(
-                codex_counting_version::reusable_under_view(
-                    &paused,
-                    &codex_counting_version::view(now, CUTOVER)
-                ),
-                codex_counting_version::reusable(
-                    paused.codex_counting.as_deref(),
-                    Some(&fresh(now))
-                ),
+                version::reusable_under_view(&paused, &version::view(now, CUTOVER)),
+                version::reusable(paused.codex_counting.as_deref(), Some(&fresh(now))),
             );
         }
-        assert!(!codex_counting_version::reusable_under_view(
-            &paused, "legacy"
-        ));
+        assert!(!version::reusable_under_view(&paused, "legacy"));
     }
     let inactive = SnapshotAccumulator::new(SnapshotSource::Codex);
-    assert!(codex_counting_version::reusable_under_view(
-        &inactive, "legacy"
-    ));
-    assert!(!codex_counting_version::reusable_under_view(
+    assert!(version::reusable_under_view(&inactive, "legacy"));
+    assert!(!version::reusable_under_view(
         &inactive,
-        &codex_counting_version::view(AckEvidence::None, CUTOVER)
+        &version::view(AckEvidence::None, CUTOVER)
     ));
 }
 
@@ -1488,7 +1471,7 @@ fn codex_v2_staged_turn_charge_stays_within_the_stated_bound() {
         values.push(ui(&hour(index), step, total));
     }
     let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
-    codex_counting_version::configure(&mut accumulator, AckEvidence::None, Some(CUTOVER));
+    version::configure(&mut accumulator, AckEvidence::None, Some(CUTOVER));
     for value in &values {
         apply_codex_line(value, &mut accumulator);
     }
@@ -1505,7 +1488,7 @@ fn codex_v2_staged_turn_charge_stays_within_the_stated_bound() {
 #[test]
 fn codex_counting_v2_compiled_cutover_is_frozen() {
     assert_eq!(
-        codex_counting_version::CODEX_COUNTING_V2_CUTOVER_UNIX_MS,
+        version::CODEX_COUNTING_V2_CUTOVER_UNIX_MS,
         1_793_016_000_000
     );
 }
