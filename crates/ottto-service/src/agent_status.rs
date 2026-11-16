@@ -411,8 +411,6 @@ use claude::slots::reconciled_valid_access_status;
 #[cfg(test)]
 use claude::slots::reconciled_valid_access_status_with_worker_receipt;
 #[cfg(test)]
-use claude::slots::record_registered_claude_worker_diagnostic;
-#[cfg(test)]
 pub(crate) use claude::slots::record_registered_claude_worker_observation;
 #[cfg(test)]
 use claude::slots::resolve_registered_claude_slot;

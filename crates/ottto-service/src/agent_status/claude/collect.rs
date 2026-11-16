@@ -7,8 +7,6 @@ use crate::agent_status::append_current_plan_observation;
 use crate::agent_status::base_snapshot;
 use crate::agent_status::billing_identity_evidence_for;
 use crate::agent_status::claude_account_from_local_metadata;
-#[cfg(test)]
-use crate::agent_status::claude_account_identifier_hash;
 use crate::agent_status::claude_account_identifier_hashes_from_observations;
 use crate::agent_status::claude_account_session_not_offered_capability;
 use crate::agent_status::claude_account_weekly_not_offered_capability;
