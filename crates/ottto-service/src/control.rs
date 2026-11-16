@@ -33482,18 +33482,11 @@ X-API-Key = "otel_redacted"
                         crate::local_resource_diagnostics::capture(|| {
                             handle_request(
                                 &daemon,
-                                LocalControlRequest {
-                                    request_id: "logout-history-error".into(),
-                                    protocol_version:
-                                        ottto_protocol::INSTALLATION_RESET_CONTROL_PROTOCOL_VERSION,
-                                    token: Some("token".into()),
-                                    client_kind: Some(LocalClientKind::Cli),
-                                    client_install_owner: None,
-                                    command: LocalControlCommand::AuthReset {
-                                        local_only,
-                                        forget_installation,
-                                    },
-                                },
+                                auth_reset_request(
+                                    "logout-history-error",
+                                    local_only,
+                                    forget_installation,
+                                ),
                             )
                         });
                     if let Some(server) = server {
