@@ -1,96 +1,210 @@
+use crate::agent_configs::claude_env;
 use crate::agent_configs::codex_toml;
-use crate::{
-    agent_configs::{claude_env, detection::detect_agent_installation, fence::AgentConfigError},
-    agent_status::{
-        pi_identity_hints_for_route, read_pi_agent_auth, read_pi_smoke_routes,
-        BillingIdentityHints, PiModelRoute,
-    },
-    current_rfc3339_timestamp, diagnostics_local_only_upload_report,
-    keychain::TelemetryKeyStore,
-    snapshot_client::relay_token_request_payload,
-    BackendErrorDetails, BackendErrorKind, LocalApiError, LocalDaemon, PendingAuthClaim,
-    SetupRunReadStart, StagedAccountSwitch,
-};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use ottto_core::token_store::{
-    OTTTO_HISTORY_BROWSER_CLAIM_ACCOUNT as HISTORY_BROWSER_ACCOUNT,
-    OTTTO_LOCAL_RELEASE_MARKER_ACCOUNT as HISTORY_MARKER_ACCOUNT,
-    OTTTO_LOCAL_RELEASE_PROOF_ACCOUNT as HISTORY_PROOF_ACCOUNT, OTTTO_REVOCATION_RECEIPT_ACCOUNT,
-};
-use ottto_core::{
-    compiled_build_id, compiled_release_channel, compiled_release_version,
-    default_prior_device_path, default_support_dir, execute_local_uninstall,
-    generate_control_token, install_owner_for_path, local_lifecycle_home_dir, plan_local_uninstall,
-    redact_inline, release_channel_from_str, ClaudeConfigSlotSettingsError,
-    CodexAccountSlotSettingsError, ControlTokenStore, DeviceCredentialContinuity, FileAccountStore,
-    FileClaudeConfigSlotSettingsStore, FileCodexAccountSlotSettingsStore, FileConnectionStore,
-    FileDeviceStore, FileMachineStore, FileOwnerSnapshotNamespaceStore,
-    FilePendingDeviceCredentialStore, KeychainSecretStore, LocalConnectionBinding,
-    LocalCredentialOwner, LocalDeviceBinding, LocalDeviceCredentialBinding, LocalDeviceEnvelope,
-    OwnerSnapshotKey, OwnerSnapshotNamespace, PendingClaimCredentialCommit,
-    PendingDeviceCredentialPreparation, PendingDeviceCredentialRequestAuthority,
-    SnapshotNamespaceAlias, TokenStoreError, UninstallExecutionOptions, OTTTO_CLIENT_NAME,
-    OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT, OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT,
-    OTTTO_PRIOR_RELAY_DEVICE_SECRET_ACCOUNT, OTTTO_RELAY_DEVICE_SECRET_ACCOUNT,
-    OTTTO_SERVICE_BINARY_NAME, OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
-};
-use ottto_protocol::{
-    validate_local_control_protocol_version, AgentContextQuery, AgentCostsQuery,
-    AgentInstallationDetection, AgentProviderImpactQuery, AgentRecommendationsQuery,
-    AgentSessionsQuery, AgentStatusSnapshot, AuthCompleteResponse, AuthResetResponse,
-    AuthStartResponse, ClaudeAccountSetupOperationState, ClaudeConfigSlotCollectionStateV1,
-    CliError, CliErrorCode, CodexAccountSetupOperationStateV1, ConfigDrift, ControlResult,
-    ControlResultStatus, DiagnosticsBundle, DiagnosticsRetentionDisclosure,
-    DiagnosticsUploadApproval, DiagnosticsUploadAuthorization, DiagnosticsUploadReport,
-    DiagnosticsUploadStatus, InstallOwner, LocalAccountBinding, LocalAccountOrganization,
-    LocalAccountState, LocalAccountUser, LocalClientKind, LocalControlCommand, LocalControlRequest,
-    LocalControlResponse, MachineIdentity, ProviderDailyReferenceBackendGrantResponseV1,
-    ProviderDailyReferenceControlAction, RedactedValue, RelayRuntimeState, RelayState,
-    ReleaseChannel, RepairAction, RepairActionApproval, RepairActionKind, RepairApprovalSurface,
-    RepairPlan, RepairPlanStatus, SecretString, ServiceOwnerState, SourceConfigState, SourceKind,
-    SourceRouteVerificationResult, SourceVerificationCheck, SourceVerificationMethod,
-    SourceVerificationResult, SourceVerificationScope, SourceVerificationStatus, StableMessage,
-    TelemetryControlAction, UninstallExecutionResult, UpdateGate, UpdateState, UpdateStatus,
-    DIAGNOSTICS_RETENTION_DISCLOSURE, PROTOCOL_VERSION,
-};
+use crate::agent_configs::detection::detect_agent_installation;
+use crate::agent_configs::fence::AgentConfigError;
+use crate::agent_status::pi_identity_hints_for_route;
+use crate::agent_status::read_pi_agent_auth;
+use crate::agent_status::read_pi_smoke_routes;
+use crate::agent_status::BillingIdentityHints;
+use crate::agent_status::PiModelRoute;
+use crate::current_rfc3339_timestamp;
+use crate::diagnostics_local_only_upload_report;
+use crate::keychain::TelemetryKeyStore;
+use crate::snapshot_client::relay_token_request_payload;
+use crate::BackendErrorDetails;
+use crate::BackendErrorKind;
+use crate::LocalApiError;
+use crate::LocalDaemon;
+use crate::PendingAuthClaim;
+use crate::SetupRunReadStart;
+use crate::StagedAccountSwitch;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
+use ottto_core::compiled_build_id;
+use ottto_core::compiled_release_channel;
+use ottto_core::compiled_release_version;
+use ottto_core::default_prior_device_path;
+use ottto_core::default_support_dir;
+use ottto_core::execute_local_uninstall;
+use ottto_core::generate_control_token;
+use ottto_core::install_owner_for_path;
+use ottto_core::local_lifecycle_home_dir;
+use ottto_core::plan_local_uninstall;
+use ottto_core::redact_inline;
+use ottto_core::release_channel_from_str;
+use ottto_core::token_store::OTTTO_HISTORY_BROWSER_CLAIM_ACCOUNT as HISTORY_BROWSER_ACCOUNT;
+use ottto_core::token_store::OTTTO_LOCAL_RELEASE_MARKER_ACCOUNT as HISTORY_MARKER_ACCOUNT;
+use ottto_core::token_store::OTTTO_LOCAL_RELEASE_PROOF_ACCOUNT as HISTORY_PROOF_ACCOUNT;
+use ottto_core::token_store::OTTTO_REVOCATION_RECEIPT_ACCOUNT;
+use ottto_core::ClaudeConfigSlotSettingsError;
+use ottto_core::CodexAccountSlotSettingsError;
+use ottto_core::ControlTokenStore;
+use ottto_core::DeviceCredentialContinuity;
+use ottto_core::FileAccountStore;
+use ottto_core::FileClaudeConfigSlotSettingsStore;
+use ottto_core::FileCodexAccountSlotSettingsStore;
+use ottto_core::FileConnectionStore;
+use ottto_core::FileDeviceStore;
+use ottto_core::FileMachineStore;
+use ottto_core::FileOwnerSnapshotNamespaceStore;
+use ottto_core::FilePendingDeviceCredentialStore;
+use ottto_core::KeychainSecretStore;
+use ottto_core::LocalConnectionBinding;
+use ottto_core::LocalCredentialOwner;
+use ottto_core::LocalDeviceBinding;
+use ottto_core::LocalDeviceCredentialBinding;
+use ottto_core::LocalDeviceEnvelope;
+#[cfg(test)]
+use ottto_core::LocalMachineBinding;
+use ottto_core::OwnerSnapshotKey;
+use ottto_core::OwnerSnapshotNamespace;
+use ottto_core::PendingClaimCredentialCommit;
+use ottto_core::PendingDeviceCredentialPreparation;
+use ottto_core::PendingDeviceCredentialRequestAuthority;
+use ottto_core::SnapshotNamespaceAlias;
+use ottto_core::TokenStoreError;
+use ottto_core::UninstallExecutionOptions;
+use ottto_core::OTTTO_CLIENT_NAME;
+use ottto_core::OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT;
+use ottto_core::OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT;
+use ottto_core::OTTTO_PRIOR_RELAY_DEVICE_SECRET_ACCOUNT;
+use ottto_core::OTTTO_RELAY_DEVICE_SECRET_ACCOUNT;
+use ottto_core::OTTTO_SERVICE_BINARY_NAME;
+use ottto_core::OTTTO_SETUP_RUN_TOKEN_ACCOUNT;
+use ottto_protocol::validate_local_control_protocol_version;
+use ottto_protocol::AgentContextQuery;
+use ottto_protocol::AgentCostsQuery;
+use ottto_protocol::AgentInstallationDetection;
+use ottto_protocol::AgentProviderImpactQuery;
+use ottto_protocol::AgentRecommendationsQuery;
+use ottto_protocol::AgentSessionsQuery;
+use ottto_protocol::AgentStatusSnapshot;
+use ottto_protocol::AuthCompleteResponse;
+use ottto_protocol::AuthResetResponse;
+use ottto_protocol::AuthStartResponse;
+use ottto_protocol::ClaudeAccountSetupOperationState;
+use ottto_protocol::ClaudeConfigSlotCollectionStateV1;
+use ottto_protocol::CliError;
+use ottto_protocol::CliErrorCode;
+use ottto_protocol::CodexAccountSetupOperationStateV1;
+use ottto_protocol::ConfigDrift;
+use ottto_protocol::ControlResult;
+use ottto_protocol::ControlResultStatus;
+use ottto_protocol::DiagnosticsBundle;
+use ottto_protocol::DiagnosticsRetentionDisclosure;
+use ottto_protocol::DiagnosticsUploadApproval;
+use ottto_protocol::DiagnosticsUploadAuthorization;
+use ottto_protocol::DiagnosticsUploadReport;
+use ottto_protocol::DiagnosticsUploadStatus;
+use ottto_protocol::InstallOwner;
+use ottto_protocol::LocalAccountBinding;
+use ottto_protocol::LocalAccountOrganization;
+use ottto_protocol::LocalAccountState;
+use ottto_protocol::LocalAccountUser;
+use ottto_protocol::LocalClientKind;
+use ottto_protocol::LocalControlCommand;
+use ottto_protocol::LocalControlRequest;
+use ottto_protocol::LocalControlResponse;
+use ottto_protocol::MachineIdentity;
+use ottto_protocol::ProviderDailyReferenceBackendGrantResponseV1;
+use ottto_protocol::ProviderDailyReferenceControlAction;
+use ottto_protocol::RedactedValue;
+use ottto_protocol::RelayRuntimeState;
+use ottto_protocol::RelayState;
+use ottto_protocol::ReleaseChannel;
+use ottto_protocol::RepairAction;
+use ottto_protocol::RepairActionApproval;
+use ottto_protocol::RepairActionKind;
+use ottto_protocol::RepairApprovalSurface;
+use ottto_protocol::RepairPlan;
+use ottto_protocol::RepairPlanStatus;
+use ottto_protocol::SecretString;
+use ottto_protocol::ServiceOwnerState;
+use ottto_protocol::SourceConfigState;
+use ottto_protocol::SourceKind;
+use ottto_protocol::SourceRouteVerificationResult;
+use ottto_protocol::SourceVerificationCheck;
+use ottto_protocol::SourceVerificationMethod;
+use ottto_protocol::SourceVerificationResult;
+use ottto_protocol::SourceVerificationScope;
+use ottto_protocol::SourceVerificationStatus;
+use ottto_protocol::StableMessage;
+use ottto_protocol::TelemetryControlAction;
+use ottto_protocol::UninstallExecutionResult;
+use ottto_protocol::UpdateGate;
+use ottto_protocol::UpdateState;
+use ottto_protocol::UpdateStatus;
+use ottto_protocol::DIAGNOSTICS_RETENTION_DISCLOSURE;
+use ottto_protocol::PROTOCOL_VERSION;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::json;
-use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use sha2::Digest;
+use sha2::Sha256;
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::error::Error as StdError;
 use std::fs;
 use std::io;
 use std::io::Read;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
+use std::net::IpAddr;
+use std::net::Ipv4Addr;
+use std::net::SocketAddr;
+use std::net::TcpStream;
 #[cfg(unix)]
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use std::os::fd::FromRawFd;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::path::Component;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Mutex, MutexGuard};
+use std::path::Path;
+use std::path::PathBuf;
+use std::process::Command;
+use std::process::Stdio;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::sync::mpsc;
+use std::sync::Mutex;
+use std::sync::MutexGuard;
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use toml_edit::{DocumentMut, Item};
-
+use std::time::Duration;
+use std::time::Instant;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 #[cfg(test)]
-use ottto_core::LocalMachineBinding;
+pub(crate) use tests::account_return_claim_for_test;
+#[cfg(test)]
+pub(crate) use tests::owner_return_credential_for_test;
+#[cfg(test)]
+pub(crate) use tests::owner_return_seed_for_test;
+use toml_edit::DocumentMut;
+use toml_edit::Item;
+
+mod diagnostics;
+use diagnostics::diagnostics_collect;
 
 // Direct API host (was the apex `ottto.net/backend` proxy, retired in the
 // marketing-site cutover). Matches DIRECT_API_BASE_URL below.
 const DEFAULT_API_BASE_URL: &str = "https://api.ottto.net";
+
 const DIRECT_API_BASE_URL: &str = "https://api.ottto.net";
+
 const DEVICE_CREDENTIAL_PREPARATION_CAPABILITY: &str = "device_credential_prepare_confirm_v1";
+
 const DEVICE_CREDENTIAL_PREPARATION_SECRET_HEADER: &str =
     "X-Ottto-Device-Credential-Preparation-Secret";
+
 const PENDING_DEVICE_CREDENTIAL_SCHEMA_VERSION: u16 = 2;
+
 // v2 is already released. History-bearing ceremonies must reject downgrade.
 const OWNER_RETURN_CREDENTIAL_SCHEMA_VERSION: u16 = 3;
 
@@ -100,52 +214,80 @@ fn supported_pending_credential_schema(version: u16) -> bool {
         PENDING_DEVICE_CREDENTIAL_SCHEMA_VERSION | OWNER_RETURN_CREDENTIAL_SCHEMA_VERSION
     )
 }
+
 // Legacy apex proxy base persisted by daemons installed before the marketing
 // cutover. Still trusted/recognized so existing installs keep ingesting until
 // they re-onboard onto the direct api.ottto.net base.
 const LEGACY_API_BASE_URL: &str = "https://ottto.net/backend";
+
 const SMOKE_PROMPT: &str = "Reply with exactly: ottto smoke test";
+
 const BACKEND_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
 const AGENT_READ_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
+
 const SETUP_SCAN_RESULT_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
+
 const SETUP_VERIFICATION_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
+
 const SETUP_VERIFICATION_MARKER_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
+
 const SMOKE_COMMAND_TIMEOUT: Duration = Duration::from_secs(45);
+
 const PI_SMOKE_COMMAND_TIMEOUT: Duration = Duration::from_secs(25);
+
 const PI_VERIFICATION_WAIT_TIMEOUT: Duration = Duration::from_secs(8);
+
 const PI_VERIFICATION_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+
 const PI_SESSION_IMPORT_UNSUPPORTED_PLATFORM_REASON: &str =
     "race-safe rooted session access is unavailable on this platform";
+
 const PI_SESSION_CENSUS_FAILED_CODE: &str = "pi_session_census_failed";
+
 // Poll long enough for slow-arriving agent telemetry (codex batches + flushes
 // its token records, then the relay forwards them) to reach the backend before
 // we give up — claude/pi still return early on success. Kept under
 // SETUP_VERIFICATION_HTTP_TIMEOUT (120s).
 const VERIFICATION_WAIT_TIMEOUT: Duration = Duration::from_secs(110);
+
 const VERIFICATION_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
 const AGENT_STATUS_SNAPSHOT_TTL_MINUTES: u64 = 15;
+
 const VERIFICATION_MARKER_METRIC_NAME: &str = "ottto.verification.smoke";
+
 const VERIFICATION_MARKER_ATTRIBUTE: &str = "ottto.verification";
+
 const VERIFICATION_MARKER_HEADER: &str = "X-Ottto-Verification";
+
 const SMOKE_USAGE_LIMIT_ERROR_CODE: &str = "usage_limited";
+
 const CLAUDE_OAUTH_REAUTH_REQUIRED_CODE: &str =
     crate::CLAUDE_OAUTH_REAUTH_REQUIRED_VERIFICATION_CODE;
+
 /// Verification message/error code for a source whose CLI is genuinely not
 /// installed on this machine. Reported instead of running a doomed smoke that
 /// would surface "not installed or not executable" as a blocking telemetry
 /// failure. Maps to a non-blocking `not_found` source state. Shared with the
 /// crate-root health projection via [`crate::SOURCE_NOT_INSTALLED_VERIFICATION_CODE`].
 const SOURCE_NOT_INSTALLED_CODE: &str = crate::SOURCE_NOT_INSTALLED_VERIFICATION_CODE;
+
 /// Data/config present but the CLI binary can't be found or executed (desktop-
 /// app-only installs). Maps to a visible, non-blocking soft warning. Shared
 /// with the crate-root health projection via
 /// [`crate::AGENT_CLI_UNAVAILABLE_VERIFICATION_CODE`].
 const AGENT_CLI_UNAVAILABLE_CODE: &str = crate::AGENT_CLI_UNAVAILABLE_VERIFICATION_CODE;
+
 const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_millis(750);
+
 const MAX_CONFIG_BACKUPS_PER_SOURCE: usize = 10;
+
 const OTTTO_CONFIG_BACKUP_RETENTION_ENV: &str = "OTTTO_CONFIG_BACKUP_RETENTION";
+
 #[cfg(target_os = "macos")]
 const OTTTO_COMPANION_BUNDLE_IDENTIFIER: &str = "net.ottto.Companion";
+
 /// Apple Developer Team ID that signs the official Ottto Companion app, baked
 /// into the binary at compile time.
 ///
@@ -181,7 +323,9 @@ const OTTTO_COMPANION_DEFAULT_TEAM_ID: &str = match option_env!("OTTTO_COMPANION
 // Serializes every account/device identity mutation with Codex cloud-task I/O
 // admission. The same lock covers that admission and the identity write/reset.
 static SETUP_RUN_BINDING_LOCK: Mutex<()> = Mutex::new(());
+
 static IDENTITY_MUTATION_RESERVATION: AtomicU64 = AtomicU64::new(0);
+
 static NEXT_IDENTITY_MUTATION_RESERVATION: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) fn lock_setup_run_binding() -> MutexGuard<'static, ()> {
@@ -860,6 +1004,7 @@ fn daemon_is_release_signed() -> bool {
 /// be told from the app's timer, so it reads nothing while Codex background
 /// limit refresh is off.
 const LEGACY_APP_QUOTA_REFRESH_MAX_PROTOCOL_VERSION: u16 = 15;
+
 const LEGACY_APP_QUOTA_REFRESH_MIN_GAP_SECONDS: u64 = 5 * 60;
 
 /// The source whose quota a `status` refresh from this client refreshes
@@ -3587,145 +3732,6 @@ fn require_authorized_local_client(
     }
 }
 
-fn diagnostics_collect(
-    daemon: &LocalDaemon,
-    authorization: &RequestAuthorization,
-    upload: bool,
-    upload_approval: Option<DiagnosticsUploadApproval>,
-    api_base_url: Option<String>,
-) -> Result<serde_json::Value, LocalApiError> {
-    let mut bundle = match authorization {
-        RequestAuthorization::Token(token) => daemon.diagnostics_stub(token)?,
-        RequestAuthorization::TrustedCompanionApp => {
-            daemon.diagnostics_stub_for_trusted_client()?
-        }
-        RequestAuthorization::Untrusted => return Err(LocalApiError::LocalClientNotTrusted),
-    };
-
-    if !upload {
-        bundle.upload = diagnostics_local_only_upload_report();
-        return to_value(bundle);
-    }
-
-    let approval = upload_approval.ok_or_else(|| {
-        LocalApiError::InvalidRequest(
-            "diagnostics upload requires --approve-upload and --accept-retention-disclosure"
-                .to_string(),
-        )
-    })?;
-    validate_diagnostics_upload_approval(&approval)?;
-    let upload_authorization = diagnostics_upload_authorization(daemon, authorization, &approval)?;
-    let api_base_url = validated_api_base_url(api_base_url.as_deref().or_else(|| {
-        upload_authorization
-            .connection_api_base_url()
-            .map(String::as_str)
-    }))?;
-
-    bundle.upload = upload_diagnostics_bundle(&api_base_url, &bundle, &upload_authorization)?;
-    to_value(bundle)
-}
-
-fn validate_diagnostics_upload_approval(
-    approval: &DiagnosticsUploadApproval,
-) -> Result<(), LocalApiError> {
-    if !approval.approved {
-        return Err(LocalApiError::InvalidRequest(
-            "diagnostics upload requires --approve-upload".to_string(),
-        ));
-    }
-    if !approval.retention_disclosure_accepted {
-        return Err(LocalApiError::InvalidRequest(
-            "diagnostics upload requires --accept-retention-disclosure".to_string(),
-        ));
-    }
-    normalize_support_claim(approval.support_claim.as_deref())?;
-    Ok(())
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum DiagnosticsUploadAuth {
-    ConnectedAccount {
-        setup_run_id: String,
-        setup_run_token: String,
-        api_base_url: String,
-    },
-    SupportClaim {
-        claim: String,
-    },
-}
-
-impl DiagnosticsUploadAuth {
-    fn authorization_kind(&self) -> DiagnosticsUploadAuthorization {
-        match self {
-            DiagnosticsUploadAuth::ConnectedAccount { .. } => {
-                DiagnosticsUploadAuthorization::ConnectedAccount
-            }
-            DiagnosticsUploadAuth::SupportClaim { .. } => {
-                DiagnosticsUploadAuthorization::SupportClaim
-            }
-        }
-    }
-
-    fn connection_api_base_url(&self) -> Option<&String> {
-        match self {
-            DiagnosticsUploadAuth::ConnectedAccount { api_base_url, .. } => Some(api_base_url),
-            DiagnosticsUploadAuth::SupportClaim { .. } => None,
-        }
-    }
-
-    fn support_claim_provided(&self) -> bool {
-        matches!(self, DiagnosticsUploadAuth::SupportClaim { .. })
-    }
-}
-
-fn diagnostics_upload_authorization(
-    daemon: &LocalDaemon,
-    authorization: &RequestAuthorization,
-    approval: &DiagnosticsUploadApproval,
-) -> Result<DiagnosticsUploadAuth, LocalApiError> {
-    if let Some(claim) = normalize_support_claim(approval.support_claim.as_deref())? {
-        return Ok(DiagnosticsUploadAuth::SupportClaim { claim });
-    }
-
-    let status = status_for(daemon, authorization)?;
-    if status.account.state != LocalAccountState::Connected {
-        return Err(LocalApiError::InvalidRequest(
-            "diagnostics upload requires an Ottto login or --support-claim".to_string(),
-        ));
-    }
-
-    let connection = daemon
-        .connection_for_authorized_client()?
-        .ok_or(LocalApiError::SetupRunConnectionMissing)?;
-    let setup_run_token = KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
-        .load()
-        .ok()
-        .ok_or(LocalApiError::SetupRunConnectionMissing)?;
-    Ok(DiagnosticsUploadAuth::ConnectedAccount {
-        setup_run_id: connection.setup_run_id,
-        setup_run_token,
-        api_base_url: connection.api_base_url,
-    })
-}
-
-fn normalize_support_claim(raw: Option<&str>) -> Result<Option<String>, LocalApiError> {
-    let Some(raw) = raw else {
-        return Ok(None);
-    };
-    let value = raw.trim();
-    if value.is_empty() {
-        return Err(LocalApiError::InvalidRequest(
-            "diagnostics support claim cannot be empty".to_string(),
-        ));
-    }
-    if value.len() > 128 || value.chars().any(char::is_control) {
-        return Err(LocalApiError::InvalidRequest(
-            "diagnostics support claim is invalid".to_string(),
-        ));
-    }
-    Ok(Some(value.to_string()))
-}
-
 #[derive(Debug, Serialize)]
 struct DiagnosticsUploadBody<'a> {
     bundle: &'a DiagnosticsBundle,
@@ -3753,92 +3759,6 @@ struct DiagnosticsUploadClient {
 struct DiagnosticsUploadResponse {
     upload_id: Option<String>,
     uploaded_at: Option<String>,
-}
-
-fn upload_diagnostics_bundle(
-    api_base_url: &str,
-    bundle: &DiagnosticsBundle,
-    authorization: &DiagnosticsUploadAuth,
-) -> Result<DiagnosticsUploadReport, LocalApiError> {
-    let url = diagnostics_upload_url(api_base_url, authorization);
-    let body = DiagnosticsUploadBody {
-        bundle,
-        approval: DiagnosticsUploadApprovalSummary {
-            approved: true,
-            retention_disclosure_accepted: true,
-            retention_disclosure: DIAGNOSTICS_RETENTION_DISCLOSURE,
-            authorization: authorization.authorization_kind(),
-            support_claim_provided: authorization.support_claim_provided(),
-        },
-        client: DiagnosticsUploadClient {
-            protocol_version: PROTOCOL_VERSION,
-            local_platform_version: bundle
-                .section_item("versions", "daemon_version")
-                .and_then(redacted_string)
-                .unwrap_or_else(|| "unknown".to_string()),
-            machine_id: bundle.machine_id.clone(),
-        },
-    };
-
-    let response: DiagnosticsUploadResponse = match authorization {
-        DiagnosticsUploadAuth::ConnectedAccount {
-            setup_run_token, ..
-        } => backend_post_json(&url, &body, &[("X-Ottto-Setup-Run-Token", setup_run_token)]),
-        DiagnosticsUploadAuth::SupportClaim { claim } => {
-            backend_post_json(&url, &body, &[("X-Ottto-Support-Claim", claim)])
-        }
-    }?;
-
-    Ok(DiagnosticsUploadReport {
-        requested: true,
-        status: DiagnosticsUploadStatus::Uploaded,
-        approval_required: true,
-        approved: true,
-        retention: DiagnosticsRetentionDisclosure {
-            accepted: true,
-            text: DIAGNOSTICS_RETENTION_DISCLOSURE.to_string(),
-        },
-        authorization: authorization.authorization_kind(),
-        support_claim_provided: authorization.support_claim_provided(),
-        upload_id: response.upload_id,
-        uploaded_at: Some(
-            response
-                .uploaded_at
-                .unwrap_or_else(current_rfc3339_timestamp),
-        ),
-    })
-}
-
-fn diagnostics_upload_url(api_base_url: &str, authorization: &DiagnosticsUploadAuth) -> String {
-    match authorization {
-        DiagnosticsUploadAuth::ConnectedAccount { setup_run_id, .. } => api_url_with_base(
-            api_base_url,
-            &format!("/api/v1/setup-runs/{setup_run_id}/local-client/diagnostics"),
-        ),
-        DiagnosticsUploadAuth::SupportClaim { .. } => {
-            api_url_with_base(api_base_url, "/api/v1/diagnostics/support-bundles")
-        }
-    }
-}
-
-trait DiagnosticsBundleExt {
-    fn section_item(&self, section: &str, key: &str) -> Option<&RedactedValue>;
-}
-
-impl DiagnosticsBundleExt for DiagnosticsBundle {
-    fn section_item(&self, section: &str, key: &str) -> Option<&RedactedValue> {
-        self.sections
-            .iter()
-            .find(|candidate| candidate.name == section)
-            .and_then(|candidate| candidate.items.get(key))
-    }
-}
-
-fn redacted_string(value: &RedactedValue) -> Option<String> {
-    match value {
-        RedactedValue::String(value) => Some(value.clone()),
-        _ => None,
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7132,11 +7052,13 @@ fn create_setup_claim(
 }
 
 const REVOCATION_RECEIPT_MAX_AGE_SECONDS: i64 = 24 * 60 * 60;
+
 static REVOCATION_RECEIPT_LOCK: Mutex<()> = Mutex::new(());
 
 fn history_now() -> i64 {
     time::OffsetDateTime::now_utc().unix_timestamp()
 }
+
 fn lock_history_recovery() -> Result<MutexGuard<'static, ()>, LocalApiError> {
     REVOCATION_RECEIPT_LOCK.lock().or_state_poisoned()
 }
@@ -7161,6 +7083,7 @@ fn history_support_dir() -> PathBuf {
 fn history_account_store() -> FileAccountStore {
     FileAccountStore::new(history_support_dir().join("account.json"))
 }
+
 fn history_connection_store() -> FileConnectionStore {
     FileConnectionStore::new(history_support_dir().join("connection.json"))
 }
@@ -7245,6 +7168,7 @@ fn history_load<T: DeserializeOwned>(
         Err(_) => Err(LocalApiError::StatePoisoned),
     }
 }
+
 fn history_save<T: Serialize>(
     store: &dyn ControlTokenStore,
     value: &T,
@@ -8699,6 +8623,7 @@ fn backend_error_means_mac_disconnected(error: &LocalApiError) -> bool {
 }
 
 const SETUP_RUN_EXPIRED_DETAIL: &str = "Setup run expired";
+
 const SETUP_RUN_CANCELLED_DETAIL: &str = "Setup run cancelled";
 
 /// Why a device-secret refresh can never succeed for the current binding.
@@ -8855,6 +8780,7 @@ struct SetupScanReconcile {
     failures: u32,
     next_due: Option<Instant>,
 }
+
 static SETUP_SCAN: std::sync::LazyLock<Mutex<SetupScanReconcile>> =
     std::sync::LazyLock::new(|| Mutex::new(SetupScanReconcile::default()));
 
@@ -12055,6 +11981,7 @@ fn validate_device_credential_status(
 }
 
 const IDENTITY_CONTINUITY_CAPABILITY: &str = "prior_device_credential_v1";
+
 // Advertise only with the uploader that reprojects health and heartbeat using
 // the paired machine id. This is compatibility information, not authority.
 const MACHINE_IDENTITY_CAPABILITY: &str = "paired_machine_local_health_v1";
@@ -12298,6 +12225,7 @@ fn reconcile_codex_source_off() -> Result<ConfigPatchResult, LocalApiError> {
 }
 
 static CODEX_CONFIG_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
 static CODEX_CONFIG_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 fn reconcile_codex_source_off_at(
@@ -13434,6 +13362,7 @@ struct SmokeResult {
 /// Code for a Verify smoke the quiet window held back: starting Claude Code
 /// now could refresh, and so sign out, the saved login.
 pub(crate) const CLAUDE_LOGIN_REFRESH_PENDING_CODE: &str = "claude_login_refresh_pending";
+
 pub(crate) const CLAUDE_SMOKE_TIMEOUT_MESSAGE: &str =
     "The Claude Code test run timed out before Ottto could check it.";
 
@@ -14958,6 +14887,7 @@ fn setup_scan_source(
 }
 
 const MANAGED_CONFIG_PREVIEW_MAX_LINES: usize = 40;
+
 const MANAGED_CONFIG_PREVIEW_MAX_LINE_LENGTH: usize = 240;
 
 /// Mask token-shaped content in one managed-config line. Never trusts a
@@ -17543,12 +17473,6 @@ fn source_display_name(source: &SourceKind) -> &'static str {
         SourceKind::Pi => "Pi",
     }
 }
-
-#[cfg(test)]
-pub(crate) use tests::{owner_return_credential_for_test, owner_return_seed_for_test};
-
-#[cfg(test)]
-pub(crate) use tests::account_return_claim_for_test;
 
 #[cfg(test)]
 pub(crate) mod tests;
