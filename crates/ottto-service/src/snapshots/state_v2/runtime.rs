@@ -180,6 +180,30 @@ fn states() -> &'static Mutex<BTreeMap<PathBuf, RouteHandle>> {
     static STATES: OnceLock<Mutex<BTreeMap<PathBuf, RouteHandle>>> = OnceLock::new();
     STATES.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
+
+/// Cold-close one saved synthetic route; leave every durable row and fence intact.
+#[cfg(test)]
+pub(crate) fn cold_close_for_test(path: &Path) -> Result<()> {
+    let _lock = super::super::CheckpointLock::acquire(path)?;
+    let state = states().lock().unwrap().get(path).cloned();
+    if let Some(state) = state {
+        for runtime in state
+            .lock()
+            .unwrap()
+            .runtimes
+            .iter()
+            .filter_map(|r| r.upgrade())
+        {
+            ensure!(
+                Arc::strong_count(&runtime) <= 2,
+                "drop fixture index handles before cold close"
+            );
+        }
+        invalidate_locked(path)?;
+        states().lock().unwrap().remove(path);
+    }
+    Ok(())
+}
 fn with_state<T>(path: &Path, f: impl FnOnce(&mut RouteState) -> Result<T>) -> Result<T> {
     let state = {
         let mut states = states().lock().map_err(|_| Hold::DbUnavailable)?;

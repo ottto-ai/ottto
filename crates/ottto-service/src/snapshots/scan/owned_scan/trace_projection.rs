@@ -29,70 +29,63 @@ fn pending(rows: &[PendingIndexFinalization], roots: &[PathBuf]) -> Value {
         .collect::<Vec<_>>())
 }
 
-impl OwnedSourceScan {
-    /// Re-select the unstepped fixture page through the ordinary constructor.
-    /// Return its original candidates to the real walk before changing order
-    /// and allowance; keep acquisition, sidecars and settlement unchanged.
-    pub(crate) fn with_oracle_schedule(self, limit: usize, reverse: bool) -> (Self, Value) {
-        assert!(self.active_file.is_none() && self.snapshots.is_empty());
-        let Self {
-            source,
-            roots,
-            mut index,
-            collected_at,
-            backfill_window_days,
-            claude_effort_support_dir,
-            claude_request_identity_capture,
-            identified_candidates,
-            selected_flags,
-            sampling,
-            launch_events,
-            codex_versions,
-            line_delivery,
-            ..
-        } = self;
-        requeue_members(&mut index, &selected_flags, &identified_candidates);
-        let walk = index.traversal.as_mut().expect("prepared fixture walk");
-        assert!(
-            walk.pending_directories.is_empty(),
-            "fixture fits one directory tick"
-        );
-        let queue = walk.pending_candidates.make_contiguous();
-        queue.sort_by(|a, b| a.path.cmp(&b.path));
-        if reverse {
-            queue.reverse();
+thread_local! {
+    static SCHEDULE: std::cell::Cell<Option<(usize, bool)>> = const { std::cell::Cell::new(None) };
+    static DISCOVERY: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+pub(super) fn requested_file_limit(default: usize) -> usize {
+    SCHEDULE.with(|slot| slot.get().map_or(default, |(limit, _)| limit))
+}
+
+pub(super) fn permute_candidates(walk: &mut ScanTraversalCheckpoint) {
+    SCHEDULE.with(|slot| {
+        if let Some((_, reverse)) = slot.get() {
+            let queue = walk.pending_candidates.make_contiguous();
+            queue.sort_by(|a, b| a.path.cmp(&b.path));
+            if reverse {
+                queue.reverse();
+            }
+            DISCOVERY
+                .with(|order| *order.borrow_mut() = queue.iter().map(|p| p.path.clone()).collect());
         }
-        let order = queue
-            .iter()
-            .map(|p| relative(&p.path.to_string_lossy(), &roots))
-            .collect::<Vec<_>>();
-        let context = sampling.expect("synthetic sampled acquisition");
-        let mut next = Self::new_with_recovery_priority(
-            source,
-            &roots,
-            index,
-            &collected_at,
-            backfill_window_days,
-            limit,
-            claude_effort_support_dir.as_deref(),
-            &[],
-            false,
-            &mut ListingRequest::default(),
-            claude_request_identity_capture,
-            &[],
-            Some((context.cache.as_ref(), &context.namespace)),
-        )
-        .with_sampled_acquisition(context.cache, context.namespace);
-        next.launch_events = launch_events;
-        next.codex_versions = codex_versions;
-        next.line_delivery = line_delivery;
-        let selected = next
+    });
+}
+
+impl OwnedSourceScan {
+    /// Install fixture scheduling before real prepare performs selection.
+    pub(crate) fn with_oracle_schedule<T>(
+        schedule: Option<(usize, bool)>,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        struct Restore(Option<(usize, bool)>, Vec<PathBuf>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                SCHEDULE.with(|slot| slot.set(self.0));
+                DISCOVERY.with(|order| *order.borrow_mut() = std::mem::take(&mut self.1));
+            }
+        }
+        let _restore = Restore(
+            SCHEDULE.with(|slot| slot.replace(schedule)),
+            DISCOVERY.with(|order| order.take()),
+        );
+        run()
+    }
+
+    pub(crate) fn oracle_schedule_plan(&self) -> Value {
+        let selected = self
             .identified_candidates
             .iter()
-            .map(|p| relative(&p.path.to_string_lossy(), &roots))
+            .map(|p| relative(&p.path.to_string_lossy(), &self.roots))
             .collect::<Vec<_>>();
-        let plan = json!({"limit":limit,"reverse":reverse,"discovery":order,"selected":selected});
-        (next, plan)
+        let discovery = DISCOVERY.with(|order| {
+            order
+                .borrow()
+                .iter()
+                .map(|p| relative(&p.to_string_lossy(), &self.roots))
+                .collect::<Vec<_>>()
+        });
+        json!({"limit":self.file_limit,"discovery":discovery,"selected":selected})
     }
 
     pub(crate) fn with_oracle_births<T>(
@@ -161,6 +154,7 @@ impl SourceScanResult {
             "ownership_incomplete_file_count": self.ownership_incomplete_file_count,
             "residue_count": self.census_residue_index_key_count,
             "continuation_pending": self.continuation_ticket.is_some(),
+            "backfill_file_limit": self.backfill_file_limit,
         })
     }
 }
@@ -245,7 +239,22 @@ impl ScanIndex {
             })
             .map(|(key, _)| relative(key, roots))
             .collect::<Vec<_>>();
-        json!({"holds":holds,"owed":owed,
+        let pending = self.traversal.as_ref().map_or(0, |walk| {
+            walk.pending_directories.len() + walk.pending_candidates.len()
+        });
+        let debt = json!({
+            "quarantine":self.quarantined_snapshot_fingerprints.len(),
+            "withheld":self.withheld_memo.held_gauge(),
+            "native_recovery":self.files.values().filter(|e| e.codex_recovery_is_pending()).count(),
+            "terminal_retry":self.terminal_contract_retries.len(),
+            "incidence_census":self.accepted_incidence_pending_census,
+            "accepted_rebuild":self.accepted_rebuild_pending_since_unix_seconds.is_some(),
+            "unsettled":self.bounded_sweep_had_unsettled_upload,
+            "residue":self.scan_residue_witness.as_ref().map_or(0, |r| r.index_keys.len()),
+            "sidecar_retry":self.claude_desktop_store_retry_not_before_unix_seconds.is_some(),
+            "deleted_unaccepted":self.tail_discovery.deleted_unaccepted_files,
+        });
+        json!({"holds":holds,"owed":owed,"pending":pending,"debt":debt,
             "copy_wait":copy_wait,
             "content_twins":self.claude_request_census.records().filter(|(_, r)| r.is_twin()).count()})
     }
