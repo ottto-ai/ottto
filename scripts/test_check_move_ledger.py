@@ -315,6 +315,23 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(status, 1)
         self.assertIn('order changed in crates/demo/src/snapshots.rs', out)
 
+    def test_method_moves_into_an_existing_impl_with_the_same_header(self):
+        destination = 'use super::Holder;\n\nimpl Holder {\n    fn three(&self) {}\n}\n'
+        root = ROOT.replace('use std::fmt;\n', 'use std::fmt;\nmod extra;\n')
+        self.base = self.repo.commit({src('snapshots.rs'): root,
+                                      src('snapshots/extra.rs'): destination})
+        method = '    fn two(&self) -> u32 {\n        self.inner\n    }\n'
+        root = root.replace('\n' + method, '')
+        moved = destination.removesuffix('}\n') + '\n' + method + '}\n'
+        status, out = self.move(root, {src('snapshots/extra.rs'): moved})
+        self.assertEqual(status, 0, out)
+        self.assertIn('impl Holder :: fn two', out)
+        self.assertIn('-> crates/demo/src/snapshots/extra.rs:', out)
+        # Matching wrappers do not excuse an edit to the moved method's body.
+        status, out = self.move(root, {src('snapshots/extra.rs'): moved.replace('self.inner', 'self.inner + 1')})
+        self.assertEqual(status, 1, out)
+        self.assertIn('changed: impl Holder :: fn two', out)
+
     def test_inline_module_becomes_a_file_with_its_cfg_and_indentation(self):
         base = self.repo.commit({src('snapshots.rs'): ROOT + code('''
 
