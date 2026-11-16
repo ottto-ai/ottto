@@ -599,11 +599,14 @@ impl LocalDaemon {
         state
             .source_reconciliation
             .insert(source_slug(&source).to_string(), enabled);
-        if receipt_window_days == 0 || !enabled {
-            snapshot_sync::reset_collection_health(snapshot_sync::snapshot_source_of_kind(&source));
-        } else {
-            // A positive prepare hint resumes the pulse before reconciliation.
-            snapshot_sync::start_collection_health(snapshot_sync::snapshot_source_of_kind(&source));
+        let policy_enabled = enabled && receipt_window_days > 0;
+        let snapshot_source = snapshot_sync::snapshot_source_of_kind(&source);
+        if !policy_enabled || !state.tracking_confirmation.policy_allows(&source) {
+            // A cycle offered while policy-stopped cannot supply the resume baseline.
+            snapshot_sync::reset_collection_health(snapshot_source);
+        }
+        if policy_enabled {
+            snapshot_sync::start_collection_health(snapshot_source);
         }
         if state
             .tracking_confirmation

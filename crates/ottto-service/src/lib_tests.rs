@@ -4103,6 +4103,8 @@ mod tests {
                         .record_reconciliation_enabled(source.clone(), enabled, window)
                         .unwrap();
                     assert!(status().collection.is_none());
+                    // A later cycle can offer a source before learning its positive hint.
+                    snapshot_sync::start_collection_health(scan_source);
                     with_clock(20000, || {
                         daemon
                             .record_reconciliation_enabled(source.clone(), true, 30)
