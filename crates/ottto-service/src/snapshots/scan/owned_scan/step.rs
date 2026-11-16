@@ -121,6 +121,7 @@ impl OwnedSourceScan {
             audit_now,
             backfill_window_days,
             file_limit,
+            mut first_read_progress,
             page_file_limit_hit,
             claude_request_identity_capture,
             claude_effort_support_dir,
@@ -288,6 +289,7 @@ impl OwnedSourceScan {
                     census.unreadable_path_count += inventory.refused.len();
                     census.unreadable_causes.merge(inventory.unreadable_causes);
                     let mut grouped_paths = BTreeSet::new();
+                    let mut inventory_held = BTreeSet::new();
                     let mut used = 0usize;
                     // R2-N6: a group with more members than the page's file
                     // limit is never excluded; it goes first and takes a page
@@ -417,15 +419,20 @@ impl OwnedSourceScan {
                             })
                             || group.members.len() < 2
                         {
+                            let members = group
+                                .members
+                                .iter()
+                                .map(|member| local_index_key(&member.path));
+                            if !inventory.complete {
+                                // Owed to the inventory hold, which keeps the
+                                // generation red until it is released.
+                                inventory_held.extend(members);
+                                continue;
+                            }
                             census.ownership_incomplete_file_count += group.members.len();
                             census.causes.add(ownership::INVENTORY, group.members.len());
                             census.record_unreadable(UnreadableCause::AliasParser, 1);
-                            residue_index_keys.extend(
-                                group
-                                    .members
-                                    .iter()
-                                    .map(|member| local_index_key(&member.path)),
-                            );
+                            residue_index_keys.extend(members);
                             continue;
                         }
                         // G1: a group whose attempt already ended in this
@@ -563,11 +570,23 @@ impl OwnedSourceScan {
                         })
                         .map(|candidate| local_index_key(&candidate.path))
                         .collect::<BTreeSet<_>>();
-                    census.ownership_incomplete_file_count += held.len();
-                    census.causes.add(ownership::INVENTORY, held.len());
-                    residue_index_keys.extend(held.iter().cloned());
                     identified_candidates
                         .retain(|candidate| !held.contains(&local_index_key(&candidate.path)));
+                    if inventory.complete {
+                        census.ownership_incomplete_file_count += held.len();
+                        census.causes.add(ownership::INVENTORY, held.len());
+                        residue_index_keys.extend(held);
+                    } else {
+                        inventory_held.extend(held);
+                    }
+                    // Record the hold now: preparation yields below, and a
+                    // resumed step does not come back here.
+                    if !inventory_held.is_empty() {
+                        if let Some(traversal) = index.traversal.as_mut() {
+                            inventory_held.extend(residue_index_keys.iter().cloned());
+                            record_codex_inventory_hold(traversal, inventory, &inventory_held);
+                        }
+                    }
                     while !identified_candidates.is_empty()
                         && used + identified_candidates.len() > file_limit
                     {
@@ -2467,6 +2486,17 @@ impl OwnedSourceScan {
                         );
                     }
                 }
+                // First-read work: a selected census read that records a path
+                // new to the index (any member of a joined group). A re-read of
+                // a recorded file, such as a live session's hint, is not.
+                let paths =
+                    || std::iter::once(&candidate.path).chain(aliases.iter().map(|a| &a.path));
+                first_read_progress |= parse_complete
+                    && sampled_scan::codex_cursor::census_member(
+                        &selected_flags,
+                        paths().map(PathBuf::as_path),
+                    )
+                    && paths().any(|path| !index.files.contains_key(&local_index_key(path)));
                 if parse_complete && !aliases.is_empty() {
                     for alias in &aliases {
                         if alias.path == candidate.path {
@@ -3161,7 +3191,7 @@ impl OwnedSourceScan {
                     // sweep, the terminal manifest) held behind it. Retryable problems
                     // veto the settlement inside the helper.
                     if let Some(traversal) = index.traversal.as_mut() {
-                        traversal.counts.settle_non_progressing_residue();
+                        traversal.settle_non_progressing_residue();
                     }
                 }
                 if let Some(traversal) = index.traversal.as_mut() {
@@ -3174,7 +3204,7 @@ impl OwnedSourceScan {
                     .expect("traversal remains active");
                 let routine_recensus =
                     traversal_transition::routine_recensus(source, &traversal_snapshot);
-                let traversal_healthy = !traversal_snapshot.counts.has_errors();
+                let traversal_healthy = !traversal_snapshot.has_errors();
                 let clean_frozen_generation = !traversal_snapshot.watcher_hint_seen;
                 let reconciliation_complete = if traversal_discovery_done
                     && traversal_healthy
@@ -3284,7 +3314,7 @@ impl OwnedSourceScan {
                 let census_status = CensusStatus {
                     pending_work: !traversal.pending_directories.is_empty()
                         || !traversal.pending_candidates.is_empty(),
-                    retryable_problem: traversal.counts.has_retryable_problems(),
+                    retryable_problem: traversal.has_retryable_problems(),
                     transport_reservation_refused: index
                         .context_read_counts
                         .transport_reservation_refused,
@@ -3485,6 +3515,7 @@ impl OwnedSourceScan {
                     page_file_limit_hit,
                     routine_recensus,
                     page_byte_budget_hit: codex_page.budget_deferred(),
+                    first_read_progress,
                     claude_queued_family_deferred_paths: std::mem::take(
                         &mut history_upgrade.queued_family_deferred_paths,
                     ),
@@ -3651,6 +3682,7 @@ impl OwnedSourceScan {
                     ("routine_recensus", scan.routine_recensus),
                     ("page_file_limit_hit", scan.page_file_limit_hit),
                     ("pending_work", scan.census_status.pending_work),
+                    ("first_read_progress", scan.first_read_progress),
                     (
                         "first_import_default_qos",
                         crate::snapshot_sync::continuation::first_import_default_qos(),
@@ -3995,26 +4027,28 @@ impl OwnedSourceScan {
                 pending!();
             }
             // After ordinary identity, decision and admission (no seed
-            // pre-open), a content twin pulls its holder and a main holder
-            // pulls the content twins it proves (one relation), so a page
-            // never reads one without the other. A proving holder is never a
-            // census twin: the arms are disjoint and the pulled set closes at
-            // the holder and its twins. A history-held holder (its bodies
-            // vetoed) pulls nothing, so its twins never emit the session alone.
+            // pre-open), content twins and mains pull every overlapping live
+            // member of the opposite kind. Pulled candidates pass the ordinary
+            // history and resident gates; the emission fence withholds incomplete
+            // sessions. History-held mains pull nothing.
             let seed = local_index_key(&candidate.path);
             let record = (source == SnapshotSource::ClaudeCode)
                 .then(|| index.claude_request_census.get(&seed))
                 .flatten();
             let walk = std::time::Instant::now();
             let pulls: Vec<String> = match record {
-                Some(record) if record.is_twin() => claude_request_money::e2::copied_file_holders(
-                    index,
-                    std::iter::once(seed.as_str()),
-                )
-                .into_values()
-                .collect(),
-                // Walk only for a holder sharing a request with some twin;
-                // the walk itself keeps only proving main holders.
+                Some(record) if record.is_twin() => {
+                    let mains = index.claude_request_census.records().filter(|(key, main)| {
+                        !main.is_twin()
+                            && claude_request_census::held_candidates(main, record.request_hashes())
+                                .next()
+                                .is_some()
+                            && Path::new(key).is_file()
+                    });
+                    mains.map(|(key, _)| key.clone()).collect()
+                }
+                // Holder choice for copied history does not define all of a
+                // session's contributors.
                 Some(record)
                     if !history_held
                         && claude_request_census::held_candidates(
@@ -4024,19 +4058,14 @@ impl OwnedSourceScan {
                         .next()
                         .is_some() =>
                 {
-                    let twins = index.claude_request_census.records().filter(|(_, twin)| {
+                    let twins = index.claude_request_census.records().filter(|(key, twin)| {
                         twin.is_twin()
                             && claude_request_census::held_candidates(twin, record.request_hashes())
                                 .next()
                                 .is_some()
+                            && Path::new(key).is_file()
                     });
-                    claude_request_money::e2::copied_file_holders(
-                        index,
-                        twins.map(|(key, _)| key.as_str()),
-                    )
-                    .into_iter()
-                    .filter_map(|(twin, holder)| (holder == seed).then_some(twin))
-                    .collect()
+                    twins.map(|(key, _)| key.clone()).collect()
                 }
                 _ => Vec::new(),
             };
@@ -4926,6 +4955,7 @@ impl OwnedSourceScan {
             audit_now,
             backfill_window_days,
             file_limit,
+            first_read_progress,
             page_file_limit_hit,
             claude_request_identity_capture,
             claude_effort_support_dir,

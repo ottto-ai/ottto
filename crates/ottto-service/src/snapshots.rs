@@ -565,6 +565,10 @@ pub struct SourceScanResult {
     pub(crate) routine_recensus: bool,
     /// Codex deferred a file because a page byte budget is spent.
     pub(crate) page_byte_budget_hit: bool,
+    /// The page recorded a selected census read of a file new to the index,
+    /// or a listing tick left census directories queued. Paces only a first
+    /// backfill.
+    pub(crate) first_read_progress: bool,
     pub scanned_file_count: usize,
     pub scanned_session_count: usize,
     pub semantic_noop_count: usize,
@@ -1479,10 +1483,12 @@ fn transcript_path_admitted(source: SnapshotSource, path: &Path) -> bool {
 pub(crate) use discovery::directory::FIRST_READ_WINDOW_DAYS;
 
 #[cfg(test)]
+pub(crate) use discovery::directory::with_test_directory_entries;
+#[cfg(test)]
 use discovery::directory::{
     advance_bounded_directory_traversal, collect_recent_jsonl_files,
     reconcile_missing_index_entries_with_limit, reconcile_missing_index_entries_with_side,
-    with_directory_read_fault, with_test_directory_entries,
+    with_directory_read_fault,
 };
 use discovery::directory::{
     advance_bounded_directory_traversal_with_budget, claude_absence_is_removal,
@@ -2110,9 +2116,13 @@ mod census_unreadable_tests {
             traversal.unreadable_path_count += page.unreadable_path_count;
             traversal.unreadable_causes.merge(page.unreadable_causes);
             // Exactly the original predicate; metadata may not settle residue.
-            assert!(traversal.has_retryable_problems());
-            assert!(traversal.has_errors());
-            assert!(!traversal.settle_non_progressing_residue());
+            let mut checkpoint = ScanTraversalCheckpoint {
+                counts: traversal.clone(),
+                ..tests::traversal_checkpoint()
+            };
+            assert!(checkpoint.has_retryable_problems());
+            assert!(checkpoint.has_errors());
+            assert!(!checkpoint.settle_non_progressing_residue());
         }
         assert_eq!(traversal.unreadable_path_count, 36);
         let projected = projection(&traversal);

@@ -183,6 +183,7 @@ fn disabled_servers_are_not_launched() {
         disabled: true,
         always_load: false,
         config_dir: None,
+        source: ServerSource::UserSettings,
     };
 
     let (input, deferred) = harvest_server(&server, &test_spawn_env());

@@ -1034,6 +1034,7 @@ fn decode_api_sidecar(
     support_dir: &Path,
     session_id: &str,
 ) -> Result<(Vec<ClaudeLocalOtelEvidence>, ApiReadWitness)> {
+    let mut read_cost = crate::local_resource_diagnostics::claude_reread::SidecarRead::begin(false);
     let path = evidence_path(support_dir, session_id);
     let mut health = ClaudeLocalOtelLoadHealth::default();
     let empty = |health| {
@@ -1082,10 +1083,10 @@ fn decode_api_sidecar(
     // Preserve ordinary API read-through on concurrent appends within the
     // protected per-pair allowance.
     let mut reader = BufReader::new((&file).take(allowance));
-    crate::local_resource_diagnostics::claude_sidecar_reparse(1, 0);
+    read_cost.reparse(1, 0);
     let rows = decode_api_rows(&mut reader, session_id, &mut health);
     let bytes = allowance - reader.get_ref().limit();
-    crate::local_resource_diagnostics::claude_sidecar_reparse(0, bytes);
+    read_cost.reparse(0, bytes);
     health.oversized_files = u64::from(opened.len().max(bytes) >= MAX_EVIDENCE_FILE_BYTES);
     if bytes >= allowance {
         health.unreadable_lines += 1;
@@ -1209,6 +1210,7 @@ pub fn load_claude_trace_ownership_evidence(
     support_dir: &Path,
     session_ids: impl IntoIterator<Item = String>,
 ) -> ClaudeTraceOwnershipLoadReport {
+    let mut read_cost = crate::local_resource_diagnostics::claude_reread::SidecarRead::begin(true);
     let mut report = ClaudeTraceOwnershipLoadReport::default();
     for session_id in BTreeSet::from_iter(session_ids) {
         let path = trace_evidence_path(support_dir, &session_id);
@@ -1253,7 +1255,7 @@ pub fn load_claude_trace_ownership_evidence(
             }
         });
         let mut reader = BufReader::new((&file).take(limit));
-        crate::local_resource_diagnostics::claude_sidecar_reparse(1, 0);
+        read_cost.reparse(1, 0);
         let mut decoder = TraceSidecarDecoder::new(&session_id, Vec::new());
         decoder.report = report;
         for line in reader.by_ref().lines() {
@@ -1267,7 +1269,7 @@ pub fn load_claude_trace_ownership_evidence(
             decoder.push_line(line.as_bytes());
         }
         let bytes = limit - reader.get_ref().limit();
-        crate::local_resource_diagnostics::claude_sidecar_reparse(0, bytes);
+        read_cost.reparse(0, bytes);
         #[cfg(test)]
         TRACE_BYTES_FOR_TEST.with(|count| count.set(count.get() + bytes));
         let unchanged = generation_unchanged(&file, &path, api_file_generation(&opened).as_ref());

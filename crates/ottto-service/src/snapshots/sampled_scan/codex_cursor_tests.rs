@@ -6931,6 +6931,42 @@ fn paced_defer_is_pending_not_waiter_not_fenced() {
     });
 }
 
+/// [regress] A census member deferred behind another rotation waiter stays
+/// owed page after page and is never first-read progress (a stuck tail).
+#[test]
+fn rotation_deferred_member_is_not_first_read_progress() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(80);
+    let path = fixture.file(SESSION);
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 1024, 64, || {
+        let ahead = rotation_key("cursor-fixture", "/ahead");
+        cache
+            .with_cursor(|cursor| cursor.rotation.wait(&ahead))
+            .unwrap();
+        let mut index = ScanIndex::default();
+        for page_number in 0..2 {
+            let (next, scan) = page(&fixture, index, Some(Arc::clone(&cache)));
+            index = next;
+            assert!(
+                pending_hint(&index, &path).is_some(),
+                "{}",
+                counters(&cache)
+            );
+            assert!(scan.census_status.pending_work, "page {page_number}");
+            assert!(!scan.first_read_progress, "page {page_number}");
+            assert!(!scan.page_byte_budget_hit, "page {page_number}");
+        }
+        assert!(
+            counter(&cache, |c| c.deferred_rotation) >= 2,
+            "{}",
+            counters(&cache)
+        );
+    });
+}
+
 /// §7 Guard, condition 2: a clock failure, an unknown ordinary interval or an
 /// overflow is unknown coverage. The attempt loses its acceleration for good
 /// (no further ticket); its pause or end forgets its slot and holds

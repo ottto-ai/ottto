@@ -120,6 +120,64 @@ fn page_observed_with_limit(
     cache: Arc<sampled_scan::SharedCache>,
     file_limit: usize,
     codex_slots: &[(String, String, usize)],
+    observe: impl FnMut(&mut OwnedSourceScan),
+) -> (ScanIndex, SourceScanResult, Delivered, u64, Vec<Value>) {
+    page_observed_hinted(roots, index, cache, file_limit, codex_slots, &[], observe)
+}
+/// `page_observed_with_limit` with the watcher's path hints.
+fn page_observed_hinted(
+    roots: &[PathBuf],
+    index: ScanIndex,
+    cache: Arc<sampled_scan::SharedCache>,
+    file_limit: usize,
+    codex_slots: &[(String, String, usize)],
+    hints: &[PathBuf],
+    observe: impl FnMut(&mut OwnedSourceScan),
+) -> (ScanIndex, SourceScanResult, Delivered, u64, Vec<Value>) {
+    page_observed_hinted_at(
+        roots,
+        index,
+        cache,
+        file_limit,
+        codex_slots,
+        hints,
+        NOW,
+        observe,
+    )
+}
+/// `page_observed_with_limit` collected at `at`, e.g. a later generation.
+fn page_observed_at(
+    roots: &[PathBuf],
+    index: ScanIndex,
+    cache: Arc<sampled_scan::SharedCache>,
+    file_limit: usize,
+    codex_slots: &[(String, String, usize)],
+    at: &str,
+    observe: impl FnMut(&mut OwnedSourceScan),
+) -> (ScanIndex, SourceScanResult, Delivered, u64, Vec<Value>) {
+    page_observed_hinted_at(
+        roots,
+        index,
+        cache,
+        file_limit,
+        codex_slots,
+        &[],
+        at,
+        observe,
+    )
+}
+#[expect(
+    clippy::too_many_arguments,
+    reason = "roots, store, cache, page limit, slots, hints, clock and observer"
+)]
+fn page_observed_hinted_at(
+    roots: &[PathBuf],
+    index: ScanIndex,
+    cache: Arc<sampled_scan::SharedCache>,
+    file_limit: usize,
+    codex_slots: &[(String, String, usize)],
+    hints: &[PathBuf],
+    at: &str,
     mut observe: impl FnMut(&mut OwnedSourceScan),
 ) -> (ScanIndex, SourceScanResult, Delivered, u64, Vec<Value>) {
     let delivered = Delivered::default();
@@ -130,11 +188,11 @@ fn page_observed_with_limit(
                 SnapshotSource::Codex,
                 roots,
                 index,
-                NOW,
+                at,
                 BACKFILL_WINDOW_DAYS,
                 file_limit,
                 None,
-                &[],
+                hints,
                 false,
                 &mut ListingRequest::default(),
                 false,
@@ -1433,6 +1491,830 @@ fn release_0217_archive_manifest_members_and_header_attempts_load_inert() {
     assert!(index.files.is_empty());
 }
 
+/// Named creator slots for both accounts, so rows carry account tags.
+fn named_creator_slots() -> [(String, String, usize); 2] {
+    let hash = |kind: &str, account: &str| {
+        let value = if kind == "account" {
+            "user"
+        } else {
+            "workspace"
+        };
+        ottto_core::billing_identity_hash("openai", kind, &format!("synthetic-{value}-{account}"))
+            .unwrap()
+    };
+    ["a", "b"].map(|account| {
+        (
+            hash("account", account),
+            hash("workspace", account),
+            crate::codex_scan_diagnostics::CREATOR_NAMED,
+        )
+    })
+}
+
+/// [money] A page held only because its header inventory was incomplete
+/// owes its candidates to the hold and adds no unreadable or ownership count.
+/// The hold keeps the generation red while it owes them. Its release catches
+/// them up with cold-equal money and reads what an unheld page reads:
+/// - "ram"/"restart": the held page drained discovery, so that generation is
+///   red and bounded; the hold survives the durable checkpoint, and the
+///   release leaves the generation healthy with no further walk.
+/// - "spans": the held page is not the drain page; no retry is ever armed and
+///   the generation completes and retires.
+/// - "unlisted": a held file the roster no longer lists stays owed after the
+///   release, durably and red, until the bounded retry's fresh walk
+///   rediscovers it and catches it up.
+/// - "pre-fix": a store an older release wrote mid-hold, synthetic counts
+///   included, ends one red generation, then catches up without subtracting
+///   them.
+#[test]
+fn inventory_held_page_catches_up_and_leaves_the_generation_healthy() {
+    const NEW: &str = "019e5a00-0000-7000-8000-00000000000e";
+    let _lock = DECODER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let slots = named_creator_slots();
+    let fresh = || Arc::new(sampled_scan::SharedCache::default());
+    let healthy = |index: &ScanIndex| index.traversal.as_ref().map_or(true, |t| !t.has_errors());
+    let unarmed = |index: &ScanIndex| {
+        index.traversal.as_ref().map_or(true, |t| {
+            t.unhealthy_retry_attempt == 0 && t.unhealthy_retry_not_before_unix_seconds.is_none()
+        })
+    };
+    let hold_of = |index: &ScanIndex| {
+        index
+            .traversal
+            .as_ref()
+            .and_then(|t| t.residue.codex_inventory_hold.clone())
+    };
+    let changed = [MAIN, OTHER, NEW];
+    let mut control_reads = None;
+    for arm in ["control", "ram", "restart", "spans", "unlisted", "pre-fix"] {
+        let limit = if arm == "spans" { 2 } else { 100 };
+        let c = Corpus::new();
+        c.write(MAIN, Some("a"));
+        c.write(OTHER, Some("b"));
+        c.write(SIDE, Some("b"));
+        c.write(GAP, None);
+        let (session, prior) = StateV2ColdSession::publish(
+            Source::Codex,
+            &ScanIndex::default(),
+            &c.scratch.join("state"),
+        );
+        let (working, first, _, _, _) =
+            page_observed_with_limit(&c.roots(), prior.clone(), fresh(), 100, &slots, |_| {});
+        let (mut index, posts) = working.checkpoint_with_captured_posts(&first, &prior, "accept");
+        let accepted = route(&index, &first, posts);
+        // A mid-session account switch, a side call, an evidence gap and a
+        // never-accepted rollout.
+        append(&c.path(MAIN), &(turn(3) + &header(MAIN, Some("switched"))));
+        append(&c.path(OTHER), &turn(3));
+        c.write(NEW, Some("a"));
+        e2_pipeline_scan_fixture::age_listing_for_test(&mut index);
+        let (_, cold, _, _, _) = page_observed_with_limit(
+            &c.roots(),
+            ScanIndex::default(),
+            fresh(),
+            100,
+            &slots,
+            |_| {},
+        );
+        assert!(
+            cold.snapshots
+                .iter()
+                .flat_map(|item| &item.model_usage)
+                .any(|row| row.account_identifier_hash.is_some()),
+            "tagged positive control"
+        );
+        let cold_of = |index: &ScanIndex, scan: &SourceScanResult| {
+            let mut page = cold.clone();
+            page.snapshots.retain(|item| {
+                scan.snapshots
+                    .iter()
+                    .any(|own| own.source_session_id == item.source_session_id)
+            });
+            emitted(index, &page)
+        };
+        let keys = changed.map(|id| local_index_key(&c.path(id)));
+        let before = index.clone();
+        let mut injected = arm == "control";
+        let (working, held, delivered, consumed, _) =
+            page_observed_with_limit(&c.roots(), index, fresh(), limit, &slots, |scan| {
+                if let Some(inventory) = scan.codex_join_inventory.as_mut().filter(|_| !injected) {
+                    inventory.complete = false;
+                    injected = true;
+                }
+            });
+        assert!(injected, "{arm}");
+        if arm == "control" {
+            let (index, posts) = working.checkpoint_with_captured_posts(&held, &before, "accept");
+            for id in changed {
+                assert!(held
+                    .snapshots
+                    .iter()
+                    .any(|item| item.source_session_id == id));
+            }
+            money_oracle::assert_equivalent(&cold_of(&index, &held), &route(&index, &held, posts));
+            assert!(
+                healthy(&index),
+                "an unheld page leaves the generation healthy"
+            );
+            control_reads = Some((held.scanned_file_count, consumed));
+            drop(session);
+            continue;
+        }
+        assert!(held.snapshots.is_empty(), "{arm}: {:?}", held.snapshots);
+        assert!(
+            delivered.0.lock().unwrap().is_empty(),
+            "{arm}: no body read"
+        );
+        assert!(!held.census_complete);
+        assert_eq!(
+            held.unreadable_path_count, 0,
+            "{arm}: no synthetic unreadable"
+        );
+        assert_eq!(
+            held.ownership_incomplete_file_count, 0,
+            "{arm}: no synthetic ownership"
+        );
+        let (mut index, posts) = working.checkpoint_with_captured_posts(&held, &before, "accept");
+        assert!(posts.is_empty());
+        {
+            // Recorded before the preparation yield: every held candidate is
+            // owed, and none is residue.
+            let traversal = index.traversal.as_ref().expect("the held generation stays");
+            let hold = hold_of(&index).expect("the held candidates are owed");
+            let owed = keys
+                .iter()
+                .filter(|key| hold.owed.contains(*key))
+                .collect::<Vec<_>>();
+            for key in &keys {
+                assert!(!traversal.residue.index_keys.contains(key), "{arm}: {key}");
+            }
+            assert!(traversal.has_errors() && !traversal.has_unsettled_residue());
+            if arm == "spans" {
+                // Two held; the third waits in the queue, so discovery is
+                // not done and no retry is armed.
+                assert_eq!(owed.len(), 2, "{arm}: {:?}", hold.owed);
+                assert!(traversal.pending_candidates.iter().any(|candidate| {
+                    keys.contains(&local_index_key(&candidate.path))
+                        && !hold.owed.contains(&local_index_key(&candidate.path))
+                }));
+                assert!(unarmed(&index), "{arm}: no retry armed by a held page");
+            } else {
+                assert_eq!(owed.len(), 3, "{arm}: {:?}", hold.owed);
+                // The held page drained discovery: red and bounded.
+                assert!(traversal.unhealthy_retry_not_before_unix_seconds.is_some());
+            }
+        }
+        for key in &keys[..2] {
+            assert_eq!(
+                index.files[key].last_upload_body_witness,
+                before.files[key].last_upload_body_witness,
+                "{arm}: a held accepted witness is unchanged"
+            );
+        }
+        assert!(index
+            .files
+            .get(&keys[2])
+            .is_none_or(|entry| entry.last_upload_body_witness.is_none()));
+        let mut held_route = emitted(&index, &held);
+        held_route.accepted = accepted.accepted.clone();
+        let mut cold_held = cold.clone();
+        cold_held
+            .snapshots
+            .retain(|item| changed.contains(&item.source_session_id.as_str()));
+        money_oracle::assert_held_set(
+            &changed,
+            &accepted,
+            &held_route,
+            &emitted(&index, &cold_held),
+        );
+        match arm {
+            "restart" => {
+                let hold = hold_of(&index);
+                index = ScanIndex::load(session.path()).unwrap();
+                assert_eq!(
+                    hold_of(&index),
+                    hold,
+                    "the durable checkpoint keeps the hold"
+                );
+            }
+            "unlisted" => {
+                // The roster loses the new file; it still exists.
+                let traversal = index.traversal.as_mut().unwrap();
+                assert!(traversal.codex_rollout_paths.remove(&keys[2]));
+                index = session.save_reload(&mut index);
+            }
+            "pre-fix" => {
+                // What an older release folded for the same held page.
+                let traversal = index.traversal.as_mut().unwrap();
+                let owed = traversal
+                    .residue
+                    .codex_inventory_hold
+                    .as_ref()
+                    .unwrap()
+                    .owed
+                    .clone();
+                traversal.counts.ownership_incomplete_file_count += owed.len();
+                traversal
+                    .counts
+                    .causes
+                    .add(ownership::INVENTORY, owed.len());
+                traversal
+                    .counts
+                    .record_unreadable(UnreadableCause::AliasParser, 1);
+                traversal.residue.index_keys.extend(owed);
+                index = session.save_reload(&mut index);
+            }
+            _ => {}
+        }
+        // Release and catch up, page by page.
+        let mut caught = BTreeSet::new();
+        let mut reads = (0, 0);
+        let mut last_accepted = None;
+        for _ in 0..8 {
+            let before = index.clone();
+            let (working, page, _, consumed, _) =
+                page_observed_with_limit(&c.roots(), index, fresh(), limit, &slots, |_| {});
+            let (next, posts) = working.checkpoint_with_captured_posts(&page, &before, "accept");
+            index = next;
+            reads = (reads.0 + page.scanned_file_count, reads.1 + consumed);
+            if !page.snapshots.is_empty() {
+                let caught_up = route(&index, &page, posts);
+                money_oracle::assert_equivalent(&cold_of(&index, &page), &caught_up);
+                caught.extend(
+                    page.snapshots
+                        .iter()
+                        .map(|item| item.source_session_id.clone()),
+                );
+                last_accepted = Some(caught_up);
+            }
+            if arm == "spans" {
+                assert!(unarmed(&index), "{arm}: a release never arms a retry");
+            }
+            if arm != "spans" || index.traversal.is_none() {
+                break;
+            }
+        }
+        if arm == "unlisted" {
+            // Released but unlisted: owed, durable and red until the retry.
+            assert_eq!(
+                caught,
+                BTreeSet::from([MAIN.to_string(), OTHER.to_string()])
+            );
+            let hold = hold_of(&index).expect("the unlisted file stays owed");
+            assert_eq!(hold.owed, BTreeSet::from([keys[2].clone()]));
+            assert!(hold.outside_roster.contains_key(&keys[2]));
+            assert!(!healthy(&index));
+            let reloaded = ScanIndex::load(session.path()).unwrap();
+            assert_eq!(hold_of(&reloaded), Some(hold));
+            assert!(!healthy(&reloaded));
+            index
+                .traversal
+                .as_mut()
+                .unwrap()
+                .unhealthy_retry_not_before_unix_seconds = Some(0);
+            let before = index.clone();
+            let (working, rewalk, _, _, _) =
+                page_observed_with_limit(&c.roots(), index, fresh(), limit, &slots, |_| {});
+            let (next, posts) = working.checkpoint_with_captured_posts(&rewalk, &before, "accept");
+            index = next;
+            assert_eq!(
+                rewalk
+                    .snapshots
+                    .iter()
+                    .map(|item| item.source_session_id.as_str())
+                    .collect::<Vec<_>>(),
+                vec![NEW],
+                "the fresh walk rediscovers only the owed file"
+            );
+            let caught_up = route(&index, &rewalk, posts);
+            money_oracle::assert_equivalent(&cold_of(&index, &rewalk), &caught_up);
+            caught.insert(NEW.to_string());
+            last_accepted = Some(caught_up);
+        }
+        assert_eq!(
+            caught,
+            changed
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<BTreeSet<_>>(),
+            "{arm}: every held session caught up"
+        );
+        assert!(hold_of(&index).is_none());
+        if arm == "pre-fix" {
+            // Forward-only: the old counts stay until the bounded re-walk.
+            let traversal = index.traversal.as_ref().expect("one red generation");
+            assert!(traversal.has_errors());
+            assert!(traversal.counts.unreadable_path_count > 0);
+            index
+                .traversal
+                .as_mut()
+                .unwrap()
+                .unhealthy_retry_not_before_unix_seconds = Some(0);
+            let before = index.clone();
+            let (working, rewalk, _, _, _) =
+                page_observed_with_limit(&c.roots(), index, fresh(), limit, &slots, |_| {});
+            assert!(rewalk.snapshots.is_empty(), "the re-walk re-emits nothing");
+            let (next, posts) = working.checkpoint_with_captured_posts(&rewalk, &before, "accept");
+            assert!(posts.is_empty());
+            index = next;
+        } else if arm != "unlisted" {
+            assert_eq!(
+                Some(reads),
+                control_reads,
+                "{arm}: the release reads what an unheld page reads"
+            );
+        }
+        assert!(healthy(&index), "{arm}: the generation is healthy");
+        if arm == "spans" {
+            assert!(index.traversal.is_none(), "{arm}: the generation retired");
+        }
+        assert_quiet(&c, index, &last_accepted.expect("a caught-up page"));
+        drop(session);
+    }
+}
+
+/// [money] Two refused first records hold a page. Repairing one releases the
+/// hold, but the other still refuses: it counts again as a real unreadable,
+/// is held again and keeps the generation open and red. Once it is repaired
+/// too, every held session catches up cold-equal.
+#[test]
+fn a_remaining_refused_header_stays_red_after_another_releases_the_hold() {
+    const BAD_A: &str = "019e5a00-0000-7000-8000-0000000000a1";
+    const BAD_B: &str = "019e5a00-0000-7000-8000-0000000000b1";
+    let _lock = DECODER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let slots = named_creator_slots();
+    let fresh = || Arc::new(sampled_scan::SharedCache::default());
+    let c = Corpus::new();
+    c.write(MAIN, Some("a"));
+    c.write(OTHER, Some("b"));
+    c.write(SIDE, Some("b"));
+    c.write(GAP, None);
+    let (session, prior) = StateV2ColdSession::publish(
+        Source::Codex,
+        &ScanIndex::default(),
+        &c.scratch.join("state"),
+    );
+    let page = |index: ScanIndex| {
+        let before = index.clone();
+        let (working, scan, _, _, _) =
+            page_observed_with_limit(&c.roots(), index, fresh(), 100, &slots, |_| {});
+        let (index, posts) = working.checkpoint_with_captured_posts(&scan, &before, "accept");
+        (index, scan, posts)
+    };
+    let (mut index, _, _) = page(prior);
+    let refused = |index: &ScanIndex| {
+        index
+            .traversal
+            .as_ref()
+            .and_then(|t| t.residue.codex_inventory_hold.as_ref())
+            .map(|hold| {
+                hold.refused_headers
+                    .keys()
+                    .cloned()
+                    .collect::<BTreeSet<_>>()
+            })
+    };
+    let [bad_a, bad_b] = [BAD_A, BAD_B].map(|id| c.path(id));
+    fs::write(&bad_a, "not a header\n").unwrap();
+    fs::write(&bad_b, "not a header\n").unwrap();
+    append(&c.path(MAIN), &turn(3));
+    e2_pipeline_scan_fixture::age_listing_for_test(&mut index);
+    let (index, held, posts) = page(index);
+    assert!(held.snapshots.is_empty() && posts.is_empty());
+    assert_eq!(held.unreadable_path_count, 2, "two real refusals");
+    assert_eq!(held.ownership_incomplete_file_count, 0);
+    assert_eq!(
+        refused(&index),
+        Some(BTreeSet::from([
+            local_index_key(&bad_a),
+            local_index_key(&bad_b)
+        ]))
+    );
+    // One witness moves: the hold releases, and the other refusal holds the
+    // page again.
+    fs::write(&bad_a, rollout(BAD_A, Some("a"))).unwrap();
+    let (index, still, posts) = page(index);
+    assert!(still.snapshots.is_empty() && posts.is_empty());
+    // Generation totals: the two earlier refusals plus the remaining one.
+    assert_eq!(
+        still.unreadable_path_count, 3,
+        "the remaining refusal counts"
+    );
+    assert_eq!(still.ownership_incomplete_file_count, 0);
+    assert_eq!(
+        refused(&index),
+        Some(BTreeSet::from([local_index_key(&bad_b)]))
+    );
+    let traversal = index.traversal.as_ref().expect("the generation stays open");
+    assert!(traversal.has_errors());
+    assert_eq!(traversal.counts.terminal_ownership_incomplete_file_count, 0);
+    fs::write(&bad_b, rollout(BAD_B, Some("b"))).unwrap();
+    let (index, recovered, posts) = page(index);
+    let mut ids = recovered
+        .snapshots
+        .iter()
+        .map(|item| item.source_session_id.as_str())
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    let mut expected = [MAIN, BAD_A, BAD_B];
+    expected.sort_unstable();
+    assert_eq!(ids, expected, "every held session catches up");
+    assert!(refused(&index).is_none());
+    let (_, mut cold, _, _, _) = page_observed_with_limit(
+        &c.roots(),
+        ScanIndex::default(),
+        fresh(),
+        100,
+        &slots,
+        |_| {},
+    );
+    cold.snapshots
+        .retain(|item| ids.contains(&item.source_session_id.as_str()));
+    money_oracle::assert_equivalent(&emitted(&index, &cold), &route(&index, &recovered, posts));
+    // The repaired headers do not erase this generation's real failures.
+    assert_eq!(
+        index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .counts
+            .unreadable_path_count,
+        3
+    );
+    drop(session);
+}
+
+/// [money] A real held page, with no seam: a watcher-hinted rollout created
+/// beside a symlink is selected, but the retained roster refresh refuses the
+/// moved directory, so the roster cannot list it and the inventory is
+/// incomplete. (A pending census-member directory cannot hold a page: while
+/// one is pending the page selects nothing.) In the next generation's census
+/// the page holds every candidate: the new rollout, the whole unchanged
+/// joined group of a selected member and an accepted rollout whose file
+/// regressed behind its accepted extent. It adds no synthetic count, arms no
+/// retry, emits no body and keeps the accepted witness through a durable
+/// restart. A later page holds a second new rollout while the first debt is
+/// still owed: the hold owes their union. Once the symlink is gone and the
+/// regressed file is restored and grown, the roster lists both rollouts, the
+/// hold releases, every session catches up cold-equal and the generation
+/// retires. Read bound, measured at the transcript reader for joined members
+/// too: after the restart each checkpointed group member's census visit
+/// consumes no byte and starts no first read, while the first generation's
+/// read of the group is non-zero on the same counters.
+#[test]
+fn unlisted_hinted_rollout_holds_a_real_page_until_the_roster_lists_it() {
+    use crate::snapshots::codex_file_join::tests::member;
+    const GROUP: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    const BEHIND: &str = "019e5a00-0000-7000-8000-0000000000d7";
+    const QUEUED: [&str; 3] = [
+        "019e5a00-0000-7000-8000-0000000000f1",
+        "019e5a00-0000-7000-8000-0000000000f2",
+        "019e5a00-0000-7000-8000-0000000000f3",
+    ];
+    const NEW1: &str = "019e5a00-0000-7000-8000-0000000000e1";
+    const NEW2: &str = "019e5a00-0000-7000-8000-0000000000e2";
+    let _lock = DECODER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let slots = named_creator_slots();
+    let fresh = || Arc::new(sampled_scan::SharedCache::default());
+    let lines = |rows: &[Value]| {
+        rows.iter()
+            .map(|row| row.to_string() + "\n")
+            .collect::<String>()
+    };
+    // A joined session emits one item per member file under one fingerprint;
+    // the upload sends the first as its representative.
+    let unique = |mut scan: SourceScanResult| {
+        let mut seen = BTreeSet::new();
+        scan.snapshots
+            .retain(|item| seen.insert(item.snapshot_fingerprint.clone()));
+        scan
+    };
+    let c = Corpus::new();
+    let roots = c.roots();
+    // A page's FirstRead events: one per file job that is new to the index,
+    // a joined group's job included.
+    let first_reads = |logs: &[Value]| {
+        logs.iter()
+            .filter(|row| row["stage"] == "native_collection_page")
+            .map(|row| row["counts"]["first_read_files"].as_u64().unwrap_or(0))
+            .sum::<u64>()
+    };
+    // Each page also returns (bytes consumed at the transcript reader, which
+    // joined members' reads pass through too, FirstRead events).
+    let step = |index: ScanIndex, limit: usize, hints: &[PathBuf]| {
+        let before = index.clone();
+        let (working, scan, delivered, consumed, logs) =
+            page_observed_hinted(&roots, index, fresh(), limit, &slots, hints, |_| {});
+        let (index, posts) = working.checkpoint_with_captured_posts(&scan, &before, "accept");
+        let scan = unique(scan);
+        let routed = route(&index, &scan, posts);
+        let reads = delivered.0.lock().unwrap().clone();
+        let measured = (consumed, first_reads(&logs));
+        (index, scan, routed, reads, before, measured)
+    };
+    let hold_of = |index: &ScanIndex| {
+        index
+            .traversal
+            .as_ref()
+            .and_then(|t| t.residue.codex_inventory_hold.clone())
+    };
+    let unarmed = |index: &ScanIndex| {
+        index.traversal.as_ref().map_or(true, |t| {
+            t.unhealthy_retry_attempt == 0 && t.unhealthy_retry_not_before_unix_seconds.is_none()
+        })
+    };
+    let ids = |scan: &SourceScanResult| {
+        scan.snapshots
+            .iter()
+            .map(|item| item.source_session_id.clone())
+            .collect::<BTreeSet<_>>()
+    };
+    let key = |path: &Path| local_index_key(path);
+    // Census order: the accepted rollout, a two-file joined session, then a
+    // queued census that outlasts every held page.
+    let behind = c.path(BEHIND);
+    let group = ["zgroup-a.jsonl", "zgroup-b.jsonl"].map(|name| c.sessions.join(name));
+    let behind_accepted = [rollout(BEHIND, Some("a")), turn(3).into_bytes()].concat();
+    fs::write(&behind, &behind_accepted).unwrap();
+    fs::write(&group[0], lines(&member(GROUP, "r-a", 100, 100))).unwrap();
+    fs::write(&group[1], lines(&member(GROUP, "r-b", 200, 300))).unwrap();
+    for (number, id) in QUEUED.iter().enumerate() {
+        let path = c.sessions.join(format!("zz-{number}.jsonl"));
+        fs::write(path, rollout(id, Some("b"))).unwrap();
+    }
+    let (session, prior) = StateV2ColdSession::publish(
+        Source::Codex,
+        &ScanIndex::default(),
+        &c.scratch.join("state"),
+    );
+    let queued_paths = (0..QUEUED.len())
+        .map(|n| c.sessions.join(format!("zz-{n}.jsonl")))
+        .collect::<Vec<_>>();
+    let size = |path: &Path| fs::metadata(path).unwrap().len();
+    let rollout_bytes = size(&behind) + queued_paths.iter().map(|path| size(path)).sum::<u64>();
+    // Positive control on the same member bytes alone: the counters see the
+    // joined group's first read.
+    let alone = Corpus::new();
+    fs::write(
+        alone.sessions.join("zgroup-a.jsonl"),
+        lines(&member(GROUP, "r-a", 100, 100)),
+    )
+    .unwrap();
+    fs::write(
+        alone.sessions.join("zgroup-b.jsonl"),
+        lines(&member(GROUP, "r-b", 200, 300)),
+    )
+    .unwrap();
+    let (_, solo, _, solo_bytes, solo_logs) = page_observed_hinted(
+        &alone.roots(),
+        ScanIndex::default(),
+        fresh(),
+        100,
+        &slots,
+        &[],
+        |_| {},
+    );
+    assert_eq!(ids(&unique(solo)), BTreeSet::from([GROUP.to_string()]));
+    assert!(
+        solo_bytes > 0 && first_reads(&solo_logs) >= 1,
+        "the group's first read is observed: {solo_bytes} bytes, {solo_logs:?}"
+    );
+    // The first generation reads and accepts everything, then retires. It
+    // reads each new file once, so its bytes past the four rollouts and its
+    // fifth FirstRead are the joined group's.
+    let (mut index, first, accepted, _, _, mut measured) = step(prior, 100, &[]);
+    let mut everyone = QUEUED.map(String::from).to_vec();
+    everyone.extend([GROUP, BEHIND].map(String::from));
+    assert_eq!(ids(&first), everyone.into_iter().collect::<BTreeSet<_>>());
+    assert!(accepted.accepted.contains_key(GROUP) && accepted.accepted.contains_key(BEHIND));
+    for _ in 0..10 {
+        if index.traversal.is_none() {
+            break;
+        }
+        let (next, _, _, _, _, more) = step(index, 100, &[]);
+        index = next;
+        measured = (measured.0 + more.0, measured.1 + more.1);
+    }
+    assert!(index.traversal.is_none(), "the first generation retired");
+    assert!(
+        measured.0 > rollout_bytes && measured.1 >= 5,
+        "the first generation reads the group: {measured:?}, rollouts {rollout_bytes} bytes"
+    );
+    let kb = key(&behind);
+    let witness = |index: &ScanIndex| {
+        index
+            .files
+            .get(&kb)
+            .and_then(|entry| entry.last_upload_body_witness.clone())
+    };
+    let accepted_witness = witness(&index);
+    assert!(accepted_witness.is_some());
+    // The next generation walks everything into its census; its first page
+    // revisits the unchanged accepted rollout.
+    let (index, walked, _, _, _, _) = step(index, 1, &[]);
+    assert!(walked.snapshots.is_empty(), "{:?}", walked.snapshots);
+    let census = |index: &ScanIndex| {
+        index
+            .traversal
+            .as_ref()
+            .expect("the census is open")
+            .pending_candidates
+            .iter()
+            .map(|candidate| key(&candidate.path))
+            .collect::<BTreeSet<_>>()
+    };
+    assert!(census(&index).contains(&key(&group[0])) && !census(&index).contains(&kb));
+    // The older revision: a strict prefix of the accepted bytes, behind the
+    // indexed extent the accepted body was read to.
+    let older = rollout(BEHIND, Some("a"));
+    assert!(behind_accepted.starts_with(&older) && older.len() < behind_accepted.len());
+    fs::write(&behind, &older).unwrap();
+    assert!(fs::metadata(&behind).unwrap().len() < index.files[&kb].size_bytes);
+    c.write(NEW1, Some("a"));
+    let link = c.sessions.join("held-link");
+    std::os::unix::fs::symlink(c.scratch.join("absent"), &link).unwrap();
+    // The fresh page: both hinted files, then census fill (the group).
+    crate::snapshots::state_v2::release_collection_page_limit_for_test(&index);
+    let (held_index, held, held_route, reads, before, _) =
+        step(index, 3, &[c.path(NEW1), behind.clone()]);
+    assert!(held.snapshots.is_empty(), "{:?}", held.snapshots);
+    assert!(reads.is_empty(), "the held page reads no transcript");
+    let (causes, _) = held.causes.summary(0);
+    assert_eq!(causes[ownership::INVENTORY], 0);
+    let walk = |index: &ScanIndex| index.traversal.clone().expect("the generation stays open");
+    let assert_held_page = |before: &ScanIndex, after: &ScanIndex, owed: &BTreeSet<String>| {
+        let (was, now) = (walk(before), walk(after));
+        assert_eq!(
+            (
+                now.counts.unreadable_path_count,
+                now.counts.ownership_incomplete_file_count
+            ),
+            (
+                was.counts.unreadable_path_count,
+                was.counts.ownership_incomplete_file_count
+            ),
+            "no synthetic count"
+        );
+        assert_eq!(now.residue.index_keys, was.residue.index_keys);
+        assert!(
+            !now.pending_directories.iter().any(|d| d.census_member),
+            "no census directory is pending"
+        );
+        let hold = now
+            .residue
+            .codex_inventory_hold
+            .clone()
+            .expect("the held page is owed");
+        assert_eq!(&hold.owed, owed);
+        assert!(!hold.awaiting_directories && hold.refused_headers.is_empty());
+        assert!(now.has_errors() && !now.has_unsettled_residue());
+        assert!(
+            !now.pending_candidates.is_empty(),
+            "not the drain page: the census still waits"
+        );
+        assert!(unarmed(after), "a held page arms no retry");
+        hold
+    };
+    let mut owed = BTreeSet::from([key(&c.path(NEW1)), kb.clone()]);
+    owed.extend(group.iter().map(|path| key(path)));
+    let hold = assert_held_page(&before, &held_index, &owed);
+    assert_eq!(
+        hold.outside_roster.keys().cloned().collect::<BTreeSet<_>>(),
+        BTreeSet::from([key(&c.path(NEW1))])
+    );
+    assert_eq!(witness(&held_index), accepted_witness);
+    // A durable restart from the committed checkpoint keeps the hold and the
+    // accepted witness.
+    let mut held_index = held_index;
+    let index = session.save_reload(&mut held_index);
+    assert_eq!(hold_of(&index), Some(hold.clone()));
+    assert_eq!(witness(&index), accepted_witness);
+    let restarted = index.clone();
+    // From here on, a page whose census visits only unchanged files (the
+    // checkpointed group's members, the queued rollouts) must consume no byte
+    // and start no first read, and every group member must be so visited.
+    let group_keys = group.iter().map(|path| key(path)).collect::<BTreeSet<_>>();
+    let mut unchanged = group_keys.clone();
+    unchanged.extend(queued_paths.iter().map(|path| key(path)));
+    let queue = |index: &ScanIndex| {
+        index.traversal.as_ref().map_or_else(BTreeSet::new, |t| {
+            t.pending_candidates
+                .iter()
+                .map(|candidate| key(&candidate.path))
+                .collect::<BTreeSet<_>>()
+        })
+    };
+    let mut unread = BTreeSet::new();
+    let mut zero_read = |before: &ScanIndex, after: &ScanIndex, measured: (u64, u64)| {
+        let visited = queue(before)
+            .difference(&queue(after))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let members = visited
+            .intersection(&group_keys)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if !members.is_empty() && visited.is_subset(&unchanged) {
+            assert_eq!(
+                measured,
+                (0, 0),
+                "{visited:?}: (consumed bytes, first reads)"
+            );
+            unread.extend(members);
+        }
+    };
+    // An ordinary census page: the debt is unmoved, so nothing releases.
+    let (index, quiet, _, _, before, measured) = step(index, 1, &[]);
+    zero_read(&before, &index, measured);
+    assert!(quiet.snapshots.is_empty(), "{:?}", quiet.snapshots);
+    assert_eq!(hold_of(&index), Some(hold));
+    // A second new rollout holds the next fresh page; the earlier debt,
+    // unselected and partly outside the roster, is still owed with it.
+    c.write(NEW2, Some("b"));
+    let (index, rehold, _, _, before, measured) = step(index, 1, &[c.path(NEW2)]);
+    zero_read(&before, &index, measured);
+    assert!(rehold.snapshots.is_empty(), "{:?}", rehold.snapshots);
+    owed.insert(key(&c.path(NEW2)));
+    let hold = assert_held_page(&before, &index, &owed);
+    assert_eq!(
+        hold.outside_roster.keys().cloned().collect::<BTreeSet<_>>(),
+        BTreeSet::from([key(&c.path(NEW1)), key(&c.path(NEW2))])
+    );
+    assert_eq!(witness(&index), accepted_witness);
+    // Restored and grown past the accepted extent; the roster can list again.
+    fs::write(
+        &behind,
+        [behind_accepted.clone(), turn(4).into_bytes()].concat(),
+    )
+    .unwrap();
+    fs::remove_file(&link).unwrap();
+    let mut index = index;
+    let mut caught = BTreeSet::new();
+    let mut pages = Vec::new();
+    for _ in 0..30 {
+        let (next, scan, routed, _, before, measured) = step(index, 1, &[]);
+        zero_read(&before, &next, measured);
+        index = next;
+        assert!(hold_of(&index).is_none(), "the listed debt is released");
+        assert!(unarmed(&index), "a release arms no retry");
+        caught.extend(ids(&scan));
+        if !scan.snapshots.is_empty() {
+            pages.push((index.clone(), scan, routed));
+        }
+        if index.traversal.is_none() {
+            break;
+        }
+    }
+    assert!(index.traversal.is_none(), "the generation retired");
+    assert_eq!(
+        caught,
+        [BEHIND, NEW1, NEW2]
+            .map(String::from)
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
+        "every changed held session catches up"
+    );
+    let (_, cold, _, _, _) =
+        page_observed_with_limit(&roots, ScanIndex::default(), fresh(), 100, &slots, |_| {});
+    let cold = unique(cold);
+    for (index, scan, routed) in &pages {
+        let mut page_cold = cold.clone();
+        page_cold
+            .snapshots
+            .retain(|item| ids(scan).contains(&item.source_session_id));
+        money_oracle::assert_equivalent(&emitted(index, &page_cold), routed);
+    }
+    // The held page: no body for any held entity, the regressed one included,
+    // and the accepted bodies and witnesses stand.
+    let cold_of = |held: &[&str]| {
+        let mut page = cold.clone();
+        page.snapshots
+            .retain(|item| held.contains(&item.source_session_id.as_str()));
+        emitted(&restarted, &page)
+    };
+    let held_ids = [NEW1, GROUP, BEHIND];
+    let mut held_route = held_route;
+    held_route.accepted = accepted.accepted.clone();
+    money_oracle::assert_no_smaller_reemit(
+        BEHIND,
+        &accepted,
+        &held_route,
+        &cold_of(&[BEHIND]),
+        true,
+    );
+    money_oracle::assert_held_set(&held_ids, &accepted, &held_route, &cold_of(&held_ids));
+    // Read bound: after the restart, each unchanged, checkpointed member of
+    // the held group was visited on a page that read nothing.
+    assert_eq!(unread, group_keys, "every group member's visit is measured");
+    drop(session);
+}
+
 /// [regress] Header decoder refusal holds its filename owner, while ordinary
 /// siblings publish exact money; funding the next attempt reaches the same EOF.
 #[test]
@@ -2004,4 +2886,9 @@ fn spare_fresh_page_capacity_preserves_money_and_quiet_restart() {
 mod sidecar_reuse_transition {
     use super::*;
     include!("sources/codex/sidecar/reuse_transition.rs");
+}
+
+mod removed_root_transition {
+    use super::*;
+    include!("discovery/removed_root_transition.rs");
 }
