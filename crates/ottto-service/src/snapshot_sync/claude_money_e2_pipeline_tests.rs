@@ -2729,6 +2729,30 @@ fn body<'a>(page: &'a Page, session: &str) -> Option<&'a SnapshotItem> {
         .iter()
         .find(|s| s.source_session_id == session)
 }
+/// The session's items on the page are withheld: none is a literal body,
+/// and the page quarantines them (delayed, never settled, never counted).
+fn assert_withheld(page: &Page, session: &str, why: &str) {
+    let items = page
+        .scan
+        .snapshots
+        .iter()
+        .filter(|s| s.source_session_id == session)
+        .collect::<Vec<_>>();
+    assert!(!items.is_empty(), "{why}: the held items stay on the page");
+    assert!(
+        items
+            .iter()
+            .all(|s| !crate::snapshots::claude_request_money::is_request_owned_literal(s)),
+        "{why}: no body publishes"
+    );
+    let held = page
+        .disposition
+        .quarantined_fingerprints(&page.scan.snapshots);
+    assert!(
+        items.iter().all(|s| held.contains(&s.snapshot_fingerprint)),
+        "{why}: the session is held"
+    );
+}
 /// An earlier twin rewritten IN PLACE
 /// (same inode, size kept) no longer holds H. Its stale identity cannot
 /// remove H from the later twin: H counts once, from the twin.
