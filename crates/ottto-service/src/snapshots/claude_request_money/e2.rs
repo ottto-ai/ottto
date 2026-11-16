@@ -3224,9 +3224,10 @@ fn decide_holders(
                 .and_then(FileFold::location_key)
         })
         .collect::<BTreeSet<_>>();
-    // An empty-proof main whose exact bytes an ACK under this context bound,
-    // while a current twin carries its session's summed body: that accepted
-    // body counts its requests, so it holds them off the page as well.
+    // An empty-proof main whose current-context empty proof binds its exact
+    // bytes, while a current twin carries its session's summed body: the
+    // twin's ACK accepted that body, which counts this main's requests, so
+    // the main holds them off the page as well.
     let carried = |key: &str| {
         index.file_upload_context_enabled()
             && index.confirmed_empty_files.contains(key)
