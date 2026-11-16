@@ -1701,8 +1701,25 @@ fn deleted_content_carrier_recovers_main_with_its_dependents() {
             "COPY keeps only D"
         );
         assert_eq!(body(&page, COPY).unwrap().removed_request_count, Some(1));
-        money_oracle::assert_equivalent(&sent_money(&reference), &sent_money(&page));
+        // COPY re-decides to the body it already has accepted: finalize
+        // carries its receipt instead of offering it again. ROOT is offered.
+        let copy_key = copy.to_string_lossy().into_owned();
+        let accepted_copy = index.files[&copy_key].last_upload_body_witness.clone();
+        let measured = sent_money(&page);
+        assert!(measured.snapshots.contains_key(ROOT));
+        assert!(!measured.snapshots.contains_key(COPY));
         index = settle(&c, &index, page, &mut e2_progress());
+        assert_eq!(
+            index.files[&copy_key].last_upload_body_witness,
+            accepted_copy
+        );
+        // An explicitly owed page of the recovered state matches the native
+        // complete-money oracle.
+        let mut verify = index.clone();
+        owe(&mut verify);
+        let complete = ready(&c, &carrier_scanner(&verify), verify, 100, true);
+        money_oracle::assert_equivalent(&sent_money(&reference), &sent_money(&complete));
+        index = settle(&c, &index, complete, &mut e2_progress());
         for _ in 0..3 {
             let page = ready(&c, &scanner, index.clone(), 100, true);
             assert!(!scanner.paths().contains(&h) && !scanner.paths().contains(&copy));

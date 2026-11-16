@@ -3224,8 +3224,29 @@ fn decide_holders(
                 .and_then(FileFold::location_key)
         })
         .collect::<BTreeSet<_>>();
+    // An empty-proof main whose exact bytes an ACK under this context bound,
+    // while a current twin carries its session's summed body: that accepted
+    // body counts its requests, so it holds them off the page as well.
+    let carried = |key: &str| {
+        index.file_upload_context_enabled()
+            && index.confirmed_empty_files.contains(key)
+            && !index.file_upload_context_requires_adoption(key)
+            && !copy_held(index, key)
+            && !index.claude_family_listed(key)
+            && index.files.get(key).is_some_and(|entry| {
+                index
+                    .claude_request_census
+                    .get(key)
+                    .is_some_and(|record| record.current_for(&entry.source_file_fingerprint))
+            })
+            && claude_index_path_member_ref(Path::new(key)).is_some_and(|member| {
+                live.get_or_init(|| indexed_main_files(index))
+                    .carried
+                    .contains(member.root)
+            })
+    };
     let owned = |key: &str| {
-        origin_owned(index, page, key, true)
+        (origin_owned(index, page, key, true) || carried(key))
             && (held_here.is_empty()
                 || !held_here.contains(&location_key(key))
                 || accepted_origin(index, key))
