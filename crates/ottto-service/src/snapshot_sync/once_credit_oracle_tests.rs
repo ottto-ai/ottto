@@ -1073,8 +1073,10 @@ fn c05_fresh_destination_requires_its_own_exact_ack() {
     let held = &unstored.index.quarantined_snapshot_fingerprints[&fingerprint];
     assert_eq!(
         held.disposition,
-        SnapshotQuarantineDisposition::UnprovenTerminal
+        SnapshotQuarantineDisposition::RetryPending
     );
+    let retry_at = held.retry_after_unix_seconds;
+    assert!(retry_at > home.now);
     assert_eq!(
         held.upload_body_witness.as_deref(),
         Some(snapshot_upload_body_witness(item).as_str())
@@ -1082,14 +1084,50 @@ fn c05_fresh_destination_requires_its_own_exact_ack() {
     *server.fallback.lock().unwrap() = Answer::Accept;
     home.restart();
     let quiet = home.cycle(&server, &recording);
+    assert!(quiet.finish.is_ok(), "{:?}", quiet.finish);
     assert!(
         quiet.batches.is_empty(),
-        "an unstored exact body remains held until a real change"
+        "an unstored context candidate remains held before its retry deadline"
     );
     assert!(!quiet
         .progress
         .accepted_body_witnesses
         .contains_key(&fingerprint));
+    assert!(!quiet
+        .index
+        .accepted_snapshot_fingerprint_recorded(&fingerprint));
+    assert_eq!(
+        quiet.index.quarantined_snapshot_fingerprints[&fingerprint], *held,
+        "restart preserves the exact unACKed body and its retry deadline"
+    );
+    // Context receipt candidates keep timed retry custody after Unstored.
+    // Retry the unchanged body only after its saved deadline, then require
+    // this destination's exact ACK before granting any stored-body credit.
+    home.now = retry_at + 1;
+    let replay = home.cycle(&server, &recording);
+    assert!(replay.finish.is_ok(), "{:?}", replay.finish);
+    assert_eq!(replay.batches.len(), 1);
+    assert_eq!(replay.acknowledged.len(), 1);
+    assert_eq!(replay.acknowledged[0].len(), 1);
+    assert_eq!(replay.finalized.len(), 1);
+    assert_eq!(replay.finalized[0].snapshot_fingerprint, fingerprint);
+    assert_eq!(
+        snapshot_upload_body_witness(&replay.finalized[0]),
+        snapshot_upload_body_witness(item)
+    );
+    assert_eq!(replay.finalized[0].input_tokens, 30);
+    assert_durable(&replay);
+    let placement = server.placement.lock().unwrap().clone();
+    assert_eq!(placement.len(), 1);
+    home.restart();
+    let settled = home.cycle(&server, &recording);
+    assert!(settled.finish.is_ok(), "{:?}", settled.finish);
+    assert!(
+        settled.batches.is_empty(),
+        "the exact ACK suppresses replay"
+    );
+    assert!(settled.acknowledged.is_empty());
+    assert_eq!(*server.placement.lock().unwrap(), placement);
     let growth = json!({"type":"assistant","sessionId":IDENTITY_PIPELINE_ROOT,
         "requestId":"fresh-destination-growth","timestamp":"2026-11-01T07:03:00Z",
         "message":{"id":"fresh-destination-growth","model":"claude-haiku-4-5",
