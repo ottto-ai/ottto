@@ -1264,7 +1264,7 @@ mod money_equivalence_tests {
             json!({"uploads":uploads,"degraded_state":state,
             "desktop":[expected_plan("account-a","org-x"),expected_plan("account-b","org-y")]}),
             json!({"carriers":[carrier,lexical,absent,none],"setup":[claude_setup_snapshot_index(&uploads,Some(&default),false),
-                claude_setup_snapshot_index(&[only.clone()],None,true),claude_setup_snapshot_index(&[degraded.clone()],Some(&default),false)],
+                claude_setup_snapshot_index(std::slice::from_ref(&only),None,true),claude_setup_snapshot_index(std::slice::from_ref(&degraded),Some(&default),false)],
                 "degraded":snapshot_views(&[degraded]),"desktop_only":snapshot_views(&[only]),"uncovered":snapshot_views(&[uncovered]),"covered":all_covered}),
             json!({"carriers":[0,1,null,null],"setup":[0,0,0],"degraded":expected_views(vec![expected_degraded]),
                 "desktop_only":expected_views(vec![expected_desktop(vec![expected_plan("account-a","org-x"),expected_plan("account-b","org-y")],true)]),
