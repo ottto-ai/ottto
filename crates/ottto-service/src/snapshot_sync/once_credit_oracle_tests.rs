@@ -2788,7 +2788,7 @@ fn scheduling_permutations_converge_to_the_same_bodies() {
                                     if parent {
                                         (55, 5)
                                     } else if late && entity == &paths[1].1 {
-                                        // Known gap: a late sidecar for a content session without a filename-matching main is not applied until the file changes; flips to 42/4 when fixed
+                                        // Unsupported shape, not observed on real machines: a late sidecar for a content session with no transcript file named after it is applied only when that transcript changes again.
                                         (35, 3)
                                     } else {
                                         (42, 4)
@@ -2837,7 +2837,7 @@ fn scheduling_permutations_converge_to_the_same_bodies() {
                                 if entity == &paths[1].1 {
                                     assert_ne!(
                                         row, expected,
-                                        "the known late-sidecar gap changes CHILD's entity row"
+                                        "the unsupported late-sidecar shape changes CHILD's entity row"
                                     );
                                 } else {
                                     assert_eq!(row, expected, "late baseline changes only CHILD: {source:?} entity {entity}");
