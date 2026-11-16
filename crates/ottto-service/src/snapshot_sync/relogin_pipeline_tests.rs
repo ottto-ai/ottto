@@ -363,6 +363,17 @@ fn account_return_today_reinterprets_orphaned_history() {
                 .unwrap()
                 .expect("due preparation");
                 let (preparation, index, scan) = collect_preparation_with_rotation(frame);
+                if namespace != namespace_a && source == SnapshotSource::ClaudeCode {
+                    if !scan.snapshots.is_empty() {
+                        assert_eq!(
+                            scan.scanned_file_count, 1,
+                            "only the recent transcript is read"
+                        );
+                    }
+                    assert!(!index
+                        .files
+                        .contains_key(&old.to_string_lossy().into_owned()));
+                }
                 let path = preparation.index_path.clone();
                 crate::agent_status_refresh::with_test_collection(collection(), || {
                     finish_sync_source(
@@ -399,8 +410,24 @@ fn account_return_today_reinterprets_orphaned_history() {
     let before = sources.map(|source| {
         let (bodies, bytes) = cycle(&device_a, &secret_a, source);
         assert!(bytes > 0);
+        assert_eq!(
+            bodies.len(),
+            if source == SnapshotSource::ClaudeCode {
+                2
+            } else {
+                1
+            }
+        );
         bodies
     });
+    for source in sources {
+        let (bodies, bytes) = cycle(&device_a, &secret_a, source);
+        assert!(
+            bodies.is_empty(),
+            "intact A does not re-offer accepted money"
+        );
+        assert_eq!(bytes, 0, "intact A reads no unchanged transcript");
+    }
     let saved = ScanIndex::load(&cx_path).unwrap();
     let entry = &saved.files[&codex.to_string_lossy().into_owned()];
     assert!(!entry.codex_counting_v2, "Legacy ACK keeps the UI counter");
@@ -415,6 +442,7 @@ fn account_return_today_reinterprets_orphaned_history() {
         .unwrap();
     std::fs::remove_dir_all(&repository).unwrap();
     let mut returned = Vec::new();
+    let mut previous_namespace = namespace_a.clone();
     for (user, org, id) in [
         ("owner-b", "org-b", "return-b"),
         ("owner-a", "org-a", "return-a-again"),
@@ -423,12 +451,18 @@ fn account_return_today_reinterprets_orphaned_history() {
         let namespace = snapshot_upload_destination_namespace(&device, &secret);
         // CHANGED-ON-RETURN: only the prior owner is considered; durable re-attach decision pending.
         assert_ne!(namespace, namespace_a);
+        assert_ne!(namespace, previous_namespace);
+        previous_namespace = namespace.clone();
         assert!(sources
             .iter()
             .all(|&source| !index_path(&namespace, source).exists()));
         returned = sources
             .map(|source| cycle(&device, &secret, source).0)
             .to_vec();
+        assert!(
+            returned.iter().all(|bodies| bodies.len() == 1),
+            "only existing recent session keys return"
+        );
         for source in sources {
             let (bodies, bytes) = cycle(&device, &secret, source);
             assert!(
@@ -459,7 +493,13 @@ fn account_return_today_reinterprets_orphaned_history() {
             "unattributed_total_tokens",
             "request_count",
         ]
-        .map(|field| body[field].as_u64().unwrap_or(0))
+        .map(|field| {
+            if field == "unattributed_total_tokens" && body.get(field).is_none() {
+                0
+            } else {
+                body[field].as_u64().expect("wire counter is present")
+            }
+        })
     };
     // Each row names its current outcome; subsequent owner re-attach changes flip these deliberately.
     for (source, session, outcome, expected) in [
@@ -510,6 +550,8 @@ fn account_return_today_reinterprets_orphaned_history() {
             }
             if source == 1 {
                 assert_eq!(counts(prior), [2000, 200, 0, 0, 0, 0, 0, 1]);
+                assert_eq!(counts(&prior["model_usage"][0]), counts(prior));
+                assert_eq!(counts(&after["model_usage"][0]), expected);
                 assert_eq!(
                     prior["model_usage"][0]["selector_context"]["service_tier"],
                     "priority"
@@ -525,6 +567,9 @@ fn account_return_today_reinterprets_orphaned_history() {
                     "priced rows/cost inputs"
                 );
                 assert_eq!(after["cost"], prior["cost"]);
+                if source == 2 {
+                    assert_eq!(after["cost"]["total_cost_usd"], "0.001");
+                }
             }
             if source == 0 {
                 assert!(prior["repository_hash"].is_string());

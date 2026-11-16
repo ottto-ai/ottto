@@ -32426,9 +32426,22 @@ X-API-Key = "otel_redacted"
         device_id: &str,
     ) -> (LocalDeviceBinding, String) {
         let device = relogin_device(device_id, &["claude_code", "codex", "pi"]);
+        let api = std::env::var("OTTTO_API_BASE_URL").expect("synthetic receiver URL");
         let secret = if let Some(prior) = prior_device_credential_for_registration().unwrap() {
             assert_ne!(prior.owner.as_ref().unwrap().user_id, user);
-            let (pending, candidate, token) = relogin_claim(&prior, user, org, device.clone());
+            relogin_local_logout();
+            assert!(
+                default_prior_device_path().exists(),
+                "logout retained the selector"
+            );
+            let prior = prior_device_credential_for_registration().unwrap().unwrap();
+            let (mut pending, candidate, token) = relogin_claim(&prior, user, org, device.clone());
+            pending
+                .claim_commit
+                .as_mut()
+                .unwrap()
+                .connection
+                .api_base_url = api;
             assert_eq!(journaled_namespace(&pending), None, "different prior owner");
             promote_relogin(&pending, &candidate, &token);
             assert!(
@@ -32437,7 +32450,8 @@ X-API-Key = "otel_redacted"
             );
             candidate
         } else {
-            let (account, connection) = relogin_account(user, org);
+            let (account, mut connection) = relogin_account(user, org);
+            connection.api_base_url = api;
             FileAccountStore::default().save(&account).unwrap();
             FileConnectionStore::default().save(&connection).unwrap();
             FileDeviceStore::default().save(&device).unwrap();
