@@ -12907,9 +12907,6 @@ pub(crate) fn snapshot_namespace_has_store(support: &Path, namespace: &str) -> R
         if !relevant {
             continue;
         }
-        if name.contains(".json.corrupt") {
-            anyhow::bail!("uncertain snapshot namespace custody");
-        }
         let sharded = name.ends_with(".json.shards") || name.ends_with(".json.v1-readonly.shards");
         let checkpoint = name
             .strip_suffix(".v1-readonly.shards")
@@ -13535,6 +13532,9 @@ mod tests {
                 true,
             ),
             ("pi-scan-index.json", true),
+            ("codex-scan-index-v3.corrupt.1.2.json", true),
+            ("codex-scan-index-v3.json.v1-readonly", true),
+            ("codex-scan-index-v3.json.v2-ack-receipt", true),
             ("codex-scan-index-v3-upload-progress.json", false),
             ("codex-scan-index-v3.json.lock", false),
             ("codex-scan-index-v3.json.tmp", false),
