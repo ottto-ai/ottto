@@ -4223,6 +4223,8 @@ pub(crate) enum TelemetryRead {
 /// identity already tagged, overflow). Their items stay on the page
 /// unchanged so the caller holds them (`hold_request_owned`): a removed item
 /// would let the page settle its file without a body. Gate off: empty.
+/// Single-chunk callers (tests) plan the content-twin holds over `items`.
+#[cfg(test)]
 pub(crate) fn finish_page(
     items: &mut Vec<SnapshotItem>,
     index: &ScanIndex,
