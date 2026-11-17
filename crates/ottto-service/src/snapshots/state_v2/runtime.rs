@@ -127,6 +127,7 @@ impl Hold {
 struct RouteState {
     pace: Pace,
     latched: bool,
+    pending_publication: Option<Identity>,
     inventory_ready: bool,
     original: Option<import::Original>,
     runtimes: Vec<std::sync::Weak<Runtime>>,
@@ -214,6 +215,7 @@ fn with_state<T>(path: &Path, f: impl FnOnce(&mut RouteState) -> Result<T>) -> R
                 Arc::new(Mutex::new(RouteState {
                     pace: Pace::default(),
                     latched: false,
+                    pending_publication: None,
                     inventory_ready: false,
                     original: None,
                     runtimes: Vec::new(),
@@ -540,33 +542,17 @@ pub(in super::super) fn after_v1_locked(path: &Path, index: &mut ScanIndex) -> R
             return Ok(());
         }
         let _gauge = telemetry::Stage::new(telemetry::Kind::Import);
-        let result = (|| -> Result<KindCx> {
+        let result = (|| {
             let original = state.original.as_ref().ok_or(Pause::Mismatch)?;
-            original.unchanged()?;
-            telemetry::event(
-                "orphan_removed",
-                &fence::cleanup_unpublished(path, state.latched)?,
-            );
-            let mut random = [0_u8; 16];
-            std::fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
             let generation = import::import_generation(index, original)?;
-            let identity = Identity {
-                format: FORMAT,
-                db_id: crate::hex::encode(&random),
-                binding,
-                fence_generation: generation,
-            };
-            let original = state.original.as_ref().ok_or(Pause::Mismatch)?;
-            original.preserve(path)?;
-            telemetry::baseline(path);
-            let import = fence::sibling(path, ".v2.sqlite.import");
-            let mut db = sqlite::Sqlite::create_import(&import)?;
-            db.control("identity", &identity)?;
-            db.control("generation", &index.generation)?;
-            let cx = import::import_graph(&mut db, index, state.original.as_ref())?;
-            original.unchanged()?;
-            original.publish_import(path, &identity, db, &mut state.latched)?;
-            Ok(cx)
+            import::publish_graph(
+                path,
+                index,
+                original,
+                generation,
+                &mut state.latched,
+                &mut state.pending_publication,
+            )
         })();
         // One gauge per import attempt, including one refused for an over-cap row.
         telemetry::row_cap_save();

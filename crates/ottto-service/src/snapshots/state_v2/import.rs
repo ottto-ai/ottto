@@ -57,10 +57,17 @@ pub(super) fn import_graph(
     original: Option<&Original>,
 ) -> Result<KindCx> {
     let original = original.ok_or(Pause::Mismatch)?;
+    map_graph_at(store, index, original, import_generation(index, original)?)
+}
+fn map_graph_at(
+    store: &mut sqlite::Sqlite,
+    index: &ScanIndex,
+    original: &Original,
+    generation: u64,
+) -> Result<KindCx> {
     original.unchanged()?;
     let mut tx = store.begin(TxnMode::Write)?;
     let identity = identity(&mut tx)?;
-    let generation = import_generation(index, original)?;
     anyhow::ensure!(identity.fence_generation == generation, Pause::Mismatch);
     let mut cx = KindCx::default();
     cx.binding = Some(identity.binding.clone());
@@ -74,6 +81,42 @@ pub(super) fn import_graph(
     // an absent original keeps G=0 until its first collection save.
     let mut tx = store.begin(TxnMode::Read)?;
     verify_normalized_at(&mut tx, index, original, identity.binding, generation)
+}
+/// The only graph publication: preserve input, map, read back, then fence.
+/// Authorized rebuilds use an empty inventory and G=0; the caller retains
+/// the damaged witness and CheckpointLock and does not adopt a runtime here.
+pub(super) fn publish_graph(
+    path: &Path,
+    index: &ScanIndex,
+    original: &Original,
+    generation: u64,
+    latched: &mut bool,
+    pending: &mut Option<Identity>,
+) -> Result<KindCx> {
+    original.unchanged()?;
+    telemetry::event(
+        "orphan_removed",
+        &fence::cleanup_unpublished(path, *latched)?,
+    );
+    let mut random = [0_u8; 16];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
+    let identity = Identity {
+        format: FORMAT,
+        db_id: crate::hex::encode(&random),
+        binding: super::super::scan_index_integration::scan_index_storage_binding(path)
+            .ok_or(Hold::ForeignBinding)?,
+        fence_generation: generation,
+    };
+    original.preserve(path)?;
+    telemetry::baseline(path);
+    let mut db = sqlite::Sqlite::create_import(&fence::sibling(path, ".v2.sqlite.import"))?;
+    db.control("identity", &identity)?;
+    db.control("generation", &index.generation)?;
+    let cx = map_graph_at(&mut db, index, original, generation)?;
+    *pending = Some(identity.clone());
+    original.publish_import(path, &identity, db, latched)?;
+    *pending = None;
+    Ok(cx)
 }
 /// Read every semantic row through Transaction::read_value, verifying
 /// value digests while decoding. Never return
