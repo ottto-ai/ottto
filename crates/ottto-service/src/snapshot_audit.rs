@@ -940,6 +940,42 @@ mod tests {
     }
 
     #[test]
+    fn stateless_audit_finishes_multiple_pages_without_a_checkpoint() {
+        let home = temp_dir("audit-multiple-pages");
+        let sessions = home.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let fixture = include_str!("../../../fixtures/snapshot-audit/pi-session.jsonl");
+        let count = 501;
+        for n in 0..count {
+            let content = fixture.replace(
+                "fixture-session-019e2700-1111-7000-9000-111111111111",
+                &format!("fixture-session-{n}"),
+            );
+            fs::write(sessions.join(format!("session-{n:04}.jsonl")), content).unwrap();
+        }
+        let key = home.join("audit.key");
+        fs::write(&key, &fixture.as_bytes()[..MIN_AUDIT_KEY_BYTES]).unwrap();
+        let options = SnapshotAuditOptions {
+            source: SnapshotSource::Pi,
+            roots: vec![sessions],
+            audit_state_dir: home.join("audit-state"),
+            audit_key_path: key,
+            session_attribution_hmac_key_path: attribution_key_file(&home),
+            attribution_home: Some(home.clone()),
+            machine_id: "fixture-machine".into(),
+            collected_at: "2026-07-22T08:02:00Z".into(),
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            let report = run_snapshot_audit(options.clone(), &mut Vec::new()).unwrap();
+            assert_eq!(report.emitted_session_count, count);
+            assert_eq!(report.scanned_file_count, count);
+            assert!(!options.audit_state_dir.join(AUDIT_SCAN_INDEX_FILE).exists());
+        }
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
     fn legacy_candidates_include_pre_policy_artifact_enabled_fingerprint() {
         let home = temp_dir("legacy-artifact-candidate");
         let sessions = home.join(".claude").join("projects").join("fixture");

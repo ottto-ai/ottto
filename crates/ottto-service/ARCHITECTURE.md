@@ -417,6 +417,13 @@ Prepare, finish, server minima, upload backoff and background QoS still apply.
 During a first backfill (not a replay revision bump), a Codex page that spent a byte budget with
 work still queued also requests a paced pass.
 
+All scan-index saves use SQLite. Legacy JSON is retained only as one-time
+import input. Collection waits for verified publication and adoption. Ordinary
+source passes retry transient import/publication failures; deterministic input
+refusals retain the existing support blocker. Successful authenticated adoption
+clears it. Quarantine and user Repair use the same verified publisher at G=0;
+Repair keeps its identity and accepted-debt carry, witness and cooldown ordering.
+
 Snapshot audits start from an empty in-memory graph, finish the traversal in
 memory and aggregate every page. Each invocation reports the complete selected
 source again; the report schema is unchanged. Audit state directories retain

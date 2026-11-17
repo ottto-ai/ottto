@@ -140,7 +140,7 @@ fn assert_integrated_decision(source: &str, frozen: &str) {
         assert!(source.contains("LoadOrigin::Missing,"));
     } else if frozen.contains("let quarantine_path = unique_checkpoint_sibling") {
         assert!(source.contains("fs::rename(path, &quarantine_path).context(\"quarantine invalid local snapshot scan index\")?;"));
-        assert!(source.contains("persistence_legacy_recovery: persistence_recovery,"));
+        assert!(source.contains("state_v2::publish_rebuilt_locked(path, &ScanIndex::default())?;"));
         assert!(source.contains("..ScanIndex::default()"));
     } else {
         panic!("unchanged historical control drifted: {frozen}");

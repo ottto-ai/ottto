@@ -426,3 +426,70 @@ fn unreadable_repair_stamp_allows_one_rebuild() {
     note_scan_index_rebuild_paused(source, false);
     SCAN_INDEX_REBUILD_OVERRIDE.with(|cell| cell.set([ScanIndexRebuildOverrideState::NONE; 3]));
 }
+
+#[test]
+fn repair_publishes_generation_zero_with_exact_accepted_carry_before_collection() {
+    let scratch = crate::test_scratch::ScratchDir::canonical("repair-native-publication");
+    let source = SnapshotSource::ClaudeCode;
+    let parent = scratch.join("a".repeat(64));
+    fs::create_dir_all(&parent).unwrap();
+    let path = parent.join("claude_code-repair-scan-index.json");
+    let support = scratch.join("support");
+    SCAN_INDEX_REBUILD_OVERRIDE.with(|cell| cell.set([ScanIndexRebuildOverrideState::NONE; 3]));
+    note_scan_index_rebuild_paused(source, false);
+    let mut seed = lc_fixture();
+    seed.historical_replay_generation = Some("kept-replay".into());
+    seed.accepted_rebuild_pending_since_unix_seconds = Some(42);
+    seed.accepted_rebuild_last_alarm_unix_seconds = Some(84);
+    seed.upload_context_proof = serde_json::from_value(serde_json::json!({
+        "destination_namespace_hash": "a".repeat(64),
+        "replay_generation": "kept-replay",
+        "entity_stamps": {lc_hex('c'): {"context_fingerprint": lc_hex('c'), "body_witness": lc_hex('d')}}
+    })).unwrap();
+    let mut expected = ScanIndex::default();
+    expected.carry_identity_from(seed.clone()).unwrap();
+    let mut damage = serde_json::to_value(&seed).unwrap();
+    damage["files"]["excess-held"] = serde_json::json!({"unknown": "x".repeat(2 * 1024 * 1024)});
+    fs::write(&path, serde_json::to_vec(&damage).unwrap()).unwrap();
+    let witness = unique_checkpoint_sibling(&path, "corrupt");
+    fs::write(&witness, b"prior damaged witness").unwrap();
+    let load = || ScanIndex::load_for_snapshot_source_with_origin(&path, source, &support);
+    assert!(load()
+        .unwrap_err()
+        .downcast_ref::<ScanIndexRebuildLoop>()
+        .is_some());
+    assert_eq!(
+        arm_scan_index_rebuild_manual_override(source, SystemTime::now()),
+        ScanIndexRebuildOverride::Armed
+    );
+    assert_eq!(
+        load().unwrap_err().downcast_ref::<state_v2::Hold>(),
+        Some(&state_v2::Hold::ReloadRequired)
+    );
+    // Restart before any collection save: the only durable graph is the repair publication.
+    state_v2::cold_close_for_test(&path).unwrap();
+    let (index, origin) = load().unwrap();
+    assert_eq!(origin, ScanIndexLoadOrigin::Loaded);
+    assert!(origin.is_fresh(&index));
+    assert_eq!(index.generation, 0);
+    assert_eq!(
+        index.accepted_rebuild_incidence,
+        expected.accepted_rebuild_incidence
+    );
+    assert_eq!(
+        index.accepted_snapshot_fingerprints,
+        expected.accepted_snapshot_fingerprints
+    );
+    assert_eq!(index.upload_context_proof, expected.upload_context_proof);
+    assert_eq!(
+        index.historical_replay_generation,
+        expected.historical_replay_generation
+    );
+    assert_eq!(index.accepted_rebuild_pending_since_unix_seconds, Some(42));
+    assert_eq!(index.accepted_rebuild_last_alarm_unix_seconds, Some(84));
+    assert!(index.accepted_incidence_pending_census);
+    assert!(witness.exists());
+    state_v2::erase_published(&path);
+    note_scan_index_rebuild_paused(source, false);
+    SCAN_INDEX_REBUILD_OVERRIDE.with(|cell| cell.set([ScanIndexRebuildOverrideState::NONE; 3]));
+}

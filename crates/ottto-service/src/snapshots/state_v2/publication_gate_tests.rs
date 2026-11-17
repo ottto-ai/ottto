@@ -140,3 +140,22 @@ fn claude_raw_hold_survives_a_native_save_and_cold_reload() {
         .collect();
     assert_eq!(restored, raw);
 }
+
+#[test]
+fn unbound_load_cannot_save_and_unadopted_bound_graph_requires_reload() {
+    let f = fixture(SnapshotSource::ClaudeCode);
+    let unbound = f.support.join("unbound.json");
+    let input = serde_json::to_vec(&ScanIndex::default()).unwrap();
+    fs::write(&unbound, &input).unwrap();
+    let mut index = ScanIndex::load(&unbound).unwrap();
+    assert_eq!(
+        index.save(&unbound).unwrap_err().downcast_ref::<Hold>(),
+        Some(&Hold::ForeignBinding)
+    );
+    assert_eq!(fs::read(&unbound).unwrap(), input);
+    assert_eq!(
+        index.save(&f.path).unwrap_err().downcast_ref::<Hold>(),
+        Some(&Hold::ReloadRequired)
+    );
+    assert!(!f.path.exists());
+}
