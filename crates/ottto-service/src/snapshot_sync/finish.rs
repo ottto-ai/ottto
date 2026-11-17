@@ -3,7 +3,7 @@
 use super::ack_retention;
 use super::anyhow;
 use super::apply_backfill_cutoff;
-use super::apply_backfill_cutoff_with_claude_corrections;
+
 use super::apply_bootstrapped_cache_heads;
 use super::apply_claude_local_evidence_to_scan_with_ledger_and_budget;
 use super::attach_head_conflict_answers;
@@ -13,7 +13,7 @@ use super::cache_head_file_groups;
 use super::cache_head_probe;
 use super::capture_codex_recovery_evidence;
 use super::capture_deferred_cache_head_identities;
-use super::checkpoint_partial_snapshot_index_with_audit_release;
+
 use super::claude_evidence_session_ids;
 use super::claude_replay_suppressed;
 use super::clear_shed_streak;
@@ -25,7 +25,7 @@ use super::defer_source_uploads;
 use super::effective_snapshot_upload_body_witness;
 use super::exclude_held_effective_body_witness_revision;
 use super::finalize_scan_after_policy_with_body_witness;
-use super::finish_selected_settlement;
+
 use super::identity_cache_wire_reserve;
 use super::is_upload_outage;
 use super::lane::ensure_snapshot_destination_current;
@@ -42,10 +42,7 @@ use super::refused_entity_state;
 use super::report_status_with_fresh_relay_token;
 use super::require_normal_write_ack_for_legacy_reconciliation;
 use super::safe_error;
-use super::save_index_and_publish_manifest;
-use super::settle_checkpointed_upload;
-use super::settle_completed_upload;
-use super::settle_index_after_upload;
+
 use super::shed_backoff;
 use super::snapshot_batch_request;
 use super::snapshot_entity_deferred;
@@ -65,8 +62,7 @@ use super::with_bootstrap_deferred;
 use super::with_retained_refusal_conflicts;
 use super::with_source_cadence;
 use super::with_source_cadence_state;
-use super::withdraw_source_manifest;
-use super::AccountAuditRelease;
+
 use super::BTreeMap;
 use super::BTreeSet;
 use super::BatchAuthorizationRejected;
@@ -78,7 +74,7 @@ use super::InplaceRetryBudget;
 use super::Instant;
 use super::LocalDaemon;
 use super::LocalDeviceBinding;
-use super::LocalHoldSettlement;
+
 use super::OffsetDateTime;
 use super::Path;
 use super::PermanentRefusalCounts;
@@ -86,7 +82,7 @@ use super::Result;
 use super::ResumableUploadResult;
 use super::Rfc3339;
 use super::ScanIndex;
-use super::SelectedSettlementInputs;
+
 use super::SnapshotApiClient;
 use super::SnapshotBatchPreflightRejected;
 use super::SnapshotBatchRequest;
@@ -103,6 +99,982 @@ use super::MAX_CYCLE_INTERVAL;
 use super::SNAPSHOT_SCHEMA_VERSION;
 use super::SNAPSHOT_SYNC_INTERVAL;
 
+#[cfg(test)]
+use super::snapshot_quarantine_witness;
+use super::ErrorKind;
+use super::Mutex;
+use super::OnceLock;
+use super::PathBuf;
+use super::RefusedSnapshotIndexes;
+use super::ShedSnapshotIndexes;
+use super::SnapshotProgressLock;
+use super::SnapshotQuarantineDisposition;
+use super::SnapshotSourceManifest;
+#[cfg(test)]
+use super::SnapshotUploadPolicy;
+use super::SnapshotUploadProgress;
+
+/// Commit a `Completed` upload that left local holds. Every uploaded entity was
+/// accepted or unchanged; only the held revisions are unsettled.
+///
+/// A hold that owes a clean follow-up (`progress_blocking`) keeps the
+/// conservative partial commit and marks the sweep unsettled, so the
+/// generation needs one clean follow-up. Otherwise every hold is
+/// non-progressing (account deferrals and bound authority holds, including
+/// bound RetryPending families under the path-(a) bridge): held keys keep their
+/// committed revision, every other key commits as the no-hold save would, and
+/// the traversal may settle. The caller keeps backfill and replay completion
+/// pending, and the durable hold disclosure keeps health red.
+///
+/// A non-progressing hold in a Claude family that retains authority evidence
+/// but has no committed entry to restore, as after a historical replay reset,
+/// still blocks: settling it would let a later page of the same traversal
+/// treat the still-present family as vanished. A never-committed member bound
+/// by its committed family's terminal quarantine settles with a delivery-free
+/// membership entry instead, so the family census stays complete.
+pub(super) fn commit_completed_with_local_holds(
+    index: ScanIndex,
+    committed_index: &ScanIndex,
+    upload_progress: &SnapshotUploadProgress,
+    locally_held_fingerprints: &BTreeSet<String>,
+    account_deferred_held_fingerprints: &BTreeSet<String>,
+    progress_blocking: bool,
+) -> ScanIndex {
+    if !progress_blocking {
+        if index.locally_held_keys_restorable(
+            committed_index,
+            locally_held_fingerprints,
+            account_deferred_held_fingerprints,
+        ) {
+            return index.into_locally_held_keys_reverted(
+                committed_index,
+                locally_held_fingerprints,
+                account_deferred_held_fingerprints,
+            );
+        }
+        crate::local_resource_diagnostics::claude_reread::held_reason(
+            crate::local_resource_diagnostics::claude_reread::HeldReason::NotRestorable,
+        );
+    }
+    let mut index = index.committable_subset_for_upload(
+        committed_index,
+        &upload_progress.accepted_fingerprints,
+        &upload_progress.quarantined_fingerprints,
+        locally_held_fingerprints,
+        true,
+    );
+    index.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::CompletedBlockingHolds);
+    index
+}
+
+/// Local holds classified once per page, after finalization and before upload.
+/// Every upload outcome settles against this one classification.
+pub(super) struct LocalHoldSettlement {
+    /// Sessions held locally on this page.
+    pub(super) held_entity_count: usize,
+    /// RetryPending Claude authority families anywhere in the index. They keep
+    /// full completion (backfill, replay) pending, but since the path-(a)
+    /// bridge they no longer make an unrelated page progress-blocking.
+    pub(super) retry_pending_family_count: usize,
+    pub(super) held_fingerprints: BTreeSet<String>,
+    pub(super) account_deferred_fingerprints: BTreeSet<String>,
+    pub(super) progress_blocking: bool,
+}
+
+pub(super) struct AccountAuditRelease<'a> {
+    pub(super) previous: &'a ScanIndex,
+    pub(super) roots: &'a [PathBuf],
+    pub(super) backfill_window_days: u64,
+}
+
+impl LocalHoldSettlement {
+    /// Record the durable account-hold disclosure, classify which holds a
+    /// later page could still change, and remove every held entity from the
+    /// upload. The disclosure is durable before upload, so every checkpoint
+    /// below carries it. Only Claude account deferrals are settled this way;
+    /// other sources keep every account deferral progress-blocking.
+    pub(super) fn classify(
+        source: SnapshotSource,
+        index: &mut ScanIndex,
+        scan_result: &mut crate::snapshots::SourceScanResult,
+        disposition: &crate::snapshots::ClaudeUsageAuthorityDisposition,
+    ) -> Self {
+        let held_entity_count = disposition.quarantined_entity_count();
+        let held_fingerprints = disposition.quarantined_fingerprints(&scan_result.snapshots);
+        let account_deferred_fingerprints =
+            disposition.account_deferred_fingerprints(&scan_result.snapshots);
+        let account_holds_recorded = source == SnapshotSource::ClaudeCode
+            && index.record_claude_account_deferred_holds(
+                scan_result.completed_parses(),
+                &disposition.account_deferred_tokens(&scan_result.snapshots),
+            );
+        if held_entity_count > 0 {
+            let counts = serde_json::json!({
+                "request_owned": disposition.request_owned_hold_reasons,
+                "account_binding": account_deferred_fingerprints.len(),
+                "authority_demotion": disposition.context_file_birth.demotion_quarantined_session_count,
+            });
+            eprintln!(
+                "local snapshot sync: hold disposition source={} held_entities={} counts={counts}",
+                source.api_slug(),
+                held_entity_count,
+            );
+        }
+        scan_result.remember_withheld_content(index);
+        let progress_blocking_held_fingerprints = disposition.progress_blocking_held_fingerprints(
+            &scan_result.snapshots,
+            index,
+            account_holds_recorded,
+        );
+        disposition.retain_uploadable(&mut scan_result.snapshots);
+        crate::snapshots::record_lineage_parentless_while_incomplete(
+            source,
+            &scan_result.snapshots,
+            index,
+        );
+        let retry_pending_family_count = index.claude_usage_authority_pending_count();
+        Self {
+            held_entity_count,
+            retry_pending_family_count,
+            held_fingerprints,
+            account_deferred_fingerprints,
+            progress_blocking: !progress_blocking_held_fingerprints.is_empty(),
+        }
+    }
+
+    pub(super) fn any(&self) -> bool {
+        self.retry_pending_family_count > 0 || self.held_entity_count > 0
+    }
+
+    /// Whether this page itself held any entity.
+    pub(super) fn page_held(&self) -> bool {
+        self.held_entity_count > 0
+    }
+}
+
+/// The index selected by an upload outcome, and its transport/local-hold
+/// settlement. Authority corrections are finalized on that selected index.
+pub(super) struct UploadIndexSettlement {
+    pub(super) index: ScanIndex,
+    pub(super) fully_settled: bool,
+}
+
+/// A persisted account hold was never uploaded, so the backfill and replay it
+/// belongs to stay pending even on a page that did not revisit it.
+pub(super) fn upload_settled_without_account_holds(index: &ScanIndex, settled: bool) -> bool {
+    settled && index.claude_account_deferred_hold_count() == 0
+}
+
+/// Settle a `Completed` upload: every uploaded entity was accepted or
+/// unchanged, and only local holds can remain unsettled.
+pub(super) fn settle_completed_upload(
+    index: ScanIndex,
+    committed_index: &ScanIndex,
+    upload_progress: &SnapshotUploadProgress,
+    holds: &LocalHoldSettlement,
+) -> UploadIndexSettlement {
+    if !holds.page_held() {
+        // RetryPending debt elsewhere settles this page as a no-hold page
+        // would, and only keeps full completion pending.
+        let fully_settled = upload_settled_without_account_holds(&index, !holds.any());
+        return UploadIndexSettlement {
+            index,
+            fully_settled,
+        };
+    }
+    let index = commit_completed_with_local_holds(
+        index,
+        committed_index,
+        upload_progress,
+        &holds.held_fingerprints,
+        &holds.account_deferred_fingerprints,
+        holds.progress_blocking,
+    );
+    eprintln!(
+        "local snapshot sync retained {} Claude usage family/families and {} revised \
+         entity/entities with unproven authority or session ownership; healthy siblings settled \
+         and the retained revisions remain pending for bounded retry",
+        holds.retry_pending_family_count, holds.held_entity_count
+    );
+    UploadIndexSettlement {
+        index,
+        fully_settled: false,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn classify_holds_for_test(
+    source: SnapshotSource,
+    index: &mut ScanIndex,
+    scan: &mut SourceScanResult,
+) {
+    LocalHoldSettlement::classify(
+        source,
+        index,
+        scan,
+        &crate::snapshots::ClaudeUsageAuthorityDisposition::default(),
+    );
+}
+
+#[cfg(test)]
+pub(super) fn classify_account_release_for_test(
+    index: &mut ScanIndex,
+    scan: &mut SourceScanResult,
+) -> (LocalHoldSettlement, SnapshotUploadProgress) {
+    let source = SnapshotSource::ClaudeCode;
+    let holds = LocalHoldSettlement::classify(
+        source,
+        index,
+        scan,
+        &crate::snapshots::ClaudeUsageAuthorityDisposition::default(),
+    );
+    assert!(!holds.page_held());
+    let mut progress =
+        SnapshotUploadProgress::new(format!("{:064x}", 99), snapshot_quarantine_witness(source));
+    let groups = cache_head_file_groups(index);
+    for item in &scan.snapshots {
+        progress
+            .record_pending_cache_head_identity(
+                item.source_file_fingerprint.as_ref(),
+                &item.snapshot_fingerprint,
+                &cache_session_key(&item.source_session_id),
+                &groups,
+                true,
+            )
+            .unwrap();
+    }
+    assert!(
+        !progress.pending_cache_heads.is_empty(),
+        "required head bindings recorded"
+    );
+    (holds, progress)
+}
+
+#[cfg(test)]
+pub(crate) fn accept_account_release_for_test(
+    mut index: ScanIndex,
+    previous: &ScanIndex,
+    scan: &mut SourceScanResult,
+    roots: &[PathBuf],
+) -> ScanIndex {
+    let (holds, mut progress) = classify_account_release_for_test(&mut index, scan);
+    progress.accepted_fingerprints.extend(
+        scan.snapshots
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone()),
+    );
+    index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
+    let mut settled = settle_completed_upload(index, previous, &progress, &holds);
+    assert!(settled.fully_settled);
+    scan.preserve_released_account_audits(
+        &mut settled.index,
+        previous,
+        roots,
+        crate::snapshots::BACKFILL_WINDOW_DAYS,
+    );
+    settled.index
+}
+
+#[cfg(test)]
+pub(crate) fn checkpoint_account_release_for_test(
+    mut index: ScanIndex,
+    previous: &ScanIndex,
+    scan: &mut SourceScanResult,
+    roots: &[PathBuf],
+    paths: (&Path, &Path),
+) -> Result<ScanIndex> {
+    let (holds, mut progress) = classify_account_release_for_test(&mut index, scan);
+    // Actual no-ACK partial save restores the prior accepted entry before
+    // transferring retry custody. Head binding above still had to succeed.
+    progress.save(paths.1)?;
+    checkpoint_partial_snapshot_index_with_audit_release(
+        &index,
+        previous,
+        &progress,
+        &scan.snapshots,
+        Some(scan),
+        &holds.held_fingerprints,
+        paths.0,
+        paths.1,
+        || Ok(()),
+        None,
+        Some(UnsettledUploadCause::UploadError),
+        Some(AccountAuditRelease {
+            previous,
+            roots,
+            backfill_window_days: crate::snapshots::BACKFILL_WINDOW_DAYS,
+        }),
+        Default::default(),
+    )
+}
+
+/// The page items a server answer names: an indexed validation rejection
+/// (422), an identity-deferral shed (503) or ACK refs that echoed another
+/// body witness. `None` when nothing is named or a location falls outside
+/// this page; that failure keeps its own path (a shed stays a whole-pass shed).
+pub(super) fn server_named_items(
+    error: &anyhow::Error,
+    indices: &[usize],
+) -> Option<BTreeSet<usize>> {
+    let named = if let Some(named) = error.downcast_ref::<ShedSnapshotIndexes>() {
+        &named.0
+    } else if let Some(named) = error.downcast_ref::<RefusedSnapshotIndexes>() {
+        &named.0
+    } else {
+        error
+            .downcast_ref::<BatchRejected>()?
+            .snapshot_indexes
+            .as_ref()?
+    };
+    named
+        .iter()
+        .map(|index| indices.get(*index).copied())
+        .collect()
+}
+
+/// Process-local, content-free count of records the attempt-count ladder made
+/// `UnprovenTerminal` (all sources), apart from server verdicts, so a later
+/// `unproven_terminal` rise can be attributed.
+pub(super) static UNPROVEN_TERMINAL_ATTEMPT_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Settle a `Deferred` or `Rejected` upload. Retryable or locally unproven
+/// entities keep replay pending and owe a clean follow-up. A validated
+/// permanent refusal settles transport and traversal; its separate health
+/// still discloses the rejected usage. Its holds settle exactly as on a
+/// `Completed` page: when every hold on this page is non-progressing and
+/// restorable, held keys keep their committed revision and the traversal may
+/// settle; backfill and replay stay pending. A RetryPending family elsewhere
+/// keeps only full completion pending (path-(a) bridge).
+pub(super) fn settle_checkpointed_upload(
+    index: ScanIndex,
+    committed_index: &ScanIndex,
+    upload_progress: &SnapshotUploadProgress,
+    holds: &LocalHoldSettlement,
+    resolved_permanent_rejections: bool,
+) -> UploadIndexSettlement {
+    let terminal_bound_holds = resolved_permanent_rejections
+        && holds.page_held()
+        && !holds.progress_blocking
+        && index.locally_held_keys_restorable(
+            committed_index,
+            &holds.held_fingerprints,
+            &holds.account_deferred_fingerprints,
+        );
+    let mut index = if terminal_bound_holds {
+        CHECKPOINTED_PAGES_SETTLED_WITH_TERMINAL_BOUND_HOLDS
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        index.into_locally_held_keys_reverted(
+            committed_index,
+            &holds.held_fingerprints,
+            &holds.account_deferred_fingerprints,
+        )
+    } else if holds.page_held() || !resolved_permanent_rejections {
+        // Refusals already have quarantine custody. Every entity that is not
+        // held settles as on a clean page, semantic no-ops not resent here
+        // included.
+        index.committable_subset_for_upload(
+            committed_index,
+            &upload_progress.accepted_fingerprints,
+            &upload_progress.quarantined_fingerprints,
+            &holds.held_fingerprints,
+            true,
+        )
+    } else {
+        index
+    };
+    let settled = resolved_permanent_rejections && (!holds.page_held() || terminal_bound_holds);
+    if !settled {
+        index.mark_bounded_sweep_unsettled_by(if resolved_permanent_rejections {
+            UnsettledUploadCause::RejectedWithHolds
+        } else {
+            UnsettledUploadCause::DeferredConflict
+        });
+    }
+    let fully_settled = upload_settled_without_account_holds(&index, settled && !holds.any());
+    UploadIndexSettlement {
+        index,
+        fully_settled,
+    }
+}
+
+/// Fold the upload ledger into the index after any outcome that reaches the
+/// durable save.
+pub(super) fn settle_index_after_upload(
+    index: &mut ScanIndex,
+    committed_index: &ScanIndex,
+    upload_progress: &SnapshotUploadProgress,
+) {
+    index.reconcile_codex_recovery_settlement(
+        committed_index,
+        &upload_progress.accepted_fingerprints,
+    );
+    index.retain_quarantined_fingerprints(&upload_progress.quarantined_fingerprints);
+    index.record_accepted_snapshot_fingerprints(&upload_progress.accepted_fingerprints);
+}
+
+/// Correction completion depends on the final selected file/empty facts. In
+/// particular, the last no-body drain must precede the completion decision.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the selected index, page facts, correction candidates and drain ledger"
+)]
+pub(super) fn settle_upload_corrections_after_selection(
+    index: &mut ScanIndex,
+    scan: &SourceScanResult,
+    committed_index: &ScanIndex,
+    progress: &SnapshotUploadProgress,
+    candidates: &[crate::snapshots::ClaudeProofCorrectionCandidate],
+    cutoff_candidates: &[crate::snapshots::ClaudeCutoffCorrectionCandidate],
+    transport_fully_settled: bool,
+    body_drains: &mut crate::snapshots::ClaudeProofBodyDrains,
+) -> bool {
+    // This drain is deliberately unavailable to partial/deferred/shed/error outcomes.
+    // Both existing durable refusal carriers must bind the exact current body.
+    // It settles against the selected entries, but a later account-audit
+    // release can still clear one; its drains join the finish restore.
+    if transport_fully_settled {
+        let drains = index.settle_claude_proof_corrections_with_permanent(
+            committed_index,
+            candidates,
+            &progress.accepted_fingerprints,
+            &progress.accepted_body_witnesses,
+            |fingerprint, body| {
+                progress
+                    .permanent_rejections
+                    .get(fingerprint)
+                    .is_some_and(|rejection| rejection.body_witness == body)
+                    && progress
+                        .quarantined_fingerprints
+                        .get(fingerprint)
+                        .is_some_and(|record| {
+                            record.disposition == SnapshotQuarantineDisposition::UnprovenTerminal
+                                && record.upload_body_witness.as_deref() == Some(body)
+                        })
+            },
+        );
+        body_drains.append(drains);
+    }
+    index.settle_cutoff_claude_proof_corrections(cutoff_candidates);
+    index.settle_empty_claude_proof_corrections(scan);
+    // Correction members the history gate holds wait for it; they are counted,
+    // not blocking.
+    let (blocking, deferred) = index.claude_authority_proof_correction_blocking();
+    if deferred > 0 {
+        eprintln!(
+            "local snapshot proof corrections deferred to the history gate for {}: members={deferred}",
+            scan.source.api_slug()
+        );
+        crate::local_resource_diagnostics::claude_history_proof_correction_deferred(deferred);
+    }
+    transport_fully_settled && !blocking
+}
+
+pub(super) struct SelectedSettlementInputs<'a> {
+    pub(super) scan: &'a SourceScanResult,
+    pub(super) committed_index: &'a ScanIndex,
+    pub(super) progress: &'a SnapshotUploadProgress,
+    pub(super) candidates: &'a [crate::snapshots::ClaudeProofCorrectionCandidate],
+    pub(super) cutoff_candidates: &'a [crate::snapshots::ClaudeCutoffCorrectionCandidate],
+    pub(super) transport_fully_settled: bool,
+    pub(super) body_drains: crate::snapshots::ClaudeProofBodyDrains,
+    pub(super) audit_release: Option<AccountAuditRelease<'a>>,
+}
+
+/// The finish order after save selection, shared with the proof-correction
+/// pipeline harness so its regressions guard this order: correction settle,
+/// account-audit release (which can clear a drained entry's revision), then the
+/// body-drain restore. Returns whether the page is fully settled.
+pub(super) fn finish_selected_settlement(
+    index: &mut ScanIndex,
+    inputs: SelectedSettlementInputs<'_>,
+) -> bool {
+    let SelectedSettlementInputs {
+        scan,
+        committed_index,
+        progress,
+        candidates,
+        cutoff_candidates,
+        transport_fully_settled,
+        mut body_drains,
+        audit_release,
+    } = inputs;
+    let mut fully_settled = settle_upload_corrections_after_selection(
+        index,
+        scan,
+        committed_index,
+        progress,
+        candidates,
+        cutoff_candidates,
+        transport_fully_settled,
+        &mut body_drains,
+    );
+    if let Some(release) = audit_release {
+        scan.preserve_released_account_audits(
+            index,
+            release.previous,
+            release.roots,
+            release.backfill_window_days,
+        );
+    }
+    // After every selected-entry restore and the account-audit release, which
+    // can clear a drained entry's revision: a drain (pre-selection or settlement)
+    // whose entry this save does not keep stays owed.
+    if index.restore_unselected_claude_proof_body_drains(body_drains) {
+        fully_settled = false;
+    }
+    fully_settled
+}
+
+pub(super) fn apply_backfill_cutoff_with_claude_corrections(
+    scan: &mut SourceScanResult,
+    index: &ScanIndex,
+    disposition: &crate::snapshots::ClaudeUsageAuthorityDisposition,
+    state: &crate::backfill::BackfillState,
+) -> (
+    usize,
+    Vec<crate::snapshots::ClaudeCutoffCorrectionCandidate>,
+) {
+    let mut candidates = index.capture_claude_cutoff_corrections(scan, disposition);
+    let removed = apply_backfill_cutoff(&mut scan.snapshots, state);
+    ScanIndex::retain_fully_cutoff_corrections(&mut candidates, &scan.snapshots);
+    (removed, candidates)
+}
+
+/// Last computed scan-index manifest per (upload destination, source).
+///
+/// The check-in heartbeat runs on its own clock and does not know which
+/// policy/attribution/destination-scoped index path the sync cycle chose, so it
+/// cannot load the index itself. The sync cycle publishes the manifest it
+/// already computed from the index it already had open, and both receipt shapes
+/// read it from here. Missing means "no scan has completed in this process yet
+/// for this destination", which is reported as an absent manifest rather than a
+/// zeroed one.
+///
+/// The destination is part of the key, not an afterthought: a setup or account
+/// switch replaces the relay binding without restarting the daemon (which is why
+/// `ensure_snapshot_destination_current` exists), and a manifest keyed by source
+/// alone would report the previous account's entity count and rolling hash to the
+/// new one — a wrong witness and a disclosure of the previous account's local
+/// session set.
+static SOURCE_MANIFESTS: OnceLock<Mutex<BTreeMap<(String, &'static str), SnapshotSourceManifest>>> =
+    OnceLock::new();
+
+type SourceManifestCache = Mutex<BTreeMap<(String, &'static str), SnapshotSourceManifest>>;
+
+pub(super) fn source_manifests() -> &'static SourceManifestCache {
+    SOURCE_MANIFESTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+pub(super) fn publish_source_manifest(
+    destination_namespace: &str,
+    source: SnapshotSource,
+    manifest: SnapshotSourceManifest,
+) {
+    // These mutations preserve BTreeMap invariants even if an unrelated
+    // consumer panics while holding the process-global cache. Recover poison
+    // so one caught panic cannot permanently suppress every future manifest.
+    let mut manifests = source_manifests()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // One destination at a time: a machine that has moved is never coming
+    // back to the old binding with the same secret, so retaining its
+    // manifests would only risk reporting them.
+    manifests.retain(|(namespace, _), _| namespace == destination_namespace);
+    manifests.insert(
+        (destination_namespace.to_string(), source.api_slug()),
+        manifest,
+    );
+}
+
+pub(super) fn withdraw_source_manifest(destination_namespace: &str, source: SnapshotSource) {
+    source_manifests()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&(destination_namespace.to_string(), source.api_slug()));
+}
+
+pub(super) fn save_index_and_publish_manifest(
+    index: &mut ScanIndex,
+    index_path: &Path,
+    destination_namespace: &str,
+    source: SnapshotSource,
+    census_complete: bool,
+    window_start: &str,
+    window_end: &str,
+) -> Result<()> {
+    // The server may already hold this pass's new entities. Keep the previous
+    // process-cache witness withdrawn until the exact replacement index is
+    // durable; a failed CAS/save or manifest derivation must not let a
+    // concurrent heartbeat repeat stale agreement.
+    withdraw_source_manifest(destination_namespace, source);
+    crate::local_resource_diagnostics::state_save_start(source.api_slug());
+    index.save(index_path)?;
+    if census_complete {
+        publish_source_manifest(
+            destination_namespace,
+            source,
+            index.manifest_for_window(source, window_start, window_end)?,
+        );
+    }
+    Ok(())
+}
+
+// Exercise the real durable-save/publication boundary from decoder rescans.
+#[cfg(test)]
+pub(crate) fn decode_hold_manifest_published_for_test(
+    index: &mut ScanIndex,
+    path: &Path,
+    source: SnapshotSource,
+    complete: bool,
+) -> Result<bool> {
+    let namespace = "lenient-decode-rescan";
+    save_index_and_publish_manifest(
+        index,
+        path,
+        namespace,
+        source,
+        complete,
+        "2026-01-01T00:00:00Z",
+        "2026-10-22T00:00:00Z",
+    )?;
+    Ok(cached_source_manifest(namespace, source).is_some())
+}
+
+/// Freshness fixtures exercise the real returning-quarantine and exact ACK path.
+#[cfg(test)]
+pub(crate) fn ack_current_again_quarantines_for_test(
+    index: &mut ScanIndex,
+    items: &[SnapshotItem],
+) -> BTreeMap<String, String> {
+    use tests::claude_money_e2_pipeline_tests::{ack, upload_source_under};
+    let source = SnapshotSource::ClaudeCode;
+    let mut progress =
+        SnapshotUploadProgress::new("a".repeat(64), snapshot_quarantine_witness(source));
+    progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints);
+    assert!(progress.retain_current_quarantines(&index.current_snapshot_fingerprints(), index));
+    assert!(progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints));
+    let (status, batches, _) = upload_source_under(
+        source,
+        SnapshotUploadPolicy::default(),
+        items,
+        &mut progress,
+        ack,
+    );
+    assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
+    assert_eq!(batches.len(), 1);
+    assert!(progress.quarantined_fingerprints.is_empty());
+    index.retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
+    index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
+    progress.fresh_context_body_acks
+}
+
+#[cfg(test)]
+pub(crate) fn checkpoint_unselected_for_test(
+    index: &ScanIndex,
+    committed: &ScanIndex,
+    scan: &SourceScanResult,
+    index_path: &Path,
+    progress_path: &Path,
+) -> Result<ScanIndex> {
+    checkpoint_page_for_test(index, committed, scan, index_path, progress_path, false)
+}
+
+#[cfg(test)]
+pub(crate) fn checkpoint_page_for_test(
+    index: &ScanIndex,
+    committed: &ScanIndex,
+    scan: &SourceScanResult,
+    index_path: &Path,
+    progress_path: &Path,
+    accept: bool,
+) -> Result<ScanIndex> {
+    let mut progress = SnapshotUploadProgress::load(
+        progress_path,
+        &format!("{:064x}", 588),
+        snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+    )?;
+    if accept {
+        use tests::claude_money_e2_pipeline_tests::{ack, upload_source_under};
+        let mut index = index.clone();
+        let mut scan = scan.clone();
+        let holds = LocalHoldSettlement::classify(
+            scan.source,
+            &mut index,
+            &mut scan,
+            &crate::snapshots::ClaudeUsageAuthorityDisposition::default(),
+        );
+        assert!(!holds.any(), "the completed fixture page has no holds");
+        let (result, _, _) = upload_source_under(
+            scan.source,
+            SnapshotUploadPolicy::default(),
+            &scan.snapshots,
+            &mut progress,
+            ack,
+        );
+        anyhow::ensure!(
+            result? == ResumableUploadResult::Completed,
+            "fixture exact ACK"
+        );
+        progress.save(progress_path)?;
+        index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
+        crate::snapshots::e2_pipeline_scan_fixture::accept_upload_context_acks_for_test(
+            &mut index,
+            &scan.snapshots,
+            &progress.fresh_context_body_acks,
+        );
+        index.save(index_path)?;
+        return Ok(index);
+    }
+    progress.save(progress_path)?;
+    checkpoint_partial_snapshot_index_with_audit_release(
+        index,
+        committed,
+        &progress,
+        &scan.snapshots,
+        Some(scan),
+        &BTreeSet::new(),
+        index_path,
+        progress_path,
+        || Ok(()),
+        None,
+        None,
+        None,
+        Default::default(),
+    )
+}
+
+/// Preserve only delivery-owned file checkpoints on an unfinished upload.
+/// Hold the progress lock through index CAS: neither an unsaved ACK nor a
+/// racing ledger generation may certify the scan's new file/body witnesses.
+#[expect(clippy::too_many_arguments, reason = "test helper, 9 case inputs")]
+#[cfg(test)]
+pub(super) fn checkpoint_partial_snapshot_index(
+    index: &ScanIndex,
+    committed_index: &ScanIndex,
+    progress: &SnapshotUploadProgress,
+    snapshots: &[SnapshotItem],
+    correction_scan: Option<&SourceScanResult>,
+    locally_held: &BTreeSet<String>,
+    index_path: &Path,
+    progress_path: &Path,
+    validate_destination: impl FnOnce() -> Result<()>,
+) -> Result<ScanIndex> {
+    checkpoint_partial_snapshot_index_with_audit_release(
+        index,
+        committed_index,
+        progress,
+        snapshots,
+        correction_scan,
+        locally_held,
+        index_path,
+        progress_path,
+        validate_destination,
+        None,
+        None,
+        None,
+        Default::default(),
+    )
+}
+
+/// Fixed labels for the partial-checkpoint steps whose own error carries no
+/// phrase `safe_error` knows. The checkpoint's other failures already carry
+/// fixed messages naming the partial checkpoint (listed in
+/// `PARTIAL_CHECKPOINT_FAILURES`).
+pub(super) const CHECKPOINT_PROGRESS_LOCK: &str = "partial checkpoint: acquire progress lock";
+
+pub(super) const CHECKPOINT_ACK_HANDOFF: &str = "partial checkpoint: stage ACK retirement handoff";
+
+pub(super) const CHECKPOINT_VALIDATE_DESTINATION: &str = "partial checkpoint: validate destination";
+
+pub(super) const CHECKPOINT_INDEX_SAVE: &str = "partial checkpoint: save scan index";
+
+/// Every partial-checkpoint failure label `safe_error` may print, so a failed
+/// checkpoint names its step instead of the bare "sync failed".
+pub(super) const PARTIAL_CHECKPOINT_FAILURES: [&str; 9] = [
+    CHECKPOINT_PROGRESS_LOCK,
+    "read snapshot progress for partial checkpoint",
+    "parse snapshot progress for partial checkpoint",
+    "partial checkpoint lacks a source witness",
+    "snapshot progress changed before partial checkpoint",
+    "conflicting snapshot bodies before partial checkpoint",
+    CHECKPOINT_ACK_HANDOFF,
+    CHECKPOINT_VALIDATE_DESTINATION,
+    CHECKPOINT_INDEX_SAVE,
+];
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "partial checkpoint keeps the selected body, audit and drain inputs together"
+)]
+pub(super) fn checkpoint_partial_snapshot_index_with_audit_release(
+    index: &ScanIndex,
+    committed_index: &ScanIndex,
+    progress: &SnapshotUploadProgress,
+    snapshots: &[SnapshotItem],
+    correction_scan: Option<&SourceScanResult>,
+    locally_held: &BTreeSet<String>,
+    index_path: &Path,
+    progress_path: &Path,
+    validate_destination: impl FnOnce() -> Result<()>,
+    read_limit: Option<usize>,
+    cause: Option<UnsettledUploadCause>,
+    audit_release: Option<AccountAuditRelease<'_>>,
+    body_drains: crate::snapshots::ClaudeProofBodyDrains,
+) -> Result<ScanIndex> {
+    let progress_owner =
+        SnapshotProgressLock::acquire(progress_path).context(CHECKPOINT_PROGRESS_LOCK)?;
+    let progress_owner = if crate::snapshots::state_v2_growth_retention_active(index) {
+        progress_owner.for_v2(progress_path)
+    } else {
+        progress_owner
+    };
+    let durable: SnapshotUploadProgress = if progress.rows.is_some() {
+        progress.durable_rows(index_path, &progress_owner)?
+    } else {
+        match match read_limit {
+            Some(cap) => crate::snapshot_retry::read_state(progress_path, cap),
+            None => std::fs::read(progress_path),
+        } {
+            Ok(bytes) => (if read_limit.is_some() {
+                crate::snapshot_retry::decode_state(&bytes)
+            } else {
+                serde_json::from_slice(&bytes).map_err(anyhow::Error::from)
+            })
+            .context("parse snapshot progress for partial checkpoint")?,
+            Err(error) if error.kind() == ErrorKind::NotFound && progress.generation == 0 => {
+                SnapshotUploadProgress::new(
+                    progress.destination_namespace_hash.clone(),
+                    progress
+                        .active_quarantine_witness
+                        .clone()
+                        .ok_or_else(|| anyhow!("partial checkpoint lacks a source witness"))?,
+                )
+            }
+            Err(error) => {
+                return Err(error).context("read snapshot progress for partial checkpoint")
+            }
+        }
+    };
+    // Refuse only a real concurrent writer, as `save()` does. The accepted
+    // and quarantined sets and the upload-context stamp read `durable`.
+    if !progress.same_writer(durable.stamp()) {
+        return Err(anyhow!(
+            "snapshot progress changed before partial checkpoint"
+        ));
+    }
+    let mut current_bodies = BTreeMap::new();
+    for item in snapshots {
+        let witness = snapshot_upload_body_witness(item);
+        if current_bodies
+            .insert(item.snapshot_fingerprint.as_str(), witness.clone())
+            .is_some_and(|previous| previous != witness)
+        {
+            return Err(anyhow!(
+                "conflicting snapshot bodies before partial checkpoint"
+            ));
+        }
+    }
+    let accepted = durable
+        .accepted_fingerprints
+        .iter()
+        .filter(|fingerprint| {
+            durable.accepted_body_witnesses.get(*fingerprint)
+                == current_bodies.get(fingerprint.as_str())
+                && current_bodies.contains_key(fingerprint.as_str())
+        })
+        .cloned()
+        .collect();
+    let quarantined = durable
+        .quarantined_fingerprints
+        .iter()
+        .filter(|(fingerprint, record)| {
+            record.upload_body_witness.as_ref() == current_bodies.get(fingerprint.as_str())
+                && current_bodies.contains_key(fingerprint.as_str())
+        })
+        .map(|(fingerprint, record)| (fingerprint.clone(), record.clone()))
+        .collect();
+    let mut committable = index.committable_subset_for_upload(
+        committed_index,
+        &accepted,
+        &quarantined,
+        locally_held,
+        false,
+    );
+    if let Some(scan) = correction_scan {
+        committable.requeue_unkept_scanned_keys(scan.source, index, locally_held);
+    }
+    if let Some(scan) = correction_scan {
+        // Settle no-body grants only against the file/empty/map facts
+        // actually selected for this save, after any old-entry restoration.
+        committable.settle_empty_claude_proof_corrections(scan);
+    }
+    if let (Some(scan), Some(release)) = (correction_scan, audit_release) {
+        scan.preserve_released_account_audits(
+            &mut committable,
+            release.previous,
+            release.roots,
+            release.backfill_window_days,
+        );
+    }
+    // After every selected-entry restore above: a drain whose entry this
+    // save does not keep stays owed.
+    committable.restore_unselected_claude_proof_body_drains(body_drains);
+    committable
+        .mark_bounded_sweep_unsettled_by(cause.unwrap_or(UnsettledUploadCause::Unattributed));
+    let census_absent = progress.complete_census_ack_retirements(
+        index,
+        correction_scan.is_some_and(|scan| scan.census_complete),
+    );
+    let scan_referenced = progress.ack_retirement_scan_references(committed_index, index);
+    progress
+        .stage_ack_retirement_handoff_with_scan(
+            committed_index,
+            &mut committable,
+            &scan_referenced,
+            locally_held,
+            &census_absent,
+        )
+        .context(CHECKPOINT_ACK_HANDOFF)?;
+    let context_rearms = committable.accept_file_upload_context_acks(
+        &progress.split_context_receipt_candidates(),
+        &progress.fresh_context_body_acks,
+        &progress.covered_stale_bodies(),
+    );
+    committable.stamp_entity_upload_context_acks(
+        &durable.destination_namespace_hash,
+        &durable.accepted_body_witnesses,
+        &durable.accepted_body_contexts,
+    );
+    validate_destination().context(CHECKPOINT_VALIDATE_DESTINATION)?;
+    committable
+        .save_with_progress_owner(index_path, read_limit, &progress_owner)
+        .context(CHECKPOINT_INDEX_SAVE)?;
+    if let Some(scan) = correction_scan {
+        scan.report_discovery_growth_after_save(&committable);
+        context_rearms.emit(scan.source);
+    }
+    Ok(committable)
+}
+
+pub(super) fn cached_source_manifest(
+    destination_namespace: &str,
+    source: SnapshotSource,
+) -> Option<SnapshotSourceManifest> {
+    source_manifests()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&(destination_namespace.to_string(), source.api_slug()))
+        .cloned()
+}
+
+#[cfg(test)]
+pub(super) fn clear_source_manifests_for_test() {
+    source_manifests()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+}
 #[expect(clippy::too_many_arguments, reason = "13 args; no options struct yet")]
 pub(super) fn finish_sync_source(
     preparation: SourcePreparation,
