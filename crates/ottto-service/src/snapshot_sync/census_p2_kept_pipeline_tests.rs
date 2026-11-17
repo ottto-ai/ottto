@@ -123,6 +123,15 @@ impl PipelineFixture {
     /// Freeze the ordinary census before edits so settlement tests retain
     /// their mixed held/refused/accepted page independently of hint priority.
     fn queue_before_append(&self) {
+        let now = OffsetDateTime::parse("2026-08-02T09:00:00Z", &Rfc3339)
+            .unwrap()
+            .unix_timestamp() as u64;
+        crate::snapshots::sampled_scan::transition_fixture::with_scan_clock(now, || {
+            self.queue_before_append_at(now);
+        });
+    }
+
+    fn queue_before_append_at(&self, now: u64) {
         let mut index = ScanIndex::load(&self.index_path).unwrap();
         let pending = std::fs::read_dir(&self.root)
             .unwrap()
@@ -136,6 +145,9 @@ impl PipelineFixture {
             183,
             &pending,
         );
+        // This queue was just created for the next visit, so page() must not
+        // age it as if it still belonged to the baseline's earlier visit.
+        self.listing_hour.set(Some((now / 3600) as i64));
         index.save_fixture(&self.index_path).unwrap();
     }
 

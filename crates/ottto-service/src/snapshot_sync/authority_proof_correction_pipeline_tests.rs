@@ -422,6 +422,25 @@ impl ApcFixture {
     }
 
     /// One page through the production stage order of `finish_sync_source`.
+    fn trace_stage(&self, at: &str, stage: &str, index: &ScanIndex) {
+        let record = index.claude_authority_record_for_test(APC_ROOT);
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "receipt": "native_correction_fixture_stage",
+                "case": self.case,
+                "at": at,
+                "stage": stage,
+                "generation": index.generation,
+                "record_contract": record.as_ref().map(|r| r.contract.as_str()),
+                "owed": record.as_ref().and_then(|r| r.correction.as_ref()).map(|(_, owed)| owed),
+                "witness": index.claude_usage_family_witness_digest_for_test(APC_ROOT),
+                "quarantined_entities": index.quarantined_snapshot_fingerprints.len(),
+            })
+        );
+    }
+
+    /// One bounded page with the same acquisition and retry clock.
     fn page(&self, collected_at: &str, upload: ApcUpload) -> ApcPage {
         let now = OffsetDateTime::parse(collected_at, &Rfc3339)
             .unwrap()
@@ -454,6 +473,7 @@ impl ApcFixture {
         );
         self.load_exclusion_list(&mut index);
         let committed_index = index.clone();
+        self.trace_stage(collected_at, "before_scan", &index);
         let native_pass = crate::snapshots::state_v2_baseline_release(&self.index_path, &index);
         let mut scan = crate::snapshots::e2_pipeline_scan_fixture::scan_native_pipeline_for_test(
             std::slice::from_ref(&self.root),
@@ -465,6 +485,7 @@ impl ApcFixture {
             None,
         )
         .expect("scan bounded Claude page");
+        self.trace_stage(collected_at, "after_scan", &index);
         let parsed = scan
             .snapshots
             .iter()
@@ -472,6 +493,7 @@ impl ApcFixture {
             .collect();
         let (mut disposition, _, _) =
             apply_claude_local_evidence_to_scan(&self.support, &mut scan, &mut index);
+        self.trace_stage(collected_at, "after_evidence", &index);
         self.stamp_owners(&mut scan);
         let deferred_accounts = index.bind_session_accounts_with_mixed(
             SnapshotSource::ClaudeCode,
@@ -539,6 +561,7 @@ impl ApcFixture {
             },
         );
         index.advance_empty_claude_proof_corrections(&scan);
+        self.trace_stage(collected_at, "after_finalize", &index);
         let sessions_by_fingerprint = scan
             .snapshots
             .iter()
@@ -705,6 +728,7 @@ impl ApcFixture {
             &progress.accepted_fingerprints,
             &progress.accepted_body_witnesses,
         );
+        self.trace_stage(collected_at, "after_exact_settlement", &index);
         index.log_claude_proof_correction_debt();
         if shed {
             progress
@@ -791,6 +815,7 @@ impl ApcFixture {
                 }),
             },
         );
+        self.trace_stage(collected_at, "after_selected_settlement", &index);
         // As the service finish, after the selected settlement: this page's
         // exact ACKs earn their file receipts. The synthetic responder answers
         // count ACKs, which the service never takes as receipt evidence; under
@@ -819,6 +844,7 @@ impl ApcFixture {
             &window_end,
         )
         .expect("save index and publish manifest");
+        self.trace_stage(collected_at, "after_save", &index);
         // Keep the page's upload observation for its assertions. The durable
         // ledger follows the real post-save ACK retirement and cycle finish.
         let observed_progress = progress.clone();
