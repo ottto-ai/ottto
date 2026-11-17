@@ -824,7 +824,8 @@ fn telemetry_growth_uses_saved_ack_then_rebuilds_to_answer_a_conflict_without_a_
                     result.unwrap(),
                     ResumableUploadResult::Deferred {
                         count: 1,
-                        isolated: 1
+                        isolated: 1,
+                        identity_503: 0
                     }
                 );
                 assert_eq!(envelope(&wires[0])["base_head_etag"], saved_head);

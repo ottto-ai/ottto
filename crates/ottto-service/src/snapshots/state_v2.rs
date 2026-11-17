@@ -160,8 +160,7 @@ struct Identity {
 
 /// Sources whose index routes through this store: their durable_sources row.
 fn v2_on(source: super::scan_index_persistence::Source) -> bool {
-    crate::snapshots::durable_sources::DurableSource::from_snapshot(source.snapshot())
-        .is_some_and(|source| source.properties().state_v2)
+    crate::snapshots::durable_sources::DurableSource::from_snapshot(source.snapshot()).is_some()
 }
 const INLINE_BYTES: usize = 512;
 const PART_BYTES: usize = 256 * 1024;

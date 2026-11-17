@@ -207,8 +207,11 @@ pub(in crate::snapshots) fn ensure_bounded_traversal(
     // cycle starts one clean follow-up walk. Reaching this point means that
     // follow-up (or another explicit fresh generation) is now starting. Any
     // new partial settlement stamps the marker again before persistence.
-    index.bounded_sweep_had_unsettled_upload = false;
-    index.bounded_sweep_unsettled_causes = 0;
+    // Owed identity-503 custody still holds the new walk; its upload
+    // ledger clears that cause.
+    index.bounded_sweep_unsettled_causes =
+        index.unsettled_cause_bits() & UnsettledUploadCause::Isolated503.bit();
+    index.bounded_sweep_had_unsettled_upload = index.bounded_sweep_unsettled_causes != 0;
 
     let mut census = ScanCensus::default();
     let resolved_roots = roots

@@ -445,7 +445,8 @@ fn cas_takeover(page: &Page, p: &mut Progress, mode: Mode) -> RouteResult {
                 result.unwrap(),
                 ResumableUploadResult::Deferred {
                     count: 1,
-                    isolated: 1
+                    isolated: 1,
+                    identity_503: 0
                 }
             );
             assert_eq!(

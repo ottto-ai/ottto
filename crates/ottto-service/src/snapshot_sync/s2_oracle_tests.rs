@@ -786,7 +786,8 @@ fn partial_ack_keeps_the_unaccepted_sibling_owed() {
             status.unwrap(),
             ResumableUploadResult::Deferred {
                 count: 1,
-                isolated: 1
+                isolated: 1,
+                identity_503: 0
             }
         );
         assert_eq!(progress.accepted_fingerprints.len(), 1);

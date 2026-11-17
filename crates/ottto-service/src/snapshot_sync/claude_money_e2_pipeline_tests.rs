@@ -2302,7 +2302,8 @@ fn retry_case(conflict: bool) {
             result.unwrap(),
             ResumableUploadResult::Deferred {
                 count: 1,
-                isolated: 1
+                isolated: 1,
+                identity_503: 0
             }
         );
         assert_eq!(

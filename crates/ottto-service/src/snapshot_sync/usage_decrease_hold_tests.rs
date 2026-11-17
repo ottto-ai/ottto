@@ -264,7 +264,8 @@ fn held_literal_body_is_retryable_reoffered_and_never_poison() {
         outcome,
         ResumableUploadResult::Deferred {
             count: 1,
-            isolated: 0
+            isolated: 0,
+            identity_503: 0
         }
     );
     // Siblings are checkpointed; the held body is not.
@@ -455,6 +456,7 @@ fn unknown_non_permanent_rejection_settles_accepted_siblings() {
                 ResumableUploadResult::Deferred {
                     count: 1,
                     isolated: 1,
+                    identity_503: 0,
                 }
             }
         );

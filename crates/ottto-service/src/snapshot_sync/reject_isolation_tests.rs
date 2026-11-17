@@ -228,6 +228,7 @@ pub(in crate::snapshot_sync) fn assert_mixed_retryable_holds() {
             let isolated = usize::from(
                 matches!(named, "mixed" | "conflict") || (identity && identity_status == 503),
             );
+            let identity_503 = usize::from(identity && identity_status == 503);
             let scratch = crate::test_scratch::ScratchDir::new("indexed-validation-progress");
             let progress_path = scratch.join("progress.json");
             let mut items = page.scan.snapshots.clone();
@@ -266,7 +267,10 @@ pub(in crate::snapshot_sync) fn assert_mixed_retryable_holds() {
                 let batches = if emitted.is_empty() {
                     vec![]
                 } else {
-                    vec![canonical(&source_wire(source, &emitted.iter().collect::<Vec<_>>()))]
+                    vec![canonical(&source_wire(
+                        source,
+                        &emitted.iter().collect::<Vec<_>>(),
+                    ))]
                 };
                 let mut result = RouteResult::emitted(mode, source, batches, &emitted);
                 result.codex_evidence = oracle::codex_evidence(&page.index, &page.scan);
@@ -376,7 +380,8 @@ pub(in crate::snapshot_sync) fn assert_mixed_retryable_holds() {
                                     }
                                     response.validate_entity_ack(&source_wire(source, batch))?;
                                     for item in batch
-                                        .iter().copied()
+                                        .iter()
+                                        .copied()
                                         .filter(|item| item.snapshot_fingerprint != fp)
                                     {
                                         backend
@@ -457,7 +462,11 @@ pub(in crate::snapshot_sync) fn assert_mixed_retryable_holds() {
             // Deferred, never Shed: the caller sets no source backoff.
             assert_eq!(
                 result,
-                ResumableUploadResult::Deferred { count: 1, isolated }
+                ResumableUploadResult::Deferred {
+                    count: 1,
+                    isolated,
+                    identity_503
+                }
             );
             assert_eq!(accepted as usize, items.len() - 1);
             assert_eq!(progress.quarantined_fingerprints.len(), 1);
@@ -554,6 +563,7 @@ pub(in crate::snapshot_sync) fn assert_mixed_retryable_holds() {
                     &progress,
                     &holds,
                     false,
+                    UnsettledUploadCause::DeferredConflict,
                 )
                 .index;
                 settle_index_after_upload(&mut settled, &page.committed, &progress);
@@ -611,7 +621,11 @@ pub(in crate::snapshot_sync) fn assert_mixed_retryable_holds() {
                 let (result, accepted, emitted) = send(&items, &mut progress, &mut backend, true);
                 assert_eq!(
                     result,
-                    ResumableUploadResult::Deferred { count: 1, isolated }
+                    ResumableUploadResult::Deferred {
+                        count: 1,
+                        isolated,
+                        identity_503
+                    }
                 );
                 assert_eq!(accepted, 1);
                 assert_eq!(emitted.len(), 1);
@@ -761,7 +775,8 @@ pub(in crate::snapshot_sync) fn indexed_refusal_fixture() -> IndexedRefusalFixtu
         result,
         ResumableUploadResult::Deferred {
             count: 1,
-            isolated: 0
+            isolated: 0,
+            identity_503: 0
         }
     );
     assert_eq!(accepted, 1);
@@ -808,8 +823,14 @@ fn indexed_refusal_settles_unsent_siblings_without_a_reread() {
         account_deferred_fingerprints: BTreeSet::new(),
         progress_blocking: false,
     };
-    let settlement =
-        settle_checkpointed_upload(scanned.clone(), &committed, &progress, &no_holds, false);
+    let settlement = settle_checkpointed_upload(
+        scanned.clone(),
+        &committed,
+        &progress,
+        &no_holds,
+        false,
+        UnsettledUploadCause::DeferredConflict,
+    );
     assert!(
         !settlement.fully_settled,
         "the refused item keeps a follow-up owed"
@@ -888,6 +909,7 @@ fn local_hold_settles_unsent_siblings_without_a_reread() {
                 &progress,
                 holds,
                 other == "rejected",
+                UnsettledUploadCause::DeferredConflict,
             ),
         };
         let mut index = settlement.index;
@@ -928,7 +950,10 @@ fn local_hold_settles_unsent_siblings_without_a_reread() {
     }
 }
 
-fn source_wire<'a>(source: SnapshotSource, items: &[&'a SnapshotItem]) -> SnapshotBatchRequest<&'a SnapshotItem> {
+fn source_wire<'a>(
+    source: SnapshotSource,
+    items: &[&'a SnapshotItem],
+) -> SnapshotBatchRequest<&'a SnapshotItem> {
     let mut request = request_under(SnapshotUploadPolicy::default(), items);
     request.source = source.api_slug().into();
     request

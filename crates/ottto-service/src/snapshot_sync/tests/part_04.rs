@@ -1261,16 +1261,28 @@ fn retry_pending_debt_elsewhere_marks_the_sweep_only_with_a_second_cause() {
         !completed.fully_settled,
         "the debt keeps completion pending"
     );
-    let rejected =
-        settle_checkpointed_upload(committed.clone(), &committed, &progress, &debt_only, true);
+    let rejected = settle_checkpointed_upload(
+        committed.clone(),
+        &committed,
+        &progress,
+        &debt_only,
+        true,
+        UnsettledUploadCause::DeferredConflict,
+    );
     assert!(!rejected.index.bounded_sweep_had_unsettled_upload());
     assert!(rejected
         .index
         .bounded_sweep_unsettled_cause_names()
         .is_empty());
     assert!(!rejected.fully_settled);
-    let deferred =
-        settle_checkpointed_upload(committed.clone(), &committed, &progress, &debt_only, false);
+    let deferred = settle_checkpointed_upload(
+        committed.clone(),
+        &committed,
+        &progress,
+        &debt_only,
+        false,
+        UnsettledUploadCause::DeferredConflict,
+    );
     assert!(
         deferred.index.bounded_sweep_had_unsettled_upload(),
         "a retryable server conflict beside the debt still marks the sweep"

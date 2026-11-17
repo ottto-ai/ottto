@@ -556,10 +556,13 @@ pub(crate) enum UnsettledUploadCause {
     /// A path that does not name itself, a flag saved before causes were
     /// recorded, or a malformed recorded value.
     Unattributed,
+    /// Only identity-unavailable 503 deferrals. Cleared once every deferred
+    /// session's later body is ACKed; an older daemon reads it as unknown.
+    Isolated503,
 }
 
 impl UnsettledUploadCause {
-    pub(super) const ALL: [Self; 9] = [
+    pub(super) const ALL: [Self; 10] = [
         Self::Shed,
         Self::UploadError,
         Self::DeferredConflict,
@@ -569,6 +572,7 @@ impl UnsettledUploadCause {
         Self::LegacyReconcile,
         Self::AdmissionReoffer,
         Self::Unattributed,
+        Self::Isolated503,
     ];
 
     pub(super) fn bit(self) -> u16 {
@@ -586,6 +590,7 @@ impl UnsettledUploadCause {
             Self::LegacyReconcile => "legacy_reconcile",
             Self::AdmissionReoffer => "admission_reoffer",
             Self::Unattributed => "unattributed",
+            Self::Isolated503 => "isolated_503",
         }
     }
 
@@ -1026,6 +1031,37 @@ impl ScanIndex {
     pub(crate) fn mark_bounded_sweep_unsettled_by(&mut self, cause: UnsettledUploadCause) {
         self.bounded_sweep_unsettled_causes = self.unsettled_cause_bits() | cause.bit();
         self.bounded_sweep_had_unsettled_upload = true;
+    }
+
+    /// Reconcile `Isolated503` with its custody before the scanner runs: an
+    /// empty set clears it (and the set), a pending one sets it, absent
+    /// custody keeps it.
+    pub(crate) fn reconcile_isolated_503(&mut self, custody: &mut Option<BTreeSet<String>>) {
+        match custody {
+            Some(pending) if pending.is_empty() => {
+                *custody = None;
+                self.bounded_sweep_unsettled_causes =
+                    self.unsettled_cause_bits() & !UnsettledUploadCause::Isolated503.bit();
+                self.bounded_sweep_had_unsettled_upload = self.bounded_sweep_unsettled_causes != 0;
+            }
+            Some(_) => self.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::Isolated503),
+            None => {}
+        }
+    }
+
+    pub(crate) fn owes_isolated_503(&self) -> bool {
+        self.unsettled_cause_bits() & UnsettledUploadCause::Isolated503.bit() != 0
+    }
+
+    /// This pass ended the walk `before` was on: none remains, or another
+    /// replaced it.
+    pub(crate) fn walk_retired_since(&self, before: &ScanIndex) -> bool {
+        self.traversal.as_ref().is_none_or(|new| {
+            before.traversal.as_ref().is_some_and(|old| {
+                (&old.context_fingerprint, &old.census_window_end)
+                    != (&new.context_fingerprint, &new.census_window_end)
+            })
+        })
     }
 
     /// The flag is authoritative: no cause without it, and
