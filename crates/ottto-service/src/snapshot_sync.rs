@@ -5256,8 +5256,15 @@ fn finish_sync_source(
             source,
             &upload_destination_namespace,
         );
-    if continuation::resident_scan_requested(&scan_result, first_read_bootstrap) {
-        continuation::request_resident_scan(source, first_read_bootstrap);
+    let power = continuation::MacPlatformSignals::default().power();
+    if continuation::resident_scan_requested_after_settlement(
+        &scan_result,
+        &index,
+        first_read_bootstrap,
+        power,
+        current_unix_seconds(),
+    ) {
+        continuation::request_resident_scan_on_power(source, first_read_bootstrap, power);
     }
 
     // Refresh the per-source detected-uses cache the daemon health assembly

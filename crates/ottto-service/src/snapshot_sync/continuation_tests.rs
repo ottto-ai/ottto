@@ -1497,6 +1497,141 @@ fn byte_budget_pages_pace_only_during_a_first_backfill() {
     }
 }
 
+/// Routine and discovery-complete pages can keep bootstrap pacing without
+/// granting battery pacing or polling a terminal traversal before its retry.
+#[test]
+fn first_import_open_walk_pacing_decision_table() {
+    use crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture;
+    let home = crate::test_scratch::private_dir("open-walk-pacing")
+        .canonicalize()
+        .unwrap();
+    let mut scan = empty_scan();
+    scan.routine_recensus = true;
+    scan.census_status.pending_work = false;
+    assert!(!resident_scan_requested(&scan, true));
+    for source in ROTATION {
+        let root = home.join(source.api_slug());
+        first_read_file(source, &root, 1);
+        first_read_file(source, &root, 2);
+        let (open, _, _) = E2ScanFixture::default().scan_other_page(
+            source,
+            &[root],
+            &home,
+            ScanIndex::default(),
+            true,
+            1,
+            &[],
+        );
+        let mut terminal = serde_json::to_value(&open).unwrap();
+        let traversal = &mut terminal["traversal"];
+        assert!(traversal.is_object(), "{source:?}");
+        traversal["pending_directories"] = serde_json::json!([]);
+        traversal["pending_candidates"] = serde_json::json!([]);
+        traversal["counts"]["unreadable_path_count"] = serde_json::json!(1);
+        traversal["unhealthy_retry_not_before_unix_seconds"] = serde_json::json!(1060);
+        // Follow-up debt must not bypass the terminal retry clock either.
+        terminal["bounded_sweep_had_unsettled_upload"] = serde_json::json!(true);
+        let waiting: ScanIndex = serde_json::from_value(terminal.clone()).unwrap();
+        terminal["traversal"]["unhealthy_retry_not_before_unix_seconds"] = serde_json::json!(1000);
+        let due: ScanIndex = serde_json::from_value(terminal.clone()).unwrap();
+        terminal["traversal"]["unhealthy_retry_not_before_unix_seconds"] = serde_json::Value::Null;
+        let legacy: ScanIndex = serde_json::from_value(terminal).unwrap();
+        let mut followup = ScanIndex::default();
+        followup.mark_bounded_sweep_unsettled();
+        for (name, index, schedulable) in [
+            ("open", &open, true),
+            ("followup", &followup, true),
+            ("waiting", &waiting, false),
+            ("due", &due, true),
+            ("legacy deadline", &legacy, true),
+            ("clean close", &ScanIndex::default(), false),
+        ] {
+            for bootstrap in [false, true] {
+                // Refused includes Low Power Mode; unknown grants nothing.
+                for power in [
+                    PlatformState::Allowed,
+                    PlatformState::Battery,
+                    PlatformState::Refused,
+                    PlatformState::Unknown,
+                ] {
+                    assert_eq!(
+                        resident_scan_requested_after_settlement(
+                            &scan, index, bootstrap, power, 1000,
+                        ),
+                        bootstrap && power == PlatformState::Allowed && schedulable,
+                        "{source:?} {name} bootstrap={bootstrap} power={power:?}",
+                    );
+                }
+            }
+        }
+    }
+    std::fs::remove_dir_all(home).unwrap();
+}
+
+/// A conflict can mark a follow-up after the final scan retired its walk.
+/// Use the saved settlement state, without changing that scan's result.
+#[test]
+fn first_import_final_page_conflict_requests_followup_after_settlement() {
+    let mut scan = empty_scan();
+    scan.census_complete = true;
+    scan.census_status.pending_work = false;
+    let mut index = ScanIndex::default();
+    let requested = |index: &ScanIndex| {
+        resident_scan_requested_after_settlement(&scan, index, true, PlatformState::Allowed, 1000)
+    };
+    assert!(!requested(&index));
+    index.mark_bounded_sweep_unsettled_by(crate::snapshots::UnsettledUploadCause::DeferredConflict);
+    let saved: ScanIndex = serde_json::from_value(serde_json::to_value(&index).unwrap()).unwrap();
+    assert!(requested(&saved));
+    assert!(!resident_scan_requested(&scan, true));
+    assert!(!requested(&ScanIndex::default()), "clean follow-up closed");
+}
+
+/// The new request uses ordinary resident pacing and remains subordinate to
+/// server minima, a 503 upload-shed deadline and source failure backoff.
+#[test]
+#[serial_test::serial(source_cadences, source_upload_deadlines)]
+fn first_import_open_walk_pacing_obeys_upload_shed_deadline() {
+    use super::super::{defer_source_uploads, paced_scan_due};
+    let _saved = OwnedCadences::install();
+    super::super::clear_cadence_state_for_test();
+    super::super::clear_source_upload_deadlines_for_test();
+    let scan = empty_scan();
+    let mut index = ScanIndex::default();
+    index.mark_bounded_sweep_unsettled();
+    crate::scan_clock::with_clock(1000, || {
+        let now = crate::scan_clock::now();
+        for source in ROTATION {
+            assert!(resident_scan_requested_after_settlement(
+                &scan,
+                &index,
+                true,
+                PlatformState::Allowed,
+                1000,
+            ));
+            with_source_cadence(source, |cadence| {
+                cadence.record_scan_success(now, 0);
+                cadence.request_paced_scan(now, Duration::ZERO, PACED_AC, true);
+                assert_eq!(
+                    cadence.paced_scan_due(),
+                    Some(now + Duration::from_secs(30))
+                );
+                cadence.set_server_min_interval(Some(Duration::from_secs(90)));
+                assert!(cadence.next_scan_after(now) >= Duration::from_secs(90));
+            });
+            defer_source_uploads(source, Duration::from_secs(120));
+        }
+        assert_eq!(paced_scan_due(), Some(now + Duration::from_secs(120)));
+        for source in ROTATION {
+            assert!(source_paced_due(source).is_none());
+            after_ordinary_source_failure(source);
+        }
+        assert_eq!(paced_scan_due(), None);
+    });
+    super::super::clear_source_upload_deadlines_for_test();
+    super::super::clear_cadence_state_for_test();
+}
+
 /// `count` Codex rollouts of about 1.7 KiB each in `root`, numbered from `first`.
 fn codex_rollouts(root: &Path, first: u64, count: u64) -> Vec<PathBuf> {
     (first..first + count)

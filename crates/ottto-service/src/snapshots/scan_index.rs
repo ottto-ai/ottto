@@ -984,6 +984,27 @@ crate::heap_layout_bound::fields!(SnapshotQuarantineRecord; reconstruction_contr
 crate::heap_layout_bound::fields!(SnapshotQuarantineWitness; contract, collector_version, parser_version, scan_identity_version, snapshot_schema_version, entity_ack_contract, item_wire_byte_limit);
 
 impl ScanIndex {
+    /// Scheduling only: keep an open walk or its clean follow-up paced, but
+    /// leave a terminal-unhealthy walk on its existing bounded retry clock.
+    pub(crate) fn bounded_walk_or_followup_schedulable(&self, now: u64) -> bool {
+        let Some(traversal) = self.traversal.as_ref() else {
+            return self.bounded_sweep_had_unsettled_upload;
+        };
+        let terminal_unhealthy = traversal.pending_directories.is_empty()
+            && !traversal
+                .pending_candidates
+                .iter()
+                .any(|candidate| candidate.census_member)
+            && traversal.has_errors();
+        !terminal_unhealthy
+            || traversal
+                .unhealthy_retry_not_before_unix_seconds
+                .is_none_or(|deadline| {
+                    now >= deadline
+                        || deadline > now.saturating_add(UNHEALTHY_SCAN_RETRY_MAX_SECONDS)
+                })
+    }
+
     /// Census members still queued at page end, exactly what
     /// `skipped_file_count_due_to_limit` counts. Cap refusals are not in it,
     /// and it is not `scan_cap_hit`. No stat or read.

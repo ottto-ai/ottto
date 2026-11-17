@@ -416,6 +416,12 @@ request pacing.
 Prepare, finish, server minima, upload backoff and background QoS still apply.
 During a first backfill (not a replay revision bump), a Codex page that spent a byte budget with
 work still queued also requests a paced pass.
+While destination bootstrap is pending, AC passes also keep an open bounded walk or an owed
+clean follow-up on the same 30-second pacing, including routine re-census pages. The request
+uses the index after upload settlement, so a final-page conflict can arm the follow-up.
+A terminal-unhealthy traversal waiting for its retry deadline grants no new request.
+Battery and Low Power Mode gain no additional pacing; clean retirement or bootstrap completion
+ends this request.
 
 ## SQLite
 

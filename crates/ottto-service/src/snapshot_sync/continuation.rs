@@ -157,8 +157,30 @@ pub(super) fn resident_scan_requested(scan: &SourceScanResult, first_read_bootst
                     && !scan.routine_recensus
                     && !scan.census_complete)))
 }
+/// Read the index after settlement: a final-page conflict can owe a follow-up
+/// even when the scan already retired its traversal and reported completion.
+pub(super) fn resident_scan_requested_after_settlement(
+    scan: &SourceScanResult,
+    index: &ScanIndex,
+    first_read_bootstrap: bool,
+    power: PlatformState,
+    now: u64,
+) -> bool {
+    resident_scan_requested(scan, first_read_bootstrap)
+        || (first_read_bootstrap
+            && power == PlatformState::Allowed
+            && index.bounded_walk_or_followup_schedulable(now))
+}
+
 pub(super) fn request_resident_scan(source: SnapshotSource, first_import: bool) {
-    if let Some(pacing) = resident_pacing(MacPlatformSignals::default().power()) {
+    request_resident_scan_on_power(source, first_import, MacPlatformSignals::default().power());
+}
+pub(super) fn request_resident_scan_on_power(
+    source: SnapshotSource,
+    first_import: bool,
+    power: PlatformState,
+) {
+    if let Some(pacing) = resident_pacing(power) {
         with_source_cadence(source, |cadence| {
             let now = crate::scan_clock::now();
             cadence.request_paced_scan(now, Duration::ZERO, pacing, first_import)
