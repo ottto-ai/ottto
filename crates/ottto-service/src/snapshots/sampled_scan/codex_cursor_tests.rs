@@ -6,7 +6,6 @@ use crate::snapshots::transcript_acquisition_tests::accept_after_policy;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::FileExt;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use crate::transcript_cache::ENTRY_BYTES;
 
@@ -16,16 +15,12 @@ fn plain_path() -> &'static Path {
 
 const NOW: &str = "2026-10-07T12:00:00Z";
 const SESSION: &str = "019fa111-2222-7333-8444-555555555555";
-static NEXT: AtomicU64 = AtomicU64::new(0);
 
 struct Temp(PathBuf);
 impl Temp {
     fn new(tag: &str, bytes: &[u8]) -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "ottto-codex-cursor-{tag}-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, AtomicOrdering::Relaxed)
-        ));
+        // Canonical: state v2 refuses a store beneath a symlinked ancestor.
+        let path = crate::test_scratch::unique_path(&format!("ottto-codex-cursor-{tag}"));
         fs::write(&path, bytes).unwrap();
         Self(path)
     }

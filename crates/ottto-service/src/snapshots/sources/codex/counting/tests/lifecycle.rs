@@ -638,7 +638,11 @@ fn bounded_reconciliation_preserves_retired_counting_evidence_across_reload() {
     let mut working = acked.previous.clone();
     let old_key = local_index_key(&acked.original);
     retirement_generation(&mut working, "2026-10-05T23:00:00Z");
-    assert!(reconcile_missing_index_entries_with_limit(&mut working, 1));
+    assert!(reconcile_missing_index_entries_with_side(
+        &mut working,
+        1,
+        SnapshotSource::Codex
+    ));
     assert!(!working.files.contains_key(&old_key));
     working.save(&acked.index_path).unwrap();
     let loaded = ScanIndex::load(&acked.index_path).unwrap();
@@ -662,7 +666,11 @@ fn unavailable_known_root_cannot_collect_retired_owner_before_archive_reload() {
         fs::rename(&acked.original, &archived).unwrap();
         let mut working = acked.previous.clone();
         retirement_generation(&mut working, "2026-10-05T23:00:00Z");
-        assert!(reconcile_missing_index_entries_with_limit(&mut working, 1));
+        assert!(reconcile_missing_index_entries_with_side(
+            &mut working,
+            1,
+            SnapshotSource::Codex
+        ));
         working.save(&acked.index_path).unwrap();
         let retired = ScanIndex::load(&acked.index_path).unwrap();
         let owner = codex_protected_owner(SESSION);
