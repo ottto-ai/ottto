@@ -23,6 +23,8 @@ impl ScanIndex {
         read_limit: Option<usize>,
         _owner: &crate::snapshot_sync::SnapshotProgressLock,
     ) -> Result<()> {
+        #[cfg(test)]
+        e2_pipeline_scan_fixture::prepare_fixture_save(self, path)?;
         if !state_v2::state_v2_growth_retention_active(self) {
             return match read_limit {
                 Some(cap) => self.save_with_read_limit(path, cap),

@@ -177,8 +177,10 @@ impl Fixture {
     /// the upload ledger reloads, and the prepare activates `mode` again.
     fn restart(&mut self, mode: Mode) {
         let path = self._scratch.join("restart-index.json");
-        self.index = e2_pipeline_scan_fixture::save_reload_for_test(&mut self.index, &path);
+        let saved = e2_pipeline_scan_fixture::save_reload_for_test(&mut self.index, &path);
+        self.index = ScanIndex::default();
         self.cache = Arc::default();
+        self.index = e2_pipeline_scan_fixture::cold_restart(saved);
         self.flip_to(mode);
         let context = self
             .index
