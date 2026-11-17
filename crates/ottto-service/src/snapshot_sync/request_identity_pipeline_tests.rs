@@ -565,9 +565,9 @@ fn preparation_error_preserves_normalization_counts_on_scan_worker() {
     )
     .unwrap();
     progress.save(&progress_path).unwrap();
-    crate::snapshots::state_v2::money_test_support::exhaust_progress_generation_for_test(&index);
+    crate::snapshots::e2_pipeline_scan_fixture::exhaust_progress_generation_for_test(&index);
     let index = ScanIndex::load(&index_path).unwrap();
-    crate::snapshots::state_v2::money_test_support::edit_record_for_test(
+    crate::snapshots::e2_pipeline_scan_fixture::edit_record_for_test(
         &index,
         "refusal.authority",
         root,
@@ -630,8 +630,15 @@ fn preparation_error_preserves_normalization_counts_on_scan_worker() {
         1
     );
     assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&std::fs::read(&progress_path).unwrap())
-            .unwrap()["generation"],
+        SnapshotUploadProgress::load_for_index(
+            &ScanIndex::load(&index_path).unwrap(),
+            &index_path,
+            &progress_path,
+            &namespace,
+            snapshot_quarantine_witness(source),
+        )
+        .unwrap()
+        .generation,
         u64::MAX
     );
     assert!(!crate::local_resource_diagnostics::claude_reread::active());

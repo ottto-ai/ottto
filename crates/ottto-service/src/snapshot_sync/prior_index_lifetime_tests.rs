@@ -198,6 +198,7 @@ fn e2_real_caller_parity_at_tight_allowances() {
             index.generation = current.generation;
             (index, scan)
         };
+        drop(current);
         let progress_path = preparation.upload_progress_path.clone();
         let guard = Guard::new(
             keep_prior,

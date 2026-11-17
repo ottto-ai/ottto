@@ -1501,3 +1501,68 @@ pub(crate) fn expire_claimed_growth_for_test(index: &mut ScanIndex, path: &Path)
     let route = route_of(index).unwrap();
     index.save_fixture(&route).unwrap();
 }
+
+pub(crate) fn discard_store_for_test(path: &Path) {
+    state_v2::erase_published(path);
+}
+
+pub(crate) fn edit_record_for_test(
+    index: &ScanIndex,
+    kind: &str,
+    name: &str,
+    edit: impl FnOnce(&mut serde_json::Value),
+) {
+    state_v2::money_test_support::edit_record_for_test(index, kind, name, edit);
+}
+
+pub(crate) fn exhaust_progress_generation_for_test(index: &ScanIndex) {
+    state_v2::money_test_support::exhaust_progress_generation_for_test(index);
+}
+
+/// The production sampled acquisition over an already bound synthetic route.
+/// A new cache per page leaves all continuation custody in the state store.
+pub(crate) fn scan_native_pipeline_for_test(
+    roots: &[PathBuf],
+    index: &mut ScanIndex,
+    collected_at: &str,
+    window_days: u64,
+    limit: usize,
+    support: &Path,
+) -> Result<SourceScanResult> {
+    state_v2::before_collection(index)?;
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let scope = Scope("native-pipeline-fixture".into());
+    let mut state = OwnedSourceScan::new_with_recovery_priority(
+        SnapshotSource::ClaudeCode,
+        roots,
+        std::mem::take(index),
+        collected_at,
+        window_days,
+        limit,
+        Some(support),
+        &[],
+        false,
+        &mut ListingRequest::default(),
+        true,
+        &[],
+        Some((cache.as_ref(), &scope)),
+    )
+    .with_sampled_acquisition(cache, scope);
+    loop {
+        if let Err(error) = state_v2::before_collection(&state.index) {
+            *index = state.index;
+            return Err(error);
+        }
+        match state.step(None) {
+            OwnedSourceScanStep::Pending(next) => state = next,
+            OwnedSourceScanStep::Complete {
+                index: complete,
+                scan,
+                ..
+            } => {
+                *index = complete;
+                return Ok(scan);
+            }
+        }
+    }
+}

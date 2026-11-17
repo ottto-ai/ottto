@@ -210,6 +210,9 @@ impl ApcFixture {
         for (agent, request, second) in APC_FAMILY_REQUESTS {
             fixture.append_family_request(agent, request, second);
         }
+        ScanIndex::default()
+            .save_fixture(&fixture.index_path)
+            .unwrap();
         fixture
     }
 
@@ -437,7 +440,7 @@ impl ApcFixture {
         );
         self.load_exclusion_list(&mut index);
         let committed_index = index.clone();
-        let mut scan = crate::snapshots::scan_source_roots_with_test_limit_and_claude_support(
+        let mut scan = crate::snapshots::e2_pipeline_scan_fixture::scan_native_pipeline_for_test(
             std::slice::from_ref(&self.root),
             &mut index,
             collected_at,
@@ -2393,7 +2396,7 @@ fn controlled_unbound_record_rearms_its_family_and_reforms_bound() {
         &fixture.index_path,
         &serde_json::to_vec(&value).unwrap(),
     );
-    crate::snapshots::state_v2::money_test_support::edit_record_for_test(
+    crate::snapshots::e2_pipeline_scan_fixture::edit_record_for_test(
         &seeded,
         "refusal.authority",
         APC_ROOT,

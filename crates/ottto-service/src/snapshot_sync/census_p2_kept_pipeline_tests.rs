@@ -103,7 +103,7 @@ impl PipelineFixture {
             )
             .expect("write synthetic Claude transcript");
         }
-        Self {
+        let fixture = Self {
             cache: Default::default(),
             index_path: base.join("claude-scan-index.json"),
             page_files: PIPELINE_PAGE_FILES,
@@ -111,7 +111,11 @@ impl PipelineFixture {
             base,
             root,
             support,
-        }
+        };
+        ScanIndex::default()
+            .save_fixture(&fixture.index_path)
+            .unwrap();
+        fixture
     }
 
     /// Freeze the ordinary census before edits so settlement tests retain
@@ -266,7 +270,7 @@ impl PipelineFixture {
         index.load_claude_reemission_exclusions(&self.support);
         crate::snapshots::claude_request_money::e2::apply_money_rules(&mut index);
         let committed_index = index.clone();
-        let mut scan = crate::snapshots::scan_source_roots_with_test_limit_and_claude_support(
+        let mut scan = crate::snapshots::e2_pipeline_scan_fixture::scan_native_pipeline_for_test(
             std::slice::from_ref(&self.root),
             &mut index,
             collected_at,

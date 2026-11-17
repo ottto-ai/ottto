@@ -1289,7 +1289,7 @@ fn complete_census_retires_never_committed_vanished_acks_after_partial_error() {
         .upload_progress_ack_incidence()
         .any(|fp| fp == first.snapshot_fingerprint));
     assert!(f
-        .load()
+        .load_native()
         .1
         .accepted_fingerprints
         .contains(&first.snapshot_fingerprint));
