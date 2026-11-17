@@ -255,31 +255,24 @@ pub(super) fn apply_bootstrapped_cache_heads(
 }
 
 pub(super) fn with_bootstrap_deferred(
-    result: ResumableUploadResult,
+    mut result: ResumableUploadResult,
     deferred: usize,
 ) -> ResumableUploadResult {
     if deferred == 0 {
         return result;
     }
-    match result {
+    match &mut result {
         ResumableUploadResult::Completed | ResumableUploadResult::Rejected { .. } => {
-            ResumableUploadResult::Deferred {
+            result = ResumableUploadResult::Deferred {
                 count: deferred,
                 isolated: 0,
                 identity_503: 0,
-            }
+            };
         }
-        ResumableUploadResult::Deferred {
-            count,
-            isolated,
-            identity_503,
-        } => ResumableUploadResult::Deferred {
-            count: count.saturating_add(deferred),
-            isolated,
-            identity_503,
-        },
-        other => other,
+        ResumableUploadResult::Deferred { count, .. } => *count = count.saturating_add(deferred),
+        _ => {}
     }
+    result
 }
 
 /// Carry a newer refused-body conflict even when the frozen upload delta is

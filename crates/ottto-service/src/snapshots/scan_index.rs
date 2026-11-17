@@ -1053,14 +1053,12 @@ impl ScanIndex {
     /// This pass ended the walk `before` was on: none remains, or another
     /// replaced it.
     pub(crate) fn walk_retired_since(&self, before: &ScanIndex) -> bool {
-        match (&before.traversal, &self.traversal) {
-            (_, None) => true,
-            (Some(old), Some(new)) => {
+        self.traversal.as_ref().is_none_or(|new| {
+            before.traversal.as_ref().is_some_and(|old| {
                 (&old.context_fingerprint, &old.census_window_end)
                     != (&new.context_fingerprint, &new.census_window_end)
-            }
-            (None, Some(_)) => false,
-        }
+            })
+        })
     }
 
     /// The flag is authoritative: no cause without it, and

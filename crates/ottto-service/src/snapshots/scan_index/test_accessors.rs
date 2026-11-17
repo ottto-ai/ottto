@@ -4,6 +4,11 @@ use crate::snapshots::*;
 
 impl ScanIndex {
     #[cfg(test)]
+    pub(crate) fn start_identity_custody_walk_for_test(&mut self, roots: &[PathBuf], at: &str) {
+        ensure_bounded_traversal(SnapshotSource::Pi, roots, self, at, BACKFILL_WINDOW_DAYS);
+    }
+
+    #[cfg(test)]
     pub(crate) fn bounded_sweep_had_unsettled_upload(&self) -> bool {
         self.bounded_sweep_had_unsettled_upload
     }
