@@ -608,10 +608,12 @@ fn preparation_error_preserves_normalization_counts_on_scan_worker() {
     let error = result
         .err()
         .expect("the progress generation cannot advance");
+    // Native progress rows refuse the exhausted generation as a storage hold.
     assert!(
-        error
-            .to_string()
-            .contains("snapshot upload progress generation overflow"),
+        error.chain().any(|cause| matches!(
+            cause.downcast_ref::<crate::snapshots::state_v2::Hold>(),
+            Some(crate::snapshots::state_v2::Hold::DbUnavailable)
+        )),
         "{error:#}"
     );
     let events = rows
