@@ -9,7 +9,6 @@ use super::current_historical_replay;
 use super::current_rfc3339;
 use super::current_unix_seconds;
 
-use super::live_snapshot_retry;
 use super::load_backfill_state;
 
 use super::reason_reoffer;
@@ -333,7 +332,6 @@ pub(super) fn exclude_held_effective_body_witness_revision(
 // Preparation stays owned by the existing cycle. No partially finalized body
 // crosses a collection step.
 pub(super) struct SourcePreparation {
-    pub(super) retry_authority: Option<live_snapshot_retry::LiveAuthority>,
     pub(super) source: SnapshotSource,
     pub(super) claude_scan_roots: Option<Vec<PathBuf>>,
     pub(super) account_witness: [u8; 32],
@@ -568,7 +566,7 @@ pub(crate) fn cycle_sampled_scope(
     crate::transcript_acquisition::Scope(format!("{:x}", Sha256::digest(sampled_scope.as_bytes())))
 }
 
-#[expect(clippy::too_many_arguments, reason = "11 args; no options struct yet")]
+#[expect(clippy::too_many_arguments, reason = "10 args; no options struct yet")]
 pub(super) fn prepare_sync_source(
     client: &SnapshotApiClient,
     device: &LocalDeviceBinding,
@@ -580,7 +578,6 @@ pub(super) fn prepare_sync_source(
     daemon: &LocalDaemon,
     transport_cycle: &mut crate::net_resilience::TransportCycleOutcome,
     account_witness: [u8; 32],
-    retry_enabled: bool,
 ) -> Result<Option<SourcePreparation>> {
     let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(
         source == SnapshotSource::ClaudeCode,
@@ -599,7 +596,6 @@ pub(super) fn prepare_sync_source(
                 daemon,
                 transport_cycle,
                 account_witness,
-                retry_enabled,
             )
         },
         |result| {
@@ -678,7 +674,6 @@ pub(super) fn prepare_sync_source_inner(
     daemon: &LocalDaemon,
     transport_cycle: &mut crate::net_resilience::TransportCycleOutcome,
     account_witness: [u8; 32],
-    retry_enabled: bool,
 ) -> Result<Option<SourcePreparation>> {
     if let Some(remaining) = source_upload_backoff_remaining(source) {
         // The server asked for room and we said yes. Re-running the cycle now
@@ -1102,23 +1097,6 @@ pub(super) fn prepare_sync_source_inner(
     }
     // The initial hint/status relay token dies here; sends acquire fresh tokens.
     drop(relay_token);
-    let retry_authority = if retry_enabled
-        && !index.legacy_settlement_ledger_needs_migration()
-        && legacy_reconciliation_pending.is_empty()
-        && active_legacy_reconciliation.is_empty()
-    {
-        live_snapshot_retry::LiveAuthority::capture(
-            source,
-            home,
-            support_dir,
-            &activity_hint,
-            &upload_destination_namespace,
-            &backfill_state,
-            client.api_base_seal(),
-        )
-    } else {
-        None
-    };
     let sampled_scope = cycle_sampled_scope(
         &account_witness,
         &upload_destination_namespace,
@@ -1161,7 +1139,6 @@ pub(super) fn prepare_sync_source_inner(
         scan = scan.with_line_observer("codex_prelude", daemon.codex_preludes.observer(&roots));
     }
     Ok(Some(SourcePreparation {
-        retry_authority,
         source,
         claude_scan_roots: (source == SnapshotSource::ClaudeCode).then_some(roots),
         account_witness,

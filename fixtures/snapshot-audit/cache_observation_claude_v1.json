@@ -181,8 +181,6 @@
       },
       "content_hash": "64faee18f6189eb2aa7f617704700f26954116dd6cc1bd4dbe151398eb6dc9bb",
       "hash_epoch": 1,
-      "revision_contract_version": "snapshot_revision:v1",
-      "revision_hash": "f20ee3f90ce5718fdffdf67c8307e9583230144c9c981c351bf30df1261236f8",
       "revision_v2_canonicalization": "rfc8785:integers-only:v1",
       "revision_v2_contract_version": "snapshot_revision:v2",
       "revision_v2_hash": "3aab021afaf0eb07b46d976f36883af112256af8144e69c6c9ab0318b04b5380",

@@ -4,7 +4,7 @@ pub(crate) use self::lane::disable_snapshot_source;
 pub(crate) use self::lane::disable_sources_dropped_from_grant;
 pub(crate) use self::lane::enabled_snapshot_sources;
 pub(crate) use self::lane::enabled_snapshot_sources_in;
-use self::lane::ensure_snapshot_destination_current;
+#[cfg(test)]
 use self::lane::ensure_snapshot_scan_authority;
 #[cfg(test)]
 pub(crate) use self::lane::forget_carried_namespaces_for_test;
@@ -119,6 +119,7 @@ pub(crate) use self::finish::checkpoint_account_release_for_test;
 pub(crate) use self::finish::checkpoint_page_for_test;
 #[cfg(test)]
 use self::finish::checkpoint_partial_snapshot_index;
+#[cfg(test)]
 use self::finish::checkpoint_partial_snapshot_index_with_audit_release;
 #[cfg(test)]
 pub(crate) use self::finish::checkpoint_unselected_for_test;
@@ -190,13 +191,10 @@ use self::progress_rows::SnapshotUploadProgressCas;
 use self::progress_rows::SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION;
 mod finish;
 #[cfg(test)]
-use self::lane::collect_file_activity_with_retry;
-#[cfg(test)]
 use self::lane::cycle_heartbeat;
 use self::lane::local_cadence_phase_offset;
 #[cfg(test)]
 pub(crate) use self::lane::retained_with_withheld;
-use self::lane::retry_ordinary_owned;
 pub use self::lane::spawn_claude_agent_status_refresh;
 pub use self::lane::spawn_failed_verification_reverify;
 pub use self::lane::spawn_local_health_projection_sync;
@@ -272,6 +270,7 @@ use self::upload::with_retained_refusal_conflicts;
 mod lane;
 #[cfg(test)]
 use self::upload::ack_usage_identical;
+#[cfg(test)]
 use self::upload::attempt_snapshot_page;
 use self::upload::is_shed_failure;
 #[cfg(test)]
@@ -293,6 +292,7 @@ use self::upload::SnapshotEntityDeferred;
 use self::upload::SnapshotLocalStateRejected;
 #[cfg(test)]
 use self::upload::SnapshotPackingLength;
+#[cfg(test)]
 use self::upload::SnapshotPageOutcome;
 use self::upload::SnapshotUploadErrorClass;
 use self::upload::SourcesFailed;
@@ -319,6 +319,8 @@ pub(crate) use self::prepare::resumed_prefix_upload_context;
 use self::prepare::SourcePreparation;
 use self::prepare::SourcePreparationStep;
 pub(crate) use self::telemetry_only::apply_claude_local_evidence_to_scan;
+#[cfg(test)]
+pub(crate) use self::telemetry_only::apply_claude_local_evidence_to_scan_for_test;
 #[cfg(test)]
 pub(crate) use self::telemetry_only::apply_claude_local_evidence_to_scan_with_accepted_for_test;
 use self::telemetry_only::apply_claude_local_evidence_to_scan_with_ledger_and_budget;
@@ -375,6 +377,7 @@ use crate::snapshot_client::{
 };
 #[cfg(test)]
 use crate::snapshots::apply_upload_policy;
+#[cfg(test)]
 use crate::snapshots::validate_snapshot_batch_request;
 use crate::snapshots::{
     collector_version, finalize_scan_after_policy_with_body_witness,
@@ -563,12 +566,6 @@ mod telemetry_only;
 mod upload_context_resend;
 
 use crate::hex::is_sha256_any_case as is_snapshot_fingerprint;
-
-#[allow(dead_code, reason = "preparation is compiled ahead of its activation")]
-#[path = "bounded_snapshot_retry.rs"]
-mod bounded_snapshot_retry;
-#[path = "live_snapshot_retry.rs"]
-mod live_snapshot_retry;
 
 #[cfg(test)]
 pub(crate) use tests::codex_archive_tests::{

@@ -10,7 +10,6 @@ use super::default_support_dir;
 
 use super::finish_sync_source;
 
-use super::live_snapshot_retry;
 use super::load_snapshot_device_credentials;
 use super::local_health_upload_can_wait_quietly;
 use super::paced_scan_due;
@@ -25,7 +24,6 @@ use super::upload_local_health_projection_now;
 use super::upload_local_health_projection_reporting;
 use super::with_source_cadence;
 use super::BTreeMap;
-use super::BTreeSet;
 use super::Context;
 use super::Duration;
 use super::FileMachineStore;
@@ -37,7 +35,6 @@ use super::Path;
 use super::Result;
 use super::ScanIndex;
 use super::SnapshotApiClient;
-use super::SnapshotItem;
 use super::SnapshotSource;
 use super::SourceKind;
 use super::SourcePreparation;
@@ -99,7 +96,6 @@ pub fn spawn_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
                 );
             }
             let mut account_switch = ClaudeAccountSwitchProbe::default();
-            let mut retry = live_snapshot_retry::LiveRetryOwner::production();
             loop {
                 let prior = watcher.as_ref().map_or(&[][..], |current| current.roots());
                 if let Ok(roots) = crate::snapshot_roots::watcher_roots(&home, prior) {
@@ -118,7 +114,7 @@ pub fn spawn_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
                             .ok();
                     }
                 }
-                match sync_once_with_retry(&home, &support_dir, &daemon, &mut retry) {
+                match sync_once(&home, &support_dir, &daemon) {
                     Ok(()) => crate::net_resilience::handle_sync_success(&daemon),
                     Err(error) => {
                         eprintln!("local snapshot sync skipped: {}", safe_error(&error));
@@ -134,7 +130,6 @@ pub fn spawn_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
                     &mut ContinuationLoop {
                         watcher: watcher.as_ref(),
                         account_switch: &mut account_switch,
-                        retry: &mut retry,
                         home: &home,
                         support_dir: &support_dir,
                         daemon: &daemon,
@@ -147,35 +142,10 @@ pub fn spawn_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
     Ok(())
 }
 
-/// The delivery-only retry wake inside a cadence wait.
-pub(super) fn delivery_wake<'a>(
-    retry: &'a mut live_snapshot_retry::LiveRetryOwner,
-    home: &'a Path,
-    support_dir: &'a Path,
-    daemon: &'a LocalDaemon,
-) -> impl FnMut(Instant) -> Instant + 'a {
-    move |ordinary| {
-        if !retry.enabled() {
-            return ordinary;
-        }
-        // The native cycle lock also excludes the UI one-shot
-        // path during a delivery-only turn. This wake never
-        // starts a provider scan or resets ordinary cadence.
-        let _guard = SNAPSHOT_SYNC_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        retry.boundary(home, support_dir, daemon);
-        retry.wake_before(ordinary)
-    }
-}
-
-/// The production loop host for continuation pages: real time, the watcher
-/// wait and the delivery wake, with no network beyond what each already does.
+/// The production loop host for continuation pages and watcher waits.
 pub(super) struct ContinuationLoop<'a> {
     pub(super) watcher: Option<&'a crate::snapshot_watcher::SnapshotWatcher>,
     pub(super) account_switch: &'a mut ClaudeAccountSwitchProbe,
-    pub(super) retry: &'a mut live_snapshot_retry::LiveRetryOwner,
     pub(super) home: &'a Path,
     pub(super) support_dir: &'a Path,
     pub(super) daemon: &'a LocalDaemon,
@@ -186,12 +156,7 @@ impl continuation::LoopHost for ContinuationLoop<'_> {
         crate::scan_clock::now()
     }
     fn wait(&mut self, wait: Duration) -> bool {
-        collect_file_activity_for(
-            wait,
-            self.watcher,
-            self.account_switch,
-            delivery_wake(self.retry, self.home, self.support_dir, self.daemon),
-        )
+        collect_file_activity_for(wait, self.watcher, self.account_switch)
     }
     fn pending(&mut self) -> Option<(Instant, Duration)> {
         continuation::production_pending()
@@ -229,35 +194,17 @@ pub(super) fn collect_file_activity_for(
     wait: Duration,
     watcher: Option<&crate::snapshot_watcher::SnapshotWatcher>,
     account_switch: &mut ClaudeAccountSwitchProbe,
-    retry_boundary: impl FnMut(Instant) -> Instant,
-) -> bool {
-    collect_file_activity_with_retry(
-        wait,
-        watcher,
-        account_switch,
-        retry_boundary,
-        crate::agent_status::claude_default_account_fingerprint,
-    )
-}
-
-pub(super) fn collect_file_activity_with_retry(
-    wait: Duration,
-    watcher: Option<&crate::snapshot_watcher::SnapshotWatcher>,
-    account_switch: &mut ClaudeAccountSwitchProbe,
-    mut retry_boundary: impl FnMut(Instant) -> Instant,
-    mut read_account: impl FnMut() -> Option<String>,
 ) -> bool {
     let deadline = crate::scan_clock::now() + wait;
     let mut watcher = watcher;
     loop {
-        // A delivery retry may share the ordinary deadline. Service it before
-        // returning to collection, which can replace its retained checkpoint.
-        let wake = retry_boundary(deadline).min(deadline);
         let now = crate::scan_clock::now();
         if now >= deadline {
             return false;
         }
-        let slice = wake.saturating_duration_since(now).min(CADENCE_WAIT_SLICE);
+        let slice = deadline
+            .saturating_duration_since(now)
+            .min(CADENCE_WAIT_SLICE);
         match watcher.map(|watcher| watcher.events.recv_timeout(slice)) {
             None => std::thread::sleep(slice),
             Some(Ok(event)) => {
@@ -273,7 +220,10 @@ pub(super) fn collect_file_activity_with_retry(
                 watcher = None;
             }
         }
-        if account_switch.observe(crate::scan_clock::now(), &mut read_account) {
+        if account_switch.observe(
+            crate::scan_clock::now(),
+            crate::agent_status::claude_default_account_fingerprint,
+        ) {
             eprintln!("local snapshot sync: Claude account switch detected; refreshing now");
             with_source_cadence(SnapshotSource::ClaudeCode, |cadence| {
                 cadence.record_account_switch(crate::scan_clock::now())
@@ -623,21 +573,6 @@ pub(super) fn set_one_shot_sync_in_flight(value: bool) {
 }
 
 pub(super) fn sync_once(home: &Path, support_dir: &Path, daemon: &LocalDaemon) -> Result<()> {
-    // Manual one-shot collection never owns the long-lived background queue.
-    sync_once_with_retry(
-        home,
-        support_dir,
-        daemon,
-        &mut live_snapshot_retry::LiveRetryOwner::closed(),
-    )
-}
-
-pub(super) fn sync_once_with_retry(
-    home: &Path,
-    support_dir: &Path,
-    daemon: &LocalDaemon,
-    retry: &mut live_snapshot_retry::LiveRetryOwner,
-) -> Result<()> {
     // The periodic loop and setup/UI one-shot path can otherwise scan and save
     // the same per-source index concurrently. Serialize the full cycle so a
     // one-shot rescan cannot race the background loop or publish an older
@@ -711,7 +646,6 @@ pub(super) fn sync_once_with_retry(
         codex_started: None,
         paced_qos: None,
         account_witness,
-        retry,
     };
     crate::source_rotation::run(
         &mut owner,
@@ -772,121 +706,7 @@ pub(super) fn snapshot_cycle_client(
         .with_receipt_context(device_label, account_binding))
 }
 
-pub(super) fn retry_ordinary_owned(item: &SnapshotItem) -> Option<SnapshotItem> {
-    if item.cache_observations.is_some() || item.cache_base_head_etag.is_some() {
-        return None;
-    }
-    Some(SnapshotItem {
-        evidence_basis: None,
-        request_evidence: Vec::new(),
-        request_identity_refusals: 0,
-        claude_org_markers: None,
-        claude_account_withheld_reason: None,
-        claude_account_display: None,
-        session_billing_route: item.session_billing_route.clone(),
-        claude_route_evidence: None,
-        session_account_evidence: item.session_account_evidence.clone(),
-        source_session_id: item.source_session_id.clone(),
-        snapshot_fingerprint: item.snapshot_fingerprint.clone(),
-        status: item.status.clone(),
-        input_tokens: item.input_tokens,
-        output_tokens: item.output_tokens,
-        cache_read_tokens: item.cache_read_tokens,
-        cache_creation_5m_tokens: item.cache_creation_5m_tokens,
-        cache_creation_1h_tokens: item.cache_creation_1h_tokens,
-        reasoning_output_tokens: item.reasoning_output_tokens,
-        unattributed_total_tokens: item.unattributed_total_tokens,
-        request_count: item.request_count,
-        usage_accounting_contract: item.usage_accounting_contract.clone(),
-        removed_request_count: item.removed_request_count,
-        removed_usage: item.removed_usage,
-        telemetry_owned_complete: item.telemetry_owned_complete,
-        resolver_conflict_count: item.resolver_conflict_count,
-        copy_unproven_counts: item.copy_unproven_counts,
-        claude_money: None,
-        claude_usage_request_ids: BTreeSet::new(),
-        claude_usage_occurrences: BTreeMap::new(),
-        request_contributions: Box::new([]),
-        cache_observations: item.cache_observations.clone(),
-        cache_observations_state: None,
-        cache_base_head_etag: None,
-        cache_conflict_answer: None,
-        cache_requests: Vec::new(),
-        cache_requests_complete: false,
-        avg_duration_ms: item.avg_duration_ms,
-        avg_time_to_first_token_ms: item.avg_time_to_first_token_ms,
-        max_duration_ms: item.max_duration_ms,
-        max_time_to_first_token_ms: item.max_time_to_first_token_ms,
-        peak_context_fill_tokens: item.peak_context_fill_tokens,
-        first_turn_context_tokens: item.first_turn_context_tokens,
-        last_turn_context_tokens: item.last_turn_context_tokens,
-        // Copied, never dropped: a retry that lost the windows would settle as
-        // UNCHANGED (they are outside every hash) and never deliver them.
-        first_turn_context_window_tokens: item.first_turn_context_window_tokens,
-        peak_context_fill_window_tokens: item.peak_context_fill_window_tokens,
-        last_turn_context_window_tokens: item.last_turn_context_window_tokens,
-        compaction_count: item.compaction_count,
-        compaction_timestamps: item.compaction_timestamps.clone(),
-        compaction_events: item.compaction_events.clone(),
-        first_own_request_at: item.first_own_request_at.clone(),
-        local_context_points: Vec::new(),
-        compaction_total_pre_tokens: item.compaction_total_pre_tokens,
-        compaction_total_post_tokens: item.compaction_total_post_tokens,
-        compaction_total_cumulative_dropped_tokens: item.compaction_total_cumulative_dropped_tokens,
-        compaction_total_duration_ms: item.compaction_total_duration_ms,
-        context_curve: item.context_curve.clone(),
-        claude_context_curve_boundaries: Vec::new(),
-        claude_context_curve_identity_complete: false,
-        claude_context_curve_request_index_complete: false,
-        claude_context_curve_owned_start_proven: false,
-        claude_file_birth: item.claude_file_birth,
-        claude_file_birth_verdict: item.claude_file_birth_verdict(),
-        activity_summary: item.activity_summary.clone(),
-        tool_usage: item.tool_usage.clone(),
-        tool_usage_truncated: item.tool_usage_truncated,
-        session_start: item.session_start.clone(),
-        model_usage: item.model_usage.clone(),
-        usage_buckets: item.usage_buckets.clone(),
-        cost: item.cost.clone(),
-        session_display_name: item.session_display_name.clone(),
-        session_display_name_source: item.session_display_name_source.clone(),
-        source_started_at: item.source_started_at.clone(),
-        source_ended_at: item.source_ended_at.clone(),
-        source_last_activity_at: item.source_last_activity_at.clone(),
-        collected_at: item.collected_at.clone(),
-        workspace_hash: item.workspace_hash.clone(),
-        workspace_display_label: item.workspace_display_label.clone(),
-        workspace_label_source: item.workspace_label_source.clone(),
-        repository_hash: item.repository_hash.clone(),
-        repository_label: item.repository_label.clone(),
-        repository_label_source: item.repository_label_source.clone(),
-        repository_identity_source: item.repository_identity_source.clone(),
-        workspace_kind: item.workspace_kind.clone(),
-        source_file_fingerprint: item.source_file_fingerprint.clone(),
-        session_artifacts: item.session_artifacts.clone(),
-        provenance: item.provenance.clone(),
-        origin: item
-            .origin
-            .as_ref()
-            .map(|o| crate::snapshots::SnapshotOrigin {
-                thread_source: o.thread_source.clone(),
-                source: o.source.clone(),
-                source_subagent: o.source_subagent,
-                originator: o.originator.clone(),
-                agent_role: o.agent_role.clone(),
-                entrypoint: o.entrypoint.clone(),
-                is_sidechain: o.is_sidechain,
-                session_kind: o.session_kind.clone(),
-                used_workflow_orchestration: o.used_workflow_orchestration,
-                parent_session_ref: None,
-            }),
-        originator: item.originator.clone(),
-        attribution_facts: item.attribution_facts.clone(),
-    })
-}
-
 pub(super) struct SnapshotCycleOwner<'a> {
-    pub(super) retry: &'a mut live_snapshot_retry::LiveRetryOwner,
     pub(super) account_witness: [u8; 32],
     pub(super) client: &'a SnapshotApiClient,
     pub(super) device: &'a LocalDeviceBinding,
@@ -934,7 +754,6 @@ impl SnapshotCycleOwner<'_> {
             self.support_dir,
             self.daemon,
             self.transport_cycle,
-            self.retry,
         )
     }
 }
@@ -972,7 +791,6 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
             self.daemon,
             self.transport_cycle,
             self.account_witness,
-            self.retry.enabled(),
         )
     }
     fn validate(&mut self, frame: &SourcePreparation) -> Result<()> {
@@ -1096,10 +914,6 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
             .transcript_cache
             .withheld_memo
             .discard_if_refused();
-    }
-    fn boundary(&mut self) {
-        self.retry
-            .boundary(self.home, self.support_dir, self.daemon);
     }
 }
 

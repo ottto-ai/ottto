@@ -191,6 +191,13 @@ file-system hint / periodic listing → select file → read new bytes from save
   mode while unaffected file receipts use the base context. A copy-capability change therefore
   conservatively re-sends unchanged files once.
 
+Snapshot envelopes send only the `snapshot_revision:v2` witness. The receiver already
+accepts bodies without the v1 revision fields. ACK matching, unchanged skips and receipt
+carry use their existing content and body proofs. Local snapshot audits use schema v5,
+with revision keys blinded from the v2 hash and explicit census and oversize evidence.
+The identity size budget retains 134 bytes of headroom so the smaller envelope does
+not change admission or account tagging at the byte cap.
+
 Telemetry-only Claude uploads require the advertised head-CAS capability and the
 exact telemetry contract and pairing window. They declare head CAS in isolated
 requests, without cache patches or cache-state ACK negotiation. Growth carries
