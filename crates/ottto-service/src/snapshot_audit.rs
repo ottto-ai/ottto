@@ -208,8 +208,70 @@ pub fn run_snapshot_audit<W: Write>(
         )
     })?;
     crate::snapshots::claude_request_identity::bind_session_context_key(Some(&attribution_context));
-    let index_path = prepare_audit_state_dir(&options.audit_state_dir)?;
-    let mut index = ScanIndex::load(&index_path)?;
+    prepare_audit_state_dir(&options.audit_state_dir)?;
+    let mut index = ScanIndex::default();
+    let mut sessions = BTreeMap::new();
+    let mut uploads = BTreeMap::new();
+    let mut scanned_files = 0;
+    let mut scanned_sessions = 0;
+    let mut semantic_noops = 0;
+    let mut held_sessions = 0;
+    let mut report = loop {
+        let (mut page, pending, snapshots) =
+            audit_page(&options, &mut index, &attribution_context, &audit_key)?;
+        scanned_files += page.scanned_file_count;
+        scanned_sessions += page.scanned_session_count;
+        semantic_noops += page.semantic_noop_count;
+        held_sessions += page.claude_locally_held_session_count.unwrap_or_default();
+        for session in page.sessions.drain(..) {
+            sessions.insert(session.session_key.clone(), session);
+        }
+        for snapshot in snapshots {
+            uploads.insert(snapshot.source_session_id.clone(), snapshot);
+        }
+        if !pending {
+            break page;
+        }
+    };
+    report.sessions = sessions.into_values().collect();
+    report.emitted_session_count = report.sessions.len();
+    report.scanned_file_count = scanned_files;
+    report.scanned_session_count = scanned_sessions;
+    report.semantic_noop_count = semantic_noops;
+    if report.claude_locally_held_session_count.is_some() {
+        report.claude_locally_held_session_count = Some(held_sessions);
+    }
+    if let Some(path) = options.private_upload_payload_out.as_deref() {
+        let policy = SnapshotUploadPolicy {
+            session_titles_enabled: false,
+            workspace_labels_enabled: false,
+            session_artifacts_enabled: false,
+            session_attribution_enabled: false,
+            session_attribution_labels_enabled: false,
+        };
+        let request = crate::snapshot_sync::snapshot_batch_request(
+            options.source,
+            &options.machine_id,
+            uploads.into_values().collect(),
+            policy,
+            crate::client_report::ClientReport::empty(),
+        );
+        write_private_json(path, &request)?;
+    }
+    serde_json::to_writer_pretty(&mut *output, &report).context("write snapshot audit report")?;
+    output
+        .write_all(b"\n")
+        .context("finish snapshot audit report")?;
+    output.flush().context("flush snapshot audit report")?;
+    Ok(report)
+}
+
+fn audit_page(
+    options: &SnapshotAuditOptions,
+    index: &mut ScanIndex,
+    attribution_context: &SessionAttributionContext,
+    audit_key: &[u8],
+) -> Result<(SnapshotAuditReport, bool, Vec<SnapshotItem>)> {
     // As a sync cycle does before scanning: the active body revision is not
     // persisted, and below it the history veto drops every request-owned body.
     index.activate_effective_upload_body_witness_revision(
@@ -218,14 +280,15 @@ pub fn run_snapshot_audit<W: Write>(
     let mut scan = scan_source_roots_with_attribution_and_claude_effort_and_hints(
         options.source,
         &options.roots,
-        &mut index,
+        index,
         &options.collected_at,
         options.backfill_window_days,
-        Some(&attribution_context),
+        Some(attribution_context),
         options.claude_support_dir.as_deref(),
         &[],
         false,
     )?;
+    let pending = scan.census_status.pending_work;
     let mut claude_local_evidence = None;
     let mut claude_authority_disposition =
         crate::snapshots::ClaudeUsageAuthorityDisposition::default();
@@ -233,13 +296,13 @@ pub fn run_snapshot_audit<W: Write>(
         if let Some(support_dir) = options.claude_support_dir.as_deref() {
             crate::snapshots::claude_request_identity::retain_root_accounts(
                 &mut scan.snapshots,
-                &index,
+                index,
                 &options.machine_id,
             );
             let (disposition, _, stats) = crate::snapshot_sync::apply_claude_local_evidence_to_scan(
                 support_dir,
                 &mut scan,
-                &mut index,
+                index,
             );
             claude_authority_disposition = disposition;
             claude_local_evidence = Some(stats);
@@ -259,7 +322,7 @@ pub fn run_snapshot_audit<W: Write>(
     };
     apply_upload_policy(options.source, &mut scan.snapshots, upload_policy);
     let post_policy_snapshots = scan.snapshots.clone();
-    finalize_scan_after_policy(options.source, &mut scan, &mut index);
+    finalize_scan_after_policy(options.source, &mut scan, index);
     let audit_upload_policy = SnapshotAuditUploadPolicy {
         session_titles_enabled: upload_policy.session_titles_enabled,
         workspace_labels_enabled: upload_policy.workspace_labels_enabled,
@@ -286,7 +349,7 @@ pub fn run_snapshot_audit<W: Write>(
             let envelope = snapshot_semantic_envelope(options.source, snapshot, upload_policy);
             Some(SnapshotAuditSession {
                 session_key: keyed_hex(
-                    &audit_key,
+                    audit_key,
                     &[
                         AUDIT_SCHEMA_VERSION,
                         options.source.api_slug(),
@@ -295,28 +358,28 @@ pub fn run_snapshot_audit<W: Write>(
                     ],
                 ),
                 semantic_key: keyed_hex(
-                    &audit_key,
+                    audit_key,
                     &[
                         AUDIT_SCHEMA_VERSION,
                         "semantic",
                         &snapshot.snapshot_fingerprint,
                     ],
                 ),
-                revision_key: blinded_revision_key(&audit_key, &envelope.revision_hash),
+                revision_key: blinded_revision_key(audit_key, &envelope.revision_hash),
                 legacy_revision_proof_available: false,
                 legacy_policy_candidate_semantic_keys: legacy_policy_candidate_semantic_keys(
-                    &audit_key,
+                    audit_key,
                     options.source,
                     pre_policy_snapshot,
                 )
                 .expect("valid upload policies stay within the audited candidate cap"),
                 policy_neutral_component_keys: blinded_component_keys(
-                    &audit_key,
+                    audit_key,
                     &envelope.component_hashes,
                     &POLICY_NEUTRAL_COMPONENTS,
                 ),
                 policy_sensitive_component_keys: blinded_component_keys(
-                    &audit_key,
+                    audit_key,
                     &envelope.component_hashes,
                     &POLICY_SENSITIVE_COMPONENTS,
                 ),
@@ -341,24 +404,8 @@ pub fn run_snapshot_audit<W: Write>(
         .collect::<Vec<_>>();
     sessions.sort_by(|left, right| left.session_key.cmp(&right.session_key));
 
-    if let Some(path) = options.private_upload_payload_out.as_deref() {
-        let mut uploadable_snapshots = scan.snapshots.clone();
-        // Production keeps the full scan for local consumers, then withholds
-        // only authority-demoting revisions at the network boundary. The
-        // audit report covers the full local scan; its optional private payload
-        // reproduces the narrower production upload exactly.
-        claude_authority_disposition.retain_uploadable(&mut uploadable_snapshots);
-        let request = crate::snapshot_sync::snapshot_batch_request(
-            options.source,
-            &options.machine_id,
-            uploadable_snapshots,
-            upload_policy,
-            // The audit is an offline reproduction of one upload, so it reports
-            // no losses of its own; the live counters belong to the sync loop.
-            crate::client_report::ClientReport::empty(),
-        );
-        write_private_json(path, &request)?;
-    }
+    let mut uploadable_snapshots = scan.snapshots.clone();
+    claude_authority_disposition.retain_uploadable(&mut uploadable_snapshots);
 
     let report = SnapshotAuditReport {
         schema_version: AUDIT_SCHEMA_VERSION,
@@ -366,7 +413,7 @@ pub fn run_snapshot_audit<W: Write>(
         revision_contract_version: SNAPSHOT_REVISION_CONTRACT_VERSION,
         source: options.source.api_slug().to_string(),
         machine_key: keyed_hex(
-            &audit_key,
+            audit_key,
             &[AUDIT_SCHEMA_VERSION, "machine", &options.machine_id],
         ),
         upload_policy: audit_upload_policy,
@@ -410,17 +457,7 @@ pub fn run_snapshot_audit<W: Write>(
         sessions,
     };
 
-    // The report is the acknowledgement for an audit scan. Commit its private
-    // state only after both optional payload output and stdout are durable from
-    // this process's point of view; a closed pipe must remain retryable.
-    serde_json::to_writer_pretty(&mut *output, &report).context("write snapshot audit report")?;
-    output
-        .write_all(b"\n")
-        .context("finish snapshot audit report")?;
-    output.flush().context("flush snapshot audit report")?;
-    write_private_json(&index_path, &index)?;
-
-    Ok(report)
+    Ok((report, pending, uploadable_snapshots))
 }
 
 fn blinded_component_keys(

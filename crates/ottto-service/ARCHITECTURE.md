@@ -417,6 +417,11 @@ Prepare, finish, server minima, upload backoff and background QoS still apply.
 During a first backfill (not a replay revision bump), a Codex page that spent a byte budget with
 work still queued also requests a paced pass.
 
+Snapshot audits start from an empty in-memory graph, finish the traversal in
+memory and aggregate every page. Each invocation reports the complete selected
+source again; the report schema is unchanged. Audit state directories retain
+only their privacy marker; old audit checkpoints are neither loaded nor updated.
+
 ## SQLite
 
 SQLite runs in-process, so a query is a function call rather than a round trip.
