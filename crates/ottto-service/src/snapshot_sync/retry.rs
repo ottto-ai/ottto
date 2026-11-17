@@ -20,6 +20,23 @@ use super::SnapshotSource;
 use super::SourceCadence;
 use super::SNAPSHOT_SYNC_INTERVAL;
 
+use super::ack_retention;
+use super::snapshot_upload_error_class;
+use super::BatchAuthorizationRejected;
+use super::BatchRejected;
+use super::Command;
+use super::LocalHealthRefreshHeld;
+use super::SnapshotAckRejected;
+use super::SnapshotBatchPreflightRejected;
+use super::SnapshotBatchResponseRejected;
+use super::SnapshotEntityDeferred;
+use super::SnapshotLocalStateRejected;
+use super::SnapshotUploadErrorClass;
+use super::SourcesFailed;
+use super::TimeDuration;
+use super::PARTIAL_CHECKPOINT_FAILURES;
+use super::SNAPSHOT_QUARANTINE_RETRY_SECONDS;
+
 // A short, explicitly transient batch failure is resent in place rather than
 // abandoning the page and marking the bounded sweep unsettled: a 429/503 whose
 // Retry-After is at most 5 s (cursor allocation and shared-lock timeouts send
@@ -39,6 +56,43 @@ const SNAPSHOT_INPLACE_RETRY_FAST_FAILURE: Duration = Duration::from_secs(15);
 const SNAPSHOT_INPLACE_RETRY_SERVER_ERROR_WAIT: Duration = Duration::from_secs(2);
 
 const SNAPSHOT_INPLACE_RETRY_MIN_WAIT: Duration = Duration::from_millis(250);
+
+pub(super) fn current_unix_seconds() -> u64 {
+    #[cfg(test)]
+    if let Some(now) =
+        tests::permanent_finish_pipeline_tests::prior_index_lifetime_tests::retry_clock()
+    {
+        return now;
+    }
+
+    crate::scan_clock::utc_seconds()
+}
+
+pub(crate) fn quarantine_retry_after(fingerprint: &str) -> u64 {
+    jittered_retry_after(
+        fingerprint,
+        current_unix_seconds(),
+        SNAPSHOT_QUARANTINE_RETRY_SECONDS,
+    )
+}
+
+/// Base of a head-CAS conflict's probe. Jitter adds less than the base, so
+/// every conflict probe and refused-answer hold ends within one hour.
+pub(super) const SNAPSHOT_CONFLICT_PROBE_SECONDS: u64 = 30 * 60;
+
+/// A conflict's mandatory probe: `[30 min, 1 h)` after `from`, per body.
+/// Backend state can change without a local change, so a conflict is never
+/// left waiting for new input alone.
+pub(super) fn conflict_probe_after(fingerprint: &str, from: u64) -> u64 {
+    jittered_retry_after(fingerprint, from, SNAPSHOT_CONFLICT_PROBE_SECONDS)
+}
+
+/// `[from + base, from + 2 * base)`, staggered deterministically by `key`.
+pub(super) fn jittered_retry_after(key: &str, from: u64, base: u64) -> u64 {
+    let digest = Sha256::digest(key.as_bytes());
+    let jitter = u64::from_be_bytes(digest[..8].try_into().expect("SHA-256 prefix")) % base;
+    from.saturating_add(base).saturating_add(jitter)
+}
 
 /// Hard ceiling on how long a source may go unscanned on cadence grounds alone.
 ///
@@ -492,4 +546,191 @@ pub(super) fn with_inplace_retry_test_clock<R>(
         .map(|clock| clock.waits)
         .unwrap_or_default();
     (result, waits)
+}
+
+pub(super) fn current_rfc3339() -> String {
+    Command::new("/bin/date")
+        .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string())
+}
+
+pub(super) fn rfc3339_after_minutes(minutes: i64) -> Option<String> {
+    OffsetDateTime::now_utc()
+        .checked_add(TimeDuration::minutes(minutes))
+        .and_then(|value| value.format(&Rfc3339).ok())
+}
+
+/// Bounded, redacted cause for the catch-all snapshot upload failure log.
+///
+/// The catch-all arm has no status code of its own, so this reconstructs the
+/// most specific failure shape still present in the error chain. Everything it
+/// emits is either a typed redacted diagnostic (endpoint + status family, never
+/// a URL or token) or one of this module's own compile-time reason literals —
+/// never raw error text, which can carry file paths.
+pub(super) fn upload_failure_diagnostic(error: &anyhow::Error) -> String {
+    if let Some(settlement) = error.downcast_ref::<ack_retention::AckSettlementRequired>() {
+        return settlement.to_string();
+    }
+    if let Some(diagnostics) = error.downcast_ref::<UploadFailureDiagnostics>() {
+        return diagnostics.safe_message();
+    }
+    if let Some(rejected) = error.downcast_ref::<BatchRejected>() {
+        return rejected.to_string();
+    }
+    if let Some(rejected) = error.downcast_ref::<BatchAuthorizationRejected>() {
+        return format!(
+            "endpoint=snapshot_batch, status={}, kind=authorization_rejected",
+            rejected.status,
+        );
+    }
+    if let Some(rejected) = error.downcast_ref::<SnapshotBatchPreflightRejected>() {
+        return format!(
+            "endpoint=snapshot_batch, kind=daemon_contract_preflight, detail={}",
+            rejected.reason,
+        );
+    }
+    if let Some(rejected) = error.downcast_ref::<SnapshotBatchResponseRejected>() {
+        return format!(
+            "endpoint=snapshot_batch, kind=response_count_mismatch, expected={}, accepted={}",
+            rejected.expected, rejected.accepted,
+        );
+    }
+    if let Some(rejected) = error.downcast_ref::<SnapshotLocalStateRejected>() {
+        return format!("kind=local_state, operation={}", rejected.operation);
+    }
+    if let Some(rejected) = error.downcast_ref::<SnapshotAckRejected>() {
+        return format!("kind=backend_response, detail={}", rejected.reason);
+    }
+    // This module's own upload-loop reasons. Matching on the literals keeps the
+    // emitted text a fixed vocabulary rather than arbitrary chain content.
+    let text = error
+        .chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ");
+    for reason in [
+        "snapshot adaptive upload attempt limit reached",
+        "snapshot adaptive upload split limit reached",
+        "snapshot response uses an unsupported entity ACK contract",
+        "local snapshot preflight index was out of bounds",
+    ] {
+        if text.contains(reason) {
+            return format!("kind=uploader_guard, detail={reason}");
+        }
+    }
+    "kind=unclassified (no typed diagnostic in the error chain)".to_string()
+}
+
+pub(crate) fn safe_error(error: &anyhow::Error) -> String {
+    // A state v2 hold is a fixed content-free code: no text, no paths.
+    if let Some(hold) = error.downcast_ref::<crate::snapshots::state_v2::Hold>() {
+        return format!("local state store held: {hold}");
+    }
+    if let Some(failed) = error.downcast_ref::<SourcesFailed>() {
+        return failed.to_string();
+    }
+    if let Some(settlement) = error.downcast_ref::<ack_retention::AckSettlementRequired>() {
+        return settlement.to_string();
+    }
+    if let Some(diagnostics) = error.downcast_ref::<UploadFailureDiagnostics>() {
+        return diagnostics.safe_message();
+    }
+    if error.downcast_ref::<BatchRejected>().is_some() {
+        return "local snapshot payload validation failed".to_string();
+    }
+    if error.downcast_ref::<SnapshotEntityDeferred>().is_some() {
+        return "local snapshot upload deferred by unsettled entities".to_string();
+    }
+    if error.downcast_ref::<LocalHealthRefreshHeld>().is_some() {
+        return "local health upload held after setup-run refresh failed".to_string();
+    }
+    match snapshot_upload_error_class(error) {
+        Some(SnapshotUploadErrorClass::LocalState) => {
+            return "local snapshot state failed".to_string();
+        }
+        Some(SnapshotUploadErrorClass::BackendResponse) => {
+            return "backend snapshot response was invalid".to_string();
+        }
+        None => {}
+    }
+    // Scan the whole context chain, not just the outermost message, so a known
+    // failure phrase wrapped under another context still classifies instead of
+    // collapsing to the undiagnosable bare "sync failed".
+    let text = error
+        .chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ");
+    if text.contains("connection binding") {
+        "connection binding is unavailable or invalid; reconnect this device".to_string()
+    } else if text.contains("relay device") {
+        "relay device credentials are unavailable".to_string()
+    } else if text.contains("machine identity") {
+        "machine identity is unavailable".to_string()
+    } else if text.contains("issue relay token failed") {
+        "relay token request failed".to_string()
+    } else if text.contains("backend rejected local health projection") {
+        "local health projection rejected".to_string()
+    } else if text.contains("backend rejected local health authorization") {
+        "local health authorization rejected".to_string()
+    } else if text.contains("get activity hint failed") {
+        "activity hint request failed".to_string()
+    } else if text.contains("upload agent status failed")
+        || text.contains("agent status upload failed")
+    {
+        "agent status upload failed".to_string()
+    } else if text.contains("scan local snapshots") {
+        "local snapshot scan failed".to_string()
+    } else if text.contains("daemon/backend contract preflight")
+        || text.contains("backend rejected snapshot batch payload")
+    {
+        "local snapshot payload validation failed".to_string()
+    } else if text.contains("snapshot adaptive upload attempt limit reached")
+        || text.contains("snapshot adaptive upload split limit reached")
+    {
+        // Distinct from a network failure: the page reached the backend and the
+        // uploader exhausted its bounded poison-isolation budget. Collapsing
+        // this into the generic upload message hid a whole failure family.
+        "local snapshot upload isolation limit reached".to_string()
+    } else if text.contains("snapshot response uses an unsupported entity ACK contract") {
+        "backend snapshot response was invalid".to_string()
+    } else if text.contains("upload local snapshots")
+        || text.contains("upload snapshot batch failed")
+    {
+        "local snapshot upload failed".to_string()
+    } else if text.contains("report snapshot status failed") {
+        "local collector status upload failed".to_string()
+    } else if text.contains("mcp inventory")
+        || text.contains("mcp handshake")
+        || text.contains("mcp server")
+    {
+        "mcp inventory sync failed".to_string()
+    } else if text.contains("backend rejected context footprint") {
+        "context footprint upload rejected".to_string()
+    } else if text.contains("context footprint") {
+        "context footprint upload failed".to_string()
+    } else if text.contains("response failed") {
+        // "parse <endpoint> response failed" family: the request went through
+        // but the backend reply didn't decode.
+        "backend response was invalid".to_string()
+    } else if text.contains(crate::snapshot_roots::CLAUDE_ROOTS_CHANGED_DURING_SCAN) {
+        crate::snapshot_roots::CLAUDE_ROOTS_CHANGED_DURING_SCAN.to_string()
+    } else if let Some(step) = PARTIAL_CHECKPOINT_FAILURES
+        .into_iter()
+        .find(|step| text.contains(step))
+    {
+        step.to_string()
+    } else if let Some(check) = crate::snapshots::CODEX_JOIN_VALIDATION_FAILURES
+        .into_iter()
+        .find(|check| text.contains(check))
+    {
+        check.to_string()
+    } else {
+        "sync failed".to_string()
+    }
 }
