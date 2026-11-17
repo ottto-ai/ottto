@@ -1135,7 +1135,7 @@ mod removed_retained_state_tests {
 }
 
 #[cfg(all(test, target_pointer_width = "64"))]
-mod retained_heap_tests {
+mod heap_tests {
     use super::*;
     use crate::heap_layout_bound::{Counter, HeapLayoutBound};
     #[test]

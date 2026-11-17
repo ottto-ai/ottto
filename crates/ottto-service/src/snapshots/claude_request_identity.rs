@@ -448,8 +448,8 @@ struct RowGroup {
 /// fed one request at a time so nothing grows with the request count. Groups
 /// are capped by the rows the item can carry (more could never reproduce), and
 /// each group by `MAX_AUTHORITY_KEYS` plus the untagged entry. A truncated
-/// row never qualifies for the sticky budget; independent later rows can
-/// still retain their proof. The emitted item keeps the global key cap.
+/// row never qualifies for the sticky budget; other rows are unaffected. The
+/// emitted item keeps the global key cap.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Grouping {
     groups: BTreeMap<String, BTreeMap<RowKey, RowGroup>>,
@@ -3735,7 +3735,7 @@ pub(crate) fn tag_telemetry_entity(
     grouping.extra_wire_bytes = budget.reservation.map_or(0, |reserve| reserve(item));
     let known = accepted.and_then(|state| state.get(&item.source_session_id));
     matches!(
-        apply_grouped_with_accepted(item, grouping, known, false, budget.max_item_bytes),
+        apply_grouped_with_accepted(item, grouping, known, budget.max_item_bytes),
         Ok(Tagged::Sent { .. })
     )
 }

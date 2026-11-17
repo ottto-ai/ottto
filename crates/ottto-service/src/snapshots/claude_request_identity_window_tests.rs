@@ -1782,6 +1782,78 @@ fn sticky_accepted_share_retag_and_missing_sibling_are_refused_after_restart() {
     assert_eq!(counts["retained_buckets"], 1);
 }
 
+/// A copy-prefix row marked `copy_unproven` and its unmarked own twin share a
+/// bucket and every other key field. #909 freezes each under the daemon's
+/// partitioned RowKey: no false refusal, no silent re-tag, and the unmarked
+/// row keeps its key when no marked row is sent.
+#[test]
+fn copy_unproven_twin_rows_freeze_separately() {
+    let (mut item, _) = sticky_session(1);
+    item.usage_accounting_contract = Some("claude_request_owned_usage:v1".into());
+    item.removed_request_count = Some(0);
+    item.removed_usage = Some(ClaudeRemovedUsage::default());
+    item.telemetry_owned_complete = Some(true);
+    // Scans always fingerprint before tagging; the budget measures this length.
+    item.snapshot_fingerprint = "a".repeat(64);
+    item.collected_at = "2026-09-02T00:00:00Z".into();
+    let own = item.usage_buckets[0].model_usage[0].clone();
+    let mut copy = own.clone();
+    copy.copy_unproven = true;
+    item.usage_buckets[0].model_usage = vec![copy.clone(), own.clone()];
+    item.model_usage = vec![copy.clone(), own.clone()];
+    let start = item.usage_buckets[0].bucket_start.clone();
+    let proof = |rows: &[(&SnapshotModelUsage, u64)]| {
+        rows.iter()
+            .map(|(row, login)| Contribution {
+                bucket_start: start.clone(),
+                row_key: row_key_from_model_usage(row),
+                usage: holder_usage(row, None),
+                identity: RequestIdentity::Tagged(AuthorityKey {
+                    login: Some(format!("{login:064x}")),
+                    org: Some(format!("{:064x}", login + 32)),
+                    basis: identity::TELEMETRY,
+                    account_source: None,
+                }),
+            })
+            .collect::<Vec<_>>()
+    };
+    let take_counts =
+        || serde_json::to_value(identity::take_identity_counts()).unwrap()["identity_cap"].clone();
+    let count = |counts: &Value, name: &str| counts[name].as_u64().unwrap_or(0);
+    let mut state = identity::AcceptedBuckets::for_test();
+    let mut first = item.clone();
+    sticky_apply(&mut first, &proof(&[(&copy, 1), (&own, 2)]), &state).unwrap();
+    state.record(&serde_json::to_value(&first).unwrap());
+    identity::take_identity_counts();
+    let mut again = item.clone();
+    sticky_apply(&mut again, &proof(&[(&copy, 1), (&own, 2)]), &state).unwrap();
+    let unchanged = take_counts();
+    assert_eq!(
+        count(&unchanged, "accepted_share_changed"),
+        0,
+        "no false refusal"
+    );
+    assert_eq!(again.request_identity_refusals, 0);
+    // The marked row's authority changes: its own frozen share refuses it.
+    let mut moved = item.clone();
+    sticky_apply(&mut moved, &proof(&[(&copy, 3), (&own, 2)]), &state).unwrap();
+    assert_eq!(
+        count(&take_counts(), "accepted_share_changed"),
+        1,
+        "never a silent re-tag"
+    );
+    assert_eq!(moved.request_identity_refusals, 1);
+    // No marked row: the own row finds its unchanged key.
+    let mut own_only = item.clone();
+    own_only.usage_buckets[0].model_usage = vec![own.clone()];
+    own_only.model_usage = vec![own.clone()];
+    sticky_apply(&mut own_only, &proof(&[(&own, 2)]), &state).unwrap();
+    let vanished = take_counts();
+    assert_eq!(count(&vanished, "accepted_share_changed"), 0);
+    assert_eq!(count(&vanished, "accepted_row_vanished"), 1);
+    assert_eq!(own_only.request_identity_refusals, 0);
+}
+
 #[test]
 fn sticky_new_untagged_presence_does_not_bless_a_later_missing_share() {
     let (original, proof) = sticky_session(1);
@@ -1852,14 +1924,8 @@ fn sticky_wire(item: SnapshotItem) -> Value {
     request.snapshots = vec![item];
     serde_json::to_value(request).unwrap()
 }
-/// #909's emitted cases. `seed` may pre-load ledger state into every
-/// accepted set.
-fn sticky_golden_cases(seed: &dyn Fn(&mut identity::AcceptedBuckets)) -> Value {
-    let fresh = || {
-        let mut state = identity::AcceptedBuckets::for_test();
-        seed(&mut state);
-        state
-    };
+/// #909's emitted cases.
+fn sticky_golden_cases() -> Value {
     let mut cases = BTreeMap::new();
     let (mut mixed, mut proof) = sticky_session(4);
     sticky_price_fixture(&mut mixed, &mut proof);
@@ -1888,13 +1954,13 @@ fn sticky_golden_cases(seed: &dyn Fn(&mut identity::AcceptedBuckets)) -> Value {
     row.cache_creation_1h_tokens = 60;
     row.reasoning_output_tokens = 72;
     row.unattributed_total_tokens = 84;
-    sticky_apply(&mut mixed, &proof, &fresh()).unwrap();
+    sticky_apply(&mut mixed, &proof, &identity::AcceptedBuckets::for_test()).unwrap();
     sticky_assert_reconciled(&mixed);
     cases.insert("mixed_presence", sticky_wire(mixed));
 
     let (mut window, mut proof) = sticky_session(576);
     sticky_price_fixture(&mut window, &mut proof);
-    sticky_apply(&mut window, &proof, &fresh()).unwrap();
+    sticky_apply(&mut window, &proof, &identity::AcceptedBuckets::for_test()).unwrap();
     assert!(window.request_identity_refusals > 0);
     assert!(sticky_tagged(&window.usage_buckets[575].model_usage[0]));
     sticky_assert_reconciled(&window);
@@ -1909,7 +1975,7 @@ fn sticky_golden_cases(seed: &dyn Fn(&mut identity::AcceptedBuckets)) -> Value {
     original.repository_label_source = Some("user_approved".into());
     sticky_price_fixture(&mut original, &mut original_proof);
     let mut tagged = original.clone();
-    let mut accepted = fresh();
+    let mut accepted = identity::AcceptedBuckets::for_test();
     sticky_apply(&mut tagged, &original_proof, &accepted).unwrap();
     accepted.record(&serde_json::to_value(&tagged).unwrap());
     let clean = stripped(&tagged);
@@ -1932,7 +1998,7 @@ fn sticky_golden_cases(seed: &dyn Fn(&mut identity::AcceptedBuckets)) -> Value {
     let (mut changed, mut proof) = sticky_session(4);
     sticky_price_fixture(&mut changed, &mut proof);
     let mut first = changed.clone();
-    let mut accepted = fresh();
+    let mut accepted = identity::AcceptedBuckets::for_test();
     sticky_apply(&mut first, &proof, &accepted).unwrap();
     accepted.record(&serde_json::to_value(first).unwrap());
     // Complementary cost presence makes every top-level untagged cost known.
@@ -1999,7 +2065,7 @@ fn sticky_emitted_wire_goldens_match_receiver_contract_cases() {
     use base64::Engine;
     use sha2::Digest;
     use std::io::Write;
-    let actual = sticky_golden_cases(&|_| {});
+    let actual = sticky_golden_cases();
     let fixture = include_str!("fixtures/claude_identity_cap_emitted.json");
     let expected: Value = serde_json::from_str(fixture).unwrap();
     for case in [

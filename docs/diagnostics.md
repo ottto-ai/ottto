@@ -2432,9 +2432,10 @@ Only registered kind labels and counts are emitted, never keys or values.
 
 The daemon no longer reads `session_request_identity_retained_contract` and
 never sends `identity_retained` or `copy_invalidated` on bucket rows; every body
-uses the accepted-priority rules above. Stored identity hints that still carry
-the removed `proved` or `missing` fields load with those fields dropped and are
-written without them.
+uses the accepted-priority rules above. A stored identity hint that still
+carries the removed `proved` or `missing` field, in the JSON ledger or as a
+state_v2 identity row, loads with those fields dropped; the next write of that
+hint omits them.
 
 ### Freshness alarm (all sources)
 
