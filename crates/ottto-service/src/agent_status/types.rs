@@ -936,7 +936,7 @@ impl ClaudeOAuthUsageBreaker {
 /// rejections and their backoff are recorded per caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ClaudeOAuthUsageCaller {
-    /// The default `~/.claude` login. Mirrors the legacy root cache/breaker.
+    /// The default `~/.claude` login. May migrate the old root usage cache.
     Default,
     /// The default login for an account that a registered managed slot has
     /// proved it reads. The slot's credential is the single provider caller;
@@ -947,7 +947,7 @@ pub(super) enum ClaudeOAuthUsageCaller {
 }
 
 impl ClaudeOAuthUsageCaller {
-    pub(super) fn mirrors_legacy_default(&self) -> bool {
+    pub(super) fn migrates_legacy_root(&self) -> bool {
         matches!(self, Self::Default | Self::DefaultDeferredToSlot)
     }
 

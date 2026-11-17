@@ -26,7 +26,6 @@ use crate::agent_status::Sha256;
 use crate::agent_status::CLAUDE_OAUTH_ACCOUNT_STATE_LOCKS;
 use crate::agent_status::CLAUDE_OAUTH_BETA_HEADER;
 use crate::agent_status::CLAUDE_OAUTH_COLLECTION_ATTEMPT_LOCKS;
-use crate::agent_status::CLAUDE_OAUTH_LEGACY_MIGRATION_LOCK;
 use crate::agent_status::CLAUDE_OAUTH_USAGE_ACCOUNT_STATE_DIR;
 use crate::agent_status::CLAUDE_OAUTH_USAGE_AUTH_BACKOFF_BASE_SECONDS;
 use crate::agent_status::CLAUDE_OAUTH_USAGE_BREAKER_AUTH_THRESHOLD;
@@ -231,25 +230,10 @@ pub(in crate::agent_status) fn claude_oauth_usage_config_fingerprint_for(
     format!("{:x}", hasher.finalize())[..16].to_string()
 }
 
-#[cfg(test)]
 pub(in crate::agent_status) fn read_claude_oauth_usage_breaker(
     account_identifier_hash: &str,
     organization_identifier_hash: &str,
     config_fingerprint: &str,
-) -> Option<ClaudeOAuthUsageBreaker> {
-    read_claude_oauth_usage_breaker_with_legacy_migration(
-        account_identifier_hash,
-        organization_identifier_hash,
-        config_fingerprint,
-        true,
-    )
-}
-
-pub(in crate::agent_status) fn read_claude_oauth_usage_breaker_with_legacy_migration(
-    account_identifier_hash: &str,
-    organization_identifier_hash: &str,
-    config_fingerprint: &str,
-    allow_legacy_migration: bool,
 ) -> Option<ClaudeOAuthUsageBreaker> {
     let lock =
         claude_oauth_account_state_lock(account_identifier_hash, organization_identifier_hash);
@@ -260,7 +244,6 @@ pub(in crate::agent_status) fn read_claude_oauth_usage_breaker_with_legacy_migra
         account_identifier_hash,
         organization_identifier_hash,
         config_fingerprint,
-        allow_legacy_migration,
     )
 }
 
@@ -268,20 +251,7 @@ pub(in crate::agent_status) fn read_claude_oauth_usage_breaker_locked(
     account_identifier_hash: &str,
     organization_identifier_hash: &str,
     config_fingerprint: &str,
-    allow_legacy_migration: bool,
 ) -> Option<ClaudeOAuthUsageBreaker> {
-    if allow_legacy_migration {
-        migrate_legacy_claude_oauth_usage_breaker_locked(
-            account_identifier_hash,
-            organization_identifier_hash,
-            config_fingerprint,
-        );
-    }
-    if allow_legacy_migration {
-        let _ = read_claude_oauth_usage_breaker_file_migrating(
-            &claude_oauth_usage_legacy_breaker_path(),
-        );
-    }
     let breaker = read_claude_oauth_usage_breaker_file_migrating(
         &claude_oauth_usage_breaker_path(account_identifier_hash, organization_identifier_hash),
     )?;
@@ -306,30 +276,10 @@ pub(in crate::agent_status) fn write_claude_oauth_usage_breaker_locked(
     write_owner_only_file_atomic_if_changed(&path, &body)
 }
 
-pub(in crate::agent_status) fn write_legacy_claude_oauth_usage_breaker(
-    breaker: &ClaudeOAuthUsageBreaker,
-) -> std::io::Result<()> {
-    let body = serde_json::to_vec_pretty(breaker).map_err(std::io::Error::other)?;
-    write_owner_only_file_atomic_if_changed(&claude_oauth_usage_legacy_breaker_path(), &body)
-}
-
 #[cfg(test)]
 pub(in crate::agent_status) fn clear_claude_oauth_usage_breaker(
     account_identifier_hash: &str,
     organization_identifier_hash: &str,
-) {
-    clear_claude_oauth_usage_breaker_with_legacy(
-        account_identifier_hash,
-        organization_identifier_hash,
-        false,
-    );
-}
-
-#[cfg(test)]
-pub(in crate::agent_status) fn clear_claude_oauth_usage_breaker_with_legacy(
-    account_identifier_hash: &str,
-    organization_identifier_hash: &str,
-    mirror_legacy_default: bool,
 ) {
     let lock =
         claude_oauth_account_state_lock(account_identifier_hash, organization_identifier_hash);
@@ -340,9 +290,6 @@ pub(in crate::agent_status) fn clear_claude_oauth_usage_breaker_with_legacy(
         account_identifier_hash,
         organization_identifier_hash,
     ));
-    if mirror_legacy_default {
-        let _ = fs::remove_file(claude_oauth_usage_legacy_breaker_path());
-    }
 }
 
 /// Clear an auth-class open breaker once consented upkeep has replaced the
@@ -407,43 +354,6 @@ pub(crate) fn clear_claude_oauth_usage_auth_breaker(
         account_identifier_hash,
         organization_identifier_hash,
     ));
-    retire(&claude_oauth_usage_legacy_breaker_path());
-}
-
-pub(in crate::agent_status) fn migrate_legacy_claude_oauth_usage_breaker_locked(
-    account_identifier_hash: &str,
-    organization_identifier_hash: &str,
-    config_fingerprint: &str,
-) {
-    let target =
-        claude_oauth_usage_breaker_path(account_identifier_hash, organization_identifier_hash);
-    if target.exists() {
-        return;
-    }
-    let _migration = CLAUDE_OAUTH_LEGACY_MIGRATION_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if target.exists() {
-        return;
-    }
-    let legacy = claude_oauth_usage_legacy_breaker_path();
-    let Some(mut breaker) = fs::read_to_string(&legacy)
-        .ok()
-        .and_then(|body| serde_json::from_str::<ClaudeOAuthUsageBreaker>(&body).ok())
-        .filter(|breaker| {
-            breaker.schema_version == CLAUDE_OAUTH_USAGE_BREAKER_SCHEMA_VERSION
-                && breaker.account_identifier_hash == account_identifier_hash
-                && breaker.organization_identifier_hash == organization_identifier_hash
-                && breaker.config_fingerprint == config_fingerprint
-        })
-    else {
-        return;
-    };
-    breaker.migrate_raw_caller_keys();
-    if write_claude_oauth_usage_breaker_locked(&breaker).is_ok() {
-        let _ = fs::remove_file(legacy);
-    }
 }
 
 pub(in crate::agent_status) fn claude_oauth_usage_breaker_is_open(
@@ -484,31 +394,12 @@ pub(in crate::agent_status) fn claude_oauth_usage_breaker_after_failure(
     breaker
 }
 
-#[cfg(test)]
 pub(in crate::agent_status) fn record_claude_oauth_usage_failure(
     failure: ClaudeOAuthUsageFailure,
     account_identifier_hash: &str,
     organization_identifier_hash: &str,
     config_fingerprint: &str,
     now: u64,
-) -> Vec<AgentStatusDiagnostic> {
-    record_claude_oauth_usage_failure_with_legacy(
-        failure,
-        account_identifier_hash,
-        organization_identifier_hash,
-        config_fingerprint,
-        now,
-        false,
-    )
-}
-
-pub(in crate::agent_status) fn record_claude_oauth_usage_failure_with_legacy(
-    failure: ClaudeOAuthUsageFailure,
-    account_identifier_hash: &str,
-    organization_identifier_hash: &str,
-    config_fingerprint: &str,
-    now: u64,
-    mirror_legacy_default: bool,
 ) -> Vec<AgentStatusDiagnostic> {
     let lock =
         claude_oauth_account_state_lock(account_identifier_hash, organization_identifier_hash);
@@ -519,7 +410,6 @@ pub(in crate::agent_status) fn record_claude_oauth_usage_failure_with_legacy(
         account_identifier_hash,
         organization_identifier_hash,
         config_fingerprint,
-        mirror_legacy_default,
     );
     let was_open = previous
         .as_ref()
@@ -533,9 +423,6 @@ pub(in crate::agent_status) fn record_claude_oauth_usage_failure_with_legacy(
         now,
     );
     let _ = write_claude_oauth_usage_breaker_locked(&breaker);
-    if mirror_legacy_default {
-        let _ = write_legacy_claude_oauth_usage_breaker(&breaker);
-    }
     if !was_open && claude_oauth_usage_breaker_is_open(&breaker, now) {
         return vec![claude_oauth_usage_circuit_open_diagnostic(&breaker, now)];
     }
@@ -626,7 +513,6 @@ pub(in crate::agent_status) fn record_claude_oauth_usage_auth_failure(
     now: u64,
     credential_expires_at: Option<&str>,
 ) -> Vec<AgentStatusDiagnostic> {
-    let mirror_legacy_default = caller.mirrors_legacy_default();
     let lock =
         claude_oauth_account_state_lock(account_identifier_hash, organization_identifier_hash);
     let _transaction = lock
@@ -636,7 +522,6 @@ pub(in crate::agent_status) fn record_claude_oauth_usage_auth_failure(
         account_identifier_hash,
         organization_identifier_hash,
         config_fingerprint,
-        mirror_legacy_default,
     );
     let was_open = previous
         .as_ref()
@@ -657,9 +542,6 @@ pub(in crate::agent_status) fn record_claude_oauth_usage_auth_failure(
         credential_expires_at,
     );
     let _ = write_claude_oauth_usage_breaker_locked(&breaker);
-    if mirror_legacy_default {
-        let _ = write_legacy_claude_oauth_usage_breaker(&breaker);
-    }
     let state = breaker
         .auth_callers
         .get(&caller.breaker_key())
@@ -726,7 +608,6 @@ pub(in crate::agent_status) fn clear_claude_oauth_usage_breaker_after_success(
     config_fingerprint: &str,
     now: u64,
 ) {
-    let mirror_legacy_default = caller.mirrors_legacy_default();
     let lock =
         claude_oauth_account_state_lock(account_identifier_hash, organization_identifier_hash);
     let _transaction = lock
@@ -736,7 +617,6 @@ pub(in crate::agent_status) fn clear_claude_oauth_usage_breaker_after_success(
         account_identifier_hash,
         organization_identifier_hash,
         config_fingerprint,
-        mirror_legacy_default,
     );
     let caller_key = caller.breaker_key();
     // Another caller's streak survives this success, held or not: it ends only
@@ -754,22 +634,11 @@ pub(in crate::agent_status) fn clear_claude_oauth_usage_breaker_after_success(
                 .collect::<BTreeMap<_, _>>()
         })
         .unwrap_or_default();
-    if !mirror_legacy_default {
-        retire_success_from_legacy_breaker_locked(
-            &caller_key,
-            account_identifier_hash,
-            organization_identifier_hash,
-            now,
-        );
-    }
     if held_others.is_empty() {
         let _ = fs::remove_file(claude_oauth_usage_breaker_path(
             account_identifier_hash,
             organization_identifier_hash,
         ));
-        if mirror_legacy_default {
-            let _ = fs::remove_file(claude_oauth_usage_legacy_breaker_path());
-        }
         return;
     }
     let retained = ClaudeOAuthUsageBreaker {
@@ -782,55 +651,6 @@ pub(in crate::agent_status) fn clear_claude_oauth_usage_breaker_after_success(
         ..Default::default()
     };
     let _ = write_claude_oauth_usage_breaker_locked(&retained);
-    if mirror_legacy_default {
-        let _ = write_legacy_claude_oauth_usage_breaker(&retained);
-    }
-}
-
-/// Apply a non-default caller's success to the legacy root breaker too.
-///
-/// The default collection mirrors the whole account breaker, other callers'
-/// streaks included, into the legacy file, and later migrates that file back
-/// whenever the account file is absent. Without this, a slot's success that
-/// deleted the account file would be undone by that migration. Only a legacy
-/// file for this exact account and organization is touched: the success
-/// resets its account-wide counters and this caller's entry, drops stale
-/// streaks, and keeps unrelated callers' state. Runs under the account lock,
-/// which is the lock the default path holds when it writes this legacy file.
-pub(in crate::agent_status) fn retire_success_from_legacy_breaker_locked(
-    caller_key: &str,
-    account_identifier_hash: &str,
-    organization_identifier_hash: &str,
-    now: u64,
-) {
-    let path = claude_oauth_usage_legacy_breaker_path();
-    let Some(previous) = read_claude_oauth_usage_breaker_file_migrating(&path).filter(|breaker| {
-        breaker.account_identifier_hash == account_identifier_hash
-            && breaker.organization_identifier_hash == organization_identifier_hash
-    }) else {
-        return;
-    };
-    let mut retired = ClaudeOAuthUsageBreaker {
-        schema_version: previous.schema_version,
-        account_identifier_hash: previous.account_identifier_hash.clone(),
-        organization_identifier_hash: previous.organization_identifier_hash.clone(),
-        config_fingerprint: previous.config_fingerprint.clone(),
-        auth_callers: previous.auth_callers.clone(),
-        last_auth_failure: previous.last_auth_failure.clone(),
-        ..Default::default()
-    };
-    retired.auth_callers.remove(caller_key);
-    retired
-        .auth_callers
-        .retain(|_, state| !claude_oauth_usage_caller_streak_is_stale(state, now));
-    if retired == previous {
-        return;
-    }
-    if retired.holds_no_state() {
-        let _ = fs::remove_file(&path);
-        return;
-    }
-    let _ = write_legacy_claude_oauth_usage_breaker(&retired);
 }
 
 /// The alert itself. Snapshot diagnostics are uploaded with the agent-status
