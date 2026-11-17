@@ -55,7 +55,7 @@ pub(in crate::agent_status) fn read_claude_oauth_usage_cache(
 pub(in crate::agent_status) fn read_claude_oauth_usage_cache_with_legacy_migration(
     account_identifier_hash: &str,
     organization_identifier_hash: &str,
-    allow_legacy_migration: bool,
+    legacy_root_migration: bool,
 ) -> Option<ClaudeOAuthUsageCache> {
     let lock =
         claude_oauth_account_state_lock(account_identifier_hash, organization_identifier_hash);
@@ -65,16 +65,16 @@ pub(in crate::agent_status) fn read_claude_oauth_usage_cache_with_legacy_migrati
     read_claude_oauth_usage_cache_locked(
         account_identifier_hash,
         organization_identifier_hash,
-        allow_legacy_migration,
+        legacy_root_migration,
     )
 }
 
 pub(in crate::agent_status) fn read_claude_oauth_usage_cache_locked(
     account_identifier_hash: &str,
     organization_identifier_hash: &str,
-    allow_legacy_migration: bool,
+    legacy_root_migration: bool,
 ) -> Option<ClaudeOAuthUsageCache> {
-    if allow_legacy_migration {
+    if legacy_root_migration {
         static CLEANUP: std::sync::Once = std::sync::Once::new();
         migrate_and_clean_up_legacy_claude_oauth_usage_locked(
             account_identifier_hash,
@@ -173,7 +173,7 @@ pub(in crate::agent_status) fn migrate_and_clean_up_legacy_claude_oauth_usage_lo
     });
 }
 
-// Old-release leftover cleanup; remove in the first release after 2026-12-31.
+// Old-release root-cache migration; remove in the first release after 2026-12-31.
 // Caller holds the account-state and legacy-migration locks.
 pub(in crate::agent_status) fn migrate_legacy_claude_oauth_usage_cache_locked(
     account_identifier_hash: &str,

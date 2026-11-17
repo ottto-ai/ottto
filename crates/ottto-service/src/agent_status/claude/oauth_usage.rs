@@ -172,7 +172,7 @@ pub(in crate::agent_status) fn collect_claude_oauth_usage_unstamped(
     clock: fn() -> u64,
 ) -> ClaudeOAuthUsageOutcome {
     let now = clock();
-    let migrate_legacy_root = caller.migrates_legacy_root();
+    let legacy_root_migration = caller.legacy_root_migration();
     // Every pass is evidence of where this caller's login is signed in; a
     // passive reading must have been fetched inside that continuous run.
     claude_oauth_pass_reached_collector(caller);
@@ -213,7 +213,7 @@ pub(in crate::agent_status) fn collect_claude_oauth_usage_unstamped(
         let cache = read_claude_oauth_usage_cache_with_legacy_migration(
             account_identifier_hash,
             organization_identifier_hash,
-            migrate_legacy_root,
+            legacy_root_migration,
         );
         if let Some(cache) = cache.filter(|cache| {
             !cache.windows.is_empty()
@@ -245,7 +245,7 @@ pub(in crate::agent_status) fn collect_claude_oauth_usage_unstamped(
         if let Some(cache) = read_claude_oauth_usage_cache_with_legacy_migration(
             account_identifier_hash,
             organization_identifier_hash,
-            migrate_legacy_root,
+            legacy_root_migration,
         )
         .filter(|cache| {
             !cache.windows.is_empty()
@@ -346,7 +346,7 @@ pub(in crate::agent_status) fn collect_claude_oauth_usage_unstamped(
     if let Some(cache) = read_claude_oauth_usage_cache_with_legacy_migration(
         account_identifier_hash,
         organization_identifier_hash,
-        migrate_legacy_root,
+        legacy_root_migration,
     ) {
         // The last stored reading: its sections are re-sent by a read that
         // does not carry them.
@@ -507,7 +507,7 @@ pub(in crate::agent_status) fn collect_claude_oauth_usage_unstamped(
                 previous_credit_balances: &previous_credit_balances,
                 latest_activity_at,
                 now,
-                migrate_legacy_root,
+                legacy_root_migration,
             },
             &mut read_schedule,
         ) {
@@ -643,7 +643,7 @@ pub(in crate::agent_status) fn collect_claude_oauth_usage_unstamped(
         let result = match read_claude_oauth_usage_cache_with_legacy_migration(
             account_identifier_hash,
             organization_identifier_hash,
-            migrate_legacy_root,
+            legacy_root_migration,
         )
         .filter(|cache| {
             !cache.windows.is_empty()
@@ -749,7 +749,7 @@ pub(in crate::agent_status) fn collect_claude_oauth_usage_unstamped(
                     previous_credit_balances: &previous_credit_balances,
                     latest_activity_at,
                     now,
-                    migrate_legacy_root,
+                    legacy_root_migration,
                 },
                 caller,
                 &config_fingerprint,
@@ -784,7 +784,7 @@ pub(in crate::agent_status) fn collect_claude_oauth_usage_unstamped(
             return claude_oauth_saved_resets_variant_unusable(
                 account_identifier_hash,
                 organization_identifier_hash,
-                migrate_legacy_root,
+                legacy_root_migration,
                 slot_seconds,
                 &mut read_schedule,
                 now,
@@ -805,7 +805,7 @@ pub(in crate::agent_status) fn collect_claude_oauth_usage_unstamped(
             let mut cache = read_claude_oauth_usage_cache_with_legacy_migration(
                 account_identifier_hash,
                 organization_identifier_hash,
-                migrate_legacy_root,
+                legacy_root_migration,
             )
             .unwrap_or(ClaudeOAuthUsageCache {
                 schema_version: CLAUDE_OAUTH_USAGE_CACHE_SCHEMA_VERSION,
@@ -887,7 +887,7 @@ pub(in crate::agent_status) fn collect_claude_oauth_usage_unstamped(
             if let Some(cache) = read_claude_oauth_usage_cache_with_legacy_migration(
                 account_identifier_hash,
                 organization_identifier_hash,
-                migrate_legacy_root,
+                legacy_root_migration,
             ) {
                 if !cache.windows.is_empty()
                     && now.saturating_sub(cache.observed_at_epoch_seconds)
@@ -936,7 +936,7 @@ pub(in crate::agent_status) fn collect_claude_oauth_usage_unstamped(
             previous_credit_balances: &previous_credit_balances,
             latest_activity_at,
             now,
-            migrate_legacy_root,
+            legacy_root_migration,
         },
         caller,
         &config_fingerprint,
@@ -1031,7 +1031,7 @@ pub(in crate::agent_status) fn claude_oauth_usage_after_response(
     let account_identifier_hash = reading.account_identifier_hash;
     let organization_identifier_hash = reading.organization_identifier_hash;
     let now = reading.now;
-    let migrate_legacy_root = reading.migrate_legacy_root;
+    let legacy_root_migration = reading.legacy_root_migration;
     let variant_recognized = (reading.read == claude_credit_pools::ClaudeUsageRead::SavedResets)
         .then(|| claude_credit_pools::claude_saved_resets_recognized(reading.body));
     if let Some(recognized) = variant_recognized {
@@ -1061,7 +1061,7 @@ pub(in crate::agent_status) fn claude_oauth_usage_after_response(
             return claude_oauth_saved_resets_variant_unusable(
                 account_identifier_hash,
                 organization_identifier_hash,
-                migrate_legacy_root,
+                legacy_root_migration,
                 slot_seconds,
                 read_schedule,
                 now,
@@ -1146,7 +1146,7 @@ pub(in crate::agent_status) fn claude_oauth_saved_resets_without_windows(
     let stored = read_claude_oauth_usage_cache_with_legacy_migration(
         account_identifier_hash,
         organization_identifier_hash,
-        reading.migrate_legacy_root,
+        reading.legacy_root_migration,
     );
     let mut usage = ClaudeOAuthUsage {
         windows: Vec::new(),
@@ -1223,7 +1223,7 @@ pub(in crate::agent_status) fn claude_oauth_saved_resets_without_windows(
 pub(in crate::agent_status) fn claude_oauth_saved_resets_variant_unusable(
     account_identifier_hash: &str,
     organization_identifier_hash: &str,
-    migrate_legacy_root: bool,
+    legacy_root_migration: bool,
     slot_seconds: u64,
     read_schedule: &mut claude_credit_pools::ClaudeReadSchedule,
     now: u64,
@@ -1246,7 +1246,7 @@ pub(in crate::agent_status) fn claude_oauth_saved_resets_variant_unusable(
     let stored = read_claude_oauth_usage_cache_with_legacy_migration(
         account_identifier_hash,
         organization_identifier_hash,
-        migrate_legacy_root,
+        legacy_root_migration,
     );
     let result = match stored {
         Some(mut cache) => {

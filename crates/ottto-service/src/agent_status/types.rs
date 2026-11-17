@@ -917,6 +917,7 @@ impl ClaudeOAuthUsageBreaker {
     }
 
     /// Nothing left but identity and history: the file can be removed.
+    #[cfg(test)]
     pub(super) fn holds_no_state(&self) -> bool {
         self.auth_failures == 0
             && self.shape_failures == 0
@@ -940,14 +941,15 @@ pub(super) enum ClaudeOAuthUsageCaller {
     Default,
     /// The default login for an account that a registered managed slot has
     /// proved it reads. The slot's credential is the single provider caller;
-    /// the default path serves the shared account cache only.
+    /// the default path serves the shared account cache only. May migrate the
+    /// old root usage cache.
     DefaultDeferredToSlot,
     /// A registered slot, by its local slot id.
     RegisteredSlot(String),
 }
 
 impl ClaudeOAuthUsageCaller {
-    pub(super) fn migrates_legacy_root(&self) -> bool {
+    pub(super) fn legacy_root_migration(&self) -> bool {
         matches!(self, Self::Default | Self::DefaultDeferredToSlot)
     }
 

@@ -174,7 +174,7 @@ pub(in crate::agent_status) struct ClaudeOAuthReading<'a> {
     pub(in crate::agent_status) previous_credit_balances: &'a [AgentCreditBalance],
     pub(in crate::agent_status) latest_activity_at: Option<u64>,
     pub(in crate::agent_status) now: u64,
-    pub(in crate::agent_status) migrate_legacy_root: bool,
+    pub(in crate::agent_status) legacy_root_migration: bool,
 }
 
 /// Parse, merge and store one reading. `Err` carries the unstored parse when
