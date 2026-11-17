@@ -698,3 +698,11 @@ state lock is released. Runtime observations belong only to that response;
 reprojection replaces its observation.
 ScanIndex catch-up materializes only the latest set and clear for each pair and
 advances the observed transition high-water marks even across a long polling gap.
+
+Accepted Claude request holders are recorded per source/session slot and contributor location.
+Only an exact body ACK replaces a slot's counted, nonzero request hashes, including an empty set.
+Copy removals consult those hashes before local ownership and census evidence.
+Rows survive refusal, temporary census loss, historical replay and bounded rebuilds.
+A destination change clears them; positive deletion prunes only hashes no stored copy names.
+The rows confer no upload receipt authority. State layout 8 stores each slot separately;
+older readers refuse this layout and require a forward update.

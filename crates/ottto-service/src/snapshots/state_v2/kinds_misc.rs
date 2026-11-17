@@ -329,10 +329,11 @@ pub(super) fn rows(index: &ScanIndex, rows: &mut mapper::Rows<'_>, cx: &mut Kind
     macro_rules! save {
         // Stamps go one row per entity; field_mode finds no two-kind entry,
         // so the stamp-free header stays one Field row.
-        (upload_context_proof, Misc, (misc $($c:ident)*), [$head:literal, $stamps:literal], $h:ident) => {
+        (upload_context_proof, Misc, (misc $($c:ident)*), [$head:literal, $stamps:literal, $contributions:literal], $h:ident) => {
             let proof = &index.upload_context_proof;
             write_field(&proof.header(), "upload_context_proof", $head, rows, cx)?;
             rows.map($stamps, &proof.entity_stamps)?;
+            rows.map($contributions, &proof.request_contributions)?;
         };
         (claude_desktop_store_inventory, Misc, (misc $($c:ident)*), [$kind:literal], $h:ident) => {
             // Like the v1 serializer: only versioned cursor fences persist.
@@ -377,12 +378,20 @@ pub(super) fn hydrate_txn(
     // so the next save removes them.
     macro_rules! load {
         // A layout-5 header holds every stamp inline; the next save splits it.
-        (upload_context_proof, Misc, (misc $($c:ident)*), [$head:literal, $stamps:literal], $h:ident) => {
-            use super::super::upload_context_receipt::{EntityStamp, ProofState};
+        (upload_context_proof, Misc, (misc $($c:ident)*), [$head:literal, $stamps:literal, $contributions:literal], $h:ident) => {
+            use super::super::upload_context_receipt::{EntityStamp, ProofState, SlotRows};
             let mut proof: ProofState =
                 read_field($head, tx, Some(&mut cx.digests), Default::default)?;
             let stamps = mapper::read_map::<EntityStamp>(tx, $stamps, None, Some(&mut cx.digests))?;
             proof.entity_stamps.extend(stamps);
+            proof
+                .request_contributions
+                .extend(mapper::read_map::<SlotRows>(
+                    tx,
+                    $contributions,
+                    None,
+                    Some(&mut cx.digests),
+                )?);
             index.upload_context_proof = proof;
         };
         ($f:ident, Misc, (misc $($c:ident)*), [$kind:literal], $h:ident) => {
@@ -394,11 +403,11 @@ pub(super) fn hydrate_txn(
     read_holds(index, tx, Some(&mut cx.digests))
 }
 pub(super) fn references(
-    _: &Header,
-    _: &dyn Value,
-    _: &mut dyn FnMut(&RowKey) -> Result<()>,
+    h: &Header,
+    value: &dyn Value,
+    emit: &mut dyn FnMut(&RowKey) -> Result<()>,
 ) -> Result<()> {
-    Ok(())
+    mapper::references(h, value, emit)
 }
 pub(super) fn private_paths(
     h: &Header,

@@ -153,10 +153,10 @@ pub(super) fn bytes(tx: &mut (impl Transaction + ?Sized), h: &Header) -> Result<
     Ok(out.inner)
 }
 /// Shared-evidence kinds: (kind, field holding request-set references, class).
-/// `file.census` keeps one set in its field; the others keep a map of sets.
+/// Census keeps one set; contributions keep pairs; the others keep maps.
 /// Retired `account_window` and `usage.pending` stay listed so removing their
 /// rows releases their sets.
-const SHARED: [(&str, &str, &str); 4] = [
+const SHARED: [(&str, &str, &str); 5] = [
     ("account_window", "r", "account"),
     ("usage.pending", "member_request_id_hashes", "requests"),
     (
@@ -165,6 +165,7 @@ const SHARED: [(&str, &str, &str); 4] = [
         "requests",
     ),
     ("file.census", "b", "census"),
+    ("proof.request_contribution", "rows", "census"),
 ];
 /// The shared field and interning class of a shared-evidence kind.
 fn shared(kind: &str) -> Option<(&'static str, &'static str)> {
@@ -173,23 +174,23 @@ fn shared(kind: &str) -> Option<(&'static str, &'static str)> {
         .find(|(name, ..)| *name == kind)
         .map(|&(_, field, class)| (field, class))
 }
-fn evidence_map<'a>(
-    kind: &str,
-    value: &'a mut Json,
-) -> Option<&'a mut serde_json::Map<String, Json>> {
-    let field = match shared(kind) {
-        Some((field, _)) if kind != "file.census" => field,
-        _ => return None,
-    };
-    value.get_mut(field)?.as_object_mut()
-}
-fn evidence_values<'a>(kind: &str, value: &'a mut Json) -> Vec<&'a mut Json> {
+fn shared_values<'a>(kind: &str, value: &'a mut Json) -> Result<Vec<&'a mut Json>> {
     if kind == "file.census" {
-        return value.get_mut("b").into_iter().collect();
+        return Ok(vec![value]);
     }
-    evidence_map(kind, value)
-        .map(|m| m.values_mut().collect())
-        .unwrap_or_default()
+    if kind == "proof.request_contribution" {
+        return value
+            .as_array_mut()
+            .context("state_v2_contribution_rows")?
+            .iter_mut()
+            .map(|row| row.get_mut(1).context("state_v2_contribution_row"))
+            .collect();
+    }
+    Ok(value
+        .as_object_mut()
+        .context("state_v2_evidence_map")?
+        .values_mut()
+        .collect())
 }
 fn id(value: &Json) -> Option<u64> {
     let object = value.as_object()?;
@@ -199,7 +200,16 @@ fn id(value: &Json) -> Option<u64> {
 }
 fn ref_ids(kind: &str, value: &mut Json) -> Result<Vec<RowKey>> {
     let mut result = Vec::new();
-    for value in evidence_values(kind, value) {
+    let Some((field, _)) = shared(kind) else {
+        return Ok(result);
+    };
+    let Some(value) = value.get_mut(field) else {
+        return Ok(result);
+    };
+    for value in shared_values(kind, value)? {
+        if kind == "proof.request_contribution" && value.is_string() {
+            continue;
+        }
         result.push(RowKey::RequestSet(
             id(value).context("state_v2_shared_reference")?,
         ));
@@ -232,16 +242,15 @@ fn shared_json(
     let mut created = Vec::new();
     if let Some(raw) = root.get_mut(field) {
         let mut value: Json = serde_json::from_str(raw.get())?;
-        let values: Vec<_> = if kind == "file.census" {
-            vec![&mut value]
-        } else {
-            value
-                .as_object_mut()
-                .context("state_v2_evidence_map")?
-                .values_mut()
-                .collect()
-        };
-        for value in values {
+        for value in shared_values(kind, &mut value)? {
+            // Base64 needs no escaping; the shared tuple adds the class and seven delimiters.
+            if kind == "proof.request_contribution"
+                && value.as_str().is_some_and(|v| {
+                    !acquire || v.len() as u64 + class.len() as u64 + 7 > VALUE_BYTES
+                })
+            {
+                continue;
+            }
             if acquire {
                 let (id, new) = interning::resolve(tx, class, value)?;
                 refs.push(RowKey::RequestSet(id));

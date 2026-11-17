@@ -111,6 +111,14 @@
     "marker_source_file_fingerprint",
     "verified_source_file_fingerprint"
   ],
+  "proof.request_contribution": [
+    "body_witness",
+    "fingerprint",
+    "rows",
+    "rows[]",
+    "rows[][]",
+    "rows[][][16]"
+  ],
   "proof.upload_context": [
     "body_witness",
     "context_fingerprint"

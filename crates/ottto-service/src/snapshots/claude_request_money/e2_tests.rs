@@ -158,10 +158,13 @@ fn hold_in_folder(index: &mut ScanIndex, copy: &Path, ids: &[&str]) {
             &fingerprint,
             1,
             ClaudeRequestCensusShape::Exact,
-            hashes,
+            hashes.clone(),
         ),
     );
     crate::snapshots::e2_pipeline_scan_fixture::origin_accepted_for_test(index, &key);
+    crate::snapshots::e2_pipeline_scan_fixture::accepted_origin_hashes_for_test(
+        index, &key, HOLDER, &hashes,
+    );
 }
 fn restart(index: &ScanIndex) -> ScanIndex {
     serde_json::from_slice(&serde_json::to_vec(index).unwrap()).unwrap()
@@ -4575,6 +4578,12 @@ fn retained_growth_identity_failure_cannot_suppress_another_sessions_request() {
                 )
             };
             crate::snapshots::e2_pipeline_scan_fixture::origin_accepted_for_test(&mut index, &key);
+            crate::snapshots::e2_pipeline_scan_fixture::accepted_origin_hashes_for_test(
+                &mut index,
+                &key,
+                ROOT,
+                &[claude_request_hash("old")],
+            );
             assert_eq!(
                 fold(&parse_copy(&index)).entity.removed_requests,
                 1,

@@ -196,6 +196,20 @@ fn distinct_same_session_file_counts_and_copies_never_prove_copies() {
             )]),
         );
         origin_accepted_for_test(&mut prior, &origin_key);
+        // Model the accepted original and the intermediate body's new counted
+        // contribution explicitly; the receipt alone carries neither hash set.
+        crate::snapshots::e2_pipeline_scan_fixture::accepted_origin_hashes_for_test(
+            &mut prior,
+            "absent-original",
+            "absent-original",
+            &[crate::snapshots::claude_request_census::claude_request_hash("a")],
+        );
+        crate::snapshots::e2_pipeline_scan_fixture::accepted_origin_hashes_for_test(
+            &mut prior,
+            &origin_key,
+            ROOT,
+            &[crate::snapshots::claude_request_census::claude_request_hash("b")],
+        );
         c.write_at(&file(THIRD), &resumed(THIRD, &[A, D]), BORN);
         owe(&mut prior);
         let page = ready(&c, &E2ScanFixture::default(), prior, 100, false);
@@ -299,6 +313,285 @@ fn accept_finished_monotone_page(
         &progress.fresh_context_body_acks,
     );
     c.reload(&mut settled.index)
+}
+
+/// [money] An old ACK cannot own a newly observed request when its holder
+/// disappears before that request reaches the receiver; real coverage survives.
+#[test]
+// The permanent refusal records Poisoned in the shared client_report counters.
+#[serial(client_report)]
+fn old_ack_does_not_own_new_request_after_holder_loss() {
+    use crate::snapshots::claude_request_census::claude_request_hash;
+    use crate::snapshots::e2_pipeline_scan_fixture::owe_claimed_growth;
+
+    // Separate hours make the receiver's literal bucket counts an independent
+    // per-request oracle, without consulting the saved copy-removal decisions.
+    type Receiver = BTreeMap<String, BTreeMap<String, u64>>;
+    fn record(receiver: &mut Receiver, item: &SnapshotItem) {
+        let hours = item
+            .usage_buckets
+            .iter()
+            .map(|bucket| {
+                (
+                    bucket.bucket_start[..13].to_owned(),
+                    bucket.model_usage.iter().map(|row| row.request_count).sum(),
+                )
+            })
+            .collect::<BTreeMap<String, u64>>();
+        assert_eq!(hours.values().sum::<u64>(), item.request_count);
+        receiver.insert(item.source_session_id.clone(), hours);
+    }
+    fn accept(
+        c: &Corpus,
+        committed: &ScanIndex,
+        mut page: Page,
+        accepted: &mut BTreeMap<String, u64>,
+        receiver: &mut Receiver,
+    ) -> ScanIndex {
+        let holds = page.finish();
+        let sent = page.scan.snapshots.clone();
+        let index = accept_finished_monotone_page(c, committed, page, accepted, holds);
+        for item in &sent {
+            record(receiver, item);
+        }
+        index
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Arm {
+        Refused,
+        ContentHeld,
+        Accepted,
+    }
+    let mut missing = Vec::new();
+    for arm in [
+        Arm::Refused,     // Expected red on main: the old ACK does not cover b.
+        Arm::ContentHeld, // Expected red on main: the held append never delivers b.
+        Arm::Accepted,    // Expected green on main: the new ACK really covers b.
+    ] {
+        if arm == Arm::ContentHeld && !crate::heap_layout_bound::layout_supported() {
+            continue;
+        }
+        with_e2(|| {
+            let mut c = Corpus::new("old-ack-new-request-holder-loss");
+            let holder = c.root(ROOT, &resumed(ROOT, &[A]));
+            let holder_key = holder.to_string_lossy().into_owned();
+            let mut accepted = BTreeMap::new();
+            let mut receiver = Receiver::new();
+            let mut prior = ScanIndex::default();
+            let mut initial = c.raw(&E2ScanFixture::default(), prior.clone(), 100, false, &[]);
+            initial.enrich(&c);
+            prior = accept(&c, &prior, initial, &mut accepted, &mut receiver);
+            assert_eq!(accepted[ROOT], 1);
+            let old_receipt = prior.files[&holder_key]
+                .upload_context_receipt
+                .clone()
+                .expect("A's original body earned a real receipt");
+
+            let twin = (arm == Arm::ContentHeld).then(|| {
+                let twin = c.write_at(
+                    &file(THIRD),
+                    &resumed(ROOT, &[A, ("d", "2026-08-02T10:00:10Z", RESUME_WRITER)]),
+                    BORN,
+                );
+                // Register T through a real parse, without uploading this page.
+                // Only A={a} has ever been accepted. T's census knows d, not b.
+                let mut known = c.raw(&E2ScanFixture::default(), prior.clone(), 100, false, &[]);
+                let key = twin.to_string_lossy();
+                let census = known
+                    .index
+                    .claude_request_census_for_test()
+                    .get(&key)
+                    .unwrap();
+                assert!(census.is_twin());
+                assert!(census.request_hashes().contains(&claude_request_hash("d")));
+                assert!(!census.request_hashes().contains(&claude_request_hash("b")));
+                prior = c.reload(&mut known.index);
+                // A duplicate response grows T's bytes without adding a request.
+                // Its next acquisition is claimed and paced until after deletion.
+                append(
+                    &twin,
+                    &resumed(ROOT, &[("d", "2026-08-02T10:00:10Z", RESUME_WRITER)]),
+                );
+                prior = owe_claimed_growth(&prior, &c.base, &twin, true);
+                twin
+            });
+
+            let b = ("b", "2026-08-02T08:00:20Z", OLD_WRITER);
+            let own = ("c", "2026-08-02T09:03:10Z", RESUME_WRITER);
+            append(&holder, &resumed(ROOT, &[b]));
+            if arm == Arm::Accepted {
+                // Prove delivery of b before B even exists in the control.
+                let mut delivered =
+                    c.raw(&E2ScanFixture::default(), prior.clone(), 100, false, &[]);
+                delivered.enrich(&c);
+                prior = accept(&c, &prior, delivered, &mut accepted, &mut receiver);
+                assert_eq!(accepted[ROOT], 2);
+            }
+            let copy = c.write_at(
+                &file(COPY),
+                &resumed(COPY, &[b, own]),
+                "2026-08-02T09:03:00Z",
+            );
+            owe(&mut prior);
+            let scanner = E2ScanFixture::default();
+            let mut page = c.raw(&scanner, prior.clone(), 100, twin.is_some(), &[]);
+            assert!(scanner.paths().contains(&holder) && scanner.paths().contains(&copy));
+            if let Some(twin) = &twin {
+                assert!(
+                    !scanner.paths().contains(twin),
+                    "T's growth stays unacquired"
+                );
+            }
+            let census = page
+                .index
+                .claude_request_census_for_test()
+                .get(&holder_key)
+                .unwrap();
+            assert!(census.current_for(&page.index.files[&holder_key].source_file_fingerprint));
+            assert!(census.request_hashes().contains(&claude_request_hash("b")));
+            if arm != Arm::Accepted {
+                assert_eq!(
+                    page.index.files[&holder_key]
+                        .upload_context_receipt
+                        .as_ref(),
+                    Some(&old_receipt)
+                );
+            }
+            page.enrich(&c);
+            assert!(body(&page, COPY).is_some(), "B is independently eligible");
+
+            if arm == Arm::Refused {
+                assert_eq!(body(&page, ROOT).unwrap().request_count, 2);
+                let holds = page.finish();
+                let sent = page.scan.snapshots.clone();
+                let mut progress = e2_progress();
+                let (status, _, _) = upload(&sent, &mut progress, |items| {
+                    let mut response = ack(items)?;
+                    for item in items {
+                        if item.source_session_id == ROOT {
+                            response.accepted_entities.retain(|entity| {
+                                entity.snapshot_fingerprint != item.snapshot_fingerprint
+                            });
+                            response.accepted -= 1;
+                            response.sessions_reconciled -= 1;
+                            response.rejected_entities.push(
+                                crate::snapshot_client::SnapshotEntityRejection {
+                                    source_session_id: ROOT.into(),
+                                    snapshot_fingerprint: item.snapshot_fingerprint.clone(),
+                                    reason: "hour_bucket_count_above_cap".into(),
+                                    detail: "synthetic permanent non-coverage refusal".into(),
+                                    permanent: true,
+                                    occurrence_count: 1,
+                                },
+                            );
+                        } else {
+                            let count = accepted.entry(item.source_session_id.clone()).or_default();
+                            assert!(
+                                item.request_count >= *count,
+                                "an ACK must not shrink a session"
+                            );
+                            *count = item.request_count;
+                            record(&mut receiver, item);
+                        }
+                    }
+                    Ok(response)
+                });
+                assert_eq!(
+                    status.unwrap(),
+                    ResumableUploadResult::Rejected { count: 1 }
+                );
+                let rejected = body(&page, ROOT).unwrap();
+                let refusal = &progress.quarantined_fingerprints[&rejected.snapshot_fingerprint];
+                assert_eq!(
+                    refusal.disposition,
+                    SnapshotQuarantineDisposition::UnprovenTerminal
+                );
+                assert_eq!(
+                    progress.permanent_rejections[&rejected.snapshot_fingerprint].reason,
+                    crate::upload_receipts::RejectedUsageReason::HourBucketCountAboveCap
+                );
+                assert_eq!(
+                    accepted[ROOT], 1,
+                    "the refused append never enters the ledger"
+                );
+                let mut settled = settle_checkpointed_upload(
+                    page.index,
+                    &prior,
+                    &progress,
+                    &holds,
+                    true,
+                    UnsettledUploadCause::DeferredConflict,
+                );
+                settle_index_after_upload(&mut settled.index, &prior, &progress);
+                accept_upload_context_acks_for_test(
+                    &mut settled.index,
+                    &sent,
+                    &progress.fresh_context_body_acks,
+                );
+                prior = c.reload(&mut settled.index);
+            } else {
+                if arm == Arm::ContentHeld {
+                    assert_eq!(
+                        page.disposition
+                            .request_owned_hold_reasons
+                            .get("absent_content_twin"),
+                        Some(&1)
+                    );
+                }
+                prior = accept(&c, &prior, page, &mut accepted, &mut receiver);
+                assert_eq!(accepted[ROOT], if arm == Arm::Accepted { 2 } else { 1 });
+            }
+            if arm != Arm::Accepted {
+                assert_eq!(
+                    prior.files[&holder_key].upload_context_receipt.as_ref(),
+                    Some(&old_receipt)
+                );
+            }
+            assert!(accepted.contains_key(COPY), "B's actual body was ACKed");
+            std::fs::remove_file(&holder).unwrap();
+            if let Some(twin) = &twin {
+                std::fs::remove_file(twin).unwrap();
+            }
+            for _ in 0..3 {
+                owe(&mut prior);
+                let mut page = c.raw(&E2ScanFixture::default(), prior.clone(), 100, false, &[]);
+                page.enrich(&c);
+                prior = accept(&c, &prior, page, &mut accepted, &mut receiver);
+            }
+            assert!(
+                !prior.files.contains_key(&holder_key),
+                "positive absence retired A"
+            );
+            if arm == Arm::Accepted {
+                assert_eq!(accepted[COPY], 1, "B keeps only c after proved ownership");
+            }
+            for (request, hour) in [
+                ("a", "2026-08-02T07"),
+                ("b", "2026-08-02T08"),
+                ("c", "2026-08-02T09"),
+            ] {
+                let count = [ROOT, COPY]
+                    .iter()
+                    .map(|session| {
+                        receiver
+                            .get(*session)
+                            .and_then(|hours| hours.get(hour))
+                            .copied()
+                            .unwrap_or(0)
+                    })
+                    .sum::<u64>();
+                if count != 1 {
+                    missing.push((arm, request, count, accepted.clone()));
+                }
+            }
+        });
+    }
+    // Collect failures so both negative arms and the positive control run.
+    assert!(
+        missing.is_empty(),
+        "each request must be accepted exactly once: {missing:?}"
+    );
 }
 
 /// [money] Native and Tail pages preserve the complete union, even when the
@@ -948,7 +1241,9 @@ fn held_content_twin_holder_proves_no_copy_until_released() {
         // at its save; that carrier loss marks H once. One recovery pass
         // re-reads H (never C) and changes no accepted body.
         let after_release = accepted.clone();
+        assert!(e2::carrier_group_owned_for_test(&prior, &main_key));
         assert!(prior.claude_copy_removals.pending(location_key(&main_key)));
+        assert!(!prior.claude_copy_removals.pending(location_key(&copy_key)));
         let mut recovery = c.raw(&scanner, prior.clone(), 100, true, &[]);
         assert!(!scanner.paths().contains(&copy));
         recovery.enrich(&c);
@@ -1892,22 +2187,28 @@ fn content_carrier_reconcile_under_open_v2_save_does_not_deadlock() {
     worker.join().unwrap();
 }
 
-/// [regress] An unrouted JSON save grants no new head-backed authority and
-/// keeps its existing residual behavior without relocking a v2 session.
+/// [regress] An unrouted JSON save retains exact accepted counted rows
+/// without granting head-backed authority or relocking a v2 session.
 #[test]
 fn legacy_content_carrier_save_stays_unrouted() {
     with_e2(|| {
         let (c, mut index, _) = settled_content_carrier(false);
         assert!(crate::snapshots::e2_pipeline_scan_fixture::route_of(&index).is_none());
+        assert!(!index.upload_context_proof.request_contributions.is_empty());
+        let rows = index.upload_context_proof.request_contributions.clone();
+        let copy = c.root.join(file(COPY));
+        let removals = removed_hashes(&index, &copy);
         for _ in 0..3 {
             let page = ready(&c, &E2ScanFixture::default(), index.clone(), 100, false);
             index = settle(&c, &index, page, &mut e2_progress());
             assert!(crate::snapshots::e2_pipeline_scan_fixture::route_of(&index).is_none());
+            assert_eq!(index.upload_context_proof.request_contributions, rows);
+            assert_eq!(removed_hashes(&index, &copy), removals);
             assert!(
-                index
+                !index
                     .claude_copy_removals
                     .pending(location_key(&c.root.join(file(COPY)).to_string_lossy())),
-                "legacy ownership behavior is unchanged"
+                "fresh accepted rows settle ownership without a head route"
             );
         }
     });
@@ -2122,6 +2423,50 @@ fn committed_content_carrier_requires_bound_receipt_after_reload() {
                 BTreeMap::new()
             });
             assert_eq!(eligible, case == "valid", "{case}");
+        }
+    });
+}
+
+mod accepted_holder_row_tests {
+    include!("accepted_holder_row_tests.rs");
+}
+
+/// [money] A current carrier keeps the main's Local proof for both a stored
+/// copy and a new copy, even when old state has no accepted counted rows.
+#[test]
+fn carried_main_keeps_local_proof_without_accepted_request_rows() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    with_e2(|| {
+        let (mut c, mut index, [h, copy, t]) = settled_content_carrier(true);
+        index.upload_context_proof.request_contributions.clear();
+        index = c.reload(&mut index);
+        index.activate_upload_context("e2-synthetic-destination".into());
+        assert!(e2::carrier_group_owned_for_test(
+            &index,
+            &h.to_string_lossy()
+        ));
+        index
+            .claude_copy_removals
+            .mark(location_key(&copy.to_string_lossy()));
+        c.write_at(
+            &file(THIRD),
+            &resumed(
+                THIRD,
+                &[A, ("own-branch", "2026-08-02T07:03:20Z", RESUME_WRITER)],
+            ),
+            BORN,
+        );
+        let scanner = carrier_scanner(&index);
+        let page = ready(&c, &scanner, index, 100, true);
+        assert!(!scanner.paths().contains(&h) && !scanner.paths().contains(&t));
+        for session in [COPY, THIRD] {
+            let item = body(&page, session).unwrap();
+            assert_eq!(
+                (item.request_count, item.removed_request_count),
+                (1, Some(1))
+            );
         }
     });
 }

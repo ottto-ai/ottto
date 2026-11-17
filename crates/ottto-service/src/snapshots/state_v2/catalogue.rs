@@ -76,9 +76,10 @@ macro_rules! scan_index_fields {
             retired_held_audit_progress => Misc (retired none) ["scan_state.held_audit_progress" => 1] side,
             claude_money_birth_store => Misc (misc check_field Field) ["v1_field.birth_store" => 1] side,
             claude_desktop_store_inventory => Misc (misc check_field Field) ["v1_field.claude_desktop_store_inventory" => 1] side,
+            deleted_holders => Misc (runtime none) [] side,
             claude_copy_removals => Misc (misc check_field Field) ["v1_field.claude_copy_removals" => 1] side,
             // Its stamps are one row per entity, as accepted.entity (layout 6).
-            upload_context_proof => Misc (misc check_field Field) ["v1_field.upload_context_proof" => 2, "proof.upload_context" => 6] side,
+            upload_context_proof => Misc (misc check_field Field) ["v1_field.upload_context_proof" => 2, "proof.upload_context" => 6, "proof.request_contribution" => 8] side,
             // Inert accepted catalogue entries; member keys retain legacy first-seen evidence.
             retired_archives => Misc (retired none) ["v1_field.archives" => 2] side,
             retired_archive_deferred_alarm_count => Misc (retired none) ["v1_field.archive_deferred_alarm_count" => 2] side,
@@ -191,6 +192,7 @@ pub(super) const LAYOUTS_HISTORY: &[(u32, &str)] = &[
     (5, "folder login ledger + tail revision + head envelope"),
     (6, "upload context proof stamps one row per entity"),
     (7, "upload progress rows"),
+    (8, "accepted request contributions per session slot"),
 ];
 pub(super) const LAYOUT: u32 = LAYOUTS_HISTORY[LAYOUTS_HISTORY.len() - 1].0;
 pub(super) const LAYOUTS: &[(&str, &str, u32)] = scan_index_fields!(layouts);
