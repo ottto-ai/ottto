@@ -953,7 +953,8 @@ mod tests {
             );
         }
 
-        // Claude start: the start reads the flag only.
+        // Claude start: the start reads the flag only, except the
+        // custody-backed `Isolated503`, which alone survives it.
         for flag in [false, true] {
             let mut plain = ScanIndex::default();
             plain.files.insert(
@@ -966,7 +967,8 @@ mod tests {
                 .unwrap(),
             );
             plain.bounded_sweep_had_unsettled_upload = flag;
-            let mut tagged = with_unsettled_causes(&plain, u16::MAX);
+            let mut tagged =
+                with_unsettled_causes(&plain, !UnsettledUploadCause::Isolated503.bit());
             let mut outcomes = Vec::new();
             for index in [&mut plain, &mut tagged] {
                 let (_, rows) = capture(|| {
@@ -1138,7 +1140,7 @@ mod tests {
             starting.context_matches = false; // longest boolean spelling
             starting.prior_unsettled_upload = false;
             starting.prior_unsettled_causes = UnsettledUploadCause::names(u16::MAX);
-            assert_eq!(starting.prior_unsettled_causes.len(), 10);
+            assert_eq!(starting.prior_unsettled_causes.len(), 11);
             starting.retry_due = Some(false);
             starting.disappearance_process_totals_v1 = disappearance_diagnostics::Totals::maximum();
             let previous = starting.previous.as_mut().unwrap();
@@ -1174,7 +1176,7 @@ mod tests {
                     .as_array()
                     .unwrap()
                     .len(),
-                10
+                11
             );
             assert_complete_max_row(rows[0].clone());
         }

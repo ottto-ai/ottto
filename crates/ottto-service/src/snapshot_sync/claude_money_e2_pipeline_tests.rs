@@ -2318,7 +2318,8 @@ fn retry_case(conflict: bool) {
             result.unwrap(),
             ResumableUploadResult::Deferred {
                 count: 1,
-                isolated: 1
+                isolated: 1,
+                identity_503: 0
             }
         );
         assert_eq!(
@@ -3388,7 +3389,11 @@ fn rewritten_original(reverse: bool) {
         let old = ScanIndex::default();
         let first = ready(&c, &scanner, old.clone(), 100, false);
         assert_eq!(total(&first), 2, "h1 once, r2 once");
-        let prior = settle(&c, &old, first, &mut progress);
+        let mut prior = settle(&c, &old, first, &mut progress);
+        // Exercise Local proof after loading older state without receiver rows.
+        // Exact accepted hashes instead survive a semantic no-op rewrite.
+        prior.upload_context_proof.request_contributions.clear();
+        let prior = c.reload(&mut prior);
         let inode = |path: &Path| {
             use std::os::unix::fs::MetadataExt;
             std::fs::metadata(path).unwrap().ino()
@@ -3614,6 +3619,9 @@ fn e2_pipeline_branch_waits_for_an_original_modified_since_its_read() {
         let first = ready(&c, &E2ScanFixture::default(), old.clone(), 100, false);
         assert_eq!(total(&first), 1);
         let mut prior = settle(&c, &old, first, &mut progress);
+        // Keep the Local-only stale-holder control separate from receiver proof.
+        prior.upload_context_proof.request_contributions.clear();
+        prior = c.reload(&mut prior);
         // Same length: h becomes u in place; the clock moves on.
         std::fs::write(&original, line(LATE, "u", AT, 10)).unwrap();
         std::fs::File::options()

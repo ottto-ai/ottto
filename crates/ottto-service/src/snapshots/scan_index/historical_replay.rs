@@ -128,8 +128,10 @@ impl ScanIndex {
         self.resume_after_path = None;
         self.resume_upper_bound_path = None;
         self.resume_census_window_end = None;
-        self.bounded_sweep_had_unsettled_upload = false;
-        self.bounded_sweep_unsettled_causes = 0;
+        // Owed identity-503 custody survives the replay, as at a walk start.
+        self.bounded_sweep_unsettled_causes =
+            self.unsettled_cause_bits() & UnsettledUploadCause::Isolated503.bit();
+        self.bounded_sweep_had_unsettled_upload = self.bounded_sweep_unsettled_causes != 0;
         self.traversal = None;
         self.scan_residue_witness = None;
         self.confirmed_empty_files.clear();

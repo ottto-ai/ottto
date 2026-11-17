@@ -157,8 +157,27 @@ pub(super) fn resident_scan_requested(scan: &SourceScanResult, first_read_bootst
                     && !scan.routine_recensus
                     && !scan.census_complete)))
 }
+/// An AC request can wake once after unplugging; battery cannot renew this reason.
+pub(super) fn resident_scan_request_after_settlement(
+    scan: &SourceScanResult,
+    bootstrap: bool,
+    power: PlatformState,
+    runnable: bool,
+) -> Option<bool> {
+    let existing = resident_scan_requested(scan, bootstrap);
+    (existing || (bootstrap && power == PlatformState::Allowed && runnable))
+        .then_some(bootstrap && existing)
+}
+#[cfg(test)]
 pub(super) fn request_resident_scan(source: SnapshotSource, first_import: bool) {
-    if let Some(pacing) = resident_pacing(MacPlatformSignals::default().power()) {
+    request_resident_scan_on_power(source, first_import, MacPlatformSignals::default().power());
+}
+pub(super) fn request_resident_scan_on_power(
+    source: SnapshotSource,
+    first_import: bool,
+    power: PlatformState,
+) {
+    if let Some(pacing) = resident_pacing(power) {
         with_source_cadence(source, |cadence| {
             let now = crate::scan_clock::now();
             cadence.request_paced_scan(now, Duration::ZERO, pacing, first_import)

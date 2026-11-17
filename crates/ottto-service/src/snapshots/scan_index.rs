@@ -17,6 +17,7 @@ mod test_accessors;
 #[cfg(test)]
 pub(in crate::snapshots) mod tests;
 
+use super::discovery::traversal::terminal_unhealthy_retry_due;
 use super::*;
 use super::{
     claude_request_money, deserialize_lenient_claude_history_cutoff, deserialize_lenient_move_hold,
@@ -491,6 +492,8 @@ pub struct ScanIndex {
         deserialize_with = "claude_request_money::copy_removals::CopyRemovals::deserialize_lenient"
     )]
     pub(crate) claude_copy_removals: claude_request_money::copy_removals::CopyRemovals,
+    #[serde(skip)]
+    pub(crate) deleted_holders: BTreeSet<claude_money_birth_store::LocationKey>,
     /// Per-item upload-context proof. Appended for old readers, which drop it;
     /// missing means owed. Gates no decision yet.
     #[serde(
@@ -552,10 +555,13 @@ pub(crate) enum UnsettledUploadCause {
     /// A path that does not name itself, a flag saved before causes were
     /// recorded, or a malformed recorded value.
     Unattributed,
+    /// Only identity-unavailable 503 deferrals. Cleared once every deferred
+    /// session's later body is ACKed; an older daemon reads it as unknown.
+    Isolated503,
 }
 
 impl UnsettledUploadCause {
-    pub(super) const ALL: [Self; 9] = [
+    pub(super) const ALL: [Self; 10] = [
         Self::Shed,
         Self::UploadError,
         Self::DeferredConflict,
@@ -565,6 +571,7 @@ impl UnsettledUploadCause {
         Self::LegacyReconcile,
         Self::AdmissionReoffer,
         Self::Unattributed,
+        Self::Isolated503,
     ];
 
     pub(super) fn bit(self) -> u16 {
@@ -582,6 +589,7 @@ impl UnsettledUploadCause {
             Self::LegacyReconcile => "legacy_reconcile",
             Self::AdmissionReoffer => "admission_reoffer",
             Self::Unattributed => "unattributed",
+            Self::Isolated503 => "isolated_503",
         }
     }
 
@@ -666,6 +674,7 @@ impl Default for ScanIndex {
             retired_claude_request_identity_contract_changed: serde::de::IgnoredAny,
             claude_desktop_store_inventory: None,
             claude_copy_removals: Default::default(),
+            deleted_holders: Default::default(),
             upload_context_proof: Default::default(),
             copy_unproven_enabled: false,
             copy_prefix_base_upload_context: None,
@@ -981,6 +990,52 @@ crate::heap_layout_bound::fields!(SnapshotQuarantineRecord; reconstruction_contr
 crate::heap_layout_bound::fields!(SnapshotQuarantineWitness; contract, collector_version, parser_version, scan_identity_version, snapshot_schema_version, entity_ack_contract, item_wire_byte_limit);
 
 impl ScanIndex {
+    pub(crate) fn runnable_walk_or_followup(
+        &self,
+        scan: &SourceScanResult,
+        held: &BTreeSet<String>,
+        progress_blocking: bool,
+        fresh_offer: bool,
+        collected_at: &str,
+    ) -> bool {
+        let quarantined = &self.quarantined_snapshot_fingerprints;
+        let membership = &self.file_snapshot_fingerprints;
+        let unblocked =
+            scan.state_census_complete && scan.sidecar_census_complete && !progress_blocking;
+        let eligible = |key: &str| {
+            let blocked = |fp: &String| held.contains(fp) || quarantined.contains_key(fp);
+            !self.decode_holds_file(key)
+                && membership
+                    .get(key)
+                    .is_none_or(|fps| !fps.iter().any(blocked))
+        };
+        if let Some(t) = &self.traversal {
+            let (terminal, due) = terminal_unhealthy_retry_due(scan.source, self, t, collected_at);
+            if terminal {
+                return due;
+            }
+            let queued = !t.pending_directories.is_empty()
+                || t.pending_candidates.iter().any(|candidate| {
+                    candidate.census_member && eligible(&local_index_key(&candidate.path))
+                });
+            if queued
+                || (unblocked
+                    && !t.watcher_hint_seen
+                    && t.reconciliation_started
+                    && scan.census_status.reconciliation_incomplete)
+            {
+                return true;
+            }
+        }
+        let holds = UnsettledUploadCause::CompletedBlockingHolds.bit()
+            | UnsettledUploadCause::RejectedWithHolds.bit();
+        unblocked
+            && self.unsettled_cause_bits() & holds == 0
+            && self.bounded_sweep_had_unsettled_upload
+            && self.decode_holds.is_empty()
+            && (fresh_offer
+                || (quarantined.is_empty() && self.files.keys().any(|key| eligible(key))))
+    }
     /// Census members still queued at page end, exactly what
     /// `skipped_file_count_due_to_limit` counts. Cap refusals are not in it,
     /// and it is not `scan_cap_hit`. No stat or read.
@@ -1020,6 +1075,37 @@ impl ScanIndex {
     pub(crate) fn mark_bounded_sweep_unsettled_by(&mut self, cause: UnsettledUploadCause) {
         self.bounded_sweep_unsettled_causes = self.unsettled_cause_bits() | cause.bit();
         self.bounded_sweep_had_unsettled_upload = true;
+    }
+
+    /// Reconcile `Isolated503` with its custody before the scanner runs: an
+    /// empty set clears it (and the set), a pending one sets it, absent
+    /// custody keeps it.
+    pub(crate) fn reconcile_isolated_503(&mut self, custody: &mut Option<BTreeSet<String>>) {
+        match custody {
+            Some(pending) if pending.is_empty() => {
+                *custody = None;
+                self.bounded_sweep_unsettled_causes =
+                    self.unsettled_cause_bits() & !UnsettledUploadCause::Isolated503.bit();
+                self.bounded_sweep_had_unsettled_upload = self.bounded_sweep_unsettled_causes != 0;
+            }
+            Some(_) => self.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::Isolated503),
+            None => {}
+        }
+    }
+
+    pub(crate) fn owes_isolated_503(&self) -> bool {
+        self.unsettled_cause_bits() & UnsettledUploadCause::Isolated503.bit() != 0
+    }
+
+    /// This pass ended the walk `before` was on: none remains, or another
+    /// replaced it.
+    pub(crate) fn walk_retired_since(&self, before: &ScanIndex) -> bool {
+        self.traversal.as_ref().is_none_or(|new| {
+            before.traversal.as_ref().is_some_and(|old| {
+                (&old.context_fingerprint, &old.census_window_end)
+                    != (&new.context_fingerprint, &new.census_window_end)
+            })
+        })
     }
 
     /// The flag is authoritative: no cause without it, and

@@ -96,7 +96,7 @@ pub(crate) use sources::claude::cross_root_evidence as claude_cross_root_evidenc
 #[cfg(test)]
 pub(crate) use upload::tests::cache_overcap as cache_overcap_tests;
 
-mod upload_context_receipt;
+pub(crate) mod upload_context_receipt;
 pub(crate) use upload_context_receipt::Candidate as UploadContextReceiptCandidate;
 pub(crate) use upload_context_receipt::ContextInputs as UploadContextInputs;
 #[cfg(test)]

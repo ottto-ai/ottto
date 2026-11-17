@@ -288,7 +288,8 @@ fn never_retried_in_place() {
         driven.result.unwrap(),
         ResumableUploadResult::Deferred {
             count: 1,
-            isolated: 1
+            isolated: 1,
+            identity_503: 0
         }
     );
     assert_eq!(driven.posts.len(), 1);

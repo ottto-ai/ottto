@@ -97,6 +97,64 @@ pub(in crate::snapshots) enum TraversalProgress {
     Resumed,
 }
 
+pub(in crate::snapshots) fn terminal_unhealthy_retry_due(
+    source: SnapshotSource,
+    index: &ScanIndex,
+    traversal: &ScanTraversalCheckpoint,
+    collected_at: &str,
+) -> (bool, bool) {
+    // Pending re-reads do not hold the bounded retry. Every remaining
+    // read/discovery error keeps its existing clock retry.
+    let family_retry_due = rfc3339_unix_seconds(collected_at).is_some_and(|now| {
+        source == SnapshotSource::ClaudeCode
+            && index
+                .claude_usage_authority_quarantine
+                .iter()
+                .any(|(root, record)| {
+                    record.disposition == ClaudeUsageAuthorityQuarantineDisposition::RetryPending
+                            && record.retry_after_unix_seconds <= now
+                            // A start already served all deadlines at or
+                            // before it, even if a held/deleted member
+                            // yielded no item and retained its old record.
+                            && rfc3339_unix_seconds(&traversal.census_window_end)
+                                .is_some_and(|started| record.retry_after_unix_seconds > started)
+                            && index.claude_usage_family_witnesses.get(root).is_some_and(|witness| {
+                                claude_usage_authority_preserves_pending(record, witness)
+                            })
+                })
+    });
+    let terminal_unhealthy = traversal.pending_directories.is_empty()
+        && !traversal
+            .pending_candidates
+            .iter()
+            .any(|candidate| candidate.census_member)
+        && traversal.has_errors();
+    // What clears the latch: a generation that completes drops the
+    // traversal, and a changed scan context takes the `else` branch below;
+    // both start the next traversal at attempt zero. What bounds it: the
+    // attempt saturates at `UNHEALTHY_SCAN_RETRY_MAX_ATTEMPTS`, the delay
+    // at `UNHEALTHY_SCAN_RETRY_MAX_SECONDS`, and a deadline that is past,
+    // absurdly far ahead, or missing altogether (an index persisted before
+    // the deadline existed) is due now. The retry depends on the clock
+    // alone, never on new input arriving.
+    let retry_due = match rfc3339_unix_seconds(collected_at) {
+        Some(now) => {
+            traversal
+                .unhealthy_retry_not_before_unix_seconds
+                .map_or(true, |deadline| {
+                    now >= deadline
+                        || deadline > now.saturating_add(UNHEALTHY_SCAN_RETRY_MAX_SECONDS)
+                })
+                || family_retry_due
+        }
+        // A malformed or backwards observation clock must not turn the
+        // durable red witness into a permanent fence. Retrying remains
+        // bounded by the per-tick traversal limits.
+        None => true,
+    };
+    (terminal_unhealthy, retry_due)
+}
+
 pub(in crate::snapshots) fn ensure_bounded_traversal(
     source: SnapshotSource,
     roots: &[PathBuf],
@@ -131,52 +189,8 @@ pub(in crate::snapshots) fn ensure_bounded_traversal(
         .as_ref()
         .filter(|traversal| traversal.context_fingerprint == context_fingerprint)
     {
-        // Pending re-reads do not hold the bounded retry. Every remaining
-        // read/discovery error keeps its existing clock retry.
-        let family_retry_due = rfc3339_unix_seconds(collected_at).is_some_and(|now| {
-            source == SnapshotSource::ClaudeCode
-                        && index.claude_usage_authority_quarantine.iter().any(|(root, record)| {
-                            record.disposition == ClaudeUsageAuthorityQuarantineDisposition::RetryPending
-                                && record.retry_after_unix_seconds <= now
-                                // A start already served all deadlines at or
-                                // before it, even if a held/deleted member
-                                // yielded no item and retained its old record.
-                                && rfc3339_unix_seconds(&traversal.census_window_end)
-                                    .is_some_and(|started| record.retry_after_unix_seconds > started)
-                                && index.claude_usage_family_witnesses.get(root).is_some_and(|witness| {
-                                    claude_usage_authority_preserves_pending(record, witness)
-                                })
-                        })
-        });
-        let terminal_unhealthy = traversal.pending_directories.is_empty()
-            && !traversal
-                .pending_candidates
-                .iter()
-                .any(|candidate| candidate.census_member)
-            && traversal.has_errors();
-        // What clears the latch: a generation that completes drops the
-        // traversal, and a changed scan context takes the `else` branch below;
-        // both start the next traversal at attempt zero. What bounds it: the
-        // attempt saturates at `UNHEALTHY_SCAN_RETRY_MAX_ATTEMPTS`, the delay
-        // at `UNHEALTHY_SCAN_RETRY_MAX_SECONDS`, and a deadline that is past,
-        // absurdly far ahead, or missing altogether (an index persisted before
-        // the deadline existed) is due now. The retry depends on the clock
-        // alone, never on new input arriving.
-        let retry_due = match rfc3339_unix_seconds(collected_at) {
-            Some(now) => {
-                traversal
-                    .unhealthy_retry_not_before_unix_seconds
-                    .map_or(true, |deadline| {
-                        now >= deadline
-                            || deadline > now.saturating_add(UNHEALTHY_SCAN_RETRY_MAX_SECONDS)
-                    })
-                    || family_retry_due
-            }
-            // A malformed or backwards observation clock must not turn the
-            // durable red witness into a permanent fence. Retrying remains
-            // bounded by the per-tick traversal limits.
-            None => true,
-        };
+        let (terminal_unhealthy, retry_due) =
+            terminal_unhealthy_retry_due(source, index, traversal, collected_at);
         (terminal_unhealthy && retry_due).then(|| {
             traversal
                 .unhealthy_retry_attempt
@@ -207,8 +221,11 @@ pub(in crate::snapshots) fn ensure_bounded_traversal(
     // cycle starts one clean follow-up walk. Reaching this point means that
     // follow-up (or another explicit fresh generation) is now starting. Any
     // new partial settlement stamps the marker again before persistence.
-    index.bounded_sweep_had_unsettled_upload = false;
-    index.bounded_sweep_unsettled_causes = 0;
+    // Owed identity-503 custody still holds the new walk; its upload
+    // ledger clears that cause.
+    index.bounded_sweep_unsettled_causes =
+        index.unsettled_cause_bits() & UnsettledUploadCause::Isolated503.bit();
+    index.bounded_sweep_had_unsettled_upload = index.bounded_sweep_unsettled_causes != 0;
 
     let mut census = ScanCensus::default();
     let resolved_roots = roots

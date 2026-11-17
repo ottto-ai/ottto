@@ -143,7 +143,9 @@ pub(super) fn bootstrap_cache_heads_with_budget(
                 // body quarantine. Carry that hold into the normal upload rather
                 // than discarding every unrelated file's progress. An isolated
                 // refusal is held alone and does not defer the pass.
-                ResumableUploadResult::Deferred { count, isolated } => {
+                ResumableUploadResult::Deferred {
+                    count, isolated, ..
+                } => {
                     deferred = deferred.saturating_add(count.saturating_sub(isolated));
                 }
                 outcome => {
@@ -253,25 +255,24 @@ pub(super) fn apply_bootstrapped_cache_heads(
 }
 
 pub(super) fn with_bootstrap_deferred(
-    result: ResumableUploadResult,
+    mut result: ResumableUploadResult,
     deferred: usize,
 ) -> ResumableUploadResult {
     if deferred == 0 {
         return result;
     }
-    match result {
+    match &mut result {
         ResumableUploadResult::Completed | ResumableUploadResult::Rejected { .. } => {
-            ResumableUploadResult::Deferred {
+            result = ResumableUploadResult::Deferred {
                 count: deferred,
                 isolated: 0,
-            }
+                identity_503: 0,
+            };
         }
-        ResumableUploadResult::Deferred { count, isolated } => ResumableUploadResult::Deferred {
-            count: count.saturating_add(deferred),
-            isolated,
-        },
-        other => other,
+        ResumableUploadResult::Deferred { count, .. } => *count = count.saturating_add(deferred),
+        _ => {}
     }
+    result
 }
 
 /// Carry a newer refused-body conflict even when the frozen upload delta is
@@ -676,10 +677,12 @@ pub(super) enum ResumableUploadResult {
     /// held for bounded retry and paced context offers wait for a later pass.
     /// `isolated` (included in `count`) are validated ordinary retryable
     /// entity refusals, each held alone; when they are all of `count`, the
-    /// pass finishes with them still owed.
+    /// pass finishes with them still owed. `identity_503` (also included in
+    /// `isolated`) are identity-unavailable 503 deferrals.
     Deferred {
         count: usize,
         isolated: usize,
+        identity_503: usize,
     },
     Disabled(Option<String>),
     /// The backend shed a page. Every earlier page is accepted and
@@ -1209,6 +1212,15 @@ where
             if settled.contains(item_fingerprint) {
                 let witness = body_witness(item);
                 progress.record_body(item_fingerprint, &witness);
+                // A main-upload ACK of the session's current body pays its
+                // identity-503 debt, in this same checkpoint.
+                if let (Some(_), Some(pending), Some(session)) = (
+                    &progress.identity_503_pass,
+                    progress.identity_503_pending.as_mut(),
+                    session_id(item),
+                ) {
+                    pending.remove(&cache_session_key(session));
+                }
 
                 if let Some(context) = &progress.context_resend.active {
                     progress
@@ -1739,6 +1751,7 @@ where
     let mut adaptive_attempts = 0usize;
     let mut conflicted_entities = 0usize;
     let mut isolated_entities = 0usize;
+    let mut identity_503_entities = 0usize;
 
     while let Some((indices, adaptive)) = batches.pop_front() {
         // A duplicate fingerprint may occur in the live scan and historical
@@ -1837,6 +1850,9 @@ where
                 // refs that echoed another body witness. Hold them; their
                 // siblings settle only from their own exact ACK, re-sent in
                 // this pass, and later batches continue.
+                let identity_503 = error.downcast_ref::<UploadShed>().is_some_and(|shed| {
+                    shed.is_original_identity_unavailable() && shed.status == 503
+                });
                 let (status, reason, identity_retry_at) = match (
                     error.downcast_ref::<UploadShed>().copied(),
                     error.downcast_ref::<BatchRejected>(),
@@ -1868,6 +1884,20 @@ where
                             "fingerprint_hash8": SessionHash::of(item_fingerprint).to_string(),
                             "body_witness_hash8": body_witness(&items[*index]).get(..8).filter(|v| v.bytes().all(|b| b.is_ascii_hexdigit()))}),
                     );
+                    // Main upload only: the session owes a later ACK before
+                    // its walk can settle; saved with the quarantine below.
+                    if let (true, Some(pass), Some(session)) = (
+                        identity_503,
+                        progress.identity_503_pass.as_mut(),
+                        session_id(&items[*index]),
+                    ) {
+                        let key = cache_session_key(session);
+                        pass.insert(key.clone());
+                        progress
+                            .identity_503_pending
+                            .get_or_insert_with(BTreeSet::new)
+                            .insert(key);
+                    }
                 }
                 if persist(progress).is_err() {
                     *progress = before;
@@ -1882,6 +1912,9 @@ where
                 conflicted_entities = conflicted_entities.saturating_add(held.len());
                 if identity_retry_at.is_some() && status == Some(503) {
                     isolated_entities = isolated_entities.saturating_add(held.len());
+                }
+                if identity_503 {
+                    identity_503_entities = identity_503_entities.saturating_add(held.len());
                 }
                 crate::local_resource_diagnostics::traversal_point(
                     "quarantine_retry",
@@ -2004,6 +2037,7 @@ where
         Ok(ResumableUploadResult::Deferred {
             count: conflicted_entities,
             isolated: isolated_entities,
+            identity_503: identity_503_entities,
         })
     } else if permanent_rejected > 0 {
         Ok(ResumableUploadResult::Rejected {

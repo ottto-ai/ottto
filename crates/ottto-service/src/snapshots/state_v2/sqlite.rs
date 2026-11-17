@@ -34,6 +34,21 @@ fn sample_pager_writes(conn: &Connection, counter: Event) {
     if rc == rusqlite::ffi::SQLITE_OK && pages >= 0 {
         add(counter, (pages as u64).saturating_mul(4096));
     }
+    let mut bytes = 0;
+    // Reset CACHE_WRITE first: TEMPBUF_SPILL shares the TEMP pager count.
+    // SAFETY: the connection owns this live handle, as above.
+    let rc = unsafe {
+        rusqlite::ffi::sqlite3_db_status64(
+            conn.handle(),
+            rusqlite::ffi::SQLITE_DBSTATUS_TEMPBUF_SPILL,
+            &mut bytes,
+            &mut high,
+            1,
+        )
+    };
+    if rc == rusqlite::ffi::SQLITE_OK && bytes > 0 {
+        add(Event::SqliteTempbufSpillBytes, bytes as u64);
+    }
 }
 
 // Default SQLite mmap ceiling: an optimisation ceiling, not a data limit.
@@ -1003,6 +1018,9 @@ impl Sqlite {
             }
             Err(_) => (CheckpointState::Failed, None, None),
         };
+        if let Some(done) = done {
+            add(Event::SqliteCheckpointReportedPages, done);
+        }
         if mode == CheckpointMode::Purge && state != CheckpointState::Complete {
             self.erasure_failed(if state == CheckpointState::Busy {
                 "busy"
