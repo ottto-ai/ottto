@@ -705,34 +705,67 @@ fn positive_placement_matches_one_home() {
             let twin_root = twin_rest.snapshots.remove(ROOT).unwrap();
             money_oracle::assert_placement_equivalent(&one_rest, &twin_rest);
             let login = serde_json::json!("1".repeat(64));
-            for row in [
-                &one_root["model_usage"][1],
-                &one_root["usage_buckets"][1]["model_usage"][0],
+            for (name, root, expected_login) in [
+                ("one home carries", &one_root, Some(&login)),
+                ("twin gap Unknown", &twin_root, None),
             ] {
-                assert_eq!(row["account_identifier_hash"], login, "one home carries");
-            }
-            for row in [
-                &twin_root["model_usage"][1],
-                &twin_root["usage_buckets"][1]["model_usage"][0],
-            ] {
-                assert!(
-                    row.get("account_identifier_hash").is_none(),
-                    "twin gap Unknown"
-                );
-            }
-            let sources = |root: &serde_json::Value| {
-                root["request_evidence"]
+                let bucket_rows = root["usage_buckets"]
                     .as_array()
                     .unwrap()
                     .iter()
-                    .map(|entry| entry.get("account_source").cloned())
-                    .collect::<Vec<_>>()
+                    .flat_map(|bucket| bucket["model_usage"].as_array().unwrap())
+                    .collect::<Vec<_>>();
+                // The resume request has 11 input tokens. Identify its sole
+                // row in each view independently of model/bucket ordering.
+                for (view, rows) in [
+                    (
+                        "model_usage",
+                        root["model_usage"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .collect::<Vec<_>>(),
+                    ),
+                    ("usage_buckets", bucket_rows),
+                ] {
+                    let resume = rows
+                        .into_iter()
+                        .filter(|row| row["input_tokens"] == 11)
+                        .collect::<Vec<_>>();
+                    assert_eq!(resume.len(), 1, "{name}/{view}, reverse={reverse}");
+                    assert_eq!(
+                        resume[0].get("account_identifier_hash"),
+                        expected_login,
+                        "{name}/{view}, reverse={reverse}"
+                    );
+                }
+            }
+            let sources = |root: &serde_json::Value| {
+                let mut sources = root["request_evidence"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|entry| {
+                        entry
+                            .get("account_source")
+                            .map(|source| source.as_str().unwrap().to_owned())
+                    })
+                    .collect::<Vec<_>>();
+                // Compare the exact multiset, retaining absent sources and
+                // duplicates, without depending on evidence table indexes.
+                sources.sort();
+                sources
             };
             assert_eq!(
                 sources(&one_root),
-                [Some(serde_json::json!("carried_forward")), None]
+                [None, Some("carried_forward".to_owned())],
+                "one home evidence, reverse={reverse}"
             );
-            assert_eq!(sources(&twin_root), [None]);
+            assert_eq!(
+                sources(&twin_root),
+                [None],
+                "twin evidence, reverse={reverse}"
+            );
             for (id, expected) in &single.snapshots {
                 let got = &actual.snapshots[id];
                 for field in [
