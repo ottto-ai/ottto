@@ -985,7 +985,6 @@ crate::heap_layout_bound::fields!(SnapshotQuarantineRecord; reconstruction_contr
 crate::heap_layout_bound::fields!(SnapshotQuarantineWitness; contract, collector_version, parser_version, scan_identity_version, snapshot_schema_version, entity_ack_contract, item_wire_byte_limit);
 
 impl ScanIndex {
-    // Finalization and capture have already run before this saved-index query.
     pub(crate) fn runnable_walk_or_followup(
         &self,
         scan: &SourceScanResult,
@@ -1001,7 +1000,9 @@ impl ScanIndex {
         let eligible = |key: &str| {
             let blocked = |fp: &String| held.contains(fp) || quarantined.contains_key(fp);
             !self.decode_holds_file(key)
-                && !membership.get(key).is_some_and(|fps| fps.iter().any(blocked))
+                && membership
+                    .get(key)
+                    .is_none_or(|fps| !fps.iter().any(blocked))
         };
         if let Some(t) = &self.traversal {
             let (terminal, due) = terminal_unhealthy_retry_due(scan.source, self, t, collected_at);
