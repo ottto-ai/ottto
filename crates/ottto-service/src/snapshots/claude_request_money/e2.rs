@@ -2282,6 +2282,9 @@ impl CopyOwnership {
             (old_carried.contains(member.root) && !live.carried.contains(member.root))
                 .then_some(location)
         }));
+        let mut carrier_lost = marks[invalidated.len()..].to_vec();
+        // A carrier transfer leaves dependents settled if the main still owns its group.
+        carrier_lost.retain(|h| !index_group_owned(next, &live, live[h]));
         let keys = before
             .keys()
             .map(String::as_str)
@@ -2385,7 +2388,6 @@ impl CopyOwnership {
                     .iter()
                     .copied()
                     .filter(|hash| changed.get(hash).is_some_and(|before| order > *before))
-                    .filter(|&hash| !saved_removal_applies(next, &live, key, hash))
                     .collect::<Vec<_>>();
                 if !hits.is_empty() {
                     candidates.insert(order.1, hits);
@@ -2463,6 +2465,8 @@ impl CopyOwnership {
                     let removed = groups
                         .iter()
                         .any(|(_, hashes)| hashes.binary_search(&hash).is_ok());
+                    let keep = saved_removal_applies(next, &live, key, hash)
+                        && !groups.iter().any(|(h, _)| carrier_lost.contains(h));
                     // Skip a family duplicate already removed inside this accepted sum.
                     let covered = holders
                         .get(&hash)
@@ -2490,8 +2494,9 @@ impl CopyOwnership {
                                     *loc == holder.1 && h.binary_search(&hash).is_ok()
                                 })
                         });
-                    // Replace an invalid saved holder even if another proves the removal.
-                    removed || (copy && covered)
+                    // An invalid old holder must be replaced in the saved
+                    // groups even if another holder proves the same removal.
+                    (removed && !keep) || (!removed && copy && covered)
                 }) {
                     marks.push(location);
                 }
