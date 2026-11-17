@@ -2188,10 +2188,12 @@ fn content_carrier_reconcile_under_open_v2_save_does_not_deadlock() {
     worker.join().unwrap();
 }
 
-/// [regress] An unsampled carrier keeps exact accepted counted rows and
-/// their settled copy ownership while saves publish through native custody.
+/// [regress] Its saves retain exact accepted counted rows, grant no new
+/// head-backed authority and never relock a v2 session. Every save is native
+/// now, so the JSON-era unrouted checks are the only ones this case no longer
+/// makes.
 #[test]
-fn unsampled_content_carrier_keeps_accepted_copy_removals_settled() {
+fn unsampled_content_carrier_keeps_accepted_rows_and_removals() {
     with_e2(|| {
         let (c, mut index, _) = settled_content_carrier(false);
         assert!(!index.upload_context_proof.request_contributions.is_empty());

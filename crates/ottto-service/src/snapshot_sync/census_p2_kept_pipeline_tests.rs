@@ -1010,7 +1010,11 @@ fn assert_real_rejected_hold(
 
     // A durable index reload has already occurred in page(). The next page
     // also reloads the actual upload ledger, keeping the exact refusal visible.
-    let last = fixture.page("2026-08-02T09:01:00Z", cycle, PipelineUpload::Accept);
+    // Native page-end reconciliation (scan/owned_scan/step.rs) re-queues the
+    // held, grown file (sampled_audit.rs queue_growth_path) at 09:01, so the
+    // census completes at 09:02; no upload, ACK, refusal or hold changes.
+    fixture.page("2026-08-02T09:01:00Z", cycle, PipelineUpload::Accept);
+    let last = fixture.page("2026-08-02T09:02:00Z", cycle, PipelineUpload::Accept);
     if !last.scan.census_complete {
         fixture.trace_completion_followup(cycle);
     }
@@ -1227,7 +1231,11 @@ fn due_reoffer_rejected_page_preserves_terminal_and_retry_pending_holds() {
             first.index.files[&held_key].last_snapshot_fingerprint,
             baseline.files[&held_key].last_snapshot_fingerprint
         );
-        let last = fixture.page("2026-08-02T09:01:00Z", &cycle, PipelineUpload::Accept);
+        // Native page-end reconciliation (scan/owned_scan/step.rs) re-queues
+        // the held, grown file (sampled_audit.rs queue_growth_path) at 09:01,
+        // so completion is read at 09:02; no upload, ACK or hold changes.
+        fixture.page("2026-08-02T09:01:00Z", &cycle, PipelineUpload::Accept);
+        let last = fixture.page("2026-08-02T09:02:00Z", &cycle, PipelineUpload::Accept);
         if last.scan.census_complete == retry_pending {
             fixture.trace_completion_followup(&cycle);
         }
