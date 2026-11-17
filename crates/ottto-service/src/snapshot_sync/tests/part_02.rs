@@ -537,9 +537,19 @@ fn account_ack_retry_checkpoints_released_witness_then_becomes_noop() {
 fn replay_generation_reuploads_prior_acks_once_and_resumes_its_own_progress() {
     let poison_scope = &unique_poison_scope();
     let root = test_dir("snapshot-replay-generation-progress");
-    let path = root.join("codex-scan-index-v3-upload-progress.json");
     let items = test_fingerprints(2);
     let destination = format!("{:064x}", 99);
+    // The old ledger bytes sit beside an empty committed native graph.
+    std::fs::create_dir_all(&root).expect("create progress fixture directory");
+    let mut route = ScanIndex::default();
+    let index_path = crate::snapshots::e2_pipeline_scan_fixture::bind_fixture_route(
+        SnapshotSource::Codex,
+        &mut route,
+        &root,
+        &destination,
+    );
+    route.save_fixture(&index_path).unwrap();
+    let path = snapshot_upload_progress_path(&index_path);
     let old_generation = format!("codex:codex_session_exclusive_usage:v2:{destination}");
     let new_generation = format!("codex:codex_session_exclusive_usage:v3:{destination}");
 
@@ -561,19 +571,19 @@ fn replay_generation_reuploads_prior_acks_once_and_resumes_its_own_progress() {
         .as_object_mut()
         .expect("progress is an object")
         .remove("historical_replay_generation");
-    std::fs::create_dir_all(&root).expect("create progress fixture directory");
     std::fs::write(
         &path,
         serde_json::to_vec_pretty(&current_v3).expect("serialize pre-change v3 progress"),
     )
     .expect("save pre-change v3 progress");
 
-    let mut rearmed = SnapshotUploadProgress::load(
-        &path,
+    // The route's first load imports the old bytes as its native rows.
+    let mut rearmed = load_routed_progress(
+        &route,
+        &index_path,
         &destination,
         snapshot_quarantine_witness(SnapshotSource::Codex),
-    )
-    .expect("load pre-change v3 progress");
+    );
     assert!(rearmed.historical_replay_generation.is_none());
     assert!(prepare_upload_progress_for_cycle(
         &mut rearmed,
@@ -606,12 +616,12 @@ fn replay_generation_reuploads_prior_acks_once_and_resumes_its_own_progress() {
     assert_eq!(result, ResumableUploadResult::Completed);
     assert_eq!((upload_calls, accepted), (1, 2));
 
-    let mut resumed = SnapshotUploadProgress::load(
-        &path,
+    let mut resumed = load_routed_progress(
+        &route,
+        &index_path,
         &destination,
         snapshot_quarantine_witness(SnapshotSource::Codex),
-    )
-    .expect("reload new replay progress");
+    );
     assert!(!resumed.prepare_historical_replay(&new_generation));
     let mut resumed_accepted = 0;
     let mut resumed_upload_calls = 0;

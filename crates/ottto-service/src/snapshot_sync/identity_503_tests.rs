@@ -302,9 +302,18 @@ fn identity_503_deferral_then_ack_keeps_cold_money_and_placement() {
     }
     let cold = money_oracle::placement_tests::placement_fixture();
     let scratch = crate::test_scratch::ScratchDir::new("identity-503-oracle");
-    let path = scratch.join("progress.json");
     let namespace = format!("{:064x}", 99);
     let witness = || snapshot_quarantine_witness(SnapshotSource::ClaudeCode);
+    // The progress lives on this install's native route.
+    let mut owner = ScanIndex::default();
+    let index_path = crate::snapshots::e2_pipeline_scan_fixture::bind_fixture_route(
+        SnapshotSource::ClaudeCode,
+        &mut owner,
+        &scratch,
+        &namespace,
+    );
+    owner.save_fixture(&index_path).unwrap();
+    let path = snapshot_upload_progress_path(&index_path);
     let mut items = cold.snapshots.values().cloned().collect::<Vec<_>>();
     for (n, item) in items.iter_mut().enumerate() {
         item["snapshot_fingerprint"] = format!("{:064x}", n + 1).into();
@@ -398,7 +407,13 @@ fn identity_503_deferral_then_ack_keeps_cold_money_and_placement() {
     let mut progress = SnapshotUploadProgress::new(namespace.clone(), witness());
     progress.accepted_identity_buckets =
         crate::snapshots::claude_request_identity::AcceptedBuckets::for_test();
+    let (routed, mut progress) =
+        crate::snapshot_sync::tests::routed_progress(&owner, &index_path, progress);
+    assert_eq!(routed, path);
+    // Stored identity rows are read before each placement comparison.
+    let entities = || cold.snapshots.keys().map(String::as_str);
     let (_, _) = send(&mut progress, std::slice::from_ref(&prior_main), None);
+    progress.load_identity(entities()).unwrap();
     let prior = route(Mode::Ram, &[], &[&prior_main], &progress);
     let (result, emitted) = send(
         &mut progress,
@@ -415,10 +430,16 @@ fn identity_503_deferral_then_ack_keeps_cold_money_and_placement() {
     ));
     let owed = Some(BTreeSet::from([cache_session_key("main")]));
     assert_eq!(progress.identity_503_pending, owed);
+    progress.load_identity(entities()).unwrap();
     let held = route(Mode::Ram, &emitted, &[&prior_main], &progress);
     money_oracle::assert_held("main", &prior, &held, &cold);
     let reload = || {
-        let mut restored = SnapshotUploadProgress::load(&path, &namespace, witness()).unwrap();
+        let mut restored = crate::snapshot_sync::tests::load_routed_progress(
+            &owner,
+            &index_path,
+            &namespace,
+            witness(),
+        );
         restored
             .accepted_identity_buckets
             .bind_test_key(Some([0x42; 32]));
@@ -432,6 +453,7 @@ fn identity_503_deferral_then_ack_keeps_cold_money_and_placement() {
     let (_, resent) = send(&mut restored, &items, None);
     assert_eq!(resent.len(), 1, "only the grown main body is sent");
     assert_eq!(reload().identity_503_pending, Some(BTreeSet::new()));
+    restored.load_identity(entities()).unwrap();
     let drained = route(
         Mode::Restart,
         &[emitted, resent].concat(),
@@ -442,6 +464,7 @@ fn identity_503_deferral_then_ack_keeps_cold_money_and_placement() {
     money_oracle::assert_no_smaller_reemit("main", &prior, &drained, &cold, false);
     let mut quiet_progress = reload();
     let (_, quiet_emitted) = send(&mut quiet_progress, &items, None);
+    quiet_progress.load_identity(entities()).unwrap();
     let mut quiet = route(Mode::Restart, &quiet_emitted, &[], &quiet_progress);
     quiet.batches = quiet_emitted
         .iter()

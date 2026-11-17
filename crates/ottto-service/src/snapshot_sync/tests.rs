@@ -36,6 +36,64 @@ fn route_fixture_progress(
     progress
 }
 
+/// `progress` as the first ledger of the empty native route that `index`, a
+/// committed fixture graph at `index_path`, owns: on the canonical sibling
+/// path, with the destination and source the route's binding names.
+pub(super) fn routed_progress(
+    index: &ScanIndex,
+    index_path: &Path,
+    progress: SnapshotUploadProgress,
+) -> (PathBuf, SnapshotUploadProgress) {
+    let (source, namespace) =
+        crate::snapshots::e2_pipeline_scan_fixture::binding_for_test(index_path);
+    let active = progress.active_quarantine_witness.clone().unwrap();
+    let bound = snapshot_quarantine_witness(source);
+    assert_eq!(
+        progress.destination_namespace_hash, namespace,
+        "ledger destination"
+    );
+    assert_eq!(
+        (&active.parser_version, &active.scan_identity_version),
+        (&bound.parser_version, &bound.scan_identity_version),
+        "ledger source"
+    );
+    let path = snapshot_upload_progress_path(index_path);
+    let empty =
+        SnapshotUploadProgress::load_for_index(index, index_path, &path, &namespace, active)
+            .expect("native fixture progress owner");
+    assert!(empty.rows.is_some(), "native fixture progress");
+    assert!(
+        empty.accepted_fingerprints.is_empty()
+            && empty.quarantined_fingerprints.is_empty()
+            && empty.permanent_rejections.is_empty()
+            && empty.accepted_cache_heads.is_empty()
+            && empty.pending_cache_heads.is_empty(),
+        "a fixture ledger seeds only an empty route"
+    );
+    let progress = route_fixture_progress(index, index_path, &path, progress);
+    (path, progress)
+}
+
+/// The route's committed upload progress, as the next pass loads it for its
+/// loaded `index`.
+pub(super) fn load_routed_progress(
+    index: &ScanIndex,
+    index_path: &Path,
+    namespace: &str,
+    witness: SnapshotQuarantineWitness,
+) -> SnapshotUploadProgress {
+    let progress = SnapshotUploadProgress::load_for_index(
+        index,
+        index_path,
+        &snapshot_upload_progress_path(index_path),
+        namespace,
+        witness,
+    )
+    .unwrap();
+    assert!(progress.rows.is_some(), "native fixture progress");
+    progress
+}
+
 fn clear_fixture_progress(progress: &mut SnapshotUploadProgress, path: &Path) -> Result<()> {
     let mut empty = SnapshotUploadProgress::new(
         progress.destination_namespace_hash.clone(),
