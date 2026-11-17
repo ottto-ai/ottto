@@ -1031,7 +1031,6 @@ impl ScanIndex {
             && (fresh_offer
                 || (quarantined.is_empty() && self.files.keys().any(|key| eligible(key))))
     }
-
     /// Census members still queued at page end, exactly what
     /// `skipped_file_count_due_to_limit` counts. Cap refusals are not in it,
     /// and it is not `scan_cap_hit`. No stat or read.

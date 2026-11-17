@@ -168,6 +168,7 @@ pub(super) fn resident_scan_request_after_settlement(
     (existing || (bootstrap && power == PlatformState::Allowed && runnable))
         .then_some(bootstrap && existing)
 }
+#[cfg(test)]
 pub(super) fn request_resident_scan(source: SnapshotSource, first_import: bool) {
     request_resident_scan_on_power(source, first_import, MacPlatformSignals::default().power());
 }
