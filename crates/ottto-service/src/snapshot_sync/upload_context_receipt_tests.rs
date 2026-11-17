@@ -195,6 +195,7 @@ pub(crate) fn partial_context_checkpoint(
         serde_json::from_slice(&std::fs::read(&progress_path).unwrap()).unwrap();
     assert!(restored.context_receipt_candidates.is_empty());
     assert!(restored.fresh_context_body_acks.is_empty());
+    crate::snapshots::e2_pipeline_scan_fixture::bind_source_for_test(&index_path, source);
     let previous =
         crate::snapshots::e2_pipeline_scan_fixture::seed_index_for_test(previous, &index_path);
     let mut index = index.clone();
