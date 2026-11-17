@@ -87,29 +87,61 @@ impl LegacyFixture {
             .unwrap()
             .save_reload(&mut self.route.index);
     }
-    fn seed_copy(&mut self) -> PathBuf {
-        let path = self
+    fn accepted_group() -> Self {
+        let route = route_for(Source::Codex);
+        let (old, lines) = historical();
+        let path = route.dir.join(format!(
+            "rollout-2026-10-18T10-00-00-{}.jsonl",
+            old.source_session_id.as_ref().unwrap()
+        ));
+        fs::write(&path, lines.join("\n") + "\n").unwrap();
+        let key = local_index_key(&path);
+        let mut f = Self { route, path, key };
+        let path = f
             .route
             .dir
             .join(format!("rollout-2026-10-18T10-00-01-{SESSION}.jsonl"));
-        fs::copy(&self.path, &path).unwrap();
-        let (pending, native) = complete::<Codex>(&self.route, &path, None, |_| {});
-        assert!(pending.publish(&native));
-        let mut entry = self.route.index.files[&self.key].clone();
-        let stat = fs::metadata(&path).unwrap();
-        entry.size_bytes = stat.len();
-        entry.modified_unix_seconds = unix_seconds(stat.modified().unwrap()).unwrap();
-        entry.modified_unix_nanos = unix_nanos(stat.modified().unwrap());
-        self.route.index.files.insert(local_index_key(&path), entry);
-        self.route.save(false);
-        historical_codex::seed(
-            &mut self.route.index,
-            &path,
-            &self.route.dir,
-            Frozen::Legacy,
-        );
-        self.route.save(false);
-        path
+        fs::copy(&f.path, &path).unwrap();
+        let (scan, _) = f.page(&E2ScanFixture::default());
+        assert!(!scan.snapshots.is_empty());
+        f.accept(&scan);
+        // Production group commits write accepted index facts, not member
+        // reductions. Rebind the genuine historical body to that same shape.
+        for member in [&f.path, &path] {
+            let key = local_index_key(member);
+            assert!(
+                state_v2::load_head(&f.route.index, &key, Codex::REDUCTION_REVISION)
+                    .unwrap()
+                    .is_none()
+            );
+            let entry = &f.route.index.files[&key];
+            let items = historical().0.into_items(
+                member,
+                "2026-10-27T08:00:00Z",
+                entry.source_file_fingerprint.clone(),
+                None,
+            );
+            assert_eq!(items.len(), 1);
+            let fingerprints = items
+                .iter()
+                .map(|item| snapshot_fingerprint(SnapshotSource::Codex, item))
+                .collect::<BTreeSet<_>>();
+            let entry = f.route.index.files.get_mut(&key).unwrap();
+            entry.codex_counting_v2 = false;
+            entry.last_snapshot_fingerprint =
+                Some(snapshot_file_entity_set_hex(fingerprints.clone()));
+            entry.last_upload_body_witness = Some(snapshot_upload_body_witness(&items[0]));
+            f.route
+                .index
+                .file_snapshot_fingerprints
+                .insert(key, fingerprints.clone());
+            f.route
+                .index
+                .record_accepted_snapshot_fingerprints(&fingerprints);
+        }
+        f.route.save(false);
+        f.restore();
+        f
     }
     fn continuation(&self) {
         let (_, lines) = historical_codex::read(Frozen::StickyLegacy);
@@ -243,9 +275,7 @@ fn codex_legacy_unchanged_upgrade_restart() {
             before.last_snapshot_fingerprint
         );
     }
-    let mut joined = LegacyFixture::new();
-    joined.seed_copy();
-    joined.restore();
+    let mut joined = LegacyFixture::accepted_group();
     let ((scan, modes), io) =
         oracle::observe_codex_quiet(|| joined.page(&E2ScanFixture::default()));
     let mut observed = oracle::scan_money(SnapshotSource::Codex, &joined.route.index, &scan);
@@ -253,72 +283,60 @@ fn codex_legacy_unchanged_upgrade_restart() {
     observed.modes = modes;
     observed.io = io;
     oracle::money_oracle::assert_quiet_restart_zero_bytes(&observed);
+    assert_eq!(scan.ownership_incomplete_file_count, 0);
+    assert!(scan.census_complete);
 
-    for grouped in [false, true] {
-        for damage in ["missing", "corrupt"] {
-            let mut f = LegacyFixture::new();
-            let copy = grouped.then(|| f.seed_copy());
-            if damage == "missing" {
-                state_v2::erase_tail(&f.route.path, &mut f.route.index, [f.key.clone()]).unwrap();
-            } else {
-                let mut old = head::<Codex>(&f.route, &f.key);
-                old.body.pop();
-                state_v2::stage_tail(
-                    &f.route.path,
-                    &f.key,
-                    state_v2::StagedFile {
-                        revision: old.revision,
-                        head: old.body,
-                        ..Default::default()
-                    },
-                )
-                .unwrap();
-            }
-            f.route.save(false);
-            f.restore();
-            if let Some(copy) = copy {
-                use std::io::Write;
-                File::options()
-                    .append(true)
-                    .open(copy)
-                    .unwrap()
-                    .write_all(b"\n")
-                    .unwrap();
-            } else {
-                f.change("\n");
-            }
-            let before = f.route.index.files[&f.key].clone();
-            let activity = codex_zst_refusal_tests::activity();
-            let ((scan, modes), io) =
-                oracle::observe_codex_quiet(|| f.page(&E2ScanFixture::default()));
-            let mut observed = oracle::scan_money(SnapshotSource::Codex, &f.route.index, &scan);
-            observed.mode = oracle::Mode::Restart;
-            observed.modes = modes;
-            observed.io = io;
-            // The file changed and its reduction proof is damaged. A bounded
-            // owning-header lookup may run; no body parse or replacement may.
-            assert!(
-                scan.snapshots.is_empty(),
-                "damaged Legacy proof keeps the body held"
-            );
-            assert_eq!(observed.modes, (0, 0, 0));
-            assert_eq!(observed.io.consumed, 0);
-            let after = codex_zst_refusal_tests::activity();
-            assert_eq!(after.0, activity.0, "no decoder constructed");
-            assert!(
-                after.1 - activity.1 <= if grouped { 2 } else { 1 },
-                "at most one header lookup per member"
-            );
-            assert_eq!(
-                f.route.index.files[&f.key].last_snapshot_fingerprint,
-                before.last_snapshot_fingerprint
-            );
-            assert_eq!(
-                f.route.index.files[&f.key].last_upload_body_witness,
-                before.last_upload_body_witness
-            );
-            assert!(!f.route.index.files[&f.key].codex_counting_v2);
+    for damage in ["missing", "corrupt"] {
+        let mut f = LegacyFixture::new();
+        if damage == "missing" {
+            state_v2::erase_tail(&f.route.path, &mut f.route.index, [f.key.clone()]).unwrap();
+        } else {
+            let mut old = head::<Codex>(&f.route, &f.key);
+            old.body.pop();
+            state_v2::stage_tail(
+                &f.route.path,
+                &f.key,
+                state_v2::StagedFile {
+                    revision: old.revision,
+                    head: old.body,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         }
+        f.route.save(false);
+        f.restore();
+        f.change("\n");
+        let before = f.route.index.files[&f.key].clone();
+        let activity = codex_zst_refusal_tests::activity();
+        let ((scan, modes), io) = oracle::observe_codex_quiet(|| f.page(&E2ScanFixture::default()));
+        let mut observed = oracle::scan_money(SnapshotSource::Codex, &f.route.index, &scan);
+        observed.mode = oracle::Mode::Restart;
+        observed.modes = modes;
+        observed.io = io;
+        // The file changed and its reduction proof is damaged. A bounded
+        // owning-header lookup may run; no body parse or replacement may.
+        assert!(
+            scan.snapshots.is_empty(),
+            "damaged Legacy proof keeps the body held"
+        );
+        assert_eq!(observed.modes, (0, 0, 0));
+        assert_eq!(observed.io.consumed, 0);
+        let after = codex_zst_refusal_tests::activity();
+        assert_eq!(after.0, activity.0, "no decoder constructed");
+        assert!(
+            after.1 - activity.1 <= 1,
+            "at most one header lookup per member"
+        );
+        assert_eq!(
+            f.route.index.files[&f.key].last_snapshot_fingerprint,
+            before.last_snapshot_fingerprint
+        );
+        assert_eq!(
+            f.route.index.files[&f.key].last_upload_body_witness,
+            before.last_upload_body_witness
+        );
+        assert!(!f.route.index.files[&f.key].codex_counting_v2);
     }
 
     // A paused audit job must also stop if its file is again at the accepted
@@ -422,6 +440,56 @@ fn codex_legacy_growth_recounts_cold_v2() {
         &group.cold(),
         &oracle::scan_money(SnapshotSource::Codex, &group.route.index, &scan),
     );
+
+    for paged in [false, true] {
+        let mut group = LegacyFixture::accepted_group();
+        group.change(
+            &(codex_lines(40)
+                .into_iter()
+                .skip(codex_lines(1).len())
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n"),
+        );
+        let scanner = E2ScanFixture::default();
+        let before = counters::total("codex_legacy_recount", "baseline_unknown");
+        let mut pages = 0;
+        let mut run = || {
+            for _ in 0..1000 {
+                pages += 1;
+                let (scan, _) = group.page(&scanner);
+                if !scan.snapshots.is_empty() {
+                    let cold = sampled_scan::codex_cursor::with_test_limits(
+                        16 * 1024 * 1024,
+                        16 * 1024 * 1024,
+                        64,
+                        || group.cold(),
+                    );
+                    oracle::money_oracle::assert_equivalent(
+                        &cold,
+                        &oracle::scan_money(SnapshotSource::Codex, &group.route.index, &scan),
+                    );
+                    assert_eq!(scan.ownership_incomplete_file_count, 0);
+                    assert_eq!(
+                        counters::total("codex_legacy_recount", "baseline_unknown") - before,
+                        1
+                    );
+                    return;
+                }
+                assert!(
+                    scanner.cache.cursor_job_key().is_some(),
+                    "changed group stays resumable"
+                );
+            }
+            panic!("accepted Legacy group did not complete");
+        };
+        if paged {
+            sampled_scan::codex_cursor::with_test_limits(2048, 1024, 64, &mut run);
+            assert!(pages > 1, "group exercised cursor resume");
+        } else {
+            run();
+        }
+    }
 
     let mut paged = LegacyFixture::new();
     paged.change(
