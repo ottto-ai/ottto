@@ -4147,7 +4147,9 @@ pub(crate) fn accept_request_contributions_for_test(
     progress.fresh_context_body_acks = acks.clone();
     progress.request_contributions = items
         .iter()
-        .filter(|item| item.claude_money.is_some())
+        .filter(|item| {
+            crate::snapshots::claude_request_money::request_owned_family_root(item).is_some()
+        })
         .map(|item| {
             (
                 item.snapshot_fingerprint.clone(),
@@ -8519,7 +8521,9 @@ fn finish_sync_source(
         scan_result
             .snapshots
             .iter()
-            .filter(|item| item.claude_money.is_some())
+            .filter(|item| {
+                crate::snapshots::claude_request_money::request_owned_family_root(item).is_some()
+            })
             .map(|item| {
                 (
                     item.snapshot_fingerprint.clone(),

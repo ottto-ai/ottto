@@ -31,7 +31,9 @@ fn contributions(items: &[SnapshotItem], progress: &mut SnapshotUploadProgress) 
     progress.request_contributions.extend(
         items
             .iter()
-            .filter(|i| i.claude_money.is_some())
+            .filter(|i| {
+                crate::snapshots::claude_request_money::request_owned_family_root(i).is_some()
+            })
             .map(|i| (i.snapshot_fingerprint.clone(), SlotRows::capture(i))),
     );
 }
@@ -137,7 +139,13 @@ fn exact_revision_replaces_the_whole_session_slot() {
     with_e2(|| {
         let mut c = Corpus::new("accepted-row-revisions");
         let holder = c.root(ROOT, &resumed(ROOT, &[A]));
-        let first = seed(&c);
+        let (first, sent, _) = send(
+            &c,
+            &ScanIndex::default(),
+            parsed(&c, ScanIndex::default()),
+            None,
+        );
+        assert!(sent.iter().all(|item| item.claude_money.is_none()));
         assert!(has(&first, &holder, "a"));
         let old_fp = first
             .upload_context_proof
@@ -234,11 +242,13 @@ fn acknowledged_rows_survive_selected_entry_restoration() {
             contributions(&items, &mut progress);
             upload(&items, &mut progress, |batch| {
                 let mut response = ack(batch)?;
-                let pending = response
+                let Some(pending) = response
                     .accepted_entities
                     .iter()
                     .position(|e| e.source_session_id != ROOT)
-                    .unwrap();
+                else {
+                    return Ok(response);
+                };
                 let mut pending = response.accepted_entities.remove(pending);
                 response.accepted -= 1;
                 response.sessions_reconciled -= 1;

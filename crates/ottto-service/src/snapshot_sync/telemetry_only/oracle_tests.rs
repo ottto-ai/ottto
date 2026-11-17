@@ -390,9 +390,9 @@ fn pair_hold() {
     }
 }
 
-/// [format] Separate processes release the exclusive SQLite owner for old sources.
+/// [format] Old readers refuse the newer layout; a current reopen keeps custody.
 #[test]
-fn telemetry_only_previous_release_source_round_trip() {
+fn telemetry_only_previous_release_refuses_new_layout() {
     if std::env::var("GITHUB_ACTIONS").as_deref() != Ok("true")
         || std::env::var("RUNNER_OS").as_deref() != Ok("Linux")
     {

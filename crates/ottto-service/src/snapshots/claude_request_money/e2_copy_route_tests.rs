@@ -447,7 +447,13 @@ fn accepted_pre_cutoff_copy_keeps_its_decision() {
             crate::snapshots::e2_pipeline_scan_fixture::origin_accepted_for_test(&mut index, &key);
         }
         if saved {
-            // One request under a holder no longer indexed: that removal stands.
+            // One request under an accepted holder no longer indexed stays removed.
+            crate::snapshots::e2_pipeline_scan_fixture::accepted_origin_hashes_for_test(
+                &mut index,
+                "gone",
+                "gone",
+                &[claude_request_hash("copy-a")],
+            );
             index.claude_copy_removals.store(
                 location_key(&key),
                 BTreeMap::from([(

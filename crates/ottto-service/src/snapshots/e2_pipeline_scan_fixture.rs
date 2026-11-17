@@ -874,6 +874,41 @@ pub(crate) fn origin_accepted_for_test(index: &mut ScanIndex, key: &str) {
         });
 }
 
+/// Declare the counted hashes of a synthetic accepted body, independently of
+/// its census and receipt. Real pipeline fixtures use exact ACK settlement.
+pub(crate) fn accepted_origin_hashes_for_test(
+    index: &mut ScanIndex,
+    key: &str,
+    session: &str,
+    hashes: &[u64],
+) {
+    use super::claude_money_birth_store::location_key;
+    use super::upload_context_receipt::SlotRows;
+    let mut digest = Sha256::new();
+    digest.update(SnapshotSource::ClaudeCode.api_slug().as_bytes());
+    digest.update([0]);
+    digest.update(session.as_bytes());
+    let slot = crate::hex::encode(&digest.finalize()[..16]);
+    let row = index
+        .upload_context_proof
+        .request_contributions
+        .entry(slot)
+        .or_insert_with(|| SlotRows {
+            fingerprint: "c".repeat(64),
+            body_witness: "d".repeat(64),
+            rows: Box::new([]),
+        });
+    let loc = location_key(key);
+    let mut rows = row.rows.to_vec();
+    rows.retain(|(location, _)| *location != loc);
+    let mut hashes = hashes.to_vec();
+    hashes.sort_unstable();
+    hashes.dedup();
+    rows.push((loc, Arc::from(hashes)));
+    rows.sort_by_key(|(location, _)| *location);
+    row.rows = rows.into_boxed_slice();
+}
+
 /// Each sent item's exact ACK (entity -> upload body witness), as the
 /// synthetic responders answer a fully accepted page.
 pub(crate) fn exact_acks_for_test(items: &[SnapshotItem]) -> BTreeMap<String, String> {

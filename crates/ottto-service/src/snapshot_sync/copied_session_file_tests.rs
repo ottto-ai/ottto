@@ -196,6 +196,20 @@ fn distinct_same_session_file_counts_and_copies_never_prove_copies() {
             )]),
         );
         origin_accepted_for_test(&mut prior, &origin_key);
+        // Model the accepted original and the intermediate body's new counted
+        // contribution explicitly; the receipt alone carries neither hash set.
+        crate::snapshots::e2_pipeline_scan_fixture::accepted_origin_hashes_for_test(
+            &mut prior,
+            "absent-original",
+            "absent-original",
+            &[crate::snapshots::claude_request_census::claude_request_hash("a")],
+        );
+        crate::snapshots::e2_pipeline_scan_fixture::accepted_origin_hashes_for_test(
+            &mut prior,
+            &origin_key,
+            ROOT,
+            &[crate::snapshots::claude_request_census::claude_request_hash("b")],
+        );
         c.write_at(&file(THIRD), &resumed(THIRD, &[A, D]), BORN);
         owe(&mut prior);
         let page = ready(&c, &E2ScanFixture::default(), prior, 100, false);

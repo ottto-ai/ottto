@@ -2577,8 +2577,7 @@ fn holder_proof(
     };
     match usage {
         HolderUse::Stored => {
-            local_owned(index, &[], key, true)
-                && index_group_owned(index, live, key)
+            index_group_owned(index, live, key)
                 && stored_holder_answer(index, Some(key), hash) != Some(false)
         }
         HolderUse::New(local) => {
