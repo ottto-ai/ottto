@@ -2021,8 +2021,8 @@ fn c11_account_hold_bypasses_the_full_audit_cap_without_staging_a_marker() {
 }
 
 // Distinct telemetry ids per root; native copied ids retain their original bytes.
-// The fifth, independent location stays queued when related-file pulls bring
-// all four original locations onto a page. Both allowances (2/3) stay real.
+// Independent locations stay queued when related-file pulls expand a page.
+// Claude also keeps a byte-identical content twin beside its session's main.
 fn scheduling_corpus(home: &OracleHome, seed_only: bool) -> Vec<(PathBuf, String)> {
     let root = home.source.default_roots(&home.fixture.home)[0].clone();
     let sessions = [
@@ -2096,18 +2096,13 @@ fn scheduling_corpus(home: &OracleHome, seed_only: bool) -> Vec<(PathBuf, String
                 row["cwd"] = json!("/synthetic/workspace");
             }
         }
-        let filename = if n == 1 && home.source == SnapshotSource::ClaudeCode {
-            sessions[3]
-        } else {
-            session
-        };
         let folder = if n == 1 && home.source == SnapshotSource::ClaudeCode {
             // Claude resumes share their parent's cwd-derived project folder.
             0
         } else {
             [0, 2, 1, 3, 4][n]
         };
-        let path = root.join(format!("{folder}-member/{filename}.jsonl"));
+        let path = root.join(format!("{folder}-member/{session}.jsonl"));
         write_jsonl(&path, &rows);
         paths.push((path, session.into()));
         if seed_only {
@@ -2115,6 +2110,11 @@ fn scheduling_corpus(home: &OracleHome, seed_only: bool) -> Vec<(PathBuf, String
         }
     }
     if home.source == SnapshotSource::ClaudeCode {
+        if !seed_only {
+            let twin = paths[1].0.with_file_name(format!("{}.jsonl", sessions[3]));
+            std::fs::copy(&paths[1].0, &twin).unwrap();
+            paths.push((twin, sessions[1].into()));
+        }
         std::fs::remove_file(home.transcript()).unwrap();
     }
     paths
@@ -2540,7 +2540,6 @@ fn scheduling_permutations_converge_to_the_same_bodies() {
         SnapshotSource::Pi,
     ] {
         let mut baseline = None;
-        let mut late_baseline = None;
         let mut baseline_inputs = None;
         let mut forward_orders = BTreeMap::new();
         let mut run = 0;
@@ -2584,18 +2583,31 @@ fn scheduling_permutations_converge_to_the_same_bodies() {
                         drop(seed);
                         home.now += 3600;
                         let paths = scheduling_corpus(&home, false);
+                        assert_eq!(
+                            paths.len(),
+                            if source == SnapshotSource::ClaudeCode {
+                                6
+                            } else {
+                                5
+                            }
+                        );
                         home.births = paths
                             .iter()
                             .map(|(p, session)| {
+                                let age = if source == SnapshotSource::ClaudeCode
+                                    && session == "3338a80a-f36e-4cbc-a5bb-50fc66430ba5"
+                                {
+                                    if p == &paths[1].0 {
+                                        10620 // Main born at 07:03, before its own turns.
+                                    } else {
+                                        10320 // Copy born at 07:08, after all copied turns.
+                                    }
+                                } else {
+                                    14400
+                                };
                                 (
                                     p.to_string_lossy().into_owned(),
-                                    (NOW - if source == SnapshotSource::ClaudeCode
-                                        && session == "3338a80a-f36e-4cbc-a5bb-50fc66430ba5"
-                                    {
-                                        10620
-                                    } else {
-                                        14400
-                                    }) * 1_000_000_000,
+                                    (NOW - age) * 1_000_000_000,
                                 )
                             })
                             .collect();
@@ -2779,7 +2791,7 @@ fn scheduling_permutations_converge_to_the_same_bodies() {
                             // This corpus cannot witness a split of that pair;
                             // independent files still prove nonterminal pages.
                             if limit == 2 {
-                                // CHILD now shares ROOT's folder; use independent n=2 for the split.
+                                // Both CHILD paths share ROOT's folder; n=2 stays independent.
                                 assert_ne!(
                                     first_page[&relative(&paths[0].0)],
                                     first_page[&relative(&paths[2].0)],
@@ -2798,9 +2810,6 @@ fn scheduling_permutations_converge_to_the_same_bodies() {
                                 SnapshotSource::ClaudeCode => {
                                     if parent {
                                         (55, 5)
-                                    } else if late && entity == &paths[1].1 {
-                                        // Unsupported shape, not observed on real machines: a late sidecar for a content session with no transcript file named after it is applied only when that transcript changes again.
-                                        (35, 3)
                                     } else {
                                         (42, 4)
                                     }
@@ -2835,43 +2844,18 @@ fn scheduling_permutations_converge_to_the_same_bodies() {
                         }
                         let canonical =
                             crate::canonical_json::canonicalize(&json!(accepted)).unwrap();
-                        if late && late_baseline.is_none() {
-                            let on_time: &BTreeMap<String, Value> = baseline.as_ref().unwrap();
-                            assert_eq!(
-                                accepted.keys().collect::<Vec<_>>(),
-                                on_time.keys().collect::<Vec<_>>()
-                            );
-                            for (entity, value) in &accepted {
-                                let row = crate::canonical_json::canonicalize(value).unwrap();
-                                let expected =
-                                    crate::canonical_json::canonicalize(&on_time[entity]).unwrap();
-                                if entity == &paths[1].1 {
-                                    assert_ne!(
-                                        row, expected,
-                                        "the unsupported late-sidecar shape changes CHILD's entity row"
-                                    );
-                                } else {
-                                    assert_eq!(row, expected, "late baseline changes only CHILD: {source:?} entity {entity}");
-                                }
-                            }
-                        }
-                        let arm_baseline = if late {
-                            &mut late_baseline
-                        } else {
-                            &mut baseline
-                        };
-                        if let Some(expected) = arm_baseline {
+                        if let Some(expected) = &baseline {
                             let expected =
                                 crate::canonical_json::canonicalize(&json!(expected)).unwrap();
                             assert_eq!(canonical, expected, "full rows and placement converge: {source:?} {one_chunk} {limit} {reverse} {restart} {late}");
                         } else {
-                            *arm_baseline = Some(accepted.clone());
+                            baseline = Some(accepted.clone());
                         }
                         // No old Cycle/index/progress Arc survives into the cold-close seam.
                         home.cold_restart();
                         // A completed census starts a fresh walk of every physical file.
                         // one_chunk only changes evidence packing at finish, not selection.
-                        let files = paths.len();
+                        let files = paths.len(); // Claude: 6 physical files; Codex/Pi: 5.
                         let quiet_limit = home.schedule.unwrap().limit;
                         // A new census queues every discovered entry again; the quiet
                         // drain must shrink it every cycle and finish within one cycle
