@@ -1727,6 +1727,8 @@ fn tag_owned_with_held(
         .collect();
     let evidence = claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new())
         .with_native_originals(&originals);
+    // Production's side pass lends root starts before reconcile (`side_calls_page`).
+    claude_request_identity::inherit_root_accounts(&mut items, false);
     claude_request_identity::reconcile_request_accounts(&mut items, &evidence);
     let activity = claude_request_identity::stage_request_owned_activity(
         &items,
