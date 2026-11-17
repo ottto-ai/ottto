@@ -11,7 +11,7 @@
 //! GREEN assert main's behavior, which FE must keep, and pass on main.
 //! Uses the EOF fixture seam; production FE lives in snapshots.rs.
 //!
-//! Conditions pinned here (d680b524):
+//! Conditions for an in-page read:
 //! - publish only when `s` is at least the last committed size;
 //! - a prefix never backs proof, v1, a family witness, or a verified
 //!   request-census record;

@@ -1118,7 +1118,7 @@ that change the member are not attempted, and out-of-root destinations are not
 covered; these retain ordinary positively proven deletion semantics. Hold caps
 and ordinary size gates remain.
 
-Known limitations: same-size middle-only rewrites remain Ron's accepted interior-edit residual.
+Same-size middle-only rewrites remain an accepted residual.
 Evidence outside stamped inputs (including API/trace metadata tokens and
 reader-health recovery) wakes only after restart: a delay while a recorded hold
 keeps the file discoverable, not an age-based drop. A never-binding account

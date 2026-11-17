@@ -2347,7 +2347,7 @@ fn real_scan_settled_alias_cannot_evict_an_ordinary_singleton_beside_ordinary_gr
         group_parses += representatives;
         assert!(
             singleton_parses <= 1 && group_parses <= 1,
-            "STOP for Lead A: an ordinary item was parsed twice without another change"
+            "an ordinary item was parsed twice without another change"
         );
         total_group_bytes += physical_group_bytes;
         if group_admitted {

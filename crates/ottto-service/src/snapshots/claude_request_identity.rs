@@ -2417,8 +2417,7 @@ fn row_tagged(row: &SnapshotModelUsage) -> bool {
             .any(|part| part.evidence_ref.is_some())
 }
 
-/// Receiver `_validate_identity_parts` money presence
-/// (backend/app/schemas/agent_session_snapshots.py:634-641): per cost field, a
+/// The receiver's identity-part validation checks each cost field. A
 /// row carrying it needs it on every part and a row without it allows none.
 fn parts_presence_holds(row: &SnapshotModelUsage) -> bool {
     let row_present = row_costs(row).map(Option::is_some);

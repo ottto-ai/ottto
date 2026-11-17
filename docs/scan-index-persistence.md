@@ -225,7 +225,8 @@ downgrade start. Downgrade to N, allow a successful legacy save, then evaluate a
 older downgrade against the existing logical-schema contracts.**
 
 This is a hard release prerequisite: do not enable or publish the writer switch
-while N is unpublished, has not been installed on the M4 with at least one successful save cycle, the version is unresolved, or those notes are missing.
+until N is published and installed on an operator Mac with at least one
+successful save cycle, its version is confirmed, and the release notes are ready.
 The writer component remains draft until that prerequisite and the integration
 qualification are met. No arbitrary version number is invented here. There is
 no promise that forcibly running an unsupported pre-N binary is intercepted by
@@ -239,13 +240,12 @@ if any marker is ignored, while retaining a full live legacy copy defeats the
 write reduction. The minimum-version contract avoids those reset paths by
 requiring a reader that actually understands every committed shard.
 
-## Pinned 0.1.201 and current-main investigation
+## Historical comparison with release 0.1.201
 
-Historical source is commit `f174d111fbcdfb0ab9c2abeb299c12d50b435c29`.
-Current source for this investigation is main
-`edcbf5edc60ddf61560ca4155b199e1323709755`. Paths below are crate-relative.
+This comparison uses the 0.1.201 release and the development version at the
+time of the investigation. Paths below are crate-relative.
 
-| Input at the original index path | 0.1.201 | Current main |
+| Input at the original index path | 0.1.201 | Development version |
 | --- | --- | --- |
 | Missing, including renamed away | `snapshots.rs:46026` returns `Default`, `LoadOrigin::Missing` | `snapshots.rs:46466` does the same |
 | Syntax corruption, first event | `snapshots.rs:46079` routes quarantinable errors; `snapshots/load_containment.rs:641` renames to a corrupt sibling, syncs, returns `Default` at 645 | `snapshots.rs:46517`, same containment lines 641–645 |
@@ -348,10 +348,10 @@ completion. This is a serializer round-trip, not a claim of identical physical
 fragment ordering/whitespace or full emitted-money/oracle qualification.
 
 Pinned downgrade fact, including absence of all three inline maps: 0.1.201
-`f174d111` has logical schema 2 (`snapshots.rs:542`), header pass plus controls
+has logical schema 2 (`snapshots.rs:542`), header pass plus controls
 (`lenient_decode.rs:922–923`), strict schema refusal (`:1037–1040`) and
 non-quarantine refusal classification (`:436–438`). Loader `snapshots.rs:46079`
-quarantines only Syntax/HoldBudget. 0.1.202 `79488a7` has schema 2 at
+quarantines only Syntax/HoldBudget. 0.1.202 has schema 2 at
 `snapshots.rs:566`, the same header/control sequence at `lenient_decode.rs:924–925`,
 strict refusal at `:1039–1042`, non-quarantine classification at `:435–437`, and
 loader quarantine branch at `snapshots.rs:46403`. The schema-3 root includes the

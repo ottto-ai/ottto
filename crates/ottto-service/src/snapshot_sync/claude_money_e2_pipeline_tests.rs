@@ -3071,7 +3071,7 @@ fn equal_birth_carrier_never_grandfathers_its_counted_request() {
             let accepted_body = snapshot_upload_body_witness(body(&twins, ROOT).unwrap());
             let prior = settle(&c, &prior, twins, &mut e2_progress());
 
-            // CS1 refreshes the ACK carrier with blank JSONL: unchanged usage
+            // Refresh the ACK carrier with blank JSONL so unchanged usage
             // acquires the summed body's COPY mark before the own turn grows.
             append(&carrier, "\n");
             let refreshed = ready(&c, &scanner, prior.clone(), 100, false);
@@ -3100,7 +3100,7 @@ fn equal_birth_carrier_never_grandfathers_its_counted_request() {
                 .any(|(holder, hashes)| *holder == carrier_key
                     && hashes.binary_search(&r1_hash).is_ok()));
 
-            // Red on main without the counting-holder guard (CS1 run 43868949339).
+            // This regression fails without the counting-holder guard.
             append(&carrier, &line(ROOT, "r2", own_at, 20));
             let grown = ready(&c, &scanner, prior.clone(), 100, false);
             literal(&grown);

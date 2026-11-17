@@ -1157,7 +1157,7 @@ fn a_touched_listed_file_is_held_history_not_a_genuine_change() {
 /// hints, an in-place resend): no literal of the listed family passes
 /// either upload path and it never stamps revision 3, while an unlisted
 /// family keeps both. [money] A paused list holds adoption only: it stamps
-/// no file (G3's lag) but filters literals by the digests it still has, so
+/// no file during the pause but filters literals by the digests it still has, so
 /// with them kept the listed family stays off `e2` (G4), and with none (a
 /// list missing after install) every family takes `e2` until the list is
 /// back (G5, disclosed).

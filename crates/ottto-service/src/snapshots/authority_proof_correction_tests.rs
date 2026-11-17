@@ -1561,16 +1561,15 @@ fn apc_emit(line: Value) {
 }
 
 /// Source-pinned pre-change decoder. The record type and its predicate are
-/// copied (with rustfmt line wrapping) from `crates/ottto-service/src/snapshots.rs` at release source
-/// 896b98f6b7347251b35c2d13cd462b132cd99d84 (release 0.1.173; blob 00ffefd4574e), lines
-/// 2350-2370 and 2570-2595; they use the unchanged shared helpers, constants
-/// and disposition enum. Only the authority conjuncts of that base's
+/// copied (with rustfmt line wrapping) from `crates/ottto-service/src/snapshots.rs`
+/// in release 0.1.173, lines 2350-2370 and 2570-2595. They use the shared
+/// helpers, constants and disposition enum. Only the authority conjuncts of that release's
 /// `ScanIndex::load` guard (lines 22481-22495) are restated as a function.
 /// This is source characterization, not an older binary.
 mod previous_release_0_1_173 {
     use super::*;
 
-    // BEGIN SOURCE-PINNED 0.1.173 896b98f6 snapshots.rs 2350-2370
+    // BEGIN SOURCE-PINNED 0.1.173 snapshots.rs 2350-2370
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     struct ClaudeUsageAuthorityQuarantineRecord {
         contract: String,
@@ -1594,7 +1593,7 @@ mod previous_release_0_1_173 {
     }
     // END SOURCE-PINNED
 
-    // BEGIN SOURCE-PINNED 0.1.173 896b98f6 snapshots.rs 2570-2595
+    // BEGIN SOURCE-PINNED 0.1.173 snapshots.rs 2570-2595
     fn claude_usage_authority_deadline_is_bounded(
         record: &ClaudeUsageAuthorityQuarantineRecord,
     ) -> bool {

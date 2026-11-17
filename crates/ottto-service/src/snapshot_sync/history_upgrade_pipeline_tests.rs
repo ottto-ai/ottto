@@ -490,7 +490,7 @@ const HISTORY_CURRENT: HistoryCycle<'static> = HistoryCycle {
 /// Primary incident shape (addendum 2) on an unverified Mac: a bootstrapped
 /// destination's index is quarantined, no list and no seen-marker, the
 /// backfill state is unreadable, the active revision is bumped. Every file
-/// comes back as a new file. On dba838f0 every body is re-sent (`uploaded`
+/// comes back as a new file. Previously every body was re-sent (`uploaded`
 /// holds all three sessions); here none is, every file is recorded locally
 /// with its census record, and the next two cycles do not re-read anything.
 #[test]
@@ -2617,7 +2617,7 @@ fn e2_listed_family_keeps_ordinary_money_beside_an_unlisted_literal() {
 /// gate on: no owed file is re-read or stamped 3. [money] The pause holds
 /// adoption only: a genuine change of an unlisted family uploads the `e2`
 /// literal, as under the installed list, never withheld (G1), and its file
-/// is not stamped 3 while the list is missing (G3).
+/// is not stamped 3 while the list is missing.
 #[test]
 fn e2_missing_list_pauses_history_and_uploads_changes_as_e2() {
     let fixture = HistoryFixture::new("e2-list-missing-ordinary");

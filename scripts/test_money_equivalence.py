@@ -163,7 +163,7 @@ class MoneyEquivalenceTests(unittest.TestCase):
         self.assertEqual(diff[kind], [path])
 
     def test_cut_c440307e6_vs_bf4d653b2_envelope_addition_passes(self):
-        # Reproduce Lead B's decoded cut shape: eight Claude cases gain only
+        # In the decoded comparison, eight Claude cases gain only
         # the batch capability (failed_then_healthy has two bodies), two Codex
         # cases are unchanged. No production/provider inputs are needed.
         self.head[CONTRACT] = CONTRACT_VALUE

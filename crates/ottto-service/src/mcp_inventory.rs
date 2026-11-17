@@ -8,11 +8,10 @@
 //! `POST /api/v1/mcp/inventory`. The backend tokenizes the schemas and persists
 //! the footprint; the daemon only sends the unweighted tool definitions.
 //!
-//! This is the daemon port of the reference Python harvester
-//! (`backend/scripts/mcp_footprint/harvest.py`). It reuses the snapshot client's
-//! device-credential / relay-token auth and API base-URL resolution, and never
-//! logs server commands, arguments, URLs, environment, or tool schemas (any of
-//! which can embed secrets or local paths).
+//! This daemon implementation follows the reference Python harvester.
+//! It reuses the snapshot client's authentication and API base-URL resolution.
+//! Server commands, arguments, URLs, environment, and tool schemas can embed
+//! secrets or local paths and are excluded from logs.
 //!
 //! Transport coverage: **stdio is fully implemented** (the common transport for
 //! locally configured MCP servers). Streamable HTTP and SSE servers are
