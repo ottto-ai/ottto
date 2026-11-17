@@ -2323,6 +2323,233 @@ fn accepted_request_rows_round_trip_replace_and_reject_future_layouts() {
     assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::Future));
 }
 
+fn contribution_reference_fixture() -> (Fixture, ScanIndex, String, String) {
+    use crate::snapshots::claude_money_birth_store::location_key;
+    use crate::snapshots::claude_request_census::{
+        ClaudeRequestCensusRecord, ClaudeRequestCensusShape,
+    };
+    use crate::snapshots::upload_context_receipt::SlotRows;
+    let f = Fixture::new();
+    f.published();
+    let mut index = load_with(&f.path, false).unwrap().unwrap();
+    let holder = f
+        .support
+        .join("1338a80a-f36e-4cbc-a5bb-50fc66430ba5.jsonl")
+        .to_string_lossy()
+        .into_owned();
+    let slot = "a".repeat(32);
+    index.files.insert(
+        holder.clone(),
+        crate::snapshots::ScanIndexEntry {
+            source_file_fingerprint: "d".repeat(64),
+            ..Default::default()
+        },
+    );
+    index.claude_request_census.insert(
+        holder.clone(),
+        ClaudeRequestCensusRecord::synthetic_for_test(
+            &"d".repeat(64),
+            1,
+            ClaudeRequestCensusShape::Exact,
+            vec![1, 7, 99],
+        ),
+    );
+    index.upload_context_proof.request_contributions.insert(
+        slot.clone(),
+        SlotRows {
+            fingerprint: "b".repeat(64),
+            body_witness: "c".repeat(64),
+            rows: vec![(location_key(&holder), Arc::from([1_u64, 7, 99]))].into_boxed_slice(),
+        },
+    );
+    assert!(save_with(&f.path, &mut index).unwrap());
+    (f, index, holder, slot)
+}
+
+#[test]
+fn contribution_references_survive_census_replacement_and_last_census_release() {
+    use crate::snapshots::claude_request_census::{
+        ClaudeRequestCensusRecord, ClaudeRequestCensusShape,
+    };
+    use crate::snapshots::upload_context_receipt::SlotRows;
+    let (f, mut index, holder, slot) = contribution_reference_fixture();
+    let expected = index.upload_context_proof.request_contributions[&slot].clone();
+    let row = mapper::key("proof.request_contribution", &slot, 1).unwrap();
+    let census = mapper::key("file.census", &holder, 1).unwrap();
+    let mut original = None;
+    with_session_db(&index, |db| {
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        let sets = kinds::tests::referenced_sets(&mut tx, &row);
+        assert_eq!(sets.len(), 1);
+        assert_eq!(kinds::tests::referenced_sets(&mut tx, &census), sets);
+        assert_eq!(kinds::tests::set_refs(&mut tx, &sets[0]), Some(2));
+        let header = tx.get(&row).unwrap().unwrap();
+        let raw: serde_json::Value =
+            codec::decode(&mapper::bytes(&mut tx, &header).unwrap(), VALUE_BYTES).unwrap();
+        let RowKey::RequestSet(id) = &sets[0] else {
+            panic!("request set")
+        };
+        assert_eq!(raw["rows"][0][1], serde_json::json!({"$request_set": id}));
+        assert!(serde_json::to_value(&expected).unwrap()["rows"][0][1].is_string());
+        assert_eq!(
+            mapper::read::<SlotRows>(&mut tx, &header, None).unwrap(),
+            expected
+        );
+        original = Some(sets[0].clone());
+    });
+    let original = original.unwrap();
+    cold_close_for_test(&f.path).unwrap();
+    index = load_with(&f.path, false).unwrap().unwrap();
+    assert_eq!(
+        index.upload_context_proof.request_contributions[&slot],
+        expected
+    );
+    index.claude_request_census.insert(
+        holder.clone(),
+        ClaudeRequestCensusRecord::synthetic_for_test(
+            &"d".repeat(64),
+            1,
+            ClaudeRequestCensusShape::Exact,
+            vec![2, 7, 99],
+        ),
+    );
+    assert!(save_with(&f.path, &mut index).unwrap());
+    let mut replacement = None;
+    with_session_db(&index, |db| {
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        assert_eq!(
+            kinds::tests::referenced_sets(&mut tx, &row),
+            vec![original.clone()]
+        );
+        let sets = kinds::tests::referenced_sets(&mut tx, &census);
+        assert_eq!(sets.len(), 1);
+        assert_ne!(sets[0], original);
+        assert_eq!(kinds::tests::set_refs(&mut tx, &original), Some(1));
+        assert_eq!(kinds::tests::set_refs(&mut tx, &sets[0]), Some(1));
+        replacement = Some(sets[0].clone());
+    });
+    let replacement = replacement.unwrap();
+    index = load_with(&f.path, false).unwrap().unwrap();
+    assert_eq!(
+        index.upload_context_proof.request_contributions[&slot],
+        expected
+    );
+    assert_eq!(
+        index
+            .claude_request_census
+            .get(&holder)
+            .unwrap()
+            .request_hashes(),
+        &[2, 7, 99]
+    );
+    index.claude_request_census.remove(&holder);
+    assert!(save_with(&f.path, &mut index).unwrap());
+    cold_close_for_test(&f.path).unwrap();
+    index = load_with(&f.path, false).unwrap().unwrap();
+    assert_eq!(
+        index.upload_context_proof.request_contributions[&slot],
+        expected
+    );
+    with_session_db(&index, |db| {
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        assert_eq!(kinds::tests::set_refs(&mut tx, &original), Some(1));
+        assert_eq!(kinds::tests::set_refs(&mut tx, &replacement), None);
+    });
+    index.upload_context_proof.request_contributions.clear();
+    assert!(save_with(&f.path, &mut index).unwrap());
+    with_session_db(&index, |db| {
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        assert_eq!(kinds::tests::set_refs(&mut tx, &original), None);
+    });
+    let mut next = expected;
+    next.rows[0].1 = Arc::from([100_u64]);
+    index
+        .upload_context_proof
+        .request_contributions
+        .insert(slot.clone(), next);
+    assert!(save_with(&f.path, &mut index).unwrap());
+    with_session_db(&index, |db| {
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        let sets = kinds::tests::referenced_sets(&mut tx, &row);
+        let (RowKey::RequestSet(new), RowKey::RequestSet(old), RowKey::RequestSet(other)) =
+            (&sets[0], original, replacement)
+        else {
+            panic!("request sets")
+        };
+        assert!(*new > old && *new > other, "deleted ids are never reused");
+    });
+}
+
+#[test]
+fn missing_contribution_only_reference_refuses_the_store() {
+    use crate::snapshots::upload_context_receipt::SlotRows;
+    let (f, mut index, holder, slot) = contribution_reference_fixture();
+    index.claude_request_census.remove(&holder);
+    assert!(save_with(&f.path, &mut index).unwrap());
+    with_session_db(&index, |db| {
+        let row = mapper::key("proof.request_contribution", &slot, 1).unwrap();
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        let sets = kinds::tests::referenced_sets(&mut tx, &row);
+        assert_eq!(sets.len(), 1);
+        assert_eq!(kinds::tests::set_refs(&mut tx, &sets[0]), Some(1));
+        drop(tx);
+        sqlite::delete_row_for_test(db, &sets[0]);
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        let header = tx.get(&row).unwrap().unwrap();
+        let error = mapper::read::<SlotRows>(&mut tx, &header, None).unwrap_err();
+        assert!(format!("{error:#}").contains("state_v2_reference_missing"));
+    });
+    cold_close_for_test(&f.path).unwrap();
+    assert!(load_with(&f.path, false).is_err());
+}
+
+#[test]
+fn inline_contribution_rows_reopen_and_intern_on_replacement() {
+    let (f, mut index, holder, slot) = contribution_reference_fixture();
+    index.claude_request_census.remove(&holder);
+    assert!(save_with(&f.path, &mut index).unwrap());
+    let expected = index.upload_context_proof.request_contributions[&slot].clone();
+    let row = mapper::key("proof.request_contribution", &slot, 1).unwrap();
+    let generation = index.generation;
+    with_session_db(&index, |db| {
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        mapper::remove(&mut tx, &row).unwrap();
+        let value = codec::encode(&codec::json(&expected, VALUE_BYTES).unwrap()).unwrap();
+        // Publish the previous inline layout-8 encoding, without projection.
+        tx.put(RowInput {
+            key: &row,
+            fixed: &Fixed::None,
+            value_version: 1,
+            value: &value,
+        })
+        .unwrap();
+        assert!(kinds::tests::referenced_sets(&mut tx, &row).is_empty());
+        assert_eq!(
+            tx.commit(generation, generation + 1),
+            DurableCommitOutcome::Committed(generation + 1)
+        );
+    });
+    cold_close_for_test(&f.path).unwrap();
+    index = load_with(&f.path, false).unwrap().unwrap();
+    assert_eq!(
+        index.upload_context_proof.request_contributions[&slot],
+        expected
+    );
+    index
+        .upload_context_proof
+        .request_contributions
+        .get_mut(&slot)
+        .unwrap()
+        .fingerprint = "e".repeat(64);
+    assert!(save_with(&f.path, &mut index).unwrap());
+    with_session_db(&index, |db| {
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        let sets = kinds::tests::referenced_sets(&mut tx, &row);
+        assert_eq!(sets.len(), 1);
+        assert_eq!(kinds::tests::set_refs(&mut tx, &sets[0]), Some(1));
+    });
+}
+
 #[test]
 fn malformed_accepted_request_rows_refuse_the_native_store() {
     use crate::snapshots::upload_context_receipt::SlotRows;

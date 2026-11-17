@@ -3383,6 +3383,7 @@ fn decide_holders(
         twin_held: BTreeSet<u64>,
         holder_sessions: BTreeSet<String>,
     }
+    // One accepted-row view for the whole acquisition page, before evidence chunks.
     let live = std::cell::OnceCell::<Live<'_>>::new();
     // The page's folds by session, for the same-session page proof. By
     // session id alone: path twins live under different folders and roots.
@@ -4756,6 +4757,11 @@ pub(crate) fn finish_page(
     queued_family_deferred_paths: &BTreeSet<LocationKey>,
 ) -> BTreeSet<String> {
     let content_held = page_content_holds(items, index);
+    let records = index
+        .files
+        .keys()
+        .map(|key| (location_key(key), key))
+        .collect();
     finish_page_planned(
         items,
         index,
@@ -4763,8 +4769,11 @@ pub(crate) fn finish_page(
         hold_reasons,
         queued_family_deferred_paths,
         &content_held,
+        &records,
     )
 }
+
+pub(crate) type ContributionLocations<'a> = BTreeMap<LocationKey, &'a String>;
 
 /// `finish_page` for one evidence chunk of a page whose content-twin holds
 /// were decided once over the whole page.
@@ -4775,6 +4784,7 @@ pub(crate) fn finish_page_planned(
     hold_reasons: &mut BTreeMap<&'static str, u64>,
     queued_family_deferred_paths: &BTreeSet<LocationKey>,
     page_content_held: &BTreeSet<String>,
+    records: &ContributionLocations<'_>,
 ) -> BTreeSet<String> {
     if !index.persistence_available() {
         let held: BTreeSet<_> = items.iter().map(|i| i.source_session_id.clone()).collect();
@@ -4839,11 +4849,6 @@ pub(crate) fn finish_page_planned(
                 .or_insert(true) &= covered;
         }
     }
-    let records = index
-        .files
-        .keys()
-        .map(|key| (location_key(key), key))
-        .collect::<BTreeMap<_, _>>();
     let mut corrected_sessions = BTreeSet::new();
     let mut sessions = BTreeMap::<String, Session>::new();
     for item in items.iter_mut() {

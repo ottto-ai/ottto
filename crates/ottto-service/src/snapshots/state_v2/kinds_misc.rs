@@ -403,11 +403,11 @@ pub(super) fn hydrate_txn(
     read_holds(index, tx, Some(&mut cx.digests))
 }
 pub(super) fn references(
-    _: &Header,
-    _: &dyn Value,
-    _: &mut dyn FnMut(&RowKey) -> Result<()>,
+    h: &Header,
+    value: &dyn Value,
+    emit: &mut dyn FnMut(&RowKey) -> Result<()>,
 ) -> Result<()> {
-    Ok(())
+    mapper::references(h, value, emit)
 }
 pub(super) fn private_paths(
     h: &Header,
