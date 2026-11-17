@@ -121,7 +121,8 @@ impl LegacyFixture {
             assert!(
                 state_v2::load_head(&f.route.index, &key, Codex::REDUCTION_REVISION)
                     .unwrap()
-                    .is_none()
+                    .is_none_or(|head| head.metadata_only),
+                "a group member must not have a reduction head"
             );
             let entry = &f.route.index.files[&key];
             let items = historical_codex::read(Frozen::StickyLegacy).0.into_items(
@@ -147,6 +148,10 @@ impl LegacyFixture {
             f.route
                 .index
                 .record_accepted_snapshot_fingerprints(&fingerprints);
+            assert!(version::legacy_head_missing(
+                &f.route.index,
+                &local_index_key(member)
+            ));
         }
         f.route.save(false);
         f.restore();
