@@ -1934,11 +1934,27 @@ fn local_hold_selection_keeps_a_pending_obligation_for_an_entity_the_scan_still_
 // raw-set bypass.
 #[test]
 fn production_ack_retirement_cannot_apply_a_plain_set() {
-    let module = include_str!("ack_retention.rs");
-    let parent = include_str!("../snapshot_sync.rs");
+    let module = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/snapshot_sync/ack_retention.rs"
+    ))
+    .expect("ACK retirement source");
+    let parent = std::fs::read_to_string(
+        if std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/snapshot_sync/finish.rs"
+        ))
+        .exists()
+        {
+            concat!(env!("CARGO_MANIFEST_DIR"), "/src/snapshot_sync/finish.rs")
+        } else {
+            concat!(env!("CARGO_MANIFEST_DIR"), "/src/snapshot_sync.rs")
+        },
+    )
+    .expect("snapshot_sync source");
     let production = &parent[..parent
         .find("\n#[cfg(test)]\nmod tests {")
-        .expect("snapshot_sync test module")];
+        .unwrap_or(parent.len())];
     assert!(
         module.contains("pub(super) struct AckRetirementPlan(BTreeSet<String>);"),
         "the plan field stays private to ack_retention"

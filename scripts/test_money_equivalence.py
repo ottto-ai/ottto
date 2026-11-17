@@ -1172,6 +1172,7 @@ class StatusFixtureCatalogTests(unittest.TestCase):
         self.assertEqual(tuple(n for n in registered if n.startswith("claude_status_")),
                          STATUS_FIXTURE_NAMES)
         self.assertEqual(tuple(n for n in registered if not n.startswith("claude_status_")), (
+            "once_credit_claude", "once_credit_native",
             "claude_bad_record_sibling", "claude_paused_suffix", "codex_bad_record_sibling",
             "resumed_prefix_sidecar_receipt", "root_twin_scoped_family"))
         self.assertEqual(len(require_disjoint_head_only()), len(registered))

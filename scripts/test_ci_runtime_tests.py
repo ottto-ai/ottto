@@ -302,13 +302,18 @@ class RetryTests(unittest.TestCase):
         relative = [path.relative_to(source) for path in source.rglob('*.rs')]
         changed = {path.as_posix(): runner.module_name(path) for path in relative
                    if runner.module_name(path) != old_module_name(path)}
-        # Only files under a src/**/tests/ directory get a new name, and none of them use the money oracle.
+        # Only files under a src/**/tests/ directory get a new name.
         self.assertTrue(changed)
         self.assertTrue(all('/src/' in path and '/tests/' in path for path in changed), changed)
-        self.assertFalse([path for path in changed if 'money_oracle' in (source / path).read_text()])
         new = runner.oracle_modules(source)
         with mock.patch.object(runner, 'module_name', old_module_name):
             old = runner.oracle_modules(source)
+        for path, module in changed.items():
+            if 'money_oracle' in (source / path).read_text():
+                # Include fragments need their owner to protect the actual test IDs.
+                self.assertTrue(runner.never_retry(f'{module}::probe', set()), path)
+                old.remove(old_module_name(Path(path)))
+                old.add(module)
         self.assertEqual(new, old)
 
     def test_modules_that_use_the_money_oracle_are_never_retried(self):

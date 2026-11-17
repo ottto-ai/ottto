@@ -3,6 +3,8 @@
 //! constructors that decide what a page selects.
 
 mod step;
+#[cfg(test)]
+mod trace_projection;
 
 use crate::snapshots::discovery::traversal::scan_traversal_context_fingerprint;
 use crate::snapshots::*;
@@ -498,6 +500,8 @@ impl OwnedSourceScan {
     ) -> Self {
         let _jsonl_scope =
             crate::local_resource_diagnostics::jsonl::Scope::begin(source.api_slug());
+        #[cfg(test)]
+        let file_limit = trace_projection::requested_file_limit(file_limit);
         let _select_window = state_v2::state_v2_growth_retention_active(&owned_index)
             .then(|| state_v2::telemetry::Window::begin("select"))
             .flatten();
@@ -681,6 +685,8 @@ impl OwnedSourceScan {
         let growth_wake = sampled_audit::expired_growth_claims(source, index, audit_now);
         let mut selection_traversal = index.traversal.take().expect("traversal initialized");
         let traversal = &mut selection_traversal;
+        #[cfg(test)]
+        trace_projection::permute_candidates(traversal);
         let census_window_end = traversal.census_window_end.clone();
         let discovered_file_count = traversal.counts.discovered_file_count;
         let mut pending_paths = scoped_prefix_paths;
