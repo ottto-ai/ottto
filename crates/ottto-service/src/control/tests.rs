@@ -1635,7 +1635,7 @@ fn manual_agent_status_upload_dispatch_returns_without_network_wait() {
     );
 }
 
-struct EnvVarGuard {
+pub(crate) struct EnvVarGuard {
     key: &'static str,
     previous: Option<OsString>,
 }
@@ -1645,7 +1645,7 @@ impl EnvVarGuard {
         Self::set_os(key, value.as_os_str().to_os_string())
     }
 
-    fn set_str(key: &'static str, value: &str) -> Self {
+    pub(crate) fn set_str(key: &'static str, value: &str) -> Self {
         Self::set_os(key, OsString::from(value))
     }
 

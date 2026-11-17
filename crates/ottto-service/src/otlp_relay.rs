@@ -1947,15 +1947,23 @@ pub(crate) mod tests {
     }
 
     /// Past the Origin and Host gate, the browser route forwards only its two
-    /// backend-token commands, and always without a local peer.
+    /// backend-token commands, and never as a trusted Companion.
     #[test]
     #[serial_test::serial]
-    fn browser_control_forwards_only_backend_token_commands_without_a_peer() {
+    fn browser_control_forwards_only_backend_token_commands_untrusted() {
         use crate::test_effects::{Effect, Recording, Scalar};
         use ottto_protocol::{
             CliErrorCode, LocalClientKind, LocalControlResponse, SourceKind, TelemetryControlAction,
         };
         let files = crate::control::tests::ControlFilesFixture::new();
+        // A loopback stub stands in for the public release manifest, so a
+        // regressed allowlist cannot reach the network; it must see no request.
+        let manifest = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind manifest stub");
+        manifest.set_nonblocking(true).unwrap();
+        let _manifest_url = crate::control::tests::EnvVarGuard::set_str(
+            "OTTTO_RELEASE_MANIFEST_URL",
+            &format!("http://{}/manifest.json", manifest.local_addr().unwrap()),
+        );
         let launch = || LocalControlCommand::SessionLaunchPrepare {
             schema_version: 1,
             provider: ottto_protocol::SessionLaunchProviderV1::Codex,
@@ -1995,7 +2003,7 @@ pub(crate) mod tests {
             }
         }
         cases.push((telemetry(), true, None, Some(CliErrorCode::InvalidRequest)));
-        // A Companion claim without a token stays untrusted: the peer is None.
+        // A Companion claim without a token reaches dispatch untrusted.
         cases.push((
             telemetry(),
             false,
@@ -2061,6 +2069,11 @@ pub(crate) mod tests {
                 "{context}"
             );
         }
+        let hits = manifest.accept();
+        assert!(
+            matches!(&hits, Err(error) if error.kind() == io::ErrorKind::WouldBlock),
+            "the release manifest stub saw a request: {hits:?}"
+        );
     }
 
     #[test]
