@@ -13,7 +13,8 @@ struct Fixture(PathBuf);
 impl Fixture {
     fn new(source: SnapshotSource) -> Self {
         // Canonical: state v2 refuses a store beneath a symlinked ancestor.
-        let path = crate::test_scratch::unique_path("ottto-native-tail").with_extension("jsonl");
+        let path =
+            crate::test_scratch::canonical_private_dir("ottto-native-tail").join("source.jsonl");
         let value = match source {
             SnapshotSource::Codex => {
                 json!({"type":"session_meta","payload":{"id":"native-tail-fixture"}})

@@ -106,7 +106,7 @@ impl SelectionFixture {
                 .set_unverified_deadline(1);
         }
         let index_path = scratch.join("index.json");
-        previous.save(&index_path).unwrap();
+        previous.save_fixture(&index_path).unwrap();
         Self {
             _scratch: scratch,
             roots: [root],
@@ -229,7 +229,7 @@ fn recovery_selection_preserves_ordinary_audit_order_and_page_limit() {
         .unwrap()
         .source_file_fingerprint
         .clear();
-    rearmed.save(&fixture.index_path).unwrap();
+    rearmed.save_fixture(&fixture.index_path).unwrap();
     let rearmed = ScanIndex::load(&fixture.index_path).unwrap();
     assert!(rearmed.files[&key].source_file_fingerprint.is_empty());
     let base = fixture.prepare(rearmed, 1);
@@ -486,7 +486,7 @@ fn selected_restore_preserves_prior_body_and_queued_debt() {
         .iter()
         .any(|entry| local_index_key(&entry.path) == owed_key));
     selected.mark_bounded_sweep_unsettled();
-    selected.save(&fixture.index_path).unwrap();
+    selected.save_fixture(&fixture.index_path).unwrap();
     let restored = ScanIndex::load(&fixture.index_path).unwrap();
     assert_eq!(serde_json::to_vec(&restored.files[&key]).unwrap(), old);
     assert!(restored.bounded_sweep_had_unsettled_upload());
@@ -713,7 +713,7 @@ fn unkept_audit_key_does_not_starve_pending_census_at_page_limit_one() {
 fn selected_save_cas_loser_never_commits() {
     let (fixture, index, scan, previous) = selected_fixture();
     let mut winner = previous.clone();
-    winner.save(&fixture.index_path).unwrap();
+    winner.save_fixture(&fixture.index_path).unwrap();
     let durable = fs::read(&fixture.index_path).unwrap();
     let progress = fixture._scratch.join("cas-progress.json");
     assert!(crate::snapshot_sync::checkpoint_unselected_for_test(
@@ -887,7 +887,7 @@ fn corrected_body_fixture(mode: &str) -> (BodyFixture, ScanIndex) {
         );
     }
     let path = fixture.dir.join("correction-selected.json");
-    index.save(&path).unwrap();
+    index.save_fixture(&path).unwrap();
     (fixture, index)
 }
 
@@ -914,7 +914,7 @@ fn proof_revision_reparse_and_restart_preserve_body_custody() {
             index.files.get_mut(&key).unwrap().source_file_fingerprint = "f".repeat(64);
         }
         let path = fixture.dir.join("correction-selected.json");
-        index.save(&path).unwrap();
+        index.save_fixture(&path).unwrap();
         let restarted = ScanIndex::load(&path).unwrap();
         assert_eq!(restarted.accepted_snapshot_fingerprints, accepted);
     }
@@ -931,7 +931,7 @@ fn default_constructor_keeps_durable_recovery_debt_under_ordinary_census_order()
         .unwrap()
         .source_file_fingerprint
         .clear();
-    index.save(&fixture.index_path).unwrap();
+    index.save_fixture(&fixture.index_path).unwrap();
     let index = ScanIndex::load(&fixture.index_path).unwrap();
     let base = fixture.prepare(index, 1);
     assert_eq!(base.identified_candidates[0].path, fixture.paths[1]);
@@ -945,7 +945,7 @@ fn default_constructor_keeps_durable_recovery_debt_under_ordinary_census_order()
         .pending_candidates
         .iter()
         .any(|p| p.path == fixture.paths[0]));
-    index.save(&fixture.index_path).unwrap();
+    index.save_fixture(&fixture.index_path).unwrap();
     let restarted = ScanIndex::load(&fixture.index_path).unwrap();
     assert!(restarted.files[&key].source_file_fingerprint.is_empty());
     assert!(restarted
@@ -1028,7 +1028,7 @@ fn account_audit_release_waits_for_cache_heads_and_selected_settlement() {
                 &mut scan,
                 &fixture.roots,
             );
-            selected.save(&fixture.index_path).unwrap();
+            selected.save_fixture(&fixture.index_path).unwrap();
             selected
         };
         assert!(!selected.claude_account_deferred_holds.contains_key(&key));

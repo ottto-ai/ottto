@@ -1311,6 +1311,10 @@ fn codex_partial_ack_keeps_the_unacknowledged_new_file_owed_without_a_restart() 
     let index_path = dir.join("codex-index.json");
     let progress_path = dir.join("codex-progress.json");
     progress.save_fixture(&progress_path).unwrap();
+    let committed =
+        crate::snapshots::e2_pipeline_scan_fixture::seed_index_for_test(&committed, &index_path);
+    working.retain_persistence_baseline_from(&committed);
+    working.generation = committed.generation;
     let mut index = checkpoint_partial_snapshot_index(
         &working,
         &committed,

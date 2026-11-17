@@ -1292,9 +1292,12 @@ fn claude_capability_activity_normalizes_built_in_mcp_names_and_dedupes_tool_use
 fn scan_index_recovers_from_truncated_json_and_replaces_it_atomically() {
     let root = temp_dir("scan-index-recovery");
     let path = root.join("codex-scan-index.json");
-    fs::write(&path, r#"{"files":{"partial""#).expect("write truncated index");
-
-    let recovered = ScanIndex::load(&path).expect("truncated index should self-heal");
+    e2_pipeline_scan_fixture::bind_source_for_test(&path, SnapshotSource::Codex);
+    e2_pipeline_scan_fixture::legacy_input_for_test(&path, br#"{"files":{"partial""#);
+    let recovered =
+        e2_pipeline_scan_fixture::load_source_for_test(&path, SnapshotSource::Codex, &root)
+            .expect("quarantine publishes and the next pass adopts fresh custody")
+            .0;
     assert!(recovered.files.is_empty());
 
     let mut replacement = ScanIndex {
@@ -1314,7 +1317,9 @@ fn scan_index_recovers_from_truncated_json_and_replaces_it_atomically() {
         )]),
         ..ScanIndex::default()
     };
-    replacement.save(&path).expect("save replacement index");
+    replacement
+        .save_fixture(&path)
+        .expect("save replacement index");
 
     assert_eq!(
         ScanIndex::load(&path)
@@ -1354,11 +1359,13 @@ fn scan_index_load_isolates_a_malformed_unsettled_cause_diagnostic() {
             if flag {
                 index.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::Shed);
             }
-            index.save(&path).expect("persist index");
-            let mut saved: serde_json::Value =
-                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            index.save_fixture(&path).expect("persist index");
+            let mut saved = serde_json::to_value(&index).unwrap();
             saved["bounded_sweep_unsettled_causes"] = value.clone();
-            fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+            e2_pipeline_scan_fixture::seed_json_for_test(
+                &path,
+                &serde_json::to_vec(&saved).unwrap(),
+            );
 
             let loaded = ScanIndex::load(&path).expect("a diagnostic leaf never fails load");
             assert!(path.exists(), "{value} must not quarantine the index");
@@ -1414,7 +1421,9 @@ fn scan_index_save_drops_only_a_syntactically_valid_corrupt_activity_witness() {
         )]),
         ..ScanIndex::default()
     };
-    corrupt.save(&path).expect("persist corrupt semantic clock");
+    corrupt
+        .save_fixture(&path)
+        .expect("persist corrupt semantic clock");
 
     let recovered = ScanIndex::load(&path).expect("corrupt semantic clock should self-heal");
     assert_eq!(recovered.generation, 1);
@@ -1741,7 +1750,7 @@ fn large_scan_index_save_preserves_bytes_and_generation_fence() {
         resume_after_path: Some("synthetic-checkpoint".repeat(4096)),
         ..ScanIndex::default()
     };
-    index.save(&path).expect("save large generation");
+    index.save_fixture(&path).expect("save large generation");
     assert_eq!(
         serde_json::to_vec(&ScanIndex::load(&path).expect("read durable index")).unwrap(),
         serde_json::to_vec(&index).unwrap()
@@ -1749,9 +1758,9 @@ fn large_scan_index_save_preserves_bytes_and_generation_fence() {
     let mut stale = ScanIndex::load(&path).expect("load stale generation");
     let mut winner = ScanIndex::load(&path).expect("load winning generation");
     winner.resume_after_path = Some("replacement-checkpoint".repeat(8192));
-    winner.save(&path).expect("save larger replacement");
+    winner.save_fixture(&path).expect("save larger replacement");
     stale
-        .save(&path)
+        .save_fixture(&path)
         .expect_err("stale generation stays fenced");
     assert_eq!(
         serde_json::to_vec(&ScanIndex::load(&path).expect("read winning graph")).unwrap(),

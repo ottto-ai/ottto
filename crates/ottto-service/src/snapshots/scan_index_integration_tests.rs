@@ -293,8 +293,8 @@ fn integrated_fresh_init_orphans_are_discarded_and_failure_observations_are_drai
     let observations = crate::local_resource_diagnostics::take_scan_index_storage_observations();
     assert_eq!(
         observations.iter().map(|(n, _, _)| n).sum::<u64>(),
-        1,
-        "the inventory probe and reader drain the one unavailable object"
+        0,
+        "the native inventory hold precedes the legacy reader"
     );
     assert!(fixture.root.exists());
 }
@@ -726,7 +726,10 @@ fn integrated_missing_root_reserved_only_stalls_before_default_save_or_transcrip
     });
     assert!(reads.is_empty());
     let error = result.expect_err("missing root must refuse before default index");
-    assert!(format!("{error:#}").contains("scan_index_root_missing_with_shards"));
+    assert_eq!(
+        error.downcast_ref::<state_v2::Hold>(),
+        Some(&state_v2::Hold::DbUnavailable)
+    );
     assert!(!fixture.root.exists(), "no fresh save");
     assert_eq!(fs::read_dir(&fixture.shards).unwrap().count(), 2);
     for path in files {

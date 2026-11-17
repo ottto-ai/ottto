@@ -674,7 +674,7 @@ fn rows_never_supply_delivery_authority_and_rebuild_carries_them() {
             .contains(&location_key(&holder.to_string_lossy())));
         let mut index = page.index;
         let path = c.base.join("rebuilt-index.json");
-        index.save(&path).unwrap();
+        index.save_fixture(&path).unwrap();
         assert!(has(&ScanIndex::load(&path).unwrap(), &holder, "a"));
     });
 }

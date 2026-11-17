@@ -1808,9 +1808,11 @@ fn claude_backfill_index_load_without_seen_marker_does_not_latch() {
     for corrupt in [false, true] {
         let path = home.join("scan-index.json");
         if corrupt {
-            fs::write(&path, "{truncated").unwrap();
+            e2_pipeline_scan_fixture::legacy_input_for_test(&path, b"{truncated");
         }
-        ScanIndex::load_for_snapshot_source(&path, SnapshotSource::ClaudeCode, &home).unwrap();
+        e2_pipeline_scan_fixture::bind_source_for_test(&path, SnapshotSource::ClaudeCode);
+        e2_pipeline_scan_fixture::load_source_for_test(&path, SnapshotSource::ClaudeCode, &home)
+            .unwrap();
         assert!(!claude_reemission_stop_latched());
         assert_eq!(claude_reemission_stop_reason(), "none");
     }
@@ -1827,10 +1829,12 @@ fn claude_backfill_index_load_preserves_other_sources_and_existing_indexes() {
     for source in [SnapshotSource::Codex, SnapshotSource::Pi] {
         // Production sources own separate checkpoints and rebuild budgets.
         let path = home.join(format!("other-{}-index.json", source.api_slug()));
-        ScanIndex::load_for_snapshot_source(&path, source, &home).unwrap();
+        e2_pipeline_scan_fixture::bind_source_for_test(&path, source);
+        e2_pipeline_scan_fixture::load_source_for_test(&path, source, &home).unwrap();
         assert!(!claude_reemission_stop_latched());
-        fs::write(&path, "{truncated").unwrap();
-        ScanIndex::load_for_snapshot_source(&path, source, &home).unwrap();
+        e2_pipeline_scan_fixture::legacy_input_for_test(&path, b"{truncated");
+        e2_pipeline_scan_fixture::bind_source_for_test(&path, source);
+        e2_pipeline_scan_fixture::load_source_for_test(&path, source, &home).unwrap();
         assert!(!claude_reemission_stop_latched());
     }
     // Both conditions matter: a populated generation-0 index and an empty
@@ -1838,12 +1842,16 @@ fn claude_backfill_index_load_preserves_other_sources_and_existing_indexes() {
     let path = home.join("existing-index.json");
     baseline.generation = 0;
     fs::write(&path, serde_json::to_vec(&baseline).unwrap()).unwrap();
-    ScanIndex::load_for_snapshot_source(&path, SnapshotSource::ClaudeCode, &home).unwrap();
+    e2_pipeline_scan_fixture::bind_source_for_test(&path, SnapshotSource::ClaudeCode);
+    e2_pipeline_scan_fixture::load_source_for_test(&path, SnapshotSource::ClaudeCode, &home)
+        .unwrap();
     assert!(!claude_reemission_stop_latched());
     baseline.files.clear();
     baseline.generation = 1;
     fs::write(&path, serde_json::to_vec(&baseline).unwrap()).unwrap();
-    ScanIndex::load_for_snapshot_source(&path, SnapshotSource::ClaudeCode, &home).unwrap();
+    e2_pipeline_scan_fixture::bind_source_for_test(&path, SnapshotSource::ClaudeCode);
+    e2_pipeline_scan_fixture::load_source_for_test(&path, SnapshotSource::ClaudeCode, &home)
+        .unwrap();
     assert!(!claude_reemission_stop_latched());
     let _ = fs::remove_dir_all(home);
 }

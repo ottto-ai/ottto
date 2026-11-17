@@ -1526,8 +1526,9 @@ fn census_sequence_index_preserves_serde_compatibility_and_isolates_evidence() {
         loaded.claude_request_census_for_test(),
         control.claude_request_census_for_test()
     );
+    loaded = e2_pipeline_scan_fixture::seed_index_for_test(&loaded, &scratch.join("sequence.json"));
     loaded
-        .save(&scratch.join("sequence.json"))
+        .save_fixture(&scratch.join("sequence.json"))
         .expect("positional CAS remains supported");
 }
 
@@ -1564,7 +1565,10 @@ fn census_valid_shadow_state_round_trips_exactly() {
                 2
             );
             let path = scratch.join(format!("{name}.json"));
-            loaded.save(&path).expect("CAS preserves shadow state");
+            loaded = e2_pipeline_scan_fixture::seed_index_for_test(&loaded, &path);
+            loaded
+                .save_fixture(&path)
+                .expect("CAS preserves shadow state");
             let reloaded = ScanIndex::load(&path).unwrap();
             assert_eq!(
                 serde_json::to_value(&reloaded).unwrap()["claude_request_census_shadow"],
@@ -1605,8 +1609,12 @@ fn census_duplicate_optional_fields_invalidate_only_the_ambiguous_evidence() {
                 None
             );
         }
+        loaded = e2_pipeline_scan_fixture::seed_index_for_test(
+            &loaded,
+            &scratch.join(format!("{field}.json")),
+        );
         loaded
-            .save(&scratch.join(format!("{field}.json")))
+            .save_fixture(&scratch.join(format!("{field}.json")))
             .expect("CAS isolates optional duplicates");
     }
     // Required duplicate fields are ambiguous. Refuse without replacing the

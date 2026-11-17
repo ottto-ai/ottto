@@ -161,7 +161,7 @@ fn apc_owed(index: &ScanIndex) -> Option<BTreeSet<String>> {
 }
 
 fn apc_save_reload(index: &mut ScanIndex, path: &Path) -> ScanIndex {
-    index.save(path).expect("save correction state");
+    index.save_fixture(path).expect("save correction state");
     let loaded = ScanIndex::load(path).expect("reload correction state");
     assert_eq!(
         serde_json::to_vec(&loaded).unwrap(),
@@ -289,7 +289,9 @@ fn invalid_correction_states_drop_only_the_affected_authority_record() {
     let scratch = crate::test_scratch::ScratchDir::new("proof-correction-load");
     let mut index = apc_terminal_fixture();
     apc_prove(&mut index, &apc_witness('f'));
-    index.save(&scratch.join("valid-source.json")).unwrap();
+    index
+        .save_fixture(&scratch.join("valid-source.json"))
+        .unwrap();
     let valid = serde_json::to_value(&index).unwrap();
     let (loaded, quarantined) = apc_load_value(&scratch, "valid", &valid);
     assert!(!quarantined);
@@ -466,7 +468,7 @@ fn pre_change_decoder_rejects_the_declared_v2_contract_and_rebuilds() {
     // The old loader's invalid branch used this shared quarantine helper.
     let scratch = crate::test_scratch::ScratchDir::new("proof-correction-old-reader");
     let path = scratch.join("index.json");
-    index.save(&path).unwrap();
+    index.save_fixture(&path).unwrap();
     let encoded_index_bytes = fs::metadata(&path).unwrap().len();
     let files = index.files.len();
     let accepted_entities = index.accepted_snapshot_fingerprints.len();
@@ -1771,7 +1773,7 @@ fn save_drops_existing_orphan_authority_record_and_succeeds() {
     let (drops, rearmed) = claude_authority_drops_for_test();
     let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
     index
-        .save(&path)
+        .save_fixture(&path)
         .expect("an orphan record never fails the save");
     assert_eq!(
         diagnostics

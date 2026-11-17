@@ -325,7 +325,7 @@ fn scan_index_save_in_progress_is_never_disturbed() {
     let f = fixture();
     let path = f.dest.join(format!("{INDEX}.json"));
     // The saver loads generation 1 from this destination's own native store.
-    ScanIndex::default().save(&path).expect("seed save");
+    ScanIndex::default().save_fixture(&path).expect("seed save");
     let mut saver = ScanIndex::load(&path).expect("seed load");
     assert_eq!(saver.generation, 1);
     let in_flight = f.dest.join(pid_temp(INDEX, std::process::id() as i32));
@@ -338,7 +338,7 @@ fn scan_index_save_in_progress_is_never_disturbed() {
     let (resume_tx, resume_rx) = std::sync::mpsc::channel();
     let save = std::thread::spawn(move || {
         crate::snapshots::pause_next_scan_index_cas_for_test(entered_tx, resume_rx);
-        saver.save(&save_path).map(|()| saver.generation)
+        saver.save_fixture(&save_path).map(|()| saver.generation)
     });
     entered_rx
         .recv_timeout(Duration::from_secs(30))
@@ -375,7 +375,7 @@ fn scan_index_save_after_the_sweep_succeeds() {
     let f = fixture();
     let path = f.dest.join("codex-scan-index-v3.json");
     let mut index = ScanIndex::default();
-    index.save(&path).expect("first save");
+    index.save_fixture(&path).expect("first save");
     let orphan = f.dest.join(pid_temp("codex-scan-index-v3", DEAD_PID));
     write(&orphan, b"orphan");
 
@@ -383,7 +383,7 @@ fn scan_index_save_after_the_sweep_succeeds() {
 
     assert_eq!(report.removed, 1);
     assert!(!orphan.exists());
-    index.save(&path).expect("save after sweep");
+    index.save_fixture(&path).expect("save after sweep");
     assert_eq!(ScanIndex::load(&path).expect("load").generation, 2);
     drop(hold_lock(&f.dest.join("codex-scan-index-v3.lock")));
 }

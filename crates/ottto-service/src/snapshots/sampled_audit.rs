@@ -667,7 +667,7 @@ mod tests {
         );
         index.remove_file_entry(&key);
         assert!(index.files.contains_key(&key));
-        index.save(&path).unwrap();
+        index.save_fixture(&path).unwrap();
         let mut older = ScanIndex::load(&path).unwrap();
         let mut current = ScanIndex::load(&path).unwrap();
         assert!(current.files[&key].has_unverified_source());

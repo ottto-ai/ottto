@@ -1018,7 +1018,7 @@ mod tests {
         let file = root.join("index.json");
         let mut index = ScanIndex::default();
         index.files.insert("kept.jsonl".into(), entry());
-        index.save(&file).unwrap();
+        index.save_fixture(&file).unwrap();
         let original: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
         for bad in [
