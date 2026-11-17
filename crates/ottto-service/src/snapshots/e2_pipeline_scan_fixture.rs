@@ -33,6 +33,147 @@ fn fixture_routes() -> &'static Mutex<BTreeSet<PathBuf>> {
     ROUTES.get_or_init(Default::default)
 }
 
+fn fixture_bindings() -> &'static Mutex<BTreeMap<PathBuf, scan_index_persistence::Binding>> {
+    static BINDINGS: std::sync::OnceLock<
+        Mutex<BTreeMap<PathBuf, scan_index_persistence::Binding>>,
+    > = std::sync::OnceLock::new();
+    BINDINGS.get_or_init(Default::default)
+}
+
+/// Synthetic checkpoint names keep their fixture-owned temporary location.
+/// The production binding recognizer never accepts these aliases.
+pub(super) fn fixture_binding(path: &Path) -> Option<scan_index_persistence::Binding> {
+    fixture_bindings().lock().unwrap().get(path).cloned()
+}
+
+fn prepare_fixture_save(index: &mut ScanIndex, path: &Path) -> Result<()> {
+    let synthetic = fixture_binding(path).is_some()
+        || scan_index_integration::scan_index_storage_binding(path).is_none();
+    if scan_index_integration::scan_index_storage_binding(path).is_none() {
+        let source = route_of(index)
+            .and_then(|route| scan_index_integration::scan_index_storage_binding(&route))
+            .map(|binding| binding.source)
+            .unwrap_or_else(|| {
+                let name = path.file_name().unwrap().to_string_lossy();
+                if name.contains("codex") {
+                    scan_index_persistence::Source::Codex
+                } else if name.contains("pi-") {
+                    scan_index_persistence::Source::Pi
+                } else {
+                    scan_index_persistence::Source::Claude
+                }
+            });
+        fixture_bindings().lock().unwrap().insert(
+            path.to_owned(),
+            scan_index_persistence::Binding {
+                source,
+                namespace_hash: "a".repeat(64),
+            },
+        );
+    }
+    if index.v2().persistence_v2.is_none()
+        || (synthetic && route_of(index).as_deref() != Some(path))
+    {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let baseline = ScanIndex::load(path)?;
+        index.retain_persistence_baseline_from(&baseline);
+        index.generation = baseline.generation;
+        E2ScanFixture::register_route_for_test(path);
+    }
+    Ok(())
+}
+
+/// Explicit native seed for decoder fixtures whose original bytes deliberately
+/// fail the production inventory gate. This never runs on a daemon load/save.
+pub(crate) fn seed_index_for_test(index: &ScanIndex, path: &Path) -> ScanIndex {
+    let binding = scan_index_integration::scan_index_storage_binding(path)
+        .expect("a destination-bound native fixture");
+    let progress = crate::snapshot_sync::with_state_v2_progress_lock(path, |progress_path| {
+        match fs::read(progress_path) {
+            Ok(bytes) => Ok(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(serde_json::to_vec(&serde_json::json!({
+                    "schema_version": 3,
+                    "destination_namespace_hash": binding.namespace_hash,
+                }))?)
+            }
+            Err(error) => Err(error.into()),
+        }
+    })
+    .unwrap();
+    let (store, loaded) = state_v2::StateV2ColdSession::publish_at(index, path, &progress);
+    // The enclosing scratch fixture owns deletion, as for bind_fixture_route.
+    std::mem::forget(store);
+    E2ScanFixture::register_route_for_test(path);
+    loaded
+}
+
+/// Decoder/mapper unit fixtures inspect legacy bytes without admitting a live
+/// runtime before constructing their separate unpublished proof database.
+pub(crate) fn read_legacy_for_test(path: &Path) -> ScanIndex {
+    read_scan_index_representation(path, "load", "unattributed", None).unwrap()
+}
+
+// Only test builds substitute these fixture-facing entry points. Every actual
+// write still runs the production saver, with its locks, CAS and reconciliation.
+impl ScanIndex {
+    pub fn save(&mut self, path: &Path) -> Result<()> {
+        prepare_fixture_save(self, path)?;
+        self.save_native(path)
+    }
+
+    pub(crate) fn save_with_read_limit(&mut self, path: &Path, cap: usize) -> Result<()> {
+        prepare_fixture_save(self, path)?;
+        self.save_internal(path, Some(cap), false)
+    }
+
+    pub(crate) fn save_with_progress_owner(
+        &mut self,
+        path: &Path,
+        cap: Option<usize>,
+        _owner: &crate::snapshot_sync::SnapshotProgressLock,
+    ) -> Result<()> {
+        prepare_fixture_save(self, path)?;
+        self.save_internal(path, cap, false)
+    }
+
+    /// Bypass fixture preparation when asserting a production refusal.
+    pub(crate) fn save_native(&mut self, path: &Path) -> Result<()> {
+        self.save_internal(path, None, false)
+    }
+}
+
+#[test]
+fn synthetic_default_indexes_save_and_reload_through_native_custody() {
+    let scratch = crate::test_scratch::ScratchDir::canonical("fixture-native-save");
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        let path = scratch.join(format!("{}-index.json", source.api_slug()));
+        let mut index = ScanIndex::default();
+        index.historical_replay_generation = Some(source.api_slug().into());
+        index.save(&path).unwrap();
+        assert_eq!(route_of(&index).as_deref(), Some(path.as_path()));
+        assert_eq!(index.generation, 1);
+        state_v2::cold_close_for_test(&path).unwrap();
+        let restored = ScanIndex::load(&path).unwrap();
+        assert_eq!(restored.generation, 1);
+        assert_eq!(
+            restored.historical_replay_generation,
+            index.historical_replay_generation
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&fs::read(path).unwrap()).unwrap()
+                ["storage_format"],
+            2
+        );
+    }
+}
+
 /// Claude continues only from the state database, so an owner's retained
 /// state is its route: the prior this owner produced is committed there first,
 /// as the daemon saves between passes, and any other owner's prior moves to a
@@ -454,10 +595,7 @@ pub(crate) fn bind_fixture_route(
         .join(namespace)
         .join(format!("{}-synthetic-scan-index.json", source.api_slug()));
     fs::create_dir_all(path.parent().unwrap()).unwrap();
-    let empty = ScanIndex::load(&path).unwrap();
-    index.retain_persistence_baseline_from(&empty);
-    index.generation = empty.generation;
-    E2ScanFixture::register_route_for_test(&path);
+    prepare_fixture_save(index, &path).unwrap();
     path
 }
 

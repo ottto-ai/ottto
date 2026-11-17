@@ -121,7 +121,15 @@ impl Hold {
             Self::DbUnavailable
         };
         // Do not retain arbitrary engine messages/paths in public health output.
-        hold.into()
+        // Synthetic test stores retain the cause for CI failure diagnostics.
+        #[cfg(test)]
+        {
+            error.context(hold)
+        }
+        #[cfg(not(test))]
+        {
+            hold.into()
+        }
     }
 }
 struct RouteState {

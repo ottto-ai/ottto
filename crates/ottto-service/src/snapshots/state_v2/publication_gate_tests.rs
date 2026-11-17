@@ -1,6 +1,7 @@
 //! Collection admission and same-process publication recovery over synthetic input.
 use super::*;
 use crate::snapshots::{self as s, SnapshotSource};
+use std::os::unix::fs::PermissionsExt;
 
 const SOURCES: [SnapshotSource; 3] = [
     SnapshotSource::ClaudeCode,
@@ -92,6 +93,11 @@ fn missing_store_adoption_clears_the_blocker_and_recovers_orphan_shards() {
     for (slot, source) in SOURCES.into_iter().enumerate() {
         let f = fixture(source);
         fs::create_dir(fence::sibling(&f.path, ".shards")).unwrap();
+        fs::set_permissions(
+            fence::sibling(&f.path, ".shards"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
         s::scan_index_health::observe(source, &Err(Hold::ReloadRequired.into()));
         assert!(s::scan_index_health::observations()[2][slot].0.is_some());
         let (index, origin) =
@@ -107,12 +113,6 @@ fn missing_store_adoption_clears_the_blocker_and_recovers_orphan_shards() {
 #[test]
 fn claude_raw_hold_survives_a_native_save_and_cold_reload() {
     let f = fixture(SnapshotSource::ClaudeCode);
-    let (mut index, _) = ScanIndex::load_for_snapshot_source_with_origin(
-        &f.path,
-        SnapshotSource::ClaudeCode,
-        &f.support,
-    )
-    .unwrap();
     let held = s::lenient_decode::read_bounded(
         br#"{"schema_version":2,"files":{"opaque":{"size_bytes":[]}}}"#,
     )
@@ -123,7 +123,9 @@ fn claude_raw_hold_survives_a_native_save_and_cold_reload() {
         .v2_entries()
         .map(|(field, key, bytes, _, _)| (field.to_owned(), key.to_owned(), bytes.to_vec()))
         .collect();
-    index.decode_holds = held.decode_holds;
+    // Raw holds are admitted custody, not new damage introduced after the
+    // pass adopted a clean baseline. Seed that custody through the mapper.
+    let mut index = s::e2_pipeline_scan_fixture::seed_index_for_test(&held, &f.path);
     index.save(&f.path).unwrap();
     drop(index);
     cold_close_for_test(&f.path).unwrap();
@@ -149,12 +151,18 @@ fn unbound_load_cannot_save_and_unadopted_bound_graph_requires_reload() {
     fs::write(&unbound, &input).unwrap();
     let mut index = ScanIndex::load(&unbound).unwrap();
     assert_eq!(
-        index.save(&unbound).unwrap_err().downcast_ref::<Hold>(),
+        index
+            .save_native(&unbound)
+            .unwrap_err()
+            .downcast_ref::<Hold>(),
         Some(&Hold::ForeignBinding)
     );
     assert_eq!(fs::read(&unbound).unwrap(), input);
     assert_eq!(
-        index.save(&f.path).unwrap_err().downcast_ref::<Hold>(),
+        index
+            .save_native(&f.path)
+            .unwrap_err()
+            .downcast_ref::<Hold>(),
         Some(&Hold::ReloadRequired)
     );
     assert!(!f.path.exists());

@@ -34,7 +34,10 @@ pub(crate) fn unique_name(prefix: &str) -> String {
 /// An unused scratch path directly under `$TMPDIR`. The directory is not
 /// created; callers that want one should use [`private_dir`].
 pub(crate) fn unique_path(prefix: &str) -> PathBuf {
-    std::env::temp_dir().join(unique_name(prefix))
+    std::env::temp_dir()
+        .canonicalize()
+        .expect("canonical temporary directory")
+        .join(unique_name(prefix))
 }
 
 /// Creates `path` as an owner-only directory and refuses to adopt anything

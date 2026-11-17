@@ -1201,9 +1201,10 @@ fn unknown_fields_and_interrupted_save_never_reset_progress_or_publish_partial_c
     raw["future_money"] = serde_json::json!({"owed": 19});
     fs::write(&f.path, serde_json::to_vec(&raw).unwrap()).unwrap();
     assert!(load_with(&f.path, true).unwrap().is_none());
-    let legacy = ScanIndex::load(&f.path).unwrap();
-    assert!(legacy.persistence_available());
-    assert!(legacy.v2().persistence_v2.is_none());
+    assert_eq!(
+        ScanIndex::load(&f.path).unwrap_err().downcast_ref::<Hold>(),
+        Some(&Hold::DbUnavailable)
+    );
     assert_eq!(fs::read(&progress_path).unwrap(), progress);
     assert!(!fence::sibling(&f.path, ".v2.sqlite").exists());
 
@@ -1585,31 +1586,23 @@ fn expired_growth_claim_rides_the_next_selecting_page() {
     );
 }
 
-/// [behaviour] a bound v1 source with no support dir never opens, creates or migrates SQLite custody.
+/// [behaviour] A bound legacy source adopts SQLite even without a support directory.
 #[test]
-fn off_bound_v1_load_and_save_leave_all_database_paths_absent() {
+fn bound_v1_load_without_support_adopts_native_custody_before_saving() {
     let f = Fixture::new();
     let bytes = serde_json::to_vec(&ScanIndex::default()).unwrap();
     fs::write(&f.path, &bytes).unwrap();
     let mut index = ScanIndex::load(&f.path).unwrap();
-    assert!(index.v2().persistence_v2.is_none());
-    index.save(&f.path).unwrap();
-    assert!(f.path.exists());
-    assert!(!states().lock().unwrap().contains_key(&f.path));
-    for suffix in [
-        ".v2.sqlite",
-        ".v2.sqlite.import",
-        ".v2.sqlite.owner",
-        ".v2.sqlite-wal",
-        ".v2.sqlite-shm",
-        ".v2-ack-receipt",
-        ".v1-readonly",
-    ] {
-        assert!(
-            !fence::sibling(&f.path, suffix).exists(),
-            "OFF created {suffix}"
-        );
-    }
+    assert!(index.v2().persistence_v2.is_some());
+    assert_eq!(index.generation, 1);
+    index.save_native(&f.path).unwrap();
+    assert_eq!(index.generation, 2);
+    assert!(fence::sibling(&f.path, ".v2.sqlite").exists());
+    assert_eq!(
+        fs::read(fence::sibling(&f.path, ".v1-readonly")).unwrap(),
+        bytes
+    );
+    assert!(published(&f.path).unwrap());
 }
 
 /// [format] Legacy refusal debt survives exact decoding and ordinary save removes it on native and imported stores.

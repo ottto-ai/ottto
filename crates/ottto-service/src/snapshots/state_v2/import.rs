@@ -1545,7 +1545,8 @@ mod application_cases {
             ..Default::default()
         };
         // The production v1 loader owns all original-span repair/freeze ordering.
-        let mut normalized = ScanIndex::load(&c.path).unwrap();
+        let mut normalized =
+            crate::snapshots::e2_pipeline_scan_fixture::read_legacy_for_test(&c.path);
         assert!(normalized.decode_holds_family("family"));
         assert!(normalized.claude_usage_authority_quarantine.is_empty());
         assert!(normalized.claude_usage_family_witnesses.is_empty());
