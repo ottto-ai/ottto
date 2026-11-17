@@ -193,13 +193,10 @@ use self::progress_rows::SnapshotUploadProgressCas;
 use self::progress_rows::SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION;
 mod finish;
 #[cfg(test)]
-use self::lane::collect_file_activity_with_retry;
-#[cfg(test)]
 use self::lane::cycle_heartbeat;
 use self::lane::local_cadence_phase_offset;
 #[cfg(test)]
 pub(crate) use self::lane::retained_with_withheld;
-use self::lane::retry_ordinary_owned;
 pub use self::lane::spawn_claude_agent_status_refresh;
 pub use self::lane::spawn_failed_verification_reverify;
 pub use self::lane::spawn_local_health_projection_sync;
@@ -566,12 +563,6 @@ mod telemetry_only;
 mod upload_context_resend;
 
 use crate::hex::is_sha256_any_case as is_snapshot_fingerprint;
-
-#[allow(dead_code, reason = "preparation is compiled ahead of its activation")]
-#[path = "bounded_snapshot_retry.rs"]
-mod bounded_snapshot_retry;
-#[path = "live_snapshot_retry.rs"]
-mod live_snapshot_retry;
 
 #[cfg(test)]
 pub(crate) use tests::codex_archive_tests::{

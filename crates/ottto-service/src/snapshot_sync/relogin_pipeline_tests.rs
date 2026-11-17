@@ -41,9 +41,8 @@ fn relogin_alias_keeps_accepted_history_without_a_reread() {
         codex_home_bindings: Vec::new(),
         setup_snapshot_index: None,
     };
-    let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
     // One cycle in a fresh daemon and client: what it offered and where.
-    let mut cycle = |device: &LocalDeviceBinding, secret: &str| {
+    let cycle = |device: &LocalDeviceBinding, secret: &str| {
         cadence.next_due_cycle();
         server.offered.lock().unwrap().clear();
         let reports = server.terminal.lock().unwrap().len();
@@ -62,7 +61,6 @@ fn relogin_alias_keeps_accepted_history_without_a_reread() {
                 &daemon,
                 &mut transport,
                 daemon.snapshot_scan_account_witness().unwrap(),
-                false,
             )
         })
         .unwrap()
@@ -86,7 +84,6 @@ fn relogin_alias_keeps_accepted_history_without_a_reread() {
                 &support,
                 &daemon,
                 &mut transport,
-                &mut retry,
             )
         })
         .unwrap();
@@ -331,11 +328,10 @@ fn owner_return_preserves_all_source_carry() {
         );
         legacy.save(&cx_path).unwrap();
         crate::snapshots::older_build_logs_priority("return-turn");
-        let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
         // A claim switch keeps the daemon alive. Keep its physical-header cache
         // while reloading account/index state on each ordinary source pass.
         let daemon_owner = test_daemon("machine_test");
-        let mut cycle = |device: &LocalDeviceBinding, secret: &str, source: SnapshotSource| {
+        let cycle = |device: &LocalDeviceBinding, secret: &str, source: SnapshotSource| {
             cadence.next_due_cycle();
             source_cadences().lock().unwrap().remove(source.api_slug());
             source_upload_deadlines()
@@ -382,7 +378,6 @@ fn owner_return_preserves_all_source_carry() {
                                 &daemon,
                                 &mut transport,
                                 daemon.snapshot_scan_account_witness().unwrap(),
-                                false,
                             )
                         })
                         .unwrap()
@@ -414,7 +409,6 @@ fn owner_return_preserves_all_source_carry() {
                             &support,
                             &daemon,
                             &mut transport,
-                            &mut retry,
                         )
                     })
                     .unwrap();
@@ -856,10 +850,9 @@ fn account_return_history_row(recorded_a: bool) {
     })
     .unwrap();
     crate::snapshots::older_build_logs_priority("return-turn");
-    let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
     let daemon_owner = test_daemon("machine_test");
     // Existing prepare/finish scaffold, now table-driven across the three sources.
-    let mut cycle = |device: &LocalDeviceBinding, secret: &str, source: SnapshotSource| {
+    let cycle = |device: &LocalDeviceBinding, secret: &str, source: SnapshotSource| {
         cadence.next_due_cycle();
         source_cadences().lock().unwrap().remove(source.api_slug());
         source_upload_deadlines()
@@ -905,7 +898,6 @@ fn account_return_history_row(recorded_a: bool) {
                         &daemon,
                         &mut transport,
                         daemon.snapshot_scan_account_witness().unwrap(),
-                        false,
                     )
                 })
                 .unwrap()
@@ -937,7 +929,6 @@ fn account_return_history_row(recorded_a: bool) {
                         &support,
                         &daemon,
                         &mut transport,
-                        &mut retry,
                     )
                 })
                 .unwrap();

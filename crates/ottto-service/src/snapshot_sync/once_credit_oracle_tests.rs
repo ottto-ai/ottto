@@ -324,7 +324,6 @@ struct OracleHome {
     client: SnapshotApiClient,
     daemon: LocalDaemon,
     transport: crate::net_resilience::TransportCycleOutcome,
-    retry: live_snapshot_retry::LiveRetryOwner,
     _env: [EnvVarGuard; 3],
 }
 
@@ -465,7 +464,6 @@ impl OracleHome {
             client: SnapshotApiClient::new(server.url.clone()),
             daemon: test_daemon("otm_test"),
             transport: Default::default(),
-            retry: live_snapshot_retry::LiveRetryOwner::closed(),
             _env: env,
         }
     }
@@ -533,7 +531,6 @@ impl OracleHome {
     }
     fn restart(&mut self) {
         drop(std::mem::replace(&mut self.daemon, test_daemon("otm_test")));
-        self.retry = live_snapshot_retry::LiveRetryOwner::closed();
         self.restarted = true;
         test_effects::record("restart", Vec::new());
     }
@@ -597,7 +594,6 @@ impl OracleHome {
                         &self.daemon,
                         &mut self.transport,
                         self.daemon.snapshot_scan_account_witness().unwrap(),
-                        false,
                     )
                 })
             })
@@ -717,7 +713,6 @@ impl OracleHome {
                         &self.support,
                         &self.daemon,
                         &mut self.transport,
-                        &mut self.retry,
                     )
                 })
             })

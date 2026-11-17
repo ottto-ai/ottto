@@ -370,7 +370,6 @@ struct ReofferPipeline {
     daemon: LocalDaemon,
     cadence: IdentityPipelineCadence,
     transport: crate::net_resilience::TransportCycleOutcome,
-    retry: live_snapshot_retry::LiveRetryOwner,
     _guards: Vec<EnvVarGuard>,
 }
 
@@ -420,7 +419,6 @@ impl ReofferPipeline {
             daemon: test_daemon("otm_test"),
             cadence,
             transport: crate::net_resilience::TransportCycleOutcome::default(),
-            retry: live_snapshot_retry::LiveRetryOwner::closed(),
             _guards: guards,
         }
     }
@@ -458,7 +456,6 @@ impl ReofferPipeline {
                 &self.daemon,
                 &mut self.transport,
                 self.daemon.snapshot_scan_account_witness().unwrap(),
-                false,
             )
         })
     }
@@ -493,7 +490,6 @@ impl ReofferPipeline {
                 &self.support,
                 &self.daemon,
                 &mut self.transport,
-                &mut self.retry,
             )
         });
         let progress_json = std::fs::read(&progress_path)
