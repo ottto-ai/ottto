@@ -64,6 +64,9 @@ or fix it with you.
 
 ## Pull Request Expectations
 
+Use an `ottto.net` or GitHub noreply email address for your commits. The public
+commit check fails if your commit identity uses another address.
+
 - **Keep it focused**: one topic per pull request. Separate mechanical
   refactoring from behavior changes.
 - **Write a plain, descriptive title.** Pull requests are squash-merged and the
