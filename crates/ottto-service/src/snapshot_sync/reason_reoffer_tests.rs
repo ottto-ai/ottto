@@ -648,14 +648,16 @@ fn retained_refusal_preserves_newer_retry_debt_without_early_transmission() {
         with_retained_refusal_conflicts(result, &index, &progress, NOW),
         ResumableUploadResult::Deferred {
             count: 1,
-            isolated: 0
+            isolated: 0,
+            identity_503: 0
         }
     );
     assert_eq!(
         with_retained_refusal_conflicts(ResumableUploadResult::Completed, &index, &progress, NOW),
         ResumableUploadResult::Deferred {
             count: 1,
-            isolated: 0
+            isolated: 0,
+            identity_503: 0
         },
         "an empty frozen delta still owes retry debt"
     );
@@ -663,7 +665,8 @@ fn retained_refusal_preserves_newer_retry_debt_without_early_transmission() {
         with_retained_refusal_conflicts(
             ResumableUploadResult::Deferred {
                 count: 2,
-                isolated: 0
+                isolated: 0,
+                identity_503: 0
             },
             &index,
             &progress,
@@ -671,7 +674,8 @@ fn retained_refusal_preserves_newer_retry_debt_without_early_transmission() {
         ),
         ResumableUploadResult::Deferred {
             count: 3,
-            isolated: 0
+            isolated: 0,
+            identity_503: 0
         },
         "ordinary and retained conflicts are distinct"
     );
@@ -680,7 +684,8 @@ fn retained_refusal_preserves_newer_retry_debt_without_early_transmission() {
         with_retained_refusal_conflicts(
             ResumableUploadResult::Deferred {
                 count: 1,
-                isolated: 0
+                isolated: 0,
+                identity_503: 0
             },
             &index,
             &progress,
@@ -688,7 +693,8 @@ fn retained_refusal_preserves_newer_retry_debt_without_early_transmission() {
         ),
         ResumableUploadResult::Deferred {
             count: 1,
-            isolated: 0
+            isolated: 0,
+            identity_503: 0
         },
         "a fresh re-offer conflict was already counted once"
     );
@@ -878,7 +884,8 @@ fn cooldown_debt_on_unvisited_pages_does_not_clear_causes_or_mask_new_conflicts(
         with_retained_refusal_conflicts(
             ResumableUploadResult::Deferred {
                 count: 2,
-                isolated: 0
+                isolated: 0,
+                identity_503: 0
             },
             &index,
             &progress,
@@ -886,7 +893,8 @@ fn cooldown_debt_on_unvisited_pages_does_not_clear_causes_or_mask_new_conflicts(
         ),
         ResumableUploadResult::Deferred {
             count: 2,
-            isolated: 0
+            isolated: 0,
+            identity_503: 0
         },
         "new unrelated conflicts stay blocking"
     );
