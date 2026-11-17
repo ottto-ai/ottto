@@ -1755,6 +1755,8 @@ impl LockedStore {
             if temp_named(text, &temp_prefix) {
                 Stamp::capture(&open_at(&self.parent, name, libc::O_RDONLY)?, true)?;
                 temps = true;
+            } else if text == format!("{root}.v2.sqlite.owner") {
+                Stamp::capture(&open_at(&self.parent, name, libc::O_RDONLY)?, true)?;
             } else if text == format!("{stem}-upload-progress.lock") {
                 Stamp::capture(&open_at(&self.parent, name, libc::O_RDONLY)?, false)?;
             } else if text == format!("{stem}.durable-tail") {

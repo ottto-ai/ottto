@@ -159,3 +159,30 @@ fn unbound_load_cannot_save_and_unadopted_bound_graph_requires_reload() {
     );
     assert!(!f.path.exists());
 }
+
+#[test]
+fn fresh_import_retries_unpublished_initialization_after_restart_without_losing_baselines() {
+    let f = fixture(SnapshotSource::ClaudeCode);
+    // A failed initialization has no semantic rows or fence, but leaves the
+    // engine owner and import file. The next process must still initialize.
+    let db = sqlite::Sqlite::create_import(&fence::sibling(&f.path, ".v2.sqlite.import")).unwrap();
+    drop(db);
+    let (index, _) = ScanIndex::load_for_snapshot_source_with_origin(
+        &f.path,
+        SnapshotSource::ClaudeCode,
+        &f.support,
+    )
+    .unwrap();
+    assert_eq!(index.generation, 0);
+    assert!(index.v2().persistence_v2.is_some());
+    let f = fixture(SnapshotSource::ClaudeCode);
+    let baseline = fence::sibling(&f.path, ".v1-readonly");
+    fs::write(&baseline, b"prior-state-baseline").unwrap();
+    assert!(ScanIndex::load_for_snapshot_source_with_origin(
+        &f.path,
+        SnapshotSource::ClaudeCode,
+        &f.support,
+    )
+    .is_err());
+    assert_eq!(fs::read(&baseline).unwrap(), b"prior-state-baseline");
+}

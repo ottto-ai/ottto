@@ -421,6 +421,19 @@ fn load_with_custody(
         if !importable {
             return Ok(None);
         }
+        if !fence::exists(path)? {
+            // A preserved legacy baseline is prior history, never fresh-init
+            // authority. Only unpublished native remnants may be discarded.
+            ensure!(
+                !fence::exists(&fence::sibling(path, ".v1-readonly"))?
+                    && !fence::exists(&fence::sibling(path, ".v1-readonly.shards"))?,
+                Hold::DbUnavailable
+            );
+            telemetry::event(
+                "orphan_removed",
+                &fence::cleanup_unpublished(path, state.latched)?,
+            );
+        }
         super::super::scan_index_integration::recover_fresh_init(
             path,
             binding.source.snapshot().api_slug(),

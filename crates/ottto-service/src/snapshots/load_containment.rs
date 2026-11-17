@@ -307,6 +307,7 @@ fn write_scan_index_override_stamp(
     let stamp = serde_json::to_vec(&ScanIndexOverrideStamp {
         last_override_unix_seconds: unix_seconds_at(now),
     })?;
+    let temp_path = path.with_extension(format!("json.{}.tmp", std::process::id()));
     let result = (|| -> Result<()> {
         let mut file = File::create(&temp_path)?;
         std::io::Write::write_all(&mut file, &stamp)?;

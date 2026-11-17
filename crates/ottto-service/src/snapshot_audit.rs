@@ -9,10 +9,10 @@
 use crate::session_attribution::{SessionAttributionContext, SESSION_ATTRIBUTION_HMAC_KEY_VERSION};
 use crate::snapshots::{
     apply_upload_policy, collector_version, finalize_scan_after_policy,
-    scan_source_roots_with_attribution_and_claude_effort_and_hints,
     snapshot_fingerprint_from_component_hashes, snapshot_semantic_component_hashes,
-    snapshot_semantic_envelope, ScanIndex, SnapshotItem, SnapshotSource, SnapshotUploadPolicy,
-    BACKFILL_WINDOW_DAYS, SNAPSHOT_REVISION_CONTRACT_VERSION, SNAPSHOT_SEMANTIC_CONTRACT_VERSION,
+    snapshot_semantic_envelope, OwnedSourceScan, OwnedSourceScanStep, ScanIndex, SnapshotItem,
+    SnapshotSource, SnapshotUploadPolicy, BACKFILL_WINDOW_DAYS, MAX_BACKFILL_FILES_PER_SOURCE,
+    SNAPSHOT_REVISION_CONTRACT_VERSION, SNAPSHOT_SEMANTIC_CONTRACT_VERSION,
 };
 use anyhow::{anyhow, Context, Result};
 use hmac::{Hmac, Mac};
@@ -210,6 +210,7 @@ pub fn run_snapshot_audit<W: Write>(
     crate::snapshots::claude_request_identity::bind_session_context_key(Some(&attribution_context));
     prepare_audit_state_dir(&options.audit_state_dir)?;
     let mut index = ScanIndex::default();
+    let cache = std::sync::Arc::new(crate::snapshots::sampled_scan::SharedCache::default());
     let mut sessions = BTreeMap::new();
     let mut uploads = BTreeMap::new();
     let mut scanned_files = 0;
@@ -217,8 +218,13 @@ pub fn run_snapshot_audit<W: Write>(
     let mut semantic_noops = 0;
     let mut held_sessions = 0;
     let mut report = loop {
-        let (mut page, pending, snapshots) =
-            audit_page(&options, &mut index, &attribution_context, &audit_key)?;
+        let (mut page, pending, snapshots) = audit_page(
+            &options,
+            &mut index,
+            &attribution_context,
+            &audit_key,
+            &cache,
+        )?;
         scanned_files += page.scanned_file_count;
         scanned_sessions += page.scanned_session_count;
         semantic_noops += page.semantic_noop_count;
@@ -271,23 +277,44 @@ fn audit_page(
     index: &mut ScanIndex,
     attribution_context: &SessionAttributionContext,
     audit_key: &[u8],
+    cache: &std::sync::Arc<crate::snapshots::sampled_scan::SharedCache>,
 ) -> Result<(SnapshotAuditReport, bool, Vec<SnapshotItem>)> {
     // As a sync cycle does before scanning: the active body revision is not
     // persisted, and below it the history veto drops every request-owned body.
     index.activate_effective_upload_body_witness_revision(
         crate::snapshot_sync::effective_upload_body_witness_revision(options.source),
     );
-    let mut scan = scan_source_roots_with_attribution_and_claude_effort_and_hints(
+    let scope = crate::transcript_acquisition::Scope("snapshot-audit".into());
+    let mut listing = crate::snapshot_watcher::ListingRequest::default();
+    let mut state = OwnedSourceScan::new_with_recovery_priority(
         options.source,
         &options.roots,
-        index,
+        std::mem::take(index),
         &options.collected_at,
         options.backfill_window_days,
-        Some(attribution_context),
+        MAX_BACKFILL_FILES_PER_SOURCE,
         options.claude_support_dir.as_deref(),
         &[],
         false,
-    )?;
+        &mut listing,
+        cfg!(test) || crate::snapshots::claude_request_identity::captures(options.source),
+        &[],
+        Some((cache, &scope)),
+    )
+    .with_sampled_acquisition(cache.clone(), scope);
+    let mut scan = loop {
+        match state.step(Some(attribution_context)) {
+            OwnedSourceScanStep::Pending(next) => state = next,
+            OwnedSourceScanStep::Complete {
+                index: complete,
+                scan,
+                ..
+            } => {
+                *index = complete;
+                break scan;
+            }
+        }
+    };
     let pending = scan.census_status.pending_work;
     let mut claude_local_evidence = None;
     let mut claude_authority_disposition =
@@ -945,7 +972,7 @@ mod tests {
         let sessions = home.join("sessions");
         fs::create_dir_all(&sessions).unwrap();
         let fixture = include_str!("../../../fixtures/snapshot-audit/pi-session.jsonl");
-        let count = 501;
+        let count = MAX_BACKFILL_FILES_PER_SOURCE + 1;
         for n in 0..count {
             let content = fixture.replace(
                 "fixture-session-019e2700-1111-7000-9000-111111111111",
@@ -972,6 +999,50 @@ mod tests {
             assert_eq!(report.scanned_file_count, count);
             assert!(!options.audit_state_dir.join(AUDIT_SCAN_INDEX_FILE).exists());
         }
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn stateless_audit_funds_compressed_codex_input() {
+        let home = temp_dir("audit-compressed-codex");
+        let sessions = home.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let rows = [
+            serde_json::json!({"type":"session_meta","payload":{"id":"compressed-fixture"}}),
+            serde_json::json!({"type":"event_msg","timestamp":"2026-10-07T10:00:00Z", "payload":{
+                "type":"token_count","info":{"model":"gpt-synthetic","total_token_usage":{
+                    "input_tokens":100,"cached_input_tokens":50,"output_tokens":10}, "last_token_usage":{
+                    "input_tokens":100,"cached_input_tokens":50,"output_tokens":10}}}}),
+        ];
+        let plain = rows
+            .iter()
+            .map(|row| format!("{row}\n"))
+            .collect::<String>();
+        let compressed = zstd::stream::encode_all(plain.as_bytes(), 1).unwrap();
+        fs::write(
+            sessions.join("rollout-compressed-fixture.jsonl.zst"),
+            compressed,
+        )
+        .unwrap();
+        let key = home.join("audit.key");
+        fs::write(&key, &plain.as_bytes()[..MIN_AUDIT_KEY_BYTES]).unwrap();
+        let report = run_snapshot_audit(
+            SnapshotAuditOptions {
+                source: SnapshotSource::Codex,
+                roots: vec![sessions],
+                audit_state_dir: home.join("audit-state"),
+                audit_key_path: key,
+                session_attribution_hmac_key_path: attribution_key_file(&home),
+                attribution_home: Some(home.clone()),
+                machine_id: "fixture-machine".into(),
+                collected_at: "2026-10-07T10:02:00Z".into(),
+                ..Default::default()
+            },
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(report.emitted_session_count, 1);
+        assert_eq!(report.sessions[0].input_tokens, 100);
         fs::remove_dir_all(home).unwrap();
     }
 
