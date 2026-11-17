@@ -284,9 +284,9 @@ fn integrated_fresh_init_orphans_are_discarded_and_failure_observations_are_drai
     assert!(ScanIndex::load(&fixture.root).is_err());
     let observations = crate::local_resource_diagnostics::take_scan_index_storage_observations();
     assert_eq!(
-        observations.len(),
+        observations.iter().map(|(n, _, _)| n).sum::<u64>(),
         1,
-        "error exits pass the same stats drain"
+        "the inventory probe and reader drain the one unavailable object"
     );
     assert!(fixture.root.exists());
 }
@@ -413,7 +413,8 @@ fn integrated_manifest_refuses_each_unknown_map_and_counts_before_window_parsing
     for map in 0..3 {
         let fixture = Fixture::new();
         fs::remove_file(fixture.bucket_path(map)).unwrap();
-        let index = fixture.load();
+        e2_pipeline_scan_fixture::assert_import_support_for_test(&fixture.root);
+        let index = fixture.read();
         let (result, rows) = crate::local_resource_diagnostics::capture(|| {
             index.manifest_for_window(SnapshotSource::ClaudeCode, "invalid", "invalid")
         });
@@ -742,8 +743,8 @@ fn off_large_v1_manifest_load_cas_and_containment_match_compact_v1() {
     assert!(bytes.len() > 4096);
     assert!(bytes.len() < scan_index_persistence::MAX_ROOT_BYTES);
     fs::write(&large.root, &bytes).unwrap();
-    // No sentinel or environment opt-in: exercise the real source-aware OFF
-    // route, v1 CAS writer, and the shared containment admission guard.
+    // Import admission and containment both accept the padded legacy root.
+    // Once adopted, both saves use native custody.
     let mut expected = compact.read();
     let mut actual = large.read();
     assert!(actual.v2().persistence_v2.is_none());
@@ -757,23 +758,13 @@ fn off_large_v1_manifest_load_cas_and_containment_match_compact_v1() {
         let _lock = CheckpointLock::acquire(&large.root).unwrap();
         state_v2::guard_containment_locked(&large.root).unwrap();
     }
+    expected.save(&compact.root).unwrap();
+    actual.save(&large.root).unwrap();
     assert_eq!(
-        expected
-            .save(&compact.root)
-            .unwrap_err()
-            .downcast_ref::<state_v2::Hold>(),
-        Some(&state_v2::Hold::ReloadRequired)
+        serde_json::to_vec(&ScanIndex::load(&large.root).unwrap()).unwrap(),
+        serde_json::to_vec(&ScanIndex::load(&compact.root).unwrap()).unwrap()
     );
-    assert_eq!(
-        actual
-            .save(&large.root)
-            .unwrap_err()
-            .downcast_ref::<state_v2::Hold>(),
-        Some(&state_v2::Hold::ReloadRequired)
-    );
-    assert_eq!(fs::read(&large.root).unwrap(), bytes);
-    assert!(large.read().persistence_available());
-    assert!(!large.root.with_extension("json.v2.sqlite").exists());
+    assert!(large.root.with_extension("json.v2.sqlite").exists());
 }
 
 // Snapshot every file in this bounded synthetic index, including storage

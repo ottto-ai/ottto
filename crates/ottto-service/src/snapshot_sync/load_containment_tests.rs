@@ -57,9 +57,7 @@ fn lc_scan_page(
 }
 
 fn lc_damage(path: &Path, mutate: impl FnOnce(&mut serde_json::Value)) {
-    let mut value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-    mutate(&mut value);
-    std::fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+    crate::snapshots::e2_pipeline_scan_fixture::mutate_index_for_test(path, mutate);
 }
 
 fn lc_item<'a>(scan: &'a crate::snapshots::SourceScanResult, session: &str) -> &'a SnapshotItem {

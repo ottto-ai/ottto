@@ -275,7 +275,10 @@ fn unavailable_shards_project_source_health_alarm_once_and_clear_after_restorati
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o600)).unwrap();
         let source = SnapshotSource::ClaudeCode;
         let load = || ScanIndex::load_for_snapshot_source_with_origin(&root, source, &scratch);
-        assert!(load().unwrap().0.persistence_available());
+        assert!(
+            crate::snapshots::e2_pipeline_scan_fixture::read_legacy_for_test(&root)
+                .persistence_available()
+        );
         let manifest: serde_json::Value =
             serde_json::from_str(fixture["root"].as_str().unwrap()).unwrap();
         let descriptor = &manifest["objects"][map + 1];
@@ -292,8 +295,10 @@ fn unavailable_shards_project_source_health_alarm_once_and_clear_after_restorati
         // The warning must also work before the first legacy source row arrives.
         let before = health::shard_transitions(source);
         let (_, records) = crate::local_resource_diagnostics::capture(|| {
-            assert!(!load().unwrap().0.persistence_available());
-            assert!(!load().unwrap().0.persistence_available());
+            for _ in 0..2 {
+                let error = load().unwrap_err();
+                crate::snapshots::e2_pipeline_scan_fixture::assert_support_error_for_test(&error);
+            }
         });
         assert_eq!(health::shard_transitions(source), before + 1);
         let alarms = records
@@ -301,7 +306,8 @@ fn unavailable_shards_project_source_health_alarm_once_and_clear_after_restorati
             .filter(|r| r["counts"]["index_shard_unavailable_alarm"] == 1)
             .collect::<Vec<_>>();
         assert_eq!(alarms.len(), 1);
-        assert_eq!(alarms[0]["counts"]["unavailable_maps"], 1);
+        // observe(Err) uses set_refusal: no loaded map inventory accompanies it.
+        assert_eq!(alarms[0]["counts"]["unavailable_maps"], 0);
         assert_eq!(alarms[0]["source"], "claude_code");
         let counters = records
             .iter()
@@ -390,12 +396,24 @@ fn unavailable_shards_project_source_health_alarm_once_and_clear_after_restorati
                 .any(|b| b.code == health::SHARD_CODE),
             "captured projections do not borrow later live recovery"
         );
-        // A new episode alarms once again. A set/clear pair between status
-        // reads must survive capture as TWO transitions, not vanish together.
+        // Start another legacy-input lineage: successful recovery adopted SQLite,
+        // so deleting its obsolete input shard cannot damage the active store.
+        crate::snapshots::e2_pipeline_scan_fixture::legacy_input_for_test(
+            &root,
+            fixture["root"].as_str().unwrap().as_bytes(),
+        );
+        std::fs::create_dir(&shards).unwrap();
+        std::fs::set_permissions(&shards, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for (name, text) in fixture["payloads"].as_object().unwrap() {
+            crate::test_scratch::write_private_file(shards.join(name), text.as_str().unwrap());
+        }
+        // A set/clear pair between status reads must survive as TWO transitions.
         std::fs::remove_file(&path).unwrap();
         let (_, records) = crate::local_resource_diagnostics::capture(|| {
-            assert!(!load().unwrap().0.persistence_available());
-            assert!(!load().unwrap().0.persistence_available());
+            for _ in 0..2 {
+                let error = load().unwrap_err();
+                crate::snapshots::e2_pipeline_scan_fixture::assert_support_error_for_test(&error);
+            }
         });
         assert_eq!(
             records

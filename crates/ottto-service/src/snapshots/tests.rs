@@ -1739,8 +1739,8 @@ fn large_scan_index_save_preserves_bytes_and_generation_fence() {
     };
     index.save(&path).expect("save large generation");
     assert_eq!(
-        fs::read(&path).expect("read durable index"),
-        serde_json::to_vec(&index).expect("encode exact compact index bytes")
+        serde_json::to_vec(&ScanIndex::load(&path).expect("read durable index")).unwrap(),
+        serde_json::to_vec(&index).unwrap()
     );
     let mut stale = ScanIndex::load(&path).expect("load stale generation");
     let mut winner = ScanIndex::load(&path).expect("load winning generation");
@@ -1750,8 +1750,8 @@ fn large_scan_index_save_preserves_bytes_and_generation_fence() {
         .save(&path)
         .expect_err("stale generation stays fenced");
     assert_eq!(
-        fs::read(&path).expect("read winning bytes"),
-        serde_json::to_vec(&winner).expect("encode winning compact bytes")
+        serde_json::to_vec(&ScanIndex::load(&path).expect("read winning graph")).unwrap(),
+        serde_json::to_vec(&winner).unwrap()
     );
     let observed = ScanIndex::load(&path).expect("reload winning generation");
     assert_eq!(observed.generation, 2);

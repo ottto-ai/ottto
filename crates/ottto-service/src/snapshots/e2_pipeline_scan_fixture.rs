@@ -49,6 +49,23 @@ pub(super) fn fixture_binding(path: &Path) -> Option<scan_index_persistence::Bin
 fn prepare_fixture_save(index: &mut ScanIndex, path: &Path) -> Result<()> {
     let synthetic = fixture_binding(path).is_some()
         || scan_index_integration::scan_index_storage_binding(path).is_none();
+    bind_input_for_test(index, path);
+    if index.v2().persistence_v2.is_none()
+        || (synthetic && route_of(index).as_deref() != Some(path))
+    {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let baseline = ScanIndex::load(path)?;
+        index.retain_persistence_baseline_from(&baseline);
+        index.generation = baseline.generation;
+        E2ScanFixture::register_route_for_test(path);
+    }
+    Ok(())
+}
+
+/// Name the fixture's synthetic destination before a legacy admission assertion.
+pub(crate) fn bind_input_for_test(index: &ScanIndex, path: &Path) {
     if scan_index_integration::scan_index_storage_binding(path).is_none() {
         let source = route_of(index)
             .and_then(|route| scan_index_integration::scan_index_storage_binding(&route))
@@ -71,25 +88,76 @@ fn prepare_fixture_save(index: &mut ScanIndex, path: &Path) -> Result<()> {
             },
         );
     }
-    if index.v2().persistence_v2.is_none()
-        || (synthetic && route_of(index).as_deref() != Some(path))
-    {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+}
+
+/// Install a new synthetic legacy input; never overwrite live native custody.
+pub(crate) fn legacy_input_for_test(path: &Path, bytes: &[u8]) {
+    bind_input_for_test(&ScanIndex::default(), path);
+    state_v2::erase_published(path);
+    ottto_core::write_owner_only_file_atomic(path, bytes).unwrap();
+}
+
+/// Model the next ordinary pass after quarantine/Repair published its G=0 store.
+pub(crate) fn load_source_for_test(
+    path: &Path,
+    source: SnapshotSource,
+    support: &Path,
+) -> Result<(ScanIndex, ScanIndexLoadOrigin)> {
+    match ScanIndex::load_for_snapshot_source_with_origin(path, source, support) {
+        Err(error)
+            if error.downcast_ref::<state_v2::Hold>() == Some(&state_v2::Hold::ReloadRequired)
+                && state_v2::published(path).unwrap_or(false) =>
+        {
+            ScanIndex::load_for_snapshot_source_with_origin(path, source, support)
         }
-        let baseline = ScanIndex::load(path)?;
-        index.retain_persistence_baseline_from(&baseline);
-        index.generation = baseline.generation;
-        E2ScanFixture::register_route_for_test(path);
+        result => result,
     }
-    Ok(())
+}
+
+/// Replace synthetic persisted state through the native mapper. Decoder tests
+/// supply legacy bytes, but never overwrite a published fence with those bytes.
+pub(crate) fn seed_json_for_test(path: &Path, bytes: &[u8]) -> ScanIndex {
+    let mut index = lenient_decode::read(std::io::Cursor::new(bytes), "load", "unattributed")
+        .expect("admitted decoder fixture");
+    // The mapper's fixture publication commits seed G+1. Keep an existing
+    // fixture generation so receipt/handoff tests still isolate their damage.
+    index.generation = index.generation.saturating_sub(1);
+    bind_input_for_test(&index, path);
+    state_v2::erase_published(path);
+    seed_index_for_test(&index, path)
+}
+
+pub(crate) fn mutate_index_for_test(path: &Path, mutate: impl FnOnce(&mut serde_json::Value)) {
+    let mut value = serde_json::to_value(ScanIndex::load(path).unwrap()).unwrap();
+    mutate(&mut value);
+    seed_json_for_test(path, &serde_json::to_vec(&value).unwrap());
+}
+
+/// Deliberately unwritable legacy shapes must preserve bytes and hold collection.
+pub(crate) fn assert_import_support_for_test(path: &Path) {
+    bind_input_for_test(&ScanIndex::default(), path);
+    let before = fs::read(path).unwrap();
+    let error = ScanIndex::load(path).unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<state_v2::Hold>(),
+        Some(&state_v2::Hold::DbUnavailable)
+    );
+    assert_support_error_for_test(&error);
+    assert_eq!(fs::read(path).unwrap(), before);
+}
+
+pub(crate) fn assert_support_error_for_test(error: &anyhow::Error) {
+    assert_eq!(
+        scan_index_health::state_v2_reason(error).unwrap().action(),
+        "contact_support"
+    );
 }
 
 /// Explicit native seed for decoder fixtures whose original bytes deliberately
 /// fail the production inventory gate. This never runs on a daemon load/save.
 pub(crate) fn seed_index_for_test(index: &ScanIndex, path: &Path) -> ScanIndex {
-    let binding = scan_index_integration::scan_index_storage_binding(path)
-        .expect("a destination-bound native fixture");
+    bind_input_for_test(index, path);
+    let binding = scan_index_integration::scan_index_storage_binding(path).unwrap();
     let progress = crate::snapshot_sync::with_state_v2_progress_lock(path, |progress_path| {
         match fs::read(progress_path) {
             Ok(bytes) => Ok(bytes),

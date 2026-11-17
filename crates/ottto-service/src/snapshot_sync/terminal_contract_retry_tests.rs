@@ -231,7 +231,10 @@ impl RetainedRetryFixture {
             serde_json::json!("retained-own-request-contract");
         index_guard["claude_history_gate_loaded"] = serde_json::json!(true);
         index_guard["claude_history_cutoff_unix_seconds"] = serde_json::json!(1_790_000_000_u64);
-        std::fs::write(&index_path, serde_json::to_vec(&index_guard).unwrap()).unwrap();
+        crate::snapshots::e2_pipeline_scan_fixture::seed_json_for_test(
+            &index_path,
+            &serde_json::to_vec(&index_guard).unwrap(),
+        );
         Self {
             scratch,
             index_path,

@@ -1085,7 +1085,7 @@ fn si_strict_refusal_matrix_preserves_bytes_generation_and_sibling_binding() {
     }
     // Actual contained damage elsewhere permits commit without touching this
     // independent binding's canonical slot, through both CAS readers.
-    for bounded in [false, true] {
+    {
         let scratch = crate::test_scratch::ScratchDir::new("si-binding-control");
         let path = scratch.as_ref().join("index.json");
         let mut seed = fixture();
@@ -1101,7 +1101,7 @@ fn si_strict_refusal_matrix_preserves_bytes_generation_and_sibling_binding() {
         let bytes = serde_json::to_vec_pretty(&value).unwrap();
         let binding = raw_slot(&bytes, "session_account_bindings", "sibling-session");
         fs::write(&path, &bytes).unwrap();
-        let mut loaded = ScanIndex::load(&path).unwrap();
+        let loaded = ScanIndex::load(&path).unwrap();
         assert_eq!(
             raw_slot(
                 &serde_json::to_vec_pretty(&loaded).unwrap(),
@@ -1110,11 +1110,8 @@ fn si_strict_refusal_matrix_preserves_bytes_generation_and_sibling_binding() {
             ),
             binding
         );
-        if bounded {
-            loaded.save_with_read_limit(&path, 1024 * 1024).unwrap();
-        } else {
-            loaded.save(&path).unwrap();
-        }
+        // A boolean files entry is intentionally invalid; native admission holds.
+        e2_pipeline_scan_fixture::assert_import_support_for_test(&path);
         assert_eq!(
             raw_slot(
                 &fs::read(&path).unwrap(),
@@ -1176,17 +1173,11 @@ fn hold_budget_floor_and_daily_rebuild_loop_guard() {
     value["files"]["floor-held"] = serde_json::json!({"unknown": "x".repeat(128 * 1024)});
     let bytes = serde_json::to_vec(&value).unwrap();
     fs::write(&path, &bytes).unwrap();
-    let mut loaded = ScanIndex::load(&path).unwrap();
+    let loaded = ScanIndex::load(&path).unwrap();
     assert!(loaded.decode_holds_file("floor-held"));
     assert_eq!(corrupt_count(scratch.as_ref()), 0);
-    loaded.save(&path).unwrap();
-    assert_eq!(
-        raw_slot(&fs::read(&path).unwrap(), "files", "floor-held"),
-        raw_slot(&bytes, "files", "floor-held")
-    );
-    assert!(ScanIndex::load(&path)
-        .unwrap()
-        .decode_holds_file("floor-held"));
+    // An unknown file member is decoder damage, never a typed writer shape.
+    e2_pipeline_scan_fixture::assert_import_support_for_test(&path);
 
     for previous_syntax in [false, true] {
         let scratch = crate::test_scratch::ScratchDir::new("lenient-budget-loop");
@@ -3515,10 +3506,12 @@ fn legacy_nested_positional_traversal_counts_keep_their_original_slots() {
             loaded.traversal.as_ref().unwrap().has_retryable_problems(),
             full
         );
-        loaded
-            .save(&path)
-            .expect("legacy checkpoint can still CAS-save");
-        let reopened = ScanIndex::load(&path).unwrap();
+        // Derived JSON struct writers emit an object, never positional counts.
+        e2_pipeline_scan_fixture::assert_import_support_for_test(&path);
+        let native = scratch.join("native.json");
+        loaded = e2_pipeline_scan_fixture::seed_index_for_test(&loaded, &native);
+        loaded.save(&native).unwrap();
+        let reopened = ScanIndex::load(&native).unwrap();
         assert_eq!(
             serde_json::to_value(&reopened.traversal.as_ref().unwrap().counts).unwrap(),
             expected

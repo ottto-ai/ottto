@@ -253,7 +253,7 @@ impl ProofChain {
             self.enrich(&mut index, &mut scan);
         }
         self.accept(&mut index, &mut scan);
-        index.save(&self.home.join("scan-index.json")).unwrap();
+        fixture::save_for_test(&mut index, &self.home.join("scan-index.json"));
         let items = scan.snapshots;
         assert!(items.iter().map(|item| item.request_count).sum::<u64>() > 7);
         (index, items)

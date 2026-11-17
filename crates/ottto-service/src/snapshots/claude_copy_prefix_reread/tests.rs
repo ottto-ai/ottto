@@ -35,6 +35,8 @@ fn setup(name: &str) -> (PathBuf, PathBuf, ScanIndex, Vec<PathBuf>) {
     for entry in index.files.values_mut() {
         entry.effective_upload_body_witness_revision = 3;
     }
+    // This metadata-only CLI deliberately inspects a legacy input view.
+    e2_pipeline_scan_fixture::save_for_test(&mut index, &home.join("scan-index.json"));
     let scope = home.join("scope.json");
     fs::write(scope, serde_json::to_vec(&paths).unwrap()).unwrap();
     (home, root, index, paths)

@@ -456,7 +456,10 @@ fn retirement_requires_committed_scope_and_preserves_unindexed_carried_unknown_a
         }
         // Exercise the real lenient decoder for unknown incidence/entity holds.
         if matches!(mode, "unknown" | "entity_hold") {
-            std::fs::write(&f.index_path, serde_json::to_vec(&raw).unwrap()).unwrap();
+            crate::snapshots::e2_pipeline_scan_fixture::seed_json_for_test(
+                &f.index_path,
+                &serde_json::to_vec(&raw).unwrap(),
+            );
             selected = ScanIndex::load(&f.index_path).unwrap();
         } else {
             selected = serde_json::from_value(raw).unwrap();
@@ -1057,7 +1060,10 @@ fn retirement_handoff_is_bound_to_destination_generation_body_and_saved_protecti
                 value["quarantined_snapshot_fingerprints"] =
                     serde_json::json!({f.item.snapshot_fingerprint.clone():{"disposition":"bad"}});
             }
-            std::fs::write(&f.index_path, serde_json::to_vec(&value).unwrap()).unwrap();
+            crate::snapshots::e2_pipeline_scan_fixture::seed_json_for_test(
+                &f.index_path,
+                &serde_json::to_vec(&value).unwrap(),
+            );
         }
         if mode == "relogin" {
             // Crash after the handoff; restart after a re-login A→B→C.
@@ -1154,7 +1160,10 @@ fn retirement_obligations_survive_opaque_decode_and_local_hold_cycles() {
                 raw["quarantined_snapshot_fingerprints"] =
                     serde_json::json!({f.item.snapshot_fingerprint.clone():{"disposition":"bad"}});
             }
-            std::fs::write(&f.index_path, serde_json::to_vec(&raw).unwrap()).unwrap();
+            crate::snapshots::e2_pipeline_scan_fixture::seed_json_for_test(
+                &f.index_path,
+                &serde_json::to_vec(&raw).unwrap(),
+            );
             selected = ScanIndex::load(&f.index_path).unwrap();
         }
         let held = if mode == "local_hold" {
@@ -1200,7 +1209,10 @@ fn retirement_obligations_survive_opaque_decode_and_local_hold_cycles() {
         let mut repaired = serde_json::to_value(&previous).unwrap();
         repaired["files"] = serde_json::json!({});
         repaired["quarantined_snapshot_fingerprints"] = serde_json::json!({});
-        std::fs::write(&f.index_path, serde_json::to_vec(&repaired).unwrap()).unwrap();
+        crate::snapshots::e2_pipeline_scan_fixture::seed_json_for_test(
+            &f.index_path,
+            &serde_json::to_vec(&repaired).unwrap(),
+        );
         let mut clean = ScanIndex::load(&f.index_path).unwrap();
         progress
             .stage_ack_retirement_handoff(&previous, &mut clean, &BTreeSet::new())

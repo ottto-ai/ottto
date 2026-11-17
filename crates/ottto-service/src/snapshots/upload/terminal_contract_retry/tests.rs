@@ -36,8 +36,10 @@ fn terminal_contract_legacy_decode_and_lenient_repair_preserve_version() {
             if repair {
                 record["failed_reconstruction_count"] = Value::Null;
             }
-            fs::write(&path, serde_json::to_vec(&wire).unwrap()).unwrap();
-            let mut loaded = ScanIndex::load(&path).unwrap();
+            let mut loaded = e2_pipeline_scan_fixture::seed_json_for_test(
+                &path,
+                &serde_json::to_vec(&wire).unwrap(),
+            );
             assert!(loaded.decode_holds.is_empty());
             assert_eq!(
                 loaded.quarantined_snapshot_fingerprints[&fingerprint].reconstruction_contract,
