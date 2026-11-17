@@ -19,6 +19,18 @@ use std::os::unix::fs::MetadataExt;
 pub(crate) const SAMPLE_BYTES: usize = 4096;
 pub(crate) const AUDIT_INTERVAL_SECONDS: u64 = 3600;
 
+/// A reader crossed its opening extent; later appends belong to another read.
+#[derive(Debug)]
+pub(crate) struct FrozenLengthExceeded;
+
+impl std::fmt::Display for FrozenLengthExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("acquisition exceeds stable source")
+    }
+}
+
+impl std::error::Error for FrozenLengthExceeded {}
+
 /// Adapter-produced interpretation witness, including parser/privacy policy and
 /// relevant original-owner/parent/sidecar revisions. Never credentials or tokens.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1188,10 +1200,16 @@ impl ReadPlan {
         let end = offset.checked_add(bytes.len() as u64).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "acquisition offset overflow")
         })?;
-        if self.mode == ReadMode::Unchanged || end > self.stamp.length {
+        if self.mode == ReadMode::Unchanged {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "acquisition exceeds stable source",
+                "unchanged acquisition cannot consume bytes",
+            ));
+        }
+        if end > self.stamp.length {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                FrozenLengthExceeded,
             ));
         }
         if seals_record && self.pending_record.is_none() {
@@ -2106,10 +2124,23 @@ mod tests {
         let f = Fixture::new(b"one\n");
         let mut file = f.open();
         let mut p = ReadPlan::prepare(&mut file, None, &scope(), None, 0).unwrap();
-        assert!(p.observe_complete_records(b"one").is_err());
+        let error = p.observe_complete_records(b"one").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(!error.get_ref().unwrap().is::<FrozenLengthExceeded>());
         assert_eq!(p.samples.sealed_offset, 0);
-        assert!(p.observe_complete_records(b"one\ntwo\n").is_err());
+        let error = p.observe_complete_records(b"one\ntwo\n").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.get_ref().unwrap().is::<FrozenLengthExceeded>());
         assert_eq!(p.samples.sealed_offset, 0);
+        p.mode = ReadMode::Unchanged;
+        let error = p.observe_complete_records(b"one\n").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(!error.get_ref().unwrap().is::<FrozenLengthExceeded>());
+        p.mode = ReadMode::Full(FullReason::StateMissing);
+        p.samples.sealed_offset = u64::MAX;
+        let error = p.observe_complete_records(b"one\n").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(!error.get_ref().unwrap().is::<FrozenLengthExceeded>());
     }
 
     #[test]

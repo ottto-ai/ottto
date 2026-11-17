@@ -1374,10 +1374,27 @@ impl OwnedSourceScan {
                         pending!();
                     }
                     Err(error) => {
-                        // Static reader text only, never a path or content. A
-                        // live rollout appended while it is read reports
-                        // "acquisition exceeds stable source"; that file is
-                        // retried when its next write is hinted.
+                        // Defensive fallback for an adapter crossing its extent.
+                        // Normal physical acquisitions stop at that extent.
+                        if error.chain().any(|cause| {
+                            cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+                                io.get_ref().is_some_and(|inner| {
+                                    inner.is::<crate::transcript_acquisition::FrozenLengthExceeded>()
+                                })
+                            })
+                        }) {
+                            if let Some(lease) = codex_cursor_lease.take() {
+                                lease.release();
+                            }
+                            if let Some(group) = active.group.as_ref() {
+                                scan::owned_scan::requeue_members(index, &selected_flags, &group.members);
+                            } else {
+                                sampled_scan::codex_cursor::requeue(index, &selected_flags, &active.candidate);
+                            }
+                            active.parser.reader.reader.close();
+                            pending!();
+                        }
+                        // Static reader text only, never a path or content.
                         eprintln!(
                             "local snapshot scan: {} transcript read failed: {error}",
                             source.api_slug()
@@ -1436,8 +1453,7 @@ impl OwnedSourceScan {
                 });
                 // Retain native trailing-line behavior at a genuine
                 // unchanged EOF. A grown read keeps this fragment withheld.
-                if source == SnapshotSource::ClaudeCode
-                    && active.cursor.is_none()
+                if active.cursor.is_none()
                     && active.parser.reader.sealed_fragment()
                     && active
                         .parser
@@ -1613,6 +1629,11 @@ impl OwnedSourceScan {
                         pending!();
                     };
                     acquisition.mode = mode;
+                    if let Some(plan) = parser.reader.acquisition.as_ref() {
+                        parser
+                            .reader
+                            .set_extent_limit(plan.frozen_length() - plan.start_offset());
+                    }
                     acquisition.tier_prefix_replay = true;
                     if let Some(context) = sampling.as_mut() {
                         context.priority_replays += 1;
@@ -1879,7 +1900,7 @@ impl OwnedSourceScan {
                 });
                 let OwnedActiveFile {
                     first_read,
-                    sampling: file_sampling,
+                    sampling: mut file_sampling,
                     candidate,
                     decision,
                     parse_reason: _,
@@ -1964,22 +1985,8 @@ impl OwnedSourceScan {
                         let prefix = current_scope
                             .as_ref()
                             .filter(|scope| *scope == &acquisition.scope)
-                            .filter(|_| {
-                                // H3c preserves an already-read prefix while an
-                                // audit waits. A byte-zero Full must instead
-                                // reach normal completion and discharge its
-                                // audit, even when RAM retention is unavailable.
-                                acquisition.audit_due.is_some()
-                                    && sampling.as_ref().is_some_and(|context| {
-                                        context.audit_metadata_supported
-                                            && (context.audit_slots > 0
-                                                || index.files.get(&acquisition.key).is_some_and(
-                                                    ScanIndexEntry::has_unverified_source,
-                                                ))
-                                    })
-                            })
                             .and_then(|scope| {
-                                parser.commit_claude_grown_prefix(
+                                parser.commit_grown_prefix(
                                     &candidate.path,
                                     scope,
                                     index
@@ -1988,6 +1995,22 @@ impl OwnedSourceScan {
                                         .map_or(0, |entry| entry.size_bytes),
                                 )
                             });
+                        if prefix.is_none()
+                            && current_scope.as_ref() == Some(&acquisition.scope)
+                            && parser.reader.acquisition.as_ref().is_some_and(|plan| {
+                                parser
+                                    .reader
+                                    .reader
+                                    .get_ref()
+                                    .metadata()
+                                    .is_ok_and(|held| held.len() > plan.frozen_length())
+                            })
+                        {
+                            // Unchanged, or a trailing record already applied at
+                            // genuine EOF: retry only this file, never the walk.
+                            sampled_scan::codex_cursor::requeue(index, &selected_flags, &candidate);
+                            pending!();
+                        }
                         (current_scope, prefix)
                     }
                     None => (None, None),
@@ -2000,7 +2023,30 @@ impl OwnedSourceScan {
                 } else if let Some(acquisition) = file_sampling.as_ref() {
                     if let Some(prefix) = prefix {
                         match prefix {
-                            Ok(grant) => parser.reader.sealed_prefix = Some(grant),
+                            Ok(grant) => {
+                                parser.reader.sealed_prefix = Some(grant);
+                                file_sampling
+                                    .as_mut()
+                                    .expect("prefix acquisition")
+                                    .audit_due
+                                    .get_or_insert_with(|| {
+                                        sampled_scan::now_seconds().saturating_add(
+                                            crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS,
+                                        )
+                                    });
+                            }
+                            Err(crate::transcript_acquisition::PrefixRefusal::Invalidated(
+                                crate::transcript_acquisition::FullReason::InvalidCheckpoint,
+                            )) if parser.reader.acquisition.is_some() => {
+                                // A withheld row would weaken the last committed
+                                // body. Keep it and retry this file alone.
+                                sampled_scan::codex_cursor::requeue(
+                                    index,
+                                    &selected_flags,
+                                    &candidate,
+                                );
+                                pending!();
+                            }
                             Err(refusal) => {
                                 claude_request_census::invalidate_claude_request_census(
                                     index,
@@ -2155,8 +2201,8 @@ impl OwnedSourceScan {
                     } else {
                         Vec::new()
                     };
-                let claude_grown_prefix =
-                    source == SnapshotSource::ClaudeCode && parser.reader.sealed_prefix.is_some();
+                let grown_prefix = parser.reader.sealed_prefix.is_some();
+                let claude_grown_prefix = source == SnapshotSource::ClaudeCode && grown_prefix;
                 let finish_request = FinishRequest {
                     expected_opened_object_identity: &candidate.opened_object_identity,
                     path: &candidate.path,
@@ -2435,6 +2481,12 @@ impl OwnedSourceScan {
                     && !index.claude_account_deferred_holds.contains_key(&index_key)
                     && (slot_unfunded || !index.can_stage_sampled_audit(&index_key))
                 {
+                    if grown_prefix {
+                        // No new audit slot: retain the committed body and
+                        // census membership, without poisoning the traversal.
+                        sampled_scan::codex_cursor::requeue(index, &selected_flags, &candidate);
+                        pending!();
+                    }
                     #[cfg(test)]
                     twin_diagnostics::event(&candidate.path, || {
                         format!(
@@ -4644,7 +4696,6 @@ impl OwnedSourceScan {
                         };
                         // The cap funds NEW obligations, never a global restore
                         // gate. Marked files Tail; quiet debt-free copies reuse.
-                        let mut cap_full = false;
                         if allow_sample
                             // Account-held reparses belong to withheld_reparse;
                             // central staging still bounds fresh audit markers.
@@ -4678,13 +4729,12 @@ impl OwnedSourceScan {
                                 );
                                 pending!();
                             }
-                            cap_full = true;
                             allow_sample = false;
                         }
                         #[cfg(test)]
                         twin_diagnostics::event(&candidate.path, || {
                             format!(
-                            "sampling forced_family={forced_family} forced_native={forced_native} forced_twin={forced_twin} allow={allow_sample} cap_full={cap_full} slots={} can_stage={}",
+                            "sampling forced_family={forced_family} forced_native={forced_native} forced_twin={forced_twin} allow={allow_sample} slots={} can_stage={}",
                             context.audit_slots, index.can_stage_sampled_audit(&key),
                         )
                         });
@@ -4756,22 +4806,6 @@ impl OwnedSourceScan {
                             });
                             sampled_audit::defer_growth_read(index, &mut census, &candidate);
                             pending!();
-                        }
-                        // H1c: the plan uses absolute offsets; the reader's
-                        // extent is relative to its Full/Tail start.
-                        if source == SnapshotSource::ClaudeCode
-                            && (allow_sample || cap_full)
-                            && matches!(
-                                mode,
-                                crate::transcript_acquisition::ReadMode::Full(_)
-                                    | crate::transcript_acquisition::ReadMode::Tail
-                            )
-                        {
-                            if let Some(plan) = parser.reader.acquisition.as_ref() {
-                                parser
-                                    .reader
-                                    .set_extent_limit(plan.frozen_length() - plan.start_offset());
-                            }
                         }
                         // Restore does not restore/extend an exact-prefix pricing receipt.
                         // Any new priority contribution below forces a real full replay.
@@ -4894,6 +4928,19 @@ impl OwnedSourceScan {
                 });
                 sampled_audit::defer_growth_read(index, &mut census, &candidate);
                 pending!();
+            }
+            // Every physical Full/Tail acquisition stops at its opening extent,
+            // including native/forced reads and cursor-only preparation.
+            if let Some(plan) = parser.reader.acquisition.as_ref().filter(|plan| {
+                matches!(
+                    plan.mode(),
+                    crate::transcript_acquisition::ReadMode::Full(_)
+                        | crate::transcript_acquisition::ReadMode::Tail
+                )
+            }) {
+                parser
+                    .reader
+                    .set_extent_limit(plan.frozen_length() - plan.start_offset());
             }
             index.note_change_reason_selected(source, &candidate, parse_reason, source_change);
             // Frozen here, before this read can change the index entry.
