@@ -2473,8 +2473,8 @@ fn carried_main_keeps_local_proof_without_accepted_request_rows() {
 
 /// [money] A settled same-session path twin can keep its counted prefix when
 /// the holder's acceptance was committed while the copy census was absent.
-/// Rule 5 compares that unchanged decision once; a resumed twin still needs
-/// its holder on the correction page under Rule A.
+/// Rule 5 compares that unchanged decision once. Ordinary twin acquisition
+/// co-reads its main; a separate off-page fold pins the resumed Rule A limit.
 #[test]
 fn settled_disclosed_copy_redecides_once_after_holder_acceptance() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -2609,11 +2609,17 @@ fn settled_disclosed_copy_redecides_once_after_holder_acceptance() {
             prior = c.reload(&mut prior);
             assert_eq!(prior.claude_money_birth_store.money_rule_version(), 5);
             assert!(prior.claude_copy_removals.pending(location));
+            assert!(!prior
+                .claude_copy_removals
+                .pending(location_key(&holder_key)));
             let mut corrected = c.raw(&scanner, prior.clone(), 100, true, &[]);
+            // Ordinary acquisition of a content twin pulls overlapping mains.
+            // Only the copy is marked; this isolated pair costs at most two
+            // reads, including its same-session main through that existing pull.
             assert_eq!(
                 scanner.paths(),
-                vec![copy.clone()],
-                "only the correction read"
+                vec![copy.clone(), holder.clone()],
+                "the marked copy plus its pulled main"
             );
             assert!(
                 scanner.acquisitions.lock().unwrap().iter().all(|read| {
@@ -2621,31 +2627,38 @@ fn settled_disclosed_copy_redecides_once_after_holder_acceptance() {
                 }),
                 "a correction keeps the ordinary validated Tail mode"
             );
-            corrected.enrich(&c);
-            corrected.finish();
-            assert!(!corrected.index.claude_copy_removals.pending(location));
+            // Pin the existing off-page Rule A decision independently of
+            // acquisition: the real correction page above includes the main.
+            // This reference page is never finalized, saved or ACKed.
+            let mut off_page = twin(&corrected);
+            off_page.scan.snapshots.retain(|item| {
+                item.claude_money
+                    .as_deref()
+                    .and_then(e2::FileFold::location_key)
+                    == Some(location)
+            });
+            unobserved(|| evidence_chunk_tests::isolated(|| off_page.enrich(&c)));
+            assert!(!off_page.index.claude_copy_removals.pending(location));
             if resumed_copy {
-                let item = body(&corrected, ROOT).unwrap();
+                let item = body(&off_page, ROOT).unwrap();
                 assert_eq!(
                     (item.request_count, item.removed_request_count),
                     (3, Some(0)),
                     "Rule A needs its holder on the page for a resumed copy"
                 );
-                assert!(removed_hashes(&corrected.index, &copy).is_empty());
+                assert!(removed_hashes(&off_page.index, &copy).is_empty());
             } else {
                 assert!(
-                    body(&corrected, ROOT).is_none(),
+                    body(&off_page, ROOT).is_none(),
                     "an all-copy-only page is suppressed"
                 );
-                assert_eq!(removed_hashes(&corrected.index, &copy).len(), 2);
+                assert_eq!(removed_hashes(&off_page.index, &copy).len(), 2);
             }
-            prior = if resumed_copy {
-                // Persist the finished decision without changing accepted
-                // holder rows: this body still has its original counted prefix.
-                c.reload(&mut corrected.index)
-            } else {
-                settle(&c, &prior, corrected, &mut e2_progress())
-            };
+            corrected.enrich(&c);
+            corrected.finish();
+            assert!(!corrected.index.claude_copy_removals.pending(location));
+            assert_eq!(removed_hashes(&corrected.index, &copy).len(), 2);
+            prior = settle(&c, &prior, corrected, &mut e2_progress());
             // A second load needs no intervening inactive-context save.
             let route = crate::snapshots::e2_pipeline_scan_fixture::route_of(&prior).unwrap();
             prior = ScanIndex::load(&route).unwrap();

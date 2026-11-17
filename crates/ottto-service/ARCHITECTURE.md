@@ -137,9 +137,13 @@ file-system hint / periodic listing → select file → read new bytes from save
   Money rule five compares settled, unheld disclosed main files against current
   holder proof once per store, using the save-time decision comparison and
   accepted request rows. Only counted hashes newly covered by an earlier holder
-  select a copy for one ordinary correction read; holders are not marked and
-  body revisions do not change. The normal save records the marks and version
-  together, so marks number at most the settled disclosed mains and never rearm
+  select a copy for one ordinary correction obligation; holders are not marked
+  and body revisions do not change. Existing content-twin scheduling co-reads
+  overlapping mains: an isolated copy and same-session main cost at most two
+  ordinary reads per mark, without forcing Full. Larger overlap closures retain
+  their existing scheduling; the rule adds no population-wide read bound.
+  The normal save records the marks and version together, so marks number at
+  most the settled disclosed mains and never rearm
   on restart. A resumed same-session copy still needs its holder on the same
   page to remove the prefix; an off-page holder leaves it counted and disclosed.
   Older daemons ignore a newer money-rule version; layout 8 already requires
