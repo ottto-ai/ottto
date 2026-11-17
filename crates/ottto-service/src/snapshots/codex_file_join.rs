@@ -839,14 +839,19 @@ impl HeaderInventory {
             // inventory cache. Its existing owner and physical stamps suffice;
             // missing owner proof remains held until the content changes.
             let durable = if durable.is_none() && legacy_unchanged {
-                let owner = index
+                let owner_proof = index
                     .files
                     .get(&key)
                     .and_then(sources::codex::counting::version::proven_owner)
                     .context(HEADER_OWNERSHIP_CHANGED)?;
+                let owner = codex_session_id_candidates_from_path(&candidate.path)
+                    .into_iter()
+                    .find(|session| codex_protected_owner(session) == owner_proof)
+                    .map(|session| resolve_codex_identity(&session))
+                    .context(HEADER_OWNERSHIP_CHANGED)?;
                 Some(CachedHeader {
                     stamp: stamp.clone(),
-                    owner: owner.to_owned(),
+                    owner,
                     created_unix_ms: None,
                     read_bytes: 0,
                     durable: Some(joined),
