@@ -1,7 +1,7 @@
 //! move snapshot upload calls into upload.
 
 use super::anyhow;
-pub(super) use super::cache_session_key;
+
 use super::conflict_probe_after;
 use super::current_unix_seconds;
 use super::inplace_retry_failed_after;
@@ -46,6 +46,624 @@ impl std::error::Error for SourcesFailed {}
 
 impl std::error::Error for SnapshotEntityDeferred {}
 
+use super::collector_version;
+use super::reason_reoffer;
+use super::snapshot_upload_body_witness;
+use super::Digest;
+#[cfg(test)]
+use super::PermanentSnapshotRejection;
+use super::ScanIndex;
+use super::Sha256;
+use super::SnapshotBatchRequest;
+use super::SnapshotItem;
+#[cfg(test)]
+use super::SnapshotQuarantineRecord;
+use super::SnapshotSource;
+use super::SnapshotUploadPolicy;
+use super::SNAPSHOT_SCHEMA_VERSION;
+
+/// Bootstrap a fresh source page's cache heads under its own in-place resend
+/// budget.
+#[cfg(test)]
+pub(super) fn bootstrap_cache_heads(
+    probes: &[SnapshotItem],
+    poison_scope: &str,
+    progress: &mut SnapshotUploadProgress,
+    upload: impl FnMut(&[&SnapshotItem], bool) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
+    persist: impl FnMut(&mut SnapshotUploadProgress) -> Result<()>,
+) -> Result<usize> {
+    bootstrap_cache_heads_with_budget(
+        probes,
+        poison_scope,
+        progress,
+        &mut InplaceRetryBudget::default(),
+        upload,
+        persist,
+    )
+}
+
+/// Bootstrap only through existing ordinary authority followed by an exact
+/// CAS repeat. Both settlements share the normal atomic ACK progress seam and
+/// the source page's in-place resend budget.
+pub(super) fn bootstrap_cache_heads_with_budget(
+    probes: &[SnapshotItem],
+    poison_scope: &str,
+    progress: &mut SnapshotUploadProgress,
+    inplace_retry: &mut InplaceRetryBudget,
+    mut upload: impl FnMut(
+        &[&SnapshotItem],
+        bool,
+    ) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
+    mut persist: impl FnMut(&mut SnapshotUploadProgress) -> Result<()>,
+) -> Result<usize> {
+    let leased = progress.active_reason_reoffers.clone();
+    // A catch-up probe must not precede any ordinary full body in this pass,
+    // including one whose own probe is sent in the first bootstrap stage.
+    progress.context_resend.bootstrap_blocks_catchup =
+        progress.context_resend.has_pending_ordinary();
+    let mut shed = false;
+    let result = (|| -> Result<usize> {
+        let mut deferred = 0usize;
+        // A headless patched body reaches here only when head CAS is optional
+        // and no legacy reconciliation is pending; otherwise prepare strips it.
+        for enforce_head_cas in [false, true] {
+            // A prior ordinary body ACK has no head proof. Force the exact probe
+            // even when delivery of these bytes was previously acknowledged.
+            if enforce_head_cas {
+                // Refusal must leave the in-memory ledger equal to its saved
+                // checkpoint so partial settlement can commit retirement proof.
+                progress.admit_ack_reoffers(probes)?;
+                for probe in probes {
+                    progress
+                        .accepted_fingerprints
+                        .remove(&probe.snapshot_fingerprint);
+                    progress
+                        .accepted_body_witnesses
+                        .remove(&probe.snapshot_fingerprint);
+                }
+            }
+            let mut accepted = 0;
+            let outcome = upload_resumable_batches_with_literal_families(
+                probes,
+                poison_scope,
+                progress,
+                &mut accepted,
+                |item| item.snapshot_fingerprint.as_str(),
+                snapshot_upload_body_witness,
+                |item| Some(item.source_session_id.as_str()),
+                |_| 0,
+                |_| None,
+                inplace_retry,
+                |items| upload(items, enforce_head_cas),
+                |progress| persist(progress),
+            )?;
+            match outcome {
+                ResumableUploadResult::Completed | ResumableUploadResult::Rejected { .. } => {}
+                // The partitioned uploader persisted each conflicting probe's exact
+                // body quarantine. Carry that hold into the normal upload rather
+                // than discarding every unrelated file's progress. An isolated
+                // refusal is held alone and does not defer the pass.
+                ResumableUploadResult::Deferred { count, isolated } => {
+                    deferred = deferred.saturating_add(count.saturating_sub(isolated));
+                }
+                outcome => {
+                    shed = matches!(outcome, ResumableUploadResult::Shed { .. });
+                    return Err(anyhow::Error::new(SnapshotAckRejected {
+                        reason: "cache head probe did not settle exact predecessor evidence",
+                    }));
+                }
+            }
+        }
+        Ok(deferred)
+    })();
+    progress.context_resend.bootstrap_blocks_catchup = false;
+    if result.is_err() {
+        progress.finish_reason_reoffers(&leased, shed, poison_scope);
+    }
+    result
+}
+
+pub(super) fn cache_head_probe(item: &SnapshotItem) -> SnapshotItem {
+    let mut probe = item.clone();
+    probe.cache_observations = None;
+    probe.cache_observations_state = None;
+    probe.cache_conflict_answer = None;
+    probe
+}
+
+/// Exact non-acceptance of these bytes, using the uploader's existing hold
+/// predicate. An accepted body without a head is not a quarantine certificate.
+pub(super) fn cache_head_probe_held(
+    progress: &SnapshotUploadProgress,
+    probe: &SnapshotItem,
+) -> bool {
+    let fingerprint = &probe.snapshot_fingerprint;
+    let witness = snapshot_upload_body_witness(probe);
+    if progress.active_reason_reoffers.get(fingerprint) == Some(&witness) {
+        return false;
+    }
+    progress.refused_body(fingerprint, &witness)
+        || (!progress.active_quarantine_retries.contains(fingerprint)
+            && progress
+                .quarantined_fingerprints
+                .get(fingerprint)
+                .is_some_and(|record| {
+                    record.upload_body_witness.as_deref() == Some(witness.as_str())
+                }))
+}
+
+pub(super) fn held_cache_head_probe(
+    progress: &SnapshotUploadProgress,
+    item: &SnapshotItem,
+) -> Option<SnapshotItem> {
+    let probe = cache_head_probe(item);
+    (item.cache_observations.is_some()
+        && item.cache_base_head_etag.is_none()
+        && cache_head_probe_held(progress, &probe))
+    .then_some(probe)
+}
+
+/// Every headless patched body takes the probe stages first, so its patch
+/// is never sent without a predecessor token.
+pub(super) fn apply_bootstrapped_cache_heads(
+    source: &str,
+    snapshots: &mut [SnapshotItem],
+    progress: &SnapshotUploadProgress,
+) -> Result<Vec<(String, String, String)>> {
+    let mut held = Vec::new();
+    for snapshot in snapshots {
+        if snapshot.cache_observations.is_none() {
+            continue;
+        }
+        if snapshot.cache_base_head_etag.is_none() {
+            // Check the hold before looking up the head: another entity for
+            // the same session may have acquired one, but that cannot release
+            // this exact body's quarantine or bypass its bounded retry.
+            if let Some(probe) = held_cache_head_probe(progress, snapshot) {
+                // No cache patch or accepted head is invented. The normal
+                // uploader sees the exact held probe and keeps its quarantine;
+                // healthy siblings retain their own independent settlement.
+                crate::local_resource_diagnostics::traversal_point(
+                    "held_cache_head_probe",
+                    source,
+                    &serde_json::json!({"fingerprint_hash8": SessionHash::of(&probe.snapshot_fingerprint).to_string(),
+                        "body_witness_hash8": &snapshot_upload_body_witness(&probe)[..8],
+                        "saved_head_present": progress.accepted_cache_heads.contains_key(&cache_session_key(&probe.source_session_id))}),
+                );
+                held.push((
+                    snapshot.snapshot_fingerprint.clone(),
+                    snapshot_upload_body_witness(snapshot),
+                    snapshot_upload_body_witness(&probe),
+                ));
+                *snapshot = probe;
+                continue;
+            }
+        }
+        snapshot.cache_base_head_etag = progress
+            .accepted_cache_heads
+            .get(&cache_session_key(&snapshot.source_session_id))
+            .cloned();
+        if snapshot.cache_base_head_etag.is_none() {
+            return Err(anyhow::Error::new(SnapshotAckRejected {
+                reason: "cache head probe lacks accepted predecessor token",
+            }));
+        }
+    }
+    Ok(held)
+}
+
+pub(super) fn with_bootstrap_deferred(
+    result: ResumableUploadResult,
+    deferred: usize,
+) -> ResumableUploadResult {
+    if deferred == 0 {
+        return result;
+    }
+    match result {
+        ResumableUploadResult::Completed | ResumableUploadResult::Rejected { .. } => {
+            ResumableUploadResult::Deferred {
+                count: deferred,
+                isolated: 0,
+            }
+        }
+        ResumableUploadResult::Deferred { count, isolated } => ResumableUploadResult::Deferred {
+            count: count.saturating_add(deferred),
+            isolated,
+        },
+        other => other,
+    }
+}
+
+/// Carry a newer refused-body conflict even when the frozen upload delta is
+/// empty. New conflicts were already counted by bootstrap/main upload; this
+/// adds only older, untransmitted debt from the current source universe.
+/// A later traversal's proven unchanged cooldown is counted and disclosed,
+/// but leaves settlement to the normal clean-traversal boundary.
+pub(super) fn with_retained_refusal_conflicts(
+    result: ResumableUploadResult,
+    index: &ScanIndex,
+    progress: &SnapshotUploadProgress,
+    reoffer_now: u64,
+) -> ResumableUploadResult {
+    let retained = index
+        .current_snapshot_fingerprint_refs()
+        .filter(|fingerprint| {
+            !progress.attempted_reason_reoffers.contains(*fingerprint)
+                && progress
+                    .permanent_rejections
+                    .get(*fingerprint)
+                    .is_some_and(|refusal| {
+                        // The I/O view also holds due records waiting for
+                        // budget. Only a still-future reservation grants the
+                        // settlement exception; at D that debt blocks again.
+                        !(index.reason_reoffer_conflict_is_deferred(
+                            fingerprint,
+                            &refusal.body_witness,
+                        ) && refusal
+                            .reoffer
+                            .and_then(reason_reoffer::RefusalReoffer::retry_after)
+                            .is_some_and(|deadline| deadline > reoffer_now))
+                            && progress
+                                .quarantined_fingerprints
+                                .get(*fingerprint)
+                                .is_some_and(|record| {
+                                    record.disposition
+                                        == SnapshotQuarantineDisposition::RetryPending
+                                        && record.upload_body_witness.as_deref()
+                                            == Some(refusal.body_witness.as_str())
+                                })
+                    })
+        })
+        .collect::<BTreeSet<_>>();
+    with_bootstrap_deferred(result, retained.len())
+}
+
+/// Exercise the real retained-conflict settlement boundary from Codex scan
+/// fixtures, without replacing its cooldown decision with a test predicate.
+#[cfg(test)]
+pub(crate) fn retained_refusal_settles_for_test(
+    index: &ScanIndex,
+    fingerprint: &str,
+    record: SnapshotQuarantineRecord,
+    body: &str,
+    now: u64,
+    deadline: u64,
+) -> bool {
+    let mut progress =
+        SnapshotUploadProgress::new("synthetic-codex-cooldown".into(), record.witness.clone());
+    progress
+        .quarantined_fingerprints
+        .insert(fingerprint.into(), record);
+    progress.permanent_rejections.insert(
+        fingerprint.into(),
+        PermanentSnapshotRejection {
+            body_witness: body.into(),
+            exposure: None,
+            revisions: BTreeMap::new(),
+            reason: crate::upload_receipts::RejectedUsageReason::Other,
+            reoffer: Some(reason_reoffer::RefusalReoffer::OriginalPair {
+                retry_after_unix_seconds: deadline,
+            }),
+        },
+    );
+    matches!(
+        with_retained_refusal_conflicts(ResumableUploadResult::Completed, index, &progress, now),
+        ResumableUploadResult::Completed
+    )
+}
+
+#[derive(Debug)]
+pub(super) struct DeferredCacheHeadIdentity {
+    pub(super) source_file_fingerprint: Option<String>,
+    pub(super) snapshot_fingerprint: String,
+    pub(super) session_key: String,
+}
+
+#[expect(clippy::too_many_arguments, reason = "8 args; no options struct yet")]
+pub(super) fn capture_deferred_cache_head_identities(
+    source: SnapshotSource,
+    items: &[SnapshotItem],
+    progress: &SnapshotUploadProgress,
+    enabled: bool,
+    head_cas_required: bool,
+    legacy_pending: &BTreeSet<String>,
+    active_legacy: &BTreeSet<String>,
+    disposition: &crate::snapshots::ClaudeUsageAuthorityDisposition,
+) -> Vec<DeferredCacheHeadIdentity> {
+    if !enabled {
+        return Vec::new();
+    }
+    let held = disposition.quarantined_fingerprints(items);
+    items
+        .iter()
+        .filter_map(|item| {
+            if item.cache_observations.is_none() || held.contains(&item.snapshot_fingerprint) {
+                return None;
+            }
+            // Use the same public semantic primitives as finalization after policy.
+            let fingerprint = crate::snapshots::snapshot_fingerprint_from_component_hashes(
+                source,
+                &item.source_session_id,
+                &crate::snapshots::snapshot_semantic_component_hashes(source, item),
+            );
+            let legacy = legacy_pending.contains(&fingerprint);
+            if legacy && !active_legacy.contains(&fingerprint) {
+                return None;
+            }
+            let session_key = cache_session_key(&item.source_session_id);
+            ((head_cas_required || legacy)
+                && !progress.accepted_cache_heads.contains_key(&session_key))
+            .then(|| DeferredCacheHeadIdentity {
+                source_file_fingerprint: item.source_file_fingerprint.clone(),
+                snapshot_fingerprint: fingerprint,
+                session_key,
+            })
+        })
+        .collect()
+}
+
+/// Both exact contracts, so Pi (no base cache contract) never marks a patch.
+pub(super) fn cache_full_replacement_negotiated(
+    source: SnapshotSource,
+    hint: &crate::snapshot_client::ActivityHintResponse,
+) -> bool {
+    source != SnapshotSource::Pi
+        && hint.session_cache_observations_contract.as_deref()
+            == Some("session_cache_observations:v1")
+        && hint.cache_full_replacement_contract.as_deref() == Some("cache_full_replacement:v1")
+}
+
+/// Pure projection shared by no-op/index witnesses and the network boundary.
+/// Local consumers retain the original cache patch and provisional state.
+pub(super) fn prepare_snapshot_cache_for_upload(
+    snapshot: &mut SnapshotItem,
+    progress: &SnapshotUploadProgress,
+    enabled: bool,
+    head_cas_required: bool,
+    legacy_pending: &BTreeSet<String>,
+) {
+    // Telemetry bodies use head CAS without negotiating cache evidence. Their
+    // predecessor is the exact saved ACK, and they never carry a cache patch.
+    if snapshot.evidence_basis == Some("otel_only") {
+        snapshot.cache_observations = None;
+        snapshot.cache_observations_state = None;
+        snapshot.cache_base_head_etag = progress
+            .accepted_cache_heads
+            .get(&cache_session_key(&snapshot.source_session_id))
+            .cloned();
+        return;
+    }
+    if !enabled {
+        snapshot.cache_observations = None;
+        snapshot.cache_observations_state = None;
+        snapshot.cache_base_head_etag = None;
+        return;
+    }
+    let key = cache_session_key(&snapshot.source_session_id);
+    snapshot.cache_base_head_etag = progress.accepted_cache_heads.get(&key).cloned();
+    if (head_cas_required || legacy_pending.contains(&snapshot.snapshot_fingerprint))
+        && snapshot.cache_base_head_etag.is_none()
+    {
+        snapshot.cache_observations = None;
+        snapshot.cache_observations_state = None;
+        return;
+    }
+    crate::snapshots::prepare_cache_observations(
+        snapshot,
+        progress.accepted_cache_states.get(&key),
+    );
+}
+
+/// Reserve growth from the ACKed cache predecessor without changing the local
+/// patch. Missing-head/legacy fencing can only remove this projected material.
+pub(super) fn identity_cache_wire_reserve(
+    snapshot: &SnapshotItem,
+    progress: &SnapshotUploadProgress,
+    full_replacement: bool,
+) -> usize {
+    if snapshot.evidence_basis != Some("otel_only")
+        && snapshot.cache_observations.is_none()
+        && !progress
+            .accepted_cache_heads
+            .contains_key(&cache_session_key(&snapshot.source_session_id))
+    {
+        return 0;
+    }
+    let mut projected = snapshot.clone();
+    prepare_snapshot_cache_for_upload(&mut projected, progress, true, false, &BTreeSet::new());
+    // An owed answer can become eligible between admission and upload. Reserve
+    // its framing even while paced, using the real attachment/size paths.
+    attach_head_conflict_answers(
+        std::slice::from_mut(&mut projected),
+        progress,
+        u64::MAX,
+        |_| full_replacement,
+    );
+    crate::snapshots::claude_request_identity::item_bytes(&projected).saturating_sub(
+        crate::snapshots::claude_request_identity::item_bytes(snapshot),
+    )
+}
+
+/// Keep ordinary (0), patched or headed (1), legacy (2), and telemetry-only (3)
+/// requests separate: the head-CAS declaration applies to the entire batch.
+/// Class 1 is a body with a cache patch (admitted, unchanged or partial-empty)
+/// or a saved head; class 0 has neither, sends no CAS contract and cannot
+/// conflict with a server head it never claimed.
+pub(super) fn snapshot_upload_batch_class(snapshot: &SnapshotItem, legacy: bool) -> u8 {
+    if snapshot.evidence_basis == Some("otel_only") {
+        3
+    } else if legacy {
+        2
+    } else {
+        u8::from(crate::snapshot_client::declares_head_cas(snapshot))
+    }
+}
+
+/// Answer each owed head-CAS challenge on the outgoing body of its session.
+/// After a validated conflict refuses this exact challenge's answer, only a
+/// re-send of a held conflicted body waits, until that body's own conflict
+/// probe (within one hour); a new revision answers at once. Only a body that
+/// declares head CAS carries the answer; telemetry is freshly rebuilt from its
+/// ordinary evidence chunk and needs neither a cache patch nor a saved base. The
+/// body itself, its fingerprint and its witness are unchanged.
+/// `replacement_owed` (negotiated, real-Full session) may also mark the patch
+/// a full replacement when no local cache state exists: that patch already
+/// completes from empty, so only the receiver's predecessor changes.
+pub(super) fn attach_head_conflict_answers(
+    snapshots: &mut [SnapshotItem],
+    progress: &SnapshotUploadProgress,
+    now: u64,
+    replacement_owed: impl Fn(&str) -> bool,
+) -> usize {
+    let mut attached = 0usize;
+    for snapshot in snapshots {
+        snapshot.cache_conflict_answer = None;
+        if let Some(patch) = snapshot.cache_observations.as_mut() {
+            patch.full_replacement = false;
+        }
+        // A saved base declares head CAS with or without a patch, and
+        // telemetry declares it with or without a base, so the request and
+        // its ACK validation admit the handshake.
+        if snapshot.evidence_basis != Some("otel_only") && snapshot.cache_base_head_etag.is_none() {
+            continue;
+        }
+        let key = cache_session_key(&snapshot.source_session_id);
+        let Some(record) = progress.head_conflict_challenges.get(&key) else {
+            continue;
+        };
+        if record.last_answer_unix != 0
+            && progress
+                .quarantined_fingerprints
+                .contains_key(&snapshot.snapshot_fingerprint)
+            && now < conflict_probe_after(&snapshot.snapshot_fingerprint, record.last_answer_unix)
+        {
+            continue;
+        }
+        snapshot.cache_conflict_answer = Some((
+            record.challenge.clone(),
+            record.stale_revision_v2_hash.clone(),
+        ));
+        if let Some(patch) = snapshot.cache_observations.as_mut().filter(|patch| {
+            replacement_owed(&key)
+                && !progress.accepted_cache_states.contains_key(&key)
+                && patch.operations.iter().all(|operation| {
+                    matches!(operation, crate::snapshots::cache_observations::Operation::Upsert { observation }
+                        if observation.status != "retracted")
+                })
+        }) {
+            // Over the patch bound the answer stays unmarked, as before.
+            patch.full_replacement = true;
+            patch.full_replacement = patch.validate();
+        }
+        attached = attached.saturating_add(1);
+    }
+    attached
+}
+
+pub(super) fn effective_snapshot_upload_body_witness(
+    snapshot: &SnapshotItem,
+    progress: &SnapshotUploadProgress,
+    enabled: bool,
+    head_cas_required: bool,
+    legacy_pending: &BTreeSet<String>,
+    local_authority: &crate::snapshots::ClaudeUsageAuthorityDisposition,
+) -> String {
+    if !local_authority
+        .quarantined_fingerprints(std::slice::from_ref(snapshot))
+        .is_empty()
+    {
+        // A held group retains its prior local-finalization semantics. It does
+        // not acquire a network settlement or a head retry obligation here.
+        return snapshot_upload_body_witness(snapshot);
+    }
+    let mut projected = snapshot.clone();
+    prepare_snapshot_cache_for_upload(
+        &mut projected,
+        progress,
+        enabled,
+        head_cas_required,
+        legacy_pending,
+    );
+    snapshot_upload_body_witness(
+        held_cache_head_probe(progress, &projected)
+            .as_ref()
+            .unwrap_or(&projected),
+    )
+}
+
+/// One hash-only group per current file. Duplicate source witnesses are not an
+/// exact mapping and are excluded rather than guessed. O(current index files).
+pub(super) fn cache_head_file_groups(
+    index: &ScanIndex,
+) -> BTreeMap<String, (String, String, &BTreeSet<String>)> {
+    let mut groups = BTreeMap::new();
+    let mut ambiguous = BTreeSet::new();
+    for (index_key, entry) in &index.files {
+        let Some(group) = entry.last_snapshot_fingerprint.as_ref() else {
+            continue;
+        };
+        let Some(entities) = index
+            .file_snapshot_fingerprints
+            .get(index_key)
+            .filter(|set| !set.is_empty())
+        else {
+            continue;
+        };
+        let file = &entry.source_file_fingerprint;
+        if groups
+            .insert(
+                file.clone(),
+                (cache_head_index_key(index_key), group.clone(), entities),
+            )
+            .is_some()
+        {
+            ambiguous.insert(file.clone());
+        }
+    }
+    for file in ambiguous {
+        groups.remove(&file);
+    }
+    groups
+}
+
+pub(super) fn cache_head_selection_witness(accepted_head: &str) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(format!("cache_head_selection:v1:{accepted_head}"))
+    )
+}
+
+pub(super) fn cache_head_index_key(index_key: &str) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(format!("cache_head_file:v1:{index_key}"))
+    )
+}
+
+pub(crate) fn cache_session_key(session: &str) -> String {
+    use sha2::Digest;
+    format!("{:x}", sha2::Sha256::digest(session.as_bytes()))
+}
+
+/// The batch request around `snapshots` for this collector's source,
+/// machine, version and upload policy.
+pub(crate) fn snapshot_batch_request<T>(
+    source: SnapshotSource,
+    machine_id: &str,
+    snapshots: Vec<T>,
+    upload_policy: SnapshotUploadPolicy,
+    client_report: crate::client_report::ClientReport,
+) -> SnapshotBatchRequest<T> {
+    SnapshotBatchRequest {
+        schema_version: SNAPSHOT_SCHEMA_VERSION,
+        source: source.api_slug().to_string(),
+        machine_id: machine_id.to_string(),
+        collector_version: Some(collector_version()),
+        snapshots,
+        upload_policy,
+        client_report,
+    }
+}
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum ResumableUploadResult {
     Completed,
