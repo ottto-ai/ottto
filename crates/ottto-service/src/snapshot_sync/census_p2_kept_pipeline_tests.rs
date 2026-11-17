@@ -495,9 +495,14 @@ impl PipelineFixture {
             PipelineUpload::Accept => {
                 settle_completed_upload(index, &committed_index, &progress, &holds)
             }
-            PipelineUpload::ServerDeferred => {
-                settle_checkpointed_upload(index, &committed_index, &progress, &holds, false)
-            }
+            PipelineUpload::ServerDeferred => settle_checkpointed_upload(
+                index,
+                &committed_index,
+                &progress,
+                &holds,
+                false,
+                UnsettledUploadCause::DeferredConflict,
+            ),
             PipelineUpload::Shed => {
                 assert!(matches!(result, ResumableUploadResult::Shed { .. }));
                 let index = checkpoint_partial_snapshot_index_with_audit_release(
@@ -522,9 +527,14 @@ impl PipelineFixture {
             }
             PipelineUpload::UploadError => unreachable!("upload error returned above"),
             PipelineUpload::EntityAckRejected { .. } => match &result {
-                ResumableUploadResult::Rejected { .. } => {
-                    settle_checkpointed_upload(index, &committed_index, &progress, &holds, true)
-                }
+                ResumableUploadResult::Rejected { .. } => settle_checkpointed_upload(
+                    index,
+                    &committed_index,
+                    &progress,
+                    &holds,
+                    true,
+                    UnsettledUploadCause::DeferredConflict,
+                ),
                 ResumableUploadResult::Completed => {
                     settle_completed_upload(index, &committed_index, &progress, &holds)
                 }

@@ -452,6 +452,7 @@ pub(super) fn settle_checkpointed_upload(
     upload_progress: &SnapshotUploadProgress,
     holds: &LocalHoldSettlement,
     resolved_permanent_rejections: bool,
+    deferred: UnsettledUploadCause,
 ) -> UploadIndexSettlement {
     let terminal_bound_holds = resolved_permanent_rejections
         && holds.page_held()
@@ -488,7 +489,7 @@ pub(super) fn settle_checkpointed_upload(
         index.mark_bounded_sweep_unsettled_by(if resolved_permanent_rejections {
             UnsettledUploadCause::RejectedWithHolds
         } else {
-            UnsettledUploadCause::DeferredConflict
+            deferred
         });
     }
     let fully_settled = upload_settled_without_account_holds(&index, settled && !holds.any());
@@ -1866,6 +1867,8 @@ pub(super) fn finish_sync_source(
     let upload_result = if let Some(error) = bootstrap_capacity_error {
         Err(error)
     } else {
+        // Only this main page upload records or drains identity-503 custody.
+        upload_progress.identity_503_pass = Some(BTreeSet::new());
         upload_resumable_batches_with_literal_families(
             &scan_result.snapshots,
             source.api_slug(),
@@ -1953,6 +1956,8 @@ pub(super) fn finish_sync_source(
             )
         })
     };
+    // Main-upload mode ends with it; retries never record or drain custody.
+    let identity_503_this_pass = upload_progress.identity_503_pass.take();
     // The logical offer ends here; normal bounded HTTP retries happened inside.
     if !bootstrap_offer_finished {
         // Bootstrap already classified its failed logical offer. A routed
@@ -2021,6 +2026,8 @@ pub(super) fn finish_sync_source(
     let mut deferred_entity_count = None;
     let mut resolved_permanent_rejections = false;
     let mut isolated_only = false;
+    let mut deferred_cause = UnsettledUploadCause::DeferredConflict;
+    let walk_retired = index.walk_retired_since(&committed_index);
     // Local-hold Completed/Deferred/Rejected subsets and selected-state
     // restoration below can omit a still-live file. Capture which retirement
     // obligations this full scan references before any selection (#794 F1).
@@ -2098,8 +2105,15 @@ pub(super) fn finish_sync_source(
                     resolved_permanent_rejections = true;
                     count
                 }
-                ResumableUploadResult::Deferred { count, isolated } => {
+                ResumableUploadResult::Deferred {
+                    count,
+                    isolated,
+                    identity_503,
+                } => {
                     isolated_only = count == isolated;
+                    if count == identity_503 {
+                        deferred_cause = UnsettledUploadCause::Isolated503;
+                    }
                     count
                 }
                 _ => unreachable!(),
@@ -2111,6 +2125,7 @@ pub(super) fn finish_sync_source(
                 &upload_progress,
                 &local_holds,
                 resolved_permanent_rejections,
+                deferred_cause,
             );
             index = settlement.index;
             if !settlement.fully_settled {
@@ -2603,6 +2618,12 @@ pub(super) fn finish_sync_source(
         &retired_upload_acks,
         locally_held_fingerprints,
     );
+    if walk_retired {
+        upload_progress.retire_identity_503_custody(
+            identity_503_this_pass.unwrap_or_default(),
+            index.owes_isolated_503(),
+        );
+    }
     #[cfg(test)]
     tests::permanent_finish_pipeline_tests::ack_post_save_failure("finish_cycle")?;
     upload_progress.finish_cycle(&upload_progress_path)?;

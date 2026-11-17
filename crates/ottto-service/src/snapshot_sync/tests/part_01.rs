@@ -703,7 +703,8 @@ fn cache_pending_head_two_files_multi_siblings_survive_partial_cache_settlement(
         outcome,
         ResumableUploadResult::Deferred {
             count: 1,
-            isolated: 1
+            isolated: 1,
+            identity_503: 0
         }
     );
     index.retain_quarantined_fingerprints(&progress.quarantined_fingerprints);

@@ -246,7 +246,8 @@ fn e2_literal_batch_validation_error_holds_entity_and_settles_siblings() {
         result.unwrap(),
         ResumableUploadResult::Deferred {
             count: 1,
-            isolated: 0
+            isolated: 0,
+            identity_503: 0
         }
     );
     assert!(progress.quarantined_fingerprints.contains_key(&poison));
@@ -277,7 +278,8 @@ fn e2_partial_entity_ack_settles_only_acknowledged_members() {
         result.unwrap(),
         ResumableUploadResult::Deferred {
             count: 1,
-            isolated: 1
+            isolated: 1,
+            identity_503: 0
         }
     );
     assert!(progress.accepted_fingerprints.contains(&root));

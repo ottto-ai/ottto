@@ -23,7 +23,8 @@ fn item_specific_422_isolates_poison_and_checkpoints_valid_siblings() {
         result,
         ResumableUploadResult::Deferred {
             count: 1,
-            isolated: 0
+            isolated: 0,
+            identity_503: 0
         }
     );
     assert_eq!(accepted, 24);
@@ -145,7 +146,8 @@ fn held_validation_rejection_prunes_old_accepted_revisions_from_progress() {
             result,
             ResumableUploadResult::Deferred {
                 count: 1,
-                isolated: 0
+                isolated: 0,
+                identity_503: 0
             } | ResumableUploadResult::Completed
         ));
         assert_eq!(progress.quarantined_fingerprints.len(), 1);
@@ -945,7 +947,8 @@ fn divergent_legacy_reconcile_is_batch_isolated_and_lands_in_bounded_quarantine(
         result,
         ResumableUploadResult::Deferred {
             count: 1,
-            isolated: 1
+            isolated: 1,
+            identity_503: 0
         }
     );
     assert_eq!(observed_classes, vec![false, true]);

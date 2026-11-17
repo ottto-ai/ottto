@@ -59,18 +59,16 @@ pub(crate) const E2_GROUPING: &str =
 /// otherwise (records written by permit-era builds without a permit).
 #[cfg(not(test))]
 pub(crate) const fn cycle_contract(captured: bool) -> &'static str {
-    compiled_cycle_contract(captured, true)
+    compiled_cycle_contract(captured)
 }
 
 // Durable grouping version shares the existing identity-contract rearm. The
 // wire collector stays v1; gate-off contracts and uploads stay byte-identical.
-const fn compiled_cycle_contract(captured: bool, request_owned: bool) -> &'static str {
+const fn compiled_cycle_contract(captured: bool) -> &'static str {
     if !captured {
         ""
-    } else if request_owned {
-        E2_GROUPING
     } else {
-        COLLECTOR
+        E2_GROUPING
     }
 }
 
@@ -5517,11 +5515,10 @@ mod request_owned_contract_tests {
     use super::*;
     #[test]
     fn grouping_version_uses_existing_contract_rearm_and_gate_off_stays_identical() {
-        assert_eq!(compiled_cycle_contract(true, false), COLLECTOR);
-        assert_eq!(compiled_cycle_contract(false, true), "");
-        let first = compiled_cycle_contract(true, true);
+        assert_eq!(compiled_cycle_contract(false), "");
+        let first = compiled_cycle_contract(true);
         assert_ne!(first, COLLECTOR);
-        assert_eq!(first, compiled_cycle_contract(true, true));
+        assert_eq!(first, compiled_cycle_contract(true));
         assert_eq!(
             serde_json::to_value(IdentityCounts::default()).unwrap(),
             json!({})
