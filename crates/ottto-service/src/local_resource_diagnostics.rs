@@ -2342,7 +2342,7 @@ pub(crate) fn claude_reemission_stop_latched(reminder: bool, counts: &impl Seria
     };
     traversal_point(stage, "claude_code", counts);
 }
-/// State-v2 backend observations use the existing local-only #799 sink.
+/// State-v2 backend observations use the existing local-only diagnostics sink.
 /// Callers supply counts, lengths and bounded states, never storage keys.
 pub(crate) fn claude_state_v2(counts: &impl Serialize) {
     traversal_point("claude_state_v2", "claude_code", counts);
@@ -2481,7 +2481,7 @@ pub(crate) struct ReadCounts {
     pub(crate) acquisition_admission: AcquisitionAdmission,
     pub(crate) page_events: PageEvents,
     pub(crate) index_state_at_page_end: IndexState,
-    /// Resumable large-file Codex read cursor (#606). `null` when its
+    /// Resumable large-file Codex read cursor. `null` when its
     /// snapshot could not be obtained (no Codex cursor page tick in this scan,
     /// or the cursor state was busy at completion): unknown, never zero
     /// activity.
@@ -4709,7 +4709,7 @@ mod continuation_tests {
     }
 }
 
-/// Fixed low-cardinality storage observations on the existing #799 envelope.
+/// Fixed low-cardinality storage observations on the existing diagnostics envelope.
 pub(crate) fn scan_index_storage(
     source: &'static str,
     orphans: u64,
@@ -4868,7 +4868,7 @@ impl StateV2Probe {
     }
 }
 
-/// V2 growth counters use the existing local #799 row. No keys or paths.
+/// V2 growth counters use the existing local diagnostics row. No keys or paths.
 pub(crate) fn v2_growth_retained(bytes: u64) {
     claude_state_v2(&serde_json::json!({"v2_growth_retained": {"files": 1, "bytes": bytes}}));
 }

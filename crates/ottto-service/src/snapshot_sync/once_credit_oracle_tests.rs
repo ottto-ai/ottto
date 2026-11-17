@@ -2526,7 +2526,7 @@ fn scheduling_equal_birth_twins(before_cutoff: bool) {
 
 /// [money] Real prepare pages, evidence chunks and cold restarts change scheduling
 /// only. Distinct sidecar ids exclude the separately documented context-tripwire
-/// counterexample. This base predates the named copy-first correction (#1730);
+/// counterexample. This base predates the copy-first correction based on local ownership;
 /// that unseeded correction case alone is unavailable here.
 #[test]
 #[serial]

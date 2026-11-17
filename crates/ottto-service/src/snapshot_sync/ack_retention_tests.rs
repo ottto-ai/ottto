@@ -714,7 +714,7 @@ fn bootstrap_capacity_drains_admitted_bodies_through_partial_settlement() {
     );
 }
 
-/// [regress] (#909) A key rotation this cycle discards saved identity hints in
+/// [regress] A key rotation this cycle discards saved identity hints in
 /// memory only, until the next ACK page; the partial checkpoint still runs.
 #[test]
 fn partial_checkpoint_ignores_the_ledger_binding_of_this_cycle() {
@@ -1494,7 +1494,7 @@ fn resumed_probe_capacity_preserves_durable_equality_for_census_retirement() {
     );
 }
 
-// #778 R2-2: an obligation left by a held save reappears in a new file whose
+// An obligation left by a held save reappears in a new file whose
 // sibling has not settled. The partial subset omits that file; the full scan
 // still references it, so the obligation stays pending and the ACK stays.
 #[test]
@@ -1655,7 +1655,7 @@ fn partial_save_keeps_a_pending_obligation_live_in_an_unsettled_new_file() {
     f.assert_identity(&saved);
 }
 
-// #778 R2-2, committed-incidence variant: E leaves its settled file for a new
+// Committed-incidence variant: E leaves its settled file for a new
 // file with an unsettled sibling. Committed incidence minus the committable
 // subset names E, but the full scan still references it.
 #[test]
@@ -1798,10 +1798,10 @@ fn body_set_witness(bodies: &[String]) -> String {
     format!("{:x}", digest.finalize())
 }
 
-// #778 huge-file follow-up: one file has more entities than the unsettled
+// One file has more entities than the unsettled
 // limit, unrelated debt already fills that limit, and a page fails mid-file.
 // Admission is per entity and settlement per file; the file must still settle.
-// #794 F1: a local hold on sibling H makes the Completed-with-holds and the
+// A local hold on sibling H makes the Completed-with-holds and the
 // Deferred/Rejected-with-holds selections omit a new file that still holds
 // pending E. The common selected save must keep E's obligation pending and
 // its exact ACK suppressed until a valid absence proof (or adoption).
@@ -1928,7 +1928,7 @@ fn local_hold_selection_keeps_a_pending_obligation_for_an_entity_the_scan_still_
     }
 }
 
-// #794 round 4 guard: production can reach the final ACK apply only with an
+// Production can reach the final ACK apply only with an
 // `AckRetirementPlan`, and no production code can make one from a plain set.
 // The compiler enforces this through the private field and `#[cfg(test)]`;
 // this pins those declarations so a refactor cannot quietly reopen the

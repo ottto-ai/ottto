@@ -33,7 +33,7 @@ fn a_shorter_file_reads_full_and_is_counted() {
     assert_eq!(counters::total("tail_shorter_file_full", "files"), 1);
 }
 
-/// [behaviour] #1255: a head made under another attribution key is never
+/// [behaviour] A head made under another attribution key is never
 /// reused; the Full is a counted explicit-action reconstruction, apart from
 /// the release gate.
 #[test]
@@ -112,7 +112,7 @@ fn an_attribution_toggle_scrubs_the_digest_and_reuses_the_head() {
     assert_eq!(counters::total("tail_reconstruct", "key_epoch"), 0);
 }
 
-/// [behaviour] #1255: the pass's start removes the retired record directory,
+/// [behaviour] The pass's start removes the retired record directory,
 /// counted, before the pass's first Tail load.
 #[test]
 fn legacy_erasure_is_counted_before_the_first_load() {

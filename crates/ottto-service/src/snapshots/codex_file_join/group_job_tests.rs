@@ -270,7 +270,7 @@ fn refused_fixture() -> PathBuf {
     root
 }
 
-/// #751: a processed group re-hinted through one member
+/// A processed group re-hinted through one member
 /// is a re-read group. On every page it would take the whole file allowance
 /// (two files) and evict the waiting census-member singleton `c`, so the
 /// census never closed. It now waits for a page without a waiting member,
@@ -1797,9 +1797,9 @@ fn memoized_large_group_takes_no_slot_and_leaves_no_waiter() {
     fs::remove_dir_all(root).unwrap();
 }
 
-/// #603 integration: the group parser is configured once from every member's
+/// The group parser is configured once from every member's
 /// evidence and the proof follows the accumulator's own V2 decision (made on
-/// the first owned record, after the proof was built). The #603 fixture's UI
+/// the first owned record, after the proof was built). The fixture's UI
 /// is unbound-span, which a V2 group holds; inactive, it replays.
 #[test]
 fn counting_v2_decision_reaches_the_group_proof() {
@@ -1813,7 +1813,7 @@ fn counting_v2_decision_reaches_the_group_proof() {
     fs::remove_dir_all(root).unwrap();
 }
 
-/// #603 integration (K8 for groups): with the cutover active, a paused V2
+/// With the cutover active, a paused V2
 /// group resumes only while `configure_group_once` would still pick its
 /// rule from every member's current entry. A Legacy ACK on any member, here
 /// the sealed first one, takes precedence and invalidates the job; a V2 mark

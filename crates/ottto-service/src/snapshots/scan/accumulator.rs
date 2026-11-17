@@ -71,8 +71,8 @@ fn row_key_with_selector_hash(row: &SnapshotModelUsage, selector_hash: String) -
 }
 
 /// The RowKey selector partition of a `copy_unproven` row. Every RowKey of a
-/// usage row, local or rebuilt from its wire form (the #909 accepted ledger,
-/// #944 proved rows), must partition through here so a marked row and an
+/// usage row, local or rebuilt from its wire form (the accepted-share ledger or
+/// proved rows), must partition through here so a marked row and an
 /// unmarked twin never share a key.
 pub(crate) fn copy_unproven_selector_hash(copy_unproven: bool, selector_hash: String) -> String {
     if copy_unproven {

@@ -492,7 +492,7 @@ fn replay_generation_or_namespace_change_clears_retained_proof() {
             .accepted_identity_buckets
             .get("synthetic-sticky-session")
             .is_some_and(|known| known.len() == 1),
-        "#909 hints are not option (ii) state"
+        "hints are not option (ii) state"
     );
     let counts =
         serde_json::to_value(crate::snapshots::claude_request_identity::take_identity_counts())

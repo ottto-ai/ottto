@@ -230,7 +230,7 @@ impl TailSource for Claude {
     }
 
     /// The one keyed field is the org markers' `session_context` digest,
-    /// an HMAC under the attribution key (#1255).
+    /// an HMAC under the attribution key.
     fn key_epoch() -> Option<[u8; 32]> {
         claude_request_identity::session_context_key_epoch()
     }

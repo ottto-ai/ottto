@@ -1,4 +1,4 @@
-//! Uses the real ScanIndex serializer and real #865 durable store in lib tests.
+//! Uses the real ScanIndex serializer and durable store in library tests.
 use crate::snapshots::scan_index_persistence as persistence;
 use crate::snapshots::ScanIndex;
 use persistence::*;

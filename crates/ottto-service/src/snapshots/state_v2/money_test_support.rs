@@ -202,7 +202,7 @@ pub(super) fn hydrate_resident(db: &mut sqlite::Sqlite) -> ScanIndex {
     import::hydrate_context(db).unwrap().0
 }
 
-/// CCR2 of #938's persisted copy-removals fixture plus one prefix-hold debt
+/// CCR2 of the persisted copy-removals fixture plus one prefix-hold debt
 /// file, with definite metadata (shared by the format and inventory tests).
 pub(super) const CCR2_DEFINITE: &str = "Q0NSMgACAAAAEhWSo6RMxEDjJVe1q0p5xwAAAAAAAAAAAQAAAAhTn1hKY1r1cpjByPzdpVwCAAAAAQAAAAAAAAACAAAAAAAAAJGPX3TzuiqIHEpSPndxZkoBAAAAAAAAAAAAAAA";
 

@@ -811,7 +811,7 @@ impl ScanIndex {
                     let mut committed = committed.clone();
                     // Account retry preserves its sampled audit obligation;
                     // authority/family-only holds keep their existing restore
-                    // semantics (#870 owns that separate composition).
+                    // semantics.
                     if let Some(working) = self.files.get(key).filter(|_| {
                         self.claude_account_deferred_holds.contains_key(key)
                             || self

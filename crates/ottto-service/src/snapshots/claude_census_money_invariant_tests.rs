@@ -110,7 +110,7 @@ fn money_birth_is_carried_only_for_the_same_object() {
         Some(replaced)
     );
     assert_eq!(census.carried_birth_for_test(key, None), None);
-    // #588 restore / failed finish: the record is replaced IN PLACE by a
+    // Selected restore or failed finish: the record is replaced IN PLACE by a
     // stub (no new key) that keeps the birth for the same object only; every
     // reader skips it.
     assert_eq!(census.hash_total_for_test(), 1);

@@ -15,7 +15,7 @@ fn retained_state() -> identity::AcceptedBuckets {
     state.set_retained_enabled(true);
     state
 }
-/// Production settles the #909 ledger first, then the witnessed proved rows.
+/// Production settles the accepted-share ledger first, then the witnessed proved rows.
 fn retained_ack(state: &mut identity::AcceptedBuckets, item: &SnapshotItem, missing: &[&str]) {
     let body = serde_json::to_value(item).unwrap();
     state.record(&body);
@@ -291,7 +291,7 @@ fn retained_unwitnessed_ack_never_adds_and_a_cleared_set_re_tags() {
     let mut first = original.clone();
     sticky_apply(&mut first, &proof, &state).unwrap();
     let body = serde_json::to_value(&first).unwrap();
-    // Count-only/legacy or unwitnessed stored ACK: #909 ledger only.
+    // Count-only, legacy or unwitnessed stored ACK: accepted-share ledger only.
     state.record(&body);
     state.record_proved(&body, false, &[]);
     let mut second = original.clone();
@@ -334,7 +334,7 @@ fn retained_gate_off_is_byte_identical_to_the_909_goldens() {
         assert!(!state.is_empty());
     });
     assert_eq!(seeded, sticky_golden_cases(&|_| {}));
-    // #909 pins these bytes; its own test owns the remaining receipt cases.
+    // The accepted-share ledger pins these bytes; its own test covers the other receipt cases.
     for case in [
         "mixed_presence",
         "window",
@@ -343,7 +343,7 @@ fn retained_gate_off_is_byte_identical_to_the_909_goldens() {
     ] {
         assert_eq!(seeded[case], fixture[case], "{case}");
     }
-    // Gate on with no proved rows yet: the plain recent window equals #909's.
+    // Without proved rows, turning the gate on leaves the accepted-share recent window unchanged.
     let (mut window, mut proof) = retained_session(576);
     sticky_price_fixture(&mut window, &mut proof);
     let mut baseline = window.clone();
@@ -586,7 +586,7 @@ fn retained_emitted_wire_goldens_for_the_receiver_contract() {
     );
 }
 
-/// [format] X-B1 wire contract (#14454): the
+/// [format] X-B1 wire contract: the
 /// shared golden bucket row with `copy_invalidated=true`, as the canonical
 /// body serializes it, and the same row unflagged. False is omitted, so a
 /// row without the flag keeps today's bytes and an old receiver, which
@@ -783,10 +783,10 @@ fn retained_lost_replacement_then_missing_proof_is_a_counted_refusal() {
 }
 
 /// A copy-prefix row marked `copy_unproven` and its unmarked own
-/// twin share a bucket and every other key field. #909 freezes, and #944
-/// proves, each under the daemon's partitioned RowKey: no false refusal, no
-/// silent re-tag, and the unmarked row keeps its key when no marked row is
-/// sent (capability off).
+/// twin share a bucket and every other key field. The accepted-share ledger freezes each
+/// row under its own partitioned RowKey and the retained-proof path proves it under the
+/// same key. This avoids false refusals and silent re-tags. The unmarked row keeps its key
+/// when no marked row is sent with the capability off.
 #[test]
 fn copy_unproven_twin_rows_freeze_and_prove_separately() {
     for retained in [false, true] {

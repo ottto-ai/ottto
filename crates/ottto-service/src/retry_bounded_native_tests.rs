@@ -891,7 +891,7 @@ fn bounded_retry_native_reshed_keeps_original_expiry_and_shared_posts() {
     assert_eq!(f.baseline.files.len(), 2);
 }
 
-// #660: persisted state that enlarges the index past `RESPONSE_BYTES` must
+// Persisted state that enlarges the index past `RESPONSE_BYTES` must
 // not loosen any cap. Bounded retry declines before any copy (the caller's
 // existing `None` → ordinary path), and the ordinary unbounded checkpoint
 // then settles the ACK and keeps the filler entries.
@@ -935,7 +935,7 @@ fn bounded_native_enlarged_by_filler() -> SameSourceAckFixture {
     f
 }
 
-// #660: the bounded checkpoint's capped read refuses the enlarged index
+// The bounded checkpoint's capped read refuses the enlarged index
 // with an error: the index and progress files are byte-identical (no
 // truncation), and the durable ACK is still settled by the ordinary
 // checkpoint afterwards (no ACK or debt loss).

@@ -21,7 +21,7 @@ const PROBE_BYTES: usize = 1024 * 1024;
 
 /// The accumulator creation point for continuous group replay (§k.4): the group's
 /// counting state is configured here, once, from every member's evidence
-/// (#603 `configure_group_once`). Only the reader is swapped per member, so
+/// (`configure_group_once`). Only the reader is swapped per member, so
 /// no member reconfigures it. The legacy tee (`legacy_tee`) stays
 /// unconfigured: it is baseline evidence, not a second counted stream.
 pub(in crate::snapshots) fn new_group_parser(

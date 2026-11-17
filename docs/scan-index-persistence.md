@@ -339,7 +339,7 @@ No transcripts or durable-tail files are traversed or removed.
 
 The byte fixture runs the SAME real legacy ScanIndex serializer before and after
 a real-shaped shard round-trip, comparing complete serialized byte arrays and
-each moved map's bytes. A real #865 `DurableTailStore::write_after_save` fixture
+each moved map's bytes. A real `DurableTailStore::write_after_save` fixture
 uses the committed root generation and restores its record after store restart.
 The writer fixture executes an actual shard commit before that durable write.
 An exhaustive metadata-complement assertion keeps every other serialized field

@@ -1454,7 +1454,7 @@ fn deleted_sibling_lost_ack_settles_once() {
     });
 }
 
-/// B2 (#1351) receipts. `claude_bad_record_sibling`: a malformed record
+/// Money equivalence receipts. `claude_bad_record_sibling`: a malformed record
 /// between valid responses never counts and its siblings count on every arm.
 /// `claude_paused_suffix`: an unterminated final response is pending on its
 /// first read and counts once after it completes.
@@ -1529,7 +1529,7 @@ fn claude_paused_suffix() {
     claude_bad_record_case("claude_paused_suffix");
 }
 
-/// B2 (#1351) receipt: an invalid native usage record between valid Codex
+/// Money equivalence receipt: an invalid native usage record between valid Codex
 /// turns never counts; its siblings count exactly as in a rollout without it.
 #[test]
 fn codex_bad_record_sibling() {
@@ -1623,7 +1623,7 @@ fn codex_bad_record_sibling() {
     );
 }
 
-/// Disk-only lifecycle fixtures (#806). scripts/money_equivalence.py counts
+/// Disk-only lifecycle fixtures. scripts/money_equivalence.py counts
 /// exactly the cross-build receipts above, so these print a distinct line and
 /// write no receipt; the job still runs them and fails on any assertion.
 fn disk_verified(name: &str, bodies: &[ReceiptBody], restored: u64) {

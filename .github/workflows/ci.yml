@@ -85,8 +85,8 @@ jobs:
     # skip) can be reverted on its own at any time.
     needs: linux-first
     if: ${{ !cancelled() && needs.linux-first.result != 'failure' && github.event_name != 'pull_request' && github.event_name != 'push' && !(github.event_name == 'workflow_dispatch' && (inputs.money_equivalence || inputs.scan_stack_margin || inputs.rust_test_filter != '')) }}
-    # Main's own queue run takes about 38 min (runs 40321546891, 40331916601,
-    # 40348583388); 40 cancelled #791 (run 40378483829). Headroom, not a target.
+    # The main merge queue usually takes about 38 minutes. A previous 40-minute limit
+    # cut off a run, so keep extra time for slower runs.
     timeout-minutes: 55
     runs-on: macos-15
     env: &rust-contract-env

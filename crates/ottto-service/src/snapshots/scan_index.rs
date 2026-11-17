@@ -474,7 +474,7 @@ pub struct ScanIndex {
     #[serde(default, deserialize_with = "deserialize_lenient_default")]
     pub(crate) claude_money_birth_store: claude_money_birth_store::BirthStore,
     /// Inventory fence for the Desktop pagination cursor, never identity proof.
-    /// The version prefix rejects #851's legacy digest; an absent/mismatched
+    /// The version prefix rejects the legacy digest. An absent or mismatched
     /// fence restarts discovery before any census can certify completeness.
     /// Reuses the existing appended positional slot.
     #[serde(

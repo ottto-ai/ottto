@@ -939,10 +939,10 @@ pub(super) mod tests {
             });
             let (((pages, events), sites), vanished) = result;
             let retired = u64::from(at == LATER);
-            // Pin the shared #799 keys and meanings independently of the
+            // Pin the shared diagnostics keys and meanings independently of the
             // temporary stage/carrier, including zero on the next generation.
             // Count across ALL records so a second emitter cannot hide behind
-            // a different stage when these paths compose with #876.
+            // a different stage when these paths run alongside the aged-growth checks.
             for (key, expected) in [
                 ("audit_retired_absent", serde_json::json!({"events": 1})),
                 ("withheld_hold_released", serde_json::json!({"deleted": 1})),

@@ -1079,7 +1079,7 @@ fn base64_hashes(hashes: &[u64]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
-/// The legacy `h` wire form (#664): concatenated 16-digit lowercase hex.
+/// The legacy `h` wire form: concatenated 16-digit lowercase hex.
 fn legacy_hex_hashes(hashes: &[u64]) -> String {
     hashes.iter().map(|hash| format!("{hash:016x}")).collect()
 }
@@ -1499,7 +1499,7 @@ fn census_sequence_index_preserves_serde_compatibility_and_isolates_evidence() {
         serde_json::json!(false),
         serde_json::json!([]),
         serde_json::json!({}),
-        // U1a-2a (#660): the side/proof fields after the parent ledgers
+        // Codex parent side-record and proof fields follow the parent ledgers
         // (`serde(skip)` RAM fields take no slot).
         serde_json::json!({}),
         serde_json::json!({}),

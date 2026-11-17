@@ -840,7 +840,7 @@ pub(in crate::snapshot_sync) fn ack_post_save_failure(stage: &'static str) -> Re
     Ok(())
 }
 
-/// #794: one scripted response per snapshot POST; an empty script accepts.
+/// One scripted response per snapshot POST; an empty script accepts.
 #[derive(Clone, Copy, Debug)]
 enum AckScriptedPost {
     Accept,
@@ -1132,7 +1132,7 @@ fn ack_followup_set_debt(preparation: &mut SourcePreparation, debt: &[String], p
     progress.save(&preparation.upload_progress_path).unwrap();
 }
 
-/// #794 F3: incomplete-census capacity stop, then a Disabled finish, then
+/// Incomplete-census capacity stop, then a Disabled finish, then
 /// another incomplete-census capacity stop. The Disabled exit resets the
 /// consecutive count, so the second stop reports 1, not 2.
 #[test]

@@ -88,7 +88,7 @@ pub(super) fn record_upload_error_cadence(
     }
 }
 
-/// #778 R2-3: over-capacity debt that only a complete census can retire.
+/// Over-capacity debt that only a complete census can retire.
 /// Counts consecutive capacity stops whose scan could not prove absence; any
 /// other finish outcome resets it. Process-local count, never uploaded.
 static INCOMPLETE_CENSUS_CAPACITY_STOPS: Mutex<BTreeMap<&'static str, u64>> =
@@ -152,7 +152,7 @@ impl Drop for CapacityStopCensusCount {
     }
 }
 
-/// Retirement obligations a pre-selection scan still references (#794 F1).
+/// Retirement obligations a pre-selection scan still references.
 ///
 /// Structural guard: every production entry point that can stage, release or
 /// plan an ACK retirement (`stage_ack_retirement_handoff_with_scan`,
@@ -184,7 +184,7 @@ impl PartialEq<BTreeSet<String>> for AckScanReferences {
 }
 
 /// The only production authority for the final ACK apply step
-/// (`retire_planned_acks_after_index_save`, #794 round 4). The field is
+/// (`retire_planned_acks_after_index_save`). The field is
 /// private: outside this module a plan is minted only by
 /// `stage_selected_ack_retirement` (which requires `AckScanReferences`) and
 /// grows only by `add_saved_handoff_retirements` (the persisted handoff, whose
@@ -322,7 +322,7 @@ impl SnapshotUploadProgress {
 
     /// `scan_referenced` comes from `ack_retirement_scan_references` on the
     /// pre-selection scan. An entity it names stays live even when the
-    /// committable subset dropped its new, unsettled file (#778 R2-2).
+    /// committable subset dropped its new, unsettled file.
     pub(super) fn release_acks_after_partial_index_save_with_scan(
         &mut self,
         path: &Path,
@@ -524,7 +524,7 @@ impl SnapshotUploadProgress {
 
     /// `scan_referenced` names obligations the pre-selection scan still
     /// references. A selection can omit such an entity's new, unsettled file;
-    /// its obligation then stays pending, never promoted (#778 R2-2).
+    /// its obligation then stays pending, never promoted.
     pub(super) fn stage_ack_retirement_handoff_with_scan(
         &self,
         previous: &ScanIndex,

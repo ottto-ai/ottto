@@ -894,7 +894,7 @@ fn head(index: &ScanIndex, key: &str) -> Option<crate::transcript_acquisition::D
     )
 }
 
-/// #641's admission setup: a real Codex cursor job paged to its certified end
+/// Admission setup: a real Codex cursor job paged to its certified end
 /// (cursor state and optional header facts).
 fn certified_cursor_job(cache: &Arc<SharedCache>) {
     let fixture = ScanRoot::new(40);
@@ -2334,7 +2334,7 @@ fn ad1_quiescent_outlived_cursor_read_verifies_at_commit_and_converges() {
     }
 }
 
-/// #606 final review: a tail-mode cursor job whose genuine-EOF
+/// A tail-mode cursor job whose genuine-EOF
 /// record introduces the file's first priority tier goes through the
 /// protected-tier full replay before anything publishes, as main's trailing
 /// line does: a sampled prefix never mints the receipt.
@@ -2796,7 +2796,7 @@ fn freshness_selection_keeps_a_fitting_census_page_together() {
     assert!(!scan.index.traversal.as_ref().unwrap().codex_freshness_yield);
 }
 
-/// [regress #789] A large revalidation backlog of owed old census re-reads
+/// [regress] A large revalidation backlog of owed old census re-reads
 /// must not spend the byte budget before fresh data. Each page's singleton
 /// budget is four fixture files, and the fresh bypass triggers once the
 /// pending bytes exceed it, so `MEMBERS` only has to dwarf a few pages.
@@ -4066,7 +4066,7 @@ fn pending_flags(index: &ScanIndex, path: &Path) -> Option<(bool, bool)> {
     })
 }
 
-/// G1 (review of #751): a re-read cursor job that is not a census member
+/// A re-read cursor job that is not a census member
 /// is paused on the page its census closes. `L` was read in the generation
 /// as a singleton, then grew past the singleton budget and was hinted with
 /// its retained state gone, so its re-read is a non-member cursor job (no
@@ -4189,7 +4189,7 @@ fn non_member_job_paused_at_census_close_resumes_in_the_next_generation() {
     assert_eq!(latest, fresh_totals(&fixture));
 }
 
-/// G1 (review of #751): a census that closes with a re-read waiting while
+/// A census that closes with a re-read waiting while
 /// the sweep is partially settled keeps the old path. Nothing is carried and
 /// the unsettled marker stays for the clean follow-up; that walk re-reads the
 /// grown file exactly once, and the totals equal a fresh full read.
@@ -4290,7 +4290,7 @@ fn unsettled_close_keeps_the_clean_follow_up_and_rereads_once() {
     assert_eq!(latest, fresh_totals(&fixture));
 }
 
-/// #630 review: a hold an append may cure is memoized on the held
+/// A hold an append may cure is memoized on the held
 /// file's exact stamp only when the job's read reached the file's end.
 /// Bytes appended past the frozen extent may already cure it, so the job
 /// keeps no hold offset (no memo entry) and its next attempt reads them.
@@ -4299,7 +4299,7 @@ fn growth_curable_hold_is_not_anchored_past_unread_bytes() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    // #635: the created thread held as `AmbiguousFork` too. R2-L3: an
+    // The created thread held as `AmbiguousFork` too. An
     // ordinary fork (not a created thread) is not growth-curable, so its
     // anchor survives the append.
     for (grow, fork, created) in [
@@ -4687,7 +4687,7 @@ fn created_usage(scan: &SourceScanResult) -> Vec<(u64, u64)> {
         .collect()
 }
 
-/// #635 (a), #631 review L1: a projection ahead of the flushed rollout holds
+/// A projection ahead of the flushed rollout holds
 /// the created thread as `AmbiguousFork`. A usage-free prefix (header, first
 /// task and turn context, flushed before the first `token_count`) is
 /// memoized on its exact stamp.
@@ -4776,7 +4776,7 @@ fn assert_admitted_once(
     );
 }
 
-/// #635 (b): the same hold wakes on its sidecar. A projection change is a
+/// The same hold wakes on its sidecar. A projection change is a
 /// memo miss: the file is re-read (still ahead, so held and memoized again)
 /// and the new entry hits while unchanged.
 #[test]
@@ -4814,7 +4814,7 @@ fn projection_ahead_created_thread_memo_wakes_on_projection_change() {
     assert_eq!(counter(&cache, |c| c.memo_hits), 1, "{}", counters(&cache));
 }
 
-/// #635 R2-L2: a lagging projection catches up with an unchanged file. The
+/// A lagging projection catches up with an unchanged file. The
 /// file is ahead of its projection, so the sidecar binds nothing and the
 /// created thread is held as `AmbiguousFork`. It holds usage and is
 /// memoized (PR-1's wider gate); the projection change misses it, the
@@ -4853,7 +4853,7 @@ fn lagging_projection_catching_up_cures_an_unchanged_created_thread() {
     assert_admitted_once(&home, &cache, index, &cured, 2);
 }
 
-/// #635 (c), negative control: a created thread with copied-history evidence
+/// Negative control: a created thread with copied-history evidence
 /// (`forked_from_id`, no trusted parent) is a true fork. Its unchanged stamp
 /// hits; growth re-reads it, and once the projection binds the grown file it
 /// stays held (no admission), memoized again and hit again while unchanged.
@@ -5947,7 +5947,7 @@ fn memo_hit_a_week_later_is_the_same_hit() {
     assert!(created_usage(&week).is_empty());
 }
 
-// #641 cursor resource: claims, admission and credit settlement.
+// Cursor resource claims, admission and credit settlement.
 
 /// [money] R3: the residue no longer vetoes retirement. A vanished file
 /// whose filename owner sits in the residue (a plain ownership refusal,

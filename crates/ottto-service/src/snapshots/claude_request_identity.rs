@@ -49,7 +49,7 @@ pub(crate) use budget::Measurement as CapMeasurement;
 pub(crate) const COLLECTOR: &str = "claude_code_jsonl:own_request_identity_rows:v1";
 /// Option (ii) activation: the exact activity-hint capability token
 /// (`session_request_identity_retained_contract`). Any other value keeps
-/// `identity_retained` off and the #909 accepted-priority body byte-identical.
+/// `identity_retained` off and the accepted-priority body byte-identical.
 pub(crate) const IDENTITY_RETAINED_CONTRACT: &str = "session_request_identity_retained:v1";
 pub(crate) const E2_GROUPING: &str =
     "claude_code_jsonl:own_request_identity_rows:v1/e2_grouping:v1";
@@ -1527,7 +1527,7 @@ impl Deferred {
         }
     }
 
-    /// Option (ii) counters on the final body. #909's accepted-priority
+    /// Option (ii) counters on the final body. The accepted-priority
     /// ledger state is not an input in this mode.
     fn count(&self, item: &SnapshotItem, retained: bool, counts: &mut budget::Counts) {
         if !retained {
@@ -1725,12 +1725,12 @@ pub(crate) struct CopyInvalidation {
     row: RowKey,
 }
 
-/// Copy-derived rows (#944): proof a copied marker lent must not keep
+/// Copy-derived rows: proof a copied marker lent must not keep
 /// placing. A frozen row whose shares change and are only accounts copied
 /// markers lent to that very row's requests (ones copy-prefix dedupe
 /// re-derived without them) is copy-derived: it is treated as never accepted
 /// (fresh own tags or untagged, never a refusal or marker). Other changed
-/// rows keep #909's refusal, and rows their own evidence still proves are
+/// rows keep the accepted-share refusal, and rows their own evidence still proves are
 /// unchanged.
 fn copy_derived_rows(
     item: &SnapshotItem,
@@ -1773,7 +1773,7 @@ fn copy_derived_rows(
         // Without per-ACK provenance, a freeze holding any
         // share copied markers did not lend may be a corrected body's, and
         // evidence this pass could not read may still prove the latest
-        // proof. Both keep #909's protection, counted.
+        // proof. Both keep accepted-share protection, and both are counted.
         if !prior.is_subset(&lent) {
             counts.copy_derived_mixed_not_invalidated += 1;
         } else if !read {
@@ -2340,7 +2340,7 @@ fn set_row(
     }
 }
 
-/// Money identity outranks display data (#909 P0): an over-cap tagged body
+/// Money identity outranks display data: an over-cap tagged body
 /// first sheds cache observations from the end of the patch, and only then
 /// may the selector strip tags. Returns the pre-shed component bytes (counts
 /// only) and the bytes after shedding.
@@ -3664,7 +3664,7 @@ pub(crate) fn reconcile_request_accounts(items: &mut [SnapshotItem], evidence: &
             // shares survive with no account. Durable bindings are untouched.
             fold.entity.repartition(None);
             accounts.unhealthy_no_fallback = true;
-            // A discard keeps #932's hold: nothing to admit.
+            // A discard keeps the trace-discard account hold: nothing to admit.
             accounts.unhealthy_cleared_account = (!evidence.trace_discarded_roots.contains(root))
                 .then(|| super::exact_session_account_hash(item))
                 .flatten();
@@ -4249,7 +4249,7 @@ pub(crate) struct ScanEvidence<'a> {
     /// Roots whose sidecar reads were incomplete in this pass.
     pub(crate) unhealthy_roots: BTreeSet<String>,
     /// Unhealthy roots whose strict trace read this pass discarded (it grew
-    /// or was replaced mid-read); #932's hold withholds their family.
+    /// or was replaced mid-read); the trace-discard account hold withholds their family.
     trace_discarded_roots: BTreeSet<String>,
     /// Unique telemetry rows that failed `valid_login`. Every unique row is
     /// checked once here (its fingerprint included); `classify` reuses the

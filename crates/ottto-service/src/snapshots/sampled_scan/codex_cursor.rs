@@ -971,7 +971,7 @@ pub(in crate::snapshots) fn counting_view(candidate: &CandidateFile, index: &Sca
     crate::snapshots::sources::codex::counting::version::singleton_view(candidate, index)
 }
 
-/// A group's counting view (#603): what
+/// A group's counting view: what
 /// `configure_group_once` would configure now from every member's index
 /// entry (`sources::codex::counting::version::group_view`, the same evidence as
 /// `group_evidence` at boot). A counting change on any member, not only the
@@ -2425,7 +2425,7 @@ pub(in crate::snapshots) fn finish_job(
     {
         job.hold_offset = job.hold_offset.or(Some(fragment.offset));
     }
-    // #630 review: a hold an append may cure is memoized on the held
+    // A hold an append may cure is memoized on the held
     // file's exact stamp, which must not cover bytes this read never
     // consumed: they may already cure it. Such a hold records no entry, so
     // its next attempt reads them.
@@ -3502,7 +3502,7 @@ impl SharedCache {
             });
             refusal
         };
-        // #625 decoder seam: a compressed input has no physical offsets,
+        // A compressed input has no physical offsets,
         // samples or frozen extent, and its decoded size is not the on-disk
         // length `PageBudget::plan` compares with B. Refuse it explicitly
         // (never a cursor job); the activation names the compressed > B plan
@@ -4324,7 +4324,7 @@ fn revalidate_decisions(job: &OwnedActiveFile) -> Resume {
 }
 
 /// A hold whose cause no appended byte can remove: an ambiguous fork, a
-/// broken native ordinal stream, or (#597) a parentless created thread whose
+/// broken native ordinal stream, or a parentless created thread whose
 /// proof failed on a set-only stream or header conjunct. Every flag read here
 /// only ever moves toward held within one read.
 ///
@@ -4366,7 +4366,7 @@ pub(in crate::snapshots) fn held_monotone(accumulator: &SnapshotAccumulator) -> 
 /// hits only on the exact recorded stamp, and any growth re-reads it.
 ///
 /// `NativeCreatedThread` is set only inside that branch, so this covers the
-/// parentless missing-projection hold and #635's unbound
+/// parentless missing-projection hold and the unbound
 /// `AmbiguousFork` hold. Memo eligibility only; admission is unchanged.
 pub(in crate::snapshots) fn growth_may_cure(accumulator: &SnapshotAccumulator) -> bool {
     accumulator.codex_created_thread_native_only

@@ -420,8 +420,8 @@ fn sticky_budget_preserves_accepted_old_bucket_and_refuses_new_when_full() {
     assert!(measured.accepted_retained > 0);
     assert_eq!(measured.item_bytes, identity::item_bytes(&second));
 }
-/// [money] [regress] #909 P0 (05f7bf85: 582 hours over 6 accounts, untagged
-/// baseline over the cap): cache observations are shed before any money tag.
+/// [money] [regress] When an untagged baseline exceeds the cap, cache observations
+/// are shed before any money tag.
 /// Every accepted share keeps its tag; totals unchanged.
 #[test]
 fn sticky_budget_sheds_cache_before_stripping_any_tag() {
@@ -1869,8 +1869,8 @@ fn sticky_wire(item: SnapshotItem) -> Value {
     request.snapshots = vec![item];
     serde_json::to_value(request).unwrap()
 }
-/// #909's emitted cases. `seed` may pre-load ledger state into every
-/// accepted set (option (ii) gate-off proof: it must not change a byte).
+/// Emitted cases for accepted-share protection. `seed` may pre-load each accepted ledger
+/// to verify that option (ii) state changes no output bytes when its gate is off.
 fn sticky_golden_cases(seed: &dyn Fn(&mut identity::AcceptedBuckets)) -> Value {
     let fresh = || {
         let mut state = identity::AcceptedBuckets::for_test();
@@ -2571,7 +2571,7 @@ fn sticky_no_emitted_rollup_or_bucket_part_omits_a_cost_its_row_carries() {
     assert!(stripped_cases > 0 && kept_parts_cases > 0);
 }
 
-/// [money][regress] #909: the advertised cap preserves every tag and total;
+/// [money][regress] The advertised cap preserves every tag and total;
 /// the real heap walker charges the large graph or refuses parking, never money.
 #[test]
 fn advertised_cap_preserves_large_tagged_body_and_heap_charge() {

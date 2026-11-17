@@ -104,7 +104,7 @@ crate::heap_layout_bound::no_heap!(true; ClaudeCompactionTrigger);
 
 /// Sizes and trigger for exactly the events `claude_compaction_summary`
 /// lists for the same `owned_observations`: every boundary plus every legacy
-/// summary #676's pairing leaves unpaired, each with a timestamp, bounded like
+/// summary the pairing step leaves unpaired, each with a timestamp, bounded like
 /// `bounded_compaction_timestamps`, so `at` matches `compaction_timestamps`
 /// entry for entry. `own_requests` are the owned requests behind the item's
 /// first/peak/last, in any order; only requests with a request id have one.
