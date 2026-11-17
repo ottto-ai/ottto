@@ -1791,6 +1791,11 @@ fn handle_command(
             to_value(plan_local_uninstall(&home))
         }
         LocalControlCommand::UninstallExecute { confirm } => {
+            // Only a request caller may uninstall: refuse the daemon's own
+            // caller before the shared check admits it and before any work.
+            if authorization == RequestAuthorization::DaemonInternal {
+                return Err(LocalApiError::LocalClientNotTrusted);
+            }
             require_authorized_local_client(daemon, &authorization)?;
             if !confirm {
                 return Err(LocalApiError::InvalidRequest(

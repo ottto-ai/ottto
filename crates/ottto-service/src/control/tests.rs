@@ -13356,10 +13356,15 @@ fn daemon_internal_is_never_a_request_caller_and_is_refused_beyond_verification(
             execute_write_config_repair(&daemon, &internal, &SourceKind::Codex),
             Err(LocalApiError::LocalClientNotTrusted)
         ));
+        // UninstallExecute refuses before its confirm guard, which precedes
+        // all of its work: a later refusal would answer InvalidRequest here.
+        // confirm=false because a regressed confirm=true would reach the
+        // host's launch agents and keychain.
         for command in [
             LocalControlCommand::AgentStatusCached { source: None },
             LocalControlCommand::RelayStart,
             LocalControlCommand::RelayStop,
+            LocalControlCommand::UninstallExecute { confirm: false },
         ] {
             let result = handle_command(
                 &daemon,
