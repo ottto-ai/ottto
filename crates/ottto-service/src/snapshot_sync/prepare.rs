@@ -1,27 +1,24 @@
 //! move snapshot prepare into prepare.
 
-use super::activate_source_upload_context;
 use super::adopt_legacy_checkpoint_file;
 use super::anyhow;
-use super::backfill_replay_pending;
+
 use super::claude_contract;
-use super::claude_prior_history;
+
 use super::continuation;
 use super::current_historical_replay;
 use super::current_rfc3339;
 use super::current_unix_seconds;
-use super::cycle_body_witness_revision;
+
 use super::legacy_policy_scoped_snapshot_index_path;
 use super::live_snapshot_retry;
 use super::load_backfill_state;
-use super::note_claude_history_cutoff_for_cycle;
-use super::note_claude_index_rebuild_for_destination;
-use super::prepare_upload_progress_for_cycle_with_reoffer;
+
 use super::reason_reoffer;
 use super::record_server_scan_directive;
 use super::rfc3339_after_minutes;
 use super::safe_error;
-use super::save_terminal_contract_claims_for_scan;
+
 use super::scan_request_window_days;
 use super::small_source_upload;
 use super::snapshot_destination_scoped_index_path;
@@ -48,6 +45,8 @@ use super::CollectorState;
 use super::CollectorStatus;
 #[cfg(test)]
 use super::Context;
+#[cfg(not(test))]
+use super::Context as _;
 use super::Digest;
 #[cfg(test)]
 use super::Duration;
@@ -77,6 +76,262 @@ use super::MAX_BACKFILL_FILES_PER_SOURCE;
 use super::MAX_CYCLE_INTERVAL;
 use super::SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE;
 use super::SNAPSHOT_SYNC_INTERVAL;
+
+use super::pending_backfill_sources_for_destination;
+use super::upload_context_resend;
+use super::SnapshotItem;
+use super::SnapshotQuarantineDisposition;
+use super::MAX_SNAPSHOT_RECONSTRUCTION_FAILURES;
+
+// Pinned with the replay strings in `backfill.rs`: a compiled history revision never
+// triggers a re-read of existing history; new meaning ships forward via a rule epoch.
+// Changing a pinned value needs owner approval (pin test: `history_revisions_are_pinned`).
+pub(crate) const fn effective_upload_body_witness_revision(source: SnapshotSource) -> u64 {
+    match source {
+        SnapshotSource::ClaudeCode => 3,
+        SnapshotSource::Codex | SnapshotSource::Pi => 1,
+    }
+}
+
+// A Claude revision the history gate is not complete for does not
+// build. Raise `MAX_GATED_CLAUDE_REVISION` only with its complete policy row.
+const _: () = assert!(
+    effective_upload_body_witness_revision(SnapshotSource::ClaudeCode)
+        <= crate::snapshots::MAX_GATED_CLAUDE_REVISION
+);
+
+/// The revision a sync cycle activates: the compiled one.
+pub(super) fn cycle_body_witness_revision(source: SnapshotSource) -> u64 {
+    effective_upload_body_witness_revision(source)
+}
+
+/// Where this destination's Claude prior history comes from. A fresh install
+/// is only a positively empty support state.
+/// - `Unverified`: the backfill state is unreadable.
+/// - `Here`: this destination's completed bootstrap; a server-attested record
+///   in its upload ledger (an accepted, quarantined or refused body or
+///   accepted cache evidence; a generation or replay claim alone is saved
+///   before any upload, so it is not evidence); a quarantined (`.corrupt.`)
+///   sibling of this index; or the re-emission seen-marker. Also, when the
+///   history is not `Moved`, an unscoped pre-scoping `claude_code-scan-index*`
+///   beside `destinations/`: it names no destination, so it
+///   is not a move, but this Mac did index history, so a cutoff keeps that
+///   history owed, list-gated and paced instead of resent ungated.
+/// - `Moved`: only a Claude bootstrap completed for another destination or
+///   recorded by a legacy state, or a Claude index, ledger or quarantined
+///   copy another destination's directory holds (an interrupted bootstrap
+///   before a re-pair). A leftover is another destination only when it sits
+///   under a different namespace; unless a claim
+///   recorded a different-user cutoff, which keeps that history excluded by
+///   the cutoff, as before.
+///
+/// Read before scanning; none of it lives in the index, so it survives index
+/// loss (fail closed).
+pub(super) fn claude_prior_history(
+    backfill_state: &crate::backfill::BackfillState,
+    destination_namespace: &str,
+    upload_progress: &SnapshotUploadProgress,
+    index_path: &Path,
+    support_dir: &Path,
+) -> crate::snapshots::PriorHistory {
+    use crate::snapshots::PriorHistory;
+    if backfill_state.prior_history_unverified {
+        return PriorHistory::Unverified;
+    }
+    let slug = SnapshotSource::ClaudeCode.api_slug();
+    // Only a different namespace's directory is another destination. An
+    // unscoped legacy `claude_code-scan-index*` beside `destinations/` names
+    // no destination; it is usually this Mac's own pre-scoping index, so it
+    // must not hold history as a move (I-r3-1). It is `Here` evidence below.
+    let other_destination = || {
+        let prefix = format!("{slug}-scan-index");
+        let own = index_path.parent();
+        let holds_claude_state =
+            |directory: &Path| Some(directory) != own && dir_holds_prefixed(directory, &prefix);
+        match std::fs::read_dir(support_dir.join("snapshots").join("destinations")) {
+            Ok(mut destinations) => destinations.any(|destination| match destination {
+                Ok(destination) => holds_claude_state(&destination.path()),
+                Err(_) => true,
+            }),
+            Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+        }
+    };
+    // Fails closed: only a positively missing marker is absent.
+    let seen_marker = || match std::fs::symlink_metadata(
+        crate::snapshots::claude_reemission_seen_marker_path(support_dir),
+    ) {
+        Ok(_) => true,
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    };
+    if claude_destination_history_here(
+        backfill_state,
+        destination_namespace,
+        upload_progress,
+        index_path,
+    ) || seen_marker()
+    {
+        return PriorHistory::Here;
+    }
+    // A claim that recorded a different-user cutoff keeps the other
+    // destinations' history excluded by that cutoff, not by the gate, but
+    // only on that claim's own destination: a later same-user re-claim keeps
+    // the cutoff on a new destination.
+    let other_user_cutoff = backfill_state.backfill_cutoff_at.is_some()
+        && backfill_state
+            .backfill_cutoff_destination_namespace
+            .as_deref()
+            == Some(destination_namespace);
+    // Claude's own entries only: `last_completed_at` is stamped by any
+    // source's bootstrap, so a Codex or Pi completion is not Claude history.
+    let earlier_bootstrap = backfill_state
+        .completed_destination_replays
+        .contains_key(slug)
+        || backfill_state
+            .completed_destination_namespaces
+            .contains_key(slug)
+        || backfill_state.completed_parser_versions.contains_key(slug)
+        || backfill_state.completed_replay_revisions.contains_key(slug);
+    // A pre-scoping daemon's unscoped index.
+    let unscoped_legacy_index = || {
+        dir_holds_prefixed(
+            &support_dir.join("snapshots"),
+            &format!("{slug}-scan-index"),
+        )
+    };
+    if !other_user_cutoff && (earlier_bootstrap || other_destination()) {
+        PriorHistory::Moved
+    } else if unscoped_legacy_index() {
+        PriorHistory::Here
+    } else {
+        PriorHistory::None
+    }
+}
+
+/// Evidence belongs to this destination, independent of the Mac-wide marker.
+pub(super) fn claude_destination_history_here(
+    backfill_state: &crate::backfill::BackfillState,
+    destination_namespace: &str,
+    upload_progress: &SnapshotUploadProgress,
+    index_path: &Path,
+) -> bool {
+    let slug = SnapshotSource::ClaudeCode.api_slug();
+    let here = backfill_state.destination_completed(slug, destination_namespace);
+    // A quarantined copy of this index, of a legacy index or of this
+    // destination's ledger. An unreadable directory fails closed; a missing
+    // one is empty.
+    let quarantined_sibling = || {
+        let own_stem = index_path.file_stem().and_then(|stem| stem.to_str());
+        let claude_prefix = format!("{slug}-scan-index");
+        let Some(parent) = index_path.parent() else {
+            return false;
+        };
+        match std::fs::read_dir(parent) {
+            Ok(mut entries) => entries.any(|entry| match entry {
+                Ok(entry) => entry.file_name().to_str().is_some_and(|name| {
+                    name.contains(".corrupt.")
+                        && (own_stem.is_some_and(|stem| name.starts_with(stem))
+                            || name.starts_with(&claude_prefix))
+                }),
+                Err(_) => true,
+            }),
+            Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+        }
+    };
+    here || upload_progress.records_server_attested_upload() || quarantined_sibling()
+}
+
+/// Narrow the corruption stop to loss of this destination's own history.
+pub(super) fn note_claude_index_rebuild_for_destination(
+    source: SnapshotSource,
+    loaded_fresh: bool,
+    backfill_state: &crate::backfill::BackfillState,
+    destination_namespace: &str,
+    upload_progress: &SnapshotUploadProgress,
+    index_path: &Path,
+    support_dir: &Path,
+) {
+    if source == SnapshotSource::ClaudeCode
+        && loaded_fresh
+        && claude_destination_history_here(
+            backfill_state,
+            destination_namespace,
+            upload_progress,
+            index_path,
+        )
+    {
+        crate::snapshots::note_claude_index_rebuild_stop(support_dir);
+    }
+}
+
+/// True when `directory` holds an entry named `{prefix}*`. An unreadable
+/// directory or entry fails closed; a missing directory is empty.
+pub(super) fn dir_holds_prefixed(directory: &Path, prefix: &str) -> bool {
+    match std::fs::read_dir(directory) {
+        Ok(mut entries) => entries.any(|entry| match entry {
+            Ok(entry) => entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(prefix)),
+            Err(_) => true,
+        }),
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
+/// Claude only, before scanning: with prior history, a fresh index (missing
+/// or quarantined), a replay that dropped entries or the first gated load of
+/// an index without one records the history cutoff; see
+/// `ScanIndex::note_claude_history_cutoff`.
+pub(super) fn note_claude_history_cutoff_for_cycle(
+    index: &mut ScanIndex,
+    source: SnapshotSource,
+    prior_history: crate::snapshots::PriorHistory,
+    backfill_state: &crate::backfill::BackfillState,
+    entries_lost: bool,
+) {
+    if source != SnapshotSource::ClaudeCode {
+        return;
+    }
+    index.note_claude_history_cutoff(
+        prior_history,
+        backfill_state.claim_backfill_policy_full,
+        entries_lost,
+    );
+}
+
+/// Whether the source's bootstrap for this destination is pending, which arms
+/// its historical replay (StateMissing H1, N2).
+pub(super) fn backfill_replay_pending(
+    source: SnapshotSource,
+    backfill_state: &crate::backfill::BackfillState,
+    destination_namespace: &str,
+) -> bool {
+    pending_backfill_sources_for_destination(backfill_state, destination_namespace)
+        .contains(&source)
+}
+
+/// Claude only: the unreadable backfill state suppresses replays until a
+/// Claude census under the history gate clears it (N2).
+pub(super) fn claude_replay_suppressed(
+    source: SnapshotSource,
+    backfill_state: &crate::backfill::BackfillState,
+) -> bool {
+    source == SnapshotSource::ClaudeCode && backfill_state.prior_history_unverified
+}
+
+pub(super) fn exclude_held_effective_body_witness_revision(
+    index: &mut ScanIndex,
+    items: &[SnapshotItem],
+    disposition: &crate::snapshots::ClaudeUsageAuthorityDisposition,
+) {
+    let held = disposition.quarantined_fingerprints(items);
+    let source_files = items
+        .iter()
+        .filter(|item| held.contains(&item.snapshot_fingerprint))
+        .filter_map(|item| item.source_file_fingerprint.clone())
+        .collect();
+    index.exclude_effective_upload_body_witness_revision_for_source_files(&source_files);
+}
 
 // Preparation stays owned by the existing cycle. No partially finalized body
 // crosses a collection step.
@@ -967,4 +1222,191 @@ pub(super) fn prepare_sync_source_inner(
         active_legacy_reconciliation,
         scan: Some(scan),
     }))
+}
+
+pub(super) fn capture_codex_recovery_evidence(
+    index: &mut ScanIndex,
+    committed_index: &mut ScanIndex,
+    scan_result: &mut SourceScanResult,
+    index_path: &Path,
+    progress_path: &Path,
+    validate_authority: impl Fn() -> Result<()>,
+) -> bool {
+    let (mut captured, changed) =
+        index.stage_codex_recovery_capture(committed_index, &scan_result.snapshots);
+    let mut adopted = false;
+    if !changed.is_empty() {
+        let protected = scan_result
+            .snapshots
+            .iter()
+            .filter(|item| changed.contains(&item.source_session_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let saved = (|| -> Result<()> {
+            // A state-store save runs its progress recovery under this owner,
+            // as the partial checkpoint does: locking the progress file again
+            // on a second descriptor would refuse this process's own lock.
+            let progress_owner = SnapshotProgressLock::acquire(progress_path)?;
+            let progress_owner = if crate::snapshots::state_v2_growth_retention_active(&captured) {
+                progress_owner.for_v2(progress_path)
+            } else {
+                progress_owner
+            };
+            validate_authority()?;
+            let validator = scan_result
+                .codex_joining_validator()
+                .context("Codex recovery capture lacks a source witness")?;
+            validator.validate(&protected)?;
+            captured.save_with_progress_owner(index_path, None, &progress_owner)
+        })();
+        match saved {
+            Ok(()) => {
+                index.generation = captured.generation;
+                index.retain_persistence_baseline_from(&captured);
+                *committed_index = captured;
+                adopted = true;
+            }
+            Err(error) => scan_result.hold_codex_groups(
+                index,
+                committed_index,
+                &changed,
+                &format!(
+                    "recovery capture could not durably publish ({})",
+                    safe_error(&error)
+                ),
+            ),
+        }
+    }
+    scan_result.finish_codex_capture_boundary(index);
+    adopted
+}
+
+/// Progress claims were saved by the caller. Mirror claims and current-again
+/// ordinary retries before source acquisition, then bind each retry to one file.
+/// Ordinary offered/queued retries stay due; source-held ones use ordinary backoff.
+pub(super) fn save_terminal_contract_claims_for_scan(
+    index: &mut ScanIndex,
+    progress: &SnapshotUploadProgress,
+    index_path: &Path,
+) -> Result<Vec<PathBuf>> {
+    let mut changed = index.merge_terminal_contract_claims(&progress.quarantined_fingerprints);
+    for (fingerprint, record) in &progress.quarantined_fingerprints {
+        let current_again = progress.active_quarantine_retries.contains(fingerprint)
+            && index
+                .eligible_snapshot_fingerprint_refs()
+                .any(|current| current == fingerprint)
+            && !index.decode_holds_entity(fingerprint)
+            && !progress.permanent_rejections.contains_key(fingerprint)
+            && record.contract_retry_claims.is_none()
+            && record.disposition == SnapshotQuarantineDisposition::RetryPending
+            && record.failed_reconstruction_count < MAX_SNAPSHOT_RECONSTRUCTION_FAILURES
+            && index
+                .quarantined_snapshot_fingerprints
+                .get(fingerprint)
+                .is_some_and(|old| {
+                    let mut pending = old.clone();
+                    pending.disposition = record.disposition;
+                    pending.retry_after_unix_seconds = record.retry_after_unix_seconds;
+                    pending.witness = record.witness.clone();
+                    old.disposition == SnapshotQuarantineDisposition::SupersededTerminal
+                        && old.witness.same_retry_contract(&record.witness)
+                        && pending == *record
+                });
+        if (current_again
+            || record
+                .upload_body_witness
+                .as_deref()
+                .is_some_and(|body| progress.owed_stale_body(fingerprint, body)))
+            && index.quarantined_snapshot_fingerprints.get(fingerprint) != Some(record)
+        {
+            index
+                .quarantined_snapshot_fingerprints
+                .insert(fingerprint.clone(), record.clone());
+            changed = true;
+        }
+    }
+    if changed {
+        index.save(index_path)?;
+    }
+    let paths =
+        index.activate_terminal_contract_retries(progress.active_quarantine_retries.clone());
+    Ok(paths)
+}
+
+/// Prepare the disposable upload ledger against the durable scan-index replay.
+///
+/// The index owns both the replay generation and conflict quarantine after a
+/// completed cycle clears upload progress. For a new generation, old index
+/// quarantine must not be restored after progress is rearmed. For the same
+/// generation, restore it only after progress has claimed that generation so a
+/// clean follow-up cannot erase a replacement conflict before its retry.
+#[cfg(test)]
+pub(super) fn prepare_upload_progress_for_cycle(
+    upload_progress: &mut SnapshotUploadProgress,
+    index: &ScanIndex,
+    replay_generation: &str,
+    historical_replay_pending: bool,
+) -> bool {
+    prepare_upload_progress_for_cycle_with_reoffer(
+        upload_progress,
+        index,
+        replay_generation,
+        historical_replay_pending,
+        None,
+    )
+}
+
+/// Ordinary and continuation prepares bind both runtime witnesses together,
+/// and mirror the open head-CAS challenge sessions into the index.
+/// Neither retained body ACKs nor receipt candidates acquire new authority here.
+pub(super) fn activate_source_upload_context(
+    source: SnapshotSource,
+    context: String,
+    index: &mut ScanIndex,
+    progress: &mut SnapshotUploadProgress,
+) {
+    progress.active_quarantine_witness = Some(
+        crate::snapshots::snapshot_quarantine_witness_for_context(source, &context),
+    );
+    index.activate_file_upload_context(source, context.clone());
+    // A session whose upload can carry a head-CAS answer reads natively, never
+    // from Tail. The answer replaces a saved base (`attach_head_conflict_answers`);
+    // a challenge without one never answers; only an ACK with a head clears it.
+    index.activate_head_conflict_sessions(
+        progress
+            .head_conflict_challenges
+            .keys()
+            .filter(|key| progress.accepted_cache_heads.contains_key(*key))
+            .cloned()
+            .collect(),
+    );
+    progress.fresh_context_body_acks.clear();
+    progress.context_receipt_candidates.clear();
+    progress.context_resend = upload_context_resend::Cycle::new(context);
+}
+
+/// Production form of the above: outside a historical replay, due refusal
+/// re-offers share the ordinary retry budget. A replay neither re-offers nor
+/// resets a cooldown.
+pub(super) fn prepare_upload_progress_for_cycle_with_reoffer(
+    upload_progress: &mut SnapshotUploadProgress,
+    index: &ScanIndex,
+    replay_generation: &str,
+    historical_replay_pending: bool,
+    reoffer: Option<&reason_reoffer::Scope<'_>>,
+) -> bool {
+    if !historical_replay_pending {
+        return upload_progress.prepare_quarantine_and_reason_retries(
+            &index.quarantined_snapshot_fingerprints,
+            reoffer,
+        );
+    }
+
+    let same_index_replay = index.historical_replay_generation_matches(replay_generation);
+    let mut progress_changed = upload_progress.prepare_historical_replay(replay_generation);
+    if same_index_replay {
+        progress_changed |=
+            upload_progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints);
+    }
+    progress_changed
 }
