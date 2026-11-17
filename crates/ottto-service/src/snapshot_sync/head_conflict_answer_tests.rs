@@ -1073,7 +1073,7 @@ fn healthy_sessions_send_the_unchanged_wire_and_keep_no_challenge() {
         crate::snapshots::claude_request_identity::item_bytes(&projected),
         "preflight reserves the complete challenge framing"
     );
-    // The estimate is the upload's own wire at its largest policy framing.
+    // The budget covers the largest policy framing plus the admission headroom.
     let largest = SnapshotUploadPolicy {
         session_titles_enabled: false,
         workspace_labels_enabled: false,
@@ -1082,6 +1082,7 @@ fn healthy_sessions_send_the_unchanged_wire_and_keep_no_challenge() {
     assert_eq!(
         crate::snapshots::claude_request_identity::item_bytes(&projected),
         crate::snapshots::snapshot_item_wire_size(SnapshotSource::ClaudeCode, &projected, largest)
+            + 134
     );
     let mut no_answer = projected.clone();
     no_answer.cache_conflict_answer = None;
