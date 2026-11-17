@@ -1979,12 +1979,19 @@ impl OwnedSourceScan {
                         if prefix.is_none()
                             && current_scope.as_ref() == Some(&acquisition.scope)
                             && parser.reader.acquisition.as_ref().is_some_and(|plan| {
-                                parser
-                                    .reader
-                                    .reader
-                                    .get_ref()
-                                    .metadata()
-                                    .is_ok_and(|held| held.len() > plan.frozen_length())
+                                // A short EOF proves truncation, even if the file
+                                // has regrown by completion. Keep strict failure.
+                                plan.start_offset()
+                                    .checked_add(parser.reader.consumed_bytes())
+                                    == Some(plan.frozen_length())
+                                    && parser.reader.reader.get_ref().metadata().is_ok_and(|held| {
+                                        held.len() > plan.frozen_length()
+                                            && fs::symlink_metadata(&candidate.path).is_ok_and(
+                                                |current| {
+                                                    metadata_describes_same_file(&held, &current)
+                                                },
+                                            )
+                                    })
                             })
                         {
                             // Unchanged, or a trailing record already applied at
@@ -2002,6 +2009,10 @@ impl OwnedSourceScan {
                     }
                     None => (None, None),
                 };
+                // Cursor finish grants also occupy sealed_prefix, including
+                // quiescent reads and withheld fragments. Only this in-page
+                // growth certificate needs the new debt/provenance handling.
+                let grown_prefix = prefix.as_ref().is_some_and(|result| result.is_ok());
                 let completed_acquisition = if let Some(certificate) = cursor_certificate {
                     certificate.map(|checkpoint| sampled_jsonl::CompletedNativeAcquisition {
                         checkpoint,
@@ -2197,7 +2208,6 @@ impl OwnedSourceScan {
                     } else {
                         Vec::new()
                     };
-                let grown_prefix = parser.reader.sealed_prefix.is_some();
                 let claude_grown_prefix = source == SnapshotSource::ClaudeCode && grown_prefix;
                 let finish_request = FinishRequest {
                     expected_opened_object_identity: &candidate.opened_object_identity,

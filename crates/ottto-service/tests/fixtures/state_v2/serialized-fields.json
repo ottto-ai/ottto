@@ -347,6 +347,8 @@
     "residue.codex_inventory_hold.owed[]",
     "residue.codex_inventory_hold.refused_headers",
     "residue.codex_inventory_hold.refused_headers.*",
+    "residue.growth_retries",
+    "residue.growth_retries.*",
     "residue.index_keys",
     "residue.index_keys[]",
     "scan_roots",

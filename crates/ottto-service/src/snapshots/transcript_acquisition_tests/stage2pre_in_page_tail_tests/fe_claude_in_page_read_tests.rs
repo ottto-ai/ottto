@@ -576,7 +576,7 @@ fn fe_claude_sp5a_truncate_then_regrow_after_short_eof_keeps_main_failure() {
     let mut regrown = bytes_of(&base.path)[sealed as usize..].to_vec();
     regrown.extend(row_bytes(CLAUDE, 6..8));
     let regrow_path = base.path.clone();
-    let ((_, tail, seen, read), at_eof) = with_eof_hook(
+    let ((index, tail, seen, read), at_eof) = with_eof_hook(
         &base.path,
         move |_| append_raw(&regrow_path, &regrown),
         || {
@@ -597,6 +597,16 @@ fn fe_claude_sp5a_truncate_then_regrow_after_short_eof_keeps_main_failure() {
     );
     assert!(len(&base.path) > read.frozen, "precondition: regrown");
     assert_refused(&tail, &seen, SCOPE_OBJECT, "SP-5a-c");
+    assert!(
+        !index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .residue
+            .growth_retries
+            .contains_key(&base.key),
+        "a short EOF cannot consume a growth retry"
+    );
 }
 
 /// SP-5b-c (GREEN): after the Claude reader passes frozen, the file is
@@ -1312,6 +1322,25 @@ fn stable_extent_growth_retry_stops_after_second_hit() {
         assert_eq!(total_reads, 2);
         assert!(third.snapshots.is_empty());
         if committed_body {
+            let walk = index
+                .traversal
+                .as_ref()
+                .expect("growth reconciliation page");
+            let pending = walk
+                .pending_candidates
+                .iter()
+                .find(|p| p.path == base.path)
+                .expect("next-pass release hint");
+            assert_eq!((pending.census_member, pending.watcher_hint), (false, true));
+            assert_eq!(index.files[&base.key].size_bytes, base.sealed);
+            assert!(index.files[&base.key].source_file_fingerprint.is_empty());
+            assert!(index.files[&base.key].last_snapshot_fingerprint.is_some());
+            // Growth revalidation retains the debt and reports queued work
+            // once. The next metadata-only page finishes reconciliation;
+            // neither page may reopen the transcript in this walk.
+            let (index, retired, seen) = plain(&base.fixture, CLAUDE, index, &base.cache);
+            assert_eq!(seen.modes, (0, 0, 0), "reconciliation opens no transcript");
+            assert!(retired.snapshots.is_empty());
             assert!(
                 index.traversal.is_none(),
                 "released for the next ordinary pass"
