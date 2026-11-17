@@ -2074,7 +2074,17 @@ pub(in crate::snapshots) mod tests {
         let singleton = downgrade_member(&out.join("activation"), owner, true);
         let mut activation = downgrade_accepted(&singleton, &native.snapshots[0]);
         downgrade_seed(&mut activation, &singleton);
-        activation.save(&out.join("activation.json")).unwrap();
+        let legacy = out.join("activation.json");
+        // The transcript directory shares this synthetic checkpoint family.
+        // A real destination refuses that evidence of prior state.
+        let error = activation.save(&legacy).unwrap_err();
+        e2_pipeline_scan_fixture::assert_support_error_for_test(&error);
+        let route = out
+            .join("native-activation")
+            .join("a".repeat(64))
+            .join("codex-scan-index.json");
+        activation = e2_pipeline_scan_fixture::seed_index_for_test(&activation, &route);
+        e2_pipeline_scan_fixture::save_for_test(&mut activation, &legacy);
         fs::write(out.join("activation-key.txt"), local_index_key(&singleton)).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
