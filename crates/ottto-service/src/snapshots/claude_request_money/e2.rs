@@ -3736,13 +3736,6 @@ fn attach_one(
     let Some(occurrence) = claude_usage_occurrences.get_mut(row.request_id.as_str()) else {
         return false;
     };
-    // Route evidence only (local, never sent), producer on: this request's own
-    // row, joined by its provider request id, named a valid account. No money
-    // input.
-    if crate::snapshots::billing_route::PRODUCER_ENABLED {
-        occurrence.route_telemetry_account |= row.account_identifier_hash.is_some();
-    }
-
     // The hour the estimated key is placed in (`occurrence_key`): its clock,
     // else the file's fallback; none or unreadable places no key.
     let clock = occurrence.timestamp.as_deref();

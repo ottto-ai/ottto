@@ -181,7 +181,6 @@ pub(crate) use codex_file_join::tests::{
     counting_v2_fixture, native_join_fixture_root, older_build_logs_expired,
     older_build_logs_priority,
 };
-pub(crate) mod billing_route;
 #[cfg(test)]
 pub(crate) use sources::codex::counting::version::TestCutover;
 #[cfg(test)]
