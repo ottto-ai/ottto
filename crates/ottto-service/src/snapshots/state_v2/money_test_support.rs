@@ -335,7 +335,14 @@ pub(crate) fn edit_record_for_test(
                 let bytes = mapper::bytes(&mut tx, &header).unwrap();
                 codec::decode::<serde_json::Value>(&bytes, value_cap(&key)).unwrap()
             }
-            None => serde_json::Value::Null,
+            None => {
+                let manifest = mapper::key(kind, "", 0).unwrap();
+                let header = tx.get(&manifest).unwrap().expect("fixture kind manifest");
+                let bytes = mapper::bytes(&mut tx, &header).unwrap();
+                let count = codec::decode::<usize>(&bytes, value_cap(&manifest)).unwrap();
+                mapper::put(&mut tx, &manifest, &(count + 1)).unwrap();
+                serde_json::Value::Null
+            }
         };
         edit(&mut value);
         mapper::put(&mut tx, &key, &value).unwrap();

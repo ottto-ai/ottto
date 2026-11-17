@@ -97,7 +97,7 @@ fn cache_event_ack_restart_correction_and_missing_proof() {
         .unwrap()
         .last_upload_body_witness = Some(format!("{:x}", digest.finalize()));
     settled_index
-        .save_fixture(&directory.join("index.json"))
+        .save_fixture_for_source(&directory.join("index.json"), SnapshotSource::Codex)
         .unwrap();
     restored = route_fixture_progress(
         &settled_index,
