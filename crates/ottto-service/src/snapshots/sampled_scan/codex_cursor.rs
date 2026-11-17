@@ -2613,10 +2613,6 @@ pub(in crate::snapshots) fn mark_eof_applied(job: &mut OwnedActiveFile) {
     }
 }
 
-pub(in crate::snapshots) fn eof_applied(job: &OwnedActiveFile) -> bool {
-    job.cursor.as_ref().is_some_and(|meta| meta.eof_applied)
-}
-
 /// The file offset where the job's reader stopped (a tail's reader counts
 /// from its start).
 pub(in crate::snapshots) fn read_end(job: &OwnedActiveFile) -> u64 {
@@ -2669,12 +2665,6 @@ pub(in crate::snapshots) fn arm_group_member(
         meta.eof_applied = false;
     }
     Ok(())
-}
-
-/// The live member's legacy baseline (P2) reads the job's frozen prefix:
-/// it may finish a grown same object, like the job's own certificate.
-pub(in crate::snapshots) fn frozen_grant(meta: &JobMeta, extent: u64) -> FinishGrant {
-    FinishGrant::certified(meta.stamp_open.dev, meta.stamp_open.ino, extent)
 }
 
 /// The live member's grant after `finish_job` certified a group job.

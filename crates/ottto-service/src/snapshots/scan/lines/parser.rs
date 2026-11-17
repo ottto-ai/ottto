@@ -489,6 +489,7 @@ impl OwnedJsonlParser {
         };
         drive(&mut self.reader, &mut sink)
     }
+    #[cfg(test)]
     #[expect(clippy::too_many_arguments, reason = "8 args; no options struct yet")]
     pub(in crate::snapshots) fn finish(
         self,
@@ -515,6 +516,7 @@ impl OwnedJsonlParser {
 
     /// `finish`, with a caller-supplied repository identity. `Some` is used
     /// as-is, so the finished item never re-resolves (IO) it.
+    #[cfg(test)]
     #[expect(clippy::too_many_arguments, reason = "10 args; no options struct yet")]
     pub(in crate::snapshots) fn finish_with_repository_identity(
         self,

@@ -78,6 +78,7 @@ impl ScanIndex {
     /// Attach only the owner proved for this session. A missing or conflicting
     /// Claude revision is held for a later complete scan; the durable proof
     /// remains intact.
+    #[cfg(test)]
     pub(crate) fn bind_session_accounts(
         &mut self,
         source: SnapshotSource,

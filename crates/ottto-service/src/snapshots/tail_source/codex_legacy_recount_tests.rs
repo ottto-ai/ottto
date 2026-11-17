@@ -24,11 +24,12 @@ impl LegacyFixture {
         let path = route.dir.join(Codex::name());
         let (_, lines) = historical_codex::read(kind);
         fs::write(&path, lines.join("\n") + "\n").unwrap();
+        let prior = std::mem::take(&mut route.index);
         let (mut index, mut scan, _) = E2ScanFixture::default().scan_other(
             SnapshotSource::Codex,
             std::slice::from_ref(&route.dir),
             &route.dir,
-            route.index,
+            prior,
             true,
         );
         apply_upload_policy(

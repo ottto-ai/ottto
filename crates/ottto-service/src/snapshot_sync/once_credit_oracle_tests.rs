@@ -312,7 +312,6 @@ struct OracleHome {
     now: u64,
     small_page: bool,
     state_budget: Option<usize>,
-    legacy_counting: bool,
     row: &'static str,
     cycle_number: usize,
     current_codex_account: &'static str,
@@ -453,7 +452,6 @@ impl OracleHome {
             now: NOW,
             small_page: false,
             state_budget: None,
-            legacy_counting: false,
             row: "c00",
             cycle_number: 0,
             current_codex_account: "a",
@@ -574,7 +572,6 @@ impl OracleHome {
         let now = self.now;
         let small_page = self.small_page;
         let budget = self.state_budget;
-        let legacy = self.legacy_counting;
 
         let at = OffsetDateTime::from_unix_timestamp(now as i64)
             .unwrap()
@@ -1613,7 +1610,6 @@ fn c07_codex_group_memo_rediscloses_without_session_credit() {
     let server = OracleServer::new(SnapshotSource::Codex, recording.handle());
     let mut home = OracleHome::new(SnapshotSource::Codex, &server);
     home.row = "c07";
-    home.legacy_counting = true;
     install_group(&home, true);
     let first = home.cycle(&server, &recording);
     assert!(first.consumed > 0);
@@ -1637,7 +1633,6 @@ fn c08_codex_group_park_rediscloses_without_reading() {
     let server = OracleServer::new(SnapshotSource::Codex, recording.handle());
     let mut home = OracleHome::new(SnapshotSource::Codex, &server);
     home.row = "c08";
-    home.legacy_counting = true;
     install_group(&home, false);
     home.small_page = true;
     home.state_budget = Some(1);
@@ -1739,7 +1734,6 @@ fn c09_codex_singleton_memo_keeps_the_previous_body() {
     let server = OracleServer::new(SnapshotSource::Codex, recording.handle());
     let mut home = OracleHome::new(SnapshotSource::Codex, &server);
     home.row = "c09";
-    home.legacy_counting = true;
     // A rewritten priority prefix is held by TierReplay before native
     // ownership completion and memo admission. Exercise the ownership memo
     // with default-tier usage; the native money row keeps positive priority.
@@ -1804,7 +1798,6 @@ fn c10_codex_singleton_park_keeps_the_previous_body() {
     let server = OracleServer::new(SnapshotSource::Codex, recording.handle());
     let mut home = OracleHome::new(SnapshotSource::Codex, &server);
     home.row = "c10";
-    home.legacy_counting = true;
     let mut rows = codex_member(
         IDENTITY_PIPELINE_ROOT,
         "first",
@@ -1928,7 +1921,6 @@ fn c11_fragment_and_obligation_charge_one_slot_and_existing_marker_charges_none(
         let server = OracleServer::new(SnapshotSource::Codex, recording.handle());
         let mut home = OracleHome::new(SnapshotSource::Codex, &server);
         home.row = if outlive { "c11_both" } else { "c11_marker" };
-        home.legacy_counting = true;
         home.small_page = true;
         fragment_corpus(&home);
         let new = finish_fragment(&mut home, &server, &recording, outlive);
@@ -2561,7 +2553,6 @@ fn scheduling_permutations_converge_to_the_same_bodies() {
                             SnapshotSource::Pi => "schedule_pi",
                         };
                         home.cycle_number = run * 128;
-                        home.legacy_counting = source == SnapshotSource::Codex;
                         let mut accepted = BTreeMap::new();
                         let seed_paths = scheduling_corpus(&home, true);
                         home.births = seed_paths
@@ -3195,7 +3186,6 @@ mod money_equivalence_tests {
             let server = OracleServer::new(SnapshotSource::Codex, recording.handle());
             let mut home = OracleHome::new(SnapshotSource::Codex, &server);
             home.row = "c01_codex";
-            home.legacy_counting = true;
             install_created_thread(&home, false, IDENTITY_PIPELINE_ROOT, true);
             install_created_thread(&home, false, "3338a80a-f36e-4cbc-a5bb-50fc66430ba5", true);
             fixture_inputs.extend(inputs(&home));
