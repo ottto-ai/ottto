@@ -747,6 +747,9 @@ fn cap_delayed_growth_survives_age_and_replacement_traversal() {
             &loaded.confirmed_empty_files,
             &fixture.file.0
         ));
+        // Clones share one native route; the cold arm restarts from its own.
+        let cold_input =
+            crate::snapshots::e2_pipeline_scan_fixture::own_install_for_test(&loaded, &fixture.dir);
         let modified =
             unix_seconds(fs::metadata(&fixture.file.0).unwrap().modified().unwrap()).unwrap();
         let future = modified + (BACKFILL_WINDOW_DAYS + 2) * 86_400;
@@ -809,7 +812,7 @@ fn cap_delayed_growth_survives_age_and_replacement_traversal() {
         for (marked, version) in &markers {
             assert_eq!(&serviced.files[marked].scan_identity_version, version);
         }
-        let (_, cold, _, _, _) = finish_production_scan_page(make_scan(loaded), source);
+        let (_, cold, _, _, _) = finish_production_scan_page(make_scan(cold_input), source);
         assert!(!cold.snapshots.is_empty());
         assert_eq!(production_body(source, raw), production_body(source, cold));
         // `serviced` continues on that copy: commit it and save a fresh one.
