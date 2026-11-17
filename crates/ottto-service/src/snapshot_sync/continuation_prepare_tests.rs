@@ -55,7 +55,7 @@ impl ContinuationFixture {
             home: root.join("home"),
             support_dir: root.join("support"),
             index_path: root.join("codex-index.json"),
-            upload_progress_path: root.join("codex-upload-progress.json"),
+            upload_progress_path: snapshot_upload_progress_path(&root.join("codex-index.json")),
         };
         std::fs::create_dir_all(&fixture.home).unwrap();
         std::fs::create_dir_all(&fixture.support_dir).unwrap();

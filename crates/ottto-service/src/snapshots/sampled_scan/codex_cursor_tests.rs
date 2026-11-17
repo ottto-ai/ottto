@@ -21,7 +21,7 @@ static NEXT: AtomicU64 = AtomicU64::new(0);
 struct Temp(PathBuf);
 impl Temp {
     fn new(tag: &str, bytes: &[u8]) -> Self {
-        let path = std::env::temp_dir().join(format!(
+        let path = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "ottto-codex-cursor-{tag}-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, AtomicOrdering::Relaxed)

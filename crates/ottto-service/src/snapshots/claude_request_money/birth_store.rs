@@ -652,7 +652,7 @@ mod tests {
     }
     fn temp(name: &str) -> std::path::PathBuf {
         static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let p = std::env::temp_dir().join(format!(
+        let p = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "birth-store-{name}-{}-{}",
             std::process::id(),
             N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)

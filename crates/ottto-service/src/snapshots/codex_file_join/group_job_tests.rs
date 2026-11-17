@@ -29,7 +29,7 @@ fn write_rows(path: &Path, rows: &[Value]) {
 
 /// A fresh `<root>/sessions` directory.
 fn temp_root(tag: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!(
+    let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
         "ottto-codex-group-{tag}-{}-{}",
         std::process::id(),
         NEXT.fetch_add(1, AtomicOrdering::Relaxed)

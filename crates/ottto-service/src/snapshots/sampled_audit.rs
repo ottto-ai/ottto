@@ -646,7 +646,7 @@ mod tests {
     }
     #[test]
     fn sampled_audit_missing_source_and_existing_cas_cannot_erase_obligation() {
-        let root = std::env::temp_dir().join(format!(
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "ottto-audit-index-{}-{}",
             std::process::id(),
             SystemTime::now()

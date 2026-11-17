@@ -309,6 +309,18 @@ fn runtime_only(index: &ScanIndex) -> ScanIndex {
     runtime
 }
 
+/// Close every native session and staged observation before a simulated restart.
+/// Callers drop all pages that borrowed the prior before handing it over.
+pub(crate) fn cold_restart(prior: ScanIndex) -> ScanIndex {
+    let route = route_of(&prior).expect("a persisted restart prior");
+    let runtime = runtime_only(&prior);
+    drop(prior);
+    state_v2::cold_close_for_test(&route).unwrap();
+    let mut restored = ScanIndex::load(&route).unwrap();
+    carry_runtime(&runtime, &mut restored);
+    restored
+}
+
 /// `prior` published on a new fixture route under `dir`: (route, cold graph).
 fn publish_route(prior: &ScanIndex, dir: &Path) -> (PathBuf, ScanIndex) {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

@@ -367,7 +367,10 @@ fn cache_pending_head_lifecycle_survives_finish_and_targets_only_accepted_head()
         .files
         .insert("synthetic/unrelated.jsonl".into(), other.clone());
     let mut progress = test_upload_progress();
-    let root = std::env::temp_dir().join(format!("ottto-pending-head-{}", unique_poison_scope()));
+    let root = std::env::temp_dir()
+        .canonicalize()
+        .unwrap()
+        .join(format!("ottto-pending-head-{}", unique_poison_scope()));
     std::fs::create_dir_all(&root).unwrap();
     let path = root.join("progress.json");
     progress
@@ -566,7 +569,7 @@ fn cache_pending_head_two_files_multi_siblings_survive_partial_cache_settlement(
             .sum::<usize>(),
         3
     );
-    let root = std::env::temp_dir().join(format!(
+    let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
         "ottto-pending-siblings-{}-{}",
         unique_poison_scope(),
         OffsetDateTime::now_utc().unix_timestamp_nanos()
@@ -844,7 +847,7 @@ fn cache_pending_head_two_files_multi_siblings_survive_partial_cache_settlement(
 
 fn cache_effective_wire_fixture_root() -> PathBuf {
     use serde_json::json;
-    let root = std::env::temp_dir().join(format!(
+    let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
         "ottto-cache-effective-wire-{}-{}",
         unique_poison_scope(),
         OffsetDateTime::now_utc().unix_timestamp_nanos()
@@ -2101,8 +2104,10 @@ fn cache_capability_toggle_headless_settlement_recovers_current_predecessor() {
 #[test]
 fn combined_revision_wire_uses_same_scan_index_and_ack_predecessor() {
     use serde_json::json;
-    let root =
-        std::env::temp_dir().join(format!("ottto-combined-revision-{}", unique_poison_scope()));
+    let root = std::env::temp_dir()
+        .canonicalize()
+        .unwrap()
+        .join(format!("ottto-combined-revision-{}", unique_poison_scope()));
     std::fs::create_dir_all(&root).unwrap();
     let id = "019e253c-3333-7000-9000-cccccccccccc";
     let path = root.join(format!("rollout-2026-09-30T10-00-00-{id}.jsonl"));

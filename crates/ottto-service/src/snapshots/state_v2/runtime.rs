@@ -50,11 +50,7 @@ impl Hold {
             return Self::UnknownRecordKind.into();
         }
         if let Some(hold) = error.downcast_ref::<Self>() {
-            let hold = *hold;
-            #[cfg(test)]
-            return error.context(hold);
-            #[cfg(not(test))]
-            return hold.into();
+            return (*hold).into();
         }
         let integrity_repair = error
             .chain()
@@ -125,15 +121,7 @@ impl Hold {
             Self::DbUnavailable
         };
         // Do not retain arbitrary engine messages/paths in public health output.
-        // Synthetic test stores retain the cause for CI failure diagnostics.
-        #[cfg(test)]
-        {
-            error.context(hold)
-        }
-        #[cfg(not(test))]
-        {
-            hold.into()
-        }
+        hold.into()
     }
 }
 struct RouteState {
@@ -565,12 +553,6 @@ pub(in super::super) fn after_v1_locked(path: &Path, index: &mut ScanIndex) -> R
             return Err(Hold::DbUnavailable.into());
         }
         if !state.inventory_ready {
-            #[cfg(test)]
-            if let Some(class) = state.import_pause {
-                return Err(
-                    anyhow::anyhow!("fixture inventory refusal: {class:?}").context(class.hold())
-                );
-            }
             return Err(state
                 .import_pause
                 .map_or(Hold::ReloadRequired, Pause::hold)

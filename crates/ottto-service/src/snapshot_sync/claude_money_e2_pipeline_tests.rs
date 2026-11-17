@@ -7,8 +7,8 @@
 use super::*;
 use crate::snapshots::claude_request_money::e2;
 use crate::snapshots::e2_pipeline_scan_fixture::{
-    accept_upload_context_acks_for_test, birth_store_bytes, upload_context_owed_for_test,
-    upload_context_receipt_earned_for_test, E2ScanFixture,
+    accept_upload_context_acks_for_test, birth_store_bytes, cold_restart,
+    upload_context_owed_for_test, upload_context_receipt_earned_for_test, E2ScanFixture,
 };
 use serde_json::json;
 
@@ -1190,12 +1190,17 @@ fn e2_pipeline_full_tail_unchanged_eviction_and_restart_are_cumulative() {
             canonical(&evicted.scan.snapshots),
             canonical(&oracle.scan.snapshots)
         );
-        let restarted = ready(&c, &E2ScanFixture::default(), prior, 100, true);
-        assert_mode(restarted.modes, (1, 0, 0));
-        assert_eq!(
-            canonical(&restarted.scan.snapshots),
-            canonical(&oracle.scan.snapshots)
+        let oracle_bytes = canonical(&oracle.scan.snapshots);
+        drop((first, full, tail, unchanged, evicted, oracle));
+        let restarted = ready(
+            &c,
+            &E2ScanFixture::default(),
+            cold_restart(prior),
+            100,
+            true,
         );
+        assert_mode(restarted.modes, (1, 0, 0));
+        assert_eq!(canonical(&restarted.scan.snapshots), oracle_bytes);
     });
 }
 
@@ -1487,7 +1492,15 @@ fn e2_pipeline_unlisted_twin_resume_counts_copied_requests_once() {
                 counted + 1,
                 "{name}: the tail adds its own turn"
             );
-            let restarted = ready(&c, &E2ScanFixture::default(), prior, 100, true);
+            let tail_money = sent_money(&tail);
+            drop(tail);
+            let restarted = ready(
+                &c,
+                &E2ScanFixture::default(),
+                cold_restart(prior),
+                100,
+                true,
+            );
             let mut cold = Corpus::new(&format!("{name}-cold"));
             for (folder, _, _, birth) in &files {
                 let relative = format!("{folder}/{ROOT}.jsonl");
@@ -1502,7 +1515,7 @@ fn e2_pipeline_unlisted_twin_resume_counts_copied_requests_once() {
                 true,
             );
             let cold = sent_money(&cold);
-            money_oracle::assert_equivalent(&cold, &sent_money(&tail));
+            money_oracle::assert_equivalent(&cold, &tail_money);
             money_oracle::assert_equivalent(&cold, &sent_money(&restarted));
         });
     }
@@ -4071,8 +4084,15 @@ fn conflict_only(subagent: bool) {
         assert_eq!(carrier.resolver_conflict_count, Some(1));
         conflicted.finish();
         let bytes = canonical(&conflicted.scan.snapshots);
-        // A crash before the ACK: the restart reads the same committed state.
-        let mut restart = ready(&c, &E2ScanFixture::default(), prior, 100, false);
+        // A crash before the ACK: discard the page's uncommitted native state.
+        drop(conflicted);
+        let mut restart = ready(
+            &c,
+            &E2ScanFixture::default(),
+            cold_restart(prior),
+            100,
+            false,
+        );
         restart.finish();
         assert_eq!(
             canonical(&restart.scan.snapshots),
