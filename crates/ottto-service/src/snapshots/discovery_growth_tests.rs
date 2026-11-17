@@ -14,6 +14,7 @@ struct Fixture {
     cache: Arc<sampled_scan::SharedCache>,
     /// Pages record no entity ACK, as when every upload failed.
     unacked: bool,
+    saves: std::cell::Cell<usize>,
 }
 impl Fixture {
     fn new() -> Self {
@@ -25,7 +26,13 @@ impl Fixture {
             root,
             cache: Arc::new(sampled_scan::SharedCache::default()),
             unacked: false,
+            saves: Default::default(),
         }
+    }
+    /// The latest saved copy. Each save makes a fresh one: a page may
+    /// continue on the previous copy.
+    fn saved_path(&self) -> PathBuf {
+        self.root.join(format!("index-{}.json", self.saves.get()))
     }
     fn append(&self, uuid: &str) {
         let line = json!({"type":"assistant", "sessionId":SESSION, "uuid":uuid,
@@ -229,10 +236,11 @@ impl Fixture {
         (index, result, reads, rows)
     }
     fn save_and_report(&self, index: &mut ScanIndex, scan: &SourceScanResult) -> Value {
-        let path = self.root.join("index.json");
+        self.saves.set(self.saves.get() + 1);
+        let path = self.saved_path();
         // Preserve the production save's updated optimistic-concurrency stamp
         // in the index passed into the next real page.
-        crate::snapshots::e2_pipeline_scan_fixture::save_for_source_test(index, &path, scan.source);
+        crate::snapshots::e2_pipeline_scan_fixture::save_for_test(index, &path);
         let saved = ScanIndex::load(&path).unwrap();
         let (_, rows) = capture(|| scan.report_discovery_growth_after_save(&saved));
         assert_eq!(rows.len(), 1, "one saved-page observation row");
@@ -325,7 +333,7 @@ fn grown_refused_then_two_unchanged_passes_read_no_extra_body_bytes() {
         let counts = f.save_and_report(&mut idle, &scan);
         fate(&counts, 0, 1);
         assert_eq!(counts["discovery_retained_grown_age"]["gt_90d"], 1);
-        committed = ScanIndex::load(&f.root.join("index.json")).unwrap();
+        committed = ScanIndex::load(&f.saved_path()).unwrap();
     }
 }
 /// [behaviour] Grown catchup reports committed only against saved extent.
@@ -1091,9 +1099,7 @@ fn listing_repass_reads_only_changed_files_for_every_source() {
             let mut f = Fixture::new();
             let mut index = kept_generation(&f, source, true);
             let path = f.root.join("index.json");
-            crate::snapshots::e2_pipeline_scan_fixture::save_for_source_test(
-                &mut index, &path, source,
-            );
+            crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut index, &path);
             let index = ScanIndex::load(&path).unwrap();
             let proven = proven_revisions(&index);
             assert!(!proven.is_empty(), "{source:?}: a proven corpus");

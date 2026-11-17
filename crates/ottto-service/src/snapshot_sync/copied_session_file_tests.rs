@@ -1892,10 +1892,9 @@ fn content_carrier_reconcile_under_open_v2_save_does_not_deadlock() {
     worker.join().unwrap();
 }
 
-/// [regress] An unsampled carrier's saves grant no new head-backed authority:
-/// the copy's removal stays pending on every pass, without relocking a v2
-/// session. Every save now has native custody, so the JSON-era checks that
-/// the index stayed unrouted are the only checks this case no longer makes.
+/// [regress] Its saves grant no new head-backed authority and never relock a
+/// v2 session. Every save is native now, so the JSON-era unrouted checks are
+/// the only ones this case no longer makes.
 #[test]
 fn unsampled_content_carrier_keeps_copy_removal_pending() {
     with_e2(|| {

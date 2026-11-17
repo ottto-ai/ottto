@@ -1023,8 +1023,6 @@ fn evicted_legacy_diagnostic_history_is_bounded_lenient_and_charged() {
                 > limit * 64
         );
     }
-    // The decoder reads old bytes from its own unbound file, apart from the
-    // native custody at `index_path`.
     let decoder = acked.root.join("decoder.json");
     fs::write(&decoder, serde_json::to_vec(&value).unwrap()).unwrap();
     let loaded = ScanIndex::load(&decoder).unwrap();
