@@ -742,8 +742,9 @@ impl HeaderInventory {
             // Durable facts keep precedence; each later source runs only when
             // every earlier one missed. Any lookup that runs and errors fails the
             // member, as before.
-            let joined = (codex_archive_path(&candidate.path)
-                || sources::codex::counting::version::unchanged_legacy(index, &candidate.path))
+            let legacy_unchanged =
+                sources::codex::counting::version::unchanged_legacy(index, &candidate.path);
+            let joined = codex_archive_path(&candidate.path)
                 && index.files.get(&key).is_some_and(|entry| {
                     entry.codex_joined_member_set.is_some()
                         && codex_index_file_body_accepted(index, &key, entry)
@@ -833,6 +834,25 @@ impl HeaderInventory {
                             })
                         })
                 }
+            };
+            // An accepted Legacy file cannot be probed merely to rebuild an
+            // inventory cache. Its existing owner and physical stamps suffice;
+            // missing owner proof remains held until the content changes.
+            let durable = if durable.is_none() && legacy_unchanged {
+                let owner = index
+                    .files
+                    .get(&key)
+                    .and_then(sources::codex::counting::version::proven_owner)
+                    .context(HEADER_OWNERSHIP_CHANGED)?;
+                Some(CachedHeader {
+                    stamp: stamp.clone(),
+                    owner: owner.to_owned(),
+                    created_unix_ms: None,
+                    read_bytes: 0,
+                    durable: Some(joined),
+                })
+            } else {
+                durable
             };
             // Keep the lookup's facts for later inventories of this store.
             let keep = cache.filter(|_| route.is_some() && !carried_hit);
