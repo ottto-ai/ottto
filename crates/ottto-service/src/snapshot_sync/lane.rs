@@ -1453,99 +1453,6 @@ pub(super) fn snapshot_index_path(support_dir: &Path, source: SnapshotSource) ->
         .join(format!("{}-scan-index.json", source.api_slug()))
 }
 
-pub(super) fn legacy_policy_scoped_snapshot_index_path(
-    support_dir: &Path,
-    source: SnapshotSource,
-    upload_policy: SnapshotUploadPolicy,
-    attribution_checkpoint_namespace: Option<&str>,
-) -> PathBuf {
-    let mut suffixes: Vec<String> = Vec::new();
-    if !upload_policy.session_titles_enabled {
-        suffixes.push("no-titles".to_string());
-    }
-    if !upload_policy.workspace_labels_enabled {
-        suffixes.push("no-labels".to_string());
-    }
-    // Artifacts are opt-in (default off), so the suffix marks the ENABLED state.
-    // Enabling switches to the fresh `-artifacts` index, forcing a full re-scan
-    // so existing/closed sessions retroactively gain artifacts. (Disabling
-    // reverts to the base index; unchanged transcripts are not re-scanned, so
-    // artifacts already uploaded persist on the backend until the file changes
-    // — consistent with the titles/labels suffix behavior.)
-    if upload_policy.session_artifacts_enabled {
-        suffixes.push("artifacts".to_string());
-    }
-    // Attribution is opt-in. A separate index makes a later enablement revisit
-    // unchanged transcripts instead of waiting for their next filesystem edit.
-    // The namespace is key-epoch-only: scheduler inventory changes affect
-    // sessions parsed from that point forward and require an explicit replay
-    // for history. They must not silently invalidate every local checkpoint.
-    if upload_policy.session_attribution_enabled {
-        let namespace = attribution_checkpoint_namespace
-            .map(str::to_string)
-            .unwrap_or_else(|| "pending".to_string());
-        suffixes.push(format!("attribution-{namespace}"));
-    }
-    // The capability changes only wire-safe display metadata, but it still
-    // needs a fresh index so unchanged historical transcripts are revisited
-    // once after backend support becomes available.
-    if upload_policy.session_attribution_labels_enabled {
-        suffixes.push("attribution-labels".to_string());
-    }
-    let policy_suffix = if suffixes.is_empty() {
-        String::new()
-    } else {
-        format!("-{}", suffixes.join("-"))
-    };
-    support_dir.join("snapshots").join(format!(
-        "{}-scan-index{}.json",
-        source.api_slug(),
-        policy_suffix
-    ))
-}
-
-pub(super) fn adopt_legacy_checkpoint_file(legacy_path: &Path, stable_path: &Path) -> Result<()> {
-    if legacy_path == stable_path || stable_path.exists() || !legacy_path.exists() {
-        return Ok(());
-    }
-    if let Some(parent) = stable_path.parent() {
-        std::fs::create_dir_all(parent).context("create stable checkpoint directory")?;
-    }
-    // Adoption targets the same lock sibling used by scan-index/progress
-    // load/save. Without it, two overlapping upgraded daemons can both observe
-    // an absent stable path and a late legacy copy can overwrite the winner's
-    // already-advanced CAS generation. Recheck after acquiring because another
-    // process may have completed adoption between the optimistic check above
-    // and this non-blocking lock attempt.
-    let _lock = SnapshotProgressLock::acquire(stable_path)?;
-    if stable_path.exists() || !legacy_path.exists() {
-        return Ok(());
-    }
-    let temp_path = stable_path.with_extension(format!("json.{}.migrate", std::process::id()));
-    let migration = (|| -> Result<()> {
-        let mut source =
-            std::fs::File::open(legacy_path).context("open legacy checkpoint for migration")?;
-        let mut destination =
-            std::fs::File::create(&temp_path).context("create stable checkpoint migration temp")?;
-        std::io::copy(&mut source, &mut destination)
-            .context("copy legacy checkpoint into stable namespace")?;
-        destination
-            .sync_all()
-            .context("sync stable checkpoint migration temp")?;
-        std::fs::rename(&temp_path, stable_path).context("publish stable checkpoint migration")?;
-        if let Some(parent) = stable_path.parent() {
-            std::fs::File::open(parent)
-                .and_then(|directory| directory.sync_all())
-                .context("sync stable checkpoint migration directory")?;
-        }
-        Ok(())
-    })();
-    if migration.is_err() {
-        let _ = std::fs::remove_file(&temp_path);
-    }
-    migration
-}
-
 /// Test access to a source's progress path under its progress owner.
 #[cfg(test)]
 pub(crate) fn with_state_v2_progress_lock<T>(
@@ -1610,14 +1517,6 @@ pub(super) fn snapshot_upload_progress_path(index_path: &Path) -> PathBuf {
         .and_then(|value| value.to_str())
         .unwrap_or("snapshot-scan-index");
     index_path.with_file_name(format!("{stem}-upload-progress.json"))
-}
-
-pub(super) fn snapshot_v2_index_path(v1_index_path: &Path) -> PathBuf {
-    let stem = v1_index_path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or("snapshot-scan-index");
-    v1_index_path.with_file_name(format!("{stem}-v2.json"))
 }
 
 pub(super) fn snapshot_v3_index_path(destination_index_path: &Path) -> PathBuf {

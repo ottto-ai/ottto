@@ -113,13 +113,13 @@ fn reoffer_decoder_is_bounded_and_isolating() {
         ),
         original_pair(5)
     );
+    // The retired one-time re-classification token is no longer a schedule:
+    // it disables this record's retry and keeps the refusal.
     assert_eq!(
         decode(
             r#"{"version":1,"reason":"legacy_other_reclassification","retry_after_unix_seconds":9}"#
         ),
-        Some(RefusalReoffer::LegacyOther {
-            retry_after_unix_seconds: 9
-        })
+        Some(RefusalReoffer::Classified)
     );
     assert_eq!(
         decode(r#"{"version":1,"reason":"classified"}"#),
@@ -175,7 +175,7 @@ fn reoffer_decoder_is_bounded_and_isolating() {
 /// R9: a frozen pre-change reader reads newly written records: the new
 /// reason keeps the old enum value, the extension is ignored, siblings and
 /// the receipt reason survive. An old rewrite drops the extension, which
-/// leaves a legacy record (one idempotent re-classification offer).
+/// leaves a refusal that is never re-offered.
 #[test]
 fn old_daemon_reads_new_refusal_records_and_receipt_reason() {
     #[derive(Debug, Serialize, Deserialize)]
@@ -207,7 +207,7 @@ fn old_daemon_reads_new_refusal_records_and_receipt_reason() {
     assert_eq!(
         written["permanent_rejections"][fp(3)]["reoffer"]["reason"],
         "classified",
-        "a fresh server `other` is already classified: no legacy pass"
+        "a fresh server `other` is already classified"
     );
     assert!(
         written["permanent_rejections"][fp(4)]
@@ -265,7 +265,7 @@ fn reoffers_share_the_ordinary_retry_budget_oldest_first() {
     let mut entities = (0..60)
         .map(|value| (value, original_pair(NOW - 1_000 + value as u64)))
         .collect::<Vec<_>>();
-    // Legacy records are due since forever.
+    // An `other` refusal without the extension is never re-offered.
     entities.push((100, None));
     let (mut progress, mut index) = refused(&entities);
     // Ten ordinary retries due before every re-offer.
@@ -281,8 +281,8 @@ fn reoffers_share_the_ordinary_retry_budget_oldest_first() {
     assert!(select(&mut progress, &index, NOW));
     assert_eq!(progress.active_quarantine_retries.len(), 10);
     assert_eq!(progress.active_reason_reoffers.len(), 40);
-    assert!(progress.active_reason_reoffers.contains_key(&fp(100)));
-    for value in 0..39 {
+    assert!(!progress.active_reason_reoffers.contains_key(&fp(100)));
+    for value in 0..40 {
         assert_eq!(progress.active_reason_reoffers[&fp(value)], body(value));
         assert_eq!(
             progress.permanent_rejections[&fp(value)].reoffer,
@@ -290,29 +290,24 @@ fn reoffers_share_the_ordinary_retry_budget_oldest_first() {
             "reserved before any lease is used"
         );
     }
-    for value in 39..60 {
+    for value in 40..60 {
         assert!(!progress.active_reason_reoffers.contains_key(&fp(value)));
         assert_eq!(
             progress.permanent_rejections[&fp(value)].reoffer,
             original_pair(NOW - 1_000 + value as u64)
         );
     }
-    assert_eq!(
-        progress.permanent_rejections[&fp(100)].reoffer,
-        Some(reason_reoffer::RefusalReoffer::LegacyOther {
-            retry_after_unix_seconds: NOW + DAY
-        })
-    );
+    assert_eq!(progress.permanent_rejections[&fp(100)].reoffer, None);
     let counts = progress.reason_reoffer_counts;
-    assert_eq!(counts.due, 61);
+    assert_eq!(counts.due, 60);
     assert_eq!(counts.selected, 40);
-    assert_eq!(counts.legacy_selected, 1);
-    assert_eq!(counts.deferred_budget, 21);
+    assert_eq!(counts.deferred_budget, 20);
 
     // The deferred remainder is the oldest work of the next cycle.
     assert!(select(&mut progress, &index, NOW + 300));
-    assert_eq!(progress.active_reason_reoffers.len(), 21);
-    assert!((39..60).all(|value| progress.active_reason_reoffers.contains_key(&fp(value))));
+    assert_eq!(progress.active_reason_reoffers.len(), 20);
+    assert!((40..60).all(|value| progress.active_reason_reoffers.contains_key(&fp(value))));
+    assert!(!progress.active_reason_reoffers.contains_key(&fp(100)));
 }
 
 /// R4/R5/R11: only a due, current, unaccepted refusal bound to its exact
@@ -467,49 +462,35 @@ fn reoffer_reservation_survives_restart_and_failed_save_grants_nothing() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// F2: injected wall-clock rollback keeps both kinds eligible after a full
-/// cooldown; a save/reload must not turn either into the permanent done marker.
+/// F2: injected wall-clock rollback keeps the record eligible after a full
+/// cooldown; a save/reload must not turn it into the permanent done marker.
 #[test]
 fn clock_rollback_reclamps_and_skips_without_consuming_classification() {
-    use reason_reoffer::RefusalReoffer;
     let fast_clock = NOW + 3_600;
-    let (mut progress, index) = refused(&[
-        (1, original_pair(fast_clock + DAY)),
-        (
-            2,
-            Some(RefusalReoffer::LegacyOther {
-                retry_after_unix_seconds: fast_clock + DAY,
-            }),
-        ),
-    ]);
+    let (mut progress, index) = refused(&[(1, original_pair(fast_clock + DAY))]);
     assert!(select(&mut progress, &index, NOW));
-    assert_eq!(progress.reason_reoffer_counts.clock_bound_skipped, 2);
+    assert_eq!(progress.reason_reoffer_counts.clock_bound_skipped, 1);
     assert!(progress.active_reason_reoffers.is_empty());
     assert_eq!(
         progress.permanent_rejections[&fp(1)].reoffer,
         original_pair(NOW + DAY)
-    );
-    assert_eq!(
-        progress.permanent_rejections[&fp(2)].reoffer,
-        Some(RefusalReoffer::LegacyOther {
-            retry_after_unix_seconds: NOW + DAY
-        })
     );
     let mut reloaded: SnapshotUploadProgress =
         serde_json::from_slice(&serde_json::to_vec(&progress).unwrap()).unwrap();
     reloaded.active_quarantine_witness = progress.active_quarantine_witness.clone();
     assert!(!select(&mut reloaded, &index, NOW + DAY - 1));
     assert!(reloaded.contains_body(&fp(1), &body(1)));
-    assert!(reloaded.contains_body(&fp(2), &body(2)));
     assert!(select(&mut reloaded, &index, NOW + DAY));
-    assert_eq!(reloaded.active_reason_reoffers.len(), 2);
+    assert_eq!(reloaded.active_reason_reoffers.len(), 1);
 }
 
-/// F8/F9: migration cannot starve ordinary retries or claim two slots for a
-/// fingerprint whose ordinary retry and refusal disagree after a crash.
+/// F9: a re-offer cannot claim two slots for a fingerprint whose ordinary
+/// retry and refusal disagree after a crash.
 #[test]
-fn legacy_pass_uses_at_most_half_the_shared_slots_and_deduplicates() {
-    let entities = (0..60).map(|value| (value, None)).collect::<Vec<_>>();
+fn reoffer_and_stale_ordinary_retry_share_one_slot() {
+    let entities = (0..20)
+        .map(|value| (value, original_pair(0)))
+        .collect::<Vec<_>>();
     let (mut progress, mut index) = refused(&entities);
     for value in 200..230 {
         let mut record = terminal_record(&body(value));
@@ -526,12 +507,11 @@ fn legacy_pass_uses_at_most_half_the_shared_slots_and_deduplicates() {
     stale.retry_after_unix_seconds = 0;
     progress.quarantined_fingerprints.insert(fp(0), stale);
     assert!(select(&mut progress, &index, NOW));
-    assert_eq!(progress.reason_reoffer_counts.legacy_selected, 25);
-    assert_eq!(progress.active_reason_reoffers.len(), 25);
-    assert_eq!(progress.active_quarantine_retries.len(), 25);
+    assert_eq!(progress.active_reason_reoffers.len(), 20);
+    assert_eq!(progress.active_quarantine_retries.len(), 30);
     assert!(progress.active_reason_reoffers.contains_key(&fp(0)));
     assert!(!progress.active_quarantine_retries.contains(&fp(0)));
-    assert_eq!(progress.reason_reoffer_counts.deferred_budget, 35);
+    assert_eq!(progress.reason_reoffer_counts.deferred_budget, 0);
 }
 
 #[test]

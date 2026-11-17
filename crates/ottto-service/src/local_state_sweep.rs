@@ -8,8 +8,6 @@
 //! - `<base>.json.<pid>.tmp`: `ScanIndex::save_internal` under
 //!   `CheckpointLock`, and `SnapshotUploadProgress::save_with_read_limit`
 //!   under `SnapshotProgressLock`.
-//! - `<base>.json.<pid>.migrate`: `adopt_legacy_checkpoint_file`, under the
-//!   stable target's `SnapshotProgressLock`.
 //! - `<base>.tmp.<pid>.<nanos>.json`: the terminal status journal writer,
 //!   under `SnapshotProgressLock`.
 //! - `<base>.cleared.<pid>.<nanos>.json`: `SnapshotUploadProgress::clear`,
@@ -95,8 +93,6 @@ const DAEMON_EXECUTABLE: &str = ottto_core::OTTTO_SERVICE_BINARY_NAME;
 enum ArtifactKind {
     /// `<base>.json.<pid>.tmp`
     PidTemp,
-    /// `<base>.json.<pid>.migrate`
-    Migrate,
     /// `<base>.tmp.<pid>.<nanos>.json`
     TerminalTemp,
     /// `<base>.cleared.<pid>.<nanos>.json`
@@ -106,17 +102,10 @@ enum ArtifactKind {
 /// Canonical base suffixes and the artifacts their writers are proven to
 /// create only under the base's lock.
 const BASES: [(&str, &[ArtifactKind]); 3] = [
-    (
-        "-scan-index-v3",
-        &[ArtifactKind::PidTemp, ArtifactKind::Migrate],
-    ),
+    ("-scan-index-v3", &[ArtifactKind::PidTemp]),
     (
         "-scan-index-v3-upload-progress",
-        &[
-            ArtifactKind::PidTemp,
-            ArtifactKind::Migrate,
-            ArtifactKind::ClearedTombstone,
-        ],
+        &[ArtifactKind::PidTemp, ArtifactKind::ClearedTombstone],
     ),
     ("-terminal-status-v1", &[ArtifactKind::TerminalTemp]),
 ];
@@ -161,10 +150,6 @@ fn parse_artifact_suffix(kind: ArtifactKind, rest: &str) -> Option<(i32, Option<
     match kind {
         ArtifactKind::PidTemp => {
             let pid = rest.strip_prefix(".json.")?.strip_suffix(".tmp")?;
-            Some((parse_pid(pid)?, None))
-        }
-        ArtifactKind::Migrate => {
-            let pid = rest.strip_prefix(".json.")?.strip_suffix(".migrate")?;
             Some((parse_pid(pid)?, None))
         }
         ArtifactKind::TerminalTemp => {

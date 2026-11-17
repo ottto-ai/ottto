@@ -2,10 +2,10 @@
 //!
 //! The backend refuses `original_pair_candidate_unproved` permanently until it
 //! can prove the original request pair, so the refused body is offered again at
-//! most once per 24 hours. Legacy `other` refusals, which an older daemon wrote
-//! for that same reason, get one bounded re-classification offer. The refusal,
-//! its body binding and its terminal quarantine stay durable throughout; this
-//! extension is local scheduling permission only, never acceptance evidence.
+//! most once per 24 hours. A refusal recorded as `other` without this extension
+//! is never re-offered. The refusal, its body binding and its terminal
+//! quarantine stay durable throughout; this extension is local scheduling
+//! permission only, never acceptance evidence.
 //!
 //! Disk form: the containing record keeps the old enum value `other`, so an
 //! older daemon still reads, suppresses and never retries the refusal. The
@@ -40,7 +40,6 @@ pub(super) const REOFFER_INTERVAL_SECONDS: u64 = 86_400;
 pub(super) const REOFFER_CLOCK_TOLERANCE_SECONDS: u64 = 600;
 
 const EXTENSION_VERSION: u64 = 1;
-const LEGACY_OTHER: &str = "legacy_other_reclassification";
 const CLASSIFIED: &str = "classified";
 const MAX_MEMBERS: usize = 8;
 const MAX_DEPTH: usize = 4;
@@ -52,9 +51,6 @@ const MAX_NODES: usize = 32;
 pub(super) enum RefusalReoffer {
     /// Exact `original_pair_candidate_unproved`: next logical offer not before.
     OriginalPair { retry_after_unix_seconds: u64 },
-    /// Legacy `other` record whose one-time re-classification offer is
-    /// reserved until this time (a crash or unmaterialized lease waits a day).
-    LegacyOther { retry_after_unix_seconds: u64 },
     /// Per-record done marker: the server classified this body, or the
     /// extension was unusable. Never re-offered automatically.
     Classified,
@@ -64,9 +60,6 @@ impl RefusalReoffer {
     pub(super) fn retry_after(self) -> Option<u64> {
         match self {
             Self::OriginalPair {
-                retry_after_unix_seconds,
-            }
-            | Self::LegacyOther {
                 retry_after_unix_seconds,
             } => Some(retry_after_unix_seconds),
             Self::Classified => None,
@@ -78,9 +71,6 @@ impl RefusalReoffer {
             Self::OriginalPair { .. } => Self::OriginalPair {
                 retry_after_unix_seconds,
             },
-            Self::LegacyOther { .. } => Self::LegacyOther {
-                retry_after_unix_seconds,
-            },
             Self::Classified => Self::Classified,
         }
     }
@@ -89,9 +79,7 @@ impl RefusalReoffer {
 impl crate::heap_layout_bound::HeapLayoutBound for RefusalReoffer {
     fn heap_bound(&self, counter: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         match self {
-            Self::OriginalPair { .. } | Self::LegacyOther { .. } | Self::Classified => {
-                counter.add(0)
-            }
+            Self::OriginalPair { .. } | Self::Classified => counter.add(0),
         }
     }
 }
@@ -158,9 +146,6 @@ pub(super) fn serialize<S: Serializer>(
             ORIGINAL_PAIR_CANDIDATE_UNPROVED,
             Some(*retry_after_unix_seconds),
         ),
-        RefusalReoffer::LegacyOther {
-            retry_after_unix_seconds,
-        } => (LEGACY_OTHER, Some(*retry_after_unix_seconds)),
         RefusalReoffer::Classified => (CLASSIFIED, None),
     };
     let mut map = serializer.serialize_map(Some(2 + usize::from(retry_after.is_some())))?;
@@ -297,11 +282,6 @@ impl<'de> Visitor<'de> for ExtensionVisitor {
                             retry_after_unix_seconds,
                         })
                     }
-                    (Token::LegacyOther, Some(Scalar::U64(retry_after_unix_seconds))) => {
-                        Some(RefusalReoffer::LegacyOther {
-                            retry_after_unix_seconds,
-                        })
-                    }
                     (Token::Classified, None) => Some(RefusalReoffer::Classified),
                     _ => None,
                 }
@@ -354,7 +334,6 @@ impl Visitor<'_> for KeyVisitor {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Token {
     OriginalPair,
-    LegacyOther,
     Classified,
 }
 
@@ -418,7 +397,6 @@ impl<'de> Visitor<'de> for ScalarVisitor<'_> {
         }
         Ok(match value {
             ORIGINAL_PAIR_CANDIDATE_UNPROVED => Scalar::Token(Token::OriginalPair),
-            LEGACY_OTHER => Scalar::Token(Token::LegacyOther),
             CLASSIFIED => Scalar::Token(Token::Classified),
             _ => Scalar::Other,
         })
@@ -566,7 +544,6 @@ impl crate::heap_layout_bound::HeapLayoutBound for ReofferCounts {
 pub(super) struct ReofferCounts {
     pub(super) due: usize,
     pub(super) selected: usize,
-    pub(super) legacy_selected: usize,
     pub(super) attempted: usize,
     pub(super) attempted_bytes: usize,
     pub(super) gate_held: usize,
@@ -592,13 +569,12 @@ impl ReofferCounts {
     pub(super) fn line(&self, source: &str) -> String {
         format!(
             "snapshot reason_reoffer source={source} reason={ORIGINAL_PAIR_CANDIDATE_UNPROVED} \
-             due={} selected={} legacy_selected={} attempted={} attempted_bytes={} gate_held={} ineligible_unbound={} clock_bound_skipped={} accepted={} \
+             due={} selected={} attempted={} attempted_bytes={} gate_held={} ineligible_unbound={} clock_bound_skipped={} accepted={} \
              unchanged_unstored={} refused_same={} refused_other={} retryable={} shed={} \
              failed={} not_materialized={} deferred_budget={} outside_policy_window={} \
              cooldown_conflict_deferred={} invalid_extension_process={}",
             self.due,
             self.selected,
-            self.legacy_selected,
             self.attempted,
             self.attempted_bytes,
             self.gate_held,
@@ -825,25 +801,6 @@ impl SnapshotUploadProgress {
             {
                 break;
             }
-            if due_reoffers.contains_key(&fingerprint) {
-                let legacy = self
-                    .permanent_rejections
-                    .get(&fingerprint)
-                    .is_some_and(|refusal| {
-                        matches!(
-                            refusal.reoffer,
-                            None | Some(reason_reoffer::RefusalReoffer::LegacyOther { .. })
-                        )
-                    });
-                // The one-time migration gets at most half the shared slots;
-                // keep walking so ordinary retries can use their share.
-                if legacy
-                    && self.reason_reoffer_counts.legacy_selected
-                        >= SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE / 2
-                {
-                    continue;
-                }
-            }
             match due_reoffers.remove(&fingerprint) {
                 Some((_, body_witness)) => {
                     self.reserve_reason_reoffer(&fingerprint, body_witness, reoffer_now);
@@ -895,15 +852,14 @@ impl SnapshotUploadProgress {
         let mut changed = false;
         for (fingerprint, refusal) in &mut self.permanent_rejections {
             // Known reasons are never re-offered; only the old `other`
-            // vocabulary can carry this reason or a legacy record of it.
+            // vocabulary can carry this reason, and only with its extension.
             if refusal.has_stale_debt()
                 || refusal.reason != crate::upload_receipts::RejectedUsageReason::Other
             {
                 continue;
             }
             let retry_after = match refusal.reoffer {
-                None => 0,
-                Some(RefusalReoffer::Classified) => continue,
+                None | Some(RefusalReoffer::Classified) => continue,
                 Some(reoffer) => reoffer.retry_after().unwrap_or_default(),
             };
             if retry_after > latest {
@@ -983,13 +939,7 @@ impl SnapshotUploadProgress {
                 }
                 let eligible =
                     owner.reason == crate::upload_receipts::RejectedUsageReason::Other
-                        && matches!(
-                            owner.reoffer,
-                            Some(
-                                RefusalReoffer::OriginalPair { .. }
-                                    | RefusalReoffer::LegacyOther { .. }
-                            )
-                        )
+                        && matches!(owner.reoffer, Some(RefusalReoffer::OriginalPair { .. }))
                         && owner
                             .reoffer
                             .and_then(RefusalReoffer::retry_after)
@@ -1026,26 +976,14 @@ impl SnapshotUploadProgress {
         body_witness: String,
         now: u64,
     ) {
-        use reason_reoffer::RefusalReoffer;
         let refusal = self
             .permanent_rejections
             .get_mut(fingerprint)
             .expect("selected re-offer has its refusal");
         let next = reason_reoffer::next_offer_after(now);
-        refusal.reoffer = Some(match refusal.reoffer {
-            None => {
-                self.reason_reoffer_counts.legacy_selected += 1;
-                RefusalReoffer::LegacyOther {
-                    retry_after_unix_seconds: next,
-                }
-            }
-            Some(reoffer) => {
-                if matches!(reoffer, RefusalReoffer::LegacyOther { .. }) {
-                    self.reason_reoffer_counts.legacy_selected += 1;
-                }
-                reoffer.with_retry_after(next)
-            }
-        });
+        refusal.reoffer = refusal
+            .reoffer
+            .map(|reoffer| reoffer.with_retry_after(next));
         self.reason_reoffer_counts.selected += 1;
         self.active_reason_reoffers
             .insert(fingerprint.to_string(), body_witness);

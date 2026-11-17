@@ -1,4 +1,3 @@
-use self::lane::adopt_legacy_checkpoint_file;
 pub(crate) use self::lane::apply_source_control;
 pub(crate) use self::lane::carry_snapshot_namespace;
 pub(crate) use self::lane::disable_snapshot_source;
@@ -11,7 +10,6 @@ use self::lane::ensure_snapshot_scan_authority;
 pub(crate) use self::lane::forget_carried_namespaces_for_test;
 use self::lane::heartbeat_source;
 pub(crate) use self::lane::home_dir;
-use self::lane::legacy_policy_scoped_snapshot_index_path;
 pub(crate) use self::lane::reconnect_snapshot_source;
 #[cfg(test)]
 pub(crate) use self::lane::relogin_namespace;
@@ -28,7 +26,6 @@ pub(crate) use self::lane::snapshot_namespace_has_store;
 use self::lane::snapshot_upload_context_fingerprint;
 pub(crate) use self::lane::snapshot_upload_destination_namespace;
 use self::lane::snapshot_upload_progress_path;
-use self::lane::snapshot_v2_index_path;
 use self::lane::snapshot_v3_index_path;
 #[cfg(test)]
 use self::lane::source_erasure_turn;

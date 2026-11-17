@@ -656,18 +656,6 @@ fn reoffer_json<'a>(cycle: &'a CycleResult, fingerprint: &str) -> &'a serde_json
     &cycle.progress_json["permanent_rejections"][fingerprint]["reoffer"]
 }
 
-/// Old daemon rewrite: the record keeps `reason: other` and loses the
-/// extension it does not know.
-fn strip_reoffer_extension(path: &Path, fingerprint: &str) {
-    let mut json: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-    json["permanent_rejections"][fingerprint]
-        .as_object_mut()
-        .unwrap()
-        .remove("reoffer");
-    std::fs::write(path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
-}
-
 /// An unchanged finished session refused for
 /// `original_pair_candidate_unproved` is offered once a day, exactly, until
 /// the server accepts it. Repeat refusals settle the census while health
@@ -792,78 +780,6 @@ fn original_pair_refusal_is_reoffered_once_a_day_until_accepted() {
     );
     assert_eq!(terminal["last_census_complete"], true);
     assert!(!after.index.bounded_sweep_had_unsettled_upload());
-}
-
-/// A legacy `other` refusal, as every older daemon wrote
-/// this reason, is re-offered once. The server's answer re-classifies it:
-/// `other` again is final; the exact reason joins the daily cycle.
-#[test]
-#[serial]
-#[serial(source_cadences, source_manifests)]
-#[serial(client_report)]
-fn legacy_other_refusal_is_reclassified_by_one_offer() {
-    if !supported("legacy_other_refusal_is_reclassified_by_one_offer") {
-        return;
-    }
-    for (name, second_answer) in [
-        ("legacy-final", Answer::Refuse("future_unknown_reason")),
-        ("legacy-daily", Answer::Refuse(ORIGINAL_PAIR)),
-    ] {
-        let t0 = current_unix_seconds();
-        let mut pipeline = ReofferPipeline::new(name, Answer::Refuse("future_unknown_reason"), t0);
-        let first = pipeline.cycle(t0);
-        assert!(first.result.is_ok(), "{name}: {:?}", first.result);
-        let fingerprint = fingerprint_of(&pipeline.server.offered()[0]);
-        assert_eq!(
-            first.progress_json["permanent_rejections"][&fingerprint]["reason"],
-            "other"
-        );
-        strip_reoffer_extension(&first.progress_path, &fingerprint);
-
-        pipeline.server.answer(second_answer);
-        let reclassified = pipeline.cycle(t0 + 600);
-        assert!(
-            reclassified.result.is_ok(),
-            "{name}: {:?}",
-            reclassified.result
-        );
-        assert_eq!(
-            pipeline.server.offered().len(),
-            2,
-            "{name}: a legacy `other` refusal is re-offered once"
-        );
-        assert_eq!(fingerprint_of(&pipeline.server.offered()[1]), fingerprint);
-        assert!(!reclassified.index.bounded_sweep_had_unsettled_upload());
-
-        // Never repeated within the day, whatever the answer.
-        let quiet = pipeline.cycle(t0 + 1_200);
-        assert!(quiet.result.is_ok(), "{name}: {:?}", quiet.result);
-        assert_eq!(pipeline.server.offered().len(), 2, "{name}");
-
-        let later = pipeline.cycle(t0 + 600 + DAY + 60);
-        assert!(later.result.is_ok(), "{name}: {:?}", later.result);
-        match second_answer {
-            Answer::Refuse(ORIGINAL_PAIR) => {
-                assert_eq!(
-                    pipeline.server.offered().len(),
-                    3,
-                    "{name}: the exact reason joins the 24 h cycle"
-                );
-            }
-            _ => {
-                assert_eq!(
-                    pipeline.server.offered().len(),
-                    2,
-                    "{name}: a server `other` is final; the done marker is per record"
-                );
-                assert_eq!(reoffer_json(&later, &fingerprint)["reason"], "classified");
-            }
-        }
-        assert!(later
-            .progress
-            .permanent_rejections
-            .contains_key(&fingerprint));
-    }
 }
 
 /// A validated `unchanged` answer that did not store the body
@@ -1346,7 +1262,7 @@ fn cache_head_probe_refusal_reoffers_its_own_exact_body() {
 
 /// #692: two physical POSTs remain one logical leased offer, including bytes.
 /// Advancing the injected clock after 503 proves the saved claim is not bumped
-/// by the resend; the legacy done marker appears only with the final answer.
+/// by the resend; the done marker appears only with the final answer.
 #[test]
 #[serial(client_report)]
 fn reoffer_fast_503_resend_keeps_one_claim_until_validated_final_answer() {
@@ -1360,7 +1276,9 @@ fn reoffer_fast_503_resend_keeps_one_claim_until_validated_final_answer() {
         .permanent_rejections
         .get_mut(&fingerprint)
         .unwrap()
-        .reoffer = None;
+        .reoffer = Some(reason_reoffer::RefusalReoffer::OriginalPair {
+        retry_after_unix_seconds: start,
+    });
     progress.reserve_reason_reoffer(&fingerprint, body.clone(), start);
     let leased = progress.active_reason_reoffers.clone();
     // The exact pre-send durable claim is observable by each fake POST.
@@ -1384,7 +1302,7 @@ fn reoffer_fast_503_resend_keeps_one_claim_until_validated_final_answer() {
                 assert_eq!(items, &[&fingerprint]);
                 let disk = saved.borrow();
                 let state = &disk["permanent_rejections"][&fingerprint]["reoffer"];
-                assert_eq!(state["reason"], "legacy_other_reclassification");
+                assert_eq!(state["reason"], ORIGINAL_PAIR);
                 assert_eq!(state["retry_after_unix_seconds"], start + DAY);
                 posts += 1;
                 if posts == 1 {
