@@ -1,6 +1,6 @@
 //! Content hashes of a `SnapshotItem`: the semantic component hashes, the
 //! snapshot fingerprint, the upload body witness, the content identity hash,
-//! the revision hashes and the semantic envelope built from them.
+//! the revision hash and the semantic envelope built from them.
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -10,8 +10,7 @@ use crate::snapshots::usage::cache_observations::upload::cache_state_from_patch;
 use crate::snapshots::{
     claude_request_identity, semantic_attribution, semantic_model_usage, semantic_usage_buckets,
     sha256_hex, SnapshotUploadPolicy, POLICY_NEUTRAL_COMPONENTS, SNAPSHOT_CONTENT_HASH_EPOCH,
-    SNAPSHOT_REVISION_CONTRACT_VERSION, SNAPSHOT_REVISION_V2_CONTRACT_VERSION,
-    SNAPSHOT_SEMANTIC_CONTRACT_VERSION,
+    SNAPSHOT_REVISION_V2_CONTRACT_VERSION, SNAPSHOT_SEMANTIC_CONTRACT_VERSION,
 };
 
 pub(crate) fn snapshot_semantic_component_hashes(
@@ -296,16 +295,15 @@ pub(crate) fn policy_neutral_component_hashes(
 /// The body `content_hash` is computed over.
 ///
 /// It carries the content identity scope (source + session id) and the
-/// policy-neutral semantic components, and nothing else. Every field of
-/// `snapshot_revision_material` that is NOT here is excluded because it is
-/// implementation state, mutable inventory, or wall-clock, and identity may not
+/// policy-neutral semantic components, and nothing else. Other revision witness
+/// inputs are excluded here because they are implementation state, mutable
+/// inventory, or wall-clock, and identity may not
 /// depend on any of those:
 ///
 /// * `source_file_fingerprint` — scan/inventory state; the same content read
 ///   from a rotated or recopied transcript is the same content.
 /// * parser version and scan-identity version — a parser fix must not re-mint
-///   every session's identity (they stay in `revision_hash`, which is the
-///   *re-upload* trigger, not the identity).
+///   every session's identity (they stay in the v2 revision witness).
 /// * `provenance.collector` / `provenance.source_file_count` — implementation
 ///   state and mutable inventory.
 /// * the lifecycle scalars (`status`, the three `source_*_at` timestamps,
@@ -351,43 +349,6 @@ pub(crate) fn snapshot_content_hash(
     let mut digest = Sha256::new();
     digest.update(&canonical);
     format!("{:x}", digest.finalize())
-}
-
-fn snapshot_revision_material(
-    item: &SnapshotItem,
-    component_hashes: &BTreeMap<&'static str, String>,
-) -> Value {
-    let policy_neutral_component_hashes = policy_neutral_component_hashes(component_hashes);
-    json!({
-        "source_file_fingerprint": &item.source_file_fingerprint,
-        "source_started_at": &item.source_started_at,
-        "source_ended_at": &item.source_ended_at,
-        "source_last_activity_at": &item.source_last_activity_at,
-        "status": &item.status,
-        "provenance": {
-            "collector": &item.provenance.collector,
-            "source_file_count": item.provenance.source_file_count,
-            "input_token_scope": &item.provenance.input_token_scope,
-            "state_total_tokens": item.provenance.state_total_tokens,
-            "state_archived": item.provenance.state_archived,
-        },
-        "policy_neutral_component_hashes": policy_neutral_component_hashes,
-    })
-}
-
-pub(crate) fn snapshot_revision_hash(
-    source: SnapshotSource,
-    item: &SnapshotItem,
-    component_hashes: &BTreeMap<&'static str, String>,
-) -> String {
-    let material = snapshot_revision_material(item, component_hashes).to_string();
-    sha256_hex(&[
-        SNAPSHOT_REVISION_CONTRACT_VERSION,
-        source.api_slug(),
-        source.parser_version(),
-        source.scan_identity_version(),
-        &material,
-    ])
 }
 
 pub(crate) fn snapshot_revision_v2_body(
@@ -445,9 +406,7 @@ pub(crate) fn snapshot_semantic_envelope(
         item.cache_handshake();
     SnapshotSemanticEnvelope {
         component_contract_version: SNAPSHOT_SEMANTIC_CONTRACT_VERSION,
-        revision_contract_version: SNAPSHOT_REVISION_CONTRACT_VERSION,
         upload_policy,
-        revision_hash: snapshot_revision_hash(source, item, &component_hashes),
         revision_v2_contract_version: SNAPSHOT_REVISION_V2_CONTRACT_VERSION,
         revision_v2_canonicalization: crate::canonical_json::CANONICAL_JSON_CONTRACT_VERSION,
         revision_v2_parser_version: source.parser_version(),

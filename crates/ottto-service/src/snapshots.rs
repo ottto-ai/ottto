@@ -359,7 +359,7 @@ pub(crate) use wire::batch_validation::validate_snapshot_batch_request_with_item
 #[cfg(test)]
 use wire::content_hash::{
     policy_neutral_component_hashes, snapshot_content_hash, snapshot_content_identity_body,
-    snapshot_revision_hash, snapshot_revision_v2_body, snapshot_revision_v2_hash,
+    snapshot_revision_v2_body, snapshot_revision_v2_hash,
 };
 pub(crate) use wire::content_hash::{
     snapshot_fingerprint, snapshot_fingerprint_from_component_hashes,
@@ -380,8 +380,7 @@ pub(crate) use wire::{
     MAX_SESSION_ARTIFACT_VALUE_CHARS, MAX_SNAPSHOT_BATCH_WIRE_BYTES,
     MAX_SNAPSHOT_ITEM_CLEAR_WIRE_BYTES, MAX_SNAPSHOT_ITEM_WIRE_BYTES,
     MAX_SNAPSHOT_RECONSTRUCTION_FAILURES, POLICY_NEUTRAL_COMPONENTS,
-    SNAPSHOT_REVISION_CONTRACT_VERSION, SNAPSHOT_REVISION_V2_CONTRACT_VERSION,
-    SNAPSHOT_SEMANTIC_CONTRACT_VERSION,
+    SNAPSHOT_REVISION_V2_CONTRACT_VERSION, SNAPSHOT_SEMANTIC_CONTRACT_VERSION,
 };
 use wire::{
     default_true, is_false, is_zero_u16, is_zero_u64, is_zero_u8, SnapshotItemWire,

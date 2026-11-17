@@ -12,7 +12,8 @@ use crate::snapshots::{
     scan_source_roots_with_attribution_and_claude_effort_and_hints,
     snapshot_fingerprint_from_component_hashes, snapshot_semantic_component_hashes,
     snapshot_semantic_envelope, ScanIndex, SnapshotItem, SnapshotSource, SnapshotUploadPolicy,
-    BACKFILL_WINDOW_DAYS, SNAPSHOT_REVISION_CONTRACT_VERSION, SNAPSHOT_SEMANTIC_CONTRACT_VERSION,
+    BACKFILL_WINDOW_DAYS, SNAPSHOT_REVISION_V2_CONTRACT_VERSION,
+    SNAPSHOT_SEMANTIC_CONTRACT_VERSION,
 };
 use anyhow::{anyhow, Context, Result};
 use hmac::{Hmac, Mac};
@@ -24,7 +25,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
-const AUDIT_SCHEMA_VERSION: &str = "local_snapshot_audit:v4";
+const AUDIT_SCHEMA_VERSION: &str = "local_snapshot_audit:v5";
 const AUDIT_STATE_SCHEMA_VERSION: &str = "local_snapshot_audit_state:v3";
 const AUDIT_STATE_MARKER_FILE: &str = "audit-state.json";
 const AUDIT_SCAN_INDEX_FILE: &str = "scan-index.json";
@@ -76,6 +77,8 @@ pub struct SnapshotAuditReport {
     pub discovered_file_count: usize,
     pub skipped_file_count_due_to_limit: usize,
     pub scan_cap_hit: bool,
+    pub oversized_file_count: usize,
+    pub census_complete: bool,
     pub scanned_file_count: usize,
     pub scanned_session_count: usize,
     pub semantic_noop_count: usize,
@@ -85,7 +88,7 @@ pub struct SnapshotAuditReport {
     pub zero_snapshot_usage_evidence_count: usize,
     pub dropped_usage_record_count: u64,
     pub emitted_session_count: usize,
-    // Kept for the v4 report schema; always 0 since the daemon builds no curves.
+    // Kept for the v5 report schema; always 0 since the daemon builds no curves.
     pub context_curve_present_session_count: usize,
     pub context_curve_available_session_count: usize,
     pub context_curve_unavailable_session_count: usize,
@@ -302,7 +305,7 @@ pub fn run_snapshot_audit<W: Write>(
                         &snapshot.snapshot_fingerprint,
                     ],
                 ),
-                revision_key: blinded_revision_key(&audit_key, &envelope.revision_hash),
+                revision_key: blinded_revision_key(&audit_key, &envelope.revision_v2_hash),
                 legacy_revision_proof_available: false,
                 legacy_policy_candidate_semantic_keys: legacy_policy_candidate_semantic_keys(
                     &audit_key,
@@ -363,7 +366,7 @@ pub fn run_snapshot_audit<W: Write>(
     let report = SnapshotAuditReport {
         schema_version: AUDIT_SCHEMA_VERSION,
         component_contract_version: SNAPSHOT_SEMANTIC_CONTRACT_VERSION,
-        revision_contract_version: SNAPSHOT_REVISION_CONTRACT_VERSION,
+        revision_contract_version: SNAPSHOT_REVISION_V2_CONTRACT_VERSION,
         source: options.source.api_slug().to_string(),
         machine_key: keyed_hex(
             &audit_key,
@@ -392,6 +395,8 @@ pub fn run_snapshot_audit<W: Write>(
         discovered_file_count: scan.discovered_file_count,
         skipped_file_count_due_to_limit: scan.skipped_file_count_due_to_limit,
         scan_cap_hit: scan.scan_cap_hit,
+        oversized_file_count: scan.oversized_file_count,
+        census_complete: scan.census_complete,
         scanned_file_count: scan.scanned_file_count,
         scanned_session_count: scan.scanned_session_count,
         semantic_noop_count: scan.semantic_noop_count,
@@ -456,7 +461,7 @@ fn blinded_revision_key(audit_key: &[u8], revision_hash: &str) -> String {
         &[
             AUDIT_SCHEMA_VERSION,
             "revision",
-            SNAPSHOT_REVISION_CONTRACT_VERSION,
+            SNAPSHOT_REVISION_V2_CONTRACT_VERSION,
             revision_hash,
         ],
     )
@@ -469,7 +474,7 @@ fn snapshot_revision_key(
     snapshot: &SnapshotItem,
 ) -> String {
     let envelope = snapshot_semantic_envelope(source, snapshot, SnapshotUploadPolicy::default());
-    blinded_revision_key(audit_key, &envelope.revision_hash)
+    blinded_revision_key(audit_key, &envelope.revision_v2_hash)
 }
 
 pub(crate) fn valid_upload_policies() -> Vec<SnapshotUploadPolicy> {
@@ -766,7 +771,16 @@ mod tests {
             .as_str()
             .expect("raw source file fingerprint");
         assert_eq!(report.emitted_session_count, 1);
-        assert_eq!(report.schema_version, "local_snapshot_audit:v4");
+        assert_eq!(report.schema_version, "local_snapshot_audit:v5");
+        assert_eq!(report.revision_contract_version, "snapshot_revision:v2");
+        assert_eq!(
+            private_payload["snapshots"][0]["semantic_envelope"]["revision_v2_hash"]
+                .as_str()
+                .map(|hash| blinded_revision_key(&fixture[..MIN_AUDIT_KEY_BYTES], hash)),
+            Some(report.sessions[0].revision_key.clone())
+        );
+        assert_eq!(report.oversized_file_count, 0);
+        assert!(report.census_complete);
         assert_eq!(report.context_curve_evidence_scope, "source_native");
         assert_eq!(report.component_contract_version, "snapshot_semantic:v1");
         assert_eq!(
@@ -807,7 +821,7 @@ mod tests {
                 <= MAX_LEGACY_POLICY_CANDIDATES
         );
         let golden: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../fixtures/snapshot-audit/v4-golden-keys.json"
+            "../../../fixtures/snapshot-audit/v5-golden-keys.json"
         ))
         .expect("parse golden keys");
         assert_eq!(
@@ -1193,7 +1207,7 @@ mod tests {
     }
 
     #[test]
-    fn policy_neutral_and_revision_keys_ignore_upload_policy() {
+    fn policy_neutral_keys_ignore_policy_while_v2_revision_keys_bind_it() {
         let fixture = include_bytes!("../../../fixtures/snapshot-audit/pi-session.jsonl");
         let key = &fixture[..MIN_AUDIT_KEY_BYTES];
         let root = temp_dir("policy-boundary");
@@ -1250,7 +1264,7 @@ mod tests {
         assert_ne!(original_sensitive, stripped_sensitive);
         let original_revision = snapshot_revision_key(key, SnapshotSource::Pi, &original);
         let golden: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../fixtures/snapshot-audit/v4-golden-keys.json"
+            "../../../fixtures/snapshot-audit/v5-golden-keys.json"
         ))
         .expect("parse golden keys");
         assert_eq!(
@@ -1260,7 +1274,7 @@ mod tests {
                 .expect("golden revision key")
         );
         let stripped_revision = snapshot_revision_key(key, SnapshotSource::Pi, &stripped);
-        assert_eq!(original_revision, stripped_revision);
+        assert_ne!(original_revision, stripped_revision);
         let mut later_observation = stripped.clone();
         later_observation.collected_at = "2026-07-22T09:00:00Z".to_string();
         assert_eq!(

@@ -2666,10 +2666,8 @@ pub(crate) fn item_bytes(item: &SnapshotItem) -> usize {
         item.cache_handshake();
     let mut envelope = super::SnapshotSemanticEnvelope {
         component_contract_version: super::SNAPSHOT_SEMANTIC_CONTRACT_VERSION,
-        revision_contract_version: super::SNAPSHOT_REVISION_CONTRACT_VERSION,
         upload_policy: policy,
         component_hashes,
-        revision_hash: hash.clone(),
         revision_v2_contract_version: super::SNAPSHOT_REVISION_V2_CONTRACT_VERSION,
         revision_v2_canonicalization: crate::canonical_json::CANONICAL_JSON_CONTRACT_VERSION,
         revision_v2_parser_version: source.parser_version(),

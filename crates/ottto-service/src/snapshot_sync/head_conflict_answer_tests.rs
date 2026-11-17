@@ -1266,7 +1266,7 @@ fn assert_rescan_claim(wire: &Value, answered: bool) {
     if answered {
         assert_eq!(envelope["forced_full_rescan"], true);
         assert!(envelope["rescan_from_revision_hash"].is_string());
-        assert!(envelope["revision_hash"].is_string());
+        assert!(envelope["revision_v2_hash"].is_string());
         assert!(wire["head_cas_contract"].is_string(), "enforced head CAS");
         assert!(envelope.get("base_head_etag").is_none(), "no expected head");
     }

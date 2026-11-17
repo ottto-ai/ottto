@@ -336,7 +336,20 @@ fn telemetry_only_cold_ram_restore_and_restart_preserve_switch_gap_and_side_call
                 .remove("head_cas_contract"),
             Some(json!("snapshot_head_etag:v1"))
         );
-        assert_eq!(old_wire, released, "only the batch declaration changes");
+        // Keep the released daemon sample frozen. Compare every other field.
+        let mut released_without_v1 = released.clone();
+        let envelope = released_without_v1["snapshots"][0]["semantic_envelope"]
+            .as_object_mut()
+            .unwrap();
+        assert_eq!(
+            envelope.remove("revision_contract_version"),
+            Some(json!("snapshot_revision:v1"))
+        );
+        assert!(envelope.remove("revision_hash").unwrap().is_string());
+        assert_eq!(
+            old_wire, released_without_v1,
+            "only the batch declaration and v1 revision fields change"
+        );
         println!(
             "OTEL_ONLY_RECEIVER_GOLDEN {}",
             serde_json::to_string(&request(&cold_page.scan.snapshots)).unwrap()

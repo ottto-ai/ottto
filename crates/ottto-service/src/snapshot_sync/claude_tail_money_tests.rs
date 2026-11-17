@@ -166,7 +166,6 @@ fn assert_cross_build_scope(raw: &Value, cross: &Value) {
     // permit any other component, content hash, money or ordering drift.
     for path in [
         "/source_file_fingerprint",
-        "/semantic_envelope/revision_hash",
         "/semantic_envelope/revision_v2_hash",
     ] {
         *restored
@@ -3557,7 +3556,11 @@ fn stray_row_echo_ack(
     let asked =
         serde_json::to_value(request(batch))?["cache_state_ack_contract"] == "cache_state_ack:v1";
     let mut response = ack(batch)?;
-    for (reference, item) in response.accepted_entities.iter_mut().zip(batch.iter().copied()) {
+    for (reference, item) in response
+        .accepted_entities
+        .iter_mut()
+        .zip(batch.iter().copied())
+    {
         let Some(state) = item.cache_observations_state.as_ref() else {
             continue;
         };
