@@ -39,8 +39,7 @@ fn cache_event_ack_restart_correction_and_missing_proof() {
     assert!(response.validate_entity_ack(&request).is_err());
     let legacy = accepted_batch(1);
     assert!(legacy.validate_entity_ack(&request).is_err());
-    response.accepted_entities[0].body_witness_digest =
-        Some(snapshot_upload_body_witness(&item));
+    response.accepted_entities[0].body_witness_digest = Some(snapshot_upload_body_witness(&item));
     let mut progress = test_upload_progress();
     let mut accepted = 0;
     upload_resumable_batches_with_body_witness(
@@ -113,14 +112,13 @@ fn cache_event_ack_restart_correction_and_missing_proof() {
     let prior = restored.accepted_cache_states[&statekey].clone();
     let mut corrected = item.clone();
     corrected.cache_base_head_etag = restored.accepted_cache_heads.get(&statekey).cloned();
-    corrected.cache_observations =
-        Some(crate::snapshots::cache_observations::CacheObservations {
-            schema_version: 1,
-            operations: Vec::new(),
-            coverage: "complete".into(),
-            omitted_observation_count: None,
-            full_replacement: false,
-        });
+    corrected.cache_observations = Some(crate::snapshots::cache_observations::CacheObservations {
+        schema_version: 1,
+        operations: Vec::new(),
+        coverage: "complete".into(),
+        omitted_observation_count: None,
+        full_replacement: false,
+    });
     crate::snapshots::prepare_cache_observations(&mut corrected, Some(&prior));
     assert_eq!(corrected.snapshot_fingerprint, item.snapshot_fingerprint);
     assert_ne!(
@@ -409,9 +407,7 @@ fn account_ack_retry_checkpoints_released_witness_then_becomes_noop() {
             session_ids: Vec::new(),
             disabled: false,
             disabled_reason: None,
-            entity_ack_contract: Some(
-                crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.to_string(),
-            ),
+            entity_ack_contract: Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.to_string()),
             accepted_entities: if unchanged {
                 vec![]
             } else {
@@ -2317,11 +2313,10 @@ fn backfill_finalization_is_idempotent_across_index_state_and_progress_crashes()
     progress
         .save(&progress_path)
         .expect("save accepted replay ledger");
-    assert!(pending_backfill_sources_for_destination(
-        &load_backfill_state(&root),
-        &destination
-    )
-    .contains(&SnapshotSource::Pi));
+    assert!(
+        pending_backfill_sources_for_destination(&load_backfill_state(&root), &destination)
+            .contains(&SnapshotSource::Pi)
+    );
 
     // A restart before the marker save re-derives the same entity but the
     // accepted ledger makes the network portion a no-op.
@@ -2354,11 +2349,10 @@ fn backfill_finalization_is_idempotent_across_index_state_and_progress_crashes()
     mark_backfill_complete_for_destination(&mut state, SnapshotSource::Pi, &destination);
     save_backfill_state(&root, &state).expect("save replay completion marker");
     resumed.clear(&progress_path).expect("clear final ledger");
-    assert!(!pending_backfill_sources_for_destination(
-        &load_backfill_state(&root),
-        &destination
-    )
-    .contains(&SnapshotSource::Pi));
+    assert!(
+        !pending_backfill_sources_for_destination(&load_backfill_state(&root), &destination)
+            .contains(&SnapshotSource::Pi)
+    );
     assert!(!progress_path.exists());
     ScanIndex::load(&index_path).expect("completed replay index remains durable");
     let _ = std::fs::remove_dir_all(root);

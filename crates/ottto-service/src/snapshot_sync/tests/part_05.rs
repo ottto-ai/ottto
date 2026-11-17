@@ -188,10 +188,7 @@ fn snapshot_status_server(captured: Arc<Mutex<Vec<String>>>) -> String {
     snapshot_status_server_with_hints(captured, vec![30])
 }
 
-fn snapshot_status_server_with_hints(
-    captured: Arc<Mutex<Vec<String>>>,
-    hints: Vec<u64>,
-) -> String {
+fn snapshot_status_server_with_hints(captured: Arc<Mutex<Vec<String>>>, hints: Vec<u64>) -> String {
     snapshot_status_server_with_hint_extras(
         captured,
         hints.into_iter().map(|days| (days, "")).collect(),
@@ -230,17 +227,21 @@ fn snapshot_status_server_with_hint_extras_and_batch(
                     .lock()
                     .expect("capture snapshot status request")
                     .push(request);
-                r#"{"token":"relay-token-codex","expires_at":"2026-06-01T10:15:00Z"}"#
-                    .to_string()
+                r#"{"token":"relay-token-codex","expires_at":"2026-06-01T10:15:00Z"}"#.to_string()
             } else if request.contains("/agent-session-snapshots/batches") {
                 let items = batch.as_ref().expect("expected snapshot upload");
-                let entities = items.iter().map(|item| {
-                    let version = crate::snapshot_client::snapshot_ack_body_witness_version(item).unwrap();
-                    serde_json::json!({"source_session_id":item.source_session_id,
+                let entities = items
+                    .iter()
+                    .map(|item| {
+                        let version =
+                            crate::snapshot_client::snapshot_ack_body_witness_version(item)
+                                .unwrap();
+                        serde_json::json!({"source_session_id":item.source_session_id,
                         "snapshot_fingerprint":item.snapshot_fingerprint,"occurrence_count":1,
                         "body_witness_version":version,
                         "body_witness_digest":version.map(|_|snapshot_upload_body_witness(item))})
-                }).collect::<Vec<_>>();
+                    })
+                    .collect::<Vec<_>>();
                 captured.lock().unwrap().push(request);
                 serde_json::json!({"accepted":items.len(),"sessions_reconciled":items.len(),
                     "session_ids":[],"disabled":false,"disabled_reason":null,

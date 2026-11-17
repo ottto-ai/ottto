@@ -260,7 +260,8 @@ fn retry_copy_keeps_compaction_events_and_never_local_context_points() {
 fn machine_icon_cache_preserves_missing_null_and_blank_echoes() {
     let root = crate::test_scratch::ScratchDir::new("machine-icon-cache");
     let path = root.join("machine_icon.json");
-    let cached = r#"{"machine_id":"otm_test","icon_url":"https://example.test/old.png","icon_version":7}"#;
+    let cached =
+        r#"{"machine_id":"otm_test","icon_url":"https://example.test/old.png","icon_version":7}"#;
     for echo in [
         None,
         Some(serde_json::Value::Null),
@@ -288,7 +289,11 @@ fn machine_icon_cache_preserves_missing_null_and_blank_echoes() {
 fn machine_icon_cache_replaces_valid_echo_and_keeps_machine_identity() {
     let root = crate::test_scratch::ScratchDir::new("machine-icon-replacement");
     let path = root.join("machine_icon.json");
-    std::fs::write(&path, r#"{"machine_id":"otm_test","icon_url":"https://example.test/old.png","icon_version":7}"#).unwrap();
+    std::fs::write(
+        &path,
+        r#"{"machine_id":"otm_test","icon_url":"https://example.test/old.png","icon_version":7}"#,
+    )
+    .unwrap();
     for machine_id in ["otm_test", "otm_other"] {
         let response = serde_json::from_value(serde_json::json!({
             "accepted":1,"machine_id":machine_id,"sources":["codex"],
@@ -362,8 +367,7 @@ fn cache_pending_head_lifecycle_survives_finish_and_targets_only_accepted_head()
         .files
         .insert("synthetic/unrelated.jsonl".into(), other.clone());
     let mut progress = test_upload_progress();
-    let root =
-        std::env::temp_dir().join(format!("ottto-pending-head-{}", unique_poison_scope()));
+    let root = std::env::temp_dir().join(format!("ottto-pending-head-{}", unique_poison_scope()));
     std::fs::create_dir_all(&root).unwrap();
     let path = root.join("progress.json");
     progress
@@ -599,8 +603,7 @@ fn cache_pending_head_two_files_multi_siblings_survive_partial_cache_settlement(
     index.save(&index_path).unwrap();
     let namespace = progress.destination_namespace_hash.clone();
     let witness = progress.active_quarantine_witness.clone().unwrap();
-    progress =
-        SnapshotUploadProgress::load(&progress_path, &namespace, witness.clone()).unwrap();
+    progress = SnapshotUploadProgress::load(&progress_path, &namespace, witness.clone()).unwrap();
     assert!(progress.accepted_cache_heads.is_empty());
     assert_eq!(progress.pending_cache_heads.len(), 2);
     // Exact ordinary repeat acquires real ACK-owned head through bootstrap.
@@ -763,8 +766,7 @@ fn cache_pending_head_two_files_multi_siblings_survive_partial_cache_settlement(
     assert!(new_generation
         .pending_cache_heads
         .values()
-        .all(|pending| pending.settled_entities.is_empty()
-            && pending.reselected_heads.is_empty()));
+        .all(|pending| pending.settled_entities.is_empty() && pending.reselected_heads.is_empty()));
     let different_namespace_path = root.join("different_namespace_progress.json");
     std::fs::copy(&progress_path, &different_namespace_path).unwrap();
     let unrelated = SnapshotUploadProgress::load(
@@ -1071,13 +1073,7 @@ fn cache_effective_wire_projection_matches_index_retractions_and_held_local_evid
         let mut wire_index = baseline.clone();
         if !held {
             for item in &mut wire_scan.snapshots {
-                prepare_snapshot_cache_for_upload(
-                    item,
-                    &progress,
-                    enabled,
-                    true,
-                    &BTreeSet::new(),
-                );
+                prepare_snapshot_cache_for_upload(item, &progress, enabled, true, &BTreeSet::new());
             }
         }
         finalize_scan_after_policy(SnapshotSource::Codex, &mut wire_scan, &mut wire_index);
@@ -1216,9 +1212,9 @@ fn cache_effective_wire_mandatory_head_obligation_survives_finalizer_noop() {
         Ok(ack)
     };
     let mut index = ScanIndex::default();
-    index.activate_effective_upload_body_witness_revision(
-        effective_upload_body_witness_revision(SnapshotSource::Codex),
-    );
+    index.activate_effective_upload_body_witness_revision(effective_upload_body_witness_revision(
+        SnapshotSource::Codex,
+    ));
     index.activate_upload_context("cache-off".into());
     let mut progress = test_upload_progress();
     let mut off = scan(&mut index);
@@ -1373,9 +1369,9 @@ fn cache_effective_wire_mandatory_head_obligation_survives_finalizer_noop() {
     progress.finish_cycle(&progress_path).unwrap();
     let mut loaded = ScanIndex::load(&index_path).unwrap();
     loaded.activate_upload_context("cache-on-mandatory".into());
-    loaded.activate_effective_upload_body_witness_revision(
-        effective_upload_body_witness_revision(SnapshotSource::Codex),
-    );
+    loaded.activate_effective_upload_body_witness_revision(effective_upload_body_witness_revision(
+        SnapshotSource::Codex,
+    ));
     let mut progress = SnapshotUploadProgress::load(
         &progress_path,
         &progress.destination_namespace_hash,
@@ -1387,9 +1383,7 @@ fn cache_effective_wire_mandatory_head_obligation_survives_finalizer_noop() {
     // Missing authority remains explicitly pending; the file stays owed
     // under the new context until its exact ACK.
     assert_eq!(
-        crate::snapshots::e2_pipeline_scan_fixture::upload_context_unproven_files_for_test(
-            &loaded
-        ),
+        crate::snapshots::e2_pipeline_scan_fixture::upload_context_unproven_files_for_test(&loaded),
         1
     );
     // Existing exact ordinary CAS transport supplies the actual prerequisite;
@@ -1469,9 +1463,9 @@ fn cache_effective_wire_mandatory_head_obligation_survives_finalizer_noop() {
 fn cache_effective_wire_unchanged_capability_enable_reads_nothing() {
     let root = cache_effective_wire_fixture_root();
     let mut index = ScanIndex::default();
-    index.activate_effective_upload_body_witness_revision(
-        effective_upload_body_witness_revision(SnapshotSource::Codex),
-    );
+    index.activate_effective_upload_body_witness_revision(effective_upload_body_witness_revision(
+        SnapshotSource::Codex,
+    ));
     index.activate_upload_context("cache-off".into());
     let scan = |index: &mut ScanIndex| {
         crate::snapshots::scan_source_roots_with_test_limit(
@@ -1500,9 +1494,7 @@ fn cache_effective_wire_unchanged_capability_enable_reads_nothing() {
         &mut off,
         &mut index,
         |item| {
-            effective_snapshot_upload_body_witness(
-                item, &progress, false, false, &legacy, &held,
-            )
+            effective_snapshot_upload_body_witness(item, &progress, false, false, &legacy, &held)
         },
     );
     assert!(
@@ -1582,9 +1574,7 @@ fn cache_effective_wire_unchanged_capability_enable_reads_nothing() {
         SnapshotSource::Codex,
         &mut on,
         &mut index,
-        |item| {
-            effective_snapshot_upload_body_witness(item, &progress, true, false, &legacy, &held)
-        },
+        |item| effective_snapshot_upload_body_witness(item, &progress, true, false, &legacy, &held),
     );
     assert_eq!(
         on.snapshots.len(),
@@ -1814,8 +1804,7 @@ fn unchanged_ack_with_usage_identical_does_not_mark_emitted() {
         let fingerprint = item.snapshot_fingerprint.clone();
         let body = snapshot_upload_body_witness(&item);
         let mut response = accepted_batch(1);
-        response.entity_ack_contract =
-            Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
+        response.entity_ack_contract = Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
         response
             .unchanged_entities
             .push(crate::snapshot_client::SnapshotEntityRef {
@@ -1938,8 +1927,7 @@ fn held_unchanged_body_never_blocks_a_later_different_body() {
                     |item| item.snapshot_fingerprint.as_str(),
                     snapshot_upload_body_witness,
                     |items: &[&SnapshotItem]| {
-                        offered
-                            .extend(items.iter().map(|item| item.snapshot_fingerprint.clone()));
+                        offered.extend(items.iter().map(|item| item.snapshot_fingerprint.clone()));
                         Ok(response.clone())
                     },
                     |_| Ok(()),
@@ -2216,8 +2204,7 @@ fn combined_revision_wire_uses_same_scan_index_and_ack_predecessor() {
             );
         }
         let mut response = accepted_batch(1);
-        response.entity_ack_contract =
-            Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
+        response.entity_ack_contract = Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
         response
             .accepted_entities
             .push(crate::snapshot_client::SnapshotEntityRef {

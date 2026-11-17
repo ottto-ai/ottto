@@ -56,12 +56,24 @@ fn unlocated_validation_failure_keeps_whole_batch_pending() {
     let mut progress = test_upload_progress();
     let mut accepted = 0;
     let mut attempts = 0;
-    let error = upload_resumable_batches(&items, &unique_poison_scope(), &mut progress,
-        &mut accepted, String::as_str, |batch| {
+    let error = upload_resumable_batches(
+        &items,
+        &unique_poison_scope(),
+        &mut progress,
+        &mut accepted,
+        String::as_str,
+        |batch| {
             attempts += 1;
-            Err(anyhow::Error::new(BatchRejected::from_response(422,
-                br#"{"errors":[{"loc":["body","snapshots",0,"field"]},{"loc":["body","other"]}]}"#.as_slice(), batch.len())))
-        }, |_| Ok(())).expect_err("mixed locations cannot isolate entities");
+            Err(anyhow::Error::new(BatchRejected::from_response(
+                422,
+                br#"{"errors":[{"loc":["body","snapshots",0,"field"]},{"loc":["body","other"]}]}"#
+                    .as_slice(),
+                batch.len(),
+            )))
+        },
+        |_| Ok(()),
+    )
+    .expect_err("mixed locations cannot isolate entities");
     assert!(error
         .downcast_ref::<BatchRejected>()
         .unwrap()
@@ -108,8 +120,13 @@ fn held_validation_rejection_prunes_old_accepted_revisions_from_progress() {
             |batch| {
                 if batch.contains(&&poison) {
                     let index = batch.iter().position(|item| *item == &poison).unwrap();
-                    Err(anyhow::Error::new(BatchRejected::from_response(422,
-                        serde_json::json!({"errors":[{"loc":["body","snapshots",index,"field"]}]}).to_string().as_bytes(), batch.len())))
+                    Err(anyhow::Error::new(BatchRejected::from_response(
+                        422,
+                        serde_json::json!({"errors":[{"loc":["body","snapshots",index,"field"]}]})
+                            .to_string()
+                            .as_bytes(),
+                        batch.len(),
+                    )))
                 } else {
                     Ok(accepted_batch(batch.len()))
                 }
@@ -140,9 +157,8 @@ fn held_validation_rejection_prunes_old_accepted_revisions_from_progress() {
 
 #[test]
 fn snapshot_upload_progress_path_stays_policy_scoped() {
-    let index = Path::new(
-        "/support/snapshots/codex-scan-index-attribution-key-attribution-labels.json",
-    );
+    let index =
+        Path::new("/support/snapshots/codex-scan-index-attribution-key-attribution-labels.json");
 
     assert_eq!(
         snapshot_upload_progress_path(index),
@@ -154,13 +170,10 @@ fn snapshot_upload_progress_path_stays_policy_scoped() {
 
 #[test]
 fn snapshot_v2_index_isolated_from_old_daemon_path() {
-    let v1 =
-        Path::new("/support/snapshots/destinations/hash/codex-scan-index-attribution.json");
+    let v1 = Path::new("/support/snapshots/destinations/hash/codex-scan-index-attribution.json");
     assert_eq!(
         snapshot_v2_index_path(v1),
-        PathBuf::from(
-            "/support/snapshots/destinations/hash/codex-scan-index-attribution-v2.json"
-        )
+        PathBuf::from("/support/snapshots/destinations/hash/codex-scan-index-attribution-v2.json")
     );
     assert_eq!(
         snapshot_upload_progress_path(&snapshot_v2_index_path(v1)),
@@ -300,8 +313,7 @@ fn snapshot_upload_progress_cas_stamps_and_quarantine_overlap() {
     let mut progress = SnapshotUploadProgress::new(namespace, test_quarantine_witness());
     progress.quarantine_body(&"a".repeat(64), &"b".repeat(64));
     progress.save(&path).expect("initial progress");
-    let saved: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     let generation = progress.generation;
     for (field, value) in [
         (
@@ -381,8 +393,7 @@ fn snapshot_upload_progress_quarantines_unbounded_retry_deadline() {
         fingerprint,
         SnapshotQuarantineRecord {
             contract_retry_claims: None,
-            reconstruction_contract:
-                crate::snapshots::terminal_contract_retry::current_contract(),
+            reconstruction_contract: crate::snapshots::terminal_contract_retry::current_contract(),
             witness: test_quarantine_witness(),
             retry_after_unix_seconds: u64::MAX,
             upload_body_witness: None,
@@ -561,11 +572,7 @@ fn due_not_pending_quarantine_resends_once_and_paces_local_holds() {
         crate::snapshots::BACKFILL_WINDOW_DAYS,
     )
     .expect("seed manifest-present revision");
-    crate::snapshots::finalize_scan_after_policy(
-        SnapshotSource::Pi,
-        &mut first_scan,
-        &mut index,
-    );
+    crate::snapshots::finalize_scan_after_policy(SnapshotSource::Pi, &mut first_scan, &mut index);
     let fingerprint = first_scan.snapshots[0].snapshot_fingerprint.clone();
     assert_eq!(index.file_snapshot_fingerprints.len(), 2);
     assert!(index
@@ -613,11 +620,7 @@ fn due_not_pending_quarantine_resends_once_and_paces_local_holds() {
         "source hold must not acquire the transcript"
     );
     assert!(scan.snapshots.is_empty());
-    assert!(progress.defer_held_quarantine_retries(
-        &scan.snapshots,
-        &index,
-        SnapshotSource::Pi
-    ));
+    assert!(progress.defer_held_quarantine_retries(&scan.snapshots, &index, SnapshotSource::Pi));
     assert!(!scan.census_complete);
     let mut accepted = 0;
     let mut upload_calls = 0;
@@ -655,8 +658,7 @@ fn due_not_pending_quarantine_resends_once_and_paces_local_holds() {
     // absent from its candidate queue, just like the four quarantines observed live.
     let mut state = serde_json::to_value(&index).unwrap();
     state["traversal"]["scan_roots"] = serde_json::json!([root]);
-    state["traversal"]["observed_index_keys"] =
-        serde_json::json!([session_path, duplicate_path]);
+    state["traversal"]["observed_index_keys"] = serde_json::json!([session_path, duplicate_path]);
     assert_eq!(
         state["traversal"]["pending_candidates"],
         serde_json::json!([])
@@ -698,8 +700,7 @@ fn due_not_pending_quarantine_resends_once_and_paces_local_holds() {
         SnapshotQuarantineDisposition::SupersededTerminal
     );
     assert!(progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints));
-    let hints =
-        save_terminal_contract_claims_for_scan(&mut index, &progress, &index_path).unwrap();
+    let hints = save_terminal_contract_claims_for_scan(&mut index, &progress, &index_path).unwrap();
     assert_eq!(hints, vec![session_path.clone()]);
     assert_eq!(
         ScanIndex::load(&index_path)
@@ -707,19 +708,18 @@ fn due_not_pending_quarantine_resends_once_and_paces_local_holds() {
             .quarantined_snapshot_fingerprints[&fingerprint],
         progress.quarantined_fingerprints[&fingerprint]
     );
-    let (pending, reads) =
-        crate::snapshots::terminal_contract_retry::source_acquisitions(|| {
-            crate::snapshots::scan_source_roots_with_test_limit_and_hints(
-                SnapshotSource::Pi,
-                std::slice::from_ref(&root),
-                &mut index,
-                collected_at,
-                crate::snapshots::BACKFILL_WINDOW_DAYS,
-                0,
-                &hints,
-            )
-            .unwrap()
-        });
+    let (pending, reads) = crate::snapshots::terminal_contract_retry::source_acquisitions(|| {
+        crate::snapshots::scan_source_roots_with_test_limit_and_hints(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            collected_at,
+            crate::snapshots::BACKFILL_WINDOW_DAYS,
+            0,
+            &hints,
+        )
+        .unwrap()
+    });
     assert!(reads.is_empty());
     assert!(pending.snapshots.is_empty());
     assert!(index.quarantine_retry_is_queued(&fingerprint));
@@ -732,29 +732,24 @@ fn due_not_pending_quarantine_resends_once_and_paces_local_holds() {
         progress.quarantined_fingerprints[&fingerprint].retry_after_unix_seconds,
         0
     );
-    let (mut retry, reads) =
-        crate::snapshots::terminal_contract_retry::source_acquisitions(|| {
-            crate::snapshots::scan_source_roots_with_test_limit_and_hints(
-                SnapshotSource::Pi,
-                std::slice::from_ref(&root),
-                &mut index,
-                collected_at,
-                crate::snapshots::BACKFILL_WINDOW_DAYS,
-                1,
-                &hints,
-            )
-            .unwrap()
-        });
+    let (mut retry, reads) = crate::snapshots::terminal_contract_retry::source_acquisitions(|| {
+        crate::snapshots::scan_source_roots_with_test_limit_and_hints(
+            SnapshotSource::Pi,
+            std::slice::from_ref(&root),
+            &mut index,
+            collected_at,
+            crate::snapshots::BACKFILL_WINDOW_DAYS,
+            1,
+            &hints,
+        )
+        .unwrap()
+    });
     crate::snapshots::finalize_scan_after_policy(SnapshotSource::Pi, &mut retry, &mut index);
     assert_eq!(reads.values().sum::<usize>(), 1);
     assert_eq!(reads.get(&session_path), Some(&1));
     assert_eq!(retry.snapshots.len(), 1);
     assert_eq!(retry.snapshots[0].snapshot_fingerprint, fingerprint);
-    assert!(!progress.defer_held_quarantine_retries(
-        &retry.snapshots,
-        &index,
-        SnapshotSource::Pi
-    ));
+    assert!(!progress.defer_held_quarantine_retries(&retry.snapshots, &index, SnapshotSource::Pi));
     // The existing DNS incident class fails before a batch can be sent.
     let unsent = upload_resumable_batches(
         &retry.snapshots,
@@ -835,8 +830,7 @@ fn due_not_pending_quarantine_resends_once_and_paces_local_holds() {
     index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
     index.retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
     assert!(!progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints));
-    let hints =
-        save_terminal_contract_claims_for_scan(&mut index, &progress, &index_path).unwrap();
+    let hints = save_terminal_contract_claims_for_scan(&mut index, &progress, &index_path).unwrap();
     assert!(hints.is_empty());
     let (quiet, reads) = crate::snapshots::terminal_contract_retry::source_acquisitions(|| {
         crate::snapshots::scan_source_roots_with_test_limit_and_hints(
@@ -1065,9 +1059,8 @@ fn admission_native_hourly_bodies_recover_without_losing_usage_or_siblings() {
         snapshot_upload_body_witness,
         |batch| {
             let req = request(source, batch.to_vec());
-            validate_snapshot_batch_request(&req).map_err(|reason| {
-                anyhow::Error::new(SnapshotBatchPreflightRejected { reason })
-            })?;
+            validate_snapshot_batch_request(&req)
+                .map_err(|reason| anyhow::Error::new(SnapshotBatchPreflightRejected { reason }))?;
             sent.extend(req.snapshots.iter().map(|item| {
                 (
                     item.source_session_id.clone(),
@@ -1106,8 +1099,7 @@ fn admission_reoffer_replaces_stale_terminal_progress_and_survives_restart() {
     let namespace = "c".repeat(64);
     let fingerprint = "a".repeat(64);
     let sibling = "b".repeat(64);
-    let mut progress =
-        SnapshotUploadProgress::new(namespace.clone(), test_quarantine_witness());
+    let mut progress = SnapshotUploadProgress::new(namespace.clone(), test_quarantine_witness());
     progress
         .active_quarantine_witness
         .as_mut()
@@ -1127,14 +1119,12 @@ fn admission_reoffer_replaces_stale_terminal_progress_and_survives_restart() {
     let index_path = root.join("index.json");
     assert!(index.prepare_snapshot_admission_reoffer(50));
     index.save(&index_path).unwrap();
-    progress =
-        SnapshotUploadProgress::load(&path, &namespace, test_quarantine_witness()).unwrap();
+    progress = SnapshotUploadProgress::load(&path, &namespace, test_quarantine_witness()).unwrap();
     assert!(progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints));
     assert!(progress.active_quarantine_retries.contains(&fingerprint));
     assert!(progress.contains(&sibling));
     progress.save(&path).unwrap();
-    progress =
-        SnapshotUploadProgress::load(&path, &namespace, test_quarantine_witness()).unwrap();
+    progress = SnapshotUploadProgress::load(&path, &namespace, test_quarantine_witness()).unwrap();
     assert!(
         progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints),
         "restart keeps the unsent admission re-offer due"
@@ -1173,8 +1163,7 @@ fn admission_reoffer_replaces_stale_terminal_progress_and_survives_restart() {
     index.retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
     assert!(!index.prepare_snapshot_admission_reoffer(50));
     let mut unrelated =
-        SnapshotUploadProgress::load(&path, &"d".repeat(64), test_quarantine_witness())
-            .unwrap();
+        SnapshotUploadProgress::load(&path, &"d".repeat(64), test_quarantine_witness()).unwrap();
     assert!(unrelated.accepted_fingerprints.is_empty());
     assert!(unrelated.quarantined_fingerprints.is_empty());
     assert!(!unrelated.prepare_quarantine_retries(&BTreeMap::new()));
@@ -1299,10 +1288,8 @@ fn supersede_while_quarantined_preserves_absence_holds_and_retry_budgets() {
             _ => unreachable!(),
         }
         let before = blocked.quarantined_fingerprints[&stale].clone();
-        blocked.retain_current_quarantines(
-            &BTreeSet::from([current.clone(), stale.clone()]),
-            &index,
-        );
+        blocked
+            .retain_current_quarantines(&BTreeSet::from([current.clone(), stale.clone()]), &index);
         assert_eq!(blocked.quarantined_fingerprints[&stale], before, "{guard}");
         assert!(blocked.active_reason_reoffers.is_empty());
     }
@@ -1331,18 +1318,18 @@ fn legacy_reconciliation_is_fail_closed_until_exact_existing_entity_ack() {
         }),
     );
     assert!(rejected_bool.is_err(), "accepted:false is not a batch ACK");
-    let rejected_status = serde_json::from_value::<
-        crate::snapshot_client::SnapshotStatusResponse,
-    >(serde_json::json!({
-        "accepted": false,
-        "source": "codex",
-        "machine_id": "otm_test",
-        "disabled": false,
-        "disabled_reason": null,
-        "settlement_ack": {
-            "accepted_snapshot_fingerprints": [fingerprint.clone()]
-        }
-    }))
+    let rejected_status = serde_json::from_value::<crate::snapshot_client::SnapshotStatusResponse>(
+        serde_json::json!({
+            "accepted": false,
+            "source": "codex",
+            "machine_id": "otm_test",
+            "disabled": false,
+            "disabled_reason": null,
+            "settlement_ack": {
+                "accepted_snapshot_fingerprints": [fingerprint.clone()]
+            }
+        }),
+    )
     .expect("forward-tolerant status receipt");
     assert!(!rejected_status.accepted);
 
@@ -1555,8 +1542,7 @@ fn copy_capability_context_preserves_partial_ack_progress_after_restart() {
     let path = root.join("progress.json");
     let destination = "d".repeat(64);
     let entity = "e".repeat(64);
-    let mut progress =
-        SnapshotUploadProgress::new(destination.clone(), test_quarantine_witness());
+    let mut progress = SnapshotUploadProgress::new(destination.clone(), test_quarantine_witness());
     progress.accepted_fingerprints.insert(entity.clone());
     progress
         .accepted_body_witnesses
@@ -1682,14 +1668,9 @@ fn endpoint_load_failure_during_scan_is_local_state() {
             safe_error(&load_error),
             "connection binding is unavailable or invalid; reconnect this device"
         );
-        let error = ensure_snapshot_scan_authority(
-            &device,
-            SnapshotSource::Pi,
-            &client,
-            &account,
-            &daemon,
-        )
-        .unwrap_err();
+        let error =
+            ensure_snapshot_scan_authority(&device, SnapshotSource::Pi, &client, &account, &daemon)
+                .unwrap_err();
         assert_eq!(
             snapshot_upload_error_class(&error),
             Some(SnapshotUploadErrorClass::LocalState)
@@ -2043,9 +2024,7 @@ fn local_health_upload_refreshes_inactive_device_before_retry() {
                     SnapshotSource::Codex,
                     Duration::from_secs(5),
                 )
-                .expect_err(
-                    "another snapshot caller observes the initial authorization rejection",
-                );
+                .expect_err("another snapshot caller observes the initial authorization rejection");
         }
         let client = SnapshotApiClient::new(api_base_url);
         let result = upload_local_health_projection_reporting(
@@ -2093,9 +2072,7 @@ fn local_health_upload_refreshes_inactive_device_before_retry() {
         let requests = captured.lock().expect("captured requests").clone();
         assert_eq!(requests.len(), 5);
         assert!(requests[0].contains("POST /api/v1/telemetry/devices/device_test/relay-token"));
-        assert!(
-            requests[1].contains("POST /api/v1/setup-runs/setup_stale/local-client/refresh")
-        );
+        assert!(requests[1].contains("POST /api/v1/setup-runs/setup_stale/local-client/refresh"));
         assert!(requests[1].contains("\"device_secret\":\"device-secret\""));
         assert!(requests[2].contains("POST /api/v1/telemetry/devices/device_test/relay-token"));
         assert!(requests[3].contains("POST /api/v1/apps/health/heartbeat"));
@@ -2129,10 +2106,7 @@ struct SourceControlBackend {
     _guards: [EnvVarGuard; 2],
 }
 
-fn source_control_backend(
-    sources: &[&str],
-    replies: &[(&str, u64, &str)],
-) -> SourceControlBackend {
+fn source_control_backend(sources: &[&str], replies: &[(&str, u64, &str)]) -> SourceControlBackend {
     clear_setup_run_refresh_hold();
     let root = test_dir("source-control-heartbeat");
     let support_dir = root.join("support");
@@ -2250,8 +2224,7 @@ fn all_sources_paused_heartbeat_still_runs() {
 #[test]
 #[serial]
 fn cycle_heartbeat_off_skips_source_same_cycle() {
-    let backend =
-        source_control_backend(&["codex", "claude_code"], &[("codex", 1, "disabled")]);
+    let backend = source_control_backend(&["codex", "claude_code"], &[("codex", 1, "disabled")]);
     assert_eq!(enabled_snapshot_sources(&backend.device).len(), 2);
     let sources = cycle_heartbeat(
         &SnapshotApiClient::new(backend.api_base_url.as_str()),
@@ -2367,9 +2340,7 @@ fn local_health_upload_holds_after_rejected_refresh_until_the_binding_changes() 
     pass();
     let captured = captured.lock().expect("captured requests").clone();
     assert_eq!(captured.len(), 4, "the reattached binding is tried again");
-    assert!(
-        captured[3].contains("POST /api/v1/setup-runs/setup_reattached/local-client/refresh")
-    );
+    assert!(captured[3].contains("POST /api/v1/setup-runs/setup_reattached/local-client/refresh"));
 
     clear_setup_run_refresh_hold();
     let _ = std::fs::remove_dir_all(root);

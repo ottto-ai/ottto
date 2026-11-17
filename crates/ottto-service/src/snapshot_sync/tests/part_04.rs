@@ -1251,8 +1251,7 @@ fn retry_pending_debt_elsewhere_marks_the_sweep_only_with_a_second_cause() {
         progress_blocking: false,
     };
     let progress = test_upload_progress();
-    let completed =
-        settle_completed_upload(committed.clone(), &committed, &progress, &debt_only);
+    let completed = settle_completed_upload(committed.clone(), &committed, &progress, &debt_only);
     assert!(!completed.index.bounded_sweep_had_unsettled_upload());
     assert!(completed
         .index
@@ -1701,8 +1700,7 @@ fn receipts_carry_the_scan_index_manifest_once_a_scan_has_published_one() {
         machine_id: Some("otm_test".to_string()),
         sources: vec!["codex".to_string()],
     };
-    let destination_namespace =
-        &snapshot_upload_destination_namespace(&device, "device-secret");
+    let destination_namespace = &snapshot_upload_destination_namespace(&device, "device-secret");
 
     // Before any scan completes the manifest is absent, not zeroed: a
     // fabricated `entity_count: 0` would read as "this machine has nothing",
@@ -1722,8 +1720,7 @@ fn receipts_carry_the_scan_index_manifest_once_a_scan_has_published_one() {
     assert!(!requests[1].contains("\"manifest\""));
 
     let scratch = crate::test_scratch::ScratchDir::new("scan-manifest-index");
-    let mut index =
-        ScanIndex::load(&scratch.join("scan-index.json")).expect("empty scan index");
+    let mut index = ScanIndex::load(&scratch.join("scan-index.json")).expect("empty scan index");
     index.file_snapshot_fingerprints.insert(
         "/tmp/rollout-session-1.jsonl".to_string(),
         BTreeSet::from(["a".repeat(64)]),
@@ -1754,9 +1751,7 @@ fn receipts_carry_the_scan_index_manifest_once_a_scan_has_published_one() {
         .expect("report check-in after a scan");
         let requests = captured.lock().expect("captured requests").clone();
         assert!(requests[1].contains("\"entity_count\":1"));
-        assert!(
-            requests[1].contains(&format!("\"rolling_hash\":\"{}\"", manifest.rolling_hash))
-        );
+        assert!(requests[1].contains(&format!("\"rolling_hash\":\"{}\"", manifest.rolling_hash)));
         // The scope and window travel with the count. Without them a
         // consumer would compare this against its whole stored set and
         // report a mismatch for every session the historical bootstrap
@@ -2033,9 +2028,8 @@ fn replay_scan_discovers_session_older_than_policy_window() {
         .open(&path)
         .expect("open old replay fixture")
         .set_times(
-            std::fs::FileTimes::new().set_modified(
-                std::time::UNIX_EPOCH + std::time::Duration::from_secs(old_mtime),
-            ),
+            std::fs::FileTimes::new()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(old_mtime)),
         )
         .expect("set old replay fixture mtime");
 

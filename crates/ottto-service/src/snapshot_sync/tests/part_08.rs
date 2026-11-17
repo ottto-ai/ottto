@@ -132,8 +132,7 @@ fn codex_union_native_transport_partial_rejection_keeps_capture_and_quarantine_g
             "source_session_id":rejected.source_session_id,"snapshot_fingerprint":rejected.snapshot_fingerprint,
             "reason":"invalid","detail":"synthetic rejection","permanent":true,"occurrence_count":1}]}).to_string();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let client =
-            SnapshotApiClient::new(format!("http://{}", listener.local_addr().unwrap()));
+        let client = SnapshotApiClient::new(format!("http://{}", listener.local_addr().unwrap()));
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let request = read_complete_http_request(&mut stream);
@@ -348,9 +347,17 @@ fn codex_union_native_transport_restart(priority: bool, lose_member_after_ack: b
         .with_receipt_state_dir(&receipt_dir);
     let representative = &result.snapshots[0];
     let version = match crate::snapshots::snapshot_upload_body_witness_version(representative) {
-        Some(crate::snapshots::SNAPSHOT_BODY_WITNESS_ENVELOPE_SESSION_ACCOUNT_VERSION) => Some(crate::snapshot_client::SNAPSHOT_BODY_WITNESS_PUBLIC_SESSION_ACCOUNT_VERSION),
-        Some(crate::snapshots::SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_SESSION_ACCOUNT_VERSION) => Some(crate::snapshot_client::SNAPSHOT_BODY_WITNESS_PUBLIC_EXCLUSIVE_SESSION_ACCOUNT_VERSION),
-        None | Some(crate::snapshots::SNAPSHOT_BODY_WITNESS_ENVELOPE_TOOL_VERSION) | Some(crate::snapshots::SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_TOOL_VERSION) => None,
+        Some(crate::snapshots::SNAPSHOT_BODY_WITNESS_ENVELOPE_SESSION_ACCOUNT_VERSION) => {
+            Some(crate::snapshot_client::SNAPSHOT_BODY_WITNESS_PUBLIC_SESSION_ACCOUNT_VERSION)
+        }
+        Some(
+            crate::snapshots::SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_SESSION_ACCOUNT_VERSION,
+        ) => Some(
+            crate::snapshot_client::SNAPSHOT_BODY_WITNESS_PUBLIC_EXCLUSIVE_SESSION_ACCOUNT_VERSION,
+        ),
+        None
+        | Some(crate::snapshots::SNAPSHOT_BODY_WITNESS_ENVELOPE_TOOL_VERSION)
+        | Some(crate::snapshots::SNAPSHOT_BODY_WITNESS_ENVELOPE_EXCLUSIVE_TOOL_VERSION) => None,
         other => panic!("unexpected synthetic union body witness {other:?}"),
     };
     let ack = serde_json::json!({"accepted":1,"sessions_reconciled":1,"session_ids":[],"disabled":false,
@@ -694,9 +701,7 @@ impl SameSourceAckFixture {
     fn send(
         &mut self,
         slot: usize,
-        upload: impl FnMut(
-            &[&SnapshotItem],
-        ) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
+        upload: impl FnMut(&[&SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
     ) -> Result<SnapshotPageOutcome> {
         // Preserve the caller's canonical pending-page selection predicate.
         // The extracted attempt helper assumes selected indices are pending.
@@ -812,8 +817,7 @@ impl SameSourceAckFixture {
     }
     fn cold_full_of(root: &Path, keep_cache: bool) -> Vec<SnapshotItem> {
         let (_, mut index, progress) = Self::fresh_state(root);
-        let mut items =
-            Self::prepare(root, &mut index, keep_cache.then_some(&progress)).snapshots;
+        let mut items = Self::prepare(root, &mut index, keep_cache.then_some(&progress)).snapshots;
         items.sort_by(|a, b| a.source_session_id.cmp(&b.source_session_id));
         items
     }
@@ -1590,8 +1594,7 @@ fn claude_p92_typed_mixed_uses_full_enrichment_order() {
 
     use crate::claude_local_otel::ClaudeIdentityDisposition;
     use sha2::{Digest, Sha256};
-    let (dir, raw, api, trace) =
-        crate::snapshots::claude_request_account_mixed_fixture(4, false);
+    let (dir, raw, api, trace) = crate::snapshots::claude_request_account_mixed_fixture(4, false);
     let mut index =
         crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default());
     let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
@@ -1642,12 +1645,12 @@ fn claude_p92_typed_mixed_uses_full_enrichment_order() {
                     .log_record_hash = Some("d".repeat(64))
             }
             "typed_conflict" => {
-                std::sync::Arc::make_mut(rows[3].request_identity.as_mut().unwrap())
-                    .disposition = ClaudeIdentityDisposition::Conflict
+                std::sync::Arc::make_mut(rows[3].request_identity.as_mut().unwrap()).disposition =
+                    ClaudeIdentityDisposition::Conflict
             }
             "typed_invalid" => {
-                std::sync::Arc::make_mut(rows[3].request_identity.as_mut().unwrap())
-                    .disposition = ClaudeIdentityDisposition::Invalid
+                std::sync::Arc::make_mut(rows[3].request_identity.as_mut().unwrap()).disposition =
+                    ClaudeIdentityDisposition::Invalid
             }
             "missing_api" => {
                 rows.pop();
@@ -1716,9 +1719,8 @@ fn claude_p92_typed_mixed_uses_full_enrichment_order() {
                 .iter()
                 .chain(item.usage_buckets.iter().flat_map(|b| &b.model_usage))
                 .all(|row| row.account_identifier_hash.is_none()));
-            let mut retained = crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(
-                ScanIndex::default(),
-            );
+            let mut retained =
+                crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(ScanIndex::default());
             let (prior_dir, mut prior, _, _) =
                 crate::snapshots::claude_request_account_mixed_fixture(2, true);
             retained.bind_session_accounts(
@@ -1737,10 +1739,7 @@ fn claude_p92_typed_mixed_uses_full_enrichment_order() {
                     &proof.mixed_uploads
                 )
                 .is_empty());
-            crate::snapshots::claude_request_account_output(
-                "native-mixed-production.json",
-                item,
-            );
+            crate::snapshots::claude_request_account_output("native-mixed-production.json", item);
             std::fs::remove_dir_all(prior_dir).unwrap();
         } else {
             assert_ne!(
@@ -1758,8 +1757,7 @@ fn claude_p92_typed_mixed_uses_full_enrichment_order() {
 fn claude_p92_mixed_503_lost_ack_restart_preserves_candidate() {
     // Legacy session-account wire shape; `e2` emits request-owned account partitions.
 
-    let (root, mut prior, _, _) =
-        crate::snapshots::claude_request_account_mixed_fixture(2, true);
+    let (root, mut prior, _, _) = crate::snapshots::claude_request_account_mixed_fixture(2, true);
     let (candidate_root, mut candidate, api, trace) =
         crate::snapshots::claude_request_account_mixed_fixture(4, true);
     let mut index =
