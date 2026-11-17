@@ -1967,3 +1967,159 @@ fn echoed_cache_state_settles_a_stored_state_divergence_and_converges() {
     assert_eq!(*stored.borrow(), server_state);
     assert_eq!(restored.accepted_cache_states[&key], server_state);
 }
+
+/// A validated exact repeat, with or without a head.
+fn unchanged(item: &SnapshotItem, head: Option<&str>) -> SnapshotBatchResponse {
+    let mut ack = accepted(item, "");
+    let mut entity = ack.accepted_entities.pop().unwrap();
+    entity.head_etag = head.map(str::to_owned);
+    ack.unchanged_entities.push(entity);
+    ack
+}
+
+/// Owe W1's challenge: its headless patched write conflicted.
+fn owe_w1(progress: &mut SnapshotUploadProgress, w1: &SnapshotItem) {
+    let (result, _) = cycle(progress, w1, 1_000, |item| conflict(item, &challenge(0xc)));
+    assert!(matches!(
+        result.unwrap(),
+        ResumableUploadResult::Deferred { .. }
+    ));
+}
+
+/// The stripped W0 probe on one page, CAS on or off, settled by `ack`.
+fn w0_page(
+    progress: &mut SnapshotUploadProgress,
+    w1: &SnapshotItem,
+    cas: bool,
+    ack: impl Fn(&SnapshotItem) -> SnapshotBatchResponse,
+) {
+    let (result, wires) = cycle_with_transport(
+        progress,
+        &[cache_head_probe(w1)],
+        2_000,
+        |_| 0,
+        |_| cas,
+        |request, _| Ok(ack(request.snapshots[0])),
+    );
+    assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+    assert!(wires[0]["snapshots"][0]["cache_observations"].is_null());
+}
+
+/// [money] W0_unchanged_cannot_clear_W1: a CAS-off unchanged W0 ACK carries
+/// no head, so W1's owed challenge survives it and a restart.
+#[test]
+fn w0_unchanged_cannot_clear_w1() {
+    let w1 = item();
+    let key = cache_session_key(&w1.source_session_id);
+    let mut progress = super::tests::class_split_tests::fresh_progress();
+    owe_w1(&mut progress, &w1);
+    let owed = progress.head_conflict_challenges[&key].clone();
+    w0_page(&mut progress, &w1, false, |item| unchanged(item, None));
+    // `cycle_with_transport` checked the restored ledger equals this one.
+    assert_eq!(progress.head_conflict_challenges[&key], owed);
+    assert!(!progress.accepted_cache_heads.contains_key(&key));
+}
+
+/// [money] headed_W0_is_not_patch_ACK and exact_W1_head_postsave_retires.
+/// A CAS-on W0 ACK with a head clears the challenge and seeds the base, but
+/// never settles W1's debt. Post-save retirement drains only the exact W1
+/// witness with a head; a W0 witness or a missing head keeps it owed.
+#[test]
+fn headed_w0_is_not_patch_ack_and_only_exact_w1_with_head_retires() {
+    let (index, w1) = super::tests::pending_head_index_item();
+    let key = cache_session_key(&w1.source_session_id);
+    let head = "e".repeat(64);
+    let mut progress = super::tests::class_split_tests::fresh_progress();
+    owe_w1(&mut progress, &w1);
+    progress
+        .record_pending_cache_head(&w1, &cache_head_file_groups(&index), true)
+        .unwrap();
+    w0_page(&mut progress, &w1, true, |item| {
+        unchanged(item, Some(&head))
+    });
+    assert!(progress.head_conflict_challenges.is_empty(), "head proof");
+    assert_eq!(progress.accepted_cache_heads[&key], head, "the base");
+    let mut sent = w1.clone();
+    sent.cache_base_head_etag = Some(head.clone());
+    let w0 = snapshot_upload_body_witness(&cache_head_probe(&w1));
+    let exact = snapshot_upload_body_witness(&sent);
+    for (row, witness, headed, retires) in [
+        ("headed_W0_is_not_patch_ACK", &w0, true, false),
+        ("no_head", &exact, false, false),
+        ("exact_W1_head_postsave_retires", &exact, true, true),
+    ] {
+        let mut ledger = progress.clone();
+        ledger.record_body(&w1.snapshot_fingerprint, witness);
+        if !headed {
+            ledger.accepted_cache_heads.remove(&key);
+        }
+        ledger.retire_pending_cache_heads(
+            &index,
+            std::slice::from_ref(&sent),
+            &BTreeSet::new(),
+            true,
+            &ledger.pending_cache_head_file_witnesses(&index),
+        );
+        assert_eq!(ledger.pending_cache_heads.is_empty(), retires, "{row}");
+    }
+}
+
+/// [money] source_and_money_equivalence (Codex; Claude is the mixed tagged
+/// page in `claude_tail_money_tests`). An adopted Codex W0 takes the head
+/// first: probe, CAS repeat, then W1 on its head, zero conflicts, every POST
+/// with the full counters, and the same settled body as a cold session. Pi is
+/// the negative control: no cache contract, so no patch, probe or CAS.
+#[test]
+fn source_and_money_equivalence() {
+    use super::tests::class_split_tests::{
+        assert_no_smaller_body, fresh_progress, probe_stages, HeadStore,
+    };
+    let w1 = item();
+    let session = w1.source_session_id.clone();
+    let run = |adopted: bool| {
+        let mut store = HeadStore::default();
+        if adopted {
+            let base = request(vec![cache_head_probe(&w1)]);
+            store.post(&base, &serde_json::to_value(&base).unwrap());
+        }
+        let mut progress = fresh_progress();
+        let mut wires = probe_stages(&mut progress, &mut store, std::slice::from_ref(&w1));
+        let head = progress.accepted_cache_heads[&cache_session_key(&session)].clone();
+        let mut items = vec![w1.clone()];
+        assert!(
+            apply_bootstrapped_cache_heads("codex", &mut items, &progress)
+                .unwrap()
+                .is_empty()
+        );
+        let (result, main) = cycle_with_transport(
+            &mut progress,
+            &items,
+            1_000,
+            |_| 1,
+            |_| false,
+            |request, wire| Ok(store.post(request, wire)),
+        );
+        assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+        assert_eq!(
+            envelope(&main[0])["base_head_etag"],
+            head,
+            "W1 rides the head"
+        );
+        assert_no_smaller_body(&main, &w1);
+        wires.extend(main);
+        (progress.accepted_body_witnesses, store.bodies, wires.len())
+    };
+    let cold = run(false);
+    assert_eq!(
+        run(true),
+        cold,
+        "same settlement and POSTs as a cold session"
+    );
+    assert_eq!(cold.2, 3, "probe, CAS repeat, W1");
+
+    let mut pi = w1.clone();
+    let progress = fresh_progress();
+    prepare_snapshot_cache_for_upload(&mut pi, &progress, false, false, &BTreeSet::new());
+    assert!(pi.cache_observations.is_none() && pi.cache_base_head_etag.is_none());
+    assert_eq!(snapshot_upload_batch_class(&pi, false), 0, "no CAS");
+}

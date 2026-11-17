@@ -102,7 +102,9 @@ pub(crate) mod privacy_flip_modes;
 #[cfg(test)]
 mod upload_context_receipt_tests;
 #[cfg(test)]
-pub(crate) use sources::claude::context_file_birth::with_remembered_tripwire_restored_for_test;
+pub(crate) use sources::claude::context_file_birth::{
+    clear_remembered_tripwire_for_test, with_remembered_tripwire_restored_for_test,
+};
 pub use sources::claude::context_file_birth::{
     ClaudeContextBasisCounts, ClaudeContextFileBirthCounts,
 };

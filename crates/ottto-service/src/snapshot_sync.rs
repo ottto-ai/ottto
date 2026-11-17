@@ -278,57 +278,12 @@ fn held_cache_head_probe(
     .then_some(probe)
 }
 
-/// Patched bodies of sessions this ledger never settled: no saved head, cache
-/// state or owed challenge for the session, no ACK, hold or refusal for the
-/// body, and the session's only body on the page. Each skips the probe stages
-/// and goes out once, whole, as a token-less head-CAS write: the backend
-/// completes the patch against an empty prior and returns the head and state
-/// echo, or, if it does hold a head, answers a conflict and challenge that
-/// the next page recovers through the ordinary bootstrap.
-fn cas_bootstrap_bodies(
-    progress: &SnapshotUploadProgress,
-    items: &[SnapshotItem],
-) -> BTreeSet<String> {
-    let mut per_session = BTreeMap::<&str, usize>::new();
-    for item in items {
-        *per_session
-            .entry(item.source_session_id.as_str())
-            .or_default() += 1;
-    }
-    items
-        .iter()
-        .filter(|item| {
-            let key = cache_session_key(&item.source_session_id);
-            let fingerprint = &item.snapshot_fingerprint;
-            item.cache_observations.is_some()
-                && item.cache_base_head_etag.is_none()
-                && per_session[item.source_session_id.as_str()] == 1
-                && !progress.accepted_fingerprints.contains(fingerprint)
-                && !progress.quarantined_fingerprints.contains_key(fingerprint)
-                && !progress.permanent_rejections.contains_key(fingerprint)
-                && !progress.accepted_cache_heads.contains_key(&key)
-                && !progress.accepted_cache_states.contains_key(&key)
-                && !progress.head_conflict_challenges.contains_key(&key)
-        })
-        .map(|item| item.snapshot_fingerprint.clone())
-        .collect()
-}
-
-#[cfg(test)]
+/// Every headless patched body takes the probe stages first, so its patch
+/// is never sent without a predecessor token.
 fn apply_bootstrapped_cache_heads(
     source: &str,
     snapshots: &mut [SnapshotItem],
     progress: &SnapshotUploadProgress,
-) -> Result<Vec<(String, String, String)>> {
-    apply_bootstrapped_cache_heads_except(source, snapshots, progress, &BTreeSet::new())
-}
-
-/// `cas_bootstrap` bodies (see `cas_bootstrap_bodies`) stay token-less.
-fn apply_bootstrapped_cache_heads_except(
-    source: &str,
-    snapshots: &mut [SnapshotItem],
-    progress: &SnapshotUploadProgress,
-    cas_bootstrap: &BTreeSet<String>,
 ) -> Result<Vec<(String, String, String)>> {
     let mut held = Vec::new();
     for snapshot in snapshots {
@@ -363,9 +318,7 @@ fn apply_bootstrapped_cache_heads_except(
             .accepted_cache_heads
             .get(&cache_session_key(&snapshot.source_session_id))
             .cloned();
-        if snapshot.cache_base_head_etag.is_none()
-            && !cas_bootstrap.contains(&snapshot.snapshot_fingerprint)
-        {
+        if snapshot.cache_base_head_etag.is_none() {
             return Err(anyhow::Error::new(SnapshotAckRejected {
                 reason: "cache head probe lacks accepted predecessor token",
             }));
@@ -4346,6 +4299,14 @@ const SHED_BACKOFF_BASE: Duration = Duration::from_secs(30);
 /// Uniform random in `[0, span]`, from the OS entropy source already used for
 /// token material. Jitter that is not random is not jitter.
 fn uniform_duration(span: Duration) -> Duration {
+    #[cfg(test)]
+    if let Some(sample) =
+        tests::permanent_finish_pipeline_tests::once_credit_oracle_tests::backoff_sample_for_test(
+            span,
+        )
+    {
+        return sample;
+    }
     if span.is_zero() {
         return Duration::ZERO;
     }
@@ -8432,10 +8393,20 @@ fn finish_sync_source(
     #[cfg(test)]
     tests::permanent_finish_pipeline_tests::ack_cache_probe_for_test(&mut scan_result.snapshots);
 
+    let headless = |progress: &SnapshotUploadProgress, snapshot: &SnapshotItem| {
+        snapshot.cache_observations.is_some()
+            && !progress
+                .accepted_cache_heads
+                .contains_key(&cache_session_key(&snapshot.source_session_id))
+    };
     let cache_head_groups = if cache_observations_enabled
         && (activity_hint.snapshot_head_cas_required
             || !legacy_reconciliation_pending.is_empty()
-            || !upload_progress.pending_cache_heads.is_empty())
+            || !upload_progress.pending_cache_heads.is_empty()
+            || scan_result
+                .snapshots
+                .iter()
+                .any(|snapshot| headless(&upload_progress, snapshot)))
     {
         cache_head_file_groups(&index)
     } else {
@@ -8454,16 +8425,17 @@ fn finish_sync_source(
 
     for snapshot in &mut scan_result.snapshots {
         if cache_observations_enabled && snapshot.cache_observations.is_some() {
-            let missing_required_head = (activity_hint.snapshot_head_cas_required
-                || legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint))
-                && !upload_progress
-                    .accepted_cache_heads
-                    .contains_key(&cache_session_key(&snapshot.source_session_id));
-            pending_cache_heads_changed |= upload_progress.record_pending_cache_head(
-                snapshot,
-                &cache_head_groups,
-                missing_required_head,
-            )?;
+            // Every headless patch is owed until its exact patched ACK with a
+            // head is saved. Only a required head fails on a missing binding.
+            let owed = headless(&upload_progress, snapshot);
+            let required = activity_hint.snapshot_head_cas_required
+                || legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint);
+            pending_cache_heads_changed |=
+                match upload_progress.record_pending_cache_head(snapshot, &cache_head_groups, owed)
+                {
+                    Err(_) if !required => false,
+                    recorded => recorded?,
+                };
         }
         prepare_snapshot_cache_for_upload(
             snapshot,
@@ -8539,15 +8511,10 @@ fn finish_sync_source(
         .context_resend
         .retain_candidates(&upload_progress.context_receipt_candidates);
     crate::local_resource_diagnostics::change_reason::propagate(source.api_slug(), &index);
-    let cas_bootstrap = cas_bootstrap_bodies(&upload_progress, &scan_result.snapshots);
     let probes = scan_result
         .snapshots
         .iter()
-        .filter(|item| {
-            item.cache_observations.is_some()
-                && item.cache_base_head_etag.is_none()
-                && !cas_bootstrap.contains(&item.snapshot_fingerprint)
-        })
+        .filter(|item| item.cache_observations.is_some() && item.cache_base_head_etag.is_none())
         .map(cache_head_probe)
         .collect::<Vec<_>>();
     let mut bootstrap_deferred = 0usize;
@@ -8641,11 +8608,10 @@ fn finish_sync_source(
                     .deferred
                     .contains(&item.snapshot_fingerprint)
             });
-            let held = apply_bootstrapped_cache_heads_except(
+            let held = apply_bootstrapped_cache_heads(
                 source.api_slug(),
                 &mut scan_result.snapshots,
                 &upload_progress,
-                &cas_bootstrap,
             )
             .inspect_err(log_bootstrap_failure("apply"))
             .inspect_err(|_| {
@@ -9606,7 +9572,7 @@ fn activate_source_upload_context(
     index.activate_file_upload_context(source, context.clone());
     // A session whose upload can carry a head-CAS answer reads natively, never
     // from Tail. The answer replaces a saved base (`attach_head_conflict_answers`);
-    // a challenge without one never answers, and an ordinary accept clears it.
+    // a challenge without one never answers; only an ACK with a head clears it.
     index.activate_head_conflict_sessions(
         progress
             .head_conflict_challenges
@@ -11203,14 +11169,16 @@ where
                     .insert(cache_session_key(&entity.source_session_id), head.clone());
             }
         }
-        // Any settled ref for the session resolves its owed challenge: the
-        // saved head is now current or removed. A conflict in the same page
-        // for an already-settled session records nothing.
+        // Only a settled ref with a head resolves the session's owed
+        // challenge: a headless ref (a stripped base without CAS) proves no
+        // head. A conflict in the same page for a session so settled records
+        // nothing.
         let mut settled_sessions = BTreeSet::new();
         for entity in response
             .accepted_entities
             .iter()
             .chain(&response.unchanged_entities)
+            .filter(|entity| entity.head_etag.is_some())
         {
             let key = cache_session_key(&entity.source_session_id);
             if let Some(record) = progress.head_conflict_challenges.remove(&key) {
@@ -13993,7 +13961,7 @@ mod tests {
         );
     }
 
-    fn pending_head_index_item() -> (ScanIndex, SnapshotItem) {
+    pub(in crate::snapshot_sync) fn pending_head_index_item() -> (ScanIndex, SnapshotItem) {
         let item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
         let mut index = ScanIndex::default();
         index.files.insert(

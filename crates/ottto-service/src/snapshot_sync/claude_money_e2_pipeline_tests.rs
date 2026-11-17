@@ -2570,6 +2570,429 @@ fn e2_pipeline_restored_twins_equal_birth_reverse_pinned_ties() {
     restored_twins_pinned(true, true, Some(false));
 }
 
+// Input-only usage makes the dominance fixtures' expected sums explicit.
+fn uncopied_rows(rows: &[(&str, u64)]) -> String {
+    rows.iter()
+        .map(|(id, tokens)| {
+            let mut row: serde_json::Value =
+                serde_json::from_str(&line(ROOT, id, AT, *tokens)).unwrap();
+            row["message"]["usage"] = json!({"input_tokens":tokens,"output_tokens":0});
+            row.to_string() + "\n"
+        })
+        .collect()
+}
+
+fn uncopied_pair(name: &str, a_first: bool, a: &str, b: &str) -> (Corpus, [PathBuf; 2]) {
+    use crate::snapshots::claude_money_birth_store::location_key;
+    let mut c = Corpus::new(&format!("e2-pipeline-uncopied-{name}-{a_first}"));
+    // Fixed suffixes, ordered by the actual full-path key rather than by name.
+    let mut paths =
+        ["a-original", "z-copy"].map(|dir| c.root.join(dir).join(format!("{ROOT}.jsonl")));
+    paths.sort_by_key(|path| location_key(&path.to_string_lossy()));
+    if !a_first {
+        paths.swap(0, 1);
+    }
+    assert_eq!(
+        location_key(&paths[0].to_string_lossy()) < location_key(&paths[1].to_string_lossy()),
+        a_first
+    );
+    let birth = "2026-08-02T07:00:00Z";
+    assert!(nanos(birth) < nanos(AT));
+    assert!(nanos(AT) < nanos("2026-11-04T00:00:00Z"));
+    for (path, text) in paths.iter().zip([a, b]) {
+        let relative = path
+            .strip_prefix(&c.root)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        c.write_at(&relative, text, birth);
+    }
+    (c, paths)
+}
+
+#[test]
+fn e2_pipeline_uncopied_t_equal() {
+    // Expected RED on main: equal clones count twice (83 input, 7 requests).
+    for a_first in [true, false] {
+        for grow_a in [true, false] {
+            with_e2(|| {
+                let a = uncopied_rows(&[("r1", 10), ("r2", 20), ("r3", 5)]);
+                let b = a.clone() + &uncopied_rows(&[("r4", 13)]);
+                let (c, paths) = uncopied_pair("equal", a_first, &a, &b);
+                let scanner = E2ScanFixture::default();
+                e2::take_diag();
+                let mut first = ready(&c, &scanner, ScanIndex::default(), 100, false);
+                literal(&first);
+                assert_eq!(
+                    (body(&first, ROOT).unwrap().input_tokens, total(&first)),
+                    (48, 4)
+                );
+                assert_eq!(copy_diag(&["copy_prefix_twin_page_removed"]), [3]);
+                first.finish();
+                let stored = stored_bodies(&first.index);
+                let prior = c.reload(&mut first.index);
+                let mut again = ready(&c, &E2ScanFixture::default(), prior, 100, false);
+                assert!(
+                    again.scan.snapshots.is_empty(),
+                    "reload repeat emits nothing"
+                );
+                again.finish();
+                assert_eq!(stored_bodies(&again.index), stored);
+                append(
+                    &paths[usize::from(!grow_a)],
+                    &uncopied_rows(&[("growth", 17)]),
+                );
+                let prior = c.reload(&mut again.index);
+                e2::take_diag();
+                let grown = ready(&c, &E2ScanFixture::default(), prior, 100, false);
+                literal(&grown);
+                assert_eq!(
+                    (body(&grown, ROOT).unwrap().input_tokens, total(&grown)),
+                    (65, 5)
+                );
+                assert_eq!(
+                    copy_diag(&[
+                        "copy_prefix_twin_page_removed",
+                        "copy_prefix_families_corrected"
+                    ]),
+                    [3, 1]
+                );
+            });
+        }
+    }
+}
+
+fn uncopied_numeric_case(name: &str, a: &[(&str, u64)], b: &[(&str, u64)], input: u64, drops: u64) {
+    for a_first in [true, false] {
+        with_e2(|| {
+            let (c, _) = uncopied_pair(name, a_first, &uncopied_rows(a), &uncopied_rows(b));
+            e2::take_diag();
+            let page = ready(
+                &c,
+                &E2ScanFixture::default(),
+                ScanIndex::default(),
+                100,
+                false,
+            );
+            literal(&page);
+            let result = body(&page, ROOT).unwrap();
+            assert_eq!(result.input_tokens, input);
+            assert_eq!(result.removed_request_count.unwrap_or(0), drops);
+            assert_eq!(
+                copy_diag(&["copy_prefix_twin_page_removed", "twin_overcount_kept"]),
+                [drops, 0]
+            );
+        });
+    }
+}
+
+#[test]
+fn e2_pipeline_uncopied_t_zero() {
+    // Guard: a zero occurrence cannot keep R or remove any of B's usage.
+    uncopied_numeric_case(
+        "zero",
+        &[("R", 0), ("S", 1)],
+        &[("R", 10), ("Q", 13)],
+        24,
+        0,
+    );
+}
+
+#[test]
+fn e2_pipeline_uncopied_t_partial() {
+    // Expected RED on main: partial R also counts (28 input); B must keep R.
+    uncopied_numeric_case("partial", &[("R", 5)], &[("R", 10), ("Q", 13)], 23, 1);
+}
+
+#[test]
+fn e2_pipeline_uncopied_t_disjoint() {
+    // Guard: different request ids remain independent.
+    uncopied_numeric_case("disjoint", &[("P", 5)], &[("Q", 13)], 18, 0);
+}
+
+#[test]
+fn e2_pipeline_uncopied_t_markers() {
+    // Expected RED on main only for the new per-id diagnostic; totals are a guard.
+    for a_first in [true, false] {
+        with_e2(|| {
+            let marker = |org: &str| {
+                json!({"type":"attachment","sessionId":ROOT,
+                "attachment":{"type":"credential_org","organizationUuid":org}})
+                .to_string()
+                    + "\n"
+            };
+            let a = marker("11111111-1111-4111-8111-111111111111") + &uncopied_rows(&[("R", 10)]);
+            let b = marker("22222222-2222-4222-8222-222222222222") + &uncopied_rows(&[("R", 10)]);
+            let (c, _) = uncopied_pair("markers", a_first, &a, &b);
+            e2::take_diag();
+            let page = ready(
+                &c,
+                &E2ScanFixture::capturing_identity(),
+                ScanIndex::default(),
+                100,
+                false,
+            );
+            literal(&page);
+            assert_eq!(
+                (body(&page, ROOT).unwrap().input_tokens, total(&page)),
+                (20, 2)
+            );
+            assert_eq!(
+                copy_diag(&["copy_prefix_twin_page_removed", "twin_overcount_kept"]),
+                [0, 1]
+            );
+        });
+    }
+}
+
+#[test]
+fn e2_pipeline_uncopied_t_untimed() {
+    // Guard: a dominated occurrence with no provider timestamp is never dropped.
+    for a_first in [true, false] {
+        with_e2(|| {
+            let mut a: serde_json::Value =
+                serde_json::from_str(&uncopied_rows(&[("R", 5)])).unwrap();
+            a.as_object_mut().unwrap().remove("timestamp");
+            // Give the untimed response a bucket without giving it a provider time.
+            let clock = json!({"type":"user","sessionId":ROOT,"timestamp":AT,
+                "message":{"role":"user","content":[]}})
+            .to_string()
+                + "\n";
+            let (c, _) = uncopied_pair(
+                "untimed",
+                a_first,
+                &(clock + &a.to_string() + "\n"),
+                &uncopied_rows(&[("R", 10)]),
+            );
+            let mut page = c.raw(
+                &E2ScanFixture::default(),
+                ScanIndex::default(),
+                100,
+                false,
+                &[],
+            );
+            assert_eq!(
+                page.scan
+                    .snapshots
+                    .iter()
+                    .map(|item| item.input_tokens)
+                    .sum::<u64>(),
+                15
+            );
+            assert_eq!(
+                total(&page),
+                2,
+                "both occurrences count before the decision"
+            );
+            // The target R has no own timestamp (the fallback bucket places its
+            // usage); the occurrence timestamp is private to the parser.
+            e2::take_diag();
+            page.enrich(&c);
+            literal(&page);
+            assert_eq!(copy_diag(&["copy_prefix_twin_page_removed"]), [0]);
+            assert_eq!(
+                (body(&page, ROOT).unwrap().input_tokens, total(&page)),
+                (15, 2)
+            );
+            assert_eq!(
+                body(&page, ROOT)
+                    .unwrap()
+                    .removed_request_count
+                    .unwrap_or(0),
+                0
+            );
+        });
+    }
+}
+
+#[test]
+fn e2_pipeline_uncopied_t_ambiguous() {
+    // Guard: neither an ambiguous keeper nor an ambiguous target proves a drop.
+    for a_first in [true, false] {
+        for ambiguous_larger in [true, false] {
+            with_e2(|| {
+                let tokens = if ambiguous_larger { 10 } else { 5 };
+                let mut second: serde_json::Value =
+                    serde_json::from_str(&uncopied_rows(&[("R", tokens)])).unwrap();
+                second["message"]["id"] = json!("msg-R-second");
+                let a = uncopied_rows(&[("R", tokens)]) + &second.to_string() + "\n";
+                let b = uncopied_rows(&[("R", if ambiguous_larger { 5 } else { 10 })]);
+                let (c, _) = uncopied_pair("ambiguous", a_first, &a, &b);
+                let scanner = E2ScanFixture::default();
+                let mut page = c.raw(&scanner, ScanIndex::default(), 100, false, &[]);
+                assert!(
+                    page.scan.snapshots.iter().any(|item| item
+                        .claude_money
+                        .as_deref()
+                        .is_some_and(|fold| fold.is_ambiguous("R"))),
+                    "fixture parsed an ambiguous request"
+                );
+                e2::take_diag();
+                page.enrich(&c);
+                assert_eq!(
+                    (body(&page, ROOT).unwrap().input_tokens, total(&page)),
+                    (if ambiguous_larger { 25 } else { 20 }, 3)
+                );
+                assert_eq!(
+                    body(&page, ROOT)
+                        .unwrap()
+                        .removed_request_count
+                        .unwrap_or(0),
+                    0
+                );
+                assert_eq!(copy_diag(&["copy_prefix_twin_page_removed"]), [0]);
+            });
+        }
+    }
+}
+
+#[test]
+fn e2_pipeline_uncopied_t_incomparable() {
+    // Expected RED on main only for the new per-id diagnostic; totals are a guard.
+    for a_first in [true, false] {
+        with_e2(|| {
+            let a = uncopied_rows(&[("R", 10)]);
+            let mut b: serde_json::Value =
+                serde_json::from_str(&uncopied_rows(&[("R", 5)])).unwrap();
+            b["message"]["usage"]["output_tokens"] = json!(10);
+            let (c, _) = uncopied_pair("incomparable", a_first, &a, &(b.to_string() + "\n"));
+            e2::take_diag();
+            let page = ready(
+                &c,
+                &E2ScanFixture::default(),
+                ScanIndex::default(),
+                100,
+                false,
+            );
+            let result = body(&page, ROOT).unwrap();
+            assert_eq!(
+                (result.input_tokens, result.output_tokens, total(&page)),
+                (15, 10, 2)
+            );
+            assert_eq!(
+                copy_diag(&["copy_prefix_twin_page_removed", "twin_overcount_kept"]),
+                [0, 1]
+            );
+        });
+    }
+}
+
+#[test]
+fn e2_pipeline_uncopied_t_chain() {
+    // Expected RED on main: three comparable occurrences count three times.
+    for a_first in [true, false] {
+        for strongest_a in [true, false] {
+            with_e2(|| {
+                let (mut c, _) = uncopied_pair(
+                    "chain",
+                    a_first,
+                    &uncopied_rows(&[("R", if strongest_a { 20 } else { 5 })]),
+                    &uncopied_rows(&[("R", if strongest_a { 5 } else { 20 })]),
+                );
+                c.write_at(
+                    &format!("middle/{ROOT}.jsonl"),
+                    &uncopied_rows(&[("R", 10)]),
+                    "2026-08-02T07:00:00Z",
+                );
+                e2::take_diag();
+                let page = ready(
+                    &c,
+                    &E2ScanFixture::default(),
+                    ScanIndex::default(),
+                    100,
+                    false,
+                );
+                assert_eq!(
+                    (body(&page, ROOT).unwrap().input_tokens, total(&page)),
+                    (20, 1)
+                );
+                assert_eq!(copy_diag(&["copy_prefix_twin_page_removed"]), [2]);
+            });
+        }
+    }
+}
+
+#[test]
+fn e2_pipeline_uncopied_guard_absent_complete() {
+    // Guard: accepted residual B1; id inclusion does not prove usage dominance.
+    for a_first in [true, false] {
+        with_e2(|| {
+            let (c, paths) = uncopied_pair(
+                "absent-complete",
+                a_first,
+                &uncopied_rows(&[("R", 10)]),
+                &uncopied_rows(&[("R", 5), ("Q", 13)]),
+            );
+            let scanner = E2ScanFixture::default();
+            let mut page = c.raw(&scanner, ScanIndex::default(), 100, false, &[]);
+            let fingerprint = page.index.files[&paths[1].to_string_lossy().into_owned()]
+                .source_file_fingerprint
+                .clone();
+            page.scan.snapshots.retain(|item| {
+                item.source_file_fingerprint.as_deref() == Some(fingerprint.as_str())
+            });
+            assert_eq!(
+                page.scan.snapshots.len(),
+                1,
+                "only partial B is on the page"
+            );
+            e2::take_diag();
+            page.enrich(&c);
+            let result =
+                body(&page, ROOT).expect("absent complete A is considered redundant by ids");
+            assert_eq!((result.input_tokens, result.request_count), (18, 2));
+            assert_eq!(
+                copy_diag(&["copy_prefix_twin_page_removed", "twin_redundant"]),
+                [0, 1]
+            );
+            assert!(paths[0].is_file(), "complete A remains live but absent");
+        });
+    }
+}
+
+#[test]
+fn e2_pipeline_uncopied_guard_carried_accounts() {
+    // Expected RED on main (22/4 vs 12/3); guards accepted residual B2 after dedup.
+    // Equal native None markers can carry different accounts; the copy-order keeper wins.
+    for a_first in [true, false] {
+        with_e2(|| {
+            let (c, _) = uncopied_pair(
+                "carried",
+                a_first,
+                &(line(ROOT, "P", AT, 1) + &line(ROOT, "R", AT, 10)),
+                &(line(ROOT, "Q", AT, 1) + &line(ROOT, "R", AT, 10)),
+            );
+            c.evidence(
+                &[
+                    api_login(ROOT, "P", 1, '1', Some('8')),
+                    api_login(ROOT, "Q", 1, '2', Some('9')),
+                ],
+                &[trace_for(ROOT, "P", ""), trace_for(ROOT, "Q", "")],
+            );
+            let scanner = E2ScanFixture::capturing_identity();
+            let mut page = c.raw(&scanner, ScanIndex::default(), 100, false, &[]);
+            let mut accepted =
+                crate::snapshots::claude_request_identity::AcceptedBuckets::for_test();
+            accepted.set_account_source_enabled(true);
+            e2::take_diag();
+            page.enrich_with(&c, Some(&mut accepted));
+            let result = body(&page, ROOT).unwrap();
+            assert_eq!((result.input_tokens, result.request_count), (12, 3));
+            assert_eq!(
+                org_shares(result),
+                BTreeMap::from([
+                    ("8".repeat(64), if a_first { 2 } else { 1 }),
+                    ("9".repeat(64), if a_first { 1 } else { 2 })
+                ])
+            );
+            assert_eq!(
+                copy_diag(&["copy_prefix_twin_page_removed", "twin_overcount_kept"]),
+                [1, 0]
+            );
+        });
+    }
+}
+
 /// [money] A summed body's COPY mark never lets its counting carrier drop r1.
 #[test]
 fn equal_birth_carrier_never_grandfathers_its_counted_request() {

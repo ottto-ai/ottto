@@ -141,6 +141,17 @@ file-system hint / periodic listing → select file → read new bytes from save
   its first own response, regardless of the subagent cutoff or file birth.
   Unmatched responses are own turns, including those before birth. Shared
   responses after the first own turn keep the existing cutoff decision.
+  Same-session main files with no copied requests at parse time on one page
+  drop timed, nonzero duplicate requests by usage dominance and equal native
+  accounts, with equal usage tied by birth and location. Zero, ambiguous and
+  untimed occurrences never drop.
+  Marker disagreements or incomparable usage keep every occurrence and disclose
+  once per request id as `twin_overcount_kept`. This is drop-only, without a
+  cutoff or persisted decision; restoring copies never makes a file eligible.
+  Accepted residuals: an absent complete twin can be deemed redundant by id
+  inclusion in a partial twin, and equal native accounts can later carry
+  different telemetry accounts; the keeper's placement
+  follows the existing reconciliation policy.
 
 - **Upload.** A session is uploaded as a whole-session replacement, idempotent at the receiver. It
   settles only on an exact acknowledgement of the exact bytes sent to that destination. A local
@@ -665,6 +676,9 @@ Verification authorizes before source reads or result writes; setup authorizes
 before acquiring the process-wide scan lock. Telemetry controls require the
 validated user and organization to match the connected local account, under the
 identity lifecycle lock, and refuse work while an identity change is reserved.
+Telemetry status and disable also require the validated device to match the
+local health device binding and the request key id to equal the validated key id
+(including both absent), before any local reads or effects for the action.
 Codex daily-reference controls build their complete returned status from local
 stores before releasing that lock. Browser control requires an allowed Origin
 and loopback Host with the listener's port. Probes return their existing identity

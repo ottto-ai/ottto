@@ -992,6 +992,12 @@ pub(crate) fn with_remembered_tripwire_restored_for_test<T>(body: impl FnOnce() 
     result
 }
 
+/// Simulate process loss after a saved fixture page, without changing durable proof.
+#[cfg(test)]
+pub(crate) fn clear_remembered_tripwire_for_test() {
+    *remembered_tripwire() = ClaudeRememberedTripwire::new(MAX_REMEMBERED_TRIPWIRE_FILES);
+}
+
 /// Content-free counters for one fold. Local only: logged on their own line
 /// beside the Claude local evidence counts; never uploaded and not part of
 /// snapshot-audit.
