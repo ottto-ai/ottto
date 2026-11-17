@@ -124,6 +124,106 @@ fn upload_history_pager_bytes_are_cumulative() {
     assert_eq!(counts.codex_sqlite_pager_wal_page_bytes_cumulative, 0);
     assert_eq!(counts.pi_sqlite_pager_wal_page_bytes_cumulative, 0);
 }
+/// [regress] External sorts on state and history connections add spill bytes once.
+#[test]
+fn tempbuf_spill_bytes_are_sampled_once_for_state_and_history() {
+    use crate::local_resource_diagnostics::{cache_lifecycle, cache_lifecycle_totals, capture};
+    let (_scratch, path, identity) = live_store("tempbuf-spill");
+    let db = open(&path, &identity);
+    let scratch = crate::test_scratch::ScratchDir::canonical("history-tempbuf-spill");
+    let history = history::Store::open(&history::Store::path(&scratch)).unwrap();
+    for (conn, event) in [
+        (db.conn().unwrap(), Event::ClaudePagerBytes),
+        (history.conn_for_test(), Event::HistoryPagerBytes),
+    ] {
+        sample_pager_writes(conn, event);
+        let row = || capture(cache_lifecycle_totals).1.remove(0);
+        let field = "sqlite_tempbuf_spill_bytes_cumulative";
+        let before = row()["counts"][field].as_u64().unwrap();
+        conn.execute_batch("PRAGMA temp_store=FILE; PRAGMA cache_size=1")
+            .unwrap();
+        // Four MiB of sort keys exceed SQLite's minimum sorter buffer too.
+        let bytes: i64 = conn
+            .query_row(
+                "SELECT sum(length(v)) FROM (
+                   WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<4096)
+                   SELECT printf('%01024d', x) AS v FROM n ORDER BY v DESC
+                 )",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(bytes, 4096 * 1024);
+        let (_, counts) = cache_lifecycle::observe(|| sample_pager_writes(conn, event));
+        assert!(counts.sqlite_tempbuf_spill_bytes_cumulative > 0);
+        assert!(
+            row()["counts"][field].as_u64().unwrap()
+                >= before + counts.sqlite_tempbuf_spill_bytes_cumulative
+        );
+        let (_, repeated) = cache_lifecycle::observe(|| {
+            sample_pager_writes(conn, event);
+            sample_pager_writes(conn, event);
+        });
+        assert_eq!(repeated.sqlite_tempbuf_spill_bytes_cumulative, 0);
+    }
+}
+
+/// [regress] Resetting pager writes first excludes overlapping TEMP-table bytes.
+#[test]
+fn temp_table_spill_is_counted_as_pager_bytes_only() {
+    use crate::local_resource_diagnostics::cache_lifecycle;
+    let (_scratch, path, identity) = live_store("tempbuf-overlap");
+    let db = open(&path, &identity);
+    db.sample_pager_writes();
+    db.conn()
+        .unwrap()
+        .execute_batch(
+            "PRAGMA temp_store=FILE;
+             PRAGMA temp.page_size=4096;
+             PRAGMA temp.cache_size=1;
+             CREATE TEMP TABLE spill(v BLOB);
+             WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<512)
+             INSERT INTO spill SELECT zeroblob(1024) FROM n;",
+        )
+        .unwrap();
+    let (_, counts) = cache_lifecycle::observe(|| db.sample_pager_writes());
+    assert!(counts.claude_sqlite_pager_wal_page_bytes_cumulative > 0);
+    assert_eq!(counts.sqlite_tempbuf_spill_bytes_cumulative, 0);
+    let (_, repeated) = cache_lifecycle::observe(|| db.sample_pager_writes());
+    assert_eq!(repeated.claude_sqlite_pager_wal_page_bytes_cumulative, 0);
+    assert_eq!(repeated.sqlite_tempbuf_spill_bytes_cumulative, 0);
+}
+
+/// [regress] Count each checkpoint's reported pages, including repeated backfill.
+#[test]
+fn checkpoint_reported_pages_follow_results_without_resampling() {
+    use crate::local_resource_diagnostics::{cache_lifecycle, cache_lifecycle_totals, capture};
+    let (_scratch, path, identity) = live_store("checkpoint-reported-pages");
+    let mut db = open(&path, &identity);
+    db.control("phase", &1_u8).unwrap();
+    let field = "sqlite_checkpoint_reported_pages_cumulative";
+    let row = || capture(cache_lifecycle_totals).1.remove(0);
+    let before = row()["counts"][field].as_u64().unwrap();
+    let (result, counts) = cache_lifecycle::observe(|| db.checkpoint(CheckpointMode::Passive));
+    let done = result.checkpointed_frames.unwrap();
+    assert!(done > 0);
+    assert_eq!(counts.sqlite_checkpoint_reported_pages_cumulative, done);
+    assert!(row()["counts"][field].as_u64().unwrap() >= before + done);
+    let (_, sampled) = cache_lifecycle::observe(|| {
+        db.sample_pager_writes();
+        db.sample_pager_writes();
+    });
+    assert_eq!(sampled.sqlite_checkpoint_reported_pages_cumulative, 0);
+    let (result, repeated) = cache_lifecycle::observe(|| db.checkpoint(CheckpointMode::Passive));
+    assert_eq!(result.checkpointed_frames, Some(done));
+    assert_eq!(repeated.sqlite_checkpoint_reported_pages_cumulative, done);
+    let (result, truncated) =
+        cache_lifecycle::observe(|| db.checkpoint(CheckpointMode::IdleReclaim));
+    assert_eq!(result.state, CheckpointState::Complete);
+    assert_eq!(result.checkpointed_frames, Some(0));
+    assert_eq!(truncated.sqlite_checkpoint_reported_pages_cumulative, 0);
+}
+
 fn open(path: &Path, identity: &Identity) -> Sqlite {
     let mut db = Sqlite::open(path, identity).unwrap();
     db.path_extractor(key_only);
