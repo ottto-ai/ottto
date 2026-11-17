@@ -719,7 +719,7 @@ fn codex_cold_full_equals_tail_restart_and_upgrade_in_totals_and_placement() {
     money_oracle::assert_equivalent(&codex_cold(&route, &paths[1..2]), &upgraded);
 }
 
-/// [money] D168-3: an account-witness change, then a destination change, after
+/// [money] An account-witness change, then a destination change, after
 /// a restart (each a new acquisition scope) continue every Codex head from
 /// Tail, and each restart equals a cold Full in totals AND creator placement:
 /// account evidence is applied from the stored creator facts and this read's

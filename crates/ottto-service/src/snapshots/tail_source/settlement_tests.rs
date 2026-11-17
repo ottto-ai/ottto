@@ -164,7 +164,7 @@ fn a_head_ahead_of_progress_resumes_from_the_head() {
 }
 
 /// [money] R6: a head behind the accepted entry replays through it to the
-/// cold Full's body (D158: no floor, no hold).
+/// cold Full's body (no floor, no hold).
 #[test]
 fn a_head_behind_the_accepted_entry_replays_through_it() {
     let mut route = route();
