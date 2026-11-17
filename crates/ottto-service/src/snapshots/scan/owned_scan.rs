@@ -278,14 +278,6 @@ pub(crate) enum OwnedSourceScanStep {
 }
 
 impl OwnedSourceScan {
-    #[cfg(test)]
-    pub(crate) fn test_active_physical_lines(&self) -> usize {
-        self.active_file
-            .as_ref()
-            .map(|file| file.parser.reader.report.physical_line_count)
-            .unwrap_or(0)
-    }
-
     #[expect(clippy::too_many_arguments, reason = "9 args; no options struct yet")]
     pub(crate) fn new(
         source: SnapshotSource,
@@ -934,8 +926,31 @@ impl OwnedSourceScan {
         };
         let pending_paths = pending_paths
             .into_iter()
-            .filter_map(|pending| {
-                if carry_deferred.contains(&local_index_key(&pending.path)) {
+            .filter_map(|mut pending| {
+                let key = local_index_key(&pending.path);
+                let growth_deferred = index
+                    .traversal
+                    .as_ref()
+                    .is_some_and(|walk| walk.residue.growth_retries.get(&key) == Some(&true));
+                if growth_deferred {
+                    // Keep the release hint for the next walk, never select a
+                    // third read in this one (including after a relist/hint).
+                    if index
+                        .files
+                        .get(&key)
+                        .is_some_and(|entry| entry.last_snapshot_fingerprint.is_some())
+                    {
+                        pending.census_member = false;
+                        pending.watcher_hint = true;
+                        index
+                            .traversal
+                            .as_mut()
+                            .expect("traversal")
+                            .pending_candidates
+                            .push_back(pending);
+                    }
+                    None
+                } else if carry_deferred.contains(&key) {
                     index
                         .traversal
                         .as_mut()
@@ -1457,5 +1472,43 @@ pub(in crate::snapshots) fn requeue_members<'a>(
             census_member,
             watcher_hint,
         });
+    }
+}
+
+/// Growth gets one same-walk retry with its original selection flags. A
+/// second hit keeps a committed body and releases its hint to the next walk;
+/// without a body the existing unreadable census must remain red.
+fn retry_grown_file(
+    index: &mut ScanIndex,
+    flags: &BTreeMap<String, (bool, bool)>,
+    candidate: &CandidateFile,
+    census: &mut ScanCensus,
+    cap_delay: bool,
+) {
+    let key = local_index_key(&candidate.path);
+    let retries = &mut index
+        .traversal
+        .as_mut()
+        .expect("active growth walk")
+        .residue
+        .growth_retries;
+    if let std::collections::btree_map::Entry::Vacant(entry) = retries.entry(key.clone()) {
+        entry.insert(false);
+        sampled_scan::codex_cursor::requeue(index, flags, candidate);
+        return;
+    }
+    retries.insert(key.clone(), true);
+    if index
+        .files
+        .get(&key)
+        .is_some_and(|entry| entry.last_snapshot_fingerprint.is_some())
+    {
+        if cap_delay {
+            sampled_audit::queue_cap_retry(index, candidate);
+        }
+        sampled_scan::codex_cursor::release_path(index, candidate, true, true);
+    } else {
+        sampled_scan::codex_cursor::dequeue(index, candidate);
+        census.record_unreadable_file(UnreadableCause::Reduction, &candidate.path);
     }
 }

@@ -1021,3 +1021,12 @@ fn note_scan_index_record_drops_and_decode(
         drops.activity, drops.accepted, drops.cursor, drops.quarantine, decode[0], decode[1], decode[2], decode[3]
     ));
 }
+
+#[cfg(test)]
+impl ScanIndex {
+    pub(crate) fn rebuild_identity_for_test(&self) -> Self {
+        let mut rebuilt = Self::default();
+        rebuilt.carry_identity_from(self.clone()).unwrap();
+        rebuilt
+    }
+}

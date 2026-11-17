@@ -881,6 +881,29 @@ pub(crate) fn apply_claude_local_evidence_to_scan(
     )
 }
 
+/// The ledger-less evidence stage under `session_request_account_source:v1`,
+/// which the server advertises to every Claude Code upload: a keyless ledger
+/// matches no session, so only the account carry differs from `None`.
+#[cfg(test)]
+pub(crate) fn apply_claude_local_evidence_to_scan_for_test(
+    support_dir: &Path,
+    scan_result: &mut crate::snapshots::SourceScanResult,
+    index: &mut ScanIndex,
+) -> (
+    crate::snapshots::ClaudeUsageAuthorityDisposition,
+    bool,
+    ClaudeLocalEvidenceStats,
+) {
+    let mut carry_on = crate::snapshots::claude_request_identity::AcceptedBuckets::default();
+    carry_on.set_account_source_enabled(true);
+    apply_claude_local_evidence_to_scan_with_accepted_for_test(
+        support_dir,
+        scan_result,
+        index,
+        Some(&carry_on),
+    )
+}
+
 /// The production evidence stage with this cycle's accepted-identity ledger.
 #[cfg(test)]
 pub(crate) fn apply_claude_local_evidence_to_scan_with_accepted_for_test(
@@ -1033,6 +1056,8 @@ pub(super) fn pack_claude_evidence_families(
 
 /// What the chunks of one page share: its original carriers and the counters.
 pub(super) struct ClaudeEvidencePage<'p> {
+    contribution_locations:
+        &'p crate::snapshots::claude_request_money::e2::ContributionLocations<'p>,
     pub(super) telemetry_window: Option<(telemetry_only::Window, &'p mut telemetry_only::Ledger)>,
     pub(super) originals: &'p BTreeMap<String, crate::snapshots::SessionAccountEvidence>,
     pub(super) request_owned_originals:
@@ -1077,7 +1102,26 @@ pub(super) fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
         crate::snapshots::claude_request_identity::capture_request_owned_originals(
             &scan_result.snapshots,
         );
+    let indexed_files = index.files.clone();
+    let contribution_locations = if scan_result
+        .snapshots
+        .iter()
+        .any(|item| item.claude_money.is_some())
+    {
+        indexed_files
+            .keys()
+            .map(|key| {
+                (
+                    crate::snapshots::claude_money_birth_store::location_key(key),
+                    key,
+                )
+            })
+            .collect()
+    } else {
+        BTreeMap::new()
+    };
     let mut page = ClaudeEvidencePage {
+        contribution_locations: &contribution_locations,
         telemetry_window,
         originals: &originals,
         request_owned_originals: &request_owned_originals,
@@ -1654,6 +1698,7 @@ pub(super) fn apply_claude_local_evidence_chunk(
         &mut disposition.request_owned_hold_reasons,
         &scan_result.claude_queued_family_deferred_paths,
         &page.content_held,
+        page.contribution_locations,
     );
     if !trace_discard_unfolded.is_empty() {
         *disposition

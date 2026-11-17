@@ -394,11 +394,11 @@ impl OwnedJsonlParser {
         self.with_line_sink(|_| {}, |_, sink| sink(value))
     }
 
-    /// FE1: certify a complete traversal of a grown Claude frozen extent.
+    /// Certify a complete traversal of a grown physical frozen extent.
     /// The checkpoint is deliberately dropped. The existing audit obligation
     /// remains prepared; FE2's sample-preserving rewrite residual is bounded
     /// by the quiet Full audit and its sampled_audit_comparison diagnostics.
-    pub(in crate::snapshots) fn commit_claude_grown_prefix(
+    pub(in crate::snapshots) fn commit_grown_prefix(
         &mut self,
         path: &Path,
         scope: &crate::transcript_acquisition::Scope,
@@ -415,10 +415,7 @@ impl OwnedJsonlParser {
         let start = plan.start_offset();
         let consumed = start.checked_add(self.reader.consumed_bytes())?;
         let held = self.reader.reader.get_ref().metadata().ok()?;
-        if self.source != SnapshotSource::ClaudeCode
-            // Only H1c-admitted reads may take H3c. Forced/comparison and
-            // other ineligible native reads retain strict completion.
-            || self.reader.extent_limit != Some(frozen.checked_sub(start)?)
+        if self.reader.extent_limit != Some(frozen.checked_sub(start)?)
             || !matches!(plan.mode(), ReadMode::Full(_) | ReadMode::Tail)
             || held.len() <= frozen
             || consumed != frozen
@@ -1298,7 +1295,7 @@ pub(in crate::snapshots) struct BoundedJsonlReader<R> {
     pub(in crate::snapshots) finished: bool,
     pub(in crate::snapshots) failure: Option<std::io::ErrorKind>,
     pub(in crate::snapshots) acquisition: Option<crate::transcript_acquisition::ReadPlan>,
-    /// Resumable reads and sampled in-page Claude Full/Tail reads: never
+    /// Resumable reads and every physical acquisition's Full/Tail read: never
     /// consume past this reader-relative frozen extent.
     pub(in crate::snapshots) extent_limit: Option<u64>,
     /// Physical bytes consumed from `reader`, including skipped bytes.
@@ -1420,6 +1417,12 @@ impl<R: BufRead> BoundedJsonlReader<R> {
         // outer loop on a trailing partial line.
         let mut line_complete = false;
         let reached_eof = loop {
+            if self
+                .extent_limit
+                .is_some_and(|limit| self.consumed >= limit)
+            {
+                break true;
+            }
             let raw = reader.fill_buf()?;
             let allowed = self.extent_limit.map_or(raw.len(), |limit| {
                 usize::try_from(limit.saturating_sub(self.consumed))

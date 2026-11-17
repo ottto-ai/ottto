@@ -555,6 +555,9 @@ pub(super) struct SnapshotUploadProgress {
     pub(super) fresh_context_body_acks: BTreeMap<String, String>,
     #[serde(skip)]
     pub(super) context_receipt_candidates: Vec<crate::snapshots::UploadContextReceiptCandidate>,
+    #[serde(skip)]
+    pub(super) request_contributions:
+        BTreeMap<String, (String, crate::snapshots::upload_context_receipt::SlotRows)>,
     /// Sessions whose identity-503 deferral still owes a later main-upload
     /// ACK (`cache_session_key`). Absent is unknown or nothing owed; only an
     /// empty set clears the walk's `Isolated503` cause.
@@ -640,6 +643,7 @@ impl SnapshotUploadProgress {
             terminal_contract_retry_pending_save: false,
             fresh_context_body_acks: BTreeMap::new(),
             context_receipt_candidates: Vec::new(),
+            request_contributions: BTreeMap::new(),
             identity_503_pending: None,
             identity_503_pass: None,
         }
@@ -1043,7 +1047,7 @@ pub(super) fn quarantine_invalid_progress(path: &Path) -> Result<()> {
     sync_progress_parent(path)
 }
 
-crate::heap_layout_bound::fields!(SnapshotUploadProgress; telemetry_only, schema_version, rows, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_body_contexts, context_resend, ack_capacity, retained_stale_ack_count, accepted_cache_states, accepted_identity_buckets, accepted_identity_scope, accepted_cache_heads, pending_cache_heads, head_conflict_challenges, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts, terminal_contract_retry_pending_save, fresh_context_body_acks, context_receipt_candidates, identity_503_pending, identity_503_pass);
+crate::heap_layout_bound::fields!(SnapshotUploadProgress; telemetry_only, schema_version, rows, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_body_contexts, context_resend, ack_capacity, retained_stale_ack_count, accepted_cache_states, accepted_identity_buckets, accepted_identity_scope, accepted_cache_heads, pending_cache_heads, head_conflict_challenges, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts, terminal_contract_retry_pending_save, fresh_context_body_acks, context_receipt_candidates, identity_503_pending, identity_503_pass, request_contributions);
 
 crate::heap_layout_bound::fields!(PendingCacheHeadFile; source_file_fingerprint, group_fingerprint, entities, reselected_heads, settled_entities);
 

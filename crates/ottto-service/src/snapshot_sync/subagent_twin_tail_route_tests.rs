@@ -129,7 +129,7 @@ fn subagent_twin_tail_corrects_the_accepted_head_once() {
         let before = revisions(&prior);
         let reowed = history_local_count(HistoryLocalCount::Reowed);
         e2::apply_money_rules(&mut prior);
-        assert_eq!(prior.claude_money_birth_store.money_rule_version(), 4);
+        assert_eq!(prior.claude_money_birth_store.money_rule_version(), 5);
         assert_eq!(
             history_local_count(HistoryLocalCount::Reowed),
             reowed + 2,
@@ -218,7 +218,7 @@ fn subagent_twin_tail_rule_four_unions_with_rule_three() {
         e2::take_diag();
         let reowed = history_local_count(HistoryLocalCount::Reowed);
         e2::apply_money_rules(&mut prior);
-        assert_eq!(prior.claude_money_birth_store.money_rule_version(), 4);
+        assert_eq!(prior.claude_money_birth_store.money_rule_version(), 5);
         assert_eq!(copy_diag(&["money_rule_v3_reowed"]), [2]);
         assert_eq!(history_local_count(HistoryLocalCount::Reowed), reowed + 2);
         let mut c = Corpus::new("subagent-twin-tail-none");
@@ -233,7 +233,7 @@ fn subagent_twin_tail_rule_four_unions_with_rule_three() {
         lone.activate_effective_upload_body_witness_revision(3);
         let reowed = history_local_count(HistoryLocalCount::Reowed);
         e2::apply_money_rules(&mut lone);
-        assert_eq!(lone.claude_money_birth_store.money_rule_version(), 4);
+        assert_eq!(lone.claude_money_birth_store.money_rule_version(), 5);
         assert_eq!(history_local_count(HistoryLocalCount::Reowed), reowed);
     });
 }

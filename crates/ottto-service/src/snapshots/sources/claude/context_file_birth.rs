@@ -598,6 +598,7 @@ impl ClaudeFileBirthVerdict {
     }
 }
 
+#[cfg(test)]
 impl SnapshotItem {
     /// Local design E decision for this fold, independent of strict ownership.
     pub(crate) fn claude_file_birth_verdict(&self) -> Option<ClaudeFileBirthVerdict> {

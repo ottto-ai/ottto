@@ -163,6 +163,7 @@ impl ReofferServer {
                     serde_json::json!({"token":"synthetic-reoffer-token","expires_at":"2099-01-01T00:00:00Z"})
                 } else if request.contains("/activity-hints") {
                     let mut hint = serde_json::json!({"source":"claude_code","server_time":current_rfc3339(),
+                        "session_request_account_source_contract":crate::snapshots::ACCOUNT_SOURCE_CONTRACT,
                         "last_data_at":null,"record_count_15m":0,"record_count_24h":0,
                         "local_usage_reconciliation_enabled":true,"backfill_window_days":183,
                         "recommended_scan_after":"2099-01-01T00:00:00Z"});
@@ -370,7 +371,6 @@ struct ReofferPipeline {
     daemon: LocalDaemon,
     cadence: IdentityPipelineCadence,
     transport: crate::net_resilience::TransportCycleOutcome,
-    retry: live_snapshot_retry::LiveRetryOwner,
     _guards: Vec<EnvVarGuard>,
 }
 
@@ -420,7 +420,6 @@ impl ReofferPipeline {
             daemon: test_daemon("otm_test"),
             cadence,
             transport: crate::net_resilience::TransportCycleOutcome::default(),
-            retry: live_snapshot_retry::LiveRetryOwner::closed(),
             _guards: guards,
         }
     }
@@ -458,7 +457,6 @@ impl ReofferPipeline {
                 &self.daemon,
                 &mut self.transport,
                 self.daemon.snapshot_scan_account_witness().unwrap(),
-                false,
             )
         })
     }
@@ -493,7 +491,6 @@ impl ReofferPipeline {
                 &self.support,
                 &self.daemon,
                 &mut self.transport,
-                &mut self.retry,
             )
         });
         let index = ScanIndex::load(&index_path).unwrap();

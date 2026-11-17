@@ -725,6 +725,10 @@ fn given() -> Vec<(&'static str, Vec<Given>)> {
             vec![g(|s| Ok(s.string().into()))],
         ),
         (
+            "upload_context_proof/request_contributions/*/rows",
+            vec![g(|_| Ok(json!([[vec![0_u8; 16], "AAAAAAAAAAE="]])))],
+        ),
+        (
             "claude_money_birth_store",
             vec![g(|_| Ok(BIRTH_STORE.into()))],
         ),

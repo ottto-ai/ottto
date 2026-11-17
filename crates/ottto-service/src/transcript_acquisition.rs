@@ -2114,10 +2114,19 @@ mod tests {
         let f = Fixture::new(b"one\n");
         let mut file = f.open();
         let mut p = ReadPlan::prepare(&mut file, None, &scope(), None, 0).unwrap();
-        assert!(p.observe_complete_records(b"one").is_err());
+        let error = p.observe_complete_records(b"one").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert_eq!(p.samples.sealed_offset, 0);
-        assert!(p.observe_complete_records(b"one\ntwo\n").is_err());
+        let error = p.observe_complete_records(b"one\ntwo\n").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert_eq!(p.samples.sealed_offset, 0);
+        p.mode = ReadMode::Unchanged;
+        let error = p.observe_complete_records(b"one\n").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        p.mode = ReadMode::Full(FullReason::StateMissing);
+        p.samples.sealed_offset = u64::MAX;
+        let error = p.observe_complete_records(b"one\n").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]

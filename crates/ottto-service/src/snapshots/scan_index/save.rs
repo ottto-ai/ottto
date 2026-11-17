@@ -112,6 +112,7 @@ impl ScanIndex {
         if !path.exists() {
             claude_request_money::e2::reconcile_copy_ownership(&ScanIndex::default(), self);
         }
+        self.prune_request_contributions();
         let previous_generation = self.generation;
         self.schema_version = SCAN_INDEX_SCHEMA_VERSION;
         self.generation = self
@@ -124,6 +125,7 @@ impl ScanIndex {
         }
         match scan_index_integration::publish_at(path, self) {
             Ok(Some(state)) => {
+                self.deleted_holders.clear();
                 self.persistence_root = Some(state);
                 self.persistence_legacy_recovery = None;
                 return Ok(());
@@ -165,6 +167,9 @@ impl ScanIndex {
         if result.is_err() {
             self.generation = previous_generation;
             let _ = fs::remove_file(&temp_path);
+        }
+        if result.is_ok() {
+            self.deleted_holders.clear();
         }
         result
     }
@@ -393,13 +398,6 @@ fn pause_scan_index_cas_if_requested_for_test() {
 }
 
 impl ScanIndex {
-    /// A routed page's save left out a new entry, and with it that file's
-    /// staged Tail head: a later save of this page would commit the entry
-    /// with no head.
-    pub(crate) fn left_out_new_tail_entry(&self, saved: &Self) -> bool {
-        self.v2().persistence_v2.is_some()
-            && self.files.keys().any(|key| !saved.files.contains_key(key))
-    }
     pub(crate) fn retain_persistence_baseline_from(&mut self, committed: &Self) {
         if let Some(state) = &committed.v2 {
             let own = self.v2_mut();

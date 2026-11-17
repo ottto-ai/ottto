@@ -1497,6 +1497,313 @@ fn byte_budget_pages_pace_only_during_a_first_backfill() {
     }
 }
 
+const WALK_NOW: &str = "2026-11-17T00:01:00Z";
+const WALK_START: &str = "2026-11-17T00:00:00Z";
+
+fn pacing_index(queued: bool) -> ScanIndex {
+    let key = "/synthetic/work.jsonl";
+    let fp = "a".repeat(64);
+    let mut index = ScanIndex::default();
+    index.files.insert(
+        key.into(),
+        crate::snapshots::ScanIndexEntry {
+            last_snapshot_fingerprint: Some(fp.clone()),
+            ..Default::default()
+        },
+    );
+    let mut value = serde_json::to_value(index).unwrap();
+    value["file_snapshot_fingerprints"] = serde_json::json!({key: [fp]});
+    value["traversal"] = serde_json::json!({
+        "context_fingerprint": "context", "census_window_end": WALK_START,
+        "scan_roots": ["/synthetic"], "pending_directories": [],
+        "pending_candidates": if queued { serde_json::json!([{
+            "scan_root": "/synthetic", "path": key, "census_member": true
+        }]) } else { serde_json::json!([]) },
+        "observed_index_keys": [], "reconciliation_upper_bound": key,
+        "reconciliation_after": null, "reconciliation_started": false, "counts": {}
+    });
+    serde_json::from_value(value).unwrap()
+}
+
+fn walk_request(scan: &SourceScanResult, index: &ScanIndex, power: PlatformState) -> Option<bool> {
+    resident_scan_request_after_settlement(
+        scan,
+        true,
+        power,
+        index.runnable_walk_or_followup(scan, &Default::default(), false, false, WALK_NOW),
+    )
+}
+
+#[test]
+fn first_import_open_walk_pacing_decision_table() {
+    let mut scan = empty_scan();
+    scan.routine_recensus = true;
+    scan.census_status.pending_work = false;
+    scan.census_status.reconciliation_incomplete = true;
+    scan.state_census_complete = true;
+    scan.sidecar_census_complete = true;
+    let open = pacing_index(true);
+    let empty = pacing_index(false);
+    let mut followup = serde_json::to_value(&empty).unwrap();
+    followup["traversal"] = serde_json::Value::Null;
+    let clean: ScanIndex = serde_json::from_value(followup.clone()).unwrap();
+    followup["bounded_sweep_had_unsettled_upload"] = serde_json::json!(true);
+    let followup: ScanIndex = serde_json::from_value(followup).unwrap();
+    let mut reconciliation = serde_json::to_value(&empty).unwrap();
+    reconciliation["traversal"]["reconciliation_started"] = serde_json::json!(true);
+    let reconciliation: ScanIndex = serde_json::from_value(reconciliation).unwrap();
+    for source in ROTATION {
+        scan.source = source;
+        for (name, index, runnable) in [
+            ("queued census", &open, true),
+            ("owed clean followup", &followup, true),
+            ("empty healthy/stalled finalization", &empty, false),
+            ("executable reconciliation", &reconciliation, true),
+            ("clean close", &clean, false),
+        ] {
+            for power in [
+                PlatformState::Allowed,
+                PlatformState::Battery,
+                PlatformState::Refused,
+                PlatformState::Unknown,
+            ] {
+                let requested = walk_request(&scan, index, power);
+                assert_eq!(
+                    requested,
+                    (runnable && power == PlatformState::Allowed).then_some(false),
+                    "{source:?} {name} {power:?}"
+                );
+                let runnable = index.runnable_walk_or_followup(
+                    &scan,
+                    &Default::default(),
+                    false,
+                    false,
+                    WALK_NOW,
+                );
+                assert_eq!(
+                    resident_scan_request_after_settlement(&scan, false, power, runnable),
+                    None,
+                    "bootstrap complete {source:?} {name}"
+                );
+            }
+        }
+        for index in [&empty, &reconciliation, &followup] {
+            scan.state_census_complete = false;
+            assert_eq!(
+                walk_request(&scan, index, PlatformState::Allowed),
+                None,
+                "metadata only"
+            );
+            scan.state_census_complete = true;
+            scan.sidecar_census_complete = false;
+            assert_eq!(
+                walk_request(&scan, index, PlatformState::Allowed),
+                None,
+                "sidecar only"
+            );
+            scan.sidecar_census_complete = true;
+        }
+    }
+}
+
+#[test]
+fn blocked_followup_debt_grants_no_new_request_but_queued_siblings_do() {
+    use crate::snapshots::UnsettledUploadCause;
+    let mut scan = empty_scan();
+    scan.state_census_complete = true;
+    scan.sidecar_census_complete = true;
+    let mut index = pacing_index(false);
+    index.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::DeferredConflict);
+    assert!(!index.runnable_walk_or_followup(&scan, &Default::default(), true, true, WALK_NOW));
+    for cause in [
+        UnsettledUploadCause::CompletedBlockingHolds,
+        UnsettledUploadCause::RejectedWithHolds,
+    ] {
+        let mut held = index.clone();
+        held.mark_bounded_sweep_unsettled_by(cause);
+        assert!(!held.runnable_walk_or_followup(
+            &scan,
+            &Default::default(),
+            false,
+            false,
+            WALK_NOW
+        ));
+    }
+    let mut value = serde_json::to_value(&index).unwrap();
+    value["quarantined_snapshot_fingerprints"] = serde_json::json!({
+        "a".repeat(64): crate::snapshots::snapshot_quarantine_record(SnapshotSource::Codex)
+    });
+    let conflicted: ScanIndex = serde_json::from_value(value.clone()).unwrap();
+    assert!(!conflicted.runnable_walk_or_followup(
+        &scan,
+        &Default::default(),
+        false,
+        false,
+        WALK_NOW
+    ));
+    value["traversal"]["pending_candidates"] = serde_json::json!([{
+        "scan_root": "/synthetic", "path": "/synthetic/work.jsonl", "census_member": true
+    }]);
+    let held: ScanIndex = serde_json::from_value(value.clone()).unwrap();
+    assert!(!held.runnable_walk_or_followup(&scan, &Default::default(), false, false, WALK_NOW));
+    value["traversal"]["pending_candidates"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "scan_root": "/synthetic", "path": "/synthetic/sibling.jsonl", "census_member": true
+        }));
+    let sibling: ScanIndex = serde_json::from_value(value).unwrap();
+    assert!(sibling.runnable_walk_or_followup(&scan, &Default::default(), true, false, WALK_NOW));
+    let local = std::collections::BTreeSet::from(["a".repeat(64)]);
+    assert!(pacing_index(true).runnable_walk_or_followup(
+        &scan,
+        &Default::default(),
+        true,
+        false,
+        WALK_NOW
+    ));
+    assert!(!pacing_index(true).runnable_walk_or_followup(&scan, &local, true, false, WALK_NOW));
+}
+
+#[test]
+fn decode_held_followup_and_candidate_are_not_runnable() {
+    let mut scan = empty_scan();
+    let home = crate::test_scratch::private_dir("pacing-decode-hold");
+    let path = home.join("index.json");
+    let mut value = serde_json::to_value(pacing_index(true)).unwrap();
+    value["bounded_sweep_had_unsettled_upload"] = serde_json::json!(true);
+    value["files"]["/synthetic/work.jsonl"]["size_bytes"] = serde_json::json!("invalid");
+    std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    let index = ScanIndex::load(&path).unwrap();
+    assert!(index.decode_held_file_keys().next().is_some());
+    scan.state_census_complete = true;
+    scan.sidecar_census_complete = true;
+    assert!(!index.runnable_walk_or_followup(&scan, &Default::default(), false, true, WALK_NOW));
+    std::fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn terminal_retry_eligibility_dominates_followup_debt_and_nonmember_rereads() {
+    let mut scan = empty_scan();
+    let now = crate::snapshots::rfc3339_unix_seconds(WALK_NOW).unwrap();
+    for source in ROTATION {
+        scan.source = source;
+        let mut index = ScanIndex::default();
+        index.install_terminal_unhealthy_traversal_for_retry_test(source, &[], 30, now + 60);
+        index.mark_bounded_sweep_unsettled();
+        let mut value = serde_json::to_value(index).unwrap();
+        value["traversal"]["census_window_end"] = serde_json::json!(WALK_START);
+        value["traversal"]["pending_candidates"] = serde_json::json!([{
+            "scan_root": "/synthetic", "path": "/synthetic/live.jsonl", "census_member": false
+        }]);
+        for (deadline, expected) in [
+            (Some(now + 60), false),
+            (Some(now), true),
+            (None, true),
+            (Some(now + 7200), true),
+        ] {
+            value["traversal"]["unhealthy_retry_not_before_unix_seconds"] =
+                serde_json::json!(deadline);
+            let index: ScanIndex = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(
+                index.runnable_walk_or_followup(&scan, &Default::default(), false, true, WALK_NOW),
+                expected,
+                "{source:?} deadline {deadline:?}"
+            );
+        }
+        value["traversal"]["unhealthy_retry_not_before_unix_seconds"] = serde_json::json!(now + 60);
+        let mut mid_walk = value.clone();
+        mid_walk["traversal"]["pending_candidates"][0]["census_member"] = serde_json::json!(true);
+        let mid_walk: ScanIndex = serde_json::from_value(mid_walk).unwrap();
+        assert!(mid_walk.runnable_walk_or_followup(
+            &scan,
+            &Default::default(),
+            false,
+            false,
+            WALK_NOW
+        ));
+        let mut index: ScanIndex = serde_json::from_value(value).unwrap();
+        index.insert_retry_pending_claude_authority_for_test("family");
+        let mut value = serde_json::to_value(index).unwrap();
+        value["claude_usage_authority_quarantine"]["family"]["retry_after_unix_seconds"] =
+            serde_json::json!(now);
+        let index: ScanIndex = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            index.runnable_walk_or_followup(&scan, &Default::default(), false, true, WALK_NOW),
+            source == SnapshotSource::ClaudeCode,
+            "family override {source:?}"
+        );
+    }
+}
+
+#[test]
+fn first_import_final_page_conflict_requests_followup_after_settlement() {
+    let mut scan = empty_scan();
+    scan.census_complete = true;
+    scan.state_census_complete = true;
+    scan.sidecar_census_complete = true;
+    let mut index = ScanIndex::default();
+    let requested = |index: &ScanIndex, fresh| {
+        resident_scan_request_after_settlement(
+            &scan,
+            true,
+            PlatformState::Allowed,
+            index.runnable_walk_or_followup(&scan, &Default::default(), false, fresh, WALK_NOW),
+        )
+    };
+    assert_eq!(requested(&index, true), None);
+    index.mark_bounded_sweep_unsettled_by(crate::snapshots::UnsettledUploadCause::DeferredConflict);
+    let saved: ScanIndex = serde_json::from_value(serde_json::to_value(&index).unwrap()).unwrap();
+    assert_eq!(requested(&saved, true), Some(false));
+    assert_eq!(requested(&ScanIndex::default(), true), None, "clean close");
+}
+
+#[test]
+#[serial_test::serial(source_cadences, source_upload_deadlines)]
+fn first_import_open_walk_pacing_obeys_upload_shed_deadline_and_unplug() {
+    use super::super::{defer_source_uploads, paced_scan_due};
+    let _saved = OwnedCadences::install();
+    super::super::clear_cadence_state_for_test();
+    super::super::clear_source_upload_deadlines_for_test();
+    let scan = empty_scan();
+    let index = pacing_index(true);
+    crate::scan_clock::with_clock(1000, || {
+        let now = crate::scan_clock::now();
+        for source in ROTATION {
+            with_source_cadence(source, |cadence| cadence.record_scan_success(now, 0));
+            let first_import = walk_request(&scan, &index, PlatformState::Allowed).unwrap();
+            assert!(!first_import, "new reason stays at background priority");
+            request_resident_scan_on_power(source, first_import, PlatformState::Allowed);
+            with_source_cadence(source, |cadence| {
+                assert_eq!(
+                    cadence.paced_scan_due(),
+                    Some(now + Duration::from_secs(30))
+                );
+                assert_eq!(
+                    paced_pass_qos(PlatformState::Battery, cadence.paced_first_import()),
+                    PassQos::Background
+                );
+                assert_eq!(
+                    walk_request(&scan, &index, PlatformState::Battery),
+                    None,
+                    "no renewal"
+                );
+                cadence.set_server_min_interval(Some(Duration::from_secs(90)));
+                assert!(cadence.next_scan_after(now) >= Duration::from_secs(90));
+            });
+            defer_source_uploads(source, Duration::from_secs(120));
+        }
+        assert_eq!(paced_scan_due(), Some(now + Duration::from_secs(120)));
+        for source in ROTATION {
+            assert!(source_paced_due(source).is_none());
+            after_ordinary_source_failure(source);
+        }
+        assert_eq!(paced_scan_due(), None);
+    });
+    super::super::clear_source_upload_deadlines_for_test();
+    super::super::clear_cadence_state_for_test();
+}
+
 /// `count` Codex rollouts of about 1.7 KiB each in `root`, numbered from `first`.
 fn codex_rollouts(root: &Path, first: u64, count: u64) -> Vec<PathBuf> {
     (first..first + count)
@@ -1604,6 +1911,18 @@ fn first_read_progress_pages_pace_only_during_a_first_backfill() {
         let progress_term = bootstrap && pending && progress && !routine && !complete;
         let requested = resident_scan_requested(&scan, bootstrap);
         assert_eq!(requested, existing || progress_term, "{bits:08b}");
+        for power in [
+            PlatformState::Allowed,
+            PlatformState::Battery,
+            PlatformState::Refused,
+            PlatformState::Unknown,
+        ] {
+            assert_eq!(
+                resident_scan_request_after_settlement(&scan, bootstrap, power, false),
+                requested.then_some(bootstrap),
+                "old predicate and QoS {bits:08b} {power:?}"
+            );
+        }
         if !bootstrap {
             scan.first_read_progress = !progress;
             assert_eq!(

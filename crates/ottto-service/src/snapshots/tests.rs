@@ -6534,6 +6534,7 @@ pub(super) fn sample_session_artifact_item() -> SnapshotItem {
         session_account_evidence: None,
         claude_usage_request_ids: BTreeSet::new(),
         claude_usage_occurrences: BTreeMap::new(),
+        request_contributions: Box::new([]),
         cache_observations: None,
         cache_observations_state: None,
         cache_base_head_etag: None,
@@ -19287,6 +19288,7 @@ fn v6_snapshot_batch_matches_backend_contract() {
         session_account_evidence: None,
         claude_usage_request_ids: BTreeSet::new(),
         claude_usage_occurrences: BTreeMap::new(),
+        request_contributions: Box::new([]),
         cache_observations: None,
         cache_observations_state: None,
         cache_base_head_etag: None,
@@ -21085,6 +21087,7 @@ pub(super) fn valid_v6_batch_request() -> SnapshotBatchRequest {
             session_account_evidence: None,
             claude_usage_request_ids: BTreeSet::new(),
             claude_usage_occurrences: BTreeMap::new(),
+            request_contributions: Box::new([]),
             cache_observations: None,
             cache_observations_state: None,
             cache_base_head_etag: None,
@@ -21189,6 +21192,52 @@ fn snapshot_preflight_enforces_item_and_batch_wire_byte_caps() {
 }
 
 #[test]
+fn emitted_snapshot_bodies_have_only_the_full_v2_revision_witness() {
+    for source in [
+        SnapshotSource::Pi,
+        SnapshotSource::Codex,
+        SnapshotSource::ClaudeCode,
+    ] {
+        let mut request = valid_v6_batch_request();
+        request.source = source.api_slug().to_string();
+        let body = serde_json::to_value(&request).expect("serialize emitted batch");
+        let envelope = &body["snapshots"][0]["semantic_envelope"];
+        assert!(envelope.get("revision_contract_version").is_none());
+        assert!(envelope.get("revision_hash").is_none());
+        assert_eq!(
+            envelope["revision_v2_contract_version"],
+            "snapshot_revision:v2"
+        );
+        assert_eq!(
+            envelope["revision_v2_canonicalization"],
+            crate::canonical_json::CANONICAL_JSON_CONTRACT_VERSION
+        );
+        assert_eq!(
+            envelope["revision_v2_parser_version"],
+            source.parser_version()
+        );
+        assert_eq!(
+            envelope["revision_v2_scan_identity_version"],
+            source.scan_identity_version()
+        );
+        let item = &request.snapshots[0];
+        assert_eq!(
+            envelope["revision_v2_hash"],
+            snapshot_revision_v2_hash(
+                source,
+                item,
+                request.upload_policy,
+                &snapshot_semantic_component_hashes(source, item)
+            )
+        );
+        if source == SnapshotSource::ClaudeCode {
+            let actual_bytes = serde_json::to_vec(&body["snapshots"][0]).unwrap().len();
+            assert!(claude_request_identity::item_bytes(item) >= actual_bytes);
+        }
+    }
+}
+
+#[test]
 fn semantic_envelope_cross_language_golden_covers_all_valid_policies() {
     let mut base = valid_v6_batch_request()
         .snapshots
@@ -21248,7 +21297,6 @@ fn semantic_envelope_cross_language_golden_covers_all_valid_policies() {
                 "policy_neutral_component_hashes":
                     policy_neutral_component_hashes(&envelope.component_hashes),
                 "snapshot_fingerprint": item.snapshot_fingerprint,
-                "revision_hash": envelope.revision_hash,
                 "revision_v2_body": revision_v2_body,
                 "revision_v2_hash": envelope.revision_v2_hash,
                 "content_hash": envelope.content_hash,
@@ -21261,7 +21309,6 @@ fn semantic_envelope_cross_language_golden_covers_all_valid_policies() {
     let actual = json!({
         "schema_version": "semantic_envelope_golden:v3",
         "component_contract_version": SNAPSHOT_SEMANTIC_CONTRACT_VERSION,
-        "revision_contract_version": SNAPSHOT_REVISION_CONTRACT_VERSION,
         "revision_v2_contract_version": SNAPSHOT_REVISION_V2_CONTRACT_VERSION,
         "canonicalization": crate::canonical_json::CANONICAL_JSON_CONTRACT_VERSION,
         "content_hash_epoch": SNAPSHOT_CONTENT_HASH_EPOCH,
@@ -21351,17 +21398,19 @@ fn content_hash_ignores_scan_state_parser_provenance_and_display_policy() {
     fingerprint.source_file_fingerprint = Some("f".repeat(32));
     assert_eq!(content_hash(&fingerprint), expected, "file fingerprint");
     assert_ne!(
-        snapshot_revision_hash(
+        snapshot_revision_v2_hash(
             source,
             &fingerprint,
+            SnapshotUploadPolicy::default(),
             &snapshot_semantic_component_hashes(source, &fingerprint)
         ),
-        snapshot_revision_hash(
+        snapshot_revision_v2_hash(
             source,
             &base,
+            SnapshotUploadPolicy::default(),
             &snapshot_semantic_component_hashes(source, &base)
         ),
-        "the revision hash — the re-upload trigger — must still move"
+        "the v2 revision witness must still move"
     );
 
     let mut collector = base.clone();

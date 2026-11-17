@@ -163,7 +163,6 @@ fn identity_pipeline_cycle(
                 &daemon,
                 &mut transport,
                 [7; 32],
-                false,
             )
         },
     )?
@@ -195,9 +194,9 @@ fn identity_pipeline_cycle(
             }
         }
     };
-    apply_claude_local_evidence_to_scan(&support, &mut oracle_scan, &mut oracle_index);
+    apply_claude_local_evidence_to_scan_for_test(&support, &mut oracle_scan, &mut oracle_index);
     let (_preparation, mut index, mut scan) = collect_preparation_with_rotation(preparation);
-    apply_claude_local_evidence_to_scan(&support, &mut scan, &mut index);
+    apply_claude_local_evidence_to_scan_for_test(&support, &mut scan, &mut index);
     Ok(IdentityPipelineCycle {
         body: serde_json::to_vec(&scan.snapshots).expect("serialize body"),
         snapshots: scan.snapshots,
@@ -600,7 +599,6 @@ fn preparation_error_preserves_normalization_counts_on_scan_worker() {
                     &daemon,
                     &mut transport,
                     [7; 32],
-                    false,
                 )
             },
         )
@@ -710,7 +708,6 @@ fn transport_errors_keep_the_contract_without_observation_on_scan_worker() {
                 &daemon,
                 &mut transport,
                 [7; 32],
-                false,
             )
         });
         assert!(result.is_err());

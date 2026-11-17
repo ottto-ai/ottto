@@ -239,14 +239,29 @@ pub(in crate::snapshots) fn advance_bounded_directory_traversal_with_budget(
         let metadata = match fs::symlink_metadata(&directory.path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                // A queued directory gone mid-walk still counts as a lost
-                // listing; its indexed subtree is offered to the absence proof.
+                // A securely absent Claude descendant is a removal; a lost
+                // configured root still prevents census completion.
                 debt.unlisted();
-                disappearance_diagnostics::not_found(
-                    &mut traversal.counts.disappeared_file_count,
-                    source,
-                    disappearance_diagnostics::Site::WalkDirectory,
-                );
+                #[cfg(test)]
+                disappearance_diagnostics::before_walk_directory_absence_proof();
+                if source == SnapshotSource::ClaudeCode
+                    && directory.path != directory.scan_root
+                    && sampled_audit::proven_absent(
+                        &directory.path,
+                        std::slice::from_ref(&directory.scan_root),
+                    )
+                {
+                    disappearance_diagnostics::not_found_removal(
+                        source,
+                        disappearance_diagnostics::Site::WalkDirectory,
+                    );
+                } else {
+                    disappearance_diagnostics::not_found(
+                        &mut traversal.counts.disappeared_file_count,
+                        source,
+                        disappearance_diagnostics::Site::WalkDirectory,
+                    );
+                }
                 unlisted_index_keys(
                     &index.files,
                     &directory.path,

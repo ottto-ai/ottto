@@ -5,6 +5,7 @@
 use crate::agent_status::claude_credit_pools;
 use crate::agent_status::claude_oauth_account_state_lock;
 use crate::agent_status::claude_oauth_usage_cache_path;
+use crate::agent_status::claude_oauth_usage_legacy_breaker_path;
 use crate::agent_status::claude_oauth_usage_legacy_cache_path;
 use crate::agent_status::claude_oauth_usage_serve_gate_seconds;
 use crate::agent_status::compiled_release_version;
@@ -54,7 +55,7 @@ pub(in crate::agent_status) fn read_claude_oauth_usage_cache(
 pub(in crate::agent_status) fn read_claude_oauth_usage_cache_with_legacy_migration(
     account_identifier_hash: &str,
     organization_identifier_hash: &str,
-    allow_legacy_migration: bool,
+    legacy_root_migration: bool,
 ) -> Option<ClaudeOAuthUsageCache> {
     let lock =
         claude_oauth_account_state_lock(account_identifier_hash, organization_identifier_hash);
@@ -64,19 +65,21 @@ pub(in crate::agent_status) fn read_claude_oauth_usage_cache_with_legacy_migrati
     read_claude_oauth_usage_cache_locked(
         account_identifier_hash,
         organization_identifier_hash,
-        allow_legacy_migration,
+        legacy_root_migration,
     )
 }
 
 pub(in crate::agent_status) fn read_claude_oauth_usage_cache_locked(
     account_identifier_hash: &str,
     organization_identifier_hash: &str,
-    allow_legacy_migration: bool,
+    legacy_root_migration: bool,
 ) -> Option<ClaudeOAuthUsageCache> {
-    if allow_legacy_migration {
-        migrate_legacy_claude_oauth_usage_cache_locked(
+    if legacy_root_migration {
+        static CLEANUP: std::sync::Once = std::sync::Once::new();
+        migrate_and_clean_up_legacy_claude_oauth_usage_locked(
             account_identifier_hash,
             organization_identifier_hash,
+            &CLEANUP,
         );
     }
     let path = claude_oauth_usage_cache_path(account_identifier_hash, organization_identifier_hash);
@@ -148,28 +151,36 @@ pub(in crate::agent_status) fn write_claude_oauth_usage_cache_locked(
     write_owner_only_file_atomic_if_changed(&path, &body)
 }
 
-pub(in crate::agent_status) fn write_legacy_claude_oauth_usage_cache(
-    cache: &ClaudeOAuthUsageCache,
-) -> std::io::Result<()> {
-    let mut legacy_cache = cache.clone();
-    legacy_cache.schema_version = CLAUDE_OAUTH_USAGE_LEGACY_CACHE_SCHEMA_VERSION;
-    let body = serde_json::to_vec_pretty(&legacy_cache).map_err(std::io::Error::other)?;
-    write_owner_only_file_atomic_if_changed(&claude_oauth_usage_legacy_cache_path(), &body)
+pub(in crate::agent_status) fn migrate_and_clean_up_legacy_claude_oauth_usage_locked(
+    account_identifier_hash: &str,
+    organization_identifier_hash: &str,
+    cleanup: &std::sync::Once,
+) {
+    let _migration = CLAUDE_OAUTH_LEGACY_MIGRATION_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    migrate_legacy_claude_oauth_usage_cache_locked(
+        account_identifier_hash,
+        organization_identifier_hash,
+    );
+    // Old-release leftover cleanup; remove in the first release after 2026-12-31.
+    // Try once after the cache decoder has had its chance, under the same lock.
+    // Missing files and all other removal errors must not fail the caller.
+    cleanup.call_once(|| {
+        let _ = fs::remove_file(claude_oauth_usage_legacy_cache_path());
+        let _ = fs::remove_file(claude_oauth_usage_legacy_breaker_path());
+    });
 }
 
+// Old-release root-cache migration; remove in the first release after 2026-12-31.
+// Caller holds the account-state and legacy-migration locks.
 pub(in crate::agent_status) fn migrate_legacy_claude_oauth_usage_cache_locked(
     account_identifier_hash: &str,
     organization_identifier_hash: &str,
 ) {
     let target =
         claude_oauth_usage_cache_path(account_identifier_hash, organization_identifier_hash);
-    if target.exists() {
-        return;
-    }
-    let _migration = CLAUDE_OAUTH_LEGACY_MIGRATION_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if target.exists() {
         return;
     }

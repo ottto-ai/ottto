@@ -111,6 +111,14 @@
     "marker_source_file_fingerprint",
     "verified_source_file_fingerprint"
   ],
+  "proof.request_contribution": [
+    "body_witness",
+    "fingerprint",
+    "rows",
+    "rows[]",
+    "rows[][]",
+    "rows[][][16]"
+  ],
   "proof.upload_context": [
     "body_witness",
     "context_fingerprint"
@@ -347,6 +355,8 @@
     "residue.codex_inventory_hold.owed[]",
     "residue.codex_inventory_hold.refused_headers",
     "residue.codex_inventory_hold.refused_headers.*",
+    "residue.growth_retries",
+    "residue.growth_retries.*",
     "residue.index_keys",
     "residue.index_keys[]",
     "scan_roots",

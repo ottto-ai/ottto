@@ -268,8 +268,7 @@ fn grown_full() -> Grown {
 /// deadline); the index keeps the opened stamp; the next page re-selects the
 /// grown file and reads `Full` with body parity.
 ///
-/// Red on main: the reader passes the frozen length and fails with
-/// "acquisition exceeds stable source", recorded as one `OpenRead`.
+/// Growth stops at the frozen extent; it is never an `OpenRead` failure.
 #[test]
 fn fe_claude_sp1c_append_during_full_read_publishes_sealed_prefix() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -577,7 +576,7 @@ fn fe_claude_sp5a_truncate_then_regrow_after_short_eof_keeps_main_failure() {
     let mut regrown = bytes_of(&base.path)[sealed as usize..].to_vec();
     regrown.extend(row_bytes(CLAUDE, 6..8));
     let regrow_path = base.path.clone();
-    let ((_, tail, seen, read), at_eof) = with_eof_hook(
+    let ((index, tail, seen, read), at_eof) = with_eof_hook(
         &base.path,
         move |_| append_raw(&regrow_path, &regrown),
         || {
@@ -598,6 +597,16 @@ fn fe_claude_sp5a_truncate_then_regrow_after_short_eof_keeps_main_failure() {
     );
     assert!(len(&base.path) > read.frozen, "precondition: regrown");
     assert_refused(&tail, &seen, SCOPE_OBJECT, "SP-5a-c");
+    assert!(
+        !index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .residue
+            .growth_retries
+            .contains_key(&base.key),
+        "a short EOF cannot consume a growth retry"
+    );
 }
 
 /// SP-5b-c (GREEN): after the Claude reader passes frozen, the file is
@@ -827,39 +836,112 @@ fn fe_claude_sp8c_overdue_checkpoint_tails_and_keeps_debt_staged() {
     );
 }
 
-/// SP-11-c, Codex (GREEN): FE is Claude-only. A Codex in-page `Full` with an
-/// append after the open step keeps main's stable-source failure (`OpenRead`).
+/// Claude, Codex and Pi share frozen extents for ordinary Full and Tail reads.
+/// Their next pass includes the append, with cold-read body parity.
 #[test]
 fn fe_claude_sp11_codex_in_page_full_with_append_keeps_main_failure() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    let source = SnapshotSource::Codex;
-    let base = baseline(source, 4, 2);
-    // No continuation: the committed head on its route is retired.
-    crate::snapshots::e2_pipeline_scan_fixture::forget_continuations_for_test(
-        &base.cache,
-        &base.index,
-    );
-    let path = base.path.clone();
-    let appended = row_bytes(source, 6..8);
-    let (_, full, seen, read) = page_injecting(
-        &base.fixture,
-        source,
-        base.index,
-        &base.cache,
-        is_full,
-        |_| append_raw(&path, &appended),
-    );
-    assert_eq!(read.mode, ReadMode::Full(FullReason::StateMissing));
-    assert_refused(&full, &seen, OPEN_READ, "SP-11-c Codex");
+    for source in [CLAUDE, SnapshotSource::Codex, SnapshotSource::Pi] {
+        for full in [true, false] {
+            for partial in [false, true] {
+                let base = baseline(source, 4, 2);
+                // No continuation: the committed head on its route is retired.
+                if full {
+                    crate::snapshots::e2_pipeline_scan_fixture::forget_continuations_for_test(
+                        &base.cache,
+                        &base.index,
+                    );
+                }
+                let path = base.path.clone();
+                let sealed = len(&path);
+                let appended = if partial {
+                    let last = row_bytes(source, 6..7);
+                    append_raw(&path, &last[..last.len() - 1]);
+                    let mut completion = b"\n".to_vec();
+                    completion.extend(row_bytes(source, 7..8));
+                    completion
+                } else {
+                    row_bytes(source, 6..8)
+                };
+                let (index, prefix, seen, read) = page_injecting(
+                    &base.fixture,
+                    source,
+                    base.index.clone(),
+                    &base.cache,
+                    if full { is_full } else { is_tail },
+                    |_| append_raw(&path, &appended),
+                );
+                assert_eq!(seen.unreadable, 0, "{source:?}: {:?}", seen.causes);
+                assert_eq!(read.extent_limit, Some(read.frozen - read.start));
+                assert_eq!(index.files[&base.key].size_bytes, read.frozen);
+                assert!(index.files[&base.key].has_unverified_source());
+                assert!(index.files[&base.key].has_prefix_provenance());
+                let grown = bytes_of(&path);
+                if partial && !full {
+                    assert_eq!(
+                        tail_source::committed_sealed_offset(source, &index, &base.key),
+                        Some(base.sealed),
+                        "the withheld fragment cannot advance the saved Tail pointer"
+                    );
+                }
+                overwrite(&path, &grown[..sealed as usize]);
+                let expected = content(full_body(&base.fixture, source));
+                overwrite(&path, &grown);
+                assert_eq!(content(production_body(source, prefix)), expected);
+                if full {
+                    sampled_scan::set_test_now(Some(
+                        sampled_scan::now_seconds() + sampled_audit::GROWTH_FULL_INTERVAL,
+                    ));
+                }
+                let (_, next, seen) = plain(&base.fixture, source, index, &base.cache);
+                sampled_scan::set_test_now(None);
+                assert_eq!(seen.unreadable, 0, "{source:?}: {:?}", seen.causes);
+                assert_eq!(
+                    content(production_body(source, next)),
+                    content(full_body(&base.fixture, source))
+                );
+            }
+        }
+    }
+    stable_extent_does_not_hide_io_failure();
 }
 
-/// With s below the last committed size (GREEN): the last page committed
+/// A real failed OS read keeps OpenRead, even with growth beside it.
+fn stable_extent_does_not_hide_io_failure() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for source in [CLAUDE, SnapshotSource::Codex, SnapshotSource::Pi] {
+        let base = baseline(source, 4, 2);
+        let mut injected = false;
+        let (_, result, seen) = page(&base.fixture, source, base.index, &base.cache, |scan| {
+            if !injected && opened(scan).is_some() {
+                append_raw(&base.path, &row_bytes(source, 6..8));
+                // Same file identity, but read(2) on a write-only FD fails
+                // with EBADF. No reader error or census cause is mocked.
+                *scan
+                    .active_file
+                    .as_mut()
+                    .unwrap()
+                    .parser
+                    .reader
+                    .reader
+                    .get_mut() = OpenOptions::new().write(true).open(&base.path).unwrap();
+                injected = true;
+            }
+        });
+        assert!(injected);
+        assert_refused(&result, &seen, OPEN_READ, "OS read failure");
+    }
+}
+
+/// With s below the last committed size: the last page committed
 /// a file ending in a complete but unterminated row (size C, main's
 /// trailing-line rule). The file is re-selected at size C and, during its
 /// in-page `Full`, the row's newline and more rows are appended. The last newline at or below frozen (= C) is the row's start,
-/// below C, so FE must publish nothing (never a weaker body): one refusal, no
+/// below C, so defer only this file and publish no weaker body: no
 /// copy, and the committed entry stands.
 #[test]
 fn fe_claude_source_s_below_last_committed_size_publishes_nothing() {
@@ -885,20 +967,51 @@ fn fe_claude_source_s_below_last_committed_size_publishes_nothing() {
     let mut completion = b"\n".to_vec();
     completion.extend(row_bytes(CLAUDE, 5..7));
     let append_path = path.clone();
-    let (index, full, seen, read) =
-        page_injecting(&fixture, CLAUDE, index, &cache, is_full, |_| {
-            append_raw(&append_path, &completion)
-        });
+    let mut read = None;
+    let mut selected = None;
+    let (index, full, seen) = page(&fixture, CLAUDE, index, &cache, |scan| {
+        if read.is_none() {
+            if let Some(opened) = opened(scan) {
+                assert!(is_full(opened.mode));
+                selected = Some((scan.census_window_end.clone(), scan.selected_flags[&key]));
+                append_raw(&append_path, &completion);
+                read = Some(opened);
+            }
+        }
+    });
+    let read = read.expect("weaker-body read opened");
     assert_eq!(read.frozen, committed, "precondition: frozen = C");
     assert_eq!(
-        seen.unreadable, 1,
-        "SOURCE: refused; causes={:?}",
+        seen.unreadable, 0,
+        "SOURCE: file-only deferral; causes={:?}",
         seen.causes
     );
     assert!(full.snapshots.is_empty(), "SOURCE: never a weaker body");
     assert_eq!(
         index.files[&key].size_bytes, committed,
         "the committed entry stands"
+    );
+    let (window, flags) = selected.unwrap();
+    let walk = index.traversal.as_ref().expect("same walk still owes file");
+    assert_eq!(walk.census_window_end, window);
+    assert_eq!(walk.residue.growth_retries.get(&key), Some(&false));
+    let pending = walk
+        .pending_candidates
+        .iter()
+        .find(|p| p.path == path)
+        .unwrap();
+    assert_eq!((pending.census_member, pending.watcher_hint), flags);
+    assert!(full.census_status.pending_work);
+    sampled_scan::set_test_now(Some(
+        sampled_scan::now_seconds() + sampled_audit::GROWTH_FULL_INTERVAL,
+    ));
+    let (index, recovered, seen) = plain(&fixture, CLAUDE, index, &cache);
+    sampled_scan::set_test_now(None);
+    assert_eq!(seen.unreadable, 0, "weaker-body blocker cleared");
+    assert_eq!(index.files[&key].size_bytes, len(&path));
+    assert_eq!(
+        content(production_body(CLAUDE, recovered)),
+        content(full_body(&fixture, CLAUDE)),
     );
 }
 
@@ -1052,15 +1165,13 @@ fn fe_claude_growth_after_e1_applied_fragment_keeps_strict_identity() {
     append_raw(&fixture.0, b"\n");
     append_raw(&fixture.0, &row_bytes(CLAUDE, 2..3));
     assert!(
-        parser
-            .commit_claude_grown_prefix(&fixture.0, &scope, 0)
-            .is_none(),
+        parser.commit_grown_prefix(&fixture.0, &scope, 0).is_none(),
         "E1-applied bytes beyond the seal cannot get a grown grant"
     );
 }
 
-/// Review F2: exhausted/unsupported legacy prefix slots still refuse a
-/// grown prefix. Ordinary acquisition keeps its frozen extent independently.
+/// Exhausted prefix slots defer only this file. The acquisition remains
+/// bounded and cannot turn capacity refusal into a walk-wide read failure.
 #[test]
 fn fe_claude_full_without_audit_capacity_keeps_main_failure_and_marker_count() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -1073,6 +1184,7 @@ fn fe_claude_full_without_audit_capacity_keeps_main_failure_and_marker_count() {
             &base.index,
         );
         let mut read = None;
+        let mut selected = None;
         let (index, result, seen) = page(&base.fixture, CLAUDE, base.index, &base.cache, |scan| {
             if let Some(context) = scan.sampling.as_mut() {
                 context.audit_metadata_supported = supported;
@@ -1080,6 +1192,10 @@ fn fe_claude_full_without_audit_capacity_keeps_main_failure_and_marker_count() {
             }
             if read.is_none() {
                 if let Some(opened) = opened(scan) {
+                    selected = Some((
+                        scan.census_window_end.clone(),
+                        scan.selected_flags[&base.key],
+                    ));
                     assert!(is_full(opened.mode));
                     assert_eq!(
                         opened.extent_limit,
@@ -1092,18 +1208,158 @@ fn fe_claude_full_without_audit_capacity_keeps_main_failure_and_marker_count() {
             }
         });
         assert!(read.is_some());
-        assert_refused(&result, &seen, SCOPE_OBJECT, "FE capacity");
+        assert_eq!(seen.unreadable, 0, "FE capacity: {:?}", seen.causes);
+        assert!(result.snapshots.is_empty());
         // H1c freezes the admitted extent independently of audit capacity.
-        // With no H3c audit marker, completion revalidates the selected object.
-        assert_eq!(
-            seen.causes,
-            [0, 0, 0, 1, 0, 0, 0, 0],
-            "only scope/object refusal"
-        );
+        // With no audit slot, the committed body and census membership stay owed.
+        assert_eq!(seen.causes, [0; 8], "capacity defers only this file");
         assert!(!index
             .files
             .values()
             .any(ScanIndexEntry::has_unverified_source));
+        let (window, flags) = selected.unwrap();
+        let walk = index.traversal.as_ref().expect("capacity keeps same walk");
+        assert_eq!(walk.census_window_end, window);
+        assert_eq!(walk.residue.growth_retries.get(&base.key), Some(&false));
+        let pending = walk
+            .pending_candidates
+            .iter()
+            .find(|p| p.path == base.path)
+            .unwrap();
+        assert_eq!((pending.census_member, pending.watcher_hint), flags);
+        assert!(result.census_status.pending_work);
+        // Capacity returns on the retry; do not leave the candidate silently lost.
+        sampled_scan::set_test_now(Some(
+            sampled_scan::now_seconds() + sampled_audit::GROWTH_FULL_INTERVAL,
+        ));
+        let (index, recovered, seen) = plain(&base.fixture, CLAUDE, index, &base.cache);
+        sampled_scan::set_test_now(None);
+        assert_eq!(seen.unreadable, 0, "capacity blocker cleared");
+        assert_eq!(index.files[&base.key].size_bytes, len(&base.path));
+        assert_eq!(
+            content(production_body(CLAUDE, recovered)),
+            content(full_body(&base.fixture, CLAUDE)),
+        );
+    }
+    stable_extent_growth_retry_stops_after_second_hit();
+}
+
+/// Two growing reads exhaust the file's allowance, even across pages/restart.
+/// A third page in that walk opens no transcript; a committed body releases
+/// to the next pass, while a new file keeps an unreadable census.
+fn stable_extent_growth_retry_stops_after_second_hit() {
+    for committed_body in [true, false] {
+        let base = baseline(CLAUDE, 4, 2);
+        crate::snapshots::e2_pipeline_scan_fixture::forget_continuations_for_test(
+            &base.cache,
+            &base.index,
+        );
+        let mut index = if committed_body {
+            base.index.clone()
+        } else {
+            ScanIndex::default()
+        };
+        let now = sampled_scan::now_seconds();
+        let mut total_reads = 0;
+        let mut window = None;
+        for attempt in 0..2 {
+            sampled_scan::set_test_now(Some(now + attempt * sampled_audit::GROWTH_FULL_INTERVAL));
+            let mut injected = false;
+            let (next, result, seen) = page(&base.fixture, CLAUDE, index, &base.cache, |scan| {
+                scan.sampling.as_mut().unwrap().audit_slots = 0;
+                if !injected && opened(scan).is_some() {
+                    if let Some(window) = window.as_ref() {
+                        assert_eq!(&scan.census_window_end, window, "same walk");
+                    } else {
+                        window = Some(scan.census_window_end.clone());
+                    }
+                    append_raw(&base.path, &row_bytes(CLAUDE, 9..10));
+                    if attempt == 1 {
+                        // Keep discovery open through the third page. Its relist
+                        // may queue the file again, but cannot renew the retry.
+                        scan.index
+                            .traversal
+                            .as_mut()
+                            .unwrap()
+                            .pending_directories
+                            .push_back(ScanTraversalPath {
+                                scan_root: base.fixture.root.clone(),
+                                path: base.fixture.root.clone(),
+                                census_member: true,
+                                watcher_hint: false,
+                            });
+                    }
+                    injected = true;
+                }
+            });
+            assert!(injected, "each of the two allowed reads opened");
+            assert_eq!(seen.modes, (1, 0, 0));
+            total_reads += seen.modes.0;
+            assert!(result.snapshots.is_empty());
+            assert_eq!(
+                seen.unreadable,
+                usize::from(attempt == 1 && !committed_body)
+            );
+            let walk = next.traversal.as_ref().expect("walk still active");
+            assert_eq!(walk.residue.growth_retries[&base.key], attempt == 1);
+            if attempt == 1 && committed_body {
+                let pending = walk
+                    .pending_candidates
+                    .iter()
+                    .find(|p| p.path == base.path)
+                    .unwrap();
+                assert_eq!((pending.census_member, pending.watcher_hint), (false, true));
+                assert_eq!(next.files[&base.key].size_bytes, base.sealed);
+            }
+            // A resumed saved walk keeps the consumed retry allowance.
+            let resumed: ScanTraversalCheckpoint =
+                serde_json::from_value(serde_json::to_value(walk).unwrap()).unwrap();
+            assert_eq!(resumed.residue.growth_retries, walk.residue.growth_retries);
+            index = next;
+        }
+        let (index, third, seen) = plain(&base.fixture, CLAUDE, index, &base.cache);
+        assert_eq!(seen.modes, (0, 0, 0), "no third read in the walk");
+        assert_eq!(total_reads, 2);
+        assert!(third.snapshots.is_empty());
+        if committed_body {
+            let walk = index
+                .traversal
+                .as_ref()
+                .expect("growth reconciliation page");
+            let pending = walk
+                .pending_candidates
+                .iter()
+                .find(|p| p.path == base.path)
+                .expect("next-pass release hint");
+            assert_eq!((pending.census_member, pending.watcher_hint), (false, true));
+            assert_eq!(index.files[&base.key].size_bytes, base.sealed);
+            assert!(index.files[&base.key].source_file_fingerprint.is_empty());
+            assert!(index.files[&base.key].last_snapshot_fingerprint.is_some());
+            // Growth revalidation retains the debt and reports queued work
+            // once. The next metadata-only page finishes reconciliation;
+            // neither page may reopen the transcript in this walk.
+            let (index, retired, seen) = plain(&base.fixture, CLAUDE, index, &base.cache);
+            assert_eq!(seen.modes, (0, 0, 0), "reconciliation opens no transcript");
+            assert!(retired.snapshots.is_empty());
+            assert!(
+                index.traversal.is_none(),
+                "released for the next ordinary pass"
+            );
+            sampled_scan::set_test_now(Some(now + 2 * sampled_audit::GROWTH_FULL_INTERVAL));
+            let (_, recovered, seen) = plain(&base.fixture, CLAUDE, index, &base.cache);
+            assert_eq!(seen.unreadable, 0);
+            assert_eq!(
+                content(production_body(CLAUDE, recovered)),
+                content(full_body(&base.fixture, CLAUDE)),
+            );
+        } else {
+            assert!(index.traversal.as_ref().unwrap().has_retryable_problems());
+            assert!(
+                third.census_status.retryable_problem,
+                "new file cannot claim completion"
+            );
+        }
+        sampled_scan::set_test_now(None);
     }
 }
 
@@ -1175,9 +1431,7 @@ fn fe_claude_full_without_h1c_admission_keeps_strict_completion() {
     while !parser.step().unwrap() {}
     assert_eq!(parser.reader.extent_limit, None);
     append_raw(&fixture.0, &row_bytes(CLAUDE, 2..3));
-    assert!(parser
-        .commit_claude_grown_prefix(&fixture.0, &scope, 0)
-        .is_none());
+    assert!(parser.commit_grown_prefix(&fixture.0, &scope, 0).is_none());
 }
 
 /// Persistence must preserve the exclusion even without a census record and after key drift.
