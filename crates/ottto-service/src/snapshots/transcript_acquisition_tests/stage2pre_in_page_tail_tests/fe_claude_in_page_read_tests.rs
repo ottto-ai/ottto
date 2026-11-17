@@ -552,16 +552,23 @@ fn assert_retried(
     );
 }
 
-/// A page that renames a same-bytes object over the path once its in-page
-/// read opens. Returns the page's walk window and the file's selection flags.
+/// A page that renames a same-bytes object over the path once an in-page
+/// read whose mode satisfies `want` opens. `rereading`: the file is selected
+/// as a watcher-hinted re-read that does not hold the census. Returns the
+/// page's walk window and the file's selection flags.
 fn replaced_page(
     source: SnapshotSource,
     base: &Baseline,
     index: ScanIndex,
+    want: fn(ReadMode) -> bool,
+    rereading: bool,
 ) -> (ScanIndex, SourceScanResult, Seen, (String, (bool, bool))) {
     let mut selected = None;
     let (index, result, seen) = page(&base.fixture, source, index, &base.cache, |scan| {
-        if selected.is_none() && opened(scan).is_some() {
+        if selected.is_none() && opened(scan).is_some_and(|read| want(read.mode)) {
+            if rereading {
+                scan.selected_flags.insert(base.key.clone(), (false, true));
+            }
             selected = Some((
                 scan.census_window_end.clone(),
                 scan.selected_flags[&base.key],
@@ -576,19 +583,28 @@ fn replaced_page(
 /// SP-3a-c: a new object renamed over the path during a `Tail`; the held FD
 /// is not grown, so the strict reopen refuses. The first refusal keeps
 /// nothing and requeues the file with its selection flags, also across a
-/// restart. A stable retry publishes the cold-read body once; a second
-/// refusal in the walk is main's `ScopeObject` and keeps the census red.
+/// restart. A re-read that did not hold the census is requeued as a census
+/// member, so the walk cannot retire before the retry. A stable retry
+/// publishes the cold-read body once; a second refusal in the walk is main's
+/// `ScopeObject` and keeps the census red.
 #[test]
 fn fe_claude_sp3a_replace_during_tail_not_grown_is_scope_object() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    for source in [CLAUDE, SnapshotSource::Codex, SnapshotSource::Pi] {
+    for (source, rereading) in [
+        (CLAUDE, false),
+        (CLAUDE, true),
+        (SnapshotSource::Codex, false),
+        (SnapshotSource::Codex, true),
+        (SnapshotSource::Pi, false),
+    ] {
         for refused_again in [false, true] {
-            let id = format!("SP-3a-c {source:?} refused_again={refused_again}");
+            let id =
+                format!("SP-3a-c {source:?} rereading={rereading} refused_again={refused_again}");
             let base = baseline(source, 4, 2);
             let (mut index, first, seen, (window, flags)) =
-                replaced_page(source, &base, base.index.clone());
+                replaced_page(source, &base, base.index.clone(), is_tail, rereading);
             assert_retried(&index, &first, &seen, &base, &id);
             let walk = index.traversal.as_ref().unwrap();
             assert_eq!(walk.census_window_end, window, "{id}: same walk");
@@ -597,17 +613,34 @@ fn fe_claude_sp3a_replace_during_tail_not_grown_is_scope_object() {
                 .iter()
                 .find(|p| p.path == base.path)
                 .unwrap();
-            assert_eq!((pending.census_member, pending.watcher_hint), flags, "{id}");
+            assert_eq!(
+                (pending.census_member, pending.watcher_hint),
+                (true, flags.1),
+                "{id}: the retry holds the census"
+            );
+            if rereading {
+                assert_eq!(flags, (false, true), "precondition: {id}");
+                assert!(!first.census_complete, "{id}: the walk waits");
+                assert!(
+                    first.skipped_file_count_due_to_limit <= first.discovered_file_count,
+                    "{id}: pending never exceeds discovered"
+                );
+            } else {
+                assert!(flags.0, "precondition: {id}");
+            }
             // A restart resumes the saved walk with its spent allowance.
             let resumed: ScanTraversalCheckpoint =
                 serde_json::from_value(serde_json::to_value(walk).unwrap()).unwrap();
             assert_eq!(resumed.residue, walk.residue, "{id}");
             index.traversal = Some(resumed);
-            sampled_scan::set_test_now(Some(
-                sampled_scan::now_seconds() + sampled_audit::GROWTH_FULL_INTERVAL,
-            ));
+            // A re-read's retry runs without moving the growth clock.
+            if !rereading {
+                sampled_scan::set_test_now(Some(
+                    sampled_scan::now_seconds() + sampled_audit::GROWTH_FULL_INTERVAL,
+                ));
+            }
             if refused_again {
-                let (_, refused, seen, _) = replaced_page(source, &base, index);
+                let (_, refused, seen, _) = replaced_page(source, &base, index, |_| true, false);
                 sampled_scan::set_test_now(None);
                 assert_refused(&refused, &seen, SCOPE_OBJECT, &id);
                 assert!(refused.census_status.retryable_problem, "{id}: census red");
@@ -623,39 +656,75 @@ fn fe_claude_sp3a_replace_during_tail_not_grown_is_scope_object() {
             }
         }
     }
-    changed_reopen_shares_growth_retry();
+    paced_reopen_refuses_without_retry();
+    changed_reopen_shares_growth_retry(CLAUDE);
+    changed_reopen_shares_growth_retry(SnapshotSource::Codex);
+}
+
+/// A Claude growth Full that spent its six-hour claim: a retry could only be
+/// paced, unread, so the strict refusal records main's `ScopeObject` at once.
+/// The clock does not move.
+fn paced_reopen_refuses_without_retry() {
+    let id = "SP-3a-c paced growth Full";
+    let base = baseline(CLAUDE, 4, 2);
+    crate::snapshots::e2_pipeline_scan_fixture::forget_continuations_for_test(
+        &base.cache,
+        &base.index,
+    );
+    let (index, refused, seen, _) =
+        replaced_page(CLAUDE, &base, base.index.clone(), is_full, false);
+    assert!(
+        sampled_audit::growth_full_paced(&index, &base.key, sampled_scan::now_seconds()),
+        "precondition: {id}: a retry would be paced"
+    );
+    assert_refused(&refused, &seen, SCOPE_OBJECT, id);
+    assert!(refused.census_status.retryable_problem, "{id}: census red");
+    assert!(
+        index
+            .traversal
+            .as_ref()
+            .is_none_or(|walk| !walk.residue.growth_retries.contains_key(&base.key)),
+        "{id}: no retry spent"
+    );
 }
 
 /// Growth and a changed strict reopen share the file's one retry in a walk:
 /// after either spends it, the other takes its existing second-hit outcome.
-fn changed_reopen_shares_growth_retry() {
+fn changed_reopen_shares_growth_retry(source: SnapshotSource) {
     for growth_first in [true, false] {
-        let id = format!("shared retry growth_first={growth_first}");
-        let base = baseline(CLAUDE, 4, 2);
-        crate::snapshots::e2_pipeline_scan_fixture::forget_continuations_for_test(
-            &base.cache,
-            &base.index,
-        );
+        let id = format!("shared retry {source:?} growth_first={growth_first}");
+        let base = baseline(source, 4, 2);
         let now = sampled_scan::now_seconds();
         let mut index = base.index.clone();
         for attempt in 0..2 {
             sampled_scan::set_test_now(Some(now + attempt * sampled_audit::GROWTH_FULL_INTERVAL));
             let grow = growth_first == (attempt == 0);
-            let mut injected = false;
-            let (next, result, seen) = page(&base.fixture, CLAUDE, index, &base.cache, |scan| {
+            // Growth takes a Full without audit capacity. A replace first is a
+            // Tail, whose retry pacing cannot defer.
+            if grow || attempt == 1 {
+                crate::snapshots::e2_pipeline_scan_fixture::forget_continuations_for_test(
+                    &base.cache,
+                    &index,
+                );
+            }
+            let mut injected = None;
+            let (next, result, seen) = page(&base.fixture, source, index, &base.cache, |scan| {
                 if grow {
                     scan.sampling.as_mut().unwrap().audit_slots = 0;
                 }
-                if !injected && opened(scan).is_some() {
-                    if grow {
-                        append_raw(&base.path, &row_bytes(CLAUDE, 9..10));
-                    } else {
-                        replace(&base.path, &bytes_of(&base.path));
+                if injected.is_none() {
+                    injected = opened(scan).map(|read| read.mode);
+                    if injected.is_some() {
+                        if grow {
+                            append_raw(&base.path, &row_bytes(source, 9..10));
+                        } else {
+                            replace(&base.path, &bytes_of(&base.path));
+                        }
                     }
-                    injected = true;
                 }
             });
-            assert!(injected, "{id}: attempt {attempt} opened");
+            let mode = injected.unwrap_or_else(|| panic!("{id}: attempt {attempt} opened"));
+            assert_eq!(is_tail(mode), !grow && attempt == 0, "{id}: {mode:?}");
             assert!(result.snapshots.is_empty(), "{id}");
             let retry = next
                 .traversal

@@ -2087,13 +2087,15 @@ impl OwnedSourceScan {
                                 );
                             }
                             // Nothing of this read is kept. A changed object
-                            // or scope uses the file's one same-walk retry;
-                            // a second refusal keeps the census red.
+                            // or scope uses the file's one same-walk retry,
+                            // which holds the walk; a second refusal keeps
+                            // the census red.
                             if !matches!(cause, UnreadableCause::ScopeObject)
                                 || !scan::owned_scan::retry_file_once(
                                     index,
                                     &selected_flags,
                                     &candidate,
+                                    true,
                                 )
                             {
                                 census.record_unreadable_file(cause, &candidate.path);
