@@ -103,7 +103,9 @@ fn acked_original(v2: bool, old_binding: bool) -> Acked {
             .codex_counting_owner = None;
     }
     let index_path = root.join("index.json");
-    previous.save(&index_path).unwrap();
+    previous
+        .save_fixture_for_source(&index_path, SnapshotSource::Codex)
+        .unwrap();
     let previous = ScanIndex::load(&index_path).unwrap();
     Acked {
         root,
@@ -1013,8 +1015,11 @@ fn evicted_legacy_diagnostic_history_is_bounded_lenient_and_charged() {
                 > limit * 64
         );
     }
-    fs::write(&acked.index_path, serde_json::to_vec(&value).unwrap()).unwrap();
-    let loaded = ScanIndex::load(&acked.index_path).unwrap();
+    // The decoder reads old bytes from its own unbound file, apart from the
+    // native custody at `index_path`.
+    let decoder = acked.root.join("decoder.json");
+    fs::write(&decoder, serde_json::to_vec(&value).unwrap()).unwrap();
+    let loaded = ScanIndex::load(&decoder).unwrap();
     assert_eq!(
         serde_json::to_value(&loaded.codex_counting_evicted_legacy).unwrap(),
         json!(expected)
@@ -1023,8 +1028,8 @@ fn evicted_legacy_diagnostic_history_is_bounded_lenient_and_charged() {
         value["codex_counting_evicted_legacy"] = damaged;
         let derived: ScanIndex = serde_json::from_value(value.clone()).unwrap();
         assert!(derived.codex_counting_evicted_legacy.is_empty());
-        fs::write(&acked.index_path, serde_json::to_vec(&value).unwrap()).unwrap();
-        assert!(ScanIndex::load(&acked.index_path)
+        fs::write(&decoder, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(ScanIndex::load(&decoder)
             .unwrap()
             .codex_counting_evicted_legacy
             .is_empty());

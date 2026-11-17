@@ -2090,7 +2090,9 @@ pub(in crate::snapshots) mod tests {
             .join("a".repeat(64))
             .join("codex-scan-index.json");
         activation = e2_pipeline_scan_fixture::seed_index_for_test(&activation, &route);
-        e2_pipeline_scan_fixture::save_for_test(&mut activation, &out.join("activation.json"));
+        activation.save_fixture(&route).unwrap();
+        // The historical binary reads only this legacy export.
+        e2_pipeline_scan_fixture::legacy_view_for_test(&activation, &out.join("activation.json"));
         fs::write(out.join("activation-key.txt"), local_index_key(&singleton)).unwrap();
         fs::remove_dir_all(root).unwrap();
     }

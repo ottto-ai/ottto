@@ -334,10 +334,12 @@ fn copy_prefix_routes(arm: Settled) {
                 "{arm:?} page {request}: the {owner} prior owes the holder again"
             );
         }
-        // The committed prior as an older release's store holds it, loaded
-        // by this build.
-        let upgraded =
-            upgrade_from_legacy_store(&priors[2], &c.base.join("legacy-scan-index.json"));
+        // The committed prior as an older release's store holds it, imported
+        // by this build; each page's store is its own scratch path.
+        let upgraded = upgrade_from_legacy_store(
+            &priors[2],
+            &c.base.join(format!("legacy-scan-index-{request}.json")),
+        );
         let restart = disk.owner(SnapshotSource::ClaudeCode);
         let mut pages = claude_pages(&c, &scanner, &restart, priors, (0, 1, 0));
         finish_claude_pages(&c, &mut pages);

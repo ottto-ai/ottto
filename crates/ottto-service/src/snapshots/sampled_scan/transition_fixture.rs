@@ -208,11 +208,14 @@ pub(crate) fn legacy_pending_store(index: &super::super::ScanIndex) -> Value {
     legacy
 }
 
-/// Writes [`legacy_pending_store`] at `path` and loads it as this build does.
+/// Writes [`legacy_pending_store`] at `path`, a fresh Claude scratch path,
+/// and imports it as this build's source-aware load does, then reopens the
+/// imported native custody cold.
 pub(crate) fn upgrade_from_legacy_store(
     index: &super::super::ScanIndex,
     path: &std::path::Path,
 ) -> super::super::ScanIndex {
+    use crate::snapshots::e2_pipeline_scan_fixture as fixture;
     let legacy = legacy_pending_store(index);
     assert!(!legacy["claude_usage_family_pending"]
         .as_object()
@@ -225,8 +228,21 @@ pub(crate) fn upgrade_from_legacy_store(
             .is_empty(),
         "a carrying walk"
     );
-    std::fs::write(path, serde_json::to_vec(&legacy).unwrap()).expect("write the legacy store");
-    super::super::ScanIndex::load(path).expect("an older release's store loads")
+    fixture::bind_source_for_test(path, SnapshotSource::ClaudeCode);
+    fixture::legacy_input_for_test(path, &serde_json::to_vec(&legacy).unwrap());
+    let (imported, _) = super::super::ScanIndex::load_for_snapshot_source_with_origin(
+        path,
+        SnapshotSource::ClaudeCode,
+        &path.parent().unwrap().join("fixture-support"),
+    )
+    .expect("an older release's store loads");
+    assert!(
+        fixture::route_of(&imported).is_some(),
+        "the upgrade imports into native custody"
+    );
+    // Like any fixture store, a scan owner continues on its own route.
+    fixture::E2ScanFixture::register_route_for_test(path);
+    fixture::cold_restart(imported)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]

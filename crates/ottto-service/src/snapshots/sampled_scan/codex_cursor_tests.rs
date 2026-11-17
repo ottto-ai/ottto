@@ -6044,7 +6044,9 @@ fn vanished_residue_owner_file_retires_like_an_ordinary_vanished_file() {
             ._dir
             .0
             .join(format!("residue-index-{removal_hint}.json"));
-        index.save(&checkpoint).unwrap();
+        index
+            .save_fixture_for_source(&checkpoint, SnapshotSource::Codex)
+            .unwrap();
         let restored = ScanIndex::load(&checkpoint).unwrap();
         let mut final_page = new_scan(restored);
         final_page.codex_join_prepared = true;
@@ -7741,7 +7743,9 @@ fn continuation_eof_parks_then_ordinary_resumes_without_rereading_and_applies_on
                 if schedule == "restart" && turn == 2 {
                     let stale = cache.paused_ticket_for_test().unwrap();
                     let path = fixture._dir.0.join("restart-index.json");
-                    index.save(&path).unwrap();
+                    index
+                        .save_fixture_for_source(&path, SnapshotSource::Codex)
+                        .unwrap();
                     drop(cache); // Cursor, reader and continuation inputs are RAM-only.
                     CARRIED.with(|v| {
                         v.borrow_mut().remove(&fixture.root);
