@@ -710,7 +710,7 @@ fn equal_before_tie_held() {
         refused(replay_group(group_of(&root), &ScanIndex::default())),
         Some((JoinRefusal::EqualBeforeTie, 0))
     );
-    let tokens = probe_before(&member(OWNER, "r", 100, 100)[2]);
+    let tokens = probe_before(&member(OWNER, "r", 100, 100)[3]);
     assert_eq!(
         order_by_probes(&[0, 1], &[tokens, tokens]),
         Err(JoinRefusal::EqualBeforeTie)

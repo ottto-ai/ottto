@@ -75,6 +75,9 @@ pub(in crate::snapshots) fn seed(index: &mut ScanIndex, path: &Path, root: &Path
         .unwrap();
     let mut unused = SnapshotAccumulator::new(SnapshotSource::Codex);
     let decoded = codex::Codex::decode_head(current.revision, &current.body, &mut unused).unwrap();
+    let capture = HeadIdentity::take(&mut Dec::new(&current.body))
+        .unwrap()
+        .capture;
     let (mut old, _, historical) = decode(kind);
     old.codex_sidecar_binding = unused.codex_sidecar_binding;
     let entry = &index.files[&key];
@@ -94,7 +97,7 @@ pub(in crate::snapshots) fn seed(index: &mut ScanIndex, path: &Path, root: &Path
         .stage::<codex::Codex>(
             &view,
             &decoded.certificate,
-            &HeadIdentity::new(&route, SnapshotSource::Codex, root, path, true),
+            &HeadIdentity::new(&route, SnapshotSource::Codex, root, path, capture),
             state_v2::Change::Reset,
         )
         .unwrap()

@@ -198,7 +198,10 @@ fn header_cache_production_wake_output_equivalence_join_fork_counting() {
                     let counting = scan.codex_counting_v2.as_deref().unwrap();
                     assert_eq!(counting.v2_sessions, 2);
                     assert_eq!(counting.native_counted, 2);
-                    assert_eq!(counting.ui_in_unbound_span, 0);
+                    assert_eq!(
+                        counting.ui_in_unbound_span, 2,
+                        "the fork has two unbound UI records"
+                    );
                     let counting = serde_json::to_value(counting).unwrap();
                     for key in &group_keys {
                         assert!(index.files[key].codex_counting_v2);

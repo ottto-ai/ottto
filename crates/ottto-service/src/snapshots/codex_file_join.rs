@@ -3346,7 +3346,7 @@ pub(super) mod tests {
         assert!(parsed.progress_complete());
         assert_eq!(parsed.snapshots.len(), 1);
         assert_eq!(parsed.snapshots[0].input_tokens, 300);
-        assert_eq!(parsed.report.parsed_json_line_count, 10);
+        assert_eq!(parsed.report.parsed_json_line_count, 12);
         fs::remove_dir_all(root).unwrap();
     }
     thread_local! {
@@ -5394,6 +5394,7 @@ pub(super) mod tests {
             text.push_str(&(serde_json::to_string(&row).unwrap() + "\n"));
         }
         fs::write(&path, text).unwrap();
+        older_build_logs_priority("r-c");
         let (mut working, mut result) = scan(&root, previous.clone(), 2);
         finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut working);
         let (captured, changed) =
@@ -5407,7 +5408,7 @@ pub(super) mod tests {
                 .unwrap()
                 .tiers
                 .len(),
-            2
+            4
         );
         for accepted in [&old_accepted, &BTreeSet::new()] {
             let mut rollback = captured.clone();
@@ -5445,7 +5446,7 @@ pub(super) mod tests {
                 .unwrap()
                 .tiers
                 .len(),
-            2
+            4
         );
         fs::remove_dir_all(root).unwrap();
     }
