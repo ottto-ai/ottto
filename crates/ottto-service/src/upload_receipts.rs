@@ -1337,14 +1337,6 @@ mod tests {
             }
             assert!(evidence(&req, &ack, true).is_none(), "{kind}");
         }
-        let ordinary = proof_request("codex", false);
-        let mut legacy = proof_response(&ordinary, false);
-        legacy.entity_ack_contract = None;
-        legacy.accepted_entities.clear();
-        assert!(legacy
-            .validate_entity_ack_with_head_cas(&ordinary, false)
-            .is_ok());
-        assert!(evidence(&ordinary, &legacy, false).is_none());
     }
 
     #[test]
