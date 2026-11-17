@@ -806,6 +806,7 @@ pub(super) fn retry_ordinary_owned(item: &SnapshotItem) -> Option<SnapshotItem> 
         claude_money: None,
         claude_usage_request_ids: BTreeSet::new(),
         claude_usage_occurrences: BTreeMap::new(),
+        request_contributions: Box::new([]),
         cache_observations: item.cache_observations.clone(),
         cache_observations_state: None,
         cache_base_head_etag: None,

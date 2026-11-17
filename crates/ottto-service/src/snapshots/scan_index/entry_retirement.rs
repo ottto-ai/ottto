@@ -220,6 +220,8 @@ impl ScanIndex {
     /// it after its own guards; dispositions, fingerprints, holds and Codex
     /// proof stay with each caller. Nothing else ends a census record.
     pub(in crate::snapshots) fn drop_file_entry(&mut self, key: &str) {
+        self.deleted_holders
+            .insert(claude_money_birth_store::location_key(key));
         self.files.remove(key);
         self.confirmed_empty_files.remove(key);
         self.claude_request_census.remove(key);

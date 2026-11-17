@@ -1385,6 +1385,7 @@ pub(super) fn activate_source_upload_context(
     );
     progress.fresh_context_body_acks.clear();
     progress.context_receipt_candidates.clear();
+    progress.request_contributions.clear();
     progress.context_resend = upload_context_resend::Cycle::new(context);
 }
 

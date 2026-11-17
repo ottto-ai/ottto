@@ -1047,6 +1047,7 @@ pub(super) fn checkpoint_partial_snapshot_index_with_audit_release(
         &durable.accepted_body_witnesses,
         &durable.accepted_body_contexts,
     );
+    committable.accept_request_contributions(progress);
     validate_destination().context(CHECKPOINT_VALIDATE_DESTINATION)?;
     committable
         .save_with_progress_owner(index_path, read_limit, &progress_owner)
@@ -1056,6 +1057,54 @@ pub(super) fn checkpoint_partial_snapshot_index_with_audit_release(
         context_rearms.emit(scan.source);
     }
     Ok(committable)
+}
+
+impl ScanIndex {
+    pub(super) fn accept_request_contributions(&mut self, progress: &SnapshotUploadProgress) {
+        let covered = progress.covered_stale_bodies();
+        let mut seen = BTreeSet::new();
+        for (fp, (slot, rows)) in &progress.request_contributions {
+            if progress.fresh_context_body_acks.get(fp) != Some(&rows.body_witness)
+                || progress.quarantined_fingerprints.contains_key(fp)
+                || covered.get(fp) == Some(&rows.body_witness)
+            {
+                continue;
+            }
+            if seen.insert(slot) {
+                self.upload_context_proof
+                    .request_contributions
+                    .insert(slot.clone(), rows.clone());
+            } else {
+                self.upload_context_proof.request_contributions.remove(slot);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn accept_request_contributions_for_test(
+    index: &mut ScanIndex,
+    items: &[SnapshotItem],
+    acks: &BTreeMap<String, String>,
+) {
+    let mut progress = SnapshotUploadProgress::new(
+        "test".into(),
+        snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+    );
+    progress.fresh_context_body_acks = acks.clone();
+    progress.request_contributions = items
+        .iter()
+        .filter(|item| {
+            crate::snapshots::claude_request_money::request_owned_family_root(item).is_some()
+        })
+        .map(|item| {
+            (
+                item.snapshot_fingerprint.clone(),
+                crate::snapshots::upload_context_receipt::SlotRows::capture(item),
+            )
+        })
+        .collect();
+    index.accept_request_contributions(&progress);
 }
 
 pub(super) fn cached_source_manifest(
@@ -1693,6 +1742,20 @@ pub(super) fn finish_sync_source(
     {
         upload_progress.save(&upload_progress_path)?;
     }
+    upload_progress.request_contributions.extend(
+        scan_result
+            .snapshots
+            .iter()
+            .filter(|item| {
+                crate::snapshots::claude_request_money::request_owned_family_root(item).is_some()
+            })
+            .map(|item| {
+                (
+                    item.snapshot_fingerprint.clone(),
+                    crate::snapshots::upload_context_receipt::SlotRows::capture(item),
+                )
+            }),
+    );
     upload_progress.context_receipt_candidates = index.file_upload_context_ack_candidates(
         &scan_result.snapshots,
         &upload_progress.covered_stale_bodies(),
@@ -2416,6 +2479,7 @@ pub(super) fn finish_sync_source(
         &upload_progress.accepted_body_witnesses,
         &upload_progress.accepted_body_contexts,
     );
+    index.accept_request_contributions(&upload_progress);
     let telemetry_removed = claude_scan_roots.as_ref().map(|_| {
         crate::snapshots::claude_telemetry_retention::removed_index_keys(&committed_index, &index)
     });

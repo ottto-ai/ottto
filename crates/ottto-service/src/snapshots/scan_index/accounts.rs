@@ -604,6 +604,13 @@ impl ScanIndex {
         let from_location = claude_money_birth_store::location_key(from);
         let to_location = claude_money_birth_store::location_key(to);
         self.claude_copy_removals.rekey(from_location, to_location);
+        for slot in self.upload_context_proof.request_contributions.values_mut() {
+            for (loc, _) in slot.rows.iter_mut() {
+                if *loc == from_location {
+                    *loc = to_location;
+                }
+            }
+        }
         let marks = self.claude_money_birth_store.money_marks(from_location)
             | self.claude_money_birth_store.money_marks(to_location);
         self.claude_money_birth_store.set_money_marks(to, marks);

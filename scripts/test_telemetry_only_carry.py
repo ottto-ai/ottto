@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the pinned prior source's real progress owner on a synthetic CI store."""
+"""Verify pinned prior sources refuse the current layout without changing custody."""
 import os
 from pathlib import Path
 import subprocess
@@ -9,40 +9,49 @@ import tempfile
 PINS = {
     "v0.1.239": "4157e768d0a45046a0225e2d61f2ac8cf65c50be",
     "v0.1.244": "b10c4e9d2acd649dbd09e901000e1f44f891a641",
+    "v0.1.256": "be32ecee30407cd66cacf193248446fd29d5a1be",
 }
 PROBE = r'''
 #[cfg(test)]
 mod telemetry_only_previous_release_probe {
     use super::*;
+    fn rows(path: &Path) -> BTreeMap<String, BTreeSet<String>> {
+        let db = PathBuf::from(format!("{}.v2.sqlite", path.display()));
+        let conn = rusqlite::Connection::open_with_flags(
+            &db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        ).unwrap();
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .unwrap().query_map([], |row| row.get(0)).unwrap()
+            .map(|name| name.unwrap()).collect();
+        let mut out = BTreeMap::new();
+        for table in tables {
+            let mut stmt = conn.prepare(&format!("SELECT * FROM \"{table}\"")).unwrap();
+            let columns = stmt.column_count();
+            let rows = stmt.query_map([], |row| {
+                let mut text = String::new();
+                for n in 0..columns {
+                    let value: rusqlite::types::Value = row.get(n)?;
+                    text.push_str(&format!("{value:?}|"));
+                }
+                Ok(text)
+            }).unwrap().map(|row| row.unwrap()).collect();
+            out.insert(table, rows);
+        }
+        out
+    }
     #[test]
-    fn hydrate_save_drop() {
+    fn refuse_new_layout() {
         let path = PathBuf::from(std::env::var_os("OTTTO_OTEL_CARRY_INDEX").unwrap());
-        let index = ScanIndex::load(&path).unwrap();
-        let progress_path = snapshot_upload_progress_path(&path);
-        let namespace = format!("{:064x}",99);
-        let witness = snapshot_quarantine_witness(SnapshotSource::ClaudeCode);
-        let mut progress = SnapshotUploadProgress::load_for_index(&index,&path,&progress_path,&namespace,witness.clone()).unwrap();
-        progress.accepted_identity_buckets.bind_test_key(Some([0x42;32]));
-        progress.load_identity(["1338a80a-f36e-4cbc-a5bb-50fc66430ba5"]).unwrap();
-        assert!(!progress.accepted_fingerprints.is_empty());
-        assert!(!progress.accepted_cache_states.is_empty());
-        assert!(!progress.accepted_cache_heads.is_empty());
-        assert!(progress.accepted_identity_buckets.get("1338a80a-f36e-4cbc-a5bb-50fc66430ba5").is_some());
-        let before = (progress.accepted_body_witnesses.clone(),progress.accepted_cache_states.clone(),
-            progress.accepted_cache_heads.clone(),serde_json::to_value(&progress.accepted_identity_buckets).unwrap());
-        progress.save(&progress_path).unwrap();
-        drop(progress);
-        let mut progress = SnapshotUploadProgress::load_for_index(&index,&path,&progress_path,&namespace,witness).unwrap();
-        progress.accepted_identity_buckets.bind_test_key(Some([0x42;32]));
-        progress.load_identity(["1338a80a-f36e-4cbc-a5bb-50fc66430ba5"]).unwrap();
-        assert_eq!(before,(progress.accepted_body_witnesses.clone(),progress.accepted_cache_states.clone(),
-            progress.accepted_cache_heads.clone(),serde_json::to_value(&progress.accepted_identity_buckets).unwrap()));
-        let owner = SnapshotProgressLock::acquire(&progress_path).unwrap().for_v2(&progress_path);
-        let (ledger,generation) = crate::snapshots::read_progress_ledger(&path,&owner).unwrap();
-        assert!(generation>0);
-        assert!(ledger.unwrap().get("telemetry_only").is_none());
-        std::fs::write(path.with_extension("old-verified"),b"TELEMETRY_ONLY_OLD_SAVE_VERIFIED").unwrap();
-        println!("TELEMETRY_ONLY_OLD_SAVE_VERIFIED");
+        let before = rows(&path);
+        let error = match ScanIndex::load(&path) {
+            Ok(_) => panic!("older reader opened a newer catalogue layout"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("scan_index_representation_refused"), "{error:#}");
+        assert_eq!(before, rows(&path), "refused open changed stored rows");
+        std::fs::write(path.with_extension("old-verified"),b"TELEMETRY_ONLY_OLD_LAYOUT_REFUSED").unwrap();
+        println!("TELEMETRY_ONLY_OLD_LAYOUT_REFUSED");
     }
 }
 '''
@@ -70,7 +79,7 @@ def main():
         marker = Path(index).with_suffix(".old-verified")
         marker.unlink(missing_ok=True)
         result = subprocess.run(["cargo", "test", "--locked", "-p", "ottto-service", "--lib", "-j", "2",
-            "telemetry_only_previous_release_probe::hydrate_save_drop", "--", "--nocapture", "--test-threads=1"],
+            "telemetry_only_previous_release_probe::refuse_new_layout", "--", "--nocapture", "--test-threads=1"],
             cwd=tree, env=env, timeout=1200, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         log = Path(index).with_suffix(f".{tag}.log")
         log.write_text(result.stdout)
@@ -78,8 +87,8 @@ def main():
             print(f"old source failed: {log}", flush=True)
             for line in result.stdout.splitlines()[-60:]: print("old-source: " + line, flush=True)
         result.check_returncode()
-        assert marker.read_bytes() == b"TELEMETRY_ONLY_OLD_SAVE_VERIFIED"
-        print(f"{tag} {pin}: TELEMETRY_ONLY_OLD_SAVE_VERIFIED", flush=True)
+        assert marker.read_bytes() == b"TELEMETRY_ONLY_OLD_LAYOUT_REFUSED"
+        print(f"{tag} {pin}: TELEMETRY_ONLY_OLD_LAYOUT_REFUSED", flush=True)
 
 
 if __name__ == "__main__":

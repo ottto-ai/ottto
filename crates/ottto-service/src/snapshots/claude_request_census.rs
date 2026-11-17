@@ -249,6 +249,13 @@ impl ClaudeRequestCensusRecord {
         self.request_hashes.as_deref().unwrap_or(&[])
     }
 
+    pub(crate) fn matching_hashes(&self, hashes: &[u64]) -> Option<Arc<[u64]>> {
+        self.request_hashes
+            .as_ref()
+            .filter(|h| h.as_ref() == hashes)
+            .cloned()
+    }
+
     pub(crate) fn birth(&self) -> Option<ClaudeRequestBirth> {
         self.birth
     }
@@ -1606,7 +1613,7 @@ use crate::hex::LowerHex;
 
 /// Base64 (standard, padded) of the big-endian bytes of each hash, streamed
 /// three hashes (24 bytes, 32 characters) at a time without a whole buffer.
-struct HashBase64<'a>(&'a [u64]);
+pub(super) struct HashBase64<'a>(pub(super) &'a [u64]);
 impl fmt::Display for HashBase64<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         use base64::Engine;
@@ -1631,7 +1638,7 @@ impl Serialize for HashBase64<'_> {
 }
 
 /// Strictly ascending, non-empty, whole hashes only; anything else is None.
-fn decode_base64_hashes(value: &str) -> Option<Vec<u64>> {
+pub(super) fn decode_base64_hashes(value: &str) -> Option<Vec<u64>> {
     use base64::Engine;
     let text = value.as_bytes();
     if text.is_empty() || text.len() % 4 != 0 {

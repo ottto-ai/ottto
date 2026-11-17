@@ -110,6 +110,8 @@ mod status;
 #[cfg(test)]
 pub(crate) use self::finish::accept_account_release_for_test;
 #[cfg(test)]
+pub(crate) use self::finish::accept_request_contributions_for_test;
+#[cfg(test)]
 pub(crate) use self::finish::ack_current_again_quarantines_for_test;
 #[cfg(test)]
 use self::finish::apply_backfill_cutoff_with_claude_corrections;
