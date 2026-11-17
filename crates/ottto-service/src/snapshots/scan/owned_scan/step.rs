@@ -1374,26 +1374,6 @@ impl OwnedSourceScan {
                         pending!();
                     }
                     Err(error) => {
-                        // Defensive fallback for an adapter crossing its extent.
-                        // Normal physical acquisitions stop at that extent.
-                        if error.chain().any(|cause| {
-                            cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
-                                io.get_ref().is_some_and(|inner| {
-                                    inner.is::<crate::transcript_acquisition::FrozenLengthExceeded>()
-                                })
-                            })
-                        }) {
-                            if let Some(lease) = codex_cursor_lease.take() {
-                                lease.release();
-                            }
-                            if let Some(group) = active.group.as_ref() {
-                                scan::owned_scan::requeue_members(index, &selected_flags, &group.members);
-                            } else {
-                                sampled_scan::codex_cursor::requeue(index, &selected_flags, &active.candidate);
-                            }
-                            active.parser.reader.reader.close();
-                            pending!();
-                        }
                         // Static reader text only, never a path or content.
                         eprintln!(
                             "local snapshot scan: {} transcript read failed: {error}",
@@ -1984,6 +1964,7 @@ impl OwnedSourceScan {
                         // audit credit or source verification can follow it.
                         let prefix = current_scope
                             .as_ref()
+                            .filter(|_| aliases.is_empty())
                             .filter(|scope| *scope == &acquisition.scope)
                             .and_then(|scope| {
                                 parser.commit_grown_prefix(
@@ -2008,7 +1989,13 @@ impl OwnedSourceScan {
                         {
                             // Unchanged, or a trailing record already applied at
                             // genuine EOF: retry only this file, never the walk.
-                            sampled_scan::codex_cursor::requeue(index, &selected_flags, &candidate);
+                            scan::owned_scan::retry_grown_file(
+                                index,
+                                &selected_flags,
+                                &candidate,
+                                &mut census,
+                                false,
+                            );
                             pending!();
                         }
                         (current_scope, prefix)
@@ -2040,25 +2027,34 @@ impl OwnedSourceScan {
                             )) if parser.reader.acquisition.is_some() => {
                                 // A withheld row would weaken the last committed
                                 // body. Keep it and retry this file alone.
-                                sampled_scan::codex_cursor::requeue(
+                                scan::owned_scan::retry_grown_file(
                                     index,
                                     &selected_flags,
                                     &candidate,
+                                    &mut census,
+                                    false,
                                 );
                                 pending!();
                             }
-                            Err(refusal) => {
+                            Err(crate::transcript_acquisition::PrefixRefusal::AuditDue) => {
+                                scan::owned_scan::retry_grown_file(
+                                    index,
+                                    &selected_flags,
+                                    &candidate,
+                                    &mut census,
+                                    false,
+                                );
+                                pending!();
+                            }
+                            Err(_) => {
                                 claude_request_census::invalidate_claude_request_census(
                                     index,
                                     &candidate.path,
                                 );
-                                let cause = match refusal {
-                                    crate::transcript_acquisition::PrefixRefusal::AuditDue => {
-                                        UnreadableCause::Reduction
-                                    }
-                                    _ => UnreadableCause::ScopeObject,
-                                };
-                                census.record_unreadable_file(cause, &candidate.path);
+                                census.record_unreadable_file(
+                                    UnreadableCause::ScopeObject,
+                                    &candidate.path,
+                                );
                                 pending!();
                             }
                         }
@@ -2477,14 +2473,24 @@ impl OwnedSourceScan {
                         .files
                         .get(&index_key)
                         .is_some_and(ScanIndexEntry::has_unverified_source);
-                if needs_marker
-                    && !index.claude_account_deferred_holds.contains_key(&index_key)
-                    && (slot_unfunded || !index.can_stage_sampled_audit(&index_key))
+                if (grown_prefix && slot_unfunded)
+                    || (needs_marker
+                        && !index.claude_account_deferred_holds.contains_key(&index_key)
+                        && (slot_unfunded || !index.can_stage_sampled_audit(&index_key)))
                 {
                     if grown_prefix {
                         // No new audit slot: retain the committed body and
                         // census membership, without poisoning the traversal.
-                        sampled_scan::codex_cursor::requeue(index, &selected_flags, &candidate);
+                        if let Some(context) = sampling.as_mut() {
+                            context.audit_cap_delay += 1;
+                        }
+                        scan::owned_scan::retry_grown_file(
+                            index,
+                            &selected_flags,
+                            &candidate,
+                            &mut census,
+                            true,
+                        );
                         pending!();
                     }
                     #[cfg(test)]
@@ -2811,28 +2817,22 @@ impl OwnedSourceScan {
                     } else if source_verified {
                         index.complete_full_audit(&index_key, &source_file_fingerprint);
                     }
-                    if source == SnapshotSource::ClaudeCode {
-                        if claude_grown_prefix {
-                            if !slot_unfunded {
-                                index.mark_sealed_prefix(&index_key, &source_file_fingerprint);
-                            }
-                        } else if completed_acquisition.is_some()
-                            && cursor_fragment.is_none()
-                            && file_sampling.as_ref().is_some_and(|active| {
-                                !matches!(
-                                    active.mode,
-                                    crate::transcript_acquisition::ReadMode::Unchanged
-                                )
-                            })
-                            && state_census_complete
-                            && sidecar_census_complete
-                            && parse_complete
-                        {
-                            index.complete_native_recomposition(
-                                &index_key,
-                                &source_file_fingerprint,
-                            );
-                        }
+                    if grown_prefix {
+                        index.mark_sealed_prefix(&index_key, &source_file_fingerprint);
+                    } else if source == SnapshotSource::ClaudeCode
+                        && completed_acquisition.is_some()
+                        && cursor_fragment.is_none()
+                        && file_sampling.as_ref().is_some_and(|active| {
+                            !matches!(
+                                active.mode,
+                                crate::transcript_acquisition::ReadMode::Unchanged
+                            )
+                        })
+                        && state_census_complete
+                        && sidecar_census_complete
+                        && parse_complete
+                    {
+                        index.complete_native_recomposition(&index_key, &source_file_fingerprint);
                     }
                     if let Some(fragment) = cursor_fragment {
                         let was_pending = index
@@ -3804,6 +3804,15 @@ impl OwnedSourceScan {
             };
             #[cfg(test)]
             twin_diagnostics::event(&candidate.path, || "candidate dequeued".into());
+            // Pulled/forced candidates obey the same walk's growth fence.
+            if index.traversal.as_ref().is_some_and(|walk| {
+                walk.residue
+                    .growth_retries
+                    .get(&local_index_key(&candidate.path))
+                    == Some(&true)
+            }) {
+                pending!();
+            }
             // Reject budget debt before opening/constructing any body parser.
             // Requeue the original census membership; absence/completion stays owed.
             if index.context_only_read(&candidate)
