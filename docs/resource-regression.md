@@ -113,6 +113,48 @@ by ordinary, scheduled and merge-group discovery and requires the runner's PR
 binding; zero-match runs fail. No paid hosted Mac workflow is added. A Linux pass is not native Mac
 evidence; record the native runner receipt separately.
 
+## Native first-import foreground gate
+
+Before enabling zero-gap first import, a release operator runs
+`scripts/resource_native_first_import_gate.sh <PR-number>` once on an approved
+native Mac at a clean PR head, on AC with Low Power Mode off. It first runs the
+ordinary QoS contract, then the ignored
+`resource_native_first_import_foreground_gate` test. The gate drives real
+byte-bound Codex acquisition pages back to back through the production
+first-import AC policy at requested UTILITY on a scan-sized worker. It generates
+4 GiB (256 ×16 MiB) of synthetic JSONL in ScratchDir at default duration, with bounded write
+buffers; acquisition, synthetic sidecars, index/ACK state and the foreground
+probe file stay under temporary directories and are removed on exit. ACKs are
+in-process fixture calls: no HTTP client, network, daemon or live store is used.
+At about 25–51 seconds per 64 MiB page, three on-phases consume roughly 15
+pages; 64 nominal pages provide more than 2× headroom plus warm-up. The wrapper
+requires at least 3× the corpus size free on the TMPDIR volume (12 GiB by default)
+before starting either test. Corpus exhaustion or loss of the byte-bound,
+pending, incomplete-census condition prints `verdict=invalid` and fails the test;
+it cannot earn PASS.
+
+Six phases are off/on/off/on/off/on, each 120 seconds, with 2,400 fixed work
+units of each type per phase: USER_INITIATED SHA-256 of 1 MiB and write/fsync/read
+of 256 KiB every 50 ms. Each phase prints p50/p95/p99 latencies and CPU, lifetime
+RSS, billed energy when available, page counts and thermal availability. CPU
+latency includes dispatch delay; scheduling lateness is also reported. Each on
+p95 is divided by the mean of its adjacent off p95 values; the final on has only
+the preceding off. Process CPU includes the foreground probe; importer CPU share
+uses its own thread clock. Energy is process-wide. Thermal is unavailable
+because the existing power shim has no thermal API.
+
+PASS requires median CPU and I/O ratios each <=1.05 and lifetime RSS <=500 MiB.
+One `resource_native_first_import_gate pr=... head=... corpus_gib=... cpu_p95_ratio=...
+io_p95_ratio=... rss_max_mib=... importer_cpu_share=... energy_j=... pages=...
+thermal=...->... verdict=pass` receipt is required, plus one passed test from
+each exact invocation. The wrapper keeps the mktemp receipt and prints its
+summary; failures exit nonzero. Duration override
+`OTTTO_RESOURCE_GATE_PHASE_SECONDS=1` is a smoke run only (1 GiB corpus;
+1–120 seconds supported): the wrapper cannot
+accept it as release evidence. Runtime is build and corpus setup plus 6×D
+seconds and any in-flight page overrun. This measures requested QoS and latency
+on one machine; it is not a universal foreground responsiveness guarantee.
+
 ## Stable candidate RC scorecard
 
 `scripts/resource_scorecard.py <stable-candidate-rc-qa.json>` validates existing

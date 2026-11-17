@@ -51,7 +51,9 @@ fn matches(trace: &[(String, String, u32)], source: SnapshotSource, class: u32) 
 }
 
 /// [regress] Actual pthread QoS inside native prepare/page/finish. Ordinary
-/// stages keep utility; explicitly due resident-paced work is background.
+/// stages keep utility; explicitly due resident-paced work is background; a
+/// first-import 30 s pass keeps its inherited class and a zero-gap one is
+/// clamped to explicit utility.
 #[test]
 #[ignore = "native macOS PR validation only; never merge_group"]
 fn resource_native_ordinary_stage_qos() {
@@ -122,12 +124,50 @@ fn resource_native_ordinary_stage_qos() {
             })
             .is_err());
             assert_eq!(schedule::native_qos().0, 0x11, "unwind restores");
+            // First-import arms from an inherited DEFAULT thread: a 30 s
+            // request keeps DEFAULT; a zero-gap byte-bound request runs at
+            // explicit UTILITY (never 0x19/0x21) and restores DEFAULT.
+            let default = schedule::native_set_qos(0x15);
+            with_scan_clock(EPOCH + 4000, || {
+                schedule::finished_first_import(SOURCES[1], false)
+            });
+            let kept = observed(&mut drivers[1], 4030);
+            assert!(
+                matches(&kept, SOURCES[1], 0x15),
+                "default arm unchanged: {kept:?}"
+            );
+            with_scan_clock(EPOCH + 5000, || {
+                schedule::finished_first_import(SOURCES[1], true)
+            });
+            let lowered = observed(&mut drivers[1], 5000);
+            assert!(
+                matches(&lowered, SOURCES[1], 0x11),
+                "explicit utility: {lowered:?}"
+            );
+            assert_eq!(
+                schedule::native_qos().0,
+                0x15,
+                "utility scope restores default"
+            );
+            drop(default);
+            // Clamp: a thread already at UTILITY is neither set nor raised.
+            with_scan_clock(EPOCH + 6000, || {
+                schedule::finished_first_import(SOURCES[1], true)
+            });
+            let clamped = observed(&mut drivers[1], 6000);
+            assert!(
+                matches(&clamped, SOURCES[1], 0x11),
+                "clamp only: {clamped:?}"
+            );
         });
         drop(utility);
         assert_eq!(
             schedule::native_qos().0,
             if initial.0 == 0 { 0x15 } else { initial.0 }
         );
+        println!("resource_native_first_import_qos default=inherited utility=explicit clamp=never_raised restoration=passed");
         println!("resource_native_qos ordinary=utility paced=background cycle_replay=tripped restoration=passed");
     });
 }
+
+mod foreground_gate;

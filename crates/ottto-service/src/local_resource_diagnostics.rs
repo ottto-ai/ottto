@@ -1206,6 +1206,9 @@ crate::heap_layout_bound::fields!(RefusalExposure; owed_entities, held_terminal_
 pub(crate) struct Probe {
     pub(crate) refusal_exposure: Option<RefusalExposure>,
     pub(crate) page_schedule: BTreeMap<&'static str, bool>,
+    /// `default` or `utility` (`background` on a failed utility entry) for a
+    /// first-import paced pass on AC.
+    pub(crate) first_import_qos: Option<&'static str>,
     withheld_memo: Option<crate::snapshots::withheld_account::Memo>,
     started: Instant,
     process: Option<ProcessSample>,
@@ -1274,6 +1277,7 @@ impl Probe {
         Self {
             refusal_exposure: None,
             page_schedule: BTreeMap::new(),
+            first_import_qos: None,
             withheld_memo: None,
             started: Instant::now(),
             process: process_sample(),
@@ -1312,6 +1316,8 @@ impl Probe {
         struct Counts<'a> {
             #[serde(flatten)]
             page_schedule: &'a BTreeMap<&'static str, bool>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            first_import_qos: Option<&'static str>,
             #[serde(skip_serializing_if = "Option::is_none")]
             refusal_exposure: Option<RefusalExposure>,
             #[serde(flatten)]
@@ -1371,6 +1377,7 @@ impl Probe {
         let seeds = seeds.zip(FORCED_SEED_START..).collect::<Vec<_>>();
         let counts = Counts {
             page_schedule: &self.page_schedule,
+            first_import_qos: self.first_import_qos,
             forced_family_seeds: drain(source, &seeds),
             line_delivery: self
                 .line_delivery
@@ -4894,6 +4901,11 @@ pub(crate) struct StateV2Memory {
 }
 pub(crate) fn state_v2_memory() -> StateV2Memory {
     footprint::current()
+}
+/// Native synthetic gate reuses the same lifetime RSS/getrusage source as rows.
+#[cfg(test)]
+pub(crate) fn resource_gate_usage() -> Option<(u64, u64)> {
+    process_sample().map(|sample| (sample.cpu_us, sample.lifetime_max_rss_bytes))
 }
 pub(crate) fn state_v2_cpu_us() -> Option<u64> {
     process_sample().map(|p| p.cpu_us)

@@ -3731,11 +3731,9 @@ impl OwnedSourceScan {
                     ("page_file_limit_hit", scan.page_file_limit_hit),
                     ("pending_work", scan.census_status.pending_work),
                     ("first_read_progress", scan.first_read_progress),
-                    (
-                        "first_import_default_qos",
-                        crate::snapshot_sync::continuation::first_import_default_qos(),
-                    ),
                 ]);
+                resource_probe.first_import_qos =
+                    crate::snapshot_sync::continuation::first_import_qos();
                 resource_probe.collection(
                     source.api_slug(),
                     crate::local_resource_diagnostics::CollectionCounts {

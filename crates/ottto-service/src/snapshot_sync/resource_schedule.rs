@@ -43,8 +43,17 @@ pub(crate) fn finished(source: SnapshotSource, uploaded: u64, paced: bool) {
     })
     .unwrap();
     if paced {
-        continuation::request_resident_scan(source, false);
+        continuation::request_resident_scan(source, Default::default());
     }
+}
+/// A successful pass during the first import that asks for a paced pass.
+pub(crate) fn finished_first_import(source: SnapshotSource, byte_hit: bool) {
+    finished(source, 1, false);
+    let reason = crate::adaptive_collector::PacedReason {
+        first_import: true,
+        byte_hit,
+    };
+    continuation::request_resident_scan(source, reason);
 }
 pub(crate) struct Switch(ClaudeAccountSwitchProbe);
 impl Switch {
