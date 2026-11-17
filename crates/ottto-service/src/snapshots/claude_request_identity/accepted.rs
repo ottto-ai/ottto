@@ -566,9 +566,11 @@ impl<'de> Deserialize<'de> for AcceptedBuckets {
     }
 }
 impl AcceptedBuckets {
+    /// A keyed fixture ledger in a cycle whose server advertises
+    /// `session_request_account_source:v1`, as production does for Claude Code.
     #[cfg(test)]
     pub(crate) fn for_test() -> Self {
-        Self(BTreeMap::new(), Some(fixture_key()), false, 0, false)
+        Self(BTreeMap::new(), Some(fixture_key()), false, 0, true)
     }
     /// One session at every per-session bound: the per-row maximum.
     #[cfg(test)]
@@ -617,6 +619,8 @@ impl AcceptedBuckets {
     pub(crate) fn restore_for_test(bytes: &[u8]) -> Self {
         let mut state: Self = serde_json::from_slice(bytes).unwrap();
         state.bind_key(Some(fixture_key()));
+        // The capability is never persisted; the next cycle sets it again.
+        state.set_account_source_enabled(true);
         state
     }
     /// The negotiated attribution key is owned by the existing per-cycle context.

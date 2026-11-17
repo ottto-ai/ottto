@@ -21,6 +21,13 @@ file-system hint / periodic listing → select file → read new bytes from save
   Each listing gives hint priority to indexed files whose listing stamp changed since their
   last read, promoting queued files in place. Unchanged census files, including owed files,
   keep their ordinary queue order. Existing selection budgets and read gates still apply.
+  A queued Claude directory or census member missing below its own readable scan root
+  is a removal when the secure absence proof succeeds, even with missing intermediate
+  directories. A missing configured root, including a nested root, keeps the census
+  incomplete. Recreation before that proof keeps the loss; recreation after a valid
+  witness belongs to the next ordinary census, under its existing admission gates.
+  Candidate discovery retains its earlier immediate-live-parent shortcut, which does
+  not provide the secure proof's ancestor or recreation guarantees.
 - **Selection.** Each pass picks files and a read mode (`transcript_acquisition.rs`). Tail, a read
   from the saved offset, is the normal mode, so bytes read track bytes appended. A Full read has a
   named cause (new or replaced file, missing or invalid saved result, a real edit) and is counted
@@ -29,6 +36,14 @@ file-system hint / periodic listing → select file → read new bytes from save
   loader. They still provide no copy proof or body-binding authority. Without audit capacity or
   when the loader holds, they read natively on their holder's page. Exact/Empty growth can lose
   census verification and require a native read on the next force.
+  Every plain Full/Tail acquisition with a read plan stops at its opening frozen length.
+  Appends beyond that extent belong to the next ordinary pass. A grown in-page read
+  validates its held-file prefix and path before publishing; it keeps no new Tail
+  checkpoint and earns no Full-audit or source-verification credit. An unfinished
+  boundary record remains withheld. If the prefix would weaken a committed body or
+  cannot reserve its audit marker, that file gets one same-walk retry; a second refusal
+  releases a committed body to the next pass, or leaves a new file unreadable.
+  Unsampled native reads without a plan (including some protected/forced paths) remain unbounded and out of scope.
 - **Reduction.** One reducer per source turns lines into usage and keeps a running result. Old
   evidence is read only for the session group a change affects.
 - **Codex rollout encodings.** Plain `.jsonl` and compressed `.jsonl.zst` use the same
@@ -134,6 +149,20 @@ file-system hint / periodic listing → select file → read new bytes from save
   and that holder are re-owed, with the rule version stamped in the same save.
   Disclosed main files include cross-session resumes whose own path and
   content identity would otherwise leave their counted prefix unchanged.
+  Money rule five compares settled, unheld disclosed main files against current
+  holder proof once per store, using the save-time decision comparison and
+  accepted request rows. Only counted hashes newly covered by an earlier holder
+  select a copy for one ordinary correction obligation; holders are not marked
+  and body revisions do not change. Existing content-twin scheduling co-reads
+  overlapping mains: an isolated copy and same-session main cost at most two
+  ordinary reads per mark, without forcing Full. Larger overlap closures retain
+  their existing scheduling; the rule adds no population-wide read bound.
+  The normal save records the marks and version together, so marks number at
+  most the settled disclosed mains and never rearm
+  on restart. A resumed same-session copy still needs its holder on the same
+  page to remove the prefix; an off-page holder leaves it counted and disclosed.
+  Older daemons ignore a newer money-rule version; layout 8 already requires
+  a forward update for readers predating the accepted-request store.
   Subagent path-twin homes sharing census ids are both selected once, for
   all-copy and prefix copies. The selector and mid-page holder lookup record
   elapsed milliseconds; holder pulls also record a scalar count.
@@ -161,6 +190,13 @@ file-system hint / periodic listing → select file → read new bytes from save
   exact stamp under the active upload context. Claude records those stamps under its resumed
   mode while unaffected file receipts use the base context. A copy-capability change therefore
   conservatively re-sends unchanged files once.
+
+Snapshot envelopes send only the `snapshot_revision:v2` witness. The receiver already
+accepts bodies without the v1 revision fields. ACK matching, unchanged skips and receipt
+carry use their existing content and body proofs. Local snapshot audits use schema v5,
+with revision keys blinded from the v2 hash and explicit census and oversize evidence.
+The identity size budget retains 134 bytes of headroom so the smaller envelope does
+not change admission or account tagging at the byte cap.
 
 Telemetry-only Claude uploads require the advertised head-CAS capability and the
 exact telemetry contract and pairing window. They declare head CAS in isolated
@@ -416,6 +452,13 @@ request pacing.
 Prepare, finish, server minima, upload backoff and background QoS still apply.
 During a first backfill (not a replay revision bump), a Codex page that spent a byte budget with
 work still queued also requests a paced pass.
+While destination bootstrap is pending, AC passes also keep runnable bounded-walk work or an
+owed clean follow-up on the same 30-second pacing at background priority. The request uses the
+index after upload settlement, including a first offer's final-page conflict. Metadata-only
+retention, decode holds and unchanged held or conflicted debt grant no follow-up urgency;
+queued unblocked siblings can still advance. Terminal-unhealthy walks use the scanner's own
+retry eligibility. Battery cannot renew this reason; an AC request already issued may wake
+once after unplugging. Clean retirement or bootstrap completion ends this request.
 
 ## SQLite
 

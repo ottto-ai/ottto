@@ -779,8 +779,8 @@ fn sticky_size_budget_matches_real_wire_with_optional_envelope_components() {
             let wire = serde_json::to_value(&request).unwrap();
             assert_eq!(
                 budgeted,
-                serde_json::to_vec(&wire["snapshots"][0]).unwrap().len(),
-                "activity={activity}, cache_head={cache_head}",
+                serde_json::to_vec(&wire["snapshots"][0]).unwrap().len() + 134,
+                "admission headroom: activity={activity}, cache_head={cache_head}",
             );
         }
     }

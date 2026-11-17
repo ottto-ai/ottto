@@ -4399,6 +4399,8 @@ mod tests {
             "codex_sqlite_pager_wal_page_bytes_cumulative",
             "pi_sqlite_pager_wal_page_bytes_cumulative",
             "upload_history_sqlite_pager_wal_page_bytes_cumulative",
+            "sqlite_tempbuf_spill_bytes_cumulative",
+            "sqlite_checkpoint_reported_pages_cumulative",
             "shared_cache_helper_write_bytes_cumulative",
         ] {
             assert_eq!(record["counts"][field], u64::MAX);
@@ -4407,7 +4409,7 @@ mod tests {
         assert!(record["observation"]["process_lifetime_max_rss_bytes"].is_null());
         // The four Pi fields, the Codex tier field, the two Claude usage
         // fields and the seven OTLP skip fields stay bounded at u64::MAX.
-        assert!(serde_json::to_string(record).unwrap().len() < 2901);
+        assert!(serde_json::to_string(record).unwrap().len() < 3101);
         let (_, actual) = capture(cache_lifecycle_totals);
         assert_eq!(actual.len(), 1);
         assert_eq!(actual[0]["stage"], record["stage"]);

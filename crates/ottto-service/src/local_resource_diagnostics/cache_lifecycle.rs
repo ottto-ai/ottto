@@ -28,6 +28,8 @@ sparse_lifetime_counters! {
     codex_sqlite_pager_wal_page_bytes_cumulative: CodexPagerBytes,
     pi_sqlite_pager_wal_page_bytes_cumulative: PiPagerBytes,
     upload_history_sqlite_pager_wal_page_bytes_cumulative: HistoryPagerBytes,
+    sqlite_tempbuf_spill_bytes_cumulative: SqliteTempbufSpillBytes,
+    sqlite_checkpoint_reported_pages_cumulative: SqliteCheckpointReportedPages,
     shared_cache_helper_write_bytes_cumulative: SharedCacheBytes,
     // Local OTLP relay requests refused or acknowledged without storing.
     otlp_relay_busy_503: OtlpRelayBusy503,

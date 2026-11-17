@@ -286,7 +286,9 @@ pub(crate) const RULE_EPOCH: u8 = 2;
 /// retired permit mark there); it stays so stored versions keep their meaning.
 /// Version 4 re-owes subagent path twins once: a shared response within the
 /// copy slack before the later home's birth counts at the earlier home.
-const MONEY_RULES: &[(u16, u8)] = &[(1, 0), (2, 0), (3, 0), (4, 0)];
+/// Version 5 marks settled counted copies once when current holder proof
+/// disagrees, without re-owing a body revision or selecting the holder.
+const MONEY_RULES: &[(u16, u8)] = &[(1, 0), (2, 0), (3, 0), (4, 0), (5, 0)];
 #[cfg(test)]
 thread_local! {
     static TEST_MONEY_RULES: std::cell::Cell<Option<&'static [(u16, u8)]>> =
@@ -502,6 +504,9 @@ pub(crate) fn apply_money_rules(index: &mut ScanIndex) {
     }
     for key in owed {
         index.re_owe_effective_upload_body_witness_revision(&key, to);
+    }
+    if rule(5) {
+        mark_settled_counted_copies(index);
     }
     live.sort_unstable();
     let store = &mut index.claude_money_birth_store;
@@ -2395,112 +2400,14 @@ impl CopyOwnership {
                 }
             }
             let union = union.into_iter().collect::<Vec<_>>();
-            let mut holders = BTreeMap::<u64, (i128, LocationKey)>::new();
-            let mut holder_sessions = BTreeMap::<&str, BTreeSet<u64>>::new();
-            let _ = next.claude_request_census.main_transcript_holders(
-                Some(&folder),
+            marks.extend(changed_copy_decisions(
+                next,
+                &live,
+                &folder,
                 &union,
-                None,
-                |key, root, record, hits| {
-                    let Some(order) =
-                        committed_holder_order(&next.claude_money_birth_store, root, key)
-                    else {
-                        return;
-                    };
-                    let owned = local_owned(next, &[], key, true);
-                    for &hash in hits {
-                        let removed = saved_removal_applies(next, &live, key, hash);
-                        let proven = holder_proof(
-                            next,
-                            &live,
-                            location_key(key),
-                            hash,
-                            HolderUse::New(owned),
-                        );
-                        if !proven || !record.proves_scan() || removed {
-                            holder_sessions.entry(root).or_default().insert(hash);
-                        }
-                        if proven {
-                            holders
-                                .entry(hash)
-                                .and_modify(|earliest| *earliest = (*earliest).min(order))
-                                .or_insert(order);
-                        }
-                    }
-                },
-            );
-            for (location, hashes) in candidates {
-                let Some(&key) = live.get(&location) else {
-                    continue;
-                };
-                let member = claude_index_path_member_ref(Path::new(key)).unwrap();
-                let order =
-                    committed_holder_order(&next.claude_money_birth_store, member.root, key)
-                        .unwrap();
-                let groups = next.claude_copy_removals.get(location);
-                let record = next.claude_request_census.get(key).unwrap();
-                let sessions = std::iter::once(member.root)
-                    .chain(
-                        holder_sessions
-                            .iter()
-                            .filter(|(_, bridge)| {
-                                bridge.iter().any(|hash| record.holds_hash(*hash))
-                            })
-                            .map(|(&session, _)| session),
-                    )
-                    .collect::<BTreeSet<_>>();
-                let copy = next.claude_money_birth_store.money_marks(location)
-                    & (money_mark::COPY | money_mark::DISCLOSED)
-                    != 0;
-                let index: &ScanIndex = next;
-                let locations = &live;
-                let contributions = &next.upload_context_proof.request_contributions;
-                let bodies = next.file_snapshot_fingerprints.get(key);
-                let rows = contributions
-                    .values()
-                    .filter(|slot| bodies.is_some_and(|b| b.contains(&slot.fingerprint)))
-                    .flat_map(|slot| slot.rows.iter())
-                    .collect::<Vec<_>>();
-                if hashes.into_iter().any(|hash| {
-                    let removed = groups
-                        .iter()
-                        .any(|(_, hashes)| hashes.binary_search(&hash).is_ok());
-                    let keep = saved_removal_applies(next, &live, key, hash)
-                        && !groups.iter().any(|(h, _)| carrier_lost.contains(h));
-                    // Skip a family duplicate already removed inside this accepted sum.
-                    let covered = holders
-                        .get(&hash)
-                        .copied()
-                        .into_iter()
-                        .chain(earliest_accepted_holder(
-                            next,
-                            &live,
-                            hash,
-                            order,
-                            sessions.iter().flat_map(move |&session| {
-                                index
-                                    .claude_money_birth_store
-                                    .observations(session)
-                                    .filter_map(move |(location, _)| {
-                                        let &key = locations.get(&location)?;
-                                        Some((key, session, local_owned(index, &[], key, true)))
-                                    })
-                            }),
-                        ))
-                        .min()
-                        .is_some_and(|holder| {
-                            holder < order
-                                && !rows.iter().any(|(loc, h)| {
-                                    *loc == holder.1 && h.binary_search(&hash).is_ok()
-                                })
-                        });
-                    // An invalid old holder must be replaced in the saved
-                    // groups even if another holder proves the same removal.
-                    (removed && !keep) || (!removed && copy && covered)
-                }) {
-                    marks.push(location);
-                }
-            }
+                candidates,
+                &carrier_lost,
+            ));
         }
         let lost_copy_marks = invalidated
             .iter()
@@ -2525,6 +2432,170 @@ impl CopyOwnership {
         }
         next.claude_copy_removals.relied_on.clear();
         sessions
+    }
+}
+
+/// Compare the saved decision with current holder proof in one complete folder walk.
+fn changed_copy_decisions(
+    index: &ScanIndex,
+    live: &Live<'_>,
+    folder: &str,
+    union: &[u64],
+    candidates: BTreeMap<LocationKey, Vec<u64>>,
+    carrier_lost: &[LocationKey],
+) -> Vec<LocationKey> {
+    let mut marks = Vec::new();
+    let mut holders = BTreeMap::<u64, (i128, LocationKey)>::new();
+    let mut holder_sessions = BTreeMap::<&str, BTreeSet<u64>>::new();
+    let _ = index.claude_request_census.main_transcript_holders(
+        Some(folder),
+        union,
+        None,
+        |key, root, record, hits| {
+            let Some(order) = committed_holder_order(&index.claude_money_birth_store, root, key)
+            else {
+                return;
+            };
+            let owned = local_owned(index, &[], key, true);
+            for &hash in hits {
+                let removed = saved_removal_applies(index, live, key, hash);
+                let proven =
+                    holder_proof(index, live, location_key(key), hash, HolderUse::New(owned));
+                if !proven || !record.proves_scan() || removed {
+                    holder_sessions.entry(root).or_default().insert(hash);
+                }
+                if proven {
+                    holders
+                        .entry(hash)
+                        .and_modify(|earliest| *earliest = (*earliest).min(order))
+                        .or_insert(order);
+                }
+            }
+        },
+    );
+    for (location, hashes) in candidates {
+        let Some(&key) = live.get(&location) else {
+            continue;
+        };
+        let member = claude_index_path_member_ref(Path::new(key)).unwrap();
+        let order =
+            committed_holder_order(&index.claude_money_birth_store, member.root, key).unwrap();
+        let groups = index.claude_copy_removals.get(location);
+        let record = index.claude_request_census.get(key).unwrap();
+        let sessions = std::iter::once(member.root)
+            .chain(
+                holder_sessions
+                    .iter()
+                    .filter(|(_, bridge)| bridge.iter().any(|hash| record.holds_hash(*hash)))
+                    .map(|(&session, _)| session),
+            )
+            .collect::<BTreeSet<_>>();
+        let copy = index.claude_money_birth_store.money_marks(location)
+            & (money_mark::COPY | money_mark::DISCLOSED)
+            != 0;
+        let locations = live;
+        let contributions = &index.upload_context_proof.request_contributions;
+        let bodies = index.file_snapshot_fingerprints.get(key);
+        let rows = contributions
+            .values()
+            .filter(|slot| bodies.is_some_and(|b| b.contains(&slot.fingerprint)))
+            .flat_map(|slot| slot.rows.iter())
+            .collect::<Vec<_>>();
+        if hashes.into_iter().any(|hash| {
+            let removed = groups
+                .iter()
+                .any(|(_, hashes)| hashes.binary_search(&hash).is_ok());
+            let keep = saved_removal_applies(index, live, key, hash)
+                && !groups.iter().any(|(h, _)| carrier_lost.contains(h));
+            // Skip a family duplicate already removed inside this accepted sum.
+            let covered = holders
+                .get(&hash)
+                .copied()
+                .into_iter()
+                .chain(earliest_accepted_holder(
+                    index,
+                    live,
+                    hash,
+                    order,
+                    sessions.iter().flat_map(move |&session| {
+                        index
+                            .claude_money_birth_store
+                            .observations(session)
+                            .filter_map(move |(location, _)| {
+                                let &key = locations.get(&location)?;
+                                Some((key, session, local_owned(index, &[], key, true)))
+                            })
+                    }),
+                ))
+                .min()
+                .is_some_and(|holder| {
+                    holder < order
+                        && !rows
+                            .iter()
+                            .any(|(loc, h)| *loc == holder.1 && h.binary_search(&hash).is_ok())
+                });
+            // An invalid old holder must be replaced in the saved
+            // groups even if another holder proves the same removal.
+            (removed && !keep) || (!removed && copy && covered)
+        }) {
+            marks.push(location);
+        }
+    }
+    marks
+}
+
+/// Rule 5 selects only settled DISCLOSED mains whose counted hashes now have
+/// positive earlier-holder proof. Each selected location owes one ordinary
+/// correction; holders never become seeds and no read revision is changed.
+fn mark_settled_counted_copies(index: &mut ScanIndex) {
+    let live = indexed_main_files(index);
+    let mut folders = BTreeMap::<_, (BTreeMap<_, _>, BTreeSet<_>)>::new();
+    for (&location, &key) in live.iter() {
+        if index.claude_money_birth_store.money_marks(location) & money_mark::DISCLOSED == 0
+            || !index.file_has_accepted_body_unheld(key)
+            || copy_held(index, key)
+            || index.claude_family_listed(key)
+        {
+            continue;
+        }
+        let member = claude_index_path_member_ref(Path::new(key)).unwrap();
+        if committed_holder_order(&index.claude_money_birth_store, member.root, key).is_none() {
+            continue;
+        }
+        let Some(record) = index.claude_request_census.get(key) else {
+            continue;
+        };
+        let groups = index.claude_copy_removals.get(location);
+        let counted = record
+            .request_hashes()
+            .iter()
+            .copied()
+            .filter(|hash| {
+                !groups
+                    .iter()
+                    .any(|(_, removed)| removed.binary_search(hash).is_ok())
+            })
+            .collect::<Vec<_>>();
+        if !counted.is_empty() {
+            let (candidates, union) = folders.entry(Path::new(key).parent().unwrap()).or_default();
+            candidates.insert(location, counted);
+            union.extend(record.request_hashes().iter().copied());
+        }
+    }
+    let mut marks = Vec::new();
+    for (folder, (candidates, union)) in folders {
+        marks.extend(changed_copy_decisions(
+            index,
+            &live,
+            &folder.to_string_lossy(),
+            &union.into_iter().collect::<Vec<_>>(),
+            candidates,
+            &[],
+        ));
+    }
+    drop(live);
+    for location in marks {
+        index.claude_copy_removals.mark(location);
     }
 }
 

@@ -166,7 +166,6 @@ fn assert_cross_build_scope(raw: &Value, cross: &Value) {
     // permit any other component, content hash, money or ordering drift.
     for path in [
         "/source_file_fingerprint",
-        "/semantic_envelope/revision_hash",
         "/semantic_envelope/revision_v2_hash",
     ] {
         *restored
@@ -3319,6 +3318,23 @@ pub(in crate::snapshot_sync) fn assert_head_conflict_account_placement() {
         let mut c = corpus("head-conflict-account-placement");
         let org_a = "11111111-1111-4111-8111-111111111111";
         let org_b = "22222222-2222-4222-8222-222222222222";
+        let a = ottto_core::billing_identity_hash("anthropic", "organization", org_a).unwrap();
+        let b = ottto_core::billing_identity_hash("anthropic", "organization", org_b).unwrap();
+        // Each request's own telemetry: a valid login, the marker's org and a
+        // trace owner, so its account is placed by its own evidence.
+        let own = |c: &Corpus, rows: &[(&str, u64, char, &String)]| {
+            let api = rows
+                .iter()
+                .map(|(request, tokens, login, org)| {
+                    api_login_org(ROOT, request, *tokens, *login, Some((*org).clone()))
+                })
+                .collect::<Vec<_>>();
+            let traces = rows
+                .iter()
+                .map(|(request, ..)| trace_for(ROOT, request, ""))
+                .collect::<Vec<_>>();
+            c.evidence(&api, &traces);
+        };
         let marker = |org: &str| {
             json!({"type":"attachment","sessionId":ROOT,
             "attachment":{"type":"credential_org","organizationUuid":org}})
@@ -3327,7 +3343,7 @@ pub(in crate::snapshot_sync) fn assert_head_conflict_account_placement() {
         };
         let path = c.root(ROOT, &(marker(org_a) + &line(ROOT, "r1", AT, 10)));
         input_clock(&path);
-        c.evidence(&[api("r1", 10, 100)], &[]);
+        own(&c, &[("r1", 10, '1', &a)]);
         let disk = Disk::new(&c);
         let retained = E2ScanFixture::capturing_identity();
         disk.begin(&retained, SnapshotSource::ClaudeCode);
@@ -3344,7 +3360,7 @@ pub(in crate::snapshot_sync) fn assert_head_conflict_account_placement() {
             &path,
             &(switch + &marker(org_b) + &line(ROOT, "r2", "2026-08-02T07:00:20Z", 20)),
         );
-        c.evidence(&[api("r1", 10, 100), api("r2", 20, 200)], &[]);
+        own(&c, &[("r1", 10, '1', &a), ("r2", 20, '2', &b)]);
         input_clock(&path);
         let restart = E2ScanFixture::capturing_identity();
         disk.begin(&restart, SnapshotSource::ClaudeCode);
@@ -3360,8 +3376,6 @@ pub(in crate::snapshot_sync) fn assert_head_conflict_account_placement() {
         assert_eq!(pages[2].modes, (0, 1, 0), "new owner Tail");
         finish_claude_pages(&c, &mut pages);
         let receipt = compare_claude_uploads(&pages);
-        let a = ottto_core::billing_identity_hash("anthropic", "organization", org_a).unwrap();
-        let b = ottto_core::billing_identity_hash("anthropic", "organization", org_b).unwrap();
         let item = receipt
             .items
             .iter()
@@ -3557,7 +3571,11 @@ fn stray_row_echo_ack(
     let asked =
         serde_json::to_value(request(batch))?["cache_state_ack_contract"] == "cache_state_ack:v1";
     let mut response = ack(batch)?;
-    for (reference, item) in response.accepted_entities.iter_mut().zip(batch.iter().copied()) {
+    for (reference, item) in response
+        .accepted_entities
+        .iter_mut()
+        .zip(batch.iter().copied())
+    {
         let Some(state) = item.cache_observations_state.as_ref() else {
             continue;
         };
@@ -3587,6 +3605,23 @@ fn mixed_class_page_is_equal_and_class_pure_on_every_route() {
         let root = forked_root(&mut c);
         let org_a = "11111111-1111-4111-8111-111111111111";
         let org_b = "22222222-2222-4222-8222-222222222222";
+        let a = ottto_core::billing_identity_hash("anthropic", "organization", org_a).unwrap();
+        let b = ottto_core::billing_identity_hash("anthropic", "organization", org_b).unwrap();
+        // The unpatched session's own telemetry: a valid login, the marker's
+        // org and a trace owner per request.
+        let other_own = |c: &Corpus, rows: &[(&str, u64, char, &String)]| {
+            let api = rows
+                .iter()
+                .map(|(request, tokens, login, org)| {
+                    api_login_org(UNPATCHED, request, *tokens, *login, Some((*org).clone()))
+                })
+                .collect::<Vec<_>>();
+            let traces = rows
+                .iter()
+                .map(|(request, ..)| trace_for(UNPATCHED, request, ""))
+                .collect::<Vec<_>>();
+            c.evidence_for(UNPATCHED, &api, &traces);
+        };
         let marker = |org: &str| {
             json!({"type":"attachment","sessionId":UNPATCHED,
             "attachment":{"type":"credential_org","organizationUuid":org}})
@@ -3596,7 +3631,7 @@ fn mixed_class_page_is_equal_and_class_pure_on_every_route() {
         let other = c.root(UNPATCHED, &(marker(org_a) + &line(UNPATCHED, "u1", AT, 7)));
         input_clock(&other);
         c.evidence(&[api("r1", 10, 100)], &[]);
-        c.evidence_for(UNPATCHED, &[api_for(UNPATCHED, "u1", 7, 70)], &[]);
+        other_own(&c, &[("u1", 7, '4', &a)]);
         let disk = Disk::new(&c);
         let warm = E2ScanFixture::capturing_identity();
         disk.begin(&warm, SnapshotSource::ClaudeCode);
@@ -3655,14 +3690,7 @@ fn mixed_class_page_is_equal_and_class_pure_on_every_route() {
             ],
             &[],
         );
-        c.evidence_for(
-            UNPATCHED,
-            &[
-                api_for(UNPATCHED, "u1", 7, 70),
-                api_for(UNPATCHED, "u2", 9, 90),
-            ],
-            &[],
-        );
+        other_own(&c, &[("u1", 7, '4', &a), ("u2", 9, '5', &b)]);
         let restart = E2ScanFixture::capturing_identity();
         disk.begin(&restart, SnapshotSource::ClaudeCode);
         let cold = E2ScanFixture::capturing_identity();
@@ -3692,8 +3720,6 @@ fn mixed_class_page_is_equal_and_class_pure_on_every_route() {
         money_oracle::assert_equivalent(&routes[1], &routes[2]);
         money_oracle::assert_no_smaller_reemit(ROOT, &routes[1], &routes[0], &routes[1], false);
         // Two organizations on the unpatched session: placement is not vacuous.
-        let a = ottto_core::billing_identity_hash("anthropic", "organization", org_a).unwrap();
-        let b = ottto_core::billing_identity_hash("anthropic", "organization", org_b).unwrap();
         let other_body = serde_json::to_string(&routes[1].snapshots[UNPATCHED]).unwrap();
         assert!(
             other_body.contains(&a) && other_body.contains(&b),
@@ -4002,6 +4028,8 @@ fn mixed_class_page_placement_survives_upgrade_and_restarts() {
         let root = forked_root(&mut c);
         let org_a = "11111111-1111-4111-8111-111111111111";
         let org_b = "22222222-2222-4222-8222-222222222222";
+        let a = ottto_core::billing_identity_hash("anthropic", "organization", org_a).unwrap();
+        let b = ottto_core::billing_identity_hash("anthropic", "organization", org_b).unwrap();
         let marker = |org: &str| {
             json!({"type":"attachment","sessionId":UNPATCHED,
             "attachment":{"type":"credential_org","organizationUuid":org}})
@@ -4026,17 +4054,24 @@ fn mixed_class_page_placement_survives_upgrade_and_restarts() {
                 .collect::<Vec<_>>();
             c.evidence(&api, &traces);
         };
-        // (request, tokens) on the unpatched session: its organizations come
-        // from transcript markers, as on the mixed page above.
-        let other_evidence = |rows: &[(&str, u64)]| {
+        // (request, tokens, login, organization hash) on the unpatched
+        // session, each with its trace owner: its own telemetry names the
+        // organization its transcript marker names, as on the mixed page above.
+        let other_evidence = |rows: &[(&str, u64, char, &String)]| {
             let api = rows
                 .iter()
-                .map(|(request, tokens)| api_for(UNPATCHED, request, *tokens, *tokens * 10))
+                .map(|(request, tokens, login, org)| {
+                    api_login_org(UNPATCHED, request, *tokens, *login, Some((*org).clone()))
+                })
                 .collect::<Vec<_>>();
-            c.evidence_for(UNPATCHED, &api, &[]);
+            let traces = rows
+                .iter()
+                .map(|(request, ..)| trace_for(UNPATCHED, request, ""))
+                .collect::<Vec<_>>();
+            c.evidence_for(UNPATCHED, &api, &traces);
         };
         root_evidence(&[("r1", 10, '1', '7')][..]);
-        other_evidence(&[("u1", 7)][..]);
+        other_evidence(&[("u1", 7, '4', &a)][..]);
         let disk = Disk::new(&c);
         let warm = E2ScanFixture::capturing_identity();
         disk.begin(&warm, SnapshotSource::ClaudeCode);
@@ -4091,7 +4126,7 @@ fn mixed_class_page_placement_survives_upgrade_and_restarts() {
             ("mixed-side", 5, '2', '8'),
         ];
         root_evidence(&page_one[..]);
-        other_evidence(&[("u1", 7), ("u2", 9)][..]);
+        other_evidence(&[("u1", 7, '4', &a), ("u2", 9, '5', &b)][..]);
         let upgraded = E2ScanFixture::capturing_identity();
         disk.begin(&upgraded, SnapshotSource::ClaudeCode);
         let upgraded_page = c.raw(&upgraded, committed.clone(), 100, true, &[]);
@@ -4133,8 +4168,6 @@ fn mixed_class_page_placement_survives_upgrade_and_restarts() {
             );
         }
         assert_mixed_placement_corruption_detected(&routes[1], &routes[2]);
-        let a = ottto_core::billing_identity_hash("anthropic", "organization", org_a).unwrap();
-        let b = ottto_core::billing_identity_hash("anthropic", "organization", org_b).unwrap();
         let other_body = serde_json::to_string(&routes[1].snapshots[UNPATCHED]).unwrap();
         assert!(
             other_body.contains(&a) && other_body.contains(&b),
@@ -4160,7 +4193,7 @@ fn mixed_class_page_placement_survives_upgrade_and_restarts() {
         let mut page_two = page_one.to_vec();
         page_two.push(("r3", 30, '1', '7'));
         root_evidence(&page_two[..]);
-        other_evidence(&[("u1", 7), ("u2", 9), ("u3", 11)][..]);
+        other_evidence(&[("u1", 7, '4', &a), ("u2", 9, '5', &b), ("u3", 11, '5', &b)][..]);
         let restarted = E2ScanFixture::capturing_identity();
         disk.begin(&restarted, SnapshotSource::ClaudeCode);
         let mut restart_page = c.raw(&restarted, next.clone(), 100, true, &[]);
