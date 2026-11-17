@@ -39,7 +39,7 @@ use crate::agent_status::persist_claude_slot_collection_states;
 use crate::agent_status::prepare_default_claude_slot_status;
 use crate::agent_status::quarantine_claude_cross_account_meters;
 use crate::agent_status::read_claude_cli_oauth_account;
-use crate::agent_status::read_claude_oauth_usage_breaker_with_legacy_migration;
+use crate::agent_status::read_claude_oauth_usage_breaker;
 use crate::agent_status::read_persisted_claude_slot_collection_state;
 use crate::agent_status::remember_claude_slot_account_profile;
 use crate::agent_status::retain_verified_claude_binding;
@@ -129,11 +129,10 @@ pub(in crate::agent_status) fn collect_claude_status_snapshots(
                 },
                 |slot_id| crate::claude_browser_auth::collection_suppression(slot_id).is_some(),
                 |binding, slot_id| {
-                    read_claude_oauth_usage_breaker_with_legacy_migration(
+                    read_claude_oauth_usage_breaker(
                         &binding.account_identifier_hash,
                         &binding.organization_identifier_hash,
                         &claude_oauth_usage_config_fingerprint(),
-                        false,
                     )
                     .is_some_and(|breaker| {
                         claude_oauth_usage_caller_auth_hold(
@@ -572,11 +571,10 @@ pub(in crate::agent_status) fn collect_claude_status_snapshots(
         &slot_states,
         &default_snapshot,
         |account, organization| {
-            read_claude_oauth_usage_breaker_with_legacy_migration(
+            read_claude_oauth_usage_breaker(
                 account,
                 organization,
                 &claude_oauth_usage_config_fingerprint(),
-                false,
             )
         },
         now_epoch,
