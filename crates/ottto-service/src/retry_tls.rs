@@ -1065,12 +1065,18 @@ mod tests {
         );
         // The included fixture file compiles only inside a test module.
         let sync = read("src/snapshot_sync.rs");
-        let include = sync
-            .find("include!(\"retry_live_native_tests.rs\");")
-            .unwrap();
-        assert!(sync
-            .find("\n#[cfg(test)]\nmod tests {")
-            .is_some_and(|tests| tests < include));
+        if let Some(include) = sync.find("include!(\"retry_live_native_tests.rs\");") {
+            assert!(sync
+                .find("\n#[cfg(test)]\nmod tests {")
+                .is_some_and(|tests| tests < include));
+        } else {
+            assert!(
+                sync.contains("\n#[cfg(test)]\nmod tests;")
+                    || sync.contains("\n#[cfg(test)]\n#[rustfmt::skip]\nmod tests;")
+            );
+            let tests = read("src/snapshot_sync/tests.rs");
+            assert!(tests.contains("include!(\"../retry_live_native_tests.rs\");"));
+        }
         assert!(read("src/retry_live_native_tests.rs")
             .contains("include!(\"retry_allocation_native_tests.rs\");"));
     }

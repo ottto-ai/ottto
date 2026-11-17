@@ -85,6 +85,7 @@ NEVER_RETRY_MODULES = frozenset({
     "money_equivalence_tests",
     "money_oracle",
     # Keeps every scan test never-retry once its tests leave snapshots.rs.
+    "snapshot_sync",
     "snapshots",
     "upload_context_receipt_tests",
 })
