@@ -21,6 +21,13 @@ file-system hint / periodic listing → select file → read new bytes from save
   Each listing gives hint priority to indexed files whose listing stamp changed since their
   last read, promoting queued files in place. Unchanged census files, including owed files,
   keep their ordinary queue order. Existing selection budgets and read gates still apply.
+  A queued Claude directory or census member missing below its own readable scan root
+  is a removal when the secure absence proof succeeds, even with missing intermediate
+  directories. A missing configured root, including a nested root, keeps the census
+  incomplete. Recreation before that proof keeps the loss; recreation after a valid
+  witness belongs to the next ordinary census, under its existing admission gates.
+  Candidate discovery retains its earlier immediate-live-parent shortcut, which does
+  not provide the secure proof's ancestor or recreation guarantees.
 - **Selection.** Each pass picks files and a read mode (`transcript_acquisition.rs`). Tail, a read
   from the saved offset, is the normal mode, so bytes read track bytes appended. A Full read has a
   named cause (new or replaced file, missing or invalid saved result, a real edit) and is counted

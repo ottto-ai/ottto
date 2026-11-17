@@ -408,43 +408,59 @@ pub(super) mod tests {
 
     #[test]
     fn real_queued_directory_absence_records_once_without_root_fallback() {
-        let dir = crate::test_scratch::ScratchDir::new("disappearance-directory");
-        let root = dir.join("root");
-        fs::create_dir(&root).unwrap();
-        let mut index = ScanIndex::default();
-        ensure_bounded_traversal(
+        for source in [
+            SnapshotSource::ClaudeCode,
+            SnapshotSource::Codex,
             SnapshotSource::Pi,
-            std::slice::from_ref(&root),
-            &mut index,
-            NOW,
-            BACKFILL_WINDOW_DAYS,
-        );
-        fs::remove_dir(&root).unwrap();
-        let (_, events) = observe(|| {
-            advance_bounded_directory_traversal(
-                SnapshotSource::Pi,
-                &mut index,
-                BACKFILL_WINDOW_DAYS,
-                None,
-            )
-        });
-        assert_eq!(events, [[0; 4], [0; 4], [1, 0, 0, 0]]);
-        assert_eq!(
-            index
-                .traversal
-                .as_ref()
-                .unwrap()
-                .counts
-                .disappeared_file_count,
-            1
-        );
-        assert!(index
-            .traversal
-            .as_ref()
-            .unwrap()
-            .pending_directories
-            .is_empty());
-        assert!(index.files.is_empty());
+        ] {
+            for root_itself in [false, true] {
+                let dir = crate::test_scratch::ScratchDir::new("disappearance-directory");
+                let root = fs::canonicalize(&dir).unwrap();
+                let path = if root_itself {
+                    root.clone()
+                } else {
+                    root.join("gone")
+                };
+                let mut index = ScanIndex::default();
+                ensure_bounded_traversal(
+                    source,
+                    std::slice::from_ref(&root),
+                    &mut index,
+                    NOW,
+                    BACKFILL_WINDOW_DAYS,
+                );
+                index.traversal.as_mut().unwrap().pending_directories = [ScanTraversalPath {
+                    scan_root: root.clone(),
+                    path,
+                    census_member: true,
+                    watcher_hint: false,
+                }]
+                .into();
+                if root_itself {
+                    fs::remove_dir(&root).unwrap();
+                }
+                let (_, sites) = observe_sites(|| {
+                    advance_bounded_directory_traversal(
+                        source,
+                        &mut index,
+                        BACKFILL_WINDOW_DAYS,
+                        None,
+                    )
+                });
+                let removal = cfg!(unix) && source == SnapshotSource::ClaudeCode && !root_itself;
+                let mut expected = [[[0; OUTCOMES]; SITES]; 3];
+                expected[source.slot()][Site::WalkDirectory.index()] =
+                    if removal { [0, 1] } else { [1, 0] };
+                assert_eq!(sites, expected, "{source:?}, root {root_itself}");
+                let traversal = index.traversal.as_ref().unwrap();
+                assert_eq!(
+                    traversal.counts.disappeared_file_count,
+                    usize::from(!removal)
+                );
+                assert!(traversal.pending_directories.is_empty());
+                assert!(index.files.is_empty());
+            }
+        }
     }
 
     #[test]
@@ -987,11 +1003,9 @@ pub(super) mod tests {
         super::super::sampled_scan::set_test_now(None);
     }
 
-    /// Control for N-T3: the same member with its parent directory missing is
-    /// not evidence of removal at its own NotFound, which stays loss. Its
-    /// session directory's complete read no longer lists the missing parent,
-    /// and the secure proof beneath that read ancestor retires the entry and
-    /// its audit marker once (the never-queued gone-parent row).
+    /// The missing-parent member is now a removal at its own NotFound; the
+    /// ancestor's nomination still retires its audit debt only once. Retain
+    /// the historical test ID for discovery compatibility.
     #[cfg(unix)]
     #[test]
     fn claude_audit_debt_member_below_missing_parent_stays_loss_and_retires_by_its_ancestor() {
@@ -1003,7 +1017,7 @@ pub(super) mod tests {
             observe_sites(|| observe(|| claude_generation(&mut index, &fixture.dir, NOW, 10, &[])))
         });
         let mut expected_sites = [[[0; OUTCOMES]; SITES]; 3];
-        expected_sites[1][Site::CandidateForcedIndex.index()] = [1, 0];
+        expected_sites[1][Site::CandidateForcedIndex.index()] = [0, 1];
         assert_eq!(sites, expected_sites);
         assert_eq!(events, [[0; 4], [1, 0, 0, 0], [0; 4]]);
         assert_eq!(vanished, [[0; VANISHED], [1, 0], [0; VANISHED]]);
@@ -1012,11 +1026,12 @@ pub(super) mod tests {
                 .iter()
                 .map(|page| page.disappeared_file_count)
                 .sum::<usize>(),
-            1
+            0
         );
-        let traversal = index.traversal.as_ref().expect("the loss keeps it red");
+        let traversal = index.traversal.as_ref().expect("the symlink keeps it red");
         assert!(traversal.has_errors());
-        assert_eq!(traversal.counts.disappeared_file_count, 1);
+        assert_eq!(traversal.counts.disappeared_file_count, 0);
+        assert_eq!(traversal.counts.symlink_rejected_count, 1);
         assert!(!index.files.contains_key(&member_key));
     }
 
@@ -1111,8 +1126,51 @@ pub(super) mod tests {
 
     const WALKS: [(&str, u64); 3] = [(NOW, 1_000), (LATER, 1_600), (RETRY, 2_200)];
 
+    /// Two natively parsed members under a directory already queued for the
+    /// next census. Its root listing is represented by that saved queue.
+    #[cfg(unix)]
+    fn queued_directory_index(root: &Path) -> (ScanIndex, PathBuf, [PathBuf; 2]) {
+        let project = root.join("project");
+        fs::create_dir(&project).unwrap();
+        let sessions = [
+            "a1111111-1111-4111-8111-111111111111",
+            "b2222222-2222-4222-8222-222222222222",
+        ];
+        let paths = sessions.map(|session| project.join(format!("{session}.jsonl")));
+        for (session, path) in sessions.iter().zip(&paths) {
+            fs::write(path, claude_line(session, session)).unwrap();
+        }
+        let mut index = ScanIndex::default();
+        assert!(
+            claude_generation(&mut index, root, NOW, 10, &[])
+                .last()
+                .unwrap()
+                .census_complete
+        );
+        for path in &paths {
+            let key = local_index_key(path);
+            assert!(index.claude_request_census_for_test().get(&key).is_some());
+            index.claude_money_birth_store.set_money_marks(&key, 3);
+        }
+        ensure_bounded_traversal(
+            SnapshotSource::ClaudeCode,
+            &[root.to_path_buf()],
+            &mut index,
+            LATER,
+            BACKFILL_WINDOW_DAYS,
+        );
+        index.traversal.as_mut().unwrap().pending_directories = [ScanTraversalPath {
+            scan_root: root.to_path_buf(),
+            path: project.clone(),
+            census_member: true,
+            watcher_hint: false,
+        }]
+        .into();
+        (index, project, paths)
+    }
+
     /// A member below a deleted directory and a vanished queued directory
-    /// stay loss at their own NotFound in every walk, as on main.
+    /// are removals at their own NotFound. Keep the historical test ID.
     #[cfg(unix)]
     #[test]
     fn claude_member_of_deleted_directory_stays_loss_at_its_not_found() {
@@ -1122,10 +1180,80 @@ pub(super) mod tests {
         for walk in WALKS {
             assert_eq!(
                 deleted_directory_walk(&mut index, &root, walk, &member, Some(&directory)),
-                (1, false, 1)
+                (0, true, 0)
             );
         }
         super::super::sampled_scan::set_test_now(None);
+
+        let dir = crate::test_scratch::ScratchDir::new("absence-queued-subtree");
+        let root = fs::canonicalize(&dir).unwrap();
+        let (mut index, project, paths) = queued_directory_index(&root);
+        unverified(index.files.get_mut(&local_index_key(&paths[1])).unwrap());
+        fs::remove_dir_all(&project).unwrap();
+        let (((mut index, page), sites), vanished) = observe_vanished(|| {
+            observe_sites(|| {
+                finish(OwnedSourceScan::new(
+                    SnapshotSource::ClaudeCode,
+                    std::slice::from_ref(&root),
+                    index,
+                    LATER,
+                    BACKFILL_WINDOW_DAYS,
+                    10,
+                    None,
+                    &[],
+                    false,
+                ))
+            })
+        });
+        let mut expected = [[[0; OUTCOMES]; SITES]; 3];
+        expected[1][Site::WalkDirectory.index()] = [0, 1];
+        assert_eq!(sites, expected);
+        assert_eq!(page.disappeared_file_count, 0);
+        assert!(page.census_complete);
+        assert!(
+            page.snapshots.is_empty(),
+            "retirement invents no replacement usage"
+        );
+        assert!(index.traversal.is_none());
+        assert_eq!(vanished, [[0; VANISHED], [1, 2], [0; VANISHED]]);
+        for path in &paths {
+            let key = local_index_key(path);
+            assert!(
+                !index.files.contains_key(&key),
+                "the subtree retires on this page"
+            );
+            assert!(index.claude_request_census_for_test().get(&key).is_none());
+            assert_eq!(
+                index
+                    .claude_money_birth_store
+                    .money_marks(super::super::claude_money_birth_store::location_key(&key)),
+                0
+            );
+        }
+        let ((pages, vanished), rows) = crate::local_resource_diagnostics::capture(|| {
+            observe_vanished(|| {
+                ensure_bounded_traversal(
+                    SnapshotSource::ClaudeCode,
+                    std::slice::from_ref(&root),
+                    &mut index,
+                    RETRY,
+                    BACKFILL_WINDOW_DAYS,
+                );
+                let walk = index.traversal.as_ref().unwrap();
+                assert_eq!(walk.unhealthy_retry_attempt, 0);
+                assert!(walk.unhealthy_retry_not_before_unix_seconds.is_none());
+                assert!(super::super::traversal_transition::routine_recensus(
+                    SnapshotSource::ClaudeCode,
+                    walk
+                ));
+                claude_generation(&mut index, &root, RETRY, 10, &[])
+            })
+        });
+        assert_eq!(vanished, [[0; VANISHED]; 3], "no second retirement");
+        assert!(pages.iter().all(|page| page.snapshots.is_empty()));
+        assert!(!rows
+            .iter()
+            .any(|row| row["counts"]["reason"] == "terminal_unhealthy_retry"));
     }
 
     /// Control: the quarantined family losing one member through N leaves the
@@ -1435,9 +1563,8 @@ pub(super) mod tests {
         assert!(index.files.contains_key(&local_index_key(&first_path)));
     }
 
-    /// Control: a missing, renamed or symlinked parent is not evidence of
-    /// removal. The Claude NotFound stays loss at the candidate stat and at
-    /// the open.
+    /// Missing parents now permit a secure candidate removal. Symlinked
+    /// ancestors still refuse it; the open-site behavior stays unchanged.
     #[cfg(unix)]
     #[test]
     fn claude_absence_without_a_present_real_parent_stays_red() {
@@ -1446,9 +1573,10 @@ pub(super) mod tests {
         fs::create_dir(&real).unwrap();
         let link = dir.join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
-        for path in [
-            dir.join("gone").join("missing.jsonl"),
-            link.join("missing.jsonl"),
+        for (path, removal) in [
+            (dir.join("gone").join("missing.jsonl"), true),
+            (link.join("missing.jsonl"), false),
+            (link.join("gone").join("missing.jsonl"), false),
         ] {
             let mut census = ScanCensus::default();
             let (candidate, events) = observe(|| {
@@ -1467,9 +1595,51 @@ pub(super) mod tests {
                 )
             });
             assert!(candidate.is_none());
-            assert_eq!(census.disappeared_file_count, 1, "{path:?}");
+            assert_eq!(
+                census.disappeared_file_count,
+                usize::from(!removal),
+                "{path:?}"
+            );
             assert_eq!(events, [[0; 4], [1, 0, 0, 0], [0; 4]]);
-            assert!(census.removed_index_keys.is_empty());
+            assert_eq!(
+                census.removed_index_keys.contains(&local_index_key(&path)),
+                removal
+            );
+            let mut index = ScanIndex::default();
+            ensure_bounded_traversal(
+                SnapshotSource::ClaudeCode,
+                &[dir.to_path_buf()],
+                &mut index,
+                NOW,
+                BACKFILL_WINDOW_DAYS,
+            );
+            index.traversal.as_mut().unwrap().pending_directories = [ScanTraversalPath {
+                scan_root: dir.to_path_buf(),
+                path: path.parent().unwrap().join("gone-directory"),
+                census_member: true,
+                watcher_hint: false,
+            }]
+            .into();
+            let (_, sites) = observe_sites(|| {
+                advance_bounded_directory_traversal(
+                    SnapshotSource::ClaudeCode,
+                    &mut index,
+                    BACKFILL_WINDOW_DAYS,
+                    None,
+                )
+            });
+            let mut expected = [[[0; OUTCOMES]; SITES]; 3];
+            expected[1][Site::WalkDirectory.index()] = if removal { [0, 1] } else { [1, 0] };
+            assert_eq!(sites, expected, "directory below {path:?}");
+            assert_eq!(
+                index
+                    .traversal
+                    .as_ref()
+                    .unwrap()
+                    .counts
+                    .disappeared_file_count,
+                usize::from(!removal)
+            );
         }
 
         let project = dir.join("project");
@@ -1604,6 +1774,38 @@ pub(super) mod tests {
         assert_eq!(sites, expected);
         assert_eq!(census.disappeared_file_count, 2, "Pi only");
 
+        let (_, sites) = observe_sites(|| {
+            for source in [
+                SnapshotSource::ClaudeCode,
+                SnapshotSource::Codex,
+                SnapshotSource::Pi,
+            ] {
+                let mut census = ScanCensus::default();
+                let mut member = pending();
+                member.path = dir.join("gone-parent/member.jsonl");
+                assert!(candidate_from_traversal_path(
+                    source,
+                    member,
+                    &mut census,
+                    None,
+                    BACKFILL_WINDOW_DAYS,
+                    &mut crate::snapshots::CandidateDiscovery::new(&mut ScanIndex::default(), None),
+                )
+                .is_none());
+                let removal = cfg!(unix) && source == SnapshotSource::ClaudeCode;
+                assert_eq!(census.disappeared_file_count, usize::from(!removal));
+                assert_eq!(!census.removed_index_keys.is_empty(), removal);
+            }
+        });
+        let mut expected = [[[0; OUTCOMES]; SITES]; 3];
+        expected[0][Site::CandidateWalk.index()] = [1, 0];
+        expected[1][Site::CandidateWalk.index()] = if cfg!(unix) { [0, 1] } else { [1, 0] };
+        expected[2][Site::CandidateWalk.index()] = [1, 0];
+        assert_eq!(
+            sites, expected,
+            "missing parent: only Claude adds secure removal"
+        );
+
         let root = dir.join("root");
         fs::create_dir(&root).unwrap();
         let mut index = ScanIndex::default();
@@ -1625,7 +1827,61 @@ pub(super) mod tests {
         });
         let mut expected = [[[0; OUTCOMES]; SITES]; 3];
         expected[1][Site::WalkDirectory.index()] = [1, 0];
-        assert_eq!(sites, expected, "a vanished queued directory stays loss");
+        assert_eq!(sites, expected, "a vanished configured root stays loss");
+
+        // A nested configured root is never proved absent through the outer
+        // root, even though the all-roots helper would accept that proof.
+        let outer = fs::canonicalize(&dir).unwrap();
+        let nested = outer.join("nested");
+        fs::create_dir(&nested).unwrap();
+        let mut index = ScanIndex::default();
+        ensure_bounded_traversal(
+            SnapshotSource::ClaudeCode,
+            &[outer, nested.clone()],
+            &mut index,
+            NOW,
+            BACKFILL_WINDOW_DAYS,
+        );
+        fs::remove_dir(&nested).unwrap();
+        let (_, sites) = observe_sites(|| {
+            advance_bounded_directory_traversal(
+                SnapshotSource::ClaudeCode,
+                &mut index,
+                BACKFILL_WINDOW_DAYS,
+                None,
+            )
+        });
+        assert_eq!(sites, expected, "the nested configured root stays loss");
+        let mut census = ScanCensus::default();
+        let (_, sites) = observe_sites(|| {
+            candidate_from_traversal_path(
+                SnapshotSource::ClaudeCode,
+                ScanTraversalPath {
+                    path: nested.join("member.jsonl"),
+                    scan_root: nested,
+                    census_member: true,
+                    watcher_hint: false,
+                },
+                &mut census,
+                None,
+                BACKFILL_WINDOW_DAYS,
+                &mut crate::snapshots::CandidateDiscovery::new(&mut index, None),
+            )
+        });
+        let mut expected = [[[0; OUTCOMES]; SITES]; 3];
+        expected[1][Site::CandidateWalk.index()] = [1, 0];
+        assert_eq!(sites, expected, "the member's own nested root is missing");
+        assert_eq!(census.disappeared_file_count, 1);
+        assert!(census.removed_index_keys.is_empty());
+        assert_eq!(
+            index
+                .traversal
+                .as_ref()
+                .unwrap()
+                .counts
+                .disappeared_file_count,
+            1
+        );
     }
 
     /// [behaviour] A directory read nominates a missing leaf below a listed
@@ -1969,6 +2225,94 @@ pub(super) mod tests {
                 }
             }
         }
+
+        // Exercise ordinary entries on both sides of the NEW directory
+        // witness, separately from the audit-only row above. The recreated
+        // paths remain eligible under the existing first-read window.
+        for before_proof in [true, false] {
+            let dir = crate::test_scratch::ScratchDir::new("absence-directory-recreation");
+            let root = fs::canonicalize(&dir).unwrap();
+            let (index, project, paths) = queued_directory_index(&root);
+            let previous = paths.clone().map(|path| {
+                index.files[&local_index_key(&path)]
+                    .source_file_fingerprint
+                    .clone()
+            });
+            fs::remove_dir_all(&project).unwrap();
+            let recreate = {
+                let (project, paths) = (project.clone(), paths.clone());
+                move || {
+                    fs::create_dir(&project).unwrap();
+                    for path in paths {
+                        let session = path.file_stem().unwrap().to_str().unwrap();
+                        fs::write(&path, claude_line(session, &format!("recreated-{session}")))
+                            .unwrap();
+                    }
+                }
+            };
+            let mut recreate = Some(recreate);
+            if before_proof {
+                super::WALK_DIRECTORY_ABSENCE_HOOK.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(recreate.take().unwrap()));
+                });
+            }
+            let (((mut index, page), sites), vanished) = observe_vanished(|| {
+                observe_sites(|| {
+                    let state = OwnedSourceScan::new(
+                        SnapshotSource::ClaudeCode,
+                        std::slice::from_ref(&root),
+                        index,
+                        LATER,
+                        BACKFILL_WINDOW_DAYS,
+                        10,
+                        None,
+                        &[],
+                        false,
+                    );
+                    assert!(super::WALK_DIRECTORY_ABSENCE_HOOK.with(|hook| hook.borrow().is_none()));
+                    if let Some(recreate) = recreate {
+                        // Both directory and per-key witnesses succeeded during
+                        // construction; this is next-generation evidence.
+                        recreate();
+                    }
+                    finish(state)
+                })
+            });
+            let mut expected = [[[0; OUTCOMES]; SITES]; 3];
+            expected[1][Site::WalkDirectory.index()] = if before_proof { [1, 0] } else { [0, 1] };
+            assert_eq!(sites, expected);
+            assert_eq!(page.disappeared_file_count, usize::from(before_proof));
+            assert_eq!(page.census_complete, !before_proof);
+            assert_eq!(vanished[1], [0, if before_proof { 0 } else { 2 }]);
+            for (path, fingerprint) in paths.iter().zip(&previous) {
+                let key = local_index_key(path);
+                assert_eq!(index.files.contains_key(&key), before_proof);
+                assert_eq!(
+                    index.claude_request_census_for_test().get(&key).is_some(),
+                    before_proof
+                );
+                if before_proof {
+                    assert_eq!(&index.files[&key].source_file_fingerprint, fingerprint);
+                }
+            }
+            if !before_proof {
+                assert!(index.traversal.is_none());
+                let pages = claude_generation(&mut index, &root, RETRY, 10, &[]);
+                assert!(pages.last().unwrap().census_complete);
+                assert_eq!(
+                    pages
+                        .iter()
+                        .map(|page| page.scanned_file_count)
+                        .sum::<usize>(),
+                    2
+                );
+                for (path, fingerprint) in paths.iter().zip(&previous) {
+                    let key = local_index_key(path);
+                    assert_ne!(&index.files[&key].source_file_fingerprint, fingerprint);
+                    assert!(index.claude_request_census_for_test().get(&key).is_some());
+                }
+            }
+        }
     }
 }
 
@@ -1977,6 +2321,14 @@ type AbsenceParentProbeHook = Box<dyn FnOnce()>;
 #[cfg(test)]
 thread_local! {
     static ABSENCE_PARENT_PROBE_HOOK: std::cell::RefCell<Option<AbsenceParentProbeHook>> = const { std::cell::RefCell::new(None) };
+    static WALK_DIRECTORY_ABSENCE_HOOK: std::cell::RefCell<Option<AbsenceParentProbeHook>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+pub(super) fn before_walk_directory_absence_proof() {
+    let hook = WALK_DIRECTORY_ABSENCE_HOOK.with(|hook| hook.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
 }
 #[cfg(test)]
 pub(super) fn before_absence_parent_probe() {
@@ -2071,7 +2423,7 @@ mod absence_parent_counts_tests {
                         ),
                     )
                 });
-                let removal = suffix.is_empty();
+                let removal = suffix != "symlink";
                 assert_eq!(
                     events[1][site.index()],
                     if removal { [0, 1] } else { [1, 0] }
@@ -2083,7 +2435,7 @@ mod absence_parent_counts_tests {
                 );
                 let actual = counts(scope);
                 let mut wanted = serde_json::Map::new();
-                if !removal {
+                if !suffix.is_empty() {
                     wanted.insert(format!("claude_absence_parent_{suffix}"), 1.into());
                 }
                 assert_eq!(actual, serde_json::Value::Object(wanted));

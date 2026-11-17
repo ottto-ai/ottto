@@ -403,7 +403,13 @@ pub(in crate::snapshots) fn candidate_from_traversal_path_at(
                     .insert(local_index_key(&pending.path));
             } else if pending.census_member {
                 let parent = claude_absence_is_removal(source, &pending.path);
-                if parent.is_removal(&pending.path) {
+                if parent.is_removal(&pending.path)
+                    || (source == SnapshotSource::ClaudeCode
+                        && sampled_audit::proven_absent(
+                            &pending.path,
+                            std::slice::from_ref(&pending.scan_root),
+                        ))
+                {
                     // The same exact retirement as a remove hint, whichever
                     // order the hint and the queued member arrived in.
                     disappearance_diagnostics::not_found_removal(source, site);
