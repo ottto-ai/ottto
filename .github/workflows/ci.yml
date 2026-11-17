@@ -265,13 +265,13 @@ jobs:
                 fail "$QUEUE_HEAD" 'cannot resolve checkout commit'
               [[ "$checkout_head" == "$QUEUE_HEAD" && "${GITHUB_SHA:-}" == "$QUEUE_HEAD" ]] ||
                 fail "$QUEUE_HEAD" 'merge group head does not match checkout'
-              args=(--base "$QUEUE_BASE" --head "$QUEUE_HEAD")
+              args=(--base "$QUEUE_BASE" --head "$QUEUE_HEAD" --require-ancestor)
               ;;
             push)
               if [[ "$PUSH_BEFORE" == 0000000000000000000000000000000000000000 ]]; then
                 args=(--root-only --head "$PUSH_AFTER")
               else
-                args=(--base "$PUSH_BEFORE" --head "$PUSH_AFTER")
+                args=(--base "$PUSH_BEFORE" --head "$PUSH_AFTER" --require-ancestor)
               fi
               ;;
             schedule|workflow_dispatch)

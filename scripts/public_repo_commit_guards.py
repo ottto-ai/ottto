@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Check the public commit identities and history for an exact revision range."""
 
+# Known gaps: percent-encoded or fullwidth @ signs, domain literals, RFC
+# comments in addresses, and message bytes after an embedded NUL.
+
 import argparse
 import os
 import re
@@ -17,7 +20,9 @@ MESSAGE_ADDRESSES = {
     # Dependabot signs off its commits with this GitHub address.
     ("support", "github.com"),
 }
-SYNTHETIC_DOMAINS = {"example.com", "example.org", "example.net", "localhost"}
+SYNTHETIC_DOMAIN_SUFFIXES = (
+    ".example", ".invalid", ".test", ".localhost", ".example.com", ".example.org", ".example.net",
+)
 # Match the whole domain before looking at its suffix. GitHub's bot aliases
 # include brackets in the local part.
 ATOM = r"[\w.!#$%&'*+/=?^`{|}~-]"
@@ -78,10 +83,10 @@ def verify_history(base, head):
 def commit_fields(base, head):
     fields = git(
         "log", "-z", "--no-mailmap", "--no-notes", "--no-show-signature", "--encoding=none",
-        f"--max-count={MAX_COMMITS + 1}", "--format=tformat:%H%x00%ae%x00%ce%x00%e%x00%B",
+        f"--max-count={MAX_COMMITS + 1}", "--format=tformat:%H%x00%ae%x00%ce%x00%an%x00%cn%x00%e%x00%B",
         f"{base}..{head}", "--",
     ).split(b"\0")
-    width = 5
+    width = 7
     if fields.pop() or len(fields) % width:
         raise GuardError("invalid git log output")
     count = len(fields) // width
@@ -107,6 +112,8 @@ def allowed_identity(address, *, committer=False):
     if match is None:
         return False
     local, domain = match.groups()
+    if local.startswith('"'):
+        return False
     domain = domain.lower()
     return domain in IDENTITY_DOMAINS or (committer and (local, domain) == ("noreply", "github.com"))
 
@@ -114,15 +121,18 @@ def allowed_identity(address, *, committer=False):
 def allowed_message(message):
     for match in EMAIL.finditer(message):
         local, domain = match.groups()
+        if local.startswith('"') and not allowed_message(local[1:-1]):
+            return False
         domain = domain.lower()
+        if "." not in domain:
+            continue
         tld = domain.rsplit(".", 1)[-1]
         if len(tld) < 2 or not tld.isalpha():
             continue
         if not (
             domain in IDENTITY_DOMAINS
             or (local, domain) in MESSAGE_ADDRESSES
-            or domain in SYNTHETIC_DOMAINS
-            or domain.endswith((".example", ".invalid", ".test"))
+            or f".{domain}".endswith(SYNTHETIC_DOMAIN_SUFFIXES)
         ):
             return False
     return True
@@ -136,6 +146,7 @@ def main():
         mode.add_argument("--base")
         mode.add_argument("--root-only", action="store_true")
         parser.add_argument("--head", required=True)
+        parser.add_argument("--require-ancestor", action="store_true")
         args = parser.parse_args()
         if not SHA.fullmatch(args.head):
             raise GuardError("invalid head SHA")
@@ -149,9 +160,9 @@ def main():
         verify_history(base, head)
         if args.root_only:
             return 0
-        if os.environ.get("GITHUB_EVENT_NAME") in {"merge_group", "push"}:
+        if args.require_ancestor:
             git("merge-base", "--is-ancestor", base, head, reason="cannot verify base ancestry")
-        for oid, author, committer, encoding, message in commit_fields(base, head):
+        for oid, author, committer, author_name, committer_name, encoding, message in commit_fields(base, head):
             sha = oid.decode("ascii")
             if not SHA.fullmatch(sha):
                 raise GuardError("invalid git log output")
@@ -160,6 +171,8 @@ def main():
                 raise GuardError("disallowed author email")
             if not allowed_identity(committer.decode("utf-8"), committer=True):
                 raise GuardError("disallowed committer email")
+            if not all(allowed_message(name.decode("utf-8")) for name in (author_name, committer_name)):
+                raise GuardError("disallowed author or committer name email")
             if not allowed_message(decode_message(sha, encoding, message)):
                 raise GuardError("disallowed commit message email")
     except GuardError as error:

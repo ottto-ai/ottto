@@ -66,6 +66,8 @@ or fix it with you.
 
 Use an `ottto.net` or GitHub noreply email address for your commits. The public
 commit check fails if your commit identity uses another address.
+Use only approved or reserved example email addresses in commit messages,
+including `Signed-off-by:` and `Co-authored-by:` trailers.
 
 - **Keep it focused**: one topic per pull request. Separate mechanical
   refactoring from behavior changes.

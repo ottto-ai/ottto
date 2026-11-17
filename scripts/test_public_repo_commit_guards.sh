@@ -80,16 +80,24 @@ printf 'Approved <author@ottto.net> <author@example.test>\n' > .mailmap
 reject "$bad_author" 'disallowed author email' guard --base "$base" --head "$bad_author"
 bad_committer="$(GIT_COMMITTER_EMAIL=committer@example.test make_commit 'Wrong committer')"
 reject "$bad_committer" 'disallowed committer email' guard --base "$base" --head "$bad_committer"
+bad_committer_case="$(GIT_COMMITTER_EMAIL=NoReply@github.com make_commit 'Wrong committer case')"
+reject "$bad_committer_case" 'disallowed committer email' guard --base "$base" --head "$bad_committer_case"
+bad_author_name="$(GIT_AUTHOR_NAME='x@sample.corp' make_commit 'Wrong author name')"
+reject "$bad_author_name" 'disallowed author or committer name email' guard --base "$base" --head "$bad_author_name"
+bad_committer_name="$(GIT_COMMITTER_NAME='Contact x@sample.corp' make_commit 'Wrong committer name')"
+reject "$bad_committer_name" 'disallowed author or committer name email' guard --base "$base" --head "$bad_committer_name"
 web_flow="$(GIT_AUTHOR_EMAIL='1+test[bot]@Users.NoReply.GitHub.Com' GIT_COMMITTER_EMAIL=noreply@github.com make_commit 'Web commit')"
 accept guard --base "$base" --head "$web_flow"
-for address in noreply@github.com author@ottto.net.evil.com author@evilottto.net; do
-  bad="$(GIT_AUTHOR_EMAIL="$address" make_commit 'Wrong author domain')"
+for address in noreply@github.com author@ottto.net.evil.com author@evilottto.net '"local name"@ottto.net'; do
+  bad="$(GIT_AUTHOR_EMAIL="$address" make_commit 'Wrong author email')"
   reject "$bad" 'disallowed author email' guard --base "$base" --head "$bad"
 done
 
 for message in 'Subject outside@sample.corp' \
   $'Subject\n\nContact mailto:outside@sample.corp for details.' \
   $'Subject\n\nReviewed-by: Test <"outside contact"@sample.corp>' \
+  'Contact "x outside@sample.corp"@ottto.net' \
+  'Contact "x outside@sample.corp"@local' \
   'Use outside@ottto.net.evil.com or author@ottto.net' \
   'Contact outside@evilottto.net' \
   'Contact outside@anthropic.com' 'Contact outside@openai.com' 'Contact noreply@github.com'; do
@@ -98,10 +106,10 @@ for message in 'Subject outside@sample.corp' \
 done
 
 allowed_message="$(cat <<'MESSAGE'
-Update pkg@1.2.3 and install-action@v2.90.0
+Update pkg@1.2.3, install-action@v2.90.0, actions/checkout@main, and react@latest.
 
 Use a@example.com, a@example.org, a@example.net, a@demo.example,
-a@demo.invalid, a@demo.test, or a@localhost.
+a@demo.invalid, a@demo.test, a@localhost, a@mail.example.com, or a@foo.localhost.
 
 Co-authored-by: Test <noreply@anthropic.com>
 Co-authored-by: Test <noreply@openai.com>
@@ -131,6 +139,7 @@ tag="$(git rev-parse fixture)"
 reject "$tag" 'head commit is missing or invalid' guard --base "$base" --head "$tag"
 reject "$base" 'empty commit range' guard --base "$base" --head "$base"
 reject '------------' 'invalid head SHA' guard --base "$base" --head author@example.test
+reject '------------' 'invalid arguments' guard --head "$good"
 
 other_root="$(git commit-tree "$tree" -m 'Second root')"
 two_roots="$(git commit-tree "$tree" -p "$good" -p "$other_root" -m 'Merge unrelated history')"
@@ -166,6 +175,8 @@ run_event() (
 )
 
 accept run_event pull_request "$good" "$allowed"
+reject "$good" 'base commit is missing or invalid' run_event pull_request '' "$good"
+PUBLIC_REPO_ROOT="$other_root" reject "$good" 'configured root does not match base root' run_event pull_request "$base" "$good"
 reject "$bad_author" 'disallowed author email' run_event pull_request "$base" "$bad_author"
 accept run_event merge_group "$base" "$good"
 reject "$allowed" 'merge group head does not match checkout' run_event merge_group "$base" "$allowed"
