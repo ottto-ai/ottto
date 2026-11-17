@@ -1,3 +1,5 @@
+use base64::Engine as _;
+
 #[test]
 fn session_exec_commands_require_cli_kind_and_authorized_token() {
     let daemon = daemon();
