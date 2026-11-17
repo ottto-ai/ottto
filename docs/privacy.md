@@ -346,7 +346,12 @@ many tokens those tool definitions add to every session. Anthropic's commercial
 terms do not allow it to train models on data sent to its API. Setting
 `OTTTO_MCP_HARVEST_DISABLED=1` or creating
 `~/Library/Application Support/Ottto/mcp_inventory/disabled` turns this off on
-the Mac; turning either setting off also stops it.
+the Mac; turning either setting off also stops it. Each time the Ottto server
+accepts an inventory upload, it sends the name, description and input schema of
+each Codex tool in it to OpenAI's input-token count API, only to count how many
+tokens those tool definitions add to every session. OpenAI's
+[API data guide](https://developers.openai.com/api/docs/guides/your-data) says
+data sent to its API is not used to train models unless you opt in.
 
 Claude Code context read: while Claude is on for this Mac and unless the server
 has turned it off, about every six hours (30 minutes after a pass skipped near a sign-in

@@ -394,3 +394,625 @@ fn purge_legacy_progress(index_path: &Path, path: &Path) -> Result<()> {
     }
     Ok(())
 }
+
+pub(super) const SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION: u16 = 3;
+
+/// Durable, privacy-minimal progress for one policy-scoped scan index.
+///
+/// The scanner cannot commit its final `ScanIndex` until every changed
+/// snapshot is accepted: committing it earlier would silently drop the files
+/// represented by a later failed batch. Persisting only the stable semantic
+/// snapshot fingerprints lets a restart skip already-accepted pages without
+/// retaining titles, paths, or prompts. Numeric cache evidence and opaque accepted
+/// head tokens survive cycle cleanup for later corrections; session keys are hashes.
+/// A subset of the current file/entity incidence table, containing only cache
+/// evidence actually deferred for missing accepted predecessor authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct PendingCacheHeadFile {
+    pub(super) source_file_fingerprint: String,
+    pub(super) group_fingerprint: String,
+    /// Semantic entity -> hashed session key; no source body or authority.
+    pub(super) entities: BTreeMap<String, String>,
+    /// Sessions whose head arrival already reached a saved current file group.
+    /// Failed bodies remain owed, but normal quarantine drives their retry.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(super) reselected_heads: BTreeMap<String, String>,
+    /// Exact cache-bearing settlements recorded only after the index save.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub(super) settled_entities: BTreeSet<String>,
+}
+
+/// A server head-CAS challenge this session still owes an answer. The
+/// challenge binds the server's current head to the exact refused revision v2
+/// hash, so the next upload can replace the stale base through the backend's
+/// existing rescan handshake instead of conflicting on it forever.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct HeadConflictChallenge {
+    pub(super) challenge: String,
+    pub(super) stale_revision_v2_hash: String,
+    /// Answers the server refused again. Counted and logged; never terminal,
+    /// so an unrecovered session keeps today's retryable conflict hold.
+    #[serde(default)]
+    pub(super) answer_attempts: u32,
+    /// When an answer to THIS challenge and revision was last refused; 0 when
+    /// none was. A re-send of the same held body waits its conflict probe
+    /// after it; a new challenge or revision resets it.
+    #[serde(default)]
+    pub(super) last_answer_unix: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct PermanentSnapshotRejection {
+    pub(super) body_witness: String,
+    /// Old enum vocabulary only: `original_pair_candidate_unproved` is
+    /// written as `other`, so an older daemon keeps reading and suppressing it.
+    pub(super) reason: crate::upload_receipts::RejectedUsageReason,
+    /// Optional daily/one-time re-offer schedule for this exact body. Older
+    /// daemons ignore it; a malformed value disables only this record's retry.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "reason_reoffer::serialize",
+        deserialize_with = "reason_reoffer::deserialize"
+    )]
+    pub(super) reoffer: Option<reason_reoffer::RefusalReoffer>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "stale_owed::decode_exposure"
+    )]
+    pub(super) exposure: Option<stale_owed::Exposure>,
+    /// Exact older revisions remain with their existing refusal owner.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(super) revisions: BTreeMap<String, PermanentSnapshotRejection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct SnapshotUploadProgress {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) telemetry_only: Option<Box<telemetry_only::Ledger>>,
+    pub(super) schema_version: u16,
+    /// A routed source's progress rows; never serialized into the ledger.
+    #[serde(skip)]
+    pub(super) rows: Option<Box<crate::snapshots::ProgressRows>>,
+    #[serde(default)]
+    pub(super) generation: u64,
+    pub(super) destination_namespace_hash: String,
+    /// Full replay generation whose ACKs populate this ledger. A new reviewed
+    /// replay must not inherit ACKs for identical entities from an older
+    /// generation, while a restart of the same generation must still resume.
+    #[serde(default)]
+    pub(super) historical_replay_generation: Option<String>,
+    #[serde(default)]
+    pub(super) accepted_fingerprints: BTreeSet<String>,
+    /// Exact local body witness accepted for each semantic entity. Schema v3
+    /// prevents a crash-resume ledger for curve A from suppressing corrected
+    /// curve B, while the backend continues to ACK the stable semantic
+    /// fingerprint.
+    #[serde(default)]
+    pub(super) accepted_body_witnesses: BTreeMap<String, String>,
+    /// Exact context of each durable stored-body ACK; absent means unknown.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(super) accepted_body_contexts: BTreeMap<String, String>,
+    #[serde(skip)]
+    pub(super) context_resend: upload_context_resend::Cycle,
+    /// Admission only: current live incidence plus bounded unsettled ACK debt.
+    #[serde(skip, default = "ack_retention::default_ack_capacity")]
+    pub(super) ack_capacity: usize,
+    /// ACKs outside known live incidence; includes valid unindexed debt.
+    #[serde(skip)]
+    pub(super) retained_stale_ack_count: usize,
+    #[serde(default)]
+    pub(super) accepted_cache_states: BTreeMap<String, serde_json::Value>,
+    /// Class L bucket/share fingerprints, written only for stored-body ACKs.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::snapshots::claude_request_identity::AcceptedBuckets::is_empty"
+    )]
+    pub(super) accepted_identity_buckets:
+        crate::snapshots::claude_request_identity::AcceptedBuckets,
+    /// Routed progress: the stored identity rows' barriers. The hints
+    /// themselves are rows of their own, loaded per page.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::snapshots::claude_request_identity::IdentityScope::is_unset"
+    )]
+    pub(super) accepted_identity_scope: crate::snapshots::claude_request_identity::IdentityScope,
+    #[serde(default)]
+    pub(super) accepted_cache_heads: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(super) pending_cache_heads: BTreeMap<String, PendingCacheHeadFile>,
+    /// Head-CAS conflict challenges keyed like `accepted_cache_heads`. Any
+    /// accepted or unchanged ACK for the session clears its entry.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(super) head_conflict_challenges: BTreeMap<String, HeadConflictChallenge>,
+    #[serde(default)]
+    pub(super) quarantined_fingerprints: BTreeMap<String, SnapshotQuarantineRecord>,
+    /// Exact server-permanent refusals. Same destination, entity and body only;
+    /// parser/replay epochs and premature retry timers cannot erase this fact.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(super) permanent_rejections: BTreeMap<String, PermanentSnapshotRejection>,
+    #[serde(skip)]
+    pub(super) active_quarantine_witness: Option<SnapshotQuarantineWitness>,
+    /// Runtime leases for quarantine entries selected this cycle. The durable
+    /// record stays armed with its next future deadline until an exact ACK
+    /// clears it; this set only bypasses suppression for the current request.
+    #[serde(skip)]
+    pub(super) active_quarantine_retries: BTreeSet<String>,
+    /// Runtime leases for refusals re-offered this cycle: fingerprint -> the
+    /// exact refused body witness. Only that body passes permanent
+    /// suppression, once per logical offer; the refusal stays durable.
+    #[serde(skip)]
+    pub(super) active_reason_reoffers: BTreeMap<String, String>,
+    #[serde(skip)]
+    pub(super) attempted_reason_reoffers: BTreeSet<String>,
+    #[serde(skip)]
+    pub(super) reason_reoffer_counts: reason_reoffer::ReofferCounts,
+    #[serde(skip)]
+    pub(super) terminal_contract_retry_pending_save: bool,
+    /// Only exact entity ACKs observed in this cycle; never restored from disk.
+    #[serde(skip)]
+    pub(super) fresh_context_body_acks: BTreeMap<String, String>,
+    #[serde(skip)]
+    pub(super) context_receipt_candidates: Vec<crate::snapshots::UploadContextReceiptCandidate>,
+    #[serde(skip)]
+    pub(super) request_contributions:
+        BTreeMap<String, (String, crate::snapshots::upload_context_receipt::SlotRows)>,
+}
+
+/// What a save's compare-and-swap reads from the on-disk progress: the writer
+/// stamp and the quarantine claims to merge. Other fields are skipped, not kept.
+#[derive(Deserialize)]
+pub(super) struct SnapshotUploadProgressCas {
+    pub(super) schema_version: u16,
+    #[serde(default)]
+    pub(super) generation: u64,
+    pub(super) destination_namespace_hash: String,
+    #[serde(default)]
+    pub(super) quarantined_fingerprints: BTreeMap<String, SnapshotQuarantineRecord>,
+}
+
+impl SnapshotUploadProgress {
+    /// A server-attested record of an earlier upload to this destination: an
+    /// accepted, quarantined or refused body, or accepted cache evidence
+    /// (prior history). A saved generation, a replay claim or a
+    /// pending cache head is this daemon's own claim, saved before any upload,
+    /// so it is not evidence.
+    pub(super) fn records_server_attested_upload(&self) -> bool {
+        !self.accepted_fingerprints.is_empty()
+            || !self.accepted_body_witnesses.is_empty()
+            || !self.accepted_cache_states.is_empty()
+            || !self.accepted_cache_heads.is_empty()
+            || !self.quarantined_fingerprints.is_empty()
+            || !self.permanent_rejections.is_empty()
+    }
+
+    pub(super) fn new(
+        destination_namespace_hash: String,
+        active_quarantine_witness: SnapshotQuarantineWitness,
+    ) -> Self {
+        Self {
+            schema_version: SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION,
+            telemetry_only: None,
+            rows: None,
+            generation: 0,
+            destination_namespace_hash,
+            historical_replay_generation: None,
+            accepted_fingerprints: BTreeSet::new(),
+            accepted_body_witnesses: BTreeMap::new(),
+            accepted_body_contexts: BTreeMap::new(),
+            context_resend: upload_context_resend::Cycle::default(),
+            ack_capacity: ack_retention::default_ack_capacity(),
+            retained_stale_ack_count: 0,
+            accepted_cache_states: BTreeMap::new(),
+            accepted_identity_buckets: Default::default(),
+            accepted_identity_scope: Default::default(),
+            accepted_cache_heads: BTreeMap::new(),
+            pending_cache_heads: BTreeMap::new(),
+            head_conflict_challenges: BTreeMap::new(),
+            quarantined_fingerprints: BTreeMap::new(),
+            permanent_rejections: BTreeMap::new(),
+            active_quarantine_witness: Some(active_quarantine_witness),
+            active_quarantine_retries: BTreeSet::new(),
+            active_reason_reoffers: BTreeMap::new(),
+            attempted_reason_reoffers: BTreeSet::new(),
+            reason_reoffer_counts: reason_reoffer::ReofferCounts::default(),
+            terminal_contract_retry_pending_save: false,
+            fresh_context_body_acks: BTreeMap::new(),
+            context_receipt_candidates: Vec::new(),
+            request_contributions: BTreeMap::new(),
+        }
+    }
+
+    pub(super) fn load(
+        path: &Path,
+        expected_destination_namespace_hash: &str,
+        active_quarantine_witness: SnapshotQuarantineWitness,
+    ) -> Result<Self> {
+        let _lock = SnapshotProgressLock::acquire(path)?;
+        if !path.exists() {
+            return Ok(Self::new(
+                expected_destination_namespace_hash.to_string(),
+                active_quarantine_witness,
+            ));
+        }
+        let parsed = std::fs::read(path)
+            .context("read snapshot upload progress")
+            .and_then(|bytes| {
+                serde_json::from_slice::<Self>(&bytes)
+                    .context("parse v3 local snapshot upload progress")
+            });
+        // Option (ii) proof is scoped to the namespace that ACKed it.
+        if let Ok(progress) = &parsed {
+            if progress.destination_namespace_hash != expected_destination_namespace_hash {
+                progress
+                    .accepted_identity_buckets
+                    .count_retained_cleared_if_any();
+            }
+        }
+        let mut progress = match parsed {
+            Ok(progress)
+                if progress.valid(expected_destination_namespace_hash)
+                    && progress
+                        .accepted_cache_states
+                        .iter()
+                        .all(|(key, state)| progress_rows::valid_cache_state(key, state))
+                    && progress
+                        .accepted_cache_heads
+                        .iter()
+                        .all(|(key, head)| progress_rows::valid_cache_head(key, head)) =>
+            {
+                progress
+            }
+            Ok(_) | Err(_) => {
+                quarantine_invalid_progress(path)?;
+                return Ok(Self::new(
+                    expected_destination_namespace_hash.to_string(),
+                    active_quarantine_witness,
+                ));
+            }
+        };
+        progress.finish_load(active_quarantine_witness);
+        Ok(progress)
+    }
+
+    /// Every durable field but the keyed cache maps is admissible for this
+    /// destination.
+    pub(super) fn valid(&self, namespace: &str) -> bool {
+        self.schema_version == SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION
+            && self.destination_namespace_hash == namespace
+            && is_snapshot_fingerprint(&self.destination_namespace_hash)
+            && self
+                .accepted_fingerprints
+                .iter()
+                .all(|value| is_snapshot_fingerprint(value))
+            && self.accepted_body_witnesses.len() == self.accepted_fingerprints.len()
+            && self.accepted_body_witnesses.keys().all(|value| {
+                is_snapshot_fingerprint(value) && self.accepted_fingerprints.contains(value)
+            })
+            && self
+                .accepted_body_witnesses
+                .values()
+                .all(|value| is_snapshot_fingerprint(value))
+            && self.accepted_body_contexts.iter().all(|(key, context)| {
+                self.accepted_body_witnesses.contains_key(key) && is_snapshot_fingerprint(context)
+            })
+            && self.pending_cache_heads.iter().all(|(file, pending)| {
+                let sessions = pending.entities.values().collect::<BTreeSet<_>>();
+                is_snapshot_fingerprint(file)
+                    && is_snapshot_fingerprint(&pending.source_file_fingerprint)
+                    && is_snapshot_fingerprint(&pending.group_fingerprint)
+                    && !pending.entities.is_empty()
+                    && pending.reselected_heads.iter().all(|(key, witness)| {
+                        is_snapshot_fingerprint(witness) && sessions.contains(key)
+                    })
+                    && pending
+                        .settled_entities
+                        .iter()
+                        .all(|entity| pending.entities.contains_key(entity))
+                    && pending.entities.iter().all(|(entity, session)| {
+                        is_snapshot_fingerprint(entity) && is_snapshot_fingerprint(session)
+                    })
+            })
+            && self
+                .quarantined_fingerprints
+                .keys()
+                .all(|value| is_snapshot_fingerprint(value))
+            && self
+                .permanent_rejections
+                .iter()
+                .all(|(fingerprint, record)| {
+                    is_snapshot_fingerprint(fingerprint)
+                        && is_snapshot_fingerprint(&record.body_witness)
+                })
+            && self.quarantined_fingerprints.values().all(|record| {
+                snapshot_quarantine_deadline_is_bounded(record)
+                    && record
+                        .upload_body_witness
+                        .as_deref()
+                        .map_or(true, is_snapshot_fingerprint)
+            })
+    }
+
+    /// Runtime state a loaded ledger starts every pass with.
+    pub(super) fn finish_load(&mut self, active_quarantine_witness: SnapshotQuarantineWitness) {
+        let permanent = &self.permanent_rejections;
+        self.terminal_contract_retry_pending_save = crate::snapshots::terminal_contract_retry::rearm(
+            self.quarantined_fingerprints
+                .iter_mut()
+                .filter(|(fingerprint, record)| {
+                    !permanent.get(*fingerprint).is_some_and(|refusal| {
+                        record.upload_body_witness.as_deref() == Some(refusal.body_witness.as_str())
+                    })
+                }),
+            Some(&active_quarantine_witness),
+        ) > 0;
+        self.active_quarantine_witness = Some(active_quarantine_witness);
+        self.active_quarantine_retries.clear();
+        self.active_reason_reoffers.clear();
+    }
+
+    /// Rearm every current entity exactly once for a new historical replay.
+    ///
+    /// The scan index independently clears its file checkpoints, but stable
+    /// semantic fingerprints mean an older accepted/quarantined progress entry
+    /// could otherwise suppress the re-derived upload. Keep same-generation
+    /// progress intact so page ACKs and conflict retries remain resumable.
+    pub(super) fn prepare_historical_replay(&mut self, generation: &str) -> bool {
+        if self.historical_replay_generation.as_deref() == Some(generation) {
+            return false;
+        }
+        self.historical_replay_generation = Some(generation.to_string());
+        self.accepted_identity_buckets.clear_retained();
+        if self.rows.is_some() && !self.accepted_identity_scope.is_unset() {
+            self.accepted_identity_scope.retained_before = self.generation.saturating_add(1);
+        }
+        self.accepted_fingerprints.clear();
+        self.accepted_body_witnesses.clear();
+        self.accepted_body_contexts.clear();
+        self.quarantined_fingerprints.clear();
+        for pending in self.pending_cache_heads.values_mut() {
+            pending.settled_entities.clear();
+            pending.reselected_heads.clear();
+        }
+        true
+    }
+
+    pub(super) fn save(&mut self, path: &Path) -> Result<()> {
+        self.save_with_read_limit(path, None)
+    }
+
+    /// The concurrent-writer stamp of every progress write: the on-disk stamp
+    /// is this owner's last save and nobody has saved since.
+    pub(super) fn same_writer(
+        &self,
+        (schema_version, generation, namespace): (u16, u64, &str),
+    ) -> bool {
+        schema_version == SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION
+            && generation == self.generation
+            && namespace == self.destination_namespace_hash
+    }
+
+    pub(super) fn stamp(&self) -> (u16, u64, &str) {
+        let namespace = self.destination_namespace_hash.as_str();
+        (self.schema_version, self.generation, namespace)
+    }
+
+    pub(super) fn save_with_read_limit(
+        &mut self,
+        path: &Path,
+        read_limit: Option<usize>,
+    ) -> Result<()> {
+        self.accepted_body_contexts
+            .retain(|fp, _| self.accepted_body_witnesses.contains_key(fp));
+        if self.rows.is_some() {
+            return self.save_rows(path);
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).context("create snapshot upload progress directory")?;
+        }
+        let _lock = SnapshotProgressLock::acquire(path)?;
+        let mut unchanged = false;
+        if path.exists() {
+            let bytes = match read_limit {
+                Some(cap) => crate::snapshot_retry::read_state(path, cap),
+                None => std::fs::read(path),
+            }
+            .context("read current snapshot upload progress")?;
+            let current: SnapshotUploadProgressCas = if read_limit.is_some() {
+                crate::snapshot_retry::decode_state(&bytes)
+            } else {
+                serde_json::from_slice(&bytes).map_err(anyhow::Error::from)
+            }
+            .context("parse current snapshot upload progress for compare-and-swap")?;
+            let namespace = current.destination_namespace_hash.as_str();
+            if !self.same_writer((current.schema_version, current.generation, namespace)) {
+                return Err(anyhow!("snapshot upload progress changed concurrently"));
+            }
+            crate::snapshots::terminal_contract_retry::merge_maps(
+                &mut self.quarantined_fingerprints,
+                &current.quarantined_fingerprints,
+            );
+            unchanged = serializes_to(&*self, &bytes);
+        } else if self.generation != 0 {
+            return Err(anyhow!("snapshot upload progress disappeared concurrently"));
+        }
+        if unchanged {
+            // The durable ledger already holds these exact bytes at this
+            // generation: write nothing and claim no generation, so the next
+            // writer's compare-and-swap still matches. Retry only the
+            // durability barrier: an earlier rename may be visible but not
+            // yet synced.
+            return sync_progress_parent(path);
+        }
+        let previous_generation = self.generation;
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("snapshot upload progress generation overflow"))?;
+        let temp_path = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        let mut file =
+            std::fs::File::create(&temp_path).context("create snapshot upload progress temp")?;
+        let result = (|| -> Result<()> {
+            serde_json::to_writer(&mut file, &*self)
+                .context("write snapshot upload progress temp")?;
+            file.sync_all()
+                .context("sync snapshot upload progress temp")?;
+            std::fs::rename(&temp_path, path).context("replace snapshot upload progress")?;
+            sync_progress_parent(path)
+        })();
+        if result.is_err() {
+            self.generation = previous_generation;
+            let _ = std::fs::remove_file(&temp_path);
+        }
+        result
+    }
+
+    pub(super) fn finish_cycle(&mut self, path: &Path) -> Result<()> {
+        if self.rows.is_none()
+            && self.accepted_fingerprints.is_empty()
+            && self.permanent_rejections.is_empty()
+            && self.accepted_cache_states.is_empty()
+            && self.accepted_cache_heads.is_empty()
+            && self.pending_cache_heads.is_empty()
+            && self.head_conflict_challenges.is_empty()
+            && self.accepted_identity_buckets.is_empty()
+        {
+            return self.clear(path);
+        }
+        // Unadopted ACKs survive until a successful index save transfers them.
+        // A later conflict on the refused bytes is the stronger settlement
+        // fact, even while the retained refusal gates its next daily offer.
+        // Keep it in the same atomic ledger so an older index-only timer can
+        // still be distinguished from this newer server answer on restart.
+        self.quarantined_fingerprints.retain(|fingerprint, record| {
+            record.disposition == SnapshotQuarantineDisposition::RetryPending
+                && self
+                    .permanent_rejections
+                    .get(fingerprint)
+                    .is_some_and(|refusal| {
+                        record.upload_body_witness.as_deref() == Some(refusal.body_witness.as_str())
+                    })
+        });
+        self.active_quarantine_retries.clear();
+        self.active_reason_reoffers.clear();
+        self.save(path)
+    }
+
+    pub(super) fn clear(&self, path: &Path) -> Result<()> {
+        let _lock = SnapshotProgressLock::acquire(path)?;
+        let current = match std::fs::read(path) {
+            Ok(bytes) => serde_json::from_slice::<Self>(&bytes)
+                .context("parse snapshot upload progress before clear")?,
+            Err(error) if error.kind() == ErrorKind::NotFound && self.generation == 0 => {
+                return Ok(())
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                return Err(anyhow!("snapshot upload progress disappeared concurrently"))
+            }
+            Err(error) => return Err(error).context("read snapshot upload progress before clear"),
+        };
+        if !self.same_writer(current.stamp()) {
+            return Err(anyhow!("snapshot upload progress changed concurrently"));
+        }
+        let tombstone = unique_progress_sibling(path, "cleared");
+        std::fs::rename(path, &tombstone).context("atomically clear snapshot upload progress")?;
+        sync_progress_parent(path)?;
+        std::fs::remove_file(&tombstone).context("remove cleared snapshot upload progress")?;
+        sync_progress_parent(path)
+    }
+}
+
+pub(crate) struct SnapshotProgressLock {
+    pub(super) file: std::fs::File,
+    pub(super) path: Option<Box<Path>>,
+}
+
+impl SnapshotProgressLock {
+    pub(super) fn acquire(path: &Path) -> Result<Self> {
+        let lock_path = path.with_extension("lock");
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent).context("create snapshot upload progress directory")?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)
+            .context("open snapshot upload progress lock")?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("snapshot upload progress is owned by another daemon");
+            }
+        }
+        Ok(Self { file, path: None })
+    }
+
+    pub(super) fn for_v2(mut self, path: &Path) -> Self {
+        self.path = Some(path.into());
+        self
+    }
+}
+
+impl Drop for SnapshotProgressLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        unsafe {
+            use std::os::fd::AsRawFd;
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+pub(super) fn unique_progress_sibling(path: &Path, kind: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    path.with_extension(format!("{kind}.{}.{nanos}.json", std::process::id()))
+}
+
+/// Whether `value` serializes to exactly `bytes` (compact JSON). Streams into
+/// the comparison and stops at the first differing byte; nothing is buffered.
+pub(super) fn serializes_to(value: &impl Serialize, bytes: &[u8]) -> bool {
+    struct Same<'a>(&'a [u8]);
+    impl Write for Same<'_> {
+        fn write(&mut self, chunk: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.strip_prefix(chunk).ok_or(ErrorKind::InvalidData)?;
+            Ok(chunk.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut same = Same(bytes);
+    serde_json::to_writer(&mut same, value).is_ok() && same.0.is_empty()
+}
+
+pub(super) fn sync_progress_parent(path: &Path) -> Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .context("sync snapshot upload progress directory")
+}
+
+pub(super) fn quarantine_invalid_progress(path: &Path) -> Result<()> {
+    let quarantine_path = unique_progress_sibling(path, "corrupt");
+    std::fs::rename(path, quarantine_path)
+        .context("quarantine invalid local snapshot upload progress")?;
+    sync_progress_parent(path)
+}
+
+crate::heap_layout_bound::fields!(SnapshotUploadProgress; telemetry_only, schema_version, rows, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_body_contexts, context_resend, ack_capacity, retained_stale_ack_count, accepted_cache_states, accepted_identity_buckets, accepted_identity_scope, accepted_cache_heads, pending_cache_heads, head_conflict_challenges, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts, terminal_contract_retry_pending_save, fresh_context_body_acks, context_receipt_candidates, request_contributions);
+
+crate::heap_layout_bound::fields!(PendingCacheHeadFile; source_file_fingerprint, group_fingerprint, entities, reselected_heads, settled_entities);
+
+crate::heap_layout_bound::fields!(PermanentSnapshotRejection; body_witness, reason, reoffer, exposure, revisions);
+
+crate::heap_layout_bound::fields!(HeadConflictChallenge; challenge, stale_revision_v2_hash, answer_attempts, last_answer_unix);
