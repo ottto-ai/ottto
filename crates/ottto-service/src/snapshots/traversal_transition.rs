@@ -708,13 +708,14 @@ mod tests {
         assert_eq!(Isolated503.bit(), 1 << 9);
         let owed = BTreeSet::from(["a".repeat(64)]);
         let drained = BTreeSet::new();
-        let rows: [(
-            &str,
-            &[UnsettledUploadCause],
+        type Row<'a> = (
+            &'a str,
+            &'a [UnsettledUploadCause],
             bool,
-            Option<&BTreeSet<String>>,
+            Option<&'a BTreeSet<String>>,
             bool,
-        ); 6] = [
+        );
+        let rows: [Row; 6] = [
             (
                 "deferred, later ACKed",
                 &[Isolated503],
@@ -1251,7 +1252,7 @@ mod tests {
             starting.context_matches = false; // longest boolean spelling
             starting.prior_unsettled_upload = false;
             starting.prior_unsettled_causes = UnsettledUploadCause::names(u16::MAX);
-            assert_eq!(starting.prior_unsettled_causes.len(), 10);
+            assert_eq!(starting.prior_unsettled_causes.len(), 11);
             starting.retry_due = Some(false);
             starting.disappearance_process_totals_v1 = disappearance_diagnostics::Totals::maximum();
             let previous = starting.previous.as_mut().unwrap();
@@ -1287,7 +1288,7 @@ mod tests {
                     .as_array()
                     .unwrap()
                     .len(),
-                10
+                11
             );
             assert_complete_max_row(rows[0].clone());
         }

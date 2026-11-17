@@ -1498,11 +1498,11 @@ fn identity_503_custody_records_and_drains_only_from_the_main_upload() {
 
 /// [money] Oracle row: the placement positive control (two accounts, a
 /// mid-session switch, a side call, an evidence gap, a tagged row) through
-/// the real upload ledger. `main` has an earlier accepted revision; its
-/// current body meets an identity 503 while `side-call` is stored. The held
-/// page keeps the prior ACK. After a restart the main upload ACKs `main` and
-/// drains its custody: the reassembled route equals cold, and a quiet pass
-/// re-sends nothing.
+/// the real upload ledger. `main` has an accepted revision; its next body
+/// meets an identity 503 while `side-call` is stored, and the held page keeps
+/// the prior ACK. After a restart the main upload ACKs the grown `main` body
+/// and drains the custody: the reassembled route equals cold, and a quiet
+/// pass re-sends nothing.
 #[test]
 fn identity_503_deferral_then_ack_keeps_cold_money_and_placement() {
     use crate::snapshot_client::{ShedSnapshotIndexes, UploadShed, UploadShedCode};
@@ -1529,6 +1529,8 @@ fn identity_503_deferral_then_ack_keeps_cold_money_and_placement() {
     let mut prior_main = items[0].clone();
     prior_main["snapshot_fingerprint"] = format!("{:064x}", 9).into();
     prior_main["request_count"] = 1.into();
+    let mut deferred_main = items[0].clone();
+    deferred_main["snapshot_fingerprint"] = format!("{:064x}", 8).into();
     let send = |progress: &mut SnapshotUploadProgress, items: &[Value], defer: Option<&str>| {
         progress.identity_503_pass = Some(BTreeSet::new());
         let mut emitted = Vec::new();
@@ -1614,7 +1616,11 @@ fn identity_503_deferral_then_ack_keeps_cold_money_and_placement() {
         crate::snapshots::claude_request_identity::AcceptedBuckets::for_test();
     let (_, _) = send(&mut progress, std::slice::from_ref(&prior_main), None);
     let prior = route(Mode::Ram, &[], &[&prior_main], &progress);
-    let (result, emitted) = send(&mut progress, &items, Some("main"));
+    let (result, emitted) = send(
+        &mut progress,
+        &[deferred_main, items[1].clone()],
+        Some("main"),
+    );
     assert!(matches!(
         result,
         ResumableUploadResult::Deferred {
@@ -1640,7 +1646,7 @@ fn identity_503_deferral_then_ack_keeps_cold_money_and_placement() {
         "custody survives a restart"
     );
     let (_, resent) = send(&mut restored, &items, None);
-    assert_eq!(resent.len(), 1, "only the deferred body is re-sent");
+    assert_eq!(resent.len(), 1, "only the grown main body is sent");
     assert_eq!(reload().identity_503_pending, Some(BTreeSet::new()));
     let drained = route(
         Mode::Restart,
