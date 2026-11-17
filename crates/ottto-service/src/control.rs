@@ -3846,6 +3846,7 @@ struct BackendControlTokenClaims {
     organization_id: Option<String>,
     user_id: Option<String>,
     device_id: Option<String>,
+    key_id: Option<String>,
     token_id: Option<String>,
 }
 
@@ -3861,6 +3862,7 @@ struct BackendControlTokenValidationResponse {
     organization_id: Option<String>,
     user_id: Option<String>,
     device_id: Option<String>,
+    key_id: Option<String>,
     token_id: Option<String>,
 }
 
@@ -3966,6 +3968,21 @@ fn telemetry_control_with_detector(
     let _binding_lock = lock_setup_run_binding();
     require_identity_mutation_reservation(None)?;
     require_local_control_account(&claims, &FileAccountStore::default(), "telemetry control")?;
+    if matches!(
+        action,
+        TelemetryControlAction::Status | TelemetryControlAction::DisableTelemetry
+    ) {
+        let device = FileDeviceStore::default()
+            .load()
+            .map_err(|_| LocalApiError::LocalClientNotTrusted)?
+            .ok_or(LocalApiError::LocalClientNotTrusted)?;
+        if device.device_id.trim().is_empty()
+            || claims.device_id.as_deref() != Some(device.device_id.as_str())
+            || key_id != claims.key_id
+        {
+            return Err(LocalApiError::LocalClientNotTrusted);
+        }
+    }
     if let (Some(expected), Some(observed)) = (
         claims.organization_id.as_deref(),
         organization_id
@@ -4479,6 +4496,7 @@ fn validate_control_token_with_backend_for(
                 .filter(|value| !value.trim().is_empty()),
             user_id: response.user_id.filter(|value| !value.trim().is_empty()),
             device_id: response.device_id.filter(|value| !value.trim().is_empty()),
+            key_id: response.key_id,
             token_id: response.token_id.filter(|value| !value.trim().is_empty()),
         }),
         Err(LocalApiError::Backend(details)) if matches!(details.status, Some(401) | Some(403)) => {
@@ -19282,6 +19300,13 @@ for line in sys.stdin:
         account.user.as_mut().unwrap().id = "user_123".into();
         account.organization.as_mut().unwrap().id = "org_123".into();
         FileAccountStore::default().save(&account).unwrap();
+        FileDeviceStore::default()
+            .save(&LocalDeviceBinding {
+                device_id: "device_local".into(),
+                machine_id: Some("machine_test".into()),
+                sources: vec![],
+            })
+            .unwrap();
         files
     }
 
@@ -26640,6 +26665,7 @@ for line in sys.stdin:
     fn telemetry_control_disable_removes_stored_key() {
         let _guard = lock_backend_test_env();
         assert_telemetry_control_requires_local_binding();
+        assert_telemetry_control_requires_matching_device_and_key();
         let _binding = bind_telemetry_control_account();
         let store_root = telemetry_key_store_root("disable");
         let _env_guard = EnvVarGuard::set_path(TELEMETRY_KEY_FILE_STORE_ENV, &store_root);
@@ -26661,7 +26687,12 @@ for line in sys.stdin:
         // working mock backend is wired through OTTTO_API_BASE_URL, while the
         // request carries a dead loopback URL that would fail validation if it
         // were (insecurely) honored.
-        let api_base_url = control_token_validation_server(200);
+        let api_base_url = control_token_validation_server_with_claims(
+            200,
+            json!({"user_id":"user_123", "organization_id":"org_123",
+                "device_id":"device_local", "key_id":"key_disable"})
+            .to_string(),
+        );
         let _api_base_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &api_base_url);
         let response = handle_request(
             &daemon(),
@@ -26739,6 +26770,13 @@ for line in sys.stdin:
                     if bound {
                         FileAccountStore::default().save(&account).unwrap();
                     }
+                    FileDeviceStore::default()
+                        .save(&LocalDeviceBinding {
+                            device_id: "device_local".into(),
+                            machine_id: Some("machine_test".into()),
+                            sources: vec![],
+                        })
+                        .unwrap();
                     let _reservation = reserved.then(|| reserve_identity_mutation().unwrap());
                     let allowed = matches_binding && !reserved;
                     let enable = action == TelemetryControlAction::EnableTelemetry;
@@ -26747,7 +26785,9 @@ for line in sys.stdin:
                     } else {
                         control_token_validation_server_with_claims(
                             200,
-                            json!({"user_id":user,"organization_id":organization}).to_string(),
+                            json!({"user_id":user,"organization_id":organization,
+                                "device_id":"device_local","key_id":"key_local"})
+                            .to_string(),
                         )
                     };
                     let _api = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &base);
@@ -26764,9 +26804,10 @@ for line in sys.stdin:
                             install_docs_url: None,
                         }
                     };
+                    let daemon = daemon();
                     let run = || {
                         telemetry_control_with_detector(
-                            &daemon(),
+                            &daemon,
                             action.clone(),
                             source.clone(),
                             test_control_token(action_slug(&action), source_slug(&source), 300),
@@ -26801,6 +26842,125 @@ for line in sys.stdin:
                         } else {
                             assert!(matches!(result, Err(LocalApiError::LocalClientNotTrusted)));
                         }
+                        let state = daemon.inner.lock().unwrap();
+                        assert!(state.sources.is_empty());
+                        assert!(state.local_health_events.is_empty());
+                        assert!(state.command_ledger.is_empty());
+                    }
+                }
+            }
+        }
+    }
+
+    fn assert_telemetry_control_requires_matching_device_and_key() {
+        const UNREADABLE_DEVICE: &str = "<unreadable device file>";
+        let device = Some("device_local");
+        let key = Some("key_local");
+        for (claim_device, local_device, request_key, claim_key, allowed) in [
+            (device, device, key, key, true),
+            (device, device, None, None, true),
+            (Some("device_other"), device, key, key, false),
+            (None, device, key, key, false),
+            (Some(""), device, key, key, false),
+            (Some(" \t"), device, key, key, false),
+            (device, None, key, key, false),
+            (None, None, None, None, false),
+            (device, Some(""), key, key, false),
+            (device, device, key, Some("key_other"), false),
+            (device, device, key, None, false),
+            (device, device, None, key, false),
+            (device, device, None, Some(""), false),
+            (device, device, None, Some(" \t"), false),
+            (device, device, key, Some(" key_local "), false),
+            (device, Some(UNREADABLE_DEVICE), key, key, false),
+        ] {
+            for source in [SourceKind::Codex, SourceKind::ClaudeCode] {
+                for action in [
+                    TelemetryControlAction::Status,
+                    TelemetryControlAction::DisableTelemetry,
+                ] {
+                    let files = bind_telemetry_control_account();
+                    let devices = FileDeviceStore::default();
+                    devices.reset().unwrap();
+                    if local_device == Some(UNREADABLE_DEVICE) {
+                        fs::create_dir_all(devices.path().parent().unwrap()).unwrap();
+                        fs::write(devices.path(), b"{not json").unwrap();
+                    } else if let Some(device_id) = local_device {
+                        devices
+                            .save(&LocalDeviceBinding {
+                                device_id: device_id.into(),
+                                machine_id: Some("machine_test".into()),
+                                sources: vec![],
+                            })
+                            .unwrap();
+                    }
+                    TelemetryKeyStore::production()
+                        .save(&SourceKind::ClaudeCode, "key_local", "synthetic-key")
+                        .unwrap();
+                    patch_claude_code_settings_at(
+                        &files.root.join(".claude/settings.json"),
+                        &test_machine(),
+                        &files.root.join("backups"),
+                    )
+                    .unwrap();
+                    let base = control_token_validation_server_with_claims(
+                        200,
+                        json!({"user_id":"user_123", "organization_id":"org_123",
+                            "device_id":claim_device, "key_id":claim_key})
+                        .to_string(),
+                    );
+                    let _api = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &base);
+                    let daemon = daemon();
+                    let detections = std::cell::Cell::new(0);
+                    let detector = |source: &SourceKind| {
+                        assert!(allowed, "refused control reached installation detection");
+                        detections.set(detections.get() + 1);
+                        AgentInstallationDetection {
+                            source: source.clone(),
+                            installed: true,
+                            version: None,
+                            config_path: None,
+                            binary_path: None,
+                            install_docs_url: None,
+                        }
+                    };
+                    let run = || {
+                        telemetry_control_with_detector(
+                            &daemon,
+                            action.clone(),
+                            source.clone(),
+                            test_control_token(action_slug(&action), source_slug(&source), 300),
+                            None,
+                            request_key.map(str::to_string),
+                            None,
+                            None,
+                            None,
+                            &detector,
+                        )
+                    };
+                    if allowed {
+                        let result = run().expect("matching device and key");
+                        assert_eq!(result.status, ControlResultStatus::Accepted);
+                        assert_eq!(
+                            detections.get(),
+                            usize::from(action == TelemetryControlAction::Status)
+                        );
+                        let key = TelemetryKeyStore::production().load(&source, "key_local");
+                        if action == TelemetryControlAction::DisableTelemetry
+                            && request_key.is_some()
+                        {
+                            assert!(matches!(key, Err(TelemetryKeychainError::Missing)));
+                        } else {
+                            assert_eq!(key.unwrap(), "synthetic-key");
+                        }
+                    } else {
+                        let result = files.assert_unchanged(run);
+                        assert!(matches!(result, Err(LocalApiError::LocalClientNotTrusted)));
+                        assert_eq!(detections.get(), 0);
+                        let state = daemon.inner.lock().unwrap();
+                        assert!(state.sources.is_empty());
+                        assert!(state.local_health_events.is_empty());
+                        assert!(state.command_ledger.is_empty());
                     }
                 }
             }
@@ -26829,7 +26989,12 @@ for line in sys.stdin:
             )
             .expect("seed key");
 
-        let api_base_url = control_token_validation_server(200);
+        let api_base_url = control_token_validation_server_with_claims(
+            200,
+            json!({"user_id":"user_123", "organization_id":"org_123",
+                "device_id":"device_local", "key_id":"key_manual_fence"})
+            .to_string(),
+        );
         let _api_base_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &api_base_url);
         let response = handle_request(
             &daemon(),
@@ -32792,6 +32957,7 @@ X-API-Key = "otel_redacted"
                 serde_json::from_str(http_request_body(&request)).expect("validation body");
             assert_eq!(body["source"], "codex");
             assert_eq!(body["action"], action);
+            // Consent requests have no telemetry key selector to compare.
             let response = serde_json::json!({
                 "valid": true,
                 "source": "codex",
@@ -32799,6 +32965,7 @@ X-API-Key = "otel_redacted"
                 "organization_id": "org_test",
                 "user_id": "user_test",
                 "device_id": device_id,
+                "key_id": "key_consent",
                 "token_id": token_id,
                 "expires_at": "2030-01-01T00:00:00Z"
             });
