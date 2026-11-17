@@ -1175,8 +1175,6 @@ pub(in crate::snapshots) fn model_usage_from_row(
         copy_unproven: row_key.selector_hash.starts_with(COPY_UNPROVEN_PARTITION),
         evidence_ref: None,
         identity_parts: None,
-        identity_retained: false,
-        copy_invalidated: false,
         model: row_key.model.clone(),
         input_tokens: row.usage.input_tokens,
         output_tokens: row.usage.output_tokens,

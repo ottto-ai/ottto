@@ -416,7 +416,6 @@ fn cache_pending_head_lifecycle_survives_finish_and_targets_only_accepted_head()
                     head_etag: enforce.then(|| "e".repeat(64)),
                     head_challenge: None,
                     unchanged_basis: None,
-                    retained_proof_missing: Vec::new(),
                     cache_observations_state: None,
                 });
             response.validate_entity_ack_with_head_cas(&request, enforce)?;
@@ -635,7 +634,6 @@ fn cache_pending_head_two_files_multi_siblings_survive_partial_cache_settlement(
                     head_etag: enforce.then(|| "e".repeat(64)),
                     head_challenge: None,
                     unchanged_basis: None,
-                    retained_proof_missing: Vec::new(),
                     cache_observations_state: None,
                 })
                 .collect();
@@ -684,7 +682,6 @@ fn cache_pending_head_two_files_multi_siblings_survive_partial_cache_settlement(
                     head_challenge: (item.snapshot_fingerprint == sibling.snapshot_fingerprint)
                         .then(|| "c".repeat(64)),
                     unchanged_basis: None,
-                    retained_proof_missing: Vec::new(),
                     cache_observations_state: None,
                 };
                 if item.snapshot_fingerprint == sibling.snapshot_fingerprint {
@@ -817,7 +814,6 @@ fn cache_pending_head_two_files_multi_siblings_survive_partial_cache_settlement(
                     head_etag: Some("e".repeat(64)),
                     head_challenge: None,
                     unchanged_basis: None,
-                    retained_proof_missing: Vec::new(),
                     cache_observations_state: None,
                 });
             response.validate_entity_ack_with_head_cas(&request, true)?;
@@ -931,7 +927,6 @@ fn cache_pending_head_stamp_preserves_actual_quarantine_candidate_retry() {
                     head_etag: enforce.then(|| "e".repeat(64)),
                     head_challenge: None,
                     unchanged_basis: None,
-                    retained_proof_missing: Vec::new(),
                     cache_observations_state: None,
                 });
             response.validate_entity_ack_with_head_cas(&request, enforce)?;
@@ -1041,7 +1036,6 @@ fn cache_effective_wire_projection_matches_index_retractions_and_held_local_evid
                     head_etag: Some("e".repeat(64)),
                     head_challenge: None,
                     unchanged_basis: None,
-                    retained_proof_missing: Vec::new(),
                     cache_observations_state: None,
                 });
             response.validate_entity_ack_with_head_cas(&request, true)?;
@@ -1206,7 +1200,6 @@ fn cache_effective_wire_mandatory_head_obligation_survives_finalizer_noop() {
                 head_etag: head,
                 head_challenge: None,
                 unchanged_basis: None,
-                retained_proof_missing: Vec::new(),
                 cache_observations_state: None,
             });
         ack.validate_entity_ack_with_head_cas(&request, enforce)?;
@@ -1538,7 +1531,6 @@ fn cache_effective_wire_unchanged_capability_enable_reads_nothing() {
                     head_etag: None,
                     head_challenge: None,
                     unchanged_basis: None,
-                    retained_proof_missing: Vec::new(),
                     cache_observations_state: None,
                 });
             response.validate_entity_ack(&request)?;
@@ -1621,7 +1613,6 @@ fn cache_effective_wire_unchanged_capability_enable_reads_nothing() {
                     head_etag: enforce.then(|| "e".repeat(64)),
                     head_challenge: None,
                     unchanged_basis: None,
-                    retained_proof_missing: Vec::new(),
                     cache_observations_state: None,
                 });
             response.validate_entity_ack_with_head_cas(&request, enforce)?;
@@ -1673,7 +1664,6 @@ fn cache_effective_wire_unchanged_capability_enable_reads_nothing() {
                     head_etag: Some("f".repeat(64)),
                     head_challenge: None,
                     unchanged_basis: None,
-                    retained_proof_missing: Vec::new(),
                     cache_observations_state: None,
                 });
             response.validate_entity_ack_with_head_cas(&request, true)?;
@@ -1763,7 +1753,6 @@ fn cache_bootstrap_grown_existing_usage_settles_before_exact_head_probe() {
                 head_etag: enforce.then(|| "e".repeat(64)),
                 head_challenge: None,
                 unchanged_basis: None,
-                retained_proof_missing: Vec::new(),
                 cache_observations_state: None,
             };
             if enforce {
@@ -1817,7 +1806,6 @@ fn unchanged_ack_with_usage_identical_does_not_mark_emitted() {
                 head_etag: None,
                 head_challenge: None,
                 unchanged_basis: basis.map(str::to_string),
-                retained_proof_missing: Vec::new(),
                 cache_observations_state: None,
             });
         let mut progress = test_upload_progress();
@@ -1904,7 +1892,6 @@ fn held_unchanged_body_never_blocks_a_later_different_body() {
                 head_etag: None,
                 head_challenge: None,
                 unchanged_basis: unchanged.then(|| basis.to_string()),
-                retained_proof_missing: Vec::new(),
                 cache_observations_state: None,
             };
             if unchanged {
@@ -2015,7 +2002,6 @@ fn cache_capability_toggle_headless_settlement_recovers_current_predecessor() {
                 head_etag: None,
                 head_challenge: None,
                 unchanged_basis: None,
-                retained_proof_missing: Vec::new(),
                 cache_observations_state: None,
             };
             if outcome == "accepted" {
@@ -2071,7 +2057,6 @@ fn cache_capability_toggle_headless_settlement_recovers_current_predecessor() {
                         head_etag: Some("2".repeat(64)),
                         head_challenge: None,
                         unchanged_basis: None,
-                        retained_proof_missing: Vec::new(),
                         cache_observations_state: None,
                     });
                 let request = SnapshotBatchRequest {
@@ -2221,7 +2206,6 @@ fn combined_revision_wire_uses_same_scan_index_and_ack_predecessor() {
                 }),
                 head_challenge: None,
                 unchanged_basis: None,
-                retained_proof_missing: Vec::new(),
                 cache_observations_state: None,
             });
         response.validate_entity_ack(&request).unwrap();

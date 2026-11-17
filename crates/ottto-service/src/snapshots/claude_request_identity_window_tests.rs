@@ -1780,23 +1780,6 @@ fn sticky_accepted_share_retag_and_missing_sibling_are_refused_after_restart() {
         serde_json::to_value(identity::take_identity_counts()).unwrap()["identity_cap"].clone();
     assert_eq!(counts["accepted_share_changed"], 0);
     assert_eq!(counts["retained_buckets"], 1);
-    // Option (ii): the server holds each row's proof, so the org-less share
-    // is fresh proof, sent tagged and counted, never frozen.
-    let (original, mut proof) = retained_session(2);
-    proof[1].identity = login_only(Some(org_b));
-    let mut state = retained_state();
-    let mut first = original.clone();
-    sticky_apply(&mut first, &proof, &state).unwrap();
-    retained_ack(&mut state, &first, &[]);
-    proof[1].identity = login_only(None);
-    identity::take_identity_counts();
-    let mut next = original.clone();
-    sticky_apply(&mut next, &proof, &state).unwrap();
-    assert_eq!(next.request_identity_refusals, 0);
-    assert!(sends_org_less(&next));
-    let counts = retained_counts();
-    assert_eq!(retained_count(&counts, "accepted_share_changed"), 1);
-    sticky_assert_reconciled(&next);
 }
 
 #[test]
@@ -1870,7 +1853,7 @@ fn sticky_wire(item: SnapshotItem) -> Value {
     serde_json::to_value(request).unwrap()
 }
 /// #909's emitted cases. `seed` may pre-load ledger state into every
-/// accepted set (option (ii) gate-off proof: it must not change a byte).
+/// accepted set.
 fn sticky_golden_cases(seed: &dyn Fn(&mut identity::AcceptedBuckets)) -> Value {
     let fresh = || {
         let mut state = identity::AcceptedBuckets::for_test();
