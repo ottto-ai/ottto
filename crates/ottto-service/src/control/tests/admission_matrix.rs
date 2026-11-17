@@ -1025,15 +1025,11 @@ fn assert_boundary(
     pending: &str,
     request: (LocalControlRequest, Option<LocalClientPeer>),
     expected: Cell,
+    expect_dispatch: bool,
     context: &str,
 ) -> LocalControlResponse {
     let health = health_snapshot(daemon);
     let files = tree_snapshot(&fixture.root);
-    let mismatched = ottto_protocol::validate_local_control_protocol_version(
-        request.0.protocol_version,
-        &request.0.command,
-    )
-    .is_err();
     let trusted = request.0.token.is_none()
         && request.0.client_kind == Some(LocalClientKind::CompanionApp)
         && request
@@ -1045,13 +1041,13 @@ fn assert_boundary(
     let entered = recording.take();
     drop(recording);
     assert_cell(&response, expected, context);
-    let expected_entry = if mismatched {
-        Vec::new()
-    } else {
+    let expected_entry = if expect_dispatch {
         dispatch_entered(trusted)
+    } else {
+        Vec::new()
     };
     assert_eq!(entered, expected_entry, "dispatch: {context}");
-    if matches!(expected, N | A | P) || mismatched {
+    if matches!(expected, N | A | P) || !expect_dispatch {
         assert_eq!(health_snapshot(daemon), health, "health: {context}");
         assert_eq!(tree_snapshot(&fixture.root), files, "tree: {context}");
         assert_eq!(fixture.backend.count(), 0, "network: {context}");
@@ -1115,8 +1111,18 @@ fn every_command_cell_and_the_identity_fence() {
             let context = format!("{} {column:?}", row.name);
             let expected = row.cells[index];
             let request = request_for((row.sample)(), column);
-            let response =
-                assert_boundary(&fixture, &daemon, &pending, request, expected, &context);
+            let local_refusal =
+                matches!(row.authority, "Local" | "LocalCli" | "LocalNoPoisonCheck")
+                    && matches!(expected, N | A | P);
+            let response = assert_boundary(
+                &fixture,
+                &daemon,
+                &pending,
+                request,
+                expected,
+                column != Column::MismatchedVersion && !local_refusal,
+                &context,
+            );
             if row.name == "RetiredClaudeAccountSubmitAuthCode" && expected == I && index > 0 {
                 assert_eq!(
                     response.error.unwrap().message,
@@ -1207,7 +1213,7 @@ fn installation_reset_needs_its_own_protocol_version() {
         if base_version {
             request.0.protocol_version = PROTOCOL_VERSION;
         }
-        assert_boundary(&fixture, &daemon, &pending, request, expected, label);
+        assert_boundary(&fixture, &daemon, &pending, request, expected, false, label);
     }
 }
 
@@ -1215,12 +1221,14 @@ fn installation_reset_needs_its_own_protocol_version() {
 enum BackendFamily {
     Telemetry,
     DailyReference,
+    DailyReferenceRevoke,
 }
 impl BackendFamily {
     fn action(self) -> &'static str {
         match self {
             Self::Telemetry => "status",
             Self::DailyReference => "provider_daily_reference_status",
+            Self::DailyReferenceRevoke => "revoke_provider_daily_reference",
         }
     }
 
@@ -1242,13 +1250,19 @@ impl BackendFamily {
                 otlp_endpoint: None,
                 ingest_key: None,
             },
-            Self::DailyReference => LocalControlCommand::ProviderDailyReferenceControl {
-                action: ProviderDailyReferenceControlAction::Status,
-                control_token: SecretString::new(token),
-                api_base_url: Some(ATTACKER_LOOPBACK_API_BASE_URL.into()),
-                backend_grant: None,
-                expected_account_fingerprint: None,
-            },
+            Self::DailyReference | Self::DailyReferenceRevoke => {
+                LocalControlCommand::ProviderDailyReferenceControl {
+                    action: if self == Self::DailyReference {
+                        ProviderDailyReferenceControlAction::Status
+                    } else {
+                        ProviderDailyReferenceControlAction::Revoke
+                    },
+                    control_token: SecretString::new(token),
+                    api_base_url: Some(ATTACKER_LOOPBACK_API_BASE_URL.into()),
+                    backend_grant: None,
+                    expected_account_fingerprint: None,
+                }
+            }
         }
     }
 }
@@ -1475,6 +1489,16 @@ fn backend_branch_points_reservation_and_binding_order() {
     ] {
         run_backend_case(BackendFamily::DailyReference, case);
     }
+    let revoke = BackendFamily::DailyReferenceRevoke;
+    run_backend_case(
+        revoke,
+        BackendCase {
+            binding: None,
+            reserved: true,
+            expected: U,
+            ..backend_case(revoke, "reserved daily reference mutation")
+        },
+    );
 
     // A present blank key is refused before any validation request.
     let fixture = Fixture::new(200, "{}".into());
@@ -1490,7 +1514,7 @@ fn backend_branch_points_reservation_and_binding_order() {
         ingest_key: None,
     };
     let request = request_for(command, Column::NoCaller);
-    assert_boundary(&fixture, &daemon, &pending, request, I, "blank key");
+    assert_boundary(&fixture, &daemon, &pending, request, I, true, "blank key");
     assert_eq!(fixture.backend.count(), 0);
 }
 
@@ -1524,12 +1548,15 @@ fn backend_tokens_ignore_an_invalid_outer_token_and_poisoned_daemon() {
         };
         assert_cell(&send(), O, &format!("poisoned daemon {family:?}"));
         assert_eq!(fixture.backend.count(), 1, "{family:?}");
+        let accepted_files = tree_snapshot(&fixture.root);
         let replay = send();
         assert_eq!(fixture.backend.count(), 2, "{family:?}");
         // DailyReference consumed the token; Telemetry has no replay record.
-        let expected = match family {
-            BackendFamily::Telemetry => O,
-            BackendFamily::DailyReference => N,
+        let expected = if family == BackendFamily::DailyReference {
+            assert_eq!(tree_snapshot(&fixture.root), accepted_files);
+            N
+        } else {
+            O
         };
         assert_cell(
             &replay,
@@ -1651,7 +1678,7 @@ fn verify_records_only_for_an_admitted_caller() {
             );
         } else {
             let request = request_for(verify_command(repair), column);
-            assert_boundary(&fixture, &daemon, &pending, request, expected, label);
+            assert_boundary(&fixture, &daemon, &pending, request, expected, false, label);
         }
         assert_eq!(fs::read(&path).unwrap(), original, "{label}: no repair");
         assert_eq!(fixture.backend.count(), 0, "{label}");
@@ -1683,24 +1710,10 @@ fn public_update_works_with_untrusted_and_poisoned_state() {
 #[serial]
 fn protocol_token_guard_and_cached_read_precedence() {
     let _lock = lock_backend_test_env();
-    for (label, column, timezone, expected) in [
-        ("mismatched version", Column::MismatchedVersion, false, I),
-        (
-            "bad token, trusted peer",
-            Column::BadTokenTrustedPeer,
-            false,
-            A,
-        ),
-        // A pure argument guard currently runs before the caller check.
-        ("argument guard, untrusted", Column::NoCaller, true, I),
-        // The same guard also runs before the poison check.
-        (
-            "argument guard, poisoned",
-            Column::PoisonedGoodToken,
-            true,
-            I,
-        ),
-        ("cached read, poisoned", Column::PoisonedGoodToken, false, O),
+    for (label, column, expected) in [
+        ("mismatched version", Column::MismatchedVersion, I),
+        ("bad token, trusted peer", Column::BadTokenTrustedPeer, A),
+        ("cached read, poisoned", Column::PoisonedGoodToken, O),
     ] {
         let fixture = Fixture::new(200, "{}".into());
         let (daemon, pending) = fixture.daemon_with_pending();
@@ -1709,16 +1722,7 @@ fn protocol_token_guard_and_cached_read_precedence() {
         }
         let health = health_snapshot(&daemon);
         let files = tree_snapshot(&fixture.root);
-        let command = if timezone {
-            LocalControlCommand::AgentContext {
-                query: AgentContextQuery {
-                    timezone: Some("UTC".into()),
-                    ..Default::default()
-                },
-            }
-        } else {
-            LocalControlCommand::AgentStatusCached { source: None }
-        };
+        let command = LocalControlCommand::AgentStatusCached { source: None };
         assert_cell(&run(&daemon, command, column), expected, label);
         assert_eq!(health_snapshot(&daemon), health, "{label}");
         assert_eq!(tree_snapshot(&fixture.root), files, "{label}");
@@ -1729,6 +1733,210 @@ fn protocol_token_guard_and_cached_read_precedence() {
             "{label}"
         );
     }
+
+    // Protocol, caller and poison refusals precede argument validation.
+    let expected_cells = [I, N, N, N, A, A, I, I, I, P, P, A];
+    let timezone_message = "invalid local control request: --timezone is not supported. Ottto uses the timezone saved in your account settings for calendar windows.";
+    for (column, expected) in COLUMNS.into_iter().zip(expected_cells) {
+        let fixture = Fixture::new(200, "{}".into());
+        let (daemon, pending) = fixture.daemon_with_pending();
+        let daemon = daemon
+            .with_account(connected_account())
+            .with_connection(Some(LocalConnectionBinding {
+                setup_run_id: "matrix-setup".into(),
+                setup_run_token_expires_at: "2099-01-01T00:00:00Z".into(),
+                machine_id: Some("machine_test".into()),
+                claim_code: None,
+                api_base_url: fixture.backend.url.clone(),
+            }));
+        if column.poisoned() {
+            poison(&daemon.inner);
+        }
+        let timezone = || Some("UTC".into());
+        for (command, validation_message) in [
+            (
+                LocalControlCommand::AgentContext {
+                    query: AgentContextQuery {
+                        timezone: timezone(),
+                        ..Default::default()
+                    },
+                },
+                timezone_message,
+            ),
+            (
+                LocalControlCommand::AgentCosts {
+                    query: AgentCostsQuery {
+                        timezone: timezone(),
+                        ..Default::default()
+                    },
+                },
+                timezone_message,
+            ),
+            (
+                LocalControlCommand::AgentSessions {
+                    query: AgentSessionsQuery {
+                        timezone: timezone(),
+                        ..Default::default()
+                    },
+                },
+                timezone_message,
+            ),
+            (
+                LocalControlCommand::CloudStatus {
+                    source: Some("".into()),
+                },
+                "invalid local control request: cloud source must be bedrock or vertex",
+            ),
+        ] {
+            let context = format!("{} {column:?}", row_name(&command));
+            let request = request_for(command, column);
+            let mismatched = column == Column::MismatchedVersion;
+            let error = assert_boundary(
+                &fixture,
+                &daemon,
+                &pending,
+                request,
+                expected,
+                expected == I && !mismatched,
+                &context,
+            )
+            .error
+            .unwrap();
+            let message = match expected {
+                I if mismatched => "unsupported local control protocol_version 16; expected 15",
+                I => validation_message,
+                N => "local client is not trusted",
+                A => "local daemon authentication failed",
+                P => "daemon state lock is poisoned",
+                other => unreachable!("{other:?}"),
+            };
+            assert_eq!(error.message, message, "{context}");
+            assert_eq!(error.retryable, expected == P, "{context}");
+            assert_eq!(fixture.backend.count(), 0, "{context}");
+        }
+    }
+}
+
+#[test]
+#[serial]
+fn legacy_companion_status_checks_caller_before_reading_quota_settings() {
+    if !crate::test_isolation::run_here() {
+        return;
+    }
+    let _lock = lock_backend_test_env();
+    let fixture = Fixture::new(200, "{}".into());
+    let request = |column| {
+        let (mut request, peer) = request_for(
+            LocalControlCommand::Status {
+                refresh_agent_status: true,
+                retry_relay_authorization: false,
+            },
+            column,
+        );
+        request.protocol_version = 15;
+        request.client_kind = Some(LocalClientKind::CompanionApp);
+        (request, peer)
+    };
+    for (column, expected) in [
+        (Column::CompanionNoPeer, N),
+        (Column::CompanionForeignEuid, N),
+        (Column::BadTokenCli, A),
+        (Column::BadTokenTrustedPeer, A),
+        (Column::PoisonedGoodToken, P),
+        (Column::PoisonedTrusted, P),
+        (Column::PoisonedBadToken, A),
+    ] {
+        let (daemon, pending) = fixture.daemon_with_pending();
+        if column.poisoned() {
+            poison(&daemon.inner);
+        }
+        assert_boundary(
+            &fixture,
+            &daemon,
+            &pending,
+            request(column),
+            expected,
+            false,
+            &format!("{column:?}"),
+        );
+    }
+    let store = FileCodexAccountSlotSettingsStore::default();
+    for (label, saved_consent, allowed) in [
+        ("missing", None, true),
+        ("off", Some(false), false),
+        ("on", Some(true), true),
+        ("malformed", None, false),
+    ] {
+        if let Some(consent) = saved_consent {
+            store
+                .set_quota_refresh_consent(
+                    ottto_protocol::CODEX_ACCOUNT_SLOT_SETTINGS_SCHEMA_VERSION,
+                    consent,
+                )
+                .unwrap();
+        } else if !allowed {
+            fs::write(
+                default_support_dir().join(ottto_core::CODEX_ACCOUNT_SLOT_SETTINGS_FILE_NAME),
+                "{malformed",
+            )
+            .unwrap();
+        }
+        let daemon = fixture.daemon();
+        let (request, peer) = request(Column::Trusted);
+        let recording = Recording::start();
+        let source_health_snapshot: AgentStatusSnapshot = serde_json::from_value(json!({
+            "source": "codex", "status": "available", "collection_method": "config_file",
+            "captured_at": "2026-11-13T00:00:00Z", "expires_at": "2026-11-13T00:15:00Z",
+        }))
+        .unwrap();
+        let collection = crate::agent_status::AgentStatusCollection {
+            snapshots: Vec::new(),
+            source_health_snapshot,
+            codex_scan_homes: Vec::new(),
+            codex_home_bindings: Vec::new(),
+            setup_snapshot_index: None,
+        };
+        let response = crate::agent_status_refresh::with_collection(collection, || {
+            handle_request_with_peer(&daemon, request, peer)
+        });
+        assert_cell(&response, O, label);
+        let mut effects = dispatch_entered(true);
+        effects.push(Effect {
+            label: "legacy_status_quota_settings_read",
+            fields: vec![("allowed", Scalar::Bool(allowed))],
+        });
+        assert_eq!(recording.take(), effects, "quota settings {label}");
+    }
+}
+
+#[test]
+#[serial]
+fn refused_identity_command_leaves_held_lock_and_pending_handoff_untouched() {
+    let _lock = lock_backend_test_env();
+    let fixture = Fixture::new(200, "{}".into());
+    let (daemon, pending) = fixture.daemon_with_pending();
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::scope(|scope| {
+        let identity_lock = lock_setup_run_binding();
+        scope.spawn(|| {
+            let recording = Recording::start();
+            let command = LocalControlCommand::AuthReset {
+                local_only: true,
+                forget_installation: false,
+            };
+            let response = run(&daemon, command, Column::BadTokenTrustedPeer);
+            sender.send((response, recording.take())).unwrap();
+        });
+        let result = receiver.recv_timeout(Duration::from_secs(5));
+        drop(identity_lock);
+        let (response, effects) = result.expect("refusal must finish while identity lock is held");
+        assert_cell(&response, A, "locked identity");
+        assert!(effects.is_empty());
+        assert_eq!(
+            pending_state(&daemon, &pending),
+            Some(ottto_protocol::SessionLaunchStateV1::Pending),
+        );
+    });
 }
 
 fn without_observation_times(mut value: serde_json::Value) -> serde_json::Value {

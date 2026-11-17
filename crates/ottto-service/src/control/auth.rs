@@ -35,15 +35,35 @@ pub(super) fn require_authorized_local_client(
     daemon: &LocalDaemon,
     authorization: &RequestAuthorization,
 ) -> Result<(), LocalApiError> {
+    // Internal verification reaches the state check with its own authority.
+    if !matches!(authorization, RequestAuthorization::DaemonInternal) {
+        require_local_caller(daemon, authorization)?;
+    }
+    daemon.require_usable_state()
+}
+
+pub(super) fn require_local_caller(
+    daemon: &LocalDaemon,
+    authorization: &RequestAuthorization,
+) -> Result<(), LocalApiError> {
     match authorization {
-        RequestAuthorization::Token(token) => {
-            daemon.control_token.authorize(token)?;
-            daemon.require_usable_state()
+        RequestAuthorization::Token(token) => daemon.control_token.authorize(token),
+        RequestAuthorization::TrustedCompanionApp => Ok(()),
+        RequestAuthorization::DaemonInternal | RequestAuthorization::Untrusted => {
+            Err(LocalApiError::LocalClientNotTrusted)
         }
-        RequestAuthorization::TrustedCompanionApp | RequestAuthorization::DaemonInternal => {
-            daemon.require_usable_state()
-        }
-        RequestAuthorization::Untrusted => Err(LocalApiError::LocalClientNotTrusted),
+    }
+}
+
+/// Only the token-authenticated CLI owns the exec plan and its report.
+pub(super) fn require_cli_token(
+    is_cli: bool,
+    authorization: &RequestAuthorization,
+) -> Result<(), LocalApiError> {
+    if is_cli && matches!(authorization, RequestAuthorization::Token(_)) {
+        Ok(())
+    } else {
+        Err(LocalApiError::Unauthorized)
     }
 }
 

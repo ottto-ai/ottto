@@ -194,6 +194,7 @@ mod backend_http;
 mod diagnostics;
 mod managed_config;
 mod peer;
+mod policy;
 mod protocol;
 mod setup;
 mod status;
@@ -252,6 +253,8 @@ use auth::provider_daily_reference_control;
 #[cfg(test)]
 use auth::provider_daily_reference_control_with_stores;
 use auth::require_authorized_local_client;
+use auth::require_cli_token;
+use auth::require_local_caller;
 use auth::require_local_control_account;
 use auth::require_non_empty_field;
 use auth::validate_control_token_fresh;
@@ -953,20 +956,24 @@ pub fn handle_request_with_peer(
         };
     }
     let authorization = request_authorization(&request, peer.as_ref());
-    let client_install_owner = request
-        .client_install_owner
-        .unwrap_or(InstallOwner::Unknown);
-    let cli_session_exec = request.client_kind == Some(LocalClientKind::Cli);
-    let status_refresh_quota_source =
-        status_refresh_quota_source(request.client_kind, request.protocol_version);
-    match handle_command(
-        daemon,
-        authorization,
-        request.command,
-        client_install_owner,
-        status_refresh_quota_source,
-        cli_session_exec,
-    ) {
+    let policy = policy::policy(&request.command);
+    match policy::admit(&policy, &request, &authorization, daemon).and_then(|()| {
+        let client_install_owner = request
+            .client_install_owner
+            .unwrap_or(InstallOwner::Unknown);
+        let cli_session_exec = request.client_kind == Some(LocalClientKind::Cli);
+        let status_refresh_quota_source =
+            status_refresh_quota_source(request.client_kind, request.protocol_version);
+        handle_command(
+            daemon,
+            authorization,
+            policy,
+            request.command,
+            client_install_owner,
+            status_refresh_quota_source,
+            cli_session_exec,
+        )
+    }) {
         Ok(payload) => LocalControlResponse {
             request_id,
             ok: true,
@@ -1059,6 +1066,7 @@ fn require_session_launch_schema(version: u16) -> Result<(), LocalApiError> {
 fn handle_command(
     daemon: &LocalDaemon,
     authorization: RequestAuthorization,
+    policy: policy::CommandPolicy,
     command: LocalControlCommand,
     client_install_owner: InstallOwner,
     status_refresh_quota_source: Option<SourceKind>,
@@ -1076,19 +1084,7 @@ fn handle_command(
     );
     // Invalidate pending handoffs before any explicit account/slot mutation.
     // Existing mutation handlers retain all of their authorization and order.
-    if matches!(
-        &command,
-        LocalControlCommand::AuthComplete { .. }
-            | LocalControlCommand::AuthCompletePending { .. }
-            | LocalControlCommand::AuthSwitchAccount { .. }
-            | LocalControlCommand::AuthReset { .. }
-            | LocalControlCommand::ClaudeAccountRemove { .. }
-            | LocalControlCommand::ClaudeAccountReconnect { .. }
-            | LocalControlCommand::ClaudeAccountReconnectTarget { .. }
-            | LocalControlCommand::ClaudeAccountStartBrowserReconnect { .. }
-            | LocalControlCommand::CodexAccountRemove { .. }
-            | LocalControlCommand::CodexAccountReconnect { .. }
-    ) {
+    if policy.changes_identity {
         require_authorized_local_client(daemon, &authorization)?;
         daemon
             .session_launch
@@ -1128,11 +1124,7 @@ fn handle_command(
             secret,
         } => {
             require_authorized_local_client(daemon, &authorization)?;
-            // Only the token-authenticated CLI owns the exec plan. The trusted
-            // Companion can prepare/poll/cancel, but never consume a handoff.
-            if !cli_session_exec || !matches!(&authorization, RequestAuthorization::Token(_)) {
-                return Err(LocalApiError::Unauthorized);
-            }
+            require_cli_token(cli_session_exec, &authorization)?;
             require_session_launch_schema(schema_version)?;
             to_value(
                 daemon
@@ -1149,9 +1141,7 @@ fn handle_command(
             reason,
         } => {
             require_authorized_local_client(daemon, &authorization)?;
-            if !cli_session_exec || !matches!(&authorization, RequestAuthorization::Token(_)) {
-                return Err(LocalApiError::Unauthorized);
-            }
+            require_cli_token(cli_session_exec, &authorization)?;
             require_session_launch_schema(schema_version)?;
             to_value(daemon.session_launch.lock().or_state_poisoned()?.report(
                 &launch_id,
@@ -1235,7 +1225,14 @@ fn handle_command(
             }
             if refresh_agent_status {
                 if let Some(source) = status_refresh_quota_source.as_ref().filter(|_| {
-                    FileCodexAccountSlotSettingsStore::default().background_quota_refresh_allowed()
+                    let allowed = FileCodexAccountSlotSettingsStore::default()
+                        .background_quota_refresh_allowed();
+                    #[cfg(test)]
+                    crate::test_effects::record(
+                        "legacy_status_quota_settings_read",
+                        vec![("allowed", crate::test_effects::Scalar::Bool(allowed))],
+                    );
+                    allowed
                 }) {
                     require_authorized_local_client(daemon, &authorization)?;
                     crate::provider_calls::with_trigger(
@@ -1325,13 +1322,7 @@ fn handle_command(
         LocalControlCommand::AgentStatusCached { source } => {
             // Unlike the usual authorization helper, this skips the daemon-state
             // poison check: the cached read uses no daemon state.
-            match &authorization {
-                RequestAuthorization::Token(token) => daemon.control_token.authorize(token)?,
-                RequestAuthorization::TrustedCompanionApp => {}
-                RequestAuthorization::Untrusted | RequestAuthorization::DaemonInternal => {
-                    return Err(LocalApiError::LocalClientNotTrusted)
-                }
-            }
+            require_local_caller(daemon, &authorization)?;
             to_value(crate::agent_status_refresh::cached(source.as_ref()))
         }
         LocalControlCommand::PersonalMeterLocalSnapshot { source } => {

@@ -1284,21 +1284,7 @@ fn is_allowed_control_origin(origin: &str) -> bool {
     matches!(
         origin,
         "https://ottto.net" | "https://www.ottto.net" | "https://app.ottto.net"
-    ) || is_loopback_origin(origin, "http", "localhost")
-        || is_loopback_origin(origin, "http", "127.0.0.1")
-        || is_loopback_origin(origin, "https", "localhost")
-        || is_loopback_origin(origin, "https", "127.0.0.1")
-}
-
-fn is_loopback_origin(origin: &str, scheme: &str, host: &str) -> bool {
-    let prefix = format!("{scheme}://{host}");
-    let Some(suffix) = origin.strip_prefix(&prefix) else {
-        return false;
-    };
-    suffix.is_empty()
-        || suffix
-            .strip_prefix(':')
-            .is_some_and(|port| !port.is_empty() && port.chars().all(|ch| ch.is_ascii_digit()))
+    )
 }
 
 fn source_from_request(request: &HttpRequest) -> Option<SnapshotSource> {
@@ -1756,13 +1742,53 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn control_origin_allowlist_accepts_production_and_loopback_only() {
+    fn control_origin_allowlist_accepts_production_only() {
         assert!(is_allowed_control_origin("https://ottto.net"));
+        assert!(is_allowed_control_origin("https://www.ottto.net"));
         assert!(is_allowed_control_origin("https://app.ottto.net"));
-        assert!(is_allowed_control_origin("http://localhost:3000"));
-        assert!(is_allowed_control_origin("http://127.0.0.1:3001"));
+        assert!(!is_allowed_control_origin("http://localhost:3000"));
+        assert!(!is_allowed_control_origin("http://127.0.0.1:3001"));
         assert!(!is_allowed_control_origin("https://ottto.net.evil"));
         assert!(!is_allowed_control_origin("http://127.0.0.1.evil:3000"));
+    }
+
+    #[test]
+    fn control_preflight_refuses_loopback_origins_before_cors() {
+        let daemon = test_daemon();
+        for (origin, allowed) in [
+            ("http://localhost:3000", false),
+            ("http://127.0.0.1:3001", false),
+            ("https://app.ottto.net", true),
+        ] {
+            let (mut client, mut server) = loopback_pair();
+            let port = server.local_addr().unwrap().port();
+            let request = HttpRequest {
+                method: "OPTIONS".into(),
+                path: "/control".into(),
+                headers: BTreeMap::from([
+                    ("host".into(), format!("127.0.0.1:{port}")),
+                    ("origin".into(), origin.into()),
+                ]),
+                body: vec![],
+            };
+            handle_control_request(&mut server, &daemon, request).unwrap();
+            drop(server);
+            let mut response = String::new();
+            client.read_to_string(&mut response).unwrap();
+            let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+            if allowed {
+                assert!(headers.starts_with("HTTP/1.1 204"), "{response}");
+                assert!(headers.contains(&format!("Access-Control-Allow-Origin: {origin}")));
+            } else {
+                assert!(headers.starts_with("HTTP/1.1 403"), "{response}");
+                assert!(
+                    !headers.to_ascii_lowercase().contains("access-control-"),
+                    "{response}"
+                );
+                let payload: serde_json::Value = serde_json::from_str(body).unwrap();
+                assert_eq!(payload["error"], "origin_forbidden");
+            }
+        }
     }
 
     #[test]
@@ -1792,6 +1818,12 @@ pub(crate) mod tests {
                 (Some("null"), "loopback", Some("origin_forbidden")),
                 (
                     Some("https://ottto.net.evil"),
+                    "loopback",
+                    Some("origin_forbidden"),
+                ),
+                // A loopback dev page gets liveness only from the probes.
+                (
+                    Some("http://localhost:3000"),
                     "loopback",
                     Some("origin_forbidden"),
                 ),
