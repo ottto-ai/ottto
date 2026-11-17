@@ -805,7 +805,7 @@ fn partial_ack_keeps_the_unaccepted_sibling_owed() {
         money_oracle::assert_equivalent(&cold, &observed);
         // Persist the progress through its real codec before retrying.
         let progress_path = c.base.join("partial-progress.json");
-        progress.save(&progress_path).unwrap();
+        progress.save_fixture(&progress_path).unwrap();
         let restored = SnapshotUploadProgress::load(
             &progress_path,
             &format!("{:064x}", 99),
@@ -1233,7 +1233,7 @@ fn current_again_quarantines_retry_root_and_subagent_without_changing_money() {
             .values()
             .all(|r| r.failed_reconstruction_count == 1 && r.retry_after_unix_seconds == 0));
         let progress_path = c.base.join("retry-progress.json");
-        progress.save(&progress_path).unwrap();
+        progress.save_fixture(&progress_path).unwrap();
         // Crash before index save: progress is pending and the index is terminal.
         prior = ScanIndex::load(session.path()).unwrap();
         progress = SnapshotUploadProgress::load(
@@ -1247,7 +1247,7 @@ fn current_again_quarantines_retry_root_and_subagent_without_changing_money() {
             .bind_test_key(Some([0x42; 32]));
         assert_eq!(prior.quarantined_snapshot_fingerprints, terminal);
         assert!(progress.prepare_quarantine_retries(&prior.quarantined_snapshot_fingerprints));
-        progress.save(&progress_path).unwrap();
+        progress.save_fixture(&progress_path).unwrap();
         let hints =
             save_terminal_contract_claims_for_scan(&mut prior, &progress, session.path()).unwrap();
         assert_eq!(
@@ -1331,7 +1331,7 @@ fn current_again_quarantines_retry_root_and_subagent_without_changing_money() {
             .unwrap(),
         );
         money_oracle::assert_equivalent(&cold, &actual);
-        progress.save(&progress_path).unwrap();
+        progress.save_fixture(&progress_path).unwrap();
         // A second crash after the durable ACK cannot restore the old retry.
         let mut restored = SnapshotUploadProgress::load(
             &progress_path,

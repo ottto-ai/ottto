@@ -46,7 +46,7 @@ impl AckFixture {
             &namespace,
         );
         index.save_fixture(&index_path).unwrap();
-        progress.save(&progress_path).unwrap();
+        progress.save_fixture(&progress_path).unwrap();
         let identity = serde_json::to_value(&index).unwrap();
         Self {
             scratch,
@@ -197,7 +197,7 @@ fn bounded_retry_quarantine_preserves_other_acks_and_contexts_after_reload() {
         progress.record_body(fp, body);
     }
     progress.accepted_body_contexts.extend(contexts.clone());
-    progress.save(&f.progress_path).unwrap();
+    progress.save_fixture(&f.progress_path).unwrap();
     let generation = progress.generation;
 
     // Exercise the settlement and capped-save seam used by PreparedRetry::turn_inner.
@@ -267,8 +267,8 @@ fn every_progress_save_prunes_contexts_without_body_witnesses() {
         let witnesses = progress.accepted_body_witnesses.clone();
 
         match read_limit {
-            None => progress.save(&f.progress_path),
-            Some(_) => progress.save_with_read_limit(&f.progress_path, read_limit),
+            None => progress.save_fixture(&f.progress_path),
+            Some(_) => progress.save_fixture_with_read_limit(&f.progress_path, read_limit),
         }
         .unwrap();
 
@@ -304,7 +304,7 @@ fn ack_saved_before_index_crash_survives_due_and_unrelated_deltas() {
             .contains(&f.item.snapshot_fingerprint));
         index.quarantined_snapshot_fingerprints = progress.quarantined_fingerprints.clone();
         index.save_fixture(&f.index_path).unwrap(); // selected, still due until transport
-        progress.save(&f.progress_path).unwrap();
+        progress.save_fixture(&f.progress_path).unwrap();
         assert!(!index.accepted_snapshot_fingerprint_recorded(&f.item.snapshot_fingerprint));
         f.upload(&mut progress, std::slice::from_ref(&f.item), exact_ack)
             .unwrap();
@@ -318,7 +318,7 @@ fn ack_saved_before_index_crash_survives_due_and_unrelated_deltas() {
             .quarantined_snapshot_fingerprints
             .contains_key(&f.item.snapshot_fingerprint));
         if progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints) {
-            progress.save(&f.progress_path).unwrap();
+            progress.save_fixture(&f.progress_path).unwrap();
         }
         assert!(!progress
             .quarantined_fingerprints
@@ -389,7 +389,7 @@ fn changed_body_replaces_only_its_own_ack() {
     let (_, mut progress) = f.load();
     let sibling = "d".repeat(64);
     progress.record_body(&sibling, &"e".repeat(64));
-    progress.save(&f.progress_path).unwrap();
+    progress.save_fixture(&f.progress_path).unwrap();
     let changed = f.item.clone();
     // Use an explicit body witness to isolate replacement from source identity.
     let changed_body = "f".repeat(64);
@@ -442,7 +442,7 @@ fn retirement_requires_committed_scope_and_preserves_unindexed_carried_unknown_a
         committed.save_fixture(&f.index_path).unwrap();
         let unindexed = "d".repeat(64);
         progress.record_body(&unindexed, &"e".repeat(64));
-        progress.save(&f.progress_path).unwrap();
+        progress.save_fixture(&f.progress_path).unwrap();
         let mut selected = committed.clone();
         selected.files.clear();
         selected.file_snapshot_fingerprints.clear();
@@ -509,7 +509,7 @@ fn ack_capacity_stops_admission_without_evicting_evidence_and_settlement_release
     progress.ack_capacity = 2;
     let debt = "d".repeat(64);
     progress.record_body(&debt, &debt);
-    progress.save(&f.progress_path).unwrap();
+    progress.save_fixture(&f.progress_path).unwrap();
     let input = vec!["e".repeat(64)];
     let result = upload_resumable_batches(
         &input,
@@ -534,7 +534,7 @@ fn ack_capacity_stops_admission_without_evicting_evidence_and_settlement_release
     assert!(stale.save_fixture(&f.index_path).is_err());
     f.assert_ack(&f.load().1);
     progress.retire_acks_after_index_save(&index, &BTreeSet::new(), &BTreeSet::new());
-    progress.save(&f.progress_path).unwrap();
+    progress.save_fixture(&f.progress_path).unwrap();
     upload_resumable_batches(
         &input,
         &unique_poison_scope(),
@@ -560,7 +560,7 @@ fn semantic_index_acceptance_cannot_dispose_a_newer_exact_body_ack() {
     let (mut index, mut progress) = f.load();
     let newer_body = "f".repeat(64);
     progress.record_body(&f.item.snapshot_fingerprint, &newer_body);
-    progress.save(&f.progress_path).unwrap();
+    progress.save_fixture(&f.progress_path).unwrap();
     index.save_fixture(&f.index_path).unwrap();
     progress.retire_acks_after_index_save(&index, &BTreeSet::new(), &BTreeSet::new());
     progress.finish_cycle(&f.progress_path).unwrap();
@@ -610,7 +610,7 @@ fn bootstrap_capacity_drains_admitted_bodies_through_partial_settlement() {
     let mut baseline = ScanIndex::default();
     baseline.save_fixture(&index_path).unwrap();
     let mut progress = test_upload_progress();
-    progress.save(&progress_path).unwrap();
+    progress.save_fixture(&progress_path).unwrap();
     let (_, template) = pending_head_index_item();
     let entry = pending_head_index_item()
         .0
@@ -757,7 +757,7 @@ fn partial_checkpoint_ignores_the_ledger_binding_of_this_cycle() {
         .set_retained_enabled(true);
     progress.accepted_identity_buckets.record(&hint);
     assert!(!progress.accepted_identity_buckets.is_empty());
-    progress.save(&f.progress_path).unwrap();
+    progress.save_fixture(&f.progress_path).unwrap();
     progress
         .accepted_identity_buckets
         .bind_test_key(Some([0x42; 32]));
@@ -868,7 +868,7 @@ fn retirement_handoff_recovers_acks_after_index_commit_and_cleanup_save_failures
         let unindexed = "f".repeat(64);
         progress.record_body(&unindexed, &"a".repeat(64));
         committed.save_fixture(&index_path).unwrap();
-        progress.save(&progress_path).unwrap();
+        progress.save_fixture(&progress_path).unwrap();
         progress.configure_ack_capacity(&committed);
         assert_eq!(progress.ack_capacity, ENTITIES + 4096);
         let mut selected = committed.clone();
@@ -1048,7 +1048,7 @@ fn retirement_handoff_is_bound_to_destination_generation_body_and_saved_protecti
             }
             "new_body" => {
                 progress.record_body(&f.item.snapshot_fingerprint, &"b".repeat(64));
-                progress.save(&f.progress_path).unwrap();
+                progress.save_fixture(&f.progress_path).unwrap();
             }
             "current" => {
                 selected.file_snapshot_fingerprints.insert(
@@ -1112,7 +1112,7 @@ fn unindexed_debt_cannot_borrow_unused_live_incidence_slots() {
         progress.record_body(&fp, &fp);
     }
     index.save_fixture(&f.index_path).unwrap();
-    progress.save(&f.progress_path).unwrap();
+    progress.save_fixture(&f.progress_path).unwrap();
     let (_, progress) = f.load();
     assert_eq!(progress.ack_capacity, 4096);
     assert!(progress.admit_ack_batch(1).is_ok());
@@ -1127,7 +1127,7 @@ fn full_unindexed_debt_still_allows_a_live_entity_without_lending_slots_to_unrel
         let fp = format!("{entity:064x}");
         progress.record_body(&fp, &fp);
     }
-    progress.save(&f.progress_path).unwrap();
+    progress.save_fixture(&f.progress_path).unwrap();
     let mut unrelated = f.item.clone();
     unrelated.snapshot_fingerprint = "e".repeat(64);
     unrelated.source_session_id = "unrelated".into();
@@ -1332,7 +1332,7 @@ fn complete_census_recovers_a_stale_full_cap_and_allows_new_unrelated_upload() {
         let fp = format!("{entity:064x}");
         progress.record_body(&fp, &fp);
     }
-    progress.save(&f.progress_path).unwrap();
+    progress.save_fixture(&f.progress_path).unwrap();
     progress.configure_ack_capacity(&previous);
     assert_eq!(progress.retained_stale_ack_count, 5000);
     assert!(progress.admit_ack_batch(1).is_err());
@@ -1447,7 +1447,7 @@ fn resumed_probe_capacity_preserves_durable_equality_for_census_retirement() {
         let fp = format!("{entity:064x}");
         progress.record_body(&fp, &fp);
     }
-    progress.save(&f.progress_path).unwrap();
+    progress.save_fixture(&f.progress_path).unwrap();
     progress.configure_ack_capacity(&committed);
     let generation = progress.generation;
     assert_eq!(progress.accepted_fingerprints.len(), 5002);
@@ -2029,7 +2029,7 @@ fn bound_progress(progress_path: &Path, namespace: &str) -> SnapshotUploadProgre
         namespace.into(),
         snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
     );
-    progress.save(progress_path).unwrap();
+    progress.save_fixture(progress_path).unwrap();
     progress
 }
 fn load_bound_progress(path: &Path, namespace: &str) -> SnapshotUploadProgress {
@@ -2051,7 +2051,7 @@ fn v2_db_first_crash_retires_only_the_committed_exact_handoff() {
     let body = "c".repeat(64);
     let mut progress = bound_progress(&path, &namespace);
     progress.record_body(&fp, &body);
-    progress.save(&path).unwrap();
+    progress.save_fixture(&path).unwrap();
     let mut saved = ScanIndex::default();
     saved.upload_ack_retirement_handoff = Some(crate::snapshots::UploadAckRetirementHandoff {
         destination_namespace_hash: namespace.clone(),
@@ -2096,7 +2096,7 @@ fn v2_transport_error_and_failed_index_commit_never_authorize_an_ack() {
     assert_eq!(accepted, 0);
 
     progress.record_body(&"b".repeat(64), &"c".repeat(64));
-    progress.save(&path).unwrap();
+    progress.save_fixture(&path).unwrap();
     let mut tentative = ScanIndex::default();
     progress
         .stage_ack_retirement_handoff_with_census(
@@ -2233,7 +2233,7 @@ fn published_v2_partial_checkpoint_reuses_progress_owner_through_atomic_save() {
                 f.namespace.clone(),
                 snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
             );
-            progress.save(&progress_path).unwrap();
+            progress.save_fixture(&progress_path).unwrap();
             let committed = crate::snapshots::publish_state_v2_for_test(
                 &scanned,
                 &index_path,
@@ -2396,7 +2396,7 @@ fn ack_bound_saves_keep_exact_progress_bytes() {
         progress.accepted_cache_states.insert(key.clone(), state);
         progress.accepted_cache_heads.insert(key, "c".repeat(64));
         let limit = (round == 1).then_some(crate::snapshot_retry::RESPONSE_BYTES);
-        progress.save_with_read_limit(&path, limit).unwrap();
+        progress.save_fixture_with_read_limit(&path, limit).unwrap();
         let saved = std::fs::read(&path).unwrap();
         let ledger: SnapshotUploadProgress = serde_json::from_slice(&saved).unwrap();
         pretty.push(sha(&serde_json::to_vec_pretty(&ledger).unwrap()));
@@ -2423,9 +2423,10 @@ fn ack_bound_save_allocation_peak_per_progress_byte() {
             .accepted_cache_heads
             .insert(format!("{n:064x}"), "c".repeat(64));
     }
-    progress.save(&path).unwrap();
+    progress.save_fixture(&path).unwrap();
     let size = std::fs::metadata(&path).unwrap().len() as usize;
-    let (_, peak) = crate::retry_allocation_probe::measure(|| progress.save(&path).unwrap());
+    let (_, peak) =
+        crate::retry_allocation_probe::measure(|| progress.save_fixture(&path).unwrap());
     let requested = peak.requested_peak as f64 / size as f64;
     let overlap = peak.requested_peak_with_overlap as f64 / size as f64;
     eprintln!(

@@ -188,7 +188,6 @@ use self::progress_rows::PermanentSnapshotRejection;
 pub(crate) use self::progress_rows::SnapshotProgressLock;
 use self::progress_rows::SnapshotUploadProgress;
 #[cfg(test)]
-#[cfg(test)]
 use self::progress_rows::SnapshotUploadProgressCas;
 #[cfg(test)]
 use self::progress_rows::SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION;

@@ -158,7 +158,7 @@ impl PiLiveFixture {
             .save_fixture_for_source(&index_path, SnapshotSource::Pi)
             .unwrap();
         let mut progress = test_upload_progress();
-        progress.save(&progress_path).unwrap();
+        progress.save_fixture(&progress_path).unwrap();
         // The real hook freezes inputs before the native parser starts.
         let opens_before = crate::snapshots::all_transcript_opens_for_test();
         let live = live_snapshot_retry::LiveAuthority::capture(
@@ -259,7 +259,7 @@ impl PiLiveFixture {
             snapshot_upload_destination_namespace(device, "synthetic-secret"),
             snapshot_quarantine_witness(SnapshotSource::Pi),
         );
-        self.progress.save(&self.progress_path).unwrap();
+        self.progress.save_fixture(&self.progress_path).unwrap();
         self.live = Some(
             live_snapshot_retry::LiveAuthority::capture(
                 SnapshotSource::Pi,

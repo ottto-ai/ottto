@@ -818,7 +818,7 @@ pub(crate) fn checkpoint_page_for_test(
             result? == ResumableUploadResult::Completed,
             "fixture exact ACK"
         );
-        progress.save(progress_path)?;
+        progress.save_fixture(progress_path)?;
         index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
         crate::snapshots::e2_pipeline_scan_fixture::accept_upload_context_acks_for_test(
             &mut index,
@@ -828,7 +828,7 @@ pub(crate) fn checkpoint_page_for_test(
         index.save(index_path)?;
         return Ok(index);
     }
-    progress.save(progress_path)?;
+    progress.save_fixture(progress_path)?;
     checkpoint_partial_snapshot_index_with_audit_release(
         index,
         committed,

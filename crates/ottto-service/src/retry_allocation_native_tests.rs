@@ -74,7 +74,7 @@ fn bounded_retry_envelope_competing_state_refusal_preserves_native_files() {
         if progress {
             assert!(f
                 .progress
-                .save_with_read_limit(
+                .save_fixture_with_read_limit(
                     &f.progress_path,
                     Some(crate::snapshot_retry::RESPONSE_BYTES)
                 )

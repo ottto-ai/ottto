@@ -158,7 +158,7 @@ fn counting_transition_capture_and_failed_upload_select_whole_entries() {
         control_item.snapshot_fingerprint.clone(),
         snapshot_upload_body_witness(control_item),
     );
-    progress.save(&progress_path).unwrap();
+    progress.save_fixture(&progress_path).unwrap();
     let mut accepted_count = 0;
     let outcome = upload_resumable_batches_with_body_witness(
         &result.snapshots,
@@ -174,7 +174,7 @@ fn counting_transition_capture_and_failed_upload_select_whole_entries() {
             );
             Err(anyhow!("synthetic upload failure after the control ACK"))
         },
-        |progress| progress.save(&progress_path),
+        |progress| progress.save_fixture(&progress_path),
     );
     assert!(outcome.is_err());
     assert!(

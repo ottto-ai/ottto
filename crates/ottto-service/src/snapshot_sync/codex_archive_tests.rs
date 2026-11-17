@@ -116,7 +116,7 @@ impl ScanIndex {
         .unwrap();
         progress.context_receipt_candidates =
             index.file_upload_context_ack_candidates(&scan.snapshots, &BTreeMap::new());
-        progress.save(&progress_path).unwrap();
+        progress.save_fixture(&progress_path).unwrap();
         // The service computes census-absent ACKs before the upload.
         let census_absent = progress.complete_census_ack_retirements(&index, scan.census_complete);
         if outcome != "partial" {
@@ -203,7 +203,7 @@ impl ScanIndex {
             for witness in progress.accepted_body_witnesses.values_mut() {
                 *witness = "0".repeat(64);
             }
-            progress.save(&progress_path).unwrap();
+            progress.save_fixture(&progress_path).unwrap();
         }
         let checkpoint = checkpoint_partial_snapshot_index(
             &index,
@@ -280,7 +280,7 @@ pub(crate) fn assert_archive_debt_preserves_replay_progress(
         destination.clone(),
         snapshot_quarantine_witness(SnapshotSource::Codex),
     );
-    progress.save(&progress_path).unwrap();
+    progress.save_fixture(&progress_path).unwrap();
     let fixture = ContinuationFixture {
         home: root.join("home"),
         support_dir: support.clone(),

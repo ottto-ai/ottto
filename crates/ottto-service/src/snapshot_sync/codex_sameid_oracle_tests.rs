@@ -148,7 +148,7 @@ fn combined_codex_ack_recovers_every_member_and_quiet_restarts_read_zero_bytes()
         "retry sends the retained exact body"
     );
     // Process loss after the ledger save, before the source save.
-    progress.save(&progress_path).unwrap();
+    progress.save_fixture(&progress_path).unwrap();
     let recovered = SnapshotUploadProgress::load(
         &progress_path,
         &"a".repeat(64),

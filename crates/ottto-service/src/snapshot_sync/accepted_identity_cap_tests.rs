@@ -126,7 +126,7 @@ impl Route {
 /// The process restart of the identity-hint owner: its progress is saved,
 /// loaded and re-keyed as the next cycle does.
 fn restarted(route: &Route, mut progress: SnapshotUploadProgress) -> SnapshotUploadProgress {
-    progress.save(&route.progress_path()).unwrap();
+    progress.save_fixture(&route.progress_path()).unwrap();
     route.load()
 }
 

@@ -2891,7 +2891,7 @@ fn pi_live_retry_admits_a_shed_that_keeps_every_entry() {
     );
     assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
     progress
-        .save(&snapshot_upload_progress_path(&disk.route))
+        .save_fixture(&snapshot_upload_progress_path(&disk.route))
         .unwrap();
     working.generation = saved.generation;
     pi_partial_save(&disk, &working, &saved, &progress, &shed, None);
@@ -3256,7 +3256,7 @@ fn successor_cold_reopen(disposition: Option<&str>) {
                 .unwrap(),
             ResumableUploadResult::Completed
         );
-        progress.save(&progress_path).unwrap(); // Existing receipts precede successor rename.
+        progress.save_fixture(&progress_path).unwrap(); // Existing receipts precede successor rename.
         let accepted_fingerprints = progress.accepted_fingerprints.clone();
         // Reuse these outcomes with a B2 loss-bearing successor.
         append(&path, "{broken\n");
@@ -3270,7 +3270,7 @@ fn successor_cold_reopen(disposition: Option<&str>) {
             let _result = upload(&successor.scan.snapshots, &mut progress, |batch| {
                 ack_with_disposition(batch, disposition)
             });
-            progress.save(&progress_path).unwrap();
+            progress.save_fixture(&progress_path).unwrap();
         }
         // Lose acquisition memory without saving its new index or ACK. Keep
         // the committed heads, original index and durable upload progress.

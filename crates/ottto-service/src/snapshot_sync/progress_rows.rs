@@ -650,6 +650,7 @@ impl SnapshotUploadProgress {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn load(
         path: &Path,
         expected_destination_namespace_hash: &str,
@@ -835,6 +836,21 @@ impl SnapshotUploadProgress {
         self.accepted_body_contexts
             .retain(|fp, _| self.accepted_body_witnesses.contains_key(fp));
         self.save_rows(path)
+    }
+
+    /// Fixture persistence is explicit; native owners still use the real saver.
+    #[cfg(test)]
+    pub(super) fn save_fixture(&mut self, path: &Path) -> Result<()> {
+        self.save_legacy_fixture(path, None)
+    }
+
+    #[cfg(test)]
+    pub(super) fn save_fixture_with_read_limit(
+        &mut self,
+        path: &Path,
+        cap: Option<usize>,
+    ) -> Result<()> {
+        self.save_legacy_fixture(path, cap)
     }
 
     /// Explicit old-release input export for decoder and ACK-import fixtures.
@@ -1057,6 +1073,7 @@ pub(super) fn sync_progress_parent(path: &Path) -> Result<()> {
         .context("sync snapshot upload progress directory")
 }
 
+#[cfg(test)]
 pub(super) fn quarantine_invalid_progress(path: &Path) -> Result<()> {
     let quarantine_path = unique_progress_sibling(path, "corrupt");
     std::fs::rename(path, quarantine_path)

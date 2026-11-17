@@ -473,7 +473,7 @@ fn replay_generation_or_namespace_change_clears_retained_proof() {
     assert_eq!(retained_rows(&progress), Some((1, 0)));
     let path = crate::test_scratch::unique_path("ottto-e2-optii-namespace").join("progress.json");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    progress.save(&path).unwrap();
+    progress.save_fixture(&path).unwrap();
     crate::snapshots::claude_request_identity::take_identity_counts();
     let mut other = SnapshotUploadProgress::load(
         &path,
@@ -609,7 +609,7 @@ fn restarted(
     key: Option<[u8; 32]>,
     route: &Route,
 ) -> SnapshotUploadProgress {
-    progress.save(&route.progress_path()).unwrap();
+    progress.save_fixture(&route.progress_path()).unwrap();
     route.load(key, progress.accepted_identity_buckets.retained_enabled())
 }
 /// The earliest session's bucket starts and frozen share set.
@@ -849,7 +849,7 @@ fn identity_rows_import_splits_a_legacy_ledger_in_one_transaction() {
     }
     // One session changes; the other 15 rows keep the import's bytes.
     stored_ack(&mut progress, &sibling_body(0, 11));
-    progress.save(&path).unwrap();
+    progress.save_fixture(&path).unwrap();
     let after = stored_rows(&progress, &sessions);
     let changed = legacy
         .accepted_identity_buckets
@@ -877,7 +877,7 @@ fn identity_rows_survive_pages_and_pass_end_with_no_resident_hint() {
     progress
         .accepted_cache_heads
         .insert("e".repeat(64), "f".repeat(64));
-    progress.save(&route.progress_path()).unwrap();
+    progress.save_fixture(&route.progress_path()).unwrap();
     progress.finish_cycle(&route.progress_path()).unwrap();
     let after = restarted(&mut progress, Some(KEY), &route);
     assert!(after.generation > 2, "the page committed");

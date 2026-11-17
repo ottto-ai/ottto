@@ -1477,7 +1477,7 @@ fn a_restarted_ordinary_prepare_mirrors_an_open_head_conflict() {
             last_answer_unix: 0,
         },
     );
-    progress.save(&first.progress_path).unwrap();
+    progress.save_fixture(&first.progress_path).unwrap();
     pipeline.daemon = test_daemon("otm_test");
     let preparation = pipeline
         .prepare_cycle(t0 + 600)
@@ -2694,7 +2694,7 @@ fn held_probe_old_refusal_cannot_receipt_legacy_or_grown_body() {
         .permanent_rejections
         .values_mut()
         .for_each(|record| record.exposure = None);
-    cycle.progress.save(&cycle.progress_path).unwrap();
+    cycle.progress.save_fixture(&cycle.progress_path).unwrap();
     for entry in cycle.index.files.values_mut() {
         entry.upload_context_receipt = None;
     }

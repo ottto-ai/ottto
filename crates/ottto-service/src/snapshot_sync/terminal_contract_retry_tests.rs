@@ -11,7 +11,7 @@ fn terminal_contract_v1_to_v2_one_paced_attempt_then_terminal_on_failure() {
     for _ in 0..MAX_SNAPSHOT_RECONSTRUCTION_FAILURES {
         progress.quarantine_body(&fingerprint, &body);
     }
-    progress.save(&path).unwrap();
+    progress.save_fixture(&path).unwrap();
     let stale_index = progress.quarantined_fingerprints.clone();
     let namespace = progress.destination_namespace_hash.clone();
     let mut same_version =
@@ -121,7 +121,7 @@ fn terminal_contract_permanent_refusal_keeps_its_existing_gate() {
     let mut progress = test_upload_progress();
     progress.quarantine_permanent_body(&fingerprint, &body, "usage_accounting_authority_downgrade");
     let namespace = progress.destination_namespace_hash.clone();
-    progress.save(&path).unwrap();
+    progress.save_fixture(&path).unwrap();
     let mut index_records = progress.quarantined_fingerprints.clone();
     with_contract(2, || {
         crate::snapshots::terminal_contract_retry::rearm(
@@ -209,7 +209,7 @@ impl RetainedRetryFixture {
             "usage_accounting_authority_downgrade",
         );
         progress.historical_replay_generation = Some("retained-replay".into());
-        progress.save(&progress_path).unwrap();
+        progress.save_fixture(&progress_path).unwrap();
         let progress_guard = serde_json::to_value(&progress).unwrap();
         let mut index = ScanIndex::default();
         for fingerprint in [held_fingerprint(), retained_ack(), retained_refusal()] {
@@ -320,7 +320,7 @@ fn successful_contract_retry(restart_after_selection: bool) {
         assert!(progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints));
         assert!(progress.active_quarantine_retries.is_empty());
         index.save_fixture(&fixture.index_path).unwrap();
-        progress.save(&fixture.progress_path).unwrap();
+        progress.save_fixture(&fixture.progress_path).unwrap();
         let stale_index_records = index.quarantined_snapshot_fingerprints.clone();
         progress
             .quarantined_fingerprints
@@ -332,7 +332,7 @@ fn successful_contract_retry(restart_after_selection: bool) {
             progress.active_quarantine_retries,
             BTreeSet::from([held_fingerprint()])
         );
-        progress.save(&fixture.progress_path).unwrap();
+        progress.save_fixture(&fixture.progress_path).unwrap();
         let selected = progress.quarantined_fingerprints[&held_fingerprint()].clone();
         assert_eq!(selected.reconstruction_contract, 2);
         assert_eq!(
@@ -372,7 +372,7 @@ fn successful_contract_retry(restart_after_selection: bool) {
                 .get_mut(&held_fingerprint())
                 .unwrap()
                 .retry_after_unix_seconds = 0;
-            progress.save(&fixture.progress_path).unwrap();
+            progress.save_fixture(&fixture.progress_path).unwrap();
             (index, progress) = fixture.load();
             assert_eq!(
                 progress.quarantined_fingerprints[&held_fingerprint()].failed_reconstruction_count,
@@ -390,7 +390,7 @@ fn successful_contract_retry(restart_after_selection: bool) {
                 progress.active_quarantine_retries,
                 BTreeSet::from([held_fingerprint()])
             );
-            progress.save(&fixture.progress_path).unwrap();
+            progress.save_fixture(&fixture.progress_path).unwrap();
         }
         // The unrelated permanent refusal remains in the durable fixture,
         // outside this attempt's frozen input. Including it would correctly
@@ -444,7 +444,7 @@ fn successful_contract_retry(restart_after_selection: bool) {
         index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
         assert!(index.accepted_snapshot_fingerprint_recorded(&held_fingerprint()));
         index.save_fixture(&fixture.index_path).unwrap();
-        progress.save(&fixture.progress_path).unwrap();
+        progress.save_fixture(&fixture.progress_path).unwrap();
         (index, progress) = fixture.load();
         assert!(index.accepted_snapshot_fingerprint_recorded(&held_fingerprint()));
         assert!(!index
@@ -550,7 +550,7 @@ impl ReadBudgetFixture {
         index.file_snapshot_fingerprints.extend(old_incidence);
         index.quarantined_snapshot_fingerprints = progress.quarantined_fingerprints.clone();
         index.save_fixture(&retained.index_path).unwrap();
-        progress.save(&retained.progress_path).unwrap();
+        progress.save_fixture(&retained.progress_path).unwrap();
         Self {
             retained,
             root,
@@ -592,7 +592,7 @@ impl ReadBudgetFixture {
             .unwrap()
             .retry_after_unix_seconds = 0;
         progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints);
-        progress.save(&self.retained.progress_path).unwrap();
+        progress.save_fixture(&self.retained.progress_path).unwrap();
         save_terminal_contract_claims_for_scan(&mut index, &progress, &self.retained.index_path)
             .unwrap();
         (index, progress)
@@ -611,7 +611,9 @@ fn contract_read_cap(outcome: InterruptedOutcome) {
         let (mut index, mut progress) = fixture.retained.load();
         assert!(progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints));
         assert!(progress.active_quarantine_retries.is_empty());
-        progress.save(&fixture.retained.progress_path).unwrap();
+        progress
+            .save_fixture(&fixture.retained.progress_path)
+            .unwrap();
         index.save_fixture(&fixture.retained.index_path).unwrap();
         assert!(fixture.scan(&index).is_empty(), "bump alone never reads");
         let stale_index = index.quarantined_snapshot_fingerprints.clone();
@@ -769,7 +771,9 @@ fn terminal_contract_stale_index_and_same_generation_cas_keep_maximum_claim() {
             progress
                 .quarantined_fingerprints
                 .insert(fixture.fingerprint.clone(), old);
-            progress.save(&fixture.retained.progress_path).unwrap();
+            progress
+                .save_fixture(&fixture.retained.progress_path)
+                .unwrap();
         }
         (index, progress) = fixture.retained.load();
         for record in [
@@ -780,7 +784,9 @@ fn terminal_contract_stale_index_and_same_generation_cas_keep_maximum_claim() {
         }
         assert!(progress.prepare_quarantine_retries(&stale)); // Exhaustion must be saved.
         assert!(progress.active_quarantine_retries.is_empty());
-        progress.save(&fixture.retained.progress_path).unwrap();
+        progress
+            .save_fixture(&fixture.retained.progress_path)
+            .unwrap();
         save_terminal_contract_claims_for_scan(&mut index, &progress, &fixture.retained.index_path)
             .unwrap();
         assert!(fixture.scan(&index).is_empty());
@@ -839,7 +845,7 @@ fn terminal_contract_malformed_claims_exhaust_without_reset_or_opaque_hold() {
             );
             assert!(progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints));
             assert!(progress.active_quarantine_retries.is_empty());
-            progress.save(&fixture.progress_path).unwrap();
+            progress.save_fixture(&fixture.progress_path).unwrap();
             save_terminal_contract_claims_for_scan(&mut index, &progress, &fixture.index_path)
                 .unwrap();
             let (index, mut progress) = fixture.load();
@@ -908,7 +914,9 @@ fn contract_ack_saved_before_index_restart(unrelated: bool) {
             .contains(&fixture.fingerprint));
         assert!(!index.accepted_snapshot_fingerprint_recorded(&fixture.fingerprint));
         if progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints) {
-            progress.save(&fixture.retained.progress_path).unwrap();
+            progress
+                .save_fixture(&fixture.retained.progress_path)
+                .unwrap();
         }
         assert!(progress.active_quarantine_retries.is_empty());
         save_terminal_contract_claims_for_scan(&mut index, &progress, &fixture.retained.index_path)
@@ -975,7 +983,9 @@ fn contract_ack_saved_before_index_restart(unrelated: bool) {
         assert_eq!(result, ResumableUploadResult::Completed);
         assert_eq!(posts, usize::from(unrelated));
         assert_eq!(delta_accepted, u64::from(unrelated));
-        progress.save(&fixture.retained.progress_path).unwrap();
+        progress
+            .save_fixture(&fixture.retained.progress_path)
+            .unwrap();
         // Reload both durable checkpoints before index adoption: the ACK must
         // still be in progress; keep the scanner's tentative index for settlement.
         let mut selected = index.clone();

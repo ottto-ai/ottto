@@ -304,7 +304,7 @@ impl PipelineFixture {
             cycle.historical_replay,
         ) {
             progress
-                .save(&progress_path)
+                .save_fixture(&progress_path)
                 .expect("save native fixture quarantine preparation");
         }
         if cycle.historical_replay {
@@ -423,7 +423,7 @@ impl PipelineFixture {
                 scan.snapshots.len()
             );
             progress
-                .save(&progress_path)
+                .save_fixture(&progress_path)
                 .expect("save lease before synthetic upload");
         }
         let request_owned_sessions = request_owned_sessions(&scan);
@@ -437,7 +437,7 @@ impl PipelineFixture {
             progress
                 .extend_reason_reoffers_before_upload(&scan.snapshots, &holds.held_fingerprints);
             progress
-                .save(&progress_path)
+                .save_fixture(&progress_path)
                 .expect("save pre-send cooldown");
         }
         let leased_reoffers = progress.active_reason_reoffers.clone();
@@ -1310,7 +1310,7 @@ fn codex_partial_ack_keeps_the_unacknowledged_new_file_owed_without_a_restart() 
     );
     let index_path = dir.join("codex-index.json");
     let progress_path = dir.join("codex-progress.json");
-    progress.save(&progress_path).unwrap();
+    progress.save_fixture(&progress_path).unwrap();
     let mut index = checkpoint_partial_snapshot_index(
         &working,
         &committed,

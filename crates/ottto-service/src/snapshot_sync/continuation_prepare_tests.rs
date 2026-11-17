@@ -121,7 +121,7 @@ impl ContinuationFixture {
             }),
         );
         index.save_fixture(&self.index_path).unwrap();
-        progress.save(&self.upload_progress_path).unwrap();
+        progress.save_fixture(&self.upload_progress_path).unwrap();
     }
 
     /// Every file a prepare could save, byte for byte.
@@ -457,7 +457,9 @@ fn a_continuation_page_mirrors_an_open_head_conflict() {
             last_answer_unix: 1,
         },
     );
-    progress.save(&fixture.upload_progress_path).unwrap();
+    progress
+        .save_fixture(&fixture.upload_progress_path)
+        .unwrap();
     let mut minted = fixture.preparation(true);
     let mut inputs = take_continuation_inputs(
         &mut minted,
@@ -641,7 +643,9 @@ fn a_due_quarantine_retry_refuses_the_continuation_prepare() {
             disposition: SnapshotQuarantineDisposition::RetryPending,
         },
     );
-    progress.save(&fixture.upload_progress_path).unwrap();
+    progress
+        .save_fixture(&fixture.upload_progress_path)
+        .unwrap();
     fixture.assert_refused(ContinuationRefusal::UploadClaim);
 }
 
@@ -684,7 +688,9 @@ fn a_due_reason_reoffer_refuses_the_continuation_prepare() {
         },
     );
     index.save_fixture(&fixture.index_path).unwrap();
-    progress.save(&fixture.upload_progress_path).unwrap();
+    progress
+        .save_fixture(&fixture.upload_progress_path)
+        .unwrap();
     let (progress, index) = fixture.load();
     assert!(!index.snapshot_admission_reoffer_pending());
     let now = reason_reoffer::now_unix_seconds();

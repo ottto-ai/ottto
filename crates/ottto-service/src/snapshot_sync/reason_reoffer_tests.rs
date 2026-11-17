@@ -420,7 +420,7 @@ fn reoffer_reservation_survives_restart_and_failed_save_grants_nothing() {
     std::fs::create_dir_all(&root).unwrap();
     let path = root.join("progress.json");
     let (mut progress, index) = refused(&[(1, original_pair(0))]);
-    progress.save(&path).unwrap();
+    progress.save_fixture(&path).unwrap();
 
     // A concurrent writer saves a changed ledger and wins the CAS: the claim
     // save fails.
@@ -616,7 +616,7 @@ fn retained_refusal_preserves_newer_retry_debt_without_early_transmission() {
     let retry = progress.quarantined_fingerprints[&fp(1)].clone();
     let root = test_dir("reoffer-newer-conflict-retirement");
     let path = root.join("progress.json");
-    progress.save(&path).unwrap();
+    progress.save_fixture(&path).unwrap();
     progress.finish_cycle(&path).unwrap();
     let mut progress = SnapshotUploadProgress::load(
         &path,

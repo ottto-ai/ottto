@@ -32,7 +32,7 @@ impl ScanIndex {
     pub(in crate::snapshots) fn save_growth_claim(&mut self, path: &Path) -> Result<()> {
         self.save_internal(path, None, true)
     }
-    pub(in crate::snapshots) fn save_internal(
+    fn save_internal(
         &mut self,
         path: &Path,
         _read_limit: Option<usize>,

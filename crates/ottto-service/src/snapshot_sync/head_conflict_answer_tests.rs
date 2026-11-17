@@ -300,7 +300,7 @@ fn conflict_challenge_is_answered_once_and_replaces_the_server_head() {
     let path = root.join("upload-progress.json");
     // This is a copy into a new ledger, not a CAS update of cycle's file.
     progress.generation = 0;
-    progress.save(&path).unwrap();
+    progress.save_fixture(&path).unwrap();
     let mut progress = SnapshotUploadProgress::load(
         &path,
         &"a".repeat(64),
@@ -1392,7 +1392,7 @@ fn a_restart_mirrors_the_persisted_challenge_again() {
     let progress_path = root.join("upload-progress.json");
     let index_path = root.join("scan-index.json");
     progress.generation = 0;
-    progress.save(&progress_path).unwrap();
+    progress.save_fixture(&progress_path).unwrap();
     let mut index = ScanIndex::default();
     activate_source_upload_context(
         SnapshotSource::Codex,
@@ -1584,7 +1584,7 @@ fn negotiated_answer_without_cache_state_marks_a_full_replacement() {
     let root = crate::test_scratch::ScratchDir::new("cache-replacement-restore");
     let path = root.join("progress.json");
     progress.generation = 0;
-    progress.save(&path).unwrap();
+    progress.save_fixture(&path).unwrap();
     let mut restored = SnapshotUploadProgress::load(
         &path,
         &"a".repeat(64),
@@ -1928,7 +1928,7 @@ fn echoed_cache_state_settles_a_stored_state_divergence_and_converges() {
     let root = crate::test_scratch::ScratchDir::new("cache-state-echo-restart");
     let path = root.join("upload-progress.json");
     progress.generation = 0;
-    progress.save(&path).unwrap();
+    progress.save_fixture(&path).unwrap();
     let mut restored = SnapshotUploadProgress::load(
         &path,
         &"a".repeat(64),

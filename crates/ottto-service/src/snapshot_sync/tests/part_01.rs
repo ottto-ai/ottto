@@ -376,7 +376,7 @@ fn cache_pending_head_lifecycle_survives_finish_and_targets_only_accepted_head()
     progress
         .record_pending_cache_head(&item, &cache_head_file_groups(&index), true)
         .unwrap();
-    progress.save(&path).unwrap();
+    progress.save_fixture(&path).unwrap();
     progress.finish_cycle(&path).unwrap();
     let namespace = progress.destination_namespace_hash.clone();
     let witness = progress.active_quarantine_witness.clone().unwrap();
@@ -425,7 +425,7 @@ fn cache_pending_head_lifecycle_survives_finish_and_targets_only_accepted_head()
             response.validate_entity_ack_with_head_cas(&request, enforce)?;
             Ok(response)
         },
-        |progress| progress.save(&path),
+        |progress| progress.save_fixture(&path),
     )
     .unwrap();
     assert_eq!(
@@ -577,7 +577,7 @@ fn cache_pending_head_two_files_multi_siblings_survive_partial_cache_settlement(
     std::fs::create_dir_all(&root).unwrap();
     let progress_path = root.join("progress.json");
     let index_path = root.join("index.json");
-    progress.save(&progress_path).unwrap();
+    progress.save_fixture(&progress_path).unwrap();
     // Ordinary body settlement followed by index commit may crash before
     // cycle cleanup. No cache/head authority is inferred from that ACK.
     let ordinary = [&first, &sibling, &second]
@@ -600,7 +600,7 @@ fn cache_pending_head_two_files_multi_siblings_survive_partial_cache_settlement(
         |item| item.snapshot_fingerprint.as_str(),
         snapshot_upload_body_witness,
         |items| Ok(accepted_batch(items.len())),
-        |progress| progress.save(&progress_path),
+        |progress| progress.save_fixture(&progress_path),
     )
     .unwrap();
     index.save_fixture(&index_path).unwrap();
@@ -645,7 +645,7 @@ fn cache_pending_head_two_files_multi_siblings_survive_partial_cache_settlement(
             response.validate_entity_ack_with_head_cas(&request, enforce)?;
             Ok(response)
         },
-        |progress| progress.save(&progress_path),
+        |progress| progress.save_fixture(&progress_path),
     )
     .unwrap();
     let mut selected = index.clone();
@@ -699,7 +699,7 @@ fn cache_pending_head_two_files_multi_siblings_survive_partial_cache_settlement(
             response.validate_entity_ack_with_head_cas(&request, true)?;
             Ok(response)
         },
-        |progress| progress.save(&progress_path),
+        |progress| progress.save_fixture(&progress_path),
     )
     .unwrap();
     assert_eq!(
@@ -826,7 +826,7 @@ fn cache_pending_head_two_files_multi_siblings_survive_partial_cache_settlement(
             response.validate_entity_ack_with_head_cas(&request, true)?;
             Ok(response)
         },
-        |progress| progress.save(&progress_path),
+        |progress| progress.save_fixture(&progress_path),
     )
     .unwrap();
     index.retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
@@ -1261,7 +1261,7 @@ fn cache_effective_wire_mandatory_head_obligation_survives_finalizer_noop() {
     let index_path = root.join("index.json");
     let progress_path = root.join("progress.json");
     index.save_fixture(&index_path).unwrap();
-    progress.save(&progress_path).unwrap();
+    progress.save_fixture(&progress_path).unwrap();
     progress.finish_cycle(&progress_path).unwrap();
     progress = SnapshotUploadProgress::load(
         &progress_path,
@@ -1368,7 +1368,7 @@ fn cache_effective_wire_mandatory_head_obligation_survives_finalizer_noop() {
             )
             .unwrap());
     }
-    progress.save(&progress_path).unwrap(); // obligation before no-op index settlement
+    progress.save_fixture(&progress_path).unwrap(); // obligation before no-op index settlement
     index.save_fixture(&index_path).unwrap();
     progress.finish_cycle(&progress_path).unwrap();
     let mut loaded = ScanIndex::load(&index_path).unwrap();
@@ -2239,7 +2239,7 @@ fn combined_revision_wire_uses_same_scan_index_and_ack_predecessor() {
             |item| item.snapshot_fingerprint.as_str(),
             snapshot_upload_body_witness,
             |_| Ok(response.clone()),
-            |progress| progress.save(&progress_path),
+            |progress| progress.save_fixture(&progress_path),
         )
         .unwrap();
         let mut projection = json!({"session_account_evidence":wire["snapshots"][0]["session_account_evidence"],
@@ -2351,7 +2351,7 @@ fn accepted_cache_state_past_old_caps_survives_progress_restart() {
     let root = test_dir("cache-state-restart");
     std::fs::create_dir_all(&root).unwrap();
     let path = root.join("progress.json");
-    progress.save(&path).unwrap();
+    progress.save_fixture(&path).unwrap();
     let namespace = progress.destination_namespace_hash.clone();
     let witness = progress.active_quarantine_witness.clone().unwrap();
     let restored = SnapshotUploadProgress::load(&path, &namespace, witness).unwrap();

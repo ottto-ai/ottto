@@ -2246,7 +2246,7 @@ fn retry_case(conflict: bool) {
         let index_path = crate::snapshots::e2_pipeline_scan_fixture::route_of(&p.index).unwrap();
         let progress_path = snapshot_upload_progress_path(&index_path);
         progress = route_fixture_progress(&p.index, &index_path, &progress_path, progress);
-        progress.save(&progress_path).unwrap();
+        progress.save_fixture(&progress_path).unwrap();
         checkpoint_partial_snapshot_index_with_audit_release(
             &p.index,
             &committed,

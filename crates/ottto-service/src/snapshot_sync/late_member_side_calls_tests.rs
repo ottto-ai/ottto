@@ -81,7 +81,7 @@ fn pending(index: &ScanIndex, path: &Path) -> bool {
 fn restart(c: &Corpus, page: &mut Page, progress: &mut SnapshotUploadProgress) -> E2ScanFixture {
     page.index = c.reload(&mut page.index);
     let path = c.base.join("late-progress.json");
-    progress.save(&path).unwrap();
+    progress.save_fixture(&path).unwrap();
     *progress = SnapshotUploadProgress::load(
         &path,
         &format!("{:064x}", 99),

@@ -497,7 +497,7 @@ impl ApcFixture {
         // that custody before acquisition, as production prepare does.
         if progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints) {
             progress
-                .save(&self.progress_path)
+                .save_fixture(&self.progress_path)
                 .expect("save native fixture quarantine preparation");
         }
         let committed_index = index.clone();
@@ -728,7 +728,7 @@ impl ApcFixture {
             },
             |progress| {
                 if persist_refusal {
-                    progress.save(&self.progress_path)
+                    progress.save_fixture(&self.progress_path)
                 } else {
                     Ok(())
                 }
@@ -749,7 +749,7 @@ impl ApcFixture {
         index.log_claude_proof_correction_debt();
         if shed {
             progress
-                .save(&self.progress_path)
+                .save_fixture(&self.progress_path)
                 .expect("persist upload progress");
             checkpoint_partial_snapshot_index_with_audit_release(
                 &index,
@@ -2073,7 +2073,7 @@ fn apc_checkpoint_last_owed_empty_agent(prior: bool, census_complete: bool) {
     );
     let mut progress = test_upload_progress();
     progress
-        .save(&progress_path)
+        .save_fixture(&progress_path)
         .expect("persist upload progress");
     checkpoint_partial_snapshot_index(
         &current,
@@ -2360,7 +2360,7 @@ fn locked_partial_checkpoint_requested_bytes_receipt() {
                     let current = apc_m2_index(roots, owed, advance, prior);
                     let mut progress = test_upload_progress();
                     progress
-                        .save(&progress_path)
+                        .save_fixture(&progress_path)
                         .expect("persist upload progress");
                     crate::retry_allocation_probe::phase_begin();
                     let committable = checkpoint_partial_snapshot_index(

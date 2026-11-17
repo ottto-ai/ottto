@@ -190,7 +190,7 @@ pub(crate) fn partial_context_checkpoint(
     }
     let progress_path = scratch.join("progress.json");
     let index_path = scratch.join("index.json");
-    progress.save(&progress_path).unwrap();
+    progress.save_fixture(&progress_path).unwrap();
     let restored: SnapshotUploadProgress =
         serde_json::from_slice(&std::fs::read(&progress_path).unwrap()).unwrap();
     assert!(restored.context_receipt_candidates.is_empty());
@@ -544,7 +544,7 @@ impl Uploader {
                 })?;
                 Ok(response)
             },
-            |progress| progress.save(&path),
+            |progress| progress.save_fixture(&path),
         )?;
         self.completed = result == ResumableUploadResult::Completed;
         settle_index_after_upload(index, previous, &self.progress);

@@ -169,7 +169,7 @@ fn codex_union_native_transport_partial_rejection_keeps_capture_and_quarantine_g
                     false,
                 )
             },
-            |progress| progress.save(&progress_path),
+            |progress| progress.save_fixture(&progress_path),
         )
         .unwrap();
         assert_eq!(outcome, ResumableUploadResult::Rejected { count: 1 });
@@ -405,7 +405,7 @@ fn codex_union_native_transport_restart(priority: bool, lose_member_after_ack: b
             };
             client.upload_batch("synthetic-relay", &request, false)
         },
-        |progress| progress.save(&progress_path),
+        |progress| progress.save_fixture(&progress_path),
     )
     .unwrap();
     assert!(matches!(outcome, ResumableUploadResult::Completed));
@@ -477,7 +477,7 @@ fn codex_union_native_transport_restart(priority: bool, lose_member_after_ack: b
         |item: &SnapshotItem| item.snapshot_fingerprint.as_str(),
         snapshot_upload_body_witness,
         |_| panic!("durable common ACK must suppress a repeated POST"),
-        |progress| progress.save(&progress_path),
+        |progress| progress.save_fixture(&progress_path),
     )
     .unwrap();
     assert!(matches!(resumed, ResumableUploadResult::Completed));
@@ -1030,7 +1030,7 @@ fn v2_progress_above_old_bound_uploads_receipts_and_recovers_exactly() {
                 },
             );
         }
-        f.progress.save(&f.progress_path).unwrap();
+        f.progress.save_fixture(&f.progress_path).unwrap();
         let bytes = std::fs::read(&f.progress_path).unwrap();
         assert!(
             phase == 0 || bytes.len() > OLD_PROGRESS_BOUND_FOR_TEST,
@@ -1068,7 +1068,7 @@ fn v2_progress_above_old_bound_uploads_receipts_and_recovers_exactly() {
                     post(items);
                     headed(items)
                 },
-                |progress| progress.save(&f.progress_path),
+                |progress| progress.save_fixture(&f.progress_path),
             )
             .unwrap();
             // Only T's head is new: the probe's.
@@ -1284,11 +1284,11 @@ fn v2_identity_ledger_above_old_bound_recovers_cold_placement() {
             serde_json::json!({"observations":[], "value":"x".repeat(100_000)}),
         );
     }
-    progress.save(&path).unwrap();
+    progress.save_fixture(&path).unwrap();
     for snapshot in cold.snapshots.values() {
         progress.record_stored_state(snapshot, false, None).unwrap();
     }
-    progress.save(&path).unwrap();
+    progress.save_fixture(&path).unwrap();
     let after = std::fs::read(&path).unwrap();
     assert!(
         after.len() > OLD_PROGRESS_BOUND_FOR_TEST,
@@ -1835,7 +1835,7 @@ fn claude_p92_mixed_503_lost_ack_restart_preserves_candidate() {
     );
     // Save/reload the existing checkpoint domains. Fresh proof reconstructs
     // the same body; a marker-only restarted binder cannot release it.
-    progress.save(&path).unwrap();
+    progress.save_fixture(&path).unwrap();
     let mut restored = SnapshotUploadProgress::load(
         &path,
         &namespace,

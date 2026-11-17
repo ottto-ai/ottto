@@ -2332,7 +2332,7 @@ fn backfill_finalization_is_idempotent_across_index_state_and_progress_crashes()
     );
     progress.record([fingerprint.as_str()]);
     progress
-        .save(&progress_path)
+        .save_fixture(&progress_path)
         .expect("save accepted replay ledger");
     assert!(
         pending_backfill_sources_for_destination(&load_backfill_state(&root), &destination)
