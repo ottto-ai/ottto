@@ -2640,11 +2640,22 @@ fn settled_disclosed_copy_redecides_once_after_holder_acceptance() {
             unobserved(|| evidence_chunk_tests::isolated(|| off_page.enrich(&c)));
             assert!(!off_page.index.claude_copy_removals.pending(location));
             if resumed_copy {
+                // Rule A needs its holder on the page for a resumed copy; this
+                // twin-only page is held for its absent filename main
+                // (content_twin_holds), so the copy keeps its 3 requests and
+                // is not emitted (no removal count).
                 let item = body(&off_page, ROOT).unwrap();
                 assert_eq!(
                     (item.request_count, item.removed_request_count),
-                    (3, Some(0)),
+                    (3, None),
                     "Rule A needs its holder on the page for a resumed copy"
+                );
+                assert_eq!(
+                    off_page
+                        .disposition
+                        .request_owned_hold_reasons
+                        .get("absent_content_twin"),
+                    Some(&1)
                 );
                 assert!(removed_hashes(&off_page.index, &copy).is_empty());
             } else {
