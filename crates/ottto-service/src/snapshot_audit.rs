@@ -757,7 +757,10 @@ fn write_private_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::snapshots::{scan_source_roots_before_policy, scan_source_roots_with_attribution};
+    use crate::snapshots::{
+        scan_source_roots_before_policy, scan_source_roots_with_attribution,
+        scan_source_roots_with_attribution_and_claude_effort_and_hints,
+    };
     use base64::Engine as _;
     use std::io;
     use std::time::{SystemTime, UNIX_EPOCH};

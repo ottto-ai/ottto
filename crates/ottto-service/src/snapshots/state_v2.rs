@@ -29,8 +29,6 @@ pub(crate) use runtime::{
 pub(crate) use runtime::{cold_close_for_test, release_collection_page_limit_for_test};
 pub(crate) use runtime::{remove_retired_record_dir, retired_record_dir, source_erasure_alarm};
 pub(super) mod telemetry;
-#[cfg(test)]
-pub(super) use runtime::guard_local;
 #[cfg(any(test, target_os = "macos"))]
 pub(super) use runtime::invalidate_tree;
 pub(crate) use runtime::BaselineRelease;
@@ -40,6 +38,8 @@ pub(super) use runtime::{
     guard_external, idle, load_locked, publish_rebuilt_locked, published, recovery_save_guard,
     runtime_path, save_locked,
 };
+#[cfg(test)]
+pub(super) use runtime::{erase_published, guard_local};
 mod catalogue;
 mod codec;
 

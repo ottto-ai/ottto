@@ -945,6 +945,7 @@ mod application_cases {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
 
     struct Corpus {
         dir: PathBuf,
