@@ -472,27 +472,42 @@ fn telemetry_only_carry_child() {
                 decode(&fs::read(root.join("manifest.json")).unwrap()).unwrap();
             let index = ScanIndex::load(&index_path).unwrap();
             let mut state = routed_progress(&index, &index_path);
+            let telemetry = value(&state.telemetry_only).unwrap();
+            let telemetry_path = root.join("telemetry.json");
             if stage == "checkpoint" {
                 assert!(
                     candidate(&state),
                     "candidate and ACK committed before graph save"
                 );
-                let c = Corpus {
-                    root: base.join("projects"),
-                    support: base.join("support"),
-                    base,
-                    births: BTreeMap::new(),
-                };
-                quiet(&c, &mut state, index);
-                std::mem::forget(c);
             } else {
-                assert!(state.telemetry_only.is_none());
+                let expected_telemetry: Value =
+                    decode(&fs::read(&telemetry_path).unwrap()).unwrap();
+                assert_eq!(
+                    telemetry, expected_telemetry,
+                    "refused old reader preserves telemetry scheduling"
+                );
+            }
+            let c = Corpus {
+                root: base.join("projects"),
+                support: base.join("support"),
+                base,
+                births: BTreeMap::new(),
+            };
+            quiet(&c, &mut state, index);
+            std::mem::forget(c);
+            assert_eq!(
+                value(&state.telemetry_only).unwrap(),
+                telemetry,
+                "quiet pass preserves telemetry scheduling"
+            );
+            if stage == "checkpoint" {
+                fs::write(&telemetry_path, encode(&telemetry).unwrap()).unwrap();
             }
             state.load_identity([ROOT]).unwrap();
             assert_eq!(
                 custody(&state),
                 expected,
-                "all known custody survives old save/drop"
+                "all known custody survives refused old reader and current resume"
             );
         }
     });
