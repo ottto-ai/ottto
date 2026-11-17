@@ -134,12 +134,8 @@ fn census_body_facts(items: &[crate::snapshots::SnapshotItem]) -> Vec<(String, S
 
 /// Observe the same immutable page input at the production boundary before
 /// LocalHoldSettlement removes held entities. This preview does not save its
-/// index or ledger. It acquires as the actual page does (aged listing, bound
-/// withheld memo, the page's ledger prepared for the cycle, the native Full
-/// seam), on its own route and cache, so the page's listing clock, cache and
-/// custody stay untouched. The actual fixture page below then checks the same
-/// selection, hold set and surviving bodies while executing upload, settlement
-/// and persistence.
+/// index. The actual fixture page below then checks the same selection, hold
+/// set and surviving bodies while executing upload, settlement and persistence.
 fn census_pre_hold_bodies(
     fixture: &PipelineFixture,
     collected_at: &str,
@@ -157,30 +153,17 @@ fn census_pre_hold_bodies_born(
     cycle: &PipelineCycle<'_>,
 ) -> CensusPreHoldBodies {
     let committed = ScanIndex::load(&fixture.index_path).expect("preview index");
-    let upload_context = format!("{:x}", Sha256::digest(cycle.upload_context.as_bytes()));
-    // The ledger the actual page loads; the preview prepares it in memory only.
-    let mut progress = fixture.page_progress(&committed, &upload_context);
     let mut index =
         crate::snapshots::e2_pipeline_scan_fixture::own_install_for_test(&committed, &fixture.base);
     drop(committed);
-    if fixture.listing_ages_at(collected_at) {
-        crate::snapshots::e2_pipeline_scan_fixture::age_listing_for_test(&mut index);
-    }
-    let cache = Arc::new(crate::snapshots::sampled_scan::SharedCache::default());
-    cache.bind_withheld(&mut index);
     // The same activation as `PipelineFixture::page`: the hashed context bound
     // to the index and the ledger, so entity fingerprints match the page's.
+    let mut progress = test_upload_progress();
     activate_source_upload_context(
         SnapshotSource::ClaudeCode,
-        upload_context,
+        format!("{:x}", Sha256::digest(cycle.upload_context.as_bytes())),
         &mut index,
         &mut progress,
-    );
-    prepare_upload_progress_for_cycle(
-        &mut progress,
-        &index,
-        cycle.replay_generation,
-        cycle.historical_replay,
     );
     let mut reset_owed_members = 0;
     if cycle.historical_replay {
@@ -216,17 +199,13 @@ fn census_pre_hold_bodies_born(
     index.adopt_effective_upload_body_witness_revision_monotonically();
     index.load_claude_reemission_exclusions(&fixture.support);
     crate::snapshots::claude_request_money::e2::apply_money_rules(&mut index);
-    let route =
-        crate::snapshots::e2_pipeline_scan_fixture::route_of(&index).expect("the preview's route");
-    let _preview_pass = crate::snapshots::state_v2_baseline_release(&route, &index);
-    let mut scan = crate::snapshots::e2_pipeline_scan_fixture::scan_native_full_pipeline_for_test(
+    let mut scan = crate::snapshots::scan_source_roots_with_test_limit_and_claude_support(
         std::slice::from_ref(&fixture.root),
         &mut index,
         collected_at,
         183,
-        fixture.page_files,
+        PIPELINE_PAGE_FILES,
         &fixture.support,
-        Some(cache),
     )
     .expect("preview bounded page");
     let (mut disposition, _, _) =

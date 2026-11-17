@@ -26,14 +26,6 @@ pub(super) fn pipeline_transcript_line(session: &str, request: &str, second: u32
     )
 }
 
-/// The fixture's listing clock moves once per collection hour.
-fn listing_hour_at(collected_at: &str) -> i64 {
-    OffsetDateTime::parse(collected_at, &Rfc3339)
-        .unwrap()
-        .unix_timestamp()
-        / 3600
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PipelineUpload {
     Accept,
@@ -251,41 +243,6 @@ impl PipelineFixture {
         .expect("in-process pipeline page")
     }
 
-    /// Whether a page at `collected_at` first ages the listing clocks, read
-    /// without moving this fixture's clock.
-    pub(super) fn listing_ages_at(&self, collected_at: &str) -> bool {
-        self.listing_hour.get() != Some(listing_hour_at(collected_at))
-    }
-
-    /// The upload ledger a page under `upload_context` loads for `index`.
-    pub(super) fn page_progress(
-        &self,
-        index: &ScanIndex,
-        upload_context: &str,
-    ) -> SnapshotUploadProgress {
-        let progress_path = snapshot_upload_progress_path(&self.index_path);
-        if self.durable_progress {
-            SnapshotUploadProgress::load_for_index(
-                index,
-                &self.index_path,
-                &progress_path,
-                &format!("{:064x}", 99),
-                crate::snapshots::snapshot_quarantine_witness_for_context(
-                    SnapshotSource::ClaudeCode,
-                    upload_context,
-                ),
-            )
-            .expect("load durable synthetic upload progress")
-        } else {
-            route_fixture_progress(
-                index,
-                &self.index_path,
-                &progress_path,
-                test_upload_progress(),
-            )
-        }
-    }
-
     fn page_with_reoffers_born(
         &self,
         collected_at: &str,
@@ -300,7 +257,10 @@ impl PipelineFixture {
             &self.support,
         )
         .expect("load native scan index");
-        let hour = listing_hour_at(collected_at);
+        let hour = OffsetDateTime::parse(collected_at, &Rfc3339)
+            .unwrap()
+            .unix_timestamp()
+            / 3600;
         if self.listing_hour.replace(Some(hour)) != Some(hour) {
             crate::snapshots::e2_pipeline_scan_fixture::age_listing_for_test(&mut index);
         }
@@ -311,7 +271,26 @@ impl PipelineFixture {
         // are fingerprint-shaped on the wire and in the durable ledger.
         let upload_context = format!("{:x}", Sha256::digest(cycle.upload_context.as_bytes()));
         let progress_path = snapshot_upload_progress_path(&self.index_path);
-        let mut progress = self.page_progress(&index, &upload_context);
+        let mut progress = if self.durable_progress {
+            SnapshotUploadProgress::load_for_index(
+                &index,
+                &self.index_path,
+                &progress_path,
+                &format!("{:064x}", 99),
+                crate::snapshots::snapshot_quarantine_witness_for_context(
+                    SnapshotSource::ClaudeCode,
+                    &upload_context,
+                ),
+            )
+            .expect("load durable synthetic upload progress")
+        } else {
+            route_fixture_progress(
+                &index,
+                &self.index_path,
+                &progress_path,
+                test_upload_progress(),
+            )
+        };
         activate_source_upload_context(
             SnapshotSource::ClaudeCode,
             upload_context,
