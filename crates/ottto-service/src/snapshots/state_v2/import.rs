@@ -161,7 +161,6 @@ pub(super) fn save(
         next,
         super::super::sampled_scan::now_seconds(),
     );
-    super::super::lenient_decode::check_held_output(next)?;
     next.prune_request_contributions();
     let mut saved = kinds::save_graph(db, identity, previous, next, cx)?;
     next.deleted_holders.clear();
