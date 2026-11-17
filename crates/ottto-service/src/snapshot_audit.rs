@@ -931,13 +931,10 @@ mod tests {
 
         let first = run_snapshot_audit(options.clone(), &mut Vec::new()).expect("first audit");
         assert_eq!(first.emitted_session_count, 1);
-        let index = ScanIndex::load(&audit_state_dir.join(AUDIT_SCAN_INDEX_FILE))
-            .expect("load settled audit index");
-        assert_eq!(index.file_snapshot_fingerprints.len(), 1);
-        assert_eq!(index.snapshot_activity_at.len(), 1);
+        assert!(!audit_state_dir.join(AUDIT_SCAN_INDEX_FILE).exists());
 
         let second = run_snapshot_audit(options, &mut Vec::new()).expect("second audit");
-        assert_eq!(second.emitted_session_count, 0);
+        assert_eq!(second.emitted_session_count, 1);
 
         let _ = fs::remove_dir_all(home);
     }

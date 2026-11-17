@@ -35,7 +35,7 @@ pub(super) fn save_with(path: &Path, index: &mut ScanIndex) -> Result<bool> {
     save_with_mode(path, index, false)
 }
 pub(super) fn save_with_mode(path: &Path, index: &mut ScanIndex, claim_only: bool) -> Result<bool> {
-    save_locked(path, index, claim_only, published(path)?)
+    save_locked(path, index, claim_only).map(|()| true)
 }
 
 /// Generation of a freshly imported native fixture store.
@@ -472,7 +472,7 @@ fn real_mapper_runtime_saves_admitted_state_and_keeps_runtime_policy() {
     let mut index = load_with(&f.path, false).unwrap().unwrap();
     index.historical_replay_generation = Some("synthetic-policy".into());
     index.active_upload_context_fingerprint = Some("active-synthetic-policy".into());
-    assert!(save_locked(&f.path, &mut index, false, published(&f.path).unwrap()).unwrap());
+    assert!(save_locked(&f.path, &mut index, false).is_ok());
     // Committed row digests seed the next page; idle releases them.
     with_state(&f.path, |state| {
         assert_eq!(
@@ -489,7 +489,7 @@ fn real_mapper_runtime_saves_admitted_state_and_keeps_runtime_policy() {
         Ok(())
     })
     .unwrap();
-    assert!(save_locked(&f.path, &mut index, false, true).unwrap());
+    assert!(save_locked(&f.path, &mut index, false).is_ok());
     with_state(&f.path, |state| {
         assert!(state.save_digests.is_some());
         Ok(())
@@ -1219,7 +1219,7 @@ fn unknown_fields_and_interrupted_save_never_reset_progress_or_publish_partial_c
     let committed_context = current.historical_replay_generation.clone();
     assert!(current.prepare_historical_replay("uncommitted-context".into()));
     fill_session(&mut current);
-    assert!(save_locked(&f.path, &mut current, false, published(&f.path).unwrap()).is_err());
+    assert!(save_locked(&f.path, &mut current, false).is_err());
     with_state(&f.path, |state| {
         assert!(state.save_digests.is_none());
         Ok(())

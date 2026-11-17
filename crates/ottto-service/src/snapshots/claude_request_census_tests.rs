@@ -665,8 +665,7 @@ fn census_continuation_rejects_unproven_native_bases() {
                 .get(&key)
                 .unwrap()
                 .unverified_for_test());
-            let custody = state_v2::published(session.path()).unwrap();
-            state_v2::save_locked(session.path(), &mut next, true, custody).unwrap();
+            state_v2::save_locked(session.path(), &mut next, true).unwrap();
             state_v2::unstage_tail(session.path(), [key.clone()]).unwrap();
             // Simulate a crash losing the staged Tail after the claim-only save.
             let restored = ScanIndex::load(session.path()).unwrap();

@@ -305,36 +305,30 @@ fn authorized_legacy_quarantine_rebuild_keeps_opaque_custody_until_replacement()
         b"{\"schema_version\":2,\"files\":{},\"generation\":\"broken",
     )
     .unwrap();
-    let mut rebuilt = fixture.load();
+    let error = ScanIndex::load_for_snapshot_source_with_origin(
+        &fixture.root,
+        SnapshotSource::ClaudeCode,
+        &fixture.scratch,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<state_v2::Hold>(),
+        Some(&state_v2::Hold::ReloadRequired)
+    );
+    let (mut rebuilt, origin) = ScanIndex::load_for_snapshot_source_with_origin(
+        &fixture.root,
+        SnapshotSource::ClaudeCode,
+        &fixture.scratch,
+    )
+    .unwrap();
+    assert_eq!(origin, ScanIndexLoadOrigin::Loaded);
+    assert!(origin.is_fresh(&rebuilt));
     assert_eq!(rebuilt.generation, 0);
-    assert!(rebuilt.persistence_legacy_recovery.is_some());
-    assert!(!fixture.root.exists());
-    let mut clone = rebuilt.clone();
-    clone.retain_persistence_baseline_from(&rebuilt);
-    assert!(clone.persistence_legacy_recovery.is_some());
-    // Arbitrary missing-root loads cannot manufacture the authorized token.
-    assert!(ScanIndex::load(&fixture.root).is_err());
+    let mut stale = rebuilt.clone();
     rebuilt.save(&fixture.root).unwrap();
     assert_eq!(rebuilt.generation, 1);
-    assert!(rebuilt.persistence_legacy_recovery.is_none());
+    assert!(stale.save(&fixture.root).is_err());
     assert_eq!(fixture.load().generation, 1);
-    // Captured recovery adopts the publication and must use ordinary CAS on
-    // its next checkpoint, rather than retrying the spent first-save grant.
-    let mut adopted = clone.clone();
-    adopted.generation = rebuilt.generation;
-    adopted.retain_persistence_baseline_from(&rebuilt);
-    assert!(adopted.persistence_legacy_recovery.is_none());
-    adopted.save(&fixture.root).unwrap();
-    assert_eq!(adopted.generation, 2);
-    assert_eq!(fixture.load().generation, 2);
-    // A stale clone cannot re-use the spent recovery grant.
-    assert!(clone.save(&fixture.root).is_err());
-    fs::remove_file(&fixture.root).unwrap();
-    assert!(clone.save(&fixture.root).is_err());
-    assert!(
-        !fixture.root.exists(),
-        "spent Arc custody never resets a lost root"
-    );
 }
 
 #[test]

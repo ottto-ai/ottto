@@ -1173,9 +1173,7 @@ mod application_cases {
             current.traversal.as_mut().unwrap().context_fingerprint = "x".repeat(16 * 1024 * 1024);
             let wide = serde_json::to_vec(&current.traversal).unwrap();
             assert!(wide.len() > 16 * 1024 * 1024);
-            assert!(
-                super::super::runtime::save_locked(&c.path, &mut current, false, true).unwrap()
-            );
+            assert!(super::super::runtime::save_locked(&c.path, &mut current, false).is_ok());
             let saved = serde_json::to_vec(&current).unwrap();
             let reloaded = super::super::runtime::load_locked(&c.path, false, true)
                 .unwrap()
