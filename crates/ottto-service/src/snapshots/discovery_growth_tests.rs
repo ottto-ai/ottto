@@ -232,7 +232,7 @@ impl Fixture {
         let path = self.root.join("index.json");
         // Preserve the production save's updated optimistic-concurrency stamp
         // in the index passed into the next real page.
-        crate::snapshots::e2_pipeline_scan_fixture::save_for_test(index, &path);
+        crate::snapshots::e2_pipeline_scan_fixture::save_for_source_test(index, &path, scan.source);
         let saved = ScanIndex::load(&path).unwrap();
         let (_, rows) = capture(|| scan.report_discovery_growth_after_save(&saved));
         assert_eq!(rows.len(), 1, "one saved-page observation row");
@@ -1091,12 +1091,19 @@ fn listing_repass_reads_only_changed_files_for_every_source() {
             let mut f = Fixture::new();
             let mut index = kept_generation(&f, source, true);
             let path = f.root.join("index.json");
-            crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut index, &path);
+            crate::snapshots::e2_pipeline_scan_fixture::save_for_source_test(
+                &mut index, &path, source,
+            );
             let index = ScanIndex::load(&path).unwrap();
             let proven = proven_revisions(&index);
             assert!(!proven.is_empty(), "{source:?}: a proven corpus");
             let index = if legacy {
-                sampled_scan::transition_fixture::upgrade_from_legacy_store(&index, &path)
+                // The older release's bytes go to their own unpublished path:
+                // `path` already holds this build's native custody.
+                sampled_scan::transition_fixture::upgrade_from_legacy_store(
+                    &index,
+                    &f.root.join("legacy-index.json"),
+                )
             } else {
                 index
             };

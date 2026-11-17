@@ -59,21 +59,52 @@ impl ScanIndex {
         source: SnapshotSource,
     ) -> Result<()> {
         if scan_index_integration::scan_index_storage_binding(path).is_none() {
-            let source = match source {
-                SnapshotSource::ClaudeCode => scan_index_persistence::Source::Claude,
-                SnapshotSource::Codex => scan_index_persistence::Source::Codex,
-                SnapshotSource::Pi => scan_index_persistence::Source::Pi,
-            };
-            fixture_bindings().lock().unwrap().insert(
-                path.to_owned(),
-                scan_index_persistence::Binding {
-                    source,
-                    namespace_hash: "a".repeat(64),
-                },
-            );
+            insert_fixture_binding(path, persistence_source(source));
         }
         self.save_fixture(path)
     }
+}
+
+fn persistence_source(source: SnapshotSource) -> scan_index_persistence::Source {
+    match source {
+        SnapshotSource::ClaudeCode => scan_index_persistence::Source::Claude,
+        SnapshotSource::Codex => scan_index_persistence::Source::Codex,
+        SnapshotSource::Pi => scan_index_persistence::Source::Pi,
+    }
+}
+
+fn insert_fixture_binding(path: &Path, source: scan_index_persistence::Source) {
+    fixture_bindings().lock().unwrap().insert(
+        path.to_owned(),
+        scan_index_persistence::Binding {
+            source,
+            namespace_hash: "a".repeat(64),
+        },
+    );
+}
+
+/// Bind `path` to `source`; a path already bound must name that source.
+pub(crate) fn bind_source_for_test(path: &Path, source: SnapshotSource) {
+    match scan_index_integration::scan_index_storage_binding(path) {
+        Some(binding) => assert_eq!(
+            binding.source.snapshot(),
+            source,
+            "{} is bound to another source",
+            path.display()
+        ),
+        None => insert_fixture_binding(path, persistence_source(source)),
+    }
+}
+
+/// A reused fixture route must hold `source`'s graph.
+fn assert_route_source(route: &Path, source: SnapshotSource) {
+    assert_eq!(
+        scan_index_integration::scan_index_storage_binding(route)
+            .map(|binding| binding.source.snapshot()),
+        Some(source),
+        "fixture route {} holds another source",
+        route.display()
+    );
 }
 
 fn prepare_fixture_save(index: &mut ScanIndex, path: &Path) -> Result<()> {
@@ -107,41 +138,40 @@ fn prepare_fixture_save(index: &mut ScanIndex, path: &Path) -> Result<()> {
 /// Name the fixture's synthetic destination before a legacy admission assertion.
 pub(crate) fn bind_input_for_test(index: &ScanIndex, path: &Path) {
     if scan_index_integration::scan_index_storage_binding(path).is_none() {
-        let source = route_of(index)
-            .and_then(|route| scan_index_integration::scan_index_storage_binding(&route))
-            .map(|binding| binding.source)
-            .or_else(|| {
-                index
-                    .active_quarantine_witness
-                    .as_ref()
-                    .and_then(|witness| {
-                        [
-                            scan_index_persistence::Source::Claude,
-                            scan_index_persistence::Source::Codex,
-                            scan_index_persistence::Source::Pi,
-                        ]
-                        .into_iter()
-                        .find(|source| witness == &snapshot_quarantine_witness(source.snapshot()))
-                    })
-            })
-            .unwrap_or_else(|| {
-                let name = path.file_name().unwrap().to_string_lossy();
-                if name.contains("codex") {
-                    scan_index_persistence::Source::Codex
-                } else if name.contains("pi-") {
-                    scan_index_persistence::Source::Pi
-                } else {
-                    scan_index_persistence::Source::Claude
-                }
-            });
-        fixture_bindings().lock().unwrap().insert(
-            path.to_owned(),
-            scan_index_persistence::Binding {
-                source,
-                namespace_hash: "a".repeat(64),
-            },
-        );
+        insert_fixture_binding(path, fixture_source(index, path));
     }
+}
+
+/// `index`'s source: its route's binding, else its active quarantine
+/// witness, else the synthetic file name.
+fn fixture_source(index: &ScanIndex, path: &Path) -> scan_index_persistence::Source {
+    route_of(index)
+        .and_then(|route| scan_index_integration::scan_index_storage_binding(&route))
+        .map(|binding| binding.source)
+        .or_else(|| {
+            index
+                .active_quarantine_witness
+                .as_ref()
+                .and_then(|witness| {
+                    [
+                        scan_index_persistence::Source::Claude,
+                        scan_index_persistence::Source::Codex,
+                        scan_index_persistence::Source::Pi,
+                    ]
+                    .into_iter()
+                    .find(|source| witness == &snapshot_quarantine_witness(source.snapshot()))
+                })
+        })
+        .unwrap_or_else(|| {
+            let name = path.file_name().unwrap().to_string_lossy();
+            if name.contains("codex") {
+                scan_index_persistence::Source::Codex
+            } else if name.contains("pi-") {
+                scan_index_persistence::Source::Pi
+            } else {
+                scan_index_persistence::Source::Claude
+            }
+        })
 }
 
 /// Install a new synthetic legacy input; never overwrite live native custody.
@@ -300,6 +330,7 @@ fn synthetic_default_indexes_save_and_reload_through_native_custody() {
 /// new, empty route, which reads what changed Full. A caller's own session is
 /// left alone.
 pub(crate) fn routed_for_test(
+    source: SnapshotSource,
     cache: &sampled_scan::SharedCache,
     index: ScanIndex,
     dir: &Path,
@@ -317,13 +348,17 @@ pub(crate) fn routed_for_test(
         if route.caller_commits {
             return match on {
                 Some(_) => index,
-                None => carry(ScanIndex::load(&route.path).unwrap()),
+                None => {
+                    assert_route_source(&route.path, source);
+                    carry(ScanIndex::load(&route.path).unwrap())
+                }
             };
         }
         if let Some(mine) = on
             .as_ref()
             .filter(|on| **on == route.path || route.others.contains(on))
         {
+            assert_route_source(mine, source);
             if *mine != route.path {
                 route.others.retain(|other| other != mine);
                 let left = std::mem::replace(&mut route.path, mine.clone());
@@ -341,7 +376,7 @@ pub(crate) fn routed_for_test(
     {
         return index;
     }
-    let (path, cold) = publish_route(&index, dir);
+    let (path, cold) = publish_route(source, &index, dir);
     let others = own.take().map_or_else(Vec::new, |route| {
         let mut others = route.others;
         others.push(route.path);
@@ -441,11 +476,11 @@ pub(crate) fn cold_restart(prior: ScanIndex) -> ScanIndex {
 }
 
 /// `prior` published on a new fixture route under `dir`: (route, cold graph).
-fn publish_route(prior: &ScanIndex, dir: &Path) -> (PathBuf, ScanIndex) {
+fn publish_route(source: SnapshotSource, prior: &ScanIndex, dir: &Path) -> (PathBuf, ScanIndex) {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let (session, cold) = StateV2ColdSession::publish(
-        scan_index_persistence::Source::Claude,
+        persistence_source(source),
         prior,
         &dir.canonicalize().unwrap().join(format!("route-{n}")),
     );
@@ -460,11 +495,15 @@ fn publish_route(prior: &ScanIndex, dir: &Path) -> (PathBuf, ScanIndex) {
 /// a new route, so another install's commits from the same prior never stale
 /// it. An unrouted index is returned as is.
 pub(crate) fn own_install_for_test(index: &ScanIndex, dir: &Path) -> ScanIndex {
-    if route_of(index).is_none() {
+    let Some(route) = route_of(index) else {
         return index.clone();
-    }
+    };
+    let source = scan_index_integration::scan_index_storage_binding(&route)
+        .expect("a bound route")
+        .source
+        .snapshot();
     // A restart from disk: runtime-only fields are gone, as through a file.
-    publish_route(index, dir).1
+    publish_route(source, index, dir).1
 }
 
 /// This thread's process total of the Tail counter `name{label}`, summed over
@@ -589,7 +628,7 @@ pub(crate) fn resident_for_test(index: &ScanIndex) -> ScanIndex {
 /// A scan fixture's page continues from its owner's route; with no cache it
 /// reads a fixture route unrouted.
 pub(crate) fn route_for_test(
-    _source: SnapshotSource,
+    source: SnapshotSource,
     cache: Option<&sampled_scan::SharedCache>,
     index: ScanIndex,
 ) -> ScanIndex {
@@ -609,7 +648,7 @@ pub(crate) fn route_for_test(
     };
     let dir = std::env::temp_dir().join(format!("ottto-fixture-routes-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    routed_for_test(cache, index, &dir)
+    routed_for_test(source, cache, index, &dir)
 }
 
 /// The saved, already-indexed walk used by a quiet restart. Like the
@@ -731,22 +770,65 @@ pub(crate) fn bind_fixture_route(
     path
 }
 
-/// Commit on the native route, then encode a legacy decoder fixture at `path`.
-/// The copy has no continuation; another owner must read changed input Full.
+/// Commit on the owner's native route, then publish a detached copy as
+/// generation 1 of its own store at `path`. The copy has no continuation;
+/// another owner must read changed input Full. The source is the owner
+/// route's, else the active witness's, else the file name's.
 pub(crate) fn save_for_test(index: &mut ScanIndex, path: &Path) {
-    let route = bind_fixture_route(
-        SnapshotSource::ClaudeCode,
-        index,
-        path.parent().unwrap(),
-        &"a".repeat(64),
-    );
+    let source = fixture_source(index, path).snapshot();
+    save_for_source_test(index, path, source);
+}
+
+/// `save_for_test` of a `source` graph.
+pub(crate) fn save_for_source_test(index: &mut ScanIndex, path: &Path, source: SnapshotSource) {
+    if let Some(route) = route_of(index) {
+        assert_route_source(&route, source);
+        if same_location(&route, path) {
+            // A graph reloaded from `path` restarts as its own owner, as a
+            // plain checkpoint read back did.
+            index.v2_mut().persistence_v2 = None;
+        }
+    }
+    let route = bind_fixture_route(source, index, path.parent().unwrap(), &"a".repeat(64));
     save_on_route(index, &route).unwrap();
-    let mut copy = index.clone();
-    copy.v2_mut().persistence_v2 = None;
+    assert!(
+        !same_location(&route, path),
+        "the detached copy never replaces its owner's custody"
+    );
+    let mut copy = detached_copy(index);
+    copy.generation = 0;
+    bind_source_for_test(path, source);
+    let loaded = seed_index_at_generation(&copy, path, Some(1));
+    assert_eq!(loaded.generation, 1, "the copy is its store's first commit");
+}
+
+/// The legacy JSON view of `index` at `path`, for readers whose subject is old
+/// bytes (the metadata CLI, a historical binary). It carries no continuation.
+pub(crate) fn legacy_view_for_test(index: &ScanIndex, path: &Path) {
+    bind_input_for_test(index, path);
+    let mut copy = detached_copy(index);
     copy.generation = 1;
     let mut bytes = Vec::new();
     lenient_decode::write_index(&mut bytes, &copy).unwrap();
-    fs::write(path, bytes).unwrap();
+    legacy_input_for_test(path, &bytes);
+}
+
+/// `index`'s persisted fields with no route and no runtime-only state.
+fn detached_copy(index: &ScanIndex) -> ScanIndex {
+    let mut copy = index.clone();
+    carry_runtime(&ScanIndex::default(), &mut copy);
+    copy.v2_mut().persistence_v2 = None;
+    copy
+}
+
+fn same_location(a: &Path, b: &Path) -> bool {
+    let canonical = |path: &Path| {
+        path.parent()
+            .and_then(|parent| parent.canonicalize().ok())
+            .map(|parent| parent.join(path.file_name().unwrap()))
+            .unwrap_or_else(|| path.to_owned())
+    };
+    canonical(a) == canonical(b)
 }
 
 /// Save and reload on this owner's native route; an unrouted seed is first
@@ -874,7 +956,7 @@ impl E2ScanFixture {
     }
 
     pub(crate) fn routed(&self, index: ScanIndex, dir: &Path) -> ScanIndex {
-        routed_for_test(&self.cache, index, dir)
+        routed_for_test(SnapshotSource::ClaudeCode, &self.cache, index, dir)
     }
 
     /// Begins this owner's pass, as the daemon does before a scan.

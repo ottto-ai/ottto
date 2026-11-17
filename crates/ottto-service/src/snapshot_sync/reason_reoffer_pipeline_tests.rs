@@ -563,8 +563,8 @@ impl ReofferPipeline {
         (cycle, parsed, bytes)
     }
 
-    /// Deletes every durable warm-cache store under the support
-    /// directory, so the next restart also loses the store and reads cold.
+    /// Deletes every retired durable-tail directory under the support
+    /// directory. Native Tail heads live in the state database and survive.
     fn drop_durable_stores(&self) {
         fn walk(dir: &std::path::Path) {
             for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
@@ -1699,7 +1699,7 @@ fn scan_worker_stack_margin_receipt() {
 /// nothing for an unchanged file whose only selection is its already
 /// refused exact body, across a restart that rebuilds the runtime view.
 /// The refusal, conflict and deadline stay disclosed while the quiet traversal
-/// settles. At the due time: one re-read and one offer.
+/// settles. At the due time: one reconstruction and one offer.
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests)]
@@ -1763,16 +1763,16 @@ fn cooldown_conflict_quiet_cycles_skip_the_reparse_until_the_daily_offer() {
         );
     }
 
-    // The reserved day arrives: exactly one re-read and one offer. With the
-    // durable warm cache a restart would restore this file and read no
-    // bytes; this cycle measures the cold reconstruction, so the restart
-    // also loses the store.
+    // The reserved day arrives: exactly one reconstruction and one offer.
+    // The restart also loses the retired durable-tail directory, but the
+    // native Tail head lives in the state database and restores the quiet
+    // body without reading transcript bytes.
     let due = deadline.as_u64().unwrap() + 60;
     pipeline.drop_durable_stores();
     let (day2, parsed, bytes) = pipeline.measured_cycle(due, true);
     assert_eq!(day2.leased_offers, 1);
     assert_eq!(parsed, 1, "one reconstruction at the due time");
-    assert!(bytes >= size, "a real full re-read: {bytes} < {size}");
+    assert_eq!(bytes, 0, "the native Tail head restores the unchanged body");
     assert!(day2.result.is_ok(), "{:?}", day2.result);
     let offered = pipeline.server.offered();
     assert_eq!(offered.len(), 3, "one offer at the due time");
@@ -1954,8 +1954,8 @@ fn history_held_file_is_not_reoffered_and_its_lease_is_not_delivered() {
 }
 
 /// A completed first cycle is not a kill before its first save: it publishes
-/// both an index and a prior-root witness. Deleting that index and clearing the
-/// ledger's ACKs must not turn the witnessed history into a fresh installation.
+/// a native fence and its state database. Deleting that fence and clearing the
+/// ledger's ACKs must not turn the database's history into a fresh installation.
 /// A replay claim is still not server attestation (the separate StateMissing
 /// N1 test covers that); it cannot waive a missing published-root refusal.
 #[test]
@@ -1980,15 +1980,16 @@ fn missing_published_index_with_claim_only_ledger_refuses_without_reread() {
         !first.index.files.is_empty(),
         "the published index holds history"
     );
-    let prior_path = first.index_path.with_file_name(format!(
-        "{}.storage-prior",
+    let database = first.index_path.with_file_name(format!(
+        "{}.v2.sqlite",
         first.index_path.file_name().unwrap().to_str().unwrap()
     ));
-    let prior_bytes = std::fs::read(&prior_path).expect("published root witness");
-    assert_eq!(prior_bytes, b"scan_index_prior_root_v1\n");
-    // A settled bootstrap leaves no ledger file. Recreate a claim-only ledger,
-    // but keep the real published-root witness: this is loss AFTER publication,
-    // not a first install killed before publication.
+    assert!(
+        database.exists(),
+        "the first cycle published its state database"
+    );
+    // Rewrite the ledger as claim-only, but keep the published state database:
+    // this is loss AFTER publication, not a first install killed before it.
     let mut claim = SnapshotUploadProgress::load_for_index(
         &first.index,
         &first.index_path,
@@ -2009,11 +2010,12 @@ fn missing_published_index_with_claim_only_ledger_refuses_without_reread() {
         .save_fixture(&first.progress_path)
         .expect("write the claim-only ledger");
     assert!(!claim.records_server_attested_upload());
-    let progress_before = std::fs::read(&first.progress_path).unwrap();
-    std::fs::remove_file(&first.index_path).expect("lose the published index");
+    let progress_before = std::fs::read(&first.progress_path).ok();
+    std::fs::remove_file(&first.index_path).expect("lose the published fence");
     let _ = std::fs::remove_file(crate::backfill::backfill_state_path(&pipeline.support));
-    // Drop all warm process custody as a restart would; the disk witness must
-    // keep the source closed without consulting a transcript or contacting upload.
+    // Drop all warm process custody as a restart would; the surviving state
+    // database must keep the source closed without consulting a transcript or
+    // contacting upload.
     pipeline.daemon = test_daemon("otm_test");
     let ((prepared, reads), records) = crate::local_resource_diagnostics::capture(|| {
         crate::snapshots::terminal_contract_retry::source_acquisitions(|| {
@@ -2024,7 +2026,10 @@ fn missing_published_index_with_claim_only_ledger_refuses_without_reread() {
         Err(error) => error,
         Ok(_) => panic!("a missing published root must refuse before collection"),
     };
-    assert!(format!("{error:#}").contains("scan_index_prior_state_requires_repair"));
+    assert!(
+        format!("{error:#}").contains("state_v2_fence_lost"),
+        "{error:#}"
+    );
     let health = pipeline
         .daemon
         .status("token")
@@ -2069,7 +2074,7 @@ fn missing_published_index_with_claim_only_ledger_refuses_without_reread() {
     assert_eq!(counters[0]["source"], "claude_code");
     assert_eq!(
         counters[0]["counts"]["scan_index_repair_required"]["cause"],
-        "prior_state"
+        "state_v2"
     );
     assert_eq!(
         counters[0]["counts"]["scan_index_repair_required"]["delta"], 1,
@@ -2078,13 +2083,10 @@ fn missing_published_index_with_claim_only_ledger_refuses_without_reread() {
     assert!(reads.is_empty(), "no transcript acquisition while held");
     assert!(
         !first.index_path.exists(),
-        "no default index or replacement save"
+        "no default index or replacement fence"
     );
-    assert_eq!(std::fs::read(&prior_path).unwrap(), prior_bytes);
-    assert_eq!(
-        std::fs::read(&first.progress_path).unwrap(),
-        progress_before
-    );
+    assert!(database.exists(), "the state database keeps its custody");
+    assert_eq!(std::fs::read(&first.progress_path).ok(), progress_before);
     assert_eq!(pipeline.server.offered(), offered, "no history re-uploaded");
 }
 

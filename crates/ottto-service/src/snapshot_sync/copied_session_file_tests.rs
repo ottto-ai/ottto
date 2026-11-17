@@ -2188,13 +2188,12 @@ fn content_carrier_reconcile_under_open_v2_save_does_not_deadlock() {
     worker.join().unwrap();
 }
 
-/// [regress] An unrouted JSON save retains exact accepted counted rows
-/// without granting head-backed authority or relocking a v2 session.
+/// [regress] An unsampled carrier keeps exact accepted counted rows and
+/// their settled copy ownership while saves publish through native custody.
 #[test]
-fn legacy_content_carrier_save_stays_unrouted() {
+fn unsampled_content_carrier_keeps_accepted_copy_removals_settled() {
     with_e2(|| {
         let (c, mut index, _) = settled_content_carrier(false);
-        assert!(crate::snapshots::e2_pipeline_scan_fixture::route_of(&index).is_none());
         assert!(!index.upload_context_proof.request_contributions.is_empty());
         let rows = index.upload_context_proof.request_contributions.clone();
         let copy = c.root.join(file(COPY));
@@ -2202,14 +2201,13 @@ fn legacy_content_carrier_save_stays_unrouted() {
         for _ in 0..3 {
             let page = ready(&c, &E2ScanFixture::default(), index.clone(), 100, false);
             index = settle(&c, &index, page, &mut e2_progress());
-            assert!(crate::snapshots::e2_pipeline_scan_fixture::route_of(&index).is_none());
             assert_eq!(index.upload_context_proof.request_contributions, rows);
             assert_eq!(removed_hashes(&index, &copy), removals);
             assert!(
                 !index
                     .claude_copy_removals
                     .pending(location_key(&c.root.join(file(COPY)).to_string_lossy())),
-                "fresh accepted rows settle ownership without a head route"
+                "fresh accepted rows settle ownership without a sampled head"
             );
         }
     });

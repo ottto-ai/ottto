@@ -1178,7 +1178,11 @@ fn sampled_production_both_scanners_reuse_native_state_and_full_audit_survives_r
         let key = local_index_key(&fixture.file.0);
         let due = index.files[&key].unverified_deadline().unwrap();
         let index_path = fixture.dir.join("index.json");
-        crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut index, &index_path);
+        crate::snapshots::e2_pipeline_scan_fixture::save_for_source_test(
+            &mut index,
+            &index_path,
+            source,
+        );
         // RAM loss: a restart keeps only the state database.
         let restarted = Arc::new(sampled_scan::SharedCache::default());
         *restarted.test_route.lock().unwrap() = cache.test_route.lock().unwrap().take();

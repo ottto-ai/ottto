@@ -718,8 +718,32 @@ impl PipelineFixture {
 
     /// Diagnose the native queue when a fixed-page completion predicate fails.
     /// The original page remains the assertion's subject, even if later work
-    /// or expiry of the six-hour growth claim permits completion.
-    fn trace_completion_followup(&self, cycle: &PipelineCycle<'_>) {
+    /// or expiry of the six-hour growth claim permits completion. First name
+    /// what `page`'s committed walk still queues.
+    fn trace_completion_followup(&self, page: &PipelinePage, cycle: &PipelineCycle<'_>) {
+        let walk = &serde_json::to_value(&page.index).unwrap()["traversal"];
+        let queued = walk["pending_candidates"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|candidate| {
+                let path = std::path::Path::new(candidate["path"].as_str().unwrap_or_default());
+                format!(
+                    "{}(census={},hint={})",
+                    path.file_name().unwrap_or_default().to_string_lossy(),
+                    candidate["census_member"],
+                    candidate["watcher_hint"],
+                )
+            })
+            .collect::<Vec<_>>();
+        eprintln!(
+            "native census queue after incomplete page: directories={} candidates={queued:?} \
+             hint_seen={}",
+            walk["pending_directories"]
+                .as_array()
+                .map_or(0, |directories| directories.len()),
+            walk["watcher_hint_seen"],
+        );
         for (hour, first_minute) in [(9, 2), (15, 0)] {
             for minute in first_minute..=7 {
                 let at = format!("2026-08-02T{hour:02}:{minute:02}:00Z");
@@ -1012,7 +1036,7 @@ fn assert_real_rejected_hold(
     // also reloads the actual upload ledger, keeping the exact refusal visible.
     let last = fixture.page("2026-08-02T09:01:00Z", cycle, PipelineUpload::Accept);
     if !last.scan.census_complete {
-        fixture.trace_completion_followup(cycle);
+        fixture.trace_completion_followup(&last, cycle);
     }
     assert!(last.scan.census_complete);
     assert_eq!(last.scan.census_window_end, first.scan.census_window_end);
@@ -1229,7 +1253,7 @@ fn due_reoffer_rejected_page_preserves_terminal_and_retry_pending_holds() {
         );
         let last = fixture.page("2026-08-02T09:01:00Z", &cycle, PipelineUpload::Accept);
         if last.scan.census_complete == retry_pending {
-            fixture.trace_completion_followup(&cycle);
+            fixture.trace_completion_followup(&last, &cycle);
         }
         assert_eq!(last.scan.census_complete, !retry_pending);
         assert_eq!(last.backfill_succeeded, !retry_pending);
