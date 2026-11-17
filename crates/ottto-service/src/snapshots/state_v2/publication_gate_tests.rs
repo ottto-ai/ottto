@@ -151,18 +151,12 @@ fn unbound_load_cannot_save_and_unadopted_bound_graph_requires_reload() {
     fs::write(&unbound, &input).unwrap();
     let mut index = ScanIndex::load(&unbound).unwrap();
     assert_eq!(
-        index
-            .save(&unbound)
-            .unwrap_err()
-            .downcast_ref::<Hold>(),
+        index.save(&unbound).unwrap_err().downcast_ref::<Hold>(),
         Some(&Hold::ForeignBinding)
     );
     assert_eq!(fs::read(&unbound).unwrap(), input);
     assert_eq!(
-        index
-            .save(&f.path)
-            .unwrap_err()
-            .downcast_ref::<Hold>(),
+        index.save(&f.path).unwrap_err().downcast_ref::<Hold>(),
         Some(&Hold::ReloadRequired)
     );
     assert!(!f.path.exists());
