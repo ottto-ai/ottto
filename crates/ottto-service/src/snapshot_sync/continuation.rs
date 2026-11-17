@@ -1,11 +1,20 @@
 //! Enabled Codex cursor pages: AC only, background QoS, EOF parked for ordinary cadence.
-use super::{
-    enabled_snapshot_sources, load_snapshot_device_credentials, run_continuation_scan, safe_error,
-    snapshot_api_base_url, snapshot_upload_destination_namespace, source_paced_due,
-    source_upload_backoff_remaining, with_source_cadence, ContinuationInputs, ContinuationScan,
-    ScanIndex, SnapshotSource, SnapshotUploadPolicy, SourcePreparation, SourceScanResult,
-    SNAPSHOT_SYNC_INTERVAL, SNAPSHOT_SYNC_LOCK, SNAPSHOT_SYNC_WORKER_STACK_BYTES,
-};
+use super::enabled_snapshot_sources;
+use super::load_snapshot_device_credentials;
+use super::safe_error;
+use super::snapshot_api_base_url;
+use super::snapshot_upload_destination_namespace;
+use super::source_paced_due;
+use super::source_upload_backoff_remaining;
+use super::with_source_cadence;
+use super::ScanIndex;
+use super::SnapshotSource;
+use super::SnapshotUploadPolicy;
+use super::SourcePreparation;
+use super::SourceScanResult;
+use super::SNAPSHOT_SYNC_INTERVAL;
+use super::SNAPSHOT_SYNC_LOCK;
+use super::SNAPSHOT_SYNC_WORKER_STACK_BYTES;
 use crate::adaptive_collector::{ContinuationPacing, SourceCadence};
 use crate::snapshots::sampled_scan::SharedCache;
 use crate::snapshots::{CodexCursorPort, CodexCursorTicket};
@@ -1235,4 +1244,411 @@ pub(super) fn resource_qos() -> Option<(u32, i32)> {
 #[cfg(all(test, unix))]
 pub(super) fn resource_set_qos(class: u32, relative: i32) -> bool {
     set_qos(class, relative)
+}
+
+use super::activate_source_upload_context;
+use super::backfill_replay_pending;
+use super::continuation;
+use super::current_rfc3339;
+use super::cycle_body_witness_revision;
+use super::cycle_replay_generation;
+use super::cycle_sampled_scope;
+use super::cycle_upload_context;
+use super::load_backfill_state;
+use super::prepare_upload_progress_for_cycle_with_reoffer;
+use super::reason_reoffer;
+use super::scan_request_window_days;
+use super::stale_owed;
+use super::BTreeSet;
+use super::PathBuf;
+use super::Result;
+use super::SessionAttributionContext;
+use super::SnapshotApiClient;
+use super::SnapshotUploadProgress;
+use super::SourcePreparationStep;
+use super::MAX_BACKFILL_FILES_PER_SOURCE;
+
+/// Stage 1 (K1 a″, K2/P-1): what a Codex continuation page needs from the
+/// ordinary prepare of the cycle that minted its ticket. The attribution
+/// context is that cycle's own, moved out of its preparation, never copied
+/// or re-decoded; the policy copies (hint, upload policy, receipt client)
+/// carry no raw key. A ticket holds these for at most its fixed lifetime
+/// (`continuation::ticket_lifetime`) and drops them, zeroizing the key, on
+/// every other end. Charged as process-retained memory
+/// (`continuation::retained_bound`).
+pub(super) struct ContinuationInputs {
+    pub(super) codex_preludes: std::sync::Arc<crate::codex_prelude_footprint::CodexPreludeFeed>,
+    pub(super) codex_versions: std::sync::Arc<crate::snapshots::codex_version::CodexVersionFeed>,
+    pub(super) account_witness: [u8; 32],
+    pub(super) activity_hint: crate::snapshot_client::ActivityHintResponse,
+    pub(super) receipt_window_days: u64,
+    pub(super) cache_observations_enabled: bool,
+    /// The one status input a continuation page reads: its finish never runs.
+    pub(super) codex_scan_homes: Vec<PathBuf>,
+    pub(super) attribution_context: Option<SessionAttributionContext>,
+    pub(super) upload_policy: SnapshotUploadPolicy,
+    pub(super) upload_destination_namespace: String,
+    pub(super) receipt_client: SnapshotApiClient,
+    pub(super) index_path: PathBuf,
+    pub(super) upload_progress_path: PathBuf,
+    pub(super) evidence: Option<crate::snapshots::CodexContinuationEvidence>,
+    pub(super) runtime_context: continuation::RuntimeContext,
+}
+
+crate::heap_layout_bound::fields!(ContinuationInputs; codex_preludes, account_witness, activity_hint,
+    receipt_window_days, cache_observations_enabled,
+    codex_scan_homes, attribution_context, upload_policy,
+    upload_destination_namespace, receipt_client, index_path, upload_progress_path, evidence, runtime_context; shared codex_versions);
+
+impl ContinuationInputs {
+    /// Whether the moved attribution context is present (tests read this
+    /// instead of the context itself).
+    #[cfg(test)]
+    pub(super) fn holds_attribution(&self) -> bool {
+        self.attribution_context.is_some()
+    }
+}
+
+pub(super) fn continuation_finish_inputs<'a>(
+    preparation: &'a mut SourcePreparation,
+    scan: &'a mut SourceScanResult,
+    remaining: Option<usize>,
+    codex_preludes: &'a std::sync::Arc<crate::codex_prelude_footprint::CodexPreludeFeed>,
+    codex_versions: std::sync::Arc<crate::snapshots::codex_version::CodexVersionFeed>,
+) -> impl FnOnce(continuation::ContinuationTicket) -> Option<continuation::ContinuationTicket> + 'a
+{
+    move |ticket| {
+        let evidence = scan.take_continuation_evidence()?;
+        let mut inputs = take_continuation_inputs(preparation, codex_preludes, codex_versions);
+        inputs.evidence = Some(evidence);
+        let refusal = remaining.map_or("no_remaining", |_| "over_bound");
+        let ticket = remaining.and_then(|limit| ticket.with_inputs(inputs, limit));
+        crate::local_resource_diagnostics::codex_continuation_mint(
+            ticket.as_ref().map_or(refusal, |_| "minted"),
+        );
+        ticket
+    }
+}
+
+/// Stage 1 (K2): the continuation inputs of a just-finished ordinary Codex
+/// page, taken before its finish. `finish_sync_source` never reads the
+/// attribution context, so moving it out changes nothing for the finish.
+/// Called only while continuation pages are enabled and a ticket was minted.
+pub(super) fn take_continuation_inputs(
+    preparation: &mut SourcePreparation,
+    codex_preludes: &std::sync::Arc<crate::codex_prelude_footprint::CodexPreludeFeed>,
+    codex_versions: std::sync::Arc<crate::snapshots::codex_version::CodexVersionFeed>,
+) -> ContinuationInputs {
+    let mut activity_hint = preparation.activity_hint.clone();
+    // The prepare took the raw key out of its hint already; never keep one.
+    if let Some(mut key) = activity_hint.session_attribution_hmac_key.take() {
+        key.zeroize();
+    }
+    ContinuationInputs {
+        codex_preludes: std::sync::Arc::clone(codex_preludes),
+        codex_versions,
+        evidence: None,
+        runtime_context: continuation::runtime_context(),
+        account_witness: preparation.account_witness,
+        activity_hint,
+        receipt_window_days: preparation.receipt_window_days,
+        cache_observations_enabled: preparation.cache_observations_enabled,
+        codex_scan_homes: preparation
+            .scan_agent_status_collection
+            .as_ref()
+            .map(|collection| collection.codex_scan_homes.clone())
+            .unwrap_or_default(),
+        attribution_context: preparation.attribution_context.take(),
+        upload_policy: preparation.upload_policy,
+        upload_destination_namespace: preparation.upload_destination_namespace.clone(),
+        receipt_client: preparation.receipt_client.clone(),
+        index_path: preparation.index_path.clone(),
+        upload_progress_path: preparation.upload_progress_path.clone(),
+    }
+}
+
+/// Stage 1 (K1.1): why a continuation page refused before reading any
+/// transcript. Each state changes only through an ordinary prepare, so the
+/// paused job waits in its slot for the ordinary pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ContinuationRefusal {
+    HistoricalReplay,
+    AdmissionReoffer,
+    LegacySettlement,
+    UploadClaim,
+    ReasonReoffer,
+    EvidenceChanged,
+}
+
+impl ContinuationRefusal {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::HistoricalReplay => "historical_replay_pending",
+            Self::AdmissionReoffer => "admission_reoffer_pending",
+            Self::LegacySettlement => "legacy_settlement_pending",
+            Self::UploadClaim => "upload_progress_claim_needed",
+            Self::ReasonReoffer => "reason_reoffer_active",
+            Self::EvidenceChanged => "continuation_evidence_changed",
+        }
+    }
+}
+
+/// Stage 1 (K1, ruled a″): whether this cycle's ordinary prepare would claim
+/// an upload-progress generation or lease a retry or re-offer (and save that
+/// claim). Pure: it runs the ordinary selection on a copy, so its answer is
+/// the mutating function's by construction, and nothing is persisted.
+pub(super) fn continuation_upload_claim_needed(
+    upload_progress: &SnapshotUploadProgress,
+    index: &ScanIndex,
+    replay_generation: &str,
+    reoffer: &reason_reoffer::Scope<'_>,
+) -> bool {
+    let mut probe = upload_progress.clone();
+    prepare_upload_progress_for_cycle_with_reoffer(
+        &mut probe,
+        index,
+        replay_generation,
+        false,
+        Some(reoffer),
+    )
+}
+
+/// How a continuation page's scan ended, on the worker.
+pub(super) enum ContinuationScan {
+    /// Refused before any transcript read: nothing was stepped or saved.
+    Refused(ContinuationRefusal),
+    /// The scan's own local admission refused a step.
+    StepRefused,
+    /// Completed without committing its job. `ticket` is the byte-budget
+    /// pause's new ticket; `snapshots` how many snapshots the page produced
+    /// (zero on every valid non-EOF end, K7.1). Nothing was saved.
+    Uncommitted {
+        ticket: Option<crate::snapshots::CodexCursorTicket>,
+        snapshots: usize,
+    },
+}
+
+pub(super) fn run_continuation_scan(
+    home: &Path,
+    support_dir: &Path,
+    cache: &std::sync::Arc<crate::snapshots::sampled_scan::SharedCache>,
+    inputs: &mut ContinuationInputs,
+    ordinary_equivalent: Option<Duration>,
+    deadline: Instant,
+) -> Result<ContinuationScan> {
+    let current = continuation::runtime_context();
+    let contexts = |value: continuation::RuntimeContext| value.map(|slot| slot.map(|v| v.0));
+    let held = if contexts(inputs.runtime_context) != contexts(current) {
+        "context_changed"
+    } else if inputs.runtime_context != current {
+        "policy_changed"
+    } else if inputs.evidence.is_none() {
+        "other"
+    } else {
+        "roster_changed"
+    };
+    if inputs.runtime_context != current
+        || !inputs
+            .evidence
+            .as_ref()
+            .is_some_and(|evidence| evidence.content_unchanged())
+    {
+        crate::local_resource_diagnostics::codex_continuation(Some(held));
+        return Ok(ContinuationScan::Refused(
+            ContinuationRefusal::EvidenceChanged,
+        ));
+    }
+    let mut preparation = match prepare_continuation_source(
+        home,
+        support_dir,
+        cache,
+        inputs,
+        ordinary_equivalent,
+        deadline,
+    )
+    .inspect_err(|_| crate::local_resource_diagnostics::codex_continuation(Some("other")))?
+    {
+        Ok(preparation) => preparation,
+        Err(reason) => {
+            crate::local_resource_diagnostics::codex_continuation(Some("other"));
+            return Ok(ContinuationScan::Refused(reason));
+        }
+    };
+    crate::local_resource_diagnostics::codex_continuation(None);
+    loop {
+        match preparation.step() {
+            SourcePreparationStep::Pending(next) => preparation = next,
+            SourcePreparationStep::Refused(mut refused, _) => {
+                crate::local_resource_diagnostics::codex_continuation(Some("other"));
+                inputs.attribution_context = refused.attribution_context.take();
+                return Ok(ContinuationScan::StepRefused);
+            }
+            SourcePreparationStep::Complete {
+                mut preparation,
+                index: _,
+                mut scan,
+            } => {
+                inputs.evidence = scan.take_continuation_evidence();
+                inputs.attribution_context = preparation.attribution_context.take();
+                return Ok(ContinuationScan::Uncommitted {
+                    ticket: scan.continuation_ticket().cloned(),
+                    snapshots: scan.snapshots.len(),
+                });
+            }
+        }
+    }
+}
+
+/// Stage 1 (K1, ruled a″): the continuation-local prepare. It is not
+/// `prepare_sync_source`'s tail: it takes no watcher hint, spends no
+/// per-cycle budget, saves nothing and never resets the index. Every state
+/// that would need one of those refuses first, before C14 or any transcript
+/// read (K1.1). The rest follows the ordinary prepare's order on the freshly
+/// loaded index and upload progress, with the same-cycle cached inputs. On
+/// `Ok(Ok(..))` the attribution context has moved into the preparation; on a
+/// refusal it is still in `inputs`.
+pub(super) fn prepare_continuation_source(
+    home: &Path,
+    support_dir: &Path,
+    cache: &std::sync::Arc<crate::snapshots::sampled_scan::SharedCache>,
+    inputs: &mut ContinuationInputs,
+    ordinary_equivalent: Option<Duration>,
+    deadline: Instant,
+) -> Result<std::result::Result<SourcePreparation, ContinuationRefusal>> {
+    let source = SnapshotSource::Codex;
+    let scan_started_at = current_rfc3339();
+    let checkpoint_namespace = inputs
+        .attribution_context
+        .as_ref()
+        .map(SessionAttributionContext::checkpoint_namespace);
+    let upload_context = cycle_upload_context(
+        inputs.upload_policy,
+        checkpoint_namespace.as_deref(),
+        inputs.cache_observations_enabled,
+    );
+    let (mut index, _) =
+        ScanIndex::load_for_snapshot_source_with_origin(&inputs.index_path, source, support_dir)?;
+    index.require_persistence_available()?;
+    let mut upload_progress = SnapshotUploadProgress::load_for_index(
+        &index,
+        &inputs.index_path,
+        &inputs.upload_progress_path,
+        &inputs.upload_destination_namespace,
+        crate::snapshots::snapshot_quarantine_witness_for_context(source, &upload_context),
+    )?;
+    upload_progress.configure_ack_capacity(&index);
+    let backfill_state = load_backfill_state(support_dir);
+    let replay_generation = cycle_replay_generation(source, &inputs.upload_destination_namespace);
+    if backfill_replay_pending(
+        source,
+        &backfill_state,
+        &inputs.upload_destination_namespace,
+    ) {
+        return Ok(Err(ContinuationRefusal::HistoricalReplay));
+    }
+    if index.snapshot_admission_reoffer_pending() {
+        return Ok(Err(ContinuationRefusal::AdmissionReoffer));
+    }
+    if index.legacy_settlement_ledger_needs_migration()
+        || !index
+            .legacy_settlement_reconciliation_pending_fingerprints()
+            .is_empty()
+    {
+        return Ok(Err(ContinuationRefusal::LegacySettlement));
+    }
+    let reoffer_now = reason_reoffer::now_unix_seconds();
+    let claim_needed = continuation_upload_claim_needed(
+        &upload_progress,
+        &index,
+        &replay_generation,
+        &reason_reoffer::Scope {
+            index: &index,
+            now: reoffer_now,
+            window_start_unix_seconds: reoffer_now
+                .saturating_sub(inputs.receipt_window_days.saturating_mul(86_400)),
+        },
+    );
+    if claim_needed {
+        return Ok(Err(ContinuationRefusal::UploadClaim));
+    }
+    activate_source_upload_context(source, upload_context, &mut index, &mut upload_progress);
+    // The ordinary selection's in-memory effects, on this page's own copy;
+    // the probe above found no claim, so there is nothing to save.
+    let claimed = prepare_upload_progress_for_cycle_with_reoffer(
+        &mut upload_progress,
+        &index,
+        &replay_generation,
+        false,
+        Some(&reason_reoffer::Scope {
+            index: &index,
+            now: reoffer_now,
+            window_start_unix_seconds: reoffer_now
+                .saturating_sub(inputs.receipt_window_days.saturating_mul(86_400)),
+        }),
+    );
+    if claimed {
+        return Ok(Err(ContinuationRefusal::UploadClaim));
+    }
+    if !upload_progress.active_reason_reoffers.is_empty() {
+        return Ok(Err(ContinuationRefusal::ReasonReoffer));
+    }
+    index.activate_effective_upload_body_witness_revision(cycle_body_witness_revision(source));
+    // K3: as the ordinary prepare, before the scan advances it. It is dropped
+    // here unless the page commits, and crosses to the parent only by move.
+    crate::local_resource_diagnostics::index_clone_start(source.api_slug());
+    let committed_index = index.clone();
+    // No lease is active (refused above), so this only installs the empty
+    // set, as the ordinary prepare does; there are no hint paths to take.
+    let leased_paths =
+        index.activate_reason_reoffer_retries(upload_progress.active_reason_reoffers.clone());
+    debug_assert!(leased_paths.is_empty());
+    index.activate_reason_reoffer_cooldowns(upload_progress.reason_reoffer_cooldowns(reoffer_now));
+    stale_owed::rearm_held_probe_once(source, &upload_progress, &mut index);
+    upload_progress.reselect_pending_cache_heads(&mut index, inputs.cache_observations_enabled);
+    let roots = crate::snapshot_roots::scan_roots(source, home, &inputs.codex_scan_homes)?;
+    // K5: reuse the ordinary page's namespace and durable pass, including GC/breaker state.
+    let sampled_scope = cycle_sampled_scope(
+        &inputs.account_witness,
+        &inputs.upload_destination_namespace,
+        &inputs.index_path,
+        false,
+    );
+    let scan = crate::snapshots::OwnedSourceScan::new_continuation(
+        &roots,
+        index,
+        &scan_started_at,
+        scan_request_window_days(inputs.receipt_window_days, false),
+        MAX_BACKFILL_FILES_PER_SOURCE,
+        ordinary_equivalent,
+        inputs.evidence.take(),
+    )
+    .with_continuation_deadline(deadline)
+    .with_sampled_acquisition(std::sync::Arc::clone(cache), sampled_scope)
+    .with_launch_events(home)
+    .with_line_observer("codex_prelude", inputs.codex_preludes.observer(&roots))
+    .with_codex_versions(inputs.codex_versions.clone());
+    Ok(Ok(SourcePreparation {
+        retry_authority: None,
+        source,
+        claude_scan_roots: None,
+        account_witness: inputs.account_witness,
+        scan_started_at,
+        activity_hint: inputs.activity_hint.clone(),
+        receipt_window_days: inputs.receipt_window_days,
+        cache_observations_enabled: inputs.cache_observations_enabled,
+        scan_agent_status_collection: None,
+        attribution_context: inputs.attribution_context.take(),
+        upload_policy: inputs.upload_policy,
+        upload_destination_namespace: inputs.upload_destination_namespace.clone(),
+        receipt_client: inputs.receipt_client.clone(),
+        index_path: inputs.index_path.clone(),
+        upload_progress_path: inputs.upload_progress_path.clone(),
+        upload_progress,
+        committed_index,
+        backfill_state,
+        backfill_pending: false,
+        legacy_reconciliation_pending: BTreeSet::new(),
+        active_legacy_reconciliation: BTreeSet::new(),
+        scan: Some(scan),
+    }))
 }
