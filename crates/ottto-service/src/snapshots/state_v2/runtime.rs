@@ -127,7 +127,7 @@ impl Hold {
 struct RouteState {
     import_pause: Option<Pause>,
     latched: bool,
-    pending_publication: Option<Identity>,
+    pending_publication: Option<(Identity, Option<fence::InputStamp>)>,
     inventory_ready: bool,
     original: Option<import::Original>,
     runtimes: Vec<std::sync::Weak<Runtime>>,
@@ -338,8 +338,9 @@ fn load_with_custody(
     let mut load_started = None;
     let result = held(with_state(path, |state| {
         if state.latched {
-            if let Some(identity) = &state.pending_publication {
+            if let Some((identity, input)) = &state.pending_publication {
                 if fence::read(path)?.is_none() {
+                    ensure!(fence::input_stamp(path)? == *input, Hold::DbUnavailable);
                     if let Some(original) = &state.original {
                         original.unchanged()?;
                         original.verify_baseline(path)?;
@@ -593,6 +594,27 @@ pub(in super::super) fn after_v1_locked(path: &Path, index: &mut ScanIndex) -> R
         state.save_digests = Some(digests);
         Ok(())
     })
+}
+/// Caller has authorized a legacy rebuild and retains CheckpointLock. Fresh
+/// publication never adopts a second runtime; the next ordinary load does.
+pub(in super::super) fn publish_rebuilt_locked(path: &Path, index: &ScanIndex) -> Result<()> {
+    binding_for(path)?;
+    with_state(path, |state| {
+        state.original = None;
+        import::publish_graph(
+            path,
+            index,
+            &import::Original::default(),
+            0,
+            &mut state.latched,
+            &mut state.pending_publication,
+        )?;
+        Ok(())
+    })
+    .map_err(Hold::storage)
+}
+pub(in super::super) fn fence_published(path: &Path) -> bool {
+    fence::read(path).ok().flatten().is_some()
 }
 fn binding_for(path: &Path) -> Result<super::super::scan_index_persistence::Binding> {
     binding(path).ok_or_else(|| Hold::ForeignBinding.into())

@@ -86,7 +86,7 @@ pub(super) fn publish_graph(
     original: &Original,
     generation: u64,
     latched: &mut bool,
-    pending: &mut Option<Identity>,
+    pending: &mut Option<(Identity, Option<fence::InputStamp>)>,
 ) -> Result<KindCx> {
     original.unchanged()?;
     telemetry::event(
@@ -108,7 +108,7 @@ pub(super) fn publish_graph(
     db.control("identity", &identity)?;
     db.control("generation", &index.generation)?;
     let cx = map_graph_at(&mut db, index, original, generation)?;
-    *pending = Some(identity.clone());
+    *pending = Some((identity.clone(), fence::input_stamp(path)?));
     original.publish_import(path, &identity, db, latched)?;
     *pending = None;
     Ok(cx)

@@ -243,6 +243,32 @@ pub(super) fn reconcile(
     Ok(Some((identity, final_db)))
 }
 
+/// The locked input's OS identity, including mutation clocks. Rebuilt graphs
+/// retain this proof across a returned pre-rename failure, including a missing
+/// quarantine root. A changed root never grants publication authority.
+#[derive(PartialEq, Eq)]
+pub(super) struct InputStamp(u64, u64, u64, i64, i64, i64, i64);
+pub(super) fn input_stamp(path: &Path) -> Result<Option<InputStamp>> {
+    let m = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    ensure!(
+        m.is_file() && m.uid() == unsafe { libc::geteuid() },
+        Hold::DbUnavailable
+    );
+    Ok(Some(InputStamp(
+        m.dev(),
+        m.ino(),
+        m.len(),
+        m.mtime(),
+        m.mtime_nsec(),
+        m.ctime(),
+        m.ctime_nsec(),
+    )))
+}
+
 /// Retry only this process's authenticated, fully verified staged publication.
 /// The caller retains CheckpointLock and the original input commitments.
 pub(super) fn resume_publication(path: &Path, identity: &Identity) -> Result<()> {
