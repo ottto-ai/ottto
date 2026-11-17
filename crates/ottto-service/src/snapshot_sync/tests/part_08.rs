@@ -35,6 +35,7 @@ fn codex_union_capture_failure_holds_only_protected_group_and_preserves_cas() {
             let index_path = root.join("index.json");
             let progress_path = root.join("progress.json");
             let mut committed = ScanIndex::default();
+            committed.activate_quarantine_witness(SnapshotSource::Codex);
             committed.save_fixture(&index_path).unwrap();
             let mut working = committed.clone();
             let mut result = prepare_codex_union_fixture(&root, &mut working);
@@ -100,6 +101,7 @@ fn codex_union_native_transport_partial_rejection_keeps_capture_and_quarantine_g
         let index_path = root.join("index.json");
         let progress_path = root.join("progress.json");
         let mut baseline = ScanIndex::default();
+        baseline.activate_quarantine_witness(SnapshotSource::Codex);
         baseline.save_fixture(&index_path).unwrap();
         let mut working = baseline.clone();
         let mut result = prepare_codex_union_fixture(&root, &mut working);
@@ -611,6 +613,7 @@ impl SameSourceAckFixture {
         let index_path = root.join("boundary-index.json");
         let progress_path = root.join("boundary-progress.json");
         let (mut baseline, mut working, mut progress) = Self::fresh_state(&root);
+        baseline.activate_quarantine_witness(SnapshotSource::Codex);
         baseline.save_fixture(&index_path).unwrap();
         let mut items = Self::prepare(&root, &mut working, None).snapshots;
         items.sort_by(|a, b| a.source_session_id.cmp(&b.source_session_id));

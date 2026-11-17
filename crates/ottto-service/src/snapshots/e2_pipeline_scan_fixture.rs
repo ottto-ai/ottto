@@ -136,6 +136,14 @@ pub(crate) fn load_source_for_test(
     support: &Path,
 ) -> Result<(ScanIndex, ScanIndexLoadOrigin)> {
     match ScanIndex::load_for_snapshot_source_with_origin(path, source, support) {
+        Ok((index, origin)) if origin == ScanIndexLoadOrigin::Quarantined => {
+            // Legacy quarantine authorizes a fresh rebuilt graph. The fixture
+            // publishes it natively before the next collection pass.
+            assert_eq!(index.generation, 0);
+            let mut native = seed_index_at_generation(&index, path, Some(0));
+            carry_runtime(&index, &mut native);
+            Ok((native, origin))
+        }
         Err(error)
             if error.downcast_ref::<state_v2::Hold>() == Some(&state_v2::Hold::ReloadRequired)
                 && state_v2::published(path).unwrap_or(false) =>
@@ -167,6 +175,10 @@ pub(crate) fn mutate_index_for_test(path: &Path, mutate: impl FnOnce(&mut serde_
 /// Explicit native seed for decoder fixtures whose original bytes deliberately
 /// fail the production inventory gate. This never runs on a daemon load/save.
 pub(crate) fn seed_index_for_test(index: &ScanIndex, path: &Path) -> ScanIndex {
+    seed_index_at_generation(index, path, None)
+}
+
+fn seed_index_at_generation(index: &ScanIndex, path: &Path, generation: Option<u64>) -> ScanIndex {
     bind_input_for_test(index, path);
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     let retained = state_v2::money_test_support::FixtureProgress::capture(path);
@@ -185,8 +197,13 @@ pub(crate) fn seed_index_for_test(index: &ScanIndex, path: &Path) -> ScanIndex {
     })
     .unwrap();
     state_v2::erase_published(path);
-    let loaded =
-        state_v2::money_test_support::publish_retaining_progress(index, path, &progress, &retained);
+    let loaded = state_v2::money_test_support::publish_fixture_at_generation(
+        index,
+        path,
+        &progress,
+        &retained,
+        generation.unwrap_or(index.generation + 1),
+    );
     assert!(
         state_v2::money_test_support::FixtureProgress::capture(path) == retained,
         "index-only fixture mutation preserves every progress row"

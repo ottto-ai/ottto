@@ -418,7 +418,9 @@ fn permanent_finish_pipeline(outcome: FinishOutcome) {
         assert!(saved
             .quarantined_snapshot_fingerprints
             .contains_key(fingerprint));
-        let progress = SnapshotUploadProgress::load(
+        let progress = SnapshotUploadProgress::load_for_index(
+            &ScanIndex::load(&index_path).unwrap(),
+            &index_path,
             &progress_path,
             &snapshot_upload_destination_namespace(&device, "device-secret"),
             snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
@@ -741,7 +743,9 @@ fn permanent_finish_dominated_refusal_with_pending_newer_body_is_not_success() {
                 .unwrap()
                 .to_string()
         };
-        let progress = SnapshotUploadProgress::load(
+        let progress = SnapshotUploadProgress::load_for_index(
+            &ScanIndex::load(&index_path).unwrap(),
+            &index_path,
             &progress_path,
             &snapshot_upload_destination_namespace(&device, "device-secret"),
             snapshot_quarantine_witness(SnapshotSource::ClaudeCode),

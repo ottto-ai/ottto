@@ -496,22 +496,23 @@ impl ReofferPipeline {
                 &mut self.retry,
             )
         });
-        let progress_json = std::fs::read(&progress_path)
-            .ok()
-            .map(|bytes| serde_json::from_slice(&bytes).unwrap())
-            .unwrap_or(serde_json::Value::Null);
+        let index = ScanIndex::load(&index_path).unwrap();
+        let progress = SnapshotUploadProgress::load_for_index(
+            &index,
+            &index_path,
+            &progress_path,
+            &snapshot_upload_destination_namespace(&self.device, "device-secret"),
+            snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+        )
+        .unwrap();
+        let progress_json = serde_json::to_value(&progress).unwrap();
         CycleResult {
             result,
             census_window_end,
             leased_offers,
             cache_enabled,
-            index: ScanIndex::load(&index_path).unwrap(),
-            progress: SnapshotUploadProgress::load(
-                &progress_path,
-                &snapshot_upload_destination_namespace(&self.device, "device-secret"),
-                snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
-            )
-            .unwrap(),
+            index,
+            progress,
             progress_json,
             progress_path,
             index_path,
@@ -1990,7 +1991,9 @@ fn missing_published_index_with_claim_only_ledger_refuses_without_reread() {
     // A settled bootstrap leaves no ledger file. Recreate a claim-only ledger,
     // but keep the real published-root witness: this is loss AFTER publication,
     // not a first install killed before publication.
-    let mut claim = SnapshotUploadProgress::load(
+    let mut claim = SnapshotUploadProgress::load_for_index(
+        &first.index,
+        &first.index_path,
         &first.progress_path,
         &snapshot_upload_destination_namespace(&pipeline.device, "device-secret"),
         snapshot_quarantine_witness(SnapshotSource::ClaudeCode),

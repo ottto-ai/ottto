@@ -113,7 +113,9 @@ fn relogin_alias_keeps_accepted_history_without_a_reread() {
         .accepted_snapshot_fingerprint_recorded(&accepted));
     let namespace = snapshot_upload_destination_namespace(&device_a, "secret-a");
     let ledger = || {
-        SnapshotUploadProgress::load(
+        SnapshotUploadProgress::load_for_index(
+            &ScanIndex::load(&index_path).unwrap(),
+            &index_path,
             &progress_path,
             &namespace,
             snapshot_quarantine_witness(SnapshotSource::ClaudeCode),

@@ -255,12 +255,23 @@ pub(crate) fn publish_retaining_progress(
     progress: &[u8],
     retained: &FixtureProgress,
 ) -> ScanIndex {
+    publish_fixture_at_generation(index, path, progress, retained, index.generation + 1)
+}
+
+/// Fresh quarantine fixtures keep the production rebuild's generation zero.
+pub(crate) fn publish_fixture_at_generation(
+    index: &ScanIndex,
+    path: &Path,
+    progress: &[u8],
+    retained: &FixtureProgress,
+    generation: u64,
+) -> ScanIndex {
     let binding = super::super::scan_index_integration::scan_index_storage_binding(path).unwrap();
     let identity = Identity {
         format: FORMAT,
         db_id: "synthetic-partial-checkpoint".into(),
         binding: binding.clone(),
-        fence_generation: index.generation + 1,
+        fence_generation: generation,
     };
     let mut db = sqlite::Sqlite::create_import(&fence::sibling(path, ".v2.sqlite.import")).unwrap();
     db.control("identity", &identity).unwrap();

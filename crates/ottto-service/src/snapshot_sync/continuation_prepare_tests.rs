@@ -76,16 +76,18 @@ impl ContinuationFixture {
 
     fn load(&self) -> (SnapshotUploadProgress, ScanIndex) {
         let source = SnapshotSource::Codex;
-        let progress = SnapshotUploadProgress::load(
-            &self.upload_progress_path,
-            CONTINUATION_NAMESPACE,
-            snapshot_quarantine_witness(source),
-        )
-        .unwrap();
         let (index, _) = ScanIndex::load_for_snapshot_source_with_origin(
             &self.index_path,
             source,
             &self.support_dir,
+        )
+        .unwrap();
+        let progress = SnapshotUploadProgress::load_for_index(
+            &index,
+            &self.index_path,
+            &self.upload_progress_path,
+            CONTINUATION_NAMESPACE,
+            snapshot_quarantine_witness(source),
         )
         .unwrap();
         (progress, index)
@@ -126,6 +128,8 @@ impl ContinuationFixture {
     fn disk(&self) -> Vec<Option<Vec<u8>>> {
         [
             self.index_path.clone(),
+            self.index_path.with_extension("json.v2.sqlite"),
+            self.index_path.with_extension("json.v2.sqlite-wal"),
             self.upload_progress_path.clone(),
             crate::backfill::backfill_state_path(&self.support_dir),
         ]

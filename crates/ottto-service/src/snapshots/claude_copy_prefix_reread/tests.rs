@@ -514,7 +514,7 @@ fn twin_setup(name: &str) -> (PathBuf, PathBuf, ScanIndex, PathBuf, BTreeSet<Pat
     for entry in index.files.values_mut() {
         entry.effective_upload_body_witness_revision = 3;
     }
-    index.save_fixture(&home.join("scan-index.json")).unwrap();
+    e2_pipeline_scan_fixture::save_for_test(&mut index, &home.join("scan-index.json"));
     let family = claude_index_path_member_ref(&main).unwrap().root;
     let expected = index
         .files
