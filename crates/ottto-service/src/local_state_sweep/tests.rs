@@ -324,17 +324,10 @@ fn scan_index_save_in_progress_is_never_disturbed() {
     }
     let f = fixture();
     let path = f.dest.join(format!("{INDEX}.json"));
-    // The generation-1 state the saver loaded before saving.
-    let seed_dir = ScratchDir::new("local-state-sweep-seed");
-    let seed = seed_dir.join(format!("{INDEX}.json"));
-    ScanIndex::default().save(&seed).expect("seed save");
-    let seed_bytes = fs::read(&seed).unwrap();
-    let mut saver = ScanIndex::load(&seed).expect("seed load");
+    // The saver loads generation 1 from this destination's own native store.
+    ScanIndex::default().save(&path).expect("seed save");
+    let mut saver = ScanIndex::load(&path).expect("seed load");
     assert_eq!(saver.generation, 1);
-    write(&f.dest.join(format!("{INDEX}.lock")), b"");
-    // Pause the real save after flock acquisition on a seekable canonical
-    // file. The lenient boundary deliberately refuses non-seekable inputs.
-    write(&path, &seed_bytes);
     let in_flight = f.dest.join(pid_temp(INDEX, std::process::id() as i32));
     write(&in_flight, b"partial");
     let orphan = f.dest.join(pid_temp(INDEX, DEAD_PID));

@@ -51,11 +51,15 @@ struct ContinuationFixture {
 impl ContinuationFixture {
     fn quiescent(name: &str) -> Self {
         let root = test_dir(name);
+        let index_path = root
+            .join("snapshots/destinations")
+            .join(CONTINUATION_NAMESPACE)
+            .join("codex-index.json");
         let fixture = Self {
             home: root.join("home"),
             support_dir: root.join("support"),
-            index_path: root.join("codex-index.json"),
-            upload_progress_path: root.join("codex-upload-progress.json"),
+            upload_progress_path: snapshot_upload_progress_path(&index_path),
+            index_path,
         };
         std::fs::create_dir_all(&fixture.home).unwrap();
         std::fs::create_dir_all(&fixture.support_dir).unwrap();

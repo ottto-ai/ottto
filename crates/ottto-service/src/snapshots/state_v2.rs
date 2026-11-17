@@ -664,3 +664,6 @@ pub(in crate::snapshots) fn seed_0217_archive_for_test(index: &ScanIndex, key: &
         );
     });
 }
+
+#[cfg(test)]
+pub(super) use runtime::erase_published;

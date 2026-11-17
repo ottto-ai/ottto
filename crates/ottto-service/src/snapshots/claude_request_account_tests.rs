@@ -437,8 +437,7 @@ fn claude_p92_mixed_body_capability_and_restart_refusals() {
         "fresh eligibility does not mint acceptance"
     );
     let index_path = dir.join("index.json");
-    index.save(&index_path).unwrap();
-    let mut restarted = ScanIndex::load(&index_path).unwrap();
+    let mut restarted = e2_pipeline_scan_fixture::save_reload_for_test(&mut index, &index_path);
     restarted = crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(restarted);
     assert!(
         restarted

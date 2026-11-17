@@ -33,6 +33,171 @@ fn fixture_routes() -> &'static Mutex<BTreeSet<PathBuf>> {
     ROUTES.get_or_init(Default::default)
 }
 
+fn fixture_bindings() -> &'static Mutex<BTreeMap<PathBuf, scan_index_persistence::Binding>> {
+    static BINDINGS: std::sync::OnceLock<
+        Mutex<BTreeMap<PathBuf, scan_index_persistence::Binding>>,
+    > = std::sync::OnceLock::new();
+    BINDINGS.get_or_init(Default::default)
+}
+
+/// Synthetic checkpoint names keep their fixture-owned temporary location.
+/// The production binding recognizer never accepts these aliases.
+pub(super) fn fixture_binding(path: &Path) -> Option<scan_index_persistence::Binding> {
+    fixture_bindings().lock().unwrap().get(path).cloned()
+}
+
+pub(crate) fn prepare_fixture_save(index: &mut ScanIndex, path: &Path) -> Result<()> {
+    let synthetic = fixture_binding(path).is_some()
+        || scan_index_integration::scan_index_storage_binding(path).is_none();
+    bind_input_for_test(index, path);
+    if index.v2().persistence_v2.is_none()
+        || (synthetic && route_of(index).as_deref() != Some(path))
+    {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let binding = scan_index_integration::scan_index_storage_binding(path).unwrap();
+        let baseline = ScanIndex::load_for_snapshot_source_with_origin(
+            path,
+            binding.source.snapshot(),
+            &path.parent().unwrap().join("fixture-support"),
+        )?
+        .0;
+        anyhow::ensure!(
+            baseline.v2().persistence_v2.is_some(),
+            "fixture_requires_native_custody"
+        );
+        index.retain_persistence_baseline_from(&baseline);
+        index.generation = baseline.generation;
+        E2ScanFixture::register_route_for_test(path);
+    }
+    Ok(())
+}
+
+/// Name the fixture's synthetic destination before a legacy admission assertion.
+pub(crate) fn bind_input_for_test(index: &ScanIndex, path: &Path) {
+    if scan_index_integration::scan_index_storage_binding(path).is_none() {
+        let source = route_of(index)
+            .and_then(|route| scan_index_integration::scan_index_storage_binding(&route))
+            .map(|binding| binding.source)
+            .unwrap_or_else(|| {
+                let name = path.file_name().unwrap().to_string_lossy();
+                if name.contains("codex") {
+                    scan_index_persistence::Source::Codex
+                } else if name.contains("pi-") {
+                    scan_index_persistence::Source::Pi
+                } else {
+                    scan_index_persistence::Source::Claude
+                }
+            });
+        fixture_bindings().lock().unwrap().insert(
+            path.to_owned(),
+            scan_index_persistence::Binding {
+                source,
+                namespace_hash: "a".repeat(64),
+            },
+        );
+    }
+}
+
+/// Install a new synthetic legacy input; never overwrite live native custody.
+pub(crate) fn legacy_input_for_test(path: &Path, bytes: &[u8]) {
+    bind_input_for_test(&ScanIndex::default(), path);
+    state_v2::erase_published(path);
+    ottto_core::write_owner_only_file_atomic(path, bytes).unwrap();
+}
+
+/// Model the next ordinary pass after quarantine/Repair published its G=0 store.
+pub(crate) fn load_source_for_test(
+    path: &Path,
+    source: SnapshotSource,
+    support: &Path,
+) -> Result<(ScanIndex, ScanIndexLoadOrigin)> {
+    match ScanIndex::load_for_snapshot_source_with_origin(path, source, support) {
+        Err(error)
+            if error.downcast_ref::<state_v2::Hold>() == Some(&state_v2::Hold::ReloadRequired)
+                && state_v2::published(path).unwrap_or(false) =>
+        {
+            ScanIndex::load_for_snapshot_source_with_origin(path, source, support)
+        }
+        result => result,
+    }
+}
+
+/// Replace synthetic persisted state through the native mapper. Decoder tests
+/// supply legacy bytes, but never overwrite a published fence with those bytes.
+pub(crate) fn seed_json_for_test(path: &Path, bytes: &[u8]) -> ScanIndex {
+    let mut index = lenient_decode::read(std::io::Cursor::new(bytes), "load", "unattributed")
+        .expect("admitted decoder fixture");
+    // The mapper's fixture publication commits seed G+1. Keep an existing
+    // fixture generation so receipt/handoff tests still isolate their damage.
+    index.generation = index.generation.saturating_sub(1);
+    bind_input_for_test(&index, path);
+    state_v2::erase_published(path);
+    seed_index_for_test(&index, path)
+}
+
+pub(crate) fn mutate_index_for_test(path: &Path, mutate: impl FnOnce(&mut serde_json::Value)) {
+    let mut value = serde_json::to_value(ScanIndex::load(path).unwrap()).unwrap();
+    mutate(&mut value);
+    seed_json_for_test(path, &serde_json::to_vec(&value).unwrap());
+}
+
+/// Explicit native seed for decoder fixtures whose original bytes deliberately
+/// fail the production inventory gate. This never runs on a daemon load/save.
+pub(crate) fn seed_index_for_test(index: &ScanIndex, path: &Path) -> ScanIndex {
+    bind_input_for_test(index, path);
+    let binding = scan_index_integration::scan_index_storage_binding(path).unwrap();
+    let progress = crate::snapshot_sync::with_state_v2_progress_lock(path, |progress_path| {
+        match fs::read(progress_path) {
+            Ok(bytes) => Ok(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(serde_json::to_vec(&serde_json::json!({
+                    "schema_version": 3,
+                    "destination_namespace_hash": binding.namespace_hash,
+                }))?)
+            }
+            Err(error) => Err(error.into()),
+        }
+    })
+    .unwrap();
+    let (store, loaded) = crate::snapshots::StateV2ColdSession::publish_at(index, path, &progress);
+    // The enclosing scratch fixture owns deletion, as for bind_fixture_route.
+    std::mem::forget(store);
+    E2ScanFixture::register_route_for_test(path);
+    loaded
+}
+
+#[test]
+fn synthetic_default_indexes_save_and_reload_through_native_custody() {
+    let scratch = crate::test_scratch::ScratchDir::canonical("fixture-native-save");
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        let path = scratch.join(format!("{}-index.json", source.api_slug()));
+        let mut index = ScanIndex {
+            historical_replay_generation: Some(source.api_slug().into()),
+            ..Default::default()
+        };
+        index.save(&path).unwrap();
+        assert_eq!(route_of(&index).as_deref(), Some(path.as_path()));
+        assert_eq!(index.generation, 1);
+        let replay = index.historical_replay_generation.clone();
+        drop(index);
+        state_v2::cold_close_for_test(&path).unwrap();
+        let restored = ScanIndex::load(&path).unwrap();
+        assert_eq!(restored.generation, 1);
+        assert_eq!(restored.historical_replay_generation, replay);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&fs::read(path).unwrap()).unwrap()
+                ["storage_format"],
+            2
+        );
+    }
+}
+
 /// Claude continues only from the state database, so an owner's retained
 /// state is its route: the prior this owner produced is committed there first,
 /// as the daemon saves between passes, and any other owner's prior moves to a
@@ -165,6 +330,18 @@ fn runtime_only(index: &ScanIndex) -> ScanIndex {
     let mut runtime = ScanIndex::default();
     carry_runtime(index, &mut runtime);
     runtime
+}
+
+/// Close every native session and staged observation before a simulated restart.
+/// Callers drop all pages that borrowed the prior before handing it over.
+pub(crate) fn cold_restart(prior: ScanIndex) -> ScanIndex {
+    let route = route_of(&prior).expect("a persisted restart prior");
+    let runtime = runtime_only(&prior);
+    drop(prior);
+    state_v2::cold_close_for_test(&route).unwrap();
+    let mut restored = ScanIndex::load(&route).unwrap();
+    carry_runtime(&runtime, &mut restored);
+    restored
 }
 
 /// `prior` published on a new fixture route under `dir`: (route, cold graph).
@@ -432,34 +609,65 @@ pub(crate) fn route_of(index: &ScanIndex) -> Option<PathBuf> {
     state_v2::runtime_path(index).ok().flatten()
 }
 
-/// A fixture's save beside its own files. A routed index commits on its route
-/// and leaves an unrouted copy at `path`: a later load from there holds no
-/// Claude continuation, so its next change reads Full.
+/// Attach a synthetic working graph to its own empty native baseline. Its
+/// first real save must still reconcile provisional ownership against empty
+/// committed state, exactly as the daemon's first pass does.
+pub(crate) fn bind_fixture_route(
+    source: SnapshotSource,
+    index: &mut ScanIndex,
+    dir: &Path,
+    namespace: &str,
+) -> PathBuf {
+    if let Some(route) = route_of(index) {
+        return route;
+    }
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = dir
+        .canonicalize()
+        .unwrap()
+        .join(format!("fixture-route-{n}"))
+        .join("snapshots/destinations")
+        .join(namespace)
+        .join(format!("{}-synthetic-scan-index.json", source.api_slug()));
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    prepare_fixture_save(index, &path).unwrap();
+    path
+}
+
+/// Commit on the native route, then encode a legacy decoder fixture at `path`.
+/// The copy has no continuation; another owner must read changed input Full.
 pub(crate) fn save_for_test(index: &mut ScanIndex, path: &Path) {
-    let Some(route) = route_of(index) else {
-        return index.save(path).unwrap();
-    };
+    let route = bind_fixture_route(
+        SnapshotSource::ClaudeCode,
+        index,
+        path.parent().unwrap(),
+        &"a".repeat(64),
+    );
     save_on_route(index, &route).unwrap();
     let mut copy = index.clone();
     copy.v2_mut().persistence_v2 = None;
-    // A fresh copy each save: its generation is the route's, not this file's.
-    let _ = fs::remove_file(path);
-    copy.generation = 0;
-    copy.save(path).unwrap();
+    copy.generation = 1;
+    let mut bytes = Vec::new();
+    lenient_decode::write_index(&mut bytes, &copy).unwrap();
+    fs::write(path, bytes).unwrap();
 }
 
-/// The same owner's save and reload between passes, as the daemon's: a
-/// routed index commits on its route and continues from it (the RAM-era
-/// fixture kept its cache across this reload); an unrouted one round-trips
-/// through `path`.
+/// Save and reload on this owner's native route; an unrouted seed is first
+/// attached to an empty store under the supplied fixture directory.
 pub(crate) fn save_reload_for_test(index: &mut ScanIndex, path: &Path) -> ScanIndex {
-    let Some(route) = route_of(index) else {
-        index.save(path).unwrap();
-        return ScanIndex::load(path).unwrap();
-    };
+    let was_routed = route_of(index).is_some();
+    let route = bind_fixture_route(
+        SnapshotSource::ClaudeCode,
+        index,
+        path.parent().unwrap(),
+        &"a".repeat(64),
+    );
     save_on_route(index, &route).unwrap();
     let mut loaded = ScanIndex::load(&route).unwrap();
-    carry_runtime(index, &mut loaded);
+    if was_routed {
+        carry_runtime(index, &mut loaded);
+    }
     loaded
 }
 
