@@ -3016,6 +3016,7 @@ fn e2_pipeline_uncopied_guard_carried_accounts() {
 fn equal_birth_carrier_never_grandfathers_its_counted_request() {
     use crate::snapshots::claude_money_birth_store::location_key;
     use crate::snapshots::claude_request_census::claude_request_hash;
+    use crate::snapshots::sampled_scan::transition_fixture::with_scan_clock;
 
     with_e2(|| {
         let copied_at = "2026-11-03T07:00:10Z";
@@ -3099,7 +3100,10 @@ fn equal_birth_carrier_never_grandfathers_its_counted_request() {
             // CS1 refreshes the ACK carrier with blank JSONL: unchanged usage
             // acquires the summed body's COPY mark before the own turn grows.
             append(&carrier, "\n");
-            let refreshed = ready(&c, &scanner, prior.clone(), 100, false);
+            let refreshed_at = crate::scan_clock::utc_seconds();
+            let refreshed = with_scan_clock(refreshed_at, || {
+                ready(&c, &scanner, prior.clone(), 100, false)
+            });
             eprintln!(
                 "counted carrier stage=refreshed carrier_first={carrier_first} bodies={}",
                 refreshed.scan.snapshots.len()
@@ -3131,7 +3135,9 @@ fn equal_birth_carrier_never_grandfathers_its_counted_request() {
 
             // Red on main without the counting-holder guard (CS1 run 43868949339).
             append(&carrier, &line(ROOT, "r2", own_at, 20));
-            let grown = ready(&c, &scanner, prior.clone(), 100, false);
+            let grown = with_scan_clock(refreshed_at + 6 * 60 * 60, || {
+                ready(&c, &scanner, prior.clone(), 100, false)
+            });
             eprintln!(
                 "counted carrier stage=grown carrier_first={carrier_first} bodies={} growth_pacing={:?}",
                 grown.scan.snapshots.len(),

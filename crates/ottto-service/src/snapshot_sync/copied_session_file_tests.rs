@@ -2,7 +2,7 @@
 use super::*;
 use crate::snapshots::claude_money_birth_store::location_key;
 use crate::snapshots::e2_pipeline_scan_fixture::{
-    origin_accepted_for_test, upload_context_proof_is_current_for_test,
+    origin_accepted_for_test, own_install_for_test, upload_context_proof_is_current_for_test,
 };
 use crate::snapshots::sampled_scan::transition_fixture::{
     money_oracle, observe_consumed, Mode, RouteResult,
@@ -233,6 +233,7 @@ fn holder_only_page_brings_its_content_twin() {
             append(&holder, &resumed(ROOT, &[D]));
             let expected = 3 + u64::from(own);
             let scanner = E2ScanFixture::default();
+            let mut again = own_install_for_test(&prior, &c.base);
             let seeded = ready(&c, &scanner, prior.clone(), 100, false);
             assert_eq!(
                 body(&seeded, ROOT).unwrap().request_count,
@@ -241,7 +242,6 @@ fn holder_only_page_brings_its_content_twin() {
             );
             // Reference: the owed copy is read first and its pull brings the
             // original, the composition of a copy-seeded page.
-            let mut again = prior.clone();
             again.activate_effective_upload_body_witness_revision(3);
             assert!(again.re_owe_effective_upload_body_witness_revision(&twin.to_string_lossy(), 2));
             let reference = ready(&c, &E2ScanFixture::default(), again, 100, false);
@@ -344,6 +344,7 @@ fn unrelated_main_and_growing_twin_pull_complete_session() {
             );
             append(&main, &resumed(ROOT, &[D]));
             let scanner = E2ScanFixture::default();
+            let mut all = own_install_for_test(&prior, &c.base);
             let mut complete = c.raw(&scanner, prior.clone(), 100, sampled, &[]);
             assert!(
                 scanner.paths().contains(&twin),
@@ -371,7 +372,6 @@ fn unrelated_main_and_growing_twin_pull_complete_session() {
             complete.enrich(&c);
             assert_eq!(body(&complete, ROOT).unwrap().request_count, 4);
             // Q's selected recovery offers both sessions, as does the all-owed oracle.
-            let mut all = prior.clone();
             owe(&mut all);
             let full = ready(&c, &E2ScanFixture::default(), all, 100, sampled);
             assert_eq!(body(&full, ROOT).unwrap().request_count, 4);
@@ -393,7 +393,7 @@ fn unrelated_main_and_growing_twin_pull_complete_session() {
                         &twin,
                         &resumed(ROOT, &[("e", "2026-08-02T07:07:10Z", RESUME_WRITER)]),
                     );
-                    let mut full_index = prior.clone();
+                    let mut full_index = own_install_for_test(&prior, &c.base);
                     // Rebuild S's complete membership; Q stays accepted on both
                     // routes and is pulled only as unchanged counting evidence.
                     full_index.activate_effective_upload_body_witness_revision(3);

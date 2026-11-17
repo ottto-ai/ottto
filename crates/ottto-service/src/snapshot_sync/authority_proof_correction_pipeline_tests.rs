@@ -423,11 +423,16 @@ impl ApcFixture {
 
     /// One page through the production stage order of `finish_sync_source`.
     fn page(&self, collected_at: &str, upload: ApcUpload) -> ApcPage {
-        // Ordinary transcripts: each file exists before its records (`e2`).
-        crate::snapshots::claude_request_money::e2::with_fixture_birth(
-            1_785_628_800_000_000_000, // 2026-08-02T00:00:00Z
-            || self.page_born(collected_at, upload),
-        )
+        let now = OffsetDateTime::parse(collected_at, &Rfc3339)
+            .unwrap()
+            .unix_timestamp() as u64;
+        crate::snapshots::sampled_scan::transition_fixture::with_scan_clock(now, || {
+            // Ordinary transcripts: each file exists before its records (`e2`).
+            crate::snapshots::claude_request_money::e2::with_fixture_birth(
+                1_785_628_800_000_000_000, // 2026-08-02T00:00:00Z
+                || self.page_born(collected_at, upload),
+            )
+        })
     }
 
     fn page_born(&self, collected_at: &str, upload: ApcUpload) -> ApcPage {
@@ -449,6 +454,7 @@ impl ApcFixture {
         );
         self.load_exclusion_list(&mut index);
         let committed_index = index.clone();
+        let native_pass = crate::snapshots::state_v2_baseline_release(&self.index_path, &index);
         let mut scan = crate::snapshots::e2_pipeline_scan_fixture::scan_native_pipeline_for_test(
             std::slice::from_ref(&self.root),
             &mut index,
@@ -563,6 +569,7 @@ impl ApcFixture {
             .collect();
         if upload == ApcUpload::Crash {
             // Nothing after the scan reaches the network or the disk.
+            drop(native_pass);
             return ApcPage {
                 upload,
                 scan,
@@ -720,6 +727,7 @@ impl ApcFixture {
             )
             .expect("checkpoint shed page");
 
+            drop(native_pass);
             return ApcPage {
                 upload,
                 scan,
@@ -818,6 +826,10 @@ impl ApcFixture {
         progress
             .finish_cycle(&self.progress_path)
             .expect("finish native fixture progress");
+        native_pass
+            .commit_tail()
+            .expect("commit native fixture Tail");
+        drop(native_pass);
         ApcPage {
             upload,
             scan,

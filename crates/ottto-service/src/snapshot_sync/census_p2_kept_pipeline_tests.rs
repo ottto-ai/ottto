@@ -210,9 +210,23 @@ impl PipelineFixture {
         before_classify: impl FnOnce(&mut ScanIndex),
         reoffers: bool,
     ) -> PipelinePage {
-        // Ordinary transcripts: each file exists before its records.
-        crate::snapshots::claude_request_money::e2::with_fixture_birth(PIPELINE_FILE_BIRTH, || {
-            self.page_with_reoffers_born(collected_at, cycle, upload, before_classify, reoffers)
+        let now = OffsetDateTime::parse(collected_at, &Rfc3339)
+            .unwrap()
+            .unix_timestamp() as u64;
+        crate::snapshots::sampled_scan::transition_fixture::with_scan_clock(now, || {
+            // Ordinary transcripts: each file exists before its records.
+            crate::snapshots::claude_request_money::e2::with_fixture_birth(
+                PIPELINE_FILE_BIRTH,
+                || {
+                    self.page_with_reoffers_born(
+                        collected_at,
+                        cycle,
+                        upload,
+                        before_classify,
+                        reoffers,
+                    )
+                },
+            )
         })
         .expect("in-process pipeline page")
     }
@@ -225,7 +239,12 @@ impl PipelineFixture {
         before_classify: impl FnOnce(&mut ScanIndex),
         reoffers: bool,
     ) -> Result<PipelinePage> {
-        let mut index = ScanIndex::load(&self.index_path).expect("load scan index");
+        let (mut index, _) = crate::snapshots::e2_pipeline_scan_fixture::load_source_for_test(
+            &self.index_path,
+            SnapshotSource::ClaudeCode,
+            &self.support,
+        )
+        .expect("load native scan index");
         let hour = OffsetDateTime::parse(collected_at, &Rfc3339)
             .unwrap()
             .unix_timestamp()
@@ -278,6 +297,7 @@ impl PipelineFixture {
         index.load_claude_reemission_exclusions(&self.support);
         crate::snapshots::claude_request_money::e2::apply_money_rules(&mut index);
         let committed_index = index.clone();
+        let native_pass = crate::snapshots::state_v2_baseline_release(&self.index_path, &index);
         let mut scan = crate::snapshots::e2_pipeline_scan_fixture::scan_native_pipeline_for_test(
             std::slice::from_ref(&self.root),
             &mut index,
@@ -398,6 +418,15 @@ impl PipelineFixture {
                 .expect("save pre-send cooldown");
         }
         let leased_reoffers = progress.active_reason_reoffers.clone();
+        eprintln!(
+            "native census page at={collected_at} parsed={parsed:?} offered={:?} held={} reoffers={}",
+            scan.snapshots
+                .iter()
+                .map(|item| item.source_session_id.as_str())
+                .collect::<BTreeSet<_>>(),
+            holds.held_fingerprints.len(),
+            leased_reoffers.len(),
+        );
         let mut uploaded = BTreeSet::new();
         let mut accepted = 0;
         let result = upload_resumable_batches_with_body_witness(
@@ -614,6 +643,10 @@ impl PipelineFixture {
         progress
             .finish_cycle(&progress_path)
             .expect("finish native fixture progress");
+        native_pass
+            .commit_tail()
+            .expect("commit native fixture Tail");
+        drop(native_pass);
         Ok(PipelinePage {
             parsed,
             scan,
