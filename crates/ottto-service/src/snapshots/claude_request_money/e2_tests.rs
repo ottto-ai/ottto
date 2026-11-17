@@ -1708,12 +1708,12 @@ fn org_hash(org: &str) -> String {
     ottto_core::billing_identity_hash("anthropic", "organization", org).unwrap()
 }
 fn tag_owned(items: Vec<SnapshotItem>, index: &ScanIndex) -> Vec<SnapshotItem> {
-    tag_owned_with_fallbacks(items, index, 0)
+    tag_owned_with_held(items, index, 0)
 }
-fn tag_owned_with_fallbacks(
+fn tag_owned_with_held(
     mut items: Vec<SnapshotItem>,
     index: &ScanIndex,
-    expected_fallbacks: usize,
+    expected_held: usize,
 ) -> Vec<SnapshotItem> {
     decide_page_copies(&mut items, index, None);
     let api = ClaudeLocalOtelLoadReport::default();
@@ -1749,9 +1749,10 @@ fn tag_owned_with_fallbacks(
     );
     let outcome = claude_request_identity::apply_scan_page(&mut items, &evidence, BTreeMap::new());
     claude_request_identity::publish_request_owned_activity(&items, activity);
-    assert!(expected_fallbacks <= items.len());
-    assert_eq!(outcome.sent, items.len() - expected_fallbacks);
-    assert_eq!(outcome.fallback, expected_fallbacks);
+    assert!(expected_held <= items.len());
+    assert_eq!(outcome.sent, items.len() - expected_held);
+    assert_eq!(outcome.held.len(), expected_held);
+    assert_eq!(outcome.fallback, 0);
     assert_eq!(outcome.ineligible, 0);
     items
 }
@@ -2566,9 +2567,11 @@ fn e2_identity_conflicting_account_attributes_preserve_complete_own_orgs() {
             item.cost.as_ref().unwrap().total_cost_usd.as_deref(),
             Some("0.0002")
         );
+        // b's own row names a conflicting account: invalid telemetry blocks b,
+        // so its own marker's org is not used and b's share stays untagged.
         assert_eq!(
             org_amounts(&item),
-            BTreeMap::from([(org_hash(ORG_A), (10, 1)), (org_hash(ORG_B), (20, 1)),])
+            BTreeMap::from([(org_hash(ORG_A), (10, 1))])
         );
         assert!(fold(&item).accounts.as_ref().unwrap().conflict);
         assert_evidence_referenced(&item);
@@ -2608,7 +2611,8 @@ fn e2_identity_final_twin_union_over_authority_cap_withholds_unproved_identity()
         assert!(items
             .iter()
             .all(|item| !fold(item).accounts.as_ref().unwrap().conflict));
-        let item = tag_owned_with_fallbacks(items, &index, 1).remove(0);
+        // Over the cap a request-owned item is held, never stripped to a fallback.
+        let item = tag_owned_with_held(items, &index, 1).remove(0);
         let requests = (first + second + 2) as u64;
         assert_eq!(
             (item.request_count, item.input_tokens),
@@ -2621,8 +2625,8 @@ fn e2_identity_final_twin_union_over_authority_cap_withholds_unproved_identity()
             && row.evidence_ref.is_none()
             && row.account_identifier_hash.is_none()));
         assert_eq!(
-            item.request_identity_refusals, 1,
-            "the bucket row lost proof"
+            item.request_identity_refusals, 0,
+            "a hold strips no row, so it refuses none"
         );
         assert_evidence_referenced(&item);
         cleanup(&[&a, &b]);
