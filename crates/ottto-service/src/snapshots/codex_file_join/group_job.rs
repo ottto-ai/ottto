@@ -358,16 +358,6 @@ impl GroupBoot {
     ) -> Boot {
         let n = self.group.members.len();
         if self.identified == 0
-            && self.group.members.iter().any(|member| {
-                sources::codex::counting::version::legacy_head_missing(
-                    index,
-                    &local_index_key(&member.path),
-                )
-            })
-        {
-            return Boot::Strict;
-        }
-        if self.identified == 0
             && self.group.members.iter().all(|member| {
                 sources::codex::counting::version::unchanged_legacy(index, &member.path)
             })

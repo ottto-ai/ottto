@@ -4066,7 +4066,11 @@ impl OwnedSourceScan {
                 decision = CandidateDecision::Parse;
             }
             if source == SnapshotSource::Codex
-                && sources::codex::counting::version::unchanged_legacy(index, &candidate.path)
+                && (sources::codex::counting::version::unchanged_legacy(index, &candidate.path)
+                    || sources::codex::counting::version::legacy_head_missing(
+                        index,
+                        &local_index_key(&candidate.path),
+                    ))
             {
                 decision = CandidateDecision::Skip;
                 parse_reason = None;

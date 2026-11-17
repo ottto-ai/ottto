@@ -52,8 +52,8 @@ pub(in crate::snapshots) fn legacy_head_missing(index: &ScanIndex, key: &str) ->
     proven_legacy(index, key) && tail_source::stored_codex_legacy_totals(index, key).is_none()
 }
 
-/// Stat-only, including an unchanged entry whose head is missing or corrupt.
-/// Audit and repair debt cannot authorize conversion of unchanged history.
+/// Stat-only; groups normally have no member reductions. Audit and repair
+/// debt cannot authorize conversion of unchanged accepted history.
 pub(in crate::snapshots) fn unchanged_legacy(index: &ScanIndex, path: &Path) -> bool {
     let key = local_index_key(path);
     if !proven_legacy(index, &key) {
@@ -64,14 +64,7 @@ pub(in crate::snapshots) fn unchanged_legacy(index: &ScanIndex, path: &Path) -> 
     };
     metadata.is_file()
         && !metadata.file_type().is_symlink()
-        && match index.codex_physical_matches(&key, &metadata) {
-            Ok(Some((same, _))) => {
-                same || tail_source::stored_codex_legacy_totals(index, &key).is_none()
-            }
-            // No baseline can be reconstructed safely here. Leave the old
-            // entry and its repair obligation untouched, even after growth.
-            _ => true,
-        }
+        && index.listing_stamp_matches(path, &metadata)
 }
 
 pub(in crate::snapshots) fn reusable(

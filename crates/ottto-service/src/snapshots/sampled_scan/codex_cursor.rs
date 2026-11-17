@@ -3998,6 +3998,7 @@ pub(in crate::snapshots) fn resume_paused_job(
         return Resumed::Idle;
     };
     if context.source == SnapshotSource::Codex
+        && job.group.is_none()
         && job_files(&job).iter().any(|file| {
             crate::snapshots::sources::codex::counting::version::legacy_head_missing(
                 index,
