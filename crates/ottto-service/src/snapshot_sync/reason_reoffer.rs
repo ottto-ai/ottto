@@ -858,16 +858,18 @@ impl SnapshotUploadProgress {
             {
                 continue;
             }
-            let retry_after = match refusal.reoffer {
-                None | Some(RefusalReoffer::Classified) => continue,
-                Some(reoffer) => reoffer.retry_after().unwrap_or_default(),
+            let Some(RefusalReoffer::OriginalPair {
+                retry_after_unix_seconds: retry_after,
+            }) = refusal.reoffer
+            else {
+                continue;
             };
             if retry_after > latest {
-                // A wall-clock rollback must not consume the one-time pass or
-                // permanently disable daily offers. Keep suppression this cycle
-                // and durably restart the conservative 24 h cooldown.
-                refusal.reoffer = refusal.reoffer.map(|reoffer| {
-                    reoffer.with_retry_after(reason_reoffer::next_offer_after(scope.now))
+                // A wall-clock rollback must not permanently disable daily
+                // offers. Keep suppression this cycle and durably restart the
+                // conservative 24 h cooldown.
+                refusal.reoffer = Some(RefusalReoffer::OriginalPair {
+                    retry_after_unix_seconds: reason_reoffer::next_offer_after(scope.now),
                 });
                 counts.clock_bound_skipped += 1;
                 changed = true;
