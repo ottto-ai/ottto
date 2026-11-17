@@ -742,7 +742,8 @@ impl HeaderInventory {
             // Durable facts keep precedence; each later source runs only when
             // every earlier one missed. Any lookup that runs and errors fails the
             // member, as before.
-            let joined = codex_archive_path(&candidate.path)
+            let joined = (codex_archive_path(&candidate.path)
+                || sources::codex::counting::version::unchanged_legacy(index, &candidate.path))
                 && index.files.get(&key).is_some_and(|entry| {
                     entry.codex_joined_member_set.is_some()
                         && codex_index_file_body_accepted(index, &key, entry)
