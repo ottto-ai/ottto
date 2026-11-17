@@ -177,9 +177,12 @@ impl Corpus {
         self.reload_in(index, "scan-index.json")
     }
     fn reload_in(&self, index: &mut ScanIndex, name: &str) -> ScanIndex {
-        // Claude continues from its route; anything else from its own file.
-        let path = crate::snapshots::e2_pipeline_scan_fixture::route_of(index)
-            .unwrap_or_else(|| self.base.join(name));
+        let path = crate::snapshots::e2_pipeline_scan_fixture::bind_fixture_route(
+            SnapshotSource::ClaudeCode,
+            index,
+            self.base.join(name).parent().unwrap(),
+            &e2_progress().destination_namespace_hash,
+        );
         index.save(&path).unwrap();
         ScanIndex::load(&path).unwrap()
     }
@@ -836,8 +839,16 @@ fn e2_progress() -> SnapshotUploadProgress {
         snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
     )
 }
-fn request(items: &[impl std::borrow::Borrow<SnapshotItem>]) -> SnapshotBatchRequest<&SnapshotItem> {
-    request_under(SnapshotUploadPolicy::default(), &items.iter().map(std::borrow::Borrow::borrow).collect::<Vec<_>>())
+fn request(
+    items: &[impl std::borrow::Borrow<SnapshotItem>],
+) -> SnapshotBatchRequest<&SnapshotItem> {
+    request_under(
+        SnapshotUploadPolicy::default(),
+        &items
+            .iter()
+            .map(std::borrow::Borrow::borrow)
+            .collect::<Vec<_>>(),
+    )
 }
 fn request_under<'a>(
     upload_policy: SnapshotUploadPolicy,
@@ -949,7 +960,9 @@ pub(in crate::snapshot_sync) fn ack(
     // head or a telemetry-only body, `validate_entity_ack`): every accepted
     // entity gets a head, including telemetry-only bodies without cache
     // evidence.
-    let head_cas = batch.iter().any(|item| crate::snapshot_client::declares_head_cas(item));
+    let head_cas = batch
+        .iter()
+        .any(|item| crate::snapshot_client::declares_head_cas(item));
     for item in batch {
         let mut reference = entity_ack_ref(&item.snapshot_fingerprint);
         reference.source_session_id = item.source_session_id.clone();

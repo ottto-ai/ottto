@@ -432,16 +432,45 @@ pub(crate) fn route_of(index: &ScanIndex) -> Option<PathBuf> {
     state_v2::runtime_path(index).ok().flatten()
 }
 
+/// Attach a synthetic working graph to its own empty native baseline. Its
+/// first real save must still reconcile provisional ownership against empty
+/// committed state, exactly as the daemon's first pass does.
+pub(crate) fn bind_fixture_route(
+    source: SnapshotSource,
+    index: &mut ScanIndex,
+    dir: &Path,
+    namespace: &str,
+) -> PathBuf {
+    if let Some(route) = route_of(index) {
+        return route;
+    }
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = dir
+        .canonicalize()
+        .unwrap()
+        .join(format!("fixture-route-{n}"))
+        .join("snapshots/destinations")
+        .join(namespace)
+        .join(format!("{}-synthetic-scan-index.json", source.api_slug()));
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let empty = ScanIndex::load(&path).unwrap();
+    index.retain_persistence_baseline_from(&empty);
+    index.generation = empty.generation;
+    E2ScanFixture::register_route_for_test(&path);
+    path
+}
+
 /// Commit on the native route, then encode a legacy decoder fixture at `path`.
 /// The copy has no continuation; another owner must read changed input Full.
 pub(crate) fn save_for_test(index: &mut ScanIndex, path: &Path) {
-    if let Some(route) = route_of(index) {
-        save_on_route(index, &route).unwrap();
-    } else {
-        let mut cold = publish_route(index, path.parent().unwrap()).1;
-        carry_runtime(index, &mut cold);
-        *index = cold;
-    }
+    let route = bind_fixture_route(
+        SnapshotSource::ClaudeCode,
+        index,
+        path.parent().unwrap(),
+        &"a".repeat(64),
+    );
+    save_on_route(index, &route).unwrap();
     let mut copy = index.clone();
     copy.v2_mut().persistence_v2 = None;
     copy.generation = 1;
@@ -451,18 +480,20 @@ pub(crate) fn save_for_test(index: &mut ScanIndex, path: &Path) {
 }
 
 /// Save and reload on this owner's native route; an unrouted seed is first
-/// published on its own route under the supplied fixture directory.
+/// attached to an empty store under the supplied fixture directory.
 pub(crate) fn save_reload_for_test(index: &mut ScanIndex, path: &Path) -> ScanIndex {
-    let Some(route) = route_of(index) else {
-        let loaded = publish_route(index, path.parent().unwrap()).1;
-        let mut saved = loaded.clone();
-        carry_runtime(index, &mut saved);
-        *index = saved;
-        return loaded;
-    };
+    let was_routed = route_of(index).is_some();
+    let route = bind_fixture_route(
+        SnapshotSource::ClaudeCode,
+        index,
+        path.parent().unwrap(),
+        &"a".repeat(64),
+    );
     save_on_route(index, &route).unwrap();
     let mut loaded = ScanIndex::load(&route).unwrap();
-    carry_runtime(index, &mut loaded);
+    if was_routed {
+        carry_runtime(index, &mut loaded);
+    }
     loaded
 }
 

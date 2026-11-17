@@ -20,7 +20,6 @@ impl AckFixture {
         let scan = Self::scan(&sources, &mut index);
         assert_eq!(scan.snapshots.len(), 1);
         let item = scan.snapshots[0].clone();
-        let index_path = scratch.join("index.json");
         let progress_path = scratch.join("progress.json");
         let namespace = "c".repeat(64);
         let mut progress = SnapshotUploadProgress::new(
@@ -40,6 +39,12 @@ impl AckFixture {
         value["session_account_bindings"] = serde_json::json!({"a".repeat(64): {
             "account_identifier_hash":"8".repeat(64), "workspace_identifier_hash":"9".repeat(64)}});
         index = serde_json::from_value(value).unwrap();
+        let index_path = crate::snapshots::e2_pipeline_scan_fixture::bind_fixture_route(
+            SnapshotSource::ClaudeCode,
+            &mut index,
+            &scratch,
+            &namespace,
+        );
         index.save(&index_path).unwrap();
         progress.save(&progress_path).unwrap();
         let identity = serde_json::to_value(&index).unwrap();
