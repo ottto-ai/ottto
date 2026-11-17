@@ -272,6 +272,8 @@ impl ScanIndex {
             retired_upload_context_fingerprint: serde::de::IgnoredAny,
             retired_archives: serde::de::IgnoredAny,
             retired_archive_deferred_alarm_count: serde::de::IgnoredAny,
+            retired_codex_counting_tombstones: serde::de::IgnoredAny,
+            retired_codex_counting_evicted_legacy: serde::de::IgnoredAny,
             retired_reread_guard: serde::de::IgnoredAny,
             files: files.into(),
             session_account_bindings: self.session_account_bindings.clone(),

@@ -31,6 +31,15 @@ file-system hint / periodic listing → select file → read new bytes from save
   census verification and require a native read on the next force.
 - **Reduction.** One reducer per source turns lines into usage and keeps a running result. Old
   evidence is read only for the session group a change affects.
+- **Codex counting.** Every new parse uses V2. An accepted old-formula file keeps its
+  accepted body until its physical content stamp changes, including during audit,
+  retry and cursor resume. A changed file is recounted to cold V2 exactly, even when
+  the total falls; a joined group recounts together when any member changes.
+  Missing or corrupt old heads remain skipped with repair owed. Index rebuilds and
+  a new destination start with V2. V2 heads and paused jobs ignore retired counting
+  views and retain their existing Tail path. The process-local `codex_legacy_recount`
+  alarm records shrink, unknown baseline or previously unaccepted usage; retries or
+  crashes may repeat it. Historical counting slots still decode without selecting a rule.
 - **Codex rollout encodings.** Plain `.jsonl` and compressed `.jsonl.zst` use the same
   ordinary first-read selection, reducer, modification-time age rules and decoded-byte page
   budget. Exact plaintext siblings win before either header opens. Decoder memory is funded
@@ -52,8 +61,7 @@ file-system hint / periodic listing → select file → read new bytes from save
   EOF. It does not restore a compressed decoder or introduce a stepped compressed reader.
 - **Codex ownership.** One secure header opener supplies ordinary membership proof for either
   encoding. A failure holds its file and decisions depending on it; an unknown header remains
-  a wildcard over every potentially colliding owner. Any missing header/listing proof still
-  prevents absence-based counting-evidence collection. Boundary validation covers surviving
+  a wildcard over every potentially colliding owner. Boundary validation covers surviving
   singleton sessions and joined groups across every registered home. A new file
   naming a page owner fails; unrelated new files defer to the next roster refresh.
   New directories are recursively listed with the same helper and their rollouts
