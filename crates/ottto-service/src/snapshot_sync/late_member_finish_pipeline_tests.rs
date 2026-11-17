@@ -54,7 +54,6 @@ struct LateMemberPipeline {
     support: PathBuf,
     server: FinishServer,
     device: LocalDeviceBinding,
-    retry: live_snapshot_retry::LiveRetryOwner,
     _env: [EnvVarGuard; 3],
 }
 
@@ -93,7 +92,6 @@ impl LateMemberPipeline {
             support,
             server,
             device,
-            retry: live_snapshot_retry::LiveRetryOwner::closed(),
             _env: env,
         };
         // The family directory exists; only its member transcript is late.
@@ -206,7 +204,6 @@ impl LateMemberPipeline {
                 &daemon,
                 &mut transport,
                 daemon.snapshot_scan_account_witness().unwrap(),
-                false,
             )
         })
         .unwrap()
@@ -228,7 +225,6 @@ impl LateMemberPipeline {
                 &self.support,
                 &daemon,
                 &mut transport,
-                &mut self.retry,
             )
         })
         .unwrap();

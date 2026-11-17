@@ -20,8 +20,8 @@ diagnostics flow sends a redacted payload.
 Agents, the CLI, the macOS app, and the web app are clients. They should not
 duplicate local setup or repair logic.
 
-`ottto uninstall --backup-state <directory>` copies the local sync state,
-which contains local session titles, prompts and workspace paths. Keep the
+`ottto uninstall --confirm --backup-state <directory>` copies the local sync
+state before uninstalling. That state contains local session titles, prompts and workspace paths. Keep the
 backup private; the CLI writes its files as 0600 and its folders as 0700. The
 local state folder is not excluded from Time Machine or iCloud backups.
 
@@ -40,7 +40,10 @@ Connecting a Mac (setup, claim completion and device registration) uploads:
 
 - the Mac name, which is the macOS hostname, read for each request so it
   follows a rename;
-- the Mac's hardware UUID (`IOPlatformUUID`), sent as-is, not hashed;
+- a one-way id derived from the Mac's hardware UUID (`IOPlatformUUID`), sent
+  in the field `hardware_uuid`; the raw UUID is not sent. The derivation is
+  fixed and public, so anyone who already knows the UUID can compute the id:
+  it is pseudonymous, not anonymous;
 - the OS family (`macos`), the CPU architecture and the Ottto version;
 - `machine_id`, a one-way hash of the hardware UUID (of the hostname if the
   UUID cannot be read), a random installation id, and a one-way id for the
@@ -52,6 +55,29 @@ the Mac name, the hardware UUID or any file path. The other health fields are
 Ottto account and organization ids, versions, states, codes, timestamps and
 short status messages; command output in those messages has local paths
 removed.
+
+## The Mac App
+
+The Ottto Mac app is a client of `ottto-service`: usage collection and uploads
+go through the daemon. The app doesn't read agent transcripts or agent
+credentials, and it doesn't upload usage itself. It makes these network
+requests itself:
+
+- it downloads the Mac's icon from Ottto's servers, when there is one; the icon
+  address includes the Ottto organization and device ids;
+- it checks Ottto's update feed for new app versions (Sparkle) and, when you
+  choose to update, downloads the new version;
+- if Ottto's service was installed with Homebrew, a manual update check runs
+  `brew update` and `brew upgrade` for Ottto.
+
+Links and sign-in pages open in your browser, and a sign-in started from the
+app runs `claude` or `codex`, which contact their providers.
+
+When you open a login or session in a terminal from the app, it reads some
+local details itself: the front terminal tab's tty (through Apple Events,
+which needs Automation permission), the working folder and process details of
+processes run by your macOS user, and up to 4 KiB of a project's `.git`
+pointer files.
 
 ## What Stays Local
 
@@ -464,19 +490,39 @@ local config or Keychain state before backend setup-key revocation completes.
 Reasoning effort is read from the Claude transcript itself, which records the
 applied tier on each assistant record. No OTLP is required for it.
 
-Claude Code can also continue sending its documented OTLP logs to Ottto's
-loopback daemon when cloud live telemetry is off. That path now only supplies
-effort for older transcripts that predate the transcript-native field. The daemon reduces only content-free
-per-request effort evidence (session id, API request id, timestamp, model,
-effort, and token counters) into owner-only hashed local sidecars and uploads
-it later through the aggregate local snapshot path. It never persists the raw
-OTLP request or identity/content attributes such as email, prompts, responses,
-commands, or paths. The API request id is an opaque provider-side call
-identifier that Claude Code already writes into your own transcripts as
-`requestId`; it stays on the machine and is used only to match an observed
-effort tier to the turn that used it, so only the tier ever leaves. Any
-transcript usage not exactly covered by local evidence remains explicitly
-effort-unknown.
+Claude Code can also send its documented OTLP logs and traces to Ottto's
+daemon on 127.0.0.1, even when cloud live telemetry is off; the daemon forwards
+none of it. From each eligible `claude_code.api_request` log record (one with a
+session id, model and timestamp) the daemon keeps one content-free row in
+owner-only local files: the session id, the API and client request ids, the
+timestamp and event sequence, the model, effort, query source, speed (service
+tier), the cost Claude Code reports, the Claude Code version, token and request
+counts, and, when present, one-way hashes of the provider account and
+organization ids. A second local file, from `claude_code.llm_request` trace
+spans, keeps the session id, the request ids, an observed timestamp, and agent,
+parent-agent and workflow-run ids; the request and agent ids tie subagent and
+workflow requests to the right session. Neither file is uploaded as is. The
+daemon never stores the raw OTLP request, raw account or organization ids,
+email, prompts, responses, commands or paths.
+
+These rows shape what the aggregate local snapshot uploads:
+
+- When a row matches a transcript request, it can fill in effort the transcript
+  doesn't record, and supply the speed mode, the cost Claude Code reports and,
+  through the account and organization hashes, which account the usage belongs
+  to.
+- A row that matches no transcript request (for example a background request,
+  or a session with no transcript; see
+  [Telemetry-only Claude sessions](telemetry-only-sessions.md)) is uploaded as
+  usage of its own: its model, effort, speed, reported cost, token and request
+  counts, hour and account hashes, under the session the second file names.
+- A row's timestamp sets the request's hour when the transcript has none, and
+  can move the session's last-activity and end times later.
+
+Raw request ids stay on the machine; they are used for matching,
+deduplication and ownership checks. Snapshots omit the query source and Claude
+Code version from these rows. Any transcript usage not exactly covered by local
+evidence remains explicitly effort-unknown.
 
 While Claude is turned off for this device, or not granted to it, the daemon
 acknowledges these exports and stores nothing; evidence already stored is
