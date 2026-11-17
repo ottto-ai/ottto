@@ -1544,7 +1544,7 @@ fn present(db: &mut sqlite::Sqlite, keys: &BTreeSet<RowKey>) -> usize {
         .filter(|key| {
             tx.get(key)
                 .unwrap()
-                .is_some_and(|h| !kinds_misc::empty_counting_root(&mut *tx, &h).unwrap())
+                .is_some_and(|h| !kinds_misc::empty_counting_root(&mut tx, &h).unwrap())
         })
         .count()
 }

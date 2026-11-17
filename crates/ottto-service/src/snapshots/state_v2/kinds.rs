@@ -218,7 +218,7 @@ pub(super) fn hydrate_txn(
             // Legacy archive member keys retain first-seen evidence. Their
             // values stay inert; no policy state or baseline digest is loaded.
             if catalogue::retired(kind.name())
-                && !kinds_misc::empty_counting_root(tx, &header)?
+                && !kinds_misc::empty_counting_root(tx, header)?
                 && !(legacy_archive_members
                     && matches!(
                         kind.name(),

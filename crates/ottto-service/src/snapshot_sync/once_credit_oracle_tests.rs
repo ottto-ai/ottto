@@ -1504,7 +1504,7 @@ fn codex_member(
         json!({"input_tokens":n,"cached_input_tokens":0,"cache_write_input_tokens":0,
         "output_tokens":0,"reasoning_output_tokens":0,"total_tokens":n})
     };
-    crate::snapshots::codex_file_join::tests::bound_rows(&[
+    crate::snapshots::codex_bound_fixture_rows(&[
         json!({"type":"session_meta","timestamp":created,"payload":{"id":owner}}),
         json!({"type":"token_usage_record","timestamp":"2026-11-01T07:01:00Z","payload":{
             "thread_id":owner,"response_id":response,"usage":usage(input),"thread_token_usage":usage(cumulative)}}),
@@ -3197,7 +3197,8 @@ mod money_equivalence_tests {
             assert_eq!(cold.finalized.len(), 2);
             assert_eq!(
                 cold.finalized.iter().map(|s| s.input_tokens).sum::<u64>(),
-                400
+                240,
+                "V2 publishes each closed 120-token turn; open turns remain pending"
             );
             let accounts = cold
                 .finalized

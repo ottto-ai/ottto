@@ -2337,23 +2337,30 @@ pub(super) mod tests {
         }
         let mut out = Vec::new();
         let mut active: Option<String> = None;
-        let event = |kind: &str, turn: &str| {
+        let mut at = rows
+            .first()
+            .map(|row| row["timestamp"].clone())
+            .unwrap_or(Value::Null);
+        let event = |kind: &str, turn: &str, at: &Value| {
             json!({"type":"event_msg",
-            "timestamp":"2026-10-01T10:01:00Z","payload":{"type":kind,"turn_id":turn}})
+            "timestamp":at,"payload":{"type":kind,"turn_id":turn}})
         };
         for row in rows {
+            if row["timestamp"].is_string() {
+                at = row["timestamp"].clone();
+            }
             let context = string_eq_at(row, &["type"], "turn_context");
             let native = string_eq_at(row, &["type"], "token_usage_record");
             if context {
                 if let Some(prior) = active.take() {
-                    out.push(event("task_complete", &prior));
+                    out.push(event("task_complete", &prior, &at));
                 }
             }
             if (context || native) && active.is_none() {
                 let turn = string_at(row, &["payload", "turn_id"])
                     .or_else(|| string_at(row, &["payload", "response_id"]))
                     .unwrap_or_else(|| "fixture-turn".into());
-                out.push(event("task_started", &turn));
+                out.push(event("task_started", &turn, &at));
                 active = Some(turn);
             }
             let mut row = row.clone();
@@ -2363,7 +2370,7 @@ pub(super) mod tests {
             out.push(row);
         }
         if let Some(turn) = active {
-            out.push(event("task_complete", &turn));
+            out.push(event("task_complete", &turn, &at));
         }
         out
     }

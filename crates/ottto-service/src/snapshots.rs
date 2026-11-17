@@ -178,11 +178,10 @@ pub(crate) use codex_file_join::CODEX_JOIN_VALIDATION_FAILURES;
 pub(in crate::snapshots) use codex_file_join::tests::older_build_logs_tier;
 #[cfg(test)]
 pub(crate) use codex_file_join::tests::{
-    counting_v2_fixture, native_join_fixture_root, older_build_logs_expired,
-    older_build_logs_priority,
+    bound_rows as codex_bound_fixture_rows, counting_v2_fixture, native_join_fixture_root,
+    older_build_logs_expired, older_build_logs_priority,
 };
 pub(crate) mod billing_route;
-#[cfg(test)]
 #[cfg(test)]
 mod claude_usage_iterations_tests;
 mod codex_usage_occurrence;
