@@ -468,7 +468,8 @@ fn account_ack_retry_checkpoints_released_witness_then_becomes_noop() {
                 (
                     ResumableUploadResult::Deferred {
                         count: 1,
-                        isolated: 0
+                        isolated: 0,
+                        identity_503: 0
                     },
                     1
                 ),
@@ -688,7 +689,8 @@ fn same_replay_generation_restores_cleared_conflict_progress_until_retry() {
         result,
         ResumableUploadResult::Deferred {
             count: 1,
-            isolated: 1
+            isolated: 1,
+            identity_503: 0
         }
     );
     assert_eq!(accepted, 0);
@@ -1231,7 +1233,8 @@ fn entity_ack_conflict_checkpoints_siblings_drains_later_batch_and_clears_on_rev
         result,
         ResumableUploadResult::Deferred {
             count: 1,
-            isolated: 1
+            isolated: 1,
+            identity_503: 0
         }
     );
     assert_eq!(uploaded_batches, vec![first_batch.clone(), later_batch]);
@@ -1335,7 +1338,8 @@ fn entity_ack_all_conflict_page_stays_pending_and_surfaces_deferred_error() {
         result,
         ResumableUploadResult::Deferred {
             count: 3,
-            isolated: 3
+            isolated: 3,
+            identity_503: 0
         }
     );
     assert_eq!(accepted, 0);

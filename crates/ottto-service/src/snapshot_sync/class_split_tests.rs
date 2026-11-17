@@ -122,10 +122,7 @@ impl HeadStore {
         let cas = wire["head_cas_contract"].is_string();
         let echo_state = wire["cache_state_ack_contract"].as_str() == Some("cache_state_ack:v1");
         let mut ack = empty_ack();
-        for (item, sent) in request
-            .items()
-            .zip(wire["snapshots"].as_array().unwrap())
-        {
+        for (item, sent) in request.items().zip(wire["snapshots"].as_array().unwrap()) {
             let envelope = &sent["semantic_envelope"];
             let session = item.source_session_id.clone();
             let state = item.cache_observations.as_ref().map(|patch| {
@@ -295,7 +292,8 @@ fn mixed_page_sends_each_patch_class_in_its_own_request() {
         result.unwrap(),
         ResumableUploadResult::Deferred {
             count: 1,
-            isolated: 1
+            isolated: 1,
+            identity_503: 0
         }
     );
     assert!(before
@@ -750,7 +748,8 @@ fn lost_ack_replays_unchanged_and_a_fresh_challenge_clears_again() {
         result.unwrap(),
         ResumableUploadResult::Deferred {
             count: 1,
-            isolated: 1
+            isolated: 1,
+            identity_503: 0
         }
     );
     assert!(wires[0]["head_cas_contract"].is_string());
@@ -844,7 +843,8 @@ fn ordinary_fence_outcomes_settle_the_owed_challenge_by_their_own_rules() {
                 result,
                 ResumableUploadResult::Deferred {
                     count: 1,
-                    isolated: 1
+                    isolated: 1,
+                    identity_503: 0
                 },
                 "{outcome}"
             );
@@ -1356,7 +1356,8 @@ fn copies_of_a_headed_session_wait_one_page_and_drop_nothing() {
         result.unwrap(),
         ResumableUploadResult::Deferred {
             count: 1,
-            isolated: 1
+            isolated: 1,
+            identity_503: 0
         }
     );
     assert_eq!(envelope(&wires[0])["base_head_etag"], stale);

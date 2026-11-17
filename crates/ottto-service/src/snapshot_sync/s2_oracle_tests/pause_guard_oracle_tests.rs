@@ -246,7 +246,8 @@ fn paused_e2_ack_loss_restart_exact_receipt() {
             status.unwrap(),
             ResumableUploadResult::Deferred {
                 count: 1,
-                isolated: 1
+                isolated: 1,
+                identity_503: 0
             }
         );
         assert_eq!(

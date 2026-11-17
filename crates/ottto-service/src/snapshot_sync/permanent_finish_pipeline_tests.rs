@@ -847,6 +847,8 @@ enum AckScriptedPost {
     Disabled,
     /// Every entity is a held conflict: a Deferred page.
     Conflict,
+    /// The identity-unavailable shed naming every entity, at this status.
+    Identity(&'static str),
 }
 
 struct AckScriptedServer {
@@ -889,7 +891,7 @@ impl AckScriptedServer {
                 } else {
                     serde_json::from_str(raw).unwrap()
                 };
-                let status = "200 OK";
+                let mut status = "200 OK";
                 let response = if request.contains("/relay-token") {
                     serde_json::json!({"token":"synthetic-finish-token","expires_at":"2099-01-01T00:00:00Z"})
                 } else if request.contains("/activity-hints") {
@@ -908,6 +910,11 @@ impl AckScriptedServer {
                         .pop_front()
                         .unwrap_or(AckScriptedPost::Accept);
                     match post {
+                        AckScriptedPost::Identity(code) => {
+                            status = code;
+                            serde_json::json!({"code":"snapshot_original_identity_unavailable",
+                                "errors":(0..items.len()).map(|i| serde_json::json!({"loc":["body","snapshots",i]})).collect::<Vec<_>>()})
+                        }
                         AckScriptedPost::Conflict => {
                             let conflicts = items
                                 .iter()
@@ -953,7 +960,12 @@ impl AckScriptedServer {
                 } else {
                     serde_json::json!({"accepted":true,"source":"claude_code","machine_id":"otm_test","disabled":false})
                 };
-                bounded_native_response(&mut stream, status, &response.to_string());
+                if status == "200 OK" {
+                    bounded_native_response(&mut stream, status, &response.to_string());
+                } else {
+                    let body = response.to_string();
+                    write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nRetry-After: 60\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                }
             }
         });
         Self {
@@ -1036,6 +1048,19 @@ impl AckFinishHome {
     }
 
     fn prepare(&mut self, cycle: &str) -> (SourcePreparation, ScanIndex, SourceScanResult) {
+        let (preparation, index, mut scan) = self.prepare_raw();
+        assert!(scan.census_complete, "{cycle}: the real scan is clean");
+        assert_eq!(
+            scan.snapshots.len(),
+            1,
+            "{cycle}: the never-committed transcript is read again"
+        );
+        // Existing debt fixtures deliberately leave census-dependent cleanup pending.
+        scan.census_complete = false;
+        (preparation, index, scan)
+    }
+
+    fn prepare_raw(&mut self) -> (SourcePreparation, ScanIndex, SourceScanResult) {
         self.cadence.next_due_cycle();
         let frame = crate::agent_status_refresh::with_test_collection(Self::collection(), || {
             prepare_sync_source(
@@ -1054,18 +1079,7 @@ impl AckFinishHome {
         })
         .unwrap()
         .expect("actual due source preparation");
-        let (preparation, index, mut scan) = collect_preparation_with_rotation(frame);
-        assert!(scan.census_complete, "{cycle}: the real scan is clean");
-        assert_eq!(
-            scan.snapshots.len(),
-            1,
-            "{cycle}: the never-committed transcript is read again"
-        );
-        // Finish reads this flag only for census-dependent decisions
-        // (complete-census ACK cleanup, backfill and manifest completion).
-        // Marking it incomplete keeps the injected debt unretired.
-        scan.census_complete = false;
-        (preparation, index, scan)
+        collect_preparation_with_rotation(frame)
     }
 
     fn finish(
@@ -1251,4 +1265,8 @@ fn telemetry_retention_follows_only_a_completed_upload_and_saved_index() {
             assert!(pair.iter().all(|path| path.exists()), "{arm}: zero unlinks");
         }
     }
+}
+
+mod identity_503_tests {
+    include!("identity_503_tests.rs");
 }

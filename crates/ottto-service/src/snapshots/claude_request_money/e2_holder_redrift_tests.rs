@@ -523,7 +523,9 @@ fn committed_parent_proves_with_a_retired_census() {
         &index,
         &key,
         ROOT,
-        (t0() + 100_000_000_000, location_key("copy"))
+        (t0() + 100_000_000_000, location_key("copy")),
+        &indexed_main_files(&index),
+        claude_request_hash("copy-a"),
     ));
     index
         .file_snapshot_fingerprints
@@ -533,7 +535,9 @@ fn committed_parent_proves_with_a_retired_census() {
             &index,
             &key,
             ROOT,
-            (t0() + 100_000_000_000, location_key("copy"))
+            (t0() + 100_000_000_000, location_key("copy")),
+            &indexed_main_files(&index),
+            claude_request_hash("copy-a"),
         ),
         "an empty committed entry supplies no requests"
     );
@@ -548,7 +552,9 @@ fn committed_parent_proves_with_a_retired_census() {
             &index,
             &key,
             ROOT,
-            (t0() + 100_000_000_000, location_key("copy"))
+            (t0() + 100_000_000_000, location_key("copy")),
+            &indexed_main_files(&index),
+            claude_request_hash("copy-a"),
         ),
         "an unaccepted held body supplies no requests"
     );

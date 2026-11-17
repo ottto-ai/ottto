@@ -2,10 +2,9 @@
 //! file, the request hashes it once removed as copies on an earlier holder's
 //! CURRENT census proof, grouped by that holder. A later re-read whose holder
 //! proof list has since retired rebuilds the same deduped body instead of
-//! restoring the prefix. A holder no longer indexed cannot disprove anything:
-//! its accepted group stands, counted (`copy_removal_holder_absent_kept`);
-//! an unaccepted holder losing ownership or an indexed holder whose census
-//! lacks a hash reverts it. Local state
+//! restoring the prefix. An exact accepted contributor row keeps each hash
+//! removed through later census changes or holder deletion. Without that row,
+//! loss of local ownership or a negative census retracts the removal. Local state
 //! (class L): never uploaded, never a wire field.
 //!
 //! Every decision is stored whole, whatever its size; recorded decisions are
@@ -126,6 +125,51 @@ impl CopyRemovals {
         }
     }
 
+    pub(in crate::snapshots) fn referenced_hashes(&self) -> BTreeMap<LocationKey, BTreeSet<u64>> {
+        let mut named = BTreeMap::<LocationKey, BTreeSet<u64>>::new();
+        for (_, _, groups) in &self.files {
+            for (holder, hashes) in groups {
+                named
+                    .entry(*holder)
+                    .or_default()
+                    .extend(hashes.iter().copied());
+            }
+        }
+        named
+    }
+    pub(super) fn drop_holder_hashes(
+        &mut self,
+        keep: &BTreeMap<LocationKey, BTreeSet<u64>>,
+    ) -> Vec<LocationKey> {
+        let mut changed = Vec::new();
+        for (file, _, groups) in &mut self.files {
+            let mut lost = false;
+            for (holder, hashes) in groups.iter_mut() {
+                if let Some(keep) = keep.get(holder) {
+                    let kept = hashes
+                        .iter()
+                        .copied()
+                        .filter(|h| keep.contains(h))
+                        .collect::<Box<[_]>>();
+                    lost |= kept.len() != hashes.len();
+                    *hashes = kept;
+                }
+            }
+            if lost {
+                *groups = groups
+                    .iter()
+                    .filter(|(_, h)| !h.is_empty())
+                    .cloned()
+                    .collect();
+                changed.push(*file);
+            }
+        }
+        self.files
+            .retain(|(_, mark, groups)| *mark > 0 || !groups.is_empty());
+        changed
+    }
+
+    #[cfg(test)]
     pub(super) fn drop_holders(&mut self, holders: &BTreeSet<LocationKey>) -> Vec<LocationKey> {
         let mut changed = Vec::new();
         for (file, _, groups) in &mut self.files {

@@ -452,6 +452,7 @@ pub(super) fn settle_checkpointed_upload(
     upload_progress: &SnapshotUploadProgress,
     holds: &LocalHoldSettlement,
     resolved_permanent_rejections: bool,
+    deferred: UnsettledUploadCause,
 ) -> UploadIndexSettlement {
     let terminal_bound_holds = resolved_permanent_rejections
         && holds.page_held()
@@ -488,7 +489,7 @@ pub(super) fn settle_checkpointed_upload(
         index.mark_bounded_sweep_unsettled_by(if resolved_permanent_rejections {
             UnsettledUploadCause::RejectedWithHolds
         } else {
-            UnsettledUploadCause::DeferredConflict
+            deferred
         });
     }
     let fully_settled = upload_settled_without_account_holds(&index, settled && !holds.any());
@@ -1046,6 +1047,7 @@ pub(super) fn checkpoint_partial_snapshot_index_with_audit_release(
         &durable.accepted_body_witnesses,
         &durable.accepted_body_contexts,
     );
+    committable.accept_request_contributions(progress);
     validate_destination().context(CHECKPOINT_VALIDATE_DESTINATION)?;
     committable
         .save_with_progress_owner(index_path, read_limit, &progress_owner)
@@ -1055,6 +1057,54 @@ pub(super) fn checkpoint_partial_snapshot_index_with_audit_release(
         context_rearms.emit(scan.source);
     }
     Ok(committable)
+}
+
+impl ScanIndex {
+    pub(super) fn accept_request_contributions(&mut self, progress: &SnapshotUploadProgress) {
+        let covered = progress.covered_stale_bodies();
+        let mut seen = BTreeSet::new();
+        for (fp, (slot, rows)) in &progress.request_contributions {
+            if progress.fresh_context_body_acks.get(fp) != Some(&rows.body_witness)
+                || progress.quarantined_fingerprints.contains_key(fp)
+                || covered.get(fp) == Some(&rows.body_witness)
+            {
+                continue;
+            }
+            if seen.insert(slot) {
+                self.upload_context_proof
+                    .request_contributions
+                    .insert(slot.clone(), rows.clone());
+            } else {
+                self.upload_context_proof.request_contributions.remove(slot);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn accept_request_contributions_for_test(
+    index: &mut ScanIndex,
+    items: &[SnapshotItem],
+    acks: &BTreeMap<String, String>,
+) {
+    let mut progress = SnapshotUploadProgress::new(
+        "test".into(),
+        snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+    );
+    progress.fresh_context_body_acks = acks.clone();
+    progress.request_contributions = items
+        .iter()
+        .filter(|item| {
+            crate::snapshots::claude_request_money::request_owned_family_root(item).is_some()
+        })
+        .map(|item| {
+            (
+                item.snapshot_fingerprint.clone(),
+                crate::snapshots::upload_context_receipt::SlotRows::capture(item),
+            )
+        })
+        .collect();
+    index.accept_request_contributions(&progress);
 }
 
 pub(super) fn cached_source_manifest(
@@ -1693,6 +1743,20 @@ pub(super) fn finish_sync_source(
     {
         upload_progress.save(&upload_progress_path)?;
     }
+    upload_progress.request_contributions.extend(
+        scan_result
+            .snapshots
+            .iter()
+            .filter(|item| {
+                crate::snapshots::claude_request_money::request_owned_family_root(item).is_some()
+            })
+            .map(|item| {
+                (
+                    item.snapshot_fingerprint.clone(),
+                    crate::snapshots::upload_context_receipt::SlotRows::capture(item),
+                )
+            }),
+    );
     upload_progress.context_receipt_candidates = index.file_upload_context_ack_candidates(
         &scan_result.snapshots,
         &upload_progress.covered_stale_bodies(),
@@ -1857,6 +1921,8 @@ pub(super) fn finish_sync_source(
     let upload_result = if let Some(error) = bootstrap_capacity_error {
         Err(error)
     } else {
+        // Only this main page upload records or drains identity-503 custody.
+        upload_progress.identity_503_pass = Some(BTreeSet::new());
         upload_resumable_batches_with_literal_families(
             &scan_result.snapshots,
             source.api_slug(),
@@ -1944,6 +2010,8 @@ pub(super) fn finish_sync_source(
             )
         })
     };
+    // Main-upload mode ends with it; retries never record or drain custody.
+    let identity_503_this_pass = upload_progress.identity_503_pass.take();
     // The logical offer ends here; normal bounded HTTP retries happened inside.
     if !bootstrap_offer_finished {
         // Bootstrap already classified its failed logical offer. A routed
@@ -2012,6 +2080,8 @@ pub(super) fn finish_sync_source(
     let mut deferred_entity_count = None;
     let mut resolved_permanent_rejections = false;
     let mut isolated_only = false;
+    let mut deferred_cause = UnsettledUploadCause::DeferredConflict;
+    let walk_retired = index.walk_retired_since(&committed_index);
     // Local-hold Completed/Deferred/Rejected subsets and selected-state
     // restoration below can omit a still-live file. Capture which retirement
     // obligations this full scan references before any selection (#794 F1).
@@ -2089,8 +2159,15 @@ pub(super) fn finish_sync_source(
                     resolved_permanent_rejections = true;
                     count
                 }
-                ResumableUploadResult::Deferred { count, isolated } => {
+                ResumableUploadResult::Deferred {
+                    count,
+                    isolated,
+                    identity_503,
+                } => {
                     isolated_only = count == isolated;
+                    if count == identity_503 {
+                        deferred_cause = UnsettledUploadCause::Isolated503;
+                    }
                     count
                 }
                 _ => unreachable!(),
@@ -2102,6 +2179,7 @@ pub(super) fn finish_sync_source(
                 &upload_progress,
                 &local_holds,
                 resolved_permanent_rejections,
+                deferred_cause,
             );
             index = settlement.index;
             if !settlement.fully_settled {
@@ -2402,6 +2480,7 @@ pub(super) fn finish_sync_source(
         &upload_progress.accepted_body_witnesses,
         &upload_progress.accepted_body_contexts,
     );
+    index.accept_request_contributions(&upload_progress);
     let telemetry_removed = claude_scan_roots.as_ref().map(|_| {
         crate::snapshots::claude_telemetry_retention::removed_index_keys(&committed_index, &index)
     });
@@ -2594,6 +2673,12 @@ pub(super) fn finish_sync_source(
         &retired_upload_acks,
         locally_held_fingerprints,
     );
+    if walk_retired {
+        upload_progress.retire_identity_503_custody(
+            identity_503_this_pass.unwrap_or_default(),
+            index.owes_isolated_503(),
+        );
+    }
     #[cfg(test)]
     tests::permanent_finish_pipeline_tests::ack_post_save_failure("finish_cycle")?;
     upload_progress.finish_cycle(&upload_progress_path)?;

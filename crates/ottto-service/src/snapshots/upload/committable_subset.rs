@@ -324,6 +324,7 @@ impl ScanIndex {
             retired_claude_request_identity_contract_changed: serde::de::IgnoredAny,
             claude_desktop_store_inventory: self.claude_desktop_store_inventory.clone(),
             claude_copy_removals: self.claude_copy_removals.clone(),
+            deleted_holders: self.deleted_holders.clone(),
             upload_context_proof: self.upload_context_proof.clone(),
             copy_unproven_enabled: self.copy_unproven_enabled,
             copy_prefix_base_upload_context: self.copy_prefix_base_upload_context.clone(),

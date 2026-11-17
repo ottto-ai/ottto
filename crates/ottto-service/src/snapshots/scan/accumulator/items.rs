@@ -480,6 +480,7 @@ impl SnapshotAccumulator {
             claude_money: self.claude_money,
             claude_usage_request_ids: self.claude_usage_request_ids,
             claude_usage_occurrences: self.claude_usage_occurrences,
+            request_contributions: Box::new([]),
             cache_observations: self.cache_observations,
             cache_observations_state: None,
             cache_base_head_etag: None,

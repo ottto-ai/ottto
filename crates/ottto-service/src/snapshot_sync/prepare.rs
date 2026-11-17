@@ -1117,6 +1117,9 @@ pub(super) fn prepare_sync_source_inner(
     } else {
         Vec::new()
     };
+    // Before the scanner and its committed baseline: identity-503 custody
+    // decides whether that cause still holds this walk unsettled.
+    index.reconcile_isolated_503(&mut upload_progress.identity_503_pending);
     crate::local_resource_diagnostics::index_clone_start(source.api_slug());
     let mut committed_index = index.clone();
     let reoffer_paths =
@@ -1382,6 +1385,7 @@ pub(super) fn activate_source_upload_context(
     );
     progress.fresh_context_body_acks.clear();
     progress.context_receipt_candidates.clear();
+    progress.request_contributions.clear();
     progress.context_resend = upload_context_resend::Cycle::new(context);
 }
 

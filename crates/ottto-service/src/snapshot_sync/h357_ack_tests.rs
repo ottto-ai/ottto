@@ -287,7 +287,8 @@ fn h357_missing_malformed_unknown_or_wrong_body_ack_never_certifies_a_page() {
         outcome,
         ResumableUploadResult::Deferred {
             count: 1,
-            isolated: 0
+            isolated: 0,
+            identity_503: 0
         }
     );
     assert_eq!(sends, 2);
@@ -1395,20 +1396,23 @@ fn h360_probe_conflict_defers_without_source_abort_and_merges_count() {
         with_bootstrap_deferred(ResumableUploadResult::Rejected { count: 2 }, 1),
         ResumableUploadResult::Deferred {
             count: 1,
-            isolated: 0
+            isolated: 0,
+            identity_503: 0
         }
     );
     assert_eq!(
         with_bootstrap_deferred(
             ResumableUploadResult::Deferred {
                 count: 2,
-                isolated: 0
+                isolated: 0,
+                identity_503: 0
             },
             1
         ),
         ResumableUploadResult::Deferred {
             count: 3,
-            isolated: 0
+            isolated: 0,
+            identity_503: 0
         }
     );
     // A true deferral beside an isolated refusal still defers the pass.
@@ -1416,13 +1420,15 @@ fn h360_probe_conflict_defers_without_source_abort_and_merges_count() {
         with_bootstrap_deferred(
             ResumableUploadResult::Deferred {
                 count: 1,
-                isolated: 1
+                isolated: 1,
+                identity_503: 0
             },
             1
         ),
         ResumableUploadResult::Deferred {
             count: 2,
-            isolated: 1
+            isolated: 1,
+            identity_503: 0
         }
     );
     assert_eq!(
@@ -2027,6 +2033,7 @@ fn dominated_refusals_beside_a_local_hold_keep_unsettled_behavior() {
         &ledger,
         &holds,
         true,
+        UnsettledUploadCause::DeferredConflict,
     );
     assert!(!settlement.fully_settled);
     let refusals = PermanentRefusalCounts::of(&ledger);
