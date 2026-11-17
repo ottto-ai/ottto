@@ -250,13 +250,18 @@ impl Page {
         let one = checks.map(|_| reference(&crate::snapshot_sync::ONE_EVIDENCE_CHUNK));
         let before = crate::claude_local_otel::evidence_read_counts_for_test().0;
         let chunks_before = crate::snapshot_sync::evidence_chunks_for_test();
+        // The sync loop sets the server's advertised capability on its ledger
+        // every cycle; production advertises it for every Claude Code upload.
+        // Without a ledger, a keyless one matches no session: only carry differs.
+        let mut cycle = accepted.as_deref().cloned().unwrap_or_default();
+        cycle.set_account_source_enabled(true);
         let ((mut disposition, _, stats), released) =
             e2::pipeline_test_observer::capture_released(|| {
                 apply_claude_local_evidence_to_scan_with_ledger_and_budget(
                     &corpus.support,
                     &mut self.scan,
                     &mut self.index,
-                    accepted.as_deref(),
+                    Some(&cycle),
                     wire_budget,
                     None,
                 )
@@ -530,6 +535,24 @@ fn api_login(
     login: char,
     org: Option<char>,
 ) -> crate::claude_local_otel::ClaudeLocalOtelEvidence {
+    api_login_org(
+        session,
+        request,
+        tokens,
+        login,
+        org.map(|org| org.to_string().repeat(64)),
+    )
+}
+
+/// `api_login` whose complete org is the given hash (e.g. a transcript
+/// marker's organization hash, so telemetry and marker agree).
+fn api_login_org(
+    session: &str,
+    request: &str,
+    tokens: u64,
+    login: char,
+    org: Option<String>,
+) -> crate::claude_local_otel::ClaudeLocalOtelEvidence {
     use crate::claude_local_otel::{
         ClaudeIdentityAttributeEvidence, ClaudeIdentityAttributeOrigin, ClaudeIdentityDisposition,
     };
@@ -555,7 +578,7 @@ fn api_login(
         crate::claude_local_otel::ClaudeRequestIdentityEvidence {
             identity_hash_scheme: "provider-sha256:v1".into(),
             account: attribute(Some(login)),
-            organization: attribute(org.map(|org| org.to_string().repeat(64))),
+            organization: attribute(org),
             disposition: ClaudeIdentityDisposition::Complete,
         },
     ));
@@ -2138,7 +2161,7 @@ fn e2_pipeline_trace_named_agent_on_another_page_is_not_published_on_root() {
 
 /// [`ready`] under a cycle with the cache mode off: as in production, the
 /// upload seam drops the cache rows before delivery, so each ACK proves the
-/// body the page keeps and a retry copy is an ordinary owned body.
+/// body the page keeps.
 fn ready_without_cache(
     corpus: &Corpus,
     scanner: &E2ScanFixture,
@@ -2262,18 +2285,7 @@ fn retry_case(conflict: bool) {
             "re-scan after restart retains canonical bytes"
         );
         assert_eq!(restart.receipt(), fingerprints);
-        let copies = restart
-            .scan
-            .snapshots
-            .iter()
-            .map(|s| retry_ordinary_owned(s).unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            canonical(&copies),
-            original,
-            "owned retry copy retains every literal field"
-        );
-        // Late telemetry must not mutate an already captured retry body.
+        // Late telemetry changes the next scan without mutating this page.
         c.evidence(&[api("own", 20, 200), api("agent", 5, 50)], &[]);
         let mut late = ready_without_cache(
             &c,
@@ -2286,9 +2298,9 @@ fn retry_case(conflict: bool) {
         assert_ne!(
             late.receipt(),
             fingerprints,
-            "fresh OTEL really changes the current body while the frozen retry stays exact"
+            "fresh OTEL really changes the current body while the previously scanned page stays exact"
         );
-        let (result, resent, _) = upload(&copies, &mut progress, |batch| {
+        let (result, resent, _) = upload(&restart.scan.snapshots, &mut progress, |batch| {
             let mut response = ack(batch)?;
             let refused = response.accepted_entities.pop().unwrap();
             response.accepted -= 1;
@@ -2318,7 +2330,9 @@ fn retry_case(conflict: bool) {
         // Accepted root and pending agent are the agreed entity-ACK split;
         // before that ACK the entire small family travelled in one batch.
         assert!(progress.accepted_fingerprints.contains(
-            &copies
+            &restart
+                .scan
+                .snapshots
                 .iter()
                 .find(|s| s.source_session_id == ROOT)
                 .unwrap()
