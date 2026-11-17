@@ -1134,7 +1134,7 @@ mod tests {
             );
             plain.bounded_sweep_had_unsettled_upload = flag;
             let mut tagged =
-                with_unsettled_causes(&plain, u16::MAX & !UnsettledUploadCause::Isolated503.bit());
+                with_unsettled_causes(&plain, !UnsettledUploadCause::Isolated503.bit());
             let mut outcomes = Vec::new();
             for index in [&mut plain, &mut tagged] {
                 let (_, rows) = capture(|| {

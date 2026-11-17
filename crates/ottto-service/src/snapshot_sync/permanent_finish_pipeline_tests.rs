@@ -1048,13 +1048,14 @@ impl AckFinishHome {
     }
 
     fn prepare(&mut self, cycle: &str) -> (SourcePreparation, ScanIndex, SourceScanResult) {
-        self.prepare_scan(cycle, true)
+        self.prepare_scan(cycle, true, 1)
     }
 
     fn prepare_scan(
         &mut self,
         cycle: &str,
         clean: bool,
+        read: usize,
     ) -> (SourcePreparation, ScanIndex, SourceScanResult) {
         self.cadence.next_due_cycle();
         let frame = crate::agent_status_refresh::with_test_collection(Self::collection(), || {
@@ -1078,7 +1079,7 @@ impl AckFinishHome {
         assert_eq!(scan.census_complete, clean, "{cycle}: the real scan");
         assert_eq!(
             scan.snapshots.len(),
-            1,
+            read,
             "{cycle}: the never-committed transcript is read again"
         );
         // Finish reads this flag only for census-dependent decisions
@@ -1359,7 +1360,7 @@ fn identity_503_custody_drains_on_a_grown_body_ack_and_switches() {
             .unwrap();
         // Owed custody holds the walk from its start: its real scan is not
         // clean, so this pass never switches, whatever its ACKs.
-        let (preparation, index, scan) = home.prepare_scan("grown body", false);
+        let (preparation, index, scan) = home.prepare_scan("grown body", false, 1);
         home.finish(preparation, index, scan).unwrap();
         {
             let offered = server.offered.lock().unwrap();
@@ -1377,7 +1378,7 @@ fn identity_503_custody_drains_on_a_grown_body_ack_and_switches() {
         );
         assert!(!switched(&home), "the held walk never switches");
         // The next walk starts settled: its reconcile clears the cause.
-        let (preparation, index, mut scan) = home.prepare("next walk");
+        let (preparation, index, mut scan) = home.prepare_scan("next walk", true, 0);
         scan.census_complete = true;
         home.finish(preparation, index, scan).unwrap();
         assert_eq!(reload(&progress_path).identity_503_pending, None);
