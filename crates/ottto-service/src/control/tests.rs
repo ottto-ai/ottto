@@ -13221,6 +13221,166 @@ fn only_the_companion_repair_press_overrides_a_rebuild_loop_pause() {
 }
 
 #[test]
+#[serial]
+fn daemon_internal_verification_leaves_a_paused_index_for_the_companion() {
+    use crate::snapshots::{ScanIndex, ScanIndexLoadOrigin, SnapshotSource};
+    let _lock = lock_backend_test_env();
+    let root = control_test_root("internal-rebuild-override");
+    create_control_test_dir(&root.join(".codex"));
+    let _home_guard = EnvVarGuard::set_path("HOME", &root);
+    fs::write(root.join(".codex/config.toml"), "model = \"gpt-6.1-sol\"\n")
+        .expect("seed clean config");
+    // Syntax damage quarantines once; recoverable hold-budget damage inside
+    // 24 hours then pauses the source.
+    let path = root.join("codex-scan-index.json");
+    fs::write(&path, b"{").expect("first damage");
+    let (_, origin) =
+        ScanIndex::load_for_snapshot_source_with_origin(&path, SnapshotSource::Codex, &root)
+            .expect("first incident rebuilds");
+    assert_eq!(origin, ScanIndexLoadOrigin::Quarantined);
+    let mut damage = serde_json::to_value(ScanIndex::default()).expect("index value");
+    damage["files"]["excess-held"] = serde_json::json!({"unknown": "x".repeat(2 * 1024 * 1024)});
+    let damage = serde_json::to_vec(&damage).expect("damaged index bytes");
+    fs::write(&path, &damage).expect("second damage");
+    let error =
+        ScanIndex::load_for_snapshot_source_with_origin(&path, SnapshotSource::Codex, &root)
+            .expect_err("the guard refuses");
+    assert!(format!("{error:#}").contains("scan_index_rebuild_loop"));
+
+    let daemon = daemon();
+    let guard = || {
+        (
+            crate::snapshots::scan_index_rebuild_paused(SnapshotSource::Codex),
+            crate::snapshots::scan_index_rebuild_manual_override_count(),
+            crate::snapshots::scan_index_rebuild_override_identity_unrecoverable_count(),
+        )
+    };
+    let before = guard();
+    assert!(before.0, "the source is paused");
+    let internal = RequestAuthorization::DaemonInternal;
+    // The internal caller first: verification reaches its account check and
+    // gets no override result, and the pause, counters and bytes stay.
+    let result = verify_source(&daemon, &internal, SourceKind::Codex, false)
+        .expect("internal verification reaches the account check");
+    assert_eq!(result.status, SourceVerificationStatus::AccountNotConnected);
+    let plan = propose_repair_plan(
+        &daemon,
+        &RequestAuthorization::TrustedCompanionApp,
+        SourceKind::Codex,
+        false,
+    )
+    .expect("ordinary repair plan");
+    assert!(
+        scan_index_rebuild_override_repair(&daemon, &internal, &SourceKind::Codex, &plan).is_none()
+    );
+    assert_eq!(guard(), before);
+    assert_eq!(fs::read(&path).expect("index kept"), damage);
+    // The same pause still gives the Companion its first arm; an earlier arm
+    // would answer with the cooldown instead.
+    let companion = scan_index_rebuild_override_repair(
+        &daemon,
+        &RequestAuthorization::TrustedCompanionApp,
+        &SourceKind::Codex,
+        &plan,
+    )
+    .expect("paused source gives the Companion an override result");
+    assert_eq!(companion.status, RepairPlanStatus::Running);
+    assert_eq!(
+        companion.authority.message.code,
+        "scan_index_rebuild_override_armed"
+    );
+    assert!(companion.actions.is_empty());
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+#[serial]
+fn daemon_internal_is_never_a_request_caller_and_is_refused_beyond_verification() {
+    let _lock = lock_backend_test_env();
+    let foreign = LocalClientPeer::from_pid_and_euid(
+        Some(std::process::id()),
+        Some(daemon_effective_uid().wrapping_add(1)),
+    );
+    for token in [None, Some("wrong-token"), Some("token")] {
+        for kind in [
+            None,
+            Some(LocalClientKind::Cli),
+            Some(LocalClientKind::CompanionApp),
+            Some(LocalClientKind::WebUi),
+        ] {
+            for peer in [
+                None,
+                Some(LocalClientPeer::default()),
+                Some(foreign.clone()),
+                Some(LocalClientPeer::trusted_for_tests()),
+            ] {
+                let request = LocalControlRequest {
+                    request_id: "internal-origin".into(),
+                    protocol_version: PROTOCOL_VERSION,
+                    token: token.map(str::to_owned),
+                    client_kind: kind.clone(),
+                    client_install_owner: None,
+                    command: LocalControlCommand::AuthStatus,
+                };
+                let expected = if let Some(token) = token {
+                    RequestAuthorization::Token(token.into())
+                } else if kind == Some(LocalClientKind::CompanionApp)
+                    && peer.as_ref().is_some_and(|peer| peer.trusted_for_tests)
+                {
+                    RequestAuthorization::TrustedCompanionApp
+                } else {
+                    RequestAuthorization::Untrusted
+                };
+                assert_eq!(request_authorization(&request, peer.as_ref()), expected);
+            }
+        }
+    }
+
+    // Verification passes repair=false and reaches none of these checks.
+    let files = ControlFilesFixture::new();
+    let _patch = EnvVarGuard::remove("OTTTO_PATCH_CODEX_DISABLED");
+    let daemon = daemon();
+    let relay = daemon.inner.lock().unwrap().relay.clone();
+    let internal = RequestAuthorization::DaemonInternal;
+    let refused = Err(LocalApiError::LocalClientNotTrusted);
+    files.assert_unchanged(|| {
+        assert_eq!(
+            diagnostics_collect(&daemon, &internal, false, None, None),
+            refused
+        );
+        assert!(matches!(
+            propose_repair_plan(&daemon, &internal, SourceKind::Codex, true),
+            Err(LocalApiError::LocalClientNotTrusted)
+        ));
+        assert!(matches!(
+            execute_write_config_repair(&daemon, &internal, &SourceKind::Codex),
+            Err(LocalApiError::LocalClientNotTrusted)
+        ));
+        for command in [
+            LocalControlCommand::AgentStatusCached { source: None },
+            LocalControlCommand::RelayStart,
+            LocalControlCommand::RelayStop,
+        ] {
+            let result = handle_command(
+                &daemon,
+                internal.clone(),
+                command,
+                InstallOwner::Unknown,
+                None,
+                false,
+            );
+            assert_eq!(result, refused);
+        }
+    });
+    let state = daemon.inner.lock().unwrap();
+    assert_eq!(state.relay, relay);
+    assert!(!state.repair_locked);
+    assert!(state.sources.is_empty());
+    assert!(state.local_health_events.is_empty());
+    assert!(state.command_ledger.is_empty());
+}
+
+#[test]
 fn backend_cli_error_message_omits_endpoint_details() {
     let error = cli_error(LocalApiError::Backend(BackendErrorDetails {
         kind: BackendErrorKind::Rejected,

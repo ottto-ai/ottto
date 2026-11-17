@@ -40,7 +40,9 @@ pub(super) fn require_authorized_local_client(
             daemon.control_token.authorize(token)?;
             daemon.require_usable_state()
         }
-        RequestAuthorization::TrustedCompanionApp => daemon.require_usable_state(),
+        RequestAuthorization::TrustedCompanionApp | RequestAuthorization::DaemonInternal => {
+            daemon.require_usable_state()
+        }
         RequestAuthorization::Untrusted => Err(LocalApiError::LocalClientNotTrusted),
     }
 }

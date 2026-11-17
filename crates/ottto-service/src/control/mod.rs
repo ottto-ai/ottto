@@ -1328,7 +1328,7 @@ fn handle_command(
             match &authorization {
                 RequestAuthorization::Token(token) => daemon.control_token.authorize(token)?,
                 RequestAuthorization::TrustedCompanionApp => {}
-                RequestAuthorization::Untrusted => {
+                RequestAuthorization::Untrusted | RequestAuthorization::DaemonInternal => {
                     return Err(LocalApiError::LocalClientNotTrusted)
                 }
             }
@@ -1652,7 +1652,9 @@ fn handle_command(
                     daemon.set_relay_state_for_trusted_client(relay)?;
                     to_value(daemon.status_for_trusted_client()?.relay)
                 }
-                RequestAuthorization::Untrusted => Err(LocalApiError::LocalClientNotTrusted),
+                RequestAuthorization::Untrusted | RequestAuthorization::DaemonInternal => {
+                    Err(LocalApiError::LocalClientNotTrusted)
+                }
             }
         }
         LocalControlCommand::RelayStop => {
@@ -1671,7 +1673,9 @@ fn handle_command(
                     daemon.set_relay_state_for_trusted_client(relay)?;
                     to_value(daemon.status_for_trusted_client()?.relay)
                 }
-                RequestAuthorization::Untrusted => Err(LocalApiError::LocalClientNotTrusted),
+                RequestAuthorization::Untrusted | RequestAuthorization::DaemonInternal => {
+                    Err(LocalApiError::LocalClientNotTrusted)
+                }
             }
         }
         LocalControlCommand::Verify { source, repair } => {
@@ -1805,7 +1809,7 @@ fn handle_command(
             match &authorization {
                 RequestAuthorization::Token(token) => daemon.stop(token)?,
                 RequestAuthorization::TrustedCompanionApp => daemon.stop_for_trusted_client()?,
-                RequestAuthorization::Untrusted => {
+                RequestAuthorization::Untrusted | RequestAuthorization::DaemonInternal => {
                     return Err(LocalApiError::LocalClientNotTrusted)
                 }
             }

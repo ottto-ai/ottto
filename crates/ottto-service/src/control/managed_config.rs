@@ -337,7 +337,9 @@ pub(super) fn propose_repair_plan(
         RequestAuthorization::TrustedCompanionApp => {
             daemon.propose_repair_for_trusted_client(source, dry_run)
         }
-        RequestAuthorization::Untrusted => Err(LocalApiError::LocalClientNotTrusted),
+        RequestAuthorization::Untrusted | RequestAuthorization::DaemonInternal => {
+            Err(LocalApiError::LocalClientNotTrusted)
+        }
     }
 }
 
@@ -357,7 +359,9 @@ pub(super) fn execute_write_config_repair(
         RequestAuthorization::TrustedCompanionApp => {
             daemon.acquire_repair_lock_for_trusted_client(source.clone())?
         }
-        RequestAuthorization::Untrusted => return Err(LocalApiError::LocalClientNotTrusted),
+        RequestAuthorization::Untrusted | RequestAuthorization::DaemonInternal => {
+            return Err(LocalApiError::LocalClientNotTrusted)
+        }
     };
     repair_source_config(daemon, source)
 }
