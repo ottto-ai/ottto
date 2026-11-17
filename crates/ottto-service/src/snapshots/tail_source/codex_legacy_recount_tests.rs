@@ -191,11 +191,13 @@ fn collapse_aliases(scan: &mut SourceScanResult) {
         if a.snapshot_fingerprint != b.snapshot_fingerprint {
             return false;
         }
-        assert_eq!(
-            serde_json::to_value(&*a).unwrap(),
-            serde_json::to_value(&*b).unwrap(),
-            "joined aliases must emit identical bytes"
-        );
+        // The aliases differ only in the physical file fingerprint. Preserve
+        // every money, placement and body-evidence field in this assertion.
+        let mut a = serde_json::to_value(a).unwrap();
+        let mut b = serde_json::to_value(b).unwrap();
+        a.as_object_mut().unwrap().remove("source_file_fingerprint");
+        b.as_object_mut().unwrap().remove("source_file_fingerprint");
+        assert_eq!(a, b, "joined aliases must carry identical logical bodies");
         true
     });
 }
@@ -285,20 +287,36 @@ fn codex_legacy_unchanged_upgrade_restart() {
             } else {
                 f.change("\n");
             }
+            let before = f.route.index.files[&f.key].clone();
+            let activity = codex_zst_refusal_tests::activity();
             let ((scan, modes), io) =
                 oracle::observe_codex_quiet(|| f.page(&E2ScanFixture::default()));
             let mut observed = oracle::scan_money(SnapshotSource::Codex, &f.route.index, &scan);
             observed.mode = oracle::Mode::Restart;
             observed.modes = modes;
             observed.io = io;
-            if grouped {
-                assert!(
-                    scan.snapshots.is_empty(),
-                    "missing member proof holds the whole group"
-                );
-            } else {
-                oracle::money_oracle::assert_quiet_restart_zero_bytes(&observed);
-            }
+            // The file changed and its reduction proof is damaged. A bounded
+            // owning-header lookup may run; no body parse or replacement may.
+            assert!(
+                scan.snapshots.is_empty(),
+                "damaged Legacy proof keeps the body held"
+            );
+            assert_eq!(observed.modes, (0, 0, 0));
+            assert_eq!(observed.io.consumed, 0);
+            let after = codex_zst_refusal_tests::activity();
+            assert_eq!(after.0, activity.0, "no decoder constructed");
+            assert!(
+                after.1 - activity.1 <= if grouped { 2 } else { 1 },
+                "at most one header lookup per member"
+            );
+            assert_eq!(
+                f.route.index.files[&f.key].last_snapshot_fingerprint,
+                before.last_snapshot_fingerprint
+            );
+            assert_eq!(
+                f.route.index.files[&f.key].last_upload_body_witness,
+                before.last_upload_body_witness
+            );
             assert!(!f.route.index.files[&f.key].codex_counting_v2);
         }
     }

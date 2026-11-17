@@ -3781,54 +3781,6 @@ pub(super) mod tests {
             .map(|name| local_index_key(&root.join("sessions").join(format!("{name}.jsonl"))));
         (root, keys)
     }
-    /// The selected local ACK facts the counting mark must move with.
-    fn local_ack(
-        entry: &ScanIndexEntry,
-    ) -> (
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    ) {
-        (
-            entry.last_snapshot_fingerprint.clone(),
-            entry.last_upload_body_witness.clone(),
-            entry.codex_joined_member_set.clone(),
-            entry.codex_protected_owner.clone(),
-        )
-    }
-    /// Finalizes one scan, saves its selected index over `file` (compare-and-
-    /// swap against the generation it was loaded at) and reloads it.
-    fn save_selected(
-        root: &Path,
-        file: &str,
-        mut working: ScanIndex,
-        mut result: SourceScanResult,
-        previous: &ScanIndex,
-        hold_owner: Option<&str>,
-    ) -> ScanIndex {
-        finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut working);
-        if let Some(owner) = hold_owner {
-            result.hold_codex_groups(
-                &mut working,
-                previous,
-                &BTreeSet::from([resolve_codex_identity(owner)]),
-                "synthetic counting hold",
-            );
-        }
-        result.finish_codex_capture_boundary(&mut working);
-        let accepted = result
-            .snapshots
-            .iter()
-            .map(|item| item.snapshot_fingerprint.clone())
-            .collect::<BTreeSet<_>>();
-        let path = root.join(file);
-        working
-            .committable_subset(previous, &accepted, &BTreeMap::new())
-            .save(&path)
-            .unwrap();
-        ScanIndex::load(&path).unwrap()
-    }
     #[test]
     fn counting_v2_group_is_configured_once_and_folded_once() {
         let (root, keys) = counting_v2_fixture();
@@ -3867,6 +3819,7 @@ pub(super) mod tests {
             2,
             json!({"type":"turn_context","payload":{"turn_id":turn,"model":"gpt-5.2"}}),
         );
+        rows.pop(); // Leave the native-backed task open across the accepted prefix.
         fs::write(
             root.join("sessions/b.jsonl"),
             rows.iter()
@@ -3895,7 +3848,17 @@ pub(super) mod tests {
             entry.codex_applied_tier_receipt_required = entry.codex_applied_tier_receipt.is_some();
         }
         let appended = member(owner, "r-c", 200, 500);
-        rows.extend(appended.into_iter().skip(1));
+        rows.extend(appended.into_iter().filter_map(|mut row| {
+            if row["type"] == "token_usage_record" {
+                row["payload"]["turn_id"] = json!(turn);
+                Some(row)
+            } else if string_eq_at(&row, &["payload", "type"], "token_count") {
+                Some(row)
+            } else {
+                None
+            }
+        }));
+        rows.push(json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":turn}}));
         fs::write(
             root.join("sessions/b.jsonl"),
             rows.iter()
@@ -5271,9 +5234,10 @@ pub(super) mod tests {
                 .map_or(0, |receipt| receipt.tiers.len())
         };
         assert_eq!(tiers(&previous), 2);
-        // 513 more admitted records under b's priority turn, 1 input token each.
+        // 513 more native/UI pairs in explicitly priority turns, 1 input each.
         let mut text = fs::read_to_string(&path).unwrap();
         for i in 0..513u64 {
+            older_build_logs_priority(&format!("r-t{i}"));
             for row in member(owner, &format!("r-t{i}"), 1, 301 + i)
                 .into_iter()
                 .skip(1)
@@ -5305,7 +5269,11 @@ pub(super) mod tests {
             .iter()
             .map(|item| serde_json::to_value(item).unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(tiers(&after), 514, "1 fixture tier + 513 appended");
+        assert_eq!(
+            tiers(&after),
+            1028,
+            "2 fixture witnesses + 513 native/UI pairs"
+        );
         finalize_scan_after_policy(SnapshotSource::Codex, &mut rescanned, &mut after);
         let (capture, _) = after.stage_codex_recovery_capture(&previous, &rescanned.snapshots);
         rescanned.finish_codex_capture_boundary(&mut after);
@@ -5318,7 +5286,7 @@ pub(super) mod tests {
         let saved = root.join("index.json");
         committed.save(&saved).unwrap();
         let mut loaded = ScanIndex::load(&saved).unwrap();
-        assert_eq!(tiers(&loaded), 514);
+        assert_eq!(tiers(&loaded), 1028);
         // T3: the trace source expires; only the saved receipt can price b.
         older_build_logs_expired();
         loaded.prepare_historical_replay("tier-cap-replay".into());

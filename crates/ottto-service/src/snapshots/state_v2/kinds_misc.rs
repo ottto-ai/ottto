@@ -442,13 +442,7 @@ pub(super) fn hydrate_txn(
         if let Some(h) = tx.get(&key)? {
             if empty_counting_root(tx, &h)? {
                 // Match the ordinary row writer's digest without hydrating history.
-                mapper::field_read::<serde_json::Value>(
-                    tx,
-                    kind,
-                    field_mode(kind),
-                    Some(&mut cx.digests),
-                    || serde_json::Value::Null,
-                )?;
+                mapper::read::<serde_json::Value>(tx, &h, Some(&mut cx.digests))?;
             }
         }
     }

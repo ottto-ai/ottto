@@ -921,8 +921,6 @@ crate::heap_layout_bound::fields!(GroupJob; key, owner, home, members, stamps, d
     charge, probe_bound, probe_limit_bound, own_page, dependencies, memo_digest, scope,
     consumed_before, independent, contributions);
 
-impl GroupJob {}
-
 /// Bytes the group consumed outside the current reader (completed members,
 /// header rechecks) since the last call.
 pub(in crate::snapshots) fn take_charge(active: &mut OwnedActiveFile) -> u64 {
