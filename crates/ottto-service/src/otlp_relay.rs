@@ -1993,29 +1993,36 @@ pub(crate) mod tests {
         let mut cases = Vec::new();
         // Even the daemon's own token cannot widen the browser route.
         for token in ["forged-token", TOKEN] {
-            for (command, stale) in [
+            for (command, mismatched) in [
                 (status(), false),
                 (LocalControlCommand::UpdateCheck, false),
                 (LocalControlCommand::UpdateCheck, true),
                 (launch(), false),
             ] {
-                cases.push((command, stale, Some(token), None));
+                let error = if mismatched {
+                    "bad_request"
+                } else {
+                    "unsupported_command"
+                };
+                cases.push((command, mismatched, Some(token), Err(error)));
             }
         }
-        cases.push((telemetry(), true, None, Some(CliErrorCode::InvalidRequest)));
+        // A mismatched protocol version fails request parsing, before command
+        // filtering, so even an allowed command is a bad request.
+        cases.push((telemetry(), true, None, Err("bad_request")));
         // A Companion claim without a token reaches dispatch untrusted.
         cases.push((
             telemetry(),
             false,
             None,
-            Some(CliErrorCode::LocalClientNotTrusted),
+            Ok(CliErrorCode::LocalClientNotTrusted),
         ));
-        for (command, stale, token, expected) in cases {
-            let context = format!("{command:?} stale={stale}");
+        for (command, mismatched, token, expected) in cases {
+            let context = format!("{command:?} mismatched={mismatched}");
             let version = ottto_protocol::expected_local_control_protocol_version(&command);
             let body = serde_json::to_vec(&LocalControlRequest {
                 request_id: "browser-allowlist".into(),
-                protocol_version: version + u16::from(stale),
+                protocol_version: version + u16::from(mismatched),
                 token: token.map(str::to_owned),
                 client_kind: Some(LocalClientKind::CompanionApp),
                 client_install_owner: None,
@@ -2043,15 +2050,18 @@ pub(crate) mod tests {
             let mut response = String::new();
             client.read_to_string(&mut response).unwrap();
             let (_, payload) = response.split_once("\r\n\r\n").unwrap();
-            let Some(expected) = expected else {
-                assert!(
-                    response.starts_with("HTTP/1.1 400"),
-                    "{context}: {response}"
-                );
-                let payload: serde_json::Value = serde_json::from_str(payload).unwrap();
-                assert_eq!(payload["error"], "unsupported_command", "{context}");
-                assert!(entered.is_empty(), "{context}");
-                continue;
+            let expected = match expected {
+                Ok(code) => code,
+                Err(error) => {
+                    assert!(
+                        response.starts_with("HTTP/1.1 400"),
+                        "{context}: {response}"
+                    );
+                    let payload: serde_json::Value = serde_json::from_str(payload).unwrap();
+                    assert_eq!(payload["error"], error, "{context}");
+                    assert!(entered.is_empty(), "{context}");
+                    continue;
+                }
             };
             assert!(
                 response.starts_with("HTTP/1.1 200"),
@@ -2063,11 +2073,7 @@ pub(crate) mod tests {
                 label: "control_dispatch_entered",
                 fields: vec![("trusted_companion", Scalar::Bool(false))],
             }];
-            assert_eq!(
-                entered,
-                if stale { vec![] } else { dispatched },
-                "{context}"
-            );
+            assert_eq!(entered, dispatched, "{context}");
         }
         let hits = manifest.accept();
         assert!(

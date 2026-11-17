@@ -16,10 +16,11 @@ enum Cell {
     NeedsUserAction,
     Internal,
     BackendResponseUnexpected,
+    NetworkUnavailable,
 }
 use Cell::{
     AuthFailed as A, BackendResponseUnexpected as B, Internal as H, InvalidRequest as I,
-    NeedsUserAction as U, NotTrusted as N, Ok as O, Poisoned as P,
+    NeedsUserAction as U, NetworkUnavailable as X, NotTrusted as N, Ok as O, Poisoned as P,
 };
 
 struct Row {
@@ -485,9 +486,10 @@ const ROWS: &[Row] = &[
             sources: vec![],
             claim_code: None,
             setup_run_id: None,
+            // An untrusted destination is refused before any keychain read.
             api_base_url: Some("invalid".into()),
         },
-        cells: [I, N, N, N, A, A, I, I, I, P, P, A],
+        cells: [I, N, N, N, A, A, X, X, X, P, P, A],
     },
     Row {
         name: "SetupAnswer",
@@ -823,6 +825,7 @@ fn assert_cell(response: &LocalControlResponse, expected: Cell, context: &str) {
         P | H => CliErrorCode::Internal,
         U => CliErrorCode::NeedsUserAction,
         B => CliErrorCode::BackendResponseUnexpected,
+        X => CliErrorCode::NetworkUnavailable,
         O => unreachable!(),
     };
     assert_eq!(error.code, code, "{context}: {response:?}");
