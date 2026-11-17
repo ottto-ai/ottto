@@ -166,7 +166,6 @@ fn assert_cross_build_scope(raw: &Value, cross: &Value) {
     // permit any other component, content hash, money or ordering drift.
     for path in [
         "/source_file_fingerprint",
-        "/semantic_envelope/revision_hash",
         "/semantic_envelope/revision_v2_hash",
     ] {
         *restored

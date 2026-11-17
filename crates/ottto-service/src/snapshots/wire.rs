@@ -112,14 +112,10 @@ pub struct SnapshotBatchRequest<T = SnapshotItem> {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SnapshotSemanticEnvelope {
     pub component_contract_version: &'static str,
-    pub revision_contract_version: &'static str,
     pub upload_policy: SnapshotUploadPolicy,
     pub component_hashes: BTreeMap<&'static str, String>,
-    pub revision_hash: String,
-    /// Additive, server-reproducible revision witness. The v1 fields remain
-    /// byte-identical for old-backend tolerance; only this RFC 8785 witness is
-    /// eligible for a future conflict challenge because every input either
-    /// travels here or already travels in the post-policy snapshot body.
+    /// Server-reproducible RFC 8785 revision witness for conflict challenges.
+    /// Every input travels here or in the post-policy snapshot body.
     pub revision_v2_contract_version: &'static str,
     pub revision_v2_canonicalization: &'static str,
     pub revision_v2_parser_version: &'static str,
@@ -988,7 +984,6 @@ crate::heap_layout_bound::fields!(SnapshotUsageBucket; bucket_start, model_usage
 pub(super) const SCAN_INDEX_SCHEMA_VERSION: u16 = 2;
 pub(super) const FILE_CONTENT_SAMPLE_BYTES: usize = 4 * 1024;
 pub(crate) const SNAPSHOT_SEMANTIC_CONTRACT_VERSION: &str = "snapshot_semantic:v1";
-pub(crate) const SNAPSHOT_REVISION_CONTRACT_VERSION: &str = "snapshot_revision:v1";
 pub(crate) const SNAPSHOT_REVISION_V2_CONTRACT_VERSION: &str = "snapshot_revision:v2";
 pub(crate) const MAX_SEMANTIC_ENVELOPE_BYTES: usize = 2 * 1024;
 pub(crate) const MAX_SNAPSHOT_ITEM_WIRE_BYTES: usize = 640 * 1024;
