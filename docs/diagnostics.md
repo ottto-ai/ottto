@@ -2011,12 +2011,14 @@ with one append per evidence file per request and no fsync. Counts only: no ids,
 paths or payload content, and they never affect usage or cost.
 
 The same `process_retained_cache_lifecycle_totals` row carries these cumulative
-writer byte counters in `counts` (all sources; the row's `source` is `unknown`):
+writer counters in `counts` (all sources; the row's `source` is `unknown`):
 
 | Field | Measurement |
 | --- | --- |
 | `{claude,codex,pi}_sqlite_pager_wal_page_bytes_cumulative` | Per verified state-store source: SQLite `SQLITE_DBSTATUS_CACHE_WRITE` pages multiplied by the 4096-byte page size already verified at connection setup. In WAL mode these are pager writes to the WAL, not checkpoint writes to the main database. |
 | `upload_history_sqlite_pager_wal_page_bytes_cumulative` | The same pager/WAL page measurement for the upload-history connection, including its cloud ACK cache. |
+| `sqlite_tempbuf_spill_bytes_cumulative` | Remaining SQLite `SQLITE_DBSTATUS_TEMPBUF_SPILL` bytes after resetting `CACHE_WRITE`, across the same verified state-store and upload-history connections. In SQLite 3.54.1 this remainder is external-sort temp-file bytes only; ephemeral intermediate tables and statement journals are in neither counter, so a low value does not rule out other TEMP file writes. |
+| `sqlite_checkpoint_reported_pages_cumulative` | Sum of nonnegative pages-checkpointed values returned by existing state-store WAL checkpoints, including partial/busy results. Reported pages, not exact copy-back bytes: passive checkpoints can re-report frames already backfilled, and successful TRUNCATE can return zero. The sum is neither an upper nor a lower bound on copy-back; upload-history automatic checkpoints are not included. |
 | `shared_cache_helper_write_bytes_cumulative` | Payload bytes from successful complete writes through `write_json_atomic` and `replace_json_cache`. Counts temp-file writes before rename, even if rename later fails; does not mean all status persistence. |
 | `otlp_relay_appended_bytes` | Existing cumulative encoded bytes from successful local OTLP evidence appends; reused unchanged. |
 
@@ -2028,10 +2030,14 @@ bytes across VACUUM publication, COMMIT reconciliation and later opens, so a new
 connection never resets a field. Upload history is sampled before this existing
 per-page row under a nonblocking try-lock (busy means retain the last sample),
 and on drop. Sampling uses `sqlite3_db_status64`, with no additional SQL.
+SQLite 3.54.1's [status counters](https://sqlite.org/c3ref/c_dbstatus_options.html)
+overlap through TEMP-table pager writes; resetting `CACHE_WRITE` before
+`TEMPBUF_SPILL` removes that overlap, so readers may ADD this spill counter to
+the pager bytes.
 File writes add one relaxed saturating atomic update through the existing
-counter helper, without allocation; pager sampling adds one status read and
-atomic update per connection boundary, without new threads or timers. The
-existing counter helper also feeds active page diagnostics. Each total is a
+counter helper, without allocation; pager/spill sampling adds two status reads
+and relaxed atomic updates per connection boundary, without new threads or
+timers. The existing counter helper also feeds active page diagnostics. Each total is a
 separate relaxed observation, not an atomic snapshot of all writers.
 
 These are payload attribution diagnostics, not process logical-write totals.
