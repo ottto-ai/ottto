@@ -17,7 +17,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{bail, ensure, Context, Result};
-use serde::de::{DeserializeSeed, Deserializer as _, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::de::{DeserializeSeed, Deserializer as _, IgnoredAny, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -571,65 +571,6 @@ impl<W: Write> Write for HashWriter<W> {
     }
     fn flush(&mut self) -> io::Result<()> {
         self.writer.flush()
-    }
-}
-
-// The probe is not a semantic decoder: it skips values and recognizes only the
-// representation fence. Unknown versions refuse while visiting their header,
-// before envelope size checks or ANY mutation. Arrays remain legacy-compatible.
-struct Probe<'a>(&'a std::cell::Cell<bool>);
-impl<'de> Visitor<'de> for Probe<'_> {
-    type Value = (u16, u64);
-    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("index representation header")
-    }
-    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<(u16, u64), A::Error> {
-        let schema = seq.next_element::<u16>()?.unwrap_or(LOGICAL_SCHEMA);
-        if schema != LOGICAL_SCHEMA {
-            return Err(serde::de::Error::custom(
-                "scan_index_representation_refused",
-            ));
-        }
-        let generation = seq.next_element::<u64>()?.unwrap_or(0);
-        while seq.next_element::<IgnoredAny>()?.is_some() {}
-        Ok((schema, generation))
-    }
-    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> std::result::Result<(u16, u64), A::Error> {
-        let mut schema = None;
-        let mut storage = false;
-        let mut generation = None;
-        while let Some(key) = map.next_key::<String>()? {
-            if key == "schema_version" {
-                if schema.is_some() {
-                    return Err(serde::de::Error::custom("scan_index_duplicate_header"));
-                }
-                let v: u16 = map.next_value()?;
-                if v != LOGICAL_SCHEMA && v != OUTER_SCHEMA {
-                    return Err(serde::de::Error::custom(
-                        "scan_index_representation_refused",
-                    ));
-                }
-                schema = Some(v);
-                // New envelopes always put the fence first. Stop here so an
-                // oversized/future root cannot force a corpus-sized parse.
-                if v == OUTER_SCHEMA {
-                    self.0.set(true);
-                    return Err(serde::de::Error::custom("scan_index_header_complete"));
-                }
-            } else if key == "generation" {
-                if generation.is_some() {
-                    return Err(serde::de::Error::custom("scan_index_duplicate_header"));
-                }
-                generation = Some(map.next_value::<u64>()?);
-            } else {
-                storage |= key == "storage_format";
-                map.next_value::<IgnoredAny>()?;
-            }
-        }
-        if storage {
-            return Err(serde::de::Error::custom("scan_index_bad_fence"));
-        }
-        Ok((schema.unwrap_or(LOGICAL_SCHEMA), generation.unwrap_or(0)))
     }
 }
 
@@ -1236,12 +1177,6 @@ impl<R: Read> KeyGuard<R> {
             header_key_len: 0,
             control_value: false,
             array_position: 0,
-        }
-    }
-    fn headers(inner: R) -> Self {
-        Self {
-            headers: true,
-            ..Self::new(inner)
         }
     }
 }

@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
 #[cfg(test)]
 use std::io::BufWriter;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(unix)]
