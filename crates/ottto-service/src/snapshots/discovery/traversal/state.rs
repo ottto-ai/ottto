@@ -311,6 +311,10 @@ impl ScanTraversalCheckpoint {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub(in crate::snapshots) struct ScanTraversalResidue {
+    /// One growth retry per file per walk: false after requeue, true once
+    /// deferred. Saved with the walk so restart cannot renew its allowance.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub(in crate::snapshots) growth_retries: BTreeMap<String, bool>,
     /// Local index keys of the residue files (the same key space as `files`).
     #[serde(skip_serializing_if = "BTreeSet::is_empty")]
     pub(in crate::snapshots) index_keys: BTreeSet<String>,
@@ -320,7 +324,9 @@ pub(in crate::snapshots) struct ScanTraversalResidue {
 
 impl ScanTraversalResidue {
     fn is_empty(&self) -> bool {
-        self.index_keys.is_empty() && self.codex_inventory_hold.is_none()
+        self.growth_retries.is_empty()
+            && self.index_keys.is_empty()
+            && self.codex_inventory_hold.is_none()
     }
 }
 
@@ -515,7 +521,7 @@ crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownersh
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; oversized_discovery, context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_freshness_yield, retired_codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue, listing_started_unix_seconds, listing_owed_requeued_unix_seconds);
 crate::heap_layout_bound::fields!(ScanTraversalCounts; max_unread_bytes, caps, causes, retired_unchanged_reread_admitted, retired_reread_budget_refused, retired_codex_roster_refresh_visited, retired_codex_roster_growth_enqueued, discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, retired_parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count, listing_generations, listing_changes_without_hint, listing_owed_requeued, growth_deferred);
 crate::heap_layout_bound::fields!(ScanTraversalPath; scan_root, path, census_member, watcher_hint);
-crate::heap_layout_bound::fields!(ScanTraversalResidue; index_keys, codex_inventory_hold);
+crate::heap_layout_bound::fields!(ScanTraversalResidue; growth_retries, index_keys, codex_inventory_hold);
 crate::heap_layout_bound::fields!(CodexInventoryHold; owed, refused_headers, outside_roster, awaiting_directories);
 crate::heap_layout_bound::fields!(TerminalJsonlDisposition; source_file_fingerprint, parser_generation, loss);
 crate::heap_layout_bound::fields!(TerminalJsonlLoss; malformed_json_line_count, invalid_utf8_line_count, recognized_usage_drop_count, dropped_usage_record_count);

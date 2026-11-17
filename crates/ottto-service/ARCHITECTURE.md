@@ -29,6 +29,14 @@ file-system hint / periodic listing → select file → read new bytes from save
   loader. They still provide no copy proof or body-binding authority. Without audit capacity or
   when the loader holds, they read natively on their holder's page. Exact/Empty growth can lose
   census verification and require a native read on the next force.
+  Every plain Full/Tail acquisition with a read plan stops at its opening frozen length.
+  Appends beyond that extent belong to the next ordinary pass. A grown in-page read
+  validates its held-file prefix and path before publishing; it keeps no new Tail
+  checkpoint and earns no Full-audit or source-verification credit. An unfinished
+  boundary record remains withheld. If the prefix would weaken a committed body or
+  cannot reserve its audit marker, that file gets one same-walk retry; a second refusal
+  releases a committed body to the next pass, or leaves a new file unreadable.
+  Unsampled native reads without a plan (including some protected/forced paths) remain unbounded and out of scope.
 - **Reduction.** One reducer per source turns lines into usage and keeps a running result. Old
   evidence is read only for the session group a change affects.
 - **Codex rollout encodings.** Plain `.jsonl` and compressed `.jsonl.zst` use the same
