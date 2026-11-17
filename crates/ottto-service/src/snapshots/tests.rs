@@ -486,6 +486,7 @@ fn codex_created_thread_rows_restore_desktop_delegation_lineage() {
             (12, 8, 2, 1),
             Some((12, 8, 2, 1)),
         ),
+        json!({"timestamp":"2026-08-26T15:02:03Z","ordinal":4,"type":"event_msg","payload":{"type":"task_complete","turn_id":"01a03e98-5000-7000-8000-000000000001"}}),
     ];
     fs::write(
         &all_local_path,
@@ -16585,6 +16586,8 @@ fn codex_created_thread_malformed_crash_tail_keeps_valid_sibling_usage() {
         ),
     ];
 
+    let mut child = child.to_vec();
+    child.push(json!({"timestamp":"2026-08-02T08:20:04Z","ordinal":4,"type":"event_msg","payload":{"type":"task_complete","turn_id":turn_id}}));
     let root = temp_dir("codex-created-thread-malformed-crash-tail");
     let path = root.join(format!("rollout-{child_id}.jsonl"));
     let mut body = child
@@ -17989,7 +17992,7 @@ fn codex_created_thread_parentless_admits_only_its_own_proven_history() {
         &jsonl_body(&grown),
         |_, _| {},
     );
-    assert_parentless_admitted(&parsed, (210, 166, 13, 4, 4));
+    assert_parentless_admitted(&parsed, (200, 160, 11, 3, 3));
     let mut reheader = grown;
     let header = reheader[0].clone();
     reheader.push(header);

@@ -196,7 +196,7 @@ fn header_cache_production_wake_output_equivalence_join_fork_counting() {
                         .validate(&scan.snapshots)
                         .unwrap();
                     let counting = scan.codex_counting_v2.as_deref().unwrap();
-                    assert_eq!(counting.v2_sessions, 1);
+                    assert_eq!(counting.v2_sessions, 2);
                     assert_eq!(counting.native_counted, 2);
                     assert_eq!(counting.ui_in_unbound_span, 0);
                     let counting = serde_json::to_value(counting).unwrap();

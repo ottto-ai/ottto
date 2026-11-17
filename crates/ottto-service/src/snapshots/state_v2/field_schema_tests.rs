@@ -789,6 +789,9 @@ fn stored_field_paths_check() {
             );
             continue;
         };
+        if catalogue::retired(kind) {
+            continue;
+        }
         for path in paths.difference(now) {
             if parent(path).is_some_and(|p| !now.contains(p))
                 || MOVED.contains(&(kind.as_str(), path.as_str()))

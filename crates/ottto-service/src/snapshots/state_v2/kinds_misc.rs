@@ -425,6 +425,24 @@ pub(super) fn hydrate_txn(
         ($($t:tt)*) => {};
     }
     scan_index_fields!(each load);
+    for kind in [
+        "v1_field.codex_counting_tombstones",
+        "v1_field.codex_counting_evicted_legacy",
+    ] {
+        let key = mapper::key(kind, "", 0)?;
+        if let Some(h) = tx.get(&key)? {
+            if empty_counting_root(tx, &h)? {
+                // Match the ordinary row writer's digest without hydrating history.
+                mapper::field_read::<serde_json::Value>(
+                    tx,
+                    kind,
+                    field_mode(kind),
+                    Some(&mut cx.digests),
+                    || serde_json::Value::Null,
+                )?;
+            }
+        }
+    }
     read_holds(index, tx, Some(&mut cx.digests))
 }
 pub(super) fn references(

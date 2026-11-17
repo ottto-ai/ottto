@@ -2402,6 +2402,7 @@ mod tests {
                 json!({"type": "response_item", "payload": {"type": "function_call_output", "call_id": "c2", "output": "0123456789"}}),
                 codex_token_count((2100, 1800, 80), (1100, 1000, 30)),
                 codex_token_count((3300, 2900, 100), (1200, 1100, 20)),
+                json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1"}}),
             ],
         );
         let items =

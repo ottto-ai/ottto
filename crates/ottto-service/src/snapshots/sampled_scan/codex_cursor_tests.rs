@@ -6506,11 +6506,13 @@ fn continuation_prepares_no_group_attempt() {
     fn chain(prefix: &str, created: &str, start: u64) -> Vec<u8> {
         let mut body = codex_line(json!({"type": "session_meta", "timestamp": created,
             "payload": {"id": OWNER, "timestamp": created}}));
+        body.extend(codex_line(json!({"type":"event_msg","timestamp":created,"payload":{"type":"task_started","turn_id":prefix}})));
+        body.extend(codex_line(json!({"type":"turn_context","timestamp":created,"payload":{"turn_id":prefix,"model":"gpt-5.2"}})));
         for i in 0..30_u64 {
             let after = start + 10 * (i + 1);
             body.extend(codex_line(json!({"type": "token_usage_record",
                 "timestamp": "2026-10-01T10:01:00Z", "payload": {"thread_id": OWNER,
-                "response_id": format!("{prefix}-{i}"), "usage": usage(10),
+                "turn_id":prefix,"response_id": format!("{prefix}-{i}"), "usage": usage(10),
                 "thread_token_usage": usage(after)}})));
             let at = format!(
                 "2026-10-01T{:02}:{:02}:{:02}Z",
@@ -6522,6 +6524,9 @@ fn continuation_prepares_no_group_attempt() {
                 "payload": {"type": "token_count", "info": {"last_token_usage": usage(10),
                 "total_token_usage": usage(after)}}})));
         }
+        body.extend(codex_line(
+            json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":prefix}}),
+        ));
         body
     }
     let dir = Temp::new("group-continuation", b"");

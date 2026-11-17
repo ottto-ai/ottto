@@ -1094,15 +1094,7 @@ fn account_return_history_row(recorded_a: bool) {
         })
     };
     for (source, session, expected) in [
-        (
-            1,
-            CX,
-            Some(if recorded_a {
-                [2000, 200, 0, 0, 0, 0, 0, 1]
-            } else {
-                [1000, 100, 0, 0, 0, 0, 0, 1]
-            }),
-        ),
+        (1, CX, Some([1000, 100, 0, 0, 0, 0, 0, 1])),
         (0, OLD, recorded_a.then_some([30, 3, 0, 0, 0, 0, 0, 1])),
         (0, IDENTITY_PIPELINE_ROOT, Some([30, 3, 0, 0, 0, 0, 0, 1])),
         (2, "return-pi", Some([12, 4, 0, 0, 0, 0, 0, 1])),
@@ -1145,7 +1137,7 @@ fn account_return_history_row(recorded_a: bool) {
                 );
             }
             if source == 1 {
-                assert_eq!(counts(prior), [2000, 200, 0, 0, 0, 0, 0, 1]);
+                assert_eq!(counts(prior), [1000, 100, 0, 0, 0, 0, 0, 1]);
                 assert_eq!(counts(&prior["model_usage"][0]), counts(prior));
                 assert_eq!(counts(&after["model_usage"][0]), expected);
                 assert_eq!(

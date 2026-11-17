@@ -157,7 +157,7 @@ fn source_rows_import_hydrate_and_save_like_v1() {
         .iter()
         .filter(|(kind, field, _)| field.starts_with("codex_") && !catalogue::retired(kind))
         .collect::<Vec<_>>();
-    assert_eq!(codex.len(), 2, "persisted Codex kinds");
+    assert_eq!(codex.len(), 0, "counting history kinds are retired");
     for (kind, field, introduced) in codex {
         assert_eq!(*introduced, 1, "{kind}: no layout bump for Codex-ON");
         assert_ne!(
@@ -321,7 +321,12 @@ fn previous_release_store_retired_rows_absent_after_save_and_reopen() {
         {
             let mut tx = db.begin(TxnMode::Read).unwrap();
             for key in &retired {
-                assert!(tx.get(key).unwrap().is_none(), "{source:?}: {key:?}");
+                assert!(
+                    tx.get(key)
+                        .unwrap()
+                        .is_none_or(|h| kinds_misc::empty_counting_root(&mut tx, &h).unwrap()),
+                    "{source:?}: {key:?}"
+                );
             }
             for (set, (refs, owners)) in &sets {
                 // Less its retired owners: a set only retired rows held is released.

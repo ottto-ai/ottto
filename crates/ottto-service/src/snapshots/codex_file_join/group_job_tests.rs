@@ -589,10 +589,19 @@ fn binding_requires_unique_logical_uuid_offset_and_chain() {
     );
     // The offset and the native chain are proven in the replay.
     let plans = planned.plans;
+    let raw_ordinals = |rows: Vec<Value>, first: u64| {
+        rows.into_iter()
+            .zip(first..)
+            .map(|(mut row, n)| {
+                row["ordinal"] = json!(n);
+                row
+            })
+            .collect::<Vec<_>>()
+    };
     let run = |offset: u64, before: u64| {
         let mut proof = StreamProof::new(OWNER.into(), false, plans.clone());
         proof.begin_member(0);
-        let rows = ordinals(
+        let rows = raw_ordinals(
             vec![
                 meta(OWNER, "2026-10-01T10:00:00Z", json!({})),
                 native(OWNER, "r-0", 100, 100),
@@ -605,7 +614,7 @@ fn binding_requires_unique_logical_uuid_offset_and_chain() {
         proof.end_member(offset);
         proof.begin_member(1);
         let mut rows = vec![base_row(OWNER, 3, 3)];
-        rows.extend(ordinals(
+        rows.extend(raw_ordinals(
             vec![
                 native(OWNER, "r-1", 50, before + 50),
                 ui(50, before + 50, "2026-10-01T11:00:30Z"),
@@ -835,8 +844,8 @@ fn line_loss_before_refusal_is_strict_and_not_memoized() {
     );
     // b's second native is missing: the chain gaps at its third.
     let mut rows = chain_rows(OWNER, "b", "2026-10-01T10:30:00Z", 20, 3);
-    rows.remove(3);
-    rows.remove(3);
+    rows.remove(4);
+    rows.remove(4);
     write_rows(&root.join("sessions/b.jsonl"), &rows);
     assert_eq!(
         refused(replay_group(group_of(&root), &ScanIndex::default())),
@@ -1387,6 +1396,10 @@ fn curable_refusal_at_frozen_cut_with_unread_growth_is_not_memoized() {
     );
     // The final turn's UI record is written before its native.
     let mut live = chain_rows(OWNER, "b", "2026-10-01T10:30:00Z", 300, 30);
+    live.push(
+        json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"late-native"}}),
+    );
+    live.push(turn("late-native"));
     live.push(ui(20, 620, "2026-10-01T10:10:20Z"));
     write_rows(&root.join("sessions/b.jsonl"), &live);
 
@@ -1401,7 +1414,14 @@ fn curable_refusal_at_frozen_cut_with_unread_growth_is_not_memoized() {
             // The native lands past the live member's frozen extent.
             append_rows(
                 &root.join("sessions/b.jsonl"),
-                &[native(OWNER, "b-30", 20, 620)],
+                &[
+                    {
+                        let mut row = native(OWNER, "b-30", 20, 620);
+                        row["payload"]["turn_id"] = json!("late-native");
+                        row
+                    },
+                    json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"late-native"}}),
+                ],
             );
             let (mut index, _, _) = pages(&root, index, &cache, || {
                 cache.paused_group_position().is_none()
@@ -1670,7 +1690,10 @@ fn memoized_large_group_takes_no_slot_and_leaves_no_waiter() {
     // per-member reason (the scaled singleton budget leaves the probes in
     // chronological order, under which a chain reason is `ProbeBudgetOrder`).
     let mut b = chain_rows(OWNER, "b", "2026-10-01T10:30:00Z", 300, 30);
-    b[5]["payload"]["response_id"] = json!("");
+    b.iter_mut()
+        .filter(|r| r["type"] == "token_usage_record")
+        .nth(1)
+        .unwrap()["payload"]["response_id"] = json!("");
     write_rows(&root.join("sessions/b.jsonl"), &b);
     let cache = Arc::new(SharedCache::default());
     with_test_limits(2048, 1024, 64, || {
@@ -1726,8 +1749,6 @@ fn memoized_large_group_takes_no_slot_and_leaves_no_waiter() {
 #[test]
 fn counting_v2_decision_reaches_the_group_proof() {
     let (root, _) = counting_v2_unbound_fixture();
-    assert!(replay_group(group_of(&root), &ScanIndex::default()).is_ok());
-
     assert_eq!(
         refused(replay_group(group_of(&root), &ScanIndex::default())),
         Some((JoinRefusal::V2UnboundUi, 1))

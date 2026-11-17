@@ -75,7 +75,8 @@ pub(in crate::snapshots) fn seed(index: &mut ScanIndex, path: &Path, root: &Path
         .unwrap();
     let mut unused = SnapshotAccumulator::new(SnapshotSource::Codex);
     let decoded = codex::Codex::decode_head(current.revision, &current.body, &mut unused).unwrap();
-    let (old, _, historical) = decode(kind);
+    let (mut old, _, historical) = decode(kind);
+    old.codex_sidecar_binding = unused.codex_sidecar_binding;
     let entry = &index.files[&key];
     let items = old.clone().into_items(
         path,

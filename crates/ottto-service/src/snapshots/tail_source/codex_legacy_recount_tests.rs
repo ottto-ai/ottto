@@ -64,6 +64,7 @@ impl LegacyFixture {
         );
         finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);
         scan.finish_codex_capture_boundary(&mut index);
+        collapse_aliases(&mut scan);
         self.route.index = index;
         (scan, modes)
     }
@@ -77,6 +78,14 @@ impl LegacyFixture {
             .index
             .record_accepted_snapshot_fingerprints(&accepted);
         self.route.save(false);
+    }
+    fn restore(&mut self) {
+        self.route.index = self
+            .route
+            ._session
+            .as_ref()
+            .unwrap()
+            .save_reload(&mut self.route.index);
     }
     fn seed_copy(&mut self) -> PathBuf {
         let path = self
@@ -170,13 +179,31 @@ impl LegacyFixture {
             SnapshotUploadPolicy::default(),
         );
         finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);
+        collapse_aliases(&mut scan);
         oracle::scan_money(SnapshotSource::Codex, &index, &scan)
     }
+}
+
+fn collapse_aliases(scan: &mut SourceScanResult) {
+    scan.snapshots
+        .sort_by(|a, b| a.snapshot_fingerprint.cmp(&b.snapshot_fingerprint));
+    scan.snapshots.dedup_by(|a, b| {
+        if a.snapshot_fingerprint != b.snapshot_fingerprint {
+            return false;
+        }
+        assert_eq!(
+            serde_json::to_value(&*a).unwrap(),
+            serde_json::to_value(&*b).unwrap(),
+            "joined aliases must emit identical bytes"
+        );
+        true
+    });
 }
 
 /// [money] Audit, witness adoption and set-aside cannot convert unchanged history.
 #[test]
 fn codex_legacy_unchanged_upgrade_restart() {
+    let _decoder = oracle::codex_decoder_test_lock();
     for selection in ["settled", "audit", "witness", "retry"] {
         let mut f = LegacyFixture::new();
         match selection {
@@ -200,6 +227,7 @@ fn codex_legacy_unchanged_upgrade_restart() {
             }
             _ => {}
         }
+        f.restore();
         let before = f.route.index.files[&f.key].clone();
         let ((scan, modes), io) = oracle::observe_codex_quiet(|| f.page(&E2ScanFixture::default()));
         let mut observed = oracle::scan_money(SnapshotSource::Codex, &f.route.index, &scan);
@@ -215,6 +243,7 @@ fn codex_legacy_unchanged_upgrade_restart() {
     }
     let mut joined = LegacyFixture::new();
     joined.seed_copy();
+    joined.restore();
     let ((scan, modes), io) =
         oracle::observe_codex_quiet(|| joined.page(&E2ScanFixture::default()));
     let mut observed = oracle::scan_money(SnapshotSource::Codex, &joined.route.index, &scan);
@@ -244,6 +273,7 @@ fn codex_legacy_unchanged_upgrade_restart() {
                 .unwrap();
             }
             f.route.save(false);
+            f.restore();
             if let Some(copy) = copy {
                 use std::io::Write;
                 File::options()
@@ -350,6 +380,7 @@ fn codex_legacy_growth_recounts_cold_v2() {
         );
         assert!(f.route.index.files[&f.key].codex_counting_v2);
         f.accept(&scan);
+        f.restore();
         let extra = codex_lines(3)
             .into_iter()
             .skip(codex_lines(2).len())

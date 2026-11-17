@@ -1814,6 +1814,9 @@ impl StreamProof {
             None => {}
         }
         if self.independent {
+            if string_eq_at(value, &["type"], "token_usage_record") {
+                self.observe_native(value)?;
+            }
             return Ok(());
         }
         let ordinal_member = self
@@ -1880,6 +1883,9 @@ impl StreamProof {
         let before = after.before(usage).ok_or(JoinRefusal::Corrupt)?;
         if !self.responses.insert(compact(b"r:", response)) {
             return Err(JoinRefusal::Overlap);
+        }
+        if self.independent {
+            return Ok(());
         }
         match self.member.last_after {
             // A non-monotone counter inside one member is a reset.
@@ -2375,7 +2381,13 @@ pub(super) mod tests {
         out
     }
     pub(crate) fn member(owner: &str, response: &str, input: u64, cumulative: u64) -> Vec<Value> {
-        bound_rows(&unbound_member(owner, response, input, cumulative))
+        let mut rows = bound_rows(&unbound_member(owner, response, input, cumulative));
+        rows.insert(
+            2,
+            json!({"type":"turn_context", "timestamp":rows[1]["timestamp"],
+            "payload":{"turn_id":response,"model":"gpt-5.2"}}),
+        );
+        rows
     }
     fn unbound_member(owner: &str, response: &str, input: u64, cumulative: u64) -> Vec<Value> {
         // Header time follows the counter: equal header bytes and size would
@@ -3841,56 +3853,6 @@ pub(super) mod tests {
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
-    fn counting_v2_member_mark_moves_only_with_the_selected_saved_ack() {
-        let (root, keys) = counting_v2_fixture();
-        let owner = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
-        let previous = {
-            let (index, result) = scan(&root, ScanIndex::default(), 2);
-            save_selected(&root, "v2.json", index, result, &ScanIndex::default(), None)
-        };
-        for key in &keys {
-            assert!(previous.files[key].codex_counting_v2, "saved V2 ACK");
-            assert!(previous.files[key].last_snapshot_fingerprint.is_some());
-        }
-        // The held and settled outcomes are alternatives: each starts from its
-        // own copy of the saved index the cycle loaded.
-        for file in ["held.json", "settled.json"] {
-            fs::copy(root.join("v2.json"), root.join(file)).unwrap();
-        }
-        // New content, parsed by an inactive build: a Legacy group decision.
-        let path = root.join("sessions/b.jsonl");
-        let mut text = fs::read_to_string(&path).unwrap();
-        for row in member(owner, "r-c", 200, 500).into_iter().skip(1) {
-            text.push_str(&(serde_json::to_string(&row).unwrap() + "\n"));
-        }
-        fs::write(&path, text).unwrap();
-        let legacy_scan = || {
-            let (working, result) = scan(&root, previous.clone(), 2);
-            for key in &keys {
-                assert!(!working.files[key].codex_counting_v2);
-            }
-            (working, result)
-        };
-        // A held group restores the old mark with the old ACK in saved state.
-        let (working, result) = legacy_scan();
-        let held = save_selected(&root, "held.json", working, result, &previous, Some(owner));
-        for key in &keys {
-            assert!(held.files[key].codex_counting_v2, "mark kept with its ACK");
-            assert_eq!(local_ack(&held.files[key]), local_ack(&previous.files[key]));
-        }
-        // Paired control: the selected save records false with the new facts.
-        let (working, result) = legacy_scan();
-        let settled = save_selected(&root, "settled.json", working, result, &previous, None);
-        for key in &keys {
-            assert!(!settled.files[key].codex_counting_v2, "false with new ACK");
-            assert_ne!(
-                settled.files[key].last_snapshot_fingerprint,
-                previous.files[key].last_snapshot_fingerprint
-            );
-        }
-        fs::remove_dir_all(root).unwrap();
-    }
-    #[test]
     fn applied_priority_survives_trace_expiry_without_pricing_appended_same_turn() {
         let (root, inventory) = fixture();
         let owner = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
@@ -3994,7 +3956,7 @@ pub(super) mod tests {
                 .unwrap()
                 .tiers
                 .len(),
-            1
+            2
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -5308,7 +5270,7 @@ pub(super) mod tests {
                 .0
                 .map_or(0, |receipt| receipt.tiers.len())
         };
-        assert_eq!(tiers(&previous), 1);
+        assert_eq!(tiers(&previous), 2);
         // 513 more admitted records under b's priority turn, 1 input token each.
         let mut text = fs::read_to_string(&path).unwrap();
         for i in 0..513u64 {
@@ -5786,7 +5748,7 @@ pub(super) mod tests {
         let a = member(OWNER, "response-a", 100, 100);
         let b = member(OWNER, "response-b", 200, 300);
         assert_eq!(stream(&[a.clone(), b.clone()]), None);
-        let probes = [probe_before(&b[2]), probe_before(&a[2])];
+        let probes = [probe_before(&b[3]), probe_before(&a[3])];
         assert_eq!(order_by_probes(&[0, 1], &probes), Ok(vec![1, 0]));
     }
     #[test]
@@ -5813,7 +5775,7 @@ pub(super) mod tests {
     fn copied_ui_contribution_cannot_gain_a_second_member() {
         let a = member(OWNER, "response-a", 100, 100);
         let mut b = member(OWNER, "response-b", 100, 200);
-        b[3] = a[3].clone();
+        b[4] = a[4].clone();
         assert_eq!(stream(&[a, b]), Some((JoinRefusal::Overlap, 1)));
     }
     #[test]
@@ -5821,7 +5783,7 @@ pub(super) mod tests {
         let rows = member(OWNER, "response", 100, 100);
         for field in ["thread_id", "response_id", "usage", "thread_token_usage"] {
             let mut changed = rows.clone();
-            changed[2]["payload"].as_object_mut().unwrap().remove(field);
+            changed[3]["payload"].as_object_mut().unwrap().remove(field);
             assert_eq!(
                 stream(&[changed]),
                 Some((JoinRefusal::Corrupt, 0)),
@@ -5829,7 +5791,7 @@ pub(super) mod tests {
             );
         }
         let mut changed = rows;
-        changed[3]["payload"]["info"]["last_token_usage"] = usage(200);
+        changed[4]["payload"]["info"]["last_token_usage"] = usage(200);
         assert_eq!(stream(&[changed]), Some((JoinRefusal::UiUnmatched, 0)));
     }
 }
