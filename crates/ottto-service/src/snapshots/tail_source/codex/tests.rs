@@ -792,18 +792,20 @@ fn export_historical_codex_head() {
     let path = dir.join("rollout.jsonl");
     let mut rows = lines(1);
     // One native response plus two UI observations: Legacy and V2 differ.
-    let ui = rows
-        .iter()
-        .find(|line| line.contains("token_count"))
-        .unwrap()
-        .clone();
-    rows.insert(rows.len() - 1, ui);
+    let mut ui: Value = serde_json::from_str(
+        rows.iter()
+            .find(|line| line.contains("token_count"))
+            .unwrap(),
+    )
+    .unwrap();
+    ui["timestamp"] = json!("2026-10-18T10:00:01Z");
+    rows.insert(rows.len() - 1, ui.to_string());
     rows.insert(
         3,
         json!({"timestamp":at(0),"type":"token_usage_record","payload":{
             "thread_id":SESSION,"turn_id":"turn-0000","response_id":"response-0000",
-            "usage":{"input_tokens":100,"output_tokens":30,"total_tokens":130},
-            "thread_token_usage":{"input_tokens":100,"output_tokens":30,"total_tokens":130}
+            "usage":{"input_tokens":100,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":30,"reasoning_output_tokens":0,"total_tokens":130},
+            "thread_token_usage":{"input_tokens":100,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":30,"reasoning_output_tokens":0,"total_tokens":130}
         }})
         .to_string(),
     );
@@ -836,6 +838,13 @@ fn export_historical_codex_head() {
                 .unwrap();
             let (reduction, checkpoint) =
                 native_cold::finish_record(&mut parser, &scope, 1_790_000_000);
+            let totals = &reduction.finish_view().0.accepted_usage_totals;
+            let expected = match (fixture, name) {
+                ("mixed", "legacy") => (200, 20),
+                ("mixed", "v2") => (100, 30),
+                _ => (10, 2),
+            };
+            assert_eq!((totals.input_tokens, totals.output_tokens), expected);
             let staged = stage_reduction::<Codex>(
                 &reduction,
                 &checkpoint.durable_certificate(0).unwrap(),
