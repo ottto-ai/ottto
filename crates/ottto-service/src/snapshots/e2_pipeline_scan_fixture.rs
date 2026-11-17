@@ -52,6 +52,28 @@ impl ScanIndex {
         prepare_fixture_save(self, path)?;
         self.save(path)
     }
+
+    pub(crate) fn save_fixture_for_source(
+        &mut self,
+        path: &Path,
+        source: SnapshotSource,
+    ) -> Result<()> {
+        if scan_index_integration::scan_index_storage_binding(path).is_none() {
+            let source = match source {
+                SnapshotSource::ClaudeCode => scan_index_persistence::Source::Claude,
+                SnapshotSource::Codex => scan_index_persistence::Source::Codex,
+                SnapshotSource::Pi => scan_index_persistence::Source::Pi,
+            };
+            fixture_bindings().lock().unwrap().insert(
+                path.to_owned(),
+                scan_index_persistence::Binding {
+                    source,
+                    namespace_hash: "a".repeat(64),
+                },
+            );
+        }
+        self.save_fixture(path)
+    }
 }
 
 fn prepare_fixture_save(index: &mut ScanIndex, path: &Path) -> Result<()> {

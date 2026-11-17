@@ -921,7 +921,7 @@ fn add_enlarging_filler(index: &mut ScanIndex) {
 fn bounded_native_enlarged_by_filler() -> SameSourceAckFixture {
     let mut f = SameSourceAckFixture::new();
     add_enlarging_filler(&mut f.baseline);
-    f.baseline.save(&f.index_path).unwrap();
+    f.baseline.save_fixture(&f.index_path).unwrap();
     add_enlarging_filler(&mut f.working);
     f.working.generation = f.baseline.generation;
     assert!(

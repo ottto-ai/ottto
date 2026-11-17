@@ -46,8 +46,9 @@ fn counting_transition_capture_and_failed_upload_select_whole_entries() {
     let index_path = root.join("index.json");
     let progress_path = root.join("progress.json");
     let mut committed = ScanIndex::default();
-    committed.activate_quarantine_witness(SnapshotSource::Codex);
-    committed.save_fixture(&index_path).unwrap();
+    committed
+        .save_fixture_for_source(&index_path, SnapshotSource::Codex)
+        .unwrap();
     {
         let _cutover = crate::snapshots::TestCutover::set(0);
         let mut working = committed.clone();

@@ -1918,8 +1918,9 @@ fn h360_restart_restores_held_probe_quarantine_from_index_and_retries_when_due()
         .file_snapshot_fingerprints
         .insert("synthetic/held.jsonl".into(), BTreeSet::from([fp.clone()]));
     index.retain_quarantined_fingerprints(&ledger.quarantined_fingerprints);
-    index.activate_quarantine_witness(SnapshotSource::Codex);
-    index.save_fixture(&index_path).unwrap();
+    index
+        .save_fixture_for_source(&index_path, SnapshotSource::Codex)
+        .unwrap();
     ledger.save(&progress_path).unwrap();
     ledger.finish_cycle(&progress_path).unwrap();
     let loaded = ScanIndex::load(&index_path).unwrap();

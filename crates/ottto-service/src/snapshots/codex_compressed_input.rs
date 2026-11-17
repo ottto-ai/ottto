@@ -683,20 +683,27 @@ pub(in crate::snapshots) mod tests {
         }
     }
 
-    struct Fixture(PathBuf);
+    struct Fixture(PathBuf, Option<crate::test_scratch::ScratchDir>);
     impl Drop for Fixture {
         fn drop(&mut self) {
+            if self.0.parent().is_some_and(Path::exists)
+                && e2_pipeline_scan_fixture::fixture_binding(&self.0).is_some()
+            {
+                state_v2::erase_published(&self.0);
+            }
             let _ = fs::remove_file(&self.0);
+            drop(self.1.take());
         }
     }
     fn fixture(bytes: &[u8], suffix: &str) -> Fixture {
-        let path = std::env::temp_dir().join(format!(
+        let scratch = crate::test_scratch::ScratchDir::canonical("compressed-input");
+        let path = scratch.join(format!(
             "ottto-compressed-input-{}-{}{suffix}",
             std::process::id(),
             NEXT.fetch_add(1, AtomicOrdering::Relaxed)
         ));
         fs::write(&path, bytes).unwrap();
-        Fixture(path)
+        Fixture(path, Some(scratch))
     }
 
     // Same synthetic Codex shapes as transcript_acquisition_tests.
@@ -952,7 +959,7 @@ pub(in crate::snapshots) mod tests {
                 codex_session_id_from_path(&archive.0).as_deref(),
                 Some(owner)
             );
-            let plain = Fixture(archive.0.with_extension(""));
+            let plain = Fixture(archive.0.with_extension(""), None);
             fs::write(&plain.0, &bytes).unwrap();
             let mut bodies = Vec::new();
             for (path, compressed) in [(&plain.0, false), (&archive.0, true)] {
@@ -1397,7 +1404,9 @@ pub(in crate::snapshots) mod tests {
                 pending.census_member && pending.watcher_hint,
                 "both selection flags survive refusal"
             );
-            refused.save(&checkpoint.0).unwrap();
+            refused
+                .save_fixture_for_source(&checkpoint.0, SnapshotSource::Codex)
+                .unwrap();
             occupied.close();
             let restored = ScanIndex::load(&checkpoint.0).unwrap();
             let restart = selector_scan(
@@ -1438,7 +1447,8 @@ pub(in crate::snapshots) mod tests {
             let mut owed = scan.index.clone();
             let restart_file = fixture(b"", ".json");
             fs::remove_file(&restart_file.0).unwrap();
-            owed.save(&restart_file.0).unwrap();
+            owed.save_fixture_for_source(&restart_file.0, SnapshotSource::Codex)
+                .unwrap();
             let (((), prefix), first_logs) = crate::local_resource_diagnostics::capture(|| {
                 observe_consumed(|| {
                     let mut scan = scan;
@@ -2074,7 +2084,13 @@ pub(in crate::snapshots) mod tests {
         let singleton = downgrade_member(&out.join("activation"), owner, true);
         let mut activation = downgrade_accepted(&singleton, &native.snapshots[0]);
         downgrade_seed(&mut activation, &singleton);
-        activation.save(&out.join("activation.json")).unwrap();
+        // The legacy decoder view is separate from the service's native route.
+        let route = out
+            .join("native-activation")
+            .join("a".repeat(64))
+            .join("codex-scan-index.json");
+        activation = e2_pipeline_scan_fixture::seed_index_for_test(&activation, &route);
+        e2_pipeline_scan_fixture::save_for_test(&mut activation, &out.join("activation.json"));
         fs::write(out.join("activation-key.txt"), local_index_key(&singleton)).unwrap();
         fs::remove_dir_all(root).unwrap();
     }

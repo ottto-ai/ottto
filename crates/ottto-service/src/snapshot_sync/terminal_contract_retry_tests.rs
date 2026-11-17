@@ -804,8 +804,11 @@ fn terminal_contract_malformed_claims_exhaust_without_reset_or_opaque_hold() {
                 (&fixture.index_path, "quarantined_snapshot_fingerprints"),
                 (&fixture.progress_path, "quarantined_fingerprints"),
             ] {
-                let mut wire: serde_json::Value =
-                    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+                let mut wire: serde_json::Value = if field == "quarantined_snapshot_fingerprints" {
+                    serde_json::to_value(ScanIndex::load(path).unwrap()).unwrap()
+                } else {
+                    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+                };
                 let record = &mut wire[field][held_fingerprint()];
                 record["contract_retry_claims"] = bad.clone();
                 record["disposition"] = serde_json::json!("retry_pending");
@@ -816,7 +819,14 @@ fn terminal_contract_malformed_claims_exhaust_without_reset_or_opaque_hold() {
                 if repair && field == "quarantined_snapshot_fingerprints" {
                     record["failed_reconstruction_count"] = serde_json::Value::Null;
                 }
-                std::fs::write(path, serde_json::to_vec(&wire).unwrap()).unwrap();
+                if field == "quarantined_snapshot_fingerprints" {
+                    crate::snapshots::e2_pipeline_scan_fixture::seed_json_for_test(
+                        path,
+                        &serde_json::to_vec(&wire).unwrap(),
+                    );
+                } else {
+                    std::fs::write(path, serde_json::to_vec(&wire).unwrap()).unwrap();
+                }
             }
             let (mut index, mut progress) = fixture.load();
             assert_eq!(
