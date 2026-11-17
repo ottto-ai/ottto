@@ -159,13 +159,12 @@ fn synthetic_default_indexes_save_and_reload_through_native_custody() {
         index.save(&path).unwrap();
         assert_eq!(route_of(&index).as_deref(), Some(path.as_path()));
         assert_eq!(index.generation, 1);
+        let replay = index.historical_replay_generation.clone();
+        drop(index);
         state_v2::cold_close_for_test(&path).unwrap();
         let restored = ScanIndex::load(&path).unwrap();
         assert_eq!(restored.generation, 1);
-        assert_eq!(
-            restored.historical_replay_generation,
-            index.historical_replay_generation
-        );
+        assert_eq!(restored.historical_replay_generation, replay);
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&fs::read(path).unwrap()).unwrap()
                 ["storage_format"],
