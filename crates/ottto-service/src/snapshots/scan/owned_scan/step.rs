@@ -133,7 +133,7 @@ impl OwnedSourceScan {
             sidecar_census_complete,
             codex_census_valid,
             census_window_end,
-            discovered_file_count,
+            mut discovered_file_count,
             census_unix_seconds,
             mut census,
             mut snapshots,
@@ -2095,7 +2095,7 @@ impl OwnedSourceScan {
                                     index,
                                     &selected_flags,
                                     &candidate,
-                                    true,
+                                    Some(&mut discovered_file_count),
                                 )
                             {
                                 census.record_unreadable_file(cause, &candidate.path);

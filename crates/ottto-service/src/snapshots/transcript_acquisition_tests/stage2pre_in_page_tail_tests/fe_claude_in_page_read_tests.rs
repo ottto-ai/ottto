@@ -554,8 +554,9 @@ fn assert_retried(
 
 /// A page that renames a same-bytes object over the path once an in-page
 /// read whose mode satisfies `want` opens. `rereading`: the file is selected
-/// as a watcher-hinted re-read that does not hold the census. Returns the
-/// page's walk window and the file's selection flags.
+/// as a watcher-hinted re-read that does not hold the census, in a walk that
+/// has counted only its pending members as discovered (the tight bound).
+/// Returns the page's walk window and the file's selection flags.
 fn replaced_page(
     source: SnapshotSource,
     base: &Baseline,
@@ -568,6 +569,10 @@ fn replaced_page(
         if selected.is_none() && opened(scan).is_some_and(|read| want(read.mode)) {
             if rereading {
                 scan.selected_flags.insert(base.key.clone(), (false, true));
+                let members = scan.index.skipped_census_member_count();
+                scan.discovered_file_count = members;
+                let walk = scan.index.traversal.as_mut().unwrap();
+                walk.counts.discovered_file_count = members;
             }
             selected = Some((
                 scan.census_window_end.clone(),
@@ -621,9 +626,15 @@ fn fe_claude_sp3a_replace_during_tail_not_grown_is_scope_object() {
             if rereading {
                 assert_eq!(flags, (false, true), "precondition: {id}");
                 assert!(!first.census_complete, "{id}: the walk waits");
+                // Skipped == discovered before the promotion; the promoted
+                // retry is counted in both, so the status stays valid.
                 assert!(
                     first.skipped_file_count_due_to_limit <= first.discovered_file_count,
                     "{id}: pending never exceeds discovered"
+                );
+                assert_eq!(
+                    walk.counts.discovered_file_count, first.discovered_file_count,
+                    "{id}: the page reports the walk's count"
                 );
             } else {
                 assert!(flags.0, "precondition: {id}");
