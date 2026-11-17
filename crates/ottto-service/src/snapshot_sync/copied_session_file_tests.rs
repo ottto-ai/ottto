@@ -2,7 +2,7 @@
 use super::*;
 use crate::snapshots::claude_money_birth_store::location_key;
 use crate::snapshots::e2_pipeline_scan_fixture::{
-    origin_accepted_for_test, upload_context_proof_is_current_for_test,
+    accepted_file_for_test, origin_accepted_for_test, upload_context_proof_is_current_for_test,
 };
 use crate::snapshots::sampled_scan::transition_fixture::{
     money_oracle, observe_consumed, Mode, RouteResult,
@@ -1712,7 +1712,7 @@ fn copied_file_version_three_converges_once() {
             prior.claude_money_birth_store.set_money_rule_version(2);
             e2::take_diag();
             e2::apply_money_rules(&mut prior);
-            assert_eq!(prior.claude_money_birth_store.money_rule_version(), 4);
+            assert_eq!(prior.claude_money_birth_store.money_rule_version(), 5);
             assert_eq!(copy_diag(&["money_rule_v3_reowed"]), [2]);
             prior = c.reload(&mut prior);
             e2::apply_money_rules(&mut prior);
@@ -2469,4 +2469,190 @@ fn carried_main_keeps_local_proof_without_accepted_request_rows() {
             );
         }
     });
+}
+
+/// [money] A settled same-session path twin can keep its counted prefix when
+/// the holder's acceptance was committed while the copy census was absent.
+/// Rule 5 compares that unchanged decision once; a resumed twin still needs
+/// its holder on the correction page under Rule A.
+#[test]
+fn settled_disclosed_copy_redecides_once_after_holder_acceptance() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    const OLD_RULES: &[(u16, u8)] = &[(1, 0), (2, 0), (3, 0), (4, 0)];
+    for resumed_copy in [false, true] {
+        with_e2(|| {
+            let mut c = Corpus::new("settled-counted-copy");
+            let turns = if resumed_copy {
+                vec![A, B, C]
+            } else {
+                vec![A, B]
+            };
+            let copy = c.write_at(&file(COPY), &resumed(ROOT, &turns), BORN);
+            let unrelated = c.write_at(
+                &format!("unrelated/{}", file(THIRD)),
+                &resumed(THIRD, &[("unrelated", A.1, OLD_WRITER)]),
+                BORN,
+            );
+            let scanner = E2ScanFixture::default();
+            let empty = ScanIndex::default();
+            let mut first = ready(&c, &scanner, empty.clone(), 100, true);
+            first.finish();
+            let counted = body(&first, ROOT).unwrap().clone();
+            assert_eq!(counted.request_count, turns.len() as u64);
+            assert_eq!(counted.removed_request_count, Some(0));
+            let mut prior = settle(&c, &empty, first, &mut e2_progress());
+            let copy_key = copy.to_string_lossy().into_owned();
+            let unrelated_key = unrelated.to_string_lossy().into_owned();
+            let location = location_key(&copy_key);
+            assert_ne!(
+                prior.claude_money_birth_store.money_marks(location) & e2::money_mark::DISCLOSED,
+                0
+            );
+            assert_ne!(
+                prior
+                    .claude_money_birth_store
+                    .money_marks(location_key(&unrelated_key))
+                    & e2::money_mark::DISCLOSED,
+                0
+            );
+            assert!(removed_hashes(&prior, &copy).is_empty());
+
+            // The copy is already settled while its earlier holder has no
+            // accepted body. Temporarily missing census is not an invitation
+            // to reread it when the holder is subsequently accepted.
+            let holder = c.root(ROOT, &resumed(ROOT, &[A, B]));
+            let holder_key = holder.to_string_lossy().into_owned();
+            assert!(!accepted_file_for_test(&prior, &holder_key));
+            let census = prior
+                .claude_request_census_for_test()
+                .get(&copy_key)
+                .unwrap()
+                .clone();
+            prior.claude_request_census_mut_for_test().remove(&copy_key);
+            let holder_page = ready(&c, &scanner, prior.clone(), 100, true);
+            assert_eq!(scanner.paths(), vec![holder.clone()]);
+            assert_eq!(body(&holder_page, ROOT).unwrap().request_count, 2);
+            prior = settle(&c, &prior, holder_page, &mut e2_progress());
+            assert!(accepted_file_for_test(&prior, &holder_key));
+            prior
+                .claude_request_census_mut_for_test()
+                .insert(copy_key.clone(), census);
+            prior.claude_money_birth_store.set_money_rule_version(4);
+            prior = c.reload(&mut prior);
+            assert!(!prior.claude_copy_removals.pending(location));
+
+            // Old-red control: no pass means no read and no removal, even
+            // though exact accepted request rows now prove the earlier main.
+            e2::with_money_rules(OLD_RULES, || e2::apply_money_rules(&mut prior));
+            let quiet = ready(&c, &scanner, prior.clone(), 100, true);
+            assert!(scanner.paths().is_empty());
+            assert!(quiet.scan.snapshots.is_empty());
+            assert!(removed_hashes(&quiet.index, &copy).is_empty());
+            prior = settle(&c, &prior, quiet, &mut e2_progress());
+            // A hold and a decision that already removed this prefix must
+            // not gain a correction obligation from the one-time pass.
+            let mut held = prior.clone();
+            held.exclude_effective_upload_body_witness_revision_for_source_files(&BTreeSet::from(
+                [held.files[&copy_key].source_file_fingerprint.clone()],
+            ));
+            e2::apply_money_rules(&mut held);
+            assert!(!held.claude_copy_removals.pending(location));
+            let mut removed = prior.clone();
+            removed.claude_copy_removals.store(
+                location,
+                BTreeMap::from([(
+                    location_key(&holder_key),
+                    BTreeSet::from(
+                        ["a", "b"]
+                            .map(crate::snapshots::claude_request_census::claude_request_hash),
+                    ),
+                )]),
+            );
+            e2::apply_money_rules(&mut removed);
+            assert!(!removed.claude_copy_removals.pending(location));
+
+            // Exact accepted request rows also suffice without a locally
+            // counted holder body; a receipt alone is not the hash proof.
+            let mut accepted_only = prior.clone();
+            accepted_only
+                .file_snapshot_fingerprints
+                .get_mut(&holder_key)
+                .unwrap()
+                .clear();
+            e2::apply_money_rules(&mut accepted_only);
+            assert!(accepted_only.claude_copy_removals.pending(location));
+            let revisions = prior
+                .files
+                .iter()
+                .map(|(k, v)| (k.clone(), v.effective_upload_body_witness_revision))
+                .collect::<BTreeMap<_, _>>();
+            e2::apply_money_rules(&mut prior);
+            assert_eq!(prior.claude_money_birth_store.money_rule_version(), 5);
+            for (key, entry) in &prior.files {
+                assert_eq!(entry.effective_upload_body_witness_revision, revisions[key]);
+                assert_eq!(
+                    prior.claude_copy_removals.pending(location_key(key)),
+                    key == &copy_key
+                );
+            }
+            // Publish the version and its one-read mark together, then load
+            // that committed state as the next ordinary page does.
+            prior = c.reload(&mut prior);
+            assert_eq!(prior.claude_money_birth_store.money_rule_version(), 5);
+            assert!(prior.claude_copy_removals.pending(location));
+            let mut corrected = c.raw(&scanner, prior.clone(), 100, true, &[]);
+            assert_eq!(
+                scanner.paths(),
+                vec![copy.clone()],
+                "only the correction read"
+            );
+            assert!(
+                scanner.acquisitions.lock().unwrap().iter().all(|read| {
+                    !matches!(read.mode, crate::transcript_acquisition::ReadMode::Full(_))
+                }),
+                "a correction keeps the ordinary validated Tail mode"
+            );
+            corrected.enrich(&c);
+            corrected.finish();
+            assert!(!corrected.index.claude_copy_removals.pending(location));
+            if resumed_copy {
+                let item = body(&corrected, ROOT).unwrap();
+                assert_eq!(
+                    (item.request_count, item.removed_request_count),
+                    (3, Some(0)),
+                    "Rule A needs its holder on the page for a resumed copy"
+                );
+                assert!(removed_hashes(&corrected.index, &copy).is_empty());
+            } else {
+                assert!(
+                    body(&corrected, ROOT).is_none(),
+                    "an all-copy-only page is suppressed"
+                );
+                assert_eq!(removed_hashes(&corrected.index, &copy).len(), 2);
+            }
+            prior = if resumed_copy {
+                // Persist the finished decision without changing accepted
+                // holder rows: this body still has its original counted prefix.
+                c.reload(&mut corrected.index)
+            } else {
+                settle(&c, &prior, corrected, &mut e2_progress())
+            };
+            prior = c.reload(&mut prior);
+            e2::apply_money_rules(&mut prior);
+            e2::with_money_rules(OLD_RULES, || e2::apply_money_rules(&mut prior));
+            assert_eq!(prior.claude_money_birth_store.money_rule_version(), 5);
+            assert!(prior
+                .files
+                .keys()
+                .all(|key| !prior.claude_copy_removals.pending(location_key(key))));
+            let quiet = ready(&c, &scanner, prior, 100, true);
+            assert!(
+                scanner.paths().is_empty(),
+                "the rule never rearms on reload"
+            );
+            assert!(quiet.scan.snapshots.is_empty());
+        });
+    }
 }

@@ -134,6 +134,16 @@ file-system hint / periodic listing → select file → read new bytes from save
   and that holder are re-owed, with the rule version stamped in the same save.
   Disclosed main files include cross-session resumes whose own path and
   content identity would otherwise leave their counted prefix unchanged.
+  Money rule five compares settled, unheld disclosed main files against current
+  holder proof once per store, using the save-time decision comparison and
+  accepted request rows. Only counted hashes newly covered by an earlier holder
+  select a copy for one ordinary correction read; holders are not marked and
+  body revisions do not change. The normal save records the marks and version
+  together, so marks number at most the settled disclosed mains and never rearm
+  on restart. A resumed same-session copy still needs its holder on the same
+  page to remove the prefix; an off-page holder leaves it counted and disclosed.
+  Older daemons ignore a newer money-rule version; layout 8 already requires
+  a forward update for readers predating the accepted-request store.
   Subagent path-twin homes sharing census ids are both selected once, for
   all-copy and prefix copies. The selector and mid-page holder lookup record
   elapsed milliseconds; holder pulls also record a scalar count.
