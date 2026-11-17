@@ -381,12 +381,24 @@ impl HistoryFixture {
             index
         };
         let settlement = if cycle.shed_upload {
-            settle_checkpointed_upload(index, &committed_index, &progress, &holds, false)
+            settle_checkpointed_upload(
+                index,
+                &committed_index,
+                &progress,
+                &holds,
+                false,
+                UnsettledUploadCause::DeferredConflict,
+            )
         } else {
             match cycle.upload {
-                PipelineUpload::ServerDeferred => {
-                    settle_checkpointed_upload(index, &committed_index, &progress, &holds, false)
-                }
+                PipelineUpload::ServerDeferred => settle_checkpointed_upload(
+                    index,
+                    &committed_index,
+                    &progress,
+                    &holds,
+                    false,
+                    UnsettledUploadCause::DeferredConflict,
+                ),
                 _ => settle_completed_upload(index, &committed_index, &progress, &holds),
             }
         };

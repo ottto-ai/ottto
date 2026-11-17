@@ -695,6 +695,119 @@ mod tests {
         }
     }
 
+    /// [money] An identity-503 deferral on an earlier page blocks its walk
+    /// until custody proves every deferred session ACKed. Real conflicts,
+    /// unknown custody and an older daemon's save keep it unsettled. Each row
+    /// runs the real pre-scanner reconcile, then the walk's terminal page.
+    #[test]
+    fn isolated_503_custody_decides_the_walk_terminal() {
+        use std::collections::BTreeSet;
+        use UnsettledUploadCause::{DeferredConflict, Isolated503};
+        // An older daemon knows 9 causes: this bit is `unknown` there, and
+        // the authoritative flag keeps the walk unsettled.
+        assert_eq!(Isolated503.bit(), 1 << 9);
+        let owed = BTreeSet::from(["a".repeat(64)]);
+        let drained = BTreeSet::new();
+        let rows: [(
+            &str,
+            &[UnsettledUploadCause],
+            bool,
+            Option<&BTreeSet<String>>,
+            bool,
+        ); 6] = [
+            (
+                "deferred, later ACKed",
+                &[Isolated503],
+                false,
+                Some(&drained),
+                true,
+            ),
+            (
+                "unACKed, vanished or never retried",
+                &[Isolated503],
+                false,
+                Some(&owed),
+                false,
+            ),
+            (
+                "custody absent or malformed",
+                &[Isolated503],
+                false,
+                None,
+                false,
+            ),
+            ("older daemon saved the bit", &[], true, None, false),
+            (
+                "503 beside a real conflict",
+                &[Isolated503, DeferredConflict],
+                false,
+                Some(&drained),
+                false,
+            ),
+            ("no 503: absent custody", &[], false, None, true),
+        ];
+        for (row, causes, older_save, custody, complete) in rows {
+            let scratch = crate::test_scratch::ScratchDir::new("isolated-503-walk");
+            let roots = [scratch.to_path_buf()];
+            let mut index = ScanIndex::default();
+            capture(|| {
+                ensure_bounded_traversal(
+                    SnapshotSource::Pi,
+                    &roots,
+                    &mut index,
+                    T1,
+                    BACKFILL_WINDOW_DAYS,
+                )
+            });
+            for cause in causes {
+                index.mark_bounded_sweep_unsettled_by(*cause);
+            }
+            if older_save {
+                // The flag and the raw bit, as an older daemon saves them.
+                index.bounded_sweep_had_unsettled_upload = true;
+                index.bounded_sweep_unsettled_causes = Isolated503.bit();
+            }
+            let before = index.bounded_sweep_unsettled_cause_names();
+            index.reconcile_isolated_503(custody);
+            let (scan, rows) = capture(|| {
+                scan_source_roots(
+                    SnapshotSource::Pi,
+                    &roots,
+                    &mut index,
+                    T1,
+                    BACKFILL_WINDOW_DAYS,
+                )
+                .unwrap()
+            });
+            assert!(index.traversal.is_none(), "{row}: the walk retired");
+            let retired = rows
+                .iter()
+                .find(|row| row["counts"]["event"] == "retiring")
+                .unwrap();
+            assert_eq!(scan.census_complete, complete, "{row}");
+            assert_eq!(retired["counts"]["raw_census_complete"], true, "{row}");
+            assert_eq!(
+                retired["counts"]["reason"],
+                if complete {
+                    "complete"
+                } else {
+                    "complete_needs_clean_followup"
+                },
+                "{row}"
+            );
+            let expected = match row {
+                "503 beside a real conflict" => vec!["deferred_conflict"],
+                _ if complete => Vec::new(),
+                _ => before,
+            };
+            assert_eq!(
+                retired["counts"]["unsettled_causes"],
+                json!(expected),
+                "{row}"
+            );
+        }
+    }
+
     fn with_unsettled_causes(index: &ScanIndex, causes: u16) -> ScanIndex {
         let mut value = serde_json::to_value(index).unwrap();
         value["bounded_sweep_unsettled_causes"] = json!(causes);

@@ -920,6 +920,7 @@ fn local_copy_refusal_deletion_and_progress_first_restart() {
                     &progress,
                     &holds,
                     true,
+                    UnsettledUploadCause::DeferredConflict,
                 )
                 .index;
                 settle_index_after_upload(&mut selected, &page.committed, &progress);
@@ -1214,8 +1215,15 @@ fn refused_origin_chain_converges_with_one_file_pages() {
             &mut page.scan,
             &page.disposition,
         );
-        let mut selected =
-            settle_checkpointed_upload(page.index, &page.committed, &progress, &holds, true).index;
+        let mut selected = settle_checkpointed_upload(
+            page.index,
+            &page.committed,
+            &progress,
+            &holds,
+            true,
+            UnsettledUploadCause::DeferredConflict,
+        )
+        .index;
         settle_index_after_upload(&mut selected, &page.committed, &progress);
         accept_upload_context_acks_for_test(
             &mut selected,
@@ -1343,6 +1351,7 @@ fn refused_holder_mark_survives_progress_only_crash() {
             &progress,
             &holds,
             true,
+            UnsettledUploadCause::DeferredConflict,
         )
         .index;
         settle_index_after_upload(&mut selected, &recovered.committed, &progress);

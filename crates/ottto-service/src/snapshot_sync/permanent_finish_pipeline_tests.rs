@@ -847,6 +847,8 @@ enum AckScriptedPost {
     Disabled,
     /// Every entity is a held conflict: a Deferred page.
     Conflict,
+    /// The identity-unavailable shed naming every entity, at this status.
+    Identity(&'static str),
 }
 
 struct AckScriptedServer {
@@ -889,7 +891,7 @@ impl AckScriptedServer {
                 } else {
                     serde_json::from_str(raw).unwrap()
                 };
-                let status = "200 OK";
+                let mut status = "200 OK";
                 let response = if request.contains("/relay-token") {
                     serde_json::json!({"token":"synthetic-finish-token","expires_at":"2099-01-01T00:00:00Z"})
                 } else if request.contains("/activity-hints") {
@@ -908,6 +910,11 @@ impl AckScriptedServer {
                         .pop_front()
                         .unwrap_or(AckScriptedPost::Accept);
                     match post {
+                        AckScriptedPost::Identity(code) => {
+                            status = code;
+                            serde_json::json!({"code":"snapshot_original_identity_unavailable",
+                                "errors":(0..items.len()).map(|i| serde_json::json!({"loc":["body","snapshots",i]})).collect::<Vec<_>>()})
+                        }
                         AckScriptedPost::Conflict => {
                             let conflicts = items
                                 .iter()
@@ -953,7 +960,12 @@ impl AckScriptedServer {
                 } else {
                     serde_json::json!({"accepted":true,"source":"claude_code","machine_id":"otm_test","disabled":false})
                 };
-                bounded_native_response(&mut stream, status, &response.to_string());
+                if status == "200 OK" {
+                    bounded_native_response(&mut stream, status, &response.to_string());
+                } else {
+                    let body = response.to_string();
+                    write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nRetry-After: 60\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                }
             }
         });
         Self {
@@ -1251,4 +1263,406 @@ fn telemetry_retention_follows_only_a_completed_upload_and_saved_index() {
             assert!(pair.iter().all(|path| path.exists()), "{arm}: zero unlinks");
         }
     }
+}
+
+/// [money] Identity-503 custody through the real prepare/finish, one row per
+/// reply. Only a 503 deferral records its session, kept past the walk its
+/// page could no longer change (the page is sent after the terminal verdict)
+/// and across a reload. A 429 or a real conflict records nothing and stays
+/// `deferred_conflict`. Then a grown body of that session is ACKed: the main
+/// upload drains the debt in its own ACK checkpoint, and the clean walk
+/// switches the first import.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn identity_503_custody_drains_on_a_grown_body_ack_and_switches() {
+    let key = cache_session_key(IDENTITY_PIPELINE_ROOT);
+    for (row, post, cause, owed) in [
+        (
+            "identity 503",
+            AckScriptedPost::Identity("503 Service Unavailable"),
+            "isolated_503",
+            true,
+        ),
+        (
+            "identity 429",
+            AckScriptedPost::Identity("429 Too Many Requests"),
+            "deferred_conflict",
+            false,
+        ),
+        (
+            "real conflict",
+            AckScriptedPost::Conflict,
+            "deferred_conflict",
+            false,
+        ),
+    ] {
+        let server = AckScriptedServer::new();
+        let mut home = AckFinishHome::new(&server);
+        let destination = snapshot_upload_destination_namespace(&home.device, "device-secret");
+        let switched = |home: &AckFinishHome| {
+            crate::backfill::load_backfill_state(&home.support)
+                .destination_completed("claude_code", &destination)
+        };
+        let reload = |path: &Path| {
+            SnapshotUploadProgress::load(
+                path,
+                &destination,
+                snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+            )
+            .unwrap()
+        };
+        server.script.lock().unwrap().push_back(post);
+        let (preparation, index, mut scan) = home.prepare(row);
+        scan.census_complete = true;
+        let index_path = preparation.index_path.clone();
+        let progress_path = preparation.upload_progress_path.clone();
+        let result = home.finish(preparation, index, scan);
+        assert_eq!(result.is_ok(), row != "identity 429", "{row}: {result:?}");
+        assert_eq!(
+            ScanIndex::load(&index_path)
+                .unwrap()
+                .bounded_sweep_unsettled_cause_names(),
+            [cause],
+            "{row}"
+        );
+        assert_eq!(
+            reload(&progress_path).identity_503_pending,
+            owed.then(|| BTreeSet::from([key.clone()])),
+            "{row}: custody after a reload"
+        );
+        assert!(!switched(&home), "{row}: an owed deferral never switches");
+        if !owed {
+            continue;
+        }
+        let transcript = home
+            .fixture
+            .home
+            .join(".claude/projects/-synthetic-repo")
+            .join(format!("{IDENTITY_PIPELINE_ROOT}.jsonl"));
+        let grown = serde_json::json!({"timestamp": current_rfc3339(), "type": "assistant",
+            "sessionId": IDENTITY_PIPELINE_ROOT, "requestId": "req_3", "message": {"id": "m3",
+            "model": "claude-haiku-4-5", "usage": {"input_tokens": 30, "output_tokens": 3}}});
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(transcript)
+            .unwrap()
+            .write_all(format!("{grown}\n").as_bytes())
+            .unwrap();
+        let (preparation, index, mut scan) = home.prepare("grown body");
+        scan.census_complete = true;
+        // Stop just before the walk's custody is retired, to read the ACK
+        // checkpoint's own drain.
+        ACK_POST_SAVE_FAILURE.with(|slot| slot.set(Some("finish_cycle")));
+        assert!(home.finish(preparation, index, scan).is_err());
+        let offered = server.offered.lock().unwrap();
+        assert_eq!(offered.len(), 2, "the deferred body, then the grown one");
+        assert_eq!(offered[1]["source_session_id"], IDENTITY_PIPELINE_ROOT);
+        assert_ne!(
+            offered[1]["snapshot_fingerprint"],
+            offered[0]["snapshot_fingerprint"]
+        );
+        assert_eq!(
+            reload(&progress_path).identity_503_pending,
+            Some(BTreeSet::new()),
+            "drained by the main-upload ACK"
+        );
+        assert!(switched(&home), "the clean, settled walk switches");
+    }
+}
+
+/// [money] Custody classes at the upload seam. Only an identity-unavailable
+/// 503 in main-upload mode records the session; only a main-upload stored
+/// ACK of it drains. Probe and retry mode, a not-stored ACK and a conflict
+/// leave it owed. Serde keeps an empty set distinct from absent, decodes
+/// malformed custody as absent, and an older daemon's save drops it.
+#[test]
+fn identity_503_custody_records_and_drains_only_from_the_main_upload() {
+    use crate::snapshot_client::{ShedSnapshotIndexes, UploadShed, UploadShedCode};
+    const SESSION: &str = "custody-session";
+    let key = cache_session_key(SESSION);
+    let items = [format!("{:064x}", 7)];
+    let reply = |kind: &str| -> Result<crate::snapshot_client::SnapshotBatchResponse> {
+        let shed = |status: u16| -> Result<crate::snapshot_client::SnapshotBatchResponse> {
+            Err(anyhow::Error::new(UploadShed {
+                status,
+                retry_after: Some(Duration::from_secs(60)),
+                code: Some(UploadShedCode::OriginalIdentityUnavailable),
+            })
+            .context(ShedSnapshotIndexes(vec![0])))
+        };
+        let entity = serde_json::json!([{"source_session_id": SESSION,
+            "snapshot_fingerprint": &items[0], "occurrence_count": 1,
+            "unchanged_basis": (kind == "usage_identical").then_some("usage_identical")}]);
+        match kind {
+            "503" => shed(503),
+            "429" => shed(429),
+            _ => Ok(serde_json::from_value(serde_json::json!({"accepted": 1,
+                "sessions_reconciled": 1, "session_ids": [], "disabled": false,
+                "disabled_reason": null, "entity_ack_contract": crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT,
+                "accepted_entities": if kind == "stored" { entity.clone() } else { serde_json::json!([]) },
+                "unchanged_entities": if kind == "usage_identical" { entity.clone() } else { serde_json::json!([]) },
+                "conflict_entities": if kind == "conflict" { entity } else { serde_json::json!([]) }}))
+            .unwrap()),
+        }
+    };
+    let owed = Some(BTreeSet::from([key.clone()]));
+    for (row, main, kind, before, after, identity_503) in [
+        ("503 in the main upload", true, "503", None, owed.clone(), 1),
+        ("503 to a probe or retry", false, "503", None, None, 1),
+        ("429 in the main upload", true, "429", None, None, 0),
+        (
+            "main stored ACK",
+            true,
+            "stored",
+            owed.clone(),
+            Some(BTreeSet::new()),
+            0,
+        ),
+        (
+            "probe or retry ACK",
+            false,
+            "stored",
+            owed.clone(),
+            owed.clone(),
+            0,
+        ),
+        (
+            "usage_identical, not stored",
+            true,
+            "usage_identical",
+            owed.clone(),
+            owed.clone(),
+            0,
+        ),
+        ("conflict", true, "conflict", owed.clone(), owed.clone(), 0),
+    ] {
+        let mut progress = SnapshotUploadProgress::new(
+            format!("{:064x}", 99),
+            snapshot_quarantine_witness(SnapshotSource::Codex),
+        );
+        progress.identity_503_pending = before;
+        progress.identity_503_pass = main.then(BTreeSet::new);
+        let mut accepted = 0;
+        let result = upload_resumable_batches_with_literal_families(
+            &items,
+            "identity-503-custody",
+            &mut progress,
+            &mut accepted,
+            String::as_str,
+            String::clone,
+            |_| Some(SESSION),
+            |_| 0,
+            |_| None,
+            &mut InplaceRetryBudget::default(),
+            |_| reply(kind),
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(progress.identity_503_pending, after, "{row}");
+        if let ResumableUploadResult::Deferred {
+            identity_503: n, ..
+        } = result
+        {
+            assert_eq!(n, identity_503, "{row}");
+        } else {
+            assert_eq!(identity_503, 0, "{row}: {result:?}");
+        }
+    }
+    let mut progress = SnapshotUploadProgress::new(
+        format!("{:064x}", 99),
+        snapshot_quarantine_witness(SnapshotSource::Codex),
+    );
+    progress.identity_503_pending = Some(BTreeSet::new());
+    let saved = serde_json::to_value(&progress).unwrap();
+    assert_eq!(saved["identity_503_pending"], serde_json::json!([]));
+    let decode = |value: &serde_json::Value| {
+        serde_json::from_value::<SnapshotUploadProgress>(value.clone())
+            .unwrap()
+            .identity_503_pending
+    };
+    assert_eq!(
+        decode(&saved),
+        Some(BTreeSet::new()),
+        "empty is proof, not absent"
+    );
+    for malformed in [serde_json::json!(7), serde_json::json!(["not-a-key"])] {
+        let mut value = saved.clone();
+        value["identity_503_pending"] = malformed;
+        assert_eq!(decode(&value), None, "malformed custody is unknown");
+    }
+    let older: head_conflict_released_progress_fixture::SnapshotUploadProgress =
+        serde_json::from_value(saved).unwrap();
+    assert_eq!(decode(&serde_json::to_value(older).unwrap()), None);
+}
+
+/// [money] Oracle row: the placement positive control (two accounts, a
+/// mid-session switch, a side call, an evidence gap, a tagged row) through
+/// the real upload ledger. `main` has an earlier accepted revision; its
+/// current body meets an identity 503 while `side-call` is stored. The held
+/// page keeps the prior ACK. After a restart the main upload ACKs `main` and
+/// drains its custody: the reassembled route equals cold, and a quiet pass
+/// re-sends nothing.
+#[test]
+fn identity_503_deferral_then_ack_keeps_cold_money_and_placement() {
+    use crate::snapshot_client::{ShedSnapshotIndexes, UploadShed, UploadShedCode};
+    use crate::snapshots::sampled_scan::transition_fixture::{
+        money_oracle, Accepted, IoBytes, Mode,
+    };
+    use serde_json::{json, Value};
+    fn fp(item: &Value) -> &str {
+        item["snapshot_fingerprint"].as_str().unwrap()
+    }
+    fn session(item: &Value) -> Option<&str> {
+        item["source_session_id"].as_str()
+    }
+    let cold = money_oracle::placement_tests::placement_fixture();
+    let scratch = crate::test_scratch::ScratchDir::new("identity-503-oracle");
+    let path = scratch.join("progress.json");
+    let namespace = format!("{:064x}", 99);
+    let witness = || snapshot_quarantine_witness(SnapshotSource::ClaudeCode);
+    let mut items = cold.snapshots.values().cloned().collect::<Vec<_>>();
+    for (n, item) in items.iter_mut().enumerate() {
+        item["snapshot_fingerprint"] = format!("{:064x}", n + 1).into();
+    }
+    assert_eq!(session(&items[0]), Some("main"));
+    let mut prior_main = items[0].clone();
+    prior_main["snapshot_fingerprint"] = format!("{:064x}", 9).into();
+    prior_main["request_count"] = 1.into();
+    let send = |progress: &mut SnapshotUploadProgress, items: &[Value], defer: Option<&str>| {
+        progress.identity_503_pass = Some(BTreeSet::new());
+        let mut emitted = Vec::new();
+        let result = upload_resumable_batches_with_literal_families(
+            items,
+            "identity-503-oracle",
+            progress,
+            &mut 0,
+            fp,
+            |item| fp(item).to_string(),
+            session,
+            |_| 0,
+            |_| None,
+            &mut InplaceRetryBudget::default(),
+            |batch: &[&Value]| {
+                if let Some(index) = batch.iter().position(|item| session(item) == defer) {
+                    return Err(anyhow::Error::new(UploadShed {
+                        status: 503,
+                        retry_after: Some(Duration::from_secs(60)),
+                        code: Some(UploadShedCode::OriginalIdentityUnavailable),
+                    })
+                    .context(ShedSnapshotIndexes(vec![index])));
+                }
+                emitted.extend(batch.iter().map(|item| (*item).clone()));
+                let refs = batch
+                    .iter()
+                    .map(|item| {
+                        json!({"source_session_id": session(item),
+                        "snapshot_fingerprint": fp(item), "occurrence_count": 1})
+                    })
+                    .collect::<Vec<_>>();
+                Ok(serde_json::from_value(json!({"accepted": batch.len(),
+                    "sessions_reconciled": batch.len(), "session_ids": [], "disabled": false,
+                    "disabled_reason": null,
+                    "entity_ack_contract": crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT,
+                    "accepted_entities": refs}))
+                .unwrap())
+            },
+            |state| state.save(&path),
+        )
+        .unwrap();
+        progress.identity_503_pass = None;
+        (result, emitted)
+    };
+    let route =
+        |mode, emitted: &[Value], accepted: &[&Value], progress: &SnapshotUploadProgress| {
+            let mut route = cold.clone();
+            route.mode = mode;
+            route.snapshots = emitted
+                .iter()
+                .map(|body| {
+                    let mut body = body.clone();
+                    body.as_object_mut().unwrap().remove("snapshot_fingerprint");
+                    (session(&body).unwrap().to_owned(), body)
+                })
+                .collect();
+            route.accepted = accepted
+                .iter()
+                .filter_map(|body| {
+                    let witness = progress.accepted_body_witnesses.get(fp(body))?;
+                    Some((
+                        session(body).unwrap().to_owned(),
+                        Accepted {
+                            body: (*body).clone(),
+                            witness: witness.clone(),
+                        },
+                    ))
+                })
+                .collect();
+            let ledger = cold
+                .snapshots
+                .keys()
+                .filter_map(|entity| {
+                    let state = progress.accepted_identity_buckets.get(entity)?;
+                    Some((entity.clone(), serde_json::to_value(state).unwrap()))
+                })
+                .collect::<BTreeMap<_, _>>();
+            route.accepted_identity_buckets = Some(json!(ledger));
+            route
+        };
+    let mut progress = SnapshotUploadProgress::new(namespace.clone(), witness());
+    progress.accepted_identity_buckets =
+        crate::snapshots::claude_request_identity::AcceptedBuckets::for_test();
+    let (_, _) = send(&mut progress, std::slice::from_ref(&prior_main), None);
+    let prior = route(Mode::Ram, &[], &[&prior_main], &progress);
+    let (result, emitted) = send(&mut progress, &items, Some("main"));
+    assert!(matches!(
+        result,
+        ResumableUploadResult::Deferred {
+            count: 1,
+            identity_503: 1,
+            ..
+        }
+    ));
+    let owed = Some(BTreeSet::from([cache_session_key("main")]));
+    assert_eq!(progress.identity_503_pending, owed);
+    let held = route(Mode::Ram, &emitted, &[&prior_main], &progress);
+    money_oracle::assert_held("main", &prior, &held, &cold);
+    let reload = || {
+        let mut restored = SnapshotUploadProgress::load(&path, &namespace, witness()).unwrap();
+        restored
+            .accepted_identity_buckets
+            .bind_test_key(Some([0x42; 32]));
+        restored
+    };
+    let mut restored = reload();
+    assert_eq!(
+        restored.identity_503_pending, owed,
+        "custody survives a restart"
+    );
+    let (_, resent) = send(&mut restored, &items, None);
+    assert_eq!(resent.len(), 1, "only the deferred body is re-sent");
+    assert_eq!(reload().identity_503_pending, Some(BTreeSet::new()));
+    let drained = route(
+        Mode::Restart,
+        &[emitted, resent].concat(),
+        &items.iter().collect::<Vec<_>>(),
+        &restored,
+    );
+    money_oracle::assert_equivalent(&cold, &drained);
+    money_oracle::assert_no_smaller_reemit("main", &prior, &drained, &cold, false);
+    let mut quiet_progress = reload();
+    let (_, quiet_emitted) = send(&mut quiet_progress, &items, None);
+    let mut quiet = route(Mode::Restart, &quiet_emitted, &[], &quiet_progress);
+    quiet.batches = quiet_emitted
+        .iter()
+        .map(|body| serde_json::to_vec(body).unwrap())
+        .collect();
+    // An upload-only route reads no transcript; its proof is the empty resend.
+    quiet.io = IoBytes {
+        cheap_checks: Some(0),
+        anchor_reads: Some(0),
+        other_reads: Some(0),
+        ..IoBytes::default()
+    };
+    money_oracle::assert_quiet_restart_zero_bytes(&quiet);
 }

@@ -555,6 +555,29 @@ pub(super) struct SnapshotUploadProgress {
     pub(super) fresh_context_body_acks: BTreeMap<String, String>,
     #[serde(skip)]
     pub(super) context_receipt_candidates: Vec<crate::snapshots::UploadContextReceiptCandidate>,
+    /// Sessions whose identity-503 deferral still owes a later main-upload
+    /// ACK (`cache_session_key`). Absent is unknown or nothing owed; only an
+    /// empty set clears the walk's `Isolated503` cause.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "decode_identity_503_pending"
+    )]
+    pub(super) identity_503_pending: Option<BTreeSet<String>>,
+    /// Main page upload only: this pass's identity-503 inserts. `None`
+    /// elsewhere (bootstrap probes, retries), which neither record nor drain.
+    #[serde(skip)]
+    pub(super) identity_503_pass: Option<BTreeSet<String>>,
+}
+
+/// Malformed custody decodes as absent (unknown), never as an empty set.
+fn decode_identity_503_pending<'de, D: serde::Deserializer<'de>>(
+    decoder: D,
+) -> Result<Option<BTreeSet<String>>, D::Error> {
+    let value = serde_json::Value::deserialize(decoder)?;
+    Ok(serde_json::from_value::<BTreeSet<String>>(value)
+        .ok()
+        .filter(|keys| keys.iter().all(|key| is_snapshot_fingerprint(key))))
 }
 
 /// What a save's compare-and-swap reads from the on-disk progress: the writer
@@ -617,6 +640,8 @@ impl SnapshotUploadProgress {
             terminal_contract_retry_pending_save: false,
             fresh_context_body_acks: BTreeMap::new(),
             context_receipt_candidates: Vec::new(),
+            identity_503_pending: None,
+            identity_503_pass: None,
         }
     }
 
@@ -873,6 +898,7 @@ impl SnapshotUploadProgress {
             && self.pending_cache_heads.is_empty()
             && self.head_conflict_challenges.is_empty()
             && self.accepted_identity_buckets.is_empty()
+            && self.identity_503_pending.is_none()
         {
             return self.clear(path);
         }
@@ -1005,7 +1031,7 @@ pub(super) fn quarantine_invalid_progress(path: &Path) -> Result<()> {
     sync_progress_parent(path)
 }
 
-crate::heap_layout_bound::fields!(SnapshotUploadProgress; telemetry_only, schema_version, rows, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_body_contexts, context_resend, ack_capacity, retained_stale_ack_count, accepted_cache_states, accepted_identity_buckets, accepted_identity_scope, accepted_cache_heads, pending_cache_heads, head_conflict_challenges, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts, terminal_contract_retry_pending_save, fresh_context_body_acks, context_receipt_candidates);
+crate::heap_layout_bound::fields!(SnapshotUploadProgress; telemetry_only, schema_version, rows, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_body_contexts, context_resend, ack_capacity, retained_stale_ack_count, accepted_cache_states, accepted_identity_buckets, accepted_identity_scope, accepted_cache_heads, pending_cache_heads, head_conflict_challenges, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts, terminal_contract_retry_pending_save, fresh_context_body_acks, context_receipt_candidates, identity_503_pending, identity_503_pass);
 
 crate::heap_layout_bound::fields!(PendingCacheHeadFile; source_file_fingerprint, group_fingerprint, entities, reselected_heads, settled_entities);
 
