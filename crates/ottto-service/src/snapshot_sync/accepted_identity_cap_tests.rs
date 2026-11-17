@@ -321,8 +321,11 @@ fn wire_logins(item: &SnapshotItem) -> BTreeSet<String> {
 /// amount as an untagged part with a refusal count, and the receiver keeps
 /// that part at the session's starting binding, here S (not the frozen
 /// authority A, not the new authority B). No deferral, hold or resend
-/// applies. The expected body is the unprotected one with every share of B
-/// moved to the untagged part; S and C keep theirs, and no part names A or B.
+/// applies. The expected body is the unprotected one with B's own share
+/// moved to the untagged part; S and C keep theirs, and no part names A.
+/// Under `session_request_account_source:v1` the gap after B's request keeps
+/// its `carried_forward` B share: a carried share is placement, never proof,
+/// so it re-tags no accepted proof and is not refused.
 fn assert_refused_share_takes_start_binding_fallback(
     item: &SnapshotItem,
     unprotected: &SnapshotItem,
@@ -355,11 +358,20 @@ fn assert_refused_share_takes_start_binding_fallback(
             .is_some_and(|requests| *requests > 0),
         "the refused share is the untagged part"
     );
+    // Carry.on (CI run 44113140067): the gap's carried B share stays tagged.
+    let mut carried_b = own(B);
+    carried_b.3 = Some(crate::snapshots::AccountSource::CarriedForward);
+    assert_eq!(placed.get(&carried_b), Some(&1), "the gap carries B");
     let logins = wire_logins(item);
-    for (who, _) in [A, B] {
+    assert!(
+        !logins.contains(&A.0.to_string().repeat(64)),
+        "no part carries A: {logins:?}"
+    );
+    // B appears only as that placement-only carried share, never as proof.
+    for key in placed.keys() {
         assert!(
-            !logins.contains(&who.to_string().repeat(64)),
-            "no part carries {who}: {logins:?}"
+            key.1.as_deref() != Some(B.0.to_string().repeat(64).as_str()) || key.3.is_some(),
+            "B is placed only by the carry: {key:?}"
         );
     }
 }

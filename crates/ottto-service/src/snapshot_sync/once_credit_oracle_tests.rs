@@ -140,10 +140,16 @@ impl OracleServer {
                 let response = if request.contains("/relay-token") {
                     json!({"token":"synthetic-oracle-token","expires_at":"2099-01-01T00:00:00Z"})
                 } else if request.contains("/activity-hints") {
-                    json!({"source":source.api_slug(),"server_time":AT,
+                    let mut hint = json!({"source":source.api_slug(),"server_time":AT,
                         "last_data_at":null,"record_count_15m":0,"record_count_24h":0,
                         "local_usage_reconciliation_enabled":true,"backfill_window_days":183,
-                        "recommended_scan_after":"2099-01-01T00:00:00Z"})
+                        "recommended_scan_after":"2099-01-01T00:00:00Z"});
+                    // Production advertises account carry to Claude Code only.
+                    if source == SnapshotSource::ClaudeCode {
+                        hint["session_request_account_source_contract"] =
+                            crate::snapshots::ACCOUNT_SOURCE_CONTRACT.into();
+                    }
+                    hint
                 } else if request.contains("/agent-status/snapshots") {
                     json!({"accepted":1,"machine_id":"otm_test","sources":[source.api_slug()]})
                 } else if let Some(items) = value["snapshots"].as_array() {
@@ -1470,9 +1476,12 @@ fn c01_claude_cold_control_preserves_accounts_side_call_gap_and_tags() {
             }
         }
     }
+    // Carry.on (CI run 44113140067): account-b's copied request never seeds
+    // a carry, so the 5-token gap is placed with account-a (the start or
+    // its carry), not with the latest own account (b). Totals are unchanged.
     assert_eq!(
         accounts,
-        BTreeMap::from([("a".repeat(64), 10), ("b".repeat(64), 32)])
+        BTreeMap::from([("a".repeat(64), 15), ("b".repeat(64), 27)])
     );
     assert!(tagged);
     money_equivalence_tests::emit_money(

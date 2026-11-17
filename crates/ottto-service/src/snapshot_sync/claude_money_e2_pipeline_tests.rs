@@ -253,13 +253,18 @@ impl Page {
         let one = checks.map(|_| reference(&crate::snapshot_sync::ONE_EVIDENCE_CHUNK));
         let before = crate::claude_local_otel::evidence_read_counts_for_test().0;
         let chunks_before = crate::snapshot_sync::evidence_chunks_for_test();
+        // The sync loop sets the server's advertised capability on its ledger
+        // every cycle; production advertises it for every Claude Code upload.
+        // Without a ledger, a keyless one matches no session: only carry differs.
+        let mut cycle = accepted.as_deref().cloned().unwrap_or_default();
+        cycle.set_account_source_enabled(true);
         let ((mut disposition, _, stats), released) =
             e2::pipeline_test_observer::capture_released(|| {
                 apply_claude_local_evidence_to_scan_with_ledger_and_budget(
                     &corpus.support,
                     &mut self.scan,
                     &mut self.index,
-                    accepted.as_deref(),
+                    Some(&cycle),
                     wire_budget,
                     None,
                 )
@@ -533,6 +538,24 @@ fn api_login(
     login: char,
     org: Option<char>,
 ) -> crate::claude_local_otel::ClaudeLocalOtelEvidence {
+    api_login_org(
+        session,
+        request,
+        tokens,
+        login,
+        org.map(|org| org.to_string().repeat(64)),
+    )
+}
+
+/// `api_login` whose complete org is the given hash (e.g. a transcript
+/// marker's organization hash, so telemetry and marker agree).
+fn api_login_org(
+    session: &str,
+    request: &str,
+    tokens: u64,
+    login: char,
+    org: Option<String>,
+) -> crate::claude_local_otel::ClaudeLocalOtelEvidence {
     use crate::claude_local_otel::{
         ClaudeIdentityAttributeEvidence, ClaudeIdentityAttributeOrigin, ClaudeIdentityDisposition,
     };
@@ -558,7 +581,7 @@ fn api_login(
         crate::claude_local_otel::ClaudeRequestIdentityEvidence {
             identity_hash_scheme: "provider-sha256:v1".into(),
             account: attribute(Some(login)),
-            organization: attribute(org.map(|org| org.to_string().repeat(64))),
+            organization: attribute(org),
             disposition: ClaudeIdentityDisposition::Complete,
         },
     ));

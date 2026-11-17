@@ -708,7 +708,6 @@ fn without_file_revision(mut route: RouteResult) -> RouteResult {
         body.remove("source_file_fingerprint");
         body.remove("collected_at");
         let envelope = body["semantic_envelope"].as_object_mut().unwrap();
-        envelope.remove("revision_hash");
         envelope.remove("revision_v2_hash");
     }
     route
