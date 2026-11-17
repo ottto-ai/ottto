@@ -13,6 +13,16 @@
 //! bounded and isolating: a malformed member disables only this record's
 //! retry, never the ledger, its siblings or the refusal itself.
 
+use super::{
+    cache_head_probe, current_unix_seconds, quarantine_retry_after, reason_reoffer,
+    snapshot_upload_body_witness, PermanentSnapshotRejection, ScanIndex, SnapshotItem,
+    SnapshotQuarantineDisposition, SnapshotQuarantineRecord, SnapshotSource,
+    SnapshotUploadProgress, MAX_SNAPSHOT_RECONSTRUCTION_FAILURES,
+    SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE,
+};
+use std::collections::{BTreeMap, BTreeSet};
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+
 use serde::de::{self, DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::ser::{SerializeMap, Serializer};
 use std::fmt;
@@ -623,4 +633,564 @@ pub(super) fn should_log_change(previous: Option<ReofferCounts>, counts: &Reoffe
         || counts.invalid_extension > 0
         || (previous.is_some_and(|old| old != *counts)
             || previous.is_none() && *counts != ReofferCounts::default())
+}
+
+impl SnapshotUploadProgress {
+    pub(super) fn prepare_quarantine_retries(
+        &mut self,
+        index_quarantine: &BTreeMap<String, SnapshotQuarantineRecord>,
+    ) -> bool {
+        self.prepare_quarantine_and_reason_retries(index_quarantine, None)
+    }
+
+    /// Select this cycle's ordinary quarantine retries and due refusal
+    /// re-offers from one shared per-cycle budget, oldest deadline first.
+    /// A selected re-offer reserves its next 24 h deadline here; the caller
+    /// saves that claim before any scan or upload uses the lease.
+    pub(super) fn prepare_quarantine_and_reason_retries(
+        &mut self,
+        index_quarantine: &BTreeMap<String, SnapshotQuarantineRecord>,
+        reoffer: Option<&reason_reoffer::Scope<'_>>,
+    ) -> bool {
+        self.active_quarantine_retries.clear();
+        self.active_reason_reoffers.clear();
+        self.attempted_reason_reoffers.clear();
+        self.reason_reoffer_counts = reason_reoffer::ReofferCounts::default();
+        let mut contract_retry_changed =
+            std::mem::take(&mut self.terminal_contract_retry_pending_save);
+        // The upload ledger is saved immediately after an exact ACK, before
+        // the index can retire its older quarantine. On crash/restart that ACK
+        // is the stronger fact and must not be overwritten by restoring the
+        // stale index-owned obligation.
+        self.quarantined_fingerprints
+            .retain(|fingerprint, _| !self.accepted_fingerprints.contains(fingerprint));
+        let newer_retryable_refusals = self
+            .quarantined_fingerprints
+            .iter()
+            .filter(|(fingerprint, record)| {
+                record.disposition == SnapshotQuarantineDisposition::RetryPending
+                    && self
+                        .permanent_rejections
+                        .get(*fingerprint)
+                        .is_some_and(|refusal| {
+                            record.upload_body_witness.as_deref()
+                                == Some(refusal.body_witness.as_str())
+                        })
+            })
+            .map(|(fingerprint, _)| fingerprint.clone())
+            .collect::<BTreeSet<_>>();
+        for (fingerprint, record) in index_quarantine {
+            if !self.accepted_fingerprints.contains(fingerprint) {
+                // The durable index claims a bounded admission re-offer before
+                // this disposable ledger leases it. A stale terminal upload
+                // record must not suppress that newer admission obligation.
+                if self
+                    .quarantined_fingerprints
+                    .get(fingerprint)
+                    .is_some_and(|old| {
+                        old.reconstruction_contract < record.reconstruction_contract
+                            || (old.reconstruction_contract == record.reconstruction_contract
+                                && old.witness.item_wire_byte_limit
+                                    < record.witness.item_wire_byte_limit)
+                    })
+                {
+                    contract_retry_changed |= self.quarantined_fingerprints[fingerprint]
+                        .reconstruction_contract
+                        < record.reconstruction_contract;
+                    let mut replacement = record.clone();
+                    crate::snapshots::terminal_contract_retry::merge_claims(
+                        &mut replacement,
+                        &self.quarantined_fingerprints[fingerprint],
+                    );
+                    self.quarantined_fingerprints
+                        .insert(fingerprint.clone(), replacement);
+                }
+                self.quarantined_fingerprints
+                    .entry(fingerprint.clone())
+                    .or_insert_with(|| {
+                        contract_retry_changed |= record.reconstruction_contract > 1;
+                        record.clone()
+                    });
+            }
+        }
+        contract_retry_changed |= crate::snapshots::terminal_contract_retry::merge_maps(
+            &mut self.quarantined_fingerprints,
+            index_quarantine,
+        );
+        for (fingerprint, record) in &mut self.quarantined_fingerprints {
+            if !self
+                .permanent_rejections
+                .get(fingerprint)
+                .is_some_and(PermanentSnapshotRejection::has_stale_debt)
+            {
+                contract_retry_changed |=
+                    crate::snapshots::terminal_contract_retry::exhaust(record);
+            }
+        }
+        // The server-permanent exact-body fact dominates an older index timer.
+        // Keep the index-facing disposition truthful as well as suppressing I/O.
+        for (fingerprint, record) in &mut self.quarantined_fingerprints {
+            // A conflict recorded alongside the retained refusal is newer:
+            // permanent refusal recording itself always writes terminal. Keep
+            // that retry debt while the old refusal still suppresses early I/O.
+            if newer_retryable_refusals.contains(fingerprint) {
+                continue;
+            }
+            if self
+                .permanent_rejections
+                .get(fingerprint)
+                .is_some_and(|permanent| {
+                    !permanent.owed()
+                        && record.upload_body_witness.as_deref()
+                            == Some(permanent.body_witness.as_str())
+                })
+            {
+                record.failed_reconstruction_count = MAX_SNAPSHOT_RECONSTRUCTION_FAILURES;
+                record.disposition = SnapshotQuarantineDisposition::UnprovenTerminal;
+                record.retry_after_unix_seconds = 0;
+            }
+        }
+        let now = current_unix_seconds();
+        let active = self
+            .active_quarantine_witness
+            .as_ref()
+            .expect("upload progress always has an active quarantine witness");
+        let mut version_only_kept = 0;
+        for record in self.quarantined_fingerprints.values_mut() {
+            if record.witness != *active && record.witness.same_retry_contract(active) {
+                record.witness = active.clone();
+                version_only_kept += 1;
+            }
+        }
+        if version_only_kept > 0 {
+            crate::local_resource_diagnostics::traversal_point(
+                "quarantine_retry",
+                "unknown",
+                &serde_json::json!({"action": "version_only_kept", "count": version_only_kept}),
+            );
+        }
+        let mut candidates = self
+            .quarantined_fingerprints
+            .iter()
+            .filter(|(fingerprint, record)| {
+                !self
+                    .permanent_rejections
+                    .get(*fingerprint)
+                    .is_some_and(PermanentSnapshotRejection::has_stale_debt)
+                    && !record
+                        .upload_body_witness
+                        .as_deref()
+                        .is_some_and(|body| self.refused_body(fingerprint, body))
+                    && record.disposition == SnapshotQuarantineDisposition::RetryPending
+                    && ((record.contract_retry_claims.is_none()
+                        && !record.witness.same_retry_contract(active)
+                        && !crate::snapshots::quarantine_context_only_changed(
+                            &record.witness,
+                            active,
+                        ))
+                        || record.retry_after_unix_seconds <= now)
+            })
+            .map(|(fingerprint, record)| {
+                (
+                    record.witness.same_retry_contract(active) as u8,
+                    record.retry_after_unix_seconds,
+                    fingerprint.clone(),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        let mut reoffer_changed = false;
+        let mut due_reoffers = BTreeMap::new();
+        if let Some(scope) = reoffer {
+            reoffer_changed = self.collect_due_reason_reoffers(scope, &mut due_reoffers);
+            // A due re-offer has the same rank as a due ordinary retry under
+            // the active witness: oldest deadline first, fingerprint ties.
+            // A fingerprint owns one shared slot even if a crash left an
+            // ordinary retry for a different body in the progress ledger.
+            candidates.retain(|(_, _, fingerprint)| !due_reoffers.contains_key(fingerprint));
+            candidates.extend(
+                due_reoffers
+                    .iter()
+                    .map(|(fingerprint, (due, _))| (1u8, *due, fingerprint.clone())),
+            );
+        }
+        let reoffer_now = reoffer.map_or(0, |scope| scope.now);
+        let mut retry = BTreeSet::new();
+        for (_, _, fingerprint) in candidates {
+            if retry.len() + self.active_reason_reoffers.len()
+                >= SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE
+            {
+                break;
+            }
+            if due_reoffers.contains_key(&fingerprint) {
+                let legacy = self
+                    .permanent_rejections
+                    .get(&fingerprint)
+                    .is_some_and(|refusal| {
+                        matches!(
+                            refusal.reoffer,
+                            None | Some(reason_reoffer::RefusalReoffer::LegacyOther { .. })
+                        )
+                    });
+                // The one-time migration gets at most half the shared slots;
+                // keep walking so ordinary retries can use their share.
+                if legacy
+                    && self.reason_reoffer_counts.legacy_selected
+                        >= SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE / 2
+                {
+                    continue;
+                }
+            }
+            match due_reoffers.remove(&fingerprint) {
+                Some((_, body_witness)) => {
+                    self.reserve_reason_reoffer(&fingerprint, body_witness, reoffer_now);
+                    reoffer_changed = true;
+                }
+                None => {
+                    retry.insert(fingerprint);
+                }
+            }
+        }
+        self.reason_reoffer_counts.deferred_budget = due_reoffers.len();
+        for fingerprint in &retry {
+            let record = self
+                .quarantined_fingerprints
+                .get_mut(fingerprint)
+                .expect("selected quarantine retry exists");
+            if record.contract_retry_claims.is_some() {
+                crate::snapshots::terminal_contract_retry::claim(record);
+                self.pace_retry(fingerprint);
+            }
+            // Selection is not a send. Offered or still-queued work keeps its
+            // deadline; source-held work is paced at the final offer boundary.
+        }
+        self.active_quarantine_retries = retry;
+        !self.active_quarantine_retries.is_empty()
+            || version_only_kept > 0
+            || reoffer_changed
+            || contract_retry_changed
+    }
+
+    /// Due, exactly bound refusal re-offers: fingerprint -> (deadline, body).
+    /// Returns whether a schedule was changed (re-clamped by the clock bound).
+    pub(super) fn collect_due_reason_reoffers(
+        &mut self,
+        scope: &reason_reoffer::Scope<'_>,
+        due: &mut BTreeMap<String, (u64, String)>,
+    ) -> bool {
+        use reason_reoffer::RefusalReoffer;
+        let index = scope.index;
+        // A missing or quarantined index cannot prove current membership.
+        if index.generation == 0 || self.permanent_rejections.is_empty() {
+            return false;
+        }
+        let current = index
+            .eligible_snapshot_fingerprint_refs()
+            .collect::<BTreeSet<_>>();
+        let latest = reason_reoffer::latest_valid_deadline(scope.now);
+        let counts = &mut self.reason_reoffer_counts;
+        let mut changed = false;
+        for (fingerprint, refusal) in &mut self.permanent_rejections {
+            // Known reasons are never re-offered; only the old `other`
+            // vocabulary can carry this reason or a legacy record of it.
+            if refusal.has_stale_debt()
+                || refusal.reason != crate::upload_receipts::RejectedUsageReason::Other
+            {
+                continue;
+            }
+            let retry_after = match refusal.reoffer {
+                None => 0,
+                Some(RefusalReoffer::Classified) => continue,
+                Some(reoffer) => reoffer.retry_after().unwrap_or_default(),
+            };
+            if retry_after > latest {
+                // A wall-clock rollback must not consume the one-time pass or
+                // permanently disable daily offers. Keep suppression this cycle
+                // and durably restart the conservative 24 h cooldown.
+                refusal.reoffer = refusal.reoffer.map(|reoffer| {
+                    reoffer.with_retry_after(reason_reoffer::next_offer_after(scope.now))
+                });
+                counts.clock_bound_skipped += 1;
+                changed = true;
+                continue;
+            }
+            let bound = index
+                .quarantined_snapshot_fingerprints
+                .get(fingerprint)
+                .is_some_and(|record| {
+                    record.disposition != SnapshotQuarantineDisposition::SupersededTerminal
+                        && record.upload_body_witness.as_deref()
+                            == Some(refusal.body_witness.as_str())
+                });
+            if !bound
+                || !current.contains(fingerprint.as_str())
+                || self.accepted_fingerprints.contains(fingerprint)
+                || index.accepted_snapshot_fingerprint_recorded(fingerprint)
+            {
+                counts.ineligible_unbound += 1;
+                continue;
+            }
+            if retry_after > scope.now {
+                continue;
+            }
+            let outside_window = index
+                .snapshot_activity_at
+                .get(fingerprint)
+                .and_then(Option::as_deref)
+                .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+                .is_some_and(|activity| {
+                    activity.unix_timestamp() < scope.window_start_unix_seconds as i64
+                });
+            if outside_window {
+                counts.outside_policy_window += 1;
+                continue;
+            }
+            counts.due += 1;
+            due.insert(
+                fingerprint.clone(),
+                (retry_after, refusal.body_witness.clone()),
+            );
+        }
+        changed
+    }
+
+    /// Extend the existing cooldown view with stale debt. Its input-only hold
+    /// survives old terminal dispositions, witness revisions and later ACKs;
+    /// those facts do not prove that the retained refusal is covered.
+    pub(super) fn reason_reoffer_cooldowns(
+        &self,
+        now: u64,
+    ) -> BTreeMap<String, crate::snapshots::ReasonReofferCooldown> {
+        use reason_reoffer::RefusalReoffer;
+        let latest = reason_reoffer::latest_valid_deadline(now);
+        self.permanent_rejections
+            .iter()
+            .filter_map(|(fingerprint, owner)| {
+                let stale = std::iter::once(owner)
+                    .chain(owner.revisions.values())
+                    .find(|r| r.owed());
+                if let Some(refusal) = stale {
+                    return Some((
+                        fingerprint.clone(),
+                        crate::snapshots::ReasonReofferCooldown {
+                            body_witness: refusal.body_witness.clone(),
+                            input_change_only: true,
+                        },
+                    ));
+                }
+                let eligible =
+                    owner.reason == crate::upload_receipts::RejectedUsageReason::Other
+                        && matches!(
+                            owner.reoffer,
+                            Some(
+                                RefusalReoffer::OriginalPair { .. }
+                                    | RefusalReoffer::LegacyOther { .. }
+                            )
+                        )
+                        && owner
+                            .reoffer
+                            .and_then(RefusalReoffer::retry_after)
+                            .is_some_and(|deadline| deadline <= latest)
+                        && !self.active_reason_reoffers.contains_key(fingerprint)
+                        && !self.active_quarantine_retries.contains(fingerprint)
+                        && !self.accepted_fingerprints.contains(fingerprint)
+                        && self
+                            .quarantined_fingerprints
+                            .get(fingerprint)
+                            .is_some_and(|record| {
+                                record.disposition == SnapshotQuarantineDisposition::RetryPending
+                                    && self.active_quarantine_witness.as_ref().is_some_and(
+                                        |active| record.witness.same_retry_contract(active),
+                                    )
+                                    && record.upload_body_witness.as_deref()
+                                        == Some(owner.body_witness.as_str())
+                            });
+                eligible.then(|| {
+                    (
+                        fingerprint.clone(),
+                        crate::snapshots::ReasonReofferCooldown::from(owner.body_witness.clone()),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// Reserve the next logical offer before any scan or upload can use it.
+    /// A crash or an unmaterialized lease therefore waits a day.
+    pub(super) fn reserve_reason_reoffer(
+        &mut self,
+        fingerprint: &str,
+        body_witness: String,
+        now: u64,
+    ) {
+        use reason_reoffer::RefusalReoffer;
+        let refusal = self
+            .permanent_rejections
+            .get_mut(fingerprint)
+            .expect("selected re-offer has its refusal");
+        let next = reason_reoffer::next_offer_after(now);
+        refusal.reoffer = Some(match refusal.reoffer {
+            None => {
+                self.reason_reoffer_counts.legacy_selected += 1;
+                RefusalReoffer::LegacyOther {
+                    retry_after_unix_seconds: next,
+                }
+            }
+            Some(reoffer) => {
+                if matches!(reoffer, RefusalReoffer::LegacyOther { .. }) {
+                    self.reason_reoffer_counts.legacy_selected += 1;
+                }
+                reoffer.with_retry_after(next)
+            }
+        });
+        self.reason_reoffer_counts.selected += 1;
+        self.active_reason_reoffers
+            .insert(fingerprint.to_string(), body_witness);
+    }
+
+    /// Immediately before the first actual transmission of this cycle, move
+    /// each materialized lease's next deadline to at least now + 24 h.
+    /// Returns whether a deadline moved; the caller persists before POST.
+    pub(super) fn extend_reason_reoffers_before_upload(
+        &mut self,
+        items: &[SnapshotItem],
+        locally_held: &BTreeSet<String>,
+    ) -> bool {
+        if self.active_reason_reoffers.is_empty() {
+            return false;
+        }
+        let materialized = items
+            .iter()
+            .filter(|item| {
+                self.active_reason_reoffers
+                    .get(&item.snapshot_fingerprint)
+                    .is_some_and(|body| {
+                        *body == snapshot_upload_body_witness(item)
+                            || (item.cache_observations.is_some()
+                                && item.cache_base_head_etag.is_none()
+                                && *body == snapshot_upload_body_witness(&cache_head_probe(item)))
+                    })
+            })
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect::<BTreeSet<_>>();
+        self.reason_reoffer_counts.gate_held = self
+            .active_reason_reoffers
+            .keys()
+            .filter(|fingerprint| locally_held.contains(*fingerprint))
+            .count();
+        // Unmaterialized leases are no longer usable this cycle.
+        self.active_reason_reoffers
+            .retain(|fingerprint, _| materialized.contains(fingerprint));
+        self.reason_reoffer_counts.not_materialized = self
+            .reason_reoffer_counts
+            .selected
+            .saturating_sub(materialized.len())
+            .saturating_sub(self.reason_reoffer_counts.gate_held);
+        let next = reason_reoffer::next_offer_after(reason_reoffer::now_unix_seconds());
+        let mut changed = false;
+        for fingerprint in &materialized {
+            if let Some(refusal) = self.permanent_rejections.get_mut(fingerprint) {
+                if let Some(reoffer) = refusal.reoffer {
+                    if reoffer
+                        .retry_after()
+                        .is_some_and(|retry_after| retry_after < next)
+                    {
+                        refusal.reoffer = Some(reoffer.with_retry_after(next));
+                        changed = true;
+                    }
+                }
+            }
+        }
+        changed
+    }
+
+    /// Re-witness a quarantined retry at the active witness and give it the
+    /// ordinary backoff, without spending a failure.
+    pub(super) fn pace_retry(&mut self, fingerprint: &str) {
+        let record = self
+            .quarantined_fingerprints
+            .get_mut(fingerprint)
+            .expect("paced quarantine retry exists");
+        record.witness = self
+            .active_quarantine_witness
+            .clone()
+            .expect("upload progress always has an active quarantine witness");
+        record.retry_after_unix_seconds = quarantine_retry_after(fingerprint);
+    }
+
+    /// Source-held retries use ordinary pacing without spending a failure.
+    /// Offered bodies keep their lease: transport/token failures still owe it.
+    pub(super) fn defer_held_quarantine_retries(
+        &mut self,
+        offered: &[SnapshotItem],
+        index: &ScanIndex,
+        source: SnapshotSource,
+    ) -> bool {
+        let mut deferred = 0;
+        self.active_quarantine_retries.retain(|fingerprint| {
+            if offered
+                .iter()
+                .any(|item| &item.snapshot_fingerprint == fingerprint)
+                || index.quarantine_retry_is_queued(fingerprint)
+            {
+                return true;
+            }
+            let Some(record) = self.quarantined_fingerprints.get_mut(fingerprint) else {
+                return true;
+            };
+            if record.contract_retry_claims.is_some()
+                || record.disposition != SnapshotQuarantineDisposition::RetryPending
+            {
+                return true;
+            }
+            record.witness = self
+                .active_quarantine_witness
+                .clone()
+                .expect("upload progress always has an active quarantine witness");
+            record.retry_after_unix_seconds = quarantine_retry_after(fingerprint);
+            deferred += 1;
+            false
+        });
+        if deferred > 0 {
+            crate::local_resource_diagnostics::traversal_point(
+                "quarantine_retry",
+                source.api_slug(),
+                &serde_json::json!({"action": "deferred_held", "count": deferred}),
+            );
+        }
+        deferred > 0
+    }
+
+    /// The logical offer ends with the main upload call. Classify each
+    /// attempted lease by its validated durable outcome; a lease still held
+    /// had no validated response and keeps its reserved cooldown.
+    pub(super) fn finish_reason_reoffers(
+        &mut self,
+        attempted: &BTreeMap<String, String>,
+        shed: bool,
+        source: &str,
+    ) {
+        self.context_resend.emit(source);
+        let counts = &mut self.reason_reoffer_counts;
+        for fingerprint in attempted.keys() {
+            if !self.attempted_reason_reoffers.contains(fingerprint) {
+                counts.gate_held += 1;
+            } else if self.active_reason_reoffers.contains_key(fingerprint) {
+                if shed {
+                    counts.shed += 1;
+                } else {
+                    counts.failed += 1;
+                }
+            }
+            // Validated outcomes were counted when they consumed the exact
+            // lease. Later cache enrichment cannot relabel a probe's ACK, and
+            // an old refusal cannot relabel a fresh retryable conflict.
+        }
+        self.active_reason_reoffers.clear();
+        counts.invalid_extension = counts
+            .invalid_extension
+            .max(reason_reoffer::take_logged_invalid_extensions());
+        if reason_reoffer::should_log(source, counts) {
+            eprintln!("{}", counts.line(source));
+        }
+    }
 }
