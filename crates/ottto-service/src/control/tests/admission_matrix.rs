@@ -1,7 +1,7 @@
-//! Caller outcomes through the request entry. M and F01–F06 cover every command
-//! and the identity fence; B01–B10 cover backend-token authority; V01–V06 pin
-//! Verify effects; U01–U02 pin public updates; P01–P05 pin precedence; I02
-//! compares internal and manual verification; R01–R04 pin output profiles.
+//! Caller outcomes through the request entry: every command's cell for each
+//! caller column and the launch identity fence, backend-token authority, Verify
+//! effects, public updates, check precedence, internal against manual
+//! verification, and output profiles.
 
 use super::*;
 use crate::test_effects::{Effect, Recording, Scalar};
@@ -695,7 +695,7 @@ fn row_name(command: &LocalControlCommand) -> &'static str {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Column {
-    StaleVersion,
+    MismatchedVersion,
     NoCaller,
     CompanionNoPeer,
     CompanionForeignEuid,
@@ -709,7 +709,7 @@ enum Column {
     PoisonedBadToken,
 }
 const COLUMNS: [Column; 12] = [
-    Column::StaleVersion,
+    Column::MismatchedVersion,
     Column::NoCaller,
     Column::CompanionNoPeer,
     Column::CompanionForeignEuid,
@@ -780,7 +780,7 @@ fn request_for(
     (
         LocalControlRequest {
             request_id: "caller-matrix".into(),
-            protocol_version: version + u16::from(column == StaleVersion),
+            protocol_version: version + u16::from(column == MismatchedVersion),
             token,
             client_kind,
             client_install_owner: None,
@@ -1026,7 +1026,7 @@ fn assert_boundary(
 ) -> LocalControlResponse {
     let health = health_snapshot(daemon);
     let files = tree_snapshot(&fixture.root);
-    let stale = ottto_protocol::validate_local_control_protocol_version(
+    let mismatched = ottto_protocol::validate_local_control_protocol_version(
         request.0.protocol_version,
         &request.0.command,
     )
@@ -1042,13 +1042,13 @@ fn assert_boundary(
     let entered = recording.take();
     drop(recording);
     assert_cell(&response, expected, context);
-    let expected_entry = if stale {
+    let expected_entry = if mismatched {
         Vec::new()
     } else {
         dispatch_entered(trusted)
     };
     assert_eq!(entered, expected_entry, "dispatch: {context}");
-    if matches!(expected, N | A | P) || stale {
+    if matches!(expected, N | A | P) || mismatched {
         assert_eq!(health_snapshot(daemon), health, "health: {context}");
         assert_eq!(tree_snapshot(&fixture.root), files, "tree: {context}");
         assert_eq!(fixture.backend.count(), 0, "network: {context}");
@@ -1075,7 +1075,7 @@ fn matrix_names_are_unique_exhaustive_and_cells_match_authority() {
     assert!(IDENTITY_FENCE.iter().all(|name| names.contains(name)));
     for row in ROWS {
         assert_eq!(row.name, row_name(&(row.sample)()));
-        assert_eq!(row.cells[0], I, "{} stale protocol", row.name);
+        assert_eq!(row.cells[0], I, "{} mismatched protocol version", row.name);
         match row.authority {
             "Local" | "LocalCli" | "LocalNoPoisonCheck" => {
                 assert_eq!(&row.cells[1..6], &[N, N, N, A, A], "{}", row.name);
@@ -1100,7 +1100,7 @@ fn matrix_names_are_unique_exhaustive_and_cells_match_authority() {
 
 #[test]
 #[serial]
-fn m_every_command_and_f01_f04_identity_fence() {
+fn every_command_cell_and_the_identity_fence() {
     let _lock = lock_backend_test_env();
     for row in ROWS {
         for (index, column) in COLUMNS.into_iter().enumerate() {
@@ -1109,7 +1109,7 @@ fn m_every_command_and_f01_f04_identity_fence() {
             if column.poisoned() {
                 poison(&daemon.inner);
             }
-            let context = format!("M/{} {column:?}", row.name);
+            let context = format!("{} {column:?}", row.name);
             let expected = row.cells[index];
             let request = request_for((row.sample)(), column);
             let response =
@@ -1121,8 +1121,8 @@ fn m_every_command_and_f01_f04_identity_fence() {
                     "{context}"
                 );
             }
-            // F01–F03: exactly the ten identity commands cancel the handoff,
-            // and only for an admitted caller. F04: invalid arguments still fence.
+            // Exactly the ten identity commands cancel the handoff, and only
+            // for an admitted caller; invalid arguments still fence.
             let cancelled = IDENTITY_FENCE.contains(&row.name)
                 && matches!(
                     column,
@@ -1137,18 +1137,18 @@ fn m_every_command_and_f01_f04_identity_fence() {
                 assert_eq!(
                     launch.state,
                     Some(ottto_protocol::SessionLaunchStateV1::Blocked),
-                    "F01 {context}"
+                    "fence cancels: {context}"
                 );
                 assert_eq!(
                     launch.block.unwrap().reason,
                     ottto_protocol::SessionLaunchBlockReasonV1::LaunchCancelled,
-                    "F04 {context}"
+                    "fence reason: {context}"
                 );
             } else {
                 assert_eq!(
                     launch.state,
                     Some(ottto_protocol::SessionLaunchStateV1::Pending),
-                    "F02/F03 {context}"
+                    "fence untouched: {context}"
                 );
             }
         }
@@ -1157,7 +1157,7 @@ fn m_every_command_and_f01_f04_identity_fence() {
 
 #[test]
 #[serial]
-fn f05_poisoned_launch_registry_refuses_only_the_identity_fence() {
+fn poisoned_launch_registry_refuses_only_the_identity_fence() {
     let _lock = lock_backend_test_env();
     for row in ROWS {
         let fixture = Fixture::new(200, "{}".into());
@@ -1166,7 +1166,7 @@ fn f05_poisoned_launch_registry_refuses_only_the_identity_fence() {
         let health = health_snapshot(&daemon);
         let files = tree_snapshot(&fixture.root);
         let response = run(&daemon, (row.sample)(), Column::GoodTokenCli);
-        let context = format!("F05/{}", row.name);
+        let context = format!("poisoned registry {}", row.name);
         if IDENTITY_FENCE.contains(&row.name) {
             assert_cell(&response, P, &context);
             assert_eq!(health_snapshot(&daemon), health, "{context}");
@@ -1182,18 +1182,18 @@ fn f05_poisoned_launch_registry_refuses_only_the_identity_fence() {
 
 #[test]
 #[serial]
-fn f06_installation_reset_needs_its_own_protocol_version() {
+fn installation_reset_needs_its_own_protocol_version() {
     let _lock = lock_backend_test_env();
     let reset = || LocalControlCommand::AuthReset {
         local_only: false,
         forget_installation: true,
     };
     for (label, base_version, column, expected) in [
-        ("F06 base", true, Column::GoodTokenCli, I),
-        ("F06 base trusted", true, Column::Trusted, I),
-        ("F06 untrusted", false, Column::NoCaller, N),
-        ("F06 bad token", false, Column::BadTokenCli, A),
-        ("F06 poisoned", false, Column::PoisonedTrusted, P),
+        ("base version", true, Column::GoodTokenCli, I),
+        ("base version, trusted", true, Column::Trusted, I),
+        ("untrusted", false, Column::NoCaller, N),
+        ("bad token", false, Column::BadTokenCli, A),
+        ("poisoned", false, Column::PoisonedTrusted, P),
     ] {
         let fixture = Fixture::new(200, "{}".into());
         let (daemon, pending) = fixture.daemon_with_pending();
@@ -1342,7 +1342,7 @@ fn run_backend_case(family: BackendFamily, case: BackendCase) {
 
 #[test]
 #[serial]
-fn b01_b08_telemetry_and_daily_reference_authority() {
+fn telemetry_and_daily_reference_token_authority() {
     let _lock = lock_backend_test_env();
     for family in [BackendFamily::Telemetry, BackendFamily::DailyReference] {
         let case = |label| backend_case(family, label);
@@ -1351,52 +1351,52 @@ fn b01_b08_telemetry_and_daily_reference_authority() {
                 token: None,
                 expected: N,
                 posts: 0,
-                ..case("B01 empty token")
+                ..case("empty token")
             },
             BackendCase {
                 token: Some((family.action(), "codex", -60)),
                 expected: N,
                 posts: 0,
-                ..case("B02 expired")
+                ..case("expired")
             },
             BackendCase {
                 token: Some(("wrong-action", "codex", 300)),
                 expected: N,
                 posts: 0,
-                ..case("B03 wrong action")
+                ..case("wrong action")
             },
             BackendCase {
                 token: Some((family.action(), "pi", 300)),
                 expected: N,
                 posts: 0,
-                ..case("B04 wrong source")
+                ..case("wrong source")
             },
             BackendCase {
                 claim: ("organization_id", json!("other-org")),
                 expected: N,
-                ..case("B05 backend org")
+                ..case("backend org")
             },
             BackendCase {
                 claim: ("user_id", json!("other-user")),
                 expected: N,
-                ..case("B06 user")
+                ..case("backend user")
             },
             BackendCase {
                 claim: ("device_id", json!("other-device")),
                 expected: N,
-                ..case("B06 device")
+                ..case("backend device")
             },
             BackendCase {
                 status: 401,
                 expected: N,
-                ..case("B07 backend refusal")
+                ..case("backend refusal")
             },
             BackendCase {
                 binding: None,
                 expected: N,
-                ..case("B07 no local binding")
+                ..case("no local binding")
             },
-            case("B08 valid, both keys absent"),
+            case("valid, both keys absent"),
         ] {
             run_backend_case(family, case);
         }
@@ -1405,7 +1405,7 @@ fn b01_b08_telemetry_and_daily_reference_authority() {
 
 #[test]
 #[serial]
-fn b10_backend_branch_points_reservation_and_binding_order() {
+fn backend_branch_points_reservation_and_binding_order() {
     let _lock = lock_backend_test_env();
     let telemetry = |label| backend_case(BackendFamily::Telemetry, label);
     for case in [
@@ -1413,38 +1413,38 @@ fn b10_backend_branch_points_reservation_and_binding_order() {
         BackendCase {
             request_organization: "other-org",
             expected: I,
-            ..telemetry("B05 request org")
+            ..telemetry("request org")
         },
         BackendCase {
             claim: ("key_id", json!("key_local")),
             request_key: Some("key_local"),
-            ..telemetry("B10 matched key")
+            ..telemetry("matched key")
         },
         BackendCase {
             claim: ("key_id", json!("key_other")),
             request_key: Some("key_local"),
             expected: N,
-            ..telemetry("B10 mismatched key")
+            ..telemetry("mismatched key")
         },
         BackendCase {
             request_key: Some("key_local"),
             expected: N,
-            ..telemetry("B10 request key only")
+            ..telemetry("request key only")
         },
         BackendCase {
             claim: ("key_id", json!("key_local")),
             expected: N,
-            ..telemetry("B10 claim key only")
+            ..telemetry("claim key only")
         },
         BackendCase {
             broken_device: true,
             expected: N,
-            ..telemetry("B10 broken device")
+            ..telemetry("broken device")
         },
         BackendCase {
             reserved: true,
             expected: U,
-            ..telemetry("B10 reservation")
+            ..telemetry("reservation")
         },
     ] {
         run_backend_case(BackendFamily::Telemetry, case);
@@ -1455,19 +1455,19 @@ fn b10_backend_branch_points_reservation_and_binding_order() {
         BackendCase {
             broken_device: true,
             expected: H,
-            ..daily("B10 broken device")
+            ..daily("broken device")
         },
         // The account refusal precedes the device read.
         BackendCase {
             binding: None,
             broken_device: true,
             expected: N,
-            ..daily("B10 no account, broken device")
+            ..daily("no account, broken device")
         },
         // Status skips the identity-mutation reservation.
         BackendCase {
             reserved: true,
-            ..daily("B10 reservation")
+            ..daily("reservation")
         },
     ] {
         run_backend_case(BackendFamily::DailyReference, case);
@@ -1487,13 +1487,13 @@ fn b10_backend_branch_points_reservation_and_binding_order() {
         ingest_key: None,
     };
     let request = request_for(command, Column::NoCaller);
-    assert_boundary(&fixture, &daemon, &pending, request, I, "B10 blank key");
+    assert_boundary(&fixture, &daemon, &pending, request, I, "blank key");
     assert_eq!(fixture.backend.count(), 0);
 }
 
 #[test]
 #[serial]
-fn b09_backend_tokens_ignore_an_invalid_outer_token_and_poisoned_daemon() {
+fn backend_tokens_ignore_an_invalid_outer_token_and_poisoned_daemon() {
     let _lock = lock_backend_test_env();
     for family in [BackendFamily::Telemetry, BackendFamily::DailyReference] {
         let body = json!({
@@ -1519,7 +1519,7 @@ fn b09_backend_tokens_ignore_an_invalid_outer_token_and_poisoned_daemon() {
             );
             response
         };
-        assert_cell(&send(), O, &format!("B09 {family:?}"));
+        assert_cell(&send(), O, &format!("poisoned daemon {family:?}"));
         assert_eq!(fixture.backend.count(), 1, "{family:?}");
         let replay = send();
         assert_eq!(fixture.backend.count(), 2, "{family:?}");
@@ -1528,7 +1528,11 @@ fn b09_backend_tokens_ignore_an_invalid_outer_token_and_poisoned_daemon() {
             BackendFamily::Telemetry => O,
             BackendFamily::DailyReference => N,
         };
-        assert_cell(&replay, expected, &format!("B09 replay {family:?}"));
+        assert_cell(
+            &replay,
+            expected,
+            &format!("poisoned daemon replay {family:?}"),
+        );
         assert!(fixture.backend.all_validate());
     }
 }
@@ -1568,16 +1572,44 @@ fn assert_verify_recorded(daemon: &LocalDaemon) {
 
 #[test]
 #[serial]
-fn v01_v06_verify_records_only_for_an_admitted_caller() {
+fn verify_records_only_for_an_admitted_caller() {
     let _lock = lock_backend_test_env();
     let drifted = drifted_config();
     for (label, config, disabled, repair, column, expected) in [
-        ("V01", DISABLED_CONFIG, true, false, Column::NoCaller, N),
-        ("V02", CLEAN_CONFIG, false, false, Column::NoCaller, N),
-        ("V03", drifted.as_str(), false, true, Column::NoCaller, N),
-        ("V04", DISABLED_CONFIG, true, false, Column::Trusted, O),
         (
-            "V05",
+            "untrusted, disabled patch",
+            DISABLED_CONFIG,
+            true,
+            false,
+            Column::NoCaller,
+            N,
+        ),
+        (
+            "untrusted, clean config",
+            CLEAN_CONFIG,
+            false,
+            false,
+            Column::NoCaller,
+            N,
+        ),
+        (
+            "untrusted, drift repair",
+            drifted.as_str(),
+            false,
+            true,
+            Column::NoCaller,
+            N,
+        ),
+        (
+            "trusted, disabled patch",
+            DISABLED_CONFIG,
+            true,
+            false,
+            Column::Trusted,
+            O,
+        ),
+        (
+            "poisoned token, drift repair",
             drifted.as_str(),
             false,
             true,
@@ -1585,7 +1617,7 @@ fn v01_v06_verify_records_only_for_an_admitted_caller() {
             P,
         ),
         (
-            "V06",
+            "poisoned trusted, drift repair",
             drifted.as_str(),
             false,
             true,
@@ -1625,7 +1657,7 @@ fn v01_v06_verify_records_only_for_an_admitted_caller() {
 
 #[test]
 #[serial]
-fn u01_u02_public_update_works_with_untrusted_and_poisoned_state() {
+fn public_update_works_with_untrusted_and_poisoned_state() {
     let _lock = lock_backend_test_env();
     for poisoned in [false, true] {
         let fixture = Fixture::new(200, "{}".into());
@@ -1636,7 +1668,7 @@ fn u01_u02_public_update_works_with_untrusted_and_poisoned_state() {
         let health = health_snapshot(&daemon);
         let files = tree_snapshot(&fixture.root);
         let response = run(&daemon, LocalControlCommand::UpdateCheck, Column::NoCaller);
-        assert_cell(&response, O, "U01/U02");
+        assert_cell(&response, O, "public update");
         assert_eq!(fixture.backend.count(), 1);
         assert!(fixture.backend.requests.lock().unwrap()[0].starts_with("GET / "));
         assert_eq!(health_snapshot(&daemon), health);
@@ -1646,16 +1678,26 @@ fn u01_u02_public_update_works_with_untrusted_and_poisoned_state() {
 
 #[test]
 #[serial]
-fn p01_p05_protocol_token_guard_and_cached_read_precedence() {
+fn protocol_token_guard_and_cached_read_precedence() {
     let _lock = lock_backend_test_env();
     for (label, column, timezone, expected) in [
-        ("P01", Column::StaleVersion, false, I),
-        ("P02", Column::BadTokenTrustedPeer, false, A),
+        ("mismatched version", Column::MismatchedVersion, false, I),
+        (
+            "bad token, trusted peer",
+            Column::BadTokenTrustedPeer,
+            false,
+            A,
+        ),
         // A pure argument guard currently runs before the caller check.
-        ("P03", Column::NoCaller, true, I),
+        ("argument guard, untrusted", Column::NoCaller, true, I),
         // The same guard also runs before the poison check.
-        ("P04", Column::PoisonedGoodToken, true, I),
-        ("P05", Column::PoisonedGoodToken, false, O),
+        (
+            "argument guard, poisoned",
+            Column::PoisonedGoodToken,
+            true,
+            I,
+        ),
+        ("cached read, poisoned", Column::PoisonedGoodToken, false, O),
     ] {
         let fixture = Fixture::new(200, "{}".into());
         let (daemon, pending) = fixture.daemon_with_pending();
@@ -1712,7 +1754,7 @@ fn without_observation_times(mut value: serde_json::Value) -> serde_json::Value 
 
 #[test]
 #[serial]
-fn i02_internal_reverify_matches_manual_verify_effects() {
+fn internal_reverify_matches_manual_verify_effects() {
     let _lock = lock_backend_test_env();
     // A disabled patch returns early; a clean config reaches the inner status check.
     for disabled in [true, false] {
@@ -1769,7 +1811,7 @@ fn assert_keys(value: &serde_json::Value, expected: &[&str]) {
 
 #[test]
 #[serial]
-fn r01_r04_output_profiles_preserve_account_and_icon_boundaries() {
+fn output_profiles_preserve_account_and_icon_boundaries() {
     let _lock = lock_backend_test_env();
     let status_keys = [
         "protocol_version",
@@ -1788,7 +1830,7 @@ fn r01_r04_output_profiles_preserve_account_and_icon_boundaries() {
     ];
     for (label, command, icon, account) in [
         (
-            "R01",
+            "status",
             LocalControlCommand::Status {
                 refresh_agent_status: false,
                 retry_relay_authorization: false,
@@ -1796,9 +1838,9 @@ fn r01_r04_output_profiles_preserve_account_and_icon_boundaries() {
             true,
             true,
         ),
-        ("R02", LocalControlCommand::AuthStatus, false, true),
-        ("R03", LocalControlCommand::Account, false, false),
-        ("R04", verify_command(false), false, false),
+        ("auth status", LocalControlCommand::AuthStatus, false, true),
+        ("account", LocalControlCommand::Account, false, false),
+        ("verify", verify_command(false), false, false),
     ] {
         let fixture = Fixture::new(200, "{}".into());
         fs::write(
@@ -1806,11 +1848,11 @@ fn r01_r04_output_profiles_preserve_account_and_icon_boundaries() {
             r#"{"machine_id":"machine_test","icon_url":"synthetic-icon"}"#,
         )
         .unwrap();
-        if label == "R04" {
+        if label == "verify" {
             verify_fixture(&fixture, DISABLED_CONFIG);
         }
         let _disabled = EnvVarGuard::set_str("OTTTO_PATCH_CODEX_DISABLED", "1");
-        let daemon = if label == "R04" {
+        let daemon = if label == "verify" {
             fixture.daemon()
         } else {
             let daemon = fixture.daemon().with_account(connected_account());
@@ -1825,8 +1867,8 @@ fn r01_r04_output_profiles_preserve_account_and_icon_boundaries() {
         assert_cell(&response, O, label);
         let payload = response.payload.unwrap();
         match label {
-            "R01" | "R02" => assert_keys(&payload, &status_keys),
-            "R03" => assert_keys(
+            "status" | "auth status" => assert_keys(&payload, &status_keys),
+            "account" => assert_keys(
                 &payload,
                 &[
                     "state",
@@ -1837,7 +1879,7 @@ fn r01_r04_output_profiles_preserve_account_and_icon_boundaries() {
                     "message",
                 ],
             ),
-            "R04" => assert_keys(
+            "verify" => assert_keys(
                 &payload,
                 &[
                     "source",
@@ -1867,7 +1909,7 @@ fn r01_r04_output_profiles_preserve_account_and_icon_boundaries() {
         if icon {
             assert_eq!(payload["machine"]["icon_url"], "synthetic-icon");
         }
-        if label != "R04" {
+        if label != "verify" {
             let status = daemon.status_for_trusted_client().unwrap();
             let effective = to_value(crate::effective_account_binding(&status)).unwrap();
             assert_eq!(effective["state"], "error", "{label}");
