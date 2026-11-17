@@ -1,4 +1,14 @@
 use self::finish::finish_sync_source;
+use self::progress_rows::sync_progress_parent;
+use self::progress_rows::HeadConflictChallenge;
+use self::progress_rows::PendingCacheHeadFile;
+use self::progress_rows::PermanentSnapshotRejection;
+pub(crate) use self::progress_rows::SnapshotProgressLock;
+use self::progress_rows::SnapshotUploadProgress;
+#[cfg(test)]
+use self::progress_rows::SnapshotUploadProgressCas;
+#[cfg(test)]
+use self::progress_rows::SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION;
 mod finish;
 #[cfg(test)]
 use self::lane::collect_file_activity_with_retry;
@@ -273,7 +283,6 @@ const SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE: usize = SNAPSHOT_BATCH_LIMIT;
 // five-minute source cycle; the scan-index cursor and quarantine map resume the
 // remaining identities across restarts.
 const LEGACY_SETTLEMENT_RECONCILE_LIMIT_PER_CYCLE: usize = SNAPSHOT_BATCH_LIMIT;
-const SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION: u16 = 3;
 static ONE_SHOT_SYNC_IN_FLIGHT: OnceLock<Mutex<bool>> = OnceLock::new();
 static SNAPSHOT_SYNC_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 #[cfg(test)]
@@ -1140,266 +1149,10 @@ fn apply_backfill_cutoff_with_claude_corrections(
     (removed, candidates)
 }
 
-/// Durable, privacy-minimal progress for one policy-scoped scan index.
-///
-/// The scanner cannot commit its final `ScanIndex` until every changed
-/// snapshot is accepted: committing it earlier would silently drop the files
-/// represented by a later failed batch. Persisting only the stable semantic
-/// snapshot fingerprints lets a restart skip already-accepted pages without
-/// retaining titles, paths, or prompts. Numeric cache evidence and opaque accepted
-/// head tokens survive cycle cleanup for later corrections; session keys are hashes.
-/// A subset of the current file/entity incidence table, containing only cache
-/// evidence actually deferred for missing accepted predecessor authority.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct PendingCacheHeadFile {
-    source_file_fingerprint: String,
-    group_fingerprint: String,
-    /// Semantic entity -> hashed session key; no source body or authority.
-    entities: BTreeMap<String, String>,
-    /// Sessions whose head arrival already reached a saved current file group.
-    /// Failed bodies remain owed, but normal quarantine drives their retry.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    reselected_heads: BTreeMap<String, String>,
-    /// Exact cache-bearing settlements recorded only after the index save.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    settled_entities: BTreeSet<String>,
-}
-
-/// A server head-CAS challenge this session still owes an answer. The
-/// challenge binds the server's current head to the exact refused revision v2
-/// hash, so the next upload can replace the stale base through the backend's
-/// existing rescan handshake instead of conflicting on it forever.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct HeadConflictChallenge {
-    challenge: String,
-    stale_revision_v2_hash: String,
-    /// Answers the server refused again. Counted and logged; never terminal,
-    /// so an unrecovered session keeps today's retryable conflict hold.
-    #[serde(default)]
-    answer_attempts: u32,
-    /// When an answer to THIS challenge and revision was last refused; 0 when
-    /// none was. A re-send of the same held body waits its conflict probe
-    /// after it; a new challenge or revision resets it.
-    #[serde(default)]
-    last_answer_unix: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct PermanentSnapshotRejection {
-    body_witness: String,
-    /// Old enum vocabulary only: `original_pair_candidate_unproved` is
-    /// written as `other`, so an older daemon keeps reading and suppressing it.
-    reason: crate::upload_receipts::RejectedUsageReason,
-    /// Optional daily/one-time re-offer schedule for this exact body. Older
-    /// daemons ignore it; a malformed value disables only this record's retry.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        serialize_with = "reason_reoffer::serialize",
-        deserialize_with = "reason_reoffer::deserialize"
-    )]
-    reoffer: Option<reason_reoffer::RefusalReoffer>,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "stale_owed::decode_exposure"
-    )]
-    exposure: Option<stale_owed::Exposure>,
-    /// Exact older revisions remain with their existing refusal owner.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    revisions: BTreeMap<String, PermanentSnapshotRejection>,
-}
-
 mod ack_retention;
 mod progress_rows;
 mod telemetry_only;
 mod upload_context_resend;
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct SnapshotUploadProgress {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    telemetry_only: Option<Box<telemetry_only::Ledger>>,
-    schema_version: u16,
-    /// A routed source's progress rows; never serialized into the ledger.
-    #[serde(skip)]
-    rows: Option<Box<crate::snapshots::ProgressRows>>,
-    #[serde(default)]
-    generation: u64,
-    destination_namespace_hash: String,
-    /// Full replay generation whose ACKs populate this ledger. A new reviewed
-    /// replay must not inherit ACKs for identical entities from an older
-    /// generation, while a restart of the same generation must still resume.
-    #[serde(default)]
-    historical_replay_generation: Option<String>,
-    #[serde(default)]
-    accepted_fingerprints: BTreeSet<String>,
-    /// Exact local body witness accepted for each semantic entity. Schema v3
-    /// prevents a crash-resume ledger for curve A from suppressing corrected
-    /// curve B, while the backend continues to ACK the stable semantic
-    /// fingerprint.
-    #[serde(default)]
-    accepted_body_witnesses: BTreeMap<String, String>,
-    /// Exact context of each durable stored-body ACK; absent means unknown.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    accepted_body_contexts: BTreeMap<String, String>,
-    #[serde(skip)]
-    context_resend: upload_context_resend::Cycle,
-    /// Admission only: current live incidence plus bounded unsettled ACK debt.
-    #[serde(skip, default = "ack_retention::default_ack_capacity")]
-    ack_capacity: usize,
-    /// ACKs outside known live incidence; includes valid unindexed debt.
-    #[serde(skip)]
-    retained_stale_ack_count: usize,
-    #[serde(default)]
-    accepted_cache_states: BTreeMap<String, serde_json::Value>,
-    /// Class L bucket/share fingerprints, written only for stored-body ACKs.
-    #[serde(
-        default,
-        skip_serializing_if = "crate::snapshots::claude_request_identity::AcceptedBuckets::is_empty"
-    )]
-    accepted_identity_buckets: crate::snapshots::claude_request_identity::AcceptedBuckets,
-    /// Routed progress: the stored identity rows' barriers. The hints
-    /// themselves are rows of their own, loaded per page.
-    #[serde(
-        default,
-        skip_serializing_if = "crate::snapshots::claude_request_identity::IdentityScope::is_unset"
-    )]
-    accepted_identity_scope: crate::snapshots::claude_request_identity::IdentityScope,
-    #[serde(default)]
-    accepted_cache_heads: BTreeMap<String, String>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pending_cache_heads: BTreeMap<String, PendingCacheHeadFile>,
-    /// Head-CAS conflict challenges keyed like `accepted_cache_heads`. Any
-    /// accepted or unchanged ACK for the session clears its entry.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    head_conflict_challenges: BTreeMap<String, HeadConflictChallenge>,
-    #[serde(default)]
-    quarantined_fingerprints: BTreeMap<String, SnapshotQuarantineRecord>,
-    /// Exact server-permanent refusals. Same destination, entity and body only;
-    /// parser/replay epochs and premature retry timers cannot erase this fact.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    permanent_rejections: BTreeMap<String, PermanentSnapshotRejection>,
-    #[serde(skip)]
-    active_quarantine_witness: Option<SnapshotQuarantineWitness>,
-    /// Runtime leases for quarantine entries selected this cycle. The durable
-    /// record stays armed with its next future deadline until an exact ACK
-    /// clears it; this set only bypasses suppression for the current request.
-    #[serde(skip)]
-    active_quarantine_retries: BTreeSet<String>,
-    /// Runtime leases for refusals re-offered this cycle: fingerprint -> the
-    /// exact refused body witness. Only that body passes permanent
-    /// suppression, once per logical offer; the refusal stays durable.
-    #[serde(skip)]
-    active_reason_reoffers: BTreeMap<String, String>,
-    #[serde(skip)]
-    attempted_reason_reoffers: BTreeSet<String>,
-    #[serde(skip)]
-    reason_reoffer_counts: reason_reoffer::ReofferCounts,
-    #[serde(skip)]
-    terminal_contract_retry_pending_save: bool,
-    /// Only exact entity ACKs observed in this cycle; never restored from disk.
-    #[serde(skip)]
-    fresh_context_body_acks: BTreeMap<String, String>,
-    #[serde(skip)]
-    context_receipt_candidates: Vec<crate::snapshots::UploadContextReceiptCandidate>,
-}
-/// What a save's compare-and-swap reads from the on-disk progress: the writer
-/// stamp and the quarantine claims to merge. Other fields are skipped, not kept.
-#[derive(Deserialize)]
-struct SnapshotUploadProgressCas {
-    schema_version: u16,
-    #[serde(default)]
-    generation: u64,
-    destination_namespace_hash: String,
-    #[serde(default)]
-    quarantined_fingerprints: BTreeMap<String, SnapshotQuarantineRecord>,
-}
-
-pub(crate) struct SnapshotProgressLock {
-    file: std::fs::File,
-    path: Option<Box<Path>>,
-}
-
-impl SnapshotProgressLock {
-    fn acquire(path: &Path) -> Result<Self> {
-        let lock_path = path.with_extension("lock");
-        if let Some(parent) = lock_path.parent() {
-            std::fs::create_dir_all(parent).context("create snapshot upload progress directory")?;
-        }
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(lock_path)
-            .context("open snapshot upload progress lock")?;
-        #[cfg(unix)]
-        {
-            use std::os::fd::AsRawFd;
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-                return Err(std::io::Error::last_os_error())
-                    .context("snapshot upload progress is owned by another daemon");
-            }
-        }
-        Ok(Self { file, path: None })
-    }
-
-    fn for_v2(mut self, path: &Path) -> Self {
-        self.path = Some(path.into());
-        self
-    }
-}
-
-impl Drop for SnapshotProgressLock {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        unsafe {
-            use std::os::fd::AsRawFd;
-            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
-        }
-    }
-}
-
-fn unique_progress_sibling(path: &Path, kind: &str) -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    path.with_extension(format!("{kind}.{}.{nanos}.json", std::process::id()))
-}
-
-/// Whether `value` serializes to exactly `bytes` (compact JSON). Streams into
-/// the comparison and stops at the first differing byte; nothing is buffered.
-fn serializes_to(value: &impl Serialize, bytes: &[u8]) -> bool {
-    struct Same<'a>(&'a [u8]);
-    impl Write for Same<'_> {
-        fn write(&mut self, chunk: &[u8]) -> std::io::Result<usize> {
-            self.0 = self.0.strip_prefix(chunk).ok_or(ErrorKind::InvalidData)?;
-            Ok(chunk.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut same = Same(bytes);
-    serde_json::to_writer(&mut same, value).is_ok() && same.0.is_empty()
-}
-
-fn sync_progress_parent(path: &Path) -> Result<()> {
-    let Some(parent) = path.parent() else {
-        return Ok(());
-    };
-    std::fs::File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .context("sync snapshot upload progress directory")
-}
-
-fn quarantine_invalid_progress(path: &Path) -> Result<()> {
-    let quarantine_path = unique_progress_sibling(path, "corrupt");
-    std::fs::rename(path, quarantine_path)
-        .context("quarantine invalid local snapshot upload progress")?;
-    sync_progress_parent(path)
-}
 
 use crate::hex::is_sha256_any_case as is_snapshot_fingerprint;
 
@@ -4640,10 +4393,6 @@ pub(crate) use tests::codex_archive_tests::{
 #[cfg(test)]
 mod tests;
 
-crate::heap_layout_bound::fields!(SnapshotUploadProgress; telemetry_only, schema_version, rows, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_body_contexts, context_resend, ack_capacity, retained_stale_ack_count, accepted_cache_states, accepted_identity_buckets, accepted_identity_scope, accepted_cache_heads, pending_cache_heads, head_conflict_challenges, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts, terminal_contract_retry_pending_save, fresh_context_body_acks, context_receipt_candidates);
-
-crate::heap_layout_bound::fields!(PendingCacheHeadFile; source_file_fingerprint, group_fingerprint, entities, reselected_heads, settled_entities);
-
 #[cfg(test)]
 #[path = "snapshot_sync/h357_ack_tests.rs"]
 mod h357_ack_tests;
@@ -4671,9 +4420,6 @@ mod progress_unchanged_save_tests;
 #[cfg(test)]
 #[path = "snapshot_sync/head_conflict_released_progress_fixture.rs"]
 mod head_conflict_released_progress_fixture;
-
-crate::heap_layout_bound::fields!(PermanentSnapshotRejection; body_witness, reason, reoffer, exposure, revisions);
-crate::heap_layout_bound::fields!(HeadConflictChallenge; challenge, stale_revision_v2_hash, answer_attempts, last_answer_unix);
 
 #[cfg(test)]
 mod codex_sidecar_reuse_tests;
