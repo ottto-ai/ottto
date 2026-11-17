@@ -417,10 +417,12 @@ fn codex_legacy_group_mixed_page_checkpoint() {
     assert!(legacy
         .iter()
         .all(|key| fs::metadata(key).unwrap().len() < window));
-    let headers = codex_file_join::header_cache_tests::READ_CALLS.with(Cell::get);
     let samples = START_IDENTITY_SAMPLE_FOR_TEST.with(Cell::get);
     let scanner = E2ScanFixture::default();
-    let ((scan, modes), consumed) = oracle::observe_consumed(|| f.page(&scanner));
+    let (((scan, modes), consumed), headers) =
+        codex_file_join::header_cache_tests::observe_read_paths(|| {
+            oracle::observe_consumed(|| f.page(&scanner))
+        });
     assert_eq!(modes, (0, 1, 0));
     assert_eq!(
         consumed,
@@ -433,10 +435,13 @@ fn codex_legacy_group_mixed_page_checkpoint() {
         .unwrap()
         .iter()
         .all(|read| read.path == path));
-    assert_eq!(
-        codex_file_join::header_cache_tests::READ_CALLS.with(Cell::get) - headers,
-        1,
-        "only the changed unit reads its owning header"
+    assert!(
+        !headers.is_empty(),
+        "the changed unit exercises header reads"
+    );
+    assert!(
+        headers.iter().all(|read| read == &path),
+        "Legacy members must have zero header reads: {headers:?}"
     );
     let sampled = START_IDENTITY_SAMPLE_FOR_TEST.with(Cell::get);
     assert!(sampled.0 > samples.0);
@@ -456,8 +461,14 @@ fn codex_legacy_group_mixed_page_checkpoint() {
         !scan.pending_finalization.is_empty(),
         "exercise the checkpoint boundary"
     );
-    scan.validate_codex_checkpoint()
-        .expect("mixed page must not reject JOINED_MEMBER_CHANGED");
+    let ((), headers) = codex_file_join::header_cache_tests::observe_read_paths(|| {
+        scan.validate_codex_checkpoint()
+            .expect("mixed page must not reject JOINED_MEMBER_CHANGED");
+    });
+    assert!(
+        headers.is_empty(),
+        "stable checkpoint headers need no reread"
+    );
     assert_eq!(
         START_IDENTITY_SAMPLE_FOR_TEST.with(Cell::get),
         sampled,

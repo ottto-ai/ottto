@@ -236,7 +236,7 @@ fn read_header_bytes(
     let input = OpenedInput::encoded(file, &candidate.path, cache)?.header_only();
     let mut reader = BufReader::with_capacity(1024, input.take((MAX_HEADER_BYTES + 1) as u64));
     #[cfg(all(test, unix))]
-    header_cache_tests::READ_CALLS.with(|calls| calls.set(calls.get() + 1));
+    header_cache_tests::note_read(&candidate.path);
     // Once reading begins, a failed attempt may have consumed the whole
     // recognition prefix. A funding refusal above consumes no header bytes.
     *read_work = MAX_HEADER_BYTES + 1;
@@ -5735,7 +5735,33 @@ pub(in crate::snapshots) mod header_cache_tests {
     use super::*;
     thread_local! {
         pub(in crate::snapshots) static READ_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        static READ_PATHS: std::cell::RefCell<Option<Vec<PathBuf>>> = const { std::cell::RefCell::new(None) };
     }
+    pub(super) fn note_read(path: &Path) {
+        READ_CALLS.with(|calls| calls.set(calls.get() + 1));
+        READ_PATHS.with(|paths| {
+            if let Some(paths) = paths.borrow_mut().as_mut() {
+                paths.push(path.to_path_buf());
+            }
+        });
+    }
+
+    pub(in crate::snapshots) fn observe_read_paths<T>(
+        run: impl FnOnce() -> T,
+    ) -> (T, Vec<PathBuf>) {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                let _ = READ_PATHS.with(|paths| paths.replace(None));
+            }
+        }
+        READ_PATHS.with(|paths| assert!(paths.replace(Some(Vec::new())).is_none()));
+        let _reset = Reset;
+        let value = run();
+        let paths = READ_PATHS.with(|paths| paths.take().unwrap());
+        (value, paths)
+    }
+
     pub(in crate::snapshots) fn page(
         root: &Path,
         paths: &BTreeSet<String>,
