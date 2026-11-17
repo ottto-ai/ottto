@@ -34,7 +34,7 @@ pub(super) fn policy(command: &LocalControlCommand) -> CommandPolicy {
             (Access::LocalCli, false)
         }
         Command::AgentStatusCached { .. } => (Access::LocalNoPoisonCheck, false),
-        Command::UpdateCheck => (Access::Public, false),
+        Command::UpdateCheck | Command::Status { .. } => (Access::Public, false),
         Command::TelemetryControl { .. } | Command::ProviderDailyReferenceControl { .. } => {
             (Access::BackendToken, false)
         }
@@ -44,7 +44,6 @@ pub(super) fn policy(command: &LocalControlCommand) -> CommandPolicy {
         | Command::SessionLaunchRecentFolders { .. }
         | Command::AccountNicknames
         | Command::AccountNicknameSet { .. }
-        | Command::Status { .. }
         | Command::Receipts { .. }
         | Command::AuthStatus
         | Command::AgentStatusRefresh { .. }
