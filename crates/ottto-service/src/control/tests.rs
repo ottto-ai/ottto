@@ -16846,3 +16846,5 @@ fn test_machine() -> MachineIdentity {
 }
 
 mod claude_settings;
+
+mod admission_matrix;

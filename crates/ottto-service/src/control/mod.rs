@@ -1064,6 +1064,16 @@ fn handle_command(
     status_refresh_quota_source: Option<SourceKind>,
     cli_session_exec: bool,
 ) -> Result<serde_json::Value, LocalApiError> {
+    #[cfg(test)]
+    crate::test_effects::record(
+        "control_dispatch_entered",
+        vec![(
+            "trusted_companion",
+            crate::test_effects::Scalar::Bool(
+                authorization == RequestAuthorization::TrustedCompanionApp,
+            ),
+        )],
+    );
     // Invalidate pending handoffs before any explicit account/slot mutation.
     // Existing mutation handlers retain all of their authorization and order.
     if matches!(
