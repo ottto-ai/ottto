@@ -74,7 +74,14 @@ fn send(
     })
     .0
     .unwrap();
-    let mut settled = settle_checkpointed_upload(page.index, before, &progress, &holds, true);
+    let mut settled = settle_checkpointed_upload(
+        page.index,
+        before,
+        &progress,
+        &holds,
+        true,
+        UnsettledUploadCause::DeferredConflict,
+    );
     settle_index_after_upload(&mut settled.index, before, &progress);
     accept_upload_context_acks_for_test(
         &mut settled.index,
@@ -300,8 +307,15 @@ fn acknowledged_rows_survive_selected_entry_restoration() {
             })
             .0
             .unwrap();
-            let mut index =
-                settle_checkpointed_upload(page.index, &before, &progress, &holds, true).index;
+            let mut index = settle_checkpointed_upload(
+                page.index,
+                &before,
+                &progress,
+                &holds,
+                true,
+                UnsettledUploadCause::DeferredConflict,
+            )
+            .index;
             // The selected entry can be behind the exact ACK's body.
             index.files.insert(
                 holder.to_string_lossy().into_owned(),

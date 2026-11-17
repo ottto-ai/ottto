@@ -515,8 +515,14 @@ fn old_ack_does_not_own_new_request_after_holder_loss() {
                     accepted[ROOT], 1,
                     "the refused append never enters the ledger"
                 );
-                let mut settled =
-                    settle_checkpointed_upload(page.index, &prior, &progress, &holds, true);
+                let mut settled = settle_checkpointed_upload(
+                    page.index,
+                    &prior,
+                    &progress,
+                    &holds,
+                    true,
+                    UnsettledUploadCause::DeferredConflict,
+                );
                 settle_index_after_upload(&mut settled.index, &prior, &progress);
                 accept_upload_context_acks_for_test(
                     &mut settled.index,
