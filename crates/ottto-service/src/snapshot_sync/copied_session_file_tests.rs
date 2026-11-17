@@ -1892,17 +1892,17 @@ fn content_carrier_reconcile_under_open_v2_save_does_not_deadlock() {
     worker.join().unwrap();
 }
 
-/// [regress] An unrouted JSON save grants no new head-backed authority and
-/// keeps its existing residual behavior without relocking a v2 session.
+/// [regress] An unsampled carrier's saves grant no new head-backed authority:
+/// the copy's removal stays pending on every pass, without relocking a v2
+/// session. Every save now has native custody, so the JSON-era checks that
+/// the index stayed unrouted are the only checks this case no longer makes.
 #[test]
-fn legacy_content_carrier_save_stays_unrouted() {
+fn unsampled_content_carrier_keeps_copy_removal_pending() {
     with_e2(|| {
         let (c, mut index, _) = settled_content_carrier(false);
-        assert!(crate::snapshots::e2_pipeline_scan_fixture::route_of(&index).is_none());
         for _ in 0..3 {
             let page = ready(&c, &E2ScanFixture::default(), index.clone(), 100, false);
             index = settle(&c, &index, page, &mut e2_progress());
-            assert!(crate::snapshots::e2_pipeline_scan_fixture::route_of(&index).is_none());
             assert!(
                 index
                     .claude_copy_removals
