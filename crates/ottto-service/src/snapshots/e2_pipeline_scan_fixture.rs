@@ -103,7 +103,7 @@ pub(crate) fn seed_index_for_test(index: &ScanIndex, path: &Path) -> ScanIndex {
         }
     })
     .unwrap();
-    let (store, loaded) = state_v2::StateV2ColdSession::publish_at(index, path, &progress);
+    let (store, loaded) = crate::snapshots::StateV2ColdSession::publish_at(index, path, &progress);
     // The enclosing scratch fixture owns deletion, as for bind_fixture_route.
     std::mem::forget(store);
     E2ScanFixture::register_route_for_test(path);
