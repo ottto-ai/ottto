@@ -186,7 +186,7 @@ fn exact_revision_replaces_the_whole_session_slot() {
 #[test]
 #[serial(client_report)]
 fn refusal_quarantine_and_missing_ack_do_not_replace_rows() {
-    for exclusion in ["refusal", "quarantine", "hold", "wrong-body"] {
+    for exclusion in ["missing-ack", "quarantine", "wrong-body"] {
         with_e2(|| {
             let mut c = Corpus::new(&format!("accepted-row-{exclusion}"));
             let holder = c.root(ROOT, &resumed(ROOT, &[A]));
@@ -199,7 +199,7 @@ fn refusal_quarantine_and_missing_ack_do_not_replace_rows() {
             upload(&page.scan.snapshots, &mut progress, ack).0.unwrap();
             let fp = body(&page, ROOT).unwrap().snapshot_fingerprint.clone();
             match exclusion {
-                "refusal" | "hold" => {
+                "missing-ack" => {
                     progress.fresh_context_body_acks.remove(&fp);
                 }
                 "wrong-body" => {

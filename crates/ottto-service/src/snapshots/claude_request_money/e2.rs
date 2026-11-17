@@ -2589,7 +2589,7 @@ fn holder_proof(
                 && index
                     .claude_request_census
                     .get(key)
-                    .is_some_and(|r| r.proves_scan() && r.holds_hash(hash) && !r.is_twin())
+                    .is_some_and(|r| r.proves_scan() && r.holds_hash(hash))
                 && !saved_removal_applies(index, live, key, hash)
         }
     }

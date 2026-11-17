@@ -2164,6 +2164,111 @@ mod progress_rows {
     }
 }
 
+/// A previous layout gains empty membership without changing delivery proof.
+#[test]
+fn layout_seven_upgrade_preserves_delivery_proof_and_persists_exact_request_ack() {
+    use crate::snapshots::claude_money_birth_store::location_key;
+    use crate::snapshots::upload_context_receipt::{EntityStamp, Receipt, SlotRows};
+    use crate::snapshots::{ScanIndexEntry, SnapshotSource};
+    use std::sync::Arc;
+    let f = Fixture::new();
+    let holder = f
+        .support
+        .join("holder.jsonl")
+        .to_string_lossy()
+        .into_owned();
+    let receipt = Receipt {
+        context_fingerprint: "a".repeat(64),
+        replay_generation: 0,
+        source_witness: "b".repeat(64),
+        body_witness: "c".repeat(64),
+    };
+    let mut previous = ScanIndex::default();
+    previous.upload_context_proof.entity_stamps.insert(
+        "d".repeat(64),
+        EntityStamp {
+            context_fingerprint: receipt.context_fingerprint.clone(),
+            body_witness: receipt.body_witness.clone(),
+        },
+    );
+    previous.files.insert(
+        holder.clone(),
+        ScanIndexEntry {
+            source_file_fingerprint: receipt.source_witness.clone(),
+            upload_context_receipt: Some(receipt.clone()),
+            ..Default::default()
+        },
+    );
+    f.import_graph(Some(&previous));
+    {
+        // Recreate the older writer's catalogue before publishing the store.
+        let mut db =
+            sqlite::Sqlite::open(&fence::sibling(&f.path, ".v2.sqlite.import"), &f.identity())
+                .unwrap();
+        sqlite::delete_row_for_test(
+            &db,
+            &mapper::key("proof.request_contribution", "", 0).unwrap(),
+        );
+        db.control("catalogue_layout", &7_u32).unwrap();
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        assert!(tx
+            .scan_kind(
+                &RecordKind::parse("proof.request_contribution").unwrap(),
+                None,
+                1
+            )
+            .unwrap()
+            .is_empty());
+    }
+    fence::publish(&f.path, &f.identity(), &mut false).unwrap();
+    let delivery_unchanged = |index: &ScanIndex| {
+        assert_eq!(
+            index.upload_context_proof.header(),
+            previous.upload_context_proof.header()
+        );
+        assert_eq!(
+            index.upload_context_proof.entity_stamps,
+            previous.upload_context_proof.entity_stamps
+        );
+        assert_eq!(
+            index.files[&holder].upload_context_receipt,
+            Some(receipt.clone())
+        );
+    };
+    let mut index = load_with(&f.path, false).unwrap().unwrap();
+    with_session_db(&index, |db| {
+        assert_eq!(db.read_control::<u32>("catalogue_layout").unwrap(), Some(7));
+    });
+    assert!(index.upload_context_proof.request_contributions.is_empty());
+    delivery_unchanged(&index);
+    assert!(save_with(&f.path, &mut index).unwrap());
+    index = load_with(&f.path, false).unwrap().unwrap();
+    with_session_db(&index, |db| {
+        assert_eq!(db.read_control::<u32>("catalogue_layout").unwrap(), Some(8));
+    });
+    assert!(index.upload_context_proof.request_contributions.is_empty());
+    delivery_unchanged(&index);
+    let mut item = crate::snapshots::tests::sample_session_artifact_item();
+    item.usage_accounting_contract =
+        Some(crate::snapshots::claude_history_upgrade::REQUEST_OWNED_USAGE_CONTRACT.into());
+    item.request_contributions =
+        vec![(location_key(&holder), Arc::from([7_u64]))].into_boxed_slice();
+    item.snapshot_fingerprint =
+        crate::snapshots::snapshot_fingerprint(SnapshotSource::ClaudeCode, &item);
+    let (slot, rows) = SlotRows::capture(&item);
+    crate::snapshot_sync::accept_request_contributions_for_test(
+        &mut index,
+        &[item],
+        &BTreeMap::from([(rows.fingerprint.clone(), rows.body_witness.clone())]),
+    );
+    let expected = BTreeMap::from([(slot, rows)]);
+    assert_eq!(index.upload_context_proof.request_contributions, expected);
+    assert!(save_with(&f.path, &mut index).unwrap());
+    index = load_with(&f.path, false).unwrap().unwrap();
+    assert_eq!(index.upload_context_proof.request_contributions, expected);
+    delivery_unchanged(&index);
+}
+
 /// Accepted request membership has its own native rows, independent of stamps.
 /// These membership assertions are expected red on main.
 #[test]
