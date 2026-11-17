@@ -2327,7 +2327,50 @@ pub(super) mod tests {
         json!({"input_tokens":input,"cached_input_tokens":0,"cache_write_input_tokens":0,
             "output_tokens":0,"reasoning_output_tokens":0,"total_tokens":input})
     }
+    /// Bind synthetic native records to explicit task lifetimes, as V2 requires.
+    pub(crate) fn bound_rows(rows: &[Value]) -> Vec<Value> {
+        if rows
+            .iter()
+            .any(|r| string_eq_at(r, &["payload", "type"], "task_started"))
+        {
+            return rows.to_vec();
+        }
+        let mut out = Vec::new();
+        let mut active: Option<String> = None;
+        let event = |kind: &str, turn: &str| {
+            json!({"type":"event_msg",
+            "timestamp":"2026-10-01T10:01:00Z","payload":{"type":kind,"turn_id":turn}})
+        };
+        for row in rows {
+            let context = string_eq_at(row, &["type"], "turn_context");
+            let native = string_eq_at(row, &["type"], "token_usage_record");
+            if context {
+                if let Some(prior) = active.take() {
+                    out.push(event("task_complete", &prior));
+                }
+            }
+            if (context || native) && active.is_none() {
+                let turn = string_at(row, &["payload", "turn_id"])
+                    .or_else(|| string_at(row, &["payload", "response_id"]))
+                    .unwrap_or_else(|| "fixture-turn".into());
+                out.push(event("task_started", &turn));
+                active = Some(turn);
+            }
+            let mut row = row.clone();
+            if native && row["payload"]["turn_id"].is_null() {
+                row["payload"]["turn_id"] = json!(active);
+            }
+            out.push(row);
+        }
+        if let Some(turn) = active {
+            out.push(event("task_complete", &turn));
+        }
+        out
+    }
     pub(crate) fn member(owner: &str, response: &str, input: u64, cumulative: u64) -> Vec<Value> {
+        bound_rows(&unbound_member(owner, response, input, cumulative))
+    }
+    fn unbound_member(owner: &str, response: &str, input: u64, cumulative: u64) -> Vec<Value> {
         // Header time follows the counter: equal header bytes and size would
         // be one copied candidate (`CandidateCopy`).
         let created = format!(
@@ -3284,7 +3327,7 @@ pub(super) mod tests {
         assert!(parsed.progress_complete());
         assert_eq!(parsed.snapshots.len(), 1);
         assert_eq!(parsed.snapshots[0].input_tokens, 300);
-        assert_eq!(parsed.report.parsed_json_line_count, 6);
+        assert_eq!(parsed.report.parsed_json_line_count, 10);
         fs::remove_dir_all(root).unwrap();
     }
     thread_local! {
@@ -3316,8 +3359,13 @@ pub(super) mod tests {
         if priority {
             let turn = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
             let mut rows = member("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "r-b", 200, 300);
+            for row in &mut rows {
+                if !row["payload"]["turn_id"].is_null() {
+                    row["payload"]["turn_id"] = json!(turn);
+                }
+            }
             rows.insert(
-                1,
+                2,
                 json!({"type":"turn_context","payload":{"turn_id":turn,"model":"gpt-5.2"}}),
             );
             fs::write(
@@ -3378,7 +3426,12 @@ pub(super) mod tests {
             // An earlier non-usage line's tier, carried by the running selector.
             context["payload"]["service_tier"] = json!(tier);
         }
-        rows.insert(1, context);
+        for row in &mut rows {
+            if !row["payload"]["turn_id"].is_null() {
+                row["payload"]["turn_id"] = json!(turn);
+            }
+        }
+        rows.insert(2, context);
         fs::write(
             root.join("sessions/b.jsonl"),
             rows.iter()
@@ -3593,8 +3646,13 @@ pub(super) mod tests {
         let turn = "cccccccc-1111-4111-8111-cccccccccccc";
         let (root, _) = fixture();
         let mut rows = member(owner, "r-c", 200, 200);
+        for row in &mut rows {
+            if !row["payload"]["turn_id"].is_null() {
+                row["payload"]["turn_id"] = json!(turn);
+            }
+        }
         rows.insert(
-            1,
+            2,
             json!({"type":"turn_context","payload":{"turn_id":turn,"model":"gpt-5.2"}}),
         );
         let path = root.join("sessions/c.jsonl");
@@ -3684,25 +3742,11 @@ pub(super) mod tests {
     fn counting_v2_fixture_with(bound: bool) -> (PathBuf, [String; 2]) {
         let (root, _) = fixture();
         let owner = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
-        for (name, mut rows) in [
-            ("a", member(owner, "r-a", 100, 100)),
-            ("b", member(owner, "r-b", 200, 300)),
+        let rows = if bound { member } else { unbound_member };
+        for (name, rows) in [
+            ("a", rows(owner, "r-a", 100, 100)),
+            ("b", rows(owner, "r-b", 200, 300)),
         ] {
-            if bound {
-                let turn = format!("turn-{name}");
-                // The native names its turn (`payload.turn_id`), as Codex
-                // writes it; the UI follows inside the same open turn.
-                rows[1]["payload"]["turn_id"] = json!(turn);
-                let at = rows[0]["timestamp"].clone();
-                rows.insert(
-                    1,
-                    json!({"type":"event_msg","timestamp":at,
-                        "payload":{"type":"task_started","turn_id":turn}}),
-                );
-                let at = rows[rows.len() - 1]["timestamp"].clone();
-                rows.push(json!({"type":"event_msg","timestamp":at,
-                    "payload":{"type":"task_complete","turn_id":turn}}));
-            }
             let body = rows
                 .into_iter()
                 .map(|mut row| {
@@ -3845,8 +3889,13 @@ pub(super) mod tests {
         let owner = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
         let turn = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
         let mut rows = member(owner, "r-b", 200, 300);
+        for row in &mut rows {
+            if !row["payload"]["turn_id"].is_null() {
+                row["payload"]["turn_id"] = json!(turn);
+            }
+        }
         rows.insert(
-            1,
+            2,
             json!({"type":"turn_context","payload":{"turn_id":turn,"model":"gpt-5.2"}}),
         );
         fs::write(
@@ -5702,55 +5751,6 @@ pub(super) mod tests {
         }
     }
 
-    pub(crate) fn legacy_index(inventory: &HeaderInventory) -> ScanIndex {
-        let mut index = ScanIndex::default();
-        for member in inventory
-            .groups()
-            .into_values()
-            .flat_map(|group| group.members)
-        {
-            let mut census = ScanCensus::default();
-            let (member, file) = open_and_identify_scan_candidate(
-                SnapshotSource::Codex,
-                member,
-                &mut census,
-                None,
-                0,
-                crate::snapshots::DiscoveryRetention::unverified(
-                    &crate::snapshots::SharedMap::default(),
-                ),
-            )
-            .unwrap();
-            let parsed = parse_opened_jsonl_file(
-                file,
-                &member.opened_object_identity,
-                &member.path,
-                "2026-10-06T23:00:00Z",
-                member.source_file_fingerprint.clone(),
-                SnapshotSource::Codex,
-                apply_codex_line,
-                Some(&CodexTitleMetadata::default()),
-                None,
-                None,
-            )
-            .unwrap();
-            assert!(parsed.progress_complete());
-            let fingerprints = parsed
-                .snapshots
-                .iter()
-                .map(|item| snapshot_fingerprint(SnapshotSource::Codex, item))
-                .collect::<BTreeSet<_>>();
-            let key = local_index_key(&member.path);
-            index.record(
-                member,
-                Some(snapshot_file_entity_set_hex(&fingerprints)),
-                ScanParseOutcome::Snapshot,
-            );
-            index.file_snapshot_fingerprints.insert(key, fingerprints);
-        }
-        index
-    }
-
     const OWNER: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
     /// Feed members in order through one `StreamProof`, with the parser's
     /// S10 tap after every UI usage record.
@@ -5779,7 +5779,7 @@ pub(super) mod tests {
         let a = member(OWNER, "response-a", 100, 100);
         let b = member(OWNER, "response-b", 200, 300);
         assert_eq!(stream(&[a.clone(), b.clone()]), None);
-        let probes = [probe_before(&b[1]), probe_before(&a[1])];
+        let probes = [probe_before(&b[2]), probe_before(&a[2])];
         assert_eq!(order_by_probes(&[0, 1], &probes), Ok(vec![1, 0]));
     }
     #[test]
@@ -5806,7 +5806,7 @@ pub(super) mod tests {
     fn copied_ui_contribution_cannot_gain_a_second_member() {
         let a = member(OWNER, "response-a", 100, 100);
         let mut b = member(OWNER, "response-b", 100, 200);
-        b[2] = a[2].clone();
+        b[3] = a[3].clone();
         assert_eq!(stream(&[a, b]), Some((JoinRefusal::Overlap, 1)));
     }
     #[test]
@@ -5814,7 +5814,7 @@ pub(super) mod tests {
         let rows = member(OWNER, "response", 100, 100);
         for field in ["thread_id", "response_id", "usage", "thread_token_usage"] {
             let mut changed = rows.clone();
-            changed[1]["payload"].as_object_mut().unwrap().remove(field);
+            changed[2]["payload"].as_object_mut().unwrap().remove(field);
             assert_eq!(
                 stream(&[changed]),
                 Some((JoinRefusal::Corrupt, 0)),
@@ -5822,7 +5822,7 @@ pub(super) mod tests {
             );
         }
         let mut changed = rows;
-        changed[2]["payload"]["info"]["last_token_usage"] = usage(200);
+        changed[3]["payload"]["info"]["last_token_usage"] = usage(200);
         assert_eq!(stream(&[changed]), Some((JoinRefusal::UiUnmatched, 0)));
     }
 }

@@ -48,6 +48,10 @@ pub(in crate::snapshots) fn proven_legacy(index: &ScanIndex, key: &str) -> bool 
     })
 }
 
+pub(in crate::snapshots) fn legacy_head_missing(index: &ScanIndex, key: &str) -> bool {
+    proven_legacy(index, key) && tail_source::stored_codex_legacy_totals(index, key).is_none()
+}
+
 /// Stat-only, including an unchanged entry whose head is missing or corrupt.
 /// Audit and repair debt cannot authorize conversion of unchanged history.
 pub(in crate::snapshots) fn unchanged_legacy(index: &ScanIndex, path: &Path) -> bool {

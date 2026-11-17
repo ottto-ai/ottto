@@ -699,11 +699,10 @@ fn without_file_revision(mut route: RouteResult) -> RouteResult {
 }
 
 /// [money] O6b: the same path restored after retirement, while its
-/// tombstones survive and after a later generation collected them. Only the
+/// state is freshly retired and after a later complete generation. Only the
 /// in-window file is read, once; its body keeps its destination key and
 /// replaces one head with the original accepted totals and placement, and
-/// equals a cold Full with equivalent historical evidence. The restored owner
-/// is a post-cutover Legacy-acknowledged owner.
+/// equals a cold V2 Full. Every restored file starts with V2.
 #[test]
 fn removed_account_readded_after_retirement_counts_once() {
     let _lock = DECODER_TEST_LOCK
@@ -743,10 +742,6 @@ fn removed_account_readded_after_retirement_counts_once() {
             fs::write(d.h.path(id), bytes).unwrap();
         }
         aged_mtime(&d.h.path(REMOVED_OLD));
-        // Equivalent historical evidence: Legacy while the tombstone
-        // survives, none (a fresh V2 owner) once it was collected.
-        let historical = (!collected).then(|| d.h.cold(true, at));
-
         let readded = d.h.step(true, index, d.cache.clone(), 100, at);
         assert_eq!(
             readded.reads,
@@ -764,12 +759,10 @@ fn removed_account_readded_after_retirement_counts_once() {
             "{row}: emitted {emitted:?}, read {read:?}"
         );
         assert!(readded.index.traversal.is_none(), "{row}: healthy");
-        if !collected {
-            assert!(
-                !readded.index.files[&local_index_key(&d.h.path(REMOVED_FRESH))].codex_counting_v2,
-                "{row}: the surviving tombstone keeps Legacy counting"
-            );
-        }
+        assert!(
+            readded.index.files[&local_index_key(&d.h.path(REMOVED_FRESH))].codex_counting_v2,
+            "{row}: a restored file uses V2"
+        );
         let replay = crate::snapshot_sync::codex_transition_acked_route(
             &readded.index,
             &readded.scan,
@@ -801,7 +794,7 @@ fn removed_account_readded_after_retirement_counts_once() {
                 "{row}: {id} {field}: the original accepted total, never a sum"
             );
         }
-        let mut cold = historical.unwrap_or_else(|| d.h.cold(true, at));
+        let mut cold = d.h.cold(true, at);
         cold.snapshots
             .retain(|item| item.source_session_id == REMOVED_FRESH);
         // A cold Full never reads the aged file; it compares the in-window one.

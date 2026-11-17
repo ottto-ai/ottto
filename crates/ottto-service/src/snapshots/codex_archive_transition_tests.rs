@@ -2439,8 +2439,8 @@ fn unfunded_compressed_header_isolates_filename_owner_and_recovers() {
     );
     assert_eq!(funded.snapshots.len(), 1);
     assert!(
-        !working.files[&local_index_key(&compressed)].codex_counting_v2,
-        "funding cannot discard the prior Legacy ACK evidence"
+        working.files[&local_index_key(&compressed)].codex_counting_v2,
+        "a funded Codex read uses V2"
     );
     let mut cold_main = cold;
     cold_main

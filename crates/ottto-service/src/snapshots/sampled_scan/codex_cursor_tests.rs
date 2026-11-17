@@ -4723,7 +4723,7 @@ fn projection_ahead_created_thread_memo_misses_on_the_curing_append() {
     assert_eq!(counter(&cache, |c| c.memo_hits), 1, "{}", counters(&cache));
     assert_eq!(
         created_usage(&cured),
-        vec![(200, 3)],
+        vec![(120, 1)],
         "{}",
         counters(&cache)
     );
@@ -4843,7 +4843,7 @@ fn lagging_projection_catching_up_cures_an_unchanged_created_thread() {
     let (index, cured) = home.generation(index, &cache, 1);
     assert_eq!(
         created_usage(&cured),
-        vec![(200, 3)],
+        vec![(120, 1)],
         "{}",
         counters(&cache)
     );
@@ -5028,7 +5028,7 @@ fn rollout_declared_created_thread_memo_misses_on_the_curing_append() {
     );
     assert_eq!(
         created_usage(&cured),
-        vec![(200, 3)],
+        vec![(120, 1)],
         "admitted: {}",
         counters(&cache)
     );
@@ -5073,7 +5073,7 @@ fn copied_created_thread_binds_from_its_header_not_file_birth() {
         }
         assert_eq!(
             created_usage(&cured),
-            vec![(200, 3)],
+            vec![(120, 1)],
             "{state_source}: {}",
             counters(&cache)
         );
@@ -5234,7 +5234,7 @@ fn candidate_less_hold_memo_misses_when_the_last_created_thread_goes() {
     );
     let cache = Arc::new(SharedCache::default());
     let (index, held) = home.generation(ScanIndex::default(), &cache, 0);
-    assert_eq!(created_usage(&held), vec![(200, 3)], "{}", counters(&cache));
+    assert_eq!(created_usage(&held), vec![(120, 1)], "{}", counters(&cache));
     assert_eq!(
         held.ownership_incomplete_file_count,
         1,
@@ -5569,7 +5569,7 @@ fn bind_seed_short_of_the_read_extent_is_never_recorded() {
     let (_, admitted) = home.generation(index, &cache, 1);
     assert_eq!(
         created_usage(&admitted),
-        vec![(200, 3)],
+        vec![(120, 1)],
         "{}",
         counters(&cache)
     );

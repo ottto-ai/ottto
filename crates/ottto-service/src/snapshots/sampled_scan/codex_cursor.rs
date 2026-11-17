@@ -1739,8 +1739,8 @@ pub(in crate::snapshots) struct Publication {
 impl Publication {
     /// Whether the withheld final record was applied at EOF, so the reduction is not
     /// the reduction through the certified prefix. Read before
-    /// `cursor_published` consumes the publication; `eof_applied(job)` is not
-    /// valid after `finish_job`.
+    /// `cursor_published` consumes the publication; the finished job no longer
+    /// carries this fact after `finish_job`.
     pub(in crate::snapshots) fn eof_applied(&self) -> bool {
         self.eof_applied
     }
@@ -3997,6 +3997,16 @@ pub(in crate::snapshots) fn resume_paused_job(
     else {
         return Resumed::Idle;
     };
+    if context.source == SnapshotSource::Codex
+        && job_files(&job).iter().any(|file| {
+            crate::snapshots::sources::codex::counting::version::legacy_head_missing(
+                index,
+                &local_index_key(&file.path),
+            )
+        })
+    {
+        return end_unavailable(job, lease, index, targets);
+    }
     if context.source == SnapshotSource::Codex
         && job_files(&job).iter().all(|file| {
             crate::snapshots::sources::codex::counting::version::unchanged_legacy(index, &file.path)

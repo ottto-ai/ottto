@@ -2,7 +2,7 @@
 //! Every fixture is synthetic; no provider account content. Scaled budgets
 //! come from `codex_cursor::with_test_limits` only.
 use super::super::tests::{
-    counting_v2_unbound_fixture, fixture, member, replay_group, scan, usage,
+    bound_rows, counting_v2_unbound_fixture, fixture, member, replay_group, scan, usage,
 };
 use super::*;
 use crate::snapshots::sampled_scan::transition_fixture::observe_consumed;
@@ -20,7 +20,8 @@ static NEXT: AtomicU64 = AtomicU64::new(0);
 fn write_rows(path: &Path, rows: &[Value]) {
     fs::write(
         path,
-        rows.iter()
+        bound_rows(rows)
+            .iter()
             .map(|row| serde_json::to_string(row).unwrap() + "\n")
             .collect::<String>(),
     )
@@ -82,7 +83,8 @@ fn turn(id: &str) -> Value {
 
 /// Number `rows` from `first` (the ordinal domain).
 fn ordinals(rows: Vec<Value>, first: u64) -> Vec<Value> {
-    rows.into_iter()
+    bound_rows(&rows)
+        .into_iter()
         .zip(first..)
         .map(|(mut row, ordinal)| {
             row["ordinal"] = json!(ordinal);
@@ -395,7 +397,7 @@ fn chain_rows(owner: &str, prefix: &str, created: &str, start: u64, count: u64) 
             ),
         ));
     }
-    rows
+    bound_rows(&rows)
 }
 
 #[test]
@@ -421,96 +423,16 @@ fn v2_group_with_ui_only_turn_held_until_turn_hook() {
     let mut ui_only = bound.to_vec();
     ui_only.extend([turn(second), ui(50, 350, "2026-10-01T10:02:30Z")]);
     write_rows(&root.join("sessions/b.jsonl"), &ui_only);
-    // Legacy counting: the extra admission has no native in its member.
-    assert_eq!(
-        refused(replay_group(group_of(&root), &ScanIndex::default())),
-        Some((JoinRefusal::UiUnmatched, 1))
-    );
     // §k.3 interim: under V2 the UI side is not money; a UI-only turn holds
     // the group at its end until the counting writer's turn hook lands.
-    let held = with_test_v2(|| replay_group(group_of(&root), &ScanIndex::default()));
+    let held = replay_group(group_of(&root), &ScanIndex::default());
     assert_eq!(refused(held), Some((JoinRefusal::V2UiOnlyTurn, 1)));
     write_rows(&root.join("sessions/b.jsonl"), &bound);
     assert!(
-        with_test_v2(|| replay_group(group_of(&root), &ScanIndex::default())).is_ok(),
+        replay_group(group_of(&root), &ScanIndex::default()).is_ok(),
         "every admitted turn has a native: the V2 group replays"
     );
     fs::remove_dir_all(root).unwrap();
-}
-
-/// R(t), E(t), zero Z, then `repeat` in member b.
-fn eze(repeat: Value) -> Option<(JoinRefusal, usize)> {
-    eze_rows(vec![repeat])
-}
-
-/// R(t), E(t), zero Z, then `tail` in member b.
-fn eze_rows(tail: Vec<Value>) -> Option<(JoinRefusal, usize)> {
-    let root = temp_root("eze");
-    write_rows(
-        &root.join("sessions/a.jsonl"),
-        &member(OWNER, "r-a", 100, 100),
-    );
-    let mut rows = vec![
-        meta(OWNER, "2026-10-01T10:01:00Z", json!({})),
-        native(OWNER, "r-b", 200, 300),
-        ui(200, 300, "2026-10-01T10:01:30Z"),
-        ui(0, 300, "2026-10-01T10:01:40Z"),
-    ];
-    rows.extend(tail);
-    write_rows(&root.join("sessions/b.jsonl"), &rows);
-    let result = refused(replay_group(group_of(&root), &ScanIndex::default()));
-    fs::remove_dir_all(root).unwrap();
-    result
-}
-
-#[test]
-fn eze_identical_repeat_is_overlap() {
-    // Before the forward date the repeated E has the same identity (the whole
-    // record): the parser admits it again after Z, and the tap's identity set
-    // refuses it.
-    assert_eq!(
-        eze(ui(200, 300, "2026-10-01T10:01:30Z")),
-        Some((JoinRefusal::Overlap, 1))
-    );
-    // Dated from it, the same re-emission after a zero line is the counter's
-    // own equal-total repeat: never admitted, so the group replays.
-    assert_eq!(
-        eze_rows(vec![
-            native(OWNER, "r-c", 10, 310),
-            ui(10, 310, "2026-11-04T10:00:00Z"),
-            ui(0, 310, "2026-11-04T10:00:10Z"),
-            ui(10, 310, "2026-11-04T10:00:00Z"),
-        ]),
-        None
-    );
-    // After another counted record the same identity is admitted again, and
-    // the tap's identity set refuses it.
-    assert_eq!(
-        eze_rows(vec![
-            ui(10, 310, "2026-11-04T10:00:00Z"),
-            ui(20, 330, "2026-11-04T10:00:10Z"),
-            ui(10, 310, "2026-11-04T10:00:00Z"),
-        ]),
-        Some((JoinRefusal::Overlap, 1))
-    );
-}
-
-#[test]
-fn eze_distinct_identity_repeat_is_ui_repeat_unproven() {
-    // A distinct record of the same tuple, with no native between the two
-    // admissions, dated before the forward date: held, never counted twice.
-    assert_eq!(
-        eze(ui(200, 300, "2026-10-01T10:01:50Z")),
-        Some((JoinRefusal::UiRepeatUnproven, 1))
-    );
-    // Dated from it, it is the counter's equal-total repeat: dropped before
-    // the tap.
-    assert_eq!(eze(ui(200, 300, "2026-11-04T00:00:00Z")), None);
-    // The same `last` with a grown total is admitted; the group is held.
-    assert_eq!(
-        eze(ui(200, 500, "2026-11-04T00:00:00Z")),
-        Some((JoinRefusal::UiRepeatUnproven, 1))
-    );
 }
 
 #[test]
@@ -779,7 +701,7 @@ fn equal_before_tie_held() {
         refused(replay_group(group_of(&root), &ScanIndex::default())),
         Some((JoinRefusal::EqualBeforeTie, 0))
     );
-    let tokens = probe_before(&member(OWNER, "r", 100, 100)[1]);
+    let tokens = probe_before(&member(OWNER, "r", 100, 100)[2]);
     assert_eq!(
         order_by_probes(&[0, 1], &[tokens, tokens]),
         Err(JoinRefusal::EqualBeforeTie)
@@ -1811,52 +1733,6 @@ fn counting_v2_decision_reaches_the_group_proof() {
         Some((JoinRefusal::V2UnboundUi, 1))
     );
     fs::remove_dir_all(root).unwrap();
-}
-
-/// #603 integration (K8 for groups): with the cutover active, a paused V2
-/// group resumes only while `configure_group_once` would still pick its
-/// rule from every member's current entry. A Legacy ACK on any member, here
-/// the sealed first one, takes precedence and invalidates the job; a V2 mark
-/// there keeps it resuming.
-#[test]
-fn active_cutover_resume_follows_every_member_ack() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    for legacy_ack in [false, true] {
-        let root = paged_corpus(if legacy_ack { "ack-legacy" } else { "ack-v2" });
-        let cache = Arc::new(SharedCache::default());
-
-        let invalidated = with_test_limits(2048, 1024, 64, || {
-            let (mut index, _, _) = pages(&root, ScanIndex::default(), &cache, || {
-                counters(&cache).jobs_paused > 0
-            });
-            let key = local_index_key(&root.join("sessions/a.jsonl"));
-            let entry = index.files.entry(key).or_insert_with(|| {
-                serde_json::from_value(json!({
-                    "size_bytes": 1, "modified_unix_seconds": 1, "modified_unix_nanos": 1,
-                    "source_file_fingerprint": "source",
-                    "scan_identity_version": LOCAL_SCAN_INDEX_IDENTITY_VERSION,
-                }))
-                .unwrap()
-            });
-            entry
-                .last_snapshot_fingerprint
-                .get_or_insert_with(|| "acknowledged".into());
-            entry.codex_counting_v2 = !legacy_ack;
-            let before = counters(&cache);
-            pages(&root, index, &cache, || {
-                counters(&cache).jobs_resumed > before.jobs_resumed
-            });
-            counters(&cache).jobs_invalidated - before.jobs_invalidated
-        });
-        assert_eq!(
-            invalidated,
-            u64::from(legacy_ack),
-            "legacy_ack: {legacy_ack}"
-        );
-        fs::remove_dir_all(root).unwrap();
-    }
 }
 
 #[test]

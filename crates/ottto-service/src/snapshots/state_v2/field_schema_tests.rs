@@ -656,6 +656,12 @@ fn read_fixture(name: &str) -> String {
 }
 /// Owned kinds no sample field writes: opaque v1 holds and retired kinds.
 fn unwritten(kind: &str) -> bool {
+    if matches!(
+        kind,
+        "v1_field.codex_counting_tombstones" | "v1_field.codex_counting_evicted_legacy"
+    ) {
+        return false; // Empty compatibility roots, never historical values.
+    }
     catalogue::retired(kind)
         || kind.starts_with("raw_hold.")
         || matches!(

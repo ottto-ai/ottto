@@ -40,6 +40,7 @@ file-system hint / periodic listing → select file → read new bytes from save
   views and retain their existing Tail path. The process-local `codex_legacy_recount`
   alarm records shrink, unknown baseline or previously unaccepted usage; retries or
   crashes may repeat it. Historical counting slots still decode without selecting a rule.
+  Retired counting histories drop their values; two empty store roots remain for older readers.
 - **Codex rollout encodings.** Plain `.jsonl` and compressed `.jsonl.zst` use the same
   ordinary first-read selection, reducer, modification-time age rules and decoded-byte page
   budget. Exact plaintext siblings win before either header opens. Decoder memory is funded

@@ -35,11 +35,6 @@ pub(in crate::snapshots) fn new_group_parser(
     Ok(Box::new(parser))
 }
 
-#[cfg(test)]
-pub(in crate::snapshots) fn with_test_v2<T>(run: impl FnOnce() -> T) -> T {
-    run()
-}
-
 pub(in crate::snapshots) fn group_counting_is_v2(accumulator: &SnapshotAccumulator) -> bool {
     accumulator.codex_counting_v2()
 }
@@ -362,6 +357,16 @@ impl GroupBoot {
         cache: Option<&Arc<sampled_scan::SharedCache>>,
     ) -> Boot {
         let n = self.group.members.len();
+        if self.identified == 0
+            && self.group.members.iter().any(|member| {
+                sources::codex::counting::version::legacy_head_missing(
+                    index,
+                    &local_index_key(&member.path),
+                )
+            })
+        {
+            return Boot::Strict;
+        }
         if self.identified == 0
             && self.group.members.iter().all(|member| {
                 sources::codex::counting::version::unchanged_legacy(index, &member.path)

@@ -16450,6 +16450,10 @@ fn codex_created_thread_five_native_corpus_shapes_admit_exactly_once() {
                 Some((10, 8, 2, 1)),
             ));
         }
+        child.push(
+            json!({"timestamp":"2026-08-26T16:37:23Z", "ordinal":first_usage_ordinal+record_count,
+            "type":"event_msg","payload":{"type":"task_complete","turn_id":turn_id}}),
+        );
         let (root, parsed) = parse_trusted_created_thread_test(
             "codex-five-native-shapes",
             child_id,
@@ -17785,8 +17789,8 @@ fn renumber(values: &mut [Value]) {
 
 /// Mirrors report §A in the dominant real shape: a long-lived Desktop created
 /// thread with no recorded parent, no `history_base`, no `trace_id`, a
-/// compaction and a counter reset. Usage is Σ last = (200, 160, 11, 3) over
-/// three requests.
+/// compaction and a counter reset. The closed first turn publishes (120, 100, 6, 2);
+/// the second turn remains open, with its 80-token UI usage pending.
 fn parentless_created_thread_values(clock: &ParentlessClock, child_id: &str) -> Vec<Value> {
     let mut values = vec![
         json!({"timestamp":clock.at(500),"type":"session_meta","payload":{"id":child_id,"session_id":child_id,"timestamp":clock.at(0),"history_mode":"paginated","thread_source":"agent_created_thread","source":"vscode","originator":"Codex Desktop","creator_user_id":"synthetic-user","creator_account_id":"synthetic-workspace"}}),
@@ -17929,7 +17933,7 @@ fn codex_created_thread_parentless_admits_only_its_own_proven_history() {
         &jsonl_body(&values),
         |_, _| {},
     );
-    assert_parentless_admitted(&parsed, (200, 160, 11, 3, 3));
+    assert_parentless_admitted(&parsed, (120, 100, 6, 2, 1));
     let item = &parsed.snapshots[0];
     assert_eq!(item.compaction_count, Some(1));
     assert!(
@@ -17963,7 +17967,7 @@ fn codex_created_thread_parentless_admits_only_its_own_proven_history() {
             &jsonl_body(&values),
             |_, _| {},
         );
-        assert_parentless_admitted(&parsed, (200, 160, 11, 3, 3));
+        assert_parentless_admitted(&parsed, (120, 100, 6, 2, 1));
     }
 
     // A grown file, re-parsed in full, keeps the proof; a re-emitted header
@@ -18272,7 +18276,7 @@ fn codex_created_thread_parentless_production_lineage_controls() {
     let admitted_item = item(&first, admitted).expect("parentless snapshot");
     assert_eq!(
         (admitted_item.input_tokens, admitted_item.request_count),
-        (200, 3)
+        (120, 1)
     );
     assert_eq!(
         admitted_item

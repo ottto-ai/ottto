@@ -26,9 +26,6 @@ fn legacy_user_fork_without_parent_counts_best_effort() {
     // Never written: the fork's parent is absent.
     const PARENT: &str = "5338a80a-f36e-4cbc-a5bb-50fc66430ba5";
     let source = SnapshotSource::Codex;
-    // 2026-10-25T00:00:00Z: the two named sessions start after it (V2), the
-    // legacy fork before it (Legacy counting).
-
     let hash = |kind: &str, session: &str| {
         let prefix = if kind == "account" {
             "user"

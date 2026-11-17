@@ -1504,13 +1504,13 @@ fn codex_member(
         json!({"input_tokens":n,"cached_input_tokens":0,"cache_write_input_tokens":0,
         "output_tokens":0,"reasoning_output_tokens":0,"total_tokens":n})
     };
-    vec![
+    crate::snapshots::codex_file_join::tests::bound_rows(&[
         json!({"type":"session_meta","timestamp":created,"payload":{"id":owner}}),
         json!({"type":"token_usage_record","timestamp":"2026-11-01T07:01:00Z","payload":{
             "thread_id":owner,"response_id":response,"usage":usage(input),"thread_token_usage":usage(cumulative)}}),
         json!({"type":"event_msg","timestamp":"2026-11-01T07:01:01Z","payload":{"type":"token_count",
             "info":{"model":"gpt-5.2","last_token_usage":usage(input),"total_token_usage":usage(cumulative)}}}),
-    ]
+    ])
 }
 
 fn write_jsonl(path: &Path, rows: &[Value]) {
@@ -1741,7 +1741,10 @@ fn c09_codex_singleton_memo_keeps_the_previous_body() {
     let cold = home.cycle(&server, &recording);
     assert!(cold.finish.is_ok());
     assert_durable(&cold);
-    assert_eq!(cold.finalized[0].input_tokens, 200);
+    assert_eq!(
+        cold.finalized[0].input_tokens, 120,
+        "V2 publishes the closed first turn; the second is pending"
+    );
     assert!(cold.index.files.values().all(|entry| {
         entry.codex_applied_tier_receipt.is_none()
             && !entry.codex_applied_tier_receipt_required

@@ -276,7 +276,8 @@ fn independent_overlap_and_conflict_hold_without_singleton() {
         if conflicting {
             second.push(meta(OTHER, "2026-10-01T10:01:00Z", json!({})));
         } else {
-            second[3] = original[3].clone();
+            second[1..4].clone_from_slice(&original[1..4]);
+            *second.last_mut().unwrap() = original.last().unwrap().clone();
         }
         let bytes = second
             .iter()
@@ -526,7 +527,9 @@ fn independent_last_member_refusal_is_not_reread_each_generation() {
         fs::write(p, zstd::stream::encode_all(bytes.as_bytes(), 1).unwrap()).unwrap();
     };
     let mut last = rows(&paths[1]);
-    last[3] = rows(&paths[0])[3].clone();
+    let original = rows(&paths[0]);
+    last[1..4].clone_from_slice(&original[1..4]);
+    *last.last_mut().unwrap() = original.last().unwrap().clone();
     write(&paths[1], &last);
     let held = |scan: &SourceScanResult| {
         assert!(scan.snapshots.is_empty(), "no singleton, no fold");

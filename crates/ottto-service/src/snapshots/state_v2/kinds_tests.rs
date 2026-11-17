@@ -1409,6 +1409,7 @@ pub(in crate::snapshots::state_v2) fn seed_retired_rows(
             continue;
         }
         let count: u64 = match *kind {
+            "v1_field.codex_counting_tombstones" | "v1_field.codex_counting_evicted_legacy" => 1,
             "usage.pending" | "family.requests" if members => 2,
             "account_window" if members => 3,
             "account.current" | "account.absent_members" | "proof.account" if members => 1,
@@ -1540,7 +1541,11 @@ pub(in crate::snapshots::state_v2) fn set_refs(
 fn present(db: &mut sqlite::Sqlite, keys: &BTreeSet<RowKey>) -> usize {
     let mut tx = db.begin(TxnMode::Read).unwrap();
     keys.iter()
-        .filter(|key| tx.get(key).unwrap().is_some())
+        .filter(|key| {
+            tx.get(key)
+                .unwrap()
+                .is_some_and(|h| !kinds_misc::empty_counting_root(&mut *tx, &h).unwrap())
+        })
         .count()
 }
 

@@ -459,7 +459,7 @@ fn owner_return_preserves_all_source_carry() {
         });
         let saved = ScanIndex::load(&cx_path).unwrap();
         let entry = &saved.files[&codex.to_string_lossy().into_owned()];
-        assert!(!entry.codex_counting_v2, "Legacy ACK keeps the UI counter");
+        assert!(entry.codex_counting_v2, "new Codex reads retain V2");
         assert!(saved.historical_replay_generation_matches(&generation));
         // The disposable progress ledger can clear after ACK handoff. Its
         // destination/replay proof survives in the authoritative index.
@@ -642,7 +642,7 @@ fn owner_return_preserves_all_source_carry() {
             }
             let saved = ScanIndex::load(&cx_path).unwrap();
             let entry = &saved.files[&codex.to_string_lossy().into_owned()];
-            assert!(!entry.codex_counting_v2);
+            assert!(entry.codex_counting_v2);
             assert_eq!(
                 serde_json::to_value(entry).unwrap()["codex_applied_tier_receipt"],
                 tier
@@ -978,7 +978,7 @@ fn account_return_history_row(recorded_a: bool) {
     }
     let saved = ScanIndex::load(&cx_path).unwrap();
     let entry = &saved.files[&codex.to_string_lossy().into_owned()];
-    assert!(!entry.codex_counting_v2, "Legacy ACK keeps the UI counter");
+    assert!(entry.codex_counting_v2, "new Codex reads retain V2");
     assert!(!serde_json::to_value(entry).unwrap()["codex_applied_tier_receipt"].is_null());
     let original_store = std::fs::read(&cx_path).unwrap();
     let tier = serde_json::to_value(entry).unwrap()["codex_applied_tier_receipt"].clone();
@@ -1059,7 +1059,7 @@ fn account_return_history_row(recorded_a: bool) {
         }
         let returned_cx = ScanIndex::load(&index_path(&namespace, SnapshotSource::Codex)).unwrap();
         let entry = &returned_cx.files[&codex.to_string_lossy().into_owned()];
-        assert_eq!(entry.codex_counting_v2, !reattached);
+        assert!(entry.codex_counting_v2);
         if reattached {
             assert_eq!(
                 serde_json::to_value(entry).unwrap()["codex_applied_tier_receipt"],

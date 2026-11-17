@@ -21,8 +21,11 @@ impl LegacyFixture {
     }
     fn under(kind: Frozen) -> Self {
         let mut route = route_for(Source::Codex);
-        let path = route.dir.join(Codex::name());
-        let (_, lines) = historical_codex::read(kind);
+        let (old, lines) = historical_codex::read(kind);
+        let path = route.dir.join(format!(
+            "rollout-2026-10-18T10-00-00-{}.jsonl",
+            old.source_session_id.as_ref().unwrap()
+        ));
         fs::write(&path, lines.join("\n") + "\n").unwrap();
         let prior = std::mem::take(&mut route.index);
         let (mut index, mut scan, _) = E2ScanFixture::default().scan_other(
@@ -99,6 +102,51 @@ impl LegacyFixture {
         self.route.save(false);
         path
     }
+    fn continuation(&self) {
+        let (_, lines) = historical_codex::read(Frozen::StickyLegacy);
+        let owner: Value = serde_json::from_str(&lines[0]).unwrap();
+        let id = owner["payload"]["id"].as_str().unwrap();
+        let path = self
+            .route
+            .dir
+            .join(format!("rollout-2026-10-27T07-01-00-{id}.jsonl"));
+        let mut rows = lines
+            .into_iter()
+            .map(|line| {
+                serde_json::from_str::<Value>(
+                    &line
+                        .replace("turn-a", "turn-b")
+                        .replace("T07:00:", "T07:01:"),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        rows[0]["timestamp"] = serde_json::json!("2026-10-27T07:01:00Z");
+        rows[0]["payload"]["timestamp"] = rows[0]["timestamp"].clone();
+        for row in &mut rows {
+            if row["type"] == "token_usage_record" {
+                row["payload"]["usage"]["input_tokens"] = 30.into();
+                row["payload"]["usage"]["total_tokens"] = 32.into();
+                row["payload"]["thread_token_usage"]["input_tokens"] = 40.into();
+                row["payload"]["thread_token_usage"]["output_tokens"] = 4.into();
+                row["payload"]["thread_token_usage"]["total_tokens"] = 44.into();
+            }
+            if row["payload"]["type"] == "token_count" {
+                row["payload"]["info"]["last_token_usage"]["input_tokens"] = 30.into();
+                row["payload"]["info"]["last_token_usage"]["total_tokens"] = 32.into();
+                row["payload"]["info"]["total_token_usage"]["input_tokens"] = 40.into();
+                row["payload"]["info"]["total_token_usage"]["output_tokens"] = 4.into();
+                row["payload"]["info"]["total_token_usage"]["total_tokens"] = 44.into();
+            }
+        }
+        fs::write(
+            path,
+            rows.iter()
+                .map(|row| row.to_string() + "\n")
+                .collect::<String>(),
+        )
+        .unwrap();
+    }
     fn change(&self, text: &str) {
         use std::io::Write;
         File::options()
@@ -155,6 +203,7 @@ fn codex_legacy_unchanged_upgrade_restart() {
         let before = f.route.index.files[&f.key].clone();
         let ((scan, modes), io) = oracle::observe_codex_quiet(|| f.page(&E2ScanFixture::default()));
         let mut observed = oracle::scan_money(SnapshotSource::Codex, &f.route.index, &scan);
+        observed.mode = oracle::Mode::Restart;
         observed.modes = modes;
         observed.io = io;
         oracle::money_oracle::assert_quiet_restart_zero_bytes(&observed);
@@ -169,36 +218,59 @@ fn codex_legacy_unchanged_upgrade_restart() {
     let ((scan, modes), io) =
         oracle::observe_codex_quiet(|| joined.page(&E2ScanFixture::default()));
     let mut observed = oracle::scan_money(SnapshotSource::Codex, &joined.route.index, &scan);
+    observed.mode = oracle::Mode::Restart;
     observed.modes = modes;
     observed.io = io;
     oracle::money_oracle::assert_quiet_restart_zero_bytes(&observed);
 
-    for damage in ["missing", "corrupt"] {
-        let mut f = LegacyFixture::new();
-        if damage == "missing" {
-            state_v2::erase_tail(&f.route.path, &mut f.route.index, [f.key.clone()]).unwrap();
-        } else {
-            let mut old = head::<Codex>(&f.route, &f.key);
-            old.body.pop();
-            state_v2::stage_tail(
-                &f.route.path,
-                &f.key,
-                state_v2::StagedFile {
-                    revision: old.revision,
-                    head: old.body,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+    for grouped in [false, true] {
+        for damage in ["missing", "corrupt"] {
+            let mut f = LegacyFixture::new();
+            let copy = grouped.then(|| f.seed_copy());
+            if damage == "missing" {
+                state_v2::erase_tail(&f.route.path, &mut f.route.index, [f.key.clone()]).unwrap();
+            } else {
+                let mut old = head::<Codex>(&f.route, &f.key);
+                old.body.pop();
+                state_v2::stage_tail(
+                    &f.route.path,
+                    &f.key,
+                    state_v2::StagedFile {
+                        revision: old.revision,
+                        head: old.body,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            }
+            f.route.save(false);
+            if let Some(copy) = copy {
+                use std::io::Write;
+                File::options()
+                    .append(true)
+                    .open(copy)
+                    .unwrap()
+                    .write_all(b"\n")
+                    .unwrap();
+            } else {
+                f.change("\n");
+            }
+            let ((scan, modes), io) =
+                oracle::observe_codex_quiet(|| f.page(&E2ScanFixture::default()));
+            let mut observed = oracle::scan_money(SnapshotSource::Codex, &f.route.index, &scan);
+            observed.mode = oracle::Mode::Restart;
+            observed.modes = modes;
+            observed.io = io;
+            if grouped {
+                assert!(
+                    scan.snapshots.is_empty(),
+                    "missing member proof holds the whole group"
+                );
+            } else {
+                oracle::money_oracle::assert_quiet_restart_zero_bytes(&observed);
+            }
+            assert!(!f.route.index.files[&f.key].codex_counting_v2);
         }
-        f.route.save(false);
-        f.change("\n");
-        let ((scan, modes), io) = oracle::observe_codex_quiet(|| f.page(&E2ScanFixture::default()));
-        let mut observed = oracle::scan_money(SnapshotSource::Codex, &f.route.index, &scan);
-        observed.modes = modes;
-        observed.io = io;
-        oracle::money_oracle::assert_quiet_restart_zero_bytes(&observed);
-        assert!(!f.route.index.files[&f.key].codex_counting_v2);
     }
 
     // A paused audit job must also stop if its file is again at the accepted
@@ -225,6 +297,7 @@ fn codex_legacy_unchanged_upgrade_restart() {
         let ((scan, modes), io) = oracle::observe_codex_quiet(|| paused.page(&scanner));
         assert!(scanner.cache.cursor_job_key().is_none());
         let mut observed = oracle::scan_money(SnapshotSource::Codex, &paused.route.index, &scan);
+        observed.mode = oracle::Mode::Restart;
         observed.modes = modes;
         observed.io = io;
         oracle::money_oracle::assert_quiet_restart_zero_bytes(&observed);
@@ -239,6 +312,8 @@ fn codex_legacy_growth_recounts_cold_v2() {
         &[0, 0, 0, 0][..],
         &[0, 0, 1, 0, 0][..],
         &[0, 0, 1, 1, 0][..],
+        &[1, 0, 1, 1, 0][..],
+        &[2, 0, 1, 0, 0][..],
     ] {
         let old = codex_usage_occurrence::CodexCounting::take(&mut Dec::new(bytes)).unwrap();
         assert_eq!(Enc::count_write(4096, |out| old.put(out)).unwrap(), bytes);
@@ -289,15 +364,9 @@ fn codex_legacy_growth_recounts_cold_v2() {
             &oracle::scan_money(SnapshotSource::Codex, &f.route.index, &scan),
         );
     }
-    let mut group = LegacyFixture::new();
-    let changed = group.seed_copy();
-    use std::io::Write;
-    File::options()
-        .append(true)
-        .open(changed)
-        .unwrap()
-        .write_all(b"\n")
-        .unwrap();
+    let mut group = LegacyFixture::under(Frozen::StickyLegacy);
+    group.continuation();
+    group.change("\n");
     let (scan, _) = group.page(&E2ScanFixture::default());
     assert!(!scan.snapshots.is_empty());
     oracle::money_oracle::assert_equivalent(
@@ -460,8 +529,10 @@ fn placement_control() {
     f.change("\n");
     let prior = std::mem::take(&mut f.route.index);
     let (index, changed) = page(&f, prior, std::slice::from_ref(&login_b));
-    let mut cold_index = ScanIndex::default();
-    cold_index.session_account_bindings = saved_start;
+    let cold_index = ScanIndex {
+        session_account_bindings: saved_start,
+        ..Default::default()
+    };
     let (cold_index, cold) = page(&f, cold_index, &[login_b]);
     oracle::money_oracle::assert_equivalent(
         &oracle::scan_money(SnapshotSource::Codex, &cold_index, &cold),
@@ -530,16 +601,14 @@ fn codex_history_base_first_record_uses_v2() {
 #[test]
 fn codex_legacy_baseline_unknown_and_new_usage() {
     for accepted in [true, false] {
-        let mut f = LegacyFixture::new();
+        let mut f = if accepted {
+            LegacyFixture::under(Frozen::StickyLegacy)
+        } else {
+            LegacyFixture::new()
+        };
         if accepted {
-            let changed = f.seed_copy();
-            use std::io::Write;
-            File::options()
-                .append(true)
-                .open(changed)
-                .unwrap()
-                .write_all(b"\n")
-                .unwrap();
+            f.continuation();
+            f.change("\n");
             let (scan, _) = f.page(&E2ScanFixture::default());
             assert!(!scan.snapshots.is_empty());
             oracle::money_oracle::assert_equivalent(
