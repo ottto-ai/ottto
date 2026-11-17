@@ -18,7 +18,6 @@ use crate::snapshots::{
     ClaudeTranscriptUsageOccurrence, ClaudeUsageAuthorityQuarantineDisposition,
     ClaudeUsageAuthorityQuarantineRecord, ClaudeUsageFamilyWitness, ScanIndex, ScanIndexEntry,
     SourceScanResult, CLAUDE_USAGE_AUTHORITY_RETRY_SECONDS, MAX_CLAUDE_USAGE_AUTHORITY_FAILURES,
-    SNAPSHOT_ACCEPTED_LEDGER_VERSION,
 };
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

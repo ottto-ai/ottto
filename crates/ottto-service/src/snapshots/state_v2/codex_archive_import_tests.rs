@@ -36,7 +36,8 @@ fn production_import_preserves_pre_archive_presence_and_rows() {
         } else {
             let value = serde_json::json!({
                 "schema_version": 2, "generation": 0,
-                "upload_context_fingerprint": null, "files": {}
+                "upload_context_fingerprint": null, "files": {},
+                "accepted_snapshot_fingerprint_ledger_version": 2
             });
             ottto_core::write_owner_only_file_atomic(&c.path, &serde_json::to_vec(&value).unwrap())
                 .unwrap();
@@ -100,7 +101,8 @@ fn import_carries_archive_custody_from_a_v1_original() {
     let c = Corpus::new();
     let value = serde_json::json!({
         "schema_version": 2, "generation": 0, "upload_context_fingerprint": null,
-        "files": {}, "archives": archives, "archive_deferred_alarm_count": 2
+        "files": {}, "archives": archives, "archive_deferred_alarm_count": 2,
+        "accepted_snapshot_fingerprint_ledger_version": 2
     });
     ottto_core::write_owner_only_file_atomic(&c.path, &serde_json::to_vec(&value).unwrap())
         .unwrap();

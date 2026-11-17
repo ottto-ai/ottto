@@ -12,7 +12,7 @@ use crate::snapshots::{
     ClaudeUsageAuthorityQuarantineDisposition, ClaudeUsageAuthorityQuarantineRecord, ScanIndex,
     SnapshotItem, SnapshotQuarantineDisposition, SnapshotSource, SourceScanResult,
     CLAUDE_USAGE_AUTHORITY_CORRECTION_CONTRACT_VERSION,
-    CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION, SNAPSHOT_ACCEPTED_LEDGER_VERSION,
+    CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION,
 };
 
 #[derive(Debug)]

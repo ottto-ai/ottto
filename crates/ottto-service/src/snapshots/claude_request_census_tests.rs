@@ -1518,6 +1518,15 @@ fn census_sequence_index_preserves_serde_compatibility_and_isolates_evidence() {
     ];
     fields.push(serde_json::json!({"good": census_record_json('a', "exact", &[1])}));
     fields.push(serde_json::json!("overflow-token"));
+    // A load refuses a pre-version-2 ledger, so fill through its slot.
+    let ledger_slot = crate::snapshots::lenient_decode::FIELDS
+        .iter()
+        .position(|name| *name == "accepted_snapshot_fingerprint_ledger_version")
+        .expect("ledger slot");
+    fields.resize(ledger_slot, serde_json::Value::Null);
+    fields.push(serde_json::json!(
+        crate::snapshots::SNAPSHOT_ACCEPTED_LEDGER_VERSION
+    ));
     let json = serde_json::to_string(&fields)
         .unwrap()
         .replace("\"overflow-token\"", "1e400");
