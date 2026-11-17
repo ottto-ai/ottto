@@ -80,6 +80,20 @@ pub(crate) fn bind_input_for_test(index: &ScanIndex, path: &Path) {
         let source = route_of(index)
             .and_then(|route| scan_index_integration::scan_index_storage_binding(&route))
             .map(|binding| binding.source)
+            .or_else(|| {
+                index
+                    .active_quarantine_witness
+                    .as_ref()
+                    .and_then(|witness| {
+                        [
+                            scan_index_persistence::Source::Claude,
+                            scan_index_persistence::Source::Codex,
+                            scan_index_persistence::Source::Pi,
+                        ]
+                        .into_iter()
+                        .find(|source| witness == &snapshot_quarantine_witness(source.snapshot()))
+                    })
+            })
             .unwrap_or_else(|| {
                 let name = path.file_name().unwrap().to_string_lossy();
                 if name.contains("codex") {
@@ -171,17 +185,22 @@ pub(crate) fn seed_index_for_test(index: &ScanIndex, path: &Path) -> ScanIndex {
 #[test]
 fn synthetic_default_indexes_save_and_reload_through_native_custody() {
     let scratch = crate::test_scratch::ScratchDir::canonical("fixture-native-save");
-    for source in [
+    for (slot, source) in [
         SnapshotSource::ClaudeCode,
         SnapshotSource::Codex,
         SnapshotSource::Pi,
-    ] {
-        let path = scratch.join(format!("{}-index.json", source.api_slug()));
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let path = scratch.join(format!("fixture-{slot}.json"));
         let mut index = ScanIndex {
             historical_replay_generation: Some(source.api_slug().into()),
             ..Default::default()
         };
+        index.activate_quarantine_witness(source);
         index.save(&path).unwrap();
+        assert_eq!(fixture_binding(&path).unwrap().source.snapshot(), source);
         assert_eq!(route_of(&index).as_deref(), Some(path.as_path()));
         assert_eq!(index.generation, 1);
         let replay = index.historical_replay_generation.clone();

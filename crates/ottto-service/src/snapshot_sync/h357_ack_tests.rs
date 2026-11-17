@@ -1902,7 +1902,7 @@ fn h360_restart_restores_held_probe_quarantine_from_index_and_retries_when_due()
     let probes = items(1);
     let fp = probes[0].snapshot_fingerprint.clone();
     let body = snapshot_upload_body_witness(&probes[0]);
-    let dir = std::env::temp_dir().join(format!(
+    let dir = std::env::temp_dir().canonicalize().unwrap().join(format!(
         "ottto-h360-restore-{}-{}",
         std::process::id(),
         current_unix_seconds()

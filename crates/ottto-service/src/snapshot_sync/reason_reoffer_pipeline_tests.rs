@@ -1894,7 +1894,7 @@ fn history_held_file_is_not_reoffered_and_its_lease_is_not_delivered() {
     // a saved history cutoff at or after every fixture birth.
     let index_path = claude_index_path(&pipeline.support);
     let mut saved: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&index_path).unwrap()).unwrap();
+        serde_json::to_value(ScanIndex::load(&index_path).unwrap()).unwrap();
     let files = saved["files"].as_object_mut().expect("indexed files");
     assert!(!files.is_empty());
     for entry in files.values_mut() {
@@ -1902,7 +1902,10 @@ fn history_held_file_is_not_reoffered_and_its_lease_is_not_delivered() {
     }
     saved["claude_history_cutoff_unix_seconds"] = current_unix_seconds().into();
     saved["claude_history_move_not_full"] = true.into();
-    std::fs::write(&index_path, serde_json::to_vec(&saved).unwrap()).unwrap();
+    crate::snapshots::e2_pipeline_scan_fixture::seed_json_for_test(
+        &index_path,
+        &serde_json::to_vec(&saved).unwrap(),
+    );
     assert!(!reemission_list_path(&pipeline.support).exists(), "no list");
 
     pipeline.server.answer(Answer::Accept);
@@ -2161,7 +2164,7 @@ fn lost_list_intent_pipeline(name: &str, set: bool, malformed: bool) {
         );
     }
     let index_path = claude_index_path(&pipeline.support);
-    std::fs::write(&index_path, b"{not json").unwrap();
+    crate::snapshots::e2_pipeline_scan_fixture::legacy_input_for_test(&index_path, b"{not json");
     assert!(!reemission_list_path(&pipeline.support).exists());
     assert!(!seen.exists());
     let (second, lines) = crate::local_resource_diagnostics::capture(|| {
@@ -2296,11 +2299,14 @@ fn returning_history_obeys_the_move_hold() {
     assert!(absent.result.is_ok(), "{:?}", absent.result);
     assert!(!absent.index.files.contains_key(&key));
     let mut saved: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&absent.index_path).unwrap()).unwrap();
+        serde_json::to_value(ScanIndex::load(&absent.index_path).unwrap()).unwrap();
     std::fs::write(&transcript, &bytes).unwrap();
     saved["claude_history_cutoff_unix_seconds"] = current_unix_seconds().into();
     saved["claude_history_move_not_full"] = true.into();
-    std::fs::write(&absent.index_path, serde_json::to_vec(&saved).unwrap()).unwrap();
+    crate::snapshots::e2_pipeline_scan_fixture::seed_json_for_test(
+        &absent.index_path,
+        &serde_json::to_vec(&saved).unwrap(),
+    );
     assert!(!reemission_list_path(&pipeline.support).exists());
     let offered_before = pipeline.server.offered().len();
 
@@ -2326,13 +2332,12 @@ fn returning_history_obeys_the_move_hold() {
     std::fs::write(api, b"{ malformed synthetic proof\n").unwrap();
     std::fs::write(&transcript, bytes).unwrap();
     let mut saved: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&absent_again.index_path).unwrap()).unwrap();
+        serde_json::to_value(ScanIndex::load(&absent_again.index_path).unwrap()).unwrap();
     saved["claude_history_cutoff_unix_seconds"] = current_unix_seconds().into();
-    std::fs::write(
+    crate::snapshots::e2_pipeline_scan_fixture::seed_json_for_test(
         &absent_again.index_path,
-        serde_json::to_vec(&saved).unwrap(),
-    )
-    .unwrap();
+        &serde_json::to_vec(&saved).unwrap(),
+    );
     let returned = pipeline.cycle(t0 + 2_400);
     assert!(returned.result.is_ok(), "{:?}", returned.result);
     // (b) The #712 hold still withholds the body: nothing uploaded, nothing
@@ -2347,7 +2352,7 @@ fn returning_history_obeys_the_move_hold() {
         0
     );
     let saved: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&returned.index_path).unwrap()).unwrap();
+        serde_json::to_value(ScanIndex::load(&returned.index_path).unwrap()).unwrap();
     assert_eq!(
         saved["claude_history_move_not_full"].as_bool(),
         Some(true),
@@ -2364,7 +2369,7 @@ fn returning_history_obeys_the_move_hold() {
     let claimed = pipeline.cycle(t0 + 3_000);
     assert!(claimed.result.is_ok(), "{:?}", claimed.result);
     let saved: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&claimed.index_path).unwrap()).unwrap();
+        serde_json::to_value(ScanIndex::load(&claimed.index_path).unwrap()).unwrap();
     assert!(
         saved.get("claude_history_move_not_full").is_none(),
         "the full claim clears the move hold"

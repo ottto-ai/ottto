@@ -1335,14 +1335,15 @@ fn upgrade_with_owed_bits_reads_zero_transcript_bytes() {
     }
     // The restart loads the older release's store itself, pending rows and
     // owed bits included.
-    std::fs::write(&fixture.index_path, serde_json::to_vec(&legacy).unwrap())
-        .expect("persist the older release's index");
+    crate::snapshots::e2_pipeline_scan_fixture::legacy_input_for_test(
+        &fixture.index_path,
+        &serde_json::to_vec(&legacy).unwrap(),
+    );
     let upgraded = ScanIndex::load(&fixture.index_path).expect("the persisted index loads");
     assert_eq!(upgraded.files.len(), index.files.len());
     assert_quiet_restart_traversal(&mut fixture, "upgrade");
     let saved: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&fixture.index_path).expect("read the saved index"))
-            .expect("decode the saved index");
+        serde_json::to_value(ScanIndex::load(&fixture.index_path).unwrap()).unwrap();
     for field in RETIRED {
         assert!(
             matches!(saved.get(field), None | Some(serde_json::Value::Null)),
@@ -1407,14 +1408,16 @@ fn grown_listed_family(
     if witnessed {
         fixture.seed_terminal_authority(PIPELINE_HELD_SESSION);
         let mut value: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&fixture.index_path).unwrap()).unwrap();
+            serde_json::to_value(ScanIndex::load(&fixture.index_path).unwrap()).unwrap();
         assert!(value["claude_usage_authority_quarantine"]
             .as_object_mut()
             .expect("authority records")
             .remove(PIPELINE_HELD_SESSION)
             .is_some());
-        std::fs::write(&fixture.index_path, serde_json::to_vec(&value).unwrap())
-            .expect("keep the witness without its record");
+        crate::snapshots::e2_pipeline_scan_fixture::seed_json_for_test(
+            &fixture.index_path,
+            &serde_json::to_vec(&value).unwrap(),
+        );
     }
     let seeded = ScanIndex::load(&fixture.index_path).expect("load the seeded index");
     assert_eq!(

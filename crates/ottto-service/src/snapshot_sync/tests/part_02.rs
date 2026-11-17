@@ -202,7 +202,7 @@ struct SourceManifestTestGuard;
 fn test_terminal_status_support_dir() -> &'static Path {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     DIR.get_or_init(|| {
-        std::env::temp_dir().join(format!(
+        std::env::temp_dir().canonicalize().unwrap().join(format!(
             "ottto-terminal-status-tests-{}",
             std::process::id()
         ))

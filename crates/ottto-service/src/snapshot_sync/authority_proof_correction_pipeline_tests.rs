@@ -252,8 +252,7 @@ impl ApcFixture {
         let index = ScanIndex::load(&self.index_path).expect("load the granted index");
         let keys = Self::family_keys(&index);
         let mut value: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&self.index_path).expect("read saved index"))
-                .expect("decode saved index");
+            serde_json::to_value(ScanIndex::load(&self.index_path).unwrap()).unwrap();
         let record = &mut value["claude_usage_authority_quarantine"][APC_ROOT];
         let map = record["member_source_file_fingerprints"]
             .as_object_mut()
@@ -270,8 +269,10 @@ impl ApcFixture {
             }
         }
         record["proof_correction"]["owed_member_ids"] = serde_json::json!(owed);
-        std::fs::write(&self.index_path, serde_json::to_vec(&value).unwrap())
-            .expect("write seeded index");
+        crate::snapshots::e2_pipeline_scan_fixture::seed_json_for_test(
+            &self.index_path,
+            &serde_json::to_vec(&value).unwrap(),
+        );
         let seeded = ScanIndex::load(&self.index_path).expect("load the seeded index");
         assert_eq!(
             self.quarantined_index_count(),
@@ -2375,8 +2376,7 @@ fn controlled_unbound_record_rearms_its_family_and_reforms_bound() {
         .claude_authority_record_for_test(APC_ROOT)
         .expect("natural authority record persists");
     let mut value: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&fixture.index_path).expect("read saved index"))
-            .expect("decode saved index");
+        serde_json::to_value(ScanIndex::load(&fixture.index_path).unwrap()).unwrap();
     // A held family can already be re-armed. Seed nonempty revisions (the
     // record's where retained, otherwise a controlled synthetic one) so this
     // drop must clear every member before real pages prove they are re-read.
@@ -2390,8 +2390,10 @@ fn controlled_unbound_record_rearms_its_family_and_reforms_bound() {
     }
     value["claude_usage_authority_quarantine"][APC_ROOT]["proven_witness_fingerprint"] =
         serde_json::json!("9".repeat(64));
-    std::fs::write(&fixture.index_path, serde_json::to_vec(&value).unwrap())
-        .expect("write unbound index");
+    crate::snapshots::e2_pipeline_scan_fixture::seed_json_for_test(
+        &fixture.index_path,
+        &serde_json::to_vec(&value).unwrap(),
+    );
 
     let (drops, rearmed) = crate::snapshots::claude_authority_drops_for_test();
     let mut reread = BTreeSet::new();
