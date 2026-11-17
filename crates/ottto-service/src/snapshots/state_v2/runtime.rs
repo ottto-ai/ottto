@@ -50,7 +50,11 @@ impl Hold {
             return Self::UnknownRecordKind.into();
         }
         if let Some(hold) = error.downcast_ref::<Self>() {
-            return (*hold).into();
+            let hold = *hold;
+            #[cfg(test)]
+            return error.context(hold);
+            #[cfg(not(test))]
+            return hold.into();
         }
         let integrity_repair = error
             .chain()
@@ -561,6 +565,12 @@ pub(in super::super) fn after_v1_locked(path: &Path, index: &mut ScanIndex) -> R
             return Err(Hold::DbUnavailable.into());
         }
         if !state.inventory_ready {
+            #[cfg(test)]
+            if let Some(class) = state.import_pause {
+                return Err(
+                    anyhow::anyhow!("fixture inventory refusal: {class:?}").context(class.hold())
+                );
+            }
             return Err(state
                 .import_pause
                 .map_or(Hold::ReloadRequired, Pause::hold)
