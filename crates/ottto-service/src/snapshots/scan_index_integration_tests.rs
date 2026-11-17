@@ -897,12 +897,17 @@ fn historical_replay_runs_once_per_generation_only_when_pending() {
 fn a_failed_save_after_a_replay_replays_again_and_a_saved_replay_holds() {
     const GENERATION: &str = "codex:replay-custody:g1";
     let key = "/s/replay-custody.jsonl";
-    let scratch = crate::test_scratch::private_dir("replay-custody");
-    let path = scratch.join("index.json");
+    let scratch = crate::test_scratch::ScratchDir::canonical("replay-custody");
     let pending =
         |index: &ScanIndex| index.historical_replay_generation.as_deref() != Some(GENERATION);
     let mut disk = ScanIndex::default();
     replay_indexed(&mut disk, key);
+    let (session, mut disk) = state_v2::money_test_support::ColdSession::publish(
+        scan_index_persistence::Source::Claude,
+        &disk,
+        scratch.as_ref(),
+    );
+    let path = session.path().to_owned();
     disk.save(&path).unwrap();
 
     // The replay resets the loaded copy; its save fails.
@@ -930,7 +935,8 @@ fn a_failed_save_after_a_replay_replays_again_and_a_saved_replay_holds() {
     assert!(!pending(&index));
     assert!(!index.prepare_historical_replay(GENERATION.into()));
     assert!(replay_delivered(&index, key));
-    fs::remove_dir_all(&scratch).unwrap();
+    drop(index);
+    drop(session);
 }
 
 // F10: count surviving complete offers at the real post-policy finalizer.
