@@ -807,13 +807,17 @@ impl HeaderInventory {
             } else {
                 None
             };
+            let mut physical_match = false;
             let durable = match carried.or(joined_archive) {
                 Some(facts) => Some(facts),
                 None => {
                     lookups += 1;
                     index
                         .codex_physical_matches(&key, &current)?
-                        .filter(|(matched, _)| *matched)
+                        .filter(|(matched, _)| {
+                            physical_match = *matched;
+                            *matched
+                        })
                         .and_then(|(_, head)| {
                             let facts = head.common.inventory.as_ref();
                             let owner = facts.map(|facts| facts.owner.clone()).or_else(|| {
@@ -837,8 +841,14 @@ impl HeaderInventory {
             // inventory cache. Its existing owner and physical stamps suffice;
             // missing owner proof remains held until the content changes.
             let durable = if durable.is_none()
-                && sources::codex::counting::version::unchanged_legacy(index, &candidate.path)
-            {
+                && fallback.is_none()
+                && sources::codex::counting::version::unchanged_legacy_with(index, &key, || {
+                    physical_match
+                        || index
+                            .files
+                            .get(&key)
+                            .is_some_and(|entry| entry.same_listing_stamp_as(&current))
+                }) {
                 let owner_proof = index
                     .files
                     .get(&key)

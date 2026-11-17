@@ -56,15 +56,23 @@ pub(in crate::snapshots) fn legacy_head_missing(index: &ScanIndex, key: &str) ->
 /// debt cannot authorize conversion of unchanged accepted history.
 pub(in crate::snapshots) fn unchanged_legacy(index: &ScanIndex, path: &Path) -> bool {
     let key = local_index_key(path);
-    if !proven_legacy(index, &key) {
-        return false;
-    }
-    let Ok(metadata) = fs::symlink_metadata(path) else {
-        return false;
-    };
-    metadata.is_file()
-        && !metadata.file_type().is_symlink()
-        && index.listing_stamp_matches(path, &metadata)
+    unchanged_legacy_with(index, &key, || {
+        let Ok(metadata) = fs::symlink_metadata(path) else {
+            return false;
+        };
+        metadata.is_file()
+            && !metadata.file_type().is_symlink()
+            && index.listing_stamp_matches(path, &metadata)
+    })
+}
+
+/// Inventory already checked the physical head; reuse that observation.
+pub(in crate::snapshots) fn unchanged_legacy_with(
+    index: &ScanIndex,
+    key: &str,
+    stamp_matches: impl FnOnce() -> bool,
+) -> bool {
+    proven_legacy(index, key) && stamp_matches()
 }
 
 pub(in crate::snapshots) fn reusable(
