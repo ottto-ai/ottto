@@ -781,3 +781,76 @@ fn codex_content_loads_back_from_its_session_facts() {
         Some(ReconstructCause::INCOMPATIBLE)
     );
 }
+
+/// Capture the pre-change writer's synthetic head for forward compatibility tests.
+#[test]
+fn export_historical_codex_head() {
+    use crate::snapshots::sampled_scan::transition_fixture::native_cold;
+    use crate::snapshots::sources::codex::counting::version::{self, AckEvidence};
+    let dir = std::env::temp_dir().join(format!("ottto-historical-head-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("rollout.jsonl");
+    let mut rows = lines(1);
+    // One native response plus two UI observations: Legacy and V2 differ.
+    let ui = rows
+        .iter()
+        .find(|line| line.contains("token_count"))
+        .unwrap()
+        .clone();
+    rows.insert(rows.len() - 1, ui);
+    rows.insert(
+        3,
+        json!({"timestamp":at(0),"type":"token_usage_record","payload":{
+            "thread_id":SESSION,"turn_id":"turn-0000","response_id":"response-0000",
+            "usage":{"input_tokens":100,"output_tokens":30,"total_tokens":130},
+            "thread_token_usage":{"input_tokens":100,"output_tokens":30,"total_tokens":130}
+        }})
+        .to_string(),
+    );
+    std::fs::write(&path, rows.join("\n") + "\n").unwrap();
+    for (name, evidence, cutover) in [
+        ("legacy", AckEvidence::LegacyAcked, Some(i64::MAX)),
+        ("v2", AckEvidence::None, Some(0)),
+    ] {
+        let mut parser = native_cold::parser(
+            SnapshotSource::Codex,
+            &path,
+            File::open(&path).unwrap(),
+            apply_codex_line,
+        );
+        version::configure(&mut parser.accumulator, evidence, cutover);
+        let scope = super::super::seam::tests::scope();
+        parser
+            .prepare_acquisition(None, &scope, None, 1_790_000_000)
+            .unwrap();
+        let (reduction, checkpoint) =
+            native_cold::finish_record(&mut parser, &scope, 1_790_000_000);
+        let staged = stage_reduction::<Codex>(
+            &reduction,
+            &checkpoint.durable_certificate(0).unwrap(),
+            &identity(),
+        );
+        let pages = staged
+            .pages
+            .iter()
+            .map(|((collection, page), bytes)| json!([format!("{collection:?}"), page, bytes]))
+            .collect::<Vec<_>>();
+        let collections = staged
+            .collections
+            .iter()
+            .map(|(collection, meta)| {
+                json!([
+                    format!("{collection:?}"),
+                    meta.shape as u8,
+                    meta.elements_per_page,
+                    meta.elements
+                ])
+            })
+            .collect::<Vec<_>>();
+        println!(
+            "HISTORICAL_CODEX_HEAD {}",
+            json!({"name":name,"revision":staged.revision,"head":staged.head,"pages":pages,"collections":collections,"lines":rows})
+        );
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
