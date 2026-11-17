@@ -2629,8 +2629,8 @@ fn untag_groups(grouping: &mut Grouping, keys: &BTreeSet<RowKey>) {
     }
 }
 
-/// Complete compact wire bytes, including the largest policy framing and a
-/// possible cache predecessor. Hash values have fixed width as tags change.
+/// Conservative compact wire budget, including the largest policy framing and
+/// a possible cache predecessor. Hash values have fixed width as tags change.
 pub(crate) fn item_bytes(item: &SnapshotItem) -> usize {
     let policy = super::SnapshotUploadPolicy {
         session_titles_enabled: false,
@@ -2697,7 +2697,10 @@ pub(crate) fn item_bytes(item: &SnapshotItem) -> usize {
         snapshot: item,
         semantic_envelope: envelope,
     })
-    .map_or(usize::MAX, |bytes| bytes.len())
+    // Keep the identity admission budget stable across the revision-envelope
+    // cutover. Reclaiming these 134 bytes here would retag boundary rows even
+    // though this change only removes transport fields.
+    .map_or(usize::MAX, |bytes| bytes.len().saturating_add(134))
 }
 
 // --- Canonical hash leaf (W0 `session_identity_leaf:v3`) ---------------------
