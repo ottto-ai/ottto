@@ -416,10 +416,14 @@ fn e2_pipeline_markerless_a_to_b_keeps_own_logins_with_and_without_a_binding() {
             .iter()
             .find(|item| item.source_session_id == root)
             .unwrap();
+        // Carry.on (CI run 44113140067): without req_2/req_4 rows the gaps
+        // take the starting binding (A): these own requests are unproven
+        // copies, which never seed a carry. Own logins are kept either way.
+        let (a, b) = if partial { (3, 1) } else { (2, 2) };
         assert_eq!(
             e2_login_counts(item),
-            BTreeMap::from([(Some(e2_account()), 2), (Some("b".repeat(64)), 2)]),
-            "bound={bound}"
+            BTreeMap::from([(Some(e2_account()), a), (Some("b".repeat(64)), b)]),
+            "bound={bound} partial={partial}"
         );
         assert_eq!(item.request_count, 4);
         assert_eq!(

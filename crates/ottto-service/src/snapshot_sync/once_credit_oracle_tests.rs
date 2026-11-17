@@ -1476,9 +1476,12 @@ fn c01_claude_cold_control_preserves_accounts_side_call_gap_and_tags() {
             }
         }
     }
+    // Carry.on (CI run 44113140067): account-b's copied request never seeds
+    // a carry, so the 5-token gap is placed with account-a (the start or
+    // its carry), not with the latest own account (b). Totals are unchanged.
     assert_eq!(
         accounts,
-        BTreeMap::from([("a".repeat(64), 10), ("b".repeat(64), 32)])
+        BTreeMap::from([("a".repeat(64), 15), ("b".repeat(64), 27)])
     );
     assert!(tagged);
     money_equivalence_tests::emit_money(

@@ -695,7 +695,44 @@ fn positive_placement_matches_one_home() {
             // Reuse the same synthetic evidence, with independent native transcript reads.
             one.support = c.support.clone();
             let single = cold(&one);
-            money_oracle::assert_placement_equivalent(&single, &actual);
+            // Carry.on (CI run 44113140067): on the twin route ROOT's newer
+            // file is a resume copy whose copied root-fork never seeds a
+            // carry, so its `resume` gap stays Unknown; one home carries
+            // root-fork's account (login 1, org 7) forward. Pin that ROOT
+            // divergence; every other entity's placement must match exactly.
+            let (mut one_rest, mut twin_rest) = (single.clone(), actual.clone());
+            let one_root = one_rest.snapshots.remove(ROOT).unwrap();
+            let twin_root = twin_rest.snapshots.remove(ROOT).unwrap();
+            money_oracle::assert_placement_equivalent(&one_rest, &twin_rest);
+            let login = serde_json::json!("1".repeat(64));
+            for row in [
+                &one_root["model_usage"][1],
+                &one_root["usage_buckets"][1]["model_usage"][0],
+            ] {
+                assert_eq!(row["account_identifier_hash"], login, "one home carries");
+            }
+            for row in [
+                &twin_root["model_usage"][1],
+                &twin_root["usage_buckets"][1]["model_usage"][0],
+            ] {
+                assert!(
+                    row.get("account_identifier_hash").is_none(),
+                    "twin gap Unknown"
+                );
+            }
+            let sources = |root: &serde_json::Value| {
+                root["request_evidence"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|entry| entry.get("account_source").cloned())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                sources(&one_root),
+                [Some(serde_json::json!("carried_forward")), None]
+            );
+            assert_eq!(sources(&twin_root), [None]);
             for (id, expected) in &single.snapshots {
                 let got = &actual.snapshots[id];
                 for field in [
