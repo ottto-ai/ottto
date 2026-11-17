@@ -310,16 +310,17 @@ impl PipelineFixture {
         crate::snapshots::claude_request_money::e2::apply_money_rules(&mut index);
         let committed_index = index.clone();
         let native_pass = crate::snapshots::state_v2_baseline_release(&self.index_path, &index);
-        let mut scan = crate::snapshots::e2_pipeline_scan_fixture::scan_native_pipeline_for_test(
-            std::slice::from_ref(&self.root),
-            &mut index,
-            collected_at,
-            183,
-            self.page_files,
-            &self.support,
-            Some(self.cache.clone()),
-        )
-        .expect("scan bounded Claude page");
+        let mut scan =
+            crate::snapshots::e2_pipeline_scan_fixture::scan_native_full_pipeline_for_test(
+                std::slice::from_ref(&self.root),
+                &mut index,
+                collected_at,
+                183,
+                self.page_files,
+                &self.support,
+                Some(self.cache.clone()),
+            )
+            .expect("scan bounded Claude page");
         let parsed = scan
             .snapshots
             .iter()
@@ -431,13 +432,17 @@ impl PipelineFixture {
         }
         let leased_reoffers = progress.active_reason_reoffers.clone();
         eprintln!(
-            "native census page at={collected_at} parsed={parsed:?} offered={:?} held={} reoffers={}",
+            "native census page at={collected_at} parsed={parsed:?} offered={:?} held={} reoffers={} complete={} status={:?} unsettled={} authority_pending={}",
             scan.snapshots
                 .iter()
                 .map(|item| item.source_session_id.as_str())
                 .collect::<BTreeSet<_>>(),
             holds.held_fingerprints.len(),
             leased_reoffers.len(),
+            scan.census_complete,
+            scan.census_status,
+            index.bounded_sweep_had_unsettled_upload(),
+            index.claude_usage_authority_pending_count(),
         );
         let mut uploaded = BTreeSet::new();
         let mut accepted = 0;

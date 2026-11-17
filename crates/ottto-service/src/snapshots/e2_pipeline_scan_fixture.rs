@@ -1525,9 +1525,11 @@ pub(crate) fn exhaust_progress_generation_for_test(index: &ScanIndex) {
     state_v2::money_test_support::exhaust_progress_generation_for_test(index);
 }
 
-/// The production sampled acquisition over an already bound synthetic route.
-/// Callers with an explicit warm memo retain its owner across pages.
-pub(crate) fn scan_native_pipeline_for_test(
+/// Native acquisition for pipeline oracles that require Full-certified source
+/// evidence. An incompatible restored acquisition scope requests the production
+/// Full(ScopeChanged) path. Index and delivery custody stay on the same native
+/// route; a caller's warm memo stays owned across pages.
+pub(crate) fn scan_native_full_pipeline_for_test(
     roots: &[PathBuf],
     index: &mut ScanIndex,
     collected_at: &str,
@@ -1536,10 +1538,19 @@ pub(crate) fn scan_native_pipeline_for_test(
     support: &Path,
     cache: Option<Arc<sampled_scan::SharedCache>>,
 ) -> Result<SourceScanResult> {
+    struct RestoreScope(bool);
+    impl Drop for RestoreScope {
+        fn drop(&mut self) {
+            crate::transcript_acquisition::RESTORED_SCOPE_MISMATCH.with(|flag| flag.set(self.0));
+        }
+    }
+    let _full = RestoreScope(
+        crate::transcript_acquisition::RESTORED_SCOPE_MISMATCH.with(|flag| flag.replace(true)),
+    );
     state_v2::release_collection_page_limit_for_test(index);
     state_v2::before_collection(index)?;
     let cache = cache.unwrap_or_default();
-    let scope = Scope("native-pipeline-fixture".into());
+    let scope = Scope("native-full-pipeline-fixture".into());
     let mut state = OwnedSourceScan::new_with_recovery_priority(
         SnapshotSource::ClaudeCode,
         roots,
@@ -1561,6 +1572,10 @@ pub(crate) fn scan_native_pipeline_for_test(
             *index = state.index;
             return Err(error);
         }
+        let retained_reads = state
+            .sampling
+            .as_ref()
+            .map_or(0, |context| context.tail_files + context.unchanged_files);
         match state.step(None) {
             OwnedSourceScanStep::Pending(next) => state = next,
             OwnedSourceScanStep::Complete {
@@ -1568,6 +1583,7 @@ pub(crate) fn scan_native_pipeline_for_test(
                 scan,
                 ..
             } => {
+                assert_eq!(retained_reads, 0, "this fixture requires Full source proof");
                 *index = complete;
                 return Ok(scan);
             }

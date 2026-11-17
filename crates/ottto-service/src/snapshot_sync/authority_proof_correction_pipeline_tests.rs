@@ -275,9 +275,13 @@ impl ApcFixture {
             }
         }
         record["proof_correction"]["owed_member_ids"] = serde_json::json!(owed);
-        crate::snapshots::e2_pipeline_scan_fixture::seed_json_for_test(
-            &self.index_path,
-            &serde_json::to_vec(&value).unwrap(),
+        // Only this authority row changes; retain the native Tail heads and
+        // progress rows that the delivered baseline earned.
+        crate::snapshots::e2_pipeline_scan_fixture::edit_record_for_test(
+            &index,
+            "refusal.authority",
+            APC_ROOT,
+            |native| *native = value["claude_usage_authority_quarantine"][APC_ROOT].clone(),
         );
         let seeded = ScanIndex::load(&self.index_path).expect("load the seeded index");
         assert_eq!(
@@ -442,9 +446,14 @@ impl ApcFixture {
 
     /// One bounded page with the same acquisition and retry clock.
     fn page(&self, collected_at: &str, upload: ApcUpload) -> ApcPage {
+        // The minute suffix identifies bounded pages of one synthetic visit.
+        // Keep their acquisition clock fixed so every member's one-hour
+        // audit becomes due together on the following visit.
         let now = OffsetDateTime::parse(collected_at, &Rfc3339)
             .unwrap()
-            .unix_timestamp() as u64;
+            .unix_timestamp() as u64
+            / 3600
+            * 3600;
         crate::snapshots::sampled_scan::transition_fixture::with_scan_clock(now, || {
             // Ordinary transcripts: each file exists before its records (`e2`).
             crate::snapshots::claude_request_money::e2::with_fixture_birth(
@@ -475,16 +484,17 @@ impl ApcFixture {
         let committed_index = index.clone();
         self.trace_stage(collected_at, "before_scan", &index);
         let native_pass = crate::snapshots::state_v2_baseline_release(&self.index_path, &index);
-        let mut scan = crate::snapshots::e2_pipeline_scan_fixture::scan_native_pipeline_for_test(
-            std::slice::from_ref(&self.root),
-            &mut index,
-            collected_at,
-            183,
-            self.page_files.get(),
-            &self.support,
-            None,
-        )
-        .expect("scan bounded Claude page");
+        let mut scan =
+            crate::snapshots::e2_pipeline_scan_fixture::scan_native_full_pipeline_for_test(
+                std::slice::from_ref(&self.root),
+                &mut index,
+                collected_at,
+                183,
+                self.page_files.get(),
+                &self.support,
+                None,
+            )
+            .expect("scan bounded Claude page");
         self.trace_stage(collected_at, "after_scan", &index);
         let parsed = scan
             .snapshots
