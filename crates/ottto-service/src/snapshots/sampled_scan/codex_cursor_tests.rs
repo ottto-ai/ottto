@@ -4348,7 +4348,7 @@ fn growth_curable_hold_is_not_anchored_past_unread_bytes() {
             if grow {
                 fixture.append(SESSION, &token_line(41));
             }
-            let _ = finish_job(&cache, None, &mut job, None, "legacy", "", true);
+            let _ = finish_job(&cache, None, &mut job, None, "", true);
             job.hold_offset
         });
         assert_eq!(
@@ -4430,7 +4430,6 @@ fn memo_wakes_on_the_conflicted_identity_set() {
             "dependencies",
             codex,
             1,
-            "counting",
         )
         .unwrap()
     };
@@ -4457,7 +4456,6 @@ fn memo_wakes_on_the_conflicted_identity_set() {
             "dependencies",
             codex,
             1,
-            "counting",
         )
         .unwrap()
     };
@@ -5869,16 +5867,7 @@ fn memo_digest_fences_receipt_contents_census_flags_and_members() {
         index
     };
     let digest = |index: &ScanIndex, codex: &CodexTitleMetadata, members: usize| {
-        memo_digest(
-            index,
-            &candidate,
-            &file,
-            "dependencies",
-            codex,
-            members,
-            "counting",
-        )
-        .unwrap()
+        memo_digest(index, &candidate, &file, "dependencies", codex, members).unwrap()
     };
     let codex = CodexTitleMetadata::default();
     let base = with_receipt(receipt("priority"));
@@ -6816,7 +6805,6 @@ fn pace_meta(temp: &Temp, pace: JobPace) -> JobMeta {
         started: 0,
         dependencies: None,
         owner: None,
-        counting: String::new(),
         fence: None,
         census_trusted: true,
         pages: 1,

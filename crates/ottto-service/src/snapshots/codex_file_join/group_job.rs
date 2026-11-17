@@ -35,10 +35,6 @@ pub(in crate::snapshots) fn new_group_parser(
     Ok(Box::new(parser))
 }
 
-pub(in crate::snapshots) fn group_counting_is_v2(accumulator: &SnapshotAccumulator) -> bool {
-    accumulator.codex_counting_v2()
-}
-
 fn filename_owner(path: &Path) -> Option<(String, bool)> {
     use crate::snapshots::scan::source_session_id::codex_identity_is_uuid_shaped as uuid;
     codex_session_id_candidates_from_path(path)
@@ -703,11 +699,7 @@ impl GroupBoot {
     }
 
     /// M-1 `scope_job` with the group's wake dependencies (§d.4).
-    pub(in crate::snapshots) fn memo_digest(
-        &self,
-        index: &ScanIndex,
-        codex: &CodexTitleMetadata,
-    ) -> Option<String> {
+    pub(in crate::snapshots) fn memo_digest(&self, codex: &CodexTitleMetadata) -> Option<String> {
         let order = self.canonical_order();
         let (_, live) = self.live()?;
         Some(cursor::group_memo_digest(
@@ -721,7 +713,6 @@ impl GroupBoot {
                 .iter()
                 .map(|i| self.headers.get(*i).map_or("", MemberHeader::digest))
                 .collect::<Vec<_>>(),
-            index,
             codex,
             |member| self.wake_identity(member),
         ))
@@ -739,7 +730,7 @@ impl GroupBoot {
         self,
         inputs: JobInputs<'_>,
     ) -> std::result::Result<Box<OwnedActiveFile>, GroupEnd> {
-        let memo_digest = self.memo_digest(inputs.index, inputs.metadata);
+        let memo_digest = self.memo_digest(inputs.metadata);
         let dependencies = self.dependencies(inputs.metadata);
         let Self {
             group,
@@ -787,15 +778,14 @@ impl GroupBoot {
             return Err(GroupEnd::Changed);
         }
         let mut parser = if independent {
-            independent_fold::parser(file, &first, inputs.metadata, inputs.index, inputs.cache)?
+            independent_fold::parser(file, &first, inputs.metadata, inputs.cache)?
         } else {
             new_group_parser(file, &first, inputs.metadata).map_err(|_| GroupEnd::Strict)?
         };
-        let v2 = group_counting_is_v2(&parser.accumulator);
         let mut join = Box::new(if independent {
             StreamProof::independent(group.owner.clone(), members.len())
         } else {
-            StreamProof::new(group.owner.clone(), v2, plan.plans)
+            StreamProof::new(group.owner.clone(), plan.plans)
         });
         join.begin_member(0);
         let previous = previous_receipts
@@ -1084,7 +1074,6 @@ fn member_eof(
     let mut join = replay.join.take().ok_or(GroupEnd::Strict)?;
     // The version is decided on the first owned record, after the proof
     // was built; the member-end rules follow it.
-    join.decide_v2(group_counting_is_v2(&active.parser.accumulator));
     join.end_member(end);
     if last {
         join.finish_group();
@@ -1204,8 +1193,7 @@ fn independent_member_eof(
         .map_err(|_| GroupEnd::Strict)?;
     let input = std::mem::replace(&mut active.parser.reader.reader, OpenedInput::plain(held));
     input.close();
-    let parser =
-        independent_fold::parser(file, &next, inputs.metadata, inputs.index, inputs.cache)?;
+    let parser = independent_fold::parser(file, &next, inputs.metadata, inputs.cache)?;
     let mut old = std::mem::replace(&mut active.parser, parser);
     active
         .parser

@@ -76,24 +76,17 @@ pub(in crate::snapshots) fn unchanged_legacy_with(
 }
 
 pub(in crate::snapshots) fn reusable(
-    old: Option<&codex_usage_occurrence::CodexCounting>,
-    fresh: Option<&codex_usage_occurrence::CodexCounting>,
+    old: &SnapshotAccumulator,
+    fresh: &SnapshotAccumulator,
 ) -> bool {
-    match fresh {
-        None => old.is_none(),
-        Some(_) => old.is_some_and(|old| old.is_v2()),
+    match fresh.codex_counting.as_ref() {
+        None => old.codex_counting.is_none(),
+        Some(_) => old.codex_counting_v2(),
     }
 }
 
-pub(in crate::snapshots) fn reusable_under_view(
-    accumulator: &SnapshotAccumulator,
-    _view: &str,
-) -> bool {
-    accumulator.codex_counting_v2()
-}
-
 /// Diagnose a completed replacement before the committed head is overwritten.
-/// This process-local alarm may repeat after a crash or a refused upload.
+/// This process-local alarm fires before the save and may repeat after refusal or a crash.
 pub(in crate::snapshots) fn note_recount(index: &ScanIndex, keys: &[String], new: &UsageTotals) {
     if !keys
         .iter()

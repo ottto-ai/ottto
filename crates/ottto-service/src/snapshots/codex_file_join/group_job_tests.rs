@@ -167,11 +167,16 @@ fn plan_refuses_an_equal_header_and_size_as_a_candidate_copy() {
 
 /// Feed rows to `proof` with the parser's S10 tap after every UI record.
 fn feed(proof: &mut StreamProof, rows: &[Value], starts: impl IntoIterator<Item = u64>) {
+    let mut turn = None;
     for (row, start) in rows.iter().zip(starts) {
+        if row["type"] == "token_usage_record" {
+            turn = row["payload"]["response_id"].as_str();
+            proof.turn = turn.map(|id| compact(b"t:", id));
+        }
         proof.set_record_start(start);
         proof.observe(row);
         if codex_last_usage(row).is_some() {
-            proof.admitted_usage(row, true, codex_usage_event_identity(row).as_deref(), None);
+            proof.admitted_usage(row, true, codex_usage_event_identity(row).as_deref(), turn);
         }
     }
 }
@@ -518,7 +523,7 @@ fn ui_shape_unreadable_is_proof_domain() {
         proof.observe(&meta(OWNER, "2026-10-01T10:00:00Z", json!({})));
         proof.observe(&native(OWNER, "r", 100, 100));
     };
-    let mut proof = StreamProof::new(OWNER.into(), false, vec![MemberPlan::default()]);
+    let mut proof = StreamProof::new(OWNER.into(), vec![MemberPlan::default()]);
     start(&mut proof);
     let mut row = ui(100, 100, "2026-10-01T10:00:30Z");
     row["payload"]["info"]["last_token_usage"]
@@ -528,12 +533,12 @@ fn ui_shape_unreadable_is_proof_domain() {
     proof.admitted_usage(&row, true, Some("identity"), None);
     assert_eq!(proof.refusal(), Some((JoinRefusal::UiShape, 0)));
     // No identity is the same named shape debt, never skipped.
-    let mut proof = StreamProof::new(OWNER.into(), false, vec![MemberPlan::default()]);
+    let mut proof = StreamProof::new(OWNER.into(), vec![MemberPlan::default()]);
     start(&mut proof);
     proof.admitted_usage(&ui(100, 100, "2026-10-01T10:00:30Z"), true, None, None);
     assert_eq!(proof.refusal(), Some((JoinRefusal::UiShape, 0)));
     // An admission the parser derived from cumulative counters.
-    let mut proof = StreamProof::new(OWNER.into(), false, vec![MemberPlan::default()]);
+    let mut proof = StreamProof::new(OWNER.into(), vec![MemberPlan::default()]);
     start(&mut proof);
     proof.admitted_usage(
         &ui(100, 100, "2026-10-01T10:00:30Z"),
@@ -599,7 +604,7 @@ fn binding_requires_unique_logical_uuid_offset_and_chain() {
             .collect::<Vec<_>>()
     };
     let run = |offset: u64, before: u64| {
-        let mut proof = StreamProof::new(OWNER.into(), false, plans.clone());
+        let mut proof = StreamProof::new(OWNER.into(), plans.clone());
         proof.begin_member(0);
         let rows = raw_ordinals(
             vec![

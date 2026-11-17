@@ -384,6 +384,92 @@ fn codex_legacy_unchanged_upgrade_restart() {
     });
 }
 
+/// [money] A stable Legacy group and a finalized unit share a real checkpoint without Legacy reads.
+#[test]
+fn codex_legacy_group_mixed_page_checkpoint() {
+    use std::cell::Cell;
+    use std::io::Write;
+    let _decoder = oracle::codex_decoder_test_lock();
+    let mut f = LegacyFixture::accepted_group();
+    let legacy = f.route.index.files.keys().cloned().collect::<Vec<_>>();
+    const OTHER: &str = "019a0c2a-8e11-7222-8333-944445555778";
+    let path = f
+        .route
+        .dir
+        .join(format!("rollout-2026-10-18T10-00-02-{OTHER}.jsonl"));
+    let rows = |n| codex_lines(n).join("\n").replace(SESSION, OTHER) + "\n";
+    let before = rows(20);
+    fs::write(&path, &before).unwrap();
+    let (seed, _) = f.page(&E2ScanFixture::default());
+    assert_eq!(seed.snapshots.len(), 1);
+    f.accept(&seed);
+    f.restore();
+    let after = rows(21);
+    let extra = after.strip_prefix(&before).unwrap();
+    File::options()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(extra.as_bytes())
+        .unwrap();
+    let window = 2 * FILE_CONTENT_SAMPLE_BYTES as u64;
+    assert!(before.len() as u64 > window);
+    assert!(legacy
+        .iter()
+        .all(|key| fs::metadata(key).unwrap().len() < window));
+    let headers = codex_file_join::header_cache_tests::READ_CALLS.with(Cell::get);
+    let samples = START_IDENTITY_SAMPLE_FOR_TEST.with(Cell::get);
+    let scanner = E2ScanFixture::default();
+    let ((scan, modes), consumed) = oracle::observe_consumed(|| f.page(&scanner));
+    assert_eq!(modes, (0, 1, 0));
+    assert_eq!(
+        consumed,
+        extra.len() as u64,
+        "only the changed unit's Tail is consumed"
+    );
+    assert!(scanner
+        .acquisitions
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|read| read.path == path));
+    assert_eq!(
+        codex_file_join::header_cache_tests::READ_CALLS.with(Cell::get) - headers,
+        1,
+        "only the changed unit reads its owning header"
+    );
+    let sampled = START_IDENTITY_SAMPLE_FOR_TEST.with(Cell::get);
+    assert!(sampled.0 > samples.0);
+    assert_eq!(
+        sampled.1 - samples.1,
+        (sampled.0 - samples.0) * window,
+        "identity samples belong only to the large changed unit, never the Legacy members"
+    );
+    assert!(scan.census_complete, "the mixed page completes");
+    assert!(
+        scan.codex_join_validation.is_some(),
+        "a real checkpoint is required"
+    );
+    assert_eq!(scan.snapshots.len(), 1);
+    assert_eq!(scan.snapshots[0].source_session_id, OTHER);
+    assert!(
+        !scan.pending_finalization.is_empty(),
+        "exercise the checkpoint boundary"
+    );
+    scan.validate_codex_checkpoint()
+        .expect("mixed page must not reject JOINED_MEMBER_CHANGED");
+    assert_eq!(
+        START_IDENTITY_SAMPLE_FOR_TEST.with(Cell::get),
+        sampled,
+        "checkpoint validation must not sample the skipped Legacy group"
+    );
+    f.accept(&scan);
+    f.restore();
+    for key in legacy {
+        assert!(!f.route.index.files[&key].codex_counting_v2);
+    }
+}
+
 /// [money] One changed Legacy head reconstructs, then durable V2 resumes Tail.
 #[test]
 fn codex_legacy_growth_recounts_cold_v2() {
@@ -398,14 +484,14 @@ fn codex_legacy_growth_recounts_cold_v2() {
         let old = codex_usage_occurrence::CodexCounting::take(&mut Dec::new(bytes)).unwrap();
         assert_eq!(Enc::count_write(4096, |out| old.put(out)).unwrap(), bytes);
     }
-    for view in ["1793016000000:none", "1793016000000:v2_marked", "legacy"] {
-        assert!(version::reusable_under_view(
-            &historical_codex::read(Frozen::V2).0,
-            view
-        ));
-        assert!(!version::reusable_under_view(&historical().0, view));
-    }
-    assert!(version::reusable(None, None));
+    let fresh = SnapshotAccumulator::new(SnapshotSource::Codex);
+    assert!(version::reusable(
+        &historical_codex::read(Frozen::V2).0,
+        &fresh
+    ));
+    assert!(!version::reusable(&historical().0, &fresh));
+    let other = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
+    assert!(version::reusable(&other, &other));
     for kind in [Frozen::Legacy, Frozen::V2] {
         let mut f = LegacyFixture::under(kind);
         let extra = codex_lines(2)

@@ -97,20 +97,6 @@ impl Homes {
             .iter()
             .all(|key| index.files.contains_key(key))
     }
-    /// Each removed session's proven owner, else its protected owner.
-    fn removed_owners(&self, index: &ScanIndex) -> BTreeMap<&'static str, String> {
-        [REMOVED_FRESH, REMOVED_OLD]
-            .into_iter()
-            .map(|id| {
-                let entry = &index.files[&local_index_key(&self.path(id))];
-                let owner = proven_owner(entry).map_or_else(
-                    || crate::snapshots::codex_protected_owner(id),
-                    str::to_owned,
-                );
-                (id, owner)
-            })
-            .collect()
-    }
     fn scan(
         &self,
         with_removed: bool,
@@ -358,7 +344,6 @@ struct Drained {
     session: StateV2ColdSession,
     gen1: RouteResult,
     gen1_acked: RouteResult,
-    _owners: BTreeMap<&'static str, String>,
     bytes: [(&'static str, Vec<u8>); 2],
     index: ScanIndex,
     accepted: BTreeMap<String, Accepted>,
@@ -374,7 +359,6 @@ fn drain(row: &str, arm: Arm) -> Drained {
     let mut cache = Arc::new(sampled_scan::SharedCache::default());
     let (first, gen1, gen1_acked) = accepted_generation(row, &h, prior, &cache);
     let removed_keys = h.removed_keys();
-    let _owners = h.removed_owners(&first.index);
     let kept_owners = [MAIN, OTHER, SIDE, GAP]
         .map(|id| local_index_key(&h.c.path(id)))
         .into_iter()
@@ -589,7 +573,6 @@ fn drain(row: &str, arm: Arm) -> Drained {
         session,
         gen1,
         gen1_acked,
-        _owners,
         bytes,
         index,
         accepted,
@@ -997,10 +980,6 @@ fn removed_root_drain_waits_for_the_inventory_hold() {
             h.removed_indexed(&first.index),
             "{arm}: keys under the canonical root"
         );
-        let _owners = h
-            .removed_owners(&first.index)
-            .into_values()
-            .collect::<BTreeSet<_>>();
         let roots = if arm == "configured-missing" {
             fs::rename(&h.removed, &h.parked).unwrap();
             &with

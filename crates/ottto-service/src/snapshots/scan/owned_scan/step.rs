@@ -752,7 +752,13 @@ impl OwnedSourceScan {
                         }
                         semantic_noop_count += members;
                         census.note_codex_group(CodexSelection::GroupUnchanged, members);
-                        if !boot.independent() {
+                        if !boot.independent()
+                            && boot
+                                .group
+                                .members
+                                .iter()
+                                .all(|member| !member.opened_object_identity.is_empty())
+                        {
                             codex_join_completed.push(boot.group);
                         }
                         pending!();
@@ -814,7 +820,7 @@ impl OwnedSourceScan {
                         // The match re-reads two samples of the live member.
                         codex_page.charge(false, sampled_scan::codex_cursor::SAMPLE_READ_BYTES);
                         let hit = boot
-                            .memo_digest(index, &codex_title_metadata)
+                            .memo_digest(&codex_title_metadata)
                             .zip(live_file.as_ref())
                             .and_then(|(digest, file)| {
                                 entry.matches_stamp(
@@ -1684,8 +1690,6 @@ impl OwnedSourceScan {
                         claude_effort_support_dir_ref,
                     )
                     .map(|dependency| context.file_scope(source, &active.candidate, &dependency));
-                    let counting_now =
-                        sampled_scan::codex_cursor::job_counting_view(&active, index);
                     let group_scope_now = sampled_scan::codex_cursor::group_scope();
                     let census_trusted = state_census_complete
                         && sidecar_census_complete
@@ -1706,7 +1710,6 @@ impl OwnedSourceScan {
                         codex_cursor_lease.take(),
                         &mut active,
                         current_scope.as_ref(),
-                        &counting_now,
                         &group_scope_now,
                         census_trusted,
                     ) {
@@ -1854,7 +1857,6 @@ impl OwnedSourceScan {
                             codex_join_inventory.as_ref(),
                             &active.candidate.path,
                         ),
-                        &sampled_scan::codex_cursor::counting_view(&active.candidate, index),
                     )?;
                     let sidecar = sampled_scan::codex_cursor::sidecar_wakes(
                         &active.parser.accumulator,
@@ -4264,7 +4266,6 @@ impl OwnedSourceScan {
                                 codex_join_inventory.as_ref(),
                                 &candidate.path,
                             ),
-                            &sampled_scan::codex_cursor::counting_view(&candidate, index),
                         )
                     });
                     let hit = digest.as_deref().and_then(|digest| {

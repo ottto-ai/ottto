@@ -48,9 +48,8 @@ pub(in crate::snapshots) struct CodexCounting {
     evidence: AckEvidence,
     cutover_unix_ms: Option<i64>,
     version: Option<CountingVersion>,
-    /// Boxed: a Legacy decision keeps only the pointer slot until its first
-    /// counted UI line, then only the repeat gate's state. The version, never
-    /// this slot, decides V2.
+    /// Boxed reduction state. Historical absent and Legacy slots still decode;
+    /// new parses always allocate the V2 reducer.
     reducer: Option<Box<OccurrenceReducer>>,
 }
 
@@ -62,10 +61,6 @@ impl CodexCounting {
             version: Some(CountingVersion::V2),
             reducer: Some(Box::default()),
         }
-    }
-
-    pub(in crate::snapshots) fn is_v2(&self) -> bool {
-        self.version == Some(CountingVersion::V2)
     }
 
     /// Local, content-free receipts for the diagnostics owner to fold in

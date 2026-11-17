@@ -8,9 +8,9 @@ mod group_job;
 mod independent_fold;
 pub(super) use custody::{fan_out_body_witnesses, fan_out_offered_to_aliases};
 pub(super) use group_job::{
-    disclose_members, disclose_strict, end_group, group_counting_is_v2, job_key, rearm_unsettled,
-    refusal_disclosure, refuse_independent, step_group, take_charge, Boot, EndInputs, GroupBoot,
-    GroupEnd, GroupJob, GroupStep, JobInputs, StepInputs,
+    disclose_members, disclose_strict, end_group, job_key, rearm_unsettled, refusal_disclosure,
+    refuse_independent, step_group, take_charge, Boot, EndInputs, GroupBoot, GroupEnd, GroupJob,
+    GroupStep, JobInputs, StepInputs,
 };
 pub(super) use independent_fold::fold as fold_independent;
 
@@ -1480,17 +1480,15 @@ impl TierReplay {
         }
     }
     /// S10: the parser admitted usage from `value` (after actual admission),
-    /// under the accumulator's counting version `v2`.
+    /// under V2 turn binding.
     pub(super) fn admitted_usage(
         &mut self,
         value: &Value,
         from_last: bool,
         identity: Option<&str>,
         turn: Option<&str>,
-        v2: bool,
     ) {
         if let Some(join) = self.join.as_mut() {
-            join.decide_v2(v2);
             join.admitted_usage(value, from_last, identity, turn);
         }
     }
@@ -1535,9 +1533,6 @@ pub(super) enum JoinRefusal {
     Corrupt,
     CumulativeOnly,
     UiShape,
-    UiOnlyMember,
-    UiUnmatched,
-    UiRepeatUnproven,
     OrdinalRestart,
     HistoryBase,
     AmbiguousPredecessor,
@@ -1557,14 +1552,7 @@ impl JoinRefusal {
     /// Growth of the live member may cure these (§d.4). Every other reason,
     /// and any reason whose first failing member is sealed, is append-incurable.
     pub(super) fn append_curable(self) -> bool {
-        matches!(
-            self,
-            Self::Gap
-                | Self::UiOnlyMember
-                | Self::UiUnmatched
-                | Self::UiRepeatUnproven
-                | Self::V2UiOnlyTurn
-        )
+        matches!(self, Self::Gap | Self::V2UiOnlyTurn)
     }
 }
 crate::heap_layout_bound::no_heap!(true; JoinRefusal);
@@ -1610,10 +1598,6 @@ struct MemberState {
     natives: u64,
     admissions: u64,
     last_after: Option<Tokens>,
-    balance: BTreeMap<Tokens, i64>,
-    repeat: BTreeMap<Tokens, u64>,
-    last_admitted: Option<Tokens>,
-    native_since_admit: bool,
     usage_shaped: bool,
     next_ordinal: Option<u64>,
     last_ordinal: Option<u64>,
@@ -1652,11 +1636,10 @@ fn independent_fork_references_prefix(value: &Value, meta: &Value, owner: &str) 
 /// The group proof, fed inside the one native replay: the native side in
 /// `TierReplay::observe`, the UI side by the parser admission tap (S10)
 /// after actual admission. It moves from member to member with the replay.
-/// Only compact identities, counters and per-member tuple balances are kept.
+/// Only compact identities, counters and per-member ordinal witnesses are kept.
 #[derive(Clone, Debug)]
 pub(super) struct StreamProof {
     owner: String,
-    v2: bool,
     independent: bool,
     independent_placement: Option<Option<(String, String)>>,
     independent_classification: Option<(Option<String>, Option<String>, Option<String>)>,
@@ -1691,7 +1674,7 @@ fn proof_tree_bytes<K, V>(len: usize) -> Option<usize> {
 }
 
 impl crate::heap_layout_bound::HeapLayoutBound for StreamProof {
-    // Fixed visits per walk: the compact sets and balance maps are charged by
+    // Fixed visits per walk: the compact sets are charged by
     // length (`proof_tree_bytes`), never element by element, so a large
     // group stays within one walk's visit limit and its bytes are counted.
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
@@ -1702,8 +1685,6 @@ impl crate::heap_layout_bound::HeapLayoutBound for StreamProof {
         self.seen.heap_bound(c)?;
         self.member.starts.heap_bound(c)?;
         let trees = [
-            proof_tree_bytes::<Tokens, i64>(self.member.balance.len())?,
-            proof_tree_bytes::<Tokens, u64>(self.member.repeat.len())?,
             proof_tree_bytes::<u64, ()>(self.responses.len())?,
             proof_tree_bytes::<u64, ()>(self.ui.len())?,
             proof_tree_bytes::<u64, ()>(self.native_turns.len())?,
@@ -1718,10 +1699,9 @@ impl crate::heap_layout_bound::HeapLayoutBound for StreamProof {
 }
 
 impl StreamProof {
-    pub(super) fn new(owner: String, v2: bool, plans: Vec<MemberPlan>) -> Self {
+    pub(super) fn new(owner: String, plans: Vec<MemberPlan>) -> Self {
         Self {
             owner,
-            v2,
             independent: false,
             independent_placement: None,
             independent_classification: None,
@@ -1742,7 +1722,7 @@ impl StreamProof {
     }
 
     fn independent(owner: String, members: usize) -> Self {
-        let mut proof = Self::new(owner, false, vec![MemberPlan::default(); members]);
+        let mut proof = Self::new(owner, vec![MemberPlan::default(); members]);
         proof.independent = true;
         proof
     }
@@ -1939,23 +1919,10 @@ impl StreamProof {
         let member = &mut self.member;
         member.last_after = Some(after);
         member.natives += 1;
-        member.native_since_admit = true;
-        let balance = member.balance.entry(usage).or_default();
-        *balance += 1;
-        if *balance == 0 {
-            member.balance.remove(&usage);
-        }
         if let Some(turn) = self.turn {
             self.native_turns.insert(turn);
         }
         Ok(())
-    }
-
-    /// The replay's counting version (§k.3), decided by the accumulator on
-    /// the session's first owned record, which precedes every admission and
-    /// member end; until then the value given at construction stands.
-    pub(super) fn decide_v2(&mut self, v2: bool) {
-        self.v2 = v2;
     }
 
     /// S10: the parser admitted UI usage from this record. `from_last` is
@@ -1994,37 +1961,21 @@ impl StreamProof {
         if self.independent {
             return Ok(());
         }
-        let tokens = codex_last_usage_root(value)
+        codex_last_usage_root(value)
             .and_then(Tokens::read)
             .ok_or(JoinRefusal::UiShape)?;
-        if self.v2 {
-            // §k.3 interim: admissions are not money under V2. Only turn
-            // binding is recorded; the group is held at its end otherwise.
-            match turn {
-                Some(turn) => {
-                    self.ui_turns.insert(compact(b"t:", turn));
-                }
-                None => self.unbound_ui = true,
+        match turn {
+            Some(turn) => {
+                self.ui_turns.insert(compact(b"t:", turn));
             }
-            return Ok(());
+            None => self.unbound_ui = true,
         }
-        let member = &mut self.member;
-        let balance = member.balance.entry(tokens).or_default();
-        *balance -= 1;
-        if *balance == 0 {
-            member.balance.remove(&tokens);
-        }
-        if member.last_admitted == Some(tokens) && !member.native_since_admit {
-            *member.repeat.entry(tokens).or_default() += 1;
-        }
-        member.last_admitted = Some(tokens);
-        member.native_since_admit = false;
         Ok(())
     }
 
     /// Member EOF at physical offset `end`: duplicate-origin stubs must be
     /// neutral, and every UI admission must be backed by a native of the
-    /// same tuple in the same member (Legacy).
+    /// same turn in the group (V2).
     pub(super) fn end_member(&mut self, end: u64) {
         if self.independent {
             return;
@@ -2036,24 +1987,6 @@ impl StreamProof {
         let stub = self.plans.get(self.position).is_some_and(|plan| plan.stub);
         if stub && (member.usage_shaped || member.natives > 0 || member.admissions > 0) {
             self.refuse(JoinRefusal::OrdinalRestart);
-            return;
-        }
-        if !self.v2 && member.balance.values().any(|balance| *balance < 0) {
-            let reason = if member.natives == 0 {
-                JoinRefusal::UiOnlyMember
-            } else if member
-                .balance
-                .iter()
-                .filter(|(_, balance)| **balance < 0)
-                .all(|(tokens, balance)| {
-                    balance.unsigned_abs() <= member.repeat.get(tokens).copied().unwrap_or(0)
-                })
-            {
-                JoinRefusal::UiRepeatUnproven
-            } else {
-                JoinRefusal::UiUnmatched
-            };
-            self.refuse(reason);
             return;
         }
         if let Some(after) = member.last_after {
@@ -2068,7 +2001,7 @@ impl StreamProof {
 
     /// After the last member: the §k.3 interim V2 hold.
     pub(super) fn finish_group(&mut self) {
-        if self.refusal.is_some() || !self.v2 {
+        if self.refusal.is_some() || self.independent {
             return;
         }
         if self.unbound_ui {
@@ -5729,18 +5662,18 @@ pub(super) mod tests {
     /// Feed members in order through one `StreamProof`, with the parser's
     /// S10 tap after every UI usage record.
     pub(crate) fn stream(members: &[Vec<Value>]) -> Option<(JoinRefusal, usize)> {
-        let mut proof = StreamProof::new(
-            OWNER.into(),
-            false,
-            vec![MemberPlan::default(); members.len()],
-        );
+        let mut proof = StreamProof::new(OWNER.into(), vec![MemberPlan::default(); members.len()]);
         for (position, rows) in members.iter().enumerate() {
             proof.begin_member(position);
+            let mut turn = None;
             for row in rows {
+                if row["payload"]["type"] == "task_started" {
+                    turn = row["payload"]["turn_id"].as_str();
+                }
                 proof.observe(row);
                 if codex_last_usage(row).is_some() {
                     let identity = codex_usage_event_identity(row);
-                    proof.admitted_usage(row, true, identity.as_deref(), None);
+                    proof.admitted_usage(row, true, identity.as_deref(), turn);
                 }
             }
             proof.end_member(0);
@@ -5784,7 +5717,7 @@ pub(super) mod tests {
         assert_eq!(stream(&[a, b]), Some((JoinRefusal::Overlap, 1)));
     }
     #[test]
-    fn missing_owner_native_fields_or_ui_coverage_is_not_accepted() {
+    fn missing_owner_or_native_fields_are_not_accepted() {
         let rows = member(OWNER, "response", 100, 100);
         for field in ["thread_id", "response_id", "usage", "thread_token_usage"] {
             let mut changed = rows.clone();
@@ -5795,9 +5728,6 @@ pub(super) mod tests {
                 "{field}"
             );
         }
-        let mut changed = rows;
-        changed[4]["payload"]["info"]["last_token_usage"] = usage(200);
-        assert_eq!(stream(&[changed]), Some((JoinRefusal::UiUnmatched, 0)));
     }
 }
 

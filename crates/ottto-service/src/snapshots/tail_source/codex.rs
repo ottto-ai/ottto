@@ -484,10 +484,7 @@ impl TailSource for Codex {
         if stored.codex_sidecar_binding != live.codex_sidecar_binding {
             return Err(incompatible(INCOMPATIBLE_SIDECAR_BINDING));
         }
-        if !sources::codex::counting::version::reusable(
-            stored.codex_counting.as_deref(),
-            live.codex_counting.as_deref(),
-        ) {
+        if !sources::codex::counting::version::reusable(stored, live) {
             return Err(incompatible(INCOMPATIBLE_COUNTING_VERSION));
         }
         // A stored read that dropped its witnesses cannot show its decisions
