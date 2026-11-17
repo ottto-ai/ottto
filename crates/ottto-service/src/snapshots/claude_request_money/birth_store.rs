@@ -937,15 +937,15 @@ mod tests {
         index
             .claude_money_birth_store
             .record_observation("session", a, 100);
-        index.save(&file).unwrap();
-        let mut loaded = ScanIndex::load(&file).unwrap();
+        index.save_fixture(&file).unwrap();
+        let mut loaded = crate::snapshots::e2_pipeline_scan_fixture::cold_restart(index);
         assert_eq!(
             loaded.claude_money_birth_store.observed_birth("session", a),
             Some(100)
         );
         loaded.files.remove(a);
-        loaded.save(&file).unwrap();
-        let mut loaded = ScanIndex::load(&file).unwrap();
+        loaded.save_fixture(&file).unwrap();
+        let mut loaded = crate::snapshots::e2_pipeline_scan_fixture::cold_restart(loaded);
         assert_eq!(
             loaded
                 .claude_money_birth_store
@@ -983,9 +983,10 @@ mod tests {
             held.claude_money_birth_store.effective_cutoff("session", b),
             Some(100)
         );
+        drop(subset);
         let mut held = held;
-        held.save(&file).unwrap();
-        let loaded = ScanIndex::load(&file).unwrap();
+        held.save_fixture(&file).unwrap();
+        let loaded = crate::snapshots::e2_pipeline_scan_fixture::cold_restart(held);
         assert_eq!(
             loaded.claude_money_birth_store.observed_birth("session", b),
             Some(200)

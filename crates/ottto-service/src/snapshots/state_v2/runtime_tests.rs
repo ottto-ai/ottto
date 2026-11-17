@@ -1595,7 +1595,7 @@ fn bound_v1_load_without_support_adopts_native_custody_before_saving() {
     let mut index = ScanIndex::load(&f.path).unwrap();
     assert!(index.v2().persistence_v2.is_some());
     assert_eq!(index.generation, 1);
-    index.save_native(&f.path).unwrap();
+    index.save(&f.path).unwrap();
     assert_eq!(index.generation, 2);
     assert!(fence::sibling(&f.path, ".v2.sqlite").exists());
     assert_eq!(

@@ -496,22 +496,23 @@ impl ReofferPipeline {
                 &mut self.retry,
             )
         });
-        let progress_json = std::fs::read(&progress_path)
-            .ok()
-            .map(|bytes| serde_json::from_slice(&bytes).unwrap())
-            .unwrap_or(serde_json::Value::Null);
+        let index = ScanIndex::load(&index_path).unwrap();
+        let progress = SnapshotUploadProgress::load_for_index(
+            &index,
+            &index_path,
+            &progress_path,
+            &snapshot_upload_destination_namespace(&self.device, "device-secret"),
+            snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+        )
+        .unwrap();
+        let progress_json = serde_json::to_value(&progress).unwrap();
         CycleResult {
             result,
             census_window_end,
             leased_offers,
             cache_enabled,
-            index: ScanIndex::load(&index_path).unwrap(),
-            progress: SnapshotUploadProgress::load(
-                &progress_path,
-                &snapshot_upload_destination_namespace(&self.device, "device-secret"),
-                snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
-            )
-            .unwrap(),
+            index,
+            progress,
             progress_json,
             progress_path,
             index_path,
@@ -624,7 +625,7 @@ impl ReofferPipeline {
             SnapshotQuarantineDisposition::RetryPending
         );
         record.retry_after_unix_seconds = 0;
-        index.save(&index_path).unwrap();
+        index.save_fixture(&index_path).unwrap();
     }
 }
 
@@ -654,18 +655,6 @@ fn usage_of(offer: &serde_json::Value) -> (u64, u64, u64) {
 
 fn reoffer_json<'a>(cycle: &'a CycleResult, fingerprint: &str) -> &'a serde_json::Value {
     &cycle.progress_json["permanent_rejections"][fingerprint]["reoffer"]
-}
-
-/// Old daemon rewrite: the record keeps `reason: other` and loses the
-/// extension it does not know.
-fn strip_reoffer_extension(path: &Path, fingerprint: &str) {
-    let mut json: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-    json["permanent_rejections"][fingerprint]
-        .as_object_mut()
-        .unwrap()
-        .remove("reoffer");
-    std::fs::write(path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
 }
 
 /// An unchanged finished session refused for
@@ -818,7 +807,16 @@ fn legacy_other_refusal_is_reclassified_by_one_offer() {
             first.progress_json["permanent_rejections"][&fingerprint]["reason"],
             "other"
         );
-        strip_reoffer_extension(&first.progress_path, &fingerprint);
+        crate::snapshots::state_v2::edit_progress_rows_for_test(
+            &first.index_path,
+            &first.index,
+            |_, _, ledger| {
+                ledger["permanent_rejections"][&fingerprint]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("reoffer");
+            },
+        );
 
         pipeline.server.answer(second_answer);
         let reclassified = pipeline.cycle(t0 + 600);
@@ -981,7 +979,7 @@ fn conflicting_reoffer_keeps_refusal_cooldown_and_follow_up() {
     {
         record.retry_after_unix_seconds = 0;
     }
-    index.save(&index_path).unwrap();
+    index.save_fixture(&index_path).unwrap();
     let quiet = pipeline.cycle(t1 + 3_600);
     assert!(
         quiet.result.is_ok(),
@@ -1542,7 +1540,7 @@ fn protected_returning_root_emits_no_literal_v1_or_revision_3() {
         ),
         "the stored witness installs"
     );
-    index.save(&first.index_path).unwrap();
+    index.save_fixture(&first.index_path).unwrap();
     let bytes = std::fs::read(&transcript).unwrap();
     std::fs::remove_file(&transcript).unwrap();
     let absent = pipeline.cycle(t0 + 600);
@@ -1894,7 +1892,7 @@ fn history_held_file_is_not_reoffered_and_its_lease_is_not_delivered() {
     // a saved history cutoff at or after every fixture birth.
     let index_path = claude_index_path(&pipeline.support);
     let mut saved: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&index_path).unwrap()).unwrap();
+        serde_json::to_value(ScanIndex::load(&index_path).unwrap()).unwrap();
     let files = saved["files"].as_object_mut().expect("indexed files");
     assert!(!files.is_empty());
     for entry in files.values_mut() {
@@ -1902,7 +1900,10 @@ fn history_held_file_is_not_reoffered_and_its_lease_is_not_delivered() {
     }
     saved["claude_history_cutoff_unix_seconds"] = current_unix_seconds().into();
     saved["claude_history_move_not_full"] = true.into();
-    std::fs::write(&index_path, serde_json::to_vec(&saved).unwrap()).unwrap();
+    crate::snapshots::e2_pipeline_scan_fixture::seed_json_for_test(
+        &index_path,
+        &serde_json::to_vec(&saved).unwrap(),
+    );
     assert!(!reemission_list_path(&pipeline.support).exists(), "no list");
 
     pipeline.server.answer(Answer::Accept);
@@ -1987,7 +1988,9 @@ fn missing_published_index_with_claim_only_ledger_refuses_without_reread() {
     // A settled bootstrap leaves no ledger file. Recreate a claim-only ledger,
     // but keep the real published-root witness: this is loss AFTER publication,
     // not a first install killed before publication.
-    let mut claim = SnapshotUploadProgress::load(
+    let mut claim = SnapshotUploadProgress::load_for_index(
+        &first.index,
+        &first.index_path,
         &first.progress_path,
         &snapshot_upload_destination_namespace(&pipeline.device, "device-secret"),
         snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
@@ -2161,7 +2164,7 @@ fn lost_list_intent_pipeline(name: &str, set: bool, malformed: bool) {
         );
     }
     let index_path = claude_index_path(&pipeline.support);
-    std::fs::write(&index_path, b"{not json").unwrap();
+    crate::snapshots::e2_pipeline_scan_fixture::legacy_input_for_test(&index_path, b"{not json");
     assert!(!reemission_list_path(&pipeline.support).exists());
     assert!(!seen.exists());
     let (second, lines) = crate::local_resource_diagnostics::capture(|| {
@@ -2296,11 +2299,14 @@ fn returning_history_obeys_the_move_hold() {
     assert!(absent.result.is_ok(), "{:?}", absent.result);
     assert!(!absent.index.files.contains_key(&key));
     let mut saved: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&absent.index_path).unwrap()).unwrap();
+        serde_json::to_value(ScanIndex::load(&absent.index_path).unwrap()).unwrap();
     std::fs::write(&transcript, &bytes).unwrap();
     saved["claude_history_cutoff_unix_seconds"] = current_unix_seconds().into();
     saved["claude_history_move_not_full"] = true.into();
-    std::fs::write(&absent.index_path, serde_json::to_vec(&saved).unwrap()).unwrap();
+    crate::snapshots::e2_pipeline_scan_fixture::seed_json_for_test(
+        &absent.index_path,
+        &serde_json::to_vec(&saved).unwrap(),
+    );
     assert!(!reemission_list_path(&pipeline.support).exists());
     let offered_before = pipeline.server.offered().len();
 
@@ -2326,13 +2332,12 @@ fn returning_history_obeys_the_move_hold() {
     std::fs::write(api, b"{ malformed synthetic proof\n").unwrap();
     std::fs::write(&transcript, bytes).unwrap();
     let mut saved: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&absent_again.index_path).unwrap()).unwrap();
+        serde_json::to_value(ScanIndex::load(&absent_again.index_path).unwrap()).unwrap();
     saved["claude_history_cutoff_unix_seconds"] = current_unix_seconds().into();
-    std::fs::write(
+    crate::snapshots::e2_pipeline_scan_fixture::seed_json_for_test(
         &absent_again.index_path,
-        serde_json::to_vec(&saved).unwrap(),
-    )
-    .unwrap();
+        &serde_json::to_vec(&saved).unwrap(),
+    );
     let returned = pipeline.cycle(t0 + 2_400);
     assert!(returned.result.is_ok(), "{:?}", returned.result);
     // (b) The #712 hold still withholds the body: nothing uploaded, nothing
@@ -2347,7 +2352,7 @@ fn returning_history_obeys_the_move_hold() {
         0
     );
     let saved: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&returned.index_path).unwrap()).unwrap();
+        serde_json::to_value(ScanIndex::load(&returned.index_path).unwrap()).unwrap();
     assert_eq!(
         saved["claude_history_move_not_full"].as_bool(),
         Some(true),
@@ -2364,7 +2369,7 @@ fn returning_history_obeys_the_move_hold() {
     let claimed = pipeline.cycle(t0 + 3_000);
     assert!(claimed.result.is_ok(), "{:?}", claimed.result);
     let saved: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&claimed.index_path).unwrap()).unwrap();
+        serde_json::to_value(ScanIndex::load(&claimed.index_path).unwrap()).unwrap();
     assert!(
         saved.get("claude_history_move_not_full").is_none(),
         "the full claim clears the move hold"
@@ -2528,7 +2533,7 @@ fn force_held_file_parse(cycle: &mut CycleResult) {
         entry.last_snapshot_fingerprint = None;
         entry.last_upload_body_witness = None;
     }
-    cycle.index.save(&cycle.index_path).unwrap();
+    cycle.index.save_fixture(&cycle.index_path).unwrap();
 }
 
 /// [regress] Real finalization records a cache-bearing body before bootstrap;
@@ -2797,7 +2802,7 @@ fn seed_legacy_probe_file(pipeline: &mut ReofferPipeline, now: u64) -> (CycleRes
         entry.last_upload_body_witness = Some(body_set(&full));
         entry.upload_context_receipt = None;
     }
-    cycle.index.save(&cycle.index_path).unwrap();
+    cycle.index.save_fixture(&cycle.index_path).unwrap();
     (cycle, probe)
 }
 
@@ -2942,7 +2947,7 @@ fn upload_outage_keeps_the_read_and_resends_from_the_head() {
                 .get_mut(&fingerprint)
             {
                 record.retry_after_unix_seconds = 0;
-                index.save(&first.index_path).unwrap();
+                index.save_fixture(&first.index_path).unwrap();
             }
             pipeline.server.answer(Answer::Accept);
             let (recovery, _, bytes) = {

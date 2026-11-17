@@ -5,17 +5,14 @@
 use crate::snapshots::*;
 
 impl ScanIndex {
-    #[cfg(not(test))]
     pub fn save(&mut self, path: &Path) -> Result<()> {
         self.save_internal(path, None, false)
     }
-    #[cfg(not(test))]
     pub(crate) fn save_with_read_limit(&mut self, path: &Path, cap: usize) -> Result<()> {
         self.save_internal(path, Some(cap), false)
     }
     /// A save while the caller holds the source's progress owner, which a
     /// routed save never takes itself: owner, then CheckpointLock.
-    #[cfg(not(test))]
     pub(crate) fn save_with_progress_owner(
         &mut self,
         path: &Path,

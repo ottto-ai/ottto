@@ -293,7 +293,7 @@ impl Disk {
         index: &mut ScanIndex,
     ) -> ScanIndex {
         let path = self.path(source);
-        index.save(path).unwrap();
+        index.save_fixture(path).unwrap();
         crate::snapshots::after_source_save(cache, &self.dir, source, index, path);
         ScanIndex::load(path).unwrap()
     }
@@ -3557,7 +3557,11 @@ fn stray_row_echo_ack(
     let asked =
         serde_json::to_value(request(batch))?["cache_state_ack_contract"] == "cache_state_ack:v1";
     let mut response = ack(batch)?;
-    for (reference, item) in response.accepted_entities.iter_mut().zip(batch.iter().copied()) {
+    for (reference, item) in response
+        .accepted_entities
+        .iter_mut()
+        .zip(batch.iter().copied())
+    {
         let Some(state) = item.cache_observations_state.as_ref() else {
             continue;
         };

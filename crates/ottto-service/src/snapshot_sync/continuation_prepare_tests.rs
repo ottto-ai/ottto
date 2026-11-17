@@ -76,16 +76,18 @@ impl ContinuationFixture {
 
     fn load(&self) -> (SnapshotUploadProgress, ScanIndex) {
         let source = SnapshotSource::Codex;
-        let progress = SnapshotUploadProgress::load(
-            &self.upload_progress_path,
-            CONTINUATION_NAMESPACE,
-            snapshot_quarantine_witness(source),
-        )
-        .unwrap();
         let (index, _) = ScanIndex::load_for_snapshot_source_with_origin(
             &self.index_path,
             source,
             &self.support_dir,
+        )
+        .unwrap();
+        let progress = SnapshotUploadProgress::load_for_index(
+            &index,
+            &self.index_path,
+            &self.upload_progress_path,
+            CONTINUATION_NAMESPACE,
+            snapshot_quarantine_witness(source),
         )
         .unwrap();
         (progress, index)
@@ -118,7 +120,7 @@ impl ContinuationFixture {
                 window_start_unix_seconds: now.saturating_sub(30 * 86_400),
             }),
         );
-        index.save(&self.index_path).unwrap();
+        index.save_fixture(&self.index_path).unwrap();
         progress.save(&self.upload_progress_path).unwrap();
     }
 
@@ -126,6 +128,8 @@ impl ContinuationFixture {
     fn disk(&self) -> Vec<Option<Vec<u8>>> {
         [
             self.index_path.clone(),
+            self.index_path.with_extension("json.v2.sqlite"),
+            self.index_path.with_extension("json.v2.sqlite-wal"),
             self.upload_progress_path.clone(),
             crate::backfill::backfill_state_path(&self.support_dir),
         ]
@@ -597,7 +601,7 @@ fn a_pending_admission_reoffer_refuses_the_continuation_prepare() {
     );
     // The ordinary prepare's arming and save.
     assert!(index.prepare_snapshot_admission_reoffer(SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE));
-    index.save(&fixture.index_path).unwrap();
+    index.save_fixture(&fixture.index_path).unwrap();
     assert!(fixture.load().1.snapshot_admission_reoffer_pending());
     fixture.assert_refused(ContinuationRefusal::AdmissionReoffer);
 }
@@ -614,7 +618,7 @@ fn a_pending_legacy_settlement_refuses_the_continuation_prepare() {
     let mut index: ScanIndex = serde_json::from_value(value).unwrap();
     assert!(index.legacy_settlement_ledger_needs_migration());
     assert!(!index.snapshot_admission_reoffer_pending());
-    index.save(&fixture.index_path).unwrap();
+    index.save_fixture(&fixture.index_path).unwrap();
     assert!(fixture.load().1.legacy_settlement_ledger_needs_migration());
     fixture.assert_refused(ContinuationRefusal::LegacySettlement);
 }
@@ -679,7 +683,7 @@ fn a_due_reason_reoffer_refuses_the_continuation_prepare() {
             }),
         },
     );
-    index.save(&fixture.index_path).unwrap();
+    index.save_fixture(&fixture.index_path).unwrap();
     progress.save(&fixture.upload_progress_path).unwrap();
     let (progress, index) = fixture.load();
     assert!(!index.snapshot_admission_reoffer_pending());

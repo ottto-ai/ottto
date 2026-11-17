@@ -1282,7 +1282,7 @@ fn refused_holder_mark_survives_progress_only_crash() {
             "2026-08-02T07:03:00Z",
         );
         let index_path = c.base.join("scan-index.json");
-        ScanIndex::default().save(&index_path).unwrap();
+        ScanIndex::default().save_fixture(&index_path).unwrap();
         let mut ledger = Ledger::new();
         let progress_path = c.base.join("progress.json");
         {

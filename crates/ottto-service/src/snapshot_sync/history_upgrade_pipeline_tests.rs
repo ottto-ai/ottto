@@ -414,7 +414,7 @@ impl HistoryFixture {
             &scan.snapshots,
             &acks,
         );
-        index.save(&index_path).expect("save scan index");
+        index.save_fixture(&index_path).expect("save scan index");
         HistoryOutcome {
             scan,
             index: ScanIndex::load(&index_path).expect("reload scan index"),
@@ -680,7 +680,7 @@ fn rearmed_unchanged_history_is_held_and_settles() {
         entry.source_file_fingerprint.clear();
     }
     baseline
-        .save(&fixture.index_path)
+        .save_fixture(&fixture.index_path)
         .expect("save re-armed index");
     fixture.corrupt_backfill_state();
     crate::snapshots::with_no_list_cutoff(u64::MAX, || {
@@ -871,7 +871,7 @@ fn user_repair_override_carries_accepted_history_through_census_and_release() {
         )
         .unwrap()
         .1,
-        crate::snapshots::ScanIndexLoadOrigin::Loaded
+        crate::snapshots::ScanIndexLoadOrigin::Quarantined
     );
     // Seed ACKs RIGHT BEFORE damage/override. No intervening rebuild or settlement.
     seed_json_for_test(&fixture.index_path, &serde_json::to_vec(&baseline).unwrap());
@@ -986,7 +986,7 @@ fn user_repair_carried_history_vanished_file_releases_at_healthy_terminal() {
         )
         .unwrap()
         .1,
-        crate::snapshots::ScanIndexLoadOrigin::Loaded
+        crate::snapshots::ScanIndexLoadOrigin::Quarantined
     );
     // Seed ACKs RIGHT BEFORE damage/override. No intervening rebuild or settlement.
     seed_json_for_test(&fixture.index_path, &serde_json::to_vec(&baseline).unwrap());
@@ -1158,7 +1158,7 @@ fn a_re_owed_file_goes_back_through_the_gate() {
         }
         assert_eq!(history_local_count(HistoryLocalCount::Reowed), reowed + 2);
         index
-            .save(&fixture.index_path)
+            .save_fixture(&fixture.index_path)
             .expect("save re-owed stamps");
         fixture.install_list(&[HISTORY_SESSIONS[0]]);
         let again = fixture.cycle("2026-08-02T10:00:00Z", revision_3);
@@ -1320,7 +1320,8 @@ fn unreadable_backfill_state_emits_no_history_from_a_rebuilt_index() {
         if quarantine {
             fixture.corrupt_index();
         } else {
-            std::fs::remove_file(&fixture.index_path).expect("lose the index");
+            crate::snapshots::e2_pipeline_scan_fixture::discard_store_for_test(&fixture.index_path);
+            assert!(!fixture.index_path.exists(), "lose the index");
         }
         for hour in [9, 10] {
             let outcome = fixture.cycle(
@@ -2416,7 +2417,7 @@ fn e2_switch_on_rereads_history_once_paced_and_money_rules_reread_only_marked_fi
     use crate::snapshots::claude_request_money::e2::{money_mark, with_money_rules};
     use crate::snapshots::{history_local_count, HistoryLocalCount};
     // Version 2 is #825's zero-mask row, kept for version stability.
-    const RELEASE: &[(u16, u8)] = &[(1, 0), (2, 0), (6, money_mark::ESTIMATED)];
+    const RELEASE: &[(u16, u8)] = &[(1, 0), (2, 0), (5, money_mark::ESTIMATED)];
     let fixture = HistoryFixture::new("e2-switch-on-once");
     let at_two = fixture.baseline_at(2);
     assert!(at_two
@@ -2448,7 +2449,7 @@ fn e2_switch_on_rereads_history_once_paced_and_money_rules_reread_only_marked_fi
             assert!(again.uploaded.is_empty());
             let index = &again.index;
             let store = &index.claude_money_birth_store;
-            assert_eq!(store.money_rule_version(), 5);
+            assert_eq!(store.money_rule_version(), 4);
             let estimated = money_mark::DISCLOSED | money_mark::ESTIMATED;
             for (session, marks) in
                 HISTORY_SESSIONS
@@ -2473,7 +2474,7 @@ fn e2_switch_on_rereads_history_once_paced_and_money_rules_reread_only_marked_fi
                     .iter()
                     .all(|(uploaded, _)| !uploaded.contains(HISTORY_SESSIONS[0])));
                 let index = &done.index;
-                assert_eq!(index.claude_money_birth_store.money_rule_version(), 6);
+                assert_eq!(index.claude_money_birth_store.money_rule_version(), 5);
                 assert!(index
                     .files
                     .values()
@@ -2982,7 +2983,7 @@ fn e2_always_on_contract_reowes_no_uncaptured_history() {
             .money_marks(location_key(&marked));
         old.claude_money_birth_store
             .set_money_marks(&marked, kept | RETIRED_PERMIT_MARK);
-        old.save(&fixture.index_path).unwrap();
+        old.save_fixture(&fixture.index_path).unwrap();
         let mut saved = serde_json::to_value(&old).unwrap();
         saved["claude_request_identity_contract"] = serde_json::json!("");
         seed_json_for_test(&fixture.index_path, &serde_json::to_vec(&saved).unwrap());
@@ -3070,7 +3071,7 @@ fn e2_restamp_carries_the_retired_permit_bit() {
             );
             old.claude_money_birth_store
                 .set_money_marks(&marked, RETIRED_PERMIT_MARK);
-            old.save(&fixture.index_path).unwrap();
+            old.save_fixture(&fixture.index_path).unwrap();
             let before = old.files[&marked].source_file_fingerprint.clone();
             fixture.append(HISTORY_SESSIONS[0], "req_0_2");
             let page = fixture.cycle("2026-08-02T09:00:00Z", cycle);

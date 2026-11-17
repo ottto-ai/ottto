@@ -1902,7 +1902,7 @@ fn h360_restart_restores_held_probe_quarantine_from_index_and_retries_when_due()
     let probes = items(1);
     let fp = probes[0].snapshot_fingerprint.clone();
     let body = snapshot_upload_body_witness(&probes[0]);
-    let dir = std::env::temp_dir().join(format!(
+    let dir = std::env::temp_dir().canonicalize().unwrap().join(format!(
         "ottto-h360-restore-{}-{}",
         std::process::id(),
         current_unix_seconds()
@@ -1918,7 +1918,9 @@ fn h360_restart_restores_held_probe_quarantine_from_index_and_retries_when_due()
         .file_snapshot_fingerprints
         .insert("synthetic/held.jsonl".into(), BTreeSet::from([fp.clone()]));
     index.retain_quarantined_fingerprints(&ledger.quarantined_fingerprints);
-    index.save(&index_path).unwrap();
+    index
+        .save_fixture_for_source(&index_path, SnapshotSource::Codex)
+        .unwrap();
     ledger.save(&progress_path).unwrap();
     ledger.finish_cycle(&progress_path).unwrap();
     let loaded = ScanIndex::load(&index_path).unwrap();

@@ -326,7 +326,7 @@ fn unbound_semantic_repairs_cannot_replace_the_legacy_input() {
     let (mut repaired, drops) = lc_assert_kept(&scratch, load);
     assert_eq!(drops.activity, 1);
     let generation = repaired.generation;
-    let error = repaired.save_native(&path).unwrap_err();
+    let error = repaired.save(&path).unwrap_err();
     assert_eq!(
         error.downcast_ref::<state_v2::Hold>(),
         Some(&state_v2::Hold::ForeignBinding)

@@ -183,7 +183,7 @@ impl Corpus {
             self.base.join(name).parent().unwrap(),
             &e2_progress().destination_namespace_hash,
         );
-        index.save(&path).unwrap();
+        index.save_fixture(&path).unwrap();
         ScanIndex::load(&path).unwrap()
     }
 }
@@ -1050,6 +1050,16 @@ fn assert_mode(actual: (usize, usize, usize), expected: (usize, usize, usize)) {
         crate::heap_layout_bound::layout_supported()
     );
 }
+/// Continue on the same committed route after discarding process state; a new
+/// scanner must not publish the restored graph onto another fixture route.
+fn cold_ready(c: &Corpus, prior: ScanIndex, limit: usize, sampled: bool) -> Page {
+    let index = cold_restart(prior);
+    let scanner = E2ScanFixture::default();
+    scanner
+        .on_committed_route(&crate::snapshots::e2_pipeline_scan_fixture::route_of(&index).unwrap());
+    ready(c, &scanner, index, limit, sampled)
+}
+
 fn ready(
     corpus: &Corpus,
     scanner: &E2ScanFixture,
@@ -1192,13 +1202,7 @@ fn e2_pipeline_full_tail_unchanged_eviction_and_restart_are_cumulative() {
         );
         let oracle_bytes = canonical(&oracle.scan.snapshots);
         drop((first, full, tail, unchanged, evicted, oracle));
-        let restarted = ready(
-            &c,
-            &E2ScanFixture::default(),
-            cold_restart(prior),
-            100,
-            true,
-        );
+        let restarted = cold_ready(&c, prior, 100, true);
         assert_mode(restarted.modes, (1, 0, 0));
         assert_eq!(canonical(&restarted.scan.snapshots), oracle_bytes);
     });
@@ -1494,13 +1498,7 @@ fn e2_pipeline_unlisted_twin_resume_counts_copied_requests_once() {
             );
             let tail_money = sent_money(&tail);
             drop(tail);
-            let restarted = ready(
-                &c,
-                &E2ScanFixture::default(),
-                cold_restart(prior),
-                100,
-                true,
-            );
+            let restarted = cold_ready(&c, prior, 100, true);
             let mut cold = Corpus::new(&format!("{name}-cold"));
             for (folder, _, _, birth) in &files {
                 let relative = format!("{folder}/{ROOT}.jsonl");
@@ -2245,9 +2243,10 @@ fn retry_case(conflict: bool) {
         );
         // Production transport-error seam: progress is durable first, then
         // only wholly settled files advance in the partial checkpoint.
-        let progress_path = c.base.join("progress.json");
+        let index_path = crate::snapshots::e2_pipeline_scan_fixture::route_of(&p.index).unwrap();
+        let progress_path = snapshot_upload_progress_path(&index_path);
+        progress = route_fixture_progress(&p.index, &index_path, &progress_path, progress);
         progress.save(&progress_path).unwrap();
-        let index_path = c.base.join("scan-index.json");
         checkpoint_partial_snapshot_index_with_audit_release(
             &p.index,
             &committed,
@@ -2265,7 +2264,9 @@ fn retry_case(conflict: bool) {
         )
         .unwrap();
         let prior = ScanIndex::load(&index_path).unwrap();
-        let mut progress = SnapshotUploadProgress::load(
+        let mut progress = SnapshotUploadProgress::load_for_index(
+            &prior,
+            &index_path,
             &progress_path,
             &format!("{:064x}", 99),
             snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
@@ -3015,6 +3016,7 @@ fn e2_pipeline_uncopied_guard_carried_accounts() {
 fn equal_birth_carrier_never_grandfathers_its_counted_request() {
     use crate::snapshots::claude_money_birth_store::location_key;
     use crate::snapshots::claude_request_census::claude_request_hash;
+    use crate::snapshots::sampled_scan::transition_fixture::with_scan_clock;
 
     with_e2(|| {
         let copied_at = "2026-11-03T07:00:10Z";
@@ -3061,6 +3063,10 @@ fn equal_birth_carrier_never_grandfathers_its_counted_request() {
                 vec![carrier.clone()],
                 "C is discovered first"
             );
+            eprintln!(
+                "counted carrier stage=seed carrier_first={carrier_first} bodies={}",
+                seed.scan.snapshots.len()
+            );
             literal(&seed);
             assert_eq!(total(&seed), 1);
             // Complete upload settlement records acceptance and exact ACK
@@ -3081,6 +3087,10 @@ fn equal_birth_carrier_never_grandfathers_its_counted_request() {
                 );
             }
             let twins = ready(&c, &scanner, prior.clone(), 100, false);
+            eprintln!(
+                "counted carrier stage=twins carrier_first={carrier_first} bodies={}",
+                twins.scan.snapshots.len()
+            );
             literal(&twins);
             assert_eq!(total(&twins), 1);
             assert_eq!(body(&twins, ROOT).unwrap().removed_request_count, Some(1));
@@ -3090,7 +3100,14 @@ fn equal_birth_carrier_never_grandfathers_its_counted_request() {
             // CS1 refreshes the ACK carrier with blank JSONL: unchanged usage
             // acquires the summed body's COPY mark before the own turn grows.
             append(&carrier, "\n");
-            let refreshed = ready(&c, &scanner, prior.clone(), 100, false);
+            let refreshed_at = crate::scan_clock::utc_seconds();
+            let refreshed = with_scan_clock(refreshed_at, || {
+                ready(&c, &scanner, prior.clone(), 100, false)
+            });
+            eprintln!(
+                "counted carrier stage=refreshed carrier_first={carrier_first} bodies={}",
+                refreshed.scan.snapshots.len()
+            );
             literal(&refreshed);
             assert_eq!(
                 snapshot_upload_body_witness(body(&refreshed, ROOT).unwrap()),
@@ -3118,7 +3135,14 @@ fn equal_birth_carrier_never_grandfathers_its_counted_request() {
 
             // Red on main without the counting-holder guard (CS1 run 43868949339).
             append(&carrier, &line(ROOT, "r2", own_at, 20));
-            let grown = ready(&c, &scanner, prior.clone(), 100, false);
+            let grown = with_scan_clock(refreshed_at + 6 * 60 * 60, || {
+                ready(&c, &scanner, prior.clone(), 100, false)
+            });
+            eprintln!(
+                "counted carrier stage=grown carrier_first={carrier_first} bodies={} growth_pacing={:?}",
+                grown.scan.snapshots.len(),
+                crate::snapshots::e2_pipeline_scan_fixture::growth_diagnostics_for_test(&grown.index, &carrier),
+            );
             literal(&grown);
             let root = body(&grown, ROOT).expect("growth emits ROOT");
             assert_eq!(
@@ -3389,11 +3413,7 @@ fn rewritten_original(reverse: bool) {
         let old = ScanIndex::default();
         let first = ready(&c, &scanner, old.clone(), 100, false);
         assert_eq!(total(&first), 2, "h1 once, r2 once");
-        let mut prior = settle(&c, &old, first, &mut progress);
-        // Exercise Local proof after loading older state without receiver rows.
-        // Exact accepted hashes instead survive a semantic no-op rewrite.
-        prior.upload_context_proof.request_contributions.clear();
-        let prior = c.reload(&mut prior);
+        let prior = settle(&c, &old, first, &mut progress);
         let inode = |path: &Path| {
             use std::os::unix::fs::MetadataExt;
             std::fs::metadata(path).unwrap().ino()
@@ -3619,9 +3639,6 @@ fn e2_pipeline_branch_waits_for_an_original_modified_since_its_read() {
         let first = ready(&c, &E2ScanFixture::default(), old.clone(), 100, false);
         assert_eq!(total(&first), 1);
         let mut prior = settle(&c, &old, first, &mut progress);
-        // Keep the Local-only stale-holder control separate from receiver proof.
-        prior.upload_context_proof.request_contributions.clear();
-        prior = c.reload(&mut prior);
         // Same length: h becomes u in place; the clock moves on.
         std::fs::write(&original, line(LATE, "u", AT, 10)).unwrap();
         std::fs::File::options()
@@ -4050,7 +4067,7 @@ fn e2_pipeline_copy_waits_for_a_queued_indexed_holder_without_a_census_record() 
 /// A file whose every response conflicts keeps
 /// a zero-usage carrier that publishes its conflict disclosure through the
 /// literal, ACK and restart path, over an accepted prior body.
-fn conflict_only(subagent: bool) {
+fn conflict_only(subagent: bool, sampled: bool) {
     with_e2(|| {
         let mut c = Corpus::new(&format!("e2-pipeline-conflict-only-{subagent}"));
         let session = if subagent {
@@ -4069,7 +4086,7 @@ fn conflict_only(subagent: bool) {
         let scanner = E2ScanFixture::default();
         let mut progress = e2_progress();
         let old = ScanIndex::default();
-        let accepted = ready(&c, &scanner, old.clone(), 100, false);
+        let accepted = ready(&c, &scanner, old.clone(), 100, sampled);
         let prior_body = body(&accepted, &session).expect("accepted prior body");
         assert_eq!(prior_body.request_count, 1);
         let prior = settle(&c, &old, accepted, &mut progress);
@@ -4080,7 +4097,7 @@ fn conflict_only(subagent: bool) {
             .unwrap()
             .write_all(b.as_bytes())
             .unwrap();
-        let mut conflicted = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
+        let mut conflicted = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, sampled);
         let carrier = body(&conflicted, &session).expect("conflict-only file keeps a carrier");
         assert!(crate::snapshots::claude_request_money::is_request_owned_literal(carrier));
         assert_eq!(carrier.request_count, 0, "no invented tokens");
@@ -4094,14 +4111,21 @@ fn conflict_only(subagent: bool) {
         let bytes = canonical(&conflicted.scan.snapshots);
         // A crash before the ACK: discard the page's uncommitted native state.
         drop(conflicted);
-        let mut restart = ready(
-            &c,
-            &E2ScanFixture::default(),
-            cold_restart(prior),
-            100,
-            false,
-        );
+        let mut restart = cold_ready(&c, prior, 100, sampled);
         restart.finish();
+        if !sampled {
+            assert!(
+                restart.scan.snapshots.is_empty(),
+                "a recent growth Full is paced"
+            );
+            let mut due = c.reload(&mut restart.index);
+            crate::snapshots::e2_pipeline_scan_fixture::expire_claimed_growth_for_test(
+                &mut due, &path,
+            );
+            drop(restart);
+            restart = cold_ready(&c, due, 100, false);
+            restart.finish();
+        }
         assert_eq!(
             canonical(&restart.scan.snapshots),
             bytes,
@@ -4113,11 +4137,18 @@ fn conflict_only(subagent: bool) {
 }
 #[test]
 fn e2_pipeline_root_conflict_only_file_publishes_its_disclosure() {
-    conflict_only(false);
+    conflict_only(false, true);
 }
 #[test]
 fn e2_pipeline_subagent_conflict_only_file_publishes_its_disclosure() {
-    conflict_only(true);
+    conflict_only(true, true);
+}
+
+#[test]
+fn e2_pipeline_unsampled_conflict_carrier_resumes_after_growth_claim_expires() {
+    for subagent in [false, true] {
+        conflict_only(subagent, false);
+    }
 }
 
 // Shared helpers above remain the real scan/evidence/finish/upload callers.

@@ -29,14 +29,6 @@ fn identity_503_paged_ack_terminal_and_successor_custody() {
         .unwrap();
     }
     let destination = snapshot_upload_destination_namespace(&home.device, "device-secret");
-    let reload = |path: &Path| {
-        SnapshotUploadProgress::load(
-            path,
-            &destination,
-            snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
-        )
-        .unwrap()
-    };
     let prepare = |home: &mut AckFinishHome| {
         crate::snapshots::OwnedSourceScan::with_oracle_schedule(Some((1, false)), || {
             home.prepare_raw()
@@ -52,6 +44,17 @@ fn identity_503_paged_ack_terminal_and_successor_custody() {
     assert_eq!(scan.snapshots[0].source_session_id, IDENTITY_PIPELINE_ROOT);
     let initial_fp = scan.snapshots[0].snapshot_fingerprint.clone();
     let progress_path = preparation.upload_progress_path.clone();
+    let index_path = preparation.index_path.clone();
+    let reload = |path: &Path| {
+        SnapshotUploadProgress::load_for_index(
+            &ScanIndex::load(&index_path).unwrap(),
+            &index_path,
+            path,
+            &destination,
+            snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+        )
+        .unwrap()
+    };
     server
         .script
         .lock()

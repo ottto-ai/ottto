@@ -610,7 +610,7 @@ fn upload_context_receipt_survives_restart() {
     );
     assert!(counts.local_bytes <= size);
     let saved_path = f._scratch.join("restart-index.json");
-    f.index.save(&saved_path).unwrap();
+    f.index.save_fixture(&saved_path).unwrap();
     f.index = ScanIndex::load(&saved_path).unwrap();
     f.index
         .activate_file_upload_context(f.source, "d".repeat(64));
@@ -939,7 +939,7 @@ fn legacy_round_trip(version: &str) {
     let mut f = Fixture::new(SnapshotSource::Codex);
     f.adopt();
     let saved_path = f._scratch.join("downgrade-index.json");
-    f.index.save(&saved_path).unwrap();
+    f.index.save_fixture(&saved_path).unwrap();
     let encoded: Value = serde_json::to_value(&f.index).unwrap();
     // The complete released per-entry codecs are byte-identical at the two
     // pinned versions. Exercise their actual serde path on every files slot.

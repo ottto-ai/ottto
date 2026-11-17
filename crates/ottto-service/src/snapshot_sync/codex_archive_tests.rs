@@ -190,7 +190,7 @@ impl ScanIndex {
             );
             index.finish_legacy_settlement_reconciliation();
             scan.validate_codex_checkpoint().unwrap();
-            index.save(&index_path).unwrap();
+            index.save_fixture(&index_path).unwrap();
             progress.add_saved_handoff_retirements(&mut retired, &index);
             progress.retire_planned_acks_after_index_save(&index, &retired, &BTreeSet::new());
             progress.finish_cycle(&progress_path).unwrap();

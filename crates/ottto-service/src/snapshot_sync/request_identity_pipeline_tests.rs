@@ -549,11 +549,30 @@ fn preparation_error_preserves_normalization_counts_on_scan_worker() {
         "failed_reconstruction_count": 1, "disposition": "retry_pending",
         "retry_after_unix_seconds": 0
     }});
-    std::fs::write(&index_path, serde_json::to_vec(&value).unwrap()).unwrap();
+    let authority = value["claude_usage_authority_quarantine"][root].clone();
+    value["claude_usage_authority_quarantine"] = serde_json::json!({});
+    let index = crate::snapshots::e2_pipeline_scan_fixture::seed_json_for_test(
+        &index_path,
+        &serde_json::to_vec(&value).unwrap(),
+    );
     let progress_path = snapshot_upload_progress_path(&index_path);
-    let mut progress = SnapshotUploadProgress::new(namespace, snapshot_quarantine_witness(source));
-    progress.generation = u64::MAX;
-    std::fs::write(&progress_path, serde_json::to_vec(&progress).unwrap()).unwrap();
+    let mut progress = SnapshotUploadProgress::load_for_index(
+        &index,
+        &index_path,
+        &progress_path,
+        &namespace,
+        snapshot_quarantine_witness(source),
+    )
+    .unwrap();
+    progress.save(&progress_path).unwrap();
+    crate::snapshots::e2_pipeline_scan_fixture::exhaust_progress_generation_for_test(&index);
+    let index = ScanIndex::load(&index_path).unwrap();
+    crate::snapshots::e2_pipeline_scan_fixture::edit_record_for_test(
+        &index,
+        "refusal.authority",
+        root,
+        |record| *record = authority,
+    );
     let client = SnapshotApiClient::new(snapshot_status_server_with_hint_extras(
         Arc::new(Mutex::new(Vec::new())),
         vec![(183, "")],
@@ -611,8 +630,15 @@ fn preparation_error_preserves_normalization_counts_on_scan_worker() {
         1
     );
     assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&std::fs::read(&progress_path).unwrap())
-            .unwrap()["generation"],
+        SnapshotUploadProgress::load_for_index(
+            &ScanIndex::load(&index_path).unwrap(),
+            &index_path,
+            &progress_path,
+            &namespace,
+            snapshot_quarantine_witness(source),
+        )
+        .unwrap()
+        .generation,
         u64::MAX
     );
     assert!(!crate::local_resource_diagnostics::claude_reread::active());

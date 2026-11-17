@@ -154,7 +154,9 @@ impl PiLiveFixture {
         let index_path = support.join("index.json");
         let progress_path = support.join("progress.json");
         let mut baseline = ScanIndex::default();
-        baseline.save(&index_path).unwrap();
+        baseline
+            .save_fixture_for_source(&index_path, SnapshotSource::Pi)
+            .unwrap();
         let mut progress = test_upload_progress();
         progress.save(&progress_path).unwrap();
         // The real hook freezes inputs before the native parser starts.
@@ -1063,7 +1065,7 @@ fn bounded_retry_live_legacy_reconciliation_declines_without_count_only_settleme
         .prepare_legacy_settlement_reconciliation(SnapshotSource::Pi, 50);
     assert!(changed && pending.contains(&f.items[0].snapshot_fingerprint));
     assert!(f.working.legacy_settlement_ledger_needs_migration());
-    f.working.save(&f.index_path).unwrap();
+    f.working.save_fixture(&f.index_path).unwrap();
     f.baseline = f.working.clone();
     let checkpoint = checkpoint_partial_snapshot_index(
         &f.working,

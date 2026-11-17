@@ -120,7 +120,10 @@ fn integrated_each_map_and_cause_retains_custody_without_release_retirement_fenc
                 continue;
             }
             let mut fixture = Fixture::new();
-            let healthy = fixture.read();
+            // The healthy control imports its own native route. Damage belongs
+            // to a separate old-release input, before its first admission.
+            let control = Fixture::new();
+            let healthy = control.load();
             assert!(healthy.persistence_available());
             match cause {
                 UnavailableCause::Missing => fs::remove_file(fixture.bucket_path(map)).unwrap(),

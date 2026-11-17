@@ -83,7 +83,7 @@ fn pretty_and_compact_files_decode_identically_through_every_reader() {
         let mut unbound = ScanIndex::load(&path).unwrap();
         assert_eq!(
             unbound
-                .save_native(&path)
+                .save(&path)
                 .unwrap_err()
                 .downcast_ref::<state_v2::Hold>(),
             Some(&state_v2::Hold::ForeignBinding)
