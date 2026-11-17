@@ -1686,7 +1686,7 @@ fn claude_p92_typed_mixed_uses_full_enrichment_order() {
         );
         assert!(stored || case != "complete", "{case}");
         let (proof, _, _) =
-            apply_claude_local_evidence_to_scan_for_test(&support, &mut candidate, &mut case_index);
+            apply_claude_local_evidence_to_scan(&support, &mut candidate, &mut case_index);
         let item = &mut candidate.snapshots[0];
         if case == "complete" {
             assert_eq!(

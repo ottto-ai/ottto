@@ -323,8 +323,7 @@ fn wire_logins(item: &SnapshotItem) -> BTreeSet<String> {
 /// authority A, not the new authority B). No deferral, hold or resend
 /// applies. The expected body is the unprotected one with B's own share
 /// moved to the untagged part; S and C keep theirs, and no part names A.
-/// Under `session_request_account_source:v1` the gap after B's request keeps
-/// its `carried_forward` B share: a carried share is placement, never proof,
+/// The gap after B's request keeps its `carried_forward` B share: a carried share is placement, never proof,
 /// so it re-tags no accepted proof and is not refused.
 fn assert_refused_share_takes_start_binding_fallback(
     item: &SnapshotItem,
