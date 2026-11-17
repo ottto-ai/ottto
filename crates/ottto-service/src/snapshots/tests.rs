@@ -11470,6 +11470,9 @@ fn projection_adoption_fixture(name: &str, count: usize) -> (PathBuf, PathBuf, S
 
 fn projection_adoption_scan(root: &Path, index: &mut ScanIndex, limit: usize) -> SourceScanResult {
     e2_pipeline_scan_fixture::age_listing_for_test(index);
+    if state_v2::state_v2_growth_retention_active(index) {
+        state_v2::release_collection_page_limit_for_test(index);
+    }
     scan_source_roots_with_limit(
         SnapshotSource::Codex,
         &[root.to_path_buf()],
@@ -18593,7 +18596,6 @@ fn codex_archive_inventory_preserves_plain_usage_through_paged_restart() {
         let checkpoint = root.join("scan-index.json");
         if checkpoint.exists() {
             state_v2::erase_published(&checkpoint);
-            fs::remove_file(&checkpoint).unwrap();
         }
         let mut index = ScanIndex::default();
         let mut child_snapshot = None;

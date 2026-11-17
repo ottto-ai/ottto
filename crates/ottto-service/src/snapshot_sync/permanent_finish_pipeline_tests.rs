@@ -855,6 +855,8 @@ enum AckScriptedPost {
     Identity(&'static str),
 }
 
+type CheckpointRace = (PathBuf, Arc<Mutex<Option<Vec<u8>>>>);
+
 struct AckScriptedServer {
     url: String,
     stop: Arc<std::sync::atomic::AtomicBool>,
@@ -862,6 +864,7 @@ struct AckScriptedServer {
     /// Every snapshot offered, accepted or not.
     offered: Arc<Mutex<Vec<serde_json::Value>>>,
     script: Arc<Mutex<VecDeque<AckScriptedPost>>>,
+    advance_before_ack: Arc<Mutex<Option<CheckpointRace>>>,
 }
 
 impl AckScriptedServer {
@@ -876,6 +879,8 @@ impl AckScriptedServer {
         let bodies = offered.clone();
         let script = Arc::new(Mutex::new(VecDeque::new()));
         let posts = script.clone();
+        let advance_before_ack = Arc::new(Mutex::new(None::<CheckpointRace>));
+        let checkpoint_race = advance_before_ack.clone();
         let worker = std::thread::spawn(move || {
             while !done.load(Ordering::Relaxed) {
                 let (mut stream, _) = match listener.accept() {
@@ -908,6 +913,12 @@ impl AckScriptedServer {
                 } else if let Some(items) = value.get("snapshots").and_then(|v| v.as_array()) {
                     assert!(!items.is_empty());
                     bodies.lock().unwrap().extend(items.iter().cloned());
+                    if let Some((path, saved)) = checkpoint_race.lock().unwrap().take() {
+                        let mut concurrent = ScanIndex::load(&path).unwrap();
+                        concurrent.save(&path).unwrap();
+                        *saved.lock().unwrap() =
+                            Some(serde_json::to_vec(&ScanIndex::load(&path).unwrap()).unwrap());
+                    }
                     let post = posts
                         .lock()
                         .unwrap()
@@ -978,6 +989,7 @@ impl AckScriptedServer {
             worker: Some(worker),
             offered,
             script,
+            advance_before_ack,
         }
     }
 }
@@ -1222,16 +1234,13 @@ fn telemetry_retention_follows_only_a_completed_upload_and_saved_index() {
             Some((u64::MAX / 2, BTreeMap::new())),
         );
         crate::snapshots::claude_telemetry_retention::take_runs_for_test();
-        let mut competing_bytes = None;
+        let competing_bytes = Arc::new(Mutex::new(None));
         match arm {
             "save_fails" => {
-                // Another writer advanced the saved index: the selected
-                // save's compare-and-swap refuses.
-                std::fs::create_dir_all(index_path.parent().unwrap()).unwrap();
-                let mut concurrent = ScanIndex::load(&index_path).unwrap();
-                concurrent.save(&index_path).unwrap();
-                competing_bytes =
-                    Some(serde_json::to_vec(&ScanIndex::load(&index_path).unwrap()).unwrap());
+                // Advance after the request reaches the server. A race before
+                // POST correctly trips the native side-effect guard earlier.
+                *server.advance_before_ack.lock().unwrap() =
+                    Some((index_path.clone(), competing_bytes.clone()));
             }
             "deferred" => server
                 .script
@@ -1253,7 +1262,7 @@ fn telemetry_retention_follows_only_a_completed_upload_and_saved_index() {
                 assert!(result.is_err(), "{arm}");
                 assert_eq!(
                     serde_json::to_vec(&ScanIndex::load(&index_path).unwrap()).unwrap(),
-                    competing_bytes.unwrap(),
+                    competing_bytes.lock().unwrap().take().unwrap(),
                     "{arm}: the selected save never committed"
                 );
                 assert_eq!(runs, 0, "{arm}");

@@ -1499,7 +1499,13 @@ pub(crate) fn expire_claimed_growth_for_test(index: &mut ScanIndex, path: &Path)
     *state = serde_json::from_value(value).unwrap();
     assert!(!sampled_audit::growth_full_paced(index, &key, now));
     let route = route_of(index).unwrap();
-    index.save_fixture(&route).unwrap();
+    // Ordinary saves preserve the maximum durable claim. A fixture clock jump
+    // installs its aged row explicitly, as owe_claimed_growth does.
+    let runtime = runtime_only(index);
+    let mut aged = seed_index_for_test(index, &route);
+    carry_runtime(&runtime, &mut aged);
+    assert!(!sampled_audit::growth_full_paced(&aged, &key, now));
+    *index = aged;
 }
 
 pub(crate) fn discard_store_for_test(path: &Path) {
@@ -1520,7 +1526,7 @@ pub(crate) fn exhaust_progress_generation_for_test(index: &ScanIndex) {
 }
 
 /// The production sampled acquisition over an already bound synthetic route.
-/// A new cache per page leaves all continuation custody in the state store.
+/// Callers with an explicit warm memo retain its owner across pages.
 pub(crate) fn scan_native_pipeline_for_test(
     roots: &[PathBuf],
     index: &mut ScanIndex,
@@ -1528,9 +1534,11 @@ pub(crate) fn scan_native_pipeline_for_test(
     window_days: u64,
     limit: usize,
     support: &Path,
+    cache: Option<Arc<sampled_scan::SharedCache>>,
 ) -> Result<SourceScanResult> {
+    state_v2::release_collection_page_limit_for_test(index);
     state_v2::before_collection(index)?;
-    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let cache = cache.unwrap_or_default();
     let scope = Scope("native-pipeline-fixture".into());
     let mut state = OwnedSourceScan::new_with_recovery_priority(
         SnapshotSource::ClaudeCode,

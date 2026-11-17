@@ -1321,7 +1321,7 @@ fn unreadable_backfill_state_emits_no_history_from_a_rebuilt_index() {
             fixture.corrupt_index();
         } else {
             crate::snapshots::e2_pipeline_scan_fixture::discard_store_for_test(&fixture.index_path);
-            std::fs::remove_file(&fixture.index_path).expect("lose the index");
+            assert!(!fixture.index_path.exists(), "lose the index");
         }
         for hour in [9, 10] {
             let outcome = fixture.cycle(

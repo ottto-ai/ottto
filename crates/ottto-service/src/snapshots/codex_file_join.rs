@@ -5111,13 +5111,11 @@ pub(super) mod tests {
                 .unwrap()
                 .0
                 .clone();
-            crate::snapshots::state_v2::money_test_support::edit_record_for_test(
-                &captured,
-                "file.progress",
-                &key,
-                |entry| {
-                    entry["codex_captured_tier_receipt"] = malformed;
-                },
+            let mut value = serde_json::to_value(&captured).unwrap();
+            value["files"][&key]["codex_captured_tier_receipt"] = malformed;
+            e2_pipeline_scan_fixture::seed_json_for_test(
+                &path,
+                &serde_json::to_vec(&value).unwrap(),
             );
             let loaded = ScanIndex::load(&path).unwrap();
             assert_eq!(

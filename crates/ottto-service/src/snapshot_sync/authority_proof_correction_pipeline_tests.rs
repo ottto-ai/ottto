@@ -8,8 +8,9 @@
 // durable index settlement, no-body settlement on the selected checkpoint,
 // then a save and a reload from disk. Requests are appended naturally to
 // member transcripts together with paired local OTEL API and trace rows.
-// Beyond the stored starting state below, tests edit no clock, quarantine,
-// witness or index state by hand. Tests named `controlled_*` say so: one seeds
+// Between visits the helper ages listing clocks to model elapsed passes.
+// Beyond the stored starting state below, tests edit no quarantine, witness
+// or index state by hand. Tests named `controlled_*` say so: one seeds
 // the owed set through the persisted index after the stored grant, and the
 // selection and checkpoint-cost tests drive the real locked partial checkpoint
 // on a synthetic persisted index.
@@ -161,6 +162,7 @@ struct ApcFixture {
     /// Members whose owner proof is withheld on the next pages.
     withheld_owners: std::cell::RefCell<BTreeSet<String>>,
     next_sequence: std::cell::Cell<u64>,
+    listing_hour: std::cell::Cell<Option<i64>>,
     page_files: std::cell::Cell<usize>,
     cutoff: std::cell::Cell<Option<&'static str>>,
     /// Opt-in production account-audit release on settled pages, with no
@@ -190,6 +192,7 @@ impl ApcFixture {
             owners,
             withheld_owners: std::cell::RefCell::new(BTreeSet::new()),
             next_sequence: std::cell::Cell::new(1),
+            listing_hour: std::cell::Cell::new(None),
             page_files: std::cell::Cell::new(APC_PAGE_FILES),
             cutoff: std::cell::Cell::new(None),
             audit_release: std::cell::Cell::new(false),
@@ -430,7 +433,13 @@ impl ApcFixture {
     fn page_born(&self, collected_at: &str, upload: ApcUpload) -> ApcPage {
         let before_bytes = std::fs::read(&self.index_path).unwrap_or_default();
         let mut before = ScanIndex::load(&self.index_path).expect("load scan index");
-        crate::snapshots::e2_pipeline_scan_fixture::age_listing_for_test(&mut before);
+        let hour = OffsetDateTime::parse(collected_at, &Rfc3339)
+            .unwrap()
+            .unix_timestamp()
+            / 3600;
+        if self.listing_hour.replace(Some(hour)) != Some(hour) {
+            crate::snapshots::e2_pipeline_scan_fixture::age_listing_for_test(&mut before);
+        }
         let mut index = before.clone();
         // As the service's source prepare: the context also binds the index's
         // quarantine witness, so refused bodies hold instead of re-reading.
@@ -447,6 +456,7 @@ impl ApcFixture {
             183,
             self.page_files.get(),
             &self.support,
+            None,
         )
         .expect("scan bounded Claude page");
         let parsed = scan
@@ -801,6 +811,13 @@ impl ApcFixture {
             &window_end,
         )
         .expect("save index and publish manifest");
+        // Keep the page's upload observation for its assertions. The durable
+        // ledger follows the real post-save ACK retirement and cycle finish.
+        let observed_progress = progress.clone();
+        progress.retire_acks_after_index_save(&index, &BTreeSet::new(), &holds.held_fingerprints);
+        progress
+            .finish_cycle(&self.progress_path)
+            .expect("finish native fixture progress");
         ApcPage {
             upload,
             scan,
@@ -817,7 +834,7 @@ impl ApcFixture {
             uploaded,
             shed,
             candidates,
-            progress,
+            progress: observed_progress,
         }
     }
 

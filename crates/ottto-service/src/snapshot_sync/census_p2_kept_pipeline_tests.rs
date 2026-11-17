@@ -69,13 +69,14 @@ pub(super) struct PipelinePage {
 }
 
 pub(super) struct PipelineFixture {
-    pub(super) cache: crate::snapshots::sampled_scan::SharedCache,
+    pub(super) cache: Arc<crate::snapshots::sampled_scan::SharedCache>,
     pub(super) base: PathBuf,
     pub(super) root: PathBuf,
     pub(super) support: PathBuf,
     pub(super) index_path: PathBuf,
     pub(super) page_files: usize,
     pub(super) durable_progress: bool,
+    listing_hour: std::cell::Cell<Option<i64>>,
 }
 
 fn request_owned_sessions(scan: &crate::snapshots::SourceScanResult) -> BTreeSet<String> {
@@ -108,6 +109,7 @@ impl PipelineFixture {
             index_path: base.join("claude-scan-index.json"),
             page_files: PIPELINE_PAGE_FILES,
             durable_progress: false,
+            listing_hour: std::cell::Cell::new(None),
             base,
             root,
             support,
@@ -224,7 +226,13 @@ impl PipelineFixture {
         reoffers: bool,
     ) -> Result<PipelinePage> {
         let mut index = ScanIndex::load(&self.index_path).expect("load scan index");
-        crate::snapshots::e2_pipeline_scan_fixture::age_listing_for_test(&mut index);
+        let hour = OffsetDateTime::parse(collected_at, &Rfc3339)
+            .unwrap()
+            .unix_timestamp()
+            / 3600;
+        if self.listing_hour.replace(Some(hour)) != Some(hour) {
+            crate::snapshots::e2_pipeline_scan_fixture::age_listing_for_test(&mut index);
+        }
         self.cache.bind_withheld(&mut index);
         // Production order (`finish_sync_source`): the upload ledger loads
         // under the context's quarantine witness, and one activation binds
@@ -277,6 +285,7 @@ impl PipelineFixture {
             183,
             self.page_files,
             &self.support,
+            Some(self.cache.clone()),
         )
         .expect("scan bounded Claude page");
         let parsed = scan
@@ -598,6 +607,13 @@ impl PipelineFixture {
             &window_end,
         )
         .expect("save index and publish manifest");
+        // Keep the page's upload observation for its assertions. The durable
+        // ledger follows the real post-save ACK retirement and cycle finish.
+        let observed_progress = progress.clone();
+        progress.retire_acks_after_index_save(&index, &BTreeSet::new(), &holds.held_fingerprints);
+        progress
+            .finish_cycle(&progress_path)
+            .expect("finish native fixture progress");
         Ok(PipelinePage {
             parsed,
             scan,
@@ -609,7 +625,7 @@ impl PipelineFixture {
             progress_blocking: holds.progress_blocking,
             uploaded,
             result,
-            progress,
+            progress: observed_progress,
         })
     }
 
