@@ -1518,15 +1518,30 @@ fn census_sequence_index_preserves_serde_compatibility_and_isolates_evidence() {
     ];
     fields.push(serde_json::json!({"good": census_record_json('a', "exact", &[1])}));
     fields.push(serde_json::json!("overflow-token"));
-    // A load refuses a pre-version-2 ledger, so fill through its slot.
-    let ledger_slot = crate::snapshots::lenient_decode::FIELDS
-        .iter()
-        .position(|name| *name == "accepted_snapshot_fingerprint_ledger_version")
-        .expect("ledger slot");
-    fields.resize(ledger_slot, serde_json::Value::Null);
-    fields.push(serde_json::json!(
-        crate::snapshots::SNAPSHOT_ACCEPTED_LEDGER_VERSION
-    ));
+    // A load refuses a pre-version-2 ledger, so fill through its slot with
+    // typed defaults (null for options and decode-and-drop slots).
+    for name in &crate::snapshots::lenient_decode::FIELDS[fields.len()..] {
+        let ledger = *name == "accepted_snapshot_fingerprint_ledger_version";
+        fields.push(match *name {
+            _ if ledger => serde_json::json!(crate::snapshots::SNAPSHOT_ACCEPTED_LEDGER_VERSION),
+            "claude_usage_authority_quarantine"
+            | "claude_account_deferred_holds"
+            | "file_snapshot_fingerprints"
+            | "snapshot_activity_at" => serde_json::json!({}),
+            "confirmed_empty_files" | "accepted_snapshot_fingerprints" => serde_json::json!([]),
+            "claude_desktop_store_sweep_had_errors"
+            | "claude_desktop_identity_census_complete"
+            | "claude_desktop_lineage_census_complete"
+            | "bounded_sweep_had_unsettled_upload" => serde_json::json!(false),
+            "claude_desktop_store_retry_attempt" | "bounded_sweep_unsettled_causes" => {
+                serde_json::json!(0)
+            }
+            _ => serde_json::Value::Null,
+        });
+        if ledger {
+            break;
+        }
+    }
     let json = serde_json::to_string(&fields)
         .unwrap()
         .replace("\"overflow-token\"", "1e400");
