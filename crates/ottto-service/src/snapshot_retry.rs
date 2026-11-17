@@ -1,7 +1,6 @@
 //! Bounded snapshot JSON reads and response limits.
 use anyhow::Result;
 
-#[cfg(test)]
 pub(crate) const RESPONSE_BYTES: usize = 128 * 1024;
 pub(crate) const TOKEN_RESPONSE_BYTES: usize = 16 * 1024;
 #[cfg(test)]

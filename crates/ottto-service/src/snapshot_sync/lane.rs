@@ -195,7 +195,6 @@ pub(super) fn collect_file_activity_for(
     watcher: Option<&crate::snapshot_watcher::SnapshotWatcher>,
     account_switch: &mut ClaudeAccountSwitchProbe,
 ) -> bool {
-    let mut read_account = crate::agent_status::claude_default_account_fingerprint;
     let deadline = crate::scan_clock::now() + wait;
     let mut watcher = watcher;
     loop {
@@ -221,7 +220,10 @@ pub(super) fn collect_file_activity_for(
                 watcher = None;
             }
         }
-        if account_switch.observe(crate::scan_clock::now(), &mut read_account) {
+        if account_switch.observe(
+            crate::scan_clock::now(),
+            crate::agent_status::claude_default_account_fingerprint,
+        ) {
             eprintln!("local snapshot sync: Claude account switch detected; refreshing now");
             with_source_cadence(SnapshotSource::ClaudeCode, |cadence| {
                 cadence.record_account_switch(crate::scan_clock::now())

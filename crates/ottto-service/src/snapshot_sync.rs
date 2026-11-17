@@ -5,7 +5,7 @@ pub(crate) use self::lane::disable_snapshot_source;
 pub(crate) use self::lane::disable_sources_dropped_from_grant;
 pub(crate) use self::lane::enabled_snapshot_sources;
 pub(crate) use self::lane::enabled_snapshot_sources_in;
-use self::lane::ensure_snapshot_destination_current;
+#[cfg(test)]
 use self::lane::ensure_snapshot_scan_authority;
 #[cfg(test)]
 pub(crate) use self::lane::forget_carried_namespaces_for_test;
@@ -122,6 +122,7 @@ pub(crate) use self::finish::checkpoint_account_release_for_test;
 pub(crate) use self::finish::checkpoint_page_for_test;
 #[cfg(test)]
 use self::finish::checkpoint_partial_snapshot_index;
+#[cfg(test)]
 use self::finish::checkpoint_partial_snapshot_index_with_audit_release;
 #[cfg(test)]
 pub(crate) use self::finish::checkpoint_unselected_for_test;
@@ -272,6 +273,7 @@ use self::upload::with_retained_refusal_conflicts;
 mod lane;
 #[cfg(test)]
 use self::upload::ack_usage_identical;
+#[cfg(test)]
 use self::upload::attempt_snapshot_page;
 use self::upload::is_shed_failure;
 #[cfg(test)]
@@ -293,6 +295,7 @@ use self::upload::SnapshotEntityDeferred;
 use self::upload::SnapshotLocalStateRejected;
 #[cfg(test)]
 use self::upload::SnapshotPackingLength;
+#[cfg(test)]
 use self::upload::SnapshotPageOutcome;
 use self::upload::SnapshotUploadErrorClass;
 use self::upload::SourcesFailed;
@@ -375,6 +378,7 @@ use crate::snapshot_client::{
 };
 #[cfg(test)]
 use crate::snapshots::apply_upload_policy;
+#[cfg(test)]
 use crate::snapshots::validate_snapshot_batch_request;
 use crate::snapshots::{
     collector_version, finalize_scan_after_policy_with_body_witness,
