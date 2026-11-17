@@ -1236,11 +1236,7 @@ pub(in crate::snapshots) mod tests {
             let expected = opened_object_identity(SnapshotSource::Codex, &mut file).unwrap();
             let mut parser = codex_parser(OpenedInput::plain(file), &f.0);
             sampled_scan::configure_tier_replay(&mut parser, &f.candidate(), &old);
-            sources::codex::counting::version::configure_singleton(
-                &mut parser,
-                &f.candidate(),
-                &old,
-            );
+
             while !parser.step().unwrap() {}
             let parsed = parser
                 .finish(

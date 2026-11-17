@@ -114,6 +114,16 @@ fn stored_usage_of<S: TailSource>(index: &ScanIndex, key: &str) -> Option<(u64, 
     Some((totals.request_count, totals.total_tokens()))
 }
 
+pub(in crate::snapshots) fn stored_codex_legacy_totals(
+    index: &ScanIndex,
+    key: &str,
+) -> Option<UsageTotals> {
+    let head = state_v2::load_head(index, key, codex::Codex::REDUCTION_REVISION).ok()??;
+    let mut acc = SnapshotAccumulator::new(SnapshotSource::Codex);
+    codex::Codex::decode_head(head.revision, &head.body, &mut acc).ok()?;
+    (!acc.codex_counting_v2()).then_some(acc.accepted_usage_totals)
+}
+
 /// `source`'s pending Tail write for one completion, through its codec.
 #[allow(
     clippy::too_many_arguments,
@@ -1286,3 +1296,6 @@ pub(in crate::snapshots) fn renumber_device_for_test(body: &[u8], key: &str) -> 
     edited.extend_from_slice(&body[body.len() - decoder.remaining()..]);
     edited
 }
+
+#[cfg(test)]
+pub(in crate::snapshots) mod historical_codex;

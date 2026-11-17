@@ -1,16 +1,11 @@
-//! Codex usage counting V2: the eight counting regressions, the counting-version
-//! decision and its acknowledgement-evidence transitions. Token numbers mirror
+//! Codex V2 counting and protected-tier regressions. Token numbers mirror
 //! the saved minimal sequences S1-S3; every fixture is synthetic.
 use super::codex_usage_occurrence::{OccurrenceCounters, T6};
-use super::sources::codex::counting::version::{self, AckEvidence, CountingVersion};
 use super::*;
 use serde_json::json;
 
 const SESSION: &str = "0199f7a0-0000-7000-8000-00000000c0de";
-/// 2026-09-21T14:13:20Z.
-const CUTOVER: i64 = 1_790_000_000_000;
 const POST: &str = "2026-10-18T10:00:00Z";
-const PRE: &str = "2026-09-01T10:00:00Z";
 const MODEL: &str = "gpt-5.6-sol";
 /// S1: one response, then its equal-total re-emission before an abort.
 const S1: T6 = [31_143, 0, 0, 420, 169, 31_563];
@@ -113,9 +108,6 @@ impl Run {
     fn counters(&self) -> &OccurrenceCounters {
         self.counters.as_ref().expect("V2 counters")
     }
-    fn wire(&self) -> Value {
-        serde_json::to_value(self.item.as_ref().expect("item")).unwrap()
-    }
 }
 
 fn five(t: T6) -> [u64; 5] {
@@ -123,11 +115,8 @@ fn five(t: T6) -> [u64; 5] {
 }
 
 /// `None` is an unconfigured (Legacy) parser.
-fn run(values: &[Value], evidence: Option<AckEvidence>) -> Run {
+fn run(values: &[Value]) -> Run {
     let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
-    if let Some(evidence) = evidence {
-        version::configure(&mut accumulator, evidence, Some(CUTOVER));
-    }
     for value in values {
         apply_codex_line(value, &mut accumulator);
     }
@@ -149,25 +138,14 @@ fn run(values: &[Value], evidence: Option<AckEvidence>) -> Run {
 }
 
 fn v2(values: &[Value]) -> Run {
-    let run = run(values, Some(AckEvidence::None));
+    let run = run(values);
     assert!(run.v2, "post-cutover root with no ACK evidence selects V2");
-    run
-}
-
-fn legacy(values: &[Value]) -> Run {
-    let run = run(values, None);
-    assert!(!run.v2);
     run
 }
 
 /// Exercise the production source factory and physical JSONL reader, with the
 /// fixture header predating the frozen cutover for the Legacy price control.
 fn run_price_source(values: &[Value], active: bool) -> Run {
-    let _cutover = version::TestCutover::set(if active {
-        0
-    } else {
-        version::CODEX_COUNTING_V2_CUTOVER_UNIX_MS
-    });
     let root = crate::test_scratch::unique_path("ottto-v2-price");
     fs::create_dir_all(&root).unwrap();
     let path = root.join(format!("rollout-2026-08-31T23-00-00-{SESSION}.jsonl"));
@@ -205,10 +183,7 @@ fn run_price_source(values: &[Value], active: bool) -> Run {
     .unwrap();
     while !parser.step().unwrap() {}
     let v2 = parser.accumulator.codex_counting_v2();
-    assert_eq!(
-        v2, active,
-        "source factory selects the intended counting version"
-    );
+    assert!(v2 && active, "every new Codex parse uses V2");
     let counting = parser.accumulator.codex_counting.as_deref();
     let counters = counting.and_then(|counting| counting.counters().cloned());
     let pending = counting.and_then(|counting| counting.open_turn_ui_pending());
@@ -372,9 +347,7 @@ fn codex_v2_native_price_buckets_match_legacy_per_hour_model_and_dimension() {
             *slot += value;
         }
     }
-    let legacy = run_price_source(&values, false);
     let counted = run_price_source(&values, true);
-    assert_price_rows(&legacy, &expected);
     assert_price_rows(&counted, &expected);
     assert_eq!(counted.counters().native_counted, cases.len() as u64);
     for row in &counted.item.as_ref().unwrap().model_usage {
@@ -422,7 +395,7 @@ fn codex_v2_native_price_bucket_requires_own_time_and_preserves_explicit_line_bu
             ),
             [300_000, 290_000, 1_000, 10, 2, 1],
         )]);
-        for active in [false, true] {
+        for active in [true] {
             assert_price_rows(&run_price_source(&values, active), &expected);
         }
     }
@@ -563,7 +536,7 @@ fn codex_thread_settings_tier_counts_only_explicit_evidence_inside_the_epoch() {
         (Some("priority".to_string()), (8 + 16 + 512, source.clone())),
         (Some("flex".to_string()), (32, source)),
     ]);
-    for active in [false, true] {
+    for active in [true] {
         let run = run_price_source(&values, active);
         assert_eq!(
             input_by_tier(run.item.as_ref().unwrap()),
@@ -594,9 +567,6 @@ fn codex_thread_tier_yields_to_the_protected_replay() {
                 receipt: Option<AppliedTierReceipt>,
                 keyless: bool| {
         let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
-        if v2 {
-            version::configure(&mut accumulator, AckEvidence::None, Some(CUTOVER));
-        }
         if older_logs {
             crate::snapshots::older_build_logs_priority("fast-turn");
         }
@@ -661,7 +631,7 @@ fn codex_thread_tier_yields_to_the_protected_replay() {
             (200, Some(THREAD_TIER_SOURCE.to_string())),
         ),
     ]);
-    for v2 in [false, true] {
+    for v2 in [true] {
         let (item, receipt) = pass(values.as_slice(), v2, true, None, false);
         assert_eq!(input_by_tier(&item), expected, "older build {v2}");
         let (item, replayed) = pass(values.as_slice(), v2, false, receipt.clone(), false);
@@ -733,15 +703,11 @@ fn codex_v2_native_only_compaction_and_overlap_price_the_original_prompt() {
             u64::from(overlap)
         );
         assert_eq!(counted.counters().native_restated, u64::from(!overlap));
-        assert!(
-            run_price_source(&values, false).item.is_none(),
-            "Legacy has no UI money to count"
-        );
     }
 }
 
 #[test]
-fn codex_v2_and_legacy_drop_the_same_equal_total_repeat() {
+fn codex_v2_drops_equal_total_repeats() {
     let values = [
         header(POST),
         started("2026-11-04T10:00:01Z", "turn-1"),
@@ -750,9 +716,6 @@ fn codex_v2_and_legacy_drop_the_same_equal_total_repeat() {
         ui("2026-11-04T10:00:20Z", S1, S1),
         aborted("2026-11-04T10:00:21Z", "turn-1"),
     ];
-    let selected_legacy = run(&values, Some(AckEvidence::LegacyAcked));
-    assert!(!selected_legacy.v2);
-    assert_eq!(selected_legacy.money(), five(S1));
     let counted = v2(&values);
     assert_eq!(counted.money(), five(S1));
     assert_eq!(counted.counters().ui_equal_total_repeat, 1);
@@ -775,145 +738,6 @@ fn codex_v2_real_reset_counts_first_post_reset_last() {
     let expected = five(sum(sum(first_last, S3_RESET), S3_NEXT));
     let counted = v2(&values);
     assert_eq!(counted.money(), expected);
-    assert_eq!(counted.counters().ui_equal_total_repeat, 0);
-    assert_eq!(legacy(&values).money(), expected);
-    let selected_legacy = run(&values, Some(AckEvidence::LegacyAcked));
-    assert_eq!(selected_legacy.money(), expected);
-    assert_eq!(selected_legacy.counters().ui_equal_total_repeat, 0);
-}
-
-/// A Legacy session's money read straight through (Full), and read again with
-/// a durable save and restore after `tail_from` lines (Tail). The two routes
-/// must always agree, and the restored session stays Legacy.
-fn legacy_on_both_routes(lines: &[Value], tail_from: usize) -> Run {
-    let cold = run(lines, Some(AckEvidence::None));
-    assert!(!cold.v2);
-
-    use crate::durable_tail_codec::{Dec, Durable, Enc};
-    let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
-    version::configure(&mut accumulator, AckEvidence::None, Some(CUTOVER));
-    for value in &lines[..tail_from] {
-        apply_codex_line(value, &mut accumulator);
-    }
-    let saved = accumulator.codex_counting.take().expect("configured");
-    assert!(
-        saved.counters().is_some(),
-        "the first counted UI line allocates the slot"
-    );
-    let body = Enc::count_write(1 << 20, |e| saved.put(e)).unwrap();
-    let restored =
-        codex_usage_occurrence::CodexCounting::take(&mut Dec::new(&body)).expect("decode");
-    let fresh = codex_usage_occurrence::CodexCounting::new(AckEvidence::None, Some(CUTOVER));
-    assert!(version::reusable(Some(&restored), Some(&fresh)));
-    accumulator.codex_counting = Some(Box::new(restored));
-    assert!(
-        !accumulator.codex_counting_v2(),
-        "the slot never selects V2"
-    );
-    for value in &lines[tail_from..] {
-        apply_codex_line(value, &mut accumulator);
-    }
-    assert!(!accumulator.codex_counting_v2());
-    let path = PathBuf::from(format!(
-        "/synthetic/sessions/rollout-2026-10-18T10-00-00-{SESSION}.jsonl"
-    ));
-    let item = accumulator
-        .into_items(&path, "2026-10-21T00:00:00Z", "fp".into(), None)
-        .pop()
-        .expect("item");
-    assert_eq!(
-        [
-            item.input_tokens,
-            item.cache_read_tokens,
-            item.cache_creation_5m_tokens,
-            item.output_tokens,
-            item.reasoning_output_tokens,
-        ],
-        cold.money(),
-        "Tail and Full agree"
-    );
-    cold
-}
-
-/// A pre-cutover session's turn with one `token_count` per timestamp, all
-/// with the same `last` and total.
-fn legacy_reemissions(day: &str, at: &[&str]) -> Vec<Value> {
-    let mut lines = vec![
-        header(PRE),
-        started(&format!("{day}T10:00:01Z"), "turn-1"),
-        context(&format!("{day}T10:00:02Z"), "turn-1"),
-    ];
-    lines.extend(at.iter().map(|at| ui(at, S1, S1)));
-    lines.push(completed(&format!("{day}T23:59:59Z"), "turn-1"));
-    lines
-}
-
-/// [regress] A pre-cutover (Legacy) session counted a re-emitted `token_count`
-/// with the same `last` and total and a new timestamp twice. Dated on or after
-/// the forward date it counts once on Full and across a save and restore.
-#[test]
-fn codex_legacy_equal_total_reemission_counts_once_across_restore() {
-    let lines = legacy_reemissions(
-        "2026-11-04",
-        &["2026-11-04T10:00:15Z", "2026-11-04T10:00:20Z"],
-    );
-    let counted = legacy_on_both_routes(&lines, 4);
-    assert_eq!(counted.money(), five(S1));
-    assert_eq!(counted.counters().ui_equal_total_repeat, 1);
-    assert_eq!(counted.counters().ui_equal_total_repeat_usage, S1);
-}
-
-/// Control: the same shape dated before the forward date keeps both rows on
-/// every route, and is not a counted drop.
-#[test]
-fn codex_legacy_reemission_before_forward_date_counts_twice_on_every_route() {
-    let lines = legacy_reemissions(
-        "2026-11-03",
-        &["2026-11-03T10:00:15Z", "2026-11-03T10:00:20Z"],
-    );
-    let counted = legacy_on_both_routes(&lines, 4);
-    assert_eq!(counted.money(), five(sum(S1, S1)));
-    assert_eq!(counted.counters().ui_equal_total_repeat, 0);
-}
-
-/// The tuple crosses the forward date: the first dated repeat of an earlier
-/// line is dropped, at the boundary second, wherever the save lands. Earlier
-/// repeats keep their rows.
-#[test]
-fn codex_legacy_repeat_tuple_crosses_the_forward_date() {
-    let lines = legacy_reemissions(
-        "2026-11-03",
-        &["2026-11-03T23:59:59Z", "2026-11-04T00:00:00Z"],
-    );
-    let counted = legacy_on_both_routes(&lines, 4);
-    assert_eq!(counted.money(), five(S1));
-    assert_eq!(counted.counters().ui_equal_total_repeat, 1);
-
-    let lines = legacy_reemissions(
-        "2026-11-03",
-        &[
-            "2026-11-03T23:59:58Z",
-            "2026-11-03T23:59:59Z",
-            "2026-11-04T00:00:00Z",
-        ],
-    );
-    for tail_from in [4, 5] {
-        let counted = legacy_on_both_routes(&lines, tail_from);
-        assert_eq!(counted.money(), five(sum(S1, S1)));
-        assert_eq!(counted.counters().ui_equal_total_repeat, 1);
-    }
-}
-
-/// A repeat with no readable timestamp counts as it always did.
-#[test]
-fn codex_legacy_repeat_without_a_timestamp_counts() {
-    let mut lines = legacy_reemissions(
-        "2026-11-04",
-        &["2026-11-04T10:00:15Z", "2026-11-04T10:00:20Z"],
-    );
-    lines[4].as_object_mut().unwrap().remove("timestamp");
-    let counted = legacy_on_both_routes(&lines, 4);
-    assert_eq!(counted.money(), five(sum(S1, S1)));
     assert_eq!(counted.counters().ui_equal_total_repeat, 0);
 }
 
@@ -973,11 +797,6 @@ fn codex_v2_native_turn_counts_compaction_once_and_inherited_base_never() {
     assert_eq!(counters.native_restated, 1);
     assert_eq!(counters.native_conflict, 0);
     assert_eq!(counted.item.as_ref().unwrap().request_count, 3);
-    // Legacy counts the UI stream: the re-emission, never the compaction.
-    assert_eq!(
-        legacy(&values).money(),
-        five(sum(sum(S2_FIRST, S2_FIRST), S2_SECOND))
-    );
 }
 
 #[test]
@@ -995,7 +814,6 @@ fn codex_v2_inherited_cumulative_base_is_not_counted() {
     let counted = v2(&values);
     assert_eq!(counted.money(), [600, 0, 0, 60, 0]);
     assert_eq!(counted.counters().v2_cumulative_base_uncounted, 1);
-    assert_eq!(legacy(&values).money(), five(grown));
 }
 
 #[test]
@@ -1013,7 +831,6 @@ fn codex_v2_pre_native_and_unbound_ui_stay_counted_without_subtraction() {
     ];
     // Unbound-span UI keeps today's rule, including its repeat.
     let expected = five(sum(sum(unbound, unbound), turn));
-    assert_eq!(legacy(&values).money(), expected);
     let mut previous = [0; 5];
     for end in 1..=values.len() {
         let prefix = v2(&values[..end]);
@@ -1069,7 +886,6 @@ fn codex_v2_pending_row_cap_flushes_once_without_double_count() {
     assert_eq!(counters.pending_overflow_flushes, 1);
     assert_eq!(counters.native_after_ui_flush, 1);
     assert_eq!(counters.native_counted, 0);
-    assert_eq!(legacy(&values).money(), expected);
 }
 
 #[test]
@@ -1099,7 +915,6 @@ fn codex_v2_reopened_closed_turn_never_regains_native_authority() {
     assert_eq!(counters.turn_reopened, 1);
     assert_eq!(counters.native_after_turn_closed, 1);
     assert_eq!(counters.native_counted, 0);
-    assert_eq!(legacy(&values).money(), five(usage));
 
     // A closure whose start was never bound is final too: the id reopens only
     // as an unbound span and its native adds nothing.
@@ -1119,7 +934,6 @@ fn codex_v2_reopened_closed_turn_never_regains_native_authority() {
         assert_eq!(counters.turn_reopened, 1);
         assert_eq!(counters.native_after_turn_closed, 1);
         assert_eq!(counters.native_counted, 0);
-        assert_eq!(legacy(&values).money(), five(usage));
     }
 
     // Far beyond the exact ring: the filter still holds turn-1 closed. The
@@ -1165,7 +979,6 @@ fn codex_v2_reopened_closed_turn_never_regains_native_authority() {
     assert_eq!(counters.closed_filter_hit_unconfirmed_native_usage, late);
     assert_eq!(counters.native_counted, 0);
     assert_eq!(counters.ui_in_unbound_span, 1);
-    assert_eq!(counted.money(), legacy(&values).money());
     assert_eq!(counted.money(), five(sum(total, step)));
 }
 
@@ -1196,264 +1009,6 @@ fn codex_v2_overlapping_native_counts_only_uncovered_part() {
 }
 
 #[test]
-fn codex_v2_legacy_selection_is_byte_identical_to_unconfigured_parse() {
-    let values = |timestamp: &str, day: &str| {
-        let at = |time: &str| format!("{day}T{time}Z");
-        vec![
-            header(timestamp),
-            started(&at("10:00:01"), "turn-1"),
-            context(&at("10:00:02"), "turn-1"),
-            native(
-                &at("10:00:10"),
-                "turn-1",
-                "resp-1",
-                S2_FIRST,
-                sum(S2_BASE, S2_FIRST),
-            ),
-            ui(&at("10:00:11"), S2_FIRST, S2_FIRST),
-            ui(&at("10:00:12"), S2_FIRST, S2_FIRST),
-            completed(&at("10:00:20"), "turn-1"),
-        ]
-    };
-    for (timestamp, evidence) in [
-        (PRE, AckEvidence::None),
-        (PRE, AckEvidence::V2Marked),
-        (POST, AckEvidence::LegacyAcked),
-    ] {
-        // Before the forward date: exactly the unconfigured parse.
-        let fixture = values(timestamp, "2026-10-18");
-        let selected = run(&fixture, Some(evidence));
-        assert!(!selected.v2);
-        assert_eq!(selected.counters, Some(OccurrenceCounters::default()));
-        assert_eq!(selected.wire(), legacy(&fixture).wire());
-        // From it: the same parse less the one equal-total re-emission the
-        // shared repeat gate drops. Natives stay V2-only.
-        let fixture = values(timestamp, "2026-11-04");
-        let selected = run(&fixture, Some(evidence));
-        assert!(!selected.v2);
-        assert_eq!(
-            selected.counters,
-            Some(OccurrenceCounters {
-                ui_equal_total_repeat: 1,
-                ui_equal_total_repeat_usage: S2_FIRST,
-                ..Default::default()
-            })
-        );
-        let mut without_reemission = fixture.clone();
-        without_reemission.remove(5);
-        assert_eq!(selected.wire(), legacy(&without_reemission).wire());
-    }
-}
-
-fn entry(fingerprint: Option<&str>, v2: bool) -> ScanIndexEntry {
-    let mut entry: ScanIndexEntry = serde_json::from_value(json!({
-        "size_bytes": 1, "modified_unix_seconds": 1, "modified_unix_nanos": 1,
-        "source_file_fingerprint": "source", "last_snapshot_fingerprint": fingerprint,
-        "scan_identity_version": LOCAL_SCAN_INDEX_IDENTITY_VERSION,
-    }))
-    .unwrap();
-    entry.codex_counting_v2 = v2;
-    entry
-}
-
-#[test]
-fn codex_counting_version_decision_is_stable() {
-    let decide = |record: &Value, evidence| version::decide(record, evidence, CUTOVER);
-    let post = header(POST);
-    assert_eq!(decide(&post, AckEvidence::None), CountingVersion::V2);
-    assert_eq!(decide(&post, AckEvidence::V2Marked), CountingVersion::V2);
-    assert_eq!(
-        decide(&post, AckEvidence::LegacyAcked),
-        CountingVersion::Legacy
-    );
-    assert_eq!(
-        decide(&header(PRE), AckEvidence::None),
-        CountingVersion::Legacy
-    );
-    let mut continuation = header(POST);
-    continuation["payload"]["history_base"] = json!({"thread_id": SESSION});
-    assert_eq!(
-        decide(&continuation, AckEvidence::None),
-        CountingVersion::Legacy
-    );
-    let mut undated = header(POST);
-    undated["payload"]
-        .as_object_mut()
-        .unwrap()
-        .remove("timestamp");
-    assert_eq!(decide(&undated, AckEvidence::None), CountingVersion::Legacy);
-    let first_usage = ui(POST, S1, S1);
-    assert_eq!(
-        decide(&first_usage, AckEvidence::None),
-        CountingVersion::Legacy
-    );
-    let marked = entry(Some("body"), true);
-    let _cutover = version::TestCutover::set(CUTOVER);
-    assert_eq!(version::group_evidence([&marked]), AckEvidence::V2Marked);
-}
-
-#[test]
-fn codex_counting_ack_bool_moves_with_its_entry_through_selected_restore() {
-    let key = "/synthetic/sessions/rollout.jsonl".to_string();
-    let mut committed = ScanIndex::default();
-    committed
-        .files
-        .insert(key.clone(), entry(Some("old-body"), false));
-    let mut working = committed.clone();
-    working
-        .files
-        .insert(key.clone(), entry(Some("new-body"), true));
-    let refused = working.committable_subset(&committed, &BTreeSet::new(), &BTreeMap::new());
-    let kept = &refused.files[&key];
-    assert_eq!(
-        (
-            kept.last_snapshot_fingerprint.as_deref(),
-            kept.codex_counting_v2
-        ),
-        (Some("old-body"), false)
-    );
-    let accepted = working.committable_subset(
-        &committed,
-        &BTreeSet::from(["new-body".to_string()]),
-        &BTreeMap::new(),
-    );
-    let settled = &accepted.files[&key];
-    assert_eq!(
-        (
-            settled.last_snapshot_fingerprint.as_deref(),
-            settled.codex_counting_v2
-        ),
-        (Some("new-body"), true)
-    );
-    // Persisted only when set; an older binary's index loads as unmarked.
-    let saved = serde_json::to_value(settled).unwrap();
-    assert_eq!(saved["codex_counting_v2"], json!(true));
-    let unmarked = serde_json::to_value(entry(Some("body"), false)).unwrap();
-    assert!(unmarked.get("codex_counting_v2").is_none());
-    let reloaded: ScanIndexEntry = serde_json::from_value(unmarked).unwrap();
-    assert!(!reloaded.codex_counting_v2);
-    assert_eq!(AckEvidence::of_view([&reloaded]), AckEvidence::LegacyAcked);
-}
-
-#[test]
-fn codex_counting_ack_bool_survives_twin_alias_and_rekeyed_entries() {
-    let marked = entry(Some("body"), true);
-    let legacy_acked = entry(Some("body"), false);
-    let unacknowledged_twin = entry(None, false);
-    assert_eq!(
-        AckEvidence::of_view([&unacknowledged_twin, &marked]),
-        AckEvidence::V2Marked
-    );
-    assert_eq!(
-        AckEvidence::of_view([&legacy_acked, &unacknowledged_twin]),
-        AckEvidence::LegacyAcked
-    );
-    assert_eq!(
-        AckEvidence::of_view([&unacknowledged_twin]),
-        AckEvidence::None
-    );
-    // Any Legacy ACK dominates any V2 mark, in either order.
-    for view in [[&marked, &legacy_acked], [&legacy_acked, &marked]] {
-        assert_eq!(AckEvidence::of_view(view), AckEvidence::LegacyAcked);
-    }
-    // Re-keyed (migrate) and re-recorded (alias) entries keep the mark with
-    // their acknowledged fingerprint.
-    let path = PathBuf::from("/synthetic/sessions/rollout.jsonl");
-    let candidate = || CandidateFile {
-        physical_identity: None,
-        scan_root: PathBuf::from("/synthetic/sessions"),
-        path: path.clone(),
-        size_bytes: 2,
-        modified_unix_seconds: 2,
-        modified_unix_nanos: 2,
-        source_file_fingerprint: "source-2".into(),
-        legacy_source_file_fingerprint: "legacy".into(),
-        legacy_config_reconciliation_required: false,
-        opened_object_identity: String::new(),
-        fingerprint_changed_nanos: 0,
-        fingerprint_birth_nanos: 0,
-        withheld_content_stamp: None,
-    };
-    let mut index = ScanIndex::default();
-    index
-        .files
-        .insert(local_index_key(&path), entry(Some("body"), true));
-    index.migrate(candidate());
-    assert!(index.files[&local_index_key(&path)].codex_counting_v2);
-    index.record(candidate(), Some("body".into()), ScanParseOutcome::Snapshot);
-    assert!(index.files[&local_index_key(&path)].codex_counting_v2);
-}
-
-#[test]
-fn codex_counting_destination_loss_rederives_only_from_its_own_index() {
-    let post = header(POST);
-    let decide = |index: &ScanIndex| {
-        let evidence = AckEvidence::of_view(index.files.get("/synthetic/sessions/rollout.jsonl"));
-        version::decide(&post, evidence, CUTOVER)
-    };
-    let mut marked = ScanIndex::default();
-    marked.files.insert(
-        "/synthetic/sessions/rollout.jsonl".into(),
-        entry(Some("body"), true),
-    );
-    let mut old_binary = ScanIndex::default();
-    old_binary.files.insert(
-        "/synthetic/sessions/rollout.jsonl".into(),
-        entry(Some("body"), false),
-    );
-    assert_eq!(decide(&marked), CountingVersion::V2);
-    assert_eq!(decide(&old_binary), CountingVersion::Legacy);
-    // Disclosed residual: a lost or rotated destination index has no ACK
-    // evidence, so an old-binary-acknowledged post-cutover session re-derives V2.
-    assert_eq!(decide(&ScanIndex::default()), CountingVersion::V2);
-}
-
-#[test]
-fn codex_counting_retained_reduction_reuse_requires_the_same_rule() {
-    let decided = |values: &[Value], evidence| {
-        let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
-        version::configure(&mut accumulator, evidence, Some(CUTOVER));
-        for value in values {
-            apply_codex_line(value, &mut accumulator);
-        }
-        accumulator.codex_counting.unwrap()
-    };
-    let fresh = |evidence| codex_usage_occurrence::CodexCounting::new(evidence, Some(CUTOVER));
-    let v2_state = decided(&[header(POST)], AckEvidence::None);
-    assert!(v2_state.reusable_under(&fresh(AckEvidence::V2Marked)));
-    assert!(!v2_state.reusable_under(&fresh(AckEvidence::LegacyAcked)));
-    let acked_legacy = decided(&[header(POST)], AckEvidence::LegacyAcked);
-    assert!(acked_legacy.reusable_under(&fresh(AckEvidence::LegacyAcked)));
-    assert!(!acked_legacy.reusable_under(&fresh(AckEvidence::None)));
-
-    // A paused cursor job, checked against its recorded view, applies the
-    // same predicate as the retained reduction's `old.filter`.
-    let evidences = [
-        AckEvidence::None,
-        AckEvidence::V2Marked,
-        AckEvidence::LegacyAcked,
-    ];
-    for decided_under in evidences {
-        let mut paused = SnapshotAccumulator::new(SnapshotSource::Codex);
-        version::configure(&mut paused, decided_under, Some(CUTOVER));
-        apply_codex_line(&header(POST), &mut paused);
-        for now in evidences {
-            assert_eq!(
-                version::reusable_under_view(&paused, &version::view(now, CUTOVER)),
-                version::reusable(paused.codex_counting.as_deref(), Some(&fresh(now))),
-            );
-        }
-        assert!(!version::reusable_under_view(&paused, "legacy"));
-    }
-    let inactive = SnapshotAccumulator::new(SnapshotSource::Codex);
-    assert!(version::reusable_under_view(&inactive, "legacy"));
-    assert!(!version::reusable_under_view(
-        &inactive,
-        &version::view(AckEvidence::None, CUTOVER)
-    ));
-}
-
-#[test]
 fn codex_v2_staged_turn_charge_stays_within_the_stated_bound() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
@@ -1471,7 +1026,7 @@ fn codex_v2_staged_turn_charge_stays_within_the_stated_bound() {
         values.push(ui(&hour(index), step, total));
     }
     let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
-    version::configure(&mut accumulator, AckEvidence::None, Some(CUTOVER));
+
     for value in &values {
         apply_codex_line(value, &mut accumulator);
     }
@@ -1482,13 +1037,4 @@ fn codex_v2_staged_turn_charge_stays_within_the_stated_bound() {
     let bound = fixed + codex_usage_occurrence::max_pending_heap_bytes();
     let charged = crate::heap_layout_bound::bound(counting, usize::MAX).unwrap();
     assert!(charged <= bound, "charged {charged} > stated bound {bound}");
-}
-
-/// Activation freezes one instant, 2026-10-26T12:00:00Z; it must never move.
-#[test]
-fn codex_counting_v2_compiled_cutover_is_frozen() {
-    assert_eq!(
-        version::CODEX_COUNTING_V2_CUTOVER_UNIX_MS,
-        1_793_016_000_000
-    );
 }

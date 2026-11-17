@@ -551,7 +551,7 @@ fn codex_login_identity_rows_bind_through_the_status_lane() {
     if !supported("codex_login_identity_rows") {
         return;
     }
-    let _cutover = crate::snapshots::TestCutover::set(0);
+
     let _no_cli = no_codex_cli();
     let c = corpus("transition-codex-login-identity-rows");
     let mut disk = Disk::with_route(&c, SnapshotSource::Codex);
@@ -619,7 +619,7 @@ fn codex_login_switch_gap_and_twin_workspaces_match_cold_full() {
     if !supported("codex_login_switch_gap_and_twin_workspaces") {
         return;
     }
-    let _cutover = crate::snapshots::TestCutover::set(0);
+
     let _no_cli = no_codex_cli();
     let c = corpus("transition-codex-login-identity-matrix");
     let mut disk = Disk::with_route(&c, SnapshotSource::Codex);
@@ -727,7 +727,7 @@ fn codex_interrupted_save_then_restart_still_serves_the_failure() {
     if !supported("codex_interrupted_save_then_restart") {
         return;
     }
-    let _cutover = crate::snapshots::TestCutover::set(0);
+
     let _no_cli = no_codex_cli();
     let c = corpus("transition-codex-login-interrupted-save");
     let mut disk = Disk::with_route(&c, SnapshotSource::Codex);

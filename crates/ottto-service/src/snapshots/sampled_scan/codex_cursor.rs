@@ -963,34 +963,24 @@ pub(in crate::snapshots) struct InlineInstant(std::time::Instant);
 
 crate::heap_layout_bound::no_heap!(true; InlineInstant);
 
-/// The counting view of `candidate`'s index entries (K8): what a fresh
-/// singleton parser would be configured with now. Recorded at job start,
-/// recomputed from the current entries at every resume and at emission.
-/// `"legacy"` while the counting cutover is inactive.
-pub(in crate::snapshots) fn counting_view(candidate: &CandidateFile, index: &ScanIndex) -> String {
-    crate::snapshots::sources::codex::counting::version::singleton_view(candidate, index)
-}
-
-/// A group's counting view (#603): what
-/// `configure_group_once` would configure now from every member's index
-/// entry (`sources::codex::counting::version::group_view`, the same evidence as
-/// `group_evidence` at boot). A counting change on any member, not only the
-/// live one, changes it; `counting_reusable` decides resume and emission
-/// against it exactly as for a singleton (any member's Legacy ACK takes
-/// precedence).
-pub(in crate::snapshots) fn group_counting_view<'a>(
-    members: impl IntoIterator<Item = &'a CandidateFile>,
-    index: &ScanIndex,
+/// Retired cursor view strings still decode, but never select a counting rule.
+pub(in crate::snapshots) fn counting_view(
+    _candidate: &CandidateFile,
+    _index: &ScanIndex,
 ) -> String {
-    crate::snapshots::sources::codex::counting::version::group_view(members, index)
+    String::new()
 }
-
-/// The counting view a job is decided under: a group's over all members.
-pub(in crate::snapshots) fn job_counting_view(job: &OwnedActiveFile, index: &ScanIndex) -> String {
-    match job.group.as_ref() {
-        Some(group) => group_counting_view(&group.members, index),
-        None => counting_view(&job.candidate, index),
-    }
+pub(in crate::snapshots) fn group_counting_view<'a>(
+    _members: impl IntoIterator<Item = &'a CandidateFile>,
+    _index: &ScanIndex,
+) -> String {
+    String::new()
+}
+pub(in crate::snapshots) fn job_counting_view(
+    _job: &OwnedActiveFile,
+    _index: &ScanIndex,
+) -> String {
+    String::new()
 }
 
 /// A group job's `scope_job`: the join-proof and identity versions.
@@ -4017,6 +4007,18 @@ pub(in crate::snapshots) fn resume_paused_job(
     else {
         return Resumed::Idle;
     };
+    if context.source == SnapshotSource::Codex
+        && job_files(&job).iter().all(|file| {
+            crate::snapshots::sources::codex::counting::version::unchanged_legacy(index, &file.path)
+        })
+    {
+        for file in job_files(&job) {
+            identified_candidates.retain(|candidate| candidate.path != file.path);
+        }
+        drop(job);
+        lease.release();
+        return Resumed::Spent;
+    }
     // A path that no longer names the held object (archived, renamed,
     // deleted or replaced) can never revalidate; end the job now.
     if !path_names_held_object(&job) {

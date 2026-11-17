@@ -28,7 +28,7 @@ fn legacy_user_fork_without_parent_counts_best_effort() {
     let source = SnapshotSource::Codex;
     // 2026-10-25T00:00:00Z: the two named sessions start after it (V2), the
     // legacy fork before it (Legacy counting).
-    let _cutover = crate::snapshots::TestCutover::set(1_792_886_400_000);
+
     let hash = |kind: &str, session: &str| {
         let prefix = if kind == "account" {
             "user"

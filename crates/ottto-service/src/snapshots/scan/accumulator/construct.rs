@@ -40,7 +40,8 @@ impl SnapshotAccumulator {
             latest_turn_id: None,
             codex_observed_priority_turns: None,
             codex_tier_replay: None,
-            codex_counting: None,
+            codex_counting: (source == SnapshotSource::Codex)
+                .then(|| Box::new(codex_usage_occurrence::CodexCounting::new())),
             current_selector: SelectorCapture::default(),
             session_cumulative_usage: None,
             codex_session_meta_seen: false,

@@ -1238,14 +1238,6 @@ pub(super) fn member_set_witness_of<'a>(
     }
     format!("{:x}", digest.finalize())
 }
-#[derive(Clone, Debug)]
-pub(crate) struct LegacyBaseline {
-    pub(crate) owner: String,
-    pub(crate) index_key: String,
-    pub(crate) expected: String,
-    pub(crate) snapshots: Vec<SnapshotItem>,
-}
-crate::heap_layout_bound::fields!(LegacyBaseline; owner, index_key, expected, snapshots);
 const RECEIPT_VERSION: u16 = 1;
 /// Previous application evidence, not provider billing truth. Only hashes of
 /// physical records/context and the applied priority provenance are retained.
@@ -1958,11 +1950,7 @@ impl StreamProof {
             return Err(JoinRefusal::Overlap);
         }
         if self.independent {
-            return if self.v2 {
-                Err(JoinRefusal::V2UnboundUi)
-            } else {
-                Ok(())
-            };
+            return Ok(());
         }
         let tokens = codex_last_usage_root(value)
             .and_then(Tokens::read)
@@ -3781,14 +3769,6 @@ pub(super) mod tests {
     #[test]
     fn counting_v2_group_is_configured_once_and_folded_once() {
         let (root, keys) = counting_v2_fixture();
-        let (legacy_index, legacy) = {
-            // The fixture's October 1 headers predate the frozen cutover.
-            let _cutover = sources::codex::counting::version::TestCutover::set(
-                sources::codex::counting::version::CODEX_COUNTING_V2_CUTOVER_UNIX_MS,
-            );
-            scan(&root, ScanIndex::default(), 2)
-        };
-        let _cutover = sources::codex::counting::version::TestCutover::set(0);
         let (index, counted) = scan(&root, ScanIndex::default(), 2);
         assert_eq!(counted.snapshots.len(), 2, "one alias per physical member");
         let receipts = counted
@@ -3803,21 +3783,8 @@ pub(super) mod tests {
         assert_eq!(receipts.ui_in_unbound_span, 0);
         for key in &keys {
             assert!(index.files[key].codex_counting_v2, "V2 marks every member");
-            assert!(!legacy_index.files[key].codex_counting_v2);
         }
-        let legacy_receipts = legacy
-            .codex_counting_v2
-            .as_deref()
-            .expect("a pre-cutover Legacy scan still reports bookkeeping");
-        assert_eq!(legacy_receipts.v2_sessions, 0);
-        assert_eq!(legacy_receipts.native_counted, 0);
-        assert_eq!(legacy_receipts.tombstone_count, 0);
-        assert_eq!(
-            legacy_receipts.tombstone_cap,
-            sources::codex::counting::version::MAX_COUNTING_TOMBSTONES as u64
-        );
-        for (counted, legacy) in counted.snapshots.iter().zip(&legacy.snapshots) {
-            assert_eq!(counted.input_tokens, legacy.input_tokens);
+        for counted in &counted.snapshots {
             assert_eq!(counted.input_tokens, 300);
         }
         fs::remove_dir_all(root).unwrap();
@@ -3827,7 +3794,6 @@ pub(super) mod tests {
         let (root, keys) = counting_v2_fixture();
         let owner = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
         let previous = {
-            let _cutover = sources::codex::counting::version::TestCutover::set(0);
             let (index, result) = scan(&root, ScanIndex::default(), 2);
             save_selected(&root, "v2.json", index, result, &ScanIndex::default(), None)
         };
@@ -5784,177 +5750,7 @@ pub(super) mod tests {
         }
         index
     }
-    #[test]
-    fn legacy_proof_refreshes_expired_launch_lookup_without_consuming_completed_proof() {
-        let (root, inventory) = fixture();
-        let previous = legacy_index(&inventory);
-        let group = inventory.groups().into_values().next().unwrap();
-        let workers = vec![group.owner.clone()];
-        let key = base64::Engine::encode(
-            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-            [13_u8; 32],
-        );
-        let context = crate::session_attribution::SessionAttributionContext::from_activity_hint(
-            SnapshotSource::Codex,
-            &root,
-            true,
-            Some(&key),
-            Some(crate::session_attribution::SESSION_ATTRIBUTION_HMAC_KEY_VERSION),
-        )
-        .unwrap();
-        let metadata = CodexTitleMetadata::default();
-        let mut boot = GroupBoot::new(group, &previous);
-        loop {
-            match boot.step(Some(&context), &previous) {
-                Boot::Pending => {}
-                Boot::Ready => break,
-                _ => panic!("the legacy group boots"),
-            }
-        }
-        assert!(context.launch_events().prepared(&workers));
-        context.expire_launch_lookup_for_test();
-        assert!(!context.launch_events().prepared(&workers));
-        let events = root.join(".ottto/launch-events/processed");
-        fs::create_dir_all(&events).unwrap();
-        for n in 1..=600 {
-            let raw = json!({"schema":"agent_launch.v1",
-                "controller_session_ref":"11111111-2222-4333-8444-555555555555",
-                "worker_session_ref":format!("{n:08x}-2222-4333-8444-555555555555"),
-                "relationship_kind":"launched", "workflow_ref":null, "pr_ref":null,
-                "launch_ts":"2026-10-01T10:00:00Z",
-                "capture_source":"launcher_event:opus_cli_agent", "evidence":"direct"})
-            .to_string();
-            let event = crate::launch_events::validate_event(&raw).unwrap();
-            fs::write(
-                events.join(format!(
-                    "{}.json",
-                    crate::launch_events::event_digest(&event)
-                )),
-                raw,
-            )
-            .unwrap();
-        }
-        let mut job = boot
-            .into_job(JobInputs {
-                metadata: &metadata,
-                cache: None,
-                index: &previous,
-            })
-            .unwrap();
-        let no_scope = |_: &CandidateFile| None;
-        let inputs = StepInputs {
-            metadata: &metadata,
-            attribution: Some(&context),
-            live_scope: &no_scope,
-            cache: None,
-            collected_at: "2026-10-01T12:00:00Z",
-            index: &previous,
-        };
-        let (mut steps, mut yields) = (0, 0);
-        loop {
-            let before = (
-                job.group.as_ref().unwrap().current,
-                job.parser.reader.consumed_bytes(),
-            );
-            match step_group(&mut job, &inputs) {
-                GroupStep::Read(Ok(true)) => break,
-                GroupStep::Read(Ok(false)) => {}
-                _ => panic!("the legacy group replays"),
-            }
-            let after = (
-                job.group.as_ref().unwrap().current,
-                job.parser.reader.consumed_bytes(),
-            );
-            if before == after && job.parser.reader.finished {
-                // A finished member re-entered its EOF: the lookup yielded.
-                yields += 1;
-            }
-            steps += 1;
-            assert!(steps < 100);
-        }
-        assert!(yields > 0, "lookup must yield across the retained backlog");
-        assert_eq!(
-            job.parser.reader.report.parsed_json_line_count, 6,
-            "completed members must not be read twice"
-        );
-        assert_eq!(job.group.as_mut().unwrap().take_legacy_baselines().len(), 2);
-        assert!(context.launch_events().prepared(&workers));
-        fs::remove_dir_all(root).unwrap();
-    }
 
-    #[test]
-    fn legacy_first_import_requires_actual_old_output_match_and_allows_healthy_sibling() {
-        let (root, inventory) = fixture();
-        let previous = legacy_index(&inventory);
-        let (mut index, mut result) = scan(&root, previous.clone(), 2);
-        assert_eq!(result.codex_legacy_join_baselines.len(), 2);
-        result.reconcile_codex_legacy_joining(&mut index, &previous, "machine", |_, _| {});
-        assert!(result.census_complete);
-        assert_eq!(result.snapshots.len(), 2);
-        fs::remove_dir_all(root).unwrap();
-        let (root, inventory) = fixture();
-        let turn = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
-        let mut rows = member("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "r-b", 200, 300);
-        rows.insert(
-            1,
-            json!({"type":"turn_context","payload":{"turn_id":turn,"model":"gpt-5.2"}}),
-        );
-        fs::write(
-            root.join("sessions/b.jsonl"),
-            rows.iter()
-                .map(|row| serde_json::to_string(row).unwrap() + "\n")
-                .collect::<String>(),
-        )
-        .unwrap();
-        older_build_logs_priority(turn);
-        let previous = legacy_index(&inventory);
-        older_build_logs_expired();
-        let sibling = member(
-            "ffffffff-bbbb-4ccc-8ddd-eeeeeeeeeeee",
-            "r-sibling",
-            100,
-            100,
-        );
-        fs::write(
-            root.join("sessions/sibling.jsonl"),
-            sibling
-                .iter()
-                .map(|row| serde_json::to_string(row).unwrap() + "\n")
-                .collect::<String>(),
-        )
-        .unwrap();
-        let (mut index, mut result) = scan(&root, previous.clone(), 3);
-        result.reconcile_codex_legacy_joining(&mut index, &previous, "machine", |_, _| {});
-        assert!(!result.census_complete);
-        assert_eq!(
-            result.snapshots.len(),
-            1,
-            "only the mismatched legacy group is held"
-        );
-        assert_eq!(
-            result.snapshots[0].source_session_id,
-            "ffffffff-bbbb-4ccc-8ddd-eeeeeeeeeeee"
-        );
-        for (key, entry) in &previous.files {
-            assert_eq!(
-                index.files[key].last_snapshot_fingerprint,
-                entry.last_snapshot_fingerprint
-            );
-        }
-        assert!(index
-            .traversal
-            .as_ref()
-            .unwrap()
-            .unhealthy_retry_not_before_unix_seconds
-            .is_some());
-        let (_index, quiet) = scan(&root, index, 3);
-        assert!(quiet.snapshots.is_empty());
-        assert_eq!(
-            quiet.scanned_file_count, 0,
-            "held unchanged group uses existing retry backoff"
-        );
-        fs::remove_dir_all(root).unwrap();
-    }
     const OWNER: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
     /// Feed members in order through one `StreamProof`, with the parser's
     /// S10 tap after every UI usage record.

@@ -651,10 +651,7 @@ fn install_live_waits_on_missing_evidence_and_rebuilds_on_changed() {
     let live = SnapshotAccumulator::new(SnapshotSource::Codex);
 
     let mut stored = continuable();
-    stored.codex_counting = Some(Box::new(codex_usage_occurrence::CodexCounting::new(
-        sources::codex::counting::version::AckEvidence::None,
-        Some(1),
-    )));
+    stored.codex_counting = None;
     assert_eq!(
         install(&mut stored, &live),
         incompatible(INCOMPATIBLE_COUNTING_VERSION)
@@ -697,10 +694,7 @@ fn install_live_labels_each_incompatible_check() {
             stored.codex_sidecar_binding = Some("another binding".into());
         }),
         ("incompatible_counting_version", |stored, _| {
-            stored.codex_counting = Some(Box::new(codex_usage_occurrence::CodexCounting::new(
-                sources::codex::counting::version::AckEvidence::None,
-                Some(1),
-            )));
+            stored.codex_counting = None;
         }),
         ("incompatible_priority_witness", |stored, _| {
             stored.codex_observed_priority_turns = None;
@@ -780,98 +774,4 @@ fn codex_content_loads_back_from_its_session_facts() {
         Codex::decode_page(Collection::SessionFacts, 6, &unknown, &mut into).err(),
         Some(ReconstructCause::INCOMPATIBLE)
     );
-}
-
-/// Capture the pre-change writer's synthetic head for forward compatibility tests.
-#[test]
-fn export_historical_codex_head() {
-    use crate::snapshots::sampled_scan::transition_fixture::native_cold;
-    use crate::snapshots::sources::codex::counting::version::{self, AckEvidence};
-    let dir = std::env::temp_dir().join(format!("ottto-historical-head-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("rollout.jsonl");
-    let mut rows = lines(1);
-    // One native response plus two UI observations: Legacy and V2 differ.
-    let mut ui: Value = serde_json::from_str(
-        rows.iter()
-            .find(|line| line.contains("token_count"))
-            .unwrap(),
-    )
-    .unwrap();
-    ui["timestamp"] = json!("2026-10-18T10:00:01Z");
-    rows.insert(rows.len() - 1, ui.to_string());
-    rows.insert(
-        3,
-        json!({"timestamp":at(0),"type":"token_usage_record","payload":{
-            "thread_id":SESSION,"turn_id":"turn-0000","response_id":"response-0000",
-            "usage":{"input_tokens":100,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":30,"reasoning_output_tokens":0,"total_tokens":130},
-            "thread_token_usage":{"input_tokens":100,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":30,"reasoning_output_tokens":0,"total_tokens":130}
-        }})
-        .to_string(),
-    );
-    let root = "1338a80a-f36e-4cbc-a5bb-50fc66430ba5";
-    let at = "2026-10-27T07:00:00Z";
-    let usage = json!({"input_tokens":10,"cached_input_tokens":0,"output_tokens":2,"reasoning_output_tokens":0,"total_tokens":12});
-    let sticky = vec![
-        json!({"type":"session_meta","timestamp":at,"payload":{"id":root,"timestamp":at}}),
-        json!({"type":"event_msg","timestamp":"2026-10-27T07:00:01Z","payload":{"type":"task_started","turn_id":"turn-a"}}),
-        json!({"type":"token_usage_record","timestamp":"2026-10-27T07:00:02Z","payload":{"thread_id":root,"turn_id":"turn-a","response_id":"turn-a","usage":usage,"thread_token_usage":usage}}),
-        json!({"type":"event_msg","timestamp":"2026-10-27T07:00:03Z","payload":{"type":"token_count","info":{"model":"gpt-5.2","last_token_usage":usage,"total_token_usage":usage}}}),
-        json!({"type":"event_msg","timestamp":"2026-10-27T07:00:04Z","payload":{"type":"task_complete","turn_id":"turn-a"}}),
-    ].into_iter().map(|row|row.to_string()).collect::<Vec<_>>();
-    for (fixture, rows) in [("mixed", rows), ("sticky", sticky)] {
-        std::fs::write(&path, rows.join("\n") + "\n").unwrap();
-        for (name, evidence, cutover) in [
-            ("legacy", AckEvidence::LegacyAcked, Some(i64::MAX)),
-            ("v2", AckEvidence::None, Some(0)),
-        ] {
-            let mut parser = native_cold::parser(
-                SnapshotSource::Codex,
-                &path,
-                File::open(&path).unwrap(),
-                apply_codex_line,
-            );
-            version::configure(&mut parser.accumulator, evidence, cutover);
-            let scope = super::super::seam::tests::scope();
-            parser
-                .prepare_acquisition(None, &scope, None, 1_790_000_000)
-                .unwrap();
-            let (reduction, checkpoint) =
-                native_cold::finish_record(&mut parser, &scope, 1_790_000_000);
-            let totals = &reduction.finish_view().0.accepted_usage_totals;
-            let expected = match (fixture, name) {
-                ("mixed", "legacy") => (200, 20),
-                ("mixed", "v2") => (100, 30),
-                _ => (10, 2),
-            };
-            assert_eq!((totals.input_tokens, totals.output_tokens), expected);
-            let staged = stage_reduction::<Codex>(
-                &reduction,
-                &checkpoint.durable_certificate(0).unwrap(),
-                &identity(),
-            );
-            let pages = staged
-                .pages
-                .iter()
-                .map(|((collection, page), bytes)| json!([format!("{collection:?}"), page, bytes]))
-                .collect::<Vec<_>>();
-            let collections = staged
-                .collections
-                .iter()
-                .map(|(collection, meta)| {
-                    json!([
-                        format!("{collection:?}"),
-                        meta.shape as u8,
-                        meta.elements_per_page,
-                        meta.elements
-                    ])
-                })
-                .collect::<Vec<_>>();
-            println!(
-                "HISTORICAL_CODEX_HEAD {}",
-                json!({"name":format!("{fixture}-{name}"),"revision":staged.revision,"head":staged.head,"pages":pages,"collections":collections,"lines":rows})
-            );
-        }
-    }
-    std::fs::remove_dir_all(dir).unwrap();
 }

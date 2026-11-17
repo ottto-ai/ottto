@@ -224,7 +224,6 @@ pub(crate) struct OwnedSourceScan {
     pub(in crate::snapshots) codex_join_groups: VecDeque<codex_file_join::Group>,
     pub(in crate::snapshots) codex_join_active: Option<Box<codex_file_join::GroupBoot>>,
     pub(in crate::snapshots) codex_join_completed: Vec<codex_file_join::Group>,
-    pub(in crate::snapshots) codex_legacy_join_baselines: Vec<codex_file_join::LegacyBaseline>,
     /// Decoded bytes this page consumed; the cursor job and ordinary Codex
     /// singleton reads have separate budgets.
     pub(in crate::snapshots) codex_page: sampled_scan::codex_cursor::PageBudget,
@@ -450,7 +449,6 @@ impl OwnedSourceScan {
             codex_join_groups: Default::default(),
             codex_join_active: None,
             codex_join_completed: Vec::new(),
-            codex_legacy_join_baselines: Vec::new(),
             codex_page,
             selected_flags: Default::default(),
             continuation_ticket: None,
@@ -1391,7 +1389,6 @@ impl OwnedSourceScan {
             codex_join_groups: VecDeque::new(),
             codex_join_active: None,
             codex_join_completed: Vec::new(),
-            codex_legacy_join_baselines: Vec::new(),
             codex_page: sampled_scan::codex_cursor::PageBudget::with_next_generation_hints(
                 next_generation_hints,
             ),

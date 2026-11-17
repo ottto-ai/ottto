@@ -1,8 +1,7 @@
 //! Codex usage counting V2: one billed request is counted once at its native
 //! usage. Local only: never uploaded except where the upload contract
 //! already carries it; persisted only in the local durable-tail store (raw
-//! response and turn ids are class `L`). A Legacy session constructs it only
-//! for the shared equal-total repeat gate, at its first counted UI line.
+//! response and turn ids are class `L`). Every new Codex parse constructs V2; historical counting slots decode only.
 //!
 //! Native `token_usage_record`s are the authority for their turn. Coverage on
 //! the native thread counter (`[before, after)`, six dimensions) decides what
@@ -15,7 +14,7 @@ mod rss_test_support;
 
 use crate::codex_scan_diagnostics::CountingV2Receipts;
 use crate::owned_heap::OwnedMap;
-use crate::snapshots::sources::codex::counting::version::{self, AckEvidence, CountingVersion};
+use crate::snapshots::sources::codex::counting::version::{AckEvidence, CountingVersion};
 use crate::snapshots::*;
 
 /// Counting-contract row cap for one open turn's staged UI money. Changing it
@@ -56,13 +55,17 @@ pub(in crate::snapshots) struct CodexCounting {
 }
 
 impl CodexCounting {
-    pub(in crate::snapshots) fn new(evidence: AckEvidence, cutover_unix_ms: Option<i64>) -> Self {
+    pub(in crate::snapshots) fn new() -> Self {
         Self {
-            evidence,
-            cutover_unix_ms,
-            version: None,
-            reducer: None,
+            evidence: AckEvidence::None,
+            cutover_unix_ms: None,
+            version: Some(CountingVersion::V2),
+            reducer: Some(Box::default()),
         }
+    }
+
+    pub(in crate::snapshots) fn is_v2(&self) -> bool {
+        self.version == Some(CountingVersion::V2)
     }
 
     /// Local, content-free receipts for the diagnostics owner to fold in
@@ -89,7 +92,7 @@ impl CodexCounting {
     }
 
     /// Adds this parse's receipts and open-turn debt to the scan's local
-    /// diagnostics. A Legacy decision adds only its repeat drops.
+    /// diagnostics.
     pub(in crate::snapshots) fn fold_receipts(&self, into: &mut CountingV2Receipts) {
         let Some(reducer) = self.reducer.as_deref() else {
             return;
@@ -196,22 +199,6 @@ impl CodexCounting {
             ),
             None => count(&mut into.open_turn_ui_pending_unsummable_this_scan, 1),
         }
-    }
-
-    /// A retained reduction may continue under fresh evidence only when that
-    /// evidence would have selected the same rule (B handoff H4).
-    pub(in crate::snapshots) fn reusable_under(&self, fresh: &CodexCounting) -> bool {
-        self.cutover_unix_ms == fresh.cutover_unix_ms
-            && match self.version {
-                None => self.evidence == fresh.evidence,
-                Some(CountingVersion::Legacy) => {
-                    // Legacy chosen from the header itself stays Legacy under
-                    // any evidence; Legacy chosen only from ACK evidence must
-                    // not be resumed once that evidence is gone.
-                    self.evidence == fresh.evidence || fresh.evidence == AckEvidence::LegacyAcked
-                }
-                Some(CountingVersion::V2) => fresh.evidence != AckEvidence::LegacyAcked,
-            }
     }
 }
 
@@ -632,8 +619,7 @@ impl SnapshotAccumulator {
         self.codex_counting.as_mut()?.reducer.as_deref_mut()
     }
 
-    /// Runs for every owned Codex line before the shared UI usage path. The
-    /// first owned record fixes the session's counting version.
+    /// Runs the V2 reducer for every owned Codex line before the UI path.
     pub(in crate::snapshots) fn observe_codex_counting_line(
         &mut self,
         value: &Value,
@@ -641,9 +627,6 @@ impl SnapshotAccumulator {
         selector: &SelectorCapture,
     ) {
         self.observe_codex_turn_lifecycle(value, true);
-        if !self.codex_counting_v2() {
-            return;
-        }
         if string_eq_at(value, &["type"], "token_usage_record") {
             self.admit_codex_native(value, timestamp, selector);
         }
@@ -653,33 +636,6 @@ impl SnapshotAccumulator {
         let Some(counting) = self.codex_counting.as_mut() else {
             return;
         };
-        if counting.version.is_none() {
-            // Preserve the meaning of historical persisted None cutovers.
-            let version = counting
-                .cutover_unix_ms
-                .map_or(CountingVersion::Legacy, |cutover| {
-                    version::decide(value, counting.evidence, cutover)
-                });
-            counting.version = Some(version);
-            if version == CountingVersion::V2 {
-                counting.reducer = Some(Box::default());
-            }
-        }
-        if counting.version != Some(CountingVersion::V2) {
-            // Legacy keeps only the shared repeat gate's state, allocated at
-            // its first UI line with a nonzero `last` (the first one it
-            // counts). Turns, natives and closures stay V2-only.
-            let line_ui = ui_t6_pair(value);
-            if counting.reducer.is_none()
-                && line_ui.is_some_and(|(last, _)| last.iter().any(|tokens| *tokens != 0))
-            {
-                counting.reducer = Some(Box::default());
-            }
-            if let Some(reducer) = counting.reducer.as_mut() {
-                reducer.line_ui = line_ui;
-            }
-            return;
-        }
         let Some(reducer) = counting.reducer.as_mut() else {
             return;
         };
@@ -954,29 +910,6 @@ impl SnapshotAccumulator {
         Some(delta)
     }
 
-    /// Legacy's use of the shared repeat gate for a line it would count.
-    /// `true` drops the line. Without the slot (no counted UI line yet) there
-    /// is nothing to repeat. `may_drop` is false for a line dated before the
-    /// forward date: it counts and is not a counted drop, but its tuple is
-    /// still noted.
-    pub(in crate::snapshots) fn codex_legacy_ui_repeat(
-        &mut self,
-        last: Option<UsageTotals>,
-        total: UsageTotals,
-        delta: &UsageTotals,
-        may_drop: bool,
-    ) -> bool {
-        let Some(reducer) = self.codex_occurrence() else {
-            return false;
-        };
-        let tuple = reducer.take_ui_tuple(last, total);
-        if may_drop && reducer.equal_total_repeat(&tuple, delta) {
-            return true;
-        }
-        reducer.note_ui(tuple);
-        false
-    }
-
     /// Shared admission decision, with no publication/staging. `false` is
     /// the unbound span admitted before the bound equal-total repeat filter.
     pub(in crate::snapshots) fn decide_codex_usage(
@@ -992,7 +925,7 @@ impl SnapshotAccumulator {
         // Today's delta: `last`, else the cumulative delta, else the whole
         // total on a first event or reset. A bound turn never counts that
         // inherited/reset base.
-        let (legacy_delta, bound_delta) = match (&last_usage, &previous) {
+        let (unbound_delta, bound_delta) = match (&last_usage, &previous) {
             (Some(last), _) => (last.clone(), Some(last.clone())),
             (None, Some(previous)) if !reset => {
                 let delta = usage.delta_from(previous);
@@ -1008,8 +941,8 @@ impl SnapshotAccumulator {
             }
             delta
         };
-        let legacy_delta = with_count(legacy_delta);
-        if legacy_delta.is_zero() {
+        let unbound_delta = with_count(unbound_delta);
+        if unbound_delta.is_zero() {
             return None;
         }
         let reducer = self.codex_occurrence()?;
@@ -1017,9 +950,9 @@ impl SnapshotAccumulator {
         if reducer.turn.is_none() {
             reducer.counters.ui_in_unbound_span += 1;
             reducer.note_ui(tuple);
-            return Some((resolved_model, legacy_delta, false));
+            return Some((resolved_model, unbound_delta, false));
         }
-        if reducer.equal_total_repeat(&tuple, &legacy_delta) {
+        if reducer.equal_total_repeat(&tuple, &unbound_delta) {
             return None;
         }
         reducer.note_ui(tuple);
@@ -1027,7 +960,7 @@ impl SnapshotAccumulator {
             reducer.counters.v2_cumulative_base_uncounted += 1;
             add_t6(
                 &mut reducer.counters.v2_cumulative_base_uncounted_usage,
-                &totals_t6(&legacy_delta),
+                &totals_t6(&unbound_delta),
             );
             return None;
         };

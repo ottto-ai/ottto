@@ -11,22 +11,33 @@ fn independent_fixture(tag: &str, members: &[u64]) -> (PathBuf, Vec<u64>) {
             meta(OWNER, &format!("2026-10-01T09:0{i}:00Z"), extra),
             turn(&format!("t-{i}")),
         ];
+        rows.insert(
+            1,
+            json!({"timestamp":"2026-10-01T10:00:00Z", "type":"event_msg",
+            "payload":{"type":"task_started", "turn_id":format!("t-{i}")}}),
+        );
         for n in 1..=*requests {
             // The revert counter starts at an earlier base, while the original
             // has billed turns beyond it. Last usage is each file's own money.
             let base = if i == 0 { 0 } else { 37 };
-            rows.push(native(
+            let mut record = native(
                 OWNER,
                 &format!("r-{i}-{n}"),
                 100 + i as u64,
                 base + n * (100 + i as u64),
-            ));
+            );
+            record["payload"]["turn_id"] = json!(format!("t-{i}"));
+            rows.push(record);
             rows.push(ui(
                 100 + i as u64,
                 base + n * (100 + i as u64),
                 "2026-10-01T10:00:00Z",
             ));
         }
+        rows.push(
+            json!({"timestamp":"2026-10-01T10:02:00Z","type":"event_msg",
+            "payload":{"type":"task_complete","turn_id":format!("t-{i}")}}),
+        );
         let bytes = rows
             .iter()
             .map(|row| row.to_string() + "\n")

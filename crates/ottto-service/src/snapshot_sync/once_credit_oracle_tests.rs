@@ -575,7 +575,7 @@ impl OracleHome {
         let small_page = self.small_page;
         let budget = self.state_budget;
         let legacy = self.legacy_counting;
-        let _cutover = legacy.then(|| crate::snapshots::TestCutover::set(i64::MAX));
+
         let at = OffsetDateTime::from_unix_timestamp(now as i64)
             .unwrap()
             .format(&Rfc3339)
@@ -637,7 +637,7 @@ impl OracleHome {
         let worker_births = self.births.clone();
         let (preparation, index, scan, steps, mut io) = run_on_scan_worker_stack(move || {
             let _entered = handle.enter();
-            let _cutover = legacy.then(|| crate::snapshots::TestCutover::set(i64::MAX));
+
             let read = move || {
                 with_scan_clock(now, || {
                     let ((preparation, index, scan, steps), io) =
