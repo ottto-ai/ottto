@@ -212,51 +212,6 @@ fn history_revisions_are_pinned() {
     }
 }
 #[test]
-fn retry_copy_keeps_compaction_events_and_never_local_context_points() {
-    let root = crate::test_scratch::ScratchDir::new("retry-compaction-events");
-    let path = root.join("rollout-retry-compaction.jsonl");
-    let token = |at: &str, total: u64, last: u64| {
-        serde_json::json!({"type":"event_msg", "timestamp":at,
-        "payload":{"type":"token_count", "info":{"model":"gpt-5.6",
-        "total_token_usage":{"input_tokens":total,"cached_input_tokens":total/2,"output_tokens":total/10},
-        "last_token_usage":{"input_tokens":last,"cached_input_tokens":last/2,"output_tokens":last/10}}}})
-    };
-    let lines = [
-        serde_json::json!({"type":"session_meta","payload":{"id":"retry-compaction"}}),
-        token("2026-10-07T11:00:00Z", 240_000, 240_000),
-        serde_json::json!({"timestamp":"2026-10-07T11:10:00Z","type":"compacted","payload":{"replacement_history":[]}}),
-        token("2026-10-07T11:20:00Z", 299_000, 59_000),
-    ];
-    let body = lines
-        .iter()
-        .map(|line| format!("{line}\n"))
-        .collect::<String>();
-    std::fs::write(&path, body).unwrap();
-    let mut item =
-        crate::snapshots::parse_codex_jsonl_file(&path, "2026-10-07T12:00:00Z", "fp".into())
-            .unwrap()
-            .remove(0);
-    item.cache_observations = None;
-    item.cache_base_head_etag = None;
-    assert_eq!(item.compaction_events.len(), 1);
-    assert!(!item.local_context_points.is_empty());
-    // Codex never carries design E's first own request time; a Claude
-    // value survives the retry copy like the other wire fields.
-    assert_eq!(item.first_own_request_at, None);
-    item.first_own_request_at = Some("2026-10-07T11:00:00Z".into());
-
-    let copy = retry_ordinary_owned(&item).expect("ordinary item copies");
-
-    assert_eq!(copy.first_own_request_at, item.first_own_request_at);
-    assert_eq!(copy.compaction_events, item.compaction_events);
-    assert!(copy.local_context_points.is_empty());
-    assert_eq!(
-        serde_json::to_value(&copy).unwrap()["compaction_events"],
-        serde_json::to_value(&item).unwrap()["compaction_events"]
-    );
-}
-
-#[test]
 fn machine_icon_cache_preserves_missing_null_and_blank_echoes() {
     let root = crate::test_scratch::ScratchDir::new("machine-icon-cache");
     let path = root.join("machine_icon.json");

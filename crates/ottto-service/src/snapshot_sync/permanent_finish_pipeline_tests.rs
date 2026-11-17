@@ -301,7 +301,6 @@ fn permanent_finish_pipeline(outcome: FinishOutcome) {
     let client = SnapshotApiClient::new(server.url.clone());
     let daemon = test_daemon("otm_test");
     let mut transport = crate::net_resilience::TransportCycleOutcome::default();
-    let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
     let collection = || AgentStatusCollection {
         snapshots: vec![test_agent_status(SourceKind::ClaudeCode)],
         source_health_snapshot: test_agent_status(SourceKind::ClaudeCode),
@@ -328,7 +327,6 @@ fn permanent_finish_pipeline(outcome: FinishOutcome) {
                 &daemon,
                 &mut transport,
                 daemon.snapshot_scan_account_witness().unwrap(),
-                false,
             )
         })
         .unwrap()
@@ -378,7 +376,6 @@ fn permanent_finish_pipeline(outcome: FinishOutcome) {
                 &support,
                 &daemon,
                 &mut transport,
-                &mut retry,
             )
         });
         assert_eq!(
@@ -685,7 +682,6 @@ fn permanent_finish_dominated_refusal_with_pending_newer_body_is_not_success() {
     let client = SnapshotApiClient::new(server.url.clone());
     let daemon = test_daemon("otm_test");
     let mut transport = crate::net_resilience::TransportCycleOutcome::default();
-    let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
     let collection = || AgentStatusCollection {
         snapshots: vec![test_agent_status(SourceKind::ClaudeCode)],
         source_health_snapshot: test_agent_status(SourceKind::ClaudeCode),
@@ -707,7 +703,6 @@ fn permanent_finish_dominated_refusal_with_pending_newer_body_is_not_success() {
                 &daemon,
                 &mut transport,
                 daemon.snapshot_scan_account_witness().unwrap(),
-                false,
             )
         })
         .unwrap()
@@ -730,7 +725,6 @@ fn permanent_finish_dominated_refusal_with_pending_newer_body_is_not_success() {
                 &support,
                 &daemon,
                 &mut transport,
-                &mut retry,
             )
         });
         assert!(result.is_ok(), "cycle {cycle}: {result:?}");
@@ -997,7 +991,6 @@ struct AckFinishHome {
     client: SnapshotApiClient,
     daemon: LocalDaemon,
     transport: crate::net_resilience::TransportCycleOutcome,
-    retry: live_snapshot_retry::LiveRetryOwner,
     _env: [EnvVarGuard; 3],
 }
 
@@ -1034,7 +1027,6 @@ impl AckFinishHome {
             client: SnapshotApiClient::new(server.url.clone()),
             daemon: test_daemon("otm_test"),
             transport: crate::net_resilience::TransportCycleOutcome::default(),
-            retry: live_snapshot_retry::LiveRetryOwner::closed(),
             _env: env,
         }
     }
@@ -1076,7 +1068,6 @@ impl AckFinishHome {
                 &self.daemon,
                 &mut self.transport,
                 self.daemon.snapshot_scan_account_witness().unwrap(),
-                false,
             )
         })
         .unwrap()
@@ -1104,7 +1095,6 @@ impl AckFinishHome {
                 &self.support,
                 &self.daemon,
                 &mut self.transport,
-                &mut self.retry,
             )
         })
     }

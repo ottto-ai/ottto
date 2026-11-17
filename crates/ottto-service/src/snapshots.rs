@@ -192,7 +192,6 @@ mod session_start;
 /// Tail state codecs: each source's head and pages in the state database.
 #[cfg(unix)]
 mod tail_source;
-pub(crate) use session_start::OpeningFileCandidate;
 pub(crate) use session_start::{session_start_verdict, StartVerdict};
 pub use session_start::{SnapshotOpeningFile, SnapshotSessionStart};
 mod disappearance_diagnostics;
@@ -221,8 +220,6 @@ mod resident_wave_tests;
 pub(crate) mod resource_fixture;
 pub(crate) use scan::lines::delivery as line_delivery;
 mod oversized_discovery;
-#[path = "pi_retry_inputs.rs"]
-mod pi_retry_inputs;
 mod sampled_audit;
 mod sampled_jsonl;
 pub(crate) mod sampled_scan;
@@ -245,7 +242,6 @@ use claude_history_upgrade::{
 use claude_reemission_exclusions::ReemissionExclusions;
 use claude_request_census::{ClaudeRequestCensus, ClaudeRequestCensusShadowState};
 use codex_compressed_input::{is_compressed_codex_rollout, refuse_compressed_codex, OpenedInput};
-pub(crate) use pi_retry_inputs::PiRetryInputs;
 #[cfg(test)]
 pub(crate) use sampled_scan::codex_cursor::{cursor_limit_for_test, with_test_limits_for_test};
 pub(crate) use sampled_scan::codex_cursor::{CodexCursorPort, CodexCursorTicket};
