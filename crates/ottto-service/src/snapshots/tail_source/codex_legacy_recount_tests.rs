@@ -89,21 +89,26 @@ impl LegacyFixture {
     }
     fn accepted_group() -> Self {
         let route = route_for(Source::Codex);
-        let (old, lines) = historical();
-        let path = route.dir.join(format!(
-            "rollout-2026-10-18T10-00-00-{}.jsonl",
-            old.source_session_id.as_ref().unwrap()
-        ));
+        let (old, lines) = historical_codex::read(Frozen::StickyLegacy);
+        let owner = old.source_session_id.as_deref().unwrap();
+        let path = route
+            .dir
+            .join(format!("rollout-2026-10-18T10-00-00-{owner}.jsonl"));
         fs::write(&path, lines.join("\n") + "\n").unwrap();
         let key = local_index_key(&path);
         let mut f = Self { route, path, key };
         let path = f
             .route
             .dir
-            .join(format!("rollout-2026-10-18T10-00-01-{SESSION}.jsonl"));
+            .join(format!("rollout-2026-10-18T10-00-01-{owner}.jsonl"));
         fs::copy(&f.path, &path).unwrap();
-        let (scan, _) = f.page(&E2ScanFixture::default());
-        assert!(!scan.snapshots.is_empty());
+        let (scan, modes) = f.page(&E2ScanFixture::default());
+        assert!(
+            !scan.snapshots.is_empty(),
+            "group setup: census={} ownership={} modes={modes:?}",
+            scan.census_complete,
+            scan.ownership_incomplete_file_count
+        );
         f.accept(&scan);
         // Production group commits write accepted index facts, not member
         // reductions. Rebind the genuine historical body to that same shape.
@@ -115,7 +120,7 @@ impl LegacyFixture {
                     .is_none()
             );
             let entry = &f.route.index.files[&key];
-            let items = historical().0.into_items(
+            let items = historical_codex::read(Frozen::StickyLegacy).0.into_items(
                 member,
                 "2026-10-27T08:00:00Z",
                 entry.source_file_fingerprint.clone(),
@@ -443,14 +448,28 @@ fn codex_legacy_growth_recounts_cold_v2() {
 
     for paged in [false, true] {
         let mut group = LegacyFixture::accepted_group();
-        group.change(
-            &(codex_lines(40)
-                .into_iter()
-                .skip(codex_lines(1).len())
-                .collect::<Vec<_>>()
-                .join("\n")
-                + "\n"),
-        );
+        group.continuation();
+        let continuation = fs::read_dir(&group.route.dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("rollout-2026-10-27T07-01-00-")
+            })
+            .unwrap();
+        let extra = fs::read_to_string(&continuation)
+            .unwrap()
+            .lines()
+            .skip(1)
+            .map(|line| line.to_owned() + "\n")
+            .collect::<String>();
+        fs::remove_file(continuation).unwrap();
+        group.change(&extra);
+        if paged {
+            group.change(&"\n".repeat(5000));
+        }
         let scanner = E2ScanFixture::default();
         let before = counters::total("codex_legacy_recount", "baseline_unknown");
         let mut pages = 0;
