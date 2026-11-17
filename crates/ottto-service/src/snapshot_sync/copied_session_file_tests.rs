@@ -2648,10 +2648,22 @@ fn settled_disclosed_copy_redecides_once_after_holder_acceptance() {
                 );
                 assert!(removed_hashes(&off_page.index, &copy).is_empty());
             } else {
+                // As in copied_content_and_path_twins_count_once, a page
+                // containing only a content twin waits for its filename main.
+                // The stored removal stands, but the held item stays owed
+                // instead of reaching the all-copy suppression branch.
                 assert!(
-                    body(&off_page, ROOT).is_none(),
-                    "an all-copy-only page is suppressed"
+                    body(&off_page, ROOT).is_some(),
+                    "the content-held copy stays owed"
                 );
+                assert_eq!(
+                    off_page
+                        .disposition
+                        .request_owned_hold_reasons
+                        .get("absent_content_twin"),
+                    Some(&1)
+                );
+                assert_eq!(off_page.disposition.quarantined_entity_count(), 1);
                 assert_eq!(removed_hashes(&off_page.index, &copy).len(), 2);
             }
             corrected.enrich(&c);
