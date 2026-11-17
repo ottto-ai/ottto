@@ -22,9 +22,9 @@ use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
-#[cfg(test)]
-use std::io::BufWriter;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+#[cfg(test)]
+use std::io::{BufWriter, Write};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(unix)]

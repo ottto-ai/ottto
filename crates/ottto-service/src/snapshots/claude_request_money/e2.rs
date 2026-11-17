@@ -2495,6 +2495,11 @@ impl CopyOwnership {
     }
 }
 
+#[cfg(test)]
+pub(in crate::snapshots) fn reconcile_copy_ownership(previous: &ScanIndex, next: &mut ScanIndex) {
+    CopyOwnership::capture(previous).reconcile(next, &mut |_| BTreeMap::new());
+}
+
 fn committed_holder_order(
     store: &super::super::claude_money_birth_store::BirthStore,
     root: &str,
