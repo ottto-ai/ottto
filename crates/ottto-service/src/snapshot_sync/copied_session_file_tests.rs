@@ -1235,7 +1235,9 @@ fn held_content_twin_holder_proves_no_copy_until_released() {
         // at its save; that carrier loss marks H once. One recovery pass
         // re-reads H (never C) and changes no accepted body.
         let after_release = accepted.clone();
+        assert!(e2::carrier_group_owned_for_test(&prior, &main_key));
         assert!(prior.claude_copy_removals.pending(location_key(&main_key)));
+        assert!(!prior.claude_copy_removals.pending(location_key(&copy_key)));
         let mut recovery = c.raw(&scanner, prior.clone(), 100, true, &[]);
         assert!(!scanner.paths().contains(&copy));
         recovery.enrich(&c);

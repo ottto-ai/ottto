@@ -2272,7 +2272,9 @@ impl CopyOwnership {
             (old_carried.contains(member.root) && !live.carried.contains(member.root))
                 .then_some(location)
         }));
-        let carrier_lost = marks[invalidated.len()..].to_vec();
+        let mut carrier_lost = marks[invalidated.len()..].to_vec();
+        // A carrier transfer leaves dependents settled if the main still owns its group.
+        carrier_lost.retain(|h| !index_group_owned(next, &live, live[h]));
         let keys = before
             .keys()
             .map(String::as_str)

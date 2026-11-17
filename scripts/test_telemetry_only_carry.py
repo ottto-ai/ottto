@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify pinned prior sources refuse the current layout without changing custody.""""
+"""Verify pinned prior sources refuse the current layout without changing custody."""
 import os
 from pathlib import Path
 import subprocess
