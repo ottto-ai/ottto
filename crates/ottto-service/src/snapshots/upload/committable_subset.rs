@@ -260,10 +260,6 @@ impl ScanIndex {
             }),
             persistence_root: previous.persistence_root.clone(),
             persistence_controls: previous.persistence_controls.clone(),
-            persistence_legacy_recovery: self
-                .persistence_legacy_recovery
-                .clone()
-                .or_else(|| previous.persistence_legacy_recovery.clone()),
             persistence_unavailable: std::array::from_fn(|i| {
                 self.persistence_unavailable[i].or(previous.persistence_unavailable[i])
             }),

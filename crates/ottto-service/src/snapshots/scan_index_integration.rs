@@ -1,4 +1,4 @@
-//! Production reader adapter; synchronous legacy saves retain the full semantic CAS.
+//! Import-only reader adapter for legacy and sharded input.
 use super::*;
 
 pub(super) fn scan_index_storage_binding(path: &Path) -> Option<scan_index_persistence::Binding> {
@@ -240,87 +240,6 @@ impl ScanIndex {
     }
 }
 
-pub(super) fn publish(
-    store: &scan_index_persistence::LockedStore,
-    expected: &scan_index_persistence::LoadedRoot,
-    index: &ScanIndex,
-) -> Result<scan_index_persistence::LoadedRoot> {
-    index.require_persistence_available()?;
-    let result = store.write_legacy(expected, index.generation, |out| {
-        lenient_decode::write_index(out, index).map_err(Into::into)
-    });
-    drain_stats(store, "unattributed");
-    result
-}
-
 #[cfg(test)]
 #[path = "scan_index_integration_tests.rs"]
 mod tests;
-
-pub(super) fn publish_at(
-    path: &Path,
-    index: &ScanIndex,
-) -> Result<
-    Option<(
-        scan_index_persistence::Binding,
-        scan_index_persistence::LoadedRoot,
-    )>,
-> {
-    let Some(binding) = index
-        .persistence_root
-        .as_ref()
-        .map(|(binding, _)| binding.clone())
-        .or_else(|| scan_index_storage_binding(path))
-    else {
-        return Ok(None);
-    };
-    anyhow::ensure!(
-        scan_index_storage_binding(path).as_ref() == Some(&binding),
-        "scan_index_binding"
-    );
-    let store =
-        scan_index_persistence::LockedStore::new(path, binding.clone(), lenient_decode::FIELDS)?;
-    if let Some(recovery) = &index.persistence_legacy_recovery {
-        let result = store.write_recovered_legacy(recovery, index.generation, |out| {
-            lenient_decode::write_index(out, index).map_err(Into::into)
-        });
-        drain_stats(&store, "unattributed");
-        return result.map(|root| Some((binding, root)));
-    }
-    let expected = if let Some((_, expected)) = &index.persistence_root {
-        expected.clone()
-    } else {
-        match open_storage(&store, "unattributed")? {
-            scan_index_persistence::Opened::Missing(root)
-            | scan_index_persistence::Opened::Legacy(_, root) => root,
-            _ => return Err(anyhow::anyhow!("current_index_requires_reload")),
-        }
-    };
-    publish(&store, &expected, index).map(|root| Some((binding, root)))
-}
-
-pub(super) fn prepare_legacy_recovery(
-    path: &Path,
-    quarantine: &Path,
-) -> Result<Option<Arc<scan_index_persistence::LegacyRecovery>>> {
-    let Some(binding) = scan_index_storage_binding(path) else {
-        return Ok(None);
-    };
-    anyhow::ensure!(
-        path.parent() == quarantine.parent(),
-        "scan_index_legacy_recovery_refused"
-    );
-    let name = quarantine
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| anyhow::anyhow!("scan_index_legacy_recovery_refused"))?;
-    scan_index_persistence::LockedStore::new(path, binding, lenient_decode::FIELDS)?
-        .legacy_recovery(name)
-        .map(Some)
-}
-impl crate::heap_layout_bound::HeapLayoutBound for scan_index_persistence::LegacyRecovery {
-    const STABLE_HEAP: bool = true;
-    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(self.retained_bytes())
-    }
-}

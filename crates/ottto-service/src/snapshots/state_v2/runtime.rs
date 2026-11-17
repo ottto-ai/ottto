@@ -598,20 +598,14 @@ fn binding_for(path: &Path) -> Result<super::super::scan_index_persistence::Bind
     binding(path).ok_or_else(|| Hold::ForeignBinding.into())
 }
 
-/// All save routes check independent evidence before any v1 CAS or publication.
+/// Only an authenticated store session may save a graph.
 pub(in super::super) fn save_locked(
     path: &Path,
     index: &mut ScanIndex,
     claim_only: bool,
-    custody: bool,
-) -> Result<bool> {
-    if binding(path).is_none() {
-        ensure!(index.v2().persistence_v2.is_none(), Hold::ForeignBinding);
-        return Ok(false);
-    }
-    if index.v2().persistence_v2.is_none() && !route_needed(path, custody)? {
-        return Ok(false);
-    }
+) -> Result<()> {
+    binding_for(path)?;
+    ensure!(index.v2().persistence_v2.is_some(), Hold::ReloadRequired);
     // This accessor authenticates the owner/session; call before route/session locks.
     let claim_generation = super::super::sampled_audit::own_growth_claim_generation(index, path);
     let runtime = index.v2().persistence_v2.clone();
@@ -656,11 +650,11 @@ pub(in super::super) fn save_locked(
                     digests
                 });
             }
-            Ok(true)
+            Ok(())
         })
     })
-    .map(|saved| saved.unwrap_or(false));
-    if result.as_ref().is_ok_and(|saved| *saved) && !claim_only {
+    .and_then(|saved| saved.ok_or_else(|| Hold::ReloadRequired.into()));
+    if result.is_ok() && !claim_only {
         super::super::sampled_audit::renew_growth_claims(index, path);
     }
     result

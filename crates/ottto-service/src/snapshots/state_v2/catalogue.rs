@@ -112,7 +112,6 @@ macro_rules! scan_index_fields {
             persistence_root => Misc (runtime none) [] side,
             persistence_unavailable => Misc (runtime none) [] side,
             persistence_controls => Misc (runtime none) [] side,
-            persistence_legacy_recovery => Misc (runtime none) [] side,
             withheld_memo => Accounts (runtime none) [] side,
             codex_counting_moved_evidence => Misc (runtime none) [] side,
             active_quarantine_witness => Misc (runtime none) [] side,

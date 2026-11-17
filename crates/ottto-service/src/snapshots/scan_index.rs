@@ -43,8 +43,6 @@ pub struct ScanIndex {
     #[serde(skip)]
     pub(super) persistence_controls: Option<Arc<lenient_decode::PersistenceControls>>,
     #[serde(skip)]
-    pub(super) persistence_legacy_recovery: Option<Arc<scan_index_persistence::LegacyRecovery>>,
-    #[serde(skip)]
     pub(super) decode_holds: lenient_decode::Holds,
     /// RAM-only pacing spans ordinary + continuation pages, never durable authority.
     #[serde(skip)]
@@ -613,7 +611,6 @@ impl Default for ScanIndex {
             persistence_root: None,
             persistence_unavailable: [None; 3],
             persistence_controls: None,
-            persistence_legacy_recovery: None,
             decode_holds: lenient_decode::Holds::default(),
             withheld_memo: Default::default(),
             first_read_pending: false,
