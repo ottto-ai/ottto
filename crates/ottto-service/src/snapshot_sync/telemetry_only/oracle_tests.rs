@@ -412,7 +412,7 @@ fn telemetry_only_previous_release_refuses_new_layout() {
             .unwrap();
         assert!(output.status.success(), "carry {stage}: {output:?}");
     };
-    for tag in ["v0.1.239", "v0.1.244"] {
+    for tag in ["v0.1.239", "v0.1.244", "v0.1.256"] {
         let root = dir.join(tag);
         fs::create_dir_all(&root).unwrap();
         child("write", &root);

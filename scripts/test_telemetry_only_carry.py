@@ -9,6 +9,7 @@ import tempfile
 PINS = {
     "v0.1.239": "4157e768d0a45046a0225e2d61f2ac8cf65c50be",
     "v0.1.244": "b10c4e9d2acd649dbd09e901000e1f44f891a641",
+    "v0.1.256": "be32ecee30407cd66cacf193248446fd29d5a1be",
 }
 PROBE = r'''
 #[cfg(test)]

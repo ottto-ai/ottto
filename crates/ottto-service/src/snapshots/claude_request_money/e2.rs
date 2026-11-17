@@ -3374,8 +3374,8 @@ fn decide_holders(
             // invalidates that saved decision; a holder family on the
             // re-emission list keeps it (listing pauses new removals only).
             // A holder no longer indexed (its transcript deleted)
-            // cannot disprove anything; its recorded removals stand,
-            // counted, instead of re-adding a proven copy.
+            // cannot disprove anything; its recorded removals stand only
+            // for hashes its accepted request rows still prove.
             let mut stored = BTreeSet::new();
             let mut absent = BTreeSet::new();
             for (holder, held) in index.claude_copy_removals.get(order.1) {

@@ -194,6 +194,10 @@ impl ScanIndex {
                 })
                 .collect();
         }
+        // A slot the prune emptied proves nothing; drop it so it cannot leak.
+        self.upload_context_proof
+            .request_contributions
+            .retain(|_, slot| !slot.rows.is_empty());
     }
 }
 
