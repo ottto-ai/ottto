@@ -163,7 +163,6 @@ fn identity_pipeline_cycle(
                 &daemon,
                 &mut transport,
                 [7; 32],
-                false,
             )
         },
     )?
@@ -600,7 +599,6 @@ fn preparation_error_preserves_normalization_counts_on_scan_worker() {
                     &daemon,
                     &mut transport,
                     [7; 32],
-                    false,
                 )
             },
         )
@@ -710,7 +708,6 @@ fn transport_errors_keep_the_contract_without_observation_on_scan_worker() {
                 &daemon,
                 &mut transport,
                 [7; 32],
-                false,
             )
         });
         assert!(result.is_err());

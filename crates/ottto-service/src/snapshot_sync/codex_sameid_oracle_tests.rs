@@ -639,7 +639,6 @@ fn codex_group_finish_uploads_after_its_capture_on_a_state_store() {
         ..destination.preparation(false)
     };
     let mut transport = crate::net_resilience::TransportCycleOutcome::default();
-    let mut retry = crate::snapshot_sync::live_snapshot_retry::LiveRetryOwner::closed();
     // The capture moves the store to a new generation inside this call; every
     // later boundary (relay token, upload, checkpoint, final save) checks the
     // store guard, so a guard built before the capture fails the pass here.
@@ -656,7 +655,6 @@ fn codex_group_finish_uploads_after_its_capture_on_a_state_store() {
         &support,
         &daemon,
         &mut transport,
-        &mut retry,
     )
     .unwrap_or_else(|error| panic!("the finish refused a boundary after the capture: {error:#}"));
 

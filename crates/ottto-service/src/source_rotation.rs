@@ -58,9 +58,6 @@ pub(crate) trait Owner {
     fn retained_budget_unavailable(&mut self) {
         self.discard_retained();
     }
-    /// One optional turn after all due sources have been offered and run
-    /// serially. No new thread, timer or parser ownership.
-    fn boundary(&mut self) {}
 }
 
 /// The rotation owns the one allowance: queue + carry.
@@ -89,9 +86,6 @@ pub(crate) fn run<O: Owner>(owner: &mut O, sources: &[O::Source], rotation_budge
         .checked_mul(size_of::<O::Source>())
         .and_then(|n| rotation_budget.checked_sub(n));
     loop {
-        if remaining.is_empty() {
-            owner.boundary();
-        }
         // Includes carry entering a new cycle and ownership changes made by a
         // finished source. Queue capacity stays paid.
         let _ = retained_remainder(owner, budget);

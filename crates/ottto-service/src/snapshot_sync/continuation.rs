@@ -1647,7 +1647,6 @@ pub(super) fn prepare_continuation_source(
     .with_line_observer("codex_prelude", inputs.codex_preludes.observer(&roots))
     .with_codex_versions(inputs.codex_versions.clone());
     Ok(Ok(SourcePreparation {
-        retry_authority: None,
         source,
         claude_scan_roots: None,
         account_witness: inputs.account_witness,

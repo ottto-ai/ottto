@@ -743,7 +743,6 @@ fn inplace_retry_claude_cycle(shed_first_batch: bool) -> InplaceRetryCycle {
     let client = SnapshotApiClient::new(server.url.clone());
     let daemon = test_daemon("otm_test");
     let mut transport = crate::net_resilience::TransportCycleOutcome::default();
-    let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
     let collection = || AgentStatusCollection {
         snapshots: vec![test_agent_status(SourceKind::ClaudeCode)],
         source_health_snapshot: test_agent_status(SourceKind::ClaudeCode),
@@ -764,7 +763,6 @@ fn inplace_retry_claude_cycle(shed_first_batch: bool) -> InplaceRetryCycle {
             &daemon,
             &mut transport,
             daemon.snapshot_scan_account_witness().unwrap(),
-            false,
         )
     })
     .unwrap()
@@ -787,7 +785,6 @@ fn inplace_retry_claude_cycle(shed_first_batch: bool) -> InplaceRetryCycle {
                 &support,
                 &daemon,
                 &mut transport,
-                &mut retry,
             )
         })
     });

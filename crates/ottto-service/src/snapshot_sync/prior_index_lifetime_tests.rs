@@ -163,7 +163,6 @@ fn e2_real_caller_parity_at_tight_allowances() {
         let daemon = test_daemon("otm_test");
         let client = SnapshotApiClient::new(server.url.clone());
         let mut transport = crate::net_resilience::TransportCycleOutcome::default();
-        let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
         let frame = crate::agent_status_refresh::with_test_collection(collection(), || {
             prepare_sync_source(
                 &client,
@@ -176,7 +175,6 @@ fn e2_real_caller_parity_at_tight_allowances() {
                 &daemon,
                 &mut transport,
                 daemon.snapshot_scan_account_witness().unwrap(),
-                false,
             )
         })
         .unwrap()
@@ -219,7 +217,6 @@ fn e2_real_caller_parity_at_tight_allowances() {
                 &support,
                 &daemon,
                 &mut transport,
-                &mut retry,
             )
         });
         drop(guard);

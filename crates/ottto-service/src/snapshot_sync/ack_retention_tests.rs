@@ -200,7 +200,7 @@ fn bounded_retry_quarantine_preserves_other_acks_and_contexts_after_reload() {
     progress.save_fixture(&f.progress_path).unwrap();
     let generation = progress.generation;
 
-    // Exercise the settlement and capped-save seam used by PreparedRetry::turn_inner.
+    // Exercise both the settlement and capped-save paths.
     // Calling it directly keeps this persistence regression independent of heap-layout pins.
     let outcome = attempt_snapshot_page(
         std::slice::from_ref(&f.item),

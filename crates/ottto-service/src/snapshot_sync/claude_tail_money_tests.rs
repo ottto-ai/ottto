@@ -2789,15 +2789,15 @@ fn pi_partial_save(
 
 #[cfg(unix)]
 /// [regress] A Pi page sheds, so its partial save keeps neither the new
-/// session's entry nor its head, and the live retry is declined. The next
+/// session's entry nor its head. The next
 /// ordinary pass reads the session once as a new file, never as a committed
 /// entry with no head, and commits it with its head.
 #[test]
-fn pi_live_retry_declines_a_shed_new_entry() {
+fn pi_ordinary_pass_reloads_a_shed_new_entry() {
     use crate::snapshots::e2_pipeline_scan_fixture::{
         continuation_for_test, route_for_test, tail_counter_for_test,
     };
-    let c = corpus("pi_live_retry_declines_a_shed_new_entry");
+    let c = corpus("pi_ordinary_pass_reloads_a_shed_new_entry");
     let path = c.root.join("session.jsonl");
     std::fs::write(&path, pi_seed()).unwrap();
     input_clock(&path);
@@ -2818,10 +2818,6 @@ fn pi_live_retry_declines_a_shed_new_entry() {
         !saved.files.contains_key(key),
         "the shed save keeps no entry"
     );
-    assert!(
-        working.left_out_new_tail_entry(&saved),
-        "the live retry is declined"
-    );
     let prior = ScanIndex::load(&disk.route).unwrap();
     assert!(!prior.files.contains_key(key));
     assert!(
@@ -2840,86 +2836,13 @@ fn pi_live_retry_declines_a_shed_new_entry() {
     assert_eq!(
         other_wire(SnapshotSource::Pi, &page),
         other_wire(SnapshotSource::Pi, &full),
-        "Pi declined retry != Full"
+        "Pi follow-up page differs from cold Full"
     );
     let after = disk.commit(&next.cache, SnapshotSource::Pi, &mut index);
     assert!(after.files.contains_key(key), "the pass keeps the entry");
     assert!(
         continuation_for_test(SnapshotSource::Pi, &next.cache, &after, key).is_some(),
         "with its head"
-    );
-}
-
-#[cfg(unix)]
-/// [regress] A Pi page of a known session's growth sheds; its partial save
-/// keeps the session's entry, so the live retry is still admitted. The
-/// retry's exact ACK and its own save keep the grown entry, and the next
-/// growth emits a cold Full's body with no `no_head` Full.
-#[test]
-fn pi_live_retry_admits_a_shed_that_keeps_every_entry() {
-    use crate::snapshots::e2_pipeline_scan_fixture::tail_counter_for_test;
-    let (c, mut disk, path, _scanner, prior, _) = pi_disk_corpus(
-        "pi_live_retry_admits_a_shed_that_keeps_every_entry",
-        &pi_seed(),
-    );
-    let key = path.to_str().unwrap();
-    pi_grow(
-        &path,
-        pi_turn("message", Some("shed-response"), 20, "2026-10-27T06:01:00Z"),
-    );
-    let owner = disk.owner(SnapshotSource::Pi);
-    let (mut working, shed, _) = other_page(&c, &owner, SnapshotSource::Pi, prior.clone());
-    let progress = pi_route_progress(&disk, &working);
-    let saved = pi_partial_save(&disk, &working, &prior, &progress, &shed, Some(&shed));
-    assert!(
-        saved.files.contains_key(key),
-        "the shed save keeps the entry"
-    );
-    assert!(
-        !working.left_out_new_tail_entry(&saved),
-        "the live retry is admitted"
-    );
-    // The live retry: its exact ACK, then its save on the shed baseline.
-    let mut progress = pi_route_progress(&disk, &saved);
-    let (status, _, _) = upload_source_under(
-        SnapshotSource::Pi,
-        SnapshotUploadPolicy::default(),
-        &shed.snapshots,
-        &mut progress,
-        ack,
-    );
-    assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
-    progress
-        .save_fixture(&snapshot_upload_progress_path(&disk.route))
-        .unwrap();
-    working.generation = saved.generation;
-    pi_partial_save(&disk, &working, &saved, &progress, &shed, None);
-    let retried = ScanIndex::load(&disk.route).unwrap();
-    assert_eq!(
-        retried.files.get(key).map(|entry| entry.size_bytes),
-        working.files.get(key).map(|entry| entry.size_bytes),
-        "the retry keeps the grown entry"
-    );
-    pi_grow(
-        &path,
-        pi_turn(
-            "message",
-            Some("later-response"),
-            20,
-            "2026-10-27T06:02:00Z",
-        ),
-    );
-    let no_head = || tail_counter_for_test("tail_bootstrap_full", "no_head");
-    let before = no_head();
-    let restart = disk.owner(SnapshotSource::Pi);
-    let (_, grown, _) = other_page(&c, &restart, SnapshotSource::Pi, retried.clone());
-    assert_eq!(no_head(), before, "no no_head Full");
-    let (_, full, modes) = other_page(&c, &E2ScanFixture::default(), SnapshotSource::Pi, retried);
-    assert_eq!(modes.1 + modes.2, 0, "the cold arm reads Full");
-    assert_eq!(
-        other_wire(SnapshotSource::Pi, &grown),
-        other_wire(SnapshotSource::Pi, &full),
-        "Pi retried page != Full"
     );
 }
 

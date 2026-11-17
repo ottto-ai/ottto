@@ -292,8 +292,6 @@ fn e2_partial_entity_ack_settles_only_acknowledged_members() {
 
 #[test]
 fn e2_transient_failure_resends_the_exact_literal_bytes() {
-    // The retry copy keeps every literal member, so the resend's bytes,
-    // fingerprint and body witness equal the first attempt's.
     let mut item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
     item.cache_observations = None;
     item.cache_base_head_etag = None;
@@ -311,17 +309,6 @@ fn e2_transient_failure_resends_the_exact_literal_bytes() {
     item.telemetry_owned_complete = Some(false);
     item.snapshot_fingerprint =
         crate::snapshots::snapshot_fingerprint(SnapshotSource::ClaudeCode, &item);
-    let copy = retry_ordinary_owned(&item).expect("ordinary owned item has a retry copy");
-    assert_eq!(
-        serde_json::to_vec(&copy).unwrap(),
-        serde_json::to_vec(&item).unwrap()
-    );
-    assert_eq!(copy.snapshot_fingerprint, item.snapshot_fingerprint);
-    assert_eq!(
-        snapshot_upload_body_witness(&copy),
-        snapshot_upload_body_witness(&item)
-    );
-
     let items = vec![item];
     let mut sent = Vec::new();
     let mut progress = test_upload_progress();
