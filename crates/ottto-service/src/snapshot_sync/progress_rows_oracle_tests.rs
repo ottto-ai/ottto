@@ -1621,12 +1621,6 @@ fn progress_rows_codex_continuation_loads_the_route_rows() {
         );
         crate::backfill::save_backfill_state(&c.support, &backfill).unwrap();
         let _ = index.prepare_snapshot_admission_reoffer(SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE);
-        if index.legacy_settlement_ledger_needs_migration() {
-            let _ = index.prepare_legacy_settlement_reconciliation(
-                source,
-                LEGACY_SETTLEMENT_RECONCILE_LIMIT_PER_CYCLE,
-            );
-        }
         let generation = cycle_replay_generation(source, &namespace());
         let now = reason_reoffer::now_unix_seconds();
         let _ = prepare_upload_progress_for_cycle_with_reoffer(

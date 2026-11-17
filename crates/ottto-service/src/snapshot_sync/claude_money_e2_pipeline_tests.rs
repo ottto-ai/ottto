@@ -930,7 +930,7 @@ pub(in crate::snapshot_sync) fn upload_source_persisting(
         |s| Some(s.source_session_id.as_str()),
         // The production main-upload class: patched and unpatched bodies
         // never share a request.
-        |s| snapshot_upload_batch_class(s, false),
+        snapshot_upload_batch_class,
         crate::snapshots::claude_request_money::request_owned_family_root,
         &mut InplaceRetryBudget::default(),
         |batch| {
@@ -2150,7 +2150,7 @@ fn ready_without_cache(
     let mut page = corpus.raw(scanner, index, limit, sampled, &[]);
     page.enrich(corpus);
     for snapshot in &mut page.scan.snapshots {
-        prepare_snapshot_cache_for_upload(snapshot, &e2_progress(), false, false, &BTreeSet::new());
+        prepare_snapshot_cache_for_upload(snapshot, &e2_progress(), false, false);
     }
     deliver_page(page)
 }

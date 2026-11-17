@@ -219,8 +219,6 @@ impl LiveRetryOwner {
     ) -> bool {
         if !self.enabled
             || source != SnapshotSource::Pi
-            || working.legacy_settlement_ledger_needs_migration()
-            || committed.legacy_settlement_ledger_needs_migration()
             // The next ordinary pass reads that file once, as a new file.
             || working.left_out_new_tail_entry(committed)
             || live.destination() != progress.destination_namespace_hash

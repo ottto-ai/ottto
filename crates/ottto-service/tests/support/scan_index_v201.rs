@@ -120,7 +120,9 @@ fn assert_integrated_decision(source: &str, frozen: &str) {
         let headers = mode
             .find("let mut headers = decoder.index(Pass::Headers)?;")
             .unwrap();
-        let controls = mode.find("controls(&headers, source)?;").unwrap();
+        let controls = mode
+            .find("view_controls(&headers, source, map_only)?;")
+            .unwrap();
         let full = mode
             .find("let result = decoder.index(Pass::Full);")
             .unwrap();
@@ -138,6 +140,14 @@ fn assert_integrated_decision(source: &str, frozen: &str) {
         assert!(source.contains("let persistence_root ="));
         assert!(source.contains("persistence_root,"));
         assert!(source.contains("LoadOrigin::Missing,"));
+    } else if frozen.contains("pub(super) fn controls(") {
+        // The schema refusal is unchanged; the ledger check now refuses every
+        // version but the current one (older ones are held, never migrated).
+        assert!(source.contains("return Err(Error::Refused(\"schema_version\"));"));
+        assert!(source.contains("if map_only || version == SNAPSHOT_ACCEPTED_LEDGER_VERSION {"));
+        assert!(source.contains("alarm_unsupported_scan_index_ledger(source, version);"));
+        assert!(source.contains("\"accepted-ledger version\""));
+        assert!(source.contains("view_controls(index, source, false)"));
     } else if frozen.contains("let quarantine_path = unique_checkpoint_sibling") {
         assert!(source.contains("fs::rename(path, &quarantine_path).context(\"quarantine invalid local snapshot scan index\")?;"));
         assert!(source.contains("persistence_legacy_recovery: persistence_recovery,"));

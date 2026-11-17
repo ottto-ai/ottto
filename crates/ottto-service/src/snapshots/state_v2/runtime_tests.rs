@@ -585,7 +585,10 @@ mod hydrate_parity {
         // Reuse the v1 hold codec to derive its platform-specific bookkeeping
         // charge rather than duplicating the private HeldRaw layout in a fixture.
         let probe =
-            lenient_decode::read_bounded(br#"{"files":{"probe":{"size_bytes":[]}}}"#).unwrap();
+            lenient_decode::read_bounded(
+                br#"{"files":{"probe":{"size_bytes":[]}},"accepted_snapshot_fingerprint_ledger_version":2}"#,
+            )
+            .unwrap();
         let (_, _, bytes, _, charge) = probe.decode_holds.v2_entries().next().unwrap();
         let overhead =
             charge - bytes.len() as u64 - serde_json::to_vec("probe").unwrap().len() as u64;
@@ -752,6 +755,27 @@ mod hydrate_parity {
             assert_eq!(fs::read(&f.path).unwrap(), before);
         }
     }
+    /// [format] An older build's accepted ledger (0 or 1) holds for a reset on
+    /// every load: refused before normalization, never migrated, and neither
+    /// a load nor a save changes its custody.
+    #[test]
+    fn older_ledger_holds_before_hydrate_normalization_and_keeps_custody() {
+        for version in [0_u8, 1] {
+            let mut index = seed();
+            index.accepted_snapshot_fingerprint_ledger_version = version;
+            let f = Fixture::new();
+            publish(&f, &index);
+            let before = fs::read(&f.path).unwrap();
+            for _ in 0..2 {
+                let error = load_locked(&f.path, false, published(&f.path).unwrap()).unwrap_err();
+                assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::OlderLedger));
+            }
+            assert!(save_with(&f.path, &mut seed()).is_err());
+            assert_eq!(fs::read(&f.path).unwrap(), before);
+            let error = load_locked(&f.path, false, published(&f.path).unwrap()).unwrap_err();
+            assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::OlderLedger));
+        }
+    }
     /// [format] every hydrate runs deadline drop and cutoff rules.
     #[test]
     fn every_hydrate_runs_deadline_drop_and_cutoff_rules() {
@@ -771,7 +795,6 @@ mod hydrate_parity {
             .snapshot_activity_at
             .insert("c".repeat(64), Some("invalid time".into()));
         index.accepted_snapshot_fingerprints.insert("bad".into());
-        index.legacy_settlement_reconcile_after_fingerprint = Some("bad".into());
         index.claude_history_cutoff_unix_seconds = Some(s::MALFORMED_CLAUDE_HISTORY_CUTOFF);
         index.claude_history_gate_loaded = true;
         let actual = typed_case(index);

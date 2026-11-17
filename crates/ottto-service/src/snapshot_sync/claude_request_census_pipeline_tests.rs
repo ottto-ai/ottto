@@ -241,16 +241,7 @@ fn census_pre_hold_bodies_born(
         SnapshotSource::ClaudeCode,
         &mut scan,
         &mut index,
-        |item| {
-            effective_snapshot_upload_body_witness(
-                item,
-                &progress,
-                false,
-                false,
-                &BTreeSet::new(),
-                &disposition,
-            )
-        },
+        |item| effective_snapshot_upload_body_witness(item, &progress, false, false, &disposition),
     );
     let offered = census_body_facts(&scan.snapshots);
     let holds = LocalHoldSettlement::classify(

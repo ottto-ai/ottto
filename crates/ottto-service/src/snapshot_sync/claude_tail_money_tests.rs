@@ -3420,7 +3420,7 @@ fn forked_root(c: &mut Corpus) -> PathBuf {
 fn under_cas(items: &[SnapshotItem], progress: &SnapshotUploadProgress) -> Vec<SnapshotItem> {
     let mut items = items.to_vec();
     for item in &mut items {
-        prepare_snapshot_cache_for_upload(item, progress, true, false, &BTreeSet::new());
+        prepare_snapshot_cache_for_upload(item, progress, true, false);
     }
     items
 }
@@ -3490,7 +3490,7 @@ fn under_required_cas(
 ) -> Vec<SnapshotItem> {
     let mut items = items.to_vec();
     for item in &mut items {
-        prepare_snapshot_cache_for_upload(item, progress, true, true, &BTreeSet::new());
+        prepare_snapshot_cache_for_upload(item, progress, true, true);
     }
     items
 }
@@ -3557,7 +3557,11 @@ fn stray_row_echo_ack(
     let asked =
         serde_json::to_value(request(batch))?["cache_state_ack_contract"] == "cache_state_ack:v1";
     let mut response = ack(batch)?;
-    for (reference, item) in response.accepted_entities.iter_mut().zip(batch.iter().copied()) {
+    for (reference, item) in response
+        .accepted_entities
+        .iter_mut()
+        .zip(batch.iter().copied())
+    {
         let Some(state) = item.cache_observations_state.as_ref() else {
             continue;
         };
@@ -3749,7 +3753,7 @@ fn head_first_route(
         .bind_test_key(Some([0x42; 32]));
     let mut sent = page.scan.snapshots.clone();
     for item in &mut sent {
-        prepare_snapshot_cache_for_upload(item, &progress, true, false, &BTreeSet::new());
+        prepare_snapshot_cache_for_upload(item, &progress, true, false);
     }
     let mut store = crate::snapshot_sync::tests::class_split_tests::HeadStore::default();
     let mut posts = 0;

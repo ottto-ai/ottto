@@ -188,7 +188,6 @@ impl ScanIndex {
                 &progress.accepted_body_witnesses,
                 &progress.accepted_body_contexts,
             );
-            index.finish_legacy_settlement_reconciliation();
             scan.validate_codex_checkpoint().unwrap();
             index.save(&index_path).unwrap();
             progress.add_saved_handoff_retirements(&mut retired, &index);

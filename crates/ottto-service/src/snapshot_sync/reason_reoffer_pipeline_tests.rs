@@ -2558,13 +2558,7 @@ fn held_probe_stale_refusal_earns_receipt_in_refusal_pass() {
         full.cache_observations.is_some(),
         "the real finalizer carried cache fields"
     );
-    prepare_snapshot_cache_for_upload(
-        &mut full,
-        &test_upload_progress(),
-        true,
-        false,
-        &BTreeSet::new(),
-    );
+    prepare_snapshot_cache_for_upload(&mut full, &test_upload_progress(), true, false);
     let probe = cache_head_probe(&full);
     assert_ne!(
         body_set(&full),
@@ -2771,13 +2765,7 @@ fn seed_legacy_probe_file(pipeline: &mut ReofferPipeline, now: u64) -> (CycleRes
     assert_eq!(finalized.len(), 1);
     let mut full = finalized[0].clone();
     assert!(full.cache_observations.is_some());
-    prepare_snapshot_cache_for_upload(
-        &mut full,
-        &test_upload_progress(),
-        true,
-        false,
-        &BTreeSet::new(),
-    );
+    prepare_snapshot_cache_for_upload(&mut full, &test_upload_progress(), true, false);
     let probe = cache_head_probe(&full);
     assert_ne!(body_set(&full), body_set(&probe));
     // finish_cycle transfers terminal custody to the index. Restore it as

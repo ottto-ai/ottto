@@ -827,9 +827,7 @@ impl ScanIndex {
                     && accepted_bodies.get(&item.fingerprint) == Some(&item.body_witness))
                     || rejected(item)
             });
-            let noop = previous.accepted_snapshot_fingerprint_ledger_version
-                == SNAPSHOT_ACCEPTED_LEDGER_VERSION
-                && previous.file_snapshot_fingerprints.get(key) == Some(&fingerprints)
+            let noop = previous.file_snapshot_fingerprints.get(key) == Some(&fingerprints)
                 && previous
                     .files
                     .get(key)

@@ -704,7 +704,7 @@ fn head_page(
         p,
         items,
         current_unix_seconds(),
-        |item| snapshot_upload_batch_class(item, false),
+        snapshot_upload_batch_class,
         |_| false,
         |request, wire| {
             assert_eq!(request.source, Claude.api_slug());
@@ -798,13 +798,7 @@ fn telemetry_growth_uses_saved_ack_then_rebuilds_to_answer_a_conflict_without_a_
                 append(&c, false, &trace("head-growth", ""));
                 let mut grown = build(&c, &mut p);
                 for item in &mut grown.scan.snapshots {
-                    prepare_snapshot_cache_for_upload(
-                        item,
-                        &p,
-                        cache_enabled,
-                        false,
-                        &BTreeSet::new(),
-                    );
+                    prepare_snapshot_cache_for_upload(item, &p, cache_enabled, false);
                     assert_eq!(item.cache_base_head_etag.as_ref(), Some(&first_head));
                     assert!(item.cache_observations.is_none());
                     assert!(item.cache_observations_state.is_none());
@@ -845,13 +839,7 @@ fn telemetry_growth_uses_saved_ack_then_rebuilds_to_answer_a_conflict_without_a_
                 );
                 assert_eq!(only(&rebuilt).request_count, 6);
                 for item in &mut rebuilt.scan.snapshots {
-                    prepare_snapshot_cache_for_upload(
-                        item,
-                        &p,
-                        cache_enabled,
-                        false,
-                        &BTreeSet::new(),
-                    );
+                    prepare_snapshot_cache_for_upload(item, &p, cache_enabled, false);
                 }
                 let mut projected = only(&rebuilt).clone();
                 let reserve = identity_cache_wire_reserve(&projected, &p, false);

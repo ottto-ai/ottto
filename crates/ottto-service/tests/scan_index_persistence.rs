@@ -178,7 +178,10 @@ fn missing_then_legacy_write_uses_existing_format() {
     let Opened::Missing(root) = store.open().unwrap() else {
         panic!()
     };
-    let value = json!({"schema_version":2,"generation":1,"files":{}});
+    let value = json!({
+        "schema_version":2,"generation":1,"files":{},
+        "accepted_snapshot_fingerprint_ledger_version":2
+    });
     let root = store
         .write_legacy(&root, 1, |out| {
             serde_json::to_writer(out, &value)?;
@@ -197,7 +200,7 @@ mod v201;
 fn legacy_optional_depth_and_syntax_reach_existing_semantic_decoder() {
     let s = Scratch::new();
     let bytes = format!(
-        "{{\"schema_version\":2,\"generation\":1,\"files\":{{}},\"claude_request_census\":{}0{}}}",
+        "{{\"schema_version\":2,\"generation\":1,\"files\":{{}},\"accepted_snapshot_fingerprint_ledger_version\":2,\"claude_request_census\":{}0{}}}",
         "[".repeat(300),
         "]".repeat(300)
     );

@@ -290,7 +290,6 @@ impl HistoryFixture {
                     &progress,
                     false,
                     false,
-                    &BTreeSet::new(),
                     &disposition,
                 )
             });
@@ -305,7 +304,6 @@ impl HistoryFixture {
                     &progress,
                     false,
                     false,
-                    &BTreeSet::new(),
                     &disposition,
                 )
             },

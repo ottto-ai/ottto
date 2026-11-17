@@ -572,7 +572,7 @@ fn materialized_cache_probe_matches_only_its_own_refusal_witness() {
     finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);
     let mut item = scan.snapshots.remove(0);
     let mut progress = ledger();
-    prepare_snapshot_cache_for_upload(&mut item, &progress, true, false, &BTreeSet::new());
+    prepare_snapshot_cache_for_upload(&mut item, &progress, true, false);
     assert!(item.cache_observations.is_some());
     assert!(item.cache_base_head_etag.is_none());
     let probe = cache_head_probe(&item);

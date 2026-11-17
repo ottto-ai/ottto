@@ -73,7 +73,7 @@ Every cache patch declares `snapshot_head_etag:v1` and uses the accepted
 predecessor etag for existing entities. A collector without that token first
 settles grown ordinary usage with cache omitted through the existing optional
 ordinary write authority, then probes that same frozen body through the existing
-CAS contract. Server-mandated CAS and legacy reconciliation skip ordinary
+CAS contract. Server-mandated CAS skips ordinary
 bootstrap; an existing changed head without a saved token then requires the
 existing authorized reconciliation path. Conflicts fail closed, and conflict
 challenges never authorize a cache correction. Exact head ACKs and numeric cache state persist in the

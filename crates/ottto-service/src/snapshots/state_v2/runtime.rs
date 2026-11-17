@@ -13,6 +13,8 @@ use std::time::Instant;
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Hold {
     Future,
+    /// An older build's accepted ledger: never migrated, held for a reset.
+    OlderLedger,
     UnknownRecordKind,
     DbUnavailable,
     ForeignBinding,
@@ -27,6 +29,7 @@ impl std::fmt::Display for Hold {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Future | Self::UnknownRecordKind => "scan_index_representation_refused",
+            Self::OlderLedger => "scan_index_older_ledger_refused",
             Self::DbUnavailable => "state_v2_db_unavailable",
             Self::ForeignBinding => "state_v2_foreign_binding",
             Self::NewerSchema => "state_v2_newer_schema_refused",
@@ -503,6 +506,9 @@ fn normalize_hydrated(
     lenient_decode::post_decode_hydrated(index, "load", slug).map_err(|error| match error {
         lenient_decode::Error::Refused("schema_version" | "accepted-ledger version") => {
             anyhow::Error::from(Hold::Future)
+        }
+        lenient_decode::Error::Refused(lenient_decode::OLDER_LEDGER_REFUSAL) => {
+            anyhow::Error::from(Hold::OlderLedger)
         }
         error => anyhow::Error::from(error),
     })?;

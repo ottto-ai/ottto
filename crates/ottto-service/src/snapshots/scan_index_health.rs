@@ -69,7 +69,9 @@ pub(super) fn state_v2_reason(error: &anyhow::Error) -> Option<Reason> {
         if let Some(hold) = cause.downcast_ref::<Hold>() {
             return Some(match hold {
                 Hold::Future | Hold::UnknownRecordKind | Hold::NewerSchema => Reason::NewerApp,
-                Hold::DbUnavailable
+                // An older build's ledger needs a support reset, not an update.
+                Hold::OlderLedger
+                | Hold::DbUnavailable
                 | Hold::ForeignBinding
                 | Hold::FenceLost
                 | Hold::ReferenceDrift => Reason::ShardUnavailable,
@@ -196,7 +198,14 @@ pub(super) fn observe(source: SnapshotSource, loaded: &anyhow::Result<(ScanIndex
             set(source, Reason::Retrying, false, 0);
         }
         Err(error) => {
-            if let Some(reason) = state_v2_reason(error) {
+            if matches!(
+                error.downcast_ref::<lenient_decode::Error>(),
+                Some(lenient_decode::Error::Refused(
+                    lenient_decode::OLDER_LEDGER_REFUSAL
+                ))
+            ) {
+                set_refusal(source, Reason::ShardUnavailable);
+            } else if let Some(reason) = state_v2_reason(error) {
                 if reason == Reason::ShardUnavailable {
                     crate::local_resource_diagnostics::scan_index_repair_required(
                         source.api_slug(),

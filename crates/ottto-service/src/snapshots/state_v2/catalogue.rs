@@ -60,6 +60,8 @@ macro_rules! scan_index_fields {
             historical_replay_generation => Misc (misc check_field Field) ["setting.historical_replay_generation" => 1] side,
             accepted_snapshot_fingerprints => Misc (misc check_field Set) ["accepted.entity" => 1] side,
             accepted_snapshot_fingerprint_ledger_version => Misc (misc check_field Field) ["v1_field.accepted_snapshot_fingerprint_ledger_version" => 1] side,
+            // Always null now. Older readers require this layout-1 row, so it
+            // stays written until the next layout change retires it.
             legacy_settlement_reconcile_after_fingerprint => Misc (misc check_field Field) ["v1_field.legacy_settlement_reconcile_after_fingerprint" => 1] side,
             quarantined_snapshot_fingerprints => Misc (misc check_field Map) ["refusal.snapshot" => 1] side,
             claude_history_cutoff_unix_seconds => Misc (misc check_field Field) ["setting.claude_history_cutoff_unix_seconds" => 1] side,

@@ -150,7 +150,8 @@ fn add_class(index: &mut ScanIndex, path: &Path, class: &str) {
         "accepted_ack" => {
             let fp = "3".repeat(64);
             raw["accepted_snapshot_fingerprints"] = json!([fp]);
-            raw["accepted_snapshot_fingerprint_ledger_version"] = json!(1);
+            // Only the current ledger loads; an older one is held for a reset.
+            raw["accepted_snapshot_fingerprint_ledger_version"] = json!(2);
             raw["accepted_rebuild_incidence"] = json!({key:[fp]});
             raw["upload_ack_retirement_handoff"] = json!({
                 "destination_namespace_hash":"4".repeat(64), "committed_generation":index.generation,

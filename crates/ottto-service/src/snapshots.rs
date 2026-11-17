@@ -389,9 +389,7 @@ use wire::{
     CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION, CLAUDE_USAGE_AUTHORITY_RETRY_SECONDS,
     FILE_CONTENT_SAMPLE_BYTES, MAX_CLAUDE_USAGE_AUTHORITY_FAILURES, MAX_MODEL_USAGE_ROWS,
     MAX_SESSION_ARTIFACTS, MAX_TOOL_USAGE_NAMES, MAX_TOOL_USAGE_NAME_LENGTH, ROW_BILLING_FIELDS,
-    SCAN_INDEX_SCHEMA_VERSION, SNAPSHOT_ACCEPTED_LEDGER_PRE_LEDGER_VERSION,
-    SNAPSHOT_ACCEPTED_LEDGER_UNPROVEN_VERSION, SNAPSHOT_ACCEPTED_LEDGER_VERSION,
-    SNAPSHOT_UNPROVEN_RETRY_CONTRACT_VERSION,
+    SCAN_INDEX_SCHEMA_VERSION, SNAPSHOT_ACCEPTED_LEDGER_VERSION,
 };
 pub use wire::{
     AccountSource, ClaudeRemovedUsage, CopyUnprovenCounts, SessionAccountEvidence, SessionArtifact,
@@ -479,11 +477,10 @@ pub(crate) use sources::claude::census::authority::ClaudeAuthorityRecordForTest;
 pub use sources::claude::census::authority::ClaudeRequestCensusShadowCounts;
 pub use sources::claude::census::authority::ClaudeUsageAuthorityDisposition;
 use sources::claude::census::authority::{
-    claude_accepted_ledger_is_current, claude_index_file_body_accepted,
-    claude_usage_authority_deadline_is_bounded, claude_usage_authority_preserves_pending,
-    claude_usage_authority_retry_deadline, claude_usage_family_witness_fingerprint,
-    ClaudeTranscriptUsageOccurrenceWitness, ProvenClaudeUsageFamily,
-    MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS,
+    claude_index_file_body_accepted, claude_usage_authority_deadline_is_bounded,
+    claude_usage_authority_preserves_pending, claude_usage_authority_retry_deadline,
+    claude_usage_family_witness_fingerprint, ClaudeTranscriptUsageOccurrenceWitness,
+    ProvenClaudeUsageFamily, MAX_CLAUDE_ACCOUNT_DEFERRED_HOLDS,
 };
 #[cfg(test)]
 use sources::claude::census::authority::{sha256_hex_is_well_formed, ClaudePostureAdmission};

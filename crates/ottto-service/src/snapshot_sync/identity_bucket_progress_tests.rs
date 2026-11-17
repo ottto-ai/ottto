@@ -144,7 +144,7 @@ fn identity_budget_reserves_predecessor_retractions_without_mutating_local_patch
     let reserved = identity_cache_wire_reserve(&item, &progress, false);
     assert_eq!(item.cache_observations, before);
     let mut projected = item.clone();
-    prepare_snapshot_cache_for_upload(&mut projected, &progress, true, false, &BTreeSet::new());
+    prepare_snapshot_cache_for_upload(&mut projected, &progress, true, false);
     assert_eq!(
         projected
             .cache_observations
@@ -172,7 +172,7 @@ fn identity_budget_reserves_predecessor_retractions_without_mutating_local_patch
     let reserved = identity_cache_wire_reserve(&item, &progress, false);
     assert!(reserved > 64);
     let mut projected = item.clone();
-    prepare_snapshot_cache_for_upload(&mut projected, &progress, true, false, &BTreeSet::new());
+    prepare_snapshot_cache_for_upload(&mut projected, &progress, true, false);
     assert_eq!(
         crate::snapshots::claude_request_identity::item_bytes(&projected),
         crate::snapshots::claude_request_identity::item_bytes(&item) + reserved,

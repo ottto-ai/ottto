@@ -1044,25 +1044,7 @@ pub(super) const CLAUDE_USAGE_AUTHORITY_RETRY_SECONDS: u64 = 6 * 60 * 60;
 /// retries. This gives transient sidecar lag three recovery windows while
 /// bounding an unchanged family's non-terminal lifetime to 18-36 hours.
 pub(super) const MAX_CLAUDE_USAGE_AUTHORITY_FAILURES: u8 = 4;
-pub(super) const SNAPSHOT_UNPROVEN_RETRY_CONTRACT_VERSION: &str = "snapshot_unproven_retry:v1";
 pub(super) const SNAPSHOT_ACCEPTED_LEDGER_VERSION: u8 = 2;
-/// Ledger version 1 was written by the first legacy-settlement migration, which
-/// had a fast path that declared every currently indexed revision accepted
-/// whenever the local index merely looked clean. That inference is unsound: the
-/// silent retry-loss path this migration exists to repair ends in a clean index.
-/// The ledger records no witness distinguishing a v1 ledger sealed by that fast
-/// path from one drained by the bounded sweep, so every v1 ledger is re-opened
-/// once and re-proved through the server, which is the authority on acceptance.
-pub(super) const SNAPSHOT_ACCEPTED_LEDGER_UNPROVEN_VERSION: u8 = 1;
-/// Ledger version 0 is the pre-ledger shape: an index written before the
-/// version field existed, so serde defaults it to 0 on load. Its accepted
-/// entries are real entity ACKs - `record_accepted_snapshot_fingerprints` is
-/// their only writer - but the revisions the silent retry-loss dropped are
-/// absent from the index entirely, so `current - accepted` cannot see them and
-/// only the bounded sweep's forced re-parse of their owning files recovers
-/// them. A pre-ledger ledger that has never armed a page therefore carries no
-/// settlement proof either, exactly like the v1 ledger above.
-pub(super) const SNAPSHOT_ACCEPTED_LEDGER_PRE_LEDGER_VERSION: u8 = 0;
 pub(crate) const MAX_SNAPSHOT_RECONSTRUCTION_FAILURES: u8 = 4;
 
 /// What the manifest counts, declared on the wire rather than assumed.

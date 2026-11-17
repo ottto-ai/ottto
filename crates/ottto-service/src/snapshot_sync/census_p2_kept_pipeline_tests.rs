@@ -314,7 +314,6 @@ impl PipelineFixture {
                     &progress,
                     false,
                     false,
-                    &BTreeSet::new(),
                     &disposition,
                 )
             },

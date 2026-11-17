@@ -363,9 +363,12 @@ fn lenient_budget_overflow_uses_existing_load_and_cas_outcomes() {
 fn lenient_legacy_defaults_duplicate_headers_and_generation_refusals() {
     let scratch = crate::test_scratch::ScratchDir::new("lenient-defaults");
     let path = scratch.as_ref().join("index.json");
-    fs::write(&path, b"{\"files\":{}}").unwrap();
+    fs::write(
+        &path,
+        b"{\"files\":{},\"accepted_snapshot_fingerprint_ledger_version\":2}",
+    )
+    .unwrap();
     let mut index = ScanIndex::load(&path).unwrap();
-    assert_eq!(index.accepted_snapshot_fingerprint_ledger_version, 0);
     assert_eq!(index.generation, 0);
     let original = b"{\"files\":{},\"generation\":0,\"gener\\u0061tion\":0}";
     fs::write(&path, original).unwrap();
@@ -797,7 +800,6 @@ fn main_depth_resource_refuses_but_admitted_bad_grammar_still_quarantines() {
 fn populated_valid_wire_matches_the_retained_native_codec() {
     let mut index = fixture();
     index.insert_retry_pending_claude_authority_for_test("valid-family");
-    index.legacy_settlement_reconcile_after_fingerprint = Some(format!("{:064x}", 0));
     index.resume_after_path = Some("/synthetic/7.jsonl".into());
     let bytes = serde_json::to_vec_pretty(&index).unwrap();
     let native = claude_request_census::decode_index(std::io::Cursor::new(&bytes)).unwrap();
@@ -902,61 +904,6 @@ fn opaque_file_incidence_preserves_existing_acks_through_both_pruners_and_restar
             );
             assert_eq!(restarted.decode_has_opaque_file_incidence(), !exact_empty);
             assert_sibling(&restarted);
-        }
-    }
-}
-
-#[test]
-fn opaque_file_incidence_blocks_both_legacy_seals_and_ack_reopening() {
-    for version in [0, SNAPSHOT_ACCEPTED_LEDGER_UNPROVEN_VERSION] {
-        let scratch = crate::test_scratch::ScratchDir::new("lenient-opaque-legacy-seal");
-        let path = scratch.as_ref().join("index.json");
-        let mut seed = fixture();
-        seed.accepted_snapshot_fingerprint_ledger_version = version;
-        seed.legacy_settlement_reconcile_after_fingerprint = Some(format!("{:064x}", 0));
-        seed.file_snapshot_fingerprints.remove("/synthetic/0.jsonl");
-        seed.save(&path).unwrap();
-        let mut value = serde_json::to_value(&seed).unwrap();
-        value["files"]["/synthetic/0.jsonl"] = Value::Bool(false);
-        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
-        let mut loaded = ScanIndex::load(&path).unwrap();
-        let accepted = loaded.accepted_snapshot_fingerprints.clone();
-        let cursor = loaded.legacy_settlement_reconcile_after_fingerprint.clone();
-        assert!(loaded
-            .legacy_settlement_reconciliation_pending_fingerprints()
-            .is_empty());
-        let (armed, changed) =
-            loaded.prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 50);
-        assert!(armed.is_empty());
-        assert!(!changed);
-        assert_eq!(loaded.accepted_snapshot_fingerprint_ledger_version, version);
-        loaded.finish_legacy_settlement_reconciliation();
-        assert_eq!(loaded.accepted_snapshot_fingerprint_ledger_version, version);
-        assert_eq!(loaded.accepted_snapshot_fingerprints, accepted);
-        assert_eq!(loaded.legacy_settlement_reconcile_after_fingerprint, cursor);
-        loaded.save(&path).unwrap();
-        let restarted = ScanIndex::load(&path).unwrap();
-        assert!(restarted.decode_has_opaque_file_incidence());
-        assert_eq!(
-            restarted.accepted_snapshot_fingerprint_ledger_version,
-            version
-        );
-        assert_eq!(restarted.accepted_snapshot_fingerprints, accepted);
-        if version == 0 {
-            // Exact empty incidence resolves UNKNOWN even while the file is
-            // held; it does not invent a fingerprint or automatic retry.
-            loaded
-                .file_snapshot_fingerprints
-                .insert("/synthetic/0.jsonl".into(), BTreeSet::new());
-            assert!(!loaded.decode_has_opaque_file_incidence());
-            let (armed, changed) =
-                loaded.prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 50);
-            assert!(armed.is_empty());
-            assert!(changed);
-            assert_eq!(
-                loaded.accepted_snapshot_fingerprint_ledger_version,
-                SNAPSHOT_ACCEPTED_LEDGER_VERSION
-            );
         }
     }
 }
@@ -1363,7 +1310,8 @@ fn every_persisted_field_fixture() -> ScanIndex {
             | "claude_usage_family_witnesses"
             | "claude_usage_authority_quarantine"
             | "codex_parent_prefix_proofs"
-            | "accepted_snapshot_fingerprint_ledger_version" => continue,
+            | "accepted_snapshot_fingerprint_ledger_version"
+            | "legacy_settlement_reconcile_after_fingerprint" => continue,
             "upload_ack_retirement_handoff" => serde_json::json!({
                 "destination_namespace_hash":"c".repeat(64),
                 "committed_generation":1,
@@ -1501,7 +1449,6 @@ fn every_persisted_field_fixture() -> ScanIndex {
             | "accepted_rebuild_pending_since_unix_seconds"
             | "accepted_rebuild_last_alarm_unix_seconds"
             | "claude_history_cutoff_unix_seconds" => serde_json::json!(1),
-            "legacy_settlement_reconcile_after_fingerprint" => serde_json::json!("0".repeat(64)),
             "claude_folder_login_ledger" => serde_json::json!({"folder": {"fresh": true}}),
             "tail_discovery" => serde_json::json!({"deleted_unaccepted_files": 1}),
             "upload_context_fingerprint"
@@ -1563,6 +1510,7 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
                             | "claude_duplicate_fence_next_full_rearm_unix_seconds"
                             | "claude_full_rearm_progress"
                             | "claude_request_identity_contract_changed"
+                            | "legacy_settlement_reconcile_after_fingerprint"
                             | "claude_stale_family_carry"
                             | "held_audit_progress"
                             | "claude_retired_family_tombstones"
@@ -3069,19 +3017,22 @@ fn override_persistence_refusal_leaves_cooldown_unspent() {
     );
 }
 
+/// [behaviour] The Repair override cannot rebuild an older build's ledger:
+/// its identity carry refuses it, so nothing is carried or re-offered.
 #[test]
-fn override_does_not_carry_unproven_or_preledger_acks() {
-    for version in [
-        SNAPSHOT_ACCEPTED_LEDGER_PRE_LEDGER_VERSION,
-        SNAPSHOT_ACCEPTED_LEDGER_UNPROVEN_VERSION,
-    ] {
-        let mut seed = fixture();
-        seed.accepted_snapshot_fingerprint_ledger_version = version;
-        let mut rebuilt = ScanIndex::default();
-        rebuilt.carry_identity_from(seed).unwrap();
-        assert!(rebuilt.accepted_snapshot_fingerprints.is_empty());
-        assert!(rebuilt.accepted_rebuild_incidence.is_empty());
-        assert!(!rebuilt.accepted_incidence_pending_census);
+fn override_identity_carry_refuses_an_older_ledger() {
+    for version in [0_u8, 1] {
+        let scratch = crate::test_scratch::ScratchDir::new("lenient-carry-older-ledger");
+        let path = scratch.as_ref().join("index.json");
+        let mut value = serde_json::to_value(fixture()).unwrap();
+        value["accepted_snapshot_fingerprint_ledger_version"] = serde_json::json!(version);
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(matches!(
+            lenient_decode::read_identity_carry(File::open(&path).unwrap(), "claude_code"),
+            Err(lenient_decode::Error::Refused(
+                lenient_decode::OLDER_LEDGER_REFUSAL
+            ))
+        ));
     }
 }
 

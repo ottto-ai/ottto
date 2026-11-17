@@ -1158,14 +1158,12 @@ impl ScanIndex {
     /// Listed while the operator list names its family; Empty only while
     /// absent on disk (a deleted file cannot grow unread; any other stat
     /// result stays owed); LedgerAccepted by the source's exact body-accepted
-    /// predicate on a current ledger (`ledger_current`, hoisted by the
-    /// caller). Pi has no file-body predicate.
+    /// predicate. Pi has no file-body predicate.
     fn owed_count_exemption(
         &self,
         source: SnapshotSource,
         key: &str,
         entry: &ScanIndexEntry,
-        ledger_current: bool,
     ) -> Option<Exempt> {
         if self.claude_family_listed(key) {
             return Some(Exempt::Listed);
@@ -1175,12 +1173,11 @@ impl ScanIndex {
                 .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
             return absent.then_some(Exempt::Empty);
         }
-        let accepted = ledger_current
-            && match source {
-                SnapshotSource::ClaudeCode => claude_index_file_body_accepted(self, key, entry),
-                SnapshotSource::Codex => codex_index_file_body_accepted(self, key, entry),
-                SnapshotSource::Pi => false,
-            };
+        let accepted = match source {
+            SnapshotSource::ClaudeCode => claude_index_file_body_accepted(self, key, entry),
+            SnapshotSource::Codex => codex_index_file_body_accepted(self, key, entry),
+            SnapshotSource::Pi => false,
+        };
         accepted.then_some(Exempt::LedgerAccepted)
     }
 
@@ -1202,7 +1199,6 @@ impl ScanIndex {
                 .get(entity)
                 .is_some_and(|stamp| stamp.context_fingerprint == *active)
         };
-        let ledger_current = claude_accepted_ledger_is_current(self);
         for (key, entry) in &self.files {
             let Some(expected) = self.file_expected_context(key) else {
                 continue;
@@ -1218,7 +1214,7 @@ impl ScanIndex {
                 continue;
             }
             // Exemption first, before any membership early exit.
-            let exempt = self.owed_count_exemption(source, key, entry, ledger_current);
+            let exempt = self.owed_count_exemption(source, key, entry);
             match exempt {
                 Some(Exempt::Listed) => counts.listed_files += 1,
                 Some(Exempt::Empty) => counts.empty_files += 1,

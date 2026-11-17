@@ -358,16 +358,8 @@ impl ScanIndex {
             snapshot_activity_at,
             accepted_snapshot_fingerprints,
             accepted_snapshot_fingerprint_ledger_version: self
-                .accepted_snapshot_fingerprint_ledger_version
-                .max(previous.accepted_snapshot_fingerprint_ledger_version),
-            legacy_settlement_reconcile_after_fingerprint: self
-                .legacy_settlement_reconcile_after_fingerprint
-                .clone()
-                .or_else(|| {
-                    previous
-                        .legacy_settlement_reconcile_after_fingerprint
-                        .clone()
-                }),
+                .accepted_snapshot_fingerprint_ledger_version,
+            legacy_settlement_reconcile_after_fingerprint: None,
             quarantined_snapshot_fingerprints: retained_quarantine.clone(),
             active_quarantine_witness: self.active_quarantine_witness.clone(),
             active_upload_context_fingerprint: self.active_upload_context_fingerprint.clone(),

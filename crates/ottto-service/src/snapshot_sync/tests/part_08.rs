@@ -246,13 +246,7 @@ fn prepare_codex_union_fixture(root: &Path, index: &mut ScanIndex) -> SourceScan
         SnapshotUploadPolicy::default(),
     );
     for item in &mut scan.snapshots {
-        prepare_snapshot_cache_for_upload(
-            item,
-            &test_upload_progress(),
-            false,
-            false,
-            &BTreeSet::new(),
-        );
+        prepare_snapshot_cache_for_upload(item, &test_upload_progress(), false, false);
     }
     finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, index);
     scan
@@ -691,7 +685,6 @@ impl SameSourceAckFixture {
                     progress,
                     true,
                     false,
-                    &BTreeSet::new(),
                     &crate::snapshots::ClaudeUsageAuthorityDisposition::default(),
                 )
             },
@@ -1215,18 +1208,10 @@ fn v2_progress_above_old_bound_uploads_receipts_and_recovers_exactly() {
             &f.progress,
             true,
             true,
-            &BTreeSet::new(),
-            &BTreeSet::new(),
-            &crate::snapshots::ClaudeUsageAuthorityDisposition::default(),
+            &crate::snapshots::ClaudeUsageAuthorityDisposition::default()
         )
         .is_empty());
-        prepare_snapshot_cache_for_upload(
-            &mut f.items[0],
-            &f.progress,
-            true,
-            true,
-            &BTreeSet::new(),
-        );
+        prepare_snapshot_cache_for_upload(&mut f.items[0], &f.progress, true, true);
         assert_eq!(f.items[0].cache_base_head_etag, Some("c".repeat(64)));
         assert!(f.items[0].cache_observations.is_some());
         let reopened = f.items[0].clone();

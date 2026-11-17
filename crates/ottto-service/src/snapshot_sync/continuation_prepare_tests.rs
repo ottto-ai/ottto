@@ -87,20 +87,12 @@ impl ContinuationFixture {
         (progress, index)
     }
 
-    /// The ordinary prepare's mutating steps (admission re-offer, legacy
-    /// migration, upload-progress claim) and their saves, as the minting
-    /// cycle ran them.
+    /// The ordinary prepare's mutating steps (admission re-offer,
+    /// upload-progress claim) and their saves, as the minting cycle ran them.
     fn ordinary_prepare_saves(&self) {
         let source = SnapshotSource::Codex;
         let (mut progress, mut index) = self.load();
         let _ = index.prepare_snapshot_admission_reoffer(SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE);
-        if index.legacy_settlement_ledger_needs_migration() {
-            let _ = index.prepare_legacy_settlement_reconciliation(
-                source,
-                LEGACY_SETTLEMENT_RECONCILE_LIMIT_PER_CYCLE,
-            );
-        }
-        assert!(!index.legacy_settlement_ledger_needs_migration());
         let generation = cycle_replay_generation(source, CONTINUATION_NAMESPACE);
         let now = reason_reoffer::now_unix_seconds();
         let _ = prepare_upload_progress_for_cycle_with_reoffer(
@@ -172,8 +164,6 @@ impl ContinuationFixture {
             committed_index: ScanIndex::default(),
             backfill_state: Default::default(),
             backfill_pending: false,
-            legacy_reconciliation_pending: BTreeSet::new(),
-            active_legacy_reconciliation: BTreeSet::new(),
             scan: None,
         }
     }
@@ -376,8 +366,6 @@ fn the_continuation_prepare_matches_the_ordinary_tail_on_a_quiescent_fixture() {
         "no LiveAuthority capture"
     );
     assert!(!prepared.backfill_pending);
-    assert!(prepared.legacy_reconciliation_pending.is_empty());
-    assert!(prepared.active_legacy_reconciliation.is_empty());
     assert!(prepared.claude_scan_roots.is_none());
     assert!(prepared.scan.is_some());
 
@@ -596,23 +584,6 @@ fn a_pending_admission_reoffer_refuses_the_continuation_prepare() {
     index.save(&fixture.index_path).unwrap();
     assert!(fixture.load().1.snapshot_admission_reoffer_pending());
     fixture.assert_refused(ContinuationRefusal::AdmissionReoffer);
-}
-
-/// K1.1 (C-1 lease): an accepted ledger the legacy settlement has not yet
-/// migrated (the unproven version the first migration wrote) refuses
-/// before any read.
-#[test]
-fn a_pending_legacy_settlement_refuses_the_continuation_prepare() {
-    let fixture = ContinuationFixture::quiescent("continuation-prepare-legacy");
-    let (_, index) = fixture.load();
-    let mut value = serde_json::to_value(&index).unwrap();
-    value["accepted_snapshot_fingerprint_ledger_version"] = serde_json::json!(1);
-    let mut index: ScanIndex = serde_json::from_value(value).unwrap();
-    assert!(index.legacy_settlement_ledger_needs_migration());
-    assert!(!index.snapshot_admission_reoffer_pending());
-    index.save(&fixture.index_path).unwrap();
-    assert!(fixture.load().1.legacy_settlement_ledger_needs_migration());
-    fixture.assert_refused(ContinuationRefusal::LegacySettlement);
 }
 
 /// K1 (a″, C-1 lease): a due quarantine retry the ordinary selection would

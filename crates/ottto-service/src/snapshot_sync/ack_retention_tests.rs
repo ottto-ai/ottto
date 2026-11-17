@@ -1401,7 +1401,7 @@ fn resumed_probe_capacity_preserves_durable_equality_for_census_retirement() {
     let (committed, mut progress) = f.load();
     let mut item = f.item.clone();
     item.cache_observations = pending_head_index_item().1.cache_observations;
-    prepare_snapshot_cache_for_upload(&mut item, &progress, true, false, &BTreeSet::new());
+    prepare_snapshot_cache_for_upload(&mut item, &progress, true, false);
     let probe = cache_head_probe(&item);
     assert_ne!(
         snapshot_upload_body_witness(&item),

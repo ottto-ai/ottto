@@ -104,8 +104,8 @@ pub(super) fn bootstrap_cache_heads_with_budget(
     let mut shed = false;
     let result = (|| -> Result<usize> {
         let mut deferred = 0usize;
-        // A headless patched body reaches here only when head CAS is optional
-        // and no legacy reconciliation is pending; otherwise prepare strips it.
+        // A headless patched body reaches here only when head CAS is optional;
+        // otherwise prepare strips it.
         for enforce_head_cas in [false, true] {
             // A prior ordinary body ACK has no head proof. Force the exact probe
             // even when delivery of these bytes was previously acknowledged.
@@ -360,15 +360,12 @@ pub(super) struct DeferredCacheHeadIdentity {
     pub(super) session_key: String,
 }
 
-#[expect(clippy::too_many_arguments, reason = "8 args; no options struct yet")]
 pub(super) fn capture_deferred_cache_head_identities(
     source: SnapshotSource,
     items: &[SnapshotItem],
     progress: &SnapshotUploadProgress,
     enabled: bool,
     head_cas_required: bool,
-    legacy_pending: &BTreeSet<String>,
-    active_legacy: &BTreeSet<String>,
     disposition: &crate::snapshots::ClaudeUsageAuthorityDisposition,
 ) -> Vec<DeferredCacheHeadIdentity> {
     if !enabled {
@@ -387,18 +384,14 @@ pub(super) fn capture_deferred_cache_head_identities(
                 &item.source_session_id,
                 &crate::snapshots::snapshot_semantic_component_hashes(source, item),
             );
-            let legacy = legacy_pending.contains(&fingerprint);
-            if legacy && !active_legacy.contains(&fingerprint) {
-                return None;
-            }
             let session_key = cache_session_key(&item.source_session_id);
-            ((head_cas_required || legacy)
-                && !progress.accepted_cache_heads.contains_key(&session_key))
-            .then(|| DeferredCacheHeadIdentity {
-                source_file_fingerprint: item.source_file_fingerprint.clone(),
-                snapshot_fingerprint: fingerprint,
-                session_key,
-            })
+            (head_cas_required && !progress.accepted_cache_heads.contains_key(&session_key)).then(
+                || DeferredCacheHeadIdentity {
+                    source_file_fingerprint: item.source_file_fingerprint.clone(),
+                    snapshot_fingerprint: fingerprint,
+                    session_key,
+                },
+            )
         })
         .collect()
 }
@@ -421,7 +414,6 @@ pub(super) fn prepare_snapshot_cache_for_upload(
     progress: &SnapshotUploadProgress,
     enabled: bool,
     head_cas_required: bool,
-    legacy_pending: &BTreeSet<String>,
 ) {
     // Telemetry bodies use head CAS without negotiating cache evidence. Their
     // predecessor is the exact saved ACK, and they never carry a cache patch.
@@ -442,9 +434,7 @@ pub(super) fn prepare_snapshot_cache_for_upload(
     }
     let key = cache_session_key(&snapshot.source_session_id);
     snapshot.cache_base_head_etag = progress.accepted_cache_heads.get(&key).cloned();
-    if (head_cas_required || legacy_pending.contains(&snapshot.snapshot_fingerprint))
-        && snapshot.cache_base_head_etag.is_none()
-    {
+    if head_cas_required && snapshot.cache_base_head_etag.is_none() {
         snapshot.cache_observations = None;
         snapshot.cache_observations_state = None;
         return;
@@ -456,7 +446,7 @@ pub(super) fn prepare_snapshot_cache_for_upload(
 }
 
 /// Reserve growth from the ACKed cache predecessor without changing the local
-/// patch. Missing-head/legacy fencing can only remove this projected material.
+/// patch. Missing-head fencing can only remove this projected material.
 pub(super) fn identity_cache_wire_reserve(
     snapshot: &SnapshotItem,
     progress: &SnapshotUploadProgress,
@@ -471,7 +461,7 @@ pub(super) fn identity_cache_wire_reserve(
         return 0;
     }
     let mut projected = snapshot.clone();
-    prepare_snapshot_cache_for_upload(&mut projected, progress, true, false, &BTreeSet::new());
+    prepare_snapshot_cache_for_upload(&mut projected, progress, true, false);
     // An owed answer can become eligible between admission and upload. Reserve
     // its framing even while paced, using the real attachment/size paths.
     attach_head_conflict_answers(
@@ -485,16 +475,14 @@ pub(super) fn identity_cache_wire_reserve(
     )
 }
 
-/// Keep ordinary (0), patched or headed (1), legacy (2), and telemetry-only (3)
-/// requests separate: the head-CAS declaration applies to the entire batch.
-/// Class 1 is a body with a cache patch (admitted, unchanged or partial-empty)
-/// or a saved head; class 0 has neither, sends no CAS contract and cannot
-/// conflict with a server head it never claimed.
-pub(super) fn snapshot_upload_batch_class(snapshot: &SnapshotItem, legacy: bool) -> u8 {
+/// Keep ordinary (0), patched or headed (1), and telemetry-only (3) requests
+/// separate: the head-CAS declaration applies to the entire batch. Class 1 is
+/// a body with a cache patch (admitted, unchanged or partial-empty) or a saved
+/// head; class 0 has neither, sends no CAS contract and cannot conflict with a
+/// server head it never claimed.
+pub(super) fn snapshot_upload_batch_class(snapshot: &SnapshotItem) -> u8 {
     if snapshot.evidence_basis == Some("otel_only") {
         3
-    } else if legacy {
-        2
     } else {
         u8::from(crate::snapshot_client::declares_head_cas(snapshot))
     }
@@ -566,7 +554,6 @@ pub(super) fn effective_snapshot_upload_body_witness(
     progress: &SnapshotUploadProgress,
     enabled: bool,
     head_cas_required: bool,
-    legacy_pending: &BTreeSet<String>,
     local_authority: &crate::snapshots::ClaudeUsageAuthorityDisposition,
 ) -> String {
     if !local_authority
@@ -578,13 +565,7 @@ pub(super) fn effective_snapshot_upload_body_witness(
         return snapshot_upload_body_witness(snapshot);
     }
     let mut projected = snapshot.clone();
-    prepare_snapshot_cache_for_upload(
-        &mut projected,
-        progress,
-        enabled,
-        head_cas_required,
-        legacy_pending,
-    );
+    prepare_snapshot_cache_for_upload(&mut projected, progress, enabled, head_cas_required);
     snapshot_upload_body_witness(
         held_cache_head_probe(progress, &projected)
             .as_ref()
@@ -736,40 +717,6 @@ impl std::fmt::Display for SnapshotBatchResponseRejected {
             self.expected, self.accepted
         )
     }
-}
-
-/// Legacy ambiguity is resolved by the normal upload/quarantine machine. The
-/// deployed handler's exact-repeat contract is deliberately truthful: it
-/// commits the source-freshness acceptance UPSERT, but skips the
-/// bronze snapshot, payload, reconciliation revision, accepted-log sequence,
-/// archive occurrence, and entity-head writes. Consequently an exact repeat
-/// has zero census-membership delta. A genuinely missing head creates exactly
-/// one new/updated census member; a divergent body is fenced by head CAS and
-/// remains quarantined with zero census delta until an explicit resolution.
-pub(super) fn require_normal_write_ack_for_legacy_reconciliation(
-    response: &crate::snapshot_client::SnapshotBatchResponse,
-    request_fingerprints: &BTreeSet<String>,
-    legacy_pending: &BTreeSet<String>,
-) -> Result<()> {
-    let carries_legacy_reconciliation = request_fingerprints
-        .iter()
-        .any(|fingerprint| legacy_pending.contains(fingerprint));
-    if !carries_legacy_reconciliation {
-        return Ok(());
-    }
-    if response.disabled {
-        return Err(anyhow::Error::new(SnapshotAckRejected {
-            reason: "disabled snapshot response cannot settle legacy reconciliation",
-        }));
-    }
-    if response.entity_ack_contract.as_deref()
-        != Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT)
-    {
-        return Err(anyhow::Error::new(SnapshotAckRejected {
-            reason: "legacy snapshot reconciliation requires the exact entity ACK contract",
-        }));
-    }
-    Ok(())
 }
 
 /// A cycle's summary. Each source's cause is on its own "skipped for" line.

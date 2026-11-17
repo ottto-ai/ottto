@@ -97,7 +97,6 @@ fn lc_load(scratch: &Path, name: &str, mutate: impl FnOnce(&mut Value)) -> LcLoa
         drops: ScanIndexLoadDrops {
             activity: after.activity - before.activity,
             accepted: after.accepted - before.accepted,
-            cursor: after.cursor - before.cursor,
             quarantine: after.quarantine - before.quarantine,
         },
         lines,
@@ -212,7 +211,7 @@ fn load_keeps_index_with_one_bad_record_of_every_kind() {
         load.lines[0].starts_with(
             "local snapshot scan index load dropped or normalized invalid record(s); \
              index kept: source=claude_code activity_dropped=1 accepted_dropped=1 \
-             cursor_normalized=1 quarantine_normalized=2 record_repairs_this_process="
+             quarantine_normalized=2 record_repairs_this_process="
         ),
         "{}",
         load.lines[0]
@@ -225,16 +224,13 @@ fn load_keeps_index_with_one_bad_record_of_every_kind() {
         .all(snapshot_quarantine_deadline_is_bounded));
     assert_eq!(index.snapshot_unproven_terminal_count(), 1);
     assert_eq!(index.accepted_snapshot_fingerprints.len(), 2);
-    assert_eq!(
-        index.legacy_settlement_reconcile_after_fingerprint,
-        Some(lc_hex('0'))
-    );
+    // The retired sweep cursor is read and dropped, whatever its value.
+    assert_eq!(index.legacy_settlement_reconcile_after_fingerprint, None);
     assert_eq!(
         drops,
         ScanIndexLoadDrops {
             activity: 1,
             accepted: 1,
-            cursor: 1,
             quarantine: 2,
         }
     );
@@ -261,6 +257,49 @@ fn load_refuses_future_ledger_version_without_quarantine() {
     assert_eq!(lc_corrupt_siblings(&scratch), 0, "no .corrupt.* sibling");
     assert_eq!(fs::read(&load.path).unwrap(), load.written);
     assert_eq!(load.drops, ScanIndexLoadDrops::default());
+}
+
+/// [behaviour] An accepted ledger from an older build (0 or 1) is never
+/// migrated: every load refuses it, the alarm names the reset once per source,
+/// a save over it is refused, and its bytes and generation stay as written.
+#[test]
+fn load_and_save_refuse_older_ledger_versions_and_keep_bytes() {
+    for version in [0_u8, 1] {
+        let scratch = crate::test_scratch::ScratchDir::new("load-containment-older-ledger");
+        let load = lc_load(&scratch, "older-ledger", |value| {
+            value["accepted_snapshot_fingerprint_ledger_version"] = json!(version);
+        });
+        let Err(error) = &load.result else {
+            panic!("an older ledger is refused");
+        };
+        assert!(matches!(
+            error.downcast_ref::<lenient_decode::Error>(),
+            Some(lenient_decode::Error::Refused(
+                lenient_decode::OLDER_LEDGER_REFUSAL
+            ))
+        ));
+        // One alarm per source per process: only the first refusal says so.
+        let alarms = load
+            .lines
+            .iter()
+            .filter(|line| line.contains("older build; reset needed"))
+            .count();
+        assert_eq!(alarms, usize::from(version == 0), "{:?}", load.lines);
+        let mut working = lc_fixture();
+        assert!(
+            working.save(&load.path).is_err(),
+            "a save never overwrites it"
+        );
+        let again =
+            ScanIndex::load_for_snapshot_source(&load.path, SnapshotSource::ClaudeCode, &scratch);
+        assert!(again.is_err(), "the next cycle refuses it again");
+        assert!(load.path.exists(), "the index stays at its path");
+        assert_eq!(fs::read(&load.path).unwrap(), load.written);
+        let on_disk: Value = serde_json::from_slice(&load.written).unwrap();
+        assert_eq!(on_disk["generation"].as_u64(), Some(load.generation));
+        assert_eq!(lc_corrupt_siblings(&scratch), 0, "no .corrupt.* sibling");
+        assert_eq!(load.drops, ScanIndexLoadDrops::default());
+    }
 }
 
 /// Structural damage keeps the whole-index rebuild: invalid JSON still
@@ -336,7 +375,6 @@ fn save_cas_rereads_raw_bad_semantic_records_and_replaces_them_with_repaired_sel
         ScanIndexLoadDrops {
             activity: 1,
             accepted: 1,
-            cursor: 1,
             quarantine: 2,
         }
     );

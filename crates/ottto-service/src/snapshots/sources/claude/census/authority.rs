@@ -389,15 +389,6 @@ pub(in crate::snapshots) fn claude_index_file_body_accepted(
             })
 }
 
-/// Whether the accepted ledger is current and not being rebuilt by the
-/// legacy settlement reconciliation.
-pub(in crate::snapshots) fn claude_accepted_ledger_is_current(index: &ScanIndex) -> bool {
-    index.accepted_snapshot_fingerprint_ledger_version == SNAPSHOT_ACCEPTED_LEDGER_VERSION
-        && index
-            .legacy_settlement_reconcile_after_fingerprint
-            .is_none()
-}
-
 /// A demoted revision owes no clean follow-up only while its family quarantine
 /// is bounded, bound to the retained witness, and records exactly this
 /// revision: the candidate gate then skips it until the family changes (or,
