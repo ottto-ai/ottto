@@ -1050,6 +1050,16 @@ fn assert_mode(actual: (usize, usize, usize), expected: (usize, usize, usize)) {
         crate::heap_layout_bound::layout_supported()
     );
 }
+/// Continue on the same committed route after discarding process state; a new
+/// scanner must not publish the restored graph onto another fixture route.
+fn cold_ready(c: &Corpus, prior: ScanIndex, limit: usize, sampled: bool) -> Page {
+    let index = cold_restart(prior);
+    let scanner = E2ScanFixture::default();
+    scanner
+        .on_committed_route(&crate::snapshots::e2_pipeline_scan_fixture::route_of(&index).unwrap());
+    ready(c, &scanner, index, limit, sampled)
+}
+
 fn ready(
     corpus: &Corpus,
     scanner: &E2ScanFixture,
@@ -1192,13 +1202,7 @@ fn e2_pipeline_full_tail_unchanged_eviction_and_restart_are_cumulative() {
         );
         let oracle_bytes = canonical(&oracle.scan.snapshots);
         drop((first, full, tail, unchanged, evicted, oracle));
-        let restarted = ready(
-            &c,
-            &E2ScanFixture::default(),
-            cold_restart(prior),
-            100,
-            true,
-        );
+        let restarted = cold_ready(&c, prior, 100, true);
         assert_mode(restarted.modes, (1, 0, 0));
         assert_eq!(canonical(&restarted.scan.snapshots), oracle_bytes);
     });
@@ -1494,13 +1498,7 @@ fn e2_pipeline_unlisted_twin_resume_counts_copied_requests_once() {
             );
             let tail_money = sent_money(&tail);
             drop(tail);
-            let restarted = ready(
-                &c,
-                &E2ScanFixture::default(),
-                cold_restart(prior),
-                100,
-                true,
-            );
+            let restarted = cold_ready(&c, prior, 100, true);
             let mut cold = Corpus::new(&format!("{name}-cold"));
             for (folder, _, _, birth) in &files {
                 let relative = format!("{folder}/{ROOT}.jsonl");
@@ -4087,13 +4085,7 @@ fn conflict_only(subagent: bool) {
         let bytes = canonical(&conflicted.scan.snapshots);
         // A crash before the ACK: discard the page's uncommitted native state.
         drop(conflicted);
-        let mut restart = ready(
-            &c,
-            &E2ScanFixture::default(),
-            cold_restart(prior),
-            100,
-            false,
-        );
+        let mut restart = cold_ready(&c, prior, 100, false);
         restart.finish();
         assert_eq!(
             canonical(&restart.scan.snapshots),
