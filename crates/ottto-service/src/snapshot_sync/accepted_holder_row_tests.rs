@@ -2,7 +2,8 @@ use super::*;
 use crate::snapshots::claude_request_census::claude_request_hash;
 use crate::snapshots::e2_pipeline_scan_fixture::{
     accepted_file_for_test, delete_holder_for_test, hold_claude_account_for_test,
-    invalidate_holder_for_test, unhold_claude_account_for_test,
+    invalidate_holder_for_test, retain_indexed_walk_with_pending_for_test,
+    unhold_claude_account_for_test,
 };
 use crate::snapshots::upload_context_receipt::SlotRows;
 
@@ -398,13 +399,31 @@ fn exact_acceptance_corrects_an_earlier_counting_copy_once() {
         let mut index = seed(&c);
         append(&holder, &resumed(ROOT, &[B]));
         index = send(&c, &index, parsed(&c, index.clone()), Some(ROOT)).0;
-        new_copy(&mut c, COPY, "b");
+        let copy = new_copy(&mut c, COPY, "b");
         let page = parsed(&c, index.clone());
         assert_eq!(body(&page, COPY).unwrap().request_count, 2);
         index = send(&c, &index, page, None).0;
+        // Keep the already-counting copy off the holder's ACK page.
+        retain_indexed_walk_with_pending_for_test(
+            &mut index,
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&c.root),
+            "2026-08-02T08:00:00Z",
+            183,
+            std::slice::from_ref(&holder),
+        );
         // A new exact body, rather than a replayed refusal, supplies b.
         append(&holder, &resumed(ROOT, &[D]));
-        index = send(&c, &index, parsed(&c, index.clone()), None).0;
+        let scanner = E2ScanFixture::default();
+        let mut accepted = c.raw(&scanner, index.clone(), 1, false, &[]);
+        assert_eq!(scanner.paths(), vec![holder.clone()]);
+        accepted.enrich(&c);
+        assert!(body(&accepted, COPY).is_none());
+        index = send(&c, &index, accepted, None).0;
+        assert!(has(&index, &holder, "b"));
+        assert!(index
+            .claude_copy_removals
+            .pending(location_key(&copy.to_string_lossy())));
         let scanner = E2ScanFixture::default();
         let mut correction = c.raw(&scanner, index.clone(), 100, false, &[]);
         assert_eq!(
@@ -598,7 +617,10 @@ fn rows_never_supply_delivery_authority_and_rebuild_carries_them() {
         ));
         // Save the first bounded rebuild page with the accepted holder absent.
         let fresh = c.write_at(&format!("a/{THIRD}.jsonl"), &resumed(THIRD, &[D]), BORN);
-        let mut page = c.raw(&E2ScanFixture::default(), index, 1, false, &[fresh]);
+        // Hint every candidate so census reservation cannot select the holder first.
+        let scanner = E2ScanFixture::default();
+        let mut page = c.raw(&scanner, index, 1, false, &[fresh.clone(), holder.clone()]);
+        assert_eq!(scanner.paths(), vec![fresh]);
         page.enrich(&c);
         assert!(!page
             .index
