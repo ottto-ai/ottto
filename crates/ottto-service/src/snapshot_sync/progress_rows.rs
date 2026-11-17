@@ -889,6 +889,18 @@ impl SnapshotUploadProgress {
         result
     }
 
+    /// A retired walk's custody ends with it, except this pass's own
+    /// deferrals (its page was sent after the walk's terminal verdict, so
+    /// they hold the walk that follows). An owed or unknown cause becomes
+    /// explicit custody, so the next reconcile settles it; one blocked walk
+    /// bounds a session that is never ACKed.
+    pub(super) fn retire_identity_503_custody(&mut self, this_pass: BTreeSet<String>, owed: bool) {
+        let pending = self.identity_503_pending.take();
+        self.identity_503_pending = pending
+            .or_else(|| owed.then(BTreeSet::new))
+            .map(|pending| &pending & &this_pass);
+    }
+
     pub(super) fn finish_cycle(&mut self, path: &Path) -> Result<()> {
         if self.rows.is_none()
             && self.accepted_fingerprints.is_empty()

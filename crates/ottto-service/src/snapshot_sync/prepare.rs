@@ -1119,7 +1119,7 @@ pub(super) fn prepare_sync_source_inner(
     };
     // Before the scanner and its committed baseline: identity-503 custody
     // decides whether that cause still holds this walk unsettled.
-    index.reconcile_isolated_503(upload_progress.identity_503_pending.as_ref());
+    index.reconcile_isolated_503(&mut upload_progress.identity_503_pending);
     crate::local_resource_diagnostics::index_clone_start(source.api_slug());
     let mut committed_index = index.clone();
     let reoffer_paths =

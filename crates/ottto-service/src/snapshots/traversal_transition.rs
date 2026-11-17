@@ -769,7 +769,7 @@ mod tests {
                 index.bounded_sweep_unsettled_causes = Isolated503.bit();
             }
             let before = index.bounded_sweep_unsettled_cause_names();
-            index.reconcile_isolated_503(custody);
+            index.reconcile_isolated_503(&mut custody.cloned());
             let (scan, rows) = capture(|| {
                 scan_source_roots(
                     SnapshotSource::Pi,
@@ -805,6 +805,58 @@ mod tests {
                 retired["counts"]["unsettled_causes"],
                 json!(expected),
                 "{row}"
+            );
+        }
+    }
+
+    /// A terminal-page 503 leaves custody owed with no walk: the next walk
+    /// starts held (only that cause survives the start), so even a
+    /// single-pass walk retires unsettled. After it retires, the ledger
+    /// makes custody explicit and empty; the next reconcile settles.
+    #[test]
+    fn owed_isolated_503_holds_the_next_walk_from_its_start() {
+        use std::collections::BTreeSet;
+        let scratch = crate::test_scratch::ScratchDir::new("isolated-503-next-walk");
+        let roots = [scratch.to_path_buf()];
+        let mut index = ScanIndex::default();
+        index.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::Isolated503);
+        index.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::DeferredConflict);
+        for (row, mut custody, complete) in [
+            (
+                "owed session vanished",
+                Some(BTreeSet::from(["a".repeat(64)])),
+                false,
+            ),
+            ("custody absent: unknown", None, false),
+            ("next walk after retirement", Some(BTreeSet::new()), true),
+        ] {
+            index.reconcile_isolated_503(&mut custody);
+            assert!(index.traversal.is_none(), "{row}");
+            let (scan, rows) = capture(|| {
+                scan_source_roots(
+                    SnapshotSource::Pi,
+                    &roots,
+                    &mut index,
+                    T1,
+                    BACKFILL_WINDOW_DAYS,
+                )
+                .unwrap()
+            });
+            let retired = rows.iter().find(|row| row["counts"]["event"] == "retiring");
+            assert_eq!(scan.census_complete, complete, "{row}");
+            assert_eq!(
+                retired.unwrap()["counts"]["unsettled_causes"],
+                if complete {
+                    json!([])
+                } else {
+                    json!(["isolated_503"])
+                },
+                "{row}"
+            );
+            assert_ne!(
+                custody,
+                Some(BTreeSet::new()),
+                "{row}: settled custody clears"
             );
         }
     }

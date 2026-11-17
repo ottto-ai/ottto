@@ -1031,19 +1031,23 @@ impl ScanIndex {
     }
 
     /// Reconcile `Isolated503` with its custody before the scanner runs: an
-    /// empty set clears it, a pending one sets it, absent custody keeps it.
-    pub(crate) fn reconcile_isolated_503(&mut self, custody: Option<&BTreeSet<String>>) {
-        let bit = UnsettledUploadCause::Isolated503.bit();
+    /// empty set clears it (and the set), a pending one sets it, absent
+    /// custody keeps it.
+    pub(crate) fn reconcile_isolated_503(&mut self, custody: &mut Option<BTreeSet<String>>) {
         match custody {
-            Some(pending) if pending.is_empty() && self.unsettled_cause_bits() & bit != 0 => {
-                self.bounded_sweep_unsettled_causes = self.unsettled_cause_bits() & !bit;
+            Some(pending) if pending.is_empty() => {
+                *custody = None;
+                self.bounded_sweep_unsettled_causes =
+                    self.unsettled_cause_bits() & !UnsettledUploadCause::Isolated503.bit();
                 self.bounded_sweep_had_unsettled_upload = self.bounded_sweep_unsettled_causes != 0;
             }
-            Some(pending) if !pending.is_empty() => {
-                self.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::Isolated503)
-            }
-            _ => {}
+            Some(_) => self.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::Isolated503),
+            None => {}
         }
+    }
+
+    pub(crate) fn owes_isolated_503(&self) -> bool {
+        self.unsettled_cause_bits() & UnsettledUploadCause::Isolated503.bit() != 0
     }
 
     /// This pass ended the walk `before` was on: none remains, or another

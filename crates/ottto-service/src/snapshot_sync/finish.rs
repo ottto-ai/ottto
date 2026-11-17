@@ -2618,16 +2618,11 @@ pub(super) fn finish_sync_source(
         &retired_upload_acks,
         locally_held_fingerprints,
     );
-    // A retired walk's custody ends with it, except this pass's own
-    // deferrals: its page was sent after the walk's terminal verdict, so
-    // they belong to the walk that follows.
     if walk_retired {
-        let this_pass = identity_503_this_pass.unwrap_or_default();
-        upload_progress.identity_503_pending = upload_progress
-            .identity_503_pending
-            .take()
-            .map(|pending| &pending & &this_pass)
-            .filter(|pending| !pending.is_empty());
+        upload_progress.retire_identity_503_custody(
+            identity_503_this_pass.unwrap_or_default(),
+            index.owes_isolated_503(),
+        );
     }
     #[cfg(test)]
     tests::permanent_finish_pipeline_tests::ack_post_save_failure("finish_cycle")?;

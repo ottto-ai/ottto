@@ -1469,6 +1469,43 @@ fn identity_503_custody_records_and_drains_only_from_the_main_upload() {
             assert_eq!(identity_503, 0, "{row}: {result:?}");
         }
     }
+    // A retired walk: earlier keys end with it (one blocked walk), this
+    // pass's keys hold the next walk, an owed or unknown cause becomes
+    // explicit so the next reconcile settles it, a no-503 walk stays absent.
+    let other = "b".repeat(64);
+    let both = Some(BTreeSet::from([key.clone(), other.clone()]));
+    for (row, before, this_pass, owed, after) in [
+        ("no 503", None, BTreeSet::new(), false, None),
+        (
+            "unknown cause",
+            None,
+            BTreeSet::new(),
+            true,
+            Some(BTreeSet::new()),
+        ),
+        (
+            "earlier key, never ACKed",
+            owed.clone(),
+            BTreeSet::new(),
+            true,
+            Some(BTreeSet::new()),
+        ),
+        (
+            "this pass's key",
+            both,
+            BTreeSet::from([other.clone()]),
+            true,
+            Some(BTreeSet::from([other])),
+        ),
+    ] {
+        let mut progress = SnapshotUploadProgress::new(
+            format!("{:064x}", 99),
+            snapshot_quarantine_witness(SnapshotSource::Codex),
+        );
+        progress.identity_503_pending = before;
+        progress.retire_identity_503_custody(this_pass, owed);
+        assert_eq!(progress.identity_503_pending, after, "{row}");
+    }
     let mut progress = SnapshotUploadProgress::new(
         format!("{:064x}", 99),
         snapshot_quarantine_witness(SnapshotSource::Codex),
