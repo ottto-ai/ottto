@@ -807,50 +807,62 @@ fn export_historical_codex_head() {
         }})
         .to_string(),
     );
-    std::fs::write(&path, rows.join("\n") + "\n").unwrap();
-    for (name, evidence, cutover) in [
-        ("legacy", AckEvidence::LegacyAcked, Some(i64::MAX)),
-        ("v2", AckEvidence::None, Some(0)),
-    ] {
-        let mut parser = native_cold::parser(
-            SnapshotSource::Codex,
-            &path,
-            File::open(&path).unwrap(),
-            apply_codex_line,
-        );
-        version::configure(&mut parser.accumulator, evidence, cutover);
-        let scope = super::super::seam::tests::scope();
-        parser
-            .prepare_acquisition(None, &scope, None, 1_790_000_000)
-            .unwrap();
-        let (reduction, checkpoint) =
-            native_cold::finish_record(&mut parser, &scope, 1_790_000_000);
-        let staged = stage_reduction::<Codex>(
-            &reduction,
-            &checkpoint.durable_certificate(0).unwrap(),
-            &identity(),
-        );
-        let pages = staged
-            .pages
-            .iter()
-            .map(|((collection, page), bytes)| json!([format!("{collection:?}"), page, bytes]))
-            .collect::<Vec<_>>();
-        let collections = staged
-            .collections
-            .iter()
-            .map(|(collection, meta)| {
-                json!([
-                    format!("{collection:?}"),
-                    meta.shape as u8,
-                    meta.elements_per_page,
-                    meta.elements
-                ])
-            })
-            .collect::<Vec<_>>();
-        println!(
-            "HISTORICAL_CODEX_HEAD {}",
-            json!({"name":name,"revision":staged.revision,"head":staged.head,"pages":pages,"collections":collections,"lines":rows})
-        );
+    let root = "1338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+    let at = "2026-10-27T07:00:00Z";
+    let usage = json!({"input_tokens":10,"cached_input_tokens":0,"output_tokens":2,"reasoning_output_tokens":0,"total_tokens":12});
+    let sticky = vec![
+        json!({"type":"session_meta","timestamp":at,"payload":{"id":root,"timestamp":at}}),
+        json!({"type":"event_msg","timestamp":"2026-10-27T07:00:01Z","payload":{"type":"task_started","turn_id":"turn-a"}}),
+        json!({"type":"token_usage_record","timestamp":"2026-10-27T07:00:02Z","payload":{"thread_id":root,"turn_id":"turn-a","response_id":"turn-a","usage":usage,"thread_token_usage":usage}}),
+        json!({"type":"event_msg","timestamp":"2026-10-27T07:00:03Z","payload":{"type":"token_count","info":{"model":"gpt-5.2","last_token_usage":usage,"total_token_usage":usage}}}),
+        json!({"type":"event_msg","timestamp":"2026-10-27T07:00:04Z","payload":{"type":"task_complete","turn_id":"turn-a"}}),
+    ].into_iter().map(|row|row.to_string()).collect::<Vec<_>>();
+    for (fixture, rows) in [("mixed", rows), ("sticky", sticky)] {
+        std::fs::write(&path, rows.join("\n") + "\n").unwrap();
+        for (name, evidence, cutover) in [
+            ("legacy", AckEvidence::LegacyAcked, Some(i64::MAX)),
+            ("v2", AckEvidence::None, Some(0)),
+        ] {
+            let mut parser = native_cold::parser(
+                SnapshotSource::Codex,
+                &path,
+                File::open(&path).unwrap(),
+                apply_codex_line,
+            );
+            version::configure(&mut parser.accumulator, evidence, cutover);
+            let scope = super::super::seam::tests::scope();
+            parser
+                .prepare_acquisition(None, &scope, None, 1_790_000_000)
+                .unwrap();
+            let (reduction, checkpoint) =
+                native_cold::finish_record(&mut parser, &scope, 1_790_000_000);
+            let staged = stage_reduction::<Codex>(
+                &reduction,
+                &checkpoint.durable_certificate(0).unwrap(),
+                &identity(),
+            );
+            let pages = staged
+                .pages
+                .iter()
+                .map(|((collection, page), bytes)| json!([format!("{collection:?}"), page, bytes]))
+                .collect::<Vec<_>>();
+            let collections = staged
+                .collections
+                .iter()
+                .map(|(collection, meta)| {
+                    json!([
+                        format!("{collection:?}"),
+                        meta.shape as u8,
+                        meta.elements_per_page,
+                        meta.elements
+                    ])
+                })
+                .collect::<Vec<_>>();
+            println!(
+                "HISTORICAL_CODEX_HEAD {}",
+                json!({"name":format!("{fixture}-{name}"),"revision":staged.revision,"head":staged.head,"pages":pages,"collections":collections,"lines":rows})
+            );
+        }
     }
     std::fs::remove_dir_all(dir).unwrap();
 }
