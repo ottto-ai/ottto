@@ -178,7 +178,9 @@ pub(crate) fn is_version_refusal(error: &anyhow::Error) -> bool {
 
 pub(super) fn observe(source: SnapshotSource, loaded: &anyhow::Result<(ScanIndex, LoadOrigin)>) {
     match loaded {
-        Ok((index, LoadOrigin::Loaded)) => {
+        Ok((index, origin))
+            if matches!(origin, LoadOrigin::Loaded) || index.v2().persistence_v2.is_some() =>
+        {
             if index.persistence_available() {
                 set(source, Reason::NewerApp, false, 0);
             }

@@ -309,7 +309,8 @@ fn publication_pending_pause_does_not_touch_v1() {
     fs::write(&f.path, &bytes).unwrap();
     assert!(load_with(&f.path, true).unwrap().is_none());
     let mut index = ScanIndex::default();
-    after_v1_locked(&f.path, &mut index).unwrap();
+    let error = after_v1_locked(&f.path, &mut index).unwrap_err();
+    assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::DbUnavailable));
     assert_eq!(fs::read(&f.path).unwrap(), bytes);
     assert_eq!(fs::read_dir(f.path.parent().unwrap()).unwrap().count(), 1);
 }
@@ -545,7 +546,8 @@ fn import_without_original_inventory_refuses_publication() {
     fs::write(&f.path, bytes).unwrap();
     assert!(load_with(&f.path, true).unwrap().is_none());
     let mut index = ScanIndex::default();
-    after_v1_locked(&f.path, &mut index).unwrap();
+    let error = after_v1_locked(&f.path, &mut index).unwrap_err();
+    assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::DbUnavailable));
     assert!(index.v2().persistence_v2.is_none());
     assert_eq!(fs::read(&f.path).unwrap(), bytes);
     for (suffix, _, _) in fence::ARTIFACTS

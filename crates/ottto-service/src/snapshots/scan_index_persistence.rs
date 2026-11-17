@@ -1961,7 +1961,7 @@ impl LockedStore {
             Ok(())
         })
     }
-    fn recover_fresh_init(&self) -> Result<()> {
+    pub(crate) fn recover_fresh_init(&self) -> Result<()> {
         match open_at(&self.parent, &self.root_name, libc::O_RDONLY) {
             Ok(_) => return Ok(()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}

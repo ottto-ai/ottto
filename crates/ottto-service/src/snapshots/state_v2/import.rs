@@ -1,8 +1,7 @@
-//! Pre-publication pacing and the semantic mapper boundary.
+//! Verified graph publication and the semantic mapper boundary.
 use super::*;
 use anyhow::bail;
 use std::path::Path;
-use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -21,21 +20,16 @@ impl std::fmt::Display for Pause {
     }
 }
 impl std::error::Error for Pause {}
-/// Every attempt, whatever its pause class, is retried after one fixed day.
-#[derive(Default)]
-pub(super) struct Pace {
-    attempts: u64,
-    next: Option<Instant>,
-}
-impl Pace {
-    pub(super) fn start(&mut self, now: Instant) -> Option<bool> {
-        if self.next.is_some_and(|next| now < next) {
-            return None;
+impl Pause {
+    pub(super) fn hold(self) -> Hold {
+        match self {
+            Self::Io | Self::Mismatch => Hold::ReloadRequired,
+            Self::Partial
+            | Self::Malformed
+            | Self::UnknownClass
+            | Self::Oversize
+            | Self::UnsafeParent => Hold::DbUnavailable,
         }
-        let first = self.attempts == 0;
-        self.attempts = self.attempts.saturating_add(1);
-        self.next = Some(now + Duration::from_secs(24 * 3600));
-        Some(first)
     }
 }
 
@@ -51,6 +45,7 @@ pub(super) fn import_generation(index: &ScanIndex, original: &Original) -> Resul
         .checked_add(u64::from(original.missing.is_none()))
         .ok_or_else(|| Pause::Oversize.into())
 }
+#[cfg(test)]
 pub(super) fn import_graph(
     store: &mut sqlite::Sqlite,
     index: &ScanIndex,
@@ -718,7 +713,7 @@ impl Original {
         self.unchanged()?;
         fence::publish(path, identity, latched)
     }
-    fn verify_baseline(&self, path: &Path) -> Result<()> {
+    pub(super) fn verify_baseline(&self, path: &Path) -> Result<()> {
         for (n, source) in self.files.iter().enumerate() {
             let target = if n == 0 {
                 fence::sibling(path, ".v1-readonly")

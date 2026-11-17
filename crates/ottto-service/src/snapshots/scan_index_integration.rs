@@ -161,6 +161,15 @@ fn drain_stats(store: &scan_index_persistence::LockedStore, source: &'static str
         stats.index_shard_unavailable,
     );
 }
+/// Caller owns CheckpointLock. Preserve initialization diagnostics even when
+/// the importer inventories before the semantic reader opens the store.
+pub(super) fn recover_fresh_init(path: &Path, source: &'static str) -> Result<()> {
+    let binding = scan_index_storage_binding(path).ok_or(state_v2::Hold::ForeignBinding)?;
+    let store = scan_index_persistence::LockedStore::new(path, binding, lenient_decode::FIELDS)?;
+    let result = store.recover_fresh_init();
+    drain_stats(&store, source);
+    result
+}
 pub(super) fn open_storage(
     store: &scan_index_persistence::LockedStore,
     source: &'static str,
