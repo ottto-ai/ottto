@@ -810,6 +810,10 @@ pub(crate) mod late_member_finish_pipeline_tests {
     include!("late_member_finish_pipeline_tests.rs");
 }
 
+pub(crate) mod once_credit_oracle_tests {
+    include!("once_credit_oracle_tests.rs");
+}
+
 thread_local! {
     static ACK_POST_SAVE_FAILURE: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
     static ACK_CACHE_PROBE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -819,6 +823,7 @@ thread_local! {
 /// synthetic cache patch after that fold to isolate finish's bootstrap exit.
 pub(in crate::snapshot_sync) fn ack_cache_probe_for_test(items: &mut [SnapshotItem]) {
     reason_reoffer_pipeline_tests::observe_finalized_probe_items(items);
+    once_credit_oracle_tests::observe_finalized_items(items);
     if ACK_CACHE_PROBE.with(|slot| slot.replace(false)) {
         items
             .first_mut()

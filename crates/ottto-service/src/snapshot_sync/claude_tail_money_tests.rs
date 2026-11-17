@@ -88,13 +88,22 @@ fn save_inputs(c: &Corpus) {
 
 // Retain the actual emitted items: SnapshotItem intentionally has no wire
 // deserializer, and production hashes must be recomputed from production types.
-pub(super) struct ReceiptBody {
+pub(in crate::snapshot_sync) struct ReceiptBody {
     raw: Vec<u8>,
     source: SnapshotSource,
     items: Vec<SnapshotItem>,
 }
 
 impl ReceiptBody {
+    #[cfg(test)]
+    pub(in crate::snapshot_sync) fn new(
+        raw: Vec<u8>,
+        source: SnapshotSource,
+        items: Vec<SnapshotItem>,
+    ) -> Self {
+        Self { raw, source, items }
+    }
+
     fn cross_build(&self) -> Vec<u8> {
         let envelope = |bytes: &[u8]| {
             let mut wire: Value = serde_json::from_slice(bytes).unwrap();
@@ -180,7 +189,7 @@ fn receipt(name: &str, bodies: &[ReceiptBody]) {
     );
 }
 
-pub(super) fn receipt_with_output(
+pub(in crate::snapshot_sync) fn receipt_with_output(
     name: &str,
     bodies: &[ReceiptBody],
     output_env: &str,
