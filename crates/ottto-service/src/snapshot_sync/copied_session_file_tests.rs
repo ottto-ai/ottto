@@ -2179,22 +2179,28 @@ fn content_carrier_reconcile_under_open_v2_save_does_not_deadlock() {
     worker.join().unwrap();
 }
 
-/// [regress] An unrouted JSON save grants no new head-backed authority and
-/// keeps its existing residual behavior without relocking a v2 session.
+/// [regress] An unrouted JSON save retains exact accepted counted rows
+/// without granting head-backed authority or relocking a v2 session.
 #[test]
 fn legacy_content_carrier_save_stays_unrouted() {
     with_e2(|| {
         let (c, mut index, _) = settled_content_carrier(false);
         assert!(crate::snapshots::e2_pipeline_scan_fixture::route_of(&index).is_none());
+        assert!(!index.upload_context_proof.request_contributions.is_empty());
+        let rows = index.upload_context_proof.request_contributions.clone();
+        let copy = c.root.join(file(COPY));
+        let removals = removed_hashes(&index, &copy);
         for _ in 0..3 {
             let page = ready(&c, &E2ScanFixture::default(), index.clone(), 100, false);
             index = settle(&c, &index, page, &mut e2_progress());
             assert!(crate::snapshots::e2_pipeline_scan_fixture::route_of(&index).is_none());
+            assert_eq!(index.upload_context_proof.request_contributions, rows);
+            assert_eq!(removed_hashes(&index, &copy), removals);
             assert!(
-                index
+                !index
                     .claude_copy_removals
                     .pending(location_key(&c.root.join(file(COPY)).to_string_lossy())),
-                "legacy ownership behavior is unchanged"
+                "fresh accepted rows settle ownership without a head route"
             );
         }
     });
@@ -2415,4 +2421,44 @@ fn committed_content_carrier_requires_bound_receipt_after_reload() {
 
 mod accepted_holder_row_tests {
     include!("accepted_holder_row_tests.rs");
+}
+
+/// [money] A current carrier keeps the main's Local proof for both a stored
+/// copy and a new copy, even when old state has no accepted counted rows.
+#[test]
+fn carried_main_keeps_local_proof_without_accepted_request_rows() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    with_e2(|| {
+        let (mut c, mut index, [h, copy, t]) = settled_content_carrier(true);
+        index.upload_context_proof.request_contributions.clear();
+        index = c.reload(&mut index);
+        index.activate_upload_context("e2-synthetic-destination".into());
+        assert!(e2::carrier_group_owned_for_test(
+            &index,
+            &h.to_string_lossy()
+        ));
+        index
+            .claude_copy_removals
+            .mark(location_key(&copy.to_string_lossy()));
+        c.write_at(
+            &file(THIRD),
+            &resumed(
+                THIRD,
+                &[A, ("own-branch", "2026-08-02T07:03:20Z", RESUME_WRITER)],
+            ),
+            BORN,
+        );
+        let scanner = carrier_scanner(&index);
+        let page = ready(&c, &scanner, index, 100, true);
+        assert!(!scanner.paths().contains(&h) && !scanner.paths().contains(&t));
+        for session in [COPY, THIRD] {
+            let item = body(&page, session).unwrap();
+            assert_eq!(
+                (item.request_count, item.removed_request_count),
+                (1, Some(1))
+            );
+        }
+    });
 }

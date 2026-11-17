@@ -785,3 +785,42 @@ fn negative_census_retracts_a_local_only_removal() {
         assert_eq!(body(&parsed(&c, index), COPY).unwrap().request_count, 2);
     });
 }
+
+#[test]
+#[serial(client_report)]
+fn semantic_noop_rewrite_keeps_rows_until_a_changed_body_is_acknowledged() {
+    with_e2(|| {
+        let mut c = Corpus::new("accepted-row-noop-rewrite");
+        let holder = c.root(ROOT, &line(ROOT, "h", AT, 10));
+        let first = seed(&c);
+        let copy = c.write_at(&file(COPY), &line(COPY, "h", AT, 10), BORN);
+        let page = parsed(&c, first.clone());
+        assert_eq!(body(&page, COPY).unwrap().request_count, 0);
+        let mut index = send(&c, &first, page, None).0;
+        std::fs::write(&holder, line(ROOT, "u", AT, 10)).unwrap();
+        let page = parsed(&c, index.clone());
+        let (next, sent, _) = send(&c, &index, page, None);
+        index = next;
+        assert!(sent.iter().all(|item| item.source_session_id != ROOT));
+        assert!(has(&index, &holder, "h"));
+        assert!(!has(&index, &holder, "u"));
+        assert!(!index
+            .claude_copy_removals
+            .pending(location_key(&copy.to_string_lossy())));
+        append(&holder, &line(ROOT, "v", "2026-08-02T07:01:00Z", 20));
+        index = send(&c, &index, parsed(&c, index.clone()), None).0;
+        assert!(!has(&index, &holder, "h"));
+        assert!(has(&index, &holder, "u"));
+        assert!(index
+            .claude_copy_removals
+            .pending(location_key(&copy.to_string_lossy())));
+        let page = parsed(&c, index.clone());
+        let item = body(&page, COPY).unwrap();
+        assert_eq!(
+            (item.request_count, item.removed_request_count),
+            (1, Some(0))
+        );
+        index = send(&c, &index, page, None).0;
+        stable(&c, &mut index);
+    });
+}

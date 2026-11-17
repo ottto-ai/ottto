@@ -836,8 +836,16 @@ fn e2_progress() -> SnapshotUploadProgress {
         snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
     )
 }
-fn request(items: &[impl std::borrow::Borrow<SnapshotItem>]) -> SnapshotBatchRequest<&SnapshotItem> {
-    request_under(SnapshotUploadPolicy::default(), &items.iter().map(std::borrow::Borrow::borrow).collect::<Vec<_>>())
+fn request(
+    items: &[impl std::borrow::Borrow<SnapshotItem>],
+) -> SnapshotBatchRequest<&SnapshotItem> {
+    request_under(
+        SnapshotUploadPolicy::default(),
+        &items
+            .iter()
+            .map(std::borrow::Borrow::borrow)
+            .collect::<Vec<_>>(),
+    )
 }
 fn request_under<'a>(
     upload_policy: SnapshotUploadPolicy,
@@ -949,7 +957,9 @@ pub(in crate::snapshot_sync) fn ack(
     // head or a telemetry-only body, `validate_entity_ack`): every accepted
     // entity gets a head, including telemetry-only bodies without cache
     // evidence.
-    let head_cas = batch.iter().any(|item| crate::snapshot_client::declares_head_cas(item));
+    let head_cas = batch
+        .iter()
+        .any(|item| crate::snapshot_client::declares_head_cas(item));
     for item in batch {
         let mut reference = entity_ack_ref(&item.snapshot_fingerprint);
         reference.source_session_id = item.source_session_id.clone();
@@ -2939,7 +2949,11 @@ fn rewritten_original(reverse: bool) {
         let old = ScanIndex::default();
         let first = ready(&c, &scanner, old.clone(), 100, false);
         assert_eq!(total(&first), 2, "h1 once, r2 once");
-        let prior = settle(&c, &old, first, &mut progress);
+        let mut prior = settle(&c, &old, first, &mut progress);
+        // Exercise Local proof after loading older state without receiver rows.
+        // Exact accepted hashes instead survive a semantic no-op rewrite.
+        prior.upload_context_proof.request_contributions.clear();
+        let prior = c.reload(&mut prior);
         let inode = |path: &Path| {
             use std::os::unix::fs::MetadataExt;
             std::fs::metadata(path).unwrap().ino()
@@ -3165,6 +3179,9 @@ fn e2_pipeline_branch_waits_for_an_original_modified_since_its_read() {
         let first = ready(&c, &E2ScanFixture::default(), old.clone(), 100, false);
         assert_eq!(total(&first), 1);
         let mut prior = settle(&c, &old, first, &mut progress);
+        // Keep the Local-only stale-holder control separate from receiver proof.
+        prior.upload_context_proof.request_contributions.clear();
+        prior = c.reload(&mut prior);
         // Same length: h becomes u in place; the clock moves on.
         std::fs::write(&original, line(LATE, "u", AT, 10)).unwrap();
         std::fs::File::options()

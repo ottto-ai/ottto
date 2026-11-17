@@ -2272,6 +2272,7 @@ impl CopyOwnership {
             (old_carried.contains(member.root) && !live.carried.contains(member.root))
                 .then_some(location)
         }));
+        let carrier_lost = marks[invalidated.len()..].to_vec();
         let keys = before
             .keys()
             .map(String::as_str)
@@ -2447,7 +2448,8 @@ impl CopyOwnership {
                     let removed = groups
                         .iter()
                         .any(|(_, hashes)| hashes.binary_search(&hash).is_ok());
-                    let keep = saved_removal_applies(next, &live, key, hash);
+                    let keep = saved_removal_applies(next, &live, key, hash)
+                        && !groups.iter().any(|(h, _)| carrier_lost.contains(h));
                     let covered = holders.get(&hash).is_some_and(|holder| *holder < order)
                         || earliest_accepted_holder(
                             next,
@@ -3315,8 +3317,32 @@ fn decide_holders(
                 .and_then(FileFold::location_key)
         })
         .collect::<BTreeSet<_>>();
-    let owned =
-        |key: &str| local_owned(index, page, key, true) && !held_here.contains(&location_key(key));
+    // An empty-proof main whose current-context empty proof binds its exact
+    // bytes, while a current twin carries its session's summed body: the
+    // twin's ACK accepted that body, which counts this main's requests, so
+    // the main holds them off the page as well.
+    let carried = |key: &str| {
+        index.file_upload_context_enabled()
+            && index.confirmed_empty_files.contains(key)
+            && !index.file_upload_context_requires_adoption(key)
+            && !copy_held(index, key)
+            && !index.claude_family_listed(key)
+            && index.files.get(key).is_some_and(|entry| {
+                index
+                    .claude_request_census
+                    .get(key)
+                    .is_some_and(|record| record.current_for(&entry.source_file_fingerprint))
+            })
+            && claude_index_path_member_ref(Path::new(key)).is_some_and(|member| {
+                live.get_or_init(|| indexed_main_files(index))
+                    .carried
+                    .contains(member.root)
+            })
+    };
+    let owned = |key: &str| {
+        (local_owned(index, page, key, true) || carried(key))
+            && !held_here.contains(&location_key(key))
+    };
     let mut page_folds = BTreeMap::<&str, Vec<usize>>::new();
     for (at, item) in page.iter().enumerate() {
         if item.claude_money.is_some() {
