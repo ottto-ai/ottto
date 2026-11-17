@@ -72,14 +72,14 @@ struct LcLoad {
     lines: Vec<String>,
 }
 
-/// Save the valid fixture (generation 1), apply one mutation to its bytes
+/// Encode a legacy fixture (generation 1), apply one mutation to its bytes
 /// the way an older or defective writer would leave them, then load once
 /// through the daemon's source-aware path.
 fn lc_load(scratch: &Path, name: &str, mutate: impl FnOnce(&mut Value)) -> LcLoad {
     let path = scratch.join(format!("{name}-claude_code-scan-index-v3.json"));
     let mut index = lc_fixture();
-    index.save(&path).expect("persist valid fixture");
-    let mut value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    index.generation = 1;
+    let mut value = serde_json::to_value(&index).unwrap();
     let generation = value["generation"].as_u64().expect("saved generation");
     mutate(&mut value);
     let written = serde_json::to_vec(&value).unwrap();
@@ -263,10 +263,10 @@ fn load_refuses_future_ledger_version_without_quarantine() {
     assert_eq!(load.drops, ScanIndexLoadDrops::default());
 }
 
-/// Structural damage keeps the whole-index rebuild: invalid JSON still
-/// quarantines, and a valid index loads with nothing dropped.
+/// Unbound inspection refuses structural damage without publication authority;
+/// a valid legacy index still loads with nothing dropped.
 #[test]
-fn load_still_quarantines_undecodable_index_and_drops_nothing_from_valid_one() {
+fn unbound_load_refuses_undecodable_index_and_drops_nothing_from_valid_one() {
     let scratch = crate::test_scratch::ScratchDir::new("load-containment-structural");
     let valid = lc_load(&scratch, "valid", |_| {});
     let (mut index, drops) = lc_assert_kept(&scratch, valid);
@@ -275,11 +275,13 @@ fn load_still_quarantines_undecodable_index_and_drops_nothing_from_valid_one() {
 
     let path = scratch.join("truncated-claude_code-scan-index-v3.json");
     fs::write(&path, b"{\"schema_version\":").unwrap();
-    let rebuilt = ScanIndex::load(&path).expect("undecodable index rebuilds");
-    assert!(!path.exists());
-    assert_eq!(lc_corrupt_siblings(&scratch), 1);
-    assert_eq!(rebuilt.generation, 0);
-    assert!(rebuilt.files.is_empty());
+    let error = ScanIndex::load(&path).unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<state_v2::Hold>(),
+        Some(&state_v2::Hold::ForeignBinding)
+    );
+    assert_eq!(fs::read(&path).unwrap(), b"{\"schema_version\":");
+    assert_eq!(lc_corrupt_siblings(&scratch), 0);
 }
 
 #[test]
@@ -314,54 +316,24 @@ fn load_repairs_superseded_terminal_without_changing_witness_body_or_disposition
 }
 
 #[test]
-fn save_cas_rereads_raw_bad_semantic_records_and_replaces_them_with_repaired_self() {
-    let scratch = crate::test_scratch::ScratchDir::new("load-containment-save-cas");
-    let load = lc_load(&scratch, "save-cas", |value| {
+fn unbound_semantic_repairs_cannot_replace_the_legacy_input() {
+    let scratch = crate::test_scratch::ScratchDir::new("load-containment-save");
+    let load = lc_load(&scratch, "save", |value| {
         value["snapshot_activity_at"][lc_hex('c')] = json!("not-rfc3339");
-        value["accepted_snapshot_fingerprints"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!("bad-identity"));
-        value["legacy_settlement_reconcile_after_fingerprint"] = json!("bad-cursor");
-        value["quarantined_snapshot_fingerprints"][lc_hex('e')]["retry_after_unix_seconds"] =
-            json!(u64::MAX);
-        value["quarantined_snapshot_fingerprints"][lc_hex('f')]["failed_reconstruction_count"] =
-            json!(0);
     });
     let path = load.path.clone();
     let raw = load.written.clone();
     let (mut repaired, drops) = lc_assert_kept(&scratch, load);
-    assert_eq!(
-        drops,
-        ScanIndexLoadDrops {
-            activity: 1,
-            accepted: 1,
-            cursor: 1,
-            quarantine: 2,
-        }
-    );
+    assert_eq!(drops.activity, 1);
     let generation = repaired.generation;
-    let mut expected = serde_json::to_value(&repaired).unwrap();
-    expected["generation"] = json!(generation + 1);
+    let error = repaired.save(&path).unwrap_err();
     assert_eq!(
-        fs::read(&path).unwrap(),
-        raw,
-        "CAS will read the bad records"
+        error.downcast_ref::<state_v2::Hold>(),
+        Some(&state_v2::Hold::ForeignBinding)
     );
-    repaired
-        .save(&path)
-        .expect("raw semantic damage does not reject CAS");
-    assert_eq!(repaired.generation, generation + 1);
-    let saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-    assert_eq!(
-        saved, expected,
-        "save replaces raw damage with repaired self"
-    );
+    assert_eq!(repaired.generation, generation);
+    assert_eq!(fs::read(&path).unwrap(), raw);
     assert_eq!(lc_corrupt_siblings(&scratch), 0);
-    let before_reload = scan_index_load_drops_for_test();
-    let reloaded = ScanIndex::load(&path).expect("reload repaired checkpoint");
-    assert_eq!(scan_index_load_drops_for_test(), before_reload);
-    assert_eq!(serde_json::to_value(reloaded).unwrap(), expected);
 }
 
 /// [behaviour] An unreadable Repair stamp allows one rebuild, then its fresh
@@ -369,15 +341,20 @@ fn save_cas_rereads_raw_bad_semantic_records_and_replaces_them_with_repaired_sel
 #[cfg(unix)]
 #[test]
 fn unreadable_repair_stamp_allows_one_rebuild() {
-    let scratch = crate::test_scratch::ScratchDir::new("load-containment-unreadable-stamp");
-    let path = scratch.join("index.json");
+    let scratch = crate::test_scratch::ScratchDir::canonical("load-containment-unreadable-stamp");
+    let parent = scratch.join("a".repeat(64));
+    fs::create_dir_all(&parent).unwrap();
+    let path = parent.join("claude_code-stamp-scan-index.json");
     let support = scratch.join("support");
     let source = SnapshotSource::ClaudeCode;
     SCAN_INDEX_REBUILD_OVERRIDE.with(|cell| cell.set([ScanIndexRebuildOverrideState::NONE; 3]));
     note_scan_index_rebuild_paused(source, false);
     let load = || ScanIndex::load_for_snapshot_source_with_origin(&path, source, &support);
-    fs::write(&path, b"{").unwrap();
-    assert_eq!(load().unwrap().1, ScanIndexLoadOrigin::Quarantined);
+    fs::write(
+        unique_checkpoint_sibling(&path, "corrupt"),
+        b"prior witness",
+    )
+    .unwrap();
 
     let stamp = scan_index_override_stamp_path(&support, source);
     fs::create_dir_all(stamp.parent().unwrap()).unwrap();
@@ -400,19 +377,19 @@ fn unreadable_repair_stamp_allows_one_rebuild() {
         arm_scan_index_rebuild_manual_override(source, SystemTime::now()),
         ScanIndexRebuildOverride::Armed
     );
-    assert_eq!(load().unwrap().1, ScanIndexLoadOrigin::Quarantined);
+    assert_eq!(
+        load().unwrap_err().downcast_ref::<state_v2::Hold>(),
+        Some(&state_v2::Hold::ReloadRequired)
+    );
+    assert_eq!(load().unwrap().1, ScanIndexLoadOrigin::Loaded);
     let fresh: ScanIndexOverrideStamp = serde_json::from_slice(&fs::read(&stamp).unwrap()).unwrap();
     assert!(fresh.last_override_unix_seconds > 0);
 
     // A different checkpoint has no override witness, so only the fresh
     // source-wide stamp can enforce the cooldown after restart.
-    let next_path = scratch.join("next-index.json");
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
+    let next_path = parent.join("claude_code-next-scan-index.json");
     fs::write(
-        scratch.join(format!("next-index.corrupt.123.{now}.json")),
+        unique_checkpoint_sibling(&next_path, "corrupt"),
         b"prior witness",
     )
     .unwrap();
@@ -423,6 +400,7 @@ fn unreadable_repair_stamp_allows_one_rebuild() {
         arm_scan_index_rebuild_manual_override(source, SystemTime::now()),
         ScanIndexRebuildOverride::Cooldown
     );
+    state_v2::erase_published(&path);
     note_scan_index_rebuild_paused(source, false);
     SCAN_INDEX_REBUILD_OVERRIDE.with(|cell| cell.set([ScanIndexRebuildOverrideState::NONE; 3]));
 }

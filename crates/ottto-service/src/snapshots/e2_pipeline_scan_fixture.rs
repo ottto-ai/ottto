@@ -432,30 +432,33 @@ pub(crate) fn route_of(index: &ScanIndex) -> Option<PathBuf> {
     state_v2::runtime_path(index).ok().flatten()
 }
 
-/// A fixture's save beside its own files. A routed index commits on its route
-/// and leaves an unrouted copy at `path`: a later load from there holds no
-/// Claude continuation, so its next change reads Full.
+/// Commit on the native route, then encode a legacy decoder fixture at `path`.
+/// The copy has no continuation; another owner must read changed input Full.
 pub(crate) fn save_for_test(index: &mut ScanIndex, path: &Path) {
-    let Some(route) = route_of(index) else {
-        return index.save(path).unwrap();
-    };
-    save_on_route(index, &route).unwrap();
+    if let Some(route) = route_of(index) {
+        save_on_route(index, &route).unwrap();
+    } else {
+        let mut cold = publish_route(index, path.parent().unwrap()).1;
+        carry_runtime(index, &mut cold);
+        *index = cold;
+    }
     let mut copy = index.clone();
     copy.v2_mut().persistence_v2 = None;
-    // A fresh copy each save: its generation is the route's, not this file's.
-    let _ = fs::remove_file(path);
-    copy.generation = 0;
-    copy.save(path).unwrap();
+    copy.generation = 1;
+    let mut bytes = Vec::new();
+    lenient_decode::write_index(&mut bytes, &copy).unwrap();
+    fs::write(path, bytes).unwrap();
 }
 
-/// The same owner's save and reload between passes, as the daemon's: a
-/// routed index commits on its route and continues from it (the RAM-era
-/// fixture kept its cache across this reload); an unrouted one round-trips
-/// through `path`.
+/// Save and reload on this owner's native route; an unrouted seed is first
+/// published on its own route under the supplied fixture directory.
 pub(crate) fn save_reload_for_test(index: &mut ScanIndex, path: &Path) -> ScanIndex {
     let Some(route) = route_of(index) else {
-        index.save(path).unwrap();
-        return ScanIndex::load(path).unwrap();
+        let loaded = publish_route(index, path.parent().unwrap()).1;
+        let mut saved = loaded.clone();
+        carry_runtime(index, &mut saved);
+        *index = saved;
+        return loaded;
     };
     save_on_route(index, &route).unwrap();
     let mut loaded = ScanIndex::load(&route).unwrap();
