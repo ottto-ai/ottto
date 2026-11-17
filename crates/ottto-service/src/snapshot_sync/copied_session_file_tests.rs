@@ -2542,6 +2542,11 @@ fn settled_disclosed_copy_redecides_once_after_holder_acceptance() {
             prior.claude_money_birth_store.set_money_rule_version(4);
             prior = c.reload(&mut prior);
             assert!(!prior.claude_copy_removals.pending(location));
+            // The graph is already committed. Avoid the fixture's implicit
+            // pre-scan save before Corpus::raw activates its upload context:
+            // that would falsely withdraw the copy's carrier proof and re-owe
+            // the main, whose read also pulls this overlapping content twin.
+            let scanner = carrier_scanner(&prior);
 
             // Old-red control: no pass means no read and no removal, even
             // though exact accepted request rows now prove the earlier main.
@@ -2551,6 +2556,8 @@ fn settled_disclosed_copy_redecides_once_after_holder_acceptance() {
             assert!(quiet.scan.snapshots.is_empty());
             assert!(removed_hashes(&quiet.index, &copy).is_empty());
             prior = settle(&c, &prior, quiet, &mut e2_progress());
+            // Match the daemon: activate the context before rules and save.
+            prior.activate_upload_context("e2-synthetic-destination".into());
             // A hold and a decision that already removed this prefix must
             // not gain a correction obligation from the one-time pass.
             let mut held = prior.clone();
@@ -2639,7 +2646,9 @@ fn settled_disclosed_copy_redecides_once_after_holder_acceptance() {
             } else {
                 settle(&c, &prior, corrected, &mut e2_progress())
             };
-            prior = c.reload(&mut prior);
+            // A second load needs no intervening inactive-context save.
+            let route = crate::snapshots::e2_pipeline_scan_fixture::route_of(&prior).unwrap();
+            prior = ScanIndex::load(&route).unwrap();
             e2::apply_money_rules(&mut prior);
             e2::with_money_rules(OLD_RULES, || e2::apply_money_rules(&mut prior));
             assert_eq!(prior.claude_money_birth_store.money_rule_version(), 5);
