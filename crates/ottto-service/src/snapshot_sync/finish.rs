@@ -19,6 +19,7 @@ use super::claude_replay_suppressed;
 use super::clear_shed_streak;
 use super::codex_scan_diagnostics;
 use super::continuation;
+use super::continuation::PlatformGates;
 use super::current_rfc3339;
 use super::current_unix_seconds;
 use super::defer_source_uploads;
@@ -1780,6 +1781,11 @@ pub(super) fn finish_sync_source(
         .filter(|item| item.cache_observations.is_some() && item.cache_base_head_etag.is_none())
         .map(cache_head_probe)
         .collect::<Vec<_>>();
+    let fresh_offer = scan_result.snapshots.iter().any(|item| {
+        let fp = &item.snapshot_fingerprint;
+        !upload_progress.quarantined_fingerprints.contains_key(fp)
+            && !upload_progress.accepted_fingerprints.contains(fp)
+    });
     let mut bootstrap_deferred = 0usize;
     let mut bootstrap_capacity_error = None;
     // One in-place resend budget for the whole source page: both bootstrap
@@ -2594,8 +2600,20 @@ pub(super) fn finish_sync_source(
             source,
             &upload_destination_namespace,
         );
-    if continuation::resident_scan_requested(&scan_result, first_read_bootstrap) {
-        continuation::request_resident_scan(source, first_read_bootstrap);
+    let power = continuation::MacPlatformSignals::default().power();
+    if let Some(first_import) = continuation::resident_scan_request_after_settlement(
+        &scan_result,
+        first_read_bootstrap,
+        power,
+        index.runnable_walk_or_followup(
+            &scan_result,
+            &local_holds.held_fingerprints,
+            local_holds.progress_blocking,
+            fresh_offer,
+            &current_rfc3339(),
+        ),
+    ) {
+        continuation::request_resident_scan_on_power(source, first_import, power);
     }
 
     // Refresh the per-source detected-uses cache the daemon health assembly
