@@ -103,12 +103,12 @@ pub(crate) struct SnapshotAckRejected {
 
 impl SnapshotAckRejected {
     fn from_validation(error: &anyhow::Error) -> Self {
+        if let Some(rejected) = error.downcast_ref::<Self>() {
+            return *rejected;
+        }
         let message = error.to_string();
         const SAFE_REASONS: &[&str] = &[
             "disabled snapshot response contains entity outcomes",
-            "legacy snapshot response accepted count mismatch",
-            "legacy snapshot response cannot durably acknowledge snapshot evidence",
-            "snapshot response uses an unsupported entity ACK contract",
             "snapshot ACK returned head tokens for a request without the head-CAS contract",
             "snapshot head-CAS ACK lacks an exclusive accepted head etag",
             "snapshot head-CAS conflict lacks an exclusive head challenge",
@@ -1136,6 +1136,15 @@ impl SnapshotBatchResponse {
         }
     }
 
+    pub(crate) fn require_entity_ack_contract(&self) -> Result<(), SnapshotAckRejected> {
+        let reason = match self.entity_ack_contract.as_deref() {
+            Some(SNAPSHOT_ENTITY_ACK_CONTRACT) => return Ok(()),
+            None => "snapshot response lacks the entity ACK contract",
+            Some(_) => "snapshot response uses an unsupported entity ACK contract",
+        };
+        Err(SnapshotAckRejected { reason })
+    }
+
     /// Reject malformed, short, duplicated, foreign, overlapping, or partial
     /// ACKs before any local checkpoint can advance.
     pub fn validate_entity_ack(
@@ -1179,29 +1188,7 @@ impl SnapshotBatchResponse {
             }
             return Ok(());
         }
-        match self.entity_ack_contract.as_deref() {
-            None => {
-                if self.accepted != request.snapshots.len() as u64 {
-                    return Err(anyhow!("legacy snapshot response accepted count mismatch"));
-                }
-                if request.items().any(|item| {
-                    crate::snapshots::claude_request_money::is_request_owned_literal(item)
-                        || item.session_account_evidence.is_some()
-                        || item.cache_observations.is_some()
-                }) {
-                    return Err(anyhow!(
-                        "legacy snapshot response cannot durably acknowledge snapshot evidence"
-                    ));
-                }
-                return Ok(());
-            }
-            Some(SNAPSHOT_ENTITY_ACK_CONTRACT) => {}
-            Some(_) => {
-                return Err(anyhow!(
-                    "snapshot response uses an unsupported entity ACK contract"
-                ));
-            }
-        }
+        self.require_entity_ack_contract()?;
         self.validate_entity_ack_identities(request.items().map(|item| {
             (
                 item.source_session_id.as_str(),
@@ -2833,11 +2820,10 @@ impl SnapshotApiClient {
             })
             .collect();
         let items = request.items().filter(|item| {
-            response.entity_ack_contract.is_none()
-                || acknowledged.contains(&(
-                    item.source_session_id.as_str(),
-                    item.snapshot_fingerprint.as_str(),
-                ))
+            acknowledged.contains(&(
+                item.source_session_id.as_str(),
+                item.snapshot_fingerprint.as_str(),
+            ))
         });
         match crate::snapshots::start_verdict_store::record(
             support,
@@ -4199,8 +4185,7 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let request = read_complete_http_request(&mut stream);
-            let body =
-                r#"{"accepted":0,"sessions_reconciled":0,"session_ids":[],"disabled":false}"#;
+            let body = r#"{"accepted":0,"sessions_reconciled":0,"session_ids":[],"disabled":false,"entity_ack_contract":"snapshot_entity_ack:v1"}"#;
             write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
             request
         });
@@ -4308,14 +4293,6 @@ mod tests {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let client =
                 SnapshotApiClient::new(format!("http://{}", listener.local_addr().unwrap()));
-            let server = std::thread::spawn(move || {
-                let (mut stream, _) = listener.accept().unwrap();
-                let request = read_complete_http_request(&mut stream);
-                let body =
-                    r#"{"accepted":0,"sessions_reconciled":0,"session_ids":[],"disabled":false}"#;
-                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
-                request
-            });
             let request = SnapshotBatchRequest {
                 schema_version: SNAPSHOT_SCHEMA_VERSION,
                 source: "codex".into(),
@@ -4325,6 +4302,35 @@ mod tests {
                 upload_policy: Default::default(),
                 client_report: crate::client_report::ClientReport::empty(),
             };
+            let head_cas = request.items().any(declares_head_cas);
+            let accepted_entities = request
+                .items()
+                .map(|item| {
+                    let witness_version = snapshot_ack_body_witness_version(item).unwrap();
+                    json!({
+                        "source_session_id": item.source_session_id,
+                        "snapshot_fingerprint": item.snapshot_fingerprint,
+                        "body_witness_version": witness_version,
+                        "body_witness_digest": witness_version.map(|_| snapshot_upload_body_witness(item)),
+                        "head_etag": head_cas.then(|| "e".repeat(64)),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let body = json!({
+                "accepted": accepted_entities.len(),
+                "sessions_reconciled": accepted_entities.len(),
+                "session_ids": [],
+                "disabled": false,
+                "entity_ack_contract": SNAPSHOT_ENTITY_ACK_CONTRACT,
+                "accepted_entities": accepted_entities,
+            })
+            .to_string();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_complete_http_request(&mut stream);
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                request
+            });
             let _ = client.upload_batch("synthetic-relay", &request, false);
             let captured = server.join().unwrap();
             let headers = captured
@@ -5242,9 +5248,15 @@ mod tests {
         disabled.disabled = true;
         client.record_composition_start_verdicts(&request, &disabled, false);
         assert_eq!(get(), StartVerdict::NotMeasured);
-        // Legacy all-accepted ACK; the final wire body measures this start.
-        let mut accepted = entity_ack(1, vec![]);
-        accepted.entity_ack_contract = None;
+        let accepted = entity_ack(
+            1,
+            vec![entity_ref(
+                id,
+                &request.snapshots[0].snapshot_fingerprint,
+                1,
+            )],
+        );
+        accepted.validate_entity_ack(&request).unwrap();
         client.record_composition_start_verdicts(&request, &accepted, false);
         assert_eq!(get(), StartVerdict::Measured);
         // A later final-body clear (including a payload-budget clear) must

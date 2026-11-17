@@ -241,7 +241,7 @@ fn lc_repaired_retry_upload(mixed: bool) {
         snapshot_upload_body_witness,
         |batch| {
             uploaded.extend(batch.iter().map(|item| item.snapshot_fingerprint.clone()));
-            Ok(accepted_batch(batch.len()))
+            claude_money_e2_pipeline_tests::ack(batch)
         },
         |_| Ok(()),
     )

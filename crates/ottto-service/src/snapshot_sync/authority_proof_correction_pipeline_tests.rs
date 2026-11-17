@@ -601,7 +601,7 @@ impl ApcFixture {
                 match upload {
                     ApcUpload::Accept | ApcUpload::Crash => {
                         uploaded.extend(items.iter().map(|item| item.snapshot_fingerprint.clone()));
-                        Ok(accepted_batch(items.len()))
+                        claude_money_e2_pipeline_tests::ack(items)
                     }
                     ApcUpload::Shed => Err(anyhow::Error::new(UploadShed {
                         status: 503,

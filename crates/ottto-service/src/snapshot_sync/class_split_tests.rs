@@ -1011,7 +1011,7 @@ fn single_class_pages_keep_the_previous_batches() {
                         .map(|item| item.session.clone())
                         .collect::<Vec<_>>(),
                 );
-                Ok(accepted_batch(batch.len()))
+                Ok(accept_batch_with(batch, |item| item.fingerprint.as_str()))
             },
             |_| Ok(()),
         )

@@ -99,7 +99,7 @@ fn batch_413_splits_and_preserves_cutoffs() {
                         false,
                     )))
                 } else {
-                    Ok(accepted_batch(batch.len()))
+                    Ok(accept_fingerprints(batch))
                 }
             },
             |_| Ok(()),
@@ -114,7 +114,7 @@ fn batch_413_splits_and_preserves_cutoffs() {
                 &mut progress,
                 &mut accepted,
                 String::as_str,
-                |batch| Ok(accepted_batch(batch.len())),
+                |batch| Ok(accept_fingerprints(batch)),
                 |_| Ok(()),
             );
             assert_eq!(retried.unwrap(), ResumableUploadResult::Completed);

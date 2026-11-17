@@ -80,7 +80,7 @@ fn short_retry_after_shed_is_retried_in_place_and_settles() {
                 retry_after: Some(Duration::from_secs(retry_after)),
                 code: None,
             })),
-            _ => Ok(accepted_batch(batch.len())),
+            _ => Ok(accept_fingerprints(batch)),
         });
         assert_eq!(
             driven.result.unwrap(),
@@ -110,7 +110,7 @@ fn fast_server_error_is_retried_in_place_and_settles() {
     for status in [500, 502] {
         let driven = drive(3, None, |attempt, batch| match attempt {
             0 => Err(batch_server_error(status)),
-            _ => Ok(accepted_batch(batch.len())),
+            _ => Ok(accept_fingerprints(batch)),
         });
         assert_eq!(
             driven.result.unwrap(),
@@ -137,7 +137,7 @@ fn inplace_retry_resends_only_unsettled_bodies() {
     let items = test_fingerprints(75);
     let driven = drive(75, None, |attempt, batch| match attempt {
         1 => Err(shed(Some(1))),
-        _ => Ok(accepted_batch(batch.len())),
+        _ => Ok(accept_fingerprints(batch)),
     });
     assert_eq!(driven.result.unwrap(), ResumableUploadResult::Completed);
     assert_eq!(
@@ -184,7 +184,7 @@ fn inplace_retry_is_bounded() {
     // page two gets only one more before the shed stands.
     let driven = drive(75, None, |attempt, batch| match attempt {
         0 | 2 | 3 => Err(shed(Some(1))),
-        _ => Ok(accepted_batch(batch.len())),
+        _ => Ok(accept_fingerprints(batch)),
     });
     assert_eq!(
         driven.result.unwrap(),
@@ -260,7 +260,7 @@ fn never_retried_in_place() {
     ] {
         let driven = drive(1, None, |attempt, batch| match attempt {
             0 => Err(never_retried_failure(name)),
-            _ => Ok(accepted_batch(batch.len())),
+            _ => Ok(accept_fingerprints(batch)),
         });
         assert!(driven.result.is_err(), "{name}");
         assert_eq!(driven.posts.len(), 1, "{name}");
@@ -269,7 +269,7 @@ fn never_retried_in_place() {
     }
 
     let driven = drive(1, None, |_, _| {
-        let mut response = accepted_batch(0);
+        let mut response = entity_ack_response(0);
         response.disabled = true;
         Ok(response)
     });
@@ -299,7 +299,7 @@ fn never_retried_in_place() {
         if batch.len() == 4 {
             Err(batch_server_error(504))
         } else {
-            Ok(accepted_batch(batch.len()))
+            Ok(accept_fingerprints(batch))
         }
     });
     assert_eq!(driven.result.unwrap(), ResumableUploadResult::Completed);
@@ -339,9 +339,7 @@ fn bootstrap_probe_resent_after_server_error_settles_as_conflict() {
                 if posts == 1 {
                     return Err(batch_server_error(500));
                 }
-                let mut response = accepted_batch(0);
-                response.entity_ack_contract =
-                    Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
+                let mut response = entity_ack_response(0);
                 response
                     .conflict_entities
                     .push(crate::snapshot_client::SnapshotEntityRef {

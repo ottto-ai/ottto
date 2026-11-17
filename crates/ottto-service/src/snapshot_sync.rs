@@ -291,7 +291,6 @@ use self::upload::upload_resumable_batches_with_body_witness;
 use self::upload::upload_resumable_batches_with_literal_families;
 use self::upload::ResumableUploadResult;
 use self::upload::SnapshotBatchPreflightRejected;
-use self::upload::SnapshotBatchResponseRejected;
 use self::upload::SnapshotEntityDeferred;
 use self::upload::SnapshotLocalStateRejected;
 #[cfg(test)]

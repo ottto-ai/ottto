@@ -21,7 +21,7 @@ fn body() -> Value {
 fn acknowledged_bucket_keys_survive_progress_restart_and_older_decoder_drops_only_hint() {
     let mut progress = progress();
     progress.record_body(&"b".repeat(64), &"c".repeat(64));
-    progress.record_cache_state(&body(), false).unwrap();
+    progress.record_cache_state(&body()).unwrap();
     let bytes = serde_json::to_vec(&progress).unwrap();
     let mut restored: SnapshotUploadProgress = serde_json::from_slice(&bytes).unwrap();
     restored
@@ -228,7 +228,6 @@ fn witnessed_body() -> Value {
 fn retained_ack(
     progress: &mut SnapshotUploadProgress,
     items: &[Value],
-    legacy: bool,
     stored: bool,
     digest: bool,
     missing: Vec<String>,
@@ -268,8 +267,7 @@ fn retained_ack(
                 session_ids: vec![],
                 disabled: false,
                 disabled_reason: None,
-                entity_ack_contract: (!legacy)
-                    .then(|| crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into()),
+                entity_ack_contract: Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into()),
                 accepted_entities: if stored { vec![entity.clone()] } else { vec![] },
                 unchanged_entities: if stored { vec![] } else { vec![entity] },
                 rejected_entities: vec![],
@@ -294,34 +292,21 @@ fn retained_progress() -> SnapshotUploadProgress {
 }
 #[test]
 fn retained_proof_needs_a_witnessed_stored_body_entity_ack() {
-    for (legacy, stored, digest) in [
-        (true, true, false),
-        (false, false, true),
-        (false, true, false),
-    ] {
+    for (stored, digest) in [(false, true), (true, false)] {
         let mut progress = retained_progress();
         let mut item = witnessed_body();
-        item["snapshot_fingerprint"] = json!(format!(
-            "{:064x}",
-            u8::from(legacy) * 4 + u8::from(stored) * 2 + u8::from(digest)
-        ));
-        retained_ack(&mut progress, &[item], legacy, stored, digest, vec![]);
+        item["snapshot_fingerprint"] =
+            json!(format!("{:064x}", u8::from(stored) * 2 + u8::from(digest)));
+        retained_ack(&mut progress, &[item], stored, digest, vec![]);
         assert_eq!(
             retained_rows(&progress).map_or(0, |rows| rows.0),
             0,
-            "legacy={legacy} stored={stored} digest={digest}"
+            "stored={stored} digest={digest}"
         );
     }
     // Before the server advertises retention, a witnessed ACK proves nothing.
     let mut progress = progress();
-    retained_ack(
-        &mut progress,
-        &[witnessed_body()],
-        false,
-        true,
-        true,
-        vec![],
-    );
+    retained_ack(&mut progress, &[witnessed_body()], true, true, vec![]);
     assert_eq!(retained_rows(&progress), Some((0, 0)));
     // A digest that is not this body's witness proves nothing, and neither
     // does any digest on a body without a public witness version (the ACK
@@ -329,20 +314,13 @@ fn retained_proof_needs_a_witnessed_stored_body_entity_ack() {
     let mut progress = retained_progress();
     let mut wrong = witnessed_body();
     wrong["local_witness"] = json!("c".repeat(64));
-    retained_ack(&mut progress, &[wrong], false, true, true, vec![]);
+    retained_ack(&mut progress, &[wrong], true, true, vec![]);
     assert_eq!(retained_rows(&progress), Some((0, 0)));
     let mut progress = retained_progress();
-    retained_ack(&mut progress, &[body()], false, true, true, vec![]);
+    retained_ack(&mut progress, &[body()], true, true, vec![]);
     assert_eq!(retained_rows(&progress), Some((0, 0)));
     let mut progress = retained_progress();
-    retained_ack(
-        &mut progress,
-        &[witnessed_body()],
-        false,
-        true,
-        true,
-        vec![],
-    );
+    retained_ack(&mut progress, &[witnessed_body()], true, true, vec![]);
     assert_eq!(retained_rows(&progress), Some((1, 0)));
     // An older server omits the field; a newer one may list a marked bucket.
     let mut marked = witnessed_body();
@@ -353,7 +331,6 @@ fn retained_proof_needs_a_witnessed_stored_body_entity_ack() {
     retained_ack(
         &mut progress,
         &[marked],
-        false,
         true,
         true,
         vec!["2026-09-01T10:00:00Z".into()],
@@ -398,11 +375,7 @@ fn retained_proof_follows_a_validated_cache_state_echo() {
     let local_witness = "d".repeat(64);
     let mut echoed = retained_progress();
     echoed
-        .record_stored_state(
-            &item,
-            false,
-            Some((&entity(Some(&state)), local_witness.as_str())),
-        )
+        .record_stored_state(&item, Some((&entity(Some(&state)), local_witness.as_str())))
         .unwrap();
     assert_eq!(retained_rows(&echoed), Some((1, 0)));
     assert_eq!(
@@ -410,7 +383,7 @@ fn retained_proof_follows_a_validated_cache_state_echo() {
         state
     );
     let mut bare = retained_progress();
-    bare.record_stored_state(&item, false, Some((&entity(None), local_witness.as_str())))
+    bare.record_stored_state(&item, Some((&entity(None), local_witness.as_str())))
         .unwrap();
     assert_eq!(retained_rows(&bare), Some((0, 0)));
 }
@@ -418,14 +391,7 @@ fn retained_proof_follows_a_validated_cache_state_echo() {
 fn a_replacement_proof_leaves_the_ledger_durably_before_its_upload() {
     for retained in [true, false] {
         let mut progress = retained_progress();
-        retained_ack(
-            &mut progress,
-            &[witnessed_body()],
-            false,
-            true,
-            true,
-            vec![],
-        );
+        retained_ack(&mut progress, &[witnessed_body()], true, true, vec![]);
         assert_eq!(retained_rows(&progress), Some((1, 0)));
         // ON->OFF: proof left in the ledger is still superseded before the POST.
         progress
@@ -462,14 +428,7 @@ fn a_replacement_proof_leaves_the_ledger_durably_before_its_upload() {
 #[test]
 fn replay_generation_or_namespace_change_clears_retained_proof() {
     let mut progress = retained_progress();
-    retained_ack(
-        &mut progress,
-        &[witnessed_body()],
-        false,
-        true,
-        true,
-        vec![],
-    );
+    retained_ack(&mut progress, &[witnessed_body()], true, true, vec![]);
     assert_eq!(retained_rows(&progress), Some((1, 0)));
     let path = crate::test_scratch::unique_path("ottto-e2-optii-namespace").join("progress.json");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();

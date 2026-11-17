@@ -396,12 +396,9 @@ impl SnapshotUploadProgress {
         Some((answer_attempts, owed_now))
     }
 
-    pub(super) fn record_cache_state<T: Serialize>(
-        &mut self,
-        item: &T,
-        head_changed_without_proof: bool,
-    ) -> Result<()> {
-        self.record_stored_state(item, head_changed_without_proof, None)
+    #[cfg(test)]
+    pub(super) fn record_cache_state<T: Serialize>(&mut self, item: &T) -> Result<()> {
+        self.record_stored_state(item, None)
     }
 
     /// `stored` is the item's stored-body entity ACK (fingerprint-exact, no
@@ -409,12 +406,11 @@ impl SnapshotUploadProgress {
     /// positive tags only while the server advertises retention and the ref
     /// carries a versioned witness equal to the local one on a body with a
     /// public witness version, so the entity-ACK validator also checked the
-    /// exact version. Count-only and legacy ACKs pass `None`.
+    /// exact version.
     /// `retained_proof_missing` only removes, so it is always applied.
     pub(super) fn record_stored_state<T: Serialize>(
         &mut self,
         item: &T,
-        head_changed_without_proof: bool,
         stored: Option<(&crate::snapshot_client::SnapshotEntityRef, &str)>,
     ) -> Result<()> {
         let value = serde_json::to_value(item)?;
@@ -473,12 +469,6 @@ impl SnapshotUploadProgress {
             }
         }
         let key = cache_session_key(session);
-        // Count-only legacy ACKs cannot distinguish changed from unchanged.
-        // Recover authority through the same bootstrap rather than retaining
-        // a token whose continued validity the response cannot certify.
-        if head_changed_without_proof {
-            self.accepted_cache_heads.remove(&key);
-        }
         let Some(patch) = value.get("cache_observations") else {
             return Ok(());
         };

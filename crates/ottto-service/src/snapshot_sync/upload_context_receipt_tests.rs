@@ -130,43 +130,6 @@ fn upload_context_prepare_preserves_resume_but_clears_prior_context_receipt_auth
     }
 }
 
-#[test]
-fn upload_context_receipt_count_only_ack_refused() {
-    let items = vec!["a".repeat(64)];
-    let mut progress = SnapshotUploadProgress::new(
-        "b".repeat(64),
-        snapshot_quarantine_witness(SnapshotSource::Codex),
-    );
-    let mut accepted = 0;
-    upload_resumable_batches_with_body_witness(
-        &items,
-        "synthetic-count-only",
-        &mut progress,
-        &mut accepted,
-        String::as_str,
-        |_| "c".repeat(64),
-        |_| {
-            Ok(crate::snapshot_client::SnapshotBatchResponse {
-                conflict_rescans: Default::default(),
-                accepted: 1,
-                sessions_reconciled: 1,
-                session_ids: Vec::new(),
-                disabled: false,
-                disabled_reason: None,
-                entity_ack_contract: None,
-                accepted_entities: Vec::new(),
-                unchanged_entities: Vec::new(),
-                rejected_entities: Vec::new(),
-                conflict_entities: Vec::new(),
-            })
-        },
-        |_| Ok(()),
-    )
-    .unwrap();
-    assert_eq!(progress.accepted_fingerprints.len(), 1);
-    assert!(progress.fresh_context_body_acks.is_empty());
-}
-
 pub(crate) fn partial_context_checkpoint(
     source: SnapshotSource,
     index: &ScanIndex,

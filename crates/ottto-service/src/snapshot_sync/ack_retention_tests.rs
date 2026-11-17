@@ -138,8 +138,7 @@ pub(super) fn exact_ack(
         upload_policy: SnapshotUploadPolicy::default(),
         client_report: crate::client_report::ClientReport::empty(),
     };
-    let mut response = accepted_batch(request.snapshots.len());
-    response.entity_ack_contract = Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
+    let mut response = entity_ack_response(request.snapshots.len() as u64);
     for item in &request.snapshots {
         let body_version = crate::snapshot_client::snapshot_ack_body_witness_version(item)?;
         response
@@ -520,7 +519,7 @@ fn ack_capacity_stops_admission_without_evicting_evidence_and_settlement_release
         &mut progress,
         &mut 0,
         String::as_str,
-        |batch| Ok(accepted_batch(batch.len())),
+        |batch| Ok(accept_fingerprints(batch)),
         |state| state.save(&f.progress_path),
     )
     .unwrap();
@@ -972,7 +971,7 @@ fn retirement_handoff_recovers_acks_after_index_commit_and_cleanup_save_failures
             String::as_str,
             |batch| {
                 attempts += 1;
-                Ok(accepted_batch(batch.len()))
+                Ok(accept_fingerprints(batch))
             },
             |state| state.save(&progress_path),
         )

@@ -1104,12 +1104,11 @@ fn bounded_retry_live_legacy_reconciliation_declines_without_count_only_settleme
     assert_eq!(std::fs::read(&f.index_path).unwrap(), before);
     // Existing ordinary delivery still refuses a count-only ACK for these
     // native legacy fingerprints. No alternative classifier is introduced.
-    assert!(require_normal_write_ack_for_legacy_reconciliation(
-        &accepted_batch(1),
-        &pending,
-        &pending
-    )
-    .is_err());
+    let mut response = entity_ack_response(1);
+    response.entity_ack_contract = None;
+    assert!(
+        require_normal_write_ack_for_legacy_reconciliation(&response, &pending, &pending).is_err()
+    );
     let durable = SnapshotUploadProgress::load(
         &f.progress_path,
         &f.progress.destination_namespace_hash,

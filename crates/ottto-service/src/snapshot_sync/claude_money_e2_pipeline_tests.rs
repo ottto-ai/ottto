@@ -951,8 +951,7 @@ pub(in crate::snapshot_sync) fn upload_source_persisting(
 pub(in crate::snapshot_sync) fn ack(
     batch: &[&SnapshotItem],
 ) -> Result<crate::snapshot_client::SnapshotBatchResponse> {
-    let mut response = accepted_batch(0);
-    response.entity_ack_contract = Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
+    let mut response = entity_ack_response(0);
     // Head-CAS covers the whole declaring request (a cache patch, a saved
     // head or a telemetry-only body, `validate_entity_ack`): every accepted
     // entity gets a head, including telemetry-only bodies without cache
