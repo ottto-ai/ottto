@@ -95,8 +95,8 @@ struct MoneyMarks {
 // the disk budget too. Integer fields are little endian; no wall time is invented.
 // CMB4 path record: key 16, birth 8, generation u32 (low bit: identity
 // follows), then object 8 and size 4 when known. CMB5 is CMB4 plus the
-// money-rule trailer: version u16, count u32, then (key 16, marks 1) records;
-// it is written only once a mark or a version exists.
+// money-rule trailer: version u16, count u32, then (key 16, marks 1) records.
+// The writer always emits CMB5; older tags stay readable until rewritten.
 impl Serialize for BirthStore {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let byte_len = self
@@ -114,9 +114,8 @@ impl Serialize for BirthStore {
             })
             .and_then(|n| n.checked_add(6 + self.2.paths.len().checked_mul(17)?))
             .ok_or_else(|| serde::ser::Error::custom("birth table size overflow"))?;
-        let marked = self.2.version != 0 || !self.2.paths.is_empty();
         let mut bytes = Vec::with_capacity(byte_len);
-        bytes.extend_from_slice(if marked { b"CMB5" } else { b"CMB4" });
+        bytes.extend_from_slice(b"CMB5");
         bytes.extend_from_slice(&(self.0.len() as u32).to_le_bytes());
         for Session(session, owner, cutoff, absent, paths) in &self.0 {
             bytes.extend_from_slice(&session.0);
@@ -138,13 +137,11 @@ impl Serialize for BirthStore {
                 }
             }
         }
-        if marked {
-            bytes.extend_from_slice(&self.2.version.to_le_bytes());
-            bytes.extend_from_slice(&(self.2.paths.len() as u32).to_le_bytes());
-            for (path, marks) in &self.2.paths {
-                bytes.extend_from_slice(&path.0);
-                bytes.push(*marks);
-            }
+        bytes.extend_from_slice(&self.2.version.to_le_bytes());
+        bytes.extend_from_slice(&(self.2.paths.len() as u32).to_le_bytes());
+        for (path, marks) in &self.2.paths {
+            bytes.extend_from_slice(&path.0);
+            bytes.push(*marks);
         }
         // serde_json streams Display into the quoted string: no second base64 buffer.
         serializer.collect_str(&base64::display::Base64Display::new(
@@ -723,16 +720,43 @@ mod tests {
             std::mem::size_of::<Option<(u8, u64)>>());
     }
 
+    fn wire(store: &BirthStore) -> Vec<u8> {
+        let text = serde_json::to_value(store).unwrap();
+        URL_SAFE_NO_PAD.decode(text.as_str().unwrap()).unwrap()
+    }
+
+    /// [format] The default table writes CMB5 with an empty trailer and reads
+    /// back empty; a stored CMB4 table still decodes and is rewritten as CMB5.
     #[test]
-    fn money_rule_marks_persist_in_a_cmb5_trailer_only_once_marked() {
-        let wire = |store: &BirthStore| {
-            let text = serde_json::to_value(store).unwrap();
-            URL_SAFE_NO_PAD.decode(text.as_str().unwrap()).unwrap()
-        };
+    fn default_table_writes_cmb5_and_stored_cmb4_still_decodes() {
+        let empty = wire(&BirthStore::default());
+        let mut expected = b"CMB5".to_vec();
+        expected.extend_from_slice(&[0; 4 + 2 + 4]);
+        assert_eq!(empty, expected);
+        let restored: BirthStore =
+            serde_json::from_value(serde_json::json!(URL_SAFE_NO_PAD.encode(&empty))).unwrap();
+        assert!(restored.is_empty());
+        assert_eq!(restored.money_rule_version(), 0);
+        assert_eq!(wire(&restored), empty);
+
+        let mut store = BirthStore::default();
+        store.record_observation("s", "A", 100);
+        let current = wire(&store);
+        let mut cmb4 = current[..current.len() - 6].to_vec();
+        cmb4[..4].copy_from_slice(b"CMB4");
+        let restored: BirthStore =
+            serde_json::from_value(serde_json::json!(URL_SAFE_NO_PAD.encode(&cmb4))).unwrap();
+        assert_eq!(restored.observed_birth("s", "A"), Some(100));
+        assert_eq!(restored.money_rule_version(), 0);
+        assert_eq!(wire(&restored), current);
+    }
+
+    #[test]
+    fn money_rule_marks_persist_in_the_cmb5_trailer() {
         let mut store = BirthStore::default();
         store.record_observation("s", "A", 100);
         let unmarked = wire(&store);
-        assert_eq!(&unmarked[..4], b"CMB4", "no marks: the CMB4 bytes stay");
+        assert_eq!(&unmarked[..4], b"CMB5", "no marks: an empty trailer");
         store.set_money_marks("B", 0);
         assert_eq!(wire(&store), unmarked, "a zero mark writes nothing");
         store.set_money_marks("B", 4);
@@ -740,7 +764,7 @@ mod tests {
         store.set_money_rule_version(1);
         let marked = wire(&store);
         assert_eq!(&marked[..4], b"CMB5");
-        assert_eq!(marked.len(), unmarked.len() + 6 + 2 * 17, "17 bytes a path");
+        assert_eq!(marked.len(), unmarked.len() + 2 * 17, "17 bytes a path");
         let restored: BirthStore =
             serde_json::from_slice(&serde_json::to_vec(&store).unwrap()).unwrap();
         assert_eq!(restored.money_rule_version(), 1);
@@ -799,7 +823,7 @@ mod tests {
     }
 
     /// [format] A CMB3 identity decodes to the compact object witness and
-    /// survives a CMB4 round trip.
+    /// survives a CMB5 round trip.
     #[test]
     fn cmb3_identity_decodes_to_the_compact_object_witness() {
         let mut restored: BirthStore = serde_json::from_value(serde_json::json!(
@@ -818,7 +842,7 @@ mod tests {
         let other = ClaudeOpenedBirth { inode: 3, ..opened };
         restored.stage_opened("s", "A", Some(other));
         assert!(!witnessed(&restored, other), "another object");
-        // Written back as CMB4 and read again, the witness is unchanged.
+        // Written back as CMB5 and read again, the witness is unchanged.
         let mut again: BirthStore =
             serde_json::from_slice(&serde_json::to_vec(&restored).unwrap()).unwrap();
         again.stage_opened("s", "A", Some(opened));
