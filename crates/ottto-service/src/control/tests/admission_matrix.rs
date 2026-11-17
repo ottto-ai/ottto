@@ -1752,11 +1752,33 @@ fn without_observation_times(mut value: serde_json::Value) -> serde_json::Value 
     value
 }
 
+// A disconnected account returns AccountNotConnected without recording
+// anything: no source row, no Verify event or ledger entry, no state file.
+fn assert_verify_not_recorded(fixture: &Fixture, daemon: &LocalDaemon) {
+    let health = health_snapshot(daemon);
+    assert_eq!(health["sources"], json!([]));
+    assert_eq!(health["ledger"], json!([]));
+    assert!(
+        health["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|event| event["action_id"] != "verify_codex"),
+        "{health}"
+    );
+    assert!(!fixture
+        .root
+        .join("support/sources/codex-state.json")
+        .exists());
+}
+
 #[test]
 #[serial]
 fn internal_reverify_matches_manual_verify_effects() {
     let _lock = lock_backend_test_env();
-    // A disabled patch returns early; a clean config reaches the inner status check.
+    // A disabled patch returns early and records its result; a clean config
+    // reaches the account check, which records nothing for this fresh,
+    // disconnected daemon.
     for disabled in [true, false] {
         let observed = [false, true].map(|internal| {
             let fixture = Fixture::new(200, "{}".into());
@@ -1781,18 +1803,25 @@ fn internal_reverify_matches_manual_verify_effects() {
                 serde_json::from_value::<SourceVerificationResult>(response.payload.unwrap())
                     .unwrap()
             };
-            assert_verify_recorded(&daemon);
+            let persisted = if disabled {
+                assert_verify_recorded(&daemon);
+                let persisted: serde_json::Value = serde_json::from_slice(
+                    &fs::read(fixture.root.join("support/sources/codex-state.json")).unwrap(),
+                )
+                .unwrap();
+                Some(without_observation_times(persisted))
+            } else {
+                assert_eq!(result.status, SourceVerificationStatus::AccountNotConnected);
+                assert_verify_not_recorded(&fixture, &daemon);
+                None
+            };
             assert_eq!(fixture.backend.count(), 0);
-            let persisted: serde_json::Value = serde_json::from_slice(
-                &fs::read(fixture.root.join("support/sources/codex-state.json")).unwrap(),
-            )
-            .unwrap();
             // Independent invocations have different observation timestamps. Keep
             // every other source/event/ledger fact, and compare the full result.
             (
                 to_value(result).unwrap(),
                 without_observation_times(health_snapshot(&daemon)),
-                without_observation_times(persisted),
+                persisted,
             )
         });
         assert_eq!(observed[0], observed[1], "disabled={disabled}");
