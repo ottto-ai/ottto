@@ -209,6 +209,52 @@ pub(super) const CCR2_DEFINITE: &str = "Q0NSMgACAAAAEhWSo6RMxEDjJVe1q0p5xwAAAAAA
 /// Install synthetic custody through the publication route.
 /// All subsequent loads, saves and receipt replay use the real route.
 pub(crate) fn publish(index: &ScanIndex, path: &Path, progress: &[u8]) -> ScanIndex {
+    publish_retaining_progress(index, path, progress, &FixtureProgress::default())
+}
+
+/// Exact native progress custody for an index-only fixture mutation, including
+/// identity barriers and rows a normal progress page leaves out of RAM.
+#[derive(Default, PartialEq, Eq)]
+pub(crate) struct FixtureProgress(Vec<(Header, Vec<u8>)>);
+impl FixtureProgress {
+    pub(crate) fn capture(path: &Path) -> Self {
+        if !runtime::published(path).unwrap() {
+            return Self::default();
+        }
+        let index = ScanIndex::load(path).unwrap();
+        let mut saved = Self::default();
+        crate::snapshot_sync::with_state_v2_progress_lock(path, |_| {
+            runtime::with_session_db(&index, |db| {
+                let mut tx = db.begin(TxnMode::Read).unwrap();
+                for kind in catalogue::PROGRESS_KINDS {
+                    let mut rows = mapper::KeyRows::new(kind, None, 128).unwrap();
+                    while let Some(header) = rows.next(&mut tx).unwrap() {
+                        let mut bytes = Vec::new();
+                        tx.read_value(&header, &mut bytes).unwrap();
+                        saved.0.push((header, bytes));
+                    }
+                }
+                for name in [progress::GENERATION, progress::IMPORT] {
+                    if let Some(header) = tx.get(&RowKey::Meta(name.into())).unwrap() {
+                        let mut bytes = Vec::new();
+                        tx.read_value(&header, &mut bytes).unwrap();
+                        saved.0.push((header, bytes));
+                    }
+                }
+            });
+            Ok(())
+        })
+        .unwrap();
+        saved
+    }
+}
+
+pub(crate) fn publish_retaining_progress(
+    index: &ScanIndex,
+    path: &Path,
+    progress: &[u8],
+    retained: &FixtureProgress,
+) -> ScanIndex {
     let binding = super::super::scan_index_integration::scan_index_storage_binding(path).unwrap();
     let identity = Identity {
         format: FORMAT,
@@ -223,6 +269,15 @@ pub(crate) fn publish(index: &ScanIndex, path: &Path, progress: &[u8]) -> ScanIn
     cx.binding = Some(binding);
     let mut tx = db.begin(TxnMode::Write).unwrap();
     kinds::populate(index, &mut tx, &mut cx).unwrap();
+    for (header, bytes) in &retained.0 {
+        tx.put(RowInput {
+            key: &header.key,
+            fixed: &header.fixed,
+            value_version: header.value_version,
+            value: bytes,
+        })
+        .unwrap();
+    }
     assert_eq!(
         tx.commit(index.generation, identity.fence_generation),
         DurableCommitOutcome::Committed(identity.fence_generation)

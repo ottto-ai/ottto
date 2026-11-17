@@ -6,13 +6,9 @@ use crate::snapshots::*;
 
 impl ScanIndex {
     pub fn save(&mut self, path: &Path) -> Result<()> {
-        #[cfg(test)]
-        e2_pipeline_scan_fixture::prepare_fixture_save(self, path)?;
         self.save_internal(path, None, false)
     }
     pub(crate) fn save_with_read_limit(&mut self, path: &Path, cap: usize) -> Result<()> {
-        #[cfg(test)]
-        e2_pipeline_scan_fixture::prepare_fixture_save(self, path)?;
         self.save_internal(path, Some(cap), false)
     }
     /// A save while the caller holds the source's progress owner, which a
@@ -23,8 +19,6 @@ impl ScanIndex {
         read_limit: Option<usize>,
         _owner: &crate::snapshot_sync::SnapshotProgressLock,
     ) -> Result<()> {
-        #[cfg(test)]
-        e2_pipeline_scan_fixture::prepare_fixture_save(self, path)?;
         if !state_v2::state_v2_growth_retention_active(self) {
             return match read_limit {
                 Some(cap) => self.save_with_read_limit(path, cap),

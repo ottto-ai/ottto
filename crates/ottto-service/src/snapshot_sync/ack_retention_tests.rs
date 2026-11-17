@@ -45,7 +45,7 @@ impl AckFixture {
             &scratch,
             &namespace,
         );
-        index.save(&index_path).unwrap();
+        index.save_fixture(&index_path).unwrap();
         progress.save(&progress_path).unwrap();
         let identity = serde_json::to_value(&index).unwrap();
         Self {
@@ -290,7 +290,7 @@ fn ack_saved_before_index_crash_survives_due_and_unrelated_deltas() {
             .active_quarantine_retries
             .contains(&f.item.snapshot_fingerprint));
         index.quarantined_snapshot_fingerprints = progress.quarantined_fingerprints.clone();
-        index.save(&f.index_path).unwrap(); // selected, still due until transport
+        index.save_fixture(&f.index_path).unwrap(); // selected, still due until transport
         progress.save(&f.progress_path).unwrap();
         assert!(!index.accepted_snapshot_fingerprint_recorded(&f.item.snapshot_fingerprint));
         f.upload(&mut progress, std::slice::from_ref(&f.item), exact_ack)
@@ -351,7 +351,7 @@ fn ack_saved_before_index_crash_survives_due_and_unrelated_deltas() {
         assert_eq!(posts, usize::from(unrelated));
         f.assert_ack(&f.load().1);
         settle_index_after_upload(&mut index, &committed, &progress);
-        index.save(&f.index_path).unwrap();
+        index.save_fixture(&f.index_path).unwrap();
         let (index, _) = f.load();
         f.assert_identity(&index);
         assert!(index.accepted_snapshot_fingerprint_recorded(&f.item.snapshot_fingerprint));
@@ -426,7 +426,7 @@ fn retirement_requires_committed_scope_and_preserves_unindexed_carried_unknown_a
         let mut raw = serde_json::to_value(&committed).unwrap();
         raw["accepted_snapshot_fingerprints"] = serde_json::json!([]);
         committed = serde_json::from_value(raw).unwrap();
-        committed.save(&f.index_path).unwrap();
+        committed.save_fixture(&f.index_path).unwrap();
         let unindexed = "d".repeat(64);
         progress.record_body(&unindexed, &"e".repeat(64));
         progress.save(&f.progress_path).unwrap();
@@ -472,7 +472,7 @@ fn retirement_requires_committed_scope_and_preserves_unindexed_carried_unknown_a
         );
         // The plan cannot change durable progress before the index save.
         f.assert_ack(&f.load().1);
-        selected.save(&f.index_path).unwrap();
+        selected.save_fixture(&f.index_path).unwrap();
         let selected = ScanIndex::load(&f.index_path).unwrap();
         progress.retire_acks_after_index_save(&selected, &retired, &BTreeSet::new());
         progress.finish_cycle(&f.progress_path).unwrap();
@@ -517,8 +517,8 @@ fn ack_capacity_stops_admission_without_evicting_evidence_and_settlement_release
     assert!(loaded.accepted_fingerprints.contains(&debt));
     // A failed index CAS cannot transfer the ACK or change durable progress.
     let mut stale = index.clone();
-    index.save(&f.index_path).unwrap();
-    assert!(stale.save(&f.index_path).is_err());
+    index.save_fixture(&f.index_path).unwrap();
+    assert!(stale.save_fixture(&f.index_path).is_err());
     f.assert_ack(&f.load().1);
     progress.retire_acks_after_index_save(&index, &BTreeSet::new(), &BTreeSet::new());
     progress.save(&f.progress_path).unwrap();
@@ -548,7 +548,7 @@ fn semantic_index_acceptance_cannot_dispose_a_newer_exact_body_ack() {
     let newer_body = "f".repeat(64);
     progress.record_body(&f.item.snapshot_fingerprint, &newer_body);
     progress.save(&f.progress_path).unwrap();
-    index.save(&f.index_path).unwrap();
+    index.save_fixture(&f.index_path).unwrap();
     progress.retire_acks_after_index_save(&index, &BTreeSet::new(), &BTreeSet::new());
     progress.finish_cycle(&f.progress_path).unwrap();
     assert_eq!(
@@ -570,7 +570,7 @@ fn semantic_index_acceptance_cannot_dispose_a_newer_exact_body_ack() {
         .next()
         .unwrap()
         .last_upload_body_witness = Some(format!("{:x}", digest.finalize()));
-    index.save(&f.index_path).unwrap();
+    index.save_fixture(&f.index_path).unwrap();
     let index = ScanIndex::load(&f.index_path).unwrap();
     progress.retire_acks_after_index_save(&index, &BTreeSet::new(), &BTreeSet::new());
     progress.finish_cycle(&f.progress_path).unwrap();
@@ -595,7 +595,7 @@ fn bootstrap_capacity_drains_admitted_bodies_through_partial_settlement() {
     let index_path = scratch.join("index.json");
     let progress_path = scratch.join("progress.json");
     let mut baseline = ScanIndex::default();
-    baseline.save(&index_path).unwrap();
+    baseline.save_fixture(&index_path).unwrap();
     let mut progress = test_upload_progress();
     progress.save(&progress_path).unwrap();
     let (_, template) = pending_head_index_item();
@@ -782,7 +782,7 @@ fn vanished_files_retire_acks_at_the_next_committed_complete_census_without_grow
         let body = snapshot_upload_body_witness(&scan.snapshots[0]);
         f.upload(&mut progress, &scan.snapshots, exact_ack).unwrap();
         settle_index_after_upload(&mut indexed, &committed, &progress);
-        indexed.save(&f.index_path).unwrap();
+        indexed.save_fixture(&f.index_path).unwrap();
         // Retain the real saved ACK across restart before cycle cleanup. The
         // file subsequently vanishes while its containing scan root stays live.
         drop(indexed);
@@ -814,7 +814,7 @@ fn vanished_files_retire_acks_at_the_next_committed_complete_census_without_grow
         .unwrap();
         assert_eq!(f.load().1.accepted_body_witnesses[&fingerprint], body);
         settle_index_after_upload(&mut selected, &committed, &progress);
-        selected.save(&f.index_path).unwrap();
+        selected.save_fixture(&f.index_path).unwrap();
         let selected = ScanIndex::load(&f.index_path).unwrap();
         assert!(!selected.accepted_snapshot_fingerprint_recorded(&fingerprint));
         assert!(selected.accepted_snapshot_fingerprint_recorded(&f.item.snapshot_fingerprint));
@@ -854,7 +854,7 @@ fn retirement_handoff_recovers_acks_after_index_commit_and_cleanup_save_failures
         committed.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
         let unindexed = "f".repeat(64);
         progress.record_body(&unindexed, &"a".repeat(64));
-        committed.save(&index_path).unwrap();
+        committed.save_fixture(&index_path).unwrap();
         progress.save(&progress_path).unwrap();
         progress.configure_ack_capacity(&committed);
         assert_eq!(progress.ack_capacity, ENTITIES + 4096);
@@ -865,7 +865,7 @@ fn retirement_handoff_recovers_acks_after_index_commit_and_cleanup_save_failures
             .unwrap();
         // An unsaved future generation cannot authorize cleanup.
         assert!(progress.saved_retirement_candidates(&selected).is_empty());
-        selected.save(&index_path).unwrap();
+        selected.save_fixture(&index_path).unwrap();
         assert_eq!(
             ScanIndex::load(&index_path)
                 .unwrap()
@@ -915,7 +915,7 @@ fn retirement_handoff_recovers_acks_after_index_commit_and_cleanup_save_failures
                 .is_some());
         } else if failure == "index_cas" {
             let mut concurrent = saved.clone();
-            concurrent.save(&index_path).unwrap();
+            concurrent.save_fixture(&index_path).unwrap();
             assert!(progress
                 .recover_ack_retirement_handoff(&mut saved, &index_path, &progress_path)
                 .is_err());
@@ -1051,7 +1051,7 @@ fn retirement_handoff_is_bound_to_destination_generation_body_and_saved_protecti
             }
             _ => {}
         }
-        selected.save(&f.index_path).unwrap();
+        selected.save_fixture(&f.index_path).unwrap();
         if matches!(mode, "unknown" | "held") {
             let mut value = serde_json::to_value(&selected).unwrap();
             if mode == "unknown" {
@@ -1098,7 +1098,7 @@ fn unindexed_debt_cannot_borrow_unused_live_incidence_slots() {
         let fp = format!("{entity:064x}");
         progress.record_body(&fp, &fp);
     }
-    index.save(&f.index_path).unwrap();
+    index.save_fixture(&f.index_path).unwrap();
     progress.save(&f.progress_path).unwrap();
     let (_, progress) = f.load();
     assert_eq!(progress.ack_capacity, 4096);
@@ -1189,7 +1189,7 @@ fn retirement_obligations_survive_opaque_decode_and_local_hold_cycles() {
                 .len(),
             1
         );
-        selected.save(&f.index_path).unwrap();
+        selected.save_fixture(&f.index_path).unwrap();
         let (mut protected, mut progress) = f.load();
         progress
             .recover_ack_retirement_handoff(&mut protected, &f.index_path, &f.progress_path)
@@ -1200,7 +1200,7 @@ fn retirement_obligations_survive_opaque_decode_and_local_hold_cycles() {
         progress
             .stage_ack_retirement_handoff(&protected, &mut again, &held)
             .unwrap();
-        again.save(&f.index_path).unwrap();
+        again.save_fixture(&f.index_path).unwrap();
         let (previous, mut progress) = f.load();
         // A later clean selection resolves the hold/opaque census. It has no
         // historical incidence left: only the persisted obligation can retire.
@@ -1226,7 +1226,7 @@ fn retirement_obligations_survive_opaque_decode_and_local_hold_cycles() {
                 .len(),
             1
         );
-        clean.save(&f.index_path).unwrap();
+        clean.save_fixture(&f.index_path).unwrap();
         let mut saved = ScanIndex::load(&f.index_path).unwrap();
         progress
             .recover_ack_retirement_handoff(&mut saved, &f.index_path, &f.progress_path)
@@ -1300,7 +1300,7 @@ fn complete_census_retires_never_committed_vanished_acks_after_partial_error() {
         )
         .unwrap();
     assert!(progress.saved_retirement_candidates(&scanned).is_empty());
-    scanned.save(&f.index_path).unwrap();
+    scanned.save_fixture(&f.index_path).unwrap();
     drop((scanned, progress)); // ordinary error/return after the index save
     let (mut saved, mut progress) = f.load();
     progress
@@ -1383,7 +1383,7 @@ fn first_install_current_live_incidence_admits_more_than_4096_without_a_stop() {
             item
         })
         .collect::<Vec<_>>();
-    scanned.save(&f.index_path).unwrap();
+    scanned.save_fixture(&f.index_path).unwrap();
     let scanned = ScanIndex::load(&f.index_path).unwrap();
     assert!(!scanned.accepted_snapshot_fingerprint_recorded(&items[0].snapshot_fingerprint));
     assert!(progress.admit_upload_input(&mut items, &scanned).is_none());
@@ -1535,7 +1535,7 @@ fn partial_save_keeps_a_pending_obligation_live_in_an_unsettled_new_file() {
             .len(),
         1
     );
-    selected.save(&f.index_path).unwrap();
+    selected.save_fixture(&f.index_path).unwrap();
     let (previous, mut progress) = f.load();
     let mut sibling = f.item.clone();
     sibling.source_session_id = "unsettled-sibling".into();
@@ -1642,7 +1642,7 @@ fn partial_save_keeps_a_pending_obligation_live_in_an_unsettled_new_file() {
             &BTreeSet::new(),
         )
         .unwrap();
-    settled.save(&f.index_path).unwrap();
+    settled.save_fixture(&f.index_path).unwrap();
     let saved = ScanIndex::load(&f.index_path).unwrap();
     retired.extend(progress.saved_retirement_candidates(&saved));
     progress.retire_acks_after_index_save(&saved, &retired, &BTreeSet::new());
@@ -1776,7 +1776,7 @@ fn partial_save_never_retires_a_committed_entity_moved_into_an_unsettled_new_fil
             &absent,
         )
         .unwrap();
-    clean.save(&f.index_path).unwrap();
+    clean.save_fixture(&f.index_path).unwrap();
     retired.extend(progress.saved_retirement_candidates(&clean));
     assert!(retired.contains(&f.item.snapshot_fingerprint));
     progress.retire_acks_after_index_save(&clean, &retired, &BTreeSet::new());
@@ -1838,7 +1838,7 @@ fn local_hold_selection_keeps_a_pending_obligation_for_an_entity_the_scan_still_
                 &BTreeSet::from([f.item.snapshot_fingerprint.clone()]),
             )
             .unwrap();
-        selected.save(&f.index_path).unwrap();
+        selected.save_fixture(&f.index_path).unwrap();
         let (previous, mut progress) = f.load();
         let held_sibling = "d".repeat(64);
         let mut working = previous.clone();
@@ -1901,7 +1901,7 @@ fn local_hold_selection_keeps_a_pending_obligation_for_an_entity_the_scan_still_
                 .contains_key(&f.item.snapshot_fingerprint),
             "{outcome}"
         );
-        selected.save(&f.index_path).unwrap();
+        selected.save_fixture(&f.index_path).unwrap();
         retired.extend(progress.saved_retirement_candidates(&selected));
         assert!(!retired.contains(&f.item.snapshot_fingerprint), "{outcome}");
         progress.retire_acks_after_index_save(&selected, &retired, &held);
@@ -1933,7 +1933,7 @@ fn local_hold_selection_keeps_a_pending_obligation_for_an_entity_the_scan_still_
                 &absent,
             )
             .unwrap();
-        clean.save(&f.index_path).unwrap();
+        clean.save_fixture(&f.index_path).unwrap();
         retired.extend(progress.saved_retirement_candidates(&clean));
         assert!(retired.contains(&f.item.snapshot_fingerprint), "{outcome}");
         progress.retire_acks_after_index_save(&clean, &retired, &BTreeSet::new());
@@ -2044,7 +2044,7 @@ fn v2_db_first_crash_retires_only_the_committed_exact_handoff() {
         bodies: [(fp.clone(), body)].into(),
         pending_bodies: BTreeMap::new(),
     });
-    saved.save(&index_path).unwrap();
+    saved.save_fixture(&index_path).unwrap();
     // Crash after source commit, before cleanup of the external progress ACK.
     let mut loaded = load_bound_progress(&path, &namespace);
     loaded
@@ -2092,7 +2092,7 @@ fn v2_transport_error_and_failed_index_commit_never_authorize_an_ack() {
         )
         .unwrap();
     std::fs::create_dir(&index_path).unwrap();
-    assert!(tentative.save(&index_path).is_err());
+    assert!(tentative.save_fixture(&index_path).is_err());
     // Generation zero is not committed authority, even with a staged handoff.
     progress
         .recover_ack_retirement_handoff(&mut tentative, &index_path, &path)

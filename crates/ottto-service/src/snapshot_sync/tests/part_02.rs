@@ -98,7 +98,9 @@ fn cache_event_ack_restart_correction_and_missing_proof() {
         .next()
         .unwrap()
         .last_upload_body_witness = Some(format!("{:x}", digest.finalize()));
-    settled_index.save(&directory.join("index.json")).unwrap();
+    settled_index
+        .save_fixture(&directory.join("index.json"))
+        .unwrap();
     restored.retire_acks_after_index_save(&settled_index, &BTreeSet::new(), &BTreeSet::new());
     restored.finish_cycle(&path).unwrap();
     let mut restored = SnapshotUploadProgress::load(
@@ -697,7 +699,9 @@ fn same_replay_generation_restores_cleared_conflict_progress_until_retry() {
 
     index.mark_bounded_sweep_unsettled();
     index.retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
-    index.save(&index_path).expect("persist conflicted index");
+    index
+        .save_fixture(&index_path)
+        .expect("persist conflicted index");
     progress
         .clear(&progress_path)
         .expect("completed conflict cycle clears disposable progress");
@@ -734,7 +738,9 @@ fn same_replay_generation_restores_cleared_conflict_progress_until_retry() {
         .get_mut(&conflicted_fingerprint)
         .expect("conflict remains in index")
         .retry_after_unix_seconds = 0;
-    due_index.save(&index_path).expect("persist due conflict");
+    due_index
+        .save_fixture(&index_path)
+        .expect("persist due conflict");
 
     let due_index = ScanIndex::load(&index_path).expect("reload due conflict index");
     let mut retry_progress = SnapshotUploadProgress::load(
@@ -1754,7 +1760,7 @@ fn oversized_local_preflight_poison_cannot_pin_later_traversal_pages() {
     // then the redundant upload ledger may be cleared.
     index.retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
     index
-        .save(&index_path)
+        .save_fixture(&index_path)
         .expect("save settled traversal page");
     progress
         .clear(&progress_path)
@@ -2307,7 +2313,7 @@ fn backfill_finalization_is_idempotent_across_index_state_and_progress_crashes()
     // while the historical completion marker and ledger clear have not run.
     let mut index = ScanIndex::default();
     index
-        .save(&index_path)
+        .save_fixture(&index_path)
         .expect("save completed replay index");
     let mut progress = SnapshotUploadProgress::new(
         destination.clone(),

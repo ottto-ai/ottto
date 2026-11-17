@@ -624,7 +624,7 @@ impl ReofferPipeline {
             SnapshotQuarantineDisposition::RetryPending
         );
         record.retry_after_unix_seconds = 0;
-        index.save(&index_path).unwrap();
+        index.save_fixture(&index_path).unwrap();
     }
 }
 
@@ -981,7 +981,7 @@ fn conflicting_reoffer_keeps_refusal_cooldown_and_follow_up() {
     {
         record.retry_after_unix_seconds = 0;
     }
-    index.save(&index_path).unwrap();
+    index.save_fixture(&index_path).unwrap();
     let quiet = pipeline.cycle(t1 + 3_600);
     assert!(
         quiet.result.is_ok(),
@@ -1542,7 +1542,7 @@ fn protected_returning_root_emits_no_literal_v1_or_revision_3() {
         ),
         "the stored witness installs"
     );
-    index.save(&first.index_path).unwrap();
+    index.save_fixture(&first.index_path).unwrap();
     let bytes = std::fs::read(&transcript).unwrap();
     std::fs::remove_file(&transcript).unwrap();
     let absent = pipeline.cycle(t0 + 600);
@@ -2533,7 +2533,7 @@ fn force_held_file_parse(cycle: &mut CycleResult) {
         entry.last_snapshot_fingerprint = None;
         entry.last_upload_body_witness = None;
     }
-    cycle.index.save(&cycle.index_path).unwrap();
+    cycle.index.save_fixture(&cycle.index_path).unwrap();
 }
 
 /// [regress] Real finalization records a cache-bearing body before bootstrap;
@@ -2802,7 +2802,7 @@ fn seed_legacy_probe_file(pipeline: &mut ReofferPipeline, now: u64) -> (CycleRes
         entry.last_upload_body_witness = Some(body_set(&full));
         entry.upload_context_receipt = None;
     }
-    cycle.index.save(&cycle.index_path).unwrap();
+    cycle.index.save_fixture(&cycle.index_path).unwrap();
     (cycle, probe)
 }
 
@@ -2947,7 +2947,7 @@ fn upload_outage_keeps_the_read_and_resends_from_the_head() {
                 .get_mut(&fingerprint)
             {
                 record.retry_after_unix_seconds = 0;
-                index.save(&first.index_path).unwrap();
+                index.save_fixture(&first.index_path).unwrap();
             }
             pipeline.server.answer(Answer::Accept);
             let (recovery, _, bytes) = {

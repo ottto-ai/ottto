@@ -118,7 +118,7 @@ impl ContinuationFixture {
                 window_start_unix_seconds: now.saturating_sub(30 * 86_400),
             }),
         );
-        index.save(&self.index_path).unwrap();
+        index.save_fixture(&self.index_path).unwrap();
         progress.save(&self.upload_progress_path).unwrap();
     }
 
@@ -597,7 +597,7 @@ fn a_pending_admission_reoffer_refuses_the_continuation_prepare() {
     );
     // The ordinary prepare's arming and save.
     assert!(index.prepare_snapshot_admission_reoffer(SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE));
-    index.save(&fixture.index_path).unwrap();
+    index.save_fixture(&fixture.index_path).unwrap();
     assert!(fixture.load().1.snapshot_admission_reoffer_pending());
     fixture.assert_refused(ContinuationRefusal::AdmissionReoffer);
 }
@@ -614,7 +614,7 @@ fn a_pending_legacy_settlement_refuses_the_continuation_prepare() {
     let mut index: ScanIndex = serde_json::from_value(value).unwrap();
     assert!(index.legacy_settlement_ledger_needs_migration());
     assert!(!index.snapshot_admission_reoffer_pending());
-    index.save(&fixture.index_path).unwrap();
+    index.save_fixture(&fixture.index_path).unwrap();
     assert!(fixture.load().1.legacy_settlement_ledger_needs_migration());
     fixture.assert_refused(ContinuationRefusal::LegacySettlement);
 }
@@ -679,7 +679,7 @@ fn a_due_reason_reoffer_refuses_the_continuation_prepare() {
             }),
         },
     );
-    index.save(&fixture.index_path).unwrap();
+    index.save_fixture(&fixture.index_path).unwrap();
     progress.save(&fixture.upload_progress_path).unwrap();
     let (progress, index) = fixture.load();
     assert!(!index.snapshot_admission_reoffer_pending());

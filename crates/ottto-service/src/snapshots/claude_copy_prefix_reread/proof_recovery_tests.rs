@@ -314,7 +314,9 @@ fn retired_unchanged_holder_authorized_reread_removes_prefix_once() {
             (1, Some(2))
         );
         chain.accept(&mut index, &mut recovered);
-        index.save(&chain.home.join("scan-index.json")).unwrap();
+        index
+            .save_fixture(&chain.home.join("scan-index.json"))
+            .unwrap();
         let mut index = ScanIndex::load(&chain.home.join("scan-index.json")).unwrap();
         assert!(chain.prepare(&mut index).is_empty());
         let temp = chain.support.join("same-request.json");
@@ -390,7 +392,9 @@ fn copy_prefix_proof_recovery_totals_and_placement() {
         let (mut index, prior) = chain.residue();
         publish(&chain.home, &chain.support, false);
         chain.prepare(&mut index);
-        index.save(&chain.home.join("scan-index.json")).unwrap();
+        index
+            .save_fixture(&chain.home.join("scan-index.json"))
+            .unwrap();
         let mut index = ScanIndex::load(&chain.home.join("scan-index.json")).unwrap();
         index = state_v2::money_test_support::roundtrip(
             &index,

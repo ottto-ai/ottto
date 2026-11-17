@@ -1374,7 +1374,7 @@ fn restart_mid_job_reboots_group_once_with_one_body() {
         // saved and loaded.
         drop(before);
         let path = root.join("index.json");
-        index.save(&path).unwrap();
+        index.save_fixture(&path).unwrap();
         let index = ScanIndex::load(&path).unwrap();
         let after = Arc::new(SharedCache::default());
         let replay = group_replays();
@@ -1409,7 +1409,7 @@ fn refused_group_debt_survives_save_and_restart() {
     let (mut index, first) = sampled(&root, ScanIndex::default(), 10, &cache);
     assert!(first.census_complete, "{first:?}");
     let path = root.join("index.json");
-    index.save(&path).unwrap();
+    index.save_fixture(&path).unwrap();
     let mut loaded = ScanIndex::load(&path).unwrap();
     assert_eq!(
         loaded

@@ -145,7 +145,7 @@ fn e2_real_caller_parity_at_tight_allowances() {
         &snapshot_index_path(&support, SnapshotSource::ClaudeCode),
         &namespace,
     ));
-    ScanIndex::default().save(&index_path).unwrap();
+    ScanIndex::default().save_fixture(&index_path).unwrap();
     let collection = || AgentStatusCollection {
         snapshots: vec![test_agent_status(SourceKind::ClaudeCode)],
         source_health_snapshot: test_agent_status(SourceKind::ClaudeCode),

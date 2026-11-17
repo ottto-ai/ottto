@@ -769,7 +769,7 @@ fn permanent_finish_dominated_refusal_with_pending_newer_body_is_not_success() {
             record.failed_reconstruction_count = 1;
             record.disposition = SnapshotQuarantineDisposition::RetryPending;
             record.retry_after_unix_seconds = quarantine_retry_after(&fingerprint);
-            saved.save(&index_path).unwrap();
+            saved.save_fixture(&index_path).unwrap();
         } else {
             assert_eq!(
                 saved.quarantined_snapshot_fingerprints[&fingerprint].disposition,

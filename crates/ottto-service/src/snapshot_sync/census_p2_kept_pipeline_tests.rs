@@ -130,7 +130,7 @@ impl PipelineFixture {
             183,
             &pending,
         );
-        index.save(&self.index_path).unwrap();
+        index.save_fixture(&self.index_path).unwrap();
     }
 
     pub(super) fn append(&self, session: &str, request: &str) {
@@ -173,7 +173,7 @@ impl PipelineFixture {
             "workspace_identifier_hash": null
         });
         let mut index: ScanIndex = serde_json::from_value(saved).unwrap();
-        index.save(&self.index_path).unwrap();
+        index.save_fixture(&self.index_path).unwrap();
     }
 
     pub(super) fn key(index: &ScanIndex, session: &str) -> String {
@@ -659,7 +659,9 @@ impl PipelineFixture {
             .source_file_fingerprint
             .clone();
         index.insert_unproven_terminal_claude_authority_for_test(session, &revision);
-        index.save(&self.index_path).expect("save scan index");
+        index
+            .save_fixture(&self.index_path)
+            .expect("save scan index");
         let index = ScanIndex::load(&self.index_path).expect("reload scan index");
         assert_eq!(
             index.bound_terminal_claude_authority_revision_for_test(session),

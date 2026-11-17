@@ -183,7 +183,7 @@ impl Corpus {
             self.base.join(name).parent().unwrap(),
             &e2_progress().destination_namespace_hash,
         );
-        index.save(&path).unwrap();
+        index.save_fixture(&path).unwrap();
         ScanIndex::load(&path).unwrap()
     }
 }

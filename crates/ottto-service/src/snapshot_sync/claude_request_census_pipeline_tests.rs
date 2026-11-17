@@ -327,7 +327,7 @@ fn census_pre_hold_parity_arm(name: &str, records: bool) -> (Vec<serde_json::Val
                 .1
                 .is_empty());
             index
-                .save(&fixture.index_path)
+                .save_fixture(&fixture.index_path)
                 .expect("save live debt before the actual replay page");
         }
         let cycle = PipelineCycle {

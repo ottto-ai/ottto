@@ -967,7 +967,7 @@ impl ApcFixture {
             )
         );
         index
-            .save(&self.index_path)
+            .save_fixture(&self.index_path)
             .expect("save the stored witness");
         assert_eq!(
             self.quarantined_index_count(),
@@ -1106,7 +1106,7 @@ impl ApcFixture {
         );
         index.bind_pre_flip_claude_correction_for_test(APC_ROOT);
         index
-            .save(&self.index_path)
+            .save_fixture(&self.index_path)
             .expect("save the owed correction");
         let seeded = ScanIndex::load(&self.index_path).expect("reload the owed correction");
         assert_eq!(
@@ -1185,7 +1185,7 @@ impl ApcFixture {
         );
         index.bind_pre_flip_claude_correction_for_test(APC_ROOT);
         index
-            .save(&self.index_path)
+            .save_fixture(&self.index_path)
             .expect("save the pre-flip index");
         let seeded = ScanIndex::load(&self.index_path).expect("reload the pre-flip index");
         assert_eq!(
@@ -2146,7 +2146,7 @@ fn last_empty_correction_completes_replay_in_its_drain_cycle() {
             );
             let scratch = crate::test_scratch::ScratchDir::new("apc-last-empty-cycle");
             let path = scratch.join("index.json");
-            index.save(&path).unwrap();
+            index.save_fixture(&path).unwrap();
             let loaded = ScanIndex::load(&path).unwrap();
             assert_eq!(
                 loaded.claude_authority_proof_correction_pending(),

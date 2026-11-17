@@ -603,7 +603,7 @@ fn cache_pending_head_two_files_multi_siblings_survive_partial_cache_settlement(
         |progress| progress.save(&progress_path),
     )
     .unwrap();
-    index.save(&index_path).unwrap();
+    index.save_fixture(&index_path).unwrap();
     let namespace = progress.destination_namespace_hash.clone();
     let witness = progress.active_quarantine_witness.clone().unwrap();
     progress = SnapshotUploadProgress::load(&progress_path, &namespace, witness.clone()).unwrap();
@@ -711,7 +711,7 @@ fn cache_pending_head_two_files_multi_siblings_survive_partial_cache_settlement(
         }
     );
     index.retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
-    index.save(&index_path).unwrap();
+    index.save_fixture(&index_path).unwrap();
     progress.retire_pending_cache_heads(
         &index,
         &items,
@@ -831,7 +831,7 @@ fn cache_pending_head_two_files_multi_siblings_survive_partial_cache_settlement(
     .unwrap();
     index.retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
     index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
-    index.save(&index_path).unwrap();
+    index.save_fixture(&index_path).unwrap();
     progress.retire_pending_cache_heads(
         &index,
         &[sibling],
@@ -954,7 +954,7 @@ fn cache_pending_head_stamp_preserves_actual_quarantine_candidate_retry() {
     );
     index.retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
     let index_path = root.join("index.json");
-    index.save(&index_path).unwrap();
+    index.save_fixture(&index_path).unwrap();
     progress.retire_pending_cache_heads(
         &index,
         &[item.clone()],
@@ -1260,7 +1260,7 @@ fn cache_effective_wire_mandatory_head_obligation_survives_finalizer_noop() {
     assert!(progress.accepted_cache_heads.is_empty());
     let index_path = root.join("index.json");
     let progress_path = root.join("progress.json");
-    index.save(&index_path).unwrap();
+    index.save_fixture(&index_path).unwrap();
     progress.save(&progress_path).unwrap();
     progress.finish_cycle(&progress_path).unwrap();
     progress = SnapshotUploadProgress::load(
@@ -1369,7 +1369,7 @@ fn cache_effective_wire_mandatory_head_obligation_survives_finalizer_noop() {
             .unwrap());
     }
     progress.save(&progress_path).unwrap(); // obligation before no-op index settlement
-    index.save(&index_path).unwrap();
+    index.save_fixture(&index_path).unwrap();
     progress.finish_cycle(&progress_path).unwrap();
     let mut loaded = ScanIndex::load(&index_path).unwrap();
     loaded.activate_upload_context("cache-on-mandatory".into());
@@ -1449,7 +1449,7 @@ fn cache_effective_wire_mandatory_head_obligation_survives_finalizer_noop() {
         &enriched.snapshots,
         &progress.fresh_context_body_acks,
     );
-    loaded.save(&index_path).unwrap();
+    loaded.save_fixture(&index_path).unwrap();
     progress.retire_pending_cache_heads(
         &loaded,
         &enriched.snapshots,

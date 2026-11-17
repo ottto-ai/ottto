@@ -46,7 +46,15 @@ pub(super) fn fixture_binding(path: &Path) -> Option<scan_index_persistence::Bin
     fixture_bindings().lock().unwrap().get(path).cloned()
 }
 
-pub(crate) fn prepare_fixture_save(index: &mut ScanIndex, path: &Path) -> Result<()> {
+/// Explicit fixture save: boundary tests of the legacy writer keep `save`.
+impl ScanIndex {
+    pub(crate) fn save_fixture(&mut self, path: &Path) -> Result<()> {
+        prepare_fixture_save(self, path)?;
+        self.save(path)
+    }
+}
+
+fn prepare_fixture_save(index: &mut ScanIndex, path: &Path) -> Result<()> {
     let synthetic = fixture_binding(path).is_some()
         || scan_index_integration::scan_index_storage_binding(path).is_none();
     bind_input_for_test(index, path);
@@ -147,7 +155,6 @@ pub(crate) fn seed_json_for_test(path: &Path, bytes: &[u8]) -> ScanIndex {
     // fixture generation so receipt/handoff tests still isolate their damage.
     index.generation = index.generation.saturating_sub(1);
     bind_input_for_test(&index, path);
-    state_v2::erase_published(path);
     seed_index_for_test(&index, path)
 }
 
@@ -161,6 +168,8 @@ pub(crate) fn mutate_index_for_test(path: &Path, mutate: impl FnOnce(&mut serde_
 /// fail the production inventory gate. This never runs on a daemon load/save.
 pub(crate) fn seed_index_for_test(index: &ScanIndex, path: &Path) -> ScanIndex {
     bind_input_for_test(index, path);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let retained = state_v2::money_test_support::FixtureProgress::capture(path);
     let binding = scan_index_integration::scan_index_storage_binding(path).unwrap();
     let progress = crate::snapshot_sync::with_state_v2_progress_lock(path, |progress_path| {
         match fs::read(progress_path) {
@@ -175,9 +184,13 @@ pub(crate) fn seed_index_for_test(index: &ScanIndex, path: &Path) -> ScanIndex {
         }
     })
     .unwrap();
-    let (store, loaded) = crate::snapshots::StateV2ColdSession::publish_at(index, path, &progress);
-    // The enclosing scratch fixture owns deletion, as for bind_fixture_route.
-    std::mem::forget(store);
+    state_v2::erase_published(path);
+    let loaded =
+        state_v2::money_test_support::publish_retaining_progress(index, path, &progress, &retained);
+    assert!(
+        state_v2::money_test_support::FixtureProgress::capture(path) == retained,
+        "index-only fixture mutation preserves every progress row"
+    );
     E2ScanFixture::register_route_for_test(path);
     loaded
 }
@@ -199,7 +212,7 @@ fn synthetic_default_indexes_save_and_reload_through_native_custody() {
             ..Default::default()
         };
         index.activate_quarantine_witness(source);
-        index.save(&path).unwrap();
+        index.save_fixture(&path).unwrap();
         assert_eq!(fixture_binding(&path).unwrap().source.snapshot(), source);
         assert_eq!(route_of(&index).as_deref(), Some(path.as_path()));
         assert_eq!(index.generation, 1);
@@ -313,7 +326,7 @@ fn save_on_route(index: &mut ScanIndex, route: &Path) -> Result<()> {
     index.retain_persistence_baseline_from(&current);
     index.generation = current.generation;
     index.decode_holds = current.decode_holds.clone();
-    index.save(route)
+    index.save_fixture(route)
 }
 
 /// An in-memory prior keeps every runtime-only (`serde(skip)`) field across
@@ -1278,7 +1291,7 @@ pub(crate) fn commit_tail_head_for_test(index: &mut ScanIndex, key: &str) -> boo
         },
     )
     .unwrap();
-    index.save(&route).unwrap();
+    index.save_fixture(&route).unwrap();
     state_v2::tail_head_keys(index).unwrap().contains(key)
 }
 
@@ -1410,7 +1423,7 @@ pub(crate) fn resolve_carrier_discovery_debt_for_test(
     );
     let _ = page.end(index, false, |_| {});
     let route = route_of(index).unwrap();
-    index.save(&route).unwrap();
+    index.save_fixture(&route).unwrap();
     let (after, kept) = revisions(index, &key);
     assert_eq!(body, kept, "debt-only save retains the committed reduction");
     (before, after)
