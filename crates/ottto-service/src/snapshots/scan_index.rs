@@ -22,9 +22,7 @@ use super::{
     claude_request_money, deserialize_lenient_claude_history_cutoff, deserialize_lenient_move_hold,
     deserialize_lenient_true, terminal_contract_retry,
 };
-use serde_lenient::{
-    deserialize_lenient_default, deserialize_lenient_map, deserialize_unsettled_causes,
-};
+use serde_lenient::{deserialize_lenient_default, deserialize_unsettled_causes};
 
 /// Saved only by the hand-written `impl Serialize` in `lenient_decode.rs`; add
 /// each new field's save rule there (serde `skip_serializing*` keys here are inert).

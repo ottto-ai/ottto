@@ -1241,13 +1241,11 @@ fn codex_legacy_acked_sticky() {
     codex_case(true, false);
 }
 
-/// [money] Content-only Legacy/V2 replay preserves the emitted body and never
+/// [money] Content-only V2 replay preserves the emitted body and never
 /// adds the restored prefix twice; a cold Full is the independent body oracle.
 #[test]
 fn codex_content_only_caller_matches_cold_full() {
-    for legacy in [false] {
-        codex_case(legacy, true);
-    }
+    codex_case(false, true);
 }
 
 /// [money] An indexed sibling transcript deleted after a committed page is
@@ -3032,16 +3030,14 @@ fn codex_admission_branches_preserve_emitted_totals() {
     }));
     overflow.push(close());
     let repeated = ui(2, Some(1), 1);
-    for (name, legacy, lines, expected) in [
+    for (name, lines, expected) in [
         (
             "unbound",
-            false,
             vec![fallback.clone(), repeated.clone(), repeated],
             2,
         ),
         (
             "base-reset-zero-repeat",
-            false,
             vec![
                 start(),
                 ui(1, None, 5),
@@ -3055,21 +3051,7 @@ fn codex_admission_branches_preserve_emitted_totals() {
             3,
         ),
         (
-            "legacy-reset",
-            true,
-            vec![
-                ui(1, None, 5),
-                ui(2, None, 7),
-                ui(3, None, 2),
-                ui(4, Some(0), 2),
-                ui(5, Some(1), 3),
-                ui(5, Some(1), 3),
-            ],
-            10,
-        ),
-        (
             "closure-mismatch",
-            false,
             vec![
                 start(),
                 ui(1, Some(1), 1),
@@ -3081,21 +3063,18 @@ fn codex_admission_branches_preserve_emitted_totals() {
         ),
         (
             "dropped-staging",
-            false,
             vec![start(), dropped, ui(2, Some(1), 2), close()],
             1,
         ),
-        ("pending-overflow", false, overflow, 66),
-        ("model-fallback", true, vec![fallback, ui(2, Some(1), 2)], 2),
+        ("pending-overflow", overflow, 66),
+        ("model-fallback", vec![fallback, ui(2, Some(1), 2)], 2),
         (
             "explicit-request-count",
-            false,
             vec![start(), explicit, close()],
             1,
         ),
         (
             "invalid-closure",
-            false,
             vec![
                 close(),
                 event("task_complete", ""),

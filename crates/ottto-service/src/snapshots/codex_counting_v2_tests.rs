@@ -114,7 +114,7 @@ fn five(t: T6) -> [u64; 5] {
     [t[0], t[1], t[2], t[3], t[4]]
 }
 
-/// `None` is an unconfigured (Legacy) parser.
+/// Run the V2 reducer through the shared line entry point.
 fn run(values: &[Value]) -> Run {
     let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
     for value in values {
@@ -139,13 +139,13 @@ fn run(values: &[Value]) -> Run {
 
 fn v2(values: &[Value]) -> Run {
     let run = run(values);
-    assert!(run.v2, "post-cutover root with no ACK evidence selects V2");
+    assert!(run.v2, "every new Codex parse uses V2");
     run
 }
 
 /// Exercise the production source factory and physical JSONL reader, with the
-/// fixture header predating the frozen cutover for the Legacy price control.
-fn run_price_source(values: &[Value], active: bool) -> Run {
+/// fixture header predating the retired cutover.
+fn run_price_source(values: &[Value]) -> Run {
     let root = crate::test_scratch::unique_path("ottto-v2-price");
     fs::create_dir_all(&root).unwrap();
     let path = root.join(format!("rollout-2026-08-31T23-00-00-{SESSION}.jsonl"));
@@ -183,7 +183,7 @@ fn run_price_source(values: &[Value], active: bool) -> Run {
     .unwrap();
     while !parser.step().unwrap() {}
     let v2 = parser.accumulator.codex_counting_v2();
-    assert!(v2 && active, "every new Codex parse uses V2");
+    assert!(v2, "every new Codex parse uses V2");
     let counting = parser.accumulator.codex_counting.as_deref();
     let counters = counting.and_then(|counting| counting.counters().cloned());
     let pending = counting.and_then(|counting| counting.open_turn_ui_pending());
@@ -198,8 +198,6 @@ fn run_price_source(values: &[Value], active: bool) -> Run {
             None,
         )
         .unwrap();
-    // Legacy's native-only control has positive usage evidence but no
-    // supported money rows; its existing empty-file diagnostic is expected.
     if !parsed.snapshots.is_empty() {
         assert_eq!(parsed.recognized_usage_drop_count, 0);
     }
@@ -347,7 +345,7 @@ fn codex_v2_native_price_buckets_match_legacy_per_hour_model_and_dimension() {
             *slot += value;
         }
     }
-    let counted = run_price_source(&values, true);
+    let counted = run_price_source(&values);
     assert_price_rows(&counted, &expected);
     assert_eq!(counted.counters().native_counted, cases.len() as u64);
     for row in &counted.item.as_ref().unwrap().model_usage {
@@ -395,9 +393,8 @@ fn codex_v2_native_price_bucket_requires_own_time_and_preserves_explicit_line_bu
             ),
             [300_000, 290_000, 1_000, 10, 2, 1],
         )]);
-        for active in [true] {
-            assert_price_rows(&run_price_source(&values, active), &expected);
-        }
+
+        assert_price_rows(&run_price_source(&values), &expected);
     }
 }
 
@@ -536,14 +533,10 @@ fn codex_thread_settings_tier_counts_only_explicit_evidence_inside_the_epoch() {
         (Some("priority".to_string()), (8 + 16 + 512, source.clone())),
         (Some("flex".to_string()), (32, source)),
     ]);
-    for active in [true] {
-        let run = run_price_source(&values, active);
-        assert_eq!(
-            input_by_tier(run.item.as_ref().unwrap()),
-            expected,
-            "{active}"
-        );
-    }
+
+    let run = run_price_source(&values);
+    assert_eq!(input_by_tier(run.item.as_ref().unwrap()), expected);
+
     let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
     let ((), counts) = crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
         for value in &values {
@@ -631,27 +624,27 @@ fn codex_thread_tier_yields_to_the_protected_replay() {
             (200, Some(THREAD_TIER_SOURCE.to_string())),
         ),
     ]);
-    for v2 in [true] {
-        let (item, receipt) = pass(values.as_slice(), v2, true, None, false);
-        assert_eq!(input_by_tier(&item), expected, "older build {v2}");
-        let (item, replayed) = pass(values.as_slice(), v2, false, receipt.clone(), false);
-        assert_eq!(input_by_tier(&item), expected, "replay {v2}");
-        assert_eq!(replayed, receipt, "the thread tier files no receipt {v2}");
-        let (_, old_receipt) = pass(values.as_slice(), v2, true, None, true);
-        assert_eq!(
-            old_receipt, receipt,
-            "the key is outside the replay key {v2}"
-        );
-        let (item, _) = pass(values.as_slice(), v2, false, None, false);
-        assert_eq!(
-            input_by_tier(&item),
-            BTreeMap::from([(
-                Some("flex".to_string()),
-                (300, Some(THREAD_TIER_SOURCE.to_string())),
-            )]),
-            "a new read takes no tier from Codex logs {v2}"
-        );
-    }
+
+    let v2 = true;
+    let (item, receipt) = pass(values.as_slice(), v2, true, None, false);
+    assert_eq!(input_by_tier(&item), expected, "older build {v2}");
+    let (item, replayed) = pass(values.as_slice(), v2, false, receipt.clone(), false);
+    assert_eq!(input_by_tier(&item), expected, "replay {v2}");
+    assert_eq!(replayed, receipt, "the thread tier files no receipt {v2}");
+    let (_, old_receipt) = pass(values.as_slice(), v2, true, None, true);
+    assert_eq!(
+        old_receipt, receipt,
+        "the key is outside the replay key {v2}"
+    );
+    let (item, _) = pass(values.as_slice(), v2, false, None, false);
+    assert_eq!(
+        input_by_tier(&item),
+        BTreeMap::from([(
+            Some("flex".to_string()),
+            (300, Some(THREAD_TIER_SOURCE.to_string())),
+        )]),
+        "a new read takes no tier from Codex logs {v2}"
+    );
 }
 
 #[test]
@@ -695,7 +688,7 @@ fn codex_v2_native_only_compaction_and_overlap_price_the_original_prompt() {
         } else {
             PriceRows::from([(key("long"), [300_000, 200_000, 2_000, 30, 6, 1])])
         };
-        let counted = run_price_source(&values, true);
+        let counted = run_price_source(&values);
         assert_price_rows(&counted, &expected);
         assert_eq!(counted.counters().native_chain_overlap, u64::from(overlap));
         assert_eq!(

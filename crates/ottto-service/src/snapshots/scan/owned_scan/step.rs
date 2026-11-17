@@ -229,6 +229,16 @@ impl OwnedSourceScan {
                         codex_file_join::Incomplete::SelectedNotInventoried,
                         missing,
                     );
+                    let current_owners = inventory
+                        .headers
+                        .iter()
+                        .map(|header| {
+                            (
+                                local_index_key(&header.candidate.path),
+                                codex_protected_owner(&header.owner),
+                            )
+                        })
+                        .collect::<BTreeMap<_, _>>();
                     let mut repurposed_protected_paths = BTreeSet::new();
                     let mut missing_protected_owners = BTreeSet::new();
                     let mut missing_unknown_owner = false;

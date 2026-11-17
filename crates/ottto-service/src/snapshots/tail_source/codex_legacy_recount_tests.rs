@@ -1,7 +1,9 @@
 // Frozen historical reductions exercise upgrades without a Legacy producer.
 use super::*;
+use crate::snapshots::e2_pipeline_scan_fixture::E2ScanFixture;
 use crate::snapshots::sampled_scan::transition_fixture as oracle;
 use crate::snapshots::sources::codex::counting::version;
+use crate::snapshots::tail_source::counters;
 use crate::snapshots::tail_source::historical_codex::{self, Frozen};
 
 fn historical() -> (SnapshotAccumulator, Vec<String>) {

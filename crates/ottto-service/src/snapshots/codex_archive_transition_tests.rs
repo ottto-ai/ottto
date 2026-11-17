@@ -2317,8 +2317,7 @@ fn unfunded_compressed_header_isolates_filename_owner_and_recovers() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    let mut seed = ScanIndex::default();
-    let owner = codex_protected_owner(MAIN);
+    let seed = ScanIndex::default();
     let c = Corpus::new();
     c.write(MAIN, Some("a"));
     c.write(OTHER, Some("b"));

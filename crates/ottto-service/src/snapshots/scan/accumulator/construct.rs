@@ -3,7 +3,7 @@
 use super::{CodexOwnershipBoundary, SelectorCapture, SnapshotAccumulator};
 use crate::snapshots::{
     claude_request_identity, codex_identity_at, codex_session_id_candidates_from_path,
-    codex_session_id_is_native_parent, codex_sidecar_rollout_file_matches,
+    codex_session_id_is_native_parent, codex_sidecar_rollout_file_matches, codex_usage_occurrence,
     resolve_codex_identity_option, rfc3339_unix_nanos, ClaudeFileBirth, ClaudeResponseBook,
     CodexCompactionSizes, CodexPathSidecarCandidate, CodexTitleMetadata, LocalContextPoints,
     PiLedger, SnapshotOrigin, SnapshotSource, UsageTotals,
