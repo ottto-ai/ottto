@@ -417,6 +417,61 @@ fn replacing_a_summed_slot_retracts_deleted_contributor_rows() {
 
 #[test]
 #[serial(client_report)]
+fn local_removals_on_the_holder_ack_page_stay_quiet() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for content_twin in [false, true] {
+        with_e2(|| {
+            let mut c = Corpus::new("accepted-row-local-already-removed");
+            let holder = c.root(ROOT, &resumed(ROOT, &[A]));
+            let before = seed(&c);
+            append(&holder, &resumed(ROOT, &[B]));
+            let copy = new_copy(&mut c, COPY, "b");
+            let copy = if content_twin {
+                let path = c.root.join(file(THIRD));
+                std::fs::rename(&copy, &path).unwrap();
+                let birth = c.births.remove(&copy).unwrap();
+                c.births.insert(path.clone(), birth);
+                path
+            } else {
+                copy
+            };
+            let location = location_key(&copy.to_string_lossy());
+            let scanner = E2ScanFixture::default();
+            let mut page = c.raw(&scanner, before.clone(), 100, false, &[]);
+            assert!(scanner.paths().contains(&holder));
+            assert!(scanner.paths().contains(&copy));
+            page.enrich(&c);
+            assert!(!has(&page.index, &holder, "b"), "b has no exact ACK yet");
+            assert_eq!(body(&page, ROOT).unwrap().request_count, 2);
+            assert_eq!(body(&page, COPY).unwrap().request_count, 1);
+            assert_eq!(body(&page, COPY).unwrap().removed_request_count, Some(1));
+            let groups = page.index.claude_copy_removals.get(location).to_vec();
+            assert_eq!(groups.len(), 1);
+            assert_eq!(groups[0].0, location_key(&holder.to_string_lossy()));
+            assert_eq!(&*groups[0].1, &[claude_request_hash("b")]);
+            assert!(!page.index.claude_copy_removals.pending(location));
+            let mut index = send(&c, &before, page, None).0;
+            assert!(has(&index, &holder, "b"));
+            assert_eq!(index.claude_copy_removals.get(location), groups.as_slice());
+            assert!(!index.claude_copy_removals.pending(location));
+            for _ in 0..2 {
+                let scanner = E2ScanFixture::default();
+                let mut repeat = c.raw(&scanner, index.clone(), 100, false, &[]);
+                assert!(!scanner.paths().contains(&copy));
+                repeat.enrich(&c);
+                assert!(repeat.scan.snapshots.is_empty());
+                index = send(&c, &index, repeat, None).0;
+                assert_eq!(index.claude_copy_removals.get(location), groups.as_slice());
+                assert!(!index.claude_copy_removals.pending(location));
+            }
+        });
+    }
+}
+
+#[test]
+#[serial(client_report)]
 fn exact_acceptance_corrects_an_earlier_counting_copy_once() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
@@ -431,6 +486,10 @@ fn exact_acceptance_corrects_an_earlier_counting_copy_once() {
         let page = parsed(&c, index.clone());
         assert_eq!(body(&page, COPY).unwrap().request_count, 2);
         index = send(&c, &index, page, None).0;
+        assert!(index
+            .claude_copy_removals
+            .get(location_key(&copy.to_string_lossy()))
+            .is_empty());
         // Keep the already-counting copy off the holder's ACK page.
         retain_indexed_walk_with_pending_for_test(
             &mut index,
@@ -465,6 +524,9 @@ fn exact_acceptance_corrects_an_earlier_counting_copy_once() {
         correction.enrich(&c);
         assert_eq!(body(&correction, COPY).unwrap().request_count, 1);
         index = send(&c, &index, correction, None).0;
+        assert!(!index
+            .claude_copy_removals
+            .pending(location_key(&copy.to_string_lossy())));
         stable(&c, &mut index);
         for _ in 0..2 {
             let scanner = E2ScanFixture::default();
