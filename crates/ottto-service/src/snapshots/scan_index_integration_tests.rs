@@ -75,6 +75,9 @@ impl Fixture {
         object["digest"] = json!(format!("{:x}", hash.finalize()));
         object["bytes"] = json!(payload.len());
     }
+    fn read(&self) -> ScanIndex {
+        read_scan_index_representation(&self.root, "load", "claude_code", None).unwrap()
+    }
     fn load(&self) -> ScanIndex {
         ScanIndex::load_for_snapshot_source_with_origin(
             &self.root,
@@ -117,7 +120,7 @@ fn integrated_each_map_and_cause_retains_custody_without_release_retirement_fenc
                 continue;
             }
             let mut fixture = Fixture::new();
-            let healthy = fixture.load();
+            let healthy = fixture.read();
             assert!(healthy.persistence_available());
             match cause {
                 UnavailableCause::Missing => fs::remove_file(fixture.bucket_path(map)).unwrap(),
@@ -142,7 +145,7 @@ fn integrated_each_map_and_cause_retains_custody_without_release_retirement_fenc
             fixture.write_root();
             let before = fs::read(&fixture.root).unwrap();
             crate::local_resource_diagnostics::take_scan_index_storage_observations();
-            let mut loaded = fixture.load();
+            let mut loaded = fixture.read();
             assert!(!loaded.persistence_available());
             assert_eq!(
                 loaded.persistence_unavailable[map],
@@ -182,6 +185,16 @@ fn integrated_each_map_and_cause_retains_custody_without_release_retirement_fenc
                     .map(|(_, c, _)| c[map][cause as usize])
                     .sum::<u64>(),
                 1
+            );
+            let refusal = ScanIndex::load_for_snapshot_source_with_origin(
+                &fixture.root,
+                SnapshotSource::ClaudeCode,
+                &fixture.scratch,
+            )
+            .unwrap_err();
+            assert_eq!(
+                refusal.downcast_ref::<state_v2::Hold>(),
+                Some(&state_v2::Hold::DbUnavailable)
             );
             assert!(loaded.decode_holds_family("arbitrary-family"));
             assert!(loaded.decode_holds_entity("arbitrary-body"));
@@ -241,8 +254,8 @@ fn integrated_reader_loads_shards_and_still_writes_legacy_with_committed_generat
     loaded.save(&fixture.root).unwrap();
     assert_eq!(loaded.generation, old_generation + 1);
     let raw: Value = serde_json::from_slice(&fs::read(&fixture.root).unwrap()).unwrap();
-    assert_eq!(raw["schema_version"], 2);
-    assert!(raw.get("storage_format").is_none());
+    assert_eq!(raw["schema_version"], 4);
+    assert_eq!(raw["storage_format"], 2);
     let restored = fixture.load();
     assert_eq!(restored.generation, loaded.generation);
     assert_eq!(
@@ -289,6 +302,9 @@ fn fresh_init_allows_the_real_progress_lock_but_never_prior_progress_state() {
     fs::write(&progress_lock, []).unwrap();
     fs::set_permissions(&progress_lock, fs::Permissions::from_mode(0o644)).unwrap();
     assert_eq!(fixture.load().generation, 0);
+    let fixture = Fixture::new();
+    fs::remove_file(&fixture.root).unwrap();
+    fs::remove_dir_all(&fixture.shards).unwrap();
     let progress_state = fixture
         .root
         .with_file_name("claude_code-scan-index-v3-upload-progress.json");
@@ -361,7 +377,7 @@ fn partial_negative_metadata_holds_keep_their_fund_when_a_map_is_missing() {
     fs::write(new, bytes).unwrap();
     fs::remove_file(fixture.bucket_path(0)).unwrap();
     fixture.write_root();
-    let index = fixture.load();
+    let index = fixture.read();
     assert!(!index.persistence_available());
     assert!(index.decode_holds.contains("files", "held-negative-file"));
     assert!(index.decode_holds.held_bytes() > 2 * 1024 * 1024);
@@ -555,7 +571,7 @@ fn recovery_emission_boundaries(
 fn integrated_each_damaged_map_holds_then_restores_equal_money_without_transcript_reads() {
     for map in 0..3 {
         let fixture = Fixture::new();
-        let healthy = fixture.load();
+        let healthy = fixture.read();
         let (prepared, evidence) = { prepared_recovery_page(&fixture, &healthy) };
         assert_eq!(prepared.len(), 1, "positive prepared E2 page");
         let mut control = healthy.clone();
@@ -584,7 +600,7 @@ fn integrated_each_damaged_map_holds_then_restores_equal_money_without_transcrip
         let payload = fixture.bucket_path(map);
         let original = fs::read(&payload).unwrap();
         fs::write(&payload, b"{damaged}").unwrap();
-        let mut unknown = fixture.load();
+        let mut unknown = fixture.read();
         assert!(!unknown.persistence_available());
         assert_eq!(
             unknown.persistence_unavailable[map].unwrap().cause,
@@ -618,7 +634,7 @@ fn integrated_each_damaged_map_holds_then_restores_equal_money_without_transcrip
         let ((restored, resumed_scan, resumed_manifest, resumed_held), reads) =
             terminal_contract_retry::source_acquisitions(|| {
                 with_transcript_io_denied(|| {
-                    let mut restored = fixture.load();
+                    let mut restored = fixture.read();
                     assert!(restored.persistence_available());
                     assert!(
                         !unknown.persistence_available(),
@@ -728,8 +744,8 @@ fn off_large_v1_manifest_load_cas_and_containment_match_compact_v1() {
     fs::write(&large.root, &bytes).unwrap();
     // No sentinel or environment opt-in: exercise the real source-aware OFF
     // route, v1 CAS writer, and the shared containment admission guard.
-    let mut expected = compact.load();
-    let mut actual = large.load();
+    let mut expected = compact.read();
+    let mut actual = large.read();
     assert!(actual.v2().persistence_v2.is_none());
     assert!(actual.persistence_available());
     assert_eq!(
@@ -741,13 +757,22 @@ fn off_large_v1_manifest_load_cas_and_containment_match_compact_v1() {
         let _lock = CheckpointLock::acquire(&large.root).unwrap();
         state_v2::guard_containment_locked(&large.root).unwrap();
     }
-    expected.save(&compact.root).unwrap();
-    actual.save(&large.root).unwrap();
     assert_eq!(
-        fs::read(&large.root).unwrap(),
-        fs::read(&compact.root).unwrap()
+        expected
+            .save(&compact.root)
+            .unwrap_err()
+            .downcast_ref::<state_v2::Hold>(),
+        Some(&state_v2::Hold::ReloadRequired)
     );
-    assert!(large.load().persistence_available());
+    assert_eq!(
+        actual
+            .save(&large.root)
+            .unwrap_err()
+            .downcast_ref::<state_v2::Hold>(),
+        Some(&state_v2::Hold::ReloadRequired)
+    );
+    assert_eq!(fs::read(&large.root).unwrap(), bytes);
+    assert!(large.read().persistence_available());
     assert!(!large.root.with_extension("json.v2.sqlite").exists());
 }
 

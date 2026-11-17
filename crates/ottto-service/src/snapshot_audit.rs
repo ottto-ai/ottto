@@ -916,8 +916,8 @@ mod tests {
                 0o700
             );
             assert_eq!(
-                fs::metadata(audit_state_dir.join(AUDIT_SCAN_INDEX_FILE))
-                    .expect("audit index metadata")
+                fs::metadata(audit_state_dir.join(AUDIT_STATE_MARKER_FILE))
+                    .expect("audit marker metadata")
                     .permissions()
                     .mode()
                     & 0o777,

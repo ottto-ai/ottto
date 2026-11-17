@@ -167,10 +167,10 @@ fn off_v1_growth_is_unknown_and_diagnostics_need_no_registry() {
                                 ScanIndex::load_attributed(&path, Some(source)).unwrap();
                             assert!(index.v2.is_none());
                             assert!(index.decode_holds.is_empty());
-                            index.save(&path).unwrap();
-                            let saved: serde_json::Value =
-                                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-                            assert!(saved.get("growth_retention").is_none());
+                            let before = fs::read(&path).unwrap();
+                            let error = index.save(&path).unwrap_err();
+                            assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::ForeignBinding));
+                            assert_eq!(fs::read(&path).unwrap(), before);
                         },
                         |_| false,
                     );

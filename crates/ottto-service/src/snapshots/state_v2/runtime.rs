@@ -548,6 +548,10 @@ pub(in super::super) fn after_v1_locked(path: &Path, index: &mut ScanIndex) -> R
         return Ok(());
     }
     with_state(path, |state| {
+        if !index.persistence_available() {
+            pause(state, Pause::Partial);
+            return Err(Hold::DbUnavailable.into());
+        }
         if !state.inventory_ready {
             return Err(state
                 .import_pause
@@ -555,10 +559,6 @@ pub(in super::super) fn after_v1_locked(path: &Path, index: &mut ScanIndex) -> R
                 .into());
         }
         state.inventory_ready = false;
-        if !index.persistence_available() {
-            pause(state, Pause::Partial);
-            return Err(Hold::DbUnavailable.into());
-        }
         let _gauge = telemetry::Stage::new(telemetry::Kind::Import);
         let result = (|| {
             let original = state.original.as_ref().ok_or(Pause::Mismatch)?;

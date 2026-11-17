@@ -46,8 +46,7 @@ fn pretty_and_compact_files_decode_identically_through_every_reader() {
     // A saved seed carries every save-owned marker, so a public load of
     // either layout settles nothing and re-encodes to the same bytes.
     let scratch = crate::test_scratch::ScratchDir::new("compact-index-readers");
-    let mut index = synthetic_index(8);
-    index.save(&scratch.as_ref().join("seed.json")).unwrap();
+    let index = synthetic_index(8);
     let compact = serde_json::to_vec(&index).unwrap();
     let pretty = serde_json::to_vec_pretty(&index).unwrap();
     assert!(compact.len() < pretty.len());
@@ -80,27 +79,16 @@ fn pretty_and_compact_files_decode_identically_through_every_reader() {
             assert!(decoded.decode_holds.is_empty(), "{label}");
             assert_eq!(serde_json::to_vec(&decoded).unwrap(), compact, "{label}");
         }
-        // Loading never rewrites; the next save writes compact and still fences.
         assert_eq!(&fs::read(&path).unwrap(), bytes);
-        for bounded in [false, true] {
-            fs::write(&path, bytes).unwrap();
-            let mut current = ScanIndex::load(&path).unwrap();
-            let mut stale = ScanIndex::load(&path).unwrap();
-            if bounded {
-                current.save_with_read_limit(&path, 1024 * 1024).unwrap();
-            } else {
-                current.save(&path).unwrap();
-            }
-            assert_eq!(current.generation, index.generation + 1);
-            let saved = fs::read(&path).unwrap();
-            assert_eq!(saved, serde_json::to_vec(&current).unwrap(), "{layout}");
-            stale.resume_after_path = Some("stale".into());
-            assert!(stale.save(&path).is_err());
-            assert!(stale.save_with_read_limit(&path, 1024 * 1024).is_err());
-            assert_eq!(stale.generation, index.generation);
-            assert_eq!(fs::read(&path).unwrap(), saved);
-            assert_same_state(&ScanIndex::load(&path).unwrap(), &current, layout);
-        }
+        let mut unbound = ScanIndex::load(&path).unwrap();
+        assert_eq!(
+            unbound
+                .save(&path)
+                .unwrap_err()
+                .downcast_ref::<state_v2::Hold>(),
+            Some(&state_v2::Hold::ForeignBinding)
+        );
+        assert_eq!(&fs::read(&path).unwrap(), bytes);
     }
 }
 
@@ -108,8 +96,7 @@ fn pretty_and_compact_files_decode_identically_through_every_reader() {
 fn held_slots_cross_both_layouts_and_save_counts_the_written_bytes() {
     let scratch = crate::test_scratch::ScratchDir::new("compact-index-held");
     let path = scratch.as_ref().join("index.json");
-    let mut seed = synthetic_index(16);
-    seed.save(&path).unwrap();
+    let seed = synthetic_index(16);
     let mut value = serde_json::to_value(&seed).unwrap();
     value["files"]["held-opaque"] = serde_json::json!({"unknown": "x".repeat(64 * 1024)});
     for (layout, bytes) in [
@@ -121,7 +108,7 @@ fn held_slots_cross_both_layouts_and_save_counts_the_written_bytes() {
         let streamed =
             lenient_decode::read_file(File::open(&path).unwrap(), "cas", "unattributed").unwrap();
         let bounded = claude_request_census::decode_bounded_index(&bytes).unwrap();
-        let mut loaded = ScanIndex::load(&path).unwrap();
+        let loaded = ScanIndex::load(&path).unwrap();
         for (reader, decoded) in [
             ("streaming_cas", &streamed),
             ("bounded_cas", &bounded),
@@ -140,31 +127,16 @@ fn held_slots_cross_both_layouts_and_save_counts_the_written_bytes() {
             );
             assert_same_state(decoded, &seed, &label);
         }
-        for bounded in [false, true] {
-            if bounded {
-                loaded
-                    .save_with_read_limit(&path, 32 * 1024 * 1024)
-                    .unwrap();
-            } else {
-                loaded.save(&path).unwrap();
-            }
-            let saved = fs::read(&path).unwrap();
-            // The admission check counted exactly the bytes the save wrote,
-            // and the next restart measures its budget on those same bytes.
-            assert_eq!(
-                lenient_decode::written_len(&loaded).unwrap(),
-                saved.len() as u64,
-                "{layout}"
-            );
-            assert_eq!(
-                saved,
-                serde_json::to_vec_pretty(&loaded).unwrap(),
-                "{layout}"
-            );
-            assert_eq!(raw_slot(&saved, "files", "held-opaque"), original);
-            let restarted = ScanIndex::load(&path).unwrap();
-            assert!(restarted.decode_holds.same_as(&loaded.decode_holds));
-            assert_same_state(&restarted, &loaded, layout);
-        }
+        let native = crate::test_scratch::ScratchDir::canonical("held-layout-native");
+        let (session, mut routed) = state_v2::money_test_support::ColdSession::publish(
+            scan_index_persistence::Source::Claude,
+            &loaded,
+            native.as_ref(),
+        );
+        let restarted = session.save_reload(&mut routed);
+        assert!(restarted.decode_holds.same_as(&loaded.decode_holds));
+        let saved = serde_json::to_vec(&restarted).unwrap();
+        assert_eq!(raw_slot(&saved, "files", "held-opaque"), original);
+        assert_eq!(restarted.files.len(), loaded.files.len());
     }
 }
