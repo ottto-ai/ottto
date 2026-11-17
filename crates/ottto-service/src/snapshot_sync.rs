@@ -321,6 +321,8 @@ use self::prepare::SourcePreparation;
 use self::prepare::SourcePreparationStep;
 pub(crate) use self::telemetry_only::apply_claude_local_evidence_to_scan;
 #[cfg(test)]
+pub(crate) use self::telemetry_only::apply_claude_local_evidence_to_scan_for_test;
+#[cfg(test)]
 pub(crate) use self::telemetry_only::apply_claude_local_evidence_to_scan_with_accepted_for_test;
 use self::telemetry_only::apply_claude_local_evidence_to_scan_with_ledger_and_budget;
 use self::telemetry_only::claude_evidence_session_ids;

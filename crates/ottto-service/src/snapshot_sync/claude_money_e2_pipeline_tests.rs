@@ -250,13 +250,18 @@ impl Page {
         let one = checks.map(|_| reference(&crate::snapshot_sync::ONE_EVIDENCE_CHUNK));
         let before = crate::claude_local_otel::evidence_read_counts_for_test().0;
         let chunks_before = crate::snapshot_sync::evidence_chunks_for_test();
+        // The sync loop sets the server's advertised capability on its ledger
+        // every cycle; production advertises it for every Claude Code upload.
+        // Without a ledger, a keyless one matches no session: only carry differs.
+        let mut cycle = accepted.as_deref().cloned().unwrap_or_default();
+        cycle.set_account_source_enabled(true);
         let ((mut disposition, _, stats), released) =
             e2::pipeline_test_observer::capture_released(|| {
                 apply_claude_local_evidence_to_scan_with_ledger_and_budget(
                     &corpus.support,
                     &mut self.scan,
                     &mut self.index,
-                    accepted.as_deref(),
+                    Some(&cycle),
                     wire_budget,
                     None,
                 )

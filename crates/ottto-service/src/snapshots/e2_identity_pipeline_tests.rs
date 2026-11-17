@@ -61,7 +61,11 @@ fn e2_page(
     support: &Path,
     index: &mut ScanIndex,
 ) -> (Vec<SnapshotItem>, ClaudeUsageAuthorityDisposition, bool) {
-    e2_page_with(dirs, support, index, None)
+    // A keyless ledger matches no session: only the advertised carry differs
+    // from the plain stage, as on every production Claude Code cycle.
+    let mut carry_on = claude_request_identity::AcceptedBuckets::default();
+    carry_on.set_account_source_enabled(true);
+    e2_page_with(dirs, support, index, Some(&carry_on))
 }
 
 /// `e2_page` under this cycle's accepted-identity state (its capabilities);
@@ -783,10 +787,12 @@ fn e2_pipeline_exact_telemetry_over_cap_refuses_upstream_lost_proof() {
         root,
         &trace,
     );
-    let (items, disposition, failed) = e2_page(
+    // The plain stage (capability off) strips; the advertised one holds (below).
+    let (items, disposition, failed) = e2_page_with(
         std::slice::from_ref(&dir),
         &support,
         &mut ScanIndex::default(),
+        None,
     );
     assert!(!failed);
     assert_eq!(items.len(), 1);
@@ -823,6 +829,7 @@ fn e2_pipeline_exact_telemetry_over_cap_refuses_upstream_lost_proof() {
         e2_write_rows(&support, crate::claude_local_otel::STORE_DIR, root, &own);
         claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
             let mut accepted = claude_request_identity::AcceptedBuckets::for_test();
+            accepted.set_account_source_enabled(false);
             let (off, off_disposition, failed) = e2_page_with(
                 std::slice::from_ref(&dir),
                 &support,
@@ -897,9 +904,10 @@ fn e2_page_with_stats(
             &index,
             "e2-identity-machine",
         );
-        let (disposition, _, stats) = crate::snapshot_sync::apply_claude_local_evidence_to_scan(
-            support, &mut scan, &mut index,
-        );
+        let (disposition, _, stats) =
+            crate::snapshot_sync::apply_claude_local_evidence_to_scan_for_test(
+                support, &mut scan, &mut index,
+            );
         (scan.snapshots, disposition, stats)
     }
 }
@@ -1080,9 +1088,15 @@ fn e2_bound_trace_page(
             );
         }
         assert_eq!(index.claude_history_emission.files.len(), 2);
+        // No ledger: a keyless one under the advertised carry (see `e2_page`).
+        let mut carry_on = claude_request_identity::AcceptedBuckets::default();
+        carry_on.set_account_source_enabled(true);
         let (disposition, _, stats) =
             crate::snapshot_sync::apply_claude_local_evidence_to_scan_with_accepted_for_test(
-                support, &mut scan, index, accepted,
+                support,
+                &mut scan,
+                index,
+                accepted.or(Some(&carry_on)),
             );
         for gated in index.claude_history_emission.files.values() {
             assert!(gated.permitted, "owed permission is retained");

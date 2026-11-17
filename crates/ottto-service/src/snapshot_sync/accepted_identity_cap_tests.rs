@@ -332,8 +332,14 @@ fn assert_refused_share_takes_start_binding_fallback(
         "a re-tag of an accepted share is refused"
     );
     let mut expected = BTreeMap::<Placement, u64>::new();
+    // B's own share and its `carried_forward` twin (the gap after it).
+    let b = own(B);
     for (key, requests) in placements(unprotected) {
-        let key = if key == own(B) { untagged() } else { key };
+        let key = if (&key.1, &key.2) == (&b.1, &b.2) {
+            untagged()
+        } else {
+            key
+        };
         *expected.entry(key).or_default() += requests;
     }
     let placed = placements(item);
