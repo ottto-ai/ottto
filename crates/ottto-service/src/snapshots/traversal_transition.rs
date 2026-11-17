@@ -1119,7 +1119,8 @@ mod tests {
             );
         }
 
-        // Claude start: the start reads the flag only.
+        // Claude start: the start reads the flag only, except the
+        // custody-backed `Isolated503`, which alone survives it.
         for flag in [false, true] {
             let mut plain = ScanIndex::default();
             plain.files.insert(
@@ -1132,7 +1133,8 @@ mod tests {
                 .unwrap(),
             );
             plain.bounded_sweep_had_unsettled_upload = flag;
-            let mut tagged = with_unsettled_causes(&plain, u16::MAX);
+            let mut tagged =
+                with_unsettled_causes(&plain, u16::MAX & !UnsettledUploadCause::Isolated503.bit());
             let mut outcomes = Vec::new();
             for index in [&mut plain, &mut tagged] {
                 let (_, rows) = capture(|| {

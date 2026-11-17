@@ -1048,6 +1048,14 @@ impl AckFinishHome {
     }
 
     fn prepare(&mut self, cycle: &str) -> (SourcePreparation, ScanIndex, SourceScanResult) {
+        self.prepare_scan(cycle, true)
+    }
+
+    fn prepare_scan(
+        &mut self,
+        cycle: &str,
+        clean: bool,
+    ) -> (SourcePreparation, ScanIndex, SourceScanResult) {
         self.cadence.next_due_cycle();
         let frame = crate::agent_status_refresh::with_test_collection(Self::collection(), || {
             prepare_sync_source(
@@ -1067,7 +1075,7 @@ impl AckFinishHome {
         .unwrap()
         .expect("actual due source preparation");
         let (preparation, index, mut scan) = collect_preparation_with_rotation(frame);
-        assert!(scan.census_complete, "{cycle}: the real scan is clean");
+        assert_eq!(scan.census_complete, clean, "{cycle}: the real scan");
         assert_eq!(
             scan.snapshots.len(),
             1,
@@ -1270,8 +1278,8 @@ fn telemetry_retention_follows_only_a_completed_upload_and_saved_index() {
 /// page could no longer change (the page is sent after the terminal verdict)
 /// and across a reload. A 429 or a real conflict records nothing and stays
 /// `deferred_conflict`. Then a grown body of that session is ACKed: the main
-/// upload drains the debt in its own ACK checkpoint, and the clean walk
-/// switches the first import.
+/// upload drains the debt in its own ACK checkpoint, but the walk it held
+/// from its start stays unsettled. The next, clean walk switches.
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests, client_report)]
@@ -1349,24 +1357,30 @@ fn identity_503_custody_drains_on_a_grown_body_ack_and_switches() {
             .unwrap()
             .write_all(format!("{grown}\n").as_bytes())
             .unwrap();
-        let (preparation, index, mut scan) = home.prepare("grown body");
-        scan.census_complete = true;
-        // Stop just before the walk's custody is retired, to read the ACK
-        // checkpoint's own drain.
-        ACK_POST_SAVE_FAILURE.with(|slot| slot.set(Some("finish_cycle")));
-        assert!(home.finish(preparation, index, scan).is_err());
-        let offered = server.offered.lock().unwrap();
-        assert_eq!(offered.len(), 2, "the deferred body, then the grown one");
-        assert_eq!(offered[1]["source_session_id"], IDENTITY_PIPELINE_ROOT);
-        assert_ne!(
-            offered[1]["snapshot_fingerprint"],
-            offered[0]["snapshot_fingerprint"]
-        );
+        // Owed custody holds the walk from its start: its real scan is not
+        // clean, so this pass never switches, whatever its ACKs.
+        let (preparation, index, scan) = home.prepare_scan("grown body", false);
+        home.finish(preparation, index, scan).unwrap();
+        {
+            let offered = server.offered.lock().unwrap();
+            assert_eq!(offered.len(), 2, "the deferred body, then the grown one");
+            assert_eq!(offered[1]["source_session_id"], IDENTITY_PIPELINE_ROOT);
+            assert_ne!(
+                offered[1]["snapshot_fingerprint"],
+                offered[0]["snapshot_fingerprint"]
+            );
+        }
         assert_eq!(
             reload(&progress_path).identity_503_pending,
             Some(BTreeSet::new()),
             "drained by the main-upload ACK"
         );
+        assert!(!switched(&home), "the held walk never switches");
+        // The next walk starts settled: its reconcile clears the cause.
+        let (preparation, index, mut scan) = home.prepare("next walk");
+        scan.census_complete = true;
+        home.finish(preparation, index, scan).unwrap();
+        assert_eq!(reload(&progress_path).identity_503_pending, None);
         assert!(switched(&home), "the clean, settled walk switches");
     }
 }
