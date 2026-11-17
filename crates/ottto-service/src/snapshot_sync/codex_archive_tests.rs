@@ -139,7 +139,7 @@ impl ScanIndex {
                         ack_retention_tests::exact_ack(items)
                     }
                 },
-                |state| state.save(&progress_path),
+                |state| state.save_fixture(&progress_path),
             )
             .unwrap();
             if outcome == "shed" {
@@ -193,7 +193,7 @@ impl ScanIndex {
             index.save_fixture(&index_path).unwrap();
             progress.add_saved_handoff_retirements(&mut retired, &index);
             progress.retire_planned_acks_after_index_save(&index, &retired, &BTreeSet::new());
-            progress.finish_cycle(&progress_path).unwrap();
+            progress.finish_cycle_fixture(&progress_path).unwrap();
             return (ScanIndex::load(&index_path).unwrap(), posts);
         }
         if outcome == "accept" {

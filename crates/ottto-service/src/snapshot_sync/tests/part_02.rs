@@ -105,9 +105,9 @@ fn cache_event_ack_restart_correction_and_missing_proof() {
         &path,
         restored,
     );
-    restored.save(&path).unwrap();
+    restored.save_fixture(&path).unwrap();
     restored.retire_acks_after_index_save(&settled_index, &BTreeSet::new(), &BTreeSet::new());
-    restored.finish_cycle(&path).unwrap();
+    restored.finish_cycle_fixture(&path).unwrap();
     let mut restored = SnapshotUploadProgress::load_for_index(
         &settled_index,
         &directory.join("index.json"),
@@ -600,7 +600,7 @@ fn replay_generation_reuploads_prior_acks_once_and_resumes_its_own_progress() {
             assert_eq!(batch, items.iter().collect::<Vec<_>>());
             Ok(accepted_batch(batch.len()))
         },
-        |state| state.save(&path),
+        |state| state.save_fixture(&path),
     )
     .expect("new replay uploads every prior old-generation entity");
     assert_eq!(result, ResumableUploadResult::Completed);
@@ -625,7 +625,7 @@ fn replay_generation_reuploads_prior_acks_once_and_resumes_its_own_progress() {
             resumed_upload_calls += 1;
             Ok(accepted_batch(0))
         },
-        |state| state.save(&path),
+        |state| state.save_fixture(&path),
     )
     .expect("same replay generation resumes from its durable ACKs");
     assert_eq!(resumed_result, ResumableUploadResult::Completed);
@@ -693,7 +693,7 @@ fn same_replay_generation_restores_cleared_conflict_progress_until_retry() {
                 }],
             })
         },
-        |state| state.save(&progress_path),
+        |state| state.save_fixture(&progress_path),
     )
     .expect("conflict remains retryable");
     assert_eq!(
@@ -736,7 +736,7 @@ fn same_replay_generation_restores_cleared_conflict_progress_until_retry() {
         "same-generation historical preparation must restore index-owned conflict"
     );
     restored
-        .save(&progress_path)
+        .save_fixture(&progress_path)
         .expect("persist restored same-generation conflict");
     clear_fixture_progress(&mut restored, &progress_path)
         .expect("model another completed follow-up cycle");
@@ -1751,7 +1751,7 @@ fn oversized_local_preflight_poison_cannot_pin_later_traversal_pages() {
             );
             Ok(accepted_batch(request.snapshots.len()))
         },
-        |state| state.save(&progress_path),
+        |state| state.save_fixture(&progress_path),
     )
     .expect("deterministic local poison is settled by quarantine");
 
@@ -2186,7 +2186,7 @@ fn snapshot_upload_restart_resumes_after_durable_timeout_checkpoint() {
                 )))
             }
         },
-        |state| state.save(&path),
+        |state| state.save_fixture(&path),
     )
     .expect_err("persistent timeout stops after checkpointing the first page");
 
@@ -2212,7 +2212,7 @@ fn snapshot_upload_restart_resumes_after_durable_timeout_checkpoint() {
             resumed_items.extend(batch.iter().copied().cloned());
             Ok(accepted_batch(batch.len()))
         },
-        |state| state.save(&path),
+        |state| state.save_fixture(&path),
     )
     .expect("restart uploads only remaining pages");
 
@@ -2264,7 +2264,7 @@ fn gateway_timeout_bisection_converges_from_entity_cursor_after_ambiguous_commit
             }
             Ok(accepted_batch(batch.len()))
         },
-        |state| state.save(&path),
+        |state| state.save_fixture(&path),
     )
     .expect("gateway timeout is bisected into resumable child pages");
 
@@ -2299,7 +2299,7 @@ fn gateway_timeout_bisection_converges_from_entity_cursor_after_ambiguous_commit
             resumed_upload_calls += 1;
             Ok(accepted_batch(0))
         },
-        |state| state.save(&path),
+        |state| state.save_fixture(&path),
     )
     .expect("restart settles entirely from the durable entity cursor");
 
@@ -2359,7 +2359,7 @@ fn backfill_finalization_is_idempotent_across_index_state_and_progress_crashes()
             upload_calls += 1;
             Ok(accepted_batch(1))
         },
-        |state| state.save(&progress_path),
+        |state| state.save_fixture(&progress_path),
     )
     .expect("restart settles from the durable accepted ledger");
     assert_eq!(result, ResumableUploadResult::Completed);

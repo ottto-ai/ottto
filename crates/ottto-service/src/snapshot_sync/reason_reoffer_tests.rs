@@ -428,10 +428,10 @@ fn reoffer_reservation_survives_restart_and_failed_save_grants_nothing() {
     competitor
         .accepted_cache_heads
         .insert(cache_session_key("competitor"), "c".repeat(64));
-    competitor.save(&path).unwrap();
+    competitor.save_fixture(&path).unwrap();
     let mut stale = progress.clone();
     assert!(select(&mut stale, &index, NOW));
-    assert!(stale.save(&path).is_err());
+    assert!(stale.save_fixture(&path).is_err());
     let reloaded = SnapshotUploadProgress::load(
         &path,
         &"a".repeat(64),
@@ -447,7 +447,7 @@ fn reoffer_reservation_survives_restart_and_failed_save_grants_nothing() {
     // A successful claim, then a crash before or after POST.
     let mut claimed = reloaded;
     assert!(select(&mut claimed, &index, NOW));
-    claimed.save(&path).unwrap();
+    claimed.save_fixture(&path).unwrap();
     drop(claimed);
     let mut restarted = SnapshotUploadProgress::load(
         &path,
@@ -617,7 +617,7 @@ fn retained_refusal_preserves_newer_retry_debt_without_early_transmission() {
     let root = test_dir("reoffer-newer-conflict-retirement");
     let path = root.join("progress.json");
     progress.save_fixture(&path).unwrap();
-    progress.finish_cycle(&path).unwrap();
+    progress.finish_cycle_fixture(&path).unwrap();
     let mut progress = SnapshotUploadProgress::load(
         &path,
         &"a".repeat(64),

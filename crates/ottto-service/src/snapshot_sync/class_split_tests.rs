@@ -1099,7 +1099,7 @@ fn assert_lost_class_request_resends_only_unsettled(items: &[FamilyItem], first:
                 if save_fails && saving_lost {
                     return Err(anyhow!("synthetic save failure"));
                 }
-                state.save(&path)
+                state.save_fixture(&path)
             },
         );
         let case = format!("{first}->{second} lost {lost} save_fails {save_fails}");

@@ -2005,7 +2005,7 @@ fn missing_published_index_with_claim_only_ledger_refuses_without_reread() {
     claim.quarantined_fingerprints.clear();
     claim.permanent_rejections.clear();
     claim
-        .save(&first.progress_path)
+        .save_fixture(&first.progress_path)
         .expect("write the claim-only ledger");
     assert!(!claim.records_server_attested_upload());
     let progress_before = std::fs::read(&first.progress_path).unwrap();

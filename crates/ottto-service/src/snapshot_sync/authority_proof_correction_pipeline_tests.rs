@@ -867,7 +867,7 @@ impl ApcFixture {
         let observed_progress = progress.clone();
         progress.retire_acks_after_index_save(&index, &BTreeSet::new(), &holds.held_fingerprints);
         progress
-            .finish_cycle(&self.progress_path)
+            .finish_cycle_fixture(&self.progress_path)
             .expect("finish native fixture progress");
         native_pass
             .commit_tail()

@@ -733,7 +733,7 @@ impl SameSourceAckFixture {
             &snapshot_upload_body_witness,
             &|item: &SnapshotItem| Some(item.source_session_id.as_str()),
             &mut { upload },
-            &mut |p: &mut SnapshotUploadProgress| p.save(&self.progress_path),
+            &mut |p: &mut SnapshotUploadProgress| p.save_fixture(&self.progress_path),
         )
     }
     fn checkpoint_boundary(&mut self, authority: impl FnOnce() -> Result<()>) -> Result<usize> {
@@ -1448,7 +1448,7 @@ fn same_source_ack_progress_manual_race_rejects_older_ledger() {
     newer
         .accepted_cache_heads
         .insert(cache_session_key("newer"), "e".repeat(64));
-    newer.save(&f.progress_path).unwrap();
+    newer.save_fixture(&f.progress_path).unwrap();
     assert!(f.checkpoint_boundary(|| Ok(())).is_err());
     assert_eq!(f.baseline.generation, before);
     assert_eq!(f.working.generation, before);
@@ -1818,7 +1818,7 @@ fn claude_p92_mixed_503_lost_ack_restart_preserves_candidate() {
                 code: None,
             }))
         },
-        |state| state.save(&path),
+        |state| state.save_fixture(&path),
     )
     .unwrap();
     assert_eq!(
@@ -1881,12 +1881,12 @@ fn claude_p92_mixed_503_lost_ack_restart_preserves_candidate() {
             assert_eq!(serde_json::to_vec(&items[0]).unwrap(), expected);
             Err(anyhow!("synthetic response lost after server settlement"))
         },
-        |state| state.save(&path),
+        |state| state.save_fixture(&path),
     );
     assert!(lost.is_err());
     assert_eq!(accepted, 0);
     assert!(!restored.accepted_fingerprints.contains(&semantic));
-    restored.save(&path).unwrap();
+    restored.save_fixture(&path).unwrap();
     let mut after_loss = SnapshotUploadProgress::load(
         &path,
         &namespace,
@@ -1936,7 +1936,7 @@ fn claude_p92_mixed_503_lost_ack_restart_preserves_candidate() {
             response.validate_entity_ack_with_head_cas(&request, true)?;
             Ok(response)
         },
-        |state| state.save(&path),
+        |state| state.save_fixture(&path),
     )
     .unwrap();
     assert_eq!(accepted, 1);
@@ -1958,7 +1958,7 @@ fn claude_p92_mixed_503_lost_ack_restart_preserves_candidate() {
             calls += 1;
             Ok(accepted_batch(1))
         },
-        |state| state.save(&path),
+        |state| state.save_fixture(&path),
     )
     .unwrap();
     assert_eq!(calls, 0);

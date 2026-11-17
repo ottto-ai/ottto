@@ -177,7 +177,7 @@ fn selected_page(
     // Each call starts from this view, then saves at the real page boundary.
     let mut durable = progress.clone();
     durable.generation = 0;
-    durable.save(&path).unwrap();
+    durable.save_fixture(&path).unwrap();
     progress.generation = durable.generation;
     let mut items = items.to_vec();
     for item in &mut items {
@@ -214,7 +214,7 @@ fn selected_page(
             response.bind_conflict_rescans(&request);
             Ok(response)
         },
-        |state| state.save(&path),
+        |state| state.save_fixture(&path),
     );
     if result.is_ok() {
         let restored = SnapshotUploadProgress::load(
@@ -408,7 +408,7 @@ fn conflict_challenge_is_answered_once_and_replaces_the_server_head() {
         conflict(item, &challenge(0xc))
     });
     other.generation = 0;
-    other.save(&path).unwrap();
+    other.save_fixture(&path).unwrap();
     let foreign = SnapshotUploadProgress::load(
         &path,
         &"b".repeat(64),

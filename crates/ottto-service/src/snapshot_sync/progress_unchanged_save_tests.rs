@@ -88,7 +88,7 @@ fn unchanged_pass_writes_no_progress_bytes() {
     f.progress
         .save_fixture_with_read_limit(&f.path, Some(crate::snapshot_retry::RESPONSE_BYTES))
         .unwrap();
-    f.progress.finish_cycle(&f.path).unwrap();
+    f.progress.finish_cycle_fixture(&f.path).unwrap();
     assert_eq!(f.progress.generation, generation, "no generation claimed");
     assert_eq!(file(&f.path), progress, "progress: 0 bytes written");
     f.no_temp_files();
@@ -135,12 +135,12 @@ fn changed_save_after_skip_writes_next_generation_and_keeps_cas() {
     assert_eq!(file(&f.path), (inode, bytes));
 
     // The owner keeps going: skip again, then change again.
-    f.progress.finish_cycle(&f.path).unwrap();
+    f.progress.finish_cycle_fixture(&f.path).unwrap();
     assert_eq!(f.progress.generation, 2);
     f.progress
         .accepted_cache_heads
         .insert(cache_session_key("s3"), "d".repeat(64));
-    f.progress.finish_cycle(&f.path).unwrap();
+    f.progress.finish_cycle_fixture(&f.path).unwrap();
     assert_eq!(f.progress.generation, 3);
     let restored = f.load();
     assert_eq!(restored.generation, 3);

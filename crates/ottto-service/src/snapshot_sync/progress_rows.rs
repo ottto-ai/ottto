@@ -853,6 +853,20 @@ impl SnapshotUploadProgress {
         self.save_legacy_fixture(path, cap)
     }
 
+    #[cfg(test)]
+    pub(super) fn finish_cycle_fixture(&mut self, path: &Path) -> Result<()> {
+        match self.finish_cycle(path) {
+            Err(error)
+                if self.rows.is_none()
+                    && error.downcast_ref::<crate::snapshots::state_v2::Hold>()
+                        == Some(&crate::snapshots::state_v2::Hold::ReloadRequired) =>
+            {
+                self.save_fixture(path)
+            }
+            result => result,
+        }
+    }
+
     /// Explicit old-release input export for decoder and ACK-import fixtures.
     #[cfg(test)]
     pub(super) fn save_legacy_fixture(

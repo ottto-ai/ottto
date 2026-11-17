@@ -37,7 +37,7 @@ fn terminal_contract_v1_to_v2_one_paced_attempt_then_terminal_on_failure() {
             "migration must be saved even before any lease is due"
         );
         assert!(loaded.active_quarantine_retries.is_empty());
-        loaded.save(&path).unwrap();
+        loaded.save_fixture(&path).unwrap();
         let record = loaded.quarantined_fingerprints[&fingerprint].clone();
         loaded = SnapshotUploadProgress::load(&path, &namespace, witness.clone()).unwrap();
         assert!(!loaded.prepare_quarantine_retries(&stale_index));
@@ -52,7 +52,7 @@ fn terminal_contract_v1_to_v2_one_paced_attempt_then_terminal_on_failure() {
             loaded.active_quarantine_retries,
             BTreeSet::from([fingerprint.clone()])
         );
-        loaded.save(&path).unwrap();
+        loaded.save_fixture(&path).unwrap();
         // The same failed reconstruction boundary used by rejected uploads.
         loaded.quarantine_body(&fingerprint, &body);
         let terminal = &loaded.quarantined_fingerprints[&fingerprint];
@@ -66,7 +66,7 @@ fn terminal_contract_v1_to_v2_one_paced_attempt_then_terminal_on_failure() {
             SnapshotQuarantineDisposition::UnprovenTerminal
         );
         assert_eq!(terminal.retry_after_unix_seconds, 0);
-        loaded.save(&path).unwrap();
+        loaded.save_fixture(&path).unwrap();
         for _ in 0..3 {
             loaded = SnapshotUploadProgress::load(&path, &namespace, witness.clone()).unwrap();
             assert!(!loaded.prepare_quarantine_retries(&stale_index));
@@ -423,7 +423,7 @@ fn successful_contract_retry(restart_after_selection: bool) {
                 )?;
                 Ok(response)
             },
-            |state| state.save(&fixture.progress_path),
+            |state| state.save_fixture(&fixture.progress_path),
         )
         .unwrap();
         assert_eq!(result, ResumableUploadResult::Completed);
@@ -465,7 +465,7 @@ fn successful_contract_retry(restart_after_selection: bool) {
                 duplicate_uploads += 1;
                 Ok(entity_ack_batch(batch, &[], &[]))
             },
-            |state| state.save(&fixture.progress_path),
+            |state| state.save_fixture(&fixture.progress_path),
         )
         .unwrap();
         assert_eq!(duplicate_result, ResumableUploadResult::Completed);
@@ -686,7 +686,7 @@ fn contract_read_cap(outcome: InterruptedOutcome) {
                             );
                             Ok(entity_ack_batch(&[], &[], batch))
                         },
-                        |state| state.save(&fixture.retained.progress_path),
+                        |state| state.save_fixture(&fixture.retained.progress_path),
                     );
                     assert_eq!(
                         result.unwrap(),
@@ -892,7 +892,7 @@ fn contract_ack_saved_before_index_restart(unrelated: bool) {
                 )?;
                 Ok(response)
             },
-            |state| state.save(&fixture.retained.progress_path),
+            |state| state.save_fixture(&fixture.retained.progress_path),
         )
         .unwrap();
         assert_eq!(result, ResumableUploadResult::Completed);
@@ -977,7 +977,7 @@ fn contract_ack_saved_before_index_restart(unrelated: bool) {
                 posts += 1;
                 Ok(entity_ack_batch(batch, &[], &[]))
             },
-            |state| state.save(&fixture.retained.progress_path),
+            |state| state.save_fixture(&fixture.retained.progress_path),
         )
         .unwrap();
         assert_eq!(result, ResumableUploadResult::Completed);

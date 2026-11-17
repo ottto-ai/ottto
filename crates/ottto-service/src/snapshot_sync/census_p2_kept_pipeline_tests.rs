@@ -510,7 +510,7 @@ impl PipelineFixture {
             },
             |checkpoint| {
                 if self.durable_progress {
-                    checkpoint.save(&progress_path)?;
+                    checkpoint.save_fixture(&progress_path)?;
                 }
                 Ok(())
             },
@@ -672,7 +672,7 @@ impl PipelineFixture {
         let observed_progress = progress.clone();
         progress.retire_acks_after_index_save(&index, &BTreeSet::new(), &holds.held_fingerprints);
         progress
-            .finish_cycle(&progress_path)
+            .finish_cycle_fixture(&progress_path)
             .expect("finish native fixture progress");
         native_pass
             .commit_tail()

@@ -878,7 +878,9 @@ fn identity_rows_survive_pages_and_pass_end_with_no_resident_hint() {
         .accepted_cache_heads
         .insert("e".repeat(64), "f".repeat(64));
     progress.save_fixture(&route.progress_path()).unwrap();
-    progress.finish_cycle(&route.progress_path()).unwrap();
+    progress
+        .finish_cycle_fixture(&route.progress_path())
+        .unwrap();
     let after = restarted(&mut progress, Some(KEY), &route);
     assert!(after.generation > 2, "the page committed");
     assert_eq!(stored_rows(&after, &sessions), before);

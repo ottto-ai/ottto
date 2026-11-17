@@ -132,7 +132,7 @@ fn held_validation_rejection_prunes_old_accepted_revisions_from_progress() {
                     Ok(accepted_batch(batch.len()))
                 }
             },
-            |state| state.save(&progress_path),
+            |state| state.save_fixture(&progress_path),
         )
         .expect("held validation rejection preserves accepted siblings");
 
@@ -457,7 +457,7 @@ fn version_only_quarantine_witness_change_keeps_retry_after() {
         retained.failed_reconstruction_count,
         original.failed_reconstruction_count
     );
-    repaired.save(&path).unwrap();
+    repaired.save_fixture(&path).unwrap();
     repaired = SnapshotUploadProgress::load(&path, &namespace, upgraded.clone()).unwrap();
     assert!(!repaired.prepare_quarantine_retries(&BTreeMap::new()));
     assert_eq!(
@@ -774,7 +774,7 @@ fn due_not_pending_quarantine_resends_once_and_paces_local_holds() {
                 false,
             )))
         },
-        |state| state.save(&progress_path),
+        |state| state.save_fixture(&progress_path),
     );
     assert!(unsent.is_err());
     assert_eq!(
@@ -795,7 +795,7 @@ fn due_not_pending_quarantine_resends_once_and_paces_local_holds() {
             require_normal_write_ack_for_legacy_reconciliation(&response, &pending, &pending)?;
             Ok(response)
         },
-        |state| state.save(&progress_path),
+        |state| state.save_fixture(&progress_path),
     );
     assert!(replied
         .unwrap_err()
@@ -832,7 +832,7 @@ fn due_not_pending_quarantine_resends_once_and_paces_local_holds() {
             assert_eq!(batch.len(), 1);
             Ok(accepted_batch(1))
         },
-        |state| state.save(&progress_path),
+        |state| state.save_fixture(&progress_path),
     )
     .unwrap();
     index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
@@ -1079,7 +1079,7 @@ fn admission_native_hourly_bodies_recover_without_losing_usage_or_siblings() {
             }));
             Ok(accepted_batch(req.snapshots.len()))
         },
-        |p| p.save(&root.join("progress.json")),
+        |p| p.save_fixture(&root.join("progress.json")),
     )
     .unwrap();
     assert_eq!(accepted, 2);
@@ -1158,7 +1158,7 @@ fn admission_reoffer_replaces_stale_terminal_progress_and_survives_restart() {
             )?;
             Ok(response)
         },
-        |p| p.save(&path),
+        |p| p.save_fixture(&path),
     )
     .unwrap();
     assert_eq!(sent, vec![fingerprint.clone()]);

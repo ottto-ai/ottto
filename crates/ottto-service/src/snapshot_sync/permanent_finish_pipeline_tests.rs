@@ -915,7 +915,7 @@ impl AckScriptedServer {
                     bodies.lock().unwrap().extend(items.iter().cloned());
                     if let Some((path, saved)) = checkpoint_race.lock().unwrap().take() {
                         let mut concurrent = ScanIndex::load(&path).unwrap();
-                        concurrent.save(&path).unwrap();
+                        concurrent.save_fixture(&path).unwrap();
                         *saved.lock().unwrap() =
                             Some(serde_json::to_vec(&ScanIndex::load(&path).unwrap()).unwrap());
                     }

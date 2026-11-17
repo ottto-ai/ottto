@@ -584,7 +584,7 @@ impl Uploader {
             .retire_acks_after_index_save(index, &BTreeSet::new(), locally_held);
         let retired = before - self.progress.accepted_body_witnesses.len();
         let path = self.scratch.join("progress.json");
-        self.progress.finish_cycle(&path)?;
+        self.progress.finish_cycle_fixture(&path)?;
         // finish_cycle may remove a fully adopted ledger. A new service cycle
         // loads it again rather than retaining the deleted file's CAS generation.
         self.progress = SnapshotUploadProgress::load(
