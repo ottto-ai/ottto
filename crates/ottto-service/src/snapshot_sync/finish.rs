@@ -19,6 +19,7 @@ use super::claude_replay_suppressed;
 use super::clear_shed_streak;
 use super::codex_scan_diagnostics;
 use super::continuation;
+use super::continuation::PlatformGates;
 use super::current_rfc3339;
 use super::current_unix_seconds;
 use super::defer_source_uploads;
@@ -30,7 +31,6 @@ use super::identity_cache_wire_reserve;
 use super::is_upload_outage;
 use super::lane::ensure_snapshot_destination_current;
 use super::lane::ensure_snapshot_scan_authority;
-use super::live_snapshot_retry;
 use super::log_retained_permanent_refusals;
 use super::mark_backfill_complete_for_destination;
 use super::note_shed_and_backoff;
@@ -1125,7 +1125,7 @@ pub(super) fn clear_source_manifests_for_test() {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clear();
 }
-#[expect(clippy::too_many_arguments, reason = "13 args; no options struct yet")]
+#[expect(clippy::too_many_arguments, reason = "12 args; no options struct yet")]
 pub(super) fn finish_sync_source(
     preparation: SourcePreparation,
     mut index: ScanIndex,
@@ -1139,13 +1139,11 @@ pub(super) fn finish_sync_source(
     support_dir: &Path,
     daemon: &LocalDaemon,
     _transport_cycle: &mut crate::net_resilience::TransportCycleOutcome,
-    retry: &mut live_snapshot_retry::LiveRetryOwner,
 ) -> Result<()> {
     let _diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::finish_decision(
         preparation.source == SnapshotSource::ClaudeCode,
     );
     let SourcePreparation {
-        retry_authority,
         source,
         claude_scan_roots,
         account_witness,
@@ -1771,6 +1769,11 @@ pub(super) fn finish_sync_source(
         .filter(|item| item.cache_observations.is_some() && item.cache_base_head_etag.is_none())
         .map(cache_head_probe)
         .collect::<Vec<_>>();
+    let fresh_offer = scan_result.snapshots.iter().any(|item| {
+        let fp = &item.snapshot_fingerprint;
+        !upload_progress.quarantined_fingerprints.contains_key(fp)
+            && !upload_progress.accepted_fingerprints.contains(fp)
+    });
     let mut bootstrap_deferred = 0usize;
     let mut bootstrap_capacity_error = None;
     // One in-place resend budget for the whole source page: both bootstrap
@@ -2197,39 +2200,10 @@ pub(super) fn finish_sync_source(
             );
         }
         Ok(ResumableUploadResult::Shed { retry_after }) => {
-            let first_shed = Instant::now();
             let retry_after = note_shed_and_backoff(source, retry_after);
             defer_source_uploads(source, retry_after);
-            let (checkpoint_succeeded, committable) =
-                match partial_checkpoint(UnsettledUploadCause::Shed, true)? {
-                    Some(committable) => (true, committable),
-                    None => (false, committed_index),
-                };
-            if retry.enabled()
-                && checkpoint_succeeded
-                && locally_held_fingerprints.is_empty()
-                && legacy_reconciliation_pending.is_empty()
-                && active_legacy_reconciliation.is_empty()
-            {
-                if let Some(live) = retry_authority {
-                    retry.capture_after_shed(
-                        live,
-                        _home,
-                        source,
-                        machine_id,
-                        upload_policy,
-                        account_witness,
-                        &scan_result.snapshots,
-                        &mut index,
-                        &committable,
-                        &upload_progress,
-                        &index_path,
-                        &upload_progress_path,
-                        first_shed,
-                        retry_after,
-                    );
-                }
-            }
+            let committable =
+                partial_checkpoint(UnsettledUploadCause::Shed, true)?.unwrap_or(committed_index);
             report_status_with_fresh_relay_token(
                 client,
                 device,
@@ -2585,8 +2559,20 @@ pub(super) fn finish_sync_source(
             source,
             &upload_destination_namespace,
         );
-    if continuation::resident_scan_requested(&scan_result, first_read_bootstrap) {
-        continuation::request_resident_scan(source, first_read_bootstrap);
+    let power = continuation::MacPlatformSignals::default().power();
+    if let Some(first_import) = continuation::resident_scan_request_after_settlement(
+        &scan_result,
+        first_read_bootstrap,
+        power,
+        index.runnable_walk_or_followup(
+            &scan_result,
+            &local_holds.held_fingerprints,
+            local_holds.progress_blocking,
+            fresh_offer,
+            &current_rfc3339(),
+        ),
+    ) {
+        continuation::request_resident_scan_on_power(source, first_import, power);
     }
 
     // Refresh the per-source detected-uses cache the daemon health assembly

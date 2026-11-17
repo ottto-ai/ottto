@@ -191,6 +191,13 @@ file-system hint / periodic listing → select file → read new bytes from save
   mode while unaffected file receipts use the base context. A copy-capability change therefore
   conservatively re-sends unchanged files once.
 
+Snapshot envelopes send only the `snapshot_revision:v2` witness. The receiver already
+accepts bodies without the v1 revision fields. ACK matching, unchanged skips and receipt
+carry use their existing content and body proofs. Local snapshot audits use schema v5,
+with revision keys blinded from the v2 hash and explicit census and oversize evidence.
+The identity size budget retains 134 bytes of headroom so the smaller envelope does
+not change admission or account tagging at the byte cap.
+
 Telemetry-only Claude uploads require the advertised head-CAS capability and the
 exact telemetry contract and pairing window. They declare head CAS in isolated
 requests, without cache patches or cache-state ACK negotiation. Growth carries
@@ -445,6 +452,13 @@ request pacing.
 Prepare, finish, server minima, upload backoff and background QoS still apply.
 During a first backfill (not a replay revision bump), a Codex page that spent a byte budget with
 work still queued also requests a paced pass.
+While destination bootstrap is pending, AC passes also keep runnable bounded-walk work or an
+owed clean follow-up on the same 30-second pacing at background priority. The request uses the
+index after upload settlement, including a first offer's final-page conflict. Metadata-only
+retention, decode holds and unchanged held or conflicted debt grant no follow-up urgency;
+queued unblocked siblings can still advance. Terminal-unhealthy walks use the scanner's own
+retry eligibility. Battery cannot renew this reason; an AC request already issued may wake
+once after unplugging. Clean retirement or bootstrap completion ends this request.
 
 ## SQLite
 

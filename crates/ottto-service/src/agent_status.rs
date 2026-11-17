@@ -180,7 +180,6 @@ pub(crate) use claude::oauth_cache::ottto_user_agent;
 use claude::oauth_cache::read_claude_oauth_usage_cache;
 use claude::oauth_cache::read_claude_oauth_usage_cache_with_legacy_migration;
 use claude::oauth_cache::write_claude_oauth_usage_cache;
-use claude::oauth_cache::write_legacy_claude_oauth_usage_cache;
 use claude::oauth_schedule::claude_background_read_withheld;
 #[cfg(test)]
 use claude::oauth_schedule::claude_explicit_refresh_attempts;
@@ -235,7 +234,6 @@ use claude::oauth_state::claude_oauth_usage_caller_auth_hold_diagnostic;
 use claude::oauth_state::claude_oauth_usage_circuit_open_diagnostic;
 use claude::oauth_state::claude_oauth_usage_config_fingerprint;
 use claude::oauth_state::claude_oauth_usage_failure_class;
-#[cfg(test)]
 use claude::oauth_state::claude_oauth_usage_legacy_breaker_path;
 pub(crate) use claude::oauth_state::claude_oauth_usage_network_disabled;
 use claude::oauth_state::claude_oauth_usage_opaque_caller_key;
@@ -245,17 +243,10 @@ pub(crate) use claude::oauth_state::clear_claude_oauth_usage_auth_breaker;
 #[cfg(test)]
 use claude::oauth_state::clear_claude_oauth_usage_breaker;
 use claude::oauth_state::clear_claude_oauth_usage_breaker_after_success;
-#[cfg(test)]
-use claude::oauth_state::clear_claude_oauth_usage_breaker_with_legacy;
-#[cfg(test)]
 use claude::oauth_state::read_claude_oauth_usage_breaker;
-use claude::oauth_state::read_claude_oauth_usage_breaker_with_legacy_migration;
 use claude::oauth_state::record_claude_oauth_usage_auth_failure;
-#[cfg(test)]
 use claude::oauth_state::record_claude_oauth_usage_failure;
-use claude::oauth_state::record_claude_oauth_usage_failure_with_legacy;
 use claude::oauth_state::try_claude_oauth_collection_attempt;
-use claude::oauth_state::write_legacy_claude_oauth_usage_breaker;
 use claude::oauth_usage::claude_oauth_stamp_account_identity;
 #[cfg(test)]
 use claude::oauth_usage::claude_slot_after_pre_gate_hook;

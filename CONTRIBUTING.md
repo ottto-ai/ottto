@@ -52,7 +52,9 @@ pinned in `rust-toolchain.toml`; rustup uses it automatically in this checkout.
 
 Prerequisites, the two Cargo workspaces, the checks to run, and Linux notes are
 in [docs/development.md](docs/development.md). Run the smallest set of checks
-for what you changed; CI runs the full suite on your pull request.
+for what you changed; CI runs the Linux checks on ready pull requests and the
+macOS contracts in the merge queue. Full macOS packaging (the app, DMG and
+release archives) is maintainer-only.
 
 ## After You Open A Pull Request
 

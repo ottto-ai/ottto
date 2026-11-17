@@ -177,7 +177,7 @@ fn family_duplicate_cold_full_matches_tail_route() {
             let limit = MAX_BACKFILL_FILES_PER_SOURCE;
             let (mut index, mut scan, _) =
                 scanner.scan(roots, &support, index, limit, sampled, &births, &[]);
-            let _ = crate::snapshot_sync::apply_claude_local_evidence_to_scan(
+            let _ = crate::snapshot_sync::apply_claude_local_evidence_to_scan_for_test(
                 &support, &mut scan, &mut index,
             );
             let policy = SnapshotUploadPolicy::default();

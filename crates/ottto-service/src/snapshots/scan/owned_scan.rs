@@ -278,14 +278,6 @@ pub(crate) enum OwnedSourceScanStep {
 }
 
 impl OwnedSourceScan {
-    #[cfg(test)]
-    pub(crate) fn test_active_physical_lines(&self) -> usize {
-        self.active_file
-            .as_ref()
-            .map(|file| file.parser.reader.report.physical_line_count)
-            .unwrap_or(0)
-    }
-
     #[expect(clippy::too_many_arguments, reason = "9 args; no options struct yet")]
     pub(crate) fn new(
         source: SnapshotSource,

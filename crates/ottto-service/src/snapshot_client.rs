@@ -2182,8 +2182,6 @@ type NicknameGenerations = std::sync::Arc<
 pub struct SnapshotApiClient {
     nickname_generations: NicknameGenerations,
     api_base_url: String,
-    #[cfg(test)]
-    bounded_retry_loopback_http_for_test: bool,
     agent: ureq::Agent,
     batch_agent: ureq::Agent,
     receipt_state_dir: Option<PathBuf>,
@@ -2201,10 +2199,6 @@ impl SnapshotApiClient {
         crate::relay_auth::binding_key(&self.api_base_url, device, secret, source.api_slug())
     }
 
-    pub(crate) fn api_base_seal(&self) -> [u8; 32] {
-        use sha2::Digest;
-        sha2::Sha256::digest(self.api_base_url.as_bytes()).into()
-    }
     pub(crate) fn matches_api_base(&self, expected: &str) -> bool {
         self.api_base_url == expected
     }
@@ -2219,44 +2213,12 @@ impl SnapshotApiClient {
         Self {
             nickname_generations: Default::default(),
             api_base_url: api_base_url.into(),
-            #[cfg(test)]
-            bounded_retry_loopback_http_for_test: false,
             agent,
             batch_agent,
             receipt_state_dir: None,
             receipt_destination_namespace: None,
             receipt_context: crate::upload_receipts::UploadReceiptContext::default(),
         }
-    }
-
-    fn require_bounded_snapshot_https(&self) -> Result<()> {
-        if self
-            .api_base_url
-            .get(..8)
-            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
-        {
-            return Ok(());
-        }
-        #[cfg(test)]
-        if self.bounded_retry_loopback_http_for_test {
-            return Ok(());
-        }
-        // Pinned ureq bounds plain HTTP response reads, but successive body
-        // writes can each use a fresh socket timeout. Only HTTPS passes through
-        // our absolute DeadlineIo wrapper, so optional production retries must
-        // decline plaintext before acquiring a token or consuming a batch POST.
-        Err(anyhow!("optional snapshot retry requires HTTPS"))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_bounded_retry_loopback_http_for_test(mut self) -> Self {
-        assert!(self
-            .api_base_url
-            .strip_prefix("http://")
-            .and_then(|address| address.parse::<std::net::SocketAddr>().ok())
-            .is_some_and(|address| address.ip().is_loopback()));
-        self.bounded_retry_loopback_http_for_test = true;
-        self
     }
 
     /// Enable privacy-safe local receipts for snapshot batch attempts.
@@ -2441,59 +2403,6 @@ impl SnapshotApiClient {
         Ok(response.token)
     }
 
-    pub(crate) fn issue_relay_token_bounded(
-        &self,
-        device: &LocalDeviceBinding,
-        device_secret: &str,
-        source: SnapshotSource,
-        budget: &crate::snapshot_retry::RetryBudget,
-        validate: &mut dyn FnMut() -> Result<()>,
-    ) -> Result<String> {
-        validate()?;
-        self.require_bounded_snapshot_https()?;
-        if budget.posts_left() == 0 {
-            return Err(anyhow!(
-                "optional snapshot retry POST allowance exhausted before token"
-            ));
-        }
-        let (agent, timeout) = bounded_snapshot_deadline_agent(budget.deadline()?)?;
-        let token = self.issue_relay_token_with_agent(
-            &agent,
-            device,
-            device_secret,
-            source,
-            timeout,
-            Some(crate::snapshot_retry::TOKEN_RESPONSE_BYTES),
-        )?;
-        budget.remaining(Instant::now())?;
-        validate()?;
-        Ok(token)
-    }
-
-    pub(crate) fn get_activity_hint_bounded(
-        &self,
-        relay_token: &str,
-        budget: &crate::snapshot_retry::RetryBudget,
-        validate: &mut dyn FnMut() -> Result<()>,
-    ) -> Result<ActivityHintResponse> {
-        validate()?;
-        self.require_bounded_snapshot_https()?;
-        let (agent, timeout) = bounded_snapshot_deadline_agent(budget.deadline()?)?;
-        let response = relay_sent(
-            relay_token,
-            self.activity_hint_request(&agent, relay_token)
-                .timeout(timeout)
-                .call(),
-        )
-        .map_err(|error| small_upload_error(error, "activity hint request", "activity_hint"))?;
-        // A policy response never needs a body-sized allowance or raw key
-        // retention. Decode only after this cap and drop the fresh hint in-turn.
-        let hint = bounded_response_json(response, crate::snapshot_retry::TOKEN_RESPONSE_BYTES)?;
-        budget.remaining(Instant::now())?;
-        validate()?;
-        Ok(hint)
-    }
-
     /// The one activity-hint GET every caller sends.
     fn activity_hint_request(&self, agent: &ureq::Agent, relay_token: &str) -> ureq::Request {
         agent
@@ -2538,64 +2447,16 @@ impl SnapshotApiClient {
         enforce_head_cas: bool,
         item_cap: usize,
     ) -> Result<SnapshotBatchResponse> {
-        self.upload_batch_inner(relay_token, request, enforce_head_cas, item_cap, None)
-    }
-
-    /// Optional retry transport: fresh authority at every physical POST, one
-    /// shared deadline/counter across identity fallback and caller auth replay.
-    pub(crate) fn upload_batch_bounded(
-        &self,
-        relay_token: &str,
-        request: &SnapshotBatchRequest<impl Borrow<SnapshotItem>>,
-        enforce_head_cas: bool,
-        budget: &mut crate::snapshot_retry::RetryBudget,
-        validate: &mut dyn FnMut() -> Result<()>,
-    ) -> Result<SnapshotBatchResponse> {
-        budget.remaining(Instant::now())?;
-        validate()?;
-        self.require_bounded_snapshot_https()?;
-        self.upload_batch_inner(
-            relay_token,
-            request,
-            enforce_head_cas,
-            crate::snapshots::claude_request_identity::MAX_ITEM_BYTES,
-            Some((budget, validate)),
-        )
-    }
-
-    fn upload_batch_inner(
-        &self,
-        relay_token: &str,
-        request: &SnapshotBatchRequest<impl Borrow<SnapshotItem>>,
-        enforce_head_cas: bool,
-        item_cap: usize,
-        mut retry: Option<(
-            &mut crate::snapshot_retry::RetryBudget,
-            &mut dyn FnMut() -> Result<()>,
-        )>,
-    ) -> Result<SnapshotBatchResponse> {
         let mut resources = crate::local_resource_diagnostics::UploadCall::start(&request.source);
         let enforce_head_cas = enforce_head_cas || request.items().any(declares_head_cas);
-        let body = if retry.is_some() && enforce_head_cas {
-            crate::snapshot_retry::encode_json(
-                &request.wire_with_head_cas(),
-                crate::snapshot_retry::REQUEST_BYTES,
-            )
-        } else if retry.is_some() {
-            crate::snapshot_retry::encode_json(request, crate::snapshot_retry::REQUEST_BYTES)
-        } else if enforce_head_cas {
+        let body = if enforce_head_cas {
             serde_json::to_vec(&request.wire_with_head_cas()).map_err(anyhow::Error::from)
         } else {
             serde_json::to_vec(request).map_err(anyhow::Error::from)
         }
         .map_err(|error| anyhow!("serialize snapshot batch failed: {error}"))?;
         resources.serialized(body.len());
-        let default_gzip = snapshot_upload_gzip_enabled();
-        let gzip_enabled = retry
-            .as_ref()
-            .map(|(budget, _)| budget.gzip_enabled(default_gzip))
-            .unwrap_or(default_gzip);
-        let compressed = gzip_snapshot_batch(&body, gzip_enabled, item_cap);
+        let compressed = gzip_snapshot_batch(&body, snapshot_upload_gzip_enabled(), item_cap);
         // Counts only for the server's logs: why each item is sent.
         let version = crate::snapshots::collector_version();
         let reasons = crate::local_resource_diagnostics::change_reason::request_header(
@@ -2604,42 +2465,31 @@ impl SnapshotApiClient {
                 .items()
                 .map(|item| item.snapshot_fingerprint.as_str()),
         );
-        let mut request_builder = || -> Result<ureq::Request> {
-            let (agent, timeout) = if let Some((budget, validate)) = retry.as_mut() {
-                validate()?;
-                budget.batch_post(Instant::now())?;
-                let (agent, timeout) = bounded_snapshot_deadline_agent(budget.deadline()?)?;
-                (agent, Some(timeout))
-            } else {
-                (self.batch_agent.clone(), None)
-            };
-            let request = agent
+        let request_builder = || {
+            let request = self
+                .batch_agent
                 .post(&self.api_url("/api/v1/agent-session-snapshots/batches"))
                 .set("Accept", "application/json")
                 .set("Content-Type", "application/json")
                 .set("Authorization", &format!("Bearer {relay_token}"))
                 .set("X-Ottto-Daemon-Version", &version);
-            let request = if reasons.is_empty() {
+            if reasons.is_empty() {
                 request
             } else {
                 request.set("X-Ottto-Upload-Reason", &reasons)
-            };
-            Ok(match timeout {
-                Some(timeout) => request.timeout(timeout),
-                None => request,
-            })
+            }
         };
         // Sent inline rather than through a closure: a closure returning
         // `ureq::Error` trips `clippy::result_large_err` on newer toolchains, and
         // the duplication here is two lines.
         let mut outcome = match compressed.as_ref() {
             Some(encoded) => {
-                let post = request_builder()?.set("Content-Encoding", "gzip");
+                let post = request_builder().set("Content-Encoding", "gzip");
                 resources.attempt(encoded.len(), true);
                 relay_sent(relay_token, post.send_bytes(encoded))
             }
             None => {
-                let post = request_builder()?;
+                let post = request_builder();
                 resources.attempt(body.len(), false);
                 relay_sent(relay_token, post.send_bytes(&body))
             }
@@ -2651,27 +2501,15 @@ impl SnapshotApiClient {
         let refused_gzip = compressed.is_some() && encoding_was_refused(&outcome);
         if refused_gzip {
             disable_snapshot_upload_gzip();
-            let post = request_builder()?;
+            let post = request_builder();
             resources.attempt(body.len(), false);
             outcome = relay_sent(relay_token, post.send_bytes(&body));
-        }
-        if refused_gzip {
-            if let Some((budget, _)) = retry.as_mut() {
-                budget.gzip_refused();
-            }
         }
         match outcome {
             Ok(response) => {
                 let status = response.status();
                 let server_request_id = response.header("X-Request-ID").map(str::to_string);
-                let decoded = if retry.is_some() {
-                    bounded_response_json(response, crate::snapshot_retry::RESPONSE_BYTES)
-                } else {
-                    response
-                        .into_json::<SnapshotBatchResponse>()
-                        .map_err(anyhow::Error::from)
-                };
-                match decoded {
+                match response.into_json::<SnapshotBatchResponse>() {
                     Ok(response) => {
                         self.record_batch_success(
                             request,
@@ -5738,8 +5576,6 @@ impl crate::heap_layout_bound::HeapLayoutBound for SnapshotApiClient {
         let Self {
             nickname_generations,
             api_base_url,
-            #[cfg(test)]
-                bounded_retry_loopback_http_for_test: _,
             agent: _,
             batch_agent: _,
             receipt_state_dir,
