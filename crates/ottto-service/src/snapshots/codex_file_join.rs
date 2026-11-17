@@ -2407,7 +2407,6 @@ pub(super) mod tests {
             live_scope: &no_scope,
             cache: None,
             collected_at: "2026-10-01T12:00:00Z",
-            index,
         };
         for _ in 0..10_000 {
             match step_group(&mut job, &inputs) {

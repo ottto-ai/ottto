@@ -945,7 +945,6 @@ pub(in crate::snapshots) struct StepInputs<'a> {
     /// The live member's acquisition scope (cursor jobs), computed on demand.
     pub(in crate::snapshots) cache: Option<&'a Arc<sampled_scan::SharedCache>>,
     pub(in crate::snapshots) collected_at: &'a str,
-    pub(in crate::snapshots) index: &'a ScanIndex,
     pub(in crate::snapshots) live_scope:
         &'a dyn Fn(&CandidateFile) -> Option<crate::transcript_acquisition::Scope>,
 }

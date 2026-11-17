@@ -134,7 +134,6 @@ fn compressed_revert_sums_are_order_independent_and_read_each_member_once() {
                 live_scope: &no_scope,
                 cache: Some(&cache),
                 collected_at: "2026-10-06T23:00:00Z",
-                index: &index,
             };
             let ((), bytes) = observe_consumed(|| {
                 for _ in 0..100_000 {
@@ -208,7 +207,6 @@ fn independent_restart_between_members_discards_unfinished_proof() {
         live_scope: &no_scope,
         cache: Some(&cache),
         collected_at: "2026-10-06T23:00:00Z",
-        index: &index,
     };
     while job.group.as_ref().unwrap().current == 0 {
         assert!(matches!(
@@ -235,7 +233,6 @@ fn independent_restart_between_members_discards_unfinished_proof() {
         live_scope: &no_scope,
         cache: Some(&cache),
         collected_at: "2026-10-06T23:00:00Z",
-        index: &index,
     };
     let (_, bytes) = observe_consumed(|| loop {
         match step_group(&mut job, &inputs) {
@@ -366,7 +363,6 @@ fn independent_members_keep_tools_distinct_activity_and_artifacts() {
         live_scope: &no_scope,
         cache: Some(&cache),
         collected_at: "2026-10-06T23:00:00Z",
-        index: &index,
     };
     let mut seeded = [false; 2];
     loop {
@@ -753,7 +749,6 @@ fn independent_fold_keeps_the_original_certified_evidence() {
         live_scope: &no_scope,
         cache: Some(&cache),
         collected_at: "2026-10-06T23:00:00Z",
-        index: &index,
     };
     loop {
         match step_group(&mut job, &inputs) {

@@ -1231,7 +1231,6 @@ impl OwnedSourceScan {
                             live_scope: &live_scope,
                             cache: sampling.as_ref().map(|context| &context.cache),
                             collected_at: &collected_at,
-                            index,
                         },
                     ) {
                         codex_file_join::GroupStep::Read(result) => result,
