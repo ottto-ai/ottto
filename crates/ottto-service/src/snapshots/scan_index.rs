@@ -17,6 +17,7 @@ mod test_accessors;
 #[cfg(test)]
 pub(in crate::snapshots) mod tests;
 
+use super::discovery::traversal::terminal_unhealthy_retry_due;
 use super::*;
 use super::{
     claude_request_money, deserialize_lenient_claude_history_cutoff, deserialize_lenient_move_hold,
@@ -984,25 +985,50 @@ crate::heap_layout_bound::fields!(SnapshotQuarantineRecord; reconstruction_contr
 crate::heap_layout_bound::fields!(SnapshotQuarantineWitness; contract, collector_version, parser_version, scan_identity_version, snapshot_schema_version, entity_ack_contract, item_wire_byte_limit);
 
 impl ScanIndex {
-    /// Scheduling only: keep an open walk or its clean follow-up paced, but
-    /// leave a terminal-unhealthy walk on its existing bounded retry clock.
-    pub(crate) fn bounded_walk_or_followup_schedulable(&self, now: u64) -> bool {
-        let Some(traversal) = self.traversal.as_ref() else {
-            return self.bounded_sweep_had_unsettled_upload;
+    // Finalization and capture have already run before this saved-index query.
+    pub(crate) fn runnable_walk_or_followup(
+        &self,
+        scan: &SourceScanResult,
+        held: &BTreeSet<String>,
+        progress_blocking: bool,
+        fresh_offer: bool,
+        collected_at: &str,
+    ) -> bool {
+        let quarantined = &self.quarantined_snapshot_fingerprints;
+        let membership = &self.file_snapshot_fingerprints;
+        let unblocked =
+            scan.state_census_complete && scan.sidecar_census_complete && !progress_blocking;
+        let eligible = |key: &str| {
+            let blocked = |fp: &String| held.contains(fp) || quarantined.contains_key(fp);
+            !self.decode_holds_file(key)
+                && !membership.get(key).is_some_and(|fps| fps.iter().any(blocked))
         };
-        let terminal_unhealthy = traversal.pending_directories.is_empty()
-            && !traversal
-                .pending_candidates
-                .iter()
-                .any(|candidate| candidate.census_member)
-            && traversal.has_errors();
-        !terminal_unhealthy
-            || traversal
-                .unhealthy_retry_not_before_unix_seconds
-                .is_none_or(|deadline| {
-                    now >= deadline
-                        || deadline > now.saturating_add(UNHEALTHY_SCAN_RETRY_MAX_SECONDS)
-                })
+        if let Some(t) = &self.traversal {
+            let (terminal, due) = terminal_unhealthy_retry_due(scan.source, self, t, collected_at);
+            if terminal {
+                return due;
+            }
+            let queued = !t.pending_directories.is_empty()
+                || t.pending_candidates.iter().any(|candidate| {
+                    candidate.census_member && eligible(&local_index_key(&candidate.path))
+                });
+            if queued
+                || (unblocked
+                    && !t.watcher_hint_seen
+                    && t.reconciliation_started
+                    && scan.census_status.reconciliation_incomplete)
+            {
+                return true;
+            }
+        }
+        let holds = UnsettledUploadCause::CompletedBlockingHolds.bit()
+            | UnsettledUploadCause::RejectedWithHolds.bit();
+        unblocked
+            && self.unsettled_cause_bits() & holds == 0
+            && self.bounded_sweep_had_unsettled_upload
+            && self.decode_holds.is_empty()
+            && (fresh_offer
+                || (quarantined.is_empty() && self.files.keys().any(|key| eligible(key))))
     }
 
     /// Census members still queued at page end, exactly what
