@@ -481,6 +481,25 @@ impl ApcFixture {
             effective_upload_body_witness_revision(SnapshotSource::ClaudeCode),
         );
         self.load_exclusion_list(&mut index);
+        let empty_progress = test_upload_progress();
+        let mut progress = SnapshotUploadProgress::load_for_index(
+            &index,
+            &self.index_path,
+            &self.progress_path,
+            &empty_progress.destination_namespace_hash,
+            crate::snapshots::snapshot_quarantine_witness_for_context(
+                SnapshotSource::ClaudeCode,
+                APC_UPLOAD_CONTEXT,
+            ),
+        )
+        .expect("reload exact synthetic upload progress");
+        // finish_cycle transfers terminal quarantine to the index. Restore
+        // that custody before acquisition, as production prepare does.
+        if progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints) {
+            progress
+                .save(&self.progress_path)
+                .expect("save native fixture quarantine preparation");
+        }
         let committed_index = index.clone();
         self.trace_stage(collected_at, "before_scan", &index);
         let native_pass = crate::snapshots::state_v2_baseline_release(&self.index_path, &index);
@@ -531,18 +550,6 @@ impl ApcFixture {
             &cutoff_state,
         );
         assert_eq!(serde_json::to_vec(&cutoff_state).unwrap(), cutoff_bytes);
-        let empty_progress = test_upload_progress();
-        let mut progress = SnapshotUploadProgress::load_for_index(
-            &index,
-            &self.index_path,
-            &self.progress_path,
-            &empty_progress.destination_namespace_hash,
-            crate::snapshots::snapshot_quarantine_witness_for_context(
-                SnapshotSource::ClaudeCode,
-                APC_UPLOAD_CONTEXT,
-            ),
-        )
-        .expect("reload exact synthetic upload progress");
         exclude_held_effective_body_witness_revision(&mut index, &scan.snapshots, &disposition);
         let candidates =
             index.capture_claude_proof_corrections(&mut scan, &disposition, |snapshot| {

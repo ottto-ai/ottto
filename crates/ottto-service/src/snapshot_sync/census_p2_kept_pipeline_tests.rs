@@ -297,6 +297,16 @@ impl PipelineFixture {
             &mut index,
             &mut progress,
         );
+        if prepare_upload_progress_for_cycle(
+            &mut progress,
+            &index,
+            cycle.replay_generation,
+            cycle.historical_replay,
+        ) {
+            progress
+                .save(&progress_path)
+                .expect("save native fixture quarantine preparation");
+        }
         if cycle.historical_replay {
             index.prepare_historical_replay(cycle.replay_generation.to_string());
         }
@@ -432,7 +442,7 @@ impl PipelineFixture {
         }
         let leased_reoffers = progress.active_reason_reoffers.clone();
         eprintln!(
-            "native census page at={collected_at} parsed={parsed:?} offered={:?} held={} reoffers={} complete={} status={:?} unsettled={} authority_pending={}",
+            "native census page at={collected_at} parsed={parsed:?} offered={:?} held={} reoffers={} complete={} status={:?} unsettled={} authority_pending={} held_growth={:?}",
             scan.snapshots
                 .iter()
                 .map(|item| item.source_session_id.as_str())
@@ -443,6 +453,10 @@ impl PipelineFixture {
             scan.census_status,
             index.bounded_sweep_had_unsettled_upload(),
             index.claude_usage_authority_pending_count(),
+            crate::snapshots::e2_pipeline_scan_fixture::growth_diagnostics_for_test(
+                &index,
+                &self.root.join(format!("{PIPELINE_HELD_SESSION}.jsonl")),
+            ),
         );
         let mut uploaded = BTreeSet::new();
         let mut accepted = 0;
@@ -700,6 +714,28 @@ impl PipelineFixture {
             }
         }
         pages
+    }
+
+    /// Diagnose the native queue when a fixed-page completion predicate fails.
+    /// The original page remains the assertion's subject, even if later work
+    /// or expiry of the six-hour growth claim permits completion.
+    fn trace_completion_followup(&self, cycle: &PipelineCycle<'_>) {
+        for (hour, first_minute) in [(9, 2), (15, 0)] {
+            for minute in first_minute..=7 {
+                let at = format!("2026-08-02T{hour:02}:{minute:02}:00Z");
+                let page = self.page(&at, cycle, PipelineUpload::Accept);
+                eprintln!(
+                    "native census followup at={at} complete={} status={:?} uploaded={} held={}",
+                    page.scan.census_complete,
+                    page.scan.census_status,
+                    page.uploaded.len(),
+                    page.held.len(),
+                );
+                if page.scan.census_complete {
+                    return;
+                }
+            }
+        }
     }
 
     /// The baseline: every session committed and accepted, one owner proven.
@@ -975,6 +1011,9 @@ fn assert_real_rejected_hold(
     // A durable index reload has already occurred in page(). The next page
     // also reloads the actual upload ledger, keeping the exact refusal visible.
     let last = fixture.page("2026-08-02T09:01:00Z", cycle, PipelineUpload::Accept);
+    if !last.scan.census_complete {
+        fixture.trace_completion_followup(cycle);
+    }
     assert!(last.scan.census_complete);
     assert_eq!(last.scan.census_window_end, first.scan.census_window_end);
     assert!(last.held.is_empty());
@@ -1189,6 +1228,9 @@ fn due_reoffer_rejected_page_preserves_terminal_and_retry_pending_holds() {
             baseline.files[&held_key].last_snapshot_fingerprint
         );
         let last = fixture.page("2026-08-02T09:01:00Z", &cycle, PipelineUpload::Accept);
+        if last.scan.census_complete == retry_pending {
+            fixture.trace_completion_followup(&cycle);
+        }
         assert_eq!(last.scan.census_complete, !retry_pending);
         assert_eq!(last.backfill_succeeded, !retry_pending);
         assert_eq!(last.scan.census_window_end, first.scan.census_window_end);
