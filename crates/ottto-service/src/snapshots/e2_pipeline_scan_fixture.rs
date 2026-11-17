@@ -154,8 +154,10 @@ fn synthetic_default_indexes_save_and_reload_through_native_custody() {
         SnapshotSource::Pi,
     ] {
         let path = scratch.join(format!("{}-index.json", source.api_slug()));
-        let mut index = ScanIndex::default();
-        index.historical_replay_generation = Some(source.api_slug().into());
+        let mut index = ScanIndex {
+            historical_replay_generation: Some(source.api_slug().into()),
+            ..Default::default()
+        };
         index.save(&path).unwrap();
         assert_eq!(route_of(&index).as_deref(), Some(path.as_path()));
         assert_eq!(index.generation, 1);
