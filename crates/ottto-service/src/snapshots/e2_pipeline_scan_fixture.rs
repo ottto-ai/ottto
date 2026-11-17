@@ -1574,3 +1574,17 @@ pub(crate) fn scan_native_pipeline_for_test(
         }
     }
 }
+
+pub(crate) fn growth_diagnostics_for_test(index: &ScanIndex, path: &Path) -> (bool, u64) {
+    (
+        sampled_audit::growth_full_paced(
+            index,
+            &local_index_key(path),
+            sampled_scan::now_seconds(),
+        ),
+        index
+            .traversal
+            .as_ref()
+            .map_or(0, |walk| walk.counts.growth_deferred),
+    )
+}

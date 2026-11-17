@@ -3133,8 +3133,9 @@ fn equal_birth_carrier_never_grandfathers_its_counted_request() {
             append(&carrier, &line(ROOT, "r2", own_at, 20));
             let grown = ready(&c, &scanner, prior.clone(), 100, false);
             eprintln!(
-                "counted carrier stage=grown carrier_first={carrier_first} bodies={}",
-                grown.scan.snapshots.len()
+                "counted carrier stage=grown carrier_first={carrier_first} bodies={} growth_pacing={:?}",
+                grown.scan.snapshots.len(),
+                crate::snapshots::e2_pipeline_scan_fixture::growth_diagnostics_for_test(&grown.index, &carrier),
             );
             literal(&grown);
             let root = body(&grown, ROOT).expect("growth emits ROOT");
