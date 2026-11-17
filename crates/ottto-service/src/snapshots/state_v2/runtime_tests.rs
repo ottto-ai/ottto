@@ -2398,6 +2398,7 @@ fn contribution_references_survive_census_replacement_and_last_census_release() 
         original = Some(sets[0].clone());
     });
     let original = original.unwrap();
+    drop(index);
     cold_close_for_test(&f.path).unwrap();
     index = load_with(&f.path, false).unwrap().unwrap();
     assert_eq!(
@@ -2444,6 +2445,7 @@ fn contribution_references_survive_census_replacement_and_last_census_release() 
     );
     index.claude_request_census.remove(&holder);
     assert!(save_with(&f.path, &mut index).unwrap());
+    drop(index);
     cold_close_for_test(&f.path).unwrap();
     index = load_with(&f.path, false).unwrap().unwrap();
     assert_eq!(
@@ -2499,6 +2501,7 @@ fn missing_contribution_only_reference_refuses_the_store() {
         let error = mapper::read::<SlotRows>(&mut tx, &header, None).unwrap_err();
         assert!(format!("{error:#}").contains("state_v2_reference_missing"));
     });
+    drop(index);
     cold_close_for_test(&f.path).unwrap();
     assert!(load_with(&f.path, false).is_err());
 }
@@ -2529,6 +2532,7 @@ fn inline_contribution_rows_reopen_and_intern_on_replacement() {
             DurableCommitOutcome::Committed(generation + 1)
         );
     });
+    drop(index);
     cold_close_for_test(&f.path).unwrap();
     index = load_with(&f.path, false).unwrap().unwrap();
     assert_eq!(
