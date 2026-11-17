@@ -136,6 +136,34 @@ fn stored_copy(c: &mut Corpus, before: &ScanIndex, id: &str) -> (ScanIndex, Path
 
 #[test]
 #[serial(client_report)]
+fn uncopied_family_duplicates_keep_only_counted_rows_and_stay_quiet() {
+    for a_first in [true, false] {
+        with_e2(|| {
+            let a = uncopied_rows(&[("r1", 10), ("r2", 20), ("r3", 5)]);
+            let b = a.clone() + &uncopied_rows(&[("r4", 13)]);
+            let (c, paths) = uncopied_pair("accepted-quiet", a_first, &a, &b);
+            let mut index = seed(&c);
+            assert_eq!(hashes(&index, &paths[0]).len(), if a_first { 3 } else { 0 });
+            assert_eq!(hashes(&index, &paths[1]).len(), if a_first { 1 } else { 4 });
+            for _ in 0..2 {
+                for path in &paths {
+                    assert!(!index
+                        .claude_copy_removals
+                        .pending(location_key(&path.to_string_lossy())));
+                }
+                let scanner = E2ScanFixture::default();
+                let mut repeat = c.raw(&scanner, index.clone(), 100, false, &[]);
+                assert!(scanner.paths().is_empty());
+                repeat.enrich(&c);
+                assert!(repeat.scan.snapshots.is_empty());
+                index = c.reload(&mut repeat.index);
+            }
+        });
+    }
+}
+
+#[test]
+#[serial(client_report)]
 fn exact_revision_replaces_the_whole_session_slot() {
     with_e2(|| {
         let mut c = Corpus::new("accepted-row-revisions");

@@ -2262,28 +2262,16 @@ impl CopyOwnership {
             })
             .copied()
             .collect::<BTreeSet<_>>();
-        invalid.extend(
-            before
-                .keys()
-                .filter(|key| !next.files.contains_key(*key))
-                .map(|key| location_key(key)),
-        );
-        invalid.extend(
-            self.2
-                .keys()
-                .filter(|loc| !live.contains_key(loc) && self.2.get(loc) != live.accepted.get(loc))
-                .copied(),
-        );
-        let keep = next
-            .claude_copy_removals
-            .referenced_hashes()
-            .into_iter()
-            .filter(|(loc, _)| invalid.contains(loc))
-            .map(|(loc, mut hashes)| {
-                hashes.retain(|&hash| holder_proof(next, &live, loc, hash, HolderUse::Stored));
-                (loc, hashes)
-            })
-            .collect::<BTreeMap<_, _>>();
+        let lost = before.keys().filter(|key| !next.files.contains_key(*key));
+        invalid.extend(lost.map(|key| location_key(key)));
+        invalid.extend(self.2.iter().filter_map(|(loc, rows)| {
+            (!live.contains_key(loc) && Some(rows) != live.accepted.get(loc)).then_some(*loc)
+        }));
+        let mut keep = next.claude_copy_removals.referenced_hashes();
+        keep.retain(|loc, _| invalid.contains(loc));
+        for (loc, hashes) in &mut keep {
+            hashes.retain(|&hash| holder_proof(next, &live, *loc, hash, HolderUse::Stored));
+        }
         let accepted = std::mem::take(&mut live.accepted);
         drop(live);
         let mut marks = next.claude_copy_removals.drop_holder_hashes(&keep);
@@ -2333,17 +2321,15 @@ impl CopyOwnership {
             else {
                 continue;
             };
-            let hashes = accepted_delta
+            let hashes = old
+                .and_then(|o| o.census.as_ref())
                 .into_iter()
+                .chain(census)
+                .flat_map(|r| r.request_hashes().iter().copied())
+                .chain(accepted_delta)
                 .chain(
-                    old.and_then(|o| o.census.as_ref())
-                        .into_iter()
-                        .chain(census)
-                        .flat_map(|r| r.request_hashes().iter().copied())
-                        .chain(
-                            old.into_iter()
-                                .flat_map(|o| o.groups.iter().flat_map(|(_, h)| h.iter().copied())),
-                        ),
+                    old.into_iter()
+                        .flat_map(|o| o.groups.iter().flat_map(|(_, h)| h.iter().copied())),
                 )
                 .collect::<BTreeSet<_>>();
             let mut destinations = BTreeSet::from([Path::new(key)
@@ -2468,14 +2454,25 @@ impl CopyOwnership {
                     != 0;
                 let index: &ScanIndex = next;
                 let locations = &live;
+                let contributions = &next.upload_context_proof.request_contributions;
+                let bodies = next.file_snapshot_fingerprints.get(key);
+                let rows = contributions
+                    .values()
+                    .filter(|slot| bodies.is_some_and(|b| b.contains(&slot.fingerprint)))
+                    .flat_map(|slot| slot.rows.iter())
+                    .collect::<Vec<_>>();
                 if hashes.into_iter().any(|hash| {
                     let removed = groups
                         .iter()
                         .any(|(_, hashes)| hashes.binary_search(&hash).is_ok());
                     let keep = saved_removal_applies(next, &live, key, hash)
                         && !groups.iter().any(|(h, _)| carrier_lost.contains(h));
-                    let covered = holders.get(&hash).is_some_and(|holder| *holder < order)
-                        || earliest_accepted_holder(
+                    // Skip a family duplicate already removed inside this accepted sum.
+                    let covered = holders
+                        .get(&hash)
+                        .copied()
+                        .into_iter()
+                        .chain(earliest_accepted_holder(
                             next,
                             &live,
                             hash,
@@ -2489,8 +2486,14 @@ impl CopyOwnership {
                                         Some((key, session, local_owned(index, &[], key, true)))
                                     })
                             }),
-                        )
-                        .is_some();
+                        ))
+                        .min()
+                        .is_some_and(|holder| {
+                            holder < order
+                                && !rows.iter().any(|(loc, h)| {
+                                    *loc == holder.1 && h.binary_search(&hash).is_ok()
+                                })
+                        });
                     // An invalid old holder must be replaced in the saved
                     // groups even if another holder proves the same removal.
                     (removed && !keep) || (!removed && copy && covered)
