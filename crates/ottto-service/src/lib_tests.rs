@@ -151,6 +151,21 @@ mod tests {
     }
 
     #[test]
+    fn control_token_refuses_an_equal_length_mismatch() {
+        let token = ControlToken::new(TOKEN).unwrap();
+        assert_eq!(token.authorize(TOKEN), Ok(()));
+        let last = format!("{}X", &TOKEN[..TOKEN.len() - 1]);
+        let first = format!("X{}", &TOKEN[1..]);
+        for candidate in [last, first] {
+            assert_eq!(candidate.len(), TOKEN.len());
+            assert_eq!(
+                token.authorize(&candidate),
+                Err(LocalApiError::Unauthorized)
+            );
+        }
+    }
+
+    #[test]
     fn concurrent_repairs_are_locked() {
         let daemon = daemon();
         let lease = daemon

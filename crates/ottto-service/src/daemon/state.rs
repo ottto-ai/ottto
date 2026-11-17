@@ -44,6 +44,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,7 +144,8 @@ impl ControlToken {
     }
 
     pub(crate) fn authorize(&self, candidate: &str) -> Result<(), LocalApiError> {
-        if self.0 == candidate {
+        // ct_eq returns early on unequal lengths; generated tokens are 64 hex.
+        if bool::from(self.0.as_bytes().ct_eq(candidate.as_bytes())) {
             Ok(())
         } else {
             Err(LocalApiError::Unauthorized)
