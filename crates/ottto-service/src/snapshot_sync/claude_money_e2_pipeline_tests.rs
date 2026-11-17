@@ -535,6 +535,24 @@ fn api_login(
     login: char,
     org: Option<char>,
 ) -> crate::claude_local_otel::ClaudeLocalOtelEvidence {
+    api_login_org(
+        session,
+        request,
+        tokens,
+        login,
+        org.map(|org| org.to_string().repeat(64)),
+    )
+}
+
+/// `api_login` whose complete org is the given hash (e.g. a transcript
+/// marker's organization hash, so telemetry and marker agree).
+fn api_login_org(
+    session: &str,
+    request: &str,
+    tokens: u64,
+    login: char,
+    org: Option<String>,
+) -> crate::claude_local_otel::ClaudeLocalOtelEvidence {
     use crate::claude_local_otel::{
         ClaudeIdentityAttributeEvidence, ClaudeIdentityAttributeOrigin, ClaudeIdentityDisposition,
     };
@@ -560,7 +578,7 @@ fn api_login(
         crate::claude_local_otel::ClaudeRequestIdentityEvidence {
             identity_hash_scheme: "provider-sha256:v1".into(),
             account: attribute(Some(login)),
-            organization: attribute(org.map(|org| org.to_string().repeat(64))),
+            organization: attribute(org),
             disposition: ClaudeIdentityDisposition::Complete,
         },
     ));
