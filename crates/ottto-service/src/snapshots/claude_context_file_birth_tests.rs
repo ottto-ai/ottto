@@ -1220,7 +1220,7 @@ fn api_sidecar_without_trace_sidecar_still_vetoes() {
         if !veto_rows {
             let _ = fs::remove_file(&path);
         }
-        let (_, _, stats) = crate::snapshot_sync::apply_claude_local_evidence_to_scan_for_test(
+        let (_, _, stats) = crate::snapshot_sync::apply_claude_local_evidence_to_scan(
             &support, &mut scan, &mut index,
         );
         let item = scan
@@ -1430,9 +1430,7 @@ fn capture_on_bodies_match_the_clear_outside_context_scalars() {
         )
         .unwrap();
         let apply = |scan: &mut SourceScanResult, index: &mut ScanIndex| {
-            crate::snapshot_sync::apply_claude_local_evidence_to_scan_for_test(
-                &support, scan, index,
-            )
+            crate::snapshot_sync::apply_claude_local_evidence_to_scan(&support, scan, index)
         };
         let (_, _, stats) = if rule_on {
             apply(&mut scan, &mut index)

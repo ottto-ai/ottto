@@ -881,29 +881,6 @@ pub(crate) fn apply_claude_local_evidence_to_scan(
     )
 }
 
-/// The ledger-less evidence stage under `session_request_account_source:v1`,
-/// which the server advertises to every Claude Code upload: a keyless ledger
-/// matches no session, so only the account carry differs from `None`.
-#[cfg(test)]
-pub(crate) fn apply_claude_local_evidence_to_scan_for_test(
-    support_dir: &Path,
-    scan_result: &mut crate::snapshots::SourceScanResult,
-    index: &mut ScanIndex,
-) -> (
-    crate::snapshots::ClaudeUsageAuthorityDisposition,
-    bool,
-    ClaudeLocalEvidenceStats,
-) {
-    let mut carry_on = crate::snapshots::claude_request_identity::AcceptedBuckets::default();
-    carry_on.set_account_source_enabled(true);
-    apply_claude_local_evidence_to_scan_with_accepted_for_test(
-        support_dir,
-        scan_result,
-        index,
-        Some(&carry_on),
-    )
-}
-
 /// The production evidence stage with this cycle's accepted-identity ledger.
 #[cfg(test)]
 pub(crate) fn apply_claude_local_evidence_to_scan_with_accepted_for_test(

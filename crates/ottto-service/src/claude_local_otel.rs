@@ -3469,9 +3469,7 @@ mod tests {
             append_trace_ownership_evidence(&dir, &row).unwrap();
         }
         let (_, records) = crate::local_resource_diagnostics::capture(|| {
-            crate::snapshot_sync::apply_claude_local_evidence_to_scan_for_test(
-                &dir, &mut scan, &mut index,
-            )
+            crate::snapshot_sync::apply_claude_local_evidence_to_scan(&dir, &mut scan, &mut index)
         });
         let reads = records
             .iter()
@@ -3532,7 +3530,7 @@ mod tests {
         let mut reference_scan = scan.clone();
         let mut reference_index = index.clone();
         API_READ_RECEIPT.with(|r| r.set((0, 0, true)));
-        let reference = crate::snapshot_sync::apply_claude_local_evidence_to_scan_for_test(
+        let reference = crate::snapshot_sync::apply_claude_local_evidence_to_scan(
             &dir,
             &mut reference_scan,
             &mut reference_index,
@@ -3541,9 +3539,7 @@ mod tests {
         assert_eq!(reference_receipt.0, 2);
         API_READ_RECEIPT.with(|r| r.set((0, 0, false)));
         let (disposition, withheld, stats) =
-            crate::snapshot_sync::apply_claude_local_evidence_to_scan_for_test(
-                &dir, &mut scan, &mut index,
-            );
+            crate::snapshot_sync::apply_claude_local_evidence_to_scan(&dir, &mut scan, &mut index);
         assert_eq!(disposition, reference.0);
         assert_eq!(withheld, reference.1);
         assert_eq!(stats, reference.2);
@@ -3641,9 +3637,8 @@ mod tests {
             .remove(0);
         bad_trace.session_id = "bad-root".into();
         append_trace_ownership_evidence(&dir, &bad_trace).unwrap();
-        let (_, _, stats) = crate::snapshot_sync::apply_claude_local_evidence_to_scan_for_test(
-            &dir, &mut scan, &mut index,
-        );
+        let (_, _, stats) =
+            crate::snapshot_sync::apply_claude_local_evidence_to_scan(&dir, &mut scan, &mut index);
         assert_eq!(stats.candidate_root_count, 2);
         assert_eq!(stats.paired_sidecar_root_count, 2);
         assert_eq!(stats.api_incomplete_root_count, 1);

@@ -195,9 +195,9 @@ fn identity_pipeline_cycle(
             }
         }
     };
-    apply_claude_local_evidence_to_scan_for_test(&support, &mut oracle_scan, &mut oracle_index);
+    apply_claude_local_evidence_to_scan(&support, &mut oracle_scan, &mut oracle_index);
     let (_preparation, mut index, mut scan) = collect_preparation_with_rotation(preparation);
-    apply_claude_local_evidence_to_scan_for_test(&support, &mut scan, &mut index);
+    apply_claude_local_evidence_to_scan(&support, &mut scan, &mut index);
     Ok(IdentityPipelineCycle {
         body: serde_json::to_vec(&scan.snapshots).expect("serialize body"),
         snapshots: scan.snapshots,
