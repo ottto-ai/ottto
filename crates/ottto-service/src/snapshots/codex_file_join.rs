@@ -3784,8 +3784,13 @@ pub(super) mod tests {
             .map(|item| item.snapshot_fingerprint.clone())
             .collect::<BTreeSet<_>>();
         let path = root.join(file);
-        working
-            .committable_subset(previous, &accepted, &BTreeMap::new())
+        let mut selected = working.committable_subset(previous, &accepted, &BTreeMap::new());
+        if path.exists() {
+            let baseline = ScanIndex::load(&path).unwrap();
+            selected.retain_persistence_baseline_from(&baseline);
+            selected.generation = baseline.generation;
+        }
+        selected
             .save_fixture_for_source(&path, SnapshotSource::Codex)
             .unwrap();
         ScanIndex::load(&path).unwrap()
@@ -3850,7 +3855,7 @@ pub(super) mod tests {
         // The held and settled outcomes are alternatives: each starts from its
         // own copy of the saved index the cycle loaded.
         for file in ["held.json", "settled.json"] {
-            fs::copy(root.join("v2.json"), root.join(file)).unwrap();
+            e2_pipeline_scan_fixture::seed_index_for_test(&previous, &root.join(file));
         }
         // New content, parsed by an inactive build: a Legacy group decision.
         let path = root.join("sessions/b.jsonl");
@@ -5106,9 +5111,14 @@ pub(super) mod tests {
                 .unwrap()
                 .0
                 .clone();
-            let mut value = serde_json::to_value(&captured).unwrap();
-            value["files"][&key]["codex_captured_tier_receipt"] = malformed;
-            fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+            crate::snapshots::state_v2::money_test_support::edit_record_for_test(
+                &captured,
+                "file.progress",
+                &key,
+                |entry| {
+                    entry["codex_captured_tier_receipt"] = malformed;
+                },
+            );
             let loaded = ScanIndex::load(&path).unwrap();
             assert_eq!(
                 loaded.files.len(),

@@ -1199,11 +1199,6 @@ fn ack_census_wait_count_resets_on_a_disabled_finish_between_capacity_stops() {
 #[serial(source_cadences, source_manifests, client_report)]
 fn telemetry_retention_follows_only_a_completed_upload_and_saved_index() {
     const UNREAD: &str = "6338a80a-f36e-4cbc-a5bb-50fc66430ba5";
-    let newer_index = || {
-        let mut newer = serde_json::to_value(ScanIndex::default()).unwrap();
-        newer["generation"] = 7.into();
-        newer
-    };
     for arm in ["save_fails", "deferred", "completed"] {
         let server = AckScriptedServer::new();
         let mut home = AckFinishHome::new(&server);
@@ -1227,12 +1222,16 @@ fn telemetry_retention_follows_only_a_completed_upload_and_saved_index() {
             Some((u64::MAX / 2, BTreeMap::new())),
         );
         crate::snapshots::claude_telemetry_retention::take_runs_for_test();
+        let mut competing_bytes = None;
         match arm {
             "save_fails" => {
                 // Another writer advanced the saved index: the selected
                 // save's compare-and-swap refuses.
                 std::fs::create_dir_all(index_path.parent().unwrap()).unwrap();
-                std::fs::write(&index_path, serde_json::to_vec(&newer_index()).unwrap()).unwrap();
+                let mut concurrent = ScanIndex::load(&index_path).unwrap();
+                concurrent.save(&index_path).unwrap();
+                competing_bytes =
+                    Some(serde_json::to_vec(&ScanIndex::load(&index_path).unwrap()).unwrap());
             }
             "deferred" => server
                 .script
@@ -1253,8 +1252,8 @@ fn telemetry_retention_follows_only_a_completed_upload_and_saved_index() {
             "save_fails" => {
                 assert!(result.is_err(), "{arm}");
                 assert_eq!(
-                    std::fs::read(&index_path).unwrap(),
-                    serde_json::to_vec(&newer_index()).unwrap(),
+                    serde_json::to_vec(&ScanIndex::load(&index_path).unwrap()).unwrap(),
+                    competing_bytes.unwrap(),
                     "{arm}: the selected save never committed"
                 );
                 assert_eq!(runs, 0, "{arm}");

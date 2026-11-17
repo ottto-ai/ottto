@@ -1479,3 +1479,25 @@ pub(crate) fn non_tail_carrier_observation_for_test(index: &ScanIndex, path: &Pa
     )
     .unwrap();
 }
+
+/// A comparison caches logical input, never an open connection across restores.
+pub(crate) fn detach_route_for_test(index: &mut ScanIndex) {
+    index.v2_mut().persistence_v2 = None;
+}
+
+pub(crate) fn expire_claimed_growth_for_test(index: &mut ScanIndex, path: &Path) {
+    let key = local_index_key(path);
+    let now = sampled_scan::now_seconds();
+    assert!(sampled_audit::growth_full_paced(index, &key, now));
+    assert!(index
+        .traversal
+        .as_ref()
+        .is_some_and(|walk| walk.counts.growth_deferred > 0));
+    let state = index.v2_mut().growth_retention.get_mut(&key).unwrap();
+    let mut value = serde_json::to_value(&*state).unwrap();
+    value["last_growth_full_unix"] = json!(now - sampled_audit::GROWTH_FULL_INTERVAL);
+    *state = serde_json::from_value(value).unwrap();
+    assert!(!sampled_audit::growth_full_paced(index, &key, now));
+    let route = route_of(index).unwrap();
+    index.save_fixture(&route).unwrap();
+}

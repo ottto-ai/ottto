@@ -318,3 +318,49 @@ pub(crate) fn publish_fixture_at_generation(
 }
 
 pub(in super::super) use runtime::erase_published;
+
+/// Inject a synthetic persisted record fault before the next real hydrate.
+pub(crate) fn edit_record_for_test(
+    index: &ScanIndex,
+    kind: &str,
+    name: &str,
+    edit: impl FnOnce(&mut serde_json::Value),
+) {
+    runtime::with_session_db(index, |db| {
+        let generation = db.read_control::<u64>("generation").unwrap().unwrap();
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        let key = mapper::key(kind, name, 1).unwrap();
+        let mut value = match tx.get(&key).unwrap() {
+            Some(header) => {
+                let bytes = mapper::bytes(&mut tx, &header).unwrap();
+                codec::decode::<serde_json::Value>(&bytes, value_cap(&key)).unwrap()
+            }
+            None => serde_json::Value::Null,
+        };
+        edit(&mut value);
+        mapper::put(&mut tx, &key, &value).unwrap();
+        assert_eq!(
+            tx.commit(generation, generation + 1),
+            DurableCommitOutcome::Committed(generation + 1)
+        );
+    });
+}
+
+/// Model a progress header exhausted by earlier commits, without JSON import.
+pub(crate) fn exhaust_progress_generation_for_test(index: &ScanIndex) {
+    runtime::with_session_db(index, |db| {
+        let generation = db.read_control::<u64>("generation").unwrap().unwrap();
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        tx.put(RowInput {
+            key: &RowKey::Meta(progress::GENERATION.into()),
+            fixed: &Fixed::None,
+            value_version: 1,
+            value: &serde_json::to_vec(&u64::MAX).unwrap(),
+        })
+        .unwrap();
+        assert_eq!(
+            tx.commit(generation, generation + 1),
+            DurableCommitOutcome::Committed(generation + 1)
+        );
+    });
+}

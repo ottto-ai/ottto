@@ -1320,6 +1320,7 @@ fn unreadable_backfill_state_emits_no_history_from_a_rebuilt_index() {
         if quarantine {
             fixture.corrupt_index();
         } else {
+            crate::snapshots::state_v2::erase_published(&fixture.index_path);
             std::fs::remove_file(&fixture.index_path).expect("lose the index");
         }
         for hour in [9, 10] {

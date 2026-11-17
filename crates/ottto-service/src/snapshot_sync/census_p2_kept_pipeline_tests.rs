@@ -220,15 +220,18 @@ impl PipelineFixture {
         reoffers: bool,
     ) -> Result<PipelinePage> {
         let mut index = ScanIndex::load(&self.index_path).expect("load scan index");
+        crate::snapshots::e2_pipeline_scan_fixture::age_listing_for_test(&mut index);
         self.cache.bind_withheld(&mut index);
         // Production order (`finish_sync_source`): the upload ledger loads
         // under the context's quarantine witness, and one activation binds
         // the context to the index and the ledger before the scan. Contexts
         // are fingerprint-shaped on the wire and in the durable ledger.
         let upload_context = format!("{:x}", Sha256::digest(cycle.upload_context.as_bytes()));
-        let progress_path = self.base.join("upload-progress.json");
+        let progress_path = snapshot_upload_progress_path(&self.index_path);
         let mut progress = if self.durable_progress {
-            SnapshotUploadProgress::load(
+            SnapshotUploadProgress::load_for_index(
+                &index,
+                &self.index_path,
                 &progress_path,
                 &format!("{:064x}", 99),
                 crate::snapshots::snapshot_quarantine_witness_for_context(
@@ -238,7 +241,12 @@ impl PipelineFixture {
             )
             .expect("load durable synthetic upload progress")
         } else {
-            test_upload_progress()
+            route_fixture_progress(
+                &index,
+                &self.index_path,
+                &progress_path,
+                test_upload_progress(),
+            )
         };
         activate_source_upload_context(
             SnapshotSource::ClaudeCode,

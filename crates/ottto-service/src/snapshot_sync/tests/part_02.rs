@@ -76,12 +76,10 @@ fn cache_event_ack_restart_correction_and_missing_proof() {
         |_| Ok(()),
     )
     .unwrap();
-    let directory =
-        std::env::temp_dir().join(format!("ottto-cache-progress-{}", std::process::id()));
+    let directory = crate::test_scratch::canonical_private_dir("cache-progress");
     std::fs::create_dir_all(&directory).unwrap();
-    let path = directory.join("progress.json");
+    let path = snapshot_upload_progress_path(&directory.join("index.json"));
     let _ = std::fs::remove_file(&path);
-    restored.save(&path).unwrap();
     let (mut settled_index, _) = pending_head_index_item();
     settled_index.record_accepted_snapshot_fingerprints(&restored.accepted_fingerprints);
     let mut digest = Sha256::new();
@@ -101,9 +99,18 @@ fn cache_event_ack_restart_correction_and_missing_proof() {
     settled_index
         .save_fixture(&directory.join("index.json"))
         .unwrap();
+    restored = route_fixture_progress(
+        &settled_index,
+        &directory.join("index.json"),
+        &path,
+        restored,
+    );
+    restored.save(&path).unwrap();
     restored.retire_acks_after_index_save(&settled_index, &BTreeSet::new(), &BTreeSet::new());
     restored.finish_cycle(&path).unwrap();
-    let mut restored = SnapshotUploadProgress::load(
+    let mut restored = SnapshotUploadProgress::load_for_index(
+        &settled_index,
+        &directory.join("index.json"),
         &path,
         &restored.destination_namespace_hash,
         restored.active_quarantine_witness.clone().unwrap(),
@@ -647,7 +654,9 @@ fn same_replay_generation_restores_cleared_conflict_progress_until_retry() {
         BTreeSet::from([conflicted_fingerprint.clone()]),
     );
 
-    let mut progress = test_upload_progress();
+    index.save_fixture(&index_path).unwrap();
+    let mut progress =
+        route_fixture_progress(&index, &index_path, &progress_path, test_upload_progress());
     assert!(progress.prepare_historical_replay(&replay_generation));
     let mut accepted = 0;
     let result = upload_resumable_batches(
@@ -702,12 +711,13 @@ fn same_replay_generation_restores_cleared_conflict_progress_until_retry() {
     index
         .save_fixture(&index_path)
         .expect("persist conflicted index");
-    progress
-        .clear(&progress_path)
+    clear_fixture_progress(&mut progress, &progress_path)
         .expect("completed conflict cycle clears disposable progress");
 
     let persisted_index = ScanIndex::load(&index_path).expect("reload conflicted index");
-    let mut restored = SnapshotUploadProgress::load(
+    let mut restored = SnapshotUploadProgress::load_for_index(
+        &persisted_index,
+        &index_path,
         &progress_path,
         &destination,
         snapshot_quarantine_witness(SnapshotSource::Codex),
@@ -728,8 +738,7 @@ fn same_replay_generation_restores_cleared_conflict_progress_until_retry() {
     restored
         .save(&progress_path)
         .expect("persist restored same-generation conflict");
-    restored
-        .clear(&progress_path)
+    clear_fixture_progress(&mut restored, &progress_path)
         .expect("model another completed follow-up cycle");
 
     let mut due_index = persisted_index;
@@ -743,7 +752,9 @@ fn same_replay_generation_restores_cleared_conflict_progress_until_retry() {
         .expect("persist due conflict");
 
     let due_index = ScanIndex::load(&index_path).expect("reload due conflict index");
-    let mut retry_progress = SnapshotUploadProgress::load(
+    let mut retry_progress = SnapshotUploadProgress::load_for_index(
+        &due_index,
+        &index_path,
         &progress_path,
         &destination,
         snapshot_quarantine_witness(SnapshotSource::Codex),

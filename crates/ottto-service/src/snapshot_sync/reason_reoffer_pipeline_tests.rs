@@ -657,18 +657,6 @@ fn reoffer_json<'a>(cycle: &'a CycleResult, fingerprint: &str) -> &'a serde_json
     &cycle.progress_json["permanent_rejections"][fingerprint]["reoffer"]
 }
 
-/// Old daemon rewrite: the record keeps `reason: other` and loses the
-/// extension it does not know.
-fn strip_reoffer_extension(path: &Path, fingerprint: &str) {
-    let mut json: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-    json["permanent_rejections"][fingerprint]
-        .as_object_mut()
-        .unwrap()
-        .remove("reoffer");
-    std::fs::write(path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
-}
-
 /// An unchanged finished session refused for
 /// `original_pair_candidate_unproved` is offered once a day, exactly, until
 /// the server accepts it. Repeat refusals settle the census while health
@@ -819,7 +807,16 @@ fn legacy_other_refusal_is_reclassified_by_one_offer() {
             first.progress_json["permanent_rejections"][&fingerprint]["reason"],
             "other"
         );
-        strip_reoffer_extension(&first.progress_path, &fingerprint);
+        crate::snapshots::state_v2::edit_progress_rows_for_test(
+            &first.index_path,
+            &first.index,
+            |_, _, ledger| {
+                ledger["permanent_rejections"][&fingerprint]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("reoffer");
+            },
+        );
 
         pipeline.server.answer(second_answer);
         let reclassified = pipeline.cycle(t0 + 600);

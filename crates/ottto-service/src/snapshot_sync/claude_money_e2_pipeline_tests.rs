@@ -2243,9 +2243,10 @@ fn retry_case(conflict: bool) {
         );
         // Production transport-error seam: progress is durable first, then
         // only wholly settled files advance in the partial checkpoint.
-        let progress_path = c.base.join("progress.json");
+        let index_path = crate::snapshots::e2_pipeline_scan_fixture::route_of(&p.index).unwrap();
+        let progress_path = snapshot_upload_progress_path(&index_path);
+        progress = route_fixture_progress(&p.index, &index_path, &progress_path, progress);
         progress.save(&progress_path).unwrap();
-        let index_path = c.base.join("scan-index.json");
         checkpoint_partial_snapshot_index_with_audit_release(
             &p.index,
             &committed,
@@ -2263,7 +2264,9 @@ fn retry_case(conflict: bool) {
         )
         .unwrap();
         let prior = ScanIndex::load(&index_path).unwrap();
-        let mut progress = SnapshotUploadProgress::load(
+        let mut progress = SnapshotUploadProgress::load_for_index(
+            &prior,
+            &index_path,
             &progress_path,
             &format!("{:064x}", 99),
             snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
@@ -3059,6 +3062,10 @@ fn equal_birth_carrier_never_grandfathers_its_counted_request() {
                 vec![carrier.clone()],
                 "C is discovered first"
             );
+            eprintln!(
+                "counted carrier stage=seed carrier_first={carrier_first} bodies={}",
+                seed.scan.snapshots.len()
+            );
             literal(&seed);
             assert_eq!(total(&seed), 1);
             // Complete upload settlement records acceptance and exact ACK
@@ -3079,6 +3086,10 @@ fn equal_birth_carrier_never_grandfathers_its_counted_request() {
                 );
             }
             let twins = ready(&c, &scanner, prior.clone(), 100, false);
+            eprintln!(
+                "counted carrier stage=twins carrier_first={carrier_first} bodies={}",
+                twins.scan.snapshots.len()
+            );
             literal(&twins);
             assert_eq!(total(&twins), 1);
             assert_eq!(body(&twins, ROOT).unwrap().removed_request_count, Some(1));
@@ -3089,6 +3100,10 @@ fn equal_birth_carrier_never_grandfathers_its_counted_request() {
             // acquires the summed body's COPY mark before the own turn grows.
             append(&carrier, "\n");
             let refreshed = ready(&c, &scanner, prior.clone(), 100, false);
+            eprintln!(
+                "counted carrier stage=refreshed carrier_first={carrier_first} bodies={}",
+                refreshed.scan.snapshots.len()
+            );
             literal(&refreshed);
             assert_eq!(
                 snapshot_upload_body_witness(body(&refreshed, ROOT).unwrap()),
@@ -3117,6 +3132,10 @@ fn equal_birth_carrier_never_grandfathers_its_counted_request() {
             // Red on main without the counting-holder guard (CS1 run 43868949339).
             append(&carrier, &line(ROOT, "r2", own_at, 20));
             let grown = ready(&c, &scanner, prior.clone(), 100, false);
+            eprintln!(
+                "counted carrier stage=grown carrier_first={carrier_first} bodies={}",
+                grown.scan.snapshots.len()
+            );
             literal(&grown);
             let root = body(&grown, ROOT).expect("growth emits ROOT");
             assert_eq!(
@@ -4041,7 +4060,7 @@ fn e2_pipeline_copy_waits_for_a_queued_indexed_holder_without_a_census_record() 
 /// A file whose every response conflicts keeps
 /// a zero-usage carrier that publishes its conflict disclosure through the
 /// literal, ACK and restart path, over an accepted prior body.
-fn conflict_only(subagent: bool) {
+fn conflict_only(subagent: bool, sampled: bool) {
     with_e2(|| {
         let mut c = Corpus::new(&format!("e2-pipeline-conflict-only-{subagent}"));
         let session = if subagent {
@@ -4060,7 +4079,7 @@ fn conflict_only(subagent: bool) {
         let scanner = E2ScanFixture::default();
         let mut progress = e2_progress();
         let old = ScanIndex::default();
-        let accepted = ready(&c, &scanner, old.clone(), 100, false);
+        let accepted = ready(&c, &scanner, old.clone(), 100, sampled);
         let prior_body = body(&accepted, &session).expect("accepted prior body");
         assert_eq!(prior_body.request_count, 1);
         let prior = settle(&c, &old, accepted, &mut progress);
@@ -4071,7 +4090,7 @@ fn conflict_only(subagent: bool) {
             .unwrap()
             .write_all(b.as_bytes())
             .unwrap();
-        let mut conflicted = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
+        let mut conflicted = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, sampled);
         let carrier = body(&conflicted, &session).expect("conflict-only file keeps a carrier");
         assert!(crate::snapshots::claude_request_money::is_request_owned_literal(carrier));
         assert_eq!(carrier.request_count, 0, "no invented tokens");
@@ -4085,8 +4104,21 @@ fn conflict_only(subagent: bool) {
         let bytes = canonical(&conflicted.scan.snapshots);
         // A crash before the ACK: discard the page's uncommitted native state.
         drop(conflicted);
-        let mut restart = cold_ready(&c, prior, 100, false);
+        let mut restart = cold_ready(&c, prior, 100, sampled);
         restart.finish();
+        if !sampled {
+            assert!(
+                restart.scan.snapshots.is_empty(),
+                "a recent growth Full is paced"
+            );
+            let mut due = c.reload(&mut restart.index);
+            crate::snapshots::e2_pipeline_scan_fixture::expire_claimed_growth_for_test(
+                &mut due, &path,
+            );
+            drop(restart);
+            restart = cold_ready(&c, due, 100, false);
+            restart.finish();
+        }
         assert_eq!(
             canonical(&restart.scan.snapshots),
             bytes,
@@ -4098,11 +4130,18 @@ fn conflict_only(subagent: bool) {
 }
 #[test]
 fn e2_pipeline_root_conflict_only_file_publishes_its_disclosure() {
-    conflict_only(false);
+    conflict_only(false, true);
 }
 #[test]
 fn e2_pipeline_subagent_conflict_only_file_publishes_its_disclosure() {
-    conflict_only(true);
+    conflict_only(true, true);
+}
+
+#[test]
+fn e2_pipeline_unsampled_conflict_carrier_resumes_after_growth_claim_expires() {
+    for subagent in [false, true] {
+        conflict_only(subagent, false);
+    }
 }
 
 // Shared helpers above remain the real scan/evidence/finish/upload callers.

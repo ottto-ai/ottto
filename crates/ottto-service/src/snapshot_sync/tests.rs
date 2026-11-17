@@ -16,3 +16,35 @@ include!("claude_request_census_pipeline_tests.rs");
 include!("tests/part_07.rs");
 include!("request_identity_pipeline_tests.rs");
 include!("tests/part_08.rs");
+
+/// Attach a synthetic working ledger to the same native owner the service uses.
+fn route_fixture_progress(
+    index: &ScanIndex,
+    index_path: &Path,
+    path: &Path,
+    mut progress: SnapshotUploadProgress,
+) -> SnapshotUploadProgress {
+    let native = SnapshotUploadProgress::load_for_index(
+        index,
+        index_path,
+        path,
+        &progress.destination_namespace_hash,
+        progress.active_quarantine_witness.clone().unwrap(),
+    )
+    .expect("native fixture progress owner");
+    progress.generation = native.generation;
+    progress.rows = native.rows;
+    progress
+}
+
+fn clear_fixture_progress(progress: &mut SnapshotUploadProgress, path: &Path) -> Result<()> {
+    let mut empty = SnapshotUploadProgress::new(
+        progress.destination_namespace_hash.clone(),
+        progress.active_quarantine_witness.clone().unwrap(),
+    );
+    empty.generation = progress.generation;
+    empty.rows = progress.rows.take();
+    empty.save(path)?;
+    *progress = empty;
+    Ok(())
+}

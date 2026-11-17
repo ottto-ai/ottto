@@ -90,6 +90,19 @@ impl AckFixture {
         (index, progress)
     }
 
+    fn load_native(&self) -> (ScanIndex, SnapshotUploadProgress) {
+        let index = ScanIndex::load(&self.index_path).unwrap();
+        let progress = SnapshotUploadProgress::load_for_index(
+            &index,
+            &self.index_path,
+            &self.progress_path,
+            &self.namespace,
+            snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+        )
+        .unwrap();
+        (index, progress)
+    }
+
     fn assert_ack(&self, progress: &SnapshotUploadProgress) {
         assert!(progress
             .accepted_fingerprints
@@ -1237,8 +1250,9 @@ fn retirement_obligations_survive_opaque_decode_and_local_hold_cycles() {
 
 #[test]
 fn complete_census_retires_never_committed_vanished_acks_after_partial_error() {
-    let f = AckFixture::new(false);
-    let (committed, mut progress) = f.load();
+    let mut f = AckFixture::new(false);
+    f.progress_path = snapshot_upload_progress_path(&f.index_path);
+    let (committed, mut progress) = f.load_native();
     // F has two unsettled siblings. Only one was accepted before an error;
     // partial settlement therefore cannot commit the file.
     let mut first = f.item.clone();
@@ -1258,6 +1272,7 @@ fn complete_census_retires_never_committed_vanished_acks_after_partial_error() {
         .unwrap();
     let mut empty_previous = ScanIndex::default();
     empty_previous.generation = committed.generation;
+    empty_previous.retain_persistence_baseline_from(&committed);
     let saved = checkpoint_partial_snapshot_index(
         &working,
         &empty_previous,
@@ -1279,7 +1294,7 @@ fn complete_census_retires_never_committed_vanished_acks_after_partial_error() {
         .accepted_fingerprints
         .contains(&first.snapshot_fingerprint));
     std::fs::remove_file(f.sources.join("held.jsonl")).unwrap();
-    let (previous, progress) = f.load();
+    let (previous, progress) = f.load_native();
     let mut scanned = previous.clone();
     let scan = AckFixture::scan(&f.sources, &mut scanned);
     assert!(scan.census_complete);
@@ -1302,11 +1317,11 @@ fn complete_census_retires_never_committed_vanished_acks_after_partial_error() {
     assert!(progress.saved_retirement_candidates(&scanned).is_empty());
     scanned.save_fixture(&f.index_path).unwrap();
     drop((scanned, progress)); // ordinary error/return after the index save
-    let (mut saved, mut progress) = f.load();
+    let (mut saved, mut progress) = f.load_native();
     progress
         .recover_ack_retirement_handoff(&mut saved, &f.index_path, &f.progress_path)
         .unwrap();
-    assert!(f.load().1.accepted_fingerprints.is_empty());
+    assert!(f.load_native().1.accepted_fingerprints.is_empty());
 }
 
 #[test]

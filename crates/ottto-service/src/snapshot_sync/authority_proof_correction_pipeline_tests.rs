@@ -183,7 +183,7 @@ impl ApcFixture {
         let fixture = Self {
             case,
             index_path: base.join("claude-scan-index.json"),
-            progress_path: base.join("claude-upload-progress.json"),
+            progress_path: snapshot_upload_progress_path(&base.join("claude-scan-index.json")),
             base,
             root,
             support,
@@ -426,7 +426,8 @@ impl ApcFixture {
 
     fn page_born(&self, collected_at: &str, upload: ApcUpload) -> ApcPage {
         let before_bytes = std::fs::read(&self.index_path).unwrap_or_default();
-        let before = ScanIndex::load(&self.index_path).expect("load scan index");
+        let mut before = ScanIndex::load(&self.index_path).expect("load scan index");
+        crate::snapshots::e2_pipeline_scan_fixture::age_listing_for_test(&mut before);
         let mut index = before.clone();
         // As the service's source prepare: the context also binds the index's
         // quarantine witness, so refused bodies hold instead of re-reading.
@@ -480,7 +481,9 @@ impl ApcFixture {
         );
         assert_eq!(serde_json::to_vec(&cutoff_state).unwrap(), cutoff_bytes);
         let empty_progress = test_upload_progress();
-        let mut progress = SnapshotUploadProgress::load(
+        let mut progress = SnapshotUploadProgress::load_for_index(
+            &index,
+            &self.index_path,
             &self.progress_path,
             &empty_progress.destination_namespace_hash,
             crate::snapshots::snapshot_quarantine_witness_for_context(
@@ -585,7 +588,7 @@ impl ApcFixture {
         let mut offered = BTreeSet::new();
         let mut uploaded = BTreeSet::new();
         let mut accepted = 0;
-        let persist_refusal = self.progress_path.exists()
+        let persist_refusal = progress.rows.is_some()
             || matches!(
                 upload,
                 ApcUpload::PermanentRejection | ApcUpload::RetryableRejection
@@ -703,9 +706,7 @@ impl ApcFixture {
                 body_drains,
             )
             .expect("checkpoint shed page");
-            if !persist_refusal {
-                let _ = std::fs::remove_file(&self.progress_path);
-            }
+
             return ApcPage {
                 upload,
                 scan,
@@ -2388,11 +2389,17 @@ fn controlled_unbound_record_rearms_its_family_and_reforms_bound() {
             .unwrap_or_else(|| "5".repeat(64));
         value["files"][&key]["source_file_fingerprint"] = serde_json::json!(revision);
     }
-    value["claude_usage_authority_quarantine"][APC_ROOT]["proven_witness_fingerprint"] =
-        serde_json::json!("9".repeat(64));
-    crate::snapshots::e2_pipeline_scan_fixture::seed_json_for_test(
+    let seeded = crate::snapshots::e2_pipeline_scan_fixture::seed_json_for_test(
         &fixture.index_path,
         &serde_json::to_vec(&value).unwrap(),
+    );
+    crate::snapshots::state_v2::money_test_support::edit_record_for_test(
+        &seeded,
+        "refusal.authority",
+        APC_ROOT,
+        |record| {
+            record["proven_witness_fingerprint"] = serde_json::json!("9".repeat(64));
+        },
     );
 
     let (drops, rearmed) = crate::snapshots::claude_authority_drops_for_test();
