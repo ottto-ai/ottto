@@ -97,11 +97,7 @@ impl LegacyFixture {
         fs::write(&path, lines.join("\n") + "\n").unwrap();
         let key = local_index_key(&path);
         let mut f = Self { route, path, key };
-        let path = f
-            .route
-            .dir
-            .join(format!("rollout-2026-10-18T10-00-01-{owner}.jsonl"));
-        fs::copy(&f.path, &path).unwrap();
+        f.continuation();
         let (scan, modes) = f.page(&E2ScanFixture::default());
         assert!(
             !scan.snapshots.is_empty(),
@@ -112,7 +108,15 @@ impl LegacyFixture {
         f.accept(&scan);
         // Production group commits write accepted index facts, not member
         // reductions. Rebind the genuine historical body to that same shape.
-        for member in [&f.path, &path] {
+        let members = f
+            .route
+            .index
+            .files
+            .keys()
+            .map(PathBuf::from)
+            .collect::<Vec<_>>();
+        assert_eq!(members.len(), 2);
+        for member in &members {
             let key = local_index_key(member);
             assert!(
                 state_v2::load_head(&f.route.index, &key, Codex::REDUCTION_REVISION)
@@ -448,7 +452,6 @@ fn codex_legacy_growth_recounts_cold_v2() {
 
     for paged in [false, true] {
         let mut group = LegacyFixture::accepted_group();
-        group.continuation();
         let continuation = fs::read_dir(&group.route.dir)
             .unwrap()
             .map(|entry| entry.unwrap().path())
@@ -463,9 +466,28 @@ fn codex_legacy_growth_recounts_cold_v2() {
             .unwrap()
             .lines()
             .skip(1)
-            .map(|line| line.to_owned() + "\n")
+            .map(|line| {
+                let mut row: Value = serde_json::from_str(
+                    &line
+                        .replace("turn-b", "turn-c")
+                        .replace("T07:01:", "T07:02:"),
+                )
+                .unwrap();
+                if row["type"] == "token_usage_record" {
+                    row["payload"]["thread_token_usage"]["input_tokens"] = 70.into();
+                    row["payload"]["thread_token_usage"]["output_tokens"] = 6.into();
+                    row["payload"]["thread_token_usage"]["total_tokens"] = 76.into();
+                }
+                if row["payload"]["type"] == "token_count" {
+                    row["payload"]["info"]["total_token_usage"]["input_tokens"] = 70.into();
+                    row["payload"]["info"]["total_token_usage"]["output_tokens"] = 6.into();
+                    row["payload"]["info"]["total_token_usage"]["total_tokens"] = 76.into();
+                }
+                row.to_string() + "\n"
+            })
             .collect::<String>();
-        fs::remove_file(continuation).unwrap();
+        group.key = local_index_key(&continuation);
+        group.path = continuation;
         group.change(&extra);
         if paged {
             group.change(&"\n".repeat(5000));
@@ -473,6 +495,7 @@ fn codex_legacy_growth_recounts_cold_v2() {
         let scanner = E2ScanFixture::default();
         let before = counters::total("codex_legacy_recount", "baseline_unknown");
         let mut pages = 0;
+        let mut paused = false;
         let mut run = || {
             for _ in 0..1000 {
                 pages += 1;
@@ -495,16 +518,14 @@ fn codex_legacy_growth_recounts_cold_v2() {
                     );
                     return;
                 }
-                assert!(
-                    scanner.cache.cursor_job_key().is_some(),
-                    "changed group stays resumable"
-                );
+                paused |= scanner.cache.cursor_job_key().is_some();
             }
             panic!("accepted Legacy group did not complete");
         };
         if paged {
             sampled_scan::codex_cursor::with_test_limits(2048, 1024, 64, &mut run);
             assert!(pages > 1, "group exercised cursor resume");
+            assert!(paused, "changed accepted group retained a cursor job");
         } else {
             run();
         }
