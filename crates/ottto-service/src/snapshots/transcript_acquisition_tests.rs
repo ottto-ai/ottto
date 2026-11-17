@@ -12,15 +12,8 @@ static NEXT: AtomicU64 = AtomicU64::new(0);
 struct Fixture(PathBuf);
 impl Fixture {
     fn new(source: SnapshotSource) -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "ottto-native-tail-{}-{}-{}.jsonl",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-            NEXT.fetch_add(1, AtomicOrdering::Relaxed)
-        ));
+        // Canonical: state v2 refuses a store beneath a symlinked ancestor.
+        let path = crate::test_scratch::unique_path("ottto-native-tail").with_extension("jsonl");
         let value = match source {
             SnapshotSource::Codex => {
                 json!({"type":"session_meta","payload":{"id":"native-tail-fixture"}})
@@ -1178,11 +1171,7 @@ fn sampled_production_both_scanners_reuse_native_state_and_full_audit_survives_r
         let key = local_index_key(&fixture.file.0);
         let due = index.files[&key].unverified_deadline().unwrap();
         let index_path = fixture.dir.join("index.json");
-        crate::snapshots::e2_pipeline_scan_fixture::save_for_source_test(
-            &mut index,
-            &index_path,
-            source,
-        );
+        crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut index, &index_path);
         // RAM loss: a restart keeps only the state database.
         let restarted = Arc::new(sampled_scan::SharedCache::default());
         *restarted.test_route.lock().unwrap() = cache.test_route.lock().unwrap().take();

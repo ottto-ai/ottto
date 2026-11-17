@@ -257,10 +257,9 @@ impl ProofChain {
             self.enrich(&mut index, &mut scan);
         }
         self.accept(&mut index, &mut scan);
-        // The metadata CLI reads a legacy view; the owner's commit and its
-        // native copy stay beside it.
-        fixture::save_for_test(&mut index, &self.home.join("native-scan-index.json"));
-        fixture::legacy_view_for_test(&index, &self.home.join("scan-index.json"));
+        let view = self.home.join("scan-index.json");
+        fixture::save_owner_for_test(SnapshotSource::ClaudeCode, &mut index, &view);
+        fixture::legacy_view_for_test(&index, &view);
         let items = scan.snapshots;
         assert!(items.iter().map(|item| item.request_count).sum::<u64>() > 7);
         (index, items)
@@ -321,8 +320,6 @@ fn retired_unchanged_holder_authorized_reread_removes_prefix_once() {
             (1, Some(2))
         );
         chain.accept(&mut index, &mut recovered);
-        // The restart reloads its own native custody; the later CLI
-        // publication reads the legacy view.
         let restart = chain.home.join("restart-scan-index.json");
         fixture::save_for_test(&mut index, &restart);
         fixture::legacy_view_for_test(&index, &chain.home.join("scan-index.json"));
@@ -401,7 +398,6 @@ fn copy_prefix_proof_recovery_totals_and_placement() {
         let (mut index, prior) = chain.residue();
         publish(&chain.home, &chain.support, false);
         chain.prepare(&mut index);
-        // The restart reloads its own native custody, apart from the CLI view.
         let restart = chain.home.join("restart-scan-index.json");
         fixture::save_for_test(&mut index, &restart);
         let mut index = ScanIndex::load(&restart).unwrap();

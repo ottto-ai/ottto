@@ -58,14 +58,12 @@ impl ScanIndex {
         path: &Path,
         source: SnapshotSource,
     ) -> Result<()> {
-        if scan_index_integration::scan_index_storage_binding(path).is_none() {
-            insert_fixture_binding(path, persistence_source(source));
-        }
+        bind_source_for_test(path, source);
         self.save_fixture(path)
     }
 }
 
-fn persistence_source(source: SnapshotSource) -> scan_index_persistence::Source {
+pub(crate) fn persistence_source(source: SnapshotSource) -> scan_index_persistence::Source {
     match source {
         SnapshotSource::ClaudeCode => scan_index_persistence::Source::Claude,
         SnapshotSource::Codex => scan_index_persistence::Source::Codex,
@@ -83,17 +81,12 @@ fn insert_fixture_binding(path: &Path, source: scan_index_persistence::Source) {
     );
 }
 
-/// Bind `path` to `source`; a path already bound must name that source.
+/// Bind an unbound `path` to `source`; a bound path must already name it.
 pub(crate) fn bind_source_for_test(path: &Path, source: SnapshotSource) {
-    match scan_index_integration::scan_index_storage_binding(path) {
-        Some(binding) => assert_eq!(
-            binding.source.snapshot(),
-            source,
-            "{} is bound to another source",
-            path.display()
-        ),
-        None => insert_fixture_binding(path, persistence_source(source)),
+    if scan_index_integration::scan_index_storage_binding(path).is_none() {
+        insert_fixture_binding(path, persistence_source(source));
     }
+    assert_route_source(path, source);
 }
 
 /// A reused fixture route must hold `source`'s graph.
@@ -771,35 +764,31 @@ pub(crate) fn bind_fixture_route(
 }
 
 /// Commit on the owner's native route, then publish a detached copy as
-/// generation 1 of its own store at `path`. The copy has no continuation;
-/// another owner must read changed input Full. The source is the owner
-/// route's, else the active witness's, else the file name's.
+/// generation 1 of a new store at `path`, which must not be the owner's own.
+/// The copy has no continuation; another owner must read changed input Full.
 pub(crate) fn save_for_test(index: &mut ScanIndex, path: &Path) {
     let source = fixture_source(index, path).snapshot();
-    save_for_source_test(index, path, source);
-}
-
-/// `save_for_test` of a `source` graph.
-pub(crate) fn save_for_source_test(index: &mut ScanIndex, path: &Path, source: SnapshotSource) {
-    if let Some(route) = route_of(index) {
-        assert_route_source(&route, source);
-        if same_location(&route, path) {
-            // A graph reloaded from `path` restarts as its own owner, as a
-            // plain checkpoint read back did.
-            index.v2_mut().persistence_v2 = None;
-        }
-    }
-    let route = bind_fixture_route(source, index, path.parent().unwrap(), &"a".repeat(64));
-    save_on_route(index, &route).unwrap();
+    let route = save_owner_for_test(source, index, path);
     assert!(
         !same_location(&route, path),
-        "the detached copy never replaces its owner's custody"
+        "a detached copy never replaces its owner's custody"
     );
     let mut copy = detached_copy(index);
     copy.generation = 0;
     bind_source_for_test(path, source);
-    let loaded = seed_index_at_generation(&copy, path, Some(1));
-    assert_eq!(loaded.generation, 1, "the copy is its store's first commit");
+    seed_index_for_test(&copy, path);
+}
+
+/// Commit on this owner's native route; an unrouted seed is first attached to
+/// an empty `source` store beside `path`.
+pub(crate) fn save_owner_for_test(
+    source: SnapshotSource,
+    index: &mut ScanIndex,
+    path: &Path,
+) -> PathBuf {
+    let route = bind_fixture_route(source, index, path.parent().unwrap(), &"a".repeat(64));
+    save_on_route(index, &route).unwrap();
+    route
 }
 
 /// The legacy JSON view of `index` at `path`, for readers whose subject is old
@@ -835,13 +824,7 @@ fn same_location(a: &Path, b: &Path) -> bool {
 /// attached to an empty store under the supplied fixture directory.
 pub(crate) fn save_reload_for_test(index: &mut ScanIndex, path: &Path) -> ScanIndex {
     let was_routed = route_of(index).is_some();
-    let route = bind_fixture_route(
-        SnapshotSource::ClaudeCode,
-        index,
-        path.parent().unwrap(),
-        &"a".repeat(64),
-    );
-    save_on_route(index, &route).unwrap();
+    let route = save_owner_for_test(SnapshotSource::ClaudeCode, index, path);
     let mut loaded = ScanIndex::load(&route).unwrap();
     if was_routed {
         carry_runtime(index, &mut loaded);
