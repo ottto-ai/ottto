@@ -976,6 +976,9 @@ fn retirement_handoff_recovers_acks_after_index_commit_and_cleanup_save_failures
             // Native rows compare the stored generation only when a page
             // writes: an unchanged page opens no transaction. Give the stale
             // ledger a page so its barrier save reaches the generation check.
+            // This proves a stale ledger with a page refuses, not a stale
+            // no-op; native writers are process-exclusive, so a concurrent
+            // no-op writer cannot occur in production.
             progress
                 .accepted_cache_heads
                 .insert(cache_session_key("stale"), "d".repeat(64));
