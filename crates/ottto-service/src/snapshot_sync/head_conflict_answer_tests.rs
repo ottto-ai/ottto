@@ -1269,7 +1269,7 @@ fn assert_rescan_claim(wire: &Value, answered: bool) {
     }
 }
 
-/// [money] D142(a) on the POSTed envelope: only the upload of a session that
+/// [money] On the POSTed envelope: only the upload of a session that
 /// owes an answer carries the rescan claim, and that session is mirrored
 /// into the scan index, so the body was read by a native Full. Before the
 /// conflict and after the answer the session is not mirrored, so its files

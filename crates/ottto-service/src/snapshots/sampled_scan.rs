@@ -259,7 +259,7 @@ pub(super) struct Active {
     pub(super) mode: ReadMode,
     pub(super) audit_due: Option<u64>,
     /// This read is a protected-tier replay: a non-Full read found protected
-    /// tiers and re-reads the file from its start (D168 `tier_prefix_replay`).
+    /// tiers and re-reads the file from its start (`tier_prefix_replay`).
     pub(super) tier_prefix_replay: bool,
     pub(super) census_base_bound: bool,
     pub(super) resident_loaded_bytes: u64,

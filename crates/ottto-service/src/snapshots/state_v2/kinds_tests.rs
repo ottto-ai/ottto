@@ -1246,7 +1246,7 @@ fn retired_codex_kinds_cross_old_new_old_new_without_a_rebuild() {
         super::save_graph(&mut db, &identity, before, &mut upgraded, &mut cx).unwrap();
         expected.generation = upgraded.generation;
         assert_persisted(&mut db, &expected);
-        // D59: a previous reader HOLDs when its required root is absent.
+        // A previous reader HOLDs when its required root is absent.
         // A later old writer can restore its original rows before the next upgrade.
         let mut tx = db.begin(TxnMode::Read).unwrap();
         for (field, mode, _, empty) in &rows {

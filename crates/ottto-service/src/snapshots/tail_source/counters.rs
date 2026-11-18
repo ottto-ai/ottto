@@ -43,7 +43,7 @@ pub(in crate::snapshots) fn add(
     });
 }
 
-/// A D168 replay: a counted read from a file's start, never a load outcome.
+/// A from-start replay: a counted read from a file's start, never a load outcome.
 #[derive(Clone, Copy)]
 pub(in crate::snapshots) enum Replay {
     /// A Codex group read from its first member.
@@ -53,7 +53,7 @@ pub(in crate::snapshots) enum Replay {
     TierPrefix,
 }
 
-/// One executed D168 replay on the reconstruction counters, with the bytes
+/// One executed from-start replay on the reconstruction counters, with the bytes
 /// the replay read. A replay is no failure after a head: it is not in
 /// `tail_reconstruct_after_head`. Its bytes are also in the page's
 /// `completed_full_native_bytes`, as every Full's.

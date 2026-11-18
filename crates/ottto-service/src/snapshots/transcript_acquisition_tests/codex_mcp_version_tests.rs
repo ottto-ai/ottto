@@ -255,7 +255,7 @@ fn tier_replay_publishes_twice_without_losing_the_winner() {
     });
     assert_eq!(modes, (1, 1, 0), "real Tail followed by TierReplay Full");
     // The Full is the protected-tier replay: counted once, with the bytes it
-    // re-read from the file's start (D168 `tier_prefix_replay`).
+    // re-read from the file's start (`tier_prefix_replay`).
     assert_eq!(replays("tail_reconstruct"), before.0 + 1);
     let read = replays("tail_reconstruct_bytes") - before.1;
     assert!(read > 0 && read <= fs::metadata(&f.file.0).unwrap().len());
