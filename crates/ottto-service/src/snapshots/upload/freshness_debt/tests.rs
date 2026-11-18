@@ -173,14 +173,30 @@ pub(in crate::snapshots) struct Fixture {
 }
 impl Fixture {
     pub(in crate::snapshots) fn new(store: Source, name: &str) -> Self {
+        Self::at_destination(store, name, &"a".repeat(64))
+    }
+    /// A fixture whose Tail route is bound to the `destination` namespace.
+    fn at_destination(store: Source, name: &str, destination: &str) -> Self {
         restart();
         let dir = crate::test_scratch::canonical_private_dir(name);
         let root = dir.join("root");
         std::fs::create_dir_all(&root).unwrap();
-        let (session, index) = crate::snapshots::StateV2ColdSession::publish(
-            store,
+        let progress = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 3,
+            "destination_namespace_hash": destination,
+        }))
+        .unwrap();
+        let route = dir
+            .join("store/snapshots/destinations")
+            .join(destination)
+            .join(format!(
+                "{}-synthetic-scan-index.json",
+                store.snapshot().api_slug()
+            ));
+        let (session, index) = crate::snapshots::StateV2ColdSession::publish_at(
             &ScanIndex::default(),
-            &dir.join("store"),
+            &route,
+            &progress,
         );
         Self {
             index,
@@ -1105,11 +1121,20 @@ fn usage_identical_file(f: &mut Fixture, entities: &[String], body: &str) -> Pat
     path
 }
 
+/// The destination namespace the index's Tail route is bound to.
+fn destination(index: &ScanIndex) -> String {
+    let route = state_v2::tail_route_path(index).unwrap().unwrap();
+    crate::snapshots::scan_index_integration::scan_index_storage_binding(&route)
+        .unwrap()
+        .namespace_hash
+}
+
 /// The note `hold_unstored_body` leaves for a `usage_identical` answer, in
-/// the index's own upload context and replay generation.
+/// the index's own destination, upload context and replay generation.
 fn note(index: &ScanIndex, entity: &str, body: &str) {
     money_freshness::note_usage_identical(
         entity,
+        &destination(index),
         CONTEXT,
         index.historical_replay_generation.as_deref(),
         body,
@@ -1124,7 +1149,7 @@ fn note(index: &ScanIndex, entity: &str, body: &str) {
 #[test]
 fn usage_identical_note_retires_only_its_exact_one_entity_body() {
     type Case = fn(&mut ScanIndex, &str, &str);
-    let cases: [(&str, usize, bool, Case); 9] = [
+    let cases: [(&str, usize, bool, Case); 10] = [
         ("noted", 1, true, |index, entity, body| {
             note(index, entity, body)
         }),
@@ -1150,17 +1175,33 @@ fn usage_identical_note_retires_only_its_exact_one_entity_body() {
             |index, entity, body| {
                 money_freshness::note_usage_identical(
                     entity,
+                    &destination(index),
                     "another-account-context",
                     index.historical_replay_generation.as_deref(),
                     body,
                 )
             },
         ),
-        ("another replay generation", 1, false, |_, entity, body| {
+        (
+            "another replay generation",
+            1,
+            false,
+            |index, entity, body| {
+                money_freshness::note_usage_identical(
+                    entity,
+                    &destination(index),
+                    CONTEXT,
+                    Some("another-replay-generation"),
+                    body,
+                )
+            },
+        ),
+        ("another destination", 1, false, |index, entity, body| {
             money_freshness::note_usage_identical(
                 entity,
+                &hex(0xd),
                 CONTEXT,
-                Some("another-replay-generation"),
+                index.historical_replay_generation.as_deref(),
                 body,
             )
         }),
@@ -1241,6 +1282,41 @@ fn usage_identical_note_retires_only_its_exact_one_entity_body() {
             .is_none());
         f.close();
     }
+}
+
+/// [regress] [money] Two destinations of one account share the upload
+/// context, and neither has a replay generation. Destination A's
+/// `usage_identical` answer clears A's file only: B holds the same entity and
+/// exact body terminally, with the same file witness, and stays held.
+#[test]
+fn usage_identical_note_of_one_destination_leaves_another_held() {
+    let entity = hex(1);
+    let body = hex(0xb1);
+    let mut a = Fixture::at_destination(Source::Claude, "usage-identical-a", &hex(0xa));
+    let mut b = Fixture::at_destination(Source::Claude, "usage-identical-b", &hex(0xb));
+    let mut paths = Vec::new();
+    for f in [&mut a, &mut b] {
+        paths.push(usage_identical_file(
+            f,
+            std::slice::from_ref(&entity),
+            &body,
+        ));
+        assert_eq!(f.walk()["debt"]["outstanding_files"], 1);
+        f.save();
+        f.index
+            .activate_file_upload_context(f.source, CONTEXT.into());
+        assert_eq!(f.index.historical_replay_generation, None);
+    }
+    assert_eq!(destination(&a.index), hex(0xa));
+    assert_eq!(destination(&b.index), hex(0xb));
+    note(&a.index, &entity, &body);
+    for (f, path, retired) in [(&mut a, &paths[0], true), (&mut b, &paths[1], false)] {
+        assert_eq!(f.walk()["debt"]["outstanding_files"], u64::from(!retired));
+        f.save();
+        assert_eq!(committed(&f.index, path).is_empty(), retired);
+    }
+    a.close();
+    b.close();
 }
 
 /// [regress] The note lives in this process only. Cleared and saved, a file

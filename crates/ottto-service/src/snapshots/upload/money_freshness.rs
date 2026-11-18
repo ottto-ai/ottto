@@ -78,6 +78,7 @@ const NO_WALKS: Walks = Walks {
 
 /// The scope an answer was given in, and the exact body it was given for.
 struct UsageIdentical {
+    destination: String,
     context: String,
     replay: Option<String>,
     body: String,
@@ -85,10 +86,18 @@ struct UsageIdentical {
 
 /// The server answered `usage_identical` for `entity`'s exact `body`: its head
 /// already holds this usage, though it stored nothing, so no receipt exists.
-/// The upload context and the historical replay generation (whose name
-/// carries the destination) scope the note. Process-local: a restart forgets it; nothing is stored.
-pub(crate) fn note_usage_identical(entity: &str, context: &str, replay: Option<&str>, body: &str) {
+/// The destination namespace, the upload context and the historical replay
+/// generation scope the note. Process-local: a restart forgets it; nothing is
+/// stored.
+pub(crate) fn note_usage_identical(
+    entity: &str,
+    destination: &str,
+    context: &str,
+    replay: Option<&str>,
+    body: &str,
+) {
     let note = UsageIdentical {
+        destination: destination.to_string(),
         context: context.to_string(),
         replay: replay.map(str::to_string),
         body: body.to_string(),
@@ -101,15 +110,20 @@ pub(crate) fn forget_usage_identical(entity: &str) {
     with_walks(|walks| walks.usage_identical.remove(entity));
 }
 
-/// `entity`'s noted body in this upload context and replay generation.
+/// `entity`'s noted body in this destination, upload context and replay
+/// generation.
 pub(in crate::snapshots) fn usage_identical_body(
     entity: &str,
+    destination: &str,
     context: &str,
     replay: Option<&str>,
 ) -> Option<String> {
     with_walks(|walks| {
         let note = walks.usage_identical.get(entity)?;
-        (note.context == context && note.replay.as_deref() == replay).then(|| note.body.clone())
+        (note.destination == destination
+            && note.context == context
+            && note.replay.as_deref() == replay)
+            .then(|| note.body.clone())
     })
 }
 

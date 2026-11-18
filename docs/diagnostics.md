@@ -2454,7 +2454,8 @@ the server already holds that body's usage. The daemon then holds the exact body
 terminally at once, so it is not offered again (a current-context re-offer
 answered `dominated_by_head` keeps its 6 h, then 12 h retry). For a file with one
 entity, the walk retires the read prefix as a receipt would, while the index
-still holds that body under the same upload context and replay generation. The
+still holds that body under the same destination, upload context and replay
+generation. The
 answer is kept in process memory only: a restart before the walk that lists
 the file leaves its debt held until the file changes. A rewritten file folds its old debt into the
 new object with the earliest time. Compressed Codex extents count by compressed size, and

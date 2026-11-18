@@ -1395,6 +1395,7 @@ impl SnapshotUploadProgress {
             if usage_identical && let Some(context) = &self.context_resend.active {
                 crate::snapshots::money_freshness::note_usage_identical(
                     fingerprint,
+                    &self.destination_namespace_hash,
                     context,
                     self.historical_replay_generation.as_deref(),
                     body_witness,
