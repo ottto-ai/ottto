@@ -72,9 +72,9 @@ use kinds::KindCx;
     reason = "the acquisition cutover consumes this staged route"
 )]
 pub(in crate::snapshots) use runtime::tail_route::{
-    carried_sessions, carry_tail, erase_tail, legacy_archive_was_seen, load_head, load_revisions,
-    load_tail, observe_tail, observe_tails, retire_tail, set_aside_tail, stage_tail,
-    tail_head_keys, tail_route_path, tail_set_aside, take_head_writes, unstage_tail,
+    carried_sessions, carry_tail, erase_tail, load_head, load_revisions, load_tail, observe_tail,
+    observe_tails, retire_tail, set_aside_tail, stage_tail, tail_head_keys, tail_route_path,
+    tail_set_aside, take_head_writes, unstage_tail,
 };
 #[cfg(test)]
 pub(in crate::snapshots) use runtime::tail_route::{staged_head_for_test, LOAD_HEAD_CALLS};
@@ -665,5 +665,24 @@ pub(in crate::snapshots) fn seed_0217_archive_for_test(index: &ScanIndex, key: &
             tx.commit(index.generation, index.generation + 1),
             DurableCommitOutcome::Committed(index.generation + 1)
         );
+    });
+}
+
+#[cfg(test)]
+pub(in crate::snapshots) fn assert_0217_archive_rows_for_test(
+    index: &ScanIndex,
+    key: &str,
+    present: bool,
+) {
+    runtime::with_session_db(index, |db| {
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        for (kind, member, position) in [
+            ("v1_field.archives", "", 0),
+            ("v1_field.archives", key, 1),
+            ("v1_field.archive_deferred_alarm_count", "", 0),
+        ] {
+            let row = mapper::key(kind, member, position).unwrap();
+            assert_eq!(tx.get(&row).unwrap().is_some(), present, "{row:?}");
+        }
     });
 }
