@@ -172,12 +172,23 @@ fn selected_page(
     replacement: bool,
 ) -> (Result<ResumableUploadResult>, Vec<Value>) {
     let root = crate::test_scratch::ScratchDir::new("head-conflict-cycle");
-    let path = root.join("progress.json");
-    // Each call starts from this view, then saves at the real page boundary.
+    let native_index = progress
+        .rows
+        .as_ref()
+        .map(|rows| rows.index_path_for_test().to_owned());
+    let path = native_index
+        .as_deref()
+        .map(snapshot_upload_progress_path)
+        .unwrap_or_else(|| root.join("progress.json"));
+    // A bound ledger keeps its actual native baseline. An isolated fixture
+    // still starts from this view, then saves at the real page boundary.
     let mut durable = progress.clone();
-    durable.generation = 0;
+    if native_index.is_none() {
+        durable.generation = 0;
+    }
     durable.save_fixture(&path).unwrap();
     progress.generation = durable.generation;
+    progress.rows = durable.rows;
     let mut items = items.to_vec();
     for item in &mut items {
         item.cache_base_head_etag = progress
@@ -216,11 +227,20 @@ fn selected_page(
         |state| state.save_fixture(&path),
     );
     if result.is_ok() {
-        let restored = SnapshotUploadProgress::load(
-            &path,
-            &progress.destination_namespace_hash,
-            snapshot_quarantine_witness(SnapshotSource::Codex),
-        )
+        let restored = match native_index {
+            Some(index_path) => SnapshotUploadProgress::load_for_index(
+                &ScanIndex::load(&index_path).unwrap(),
+                &index_path,
+                &path,
+                &progress.destination_namespace_hash,
+                progress.active_quarantine_witness.clone().unwrap(),
+            ),
+            None => SnapshotUploadProgress::load(
+                &path,
+                &progress.destination_namespace_hash,
+                snapshot_quarantine_witness(SnapshotSource::Codex),
+            ),
+        }
         .unwrap();
         assert_eq!(
             restored.head_conflict_challenges,
