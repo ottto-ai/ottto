@@ -3725,6 +3725,8 @@ fn retired_codex_field(field: &str) -> bool {
         field,
         "archives"
             | "archive_deferred_alarm_count"
+            | "codex_counting_tombstones"
+            | "codex_counting_evicted_legacy"
             | "codex_parent_ownership_refs"
             | "codex_parent_ownership_ledgers"
             | "codex_parent_side_requests"

@@ -38,7 +38,7 @@ fn revert_archives(c: &Corpus, second_account: &str) -> Vec<PathBuf> {
 #[test]
 fn combined_codex_ack_recovers_every_member_and_quiet_restarts_read_zero_bytes() {
     let _decoder = fixture::codex_decoder_test_lock();
-    let _cutover = crate::snapshots::TestCutover::set(i64::MAX);
+
     let mut c = Corpus::new("codex-combined-ack-restart");
     c.base = c.base.canonicalize().unwrap();
     c.root = c.base.join("projects");
@@ -299,7 +299,7 @@ fn combined_codex_ack_recovers_every_member_and_quiet_restarts_read_zero_bytes()
 #[test]
 fn combined_codex_account_switch_holds_without_request_evidence() {
     let _decoder = fixture::codex_decoder_test_lock();
-    let _cutover = crate::snapshots::TestCutover::set(i64::MAX);
+
     let c = Corpus::new("codex-combined-account-switch");
     revert_archives(&c, "b");
     let original_account =
@@ -340,7 +340,7 @@ fn combined_codex_account_switch_holds_without_request_evidence() {
 #[test]
 fn codex_group_capture_commits_on_its_state_store_after_first_load_rearm() {
     let _decoder = fixture::codex_decoder_test_lock();
-    let _cutover = crate::snapshots::TestCutover::set(i64::MAX);
+
     let mut c = Corpus::new("codex-group-capture-state-store");
     c.base = c.base.canonicalize().unwrap();
     c.root = c.base.join("projects");
@@ -494,7 +494,7 @@ fn codex_group_finish_uploads_after_its_capture_on_a_state_store() {
     const DEVICE: &str = "codex-finish-guard-device";
     const SECRET: &str = "device-secret";
     let _decoder = fixture::codex_decoder_test_lock();
-    let _cutover = crate::snapshots::TestCutover::set(i64::MAX);
+
     crate::snapshot_sync::forget_carried_namespaces_for_test(&[DEVICE]);
     let mut c = Corpus::new("codex-group-finish-state-store");
     c.base = c.base.canonicalize().unwrap();
@@ -749,7 +749,7 @@ fn original_pair() -> (String, String) {
 #[test]
 fn uncertified_revert_header_with_the_original_pair_folds_one_body() {
     let _decoder = fixture::codex_decoder_test_lock();
-    let _cutover = crate::snapshots::TestCutover::set(i64::MAX);
+
     let mut c = Corpus::new("codex-uncertified-revert-fold");
     c.base = c.base.canonicalize().unwrap();
     c.root = c.base.join("projects");
@@ -958,7 +958,7 @@ fn uncertified_revert_header_with_the_original_pair_folds_one_body() {
 #[test]
 fn uncertified_revert_header_without_the_original_pair_holds() {
     let _decoder = fixture::codex_decoder_test_lock();
-    let _cutover = crate::snapshots::TestCutover::set(i64::MAX);
+
     let (account, workspace) = original_pair();
     for (tag, second, strip) in [("different", "b", false), ("missing", "a", true)] {
         let c = Corpus::new(&format!("codex-uncertified-revert-{tag}"));
@@ -1003,7 +1003,7 @@ fn uncertified_revert_header_without_the_original_pair_holds() {
 #[test]
 fn uncertified_revert_folds_untagged_when_the_saved_account_differs() {
     let _decoder = fixture::codex_decoder_test_lock();
-    let _cutover = crate::snapshots::TestCutover::set(i64::MAX);
+
     let c = Corpus::new("codex-uncertified-revert-other-binding");
     let paths = revert_archives(&c, "a");
     edit_revert_header(&paths[1], |header| header["ordinal"] = json!(1));
@@ -1141,7 +1141,7 @@ fn fork_archives(c: &Corpus, turns: [u64; 2], copied: bool) -> Vec<PathBuf> {
 #[test]
 fn paginated_fork_revert_group_folds_one_summed_body() {
     let _decoder = fixture::codex_decoder_test_lock();
-    let _cutover = crate::snapshots::TestCutover::set(i64::MAX);
+
     let mut c = Corpus::new("codex-paginated-fork-revert-fold");
     c.base = c.base.canonicalize().unwrap();
     c.root = c.base.join("projects");
@@ -1296,7 +1296,7 @@ fn paginated_fork_revert_group_folds_one_summed_body() {
 #[test]
 fn paginated_fork_group_holds_on_other_parent_inline_or_copied_records() {
     let _decoder = fixture::codex_decoder_test_lock();
-    let _cutover = crate::snapshots::TestCutover::set(i64::MAX);
+
     let (account, workspace) = original_pair();
     for tag in ["other-parent", "inline", "copied"] {
         let c = Corpus::new(&format!("codex-paginated-fork-{tag}"));

@@ -51,6 +51,9 @@ impl ScanIndex {
         let key = local_index_key(&candidate.path);
         let file = open_candidate_beneath_root(candidate)?;
         let stat = file.metadata()?;
+        if sources::codex::counting::version::unchanged_legacy(self, &candidate.path) {
+            return Ok(Some((file, CandidateDecision::Skip, None)));
+        }
         match self.codex_physical_matches(&key, &stat)? {
             Some((true, head)) => {
                 let binding = Some(metadata.path_reduction_fingerprint(&candidate.path))

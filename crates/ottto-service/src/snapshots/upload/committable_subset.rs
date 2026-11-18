@@ -243,14 +243,6 @@ impl ScanIndex {
         );
         let mut result = ScanIndex {
             claude_money_birth_store,
-            codex_counting_moved_evidence: self.codex_counting_moved_evidence.clone(),
-            // The working map, bounded: its slots were freed only against the
-            // committed state this page loaded or by its eviction order, and a
-            // tombstone for a retirement this subset does not publish only
-            // repeats the evidence of the entry it keeps.
-            codex_counting_tombstones: self.codex_counting_tombstones.clone(),
-            codex_counting_evicted_legacy: self.codex_counting_evicted_legacy.clone(),
-            codex_counting_evictions: self.codex_counting_evictions,
             v2: previous.v2.as_ref().map(|state| {
                 Box::new(state_v2::IndexState {
                     persistence_v2: state.persistence_v2.clone(),
@@ -272,6 +264,8 @@ impl ScanIndex {
             retired_upload_context_fingerprint: serde::de::IgnoredAny,
             retired_archives: serde::de::IgnoredAny,
             retired_archive_deferred_alarm_count: serde::de::IgnoredAny,
+            retired_codex_counting_tombstones: serde::de::IgnoredAny,
+            retired_codex_counting_evicted_legacy: serde::de::IgnoredAny,
             retired_reread_guard: serde::de::IgnoredAny,
             files: files.into(),
             session_account_bindings: self.session_account_bindings.clone(),

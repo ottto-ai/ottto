@@ -339,8 +339,7 @@ pub(in crate::snapshots) struct SnapshotAccumulator {
     // already carries it; persisted only in the local durable-tail store.
     pub(in crate::snapshots) codex_observed_priority_turns: Option<BTreeMap<String, bool>>,
     pub(in crate::snapshots) codex_tier_replay: Option<codex_file_join::TierReplay>,
-    // Usage-counting V2 state. `None` (unconfigured) and a Legacy decision
-    // keep today's counting byte for byte.
+    // Every fresh Codex parse has V2 state; historical slots decode inertly.
     pub(in crate::snapshots) codex_counting: Option<Box<codex_usage_occurrence::CodexCounting>>,
     pub(in crate::snapshots) current_selector: SelectorCapture,
     pub(in crate::snapshots) session_cumulative_usage: Option<UsageTotals>,
@@ -984,37 +983,19 @@ impl SnapshotAccumulator {
         // Per-turn reasoning effort tier (Codex), attached to the same usage row.
         effort: Option<String>,
     ) -> Option<UsageTotals> {
-        if self.codex_counting_v2() {
-            return self.set_codex_v2_cumulative_usage(
-                model,
-                usage,
-                last_usage,
-                usage_event_identity,
-                selector,
-                timestamp,
-                implicit_request_count,
-                effort,
-            );
-        }
-        let (resolved_model, delta) = self.decide_codex_legacy_usage(
+        self.set_codex_v2_cumulative_usage(
             model,
             usage,
             last_usage,
             usage_event_identity,
-            timestamp,
-            implicit_request_count,
-        )?;
-        self.add_usage_with_selector(
-            Some(resolved_model),
-            delta.clone(),
             selector,
             timestamp,
+            implicit_request_count,
             effort,
-        );
-        Some(delta)
+        )
     }
 
-    /// Admission steps shared by the legacy and v2 decisions, in their
+    /// Admission steps for cumulative UI evidence, in their
     /// order: the model carries forward, an exact repeated usage event is
     /// skipped (`None`), a cumulative reset is counted and `usage` becomes
     /// the cumulative total. Returns the resolved model, the previous
@@ -1052,49 +1033,6 @@ impl SnapshotAccumulator {
         }
         let previous = self.session_cumulative_usage.replace(usage.clone());
         Some((resolved_model, previous, reset))
-    }
-
-    /// Admission only. The native caller owns publication; bounded replay
-    /// uses the same ordered state transition without constructing money rows.
-    fn decide_codex_legacy_usage(
-        &mut self,
-        model: Option<String>,
-        usage: UsageTotals,
-        last_usage: Option<UsageTotals>,
-        usage_event_identity: Option<String>,
-        timestamp: Option<&str>,
-        implicit_request_count: Option<u64>,
-    ) -> Option<(String, UsageTotals)> {
-        let (resolved_model, previous, reset) =
-            self.admit_codex_cumulative_usage(model, &usage, usage_event_identity)?;
-        // `last_token_usage` is Codex's exact current-response usage and stays
-        // correct across compaction/restart resets. Older rollouts lack it; in
-        // that case use a cumulative delta, beginning a new additive epoch on
-        // a reset. Never erase usage already accepted from the same rollout.
-        let mut delta = match &last_usage {
-            Some(last) => last.clone(),
-            None => match &previous {
-                Some(previous) if !reset => usage.delta_from(previous),
-                Some(_) | None => usage.clone(),
-            },
-        };
-        if !delta.is_zero() {
-            if let Some(count) = implicit_request_count {
-                delta.request_count = count;
-            }
-        }
-        if delta.is_zero() {
-            return None;
-        }
-        // The V2 equal-total repeat gate: a re-emitted line with the same
-        // `last` and total as the previous counted one is not a new request.
-        // Forward only: earlier lines count as they always did, and still
-        // set the tuple a later dated repeat is compared with.
-        let may_drop = dated_on_or_after(timestamp, CODEX_LEGACY_REPEAT_FROM_UNIX_SECONDS);
-        if self.codex_legacy_ui_repeat(last_usage, usage, &delta, may_drop) {
-            return None;
-        }
-        Some((resolved_model, delta))
     }
 }
 

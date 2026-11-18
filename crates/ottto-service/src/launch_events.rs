@@ -386,11 +386,6 @@ impl LaunchEventInventory {
     }
 
     #[cfg(test)]
-    pub(crate) fn expire_for_test(&self) {
-        self.lookup.lock().unwrap().loaded_at = Some(Instant::now() - INVENTORY_TTL);
-    }
-
-    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.lookup
             .lock()
