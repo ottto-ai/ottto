@@ -410,7 +410,6 @@ fn carry_runtime(from: &ScanIndex, into: &mut ScanIndex) {
     into.claude_reemission_exclusions = from.claude_reemission_exclusions.clone();
     into.copy_unproven_enabled = from.copy_unproven_enabled;
     into.copy_prefix_base_upload_context = from.copy_prefix_base_upload_context.clone();
-    into.codex_counting_moved_evidence = from.codex_counting_moved_evidence.clone();
     into.active_quarantine_witness = from.active_quarantine_witness.clone();
     into.active_upload_context_fingerprint = from.active_upload_context_fingerprint.clone();
     into.context_read_counts = from.context_read_counts.clone();
@@ -425,7 +424,6 @@ fn carry_runtime(from: &ScanIndex, into: &mut ScanIndex) {
     into.terminal_contract_retries = from.terminal_contract_retries.clone();
     into.head_conflict_sessions = from.head_conflict_sessions.clone();
     into.reason_reoffer_cooldowns = from.reason_reoffer_cooldowns.clone();
-    into.codex_counting_evictions = from.codex_counting_evictions;
     into.claude_no_list_policy = from.claude_no_list_policy;
     into.claude_history_emission = from.claude_history_emission.clone();
     into.withheld_memo = from.withheld_memo.clone();

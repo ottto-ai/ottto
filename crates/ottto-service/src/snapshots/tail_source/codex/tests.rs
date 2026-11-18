@@ -651,10 +651,7 @@ fn install_live_waits_on_missing_evidence_and_rebuilds_on_changed() {
     let live = SnapshotAccumulator::new(SnapshotSource::Codex);
 
     let mut stored = continuable();
-    stored.codex_counting = Some(Box::new(codex_usage_occurrence::CodexCounting::new(
-        sources::codex::counting::version::AckEvidence::None,
-        Some(1),
-    )));
+    stored.codex_counting = None;
     assert_eq!(
         install(&mut stored, &live),
         incompatible(INCOMPATIBLE_COUNTING_VERSION)
@@ -697,10 +694,7 @@ fn install_live_labels_each_incompatible_check() {
             stored.codex_sidecar_binding = Some("another binding".into());
         }),
         ("incompatible_counting_version", |stored, _| {
-            stored.codex_counting = Some(Box::new(codex_usage_occurrence::CodexCounting::new(
-                sources::codex::counting::version::AckEvidence::None,
-                Some(1),
-            )));
+            stored.codex_counting = None;
         }),
         ("incompatible_priority_witness", |stored, _| {
             stored.codex_observed_priority_turns = None;

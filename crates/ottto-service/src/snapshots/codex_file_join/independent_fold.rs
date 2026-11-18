@@ -5,11 +5,10 @@ pub(super) fn parser(
     file: File,
     member: &CandidateFile,
     metadata: &CodexTitleMetadata,
-    index: &ScanIndex,
     cache: Option<&Arc<sampled_scan::SharedCache>>,
 ) -> std::result::Result<Box<OwnedJsonlParser>, GroupEnd> {
     let input = OpenedInput::encoded(file, &member.path, cache).map_err(|_| GroupEnd::Strict)?;
-    let mut parser = OwnedJsonlParser::new_opened(
+    let parser = OwnedJsonlParser::new_opened(
         input,
         &member.path,
         SnapshotSource::Codex,
@@ -17,7 +16,7 @@ pub(super) fn parser(
         Some(metadata),
     )
     .map_err(|_| GroupEnd::Strict)?;
-    sources::codex::counting::version::configure_singleton(&mut parser, member, index);
+
     Ok(Box::new(parser))
 }
 
