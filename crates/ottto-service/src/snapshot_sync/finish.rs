@@ -2736,6 +2736,10 @@ pub(super) fn finish_sync_source(
         // reporting failure does not change the resolved transport outcome.
         return Ok(());
     } else {
+        // The receipt's own loss: an idle pass must never replace a disclosure.
+        let counts = SyncCounts::from_scan_result(&scan_result, accepted, receipt_window_days)
+            .with_snapshot_terminal_counts(&index);
+        let loss_free = !counts.has_disclosed_loss();
         report_status_with_fresh_relay_token(
             client,
             device,
@@ -2751,14 +2755,14 @@ pub(super) fn finish_sync_source(
                 source,
                 machine_id,
                 scan_started_at: terminal_scan_started_at,
-                counts: SyncCounts::from_scan_result(&scan_result, accepted, receipt_window_days)
-                    .with_snapshot_terminal_counts(&index),
+                counts,
                 state: CollectorState::Success,
             },
         )?;
         if let Some((pass, cycle_owed_nothing)) = walk_idle_pass {
             let now = crate::scan_clock::utc_seconds();
             let outside = cycle_owed_nothing
+                && loss_free
                 && upload_fully_settled
                 && super::prepare::upload_owes_nothing(
                     source,
