@@ -3010,7 +3010,7 @@ fn e2_pipeline_uncopied_guard_carried_accounts() {
 
 /// [money] A summed body's COPY mark never lets its counting carrier drop r1.
 #[test]
-fn equal_birth_carrier_never_grandfathers_its_counted_request() {
+fn equal_birth_carrier_never_drops_its_counted_request() {
     use crate::snapshots::claude_money_birth_store::location_key;
     use crate::snapshots::claude_request_census::claude_request_hash;
 
@@ -3114,7 +3114,6 @@ fn equal_birth_carrier_never_grandfathers_its_counted_request() {
                 .any(|(holder, hashes)| *holder == carrier_key
                     && hashes.binary_search(&r1_hash).is_ok()));
 
-            // Red on main without the counting-holder guard (CS1 run 43868949339).
             append(&carrier, &line(ROOT, "r2", own_at, 20));
             let grown = ready(&c, &scanner, prior.clone(), 100, false);
             literal(&grown);

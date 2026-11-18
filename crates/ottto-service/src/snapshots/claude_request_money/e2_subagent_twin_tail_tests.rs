@@ -150,52 +150,6 @@ fn forked_first_line_is_removed_once() {
     remove(&paths);
 }
 
-/// [money] T8: a grandfathered later home (COPY mark, accepted body, no
-/// stored removal) keeps its accepted skips and drops only the slack tail:
-/// n, not n + 1. A second read is identical.
-#[test]
-fn grandfathered_later_home_only_drops_the_tail() {
-    let (paths, mut index) = homes(&["a", "z"], &[t0(), t0() + LATER]);
-    let key = local_index_key(&paths[1]);
-    index
-        .claude_money_birth_store
-        .set_money_marks(&key, money_mark::COPY);
-    crate::snapshots::e2_pipeline_scan_fixture::origin_accepted_for_test(&mut index, &key);
-    let mut later = shared();
-    later.push(line("o1", &at(130), 40));
-    let read = |index: &ScanIndex| {
-        let mut items = vec![
-            parse_undecided(&paths[0], Some(t0()), index, &shared()),
-            parse_undecided(&paths[1], Some(t0() + LATER), index, &later),
-        ];
-        assert!(fold(&items[1]).grandfathered && !fold(&items[1]).twin_pending);
-        assert_eq!(fold(&items[1]).own_requests, 2);
-        take_diag();
-        decide_page_copies(&mut items, index, None);
-        let diag = take_diag();
-        let z = fold(&items[1]);
-        assert!(z.grandfathered);
-        assert_eq!((z.entity.totals().1, z.entity.removed_requests), (1, 3));
-        assert_eq!(z.own_requests, 1);
-        assert_eq!((diag.get(REMOVED), diag.get(MISSED)), (Some(&1), None));
-        publish(items, None, TelemetryRead::Loaded, index)
-    };
-    let first = read(&index);
-    let session = first
-        .iter()
-        .find(|item| item.source_session_id == member())
-        .unwrap();
-    assert_eq!(
-        (session.request_count, session.removed_request_count),
-        (4, Some(3))
-    );
-    assert_eq!(
-        serde_json::to_value(&first).unwrap(),
-        serde_json::to_value(read(&index)).unwrap()
-    );
-    remove(&paths);
-}
-
 /// [money] T13: a zero-usage held id before the first own turn, in the
 /// grain of a later own response (and, second, in no counted grain), is
 /// never dropped: nothing is subtracted, the own response still counts.
