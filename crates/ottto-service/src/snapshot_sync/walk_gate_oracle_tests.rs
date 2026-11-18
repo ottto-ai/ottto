@@ -70,7 +70,12 @@ fn walked(cycle: &Cycle) -> bool {
 }
 
 fn assert_idle(cycle: &Cycle) {
-    assert!(!walked(cycle), "{}", cycle.gate);
+    assert!(
+        !walked(cycle),
+        "{}\nTRACE:\n{}",
+        cycle.gate,
+        walk_idle::take_trace_for_test().join("\n")
+    );
     assert_eq!(cycle.steps.len(), 1, "an idle page is one step");
     assert_eq!(cycle.gate["scanned_file_count"], 0);
     assert!(cycle.before.is_empty() && cycle.finalized.is_empty());
@@ -82,7 +87,11 @@ fn assert_idle(cycle: &Cycle) {
 fn settle(home: &mut OracleHome, server: &OracleServer, recording: &Recording) -> Vec<Cycle> {
     let mut cycles = Vec::new();
     loop {
-        assert!(cycles.len() < 4, "the fixture walk did not settle");
+        assert!(
+            cycles.len() < 4,
+            "the fixture walk did not settle\nTRACE:\n{}",
+            walk_idle::take_trace_for_test().join("\n")
+        );
         cycles.push(home.cycle(server, recording));
         if walked(cycles.last().unwrap()) && walk_idle::armed_for_test(home.source).is_some() {
             return cycles;
@@ -316,7 +325,10 @@ fn idle_page_that_starts_a_walk_finishes_ordinarily() {
             scan,
         } = frame.step()
         else {
-            panic!("an idle page completes in one step");
+            panic!(
+                "an idle page completes in one step\nTRACE:\n{}",
+                walk_idle::take_trace_for_test().join("\n")
+            );
         };
         assert!(scan.walk_idle);
         walk_idle::start_walk_for_test(source, &watched, &mut index);

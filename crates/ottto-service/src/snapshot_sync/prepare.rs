@@ -1183,6 +1183,25 @@ pub(super) fn prepare_sync_source_inner(
         && copy_prefix_scope.is_empty()
         && legacy_reconciliation_pending.is_empty();
     let now = crate::scan_clock::utc_seconds();
+    #[cfg(test)]
+    crate::snapshots::walk_idle::trace(format!(
+        "prepare {source:?} hints={} overflow={} list_all={} backfill={backfill_pending} \
+         reoffer={admission_reoffer_pending} fresh={claude_index_loaded_fresh} copy={} legacy={} \
+         upload=[{}]",
+        watcher_hints.paths.len(),
+        watcher_hints.overflowed,
+        watcher_hints.list_all.requested(),
+        copy_prefix_scope.len(),
+        legacy_reconciliation_pending.len(),
+        upload_owes_trace(
+            source,
+            &upload_progress,
+            support_dir,
+            &activity_hint,
+            &index,
+            now
+        ),
+    ));
     let walk_idle = crate::snapshots::walk_idle::gate(
         source,
         &walk_idle_pass,
@@ -1280,6 +1299,38 @@ pub(super) fn upload_owes_nothing(
         && with_source_cadence_state(source, |cadence| cadence.continuation_work().is_none())
             .unwrap_or(false)
         && !progress.telemetry_owes_walk(support, hint, index)
+}
+
+#[cfg(test)]
+fn upload_owes_trace(
+    source: SnapshotSource,
+    progress: &SnapshotUploadProgress,
+    support: &Path,
+    hint: &crate::snapshot_client::ActivityHintResponse,
+    index: &ScanIndex,
+    now: u64,
+) -> String {
+    format!(
+        "ack={}/{} heads={} resend={} conflict={} id503={} qretry={} reoffers={} qdue={} \
+         cadence={:?} telemetry={}",
+        progress.accepted_fingerprints.len(),
+        progress.ack_capacity,
+        progress.pending_cache_heads.len(),
+        progress.context_resend.has_pending_ordinary(),
+        progress
+            .head_conflict_challenges
+            .keys()
+            .any(|key| progress.accepted_cache_heads.contains_key(key)),
+        progress.identity_503_pending.as_ref().map(BTreeSet::len),
+        progress.active_quarantine_retries.len(),
+        progress.active_reason_reoffers.len(),
+        progress.quarantined_fingerprints.values().any(|record| {
+            record.disposition == SnapshotQuarantineDisposition::RetryPending
+                && (1..=now).contains(&record.retry_after_unix_seconds)
+        }),
+        with_source_cadence_state(source, |cadence| cadence.continuation_work().is_none()),
+        progress.telemetry_owes_walk(support, hint, index),
+    )
 }
 
 pub(super) fn capture_codex_recovery_evidence(

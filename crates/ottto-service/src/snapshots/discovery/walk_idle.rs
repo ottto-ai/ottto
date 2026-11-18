@@ -165,6 +165,24 @@ pub(crate) fn gate(
                         .contains(&now)
             })
             && owes_nothing(index, pass.days, now);
+        #[cfg(test)]
+        trace(format!(
+            "gate {source:?} idle={idle} walking={walking} covered={} outside={outside_owes_nothing} \
+             previous={previous:?} now={now} record={:?} owes=[{}]",
+            pass.covered,
+            slot.record.as_ref().map(|record| format!(
+                "key_same={} homes_same={} homes={:?}/{:?} gen={}/{} started={} in_gap={}",
+                record.pass.key == pass.key,
+                record.pass.same(pass),
+                record.pass.codex_homes.iter().map(Option::is_some).collect::<Vec<_>>(),
+                pass.codex_homes.iter().map(Option::is_some).collect::<Vec<_>>(),
+                record.generation,
+                index.generation,
+                record.started_at,
+                (record.started_at..record.started_at.saturating_add(WALK_GAP)).contains(&now),
+            )),
+            owes_trace(index, pass.days, now),
+        ));
         if !idle {
             slot.record = None;
         }
@@ -192,7 +210,24 @@ pub(crate) fn arm_after_finish(
                 .any(|gated| gated.held == Some(HistoryHold::TelemetryUnread))
             && owes_nothing(index, pass.days, crate::scan_clock::utc_seconds())
     });
+    #[cfg(test)]
+    trace(format!(
+        "arm {:?} walk_idle={} settled_start={:?} settled={settled:?} outside={outside_owes_nothing} \
+         traversal={} generation={generation:?} index_gen={}",
+        scan.source,
+        scan.walk_idle,
+        scan.settled_walk_start,
+        index.traversal.is_some(),
+        index.generation,
+    ));
     with_slot(scan.source, |slot| {
+        #[cfg(test)]
+        trace(format!(
+            "arm walk_start_same={:?}",
+            slot.walk_start
+                .as_ref()
+                .map(|start| (start.key == pass.key, start.same(&pass)))
+        ));
         if scan.walk_idle {
             let record = slot
                 .record
@@ -288,6 +323,53 @@ fn stored_candidate(key: &str, entry: &ScanIndexEntry) -> CandidateFile {
         fingerprint_birth_nanos: entry.opened_birth_nanos,
         withheld_content_stamp: None,
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TRACE: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Diagnostic only: why the gate held or walked.
+#[cfg(test)]
+pub(crate) fn trace(line: String) {
+    TRACE.with(|lines| lines.borrow_mut().push(line));
+}
+
+#[cfg(test)]
+pub(crate) fn take_trace_for_test() -> Vec<String> {
+    TRACE.with(|lines| std::mem::take(&mut *lines.borrow_mut()))
+}
+
+#[cfg(test)]
+fn owes_trace(index: &ScanIndex, days: u64, now: u64) -> String {
+    let selected = index
+        .files
+        .iter()
+        .filter(|(key, entry)| {
+            is_recent_enough_at(entry.modified_unix_seconds, now, days)
+                && stored_stamp_selects(index, key, entry, now)
+        })
+        .map(|(key, entry)| {
+            let (decision, reason) = index.candidate_walk_debt(&stored_candidate(key, entry), now);
+            format!(
+                "{}:{decision:?}:{reason:?}",
+                key.rsplit('/').next().unwrap_or(key)
+            )
+        })
+        .collect::<Vec<_>>();
+    format!(
+        "persist={} unsettled={} decode={} deferred={} quarantine={} correction={} growth={} selected={selected:?}",
+        index.persistence_available(),
+        index.bounded_sweep_had_unsettled_upload,
+        index.decode_holds.len(),
+        index.claude_account_deferred_holds.len(),
+        index.claude_usage_authority_quarantine.values().any(|record| {
+            record.disposition == ClaudeUsageAuthorityQuarantineDisposition::RetryPending
+        }),
+        index.claude_authority_proof_correction_blocking().0,
+        sampled_audit::growth_claim_expired(index, now),
+    )
 }
 
 /// A simulated process start: every source's record and clocks are gone.
