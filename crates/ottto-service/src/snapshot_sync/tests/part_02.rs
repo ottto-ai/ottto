@@ -955,7 +955,33 @@ fn off_busy_progress_preserves_damaged_v1_before_containment() {
         .to_string_lossy()
         .contains(".corrupt.")));
     drop(busy);
-    // The same damage is eligible for containment once progress admits.
+    // Releasing progress permits the native G=0 publication. Adoption waits
+    // for the next ordinary pass, with the damaged bytes kept as its witness.
+    let error = load_source_checkpoints(
+        &index_path,
+        &progress_path,
+        SnapshotSource::ClaudeCode,
+        &root,
+        &"b".repeat(64),
+        snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+    )
+    .expect_err("fresh publication requires the next pass");
+    assert_eq!(
+        error.downcast_ref::<crate::snapshots::state_v2::Hold>(),
+        Some(&crate::snapshots::state_v2::Hold::ReloadRequired)
+    );
+    let witness = std::fs::read_dir(&namespace)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains(".corrupt.")
+        })
+        .expect("quarantine witness");
+    assert_eq!(std::fs::read(witness).unwrap(), damaged);
+    assert!(index_path.exists());
     let (_, origin, _) = load_source_checkpoints(
         &index_path,
         &progress_path,
@@ -965,8 +991,8 @@ fn off_busy_progress_preserves_damaged_v1_before_containment() {
         snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
     )
     .unwrap();
-    assert_eq!(origin, crate::snapshots::ScanIndexLoadOrigin::Quarantined);
-    assert!(!index_path.exists());
+    assert_eq!(origin, crate::snapshots::ScanIndexLoadOrigin::Loaded);
+    assert!(index_path.exists());
     std::fs::remove_dir_all(root).unwrap();
 }
 

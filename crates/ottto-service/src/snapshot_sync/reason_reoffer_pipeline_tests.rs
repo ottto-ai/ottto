@@ -2164,6 +2164,16 @@ fn lost_list_intent_pipeline(name: &str, set: bool, malformed: bool) {
     }
     let index_path = claude_index_path(&pipeline.support);
     crate::snapshots::e2_pipeline_scan_fixture::legacy_input_for_test(&index_path, b"{not json");
+    let held = match pipeline.prepare_cycle(t0 + 120) {
+        Err(error) => error,
+        _ => panic!("quarantine publication requires the next ordinary pass"),
+    };
+    assert_eq!(
+        held.downcast_ref::<crate::snapshots::state_v2::Hold>(),
+        Some(&crate::snapshots::state_v2::Hold::ReloadRequired)
+    );
+    assert_eq!(pipeline.server.offered().len(), initial);
+    assert!(index_path.exists(), "native publication keeps its fence");
     assert!(!reemission_list_path(&pipeline.support).exists());
     assert!(!seen.exists());
     let (second, lines) = crate::local_resource_diagnostics::capture(|| {

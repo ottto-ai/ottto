@@ -278,14 +278,20 @@ pub(crate) fn assert_archive_debt_preserves_replay_progress(
     .unwrap();
     let destination = snapshot_upload_destination_namespace(&device, "device-secret");
     let daemon = test_daemon("otm_test");
-    let path = support.join("index.json");
-    std::fs::write(&path, serde_json::to_vec(&index).unwrap()).unwrap();
-    let progress_path = snapshot_upload_progress_path(&path);
-    let mut progress = SnapshotUploadProgress::new(
-        destination.clone(),
-        snapshot_quarantine_witness(SnapshotSource::Codex),
+    let path = support
+        .join("snapshots/destinations")
+        .join(&destination)
+        .join("codex-scan-index-v3.json");
+    index = crate::snapshots::e2_pipeline_scan_fixture::seed_index_for_test(&index, &path);
+    let (progress_path, mut progress) = routed_progress(
+        &index,
+        &path,
+        SnapshotUploadProgress::new(
+            destination.clone(),
+            snapshot_quarantine_witness(SnapshotSource::Codex),
+        ),
     );
-    progress.save_fixture(&progress_path).unwrap();
+    progress.save(&progress_path).unwrap();
     let fixture = ContinuationFixture {
         home: root.join("home"),
         support_dir: support.clone(),
