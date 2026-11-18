@@ -448,3 +448,38 @@ fn projection_owes_iff_walk_selects() {
     index.files.get_mut(KEY).unwrap().last_snapshot_fingerprint = None;
     assert!(owes_nothing(&index, DAYS, START));
 }
+
+/// Wakes no transcript hint names, each idle -> event -> walk: a watched
+/// Claude sidecar edit (subagent `.meta.json`, workflow record) and a
+/// launch-event inbox stamp (`pending/`, `processed/`).
+#[test]
+fn sidecar_and_launch_inbox_events_walk_an_idle_source() {
+    let source = SnapshotSource::ClaudeCode;
+    let fixture = Fixture::new(source);
+    let index = ScanIndex::default();
+    let root = &fixture.roots[0];
+    let sidecar = |path: PathBuf| {
+        crate::snapshot_watcher::simulate_transcript_events(source, &fixture.roots, &[path]);
+    };
+    let [pending, processed] = crate::launch_events::inbox_dirs(&fixture.scratch);
+    let wakes: [(&str, &dyn Fn()); 4] = [
+        ("meta", &|| {
+            sidecar(root.join("p/s/subagents/agent-a.meta.json"))
+        }),
+        ("workflow", &|| sidecar(root.join("p/workflows/run.json"))),
+        ("pending", &|| std::fs::create_dir_all(&pending).unwrap()),
+        ("processed", &|| {
+            std::fs::create_dir_all(&processed).unwrap()
+        }),
+    ];
+    for (n, (name, wake)) in (0_u64..).zip(&wakes) {
+        let at = START + n * 600;
+        fixture.walk(&index, at);
+        assert!(
+            fixture.gate(&index, at + 60),
+            "{name}: idle before the event"
+        );
+        wake();
+        assert!(!fixture.gate(&index, at + 120), "{name}: the event walks");
+    }
+}

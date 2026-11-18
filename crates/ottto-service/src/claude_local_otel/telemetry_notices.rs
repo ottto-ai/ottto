@@ -27,6 +27,11 @@ pub(super) fn appended(support: &Path, root: &str) {
         }
     }
 }
+/// One appended row's notice, as the relay records it.
+#[cfg(test)]
+pub(crate) fn appended_for_test(support: &Path, root: &str) {
+    appended(support, root);
+}
 pub(crate) fn pending(support: &Path) -> Result<BTreeSet<String>> {
     Ok(notices()
         .lock()

@@ -343,6 +343,9 @@ pub struct SnapshotWatcher {
     watch_paths: BTreeMap<PathBuf, RecursiveMode>,
     live: Arc<AtomicBool>,
     pub events: Receiver<SnapshotFileEvent>,
+    /// The worker's raw input, so a test can deliver a backend error.
+    #[cfg(test)]
+    backend_for_test: mpsc::SyncSender<DebounceEventResult>,
 }
 
 impl SnapshotWatcher {
@@ -385,6 +388,8 @@ fn watch_paths(roots: &[(SnapshotSource, PathBuf)]) -> BTreeMap<PathBuf, Recursi
 
 pub fn watch_snapshot_roots(roots: Vec<(SnapshotSource, PathBuf)>) -> Result<SnapshotWatcher> {
     let (raw_tx, raw_rx) = mpsc::sync_channel::<DebounceEventResult>(SNAPSHOT_WATCH_RAW_CAPACITY);
+    #[cfg(test)]
+    let backend_for_test = raw_tx.clone();
     // Watching promotes cadence; rename file-ID reconciliation is not scan
     // authority. NoCache avoids the recommended macOS cache's synchronous,
     // symlink-following filesystem walk during watch/refresh.
@@ -440,6 +445,8 @@ pub fn watch_snapshot_roots(roots: Vec<(SnapshotSource, PathBuf)>) -> Result<Sna
         watch_paths,
         live,
         events: event_rx,
+        #[cfg(test)]
+        backend_for_test,
     })
 }
 
@@ -613,6 +620,44 @@ mod tests {
         ] {
             assert!(take_pending_snapshot_paths(source).overflowed);
         }
+    }
+
+    /// A backend error stops the worker: the watcher is no longer live, so it
+    /// covers nothing (the walk gate never idles uncovered roots) and the lane
+    /// re-creates it.
+    #[test]
+    fn watcher_backend_error_stops_the_worker_and_its_coverage() {
+        let _guard = pending_state_test_guard();
+        let root = crate::test_scratch::canonical_private_dir("watcher-backend-error");
+        let roots = vec![(SnapshotSource::Pi, root.clone())];
+        let watcher = watch_snapshot_roots(roots.clone()).unwrap();
+        cover(Some(&watcher));
+        assert!(covers(std::slice::from_ref(&root)), "a live watcher covers");
+        watcher
+            .backend_for_test
+            .send(Err(vec![notify::Error::generic(
+                "test watcher backend failure",
+            )]))
+            .unwrap();
+        let stopped = (0..400).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            !watcher.matches_roots(&roots)
+        });
+        assert!(stopped, "the worker stops on a backend error");
+        cover(Some(&watcher));
+        assert!(
+            !covers(std::slice::from_ref(&root)),
+            "a stopped worker covers nothing"
+        );
+        drop(watcher);
+        for source in [
+            SnapshotSource::Codex,
+            SnapshotSource::ClaudeCode,
+            SnapshotSource::Pi,
+        ] {
+            let _ = take_pending_snapshot_paths(source);
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn requested(triggers: &[ListingTrigger]) -> ListingRequest {
