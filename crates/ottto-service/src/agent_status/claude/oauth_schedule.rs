@@ -417,7 +417,7 @@ pub(in crate::agent_status) fn claude_explicit_refresh_request(
 
 /// Ask the next Claude collection to read every account now, each only when
 /// its stored reading and its last explicit refresh are both at least a
-/// minute old. The caller's trigger (an older app's status refresh) labels
+/// minute old. The caller's trigger (setup or sign-in) labels
 /// those reads; a person's Refresh is the default.
 pub(crate) fn request_claude_explicit_refresh() {
     *claude_explicit_refresh_request() = ClaudeExplicitRefreshRequest {

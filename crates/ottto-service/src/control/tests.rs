@@ -1131,7 +1131,7 @@ fn codex_daemon_sign_in_reconnect_counts_only_the_clis_own_sign_in() {
 
         // A scheduled round and an explicit refresh during the run.
         crate::agent_status::codex_scheduled_round_now(later());
-        crate::agent_status::refresh_codex_quota_now(0);
+        crate::agent_status::refresh_codex_quota_now();
         assert_eq!(fixture.app_server_runs_for(&home), 2, "exit {exit}");
         // The person's own Codex session refreshes the credential.
         write_synthetic_codex_auth(&home, &format!("{auth_body}\n"));
@@ -2637,32 +2637,6 @@ fn count_backup_files(path: &Path) -> usize {
                 .count()
         })
         .unwrap_or(0)
-}
-
-/// Only an app without `quota_refresh` (protocol 15 or older) has its
-/// status refresh stand in for Refresh, and only for Codex; the CLI and
-/// newer apps do not.
-#[test]
-fn only_older_companion_apps_status_refresh_reads_codex_quota() {
-    for version in [15, 14] {
-        assert_eq!(
-            status_refresh_quota_source(Some(LocalClientKind::CompanionApp), version),
-            Some(SourceKind::Codex)
-        );
-    }
-    assert_eq!(
-        status_refresh_quota_source(Some(LocalClientKind::CompanionApp), 16),
-        None
-    );
-    assert_eq!(
-        status_refresh_quota_source(Some(LocalClientKind::Cli), 15),
-        None
-    );
-    assert_eq!(
-        status_refresh_quota_source(Some(LocalClientKind::WebUi), 15),
-        None
-    );
-    assert_eq!(status_refresh_quota_source(None, 15), None);
 }
 
 #[test]
@@ -7662,7 +7636,6 @@ fn auth_only_command_keeps_trust_and_poisoned_state_refusals() {
             authorization,
             command(),
             InstallOwner::Unknown,
-            None,
             false,
         )
     };
@@ -11080,7 +11053,6 @@ fn relay_runtime_failure_health_survives_control_and_config_intents() {
                 RequestAuthorization::Token("token".into()),
                 command,
                 InstallOwner::Unknown,
-                None,
                 false,
             )
             .unwrap();
