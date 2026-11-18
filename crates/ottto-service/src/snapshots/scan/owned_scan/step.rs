@@ -4462,8 +4462,7 @@ impl OwnedSourceScan {
             let mut resident_loaded_bytes = 0;
             let mut file_sampling = None;
             let mut retained_offset = None;
-            use crate::local_resource_diagnostics::change_reason::Restore;
-            let mut tail_restore = Restore::Bypass;
+            let mut tail_restore = "bypass";
             // Counted once the page actually reads the file: a fence
             // or deferral below does not inflate the read diagnostics.
             let mut planned_mode = None;
@@ -4647,7 +4646,7 @@ impl OwnedSourceScan {
                                 resident_loaded_bytes = loaded_bytes;
                                 match loaded {
                                     tail_source::load::Load::Reused(retained, base) => {
-                                        tail_restore = Restore::Hit;
+                                        tail_restore = "hit";
                                         if let Some(base) = base {
                                             parser.set_tail_base(base);
                                         }
@@ -4667,7 +4666,7 @@ impl OwnedSourceScan {
                                     }
                                     // A pulled twin falls back to this page's native read.
                                     tail_source::load::Load::Held if forced_twin => {
-                                        tail_restore = Restore::Miss;
+                                        tail_restore = "miss";
                                         #[cfg(test)]
                                         twin_diagnostics::event(&candidate.path, || {
                                             "Held forced_twin=true native_fallback".into()
@@ -4685,7 +4684,7 @@ impl OwnedSourceScan {
                                         pending!();
                                     }
                                     tail_source::load::Load::Cold(proven) => {
-                                        tail_restore = Restore::Miss;
+                                        tail_restore = "miss";
                                         tail_proven_full = proven;
                                         (None, debt)
                                     }
@@ -4751,7 +4750,7 @@ impl OwnedSourceScan {
                         context.admission.sampling_allowed.observe(allow_sample);
                         // Only the cap turns sampling off after a kept hit.
                         if !allow_sample && retained.take().is_some() {
-                            tail_restore = Restore::HitDiscardedByCap;
+                            tail_restore = "hit_discarded_by_cap";
                         }
                         context.admission.prepare_started =
                             context.admission.prepare_started.saturating_add(1);

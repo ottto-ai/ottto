@@ -9,7 +9,7 @@ use super::{source_count, source_slot, CHANGE_REASON_START};
 use crate::snapshots::ScanIndex;
 use crate::transcript_acquisition::{FullReason, ReadMode};
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::atomic::Ordering::Relaxed;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,29 +60,17 @@ const CAUSES: [&str; 8] = [
     "audit",
     "other",
 ];
-const CAUSE_FIELDS: [&str; 2] = ["files", "native_bytes"];
-/// The Tail restore outcome of a read's selection.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Restore {
-    Bypass,
-    Miss,
-    Hit,
-    HitDiscardedByCap,
-}
 /// Selection-time labels of a read: its restore outcome and retry provenance.
 #[derive(Clone, Copy, Debug, Default)]
 struct Context {
     restore: Option<&'static str>,
     audit_cap: bool,
-    partial_save: bool,
 }
 #[derive(Clone, Copy, Debug, Default, Serialize)]
 struct Cells {
     files: u64,
     native_bytes: u64,
 }
-/// Bounds the partial-save restore flags awaiting their next selection.
-const RESTORED_CAP: usize = 4096;
 const TOKENS: [&str; 13] = [
     "append",
     "finalizer_revision",
@@ -118,13 +106,9 @@ const PLACEMENT_U: usize = 5;
 const UPLOAD_BYTES: usize = 6;
 /// File grain, per reason.
 const READ_FIELDS: [&str; 3] = ["files", "native_bytes", "validation_bytes"];
-/// The refold pair counts fingerprint reads that continued from stored
-/// state (not Full); by design they read 0 native bytes.
-const SUB_COUNTS: [&str; 4] = [
+const SUB_COUNTS: [&str; 2] = [
     "source_reset_same_size_edit_files",
     "admin_other_sidecar_or_fingerprint_files",
-    "admin_other_fingerprint_refold_files",
-    "admin_other_fingerprint_refold_native_bytes",
 ];
 /// Disclosed U, never a hidden zero: money-only reveals are invisible to the
 /// daemon, and late external evidence stays in admin_other's
@@ -133,8 +117,7 @@ const UNKNOWN: [&str; 2] = ["money_only_reveal", "late_external_evidence"];
 const UPLOAD_START: usize = CHANGE_REASON_START;
 const READ_START: usize = UPLOAD_START + TOKENS.len() * FIELDS.len();
 const SUB_START: usize = READ_START + TOKENS.len() * READ_FIELDS.len();
-const CAUSE_START: usize = SUB_START + SUB_COUNTS.len();
-pub(super) const END: usize = CAUSE_START + CAUSES.len() * CAUSE_FIELDS.len();
+pub(super) const END: usize = SUB_START + SUB_COUNTS.len();
 
 /// Claude session bits from this page's identity tagging.
 const KNOWN: u8 = 1;
@@ -161,9 +144,6 @@ struct Tags {
     /// Index key -> (source slot, first cause, `admin_other` cause, read
     /// context), selection to upload.
     files: BTreeMap<String, (usize, Token, AdminCause, Context)>,
-    /// Index keys whose prior entry a partial save restored, until their next
-    /// selection; at most `RESTORED_CAP`.
-    restored: BTreeSet<String>,
     /// Per source: `admin_other` reads by joint label, until the page line.
     admin: [BTreeMap<String, Cells>; 3],
     sessions: BTreeMap<String, u8>,
@@ -178,7 +158,6 @@ struct Tags {
 impl Tags {
     const NEW: Self = Self {
         files: BTreeMap::new(),
-        restored: BTreeSet::new(),
         admin: [BTreeMap::new(), BTreeMap::new(), BTreeMap::new()],
         sessions: BTreeMap::new(),
         new_file: [Token::Append; 3],
@@ -253,18 +232,13 @@ pub(crate) fn upload_policy(source: &str, bits: u8) {
 pub(crate) fn privacy_off(source: &str) -> bool {
     source_slot(source).is_some_and(|slot| with_tags(|tags| tags.policy[slot] & POLICY_OFF != 0))
 }
-fn moved_fingerprint(cause: AdminCause) -> bool {
-    matches!(
-        cause,
-        AdminCause::FingerprintObject | AdminCause::FingerprintUnattributed
-    )
-}
 /// A file the scan is about to read, with its selection-time first cause.
 pub(crate) fn selected(source: &str, key: String, token: Token, cause: AdminCause) {
     let Some(slot) = source_slot(source) else {
         return;
     };
-    if token == Token::AdminOther && moved_fingerprint(cause) {
+    use AdminCause::{FingerprintObject, FingerprintUnattributed};
+    if token == Token::AdminOther && matches!(cause, FingerprintObject | FingerprintUnattributed) {
         add(source, SUB_START + 1, 1);
     }
     with_tags(|tags| {
@@ -294,14 +268,14 @@ pub(crate) fn read(
                 | FullReason::InvalidCheckpoint
         )
     );
-    let (token, cause) = with_tags(|tags| match tags.files.get_mut(key) {
-        Some((_, token, cause, _)) => {
+    let token = with_tags(|tags| match tags.files.get_mut(key) {
+        Some((_, token, _, _)) => {
             if reset && *token == Token::Append {
                 *token = Token::SourceReset;
             }
-            (*token, *cause)
+            *token
         }
-        None => (Token::Unattributed, AdminCause::Other),
+        None => Token::Unattributed,
     });
     if token == Token::SourceReset && mode == ReadMode::Full(FullReason::SameSizeEdit) {
         add(source, SUB_START, 1);
@@ -310,50 +284,26 @@ pub(crate) fn read(
     for (field, amount) in [1, native_bytes, validation_bytes].into_iter().enumerate() {
         add(source, row + field, amount);
     }
-    if token == Token::AdminOther {
-        let row = CAUSE_START + cause as usize * CAUSE_FIELDS.len();
-        add(source, row, 1);
-        add(source, row + 1, native_bytes);
-        if moved_fingerprint(cause) && !matches!(mode, ReadMode::Full(_)) {
-            add(source, SUB_START + 2, 1);
-            add(source, SUB_START + 3, native_bytes);
-        }
-    }
 }
-/// A partial save restored this key's prior entry (process-local only).
-pub(crate) fn partial_save_restored(key: &str) {
-    with_tags(|tags| {
-        if tags.restored.len() < RESTORED_CAP {
-            tags.restored.insert(key.to_owned());
-        }
-    });
-}
-/// Right after selection: the restore outcome, with `(seal, indexed size,
-/// opening extent)` on a kept hit, and the retry provenance (an outstanding
-/// audit-cap clear; a partial-save restore flag, read and cleared here).
-pub(crate) fn read_context(key: &str, restore: Restore, extent: Option<(u64, u64, u64)>) {
+/// Right after selection: the Tail restore outcome (`bypass`, `miss`,
+/// `hit_discarded_by_cap` or `hit`), with `(seal, indexed size, opening
+/// extent)` on a kept hit, and an outstanding audit-cap clear.
+pub(crate) fn read_context(key: &str, restore: &'static str, extent: Option<(u64, u64, u64)>) {
     let audit_cap = super::rearm_cause::audit_cap_cleared(key);
-    let restore = match (restore, extent) {
-        (Restore::Hit, Some((seal, indexed, opening))) => {
-            match (seal < indexed, opening > indexed) {
-                (true, true) => "hit.both",
-                (true, false) => "hit.indexed_gap",
-                (false, true) => "hit.new_bytes",
-                (false, false) => "hit.neither",
-            }
-        }
-        (Restore::Hit, None) => "hit",
-        (Restore::Miss, _) => "miss",
-        (Restore::Bypass, _) => "bypass",
-        (Restore::HitDiscardedByCap, _) => "hit_discarded_by_cap",
+    let restore = match extent.filter(|_| restore == "hit") {
+        Some((seal, indexed, opening)) => match (seal < indexed, opening > indexed) {
+            (true, true) => "hit.both",
+            (true, false) => "hit.indexed_gap",
+            (false, true) => "hit.new_bytes",
+            (false, false) => "hit.neither",
+        },
+        None => restore,
     };
     with_tags(|tags| {
-        let partial_save = tags.restored.remove(key);
         if let Some(tag) = tags.files.get_mut(key) {
             tag.3 = Context {
                 restore: Some(restore),
                 audit_cap,
-                partial_save,
             };
         }
     });
@@ -361,7 +311,7 @@ pub(crate) fn read_context(key: &str, restore: Restore, extent: Option<(u64, u64
 /// Every completed body read, with or without an acquisition plan
 /// `(mode, native bytes)`. An `admin_other` read counts under
 /// `<cause>.<mode>`, `<cause>.restore.<outcome>` and
-/// `<cause>.retry.<provenance>`. Without a plan its parser bytes count under
+/// `<cause>.retry.audit_cap_clear`. Without a plan its parser bytes count under
 /// `no_plan`, never in `read`, so the planned rows still reconcile.
 pub(crate) fn admin_read(
     source: &str,
@@ -394,9 +344,6 @@ pub(crate) fn admin_read(
             context
                 .audit_cap
                 .then(|| "retry.audit_cap_clear".to_owned()),
-            context
-                .partial_save
-                .then(|| "retry.partial_save_restore".to_owned()),
         ];
         for label in labels.into_iter().flatten() {
             let cells = tags.admin[slot]
@@ -555,9 +502,6 @@ pub(crate) struct Page {
     read: BTreeMap<&'static str, BTreeMap<&'static str, u64>>,
     #[serde(flatten)]
     sub_counts: BTreeMap<&'static str, u64>,
-    /// `admin_other` reads per selection cause.
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    admin_other_cause: BTreeMap<&'static str, BTreeMap<&'static str, u64>>,
     /// `admin_other` reads by joint label, from `admin_read`.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     admin_other_read: BTreeMap<String, Cells>,
@@ -595,12 +539,6 @@ pub(crate) fn drain(source: &str) -> Option<Page> {
         }
     }
     page.sub_counts = cells(SUB_START, &SUB_COUNTS[..]);
-    for (cause, name) in CAUSES.into_iter().enumerate() {
-        let row = cells(CAUSE_START + cause * CAUSE_FIELDS.len(), &CAUSE_FIELDS[..]);
-        if !row.is_empty() {
-            page.admin_other_cause.insert(name, row);
-        }
-    }
     if let Some(slot) = source_slot(source) {
         page.admin_other_read = with_tags(|tags| std::mem::take(&mut tags.admin[slot]));
     }
@@ -695,8 +633,8 @@ mod tests {
     }
 
     /// [behaviour] Each `admin_other` read counts once under its selection
-    /// cause; a fingerprint read that continued from stored state also counts
-    /// as a refold with its native bytes, and a Full one does not.
+    /// cause; only a moved fingerprint bumps the sidecar sub-count, and
+    /// another first cause counts nowhere.
     #[test]
     fn admin_other_reads_split_by_cause() {
         use AdminCause as C;
@@ -712,33 +650,21 @@ mod tests {
         ];
         for (n, (cause, name)) in (1u64..).zip(cases) {
             selected("pi", "admin".into(), Token::AdminOther, cause);
-            read("pi", "admin", ReadMode::Tail, n, 2);
+            selected("pi", "kept".into(), Token::CopyOwnership, cause);
+            for key in ["admin", "kept"] {
+                admin_read("pi", key, Some((ReadMode::Tail, n)), 0);
+            }
             let page = serde_json::to_value(drain("pi").unwrap()).unwrap();
-            let split = page["admin_other_cause"].as_object().unwrap();
+            let split = page["admin_other_read"].as_object().unwrap();
             assert_eq!(split.len(), 1, "{name}");
-            assert_eq!(split[name]["files"], 1, "{name}");
-            assert_eq!(split[name]["native_bytes"], n, "{name}");
-            assert_eq!(page["read"]["admin_other"]["native_bytes"], n);
+            assert_eq!(split[&format!("{name}.tail")]["native_bytes"], n, "{name}");
             let moved = matches!(cause, C::FingerprintObject | C::FingerprintUnattributed);
-            let refold = &page["admin_other_fingerprint_refold_native_bytes"];
-            assert_eq!(refold.as_u64(), moved.then_some(n), "{name}");
             assert_eq!(
                 page["admin_other_sidecar_or_fingerprint_files"].as_u64(),
                 moved.then_some(1),
                 "{name}"
             );
         }
-        selected("pi", "full".into(), Token::AdminOther, C::FingerprintObject);
-        selected("pi", "kept".into(), Token::CopyOwnership, C::Memo);
-        read("pi", "full", ReadMode::Full(FullReason::StateMissing), 9, 0);
-        read("pi", "kept", ReadMode::Tail, 4, 0);
-        let page = serde_json::to_value(drain("pi").unwrap()).unwrap();
-        assert_eq!(
-            page["admin_other_cause"]["fingerprint_object"]["native_bytes"],
-            9
-        );
-        assert_eq!(page["admin_other_cause"].as_object().unwrap().len(), 1);
-        assert!(page.get("admin_other_fingerprint_refold_files").is_none());
     }
 
     /// [behaviour] An `admin_other` read counts under its cause with its
@@ -749,43 +675,43 @@ mod tests {
         let full = Some((ReadMode::Full(FullReason::StateMissing), 7));
         let cases = [
             (
-                Restore::Hit,
+                "hit",
                 Some((5, 10, 12)),
                 Some((ReadMode::Tail, 3)),
                 "hit.both",
                 "tail",
             ),
             (
-                Restore::Hit,
+                "hit",
                 Some((5, 10, 10)),
                 Some((ReadMode::Unchanged, 0)),
                 "hit.indexed_gap",
                 "unchanged",
             ),
             (
-                Restore::Hit,
+                "hit",
                 Some((10, 10, 12)),
                 full,
                 "hit.new_bytes",
                 "full:state_missing",
             ),
             (
-                Restore::Hit,
+                "hit",
                 Some((10, 10, 10)),
                 full,
                 "hit.neither",
                 "full:state_missing",
             ),
-            (Restore::Hit, None, full, "hit", "full:state_missing"),
-            (Restore::Miss, None, full, "miss", "full:state_missing"),
+            ("hit", None, full, "hit", "full:state_missing"),
+            ("miss", None, full, "miss", "full:state_missing"),
             (
-                Restore::HitDiscardedByCap,
+                "hit_discarded_by_cap",
                 Some((5, 10, 12)),
                 full,
                 "hit_discarded_by_cap",
                 "full:state_missing",
             ),
-            (Restore::Bypass, None, None, "bypass", "no_plan"),
+            ("bypass", None, None, "bypass", "no_plan"),
         ];
         for (restore, extent, plan, outcome, mode) in cases {
             selected("pi", "k".into(), Token::AdminOther, AdminCause::Rearm);
@@ -803,9 +729,8 @@ mod tests {
         }
     }
 
-    /// [behaviour] Retry provenance: an outstanding audit-cap clear, and a
-    /// partial-save restore flag that the next selection reads and clears.
-    /// Another first cause counts nowhere.
+    /// [behaviour] Retry provenance: a read selected while its entry carries
+    /// an audit-cap clear; other reads carry none.
     #[test]
     fn admin_other_read_counts_retry_provenance() {
         use crate::local_resource_diagnostics::rearm_cause::{self, Cause};
@@ -814,26 +739,20 @@ mod tests {
             ..Default::default()
         };
         rearm_cause::clear("cap", &mut entry, Cause::AuditCapDelay);
-        partial_save_restored("saved");
         let read_once = |key: &str, token| {
             selected("pi", key.into(), token, AdminCause::Other);
-            read_context(key, Restore::Bypass, None);
+            read_context(key, "bypass", None);
             admin_read("pi", key, None, 4);
         };
-        for key in ["cap", "saved", "plain"] {
+        for key in ["cap", "plain"] {
             read_once(key, Token::AdminOther);
         }
         let page = serde_json::to_value(drain("pi").unwrap()).unwrap();
         let labels = page["admin_other_read"].as_object().unwrap();
         assert_eq!(labels["other.retry.audit_cap_clear"]["native_bytes"], 4);
-        assert_eq!(labels["other.retry.partial_save_restore"]["files"], 1);
-        assert_eq!(labels["other.no_plan"]["files"], 3);
-        assert_eq!(labels["other.restore.bypass"]["native_bytes"], 12);
-        read_once("saved", Token::AdminOther);
-        read_once("kept", Token::CopyOwnership);
-        let page = serde_json::to_value(drain("pi").unwrap()).unwrap();
-        let labels = page["admin_other_read"].as_object().unwrap();
-        assert_eq!(labels.len(), 2, "the flag was cleared at selection");
-        assert_eq!(labels["other.no_plan"]["files"], 1);
+        assert_eq!(labels["other.retry.audit_cap_clear"]["files"], 1);
+        assert_eq!(labels["other.no_plan"]["files"], 2);
+        assert_eq!(labels["other.restore.bypass"]["native_bytes"], 8);
+        assert_eq!(labels.len(), 3);
     }
 }

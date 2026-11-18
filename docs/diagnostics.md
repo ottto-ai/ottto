@@ -1152,34 +1152,28 @@ gate, cap and upload nothing.
 - **Sub-counts:** `source_reset_same_size_edit_files` and
   `admin_other_sidecar_or_fingerprint_files`. `unknown` lists what the daemon
   cannot see: money-only reveals and late external evidence.
-- **`admin_other_cause`** (per file): the `admin_other` reads split by
-  selection cause, each with `files` and `native_bytes`; the rows sum to
-  `read.admin_other`. `fingerprint_object` is a moved fingerprint whose
+- **`admin_other_read`** (per file, at body-read completion): `files` and
+  `native_bytes` of `admin_other` reads by fixed joint label, each prefixed by
+  the selection cause. `fingerprint_object` is a moved fingerprint whose
   opened-object ctime witness differs from the stored one (a sidecar may have
   moved too). `fingerprint_unattributed` is any other moved fingerprint: the
   index keeps no per-input digest, so a Desktop store, OTLP sidecar, launcher
-  context, inode or sampled-byte move cannot be told apart. `adoption` is a non-money
-  body-witness revision adoption, `rearm` a cleared entry fingerprint, `memo`
-  an account memo-miss, `new_file_fresh_index` a new file after a fresh index
-  without prior-history evidence, `audit` a due audit, and `other` the rest.
-- **`admin_other_read`** (per file, at body-read completion): `files` and
-  `native_bytes` by fixed joint label, each prefixed by the cause above.
-  `<cause>.<mode>` is the actual acquisition mode: `unchanged`, `tail`,
-  `full:<reason>`, or `no_plan`. A `no_plan` read counts its parser bytes and
-  is never in `read`, so the other modes still sum to the `admin_other_cause`
-  row. `<cause>.restore.<outcome>` is the Tail restore at selection: `miss`
-  (cold or held), `bypass` (no load), `hit_discarded_by_cap`, or `hit`. A kept
-  `hit` compares the loaded seal and the plan's opening extent with the prior
-  indexed size: `hit.indexed_gap` (seal below it), `hit.new_bytes` (extent
-  above it), `hit.both` or `hit.neither`. `<cause>.retry.audit_cap_clear`
-  marks a read selected while its entry carries an audit-cap clear.
-  `<cause>.retry.partial_save_restore` marks a read whose prior entry a partial
-  save restored. That flag is process-local, holds at most 4096 keys, and is
-  cleared at the next selection.
-- **Refold:** `admin_other_fingerprint_refold_files` and
-  `admin_other_fingerprint_refold_native_bytes` count the moved-fingerprint
-  reads that continued from stored state (not Full). Such a re-fold should read
-  0 native bytes, so nonzero bytes mean it read the transcript.
+  context, inode or sampled-byte move cannot be told apart. `adoption` is a
+  non-money body-witness revision adoption, `rearm` a cleared entry
+  fingerprint, `memo` an account memo-miss, `new_file_fresh_index` a new file
+  after a fresh index without prior-history evidence, `audit` a due audit, and
+  `other` the rest.
+  - `<cause>.<mode>` is the actual acquisition mode: `unchanged`, `tail`,
+    `full:<reason>`, or `no_plan`. A `no_plan` read counts its parser bytes and
+    is never in `read`, so the planned modes sum to `read.admin_other`.
+  - `<cause>.restore.<outcome>` is the Tail restore at selection: `miss` (cold
+    or held), `bypass` (no load), `hit_discarded_by_cap`, or `hit`. A kept `hit`
+    compares the loaded seal and the plan's opening extent with the prior
+    indexed size: `hit.indexed_gap` (seal below it), `hit.new_bytes` (extent
+    above it), `hit.both` or `hit.neither`. A re-fold of a moved fingerprint
+    should read 0 native bytes in `tail` or `unchanged`.
+  - `<cause>.retry.audit_cap_clear` marks a read selected while its entry
+    carries an audit-cap clear.
 
 Upload counts land on the line after the source's next page line.
 

@@ -70,31 +70,22 @@ impl ScanIndex {
             Some(R::SourceChanged) => {
                 return match source_change {
                     Some(SourceChange::CopyRemoval) => (Token::CopyOwnership, AdminCause::Other),
-                    Some(SourceChange::Fingerprint) => (
-                        Token::AdminOther,
-                        self.fingerprint_cause(key, changed_nanos),
-                    ),
+                    // The stored fingerprint used the stored ctime: another
+                    // proves the object moved. No stored input names a sidecar.
+                    Some(SourceChange::Fingerprint) => {
+                        let stored = self.files.get(key).map_or(0, |e| e.opened_changed_nanos);
+                        if stored != 0 && stored != changed_nanos {
+                            (Token::AdminOther, AdminCause::FingerprintObject)
+                        } else {
+                            (Token::AdminOther, AdminCause::FingerprintUnattributed)
+                        }
+                    }
                     None => (Token::AdminOther, AdminCause::Memo),
                 };
             }
             _ => Token::AdminOther,
         };
         (token, AdminCause::Other)
-    }
-
-    /// The stored fingerprint used the entry's stored ctime: a different
-    /// candidate ctime proves the opened-object identity moved. Nothing
-    /// persisted names a moved sidecar input.
-    fn fingerprint_cause(&self, key: &str, changed_nanos: u64) -> AdminCause {
-        let stored = self
-            .files
-            .get(key)
-            .map_or(0, |entry| entry.opened_changed_nanos);
-        if stored != 0 && stored != changed_nanos {
-            AdminCause::FingerprintObject
-        } else {
-            AdminCause::FingerprintUnattributed
-        }
     }
 
     /// An operator re-owe (`REOWED`) is exact; otherwise an owed revision
@@ -284,10 +275,11 @@ mod tests {
             );
             counts::selected("claude_code", key.into(), token, cause);
             counts::read("claude_code", key, ReadMode::Tail, 10, 2);
+            counts::admin_read("claude_code", key, Some((ReadMode::Tail, 10)), 0);
             let page = serde_json::to_value(counts::drain("claude_code").unwrap()).unwrap();
-            let split = page["admin_other_cause"].as_object().unwrap();
+            let split = page["admin_other_read"].as_object().unwrap();
             assert_eq!(split.len(), 1, "{reason:?}");
-            assert_eq!(split[expected]["files"], 1, "{reason:?}");
+            assert_eq!(split[&format!("{expected}.tail")]["files"], 1, "{reason:?}");
             assert_eq!(page["read"]["admin_other"]["files"], 1, "{reason:?}");
             counts::index_loaded("claude_code", false, None);
         }
