@@ -1339,7 +1339,7 @@ fn cache_head_probe_refusal_reoffers_its_own_exact_body() {
     );
 }
 
-/// #692: two physical POSTs remain one logical leased offer, including bytes.
+/// Two physical POSTs remain one logical leased offer, including bytes.
 /// Advancing the injected clock after 503 proves the saved claim is not bumped
 /// by the resend; the legacy done marker appears only with the final answer.
 #[test]
@@ -1856,7 +1856,7 @@ fn reemission_list_path(support: &Path) -> PathBuf {
     support.join("snapshots/claude_code-reemission-exclusions.txt")
 }
 
-/// #712 held-body control for #706: a history-held file (stored revision
+/// Held-body control for StateMissing re-offers: a history-held file (stored revision
 /// below the active one, no list, a saved history cutoff after its birth; the
 /// refusal in the ledger is prior history) with a due original-pair re-offer
 /// lease is not re-offered. Where no list is intended, only an unverified
@@ -2253,8 +2253,8 @@ fn first_nonempty_list_read_records_durable_intent_through_prepare_finish() {
     assert!(crate::snapshots::claude_reemission_seen_marker_path(&pipeline.support).exists());
 }
 
-/// A returning member under #712's move hold, on the always-on path: (b) the
-/// #712 hold withholds the body, with nothing uploaded or stamped; (c) once
+/// A returning member under a history move hold, on the always-on path: (b) the
+/// hold withholds the body, with nothing uploaded or stamped; (c) once
 /// the hold releases (an explicit `full` claim, then readable proof) the
 /// family's money is exactly its request-owned total: one request-owned body,
 /// never a legacy one beside it, and no identity beyond what the first
@@ -2319,7 +2319,7 @@ fn returning_history_obeys_the_move_hold() {
     assert!(!reemission_list_path(&pipeline.support).exists());
     let offered_before = pipeline.server.offered().len();
 
-    // Healthy local proof cannot waive #712's history hold or stamp the
+    // Healthy local proof cannot waive the history hold or stamp the
     // body as uploaded.
     let proved_return = pipeline.cycle(t0 + 1_200);
     assert!(proved_return.result.is_ok(), "{:?}", proved_return.result);
@@ -2349,7 +2349,7 @@ fn returning_history_obeys_the_move_hold() {
     );
     let returned = pipeline.cycle(t0 + 2_400);
     assert!(returned.result.is_ok(), "{:?}", returned.result);
-    // (b) The #712 hold still withholds the body: nothing uploaded, nothing
+    // (b) The history hold still withholds the body: nothing uploaded, nothing
     // stamped, and the durable move marker stands.
     assert_eq!(
         pipeline.server.offered().len(),

@@ -40,11 +40,11 @@ pub(crate) struct Counts {
     /// Frozen tagged rows absent from their still-present accepted bucket.
     pub(crate) accepted_row_vanished: u64,
     pub(crate) accepted_state_unknown_cause: UnknownCauses,
-    /// Copy-prefix switch on: accepted rows whose proof a copied marker lent
-    /// (#944), tombstoned once per row.
+    /// Copy-prefix switch on: accepted rows whose proof a copied marker lent,
+    /// tombstoned once per row.
     #[serde(skip_serializing_if = "is_zero")]
     pub(crate) copy_derived_proof_invalidated: u64,
-    /// Lent rows kept on #909 per pass: an OFF-era freeze
+    /// Lent rows kept by accepted-share protection per pass: an OFF-era freeze
     /// mixing lent and other shares, or lent requests whose own evidence this
     /// pass could not read.
     #[serde(skip_serializing_if = "is_zero")]

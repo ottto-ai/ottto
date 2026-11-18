@@ -798,7 +798,7 @@ fn cap_delayed_growth_survives_age_and_replacement_traversal() {
             page["counts"]["sampled_acquisition"]["page_events"]["full_cause"]
                 ["rearm_cleared{audit_cap_delay}"],
             json!({"count": 1, "completed_native_bytes": actual_size}),
-            "the #897 wrapper retains the cap-delay cause across index reload"
+            "the wrapper retains the cap-delay cause across index reload"
         );
         assert!(
             !raw.snapshots.is_empty(),

@@ -1,5 +1,5 @@
 //! Contract-5 cutover: contract 5 is always on for Claude Code.
-//! The identity permit and #825's `STAMPED_WITHOUT_PERMIT` machinery are
+//! The identity permit and `STAMPED_WITHOUT_PERMIT` machinery are
 //! retired. Old stores keep decoding the retired bit (64), which is never
 //! set, cleared or replayed; money-rule version 2 keeps its meaning; a
 //! contract change re-owes nothing; caps are unchanged.
@@ -10,7 +10,7 @@ use super::claude_request_money::e2::{apply_money_rules, money_mark};
 use super::*;
 use crate::local_resource_diagnostics::claude_reread;
 
-/// #825's `STAMPED_WITHOUT_PERMIT`, retired: decoded, never acted on.
+/// The retired `STAMPED_WITHOUT_PERMIT` bit still decodes and has no effect.
 const RETIRED_PERMIT_MARK: u8 = 64;
 
 // The contract-5 caps: 32 accounts per item; the parts bound at the default
@@ -93,7 +93,7 @@ fn version_two_reowes_nothing_and_seeds_no_mark() {
     }
 }
 
-/// A store written by a #825 build may carry the retired bit. It decodes
+/// A store written by a permit-era build may carry the retired bit. It decodes
 /// unchanged through a save and load, and neither a money-rule pass nor a
 /// contract change re-owes, clears or replays it.
 #[test]

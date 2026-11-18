@@ -193,7 +193,7 @@ fn an_opening_settings_count_mismatch_reconstructs_that_file_only() {
     assert_eq!(counted(&records), ("hit".into(), vec![]));
 }
 
-/// [privacy] STATE: no session fact (title, first prompt material and display
+/// [privacy] No session fact (title, first prompt material and display
 /// title, workspace, opening instructions and file paths) reaches a
 /// diagnostics record through a stage, save or load, while the load restores
 /// each one (the positive control).

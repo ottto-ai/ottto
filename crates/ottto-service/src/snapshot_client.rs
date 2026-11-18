@@ -3265,8 +3265,8 @@ fn with_snapshot_timeouts(builder: ureq::AgentBuilder, read_timeout: Duration) -
         // to bound stale-socket reuse short of rebuilding the agent: every
         // request opens a fresh connect and can never reuse a socket bound to a
         // dead local IP. Intentional tradeoff: this forfeits the shared pool's
-        // warm-socket survival that #234 relied on, but DNS-incident coverage is
-        // retained independently by the FallbackDnsResolver below, and the cost
+        // ability to keep a warm socket through DNS outages. The FallbackDnsResolver
+        // below still handles DNS outages. The cost
         // is one extra TCP+TLS handshake per request at the 5-min/60-s upload
         // cadence (bounded by the 5-s connect timeout) — negligible. Do NOT
         // apply this to the OTLP UPSTREAM_HTTP_AGENT, whose warm pool is

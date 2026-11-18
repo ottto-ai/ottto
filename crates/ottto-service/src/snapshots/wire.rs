@@ -319,8 +319,8 @@ impl<T: Borrow<SnapshotItem>> Serialize for SnapshotBatchWireRequest<'_, T> {
 }
 
 // Hoisted onto each SnapshotModelUsage row in v6: these participate in the
-// backend's billing_hash (one of the two row-key dimensions). Names match
-// `_usage_row_key` in backend/app/schemas/agent_session_snapshots.py.
+// receiver's billing hash, one of the two row-key dimensions. Names match the
+// receiver's usage row key.
 pub(super) const ROW_BILLING_FIELDS: &[&str] = &[
     "auth_mode",
     "billing_channel",

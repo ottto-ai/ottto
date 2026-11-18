@@ -1185,7 +1185,7 @@ fn e2_bound_trace_case(
     let support = dir.join("support");
     let (mut api, trace) = e2_family_evidence(&root);
     // Own login B, except the mixed arm: own A == the bound owner, which main
-    // uploads and only #947's clear would hold.
+    // uploads unless the unhealthy trace requires clearing the account.
     let own = if billing == "mixed" { "a" } else { "b" };
     for row in &mut api {
         row.account_identifier_hash = Some(own.repeat(64).into());
@@ -1365,7 +1365,7 @@ fn e2_bound_trace_case(
             assert_eq!(
                 held,
                 BTreeSet::from([root.clone()]),
-                "#932's discard keeps main's account hold"
+                "the discard keeps main's account hold"
             );
         }
         assert_eq!(stats.trace_discard_deferred_items, 2);
@@ -1408,7 +1408,7 @@ fn e2_bound_trace_case(
         }
         for item in &items {
             assert_eq!(item.telemetry_owned_complete, Some(false));
-            // #909: one refusal per changed accepted row; none if never accepted.
+            // One refusal per changed accepted row. A row never accepted gets no refusal.
             assert_eq!(
                 item.request_identity_refusals,
                 refusals.get(&item.source_session_id).copied().unwrap_or(0),
@@ -1460,13 +1460,13 @@ fn e2_bound_trace_case(
     fs::remove_dir_all(dir).unwrap();
 }
 
-/// [money] #932: a discard withholds, never another account.
+/// [money] A discarded trace withholds attribution to every account.
 #[test]
 fn e2_pipeline_bound_a_own_b_cap_discard_has_no_fallback_then_recovers() {
     e2_bound_trace_case("cap", false, "subscription", false, false);
 }
 
-/// [money] #932: a replaced trace is a discard too.
+/// [money] A replaced trace is a discard too.
 #[cfg(unix)]
 #[test]
 fn e2_pipeline_bound_a_own_b_generation_discard_has_no_fallback_then_recovers() {
@@ -1475,7 +1475,7 @@ fn e2_pipeline_bound_a_own_b_generation_discard_has_no_fallback_then_recovers() 
 
 /// [money] Uniform B on a malformed trace is Unknown until a clean read,
 /// never B through the request-census shortcut.
-/// guard: unseen live (0 of 3,614 evidence pages); code-derived from #932 review P2-1
+/// Covers the no-fallback path when trace ownership cannot be verified.
 #[test]
 fn e2_pipeline_bound_a_uniform_b_malformed_trace_is_unknown_not_a() {
     e2_bound_trace_case("malformed", false, "subscription", false, false);
@@ -1483,7 +1483,7 @@ fn e2_pipeline_bound_a_uniform_b_malformed_trace_is_unknown_not_a() {
 
 /// [money] Split B/C on a malformed trace is Unknown, never retained A.
 /// Never accepted, so no refusal.
-/// guard: unseen live (0 of 3,614 evidence pages); code-derived from #932 review P2-1
+/// Covers the no-fallback path when trace ownership cannot be verified.
 #[test]
 fn e2_pipeline_bound_a_split_logins_malformed_trace_is_unknown_not_a() {
     e2_bound_trace_case("malformed", true, "subscription", false, false);
@@ -1506,26 +1506,26 @@ fn e2_pipeline_bound_a_split_logins_unhealthy_trace_reasons_are_unknown_not_a() 
     }
 }
 
-/// [money] #932: the discard withholds the split family too.
+/// [money] The discard withholds the split family too.
 #[test]
 fn e2_pipeline_bound_a_split_logins_cap_discard_blocks_retained_a() {
     e2_bound_trace_case("cap", true, "subscription", false, false);
 }
 
-/// [money] #932: the same for a replaced trace.
+/// [money] The split family is also withheld for a replaced trace.
 #[cfg(unix)]
 #[test]
 fn e2_pipeline_bound_a_split_logins_generation_discard_blocks_retained_a() {
     e2_bound_trace_case("generation", true, "subscription", false, false);
 }
 
-/// [money] #932: external billing bypasses grouping; the discard clears it.
+/// [money] External billing bypasses grouping; the discard clears its wire account.
 #[test]
 fn e2_pipeline_external_billing_cap_discard_clears_wire_account_then_recovers() {
     e2_bound_trace_case("cap", false, "external", false, false);
 }
 
-/// [money] #932: the same for a replaced trace.
+/// [money] A replaced trace clears the wire account too.
 #[cfg(unix)]
 #[test]
 fn e2_pipeline_external_billing_generation_discard_clears_wire_account_then_recovers() {
@@ -1543,14 +1543,14 @@ fn e2_pipeline_external_billing_malformed_trace_clears_wire_account() {
 
 /// [money] Mixed billing (only req_3/req_4
 /// API-key billed), own login A == bound owner: the body uploads Unknown on
-/// the same page with 0 account holds, decision-2 refusals (none here: this
-/// body never enters the #909 ledger) and unchanged totals.
+/// the same page with zero account holds, zero refusals (this
+/// body never enters the accepted-share ledger) and unchanged totals.
 #[test]
 fn e2_pipeline_mixed_billing_malformed_trace_clears_wire_account() {
     e2_bound_trace_case("malformed", false, "mixed", false, false);
 }
 
-/// [money] #932 x #909: a bucket already accepted tagged (B root, C child) is
+/// [money] A bucket already accepted tagged (B root, C child) is
 /// never replaced by an untagged revision: the discard page uploads nothing
 /// for the family, and the next clean page uploads B/C again.
 #[test]
@@ -1558,21 +1558,21 @@ fn e2_pipeline_accepted_b_cap_discard_defers_upload_then_recovers() {
     e2_bound_trace_case("cap", true, "subscription", true, false);
 }
 
-/// [money] #932 x #909: the same for a replaced trace.
+/// [money] A replaced trace also withholds the untagged revision of an accepted bucket.
 #[cfg(unix)]
 #[test]
 fn e2_pipeline_accepted_b_generation_discard_defers_upload_then_recovers() {
     e2_bound_trace_case("generation", true, "subscription", true, false);
 }
 
-/// [money] #947 x #909: an accepted bucket made Unknown by a
-/// malformed trace keeps #909's refusal, one per changed accepted row.
+/// [money] An accepted bucket made Unknown by a
+/// malformed trace keeps its refusal, one per changed accepted row.
 #[test]
 fn e2_pipeline_accepted_bucket_unhealthy_root_keeps_909_refusal() {
     e2_bound_trace_case("malformed", true, "subscription", true, false);
 }
 
-/// [money] #932 x #909: a listed family (real
+/// [money] A listed family (real
 /// re-emission list, no `e2` fold) whose accepted trace grows mid-read is held
 /// like a folded one: nothing untagged or refused uploads, its history stays
 /// owed, and the next clean read keeps the tags.

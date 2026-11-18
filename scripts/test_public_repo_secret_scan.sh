@@ -13,8 +13,8 @@ write_config() {
   cat > "$repo/config/deny-patterns.tsv" <<'DENY'
 # scope	regex	description
 path	(^|/)backend(/|$)	backend path denied
-content	/Users/ronshub	local operator path denied
-content	docs/dev/	private docs denied
+content	/Users/example	local operator path denied
+content	private-notes/	private docs denied
 content	Bearer[[:space:]]+[A-Za-z0-9._~+/=-]{16,}	bearer token denied
 DENY
 }
@@ -68,7 +68,7 @@ run_scan "$history_repo" >"$tmp_dir/head-only.out"
 current_repo="$tmp_dir/current"
 init_repo "$current_repo"
 cat > "$current_repo/public/README.md" <<'EOF'
-Raw operator output: /Users/ronshub/private
+Raw operator output: /Users/example/private
 EOF
 git -C "$current_repo" add public
 git -C "$current_repo" commit -qm current-secret
@@ -108,7 +108,7 @@ main_branch="$(git -C "$side_ref_repo" branch --show-current)"
 git -C "$side_ref_repo" checkout -qb unrelated-local-ref
 mkdir -p "$side_ref_repo/public/target"
 cat > "$side_ref_repo/public/target/noise.txt" <<'EOF'
-Raw operator output: /Users/ronshub/private
+Raw operator output: /Users/example/private
 EOF
 git -C "$side_ref_repo" add public
 git -C "$side_ref_repo" commit -qm unrelated-build-output

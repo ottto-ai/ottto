@@ -1,4 +1,4 @@
-//! Counts/bytes/times only. Reuse #799 and its bounded process sampler.
+//! Counts, bytes and times only. Reuse local diagnostics and their bounded process sampler.
 use super::catalogue::scan_index_fields;
 use super::*;
 use std::collections::BTreeMap;

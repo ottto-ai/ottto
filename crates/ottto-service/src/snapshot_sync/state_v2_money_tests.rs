@@ -74,7 +74,7 @@ fn add_class(index: &mut ScanIndex, path: &Path, class: &str) {
     match class {
         "census_keep" => {
             // The retained old copy shares exact request hashes with the live
-            // member. This is #920's keep evidence, including its old window.
+            // member. These hashes justify keeping the old copy and its old window.
             let record = raw["claude_request_census"][key].clone();
             assert!(
                 record.is_object(),
@@ -471,7 +471,7 @@ classes! {
 fn v2_accepted_identity_buckets_and_ack_receipt_preserve_identical_next_upload() {
     with_e2(|| {
         let mut c = corpus("v2-accepted-identity-buckets");
-        // #909 deliberately retains uniform markerless `e2` bodies in the
+        // Accepted-share protection deliberately retains uniform markerless `e2` bodies in the
         // existing wire shape. An own captured marker exercises identity rows.
         let marker = json!({"type":"attachment", "sessionId":ROOT,
             "attachment":{"type":"credential_org",

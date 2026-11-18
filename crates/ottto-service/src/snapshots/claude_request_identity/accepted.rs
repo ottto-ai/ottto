@@ -746,7 +746,7 @@ impl AcceptedBuckets {
     /// may have frozen `session`'s bucket at `bucket_start`. Known hints
     /// answer exactly; incomplete hints (whole buckets evicted) or an
     /// unparsable start answer yes. Without hints for the session the answer
-    /// is no, the same reach as #909's own protection (`accepted_state_unknown`).
+    /// is no, the same reach as accepted-share protection (`accepted_state_unknown`).
     #[cfg(test)]
     pub(crate) fn may_have_accepted(&self, session: &str, bucket_start: &str) -> bool {
         self.get(session).is_some_and(|state| {

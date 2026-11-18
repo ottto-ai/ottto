@@ -1310,9 +1310,8 @@ fn codec_page(
 
 /// [regress] A source with a Tail codec keeps no reduction in RAM, on a
 /// state database route or off one: retention and the take key on the codec
-/// alone. A split rule kept a copy it never took and read Full every time
-/// (CX1 S2b run 41569018173: 27 Codex rows); RAM off a route was a second
-/// continuation beside the database (conformance B2).
+/// alone. The old split rule kept an unused copy and forced every Codex read
+/// in the sample to be Full. That copy also duplicated the database continuation.
 #[test]
 fn an_unrouted_codec_source_keeps_no_ram_copy() {
     use crate::snapshots::e2_pipeline_scan_fixture::tail_counter_for_test;

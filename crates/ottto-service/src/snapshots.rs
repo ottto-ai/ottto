@@ -282,8 +282,7 @@ pub const USAGE_DECREASE_HOLD_ACK_CONTRACT: &str = "usage_decrease_hold_ack:v1";
 /// behind each stored ref's body witness. Older servers ignore the field.
 pub const CACHE_STATE_ACK_CONTRACT: &str = "cache_state_ack:v1";
 // SnapshotStatusRequest endpoint stayed at v5; only the batch endpoint
-// cut over to v6 in this change. Backend's AgentSessionSnapshotStatusRequest
-// is still Literal[5] (backend/app/schemas/agent_session_snapshots.py).
+// cut over to v6. The receiver's status request model still requires v5.
 pub const SNAPSHOT_STATUS_SCHEMA_VERSION: u16 = 5;
 // The per-request long-context price bucket (`provider_context_bucket`)
 // restates recent Codex history once. It rides the release's single bundled

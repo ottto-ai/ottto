@@ -345,7 +345,7 @@ impl SyncCounts {
         self.cooldown_conflict_deferred = index.reason_reoffer_cooldown_deferred_count();
         self.snapshot_unproven_terminal_count = index.snapshot_unproven_terminal_count() as u64;
         self.snapshot_superseded_terminal_count = index.snapshot_superseded_terminal_count() as u64;
-        // Mirror #389's disclosed-loss convention: terminal unproven entities
+        // Follow the existing disclosed-loss convention: terminal unproven entities
         // also contribute to the established incomplete-evidence health scalar.
         self.ownership_incomplete_file_count = self
             .ownership_incomplete_file_count
