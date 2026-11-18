@@ -9,7 +9,7 @@ use super::{source_count, source_slot, CHANGE_REASON_START};
 use crate::snapshots::ScanIndex;
 use crate::transcript_acquisition::{FullReason, ReadMode};
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::Ordering::Relaxed;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,19 +46,43 @@ pub(crate) enum AdminCause {
     Memo,
     /// A new file after a fresh index without prior-history evidence.
     NewFileFreshIndex,
+    Audit,
     #[default]
     Other,
 }
-const CAUSES: [&str; 7] = [
+const CAUSES: [&str; 8] = [
     "fingerprint_object",
     "fingerprint_unattributed",
     "adoption",
     "rearm",
     "memo",
     "new_file_fresh_index",
+    "audit",
     "other",
 ];
 const CAUSE_FIELDS: [&str; 2] = ["files", "native_bytes"];
+/// The Tail restore outcome of a read's selection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Restore {
+    Bypass,
+    Miss,
+    Hit,
+    HitDiscardedByCap,
+}
+/// Selection-time labels of a read: its restore outcome and retry provenance.
+#[derive(Clone, Copy, Debug, Default)]
+struct Context {
+    restore: Option<&'static str>,
+    audit_cap: bool,
+    partial_save: bool,
+}
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+struct Cells {
+    files: u64,
+    native_bytes: u64,
+}
+/// Bounds the partial-save restore flags awaiting their next selection.
+const RESTORED_CAP: usize = 4096;
 const TOKENS: [&str; 13] = [
     "append",
     "finalizer_revision",
@@ -134,9 +158,14 @@ impl Upload {
     };
 }
 struct Tags {
-    /// Index key -> (source slot, first cause, `admin_other` cause),
-    /// selection to upload.
-    files: BTreeMap<String, (usize, Token, AdminCause)>,
+    /// Index key -> (source slot, first cause, `admin_other` cause, read
+    /// context), selection to upload.
+    files: BTreeMap<String, (usize, Token, AdminCause, Context)>,
+    /// Index keys whose prior entry a partial save restored, until their next
+    /// selection; at most `RESTORED_CAP`.
+    restored: BTreeSet<String>,
+    /// Per source: `admin_other` reads by joint label, until the page line.
+    admin: [BTreeMap<String, Cells>; 3],
     sessions: BTreeMap<String, u8>,
     /// Per source: the cause of a `NewFile`, decided at index load.
     new_file: [Token; 3],
@@ -149,6 +178,8 @@ struct Tags {
 impl Tags {
     const NEW: Self = Self {
         files: BTreeMap::new(),
+        restored: BTreeSet::new(),
+        admin: [BTreeMap::new(), BTreeMap::new(), BTreeMap::new()],
         sessions: BTreeMap::new(),
         new_file: [Token::Append; 3],
         policy: [0; 3],
@@ -239,9 +270,10 @@ pub(crate) fn selected(source: &str, key: String, token: Token, cause: AdminCaus
     with_tags(|tags| {
         // A Tail load refused on an owed head-CAS answer tags its read first;
         // the selection tag that follows keeps it.
-        let tag = tags.files.entry(key).or_insert((slot, token, cause));
-        if tag.1 != Token::HeadConflict {
-            *tag = (slot, token, cause);
+        let tag = (slot, token, cause, Context::default());
+        let old = tags.files.entry(key).or_insert(tag);
+        if old.1 != Token::HeadConflict {
+            *old = tag;
         }
     });
 }
@@ -263,7 +295,7 @@ pub(crate) fn read(
         )
     );
     let (token, cause) = with_tags(|tags| match tags.files.get_mut(key) {
-        Some((_, token, cause)) => {
+        Some((_, token, cause, _)) => {
             if reset && *token == Token::Append {
                 *token = Token::SourceReset;
             }
@@ -288,6 +320,93 @@ pub(crate) fn read(
         }
     }
 }
+/// A partial save restored this key's prior entry (process-local only).
+pub(crate) fn partial_save_restored(key: &str) {
+    with_tags(|tags| {
+        if tags.restored.len() < RESTORED_CAP {
+            tags.restored.insert(key.to_owned());
+        }
+    });
+}
+/// Right after selection: the restore outcome, with `(seal, indexed size,
+/// opening extent)` on a kept hit, and the retry provenance (an outstanding
+/// audit-cap clear; a partial-save restore flag, read and cleared here).
+pub(crate) fn read_context(key: &str, restore: Restore, extent: Option<(u64, u64, u64)>) {
+    let audit_cap = super::rearm_cause::audit_cap_cleared(key);
+    let restore = match (restore, extent) {
+        (Restore::Hit, Some((seal, indexed, opening))) => {
+            match (seal < indexed, opening > indexed) {
+                (true, true) => "hit.both",
+                (true, false) => "hit.indexed_gap",
+                (false, true) => "hit.new_bytes",
+                (false, false) => "hit.neither",
+            }
+        }
+        (Restore::Hit, None) => "hit",
+        (Restore::Miss, _) => "miss",
+        (Restore::Bypass, _) => "bypass",
+        (Restore::HitDiscardedByCap, _) => "hit_discarded_by_cap",
+    };
+    with_tags(|tags| {
+        let partial_save = tags.restored.remove(key);
+        if let Some(tag) = tags.files.get_mut(key) {
+            tag.3 = Context {
+                restore: Some(restore),
+                audit_cap,
+                partial_save,
+            };
+        }
+    });
+}
+/// Every completed body read, with or without an acquisition plan
+/// `(mode, native bytes)`. An `admin_other` read counts under
+/// `<cause>.<mode>`, `<cause>.restore.<outcome>` and
+/// `<cause>.retry.<provenance>`. Without a plan its parser bytes count under
+/// `no_plan`, never in `read`, so the planned rows still reconcile.
+pub(crate) fn admin_read(
+    source: &str,
+    key: &str,
+    plan: Option<(ReadMode, u64)>,
+    parser_bytes: u64,
+) {
+    let Some(slot) = source_slot(source) else {
+        return;
+    };
+    let (mode, bytes) = match plan {
+        Some((ReadMode::Full(reason), bytes)) => {
+            let reason = serde_json::to_value(reason).unwrap_or_default();
+            (
+                format!("full:{}", reason.as_str().unwrap_or("unknown")),
+                bytes,
+            )
+        }
+        Some((ReadMode::Tail, bytes)) => ("tail".to_owned(), bytes),
+        Some((ReadMode::Unchanged, bytes)) => ("unchanged".to_owned(), bytes),
+        None => ("no_plan".to_owned(), parser_bytes),
+    };
+    with_tags(|tags| {
+        let Some(&(_, Token::AdminOther, cause, context)) = tags.files.get(key) else {
+            return;
+        };
+        let labels = [
+            Some(mode),
+            context.restore.map(|outcome| format!("restore.{outcome}")),
+            context
+                .audit_cap
+                .then(|| "retry.audit_cap_clear".to_owned()),
+            context
+                .partial_save
+                .then(|| "retry.partial_save_restore".to_owned()),
+        ];
+        for label in labels.into_iter().flatten() {
+            let cells = tags.admin[slot]
+                .entry(format!("{}.{label}", CAUSES[cause as usize]))
+                .or_default();
+            cells.files = cells.files.saturating_add(1);
+            cells.native_bytes = cells.native_bytes.saturating_add(bytes);
+        }
+    });
+}
 /// Claude identity tagging: `moved` is `None` without complete accepted state.
 pub(crate) fn claude_placement(session: &str, moved: Option<bool>) {
     if let Some(moved) = moved {
@@ -306,7 +425,7 @@ pub(crate) fn propagate(source: &str, index: &ScanIndex) {
     };
     with_tags(|tags| {
         let mut entities = BTreeMap::new();
-        tags.files.retain(|key, (owner, token, _)| {
+        tags.files.retain(|key, (owner, token, _, _)| {
             if *owner != slot {
                 return true;
             }
@@ -439,6 +558,9 @@ pub(crate) struct Page {
     /// `admin_other` reads per selection cause.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     admin_other_cause: BTreeMap<&'static str, BTreeMap<&'static str, u64>>,
+    /// `admin_other` reads by joint label, from `admin_read`.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    admin_other_read: BTreeMap<String, Cells>,
     unknown: [&'static str; 2],
 }
 pub(crate) fn drain(source: &str) -> Option<Page> {
@@ -479,8 +601,14 @@ pub(crate) fn drain(source: &str) -> Option<Page> {
             page.admin_other_cause.insert(name, row);
         }
     }
-    (!page.upload.is_empty() || !page.read.is_empty() || !page.sub_counts.is_empty())
-        .then_some(page)
+    if let Some(slot) = source_slot(source) {
+        page.admin_other_read = with_tags(|tags| std::mem::take(&mut tags.admin[slot]));
+    }
+    (!page.upload.is_empty()
+        || !page.read.is_empty()
+        || !page.sub_counts.is_empty()
+        || !page.admin_other_read.is_empty())
+    .then_some(page)
 }
 
 #[cfg(test)]
@@ -579,6 +707,7 @@ mod tests {
             (C::Rearm, "rearm"),
             (C::Memo, "memo"),
             (C::NewFileFreshIndex, "new_file_fresh_index"),
+            (C::Audit, "audit"),
             (C::Other, "other"),
         ];
         for (n, (cause, name)) in (1u64..).zip(cases) {
@@ -610,5 +739,101 @@ mod tests {
         );
         assert_eq!(page["admin_other_cause"].as_object().unwrap().len(), 1);
         assert!(page.get("admin_other_fingerprint_refold_files").is_none());
+    }
+
+    /// [behaviour] An `admin_other` read counts under its cause with its
+    /// actual mode (no-plan parser bytes never in `read`) and its restore
+    /// outcome, a kept hit by its seal against index size and opening extent.
+    #[test]
+    fn admin_other_read_counts_mode_and_restore() {
+        let full = Some((ReadMode::Full(FullReason::StateMissing), 7));
+        let cases = [
+            (
+                Restore::Hit,
+                Some((5, 10, 12)),
+                Some((ReadMode::Tail, 3)),
+                "hit.both",
+                "tail",
+            ),
+            (
+                Restore::Hit,
+                Some((5, 10, 10)),
+                Some((ReadMode::Unchanged, 0)),
+                "hit.indexed_gap",
+                "unchanged",
+            ),
+            (
+                Restore::Hit,
+                Some((10, 10, 12)),
+                full,
+                "hit.new_bytes",
+                "full:state_missing",
+            ),
+            (
+                Restore::Hit,
+                Some((10, 10, 10)),
+                full,
+                "hit.neither",
+                "full:state_missing",
+            ),
+            (Restore::Hit, None, full, "hit", "full:state_missing"),
+            (Restore::Miss, None, full, "miss", "full:state_missing"),
+            (
+                Restore::HitDiscardedByCap,
+                Some((5, 10, 12)),
+                full,
+                "hit_discarded_by_cap",
+                "full:state_missing",
+            ),
+            (Restore::Bypass, None, None, "bypass", "no_plan"),
+        ];
+        for (restore, extent, plan, outcome, mode) in cases {
+            selected("pi", "k".into(), Token::AdminOther, AdminCause::Rearm);
+            read_context("k", restore, extent);
+            admin_read("pi", "k", plan, 9);
+            let bytes = plan.map_or(9, |(_, bytes)| bytes);
+            let page = serde_json::to_value(drain("pi").unwrap()).unwrap();
+            let labels = page["admin_other_read"].as_object().unwrap();
+            assert_eq!(labels.len(), 2, "{outcome}");
+            for label in [format!("rearm.restore.{outcome}"), format!("rearm.{mode}")] {
+                assert_eq!(labels[&label]["files"], 1, "{label}");
+                assert_eq!(labels[&label]["native_bytes"], bytes, "{label}");
+            }
+            assert!(page.get("read").is_none(), "{outcome}");
+        }
+    }
+
+    /// [behaviour] Retry provenance: an outstanding audit-cap clear, and a
+    /// partial-save restore flag that the next selection reads and clears.
+    /// Another first cause counts nowhere.
+    #[test]
+    fn admin_other_read_counts_retry_provenance() {
+        use crate::local_resource_diagnostics::rearm_cause::{self, Cause};
+        let mut entry = crate::snapshots::ScanIndexEntry {
+            source_file_fingerprint: "old".into(),
+            ..Default::default()
+        };
+        rearm_cause::clear("cap", &mut entry, Cause::AuditCapDelay);
+        partial_save_restored("saved");
+        let read_once = |key: &str, token| {
+            selected("pi", key.into(), token, AdminCause::Other);
+            read_context(key, Restore::Bypass, None);
+            admin_read("pi", key, None, 4);
+        };
+        for key in ["cap", "saved", "plain"] {
+            read_once(key, Token::AdminOther);
+        }
+        let page = serde_json::to_value(drain("pi").unwrap()).unwrap();
+        let labels = page["admin_other_read"].as_object().unwrap();
+        assert_eq!(labels["other.retry.audit_cap_clear"]["native_bytes"], 4);
+        assert_eq!(labels["other.retry.partial_save_restore"]["files"], 1);
+        assert_eq!(labels["other.no_plan"]["files"], 3);
+        assert_eq!(labels["other.restore.bypass"]["native_bytes"], 12);
+        read_once("saved", Token::AdminOther);
+        read_once("kept", Token::CopyOwnership);
+        let page = serde_json::to_value(drain("pi").unwrap()).unwrap();
+        let labels = page["admin_other_read"].as_object().unwrap();
+        assert_eq!(labels.len(), 2, "the flag was cleared at selection");
+        assert_eq!(labels["other.no_plan"]["files"], 1);
     }
 }

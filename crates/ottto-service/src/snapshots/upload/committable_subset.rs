@@ -131,6 +131,7 @@ impl ScanIndex {
                         exact_only,
                     );
                 }
+                crate::local_resource_diagnostics::change_reason::partial_save_restored(key);
                 files.insert(key.clone(), committed.clone());
             }
         }

@@ -63,6 +63,7 @@ impl ScanIndex {
                 return (self.revision_change_reason(key), AdminCause::Adoption);
             }
             Some(R::Rearmed) => return (Token::AdminOther, AdminCause::Rearm),
+            Some(R::Audit) => return (Token::AdminOther, AdminCause::Audit),
             Some(R::UploadContext) if delivered() && counts::privacy_off(source.api_slug()) => {
                 Token::PrivacyOffErase
             }
@@ -261,7 +262,8 @@ mod tests {
             (R::BodyWitnessAdoption, None, 5, "adoption"),
             (R::Rearmed, None, 5, "rearm"),
             (R::NewFile, None, 5, "new_file_fresh_index"),
-            (R::Audit, None, 5, "other"),
+            (R::Audit, None, 5, "audit"),
+            (R::UnknownOutcome, None, 5, "other"),
         ];
         for (reason, change, changed_nanos, expected) in cases {
             let mut index = ScanIndex::default();
