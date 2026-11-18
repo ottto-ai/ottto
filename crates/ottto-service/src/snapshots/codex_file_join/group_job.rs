@@ -19,56 +19,20 @@ use sampled_scan::codex_cursor::{self as cursor, DisclosureTargets, OpenStamp};
 /// (`probe_bound`); a refusal then is strict `ProbeBudgetOrder`.
 const PROBE_BYTES: usize = 1024 * 1024;
 
-/// The accumulator creation point for continuous group replay (§k.4): the group's
-/// counting state is configured here, once, from every member's evidence
-/// (#603 `configure_group_once`). Only the reader is swapped per member, so
-/// no member reconfigures it. The legacy tee (`legacy_tee`) stays
-/// unconfigured: it is baseline evidence, not a second counted stream.
+/// One V2 accumulator is carried across a continuous group's members.
 pub(in crate::snapshots) fn new_group_parser(
     file: File,
     member: &CandidateFile,
     metadata: &CodexTitleMetadata,
-    evidence: sources::codex::counting::version::AckEvidence,
 ) -> Result<Box<OwnedJsonlParser>> {
-    let mut parser = OwnedJsonlParser::new(
+    let parser = OwnedJsonlParser::new(
         file,
         &member.path,
         SnapshotSource::Codex,
         apply_codex_line,
         Some(metadata),
     )?;
-    sources::codex::counting::version::configure_group_once(&mut parser.accumulator, evidence);
     Ok(Box::new(parser))
-}
-
-#[cfg(test)]
-thread_local! {
-    static TEST_V2: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Tests only: replay groups as V2 counting (§k.3) while cutover is None.
-#[cfg(test)]
-pub(in crate::snapshots) fn with_test_v2<T>(run: impl FnOnce() -> T) -> T {
-    struct Reset;
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            TEST_V2.with(|v2| v2.set(false));
-        }
-    }
-    TEST_V2.with(|v2| v2.set(true));
-    let _reset = Reset;
-    run()
-}
-
-/// The replay counts under V2 (§k.3): the accumulator's own decision, made
-/// on the session's first owned record (false before it and while the
-/// cutover is None).
-pub(in crate::snapshots) fn group_counting_is_v2(accumulator: &SnapshotAccumulator) -> bool {
-    #[cfg(test)]
-    if TEST_V2.with(std::cell::Cell::get) {
-        return true;
-    }
-    accumulator.codex_counting_v2()
 }
 
 fn filename_owner(path: &Path) -> Option<(String, bool)> {
@@ -295,13 +259,11 @@ pub(in crate::snapshots) struct GroupBoot {
     charge: u64,
     previous_receipts: BTreeMap<String, (Option<AppliedTierReceipt>, bool)>,
     receipt_scope: String,
-    legacy_expected: BTreeMap<String, String>,
-    evidence: sources::codex::counting::version::AckEvidence,
     independent: bool,
 }
 crate::heap_layout_bound::fields!(GroupBoot; group, key, identified, stamps, wake_identities, headers, plan,
     probes, probed, ordered, admitted, probe_bound, probe_limit_bound, own_page, probe_allowance,
-    charge, previous_receipts, receipt_scope, legacy_expected, evidence, independent);
+    charge, previous_receipts, receipt_scope, independent);
 
 impl GroupBoot {
     pub(in crate::snapshots) fn new(group: Group, index: &ScanIndex) -> Self {
@@ -310,23 +272,12 @@ impl GroupBoot {
             .clone()
             .unwrap_or_default();
         let mut previous_receipts = BTreeMap::new();
-        let mut legacy_expected = BTreeMap::new();
         for member in &group.members {
             let key = local_index_key(&member.path);
             if let Some(entry) = index.files.get(&key) {
-                if entry.codex_joined_member_set.is_none()
-                    && entry.codex_captured_joined_member_set.is_none()
-                    && entry.codex_applied_tier_receipt.is_none()
-                    && entry.codex_captured_tier_receipt.is_none()
-                {
-                    if let Some(expected) = &entry.last_snapshot_fingerprint {
-                        legacy_expected.insert(key.clone(), expected.clone());
-                    }
-                }
                 previous_receipts.insert(key, receipt_state(Some(entry)));
             }
         }
-        let evidence = sources::codex::counting::version::members_evidence(&group.members, index);
         let independent = independent_group(&group);
         Self {
             independent,
@@ -348,8 +299,6 @@ impl GroupBoot {
             charge: 0,
             previous_receipts,
             receipt_scope,
-            legacy_expected,
-            evidence,
         }
     }
 
@@ -404,6 +353,14 @@ impl GroupBoot {
         cache: Option<&Arc<sampled_scan::SharedCache>>,
     ) -> Boot {
         let n = self.group.members.len();
+        if self.identified == 0
+            && self.group.members.iter().all(|member| {
+                sources::codex::counting::version::unchanged_legacy(index, &member.path)
+            })
+        {
+            return Boot::Unchanged;
+        }
+
         if self.independent && self.identified == 0 {
             let mut members = self.group.members.clone();
             let quiet = members.iter_mut().all(|member| {
@@ -452,6 +409,12 @@ impl GroupBoot {
         // A changed member stays owed rather than rereading sealed accepted
         // history or publishing a survivor-only replacement.
         if self.independent
+            && !self.group.members.iter().any(|member| {
+                sources::codex::counting::version::proven_legacy(
+                    index,
+                    &local_index_key(&member.path),
+                )
+            })
             && self.group.members.iter().any(|member| {
                 let key = local_index_key(&member.path);
                 index.files.get(&key).is_some_and(|entry| {
@@ -736,11 +699,7 @@ impl GroupBoot {
     }
 
     /// M-1 `scope_job` with the group's wake dependencies (§d.4).
-    pub(in crate::snapshots) fn memo_digest(
-        &self,
-        index: &ScanIndex,
-        codex: &CodexTitleMetadata,
-    ) -> Option<String> {
+    pub(in crate::snapshots) fn memo_digest(&self, codex: &CodexTitleMetadata) -> Option<String> {
         let order = self.canonical_order();
         let (_, live) = self.live()?;
         Some(cursor::group_memo_digest(
@@ -754,7 +713,6 @@ impl GroupBoot {
                 .iter()
                 .map(|i| self.headers.get(*i).map_or("", MemberHeader::digest))
                 .collect::<Vec<_>>(),
-            index,
             codex,
             |member| self.wake_identity(member),
         ))
@@ -772,7 +730,7 @@ impl GroupBoot {
         self,
         inputs: JobInputs<'_>,
     ) -> std::result::Result<Box<OwnedActiveFile>, GroupEnd> {
-        let memo_digest = self.memo_digest(inputs.index, inputs.metadata);
+        let memo_digest = self.memo_digest(inputs.metadata);
         let dependencies = self.dependencies(inputs.metadata);
         let Self {
             group,
@@ -785,8 +743,6 @@ impl GroupBoot {
             own_page,
             previous_receipts,
             receipt_scope,
-            legacy_expected,
-            evidence,
             independent,
             ..
         } = self;
@@ -821,22 +777,15 @@ impl GroupBoot {
         if opened.opened_object_identity != first.opened_object_identity {
             return Err(GroupEnd::Changed);
         }
-        let tee = if independent {
-            None
-        } else {
-            legacy_tee(&legacy_expected, &first, &file, inputs.metadata)?
-        };
         let mut parser = if independent {
-            independent_fold::parser(file, &first, inputs.metadata, inputs.index, inputs.cache)?
+            independent_fold::parser(file, &first, inputs.metadata, inputs.cache)?
         } else {
-            new_group_parser(file, &first, inputs.metadata, evidence)
-                .map_err(|_| GroupEnd::Strict)?
+            new_group_parser(file, &first, inputs.metadata).map_err(|_| GroupEnd::Strict)?
         };
-        let v2 = group_counting_is_v2(&parser.accumulator);
         let mut join = Box::new(if independent {
             StreamProof::independent(group.owner.clone(), members.len())
         } else {
-            StreamProof::new(group.owner.clone(), v2, plan.plans)
+            StreamProof::new(group.owner.clone(), plan.plans)
         });
         join.begin_member(0);
         let previous = previous_receipts
@@ -882,9 +831,6 @@ impl GroupBoot {
                 finished: false,
                 previous_receipts,
                 receipt_scope,
-                legacy_expected,
-                tee,
-                legacy_baselines: Vec::new(),
                 lines: (0, 0),
                 charge: 0,
                 probe_bound,
@@ -917,30 +863,6 @@ fn open_member_file(member: &mut CandidateFile) -> std::result::Result<File, Gro
     }
 }
 
-/// A member that was indexed as its own file before it joined keeps its
-/// legacy pricing baseline: the same records, applied to a second parser in
-/// the same pass (no extra read), finished like the pre-P2 proof parser.
-fn legacy_tee(
-    legacy_expected: &BTreeMap<String, String>,
-    member: &CandidateFile,
-    file: &File,
-    metadata: &CodexTitleMetadata,
-) -> std::result::Result<Option<Box<OwnedJsonlParser>>, GroupEnd> {
-    if !legacy_expected.contains_key(&local_index_key(&member.path)) {
-        return Ok(None);
-    }
-    let clone = file.try_clone().map_err(|_| GroupEnd::Strict)?;
-    OwnedJsonlParser::new(
-        clone,
-        &member.path,
-        SnapshotSource::Codex,
-        apply_codex_line,
-        Some(metadata),
-    )
-    .map(|tee| Some(Box::new(tee)))
-    .map_err(|_| GroupEnd::Strict)
-}
-
 /// The running group job, carried by its `OwnedActiveFile`.
 pub(in crate::snapshots) struct GroupJob {
     pub(in crate::snapshots) key: String,
@@ -955,9 +877,6 @@ pub(in crate::snapshots) struct GroupJob {
     finished: bool,
     previous_receipts: BTreeMap<String, (Option<AppliedTierReceipt>, bool)>,
     receipt_scope: String,
-    legacy_expected: BTreeMap<String, String>,
-    tee: Option<Box<OwnedJsonlParser>>,
-    legacy_baselines: Vec<LegacyBaseline>,
     /// Physical and parsed line counts of the completed members.
     lines: (usize, usize),
     charge: u64,
@@ -978,15 +897,9 @@ pub(in crate::snapshots) struct GroupJob {
     pub(in crate::snapshots) contributions: Vec<SnapshotItem>,
 }
 crate::heap_layout_bound::fields!(GroupJob; key, owner, home, members, stamps, digests, current,
-    finished, previous_receipts, receipt_scope, legacy_expected, tee, legacy_baselines, lines,
+    finished, previous_receipts, receipt_scope, lines,
     charge, probe_bound, probe_limit_bound, own_page, dependencies, memo_digest, scope,
     consumed_before, independent, contributions);
-
-impl GroupJob {
-    pub(in crate::snapshots) fn take_legacy_baselines(&mut self) -> Vec<LegacyBaseline> {
-        std::mem::take(&mut self.legacy_baselines)
-    }
-}
 
 /// Bytes the group consumed outside the current reader (completed members,
 /// header rechecks) since the last call.
@@ -1032,7 +945,6 @@ pub(in crate::snapshots) struct StepInputs<'a> {
     /// The live member's acquisition scope (cursor jobs), computed on demand.
     pub(in crate::snapshots) cache: Option<&'a Arc<sampled_scan::SharedCache>>,
     pub(in crate::snapshots) collected_at: &'a str,
-    pub(in crate::snapshots) index: &'a ScanIndex,
     pub(in crate::snapshots) live_scope:
         &'a dyn Fn(&CandidateFile) -> Option<crate::transcript_acquisition::Scope>,
 }
@@ -1074,13 +986,7 @@ pub(in crate::snapshots) fn step_group(
     }
     #[cfg(test)]
     let before_body_read = active.parser.reader.consumed_bytes();
-    let stepped = {
-        let OwnedActiveFile { parser, group, .. } = &mut *active;
-        match group.as_mut().and_then(|group| group.tee.as_deref_mut()) {
-            Some(tee) => parser.step_with_observer(|value| tee.tee_line(value)),
-            None => parser.step(),
-        }
-    };
+    let stepped = active.parser.step();
     #[cfg(test)]
     terminal_contract_retry::record_group_body_bytes(
         active
@@ -1129,19 +1035,16 @@ fn member_eof(
     let member = group.members[position].clone();
     let key = local_index_key(&member.path);
     let last = position + 1 == group.members.len();
-    let lookup_parser = group
-        .tee
-        .as_deref()
-        .or_else(|| group.independent.then_some(active.parser.as_ref()));
-    if let (Some(context), Some(tee)) = (inputs.attribution, lookup_parser) {
-        let workers = tee
+    let lookup_parser = group.independent.then_some(active.parser.as_ref());
+    if let (Some(context), Some(parser)) = (inputs.attribution, lookup_parser) {
+        let workers = parser
             .accumulator
             .source_session_id
             .as_ref()
             .map(|id| vec![resolve_codex_identity(id)])
             .unwrap_or_else(|| launch_workers_for_path(SnapshotSource::Codex, &member.path));
-        // The legacy baseline below needs the lookup; park the finished
-        // member until it is prepared.
+        // Independent native finalization needs the lookup; park the member
+        // until it is prepared.
         match context.launch_events().prepare_step(&workers) {
             Ok(false) => return Ok(false),
             Err(()) => return Err(GroupEnd::Strict),
@@ -1163,7 +1066,6 @@ fn member_eof(
     if last && paged {
         apply_live_eof_record(active);
     }
-    let eof_applied = cursor::eof_applied(active);
     let end = active.parser.reader.consumed_bytes();
     let Some(mut replay) = active.parser.accumulator.codex_tier_replay.take() else {
         return Err(GroupEnd::Strict);
@@ -1171,7 +1073,6 @@ fn member_eof(
     let mut join = replay.join.take().ok_or(GroupEnd::Strict)?;
     // The version is decided on the first owned record, after the proof
     // was built; the member-end rules follow it.
-    join.decide_v2(group_counting_is_v2(&active.parser.accumulator));
     join.end_member(end);
     if last {
         join.finish_group();
@@ -1186,59 +1087,15 @@ fn member_eof(
     }
     let receipt = replay.finish().map_err(|_| GroupEnd::Strict)?;
     // The variable records this member leaves in the job (round 4, L3).
-    let mut retained = [
+    let retained = [
         crate::heap_layout_bound::completed_bound(&receipt, usize::MAX),
         crate::heap_layout_bound::completed_bound(&key, usize::MAX),
-        Some(0),
     ];
     active.applied_receipts.insert(key.clone(), receipt);
     if active.group.as_ref().is_some_and(|group| group.independent) {
         return independent_member_eof(active, join, inputs);
     }
-    let report = active.parser.reader.report;
     let group = active.group.as_deref_mut().expect("group job");
-    if let Some(mut tee) = group.tee.take() {
-        let expected = group
-            .legacy_expected
-            .get(&key)
-            .cloned()
-            .ok_or(GroupEnd::Strict)?;
-        tee.reader.finished = true;
-        tee.reader.report = report;
-        if last && paged && !eof_applied {
-            // The live member's legacy baseline reads the same frozen prefix.
-            tee.reader.sealed_prefix = active
-                .cursor
-                .as_ref()
-                .map(|meta| cursor::frozen_grant(meta, end));
-        }
-        let parsed = (*tee)
-            .finish(
-                &member.opened_object_identity,
-                &member.path,
-                "1970-01-01T00:00:00Z",
-                member.source_file_fingerprint.clone(),
-                Some(inputs.metadata),
-                None,
-                inputs.attribution,
-            )
-            .map_err(|_| GroupEnd::Strict)?;
-        if !parsed.progress_complete() {
-            return Err(GroupEnd::Strict);
-        }
-        let mut snapshots = parsed.snapshots;
-        for snapshot in &mut snapshots {
-            apply_codex_state_evidence(snapshot, inputs.metadata, &member.path);
-        }
-        let baseline = LegacyBaseline {
-            owner: group.owner.clone(),
-            index_key: key,
-            expected,
-            snapshots,
-        };
-        retained[2] = crate::heap_layout_bound::completed_bound(&baseline, usize::MAX);
-        group.legacy_baselines.push(baseline);
-    }
     if last {
         // The existing single-file optional witness can be cleared on
         // conflict. A joined body must not reach account fallback through it.
@@ -1310,9 +1167,7 @@ fn independent_member_eof(
     join: Box<StreamProof>,
     inputs: &StepInputs<'_>,
 ) -> std::result::Result<bool, GroupEnd> {
-    if active.parser.accumulator.codex_counting_v2()
-        || active.parser.accumulator.codex_creator_evidence_conflicted
-    {
+    if active.parser.accumulator.codex_creator_evidence_conflicted {
         return Err(GroupEnd::Strict);
     }
     let group = active.group.as_mut().expect("group");
@@ -1337,8 +1192,7 @@ fn independent_member_eof(
         .map_err(|_| GroupEnd::Strict)?;
     let input = std::mem::replace(&mut active.parser.reader.reader, OpenedInput::plain(held));
     input.close();
-    let parser =
-        independent_fold::parser(file, &next, inputs.metadata, inputs.index, inputs.cache)?;
+    let parser = independent_fold::parser(file, &next, inputs.metadata, inputs.cache)?;
     let mut old = std::mem::replace(&mut active.parser, parser);
     active
         .parser
@@ -1382,7 +1236,7 @@ fn independent_member_eof(
 /// EOF-record handling for a paged group's live member, at its genuine unchanged
 /// EOF only (`cursor::group_eof_record_due`): the withheld final record is
 /// applied from the buffered bytes through the same line sink, the proof
-/// and the legacy tee included, before the member's proof ends. The job
+/// before the member's proof ends. The job
 /// then gets no S12 grant (`finish_job`), so strict finish identity covers
 /// the record. Without it, a quiescent live member ending in an
 /// unterminated record would stage hourly audit debt and re-read the whole
@@ -1400,7 +1254,7 @@ fn apply_live_eof_record(active: &mut OwnedActiveFile) {
     }
     let offset = active.parser.reader.last_complete_line_end();
     let applied = {
-        let OwnedActiveFile { parser, group, .. } = &mut *active;
+        let parser = &mut active.parser;
         if let Some(join) = parser
             .accumulator
             .codex_tier_replay
@@ -1409,15 +1263,7 @@ fn apply_live_eof_record(active: &mut OwnedActiveFile) {
         {
             join.set_record_start(offset);
         }
-        let mut tee = group.as_mut().and_then(|group| group.tee.as_deref_mut());
-        parser.with_line_sink(
-            |value| {
-                if let Some(tee) = tee.as_mut() {
-                    tee.tee_line(value);
-                }
-            },
-            |reader, sink| reader.apply_sealed_fragment(sink),
-        )
+        parser.with_line_sink(|_| {}, |reader, sink| reader.apply_sealed_fragment(sink))
     };
     if applied {
         cursor::mark_eof_applied(active);
@@ -1454,8 +1300,6 @@ fn open_member(
     } else if opened.opened_object_identity != member.opened_object_identity {
         return Err(GroupEnd::Changed);
     }
-    let tee = legacy_tee(&group.legacy_expected, &member, &file, inputs.metadata)?;
-    group.tee = tee;
     // The copy budget keeps counting across the swap: no walk per member.
     group.consumed_before = group
         .consumed_before

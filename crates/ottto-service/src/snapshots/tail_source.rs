@@ -100,18 +100,28 @@ pub(in crate::snapshots) fn stored_usage(
     index: &ScanIndex,
     key: &str,
 ) -> Option<(u64, u64)> {
-    with_codec!(source, S => stored_usage_of::<S>(index, key))
+    with_codec!(source, S => stored_usage_of::<S>(index, key)).map(|acc| {
+        let totals = acc.accepted_usage_totals;
+        (totals.request_count, totals.total_tokens())
+    })
 }
 
-fn stored_usage_of<S: TailSource>(index: &ScanIndex, key: &str) -> Option<(u64, u64)> {
+fn stored_usage_of<S: TailSource>(index: &ScanIndex, key: &str) -> Option<SnapshotAccumulator> {
     if !S::USAGE_BEFORE_FINISH {
         return None;
     }
     let head = state_v2::load_head(index, key, S::REDUCTION_REVISION).ok()??;
     let mut acc = SnapshotAccumulator::new(S::SOURCE);
     S::decode_head(head.revision, &head.body, &mut acc).ok()?;
-    let totals = &acc.accepted_usage_totals;
-    Some((totals.request_count, totals.total_tokens()))
+    Some(acc)
+}
+
+pub(in crate::snapshots) fn stored_codex_legacy_totals(
+    index: &ScanIndex,
+    key: &str,
+) -> Option<UsageTotals> {
+    let acc = stored_usage_of::<codex::Codex>(index, key)?;
+    (!acc.codex_counting_v2()).then_some(acc.accepted_usage_totals)
 }
 
 /// `source`'s pending Tail write for one completion, through its codec.
@@ -1286,3 +1296,6 @@ pub(in crate::snapshots) fn renumber_device_for_test(body: &[u8], key: &str) -> 
     edited.extend_from_slice(&body[body.len() - decoder.remaining()..]);
     edited
 }
+
+#[cfg(test)]
+pub(in crate::snapshots) mod historical_codex;

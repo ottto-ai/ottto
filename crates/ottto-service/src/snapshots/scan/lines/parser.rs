@@ -373,12 +373,7 @@ impl OwnedJsonlParser {
         }
         self.step_observed(|_| {}, on_line)
     }
-    pub(in crate::snapshots) fn step_with_observer(
-        &mut self,
-        observe: impl FnMut(&Value),
-    ) -> Result<bool> {
-        self.step_observed(observe, None)
-    }
+
     fn step_observed(
         &mut self,
         observe: impl FnMut(&Value),
@@ -386,12 +381,6 @@ impl OwnedJsonlParser {
     ) -> Result<bool> {
         let step = self.with_line_sink(observe, |reader, sink| reader.step_lines(sink, on_line));
         Ok(matches!(step?, JsonlReaderStep::Complete(_)))
-    }
-
-    /// Apply one record another parser's reader produced (a group's legacy
-    /// tee, P2) through this parser's line sink; this reader is not read.
-    pub(in crate::snapshots) fn tee_line(&mut self, value: &Value) {
-        self.with_line_sink(|_| {}, |_, sink| sink(value))
     }
 
     /// Certify a complete traversal of a grown physical frozen extent.
@@ -497,6 +486,7 @@ impl OwnedJsonlParser {
         };
         drive(&mut self.reader, &mut sink)
     }
+    #[cfg(test)]
     #[expect(clippy::too_many_arguments, reason = "8 args; no options struct yet")]
     pub(in crate::snapshots) fn finish(
         self,
@@ -523,6 +513,7 @@ impl OwnedJsonlParser {
 
     /// `finish`, with a caller-supplied repository identity. `Some` is used
     /// as-is, so the finished item never re-resolves (IO) it.
+    #[cfg(test)]
     #[expect(clippy::too_many_arguments, reason = "10 args; no options struct yet")]
     pub(in crate::snapshots) fn finish_with_repository_identity(
         self,

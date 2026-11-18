@@ -929,3 +929,7 @@ mod independent {
     use super::*;
     include!("sameid_transition_tests.rs");
 }
+
+mod legacy_recount {
+    include!("codex_legacy_recount_tests.rs");
+}

@@ -908,7 +908,7 @@ fn codex_occurrences() {
     }
     write(&path, &rows);
     // Native records require the configured production counting factory.
-    let _cutover = TestCutover::set(0);
+
     let candidate = candidate(&path);
     let metadata = CodexTitleMetadata::default();
     let mut p = sampled_scan::new_source_parser(

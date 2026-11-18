@@ -1380,3 +1380,13 @@ pub(crate) mod native_cold {
         (reduction, checkpoint)
     }
 }
+
+/// Seed the compared Codex transition from the pre-change writer's frozen head.
+pub(crate) fn codex_legacy_transition_seed(
+    index: &mut super::super::ScanIndex,
+    path: &std::path::Path,
+    root: &std::path::Path,
+) {
+    use super::super::tail_source::historical_codex::{self, Frozen};
+    historical_codex::seed(index, path, root, Frozen::StickyLegacy);
+}

@@ -385,7 +385,6 @@ fn compressed_rename_keeps_all_state_without_read_or_upload() {
         let logical_entry = serde_json::to_value(&index.files[&old_key]).unwrap();
         let entity_set = index.file_snapshot_fingerprints[&old_key].clone();
         let accepted = index.accepted_snapshot_fingerprints.clone();
-        let tombstones = serde_json::to_value(&index.codex_counting_tombstones).unwrap();
         let refusals = serde_json::to_value(&index.quarantined_snapshot_fingerprints).unwrap();
         let replay = index.historical_replay_generation.clone();
         let bindings = serde_json::to_value(&index.session_account_bindings).unwrap();
@@ -423,11 +422,6 @@ fn compressed_rename_keeps_all_state_without_read_or_upload() {
         );
         assert_eq!(working.file_snapshot_fingerprints[&new_key], entity_set);
         assert_eq!(working.accepted_snapshot_fingerprints, accepted);
-        assert_eq!(
-            serde_json::to_value(&working.codex_counting_tombstones).unwrap(),
-            tombstones,
-            "carry cannot retire the predecessor or mint a counting tombstone"
-        );
         assert_eq!(
             serde_json::to_value(&working.quarantined_snapshot_fingerprints).unwrap(),
             refusals
@@ -2322,16 +2316,8 @@ fn unfunded_compressed_header_isolates_filename_owner_and_recovers() {
     let _lock = DECODER_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _cutover = sources::codex::counting::version::TestCutover::set(0);
-    let mut seed = ScanIndex::default();
-    let owner = codex_protected_owner(MAIN);
-    let tombstone = sources::codex::counting::version::CountingTombstone {
-        evidence: sources::codex::counting::version::AckEvidence::LegacyAcked,
-        retired_in: "2026-10-06T00:00:00Z".into(),
-        created_unix_ms: None,
-    };
-    seed.codex_counting_tombstones
-        .insert(owner.clone(), tombstone.clone());
+
+    let seed = ScanIndex::default();
     let c = Corpus::new();
     c.write(MAIN, Some("a"));
     c.write(OTHER, Some("b"));
@@ -2396,11 +2382,6 @@ fn unfunded_compressed_header_isolates_filename_owner_and_recovers() {
             > 0
     );
     assert_eq!(full_decodes(&logs), 0);
-    assert_eq!(
-        working.codex_counting_tombstones.get(&owner),
-        Some(&tombstone),
-        "an unresolved header cannot prove its counting owner absent"
-    );
     let pending = working
         .traversal
         .as_ref()
@@ -2425,11 +2406,6 @@ fn unfunded_compressed_header_isolates_filename_owner_and_recovers() {
     );
     let (index, posts) = working.checkpoint_with_captured_posts(&refused, &prior, "accept");
     assert_eq!(posts.len(), 1);
-    assert_eq!(
-        index.codex_counting_tombstones.get(&owner),
-        Some(&tombstone),
-        "the partial checkpoint retains the Legacy carrier"
-    );
     occupied.close();
     assert_eq!(cache.cursor_reserved(), 0);
     // Reuse an ordinary funded header, then count only the body Full below.
@@ -2463,8 +2439,8 @@ fn unfunded_compressed_header_isolates_filename_owner_and_recovers() {
     );
     assert_eq!(funded.snapshots.len(), 1);
     assert!(
-        !working.files[&local_index_key(&compressed)].codex_counting_v2,
-        "funding cannot discard the prior Legacy ACK evidence"
+        working.files[&local_index_key(&compressed)].codex_counting_v2,
+        "a funded Codex read uses V2"
     );
     let mut cold_main = cold;
     cold_main

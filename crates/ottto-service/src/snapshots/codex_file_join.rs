@@ -8,9 +8,9 @@ mod group_job;
 mod independent_fold;
 pub(super) use custody::{fan_out_body_witnesses, fan_out_offered_to_aliases};
 pub(super) use group_job::{
-    disclose_members, disclose_strict, end_group, group_counting_is_v2, job_key, rearm_unsettled,
-    refusal_disclosure, refuse_independent, step_group, take_charge, Boot, EndInputs, GroupBoot,
-    GroupEnd, GroupJob, GroupStep, JobInputs, StepInputs,
+    disclose_members, disclose_strict, end_group, job_key, rearm_unsettled, refusal_disclosure,
+    refuse_independent, step_group, take_charge, Boot, EndInputs, GroupBoot, GroupEnd, GroupJob,
+    GroupStep, JobInputs, StepInputs,
 };
 pub(super) use independent_fold::fold as fold_independent;
 
@@ -236,7 +236,7 @@ fn read_header_bytes(
     let input = OpenedInput::encoded(file, &candidate.path, cache)?.header_only();
     let mut reader = BufReader::with_capacity(1024, input.take((MAX_HEADER_BYTES + 1) as u64));
     #[cfg(all(test, unix))]
-    header_cache_tests::READ_CALLS.with(|calls| calls.set(calls.get() + 1));
+    header_cache_tests::note_read(&candidate.path);
     // Once reading begins, a failed attempt may have consumed the whole
     // recognition prefix. A funding refusal above consumes no header bytes.
     *read_work = MAX_HEADER_BYTES + 1;
@@ -807,13 +807,17 @@ impl HeaderInventory {
             } else {
                 None
             };
+            let mut physical_match = false;
             let durable = match carried.or(joined_archive) {
                 Some(facts) => Some(facts),
                 None => {
                     lookups += 1;
                     index
                         .codex_physical_matches(&key, &current)?
-                        .filter(|(matched, _)| *matched)
+                        .filter(|(matched, _)| {
+                            physical_match = *matched;
+                            *matched
+                        })
                         .and_then(|(_, head)| {
                             let facts = head.common.inventory.as_ref();
                             let owner = facts.map(|facts| facts.owner.clone()).or_else(|| {
@@ -832,6 +836,38 @@ impl HeaderInventory {
                             })
                         })
                 }
+            };
+            // An accepted Legacy file cannot be probed merely to rebuild an
+            // inventory cache. Its existing owner and physical stamps suffice;
+            // missing owner proof remains held until the content changes.
+            let durable = if durable.is_none()
+                && fallback.is_none()
+                && sources::codex::counting::version::unchanged_legacy_with(index, &key, || {
+                    physical_match
+                        || index
+                            .files
+                            .get(&key)
+                            .is_some_and(|entry| entry.same_listing_stamp_as(&current))
+                }) {
+                let owner_proof = index
+                    .files
+                    .get(&key)
+                    .and_then(sources::codex::counting::version::proven_owner)
+                    .context(HEADER_OWNERSHIP_CHANGED)?;
+                let owner = codex_session_id_candidates_from_path(&candidate.path)
+                    .into_iter()
+                    .find(|session| codex_protected_owner(session) == owner_proof)
+                    .map(|session| resolve_codex_identity(&session))
+                    .context(HEADER_OWNERSHIP_CHANGED)?;
+                Some(CachedHeader {
+                    stamp: stamp.clone(),
+                    owner,
+                    created_unix_ms: None,
+                    read_bytes: 0,
+                    durable: Some(joined),
+                })
+            } else {
+                durable
             };
             // Keep the lookup's facts for later inventories of this store.
             let keep = cache.filter(|_| route.is_some() && !carried_hit);
@@ -1238,14 +1274,6 @@ pub(super) fn member_set_witness_of<'a>(
     }
     format!("{:x}", digest.finalize())
 }
-#[derive(Clone, Debug)]
-pub(crate) struct LegacyBaseline {
-    pub(crate) owner: String,
-    pub(crate) index_key: String,
-    pub(crate) expected: String,
-    pub(crate) snapshots: Vec<SnapshotItem>,
-}
-crate::heap_layout_bound::fields!(LegacyBaseline; owner, index_key, expected, snapshots);
 const RECEIPT_VERSION: u16 = 1;
 /// Previous application evidence, not provider billing truth. Only hashes of
 /// physical records/context and the applied priority provenance are retained.
@@ -1452,17 +1480,15 @@ impl TierReplay {
         }
     }
     /// S10: the parser admitted usage from `value` (after actual admission),
-    /// under the accumulator's counting version `v2`.
+    /// under V2 turn binding.
     pub(super) fn admitted_usage(
         &mut self,
         value: &Value,
         from_last: bool,
         identity: Option<&str>,
         turn: Option<&str>,
-        v2: bool,
     ) {
         if let Some(join) = self.join.as_mut() {
-            join.decide_v2(v2);
             join.admitted_usage(value, from_last, identity, turn);
         }
     }
@@ -1507,9 +1533,6 @@ pub(super) enum JoinRefusal {
     Corrupt,
     CumulativeOnly,
     UiShape,
-    UiOnlyMember,
-    UiUnmatched,
-    UiRepeatUnproven,
     OrdinalRestart,
     HistoryBase,
     AmbiguousPredecessor,
@@ -1529,14 +1552,7 @@ impl JoinRefusal {
     /// Growth of the live member may cure these (§d.4). Every other reason,
     /// and any reason whose first failing member is sealed, is append-incurable.
     pub(super) fn append_curable(self) -> bool {
-        matches!(
-            self,
-            Self::Gap
-                | Self::UiOnlyMember
-                | Self::UiUnmatched
-                | Self::UiRepeatUnproven
-                | Self::V2UiOnlyTurn
-        )
+        matches!(self, Self::Gap | Self::V2UiOnlyTurn)
     }
 }
 crate::heap_layout_bound::no_heap!(true; JoinRefusal);
@@ -1582,10 +1598,6 @@ struct MemberState {
     natives: u64,
     admissions: u64,
     last_after: Option<Tokens>,
-    balance: BTreeMap<Tokens, i64>,
-    repeat: BTreeMap<Tokens, u64>,
-    last_admitted: Option<Tokens>,
-    native_since_admit: bool,
     usage_shaped: bool,
     next_ordinal: Option<u64>,
     last_ordinal: Option<u64>,
@@ -1624,11 +1636,10 @@ fn independent_fork_references_prefix(value: &Value, meta: &Value, owner: &str) 
 /// The group proof, fed inside the one native replay: the native side in
 /// `TierReplay::observe`, the UI side by the parser admission tap (S10)
 /// after actual admission. It moves from member to member with the replay.
-/// Only compact identities, counters and per-member tuple balances are kept.
+/// Only compact identities, counters and per-member ordinal witnesses are kept.
 #[derive(Clone, Debug)]
 pub(super) struct StreamProof {
     owner: String,
-    v2: bool,
     independent: bool,
     independent_placement: Option<Option<(String, String)>>,
     independent_classification: Option<(Option<String>, Option<String>, Option<String>)>,
@@ -1663,7 +1674,7 @@ fn proof_tree_bytes<K, V>(len: usize) -> Option<usize> {
 }
 
 impl crate::heap_layout_bound::HeapLayoutBound for StreamProof {
-    // Fixed visits per walk: the compact sets and balance maps are charged by
+    // Fixed visits per walk: the compact sets are charged by
     // length (`proof_tree_bytes`), never element by element, so a large
     // group stays within one walk's visit limit and its bytes are counted.
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
@@ -1674,8 +1685,6 @@ impl crate::heap_layout_bound::HeapLayoutBound for StreamProof {
         self.seen.heap_bound(c)?;
         self.member.starts.heap_bound(c)?;
         let trees = [
-            proof_tree_bytes::<Tokens, i64>(self.member.balance.len())?,
-            proof_tree_bytes::<Tokens, u64>(self.member.repeat.len())?,
             proof_tree_bytes::<u64, ()>(self.responses.len())?,
             proof_tree_bytes::<u64, ()>(self.ui.len())?,
             proof_tree_bytes::<u64, ()>(self.native_turns.len())?,
@@ -1690,10 +1699,9 @@ impl crate::heap_layout_bound::HeapLayoutBound for StreamProof {
 }
 
 impl StreamProof {
-    pub(super) fn new(owner: String, v2: bool, plans: Vec<MemberPlan>) -> Self {
+    pub(super) fn new(owner: String, plans: Vec<MemberPlan>) -> Self {
         Self {
             owner,
-            v2,
             independent: false,
             independent_placement: None,
             independent_classification: None,
@@ -1714,7 +1722,7 @@ impl StreamProof {
     }
 
     fn independent(owner: String, members: usize) -> Self {
-        let mut proof = Self::new(owner, false, vec![MemberPlan::default(); members]);
+        let mut proof = Self::new(owner, vec![MemberPlan::default(); members]);
         proof.independent = true;
         proof
     }
@@ -1822,6 +1830,9 @@ impl StreamProof {
             None => {}
         }
         if self.independent {
+            if string_eq_at(value, &["type"], "token_usage_record") {
+                self.observe_native(value)?;
+            }
             return Ok(());
         }
         let ordinal_member = self
@@ -1889,6 +1900,9 @@ impl StreamProof {
         if !self.responses.insert(compact(b"r:", response)) {
             return Err(JoinRefusal::Overlap);
         }
+        if self.independent {
+            return Ok(());
+        }
         match self.member.last_after {
             // A non-monotone counter inside one member is a reset.
             Some(previous) if previous != before => return Err(JoinRefusal::Gap),
@@ -1905,23 +1919,10 @@ impl StreamProof {
         let member = &mut self.member;
         member.last_after = Some(after);
         member.natives += 1;
-        member.native_since_admit = true;
-        let balance = member.balance.entry(usage).or_default();
-        *balance += 1;
-        if *balance == 0 {
-            member.balance.remove(&usage);
-        }
         if let Some(turn) = self.turn {
             self.native_turns.insert(turn);
         }
         Ok(())
-    }
-
-    /// The replay's counting version (§k.3), decided by the accumulator on
-    /// the session's first owned record, which precedes every admission and
-    /// member end; until then the value given at construction stands.
-    pub(super) fn decide_v2(&mut self, v2: bool) {
-        self.v2 = v2;
     }
 
     /// S10: the parser admitted UI usage from this record. `from_last` is
@@ -1958,43 +1959,23 @@ impl StreamProof {
             return Err(JoinRefusal::Overlap);
         }
         if self.independent {
-            return if self.v2 {
-                Err(JoinRefusal::V2UnboundUi)
-            } else {
-                Ok(())
-            };
-        }
-        let tokens = codex_last_usage_root(value)
-            .and_then(Tokens::read)
-            .ok_or(JoinRefusal::UiShape)?;
-        if self.v2 {
-            // §k.3 interim: admissions are not money under V2. Only turn
-            // binding is recorded; the group is held at its end otherwise.
-            match turn {
-                Some(turn) => {
-                    self.ui_turns.insert(compact(b"t:", turn));
-                }
-                None => self.unbound_ui = true,
-            }
             return Ok(());
         }
-        let member = &mut self.member;
-        let balance = member.balance.entry(tokens).or_default();
-        *balance -= 1;
-        if *balance == 0 {
-            member.balance.remove(&tokens);
+        codex_last_usage_root(value)
+            .and_then(Tokens::read)
+            .ok_or(JoinRefusal::UiShape)?;
+        match turn {
+            Some(turn) => {
+                self.ui_turns.insert(compact(b"t:", turn));
+            }
+            None => self.unbound_ui = true,
         }
-        if member.last_admitted == Some(tokens) && !member.native_since_admit {
-            *member.repeat.entry(tokens).or_default() += 1;
-        }
-        member.last_admitted = Some(tokens);
-        member.native_since_admit = false;
         Ok(())
     }
 
     /// Member EOF at physical offset `end`: duplicate-origin stubs must be
     /// neutral, and every UI admission must be backed by a native of the
-    /// same tuple in the same member (Legacy).
+    /// same turn in the group (V2).
     pub(super) fn end_member(&mut self, end: u64) {
         if self.independent {
             return;
@@ -2006,24 +1987,6 @@ impl StreamProof {
         let stub = self.plans.get(self.position).is_some_and(|plan| plan.stub);
         if stub && (member.usage_shaped || member.natives > 0 || member.admissions > 0) {
             self.refuse(JoinRefusal::OrdinalRestart);
-            return;
-        }
-        if !self.v2 && member.balance.values().any(|balance| *balance < 0) {
-            let reason = if member.natives == 0 {
-                JoinRefusal::UiOnlyMember
-            } else if member
-                .balance
-                .iter()
-                .filter(|(_, balance)| **balance < 0)
-                .all(|(tokens, balance)| {
-                    balance.unsigned_abs() <= member.repeat.get(tokens).copied().unwrap_or(0)
-                })
-            {
-                JoinRefusal::UiRepeatUnproven
-            } else {
-                JoinRefusal::UiUnmatched
-            };
-            self.refuse(reason);
             return;
         }
         if let Some(after) = member.last_after {
@@ -2038,7 +2001,7 @@ impl StreamProof {
 
     /// After the last member: the §k.3 interim V2 hold.
     pub(super) fn finish_group(&mut self) {
-        if self.refusal.is_some() || !self.v2 {
+        if self.refusal.is_some() || self.independent {
             return;
         }
         if self.unbound_ui {
@@ -2339,7 +2302,63 @@ pub(super) mod tests {
         json!({"input_tokens":input,"cached_input_tokens":0,"cache_write_input_tokens":0,
             "output_tokens":0,"reasoning_output_tokens":0,"total_tokens":input})
     }
+    /// Bind synthetic native records to explicit task lifetimes, as V2 requires.
+    pub(crate) fn bound_rows(rows: &[Value]) -> Vec<Value> {
+        if rows
+            .iter()
+            .any(|r| string_eq_at(r, &["payload", "type"], "task_started"))
+        {
+            return rows.to_vec();
+        }
+        let mut out = Vec::new();
+        let mut active: Option<String> = None;
+        let mut at = rows
+            .first()
+            .map(|row| row["timestamp"].clone())
+            .unwrap_or(Value::Null);
+        let event = |kind: &str, turn: &str, at: &Value| {
+            json!({"type":"event_msg",
+            "timestamp":at,"payload":{"type":kind,"turn_id":turn}})
+        };
+        for row in rows {
+            if row["timestamp"].is_string() {
+                at = row["timestamp"].clone();
+            }
+            let context = string_eq_at(row, &["type"], "turn_context");
+            let native = string_eq_at(row, &["type"], "token_usage_record");
+            if context {
+                if let Some(prior) = active.take() {
+                    out.push(event("task_complete", &prior, &at));
+                }
+            }
+            if (context || native) && active.is_none() {
+                let turn = string_at(row, &["payload", "turn_id"])
+                    .or_else(|| string_at(row, &["payload", "response_id"]))
+                    .unwrap_or_else(|| "fixture-turn".into());
+                out.push(event("task_started", &turn, &at));
+                active = Some(turn);
+            }
+            let mut row = row.clone();
+            if native && row["payload"]["turn_id"].is_null() {
+                row["payload"]["turn_id"] = json!(active);
+            }
+            out.push(row);
+        }
+        if let Some(turn) = active {
+            out.push(event("task_complete", &turn, &at));
+        }
+        out
+    }
     pub(crate) fn member(owner: &str, response: &str, input: u64, cumulative: u64) -> Vec<Value> {
+        let mut rows = bound_rows(&unbound_member(owner, response, input, cumulative));
+        rows.insert(
+            2,
+            json!({"type":"turn_context", "timestamp":rows[1]["timestamp"],
+            "payload":{"turn_id":response,"model":"gpt-5.2"}}),
+        );
+        rows
+    }
+    fn unbound_member(owner: &str, response: &str, input: u64, cumulative: u64) -> Vec<Value> {
         // Header time follows the counter: equal header bytes and size would
         // be one copied candidate (`CandidateCopy`).
         let created = format!(
@@ -2388,7 +2407,6 @@ pub(super) mod tests {
             live_scope: &no_scope,
             cache: None,
             collected_at: "2026-10-01T12:00:00Z",
-            index,
         };
         for _ in 0..10_000 {
             match step_group(&mut job, &inputs) {
@@ -3296,7 +3314,7 @@ pub(super) mod tests {
         assert!(parsed.progress_complete());
         assert_eq!(parsed.snapshots.len(), 1);
         assert_eq!(parsed.snapshots[0].input_tokens, 300);
-        assert_eq!(parsed.report.parsed_json_line_count, 6);
+        assert_eq!(parsed.report.parsed_json_line_count, 12);
         fs::remove_dir_all(root).unwrap();
     }
     thread_local! {
@@ -3328,8 +3346,13 @@ pub(super) mod tests {
         if priority {
             let turn = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
             let mut rows = member("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "r-b", 200, 300);
+            for row in &mut rows {
+                if !row["payload"]["turn_id"].is_null() {
+                    row["payload"]["turn_id"] = json!(turn);
+                }
+            }
             rows.insert(
-                1,
+                2,
                 json!({"type":"turn_context","payload":{"turn_id":turn,"model":"gpt-5.2"}}),
             );
             fs::write(
@@ -3390,7 +3413,12 @@ pub(super) mod tests {
             // An earlier non-usage line's tier, carried by the running selector.
             context["payload"]["service_tier"] = json!(tier);
         }
-        rows.insert(1, context);
+        for row in &mut rows {
+            if !row["payload"]["turn_id"].is_null() {
+                row["payload"]["turn_id"] = json!(turn);
+            }
+        }
+        rows.insert(2, context);
         fs::write(
             root.join("sessions/b.jsonl"),
             rows.iter()
@@ -3605,8 +3633,13 @@ pub(super) mod tests {
         let turn = "cccccccc-1111-4111-8111-cccccccccccc";
         let (root, _) = fixture();
         let mut rows = member(owner, "r-c", 200, 200);
+        for row in &mut rows {
+            if !row["payload"]["turn_id"].is_null() {
+                row["payload"]["turn_id"] = json!(turn);
+            }
+        }
         rows.insert(
-            1,
+            2,
             json!({"type":"turn_context","payload":{"turn_id":turn,"model":"gpt-5.2"}}),
         );
         let path = root.join("sessions/c.jsonl");
@@ -3696,25 +3729,11 @@ pub(super) mod tests {
     fn counting_v2_fixture_with(bound: bool) -> (PathBuf, [String; 2]) {
         let (root, _) = fixture();
         let owner = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
-        for (name, mut rows) in [
-            ("a", member(owner, "r-a", 100, 100)),
-            ("b", member(owner, "r-b", 200, 300)),
+        let rows = if bound { member } else { unbound_member };
+        for (name, rows) in [
+            ("a", rows(owner, "r-a", 100, 100)),
+            ("b", rows(owner, "r-b", 200, 300)),
         ] {
-            if bound {
-                let turn = format!("turn-{name}");
-                // The native names its turn (`payload.turn_id`), as Codex
-                // writes it; the UI follows inside the same open turn.
-                rows[1]["payload"]["turn_id"] = json!(turn);
-                let at = rows[0]["timestamp"].clone();
-                rows.insert(
-                    1,
-                    json!({"type":"event_msg","timestamp":at,
-                        "payload":{"type":"task_started","turn_id":turn}}),
-                );
-                let at = rows[rows.len() - 1]["timestamp"].clone();
-                rows.push(json!({"type":"event_msg","timestamp":at,
-                    "payload":{"type":"task_complete","turn_id":turn}}));
-            }
             let body = rows
                 .into_iter()
                 .map(|mut row| {
@@ -3730,65 +3749,9 @@ pub(super) mod tests {
             .map(|name| local_index_key(&root.join("sessions").join(format!("{name}.jsonl"))));
         (root, keys)
     }
-    /// The selected local ACK facts the counting mark must move with.
-    fn local_ack(
-        entry: &ScanIndexEntry,
-    ) -> (
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    ) {
-        (
-            entry.last_snapshot_fingerprint.clone(),
-            entry.last_upload_body_witness.clone(),
-            entry.codex_joined_member_set.clone(),
-            entry.codex_protected_owner.clone(),
-        )
-    }
-    /// Finalizes one scan, saves its selected index over `file` (compare-and-
-    /// swap against the generation it was loaded at) and reloads it.
-    fn save_selected(
-        root: &Path,
-        file: &str,
-        mut working: ScanIndex,
-        mut result: SourceScanResult,
-        previous: &ScanIndex,
-        hold_owner: Option<&str>,
-    ) -> ScanIndex {
-        finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut working);
-        if let Some(owner) = hold_owner {
-            result.hold_codex_groups(
-                &mut working,
-                previous,
-                &BTreeSet::from([resolve_codex_identity(owner)]),
-                "synthetic counting hold",
-            );
-        }
-        result.finish_codex_capture_boundary(&mut working);
-        let accepted = result
-            .snapshots
-            .iter()
-            .map(|item| item.snapshot_fingerprint.clone())
-            .collect::<BTreeSet<_>>();
-        let path = root.join(file);
-        working
-            .committable_subset(previous, &accepted, &BTreeMap::new())
-            .save(&path)
-            .unwrap();
-        ScanIndex::load(&path).unwrap()
-    }
     #[test]
     fn counting_v2_group_is_configured_once_and_folded_once() {
         let (root, keys) = counting_v2_fixture();
-        let (legacy_index, legacy) = {
-            // The fixture's October 1 headers predate the frozen cutover.
-            let _cutover = sources::codex::counting::version::TestCutover::set(
-                sources::codex::counting::version::CODEX_COUNTING_V2_CUTOVER_UNIX_MS,
-            );
-            scan(&root, ScanIndex::default(), 2)
-        };
-        let _cutover = sources::codex::counting::version::TestCutover::set(0);
         let (index, counted) = scan(&root, ScanIndex::default(), 2);
         assert_eq!(counted.snapshots.len(), 2, "one alias per physical member");
         let receipts = counted
@@ -3803,73 +3766,9 @@ pub(super) mod tests {
         assert_eq!(receipts.ui_in_unbound_span, 0);
         for key in &keys {
             assert!(index.files[key].codex_counting_v2, "V2 marks every member");
-            assert!(!legacy_index.files[key].codex_counting_v2);
         }
-        let legacy_receipts = legacy
-            .codex_counting_v2
-            .as_deref()
-            .expect("a pre-cutover Legacy scan still reports bookkeeping");
-        assert_eq!(legacy_receipts.v2_sessions, 0);
-        assert_eq!(legacy_receipts.native_counted, 0);
-        assert_eq!(legacy_receipts.tombstone_count, 0);
-        assert_eq!(
-            legacy_receipts.tombstone_cap,
-            sources::codex::counting::version::MAX_COUNTING_TOMBSTONES as u64
-        );
-        for (counted, legacy) in counted.snapshots.iter().zip(&legacy.snapshots) {
-            assert_eq!(counted.input_tokens, legacy.input_tokens);
+        for counted in &counted.snapshots {
             assert_eq!(counted.input_tokens, 300);
-        }
-        fs::remove_dir_all(root).unwrap();
-    }
-    #[test]
-    fn counting_v2_member_mark_moves_only_with_the_selected_saved_ack() {
-        let (root, keys) = counting_v2_fixture();
-        let owner = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
-        let previous = {
-            let _cutover = sources::codex::counting::version::TestCutover::set(0);
-            let (index, result) = scan(&root, ScanIndex::default(), 2);
-            save_selected(&root, "v2.json", index, result, &ScanIndex::default(), None)
-        };
-        for key in &keys {
-            assert!(previous.files[key].codex_counting_v2, "saved V2 ACK");
-            assert!(previous.files[key].last_snapshot_fingerprint.is_some());
-        }
-        // The held and settled outcomes are alternatives: each starts from its
-        // own copy of the saved index the cycle loaded.
-        for file in ["held.json", "settled.json"] {
-            fs::copy(root.join("v2.json"), root.join(file)).unwrap();
-        }
-        // New content, parsed by an inactive build: a Legacy group decision.
-        let path = root.join("sessions/b.jsonl");
-        let mut text = fs::read_to_string(&path).unwrap();
-        for row in member(owner, "r-c", 200, 500).into_iter().skip(1) {
-            text.push_str(&(serde_json::to_string(&row).unwrap() + "\n"));
-        }
-        fs::write(&path, text).unwrap();
-        let legacy_scan = || {
-            let (working, result) = scan(&root, previous.clone(), 2);
-            for key in &keys {
-                assert!(!working.files[key].codex_counting_v2);
-            }
-            (working, result)
-        };
-        // A held group restores the old mark with the old ACK in saved state.
-        let (working, result) = legacy_scan();
-        let held = save_selected(&root, "held.json", working, result, &previous, Some(owner));
-        for key in &keys {
-            assert!(held.files[key].codex_counting_v2, "mark kept with its ACK");
-            assert_eq!(local_ack(&held.files[key]), local_ack(&previous.files[key]));
-        }
-        // Paired control: the selected save records false with the new facts.
-        let (working, result) = legacy_scan();
-        let settled = save_selected(&root, "settled.json", working, result, &previous, None);
-        for key in &keys {
-            assert!(!settled.files[key].codex_counting_v2, "false with new ACK");
-            assert_ne!(
-                settled.files[key].last_snapshot_fingerprint,
-                previous.files[key].last_snapshot_fingerprint
-            );
         }
         fs::remove_dir_all(root).unwrap();
     }
@@ -3879,10 +3778,16 @@ pub(super) mod tests {
         let owner = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
         let turn = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
         let mut rows = member(owner, "r-b", 200, 300);
+        for row in &mut rows {
+            if !row["payload"]["turn_id"].is_null() {
+                row["payload"]["turn_id"] = json!(turn);
+            }
+        }
         rows.insert(
-            1,
+            2,
             json!({"type":"turn_context","payload":{"turn_id":turn,"model":"gpt-5.2"}}),
         );
+        rows.pop(); // Leave the native-backed task open across the accepted prefix.
         fs::write(
             root.join("sessions/b.jsonl"),
             rows.iter()
@@ -3911,7 +3816,17 @@ pub(super) mod tests {
             entry.codex_applied_tier_receipt_required = entry.codex_applied_tier_receipt.is_some();
         }
         let appended = member(owner, "r-c", 200, 500);
-        rows.extend(appended.into_iter().skip(1));
+        rows.extend(appended.into_iter().filter_map(|mut row| {
+            if row["type"] == "token_usage_record" {
+                row["payload"]["turn_id"] = json!(turn);
+                Some(row)
+            } else if string_eq_at(&row, &["payload", "type"], "token_count") {
+                Some(row)
+            } else {
+                None
+            }
+        }));
+        rows.push(json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":turn}}));
         fs::write(
             root.join("sessions/b.jsonl"),
             rows.iter()
@@ -3972,7 +3887,7 @@ pub(super) mod tests {
                 .unwrap()
                 .tiers
                 .len(),
-            1
+            2
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -5286,10 +5201,11 @@ pub(super) mod tests {
                 .0
                 .map_or(0, |receipt| receipt.tiers.len())
         };
-        assert_eq!(tiers(&previous), 1);
-        // 513 more admitted records under b's priority turn, 1 input token each.
+        assert_eq!(tiers(&previous), 2);
+        // 513 more native/UI pairs in explicitly priority turns, 1 input each.
         let mut text = fs::read_to_string(&path).unwrap();
         for i in 0..513u64 {
+            older_build_logs_priority(&format!("r-t{i}"));
             for row in member(owner, &format!("r-t{i}"), 1, 301 + i)
                 .into_iter()
                 .skip(1)
@@ -5321,7 +5237,11 @@ pub(super) mod tests {
             .iter()
             .map(|item| serde_json::to_value(item).unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(tiers(&after), 514, "1 fixture tier + 513 appended");
+        assert_eq!(
+            tiers(&after),
+            1028,
+            "2 fixture witnesses + 513 native/UI pairs"
+        );
         finalize_scan_after_policy(SnapshotSource::Codex, &mut rescanned, &mut after);
         let (capture, _) = after.stage_codex_recovery_capture(&previous, &rescanned.snapshots);
         rescanned.finish_codex_capture_boundary(&mut after);
@@ -5334,7 +5254,7 @@ pub(super) mod tests {
         let saved = root.join("index.json");
         committed.save(&saved).unwrap();
         let mut loaded = ScanIndex::load(&saved).unwrap();
-        assert_eq!(tiers(&loaded), 514);
+        assert_eq!(tiers(&loaded), 1028);
         // T3: the trace source expires; only the saved receipt can price b.
         older_build_logs_expired();
         loaded.prepare_historical_replay("tier-cap-replay".into());
@@ -5442,6 +5362,7 @@ pub(super) mod tests {
             text.push_str(&(serde_json::to_string(&row).unwrap() + "\n"));
         }
         fs::write(&path, text).unwrap();
+        older_build_logs_priority("r-c");
         let (mut working, mut result) = scan(&root, previous.clone(), 2);
         finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut working);
         let (captured, changed) =
@@ -5455,7 +5376,7 @@ pub(super) mod tests {
                 .unwrap()
                 .tiers
                 .len(),
-            2
+            4
         );
         for accepted in [&old_accepted, &BTreeSet::new()] {
             let mut rollback = captured.clone();
@@ -5493,7 +5414,7 @@ pub(super) mod tests {
                 .unwrap()
                 .tiers
                 .len(),
-            2
+            4
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -5736,241 +5657,22 @@ pub(super) mod tests {
         }
     }
 
-    pub(crate) fn legacy_index(inventory: &HeaderInventory) -> ScanIndex {
-        let mut index = ScanIndex::default();
-        for member in inventory
-            .groups()
-            .into_values()
-            .flat_map(|group| group.members)
-        {
-            let mut census = ScanCensus::default();
-            let (member, file) = open_and_identify_scan_candidate(
-                SnapshotSource::Codex,
-                member,
-                &mut census,
-                None,
-                0,
-                crate::snapshots::DiscoveryRetention::unverified(
-                    &crate::snapshots::SharedMap::default(),
-                ),
-            )
-            .unwrap();
-            let parsed = parse_opened_jsonl_file(
-                file,
-                &member.opened_object_identity,
-                &member.path,
-                "2026-10-06T23:00:00Z",
-                member.source_file_fingerprint.clone(),
-                SnapshotSource::Codex,
-                apply_codex_line,
-                Some(&CodexTitleMetadata::default()),
-                None,
-                None,
-            )
-            .unwrap();
-            assert!(parsed.progress_complete());
-            let fingerprints = parsed
-                .snapshots
-                .iter()
-                .map(|item| snapshot_fingerprint(SnapshotSource::Codex, item))
-                .collect::<BTreeSet<_>>();
-            let key = local_index_key(&member.path);
-            index.record(
-                member,
-                Some(snapshot_file_entity_set_hex(&fingerprints)),
-                ScanParseOutcome::Snapshot,
-            );
-            index.file_snapshot_fingerprints.insert(key, fingerprints);
-        }
-        index
-    }
-    #[test]
-    fn legacy_proof_refreshes_expired_launch_lookup_without_consuming_completed_proof() {
-        let (root, inventory) = fixture();
-        let previous = legacy_index(&inventory);
-        let group = inventory.groups().into_values().next().unwrap();
-        let workers = vec![group.owner.clone()];
-        let key = base64::Engine::encode(
-            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-            [13_u8; 32],
-        );
-        let context = crate::session_attribution::SessionAttributionContext::from_activity_hint(
-            SnapshotSource::Codex,
-            &root,
-            true,
-            Some(&key),
-            Some(crate::session_attribution::SESSION_ATTRIBUTION_HMAC_KEY_VERSION),
-        )
-        .unwrap();
-        let metadata = CodexTitleMetadata::default();
-        let mut boot = GroupBoot::new(group, &previous);
-        loop {
-            match boot.step(Some(&context), &previous) {
-                Boot::Pending => {}
-                Boot::Ready => break,
-                _ => panic!("the legacy group boots"),
-            }
-        }
-        assert!(context.launch_events().prepared(&workers));
-        context.expire_launch_lookup_for_test();
-        assert!(!context.launch_events().prepared(&workers));
-        let events = root.join(".ottto/launch-events/processed");
-        fs::create_dir_all(&events).unwrap();
-        for n in 1..=600 {
-            let raw = json!({"schema":"agent_launch.v1",
-                "controller_session_ref":"11111111-2222-4333-8444-555555555555",
-                "worker_session_ref":format!("{n:08x}-2222-4333-8444-555555555555"),
-                "relationship_kind":"launched", "workflow_ref":null, "pr_ref":null,
-                "launch_ts":"2026-10-01T10:00:00Z",
-                "capture_source":"launcher_event:opus_cli_agent", "evidence":"direct"})
-            .to_string();
-            let event = crate::launch_events::validate_event(&raw).unwrap();
-            fs::write(
-                events.join(format!(
-                    "{}.json",
-                    crate::launch_events::event_digest(&event)
-                )),
-                raw,
-            )
-            .unwrap();
-        }
-        let mut job = boot
-            .into_job(JobInputs {
-                metadata: &metadata,
-                cache: None,
-                index: &previous,
-            })
-            .unwrap();
-        let no_scope = |_: &CandidateFile| None;
-        let inputs = StepInputs {
-            metadata: &metadata,
-            attribution: Some(&context),
-            live_scope: &no_scope,
-            cache: None,
-            collected_at: "2026-10-01T12:00:00Z",
-            index: &previous,
-        };
-        let (mut steps, mut yields) = (0, 0);
-        loop {
-            let before = (
-                job.group.as_ref().unwrap().current,
-                job.parser.reader.consumed_bytes(),
-            );
-            match step_group(&mut job, &inputs) {
-                GroupStep::Read(Ok(true)) => break,
-                GroupStep::Read(Ok(false)) => {}
-                _ => panic!("the legacy group replays"),
-            }
-            let after = (
-                job.group.as_ref().unwrap().current,
-                job.parser.reader.consumed_bytes(),
-            );
-            if before == after && job.parser.reader.finished {
-                // A finished member re-entered its EOF: the lookup yielded.
-                yields += 1;
-            }
-            steps += 1;
-            assert!(steps < 100);
-        }
-        assert!(yields > 0, "lookup must yield across the retained backlog");
-        assert_eq!(
-            job.parser.reader.report.parsed_json_line_count, 6,
-            "completed members must not be read twice"
-        );
-        assert_eq!(job.group.as_mut().unwrap().take_legacy_baselines().len(), 2);
-        assert!(context.launch_events().prepared(&workers));
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn legacy_first_import_requires_actual_old_output_match_and_allows_healthy_sibling() {
-        let (root, inventory) = fixture();
-        let previous = legacy_index(&inventory);
-        let (mut index, mut result) = scan(&root, previous.clone(), 2);
-        assert_eq!(result.codex_legacy_join_baselines.len(), 2);
-        result.reconcile_codex_legacy_joining(&mut index, &previous, "machine", |_, _| {});
-        assert!(result.census_complete);
-        assert_eq!(result.snapshots.len(), 2);
-        fs::remove_dir_all(root).unwrap();
-        let (root, inventory) = fixture();
-        let turn = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
-        let mut rows = member("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "r-b", 200, 300);
-        rows.insert(
-            1,
-            json!({"type":"turn_context","payload":{"turn_id":turn,"model":"gpt-5.2"}}),
-        );
-        fs::write(
-            root.join("sessions/b.jsonl"),
-            rows.iter()
-                .map(|row| serde_json::to_string(row).unwrap() + "\n")
-                .collect::<String>(),
-        )
-        .unwrap();
-        older_build_logs_priority(turn);
-        let previous = legacy_index(&inventory);
-        older_build_logs_expired();
-        let sibling = member(
-            "ffffffff-bbbb-4ccc-8ddd-eeeeeeeeeeee",
-            "r-sibling",
-            100,
-            100,
-        );
-        fs::write(
-            root.join("sessions/sibling.jsonl"),
-            sibling
-                .iter()
-                .map(|row| serde_json::to_string(row).unwrap() + "\n")
-                .collect::<String>(),
-        )
-        .unwrap();
-        let (mut index, mut result) = scan(&root, previous.clone(), 3);
-        result.reconcile_codex_legacy_joining(&mut index, &previous, "machine", |_, _| {});
-        assert!(!result.census_complete);
-        assert_eq!(
-            result.snapshots.len(),
-            1,
-            "only the mismatched legacy group is held"
-        );
-        assert_eq!(
-            result.snapshots[0].source_session_id,
-            "ffffffff-bbbb-4ccc-8ddd-eeeeeeeeeeee"
-        );
-        for (key, entry) in &previous.files {
-            assert_eq!(
-                index.files[key].last_snapshot_fingerprint,
-                entry.last_snapshot_fingerprint
-            );
-        }
-        assert!(index
-            .traversal
-            .as_ref()
-            .unwrap()
-            .unhealthy_retry_not_before_unix_seconds
-            .is_some());
-        let (_index, quiet) = scan(&root, index, 3);
-        assert!(quiet.snapshots.is_empty());
-        assert_eq!(
-            quiet.scanned_file_count, 0,
-            "held unchanged group uses existing retry backoff"
-        );
-        fs::remove_dir_all(root).unwrap();
-    }
     const OWNER: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
     /// Feed members in order through one `StreamProof`, with the parser's
     /// S10 tap after every UI usage record.
     pub(crate) fn stream(members: &[Vec<Value>]) -> Option<(JoinRefusal, usize)> {
-        let mut proof = StreamProof::new(
-            OWNER.into(),
-            false,
-            vec![MemberPlan::default(); members.len()],
-        );
+        let mut proof = StreamProof::new(OWNER.into(), vec![MemberPlan::default(); members.len()]);
         for (position, rows) in members.iter().enumerate() {
             proof.begin_member(position);
+            let mut turn = None;
             for row in rows {
+                if row["payload"]["type"] == "task_started" {
+                    turn = row["payload"]["turn_id"].as_str();
+                }
                 proof.observe(row);
                 if codex_last_usage(row).is_some() {
                     let identity = codex_usage_event_identity(row);
-                    proof.admitted_usage(row, true, identity.as_deref(), None);
+                    proof.admitted_usage(row, true, identity.as_deref(), turn);
                 }
             }
             proof.end_member(0);
@@ -5983,7 +5685,7 @@ pub(super) mod tests {
         let a = member(OWNER, "response-a", 100, 100);
         let b = member(OWNER, "response-b", 200, 300);
         assert_eq!(stream(&[a.clone(), b.clone()]), None);
-        let probes = [probe_before(&b[1]), probe_before(&a[1])];
+        let probes = [probe_before(&b[3]), probe_before(&a[3])];
         assert_eq!(order_by_probes(&[0, 1], &probes), Ok(vec![1, 0]));
     }
     #[test]
@@ -6010,24 +5712,21 @@ pub(super) mod tests {
     fn copied_ui_contribution_cannot_gain_a_second_member() {
         let a = member(OWNER, "response-a", 100, 100);
         let mut b = member(OWNER, "response-b", 100, 200);
-        b[2] = a[2].clone();
+        b[4] = a[4].clone();
         assert_eq!(stream(&[a, b]), Some((JoinRefusal::Overlap, 1)));
     }
     #[test]
-    fn missing_owner_native_fields_or_ui_coverage_is_not_accepted() {
+    fn missing_owner_or_native_fields_are_not_accepted() {
         let rows = member(OWNER, "response", 100, 100);
         for field in ["thread_id", "response_id", "usage", "thread_token_usage"] {
             let mut changed = rows.clone();
-            changed[1]["payload"].as_object_mut().unwrap().remove(field);
+            changed[3]["payload"].as_object_mut().unwrap().remove(field);
             assert_eq!(
                 stream(&[changed]),
                 Some((JoinRefusal::Corrupt, 0)),
                 "{field}"
             );
         }
-        let mut changed = rows;
-        changed[2]["payload"]["info"]["last_token_usage"] = usage(200);
-        assert_eq!(stream(&[changed]), Some((JoinRefusal::UiUnmatched, 0)));
     }
 }
 
@@ -6036,7 +5735,33 @@ pub(in crate::snapshots) mod header_cache_tests {
     use super::*;
     thread_local! {
         pub(in crate::snapshots) static READ_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        static READ_PATHS: std::cell::RefCell<Option<Vec<PathBuf>>> = const { std::cell::RefCell::new(None) };
     }
+    pub(super) fn note_read(path: &Path) {
+        READ_CALLS.with(|calls| calls.set(calls.get() + 1));
+        READ_PATHS.with(|paths| {
+            if let Some(paths) = paths.borrow_mut().as_mut() {
+                paths.push(path.to_path_buf());
+            }
+        });
+    }
+
+    pub(in crate::snapshots) fn observe_read_paths<T>(
+        run: impl FnOnce() -> T,
+    ) -> (T, Vec<PathBuf>) {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                let _ = READ_PATHS.with(|paths| paths.replace(None));
+            }
+        }
+        READ_PATHS.with(|paths| assert!(paths.replace(Some(Vec::new())).is_none()));
+        let _reset = Reset;
+        let value = run();
+        let paths = READ_PATHS.with(|paths| paths.take().unwrap());
+        (value, paths)
+    }
+
     pub(in crate::snapshots) fn page(
         root: &Path,
         paths: &BTreeSet<String>,
