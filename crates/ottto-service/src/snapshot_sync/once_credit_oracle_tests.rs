@@ -1285,6 +1285,39 @@ fn receipt(cycle: &Cycle, path: &Path) -> Option<(String, u64, String)> {
     ))
 }
 
+/// The daemon's durable accepted and identity rows for `entities`: the
+/// accepted ledger, entity stamps and request contributions of `index`.
+fn durable_rows(index: &ScanIndex, entities: &[&String]) -> Value {
+    let proof = serde_json::to_value(&index.upload_context_proof).unwrap();
+    json!({
+        "accepted": entities
+            .iter()
+            .map(|entity| index.accepted_snapshot_fingerprint_recorded(entity))
+            .collect::<Vec<_>>(),
+        "stamps": entities
+            .iter()
+            .map(|entity| proof["entity_stamps"][entity.as_str()].clone())
+            .collect::<Vec<_>>(),
+        "contributions": proof["request_contributions"],
+    })
+}
+
+/// `to`'s transcript becomes `from`'s, bytes and modification time.
+fn copy_transcript(from: &OracleHome, to: &OracleHome) {
+    std::fs::copy(from.transcript(), to.transcript()).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(to.transcript())
+        .unwrap()
+        .set_modified(
+            std::fs::metadata(from.transcript())
+                .unwrap()
+                .modified()
+                .unwrap(),
+        )
+        .unwrap();
+}
+
 fn assert_terminal(cycle: &Cycle, fingerprint: &str, body: &str) {
     let hold = &cycle.index.quarantined_snapshot_fingerprints[fingerprint];
     assert_eq!(
@@ -1380,6 +1413,15 @@ fn c12_head_unstored_answers_hold_until_growth_earns_its_own_ack() {
         Some(snapshot_upload_body_witness(&item(&answered, 6)).as_str())
     );
     assert_eq!(*server.placement.lock().unwrap(), placed);
+    // The answer adds no accepted row or stamp to this destination's index.
+    let before: ScanIndex = serde_json::from_slice(&answered.pre_index_bytes).unwrap();
+    for (index, label) in [(&before, "before"), (&answered.index, "after")] {
+        let rows = durable_rows(index, &[&e, &d]);
+        assert_eq!(rows["accepted"], json!([false, false]), "{label}");
+        assert_eq!(rows["stamps"], json!([null, null]), "{label}");
+    }
+    assert!(!answered.progress.accepted_body_witnesses.contains_key(&e));
+    assert!(!answered.progress.accepted_body_witnesses.contains_key(&d));
 
     // An unchanged same-generation restart reads and offers nothing; both
     // held entities keep their accepted head, and the covered revision is
@@ -1466,6 +1508,20 @@ fn c12_head_unstored_answers_hold_until_growth_earns_its_own_ack() {
     assert!(reentered.finish.is_ok(), "{:?}", reentered.finish);
     assert_eq!(posted(&reentered), vec![e.clone()]);
     assert_terminal(&reentered, &e, &main_body);
+    // Before and after this not-stored answer: the same first-offer body, and
+    // the same durable accepted, stamp and contribution rows.
+    assert_eq!(
+        snapshot_upload_body_witness(&reentered.finalized[0]),
+        main_body
+    );
+    assert_eq!(
+        durable_rows(&reentered.index, &[&e, &d]),
+        durable_rows(&later.index, &[&e, &d])
+    );
+    assert_eq!(
+        reentered.progress.accepted_body_witnesses.get(&e),
+        later.progress.accepted_body_witnesses.get(&e)
+    );
     home.restart();
     let after = home.cycle(&server, &recording);
     assert!(after.finish.is_ok(), "{:?}", after.finish);
@@ -1518,18 +1574,7 @@ fn c12_head_unstored_answers_hold_until_growth_earns_its_own_ack() {
     let mut cold_home = OracleHome::new(claude, &cold_server);
     cold_home.row = "c12_cold";
     let cold_sibling = c12_install(&cold_home);
-    std::fs::copy(home.transcript(), cold_home.transcript()).unwrap();
-    std::fs::File::options()
-        .write(true)
-        .open(cold_home.transcript())
-        .unwrap()
-        .set_modified(
-            std::fs::metadata(home.transcript())
-                .unwrap()
-                .modified()
-                .unwrap(),
-        )
-        .unwrap();
+    copy_transcript(&home, &cold_home);
     cold_home.now = home.now;
     move_destination(&mut cold_home);
     *cold_server.fallback.lock().unwrap() = Answer::ByHead;
@@ -1538,6 +1583,11 @@ fn c12_head_unstored_answers_hold_until_growth_earns_its_own_ack() {
     assert_eq!(cold.finalized.len(), 2);
     assert_durable(&cold);
     let cold_route = emitted_route(&cold, claude, &cold_server);
+    // (full, tail, unchanged) files: growth read the Tail; cold read Full.
+    assert_eq!(grown_route.modes.0, 0, "growth read no file Full");
+    assert!(grown_route.modes.1 > 0, "growth used the Tail");
+    assert!(cold_route.modes.0 > 0, "cold read Full");
+    assert_eq!(cold_route.modes.1, 0, "cold used no Tail");
     transition::money_oracle::assert_no_smaller_reemit(
         &e_session,
         &prior,
@@ -1572,6 +1622,124 @@ fn c12_head_unstored_answers_hold_until_growth_earns_its_own_ack() {
         .confirmed_empty_files
         .contains(&index_key(&sibling)));
     assert_eq!(receipt(&resumed, &sibling), receipt(&cold, &cold_sibling));
+}
+
+/// [money] c01's identity-positive control (two accounts, a side call, an
+/// evidence gap, the effort tag) through the changed transition. At a moved
+/// destination, every head already holds its usage: each body is answered
+/// `usage_identical` and held, with the same body and the same account split
+/// as the cold offer, and nothing is accepted. Growth then earns its own
+/// exact ACK. Its body, placement and account split equal a cold Full of the
+/// same transcript and evidence at the same destination.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn c13_identity_control_through_usage_identical_then_growth() {
+    let claude = SnapshotSource::ClaudeCode;
+    let recording = Recording::start();
+    let server = OracleServer::new(claude, recording.handle());
+    let mut home = OracleHome::new(claude, &server);
+    home.row = "c13";
+    install_claude_control(&home);
+    *server.fallback.lock().unwrap() = Answer::ByHead;
+    let cold = home.cycle(&server, &recording);
+    assert!(cold.finish.is_ok(), "{:?}", cold.finish);
+    assert_durable(&cold);
+    let (accounts, tagged) = accounts_and_tags(&cold.finalized);
+    assert_eq!(
+        accounts,
+        BTreeMap::from([("a".repeat(64), 15), ("b".repeat(64), 27)])
+    );
+    assert!(tagged);
+    let witnesses = |cycle: &Cycle| {
+        cycle
+            .finalized
+            .iter()
+            .map(|item| {
+                (
+                    item.snapshot_fingerprint.clone(),
+                    snapshot_upload_body_witness(item),
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    let placed = server.placement.lock().unwrap().clone();
+
+    move_destination(&mut home);
+    home.restart();
+    let answered = home.cycle(&server, &recording);
+    assert!(answered.finish.is_ok(), "{:?}", answered.finish);
+    assert!(!answered.batches.is_empty());
+    assert_eq!(witnesses(&answered), witnesses(&cold), "the same bodies");
+    assert_eq!(accounts_and_tags(&answered.finalized), (accounts, tagged));
+    for item in &answered.finalized {
+        assert!(!answered.accepted_body(item));
+        assert_terminal(
+            &answered,
+            &item.snapshot_fingerprint,
+            &snapshot_upload_body_witness(item),
+        );
+    }
+    assert_eq!(*server.placement.lock().unwrap(), placed);
+
+    let growth = json!({"type":"assistant","sessionId":IDENTITY_PIPELINE_ROOT,
+        "version":"2.1.309","requestId":"c13-growth","timestamp":"2026-11-01T07:05:00Z",
+        "message":{"id":"msg-c13-growth","model":"claude-haiku-4-5",
+        "usage":{"input_tokens":13,"output_tokens":13}}});
+    writeln!(
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(home.transcript())
+            .unwrap(),
+        "{growth}"
+    )
+    .unwrap();
+    let grown = home.cycle(&server, &recording);
+    assert!(grown.finish.is_ok(), "{:?}", grown.finish);
+    assert_eq!(grown.finalized.len(), 1, "only the grown entity");
+    assert_eq!(posted(&grown).len(), 1);
+    assert_durable(&grown);
+    let session = grown.finalized[0].source_session_id.clone();
+    let grown_route = emitted_route(&grown, claude, &server);
+
+    let cold_server = OracleServer::new(claude, recording.handle());
+    let mut cold_home = OracleHome::new(claude, &cold_server);
+    cold_home.row = "c13_cold";
+    install_claude_control(&cold_home);
+    copy_transcript(&home, &cold_home);
+    cold_home.now = home.now;
+    move_destination(&mut cold_home);
+    let cold_grown = cold_home.cycle(&cold_server, &recording);
+    assert!(cold_grown.finish.is_ok(), "{:?}", cold_grown.finish);
+    assert_durable(&cold_grown);
+    let cold_route = emitted_route(&cold_grown, claude, &cold_server);
+    transition::money_oracle::assert_no_smaller_reemit(
+        &session,
+        &cold_route,
+        &entity_rows(&grown_route, &session),
+        &entity_rows(&cold_route, &session),
+        false,
+    );
+    assert_eq!(
+        *server.placement.lock().unwrap(),
+        *cold_server.placement.lock().unwrap()
+    );
+    assert_eq!(
+        accounts_and_tags(&grown.finalized),
+        accounts_and_tags(
+            &cold_grown
+                .finalized
+                .iter()
+                .filter(|item| item.source_session_id == session)
+                .cloned()
+                .collect::<Vec<_>>()
+        )
+    );
+    assert_eq!(grown_route.accepted, cold_route.accepted);
+    assert_eq!(
+        grown_route.accepted_identity_buckets,
+        cold_route.accepted_identity_buckets
+    );
 }
 
 #[test]
@@ -1838,6 +2006,34 @@ fn install_claude_control_for(
     }
 }
 
+/// Input tokens by account over every model-usage row's identity shares,
+/// and whether any row carries the `high` effort tag.
+fn accounts_and_tags(items: &[SnapshotItem]) -> (BTreeMap<String, u64>, bool) {
+    let mut accounts = BTreeMap::<String, u64>::new();
+    let mut tagged = false;
+    for item in items {
+        let value = serde_json::to_value(item).unwrap();
+        for row in value["model_usage"].as_array().unwrap() {
+            tagged |= row["reasoning_effort"] == "high";
+            let shares = row["identity_parts"]
+                .as_array()
+                .map(|v| v.iter().collect::<Vec<_>>())
+                .unwrap_or_else(|| vec![row]);
+            for share in shares {
+                *accounts
+                    .entry(
+                        share["account_identifier_hash"]
+                            .as_str()
+                            .unwrap()
+                            .to_owned(),
+                    )
+                    .or_default() += share["input_tokens"].as_u64().unwrap();
+            }
+        }
+    }
+    (accounts, tagged)
+}
+
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests, client_report)]
@@ -1863,28 +2059,7 @@ fn c01_claude_cold_control_preserves_accounts_side_call_gap_and_tags() {
         cold.finalized.iter().map(|s| s.request_count).sum::<u64>(),
         4
     );
-    let mut accounts = BTreeMap::<String, u64>::new();
-    let mut tagged = false;
-    for item in &cold.finalized {
-        let value = serde_json::to_value(item).unwrap();
-        for row in value["model_usage"].as_array().unwrap() {
-            tagged |= row["reasoning_effort"] == "high";
-            let shares = row["identity_parts"]
-                .as_array()
-                .map(|v| v.iter().collect::<Vec<_>>())
-                .unwrap_or_else(|| vec![row]);
-            for share in shares {
-                *accounts
-                    .entry(
-                        share["account_identifier_hash"]
-                            .as_str()
-                            .unwrap()
-                            .to_owned(),
-                    )
-                    .or_default() += share["input_tokens"].as_u64().unwrap();
-            }
-        }
-    }
+    let (accounts, tagged) = accounts_and_tags(&cold.finalized);
     // All three transcript requests are unproven copies (this fixture has no
     // file birth), so none seeds a carry: the 5-token gap takes the start
     // account (account-a, unmarked), not the latest own account (b). Totals
@@ -3582,6 +3757,7 @@ mod money_equivalence_tests {
         c11_fragment_and_obligation_charge_one_slot_and_existing_marker_charges_none();
         c11_account_hold_bypasses_the_full_audit_cap_without_staging_a_marker();
         c12_head_unstored_answers_hold_until_growth_earns_its_own_ack();
+        c13_identity_control_through_usage_identical_then_growth();
         scheduling_permutations_converge_to_the_same_bodies();
     }
 

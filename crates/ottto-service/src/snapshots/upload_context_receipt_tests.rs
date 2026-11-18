@@ -1424,12 +1424,26 @@ fn real_uploader_unstored_answer_holds_by_basis_and_growth_earns_receipt() {
     }
     assert_eq!(answered[0], answered[1], "the answer never changes a body");
 }
+impl Fixture {
+    /// A process restart: the index and the upload ledger are saved, then
+    /// both reload from disk, with a cold transcript cache.
+    fn restart_from_disk(&mut self, context: &str) {
+        let path = self._scratch.join("index.json");
+        self.index.save_fixture(&path).unwrap();
+        self.index = ScanIndex::load(&path).unwrap();
+        self.cache = Arc::default();
+        self.uploader.save_and_restart(self.source, context);
+    }
+}
+
 /// [regress] [money] Two sessions hold an old `usage_identical` answer
 /// terminally. A new historical replay (the server no longer has the head)
 /// reads one file per page, so one body is first met on page 2 whatever the
-/// order. Each unchanged body is offered once and earns one exact ACK: a
-/// terminal hold carried from before the replay keeps its disclosure but does
-/// not suppress re-entry on a later page, as it does not on the first.
+/// order. The process restarts between the pages, with the old terminal of
+/// the page-2 body still on disk. Each unchanged body is offered once and
+/// earns one durable exact ACK: a terminal hold carried from before the
+/// replay keeps its disclosure but does not suppress re-entry on a later
+/// page, as it does not on the first.
 #[test]
 fn replay_re_offers_a_pre_replay_usage_identical_body_met_on_a_later_page() {
     const OTHER: &str = "019fa111-2222-7333-8444-666666666666";
@@ -1483,6 +1497,21 @@ fn replay_re_offers_a_pre_replay_usage_identical_body_met_on_a_later_page() {
                 .entry(item.snapshot_fingerprint.clone())
                 .or_insert(met);
         }
+        if page == 1 {
+            f.restart_from_disk(&context);
+            let waiting = held
+                .keys()
+                .filter(|entity| !first_page.contains_key(*entity))
+                .collect::<Vec<_>>();
+            assert_eq!(waiting.len(), 1, "one held body waits for page 2");
+            let hold = &f.index.quarantined_snapshot_fingerprints[waiting[0]];
+            assert_eq!(
+                hold.disposition,
+                SnapshotQuarantineDisposition::UnprovenTerminal,
+                "the old terminal is still on disk"
+            );
+            assert_eq!(hold.upload_body_witness.as_ref(), Some(&held[waiting[0]]));
+        }
     }
     assert_eq!(
         first_page
@@ -1515,12 +1544,18 @@ fn replay_re_offers_a_pre_replay_usage_identical_body_met_on_a_later_page() {
         held.keys().cloned().collect::<Vec<_>>(),
         "each held body is offered exactly once"
     );
-    for entity in held.keys() {
+    f.restart_from_disk(&context);
+    for (entity, witness) in &held {
         assert!(f.index.accepted_snapshot_fingerprint_recorded(entity));
         assert!(!f
             .index
             .quarantined_snapshot_fingerprints
             .contains_key(entity));
+        assert_eq!(
+            f.uploader.accepted_body(entity),
+            Some(witness),
+            "a durable exact ACK of the old body"
+        );
     }
 }
 

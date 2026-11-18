@@ -623,6 +623,17 @@ impl Uploader {
         )
         .unwrap();
     }
+    /// A restart: the ledger is saved, then reloaded from disk.
+    pub(crate) fn save_and_restart(&mut self, source: SnapshotSource, context: &str) {
+        self.progress
+            .save_fixture(&self.scratch.join("progress.json"))
+            .unwrap();
+        self.restart(source, context);
+    }
+    /// The ledger's durable exact ACK for `entity`.
+    pub(crate) fn accepted_body(&self, entity: &str) -> Option<&String> {
+        self.progress.accepted_body_witnesses.get(entity)
+    }
     /// A historical replay page's prepare, in the service's order: progress
     /// first (it imports the index's holds only once the index already
     /// carries this generation), then the index.
@@ -791,4 +802,67 @@ fn usage_identical_answer_retires_held_debt_without_a_receipt() {
         posted.windows(2).all(|pair| pair[0] == pair[1]),
         "every answer leaves the posted body byte-equal"
     );
+}
+
+/// [regress] [money] After a `usage_identical` answer, the file is read again
+/// with an additive change: the same entity fingerprint, but a different body
+/// witness. The old answer's note cannot clear the changed file: its debt
+/// stays held. Once offered, the changed body POSTs and earns its own exact
+/// ACK, and that receipt alone retires the debt.
+#[test]
+fn usage_identical_note_never_covers_an_additive_body_change() {
+    let source = SnapshotSource::ClaudeCode;
+    let mut item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
+    item.cache_observations = None;
+    item.cache_observations_state = None;
+    item.source_file_fingerprint = Some("a".repeat(64));
+    let mut changed = item.clone();
+    super::h357_ack_tests::change_witnessed_body(&mut changed);
+    assert_eq!(
+        crate::snapshots::snapshot_fingerprint(source, &changed),
+        crate::snapshots::snapshot_fingerprint(source, &item),
+        "the same entity"
+    );
+    let entity = item.snapshot_fingerprint.clone();
+    let (old_body, new_body) = (
+        snapshot_upload_body_witness(&item),
+        snapshot_upload_body_witness(&changed),
+    );
+    assert_ne!(old_body, new_body, "a different body");
+    // The file now reads as the changed body; the old answer was for the old.
+    for offer_changed in [false, true] {
+        crate::snapshots::e2_pipeline_scan_fixture::assert_file_debt_retired(
+            std::slice::from_ref(&changed),
+            offer_changed,
+            offer_changed,
+            |index, context| {
+                let mut uploader = Uploader::new(source);
+                uploader.activate(source, context.to_string(), index);
+                uploader.not_stored = Some("usage_identical");
+                let previous = index.clone();
+                uploader
+                    .send(source, index, &previous, std::slice::from_ref(&item))
+                    .unwrap();
+                let hold = &index.quarantined_snapshot_fingerprints[&entity];
+                assert_eq!(hold.upload_body_witness.as_ref(), Some(&old_body));
+                if !offer_changed {
+                    return;
+                }
+                uploader.not_stored = None;
+                let previous = index.clone();
+                uploader
+                    .send(source, index, &previous, std::slice::from_ref(&changed))
+                    .unwrap();
+                assert_eq!(uploader.posts.len(), 2, "the changed body POSTs");
+                assert_eq!(
+                    uploader.posts[1][0]["snapshot_fingerprint"].as_str(),
+                    Some(entity.as_str())
+                );
+                assert_ne!(uploader.posts[1], uploader.posts[0]);
+                assert_eq!(uploader.fresh_count(), 1, "its own exact ACK");
+                assert_eq!(uploader.accepted_body(&entity), Some(&new_body));
+                assert!(index.accepted_snapshot_fingerprint_recorded(&entity));
+            },
+        );
+    }
 }
