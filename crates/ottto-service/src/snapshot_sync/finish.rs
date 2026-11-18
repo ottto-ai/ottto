@@ -1229,8 +1229,7 @@ pub(super) fn finish_sync_source(
         )?;
     }
     if scan_result.walk_idle && crate::snapshots::walk_idle::idle_finish(&index) {
-        // The walk gate held this pass: nothing was read, so there is no
-        // body, save or manifest. The receipt reports a healthy source.
+        // Nothing was read: no body, save or manifest; a healthy receipt.
         if crate::snapshots::maintain_state_v2_idle(&index_path, &index, true).is_err() {
             eprintln!("local state maintenance deferred for {}", source.api_slug());
         }

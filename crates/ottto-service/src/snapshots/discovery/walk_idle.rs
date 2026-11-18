@@ -1,25 +1,18 @@
-//! The per-source record that lets a settled source skip repeated walks.
-//!
-//! A walk that retires cleanly with nothing owed arms one record per source.
-//! Until the backstop, `WALK_GAP` after that walk's listing started, a pass
-//! whose inputs all still match returns an empty, census-incomplete page
-//! instead of walking. A watcher hint, a changed input, due work or a failed
-//! pass clears or misses the record, and the pass walks as before. The record
-//! lives in process memory only, so a restart always walks.
-use crate::agent_status::CodexHomeBinding;
+//! Lets a settled source skip repeated walks. A clean walk with nothing owed
+//! arms one in-memory record per source; until `WALK_GAP` after that walk's
+//! listing began, a pass whose inputs still match returns an empty,
+//! census-incomplete page. Anything else walks; a restart always walks.
 use crate::snapshot_client::ActivityHintResponse;
 use crate::snapshots::*;
 use crate::transcript_acquisition::{Scope, SourceStamp};
 use std::sync::Mutex;
 
-/// The backstop, measured start to start: a settled source walks at least
-/// this long after its last walk's listing began, even with no wake.
+/// The backstop, start to start.
 pub(crate) const WALK_GAP: u64 = LISTING_INTERVAL_SECONDS;
-/// Twice the longest cadence interval. A longer gap between passes (sleep,
-/// a stalled process, a backward clock) walks.
+/// Twice the longest cadence interval: a longer gap (sleep) walks.
 pub(crate) const PASS_GAP: u64 = 2 * 30 * 60;
 
-/// What one pass's walk would read, captured before the scan reads it.
+/// What one pass's walk would read, captured before the scan.
 #[derive(Clone)]
 pub(crate) struct Pass {
     key: [u8; 32],
@@ -65,10 +58,7 @@ pub(crate) fn clear(source: SnapshotSource) {
 }
 
 impl Pass {
-    /// Binds the record to what decides a walk's reads: destination scope and
-    /// index, roots and window, replay generation, the server's directives
-    /// (not its activity counts), upload policy and context, Claude history
-    /// policy, Codex logins, and the side inputs no transcript hint carries.
+    /// Every input that decides a walk's reads and no hint announces.
     #[expect(clippy::too_many_arguments, reason = "the inputs prepare holds")]
     pub(crate) fn new(
         source: SnapshotSource,
@@ -80,7 +70,6 @@ impl Pass {
         replay_generation: &str,
         hint: &ActivityHintResponse,
         policy_bytes: &[u8],
-        codex_logins: &[CodexHomeBinding],
         index: &ScanIndex,
     ) -> Self {
         let window = effective_backfill_window_days(days);
@@ -90,38 +79,22 @@ impl Pass {
         add(index_path.as_os_str().as_encoded_bytes());
         add(scan_traversal_context_fingerprint(source, roots, window).as_bytes());
         add(replay_generation.as_bytes());
-        add(&directives(hint));
+        // The hint's volatile counts and its key are not serialized.
+        add(&serde_json::to_vec(hint).expect("activity hint is serializable"));
         add(policy_bytes);
         add(format!(
-            "{:?}:{}:{:?}",
+            "{:?}:{}:{:?}:{:?}:{:?}:{:?}",
             index.active_upload_context_fingerprint,
             index.active_effective_upload_body_witness_revision,
             index.effective_upload_body_witness_revision_excluded_source_files,
+            index.claude_reemission_exclusions,
+            index.claude_no_list_policy,
+            index.claude_history_cutoff_unix_seconds,
         )
         .as_bytes());
         if source == SnapshotSource::ClaudeCode {
-            add(format!(
-                "{:?}:{:?}:{:?}:{}",
-                index.claude_reemission_exclusions,
-                index.claude_no_list_policy,
-                index.claude_history_cutoff_unix_seconds,
-                claude_reemission_stop_latched(),
-            )
-            .as_bytes());
-            add(
-                &crate::local_resource_diagnostics::cache_lifecycle::otlp_appended_rows()
-                    .to_be_bytes(),
-            );
-        }
-        for login in codex_logins {
-            add(format!(
-                "{:?}:{:?}:{:?}:{:?}",
-                login.home,
-                login.account_identifier_hash,
-                login.workspace_identifier_hash,
-                login.auth_modified_at,
-            )
-            .as_bytes());
+            let rows = crate::local_resource_diagnostics::cache_lifecycle::otlp_appended_rows();
+            add(format!("{}:{rows}", claude_reemission_stop_latched()).as_bytes());
         }
         for dir in crate::launch_events::inbox_dirs(home) {
             let modified = std::fs::metadata(dir).and_then(|meta| meta.modified());
@@ -152,8 +125,7 @@ impl Pass {
         }
     }
 
-    /// The same inputs. A stamp that could not be taken either time is
-    /// stable (an absent file is a stamp of its own).
+    /// A stamp that could not be taken either time is stable.
     fn same(&self, other: &Self) -> bool {
         self.key == other.key
             && self.codex_homes.len() == other.codex_homes.len()
@@ -168,41 +140,7 @@ impl Pass {
     }
 }
 
-/// The server's directives and capabilities, without its activity
-/// observations (they move on every hint) or the attribution key itself.
-fn directives(hint: &ActivityHintResponse) -> Vec<u8> {
-    let mut value = serde_json::to_value(hint).expect("activity hint is serializable");
-    if let Some(fields) = value.as_object_mut() {
-        for field in [
-            "server_time",
-            "last_data_at",
-            "record_count_15m",
-            "record_count_24h",
-            "recommended_scan_after",
-            "session_attribution_hmac_key",
-        ] {
-            fields.remove(field);
-        }
-    }
-    serde_json::to_vec(&(
-        value,
-        (hint.workspace_labels_explicit, hint.max_snapshot_item_bytes),
-        &hint.claude_otel_only_sessions_contract,
-        &hint.claude_otel_only_pairing_floor,
-        &hint.claude_otel_only_pairing_ceiling,
-        (
-            hint.codex_cloud_tasks_enabled,
-            &hint.codex_cloud_tasks_contract,
-        ),
-    ))
-    .expect("activity hint is serializable")
-}
-
-/// Whether this pass may skip its walk: the armed record still binds every
-/// input and the index generation, the backstop is not due, this pass
-/// closely follows the last one, the watcher covers the roots, and nothing is
-/// owed: `outside_owes_nothing` is the upload ledger's half, `owes_nothing`
-/// the index's. The scan re-checks its side inputs before it idles.
+/// Whether this pass may skip its walk (the scan re-checks its sidecars).
 pub(crate) fn gate(
     source: SnapshotSource,
     pass: &Pass,
@@ -234,10 +172,8 @@ pub(crate) fn gate(
     })
 }
 
-/// After a successful finish: arm the record when this page retired a clean
-/// walk whose inputs did not move while it ran and nothing is owed, or, after
-/// an idle pass, follow its own maintenance commits. Either way the record
-/// binds the store generation after the pass's last commit.
+/// After a successful finish: arm on a clean retired walk whose inputs held
+/// still; an idle pass follows its own maintenance commits.
 pub(crate) fn arm_after_finish(
     pass: Pass,
     index: &ScanIndex,
@@ -248,7 +184,6 @@ pub(crate) fn arm_after_finish(
     let generation = store_generation(index, index_path);
     let settled = scan.settled_walk_start.filter(|_| {
         outside_owes_nothing
-            && scan.census_complete
             && index.traversal.is_none()
             && !index
                 .claude_history_emission
@@ -284,9 +219,8 @@ pub(crate) fn arm_after_finish(
     });
 }
 
-/// The graph generation the next prepare loads: the store's stamp after this
-/// pass's last commit, which can follow its save (staged Tail state commits
-/// at exit). A stamp another writer moved is not this pass's: `None`.
+/// The generation the next prepare loads, after this pass's last commit (the
+/// exit Tail commit follows the save). Another writer's stamp is `None`.
 fn store_generation(index: &ScanIndex, path: &Path) -> Option<u64> {
     if index.v2().persistence_v2.is_none() {
         return Some(index.generation);
@@ -296,16 +230,13 @@ fn store_generation(index: &ScanIndex, path: &Path) -> Option<u64> {
         .map(|(generation, _)| generation)
 }
 
-/// An idle page finishes without a save only while no walk has started since
-/// its gate; a finish step can start one (a side-call hint).
+/// An idle page finishes without a save only while no walk has started.
 pub(crate) fn idle_finish(index: &ScanIndex) -> bool {
     index.traversal.is_none()
 }
 
-/// Nothing in the index needs a walk: no unsettled sweep, hold, authority
-/// retry, blocking correction or expired growth claim, and no file in the
-/// window whose stored stamp the walk's own decision would select. A due
-/// sampled audit waits for the backstop walk.
+/// Nothing in the index needs a walk. A due sampled audit waits for the
+/// backstop; an expired growth claim does not.
 pub(in crate::snapshots) fn owes_nothing(index: &ScanIndex, days: u64, now: u64) -> bool {
     index.persistence_available()
         && !index.bounded_sweep_had_unsettled_upload
@@ -348,8 +279,7 @@ pub(in crate::snapshots) fn stored_stamp_selects(
         withheld_content_stamp: None,
     };
     let (decision, reason) = index.candidate_walk_debt(&candidate, now);
-    // A held member owed only a proof correction is skipped by the walk too.
-    // A migration is work as well: it rewrites the entry.
+    // The walk skips a held member owed only a proof correction.
     decision != CandidateDecision::Skip
         && !(reason == Some(CandidateParseReason::AuthorityQuarantine)
             && index.claude_authority_correction_only(&candidate)

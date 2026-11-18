@@ -82,8 +82,7 @@ impl Ledger {
     }
 }
 
-/// Whether a seeded candidate's current generation needs a body: both halves
-/// are present, nothing was truncated, and the accepted body is not this one.
+/// Whether a seeded candidate's current generation needs a body.
 fn owed(
     candidate: &Candidate,
     generation: &TelemetryGeneration,
@@ -102,8 +101,7 @@ fn owed(
 }
 
 impl SnapshotUploadProgress {
-    /// Telemetry-only work only a walking pass takes up: a new pairing floor,
-    /// an unread notice, or an owed body (the walk gate's telemetry half).
+    /// Telemetry-only work only a walking pass takes up (`walk_idle`).
     pub(super) fn telemetry_owes_walk(
         &self,
         support: &Path,

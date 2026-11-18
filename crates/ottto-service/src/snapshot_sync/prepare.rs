@@ -336,8 +336,7 @@ pub(super) fn exclude_held_effective_body_witness_revision(
 // crosses a collection step.
 pub(super) struct SourcePreparation {
     pub(super) source: SnapshotSource,
-    /// This pass's walk-gate inputs, and whether the cycle's own state owed
-    /// no walk when it prepared (`walk_idle`).
+    /// Walk-gate inputs, and whether the cycle's own state owed no walk.
     pub(super) walk_idle_pass: Option<(crate::snapshots::walk_idle::Pass, bool)>,
     pub(super) claude_scan_roots: Option<Vec<PathBuf>>,
     pub(super) account_witness: [u8; 32],
@@ -1157,8 +1156,7 @@ pub(super) fn prepare_sync_source_inner(
         &sampled_scope,
         request_identity_capture,
     );
-    // The walk gate: a hint or a listing request is a change, so this pass
-    // walks; otherwise an armed record that still binds every input may idle.
+    // A hint or listing request is a change: this pass walks.
     if !watcher_hints.paths.is_empty()
         || watcher_hints.overflowed
         || watcher_hints.list_all.requested()
@@ -1175,7 +1173,6 @@ pub(super) fn prepare_sync_source_inner(
         &replay_generation,
         &activity_hint,
         &policy_bytes,
-        &scan_agent_status_collection.codex_home_bindings,
         &index,
     );
     let cycle_owes_nothing = !backfill_pending
@@ -1252,9 +1249,7 @@ pub(super) fn prepare_sync_source_inner(
     }))
 }
 
-/// The upload ledger's half of the walk gate: no ACK room is short, no cache
-/// head, resend, conflict challenge, identity-503 custody, lease, due
-/// quarantine retry or continuation waits, and no telemetry-only work waits.
+/// The upload ledger's half of the walk gate (`walk_idle`).
 pub(super) fn upload_owes_nothing(
     source: SnapshotSource,
     progress: &SnapshotUploadProgress,

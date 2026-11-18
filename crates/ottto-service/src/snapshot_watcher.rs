@@ -135,9 +135,8 @@ crate::local_resource_diagnostics::process_static!(
     fn with_coverage: Mutex<Option<Vec<PathBuf>>> = Mutex::new(None)
 );
 
-/// Counts edits to the Claude sidecars a walk reads beside the transcripts
-/// (subagent `.meta.json` files and workflow records). No transcript hint
-/// names them, so the walk gate binds this count instead.
+/// Edits to Claude sidecars no transcript hint names (subagent `.meta.json`,
+/// workflow records); the walk gate binds this count.
 pub(crate) fn sidecar_epoch(source: SnapshotSource) -> u64 {
     with_sidecar_epochs(|epochs| epochs[source.slot()].load(Ordering::Relaxed))
 }
@@ -172,8 +171,7 @@ pub(crate) fn cover(watcher: Option<&SnapshotWatcher>) {
     });
 }
 
-/// Whether a live watcher hints every existing root; an absent root has
-/// nothing to hint, and its creation recreates the watcher.
+/// A live watcher hints every existing root (creating one recreates it).
 pub(crate) fn covers(roots: &[PathBuf]) -> bool {
     with_coverage(|coverage| {
         coverage
@@ -361,8 +359,7 @@ pub fn watch_snapshot_roots(roots: Vec<(SnapshotSource, PathBuf)>) -> Result<Sna
     let live = Arc::new(AtomicBool::new(true));
     let worker_live = Arc::clone(&live);
     std::thread::spawn(move || {
-        // A worker that stops, even by a panic, no longer hints: the
-        // watcher reads as stale and is recreated with a listing.
+        // A stopped worker no longer hints: the watcher reads as stale.
         struct Stopped(Arc<AtomicBool>);
         impl Drop for Stopped {
             fn drop(&mut self) {

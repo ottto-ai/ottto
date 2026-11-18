@@ -96,9 +96,8 @@ impl ScanIndex {
         self.candidate_decision_refined(candidate, now, body_witness_adoption, true, &mut None)
     }
 
-    /// What a walk would still read from a file whose stamp has not moved,
-    /// without the body-witness revision (its change moves the walk gate's
-    /// key) or a due sampled audit (served by the gate's backstop walk).
+    /// The walk gate's projection: no body-witness gate (it is in the gate's
+    /// key) and no sampled audit (the backstop serves it).
     pub(in crate::snapshots) fn candidate_walk_debt(
         &self,
         candidate: &CandidateFile,

@@ -340,8 +340,7 @@ impl OwnedSourceScan {
     }
 
     /// The daemon names its recovery files before the first bounded page.
-    /// `walk_idle_allowed`: the walk gate let this pass skip its walk, if the
-    /// side inputs the scan loads first are also unchanged.
+    /// `walk_idle_allowed`: the walk gate's verdict (`walk_idle`).
     #[expect(clippy::too_many_arguments, reason = "13 args; no options struct yet")]
     pub(crate) fn new_with_recovery_priority(
         source: SnapshotSource,
@@ -559,7 +558,6 @@ impl OwnedSourceScan {
                 .is_some()
                 || index.claude_desktop_store_cursor.is_some()
                 || index.claude_desktop_store_sweep_had_errors);
-        let desktop_titles_before = index.claude_desktop_title_files.clone();
         let mut claude_title_metadata = if source == SnapshotSource::ClaudeCode {
             let mut load = |facts: &mut _| {
                 ClaudeTitleMetadata::load_from_roots_reusing(roots, index, collected_at, facts)
@@ -587,13 +585,6 @@ impl OwnedSourceScan {
             SnapshotSource::ClaudeCode => !claude_title_metadata.sidecar_census_incomplete,
             SnapshotSource::Pi => true,
         };
-        let desktop_titles_moved = index.claude_desktop_title_files != desktop_titles_before;
-        if desktop_titles_moved {
-            // Desktop titles change what a walk folds into each file.
-            if let Some(traversal) = index.traversal.as_mut() {
-                traversal.rewalk_owed = true;
-            }
-        }
         let sidecar_restart = (claude_sidecar_was_incomplete && sidecar_census_complete)
             || (source == SnapshotSource::ClaudeCode
                 && claude_identity_census_was_complete
@@ -601,7 +592,6 @@ impl OwnedSourceScan {
         if walk_idle_allowed
             && index.traversal.is_none()
             && !sidecar_restart
-            && !desktop_titles_moved
             && !claude_sidecar_was_incomplete
             && state_census_complete
             && sidecar_census_complete

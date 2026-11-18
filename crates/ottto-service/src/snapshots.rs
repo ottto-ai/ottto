@@ -568,11 +568,9 @@ pub struct SourceScanResult {
     pub scanned_session_count: usize,
     pub semantic_noop_count: usize,
     pub census_complete: bool,
-    /// The walk gate held this pass: nothing was listed or read, and the
-    /// census is not complete (`walk_idle`).
+    /// The walk gate held this pass: nothing was listed or read.
     pub(crate) walk_idle: bool,
-    /// The listing start of the clean walk this page retired, which may arm
-    /// the walk gate.
+    /// The listing start of a clean walk this page retired (`walk_idle`).
     pub(crate) settled_walk_start: Option<u64>,
     pub census_window_end: String,
     /// State-only Codex census is separate from transcript discovery. If an

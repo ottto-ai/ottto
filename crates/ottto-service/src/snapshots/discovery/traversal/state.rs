@@ -267,9 +267,7 @@ pub(in crate::snapshots) struct ScanTraversalCheckpoint {
     /// with that pass's start. Stamps older than the pace are pruned.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(in crate::snapshots) listing_owed_requeued_unix_seconds: BTreeMap<String, u64>,
-    /// Set when this walk learned of a change it may not have read (a
-    /// history budget hold, or Claude Desktop state that moved while it ran):
-    /// its retirement then never lets the next passes skip walking.
+    /// A history budget hold left a change unread: the walk gate stays off.
     #[serde(default, skip_serializing_if = "is_false")]
     pub(in crate::snapshots) rewalk_owed: bool,
 }

@@ -1643,8 +1643,7 @@ pub(super) fn expired_growth_claims(
     due
 }
 
-/// Whether `expired_growth_claims` would name a file, without its wake
-/// diagnostic.
+/// `expired_growth_claims` is non-empty, without its wake diagnostic.
 pub(super) fn growth_claim_expired(index: &ScanIndex, now: u64) -> bool {
     growth_active(index)
         && index.v2().growth_retention.values().any(|state| {

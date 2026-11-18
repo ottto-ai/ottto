@@ -3308,8 +3308,7 @@ impl OwnedSourceScan {
                     .expect("traversal remains active");
                 let routine_recensus =
                     traversal_transition::routine_recensus(source, &traversal_snapshot);
-                // A clean walk with no change it left unread may arm the walk
-                // gate once it retires (`walk_idle`).
+                // A clean walk retiring here may arm the walk gate.
                 let settled_walk_start =
                     traversal_snapshot.listing_started_unix_seconds.filter(|_| {
                         !traversal_snapshot.rewalk_owed
