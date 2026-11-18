@@ -3824,7 +3824,7 @@ fn codex_explicit_refresh_is_rate_limited_and_the_schedule_waits_its_interval() 
     codex_saved_quota::forget_running_homes();
     let before = codex_app_server_runs();
 
-    let first = with_trigger(Trigger::ExplicitRefresh, || refresh_codex_quota_now());
+    let first = with_trigger(Trigger::ExplicitRefresh, refresh_codex_quota_now);
     assert_eq!(first.read, 1);
     assert_eq!(first.rate_limited, 0);
     assert_eq!(codex_app_server_runs(), before + 1);
