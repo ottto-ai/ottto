@@ -621,13 +621,17 @@ pub(crate) fn setup_snapshot(
 fn setup_snapshot_of(
     collection: Result<Arc<AgentStatusCollection>, LocalApiError>,
 ) -> Option<ottto_protocol::AgentStatusSnapshot> {
-    Some(
-        collection
-            .ok()?
-            .setup_snapshot()?
-            .clone()
-            .redacted_for_backend(),
-    )
+    let mut snapshot = collection
+        .ok()?
+        .setup_snapshot()?
+        .clone()
+        .redacted_for_backend();
+    // Saved auto-compaction values ride only the status upload; the setup
+    // scan keeps the bytes it sent before they existed.
+    if let Some(defaults) = snapshot.runtime_defaults.as_mut() {
+        defaults.auto_compaction = None;
+    }
+    Some(snapshot)
 }
 
 /// Revalidate the existing local auth-file witness immediately before binding
@@ -1553,6 +1557,49 @@ mod tests {
         assert!(setup_snapshot_of(lane.collection_at(seconds(8), false)).is_none());
         lane.stop();
         assert!(setup_snapshot_of(lane.collection_at(seconds(9), false)).is_none());
+    }
+    /// [behaviour] Saved auto-compaction values ride the status upload only:
+    /// the setup scan row is byte-identical to the one sent without them.
+    #[test]
+    fn setup_scan_bytes_ignore_saved_auto_compaction() {
+        let defaults = ottto_protocol::AgentRuntimeDefaults {
+            provenance: Some("config_file".to_string()),
+            model: Some("claude-opus-5-5".to_string()),
+            fast_mode_enabled: Some(false),
+            ..Default::default()
+        };
+        let collection = |auto_compaction| {
+            let mut collection = specimen(SourceKind::Claude);
+            let row = &mut collection.snapshots[0];
+            row.runtime_defaults = Some(ottto_protocol::AgentRuntimeDefaults {
+                auto_compaction,
+                ..defaults.clone()
+            });
+            collection
+        };
+        let saved = ottto_protocol::AgentAutoCompaction {
+            auto_compact_window: Some(Some(400_000)),
+            auto_compact_enabled: Some(None),
+            ..Default::default()
+        };
+        let with = setup_snapshot_of(Ok(Arc::new(collection(Some(saved))))).expect("setup row");
+        let without = setup_snapshot_of(Ok(Arc::new(collection(None)))).expect("setup row");
+        assert_eq!(
+            serde_json::to_vec(&with).unwrap(),
+            serde_json::to_vec(&without).unwrap()
+        );
+        assert!(!serde_json::to_string(&with)
+            .unwrap()
+            .contains("auto_compact"));
+        // The status upload itself still carries the values.
+        assert_eq!(
+            collection(Some(saved)).snapshots[0]
+                .clone()
+                .redacted_for_backend()
+                .runtime_defaults
+                .and_then(|defaults| defaults.auto_compaction),
+            Some(saved)
+        );
     }
     #[test]
     fn explicit_manual_refresh_can_recover_acquisition_during_backoff() {

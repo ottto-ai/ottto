@@ -137,17 +137,28 @@ the daemon builds and fits no context curves, so none are uploaded.
 Agent status collection also reports display-safe runtime defaults read from an
 agent's own configuration files: Codex `config.toml`, and Claude Code's
 `settings.json`, `settings.local.json`, and macOS managed-policy settings. Only
-specifically named cost-relevant keys are read — model, reasoning effort level,
-service tier or fast mode, approval or permission mode, and sandbox mode —
-together with a label naming which file supplied each
-value. Environment variables, environment blocks, credential helpers, status-line
-commands, permission allow/ask/deny rules, and sandbox filesystem or credential
-rules are never read.
+specifically named cost-relevant keys are read: model, reasoning effort level
+(including the effort saved for each model), service tier or fast mode, approval
+or permission mode, sandbox mode, Claude Code's top-level `autoCompactWindow`
+and `autoCompactEnabled`, and Codex's `model_auto_compact_token_limit` and
+`model_context_window` (from the base `config.toml` of the default Codex home
+only), together with a label naming which file supplied each value. The
+auto-compaction keys are uploaded as values only, with no file label: the saved
+number or on/off switch, or an empty value when the files were read and none of
+them saves the key. They are sent only with a defaults record that is uploaded
+anyway, and per-model auto-compaction values are not uploaded. Environment
+variables, environment blocks, credential helpers, status-line commands,
+permission allow/ask/deny rules, and sandbox filesystem or credential rules are
+never read.
 Values must be short scalars; anything long, quoted, path-like, or URL-like is
 dropped rather than uploaded, and Claude Code's `bypassPermissions` mode is
-treated as a local safety posture and never reported. Configuration that sets
-none of these keys uploads no defaults at all rather than an empty record, so
-"not configured" stays distinguishable from "not readable".
+treated as a local safety posture and never reported. Codex configuration that
+sets none of these keys, or only the auto-compaction ones, uploads no defaults
+at all rather than an empty record.
+For Claude Code, any readable settings file uploads a record that reports Fast
+mode as off unless a file turns it on. When no settings file can be read, no
+defaults are uploaded, so "not configured" stays distinguishable from "not
+readable".
 
 When a scan needs multiple uploads, `ottto-service` stores a temporary local
 resume checkpoint containing only the semantic hashes of snapshots the backend

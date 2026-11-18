@@ -1400,6 +1400,58 @@ pub struct AgentRuntimeDefaults {
     pub selector_context: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub selector_sources: BTreeMap<String, String>,
+    /// Saved auto-compaction values from the same settings files. Absent means
+    /// unknown: an older daemon, or no defaults record for this row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_compaction: Option<AgentAutoCompaction>,
+}
+
+/// Saved auto-compaction values, numbers and switches only.
+///
+/// Each field is three-way: `None` omits the key (it belongs to the other
+/// tool), `Some(None)` sends `null` (the files were read and the key is not
+/// saved), and `Some(Some(value))` sends the saved value. Claude Code fills the
+/// first two fields and Codex the last two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AgentAutoCompaction {
+    /// Claude Code top-level `autoCompactWindow`, in tokens.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_or_null"
+    )]
+    pub auto_compact_window: Option<Option<i64>>,
+    /// Claude Code top-level `autoCompactEnabled`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_or_null"
+    )]
+    pub auto_compact_enabled: Option<Option<bool>>,
+    /// Codex `model_auto_compact_token_limit`, in tokens.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_or_null"
+    )]
+    pub model_auto_compact_token_limit: Option<Option<i64>>,
+    /// Codex `model_context_window`, in tokens.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_or_null"
+    )]
+    pub model_context_window: Option<Option<i64>>,
+}
+
+/// A key that is present, even as `null`, reads as `Some`; a missing key falls
+/// back to `#[serde(default)]`, which is `None`.
+fn present_or_null<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2148,7 +2200,7 @@ pub enum CreditGrantStatus {
 /// so one drifted enum never fails the surrounding snapshot.
 fn lenient_optional<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
-    D: serde::Deserializer<'de>,
+    D: Deserializer<'de>,
     T: serde::de::DeserializeOwned,
 {
     let value = Option::<serde_json::Value>::deserialize(deserializer)?;
@@ -7585,6 +7637,93 @@ mod tests {
         // exact pre-change wire shape).
         let json = serde_json::to_value(&decoded).expect("serialize legacy context");
         assert!(json.get("posture").is_none());
+    }
+
+    /// [behaviour] Saved auto-compaction values go out as numbers, switches and
+    /// `null` only: each tool sends its own two keys, `null` means read and not
+    /// saved, a missing member means unknown, and redaction keeps them as is.
+    #[test]
+    fn saved_auto_compaction_wire_shape_and_redaction() {
+        let claude = AgentAutoCompaction {
+            auto_compact_window: Some(Some(400_000)),
+            auto_compact_enabled: Some(None),
+            ..Default::default()
+        };
+        let codex = AgentAutoCompaction {
+            model_auto_compact_token_limit: Some(Some(200_000)),
+            model_context_window: Some(None),
+            ..Default::default()
+        };
+        let off = AgentAutoCompaction {
+            auto_compact_window: Some(None),
+            auto_compact_enabled: Some(Some(false)),
+            ..Default::default()
+        };
+        for (saved, wire) in [
+            (
+                claude,
+                serde_json::json!({"auto_compact_window": 400000, "auto_compact_enabled": null}),
+            ),
+            (
+                codex,
+                serde_json::json!({"model_auto_compact_token_limit": 200000, "model_context_window": null}),
+            ),
+            (
+                off,
+                serde_json::json!({"auto_compact_window": null, "auto_compact_enabled": false}),
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(saved).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_value::<AgentAutoCompaction>(wire).unwrap(),
+                saved
+            );
+        }
+
+        let snapshot = |auto_compaction| AgentStatusSnapshot {
+            source: SourceKind::ClaudeCode,
+            status: AgentStatusState::Available,
+            collection_method: AgentStatusCollectionMethod::ConfigFile,
+            captured_at: "2026-11-18T00:00:00Z".to_string(),
+            expires_at: "2026-11-18T00:15:00Z".to_string(),
+            account: None,
+            model: None,
+            quota_windows: Vec::new(),
+            credit_balances: Vec::new(),
+            context: None,
+            capabilities: Vec::new(),
+            plan_observations: Vec::new(),
+            diagnostics: Vec::new(),
+            runtime_defaults: Some(AgentRuntimeDefaults {
+                provenance: Some("config_file".to_string()),
+                fast_mode_enabled: Some(false),
+                auto_compaction,
+                ..Default::default()
+            }),
+        };
+        let redacted = snapshot(Some(claude)).redacted_for_backend();
+        assert_eq!(
+            redacted
+                .runtime_defaults
+                .as_ref()
+                .and_then(|defaults| defaults.auto_compaction),
+            Some(claude)
+        );
+        let wire = serde_json::to_value(&redacted).unwrap();
+        assert_eq!(
+            wire["runtime_defaults"]["auto_compaction"],
+            serde_json::json!({"auto_compact_window": 400000, "auto_compact_enabled": null})
+        );
+        // Unknown stays absent: the record without the member keeps its
+        // existing bytes and reads back as unknown.
+        let without = serde_json::to_value(snapshot(None).redacted_for_backend()).unwrap();
+        assert_eq!(
+            without["runtime_defaults"],
+            serde_json::json!({"provenance": "config_file", "fast_mode_enabled": false})
+        );
+        let read: AgentRuntimeDefaults =
+            serde_json::from_value(without["runtime_defaults"].clone()).unwrap();
+        assert_eq!(read.auto_compaction, None);
     }
 
     #[test]

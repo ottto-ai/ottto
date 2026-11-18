@@ -7083,6 +7083,119 @@ fn codex_config_defaults_capture_service_tier_model_and_selectors() {
     }
 }
 
+/// [behaviour] Codex auto-compaction values are read as top-level integers
+/// beside the other keys, but never decide on their own whether a defaults
+/// record exists.
+#[test]
+fn codex_config_defaults_read_auto_compaction_without_widening_has_any() {
+    let defaults = parse_codex_config_defaults(
+        "model = \"gpt-5.5\"\nmodel_auto_compact_token_limit = 200000\nmodel_context_window = 400000\n",
+    )
+    .expect("defaults");
+    assert_eq!(defaults.model_auto_compact_token_limit, Some(200_000));
+    assert_eq!(defaults.model_context_window, Some(400_000));
+    assert!(!defaults
+        .selector_context
+        .contains_key("model_auto_compact_token_limit"));
+    assert!(defaults
+        .selector_sources
+        .values()
+        .all(|source| !source.contains("auto_compact")));
+
+    // Wrong types and nested tables read as not saved.
+    for raw in [
+        "model = \"gpt-5.5\"\nmodel_auto_compact_token_limit = \"200000\"\nmodel_context_window = 4.0e5\n",
+        "model = \"gpt-5.5\"\n[profiles.fast]\nmodel_auto_compact_token_limit = 100000\nmodel_context_window = 200000\n",
+    ] {
+        let defaults = parse_codex_config_defaults(raw).expect("defaults");
+        assert_eq!(defaults.model_auto_compact_token_limit, None, "{raw}");
+        assert_eq!(defaults.model_context_window, None, "{raw}");
+    }
+
+    // A file that saves only these keys still yields no defaults record.
+    for raw in [
+        "model_auto_compact_token_limit = 200000\n",
+        "model_context_window = 400000\n",
+        "model_auto_compact_token_limit = 200000\nmodel_context_window = 400000\n",
+    ] {
+        assert!(parse_codex_config_defaults(raw).is_none(), "{raw}");
+    }
+}
+
+/// [behaviour] Claude Code's top-level `autoCompactWindow` and
+/// `autoCompactEnabled` follow the same per-key scope merge as `fastMode`:
+/// highest readable file wins, failed files are skipped, out-of-range or
+/// wrongly typed values are ignored, and per-model saves are never read.
+#[test]
+fn claude_settings_defaults_merge_auto_compaction_by_scope() {
+    let root = temp_dir("claude-auto-compaction-scopes");
+    let claude_dir = root.join(".claude");
+    fs::create_dir_all(&claude_dir).expect("create .claude");
+    let user = claude_dir.join("settings.json");
+    let local = claude_dir.join("settings.local.json");
+    let managed = root.join("managed-settings.json");
+    let paths = claude_settings_chain(&claude_dir, &managed);
+    let saved = || {
+        let ClaudeConfigDefaultsOutcome::Configured(defaults) = load_claude_defaults(&paths) else {
+            panic!("expected configured Claude defaults");
+        };
+        // Codex keys are never filled from Claude settings.
+        assert_eq!(
+            defaults.auto_compaction.model_auto_compact_token_limit,
+            None
+        );
+        assert_eq!(defaults.auto_compaction.model_context_window, None);
+        (
+            defaults.auto_compaction.auto_compact_window,
+            defaults.auto_compaction.auto_compact_enabled,
+        )
+    };
+
+    // Readable but nothing saved: checked, not saved.
+    fs::write(&user, "{\"model\": \"claude-opus-5-5\"}\n").expect("write user");
+    assert_eq!(saved(), (Some(None), Some(None)));
+
+    // Top-level keys only; a per-model save is ignored.
+    fs::write(
+        &user,
+        "{\"autoCompactWindow\": 300000, \"autoCompactEnabled\": true, \"modelSettings\": {\"claude-opus-5-5\": {\"autoCompactWindow\": 500000}}}\n",
+    )
+    .expect("write user");
+    assert_eq!(saved(), (Some(Some(300_000)), Some(Some(true))));
+
+    // A higher file wins per key; the switch from the user file survives.
+    fs::write(&local, "{\"autoCompactWindow\": 1000000}\n").expect("write local");
+    assert_eq!(saved(), (Some(Some(1_000_000)), Some(Some(true))));
+
+    // Managed is highest, but its out-of-range window is ignored.
+    fs::write(
+        &managed,
+        "{\"autoCompactWindow\": 99999, \"autoCompactEnabled\": false}\n",
+    )
+    .expect("write managed");
+    assert_eq!(saved(), (Some(Some(1_000_000)), Some(Some(false))));
+
+    // A failed file is skipped like every other key.
+    fs::write(&managed, "{\"autoCompactEnabled\": false\n").expect("write managed");
+    assert_eq!(saved(), (Some(Some(1_000_000)), Some(Some(true))));
+
+    // Wrongly typed or out-of-range values everywhere read as not saved.
+    fs::remove_file(&managed).expect("remove managed");
+    fs::write(&local, "{\"autoCompactWindow\": 1000001}\n").expect("write local");
+    fs::write(
+        &user,
+        "{\"autoCompactWindow\": \"400000\", \"autoCompactEnabled\": \"true\"}\n",
+    )
+    .expect("write user");
+    assert_eq!(saved(), (Some(None), Some(None)));
+
+    // The lowest accepted window is kept.
+    fs::write(&local, "{\"autoCompactWindow\": 100000}\n").expect("write local");
+    assert_eq!(saved(), (Some(Some(100_000)), Some(None)));
+
+    let _ = fs::remove_dir_all(root);
+}
+
 /// Build the ordered Claude Code settings chain for a fake home directory.
 fn claude_settings_chain(claude_dir: &Path, managed: &Path) -> Vec<(String, PathBuf)> {
     vec![

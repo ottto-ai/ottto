@@ -1328,4 +1328,71 @@ mod tracking_rollback_tests {
         assert_eq!(upgraded.last_health, saved.last_health);
         assert_eq!(upgraded.tracking_confirmation, None);
     }
+
+    /// [behaviour] Persisted health keeps saved auto-compaction values exactly,
+    /// `null` included, and a file written before they existed still loads.
+    #[test]
+    fn persisted_health_round_trips_saved_auto_compaction() {
+        const DEFAULTS_POINTER: &str = "/last_health/agent_status/runtime_defaults";
+        let state = |runtime_defaults: serde_json::Value| -> serde_json::Value {
+            serde_json::json!({
+                "first_seen_at": "2026-11-15T10:00:00Z",
+                "last_health": {
+                    "source": "claude_code", "descriptor": {
+                        "source": "claude_code", "display_name": "Claude Code", "operations": [],
+                        "review_tier": "official", "maturity": "stable", "collectors": [],
+                        "local_state_owner": "local_daemon", "telemetry_owner": "backend", "repair_owner": "local_daemon"
+                    },
+                    "state": "healthy", "grade": "ok",
+                    "account_binding": {"expected_account_id": null, "observed_account_id": null, "matched": null},
+                    "config": {"discovered": false, "path_hint": null, "fingerprint": null, "drift": []},
+                    "collector": null,
+                    "agent_status": {
+                        "source": "claude_code", "status": "available", "collection_method": "cli_json",
+                        "captured_at": "2026-11-15T12:00:00Z", "expires_at": "2026-11-15T12:15:00Z",
+                        "runtime_defaults": runtime_defaults
+                    },
+                    "last_seen_at": "2026-11-15T12:00:00Z", "last_verified_at": "2026-11-15T12:00:00Z",
+                    "problems": [], "recommended_actions": []
+                }
+            })
+        };
+        let auto_compaction = |file: &LocalSourceState| {
+            file.last_health
+                .as_ref()
+                .and_then(|health| health.agent_status.as_ref())
+                .and_then(|status| status.runtime_defaults.as_ref())
+                .map(|defaults| defaults.auto_compaction)
+                .expect("persisted defaults")
+        };
+
+        let with = state(serde_json::json!({
+            "provenance": "config_file",
+            "auto_compaction": {"auto_compact_window": 400000, "auto_compact_enabled": null}
+        }));
+        let loaded: LocalSourceState = serde_json::from_value(with.clone()).unwrap();
+        let saved = auto_compaction(&loaded).expect("saved values");
+        assert_eq!(saved.auto_compact_window, Some(Some(400_000)));
+        assert_eq!(saved.auto_compact_enabled, Some(None));
+        assert_eq!(saved.model_auto_compact_token_limit, None);
+        assert_eq!(saved.model_context_window, None);
+        let written = serde_json::to_value(&loaded).unwrap();
+        assert_eq!(
+            written.pointer(DEFAULTS_POINTER),
+            with.pointer(DEFAULTS_POINTER)
+        );
+        let reloaded: LocalSourceState = serde_json::from_value(written).unwrap();
+        assert_eq!(reloaded, loaded);
+
+        let without = state(serde_json::json!({"provenance": "config_file"}));
+        let loaded: LocalSourceState = serde_json::from_value(without.clone()).unwrap();
+        assert_eq!(auto_compaction(&loaded), None);
+        let written = serde_json::to_value(&loaded).unwrap();
+        assert_eq!(
+            written.pointer(DEFAULTS_POINTER),
+            without.pointer(DEFAULTS_POINTER)
+        );
+        let reloaded: LocalSourceState = serde_json::from_value(written).unwrap();
+        assert_eq!(reloaded, loaded);
+    }
 }
