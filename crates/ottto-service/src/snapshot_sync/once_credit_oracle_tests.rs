@@ -70,6 +70,11 @@ impl Drop for FinalizedCapture {
 enum Answer {
     Accept,
     Unstored,
+    /// `unchanged` with `unchanged_basis: dominated_by_head`: nothing stored.
+    Dominated,
+    /// The server's own per-entity judgement against its placed head
+    /// (`by_head`).
+    ByHead,
     Refuse(&'static str),
     Conflict,
     LostAck,
@@ -87,6 +92,36 @@ fn exact_ack(item: &Value) -> Value {
         "snapshot_fingerprint":item["snapshot_fingerprint"],"occurrence_count":1,
         "body_witness_version":version,
         "body_witness_digest":version.map(|_| finish_wire_body_witness(item))})
+}
+
+/// Equal usage at the placed head is `usage_identical`; a head holding at
+/// least the offered usage in every counter is `dominated_by_head`; no head,
+/// or growth past it, is stored.
+fn by_head(placed: &BTreeMap<String, Value>, item: &Value) -> Answer {
+    const COUNTS: [&str; 6] = [
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_creation_5m_tokens",
+        "cache_creation_1h_tokens",
+        "request_count",
+    ];
+    let Some(head) = placed.get(item["source_session_id"].as_str().unwrap()) else {
+        return Answer::Accept;
+    };
+    let counts = |body: &Value| COUNTS.map(|field| body[field].as_u64().unwrap_or(0));
+    let (head, offered) = (counts(head), counts(item));
+    if head == offered {
+        Answer::Unstored
+    } else if head
+        .iter()
+        .zip(offered)
+        .all(|(head, offered)| *head >= offered)
+    {
+        Answer::Dominated
+    } else {
+        Answer::Accept
+    }
 }
 
 struct OracleServer {
@@ -183,6 +218,10 @@ impl OracleServer {
                     let mut lost_ack = false;
                     for (item, answer) in items.iter().zip(answers) {
                         let mut reference = exact_ack(item);
+                        let answer = match answer {
+                            Answer::ByHead => by_head(&placed.lock().unwrap(), item),
+                            answer => answer,
+                        };
                         match answer {
                             Answer::Accept | Answer::LostAck => {
                                 let mut body = item.clone();
@@ -204,8 +243,14 @@ impl OracleServer {
                                     accepted_rows.push(item.clone());
                                 }
                             }
-                            Answer::Unstored => {
-                                reference["unchanged_basis"] = "usage_identical".into();
+                            Answer::Unstored | Answer::Dominated => {
+                                reference["unchanged_basis"] =
+                                    if matches!(answer, Answer::Dominated) {
+                                        "dominated_by_head"
+                                    } else {
+                                        "usage_identical"
+                                    }
+                                    .into();
                                 reply["unchanged_entities"]
                                     .as_array_mut()
                                     .unwrap()
@@ -229,6 +274,7 @@ impl OracleServer {
                                     .push(reference);
                             }
                             Answer::Dropped | Answer::Shed => unreachable!("handled per POST"),
+                            Answer::ByHead => unreachable!("resolved against the head above"),
                         }
                     }
                     if lost_ack {
@@ -518,21 +564,7 @@ impl OracleHome {
         }
     }
     fn write_rows(&self, rows: &[Value]) {
-        let path = self.transcript();
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &path,
-            rows.iter()
-                .map(|r| r.to_string() + "\n")
-                .collect::<String>(),
-        )
-        .unwrap();
-        std::fs::File::options()
-            .write(true)
-            .open(path)
-            .unwrap()
-            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(NOW - 3600))
-            .unwrap();
+        write_rows_at(&self.transcript(), rows);
     }
     fn restart(&mut self) {
         drop(std::mem::replace(&mut self.daemon, test_daemon("otm_test")));
@@ -1056,6 +1088,24 @@ fn c04_pi_positive_conflicted_result_cannot_publish() {
     );
 }
 
+/// A different destination with history on this Mac is a move. Authorize
+/// that history through the real claim policy before testing its ACK gate.
+fn move_destination(home: &mut OracleHome) {
+    home.device.device_id = "other-oracle-device".into();
+    FileDeviceStore::default().save(&home.device).unwrap();
+    let destination = snapshot_upload_destination_namespace(&home.device, "device-secret");
+    crate::backfill::apply_claim_backfill_policy_for_destination(
+        &home.support,
+        Some("full"),
+        None,
+        "synthetic-oracle-user",
+        Some(&destination),
+    )
+    .unwrap();
+    crate::backfill::record_first_census(&home.support, home.source, &destination, AT, true)
+        .unwrap();
+}
+
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests, client_report)]
@@ -1068,21 +1118,7 @@ fn c05_fresh_destination_requires_its_own_exact_ack() {
     assert!(first.finish.is_ok());
     assert_durable(&first);
     let fingerprint = first.finalized[0].snapshot_fingerprint.clone();
-    home.device.device_id = "other-oracle-device".into();
-    FileDeviceStore::default().save(&home.device).unwrap();
-    let destination = snapshot_upload_destination_namespace(&home.device, "device-secret");
-    // A different destination with history on this Mac is a move. Authorize
-    // that history through the real claim policy before testing its ACK gate.
-    crate::backfill::apply_claim_backfill_policy_for_destination(
-        &home.support,
-        Some("full"),
-        None,
-        "synthetic-oracle-user",
-        Some(&destination),
-    )
-    .unwrap();
-    crate::backfill::record_first_census(&home.support, home.source, &destination, AT, true)
-        .unwrap();
+    move_destination(&mut home);
     home.restart();
     *server.fallback.lock().unwrap() = Answer::Unstored;
     let unstored = home.cycle(&server, &recording);
@@ -1161,6 +1197,383 @@ fn c05_fresh_destination_requires_its_own_exact_ack() {
     );
 }
 
+const C12_OTHER: &str = "5b0c2d9e-1f3a-4b6c-8d7e-9f0a1b2c3d4e";
+
+/// c12's second session in the oracle project, and a confirmed-empty file in
+/// a second project (returned). It has its own stem: a Claude file with the
+/// first session's stem in another project is a path twin of that session.
+fn c12_install(home: &OracleHome) -> PathBuf {
+    let transcript = home.transcript();
+    let project = transcript.parent().unwrap();
+    write_rows_at(
+        &project.join(format!("{C12_OTHER}.jsonl")),
+        &[
+            json!({"timestamp":"2026-11-01T07:00:00Z","type":"attachment",
+                "sessionId":C12_OTHER,"attachment":{"type":"credential_org",
+                "organizationUuid":IDENTITY_PIPELINE_ORG}}),
+            json!({"timestamp":"2026-11-01T07:04:00Z","type":"assistant",
+                "sessionId":C12_OTHER,"requestId":"c12-other-request",
+                "message":{"id":"c12-other-message","model":"claude-haiku-4-5",
+                "usage":{"input_tokens":6,"output_tokens":2}}}),
+        ],
+    );
+    let sibling = project
+        .with_file_name("-synthetic-repo-sibling")
+        .join("6c3d2e1f-4a5b-4c6d-9e8f-0a1b2c3d4e5f.jsonl");
+    write_rows_at(
+        &sibling,
+        &[json!({"type":"summary","summary":"synthetic","leafUuid":"synthetic-leaf"})],
+    );
+    sibling
+}
+
+/// The entity fingerprints a cycle POSTed, sorted, repeats kept.
+fn posted(cycle: &Cycle) -> Vec<String> {
+    let mut posted = cycle
+        .batches
+        .iter()
+        .flat_map(|batch| {
+            let wire: Value = serde_json::from_slice(batch).unwrap();
+            wire["snapshots"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["snapshot_fingerprint"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    posted.sort();
+    posted
+}
+
+/// `route`'s rows for one session: its emitted body, and its POST items
+/// without the envelope (whose client report discloses each home's own
+/// history).
+fn entity_rows(route: &transition::RouteResult, session: &str) -> transition::RouteResult {
+    let mut rows = route.clone();
+    rows.snapshots.retain(|entity, _| entity == session);
+    let items = rows
+        .normalized
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|envelope| envelope["snapshots"].as_array().unwrap().iter())
+        .filter(|item| item["source_session_id"] == session)
+        .cloned()
+        .collect::<Vec<_>>();
+    rows.normalized = if items.is_empty() {
+        json!([])
+    } else {
+        json!([{"source": route.source.api_slug(), "snapshots": items}])
+    };
+    rows
+}
+
+/// The index key of `path`: the scan index keys a local file by its path.
+fn index_key(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+/// A file's upload receipt, without its physical source witness.
+fn receipt(cycle: &Cycle, path: &Path) -> Option<(String, u64, String)> {
+    let entry = cycle.index.files.get(&index_key(path))?;
+    let receipt = entry.upload_context_receipt.as_ref()?;
+    Some((
+        receipt.context_fingerprint.clone(),
+        receipt.replay_generation,
+        receipt.body_witness.clone(),
+    ))
+}
+
+fn assert_terminal(cycle: &Cycle, fingerprint: &str, body: &str) {
+    let hold = &cycle.index.quarantined_snapshot_fingerprints[fingerprint];
+    assert_eq!(
+        hold.disposition,
+        SnapshotQuarantineDisposition::UnprovenTerminal
+    );
+    assert_eq!(hold.retry_after_unix_seconds, 0);
+    assert_eq!(hold.upload_body_witness.as_deref(), Some(body));
+}
+
+/// [money] The server answers each entity against its own placed head. At a
+/// moved destination, one session's equal usage is `usage_identical` (held
+/// terminally at once) and the other's dominated usage is `dominated_by_head`
+/// (6 h retry). Restarts, a durable restore, the clock past 6 h and 12 h and
+/// a pre-change retry hold never get the `usage_identical` body stored, nor
+/// re-emit it smaller. The dominated body, once due with its head gone, earns
+/// its own exact ACK. Growth then earns its own ACK through a crash between
+/// that ACK and the index commit. Its POST item, placement, accepted rows,
+/// identity buckets, receipts, stamps and an empty sibling's proof all equal
+/// a cold Full of the same files at the same destination.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn c12_head_unstored_answers_hold_until_growth_earns_its_own_ack() {
+    const SIX_HOURS: u64 = crate::snapshots::SNAPSHOT_QUARANTINE_RETRY_SECONDS;
+    let claude = SnapshotSource::ClaudeCode;
+    let recording = Recording::start();
+    let server = OracleServer::new(claude, recording.handle());
+    let mut home = OracleHome::new(claude, &server);
+    home.row = "c12";
+    let sibling = c12_install(&home);
+    *server.fallback.lock().unwrap() = Answer::ByHead;
+    let first = home.cycle(&server, &recording);
+    assert!(first.finish.is_ok(), "{:?}", first.finish);
+    assert_eq!(first.finalized.len(), 2);
+    assert_durable(&first);
+    assert!(first
+        .index
+        .confirmed_empty_files
+        .contains(&index_key(&sibling)));
+    let item = |cycle: &Cycle, input: u64| {
+        cycle
+            .finalized
+            .iter()
+            .find(|item| item.input_tokens == input)
+            .unwrap()
+            .clone()
+    };
+    let (main, other) = (item(&first, 30), item(&first, 6));
+    let (e, d) = (
+        main.snapshot_fingerprint.clone(),
+        other.snapshot_fingerprint.clone(),
+    );
+    let (e_session, d_session) = (
+        main.source_session_id.clone(),
+        other.source_session_id.clone(),
+    );
+    // The other session's head already holds more usage than this Mac's body.
+    server
+        .placement
+        .lock()
+        .unwrap()
+        .get_mut(&d_session)
+        .unwrap()["input_tokens"] = 106.into();
+    let placed = server.placement.lock().unwrap().clone();
+    let prior = emitted_route(&first, claude, &server);
+    let cold_main = entity_rows(&prior, &e_session);
+
+    move_destination(&mut home);
+    home.restart();
+    let answered = home.cycle(&server, &recording);
+    assert!(answered.finish.is_ok(), "{:?}", answered.finish);
+    assert_eq!(answered.batches.len(), 1);
+    assert_eq!(posted(&answered), {
+        let mut both = vec![e.clone(), d.clone()];
+        both.sort();
+        both
+    });
+    assert!(answered.acknowledged.iter().all(Vec::is_empty));
+    for offered in &answered.finalized {
+        assert!(!answered.accepted_body(offered));
+    }
+    let main_body = snapshot_upload_body_witness(&item(&answered, 30));
+    assert_terminal(&answered, &e, &main_body);
+    let other_hold = answered.index.quarantined_snapshot_fingerprints[&d].clone();
+    assert_eq!(
+        other_hold.disposition,
+        SnapshotQuarantineDisposition::RetryPending
+    );
+    assert!(other_hold.retry_after_unix_seconds > 0);
+    assert_eq!(
+        other_hold.upload_body_witness.as_deref(),
+        Some(snapshot_upload_body_witness(&item(&answered, 6)).as_str())
+    );
+    assert_eq!(*server.placement.lock().unwrap(), placed);
+
+    // An unchanged same-generation restart reads and offers nothing; both
+    // held entities keep their accepted head, and the covered revision is
+    // never re-emitted smaller.
+    home.restart();
+    let quiet = home.cycle(&server, &recording);
+    assert!(quiet.finish.is_ok(), "{:?}", quiet.finish);
+    assert!(quiet.before.is_empty());
+    let mut quiet_route = emitted_route(&quiet, claude, &server);
+    quiet_route.mode = transition::Mode::Restart;
+    transition::money_oracle::assert_quiet_restart_with_anchor_window(
+        &quiet_route,
+        quiet.quiet_anchor_window,
+    );
+    transition::money_oracle::assert_held_set(
+        &[&e_session, &d_session],
+        &prior,
+        &quiet_route,
+        &prior,
+    );
+    transition::money_oracle::assert_no_smaller_reemit(
+        &e_session,
+        &prior,
+        &quiet_route,
+        &cold_main,
+        true,
+    );
+
+    // A durable restore (cold close, reload) keeps both holds exactly.
+    home.cold_restart();
+    let restored = home.cycle(&server, &recording);
+    assert!(restored.finish.is_ok(), "{:?}", restored.finish);
+    assert!(restored.batches.is_empty());
+    assert_terminal(&restored, &e, &main_body);
+    assert_eq!(
+        restored.index.quarantined_snapshot_fingerprints[&d],
+        other_hold
+    );
+    let restored_route = emitted_route(&restored, claude, &server);
+    transition::money_oracle::assert_held_set(
+        &[&e_session, &d_session],
+        &prior,
+        &restored_route,
+        &prior,
+    );
+
+    // Past 6 h the dominated hold is due, and its head is gone: the same
+    // body earns its own exact ACK. The usage_identical body is not leased,
+    // read or offered.
+    server.placement.lock().unwrap().remove(&d_session);
+    home.now = (home.now + SIX_HOURS + 1).max(other_hold.retry_after_unix_seconds + 1);
+    let due = home.cycle(&server, &recording);
+    assert!(due.finish.is_ok(), "{:?}", due.finish);
+    assert_eq!(posted(&due), vec![d.clone()]);
+    assert_eq!(due.finalized.len(), 1);
+    assert_eq!(
+        Some(snapshot_upload_body_witness(&due.finalized[0])),
+        other_hold.upload_body_witness
+    );
+    assert_durable(&due);
+    assert!(!due.progress.active_quarantine_retries.contains(&e));
+    assert_terminal(&due, &e, &main_body);
+
+    // Past 12 h: nothing.
+    home.now += SIX_HOURS;
+    let later = home.cycle(&server, &recording);
+    assert!(later.finish.is_ok(), "{:?}", later.finish);
+    assert!(later.batches.is_empty());
+    assert!(later.finalized.is_empty());
+    assert_terminal(&later, &e, &main_body);
+    assert!(!later.index.accepted_snapshot_fingerprint_recorded(&e));
+
+    // Upgrade route: a build before this change kept this body in 6 h/12 h
+    // retry custody. Once due, it is offered once more; the head still holds
+    // its usage, so the re-entered revision is terminal and held.
+    let mut index = ScanIndex::load(&home.index_path()).unwrap();
+    let hold = index.quarantined_snapshot_fingerprints.get_mut(&e).unwrap();
+    hold.disposition = SnapshotQuarantineDisposition::RetryPending;
+    hold.failed_reconstruction_count = 1;
+    hold.retry_after_unix_seconds = home.now - 1;
+    index.save_fixture(&home.index_path()).unwrap();
+    home.restart();
+    let reentered = home.cycle(&server, &recording);
+    assert!(reentered.finish.is_ok(), "{:?}", reentered.finish);
+    assert_eq!(posted(&reentered), vec![e.clone()]);
+    assert_terminal(&reentered, &e, &main_body);
+    home.restart();
+    let after = home.cycle(&server, &recording);
+    assert!(after.finish.is_ok(), "{:?}", after.finish);
+    assert!(after.batches.is_empty());
+    let after_route = emitted_route(&after, claude, &server);
+    transition::money_oracle::assert_no_smaller_reemit(
+        &e_session,
+        &prior,
+        &after_route,
+        &cold_main,
+        true,
+    );
+
+    // Growth: the head no longer holds this usage, so it is stored. A crash
+    // between that ACK and the index commit restores the prior index; the
+    // durable ACK keeps the grown body from a second POST.
+    let growth = json!({"type":"assistant","sessionId":IDENTITY_PIPELINE_ROOT,
+        "requestId":"c12-growth","timestamp":"2026-11-01T07:03:00Z",
+        "message":{"id":"c12-growth","model":"claude-haiku-4-5",
+        "usage":{"input_tokens":13,"output_tokens":1}}});
+    writeln!(
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(home.transcript())
+            .unwrap(),
+        "{growth}"
+    )
+    .unwrap();
+    let failure = SaveFailure::at("selected_save");
+    let grown = home.cycle(&server, &recording);
+    drop(failure);
+    assert!(grown.finish.is_err());
+    assert_eq!(grown.finalized.len(), 1);
+    assert_eq!(grown.finalized[0].input_tokens, 43);
+    assert_ne!(grown.finalized[0].snapshot_fingerprint, e);
+    assert_eq!(
+        posted(&grown),
+        vec![grown.finalized[0].snapshot_fingerprint.clone()]
+    );
+    assert_durable(&grown);
+    let grown_route = emitted_route(&grown, claude, &server);
+    home.restore_pre_cycle_index(&grown);
+    let resumed = home.cycle(&server, &recording);
+    assert!(resumed.finish.is_ok(), "{:?}", resumed.finish);
+    assert!(resumed.batches.is_empty());
+    assert_durable(&resumed);
+
+    // A cold Full of the same files at the same destination.
+    let cold_server = OracleServer::new(claude, recording.handle());
+    let mut cold_home = OracleHome::new(claude, &cold_server);
+    cold_home.row = "c12_cold";
+    let cold_sibling = c12_install(&cold_home);
+    std::fs::copy(home.transcript(), cold_home.transcript()).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(cold_home.transcript())
+        .unwrap()
+        .set_modified(
+            std::fs::metadata(home.transcript())
+                .unwrap()
+                .modified()
+                .unwrap(),
+        )
+        .unwrap();
+    cold_home.now = home.now;
+    move_destination(&mut cold_home);
+    *cold_server.fallback.lock().unwrap() = Answer::ByHead;
+    let cold = cold_home.cycle(&cold_server, &recording);
+    assert!(cold.finish.is_ok(), "{:?}", cold.finish);
+    assert_eq!(cold.finalized.len(), 2);
+    assert_durable(&cold);
+    let cold_route = emitted_route(&cold, claude, &cold_server);
+    transition::money_oracle::assert_no_smaller_reemit(
+        &e_session,
+        &prior,
+        &entity_rows(&grown_route, &e_session),
+        &entity_rows(&cold_route, &e_session),
+        false,
+    );
+    assert_eq!(
+        *server.placement.lock().unwrap(),
+        *cold_server.placement.lock().unwrap()
+    );
+    assert_eq!(grown_route.accepted, cold_route.accepted);
+    assert_eq!(
+        grown_route.accepted_identity_buckets,
+        cold_route.accepted_identity_buckets
+    );
+    let stamps = |cycle: &Cycle| {
+        serde_json::to_value(&cycle.index.upload_context_proof).unwrap()["entity_stamps"].clone()
+    };
+    assert_eq!(stamps(&resumed), stamps(&cold));
+    assert!(receipt(&cold, &cold_home.transcript()).is_some());
+    assert_eq!(
+        receipt(&resumed, &home.transcript()),
+        receipt(&cold, &cold_home.transcript())
+    );
+    assert!(cold
+        .index
+        .confirmed_empty_files
+        .contains(&index_key(&cold_sibling)));
+    assert!(resumed
+        .index
+        .confirmed_empty_files
+        .contains(&index_key(&sibling)));
+    assert_eq!(receipt(&resumed, &sibling), receipt(&cold, &cold_sibling));
+}
+
 #[test]
 #[serial]
 #[serial(source_cadences, source_manifests, client_report)]
@@ -1235,6 +1648,24 @@ fn c06_crash_windows_preserve_placement_and_durable_suppression() {
             30
         );
     }
+}
+
+/// Writes `rows` as JSONL at `path`, last modified an hour before `NOW`.
+fn write_rows_at(path: &Path, rows: &[Value]) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        path,
+        rows.iter()
+            .map(|r| r.to_string() + "\n")
+            .collect::<String>(),
+    )
+    .unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(NOW - 3600))
+        .unwrap();
 }
 
 fn emitted_route(
@@ -3150,6 +3581,7 @@ mod money_equivalence_tests {
         c10_codex_singleton_park_keeps_the_previous_body();
         c11_fragment_and_obligation_charge_one_slot_and_existing_marker_charges_none();
         c11_account_hold_bypasses_the_full_audit_cap_without_staging_a_marker();
+        c12_head_unstored_answers_hold_until_growth_earns_its_own_ack();
         scheduling_permutations_converge_to_the_same_bodies();
     }
 
