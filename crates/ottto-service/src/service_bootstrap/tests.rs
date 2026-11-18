@@ -371,9 +371,10 @@ fn unchanged_loaded_job_restarts_in_place_and_changed_plist_is_replaced() {
 }
 
 /// [behaviour] After `bootout`, bootstrap waits until launchd has removed the
-/// job; a job that stays loaded or an unknown probe result is an error.
+/// job, within one time budget that also caps each probe; a job still loaded
+/// at the deadline or an unknown probe result is an error.
 #[test]
-fn bootout_waits_for_delayed_job_removal() {
+fn bootout_waits_for_delayed_job_removal_within_one_budget() {
     let loaded = || -> Result<Option<PathBuf>> {
         Ok(Some(PathBuf::from(
             "/Applications/Ottto.app/Contents/Helpers/ottto-service",
@@ -381,7 +382,7 @@ fn bootout_waits_for_delayed_job_removal() {
     };
     let mut probes = 0;
     wait_until_job_absent(
-        || {
+        |_| {
             probes += 1;
             if probes < 3 {
                 loaded()
@@ -389,32 +390,46 @@ fn bootout_waits_for_delayed_job_removal() {
                 Ok(None)
             }
         },
-        5,
+        Duration::from_secs(5),
         Duration::ZERO,
     )
     .unwrap();
     assert_eq!(probes, 3);
 
-    let mut probes = 0;
+    // Slow probes that keep finding the job: the budget covers the probes
+    // themselves, and each probe's timeout is the time left (floored).
+    let budget = Duration::from_millis(200);
+    let mut timeouts = Vec::new();
+    let started = std::time::Instant::now();
     let error = wait_until_job_absent(
-        || {
-            probes += 1;
+        |timeout| {
+            timeouts.push(timeout);
+            std::thread::sleep(Duration::from_millis(80));
             loaded()
         },
-        5,
-        Duration::ZERO,
+        budget,
+        Duration::from_millis(1),
     )
     .unwrap_err();
-    assert_eq!(probes, 5);
     assert!(error.to_string().contains("still loaded after bootout"));
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(timeouts.len() >= 2, "{timeouts:?}");
+    assert!(
+        timeouts.iter().all(|timeout| *timeout <= budget),
+        "{timeouts:?}"
+    );
+    assert!(
+        timeouts.windows(2).all(|pair| pair[1] <= pair[0]),
+        "{timeouts:?}"
+    );
 
     let mut probes = 0;
     assert!(wait_until_job_absent(
-        || {
+        |_| {
             probes += 1;
             parse_loaded_program(Some(112), b"")
         },
-        5,
+        Duration::from_secs(5),
         Duration::ZERO,
     )
     .is_err());
