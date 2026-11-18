@@ -973,6 +973,12 @@ fn retirement_handoff_recovers_acks_after_index_commit_and_cleanup_save_failures
                 .accepted_cache_heads
                 .insert(cache_session_key("concurrent"), "c".repeat(64));
             concurrent.save(&progress_path).unwrap();
+            // Native rows compare the stored generation only when a page
+            // writes: an unchanged page opens no transaction. Give the stale
+            // ledger a page so its barrier save reaches the generation check.
+            progress
+                .accepted_cache_heads
+                .insert(cache_session_key("stale"), "d".repeat(64));
             assert!(progress
                 .recover_ack_retirement_handoff(&mut saved, &index_path, &progress_path,)
                 .is_err());
