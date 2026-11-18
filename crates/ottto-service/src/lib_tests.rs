@@ -339,32 +339,36 @@ mod tests {
             )
             .expect("save synthetic diagnostic secret");
         }
-        // A real retained ledger is present on disk. Diagnostics and status
-        // must exclude its class H grain, including the compact persisted form.
+        // A ledger the removed retained-identity path wrote is on disk.
+        // Diagnostics and status must exclude its class H grain, including
+        // the compact persisted form (one 73-byte proved-row record).
         let retained_hash = "0123456789abcdef".repeat(4);
         let mut ledger = snapshots::claude_request_identity::AcceptedBuckets::for_test();
-        ledger.record_proved(
-            &serde_json::json!({
-                "source_session_id":"diagnostics-retained",
-                "provenance":{"collector":snapshots::claude_request_identity::COLLECTOR},
-                "request_evidence":[{"identity_basis":"telemetry_login"}],
-                "usage_buckets":[{"bucket_start":"2026-09-01T10:00:00Z", "model_usage":[{
-                    "model":"claude-synthetic", "request_count":1, "evidence_ref":0,
-                    "account_identifier_hash":retained_hash
-                }]}]
-            }),
-            true,
-            &[],
+        ledger.record(&serde_json::json!({
+            "source_session_id":"diagnostics-retained",
+            "provenance":{"collector":snapshots::claude_request_identity::COLLECTOR},
+            "request_evidence":[{"identity_basis":"telemetry_login"}],
+            "usage_buckets":[{"bucket_start":"2026-09-01T10:00:00Z", "model_usage":[{
+                "model":"claude-synthetic", "request_count":1, "evidence_ref":0,
+                "account_identifier_hash":retained_hash
+            }]}]
+        }));
+        let mut record = vec![0_u8; 40];
+        record.push(1);
+        record.extend(
+            snapshots::claude_request_identity::digest_hex::decode::<serde::de::value::Error>(
+                &retained_hash,
+            )
+            .unwrap(),
         );
-        assert_eq!(
-            ledger.proved_rows_for_test("diagnostics-retained"),
-            Some((1, 0))
+        let compact = format!(
+            "v2:{}",
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, record)
         );
-        let ledger_value = serde_json::to_value(&ledger).unwrap();
-        let compact = ledger_value.as_object().unwrap().values().next().unwrap()["proved"]
-            .as_str()
-            .unwrap()
-            .to_owned();
+        let mut ledger_value = serde_json::to_value(&ledger).unwrap();
+        for session in ledger_value.as_object_mut().unwrap().values_mut() {
+            session["proved"] = serde_json::json!(compact);
+        }
         let progress_path =
             support.join("snapshots/destinations/synthetic/claude-upload-progress.json");
         std::fs::create_dir_all(progress_path.parent().unwrap()).unwrap();

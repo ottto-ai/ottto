@@ -67,7 +67,6 @@ pub(super) fn reference(item: &SnapshotItem) -> SnapshotEntityRef {
         head_etag: None,
         head_challenge: None,
         unchanged_basis: None,
-        retained_proof_missing: Vec::new(),
         cache_observations_state: None,
     }
 }
@@ -1173,9 +1172,6 @@ fn released_0205_rewrite_preserves_money_ledgers_and_drops_only_recovery_metadat
             "model":"claude-synthetic","evidence_ref":0,"account_identifier_hash":"a".repeat(64),
             "input_tokens":10,"cost_usd":"1.00"}]}]});
     progress.accepted_identity_buckets.record(&identity);
-    progress
-        .accepted_identity_buckets
-        .record_proved(&identity, true, &[]);
     assert!(!progress.accepted_identity_buckets.is_empty());
     let bytes = serde_json::to_vec(&progress).unwrap();
     let old: head_conflict_released_progress_fixture::SnapshotUploadProgress =
