@@ -307,6 +307,16 @@ pub fn install_owner_repair_hint(owner: InstallOwner) -> &'static str {
 pub fn render_launch_agent_plist(config: &LaunchAgentConfig) -> Result<Vec<u8>> {
     let mut root = Dictionary::new();
     root.insert("Label".to_string(), Value::String(config.label.clone()));
+    // launchd.plist(5): an app that installs a legacy plist names its bundle
+    // here, so Login Items shows the job under the app, not the signer's name.
+    // macOS applies it only when the program and the app share a signing Team
+    // ID and Launch Services knows the app.
+    root.insert(
+        "AssociatedBundleIdentifiers".to_string(),
+        Value::Array(vec![Value::String(
+            crate::app_bundle_version::COMPANION_BUNDLE_IDENTIFIER.to_string(),
+        )]),
+    );
     root.insert(
         "ProgramArguments".to_string(),
         Value::Array(vec![
@@ -475,6 +485,12 @@ mod tests {
         assert_eq!(
             root.get("Label").and_then(Value::as_string),
             Some(LAUNCH_AGENT_LABEL)
+        );
+        assert_eq!(
+            root.get("AssociatedBundleIdentifiers")
+                .and_then(Value::as_array)
+                .map(|ids| ids.iter().map(Value::as_string).collect::<Vec<_>>()),
+            Some(vec![Some("net.ottto.Companion")])
         );
         assert_eq!(
             root.get("RunAtLoad").and_then(Value::as_boolean),

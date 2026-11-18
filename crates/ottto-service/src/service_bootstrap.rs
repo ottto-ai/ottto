@@ -6,9 +6,14 @@ use ottto_core::service_lifecycle::{
 use ottto_service::macos_service::{self, LaunchAgentConfig, LaunchAgentInstallPlan};
 use std::path::Path;
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+/// Total time, including probes, for launchd to remove a booted-out job.
+const REMOVAL_BUDGET: Duration = Duration::from_secs(5);
+const REMOVAL_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// Shortest probe timeout, so the last probe near the deadline can still answer.
+const MIN_PROBE_TIMEOUT: Duration = Duration::from_millis(100);
 
 pub(super) fn install(
     home: &Path,
@@ -30,7 +35,7 @@ pub(super) fn install(
                 plist,
                 migrate_owner,
                 execute,
-                || loaded_program(lock),
+                || loaded_program(lock, COMMAND_TIMEOUT),
                 |args| {
                     let (program, rest) = args.split_first().context("empty service command")?;
                     // Plans retain their existing CLI strings; execution uses a fixed path.
@@ -43,6 +48,15 @@ pub(super) fn install(
                 "service lifecycle command failed ({status}); installation may be partial: {}",
                 args.join(" ")
             );
+                    // `bootout` can return before launchd removes the job, and a
+                    // bootstrap that arrives first fails. Wait for removal.
+                    if rest.first().map(String::as_str) == Some("bootout") {
+                        wait_until_job_absent(
+                            |timeout| loaded_program(lock, timeout),
+                            REMOVAL_BUDGET,
+                            REMOVAL_POLL_INTERVAL,
+                        )?;
+                    }
                     Ok(())
                 },
             )
@@ -109,13 +123,40 @@ fn install_with(
     Ok(plan)
 }
 
-fn loaded_program(lock: &ServiceLifecycleTransaction) -> Result<Option<std::path::PathBuf>> {
+/// Polls `probe` until the job is absent, within one `budget` measured from
+/// the first probe. Each probe gets the time left (at least 100 ms) as its
+/// timeout. A probe error (unknown state) or a job still present at the
+/// deadline is an error, so bootstrap never runs against a job that may still
+/// be loaded.
+fn wait_until_job_absent(
+    mut probe: impl FnMut(Duration) -> Result<Option<std::path::PathBuf>>,
+    budget: Duration,
+    interval: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + budget;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if probe(left.max(MIN_PROBE_TIMEOUT))?.is_none() {
+            return Ok(());
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            anyhow::bail!("LaunchAgent is still loaded after bootout; installation may be partial");
+        }
+        std::thread::sleep(interval.min(left));
+    }
+}
+
+fn loaded_program(
+    lock: &ServiceLifecycleTransaction,
+    timeout: Duration,
+) -> Result<Option<std::path::PathBuf>> {
     if !cfg!(target_os = "macos") {
         return Ok(None);
     }
     let mut command = Command::new("/bin/launchctl");
     command.args(["print", &ottto_core::macos_launch_agent_target()]);
-    let (status, output) = lock.run(&mut command, COMMAND_TIMEOUT)?;
+    let (status, output) = lock.run(&mut command, timeout)?;
     parse_loaded_program(status.code(), &output)
 }
 
