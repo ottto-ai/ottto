@@ -1406,6 +1406,22 @@ pub struct AgentRuntimeDefaults {
     pub auto_compaction: Option<AgentAutoCompaction>,
 }
 
+impl AgentRuntimeDefaults {
+    /// Whether any default value is set. Capture metadata, selector maps and
+    /// auto-compaction values do not count.
+    fn has_default_value(&self) -> bool {
+        self.model.is_some()
+            || self.service_tier.is_some()
+            || self.speed_mode.is_some()
+            || self.fast_mode_enabled.is_some()
+            || self.priority_enabled.is_some()
+            || self.reasoning_effort.is_some()
+            || !self.reasoning_effort_by_model.is_empty()
+            || self.approval_policy.is_some()
+            || self.sandbox_mode.is_some()
+    }
+}
+
 /// Saved auto-compaction values, numbers and switches only.
 ///
 /// Each field is three-way: `None` omits the key (it belongs to the other
@@ -1614,6 +1630,11 @@ impl AgentStatusSnapshot {
                 .into_iter()
                 .filter(|(key, value)| is_safe_backend_text(key) && is_safe_backend_text(value))
                 .collect();
+            // Auto-compaction values only ride a record that still carries a
+            // default after redaction; an emptied record drops them too.
+            if !defaults.has_default_value() {
+                defaults.auto_compaction = None;
+            }
         }
         self
     }
@@ -7724,6 +7745,60 @@ mod tests {
         let read: AgentRuntimeDefaults =
             serde_json::from_value(without["runtime_defaults"].clone()).unwrap();
         assert_eq!(read.auto_compaction, None);
+    }
+
+    /// [behaviour] A defaults record that redaction empties, such as a Codex
+    /// config whose only default is a path-like model, drops its
+    /// auto-compaction values too; a record that keeps a default keeps them.
+    #[test]
+    fn redaction_drops_auto_compaction_from_an_emptied_defaults_record() {
+        let saved = AgentAutoCompaction {
+            model_auto_compact_token_limit: Some(Some(200_000)),
+            model_context_window: Some(None),
+            ..Default::default()
+        };
+        let redacted = |model: &str| {
+            AgentStatusSnapshot {
+                source: SourceKind::Codex,
+                status: AgentStatusState::Available,
+                collection_method: AgentStatusCollectionMethod::ConfigFile,
+                captured_at: "2026-11-18T00:00:00Z".to_string(),
+                expires_at: "2026-11-18T00:15:00Z".to_string(),
+                account: None,
+                model: None,
+                quota_windows: Vec::new(),
+                credit_balances: Vec::new(),
+                context: None,
+                capabilities: Vec::new(),
+                plan_observations: Vec::new(),
+                diagnostics: Vec::new(),
+                runtime_defaults: Some(AgentRuntimeDefaults {
+                    captured_at: Some("2026-11-18T00:00:00Z".to_string()),
+                    provenance: Some("config_file".to_string()),
+                    model: Some(model.to_string()),
+                    selector_sources: BTreeMap::from([(
+                        "model".to_string(),
+                        "codex.config.model".to_string(),
+                    )]),
+                    auto_compaction: Some(saved),
+                    ..Default::default()
+                }),
+            }
+            .redacted_for_backend()
+            .runtime_defaults
+            .expect("defaults record")
+        };
+
+        let emptied = redacted("/Users/example/models/custom");
+        assert_eq!(emptied.model, None);
+        assert_eq!(emptied.auto_compaction, None);
+        assert!(!serde_json::to_string(&emptied)
+            .unwrap()
+            .contains("auto_compaction"));
+
+        let kept = redacted("gpt-5.5");
+        assert_eq!(kept.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(kept.auto_compaction, Some(saved));
     }
 
     #[test]
