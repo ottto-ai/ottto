@@ -610,6 +610,7 @@ impl InplaceRetryServer {
                     serde_json::json!({"token":"synthetic-inplace-token","expires_at":"2099-01-01T00:00:00Z"})
                 } else if request.contains("/activity-hints") {
                     serde_json::json!({"source":"claude_code","server_time":current_rfc3339(),
+                        "session_request_account_source_contract":crate::snapshots::ACCOUNT_SOURCE_CONTRACT,
                         "last_data_at":null,"record_count_15m":0,"record_count_24h":0,
                         "local_usage_reconciliation_enabled":true,"backfill_window_days":183,
                         "recommended_scan_after":"2099-01-01T00:00:00Z"})
@@ -742,7 +743,6 @@ fn inplace_retry_claude_cycle(shed_first_batch: bool) -> InplaceRetryCycle {
     let client = SnapshotApiClient::new(server.url.clone());
     let daemon = test_daemon("otm_test");
     let mut transport = crate::net_resilience::TransportCycleOutcome::default();
-    let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
     let collection = || AgentStatusCollection {
         snapshots: vec![test_agent_status(SourceKind::ClaudeCode)],
         source_health_snapshot: test_agent_status(SourceKind::ClaudeCode),
@@ -763,7 +763,6 @@ fn inplace_retry_claude_cycle(shed_first_batch: bool) -> InplaceRetryCycle {
             &daemon,
             &mut transport,
             daemon.snapshot_scan_account_witness().unwrap(),
-            false,
         )
     })
     .unwrap()
@@ -786,7 +785,6 @@ fn inplace_retry_claude_cycle(shed_first_batch: bool) -> InplaceRetryCycle {
                 &support,
                 &daemon,
                 &mut transport,
-                &mut retry,
             )
         })
     });

@@ -430,7 +430,6 @@ impl RouteResult {
                         let mut restored = snapshot.clone();
                         for path in [
                             "/source_file_fingerprint",
-                            "/semantic_envelope/revision_hash",
                             "/semantic_envelope/revision_v2_hash",
                         ] {
                             *restored.pointer_mut(path).expect("existing sentinel path") =

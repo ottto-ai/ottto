@@ -1885,11 +1885,6 @@ refusals. While a placeholder is stored, a contract change cannot be
 classified into `from_empty`, `to_empty` or `collector_e2_grouping` from that
 unknown prior contract.
 
-Retained Pi retry authority also binds the original client's API endpoint digest.
-An endpoint-only transition refuses before relay-token acquisition and batch
-submission, even if device credentials and the account witness stay unchanged.
-The digest is RAM-only authority and is never emitted in diagnostic records.
-
 ### Restore Provenance (schema 2 additive)
 
 Completed `native_collection_page` records can include

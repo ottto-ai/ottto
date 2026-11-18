@@ -1072,7 +1072,7 @@ fn healthy_sessions_send_the_unchanged_wire_and_keep_no_challenge() {
         crate::snapshots::claude_request_identity::item_bytes(&projected),
         "preflight reserves the complete challenge framing"
     );
-    // The estimate is the upload's own wire at its largest policy framing.
+    // The budget covers the largest policy framing plus the admission headroom.
     let largest = SnapshotUploadPolicy {
         session_titles_enabled: false,
         workspace_labels_enabled: false,
@@ -1081,6 +1081,7 @@ fn healthy_sessions_send_the_unchanged_wire_and_keep_no_challenge() {
     assert_eq!(
         crate::snapshots::claude_request_identity::item_bytes(&projected),
         crate::snapshots::snapshot_item_wire_size(SnapshotSource::ClaudeCode, &projected, largest)
+            + 134
     );
     let mut no_answer = projected.clone();
     no_answer.cache_conflict_answer = None;
@@ -1265,7 +1266,7 @@ fn assert_rescan_claim(wire: &Value, answered: bool) {
     if answered {
         assert_eq!(envelope["forced_full_rescan"], true);
         assert!(envelope["rescan_from_revision_hash"].is_string());
-        assert!(envelope["revision_hash"].is_string());
+        assert!(envelope["revision_v2_hash"].is_string());
         assert!(wire["head_cas_contract"].is_string(), "enforced head CAS");
         assert!(envelope.get("base_head_etag").is_none(), "no expected head");
     }

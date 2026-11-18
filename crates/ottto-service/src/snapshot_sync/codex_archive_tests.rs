@@ -302,7 +302,6 @@ pub(crate) fn assert_archive_debt_preserves_replay_progress(
         ..fixture.preparation(false)
     };
     let mut transport = crate::net_resilience::TransportCycleOutcome::default();
-    let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
     finish_sync_source(
         preparation,
         index,
@@ -316,7 +315,6 @@ pub(crate) fn assert_archive_debt_preserves_replay_progress(
         &support,
         &daemon,
         &mut transport,
-        &mut retry,
     )
     .unwrap();
     let backfill = load_backfill_state(&support);

@@ -184,7 +184,8 @@ fn hint_json() -> Value {
         "backfill_window_days":30, "recommended_scan_after":AT,
         "snapshot_head_cas_enabled":true, "snapshot_head_cas_required":false,
         "claude_otel_only_sessions_contract":"claude_otel_only_sessions:v1",
-        "claude_otel_only_pairing_floor":"2026-08-02T06:00:00Z"
+        "claude_otel_only_pairing_floor":"2026-08-02T06:00:00Z",
+        "session_request_account_source_contract":crate::snapshots::ACCOUNT_SOURCE_CONTRACT
     })
 }
 fn hint() -> Hint {
@@ -252,6 +253,13 @@ fn page_from(
     for item in &mut page.scan.snapshots {
         item.collected_at = AT.into();
     }
+    // As the sync loop's finish does every cycle.
+    progress
+        .accepted_identity_buckets
+        .set_account_source_enabled(
+            hint.session_request_account_source_contract.as_deref()
+                == Some(crate::snapshots::ACCOUNT_SOURCE_CONTRACT),
+        );
     let mut ledger = progress.telemetry_only.take();
     let (disposition, _, stats) = apply_claude_local_evidence_to_scan_with_ledger_and_budget(
         &c.support,
@@ -336,7 +344,20 @@ fn telemetry_only_cold_ram_restore_and_restart_preserve_switch_gap_and_side_call
                 .remove("head_cas_contract"),
             Some(json!("snapshot_head_etag:v1"))
         );
-        assert_eq!(old_wire, released, "only the batch declaration changes");
+        // Keep the released daemon sample frozen. Compare every other field.
+        let mut released_without_v1 = released.clone();
+        let envelope = released_without_v1["snapshots"][0]["semantic_envelope"]
+            .as_object_mut()
+            .unwrap();
+        assert_eq!(
+            envelope.remove("revision_contract_version"),
+            Some(json!("snapshot_revision:v1"))
+        );
+        assert!(envelope.remove("revision_hash").unwrap().is_string());
+        assert_eq!(
+            old_wire, released_without_v1,
+            "only the batch declaration and v1 revision fields change"
+        );
         println!(
             "OTEL_ONLY_RECEIVER_GOLDEN {}",
             serde_json::to_string(&request(&cold_page.scan.snapshots)).unwrap()

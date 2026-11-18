@@ -190,7 +190,7 @@ ottto update --json
 Only uninstall after the user asks for removal:
 
 ```bash
-ottto uninstall --json
+ottto uninstall --confirm --json
 ```
 
 ## Reporting

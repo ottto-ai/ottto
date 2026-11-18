@@ -127,7 +127,6 @@ impl ContinuationFixture {
     fn preparation(&self, attribution: bool) -> SourcePreparation {
         let status = test_agent_status(SourceKind::Codex);
         SourcePreparation {
-            retry_authority: None,
             source: SnapshotSource::Codex,
             claude_scan_roots: None,
             account_witness: [3; 32],
@@ -361,10 +360,6 @@ fn the_continuation_prepare_matches_the_ordinary_tail_on_a_quiescent_fixture() {
     );
 
     // The documented SKIPs.
-    assert!(
-        prepared.retry_authority.is_none(),
-        "no LiveAuthority capture"
-    );
     assert!(!prepared.backfill_pending);
     assert!(prepared.claude_scan_roots.is_none());
     assert!(prepared.scan.is_some());
