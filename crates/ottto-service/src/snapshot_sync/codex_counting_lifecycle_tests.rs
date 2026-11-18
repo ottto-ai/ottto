@@ -46,9 +46,10 @@ fn counting_transition_capture_and_failed_upload_select_whole_entries() {
     let index_path = root.join("index.json");
     let progress_path = root.join("progress.json");
     let mut committed = ScanIndex::default();
-    committed.save(&index_path).unwrap();
+    committed
+        .save_fixture_for_source(&index_path, SnapshotSource::Codex)
+        .unwrap();
     {
-        let _cutover = crate::snapshots::TestCutover::set(0);
         let mut working = committed.clone();
         let result = prepare(&root, &mut working);
         result.finish_codex_capture_boundary(&mut working);
@@ -115,8 +116,8 @@ fn counting_transition_capture_and_failed_upload_select_whole_entries() {
     assert_eq!(result.snapshots.len(), 4, "{result:?}");
     for key in keys.iter().chain(std::iter::once(&control_key)) {
         assert!(
-            !working.files[key].codex_counting_v2,
-            "inactive complete parse clears the mark"
+            working.files[key].codex_counting_v2,
+            "a complete Codex parse retains the V2 mark"
         );
     }
     capture_codex_recovery_evidence(
@@ -213,8 +214,8 @@ fn counting_transition_capture_and_failed_upload_select_whole_entries() {
         );
     }
     assert!(
-        !loaded.files[&control_key].codex_counting_v2,
-        "settled control saves Legacy"
+        loaded.files[&control_key].codex_counting_v2,
+        "settled control saves V2"
     );
     assert_ne!(
         loaded.files[&control_key].last_snapshot_fingerprint,

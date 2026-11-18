@@ -6,7 +6,6 @@ use crate::snapshots::transcript_acquisition_tests::accept_after_policy;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::FileExt;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use crate::transcript_cache::ENTRY_BYTES;
 
@@ -16,16 +15,12 @@ fn plain_path() -> &'static Path {
 
 const NOW: &str = "2026-10-07T12:00:00Z";
 const SESSION: &str = "019fa111-2222-7333-8444-555555555555";
-static NEXT: AtomicU64 = AtomicU64::new(0);
 
 struct Temp(PathBuf);
 impl Temp {
     fn new(tag: &str, bytes: &[u8]) -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "ottto-codex-cursor-{tag}-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, AtomicOrdering::Relaxed)
-        ));
+        // Canonical: state v2 refuses a store beneath a symlinked ancestor.
+        let path = crate::test_scratch::unique_path(&format!("ottto-codex-cursor-{tag}"));
         fs::write(&path, bytes).unwrap();
         Self(path)
     }
@@ -4348,7 +4343,7 @@ fn growth_curable_hold_is_not_anchored_past_unread_bytes() {
             if grow {
                 fixture.append(SESSION, &token_line(41));
             }
-            let _ = finish_job(&cache, None, &mut job, None, "legacy", "", true);
+            let _ = finish_job(&cache, None, &mut job, None, "", true);
             job.hold_offset
         });
         assert_eq!(
@@ -4430,7 +4425,6 @@ fn memo_wakes_on_the_conflicted_identity_set() {
             "dependencies",
             codex,
             1,
-            "counting",
         )
         .unwrap()
     };
@@ -4457,7 +4451,6 @@ fn memo_wakes_on_the_conflicted_identity_set() {
             "dependencies",
             codex,
             1,
-            "counting",
         )
         .unwrap()
     };
@@ -4482,7 +4475,6 @@ const SPAWN_PARENT: &str = "01a0c0de-5e24-7f10-8a93-a0c1968d8a3a";
 /// `forked_from_id` (copied-history evidence that keeps it held).
 struct CreatedThreadHome {
     // These lineage controls count Legacy: their owning header predates this epoch.
-    _cutover: sources::codex::counting::version::TestCutover,
     fixture: ScanRoot,
     path: PathBuf,
     body: Vec<Vec<u8>>,
@@ -4573,7 +4565,6 @@ impl CreatedThreadHome {
         let path = fixture.root.join(format!("rollout-{CREATED}.jsonl"));
         fs::write(&path, body[..written].concat()).unwrap();
         let home = Self {
-            _cutover: sources::codex::counting::version::TestCutover::set(base_ms + 1),
             fixture,
             path,
             body,
@@ -4725,7 +4716,7 @@ fn projection_ahead_created_thread_memo_misses_on_the_curing_append() {
     assert_eq!(counter(&cache, |c| c.memo_hits), 1, "{}", counters(&cache));
     assert_eq!(
         created_usage(&cured),
-        vec![(200, 3)],
+        vec![(120, 1)],
         "{}",
         counters(&cache)
     );
@@ -4845,7 +4836,7 @@ fn lagging_projection_catching_up_cures_an_unchanged_created_thread() {
     let (index, cured) = home.generation(index, &cache, 1);
     assert_eq!(
         created_usage(&cured),
-        vec![(200, 3)],
+        vec![(120, 1)],
         "{}",
         counters(&cache)
     );
@@ -5030,7 +5021,7 @@ fn rollout_declared_created_thread_memo_misses_on_the_curing_append() {
     );
     assert_eq!(
         created_usage(&cured),
-        vec![(200, 3)],
+        vec![(120, 1)],
         "admitted: {}",
         counters(&cache)
     );
@@ -5075,7 +5066,7 @@ fn copied_created_thread_binds_from_its_header_not_file_birth() {
         }
         assert_eq!(
             created_usage(&cured),
-            vec![(200, 3)],
+            vec![(120, 1)],
             "{state_source}: {}",
             counters(&cache)
         );
@@ -5236,7 +5227,7 @@ fn candidate_less_hold_memo_misses_when_the_last_created_thread_goes() {
     );
     let cache = Arc::new(SharedCache::default());
     let (index, held) = home.generation(ScanIndex::default(), &cache, 0);
-    assert_eq!(created_usage(&held), vec![(200, 3)], "{}", counters(&cache));
+    assert_eq!(created_usage(&held), vec![(120, 1)], "{}", counters(&cache));
     assert_eq!(
         held.ownership_incomplete_file_count,
         1,
@@ -5571,7 +5562,7 @@ fn bind_seed_short_of_the_read_extent_is_never_recorded() {
     let (_, admitted) = home.generation(index, &cache, 1);
     assert_eq!(
         created_usage(&admitted),
-        vec![(200, 3)],
+        vec![(120, 1)],
         "{}",
         counters(&cache)
     );
@@ -5871,16 +5862,7 @@ fn memo_digest_fences_receipt_contents_census_flags_and_members() {
         index
     };
     let digest = |index: &ScanIndex, codex: &CodexTitleMetadata, members: usize| {
-        memo_digest(
-            index,
-            &candidate,
-            &file,
-            "dependencies",
-            codex,
-            members,
-            "counting",
-        )
-        .unwrap()
+        memo_digest(index, &candidate, &file, "dependencies", codex, members).unwrap()
     };
     let codex = CodexTitleMetadata::default();
     let base = with_receipt(receipt("priority"));
@@ -6044,7 +6026,9 @@ fn vanished_residue_owner_file_retires_like_an_ordinary_vanished_file() {
             ._dir
             .0
             .join(format!("residue-index-{removal_hint}.json"));
-        index.save(&checkpoint).unwrap();
+        index
+            .save_fixture_for_source(&checkpoint, SnapshotSource::Codex)
+            .unwrap();
         let restored = ScanIndex::load(&checkpoint).unwrap();
         let mut final_page = new_scan(restored);
         final_page.codex_join_prepared = true;
@@ -6508,11 +6492,13 @@ fn continuation_prepares_no_group_attempt() {
     fn chain(prefix: &str, created: &str, start: u64) -> Vec<u8> {
         let mut body = codex_line(json!({"type": "session_meta", "timestamp": created,
             "payload": {"id": OWNER, "timestamp": created}}));
+        body.extend(codex_line(json!({"type":"event_msg","timestamp":created,"payload":{"type":"task_started","turn_id":prefix}})));
+        body.extend(codex_line(json!({"type":"turn_context","timestamp":created,"payload":{"turn_id":prefix,"model":"gpt-5.2"}})));
         for i in 0..30_u64 {
             let after = start + 10 * (i + 1);
             body.extend(codex_line(json!({"type": "token_usage_record",
                 "timestamp": "2026-10-01T10:01:00Z", "payload": {"thread_id": OWNER,
-                "response_id": format!("{prefix}-{i}"), "usage": usage(10),
+                "turn_id":prefix,"response_id": format!("{prefix}-{i}"), "usage": usage(10),
                 "thread_token_usage": usage(after)}})));
             let at = format!(
                 "2026-10-01T{:02}:{:02}:{:02}Z",
@@ -6524,6 +6510,9 @@ fn continuation_prepares_no_group_attempt() {
                 "payload": {"type": "token_count", "info": {"last_token_usage": usage(10),
                 "total_token_usage": usage(after)}}})));
         }
+        body.extend(codex_line(
+            json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":prefix}}),
+        ));
         body
     }
     let dir = Temp::new("group-continuation", b"");
@@ -6813,7 +6802,6 @@ fn pace_meta(temp: &Temp, pace: JobPace) -> JobMeta {
         started: 0,
         dependencies: None,
         owner: None,
-        counting: String::new(),
         fence: None,
         census_trusted: true,
         pages: 1,
@@ -7741,7 +7729,9 @@ fn continuation_eof_parks_then_ordinary_resumes_without_rereading_and_applies_on
                 if schedule == "restart" && turn == 2 {
                     let stale = cache.paused_ticket_for_test().unwrap();
                     let path = fixture._dir.0.join("restart-index.json");
-                    index.save(&path).unwrap();
+                    index
+                        .save_fixture_for_source(&path, SnapshotSource::Codex)
+                        .unwrap();
                     drop(cache); // Cursor, reader and continuation inputs are RAM-only.
                     CARRIED.with(|v| {
                         v.borrow_mut().remove(&fixture.root);

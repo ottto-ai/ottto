@@ -91,11 +91,6 @@ impl SnapshotAccumulator {
         &mut self,
         money_context: Option<claude_request_money::e2::ReadContext<'_>>,
     ) {
-        // Route evidence only, producer on: each key's id shapes by sequence,
-        // read before the book is consumed. Money and every other input
-        // ignore it.
-        let route_ids = crate::snapshots::billing_route::producer_on()
-            .then(|| self.claude_responses.route_ids_by_sequence());
         let (mut responses, selectors) = std::mem::take(&mut self.claude_responses).into_parts();
         responses.sort_by_key(|response| response.sequence);
         // Gate off, the fold keys by hour only: it never reads the selector.
@@ -242,10 +237,6 @@ impl SnapshotAccumulator {
                         shared
                     }
                 };
-                let route_id_flags = route_ids
-                    .as_ref()
-                    .and_then(|ids| ids.get(&response.sequence).copied())
-                    .unwrap_or_default();
                 let prior_occurrence = self.claude_usage_occurrences.insert(
                     request_id.clone(),
                     ClaudeTranscriptUsageOccurrence {
@@ -259,14 +250,6 @@ impl SnapshotAccumulator {
                         event_clock_complete: response.event_clock_complete,
                         desktop_request: response.desktop_request,
                         effective_input_context,
-                        route_native_ids: route_id_flags.0,
-                        route_third_party_id: route_id_flags.1,
-                        route_telemetry_account: false,
-                        // Producer off, `route_ids` is `None`: nothing parsed.
-                        route_started_ns: route_ids
-                            .as_ref()
-                            .and(response.preceding_user_timestamp.as_deref())
-                            .and_then(crate::snapshots::billing_route::unix_nanos),
                     },
                 );
                 if self.claude_usage_request_ids.contains(&request_id) || prior_occurrence.is_some()

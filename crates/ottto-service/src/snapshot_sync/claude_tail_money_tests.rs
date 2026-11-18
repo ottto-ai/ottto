@@ -292,7 +292,7 @@ impl Disk {
         index: &mut ScanIndex,
     ) -> ScanIndex {
         let path = self.path(source);
-        index.save(path).unwrap();
+        index.save_fixture(path).unwrap();
         crate::snapshots::after_source_save(cache, &self.dir, source, index, path);
         ScanIndex::load(path).unwrap()
     }
@@ -1164,7 +1164,6 @@ fn codex_case(legacy: bool, content: bool) {
     let source = SnapshotSource::Codex;
     disk.begin(&scanner, source);
     let mut prior = {
-        let _cutover = crate::snapshots::TestCutover::set(if legacy { i64::MAX } else { 0 });
         let (mut index, scan, _) = other_page(&c, &scanner, source, ScanIndex::default());
         let accepted = scan
             .snapshots
@@ -1173,20 +1172,26 @@ fn codex_case(legacy: bool, content: bool) {
             .collect();
         index.record_accepted_snapshot_fingerprints(&accepted);
         assert!(!index.files.is_empty());
-        assert!(index.files.values().all(|e| e.codex_counting_v2 != legacy));
+        assert!(index.files.values().all(|e| e.codex_counting_v2));
         disk.commit(&scanner.cache, source, &mut index)
     };
+    if legacy {
+        assert!(!content, "historical seed uses the exact compared input");
+        crate::snapshots::sampled_scan::transition_fixture::codex_legacy_transition_seed(
+            &mut prior, &path, &c.root,
+        );
+        prior = disk.commit(&scanner.cache, source, &mut prior);
+    }
     append(&path, &codex_rows("turn-b", 30));
     input_clock(&path);
-    let _cutover = crate::snapshots::TestCutover::set(0);
+
     if legacy {
-        // The old binary's cutover differs, so its committed head cannot be
-        // reused. Warm the upgraded binary from the actual Legacy ACK facts,
-        // then exercise its next page's routed Tail under that same rule.
+        // The changed file replaces its historical head with cold V2 once;
+        // the following growth must reuse the durable V2 head.
         let (mut upgraded, scan, modes) = other_page(&c, &scanner, source, prior);
         assert_eq!(modes, (1, 0, 0));
         assert!(!scan.snapshots.is_empty());
-        assert!(upgraded.files.values().all(|e| !e.codex_counting_v2));
+        assert!(upgraded.files.values().all(|e| e.codex_counting_v2));
         prior = disk.commit(&scanner.cache, source, &mut upgraded);
         append(&path, &codex_rows("turn-c", 40));
         input_clock(&path);
@@ -1204,10 +1209,7 @@ fn codex_case(legacy: bool, content: bool) {
         (0, 1, 0),
         "a restarted Codex owner continues from the same committed heads"
     );
-    assert!(tail_index
-        .files
-        .values()
-        .all(|e| e.codex_counting_v2 != legacy));
+    assert!(tail_index.files.values().all(|e| e.codex_counting_v2));
     let (a, b) = (other_wire(source, &tail), other_wire(source, &full));
     let d = other_wire(source, &restored);
     assert_eq!(a, b);
@@ -1238,13 +1240,11 @@ fn codex_legacy_acked_sticky() {
     codex_case(true, false);
 }
 
-/// [money] Content-only Legacy/V2 replay preserves the emitted body and never
+/// [money] Content-only V2 replay preserves the emitted body and never
 /// adds the restored prefix twice; a cold Full is the independent body oracle.
 #[test]
 fn codex_content_only_caller_matches_cold_full() {
-    for legacy in [false, true] {
-        codex_case(legacy, true);
-    }
+    codex_case(false, true);
 }
 
 /// [money] An indexed sibling transcript deleted after a committed page is
@@ -1261,7 +1261,7 @@ fn deleted_sibling_retires_without_changing_live_money() {
         if !supported(&name) {
             return;
         }
-        let _cutover = crate::snapshots::TestCutover::set(0);
+
         let c = corpus(&name);
         let mut disk = Disk::with_route(&c, source);
         let (live, sibling) = (c.root.join("live.jsonl"), c.root.join("sibling.jsonl"));
@@ -1536,7 +1536,7 @@ fn codex_bad_record_sibling() {
     if !supported(name) {
         return;
     }
-    let _cutover = crate::snapshots::TestCutover::set(0);
+
     let source = SnapshotSource::Codex;
     let header = json!({"type":"session_meta","timestamp":"2026-10-27T07:00:00Z","payload":{"id":ROOT,"timestamp":"2026-10-27T07:00:00Z"}}).to_string()+"\n";
     let thread = json!({"input_tokens":25,"cached_input_tokens":0,"output_tokens":2,"reasoning_output_tokens":0,"total_tokens":27});
@@ -2952,16 +2952,14 @@ fn codex_admission_branches_preserve_emitted_totals() {
     }));
     overflow.push(close());
     let repeated = ui(2, Some(1), 1);
-    for (name, legacy, lines, expected) in [
+    for (name, lines, expected) in [
         (
             "unbound",
-            false,
             vec![fallback.clone(), repeated.clone(), repeated],
             2,
         ),
         (
             "base-reset-zero-repeat",
-            false,
             vec![
                 start(),
                 ui(1, None, 5),
@@ -2975,21 +2973,7 @@ fn codex_admission_branches_preserve_emitted_totals() {
             3,
         ),
         (
-            "legacy-reset",
-            true,
-            vec![
-                ui(1, None, 5),
-                ui(2, None, 7),
-                ui(3, None, 2),
-                ui(4, Some(0), 2),
-                ui(5, Some(1), 3),
-                ui(5, Some(1), 3),
-            ],
-            10,
-        ),
-        (
             "closure-mismatch",
-            false,
             vec![
                 start(),
                 ui(1, Some(1), 1),
@@ -3001,21 +2985,18 @@ fn codex_admission_branches_preserve_emitted_totals() {
         ),
         (
             "dropped-staging",
-            false,
             vec![start(), dropped, ui(2, Some(1), 2), close()],
             1,
         ),
-        ("pending-overflow", false, overflow, 66),
-        ("model-fallback", true, vec![fallback, ui(2, Some(1), 2)], 2),
+        ("pending-overflow", overflow, 66),
+        ("model-fallback", vec![fallback, ui(2, Some(1), 2)], 2),
         (
             "explicit-request-count",
-            false,
             vec![start(), explicit, close()],
             1,
         ),
         (
             "invalid-closure",
-            false,
             vec![
                 close(),
                 event("task_complete", ""),
@@ -3041,7 +3022,7 @@ fn codex_admission_branches_preserve_emitted_totals() {
             // Invalid records are isolated after a genuine disk restore and
             // Tail, as well as from RAM and a cold byte-zero read.
             let source = SnapshotSource::Codex;
-            let _cutover = crate::snapshots::TestCutover::set(0);
+
             let mut disk = Disk::with_route(&c, source);
             let scanner = E2ScanFixture::default();
             disk.begin(&scanner, source);
@@ -3087,7 +3068,7 @@ fn codex_admission_branches_preserve_emitted_totals() {
         }
         std::fs::write(&path, text).unwrap();
         input_clock(&path);
-        let _cutover = crate::snapshots::TestCutover::set(if legacy { i64::MAX } else { 0 });
+
         let (_, scan, _) = other_page(
             &c,
             &E2ScanFixture::default(),

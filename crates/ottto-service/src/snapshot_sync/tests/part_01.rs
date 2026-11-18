@@ -322,7 +322,10 @@ fn cache_pending_head_lifecycle_survives_finish_and_targets_only_accepted_head()
         .files
         .insert("synthetic/unrelated.jsonl".into(), other.clone());
     let mut progress = test_upload_progress();
-    let root = std::env::temp_dir().join(format!("ottto-pending-head-{}", unique_poison_scope()));
+    let root = std::env::temp_dir()
+        .canonicalize()
+        .unwrap()
+        .join(format!("ottto-pending-head-{}", unique_poison_scope()));
     std::fs::create_dir_all(&root).unwrap();
     let path = root.join("progress.json");
     progress
@@ -520,7 +523,7 @@ fn cache_pending_head_two_files_multi_siblings_survive_partial_cache_settlement(
             .sum::<usize>(),
         3
     );
-    let root = std::env::temp_dir().join(format!(
+    let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
         "ottto-pending-siblings-{}-{}",
         unique_poison_scope(),
         OffsetDateTime::now_utc().unix_timestamp_nanos()
@@ -554,7 +557,7 @@ fn cache_pending_head_two_files_multi_siblings_survive_partial_cache_settlement(
         |progress| progress.save(&progress_path),
     )
     .unwrap();
-    index.save(&index_path).unwrap();
+    index.save_fixture(&index_path).unwrap();
     let namespace = progress.destination_namespace_hash.clone();
     let witness = progress.active_quarantine_witness.clone().unwrap();
     progress = SnapshotUploadProgress::load(&progress_path, &namespace, witness.clone()).unwrap();
@@ -660,7 +663,7 @@ fn cache_pending_head_two_files_multi_siblings_survive_partial_cache_settlement(
         }
     );
     index.retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
-    index.save(&index_path).unwrap();
+    index.save_fixture(&index_path).unwrap();
     progress.retire_pending_cache_heads(
         &index,
         &items,
@@ -779,7 +782,7 @@ fn cache_pending_head_two_files_multi_siblings_survive_partial_cache_settlement(
     .unwrap();
     index.retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
     index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
-    index.save(&index_path).unwrap();
+    index.save_fixture(&index_path).unwrap();
     progress.retire_pending_cache_heads(
         &index,
         &[sibling],
@@ -796,7 +799,7 @@ fn cache_pending_head_two_files_multi_siblings_survive_partial_cache_settlement(
 
 fn cache_effective_wire_fixture_root() -> PathBuf {
     use serde_json::json;
-    let root = std::env::temp_dir().join(format!(
+    let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
         "ottto-cache-effective-wire-{}-{}",
         unique_poison_scope(),
         OffsetDateTime::now_utc().unix_timestamp_nanos()
@@ -901,7 +904,7 @@ fn cache_pending_head_stamp_preserves_actual_quarantine_candidate_retry() {
     );
     index.retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
     let index_path = root.join("index.json");
-    index.save(&index_path).unwrap();
+    index.save_fixture(&index_path).unwrap();
     progress.retire_pending_cache_heads(
         &index,
         &[item.clone()],
@@ -1205,7 +1208,7 @@ fn cache_effective_wire_mandatory_head_obligation_survives_finalizer_noop() {
     assert!(progress.accepted_cache_heads.is_empty());
     let index_path = root.join("index.json");
     let progress_path = root.join("progress.json");
-    index.save(&index_path).unwrap();
+    index.save_fixture(&index_path).unwrap();
     progress.save(&progress_path).unwrap();
     progress.finish_cycle(&progress_path).unwrap();
     progress = SnapshotUploadProgress::load(
@@ -1314,7 +1317,7 @@ fn cache_effective_wire_mandatory_head_obligation_survives_finalizer_noop() {
             .unwrap());
     }
     progress.save(&progress_path).unwrap(); // obligation before no-op index settlement
-    index.save(&index_path).unwrap();
+    index.save_fixture(&index_path).unwrap();
     progress.finish_cycle(&progress_path).unwrap();
     let mut loaded = ScanIndex::load(&index_path).unwrap();
     loaded.activate_upload_context("cache-on-mandatory".into());
@@ -1394,7 +1397,7 @@ fn cache_effective_wire_mandatory_head_obligation_survives_finalizer_noop() {
         &enriched.snapshots,
         &progress.fresh_context_body_acks,
     );
-    loaded.save(&index_path).unwrap();
+    loaded.save_fixture(&index_path).unwrap();
     progress.retire_pending_cache_heads(
         &loaded,
         &enriched.snapshots,
@@ -2042,8 +2045,10 @@ fn cache_capability_toggle_headless_settlement_recovers_current_predecessor() {
 #[test]
 fn combined_revision_wire_uses_same_scan_index_and_ack_predecessor() {
     use serde_json::json;
-    let root =
-        std::env::temp_dir().join(format!("ottto-combined-revision-{}", unique_poison_scope()));
+    let root = std::env::temp_dir()
+        .canonicalize()
+        .unwrap()
+        .join(format!("ottto-combined-revision-{}", unique_poison_scope()));
     std::fs::create_dir_all(&root).unwrap();
     let id = "019e253c-3333-7000-9000-cccccccccccc";
     let path = root.join(format!("rollout-2026-09-30T10-00-00-{id}.jsonl"));
