@@ -77,7 +77,7 @@ impl Pass {
         let mut add = |bytes: &[u8]| update_length_prefixed(&mut digest, bytes);
         add(scope.0.as_bytes());
         add(index_path.as_os_str().as_encoded_bytes());
-        add(scan_traversal_context_fingerprint(source, roots, window).as_bytes());
+        add(super::traversal::scan_traversal_context_fingerprint(source, roots, window).as_bytes());
         add(replay_generation.as_bytes());
         // The hint's volatile counts and its key are not serialized.
         add(&serde_json::to_vec(hint).expect("activity hint is serializable"));
