@@ -592,6 +592,20 @@ fn e2_pipeline_carry_moves_gap_shares_and_keeps_totals() {
     use AccountSource::{CarriedBackward, CarriedForward};
     let a = Some(e2_account());
     let b = Some("b".repeat(64));
+    // Independent reference: the same files with every own row present place
+    // no carry, so their request and token totals do not depend on it.
+    let tokens = |item: &SnapshotItem| {
+        (
+            item.request_count,
+            item.input_tokens,
+            item.output_tokens,
+            item.cache_read_tokens,
+            item.cache_creation_5m_tokens + item.cache_creation_1h_tokens,
+        )
+    };
+    let reference = e2_carry_pages(&[], &[], 1, false, false, true);
+    assert_eq!(e2_source_counts(&reference[0]).values().sum::<u64>(), 5);
+    let reference = tokens(&reference[0]);
     for (gaps, expected) in [
         (
             &["req_2", "req_4"][..],
@@ -639,6 +653,7 @@ fn e2_pipeline_carry_moves_gap_shares_and_keeps_totals() {
             )
         };
         assert_eq!(totals(again), totals(on), "{gaps:?}: money never changes");
+        assert_eq!(tokens(on), reference, "{gaps:?}: carry never moves usage");
         assert_eq!(
             on.request_count, 5,
             "four non-zero responses plus the side call"
@@ -716,8 +731,9 @@ fn e2_pipeline_no_account_row_blocks_the_carry() {
     }
 }
 
-/// [money] Carried-twin exhaustion of the item's key cap stays held before
-/// any strip: never refused, known identity kept, nothing uploadable.
+/// [money] Own-key overflow and carried-twin exhaustion of the item's key cap
+/// stay held before any strip: never refused, usage and known identity kept,
+/// nothing uploadable.
 #[test]
 fn e2_pipeline_exact_telemetry_over_cap_refuses_upstream_lost_proof() {
     let dir = temp_dir("e2-identity-telemetry-cap");
@@ -751,7 +767,8 @@ fn e2_pipeline_exact_telemetry_over_cap_refuses_upstream_lost_proof() {
     // The 33-request fixture reaches the cap through a forward twin, a
     // backward twin, and a twin occupying a later own key's slot. No raised
     // byte limit is required for provenance to remain owed.
-    for gaps in [vec![1], vec![33], (2..=32).step_by(2).collect()] {
+    // All 33 own logins: one key over the cap, held like the carried twins.
+    for gaps in [vec![], vec![1], vec![33], (2..=32).step_by(2).collect()] {
         let own = api
             .iter()
             .filter(|row| !gaps.iter().any(|n| row.request_id == format!("req_{n}")))
@@ -775,6 +792,18 @@ fn e2_pipeline_exact_telemetry_over_cap_refuses_upstream_lost_proof() {
             );
             assert!(disposition.quarantined_source_session_ids.contains(root));
             assert_eq!(on[0].request_count, 33);
+            assert_eq!(
+                (on[0].input_tokens, on[0].output_tokens),
+                (330, 330),
+                "{gaps:?}: usage conserved while Held"
+            );
+            if gaps.is_empty() {
+                assert_eq!(
+                    on[0].cost.as_ref().unwrap().total_cost_usd.as_deref(),
+                    Some("0.0033"),
+                    "every own row's reported cost is kept while Held"
+                );
+            }
             assert_eq!(on[0].request_identity_refusals, 0, "HOLD never strips");
             assert!(
                 e2_source_counts(&on[0])

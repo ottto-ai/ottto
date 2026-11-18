@@ -2620,12 +2620,12 @@ fn e2_identity_final_twin_union_over_authority_cap_withholds_unproved_identity()
             (item.request_count, item.input_tokens),
             (requests, requests)
         );
-        // Overflowing proof cannot be replaced by the starting org.
-        // The old uniform-retry expectation would manufacture that identity.
-        assert!(item.request_evidence.is_empty());
-        assert!(rows_of(&item).all(|row| row.identity_parts.is_none()
-            && row.evidence_ref.is_none()
-            && row.account_identifier_hash.is_none()));
+        // Overflowing proof is never replaced by the starting org: the item
+        // is held under the account-limit reason and never uploads.
+        assert_eq!(
+            item.claude_account_withheld_reason,
+            Some(crate::snapshots::CLAUDE_ACCOUNT_WITHHELD_TOO_MANY_ACCOUNTS)
+        );
         assert_eq!(
             item.request_identity_refusals, 0,
             "a hold strips no row, so it refuses none"
@@ -2902,12 +2902,15 @@ fn e2_identity_unqualified_markerless_twins_use_known_session_start_in_both_orde
                 } else {
                     vec![known, markerless]
                 };
-                claude_request_identity::inherit_root_accounts(&mut items, false);
-                assert!(items
+                // Probe both inherit passes on a copy: `tag_owned` runs them in
+                // production order (side pass, reconcile, settled finish).
+                let mut probe = items.clone();
+                claude_request_identity::inherit_root_accounts(&mut probe, false);
+                assert!(probe
                     .iter()
                     .all(|item| !fold(item).accounts.as_ref().unwrap().conflict));
-                claude_request_identity::inherit_root_accounts(&mut items, true);
-                assert!(items
+                claude_request_identity::inherit_root_accounts(&mut probe, true);
+                assert!(probe
                     .iter()
                     .all(|item| !fold(item).accounts.as_ref().unwrap().conflict));
                 let item = tag_owned(items, &index).remove(0);
