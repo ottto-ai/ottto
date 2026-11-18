@@ -183,6 +183,7 @@ fn off_v1_growth_is_unknown_and_diagnostics_need_no_registry() {
         assert!(completed.is_ok(), "OFF loads waited for the v2 registry");
     });
     fs::remove_dir_all(root).unwrap();
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 /// [regress] F5: uninstall must not flock or latch a paused v1 import route.

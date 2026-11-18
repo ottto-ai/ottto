@@ -241,6 +241,7 @@ fn snapshot_upload_progress_resets_when_relay_device_changes() {
         1
     );
     let _ = std::fs::remove_dir_all(root);
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 #[test]
@@ -278,6 +279,7 @@ fn snapshot_upload_progress_compare_and_swap_rejects_stale_writer() {
     assert!(observed.accepted_fingerprints.contains(&"a".repeat(64)));
     assert!(!observed.accepted_fingerprints.contains(&"b".repeat(64)));
     let _ = std::fs::remove_dir_all(root);
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 #[test]
@@ -306,6 +308,7 @@ fn snapshot_upload_progress_stale_clear_cannot_delete_winner() {
     winner.clear(&path).expect("winning generation clears");
     assert!(!path.exists());
     let _ = std::fs::remove_dir_all(root);
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 /// [money] The narrow CAS decode refuses a changed schema or namespace,
@@ -361,6 +364,7 @@ fn snapshot_upload_progress_cas_stamps_and_quarantine_overlap() {
         serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     assert_eq!(written.quarantined_fingerprints, expected);
     let _ = std::fs::remove_dir_all(root);
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 #[test]
@@ -424,6 +428,7 @@ fn snapshot_upload_progress_quarantines_unbounded_retry_deadline() {
         1
     );
     let _ = std::fs::remove_dir_all(root);
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 /// [regress] Version 0.1.206 moved 9/9 unchanged-body deadlines by 21,444s.
@@ -472,6 +477,7 @@ fn version_only_quarantine_witness_change_keeps_retry_after() {
     assert!(!repaired.contains(&fingerprint));
     assert!(repaired.active_quarantine_retries.contains(&fingerprint));
     let _ = std::fs::remove_dir_all(root);
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 #[test]
@@ -856,6 +862,7 @@ fn due_not_pending_quarantine_resends_once_and_paces_local_holds() {
     assert!(quiet.snapshots.is_empty());
     assert_eq!((upload_calls, accepted), (1, 1));
     let _ = std::fs::remove_dir_all(root);
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 #[test]
@@ -1099,6 +1106,7 @@ fn admission_native_hourly_bodies_recover_without_losing_usage_or_siblings() {
     );
     println!("native admission: item_bytes={large_bytes} hours=1000 accepted=2 quarantined=1 private_reads=0");
     let _ = std::fs::remove_dir_all(root);
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 #[test]
@@ -1177,6 +1185,7 @@ fn admission_reoffer_replaces_stale_terminal_progress_and_survives_restart() {
     assert!(unrelated.quarantined_fingerprints.is_empty());
     assert!(!unrelated.prepare_quarantine_retries(&BTreeMap::new()));
     let _ = std::fs::remove_dir_all(root);
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 #[test]
@@ -1565,6 +1574,7 @@ fn copy_capability_context_preserves_partial_ack_progress_after_restart() {
     assert_eq!(loaded.accepted_body_contexts.get(&entity), Some(&context));
     assert!(loaded.accepted_fingerprints.contains(&entity));
     let _ = std::fs::remove_dir_all(root);
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 #[test]

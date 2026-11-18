@@ -89,10 +89,29 @@ impl ScanIndex {
     ) -> (ScanIndex, Vec<Vec<u8>>) {
         let mut index = self;
         let mut posts = Vec::new();
-        // The returned index retains this route across subsequent pages.
-        let root = crate::test_scratch::canonical_private_dir("archive-upload-checkpoint");
         let route = crate::snapshots::e2_pipeline_scan_fixture::route_of(&index);
-        let index_path = route.clone().unwrap_or_else(|| root.join("index.json"));
+        let index_path = route.clone().unwrap_or_else(|| {
+            // The returned index retains this route between pages; the corpus
+            // owns its scanned roots and removes them when the fixture ends.
+            let root = index
+                .known_configured_scan_roots
+                .iter()
+                .next()
+                .map(|root| Path::new(root).to_owned())
+                .or_else(|| {
+                    index
+                        .files
+                        .keys()
+                        .chain(previous.files.keys())
+                        .next()
+                        .and_then(|key| Path::new(key).parent().map(Path::to_owned))
+                })
+                .expect("archive checkpoint has a fixture scan root");
+            root.join(crate::test_scratch::unique_name(
+                "archive-upload-checkpoint",
+            ))
+            .join("index.json")
+        });
         // A prepare-time carry already committed both old/new keys. Match
         // the production constructor's baseline, without admitting later work.
         let prepared = (route.is_some() && index.generation != previous.generation)

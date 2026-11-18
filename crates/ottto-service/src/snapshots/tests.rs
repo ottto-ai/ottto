@@ -1332,6 +1332,7 @@ fn scan_index_recovers_from_truncated_json_and_replaces_it_atomically() {
     let temp_path = path.with_extension(format!("json.{}.tmp", std::process::id()));
     assert!(!temp_path.exists());
     let _ = fs::remove_dir_all(root);
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 /// The unsettled causes are a diagnostic leaf. A malformed value decodes
@@ -1400,6 +1401,7 @@ fn scan_index_load_isolates_a_malformed_unsettled_cause_diagnostic() {
         0
     );
     let _ = fs::remove_dir_all(root);
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 #[test]
@@ -1444,6 +1446,7 @@ fn scan_index_save_drops_only_a_syntactically_valid_corrupt_activity_witness() {
         0
     );
     let _ = fs::remove_dir_all(root);
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 #[test]
@@ -1773,6 +1776,7 @@ fn large_scan_index_save_preserves_bytes_and_generation_fence() {
     let temp_path = path.with_extension(format!("json.{}.tmp", std::process::id()));
     assert!(!temp_path.exists());
     let _ = fs::remove_dir_all(root);
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 pub(super) fn test_candidate(path: PathBuf) -> CandidateFile {

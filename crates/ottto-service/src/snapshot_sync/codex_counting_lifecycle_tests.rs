@@ -234,4 +234,5 @@ fn counting_transition_capture_and_failed_upload_select_whole_entries() {
         baseline.files[&control_key].codex_counting_owner
     );
     std::fs::remove_dir_all(root).unwrap();
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }

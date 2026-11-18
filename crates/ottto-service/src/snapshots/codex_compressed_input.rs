@@ -1016,6 +1016,7 @@ pub(in crate::snapshots) mod tests {
     impl Drop for ArchiveFixture {
         fn drop(&mut self) {
             fs::remove_dir_all(self.0.parent().unwrap()).unwrap();
+            state_v2::close_removed_routes_for_test();
         }
     }
     fn selector_scan(

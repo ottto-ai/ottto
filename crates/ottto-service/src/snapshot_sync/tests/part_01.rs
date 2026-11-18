@@ -405,6 +405,7 @@ fn cache_pending_head_lifecycle_survives_finish_and_targets_only_accepted_head()
         "ordinary head acquisition does not certify provisional cache state"
     );
     std::fs::remove_dir_all(&root).unwrap();
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 #[test]
@@ -795,6 +796,7 @@ fn cache_pending_head_two_files_multi_siblings_survive_partial_cache_settlement(
         "final exact cache-bearing sibling ACK completes the group"
     );
     std::fs::remove_dir_all(&root).unwrap();
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 fn cache_effective_wire_fixture_root() -> PathBuf {
@@ -1409,6 +1411,7 @@ fn cache_effective_wire_mandatory_head_obligation_survives_finalizer_noop() {
     progress.finish_cycle_fixture(&progress_path).unwrap();
     assert!(scan(&mut loaded).snapshots.is_empty());
     std::fs::remove_dir_all(&root).unwrap();
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 #[test]
@@ -2216,6 +2219,7 @@ fn combined_revision_wire_uses_same_scan_index_and_ack_predecessor() {
         std::fs::write(output, serde_json::to_vec_pretty(&json!({"contract_version":"paired_creator_cache_revision_corpus:v1","cases":cases})).unwrap()).unwrap();
     }
     std::fs::remove_dir_all(root).unwrap();
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 #[test]
@@ -2311,4 +2315,5 @@ fn accepted_cache_state_past_old_caps_survives_progress_restart() {
         "nothing quarantined beside the progress file"
     );
     std::fs::remove_dir_all(root).unwrap();
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }

@@ -1050,6 +1050,7 @@ mod tests {
             .to_string_lossy()
             .contains("corrupt")));
         std::fs::remove_dir_all(root).unwrap();
+        crate::snapshots::state_v2::close_removed_routes_for_test();
     }
     #[test]
     fn m4_size_memory_and_wire_receipt() {

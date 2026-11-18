@@ -13223,6 +13223,7 @@ fn only_the_companion_repair_press_overrides_a_rebuild_loop_pause() {
     assert!(plan.authority.message.text.contains("too damaged"));
     assert!(plan.authority.message.text.contains("retries by itself at"));
     let _ = fs::remove_dir_all(&root);
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 #[test]

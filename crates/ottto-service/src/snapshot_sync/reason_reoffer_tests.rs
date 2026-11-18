@@ -465,6 +465,7 @@ fn reoffer_reservation_survives_restart_and_failed_save_grants_nothing() {
     assert!(select(&mut restarted, &index, NOW + DAY));
     assert_eq!(restarted.active_reason_reoffers.len(), 1);
     let _ = std::fs::remove_dir_all(root);
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 /// F2: injected wall-clock rollback keeps both kinds eligible after a full
@@ -705,6 +706,7 @@ fn retained_refusal_preserves_newer_retry_debt_without_early_transmission() {
     );
 
     std::fs::remove_dir_all(root).unwrap();
+    crate::snapshots::state_v2::close_removed_routes_for_test();
     let (mut old_progress, mut old_index) = refused(&[(2, original_pair(NOW + DAY))]);
     let old_timer = old_index
         .quarantined_snapshot_fingerprints

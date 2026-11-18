@@ -91,6 +91,7 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         fs::remove_dir_all(&self.scratch).unwrap();
+        crate::snapshots::state_v2::close_removed_routes_for_test();
     }
 }
 

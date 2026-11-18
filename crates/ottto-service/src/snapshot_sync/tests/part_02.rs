@@ -639,6 +639,7 @@ fn replay_generation_reuploads_prior_acks_once_and_resumes_its_own_progress() {
     assert_eq!(resumed_result, ResumableUploadResult::Completed);
     assert_eq!((resumed_upload_calls, resumed_accepted), (0, 0));
     let _ = std::fs::remove_dir_all(root);
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 #[test]
@@ -797,6 +798,7 @@ fn same_replay_generation_restores_cleared_conflict_progress_until_retry() {
     assert_eq!((retry_uploads, retry_accepted), (1, 1));
 
     let _ = std::fs::remove_dir_all(root);
+    crate::snapshots::state_v2::close_removed_routes_for_test();
     reset_for_test();
 }
 
@@ -1824,6 +1826,7 @@ fn oversized_local_preflight_poison_cannot_pin_later_traversal_pages() {
     assert!(!first_page_sessions.contains(&second.snapshots[0].source_session_id));
 
     let _ = std::fs::remove_dir_all(root);
+    crate::snapshots::state_v2::close_removed_routes_for_test();
     reset_for_test();
 }
 
@@ -2254,6 +2257,7 @@ fn snapshot_upload_restart_resumes_after_durable_timeout_checkpoint() {
         .iter()
         .all(|fingerprint| !first_page.contains(fingerprint)));
     let _ = std::fs::remove_dir_all(root);
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 #[test]
@@ -2339,6 +2343,7 @@ fn gateway_timeout_bisection_converges_from_entity_cursor_after_ambiguous_commit
     assert_eq!(resumed_accepted, 0);
     assert_eq!(remotely_held.len(), SNAPSHOT_BATCH_LIMIT);
     let _ = std::fs::remove_dir_all(root);
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 #[test]
@@ -2408,4 +2413,5 @@ fn backfill_finalization_is_idempotent_across_index_state_and_progress_crashes()
     assert!(!progress_path.exists());
     ScanIndex::load(&index_path).expect("completed replay index remains durable");
     let _ = std::fs::remove_dir_all(root);
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }

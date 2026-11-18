@@ -690,6 +690,7 @@ mod tests {
             150
         );
         fs::remove_dir_all(root).unwrap();
+        crate::snapshots::state_v2::close_removed_routes_for_test();
     }
 }
 

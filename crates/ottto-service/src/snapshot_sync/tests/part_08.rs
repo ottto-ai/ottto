@@ -228,6 +228,7 @@ fn codex_union_native_transport_partial_rejection_keeps_capture_and_quarantine_g
             2
         );
         std::fs::remove_dir_all(root).unwrap();
+        crate::snapshots::state_v2::close_removed_routes_for_test();
     }
 }
 mod codex_counting_lifecycle_tests {
@@ -436,6 +437,7 @@ fn codex_union_native_transport_restart(priority: bool, lose_member_after_ack: b
         assert!(held.snapshots.is_empty(), "durable standard-tier ACK must not permit a smaller replacement after loss before index promotion: {:?}", held.snapshots.iter().map(|item| item.input_tokens).collect::<Vec<_>>());
         assert!(!held.census_complete);
         std::fs::remove_dir_all(root).unwrap();
+        crate::snapshots::state_v2::close_removed_routes_for_test();
         return;
     }
     let before_promotion = ScanIndex::load(&index_path).unwrap();
@@ -519,6 +521,7 @@ fn codex_union_native_transport_restart(priority: bool, lose_member_after_ack: b
     assert!(quiet.snapshots.is_empty());
     assert_eq!(quiet.semantic_noop_count, 2);
     std::fs::remove_dir_all(root).unwrap();
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 fn same_source_fixture_ack(
@@ -965,6 +968,7 @@ fn v2_progress_above_old_bound_uploads_receipts_and_recovers_exactly() {
             grow(&copied);
             let scanned = SameSourceAckFixture::cold_full_of(&copy, true);
             std::fs::remove_dir_all(&copy).unwrap();
+            crate::snapshots::state_v2::close_removed_routes_for_test();
             let patch = scanned
                 .iter()
                 .find(|item| item.source_session_id == f.items[2].source_session_id)
@@ -1947,6 +1951,9 @@ fn claude_p92_mixed_503_lost_ack_restart_preserves_candidate() {
     assert_eq!(calls, 0);
     assert_eq!(accepted, 1, "same settled candidate is a no-op");
     std::fs::remove_dir_all(root).unwrap();
+    crate::snapshots::state_v2::close_removed_routes_for_test();
     std::fs::remove_dir_all(candidate_root).unwrap();
+    crate::snapshots::state_v2::close_removed_routes_for_test();
     std::fs::remove_dir_all(retry_root).unwrap();
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }

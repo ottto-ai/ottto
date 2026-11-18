@@ -810,6 +810,7 @@ pub(super) fn assert_listed_fold_absent<'a>(
 impl Drop for PipelineFixture {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.base);
+        crate::snapshots::state_v2::close_removed_routes_for_test();
     }
 }
 
@@ -1365,6 +1366,7 @@ fn codex_partial_ack_keeps_the_unacknowledged_new_file_owed_without_a_restart() 
         "the acknowledged file is not read again"
     );
     let _ = std::fs::remove_dir_all(&dir);
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 /// A quiet traversal after a restart (a fresh in-memory cache) in the same
