@@ -906,6 +906,9 @@ impl E2ScanFixture {
     }
 
     pub(crate) fn register_route_for_test(path: &Path) {
+        // Each new fixture route first releases the sessions of fixtures
+        // whose directories are gone.
+        state_v2::close_removed_routes_for_test();
         fixture_routes().lock().unwrap().insert(path.to_owned());
     }
 

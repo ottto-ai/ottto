@@ -103,6 +103,9 @@ impl Drop for ScratchDir {
         // narrowed the directory on purpose.
         let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o700));
         let _ = std::fs::remove_dir_all(&self.path);
+        // Release native state sessions on removed directories, including
+        // routes under fixture directories removed since the last scratch.
+        crate::snapshots::state_v2::close_removed_routes_for_test();
     }
 }
 
