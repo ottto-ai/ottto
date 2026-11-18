@@ -286,13 +286,20 @@ pub(super) fn save_failure() {
     let bad = c.base.join("not-a-directory");
     fs::write(&bad, b"file").unwrap();
     let mut p = progress();
+    let mut index = ScanIndex::default();
+    let route = crate::snapshots::e2_pipeline_scan_fixture::bind_fixture_route(
+        Claude,
+        &mut index,
+        &c.base,
+        &p.destination_namespace_hash,
+    );
+    index.save_fixture(&route).unwrap();
+    let (progress_path, native) = crate::snapshot_sync::tests::routed_progress(&index, &route, p);
+    p = native;
     let mut scan = empty_scan(&c);
-    for (path, success) in [
-        (bad.join("progress.json"), false),
-        (c.base.join("saved.json"), true),
-    ] {
+    for (path, success) in [(bad.join("progress.json"), false), (progress_path, true)] {
         assert_eq!(
-            p.seed_telemetry(&c.support, &hint(), &mut scan, &ScanIndex::default(), &path)
+            p.seed_telemetry(&c.support, &hint(), &mut scan, &index, &path)
                 .is_ok(),
             success
         );
