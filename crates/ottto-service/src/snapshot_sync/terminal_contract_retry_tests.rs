@@ -320,7 +320,7 @@ fn successful_contract_retry(restart_after_selection: bool) {
         assert!(progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints));
         assert!(progress.active_quarantine_retries.is_empty());
         index.save_fixture(&fixture.index_path).unwrap();
-        progress.save(&fixture.progress_path).unwrap();
+        progress.save_fixture(&fixture.progress_path).unwrap();
         let stale_index_records = index.quarantined_snapshot_fingerprints.clone();
         progress
             .quarantined_fingerprints
@@ -550,7 +550,7 @@ impl ReadBudgetFixture {
         index.file_snapshot_fingerprints.extend(old_incidence);
         index.quarantined_snapshot_fingerprints = progress.quarantined_fingerprints.clone();
         index.save_fixture(&retained.index_path).unwrap();
-        progress.save(&retained.progress_path).unwrap();
+        progress.save_fixture(&retained.progress_path).unwrap();
         Self {
             retained,
             root,
