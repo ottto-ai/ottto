@@ -195,6 +195,8 @@ pub(crate) use session_start::{session_start_verdict, StartVerdict};
 pub use session_start::{SnapshotOpeningFile, SnapshotSessionStart};
 mod disappearance_diagnostics;
 #[cfg(test)]
+pub(crate) use disappearance_diagnostics::observe_sites;
+#[cfg(test)]
 mod launch_demand_tests;
 #[cfg(test)]
 mod launcher_recognition_tests;

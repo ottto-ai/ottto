@@ -196,7 +196,7 @@ pub(super) fn snapshot(source: SnapshotSource) -> Totals {
 }
 
 #[cfg(test)]
-type SiteEvents = [[[u64; OUTCOMES]; SITES]; 3];
+pub(crate) type SiteEvents = [[[u64; OUTCOMES]; SITES]; 3];
 
 #[cfg(test)]
 thread_local! {
@@ -223,7 +223,7 @@ pub(super) fn observe<T>(f: impl FnOnce() -> T) -> (T, [[u64; 4]; 3]) {
 
 /// The caller-thread NotFound site split, per source, `Site` order, `[loss, removal]`.
 #[cfg(test)]
-pub(super) fn observe_sites<T>(f: impl FnOnce() -> T) -> (T, SiteEvents) {
+pub(crate) fn observe_sites<T>(f: impl FnOnce() -> T) -> (T, SiteEvents) {
     struct Reset(Option<SiteEvents>);
     impl Drop for Reset {
         fn drop(&mut self) {

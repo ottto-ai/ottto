@@ -1506,41 +1506,59 @@ fn recreated_before_absence_proof_recovers_owed_change_once() {
             }
             false
         };
-        let (mut page, rows) = crate::local_resource_diagnostics::capture(|| {
+        // The race page starts the next census generation; its pages run, each
+        // committed as the daemon does, until that census completes.
+        let mut rows = Vec::new();
+        let (saved, sites) = crate::snapshots::observe_sites(|| {
             crate::snapshots::with_directory_read_fault(race, || {
-                c.raw(&scanner, prior, 100, true, &[])
+                let mut index = Some(prior);
+                for number in 0..12 {
+                    let prior = index.take().unwrap();
+                    let (mut page, page_rows) = crate::local_resource_diagnostics::capture(|| {
+                        c.raw(&scanner, prior, 100, true, &[])
+                    });
+                    assert!(
+                        number > 0
+                            || page_rows.iter().any(|row| {
+                                row["stage"] == "bounded_traversal_transition"
+                                    && row["counts"]["event"] == "starting"
+                            }),
+                        "the race page lists a new census generation"
+                    );
+                    page.enrich(&c);
+                    page.finish();
+                    assert!(
+                        page.scan.snapshots.is_empty(),
+                        "page {number}: nothing sent"
+                    );
+                    rows.extend(page_rows);
+                    let committed =
+                        disk.commit(&page.cache, SnapshotSource::ClaudeCode, &mut page.index);
+                    if page.scan.census_complete {
+                        return committed;
+                    }
+                    index = Some(committed);
+                }
+                panic!("the race generation did not complete its census");
             })
         });
-        page.enrich(&c);
-        page.finish();
         assert_eq!(step.get(), 2, "deleted after the listing, then recreated");
-        assert!(
-            page.scan.census_complete,
-            "the walk stays clean: status={:?} disappeared={} unreadable={} discovered={} scanned={} rows={}",
-            page.scan.census_status,
-            page.scan.disappeared_file_count,
-            page.scan.unreadable_path_count,
-            page.scan.discovered_file_count,
-            page.scan.scanned_file_count,
-            rows.iter()
-                .filter(|row| row.to_string().contains("disappear") || row.to_string().contains("WalkEntry"))
-                .map(|row| row.to_string().chars().take(300).collect::<String>())
-                .collect::<Vec<_>>()
-                .join(" | "),
+        assert_eq!(
+            sites[SnapshotSource::ClaudeCode.slot()],
+            [[0, 0], [0, 1], [0, 0], [0, 0], [0, 0]],
+            "one WalkEntry removal and no other NotFound"
         );
-        let kept = page.index.files.get(&key).expect("the entry is kept");
+        let kept = saved.files.get(&key).expect("the entry is kept");
         assert_eq!(
             kept.last_upload_body_witness,
             before.last_upload_body_witness
         );
         assert_eq!(kept.size_bytes, before.size_bytes, "the change stays owed");
-        assert!(page.scan.snapshots.is_empty(), "nothing sent or ACKed");
         for row in &rows {
             for count in ["unacked_usage_lost_to_deletion", "withheld_hold_released"] {
                 assert!(row["counts"].get(count).is_none(), "{count}: {row}");
             }
         }
-        let saved = disk.commit(&page.cache, SnapshotSource::ClaudeCode, &mut page.index);
         let restart = disk.owner(SnapshotSource::ClaudeCode);
         let mut pages = [&scanner, &E2ScanFixture::default(), &restart]
             .map(|owner| c.raw(owner, saved.clone(), 100, true, &[]));
