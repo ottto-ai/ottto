@@ -99,11 +99,14 @@ impl SelectionFixture {
             }
         }
         if audit {
-            previous
-                .files
-                .get_mut(&local_index_key(&paths[1]))
-                .unwrap()
-                .set_unverified_deadline(1);
+            // B is an unchanged audit, not synthetic source growth. Native
+            // reconciliation must not queue bytes hidden by a placeholder size.
+            let metadata = fs::metadata(&paths[1]).unwrap();
+            let entry = previous.files.get_mut(&local_index_key(&paths[1])).unwrap();
+            entry.size_bytes = metadata.len();
+            entry.modified_unix_nanos = metadata.modified().ok().and_then(unix_nanos);
+            entry.modified_unix_seconds = metadata.modified().ok().and_then(unix_seconds).unwrap();
+            entry.set_unverified_deadline(1);
         }
         let index_path = scratch.join("index.json");
         previous.save_fixture(&index_path).unwrap();

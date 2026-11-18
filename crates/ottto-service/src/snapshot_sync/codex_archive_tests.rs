@@ -89,7 +89,8 @@ impl ScanIndex {
     ) -> (ScanIndex, Vec<Vec<u8>>) {
         let mut index = self;
         let mut posts = Vec::new();
-        let root = crate::test_scratch::ScratchDir::canonical("archive-upload-checkpoint");
+        // The returned index retains this route across subsequent pages.
+        let root = crate::test_scratch::canonical_private_dir("archive-upload-checkpoint");
         let route = crate::snapshots::e2_pipeline_scan_fixture::route_of(&index);
         let index_path = route.clone().unwrap_or_else(|| root.join("index.json"));
         // A prepare-time carry already committed both old/new keys. Match

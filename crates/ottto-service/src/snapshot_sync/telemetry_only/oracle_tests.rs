@@ -287,6 +287,16 @@ fn page_from(
             hint.session_request_account_source_contract.as_deref()
                 == Some(crate::snapshots::ACCOUNT_SOURCE_CONTRACT),
         );
+    // Native notice saves release resident hints, as the service finish then
+    // reloads the current page's identity rows before applying evidence.
+    progress
+        .load_identity(
+            page.scan
+                .snapshots
+                .iter()
+                .map(|item| item.source_session_id.as_str()),
+        )
+        .unwrap();
     let mut ledger = progress.telemetry_only.take();
     let (disposition, _, stats) = apply_claude_local_evidence_to_scan_with_ledger_and_budget(
         &c.support,

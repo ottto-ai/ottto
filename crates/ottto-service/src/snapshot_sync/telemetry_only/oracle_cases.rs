@@ -461,7 +461,24 @@ fn cas_takeover(page: &Page, p: &mut Progress, mode: Mode) -> RouteResult {
             );
             assert_eq!(envelope["base_head_etag"], stale);
             assert_eq!(p.accepted_cache_heads[&key], stale);
-            *p = restore(p);
+            let native = p
+                .rows
+                .as_ref()
+                .map(|rows| rows.index_path_for_test().to_owned());
+            *p = match native {
+                Some(index_path) => {
+                    // The native save released resident hints. A serde copy
+                    // cannot stand in for reloading the committed identity rows.
+                    let enabled = p.accepted_identity_buckets.account_source_enabled();
+                    let mut restored =
+                        routed_progress(&ScanIndex::load(&index_path).unwrap(), &index_path);
+                    restored
+                        .accepted_identity_buckets
+                        .set_account_source_enabled(enabled);
+                    restored
+                }
+                None => restore(p),
+            };
             assert_eq!(
                 p.head_conflict_challenges[&key].challenge,
                 cas::challenge(0xc)
@@ -473,6 +490,8 @@ fn cas_takeover(page: &Page, p: &mut Progress, mode: Mode) -> RouteResult {
             assert!(envelope.get("base_head_etag").is_none());
             assert_eq!(p.accepted_cache_heads[&key], "2".repeat(64));
             assert!(!p.head_conflict_challenges.contains_key(&key));
+            p.load_identity(offered.iter().map(|item| item.source_session_id.as_str()))
+                .unwrap();
             return delivered(&offered, p, mode, wires.iter().map(canonical).collect());
         }
     }
