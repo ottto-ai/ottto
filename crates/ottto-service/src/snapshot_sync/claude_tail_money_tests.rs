@@ -1455,10 +1455,11 @@ fn deleted_sibling_lost_ack_settles_once() {
 
 /// [money] An indexed transcript with an accepted prefix and an owed change is
 /// listed, gone before its lstat and recreated before the page's absence
-/// proof. That page keeps the accepted witness and the owed change, sends and
-/// ACKs nothing and credits no deletion. After the save, a restarted owner
-/// recovers the change once, equal to cold Full with placement, and a quiet
-/// restart after its delivery reads and sends nothing.
+/// proof. That page keeps the accepted witness, sends nothing and credits no
+/// deletion. The owed change is then sent and ACKed exactly once, either by a
+/// later page of the same generation or by a restarted owner after the save,
+/// equal to cold Full with placement and never smaller than the accepted
+/// body, and a quiet restart after its delivery reads and sends nothing.
 #[test]
 fn recreated_before_absence_proof_recovers_owed_change_once() {
     use super::state_v2_money_tests::routed;
@@ -1507,30 +1508,44 @@ fn recreated_before_absence_proof_recovers_owed_change_once() {
             false
         };
         // The race page starts the next census generation; its pages run, each
-        // committed as the daemon does, until that census completes.
+        // delivered and committed as the daemon does, until that census
+        // completes. A later page may read the recreated file and send the
+        // owed change: `sent` keeps each sending page's route and its prior.
         let mut rows = Vec::new();
+        let mut sent = Vec::new();
         let (saved, sites) = crate::snapshots::observe_sites(|| {
             crate::snapshots::with_directory_read_fault(race, || {
                 let mut index = Some(prior);
                 for number in 0..12 {
                     let prior = index.take().unwrap();
+                    let page_prior = prior.clone();
                     let (mut page, page_rows) = crate::local_resource_diagnostics::capture(|| {
                         c.raw(&scanner, prior, 100, true, &[])
                     });
-                    assert!(
-                        number > 0
-                            || page_rows.iter().any(|row| {
+                    page.enrich(&c);
+                    page.finish();
+                    if number == 0 {
+                        assert!(
+                            page_rows.iter().any(|row| {
                                 row["stage"] == "bounded_traversal_transition"
                                     && row["counts"]["event"] == "starting"
                             }),
-                        "the race page lists a new census generation"
-                    );
-                    page.enrich(&c);
-                    page.finish();
-                    assert!(
-                        page.scan.snapshots.is_empty(),
-                        "page {number}: nothing sent"
-                    );
+                            "the race page lists a new census generation"
+                        );
+                        let kept = page.index.files.get(&key).expect("the entry is kept");
+                        assert_eq!(
+                            kept.last_upload_body_witness,
+                            before.last_upload_body_witness
+                        );
+                        assert!(
+                            page.scan.snapshots.is_empty(),
+                            "the race page sends nothing"
+                        );
+                    }
+                    if !page.scan.snapshots.is_empty() {
+                        sent.push((page_prior, routed(&page, SnapshotUploadPolicy::default())));
+                        accept_page(&mut page);
+                    }
                     rows.extend(page_rows);
                     let committed =
                         disk.commit(&page.cache, SnapshotSource::ClaudeCode, &mut page.index);
@@ -1548,37 +1563,58 @@ fn recreated_before_absence_proof_recovers_owed_change_once() {
             [[0, 0], [0, 1], [0, 0], [0, 0], [0, 0]],
             "one WalkEntry removal and no other NotFound"
         );
-        let kept = saved.files.get(&key).expect("the entry is kept");
-        assert_eq!(
-            kept.last_upload_body_witness,
-            before.last_upload_body_witness
-        );
-        assert_eq!(kept.size_bytes, before.size_bytes, "the change stays owed");
         for row in &rows {
             for count in ["unacked_usage_lost_to_deletion", "withheld_hold_released"] {
                 assert!(row["counts"].get(count).is_none(), "{count}: {row}");
             }
         }
+        assert!(
+            sent.len() <= 1,
+            "the race generation sends the change at most once"
+        );
         let restart = disk.owner(SnapshotSource::ClaudeCode);
         let mut pages = [&scanner, &E2ScanFixture::default(), &restart]
             .map(|owner| c.raw(owner, saved.clone(), 100, true, &[]));
-        assert_eq!(pages[1].modes.1 + pages[1].modes.2, 0, "cold Full");
         finish_claude_pages(&c, &mut pages);
-        compare_claude_uploads(&pages);
-        let routes = pages
-            .each_ref()
-            .map(|page| routed(page, SnapshotUploadPolicy::default()));
-        for other in [&routes[0], &routes[2]] {
-            money_oracle::assert_equivalent(&routes[1], other);
-            money_oracle::assert_no_smaller_reemit(ROOT, &accepted, other, &routes[1], false);
-        }
-        let [_, _, mut recovered] = pages;
-        accept_page(&mut recovered);
-        let next = disk.commit(
-            &recovered.cache,
-            SnapshotSource::ClaudeCode,
-            &mut recovered.index,
+        let (cold, delivered, next) = if let Some((sending_prior, delivered)) = sent.pop() {
+            // The branch run 44333739701 took: a later race-generation page
+            // read the recreated file and its delivery settled the change.
+            // No owner sends it again; cold Full reads that page's prior.
+            for page in &pages {
+                assert!(page.scan.snapshots.is_empty(), "the change is sent once");
+            }
+            let mut cold = c.raw(&E2ScanFixture::default(), sending_prior, 100, true, &[]);
+            assert_eq!(cold.modes.1 + cold.modes.2, 0, "cold Full");
+            cold.enrich(&c);
+            cold.finish();
+            let cold = routed(&cold, SnapshotUploadPolicy::default());
+            (cold, delivered, saved)
+        } else {
+            // The race generation left the change owed: the restarted owner
+            // sends it, equal to the retained owner and cold Full.
+            assert_eq!(pages[1].modes.1 + pages[1].modes.2, 0, "cold Full");
+            compare_claude_uploads(&pages);
+            let routes = pages
+                .each_ref()
+                .map(|page| routed(page, SnapshotUploadPolicy::default()));
+            money_oracle::assert_equivalent(&routes[1], &routes[0]);
+            money_oracle::assert_no_smaller_reemit(ROOT, &accepted, &routes[0], &routes[1], false);
+            let [_, _, mut recovered] = pages;
+            accept_page(&mut recovered);
+            let next = disk.commit(
+                &recovered.cache,
+                SnapshotSource::ClaudeCode,
+                &mut recovered.index,
+            );
+            let [_, cold, delivered] = routes;
+            (cold, delivered, next)
+        };
+        assert!(
+            delivered.snapshots.contains_key(ROOT),
+            "the change is delivered"
         );
+        money_oracle::assert_equivalent(&cold, &delivered);
+        money_oracle::assert_no_smaller_reemit(ROOT, &accepted, &delivered, &cold, false);
         let quiet_owner = disk.owner(SnapshotSource::ClaudeCode);
         let (mut quiet, consumed) = observe_consumed(|| c.raw(&quiet_owner, next, 100, true, &[]));
         quiet.enrich(&c);
