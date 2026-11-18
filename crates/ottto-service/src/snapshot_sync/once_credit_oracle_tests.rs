@@ -98,6 +98,8 @@ struct OracleServer {
     batches: Arc<Mutex<Vec<Vec<u8>>>>,
     placement: Arc<Mutex<BTreeMap<String, Value>>>,
     acknowledged: Arc<Mutex<Vec<Vec<Value>>>>,
+    /// Every collector status body, in arrival order.
+    statuses: Arc<Mutex<Vec<Value>>>,
 }
 impl OracleServer {
     fn new(source: SnapshotSource, handle: Handle) -> Self {
@@ -117,6 +119,8 @@ impl OracleServer {
         let placed = placement.clone();
         let acknowledged = Arc::new(Mutex::new(Vec::new()));
         let proved = acknowledged.clone();
+        let statuses = Arc::new(Mutex::new(Vec::new()));
+        let reported = statuses.clone();
         let worker = std::thread::spawn(move || {
             let _entered = handle.enter();
             while !done.load(Ordering::Relaxed) {
@@ -137,6 +141,9 @@ impl OracleServer {
                 } else {
                     serde_json::from_str(raw).unwrap()
                 };
+                if value.get("report_kind").is_some() {
+                    reported.lock().unwrap().push(value.clone());
+                }
                 let response = if request.contains("/relay-token") {
                     json!({"token":"synthetic-oracle-token","expires_at":"2099-01-01T00:00:00Z"})
                 } else if request.contains("/activity-hints") {
@@ -256,6 +263,7 @@ impl OracleServer {
             batches,
             placement,
             acknowledged,
+            statuses,
         }
     }
 }

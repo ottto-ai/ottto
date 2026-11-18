@@ -58,9 +58,19 @@ fn hint(home: &OracleHome) {
     simulate_transcript_events(home.source, &roots(home), &[transcript(home)]);
 }
 
-/// One pass `aged` seconds after the previous one.
+thread_local! {
+    /// Passes move the oracle's scan clock instead of aging the gate's record.
+    static MOVING_CLOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// One pass `aged` seconds after the previous one. On a moving clock the scan
+/// clock itself advances, so time-due states and the backstop age together.
 fn pass(home: &mut OracleHome, server: &OracleServer, recording: &Recording, aged: u64) -> Cycle {
-    walk_idle::age_for_test(home.source, aged);
+    if MOVING_CLOCK.with(std::cell::Cell::get) {
+        home.now += aged;
+    } else {
+        walk_idle::age_for_test(home.source, aged);
+    }
     home.cycle(server, recording)
 }
 
@@ -304,6 +314,34 @@ fn walk_gate_lifecycle_pi_matches_back_to_back_walks() {
     walk_gate_lifecycle(SnapshotSource::Pi, "w01_pi", "w01_pi_today");
 }
 
+/// The same lifecycle on a moving scan clock (growth claims, retry times and
+/// the backstop all come due on it).
+fn walk_gate_lifecycle_moving(source: SnapshotSource, row: &'static str, control: &'static str) {
+    MOVING_CLOCK.with(|moving| moving.set(true));
+    walk_gate_lifecycle(source, row, control);
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn walk_gate_lifecycle_claude_on_a_moving_clock() {
+    walk_gate_lifecycle_moving(SnapshotSource::ClaudeCode, "w12_claude", "w12_claude_today");
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn walk_gate_lifecycle_codex_on_a_moving_clock() {
+    walk_gate_lifecycle_moving(SnapshotSource::Codex, "w12_codex", "w12_codex_today");
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn walk_gate_lifecycle_pi_on_a_moving_clock() {
+    walk_gate_lifecycle_moving(SnapshotSource::Pi, "w12_pi", "w12_pi_today");
+}
+
 /// Settles `home` under the simulated watcher, with one idle pass behind it.
 fn settle_idle(home: &mut OracleHome, server: &OracleServer, recording: &Recording) {
     walk_idle::restart_for_test();
@@ -540,28 +578,44 @@ fn no_hint_arm(
     })
 }
 
-/// Each source, gated and gate off: the gap idles (an owed source never arms),
+/// One source, gated and gate off: the gap idles (an owed source never arms),
 /// and the money is the same.
-fn no_hint_arm_matches(prefix: &str, owed: bool, arm: &dyn Fn(&OracleHome, &OracleServer, Moment)) {
+fn no_hint_arm_pair(
+    prefix: &str,
+    source: SnapshotSource,
+    owed: bool,
+    arm: &dyn Fn(&OracleHome, &OracleServer, Moment),
+) -> (Lifecycle, Lifecycle) {
+    let row = |suffix: &str| -> &'static str {
+        Box::leak(format!("{prefix}_{}{suffix}", source.api_slug()).into_boxed_str())
+    };
+    let gated = no_hint_arm(source, row(""), true, owed, arm);
+    let today = no_hint_arm(source, row("_today"), false, owed, arm);
+    assert!(
+        gated.walks < today.walks || (owed && gated.walks == today.walks),
+        "{prefix} {source:?}: the gap idled"
+    );
+    gated.assert_matches(&today, prefix);
+    (gated, today)
+}
+
+/// Every source's pair; none where the layout bound is unsupported.
+fn no_hint_arm_matches(
+    prefix: &str,
+    owed: bool,
+    arm: &dyn Fn(&OracleHome, &OracleServer, Moment),
+) -> Vec<(Lifecycle, Lifecycle)> {
     if !crate::heap_layout_bound::layout_supported() {
-        return;
+        return Vec::new();
     }
-    for source in [
+    [
         SnapshotSource::ClaudeCode,
         SnapshotSource::Codex,
         SnapshotSource::Pi,
-    ] {
-        let row = |suffix: &str| -> &'static str {
-            Box::leak(format!("{prefix}_{}{suffix}", source.api_slug()).into_boxed_str())
-        };
-        let gated = no_hint_arm(source, row(""), true, owed, arm);
-        let today = no_hint_arm(source, row("_today"), false, owed, arm);
-        assert!(
-            gated.walks < today.walks || (owed && gated.walks == today.walks),
-            "{prefix} {source:?}: the gap idled"
-        );
-        gated.assert_matches(&today, prefix);
-    }
+    ]
+    .into_iter()
+    .map(|source| no_hint_arm_pair(prefix, source, owed, arm))
+    .collect()
 }
 
 #[test]
@@ -579,12 +633,19 @@ fn accepted_holder_deleted_without_a_hint_matches_back_to_back_walks() {
 #[serial]
 #[serial(source_cadences, source_manifests, client_report)]
 fn unaccepted_holder_deleted_without_a_hint_matches_back_to_back_walks() {
-    no_hint_arm_matches("w08", true, &|home, server, moment| match moment {
+    let pairs = no_hint_arm_matches("w08", true, &|home, server, moment| match moment {
         // The server keeps no stored body for the holder, so it is never
         // accepted.
         Moment::Install => *server.fallback.lock().unwrap() = Answer::Unstored,
         Moment::Gap => std::fs::remove_file(transcript(home)).unwrap(),
     });
+    // The deleted holder's parsed body was never ACKed: each run counts it lost.
+    for (gated, today) in pairs {
+        for run in [gated, today] {
+            let files = run.unacked_lost.get("files").copied().unwrap_or(0);
+            assert!(files > 0, "unacked lost: {:?}", run.unacked_lost);
+        }
+    }
 }
 
 #[test]
@@ -614,4 +675,162 @@ fn candidate_at_the_window_edge_across_the_gap_matches_back_to_back_walks() {
             file.unwrap().set_modified(edge).unwrap();
         }
     });
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn codex_rollout_append_without_a_hint_is_served_by_the_backstop() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    // Usage appended to the rollout alone: no state store or home stamp moves
+    // and no hint names it, so the gated run idles to the backstop walk.
+    let (_, today) = no_hint_arm_pair("w11", SnapshotSource::Codex, false, &|home, _, moment| {
+        if moment == Moment::Gap {
+            let usage = |input: u64, cached: u64, output: u64, reasoning: u64| {
+                json!({"input_tokens":input,"cached_input_tokens":cached,
+                    "output_tokens":output,"reasoning_output_tokens":reasoning})
+            };
+            let line = json!({"timestamp":"2026-11-01T07:00:07Z","type":"event_msg",
+                "payload":{"type":"token_count","info":{"total_token_usage":usage(95,70,7,1),
+                "last_token_usage":usage(15,10,2,0),"model":"gpt-5.6-sol"}},"ordinal":10});
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(transcript(home))
+                .unwrap();
+            writeln!(file, "{line}").unwrap();
+        }
+    });
+    // The control reads the append at its next walk: it is new usage.
+    assert_ne!(
+        today.amounts.first(),
+        today.amounts.last(),
+        "{:?}",
+        today.amounts
+    );
+}
+
+/// A walk whose census completes with settled named loss never arms, so the
+/// next pass walks and discloses that loss again: no idle receipt replaces it.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn settled_loss_never_arms_and_the_next_pass_rediscloses_it() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let recording = Recording::start();
+    let source = SnapshotSource::Pi;
+    let server = OracleServer::new(source, recording.handle());
+    let mut home = OracleHome::new(source, &server);
+    home.row = "w13";
+    // A conflicted pair leaves one ownership-incomplete file no retry changes.
+    home.write_rows(&pi_rows(true));
+    let watched = roots(&home);
+    with_simulated_watch(&watched, || {
+        walk_idle::restart_for_test();
+        let mut cycle = home.cycle(&server, &recording);
+        for _ in 0..3 {
+            if walked(&cycle) {
+                break;
+            }
+            cycle = home.cycle(&server, &recording);
+        }
+        assert!(walked(&cycle), "the census completes: {}", cycle.gate);
+        assert!(cycle.gate["ownership_incomplete_file_count"].as_u64() > Some(0));
+        assert_eq!(walk_idle::armed_for_test(source), None, "settled loss");
+        for _ in 0..2 {
+            let next = pass(&mut home, &server, &recording, STEP);
+            assert!(walked(&next), "the next pass walks: {}", next.gate);
+            let status = server.statuses.lock().unwrap().last().cloned().unwrap();
+            let lost: u64 = [
+                "last_ownership_incomplete_file_count",
+                "last_zero_snapshot_usage_evidence_count",
+                "last_dropped_usage_record_count",
+            ]
+            .iter()
+            .map(|field| status[*field].as_u64().unwrap())
+            .sum();
+            assert!(lost > 0, "a loss vector: {status}");
+            assert!(!status["last_error_code"].is_null(), "disclosed: {status}");
+        }
+    });
+}
+
+/// Arming needs a fully settled upload: a walk whose body the server keeps
+/// unstored completes its census, yet does not arm, and the next pass walks.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn unsettled_upload_never_arms() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let recording = Recording::start();
+    let source = SnapshotSource::Pi;
+    let server = OracleServer::new(source, recording.handle());
+    let mut home = OracleHome::new(source, &server);
+    home.row = "w14";
+    install(&home);
+    let watched = roots(&home);
+    with_simulated_watch(&watched, || {
+        settle_idle(&mut home, &server, &recording);
+        *server.fallback.lock().unwrap() = Answer::Unstored;
+        change(&home);
+        hint(&home);
+        let unsettled = pass(&mut home, &server, &recording, STEP);
+        assert!(walked(&unsettled), "{}", unsettled.gate);
+        assert!(!unsettled.batches.is_empty(), "the change was offered");
+        assert_eq!(walk_idle::armed_for_test(source), None, "unsettled upload");
+        let next = pass(&mut home, &server, &recording, STEP);
+        assert!(walked(&next), "the next pass walks: {}", next.gate);
+    });
+}
+
+/// The lane's clears drop armed records: a resumed (reconnected) source, and
+/// a requested sync of every source, cleared under the cycle lock before
+/// credentials load, so it holds even when that cycle then fails.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn lane_clears_drop_armed_records() {
+    let base = crate::test_scratch::ScratchDir::new("walk-gate-lane");
+    let support = base.join("support");
+    let secrets = base.join("secrets");
+    std::fs::create_dir_all(&support).unwrap();
+    std::fs::create_dir_all(&secrets).unwrap();
+    // No device anywhere: the requested cycle stops at its credentials.
+    let _env = [
+        EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support),
+        EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secrets),
+        EnvVarGuard::set_str("OTTTO_API_BASE_URL", "http://127.0.0.1:9"),
+    ];
+    walk_idle::restart_for_test();
+    walk_idle::arm_for_test(SnapshotSource::Pi);
+    crate::snapshot_sync::disable_snapshot_source(&support, SnapshotSource::Pi).unwrap();
+    crate::snapshot_sync::reconnect_snapshot_source(&support, SnapshotSource::Pi).unwrap();
+    crate::snapshot_sync::resume_reconnected_sources(&support);
+    assert_eq!(
+        walk_idle::armed_for_test(SnapshotSource::Pi),
+        None,
+        "resumed"
+    );
+    let sources = [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ];
+    for source in sources {
+        walk_idle::arm_for_test(source);
+    }
+    let daemon = test_daemon("otm_lane");
+    let _ = crate::snapshot_sync::lane::sync_once(&base, &support, &daemon, true);
+    for source in sources {
+        assert_eq!(
+            walk_idle::armed_for_test(source),
+            None,
+            "{source:?}: requested"
+        );
+    }
 }

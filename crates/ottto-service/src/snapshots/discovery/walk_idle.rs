@@ -306,6 +306,24 @@ pub(crate) fn armed_for_test(source: SnapshotSource) -> Option<(u64, u64)> {
     })
 }
 
+/// An armed record, as a settled walk leaves one (lane clears drop it).
+#[cfg(test)]
+pub(crate) fn arm_for_test(source: SnapshotSource) {
+    let pass = Pass {
+        key: [0; 32],
+        codex_homes: Vec::new(),
+        days: 0,
+        covered: true,
+    };
+    with_slot(source, |slot| {
+        slot.record = Some(Record {
+            pass,
+            generation: 0,
+            started_at: 0,
+        });
+    });
+}
+
 /// As if `seconds` went by since this thread's last pass and armed walk.
 #[cfg(test)]
 pub(crate) fn age_for_test(source: SnapshotSource, seconds: u64) {
