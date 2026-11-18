@@ -187,6 +187,7 @@ pub(crate) fn load_source_for_test(
     source: SnapshotSource,
     support: &Path,
 ) -> Result<(ScanIndex, ScanIndexLoadOrigin)> {
+    bind_source_for_test(path, source);
     match ScanIndex::load_for_snapshot_source_with_origin(path, source, support) {
         Ok((index, origin)) if origin == ScanIndexLoadOrigin::Quarantined => {
             // Legacy quarantine authorizes a fresh rebuilt graph. The fixture
@@ -1627,6 +1628,39 @@ pub(crate) fn expire_claimed_growth_for_test(index: &mut ScanIndex, path: &Path)
         .traversal
         .as_ref()
         .is_some_and(|walk| walk.counts.growth_deferred > 0));
+    expire_growth_claim(index, path);
+}
+
+/// Age only a saved claim proved by an uncommitted deferred page. Its
+/// predecessor metadata and queue changes remain uncommitted.
+pub(crate) fn expire_observed_growth_for_test(
+    index: &mut ScanIndex,
+    path: &Path,
+    deferred: &ScanIndex,
+) {
+    assert_eq!(route_of(index), route_of(deferred));
+    let key = local_index_key(path);
+    assert!(sampled_audit::growth_full_paced(
+        deferred,
+        &key,
+        sampled_scan::now_seconds()
+    ));
+    assert!(deferred
+        .traversal
+        .as_ref()
+        .is_some_and(|walk| walk.counts.growth_deferred > 0));
+    let saved = serde_json::to_value(&index.v2().growth_retention[&key]).unwrap();
+    let observed = serde_json::to_value(&deferred.v2().growth_retention[&key]).unwrap();
+    assert_eq!(
+        saved["last_growth_full_unix"],
+        observed["last_growth_full_unix"]
+    );
+    expire_growth_claim(index, path);
+}
+
+fn expire_growth_claim(index: &mut ScanIndex, path: &Path) {
+    let key = local_index_key(path);
+    let now = sampled_scan::now_seconds();
     let state = index.v2_mut().growth_retention.get_mut(&key).unwrap();
     let mut value = serde_json::to_value(&*state).unwrap();
     value["last_growth_full_unix"] = json!(now - sampled_audit::GROWTH_FULL_INTERVAL);
