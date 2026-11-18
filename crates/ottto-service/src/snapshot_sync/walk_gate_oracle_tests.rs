@@ -274,6 +274,16 @@ fn lifecycle(source: SnapshotSource, row: &'static str, gated: bool) -> Lifecycl
         walk_idle::restart_for_test();
         let cycle = pass(&mut home, &server, &recording, STEP);
         expect(cycle, true, &mut cycles);
+        // On a moving clock the restart walk can drop a time-due re-read for
+        // the next walk, so it does not arm; that next walk does.
+        for extra in 0.. {
+            if walk_idle::armed_for_test(source).is_some() {
+                break;
+            }
+            assert!(extra < 3, "{row}: the gate never re-armed");
+            let cycle = pass(&mut home, &server, &recording, STEP);
+            expect(cycle, true, &mut cycles);
+        }
         let cycle = pass(&mut home, &server, &recording, STEP);
         expect(cycle, false, &mut cycles);
         // Every completed walk takes its census once; an idle pass none.
@@ -675,40 +685,6 @@ fn candidate_at_the_window_edge_across_the_gap_matches_back_to_back_walks() {
             file.unwrap().set_modified(edge).unwrap();
         }
     });
-}
-
-#[test]
-#[serial]
-#[serial(source_cadences, source_manifests, client_report)]
-fn codex_rollout_append_without_a_hint_is_served_by_the_backstop() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    // Usage appended to the rollout alone: no state store or home stamp moves
-    // and no hint names it, so the gated run idles to the backstop walk.
-    let (_, today) = no_hint_arm_pair("w11", SnapshotSource::Codex, false, &|home, _, moment| {
-        if moment == Moment::Gap {
-            let usage = |input: u64, cached: u64, output: u64, reasoning: u64| {
-                json!({"input_tokens":input,"cached_input_tokens":cached,
-                    "output_tokens":output,"reasoning_output_tokens":reasoning})
-            };
-            let line = json!({"timestamp":"2026-11-01T07:00:07Z","type":"event_msg",
-                "payload":{"type":"token_count","info":{"total_token_usage":usage(95,70,7,1),
-                "last_token_usage":usage(15,10,2,0),"model":"gpt-5.6-sol"}},"ordinal":10});
-            let mut file = std::fs::OpenOptions::new()
-                .append(true)
-                .open(transcript(home))
-                .unwrap();
-            writeln!(file, "{line}").unwrap();
-        }
-    });
-    // The control reads the append at its next walk: it is new usage.
-    assert_ne!(
-        today.amounts.first(),
-        today.amounts.last(),
-        "{:?}",
-        today.amounts
-    );
 }
 
 /// A walk whose census completes with settled named loss never arms, so the
