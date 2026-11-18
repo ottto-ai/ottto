@@ -118,6 +118,82 @@ fn slack_tail_counts_once_at_the_earlier_home() {
     }
 }
 
+/// [money] A later home in the state the removed dated rule matched: first
+/// own turn before the copy-proof cutoff, COPY mark, accepted body and no
+/// saved removal of its own. The twin pass decides it. With the earlier home
+/// co-read, accepted (1) or never accepted (2), each shared request counts
+/// once, at the earlier home, and the later home keeps all three removed.
+/// With the earlier home's file gone but still indexed (3), nothing proves
+/// the copied prefix: the later home counts it once and nothing is held
+/// (the dated rule kept s1 and s2 removed with no holder: an undercount).
+#[test]
+fn pre_cutoff_accepted_copy_counts_each_shared_request_once() {
+    for arm in ["twin accepted", "twin never accepted", "twin gone"] {
+        let (paths, mut index) = homes(&["a", "z"], &[t0(), t0() + LATER]);
+        let [twin, copy] = [0, 1].map(|n| local_index_key(&paths[n]));
+        index
+            .claude_money_birth_store
+            .set_money_marks(&copy, money_mark::COPY);
+        crate::snapshots::e2_pipeline_scan_fixture::origin_accepted_for_test(&mut index, &copy);
+        if arm == "twin accepted" {
+            crate::snapshots::e2_pipeline_scan_fixture::origin_accepted_for_test(&mut index, &twin);
+        }
+        let own_at = at(130);
+        let mut later = shared();
+        later.push(line("o1", &own_at, 40));
+        // The premise the dated rule tested, now ignored.
+        assert!(!from_copy_proof_cutoff(
+            rfc3339_unix_nanos(&own_at).unwrap()
+        ));
+        assert!(index.file_has_accepted_body(&copy), "{arm}");
+        assert!(index
+            .claude_copy_removals
+            .get(location_key(&copy))
+            .is_empty());
+        assert_eq!(
+            index.file_has_accepted_body(&twin),
+            arm == "twin accepted",
+            "{arm}"
+        );
+        let mut items = Vec::new();
+        if arm == "twin gone" {
+            fs::remove_file(&paths[0]).unwrap();
+            assert!(index.files.contains_key(&twin), "still indexed");
+        } else {
+            items.push(parse_undecided(&paths[0], Some(t0()), &index, &shared()));
+        }
+        items.push(parse_undecided(
+            &paths[1],
+            Some(t0() + LATER),
+            &index,
+            &later,
+        ));
+        let z = fold(items.last().unwrap());
+        assert!(z.twin_pending, "{arm}: the twin pass decides it");
+        assert_eq!(z.own_requests, 2, "{arm}: the tail and o1 are own");
+        take_diag();
+        decide_page_copies(&mut items, &index, None);
+        let diag = take_diag();
+        let z = fold(items.last().unwrap());
+        assert!(!z.entity.held, "{arm}");
+        if arm == "twin gone" {
+            assert_eq!((z.entity.totals().1, z.entity.removed_requests), (4, 0));
+            assert_eq!((diag.get(REMOVED), diag.get(MISSED)), (None, None));
+            assert_eq!(body(items, &index), (4, 0, 100, 4), "counted once");
+        } else {
+            assert_eq!(
+                (z.entity.totals().1, z.entity.removed_requests),
+                (1, 3),
+                "{arm}"
+            );
+            assert_eq!(z.own_requests, 1, "{arm}");
+            assert_eq!((diag.get(REMOVED), diag.get(MISSED)), (Some(&3), None));
+            assert_eq!(body(items, &index), (4, 3, 100, 4), "{arm}: once");
+        }
+        remove(&paths);
+    }
+}
+
 /// [control] T6 (ii): a forked first line, held by the root on the page and
 /// by the earlier home, is removed once. The twin pass drops it and counts
 /// it in slot 27; the family pass then finds it skipped. Money as before.
