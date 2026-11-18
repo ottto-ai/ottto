@@ -1453,6 +1453,110 @@ fn deleted_sibling_lost_ack_settles_once() {
     });
 }
 
+/// [money] An indexed transcript with an accepted prefix and an owed change is
+/// listed, gone before its lstat and recreated before the page's absence
+/// proof. That page keeps the accepted witness and the owed change, sends and
+/// ACKs nothing and credits no deletion. After the save, a restarted owner
+/// recovers the change once, equal to cold Full with placement, and a quiet
+/// restart after its delivery reads and sends nothing.
+#[test]
+fn recreated_before_absence_proof_recovers_owed_change_once() {
+    use super::state_v2_money_tests::routed;
+    use crate::snapshots::sampled_scan::transition_fixture::{money_oracle, observe_consumed};
+    let name = "recreated_before_absence_proof";
+    if !supported(name) {
+        return;
+    }
+    with_e2(|| {
+        let mut c = corpus(name);
+        let path = c.root(ROOT, &line(ROOT, "r1", AT, 10));
+        input_clock(&path);
+        // A directory the walk reads after the transcript's.
+        std::fs::create_dir_all(c.root.join("zz")).unwrap();
+        std::fs::write(c.root.join("zz/notes.txt"), "synthetic\n").unwrap();
+        let mut disk = Disk::new(&c);
+        let scanner = E2ScanFixture::default();
+        disk.begin(&scanner, SnapshotSource::ClaudeCode);
+        let mut warm = c.raw(&scanner, ScanIndex::default(), 100, true, &[]);
+        warm.enrich(&c);
+        warm.finish();
+        let accepted = routed(&warm, SnapshotUploadPolicy::default());
+        accept_page(&mut warm);
+        let prior = disk.commit(&warm.cache, SnapshotSource::ClaudeCode, &mut warm.index);
+        let key = path.to_string_lossy().into_owned();
+        let before = prior.files.get(&key).unwrap().clone();
+        assert!(before.last_upload_body_witness.is_some());
+        grow(&path, "r2", 20);
+        let bytes = std::fs::read(&path).unwrap();
+        let step = std::rc::Rc::new(std::cell::Cell::new(0));
+        let (listed, later, target, seen) = (
+            c.root.clone(),
+            c.root.join("zz"),
+            path.clone(),
+            step.clone(),
+        );
+        let race = move |read: &Path, type_read: bool| {
+            if type_read && read == listed.as_path() && seen.get() == 0 {
+                std::fs::remove_file(&target).unwrap();
+                seen.set(1);
+            } else if read == later.as_path() && seen.get() == 1 {
+                std::fs::write(&target, &bytes).unwrap();
+                input_clock(&target);
+                seen.set(2);
+            }
+            false
+        };
+        let (mut page, rows) = crate::local_resource_diagnostics::capture(|| {
+            crate::snapshots::with_directory_read_fault(race, || {
+                c.raw(&scanner, prior, 100, true, &[])
+            })
+        });
+        page.enrich(&c);
+        page.finish();
+        assert_eq!(step.get(), 2, "deleted after the listing, then recreated");
+        assert!(page.scan.census_complete, "the walk stays clean");
+        let kept = page.index.files.get(&key).expect("the entry is kept");
+        assert_eq!(
+            kept.last_upload_body_witness,
+            before.last_upload_body_witness
+        );
+        assert_eq!(kept.size_bytes, before.size_bytes, "the change stays owed");
+        assert!(page.scan.snapshots.is_empty(), "nothing sent or ACKed");
+        for row in &rows {
+            for count in ["unacked_usage_lost_to_deletion", "withheld_hold_released"] {
+                assert!(row["counts"].get(count).is_none(), "{count}: {row}");
+            }
+        }
+        let saved = disk.commit(&page.cache, SnapshotSource::ClaudeCode, &mut page.index);
+        let restart = disk.owner(SnapshotSource::ClaudeCode);
+        let mut pages = [&scanner, &E2ScanFixture::default(), &restart]
+            .map(|owner| c.raw(owner, saved.clone(), 100, true, &[]));
+        assert_eq!(pages[1].modes.1 + pages[1].modes.2, 0, "cold Full");
+        finish_claude_pages(&c, &mut pages);
+        compare_claude_uploads(&pages);
+        let routes = pages
+            .each_ref()
+            .map(|page| routed(page, SnapshotUploadPolicy::default()));
+        for other in [&routes[0], &routes[2]] {
+            money_oracle::assert_equivalent(&routes[1], other);
+            money_oracle::assert_no_smaller_reemit(ROOT, &accepted, other, &routes[1], false);
+        }
+        let [_, _, mut recovered] = pages;
+        accept_page(&mut recovered);
+        let next = disk.commit(
+            &recovered.cache,
+            SnapshotSource::ClaudeCode,
+            &mut recovered.index,
+        );
+        let quiet_owner = disk.owner(SnapshotSource::ClaudeCode);
+        let (mut quiet, consumed) = observe_consumed(|| c.raw(&quiet_owner, next, 100, true, &[]));
+        quiet.enrich(&c);
+        quiet.finish();
+        assert_eq!((quiet.modes.0, consumed), (0, 0), "the quiet restart read");
+        assert!(quiet.scan.snapshots.is_empty(), "the change is sent once");
+    });
+}
+
 /// B2 (#1351) receipts. `claude_bad_record_sibling`: a malformed record
 /// between valid responses never counts and its siblings count on every arm.
 /// `claude_paused_suffix`: an unterminated final response is pending on its

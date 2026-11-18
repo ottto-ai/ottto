@@ -144,7 +144,7 @@ fn directory_read_fault<T>(
 
 /// Runs `run` with a directory entry/type read fault, for tests only.
 #[cfg(test)]
-pub(in crate::snapshots) fn with_directory_read_fault<T>(
+pub(crate) fn with_directory_read_fault<T>(
     fault: impl FnMut(&Path, bool) -> bool + 'static,
     run: impl FnOnce() -> T,
 ) -> T {

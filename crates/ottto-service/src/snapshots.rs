@@ -1417,12 +1417,9 @@ fn transcript_path_admitted(source: SnapshotSource, path: &Path) -> bool {
 pub(crate) use discovery::directory::FIRST_READ_WINDOW_DAYS;
 
 #[cfg(test)]
-pub(crate) use discovery::directory::with_test_directory_entries;
-#[cfg(test)]
 use discovery::directory::{
     advance_bounded_directory_traversal, collect_recent_jsonl_files,
     reconcile_missing_index_entries_with_limit, reconcile_missing_index_entries_with_side,
-    with_directory_read_fault,
 };
 use discovery::directory::{
     advance_bounded_directory_traversal_with_budget, claude_absence_is_removal,
@@ -1430,6 +1427,8 @@ use discovery::directory::{
     is_recent_enough_at, opened_candidate_is_within_frozen_window,
     reconcile_missing_index_entries_bounded, DiscoveryRecovery,
 };
+#[cfg(test)]
+pub(crate) use discovery::directory::{with_directory_read_fault, with_test_directory_entries};
 use discovery::first_read_order;
 use discovery::retention::{AccountMoveObservations, DiscoveryRetention};
 
