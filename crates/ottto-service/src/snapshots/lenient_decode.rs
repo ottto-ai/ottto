@@ -366,11 +366,6 @@ impl Serialize for ScanIndex {
         field!(accepted_rebuild_incidence, BTreeMap::is_empty);
         field!(accepted_rebuild_pending_since_unix_seconds, Option::is_none);
         field!(accepted_rebuild_last_alarm_unix_seconds, Option::is_none);
-        field!(codex_counting_tombstones, BTreeMap::is_empty);
-        field!(
-            codex_counting_evicted_legacy,
-            sources::codex::counting::version::EvictedLegacyOwners::is_empty
-        );
         field!(upload_ack_retirement_handoff, Option::is_none);
         field!(
             claude_money_birth_store,
@@ -2017,10 +2012,7 @@ impl<R: BufRead + Seek> Decoder<R> {
                         "confirmed_empty_files" => {
                             index.confirmed_empty_files = self.typed(value)?
                         }
-                        "codex_counting_evicted_legacy" => {
-                            index.codex_counting_evicted_legacy =
-                                self.history_scalar(value, Default::default())?
-                        }
+                        "codex_counting_evicted_legacy" => {} // Retired counting history.
                         "copy_prefix_last_accepted_nonce" => {
                             index.copy_prefix_last_accepted_nonce = self.typed(value)?
                         }
@@ -2032,12 +2024,7 @@ impl<R: BufRead + Seek> Decoder<R> {
                             index.upload_context_proof =
                                 self.history_scalar(value, Default::default())?
                         }
-                        "codex_counting_tombstones" => {
-                            // Counting-only memory: damage loses it like a
-                            // lost index, never refuses the index.
-                            index.codex_counting_tombstones =
-                                self.history_scalar(value, BTreeMap::new())?
-                        }
+                        "codex_counting_tombstones" => {} // Retired counting history.
                         "file_snapshot_fingerprints" => {
                             if pass == Pass::IdentityCarry
                                 && value.len > CARRIED_ACK_BYTES_MAX as u64

@@ -147,7 +147,7 @@ fn header_cache_production_wake_output_equivalence_join_fork_counting() {
     }
     // Between the August fork and October join: exercise a legacy user fork
     // and a non-empty V2 group in the same production scan.
-    let _cutover = sources::codex::counting::version::TestCutover::set(1_790_000_000_000);
+
     let paths = fs::read_dir(root.join("sessions"))
         .unwrap()
         .map(|entry| local_index_key(&entry.unwrap().path()))
@@ -196,9 +196,12 @@ fn header_cache_production_wake_output_equivalence_join_fork_counting() {
                         .validate(&scan.snapshots)
                         .unwrap();
                     let counting = scan.codex_counting_v2.as_deref().unwrap();
-                    assert_eq!(counting.v2_sessions, 1);
+                    assert_eq!(counting.v2_sessions, 2);
                     assert_eq!(counting.native_counted, 2);
-                    assert_eq!(counting.ui_in_unbound_span, 0);
+                    assert_eq!(
+                        counting.ui_in_unbound_span, 2,
+                        "the fork has two unbound UI records"
+                    );
                     let counting = serde_json::to_value(counting).unwrap();
                     for key in &group_keys {
                         assert!(index.files[key].codex_counting_v2);

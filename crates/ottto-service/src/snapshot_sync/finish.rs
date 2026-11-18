@@ -1439,17 +1439,7 @@ pub(super) fn finish_sync_source(
             source.api_slug(),
         );
     }
-    scan_result.reconcile_codex_legacy_joining(
-        &mut index,
-        &committed_index,
-        machine_id,
-        |index, snapshots| {
-            index.bind_session_accounts(source, machine_id, snapshots, &current_codex_bindings);
-            // Checks a fingerprint an older release persisted, under that release's rules.
-            crate::upload_policy::apply_upload_policy_v1(source, snapshots, upload_policy);
-            apply_backfill_cutoff(snapshots, &backfill_state);
-        },
-    );
+
     backfill_succeeded &= scan_result.census_complete;
     let deferred_cache_head_identities = capture_deferred_cache_head_identities(
         source,

@@ -178,12 +178,10 @@ pub(crate) use codex_file_join::CODEX_JOIN_VALIDATION_FAILURES;
 pub(in crate::snapshots) use codex_file_join::tests::older_build_logs_tier;
 #[cfg(test)]
 pub(crate) use codex_file_join::tests::{
-    counting_v2_fixture, native_join_fixture_root, older_build_logs_expired,
-    older_build_logs_priority,
+    bound_rows as codex_bound_fixture_rows, counting_v2_fixture, native_join_fixture_root,
+    older_build_logs_expired, older_build_logs_priority,
 };
 pub(crate) mod billing_route;
-#[cfg(test)]
-pub(crate) use sources::codex::counting::version::TestCutover;
 #[cfg(test)]
 mod claude_usage_iterations_tests;
 mod codex_usage_occurrence;
@@ -317,8 +315,7 @@ pub use scan::identity::{
 use scan::limits::CODEX_FORWARD_EVIDENCE_FROM_UNIX_SECONDS;
 pub(crate) use scan::limits::LISTING_INTERVAL_SECONDS;
 use scan::limits::{
-    dated_on_or_after, in_codex_forward_evidence_epoch, CODEX_LEGACY_REPEAT_FROM_UNIX_SECONDS,
-    LISTING_OWED_PACE_SECONDS, UNHEALTHY_SCAN_RETRY_BASE_SECONDS,
+    in_codex_forward_evidence_epoch, LISTING_OWED_PACE_SECONDS, UNHEALTHY_SCAN_RETRY_BASE_SECONDS,
     UNHEALTHY_SCAN_RETRY_MAX_ATTEMPTS, UNHEALTHY_SCAN_RETRY_MAX_SECONDS,
 };
 pub use scan::limits::{
@@ -626,7 +623,6 @@ pub struct SourceScanResult {
     )]
     pub(crate) codex_counting_v2: Option<Box<crate::codex_scan_diagnostics::CountingV2Receipts>>,
     codex_join_validation: Option<codex_file_join::Validation>,
-    codex_legacy_join_baselines: Vec<codex_file_join::LegacyBaseline>,
     /// Request-census shadow, measured by a complete Claude terminal scan.
     /// Count-only; the local evidence line reports it.
     pub(crate) claude_request_census_shadow: Option<ClaudeRequestCensusShadowCounts>,
@@ -674,72 +670,7 @@ impl SourceScanResult {
         }
         Ok(())
     }
-    pub(crate) fn reconcile_codex_legacy_joining(
-        &mut self,
-        index: &mut ScanIndex,
-        previous: &ScanIndex,
-        machine_id: &str,
-        mut project: impl FnMut(&mut ScanIndex, &mut Vec<SnapshotItem>),
-    ) {
-        let mut held = BTreeSet::new();
-        for mut baseline in std::mem::take(&mut self.codex_legacy_join_baselines) {
-            project(index, &mut baseline.snapshots);
-            let matches = |snapshots: &[SnapshotItem]| {
-                let fingerprints = snapshots
-                    .iter()
-                    .map(|snapshot| snapshot_fingerprint(SnapshotSource::Codex, snapshot))
-                    .collect::<BTreeSet<_>>();
-                snapshot_file_entity_set_hex(fingerprints) == baseline.expected
-            };
-            if matches(&baseline.snapshots) {
-                continue;
-            }
-            // Explicit missing/conflict creator evidence intentionally retracts
-            // legacy guessed ownership. Compare with the previously cached
-            // binding only to isolate that authorized correction; never emit it.
-            for item in &mut baseline.snapshots {
-                if item
-                    .session_account_evidence
-                    .as_ref()
-                    .is_some_and(|evidence| {
-                        evidence.evidence_source == "codex_creator_header:v1"
-                            && matches!(evidence.identity_disposition, Some("missing" | "conflict"))
-                    })
-                {
-                    let key =
-                        sha256_hex(&["session_owner:v1", machine_id, &item.source_session_id]);
-                    if let Some(binding) = previous.session_account_bindings.get(&key) {
-                        set_session_account_hash(item, Some(&binding.account_identifier_hash));
-                    }
-                }
-            }
-            if !matches(&baseline.snapshots) {
-                held.insert(baseline.owner);
-            }
-        }
-        if held.is_empty() {
-            if self.census_complete
-                && !self.pending_finalization.iter().any(|pending| {
-                    index
-                        .files
-                        .get(&pending.index_key)
-                        .is_some_and(|entry| entry.codex_applied_tier_receipt.is_some())
-                })
-            {
-                index.traversal = None;
-                index.resume_after_path = None;
-                index.resume_upper_bound_path = None;
-                index.resume_census_window_end = None;
-            }
-            return;
-        }
-        self.hold_codex_groups(
-            index,
-            previous,
-            &held,
-            "legacy applied output could not be reproduced",
-        );
-    }
+
     pub(crate) fn hold_codex_groups(
         &mut self,
         index: &mut ScanIndex,
