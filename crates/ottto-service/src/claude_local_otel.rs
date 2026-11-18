@@ -108,10 +108,12 @@ pub struct ClaudeLocalOtelEvidence {
 }
 
 /// Result of a row's fingerprint check, filled by whichever step asks first
-/// (`snapshots::claude_api_evidence_fingerprint_is_valid`) so later steps on
+/// (`snapshots::claude_api_evidence_fingerprint_is_valid` or
+/// `snapshots::claude_trace_evidence_fingerprint_is_valid`) so later steps on
 /// the same page do not hash it again. Never serialized, ignored by `==`, and
 /// cleared on `Clone`: a copy may be edited, so it is checked anew. Rows are
-/// not edited after decode. One byte, inside the row's existing padding.
+/// not edited after decode. One byte: inside an API row's existing padding;
+/// it grows a trace row by 8 bytes.
 #[derive(Default)]
 pub(crate) struct FingerprintCheck(std::sync::atomic::AtomicU8);
 
@@ -328,6 +330,9 @@ pub struct ClaudeTraceOwnershipEvidence {
     #[serde(default)]
     pub workflow_run_id: String,
     pub observed_at: String,
+    /// The row's one fingerprint check, kept in memory only.
+    #[serde(skip)]
+    pub(crate) fingerprint_check: FingerprintCheck,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -655,6 +660,7 @@ fn trace_evidence_from_attrs(
         parent_agent_id: bounded_attr(attrs, &["parent_agent_id", "parent.agent.id"], 256),
         workflow_run_id: bounded_attr(attrs, &["workflow.run_id", "workflow_run_id"], 256),
         observed_at,
+        fingerprint_check: FingerprintCheck::default(),
     };
     let bytes = serde_json::to_vec(&item).ok()?;
     item.fingerprint = format!("sha256:{:x}", Sha256::digest(bytes));
@@ -3423,6 +3429,7 @@ mod tests {
                     parent_agent_id: String::new(),
                     workflow_run_id: String::new(),
                     observed_at: row.observed_at.clone(),
+                    fingerprint_check: Default::default(),
                 },
             )
             .unwrap();
@@ -4114,7 +4121,7 @@ crate::heap_layout_bound::fields!(ClaudeLocalOtelLoadHealth; missing_files, malf
 crate::heap_layout_bound::fields!(ClaudeLocalOtelEvidence; capture_revision, fingerprint, session_id, request_id, client_request_id, observed_at, model, effort, query_source, speed, cost_usd_micros, event_sequence, app_version, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, request_count, account_identity_checked, account_identifier_hash, request_identity, fingerprint_check);
 crate::heap_layout_bound::fields!(ClaudeRequestIdentityEvidence; identity_hash_scheme, account, organization, disposition);
 crate::heap_layout_bound::fields!(ClaudeIdentityAttributeEvidence; origin, disposition, resource_hash, log_record_hash);
-crate::heap_layout_bound::fields!(ClaudeTraceOwnershipEvidence; capture_revision, fingerprint, session_id, request_id, client_request_id, agent_id, parent_agent_id, workflow_run_id, observed_at);
+crate::heap_layout_bound::fields!(ClaudeTraceOwnershipEvidence; capture_revision, fingerprint, session_id, request_id, client_request_id, agent_id, parent_agent_id, workflow_run_id, observed_at, fingerprint_check);
 crate::heap_layout_bound::fields!(ClaudeTraceOwnershipLoadReport; evidence, missing_files, malformed_lines, unreadable_lines, oversized_files, invalid_session_rows, missing_request_ids, conflicting_request_ids, rows_discarded);
 crate::heap_layout_bound::fields!(ClaudeTraceRowsDiscarded; cap, generation, cap_rows, generation_rows);
 

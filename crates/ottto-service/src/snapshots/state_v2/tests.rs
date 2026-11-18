@@ -155,6 +155,54 @@ fn header_scan_cannot_hide_corrupt_value_parts() {
     assert!(tx.read_value(&h, &mut std::io::sink()).is_err());
 }
 
+/// [format] a damaged stored row checksum or value digest refuses the row at
+/// its header read, before any value byte is written out.
+#[test]
+fn damaged_row_checksum_or_value_digest_refuses_before_any_value_byte() {
+    for column in ["row_checksum", "value_digest"] {
+        let tmp = Scratch::new();
+        let mut db = tmp.store();
+        let key = traversal("traversal".into());
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        let h = put(&mut tx, &key, b"stored value");
+        assert_eq!(tx.commit(0, 1), DurableCommitOutcome::Committed(1));
+        {
+            let mut tx = db.begin(TxnMode::Read).unwrap();
+            assert_eq!(tx.get(&key).unwrap(), Some(h.clone()));
+            assert_eq!(value(&mut tx, &h), b"stored value");
+        }
+        sqlite::flip_record_byte_for_test(&db, column);
+        let mut tx = db.begin(TxnMode::Read).unwrap();
+        let mut out = Vec::new();
+        let error = tx
+            .get(&key)
+            .and_then(|found| tx.read_value(&found.unwrap(), &mut out))
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("state_v2_row_checksum"),
+            "{column}: {error:#}"
+        );
+        let error = tx
+            .scan_prefix(
+                RowPrefix {
+                    table: Table::Records,
+                },
+                None,
+                128,
+            )
+            .and_then(|page| {
+                page.iter()
+                    .try_for_each(|found| tx.read_value(found, &mut out))
+            })
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("state_v2_row_checksum"),
+            "{column}: {error:#}"
+        );
+        assert!(out.is_empty(), "{column}");
+    }
+}
+
 /// [format] f8 orphan and dangling parts are damage without silent gc.
 #[test]
 fn f8_orphan_and_dangling_parts_are_damage_without_silent_gc() {

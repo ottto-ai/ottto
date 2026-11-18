@@ -102,6 +102,7 @@ fn trace_row() -> ClaudeTraceOwnershipEvidence {
         parent_agent_id: String::new(),
         workflow_run_id: "wf-1".into(),
         observed_at: "2026-11-05T00:00:00.000000000Z".into(),
+        fingerprint_check: Default::default(),
     }
 }
 

@@ -217,7 +217,7 @@ pub(super) enum Fixed {
     RequestSet { commitment: [u8; 32], refs: u64 },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(super) struct Header {
     key: RowKey,
     fixed: Fixed,
