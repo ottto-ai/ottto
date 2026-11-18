@@ -128,7 +128,9 @@ fn lost_holder_correction_keeps_the_head_clock_through_ack_and_restart() {
         // An independent session joins the page as the sibling to partially ACK.
         c.root(LATE, &line(LATE, "late", AT, 5));
         owe(&mut prior);
-        let mut p = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
+        // Cache rows dropped as the production upload seam does: a summed body
+        // and its sibling then share one batch class, so one request carries both.
+        let mut p = ready_without_cache(&c, &E2ScanFixture::default(), prior.clone(), 100, false);
         let item = body(&p, ROOT).unwrap();
         assert_eq!(
             item.source_file_fingerprint.as_deref(),
@@ -153,10 +155,15 @@ fn lost_holder_correction_keeps_the_head_clock_through_ack_and_restart() {
         let original = canonical(&p.scan.snapshots);
         let fingerprints = p.receipt();
         let mut progress = e2_progress();
-        let (failed, first, _) = upload(&p.scan.snapshots, &mut progress, |_| {
+        let (failed, first, order) = upload(&p.scan.snapshots, &mut progress, |_| {
             Err(anyhow!("synthetic connection reset before ACK"))
         });
         assert!(failed.is_err());
+        assert_eq!(
+            order,
+            [[ROOT.to_owned(), LATE.to_owned()]],
+            "the session and its sibling travel in one request"
+        );
         assert!(progress.accepted_fingerprints.is_empty());
         let holds = LocalHoldSettlement::classify(
             SnapshotSource::ClaudeCode,
@@ -190,7 +197,8 @@ fn lost_holder_correction_keeps_the_head_clock_through_ack_and_restart() {
             snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
         )
         .unwrap();
-        let mut restart = ready(&c, &E2ScanFixture::default(), restarted.clone(), 100, false);
+        let mut restart =
+            ready_without_cache(&c, &E2ScanFixture::default(), restarted.clone(), 100, false);
         let holds = restart.finish();
         assert_eq!(
             canonical(&restart.scan.snapshots),
@@ -243,7 +251,13 @@ fn lost_holder_correction_keeps_the_head_clock_through_ack_and_restart() {
             &progress.fresh_context_body_acks,
         );
         let settled = c.reload(&mut settled.index);
-        let mut next = twin(&ready(&c, &E2ScanFixture::default(), settled, 100, false));
+        let mut next = twin(&ready_without_cache(
+            &c,
+            &E2ScanFixture::default(),
+            settled,
+            100,
+            false,
+        ));
         next.finish();
         assert!(
             body(&next, ROOT).is_none(),
