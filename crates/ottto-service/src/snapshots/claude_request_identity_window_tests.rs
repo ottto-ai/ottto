@@ -420,8 +420,8 @@ fn sticky_budget_preserves_accepted_old_bucket_and_refuses_new_when_full() {
     assert!(measured.accepted_retained > 0);
     assert_eq!(measured.item_bytes, identity::item_bytes(&second));
 }
-/// [money] [regress] #909 P0 (05f7bf85: 582 hours over 6 accounts, untagged
-/// baseline over the cap): cache observations are shed before any money tag.
+/// [money] [regress] When an untagged baseline exceeds the cap, cache observations
+/// are shed before any money tag.
 /// Every accepted share keeps its tag; totals unchanged.
 #[test]
 fn sticky_budget_sheds_cache_before_stripping_any_tag() {
@@ -1783,8 +1783,8 @@ fn sticky_accepted_share_retag_and_missing_sibling_are_refused_after_restart() {
 }
 
 /// A copy-prefix row marked `copy_unproven` and its unmarked own twin share a
-/// bucket and every other key field. #909 freezes each under the daemon's
-/// partitioned RowKey: no false refusal, no silent re-tag, and the unmarked
+/// bucket and every other key field. The accepted-share ledger freezes each
+/// under the daemon's partitioned RowKey: no false refusal, no silent re-tag, and the unmarked
 /// row keeps its key when no marked row is sent.
 #[test]
 fn copy_unproven_twin_rows_freeze_separately() {
@@ -1924,7 +1924,7 @@ fn sticky_wire(item: SnapshotItem) -> Value {
     request.snapshots = vec![item];
     serde_json::to_value(request).unwrap()
 }
-/// #909's emitted cases.
+/// Emitted cases for accepted-share protection.
 fn sticky_golden_cases() -> Value {
     let mut cases = BTreeMap::new();
     let (mut mixed, mut proof) = sticky_session(4);
@@ -2620,7 +2620,7 @@ fn sticky_no_emitted_rollup_or_bucket_part_omits_a_cost_its_row_carries() {
     assert!(stripped_cases > 0 && kept_parts_cases > 0);
 }
 
-/// [money][regress] #909: the advertised cap preserves every tag and total;
+/// [money][regress] The advertised cap preserves every tag and total;
 /// the real heap walker charges the large graph or refuses parking, never money.
 #[test]
 fn advertised_cap_preserves_large_tagged_body_and_heap_charge() {

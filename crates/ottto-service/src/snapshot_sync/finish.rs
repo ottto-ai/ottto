@@ -1288,7 +1288,7 @@ pub(super) fn finish_sync_source(
             receipt_window_days,
             &mut disposition,
         );
-        // Copy-derived rows (#944): the bodies just built treat these
+        // Copy-derived rows: the bodies just built treat these
         // rows as never accepted; the ledger records that durably before any
         // upload, so a lost reply or restart cannot restore their proof.
         if upload_progress
@@ -2063,12 +2063,12 @@ pub(super) fn finish_sync_source(
     let walk_retired = index.walk_retired_since(&committed_index);
     // Local-hold Completed/Deferred/Rejected subsets and selected-state
     // restoration below can omit a still-live file. Capture which retirement
-    // obligations this full scan references before any selection (#794 F1).
+    // obligations this full scan references before any selection.
     let ack_scan_referenced =
         upload_progress.ack_retirement_scan_references(&committed_index, &index);
     // Shed and upload-error partial checkpoint: save wholly settled files,
-    // then release adopted ACK capacity against the full scan's references
-    // (#778 R2-2). A failed save is logged and yields `None`; a failed
+    // then release adopted ACK capacity against the full scan's references.
+    // A failed save is logged and yields `None`; a failed
     // release fails the pass.
     let mut partial_checkpoint =
         |cause: UnsettledUploadCause, keep_adopted_for_retry: bool| -> Result<Option<ScanIndex>> {

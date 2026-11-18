@@ -157,10 +157,10 @@ fn retired_leaves<T>() -> &'static [&'static [&'static str]] {
     use std::any::type_name;
     let row = type_name::<T>();
     if row == type_name::<crate::snapshots::upload_context_receipt::ProofState>() {
-        // 0.1.215 writes it every source cycle; #1287 retired it.
+        // 0.1.215 writes it every source cycle. It is now decode-only.
         &[&["direction"]]
     } else if row == type_name::<Option<crate::snapshots::ScanTraversalCheckpoint>>() {
-        // 0.1.208-0.1.215 stored each while nonzero; #1290 retired them. The
+        // 0.1.208-0.1.215 stored these retired counters while nonzero. The
         // residue's blocked ids went with the Codex state-only fallback.
         &[
             &["counts", "listing_owed_pace_evicted"],
@@ -487,8 +487,8 @@ mod tests {
         let proof = strict_json::<ProofState>(old).unwrap();
         assert_eq!(serde_json::to_string(&proof).unwrap(), "{}");
     }
-    /// [behaviour] An older build's traversal row holding the counters #1290
-    /// retired loads, re-encodes without them, and seeds the stored bytes so
+    /// [behaviour] An older build's traversal row holding the
+    /// retired counters loads, re-encodes without them, and seeds the stored bytes so
     /// the next save rewrites the row; a live sibling counter stays.
     #[test]
     fn retired_traversal_counters_load_and_reencode_without_them() {

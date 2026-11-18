@@ -2410,7 +2410,7 @@ fn locked_partial_checkpoint_requested_bytes_receipt() {
             assert_eq!(owed_after, (owed > 0).then_some(owed), "{variant}");
             assert_eq!(
                 agent_revision, expected_revision,
-                "{variant}: A2 rolls the map back with a restored entity, else carries it"
+                "{variant}: roll the map back for restored entities and carry it forward otherwise"
             );
             let saved = std::fs::metadata(&index_path).expect("saved index").len();
             let line = serde_json::json!({
@@ -3415,7 +3415,7 @@ fn apc_f1_redrain(
 /// beside an unselected drained revision. The retry drains it again at the
 /// revision its saved entry has, offering at most the same exact body.
 /// At the production `e2` gate (ON), on an owed pre-flip correction
-/// (`ApcFixture::pre_flip_grant`). Fails without 2015e841f: the restore runs
+/// (`ApcFixture::pre_flip_grant`). With the wrong order, the restore runs
 /// before the release, carries the drain and clears the record, so
 /// `apc_f1_released_members_stay_owed` panics "the record is kept".
 #[test]
@@ -3469,10 +3469,10 @@ fn f1_released_account_hold_audit_clear_keeps_the_last_owed_member_owed() {
 /// revision. It stays owed with its pre-drain pair beside the held root, and
 /// drains again once the retry re-reads it.
 /// At the production `e2` gate (ON), on an owed pre-flip correction
-/// (`ApcFixture::pre_flip_grant`). Not a discriminator of 2015e841f on its
-/// own: if selection kept agent b's committed re-arm marker, either order
-/// re-owes it, and the page exposes no pre-release entry to tell. The last
-/// owed and permanent refusal F1 tests are the discriminators.
+/// (`ApcFixture::pre_flip_grant`). This case alone can pass in either order
+/// if selection kept agent b's committed re-arm marker. Both orders leave
+/// it owed, and the page exposes no pre-release entry to distinguish them.
+/// The last-owed and permanent-refusal cases distinguish the ordering.
 #[test]
 #[serial(source_manifests)]
 fn f1_released_account_hold_audit_clear_keeps_a_no_op_member_owed_beside_a_held_one() {
@@ -3543,7 +3543,7 @@ fn f1_released_account_hold_audit_clear_keeps_a_no_op_member_owed_beside_a_held_
 /// its pre-drain pair, and drains again at the revision its saved entry has
 /// once the retry re-reads it.
 /// At the production `e2` gate (ON), on an owed pre-flip correction
-/// (`ApcFixture::pre_flip_grant`). Fails without 2015e841f: the drain never
+/// (`ApcFixture::pre_flip_grant`). With the wrong order, the drain never
 /// reaches the restore and clears the record, so
 /// `apc_f1_released_members_stay_owed` panics "the record is kept".
 #[test]

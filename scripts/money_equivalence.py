@@ -19,7 +19,7 @@ def output(args):
     return subprocess.check_output(args, text=True).strip()
 
 
-# Disk-only lifecycle fixtures (#806): a VERIFIED line each, no receipt file.
+# Disk-only lifecycle fixtures print a VERIFIED line each and omit the receipt file.
 DISK_FIXTURES = ("restart_between_pages", "upgrade_without_semantic_revision")
 # A base with the retired restart-record store also runs its downgrade
 # fixture; the head has no record store to downgrade from (its Tail writer is

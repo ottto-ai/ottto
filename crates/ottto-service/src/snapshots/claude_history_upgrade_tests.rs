@@ -1092,9 +1092,9 @@ fn activation_without_a_policy_row_keeps_the_previous_revision_and_alarms() {
     });
 }
 
-/// Stand-in for MONEY's emitter (#699), which builds request-owned items
+/// Stand-in for the money item emitter, which builds request-owned items
 /// after the emission seam: one literal copy of every item. It ignores
-/// #699's own protected-root skip, so only the gate removes it.
+/// the emitter's own protected-root skip, so only the gate removes it.
 fn mint_request_owned_copies(snapshots: &mut Vec<SnapshotItem>) {
     let copies = snapshots
         .iter()
@@ -1153,10 +1153,10 @@ fn a_touched_listed_file_is_held_history_not_a_genuine_change() {
 
 /// A literal item and a covering stamp for a listed root that
 /// is not a candidate this cycle (a settlement, a re-offer outside the scan
-/// hints, a #692 in-place resend): no literal of the listed family passes
+/// hints, an in-place resend): no literal of the listed family passes
 /// either upload path and it never stamps revision 3, while an unlisted
 /// family keeps both. [money] A paused list holds adoption only: it stamps
-/// no file (G3's lag) but filters literals by the digests it still has, so
+/// no file during the pause but filters literals by the digests it still has, so
 /// with them kept the listed family stays off `e2` (G4), and with none (a
 /// list missing after install) every family takes `e2` until the list is
 /// back (G5, disclosed).

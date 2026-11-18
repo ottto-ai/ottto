@@ -861,7 +861,7 @@ the age gate. Grown since committed: retention ends when the growth is committed
 (`size_bytes` catches up). Untouched and truncated files gain no exemption. This
 covers the walk, candidate/open rechecks and Codex roster.
 `counts.discovery_retained.grown` counts aged growth-retention decisions by
-source on the #799 page line, drained per page and omitted at zero. It counts
+source on the page diagnostics line, drained per page and omitted at zero. It counts
 one event per gate check, even if another retention source also matches; a file
 may pass several gates. Oversized growth stays observed for reconciliation
 without a full parse under the existing size cap. Retention grants no new
@@ -950,7 +950,7 @@ frame (`snapshot_sync/continuation.rs:1078`, `snapshot_sync.rs:6528,6594`); it i
 not limited to once per outer sync cycle. Thus the bound is per preparation,
 not per process or per day.
 
-On the #799 Codex `native_collection_page` line,
+On the Codex `native_collection_page` diagnostics line,
 `counts.codex_fragment_tail_repeat{files, bytes}` counts this residual using the
 approved fallback: actual aged Tail completions with no RAM fragment witness,
 an unchanged sampled source fingerprint, a start equal to the committed prefix,
@@ -1013,9 +1013,9 @@ its existing due time. Unknown identity or resource refusal grants no new Skip
 or completion credit. It applies only to an aged grown key admitted solely by the
 grown-since-committed retention arm. A recent grown key keeps main's immediate
 TranscriptChanged selection. At its retained due time, the aged key takes the
-existing Audit cause. Main's #903 fixes virtual-deadline to sampled-marker
-conversion: restoration carries the minimum owed due time, and only a successful
-secure open marks the slot attempted. Failed opens preserve the owed due time;
+existing Audit cause. When virtual deadlines convert to sampled markers,
+restoration carries the minimum owed due time, and only a successful secure
+open marks the slot attempted. Failed opens preserve the owed due time;
 stat-aware backoff and parking pace retries. The RAM backoff map admits 256 keys;
 longest-quiet eviction is counted and transfers the evicted owed deadline into
 the next slot, failing toward reading rather than dropping the obligation.
@@ -1118,7 +1118,7 @@ that change the member are not attempted, and out-of-root destinations are not
 covered; these retain ordinary positively proven deletion semantics. Hold caps
 and ordinary size gates remain.
 
-Known limitations: same-size middle-only rewrites remain Ron's accepted interior-edit residual.
+Same-size middle-only rewrites remain an accepted residual.
 Evidence outside stamped inputs (including API/trace metadata tokens and
 reader-health recovery) wakes only after restart: a delay while a recorded hold
 keeps the file discoverable, not an age-based drop. A never-binding account
@@ -2118,7 +2118,7 @@ scheduling and zero replay are not promised. Downgrade to 0.1.214/215 may redo o
 header attempt per archive; no money effect. Whether an older binary decodes carried
 state remains an open risk: the Linux workflow does not run the historical-binary driver.
 
-On close, each body decoder prints `codex_zst_input` on the #799 carrier with
+On close, each body decoder prints `codex_zst_input` on the diagnostics row with
 consumed `codex_zst_compressed_bytes`, produced `codex_zst_decoded_bytes` and decoder
 thread `codex_zst_cpu_micros`, including failures. Inventory header reads decode
 every `.zst` once per walk, so their closes print no row of their own: the Codex
@@ -2252,7 +2252,7 @@ observed scalar; the pre-existing scalar arithmetic itself is unchanged.
 Persistence uses the existing traversal counts: `causes` is a trailing defaulted
 slot after retired positional slots. Its eight numeric contribution slots keep
 the prior order (six causes, two retired input counters). Empty `causes` is omitted
-from object-form checkpoints and #799 JSON rows, including Claude/Pi defaults;
+from object-form checkpoints and JSON diagnostics rows, including Claude/Pi defaults;
 fixed positional arrays retain zero elements because position is their schema.
 SOURCE approved class N counts and these absence/re-upgrade semantics on
 2026-10-29. Object form is the only supported downgrade representation;

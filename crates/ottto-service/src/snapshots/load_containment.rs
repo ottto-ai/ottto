@@ -1,4 +1,4 @@
-// Record-local load containment (follow-up to #694). For the converted
+// Record-local load containment. For the converted
 // semantic checks, dropping or normalizing one record preserves unrelated
 // checkpoints and avoids whole-index replay. The candidate gate re-reads a
 // file whose activity clock is missing or whose RetryPending refusal is due;
@@ -237,10 +237,10 @@ fn scan_index_rebuilt_recently(path: &Path, now: SystemTime) -> Result<bool> {
         .is_some_and(|stamp| now.saturating_sub(stamp) <= SCAN_INDEX_REBUILD_COOLDOWN_NANOS))
 }
 
-// User Repair override (#718 follow-up): one explicit,
+// User Repair override: one explicit,
 // interactive Repair of a paused source passes the 24-hour guard once. The
 // override rebuild is the ordinary gated rebuild (quarantined origin, so the
-// #712 history gate, protected list and latches apply) and its witness
+// history gate, protected list and latches apply) and its witness
 // re-arms the 24-hour clock. Transcripts stay on disk: late, not lost.
 /// The override witness keeps `.corrupt.`, so prior-history detection, the
 /// sweep's keep rule and the 24-hour clock treat it as any quarantine; this

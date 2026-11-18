@@ -7158,10 +7158,10 @@ mod tests {
                 confidence: AgentStatusConfidence::High,
             }),
             model: Some(AgentModelStatus {
-                active_model: Some("/Users/ron/.codex/private".to_string()),
+                active_model: Some("/Users/example/.codex/private".to_string()),
                 default_model: Some("gpt-5.4".to_string()),
                 provider: Some("openai".to_string()),
-                available_models: vec!["gpt-5.4".to_string(), "/Users/ron/model".to_string()],
+                available_models: vec!["gpt-5.4".to_string(), "/Users/example/model".to_string()],
                 available_model_details: vec![AgentAvailableModelStatus {
                     id: "gpt-5.4".to_string(),
                     provider: Some("openai".to_string()),
@@ -7233,7 +7233,7 @@ mod tests {
             diagnostics: vec![AgentStatusDiagnostic::source(
                 "stderr",
                 AgentDiagnosticSeverity::Warning,
-                "failed reading /Users/ron/.codex/config",
+                "failed reading /Users/example/.codex/config",
             )],
             runtime_defaults: Some(AgentRuntimeDefaults {
                 provenance: Some("config_file".to_string()),
@@ -7243,7 +7243,10 @@ mod tests {
                 selector_context: BTreeMap::from([
                     ("service_tier".to_string(), "default".to_string()),
                     // Path-like value must be stripped by redaction.
-                    ("leaked".to_string(), "/Users/ron/.codex/config".to_string()),
+                    (
+                        "leaked".to_string(),
+                        "/Users/example/.codex/config".to_string(),
+                    ),
                 ]),
                 selector_sources: BTreeMap::from([(
                     "service_tier".to_string(),
@@ -7251,7 +7254,7 @@ mod tests {
                 )]),
                 reasoning_effort_by_model: BTreeMap::from([
                     ("claude-opus-5-5".to_string(), "medium".to_string()),
-                    ("/Users/ron/.claude".to_string(), "high".to_string()),
+                    ("/Users/example/.claude".to_string(), "high".to_string()),
                 ]),
                 ..Default::default()
             }),

@@ -251,9 +251,9 @@ fn money_915_lost_saturated_and_unknown_copy_classes_pause_before_any_baseline()
         import::inventory_context(&path).is_ok(),
         "valid original must reach inventory"
     );
-    // #915 has no mapper on this main: every prospective representation is
-    // refused by original inventory, while its v1 bytes stay available. The
-    // mapped #938 copy removals pause only when malformed; checked CCR2 passes.
+    // There is no mapper for the census lost/saturated fields. Every proposed
+    // representation is refused by original inventory, while its v1 bytes stay available. The
+    // mapped copy removals pause only when malformed. Checked CCR2 passes.
     for (field, value, expected, case) in [
         (
             "claude_request_census",

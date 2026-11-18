@@ -9464,7 +9464,7 @@ fn codex_agent_path_labels_replay_anonymous_production_subagents() {
         );
     }
     for unsafe_path in [
-        "/Users/ron/private_task",
+        "/Users/example/private_task",
         "/root/",
         "/root/task name",
         "/root/task.name",
@@ -19082,10 +19082,8 @@ fn pi_unlabeled_turn_lands_in_distinct_row_from_labeled_turn() {
 
 #[test]
 fn v6_snapshot_batch_matches_backend_contract() {
-    // Golden daemon<->backend contract guard. Companion to the backend's
-    // backend/tests/unit/test_daemon_snapshot_contract.py (master 6fa4deeff),
-    // which validates the canonical daemon payload (generated from THIS
-    // serializer) against AgentSessionSnapshotBatchRequest. The v5->v6
+    // The receiver's matching contract test validates the canonical payload
+    // from this serializer against AgentSessionSnapshotBatchRequest. The v5->v6
     // break shipped silent because the then-current contract forbade
     // unknown fields and no
     // cross-language test existed: the daemon emitted item-level
@@ -19094,10 +19092,9 @@ fn v6_snapshot_batch_matches_backend_contract() {
     // when the snapshot schema changes, update the field sets below AND the
     // backend fixture/model together.
 
-    // Registered AgentSessionSnapshotItem fields, copied from
-    // app/schemas/agent_session_snapshots.py. The current ingest model is
-    // forward-tolerant, but keeping this registry synchronized prevents a
-    // new daemon field from being silently ignored by an older backend.
+    // Registered fields from the receiver's AgentSessionSnapshotItem model.
+    // The current ingest model is forward-tolerant. Keeping this registry
+    // synchronized prevents older receivers from silently ignoring new fields.
     // Pi emits `cost`; the other collectors omit it.
     const ALLOWED_ITEM_FIELDS: &[&str] = &[
         "source_session_id",

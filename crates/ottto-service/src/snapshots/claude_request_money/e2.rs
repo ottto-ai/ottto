@@ -262,7 +262,7 @@ pub(crate) mod money_mark {
     pub(crate) const CONFLICT: u8 = 16;
     /// This file was kept on ordinary money by the local list.
     pub(crate) const LEGACY: u8 = 32;
-    /// #825's `STAMPED_WITHOUT_PERMIT`, retired with the identity permit
+    /// `STAMPED_WITHOUT_PERMIT`, retired with the identity permit
     /// (contract 5 always on). Stores may still carry it: it is decoded and
     /// carried through every restamp as stored (durable entry digests bind
     /// the raw byte), but never set, cleared, acted on or replayed.
@@ -282,8 +282,9 @@ pub(crate) const RULE_EPOCH: u8 = 2;
 /// switch-on, whose revision 3 already re-reads every file. A later money
 /// fix appends a row naming the marks it changes, so only those files are
 /// re-owed (once, under the history budget); never a revision bump, which
-/// re-reads the whole history. Version 2 re-owes nothing (#825 seeded its
-/// retired permit mark there); it stays so stored versions keep their meaning.
+/// re-reads the whole history. Version 2 re-owes nothing (the identity-permit
+/// change seeded the retired permit mark there); it stays so stored versions
+/// keep their meaning.
 /// Version 4 re-owes subagent path twins once: a shared response within the
 /// copy slack before the later home's birth counts at the earlier home.
 /// Version 5 marks settled counted copies once when current holder proof
@@ -2011,7 +2012,7 @@ fn finish_holder_identity(item: &mut SnapshotItem) {
         .min();
     let mut rebuilt =
         accounts.after_copy_decision(claude_org_markers.as_deref(), &fold.skipped, first_retained);
-    // #944: identity a copied marker lent to a
+    // Identity a copied marker lent to a
     // counted request is invalidated where a stored body froze it, so the
     // identity pass learns which (bucket, account) this re-derivation moved.
     if let Some(own) = rebuilt.as_mut() {
