@@ -1528,7 +1528,8 @@ fn leased_reoffer_hint_survives_the_settled_hint_filter() {
 /// copy folds its responses only at finish, so its totals are unknown. The
 /// same file deleted after its ACK counts nothing.
 /// Count only: the entry retires exactly as before, whether a remove hint or
-/// the re-listing's complete directory read proves it absent; the retirement
+/// the re-listing's complete directory read proves it absent, or (Claude) the
+/// re-listing listed it and it was gone before its lstat; the retirement
 /// adds no accepted fingerprint.
 #[test]
 fn deleted_before_ack_counts_unacked_usage_lost() {
@@ -1537,7 +1538,17 @@ fn deleted_before_ack_counts_unacked_usage_lost() {
         SnapshotSource::Codex,
         SnapshotSource::Pi,
     ] {
-        for (unacked, hinted) in [(true, true), (false, true), (true, false), (false, false)] {
+        for (unacked, hinted, race) in [
+            (true, true, false),
+            (false, true, false),
+            (true, false, false),
+            (false, false, false),
+            (true, false, true),
+            (false, false, true),
+        ] {
+            if race && source != SnapshotSource::ClaudeCode {
+                continue;
+            }
             let mut f = Fixture::new();
             f.unacked = unacked;
             let index = kept_generation(&f, source, !hinted);
@@ -1545,10 +1556,27 @@ fn deleted_before_ack_counts_unacked_usage_lost() {
             let key = local_index_key(&grown);
             assert!(index.files[&key].last_upload_body_witness.is_some());
             let accepted = index.accepted_snapshot_fingerprints.clone();
-            fs::remove_file(&grown).unwrap();
             let (index, _, _, rows) = if hinted {
+                fs::remove_file(&grown).unwrap();
                 f.page_hinted(source, index, &[grown])
+            } else if race {
+                // Listed by the re-listing's read, gone before its lstat.
+                let (root, target) = (f.root.clone(), grown.clone());
+                let fault = move |read: &Path, type_read: bool| {
+                    if type_read && read == root.as_path() && target.exists() {
+                        fs::remove_file(&target).unwrap();
+                    }
+                    false
+                };
+                let (page, sites) = with_directory_read_fault(fault, || {
+                    crate::snapshots::disappearance_diagnostics::observe_sites(|| {
+                        f.page(source, index)
+                    })
+                });
+                assert_eq!(sites[source.slot()][1], [0, 1], "one WalkEntry removal");
+                page
             } else {
+                fs::remove_file(&grown).unwrap();
                 f.page(source, index)
             };
             assert!(!index.files.contains_key(&key), "{source:?}: retired");
@@ -1570,7 +1598,7 @@ fn deleted_before_ack_counts_unacked_usage_lost() {
             };
             assert_eq!(
                 page["counts"]["unacked_usage_lost_to_deletion"], expected,
-                "{source:?} unacked {unacked} hinted {hinted}"
+                "{source:?} unacked {unacked} hinted {hinted} race {race}"
             );
         }
     }
