@@ -351,6 +351,8 @@ struct Cycle {
     schedule: Option<Value>,
     evidence_chunks: usize,
     debt: Value,
+    /// The scan's `unacked_usage_lost_to_deletion` counts, summed over its pages.
+    unacked_lost: BTreeMap<String, u64>,
 }
 
 impl Cycle {
@@ -635,6 +637,9 @@ impl OracleHome {
         let pre_index_bytes = serde_json::to_vec(&frame.committed_index).unwrap();
         let handle = recording.handle();
         let worker_births = self.births.clone();
+        // The page rows the scan worker emits.
+        let pages = Mutex::new(Vec::new());
+        let worker_pages = &pages;
         let (preparation, index, scan, steps, mut io) = run_on_scan_worker_stack(move || {
             let _entered = handle.enter();
 
@@ -680,14 +685,29 @@ impl OracleHome {
             };
             let read =
                 || crate::snapshots::OwnedSourceScan::with_oracle_births(worker_births, read);
-            if small_page {
-                crate::snapshots::with_test_limits_for_test(2048, 1024, 64, || {
-                    crate::snapshots::OwnedSourceScan::with_oracle_state_budget(budget, read)
-                })
-            } else {
-                read()
-            }
+            let (result, rows) = crate::local_resource_diagnostics::capture(|| {
+                if small_page {
+                    crate::snapshots::with_test_limits_for_test(2048, 1024, 64, || {
+                        crate::snapshots::OwnedSourceScan::with_oracle_state_budget(budget, read)
+                    })
+                } else {
+                    read()
+                }
+            });
+            *worker_pages.lock().unwrap() = rows;
+            result
         });
+        let mut unacked_lost = BTreeMap::<String, u64>::new();
+        for page in pages.into_inner().unwrap() {
+            if page["stage"] != "native_collection_page" {
+                continue;
+            }
+            if let Some(lost) = page["counts"]["unacked_usage_lost_to_deletion"].as_object() {
+                for (name, count) in lost {
+                    *unacked_lost.entry(name.clone()).or_default() += count.as_u64().unwrap();
+                }
+            }
+        }
         let gate = scan.trace_projection(&roots);
         test_effects::record(
             "gate_c",
@@ -803,6 +823,7 @@ impl OracleHome {
             schedule,
             evidence_chunks,
             debt,
+            unacked_lost,
         };
         let mut expected = Vec::new();
         if self.restarted {

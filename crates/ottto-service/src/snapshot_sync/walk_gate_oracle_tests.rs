@@ -141,12 +141,68 @@ fn placement(server: &OracleServer) -> Value {
         .into()
 }
 
+/// Whether the source's terminal manifest is published: every terminal report
+/// withdraws it first, and only a complete census publishes it again.
+fn manifest(source: SnapshotSource) -> bool {
+    crate::snapshot_sync::finish::source_manifests()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .keys()
+        .any(|(_, slug)| *slug == source.api_slug())
+}
+
+/// One pass that must walk or idle. Each census money step with a seam (the
+/// terminal manifest) runs once per completed walk and never on an idle pass.
+fn expect_pass(source: SnapshotSource, row: &str, cycle: &Cycle, walk: bool) {
+    if walk {
+        assert!(walked(cycle), "{row}: expected a walk: {}", cycle.gate);
+    } else {
+        assert_idle(cycle);
+    }
+    assert_eq!(manifest(source), walk, "{row}: manifest: {}", cycle.gate);
+}
+
+fn unacked_lost(cycles: &[Cycle]) -> BTreeMap<String, u64> {
+    let mut lost = BTreeMap::<String, u64>::new();
+    for (name, count) in cycles.iter().flat_map(|cycle| &cycle.unacked_lost) {
+        *lost.entry(name.clone()).or_default() += count;
+    }
+    lost
+}
+
 struct Lifecycle {
     amounts: Vec<Value>,
     acknowledged: usize,
     placement: Value,
+    unacked_lost: BTreeMap<String, u64>,
     walks: usize,
     passes: usize,
+}
+
+impl Lifecycle {
+    fn of(server: &OracleServer, cycles: &[Cycle], walks: usize) -> Self {
+        Self {
+            amounts: cycles.iter().flat_map(amounts).collect(),
+            acknowledged: cycles.iter().map(|c| c.acknowledged.concat().len()).sum(),
+            placement: placement(server),
+            unacked_lost: unacked_lost(cycles),
+            walks,
+            passes: cycles.len(),
+        }
+    }
+
+    /// The same money as today's back-to-back walks over the same inputs.
+    fn assert_matches(&self, today: &Self, row: &str) {
+        assert_eq!(self.passes, today.passes, "{row}");
+        assert_eq!(today.walks, today.passes, "{row}");
+        assert_eq!(
+            self.amounts, today.amounts,
+            "{row}: the same bodies, in order"
+        );
+        assert_eq!(self.acknowledged, today.acknowledged, "{row}");
+        assert_eq!(self.placement, today.placement, "{row}");
+        assert_eq!(self.unacked_lost, today.unacked_lost, "{row}");
+    }
 }
 
 /// complete -> idle gap -> hint -> relist -> unannounced change -> backstop
@@ -168,12 +224,8 @@ fn lifecycle(source: SnapshotSource, row: &'static str, gated: bool) -> Lifecycl
         let mut walks = cycles.iter().filter(|cycle| walked(cycle)).count();
         let mut expect = |cycle: Cycle, walk: bool, cycles: &mut Vec<Cycle>| {
             let walk = walk || !gated;
-            if walk {
-                assert!(walked(&cycle), "{row}: expected a walk: {}", cycle.gate);
-                walks += 1;
-            } else {
-                assert_idle(&cycle);
-            }
+            expect_pass(source, row, &cycle, walk);
+            walks += usize::from(walk);
             cycles.push(cycle);
         };
         for _ in 0..2 {
@@ -212,13 +264,7 @@ fn lifecycle(source: SnapshotSource, row: &'static str, gated: bool) -> Lifecycl
         // Every completed walk takes its census once; an idle pass none.
         let censuses = cycles.iter().filter(|cycle| walked(cycle)).count();
         assert_eq!(censuses, walks, "{row}");
-        Lifecycle {
-            amounts: cycles.iter().flat_map(amounts).collect(),
-            acknowledged: cycles.iter().map(|c| c.acknowledged.concat().len()).sum(),
-            placement: placement(&server),
-            walks,
-            passes: cycles.len(),
-        }
+        Lifecycle::of(&server, &cycles, walks)
     })
 }
 
@@ -228,12 +274,8 @@ fn walk_gate_lifecycle(source: SnapshotSource, row: &'static str, control: &'sta
     }
     let gated = lifecycle(source, row, true);
     let today = lifecycle(source, control, false);
-    assert_eq!(gated.passes, today.passes);
     assert!(gated.walks < today.walks, "the gate skipped no walk");
-    assert_eq!(today.walks, today.passes);
-    assert_eq!(gated.amounts, today.amounts, "the same bodies, in order");
-    assert_eq!(gated.acknowledged, today.acknowledged);
-    assert_eq!(gated.placement, today.placement);
+    gated.assert_matches(&today, row);
 }
 
 #[test]
@@ -430,4 +472,122 @@ fn hint_loss_deleted_file_walks_next() {
     hint_then_failure(SnapshotSource::ClaudeCode, "w06_claude", "finish_cycle");
     hint_then_failure(SnapshotSource::Codex, "w06_codex", "finish_cycle");
     hint_then_failure(SnapshotSource::Pi, "w06_pi", "finish_cycle");
+}
+
+/// When a no-hint arm acts: before the first walk, or in the idle gap.
+#[derive(Clone, Copy, PartialEq)]
+enum Moment {
+    Install,
+    Gap,
+}
+
+/// settle -> idle -> `arm` acts in the gap with no hint -> idle to the
+/// backstop walk -> idle. With `gated` false every pass walks.
+fn no_hint_arm(
+    source: SnapshotSource,
+    row: &'static str,
+    gated: bool,
+    arm: &dyn Fn(&OracleHome, &OracleServer, Moment),
+) -> Lifecycle {
+    let recording = Recording::start();
+    let server = OracleServer::new(source, recording.handle());
+    let mut home = OracleHome::new(source, &server);
+    home.row = row;
+    install(&home);
+    arm(&home, &server, Moment::Install);
+    let watched = roots(&home);
+    with_simulated_watch(&watched, || {
+        walk_idle::restart_for_test();
+        if !gated {
+            crate::snapshot_watcher::cover_paths_for_test(None);
+        }
+        let mut cycles = settle(&mut home, &server, &recording);
+        let mut walks = cycles.iter().filter(|cycle| walked(cycle)).count();
+        let backstop = WALK_GAP / STEP;
+        for step in 1..=backstop + 1 {
+            if step == 2 {
+                arm(&home, &server, Moment::Gap);
+            }
+            let cycle = pass(&mut home, &server, &recording, STEP);
+            let walk = step == backstop || !gated;
+            expect_pass(source, row, &cycle, walk);
+            walks += usize::from(walk);
+            cycles.push(cycle);
+        }
+        Lifecycle::of(&server, &cycles, walks)
+    })
+}
+
+/// Each source, gated and gate off: the gap idles, and the money is the same.
+fn no_hint_arm_matches(prefix: &str, arm: &dyn Fn(&OracleHome, &OracleServer, Moment)) {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        let row = |suffix: &str| -> &'static str {
+            Box::leak(format!("{prefix}_{}{suffix}", source.api_slug()).into_boxed_str())
+        };
+        let gated = no_hint_arm(source, row(""), true, arm);
+        let today = no_hint_arm(source, row("_today"), false, arm);
+        assert!(
+            gated.walks < today.walks,
+            "{prefix} {source:?}: the gap idled"
+        );
+        gated.assert_matches(&today, prefix);
+    }
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn accepted_holder_deleted_without_a_hint_matches_back_to_back_walks() {
+    no_hint_arm_matches("w07", &|home, _, moment| {
+        if moment == Moment::Gap {
+            std::fs::remove_file(transcript(home)).unwrap();
+        }
+    });
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn unaccepted_holder_deleted_without_a_hint_matches_back_to_back_walks() {
+    no_hint_arm_matches("w08", &|home, server, moment| match moment {
+        // The holder's body is refused, so it is never accepted.
+        Moment::Install => *server.fallback.lock().unwrap() = Answer::Refuse("synthetic"),
+        Moment::Gap => std::fs::remove_file(transcript(home)).unwrap(),
+    });
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn unread_input_vanishing_in_the_gap_matches_back_to_back_walks() {
+    // It appears and vanishes between two passes: no run reads it.
+    no_hint_arm_matches("w09", &|home, _, moment| {
+        if moment == Moment::Gap {
+            let unread = transcript(home).with_file_name("unread.jsonl");
+            std::fs::write(&unread, b"{}\n").unwrap();
+            std::fs::remove_file(&unread).unwrap();
+        }
+    });
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn candidate_at_the_window_edge_across_the_gap_matches_back_to_back_walks() {
+    // The oracle hint's window; the edge itself is inside it.
+    const WINDOW: u64 = 183 * 24 * 60 * 60;
+    no_hint_arm_matches("w10", &|home, _, moment| {
+        if moment == Moment::Gap {
+            let edge = std::time::UNIX_EPOCH + std::time::Duration::from_secs(home.now - WINDOW);
+            let file = std::fs::File::options().write(true).open(transcript(home));
+            file.unwrap().set_modified(edge).unwrap();
+        }
+    });
 }
