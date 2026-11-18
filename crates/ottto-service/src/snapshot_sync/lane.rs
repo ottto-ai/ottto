@@ -98,7 +98,9 @@ pub fn spawn_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
             let mut account_switch = ClaudeAccountSwitchProbe::default();
             loop {
                 let prior = watcher.as_ref().map_or(&[][..], |current| current.roots());
-                if let Ok(roots) = crate::snapshot_roots::watcher_roots(&home, prior) {
+                let listed = crate::snapshot_roots::watcher_roots(&home, prior);
+                let listed_ok = listed.is_ok();
+                if let Ok(roots) = listed {
                     if watcher.as_ref().map_or(true, |current| !current.matches_roots(&roots)) {
                         // Nothing watched the changed or new targets until now.
                         crate::snapshot_watcher::request_listing_all(
@@ -114,6 +116,8 @@ pub fn spawn_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
                             .ok();
                     }
                 }
+                // The walk gate idles only roots a live, current watcher hints.
+                crate::snapshot_watcher::cover(watcher.as_ref().filter(|_| listed_ok));
                 match sync_once(&home, &support_dir, &daemon) {
                     Ok(()) => crate::net_resilience::handle_sync_success(&daemon),
                     Err(error) => {
@@ -225,6 +229,7 @@ pub(super) fn collect_file_activity_for(
             crate::agent_status::claude_default_account_fingerprint,
         ) {
             eprintln!("local snapshot sync: Claude account switch detected; refreshing now");
+            crate::snapshots::walk_idle::clear(SnapshotSource::ClaudeCode);
             with_source_cadence(SnapshotSource::ClaudeCode, |cadence| {
                 cadence.record_account_switch(crate::scan_clock::now())
             });
@@ -531,6 +536,10 @@ pub fn spawn_one_shot_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
         .name("ottto-snapshot-sync-now".to_string())
         .stack_size(SNAPSHOT_SYNC_WORKER_STACK_BYTES)
         .spawn(move || {
+            // A requested sync walks every source.
+            for source in SNAPSHOT_SOURCES {
+                crate::snapshots::walk_idle::clear(source);
+            }
             match sync_once(&home, &support_dir, &daemon) {
                 Ok(()) => crate::net_resilience::handle_sync_success(&daemon),
                 Err(error) => {
@@ -867,6 +876,7 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
         crate::local_resource_diagnostics::pass_ended(source.api_slug());
         if result.is_err() {
             continuation::after_ordinary_source_failure(source);
+            crate::snapshots::walk_idle::clear(source);
         }
         match result {
             Ok(()) => self.transport_cycle.note_success(),
@@ -1124,6 +1134,7 @@ pub(crate) fn resume_reconnected_sources(support_dir: &Path) {
                 // The source is eligible now, even if the later directory sync fails.
                 // A prepare hint in flight at pause may have re-armed its pulse.
                 reset_collection_health(source);
+                crate::snapshots::walk_idle::clear(source);
                 sync_progress_parent(&marker)
             });
         let failures = turn.entry(marker).or_default();

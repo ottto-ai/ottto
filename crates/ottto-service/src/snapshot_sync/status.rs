@@ -122,6 +122,8 @@ pub(super) fn counted_poison_fingerprints_for_test(scope: &str) -> BTreeSet<Stri
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct SyncCounts {
     pub(super) census_status: crate::snapshots::CensusStatus,
+    /// The walk gate held this pass: no census was taken, and none is lost.
+    pub(super) walk_idle: bool,
     pub(super) backfill_window_days: u64,
     pub(super) backfill_file_limit: u64,
     pub(super) discovered_file_count: u64,
@@ -207,6 +209,9 @@ impl SyncCounts {
         // `census_complete` and raise the scan-cap latch without inventing a
         // per-file loss. Letting the zero-loss fast path win here would emit a
         // clean success that the backend classifies as terminal.
+        if self.walk_idle {
+            return DisclosedLoss::None;
+        }
         if !self.census_complete {
             return DisclosedLoss::Unsettled;
         }
@@ -247,6 +252,7 @@ impl SyncCounts {
             // semantic activity window.
             backfill_window_days: receipt_window_days,
             census_status: scan_result.census_status,
+            walk_idle: scan_result.walk_idle,
             backfill_file_limit: scan_result.backfill_file_limit as u64,
             discovered_file_count: scan_result.discovered_file_count as u64,
             skipped_file_count_due_to_limit: scan_result.skipped_file_count_due_to_limit as u64,
@@ -337,6 +343,9 @@ impl SyncCounts {
                     }
                 }
             }
+        }
+        if self.walk_idle {
+            line.push_str(" walk_idle=true");
         }
         line
     }
@@ -708,8 +717,9 @@ pub(super) fn collector_status_request(
 ) -> Result<SnapshotStatusRequest> {
     let finished_at = current_rfc3339();
     let disclosed_loss = status.counts.disclosed_loss();
-    let census_status_active =
-        matches!(&status.state, CollectorState::Success) && !status.counts.census_complete;
+    let census_status_active = matches!(&status.state, CollectorState::Success)
+        && !status.counts.census_complete
+        && !status.counts.walk_idle;
     let (
         enabled,
         disabled_reason,

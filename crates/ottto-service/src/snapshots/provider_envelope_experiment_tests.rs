@@ -218,6 +218,7 @@ fn recovery_priority_scan(
         false,
         paths,
         None,
+        false,
     )
 }
 

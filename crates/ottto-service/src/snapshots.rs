@@ -568,6 +568,12 @@ pub struct SourceScanResult {
     pub scanned_session_count: usize,
     pub semantic_noop_count: usize,
     pub census_complete: bool,
+    /// The walk gate held this pass: nothing was listed or read, and the
+    /// census is not complete (`walk_idle`).
+    pub(crate) walk_idle: bool,
+    /// The listing start of the clean walk this page retired, which may arm
+    /// the walk gate.
+    pub(crate) settled_walk_start: Option<u64>,
     pub census_window_end: String,
     /// State-only Codex census is separate from transcript discovery. If an
     /// existing SQLite source was unreadable, its previous durable map must be
@@ -1450,6 +1456,7 @@ use discovery::candidate_open::{
     opened_object_identity_from, reopen_for_replay, resolve_configured_scan_root, unix_nanos,
     unix_seconds, OpenedContentSamples,
 };
+pub(crate) use discovery::walk_idle;
 
 use discovery::candidate_open::{open_candidate_beneath_root, opened_object_identity};
 #[cfg(test)]

@@ -206,6 +206,7 @@ fn page_observed_hinted_at(
                 false,
                 &[],
                 Some((&cache, &scope)),
+                false,
             )
             .with_sampled_acquisition(cache, scope)
             .with_line_observer("test", Box::new(delivered.clone()));

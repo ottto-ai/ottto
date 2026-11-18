@@ -36,7 +36,7 @@ impl HeapLayoutBound for SidecarFacts {
     }
 }
 
-fn capture(root: &Path) -> [Option<SourceStamp>; 3] {
+pub(in crate::snapshots) fn capture(root: &Path) -> [Option<SourceStamp>; 3] {
     [
         SourceStamp::capture_sqlite(&root.join("state_5.sqlite")),
         SourceStamp::capture_sqlite(&root.join("thread_history_1.sqlite")),

@@ -240,6 +240,8 @@ pub(crate) struct OwnedSourceScan {
     /// Launch evidence for the source fingerprint when no attribution context
     /// supplies it: a file's identity does not depend on the toggle.
     pub(in crate::snapshots) launch_events: Option<Arc<crate::launch_events::LaunchEventInventory>>,
+    /// The walk gate held this pass (`walk_idle`): the step lists nothing.
+    pub(in crate::snapshots) walk_idle: bool,
 }
 pub(in crate::snapshots) struct OwnedActiveFile {
     pub(in crate::snapshots) first_read: Option<crate::local_resource_diagnostics::FirstRead>,
@@ -333,11 +335,14 @@ impl OwnedSourceScan {
             claude_request_identity_capture,
             &[],
             None,
+            false,
         )
     }
 
     /// The daemon names its recovery files before the first bounded page.
-    #[expect(clippy::too_many_arguments, reason = "12 args; no options struct yet")]
+    /// `walk_idle_allowed`: the walk gate let this pass skip its walk, if the
+    /// side inputs the scan loads first are also unchanged.
+    #[expect(clippy::too_many_arguments, reason = "13 args; no options struct yet")]
     pub(crate) fn new_with_recovery_priority(
         source: SnapshotSource,
         roots: &[PathBuf],
@@ -355,6 +360,7 @@ impl OwnedSourceScan {
             &sampled_scan::SharedCache,
             &crate::transcript_acquisition::Scope,
         )>,
+        walk_idle_allowed: bool,
     ) -> Self {
         Self::new_selecting(
             source,
@@ -370,6 +376,7 @@ impl OwnedSourceScan {
             claude_request_identity_capture,
             recovery_priority,
             carry_cache,
+            walk_idle_allowed,
         )
     }
 
@@ -447,6 +454,7 @@ impl OwnedSourceScan {
             line_delivery: None,
             launch_events: None,
             codex_versions: None,
+            walk_idle: false,
         }
     }
 
@@ -467,7 +475,7 @@ impl OwnedSourceScan {
         self
     }
 
-    #[expect(clippy::too_many_arguments, reason = "14 args; no options struct yet")]
+    #[expect(clippy::too_many_arguments, reason = "15 args; no options struct yet")]
     pub(in crate::snapshots) fn new_selecting(
         source: SnapshotSource,
         roots: &[PathBuf],
@@ -487,6 +495,7 @@ impl OwnedSourceScan {
             &sampled_scan::SharedCache,
             &crate::transcript_acquisition::Scope,
         )>,
+        walk_idle_allowed: bool,
     ) -> Self {
         let _jsonl_scope =
             crate::local_resource_diagnostics::jsonl::Scope::begin(source.api_slug());
@@ -550,6 +559,7 @@ impl OwnedSourceScan {
                 .is_some()
                 || index.claude_desktop_store_cursor.is_some()
                 || index.claude_desktop_store_sweep_had_errors);
+        let desktop_titles_before = index.claude_desktop_title_files.clone();
         let mut claude_title_metadata = if source == SnapshotSource::ClaudeCode {
             let mut load = |facts: &mut _| {
                 ClaudeTitleMetadata::load_from_roots_reusing(roots, index, collected_at, facts)
@@ -577,11 +587,40 @@ impl OwnedSourceScan {
             SnapshotSource::ClaudeCode => !claude_title_metadata.sidecar_census_incomplete,
             SnapshotSource::Pi => true,
         };
-        if (claude_sidecar_was_incomplete && sidecar_census_complete)
+        let desktop_titles_moved = index.claude_desktop_title_files != desktop_titles_before;
+        if desktop_titles_moved {
+            // Desktop titles change what a walk folds into each file.
+            if let Some(traversal) = index.traversal.as_mut() {
+                traversal.rewalk_owed = true;
+            }
+        }
+        let sidecar_restart = (claude_sidecar_was_incomplete && sidecar_census_complete)
             || (source == SnapshotSource::ClaudeCode
                 && claude_identity_census_was_complete
-                && claude_title_metadata.original_identity_census_incomplete)
+                && claude_title_metadata.original_identity_census_incomplete);
+        if walk_idle_allowed
+            && index.traversal.is_none()
+            && !sidecar_restart
+            && !desktop_titles_moved
+            && !claude_sidecar_was_incomplete
+            && state_census_complete
+            && sidecar_census_complete
+            && !claude_title_metadata.original_identity_census_incomplete
         {
+            let mut idle = Self::new_continuation(
+                &[],
+                owned_index,
+                collected_at,
+                requested_backfill_window_days,
+                file_limit,
+                None,
+                None,
+            );
+            idle.source = source;
+            idle.walk_idle = true;
+            return idle;
+        }
+        if sidecar_restart {
             // The prior transcript generation was intentionally held red while
             // title discovery was partial. Start a fresh bounded transcript walk
             // now so sidecar additions/removals are folded into each affected
@@ -1412,6 +1451,7 @@ impl OwnedSourceScan {
             line_delivery: None,
             launch_events: None,
             codex_versions: None,
+            walk_idle: false,
         }
     }
     pub(crate) fn with_launch_events(mut self, home: &Path) -> Self {

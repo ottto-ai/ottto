@@ -8,8 +8,9 @@ use notify_debouncer_full::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 pub const SNAPSHOT_WATCH_DEBOUNCE: Duration = Duration::from_secs(2);
@@ -127,6 +128,67 @@ fn record_pending_snapshot_paths(source: SnapshotSource, paths: &BTreeSet<PathBu
     }
 }
 
+crate::local_resource_diagnostics::process_static!(
+    fn with_sidecar_epochs: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3]
+);
+crate::local_resource_diagnostics::process_static!(
+    fn with_coverage: Mutex<Option<Vec<PathBuf>>> = Mutex::new(None)
+);
+
+/// Counts edits to the Claude sidecars a walk reads beside the transcripts
+/// (subagent `.meta.json` files and workflow records). No transcript hint
+/// names them, so the walk gate binds this count instead.
+pub(crate) fn sidecar_epoch(source: SnapshotSource) -> u64 {
+    with_sidecar_epochs(|epochs| epochs[source.slot()].load(Ordering::Relaxed))
+}
+
+fn claude_sidecar(path: &std::path::Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    name.ends_with(".meta.json")
+        || (name.ends_with(".json")
+            && path.parent().and_then(|parent| parent.file_name())
+                == Some(std::ffi::OsStr::new("workflows")))
+}
+
+/// Publishes what a live watcher watches recursively; `None` watches nothing.
+pub(crate) fn cover(watcher: Option<&SnapshotWatcher>) {
+    let covered = watcher
+        .filter(|watcher| watcher.live.load(Ordering::Relaxed))
+        .map(|watcher| {
+            watcher
+                .watch_paths
+                .iter()
+                .filter(|(_, mode)| **mode == RecursiveMode::Recursive)
+                .map(|(path, _)| path.clone())
+                .collect()
+        });
+    with_coverage(|coverage| {
+        *coverage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = covered
+    });
+}
+
+/// Whether a live watcher hints every existing root; an absent root has
+/// nothing to hint, and its creation recreates the watcher.
+pub(crate) fn covers(roots: &[PathBuf]) -> bool {
+    with_coverage(|coverage| {
+        coverage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|watched| {
+                roots
+                    .iter()
+                    .filter(|root| root.exists())
+                    .all(|root| watched.iter().any(|path| root.starts_with(path)))
+            })
+    })
+}
+
 fn record_raw_watcher_overflow() {
     lock_pending_snapshot_paths().overflowed.fill(true);
     request_listing_all(ListingTrigger::Overflow);
@@ -146,6 +208,17 @@ fn record_watcher_events(
         request_listing_all(ListingTrigger::Rescan);
     }
     for (source, root) in roots {
+        if *source == SnapshotSource::ClaudeCode
+            && events.iter().any(|event| {
+                !matches!(event.kind, EventKind::Access(_))
+                    && event
+                        .paths
+                        .iter()
+                        .any(|path| path.starts_with(root) && claude_sidecar(path))
+            })
+        {
+            with_sidecar_epochs(|epochs| epochs[source.slot()].fetch_add(1, Ordering::Relaxed));
+        }
         let paths = paths_from_events(
             *source,
             events
@@ -216,12 +289,15 @@ pub struct SnapshotWatcher {
     _debouncer: Debouncer<notify::RecommendedWatcher, NoCache>,
     roots: Vec<(SnapshotSource, PathBuf)>,
     watch_paths: BTreeMap<PathBuf, RecursiveMode>,
+    live: Arc<AtomicBool>,
     pub events: Receiver<SnapshotFileEvent>,
 }
 
 impl SnapshotWatcher {
     pub(crate) fn matches_roots(&self, roots: &[(SnapshotSource, PathBuf)]) -> bool {
-        self.roots == roots && self.watch_paths == watch_paths(roots)
+        self.live.load(Ordering::Relaxed)
+            && self.roots == roots
+            && self.watch_paths == watch_paths(roots)
     }
 
     pub(crate) fn roots(&self) -> &[(SnapshotSource, PathBuf)] {
@@ -282,7 +358,18 @@ pub fn watch_snapshot_roots(roots: Vec<(SnapshotSource, PathBuf)>) -> Result<Sna
     let (event_tx, event_rx) =
         mpsc::sync_channel::<SnapshotFileEvent>(SNAPSHOT_WATCH_SIGNAL_CAPACITY);
     let configured_roots = roots.clone();
+    let live = Arc::new(AtomicBool::new(true));
+    let worker_live = Arc::clone(&live);
     std::thread::spawn(move || {
+        // A worker that stops, even by a panic, no longer hints: the
+        // watcher reads as stale and is recreated with a listing.
+        struct Stopped(Arc<AtomicBool>);
+        impl Drop for Stopped {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Relaxed);
+            }
+        }
+        let _stopped = Stopped(worker_live);
         while let Ok(result) = raw_rx.recv() {
             let _stage = StageWindow::begin("unknown", "offpass_watcher");
             // A backend watcher error means the event stream is no longer a
@@ -300,6 +387,7 @@ pub fn watch_snapshot_roots(roots: Vec<(SnapshotSource, PathBuf)>) -> Result<Sna
         _debouncer: debouncer,
         roots: configured_roots,
         watch_paths,
+        live,
         events: event_rx,
     })
 }

@@ -1148,6 +1148,7 @@ pub(super) fn finish_sync_source(
     );
     let SourcePreparation {
         source,
+        walk_idle_pass,
         claude_scan_roots,
         account_witness,
         scan_started_at,
@@ -1216,6 +1217,9 @@ pub(super) fn finish_sync_source(
         // A held pass authenticates local recovery here before any upload IO.
         validate_recovery_save()?;
         ensure_destination_authority()?;
+    } else if scan_result.walk_idle {
+        // An idle pass took no census: the fenced one stays.
+        ensure_authority()?;
     } else {
         codex_scan_diagnostics::after_existing_census_fence(
             source,
@@ -1224,6 +1228,43 @@ pub(super) fn finish_sync_source(
             || codex_scan_diagnostics::write_fenced_census(support_dir, &scan_result, &index),
         )?;
     }
+    if scan_result.walk_idle && crate::snapshots::walk_idle::idle_finish(&index) {
+        // The walk gate held this pass: nothing was read, so there is no
+        // body, save or manifest. The receipt reports a healthy source.
+        if crate::snapshots::maintain_state_v2_idle(&index_path, &index, true).is_err() {
+            eprintln!("local state maintenance deferred for {}", source.api_slug());
+        }
+        with_source_cadence(source, |cadence| {
+            cadence.record_scan_success(Instant::now(), 0)
+        });
+        report_status_with_fresh_relay_token(
+            client,
+            device,
+            device_secret,
+            support_dir,
+            source,
+            TerminalManifestSource::Withdraw,
+            CollectorStatus {
+                source,
+                machine_id,
+                scan_started_at: &scan_started_at,
+                counts: SyncCounts::from_scan_result(&scan_result, 0, receipt_window_days),
+                state: CollectorState::Success,
+            },
+        )?;
+        if let Some((pass, _)) = walk_idle_pass {
+            crate::snapshots::walk_idle::arm_after_finish(
+                pass,
+                &index,
+                &index_path,
+                &scan_result,
+                false,
+            );
+        }
+        return Ok(());
+    }
+    // A pass that started a walk while finishing is an ordinary page.
+    scan_result.walk_idle = false;
     let scan_agent_status = reconciliation_agent_status(&scan_agent_status_collection);
     // State advances only after the exact paged replay census and its upload
     // both finish. Incomplete pages persist their cursor in the destination
@@ -2714,6 +2755,25 @@ pub(super) fn finish_sync_source(
                 state: CollectorState::Success,
             },
         )?;
+        if let Some((pass, cycle_owed_nothing)) = walk_idle_pass {
+            let now = crate::scan_clock::utc_seconds();
+            let outside = cycle_owed_nothing
+                && super::prepare::upload_owes_nothing(
+                    source,
+                    &upload_progress,
+                    support_dir,
+                    &activity_hint,
+                    &index,
+                    now,
+                );
+            crate::snapshots::walk_idle::arm_after_finish(
+                pass,
+                &index,
+                &index_path,
+                &scan_result,
+                outside,
+            );
+        }
     }
     Ok(())
 }

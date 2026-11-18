@@ -267,6 +267,11 @@ pub(in crate::snapshots) struct ScanTraversalCheckpoint {
     /// with that pass's start. Stamps older than the pace are pruned.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(in crate::snapshots) listing_owed_requeued_unix_seconds: BTreeMap<String, u64>,
+    /// Set when this walk learned of a change it may not have read (a
+    /// history budget hold, or Claude Desktop state that moved while it ran):
+    /// its retirement then never lets the next passes skip walking.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(in crate::snapshots) rewalk_owed: bool,
 }
 
 // A candidate's scan root is not only where its no-follow open starts: it is
@@ -518,7 +523,7 @@ impl From<String> for ReasonReofferCooldown {
 crate::heap_layout_bound::fields!(ReasonReofferCooldown; body_witness, input_change_only);
 
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys);
-crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; oversized_discovery, context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_freshness_yield, retired_codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue, listing_started_unix_seconds, listing_owed_requeued_unix_seconds);
+crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; oversized_discovery, context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_freshness_yield, retired_codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue, listing_started_unix_seconds, listing_owed_requeued_unix_seconds, rewalk_owed);
 crate::heap_layout_bound::fields!(ScanTraversalCounts; max_unread_bytes, caps, causes, retired_unchanged_reread_admitted, retired_reread_budget_refused, retired_codex_roster_refresh_visited, retired_codex_roster_growth_enqueued, discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, retired_parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count, listing_generations, listing_changes_without_hint, listing_owed_requeued, growth_deferred);
 crate::heap_layout_bound::fields!(ScanTraversalPath; scan_root, path, census_member, watcher_hint);
 crate::heap_layout_bound::fields!(ScanTraversalResidue; growth_retries, index_keys, codex_inventory_hold);

@@ -199,6 +199,7 @@ impl Fixture {
                 true,
                 &[],
                 None,
+                false,
             )
             .with_sampled_acquisition(
                 self.cache.clone(),

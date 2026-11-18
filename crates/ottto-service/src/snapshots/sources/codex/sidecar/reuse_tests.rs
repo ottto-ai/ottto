@@ -58,6 +58,7 @@ impl Fixture {
                 cache,
                 &crate::transcript_acquisition::Scope("sidecar-reuse".into()),
             )),
+            false,
         )
     }
 }
