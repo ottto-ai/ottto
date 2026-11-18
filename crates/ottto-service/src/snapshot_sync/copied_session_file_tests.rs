@@ -2209,7 +2209,7 @@ fn unsampled_content_carrier_keeps_accepted_rows_and_removals() {
                 !index
                     .claude_copy_removals
                     .pending(location_key(&c.root.join(file(COPY)).to_string_lossy())),
-                "fresh accepted rows settle ownership without a head route"
+                "fresh accepted rows settle ownership without a sampled head"
             );
         }
     });

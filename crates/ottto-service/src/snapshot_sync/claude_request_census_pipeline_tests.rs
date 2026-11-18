@@ -209,7 +209,7 @@ fn census_pre_hold_bodies_born(
     )
     .expect("preview bounded page");
     let (mut disposition, _, _) =
-        apply_claude_local_evidence_to_scan_for_test(&fixture.support, &mut scan, &mut index);
+        apply_claude_local_evidence_to_scan(&fixture.support, &mut scan, &mut index);
     if let Some(owner) = cycle.proven_owner_session {
         for item in scan
             .snapshots

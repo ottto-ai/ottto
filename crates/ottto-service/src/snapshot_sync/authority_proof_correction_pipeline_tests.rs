@@ -521,7 +521,7 @@ impl ApcFixture {
             .map(|item| item.source_session_id.clone())
             .collect();
         let (mut disposition, _, _) =
-            apply_claude_local_evidence_to_scan_for_test(&self.support, &mut scan, &mut index);
+            apply_claude_local_evidence_to_scan(&self.support, &mut scan, &mut index);
         self.trace_stage(collected_at, "after_evidence", &index);
         self.stamp_owners(&mut scan);
         let deferred_accounts = index.bind_session_accounts_with_mixed(
@@ -727,7 +727,7 @@ impl ApcFixture {
             },
             |progress| {
                 if persist_refusal {
-                    progress.save(&self.progress_path)
+                    progress.save_fixture(&self.progress_path)
                 } else {
                     Ok(())
                 }
@@ -748,7 +748,7 @@ impl ApcFixture {
         index.log_claude_proof_correction_debt();
         if shed {
             progress
-                .save(&self.progress_path)
+                .save_fixture(&self.progress_path)
                 .expect("persist upload progress");
             checkpoint_partial_snapshot_index_with_audit_release(
                 &index,
@@ -1520,6 +1520,7 @@ impl ApcFixture {
 impl Drop for ApcFixture {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.base);
+        crate::snapshots::state_v2::close_removed_routes_for_test();
     }
 }
 
@@ -2056,8 +2057,13 @@ fn apc_checkpoint_last_owed_empty_agent(prior: bool, census_complete: bool) {
     let scratch = crate::test_scratch::ScratchDir::new("apc-a2-checkpoint");
     let index_path = scratch.join("claude-scan-index.json");
     let progress_path = scratch.join("claude-upload-progress.json");
-    let committed = apc_m2_index(1, 1, false, prior);
-    let current = apc_m2_index(1, 1, true, prior);
+    let committed = crate::snapshots::e2_pipeline_scan_fixture::seed_index_for_test(
+        &apc_m2_index(1, 1, false, prior),
+        &index_path,
+    );
+    let mut current = apc_m2_index(1, 1, true, prior);
+    current.retain_persistence_baseline_from(&committed);
+    current.generation = committed.generation;
     let (session, agent, key) = (apc_m2_root(0), apc_m2_agent(0), apc_m2_agent_key(0));
     let advanced = current
         .claude_authority_record_for_test(&session)
@@ -2072,7 +2078,7 @@ fn apc_checkpoint_last_owed_empty_agent(prior: bool, census_complete: bool) {
     );
     let mut progress = test_upload_progress();
     progress
-        .save(&progress_path)
+        .save_fixture(&progress_path)
         .expect("persist upload progress");
     checkpoint_partial_snapshot_index(
         &current,
@@ -2355,11 +2361,16 @@ fn locked_partial_checkpoint_requested_bytes_receipt() {
             let progress_path = scratch.join("claude-upload-progress.json");
             let ((phase_peak, owed_after, agent_revision, expected_revision), stats) =
                 crate::retry_allocation_probe::measure(|| {
-                    let committed = apc_m2_index(roots, owed, false, prior);
-                    let current = apc_m2_index(roots, owed, advance, prior);
+                    let committed = crate::snapshots::e2_pipeline_scan_fixture::seed_index_for_test(
+                        &apc_m2_index(roots, owed, false, prior),
+                        &index_path,
+                    );
+                    let mut current = apc_m2_index(roots, owed, advance, prior);
+                    current.retain_persistence_baseline_from(&committed);
+                    current.generation = committed.generation;
                     let mut progress = test_upload_progress();
                     progress
-                        .save(&progress_path)
+                        .save_fixture(&progress_path)
                         .expect("persist upload progress");
                     crate::retry_allocation_probe::phase_begin();
                     let committable = checkpoint_partial_snapshot_index(

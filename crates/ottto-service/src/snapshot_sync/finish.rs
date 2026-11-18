@@ -384,9 +384,12 @@ pub(crate) fn checkpoint_account_release_for_test(
     paths: (&Path, &Path),
 ) -> Result<ScanIndex> {
     let (holds, mut progress) = classify_account_release_for_test(&mut index, scan);
+    progress.destination_namespace_hash =
+        crate::snapshots::e2_pipeline_scan_fixture::binding_for_test(paths.0).1;
+    let (progress_path, mut progress) = tests::routed_progress(previous, paths.0, progress);
     // Actual no-ACK partial save restores the prior accepted entry before
     // transferring retry custody. Head binding above still had to succeed.
-    progress.save(paths.1)?;
+    progress.save(&progress_path)?;
     checkpoint_partial_snapshot_index_with_audit_release(
         &index,
         previous,
@@ -395,7 +398,7 @@ pub(crate) fn checkpoint_account_release_for_test(
         Some(scan),
         &holds.held_fingerprints,
         paths.0,
-        paths.1,
+        &progress_path,
         || Ok(()),
         None,
         Some(UnsettledUploadCause::UploadError),
@@ -817,7 +820,7 @@ pub(crate) fn checkpoint_page_for_test(
             result? == ResumableUploadResult::Completed,
             "fixture exact ACK"
         );
-        progress.save(progress_path)?;
+        progress.save_fixture(progress_path)?;
         index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
         crate::snapshots::e2_pipeline_scan_fixture::accept_upload_context_acks_for_test(
             &mut index,
@@ -827,7 +830,7 @@ pub(crate) fn checkpoint_page_for_test(
         index.save(index_path)?;
         return Ok(index);
     }
-    progress.save(progress_path)?;
+    progress.save_fixture(progress_path)?;
     checkpoint_partial_snapshot_index_with_audit_release(
         index,
         committed,
@@ -1183,14 +1186,6 @@ pub(super) fn finish_sync_source(
     upload_progress
         .accepted_identity_buckets
         .set_item_cap(identity_item_cap);
-    upload_progress
-        .accepted_identity_buckets
-        .set_account_source_enabled(
-            activity_hint
-                .session_request_account_source_contract
-                .as_deref()
-                == Some(crate::snapshots::ACCOUNT_SOURCE_CONTRACT),
-        );
     let state_v2_baseline = crate::snapshots::state_v2_baseline_release(&index_path, &index);
     // Resets the census-wait count on every exit that is not a capacity stop.
     let mut census_wait = ack_retention::CapacityStopCensusCount::begin(source);

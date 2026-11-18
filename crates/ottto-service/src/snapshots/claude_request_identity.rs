@@ -2744,15 +2744,13 @@ struct CarryCounts {
 }
 crate::heap_layout_bound::fields!(CarryCounts; no_seed, blocked_no_account, keys_over_cap);
 
-/// The carry rule under `session_request_account_source:v1`, within one
-/// transcript in native order: a gap (a request with no
+/// The carry rule, within one transcript in native order: a gap (a request with no
 /// telemetry row) takes the account the latest earlier request's own
 /// telemetry named, marked `carried_forward`; gaps before the first such
 /// request take it, marked `carried_backward`. Only own telemetry seeds, never
 /// a fill (marker, start, bound, retained, root) or a copied request. A row
 /// naming no valid account blocks the carry on both sides.
 struct Carry<'o> {
-    on: bool,
     /// The normal read holds every request of this transcript.
     complete: bool,
     /// An own (non-copy) request was seen: later gaps carry or stay Unknown.
@@ -2763,16 +2761,15 @@ struct Carry<'o> {
     seed: Option<(u64, Arc<AuthorityKey>)>,
     first: Option<Arc<AuthorityKey>>,
     /// Gaps before the first seed; the first `closed` were cut off by a block.
-    /// 8 bytes per request, at most 512 KiB (native 65,536 cap), capability on.
+    /// 8 bytes per request, at most 512 KiB (native 65,536 cap).
     pending: Vec<&'o mut super::ClaudeTranscriptUsageOccurrence>,
     closed: usize,
     counts: CarryCounts,
 }
 
 impl Carry<'_> {
-    fn new(on: bool, complete: bool) -> Self {
+    fn new(complete: bool) -> Self {
         Self {
-            on,
             complete,
             seen_own: false,
             blocked: false,
@@ -2810,7 +2807,7 @@ impl Carry<'_> {
     /// A request whose own telemetry named `own`: always a whole observed
     /// pair (telemetry org, or a login with no org at all), so it seeds.
     fn own(&mut self, sequence: u64, own: &Arc<AuthorityKey>, copy: bool) {
-        if !self.on || copy {
+        if copy {
             return;
         }
         // Backward fill reaches only the first own request's account.
@@ -2838,16 +2835,12 @@ impl Carry<'_> {
         }
     }
 
-    /// The forward carry for a gap, or main's `earlier` with the switch off.
+    /// The forward carry for a gap.
     fn forward(
         &mut self,
-        earlier: &Option<(u64, AccountPartition)>,
         gap: bool,
         keys: &mut Vec<Arc<AuthorityKey>>,
     ) -> Option<(u64, AccountPartition)> {
-        if !self.on {
-            return earlier.clone();
-        }
         let (position, own) = self.seed.as_ref().filter(|_| gap)?;
         // Only keys actually used by gaps consume the shared authority cap.
         Self::marked(
@@ -2862,11 +2855,8 @@ impl Carry<'_> {
     /// Notes a request placed without own evidence; returns whether it
     /// waits for backward fill (a gap before any own request, still Unknown).
     fn placed(&mut self, gap: bool, account: &AccountPartition, requests: u64) -> bool {
-        if !self.on {
-            return false;
-        }
         match account {
-            // Before own evidence a non-gap keeps main's (absent) fill.
+            // Before own evidence a non-gap keeps its (absent) fill.
             Some(_) => false,
             None if !self.seen_own && !gap => false,
             None if !self.seen_own && self.complete => true,
@@ -3161,8 +3151,9 @@ impl RequestAccounts {
 }
 
 /// Own exact telemetry uses the existing request classifier, with the same
-/// standing as an own credential_org. Only missing evidence inherits an
-/// earlier own request, then the start/binding; every such fill is counted.
+/// standing as an own credential_org. Only missing evidence is filled: by a
+/// marker or the `Carry` rule, else (before own evidence) the start/binding;
+/// every such fill is counted.
 /// A family whose strict sidecar read failed this page inherits nothing: its
 /// requests stay Unknown.
 pub(crate) fn reconcile_request_accounts(items: &mut [SnapshotItem], evidence: &ScanEvidence<'_>) {
@@ -3241,21 +3232,18 @@ pub(crate) fn reconcile_request_accounts(items: &mut [SnapshotItem], evidence: &
         // include responses without a usable id. Proven copies no longer
         // count. Check before draining the occurrence map.
         let mut carry = Carry::new(
-            evidence.carries_accounts(),
-            !evidence.carries_accounts()
-                || (item
+            item.claude_usage_occurrences
+                .keys()
+                .eq(item.claude_usage_request_ids.iter())
+                && item
                     .claude_usage_occurrences
-                    .keys()
-                    .eq(item.claude_usage_request_ids.iter())
-                    && item
-                        .claude_usage_occurrences
-                        .values()
-                        .filter(|occurrence| {
-                            !fold.is_skipped(occurrence.sequence) && !occurrence.usage.is_zero()
-                        })
-                        .map(|occurrence| occurrence.usage.request_count)
-                        .try_fold(0_u64, u64::checked_add)
-                        .is_some_and(|requests| requests <= item.request_count)),
+                    .values()
+                    .filter(|occurrence| {
+                        !fold.is_skipped(occurrence.sequence) && !occurrence.usage.is_zero()
+                    })
+                    .map(|occurrence| occurrence.usage.request_count)
+                    .try_fold(0_u64, u64::checked_add)
+                    .is_some_and(|requests| requests <= item.request_count),
         );
         let spanless_first = spanless_first_sequence(item, &fold);
         let mut occurrences = std::mem::take(&mut item.claude_usage_occurrences);
@@ -3267,7 +3255,6 @@ pub(crate) fn reconcile_request_accounts(items: &mut [SnapshotItem], evidence: &
                 !fold.is_skipped(occurrence.sequence) && !occurrence.usage.is_zero()
             })
             .map(|(_, occurrence)| occurrence.sequence);
-        let mut earlier: Option<(u64, AccountPartition)> = None;
         let mut keys: Vec<Arc<AuthorityKey>> = Vec::new();
         // Recompute local clocks at their final accounts. Id-less records do
         // not prove an exact request identity and cannot decide current login.
@@ -3286,10 +3273,9 @@ pub(crate) fn reconcile_request_accounts(items: &mut [SnapshotItem], evidence: &
                 .and_then(|row| *row);
             let identity = request_occurrence_facts(item, request, occurrence, spanless_first)
                 .map(|facts| classify_ref(evidence, &facts));
-            let copy = carry.on && fold.unproven_copy(occurrence);
+            let copy = fold.unproven_copy(occurrence);
             // A gap has no telemetry row and no other stream's owner.
-            let gap = carry.on
-                && !copy
+            let gap = !copy
                 && !evidence.requests.contains_key(&(root, request.as_str()))
                 && !matches!(
                     identity,
@@ -3359,9 +3345,8 @@ pub(crate) fn reconcile_request_accounts(items: &mut [SnapshotItem], evidence: &
             // Present but invalid/no-account telemetry blocks both directions,
             // including the contradictory/refused arm. Reuse valid_login's
             // normalized verdict, never guess from a marker or binding.
-            let blocked = carry.on
-                && (evidence.invalid_logins.contains(&(root, request.as_str()))
-                    || matches!(evidence.requests.get(&(root, request.as_str())), Some(None)));
+            let blocked = evidence.invalid_logins.contains(&(root, request.as_str()))
+                || matches!(evidence.requests.get(&(root, request.as_str())), Some(None));
             if blocked {
                 carry.block(occurrence.usage.request_count);
             }
@@ -3385,13 +3370,12 @@ pub(crate) fn reconcile_request_accounts(items: &mut [SnapshotItem], evidence: &
                     accounts.starting = account.clone();
                     accounts.fallback = account.clone();
                 }
-                earlier = Some((sequence, account.clone()));
                 account
             } else if refused {
                 accounts.conflict = true;
                 accounts.fallback.clone().or_else(|| accounts.bound.clone())
             } else {
-                let carried = carry.forward(&earlier, gap, &mut keys);
+                let carried = carry.forward(gap, &mut keys);
                 let account = match (marker, carried.as_ref()) {
                     _ if carry.blocked => None,
                     (Some(marker), Some((position, account))) if marker.position < *position => {
@@ -3400,7 +3384,7 @@ pub(crate) fn reconcile_request_accounts(items: &mut [SnapshotItem], evidence: &
                     (Some(marker), _) => marker.account.clone(),
                     (_, Some((_, account))) => account.clone(),
                     // After own evidence only a carry or marker places a gap.
-                    _ if carry.on && carry.seen_own => None,
+                    _ if carry.seen_own => None,
                     _ => accounts
                         .starting
                         .clone()
@@ -3919,12 +3903,6 @@ impl<'a> ScanEvidence<'a> {
     pub(crate) fn with_accepted_buckets(mut self, accepted: Option<&'a AcceptedBuckets>) -> Self {
         self.accepted_buckets = accepted;
         self
-    }
-
-    /// This cycle's `session_request_account_source:v1` capability.
-    fn carries_accounts(&self) -> bool {
-        self.accepted_buckets
-            .is_some_and(AcceptedBuckets::account_source_enabled)
     }
 
     pub(crate) fn with_wire_budget(mut self, budget: WireBudget<'a>) -> Self {
@@ -4883,7 +4861,7 @@ fn tag_item(
             return None;
         }
         let mut grouping = request_owned_grouping(item)?;
-        grouping.hold_over_cap = evidence.carries_accounts();
+        grouping.hold_over_cap = true;
         let lifecycle = (
             item.source_started_at.clone(),
             item.source_ended_at.clone(),

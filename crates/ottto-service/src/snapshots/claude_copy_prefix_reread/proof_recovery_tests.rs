@@ -205,11 +205,7 @@ impl ProofChain {
 
     fn enrich(&self, index: &mut ScanIndex, scan: &mut SourceScanResult) {
         let (disposition, _, _) =
-            crate::snapshot_sync::apply_claude_local_evidence_to_scan_for_test(
-                &self.support,
-                scan,
-                index,
-            );
+            crate::snapshot_sync::apply_claude_local_evidence_to_scan(&self.support, scan, index);
         assert!(disposition.quarantined_source_session_ids.is_empty());
         apply_upload_policy(
             SnapshotSource::ClaudeCode,

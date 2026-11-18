@@ -452,7 +452,9 @@ fn a_continuation_page_mirrors_an_open_head_conflict() {
             last_answer_unix: 1,
         },
     );
-    progress.save(&fixture.upload_progress_path).unwrap();
+    progress
+        .save_fixture(&fixture.upload_progress_path)
+        .unwrap();
     let mut minted = fixture.preparation(true);
     let mut inputs = take_continuation_inputs(
         &mut minted,
@@ -636,7 +638,9 @@ fn a_due_quarantine_retry_refuses_the_continuation_prepare() {
             disposition: SnapshotQuarantineDisposition::RetryPending,
         },
     );
-    progress.save(&fixture.upload_progress_path).unwrap();
+    progress
+        .save_fixture(&fixture.upload_progress_path)
+        .unwrap();
     fixture.assert_refused(ContinuationRefusal::UploadClaim);
 }
 

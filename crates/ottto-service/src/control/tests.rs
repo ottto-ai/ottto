@@ -13041,11 +13041,13 @@ fn only_the_companion_repair_press_overrides_a_rebuild_loop_pause() {
     // A second whole-index incident inside 24 hours pauses the source.
     let pause = |source: SnapshotSource| {
         let path = root.join(format!("{}-scan-index.json", source.api_slug()));
-        fs::write(&path, b"{").expect("first damage");
-        let (_, origin) = ScanIndex::load_for_snapshot_source_with_origin(&path, source, &root)
-            .expect("first incident rebuilds");
-        assert_eq!(origin, ScanIndexLoadOrigin::Quarantined);
-        fs::write(&path, &damage).expect("second damage");
+        crate::snapshots::e2_pipeline_scan_fixture::bind_source_for_test(&path, source);
+        crate::snapshots::e2_pipeline_scan_fixture::legacy_input_for_test(&path, b"{");
+        let (_, origin) =
+            crate::snapshots::e2_pipeline_scan_fixture::load_source_for_test(&path, source, &root)
+                .expect("first incident publishes and then adopts fresh native custody");
+        assert_eq!(origin, ScanIndexLoadOrigin::Loaded);
+        crate::snapshots::e2_pipeline_scan_fixture::legacy_input_for_test(&path, &damage);
         path
     };
     let refused = |path: &Path, source: SnapshotSource| {
@@ -13137,10 +13139,13 @@ fn only_the_companion_repair_press_overrides_a_rebuild_loop_pause() {
         again.authority.message.code,
         "scan_index_rebuild_override_cooldown"
     );
-    let (index, origin) =
-        ScanIndex::load_for_snapshot_source_with_origin(&pi, SnapshotSource::Pi, &root)
-            .expect("the armed press passes the guard once");
-    assert_eq!(origin, ScanIndexLoadOrigin::Quarantined);
+    let (index, origin) = crate::snapshots::e2_pipeline_scan_fixture::load_source_for_test(
+        &pi,
+        SnapshotSource::Pi,
+        &root,
+    )
+    .expect("the armed press publishes and the next pass adopts the carried rebuild");
+    assert_eq!(origin, ScanIndexLoadOrigin::Loaded);
     assert!(index.files.is_empty());
     assert!(!crate::snapshots::scan_index_rebuild_paused(
         SnapshotSource::Pi
@@ -13154,7 +13159,7 @@ fn only_the_companion_repair_press_overrides_a_rebuild_loop_pause() {
 
     // A fresh failure inside 24 hours of the override refuses again,
     // and a press inside 24 hours names the cooldown and the retry time.
-    fs::write(&pi, &damage).expect("third damage");
+    crate::snapshots::e2_pipeline_scan_fixture::legacy_input_for_test(&pi, &damage);
     refused(&pi, SnapshotSource::Pi);
     let cooling = repair(
         None,
@@ -13218,6 +13223,7 @@ fn only_the_companion_repair_press_overrides_a_rebuild_loop_pause() {
     assert!(plan.authority.message.text.contains("too damaged"));
     assert!(plan.authority.message.text.contains("retries by itself at"));
     let _ = fs::remove_dir_all(&root);
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 #[test]

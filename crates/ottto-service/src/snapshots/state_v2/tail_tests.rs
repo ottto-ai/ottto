@@ -1177,7 +1177,7 @@ pub(crate) fn seed_tail_literals_for_test(
         ),
     )
     .unwrap();
-    save_locked(&path, &mut index, false, true).unwrap();
+    save_locked(&path, &mut index, false).unwrap();
     let wal = fs::read(sqlite::sidecar(
         &fence::sibling(&path, ".v2.sqlite"),
         "-wal",
@@ -1221,7 +1221,7 @@ pub(crate) fn seed_tail_kinds_for_test(path: &Path, index: &mut ScanIndex, canar
     .unwrap();
     observe_tail(path, FILE, observation(&[canary.as_bytes()])).unwrap();
     set_aside_tail(path, SIBLING, SetAsideCause::Encode).unwrap();
-    save_locked(path, index, false, true).unwrap();
+    save_locked(path, index, false).unwrap();
 }
 /// Rows of each Tail kind in the store behind `index`, every file.
 pub(crate) fn tail_kind_counts_for_test(index: &ScanIndex) -> BTreeMap<&'static str, usize> {

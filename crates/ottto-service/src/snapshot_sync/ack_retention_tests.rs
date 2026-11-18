@@ -14,7 +14,7 @@ struct AckFixture {
 
 impl AckFixture {
     fn new(committed_ack: bool) -> Self {
-        Self::with_progress(committed_ack, false)
+        Self::native(committed_ack)
     }
 
     /// The fixture with its ledger on the graph route's native progress.
@@ -294,7 +294,7 @@ fn every_progress_save_prunes_contexts_without_body_witnesses() {
         assert_eq!(reloaded.accepted_fingerprints, fingerprints);
         assert_eq!(reloaded.accepted_body_witnesses, witnesses);
         assert_eq!(reloaded.accepted_body_contexts, contexts);
-        assert!(f.progress_path.exists());
+        assert!(reloaded.rows.is_some());
     }
 }
 
@@ -2035,22 +2035,14 @@ fn production_ack_retirement_cannot_apply_a_plain_set() {
     assert_eq!(minted_by, BTreeSet::from(["stage_selected_ack_retirement"]));
 }
 
-// Synthetic persisted ACKs only; no live source/provider/account state.
+// Frozen legacy bytes for size/encoder fixtures; native ACKs use routed_progress.
 fn bound_progress(progress_path: &Path, namespace: &str) -> SnapshotUploadProgress {
     let mut progress = SnapshotUploadProgress::new(
         namespace.into(),
         snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
     );
-    progress.save(progress_path).unwrap();
+    progress.save_legacy_fixture(progress_path, None).unwrap();
     progress
-}
-fn load_bound_progress(path: &Path, namespace: &str) -> SnapshotUploadProgress {
-    SnapshotUploadProgress::load(
-        path,
-        namespace,
-        snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
-    )
-    .unwrap()
 }
 /// [money] v2 db first crash retires only the committed exact handoff.
 #[test]
@@ -2100,9 +2092,22 @@ fn v2_db_first_crash_retires_only_the_committed_exact_handoff() {
 fn v2_transport_error_and_failed_index_commit_never_authorize_an_ack() {
     let scratch = crate::test_scratch::ScratchDir::new("v2-ack-err");
     let index_path = scratch.join("index");
-    let path = scratch.join("progress");
     let namespace = "a".repeat(64);
-    let mut progress = bound_progress(&path, &namespace);
+    let mut baseline = ScanIndex::default();
+    let route = crate::snapshots::e2_pipeline_scan_fixture::bind_fixture_route(
+        SnapshotSource::ClaudeCode,
+        &mut baseline,
+        &scratch,
+        &namespace,
+    );
+    baseline.save_fixture(&route).unwrap();
+    let witness = || snapshot_quarantine_witness(SnapshotSource::ClaudeCode);
+    let (path, mut progress) = super::routed_progress(
+        &baseline,
+        &route,
+        SnapshotUploadProgress::new(namespace.clone(), witness()),
+    );
+    progress.save(&path).unwrap();
     let item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
     let mut accepted = 0;
     let result = upload_resumable_batches_with_body_witness(
@@ -2116,7 +2121,7 @@ fn v2_transport_error_and_failed_index_commit_never_authorize_an_ack() {
         |state| state.save(&path),
     );
     assert!(result.is_err());
-    let loaded = load_bound_progress(&path, &namespace);
+    let loaded = super::load_routed_progress(&baseline, &route, &namespace, witness());
     assert!(loaded.accepted_fingerprints.is_empty());
     assert_eq!(accepted, 0);
 
@@ -2187,8 +2192,8 @@ fn first_page_shed_checkpoint_refuses_only_a_concurrent_progress_writer() {
                 .insert(cache_session_key("concurrent"), "c".repeat(64));
             writer.save(&f.progress_path).unwrap();
         }
-        let index_before = std::fs::read(&f.index_path).unwrap();
-        let progress_before = std::fs::read(&f.progress_path).unwrap();
+        let index_before = serde_json::to_value(ScanIndex::load(&f.index_path).unwrap()).unwrap();
+        let progress_before = serde_json::to_value(f.load().1).unwrap();
         let result = checkpoint_partial_snapshot_index_with_audit_release(
             &working,
             &committed,
@@ -2204,11 +2209,14 @@ fn first_page_shed_checkpoint_refuses_only_a_concurrent_progress_writer() {
             None,
             Default::default(),
         );
-        assert_eq!(std::fs::read(&f.progress_path).unwrap(), progress_before);
+        assert_eq!(serde_json::to_value(f.load().1).unwrap(), progress_before);
         if concurrent_writer {
             let error = result.unwrap_err();
             assert!(format!("{error:#}").contains("snapshot progress changed"));
-            assert_eq!(std::fs::read(&f.index_path).unwrap(), index_before);
+            assert_eq!(
+                serde_json::to_value(ScanIndex::load(&f.index_path).unwrap()).unwrap(),
+                index_before
+            );
             continue;
         }
         let saved = result.unwrap();
@@ -2258,7 +2266,7 @@ fn published_v2_partial_checkpoint_reuses_progress_owner_through_atomic_save() {
                 f.namespace.clone(),
                 snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
             );
-            progress.save(&progress_path).unwrap();
+            progress.save_legacy_fixture(&progress_path, None).unwrap();
             let committed = crate::snapshots::publish_state_v2_for_test(
                 &scanned,
                 &index_path,
@@ -2402,7 +2410,7 @@ const PRETTY_PROGRESS_BYTES: [&str; 2] = [
     "07fdf151c88756a84cca98ad56e500c6474b1ea7be5b64d2ee7db34fa2a6e159",
     "c6b59ea619ee3df020bfd475619a4bd4182b3a67c1a9bbba7eb6f8e92422e3c5",
 ];
-/// [money] An ACK save writes stable progress bytes through both
+/// [money] The frozen legacy ACK encoder writes stable progress bytes through both
 /// compare-and-swap decode paths, and the compact progress holds the same
 /// ledger the pretty build wrote: printed pretty again, it is byte-identical.
 #[test]
@@ -2421,7 +2429,7 @@ fn ack_bound_saves_keep_exact_progress_bytes() {
         progress.accepted_cache_states.insert(key.clone(), state);
         progress.accepted_cache_heads.insert(key, "c".repeat(64));
         let limit = (round == 1).then_some(crate::snapshot_retry::RESPONSE_BYTES);
-        progress.save_with_read_limit(&path, limit).unwrap();
+        progress.save_legacy_fixture(&path, limit).unwrap();
         let saved = std::fs::read(&path).unwrap();
         let ledger: SnapshotUploadProgress = serde_json::from_slice(&saved).unwrap();
         pretty.push(sha(&serde_json::to_vec_pretty(&ledger).unwrap()));
@@ -2431,7 +2439,7 @@ fn ack_bound_saves_keep_exact_progress_bytes() {
     assert_eq!(pretty, PRETTY_PROGRESS_BYTES);
 }
 
-/// Memory: allocator peak of one ACK save of a ~5 MiB progress, per
+/// Frozen legacy encoder: allocator peak of a ~5 MiB progress, per
 /// progress byte. Requested bytes with realloc overlap; not resident memory.
 #[test]
 fn ack_bound_save_allocation_peak_per_progress_byte() {
@@ -2448,9 +2456,11 @@ fn ack_bound_save_allocation_peak_per_progress_byte() {
             .accepted_cache_heads
             .insert(format!("{n:064x}"), "c".repeat(64));
     }
-    progress.save(&path).unwrap();
+    progress.save_legacy_fixture(&path, None).unwrap();
     let size = std::fs::metadata(&path).unwrap().len() as usize;
-    let (_, peak) = crate::retry_allocation_probe::measure(|| progress.save(&path).unwrap());
+    let (_, peak) = crate::retry_allocation_probe::measure(|| {
+        progress.save_legacy_fixture(&path, None).unwrap()
+    });
     let requested = peak.requested_peak as f64 / size as f64;
     let overlap = peak.requested_peak_with_overlap as f64 / size as f64;
     eprintln!(
