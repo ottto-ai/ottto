@@ -238,6 +238,11 @@ fn lifecycle(source: SnapshotSource, row: &'static str, gated: bool) -> Lifecycl
         request_listing_all(ListingTrigger::Rescan);
         let cycle = pass(&mut home, &server, &recording, STEP);
         expect(cycle, true, &mut cycles);
+        // A dropped-event overflow walks the same way (FSEvents drop flags
+        // arrive as the Rescan above).
+        request_listing_all(ListingTrigger::Overflow);
+        let cycle = pass(&mut home, &server, &recording, STEP);
+        expect(cycle, true, &mut cycles);
         // An unannounced change waits for the backstop. Codex's state store
         // moved too, which wakes it at once; it then idles to the backstop.
         change(&home);
