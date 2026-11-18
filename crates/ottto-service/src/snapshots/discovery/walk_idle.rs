@@ -308,5 +308,29 @@ pub(crate) fn armed_for_test(source: SnapshotSource) -> Option<(u64, u64)> {
     })
 }
 
+/// As if `seconds` went by since this thread's last pass and armed walk.
+#[cfg(test)]
+pub(crate) fn age_for_test(source: SnapshotSource, seconds: u64) {
+    with_slot(source, |slot| {
+        if let Some(record) = slot.record.as_mut() {
+            record.started_at -= seconds;
+        }
+        if let Some(at) = slot.last_pass_at.as_mut() {
+            *at -= seconds;
+        }
+    });
+}
+
+/// Starts a walk in `index`, as a page that began one would.
+#[cfg(test)]
+pub(crate) fn start_walk_for_test(
+    source: SnapshotSource,
+    roots: &[PathBuf],
+    index: &mut ScanIndex,
+) {
+    ensure_bounded_traversal(source, roots, index, "2026-11-01T10:00:00Z", 183);
+    assert!(!idle_finish(index));
+}
+
 #[cfg(test)]
 mod tests;

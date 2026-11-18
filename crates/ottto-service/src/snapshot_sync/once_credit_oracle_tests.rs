@@ -3276,3 +3276,8 @@ mod money_equivalence_tests {
         emit_money("once_credit_native", receipt_bodies, fixture_inputs);
     }
 }
+
+// The walk gate on this runner: idle passes, wakes, the backstop and hint loss.
+mod walk_gate_oracle_tests {
+    include!("walk_gate_oracle_tests.rs");
+}

@@ -1163,6 +1163,8 @@ pub(super) fn prepare_sync_source_inner(
     {
         crate::snapshots::walk_idle::clear(source);
     }
+    #[cfg(test)]
+    tests::permanent_finish_pipeline_tests::ack_post_save_failure("after_hint_take")?;
     let walk_idle_pass = crate::snapshots::walk_idle::Pass::new(
         source,
         &roots,

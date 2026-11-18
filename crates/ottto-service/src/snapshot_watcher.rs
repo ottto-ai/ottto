@@ -89,6 +89,10 @@ pub struct PendingSnapshotPaths {
 }
 
 fn pending_snapshot_paths() -> &'static Mutex<PendingSnapshotPathsState> {
+    #[cfg(test)]
+    if let Some(scoped) = SCOPED_PENDING.with(std::cell::Cell::get) {
+        return scoped;
+    }
     static PENDING: OnceLock<Mutex<PendingSnapshotPathsState>> = OnceLock::new();
     PENDING.get_or_init(|| Mutex::new(PendingSnapshotPathsState::default()))
 }
@@ -175,6 +179,50 @@ pub(crate) fn cover(watcher: Option<&SnapshotWatcher>) {
 #[cfg(test)]
 pub(crate) fn cover_paths_for_test(paths: Option<Vec<PathBuf>>) {
     with_coverage(|coverage| *coverage.lock().unwrap() = paths);
+}
+
+#[cfg(test)]
+thread_local! {
+    static SCOPED_PENDING: std::cell::Cell<Option<&'static Mutex<PendingSnapshotPathsState>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Runs `run` as under a live watcher of `roots`: this thread gets its own
+/// hint queue (other tests' events never reach it) and covers `roots`.
+#[cfg(test)]
+pub(crate) fn with_simulated_watch<T>(roots: &[PathBuf], run: impl FnOnce() -> T) -> T {
+    type Scoped = Option<&'static Mutex<PendingSnapshotPathsState>>;
+    struct Restore(Scoped);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SCOPED_PENDING.with(|pending| pending.set(self.0));
+            cover_paths_for_test(None);
+        }
+    }
+    let queue: &'static Mutex<PendingSnapshotPathsState> = Box::leak(Box::default());
+    let _restore = Restore(SCOPED_PENDING.with(|pending| pending.replace(Some(queue))));
+    cover_paths_for_test(Some(roots.to_vec()));
+    run()
+}
+
+/// One watcher batch that modified `paths` under `source`'s `roots`.
+#[cfg(test)]
+pub(crate) fn simulate_transcript_events(
+    source: SnapshotSource,
+    roots: &[PathBuf],
+    paths: &[PathBuf],
+) {
+    let event = paths.iter().fold(
+        notify::Event::new(EventKind::Modify(ModifyKind::Any)),
+        |event, path| event.add_path(path.clone()),
+    );
+    let events = [DebouncedEvent::new(event, std::time::Instant::now())];
+    let roots = roots
+        .iter()
+        .map(|root| (source, root.clone()))
+        .collect::<Vec<_>>();
+    let (event_tx, _) = mpsc::sync_channel(1);
+    record_watcher_events(&roots, &events, &event_tx);
 }
 
 /// A live watcher hints every existing root (creating one recreates it).
