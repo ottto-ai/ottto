@@ -1186,14 +1186,6 @@ pub(super) fn finish_sync_source(
     upload_progress
         .accepted_identity_buckets
         .set_item_cap(identity_item_cap);
-    upload_progress
-        .accepted_identity_buckets
-        .set_account_source_enabled(
-            activity_hint
-                .session_request_account_source_contract
-                .as_deref()
-                == Some(crate::snapshots::ACCOUNT_SOURCE_CONTRACT),
-        );
     let state_v2_baseline = crate::snapshots::state_v2_baseline_release(&index_path, &index);
     // Resets the census-wait count on every exit that is not a capacity stop.
     let mut census_wait = ack_retention::CapacityStopCensusCount::begin(source);

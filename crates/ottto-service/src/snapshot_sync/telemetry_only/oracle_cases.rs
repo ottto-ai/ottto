@@ -469,13 +469,7 @@ fn cas_takeover(page: &Page, p: &mut Progress, mode: Mode) -> RouteResult {
                 Some(index_path) => {
                     // The native save released resident hints. A serde copy
                     // cannot stand in for reloading the committed identity rows.
-                    let enabled = p.accepted_identity_buckets.account_source_enabled();
-                    let mut restored =
-                        routed_progress(&ScanIndex::load(&index_path).unwrap(), &index_path);
-                    restored
-                        .accepted_identity_buckets
-                        .set_account_source_enabled(enabled);
-                    restored
+                    routed_progress(&ScanIndex::load(&index_path).unwrap(), &index_path)
                 }
                 None => restore(p),
             };

@@ -257,7 +257,7 @@ impl HistoryFixture {
         .expect("scan Claude page");
         before_evidence(&mut scan);
         let (mut disposition, _, _) =
-            apply_claude_local_evidence_to_scan_for_test(&self.support, &mut scan, &mut index);
+            apply_claude_local_evidence_to_scan(&self.support, &mut scan, &mut index);
         index.veto_claude_history_emission(SnapshotSource::ClaudeCode, &mut scan.snapshots);
         let deferred_accounts = index.bind_session_accounts_with_mixed(
             SnapshotSource::ClaudeCode,

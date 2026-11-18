@@ -1708,12 +1708,12 @@ fn org_hash(org: &str) -> String {
     ottto_core::billing_identity_hash("anthropic", "organization", org).unwrap()
 }
 fn tag_owned(items: Vec<SnapshotItem>, index: &ScanIndex) -> Vec<SnapshotItem> {
-    tag_owned_with_fallbacks(items, index, 0)
+    tag_owned_with_held(items, index, 0)
 }
-fn tag_owned_with_fallbacks(
+fn tag_owned_with_held(
     mut items: Vec<SnapshotItem>,
     index: &ScanIndex,
-    expected_fallbacks: usize,
+    expected_held: usize,
 ) -> Vec<SnapshotItem> {
     decide_page_copies(&mut items, index, None);
     let api = ClaudeLocalOtelLoadReport::default();
@@ -1730,6 +1730,8 @@ fn tag_owned_with_fallbacks(
         .collect();
     let evidence = claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new())
         .with_native_originals(&originals);
+    // Production's side pass lends root starts before reconcile (`side_calls_page`).
+    claude_request_identity::inherit_root_accounts(&mut items, false);
     claude_request_identity::reconcile_request_accounts(&mut items, &evidence);
     let activity = claude_request_identity::stage_request_owned_activity(
         &items,
@@ -1749,9 +1751,10 @@ fn tag_owned_with_fallbacks(
     );
     let outcome = claude_request_identity::apply_scan_page(&mut items, &evidence, BTreeMap::new());
     claude_request_identity::publish_request_owned_activity(&items, activity);
-    assert!(expected_fallbacks <= items.len());
-    assert_eq!(outcome.sent, items.len() - expected_fallbacks);
-    assert_eq!(outcome.fallback, expected_fallbacks);
+    assert!(expected_held <= items.len());
+    assert_eq!(outcome.sent, items.len() - expected_held);
+    assert_eq!(outcome.held.len(), expected_held);
+    assert_eq!(outcome.fallback, 0);
     assert_eq!(outcome.ineligible, 0);
     items
 }
@@ -2566,9 +2569,11 @@ fn e2_identity_conflicting_account_attributes_preserve_complete_own_orgs() {
             item.cost.as_ref().unwrap().total_cost_usd.as_deref(),
             Some("0.0002")
         );
+        // b's own row names a conflicting account: invalid telemetry blocks b,
+        // so its own marker's org is not used and b's share stays untagged.
         assert_eq!(
             org_amounts(&item),
-            BTreeMap::from([(org_hash(ORG_A), (10, 1)), (org_hash(ORG_B), (20, 1)),])
+            BTreeMap::from([(org_hash(ORG_A), (10, 1))])
         );
         assert!(fold(&item).accounts.as_ref().unwrap().conflict);
         assert_evidence_referenced(&item);
@@ -2608,18 +2613,21 @@ fn e2_identity_final_twin_union_over_authority_cap_withholds_unproved_identity()
         assert!(items
             .iter()
             .all(|item| !fold(item).accounts.as_ref().unwrap().conflict));
-        let item = tag_owned_with_fallbacks(items, &index, 1).remove(0);
+        // Over the cap a request-owned item is held, never stripped to a fallback.
+        let item = tag_owned_with_held(items, &index, 1).remove(0);
         let requests = (first + second + 2) as u64;
         assert_eq!(
             (item.request_count, item.input_tokens),
             (requests, requests)
         );
-        // Overflowing proof cannot be replaced by the starting org.
-        // The old uniform-retry expectation would manufacture that identity.
-        assert!(item.request_evidence.is_empty());
-        assert!(rows_of(&item).all(|row| row.identity_parts.is_none()
-            && row.evidence_ref.is_none()
-            && row.account_identifier_hash.is_none()));
+        // Overflowing proof is never replaced by the starting org: the item
+        // is held under the account-limit reason and never uploads.
+        assert_eq!(
+            item.claude_account_withheld_reason,
+            Some(crate::snapshots::CLAUDE_ACCOUNT_WITHHELD_TOO_MANY_ACCOUNTS)
+        );
+        // Grouping already folded the keys past the row limit and refused
+        // that bucket row; the hold keeps that count and strips nothing more.
         assert_eq!(
             item.request_identity_refusals, 1,
             "the bucket row lost proof"
@@ -2891,17 +2899,20 @@ fn e2_identity_unqualified_markerless_twins_use_known_session_start_in_both_orde
                     markerless.source_started_at = Some(at(1));
                 }
                 assert!(crate::snapshots::exact_session_account_hash(&markerless).is_none());
-                let mut items = if reverse {
+                let items = if reverse {
                     vec![markerless, known]
                 } else {
                     vec![known, markerless]
                 };
-                claude_request_identity::inherit_root_accounts(&mut items, false);
-                assert!(items
+                // Probe both inherit passes on a copy: `tag_owned` runs them in
+                // production order (side pass, reconcile, settled finish).
+                let mut probe = items.clone();
+                claude_request_identity::inherit_root_accounts(&mut probe, false);
+                assert!(probe
                     .iter()
                     .all(|item| !fold(item).accounts.as_ref().unwrap().conflict));
-                claude_request_identity::inherit_root_accounts(&mut items, true);
-                assert!(items
+                claude_request_identity::inherit_root_accounts(&mut probe, true);
+                assert!(probe
                     .iter()
                     .all(|item| !fold(item).accounts.as_ref().unwrap().conflict));
                 let item = tag_owned(items, &index).remove(0);

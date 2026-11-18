@@ -521,7 +521,7 @@ impl ApcFixture {
             .map(|item| item.source_session_id.clone())
             .collect();
         let (mut disposition, _, _) =
-            apply_claude_local_evidence_to_scan_for_test(&self.support, &mut scan, &mut index);
+            apply_claude_local_evidence_to_scan(&self.support, &mut scan, &mut index);
         self.trace_stage(collected_at, "after_evidence", &index);
         self.stamp_owners(&mut scan);
         let deferred_accounts = index.bind_session_accounts_with_mixed(
