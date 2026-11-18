@@ -96,21 +96,26 @@ impl ScanIndex {
         // the production constructor's baseline, without admitting later work.
         let prepared = (route.is_some() && index.generation != previous.generation)
             .then(|| ScanIndex::load(&index_path).unwrap());
-        let previous = prepared.as_ref().unwrap_or(previous);
-        let progress_path = snapshot_upload_progress_path(&index_path);
-        if route.is_none() {
-            std::fs::write(&index_path, serde_json::to_vec(previous).unwrap()).unwrap();
+        let seeded = route.is_none().then(|| {
+            crate::snapshots::e2_pipeline_scan_fixture::bind_source_for_test(
+                &index_path,
+                SnapshotSource::Codex,
+            );
+            crate::snapshots::e2_pipeline_scan_fixture::seed_index_for_test(previous, &index_path)
+        });
+        let previous = prepared.as_ref().or(seeded.as_ref()).unwrap_or(previous);
+        if let Some(seed) = &seeded {
+            index.retain_persistence_baseline_from(seed);
+            index.generation = seed.generation;
         }
-        let expected = test_upload_progress();
-        let destination = route
-            .as_ref()
-            .and_then(|path| path.parent()?.file_name()?.to_str())
-            .unwrap_or(&expected.destination_namespace_hash);
+        let progress_path = snapshot_upload_progress_path(&index_path);
+        let (_, destination) =
+            crate::snapshots::e2_pipeline_scan_fixture::binding_for_test(&index_path);
         let mut progress = SnapshotUploadProgress::load_for_index(
             &index,
             &index_path,
             &progress_path,
-            destination,
+            &destination,
             snapshot_quarantine_witness(SnapshotSource::Codex),
         )
         .unwrap();
