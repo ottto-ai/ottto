@@ -586,15 +586,10 @@ fn growth() {
                 &send(&build(&c, &mut retry), &mut retry, Mode::Restart),
             );
         }
-        let path = c.base.join("committed.json");
+        let path = notice_progress_path(&c, &mut p);
         p.save(&path).unwrap();
-        p = Progress::load(
-            &path,
-            &p.destination_namespace_hash,
-            snapshot_quarantine_witness(Claude),
-        )
-        .unwrap();
-        p.accepted_identity_buckets.bind_test_key(Some([0x42; 32]));
+        let index_path = p.rows.as_ref().unwrap().index_path_for_test().to_owned();
+        p = routed_progress(&ScanIndex::load(&index_path).unwrap(), &index_path);
         quiet(&c, &mut p, ScanIndex::default());
         assert!(notice(&c).is_empty());
         grow(&c, &mut p, &cold, first);

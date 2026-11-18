@@ -384,9 +384,12 @@ pub(crate) fn checkpoint_account_release_for_test(
     paths: (&Path, &Path),
 ) -> Result<ScanIndex> {
     let (holds, mut progress) = classify_account_release_for_test(&mut index, scan);
+    progress.destination_namespace_hash =
+        crate::snapshots::e2_pipeline_scan_fixture::binding_for_test(paths.0).1;
+    let (progress_path, mut progress) = tests::routed_progress(previous, paths.0, progress);
     // Actual no-ACK partial save restores the prior accepted entry before
     // transferring retry custody. Head binding above still had to succeed.
-    progress.save(paths.1)?;
+    progress.save(&progress_path)?;
     checkpoint_partial_snapshot_index_with_audit_release(
         &index,
         previous,
@@ -395,7 +398,7 @@ pub(crate) fn checkpoint_account_release_for_test(
         Some(scan),
         &holds.held_fingerprints,
         paths.0,
-        paths.1,
+        &progress_path,
         || Ok(()),
         None,
         Some(UnsettledUploadCause::UploadError),
