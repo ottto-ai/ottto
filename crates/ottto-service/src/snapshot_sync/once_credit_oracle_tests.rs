@@ -1446,6 +1446,8 @@ fn c12_head_unstored_answers_hold_until_growth_earns_its_own_ack() {
     // the scan clock, is not due and suppresses its POST. In production both
     // read one clock. The zero-byte quiet oracle runs past 12 h below, once
     // no timed hold is left.
+    // D's item as `answered` read it (fingerprint `d`), for the message below.
+    let d_answered = serde_json::to_value(item(&answered, 6)).unwrap();
     let assert_untouched = |label: &str, cycle: &Cycle| {
         assert!(cycle.finish.is_ok(), "{:?}", cycle.finish);
         assert!(cycle.batches.is_empty());
@@ -1462,7 +1464,24 @@ fn c12_head_unstored_answers_hold_until_growth_earns_its_own_ack() {
                         "other"
                     };
                     let id = (&item.source_session_id, &item.snapshot_fingerprint);
-                    (role, id, item.input_tokens)
+                    // For D's session: each field that differs from `answered`.
+                    let mut changed = Vec::new();
+                    if item.source_session_id == d_session {
+                        let now = serde_json::to_value(item).unwrap();
+                        let keys = now
+                            .as_object()
+                            .unwrap()
+                            .keys()
+                            .chain(d_answered.as_object().unwrap().keys())
+                            .collect::<BTreeSet<_>>();
+                        for key in keys {
+                            let (was, is) = (&d_answered[key.as_str()], &now[key.as_str()]);
+                            if was != is {
+                                changed.push(format!("{key}: {was} -> {is}"));
+                            }
+                        }
+                    }
+                    (role, id, item.input_tokens, changed)
                 })
                 .collect::<Vec<_>>();
             assert!(
