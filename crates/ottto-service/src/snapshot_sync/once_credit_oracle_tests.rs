@@ -1094,62 +1094,47 @@ fn c05_fresh_destination_requires_its_own_exact_ack() {
     assert_eq!(item.snapshot_fingerprint, fingerprint);
     assert!(!unstored.accepted_body(item));
     let held = &unstored.index.quarantined_snapshot_fingerprints[&fingerprint];
+    // `usage_identical`: this destination's head already holds the usage, so
+    // even a context candidate's exact body is held terminally at once.
     assert_eq!(
         held.disposition,
-        SnapshotQuarantineDisposition::RetryPending
+        SnapshotQuarantineDisposition::UnprovenTerminal
     );
-    let retry_at = held.retry_after_unix_seconds;
-    assert!(retry_at > home.now);
+    assert_eq!(held.retry_after_unix_seconds, 0);
     assert_eq!(
         held.upload_body_witness.as_deref(),
         Some(snapshot_upload_body_witness(item).as_str())
     );
+    let placement = server.placement.lock().unwrap().clone();
+    assert_eq!(placement.len(), 1);
     *server.fallback.lock().unwrap() = Answer::Accept;
     home.restart();
     let quiet = home.cycle(&server, &recording);
     assert!(quiet.finish.is_ok(), "{:?}", quiet.finish);
     assert!(
         quiet.batches.is_empty(),
-        "an unstored context candidate remains held before its retry deadline"
+        "the held body is not offered again"
     );
-    assert!(!quiet
-        .progress
-        .accepted_body_witnesses
-        .contains_key(&fingerprint));
-    assert!(!quiet
-        .index
-        .accepted_snapshot_fingerprint_recorded(&fingerprint));
     assert_eq!(
         quiet.index.quarantined_snapshot_fingerprints[&fingerprint], *held,
-        "restart preserves the exact unACKed body and its retry deadline"
+        "restart preserves the exact held body"
     );
-    // Context receipt candidates keep timed retry custody after Unstored.
-    // Retry the unchanged body only after its saved deadline, then require
-    // this destination's exact ACK before granting any stored-body credit.
-    home.now = retry_at + 1;
-    let replay = home.cycle(&server, &recording);
-    assert!(replay.finish.is_ok(), "{:?}", replay.finish);
-    assert_eq!(replay.batches.len(), 1);
-    assert_eq!(replay.acknowledged.len(), 1);
-    assert_eq!(replay.acknowledged[0].len(), 1);
-    assert_eq!(replay.finalized.len(), 1);
-    assert_eq!(replay.finalized[0].snapshot_fingerprint, fingerprint);
-    assert_eq!(
-        snapshot_upload_body_witness(&replay.finalized[0]),
-        snapshot_upload_body_witness(item)
-    );
-    assert_eq!(replay.finalized[0].input_tokens, 30);
-    assert_durable(&replay);
-    let placement = server.placement.lock().unwrap().clone();
-    assert_eq!(placement.len(), 1);
-    home.restart();
-    let settled = home.cycle(&server, &recording);
-    assert!(settled.finish.is_ok(), "{:?}", settled.finish);
-    assert!(
-        settled.batches.is_empty(),
-        "the exact ACK suppresses replay"
-    );
-    assert!(settled.acknowledged.is_empty());
+    // Past the 6 h and 12 h retries a context candidate used to get, the
+    // body is still not offered, and no stored-body credit exists without
+    // this destination's own exact ACK.
+    home.now += 2 * crate::snapshots::SNAPSHOT_QUARANTINE_RETRY_SECONDS + 1;
+    let later = home.cycle(&server, &recording);
+    assert!(later.finish.is_ok(), "{:?}", later.finish);
+    assert!(later.batches.is_empty());
+    for cycle in [&quiet, &later] {
+        assert!(!cycle
+            .progress
+            .accepted_body_witnesses
+            .contains_key(&fingerprint));
+        assert!(!cycle
+            .index
+            .accepted_snapshot_fingerprint_recorded(&fingerprint));
+    }
     assert_eq!(*server.placement.lock().unwrap(), placement);
     let growth = json!({"type":"assistant","sessionId":IDENTITY_PIPELINE_ROOT,
         "requestId":"fresh-destination-growth","timestamp":"2026-11-01T07:03:00Z",
