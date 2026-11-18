@@ -1324,55 +1324,105 @@ fn real_uploader_new_usage_precedes_pending_context_catchup() {
         .iter()
         .all(|post| serde_json::to_vec(post).unwrap().len() <= 2 * 1024 * 1024));
 }
+/// [regress] [money] A context re-offer the server answers `unchanged`
+/// without storing it is one POST. `usage_identical` holds the exact body
+/// terminally; `dominated_by_head` keeps its 6 h retry. Neither mints a
+/// receipt, stamp or accepted mark, and later passes lease, read and POST
+/// nothing. Growth is a new body: it equals a cold Full, is POSTed and earns
+/// the receipt. The answered POST is byte-equal under both answers.
 #[test]
-fn real_uploader_not_stored_backs_off_but_growth_earns_receipt() {
-    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
-    f.adopt();
-    f.index
-        .activate_file_upload_context(f.source, "e".repeat(64));
-    f.drop_entity_stamps();
-    f.rearm_for_read();
-    let previous = f.index.clone();
-    let (_, items) = f.pending();
-    f.uploader.activate(f.source, "e".repeat(64), &mut f.index);
-    f.uploader.not_stored = true;
-    assert_eq!(
-        f.uploader
-            .send(f.source, &mut f.index, &previous, &items)
-            .unwrap()
-            .0,
-        0
-    );
-    assert_eq!(f.uploader.fresh_count(), 0);
-    assert_eq!(f.uploader.not_stored_files(), 1);
-    assert_ne!(
-        f.entry()
-            .upload_context_receipt
-            .as_ref()
-            .unwrap()
-            .context_fingerprint,
-        "e".repeat(64)
-    );
-    let posts = f.uploader.posts.len();
-    for _ in 0..3 {
-        let (scan, bytes) = f.walk(true);
-        assert_eq!((scan.scanned_file_count, bytes), (0, 0));
-        assert_eq!(f.uploader.posts.len(), posts);
+fn real_uploader_unstored_answer_holds_by_basis_and_growth_earns_receipt() {
+    let mut answered = Vec::new();
+    for (basis, terminal) in [("usage_identical", true), ("dominated_by_head", false)] {
+        let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+        f.adopt();
+        let context = "e".repeat(64);
+        f.index
+            .activate_file_upload_context(f.source, context.clone());
+        f.drop_entity_stamps();
+        f.rearm_for_read();
+        let previous = f.index.clone();
+        let (_, items) = f.pending();
+        f.uploader.activate(f.source, context.clone(), &mut f.index);
+        f.uploader.not_stored = Some(basis);
+        let posts = f.uploader.posts.len();
+        assert_eq!(
+            f.uploader
+                .send(f.source, &mut f.index, &previous, &items)
+                .unwrap()
+                .0,
+            0
+        );
+        assert_eq!(f.uploader.posts.len(), posts + 1, "{basis}: one POST");
+        answered.push(f.uploader.posts[posts].clone());
+        assert_eq!(f.uploader.fresh_count(), 0);
+        assert_eq!(f.uploader.not_stored_files(), 1);
+        assert_ne!(
+            f.entry()
+                .upload_context_receipt
+                .as_ref()
+                .unwrap()
+                .context_fingerprint,
+            context
+        );
+        assert!(f.index.upload_context_proof.entity_stamps.is_empty());
+        for item in &items {
+            let entity = &item.snapshot_fingerprint;
+            assert!(!f.index.accepted_snapshot_fingerprint_recorded(entity));
+            let hold = &f.index.quarantined_snapshot_fingerprints[entity];
+            assert_eq!(
+                hold.upload_body_witness,
+                Some(snapshot_upload_body_witness(item))
+            );
+            assert_eq!(
+                hold.disposition == SnapshotQuarantineDisposition::UnprovenTerminal,
+                terminal,
+                "{basis}"
+            );
+            assert_eq!(hold.retry_after_unix_seconds == 0, terminal, "{basis}");
+        }
+        // A terminal hold's deadline is 0, so every later pass is past its
+        // 6 h and 12 h retries; none leases, reads or POSTs it.
+        for _ in 0..3 {
+            f.uploader
+                .prepare_for_scan(f.source, context.clone(), &mut f.index);
+            f.assert_no_read_or_post();
+        }
+        assert_eq!(f.uploader.posts.len(), posts + 1);
+        let mut body = fs::read_to_string(&f.path).unwrap();
+        body.push_str(&format!("{}\n",json!({"type":"assistant","sessionId":SESSION,"timestamp":"2026-10-29T10:02:01Z","requestId":"grown-request","message":{"id":"grown-message","model":"claude-sonnet-4-6","usage":{"input_tokens":30,"output_tokens":10}}})));
+        fs::write(&f.path, &body).unwrap();
+        f.uploader.not_stored = None;
+        let previous = f.index.clone();
+        let (scan, _) = f.walk(true);
+        assert_eq!(scan.scanned_file_count, 1, "growth reads once");
+        let mut cold = Fixture::new(f.source);
+        fs::write(&cold.path, &body).unwrap();
+        cold.index
+            .activate_file_upload_context(cold.source, context.clone());
+        let (cold_scan, _) = cold.walk(true);
+        sampled_scan::transition_fixture::money_oracle::assert_equivalent(
+            &sampled_scan::transition_fixture::scan_money(f.source, &cold.index, &cold_scan),
+            &sampled_scan::transition_fixture::scan_money(f.source, &f.index, &scan),
+        );
+        f.uploader.activate(f.source, context.clone(), &mut f.index);
+        let (files, _) = f
+            .uploader
+            .send(f.source, &mut f.index, &previous, &scan.snapshots)
+            .unwrap();
+        assert_eq!(files, 1, "{basis}: growth earns the receipt");
+        assert_eq!(f.uploader.posts.len(), posts + 2);
+        assert_eq!(
+            f.entry()
+                .upload_context_receipt
+                .as_ref()
+                .unwrap()
+                .context_fingerprint,
+            context
+        );
+        f.assert_quiet();
     }
-    let mut body = fs::read_to_string(&f.path).unwrap();
-    body.push_str(&format!("{}\n",json!({"type":"assistant","sessionId":SESSION,"timestamp":"2026-10-29T10:02:01Z","requestId":"grown-request","message":{"id":"grown-message","model":"claude-sonnet-4-6","usage":{"input_tokens":30,"output_tokens":10}}})));
-    fs::write(&f.path, body).unwrap();
-    f.uploader.not_stored = false;
-    assert_eq!(f.adopt().files, 1);
-    assert_eq!(f.uploader.posts.len(), posts + 1);
-    assert_eq!(
-        f.entry()
-            .upload_context_receipt
-            .as_ref()
-            .unwrap()
-            .context_fingerprint,
-        "e".repeat(64)
-    );
+    assert_eq!(answered[0], answered[1], "the answer never changes a body");
 }
 #[test]
 fn real_uploader_duplicate_refusal_mints_nothing_and_does_not_loop() {
