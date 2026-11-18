@@ -1446,11 +1446,30 @@ fn c12_head_unstored_answers_hold_until_growth_earns_its_own_ack() {
     // the scan clock, is not due and suppresses its POST. In production both
     // read one clock. The zero-byte quiet oracle runs past 12 h below, once
     // no timed hold is left.
-    let assert_untouched = |cycle: &Cycle| {
+    let assert_untouched = |label: &str, cycle: &Cycle| {
         assert!(cycle.finish.is_ok(), "{:?}", cycle.finish);
         assert!(cycle.batches.is_empty());
-        for items in [&cycle.before, &cycle.finalized] {
-            assert!(items.iter().all(|item| item.snapshot_fingerprint == d));
+        for (list, items) in [("before", &cycle.before), ("finalized", &cycle.finalized)] {
+            // Exactly the predicate `item == D`; the message names any other
+            // item (E or an unexpected one) and this cycle's read modes.
+            let others = items
+                .iter()
+                .filter(|item| item.snapshot_fingerprint != d)
+                .map(|item| {
+                    let role = if item.snapshot_fingerprint == e {
+                        "E"
+                    } else {
+                        "other"
+                    };
+                    let id = (&item.source_session_id, &item.snapshot_fingerprint);
+                    (role, id, item.input_tokens)
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                others.is_empty(),
+                "{label} {list}: {others:?}; read modes {}",
+                cycle.steps.last().unwrap()["before"]
+            );
         }
         assert_terminal(cycle, &e, &main_body);
         assert_eq!(
@@ -1460,12 +1479,12 @@ fn c12_head_unstored_answers_hold_until_growth_earns_its_own_ack() {
     };
     home.restart();
     let quiet = home.cycle(&server, &recording);
-    assert_untouched(&quiet);
+    assert_untouched("quiet", &quiet);
 
     // A durable restore (cold close, reload) keeps both holds exactly.
     home.cold_restart();
     let restored = home.cycle(&server, &recording);
-    assert_untouched(&restored);
+    assert_untouched("restored", &restored);
     assert_eq!(*server.placement.lock().unwrap(), placed);
 
     // Past 6 h the dominated hold is due, and its head is gone: the same
