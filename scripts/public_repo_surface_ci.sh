@@ -296,6 +296,7 @@ run_step P "check root manifest is derived from the commit tree" \
 run_step P "scan committed public tree" bash scripts/public_repo_secret_scan.sh
 run_step P "verify root public contracts" bash scripts/public_repo_contract_check.sh
 run_step P "test public secret scan" bash scripts/test_public_repo_secret_scan.sh
+run_step P "test public commit guards" bash scripts/test_public_repo_commit_guards.sh
 run_step B "test public temp cleanup" bash scripts/test_public_repo_temp_cleanup.sh
 run_step P "test public contract check" bash scripts/test_public_repo_contract_check.sh
 run_step B "test macOS release gate" bash scripts/test_macos_release_gate.sh
