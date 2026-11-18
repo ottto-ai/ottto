@@ -28,6 +28,17 @@ file-system hint / periodic listing → select file → read new bytes from save
   witness belongs to the next ordinary census, under its existing admission gates.
   Candidate discovery retains its earlier immediate-live-parent shortcut, which does
   not provide the secure proof's ancestor or recreation guarantees.
+- **Settled sources skip repeated walks** (`snapshots/discovery/walk_idle.rs`). A walk that
+  completed its census cleanly, with nothing owed to the index, the upload or telemetry, arms one
+  in-memory record per source, bound to the inputs the walk read and the store generation its
+  finish left. Until `WALK_GAP` (the listing interval, three hours) after that walk's listing
+  began, a pass with no watcher hint or listing request, unchanged inputs, a live watcher covering
+  every existing root, and a pass gap of at most one hour returns an empty, census-incomplete page:
+  it reads, uploads and saves nothing, and reports a healthy source with the manifest withdrawn.
+  Anything else walks as before: any failure, an account switch, a restart or another writer's
+  save. A due sampled audit waits for the next walk, at the latest the backstop. A pass that took
+  a hint clears the record before any fallible step, so a failed pass is followed by a walk. An
+  idle pass never emits a body.
 - **Selection.** Each pass picks files and a read mode (`transcript_acquisition.rs`). Tail, a read
   from the saved offset, is the normal mode, so bytes read track bytes appended. A Full read has a
   named cause (new or replaced file, missing or invalid saved result, a real edit) and is counted

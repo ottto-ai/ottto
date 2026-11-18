@@ -1610,6 +1610,16 @@ files are all skipped waits the ordinary cadence. These observations add no
 timer or trigger.
 No full fingerprint, path or key is emitted, and none of these fields enters uploads.
 
+## Idle passes of a settled source
+
+A pass the walk gate held logs `walk_idle=true` at the end of its
+`snapshot terminal_census` line, with `census_complete=false` and no scanned
+files. Its status report is a Success with no census loss, no census or parse
+error code, and the source manifest withdrawn; nothing was read, uploaded or
+saved. A hint, a listing request, a changed input, a failure, an account switch
+or a restart makes the next pass walk, and a settled source still walks at
+least once every listing interval (three hours).
+
 ## Prior Held Family Observation
 
 A `bounded_traversal_transition` row with `event: starting` includes
