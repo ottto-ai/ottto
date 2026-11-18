@@ -374,7 +374,13 @@ fn hint_then_failure(source: SnapshotSource, row: &'static str, stage: &'static 
         if stage == "after_hint_take" {
             assert!(prepare_once(&mut home).is_err());
         } else {
-            assert!(home.cycle(&server, &recording).finish.is_err());
+            let failed = home.cycle(&server, &recording);
+            assert!(failed.finish.is_err());
+            if stage == "selected_save" {
+                // The index save precedes this failure point: a crash before
+                // it is modeled by the committed state before the pass.
+                home.restore_pre_cycle_index(&failed);
+            }
         }
         drop(failure);
         assert_eq!(walk_idle::armed_for_test(source), None);

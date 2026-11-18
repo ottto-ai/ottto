@@ -148,7 +148,11 @@ fn clock_moved_back_or_past_the_backstop_walks() {
     let fixture = Fixture::new(SnapshotSource::Pi);
     let index = ScanIndex::default();
     fixture.walk(&index, START);
+    // The scan clock is the wall clock, not monotonic: a step back (or a
+    // restored clock) before the walk's start is due, and drops the record.
     assert!(!fixture.gate(&index, START - 1), "a backward clock walks");
+    assert_eq!(armed_for_test(SnapshotSource::Pi), None);
+    assert!(!fixture.gate(&index, START + 60), "and stays due");
     fixture.walk(&index, START);
     assert!(
         !fixture.gate(&index, START + WALK_GAP + 1),
