@@ -171,9 +171,11 @@ fn lost_holder_correction_keeps_the_head_clock_through_ack_and_restart() {
             &mut p.scan,
             &p.disposition,
         );
-        let progress_path = c.base.join("progress.json");
+        // The checkpoint commits to the page's own fixture route.
+        let index_path = crate::snapshots::e2_pipeline_scan_fixture::route_of(&p.index).unwrap();
+        let progress_path = snapshot_upload_progress_path(&index_path);
+        progress = route_fixture_progress(&p.index, &index_path, &progress_path, progress);
         progress.save(&progress_path).unwrap();
-        let index_path = c.base.join("scan-index.json");
         checkpoint_partial_snapshot_index_with_audit_release(
             &p.index,
             &prior,
@@ -191,7 +193,9 @@ fn lost_holder_correction_keeps_the_head_clock_through_ack_and_restart() {
         )
         .unwrap();
         let restarted = ScanIndex::load(&index_path).unwrap();
-        let mut progress = SnapshotUploadProgress::load(
+        let mut progress = SnapshotUploadProgress::load_for_index(
+            &restarted,
+            &index_path,
             &progress_path,
             &format!("{:064x}", 99),
             snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
