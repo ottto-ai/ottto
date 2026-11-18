@@ -1246,6 +1246,38 @@ fn posted(cycle: &Cycle) -> Vec<String> {
     posted
 }
 
+/// The one POST item of `fingerprint` in `cycle`'s batches.
+fn posted_item(cycle: &Cycle, fingerprint: &str) -> Value {
+    let mut items = cycle.batches.iter().flat_map(|batch| {
+        let wire: Value = serde_json::from_slice(batch).unwrap();
+        wire["snapshots"].as_array().unwrap().clone()
+    });
+    let item = items
+        .find(|item| item["snapshot_fingerprint"] == fingerprint)
+        .expect("posted item");
+    assert!(
+        !items.any(|item| item["snapshot_fingerprint"] == fingerprint),
+        "posted once"
+    );
+    item
+}
+
+/// A POST item's money and identity fields: the money oracle's fields plus
+/// the entity, its fingerprint and its request and account evidence.
+fn money_and_identity(item: &Value) -> Value {
+    transition::money_oracle::FIELDS
+        .iter()
+        .chain(&[
+            "source_session_id",
+            "snapshot_fingerprint",
+            "request_evidence",
+            "session_account_evidence",
+        ])
+        .map(|field| (field.to_string(), item[*field].clone()))
+        .collect::<serde_json::Map<_, _>>()
+        .into()
+}
+
 /// `route`'s rows for one session: its emitted body, and its POST items
 /// without the envelope (whose client report discloses each home's own
 /// history).
@@ -1438,47 +1470,22 @@ fn c12_head_unstored_answers_hold_until_growth_earns_its_own_ack() {
     assert!(!answered.progress.accepted_body_witnesses.contains_key(&e));
     assert!(!answered.progress.accepted_body_witnesses.contains_key(&d));
 
-    // An unchanged restart never reads, finalizes or offers the
-    // usage_identical body, and offers nothing at all. This fixture writes
-    // hold deadlines on its scan clock (`NOW`), while the index selects due
-    // retries by the wall clock (reoffer_quarantine.rs), which is later. So
-    // the dominated hold's file may be re-read here; the ledger's lease, on
-    // the scan clock, is not due and suppresses its POST. In production both
-    // read one clock. The zero-byte quiet oracle runs past 12 h below, once
-    // no timed hold is left.
-    // KNOWN (pre-existing on main, separate RF1 finding "retry re-read emits an
-    // unfolded Claude body"): a due RetryPending retry re-reads D's unchanged file
-    // through ReadMode::Unchanged and builds a body without the request-money fold
-    // (no usage_accounting_contract, request_evidence or usage_buckets), so its
-    // fingerprint differs from `d`. It is not posted here only because the
-    // fixture's lease runs on the scan clock. Match D by session until that
-    // finding is fixed.
-    let assert_untouched = |label: &str, cycle: &Cycle| {
+    // D's POST item in `answered`: the finished body the due retry must repeat.
+    let answered_d = posted_item(&answered, &d);
+    // (Full, Tail, Unchanged) files this cycle read.
+    let modes = |cycle: &Cycle| {
+        let last = &cycle.steps.last().unwrap()["before"];
+        ["full_files", "tail_files", "unchanged_files"].map(|key| last[key].as_u64().unwrap_or(0))
+    };
+    // Before D's deadline (both the index timer and the ledger read the scan
+    // clock), a restart or a durable restore reads no file, finalizes nothing,
+    // offers nothing, and keeps both holds exactly. `before` items are pre-fold
+    // by design; compare finished bodies.
+    let assert_untouched = |cycle: &Cycle| {
         assert!(cycle.finish.is_ok(), "{:?}", cycle.finish);
+        assert_eq!(modes(cycle), [0, 0, 0], "a held file was read");
+        assert!(cycle.finalized.is_empty());
         assert!(cycle.batches.is_empty());
-        for (list, items) in [("before", &cycle.before), ("finalized", &cycle.finalized)] {
-            // Only D's session may appear; E never, by fingerprint or session.
-            let others = items
-                .iter()
-                .filter(|item| {
-                    item.source_session_id != d_session
-                        || item.source_session_id == e_session
-                        || item.snapshot_fingerprint == e
-                })
-                .map(|item| {
-                    let is_e =
-                        item.snapshot_fingerprint == e || item.source_session_id == e_session;
-                    let role = if is_e { "E" } else { "other" };
-                    let id = (&item.source_session_id, &item.snapshot_fingerprint);
-                    (role, id, item.input_tokens)
-                })
-                .collect::<Vec<_>>();
-            assert!(
-                others.is_empty(),
-                "{label} {list}: {others:?}; read modes {}",
-                cycle.steps.last().unwrap()["before"]
-            );
-        }
         assert_terminal(cycle, &e, &main_body);
         assert_eq!(
             cycle.index.quarantined_snapshot_fingerprints[&d],
@@ -1487,40 +1494,56 @@ fn c12_head_unstored_answers_hold_until_growth_earns_its_own_ack() {
     };
     home.restart();
     let quiet = home.cycle(&server, &recording);
-    assert_untouched("quiet", &quiet);
+    assert_untouched(&quiet);
+    let mut quiet_route = emitted_route(&quiet, claude, &server);
+    quiet_route.mode = transition::Mode::Restart;
+    transition::money_oracle::assert_quiet_restart_with_anchor_window(
+        &quiet_route,
+        quiet.quiet_anchor_window,
+    );
+    transition::money_oracle::assert_no_smaller_reemit(
+        &e_session,
+        &prior,
+        &quiet_route,
+        &cold_main,
+        true,
+    );
 
     // A durable restore (cold close, reload) keeps both holds exactly.
     home.cold_restart();
     let restored = home.cycle(&server, &recording);
-    assert_untouched("restored", &restored);
+    assert_untouched(&restored);
     assert_eq!(*server.placement.lock().unwrap(), placed);
+    // No file owes an audit, so only D's hold can select a read below, and a
+    // Full read cannot stand in for the due retry.
+    assert_eq!(
+        restored.steps.last().unwrap()["before"]["audit_marker_count"],
+        0
+    );
 
-    // Past 6 h the dominated hold is due, and its head is gone: the same
-    // body earns its own exact ACK. The usage_identical body is not leased,
-    // read or offered.
+    // Past 6 h on both clocks the dominated hold is due, and its head is gone:
+    // the retry re-reads D's unchanged file without a Full read and POSTs the
+    // same finished body, which earns its own exact ACK. The usage_identical
+    // body is not read, leased or offered.
     server.placement.lock().unwrap().remove(&d_session);
     home.now = (home.now + SIX_HOURS + 1).max(other_hold.retry_after_unix_seconds + 1);
     let due = home.cycle(&server, &recording);
     assert!(due.finish.is_ok(), "{:?}", due.finish);
-    // What production must do: the due retry POSTs exactly the held body `d`
-    // (see KNOWN above; an unfolded re-read fails here, by design).
+    let [full, tail, unchanged] = modes(&due);
     assert_eq!(
-        posted(&due),
-        vec![d.clone()],
-        "finalized (fingerprint, usage_accounting_contract, usage_buckets): {:?}",
-        due.finalized
-            .iter()
-            .map(|item| (
-                &item.snapshot_fingerprint,
-                &item.usage_accounting_contract,
-                item.usage_buckets.len()
-            ))
-            .collect::<Vec<_>>()
+        (full, tail + unchanged),
+        (0, 1),
+        "one non-Full read of D's file"
     );
+    assert_eq!(posted(&due), vec![d.clone()]);
     assert_eq!(due.finalized.len(), 1);
     assert_eq!(
         Some(snapshot_upload_body_witness(&due.finalized[0])),
         other_hold.upload_body_witness
+    );
+    assert_eq!(
+        money_and_identity(&posted_item(&due, &d)),
+        money_and_identity(&answered_d)
     );
     assert_durable(&due);
     assert!(!due.progress.active_quarantine_retries.contains(&e));
