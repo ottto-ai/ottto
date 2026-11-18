@@ -1,5 +1,5 @@
 //! S2 c7 on real committed Tail state: a shorter file reads main's counted
-//! Full (D158), a key rotation is a counted explicit-action reconstruction
+//! Full, a key rotation is a counted explicit-action reconstruction
 //! while an attribution toggle scrubs and reuses, the legacy record directory
 //! is erased and counted before the first load, the first format round-trips
 //! the lineage clocks and the rule epoch, and the shared hour pages carry usage
@@ -15,7 +15,7 @@ use crate::snapshots::tail_source::{counters, hour_pages, read_hour_page};
 use crate::transcript_acquisition::ReadMode;
 use serde_json::Value;
 
-/// [behaviour] D158: a file shorter than its committed head reads main's
+/// [behaviour] A file shorter than its committed head reads main's
 /// counted Full, `Shrunk`, with no hold.
 #[test]
 fn a_shorter_file_reads_full_and_is_counted() {
@@ -62,7 +62,7 @@ fn keyed_lines(responses: usize) -> Vec<String> {
     lines
 }
 
-/// [behaviour] D168-2: session attribution toggled off, then on, is a
+/// [behaviour] Session attribution toggled off, then on, is a
 /// settings change applied forward only, never a reconstruction: each load
 /// reuses the head with its context digest scrubbed, as main scrubs a
 /// retained parse's, and the continued body equals a cold read's under the

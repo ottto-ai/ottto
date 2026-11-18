@@ -572,7 +572,7 @@ fn continuable() -> SnapshotAccumulator {
     stored
 }
 
-/// [money] The lineage (D131): a head continues only the session its owning
+/// [money] The lineage: a head continues only the session its owning
 /// header named. Another id, or none stored, is a counted `Identity`
 /// reconstruction; a header this read cannot read waits.
 #[test]

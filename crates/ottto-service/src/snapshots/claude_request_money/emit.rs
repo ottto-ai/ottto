@@ -69,8 +69,6 @@ pub(super) fn grain_row(
         evidence_ref: None,
         identity_parts: None,
         copy_unproven,
-        identity_retained: false,
-        copy_invalidated: false,
         cost_usd: grain.cost().map(dollars),
         input_cost_usd: None,
         output_cost_usd: None,

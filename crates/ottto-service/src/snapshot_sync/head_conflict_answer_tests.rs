@@ -67,7 +67,6 @@ pub(super) fn reference(item: &SnapshotItem) -> SnapshotEntityRef {
         head_etag: None,
         head_challenge: None,
         unchanged_basis: None,
-        retained_proof_missing: Vec::new(),
         cache_observations_state: None,
     }
 }
@@ -1173,9 +1172,6 @@ fn released_0205_rewrite_preserves_money_ledgers_and_drops_only_recovery_metadat
             "model":"claude-synthetic","evidence_ref":0,"account_identifier_hash":"a".repeat(64),
             "input_tokens":10,"cost_usd":"1.00"}]}]});
     progress.accepted_identity_buckets.record(&identity);
-    progress
-        .accepted_identity_buckets
-        .record_proved(&identity, true, &[]);
     assert!(!progress.accepted_identity_buckets.is_empty());
     let bytes = serde_json::to_vec(&progress).unwrap();
     let old: head_conflict_released_progress_fixture::SnapshotUploadProgress =
@@ -1273,7 +1269,7 @@ fn assert_rescan_claim(wire: &Value, answered: bool) {
     }
 }
 
-/// [money] D142(a) on the POSTed envelope: only the upload of a session that
+/// [money] On the POSTed envelope: only the upload of a session that
 /// owes an answer carries the rescan claim, and that session is mirrored
 /// into the scan index, so the body was read by a native Full. Before the
 /// conflict and after the answer the session is not mirrored, so its files

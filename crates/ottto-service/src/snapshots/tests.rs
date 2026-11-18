@@ -11355,7 +11355,6 @@ fn paired_creator_cache_wire_corpus_matches_exact_ack() {
                         head_etag: item.cache_observations.as_ref().map(|_| "a".repeat(64)),
                         head_challenge: None,
                         unchanged_basis: None,
-                        retained_proof_missing: Vec::new(),
                         cache_observations_state: None,
                     };
                     crate::snapshot_client::SnapshotBatchResponse {
@@ -12846,7 +12845,6 @@ fn claude_original_carrier_source_generated_wire_corpus() {
                         head_etag: item.cache_observations.as_ref().map(|_| "a".repeat(64)),
                         head_challenge: None,
                         unchanged_basis: None,
-                        retained_proof_missing: Vec::new(),
                         cache_observations_state: None,
                     };
                     crate::snapshot_client::SnapshotBatchResponse {
@@ -19152,8 +19150,6 @@ fn v6_snapshot_batch_matches_backend_contract() {
         evidence_ref: None,
         identity_parts: None,
         copy_unproven: false,
-        identity_retained: false,
-        copy_invalidated: false,
         model: "claude-opus-4-7".to_string(),
         input_tokens: 100,
         output_tokens: 40,
@@ -20925,7 +20921,6 @@ fn codex_creator_upload_privacy_and_exact_ack_preserve_hashes_only() {
             head_etag: None,
             head_challenge: None,
             unchanged_basis: None,
-            retained_proof_missing: Vec::new(),
             cache_observations_state: None,
         }],
         unchanged_entities: vec![],
@@ -20996,8 +20991,6 @@ pub(super) fn valid_v6_batch_request() -> SnapshotBatchRequest {
         evidence_ref: None,
         identity_parts: None,
         copy_unproven: false,
-        identity_retained: false,
-        copy_invalidated: false,
         model: "claude-opus-4-7".to_string(),
         input_tokens: 100,
         output_tokens: 40,

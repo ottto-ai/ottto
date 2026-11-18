@@ -164,7 +164,7 @@ fn staged_successor_crash_replays_from_the_previous_head() {
 
 /// [money] A head behind accepted progress continues from its seal to the
 /// end of the file even after an evidence-only fingerprint clear; the record
-/// stays eligible. No floor holds it (D158).
+/// stays eligible. No floor holds it.
 #[test]
 fn evidence_clear_keeps_a_head_behind_accepted_progress_eligible() {
     let mut route = route();

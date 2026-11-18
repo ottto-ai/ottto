@@ -337,7 +337,7 @@ pub(super) fn path_witness(path: &Path) -> Option<String> {
         .map(|metadata| metadata_witness(&metadata))
 }
 /// The session id the file's owning header names now: the lineage a stored
-/// Tail head continues (D131), read as the inventory reads it.
+/// Tail head continues, read as the inventory reads it.
 #[cfg(unix)]
 pub(super) fn header_owner(candidate: &CandidateFile) -> Result<String> {
     read_header_settled(candidate, None)

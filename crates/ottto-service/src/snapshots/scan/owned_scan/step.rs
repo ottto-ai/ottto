@@ -1503,7 +1503,7 @@ impl OwnedSourceScan {
                                 crate::transcript_acquisition::ReadMode::Full(_)
                             ),
                         );
-                        // D168's replays, with the bytes they read: a group
+                        // From-start replays, with the bytes they read: a group
                         // from its first member, and a file with protected
                         // tiers re-read from its start.
                         #[cfg(unix)]
