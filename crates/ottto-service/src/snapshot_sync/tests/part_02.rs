@@ -104,9 +104,9 @@ fn cache_event_ack_restart_correction_and_missing_proof() {
         &path,
         restored,
     );
-    restored.save_fixture(&path).unwrap();
+    restored.save(&path).unwrap();
     restored.retire_acks_after_index_save(&settled_index, &BTreeSet::new(), &BTreeSet::new());
-    restored.finish_cycle_fixture(&path).unwrap();
+    restored.finish_cycle(&path).unwrap();
     let mut restored = SnapshotUploadProgress::load_for_index(
         &settled_index,
         &directory.join("index.json"),

@@ -205,6 +205,51 @@ pub(crate) fn cold_close_for_test(path: &Path) -> Result<()> {
     }
     Ok(())
 }
+/// Close each registered session whose route directory is gone and that no
+/// graph still holds. Removing a test directory unlinks the store, but the
+/// registry's session keeps its descriptors (database, WAL, SHM, identity
+/// file and owner lock) open until the test process exits. Any later load or
+/// save of the route reconciles its missing fence before it reaches a
+/// session, so the close changes no result; latches and staged state stay.
+#[cfg(test)]
+pub(crate) fn close_removed_routes_for_test() {
+    let Ok(routes) = states().lock().map(|states| {
+        states
+            .iter()
+            .map(|(path, state)| (path.clone(), state.clone()))
+            .collect::<Vec<_>>()
+    }) else {
+        return;
+    };
+    let removed = |path: &Path| {
+        path.parent().is_some_and(|dir| {
+            fs::symlink_metadata(dir).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+        })
+    };
+    let mut closed = Vec::new();
+    for (path, state) in routes {
+        // A route in use by another thread is never idle.
+        let Ok(mut state) = state.try_lock() else {
+            continue;
+        };
+        if state
+            .current
+            .as_ref()
+            .is_some_and(|runtime| Arc::strong_count(runtime) == 1)
+            && removed(&path)
+        {
+            closed.extend(state.current.take());
+        }
+    }
+    if closed.is_empty() {
+        return;
+    }
+    // Closing samples pager counters; keep them out of this thread's
+    // `cache_lifecycle::observe` scope.
+    if let Ok(closer) = std::thread::Builder::new().spawn(move || drop(closed)) {
+        let _ = closer.join();
+    }
+}
 fn with_state<T>(path: &Path, f: impl FnOnce(&mut RouteState) -> Result<T>) -> Result<T> {
     let state = {
         let mut states = states().lock().map_err(|_| Hold::DbUnavailable)?;

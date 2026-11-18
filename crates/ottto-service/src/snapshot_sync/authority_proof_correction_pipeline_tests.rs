@@ -497,7 +497,7 @@ impl ApcFixture {
         // that custody before acquisition, as production prepare does.
         if progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints) {
             progress
-                .save_fixture(&self.progress_path)
+                .save(&self.progress_path)
                 .expect("save native fixture quarantine preparation");
         }
         let committed_index = index.clone();
@@ -866,7 +866,7 @@ impl ApcFixture {
         let observed_progress = progress.clone();
         progress.retire_acks_after_index_save(&index, &BTreeSet::new(), &holds.held_fingerprints);
         progress
-            .finish_cycle_fixture(&self.progress_path)
+            .finish_cycle(&self.progress_path)
             .expect("finish native fixture progress");
         native_pass
             .commit_tail()

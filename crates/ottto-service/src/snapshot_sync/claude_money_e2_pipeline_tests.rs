@@ -2269,7 +2269,7 @@ fn retry_case(conflict: bool) {
         let index_path = crate::snapshots::e2_pipeline_scan_fixture::route_of(&p.index).unwrap();
         let progress_path = snapshot_upload_progress_path(&index_path);
         progress = route_fixture_progress(&p.index, &index_path, &progress_path, progress);
-        progress.save_fixture(&progress_path).unwrap();
+        progress.save(&progress_path).unwrap();
         checkpoint_partial_snapshot_index_with_audit_release(
             &p.index,
             &committed,
@@ -4141,9 +4141,7 @@ fn conflict_only(subagent: bool, sampled: bool) {
             );
             let mut due = c.reload(&mut restart.index);
             crate::snapshots::e2_pipeline_scan_fixture::expire_claimed_growth_for_test(
-                &mut due,
-                &path,
-                &restart.index,
+                &mut due, &path,
             );
             drop(restart);
             restart = cold_ready(&c, due, 100, false);

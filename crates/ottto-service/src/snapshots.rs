@@ -183,7 +183,6 @@ pub(crate) use codex_file_join::tests::{
     bound_rows as codex_bound_fixture_rows, counting_v2_fixture, native_join_fixture_root,
     older_build_logs_expired, older_build_logs_priority,
 };
-pub(crate) mod billing_route;
 #[cfg(test)]
 mod claude_usage_iterations_tests;
 mod codex_usage_occurrence;

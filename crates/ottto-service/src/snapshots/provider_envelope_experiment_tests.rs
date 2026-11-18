@@ -633,11 +633,12 @@ fn partial_locked_save_and_restart_keep_exact_debt() {
         // Age only the witnessed claim in the saved baseline. Advancing the
         // whole clock would also release the excluded audit B's unrelated debt.
         let mut prior = restarted;
+        prior.traversal.as_mut().unwrap().counts.growth_deferred =
+            paced.traversal.as_ref().unwrap().counts.growth_deferred;
         for key in &paced_keys {
             e2_pipeline_scan_fixture::expire_claimed_growth_for_test(
                 &mut prior,
                 Path::new(key),
-                &paced,
             );
         }
         drop(paced);
@@ -647,10 +648,11 @@ fn partial_locked_save_and_restart_keep_exact_debt() {
             if scan.completed_parses().next().is_none() {
                 assert_eq!(selected.len(), 1);
                 let key = selected.iter().next().unwrap();
+                prior.traversal.as_mut().unwrap().counts.growth_deferred =
+                    working.traversal.as_ref().unwrap().counts.growth_deferred;
                 e2_pipeline_scan_fixture::expire_claimed_growth_for_test(
                     &mut prior,
                     Path::new(key),
-                    &working,
                 );
                 let next = selection_page(&fixture, prior.clone(), 1);
                 assert_eq!(next.0, selected, "only the deferred claim was expired");

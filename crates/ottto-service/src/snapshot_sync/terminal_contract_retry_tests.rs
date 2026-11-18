@@ -320,7 +320,7 @@ fn successful_contract_retry(restart_after_selection: bool) {
         assert!(progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints));
         assert!(progress.active_quarantine_retries.is_empty());
         index.save_fixture(&fixture.index_path).unwrap();
-        progress.save_fixture(&fixture.progress_path).unwrap();
+        progress.save(&fixture.progress_path).unwrap();
         let stale_index_records = index.quarantined_snapshot_fingerprints.clone();
         progress
             .quarantined_fingerprints
@@ -444,7 +444,7 @@ fn successful_contract_retry(restart_after_selection: bool) {
         index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
         assert!(index.accepted_snapshot_fingerprint_recorded(&held_fingerprint()));
         index.save_fixture(&fixture.index_path).unwrap();
-        progress.save_fixture(&fixture.progress_path).unwrap();
+        progress.save(&fixture.progress_path).unwrap();
         (index, progress) = fixture.load();
         assert!(index.accepted_snapshot_fingerprint_recorded(&held_fingerprint()));
         assert!(!index
@@ -550,7 +550,7 @@ impl ReadBudgetFixture {
         index.file_snapshot_fingerprints.extend(old_incidence);
         index.quarantined_snapshot_fingerprints = progress.quarantined_fingerprints.clone();
         index.save_fixture(&retained.index_path).unwrap();
-        progress.save_fixture(&retained.progress_path).unwrap();
+        progress.save(&retained.progress_path).unwrap();
         Self {
             retained,
             root,
@@ -611,9 +611,7 @@ fn contract_read_cap(outcome: InterruptedOutcome) {
         let (mut index, mut progress) = fixture.retained.load();
         assert!(progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints));
         assert!(progress.active_quarantine_retries.is_empty());
-        progress
-            .save_fixture(&fixture.retained.progress_path)
-            .unwrap();
+        progress.save(&fixture.retained.progress_path).unwrap();
         index.save_fixture(&fixture.retained.index_path).unwrap();
         assert!(fixture.scan(&index).is_empty(), "bump alone never reads");
         let stale_index = index.quarantined_snapshot_fingerprints.clone();

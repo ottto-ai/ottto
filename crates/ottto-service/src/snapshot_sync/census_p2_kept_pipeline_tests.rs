@@ -304,7 +304,7 @@ impl PipelineFixture {
             cycle.historical_replay,
         ) {
             progress
-                .save_fixture(&progress_path)
+                .save(&progress_path)
                 .expect("save native fixture quarantine preparation");
         }
         if cycle.historical_replay {
@@ -672,7 +672,7 @@ impl PipelineFixture {
         let observed_progress = progress.clone();
         progress.retire_acks_after_index_save(&index, &BTreeSet::new(), &holds.held_fingerprints);
         progress
-            .finish_cycle_fixture(&progress_path)
+            .finish_cycle(&progress_path)
             .expect("finish native fixture progress");
         native_pass
             .commit_tail()

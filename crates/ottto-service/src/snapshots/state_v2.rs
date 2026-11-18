@@ -26,7 +26,9 @@ pub(crate) use runtime::{
     take_progress_set_aside_for_test,
 };
 #[cfg(test)]
-pub(crate) use runtime::{cold_close_for_test, release_collection_page_limit_for_test};
+pub(crate) use runtime::{
+    close_removed_routes_for_test, cold_close_for_test, release_collection_page_limit_for_test,
+};
 pub(crate) use runtime::{remove_retired_record_dir, retired_record_dir, source_erasure_alarm};
 pub(super) mod telemetry;
 #[cfg(any(test, target_os = "macos"))]
@@ -665,3 +667,6 @@ pub(in crate::snapshots) fn seed_0217_archive_for_test(index: &ScanIndex, key: &
         );
     });
 }
+
+#[cfg(test)]
+pub(super) use runtime::erase_published;

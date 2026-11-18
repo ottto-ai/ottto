@@ -95,7 +95,7 @@ fn held_validation_rejection_prunes_old_accepted_revisions_from_progress() {
     let progress_path = scratch.join("progress.json");
     let mut index = ScanIndex::default();
     index.save_fixture(&index_path).unwrap();
-    progress.save_fixture(&progress_path).unwrap();
+    progress.save(&progress_path).unwrap();
 
     for revision in 0..20 {
         let valid = format!("{:064x}", 10_000 + revision);
@@ -675,7 +675,7 @@ fn due_not_pending_quarantine_resends_once_and_paces_local_holds() {
     let index_path = root.join("index.json");
     let progress_path = root.join("progress.json");
     index.save_fixture(&index_path).unwrap();
-    progress.save_fixture(&progress_path).unwrap();
+    progress.save(&progress_path).unwrap();
     progress = SnapshotUploadProgress::load(
         &progress_path,
         &progress.destination_namespace_hash,

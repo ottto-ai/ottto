@@ -563,7 +563,7 @@ fn preparation_error_preserves_normalization_counts_on_scan_worker() {
         snapshot_quarantine_witness(source),
     )
     .unwrap();
-    progress.save_fixture(&progress_path).unwrap();
+    progress.save(&progress_path).unwrap();
     crate::snapshots::e2_pipeline_scan_fixture::exhaust_progress_generation_for_test(&index);
     let index = ScanIndex::load(&index_path).unwrap();
     crate::snapshots::e2_pipeline_scan_fixture::edit_record_for_test(
