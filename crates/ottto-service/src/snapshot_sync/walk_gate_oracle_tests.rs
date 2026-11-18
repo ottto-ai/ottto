@@ -562,8 +562,9 @@ fn accepted_holder_deleted_without_a_hint_matches_back_to_back_walks() {
 #[serial(source_cadences, source_manifests, client_report)]
 fn unaccepted_holder_deleted_without_a_hint_matches_back_to_back_walks() {
     no_hint_arm_matches("w08", &|home, server, moment| match moment {
-        // The holder's body is refused, so it is never accepted.
-        Moment::Install => *server.fallback.lock().unwrap() = Answer::Refuse("synthetic"),
+        // The server keeps no stored body for the holder, so it is never
+        // accepted.
+        Moment::Install => *server.fallback.lock().unwrap() = Answer::Unstored,
         Moment::Gap => std::fs::remove_file(transcript(home)).unwrap(),
     });
 }
