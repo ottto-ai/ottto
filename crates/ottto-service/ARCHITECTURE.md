@@ -68,10 +68,8 @@ file-system hint / periodic listing → select file → read new bytes from save
   budget and deferred-path requeue. Fill does not count as a census turn. A periodic relist
   can select files and certify their membership from the retained census while only
   non-census directories remain pending; pending census-member directories still block.
-  Compressed rollouts keep their original modification time,
-  so they age as the plain file did. Legacy held archive member keys count as already seen
-  for the ordinary first-read age gate; their values remain inert, and header/ownership
-  admission still applies. A provider-written new plaintext object takes the existing
+  Compressed rollouts keep their original modification time, so they age as the plain file did.
+  A provider-written new plaintext object takes the existing
   counted Full path; only a returning original object can continue from its saved suffix.
   A restart during its first read re-decodes the prefix, counted as decoder work, before reaching
   EOF. It does not restore a compressed decoder or introduce a stepped compressed reader.
@@ -404,9 +402,8 @@ backfill-state save, so re-upgrade omits the cutoff for existing destinations.
   the ordinary save. A failed save exposes the complete old or complete new state.
   A provider-written new plaintext object follows the existing replaced-file path: one counted
   Full and one whole-session replacement. Returning the original object retains ordinary Tail
-  continuation. The old archive catalogue entries remain accepted and inert; their physical rows
-  are neither hydrated nor rewritten, and old field/cause ordinals and formats stay unchanged.
-  Compatibility with older binaries is decode-only; older scheduling may replay retained work.
+  continuation. The old archive catalogue entries remain readable by key and keep their field and
+  cause ordinals. The generic retirement path deletes their rows on the next committed graph save.
 - A parser or scan-identity version bump invalidates every saved record. A change that bumps one
   also migrates saved state forward, or it explicitly accepts the full re-read.
 

@@ -94,24 +94,10 @@ fn assert_kinds(db: &mut sqlite::Sqlite, present: bool) {
         assert_eq!(!rows.is_empty(), present, "{kind}");
     }
 }
-/// Save `next` over the committed store, then reopen it.
-fn save_and_reopen(
-    db: &mut sqlite::Sqlite,
-    previous: &ScanIndex,
-    next: &mut ScanIndex,
-    cx: &mut KindCx,
-) -> (ScanIndex, KindCx) {
-    let identity = db.read_control("identity").unwrap().unwrap();
-    // Before the fix this refused with state_v2_archive_state_unsupported,
-    // failing every checkpoint save, so no Codex pass could upload.
-    save_graph(db, &identity, previous, next, cx).unwrap();
-    hydrate(db, codex_binding()).unwrap()
-}
-
-/// [format] Retired layout-2 archive rows are accepted but never hydrated,
-/// digested, rewritten or swept. Preserve their bytes through save and reopen.
+/// [format] Layout-2 archive rows hydrate as retirement markers and are
+/// deleted by the next committed save.
 #[test]
-fn codex_store_persists_archive_custody_through_populate_delta_and_upgrade() {
+fn codex_store_retires_archive_rows_on_committed_save() {
     let (scratch, mut db) = codex_store();
     let mut tx = db.begin(TxnMode::Write).unwrap();
     let mut cx = KindCx {
@@ -155,34 +141,27 @@ fn codex_store_persists_archive_custody_through_populate_delta_and_upgrade() {
     };
     let mut db = reopen();
     let (mut index, mut cx) = hydrate(&mut db, codex_binding()).unwrap();
-    let rows = baseline(&index, &mut cx).unwrap().rows;
-    for (key, _) in &expected {
-        assert!(
-            !rows.contains_key(key),
-            "inert rows are not baseline digests"
-        );
+    assert!(index.decode_holds.is_empty());
+    let previous = baseline(&index, &mut cx).unwrap();
+    let mut tx = db.begin(TxnMode::Read).unwrap();
+    for (key, header) in &expected {
+        assert_eq!(previous.rows.get(key), Some(&[0; 32]));
+        assert_eq!(tx.get(key).unwrap().as_ref(), Some(header));
     }
+    drop(tx);
     assert!(serde_json::to_value(&index)
         .unwrap()
         .get("archives")
         .is_none());
-    let previous = index.clone();
-    let (restored, _) = save_and_reopen(&mut db, &previous, &mut index, &mut cx);
+    super::super::save_graph(&mut db, &identity, previous, &mut index, &mut cx).unwrap();
+    assert_kinds(&mut db, false);
+    drop(db);
+
+    let mut db = reopen();
+    let (restored, _) = hydrate(&mut db, codex_binding()).unwrap();
+    assert!(restored.decode_holds.is_empty());
     assert_eq!(
         serde_json::to_value(&restored).unwrap(),
         serde_json::to_value(&index).unwrap()
     );
-    drop(db);
-    let mut db = reopen();
-    let mut tx = db.begin(TxnMode::Read).unwrap();
-    for (key, header) in expected {
-        let actual = tx
-            .get(&key)
-            .unwrap()
-            .expect("inert row survives ordinary save");
-        assert_eq!(
-            actual, header,
-            "byte commitment, key and position preserved"
-        );
-    }
 }

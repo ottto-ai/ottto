@@ -2089,8 +2089,6 @@ retry timer, Held queue or separate power/work gate remains.
 Compressed `.jsonl.zst` is an ordinary Codex rollout encoding. Plain exact siblings
 win before header/body selection, and both encodings use the same mtime age rules;
 compressed rollouts keep their original modification time, so they age as the plain file did.
-Legacy archive member keys retain first-seen eligibility under the ordinary 60-day gate;
-no disposition or attempt count is applied, and normal header/ownership admission remains.
 Never-seen old plain and compressed files are skipped equally.
 One secure header opener
 supplies ownership proof. The inventory has no file-count, directory-count, cache
