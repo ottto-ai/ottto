@@ -132,7 +132,7 @@ fn settled_walk_idles_until_the_start_to_start_backstop() {
 #[test]
 fn pass_gap_equal_to_twice_the_longest_interval_idles_and_longer_walks() {
     assert_eq!(PASS_GAP, 2 * 30 * 60);
-    assert!(2 * PASS_GAP + 1 < WALK_GAP);
+    const { assert!(2 * PASS_GAP + 1 < WALK_GAP) };
     let fixture = Fixture::new(SnapshotSource::Pi);
     let index = ScanIndex::default();
     fixture.walk(&index, START);
