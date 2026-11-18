@@ -1,7 +1,6 @@
-//! Lets a settled source skip repeated walks. A clean walk with nothing owed
-//! arms one in-memory record per source; until `WALK_GAP` after that walk's
-//! first pass began, a pass whose inputs still match returns an empty,
-//! census-incomplete page. Anything else walks; a restart always walks.
+//! Lets a settled source skip repeated walks: a clean walk arms one in-memory
+//! record per source, and until `WALK_GAP` after its first pass a pass whose
+//! inputs match returns an empty page. A restart always walks.
 use crate::snapshot_client::ActivityHintResponse;
 use crate::snapshots::*;
 use crate::transcript_acquisition::{Scope, SourceStamp};
@@ -173,8 +172,7 @@ pub(crate) fn gate(
     })
 }
 
-/// After a successful finish: arm on a clean retired walk whose inputs held
-/// still; an idle pass follows its own maintenance commits.
+/// After a successful finish: arm on a clean walk whose inputs held still.
 pub(crate) fn arm_after_finish(
     pass: Pass,
     index: &ScanIndex,
@@ -233,8 +231,7 @@ pub(crate) fn idle_finish(index: &ScanIndex) -> bool {
     index.traversal.is_none()
 }
 
-/// Nothing in the index needs a walk. A due sampled audit waits for the
-/// backstop; an expired growth claim does not.
+/// Nothing in the index needs a walk (a due audit waits for the backstop).
 pub(in crate::snapshots) fn owes_nothing(index: &ScanIndex, days: u64, now: u64) -> bool {
     index.persistence_available()
         && !index.bounded_sweep_had_unsettled_upload
