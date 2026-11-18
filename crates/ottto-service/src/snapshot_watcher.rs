@@ -171,6 +171,12 @@ pub(crate) fn cover(watcher: Option<&SnapshotWatcher>) {
     });
 }
 
+/// Test coverage without a native watcher: `Some` covers these paths.
+#[cfg(test)]
+pub(crate) fn cover_paths_for_test(paths: Option<Vec<PathBuf>>) {
+    with_coverage(|coverage| *coverage.lock().unwrap() = paths);
+}
+
 /// A live watcher hints every existing root (creating one recreates it).
 pub(crate) fn covers(roots: &[PathBuf]) -> bool {
     with_coverage(|coverage| {

@@ -263,7 +263,17 @@ pub(in crate::snapshots) fn stored_stamp_selects(
     entry: &ScanIndexEntry,
     now: u64,
 ) -> bool {
-    let candidate = CandidateFile {
+    let candidate = stored_candidate(key, entry);
+    let (decision, reason) = index.candidate_walk_debt(&candidate, now);
+    // The walk skips a held member owed only a proof correction.
+    decision != CandidateDecision::Skip
+        && !(reason == Some(CandidateParseReason::AuthorityQuarantine)
+            && index.claude_authority_correction_only(&candidate)
+            && index.effective_upload_body_witness_revision_requires_adoption(key))
+}
+
+fn stored_candidate(key: &str, entry: &ScanIndexEntry) -> CandidateFile {
+    CandidateFile {
         path: PathBuf::from(key),
         scan_root: PathBuf::new(),
         physical_identity: None,
@@ -277,11 +287,26 @@ pub(in crate::snapshots) fn stored_stamp_selects(
         fingerprint_changed_nanos: entry.opened_changed_nanos,
         fingerprint_birth_nanos: entry.opened_birth_nanos,
         withheld_content_stamp: None,
-    };
-    let (decision, reason) = index.candidate_walk_debt(&candidate, now);
-    // The walk skips a held member owed only a proof correction.
-    decision != CandidateDecision::Skip
-        && !(reason == Some(CandidateParseReason::AuthorityQuarantine)
-            && index.claude_authority_correction_only(&candidate)
-            && index.effective_upload_body_witness_revision_requires_adoption(key))
+    }
 }
+
+/// A simulated process start: every source's record and clocks are gone.
+#[cfg(test)]
+pub(crate) fn restart_for_test() {
+    with_slots(|slots| {
+        *slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = [const { Slot::EMPTY }; 3];
+    });
+}
+
+/// The armed record's (generation, walk start), if any.
+#[cfg(test)]
+pub(crate) fn armed_for_test(source: SnapshotSource) -> Option<(u64, u64)> {
+    with_slot(source, |slot| {
+        (slot.record.as_ref()).map(|record| (record.generation, record.started_at))
+    })
+}
+
+#[cfg(test)]
+mod tests;
