@@ -5,6 +5,7 @@ use crate::snapshots::e2_pipeline_scan_fixture::{
     invalidate_holder_for_test, retain_indexed_walk_with_pending_for_test,
     unhold_claude_account_for_test,
 };
+use crate::snapshots::sampled_scan::transition_fixture::with_scan_clock;
 use crate::snapshots::upload_context_receipt::SlotRows;
 
 // Accepted-row assertions, refused-parent and fresh-upgrade controls are
@@ -24,7 +25,7 @@ fn has(index: &ScanIndex, path: &Path, id: &str) -> bool {
     hashes(index, path).contains(&claude_request_hash(id))
 }
 fn parsed(c: &Corpus, index: ScanIndex) -> Page {
-    let mut page = c.raw(&E2ScanFixture::default(), index, 100, false, &[]);
+    let mut page = c.raw(&E2ScanFixture::default(), index, 100, true, &[]);
     page.enrich(c);
     page
 }
@@ -159,7 +160,7 @@ fn uncopied_family_duplicates_keep_only_counted_rows_and_stay_quiet() {
                         .pending(location_key(&path.to_string_lossy())));
                 }
                 let scanner = E2ScanFixture::default();
-                let mut repeat = c.raw(&scanner, index.clone(), 100, false, &[]);
+                let mut repeat = c.raw(&scanner, index.clone(), 100, true, &[]);
                 assert!(scanner.paths().is_empty());
                 repeat.enrich(&c);
                 assert!(repeat.scan.snapshots.is_empty());
@@ -436,56 +437,63 @@ fn exact_acceptance_corrects_an_earlier_counting_copy_once() {
         return;
     }
     with_e2(|| {
-        let mut c = Corpus::new("accepted-row-correct-once");
-        let holder = c.root(ROOT, &resumed(ROOT, &[A]));
-        let mut index = seed(&c);
-        append(&holder, &resumed(ROOT, &[B]));
-        index = send(&c, &index, parsed(&c, index.clone()), Some(ROOT)).0;
-        let copy = new_copy(&mut c, COPY, "b");
-        let page = parsed(&c, index.clone());
-        assert_eq!(body(&page, COPY).unwrap().request_count, 2);
-        index = send(&c, &index, page, None).0;
-        // Keep the already-counting copy off the holder's ACK page.
-        retain_indexed_walk_with_pending_for_test(
-            &mut index,
-            SnapshotSource::ClaudeCode,
-            std::slice::from_ref(&c.root),
-            "2026-08-02T08:00:00Z",
-            183,
-            std::slice::from_ref(&holder),
-        );
-        // A new exact body, rather than a replayed refusal, supplies b.
-        append(&holder, &resumed(ROOT, &[D]));
-        let scanner = E2ScanFixture::default();
-        let mut accepted = c.raw(&scanner, index.clone(), 1, false, &[]);
-        assert_eq!(scanner.paths(), vec![holder.clone()]);
-        accepted.enrich(&c);
-        assert!(body(&accepted, COPY).is_none());
-        index = send(&c, &index, accepted, None).0;
-        assert!(has(&index, &holder, "b"));
-        assert!(index
-            .claude_copy_removals
-            .pending(location_key(&copy.to_string_lossy())));
-        let scanner = E2ScanFixture::default();
-        let mut correction = c.raw(&scanner, index.clone(), 100, false, &[]);
-        assert_eq!(
-            scanner
-                .paths()
-                .iter()
-                .filter(|p| p.file_name().unwrap() == file(COPY).as_str())
-                .count(),
-            1
-        );
-        correction.enrich(&c);
-        assert_eq!(body(&correction, COPY).unwrap().request_count, 1);
-        index = send(&c, &index, correction, None).0;
-        stable(&c, &mut index);
-        for _ in 0..2 {
+        let now = crate::scan_clock::utc_seconds();
+        let (c, mut index, holder, copy) = with_scan_clock(now, || {
+            let mut c = Corpus::new("accepted-row-correct-once");
+            let holder = c.root(ROOT, &resumed(ROOT, &[A]));
+            let mut index = seed(&c);
+            append(&holder, &resumed(ROOT, &[B]));
+            index = send(&c, &index, parsed(&c, index.clone()), Some(ROOT)).0;
+            let copy = new_copy(&mut c, COPY, "b");
+            let page = parsed(&c, index.clone());
+            assert_eq!(body(&page, COPY).unwrap().request_count, 2);
+            index = send(&c, &index, page, None).0;
+            // Keep the already-counting copy off the holder's ACK page.
+            retain_indexed_walk_with_pending_for_test(
+                &mut index,
+                SnapshotSource::ClaudeCode,
+                std::slice::from_ref(&c.root),
+                "2026-08-02T08:00:00Z",
+                183,
+                std::slice::from_ref(&holder),
+            );
+            (c, index, holder, copy)
+        });
+        // The next native growth Full is beyond the preceding six-hour claim.
+        with_scan_clock(now + 7 * 60 * 60, || {
+            // A new exact body, rather than a replayed refusal, supplies b.
+            append(&holder, &resumed(ROOT, &[D]));
             let scanner = E2ScanFixture::default();
-            let page = c.raw(&scanner, index.clone(), 100, false, &[]);
-            assert!(scanner.paths().is_empty());
-            assert!(page.scan.snapshots.is_empty());
-        }
+            let mut accepted = c.raw(&scanner, index.clone(), 1, true, &[]);
+            assert_eq!(scanner.paths(), vec![holder.clone()]);
+            accepted.enrich(&c);
+            assert!(body(&accepted, COPY).is_none());
+            index = send(&c, &index, accepted, None).0;
+            assert!(has(&index, &holder, "b"));
+            assert!(index
+                .claude_copy_removals
+                .pending(location_key(&copy.to_string_lossy())));
+            let scanner = E2ScanFixture::default();
+            let mut correction = c.raw(&scanner, index.clone(), 100, true, &[]);
+            assert_eq!(
+                scanner
+                    .paths()
+                    .iter()
+                    .filter(|p| p.file_name().unwrap() == file(COPY).as_str())
+                    .count(),
+                1
+            );
+            correction.enrich(&c);
+            assert_eq!(body(&correction, COPY).unwrap().request_count, 1);
+            index = send(&c, &index, correction, None).0;
+            stable(&c, &mut index);
+            for _ in 0..2 {
+                let scanner = E2ScanFixture::default();
+                let page = c.raw(&scanner, index.clone(), 100, true, &[]);
+                assert!(scanner.paths().is_empty());
+                assert!(page.scan.snapshots.is_empty());
+            }
+        });
     });
 }
 
@@ -553,29 +561,48 @@ fn destination_changes_clear_contribution_only_proof_but_replay_does_not() {
 #[serial(client_report)]
 fn fresh_upgrade_refused_holder_counts_until_its_next_exact_ack() {
     with_e2(|| {
-        let mut c = Corpus::new("accepted-row-fresh-upgrade");
-        let holder = c.root(ROOT, &resumed(ROOT, &[A, B]));
-        let first = seed(&c);
-        let (mut index, copy) = stored_copy(&mut c, &first, "b");
-        index.upload_context_proof.request_contributions.clear();
-        append(&holder, &resumed(ROOT, &[D]));
-        index = send(&c, &index, parsed(&c, index.clone()), Some(ROOT)).0;
-        assert!(index
-            .claude_copy_removals
-            .pending(location_key(&copy.to_string_lossy())));
-        assert_eq!(
-            body(&parsed(&c, index.clone()), COPY)
-                .unwrap()
-                .request_count,
-            2
-        );
-        append(
-            &holder,
-            &resumed(ROOT, &[("e", "2026-08-02T07:00:40Z", OLD_WRITER)]),
-        );
-        index = send(&c, &index, parsed(&c, index.clone()), None).0;
-        assert!(has(&index, &holder, "b"));
-        stable(&c, &mut index);
+        let now = crate::scan_clock::utc_seconds();
+        let (c, index, holder) = with_scan_clock(now, || {
+            let mut c = Corpus::new("accepted-row-fresh-upgrade");
+            let holder = c.root(ROOT, &resumed(ROOT, &[A, B]));
+            let first = seed(&c);
+            let (mut index, copy) = stored_copy(&mut c, &first, "b");
+            index.upload_context_proof.request_contributions.clear();
+            append(&holder, &resumed(ROOT, &[D]));
+            index = send(&c, &index, parsed(&c, index.clone()), Some(ROOT)).0;
+            assert!(index
+                .claude_copy_removals
+                .pending(location_key(&copy.to_string_lossy())));
+            assert_eq!(
+                body(&parsed(&c, index.clone()), COPY)
+                    .unwrap()
+                    .request_count,
+                2
+            );
+            (c, index, holder)
+        });
+        // The replacement ACK follows the refused body's six-hour growth claim.
+        with_scan_clock(now + 7 * 60 * 60, || {
+            append(
+                &holder,
+                &resumed(ROOT, &[("e", "2026-08-02T07:00:40Z", OLD_WRITER)]),
+            );
+            let (mut index, sent, progress) = send(&c, &index, parsed(&c, index.clone()), None);
+            let holder_item = sent
+                .iter()
+                .find(|item| item.source_session_id == ROOT)
+                .expect("the holder's replacement body was sent");
+            let witness = snapshot_upload_body_witness(holder_item);
+            assert_eq!(
+                progress
+                    .fresh_context_body_acks
+                    .get(&holder_item.snapshot_fingerprint),
+                Some(&witness),
+                "the holder's replacement body has a fresh exact ACK"
+            );
+            assert!(has(&index, &holder, "b"));
+            stable(&c, &mut index);
+        });
     });
 }
 
@@ -661,7 +688,7 @@ fn rows_never_supply_delivery_authority_and_rebuild_carries_them() {
         let fresh = c.write_at(&format!("a/{THIRD}.jsonl"), &resumed(THIRD, &[D]), BORN);
         // Hint every candidate so census reservation cannot select the holder first.
         let scanner = E2ScanFixture::default();
-        let mut page = c.raw(&scanner, index, 1, false, &[fresh.clone(), holder.clone()]);
+        let mut page = c.raw(&scanner, index, 1, true, &[fresh.clone(), holder.clone()]);
         assert_eq!(scanner.paths(), vec![fresh]);
         page.enrich(&c);
         assert!(!page
@@ -673,9 +700,8 @@ fn rows_never_supply_delivery_authority_and_rebuild_carries_them() {
             .deleted_holders
             .contains(&location_key(&holder.to_string_lossy())));
         let mut index = page.index;
-        let path = c.base.join("rebuilt-index.json");
-        index.save_fixture(&path).unwrap();
-        assert!(has(&ScanIndex::load(&path).unwrap(), &holder, "a"));
+        index = c.reload(&mut index);
+        assert!(has(&index, &holder, "a"));
     });
 }
 
