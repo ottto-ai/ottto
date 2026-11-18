@@ -570,8 +570,8 @@ pub struct SourceScanResult {
     pub census_complete: bool,
     /// The walk gate held this pass: nothing was listed or read.
     pub(crate) walk_idle: bool,
-    /// The listing start of a clean walk this page retired (`walk_idle`).
-    pub(crate) settled_walk_start: Option<u64>,
+    /// This page retired a clean walk (`walk_idle`).
+    pub(crate) settled_walk: bool,
     pub census_window_end: String,
     /// State-only Codex census is separate from transcript discovery. If an
     /// existing SQLite source was unreadable, its previous durable map must be

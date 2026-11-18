@@ -31,8 +31,8 @@ file-system hint / periodic listing → select file → read new bytes from save
 - **Settled sources skip repeated walks** (`snapshots/discovery/walk_idle.rs`). A walk that
   completed its census cleanly, with nothing owed to the index, the upload or telemetry, arms one
   in-memory record per source, bound to the inputs the walk read and the store generation its
-  finish left. Until `WALK_GAP` (the listing interval, three hours) after that walk's listing
-  began, a pass with no watcher hint or listing request, unchanged inputs, a live watcher covering
+  finish left. Until `WALK_GAP` (the listing interval, three hours) after that walk's first
+  pass, a pass with no watcher hint or listing request, unchanged inputs, a live watcher covering
   every existing root, and a pass gap of at most one hour returns an empty, census-incomplete page:
   it reads, uploads and saves nothing, and reports a healthy source with the manifest withdrawn.
   Anything else walks as before: any failure, an account switch, a restart or another writer's

@@ -3309,14 +3309,11 @@ impl OwnedSourceScan {
                 let routine_recensus =
                     traversal_transition::routine_recensus(source, &traversal_snapshot);
                 // A clean walk retiring here may arm the walk gate.
-                let settled_walk_start =
-                    traversal_snapshot.listing_started_unix_seconds.filter(|_| {
-                        !traversal_snapshot.rewalk_owed
-                            && traversal_snapshot
-                                .pending_candidates
-                                .iter()
-                                .all(|candidate| candidate.census_member)
-                    });
+                let settled_walk = !traversal_snapshot.rewalk_owed
+                    && traversal_snapshot
+                        .pending_candidates
+                        .iter()
+                        .all(|candidate| candidate.census_member);
                 let traversal_healthy = !traversal_snapshot.has_errors();
                 let clean_frozen_generation = !traversal_snapshot.watcher_hint_seen;
                 let reconciliation_complete = if traversal_discovery_done
@@ -3619,7 +3616,7 @@ impl OwnedSourceScan {
                 let scan = SourceScanResult {
                     census_status,
                     walk_idle: false,
-                    settled_walk_start: settled_walk_start.filter(|_| census_complete),
+                    settled_walk: settled_walk && census_complete,
                     charge_deferred: history_upgrade.charge_deferred > 0,
                     page_file_limit_hit,
                     routine_recensus,

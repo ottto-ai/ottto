@@ -66,7 +66,7 @@ impl Fixture {
     fn arm(&self, index: &ScanIndex, started: u64) {
         let mut scan = SourceScanResult::empty(self.source);
         scan.census_complete = true;
-        scan.settled_walk_start = Some(started);
+        scan.settled_walk = true;
         let path = self.scratch.join("index");
         let pass = self.pass(index, "a");
         crate::scan_clock::with_clock(started, || {
@@ -263,7 +263,7 @@ fn input_moved_during_the_walk_does_not_arm() {
     assert!(!fixture.gate(&index, START));
     let mut scan = SourceScanResult::empty(SnapshotSource::Pi);
     scan.census_complete = true;
-    scan.settled_walk_start = Some(START);
+    scan.settled_walk = true;
     let path = fixture.scratch.join("index");
     arm_after_finish(fixture.pass(&index, "b"), &index, &path, &scan, true);
     assert_eq!(armed_for_test(SnapshotSource::Pi), None);

@@ -1,6 +1,6 @@
 //! Lets a settled source skip repeated walks. A clean walk with nothing owed
 //! arms one in-memory record per source; until `WALK_GAP` after that walk's
-//! listing began, a pass whose inputs still match returns an empty,
+//! first pass began, a pass whose inputs still match returns an empty,
 //! census-incomplete page. Anything else walks; a restart always walks.
 use crate::snapshot_client::ActivityHintResponse;
 use crate::snapshots::*;
@@ -29,7 +29,8 @@ struct Record {
 
 struct Slot {
     record: Option<Record>,
-    walk_start: Option<Pass>,
+    /// The inputs and gate-clock time of the pass that began the walk.
+    walk_start: Option<(Pass, u64)>,
     last_pass_at: Option<u64>,
 }
 
@@ -152,7 +153,7 @@ pub(crate) fn gate(
         let previous = slot.last_pass_at.replace(now);
         let walking = index.traversal.is_some();
         if !walking {
-            slot.walk_start = Some(pass.clone());
+            slot.walk_start = Some((pass.clone(), now));
         }
         let idle = !walking
             && pass.covered
@@ -209,30 +210,31 @@ pub(crate) fn arm_after_finish(
     outside_owes_nothing: bool,
 ) {
     let generation = store_generation(index, index_path);
-    let settled = scan.settled_walk_start.filter(|_| {
-        outside_owes_nothing
-            && index.traversal.is_none()
-            && !index
-                .claude_history_emission
-                .files
-                .values()
-                .any(|gated| gated.held == Some(HistoryHold::TelemetryUnread))
-            && owes_nothing(index, pass.days, crate::scan_clock::utc_seconds())
-    });
+    let settled = scan.settled_walk
+        && outside_owes_nothing
+        && index.traversal.is_none()
+        && !index
+            .claude_history_emission
+            .files
+            .values()
+            .any(|gated| gated.held == Some(HistoryHold::TelemetryUnread))
+        && owes_nothing(index, pass.days, crate::scan_clock::utc_seconds());
     with_slot(scan.source, |slot| {
         #[cfg(test)]
         trace(format!(
-            "A wi{} ss{:?} st{} o{} t{} g{:?}/{} same{:?}",
+            "A wi{} ss{} st{} o{} t{} g{:?}/{} same{:?}",
             u8::from(scan.walk_idle),
-            scan.settled_walk_start,
-            u8::from(settled.is_some()),
+            u8::from(scan.settled_walk),
+            u8::from(settled),
             u8::from(outside_owes_nothing),
             u8::from(index.traversal.is_some()),
             generation,
             index.generation,
-            slot.walk_start
-                .as_ref()
-                .map(|start| (u8::from(start.key == pass.key), u8::from(start.same(&pass)))),
+            slot.walk_start.as_ref().map(|(start, at)| (
+                u8::from(start.key == pass.key),
+                u8::from(start.same(&pass)),
+                *at
+            )),
         ));
         if scan.walk_idle {
             let record = slot
@@ -244,19 +246,17 @@ pub(crate) fn arm_after_finish(
             }
             return;
         }
-        let unchanged = slot
-            .walk_start
-            .as_ref()
-            .is_some_and(|start| start.same(&pass));
-        slot.record =
-            settled
-                .zip(generation)
-                .filter(|_| unchanged)
-                .map(|(started_at, generation)| Record {
-                    pass,
-                    generation,
-                    started_at,
-                });
+        // The backstop runs from the walk's first pass, on the gate's clock.
+        let started = (slot.walk_start.as_ref())
+            .filter(|(start, _)| settled && start.same(&pass))
+            .map(|&(_, at)| at);
+        slot.record = started
+            .zip(generation)
+            .map(|(started_at, generation)| Record {
+                pass,
+                generation,
+                started_at,
+            });
     });
 }
 
