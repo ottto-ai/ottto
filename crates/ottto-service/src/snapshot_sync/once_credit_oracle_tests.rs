@@ -1423,50 +1423,35 @@ fn c12_head_unstored_answers_hold_until_growth_earns_its_own_ack() {
     assert!(!answered.progress.accepted_body_witnesses.contains_key(&e));
     assert!(!answered.progress.accepted_body_witnesses.contains_key(&d));
 
-    // An unchanged same-generation restart reads and offers nothing; both
-    // held entities keep their accepted head, and the covered revision is
-    // never re-emitted smaller.
+    // An unchanged restart never reads, finalizes or offers the
+    // usage_identical body, and offers nothing at all. This fixture writes
+    // hold deadlines on its scan clock (`NOW`), while the index selects due
+    // retries by the wall clock (reoffer_quarantine.rs), which is later. So
+    // the dominated hold's file may be re-read here; the ledger's lease, on
+    // the scan clock, is not due and suppresses its POST. In production both
+    // read one clock. The zero-byte quiet oracle runs past 12 h below, once
+    // no timed hold is left.
+    let assert_untouched = |cycle: &Cycle| {
+        assert!(cycle.finish.is_ok(), "{:?}", cycle.finish);
+        assert!(cycle.batches.is_empty());
+        for items in [&cycle.before, &cycle.finalized] {
+            assert!(items.iter().all(|item| item.snapshot_fingerprint == d));
+        }
+        assert_terminal(cycle, &e, &main_body);
+        assert_eq!(
+            cycle.index.quarantined_snapshot_fingerprints[&d],
+            other_hold
+        );
+    };
     home.restart();
     let quiet = home.cycle(&server, &recording);
-    assert!(quiet.finish.is_ok(), "{:?}", quiet.finish);
-    assert!(quiet.before.is_empty());
-    let mut quiet_route = emitted_route(&quiet, claude, &server);
-    quiet_route.mode = transition::Mode::Restart;
-    transition::money_oracle::assert_quiet_restart_with_anchor_window(
-        &quiet_route,
-        quiet.quiet_anchor_window,
-    );
-    transition::money_oracle::assert_held_set(
-        &[&e_session, &d_session],
-        &prior,
-        &quiet_route,
-        &prior,
-    );
-    transition::money_oracle::assert_no_smaller_reemit(
-        &e_session,
-        &prior,
-        &quiet_route,
-        &cold_main,
-        true,
-    );
+    assert_untouched(&quiet);
 
     // A durable restore (cold close, reload) keeps both holds exactly.
     home.cold_restart();
     let restored = home.cycle(&server, &recording);
-    assert!(restored.finish.is_ok(), "{:?}", restored.finish);
-    assert!(restored.batches.is_empty());
-    assert_terminal(&restored, &e, &main_body);
-    assert_eq!(
-        restored.index.quarantined_snapshot_fingerprints[&d],
-        other_hold
-    );
-    let restored_route = emitted_route(&restored, claude, &server);
-    transition::money_oracle::assert_held_set(
-        &[&e_session, &d_session],
-        &prior,
-        &restored_route,
-        &prior,
-    );
+    assert_untouched(&restored);
+    assert_eq!(*server.placement.lock().unwrap(), placed);
 
     // Past 6 h the dominated hold is due, and its head is gone: the same
     // body earns its own exact ACK. The usage_identical body is not leased,
@@ -1485,14 +1470,31 @@ fn c12_head_unstored_answers_hold_until_growth_earns_its_own_ack() {
     assert!(!due.progress.active_quarantine_retries.contains(&e));
     assert_terminal(&due, &e, &main_body);
 
-    // Past 12 h: nothing.
+    // Past 12 h, an unchanged same-generation restart reads and offers
+    // nothing: the covered revision keeps its accepted head and is never
+    // re-emitted smaller.
     home.now += SIX_HOURS;
+    home.restart();
     let later = home.cycle(&server, &recording);
     assert!(later.finish.is_ok(), "{:?}", later.finish);
+    assert!(later.before.is_empty());
     assert!(later.batches.is_empty());
     assert!(later.finalized.is_empty());
     assert_terminal(&later, &e, &main_body);
     assert!(!later.index.accepted_snapshot_fingerprint_recorded(&e));
+    let mut quiet_route = emitted_route(&later, claude, &server);
+    quiet_route.mode = transition::Mode::Restart;
+    transition::money_oracle::assert_quiet_restart_with_anchor_window(
+        &quiet_route,
+        later.quiet_anchor_window,
+    );
+    transition::money_oracle::assert_no_smaller_reemit(
+        &e_session,
+        &prior,
+        &quiet_route,
+        &cold_main,
+        true,
+    );
 
     // Upgrade route: a build before this change kept this body in 6 h/12 h
     // retry custody. Once due, it is offered once more; the head still holds

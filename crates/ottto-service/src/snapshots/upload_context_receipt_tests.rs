@@ -1354,7 +1354,14 @@ fn real_uploader_unstored_answer_holds_by_basis_and_growth_earns_receipt() {
             0
         );
         assert_eq!(f.uploader.posts.len(), posts + 1, "{basis}: one POST");
-        answered.push(f.uploader.posts[posts].clone());
+        // Each arm reads its own fixture file: only the physical identity
+        // (`source_file_fingerprint`) may differ, as in the money oracle's
+        // normalization. Every other byte, money included, must be equal.
+        let mut post = f.uploader.posts[posts].clone();
+        for item in &mut post {
+            item["source_file_fingerprint"] = json!("physical-identity:excluded");
+        }
+        answered.push(post);
         assert_eq!(f.uploader.fresh_count(), 0);
         assert_eq!(f.uploader.not_stored_files(), 1);
         assert_ne!(
