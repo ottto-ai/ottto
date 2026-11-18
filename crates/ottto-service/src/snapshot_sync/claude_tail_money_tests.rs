@@ -1514,7 +1514,20 @@ fn recreated_before_absence_proof_recovers_owed_change_once() {
         page.enrich(&c);
         page.finish();
         assert_eq!(step.get(), 2, "deleted after the listing, then recreated");
-        assert!(page.scan.census_complete, "the walk stays clean");
+        assert!(
+            page.scan.census_complete,
+            "the walk stays clean: status={:?} disappeared={} unreadable={} discovered={} scanned={} rows={}",
+            page.scan.census_status,
+            page.scan.disappeared_file_count,
+            page.scan.unreadable_path_count,
+            page.scan.discovered_file_count,
+            page.scan.scanned_file_count,
+            rows.iter()
+                .filter(|row| row.to_string().contains("disappear") || row.to_string().contains("WalkEntry"))
+                .map(|row| row.to_string().chars().take(300).collect::<String>())
+                .collect::<Vec<_>>()
+                .join(" | "),
+        );
         let kept = page.index.files.get(&key).expect("the entry is kept");
         assert_eq!(
             kept.last_upload_body_witness,
