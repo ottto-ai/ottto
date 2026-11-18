@@ -1318,9 +1318,9 @@ fn cache_effective_wire_mandatory_head_obligation_survives_finalizer_noop() {
             )
             .unwrap());
     }
-    progress.save(&progress_path).unwrap(); // obligation before no-op index settlement
+    progress.save_fixture(&progress_path).unwrap(); // obligation before no-op index settlement
     index.save_fixture(&index_path).unwrap();
-    progress.finish_cycle(&progress_path).unwrap();
+    progress.finish_cycle_fixture(&progress_path).unwrap();
     let mut loaded = ScanIndex::load(&index_path).unwrap();
     loaded.activate_upload_context("cache-on-mandatory".into());
     loaded.activate_effective_upload_body_witness_revision(effective_upload_body_witness_revision(
