@@ -69,13 +69,20 @@ fn walked(cycle: &Cycle) -> bool {
     cycle.gate["census_complete"] == true
 }
 
+/// The previous pass's arm, then this pass's prepare and gate, one short
+/// line each (diagnostic only).
+fn trace_lines() -> String {
+    let lines = walk_idle::take_trace_for_test();
+    let p = lines.iter().rposition(|line| line.starts_with("P "));
+    let arm = p.and_then(|p| lines[..p].iter().rev().find(|line| line.starts_with("A ")));
+    let pick = |found: Option<&String>| found.map_or("none".to_owned(), Clone::clone);
+    let prepare = pick(p.map(|p| &lines[p]));
+    let gate = pick(p.and_then(|p| lines[p..].iter().find(|line| line.starts_with("G "))));
+    format!("{}\n{prepare}\n{gate}", pick(arm))
+}
+
 fn assert_idle(cycle: &Cycle) {
-    assert!(
-        !walked(cycle),
-        "{}\nTRACE:\n{}",
-        cycle.gate,
-        walk_idle::take_trace_for_test().join("\n")
-    );
+    assert!(!walked(cycle), "{}", trace_lines());
     assert_eq!(cycle.steps.len(), 1, "an idle page is one step");
     assert_eq!(cycle.gate["scanned_file_count"], 0);
     assert!(cycle.before.is_empty() && cycle.finalized.is_empty());
@@ -87,11 +94,7 @@ fn assert_idle(cycle: &Cycle) {
 fn settle(home: &mut OracleHome, server: &OracleServer, recording: &Recording) -> Vec<Cycle> {
     let mut cycles = Vec::new();
     loop {
-        assert!(
-            cycles.len() < 4,
-            "the fixture walk did not settle\nTRACE:\n{}",
-            walk_idle::take_trace_for_test().join("\n")
-        );
+        assert!(cycles.len() < 4, "{}", trace_lines());
         cycles.push(home.cycle(server, recording));
         if walked(cycles.last().unwrap()) && walk_idle::armed_for_test(home.source).is_some() {
             return cycles;
@@ -325,10 +328,7 @@ fn idle_page_that_starts_a_walk_finishes_ordinarily() {
             scan,
         } = frame.step()
         else {
-            panic!(
-                "an idle page completes in one step\nTRACE:\n{}",
-                walk_idle::take_trace_for_test().join("\n")
-            );
+            panic!("{}", trace_lines());
         };
         assert!(scan.walk_idle);
         walk_idle::start_walk_for_test(source, &watched, &mut index);

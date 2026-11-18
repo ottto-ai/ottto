@@ -167,20 +167,29 @@ pub(crate) fn gate(
             && owes_nothing(index, pass.days, now);
         #[cfg(test)]
         trace(format!(
-            "gate {source:?} idle={idle} walking={walking} covered={} outside={outside_owes_nothing} \
-             previous={previous:?} now={now} record={:?} owes=[{}]",
-            pass.covered,
-            slot.record.as_ref().map(|record| format!(
-                "key_same={} homes_same={} homes={:?}/{:?} gen={}/{} started={} in_gap={}",
-                record.pass.key == pass.key,
-                record.pass.same(pass),
-                record.pass.codex_homes.iter().map(Option::is_some).collect::<Vec<_>>(),
-                pass.codex_homes.iter().map(Option::is_some).collect::<Vec<_>>(),
-                record.generation,
-                index.generation,
-                record.started_at,
-                (record.started_at..record.started_at.saturating_add(WALK_GAP)).contains(&now),
-            )),
+            "G i{} w{} c{} o{} p{} r{} ow{}",
+            u8::from(idle),
+            u8::from(walking),
+            u8::from(pass.covered),
+            u8::from(outside_owes_nothing),
+            previous.map_or(-1, |at| now as i64 - at as i64),
+            slot.record
+                .as_ref()
+                .map_or("-".to_owned(), |record| format!(
+                    "[k{} s{} h{}/{} g{}/{} gap{}]",
+                    u8::from(record.pass.key == pass.key),
+                    u8::from(record.pass.same(pass)),
+                    record
+                        .pass
+                        .codex_homes
+                        .iter()
+                        .filter(|h| h.is_some())
+                        .count(),
+                    pass.codex_homes.iter().filter(|h| h.is_some()).count(),
+                    record.generation,
+                    index.generation,
+                    now as i64 - record.started_at as i64,
+                )),
             owes_trace(index, pass.days, now),
         ));
         if !idle {
@@ -210,23 +219,20 @@ pub(crate) fn arm_after_finish(
                 .any(|gated| gated.held == Some(HistoryHold::TelemetryUnread))
             && owes_nothing(index, pass.days, crate::scan_clock::utc_seconds())
     });
-    #[cfg(test)]
-    trace(format!(
-        "arm {:?} walk_idle={} settled_start={:?} settled={settled:?} outside={outside_owes_nothing} \
-         traversal={} generation={generation:?} index_gen={}",
-        scan.source,
-        scan.walk_idle,
-        scan.settled_walk_start,
-        index.traversal.is_some(),
-        index.generation,
-    ));
     with_slot(scan.source, |slot| {
         #[cfg(test)]
         trace(format!(
-            "arm walk_start_same={:?}",
+            "A wi{} ss{:?} st{} o{} t{} g{:?}/{} same{:?}",
+            u8::from(scan.walk_idle),
+            scan.settled_walk_start,
+            u8::from(settled.is_some()),
+            u8::from(outside_owes_nothing),
+            u8::from(index.traversal.is_some()),
+            generation,
+            index.generation,
             slot.walk_start
                 .as_ref()
-                .map(|start| (start.key == pass.key, start.same(&pass)))
+                .map(|start| (u8::from(start.key == pass.key), u8::from(start.same(&pass)))),
         ));
         if scan.walk_idle {
             let record = slot
@@ -359,16 +365,23 @@ fn owes_trace(index: &ScanIndex, days: u64, now: u64) -> String {
         })
         .collect::<Vec<_>>();
     format!(
-        "persist={} unsettled={} decode_empty={} deferred={} quarantine={} correction={} growth={} selected={selected:?}",
-        index.persistence_available(),
-        index.bounded_sweep_had_unsettled_upload,
-        index.decode_holds.is_empty(),
+        "[p{} u{} d{} df{} q{} c{} gr{} sel{}:{}]",
+        u8::from(index.persistence_available()),
+        u8::from(index.bounded_sweep_had_unsettled_upload),
+        u8::from(!index.decode_holds.is_empty()),
         index.claude_account_deferred_holds.len(),
-        index.claude_usage_authority_quarantine.values().any(|record| {
-            record.disposition == ClaudeUsageAuthorityQuarantineDisposition::RetryPending
-        }),
-        index.claude_authority_proof_correction_blocking().0,
-        sampled_audit::growth_claim_expired(index, now),
+        u8::from(
+            index
+                .claude_usage_authority_quarantine
+                .values()
+                .any(|record| {
+                    record.disposition == ClaudeUsageAuthorityQuarantineDisposition::RetryPending
+                })
+        ),
+        u8::from(index.claude_authority_proof_correction_blocking().0),
+        u8::from(sampled_audit::growth_claim_expired(index, now)),
+        selected.len(),
+        selected.first().map_or("", String::as_str),
     )
 }
 
