@@ -112,8 +112,7 @@ fn settle(
         &acks,
     );
     let path = home.join("scan-index.json");
-    settled.save(&path).unwrap();
-    ScanIndex::load(&path).unwrap()
+    e2_pipeline_scan_fixture::save_reload_for_test(&mut settled, &path)
 }
 
 fn support(name: &str) -> crate::test_scratch::ScratchDir {

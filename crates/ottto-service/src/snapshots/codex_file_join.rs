@@ -2907,7 +2907,9 @@ pub(super) mod tests {
         result.validate_codex_checkpoint().unwrap();
         result.finish_codex_capture_boundary(&mut index);
         let state = root.join("index.json");
-        index.save(&state).unwrap();
+        index
+            .save_fixture_for_source(&state, SnapshotSource::Codex)
+            .unwrap();
         assert!(state.is_file());
         fs::remove_dir_all(root).unwrap();
     }
@@ -2964,7 +2966,9 @@ pub(super) mod tests {
             .collect();
         index = index.committable_subset(&previous, &accepted, &BTreeMap::new());
         let state = root.join("index.json");
-        index.save(&state).unwrap();
+        index
+            .save_fixture_for_source(&state, SnapshotSource::Codex)
+            .unwrap();
         index = ScanIndex::load(&state).unwrap();
         assert!(!index
             .traversal
@@ -3011,7 +3015,9 @@ pub(super) mod tests {
             .collect();
         later.finish_codex_capture_boundary(&mut index);
         index = index.committable_subset(&previous, &accepted, &BTreeMap::new());
-        index.save(&state).unwrap();
+        index
+            .save_fixture_for_source(&state, SnapshotSource::Codex)
+            .unwrap();
         let (_, quiet) = scan(&root, ScanIndex::load(&state).unwrap(), 8);
         assert_eq!(
             quiet.scanned_file_count, 0,
@@ -3550,7 +3556,9 @@ pub(super) mod tests {
         let mut committed =
             working.committable_subset(&ScanIndex::default(), &fingerprints, &BTreeMap::new());
         let saved = root.join("index.json");
-        committed.save(&saved).unwrap();
+        committed
+            .save_fixture_for_source(&saved, SnapshotSource::Codex)
+            .unwrap();
         older_build_logs_expired();
         saved
     }
@@ -3657,7 +3665,9 @@ pub(super) mod tests {
         entry.codex_applied_tier_receipt_required = false;
         entry.codex_captured_tier_receipt = None;
         entry.codex_captured_tier_receipt_required = false;
-        legacy.save(&saved).unwrap();
+        legacy
+            .save_fixture_for_source(&saved, SnapshotSource::Codex)
+            .unwrap();
         let mut loaded = ScanIndex::load(&saved).unwrap();
         loaded.prepare_historical_replay("receipt-less-upgrade".into());
         let (_, replayed) = scan(&root, loaded, 3);
@@ -3706,7 +3716,9 @@ pub(super) mod tests {
         let mut settled = index.committable_subset(&previous, &accepted, &BTreeMap::new());
         assert_eq!(settled.files.len(), 2);
         let path = root.join("index.json");
-        settled.save(&path).unwrap();
+        settled
+            .save_fixture_for_source(&path, SnapshotSource::Codex)
+            .unwrap();
         let loaded = ScanIndex::load(&path).unwrap();
         let (_index, restarted) = scan(&root, loaded, 2);
         assert!(
@@ -3985,7 +3997,9 @@ pub(super) mod tests {
         );
         let mut settled = after.committable_subset(&previous, &accepted, &BTreeMap::new());
         let state = root.join("index.json");
-        settled.save(&state).unwrap();
+        settled
+            .save_fixture_for_source(&state, SnapshotSource::Codex)
+            .unwrap();
         let (_, quiet) = scan(&root, ScanIndex::load(&state).unwrap(), 2);
         assert!(quiet.snapshots.is_empty());
         assert_eq!(quiet.semantic_noop_count, 2);
@@ -4997,7 +5011,9 @@ pub(super) mod tests {
                 working.stage_codex_recovery_capture(&ScanIndex::default(), &result.snapshots);
             assert_eq!(changed.len(), 1);
             let path = root.join("capture.json");
-            captured.save(&path).unwrap();
+            captured
+                .save_fixture_for_source(&path, SnapshotSource::Codex)
+                .unwrap();
             let key = captured
                 .files
                 .iter()
@@ -5007,7 +5023,10 @@ pub(super) mod tests {
                 .clone();
             let mut value = serde_json::to_value(&captured).unwrap();
             value["files"][&key]["codex_captured_tier_receipt"] = malformed;
-            fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+            e2_pipeline_scan_fixture::seed_json_for_test(
+                &path,
+                &serde_json::to_vec(&value).unwrap(),
+            );
             let loaded = ScanIndex::load(&path).unwrap();
             assert_eq!(
                 loaded.files.len(),
@@ -5252,7 +5271,9 @@ pub(super) mod tests {
             .collect();
         let mut committed = after.committable_subset(&capture, &accepted, &BTreeMap::new());
         let saved = root.join("index.json");
-        committed.save(&saved).unwrap();
+        committed
+            .save_fixture_for_source(&saved, SnapshotSource::Codex)
+            .unwrap();
         let mut loaded = ScanIndex::load(&saved).unwrap();
         assert_eq!(tiers(&loaded), 1028);
         // T3: the trace source expires; only the saved receipt can price b.
@@ -5313,7 +5334,9 @@ pub(super) mod tests {
         let mut committed =
             working.committable_subset(&ScanIndex::default(), &fingerprints, &BTreeMap::new());
         let saved = root.join("index.json");
-        committed.save(&saved).unwrap();
+        committed
+            .save_fixture_for_source(&saved, SnapshotSource::Codex)
+            .unwrap();
         // Both routes take their receipt evidence from the saved index, which
         // the replay reads; what can differ is the replayed rows' money and
         // placement.

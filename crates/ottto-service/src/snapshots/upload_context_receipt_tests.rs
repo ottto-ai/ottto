@@ -610,7 +610,7 @@ fn upload_context_receipt_survives_restart() {
     );
     assert!(counts.local_bytes <= size);
     let saved_path = f._scratch.join("restart-index.json");
-    f.index.save(&saved_path).unwrap();
+    f.index.save_fixture(&saved_path).unwrap();
     f.index = ScanIndex::load(&saved_path).unwrap();
     f.index
         .activate_file_upload_context(f.source, "d".repeat(64));
@@ -939,8 +939,8 @@ fn legacy_round_trip(version: &str) {
     let mut f = Fixture::new(SnapshotSource::Codex);
     f.adopt();
     let saved_path = f._scratch.join("downgrade-index.json");
-    f.index.save(&saved_path).unwrap();
-    let encoded: Value = serde_json::from_slice(&fs::read(&saved_path).unwrap()).unwrap();
+    f.index.save_fixture(&saved_path).unwrap();
+    let encoded: Value = serde_json::to_value(&f.index).unwrap();
     // The complete released per-entry codecs are byte-identical at the two
     // pinned versions. Exercise their actual serde path on every files slot.
     let mut old = encoded.clone();
@@ -949,8 +949,10 @@ fn legacy_round_trip(version: &str) {
         *value = serde_json::to_value(decoded).unwrap();
         assert!(value.get("upload_context_receipt").is_none(), "{version}");
     }
-    fs::write(&saved_path, serde_json::to_vec(&old).unwrap()).unwrap();
-    f.index = ScanIndex::load(&saved_path).unwrap();
+    f.index = e2_pipeline_scan_fixture::seed_json_for_test(
+        &saved_path,
+        &serde_json::to_vec(&old).unwrap(),
+    );
     // Downgrade saves also pass progress through the old unknown-field codec.
     f.uploader.forget_stamps();
     f.index

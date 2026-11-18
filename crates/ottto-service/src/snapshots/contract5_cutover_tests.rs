@@ -109,8 +109,7 @@ fn a_retired_permit_bit_is_decoded_and_never_replayed() {
         store.set_money_rule_version(stored_version);
         store.set_money_marks(marked, RETIRED_PERMIT_MARK | money_mark::DISCLOSED);
         index.claude_request_identity_contract = Some(String::new());
-        index.save(&file).unwrap();
-        let mut loaded = ScanIndex::load(&file).unwrap();
+        let mut loaded = e2_pipeline_scan_fixture::save_reload_for_test(&mut index, &file);
         assert_eq!(
             marks(&loaded, marked),
             RETIRED_PERMIT_MARK | money_mark::DISCLOSED,

@@ -110,7 +110,9 @@ fn relogin_alias_keeps_accepted_history_without_a_reread() {
         .accepted_snapshot_fingerprint_recorded(&accepted));
     let namespace = snapshot_upload_destination_namespace(&device_a, "secret-a");
     let ledger = || {
-        SnapshotUploadProgress::load(
+        SnapshotUploadProgress::load_for_index(
+            &ScanIndex::load(&index_path).unwrap(),
+            &index_path,
             &progress_path,
             &namespace,
             snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
@@ -326,7 +328,7 @@ fn owner_return_preserves_all_source_carry() {
             }))
             .unwrap(),
         );
-        legacy.save(&cx_path).unwrap();
+        legacy.save_fixture(&cx_path).unwrap();
         crate::snapshots::older_build_logs_priority("return-turn");
         // A claim switch keeps the daemon alive. Keep its physical-header cache
         // while reloading account/index state on each ordinary source pass.
@@ -509,7 +511,7 @@ fn owner_return_preserves_all_source_carry() {
             let source = SnapshotSource::Pi;
             let mut old = ScanIndex::load(&index_path(&namespace_a, source)).unwrap();
             old.prepare_historical_replay(format!("pi:old-revision:{namespace_a}"));
-            old.save(&index_path(&namespace_a, source)).unwrap();
+            old.save_fixture(&index_path(&namespace_a, source)).unwrap();
             crate::backfill::update_backfill_state(&support, |state| {
                 state
                     .completed_destination_replays
@@ -839,7 +841,7 @@ fn account_return_history_row(recorded_a: bool) {
         }))
         .unwrap(),
     );
-    legacy.save(&cx_path).unwrap();
+    legacy.save_fixture(&cx_path).unwrap();
     // Like install_legacy_active: A already completed its initial Codex backfill.
     crate::backfill::update_backfill_state(&support, |state| {
         crate::backfill::mark_backfill_complete_for_destination(

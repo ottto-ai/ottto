@@ -290,8 +290,7 @@ fn invalid_correction_states_drop_only_the_affected_authority_record() {
     let mut index = apc_terminal_fixture();
     apc_prove(&mut index, &apc_witness('f'));
     index.save(&scratch.join("valid-source.json")).unwrap();
-    let valid: Value =
-        serde_json::from_slice(&fs::read(scratch.join("valid-source.json")).unwrap()).unwrap();
+    let valid = serde_json::to_value(&index).unwrap();
     let (loaded, quarantined) = apc_load_value(&scratch, "valid", &valid);
     assert!(!quarantined);
     assert_eq!(serde_json::to_value(&loaded).unwrap(), valid);

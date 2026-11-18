@@ -94,7 +94,7 @@ fn held_validation_rejection_prunes_old_accepted_revisions_from_progress() {
     let index_path = scratch.join("index.json");
     let progress_path = scratch.join("progress.json");
     let mut index = ScanIndex::default();
-    index.save(&index_path).unwrap();
+    index.save_fixture(&index_path).unwrap();
     progress.save(&progress_path).unwrap();
 
     for revision in 0..20 {
@@ -106,7 +106,7 @@ fn held_validation_rejection_prunes_old_accepted_revisions_from_progress() {
             .file_snapshot_fingerprints
             .insert("changing.jsonl".into(), BTreeSet::from([valid.clone()]));
         let retired = progress.retired_ack_candidates(&previous, &index);
-        index.save(&index_path).unwrap();
+        index.save_fixture(&index_path).unwrap();
         index = ScanIndex::load(&index_path).unwrap();
         progress.retire_acks_after_index_save(&index, &retired, &BTreeSet::new());
         progress.save(&progress_path).unwrap();
@@ -668,7 +668,7 @@ fn due_not_pending_quarantine_resends_once_and_paces_local_holds() {
     index = serde_json::from_value(state).unwrap();
     let index_path = root.join("index.json");
     let progress_path = root.join("progress.json");
-    index.save(&index_path).unwrap();
+    index.save_fixture(&index_path).unwrap();
     progress.save(&progress_path).unwrap();
     progress = SnapshotUploadProgress::load(
         &progress_path,
@@ -687,7 +687,7 @@ fn due_not_pending_quarantine_resends_once_and_paces_local_holds() {
     progress
         .quarantined_fingerprints
         .insert(fingerprint.clone(), terminal.clone());
-    index.save(&index_path).unwrap();
+    index.save_fixture(&index_path).unwrap();
     assert!(progress.retain_current_quarantines(&index.current_snapshot_fingerprints(), &index));
     progress.save(&progress_path).unwrap();
     index = ScanIndex::load(&index_path).unwrap();
@@ -1047,7 +1047,7 @@ fn admission_native_hourly_bodies_recover_without_losing_usage_or_siblings() {
     );
     index.quarantined_snapshot_fingerprints = progress.quarantined_fingerprints.clone();
     assert!(index.prepare_snapshot_admission_reoffer(50));
-    index.save(&root.join("index.json")).unwrap();
+    index.save_fixture(&root.join("index.json")).unwrap();
     progress.active_quarantine_witness = Some(test_quarantine_witness());
     assert!(progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints));
     let before = snapshot_upload_body_witness(large);
@@ -1121,7 +1121,7 @@ fn admission_reoffer_replaces_stale_terminal_progress_and_survives_restart() {
     index.quarantined_snapshot_fingerprints = progress.quarantined_fingerprints.clone();
     let index_path = root.join("index.json");
     assert!(index.prepare_snapshot_admission_reoffer(50));
-    index.save(&index_path).unwrap();
+    index.save_fixture(&index_path).unwrap();
     progress = SnapshotUploadProgress::load(&path, &namespace, test_quarantine_witness()).unwrap();
     assert!(progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints));
     assert!(progress.active_quarantine_retries.contains(&fingerprint));
