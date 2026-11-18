@@ -136,6 +136,24 @@ baseline uses an explicit absolute bound, otherwise any nonzero value fails.
 Reads >3GiB/hour are an alarm. Missing/nonfinite/negative or mismatched evidence
 fails. Supplied pass flags are not trusted.
 
+Trial rest and active budgets (advisory, not checked by the validator yet):
+the single 180 CPU seconds/hour and 100mW ceilings mix quiet hours with hours
+that carry new work, so a daemon that keeps itself busy while nothing changes
+can still pass. RC evidence also reports these trial budgets, split by hour
+class, counting the whole daemon including children:
+
+- **Rest hour** (no new provider input and no owed work at the hour start, and
+  no first import or recovery during it): <=36 CPU seconds/hour (1% of one
+  core) and <=25mW battery energy averaged over the hour.
+- **Active hour** (any other awake hour): the existing 180 CPU seconds/hour and
+  100mW ceilings.
+- Memory keeps the existing 150MiB median footprint and 600MiB peak, judged on
+  measured rest and peak, including any state kept between passes.
+
+Report first-import and recovery hours separately rather than in either class.
+Promote a trial budget to an absolute ceiling only after matched RC evidence
+shows it is met with unchanged delivery freshness.
+
 The validator consumes reviewed aggregates; it neither runs the real Mac soak
 nor independently verifies live process identity. Verify candidate PID/start/
 digest and previous-stable provenance before producing evidence. Keep raw
