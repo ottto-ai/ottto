@@ -423,7 +423,10 @@ impl SaveSpan {
     }
     pub(super) fn outcome(&mut self, outcome: &DurableCommitOutcome) {
         self.outcome = match outcome {
-            DurableCommitOutcome::Committed(_) | DurableCommitOutcome::Published(_) => "committed",
+            DurableCommitOutcome::Committed(_) | DurableCommitOutcome::Published(_) => {
+                crate::local_resource_diagnostics::pass_outcomes(|counts| counts.index_saved = 1);
+                "committed"
+            }
             DurableCommitOutcome::NotPublished => "not_published",
             DurableCommitOutcome::Ambiguous => "ambiguous",
         };

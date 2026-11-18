@@ -2,6 +2,7 @@
 //! source manifest, upload-progress ACK incidence and the current
 //! snapshot fingerprints.
 
+use crate::local_resource_diagnostics::pass_outcomes;
 use crate::snapshots::*;
 
 impl ScanIndex {
@@ -125,6 +126,7 @@ impl ScanIndex {
         }
         match scan_index_integration::publish_at(path, self) {
             Ok(Some(state)) => {
+                pass_outcomes(|counts| counts.index_saved = 1);
                 self.deleted_holders.clear();
                 self.persistence_root = Some(state);
                 self.persistence_legacy_recovery = None;
@@ -169,6 +171,7 @@ impl ScanIndex {
             let _ = fs::remove_file(&temp_path);
         }
         if result.is_ok() {
+            pass_outcomes(|counts| counts.index_saved = 1);
             self.deleted_holders.clear();
         }
         result
