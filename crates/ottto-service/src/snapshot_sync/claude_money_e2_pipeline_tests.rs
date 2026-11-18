@@ -4802,13 +4802,14 @@ fn e2_pipeline_lossy_absence_never_invalidates_a_stored_removal() {
     });
 }
 
-/// [money] Forward-only: an accepted copy settled with its prefix removed
-/// before the copy proof cutoff keeps that removal when its saved removal
-/// metadata is lost (absent or damaged), even when no census proves it any
-/// more; re-counting would re-emit a larger body than the one accepted. Own
-/// turns publish without delay.
+/// [money] An accepted copy whose saved removal metadata is lost (absent or
+/// damaged) is decided by the request-id holder proof like any other copy:
+/// while the census still proves the holder, the prefix stays removed; once
+/// nothing proves it, the prefix is counted and flagged as unproven, and a
+/// damaged record is also flagged as lost metadata. Own turns publish
+/// without delay.
 #[test]
-fn e2_pipeline_lost_removal_metadata_keeps_an_accepted_copys_decision() {
+fn e2_pipeline_lost_removal_metadata_decides_by_holder_proof() {
     for missing in [false, true] {
         for retired in [false, true] {
             with_e2(|| {
@@ -4837,16 +4838,31 @@ fn e2_pipeline_lost_removal_metadata_keeps_an_accepted_copys_decision() {
                 let page = ready(&c, &E2ScanFixture::default(), prior, 100, false);
                 let third = body(&page, THIRD).expect("own turns always publish");
                 let case = format!("missing {missing} retired {retired}");
-                assert_eq!(
-                    (third.request_count, third.removed_request_count),
-                    (2, Some(3)),
-                    "{case}"
-                );
-                assert_eq!(
-                    copy_diag(&["copy_prefix_unproven", "copy_removal_metadata_lost"]),
-                    [0, 0],
-                    "{case}: nothing flagged"
-                );
+                if retired {
+                    // No proof left: the prefix counts and is flagged.
+                    assert_eq!(
+                        (third.request_count, third.removed_request_count),
+                        (5, Some(0)),
+                        "{case}"
+                    );
+                    assert_eq!(
+                        copy_diag(&["copy_prefix_unproven", "copy_removal_metadata_lost"]),
+                        [3, if missing { 0 } else { 3 }],
+                        "{case}: counted prefix is flagged"
+                    );
+                } else {
+                    // The census still proves the holder: the removal stays.
+                    assert_eq!(
+                        (third.request_count, third.removed_request_count),
+                        (2, Some(3)),
+                        "{case}"
+                    );
+                    assert_eq!(
+                        copy_diag(&["copy_prefix_unproven", "copy_removal_metadata_lost"]),
+                        [0, 0],
+                        "{case}: nothing flagged"
+                    );
+                }
             });
         }
     }
