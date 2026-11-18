@@ -1569,7 +1569,7 @@ mod tests {
             ..Default::default()
         };
         let collection = |auto_compaction| {
-            let mut collection = specimen(SourceKind::Claude);
+            let mut collection = specimen(SourceKind::ClaudeCode);
             let row = &mut collection.snapshots[0];
             row.runtime_defaults = Some(ottto_protocol::AgentRuntimeDefaults {
                 auto_compaction,

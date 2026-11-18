@@ -15157,7 +15157,11 @@ fn codex_runtime_defaults_carry_saved_auto_compaction_for_default_home_only() {
         "model = \"gpt-5.5\"\nmodel_auto_compact_token_limit = 200000\n",
     );
     let build = |trust| {
-        codex::collect::build_codex_runtime_defaults_at("2026-07-25T10:00:00Z", &home, trust)
+        crate::agent_status::codex::collect::build_codex_runtime_defaults_at(
+            "2026-07-25T10:00:00Z",
+            &home,
+            trust,
+        )
     };
     let default_home = build(CodexHomeTrust::ProviderDefault).expect("defaults record");
     assert_eq!(default_home.model.as_deref(), Some("gpt-5.5"));

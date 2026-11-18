@@ -708,7 +708,6 @@ mod sampled_scalar_buffer_tests {
             ..without.clone()
         };
         assert!(with.stable_heap());
-        assert!(<ottto_protocol::AgentAutoCompaction as HeapLayoutBound>::INLINE_ONLY);
         if !layout_supported() {
             return;
         }

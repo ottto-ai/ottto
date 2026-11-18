@@ -89,7 +89,7 @@ const CLAUDE_FAST_MODE_DEFAULT_SOURCE: &str = "claude_code.default.fastMode";
 pub(crate) enum ClaudeConfigDefaultsOutcome {
     /// At least one settings file parsed cleanly. Fast mode is always known
     /// then: a chain without `fastMode` reports Claude Code's default, off.
-    Configured(ClaudeConfigDefaults),
+    Configured(Box<ClaudeConfigDefaults>),
     /// No settings file in the chain could be read and parsed, so nothing is
     /// reported, not even the Fast default.
     Unreadable,
@@ -243,7 +243,7 @@ pub(crate) fn load_claude_settings_defaults(
         ..Default::default()
     };
 
-    ClaudeConfigDefaultsOutcome::Configured(defaults)
+    ClaudeConfigDefaultsOutcome::Configured(Box::new(defaults))
 }
 
 /// Read one Claude Code settings file into JSON; `None` for any failure.
