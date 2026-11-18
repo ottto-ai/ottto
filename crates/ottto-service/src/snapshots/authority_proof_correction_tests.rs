@@ -472,7 +472,10 @@ fn pre_change_decoder_rejects_v2_but_native_import_keeps_its_correction() {
     e2_pipeline_scan_fixture::legacy_input_for_test(&path, &serde_json::to_vec(&index).unwrap());
     let encoded_index_bytes = fs::metadata(&path).unwrap().len();
     let imported = ScanIndex::load(&path).unwrap();
-    assert_eq!(serde_json::to_value(&imported).unwrap(), saved);
+    assert_eq!(imported.generation, index.generation + 1);
+    let mut imported_expected = saved;
+    imported_expected["generation"] = json!(imported.generation);
+    assert_eq!(serde_json::to_value(&imported).unwrap(), imported_expected);
     apc_emit(json!({
         "receipt": "claude_authority_correction_old_reader:v1",
         "decoder": "source_pinned_0_1_173_896b98f6_record_and_predicate",
