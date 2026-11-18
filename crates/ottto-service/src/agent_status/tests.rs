@@ -3824,13 +3824,13 @@ fn codex_explicit_refresh_is_rate_limited_and_the_schedule_waits_its_interval() 
     codex_saved_quota::forget_running_homes();
     let before = codex_app_server_runs();
 
-    let first = with_trigger(Trigger::ExplicitRefresh, || refresh_codex_quota_now(0));
+    let first = with_trigger(Trigger::ExplicitRefresh, refresh_codex_quota_now);
     assert_eq!(first.read, 1);
     assert_eq!(first.rate_limited, 0);
     assert_eq!(codex_app_server_runs(), before + 1);
 
     // A second press within the minute reads nothing.
-    let second = refresh_codex_quota_now(0);
+    let second = refresh_codex_quota_now();
     assert_eq!(second.read, 0);
     assert_eq!(second.rate_limited, 1);
     assert_eq!(codex_app_server_runs(), before + 1);
@@ -3952,7 +3952,7 @@ fn codex_background_refresh_off_stops_the_schedule_but_not_refresh_or_setup() {
     assert_eq!(codex_app_server_runs(), before);
 
     // A person's Refresh reads.
-    let refreshed = refresh_codex_quota_now(0);
+    let refreshed = refresh_codex_quota_now();
     assert_eq!((refreshed.read, refreshed.rate_limited), (1, 0));
     assert_eq!(codex_app_server_runs(), before + 1);
     // The setup check's provider read reads too.
