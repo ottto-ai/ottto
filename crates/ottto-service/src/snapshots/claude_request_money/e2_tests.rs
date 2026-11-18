@@ -2626,9 +2626,11 @@ fn e2_identity_final_twin_union_over_authority_cap_withholds_unproved_identity()
             item.claude_account_withheld_reason,
             Some(crate::snapshots::CLAUDE_ACCOUNT_WITHHELD_TOO_MANY_ACCOUNTS)
         );
+        // Grouping already folded the keys past the row limit and refused
+        // that bucket row; the hold keeps that count and strips nothing more.
         assert_eq!(
-            item.request_identity_refusals, 0,
-            "a hold strips no row, so it refuses none"
+            item.request_identity_refusals, 1,
+            "the bucket row lost proof"
         );
         assert_evidence_referenced(&item);
         cleanup(&[&a, &b]);
