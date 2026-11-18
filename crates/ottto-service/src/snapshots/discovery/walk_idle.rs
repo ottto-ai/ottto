@@ -166,33 +166,6 @@ pub(crate) fn gate(
                         .contains(&now)
             })
             && owes_nothing(index, pass.days, now);
-        #[cfg(test)]
-        trace(format!(
-            "G i{} w{} c{} o{} p{} r{} ow{}",
-            u8::from(idle),
-            u8::from(walking),
-            u8::from(pass.covered),
-            u8::from(outside_owes_nothing),
-            previous.map_or(-1, |at| now as i64 - at as i64),
-            slot.record
-                .as_ref()
-                .map_or("-".to_owned(), |record| format!(
-                    "[k{} s{} h{}/{} g{}/{} gap{}]",
-                    u8::from(record.pass.key == pass.key),
-                    u8::from(record.pass.same(pass)),
-                    record
-                        .pass
-                        .codex_homes
-                        .iter()
-                        .filter(|h| h.is_some())
-                        .count(),
-                    pass.codex_homes.iter().filter(|h| h.is_some()).count(),
-                    record.generation,
-                    index.generation,
-                    now as i64 - record.started_at as i64,
-                )),
-            owes_trace(index, pass.days, now),
-        ));
         if !idle {
             slot.record = None;
         }
@@ -220,22 +193,6 @@ pub(crate) fn arm_after_finish(
             .any(|gated| gated.held == Some(HistoryHold::TelemetryUnread))
         && owes_nothing(index, pass.days, crate::scan_clock::utc_seconds());
     with_slot(scan.source, |slot| {
-        #[cfg(test)]
-        trace(format!(
-            "A wi{} ss{} st{} o{} t{} g{:?}/{} same{:?}",
-            u8::from(scan.walk_idle),
-            u8::from(scan.settled_walk),
-            u8::from(settled),
-            u8::from(outside_owes_nothing),
-            u8::from(index.traversal.is_some()),
-            generation,
-            index.generation,
-            slot.walk_start.as_ref().map(|(start, at)| (
-                u8::from(start.key == pass.key),
-                u8::from(start.same(&pass)),
-                *at
-            )),
-        ));
         if scan.walk_idle {
             let record = slot
                 .record
@@ -329,60 +286,6 @@ fn stored_candidate(key: &str, entry: &ScanIndexEntry) -> CandidateFile {
         fingerprint_birth_nanos: entry.opened_birth_nanos,
         withheld_content_stamp: None,
     }
-}
-
-#[cfg(test)]
-thread_local! {
-    static TRACE: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// Diagnostic only: why the gate held or walked.
-#[cfg(test)]
-pub(crate) fn trace(line: String) {
-    TRACE.with(|lines| lines.borrow_mut().push(line));
-}
-
-#[cfg(test)]
-pub(crate) fn take_trace_for_test() -> Vec<String> {
-    TRACE.with(|lines| std::mem::take(&mut *lines.borrow_mut()))
-}
-
-#[cfg(test)]
-fn owes_trace(index: &ScanIndex, days: u64, now: u64) -> String {
-    let selected = index
-        .files
-        .iter()
-        .filter(|(key, entry)| {
-            is_recent_enough_at(entry.modified_unix_seconds, now, days)
-                && stored_stamp_selects(index, key, entry, now)
-        })
-        .map(|(key, entry)| {
-            let (decision, reason) = index.candidate_walk_debt(&stored_candidate(key, entry), now);
-            format!(
-                "{}:{decision:?}:{reason:?}",
-                key.rsplit('/').next().unwrap_or(key)
-            )
-        })
-        .collect::<Vec<_>>();
-    format!(
-        "[p{} u{} d{} df{} q{} c{} gr{} sel{}:{}]",
-        u8::from(index.persistence_available()),
-        u8::from(index.bounded_sweep_had_unsettled_upload),
-        u8::from(!index.decode_holds.is_empty()),
-        index.claude_account_deferred_holds.len(),
-        u8::from(
-            index
-                .claude_usage_authority_quarantine
-                .values()
-                .any(|record| {
-                    record.disposition == ClaudeUsageAuthorityQuarantineDisposition::RetryPending
-                })
-        ),
-        u8::from(index.claude_authority_proof_correction_blocking().0),
-        u8::from(sampled_audit::growth_claim_expired(index, now)),
-        selected.len(),
-        selected.first().map_or("", String::as_str),
-    )
 }
 
 /// A simulated process start: every source's record and clocks are gone.
