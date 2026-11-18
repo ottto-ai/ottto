@@ -2574,8 +2574,6 @@ fn malformed_upload_ack_retirement_handoff_keeps_index_identity_without_pause() 
 
             let before = scan_index_containment_lines_for_test().len();
             let mut loaded = read_decoder_fixture(&path).unwrap();
-            let origin = ScanIndexLoadOrigin::Loaded;
-            assert_eq!(origin, ScanIndexLoadOrigin::Loaded, "{case}");
             assert!(!scan_index_rebuild_paused(source), "{case}");
             assert!(loaded.upload_ack_retirement_handoff.is_none(), "{case}");
             assert_identity_carried(&loaded, &seed, case);
@@ -2611,7 +2609,10 @@ fn malformed_upload_ack_retirement_handoff_keeps_index_identity_without_pause() 
             } else {
                 loaded.save(&path).unwrap();
             }
-            let reloaded = ScanIndex::load(&path).unwrap();
+            let (reloaded, origin) =
+                e2_pipeline_scan_fixture::load_source_for_test(&path, source, scratch.as_ref())
+                    .unwrap();
+            assert_eq!(origin, ScanIndexLoadOrigin::Loaded, "{case}");
             assert!(reloaded.upload_ack_retirement_handoff.is_none());
             assert_identity_carried(&reloaded, &seed, case);
             assert_eq!(
