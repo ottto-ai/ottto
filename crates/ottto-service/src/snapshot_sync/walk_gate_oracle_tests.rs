@@ -272,20 +272,18 @@ fn lifecycle(source: SnapshotSource, row: &'static str, gated: bool) -> Lifecycl
         }
         home.restart();
         walk_idle::restart_for_test();
-        let cycle = pass(&mut home, &server, &recording, STEP);
-        expect(cycle, true, &mut cycles);
-        // On a moving clock the restart walk can drop a time-due re-read for
-        // the next walk, so it does not arm; that next walk does.
-        for extra in 0.. {
-            if walk_idle::armed_for_test(source).is_some() {
-                break;
-            }
-            assert!(extra < 3, "{row}: the gate never re-armed");
+        // A restart walks. On a moving clock that walk can drop a time-due
+        // re-read for the next walk and not arm; a pass idles once armed.
+        // Both runs take the same three passes, so their money compares.
+        for after_restart in 0..3 {
+            let armed = walk_idle::armed_for_test(source).is_some();
             let cycle = pass(&mut home, &server, &recording, STEP);
-            expect(cycle, true, &mut cycles);
+            expect(cycle, after_restart == 0 || !armed, &mut cycles);
         }
-        let cycle = pass(&mut home, &server, &recording, STEP);
-        expect(cycle, false, &mut cycles);
+        assert!(
+            walk_idle::armed_for_test(source).is_some(),
+            "{row}: re-armed"
+        );
         // Every completed walk takes its census once; an idle pass none.
         let censuses = cycles.iter().filter(|cycle| walked(cycle)).count();
         assert_eq!(censuses, walks, "{row}");
