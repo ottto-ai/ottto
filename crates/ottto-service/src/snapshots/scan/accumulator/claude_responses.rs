@@ -349,11 +349,7 @@ impl SnapshotAccumulator {
         }
         if let Some(mut money) = money {
             claude_request_money::e2::timed("e2.finish_native", || {
-                money.finish_native(
-                    money_context.as_ref(),
-                    self.claude_org_markers.as_deref(),
-                    self.claude_fork_parent.as_deref(),
-                )
+                money.finish_native(money_context.as_ref(), self.claude_fork_parent.as_deref())
             });
             self.claude_money = Some(Box::new(money));
         }

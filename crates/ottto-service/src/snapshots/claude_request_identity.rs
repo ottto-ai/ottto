@@ -3120,29 +3120,6 @@ impl RequestAccounts {
         runs.last().map(|run| run.position)
     }
 
-    /// Rebuild only after the money owner confirms exclusion. Restored files
-    /// keep every marker; excluded requests cannot lend a marker to own usage.
-    pub(crate) fn finish_native(&mut self, markers: Option<&OrgMarkers>, prefix_excluded: bool) {
-        if prefix_excluded && !self.subagent {
-            let excluded = self
-                .runs
-                .iter()
-                .filter(|run| matches!(run.copied, Some((_, true))))
-                .map(|run| run.position)
-                .collect::<Vec<_>>();
-            let mut own = request_accounts(
-                markers,
-                self.bound.as_ref().and_then(|key| key.login.as_deref()),
-                self.first_retained,
-                false,
-                &excluded,
-                self.trust_from,
-            );
-            own.first_retained = self.first_retained;
-            *self = own;
-        }
-    }
-
     /// The money owner has decided individual copies. Exclude only markers
     /// on still-removed/held requests; an emitted unproven prefix keeps its
     /// own markers. Build beside the original so its grains can be moved.

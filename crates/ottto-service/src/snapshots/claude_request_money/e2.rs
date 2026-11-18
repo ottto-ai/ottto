@@ -1346,7 +1346,6 @@ impl FileFold {
     pub(in crate::snapshots) fn finish_native(
         &mut self,
         context: Option<&ReadContext<'_>>,
-        markers: Option<&claude_request_identity::OrgMarkers>,
         fork_parent: Option<&str>,
     ) {
         let started = Instant::now();
@@ -1354,7 +1353,7 @@ impl FileFold {
             .filter(|parent| !parent.is_empty())
             .map(str::to_owned);
         self.native_copied = self.copied > 0;
-        self.decide_native(context, markers);
+        self.decide_native(context);
         if self.proof.is_none() {
             self.proof = context
                 .and_then(|context| {
@@ -1369,16 +1368,12 @@ impl FileFold {
         self.spend(started);
     }
 
-    fn decide_native(
-        &mut self,
-        context: Option<&ReadContext<'_>>,
-        markers: Option<&claude_request_identity::OrgMarkers>,
-    ) {
+    fn decide_native(&mut self, context: Option<&ReadContext<'_>>) {
         if self.money_birth.uncertain_root() {
             self.disclose("uncertain_birth", self.responses); // counted, disclosed
         }
         if self.copied == 0 {
-            self.finish_identity_start(markers);
+            self.finish_identity_start();
             return;
         }
         if let Some(context) = context.filter(|context| self.cross_session_candidate(context)) {
@@ -1408,7 +1403,7 @@ impl FileFold {
         {
             self.twin_pending = true;
             self.copy = None;
-            self.finish_identity_start(markers);
+            self.finish_identity_start();
             return;
         }
         if let Some(mut copy) = self.copy.take() {
@@ -1423,13 +1418,10 @@ impl FileFold {
         self.skipped.clear();
         self.disclose("copy_unproven", self.copied);
         self.copied = 0;
-        self.finish_identity_start(markers);
+        self.finish_identity_start();
     }
 
-    fn finish_identity_start(&mut self, markers: Option<&claude_request_identity::OrgMarkers>) {
-        if let Some(accounts) = self.accounts.as_deref_mut() {
-            accounts.finish_native(markers, false);
-        }
+    fn finish_identity_start(&mut self) {
         self.absorb_prefix_inherited(false);
     }
 
