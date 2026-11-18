@@ -75,12 +75,10 @@ fn cache_event_ack_restart_correction_and_missing_proof() {
         |_| Ok(()),
     )
     .unwrap();
-    let directory =
-        std::env::temp_dir().join(format!("ottto-cache-progress-{}", std::process::id()));
+    let directory = crate::test_scratch::canonical_private_dir("cache-progress");
     std::fs::create_dir_all(&directory).unwrap();
-    let path = directory.join("progress.json");
+    let path = snapshot_upload_progress_path(&directory.join("index.json"));
     let _ = std::fs::remove_file(&path);
-    restored.save(&path).unwrap();
     let (mut settled_index, _) = pending_head_index_item();
     settled_index.record_accepted_snapshot_fingerprints(&restored.accepted_fingerprints);
     let mut digest = Sha256::new();
@@ -97,10 +95,21 @@ fn cache_event_ack_restart_correction_and_missing_proof() {
         .next()
         .unwrap()
         .last_upload_body_witness = Some(format!("{:x}", digest.finalize()));
-    settled_index.save(&directory.join("index.json")).unwrap();
+    settled_index
+        .save_fixture_for_source(&directory.join("index.json"), SnapshotSource::Codex)
+        .unwrap();
+    restored = route_fixture_progress(
+        &settled_index,
+        &directory.join("index.json"),
+        &path,
+        restored,
+    );
+    restored.save(&path).unwrap();
     restored.retire_acks_after_index_save(&settled_index, &BTreeSet::new(), &BTreeSet::new());
     restored.finish_cycle(&path).unwrap();
-    let mut restored = SnapshotUploadProgress::load(
+    let mut restored = SnapshotUploadProgress::load_for_index(
+        &settled_index,
+        &directory.join("index.json"),
         &path,
         &restored.destination_namespace_hash,
         restored.active_quarantine_witness.clone().unwrap(),
@@ -201,7 +210,7 @@ struct SourceManifestTestGuard;
 fn test_terminal_status_support_dir() -> &'static Path {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     DIR.get_or_init(|| {
-        std::env::temp_dir().join(format!(
+        std::env::temp_dir().canonicalize().unwrap().join(format!(
             "ottto-terminal-status-tests-{}",
             std::process::id()
         ))
@@ -526,9 +535,19 @@ fn account_ack_retry_checkpoints_released_witness_then_becomes_noop() {
 fn replay_generation_reuploads_prior_acks_once_and_resumes_its_own_progress() {
     let poison_scope = &unique_poison_scope();
     let root = test_dir("snapshot-replay-generation-progress");
-    let path = root.join("codex-scan-index-v3-upload-progress.json");
     let items = test_fingerprints(2);
     let destination = format!("{:064x}", 99);
+    // The old ledger bytes sit beside an empty committed native graph.
+    std::fs::create_dir_all(&root).expect("create progress fixture directory");
+    let mut route = ScanIndex::default();
+    let index_path = crate::snapshots::e2_pipeline_scan_fixture::bind_fixture_route(
+        SnapshotSource::Codex,
+        &mut route,
+        &root,
+        &destination,
+    );
+    route.save_fixture(&index_path).unwrap();
+    let path = snapshot_upload_progress_path(&index_path);
     let old_generation = format!("codex:codex_session_exclusive_usage:v2:{destination}");
     let new_generation = format!("codex:codex_session_exclusive_usage:v3:{destination}");
 
@@ -550,19 +569,19 @@ fn replay_generation_reuploads_prior_acks_once_and_resumes_its_own_progress() {
         .as_object_mut()
         .expect("progress is an object")
         .remove("historical_replay_generation");
-    std::fs::create_dir_all(&root).expect("create progress fixture directory");
     std::fs::write(
         &path,
         serde_json::to_vec_pretty(&current_v3).expect("serialize pre-change v3 progress"),
     )
     .expect("save pre-change v3 progress");
 
-    let mut rearmed = SnapshotUploadProgress::load(
-        &path,
+    // The route's first load imports the old bytes as its native rows.
+    let mut rearmed = load_routed_progress(
+        &route,
+        &index_path,
         &destination,
         snapshot_quarantine_witness(SnapshotSource::Codex),
-    )
-    .expect("load pre-change v3 progress");
+    );
     assert!(rearmed.historical_replay_generation.is_none());
     assert!(prepare_upload_progress_for_cycle(
         &mut rearmed,
@@ -589,18 +608,18 @@ fn replay_generation_reuploads_prior_acks_once_and_resumes_its_own_progress() {
             assert_eq!(batch, items.iter().collect::<Vec<_>>());
             Ok(accepted_batch(batch.len()))
         },
-        |state| state.save(&path),
+        |state| state.save_fixture(&path),
     )
     .expect("new replay uploads every prior old-generation entity");
     assert_eq!(result, ResumableUploadResult::Completed);
     assert_eq!((upload_calls, accepted), (1, 2));
 
-    let mut resumed = SnapshotUploadProgress::load(
-        &path,
+    let mut resumed = load_routed_progress(
+        &route,
+        &index_path,
         &destination,
         snapshot_quarantine_witness(SnapshotSource::Codex),
-    )
-    .expect("reload new replay progress");
+    );
     assert!(!resumed.prepare_historical_replay(&new_generation));
     let mut resumed_accepted = 0;
     let mut resumed_upload_calls = 0;
@@ -614,12 +633,13 @@ fn replay_generation_reuploads_prior_acks_once_and_resumes_its_own_progress() {
             resumed_upload_calls += 1;
             Ok(accepted_batch(0))
         },
-        |state| state.save(&path),
+        |state| state.save_fixture(&path),
     )
     .expect("same replay generation resumes from its durable ACKs");
     assert_eq!(resumed_result, ResumableUploadResult::Completed);
     assert_eq!((resumed_upload_calls, resumed_accepted), (0, 0));
     let _ = std::fs::remove_dir_all(root);
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 #[test]
@@ -643,7 +663,9 @@ fn same_replay_generation_restores_cleared_conflict_progress_until_retry() {
         BTreeSet::from([conflicted_fingerprint.clone()]),
     );
 
-    let mut progress = test_upload_progress();
+    index.save_fixture(&index_path).unwrap();
+    let mut progress =
+        route_fixture_progress(&index, &index_path, &progress_path, test_upload_progress());
     assert!(progress.prepare_historical_replay(&replay_generation));
     let mut accepted = 0;
     let result = upload_resumable_batches(
@@ -679,7 +701,7 @@ fn same_replay_generation_restores_cleared_conflict_progress_until_retry() {
                 }],
             })
         },
-        |state| state.save(&progress_path),
+        |state| state.save_fixture(&progress_path),
     )
     .expect("conflict remains retryable");
     assert_eq!(
@@ -694,13 +716,16 @@ fn same_replay_generation_restores_cleared_conflict_progress_until_retry() {
 
     index.mark_bounded_sweep_unsettled();
     index.retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
-    index.save(&index_path).expect("persist conflicted index");
-    progress
-        .clear(&progress_path)
+    index
+        .save_fixture(&index_path)
+        .expect("persist conflicted index");
+    clear_fixture_progress(&mut progress, &progress_path)
         .expect("completed conflict cycle clears disposable progress");
 
     let persisted_index = ScanIndex::load(&index_path).expect("reload conflicted index");
-    let mut restored = SnapshotUploadProgress::load(
+    let mut restored = SnapshotUploadProgress::load_for_index(
+        &persisted_index,
+        &index_path,
         &progress_path,
         &destination,
         snapshot_quarantine_witness(SnapshotSource::Codex),
@@ -719,10 +744,9 @@ fn same_replay_generation_restores_cleared_conflict_progress_until_retry() {
         "same-generation historical preparation must restore index-owned conflict"
     );
     restored
-        .save(&progress_path)
+        .save_fixture(&progress_path)
         .expect("persist restored same-generation conflict");
-    restored
-        .clear(&progress_path)
+    clear_fixture_progress(&mut restored, &progress_path)
         .expect("model another completed follow-up cycle");
 
     let mut due_index = persisted_index;
@@ -731,10 +755,14 @@ fn same_replay_generation_restores_cleared_conflict_progress_until_retry() {
         .get_mut(&conflicted_fingerprint)
         .expect("conflict remains in index")
         .retry_after_unix_seconds = 0;
-    due_index.save(&index_path).expect("persist due conflict");
+    due_index
+        .save_fixture(&index_path)
+        .expect("persist due conflict");
 
     let due_index = ScanIndex::load(&index_path).expect("reload due conflict index");
-    let mut retry_progress = SnapshotUploadProgress::load(
+    let mut retry_progress = SnapshotUploadProgress::load_for_index(
+        &due_index,
+        &index_path,
         &progress_path,
         &destination,
         snapshot_quarantine_witness(SnapshotSource::Codex),
@@ -770,6 +798,7 @@ fn same_replay_generation_restores_cleared_conflict_progress_until_retry() {
     assert_eq!((retry_uploads, retry_accepted), (1, 1));
 
     let _ = std::fs::remove_dir_all(root);
+    crate::snapshots::state_v2::close_removed_routes_for_test();
     reset_for_test();
 }
 
@@ -928,7 +957,33 @@ fn off_busy_progress_preserves_damaged_v1_before_containment() {
         .to_string_lossy()
         .contains(".corrupt.")));
     drop(busy);
-    // The same damage is eligible for containment once progress admits.
+    // Releasing progress permits the native G=0 publication. Adoption waits
+    // for the next ordinary pass, with the damaged bytes kept as its witness.
+    let error = load_source_checkpoints(
+        &index_path,
+        &progress_path,
+        SnapshotSource::ClaudeCode,
+        &root,
+        &"b".repeat(64),
+        snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+    )
+    .expect_err("fresh publication requires the next pass");
+    assert_eq!(
+        error.downcast_ref::<crate::snapshots::state_v2::Hold>(),
+        Some(&crate::snapshots::state_v2::Hold::ReloadRequired)
+    );
+    let witness = std::fs::read_dir(&namespace)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains(".corrupt.")
+        })
+        .expect("quarantine witness");
+    assert_eq!(std::fs::read(witness).unwrap(), damaged);
+    assert!(index_path.exists());
     let (_, origin, _) = load_source_checkpoints(
         &index_path,
         &progress_path,
@@ -938,8 +993,8 @@ fn off_busy_progress_preserves_damaged_v1_before_containment() {
         snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
     )
     .unwrap();
-    assert_eq!(origin, crate::snapshots::ScanIndexLoadOrigin::Quarantined);
-    assert!(!index_path.exists());
+    assert_eq!(origin, crate::snapshots::ScanIndexLoadOrigin::Loaded);
+    assert!(index_path.exists());
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -1729,7 +1784,7 @@ fn oversized_local_preflight_poison_cannot_pin_later_traversal_pages() {
             );
             Ok(accepted_batch(request.snapshots.len()))
         },
-        |state| state.save(&progress_path),
+        |state| state.save_fixture(&progress_path),
     )
     .expect("deterministic local poison is settled by quarantine");
 
@@ -1749,7 +1804,7 @@ fn oversized_local_preflight_poison_cannot_pin_later_traversal_pages() {
     // then the redundant upload ledger may be cleared.
     index.retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
     index
-        .save(&index_path)
+        .save_fixture(&index_path)
         .expect("save settled traversal page");
     progress
         .clear(&progress_path)
@@ -1771,6 +1826,7 @@ fn oversized_local_preflight_poison_cannot_pin_later_traversal_pages() {
     assert!(!first_page_sessions.contains(&second.snapshots[0].source_session_id));
 
     let _ = std::fs::remove_dir_all(root);
+    crate::snapshots::state_v2::close_removed_routes_for_test();
     reset_for_test();
 }
 
@@ -2164,7 +2220,7 @@ fn snapshot_upload_restart_resumes_after_durable_timeout_checkpoint() {
                 )))
             }
         },
-        |state| state.save(&path),
+        |state| state.save_fixture(&path),
     )
     .expect_err("persistent timeout stops after checkpointing the first page");
 
@@ -2190,7 +2246,7 @@ fn snapshot_upload_restart_resumes_after_durable_timeout_checkpoint() {
             resumed_items.extend(batch.iter().copied().cloned());
             Ok(accepted_batch(batch.len()))
         },
-        |state| state.save(&path),
+        |state| state.save_fixture(&path),
     )
     .expect("restart uploads only remaining pages");
 
@@ -2201,6 +2257,7 @@ fn snapshot_upload_restart_resumes_after_durable_timeout_checkpoint() {
         .iter()
         .all(|fingerprint| !first_page.contains(fingerprint)));
     let _ = std::fs::remove_dir_all(root);
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 #[test]
@@ -2242,7 +2299,7 @@ fn gateway_timeout_bisection_converges_from_entity_cursor_after_ambiguous_commit
             }
             Ok(accepted_batch(batch.len()))
         },
-        |state| state.save(&path),
+        |state| state.save_fixture(&path),
     )
     .expect("gateway timeout is bisected into resumable child pages");
 
@@ -2277,7 +2334,7 @@ fn gateway_timeout_bisection_converges_from_entity_cursor_after_ambiguous_commit
             resumed_upload_calls += 1;
             Ok(accepted_batch(0))
         },
-        |state| state.save(&path),
+        |state| state.save_fixture(&path),
     )
     .expect("restart settles entirely from the durable entity cursor");
 
@@ -2286,6 +2343,7 @@ fn gateway_timeout_bisection_converges_from_entity_cursor_after_ambiguous_commit
     assert_eq!(resumed_accepted, 0);
     assert_eq!(remotely_held.len(), SNAPSHOT_BATCH_LIMIT);
     let _ = std::fs::remove_dir_all(root);
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 #[test]
@@ -2302,7 +2360,7 @@ fn backfill_finalization_is_idempotent_across_index_state_and_progress_crashes()
     // while the historical completion marker and ledger clear have not run.
     let mut index = ScanIndex::default();
     index
-        .save(&index_path)
+        .save_fixture(&index_path)
         .expect("save completed replay index");
     let mut progress = SnapshotUploadProgress::new(
         destination.clone(),
@@ -2310,7 +2368,7 @@ fn backfill_finalization_is_idempotent_across_index_state_and_progress_crashes()
     );
     progress.record([fingerprint.as_str()]);
     progress
-        .save(&progress_path)
+        .save_fixture(&progress_path)
         .expect("save accepted replay ledger");
     assert!(
         pending_backfill_sources_for_destination(&load_backfill_state(&root), &destination)
@@ -2337,7 +2395,7 @@ fn backfill_finalization_is_idempotent_across_index_state_and_progress_crashes()
             upload_calls += 1;
             Ok(accepted_batch(1))
         },
-        |state| state.save(&progress_path),
+        |state| state.save_fixture(&progress_path),
     )
     .expect("restart settles from the durable accepted ledger");
     assert_eq!(result, ResumableUploadResult::Completed);
@@ -2355,4 +2413,5 @@ fn backfill_finalization_is_idempotent_across_index_state_and_progress_crashes()
     assert!(!progress_path.exists());
     ScanIndex::load(&index_path).expect("completed replay index remains durable");
     let _ = std::fs::remove_dir_all(root);
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }

@@ -292,7 +292,7 @@ impl Disk {
         index: &mut ScanIndex,
     ) -> ScanIndex {
         let path = self.path(source);
-        index.save(path).unwrap();
+        index.save_fixture(path).unwrap();
         crate::snapshots::after_source_save(cache, &self.dir, source, index, path);
         ScanIndex::load(path).unwrap()
     }
@@ -3159,7 +3159,7 @@ fn successor_cold_reopen(disposition: Option<&str>) {
                 .unwrap(),
             ResumableUploadResult::Completed
         );
-        progress.save(&progress_path).unwrap(); // Existing receipts precede successor rename.
+        progress.save_fixture(&progress_path).unwrap(); // Existing receipts precede successor rename.
         let accepted_fingerprints = progress.accepted_fingerprints.clone();
         // Reuse these outcomes with a B2 loss-bearing successor.
         append(&path, "{broken\n");
@@ -3173,7 +3173,7 @@ fn successor_cold_reopen(disposition: Option<&str>) {
             let _result = upload(&successor.scan.snapshots, &mut progress, |batch| {
                 ack_with_disposition(batch, disposition)
             });
-            progress.save(&progress_path).unwrap();
+            progress.save_fixture(&progress_path).unwrap();
         }
         // Lose acquisition memory without saving its new index or ACK. Keep
         // the committed heads, original index and durable upload progress.

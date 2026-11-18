@@ -189,14 +189,20 @@ pub(crate) fn partial_context_checkpoint(
     }
     let progress_path = scratch.join("progress.json");
     let index_path = scratch.join("index.json");
-    progress.save(&progress_path).unwrap();
+    progress.save_fixture(&progress_path).unwrap();
     let restored: SnapshotUploadProgress =
         serde_json::from_slice(&std::fs::read(&progress_path).unwrap()).unwrap();
     assert!(restored.context_receipt_candidates.is_empty());
     assert!(restored.fresh_context_body_acks.is_empty());
+    crate::snapshots::e2_pipeline_scan_fixture::bind_source_for_test(&index_path, source);
+    let previous =
+        crate::snapshots::e2_pipeline_scan_fixture::seed_index_for_test(previous, &index_path);
+    let mut index = index.clone();
+    index.retain_persistence_baseline_from(&previous);
+    index.generation = previous.generation;
     let selected = checkpoint_partial_snapshot_index(
-        index,
-        previous,
+        &index,
+        &previous,
         &progress,
         items,
         None,
@@ -542,7 +548,7 @@ impl Uploader {
                 })?;
                 Ok(response)
             },
-            |progress| progress.save(&path),
+            |progress| progress.save_fixture(&path),
         )?;
         self.completed = result == ResumableUploadResult::Completed;
         settle_index_after_upload(index, previous, &self.progress);
@@ -575,14 +581,14 @@ impl Uploader {
     ) -> Result<usize> {
         // Match the successful service finish: durable index first, then only
         // adopted/non-held ACK retirement, then the atomic progress finish.
-        index.save(&self.scratch.join("index.json"))?;
+        index.save_fixture(&self.scratch.join("index.json"))?;
         assert!(index.generation > 0, "the real save advances generation");
         let before = self.progress.accepted_body_witnesses.len();
         self.progress
             .retire_acks_after_index_save(index, &BTreeSet::new(), locally_held);
         let retired = before - self.progress.accepted_body_witnesses.len();
         let path = self.scratch.join("progress.json");
-        self.progress.finish_cycle(&path)?;
+        self.progress.finish_cycle_fixture(&path)?;
         // finish_cycle may remove a fully adopted ledger. A new service cycle
         // loads it again rather than retaining the deleted file's CAS generation.
         self.progress = SnapshotUploadProgress::load(

@@ -792,7 +792,7 @@ impl OwnedJsonlParser {
             && recognized_usage_drop_count == 0
             && accumulator_dropped_usage_record_count == 0
             && !positive_usage_evidence;
-        let mut snapshots = claude_request_money::e2::timed("native.into_items", || {
+        let snapshots = claude_request_money::e2::timed("native.into_items", || {
             accumulator.into_items_with_repository_identity(
                 path,
                 collected_at,
@@ -802,15 +802,6 @@ impl OwnedJsonlParser {
                 emit_empty_pi_fork,
             )
         });
-        // Route evidence only, producer on: an undecodable physical line
-        // anywhere in the file (the report spans Tail resumes) leaves the
-        // Claude first route unproven.
-        if crate::snapshots::billing_route::producer_on()
-            && source == SnapshotSource::ClaudeCode
-            && !report.complete()
-        {
-            crate::snapshots::billing_route::invalidate_route_proof(&mut snapshots);
-        }
         // A syntactically valid, positive provider usage record that yields no
         // entity is still loss. Typical causes are an absent/unparseable activity
         // timestamp or an identity shape the accumulator cannot settle. Treat the

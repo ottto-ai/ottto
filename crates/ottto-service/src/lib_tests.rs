@@ -666,16 +666,17 @@ mod tests {
             .unwrap();
         let scratch = crate::test_scratch::ScratchDir::new("rebuild-loop-source-health");
         let path = scratch.as_ref().join("index.json");
-        std::fs::write(&path, b"{").unwrap();
-        let (_, origin) = ScanIndex::load_for_snapshot_source_with_origin(
+        snapshots::e2_pipeline_scan_fixture::bind_source_for_test(&path, SnapshotSource::Codex);
+        snapshots::e2_pipeline_scan_fixture::legacy_input_for_test(&path, b"{");
+        let (_, origin) = snapshots::e2_pipeline_scan_fixture::load_source_for_test(
             &path,
             SnapshotSource::Codex,
             scratch.as_ref(),
         )
         .unwrap();
-        assert_eq!(origin, snapshots::ScanIndexLoadOrigin::Quarantined);
+        assert_eq!(origin, snapshots::ScanIndexLoadOrigin::Loaded);
         let original = b"{ ";
-        std::fs::write(&path, original).unwrap();
+        snapshots::e2_pipeline_scan_fixture::legacy_input_for_test(&path, original);
         let error = ScanIndex::load_for_snapshot_source_with_origin(
             &path,
             SnapshotSource::Codex,
@@ -753,7 +754,7 @@ mod tests {
         // Reviewed repair restores a compatible index; the next actual load
         // clears only this source's runtime pause without a daemon restart.
         std::fs::write(&path, serde_json::to_vec(&ScanIndex::default()).unwrap()).unwrap();
-        let (_, origin) = ScanIndex::load_for_snapshot_source_with_origin(
+        let (_, origin) = snapshots::e2_pipeline_scan_fixture::load_source_for_test(
             &path,
             SnapshotSource::Codex,
             scratch.as_ref(),

@@ -1293,9 +1293,12 @@ fn claude_capability_activity_normalizes_built_in_mcp_names_and_dedupes_tool_use
 fn scan_index_recovers_from_truncated_json_and_replaces_it_atomically() {
     let root = temp_dir("scan-index-recovery");
     let path = root.join("codex-scan-index.json");
-    fs::write(&path, r#"{"files":{"partial""#).expect("write truncated index");
-
-    let recovered = ScanIndex::load(&path).expect("truncated index should self-heal");
+    e2_pipeline_scan_fixture::bind_source_for_test(&path, SnapshotSource::Codex);
+    e2_pipeline_scan_fixture::legacy_input_for_test(&path, br#"{"files":{"partial""#);
+    let recovered =
+        e2_pipeline_scan_fixture::load_source_for_test(&path, SnapshotSource::Codex, &root)
+            .expect("quarantine publishes and the next pass adopts fresh custody")
+            .0;
     assert!(recovered.files.is_empty());
 
     let mut replacement = ScanIndex {
@@ -1315,7 +1318,9 @@ fn scan_index_recovers_from_truncated_json_and_replaces_it_atomically() {
         )]),
         ..ScanIndex::default()
     };
-    replacement.save(&path).expect("save replacement index");
+    replacement
+        .save_fixture(&path)
+        .expect("save replacement index");
 
     assert_eq!(
         ScanIndex::load(&path)
@@ -1327,6 +1332,7 @@ fn scan_index_recovers_from_truncated_json_and_replaces_it_atomically() {
     let temp_path = path.with_extension(format!("json.{}.tmp", std::process::id()));
     assert!(!temp_path.exists());
     let _ = fs::remove_dir_all(root);
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 /// The unsettled causes are a diagnostic leaf. A malformed value decodes
@@ -1355,11 +1361,13 @@ fn scan_index_load_isolates_a_malformed_unsettled_cause_diagnostic() {
             if flag {
                 index.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::Shed);
             }
-            index.save(&path).expect("persist index");
-            let mut saved: serde_json::Value =
-                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            index.save_fixture(&path).expect("persist index");
+            let mut saved = serde_json::to_value(&index).unwrap();
             saved["bounded_sweep_unsettled_causes"] = value.clone();
-            fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+            e2_pipeline_scan_fixture::seed_json_for_test(
+                &path,
+                &serde_json::to_vec(&saved).unwrap(),
+            );
 
             let loaded = ScanIndex::load(&path).expect("a diagnostic leaf never fails load");
             assert!(path.exists(), "{value} must not quarantine the index");
@@ -1393,6 +1401,7 @@ fn scan_index_load_isolates_a_malformed_unsettled_cause_diagnostic() {
         0
     );
     let _ = fs::remove_dir_all(root);
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 #[test]
@@ -1415,7 +1424,9 @@ fn scan_index_save_drops_only_a_syntactically_valid_corrupt_activity_witness() {
         )]),
         ..ScanIndex::default()
     };
-    corrupt.save(&path).expect("persist corrupt semantic clock");
+    corrupt
+        .save_fixture(&path)
+        .expect("persist corrupt semantic clock");
 
     let recovered = ScanIndex::load(&path).expect("corrupt semantic clock should self-heal");
     assert_eq!(recovered.generation, 1);
@@ -1435,6 +1446,7 @@ fn scan_index_save_drops_only_a_syntactically_valid_corrupt_activity_witness() {
         0
     );
     let _ = fs::remove_dir_all(root);
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 #[test]
@@ -1551,7 +1563,9 @@ fn admission_reoffer_reconstructs_terminal_file_through_existing_scanner() {
     );
     assert!(index.prepare_snapshot_admission_reoffer(50));
     let path = root.join("index.json");
-    index.save(&path).unwrap();
+    index
+        .save_fixture_for_source(&path, SnapshotSource::Pi)
+        .unwrap();
     index = ScanIndex::load(&path).unwrap();
     assert_eq!(
         index.bounded_sweep_unsettled_cause_names(),
@@ -1716,7 +1730,9 @@ fn historical_replay_preserves_absent_terminal_disclosure_and_counters() {
     index.retain_quarantined_fingerprints(&BTreeMap::new());
     assert_eq!(index.snapshot_unproven_terminal_count(), 1);
     assert_eq!(index.snapshot_superseded_terminal_count(), 1);
-    index.save(&path).expect("persist replay-safe terminals");
+    index
+        .save_fixture(&path)
+        .expect("persist replay-safe terminals");
 
     let restarted = ScanIndex::load(&path).expect("reload replay-safe terminals");
     assert_eq!(restarted.snapshot_unproven_terminal_count(), 1);
@@ -1738,21 +1754,21 @@ fn large_scan_index_save_preserves_bytes_and_generation_fence() {
         resume_after_path: Some("synthetic-checkpoint".repeat(4096)),
         ..ScanIndex::default()
     };
-    index.save(&path).expect("save large generation");
+    index.save_fixture(&path).expect("save large generation");
     assert_eq!(
-        fs::read(&path).expect("read durable index"),
-        serde_json::to_vec(&index).expect("encode exact compact index bytes")
+        serde_json::to_vec(&ScanIndex::load(&path).expect("read durable index")).unwrap(),
+        serde_json::to_vec(&index).unwrap()
     );
     let mut stale = ScanIndex::load(&path).expect("load stale generation");
     let mut winner = ScanIndex::load(&path).expect("load winning generation");
     winner.resume_after_path = Some("replacement-checkpoint".repeat(8192));
-    winner.save(&path).expect("save larger replacement");
+    winner.save_fixture(&path).expect("save larger replacement");
     stale
-        .save(&path)
+        .save_fixture(&path)
         .expect_err("stale generation stays fenced");
     assert_eq!(
-        fs::read(&path).expect("read winning bytes"),
-        serde_json::to_vec(&winner).expect("encode winning compact bytes")
+        serde_json::to_vec(&ScanIndex::load(&path).expect("read winning graph")).unwrap(),
+        serde_json::to_vec(&winner).unwrap()
     );
     let observed = ScanIndex::load(&path).expect("reload winning generation");
     assert_eq!(observed.generation, 2);
@@ -1760,6 +1776,7 @@ fn large_scan_index_save_preserves_bytes_and_generation_fence() {
     let temp_path = path.with_extension(format!("json.{}.tmp", std::process::id()));
     assert!(!temp_path.exists());
     let _ = fs::remove_dir_all(root);
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 pub(super) fn test_candidate(path: PathBuf) -> CandidateFile {
@@ -2232,7 +2249,7 @@ fn claude_authority_quarantine_is_durable_and_retries_on_change_or_deadline() {
     );
     let index_path = root.join("scan-index.json");
     index
-        .save(&index_path)
+        .save_fixture(&index_path)
         .expect("persist authority quarantine");
     let mut loaded = ScanIndex::load(&index_path).expect("reload authority quarantine");
     loaded.activate_effective_upload_body_witness_revision(1);
@@ -2852,7 +2869,9 @@ fn bounded_traversal_resumes_after_scan_index_restart() {
     .expect("first page");
     assert!(!first.census_complete);
     assert_eq!(first.scanned_file_count, 3);
-    index.save(&index_path).expect("save traversal checkpoint");
+    index
+        .save_fixture_for_source(&index_path, SnapshotSource::Pi)
+        .expect("save traversal checkpoint");
 
     let mut resumed = ScanIndex::load(&index_path).expect("reload traversal checkpoint");
     let second = scan_source_roots_with_limit(
@@ -3020,7 +3039,9 @@ fn exercise_claude_partial_census_recovery(duplicate: bool, future_quarantine: b
                 .all(|fp| index.accepted_snapshot_fingerprints.contains(fp)));
             index.mark_bounded_sweep_unsettled();
         }
-        index.save(&checkpoint).expect("persist partial page");
+        index
+            .save_fixture(&checkpoint)
+            .expect("persist partial page");
         index = ScanIndex::load(&checkpoint).expect("reload partial page");
         let finished = format!("2026-08-20T10:{:02}:00Z", 3 + generation * 2);
         let mut last = scan_source_roots_with_limit(
@@ -3036,7 +3057,9 @@ fn exercise_claude_partial_census_recovery(duplicate: bool, future_quarantine: b
         finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut last, &mut index);
         assert!(index.traversal.is_none(), "directory census drained");
         assert_eq!(last.census_complete, generation >= 1);
-        index.save(&checkpoint).expect("persist terminal page");
+        index
+            .save_fixture(&checkpoint)
+            .expect("persist terminal page");
         index = ScanIndex::load(&checkpoint).expect("reload terminal page");
         if future_quarantine {
             let (fingerprint, deadline) = held_conflict.as_ref().expect("future conflict");
@@ -6502,8 +6525,6 @@ pub(super) fn sample_session_artifact_item() -> SnapshotItem {
         claude_org_markers: None,
         claude_account_withheld_reason: None,
         claude_account_display: None,
-        session_billing_route: None,
-        claude_route_evidence: None,
         source_session_id: "artifact-session".to_string(),
         snapshot_fingerprint: String::new(),
         status: "final".to_string(),
@@ -8519,7 +8540,7 @@ fn claude_d1_fresh_reparse_retains_binding_refusal_until_exact_proof_returns() {
         )
         .is_empty());
     let index_path = dir.join("account-index.json");
-    index.save(&index_path).unwrap();
+    index.save_fixture(&index_path).unwrap();
     let mut restarted = ScanIndex::load(&index_path).unwrap();
     restarted = crate::snapshots::e2_pipeline_scan_fixture::ordinary_index(restarted);
     let before_bindings = restarted.session_account_bindings.clone();
@@ -11443,7 +11464,7 @@ fn projection_adoption_fixture(name: &str, count: usize) -> (PathBuf, PathBuf, S
         &baseline.snapshots,
         &crate::snapshots::e2_pipeline_scan_fixture::exact_acks_for_test(&baseline.snapshots),
     );
-    index.save(&home.join("scan-index.json")).unwrap();
+    index.save_fixture(&home.join("scan-index.json")).unwrap();
     let mut loaded = ScanIndex::load(&home.join("scan-index.json")).unwrap();
     loaded.activate_upload_context("already-admitted-context".into());
     assert_eq!(loaded.accepted_snapshot_fingerprints.len(), count);
@@ -11460,6 +11481,10 @@ fn projection_adoption_fixture(name: &str, count: usize) -> (PathBuf, PathBuf, S
 }
 
 fn projection_adoption_scan(root: &Path, index: &mut ScanIndex, limit: usize) -> SourceScanResult {
+    e2_pipeline_scan_fixture::age_listing_for_test(index);
+    if state_v2::state_v2_growth_retention_active(index) {
+        state_v2::release_collection_page_limit_for_test(index);
+    }
     scan_source_roots_with_limit(
         SnapshotSource::Codex,
         &[root.to_path_buf()],
@@ -11649,7 +11674,9 @@ fn unkept_terminal_page_waits_for_a_fresh_traversal() {
     selected.requeue_unkept_scanned_keys(SnapshotSource::Codex, &working, &BTreeSet::new());
     assert!(selected.traversal.is_none());
     assert!(selected.files.is_empty());
-    selected.save(&home.join("terminal-index.json")).unwrap();
+    selected
+        .save_fixture(&home.join("terminal-index.json"))
+        .unwrap();
     let mut restart = ScanIndex::load(&home.join("terminal-index.json")).unwrap();
     let next = projection_adoption_scan(&root, &mut restart, MAX_BACKFILL_FILES_PER_SOURCE);
     assert_eq!(next.scanned_file_count, 3);
@@ -11696,7 +11723,9 @@ fn projection_adoption_reselects_3_current_files_with_equal_body_once() {
         .values()
         .all(|entry| entry.effective_upload_body_witness_revision == 0));
     unaccepted.mark_bounded_sweep_unsettled();
-    unaccepted.save(&home.join("scan-index.json")).unwrap();
+    unaccepted
+        .save_fixture(&home.join("scan-index.json"))
+        .unwrap();
     let mut retry_index = ScanIndex::load(&home.join("scan-index.json")).unwrap();
     retry_index.activate_upload_context("already-admitted-context".into());
     retry_index.activate_effective_upload_body_witness_revision(1);
@@ -11716,7 +11745,7 @@ fn projection_adoption_reselects_3_current_files_with_equal_body_once() {
         &retry.snapshots,
         &crate::snapshots::e2_pipeline_scan_fixture::exact_acks_for_test(&retry.snapshots),
     );
-    settled.save(&home.join("scan-index.json")).unwrap();
+    settled.save_fixture(&home.join("scan-index.json")).unwrap();
     let mut loaded = ScanIndex::load(&home.join("scan-index.json")).unwrap();
     assert_eq!(loaded.active_effective_upload_body_witness_revision, 0);
     loaded.activate_upload_context("already-admitted-context".into());
@@ -11770,7 +11799,7 @@ fn projection_adoption_partial_file_never_stamps_while_sibling_progresses() {
         .map(|item| item.snapshot_fingerprint.clone())
         .collect();
     let mut settled = index.committable_subset(&previous, &accepted, &BTreeMap::new());
-    settled.save(&home.join("scan-index.json")).unwrap();
+    settled.save_fixture(&home.join("scan-index.json")).unwrap();
     let loaded = ScanIndex::load(&home.join("scan-index.json")).unwrap();
     assert_eq!(
         loaded.files[&partial_key].effective_upload_body_witness_revision,
@@ -11813,7 +11842,7 @@ fn projection_adoption_capped_pages_stamp_and_settle_individually() {
             &scan.snapshots,
             &crate::snapshots::e2_pipeline_scan_fixture::exact_acks_for_test(&scan.snapshots),
         );
-        settled.save(&home.join("scan-index.json")).unwrap();
+        settled.save_fixture(&home.join("scan-index.json")).unwrap();
         index = ScanIndex::load(&home.join("scan-index.json")).unwrap();
         index.activate_upload_context("already-admitted-context".into());
     }
@@ -11919,7 +11948,7 @@ fn claude_context_backfill_fixture(name: &str, roots: usize) -> (PathBuf, PathBu
         &baseline.snapshots,
         &crate::snapshots::e2_pipeline_scan_fixture::exact_acks_for_test(&baseline.snapshots),
     );
-    index.save(&home.join("scan-index.json")).unwrap();
+    index.save_fixture(&home.join("scan-index.json")).unwrap();
     let mut loaded = ScanIndex::load(&home.join("scan-index.json")).unwrap();
     loaded.activate_upload_context("already-admitted-context".into());
     assert_eq!(loaded.files.len(), roots * 2);
@@ -11981,7 +12010,7 @@ fn claude_context_backfill_leaves_codex_and_pi_unselected() {
         &adopted.snapshots,
         &crate::snapshots::e2_pipeline_scan_fixture::exact_acks_for_test(&adopted.snapshots),
     );
-    settled.save(&home.join("scan-index.json")).unwrap();
+    settled.save_fixture(&home.join("scan-index.json")).unwrap();
     let mut loaded = ScanIndex::load(&home.join("scan-index.json")).unwrap();
     loaded.activate_upload_context("already-admitted-context".into());
     loaded.activate_effective_upload_body_witness_revision(revision(SnapshotSource::Codex));
@@ -13924,7 +13953,7 @@ fn claude_desktop_all_profiles_inventory_change_restarts_pagination() {
     assert!(first.original_identity_census_incomplete);
     // Exercise the actual bounded production serializer and decoder.
     let index_path = home.join("scan-index.json");
-    index.save(&index_path).unwrap();
+    index.save_fixture(&index_path).unwrap();
     index = ScanIndex::load(&index_path).unwrap();
     let complete = ClaudeTitleMetadata::load_from_roots_with_index(
         std::slice::from_ref(&projects),
@@ -13944,7 +13973,7 @@ fn claude_desktop_all_profiles_inventory_change_restarts_pagination() {
         "2026-07-10T10:06:00Z",
     );
     assert!(refresh.sidecar_census_incomplete);
-    index.save(&index_path).unwrap();
+    index.save_fixture(&index_path).unwrap();
     index = ScanIndex::load(&index_path).unwrap();
     let alt = support.join("Claude-ALT");
     let other = alt
@@ -13960,7 +13989,7 @@ fn claude_desktop_all_profiles_inventory_change_restarts_pagination() {
         "2026-07-10T10:06:01Z",
     );
     assert!(deferred.original_identity_census_incomplete);
-    index.save(&index_path).unwrap();
+    index.save_fixture(&index_path).unwrap();
     index = ScanIndex::load(&index_path).unwrap();
     for at in ["2026-07-10T10:07:00Z", "2026-07-10T10:09:00Z"] {
         let metadata = ClaudeTitleMetadata::load_from_roots_with_index(
@@ -13975,7 +14004,7 @@ fn claude_desktop_all_profiles_inventory_change_restarts_pagination() {
             Some("conflict")
         );
         assert!(metadata.account_identifier_hash("shared").is_none());
-        index.save(&index_path).unwrap();
+        index.save_fixture(&index_path).unwrap();
         index = ScanIndex::load(&index_path).unwrap();
     }
     assert!(index.claude_desktop_identity_census_complete);
@@ -18583,7 +18612,7 @@ fn codex_archive_inventory_preserves_plain_usage_through_paged_restart() {
         }
         let checkpoint = root.join("scan-index.json");
         if checkpoint.exists() {
-            fs::remove_file(&checkpoint).unwrap();
+            state_v2::erase_published(&checkpoint);
         }
         let mut index = ScanIndex::default();
         let mut child_snapshot = None;
@@ -18625,7 +18654,9 @@ fn codex_archive_inventory_preserves_plain_usage_through_paged_restart() {
                 .find(|snapshot| snapshot.source_session_id == child_id)
                 .cloned();
             finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);
-            index.save(&checkpoint).expect("persist paged scan");
+            index
+                .save_fixture_for_source(&checkpoint, SnapshotSource::Codex)
+                .expect("persist paged scan");
             index = ScanIndex::load(&checkpoint).expect("reload paged scan");
             if child_snapshot.is_some() {
                 break;
@@ -18715,7 +18746,9 @@ fn codex_archive_inventory_preserves_plain_usage_through_paged_restart() {
                     assert!(scan.snapshots.is_empty(), "header-only input has no money");
                     assert!(index.accepted_snapshot_fingerprints.is_empty());
                     finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);
-                    index.save(&checkpoint).unwrap();
+                    index
+                        .save_fixture_for_source(&checkpoint, SnapshotSource::Codex)
+                        .unwrap();
                     completed = Some(index);
                     break;
                 }
@@ -19246,8 +19279,6 @@ fn v6_snapshot_batch_matches_backend_contract() {
         claude_org_markers: None,
         claude_account_withheld_reason: None,
         claude_account_display: None,
-        session_billing_route: None,
-        claude_route_evidence: None,
         source_session_id: "claude-vertex-session-1".to_string(),
         snapshot_fingerprint: "a".repeat(32),
         status: "final".to_string(),
@@ -21042,8 +21073,6 @@ pub(super) fn valid_v6_batch_request() -> SnapshotBatchRequest {
             claude_org_markers: None,
             claude_account_withheld_reason: None,
             claude_account_display: None,
-            session_billing_route: None,
-            claude_route_evidence: None,
             source_session_id: "claude-vertex-session-1".to_string(),
             snapshot_fingerprint: "a".repeat(32),
             status: "final".to_string(),

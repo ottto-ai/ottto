@@ -12,15 +12,8 @@ static NEXT: AtomicU64 = AtomicU64::new(0);
 struct Fixture(PathBuf);
 impl Fixture {
     fn new(source: SnapshotSource) -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "ottto-native-tail-{}-{}-{}.jsonl",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-            NEXT.fetch_add(1, AtomicOrdering::Relaxed)
-        ));
+        // Canonical: state v2 refuses a store beneath a symlinked ancestor.
+        let path = crate::test_scratch::unique_path("ottto-native-tail").with_extension("jsonl");
         let value = match source {
             SnapshotSource::Codex => {
                 json!({"type":"session_meta","payload":{"id":"native-tail-fixture"}})

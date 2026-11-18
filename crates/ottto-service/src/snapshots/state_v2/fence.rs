@@ -126,7 +126,7 @@ pub(super) fn exists(path: &Path) -> Result<bool> {
         Err(e) => Err(e.into()),
     }
 }
-fn read(path: &Path) -> Result<Option<Fence>> {
+pub(super) fn read(path: &Path) -> Result<Option<Fence>> {
     if !exists(path)? {
         return Ok(None);
     }
@@ -243,6 +243,43 @@ pub(super) fn reconcile(
     Ok(Some((identity, final_db)))
 }
 
+/// The locked input's OS identity, including mutation clocks. Rebuilt graphs
+/// retain this proof across a returned pre-rename failure, including a missing
+/// quarantine root. A changed root never grants publication authority.
+#[derive(PartialEq, Eq)]
+pub(super) struct InputStamp(u64, u64, u64, i64, i64, i64, i64);
+pub(super) fn input_stamp(path: &Path) -> Result<Option<InputStamp>> {
+    let m = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    ensure!(
+        m.is_file() && m.uid() == unsafe { libc::geteuid() },
+        Hold::DbUnavailable
+    );
+    Ok(Some(InputStamp(
+        m.dev(),
+        m.ino(),
+        m.len(),
+        m.mtime(),
+        m.mtime_nsec(),
+        m.ctime(),
+        m.ctime_nsec(),
+    )))
+}
+
+/// Retry only this process's authenticated, fully verified staged publication.
+/// The caller retains CheckpointLock and the original input commitments.
+pub(super) fn resume_publication(path: &Path, identity: &Identity) -> Result<()> {
+    let temp = sibling(path, ".v2-fence.tmp");
+    let staged = read(&temp)?.ok_or(Hold::DbUnavailable)?;
+    ensure!(staged.identity() == *identity, Hold::ForeignBinding);
+    sqlite::Sqlite::probe(&sibling(path, ".v2.sqlite.import"), identity).map_err(Hold::storage)?;
+    fs::rename(&temp, path).map_err(publication_io)?;
+    super::super::sync_checkpoint_parent(path).map_err(Hold::storage)
+}
+
 /// Safe creation is deliberately shared by fence and preserved-baseline files.
 pub(super) fn create_private(path: &Path) -> Result<File> {
     sqlite::private_parent(path)?;
@@ -287,6 +324,20 @@ pub(super) fn preserve_file(from: &Path, to: &Path) -> Result<u64> {
     Ok(bytes)
 }
 
+fn publication_io(error: std::io::Error) -> anyhow::Error {
+    let error = error.into();
+    if sqlite::disk_full(&error) {
+        Hold::SaveFull.into()
+    } else {
+        Hold::ReloadRequired.into()
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static FAIL_BEFORE_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// The importer must finish and fsync baseline + .import BEFORE calling this.
 /// Set latch BEFORE the first rename attempt; every subsequent error is a hold.
 pub(super) fn publish(path: &Path, identity: &Identity, latch: &mut bool) -> Result<()> {
@@ -296,7 +347,11 @@ pub(super) fn publish(path: &Path, identity: &Identity, latch: &mut bool) -> Res
     file.flush()?;
     file.sync_all()?;
     *latch = true;
-    fs::rename(&temp, path).map_err(|_| Hold::DbUnavailable)?;
+    #[cfg(test)]
+    if FAIL_BEFORE_RENAME.replace(false) {
+        return Err(Hold::ReloadRequired.into());
+    }
+    fs::rename(&temp, path).map_err(publication_io)?;
     super::super::sync_checkpoint_parent(path).map_err(|_| Hold::DbUnavailable)?;
     let pair = reconcile(path, &identity.binding, true)?;
     if pair.is_none() {

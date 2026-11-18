@@ -22,7 +22,7 @@ fn terminal_contract_legacy_decode_and_lenient_repair_preserve_version() {
             index
                 .quarantined_snapshot_fingerprints
                 .insert(fingerprint.clone(), record);
-            index.save(&path).unwrap();
+            index.save_fixture(&path).unwrap();
             let mut wire = serde_json::to_value(&index).unwrap();
             let record = &mut wire["quarantined_snapshot_fingerprints"][&fingerprint];
             if let Some(version) = version {
@@ -36,8 +36,10 @@ fn terminal_contract_legacy_decode_and_lenient_repair_preserve_version() {
             if repair {
                 record["failed_reconstruction_count"] = Value::Null;
             }
-            fs::write(&path, serde_json::to_vec(&wire).unwrap()).unwrap();
-            let mut loaded = ScanIndex::load(&path).unwrap();
+            let mut loaded = e2_pipeline_scan_fixture::seed_json_for_test(
+                &path,
+                &serde_json::to_vec(&wire).unwrap(),
+            );
             assert!(loaded.decode_holds.is_empty());
             assert_eq!(
                 loaded.quarantined_snapshot_fingerprints[&fingerprint].reconstruction_contract,
@@ -47,7 +49,7 @@ fn terminal_contract_legacy_decode_and_lenient_repair_preserve_version() {
                 loaded.quarantined_snapshot_fingerprints[&fingerprint].disposition,
                 SnapshotQuarantineDisposition::UnprovenTerminal
             );
-            loaded.save(&path).unwrap();
+            loaded.save_fixture(&path).unwrap();
             assert_eq!(
                 ScanIndex::load(&path)
                     .unwrap()
@@ -76,7 +78,7 @@ fn terminal_contract_load_is_paced_and_preserves_account_and_history_state() {
         .insert("owner".into(), binding.clone());
     index.claude_history_gate_loaded = true;
     index.claude_history_cutoff_unix_seconds = Some(1_790_000_000);
-    index.save(&path).unwrap();
+    index.save_fixture(&path).unwrap();
     with_contract(2, || {
         let before = sampled_scan::now_seconds();
         let mut loaded = ScanIndex::load_for_snapshot_source(
@@ -111,7 +113,7 @@ fn terminal_contract_load_is_paced_and_preserves_account_and_history_state() {
         );
         assert!(loaded.claude_history_gate_loaded);
         let records = loaded.quarantined_snapshot_fingerprints.clone();
-        loaded.save(&path).unwrap();
+        loaded.save_fixture(&path).unwrap();
         let restarted = ScanIndex::load(&path).unwrap();
         assert_eq!(
             restarted.quarantined_snapshot_fingerprints, records,
@@ -166,7 +168,7 @@ fn terminal_contract_retry_reads_only_the_owning_file() {
         .insert(fingerprint.clone(), record);
     assert_eq!(scan(&mut index).scanned_file_count, 0, "quiet baseline");
     let path = scratch.join("index.json");
-    index.save(&path).unwrap();
+    index.save_fixture(&path).unwrap();
     with_contract(2, || {
         let mut loaded = ScanIndex::load_for_snapshot_source(
             &path,
@@ -190,7 +192,7 @@ fn terminal_contract_retry_reads_only_the_owning_file() {
                 .get_mut(&fingerprint)
                 .unwrap(),
         );
-        loaded.save(&path).unwrap();
+        loaded.save_fixture(&path).unwrap();
         loaded.activate_terminal_contract_retries(BTreeSet::from([fingerprint.clone()]));
         let due = scan(&mut loaded);
         assert_eq!(due.scanned_file_count, 1);

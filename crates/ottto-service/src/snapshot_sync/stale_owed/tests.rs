@@ -98,7 +98,7 @@ fn stale_refusals_stay_owed_and_only_changed_bytes_retry() {
     assert_eq!(offer(&item, source, STALE, &mut progress), 0);
     let scratch = crate::test_scratch::ScratchDir::new("stale-refusal-restart");
     let path = scratch.join("progress.json");
-    progress.save(&path).unwrap();
+    progress.save_fixture(&path).unwrap();
     let mut restored =
         SnapshotUploadProgress::load(&path, &"a".repeat(64), snapshot_quarantine_witness(source))
             .unwrap();

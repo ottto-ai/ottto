@@ -68,8 +68,6 @@ use claude::collect::apply_claude_token_owner;
 #[cfg(test)]
 use claude::collect::claude_alternative_auth;
 pub(crate) use claude::collect::claude_alternative_auth_layers;
-#[cfg(test)]
-pub(crate) use claude::collect::claude_login_route_candidate;
 pub(crate) use claude::collect::claude_refresher_skip_reason;
 #[cfg(test)]
 use claude::collect::claude_runtime_defaults_from_paths;

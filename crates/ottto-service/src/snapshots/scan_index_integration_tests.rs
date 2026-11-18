@@ -75,6 +75,9 @@ impl Fixture {
         object["digest"] = json!(format!("{:x}", hash.finalize()));
         object["bytes"] = json!(payload.len());
     }
+    fn read(&self) -> ScanIndex {
+        read_scan_index_representation(&self.root, "load", "claude_code", None).unwrap()
+    }
     fn load(&self) -> ScanIndex {
         ScanIndex::load_for_snapshot_source_with_origin(
             &self.root,
@@ -88,6 +91,7 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         fs::remove_dir_all(&self.scratch).unwrap();
+        crate::snapshots::state_v2::close_removed_routes_for_test();
     }
 }
 
@@ -117,7 +121,10 @@ fn integrated_each_map_and_cause_retains_custody_without_release_retirement_fenc
                 continue;
             }
             let mut fixture = Fixture::new();
-            let healthy = fixture.load();
+            // The healthy control imports its own native route. Damage belongs
+            // to a separate old-release input, before its first admission.
+            let control = Fixture::new();
+            let healthy = control.load();
             assert!(healthy.persistence_available());
             match cause {
                 UnavailableCause::Missing => fs::remove_file(fixture.bucket_path(map)).unwrap(),
@@ -142,7 +149,7 @@ fn integrated_each_map_and_cause_retains_custody_without_release_retirement_fenc
             fixture.write_root();
             let before = fs::read(&fixture.root).unwrap();
             crate::local_resource_diagnostics::take_scan_index_storage_observations();
-            let mut loaded = fixture.load();
+            let mut loaded = fixture.read();
             assert!(!loaded.persistence_available());
             assert_eq!(
                 loaded.persistence_unavailable[map],
@@ -182,6 +189,16 @@ fn integrated_each_map_and_cause_retains_custody_without_release_retirement_fenc
                     .map(|(_, c, _)| c[map][cause as usize])
                     .sum::<u64>(),
                 1
+            );
+            let refusal = ScanIndex::load_for_snapshot_source_with_origin(
+                &fixture.root,
+                SnapshotSource::ClaudeCode,
+                &fixture.scratch,
+            )
+            .unwrap_err();
+            assert_eq!(
+                refusal.downcast_ref::<state_v2::Hold>(),
+                Some(&state_v2::Hold::DbUnavailable)
             );
             assert!(loaded.decode_holds_family("arbitrary-family"));
             assert!(loaded.decode_holds_entity("arbitrary-body"));
@@ -232,17 +249,22 @@ fn integrated_each_map_and_cause_retains_custody_without_release_retirement_fenc
     }
 }
 
+/// The sharded old-release store imports once; its next save commits to the
+/// state database and leaves only the native fence at the index path.
 #[test]
-fn integrated_reader_loads_shards_and_still_writes_legacy_with_committed_generation() {
+fn integrated_reader_imports_shards_and_saves_native_with_committed_generation() {
     let fixture = Fixture::new();
     let mut loaded = fixture.load();
     assert!(loaded.persistence_available());
+    assert!(loaded.v2().persistence_v2.is_some());
     let old_generation = loaded.generation;
     loaded.save(&fixture.root).unwrap();
     assert_eq!(loaded.generation, old_generation + 1);
     let raw: Value = serde_json::from_slice(&fs::read(&fixture.root).unwrap()).unwrap();
-    assert_eq!(raw["schema_version"], 2);
-    assert!(raw.get("storage_format").is_none());
+    assert_eq!(raw["schema_version"], 4);
+    assert_eq!(raw["storage_format"], 2);
+    assert_eq!(raw["files"], json!({}));
+    assert!(fixture.root.with_extension("json.v2.sqlite").exists());
     let restored = fixture.load();
     assert_eq!(restored.generation, loaded.generation);
     assert_eq!(
@@ -271,29 +293,47 @@ fn integrated_fresh_init_orphans_are_discarded_and_failure_observations_are_drai
     assert!(ScanIndex::load(&fixture.root).is_err());
     let observations = crate::local_resource_diagnostics::take_scan_index_storage_observations();
     assert_eq!(
-        observations.len(),
-        1,
-        "error exits pass the same stats drain"
+        observations.iter().map(|(n, _, _)| n).sum::<u64>(),
+        0,
+        "the native inventory hold precedes the legacy reader"
     );
     assert!(fixture.root.exists());
 }
 
+/// A fresh install may find the real progress lock, but never prior progress
+/// state: that refuses before any native publication. Once fresh G0 custody is
+/// published, a later JSON ledger beside it does not revoke that custody.
 #[test]
 fn fresh_init_allows_the_real_progress_lock_but_never_prior_progress_state() {
-    let fixture = Fixture::new();
-    fs::remove_file(&fixture.root).unwrap();
-    fs::remove_dir_all(&fixture.shards).unwrap();
-    let progress_lock = fixture
-        .root
-        .with_file_name("claude_code-scan-index-v3-upload-progress.lock");
-    fs::write(&progress_lock, []).unwrap();
-    fs::set_permissions(&progress_lock, fs::Permissions::from_mode(0o644)).unwrap();
-    assert_eq!(fixture.load().generation, 0);
-    let progress_state = fixture
-        .root
-        .with_file_name("claude_code-scan-index-v3-upload-progress.json");
-    fs::write(progress_state, b"{}").unwrap();
-    assert!(ScanIndex::load(&fixture.root).is_err());
+    for prior_state in [false, true] {
+        let fixture = Fixture::new();
+        fs::remove_file(&fixture.root).unwrap();
+        fs::remove_dir_all(&fixture.shards).unwrap();
+        let progress_lock = fixture
+            .root
+            .with_file_name("claude_code-scan-index-v3-upload-progress.lock");
+        fs::write(&progress_lock, []).unwrap();
+        fs::set_permissions(&progress_lock, fs::Permissions::from_mode(0o644)).unwrap();
+        let progress_state = fixture
+            .root
+            .with_file_name("claude_code-scan-index-v3-upload-progress.json");
+        if prior_state {
+            fs::write(&progress_state, b"{}").unwrap();
+            assert!(ScanIndex::load_for_snapshot_source_with_origin(
+                &fixture.root,
+                SnapshotSource::ClaudeCode,
+                &fixture.scratch,
+            )
+            .is_err());
+            assert!(!fixture.root.exists(), "no fresh fence");
+            assert!(!fixture.root.with_extension("json.v2.sqlite").exists());
+            assert_eq!(fs::read(&progress_state).unwrap(), b"{}");
+        } else {
+            assert_eq!(fixture.load().generation, 0);
+            fs::write(&progress_state, b"{}").unwrap();
+            assert_eq!(ScanIndex::load(&fixture.root).unwrap().generation, 0);
+        }
+    }
 }
 
 #[test]
@@ -305,36 +345,30 @@ fn authorized_legacy_quarantine_rebuild_keeps_opaque_custody_until_replacement()
         b"{\"schema_version\":2,\"files\":{},\"generation\":\"broken",
     )
     .unwrap();
-    let mut rebuilt = fixture.load();
+    let error = ScanIndex::load_for_snapshot_source_with_origin(
+        &fixture.root,
+        SnapshotSource::ClaudeCode,
+        &fixture.scratch,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<state_v2::Hold>(),
+        Some(&state_v2::Hold::ReloadRequired)
+    );
+    let (mut rebuilt, origin) = ScanIndex::load_for_snapshot_source_with_origin(
+        &fixture.root,
+        SnapshotSource::ClaudeCode,
+        &fixture.scratch,
+    )
+    .unwrap();
+    assert_eq!(origin, ScanIndexLoadOrigin::Loaded);
+    assert!(origin.is_fresh(&rebuilt));
     assert_eq!(rebuilt.generation, 0);
-    assert!(rebuilt.persistence_legacy_recovery.is_some());
-    assert!(!fixture.root.exists());
-    let mut clone = rebuilt.clone();
-    clone.retain_persistence_baseline_from(&rebuilt);
-    assert!(clone.persistence_legacy_recovery.is_some());
-    // Arbitrary missing-root loads cannot manufacture the authorized token.
-    assert!(ScanIndex::load(&fixture.root).is_err());
+    let mut stale = rebuilt.clone();
     rebuilt.save(&fixture.root).unwrap();
     assert_eq!(rebuilt.generation, 1);
-    assert!(rebuilt.persistence_legacy_recovery.is_none());
+    assert!(stale.save(&fixture.root).is_err());
     assert_eq!(fixture.load().generation, 1);
-    // Captured recovery adopts the publication and must use ordinary CAS on
-    // its next checkpoint, rather than retrying the spent first-save grant.
-    let mut adopted = clone.clone();
-    adopted.generation = rebuilt.generation;
-    adopted.retain_persistence_baseline_from(&rebuilt);
-    assert!(adopted.persistence_legacy_recovery.is_none());
-    adopted.save(&fixture.root).unwrap();
-    assert_eq!(adopted.generation, 2);
-    assert_eq!(fixture.load().generation, 2);
-    // A stale clone cannot re-use the spent recovery grant.
-    assert!(clone.save(&fixture.root).is_err());
-    fs::remove_file(&fixture.root).unwrap();
-    assert!(clone.save(&fixture.root).is_err());
-    assert!(
-        !fixture.root.exists(),
-        "spent Arc custody never resets a lost root"
-    );
 }
 
 #[test]
@@ -367,7 +401,7 @@ fn partial_negative_metadata_holds_keep_their_fund_when_a_map_is_missing() {
     fs::write(new, bytes).unwrap();
     fs::remove_file(fixture.bucket_path(0)).unwrap();
     fixture.write_root();
-    let index = fixture.load();
+    let index = fixture.read();
     assert!(!index.persistence_available());
     assert!(index.decode_holds.contains("files", "held-negative-file"));
     assert!(index.decode_holds.held_bytes() > 2 * 1024 * 1024);
@@ -403,7 +437,8 @@ fn integrated_manifest_refuses_each_unknown_map_and_counts_before_window_parsing
     for map in 0..3 {
         let fixture = Fixture::new();
         fs::remove_file(fixture.bucket_path(map)).unwrap();
-        let index = fixture.load();
+        e2_pipeline_scan_fixture::assert_import_support_for_test(&fixture.root);
+        let index = fixture.read();
         let (result, rows) = crate::local_resource_diagnostics::capture(|| {
             index.manifest_for_window(SnapshotSource::ClaudeCode, "invalid", "invalid")
         });
@@ -557,12 +592,17 @@ fn recovery_emission_boundaries(
     (scan, manifest, held)
 }
 
+/// Damage belongs to an old-release input before its first admission: an
+/// imported native route never reads the legacy shards again. A restart after
+/// restoration imports the same graph as the healthy control.
 #[test]
 fn integrated_each_damaged_map_holds_then_restores_equal_money_without_transcript_reads() {
     for map in 0..3 {
+        let control_fixture = Fixture::new();
         let fixture = Fixture::new();
-        let healthy = fixture.load();
-        let (prepared, evidence) = { prepared_recovery_page(&fixture, &healthy) };
+        let healthy = control_fixture.load();
+        assert!(healthy.v2().persistence_v2.is_some());
+        let (prepared, evidence) = { prepared_recovery_page(&control_fixture, &healthy) };
         assert_eq!(prepared.len(), 1, "positive prepared E2 page");
         let mut control = healthy.clone();
         let ((control_scan, control_manifest, control_held), reads) =
@@ -590,7 +630,7 @@ fn integrated_each_damaged_map_holds_then_restores_equal_money_without_transcrip
         let payload = fixture.bucket_path(map);
         let original = fs::read(&payload).unwrap();
         fs::write(&payload, b"{damaged}").unwrap();
-        let mut unknown = fixture.load();
+        let mut unknown = fixture.read();
         assert!(!unknown.persistence_available());
         assert_eq!(
             unknown.persistence_unavailable[map].unwrap().cause,
@@ -621,11 +661,14 @@ fn integrated_each_damaged_map_holds_then_restores_equal_money_without_transcrip
         assert_eq!(serde_json::to_vec(&unknown.files).unwrap(), old_files);
 
         fs::write(&payload, original).unwrap();
+        // The damaged load paused the import; a restart admits it again.
+        state_v2::cold_close_for_test(&fixture.root).unwrap();
         let ((restored, resumed_scan, resumed_manifest, resumed_held), reads) =
             terminal_contract_retry::source_acquisitions(|| {
                 with_transcript_io_denied(|| {
                     let mut restored = fixture.load();
                     assert!(restored.persistence_available());
+                    assert!(restored.v2().persistence_v2.is_some());
                     assert!(
                         !unknown.persistence_available(),
                         "old views never clear in place"
@@ -684,7 +727,10 @@ fn integrated_missing_root_reserved_only_stalls_before_default_save_or_transcrip
     });
     assert!(reads.is_empty());
     let error = result.expect_err("missing root must refuse before default index");
-    assert!(format!("{error:#}").contains("scan_index_root_missing_with_shards"));
+    assert_eq!(
+        error.downcast_ref::<state_v2::Hold>(),
+        Some(&state_v2::Hold::DbUnavailable)
+    );
     assert!(!fixture.root.exists(), "no fresh save");
     assert_eq!(fs::read_dir(&fixture.shards).unwrap().count(), 2);
     for path in files {
@@ -721,9 +767,10 @@ fn integrated_no_store_true_first_install_still_initializes_without_transcript_r
     assert_eq!(observations.iter().map(|(_, _, n)| n).sum::<u64>(), 0);
 }
 
-/// [off=main] off large v1 manifest load cas and containment match compact v1.
+/// A large v1 manifest imports, saves and refuses v1 containment exactly like a
+/// compact v1 manifest: the bounded fence sniff never routes it elsewhere.
 #[test]
-fn off_large_v1_manifest_load_cas_and_containment_match_compact_v1() {
+fn large_v1_manifest_import_save_and_containment_match_compact_v1() {
     let compact = Fixture::new();
     let large = Fixture::new();
     assert_eq!(large.manifest["storage_format"], json!(1));
@@ -732,29 +779,35 @@ fn off_large_v1_manifest_load_cas_and_containment_match_compact_v1() {
     assert!(bytes.len() > 4096);
     assert!(bytes.len() < scan_index_persistence::MAX_ROOT_BYTES);
     fs::write(&large.root, &bytes).unwrap();
-    // No sentinel or environment opt-in: exercise the real source-aware OFF
-    // route, v1 CAS writer, and the shared containment admission guard.
+    // No sentinel or environment opt-in: exercise the real source-aware
+    // import, native save and the shared containment admission guard.
     let mut expected = compact.load();
     let mut actual = large.load();
-    assert!(actual.v2().persistence_v2.is_none());
+    assert!(expected.v2().persistence_v2.is_some());
+    assert!(actual.v2().persistence_v2.is_some());
+    assert!(actual.persistence_available());
+    assert_eq!(actual.generation, expected.generation);
+    assert_eq!(
+        serde_json::to_vec(&actual).unwrap(),
+        serde_json::to_vec(&expected).unwrap()
+    );
+    for fixture in [&compact, &large] {
+        let raw: Value = serde_json::from_slice(&fs::read(&fixture.root).unwrap()).unwrap();
+        assert_eq!(raw["schema_version"], 4);
+        assert_eq!(raw["files"], json!({}));
+        let _lock = CheckpointLock::acquire(&fixture.root).unwrap();
+        assert!(state_v2::guard_containment_locked(&fixture.root).is_err());
+    }
+    expected.save(&compact.root).unwrap();
+    actual.save(&large.root).unwrap();
+    assert_eq!(actual.generation, expected.generation);
+    let (expected, actual) = (compact.load(), large.load());
     assert!(actual.persistence_available());
     assert_eq!(
         serde_json::to_vec(&actual).unwrap(),
         serde_json::to_vec(&expected).unwrap()
     );
-    assert_eq!(fs::read(&large.root).unwrap(), bytes);
-    {
-        let _lock = CheckpointLock::acquire(&large.root).unwrap();
-        state_v2::guard_containment_locked(&large.root).unwrap();
-    }
-    expected.save(&compact.root).unwrap();
-    actual.save(&large.root).unwrap();
-    assert_eq!(
-        fs::read(&large.root).unwrap(),
-        fs::read(&compact.root).unwrap()
-    );
-    assert!(large.load().persistence_available());
-    assert!(!large.root.with_extension("json.v2.sqlite").exists());
+    assert!(large.root.with_extension("json.v2.sqlite").exists());
 }
 
 // Snapshot every file in this bounded synthetic index, including storage
@@ -878,12 +931,17 @@ fn historical_replay_runs_once_per_generation_only_when_pending() {
 fn a_failed_save_after_a_replay_replays_again_and_a_saved_replay_holds() {
     const GENERATION: &str = "codex:replay-custody:g1";
     let key = "/s/replay-custody.jsonl";
-    let scratch = crate::test_scratch::private_dir("replay-custody");
-    let path = scratch.join("index.json");
+    let scratch = crate::test_scratch::ScratchDir::canonical("replay-custody");
     let pending =
         |index: &ScanIndex| index.historical_replay_generation.as_deref() != Some(GENERATION);
     let mut disk = ScanIndex::default();
     replay_indexed(&mut disk, key);
+    let (session, mut disk) = state_v2::money_test_support::ColdSession::publish(
+        scan_index_persistence::Source::Claude,
+        &disk,
+        scratch.as_ref(),
+    );
+    let path = session.path().to_owned();
     disk.save(&path).unwrap();
 
     // The replay resets the loaded copy; its save fails.
@@ -911,7 +969,8 @@ fn a_failed_save_after_a_replay_replays_again_and_a_saved_replay_holds() {
     assert!(!pending(&index));
     assert!(!index.prepare_historical_replay(GENERATION.into()));
     assert!(replay_delivered(&index, key));
-    fs::remove_dir_all(&scratch).unwrap();
+    drop(index);
+    drop(session);
 }
 
 // F10: count surviving complete offers at the real post-policy finalizer.
