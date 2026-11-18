@@ -4902,7 +4902,9 @@ pub(crate) fn finish_page_planned(
 
     claude_request_identity::inherit_root_accounts(items, true);
 
-    let mut drop_copies = BTreeMap::<String, bool>::new();
+    // Per session: whether every fold is a covered copy, and the latest last
+    // clock over its folds, which the emitted body keeps.
+    let mut drop_copies = BTreeMap::<String, (bool, Option<String>)>::new();
     for item in items.iter() {
         if let Some(fold) = item.claude_money.as_deref() {
             let covered = fold.first_own.is_none()
@@ -4915,9 +4917,17 @@ pub(crate) fn finish_page_planned(
                         .observations(&item.source_session_id)
                         .any(|(location, _)| location != here)
                 });
-            *drop_copies
+            let (covered_only, last) = drop_copies
                 .entry(item.source_session_id.clone())
-                .or_insert(true) &= covered;
+                .or_insert((true, None));
+            *covered_only &= covered;
+            if let Some(clock) = item.source_last_activity_at.as_deref() {
+                if last.as_deref().map_or(true, |current| {
+                    super::super::timestamp_is_after(clock, current)
+                }) {
+                    *last = Some(clock.to_owned());
+                }
+            }
         }
     }
     let mut corrected_sessions = BTreeSet::new();
@@ -5090,9 +5100,10 @@ pub(crate) fn finish_page_planned(
         if item.claude_money.is_none() {
             return true;
         }
-        if !content_held.contains(&item.source_session_id)
-            && drop_copies.get(&item.source_session_id) == Some(&true)
-        {
+        let (covered_only, span_last) = drop_copies
+            .get(&item.source_session_id)
+            .map_or((false, None), |(covered, last)| (*covered, last.as_deref()));
+        if !content_held.contains(&item.source_session_id) && covered_only {
             return false;
         }
         // One body per session: the first item carries the summed entity.
@@ -5104,7 +5115,7 @@ pub(crate) fn finish_page_planned(
         };
         // apply refuses before mutating, so a withheld item is unchanged:
         // its fold gets its own entity back (moved out above).
-        let emitted = super::emit::apply(item, &entity, first_original.is_some());
+        let emitted = super::emit::apply(item, &entity, span_last);
         if emitted {
             item.request_contributions = contributions.into_boxed_slice();
             if let Some(marked) = item.copy_unproven_counts {
@@ -5292,7 +5303,7 @@ pub(crate) fn telemetry_scope(
 }
 
 pub(crate) fn emit_entity(item: &mut SnapshotItem, entity: &ClaudeEntityBody) -> bool {
-    super::emit::apply(item, entity, false)
+    super::emit::apply(item, entity, None)
 }
 
 /// The identity row of each request a copied marker
