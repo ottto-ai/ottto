@@ -89,6 +89,13 @@ pub(crate) fn bind_source_for_test(path: &Path, source: SnapshotSource) {
     assert_route_source(path, source);
 }
 
+/// The source and destination namespace `path`'s storage binding names,
+/// including a registered synthetic alias.
+pub(crate) fn binding_for_test(path: &Path) -> (SnapshotSource, String) {
+    let binding = scan_index_integration::scan_index_storage_binding(path).expect("a bound route");
+    (binding.source.snapshot(), binding.namespace_hash)
+}
+
 /// A reused fixture route must hold `source`'s graph.
 fn assert_route_source(route: &Path, source: SnapshotSource) {
     assert_eq!(

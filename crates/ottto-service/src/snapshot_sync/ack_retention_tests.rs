@@ -8,10 +8,21 @@ struct AckFixture {
     namespace: String,
     item: SnapshotItem,
     identity: serde_json::Value,
+    /// The ledger is the route's native progress rows.
+    native: bool,
 }
 
 impl AckFixture {
     fn new(committed_ack: bool) -> Self {
+        Self::with_progress(committed_ack, false)
+    }
+
+    /// The fixture with its ledger on the graph route's native progress.
+    fn native(committed_ack: bool) -> Self {
+        Self::with_progress(committed_ack, true)
+    }
+
+    fn with_progress(committed_ack: bool, native: bool) -> Self {
         let scratch = crate::test_scratch::ScratchDir::canonical("upload-ack-retention");
         let sources = scratch.join("sources");
         std::fs::create_dir_all(&sources).unwrap();
@@ -46,7 +57,12 @@ impl AckFixture {
             &namespace,
         );
         index.save_fixture(&index_path).unwrap();
-        progress.save_fixture(&progress_path).unwrap();
+        let (progress_path, mut progress) = if native {
+            super::routed_progress(&index, &index_path, progress)
+        } else {
+            (progress_path, progress)
+        };
+        progress.save(&progress_path).unwrap();
         let identity = serde_json::to_value(&index).unwrap();
         Self {
             scratch,
@@ -56,6 +72,7 @@ impl AckFixture {
             namespace,
             item,
             identity,
+            native,
         }
     }
 
@@ -80,12 +97,12 @@ impl AckFixture {
 
     fn load(&self) -> (ScanIndex, SnapshotUploadProgress) {
         let index = ScanIndex::load(&self.index_path).unwrap();
-        let mut progress = SnapshotUploadProgress::load(
-            &self.progress_path,
-            &self.namespace,
-            snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
-        )
-        .unwrap();
+        let witness = snapshot_quarantine_witness(SnapshotSource::ClaudeCode);
+        let mut progress = if self.native {
+            super::load_routed_progress(&index, &self.index_path, &self.namespace, witness)
+        } else {
+            SnapshotUploadProgress::load(&self.progress_path, &self.namespace, witness).unwrap()
+        };
         progress.configure_ack_capacity(&index);
         (index, progress)
     }
@@ -181,7 +198,7 @@ pub(super) fn exact_ack(
 
 #[test]
 fn bounded_retry_quarantine_preserves_other_acks_and_contexts_after_reload() {
-    let f = AckFixture::new(true);
+    let f = AckFixture::native(true);
     let (_, mut progress) = f.load();
     let fingerprint = &f.item.snapshot_fingerprint;
     progress
@@ -243,7 +260,7 @@ fn bounded_retry_quarantine_preserves_other_acks_and_contexts_after_reload() {
         reloaded.quarantined_fingerprints,
         progress.quarantined_fingerprints
     );
-    assert!(f.progress_path.exists(), "valid ledger was not quarantined");
+    assert!(reloaded.rows.is_some(), "valid ledger was not quarantined");
     assert!(!std::fs::read_dir(&f.scratch).unwrap().any(|entry| {
         entry
             .unwrap()
@@ -605,12 +622,18 @@ fn one_body_set_witness(body: &str) -> String {
 #[test]
 fn bootstrap_capacity_drains_admitted_bodies_through_partial_settlement() {
     let scratch = crate::test_scratch::ScratchDir::new("bootstrap-ack-capacity");
-    let index_path = scratch.join("index.json");
-    let progress_path = scratch.join("progress.json");
+    let progress = test_upload_progress();
+    let namespace = progress.destination_namespace_hash.clone();
     let mut baseline = ScanIndex::default();
+    let index_path = crate::snapshots::e2_pipeline_scan_fixture::bind_fixture_route(
+        SnapshotSource::Codex,
+        &mut baseline,
+        &scratch,
+        &namespace,
+    );
     baseline.save_fixture(&index_path).unwrap();
-    let mut progress = test_upload_progress();
-    progress.save_fixture(&progress_path).unwrap();
+    let (progress_path, mut progress) = super::routed_progress(&baseline, &index_path, progress);
+    progress.save(&progress_path).unwrap();
     let (_, template) = pending_head_index_item();
     let entry = pending_head_index_item()
         .0
@@ -630,12 +653,12 @@ fn bootstrap_capacity_drains_admitted_bodies_through_partial_settlement() {
     let mut main_posts = 0;
     for cycle in 0..3 {
         baseline = ScanIndex::load(&index_path).unwrap();
-        progress = SnapshotUploadProgress::load(
-            &progress_path,
-            &progress.destination_namespace_hash,
+        progress = super::load_routed_progress(
+            &baseline,
+            &index_path,
+            &namespace,
             test_quarantine_witness(),
-        )
-        .unwrap();
+        );
         progress.ack_capacity = 2; // exact production capacity seam, small oracle
         let mut items = all
             .iter()
@@ -713,12 +736,12 @@ fn bootstrap_capacity_drains_admitted_bodies_through_partial_settlement() {
                 false,
             )
             .unwrap();
-        let loaded = SnapshotUploadProgress::load(
-            &progress_path,
-            &progress.destination_namespace_hash,
+        let loaded = super::load_routed_progress(
+            &ScanIndex::load(&index_path).unwrap(),
+            &index_path,
+            &namespace,
             test_quarantine_witness(),
-        )
-        .unwrap();
+        );
         assert!(
             loaded.accepted_fingerprints.is_empty(),
             "adopted capacity drains each cycle"
@@ -851,8 +874,6 @@ fn retirement_handoff_recovers_acks_after_index_commit_and_cleanup_save_failures
     const ENTITIES: usize = 50;
     for failure in ["crash", "progress_cas", "index_cas"] {
         let scratch = crate::test_scratch::ScratchDir::new("ack-retirement-crash");
-        let index_path = scratch.join("index.json");
-        let progress_path = scratch.join("progress.json");
         let mut progress = test_upload_progress();
         let namespace = progress.destination_namespace_hash.clone();
         let mut committed = ScanIndex::default();
@@ -867,8 +888,19 @@ fn retirement_handoff_recovers_acks_after_index_commit_and_cleanup_save_failures
         committed.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
         let unindexed = "f".repeat(64);
         progress.record_body(&unindexed, &"a".repeat(64));
+        let index_path = crate::snapshots::e2_pipeline_scan_fixture::bind_fixture_route(
+            SnapshotSource::Codex,
+            &mut committed,
+            &scratch,
+            &namespace,
+        );
         committed.save_fixture(&index_path).unwrap();
-        progress.save_fixture(&progress_path).unwrap();
+        let (progress_path, mut progress) =
+            super::routed_progress(&committed, &index_path, progress);
+        progress.save(&progress_path).unwrap();
+        let load = |index: &ScanIndex| {
+            super::load_routed_progress(index, &index_path, &namespace, test_quarantine_witness())
+        };
         progress.configure_ack_capacity(&committed);
         assert_eq!(progress.ack_capacity, ENTITIES + 4096);
         let mut selected = committed.clone();
@@ -892,9 +924,7 @@ fn retirement_handoff_recovers_acks_after_index_commit_and_cleanup_save_failures
         drop((committed, selected, progress)); // crash before any progress cleanup
 
         let mut saved = ScanIndex::load(&index_path).unwrap();
-        let mut progress =
-            SnapshotUploadProgress::load(&progress_path, &namespace, test_quarantine_witness())
-                .unwrap();
+        let mut progress = load(&saved);
         progress.configure_ack_capacity(&saved);
         assert_eq!(progress.accepted_fingerprints.len(), ENTITIES + 1);
         assert_eq!(progress.ack_capacity, 4096);
@@ -915,13 +945,7 @@ fn retirement_handoff_recovers_acks_after_index_commit_and_cleanup_save_failures
                 ENTITIES + 1,
                 "failed cleanup restores memory"
             );
-            assert_eq!(
-                SnapshotUploadProgress::load(&progress_path, &namespace, test_quarantine_witness())
-                    .unwrap()
-                    .accepted_fingerprints
-                    .len(),
-                ENTITIES + 1
-            );
+            assert_eq!(load(&saved).accepted_fingerprints.len(), ENTITIES + 1);
             assert!(ScanIndex::load(&index_path)
                 .unwrap()
                 .upload_ack_retirement_handoff
@@ -932,13 +956,7 @@ fn retirement_handoff_recovers_acks_after_index_commit_and_cleanup_save_failures
             assert!(progress
                 .recover_ack_retirement_handoff(&mut saved, &index_path, &progress_path)
                 .is_err());
-            assert_eq!(
-                SnapshotUploadProgress::load(&progress_path, &namespace, test_quarantine_witness())
-                    .unwrap()
-                    .accepted_fingerprints
-                    .len(),
-                1
-            );
+            assert_eq!(load(&saved).accepted_fingerprints.len(), 1);
             assert!(ScanIndex::load(&index_path)
                 .unwrap()
                 .upload_ack_retirement_handoff
@@ -946,9 +964,7 @@ fn retirement_handoff_recovers_acks_after_index_commit_and_cleanup_save_failures
         }
         // Restart after either failure, too. No absent-input eviction is used.
         let mut saved = ScanIndex::load(&index_path).unwrap();
-        let mut progress =
-            SnapshotUploadProgress::load(&progress_path, &namespace, test_quarantine_witness())
-                .unwrap();
+        let mut progress = load(&saved);
         if failure == "index_cas" {
             // Cleanup is already visible, but proof consumption still needs a
             // successful progress save. A stale generation must keep authority.
@@ -964,9 +980,7 @@ fn retirement_handoff_recovers_acks_after_index_commit_and_cleanup_save_failures
                 .unwrap()
                 .upload_ack_retirement_handoff
                 .is_some());
-            progress =
-                SnapshotUploadProgress::load(&progress_path, &namespace, test_quarantine_witness())
-                    .unwrap();
+            progress = load(&saved);
             saved = ScanIndex::load(&index_path).unwrap();
         }
         progress
@@ -999,14 +1013,7 @@ fn retirement_handoff_recovers_acks_after_index_commit_and_cleanup_save_failures
         )
         .unwrap();
         assert_eq!(attempts, 1);
-        assert!(SnapshotUploadProgress::load(
-            &progress_path,
-            &namespace,
-            test_quarantine_witness()
-        )
-        .unwrap()
-        .accepted_fingerprints
-        .contains(&unrelated));
+        assert!(load(&saved).accepted_fingerprints.contains(&unrelated));
     }
 }
 
@@ -1023,7 +1030,7 @@ fn retirement_handoff_is_bound_to_destination_generation_body_and_saved_protecti
         "held",
         "relogin",
     ] {
-        let mut f = AckFixture::new(true);
+        let mut f = AckFixture::native(true);
         let (committed, mut progress) = f.load();
         let mut selected = committed.clone();
         selected.files.clear();
@@ -1160,7 +1167,7 @@ fn full_unindexed_debt_still_allows_a_live_entity_without_lending_slots_to_unrel
 #[test]
 fn retirement_obligations_survive_opaque_decode_and_local_hold_cycles() {
     for mode in ["opaque", "entity_hold", "local_hold"] {
-        let f = AckFixture::new(true);
+        let f = AckFixture::native(true);
         let (committed, progress) = f.load();
         let mut selected = committed.clone();
         selected.files.clear();
@@ -1326,7 +1333,7 @@ fn complete_census_retires_never_committed_vanished_acks_after_partial_error() {
 
 #[test]
 fn complete_census_recovers_a_stale_full_cap_and_allows_new_unrelated_upload() {
-    let f = AckFixture::new(false);
+    let f = AckFixture::native(false);
     let (previous, mut progress) = f.load();
     for entity in 0..5000 {
         let fp = format!("{entity:064x}");
@@ -1429,7 +1436,7 @@ fn first_install_current_live_incidence_admits_more_than_4096_without_a_stop() {
 
 #[test]
 fn resumed_probe_capacity_preserves_durable_equality_for_census_retirement() {
-    let f = AckFixture::new(false);
+    let f = AckFixture::native(false);
     let (committed, mut progress) = f.load();
     let mut item = f.item.clone();
     item.cache_observations = pending_head_index_item().1.cache_observations;
@@ -1692,7 +1699,7 @@ fn partial_save_keeps_a_pending_obligation_live_in_an_unsettled_new_file() {
 // subset names E, but the full scan still references it.
 #[test]
 fn partial_save_never_retires_a_committed_entity_moved_into_an_unsettled_new_file() {
-    let f = AckFixture::new(true);
+    let f = AckFixture::native(true);
     let (committed, mut progress) = f.load();
     let key = committed.files.keys().next().unwrap().clone();
     let entry = committed.files[&key].clone();
@@ -2044,30 +2051,43 @@ fn load_bound_progress(path: &Path, namespace: &str) -> SnapshotUploadProgress {
 #[test]
 fn v2_db_first_crash_retires_only_the_committed_exact_handoff() {
     let scratch = crate::test_scratch::ScratchDir::new("v2-ack-db-first");
-    let index_path = scratch.join("index");
-    let path = scratch.join("progress");
     let namespace = "a".repeat(64);
     let fp = "b".repeat(64);
     let body = "c".repeat(64);
-    let mut progress = bound_progress(&path, &namespace);
-    progress.record_body(&fp, &body);
-    progress.save_fixture(&path).unwrap();
+    // The empty committed graph owns the progress before the ACK page.
     let mut saved = ScanIndex::default();
+    let index_path = crate::snapshots::e2_pipeline_scan_fixture::bind_fixture_route(
+        SnapshotSource::ClaudeCode,
+        &mut saved,
+        &scratch,
+        &namespace,
+    );
+    saved.save_fixture(&index_path).unwrap();
+    let witness = || snapshot_quarantine_witness(SnapshotSource::ClaudeCode);
+    let (path, mut progress) = super::routed_progress(
+        &saved,
+        &index_path,
+        SnapshotUploadProgress::new(namespace.clone(), witness()),
+    );
+    progress.save(&path).unwrap();
+    progress.record_body(&fp, &body);
+    progress.save(&path).unwrap();
     saved.upload_ack_retirement_handoff = Some(crate::snapshots::UploadAckRetirementHandoff {
         destination_namespace_hash: namespace.clone(),
-        committed_generation: 1,
+        // The generation this save commits, as staging records it.
+        committed_generation: saved.generation + 1,
         bodies: [(fp.clone(), body)].into(),
         pending_bodies: BTreeMap::new(),
     });
     saved.save_fixture(&index_path).unwrap();
     // Crash after source commit, before cleanup of the external progress ACK.
-    let mut loaded = load_bound_progress(&path, &namespace);
+    let mut loaded = super::load_routed_progress(&saved, &index_path, &namespace, witness());
     loaded
         .recover_ack_retirement_handoff(&mut saved, &index_path, &path)
         .unwrap();
     assert!(loaded.accepted_fingerprints.is_empty());
     assert!(saved.upload_ack_retirement_handoff.is_none());
-    let reloaded = load_bound_progress(&path, &namespace);
+    let reloaded = super::load_routed_progress(&saved, &index_path, &namespace, witness());
     assert!(reloaded.accepted_fingerprints.is_empty());
 }
 /// [money] v2 transport error and failed index commit never authorize an ack.
