@@ -1424,6 +1424,106 @@ fn real_uploader_unstored_answer_holds_by_basis_and_growth_earns_receipt() {
     }
     assert_eq!(answered[0], answered[1], "the answer never changes a body");
 }
+/// [regress] [money] Two sessions hold an old `usage_identical` answer
+/// terminally. A new historical replay (the server no longer has the head)
+/// reads one file per page, so one body is first met on page 2 whatever the
+/// order. Each unchanged body is offered once and earns one exact ACK: a
+/// terminal hold carried from before the replay keeps its disclosure but does
+/// not suppress re-entry on a later page, as it does not on the first.
+#[test]
+fn replay_re_offers_a_pre_replay_usage_identical_body_met_on_a_later_page() {
+    const OTHER: &str = "019fa111-2222-7333-8444-666666666666";
+    let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+    fs::write(
+        f.root.join(format!("{OTHER}.jsonl")),
+        format!("{}\n", json!({"type":"assistant","sessionId":OTHER,"timestamp":"2026-10-29T10:00:02Z","requestId":"other-request","message":{"id":"other-message","model":"claude-sonnet-4-6","usage":{"input_tokens":7,"output_tokens":3}}})),
+    )
+    .unwrap();
+    let context = "e".repeat(64);
+    f.index
+        .activate_file_upload_context(f.source, context.clone());
+    let previous = f.index.clone();
+    let (scan, _) = f.walk(true);
+    assert_eq!(scan.snapshots.len(), 2);
+    f.uploader.activate(f.source, context.clone(), &mut f.index);
+    f.uploader.not_stored = Some("usage_identical");
+    f.uploader
+        .send(f.source, &mut f.index, &previous, &scan.snapshots)
+        .unwrap();
+    let held = scan
+        .snapshots
+        .iter()
+        .map(|item| {
+            let hold = &f.index.quarantined_snapshot_fingerprints[&item.snapshot_fingerprint];
+            assert_eq!(
+                hold.disposition,
+                SnapshotQuarantineDisposition::UnprovenTerminal
+            );
+            let witness = snapshot_upload_body_witness(item);
+            assert_eq!(hold.upload_body_witness.as_ref(), Some(&witness));
+            (item.snapshot_fingerprint.clone(), witness)
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    f.uploader.not_stored = None;
+    let posts = f.uploader.posts.len();
+    let mut first_page = BTreeMap::new();
+    for page in 1..=2 {
+        f.uploader
+            .prepare_replay_page(f.source, context.clone(), &mut f.index, "replay-1");
+        let previous = f.index.clone();
+        let (scan, _) = f.walk_with_file_limit(true, 1, false);
+        assert_eq!(scan.scanned_file_count, 1, "page {page}");
+        f.uploader
+            .send(f.source, &mut f.index, &previous, &scan.snapshots)
+            .unwrap();
+        for item in &scan.snapshots {
+            let met = (page, snapshot_upload_body_witness(item));
+            first_page
+                .entry(item.snapshot_fingerprint.clone())
+                .or_insert(met);
+        }
+    }
+    assert_eq!(
+        first_page
+            .iter()
+            .map(|(entity, (_, witness))| (entity.clone(), witness.clone()))
+            .collect::<BTreeMap<_, _>>(),
+        held,
+        "the replay meets each held body unchanged"
+    );
+    assert!(
+        first_page.values().any(|(page, _)| *page == 2),
+        "one held body is first met on page 2"
+    );
+    // Later passes of the same replay offer nothing again.
+    f.uploader
+        .prepare_replay_page(f.source, context.clone(), &mut f.index, "replay-1");
+    let previous = f.index.clone();
+    let (scan, _) = f.walk(true);
+    f.uploader
+        .send(f.source, &mut f.index, &previous, &scan.snapshots)
+        .unwrap();
+    let mut offered = f.uploader.posts[posts..]
+        .iter()
+        .flatten()
+        .map(|body| body["snapshot_fingerprint"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    offered.sort();
+    assert_eq!(
+        offered,
+        held.keys().cloned().collect::<Vec<_>>(),
+        "each held body is offered exactly once"
+    );
+    for entity in held.keys() {
+        assert!(f.index.accepted_snapshot_fingerprint_recorded(entity));
+        assert!(!f
+            .index
+            .quarantined_snapshot_fingerprints
+            .contains_key(entity));
+    }
+}
+
 #[test]
 fn real_uploader_duplicate_refusal_mints_nothing_and_does_not_loop() {
     let mut f = Fixture::new(SnapshotSource::ClaudeCode);

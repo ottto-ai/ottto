@@ -623,6 +623,26 @@ impl Uploader {
         )
         .unwrap();
     }
+    /// A historical replay page's prepare, in the service's order: progress
+    /// first (it imports the index's holds only once the index already
+    /// carries this generation), then the index.
+    pub(crate) fn prepare_replay_page(
+        &mut self,
+        source: SnapshotSource,
+        context: String,
+        index: &mut ScanIndex,
+        generation: &str,
+    ) {
+        self.activate(source, context, index);
+        prepare_upload_progress_for_cycle_with_reoffer(
+            &mut self.progress,
+            index,
+            generation,
+            true,
+            None,
+        );
+        index.prepare_historical_replay(generation.into());
+    }
     pub(crate) fn replay(&mut self, generation: &str) {
         assert!(self.progress.prepare_historical_replay(generation));
     }
