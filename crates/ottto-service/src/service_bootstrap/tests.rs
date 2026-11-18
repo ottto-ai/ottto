@@ -398,7 +398,7 @@ fn bootout_waits_for_delayed_job_removal_within_one_budget() {
 
     // Slow probes that keep finding the job: the budget covers the probes
     // themselves, and each probe's timeout is the time left (floored).
-    let budget = Duration::from_millis(200);
+    let budget = Duration::from_millis(500);
     let mut timeouts = Vec::new();
     let started = std::time::Instant::now();
     let error = wait_until_job_absent(

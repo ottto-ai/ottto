@@ -124,9 +124,10 @@ fn install_with(
 }
 
 /// Polls `probe` until the job is absent, within one `budget` measured from
-/// the first probe. Each probe gets the time left as its timeout. A probe
-/// error (unknown state) or a job still present at the deadline is an error,
-/// so bootstrap never runs against a job that may still be loaded.
+/// the first probe. Each probe gets the time left (at least 100 ms) as its
+/// timeout. A probe error (unknown state) or a job still present at the
+/// deadline is an error, so bootstrap never runs against a job that may still
+/// be loaded.
 fn wait_until_job_absent(
     mut probe: impl FnMut(Duration) -> Result<Option<std::path::PathBuf>>,
     budget: Duration,
