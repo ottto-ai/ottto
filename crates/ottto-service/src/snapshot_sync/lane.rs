@@ -577,7 +577,7 @@ pub(super) fn set_one_shot_sync_in_flight(value: bool) {
     }
 }
 
-/// `walk_all`: a requested sync walks every source.
+/// `walk_all`: a requested sync walks every source (cleared under the lock).
 pub(super) fn sync_once(
     home: &Path,
     support_dir: &Path,
@@ -592,7 +592,6 @@ pub(super) fn sync_once(
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    // Cleared under the lock, so no finish in flight can re-arm a source.
     for source in SNAPSHOT_SOURCES.into_iter().filter(|_| walk_all) {
         crate::snapshots::walk_idle::clear(source);
     }

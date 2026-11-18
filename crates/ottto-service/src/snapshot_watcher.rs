@@ -426,8 +426,7 @@ pub fn watch_snapshot_roots(roots: Vec<(SnapshotSource, PathBuf)>) -> Result<Sna
             // A backend watcher error means the event stream is no longer a
             // complete witness. The periodic durable scan must finish one
             // explicitly dirty generation and then a clean generation before
-            // publishing a manifest. The worker stops, so the lane re-creates
-            // the watcher (and lists) instead of trusting it.
+            // publishing a manifest. The worker stops: the lane re-creates it.
             let Some(events) = complete_debounce_events(result) else {
                 break;
             };
