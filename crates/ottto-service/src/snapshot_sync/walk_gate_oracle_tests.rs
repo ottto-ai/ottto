@@ -492,6 +492,7 @@ fn no_hint_arm(
     source: SnapshotSource,
     row: &'static str,
     gated: bool,
+    owed: bool,
     arm: &dyn Fn(&OracleHome, &OracleServer, Moment),
 ) -> Lifecycle {
     let recording = Recording::start();
@@ -506,7 +507,16 @@ fn no_hint_arm(
         if !gated {
             crate::snapshot_watcher::cover_paths_for_test(None);
         }
-        let mut cycles = settle(&mut home, &server, &recording);
+        // An owed source never arms: its walks stay back to back until the
+        // deletion settles it, so its passes are observed, not predicted.
+        let mut cycles = if owed {
+            let cycle = home.cycle(&server, &recording);
+            assert!(walked(&cycle), "{row}: {}", cycle.gate);
+            assert_eq!(walk_idle::armed_for_test(source), None, "{row}: owed");
+            vec![cycle]
+        } else {
+            settle(&mut home, &server, &recording)
+        };
         let mut walks = cycles.iter().filter(|cycle| walked(cycle)).count();
         let backstop = WALK_GAP / STEP;
         for step in 1..=backstop + 1 {
@@ -514,7 +524,14 @@ fn no_hint_arm(
                 arm(&home, &server, Moment::Gap);
             }
             let cycle = pass(&mut home, &server, &recording, STEP);
-            let walk = step == backstop || !gated;
+            let walk = if owed && (step < 2 || !gated) {
+                assert!(walked(&cycle), "{row}: an owed source walks");
+                true
+            } else if owed {
+                walked(&cycle)
+            } else {
+                step == backstop || !gated
+            };
             expect_pass(source, row, &cycle, walk);
             walks += usize::from(walk);
             cycles.push(cycle);
@@ -523,8 +540,9 @@ fn no_hint_arm(
     })
 }
 
-/// Each source, gated and gate off: the gap idles, and the money is the same.
-fn no_hint_arm_matches(prefix: &str, arm: &dyn Fn(&OracleHome, &OracleServer, Moment)) {
+/// Each source, gated and gate off: the gap idles (an owed source never arms),
+/// and the money is the same.
+fn no_hint_arm_matches(prefix: &str, owed: bool, arm: &dyn Fn(&OracleHome, &OracleServer, Moment)) {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -536,10 +554,10 @@ fn no_hint_arm_matches(prefix: &str, arm: &dyn Fn(&OracleHome, &OracleServer, Mo
         let row = |suffix: &str| -> &'static str {
             Box::leak(format!("{prefix}_{}{suffix}", source.api_slug()).into_boxed_str())
         };
-        let gated = no_hint_arm(source, row(""), true, arm);
-        let today = no_hint_arm(source, row("_today"), false, arm);
+        let gated = no_hint_arm(source, row(""), true, owed, arm);
+        let today = no_hint_arm(source, row("_today"), false, owed, arm);
         assert!(
-            gated.walks < today.walks,
+            gated.walks < today.walks || (owed && gated.walks == today.walks),
             "{prefix} {source:?}: the gap idled"
         );
         gated.assert_matches(&today, prefix);
@@ -550,7 +568,7 @@ fn no_hint_arm_matches(prefix: &str, arm: &dyn Fn(&OracleHome, &OracleServer, Mo
 #[serial]
 #[serial(source_cadences, source_manifests, client_report)]
 fn accepted_holder_deleted_without_a_hint_matches_back_to_back_walks() {
-    no_hint_arm_matches("w07", &|home, _, moment| {
+    no_hint_arm_matches("w07", false, &|home, _, moment| {
         if moment == Moment::Gap {
             std::fs::remove_file(transcript(home)).unwrap();
         }
@@ -561,7 +579,7 @@ fn accepted_holder_deleted_without_a_hint_matches_back_to_back_walks() {
 #[serial]
 #[serial(source_cadences, source_manifests, client_report)]
 fn unaccepted_holder_deleted_without_a_hint_matches_back_to_back_walks() {
-    no_hint_arm_matches("w08", &|home, server, moment| match moment {
+    no_hint_arm_matches("w08", true, &|home, server, moment| match moment {
         // The server keeps no stored body for the holder, so it is never
         // accepted.
         Moment::Install => *server.fallback.lock().unwrap() = Answer::Unstored,
@@ -574,7 +592,7 @@ fn unaccepted_holder_deleted_without_a_hint_matches_back_to_back_walks() {
 #[serial(source_cadences, source_manifests, client_report)]
 fn unread_input_vanishing_in_the_gap_matches_back_to_back_walks() {
     // It appears and vanishes between two passes: no run reads it.
-    no_hint_arm_matches("w09", &|home, _, moment| {
+    no_hint_arm_matches("w09", false, &|home, _, moment| {
         if moment == Moment::Gap {
             let unread = transcript(home).with_file_name("unread.jsonl");
             std::fs::write(&unread, b"{}\n").unwrap();
@@ -589,7 +607,7 @@ fn unread_input_vanishing_in_the_gap_matches_back_to_back_walks() {
 fn candidate_at_the_window_edge_across_the_gap_matches_back_to_back_walks() {
     // The oracle hint's window; the edge itself is inside it.
     const WINDOW: u64 = 183 * 24 * 60 * 60;
-    no_hint_arm_matches("w10", &|home, _, moment| {
+    no_hint_arm_matches("w10", false, &|home, _, moment| {
         if moment == Moment::Gap {
             let edge = std::time::UNIX_EPOCH + std::time::Duration::from_secs(home.now - WINDOW);
             let file = std::fs::File::options().write(true).open(transcript(home));
