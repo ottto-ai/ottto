@@ -52,7 +52,9 @@ pinned in `rust-toolchain.toml`; rustup uses it automatically in this checkout.
 
 Prerequisites, the two Cargo workspaces, the checks to run, and Linux notes are
 in [docs/development.md](docs/development.md). Run the smallest set of checks
-for what you changed; CI runs the full suite on your pull request.
+for what you changed; CI runs the Linux checks on ready pull requests and the
+macOS contracts in the merge queue. Full macOS packaging (the app, DMG and
+release archives) is maintainer-only.
 
 ## After You Open A Pull Request
 
@@ -63,6 +65,11 @@ and queues your pull request; if they fail there, we will tell you what broke
 or fix it with you.
 
 ## Pull Request Expectations
+
+Use an `ottto.net` or GitHub noreply email address for your commits. The public
+commit check fails if your commit identity uses another address.
+Use only approved or reserved example email addresses in commit messages,
+including `Signed-off-by:` and `Co-authored-by:` trailers.
 
 - **Keep it focused**: one topic per pull request. Separate mechanical
   refactoring from behavior changes.

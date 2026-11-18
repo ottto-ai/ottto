@@ -112,8 +112,7 @@ fn settle(
         &acks,
     );
     let path = home.join("scan-index.json");
-    settled.save(&path).unwrap();
-    ScanIndex::load(&path).unwrap()
+    e2_pipeline_scan_fixture::save_reload_for_test(&mut settled, &path)
 }
 
 fn support(name: &str) -> crate::test_scratch::ScratchDir {
@@ -986,7 +985,7 @@ fn no_list_policy_follows_the_prior_history_evidence() {
     let path = scratch.join("index.json");
     let mut moved = ScanIndex::default();
     moved.note_claude_history_cutoff(PriorHistory::Moved, false, true);
-    moved.save(&path).unwrap();
+    moved.save_fixture(&path).unwrap();
     let mut reloaded = ScanIndex::load(&path).unwrap();
     assert!(reloaded.claude_history_move_not_full, "persisted");
     assert!(
@@ -1003,7 +1002,7 @@ fn no_list_policy_follows_the_prior_history_evidence() {
         !lifted.claude_history_move_not_full,
         "a partial commit keeps it lifted"
     );
-    lifted.save(&path).unwrap();
+    lifted.save_fixture(&path).unwrap();
     let mut again = ScanIndex::load(&path).unwrap();
     again.note_claude_history_cutoff(PriorHistory::Here, false, false);
     assert_eq!(again.claude_no_list_policy, NoListPolicy::Pace);
@@ -1017,7 +1016,7 @@ fn no_list_policy_follows_the_prior_history_evidence() {
     moving.note_claude_history_cutoff(PriorHistory::Moved, true, false);
     assert_eq!(moving.claude_no_list_policy, NoListPolicy::Pace);
     let moving_path = scratch.join("moving.json");
-    moving.save(&moving_path).unwrap();
+    moving.save_fixture(&moving_path).unwrap();
     let mut reloaded = ScanIndex::load(&moving_path).unwrap();
     for entries_lost in [false, true] {
         reloaded.note_claude_history_cutoff(PriorHistory::Moved, false, entries_lost);

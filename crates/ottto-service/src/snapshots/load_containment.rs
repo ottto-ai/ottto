@@ -304,10 +304,10 @@ fn write_scan_index_override_stamp(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).context("create scan index override stamp directory")?;
     }
-    let temp_path = path.with_extension(format!("json.{}.tmp", std::process::id()));
     let stamp = serde_json::to_vec(&ScanIndexOverrideStamp {
         last_override_unix_seconds: unix_seconds_at(now),
     })?;
+    let temp_path = path.with_extension(format!("json.{}.tmp", std::process::id()));
     let result = (|| -> Result<()> {
         let mut file = File::create(&temp_path)?;
         std::io::Write::write_all(&mut file, &stamp)?;
@@ -601,15 +601,15 @@ fn quarantine_invalid_scan_index(
     // structural damage must not permanently block collection, but never
     // overwrite the unreadable witness in place.
     let quarantine_path = unique_checkpoint_sibling(path, "corrupt");
-    let persistence_recovery =
-        scan_index_integration::prepare_legacy_recovery(path, &quarantine_path)?;
+    let binding = scan_index_integration::scan_index_storage_binding(path)
+        .ok_or(state_v2::Hold::ForeignBinding)?;
+    scan_index_persistence::LockedStore::new(path, binding, lenient_decode::FIELDS)?
+        .require_legacy_rebuild()?;
     fs::rename(path, &quarantine_path).context("quarantine invalid local snapshot scan index")?;
     sync_checkpoint_parent(path)?;
     note_scan_index_quarantine_rebuild(cause, discarded_file_entries, source);
-    Ok(ScanIndex {
-        persistence_legacy_recovery: persistence_recovery,
-        ..ScanIndex::default()
-    })
+    state_v2::publish_rebuilt_locked(path, &ScanIndex::default())?;
+    Err(state_v2::Hold::ReloadRequired.into())
 }
 
 fn note_scan_index_quarantine_rebuild(
@@ -690,20 +690,12 @@ fn override_scan_index_rebuild_loop(
     // preserve this.
     let mut stamp_attempted = false;
     let mut replaced = false;
-    let temp_path = path.with_extension(format!("json.{}.tmp", std::process::id()));
     let quarantine_path = unique_checkpoint_sibling(path, SCAN_INDEX_OVERRIDE_WITNESS_KIND);
     let result = (|| -> Result<()> {
-        {
-            let mut file = File::create(&temp_path)
-                .with_context(|| format!("create scan index temp {}", temp_path.display()))?;
-            let mut writer = BufWriter::new(&mut file);
-            serde_json::to_writer_pretty(&mut writer, &rebuilt)
-                .context("write override-rebuilt scan index")?;
-            std::io::Write::flush(&mut writer).context("flush override-rebuilt scan index")?;
-            drop(writer);
-            file.sync_all()
-                .context("sync override-rebuilt scan index")?;
-        }
+        let binding = scan_index_integration::scan_index_storage_binding(path)
+            .ok_or(state_v2::Hold::ForeignBinding)?;
+        scan_index_persistence::LockedStore::new(path, binding, lenient_decode::FIELDS)?
+            .require_legacy_rebuild()?;
         // Every crash point leaves either the damaged index (still refused,
         // the press lost) or the carried rebuild in place.
         fs::hard_link(path, &quarantine_path)
@@ -714,13 +706,14 @@ fn override_scan_index_rebuild_loop(
         // never becomes a successful-override cooldown.
         stamp_attempted = true;
         write_scan_index_override_stamp(support_dir, source, now)?;
-        fs::rename(&temp_path, path).context("replace scan index with the override rebuild")?;
-        replaced = true;
-        sync_checkpoint_parent(path)
+        let result = state_v2::publish_rebuilt_locked(path, &rebuilt);
+        replaced = state_v2::fence_published(path);
+        result
     })();
     if result.is_err() && !replaced {
-        let _ = fs::remove_file(&temp_path);
-        let _ = fs::remove_file(&quarantine_path);
+        if !state_v2::published(path).unwrap_or(true) {
+            let _ = fs::remove_file(&quarantine_path);
+        }
         let rollback = (|| -> Result<()> {
             if stamp_attempted {
                 match prior_stamp {
@@ -760,7 +753,7 @@ fn override_scan_index_rebuild_loop(
     // Once replaced, this was an actual override (never a refused press), even
     // if the final directory sync reports an uncertain durability outcome.
     result?;
-    Ok(rebuilt)
+    Err(state_v2::Hold::ReloadRequired.into())
 }
 
 impl ScanIndex {

@@ -214,7 +214,7 @@ fn checkpoint(
     cause: Option<crate::snapshots::UnsettledUploadCause>,
 ) -> ScanIndex {
     let progress_path = snapshot_upload_progress_path(index_path);
-    progress.save(&progress_path).unwrap();
+    progress.save_fixture(&progress_path).unwrap();
     checkpoint_partial_snapshot_index_with_audit_release(
         &page.index,
         &page.committed,

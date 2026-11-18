@@ -13,9 +13,7 @@ fn cycle_outcome_closes_unfinished_pass_for_offpass_overlap() {
     let daemon = test_daemon("otm_test");
     let mut transport_cycle = crate::net_resilience::TransportCycleOutcome::default();
     let mut failed_sources = Vec::new();
-    let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
     let mut owner = SnapshotCycleOwner {
-        retry: &mut retry,
         account_witness: [0; 32],
         client: &client,
         device: &device,
@@ -314,8 +312,7 @@ fn read_complete_http_request(stream: &mut std::net::TcpStream) -> String {
     decoded_http_request(&request)
 }
 
-// Mock receivers inspect decoded JSON just as the backend does. Keep the
-// raw bounded_native_read fixture for tests asserting encoded wire bytes.
+// For server fixtures that inspect decoded JSON.
 fn decoded_http_request(request: &[u8]) -> String {
     let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
         return String::from_utf8_lossy(request).into_owned();
@@ -361,90 +358,4 @@ fn http_request_complete(request: &[u8]) -> bool {
     content_length
         .map(|length| request.len() >= body_start + length)
         .unwrap_or(true)
-}
-
-// Research only. The canonical page seam is executable; the clock/guards
-// below are an explicit candidate model, not daemon scheduling hooks.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct RetryAuthority {
-    destination: u64,
-    account: u64,
-    device: u64,
-    auth: u64,
-    policy: u64,
-    contract: u64,
-    body: u64,
-    file: u64,
-    parent: u64,
-    sidecar: u64,
-    key: u64,
-    index: u64,
-    progress: u64,
-    enabled: bool,
-}
-
-impl Default for RetryAuthority {
-    fn default() -> Self {
-        Self {
-            destination: 1,
-            account: 1,
-            device: 1,
-            auth: 1,
-            policy: 1,
-            contract: 1,
-            body: 1,
-            file: 1,
-            parent: 1,
-            sidecar: 1,
-            key: 1,
-            index: 1,
-            progress: 1,
-            enabled: true,
-        }
-    }
-}
-
-struct RetryBudget {
-    authority: RetryAuthority,
-    due: u64,
-    expires: u64,
-    turn_deadline: u64,
-    posts_left: usize,
-    stopped: bool,
-}
-
-impl RetryBudget {
-    fn after_shed(now: u64, minimum: u64, jitter: u64) -> Self {
-        Self {
-            authority: RetryAuthority::default(),
-            due: now + minimum + jitter,
-            expires: now + 300_000,
-            turn_deadline: 0,
-            posts_left: 3,
-            stopped: false,
-        }
-    }
-    fn enter(&mut self, now: u64, current: Option<&RetryAuthority>) -> bool {
-        if self.stopped
-            || current != Some(&self.authority)
-            || !self.authority.enabled
-            || now < self.due
-            || now >= self.expires
-            || self.posts_left == 0
-        {
-            return false;
-        }
-        self.turn_deadline = (now + 60_000).min(self.expires);
-        true
-    }
-    fn phase(&self, now: u64, current: Option<&RetryAuthority>) -> bool {
-        !self.stopped && current == Some(&self.authority) && now < self.turn_deadline
-    }
-    fn post(&mut self, now: u64, current: Option<&RetryAuthority>) -> bool {
-        if !self.phase(now, current) || self.posts_left == 0 {
-            return false;
-        }
-        self.posts_left -= 1;
-        true
-    }
 }

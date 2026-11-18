@@ -184,7 +184,8 @@ fn hint_json() -> Value {
         "backfill_window_days":30, "recommended_scan_after":AT,
         "snapshot_head_cas_enabled":true, "snapshot_head_cas_required":false,
         "claude_otel_only_sessions_contract":"claude_otel_only_sessions:v1",
-        "claude_otel_only_pairing_floor":"2026-08-02T06:00:00Z"
+        "claude_otel_only_pairing_floor":"2026-08-02T06:00:00Z",
+        "session_request_account_source_contract":"session_request_account_source:v1"
     })
 }
 fn hint() -> Hint {
@@ -230,6 +231,34 @@ fn notice(c: &Corpus) -> BTreeSet<String> {
 fn retained(c: &Corpus, p: &mut Progress, index: ScanIndex, limit: usize) -> Page {
     page_from(c, p, &hint(), WireBudget::default(), index, limit)
 }
+fn notice_progress_path(c: &Corpus, progress: &mut Progress) -> PathBuf {
+    if let Some(rows) = &progress.rows {
+        return snapshot_upload_progress_path(rows.index_path_for_test());
+    }
+    let index_path = c
+        .base
+        .join("snapshots/destinations")
+        .join(&progress.destination_namespace_hash)
+        .join("claude_code-scan-index-v3.json");
+    let index = if index_path.exists() {
+        ScanIndex::load(&index_path).unwrap()
+    } else {
+        crate::snapshots::e2_pipeline_scan_fixture::seed_index_for_test(
+            &ScanIndex::default(),
+            &index_path,
+        )
+    };
+    let path = snapshot_upload_progress_path(&index_path);
+    let placeholder = Progress::new(
+        progress.destination_namespace_hash.clone(),
+        snapshot_quarantine_witness(Claude),
+    );
+    let working = std::mem::replace(progress, placeholder);
+    *progress =
+        crate::snapshot_sync::tests::route_fixture_progress(&index, &index_path, &path, working);
+    path
+}
+
 fn page_from(
     c: &Corpus,
     progress: &mut Progress,
@@ -240,18 +269,27 @@ fn page_from(
 ) -> Page {
     let scanner = Scanner::capturing_identity();
     let mut page = c.raw(&scanner, index, limit, false, &[]);
+    let path = if crate::snapshot_sync::telemetry_only::advertised(hint).is_some() {
+        notice_progress_path(c, progress)
+    } else {
+        c.base.join("progress.json")
+    };
     let window = progress
-        .seed_telemetry(
-            &c.support,
-            hint,
-            &mut page.scan,
-            &page.index,
-            &c.base.join("progress.json"),
-        )
+        .seed_telemetry(&c.support, hint, &mut page.scan, &page.index, &path)
         .unwrap();
     for item in &mut page.scan.snapshots {
         item.collected_at = AT.into();
     }
+    // Native notice saves release resident hints, as the service finish then
+    // reloads the current page's identity rows before applying evidence.
+    progress
+        .load_identity(
+            page.scan
+                .snapshots
+                .iter()
+                .map(|item| item.source_session_id.as_str()),
+        )
+        .unwrap();
     let mut ledger = progress.telemetry_only.take();
     let (disposition, _, stats) = apply_claude_local_evidence_to_scan_with_ledger_and_budget(
         &c.support,
@@ -336,7 +374,20 @@ fn telemetry_only_cold_ram_restore_and_restart_preserve_switch_gap_and_side_call
                 .remove("head_cas_contract"),
             Some(json!("snapshot_head_etag:v1"))
         );
-        assert_eq!(old_wire, released, "only the batch declaration changes");
+        // Keep the released daemon sample frozen. Compare every other field.
+        let mut released_without_v1 = released.clone();
+        let envelope = released_without_v1["snapshots"][0]["semantic_envelope"]
+            .as_object_mut()
+            .unwrap();
+        assert_eq!(
+            envelope.remove("revision_contract_version"),
+            Some(json!("snapshot_revision:v1"))
+        );
+        assert!(envelope.remove("revision_hash").unwrap().is_string());
+        assert_eq!(
+            old_wire, released_without_v1,
+            "only the batch declaration and v1 revision fields change"
+        );
         println!(
             "OTEL_ONLY_RECEIVER_GOLDEN {}",
             serde_json::to_string(&request(&cold_page.scan.snapshots)).unwrap()
@@ -528,15 +579,10 @@ fn growth() {
                 &send(&build(&c, &mut retry), &mut retry, Mode::Restart),
             );
         }
-        let path = c.base.join("committed.json");
+        let path = notice_progress_path(&c, &mut p);
         p.save(&path).unwrap();
-        p = Progress::load(
-            &path,
-            &p.destination_namespace_hash,
-            snapshot_quarantine_witness(Claude),
-        )
-        .unwrap();
-        p.accepted_identity_buckets.bind_test_key(Some([0x42; 32]));
+        let index_path = p.rows.as_ref().unwrap().index_path_for_test().to_owned();
+        p = routed_progress(&ScanIndex::load(&index_path).unwrap(), &index_path);
         quiet(&c, &mut p, ScanIndex::default());
         assert!(notice(&c).is_empty());
         grow(&c, &mut p, &cold, first);

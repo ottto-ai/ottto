@@ -713,8 +713,6 @@ pub(in crate::snapshots) fn reconcile_missing_index_entries_with_side(
                 .files
                 .get(key)
                 .is_some_and(ScanIndexEntry::codex_history_is_protected)
-                || (source == SnapshotSource::Codex
-                    && !sources::codex::counting::version::tombstone_before_retire(index, key))
             {
                 index
                     .files
@@ -733,7 +731,6 @@ pub(in crate::snapshots) fn reconcile_missing_index_entries_with_side(
                 .files
                 .get(key)
                 .is_some_and(ScanIndexEntry::retain_history_evidence)
-            && sources::codex::counting::version::tombstone_before_retire(index, key)
         {
             index.drop_file_entry(key);
             index.file_snapshot_fingerprints.remove(key);

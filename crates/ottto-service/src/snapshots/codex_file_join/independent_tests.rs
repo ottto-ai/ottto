@@ -11,22 +11,33 @@ fn independent_fixture(tag: &str, members: &[u64]) -> (PathBuf, Vec<u64>) {
             meta(OWNER, &format!("2026-10-01T09:0{i}:00Z"), extra),
             turn(&format!("t-{i}")),
         ];
+        rows.insert(
+            1,
+            json!({"timestamp":"2026-10-01T10:00:00Z", "type":"event_msg",
+            "payload":{"type":"task_started", "turn_id":format!("t-{i}")}}),
+        );
         for n in 1..=*requests {
             // The revert counter starts at an earlier base, while the original
             // has billed turns beyond it. Last usage is each file's own money.
             let base = if i == 0 { 0 } else { 37 };
-            rows.push(native(
+            let mut record = native(
                 OWNER,
                 &format!("r-{i}-{n}"),
                 100 + i as u64,
                 base + n * (100 + i as u64),
-            ));
+            );
+            record["payload"]["turn_id"] = json!(format!("t-{i}"));
+            rows.push(record);
             rows.push(ui(
                 100 + i as u64,
                 base + n * (100 + i as u64),
                 "2026-10-01T10:00:00Z",
             ));
         }
+        rows.push(
+            json!({"timestamp":"2026-10-01T10:02:00Z","type":"event_msg",
+            "payload":{"type":"task_complete","turn_id":format!("t-{i}")}}),
+        );
         let bytes = rows
             .iter()
             .map(|row| row.to_string() + "\n")
@@ -123,7 +134,6 @@ fn compressed_revert_sums_are_order_independent_and_read_each_member_once() {
                 live_scope: &no_scope,
                 cache: Some(&cache),
                 collected_at: "2026-10-06T23:00:00Z",
-                index: &index,
             };
             let ((), bytes) = observe_consumed(|| {
                 for _ in 0..100_000 {
@@ -197,7 +207,6 @@ fn independent_restart_between_members_discards_unfinished_proof() {
         live_scope: &no_scope,
         cache: Some(&cache),
         collected_at: "2026-10-06T23:00:00Z",
-        index: &index,
     };
     while job.group.as_ref().unwrap().current == 0 {
         assert!(matches!(
@@ -224,7 +233,6 @@ fn independent_restart_between_members_discards_unfinished_proof() {
         live_scope: &no_scope,
         cache: Some(&cache),
         collected_at: "2026-10-06T23:00:00Z",
-        index: &index,
     };
     let (_, bytes) = observe_consumed(|| loop {
         match step_group(&mut job, &inputs) {
@@ -265,7 +273,8 @@ fn independent_overlap_and_conflict_hold_without_singleton() {
         if conflicting {
             second.push(meta(OTHER, "2026-10-01T10:01:00Z", json!({})));
         } else {
-            second[3] = original[3].clone();
+            second[1..4].clone_from_slice(&original[1..4]);
+            *second.last_mut().unwrap() = original.last().unwrap().clone();
         }
         let bytes = second
             .iter()
@@ -354,7 +363,6 @@ fn independent_members_keep_tools_distinct_activity_and_artifacts() {
         live_scope: &no_scope,
         cache: Some(&cache),
         collected_at: "2026-10-06T23:00:00Z",
-        index: &index,
     };
     let mut seeded = [false; 2];
     loop {
@@ -515,7 +523,9 @@ fn independent_last_member_refusal_is_not_reread_each_generation() {
         fs::write(p, zstd::stream::encode_all(bytes.as_bytes(), 1).unwrap()).unwrap();
     };
     let mut last = rows(&paths[1]);
-    last[3] = rows(&paths[0])[3].clone();
+    let original = rows(&paths[0]);
+    last[1..4].clone_from_slice(&original[1..4]);
+    *last.last_mut().unwrap() = original.last().unwrap().clone();
     write(&paths[1], &last);
     let held = |scan: &SourceScanResult| {
         assert!(scan.snapshots.is_empty(), "no singleton, no fold");
@@ -739,7 +749,6 @@ fn independent_fold_keeps_the_original_certified_evidence() {
         live_scope: &no_scope,
         cache: Some(&cache),
         collected_at: "2026-10-06T23:00:00Z",
-        index: &index,
     };
     loop {
         match step_group(&mut job, &inputs) {

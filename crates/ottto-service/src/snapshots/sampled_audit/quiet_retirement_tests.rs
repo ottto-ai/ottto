@@ -747,6 +747,9 @@ fn cap_delayed_growth_survives_age_and_replacement_traversal() {
             &loaded.confirmed_empty_files,
             &fixture.file.0
         ));
+        // Clones share one native route; the cold arm restarts from its own.
+        let cold_input =
+            crate::snapshots::e2_pipeline_scan_fixture::own_install_for_test(&loaded, &fixture.dir);
         let modified =
             unix_seconds(fs::metadata(&fixture.file.0).unwrap().modified().unwrap()).unwrap();
         let future = modified + (BACKFILL_WINDOW_DAYS + 2) * 86_400;
@@ -809,9 +812,11 @@ fn cap_delayed_growth_survives_age_and_replacement_traversal() {
         for (marked, version) in &markers {
             assert_eq!(&serviced.files[marked].scan_identity_version, version);
         }
-        let (_, cold, _, _, _) = finish_production_scan_page(make_scan(loaded), source);
+        let (_, cold, _, _, _) = finish_production_scan_page(make_scan(cold_input), source);
         assert!(!cold.snapshots.is_empty());
         assert_eq!(production_body(source, raw), production_body(source, cold));
+        // `serviced` continues on that copy: commit it and save a fresh one.
+        let index_path = fixture.dir.join("cap-delay-serviced-index.json");
         crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut serviced, &index_path);
         let loaded = ScanIndex::load(&index_path).unwrap();
         assert_eq!(loaded.files[&key].size_bytes, actual_size);
@@ -1374,6 +1379,8 @@ fn post_scan_account_release_keeps_unfunded_debt_selectable_across_restart() {
                 .count(),
             usize::from(marked == crate::transcript_cache::CACHE_ENTRIES)
         );
+        // The restart may continue on that copy: save a fresh one.
+        let path = fixture.dir.join("serviced-index.json");
         crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut serviced, &path);
         let loaded = ScanIndex::load(&path).unwrap();
         assert!(!loaded.files[&key].has_unverified_source());
@@ -1543,7 +1550,7 @@ fn staged_quiet_retirement_commits_only_with_its_second_save() {
     assert!(index.files[&key].has_unverified_source());
     let body = index.files[&key].source_file_fingerprint.clone();
     crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut index, &index_path);
-    // The reconcile saves to `index_path`: it runs on the plain index saved
+    // The reconcile saves to `index_path`: it runs on the copy published
     // there, off the route the scans continued on.
     let mut index = ScanIndex::load(&index_path).unwrap();
     // Unproven: nothing retires, and nothing stays staged.
@@ -1803,76 +1810,6 @@ fn protected_codex_absence_retires_only_the_audit_obligation() {
             .count(),
         1
     );
-}
-
-#[test]
-fn audit_absence_preserves_legacy_counting_evidence_or_retains_its_entry() {
-    use sources::codex::counting::version::{AckEvidence, CountingTombstone};
-    let _cutover = sources::codex::counting::version::TestCutover::set(1_790_000_000_000);
-    for full_tombstones in [false, true] {
-        let fixture = ScanFixture::new(SnapshotSource::Codex);
-        let key = local_index_key(&fixture.file.0);
-        let id = "019fa111-2222-7333-8444-555555555555";
-        let owner = codex_protected_owner(id);
-        let entry: ScanIndexEntry = serde_json::from_value(json!({
-            "size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":"fp",
-            "last_snapshot_fingerprint":"legacy-acked", "codex_counting_owner": owner,
-            "scan_identity_version": sampled_audit::marker(1)
-        }))
-        .unwrap();
-        assert!(!entry.codex_history_is_protected());
-        let mut index = ScanIndex::default();
-        index.files.insert(key.clone(), entry);
-        ensure_bounded_traversal(
-            SnapshotSource::Codex,
-            std::slice::from_ref(&fixture.root),
-            &mut index,
-            NOW,
-            BACKFILL_WINDOW_DAYS,
-        );
-        let traversal = index.traversal.as_mut().unwrap();
-        traversal.observed_index_keys.clear();
-        traversal.reconciliation_upper_bound = Some(key.clone());
-        let generation = traversal.census_window_end.clone();
-        if full_tombstones {
-            index.codex_counting_tombstones = (0
-                ..sources::codex::counting::version::MAX_COUNTING_TOMBSTONES)
-                .map(|n| {
-                    (
-                        format!("{n:064x}"),
-                        CountingTombstone {
-                            evidence: AckEvidence::LegacyAcked,
-                            retired_in: generation.clone(),
-                            created_unix_ms: None,
-                        },
-                    )
-                })
-                .collect();
-        }
-        fs::remove_file(&fixture.file.0).unwrap();
-        assert!(reconcile_missing_index_entries_with_side(
-            &mut index,
-            10,
-            SnapshotSource::Codex
-        ));
-        if full_tombstones {
-            assert_eq!(
-                index.files[&key].last_snapshot_fingerprint.as_deref(),
-                Some("legacy-acked")
-            );
-            assert!(
-                !index.files[&key].has_unverified_source(),
-                "only the fulfilled audit ends"
-            );
-            assert!(!index.codex_counting_tombstones.contains_key(&owner));
-        } else {
-            assert!(!index.files.contains_key(&key));
-            assert_eq!(
-                index.codex_counting_tombstones[&owner].evidence,
-                AckEvidence::LegacyAcked
-            );
-        }
-    }
 }
 
 /// [behaviour] Hold-only removal requires stable rooted absence twice.
@@ -2138,6 +2075,8 @@ fn pi_recordless_due_audit_reads_once_without_counting_a_content_change() {
         assert_eq!(events["audits_started"], 1);
         assert_eq!(events["audits_completed"], 1);
         assert!(!index.files[&key].has_unverified_source());
+        // `index` continues on the first copy: commit it and save a fresh one.
+        let state = fixture.dir.join("pi-recordless-retired-index.json");
         crate::snapshots::e2_pipeline_scan_fixture::save_for_test(&mut index, &state);
         // Retirement survives from the saved index, and the later real
         // change must exercise the transitional Full.

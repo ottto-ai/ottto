@@ -334,10 +334,12 @@ fn copy_prefix_routes(arm: Settled) {
                 "{arm:?} page {request}: the {owner} prior owes the holder again"
             );
         }
-        // The committed prior as an older release's store holds it, loaded
-        // by this build.
-        let upgraded =
-            upgrade_from_legacy_store(&priors[2], &c.base.join("legacy-scan-index.json"));
+        // The committed prior as an older release's store holds it, imported
+        // by this build; each page's store is its own scratch path.
+        let upgraded = upgrade_from_legacy_store(
+            &priors[2],
+            &c.base.join(format!("legacy-scan-index-{request}.json")),
+        );
         let restart = disk.owner(SnapshotSource::ClaudeCode);
         let mut pages = claude_pages(&c, &scanner, &restart, priors, (0, 1, 0));
         finish_claude_pages(&c, &mut pages);
@@ -906,7 +908,9 @@ fn local_copy_refusal_deletion_and_progress_first_restart() {
                 // A later revision may be refused even after this body earned
                 // its durable file receipt. Neither refusal nor deletion erases it.
                 refuse_original(&page.scan.snapshots, &mut progress);
-                progress.save(&c.base.join("progress.json")).unwrap();
+                progress
+                    .save_fixture(&c.base.join("progress.json"))
+                    .unwrap();
                 assert_eq!(shared(&ledger), (if accepted_before { 2 } else { 0 }, 0));
                 let holds = LocalHoldSettlement::classify(
                     SnapshotSource::ClaudeCode,
@@ -1100,7 +1104,9 @@ fn failed_same_page_holder_drops_provisional_groups_before_deletion() {
         .0
         .is_err());
         progress.hold_outage_bodies(&page.scan.snapshots, u64::MAX);
-        progress.save(&c.base.join("progress.json")).unwrap();
+        progress
+            .save_fixture(&c.base.join("progress.json"))
+            .unwrap();
         let mut selected = page.index.committable_subset_for_upload(
             &page.committed,
             &progress.accepted_fingerprints,
@@ -1282,7 +1288,7 @@ fn refused_holder_mark_survives_progress_only_crash() {
             "2026-08-02T07:03:00Z",
         );
         let index_path = c.base.join("scan-index.json");
-        ScanIndex::default().save(&index_path).unwrap();
+        ScanIndex::default().save_fixture(&index_path).unwrap();
         let mut ledger = Ledger::new();
         let progress_path = c.base.join("progress.json");
         {
@@ -1313,7 +1319,7 @@ fn refused_holder_mark_survives_progress_only_crash() {
             .0
             .unwrap();
             refuse_original(&page.scan.snapshots, &mut progress);
-            progress.save(&progress_path).unwrap();
+            progress.save_fixture(&progress_path).unwrap();
             // Crash here: page, committed baseline, scanner and progress drop.
             // No index save or settlement occurs after the progress publication.
         }

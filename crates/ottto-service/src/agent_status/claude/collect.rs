@@ -456,81 +456,6 @@ pub(in crate::agent_status) fn claude_approved_api_key_suffixes(path: &Path) -> 
         .unwrap_or_default()
 }
 
-/// One read of a login's evaluator inputs, as
-/// [`claude_alternative_auth_for_slot`] reads them: settings layers (highest
-/// precedence first), approved API-key suffixes and stored Console key. Only
-/// the billing route producer uses it, to evaluate both modes from one read.
-pub(in crate::agent_status) struct ClaudeLoginInputs {
-    pub(in crate::agent_status) layers: Vec<Value>,
-    pub(in crate::agent_status) approved_api_key_suffixes: Vec<String>,
-    pub(in crate::agent_status) stored_console_key: bool,
-}
-
-impl ClaudeLoginInputs {
-    pub(in crate::agent_status) fn read(slot: &ClaudeConfigDirSlot, oauth_usable: bool) -> Self {
-        Self {
-            layers: claude_settings_layers(&claude_settings_paths_for_slot(slot)),
-            approved_api_key_suffixes: claude_approved_api_key_suffixes(
-                &slot.identity_path(&home_dir()),
-            ),
-            stored_console_key: !oauth_usable && claude_stored_console_key_present(slot),
-        }
-    }
-
-    /// [`claude_alternative_auth`] over these inputs.
-    pub(in crate::agent_status) fn alternative(
-        &self,
-        ambient: &dyn Fn(&str) -> Option<String>,
-        oauth_usable: bool,
-        print_mode: bool,
-    ) -> Option<ClaudeAlternativeAuth> {
-        claude_alternative_auth_layers(
-            &self.layers,
-            ambient,
-            // The approval rule applies only while an OAuth login is usable.
-            oauth_usable && !print_mode,
-            &self.approved_api_key_suffixes,
-            self.stored_console_key,
-        )
-    }
-}
-
-/// The billing route evaluator result over already-read layers (highest
-/// precedence first) and both mode evaluations. The daemon never knows a
-/// session's invocation mode, so a disagreement is `ModeUnknown`. Only what
-/// the daemon can see is read: a session's own shell environment and project
-/// settings stay invisible, so this never names a route alone.
-pub(crate) fn claude_login_route_candidate(
-    layers: &[Value],
-    ambient: &dyn Fn(&str) -> Option<String>,
-    oauth_usable: bool,
-    interactive: Option<ClaudeAlternativeAuth>,
-    print: Option<ClaudeAlternativeAuth>,
-) -> crate::snapshots::billing_route::LoginCandidate {
-    use crate::snapshots::billing_route::LoginCandidate as C;
-    let base_url_rewritten = claude_visible_env(layers, ambient, "ANTHROPIC_BASE_URL")
-        .map(|url| url.trim().trim_end_matches('/').to_ascii_lowercase())
-        .is_some_and(|url| !url.is_empty() && url != "https://api.anthropic.com");
-    match interactive {
-        Some(ClaudeAlternativeAuth::Bedrock | ClaudeAlternativeAuth::Vertex) => {
-            C::ThirdPartyPending
-        }
-        _ if claude_env_truthy(claude_visible_env(
-            layers,
-            ambient,
-            "CLAUDE_CODE_USE_FOUNDRY",
-        )) =>
-        {
-            C::Unsupported
-        }
-        _ if interactive != print => C::ModeUnknown,
-        _ if base_url_rewritten => C::ProxyEndpoint,
-        Some(ClaudeAlternativeAuth::ApiKey) => C::ApiKey,
-        None if oauth_usable => C::Oauth,
-        None => C::NoUsableLogin,
-    }
-}
-
 pub(in crate::agent_status) fn claude_default_alternative_auth_now(
     oauth_usable: bool,
 ) -> Option<ClaudeAlternativeAuth> {
@@ -824,9 +749,6 @@ pub(in crate::agent_status) fn collect_claude_status(
     // the stored credential, `.claude.json` (after). `claude auth status`
     // printed exactly these fields but could refresh, and so sign out, the
     // default login on every pass.
-    // Billing route only, producer on: the evaluation below reflects inputs
-    // read from this instant on. Off, no clock is read.
-    let route_read_started = crate::snapshots::billing_route::login_read_started();
     let local = read_claude_slot_locally(&ClaudeConfigDirSlot::Default);
     let mut login_state = local.state;
     let default_live = local.live_login();
@@ -889,28 +811,7 @@ pub(in crate::agent_status) fn collect_claude_status(
         login_state,
         ClaudeLocalLoginState::AccessValid | ClaudeLocalLoginState::RefreshPending
     );
-    let alternative = if let Some(read_started) = route_read_started {
-        // One read of the inputs serves the status (interactive, as off) and
-        // the billing route annotation, which also needs `-p` mode. No status
-        // field, account or money input reads the annotation.
-        let ambient = |key: &str| std::env::var(key).ok();
-        let inputs = ClaudeLoginInputs::read(&ClaudeConfigDirSlot::Default, oauth_usable);
-        let interactive = inputs.alternative(&ambient, oauth_usable, false);
-        let print = inputs.alternative(&ambient, oauth_usable, true);
-        crate::snapshots::billing_route::publish_claude_login(
-            claude_login_route_candidate(
-                &inputs.layers,
-                &ambient,
-                oauth_usable,
-                interactive,
-                print,
-            ),
-            read_started,
-        );
-        interactive
-    } else {
-        claude_default_alternative_auth_now(oauth_usable)
-    };
+    let alternative = claude_default_alternative_auth_now(oauth_usable);
     match login_state {
         ClaudeLocalLoginState::AccessValid | ClaudeLocalLoginState::RefreshPending => {
             snapshot.collection_method = AgentStatusCollectionMethod::CliJson;

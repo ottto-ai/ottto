@@ -32,9 +32,7 @@ fn money_census_round_trip(census: &ClaudeRequestCensus) -> ClaudeRequestCensus 
     *index.claude_request_census_mut_for_test() = census.clone();
     let scratch = crate::test_scratch::ScratchDir::new("money-census-round-trip");
     let path = scratch.join("index.json");
-    index.save(&path).expect("save index");
-    ScanIndex::load(&path)
-        .expect("load index")
+    e2_pipeline_scan_fixture::save_reload_for_test(&mut index, &path)
         .claude_request_census_for_test()
         .clone()
 }

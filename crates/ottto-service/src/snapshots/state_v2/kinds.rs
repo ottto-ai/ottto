@@ -218,6 +218,7 @@ pub(super) fn hydrate_txn(
             // Legacy archive member keys retain first-seen evidence. Their
             // values stay inert; no policy state or baseline digest is loaded.
             if catalogue::retired(kind.name())
+                && !kinds_misc::empty_counting_root(tx, header)?
                 && !(legacy_archive_members
                     && matches!(
                         kind.name(),
@@ -337,7 +338,6 @@ pub(super) fn save_graph(
             // CAS-restored custody joins the same map move before encoding.
             next.rekey_account_custody(&carry.from, to, Some(&carry.scan_root));
         }
-        super::super::lenient_decode::check_held_output(next)?;
         let mut tx = store.begin(TxnMode::Write)?;
         let mut digests = delta(previous, next, &mut tx, &mut pending)?;
         let outcome = tx.commit(generation, next.generation);

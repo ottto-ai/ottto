@@ -646,7 +646,7 @@ mod tests {
     }
     #[test]
     fn sampled_audit_missing_source_and_existing_cas_cannot_erase_obligation() {
-        let root = std::env::temp_dir().join(format!(
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "ottto-audit-index-{}-{}",
             std::process::id(),
             SystemTime::now()
@@ -667,7 +667,7 @@ mod tests {
         );
         index.remove_file_entry(&key);
         assert!(index.files.contains_key(&key));
-        index.save(&path).unwrap();
+        index.save_fixture(&path).unwrap();
         let mut older = ScanIndex::load(&path).unwrap();
         let mut current = ScanIndex::load(&path).unwrap();
         assert!(current.files[&key].has_unverified_source());
@@ -690,6 +690,7 @@ mod tests {
             150
         );
         fs::remove_dir_all(root).unwrap();
+        crate::snapshots::state_v2::close_removed_routes_for_test();
     }
 }
 

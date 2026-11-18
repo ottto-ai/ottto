@@ -249,7 +249,7 @@ fn codex_exec_creator_slot_reaches_active_sessions_with_workspace() {
     }
 }
 
-/// [regress] Forward only (D185): a session already uploaded as Unknown stays
+/// [regress] Forward only: a session already uploaded as Unknown stays
 /// Unknown on every later revision, counted, and mints no owner.
 #[test]
 fn codex_session_uploaded_unknown_stays_unknown_as_it_grows() {
@@ -281,7 +281,7 @@ fn codex_compressed_rollout_without_emission_history_stays_unknown() {
     assert_eq!(named, (None, None, counted(Some(PREVIOUSLY_UPLOADED))));
 }
 
-/// D185: a session found in slot A's home whose creator pair matches slot B
+/// A session found in slot A's home whose creator pair matches slot B
 /// is named B, never A.
 #[test]
 fn codex_creator_pair_names_its_slot_never_the_home_it_was_found_in() {
@@ -400,53 +400,4 @@ fn codex_creator_slot_refusals_name_nothing_and_count_their_cause() {
         let counts_and_name = (named.as_deref(), counts);
         assert_eq!(counts_and_name, (expected, counted(cause)), "{label}");
     }
-}
-
-/// [regress] Upgrade: pre-join Codex groups an older release uploaded as
-/// Unknown are not named by their creator slot, so the legacy check
-/// reproduces their untagged output and the groups are not held.
-#[test]
-fn codex_legacy_join_groups_uploaded_unknown_stay_unknown_on_upgrade() {
-    let (root, inventory) = codex_file_join::tests::fixture();
-    let previous = codex_file_join::tests::legacy_index(&inventory);
-    let (mut index, mut result) = codex_file_join::tests::scan(&root, previous.clone(), 2);
-    assert_eq!(result.codex_legacy_join_baselines.len(), 2);
-    for baseline in &mut result.codex_legacy_join_baselines {
-        for snapshot in &mut baseline.snapshots {
-            assert!(!snapshot.model_usage.is_empty());
-            snapshot.session_account_evidence = Some(creator(Some("slot-b"), None));
-            for row in snapshot.model_usage.iter_mut().chain(
-                snapshot
-                    .usage_buckets
-                    .iter_mut()
-                    .flat_map(|bucket| bucket.model_usage.iter_mut()),
-            ) {
-                row.auth_mode = None;
-                row.account_identifier_hash = None;
-            }
-        }
-        let fingerprints = baseline
-            .snapshots
-            .iter()
-            .map(|snapshot| snapshot_fingerprint(SnapshotSource::Codex, snapshot));
-        baseline.expected = snapshot_file_entity_set_hex(fingerprints.collect::<BTreeSet<_>>());
-    }
-    let slots = [slot("slot-b", NAMED)];
-    let mut counts = [0; 9];
-    result.reconcile_codex_legacy_joining(&mut index, &previous, "machine", |index, snapshots| {
-        let creator = (&slots[..], &mut counts);
-        let mixed = Default::default();
-        index.bind_session_accounts_with_mixed(
-            SnapshotSource::Codex,
-            "machine",
-            snapshots,
-            &[],
-            creator,
-            &mixed,
-        );
-    });
-    assert!(result.census_complete, "untagged legacy output reproduces");
-    assert_eq!(counts[NAMED], 0);
-    assert!(counts[PREVIOUSLY_UPLOADED] > 0);
-    std::fs::remove_dir_all(root).unwrap();
 }

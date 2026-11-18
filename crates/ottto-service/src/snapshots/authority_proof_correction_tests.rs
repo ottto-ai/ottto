@@ -161,7 +161,7 @@ fn apc_owed(index: &ScanIndex) -> Option<BTreeSet<String>> {
 }
 
 fn apc_save_reload(index: &mut ScanIndex, path: &Path) -> ScanIndex {
-    index.save(path).expect("save correction state");
+    index.save_fixture(path).expect("save correction state");
     let loaded = ScanIndex::load(path).expect("reload correction state");
     assert_eq!(
         serde_json::to_vec(&loaded).unwrap(),
@@ -289,9 +289,10 @@ fn invalid_correction_states_drop_only_the_affected_authority_record() {
     let scratch = crate::test_scratch::ScratchDir::new("proof-correction-load");
     let mut index = apc_terminal_fixture();
     apc_prove(&mut index, &apc_witness('f'));
-    index.save(&scratch.join("valid-source.json")).unwrap();
-    let valid: Value =
-        serde_json::from_slice(&fs::read(scratch.join("valid-source.json")).unwrap()).unwrap();
+    index
+        .save_fixture(&scratch.join("valid-source.json"))
+        .unwrap();
+    let valid = serde_json::to_value(&index).unwrap();
     let (loaded, quarantined) = apc_load_value(&scratch, "valid", &valid);
     assert!(!quarantined);
     assert_eq!(serde_json::to_value(&loaded).unwrap(), valid);
@@ -435,7 +436,7 @@ fn new_reader_keeps_old_contract_records_byte_identical() {
 /// the new reader rejects v1 with the field). This characterizes the pinned
 /// source; it is not an execution of an older binary.
 #[test]
-fn pre_change_decoder_rejects_the_declared_v2_contract_and_rebuilds() {
+fn pre_change_decoder_rejects_v2_but_native_import_keeps_its_correction() {
     let mut index = apc_terminal_fixture();
     apc_prove(&mut index, &apc_witness('f'));
     let saved = serde_json::to_value(&index).unwrap();
@@ -464,28 +465,17 @@ fn pre_change_decoder_rejects_the_declared_v2_contract_and_rebuilds() {
     .unwrap();
     assert!(dropped.get("proof_correction").is_none());
 
-    // The old loader's invalid branch used this shared quarantine helper.
+    // The frozen old predicate above rejects v2. Current import preserves
+    // the declared correction instead of invoking a historical JSON rebuild.
     let scratch = crate::test_scratch::ScratchDir::new("proof-correction-old-reader");
     let path = scratch.join("index.json");
-    index.save(&path).unwrap();
+    e2_pipeline_scan_fixture::legacy_input_for_test(&path, &serde_json::to_vec(&index).unwrap());
     let encoded_index_bytes = fs::metadata(&path).unwrap().len();
-    let files = index.files.len();
-    let accepted_entities = index.accepted_snapshot_fingerprints.len();
-    let rebuilt =
-        quarantine_invalid_scan_index(&path, "decode", None, None, None, SystemTime::now())
-            .unwrap();
-    assert!(!path.exists());
-    assert!(rebuilt.files.is_empty());
-    for slot in 0..2 {
-        assert_eq!(
-            apc_decision(&rebuilt, &apc_candidate(&index, slot)),
-            (
-                CandidateDecision::Parse,
-                Some(CandidateParseReason::NewFile)
-            ),
-            "the rebuild reparses every discovered file"
-        );
-    }
+    let imported = ScanIndex::load(&path).unwrap();
+    assert_eq!(imported.generation, index.generation + 1);
+    let mut imported_expected = saved;
+    imported_expected["generation"] = json!(imported.generation);
+    assert_eq!(serde_json::to_value(&imported).unwrap(), imported_expected);
     apc_emit(json!({
         "receipt": "claude_authority_correction_old_reader:v1",
         "decoder": "source_pinned_0_1_173_896b98f6_record_and_predicate",
@@ -495,8 +485,8 @@ fn pre_change_decoder_rejects_the_declared_v2_contract_and_rebuilds() {
         "synthetic_encoded_index_bytes": encoded_index_bytes,
         "v2_record_serde_decode_ok": true,
         "v2_record_old_predicate_accepts": accepted,
-        "rebuild_reparsed_file_count": files,
-        "rebuild_lost_accepted_entity_count": accepted_entities,
+        "native_preserved_file_count": imported.files.len(),
+        "native_preserved_accepted_entity_count": imported.accepted_snapshot_fingerprints.len(),
     }));
 }
 
@@ -1771,7 +1761,7 @@ fn save_drops_existing_orphan_authority_record_and_succeeds() {
     let (drops, rearmed) = claude_authority_drops_for_test();
     let diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::begin(true);
     index
-        .save(&path)
+        .save_fixture(&path)
         .expect("an orphan record never fails the save");
     assert_eq!(
         diagnostics
@@ -1785,12 +1775,7 @@ fn save_drops_existing_orphan_authority_record_and_succeeds() {
         (drops + 1, rearmed + apc_keys().len())
     );
     assert_eq!(serde_json::to_value(&index).unwrap(), expected);
-    let (loaded, quarantined) = apc_load_value(
-        &scratch,
-        "saved",
-        &serde_json::from_slice(&fs::read(&path).unwrap()).unwrap(),
-    );
-    assert!(!quarantined, "load accepts the saved result");
+    let loaded = ScanIndex::load(&path).expect("load accepts the native saved result");
     assert_eq!(
         claude_authority_drops_for_test(),
         (drops + 1, rearmed + apc_keys().len()),

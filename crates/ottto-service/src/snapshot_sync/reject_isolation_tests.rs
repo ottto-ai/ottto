@@ -230,7 +230,6 @@ pub(in crate::snapshot_sync) fn assert_mixed_retryable_holds() {
             );
             let identity_503 = usize::from(identity && identity_status == 503);
             let scratch = crate::test_scratch::ScratchDir::new("indexed-validation-progress");
-            let progress_path = scratch.join("progress.json");
             let mut items = page.scan.snapshots.clone();
             for item in &mut items {
                 item.snapshot_fingerprint = crate::snapshots::snapshot_fingerprint(source, item);
@@ -254,6 +253,17 @@ pub(in crate::snapshot_sync) fn assert_mixed_retryable_holds() {
             progress
                 .accepted_identity_buckets
                 .bind_test_key(Some([0x42; 32]));
+            // The row's progress lives on its own install's native route.
+            let mut owner = ScanIndex::default();
+            let index_path = crate::snapshots::e2_pipeline_scan_fixture::bind_fixture_route(
+                source,
+                &mut owner,
+                &scratch,
+                &progress.destination_namespace_hash,
+            );
+            owner.save_fixture(&index_path).unwrap();
+            let (progress_path, mut progress) =
+                crate::snapshot_sync::tests::routed_progress(&owner, &index_path, progress);
             let mut backend = BTreeMap::<String, SnapshotItem>::new();
             let mut fresh = poison.clone();
             fresh.source_session_id = "synthetic-fresh".into();
@@ -434,6 +444,10 @@ pub(in crate::snapshot_sync) fn assert_mixed_retryable_holds() {
             assert_ne!(old.snapshot_fingerprint, fp);
             let (_, accepted, _) = send(&[old], &mut progress, &mut backend, false);
             assert_eq!(accepted, 1, "one ACK for the distinct prior revision");
+            // Stored identity rows are read before a placement comparison.
+            progress
+                .load_identity(backend.keys().map(String::as_str))
+                .unwrap();
             let prior = route(Mode::Ram, vec![], &backend, &progress);
             let sent_at = current_unix_seconds();
             let ((result, accepted, emitted), records) =
@@ -539,15 +553,18 @@ pub(in crate::snapshot_sync) fn assert_mixed_retryable_holds() {
             )
             .unwrap();
             let cold = route(Mode::ColdFull, items.clone(), &cold_backend, &cold_progress);
+            progress
+                .load_identity(backend.keys().map(String::as_str))
+                .unwrap();
             let held = route(Mode::Ram, emitted, &backend, &progress);
             assert_held(&entity, &prior, &held, &cold);
             let namespace = progress.destination_namespace_hash.clone();
-            progress = SnapshotUploadProgress::load(
-                &progress_path,
+            progress = crate::snapshot_sync::tests::load_routed_progress(
+                &owner,
+                &index_path,
                 &namespace,
                 snapshot_quarantine_witness(source),
-            )
-            .unwrap();
+            );
             progress
                 .accepted_identity_buckets
                 .bind_test_key(Some([0x42; 32]));
@@ -685,6 +702,9 @@ pub(in crate::snapshot_sync) fn assert_mixed_retryable_holds() {
             )
             .unwrap();
             let cold = route(Mode::ColdFull, items.clone(), &cold_backend, &cold_progress);
+            progress
+                .load_identity(backend.keys().map(String::as_str))
+                .unwrap();
             let caught_up = route(
                 Mode::Restart,
                 backend.values().cloned().collect(),

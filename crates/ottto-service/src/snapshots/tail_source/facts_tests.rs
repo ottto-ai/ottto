@@ -1,4 +1,4 @@
-//! Session facts (D168-1) on real committed Tail state: a restart restores
+//! Session facts on real committed Tail state: a restart restores
 //! them from the database with no transcript byte, a changed fact rewrites
 //! only its slot and purges the old value, and a long first prompt goes
 //! through the store's fragments and loads back whole.

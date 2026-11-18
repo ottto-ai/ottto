@@ -140,10 +140,17 @@ impl OracleServer {
                 let response = if request.contains("/relay-token") {
                     json!({"token":"synthetic-oracle-token","expires_at":"2099-01-01T00:00:00Z"})
                 } else if request.contains("/activity-hints") {
-                    json!({"source":source.api_slug(),"server_time":AT,
+                    let mut hint = json!({"source":source.api_slug(),"server_time":AT,
                         "last_data_at":null,"record_count_15m":0,"record_count_24h":0,
                         "local_usage_reconciliation_enabled":true,"backfill_window_days":183,
-                        "recommended_scan_after":"2099-01-01T00:00:00Z"})
+                        "recommended_scan_after":"2099-01-01T00:00:00Z"});
+                    // Production still advertises this key to Claude Code
+                    // only; the daemon no longer reads it (decode tolerates it).
+                    if source == SnapshotSource::ClaudeCode {
+                        hint["session_request_account_source_contract"] =
+                            "session_request_account_source:v1".into();
+                    }
+                    hint
                 } else if request.contains("/agent-status/snapshots") {
                     json!({"accepted":1,"machine_id":"otm_test","sources":[source.api_slug()]})
                 } else if let Some(items) = value["snapshots"].as_array() {
@@ -312,7 +319,6 @@ struct OracleHome {
     now: u64,
     small_page: bool,
     state_budget: Option<usize>,
-    legacy_counting: bool,
     row: &'static str,
     cycle_number: usize,
     current_codex_account: &'static str,
@@ -324,7 +330,6 @@ struct OracleHome {
     client: SnapshotApiClient,
     daemon: LocalDaemon,
     transport: crate::net_resilience::TransportCycleOutcome,
-    retry: live_snapshot_retry::LiveRetryOwner,
     _env: [EnvVarGuard; 3],
 }
 
@@ -453,7 +458,6 @@ impl OracleHome {
             now: NOW,
             small_page: false,
             state_budget: None,
-            legacy_counting: false,
             row: "c00",
             cycle_number: 0,
             current_codex_account: "a",
@@ -465,7 +469,6 @@ impl OracleHome {
             client: SnapshotApiClient::new(server.url.clone()),
             daemon: test_daemon("otm_test"),
             transport: Default::default(),
-            retry: live_snapshot_retry::LiveRetryOwner::closed(),
             _env: env,
         }
     }
@@ -533,7 +536,6 @@ impl OracleHome {
     }
     fn restart(&mut self) {
         drop(std::mem::replace(&mut self.daemon, test_daemon("otm_test")));
-        self.retry = live_snapshot_retry::LiveRetryOwner::closed();
         self.restarted = true;
         test_effects::record("restart", Vec::new());
     }
@@ -549,7 +551,7 @@ impl OracleHome {
         // the current CAS/root binding. Progress rows remain authoritative.
         previous.retain_persistence_baseline_from(&current);
         previous.generation = current.generation;
-        previous.save(&self.index_path()).unwrap();
+        previous.save_fixture(&self.index_path()).unwrap();
         crate::snapshots::e2_pipeline_scan_fixture::forget_continuations_for_test(
             &self.daemon.transcript_cache,
             &current,
@@ -559,7 +561,7 @@ impl OracleHome {
     fn age_listing(&self) {
         let mut index = ScanIndex::load(&self.index_path()).unwrap();
         crate::snapshots::e2_pipeline_scan_fixture::age_listing_for_test(&mut index);
-        index.save(&self.index_path()).unwrap();
+        index.save_fixture(&self.index_path()).unwrap();
     }
     fn cycle(&mut self, server: &OracleServer, recording: &Recording) -> Cycle {
         let schedule = self.schedule.map(|s| (s.limit, s.reverse));
@@ -574,8 +576,7 @@ impl OracleHome {
         let now = self.now;
         let small_page = self.small_page;
         let budget = self.state_budget;
-        let legacy = self.legacy_counting;
-        let _cutover = legacy.then(|| crate::snapshots::TestCutover::set(i64::MAX));
+
         let at = OffsetDateTime::from_unix_timestamp(now as i64)
             .unwrap()
             .format(&Rfc3339)
@@ -597,7 +598,6 @@ impl OracleHome {
                         &self.daemon,
                         &mut self.transport,
                         self.daemon.snapshot_scan_account_witness().unwrap(),
-                        false,
                     )
                 })
             })
@@ -637,7 +637,7 @@ impl OracleHome {
         let worker_births = self.births.clone();
         let (preparation, index, scan, steps, mut io) = run_on_scan_worker_stack(move || {
             let _entered = handle.enter();
-            let _cutover = legacy.then(|| crate::snapshots::TestCutover::set(i64::MAX));
+
             let read = move || {
                 with_scan_clock(now, || {
                     let ((preparation, index, scan, steps), io) =
@@ -717,7 +717,6 @@ impl OracleHome {
                         &self.support,
                         &self.daemon,
                         &mut self.transport,
-                        &mut self.retry,
                     )
                 })
             })
@@ -1470,9 +1469,13 @@ fn c01_claude_cold_control_preserves_accounts_side_call_gap_and_tags() {
             }
         }
     }
+    // All three transcript requests are unproven copies (this fixture has no
+    // file birth), so none seeds a carry: the 5-token gap takes the start
+    // account (account-a, unmarked), not the latest own account (b). Totals
+    // are unchanged.
     assert_eq!(
         accounts,
-        BTreeMap::from([("a".repeat(64), 10), ("b".repeat(64), 32)])
+        BTreeMap::from([("a".repeat(64), 15), ("b".repeat(64), 27)])
     );
     assert!(tagged);
     money_equivalence_tests::emit_money(
@@ -1507,13 +1510,13 @@ fn codex_member(
         json!({"input_tokens":n,"cached_input_tokens":0,"cache_write_input_tokens":0,
         "output_tokens":0,"reasoning_output_tokens":0,"total_tokens":n})
     };
-    vec![
+    crate::snapshots::codex_bound_fixture_rows(&[
         json!({"type":"session_meta","timestamp":created,"payload":{"id":owner}}),
         json!({"type":"token_usage_record","timestamp":"2026-11-01T07:01:00Z","payload":{
             "thread_id":owner,"response_id":response,"usage":usage(input),"thread_token_usage":usage(cumulative)}}),
         json!({"type":"event_msg","timestamp":"2026-11-01T07:01:01Z","payload":{"type":"token_count",
             "info":{"model":"gpt-5.2","last_token_usage":usage(input),"total_token_usage":usage(cumulative)}}}),
-    ]
+    ])
 }
 
 fn write_jsonl(path: &Path, rows: &[Value]) {
@@ -1613,7 +1616,6 @@ fn c07_codex_group_memo_rediscloses_without_session_credit() {
     let server = OracleServer::new(SnapshotSource::Codex, recording.handle());
     let mut home = OracleHome::new(SnapshotSource::Codex, &server);
     home.row = "c07";
-    home.legacy_counting = true;
     install_group(&home, true);
     let first = home.cycle(&server, &recording);
     assert!(first.consumed > 0);
@@ -1637,7 +1639,6 @@ fn c08_codex_group_park_rediscloses_without_reading() {
     let server = OracleServer::new(SnapshotSource::Codex, recording.handle());
     let mut home = OracleHome::new(SnapshotSource::Codex, &server);
     home.row = "c08";
-    home.legacy_counting = true;
     install_group(&home, false);
     home.small_page = true;
     home.state_budget = Some(1);
@@ -1739,7 +1740,6 @@ fn c09_codex_singleton_memo_keeps_the_previous_body() {
     let server = OracleServer::new(SnapshotSource::Codex, recording.handle());
     let mut home = OracleHome::new(SnapshotSource::Codex, &server);
     home.row = "c09";
-    home.legacy_counting = true;
     // A rewritten priority prefix is held by TierReplay before native
     // ownership completion and memo admission. Exercise the ownership memo
     // with default-tier usage; the native money row keeps positive priority.
@@ -1747,7 +1747,10 @@ fn c09_codex_singleton_memo_keeps_the_previous_body() {
     let cold = home.cycle(&server, &recording);
     assert!(cold.finish.is_ok());
     assert_durable(&cold);
-    assert_eq!(cold.finalized[0].input_tokens, 200);
+    assert_eq!(
+        cold.finalized[0].input_tokens, 120,
+        "V2 publishes the closed first turn; the second is pending"
+    );
     assert!(cold.index.files.values().all(|entry| {
         entry.codex_applied_tier_receipt.is_none()
             && !entry.codex_applied_tier_receipt_required
@@ -1804,7 +1807,6 @@ fn c10_codex_singleton_park_keeps_the_previous_body() {
     let server = OracleServer::new(SnapshotSource::Codex, recording.handle());
     let mut home = OracleHome::new(SnapshotSource::Codex, &server);
     home.row = "c10";
-    home.legacy_counting = true;
     let mut rows = codex_member(
         IDENTITY_PIPELINE_ROOT,
         "first",
@@ -1928,7 +1930,6 @@ fn c11_fragment_and_obligation_charge_one_slot_and_existing_marker_charges_none(
         let server = OracleServer::new(SnapshotSource::Codex, recording.handle());
         let mut home = OracleHome::new(SnapshotSource::Codex, &server);
         home.row = if outlive { "c11_both" } else { "c11_marker" };
-        home.legacy_counting = true;
         home.small_page = true;
         fragment_corpus(&home);
         let new = finish_fragment(&mut home, &server, &recording, outlive);
@@ -1985,7 +1986,7 @@ fn c11_account_hold_bypasses_the_full_audit_cap_without_staging_a_marker() {
         NOW + crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS,
     );
     crate::snapshots::e2_pipeline_scan_fixture::age_listing_for_test(&mut index);
-    index.save(&home.index_path()).unwrap();
+    index.save_fixture(&home.index_path()).unwrap();
     let row = json!({"type":"assistant","sessionId":IDENTITY_PIPELINE_ROOT,
         "version":"2.1.309","timestamp":"2026-11-01T07:03:00Z","requestId":"held-growth",
         "message":{"id":"held-growth-message","model":"claude-haiku-4-5",
@@ -2560,7 +2561,6 @@ fn scheduling_permutations_converge_to_the_same_bodies() {
                             SnapshotSource::Pi => "schedule_pi",
                         };
                         home.cycle_number = run * 128;
-                        home.legacy_counting = source == SnapshotSource::Codex;
                         let mut accepted = BTreeMap::new();
                         let seed_paths = scheduling_corpus(&home, true);
                         home.births = seed_paths
@@ -3179,7 +3179,6 @@ mod money_equivalence_tests {
             let server = OracleServer::new(SnapshotSource::Codex, recording.handle());
             let mut home = OracleHome::new(SnapshotSource::Codex, &server);
             home.row = "c01_codex";
-            home.legacy_counting = true;
             install_created_thread(&home, false, IDENTITY_PIPELINE_ROOT, true);
             install_created_thread(&home, false, "3338a80a-f36e-4cbc-a5bb-50fc66430ba5", true);
             fixture_inputs.extend(inputs(&home));
@@ -3188,7 +3187,8 @@ mod money_equivalence_tests {
             assert_eq!(cold.finalized.len(), 2);
             assert_eq!(
                 cold.finalized.iter().map(|s| s.input_tokens).sum::<u64>(),
-                400
+                240,
+                "V2 publishes each closed 120-token turn; open turns remain pending"
             );
             let accounts = cold
                 .finalized

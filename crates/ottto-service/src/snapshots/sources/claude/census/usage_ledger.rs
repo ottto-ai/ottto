@@ -1154,7 +1154,7 @@ pub(in crate::snapshots) fn semantic_attribution(item: &SnapshotItem) -> Value {
 pub(in crate::snapshots) fn semantic_model_usage(row: &SnapshotModelUsage) -> Value {
     // `account_identifier_hash` remains outside hash epoch 1. The account-keyed
     // Claude sidecar fingerprint changes `source_file_fingerprint`, and thus
-    // `revision_hash`, when exact evidence appears; changing epoch-1 content
+    // `revision_v2_hash`, when exact evidence appears; changing epoch-1 content
     // semantics would reject older clients that already use this wire field.
     let mut value = json!({
         "model": &row.model,

@@ -12,15 +12,8 @@ static NEXT: AtomicU64 = AtomicU64::new(0);
 struct Fixture(PathBuf);
 impl Fixture {
     fn new(source: SnapshotSource) -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "ottto-native-tail-{}-{}-{}.jsonl",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-            NEXT.fetch_add(1, AtomicOrdering::Relaxed)
-        ));
+        // Canonical: state v2 refuses a store beneath a symlinked ancestor.
+        let path = crate::test_scratch::unique_path("ottto-native-tail").with_extension("jsonl");
         let value = match source {
             SnapshotSource::Codex => {
                 json!({"type":"session_meta","payload":{"id":"native-tail-fixture"}})
@@ -1369,8 +1362,8 @@ fn a_codec_route_error_holds_the_file_without_ram() {
 
 /// [money] An account-witness change, then a destination change, after a
 /// restart: each production namespace (`cycle_sampled_scope`) is new, and
-/// every source's head continues from Tail with no reconstruction (D168-3:
-/// account evidence is applied from stored facts and live evidence, never by
+/// every source's head continues from Tail with no reconstruction
+/// (account evidence is applied from stored facts and live evidence, never by
 /// a re-read). The body equals a cold Full under the new namespace, Codex's
 /// creator placement included. A new priority still replays for real.
 #[test]

@@ -350,12 +350,6 @@ impl ClaudeFileBirth {
             .or_else(|| self.birth_nanos())
     }
 
-    /// The sequence of the file's first response not proven copied, id-less
-    /// and synthetic ones included.
-    pub(in crate::snapshots) fn first_own_sequence(&self) -> Option<u64> {
-        self.first_own_sequence
-    }
-
     fn root_with_birth(&self) -> bool {
         matches!(self.scope, ClaudeBirthScope::Root(_))
     }
@@ -598,6 +592,7 @@ impl ClaudeFileBirthVerdict {
     }
 }
 
+#[cfg(test)]
 impl SnapshotItem {
     /// Local design E decision for this fold, independent of strict ownership.
     pub(crate) fn claude_file_birth_verdict(&self) -> Option<ClaudeFileBirthVerdict> {

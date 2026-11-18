@@ -3,7 +3,7 @@
 use super::*;
 use crate::test_scratch::ScratchDir as TempDir;
 use e2_pipeline_scan_fixture::{
-    accept_upload_context_acks_for_test, exact_acks_for_test, E2ScanFixture,
+    accept_upload_context_acks_for_test, exact_acks_for_test, persistence_source, E2ScanFixture,
 };
 use sampled_scan::transition_fixture::{observe_consumed, with_scan_clock};
 use sha2::{Digest, Sha256};
@@ -315,13 +315,8 @@ struct Driver<'a> {
 impl<'a> Driver<'a> {
     fn new(corpus: &'a Corpus, source: usize) -> Self {
         let fixture = E2ScanFixture::clocked_collection();
-        let kind = match SOURCES[source] {
-            SnapshotSource::ClaudeCode => scan_index_persistence::Source::Claude,
-            SnapshotSource::Codex => scan_index_persistence::Source::Codex,
-            SnapshotSource::Pi => scan_index_persistence::Source::Pi,
-        };
         let (session, mut index) = StateV2ColdSession::publish(
-            kind,
+            persistence_source(SOURCES[source]),
             &ScanIndex::default(),
             &corpus.support.join(SOURCES[source].api_slug()),
         );

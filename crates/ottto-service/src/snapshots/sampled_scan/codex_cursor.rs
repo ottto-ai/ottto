@@ -896,8 +896,6 @@ pub(in crate::snapshots) struct JobMeta {
     started: u64,
     dependencies: Option<String>,
     owner: Option<String>,
-    /// `counting_view` of the file's index entries at job start (K8).
-    counting: String,
     /// The census generation this job started in (K7 fence).
     fence: Option<String>,
     /// The state and sidecar census were complete at start. A cursor-only
@@ -913,7 +911,7 @@ pub(in crate::snapshots) struct JobMeta {
     pace: JobPace,
 }
 crate::heap_layout_bound::fields!(JobMeta; key, namespace, stamp_open, started, dependencies,
-    owner, counting, fence, census_trusted, pages, unavailable_resumes, eof_applied,
+    owner, fence, census_trusted, pages, unavailable_resumes, eof_applied,
     pace);
 
 /// Stage 1 guard (`stage1/c14c15-answer.md` §6): one cursor attempt's
@@ -963,36 +961,6 @@ pub(in crate::snapshots) struct InlineInstant(std::time::Instant);
 
 crate::heap_layout_bound::no_heap!(true; InlineInstant);
 
-/// The counting view of `candidate`'s index entries (K8): what a fresh
-/// singleton parser would be configured with now. Recorded at job start,
-/// recomputed from the current entries at every resume and at emission.
-/// `"legacy"` while the counting cutover is inactive.
-pub(in crate::snapshots) fn counting_view(candidate: &CandidateFile, index: &ScanIndex) -> String {
-    crate::snapshots::sources::codex::counting::version::singleton_view(candidate, index)
-}
-
-/// A group's counting view: what
-/// `configure_group_once` would configure now from every member's index
-/// entry (`sources::codex::counting::version::group_view`, the same evidence as
-/// `group_evidence` at boot). A counting change on any member, not only the
-/// live one, changes it; `counting_reusable` decides resume and emission
-/// against it exactly as for a singleton (any member's Legacy ACK takes
-/// precedence).
-pub(in crate::snapshots) fn group_counting_view<'a>(
-    members: impl IntoIterator<Item = &'a CandidateFile>,
-    index: &ScanIndex,
-) -> String {
-    crate::snapshots::sources::codex::counting::version::group_view(members, index)
-}
-
-/// The counting view a job is decided under: a group's over all members.
-pub(in crate::snapshots) fn job_counting_view(job: &OwnedActiveFile, index: &ScanIndex) -> String {
-    match job.group.as_ref() {
-        Some(group) => group_counting_view(&group.members, index),
-        None => counting_view(&job.candidate, index),
-    }
-}
-
 /// A group job's `scope_job`: the join-proof and identity versions.
 /// Recorded at job start; a change at any resume or at emission invalidates
 /// the job (a paused group never mixes proofs). Settings, capabilities and the
@@ -1003,14 +971,6 @@ pub(in crate::snapshots) fn group_scope() -> String {
         CODEX_JOIN_PROOF_VERSION,
         SnapshotSource::Codex.scan_identity_version(),
     ])
-}
-
-/// The one counting reuse predicate for a restored accumulator, shared with
-/// the retained-reduction `old.filter`: the paused job continues only under
-/// the rule `current` would select. The paused accumulator carries the
-/// configuration it was decided under, so `recorded` adds nothing to it.
-fn counting_reusable(accumulator: &SnapshotAccumulator, _recorded: &str, current: &str) -> bool {
-    crate::snapshots::sources::codex::counting::version::reusable_under_view(accumulator, current)
 }
 
 /// The strict census generation a cursor attempt belongs to (K7): the
@@ -1749,8 +1709,8 @@ pub(in crate::snapshots) struct Publication {
 impl Publication {
     /// Whether the withheld final record was applied at EOF, so the reduction is not
     /// the reduction through the certified prefix. Read before
-    /// `cursor_published` consumes the publication; `eof_applied(job)` is not
-    /// valid after `finish_job`.
+    /// `cursor_published` consumes the publication; the finished job no longer
+    /// carries this fact after `finish_job`.
     pub(in crate::snapshots) fn eof_applied(&self) -> bool {
         self.eof_applied
     }
@@ -2334,7 +2294,7 @@ fn park(cursor: &mut CursorState, key: String, parked: Parked) {
 
 /// End a cursor job at its frozen extent: certify the sealed prefix from the
 /// held FD (`ReadPlan::commit_sealed_prefix`), record the attempt and free
-/// the slot. `current_scope` and `counting_now` are recomputed now from the
+/// the slot. `current_scope` is recomputed now from the
 /// current index (K8, K9). `census_trusted`: the state and sidecar census
 /// were complete at start and are now.
 pub(in crate::snapshots) fn finish_job(
@@ -2342,7 +2302,6 @@ pub(in crate::snapshots) fn finish_job(
     lease: Option<CursorLease>,
     job: &mut OwnedActiveFile,
     current_scope: Option<&Scope>,
-    counting_now: &str,
     group_scope_now: &str,
     census_trusted: bool,
 ) -> JobEnd {
@@ -2367,7 +2326,7 @@ pub(in crate::snapshots) fn finish_job(
     let consumed = parser.reader.consumed_bytes();
     let now = super::now_seconds();
     // A group's receipts and replay are bound to its start scope.
-    let counting_holds = counting_reusable(&parser.accumulator, &meta.counting, counting_now)
+    let counting_holds = parser.accumulator.codex_counting_v2()
         && job
             .group
             .as_ref()
@@ -2623,10 +2582,6 @@ pub(in crate::snapshots) fn mark_eof_applied(job: &mut OwnedActiveFile) {
     }
 }
 
-pub(in crate::snapshots) fn eof_applied(job: &OwnedActiveFile) -> bool {
-    job.cursor.as_ref().is_some_and(|meta| meta.eof_applied)
-}
-
 /// The file offset where the job's reader stopped (a tail's reader counts
 /// from its start).
 pub(in crate::snapshots) fn read_end(job: &OwnedActiveFile) -> u64 {
@@ -2681,12 +2636,6 @@ pub(in crate::snapshots) fn arm_group_member(
     Ok(())
 }
 
-/// The live member's legacy baseline (P2) reads the job's frozen prefix:
-/// it may finish a grown same object, like the job's own certificate.
-pub(in crate::snapshots) fn frozen_grant(meta: &JobMeta, extent: u64) -> FinishGrant {
-    FinishGrant::certified(meta.stamp_open.dev, meta.stamp_open.ino, extent)
-}
-
 /// The live member's grant after `finish_job` certified a group job.
 pub(in crate::snapshots) fn certified_prefix(job: &OwnedActiveFile) -> Option<SealedPrefix> {
     match job.parser.reader.sealed_prefix.as_ref()? {
@@ -2719,14 +2668,13 @@ pub(in crate::snapshots) fn defer_group_lease(lease: CursorLease) {
 /// M-1 `scope_job` of a group, with its wake dependencies (§d.4): identity
 /// and proof versions, owner, canonical member keys, every sealed
 /// member's opened identity and the live member's `{dev, ino}` (never its
-/// growing length), header digests, counting view, each
+/// growing length), header digests, each
 /// member's path reduction facts and the census flags.
 pub(in crate::snapshots) fn group_memo_digest(
     owner: &str,
     members: &[&CandidateFile],
     live: &OpenStamp,
     digests: &[&str],
-    index: &ScanIndex,
     codex: &CodexTitleMetadata,
     identity: impl Fn(&CandidateFile) -> String,
 ) -> String {
@@ -2735,7 +2683,6 @@ pub(in crate::snapshots) fn group_memo_digest(
         CODEX_JOIN_PROOF_VERSION.to_owned(),
         SnapshotSource::Codex.scan_identity_version().to_owned(),
         owner.to_owned(),
-        group_counting_view(members.iter().copied(), index),
         format!("{}:{}", live.dev, live.ino),
         if members
             .iter()
@@ -3570,7 +3517,6 @@ impl SharedCache {
             .reader
             .set_extent_limit(frozen.min(stamp_open.extent).saturating_sub(start));
         job.cursor = Some(JobMeta {
-            counting: counting_view(&job.candidate, index),
             fence: census_token(index),
             key,
             namespace: namespace.0.clone(),
@@ -3610,7 +3556,6 @@ impl SharedCache {
         let key = group.key.clone();
         let owner = group.owner.clone();
         let boot = group.stamps.first().cloned();
-        let counting = group_counting_view(&group.members, index);
         let members = group
             .members
             .iter()
@@ -3659,7 +3604,6 @@ impl SharedCache {
             .get_or_insert_with(BTreeMap::new);
         job.parser.reader.set_extent_limit(boot.extent);
         job.cursor = Some(JobMeta {
-            counting,
             fence: census_token(index),
             key,
             namespace: namespace.0.clone(),
@@ -3962,8 +3906,6 @@ pub(in crate::snapshots) struct ResumeInputs<'a> {
     pub(in crate::snapshots) inventory: Option<&'a codex_file_join::HeaderInventory>,
     /// The acquisition scope recomputed under the resuming scan's index.
     pub(in crate::snapshots) scope: Option<Scope>,
-    /// `counting_view` recomputed from the resuming scan's index (K8).
-    pub(in crate::snapshots) counting: String,
     /// `group_scope` recomputed from the resuming scan's index.
     pub(in crate::snapshots) group_scope: String,
     /// The state and sidecar census are complete now.
@@ -4017,6 +3959,29 @@ pub(in crate::snapshots) fn resume_paused_job(
     else {
         return Resumed::Idle;
     };
+    if context.source == SnapshotSource::Codex
+        && job.group.is_none()
+        && job_files(&job).iter().any(|file| {
+            crate::snapshots::sources::codex::counting::version::legacy_head_missing(
+                index,
+                &local_index_key(&file.path),
+            )
+        })
+    {
+        return end_unavailable(job, lease, index, targets);
+    }
+    if context.source == SnapshotSource::Codex
+        && job_files(&job).iter().all(|file| {
+            crate::snapshots::sources::codex::counting::version::unchanged_legacy(index, &file.path)
+        })
+    {
+        for file in job_files(&job) {
+            identified_candidates.retain(|candidate| candidate.path != file.path);
+        }
+        drop(job);
+        lease.release();
+        return Resumed::Spent;
+    }
     // A path that no longer names the held object (archived, renamed,
     // deleted or replaced) can never revalidate; end the job now.
     if !path_names_held_object(&job) {
@@ -4032,8 +3997,6 @@ pub(in crate::snapshots) fn resume_paused_job(
         )
         .map(|dependency| sampling.file_scope(context.source, &job.candidate, &dependency))
     });
-    // A group's counting view is built over every member.
-    let counting = job_counting_view(&job, index);
     let verdict = revalidate(
         &mut job,
         ResumeInputs {
@@ -4042,7 +4005,6 @@ pub(in crate::snapshots) fn resume_paused_job(
             support: context.support,
             inventory: context.inventory,
             scope,
-            counting,
             group_scope: group_scope(),
             census_complete: context.census_complete,
         },
@@ -4167,8 +4129,7 @@ pub(in crate::snapshots) enum Resume {
 /// Singleton subset of the revalidation checklist, run at every resume:
 /// same object without shrink or in-place edit (growth is outside the frozen
 /// extent), unchanged reduction dependencies and scope, still a singleton,
-/// every earlier priority decision still valid, and a counting view the paused accumulator may
-/// continue under (`counting_reusable`, the second restore path K8 names).
+/// every earlier priority decision still valid, and a V2 paused accumulator.
 pub(in crate::snapshots) fn revalidate(
     job: &mut OwnedActiveFile,
     inputs: ResumeInputs<'_>,
@@ -4182,9 +4143,7 @@ pub(in crate::snapshots) fn revalidate(
     let Ok(now) = OpenStamp::capture(job.parser.reader.reader.get_ref()) else {
         return Resume::Changed;
     };
-    if !meta.stamp_open.append_compatible(&now)
-        || !counting_reusable(&job.parser.accumulator, &meta.counting, &inputs.counting)
-    {
+    if !meta.stamp_open.append_compatible(&now) || !job.parser.accumulator.codex_counting_v2() {
         return Resume::Changed;
     }
     let Some(dependencies) = sampled_scan::reduction_dependencies(
@@ -4232,7 +4191,7 @@ pub(in crate::snapshots) fn revalidate(
 /// read is the same object without shrink or in-place edit; every member
 /// already read still names its boot object's content (`same_content`, at
 /// the exact boot length; a ctime-only change is not a change); the group's reduction
-/// dependencies, member set and counting view are unchanged; then the
+/// dependencies and member set are unchanged; then the
 /// singleton's priority-decision and live-input rules. A member's path
 /// stamp carries no birth witness: an in-place same-length rewrite that
 /// restores mtime passes here, and a replacement is seen only through a new
@@ -4247,7 +4206,7 @@ fn revalidate_group(job: &mut OwnedActiveFile, inputs: ResumeInputs<'_>) -> Resu
         return Resume::Changed;
     };
     if !meta.stamp_open.append_compatible(&now)
-        || !counting_reusable(&job.parser.accumulator, &meta.counting, &inputs.counting)
+        || !job.parser.accumulator.codex_counting_v2()
         || group.scope != inputs.group_scope
     {
         return Resume::Changed;
@@ -4531,7 +4490,7 @@ pub(in crate::snapshots) fn strict_disclosure(reason: DebtReason) -> Disclosure 
 /// same-length stamp change (mtime/ctime) of the held file, a head or
 /// boundary sample mismatch at the refused offset, any dependency in the
 /// digest (parser, proof and scope versions, reduction dependencies, census
-/// flags, owner members, counting view), or (for every hold but an
+/// flags, owner members), or (for every hold but an
 /// ambiguous fork) the path's full sidecar facts (K3).
 ///
 /// Premise (disclosed): an in-place interior edit outside the samples that
@@ -4733,7 +4692,7 @@ impl SingletonMemo {
 
 /// The memo key for a singleton: identity and proof versions, the
 /// file's logical key and opened `{dev, ino}` (never its growing length),
-/// the counting view, and the wake dependencies (path-scoped reduction facts
+/// the wake dependencies (path-scoped reduction facts
 /// and header witness, the path's conflicted candidate ids, the global sidecar
 /// census flags, and how many inventory members its owner has). The census
 /// flags cannot cure most holds but are kept as conservative wake inputs
@@ -4746,7 +4705,6 @@ pub(in crate::snapshots) fn memo_digest(
     dependencies: &str,
     codex: &CodexTitleMetadata,
     owner_members: usize,
-    counting: &str,
 ) -> Option<String> {
     let stamp = OpenStamp::capture(file).ok()?;
     Some(sha256_hex(&[
@@ -4756,7 +4714,6 @@ pub(in crate::snapshots) fn memo_digest(
         &local_index_key(&candidate.path),
         &stamp.dev.to_string(),
         &stamp.ino.to_string(),
-        counting,
         // PR-1: the tier receipt configures the parse
         // (`configure_tier_replay`), contents included.
         &{

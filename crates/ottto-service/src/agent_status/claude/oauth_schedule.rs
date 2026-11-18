@@ -21,7 +21,6 @@ use crate::agent_status::read_claude_oauth_usage_cache_with_legacy_migration;
 use crate::agent_status::read_claude_statusline_cache;
 use crate::agent_status::rfc3339_from_unix_seconds;
 use crate::agent_status::write_claude_oauth_usage_cache;
-use crate::agent_status::write_legacy_claude_oauth_usage_cache;
 use crate::agent_status::AgentCreditBalance;
 use crate::agent_status::AgentDiagnosticSeverity;
 use crate::agent_status::AgentStatusCollection;
@@ -175,7 +174,7 @@ pub(in crate::agent_status) struct ClaudeOAuthReading<'a> {
     pub(in crate::agent_status) previous_credit_balances: &'a [AgentCreditBalance],
     pub(in crate::agent_status) latest_activity_at: Option<u64>,
     pub(in crate::agent_status) now: u64,
-    pub(in crate::agent_status) mirror_legacy_default: bool,
+    pub(in crate::agent_status) legacy_root_migration: bool,
 }
 
 /// Parse, merge and store one reading. `Err` carries the unstored parse when
@@ -248,9 +247,6 @@ pub(in crate::agent_status) fn claude_oauth_usage_record_reading(
         account_session_not_offered: usage.account_session_not_offered,
     };
     let _ = write_claude_oauth_usage_cache(&cache);
-    if reading.mirror_legacy_default {
-        let _ = write_legacy_claude_oauth_usage_cache(&cache);
-    }
     read_schedule.after_reading(
         reading.read,
         reading.observed_at_epoch_seconds,

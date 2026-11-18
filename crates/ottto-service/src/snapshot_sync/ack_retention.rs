@@ -337,7 +337,7 @@ impl SnapshotUploadProgress {
         retired.retain(|fp| !scan_referenced.contains(fp));
         let before = self.accepted_fingerprints.len();
         if keep_adopted_for_retry {
-            // The retained retry driver still reads this resume ledger. Keep
+            // A later ordinary pass still reads this resume ledger. Keep
             // its adopted siblings suppressed until that logical offer ends.
             self.accepted_body_witnesses
                 .retain(|fp, _| !retired.contains(fp) || locally_held.contains(fp));

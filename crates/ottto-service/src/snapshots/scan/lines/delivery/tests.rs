@@ -3910,8 +3910,11 @@ fn withheld_equal_fingerprint_recovers_for_reason(failure: &str, reason: Candida
     let mut held = crate::snapshot_sync::withheld_support::settle_withheld(&previous, parsed, scan);
     assert_eq!(held.files[&key].source_file_fingerprint, fingerprint);
     assert!(held.claude_account_deferred_holds.contains_key(&key));
-    let checkpoint = root.0.join("equal-held.json");
+    // Each reload saves a fresh copy: the previous one stays the live owner.
+    let reloads = std::cell::Cell::new(0);
     let reload = |index: &mut ScanIndex| {
+        reloads.set(reloads.get() + 1);
+        let checkpoint = root.0.join(format!("equal-held-{}.json", reloads.get()));
         crate::snapshots::e2_pipeline_scan_fixture::save_for_test(index, &checkpoint);
         let mut index = ScanIndex::load(&checkpoint).unwrap();
         index.withheld_memo = memo.clone();

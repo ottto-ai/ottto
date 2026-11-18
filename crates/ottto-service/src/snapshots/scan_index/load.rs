@@ -200,27 +200,7 @@ impl ScanIndex {
                 ))
             }
             Ok(mut index) => {
-                if !index.finish_decoded_load(source) {
-                    if index
-                        .persistence_root
-                        .as_ref()
-                        .is_some_and(|(_, root)| !root.is_legacy())
-                    {
-                        return Err(anyhow::anyhow!(
-                            "scan_index_storage_generation_requires_repair"
-                        ));
-                    }
-                    let discarded = index.files.len();
-                    return quarantine_invalid_scan_index(
-                        path,
-                        "codex_identity_collision",
-                        Some(discarded),
-                        source,
-                        support_dir,
-                        now,
-                    )
-                    .map(|index| (index, LoadOrigin::Quarantined));
-                }
+                index.finish_decoded_load(source);
                 if try_import {
                     state_v2::after_v1_locked(path, &mut index)?;
                 }

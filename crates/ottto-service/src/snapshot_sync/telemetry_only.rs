@@ -1284,10 +1284,6 @@ pub(super) fn apply_claude_local_evidence_to_scan_with_ledger_and_budget(
 pub(super) fn release_emitted(item: &mut SnapshotItem) {
     #[cfg(test)]
     crate::snapshots::claude_request_money::e2::pipeline_test_observer::before_release(item);
-    // Route evidence only; captured before the native request inputs go.
-    if crate::snapshots::billing_route::PRODUCER_ENABLED {
-        crate::snapshots::billing_route::capture_claude_route_evidence(item);
-    }
     crate::snapshots::claude_request_money::e2::release_emitted_fold(item);
 }
 

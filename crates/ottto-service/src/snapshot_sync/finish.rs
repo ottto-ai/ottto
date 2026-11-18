@@ -31,7 +31,6 @@ use super::identity_cache_wire_reserve;
 use super::is_upload_outage;
 use super::lane::ensure_snapshot_destination_current;
 use super::lane::ensure_snapshot_scan_authority;
-use super::live_snapshot_retry;
 use super::log_retained_permanent_refusals;
 use super::mark_backfill_complete_for_destination;
 use super::note_shed_and_backoff;
@@ -385,9 +384,12 @@ pub(crate) fn checkpoint_account_release_for_test(
     paths: (&Path, &Path),
 ) -> Result<ScanIndex> {
     let (holds, mut progress) = classify_account_release_for_test(&mut index, scan);
+    progress.destination_namespace_hash =
+        crate::snapshots::e2_pipeline_scan_fixture::binding_for_test(paths.0).1;
+    let (progress_path, mut progress) = tests::routed_progress(previous, paths.0, progress);
     // Actual no-ACK partial save restores the prior accepted entry before
     // transferring retry custody. Head binding above still had to succeed.
-    progress.save(paths.1)?;
+    progress.save(&progress_path)?;
     checkpoint_partial_snapshot_index_with_audit_release(
         &index,
         previous,
@@ -396,7 +398,7 @@ pub(crate) fn checkpoint_account_release_for_test(
         Some(scan),
         &holds.held_fingerprints,
         paths.0,
-        paths.1,
+        &progress_path,
         || Ok(()),
         None,
         Some(UnsettledUploadCause::UploadError),
@@ -818,7 +820,7 @@ pub(crate) fn checkpoint_page_for_test(
             result? == ResumableUploadResult::Completed,
             "fixture exact ACK"
         );
-        progress.save(progress_path)?;
+        progress.save_fixture(progress_path)?;
         index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
         crate::snapshots::e2_pipeline_scan_fixture::accept_upload_context_acks_for_test(
             &mut index,
@@ -828,7 +830,7 @@ pub(crate) fn checkpoint_page_for_test(
         index.save(index_path)?;
         return Ok(index);
     }
-    progress.save(progress_path)?;
+    progress.save_fixture(progress_path)?;
     checkpoint_partial_snapshot_index_with_audit_release(
         index,
         committed,
@@ -1126,7 +1128,7 @@ pub(super) fn clear_source_manifests_for_test() {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clear();
 }
-#[expect(clippy::too_many_arguments, reason = "13 args; no options struct yet")]
+#[expect(clippy::too_many_arguments, reason = "12 args; no options struct yet")]
 pub(super) fn finish_sync_source(
     preparation: SourcePreparation,
     mut index: ScanIndex,
@@ -1140,13 +1142,11 @@ pub(super) fn finish_sync_source(
     support_dir: &Path,
     daemon: &LocalDaemon,
     _transport_cycle: &mut crate::net_resilience::TransportCycleOutcome,
-    retry: &mut live_snapshot_retry::LiveRetryOwner,
 ) -> Result<()> {
     let _diagnostics = crate::local_resource_diagnostics::claude_reread::Scope::finish_decision(
         preparation.source == SnapshotSource::ClaudeCode,
     );
     let SourcePreparation {
-        retry_authority,
         source,
         claude_scan_roots,
         account_witness,
@@ -1186,23 +1186,6 @@ pub(super) fn finish_sync_source(
     upload_progress
         .accepted_identity_buckets
         .set_item_cap(identity_item_cap);
-    upload_progress
-        .accepted_identity_buckets
-        .set_retained_enabled(
-            source == SnapshotSource::ClaudeCode
-                && activity_hint
-                    .session_request_identity_retained_contract
-                    .as_deref()
-                    == Some(crate::snapshots::claude_request_identity::IDENTITY_RETAINED_CONTRACT),
-        );
-    upload_progress
-        .accepted_identity_buckets
-        .set_account_source_enabled(
-            activity_hint
-                .session_request_account_source_contract
-                .as_deref()
-                == Some(crate::snapshots::ACCOUNT_SOURCE_CONTRACT),
-        );
     let state_v2_baseline = crate::snapshots::state_v2_baseline_release(&index_path, &index);
     // Resets the census-wait count on every exit that is not a capacity stop.
     let mut census_wait = ack_retention::CapacityStopCensusCount::begin(source);
@@ -1357,15 +1340,6 @@ pub(super) fn finish_sync_source(
         &claude_authority_disposition.mixed_uploads,
     );
     claude_authority_disposition.defer_sessions(deferred_accounts);
-    // Billing route annotation: after ownership is bound, before upload policy.
-    // Process memory only; off, nothing runs.
-    crate::snapshots::billing_route::annotate_session_billing_routes(
-        &upload_destination_namespace,
-        source,
-        machine_id,
-        &mut scan_result.snapshots,
-        activity_hint.session_billing_route_contract.as_deref(),
-    );
 
     // The Companion uses machine-local labels before upload policy clears them.
     let reconciliation_status = crate::agent_status_refresh::status_for_reconciliation(
@@ -1459,17 +1433,7 @@ pub(super) fn finish_sync_source(
             source.api_slug(),
         );
     }
-    scan_result.reconcile_codex_legacy_joining(
-        &mut index,
-        &committed_index,
-        machine_id,
-        |index, snapshots| {
-            index.bind_session_accounts(source, machine_id, snapshots, &current_codex_bindings);
-            // Checks a fingerprint an older release persisted, under that release's rules.
-            crate::upload_policy::apply_upload_policy_v1(source, snapshots, upload_policy);
-            apply_backfill_cutoff(snapshots, &backfill_state);
-        },
-    );
+
     backfill_succeeded &= scan_result.census_complete;
     let deferred_cache_head_identities = capture_deferred_cache_head_identities(
         source,
@@ -2212,39 +2176,10 @@ pub(super) fn finish_sync_source(
             );
         }
         Ok(ResumableUploadResult::Shed { retry_after }) => {
-            let first_shed = Instant::now();
             let retry_after = note_shed_and_backoff(source, retry_after);
             defer_source_uploads(source, retry_after);
-            let (checkpoint_succeeded, committable) =
-                match partial_checkpoint(UnsettledUploadCause::Shed, true)? {
-                    Some(committable) => (true, committable),
-                    None => (false, committed_index),
-                };
-            if retry.enabled()
-                && checkpoint_succeeded
-                && locally_held_fingerprints.is_empty()
-                && legacy_reconciliation_pending.is_empty()
-                && active_legacy_reconciliation.is_empty()
-            {
-                if let Some(live) = retry_authority {
-                    retry.capture_after_shed(
-                        live,
-                        _home,
-                        source,
-                        machine_id,
-                        upload_policy,
-                        account_witness,
-                        &scan_result.snapshots,
-                        &mut index,
-                        &committable,
-                        &upload_progress,
-                        &index_path,
-                        &upload_progress_path,
-                        first_shed,
-                        retry_after,
-                    );
-                }
-            }
+            let committable =
+                partial_checkpoint(UnsettledUploadCause::Shed, true)?.unwrap_or(committed_index);
             report_status_with_fresh_relay_token(
                 client,
                 device,

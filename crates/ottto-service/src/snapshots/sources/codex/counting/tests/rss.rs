@@ -206,91 +206,80 @@ fn grown_unretained_history_is_read_in_the_next_rss_round() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    for case in ["legacy", "v2"] {
-        // AT predates the frozen cutover: Legacy is a real history decision.
-        let _cutover = sources::codex::counting::version::TestCutover::set(if case == "v2" {
-            0
-        } else {
-            sources::codex::counting::version::CODEX_COUNTING_V2_CUTOVER_UNIX_MS
-        });
-        let fixture = Fixture(std::env::temp_dir().join(format!(
-            "ottto-rss-tail-regression-{}-{}-{case}",
+    let fixture = Fixture(std::env::temp_dir().join(format!(
+            "ottto-rss-tail-regression-{}-{}",
             std::process::id(),
             SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
         )));
-        let root = &fixture.0;
-        fs::create_dir_all(root.join("sessions")).unwrap();
-        let path = root.join("sessions/pending.jsonl");
-        let mut file = BufWriter::new(File::create(&path).unwrap());
-        let mut records = 0;
-        write_row(&mut file, &header(PENDING), &mut records);
-        let turns = 257;
-        for n in 1..=turns {
-            let turn = format!("closed-{n}");
-            for value in [
-                event("task_started", &turn),
-                ui(n, "fixture-model"),
-                event("task_complete", &turn),
-            ] {
-                write_row(&mut file, &value, &mut records);
-            }
+    let root = &fixture.0;
+    fs::create_dir_all(root.join("sessions")).unwrap();
+    let path = root.join("sessions/pending.jsonl");
+    let mut file = BufWriter::new(File::create(&path).unwrap());
+    let mut records = 0;
+    write_row(&mut file, &header(PENDING), &mut records);
+    let turns = 257;
+    for n in 1..=turns {
+        let turn = format!("closed-{n}");
+        for value in [
+            event("task_started", &turn),
+            ui(n, "fixture-model"),
+            event("task_complete", &turn),
+        ] {
+            write_row(&mut file, &value, &mut records);
         }
-        file.flush().unwrap();
-        drop(file);
-        let cache = Arc::new(sampled_scan::SharedCache::default());
-        let mut out = Money::new();
-        let mut observed = Observed::default();
-        sampled_scan::codex_cursor::with_test_limits(32 * 1024, 16 * 1024, 1024, || {
-            let index = acquire(
-                root,
-                ScanIndex::default(),
-                Some(&cache),
-                &mut out,
-                &mut observed,
-                NOW,
-            );
-            assert_eq!(
-                observed.max_priority_witnesses, 0,
-                "a new read records no witness"
-            );
-            assert!(cache.counters_for_test().jobs_paused > 0);
-            let cold = out.clone();
-            let mut tail = BufWriter::new(File::create(root.join("tail.jsonl")).unwrap());
-            write_row(&mut tail, &ui(turns + 1, "fixture-model"), &mut records);
-            tail.flush().unwrap();
-            drop(tail);
-            append_tail(root);
-            acquire(
-                root,
-                index,
-                Some(&cache),
-                &mut out,
-                &mut observed,
-                &next_census_time(NOW),
-            );
-            // No retained copy: the appended round must be a real full re-read.
-            assert!(observed.selection.scanned_files > 0);
-            assert!(observed.selection.full_files > 0);
-            assert_eq!(observed.selection.tail_files, 0);
-            assert!(
-                observed.selection.full_reasons
-                    [crate::transcript_acquisition::FullReason::StateMissing.slot()]
-                    > 0
-            );
-            assert!(out != cold, "the appended usage must affect money");
-            let mut full = Money::new();
-            acquire(
-                root,
-                ScanIndex::default(),
-                None,
-                &mut full,
-                &mut Observed::default(),
-                NOW,
-            );
-            assert_eq!(
-                out, full,
-                "{case} appended money must match an unpaged full read"
-            );
-        });
     }
+    file.flush().unwrap();
+    drop(file);
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let mut out = Money::new();
+    let mut observed = Observed::default();
+    sampled_scan::codex_cursor::with_test_limits(32 * 1024, 16 * 1024, 1024, || {
+        let index = acquire(
+            root,
+            ScanIndex::default(),
+            Some(&cache),
+            &mut out,
+            &mut observed,
+            NOW,
+        );
+        assert_eq!(
+            observed.max_priority_witnesses, 0,
+            "a new read records no witness"
+        );
+        assert!(cache.counters_for_test().jobs_paused > 0);
+        let cold = out.clone();
+        let mut tail = BufWriter::new(File::create(root.join("tail.jsonl")).unwrap());
+        write_row(&mut tail, &ui(turns + 1, "fixture-model"), &mut records);
+        tail.flush().unwrap();
+        drop(tail);
+        append_tail(root);
+        acquire(
+            root,
+            index,
+            Some(&cache),
+            &mut out,
+            &mut observed,
+            &next_census_time(NOW),
+        );
+        // No retained copy: the appended round must be a real full re-read.
+        assert!(observed.selection.scanned_files > 0);
+        assert!(observed.selection.full_files > 0);
+        assert_eq!(observed.selection.tail_files, 0);
+        assert!(
+            observed.selection.full_reasons
+                [crate::transcript_acquisition::FullReason::StateMissing.slot()]
+                > 0
+        );
+        assert!(out != cold, "the appended usage must affect money");
+        let mut full = Money::new();
+        acquire(
+            root,
+            ScanIndex::default(),
+            None,
+            &mut full,
+            &mut Observed::default(),
+            NOW,
+        );
+        assert_eq!(out, full, "appended money must match an unpaged full read");
+    });
 }

@@ -277,6 +277,7 @@ pub fn apply_upload_policy(
 
 /// The rules of the releases before names were filtered. Only for checking a
 /// fingerprint such a release persisted; never on an upload path.
+#[cfg(test)]
 pub(crate) fn apply_upload_policy_v1(
     source: SnapshotSource,
     snapshots: &mut [SnapshotItem],
