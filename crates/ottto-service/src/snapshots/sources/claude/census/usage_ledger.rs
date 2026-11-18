@@ -1064,26 +1064,30 @@ pub(in crate::snapshots) fn rebuild_claude_reported_usage(
             item.source_started_at = Some(first_activity_at);
         }
     }
-    if let Some(last_activity_at) = reported_activity.last_activity_at {
-        if item
-            .source_last_activity_at
-            .as_ref()
-            .map_or(true, |current| {
-                timestamp_is_after(&last_activity_at, current)
-            })
-        {
-            item.source_last_activity_at = Some(last_activity_at.clone());
-        }
-        if item
-            .source_ended_at
-            .as_ref()
-            .is_some_and(|current| timestamp_is_after(&last_activity_at, current))
-        {
-            item.source_ended_at = Some(last_activity_at);
-        }
+    if let Some(last_activity_at) = reported_activity.last_activity_at.as_deref() {
+        widen_last_activity(item, last_activity_at);
     }
     item.cost = cost;
     true
+}
+
+/// Raises the item's last-activity clock to `last` when it is missing or
+/// earlier. A present end advances with it; a missing end stays missing.
+pub(in crate::snapshots) fn widen_last_activity(item: &mut SnapshotItem, last: &str) {
+    if item
+        .source_last_activity_at
+        .as_ref()
+        .map_or(true, |current| timestamp_is_after(last, current))
+    {
+        item.source_last_activity_at = Some(last.to_owned());
+    }
+    if item
+        .source_ended_at
+        .as_ref()
+        .is_some_and(|current| timestamp_is_after(last, current))
+    {
+        item.source_ended_at = Some(last.to_owned());
+    }
 }
 
 fn semantic_attribution_facts(item: &SnapshotItem) -> Vec<Value> {
