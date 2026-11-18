@@ -959,14 +959,25 @@ fn membership_only_aged_archive_stays_unqueued_after_restart() {
     let _lock = DECODER_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let c = Corpus::new();
-    let compressed = c.path(MAIN).with_extension("jsonl.zst");
-    let encoded = zstd::stream::encode_all(&rollout(MAIN, Some("a"))[..], 1).unwrap();
-    fs::write(&compressed, encoded).unwrap();
+    let (c, compressed, _) = legacy_age_corpus();
+    let key = local_index_key(&compressed);
+    let slots = named_creator_slots();
+    let (mut cold_index, mut cold, _, _, _) = page_observed_with_limit(
+        &c.roots(),
+        ScanIndex::default(),
+        Arc::default(),
+        100,
+        &slots,
+        |_| {},
+    );
+    assert_eq!(cold.snapshots.len(), 4);
+    cold.snapshots.retain(|item| item.source_session_id != MAIN);
+    assert_eq!(cold.snapshots.len(), 3);
+    cold_index.files.remove(&key);
+    let expected = emitted(&cold_index, &cold);
     aged_mtime(&compressed);
 
     let (session, prior) = c.publish();
-    let key = local_index_key(&compressed);
     state_v2::seed_0217_archive_for_test(&prior, &key);
     drop(prior);
     let prior = ScanIndex::load(session.path()).unwrap();
@@ -984,8 +995,8 @@ fn membership_only_aged_archive_stays_unqueued_after_restart() {
     state_v2::assert_0217_archive_rows_for_test(&prior, &key, true);
 
     let scan_excluded = |index| {
-        let (working, scan, delivery, consumed, logs) =
-            page_observed(&c, index, Arc::default(), |step| {
+        let (working, scan, _, _, logs) =
+            page_observed_with_limit(&c.roots(), index, Arc::default(), 100, &slots, |step| {
                 assert!(
                     !e2_pipeline_scan_fixture::pending_keys_for_test(&step.index).contains(&key)
                 );
@@ -993,15 +1004,17 @@ fn membership_only_aged_archive_stays_unqueued_after_restart() {
             });
         assert!(!e2_pipeline_scan_fixture::pending_keys_for_test(&working).contains(&key));
         assert!(!working.files.contains_key(&key));
-        assert!(delivery.0.lock().unwrap().is_empty());
-        assert_eq!(consumed, 0);
+        assert!(state_v2::load_head(&working, &key, u32::MAX)
+            .unwrap()
+            .is_none());
         assert_eq!(full_decodes(&logs), 0);
-        assert!(scan.snapshots.is_empty());
-        assert!(emitted(&working, &scan).batches.is_empty());
-        working
+        let actual = emitted(&working, &scan);
+        assert!(!actual.snapshots.contains_key(MAIN));
+        (working, actual)
     };
 
-    let mut working = scan_excluded(prior);
+    let (mut working, actual) = scan_excluded(prior);
+    money_oracle::assert_equivalent(&expected, &actual);
     let saved = session.save_reload(&mut working);
     state_v2::assert_0217_archive_rows_for_test(&saved, &key, false);
     drop((working, saved));
