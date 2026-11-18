@@ -1269,6 +1269,21 @@ fn entity_rows(route: &transition::RouteResult, session: &str) -> transition::Ro
     rows
 }
 
+/// `server`'s placed bodies for comparison with another home's server. Each
+/// home reads its own copy of a transcript, so the file's physical identity
+/// (`source_file_fingerprint`) differs by construction; every other field,
+/// money and identity included, is compared exactly.
+fn placed_bodies(server: &OracleServer) -> BTreeMap<String, Value> {
+    let mut placed = server.placement.lock().unwrap().clone();
+    for fingerprint in placed
+        .values_mut()
+        .filter_map(|body| body.get_mut("source_file_fingerprint"))
+    {
+        *fingerprint = json!("physical-identity:excluded");
+    }
+    placed
+}
+
 /// The index key of `path`: the scan index keys a local file by its path.
 fn index_key(path: &Path) -> String {
     path.to_string_lossy().into_owned()
@@ -1597,10 +1612,7 @@ fn c12_head_unstored_answers_hold_until_growth_earns_its_own_ack() {
         &entity_rows(&cold_route, &e_session),
         false,
     );
-    assert_eq!(
-        *server.placement.lock().unwrap(),
-        *cold_server.placement.lock().unwrap()
-    );
+    assert_eq!(placed_bodies(&server), placed_bodies(&cold_server));
     assert_eq!(grown_route.accepted, cold_route.accepted);
     assert_eq!(
         grown_route.accepted_identity_buckets,
@@ -1722,10 +1734,7 @@ fn c13_identity_control_through_usage_identical_then_growth() {
         &entity_rows(&cold_route, &session),
         false,
     );
-    assert_eq!(
-        *server.placement.lock().unwrap(),
-        *cold_server.placement.lock().unwrap()
-    );
+    assert_eq!(placed_bodies(&server), placed_bodies(&cold_server));
     assert_eq!(
         accounts_and_tags(&grown.finalized),
         accounts_and_tags(
@@ -1849,9 +1858,8 @@ fn emitted_route(
         cycle.batches.clone(),
         &cycle.finalized,
     );
-    let placed = server.placement.lock().unwrap();
     let mut buckets = serde_json::Map::new();
-    for body in placed.values() {
+    for body in placed_bodies(server).values() {
         let entity = body["source_session_id"].as_str().unwrap().to_owned();
         route.accepted.insert(
             entity.clone(),
