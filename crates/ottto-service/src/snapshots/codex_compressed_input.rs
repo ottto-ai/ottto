@@ -1744,7 +1744,9 @@ pub(in crate::snapshots) mod tests {
             assert!(decoded.decode_holds.is_empty());
             assert!(decoded.accepted_snapshot_fingerprints.is_empty());
             assert_eq!(serde_json::to_value(&decoded).unwrap(), before);
-            decoded.save(&checkpoint.0).unwrap();
+            decoded
+                .save_fixture_for_source(&checkpoint.0, SnapshotSource::Codex)
+                .unwrap();
             let restored = ScanIndex::load(&checkpoint.0).unwrap();
             assert!(restored.decode_holds.is_empty());
             assert!(restored.files.is_empty());

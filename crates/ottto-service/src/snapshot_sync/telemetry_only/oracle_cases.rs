@@ -85,8 +85,12 @@ pub(super) fn scope_hold() {
     let mut raw = value(ScanIndex::default()).unwrap();
     raw["claude_usage_family_witnesses"] = json!({ROOT:{"members":[false],"opaque":"future"}});
     let path = c.base.join("held-index.json");
-    fs::write(&path, encode(&raw).unwrap()).unwrap();
-    indices.push(ScanIndex::load(&path).unwrap());
+    indices.push(
+        crate::snapshots::e2_pipeline_scan_fixture::seed_json_for_test(
+            &path,
+            &encode(&raw).unwrap(),
+        ),
+    );
     for index in indices {
         let (absent, backed) = crate::snapshots::claude_request_money::e2::telemetry_scope(
             &index,
@@ -96,14 +100,9 @@ pub(super) fn scope_hold() {
         let mut next = restore(&p);
         let mut scan = empty_scan(&c);
         let reads = otel::evidence_read_counts_for_test();
-        next.seed_telemetry(
-            &c.support,
-            &hint(),
-            &mut scan,
-            &index,
-            &c.base.join("held-progress.json"),
-        )
-        .unwrap();
+        let progress_path = notice_progress_path(&c, &mut next);
+        next.seed_telemetry(&c.support, &hint(), &mut scan, &index, &progress_path)
+            .unwrap();
         assert!(scan.snapshots.is_empty());
         assert_eq!(reads, otel::evidence_read_counts_for_test());
         held(&accepted, &next);
