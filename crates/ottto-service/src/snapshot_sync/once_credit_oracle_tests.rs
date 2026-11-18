@@ -1509,7 +1509,10 @@ fn c12_head_unstored_answers_hold_until_growth_earns_its_own_ack() {
         true,
     );
 
-    // A durable restore (cold close, reload) keeps both holds exactly.
+    // A durable restore (cold close, reload) keeps both holds exactly. No
+    // earlier Cycle or index survives into the cold-close seam; what later
+    // checks need was taken above as owned values.
+    drop((first, answered, before, quiet));
     home.cold_restart();
     let restored = home.cycle(&server, &recording);
     assert_untouched(&restored);
