@@ -3,6 +3,10 @@ use super::*;
 
 pub(super) fn scan_index_storage_binding(path: &Path) -> Option<scan_index_persistence::Binding> {
     use scan_index_persistence::{Binding, Source};
+    #[cfg(test)]
+    if let Some(binding) = e2_pipeline_scan_fixture::fixture_binding(path) {
+        return Some(binding);
+    }
     let namespace = path.parent()?.file_name()?.to_str()?;
     if namespace.len() != 64 || !namespace.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;

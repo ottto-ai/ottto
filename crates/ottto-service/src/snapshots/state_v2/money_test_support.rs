@@ -209,12 +209,69 @@ pub(super) const CCR2_DEFINITE: &str = "Q0NSMgACAAAAEhWSo6RMxEDjJVe1q0p5xwAAAAAA
 /// Install synthetic custody through the publication route.
 /// All subsequent loads, saves and receipt replay use the real route.
 pub(crate) fn publish(index: &ScanIndex, path: &Path, progress: &[u8]) -> ScanIndex {
+    publish_retaining_progress(index, path, progress, &FixtureProgress::default())
+}
+
+/// Exact native progress custody for an index-only fixture mutation, including
+/// identity barriers and rows a normal progress page leaves out of RAM.
+#[derive(Default, PartialEq, Eq)]
+pub(crate) struct FixtureProgress(Vec<(Header, Vec<u8>)>);
+impl FixtureProgress {
+    pub(crate) fn capture(path: &Path) -> Self {
+        if !runtime::published(path).unwrap() {
+            return Self::default();
+        }
+        let index = ScanIndex::load(path).unwrap();
+        let mut saved = Self::default();
+        crate::snapshot_sync::with_state_v2_progress_lock(path, |_| {
+            runtime::with_session_db(&index, |db| {
+                let mut tx = db.begin(TxnMode::Read).unwrap();
+                for kind in catalogue::PROGRESS_KINDS {
+                    let mut rows = mapper::KeyRows::new(kind, None, 128).unwrap();
+                    while let Some(header) = rows.next(&mut tx).unwrap() {
+                        let mut bytes = Vec::new();
+                        tx.read_value(&header, &mut bytes).unwrap();
+                        saved.0.push((header, bytes));
+                    }
+                }
+                for name in [progress::GENERATION, progress::IMPORT] {
+                    if let Some(header) = tx.get(&RowKey::Meta(name.into())).unwrap() {
+                        let mut bytes = Vec::new();
+                        tx.read_value(&header, &mut bytes).unwrap();
+                        saved.0.push((header, bytes));
+                    }
+                }
+            });
+            Ok(())
+        })
+        .unwrap();
+        saved
+    }
+}
+
+pub(crate) fn publish_retaining_progress(
+    index: &ScanIndex,
+    path: &Path,
+    progress: &[u8],
+    retained: &FixtureProgress,
+) -> ScanIndex {
+    publish_fixture_at_generation(index, path, progress, retained, index.generation + 1)
+}
+
+/// Fresh quarantine fixtures keep the production rebuild's generation zero.
+pub(crate) fn publish_fixture_at_generation(
+    index: &ScanIndex,
+    path: &Path,
+    progress: &[u8],
+    retained: &FixtureProgress,
+    generation: u64,
+) -> ScanIndex {
     let binding = super::super::scan_index_integration::scan_index_storage_binding(path).unwrap();
     let identity = Identity {
         format: FORMAT,
         db_id: "synthetic-partial-checkpoint".into(),
         binding: binding.clone(),
-        fence_generation: index.generation + 1,
+        fence_generation: generation,
     };
     let mut db = sqlite::Sqlite::create_import(&fence::sibling(path, ".v2.sqlite.import")).unwrap();
     db.control("identity", &identity).unwrap();
@@ -223,6 +280,15 @@ pub(crate) fn publish(index: &ScanIndex, path: &Path, progress: &[u8]) -> ScanIn
     cx.binding = Some(binding);
     let mut tx = db.begin(TxnMode::Write).unwrap();
     kinds::populate(index, &mut tx, &mut cx).unwrap();
+    for (header, bytes) in &retained.0 {
+        tx.put(RowInput {
+            key: &header.key,
+            fixed: &header.fixed,
+            value_version: header.value_version,
+            value: bytes,
+        })
+        .unwrap();
+    }
     assert_eq!(
         tx.commit(index.generation, identity.fence_generation),
         DurableCommitOutcome::Committed(identity.fence_generation)
@@ -252,3 +318,56 @@ pub(crate) fn publish(index: &ScanIndex, path: &Path, progress: &[u8]) -> ScanIn
 }
 
 pub(in super::super) use runtime::erase_published;
+
+/// Inject a synthetic persisted record fault before the next real hydrate.
+pub(crate) fn edit_record_for_test(
+    index: &ScanIndex,
+    kind: &str,
+    name: &str,
+    edit: impl FnOnce(&mut serde_json::Value),
+) {
+    runtime::with_session_db(index, |db| {
+        let generation = db.read_control::<u64>("generation").unwrap().unwrap();
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        let key = mapper::key(kind, name, 1).unwrap();
+        let mut value = match tx.get(&key).unwrap() {
+            Some(header) => {
+                let bytes = mapper::bytes(&mut tx, &header).unwrap();
+                codec::decode::<serde_json::Value>(&bytes, value_cap(&key)).unwrap()
+            }
+            None => {
+                let manifest = mapper::key(kind, "", 0).unwrap();
+                let header = tx.get(&manifest).unwrap().expect("fixture kind manifest");
+                let bytes = mapper::bytes(&mut tx, &header).unwrap();
+                let count = codec::decode::<usize>(&bytes, value_cap(&manifest)).unwrap();
+                mapper::put(&mut tx, &manifest, &(count + 1)).unwrap();
+                serde_json::Value::Null
+            }
+        };
+        edit(&mut value);
+        mapper::put(&mut tx, &key, &value).unwrap();
+        assert_eq!(
+            tx.commit(generation, generation + 1),
+            DurableCommitOutcome::Committed(generation + 1)
+        );
+    });
+}
+
+/// Model a progress header exhausted by earlier commits, without JSON import.
+pub(crate) fn exhaust_progress_generation_for_test(index: &ScanIndex) {
+    runtime::with_session_db(index, |db| {
+        let generation = db.read_control::<u64>("generation").unwrap().unwrap();
+        let mut tx = db.begin(TxnMode::Write).unwrap();
+        tx.put(RowInput {
+            key: &RowKey::Meta(progress::GENERATION.into()),
+            fixed: &Fixed::None,
+            value_version: 1,
+            value: &serde_json::to_vec(&u64::MAX).unwrap(),
+        })
+        .unwrap();
+        assert_eq!(
+            tx.commit(generation, generation + 1),
+            DurableCommitOutcome::Committed(generation + 1)
+        );
+    });
+}

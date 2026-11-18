@@ -250,11 +250,17 @@ fn refusal_is_visible_before_the_first_legacy_source_row_exists() {
     std::fs::remove_dir_all(scratch).unwrap();
 }
 
+/// Shard damage is visible only on an old-release input before its first
+/// admission: an imported native route never reads the legacy shards again.
+/// A healthy control import first clears the source's health state.
 #[test]
 fn unavailable_shards_project_source_health_alarm_once_and_clear_after_restoration() {
     use std::os::unix::fs::PermissionsExt;
-    for map in 0..3 {
-        let scratch = crate::test_scratch::private_dir("shard-unavailable-health");
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../tests/fixtures/scan_index/real-shaped-v1.json"
+    ))
+    .unwrap();
+    let seed = |scratch: &std::path::Path| {
         let namespace = scratch.join("a".repeat(64));
         std::fs::create_dir(&namespace).unwrap();
         std::fs::set_permissions(&namespace, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -262,10 +268,6 @@ fn unavailable_shards_project_source_health_alarm_once_and_clear_after_restorati
         let shards = namespace.join("claude_code-scan-index-v3.json.shards");
         std::fs::create_dir(&shards).unwrap();
         std::fs::set_permissions(&shards, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../tests/fixtures/scan_index/real-shaped-v1.json"
-        ))
-        .unwrap();
         for (name, text) in fixture["payloads"].as_object().unwrap() {
             let path = shards.join(name);
             std::fs::write(&path, text.as_str().unwrap()).unwrap();
@@ -273,9 +275,24 @@ fn unavailable_shards_project_source_health_alarm_once_and_clear_after_restorati
         }
         std::fs::write(&root, fixture["root"].as_str().unwrap()).unwrap();
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o600)).unwrap();
+        (root, shards)
+    };
+    for map in 0..3 {
         let source = SnapshotSource::ClaudeCode;
+        let control = crate::test_scratch::private_dir("shard-unavailable-health-control");
+        let (control_root, _) = seed(&control);
+        let healthy =
+            ScanIndex::load_for_snapshot_source_with_origin(&control_root, source, &control)
+                .unwrap()
+                .0;
+        assert!(healthy.persistence_available());
+        let fence: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&control_root).unwrap()).unwrap();
+        assert_eq!(fence["schema_version"], 4, "the control imported natively");
+        drop(healthy);
+        let scratch = crate::test_scratch::private_dir("shard-unavailable-health");
+        let (root, shards) = seed(&scratch);
         let load = || ScanIndex::load_for_snapshot_source_with_origin(&root, source, &scratch);
-        assert!(load().unwrap().0.persistence_available());
         let manifest: serde_json::Value =
             serde_json::from_str(fixture["root"].as_str().unwrap()).unwrap();
         let descriptor = &manifest["objects"][map + 1];
@@ -429,5 +446,6 @@ fn unavailable_shards_project_source_health_alarm_once_and_clear_after_restorati
         assert_eq!(events[events.len() - 1].payload["blocked_sources"], 0);
         assert_eq!(health::shard_transitions(source), before + 4);
         std::fs::remove_dir_all(scratch).unwrap();
+        std::fs::remove_dir_all(control).unwrap();
     }
 }

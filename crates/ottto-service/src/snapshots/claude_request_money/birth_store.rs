@@ -652,7 +652,7 @@ mod tests {
     }
     fn temp(name: &str) -> std::path::PathBuf {
         static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let p = std::env::temp_dir().join(format!(
+        let p = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "birth-store-{name}-{}-{}",
             std::process::id(),
             N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -937,15 +937,15 @@ mod tests {
         index
             .claude_money_birth_store
             .record_observation("session", a, 100);
-        index.save(&file).unwrap();
-        let mut loaded = ScanIndex::load(&file).unwrap();
+        index.save_fixture(&file).unwrap();
+        let mut loaded = crate::snapshots::e2_pipeline_scan_fixture::cold_restart(index);
         assert_eq!(
             loaded.claude_money_birth_store.observed_birth("session", a),
             Some(100)
         );
         loaded.files.remove(a);
-        loaded.save(&file).unwrap();
-        let mut loaded = ScanIndex::load(&file).unwrap();
+        loaded.save_fixture(&file).unwrap();
+        let mut loaded = crate::snapshots::e2_pipeline_scan_fixture::cold_restart(loaded);
         assert_eq!(
             loaded
                 .claude_money_birth_store
@@ -983,9 +983,10 @@ mod tests {
             held.claude_money_birth_store.effective_cutoff("session", b),
             Some(100)
         );
+        drop(subset);
         let mut held = held;
-        held.save(&file).unwrap();
-        let loaded = ScanIndex::load(&file).unwrap();
+        held.save_fixture(&file).unwrap();
+        let loaded = crate::snapshots::e2_pipeline_scan_fixture::cold_restart(held);
         assert_eq!(
             loaded.claude_money_birth_store.observed_birth("session", b),
             Some(200)

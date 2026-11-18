@@ -193,7 +193,7 @@ fn settle(page: &mut Page, progress: &mut SnapshotUploadProgress, index_path: &P
         &page.scan.snapshots,
         &progress.fresh_context_body_acks,
     );
-    page.index.save(index_path).unwrap();
+    page.index.save_fixture(index_path).unwrap();
     progress.finish_cycle(&path).unwrap();
 }
 
@@ -1137,7 +1137,7 @@ fn progress_rows_own_graph_saves_never_reload_the_next_page() {
                     first
                         .index
                         .record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
-                    first.index.save(path).unwrap();
+                    first.index.save_fixture(path).unwrap();
                     first.index
                 }
             };
@@ -1640,7 +1640,7 @@ fn progress_rows_codex_continuation_loads_the_route_rows() {
                 window_start_unix_seconds: now.saturating_sub(30 * 86_400),
             }),
         );
-        index.save(path).unwrap();
+        index.save_fixture(path).unwrap();
         progress.save(&progress_path(path)).unwrap();
         let rows_ledger = durable(&progress);
         drop((index, progress));

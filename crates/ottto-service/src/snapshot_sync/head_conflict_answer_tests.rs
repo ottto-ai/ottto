@@ -1399,7 +1399,7 @@ fn a_restart_mirrors_the_persisted_challenge_again() {
     );
     assert!(index.head_conflict_owed(&key));
     assert!(!index.head_conflict_owed(&baseless), "no base: re-folds");
-    index.save(&index_path).unwrap();
+    index.save_fixture(&index_path).unwrap();
 
     let namespace = crate::snapshot_sync::relogin_namespace(&"a".repeat(64), 2);
     let mut restarted = SnapshotUploadProgress::load(

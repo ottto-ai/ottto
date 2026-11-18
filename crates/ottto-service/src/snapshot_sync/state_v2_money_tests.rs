@@ -364,7 +364,7 @@ fn condition_b(class: &str) {
                 // `ram` carries the v2 store's generation; a v1 save creates
                 // a new file only from generation 0.
                 saved.generation = 0;
-                saved.save(&index_path).unwrap();
+                saved.save_fixture(&index_path).unwrap();
                 ScanIndex::load(&index_path).unwrap()
             };
             let [_, _, disk] = pages;

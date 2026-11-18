@@ -550,7 +550,7 @@ impl OracleHome {
         // the current CAS/root binding. Progress rows remain authoritative.
         previous.retain_persistence_baseline_from(&current);
         previous.generation = current.generation;
-        previous.save(&self.index_path()).unwrap();
+        previous.save_fixture(&self.index_path()).unwrap();
         crate::snapshots::e2_pipeline_scan_fixture::forget_continuations_for_test(
             &self.daemon.transcript_cache,
             &current,
@@ -560,7 +560,7 @@ impl OracleHome {
     fn age_listing(&self) {
         let mut index = ScanIndex::load(&self.index_path()).unwrap();
         crate::snapshots::e2_pipeline_scan_fixture::age_listing_for_test(&mut index);
-        index.save(&self.index_path()).unwrap();
+        index.save_fixture(&self.index_path()).unwrap();
     }
     fn cycle(&mut self, server: &OracleServer, recording: &Recording) -> Cycle {
         let schedule = self.schedule.map(|s| (s.limit, s.reverse));
@@ -1984,7 +1984,7 @@ fn c11_account_hold_bypasses_the_full_audit_cap_without_staging_a_marker() {
         NOW + crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS,
     );
     crate::snapshots::e2_pipeline_scan_fixture::age_listing_for_test(&mut index);
-    index.save(&home.index_path()).unwrap();
+    index.save_fixture(&home.index_path()).unwrap();
     let row = json!({"type":"assistant","sessionId":IDENTITY_PIPELINE_ROOT,
         "version":"2.1.309","timestamp":"2026-11-01T07:03:00Z","requestId":"held-growth",
         "message":{"id":"held-growth-message","model":"claude-haiku-4-5",

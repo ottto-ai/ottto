@@ -575,7 +575,7 @@ impl Uploader {
     ) -> Result<usize> {
         // Match the successful service finish: durable index first, then only
         // adopted/non-held ACK retirement, then the atomic progress finish.
-        index.save(&self.scratch.join("index.json"))?;
+        index.save_fixture(&self.scratch.join("index.json"))?;
         assert!(index.generation > 0, "the real save advances generation");
         let before = self.progress.accepted_body_witnesses.len();
         self.progress

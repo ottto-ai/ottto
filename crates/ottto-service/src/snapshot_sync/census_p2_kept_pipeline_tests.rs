@@ -69,13 +69,14 @@ pub(super) struct PipelinePage {
 }
 
 pub(super) struct PipelineFixture {
-    pub(super) cache: crate::snapshots::sampled_scan::SharedCache,
+    pub(super) cache: Arc<crate::snapshots::sampled_scan::SharedCache>,
     pub(super) base: PathBuf,
     pub(super) root: PathBuf,
     pub(super) support: PathBuf,
     pub(super) index_path: PathBuf,
     pub(super) page_files: usize,
     pub(super) durable_progress: bool,
+    listing_hour: std::cell::Cell<Option<i64>>,
 }
 
 fn request_owned_sessions(scan: &crate::snapshots::SourceScanResult) -> BTreeSet<String> {
@@ -103,20 +104,34 @@ impl PipelineFixture {
             )
             .expect("write synthetic Claude transcript");
         }
-        Self {
+        let fixture = Self {
             cache: Default::default(),
             index_path: base.join("claude-scan-index.json"),
             page_files: PIPELINE_PAGE_FILES,
             durable_progress: false,
+            listing_hour: std::cell::Cell::new(None),
             base,
             root,
             support,
-        }
+        };
+        ScanIndex::default()
+            .save_fixture(&fixture.index_path)
+            .unwrap();
+        fixture
     }
 
     /// Freeze the ordinary census before edits so settlement tests retain
     /// their mixed held/refused/accepted page independently of hint priority.
     fn queue_before_append(&self) {
+        let now = OffsetDateTime::parse("2026-08-02T09:00:00Z", &Rfc3339)
+            .unwrap()
+            .unix_timestamp() as u64;
+        crate::snapshots::sampled_scan::transition_fixture::with_scan_clock(now, || {
+            self.queue_before_append_at(now);
+        });
+    }
+
+    fn queue_before_append_at(&self, now: u64) {
         let mut index = ScanIndex::load(&self.index_path).unwrap();
         let pending = std::fs::read_dir(&self.root)
             .unwrap()
@@ -130,7 +145,10 @@ impl PipelineFixture {
             183,
             &pending,
         );
-        index.save(&self.index_path).unwrap();
+        // This queue was just created for the next visit, so page() must not
+        // age it as if it still belonged to the baseline's earlier visit.
+        self.listing_hour.set(Some((now / 3600) as i64));
+        index.save_fixture(&self.index_path).unwrap();
     }
 
     pub(super) fn append(&self, session: &str, request: &str) {
@@ -173,7 +191,7 @@ impl PipelineFixture {
             "workspace_identifier_hash": null
         });
         let mut index: ScanIndex = serde_json::from_value(saved).unwrap();
-        index.save(&self.index_path).unwrap();
+        index.save_fixture(&self.index_path).unwrap();
     }
 
     pub(super) fn key(index: &ScanIndex, session: &str) -> String {
@@ -204,9 +222,23 @@ impl PipelineFixture {
         before_classify: impl FnOnce(&mut ScanIndex),
         reoffers: bool,
     ) -> PipelinePage {
-        // Ordinary transcripts: each file exists before its records.
-        crate::snapshots::claude_request_money::e2::with_fixture_birth(PIPELINE_FILE_BIRTH, || {
-            self.page_with_reoffers_born(collected_at, cycle, upload, before_classify, reoffers)
+        let now = OffsetDateTime::parse(collected_at, &Rfc3339)
+            .unwrap()
+            .unix_timestamp() as u64;
+        crate::snapshots::sampled_scan::transition_fixture::with_scan_clock(now, || {
+            // Ordinary transcripts: each file exists before its records.
+            crate::snapshots::claude_request_money::e2::with_fixture_birth(
+                PIPELINE_FILE_BIRTH,
+                || {
+                    self.page_with_reoffers_born(
+                        collected_at,
+                        cycle,
+                        upload,
+                        before_classify,
+                        reoffers,
+                    )
+                },
+            )
         })
         .expect("in-process pipeline page")
     }
@@ -219,16 +251,30 @@ impl PipelineFixture {
         before_classify: impl FnOnce(&mut ScanIndex),
         reoffers: bool,
     ) -> Result<PipelinePage> {
-        let mut index = ScanIndex::load(&self.index_path).expect("load scan index");
+        let (mut index, _) = crate::snapshots::e2_pipeline_scan_fixture::load_source_for_test(
+            &self.index_path,
+            SnapshotSource::ClaudeCode,
+            &self.support,
+        )
+        .expect("load native scan index");
+        let hour = OffsetDateTime::parse(collected_at, &Rfc3339)
+            .unwrap()
+            .unix_timestamp()
+            / 3600;
+        if self.listing_hour.replace(Some(hour)) != Some(hour) {
+            crate::snapshots::e2_pipeline_scan_fixture::age_listing_for_test(&mut index);
+        }
         self.cache.bind_withheld(&mut index);
         // Production order (`finish_sync_source`): the upload ledger loads
         // under the context's quarantine witness, and one activation binds
         // the context to the index and the ledger before the scan. Contexts
         // are fingerprint-shaped on the wire and in the durable ledger.
         let upload_context = format!("{:x}", Sha256::digest(cycle.upload_context.as_bytes()));
-        let progress_path = self.base.join("upload-progress.json");
+        let progress_path = snapshot_upload_progress_path(&self.index_path);
         let mut progress = if self.durable_progress {
-            SnapshotUploadProgress::load(
+            SnapshotUploadProgress::load_for_index(
+                &index,
+                &self.index_path,
                 &progress_path,
                 &format!("{:064x}", 99),
                 crate::snapshots::snapshot_quarantine_witness_for_context(
@@ -238,7 +284,12 @@ impl PipelineFixture {
             )
             .expect("load durable synthetic upload progress")
         } else {
-            test_upload_progress()
+            route_fixture_progress(
+                &index,
+                &self.index_path,
+                &progress_path,
+                test_upload_progress(),
+            )
         };
         activate_source_upload_context(
             SnapshotSource::ClaudeCode,
@@ -246,6 +297,16 @@ impl PipelineFixture {
             &mut index,
             &mut progress,
         );
+        if prepare_upload_progress_for_cycle(
+            &mut progress,
+            &index,
+            cycle.replay_generation,
+            cycle.historical_replay,
+        ) {
+            progress
+                .save(&progress_path)
+                .expect("save native fixture quarantine preparation");
+        }
         if cycle.historical_replay {
             index.prepare_historical_replay(cycle.replay_generation.to_string());
         }
@@ -258,15 +319,18 @@ impl PipelineFixture {
         index.load_claude_reemission_exclusions(&self.support);
         crate::snapshots::claude_request_money::e2::apply_money_rules(&mut index);
         let committed_index = index.clone();
-        let mut scan = crate::snapshots::scan_source_roots_with_test_limit_and_claude_support(
-            std::slice::from_ref(&self.root),
-            &mut index,
-            collected_at,
-            183,
-            self.page_files,
-            &self.support,
-        )
-        .expect("scan bounded Claude page");
+        let native_pass = crate::snapshots::state_v2_baseline_release(&self.index_path, &index);
+        let mut scan =
+            crate::snapshots::e2_pipeline_scan_fixture::scan_native_full_pipeline_for_test(
+                std::slice::from_ref(&self.root),
+                &mut index,
+                collected_at,
+                183,
+                self.page_files,
+                &self.support,
+                Some(self.cache.clone()),
+            )
+            .expect("scan bounded Claude page");
         let parsed = scan
             .snapshots
             .iter()
@@ -377,6 +441,23 @@ impl PipelineFixture {
                 .expect("save pre-send cooldown");
         }
         let leased_reoffers = progress.active_reason_reoffers.clone();
+        eprintln!(
+            "native census page at={collected_at} parsed={parsed:?} offered={:?} held={} reoffers={} complete={} status={:?} unsettled={} authority_pending={} held_growth={:?}",
+            scan.snapshots
+                .iter()
+                .map(|item| item.source_session_id.as_str())
+                .collect::<BTreeSet<_>>(),
+            holds.held_fingerprints.len(),
+            leased_reoffers.len(),
+            scan.census_complete,
+            scan.census_status,
+            index.bounded_sweep_had_unsettled_upload(),
+            index.claude_usage_authority_pending_count(),
+            crate::snapshots::e2_pipeline_scan_fixture::growth_diagnostics_for_test(
+                &index,
+                &self.root.join(format!("{PIPELINE_HELD_SESSION}.jsonl")),
+            ),
+        );
         let mut uploaded = BTreeSet::new();
         let mut accepted = 0;
         let result = upload_resumable_batches_with_body_witness(
@@ -586,6 +667,17 @@ impl PipelineFixture {
             &window_end,
         )
         .expect("save index and publish manifest");
+        // Keep the page's upload observation for its assertions. The durable
+        // ledger follows the real post-save ACK retirement and cycle finish.
+        let observed_progress = progress.clone();
+        progress.retire_acks_after_index_save(&index, &BTreeSet::new(), &holds.held_fingerprints);
+        progress
+            .finish_cycle(&progress_path)
+            .expect("finish native fixture progress");
+        native_pass
+            .commit_tail()
+            .expect("commit native fixture Tail");
+        drop(native_pass);
         Ok(PipelinePage {
             parsed,
             scan,
@@ -597,7 +689,7 @@ impl PipelineFixture {
             progress_blocking: holds.progress_blocking,
             uploaded,
             result,
-            progress,
+            progress: observed_progress,
         })
     }
 
@@ -622,6 +714,28 @@ impl PipelineFixture {
             }
         }
         pages
+    }
+
+    /// Diagnose the native queue when a fixed-page completion predicate fails.
+    /// The original page remains the assertion's subject, even if later work
+    /// or expiry of the six-hour growth claim permits completion.
+    fn trace_completion_followup(&self, cycle: &PipelineCycle<'_>) {
+        for (hour, first_minute) in [(9, 2), (15, 0)] {
+            for minute in first_minute..=7 {
+                let at = format!("2026-08-02T{hour:02}:{minute:02}:00Z");
+                let page = self.page(&at, cycle, PipelineUpload::Accept);
+                eprintln!(
+                    "native census followup at={at} complete={} status={:?} uploaded={} held={}",
+                    page.scan.census_complete,
+                    page.scan.census_status,
+                    page.uploaded.len(),
+                    page.held.len(),
+                );
+                if page.scan.census_complete {
+                    return;
+                }
+            }
+        }
     }
 
     /// The baseline: every session committed and accepted, one owner proven.
@@ -659,7 +773,9 @@ impl PipelineFixture {
             .source_file_fingerprint
             .clone();
         index.insert_unproven_terminal_claude_authority_for_test(session, &revision);
-        index.save(&self.index_path).expect("save scan index");
+        index
+            .save_fixture(&self.index_path)
+            .expect("save scan index");
         let index = ScanIndex::load(&self.index_path).expect("reload scan index");
         assert_eq!(
             index.bound_terminal_claude_authority_revision_for_test(session),
@@ -894,7 +1010,14 @@ fn assert_real_rejected_hold(
 
     // A durable index reload has already occurred in page(). The next page
     // also reloads the actual upload ledger, keeping the exact refusal visible.
-    let last = fixture.page("2026-08-02T09:01:00Z", cycle, PipelineUpload::Accept);
+    // Native page-end reconciliation (scan/owned_scan/step.rs) re-queues the
+    // held, grown file (sampled_audit.rs queue_growth_path) at 09:01, so the
+    // census completes at 09:02; no upload, ACK, refusal or hold changes.
+    fixture.page("2026-08-02T09:01:00Z", cycle, PipelineUpload::Accept);
+    let last = fixture.page("2026-08-02T09:02:00Z", cycle, PipelineUpload::Accept);
+    if !last.scan.census_complete {
+        fixture.trace_completion_followup(cycle);
+    }
     assert!(last.scan.census_complete);
     assert_eq!(last.scan.census_window_end, first.scan.census_window_end);
     assert!(last.held.is_empty());
@@ -1108,7 +1231,14 @@ fn due_reoffer_rejected_page_preserves_terminal_and_retry_pending_holds() {
             first.index.files[&held_key].last_snapshot_fingerprint,
             baseline.files[&held_key].last_snapshot_fingerprint
         );
-        let last = fixture.page("2026-08-02T09:01:00Z", &cycle, PipelineUpload::Accept);
+        // Native page-end reconciliation (scan/owned_scan/step.rs) re-queues
+        // the held, grown file (sampled_audit.rs queue_growth_path) at 09:01,
+        // so completion is read at 09:02; no upload, ACK or hold changes.
+        fixture.page("2026-08-02T09:01:00Z", &cycle, PipelineUpload::Accept);
+        let last = fixture.page("2026-08-02T09:02:00Z", &cycle, PipelineUpload::Accept);
+        if last.scan.census_complete == retry_pending {
+            fixture.trace_completion_followup(&cycle);
+        }
         assert_eq!(last.scan.census_complete, !retry_pending);
         assert_eq!(last.backfill_succeeded, !retry_pending);
         assert_eq!(last.scan.census_window_end, first.scan.census_window_end);
@@ -1335,14 +1465,15 @@ fn upgrade_with_owed_bits_reads_zero_transcript_bytes() {
     }
     // The restart loads the older release's store itself, pending rows and
     // owed bits included.
-    std::fs::write(&fixture.index_path, serde_json::to_vec(&legacy).unwrap())
-        .expect("persist the older release's index");
+    crate::snapshots::e2_pipeline_scan_fixture::legacy_input_for_test(
+        &fixture.index_path,
+        &serde_json::to_vec(&legacy).unwrap(),
+    );
     let upgraded = ScanIndex::load(&fixture.index_path).expect("the persisted index loads");
     assert_eq!(upgraded.files.len(), index.files.len());
     assert_quiet_restart_traversal(&mut fixture, "upgrade");
     let saved: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&fixture.index_path).expect("read the saved index"))
-            .expect("decode the saved index");
+        serde_json::to_value(ScanIndex::load(&fixture.index_path).unwrap()).unwrap();
     for field in RETIRED {
         assert!(
             matches!(saved.get(field), None | Some(serde_json::Value::Null)),
@@ -1407,14 +1538,16 @@ fn grown_listed_family(
     if witnessed {
         fixture.seed_terminal_authority(PIPELINE_HELD_SESSION);
         let mut value: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&fixture.index_path).unwrap()).unwrap();
+            serde_json::to_value(ScanIndex::load(&fixture.index_path).unwrap()).unwrap();
         assert!(value["claude_usage_authority_quarantine"]
             .as_object_mut()
             .expect("authority records")
             .remove(PIPELINE_HELD_SESSION)
             .is_some());
-        std::fs::write(&fixture.index_path, serde_json::to_vec(&value).unwrap())
-            .expect("keep the witness without its record");
+        crate::snapshots::e2_pipeline_scan_fixture::seed_json_for_test(
+            &fixture.index_path,
+            &serde_json::to_vec(&value).unwrap(),
+        );
     }
     let seeded = ScanIndex::load(&fixture.index_path).expect("load the seeded index");
     assert_eq!(

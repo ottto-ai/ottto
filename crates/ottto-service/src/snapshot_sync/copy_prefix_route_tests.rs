@@ -315,10 +315,12 @@ fn copy_prefix_routes(arm: Settled) {
                 "{arm:?} page {request}: the {owner} prior owes the holder again"
             );
         }
-        // The committed prior as an older release's store holds it, loaded
-        // by this build.
-        let upgraded =
-            upgrade_from_legacy_store(&priors[2], &c.base.join("legacy-scan-index.json"));
+        // The committed prior as an older release's store holds it, imported
+        // by this build; each page's store is its own scratch path.
+        let upgraded = upgrade_from_legacy_store(
+            &priors[2],
+            &c.base.join(format!("legacy-scan-index-{request}.json")),
+        );
         let restart = disk.owner(SnapshotSource::ClaudeCode);
         let mut pages = claude_pages(&c, &scanner, &restart, priors, (0, 1, 0));
         finish_claude_pages(&c, &mut pages);
@@ -1263,7 +1265,7 @@ fn refused_holder_mark_survives_progress_only_crash() {
             "2026-08-02T07:03:00Z",
         );
         let index_path = c.base.join("scan-index.json");
-        ScanIndex::default().save(&index_path).unwrap();
+        ScanIndex::default().save_fixture(&index_path).unwrap();
         let mut ledger = Ledger::new();
         let progress_path = c.base.join("progress.json");
         {

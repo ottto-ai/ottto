@@ -292,7 +292,7 @@ impl Disk {
         index: &mut ScanIndex,
     ) -> ScanIndex {
         let path = self.path(source);
-        index.save(path).unwrap();
+        index.save_fixture(path).unwrap();
         crate::snapshots::after_source_save(cache, &self.dir, source, index, path);
         ScanIndex::load(path).unwrap()
     }

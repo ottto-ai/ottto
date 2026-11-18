@@ -79,8 +79,7 @@ fn pre_e2_terminal_retries_once_and_matches_cold_full() {
     assert_eq!(record.disposition, UnprovenTerminal);
     assert!(record.retry_after_unix_seconds > PRE_E2_TERMINAL_DEADLINE_CUTOFF);
     let saved = scratch.join("scan-index.json");
-    failed_idx.save(&saved).unwrap();
-    let failed_idx = ScanIndex::load(&saved).unwrap();
+    let failed_idx = e2_pipeline_scan_fixture::save_reload_for_test(&mut failed_idx, &saved);
     assert_eq!(
         failed_idx.candidate_decision(candidate),
         CandidateDecision::Skip
