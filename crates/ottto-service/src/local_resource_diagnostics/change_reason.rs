@@ -28,6 +28,37 @@ pub(crate) enum Token {
     OperatorRepair,
     Unattributed,
 }
+/// Which selection cause put a file under `admin_other`; read only with that
+/// token. A fingerprint move is `FingerprintObject` when the opened-object
+/// ctime witness differs from the entry's stored one (the object identity
+/// moved, perhaps with a sidecar too); else `FingerprintUnattributed`: the
+/// entry keeps no per-input digest, so a Desktop store, OTLP sidecar,
+/// launcher context, inode or sampled-byte move cannot be told apart.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum AdminCause {
+    FingerprintObject,
+    FingerprintUnattributed,
+    /// A non-money body-witness revision adoption.
+    Adoption,
+    /// A cleared entry fingerprint.
+    Rearm,
+    /// An account memo-miss.
+    Memo,
+    /// A new file after a fresh index without prior-history evidence.
+    NewFileFreshIndex,
+    #[default]
+    Other,
+}
+const CAUSES: [&str; 7] = [
+    "fingerprint_object",
+    "fingerprint_unattributed",
+    "adoption",
+    "rearm",
+    "memo",
+    "new_file_fresh_index",
+    "other",
+];
+const CAUSE_FIELDS: [&str; 2] = ["files", "native_bytes"];
 const TOKENS: [&str; 13] = [
     "append",
     "finalizer_revision",
@@ -63,9 +94,13 @@ const PLACEMENT_U: usize = 5;
 const UPLOAD_BYTES: usize = 6;
 /// File grain, per reason.
 const READ_FIELDS: [&str; 3] = ["files", "native_bytes", "validation_bytes"];
-const SUB_COUNTS: [&str; 2] = [
+/// The refold pair counts fingerprint reads that continued from stored
+/// state (not Full); by design they read 0 native bytes.
+const SUB_COUNTS: [&str; 4] = [
     "source_reset_same_size_edit_files",
     "admin_other_sidecar_or_fingerprint_files",
+    "admin_other_fingerprint_refold_files",
+    "admin_other_fingerprint_refold_native_bytes",
 ];
 /// Disclosed U, never a hidden zero: money-only reveals are invisible to the
 /// daemon, and late external evidence stays in admin_other's
@@ -74,7 +109,8 @@ const UNKNOWN: [&str; 2] = ["money_only_reveal", "late_external_evidence"];
 const UPLOAD_START: usize = CHANGE_REASON_START;
 const READ_START: usize = UPLOAD_START + TOKENS.len() * FIELDS.len();
 const SUB_START: usize = READ_START + TOKENS.len() * READ_FIELDS.len();
-pub(super) const END: usize = SUB_START + SUB_COUNTS.len();
+const CAUSE_START: usize = SUB_START + SUB_COUNTS.len();
+pub(super) const END: usize = CAUSE_START + CAUSES.len() * CAUSE_FIELDS.len();
 
 /// Claude session bits from this page's identity tagging.
 const KNOWN: u8 = 1;
@@ -98,8 +134,9 @@ impl Upload {
     };
 }
 struct Tags {
-    /// Index key -> (source slot, first cause), selection to upload.
-    files: BTreeMap<String, (usize, Token)>,
+    /// Index key -> (source slot, first cause, `admin_other` cause),
+    /// selection to upload.
+    files: BTreeMap<String, (usize, Token, AdminCause)>,
     sessions: BTreeMap<String, u8>,
     /// Per source: the cause of a `NewFile`, decided at index load.
     new_file: [Token; 3],
@@ -185,20 +222,26 @@ pub(crate) fn upload_policy(source: &str, bits: u8) {
 pub(crate) fn privacy_off(source: &str) -> bool {
     source_slot(source).is_some_and(|slot| with_tags(|tags| tags.policy[slot] & POLICY_OFF != 0))
 }
+fn moved_fingerprint(cause: AdminCause) -> bool {
+    matches!(
+        cause,
+        AdminCause::FingerprintObject | AdminCause::FingerprintUnattributed
+    )
+}
 /// A file the scan is about to read, with its selection-time first cause.
-pub(crate) fn selected(source: &str, key: String, token: Token, sidecar_or_fingerprint: bool) {
+pub(crate) fn selected(source: &str, key: String, token: Token, cause: AdminCause) {
     let Some(slot) = source_slot(source) else {
         return;
     };
-    if sidecar_or_fingerprint {
+    if token == Token::AdminOther && moved_fingerprint(cause) {
         add(source, SUB_START + 1, 1);
     }
     with_tags(|tags| {
         // A Tail load refused on an owed head-CAS answer tags its read first;
         // the selection tag that follows keeps it.
-        let tag = tags.files.entry(key).or_insert((slot, token));
+        let tag = tags.files.entry(key).or_insert((slot, token, cause));
         if tag.1 != Token::HeadConflict {
-            *tag = (slot, token);
+            *tag = (slot, token, cause);
         }
     });
 }
@@ -219,14 +262,14 @@ pub(crate) fn read(
                 | FullReason::InvalidCheckpoint
         )
     );
-    let token = with_tags(|tags| match tags.files.get_mut(key) {
-        Some((_, token)) => {
+    let (token, cause) = with_tags(|tags| match tags.files.get_mut(key) {
+        Some((_, token, cause)) => {
             if reset && *token == Token::Append {
                 *token = Token::SourceReset;
             }
-            *token
+            (*token, *cause)
         }
-        None => Token::Unattributed,
+        None => (Token::Unattributed, AdminCause::Other),
     });
     if token == Token::SourceReset && mode == ReadMode::Full(FullReason::SameSizeEdit) {
         add(source, SUB_START, 1);
@@ -234,6 +277,15 @@ pub(crate) fn read(
     let row = READ_START + token as usize * READ_FIELDS.len();
     for (field, amount) in [1, native_bytes, validation_bytes].into_iter().enumerate() {
         add(source, row + field, amount);
+    }
+    if token == Token::AdminOther {
+        let row = CAUSE_START + cause as usize * CAUSE_FIELDS.len();
+        add(source, row, 1);
+        add(source, row + 1, native_bytes);
+        if moved_fingerprint(cause) && !matches!(mode, ReadMode::Full(_)) {
+            add(source, SUB_START + 2, 1);
+            add(source, SUB_START + 3, native_bytes);
+        }
     }
 }
 /// Claude identity tagging: `moved` is `None` without complete accepted state.
@@ -254,7 +306,7 @@ pub(crate) fn propagate(source: &str, index: &ScanIndex) {
     };
     with_tags(|tags| {
         let mut entities = BTreeMap::new();
-        tags.files.retain(|key, (owner, token)| {
+        tags.files.retain(|key, (owner, token, _)| {
             if *owner != slot {
                 return true;
             }
@@ -384,6 +436,9 @@ pub(crate) struct Page {
     read: BTreeMap<&'static str, BTreeMap<&'static str, u64>>,
     #[serde(flatten)]
     sub_counts: BTreeMap<&'static str, u64>,
+    /// `admin_other` reads per selection cause.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    admin_other_cause: BTreeMap<&'static str, BTreeMap<&'static str, u64>>,
     unknown: [&'static str; 2],
 }
 pub(crate) fn drain(source: &str) -> Option<Page> {
@@ -418,6 +473,12 @@ pub(crate) fn drain(source: &str) -> Option<Page> {
         }
     }
     page.sub_counts = cells(SUB_START, &SUB_COUNTS[..]);
+    for (cause, name) in CAUSES.into_iter().enumerate() {
+        let row = cells(CAUSE_START + cause * CAUSE_FIELDS.len(), &CAUSE_FIELDS[..]);
+        if !row.is_empty() {
+            page.admin_other_cause.insert(name, row);
+        }
+    }
     (!page.upload.is_empty() || !page.read.is_empty() || !page.sub_counts.is_empty())
         .then_some(page)
 }
@@ -430,7 +491,12 @@ mod tests {
     /// never set counts once under `unattributed`, with unknown placement.
     #[test]
     fn lost_tag_counts_unattributed_once() {
-        selected("pi", "synthetic-key".into(), Token::Append, false);
+        selected(
+            "pi",
+            "synthetic-key".into(),
+            Token::Append,
+            AdminCause::Other,
+        );
         with_tags(|tags| *tags = Tags::NEW);
         propagate("pi", &ScanIndex::default());
         attempted("pi", "synthetic-entity", None, None, 5);
@@ -457,7 +523,7 @@ mod tests {
             "codex",
             "synthetic-key".into(),
             Token::ParserRevision,
-            false,
+            AdminCause::Other,
         );
         let mut index = ScanIndex::default();
         index.file_snapshot_fingerprints.insert(
@@ -481,10 +547,15 @@ mod tests {
     /// same file; any other tag is replaced by the later selection.
     #[test]
     fn a_head_conflict_tag_survives_a_later_selection() {
-        selected("pi", "owed".into(), Token::HeadConflict, false);
-        selected("pi", "owed".into(), Token::CopyOwnership, false);
-        selected("pi", "other".into(), Token::Append, false);
-        selected("pi", "other".into(), Token::CopyOwnership, false);
+        selected("pi", "owed".into(), Token::HeadConflict, AdminCause::Other);
+        selected("pi", "owed".into(), Token::CopyOwnership, AdminCause::Other);
+        selected("pi", "other".into(), Token::Append, AdminCause::Other);
+        selected(
+            "pi",
+            "other".into(),
+            Token::CopyOwnership,
+            AdminCause::Other,
+        );
         read("pi", "owed", ReadMode::Tail, 3, 0);
         read("pi", "other", ReadMode::Tail, 5, 0);
         let page = serde_json::to_value(drain("pi").unwrap()).unwrap();
@@ -493,5 +564,51 @@ mod tests {
         assert_eq!(page["read"]["copy_ownership"]["files"], 1);
         assert_eq!(page["read"]["copy_ownership"]["native_bytes"], 5);
         assert!(page["read"].get("append").is_none());
+    }
+
+    /// [behaviour] Each `admin_other` read counts once under its selection
+    /// cause; a fingerprint read that continued from stored state also counts
+    /// as a refold with its native bytes, and a Full one does not.
+    #[test]
+    fn admin_other_reads_split_by_cause() {
+        use AdminCause as C;
+        let cases = [
+            (C::FingerprintObject, "fingerprint_object"),
+            (C::FingerprintUnattributed, "fingerprint_unattributed"),
+            (C::Adoption, "adoption"),
+            (C::Rearm, "rearm"),
+            (C::Memo, "memo"),
+            (C::NewFileFreshIndex, "new_file_fresh_index"),
+            (C::Other, "other"),
+        ];
+        for (n, (cause, name)) in (1u64..).zip(cases) {
+            selected("pi", "admin".into(), Token::AdminOther, cause);
+            read("pi", "admin", ReadMode::Tail, n, 2);
+            let page = serde_json::to_value(drain("pi").unwrap()).unwrap();
+            let split = page["admin_other_cause"].as_object().unwrap();
+            assert_eq!(split.len(), 1, "{name}");
+            assert_eq!(split[name]["files"], 1, "{name}");
+            assert_eq!(split[name]["native_bytes"], n, "{name}");
+            assert_eq!(page["read"]["admin_other"]["native_bytes"], n);
+            let moved = matches!(cause, C::FingerprintObject | C::FingerprintUnattributed);
+            let refold = &page["admin_other_fingerprint_refold_native_bytes"];
+            assert_eq!(refold.as_u64(), moved.then_some(n), "{name}");
+            assert_eq!(
+                page["admin_other_sidecar_or_fingerprint_files"].as_u64(),
+                moved.then_some(1),
+                "{name}"
+            );
+        }
+        selected("pi", "full".into(), Token::AdminOther, C::FingerprintObject);
+        selected("pi", "kept".into(), Token::CopyOwnership, C::Memo);
+        read("pi", "full", ReadMode::Full(FullReason::StateMissing), 9, 0);
+        read("pi", "kept", ReadMode::Tail, 4, 0);
+        let page = serde_json::to_value(drain("pi").unwrap()).unwrap();
+        assert_eq!(
+            page["admin_other_cause"]["fingerprint_object"]["native_bytes"],
+            9
+        );
+        assert_eq!(page["admin_other_cause"].as_object().unwrap().len(), 1);
+        assert!(page.get("admin_other_fingerprint_refold_files").is_none());
     }
 }

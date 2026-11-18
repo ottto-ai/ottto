@@ -1152,6 +1152,20 @@ gate, cap and upload nothing.
 - **Sub-counts:** `source_reset_same_size_edit_files` and
   `admin_other_sidecar_or_fingerprint_files`. `unknown` lists what the daemon
   cannot see: money-only reveals and late external evidence.
+- **`admin_other_cause`** (per file): the `admin_other` reads split by
+  selection cause, each with `files` and `native_bytes`; the rows sum to
+  `read.admin_other`. `fingerprint_object` is a moved fingerprint whose
+  opened-object ctime witness differs from the stored one (a sidecar may have
+  moved too). `fingerprint_unattributed` is any other moved fingerprint: the
+  index keeps no per-input digest, so a Desktop store, OTLP sidecar, launcher
+  context, inode or sampled-byte move cannot be told apart. `adoption` is a non-money
+  body-witness revision adoption, `rearm` a cleared entry fingerprint, `memo`
+  an account memo-miss, `new_file_fresh_index` a new file after a fresh index
+  without prior-history evidence, and `other` the rest.
+- **Refold:** `admin_other_fingerprint_refold_files` and
+  `admin_other_fingerprint_refold_native_bytes` count the moved-fingerprint
+  reads that continued from stored state (not Full). Such a re-fold should read
+  0 native bytes, so nonzero bytes mean it read the transcript.
 
 Upload counts land on the line after the source's next page line.
 

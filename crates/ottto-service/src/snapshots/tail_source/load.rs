@@ -319,7 +319,7 @@ fn load_with_bytes<S: TailSource>(
                 source.api_slug(),
                 key.to_owned(),
                 crate::local_resource_diagnostics::change_reason::Token::HeadConflict,
-                false,
+                crate::local_resource_diagnostics::change_reason::AdminCause::Other,
             );
             ("miss", None, Load::Cold(None))
         }
