@@ -1208,6 +1208,7 @@ impl SnapshotUploadProgress {
     }
 
     pub(super) fn quarantine_body(&mut self, fingerprint: &str, body_witness: &str) {
+        crate::snapshots::money_freshness::forget_usage_identical(fingerprint);
         let witness = self
             .active_quarantine_witness
             .clone()
@@ -1337,8 +1338,16 @@ impl SnapshotUploadProgress {
     /// store this body. Hold the exact body terminally, like a permanent
     /// refusal of the same body before that answer existed, but record no
     /// refusal: no usage was rejected. A changed body is a new fingerprint and
-    /// is offered again; a historical replay rearms it once.
-    pub(super) fn hold_unstored_body(&mut self, fingerprint: &str, body_witness: &str) {
+    /// is offered again; a historical replay rearms it once. A current-context
+    /// re-offer answered `dominated_by_head` keeps 6h/12h retry custody; one
+    /// answered `usage_identical` is terminal at once, and this process notes
+    /// the exact body for the freshness walk (`note_usage_identical`).
+    pub(super) fn hold_unstored_body(
+        &mut self,
+        fingerprint: &str,
+        body_witness: &str,
+        usage_identical: bool,
+    ) {
         if self
             .active_reason_reoffers
             .get(fingerprint)
@@ -1369,7 +1378,7 @@ impl SnapshotUploadProgress {
         if stale_owed {
             record.disposition = SnapshotQuarantineDisposition::RetryPending;
             record.contract_retry_claims = None;
-        } else if self.context_resend.is_candidate(fingerprint) {
+        } else if self.context_resend.is_candidate(fingerprint) && !usage_identical {
             // Current-context not_stored re-offers retain ordinary retry custody.
             // Exponential 6h/12h, capped by the existing 12h decoder bound.
             if record.disposition == SnapshotQuarantineDisposition::RetryPending {
@@ -1383,6 +1392,14 @@ impl SnapshotUploadProgress {
             record.failed_reconstruction_count = MAX_SNAPSHOT_RECONSTRUCTION_FAILURES;
             record.disposition = SnapshotQuarantineDisposition::UnprovenTerminal;
             record.retry_after_unix_seconds = 0;
+            if usage_identical && let Some(context) = &self.context_resend.active {
+                crate::snapshots::money_freshness::note_usage_identical(
+                    fingerprint,
+                    context,
+                    self.historical_replay_generation.as_deref(),
+                    body_witness,
+                );
+            }
         }
     }
 
