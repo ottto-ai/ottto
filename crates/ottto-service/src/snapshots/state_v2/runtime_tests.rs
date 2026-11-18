@@ -765,16 +765,50 @@ mod hydrate_parity {
             index.accepted_snapshot_fingerprint_ledger_version = version;
             let f = Fixture::new();
             publish(&f, &index);
-            let before = fs::read(&f.path).unwrap();
+            // The fence, the database (published import or its final name)
+            // and its WAL, plus the committed generation inside it.
+            let custody = || {
+                let read = |suffix: &str| fs::read(fence::sibling(&f.path, suffix)).ok();
+                let db = [".v2.sqlite", ".v2.sqlite.import"]
+                    .map(|suffix| fence::sibling(&f.path, suffix))
+                    .into_iter()
+                    .find(|path| path.exists())
+                    .unwrap();
+                (
+                    read(""),
+                    fs::read(&db).unwrap(),
+                    read(".v2.sqlite-wal"),
+                    sqlite::generation_for_test(&db),
+                )
+            };
+            let before = custody();
             for _ in 0..2 {
+                // Each refusal is a cold open: it must not commit even its phase.
                 let error = load_locked(&f.path, false, published(&f.path).unwrap()).unwrap_err();
                 assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::OlderLedger));
+                assert_eq!(custody(), before, "ledger {version}");
             }
             assert!(save_with(&f.path, &mut seed()).is_err());
-            assert_eq!(fs::read(&f.path).unwrap(), before);
+            assert_eq!(custody(), before, "ledger {version}");
             let error = load_locked(&f.path, false, published(&f.path).unwrap()).unwrap_err();
             assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::OlderLedger));
         }
+    }
+    /// [format] A hydrate clears a stale retired sweep cursor after its
+    /// baseline, so the next save writes the layout-1 row as null.
+    #[test]
+    fn hydrate_clears_a_stale_retired_cursor_and_the_next_save_writes_null() {
+        let mut index = seed();
+        index.legacy_settlement_reconcile_after_fingerprint = Some("a".repeat(64));
+        let f = Fixture::new();
+        publish(&f, &index);
+        let mut loaded = load_with(&f.path, false).unwrap().unwrap();
+        assert_eq!(loaded.legacy_settlement_reconcile_after_fingerprint, None);
+        save_with(&f.path, &mut loaded).unwrap();
+        with_session_db(&loaded, |db| {
+            let (stored, _) = import::hydrate_context(db).unwrap();
+            assert_eq!(stored.legacy_settlement_reconcile_after_fingerprint, None);
+        });
     }
     /// [format] every hydrate runs deadline drop and cutoff rules.
     #[test]

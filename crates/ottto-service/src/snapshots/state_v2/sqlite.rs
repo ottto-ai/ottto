@@ -740,6 +740,14 @@ impl Sqlite {
     /// settings changes, and SHM creation. The expected identity comes from the
     /// independently read fence, never from the candidate database.
     pub(super) fn open(path: &Path, identity: &super::Identity) -> Result<Self> {
+        Self::open_gated(path, identity, |_| Ok(()))
+    }
+    /// `open`, with `gate` reading the validated store before its first write.
+    pub(super) fn open_gated(
+        path: &Path,
+        identity: &super::Identity,
+        gate: impl FnOnce(&mut Self) -> Result<()>,
+    ) -> Result<Self> {
         ensure!(
             identity.format == FORMAT,
             "scan_index_representation_refused"
@@ -756,6 +764,7 @@ impl Sqlite {
         let (conn, file) = Self::open_locked(path, identity, None, false)?;
         super::telemetry::event("schema_layout", &"four_tables");
         let mut store = Self::fresh(conn, path, false, file, owner_lock);
+        gate(&mut store)?;
         use super::super::scan_index_persistence::Source;
         store.pager_counter = Some(match identity.binding.source {
             Source::Claude => Event::ClaudePagerBytes,
@@ -1230,6 +1239,16 @@ impl Value for StoredValue<'_> {
     fn write(&self, out: &mut dyn Write) -> Result<()> {
         read_value(self.conn, self.header, out)
     }
+}
+/// The committed generation, read without locks, WAL or any write.
+#[cfg(test)]
+pub(super) fn generation_for_test(path: &Path) -> u64 {
+    let uri = format!("file:{}?immutable=1", path.display());
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI;
+    let conn = Connection::open_with_flags(uri, flags).unwrap();
+    read_json(&conn, &RowKey::Meta("generation".into()))
+        .unwrap()
+        .unwrap()
 }
 impl Sqlite {
     #[cfg(test)]

@@ -24,10 +24,14 @@ type Row = (String, String, u64, Box<RawValue>);
 
 const HISTORY: &str = "tests/fixtures/state_v2/serialized-fields.json";
 /// Frozen releases: each one's rows and the catalogue layout it wrote.
-const RELEASES: [(&str, u32); 2] = [
+const RELEASES: [(&str, u32); 3] = [
     ("tests/fixtures/state_v2/release-0.1.216.json", 5),
     ("tests/fixtures/state_v2/release-0.1.218.json", 5),
+    (RELEASE_0_1_258, 8),
 ];
+/// The last release with legacy settlement reconciliation: its sample with
+/// accepted ledger 2 and a null retired sweep cursor, as it wrote them.
+const RELEASE_0_1_258: &str = "tests/fixtures/state_v2/release-0.1.258.json";
 /// Paths a later layout stores as another kind's rows; the frozen releases
 /// still load them inline.
 const MOVED: [(&str, &str); 1] = [("v1_field.upload_context_proof", "entity_stamps")];
@@ -840,6 +844,41 @@ fn previous_release_check(path: &str, layout: u32) {
     if let Err(e) = hydrate(&mut db, Scratch::binding()) {
         panic!("{path}: release refused: {e:#}");
     }
+}
+
+/// [regress] Rows the last release with legacy reconciliation wrote hydrate
+/// here, and a save keeps every row byte-identical, so that release still
+/// opens the store. Its retired sweep cursor row stays, null.
+#[test]
+fn last_reconciling_release_rows_survive_a_save_byte_identical() {
+    deep_stack(|| {
+        let release: Release = serde_json::from_str(&read_fixture(RELEASE_0_1_258)).unwrap();
+        let cursor = "v1_field.legacy_settlement_reconcile_after_fingerprint";
+        let rows = |release: &Release| -> Vec<(String, String, u64, String)> {
+            release
+                .rows
+                .iter()
+                .map(|(kind, name, position, value)| {
+                    (
+                        kind.clone(),
+                        name.clone(),
+                        *position,
+                        value.get().to_owned(),
+                    )
+                })
+                .collect()
+        };
+        let before = rows(&release);
+        assert!(before.iter().any(|row| row.0 == cursor && row.3 == "null"));
+        let (_scratch, mut db) = load(&release).unwrap();
+        let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
+        let (mut restored, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+        assert_eq!(restored.accepted_snapshot_fingerprint_ledger_version, 2);
+        assert_eq!(restored.legacy_settlement_reconcile_after_fingerprint, None);
+        let previous = restored.clone();
+        super::save_graph(&mut db, &identity, &previous, &mut restored, &mut cx).unwrap();
+        assert_eq!(rows(&dump(&mut db).unwrap()), before);
+    });
 }
 
 #[path = "proof_split_tests.rs"]

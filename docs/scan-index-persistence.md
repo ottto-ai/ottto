@@ -374,10 +374,10 @@ missing state or unrelated errors cannot clear an existing version refusal.
 
 An accepted ledger older than the current version (0 or 1, from a build that
 predates the version-2 ledger) is never migrated. Every JSON and native load and
-save refuses it, keeps its bytes, and records the support-directed
-`index_shard_unavailable` status instead; stderr names the older store once per
-source per process. Collection for that source stays paused until the local
-data is reset. The user Repair override cannot rebuild it either, because its
+save refuses it, keeps its bytes (a native open reads the versions before its
+first write), and records the support-directed `index_shard_unavailable` status
+instead; stderr names the older store once per source per process. Collection
+for that source stays paused until the local data is reset. The user Repair override cannot rebuild it either, because its
 identity carry refuses the same ledger.
 
 Each source transition emits one content-free log. The next daemon status emits

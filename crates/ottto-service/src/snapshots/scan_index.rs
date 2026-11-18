@@ -332,8 +332,9 @@ pub struct ScanIndex {
     #[serde(default)]
     pub(super) accepted_snapshot_fingerprint_ledger_version: u8,
     /// Retired legacy sweep cursor: always None, never set. JSON reads and
-    /// drops it. The native layout-1 row stays (written as null) because
-    /// older readers require it; remove it with the next layout change.
+    /// drops it; a native hydrate clears it after the baseline, so the next
+    /// save writes a stale value as null. The native layout-1 row stays
+    /// because older readers require it; remove it with the next layout change.
     #[serde(default)]
     pub(super) legacy_settlement_reconcile_after_fingerprint: Option<String>,
     /// Rejected entities are quarantined under the exact daemon/parser/wire

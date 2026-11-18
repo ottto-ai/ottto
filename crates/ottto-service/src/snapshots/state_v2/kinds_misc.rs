@@ -161,6 +161,19 @@ pub(super) fn read_control<T: serde::de::DeserializeOwned + Serialize>(
     Ok(value)
 }
 
+/// Reads the persisted schema and accepted-ledger versions, which the shared
+/// load gate checks.
+pub(super) fn read_version_controls(tx: &mut dyn Transaction, index: &mut ScanIndex) -> Result<()> {
+    index.schema_version = read_control("schema_version", tx)?;
+    index.accepted_snapshot_fingerprint_ledger_version = read_field(
+        "v1_field.accepted_snapshot_fingerprint_ledger_version",
+        tx,
+        None,
+        || ScanIndex::default().accepted_snapshot_fingerprint_ledger_version,
+    )?;
+    Ok(())
+}
+
 pub(super) fn merge_cas_at(
     tx: &mut dyn Transaction,
     working: &mut ScanIndex,
@@ -169,21 +182,14 @@ pub(super) fn merge_cas_at(
     use super::super::terminal_contract_retry;
     use serde::de::{DeserializeSeed, MapAccess, Visitor};
     let generation: u64 = read_control("generation", tx)?;
-    let schema: u16 = read_control("schema_version", tx)?;
+    let mut custody = ScanIndex::default();
+    read_version_controls(tx, &mut custody)?;
     ensure!(
-        generation == expected && schema == working.schema_version,
+        generation == expected && custody.schema_version == working.schema_version,
         "state_v2_concurrent_change"
     );
-    let mut custody = ScanIndex::default();
     read_holds(&mut custody, tx, None)?;
-    custody.schema_version = schema;
     custody.generation = generation;
-    custody.accepted_snapshot_fingerprint_ledger_version = read_field(
-        "v1_field.accepted_snapshot_fingerprint_ledger_version",
-        tx,
-        None,
-        || ScanIndex::default().accepted_snapshot_fingerprint_ledger_version,
-    )?;
     let raw_quarantines: BTreeSet<_> = custody
         .decode_holds
         .v2_entries()
