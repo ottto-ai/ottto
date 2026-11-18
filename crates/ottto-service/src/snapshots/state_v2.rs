@@ -17,6 +17,11 @@ pub(super) const INTEGRITY_REPAIR: &str = "state_v2_integrity_requires_explicit_
 mod fence;
 mod import;
 mod runtime;
+
+/// Rest-heap diagnostics: open store routes, or None while busy.
+pub(crate) fn route_entries() -> Option<usize> {
+    runtime::route_entries()
+}
 #[cfg(test)]
 pub(crate) use runtime::{
     before_progress_import_for_test, claim_growth_for_test, damage_identity_row_for_test,

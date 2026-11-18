@@ -777,6 +777,11 @@ use statics::{CLAUDE_DESKTOP_JSON_READ_RECEIPT, CODEX_APP_SERVER_TEST_TIMEOUTS};
 
 mod claude_credit_pools;
 mod claude_token_owner;
+
+/// Rest-heap diagnostics: homes with a remembered token verdict.
+pub(crate) fn token_owner_entries() -> usize {
+    claude_token_owner::owner_entries()
+}
 mod codex_credit_grants;
 mod codex_last_known;
 #[cfg(test)]

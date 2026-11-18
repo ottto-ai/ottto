@@ -82,6 +82,12 @@ pub(super) fn counted_poison_fingerprints() -> &'static Mutex<BTreeMap<String, B
     COUNTED_POISON_FINGERPRINTS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
+/// Rest-heap diagnostics: scopes and fingerprints held, or None while busy.
+pub(super) fn counted_poison_entries() -> Option<(usize, usize)> {
+    let ledger = counted_poison_fingerprints().try_lock().ok()?;
+    Some((ledger.len(), ledger.values().map(BTreeSet::len).sum()))
+}
+
 pub(super) fn retain_counted_poison_fingerprints(scope: &str, current: &BTreeSet<String>) {
     if let Ok(mut counted) = counted_poison_fingerprints().lock() {
         if let Some(ledger) = counted.get_mut(scope) {

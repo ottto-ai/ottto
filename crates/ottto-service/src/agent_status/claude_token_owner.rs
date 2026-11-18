@@ -56,6 +56,11 @@ fn with_owners<R>(use_owners: impl FnOnce(&mut Owners) -> R) -> R {
     )
 }
 
+/// Rest-heap diagnostics: homes with a remembered token verdict.
+pub(super) fn owner_entries() -> usize {
+    with_owners(|owners| owners.len())
+}
+
 #[cfg(test)]
 thread_local! {
     static OWNERS: std::cell::RefCell<Owners> = const { std::cell::RefCell::new(BTreeMap::new()) };

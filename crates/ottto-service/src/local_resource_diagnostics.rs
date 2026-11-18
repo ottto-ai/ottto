@@ -203,6 +203,7 @@ pub(crate) mod claude_reread;
 pub(crate) mod codex_memo_lifecycle;
 mod footprint;
 pub(crate) mod rearm_cause;
+pub(crate) mod rest_heap;
 #[cfg(unix)]
 mod shutdown;
 #[cfg(unix)]
