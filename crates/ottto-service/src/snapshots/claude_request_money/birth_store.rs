@@ -1019,8 +1019,7 @@ mod tests {
         let mut index = ScanIndex::default();
         index.files.insert("kept.jsonl".into(), entry());
         index.save_fixture(&file).unwrap();
-        let original: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        let original = serde_json::to_value(&index).unwrap();
         for bad in [
             None,
             Some(serde_json::json!({"wrong":"shape"})),
@@ -1036,8 +1035,11 @@ mod tests {
                     .unwrap()
                     .remove("claude_money_birth_store");
             }
-            std::fs::write(&file, serde_json::to_vec(&wire).unwrap()).unwrap();
-            let loaded = ScanIndex::load(&file).unwrap();
+            // Malformed optional values are decoder inputs, never native fences.
+            let loaded = crate::snapshots::e2_pipeline_scan_fixture::seed_json_for_test(
+                &file,
+                &serde_json::to_vec(&wire).unwrap(),
+            );
             assert!(loaded.files.contains_key("kept.jsonl"));
             assert_eq!(loaded.generation, index.generation);
             assert!(loaded.claude_money_birth_store.is_empty());

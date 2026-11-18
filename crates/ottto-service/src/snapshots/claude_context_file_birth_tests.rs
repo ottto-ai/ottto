@@ -1841,14 +1841,14 @@ fn claude_backfill_index_load_preserves_other_sources_and_existing_indexes() {
     // saved index with a nonzero generation must not be treated as fresh.
     let path = home.join("existing-index.json");
     baseline.generation = 0;
-    fs::write(&path, serde_json::to_vec(&baseline).unwrap()).unwrap();
+    e2_pipeline_scan_fixture::legacy_input_for_test(&path, &serde_json::to_vec(&baseline).unwrap());
     e2_pipeline_scan_fixture::bind_source_for_test(&path, SnapshotSource::ClaudeCode);
     e2_pipeline_scan_fixture::load_source_for_test(&path, SnapshotSource::ClaudeCode, &home)
         .unwrap();
     assert!(!claude_reemission_stop_latched());
     baseline.files.clear();
     baseline.generation = 1;
-    fs::write(&path, serde_json::to_vec(&baseline).unwrap()).unwrap();
+    e2_pipeline_scan_fixture::legacy_input_for_test(&path, &serde_json::to_vec(&baseline).unwrap());
     e2_pipeline_scan_fixture::bind_source_for_test(&path, SnapshotSource::ClaudeCode);
     e2_pipeline_scan_fixture::load_source_for_test(&path, SnapshotSource::ClaudeCode, &home)
         .unwrap();

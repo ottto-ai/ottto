@@ -458,6 +458,7 @@ fn lenient_authority_scalar_repair_and_held_family_correction_custody() {
             record.proof_correction,
             index.claude_usage_authority_quarantine["family"].proof_correction
         );
+        loaded = e2_pipeline_scan_fixture::seed_index_for_test(&loaded, &path);
         loaded.save_with_read_limit(&path, 1024 * 1024).unwrap();
         // Losing a family witness must also freeze its intact correction debt.
         let mut value = serde_json::to_value(&loaded).unwrap();
@@ -725,6 +726,7 @@ fn held_entity_finalization_keeps_file_membership_and_never_confirms_empty() {
 
 fn write_deep_optional(path: &Path, prefix: &[u8], depth: usize) -> usize {
     use std::io::Write;
+    e2_pipeline_scan_fixture::legacy_input_for_test(path, b"");
     let mut file = BufWriter::new(File::create(path).unwrap());
     file.write_all(&prefix[..prefix.len() - 1]).unwrap();
     let field = b",\"claude_request_census\":";
@@ -1160,9 +1162,12 @@ fn si_strict_refusal_matrix_preserves_bytes_generation_and_sibling_binding() {
         );
         // A boolean files entry is intentionally invalid; native admission holds.
         e2_pipeline_scan_fixture::assert_import_support_for_test(&path);
+        // The deliberately invalid input is held unchanged. Publish its
+        // decoded graph explicitly to exercise native binding preservation.
+        e2_pipeline_scan_fixture::seed_index_for_test(&loaded, &path);
         assert_eq!(
             raw_slot(
-                &serde_json::to_vec(&ScanIndex::load(&path).unwrap()).unwrap(),
+                &serde_json::to_vec_pretty(&ScanIndex::load(&path).unwrap()).unwrap(),
                 "session_account_bindings",
                 "sibling-session"
             ),
@@ -2166,6 +2171,7 @@ fn actual_transcript_rescans_keep_file_and_family_holds_out_of_publication() {
             assert_eq!(rescanned.ownership_incomplete_file_count, 0);
             assert_eq!(rescanned.unreadable_path_count, 0);
             assert!(!rescanned.census_complete);
+            loaded = e2_pipeline_scan_fixture::seed_index_for_test(&loaded, &path);
             assert!(
                 !crate::snapshot_sync::decode_hold_manifest_published_for_test(
                     &mut loaded,
@@ -2901,9 +2907,9 @@ fn user_repair_override_cooldown_is_source_wide_across_destinations() {
         assert_eq!(fs::read(path).unwrap(), damage);
     };
     let pause = |path: &Path| {
-        fs::write(path, b"{").unwrap();
+        e2_pipeline_scan_fixture::legacy_input_for_test(path, b"{");
         assert_eq!(load(path).unwrap().1, ScanIndexLoadOrigin::Loaded);
-        fs::write(path, &damage).unwrap();
+        e2_pipeline_scan_fixture::legacy_input_for_test(path, &damage);
         refused(path);
     };
 
@@ -3581,8 +3587,6 @@ fn legacy_nested_positional_traversal_counts_keep_their_original_slots() {
                 value
             })
             .collect::<Vec<_>>();
-        // Load retires only this decoded legacy value; neighboring positional counts survive.
-        expected["oversized_file_count"] = serde_json::json!(0);
         let mut root = serde_json::to_value(ScanIndex::default()).unwrap();
         root["traversal"] = serde_json::json!({
             "context_fingerprint":"context", "census_window_end":"2026-10-24T23:00:00Z",
@@ -3599,7 +3603,9 @@ fn legacy_nested_positional_traversal_counts_keep_their_original_slots() {
             loaded.traversal.as_ref().unwrap().has_retryable_problems(),
             full
         );
-        // The decoder normalizes positional counts before native publication.
+        // The pure decoder preserves every positional slot. Native load
+        // retires the obsolete size debt after decoding (runtime::decode_context).
+        expected["oversized_file_count"] = serde_json::json!(0);
         let native = scratch.join("native.json");
         loaded = e2_pipeline_scan_fixture::seed_index_for_test(&loaded, &native);
         loaded.save_fixture(&native).unwrap();
