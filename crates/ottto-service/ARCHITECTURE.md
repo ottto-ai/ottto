@@ -562,39 +562,6 @@ exempt a new production file from the ceiling.
   the same account placement. The money oracle in `snapshots/sampled_scan/transition_fixture.rs`
   and the `money_equivalence` CI job check this.
 
-## Billing route annotation
-
-`snapshots/billing_route.rs` labels each session's billing route (`session_billing_route:v1`).
-It is annotation only: pricing, placement, identity, row keys, hashes, body witnesses and upload
-decisions never read it, and the wire object is sent only when the receiver advertises that exact
-contract. Nothing is persisted. Codex reads the auth mode recorded on its rows and Pi accepts only
-allowlisted cloud provider and explicit auth pairs; they keep no latch: each pass takes the first
-route from the earliest hour bucket holding a known route (rows within an hour sort by row key, not
-time), and two known routes there are `signal_conflict`. Claude Code keeps in-memory latches, keyed
-by destination, source, machine and session, for known first routes only. Only the session's first
-own response (sequence order, never filtered away) can name one, and only when every physical line
-of the file decoded (the read report spans Tail resumes), no response, resolved or not, precedes it,
-the session's earliest stamped line of any kind (`claude_line_clocks`, inherited and invalid fork lines included)
-is strictly after this process started and that response has a request id, is not synthetic and
-has a complete clock whose start and end are strictly after the start (precise timestamps). Any
-other missing, unstamped or unproven input is `first_request_snapshot_missing`; a later request
-never stands in, and later requests, under the same clock rule, only join `routes_seen`. Latches
-follow one destination at a time, as the source manifests do. The status refresh publishes the
-login evaluator result with when it last changed and when it was last observed; a request is
-classified with it only when it changed at or before the request started (its preceding prompt or
-tool-result record) and was observed at or after the request ended. A request not yet covered is
-deferred to a later pass (no object meanwhile); one whose evaluator changed after it started is
-`first_request_snapshot_missing`. The evaluator never labels alone: OAuth needs that session's own
-Desktop request or a request whose own telemetry row named a valid account, an API key needs a
-native `req_`/`msg_` pair, and a cloud message or request id (`msg_bdrk_`, `msg_vrtx_`) or
-cloud-shaped model on any owned request keeps both unknown. A known first route never becomes a
-different known route (Codex/Pi: a second route in its hour turns it to `signal_conflict`); later
-proven routes join `routes_seen`. Disclosed residuals: a gateway forwarding native-looking
-ids can satisfy either conjunction, a same-session account does not prove who paid for the first
-request, and a login switched and switched back between two status refreshes is not seen, so the
-label is not fail-closed for every proxy. `PRODUCER_ENABLED` turns the annotation on in a later
-release; off, no route clock, lock, capability copy or telemetry flag is touched.
-
 ## One version
 
 - A runtime switch is a support-directory marker, never an environment variable alone, and it is

@@ -55,21 +55,6 @@ impl ClaudeResponseBook {
         keys
     }
 
-    /// Billing route annotation only: each response's key id shapes
-    /// `(native pair, cloud id)` by response sequence.
-    pub(in crate::snapshots) fn route_ids_by_sequence(&self) -> BTreeMap<u64, (bool, bool)> {
-        self.index
-            .iter()
-            .filter_map(|(key, slot)| {
-                let response = self.responses.get(*slot as usize)?;
-                Some((
-                    response.sequence,
-                    crate::snapshots::billing_route::claude_key_route_ids(key),
-                ))
-            })
-            .collect()
-    }
-
     pub(in crate::snapshots) fn get_mut(
         &mut self,
         key: &str,
@@ -642,17 +627,6 @@ pub(crate) struct ClaudeTranscriptUsageOccurrence {
     pub(in crate::snapshots) effective_input_context: u64,
     /// Page-local `e2` outcome; neither persisted nor sent.
     pub(in crate::snapshots) telemetry_attached: bool,
-    /// Route evidence only, derived from the retained response key: a
-    /// `req_` request id with a plain `msg_` message id. Local; never sent.
-    pub(in crate::snapshots) route_native_ids: bool,
-    /// Route evidence only: a cloud-provider message or request id.
-    pub(in crate::snapshots) route_third_party_id: bool,
-    /// Route evidence only: this request's own telemetry row, joined by its
-    /// provider request id, named a valid account. Local; never sent.
-    pub(in crate::snapshots) route_telemetry_account: bool,
-    /// Route evidence only, producer on: the preceding prompt or tool-result
-    /// record's time (unix nanoseconds), no later than the request started.
-    pub(in crate::snapshots) route_started_ns: Option<i64>,
 }
 
 /// Why a retained Claude response has no resolution.
@@ -975,7 +949,7 @@ crate::durable_tail_codec::durable_struct!(ClaudeResponseObservation {
     N desktop_request: bool,
     N rule_epoch: u8,
 });
-crate::heap_layout_bound::fields!(ClaudeTranscriptUsageOccurrence; sequence, usage, model, selector, reasoning_effort, timestamp, event_clock_complete, desktop_request, effective_input_context, telemetry_attached, route_native_ids, route_third_party_id, route_telemetry_account, route_started_ns);
+crate::heap_layout_bound::fields!(ClaudeTranscriptUsageOccurrence; sequence, usage, model, selector, reasoning_effort, timestamp, event_clock_complete, desktop_request, effective_input_context, telemetry_attached);
 
 #[cfg(test)]
 mod output_tests {
