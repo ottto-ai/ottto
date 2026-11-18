@@ -219,6 +219,7 @@ pub(in crate::snapshots) fn advance_bounded_directory_traversal_with_budget(
                    members: &mut usize| {
         if let Some(mut saved) = saved {
             saved.listing_changes_without_hint = counts.listing_changes_without_hint;
+            saved.listing_changes_by_class = counts.listing_changes_by_class;
             saved.listing_owed_requeued = counts.listing_owed_requeued;
             saved.discovered_file_count += std::mem::take(members);
             *counts = saved;
@@ -511,22 +512,25 @@ pub(in crate::snapshots) fn advance_bounded_directory_traversal_with_budget(
             );
             traversal.counts.discovered_file_count += 1;
             let first_observed = traversal.observed_index_keys.insert(key);
+            let queued = pending
+                .get(&path)
+                .map(|&at| &traversal.pending_candidates[at]);
+            if changed && !queued.map_or(directory.watcher_hint, |queued| queued.watcher_hint) {
+                let root = &directory.scan_root;
+                (traversal.counts).note_change_without_hint(source, root, &path, first_observed);
+            }
 
             if let Some(&position) = pending.get(&path) {
                 let existing = traversal
                     .pending_candidates
                     .get_mut(position)
                     .expect("walk queue position");
-                traversal.counts.listing_changes_without_hint +=
-                    u64::from(changed && !existing.watcher_hint);
                 if !relisting {
                     existing.census_member = true;
                 }
                 existing.watcher_hint |= directory.watcher_hint || changed;
             } else {
                 // Changed indexed files get hint priority even on a census walk.
-                traversal.counts.listing_changes_without_hint +=
-                    u64::from(changed && !directory.watcher_hint);
                 traversal.counts.listing_owed_requeued += u64::from(owed_unchanged);
                 relisted_members += usize::from(relisting && census_member && first_observed);
                 pending.insert(path.clone(), traversal.pending_candidates.len());
