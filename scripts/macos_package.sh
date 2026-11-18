@@ -1142,11 +1142,11 @@ SETUP_NOTES=()
 
 if [[ "$BOOTSTRAP_DAEMON" == "true" ]]; then
   if ! "$daemon_target" service bootstrap --executable "$daemon_target" --json >/dev/null 2>&1; then
-    SETUP_NOTES+=("ottto-service LaunchAgent bootstrap failed. Open Ottto to retry.")
+    SETUP_NOTES+=("ottto-service LaunchAgent bootstrap failed. Run $cli_target status to retry.")
   elif ! wait_for_daemon "$cli_target"; then
     "$daemon_target" service bootstrap --executable "$daemon_target" --json >/dev/null 2>&1 || true
     if ! wait_for_daemon "$cli_target"; then
-      SETUP_NOTES+=("ottto-service did not become ready. Open Ottto to retry.")
+      SETUP_NOTES+=("ottto-service did not become ready. Run $cli_target status to retry.")
     fi
   fi
 fi
