@@ -636,10 +636,7 @@ fn partial_locked_save_and_restart_keep_exact_debt() {
         prior.traversal.as_mut().unwrap().counts.growth_deferred =
             paced.traversal.as_ref().unwrap().counts.growth_deferred;
         for key in &paced_keys {
-            e2_pipeline_scan_fixture::expire_claimed_growth_for_test(
-                &mut prior,
-                Path::new(key),
-            );
+            e2_pipeline_scan_fixture::expire_claimed_growth_for_test(&mut prior, Path::new(key));
         }
         drop(paced);
         let mut read = BTreeSet::new();
