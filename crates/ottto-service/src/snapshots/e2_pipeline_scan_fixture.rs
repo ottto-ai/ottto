@@ -224,6 +224,31 @@ pub(crate) fn mutate_index_for_test(path: &Path, mutate: impl FnOnce(&mut serde_
     seed_json_for_test(path, &serde_json::to_vec(&value).unwrap());
 }
 
+/// Decoder-only inspection does not adopt the mapper's input as live custody.
+pub(crate) fn read_legacy_for_test(path: &Path) -> ScanIndex {
+    read_scan_index_representation(path, "load", "unattributed", None).unwrap()
+}
+
+/// Inventory refusals preserve their original input and expose support action.
+pub(crate) fn assert_import_support_for_test(path: &Path) {
+    bind_input_for_test(&ScanIndex::default(), path);
+    let before = fs::read(path).unwrap();
+    let error = ScanIndex::load(path).unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<state_v2::Hold>(),
+        Some(&state_v2::Hold::DbUnavailable)
+    );
+    assert_support_error_for_test(&error);
+    assert_eq!(fs::read(path).unwrap(), before);
+}
+
+pub(crate) fn assert_support_error_for_test(error: &anyhow::Error) {
+    assert_eq!(
+        scan_index_health::state_v2_reason(error).unwrap().action(),
+        "contact_support"
+    );
+}
+
 /// Explicit native seed for decoder fixtures whose original bytes deliberately
 /// fail the production inventory gate. This never runs on a daemon load/save.
 pub(crate) fn seed_index_for_test(index: &ScanIndex, path: &Path) -> ScanIndex {

@@ -94,18 +94,11 @@ impl ScanIndex {
             // The returned index retains this route between pages; the corpus
             // owns its scanned roots and removes them when the fixture ends.
             let root = index
-                .known_configured_scan_roots
-                .iter()
+                .files
+                .keys()
+                .chain(previous.files.keys())
                 .next()
-                .map(|root| Path::new(root).to_owned())
-                .or_else(|| {
-                    index
-                        .files
-                        .keys()
-                        .chain(previous.files.keys())
-                        .next()
-                        .and_then(|key| Path::new(key).parent().map(Path::to_owned))
-                })
+                .and_then(|key| Path::new(key).parent().map(Path::to_owned))
                 .expect("archive checkpoint has a fixture scan root");
             root.join(crate::test_scratch::unique_name(
                 "archive-upload-checkpoint",
