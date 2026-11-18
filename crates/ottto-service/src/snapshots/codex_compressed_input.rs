@@ -1016,6 +1016,7 @@ pub(in crate::snapshots) mod tests {
     impl Drop for ArchiveFixture {
         fn drop(&mut self) {
             fs::remove_dir_all(self.0.parent().unwrap()).unwrap();
+            state_v2::close_removed_routes_for_test();
         }
     }
     fn selector_scan(
@@ -1740,7 +1741,9 @@ pub(in crate::snapshots) mod tests {
             assert!(decoded.decode_holds.is_empty());
             assert!(decoded.accepted_snapshot_fingerprints.is_empty());
             assert_eq!(serde_json::to_value(&decoded).unwrap(), before);
-            decoded.save(&checkpoint.0).unwrap();
+            decoded
+                .save_fixture_for_source(&checkpoint.0, SnapshotSource::Codex)
+                .unwrap();
             let restored = ScanIndex::load(&checkpoint.0).unwrap();
             assert!(restored.decode_holds.is_empty());
             assert!(restored.files.is_empty());

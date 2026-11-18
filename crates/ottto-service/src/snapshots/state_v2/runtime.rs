@@ -1,8 +1,8 @@
-//! Locked runtime routing. A load that names its support dir converts v1 to the
-//! store; any other load stays v1 before publication. Custody evidence always wins.
+//! Locked runtime routing. Bound loads must publish and adopt the store before
+//! collection. Custody evidence always wins.
 use super::*;
 use anyhow::{bail, ensure, Context};
-use import::{Pace, Pause};
+use import::Pause;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -125,8 +125,9 @@ impl Hold {
     }
 }
 struct RouteState {
-    pace: Pace,
+    import_pause: Option<Pause>,
     latched: bool,
+    pending_publication: Option<(Identity, Option<fence::InputStamp>)>,
     inventory_ready: bool,
     original: Option<import::Original>,
     runtimes: Vec<std::sync::Weak<Runtime>>,
@@ -257,8 +258,9 @@ fn with_state<T>(path: &Path, f: impl FnOnce(&mut RouteState) -> Result<T>) -> R
             .entry(path.to_owned())
             .or_insert_with(|| {
                 Arc::new(Mutex::new(RouteState {
-                    pace: Pace::default(),
+                    import_pause: None,
                     latched: false,
+                    pending_publication: None,
                     inventory_ready: false,
                     original: None,
                     runtimes: Vec::new(),
@@ -355,19 +357,18 @@ fn held<T>(result: Result<T>) -> Result<T> {
 }
 
 /// Caller owns CheckpointLock, before missing-root validation or v1 decode.
-/// Without a support dir (unit tests, tools) `importable` is false and only an
-/// existing route loads. The returned flag says the caller's v1 load may import.
+/// The returned flag says the caller's decoded legacy graph must import.
 pub(in super::super) fn load_locked(
     path: &Path,
-    importable: bool,
+    _importable: bool,
     custody: bool,
 ) -> Result<(Option<ScanIndex>, bool)> {
     // Unbound paths and sources outside `v2_on` never probe the store.
     let Some(binding) = binding(path) else {
         return Ok((None, false));
     };
-    let index = load_with_custody(path, &binding, importable, custody)?;
-    let try_import = importable && index.is_none();
+    let index = load_with_custody(path, &binding, true, custody)?;
+    let try_import = index.is_none();
     Ok((index, try_import))
 }
 fn load_with_custody(
@@ -381,8 +382,21 @@ fn load_with_custody(
     }
     let mut load_started = None;
     let result = held(with_state(path, |state| {
+        if state.latched {
+            if let Some((identity, input)) = &state.pending_publication {
+                if fence::read(path)?.is_none() {
+                    ensure!(fence::input_stamp(path)? == *input, Hold::DbUnavailable);
+                    if let Some(original) = &state.original {
+                        original.unchanged()?;
+                        original.verify_baseline(path)?;
+                    }
+                    fence::resume_publication(path, identity)?;
+                }
+            }
+        }
         state.inventory_ready = false;
         state.original = None;
+        state.import_pause = None;
         state.save_digests = None;
         let pair = fence::reconcile(path, binding, state.latched)?;
         state.pass_written_start = (importable || pair.is_some())
@@ -392,6 +406,7 @@ fn load_with_custody(
             telemetry::hydrate_checkpoint("hydrate_route_entry", 0, None);
             load_started = Some(Instant::now());
             state.latched = true;
+            state.pending_publication = None;
             telemetry::baseline(path);
             if let Some(runtime) = state.current.clone() {
                 let mut guard = runtime.session.lock().map_err(|_| Hold::DbUnavailable)?;
@@ -451,29 +466,30 @@ fn load_with_custody(
         if !importable {
             return Ok(None);
         }
-        let now = Instant::now();
-        if let Some(first) = state.pace.start(now) {
-            telemetry::event(
-                "import_attempt",
-                &if first { "first_in_process" } else { "retry" },
+        if !fence::exists(path)? {
+            // A preserved legacy baseline is prior history, never fresh-init
+            // authority. Only unpublished native remnants may be discarded.
+            ensure!(
+                !fence::exists(&fence::sibling(path, ".v1-readonly"))?
+                    && !fence::exists(&fence::sibling(path, ".v1-readonly.shards"))?,
+                Hold::DbUnavailable
             );
-            if first
-                && (fence::exists(path)?
-                    || fence::exists(&fence::sibling(path, ".v1-readonly"))?
-                    || fence::exists(&fence::sibling(path, ".v2.sqlite.import"))?)
-            {
-                telemetry::event("import_restart_attempt", &1);
+            telemetry::event(
+                "orphan_removed",
+                &fence::cleanup_unpublished(path, state.latched)?,
+            );
+        }
+        super::super::scan_index_integration::recover_fresh_init(
+            path,
+            binding.source.snapshot().api_slug(),
+        )?;
+        telemetry::event("import_attempt", &"retry");
+        match import::inventory_context(path) {
+            Ok(original) => {
+                state.inventory_ready = true;
+                state.original = original;
             }
-            // Inventory precedes v1 recovery/decoding and never creates artifacts.
-            match import::inventory_context(path) {
-                Ok(original) => {
-                    state.inventory_ready = true;
-                    state.original = original;
-                }
-                Err(class) => {
-                    pause(state, class);
-                }
-            }
+            Err(class) => pause(state, class),
         }
         telemetry::event("route", &"v1");
         Ok(None)
@@ -558,14 +574,15 @@ fn normalize_hydrated(
 fn pause(state: &mut RouteState, class: Pause) {
     state.inventory_ready = false;
     state.original = None;
+    state.import_pause = Some(class);
     telemetry::event("import_paused", &class);
     telemetry::event("import_paused_alarm", &1);
 }
 
-/// Import is attempted only on the normalized available graph and only if the
-/// pre-decode inventory acquired a due slot. No writes on any paused path.
+/// Import must succeed before a bound graph can collect. A paused inventory
+/// keeps the input intact and exposes its existing recovery action.
 pub(in super::super) fn after_v1_locked(path: &Path, index: &mut ScanIndex) -> Result<()> {
-    let Some(binding) = binding(path) else {
+    let Some(_binding) = binding(path) else {
         return Ok(());
     };
     if !states()
@@ -576,42 +593,29 @@ pub(in super::super) fn after_v1_locked(path: &Path, index: &mut ScanIndex) -> R
         return Ok(());
     }
     with_state(path, |state| {
-        if !state.inventory_ready {
-            return Ok(());
-        }
-        state.inventory_ready = false;
         if !index.persistence_available() {
             pause(state, Pause::Partial);
-            return Ok(());
+            return Err(Hold::DbUnavailable.into());
         }
+        if !state.inventory_ready {
+            return Err(state
+                .import_pause
+                .map_or(Hold::ReloadRequired, Pause::hold)
+                .into());
+        }
+        state.inventory_ready = false;
         let _gauge = telemetry::Stage::new(telemetry::Kind::Import);
-        let result = (|| -> Result<KindCx> {
+        let result = (|| {
             let original = state.original.as_ref().ok_or(Pause::Mismatch)?;
-            original.unchanged()?;
-            telemetry::event(
-                "orphan_removed",
-                &fence::cleanup_unpublished(path, state.latched)?,
-            );
-            let mut random = [0_u8; 16];
-            std::fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
             let generation = import::import_generation(index, original)?;
-            let identity = Identity {
-                format: FORMAT,
-                db_id: crate::hex::encode(&random),
-                binding,
-                fence_generation: generation,
-            };
-            let original = state.original.as_ref().ok_or(Pause::Mismatch)?;
-            original.preserve(path)?;
-            telemetry::baseline(path);
-            let import = fence::sibling(path, ".v2.sqlite.import");
-            let mut db = sqlite::Sqlite::create_import(&import)?;
-            db.control("identity", &identity)?;
-            db.control("generation", &index.generation)?;
-            let cx = import::import_graph(&mut db, index, state.original.as_ref())?;
-            original.unchanged()?;
-            original.publish_import(path, &identity, db, &mut state.latched)?;
-            Ok(cx)
+            import::publish_graph(
+                path,
+                index,
+                original,
+                generation,
+                &mut state.latched,
+                &mut state.pending_publication,
+            )
         })();
         // One gauge per import attempt, including one refused for an over-cap row.
         telemetry::row_cap_save();
@@ -622,9 +626,15 @@ pub(in super::super) fn after_v1_locked(path: &Path, index: &mut ScanIndex) -> R
             }
             Err(error) if state.latched => return Err(Hold::storage(error)),
             Err(error) => {
-                let class = error.downcast_ref::<Pause>().copied().unwrap_or(Pause::Io);
-                pause(state, class);
-                return Ok(());
+                if let Some(class) = error.downcast_ref::<Pause>().copied() {
+                    pause(state, class);
+                    return Err(class.hold().into());
+                }
+                if !sqlite::disk_full(&error) && error.downcast_ref::<std::io::Error>().is_some() {
+                    pause(state, Pause::Io);
+                    return Err(Hold::ReloadRequired.into());
+                }
+                return Err(Hold::storage(error));
             }
         };
         // Publication succeeded: adoption failure is a hold, never a v1 result.
@@ -643,24 +653,39 @@ pub(in super::super) fn after_v1_locked(path: &Path, index: &mut ScanIndex) -> R
         Ok(())
     })
 }
+/// Caller has authorized a legacy rebuild and retains CheckpointLock. Fresh
+/// publication never adopts a second runtime; the next ordinary load does.
+pub(in super::super) fn publish_rebuilt_locked(path: &Path, index: &ScanIndex) -> Result<()> {
+    binding_for(path)?;
+    with_state(path, |state| {
+        state.original = None;
+        import::publish_graph(
+            path,
+            index,
+            &import::Original::default(),
+            0,
+            &mut state.latched,
+            &mut state.pending_publication,
+        )?;
+        Ok(())
+    })
+    .map_err(Hold::storage)
+}
+pub(in super::super) fn fence_published(path: &Path) -> bool {
+    fence::read(path).ok().flatten().is_some()
+}
 fn binding_for(path: &Path) -> Result<super::super::scan_index_persistence::Binding> {
     binding(path).ok_or_else(|| Hold::ForeignBinding.into())
 }
 
-/// All save routes check independent evidence before any v1 CAS or publication.
+/// Only an authenticated store session may save a graph.
 pub(in super::super) fn save_locked(
     path: &Path,
     index: &mut ScanIndex,
     claim_only: bool,
-    custody: bool,
-) -> Result<bool> {
-    if binding(path).is_none() {
-        ensure!(index.v2().persistence_v2.is_none(), Hold::ForeignBinding);
-        return Ok(false);
-    }
-    if index.v2().persistence_v2.is_none() && !route_needed(path, custody)? {
-        return Ok(false);
-    }
+) -> Result<()> {
+    binding_for(path)?;
+    ensure!(index.v2().persistence_v2.is_some(), Hold::ReloadRequired);
     // This accessor authenticates the owner/session; call before route/session locks.
     let claim_generation = super::super::sampled_audit::own_growth_claim_generation(index, path);
     let runtime = index.v2().persistence_v2.clone();
@@ -705,11 +730,11 @@ pub(in super::super) fn save_locked(
                     digests
                 });
             }
-            Ok(true)
+            Ok(())
         })
     })
-    .map(|saved| saved.unwrap_or(false));
-    if result.as_ref().is_ok_and(|saved| *saved) && !claim_only {
+    .and_then(|saved| saved.ok_or_else(|| Hold::ReloadRequired.into()));
+    if result.is_ok() && !claim_only {
         super::super::sampled_audit::renew_growth_claims(index, path);
     }
     result
@@ -1400,3 +1425,7 @@ pub(crate) use tail_tests::{
     seed_tail_kinds_for_test, seed_tail_literals_for_test, stage_tail_for_test,
     tail_kind_counts_for_test, tail_published_for_test, TAIL_FACT_LITERALS,
 };
+
+#[cfg(test)]
+#[path = "publication_gate_tests.rs"]
+mod publication_gate_tests;

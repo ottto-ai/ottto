@@ -75,6 +75,9 @@ impl Fixture {
         object["digest"] = json!(format!("{:x}", hash.finalize()));
         object["bytes"] = json!(payload.len());
     }
+    fn read(&self) -> ScanIndex {
+        read_scan_index_representation(&self.root, "load", "claude_code", None).unwrap()
+    }
     fn load(&self) -> ScanIndex {
         ScanIndex::load_for_snapshot_source_with_origin(
             &self.root,
@@ -88,6 +91,7 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         fs::remove_dir_all(&self.scratch).unwrap();
+        crate::snapshots::state_v2::close_removed_routes_for_test();
     }
 }
 
@@ -145,7 +149,7 @@ fn integrated_each_map_and_cause_retains_custody_without_release_retirement_fenc
             fixture.write_root();
             let before = fs::read(&fixture.root).unwrap();
             crate::local_resource_diagnostics::take_scan_index_storage_observations();
-            let mut loaded = fixture.load();
+            let mut loaded = fixture.read();
             assert!(!loaded.persistence_available());
             assert_eq!(
                 loaded.persistence_unavailable[map],
@@ -185,6 +189,16 @@ fn integrated_each_map_and_cause_retains_custody_without_release_retirement_fenc
                     .map(|(_, c, _)| c[map][cause as usize])
                     .sum::<u64>(),
                 1
+            );
+            let refusal = ScanIndex::load_for_snapshot_source_with_origin(
+                &fixture.root,
+                SnapshotSource::ClaudeCode,
+                &fixture.scratch,
+            )
+            .unwrap_err();
+            assert_eq!(
+                refusal.downcast_ref::<state_v2::Hold>(),
+                Some(&state_v2::Hold::DbUnavailable)
             );
             assert!(loaded.decode_holds_family("arbitrary-family"));
             assert!(loaded.decode_holds_entity("arbitrary-body"));
@@ -279,9 +293,9 @@ fn integrated_fresh_init_orphans_are_discarded_and_failure_observations_are_drai
     assert!(ScanIndex::load(&fixture.root).is_err());
     let observations = crate::local_resource_diagnostics::take_scan_index_storage_observations();
     assert_eq!(
-        observations.len(),
-        1,
-        "error exits pass the same stats drain"
+        observations.iter().map(|(n, _, _)| n).sum::<u64>(),
+        0,
+        "the native inventory hold precedes the legacy reader"
     );
     assert!(fixture.root.exists());
 }
@@ -331,36 +345,30 @@ fn authorized_legacy_quarantine_rebuild_keeps_opaque_custody_until_replacement()
         b"{\"schema_version\":2,\"files\":{},\"generation\":\"broken",
     )
     .unwrap();
-    let mut rebuilt = fixture.load();
+    let error = ScanIndex::load_for_snapshot_source_with_origin(
+        &fixture.root,
+        SnapshotSource::ClaudeCode,
+        &fixture.scratch,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<state_v2::Hold>(),
+        Some(&state_v2::Hold::ReloadRequired)
+    );
+    let (mut rebuilt, origin) = ScanIndex::load_for_snapshot_source_with_origin(
+        &fixture.root,
+        SnapshotSource::ClaudeCode,
+        &fixture.scratch,
+    )
+    .unwrap();
+    assert_eq!(origin, ScanIndexLoadOrigin::Loaded);
+    assert!(origin.is_fresh(&rebuilt));
     assert_eq!(rebuilt.generation, 0);
-    assert!(rebuilt.persistence_legacy_recovery.is_some());
-    assert!(!fixture.root.exists());
-    let mut clone = rebuilt.clone();
-    clone.retain_persistence_baseline_from(&rebuilt);
-    assert!(clone.persistence_legacy_recovery.is_some());
-    // Arbitrary missing-root loads cannot manufacture the authorized token.
-    assert!(ScanIndex::load(&fixture.root).is_err());
+    let mut stale = rebuilt.clone();
     rebuilt.save(&fixture.root).unwrap();
     assert_eq!(rebuilt.generation, 1);
-    assert!(rebuilt.persistence_legacy_recovery.is_none());
+    assert!(stale.save(&fixture.root).is_err());
     assert_eq!(fixture.load().generation, 1);
-    // Captured recovery adopts the publication and must use ordinary CAS on
-    // its next checkpoint, rather than retrying the spent first-save grant.
-    let mut adopted = clone.clone();
-    adopted.generation = rebuilt.generation;
-    adopted.retain_persistence_baseline_from(&rebuilt);
-    assert!(adopted.persistence_legacy_recovery.is_none());
-    adopted.save(&fixture.root).unwrap();
-    assert_eq!(adopted.generation, 2);
-    assert_eq!(fixture.load().generation, 2);
-    // A stale clone cannot re-use the spent recovery grant.
-    assert!(clone.save(&fixture.root).is_err());
-    fs::remove_file(&fixture.root).unwrap();
-    assert!(clone.save(&fixture.root).is_err());
-    assert!(
-        !fixture.root.exists(),
-        "spent Arc custody never resets a lost root"
-    );
 }
 
 #[test]
@@ -393,7 +401,7 @@ fn partial_negative_metadata_holds_keep_their_fund_when_a_map_is_missing() {
     fs::write(new, bytes).unwrap();
     fs::remove_file(fixture.bucket_path(0)).unwrap();
     fixture.write_root();
-    let index = fixture.load();
+    let index = fixture.read();
     assert!(!index.persistence_available());
     assert!(index.decode_holds.contains("files", "held-negative-file"));
     assert!(index.decode_holds.held_bytes() > 2 * 1024 * 1024);
@@ -429,7 +437,8 @@ fn integrated_manifest_refuses_each_unknown_map_and_counts_before_window_parsing
     for map in 0..3 {
         let fixture = Fixture::new();
         fs::remove_file(fixture.bucket_path(map)).unwrap();
-        let index = fixture.load();
+        e2_pipeline_scan_fixture::assert_import_support_for_test(&fixture.root);
+        let index = fixture.read();
         let (result, rows) = crate::local_resource_diagnostics::capture(|| {
             index.manifest_for_window(SnapshotSource::ClaudeCode, "invalid", "invalid")
         });
@@ -621,7 +630,7 @@ fn integrated_each_damaged_map_holds_then_restores_equal_money_without_transcrip
         let payload = fixture.bucket_path(map);
         let original = fs::read(&payload).unwrap();
         fs::write(&payload, b"{damaged}").unwrap();
-        let mut unknown = fixture.load();
+        let mut unknown = fixture.read();
         assert!(!unknown.persistence_available());
         assert_eq!(
             unknown.persistence_unavailable[map].unwrap().cause,
@@ -718,7 +727,10 @@ fn integrated_missing_root_reserved_only_stalls_before_default_save_or_transcrip
     });
     assert!(reads.is_empty());
     let error = result.expect_err("missing root must refuse before default index");
-    assert!(format!("{error:#}").contains("scan_index_root_missing_with_shards"));
+    assert_eq!(
+        error.downcast_ref::<state_v2::Hold>(),
+        Some(&state_v2::Hold::DbUnavailable)
+    );
     assert!(!fixture.root.exists(), "no fresh save");
     assert_eq!(fs::read_dir(&fixture.shards).unwrap().count(), 2);
     for path in files {
@@ -919,12 +931,17 @@ fn historical_replay_runs_once_per_generation_only_when_pending() {
 fn a_failed_save_after_a_replay_replays_again_and_a_saved_replay_holds() {
     const GENERATION: &str = "codex:replay-custody:g1";
     let key = "/s/replay-custody.jsonl";
-    let scratch = crate::test_scratch::private_dir("replay-custody");
-    let path = scratch.join("index.json");
+    let scratch = crate::test_scratch::ScratchDir::canonical("replay-custody");
     let pending =
         |index: &ScanIndex| index.historical_replay_generation.as_deref() != Some(GENERATION);
     let mut disk = ScanIndex::default();
     replay_indexed(&mut disk, key);
+    let (session, mut disk) = state_v2::money_test_support::ColdSession::publish(
+        scan_index_persistence::Source::Claude,
+        &disk,
+        scratch.as_ref(),
+    );
+    let path = session.path().to_owned();
     disk.save(&path).unwrap();
 
     // The replay resets the loaded copy; its save fails.
@@ -952,7 +969,8 @@ fn a_failed_save_after_a_replay_replays_again_and_a_saved_replay_holds() {
     assert!(!pending(&index));
     assert!(!index.prepare_historical_replay(GENERATION.into()));
     assert!(replay_delivered(&index, key));
-    fs::remove_dir_all(&scratch).unwrap();
+    drop(index);
+    drop(session);
 }
 
 // F10: count surviving complete offers at the real post-policy finalizer.

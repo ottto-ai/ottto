@@ -31,16 +31,17 @@ pub(crate) use runtime::{
 };
 pub(crate) use runtime::{remove_retired_record_dir, retired_record_dir, source_erasure_alarm};
 pub(super) mod telemetry;
-#[cfg(test)]
-pub(super) use runtime::guard_local;
 #[cfg(any(test, target_os = "macos"))]
 pub(super) use runtime::invalidate_tree;
 pub(crate) use runtime::BaselineRelease;
 pub(crate) use runtime::Hold;
 pub(super) use runtime::{
-    after_v1_locked, collection_page_limit, guard_containment_locked, guard_external, idle,
-    load_locked, published, recovery_save_guard, runtime_path, save_locked,
+    after_v1_locked, collection_page_limit, fence_published, guard_containment_locked,
+    guard_external, idle, load_locked, publish_rebuilt_locked, published, recovery_save_guard,
+    runtime_path, save_locked,
 };
+#[cfg(test)]
+pub(super) use runtime::{erase_published, guard_local};
 mod catalogue;
 mod codec;
 
@@ -666,6 +667,3 @@ pub(in crate::snapshots) fn seed_0217_archive_for_test(index: &ScanIndex, key: &
         );
     });
 }
-
-#[cfg(test)]
-pub(super) use runtime::erase_published;

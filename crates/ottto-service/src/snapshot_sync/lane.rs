@@ -871,6 +871,7 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
         match result {
             Ok(()) => self.transport_cycle.note_success(),
             Err(error) => {
+                crate::snapshots::scan_index_health::observe_failure(source, &error);
                 if error
                     .downcast_ref::<crate::source_rotation::LocalRefusal>()
                     .is_none()

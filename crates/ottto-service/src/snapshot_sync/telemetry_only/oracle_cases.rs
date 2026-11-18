@@ -85,8 +85,12 @@ pub(super) fn scope_hold() {
     let mut raw = value(ScanIndex::default()).unwrap();
     raw["claude_usage_family_witnesses"] = json!({ROOT:{"members":[false],"opaque":"future"}});
     let path = c.base.join("held-index.json");
-    fs::write(&path, encode(&raw).unwrap()).unwrap();
-    indices.push(ScanIndex::load(&path).unwrap());
+    indices.push(
+        crate::snapshots::e2_pipeline_scan_fixture::seed_json_for_test(
+            &path,
+            &encode(&raw).unwrap(),
+        ),
+    );
     for index in indices {
         let (absent, backed) = crate::snapshots::claude_request_money::e2::telemetry_scope(
             &index,
@@ -96,14 +100,9 @@ pub(super) fn scope_hold() {
         let mut next = restore(&p);
         let mut scan = empty_scan(&c);
         let reads = otel::evidence_read_counts_for_test();
-        next.seed_telemetry(
-            &c.support,
-            &hint(),
-            &mut scan,
-            &index,
-            &c.base.join("held-progress.json"),
-        )
-        .unwrap();
+        let progress_path = notice_progress_path(&c, &mut next);
+        next.seed_telemetry(&c.support, &hint(), &mut scan, &index, &progress_path)
+            .unwrap();
         assert!(scan.snapshots.is_empty());
         assert_eq!(reads, otel::evidence_read_counts_for_test());
         held(&accepted, &next);
@@ -286,13 +285,20 @@ pub(super) fn save_failure() {
     let bad = c.base.join("not-a-directory");
     fs::write(&bad, b"file").unwrap();
     let mut p = progress();
+    let mut index = ScanIndex::default();
+    let route = crate::snapshots::e2_pipeline_scan_fixture::bind_fixture_route(
+        Claude,
+        &mut index,
+        &c.base,
+        &p.destination_namespace_hash,
+    );
+    index.save_fixture(&route).unwrap();
+    let (progress_path, native) = crate::snapshot_sync::tests::routed_progress(&index, &route, p);
+    p = native;
     let mut scan = empty_scan(&c);
-    for (path, success) in [
-        (bad.join("progress.json"), false),
-        (c.base.join("saved.json"), true),
-    ] {
+    for (path, success) in [(bad.join("progress.json"), false), (progress_path, true)] {
         assert_eq!(
-            p.seed_telemetry(&c.support, &hint(), &mut scan, &ScanIndex::default(), &path)
+            p.seed_telemetry(&c.support, &hint(), &mut scan, &index, &path)
                 .is_ok(),
             success
         );
@@ -455,7 +461,18 @@ fn cas_takeover(page: &Page, p: &mut Progress, mode: Mode) -> RouteResult {
             );
             assert_eq!(envelope["base_head_etag"], stale);
             assert_eq!(p.accepted_cache_heads[&key], stale);
-            *p = restore(p);
+            let native = p
+                .rows
+                .as_ref()
+                .map(|rows| rows.index_path_for_test().to_owned());
+            *p = match native {
+                Some(index_path) => {
+                    // The native save released resident hints. A serde copy
+                    // cannot stand in for reloading the committed identity rows.
+                    routed_progress(&ScanIndex::load(&index_path).unwrap(), &index_path)
+                }
+                None => restore(p),
+            };
             assert_eq!(
                 p.head_conflict_challenges[&key].challenge,
                 cas::challenge(0xc)
@@ -467,6 +484,8 @@ fn cas_takeover(page: &Page, p: &mut Progress, mode: Mode) -> RouteResult {
             assert!(envelope.get("base_head_etag").is_none());
             assert_eq!(p.accepted_cache_heads[&key], "2".repeat(64));
             assert!(!p.head_conflict_challenges.contains_key(&key));
+            p.load_identity(offered.iter().map(|item| item.source_session_id.as_str()))
+                .unwrap();
             return delivered(&offered, p, mode, wires.iter().map(canonical).collect());
         }
     }

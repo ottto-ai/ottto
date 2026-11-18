@@ -689,7 +689,11 @@ mod ops_tests {
         abort_pass();
         THREAD_CHECKPOINTS.with(|checkpoints| checkpoints.borrow_mut().clear());
         ScanIndex::load(&path).unwrap();
-        // Cold loads/checkpoints must not open or initialize a pass window.
+        // First-install adoption starts the native pass; checkpoints outside
+        // a pass still do nothing. Remove this seed before the cold fixture.
+        abort_pass();
+        super::super::erase_published(&path);
+        THREAD_CHECKPOINTS.with(|checkpoints| checkpoints.borrow_mut().clear());
         hydrate_checkpoint("hydrate_route_entry", 0, None);
         assert_eq!(PASS.with(|pass| pass.borrow().clone()), Pass::default());
         THREAD_CHECKPOINTS.with(|checkpoints| assert!(checkpoints.borrow().is_empty()));

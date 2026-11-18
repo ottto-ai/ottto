@@ -26,15 +26,13 @@ impl std::fmt::Debug for FingerprintKey {
         f.write_str("FingerprintKey([redacted])")
     }
 }
-/// Third field: epoch changed this pass; fourth: receiver item cap; fifth:
-/// per-cycle account-source capability.
+/// Third field: epoch changed this pass; fourth: receiver item cap.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct AcceptedBuckets(
     BTreeMap<String, AcceptedSession>,
     Option<FingerprintKey>,
     bool,
     usize,
-    bool,
 );
 /// Why a tagging attempt had no complete accepted state (local diagnostics).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -537,7 +535,7 @@ impl<'de> Deserialize<'de> for AcceptedBuckets {
                         states.insert(session, state);
                     }
                 }
-                Ok(AcceptedBuckets(states, None, false, 0, false))
+                Ok(AcceptedBuckets(states, None, false, 0))
             }
             fn visit_seq<S: SeqAccess<'de>>(self, mut seq: S) -> Result<Self::Value, S::Error> {
                 while seq.next_element::<IgnoredAny>()?.is_some() {}
@@ -566,11 +564,9 @@ impl<'de> Deserialize<'de> for AcceptedBuckets {
     }
 }
 impl AcceptedBuckets {
-    /// A keyed fixture ledger in a cycle whose server advertises
-    /// `session_request_account_source:v1`, as production does for Claude Code.
     #[cfg(test)]
     pub(crate) fn for_test() -> Self {
-        Self(BTreeMap::new(), Some(fixture_key()), false, 0, true)
+        Self(BTreeMap::new(), Some(fixture_key()), false, 0)
     }
     /// One session at every per-session bound: the per-row maximum.
     #[cfg(test)]
@@ -612,15 +608,12 @@ impl AcceptedBuckets {
             Some(key),
             false,
             0,
-            false,
         )
     }
     #[cfg(test)]
     pub(crate) fn restore_for_test(bytes: &[u8]) -> Self {
         let mut state: Self = serde_json::from_slice(bytes).unwrap();
         state.bind_key(Some(fixture_key()));
-        // The capability is never persisted; the next cycle sets it again.
-        state.set_account_source_enabled(true);
         state
     }
     /// The negotiated attribution key is owned by the existing per-cycle context.
@@ -661,14 +654,6 @@ impl AcceptedBuckets {
             (Some(_), true) => UnknownCause::EpochChanged,
             (Some(_), false) => UnknownCause::UntrackedSession,
         }
-    }
-    /// Account carry marking for this cycle: only the server's exact
-    /// capability token emits `account_source`; absent keeps main's bytes.
-    pub(crate) fn set_account_source_enabled(&mut self, enabled: bool) {
-        self.4 = enabled;
-    }
-    pub(crate) fn account_source_enabled(&self) -> bool {
-        self.4
     }
     /// Tombstone the copy-derived rows an identity pass treated as never
     /// accepted (`AcceptedSession::invalidate`), counted once per row.

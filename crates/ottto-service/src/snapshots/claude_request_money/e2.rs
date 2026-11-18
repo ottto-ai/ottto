@@ -2599,6 +2599,7 @@ fn mark_settled_counted_copies(index: &mut ScanIndex) {
     }
 }
 
+#[cfg(test)]
 pub(in crate::snapshots) fn reconcile_copy_ownership(previous: &ScanIndex, next: &mut ScanIndex) {
     CopyOwnership::capture(previous).reconcile(next, &mut |_| BTreeMap::new());
 }

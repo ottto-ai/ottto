@@ -190,6 +190,7 @@ impl Corpus {
 impl Drop for Corpus {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.base);
+        crate::snapshots::state_v2::close_removed_routes_for_test();
     }
 }
 struct Page {
@@ -253,18 +254,13 @@ impl Page {
         let one = checks.map(|_| reference(&crate::snapshot_sync::ONE_EVIDENCE_CHUNK));
         let before = crate::claude_local_otel::evidence_read_counts_for_test().0;
         let chunks_before = crate::snapshot_sync::evidence_chunks_for_test();
-        // The sync loop sets the server's advertised capability on its ledger
-        // every cycle; production advertises it for every Claude Code upload.
-        // Without a ledger, a keyless one matches no session: only carry differs.
-        let mut cycle = accepted.as_deref().cloned().unwrap_or_default();
-        cycle.set_account_source_enabled(true);
         let ((mut disposition, _, stats), released) =
             e2::pipeline_test_observer::capture_released(|| {
                 apply_claude_local_evidence_to_scan_with_ledger_and_budget(
                     &corpus.support,
                     &mut self.scan,
                     &mut self.index,
-                    Some(&cycle),
+                    accepted.as_deref(),
                     wire_budget,
                     None,
                 )
@@ -597,8 +593,8 @@ const RESUMED: &str = "3338a80a-f36e-4cbc-a5bb-50fc66430ba5";
 const LOGINS: &str = "4338a80a-f36e-4cbc-a5bb-50fc66430ba5";
 const MALFORMED: &str = "5338a80a-f36e-4cbc-a5bb-50fc66430ba5";
 
-/// Five roots swept one file per page, then again after the page root grows,
-/// with the account-source capability on: root A (side call, a switch from
+/// Five roots swept one file per page, then again after the page root grows:
+/// root A (side call, a switch from
 /// login-only L1 to L2 with a complete org mid-stream, then an own request
 /// with no telemetry row that carries L2 forward), legacy
 /// fork F of A, resume copy C of A with no rows of its own, D (L1's complete
@@ -689,7 +685,6 @@ fn five_root_sweep_paged(multi_root: bool, limit: usize) {
         let scanner = E2ScanFixture::default();
         let mut index = ScanIndex::default();
         let mut accepted = crate::snapshots::claude_request_identity::AcceptedBuckets::for_test();
-        accepted.set_account_source_enabled(true);
         for sweep in 0..2 {
             if sweep == 1 {
                 // A packed-page comparison needs every family selected on
@@ -3005,7 +3000,6 @@ fn e2_pipeline_uncopied_guard_carried_accounts() {
             let mut page = c.raw(&scanner, ScanIndex::default(), 100, false, &[]);
             let mut accepted =
                 crate::snapshots::claude_request_identity::AcceptedBuckets::for_test();
-            accepted.set_account_source_enabled(true);
             e2::take_diag();
             page.enrich_with(&c, Some(&mut accepted));
             let result = body(&page, ROOT).unwrap();
