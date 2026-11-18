@@ -1619,16 +1619,28 @@ pub(crate) fn detach_route_for_test(index: &mut ScanIndex) {
     index.v2_mut().persistence_v2 = None;
 }
 
-pub(crate) fn expire_claimed_growth_for_test(index: &mut ScanIndex, path: &Path) {
+/// Age the saved claim witnessed by an uncommitted deferred page, without
+/// releasing other claims or audits by advancing the whole scan clock.
+pub(crate) fn expire_claimed_growth_for_test(
+    index: &mut ScanIndex,
+    path: &Path,
+    deferred: &ScanIndex,
+) {
+    assert_eq!(route_of(index), route_of(deferred));
     let key = local_index_key(path);
     let now = sampled_scan::now_seconds();
-    assert!(sampled_audit::growth_full_paced(index, &key, now));
-    assert!(index
+    assert!(sampled_audit::growth_full_paced(deferred, &key, now));
+    assert!(deferred
         .traversal
         .as_ref()
         .is_some_and(|walk| walk.counts.growth_deferred > 0));
     let state = index.v2_mut().growth_retention.get_mut(&key).unwrap();
     let mut value = serde_json::to_value(&*state).unwrap();
+    let observed = serde_json::to_value(&deferred.v2().growth_retention[&key]).unwrap();
+    assert_eq!(
+        value["last_growth_full_unix"],
+        observed["last_growth_full_unix"]
+    );
     value["last_growth_full_unix"] = json!(now - sampled_audit::GROWTH_FULL_INTERVAL);
     *state = serde_json::from_value(value).unwrap();
     assert!(!sampled_audit::growth_full_paced(index, &key, now));

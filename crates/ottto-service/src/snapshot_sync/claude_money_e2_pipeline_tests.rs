@@ -4141,7 +4141,9 @@ fn conflict_only(subagent: bool, sampled: bool) {
             );
             let mut due = c.reload(&mut restart.index);
             crate::snapshots::e2_pipeline_scan_fixture::expire_claimed_growth_for_test(
-                &mut due, &path,
+                &mut due,
+                &path,
+                &restart.index,
             );
             drop(restart);
             restart = cold_ready(&c, due, 100, false);

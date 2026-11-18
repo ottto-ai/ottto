@@ -627,51 +627,65 @@ fn partial_locked_save_and_restart_keep_exact_debt() {
             expected,
             "the paced attempt does not commit or discharge any owed key"
         );
+        // Age only the witnessed claim in the saved baseline. Advancing the
+        // whole clock would also release the excluded audit B's unrelated debt.
+        let mut prior = restarted;
+        for key in &paced_keys {
+            e2_pipeline_scan_fixture::expire_claimed_growth_for_test(
+                &mut prior,
+                Path::new(key),
+                &paced,
+            );
+        }
         drop(paced);
-        // After the existing six-hour lease expires, keep every exact-debt
-        // and ACK assertion of the retry sequence.
-        sampled_scan::transition_fixture::with_scan_clock(
-            now + sampled_audit::GROWTH_FULL_INTERVAL,
-            || {
-                let mut prior = restarted;
-                let mut read = BTreeSet::new();
-                for _ in 0..expected.len() {
-                    let (selected, working, scan) = selection_page(&fixture, prior.clone(), 1);
-                    assert_eq!(selected.len(), 1);
-                    assert_eq!(scan.scanned_file_count, 1);
-                    assert_eq!(
-                        scan.completed_parses()
-                            .map(|(key, _)| key.to_string())
-                            .collect::<BTreeSet<_>>(),
-                        selected
-                    );
-                    let key = selected.into_iter().next().unwrap();
-                    assert!(read.insert(key.clone()), "a recovered key reads once");
-                    let accepted = crate::snapshot_sync::checkpoint_page_for_test(
-                        &working,
-                        &prior,
-                        &scan,
-                        &fixture.index_path,
-                        &progress,
-                        true,
-                    )
-                    .unwrap();
-                    assert_eq!(
-                        accepted.files[&key].source_file_fingerprint,
-                        working.files[&key].source_file_fingerprint
-                    );
-                    prior = ScanIndex::load(&fixture.index_path).unwrap();
-                    let remaining = expected.difference(&read).cloned().collect::<BTreeSet<_>>();
-                    assert_eq!(
-                        e2_pipeline_scan_fixture::pending_keys_for_test(&prior),
-                        remaining,
-                        "exact ACK prevents requeue"
-                    );
-                }
-                assert_eq!(read, expected);
-                assert!(e2_pipeline_scan_fixture::pending_keys_for_test(&prior).is_empty());
-            },
-        );
+        let mut read = BTreeSet::new();
+        for _ in 0..expected.len() {
+            let (mut selected, mut working, mut scan) = selection_page(&fixture, prior.clone(), 1);
+            if scan.completed_parses().next().is_none() {
+                assert_eq!(selected.len(), 1);
+                let key = selected.iter().next().unwrap();
+                e2_pipeline_scan_fixture::expire_claimed_growth_for_test(
+                    &mut prior,
+                    Path::new(key),
+                    &working,
+                );
+                let next = selection_page(&fixture, prior.clone(), 1);
+                assert_eq!(next.0, selected, "only the deferred claim was expired");
+                (selected, working, scan) = next;
+            }
+            assert_eq!(selected.len(), 1);
+            assert_eq!(scan.scanned_file_count, 1);
+            assert_eq!(
+                scan.completed_parses()
+                    .map(|(key, _)| key.to_string())
+                    .collect::<BTreeSet<_>>(),
+                selected
+            );
+            let key = selected.into_iter().next().unwrap();
+            assert!(read.insert(key.clone()), "a recovered key reads once");
+            let accepted = crate::snapshot_sync::checkpoint_page_for_test(
+                &working,
+                &prior,
+                &scan,
+                &fixture.index_path,
+                &progress,
+                true,
+            )
+            .unwrap();
+            assert_eq!(
+                accepted.files[&key].source_file_fingerprint,
+                working.files[&key].source_file_fingerprint
+            );
+            prior = ScanIndex::load(&fixture.index_path).unwrap();
+            let remaining = expected.difference(&read).cloned().collect::<BTreeSet<_>>();
+            assert_eq!(
+                e2_pipeline_scan_fixture::pending_keys_for_test(&prior),
+                remaining,
+                "exact ACK prevents requeue"
+            );
+        }
+        assert_eq!(read, expected);
+        assert!(e2_pipeline_scan_fixture::pending_keys_for_test(&prior).is_empty());
     }
 }
 
