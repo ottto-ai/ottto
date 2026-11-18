@@ -2759,6 +2759,7 @@ pub(super) fn finish_sync_source(
         if let Some((pass, cycle_owed_nothing)) = walk_idle_pass {
             let now = crate::scan_clock::utc_seconds();
             let outside = cycle_owed_nothing
+                && upload_fully_settled
                 && super::prepare::upload_owes_nothing(
                     source,
                     &upload_progress,

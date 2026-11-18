@@ -3308,8 +3308,10 @@ impl OwnedSourceScan {
                     .expect("traversal remains active");
                 let routine_recensus =
                     traversal_transition::routine_recensus(source, &traversal_snapshot);
-                // A clean walk retiring here may arm the walk gate.
+                // A clean walk with no named loss retiring here may arm the
+                // walk gate, so an idle pass never replaces a loss disclosure.
                 let settled_walk = !traversal_snapshot.rewalk_owed
+                    && traversal_snapshot.counts.settled_residue().is_none()
                     && traversal_snapshot
                         .pending_candidates
                         .iter()

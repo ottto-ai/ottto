@@ -244,7 +244,7 @@ pub(crate) use self::retry::start_collection_health;
 use self::retry::with_source_cadence;
 use self::retry::with_source_cadence_state;
 use self::retry::CADENCE_WAIT_SLICE;
-use self::retry::MAX_CYCLE_INTERVAL;
+pub(crate) use self::retry::MAX_CYCLE_INTERVAL;
 #[cfg(test)]
 use self::retry::SHED_BACKOFF_BASE;
 use self::upload::apply_bootstrapped_cache_heads;

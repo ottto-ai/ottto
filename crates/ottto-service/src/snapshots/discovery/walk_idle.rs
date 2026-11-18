@@ -10,7 +10,7 @@ use std::sync::Mutex;
 /// The backstop, start to start.
 pub(crate) const WALK_GAP: u64 = LISTING_INTERVAL_SECONDS;
 /// Twice the longest cadence interval: a longer gap (sleep) walks.
-pub(crate) const PASS_GAP: u64 = 2 * 30 * 60;
+pub(crate) const PASS_GAP: u64 = 2 * crate::snapshot_sync::MAX_CYCLE_INTERVAL.as_secs();
 
 /// What one pass's walk would read, captured before the scan.
 #[derive(Clone)]

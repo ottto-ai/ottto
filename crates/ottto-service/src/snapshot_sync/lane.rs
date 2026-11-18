@@ -118,7 +118,7 @@ pub fn spawn_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
                 }
                 // The walk gate idles only roots a live, current watcher hints.
                 crate::snapshot_watcher::cover(watcher.as_ref().filter(|_| listed_ok));
-                match sync_once(&home, &support_dir, &daemon) {
+                match sync_once(&home, &support_dir, &daemon, false) {
                     Ok(()) => crate::net_resilience::handle_sync_success(&daemon),
                     Err(error) => {
                         eprintln!("local snapshot sync skipped: {}", safe_error(&error));
@@ -536,11 +536,7 @@ pub fn spawn_one_shot_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
         .name("ottto-snapshot-sync-now".to_string())
         .stack_size(SNAPSHOT_SYNC_WORKER_STACK_BYTES)
         .spawn(move || {
-            // A requested sync walks every source.
-            for source in SNAPSHOT_SOURCES {
-                crate::snapshots::walk_idle::clear(source);
-            }
-            match sync_once(&home, &support_dir, &daemon) {
+            match sync_once(&home, &support_dir, &daemon, true) {
                 Ok(()) => crate::net_resilience::handle_sync_success(&daemon),
                 Err(error) => {
                     eprintln!(
@@ -581,7 +577,13 @@ pub(super) fn set_one_shot_sync_in_flight(value: bool) {
     }
 }
 
-pub(super) fn sync_once(home: &Path, support_dir: &Path, daemon: &LocalDaemon) -> Result<()> {
+/// `walk_all`: a requested sync walks every source.
+pub(super) fn sync_once(
+    home: &Path,
+    support_dir: &Path,
+    daemon: &LocalDaemon,
+    walk_all: bool,
+) -> Result<()> {
     // The periodic loop and setup/UI one-shot path can otherwise scan and save
     // the same per-source index concurrently. Serialize the full cycle so a
     // one-shot rescan cannot race the background loop or publish an older
@@ -590,6 +592,10 @@ pub(super) fn sync_once(home: &Path, support_dir: &Path, daemon: &LocalDaemon) -
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Cleared under the lock, so no finish in flight can re-arm a source.
+    for source in SNAPSHOT_SOURCES.into_iter().filter(|_| walk_all) {
+        crate::snapshots::walk_idle::clear(source);
+    }
     // Before credentials: a re-enabled source resumes even with no live device.
     resume_reconnected_sources(support_dir);
     crate::claude_local_otel::close_append_handles();

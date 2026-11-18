@@ -43,6 +43,8 @@ file-system hint / periodic listing → select file → read new bytes from save
   so that pass walks. Limit: a change the watcher misses silently, with no event and no drop
   flag, waits for the backstop; if its file is deleted before then, its unread usage is lost.
   Back-to-back walks narrow that window to about one walk but do not close it.
+  Desktop store-only edits to idle sessions (rename, archive, removal) do not wake the gate:
+  their titles, lineage and placement can show up to `WALK_GAP` late. Amounts are unaffected.
 - **Selection.** Each pass picks files and a read mode (`transcript_acquisition.rs`). Tail, a read
   from the saved offset, is the normal mode, so bytes read track bytes appended. A Full read has a
   named cause (new or replaced file, missing or invalid saved result, a real edit) and is counted
