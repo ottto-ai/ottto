@@ -309,6 +309,8 @@ pub fn render_launch_agent_plist(config: &LaunchAgentConfig) -> Result<Vec<u8>> 
     root.insert("Label".to_string(), Value::String(config.label.clone()));
     // launchd.plist(5): an app that installs a legacy plist names its bundle
     // here, so Login Items shows the job under the app, not the signer's name.
+    // macOS applies it only when the program and the app share a signing Team
+    // ID and Launch Services knows the app; otherwise nothing changes.
     root.insert(
         "AssociatedBundleIdentifiers".to_string(),
         Value::Array(vec![Value::String(

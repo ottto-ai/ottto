@@ -369,3 +369,54 @@ fn unchanged_loaded_job_restarts_in_place_and_changed_plist_is_replaced() {
     changed.companion_code_requirement = Some("identifier \"test\"".to_string());
     assert_eq!(stages(run(&changed)), ["bootout", "enable", "bootstrap"]);
 }
+
+/// [behaviour] After `bootout`, bootstrap waits until launchd has removed the
+/// job; a job that stays loaded or an unknown probe result is an error.
+#[test]
+fn bootout_waits_for_delayed_job_removal() {
+    let loaded = || -> Result<Option<PathBuf>> {
+        Ok(Some(PathBuf::from(
+            "/Applications/Ottto.app/Contents/Helpers/ottto-service",
+        )))
+    };
+    let mut probes = 0;
+    wait_until_job_absent(
+        || {
+            probes += 1;
+            if probes < 3 {
+                loaded()
+            } else {
+                Ok(None)
+            }
+        },
+        5,
+        Duration::ZERO,
+    )
+    .unwrap();
+    assert_eq!(probes, 3);
+
+    let mut probes = 0;
+    let error = wait_until_job_absent(
+        || {
+            probes += 1;
+            loaded()
+        },
+        5,
+        Duration::ZERO,
+    )
+    .unwrap_err();
+    assert_eq!(probes, 5);
+    assert!(error.to_string().contains("still loaded after bootout"));
+
+    let mut probes = 0;
+    assert!(wait_until_job_absent(
+        || {
+            probes += 1;
+            parse_loaded_program(Some(112), b"")
+        },
+        5,
+        Duration::ZERO,
+    )
+    .is_err());
+    assert_eq!(probes, 1);
+}

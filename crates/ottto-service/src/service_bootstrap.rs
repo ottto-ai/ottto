@@ -9,6 +9,9 @@ use std::process::Command;
 use std::time::Duration;
 
 const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+/// Up to about 5 s for launchd to remove a booted-out job.
+const REMOVAL_POLLS: u32 = 50;
+const REMOVAL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 pub(super) fn install(
     home: &Path,
@@ -43,6 +46,15 @@ pub(super) fn install(
                 "service lifecycle command failed ({status}); installation may be partial: {}",
                 args.join(" ")
             );
+                    // `bootout` can return before launchd removes the job, and a
+                    // bootstrap that arrives first fails. Wait for removal.
+                    if rest.first().map(String::as_str) == Some("bootout") {
+                        wait_until_job_absent(
+                            || loaded_program(lock),
+                            REMOVAL_POLLS,
+                            REMOVAL_POLL_INTERVAL,
+                        )?;
+                    }
                     Ok(())
                 },
             )
@@ -107,6 +119,25 @@ fn install_with(
         }
     }
     Ok(plan)
+}
+
+/// Polls `probe` until the job is absent. A probe error (unknown state) or a
+/// job still present after `polls` checks is an error, so bootstrap never runs
+/// against a job that may still be loaded.
+fn wait_until_job_absent(
+    mut probe: impl FnMut() -> Result<Option<std::path::PathBuf>>,
+    polls: u32,
+    interval: Duration,
+) -> Result<()> {
+    for attempt in 0..polls {
+        if probe()?.is_none() {
+            return Ok(());
+        }
+        if attempt + 1 < polls {
+            std::thread::sleep(interval);
+        }
+    }
+    anyhow::bail!("LaunchAgent is still loaded after bootout; installation may be partial")
 }
 
 fn loaded_program(lock: &ServiceLifecycleTransaction) -> Result<Option<std::path::PathBuf>> {
