@@ -1089,7 +1089,7 @@ fn mid_stream_live_gap_is_memoized_and_skipped_while_unchanged() {
     fs::remove_dir_all(root).unwrap();
 }
 
-/// A real D168 replay refuses inside its first member: the reconstruction
+/// A real from-start replay refuses inside its first member: the reconstruction
 /// counter records that attempt once and exactly the prefix its reader consumed.
 #[test]
 fn a_group_replay_counts_once_with_its_consumed_bytes() {

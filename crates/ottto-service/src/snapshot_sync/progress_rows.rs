@@ -143,9 +143,6 @@ impl SnapshotUploadProgress {
         progress.accepted_cache_heads = heads;
         if progress.destination_namespace_hash != namespace {
             // Another destination's progress, as the JSON load clears it.
-            progress
-                .accepted_identity_buckets
-                .count_retained_cleared_if_any();
             progress = Self::new(namespace.to_owned(), witness.clone());
             progress.generation = rows.generation();
         } else {
@@ -194,9 +191,6 @@ impl SnapshotUploadProgress {
             generation: progress.generation,
         };
         if progress.destination_namespace_hash != namespace {
-            progress
-                .accepted_identity_buckets
-                .count_retained_cleared_if_any();
             progress = Self::new(namespace.to_owned(), witness.clone());
         }
         anyhow::ensure!(
@@ -317,8 +311,7 @@ impl SnapshotUploadProgress {
             point.progress_generation >= discard_before && hints.admissible(&point.accepted)
         })?;
         for (name, point) in points {
-            let retained_reset = point.progress_generation < scope.retained_before;
-            hints.admit(name, point.accepted, retained_reset);
+            hints.admit(name, point.accepted);
         }
         Ok(())
     }
@@ -669,14 +662,6 @@ impl SnapshotUploadProgress {
                 serde_json::from_slice::<Self>(&bytes)
                     .context("parse v3 local snapshot upload progress")
             });
-        // Option (ii) proof is scoped to the namespace that ACKed it.
-        if let Ok(progress) = &parsed {
-            if progress.destination_namespace_hash != expected_destination_namespace_hash {
-                progress
-                    .accepted_identity_buckets
-                    .count_retained_cleared_if_any();
-            }
-        }
         let mut progress = match parsed {
             Ok(progress)
                 if progress.valid(expected_destination_namespace_hash)
@@ -790,7 +775,8 @@ impl SnapshotUploadProgress {
             return false;
         }
         self.historical_replay_generation = Some(generation.to_string());
-        self.accepted_identity_buckets.clear_retained();
+        // The removed retained-identity barrier: still written so the stored
+        // scope keeps its bytes; nothing reads it.
         if self.rows.is_some() && !self.accepted_identity_scope.is_unset() {
             self.accepted_identity_scope.retained_before = self.generation.saturating_add(1);
         }

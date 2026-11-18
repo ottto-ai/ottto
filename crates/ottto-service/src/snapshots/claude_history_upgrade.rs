@@ -585,7 +585,7 @@ crate::heap_layout_bound::fields!(HistoryPage; files, bytes, resident_charge, re
 const PEAK_LINE_MIB: u64 = 500;
 const FLOOR_MIB: u64 = 150;
 const FINISH_RESERVE_MIB: u64 = 120;
-/// D326 amendment: soft admission allowance, not a footprint guarantee.
+/// Soft admission allowance, not a footprint guarantee.
 /// The AIMD file limit binds above ≈200 MiB on observed waves.
 pub(super) const RESIDENT_PAGE_BUDGET_MIB: u64 = PEAK_LINE_MIB - FLOOR_MIB - FINISH_RESERVE_MIB;
 const _: () = assert!(PEAK_LINE_MIB > FLOOR_MIB + FINISH_RESERVE_MIB);

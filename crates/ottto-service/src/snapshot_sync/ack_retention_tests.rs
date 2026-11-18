@@ -188,7 +188,6 @@ pub(super) fn exact_ack(
                 head_etag: item.cache_observations.as_ref().map(|_| "a".repeat(64)),
                 head_challenge: None,
                 unchanged_basis: None,
-                retained_proof_missing: Vec::new(),
                 cache_observations_state: None,
             });
     }
@@ -775,9 +774,6 @@ fn partial_checkpoint_ignores_the_ledger_binding_of_this_cycle() {
     progress
         .accepted_identity_buckets
         .bind_test_key(Some([0x41; 32]));
-    progress
-        .accepted_identity_buckets
-        .set_retained_enabled(true);
     progress.accepted_identity_buckets.record(&hint);
     assert!(!progress.accepted_identity_buckets.is_empty());
     progress.save_fixture(&f.progress_path).unwrap();

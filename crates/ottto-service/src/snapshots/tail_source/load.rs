@@ -25,7 +25,7 @@
 //! key (a rotation) is an explicit-action reconstruction: counted, but
 //! neither a release-gate failure nor an alarm. Attribution toggled on or off
 //! since the head is no rotation: the head is reused with its context digest
-//! scrubbed, as main scrubs a retained parse's (D168-2).
+//! scrubbed, as main scrubs a retained parse's.
 use super::counters;
 use super::seam::TailBase;
 use super::{HeadIdentity, LiveLoadError, ReconstructCause, TailSource};
@@ -306,7 +306,7 @@ fn load_with_bytes<S: TailSource>(
         }
         Err(Miss::Future | Miss::FutureFact | Miss::LiveUnavailable) => ("held", None, Load::Held),
         // Valid stored state for a file that changed: an ordinary Full. A
-        // shorter file is main's counted Full; no floor holds it (D158).
+        // shorter file is main's counted Full; no floor holds it.
         Err(Miss::Changed(reason)) => {
             if reason == FullReason::Shrunk {
                 counters::bump(source, "tail_shorter_file_full", "files");

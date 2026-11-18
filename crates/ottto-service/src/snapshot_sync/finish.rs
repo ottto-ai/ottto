@@ -1185,15 +1185,6 @@ pub(super) fn finish_sync_source(
         .set_item_cap(identity_item_cap);
     upload_progress
         .accepted_identity_buckets
-        .set_retained_enabled(
-            source == SnapshotSource::ClaudeCode
-                && activity_hint
-                    .session_request_identity_retained_contract
-                    .as_deref()
-                    == Some(crate::snapshots::claude_request_identity::IDENTITY_RETAINED_CONTRACT),
-        );
-    upload_progress
-        .accepted_identity_buckets
         .set_account_source_enabled(
             activity_hint
                 .session_request_account_source_contract

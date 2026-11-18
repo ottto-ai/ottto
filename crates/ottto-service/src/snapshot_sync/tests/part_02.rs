@@ -27,7 +27,6 @@ fn cache_event_ack_restart_correction_and_missing_proof() {
             head_etag: Some("e".repeat(64)),
             head_challenge: None,
             unchanged_basis: None,
-            retained_proof_missing: Vec::new(),
             cache_observations_state: None,
         }],
         unchanged_entities: Vec::new(),
@@ -406,7 +405,6 @@ fn account_ack_retry_checkpoints_released_witness_then_becomes_noop() {
             head_etag: None,
             head_challenge: None,
             unchanged_basis: None,
-            retained_proof_missing: Vec::new(),
             cache_observations_state: None,
         };
         let response = crate::snapshot_client::SnapshotBatchResponse {
@@ -698,7 +696,6 @@ fn same_replay_generation_restores_cleared_conflict_progress_until_retry() {
                     head_etag: None,
                     head_challenge: None,
                     unchanged_basis: None,
-                    retained_proof_missing: Vec::new(),
                     cache_observations_state: None,
                 }],
             })
@@ -1070,7 +1067,6 @@ fn entity_ack_ref(fingerprint: &str) -> crate::snapshot_client::SnapshotEntityRe
         head_etag: None,
         head_challenge: None,
         unchanged_basis: None,
-        retained_proof_missing: Vec::new(),
         cache_observations_state: None,
     }
 }
@@ -1170,7 +1166,6 @@ fn entity_ack_rejection_counts_one_poison_after_durable_quarantine() {
                     head_etag: None,
                     head_challenge: None,
                     unchanged_basis: None,
-                    retained_proof_missing: Vec::new(),
                     cache_observations_state: None,
                 }],
                 unchanged_entities: Vec::new(),

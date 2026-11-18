@@ -831,7 +831,7 @@ fn partial_ack_keeps_the_unaccepted_sibling_owed() {
 }
 
 /// [money] A saved accepted extent ahead of all available bytes, with no
-/// independent shrink proof. No floor holds the file (D158): whatever the
+/// independent shrink proof. No floor holds the file: whatever the
 /// scan reads, it never re-emits a smaller body, and any body it sends is the
 /// cold Full's.
 #[test]

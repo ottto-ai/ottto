@@ -354,7 +354,7 @@ impl HeadIdentity {
     /// field: another route is `Identity`, another capture mode
     /// `Incompatible`, another key `KeyEpoch`. `Ok(true)`: a key on one side
     /// only, so session attribution was toggled since. That is a settings
-    /// change, applied forward only (D168-2): the head is reused with its
+    /// change, applied forward only: the head is reused with its
     /// keyed fields scrubbed, as a retained parse's are, never re-read.
     pub(in crate::snapshots) fn check(&self, head: &[u8]) -> Result<bool, ReconstructCause> {
         let stored = Self::take(&mut Dec::new(head))?;
@@ -811,7 +811,7 @@ fn read_shared_page(
     }
 }
 
-/// The session facts (D168-1): content the head never carries, one element
+/// The session facts: content the head never carries, one element
 /// per page at the kind's position, `[kind][version][value]`. A slot is
 /// rewritten when its fact changes. An unknown kind or version holds its file
 /// as future state. Workspace accepts path-only v1 and v2 with a Git or non-Git
@@ -1027,8 +1027,8 @@ macro_rules! head_fields {
 // and requests, usage buckets and totals), live fields (Desktop identity and
 // spawn lineage, account hash). The Pi ledger and Codex's `I` fields are
 // written only by those sources' parsers (Codex's by
-// `apply_codex_owned_line`), so a Claude parse leaves them empty (D62).
-// D203: retired entries retain only the original byte walk and shape descriptors.
+// `apply_codex_owned_line`), so a Claude parse leaves them empty.
+// Retired entries retain only the original byte walk and shape descriptors.
 head_fields! {
     {
         N source: SnapshotSource,
