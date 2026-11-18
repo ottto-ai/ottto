@@ -362,6 +362,7 @@
     "residue.growth_retries.*",
     "residue.index_keys",
     "residue.index_keys[]",
+    "rewalk_owed",
     "scan_roots",
     "scan_roots[]",
     "unhealthy_retry_attempt",
