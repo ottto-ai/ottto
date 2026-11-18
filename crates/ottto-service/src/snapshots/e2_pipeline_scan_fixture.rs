@@ -187,6 +187,7 @@ pub(crate) fn load_source_for_test(
     source: SnapshotSource,
     support: &Path,
 ) -> Result<(ScanIndex, ScanIndexLoadOrigin)> {
+    bind_source_for_test(path, source);
     match ScanIndex::load_for_snapshot_source_with_origin(path, source, support) {
         Ok((index, origin)) if origin == ScanIndexLoadOrigin::Quarantined => {
             // Legacy quarantine authorizes a fresh rebuilt graph. The fixture
@@ -222,6 +223,31 @@ pub(crate) fn mutate_index_for_test(path: &Path, mutate: impl FnOnce(&mut serde_
     let mut value = serde_json::to_value(ScanIndex::load(path).unwrap()).unwrap();
     mutate(&mut value);
     seed_json_for_test(path, &serde_json::to_vec(&value).unwrap());
+}
+
+/// Decoder-only inspection does not adopt the mapper's input as live custody.
+pub(crate) fn read_legacy_for_test(path: &Path) -> ScanIndex {
+    read_scan_index_representation(path, "load", "unattributed", None).unwrap()
+}
+
+/// Inventory refusals preserve their original input and expose support action.
+pub(crate) fn assert_import_support_for_test(path: &Path) {
+    bind_input_for_test(&ScanIndex::default(), path);
+    let before = fs::read(path).unwrap();
+    let error = ScanIndex::load(path).unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<state_v2::Hold>(),
+        Some(&state_v2::Hold::DbUnavailable)
+    );
+    assert_support_error_for_test(&error);
+    assert_eq!(fs::read(path).unwrap(), before);
+}
+
+pub(crate) fn assert_support_error_for_test(error: &anyhow::Error) {
+    assert_eq!(
+        scan_index_health::state_v2_reason(error).unwrap().action(),
+        "contact_support"
+    );
 }
 
 /// Explicit native seed for decoder fixtures whose original bytes deliberately
@@ -1602,6 +1628,39 @@ pub(crate) fn expire_claimed_growth_for_test(index: &mut ScanIndex, path: &Path)
         .traversal
         .as_ref()
         .is_some_and(|walk| walk.counts.growth_deferred > 0));
+    expire_growth_claim(index, path);
+}
+
+/// Age only a saved claim proved by an uncommitted deferred page. Its
+/// predecessor metadata and queue changes remain uncommitted.
+pub(crate) fn expire_observed_growth_for_test(
+    index: &mut ScanIndex,
+    path: &Path,
+    deferred: &ScanIndex,
+) {
+    assert_eq!(route_of(index), route_of(deferred));
+    let key = local_index_key(path);
+    assert!(sampled_audit::growth_full_paced(
+        deferred,
+        &key,
+        sampled_scan::now_seconds()
+    ));
+    assert!(deferred
+        .traversal
+        .as_ref()
+        .is_some_and(|walk| walk.counts.growth_deferred > 0));
+    let saved = serde_json::to_value(&index.v2().growth_retention[&key]).unwrap();
+    let observed = serde_json::to_value(&deferred.v2().growth_retention[&key]).unwrap();
+    assert_eq!(
+        saved["last_growth_full_unix"],
+        observed["last_growth_full_unix"]
+    );
+    expire_growth_claim(index, path);
+}
+
+fn expire_growth_claim(index: &mut ScanIndex, path: &Path) {
+    let key = local_index_key(path);
+    let now = sampled_scan::now_seconds();
     let state = index.v2_mut().growth_retention.get_mut(&key).unwrap();
     let mut value = serde_json::to_value(&*state).unwrap();
     value["last_growth_full_unix"] = json!(now - sampled_audit::GROWTH_FULL_INTERVAL);

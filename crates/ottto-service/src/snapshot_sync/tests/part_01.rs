@@ -331,8 +331,8 @@ fn cache_pending_head_lifecycle_survives_finish_and_targets_only_accepted_head()
     progress
         .record_pending_cache_head(&item, &cache_head_file_groups(&index), true)
         .unwrap();
-    progress.save(&path).unwrap();
-    progress.finish_cycle(&path).unwrap();
+    progress.save_fixture(&path).unwrap();
+    progress.finish_cycle_fixture(&path).unwrap();
     let namespace = progress.destination_namespace_hash.clone();
     let witness = progress.active_quarantine_witness.clone().unwrap();
     progress = SnapshotUploadProgress::load(&path, &namespace, witness).unwrap();
@@ -379,7 +379,7 @@ fn cache_pending_head_lifecycle_survives_finish_and_targets_only_accepted_head()
             response.validate_entity_ack_with_head_cas(&request, enforce)?;
             Ok(response)
         },
-        |progress| progress.save(&path),
+        |progress| progress.save_fixture(&path),
     )
     .unwrap();
     assert_eq!(
@@ -405,6 +405,7 @@ fn cache_pending_head_lifecycle_survives_finish_and_targets_only_accepted_head()
         "ordinary head acquisition does not certify provisional cache state"
     );
     std::fs::remove_dir_all(&root).unwrap();
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 #[test]
@@ -531,7 +532,7 @@ fn cache_pending_head_two_files_multi_siblings_survive_partial_cache_settlement(
     std::fs::create_dir_all(&root).unwrap();
     let progress_path = root.join("progress.json");
     let index_path = root.join("index.json");
-    progress.save(&progress_path).unwrap();
+    progress.save_fixture(&progress_path).unwrap();
     // Ordinary body settlement followed by index commit may crash before
     // cycle cleanup. No cache/head authority is inferred from that ACK.
     let ordinary = [&first, &sibling, &second]
@@ -554,7 +555,7 @@ fn cache_pending_head_two_files_multi_siblings_survive_partial_cache_settlement(
         |item| item.snapshot_fingerprint.as_str(),
         snapshot_upload_body_witness,
         |items| Ok(accepted_batch(items.len())),
-        |progress| progress.save(&progress_path),
+        |progress| progress.save_fixture(&progress_path),
     )
     .unwrap();
     index.save_fixture(&index_path).unwrap();
@@ -598,7 +599,7 @@ fn cache_pending_head_two_files_multi_siblings_survive_partial_cache_settlement(
             response.validate_entity_ack_with_head_cas(&request, enforce)?;
             Ok(response)
         },
-        |progress| progress.save(&progress_path),
+        |progress| progress.save_fixture(&progress_path),
     )
     .unwrap();
     let mut selected = index.clone();
@@ -651,7 +652,7 @@ fn cache_pending_head_two_files_multi_siblings_survive_partial_cache_settlement(
             response.validate_entity_ack_with_head_cas(&request, true)?;
             Ok(response)
         },
-        |progress| progress.save(&progress_path),
+        |progress| progress.save_fixture(&progress_path),
     )
     .unwrap();
     assert_eq!(
@@ -682,7 +683,7 @@ fn cache_pending_head_two_files_multi_siblings_survive_partial_cache_settlement(
         pending.settled_entities,
         BTreeSet::from([first.snapshot_fingerprint.clone()])
     );
-    progress.finish_cycle(&progress_path).unwrap();
+    progress.finish_cycle_fixture(&progress_path).unwrap();
     progress = SnapshotUploadProgress::load(&progress_path, &namespace, witness).unwrap();
     assert_eq!(
         progress.reselect_pending_cache_heads(&mut index.clone(), true),
@@ -777,7 +778,7 @@ fn cache_pending_head_two_files_multi_siblings_survive_partial_cache_settlement(
             response.validate_entity_ack_with_head_cas(&request, true)?;
             Ok(response)
         },
-        |progress| progress.save(&progress_path),
+        |progress| progress.save_fixture(&progress_path),
     )
     .unwrap();
     index.retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
@@ -795,6 +796,7 @@ fn cache_pending_head_two_files_multi_siblings_survive_partial_cache_settlement(
         "final exact cache-bearing sibling ACK completes the group"
     );
     std::fs::remove_dir_all(&root).unwrap();
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 fn cache_effective_wire_fixture_root() -> PathBuf {
@@ -1209,8 +1211,8 @@ fn cache_effective_wire_mandatory_head_obligation_survives_finalizer_noop() {
     let index_path = root.join("index.json");
     let progress_path = root.join("progress.json");
     index.save_fixture(&index_path).unwrap();
-    progress.save(&progress_path).unwrap();
-    progress.finish_cycle(&progress_path).unwrap();
+    progress.save_fixture(&progress_path).unwrap();
+    progress.finish_cycle_fixture(&progress_path).unwrap();
     progress = SnapshotUploadProgress::load(
         &progress_path,
         &progress.destination_namespace_hash,
@@ -1316,9 +1318,9 @@ fn cache_effective_wire_mandatory_head_obligation_survives_finalizer_noop() {
             )
             .unwrap());
     }
-    progress.save(&progress_path).unwrap(); // obligation before no-op index settlement
+    progress.save_fixture(&progress_path).unwrap(); // obligation before no-op index settlement
     index.save_fixture(&index_path).unwrap();
-    progress.finish_cycle(&progress_path).unwrap();
+    progress.finish_cycle_fixture(&progress_path).unwrap();
     let mut loaded = ScanIndex::load(&index_path).unwrap();
     loaded.activate_upload_context("cache-on-mandatory".into());
     loaded.activate_effective_upload_body_witness_revision(effective_upload_body_witness_revision(
@@ -1345,7 +1347,7 @@ fn cache_effective_wire_mandatory_head_obligation_survives_finalizer_noop() {
         &unique_poison_scope(),
         &mut progress,
         |items, enforce| response(items, enforce, enforce.then(|| "e".repeat(64))),
-        |state| state.save(&progress_path),
+        |state| state.save_fixture(&progress_path),
     )
     .unwrap();
     assert_eq!(progress.reselect_pending_cache_heads(&mut loaded, true), 1);
@@ -1383,7 +1385,7 @@ fn cache_effective_wire_mandatory_head_obligation_survives_finalizer_noop() {
         |item| item.snapshot_fingerprint.as_str(),
         snapshot_upload_body_witness,
         |items| response(items, true, Some("f".repeat(64))),
-        |state| state.save(&progress_path),
+        |state| state.save_fixture(&progress_path),
     )
     .unwrap();
     assert_eq!(
@@ -1406,9 +1408,10 @@ fn cache_effective_wire_mandatory_head_obligation_survives_finalizer_noop() {
         &witnesses,
     );
     assert!(progress.pending_cache_heads.is_empty());
-    progress.finish_cycle(&progress_path).unwrap();
+    progress.finish_cycle_fixture(&progress_path).unwrap();
     assert!(scan(&mut loaded).snapshots.is_empty());
     std::fs::remove_dir_all(&root).unwrap();
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 #[test]
@@ -2178,7 +2181,7 @@ fn combined_revision_wire_uses_same_scan_index_and_ack_predecessor() {
             |item| item.snapshot_fingerprint.as_str(),
             snapshot_upload_body_witness,
             |_| Ok(response.clone()),
-            |progress| progress.save(&progress_path),
+            |progress| progress.save_fixture(&progress_path),
         )
         .unwrap();
         let mut projection = json!({"session_account_evidence":wire["snapshots"][0]["session_account_evidence"],
@@ -2204,7 +2207,7 @@ fn combined_revision_wire_uses_same_scan_index_and_ack_predecessor() {
             "predecessor_cache_observations_state":if step==0 {serde_json::Value::Null} else {first_state.clone()},
             "predecessor_head_etag":if step==0 {serde_json::Value::Null} else {json!("65".repeat(32))},
             "body_projection":projection,"accepted_head_etag":response.accepted_entities[0].head_etag}));
-        progress.finish_cycle(&progress_path).unwrap();
+        progress.finish_cycle_fixture(&progress_path).unwrap();
         progress = SnapshotUploadProgress::load(
             &progress_path,
             &progress.destination_namespace_hash,
@@ -2216,6 +2219,7 @@ fn combined_revision_wire_uses_same_scan_index_and_ack_predecessor() {
         std::fs::write(output, serde_json::to_vec_pretty(&json!({"contract_version":"paired_creator_cache_revision_corpus:v1","cases":cases})).unwrap()).unwrap();
     }
     std::fs::remove_dir_all(root).unwrap();
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 #[test]
@@ -2290,7 +2294,7 @@ fn accepted_cache_state_past_old_caps_survives_progress_restart() {
     let root = test_dir("cache-state-restart");
     std::fs::create_dir_all(&root).unwrap();
     let path = root.join("progress.json");
-    progress.save(&path).unwrap();
+    progress.save_fixture(&path).unwrap();
     let namespace = progress.destination_namespace_hash.clone();
     let witness = progress.active_quarantine_witness.clone().unwrap();
     let restored = SnapshotUploadProgress::load(&path, &namespace, witness).unwrap();
@@ -2311,4 +2315,5 @@ fn accepted_cache_state_past_old_caps_survives_progress_restart() {
         "nothing quarantined beside the progress file"
     );
     std::fs::remove_dir_all(root).unwrap();
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }

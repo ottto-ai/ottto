@@ -169,7 +169,7 @@ fn codex_union_native_transport_partial_rejection_keeps_capture_and_quarantine_g
                     false,
                 )
             },
-            |progress| progress.save(&progress_path),
+            |progress| progress.save_fixture(&progress_path),
         )
         .unwrap();
         assert_eq!(outcome, ResumableUploadResult::Rejected { count: 1 });
@@ -228,6 +228,7 @@ fn codex_union_native_transport_partial_rejection_keeps_capture_and_quarantine_g
             2
         );
         std::fs::remove_dir_all(root).unwrap();
+        crate::snapshots::state_v2::close_removed_routes_for_test();
     }
 }
 mod codex_counting_lifecycle_tests {
@@ -405,7 +406,7 @@ fn codex_union_native_transport_restart(priority: bool, lose_member_after_ack: b
             };
             client.upload_batch("synthetic-relay", &request, false)
         },
-        |progress| progress.save(&progress_path),
+        |progress| progress.save_fixture(&progress_path),
     )
     .unwrap();
     assert!(matches!(outcome, ResumableUploadResult::Completed));
@@ -436,6 +437,7 @@ fn codex_union_native_transport_restart(priority: bool, lose_member_after_ack: b
         assert!(held.snapshots.is_empty(), "durable standard-tier ACK must not permit a smaller replacement after loss before index promotion: {:?}", held.snapshots.iter().map(|item| item.input_tokens).collect::<Vec<_>>());
         assert!(!held.census_complete);
         std::fs::remove_dir_all(root).unwrap();
+        crate::snapshots::state_v2::close_removed_routes_for_test();
         return;
     }
     let before_promotion = ScanIndex::load(&index_path).unwrap();
@@ -477,7 +479,7 @@ fn codex_union_native_transport_restart(priority: bool, lose_member_after_ack: b
         |item: &SnapshotItem| item.snapshot_fingerprint.as_str(),
         snapshot_upload_body_witness,
         |_| panic!("durable common ACK must suppress a repeated POST"),
-        |progress| progress.save(&progress_path),
+        |progress| progress.save_fixture(&progress_path),
     )
     .unwrap();
     assert!(matches!(resumed, ResumableUploadResult::Completed));
@@ -519,6 +521,7 @@ fn codex_union_native_transport_restart(priority: bool, lose_member_after_ack: b
     assert!(quiet.snapshots.is_empty());
     assert_eq!(quiet.semantic_noop_count, 2);
     std::fs::remove_dir_all(root).unwrap();
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 fn same_source_fixture_ack(
@@ -733,7 +736,7 @@ impl SameSourceAckFixture {
             &snapshot_upload_body_witness,
             &|item: &SnapshotItem| Some(item.source_session_id.as_str()),
             &mut { upload },
-            &mut |p: &mut SnapshotUploadProgress| p.save(&self.progress_path),
+            &mut |p: &mut SnapshotUploadProgress| p.save_fixture(&self.progress_path),
         )
     }
     fn checkpoint_boundary(&mut self, authority: impl FnOnce() -> Result<()>) -> Result<usize> {
@@ -965,6 +968,7 @@ fn v2_progress_above_old_bound_uploads_receipts_and_recovers_exactly() {
             grow(&copied);
             let scanned = SameSourceAckFixture::cold_full_of(&copy, true);
             std::fs::remove_dir_all(&copy).unwrap();
+            crate::snapshots::state_v2::close_removed_routes_for_test();
             let patch = scanned
                 .iter()
                 .find(|item| item.source_session_id == f.items[2].source_session_id)
@@ -1030,7 +1034,7 @@ fn v2_progress_above_old_bound_uploads_receipts_and_recovers_exactly() {
                 },
             );
         }
-        f.progress.save(&f.progress_path).unwrap();
+        f.progress.save_fixture(&f.progress_path).unwrap();
         let bytes = std::fs::read(&f.progress_path).unwrap();
         assert!(
             phase == 0 || bytes.len() > OLD_PROGRESS_BOUND_FOR_TEST,
@@ -1068,7 +1072,7 @@ fn v2_progress_above_old_bound_uploads_receipts_and_recovers_exactly() {
                     post(items);
                     headed(items)
                 },
-                |progress| progress.save(&f.progress_path),
+                |progress| progress.save_fixture(&f.progress_path),
             )
             .unwrap();
             // Only T's head is new: the probe's.
@@ -1284,11 +1288,11 @@ fn v2_identity_ledger_above_old_bound_recovers_cold_placement() {
             serde_json::json!({"observations":[], "value":"x".repeat(100_000)}),
         );
     }
-    progress.save(&path).unwrap();
+    progress.save_fixture(&path).unwrap();
     for snapshot in cold.snapshots.values() {
         progress.record_stored_state(snapshot, false, None).unwrap();
     }
-    progress.save(&path).unwrap();
+    progress.save_fixture(&path).unwrap();
     let after = std::fs::read(&path).unwrap();
     assert!(
         after.len() > OLD_PROGRESS_BOUND_FOR_TEST,
@@ -1448,7 +1452,7 @@ fn same_source_ack_progress_manual_race_rejects_older_ledger() {
     newer
         .accepted_cache_heads
         .insert(cache_session_key("newer"), "e".repeat(64));
-    newer.save(&f.progress_path).unwrap();
+    newer.save_fixture(&f.progress_path).unwrap();
     assert!(f.checkpoint_boundary(|| Ok(())).is_err());
     assert_eq!(f.baseline.generation, before);
     assert_eq!(f.working.generation, before);
@@ -1802,7 +1806,7 @@ fn claude_p92_mixed_503_lost_ack_restart_preserves_candidate() {
                 code: None,
             }))
         },
-        |state| state.save(&path),
+        |state| state.save_fixture(&path),
     )
     .unwrap();
     assert_eq!(
@@ -1819,7 +1823,7 @@ fn claude_p92_mixed_503_lost_ack_restart_preserves_candidate() {
     );
     // Save/reload the existing checkpoint domains. Fresh proof reconstructs
     // the same body; a marker-only restarted binder cannot release it.
-    progress.save(&path).unwrap();
+    progress.save_fixture(&path).unwrap();
     let mut restored = SnapshotUploadProgress::load(
         &path,
         &namespace,
@@ -1865,12 +1869,12 @@ fn claude_p92_mixed_503_lost_ack_restart_preserves_candidate() {
             assert_eq!(serde_json::to_vec(&items[0]).unwrap(), expected);
             Err(anyhow!("synthetic response lost after server settlement"))
         },
-        |state| state.save(&path),
+        |state| state.save_fixture(&path),
     );
     assert!(lost.is_err());
     assert_eq!(accepted, 0);
     assert!(!restored.accepted_fingerprints.contains(&semantic));
-    restored.save(&path).unwrap();
+    restored.save_fixture(&path).unwrap();
     let mut after_loss = SnapshotUploadProgress::load(
         &path,
         &namespace,
@@ -1919,7 +1923,7 @@ fn claude_p92_mixed_503_lost_ack_restart_preserves_candidate() {
             response.validate_entity_ack_with_head_cas(&request, true)?;
             Ok(response)
         },
-        |state| state.save(&path),
+        |state| state.save_fixture(&path),
     )
     .unwrap();
     assert_eq!(accepted, 1);
@@ -1941,12 +1945,15 @@ fn claude_p92_mixed_503_lost_ack_restart_preserves_candidate() {
             calls += 1;
             Ok(accepted_batch(1))
         },
-        |state| state.save(&path),
+        |state| state.save_fixture(&path),
     )
     .unwrap();
     assert_eq!(calls, 0);
     assert_eq!(accepted, 1, "same settled candidate is a no-op");
     std::fs::remove_dir_all(root).unwrap();
+    crate::snapshots::state_v2::close_removed_routes_for_test();
     std::fs::remove_dir_all(candidate_root).unwrap();
+    crate::snapshots::state_v2::close_removed_routes_for_test();
     std::fs::remove_dir_all(retry_root).unwrap();
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }

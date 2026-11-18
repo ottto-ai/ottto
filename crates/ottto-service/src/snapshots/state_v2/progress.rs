@@ -612,6 +612,11 @@ fn count_page(outcome: Option<&ProgressPage>) {
 fn count_page(_: Option<&ProgressPage>) {}
 
 impl ProgressRows {
+    #[cfg(test)]
+    pub(crate) fn index_path_for_test(&self) -> &Path {
+        &self.path
+    }
+
     pub(crate) fn generation(&self) -> u64 {
         self.baseline.generation
     }

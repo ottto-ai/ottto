@@ -423,7 +423,7 @@ impl PipelineFixture {
                 scan.snapshots.len()
             );
             progress
-                .save(&progress_path)
+                .save_fixture(&progress_path)
                 .expect("save lease before synthetic upload");
         }
         let request_owned_sessions = request_owned_sessions(&scan);
@@ -437,7 +437,7 @@ impl PipelineFixture {
             progress
                 .extend_reason_reoffers_before_upload(&scan.snapshots, &holds.held_fingerprints);
             progress
-                .save(&progress_path)
+                .save_fixture(&progress_path)
                 .expect("save pre-send cooldown");
         }
         let leased_reoffers = progress.active_reason_reoffers.clone();
@@ -510,7 +510,7 @@ impl PipelineFixture {
             },
             |checkpoint| {
                 if self.durable_progress {
-                    checkpoint.save(&progress_path)?;
+                    checkpoint.save_fixture(&progress_path)?;
                 }
                 Ok(())
             },
@@ -810,6 +810,7 @@ pub(super) fn assert_listed_fold_absent<'a>(
 impl Drop for PipelineFixture {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.base);
+        crate::snapshots::state_v2::close_removed_routes_for_test();
     }
 }
 
@@ -1318,7 +1319,11 @@ fn codex_partial_ack_keeps_the_unacknowledged_new_file_owed_without_a_restart() 
     );
     let index_path = dir.join("codex-index.json");
     let progress_path = dir.join("codex-progress.json");
-    progress.save(&progress_path).unwrap();
+    progress.save_fixture(&progress_path).unwrap();
+    let committed =
+        crate::snapshots::e2_pipeline_scan_fixture::seed_index_for_test(&committed, &index_path);
+    working.retain_persistence_baseline_from(&committed);
+    working.generation = committed.generation;
     let mut index = checkpoint_partial_snapshot_index(
         &working,
         &committed,
@@ -1361,6 +1366,7 @@ fn codex_partial_ack_keeps_the_unacknowledged_new_file_owed_without_a_restart() 
         "the acknowledged file is not read again"
     );
     let _ = std::fs::remove_dir_all(&dir);
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 /// A quiet traversal after a restart (a fresh in-memory cache) in the same

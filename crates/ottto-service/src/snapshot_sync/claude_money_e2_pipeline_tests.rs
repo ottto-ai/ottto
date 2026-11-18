@@ -190,6 +190,7 @@ impl Corpus {
 impl Drop for Corpus {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.base);
+        crate::snapshots::state_v2::close_removed_routes_for_test();
     }
 }
 struct Page {

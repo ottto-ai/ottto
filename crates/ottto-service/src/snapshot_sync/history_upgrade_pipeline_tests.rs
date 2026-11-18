@@ -463,6 +463,7 @@ impl HistoryFixture {
 impl Drop for HistoryFixture {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.base);
+        crate::snapshots::state_v2::close_removed_routes_for_test();
     }
 }
 
@@ -871,7 +872,7 @@ fn user_repair_override_carries_accepted_history_through_census_and_release() {
         )
         .unwrap()
         .1,
-        crate::snapshots::ScanIndexLoadOrigin::Quarantined
+        crate::snapshots::ScanIndexLoadOrigin::Loaded
     );
     // Seed ACKs RIGHT BEFORE damage/override. No intervening rebuild or settlement.
     seed_json_for_test(&fixture.index_path, &serde_json::to_vec(&baseline).unwrap());
@@ -986,7 +987,7 @@ fn user_repair_carried_history_vanished_file_releases_at_healthy_terminal() {
         )
         .unwrap()
         .1,
-        crate::snapshots::ScanIndexLoadOrigin::Quarantined
+        crate::snapshots::ScanIndexLoadOrigin::Loaded
     );
     // Seed ACKs RIGHT BEFORE damage/override. No intervening rebuild or settlement.
     seed_json_for_test(&fixture.index_path, &serde_json::to_vec(&baseline).unwrap());

@@ -242,7 +242,7 @@ fn drain_from(
         assert!(page.scan.charge_deferred);
         if restart {
             let progress_path = c.base.join("resident-progress.json");
-            progress.save(&progress_path).unwrap();
+            progress.save_fixture(&progress_path).unwrap();
             progress = SnapshotUploadProgress::load(
                 &progress_path,
                 &format!("{:064x}", 99),
@@ -544,7 +544,7 @@ fn resident_wave_held_money_survives_refusal_not_stored_partial_and_ack_crash() 
             });
             if refusal == "crash_after_ack" {
                 let path = c.base.join("ack-crash-progress.json");
-                progress.save(&path).unwrap();
+                progress.save_fixture(&path).unwrap();
                 progress = SnapshotUploadProgress::load(
                     &path,
                     &format!("{:064x}", 99),

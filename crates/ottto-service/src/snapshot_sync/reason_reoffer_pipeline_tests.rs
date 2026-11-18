@@ -1474,7 +1474,7 @@ fn a_restarted_ordinary_prepare_mirrors_an_open_head_conflict() {
             last_answer_unix: 0,
         },
     );
-    progress.save(&first.progress_path).unwrap();
+    progress.save_fixture(&first.progress_path).unwrap();
     pipeline.daemon = test_daemon("otm_test");
     let preparation = pipeline
         .prepare_cycle(t0 + 600)
@@ -2003,7 +2003,7 @@ fn missing_published_index_with_claim_only_ledger_refuses_without_reread() {
     claim.quarantined_fingerprints.clear();
     claim.permanent_rejections.clear();
     claim
-        .save(&first.progress_path)
+        .save_fixture(&first.progress_path)
         .expect("write the claim-only ledger");
     assert!(!claim.records_server_attested_upload());
     let progress_before = std::fs::read(&first.progress_path).ok();
@@ -2164,6 +2164,16 @@ fn lost_list_intent_pipeline(name: &str, set: bool, malformed: bool) {
     }
     let index_path = claude_index_path(&pipeline.support);
     crate::snapshots::e2_pipeline_scan_fixture::legacy_input_for_test(&index_path, b"{not json");
+    let held = match pipeline.prepare_cycle(t0 + 120) {
+        Err(error) => error,
+        _ => panic!("quarantine publication requires the next ordinary pass"),
+    };
+    assert_eq!(
+        held.downcast_ref::<crate::snapshots::state_v2::Hold>(),
+        Some(&crate::snapshots::state_v2::Hold::ReloadRequired)
+    );
+    assert_eq!(pipeline.server.offered().len(), initial);
+    assert!(index_path.exists(), "native publication keeps its fence");
     assert!(!reemission_list_path(&pipeline.support).exists());
     assert!(!seen.exists());
     let (second, lines) = crate::local_resource_diagnostics::capture(|| {
@@ -2693,7 +2703,7 @@ fn held_probe_old_refusal_cannot_receipt_legacy_or_grown_body() {
         .permanent_rejections
         .values_mut()
         .for_each(|record| record.exposure = None);
-    cycle.progress.save(&cycle.progress_path).unwrap();
+    cycle.progress.save_fixture(&cycle.progress_path).unwrap();
     for entry in cycle.index.files.values_mut() {
         entry.upload_context_receipt = None;
     }

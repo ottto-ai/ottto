@@ -1137,7 +1137,9 @@ fn ack_followup_set_debt(preparation: &mut SourcePreparation, debt: &[String], p
             .accepted_fingerprints
             .retain(|fp| !debt.contains(fp));
     }
-    progress.save(&preparation.upload_progress_path).unwrap();
+    progress
+        .save_fixture(&preparation.upload_progress_path)
+        .unwrap();
 }
 
 /// #794 F3: incomplete-census capacity stop, then a Disabled finish, then

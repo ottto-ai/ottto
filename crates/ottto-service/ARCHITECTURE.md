@@ -469,6 +469,18 @@ queued unblocked siblings can still advance. Terminal-unhealthy walks use the sc
 retry eligibility. Battery cannot renew this reason; an AC request already issued may wake
 once after unplugging. Clean retirement or bootstrap completion ends this request.
 
+All scan-index saves use SQLite. Legacy JSON is retained only as one-time
+import input. Collection waits for verified publication and adoption. Ordinary
+source passes retry transient import/publication failures; deterministic input
+refusals retain the existing support blocker. Successful authenticated adoption
+clears it. Quarantine and user Repair use the same verified publisher at G=0;
+Repair keeps its identity and accepted-debt carry, witness and cooldown ordering.
+
+Snapshot audits start from an empty in-memory graph, finish the traversal in
+memory and aggregate every page. Each invocation reports the complete selected
+source again; the report schema is unchanged. Audit state directories retain
+only their privacy marker; old audit checkpoints are neither loaded nor updated.
+
 ## SQLite
 
 SQLite runs in-process, so a query is a function call rather than a round trip.

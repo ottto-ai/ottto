@@ -99,14 +99,17 @@ impl SelectionFixture {
             }
         }
         if audit {
-            previous
-                .files
-                .get_mut(&local_index_key(&paths[1]))
-                .unwrap()
-                .set_unverified_deadline(1);
+            // B is an unchanged audit, not synthetic source growth. Native
+            // reconciliation must not queue bytes hidden by a placeholder size.
+            let metadata = fs::metadata(&paths[1]).unwrap();
+            let entry = previous.files.get_mut(&local_index_key(&paths[1])).unwrap();
+            entry.size_bytes = metadata.len();
+            entry.modified_unix_nanos = metadata.modified().ok().and_then(unix_nanos);
+            entry.modified_unix_seconds = metadata.modified().ok().and_then(unix_seconds).unwrap();
+            entry.set_unverified_deadline(1);
         }
         let index_path = scratch.join("index.json");
-        previous.save(&index_path).unwrap();
+        previous.save_fixture(&index_path).unwrap();
         Self {
             _scratch: scratch,
             roots: [root],
@@ -229,7 +232,7 @@ fn recovery_selection_preserves_ordinary_audit_order_and_page_limit() {
         .unwrap()
         .source_file_fingerprint
         .clear();
-    rearmed.save(&fixture.index_path).unwrap();
+    rearmed.save_fixture(&fixture.index_path).unwrap();
     let rearmed = ScanIndex::load(&fixture.index_path).unwrap();
     assert!(rearmed.files[&key].source_file_fingerprint.is_empty());
     let base = fixture.prepare(rearmed, 1);
@@ -486,7 +489,7 @@ fn selected_restore_preserves_prior_body_and_queued_debt() {
         .iter()
         .any(|entry| local_index_key(&entry.path) == owed_key));
     selected.mark_bounded_sweep_unsettled();
-    selected.save(&fixture.index_path).unwrap();
+    selected.save_fixture(&fixture.index_path).unwrap();
     let restored = ScanIndex::load(&fixture.index_path).unwrap();
     assert_eq!(serde_json::to_vec(&restored.files[&key]).unwrap(), old);
     assert!(restored.bounded_sweep_had_unsettled_upload());
@@ -609,10 +612,50 @@ fn partial_locked_save_and_restart_keep_exact_debt() {
             !audit,
             "audit-due restored B waits for the next walk"
         );
+        // An immediate unsampled Full retry is paced by the native claim
+        // retained across the partial save, exactly as on a daemon restart.
+        let now = sampled_scan::now_seconds();
+        let (paced_keys, paced, attempt) = selection_page(&fixture, restarted.clone(), 1);
+        assert_eq!(paced_keys.len(), 1);
+        assert_eq!(attempt.scanned_file_count, 1);
+        assert_eq!(attempt.completed_parses().count(), 0);
+        assert!(paced.traversal.as_ref().unwrap().counts.growth_deferred > 0);
+        assert!(paced_keys
+            .iter()
+            .all(|key| sampled_audit::growth_full_paced(&paced, key, now)));
+        assert_eq!(
+            e2_pipeline_scan_fixture::pending_keys_for_test(
+                &ScanIndex::load(&fixture.index_path).unwrap()
+            ),
+            expected,
+            "the paced attempt does not commit or discharge any owed key"
+        );
+        // Age only the witnessed claim in the saved baseline. Advancing the
+        // whole clock would also release the excluded audit B's unrelated debt.
         let mut prior = restarted;
+        for key in &paced_keys {
+            e2_pipeline_scan_fixture::expire_observed_growth_for_test(
+                &mut prior,
+                Path::new(key),
+                &paced,
+            );
+        }
+        drop(paced);
         let mut read = BTreeSet::new();
         for _ in 0..expected.len() {
-            let (selected, working, scan) = selection_page(&fixture, prior.clone(), 1);
+            let (mut selected, mut working, mut scan) = selection_page(&fixture, prior.clone(), 1);
+            if scan.completed_parses().next().is_none() {
+                assert_eq!(selected.len(), 1);
+                let key = selected.iter().next().unwrap();
+                e2_pipeline_scan_fixture::expire_observed_growth_for_test(
+                    &mut prior,
+                    Path::new(key),
+                    &working,
+                );
+                let next = selection_page(&fixture, prior.clone(), 1);
+                assert_eq!(next.0, selected, "only the deferred claim was expired");
+                (selected, working, scan) = next;
+            }
             assert_eq!(selected.len(), 1);
             assert_eq!(scan.scanned_file_count, 1);
             assert_eq!(
@@ -713,7 +756,7 @@ fn unkept_audit_key_does_not_starve_pending_census_at_page_limit_one() {
 fn selected_save_cas_loser_never_commits() {
     let (fixture, index, scan, previous) = selected_fixture();
     let mut winner = previous.clone();
-    winner.save(&fixture.index_path).unwrap();
+    winner.save_fixture(&fixture.index_path).unwrap();
     let durable = fs::read(&fixture.index_path).unwrap();
     let progress = fixture._scratch.join("cas-progress.json");
     assert!(crate::snapshot_sync::checkpoint_unselected_for_test(
@@ -887,7 +930,7 @@ fn corrected_body_fixture(mode: &str) -> (BodyFixture, ScanIndex) {
         );
     }
     let path = fixture.dir.join("correction-selected.json");
-    index.save(&path).unwrap();
+    index.save_fixture(&path).unwrap();
     (fixture, index)
 }
 
@@ -914,7 +957,7 @@ fn proof_revision_reparse_and_restart_preserve_body_custody() {
             index.files.get_mut(&key).unwrap().source_file_fingerprint = "f".repeat(64);
         }
         let path = fixture.dir.join("correction-selected.json");
-        index.save(&path).unwrap();
+        index.save_fixture(&path).unwrap();
         let restarted = ScanIndex::load(&path).unwrap();
         assert_eq!(restarted.accepted_snapshot_fingerprints, accepted);
     }
@@ -931,7 +974,7 @@ fn default_constructor_keeps_durable_recovery_debt_under_ordinary_census_order()
         .unwrap()
         .source_file_fingerprint
         .clear();
-    index.save(&fixture.index_path).unwrap();
+    index.save_fixture(&fixture.index_path).unwrap();
     let index = ScanIndex::load(&fixture.index_path).unwrap();
     let base = fixture.prepare(index, 1);
     assert_eq!(base.identified_candidates[0].path, fixture.paths[1]);
@@ -945,7 +988,7 @@ fn default_constructor_keeps_durable_recovery_debt_under_ordinary_census_order()
         .pending_candidates
         .iter()
         .any(|p| p.path == fixture.paths[0]));
-    index.save(&fixture.index_path).unwrap();
+    index.save_fixture(&fixture.index_path).unwrap();
     let restarted = ScanIndex::load(&fixture.index_path).unwrap();
     assert!(restarted.files[&key].source_file_fingerprint.is_empty());
     assert!(restarted
@@ -1028,7 +1071,7 @@ fn account_audit_release_waits_for_cache_heads_and_selected_settlement() {
                 &mut scan,
                 &fixture.roots,
             );
-            selected.save(&fixture.index_path).unwrap();
+            selected.save_fixture(&fixture.index_path).unwrap();
             selected
         };
         assert!(!selected.claude_account_deferred_holds.contains_key(&key));
