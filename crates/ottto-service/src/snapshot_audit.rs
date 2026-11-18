@@ -302,6 +302,7 @@ fn audit_page(
         cfg!(test) || crate::snapshots::claude_request_identity::captures(options.source),
         &[],
         Some((cache, &scope)),
+        false,
     )
     .with_sampled_acquisition(cache.clone(), scope);
     let mut scan = loop {
