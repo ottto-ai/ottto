@@ -654,6 +654,16 @@ fn e2_pipeline_carry_moves_gap_shares_and_keeps_totals() {
         };
         assert_eq!(totals(again), totals(on), "{gaps:?}: money never changes");
         assert_eq!(tokens(on), reference, "{gaps:?}: carry never moves usage");
+        // Each supplied telemetry row reports 100 micro-USD: the own rows left
+        // after the gaps plus the side call. Removed rows report no cost.
+        let supplied = 4 - gaps.len() + 1;
+        assert_eq!(
+            on.cost
+                .as_ref()
+                .and_then(|cost| cost.total_cost_usd.as_deref()),
+            Some(format!("0.{supplied:04}").as_str()),
+            "{gaps:?}: reported cost"
+        );
         assert_eq!(
             on.request_count, 5,
             "four non-zero responses plus the side call"
@@ -797,13 +807,16 @@ fn e2_pipeline_exact_telemetry_over_cap_refuses_upstream_lost_proof() {
                 (330, 330),
                 "{gaps:?}: usage conserved while Held"
             );
-            if gaps.is_empty() {
-                assert_eq!(
-                    on[0].cost.as_ref().unwrap().total_cost_usd.as_deref(),
-                    Some("0.0033"),
-                    "every own row's reported cost is kept while Held"
-                );
-            }
+            // Each own row still supplied reports 100 micro-USD.
+            let supplied = 33 - gaps.len();
+            assert_eq!(
+                on[0]
+                    .cost
+                    .as_ref()
+                    .and_then(|cost| cost.total_cost_usd.as_deref()),
+                Some(format!("0.{supplied:04}").as_str()),
+                "{gaps:?}: reported cost kept while Held"
+            );
             assert_eq!(on[0].request_identity_refusals, 0, "HOLD never strips");
             assert!(
                 e2_source_counts(&on[0])

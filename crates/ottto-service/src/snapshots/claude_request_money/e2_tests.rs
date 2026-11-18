@@ -2897,7 +2897,7 @@ fn e2_identity_unqualified_markerless_twins_use_known_session_start_in_both_orde
                     markerless.source_started_at = Some(at(1));
                 }
                 assert!(crate::snapshots::exact_session_account_hash(&markerless).is_none());
-                let mut items = if reverse {
+                let items = if reverse {
                     vec![markerless, known]
                 } else {
                     vec![known, markerless]
