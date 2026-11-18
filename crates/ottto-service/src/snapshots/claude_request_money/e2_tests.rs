@@ -4446,6 +4446,40 @@ fn e2_fingerprint_check_matches_the_blanked_copy_rule_on_every_shape() {
         let want = reference_fingerprint_ok(trace, &trace.fingerprint, |r| r.fingerprint.clear());
         assert_eq!(claude_trace_evidence_fingerprint_is_valid(trace), want);
     }
+    // A trace row keeps its first outcome, which is never serialized, ignored
+    // by `==`, and cleared on Clone and on decode.
+    let fresh = complete_trace_row(ROOT, "req-a", "7");
+    let bytes = serde_json::to_vec(&fresh).unwrap();
+    let checked = fresh.clone();
+    assert!(claude_trace_evidence_fingerprint_is_valid(&checked));
+    assert!(claude_trace_evidence_fingerprint_is_valid(&checked));
+    assert!(checked
+        .fingerprint_check
+        .get_or_check(|| unreachable!("the valid outcome is kept")));
+    assert_eq!(serde_json::to_vec(&checked).unwrap(), bytes);
+    assert_eq!(checked, fresh);
+    let mut moved = checked.clone();
+    moved.agent_id = "8".into();
+    assert!(!claude_trace_evidence_fingerprint_is_valid(&moved));
+    let mut tampered = fresh.clone();
+    tampered.request_id = "req-b".into();
+    let tampered_bytes = serde_json::to_vec(&tampered).unwrap();
+    let unchecked = tampered.clone();
+    assert!(!claude_trace_evidence_fingerprint_is_valid(&tampered));
+    assert!(!claude_trace_evidence_fingerprint_is_valid(&tampered));
+    assert!(!tampered
+        .fingerprint_check
+        .get_or_check(|| unreachable!("the invalid outcome is kept")));
+    assert_eq!(serde_json::to_vec(&tampered).unwrap(), tampered_bytes);
+    assert_eq!(tampered, unchecked);
+    let decoded: crate::claude_local_otel::ClaudeTraceOwnershipEvidence =
+        serde_json::from_slice(&serde_json::to_vec(&checked).unwrap()).unwrap();
+    let mut ran = false;
+    assert!(decoded.fingerprint_check.get_or_check(|| {
+        ran = true;
+        true
+    }));
+    assert!(ran, "a decoded row starts with an empty memo");
 }
 
 #[test]

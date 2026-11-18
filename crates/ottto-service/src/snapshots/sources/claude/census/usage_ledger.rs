@@ -449,15 +449,18 @@ pub(crate) fn claude_api_evidence_fingerprint_is_valid(
     })
 }
 
+/// Hashed once per row: the first caller fills the row's kept result.
 pub(crate) fn claude_trace_evidence_fingerprint_is_valid(
     row: &crate::claude_local_otel::ClaudeTraceOwnershipEvidence,
 ) -> bool {
-    let mut canonical = row.clone();
-    canonical.fingerprint.clear();
-    serialized_json_digest(&canonical, b"")
-        .map(|digest| format!("sha256:{:x}", digest.finalize()))
-        .as_deref()
-        == Some(row.fingerprint.as_str())
+    row.fingerprint_check.get_or_check(|| {
+        let mut canonical = row.clone();
+        canonical.fingerprint.clear();
+        serialized_json_digest(&canonical, b"")
+            .map(|digest| format!("sha256:{:x}", digest.finalize()))
+            .as_deref()
+            == Some(row.fingerprint.as_str())
+    })
 }
 
 pub(in crate::snapshots) fn claude_snapshot_request_id_hashes(
