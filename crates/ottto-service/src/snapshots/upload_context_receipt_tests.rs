@@ -1524,6 +1524,169 @@ fn replay_re_offers_a_pre_replay_usage_identical_body_met_on_a_later_page() {
     }
 }
 
+/// One measured pass: the files parsed (by path), the body bytes read, the
+/// page lines' forced-family seeds and family selections, and the POSTs.
+struct FamilyPass {
+    parsed: BTreeMap<PathBuf, usize>,
+    bytes: u64,
+    seeds: u64,
+    family: u64,
+    posts: usize,
+}
+
+impl Fixture {
+    fn family_pass(&mut self, context: &str) -> FamilyPass {
+        self.uploader
+            .prepare_for_scan(self.source, context.into(), &mut self.index);
+        let previous = self.index.clone();
+        let ((((scan, bytes), parsed), group_bytes), rows) =
+            crate::local_resource_diagnostics::capture(|| {
+                terminal_contract_retry::group_body_bytes(|| {
+                    terminal_contract_retry::source_acquisitions(|| {
+                        self.walk_with_file_limit(true, 10, true)
+                    })
+                })
+            });
+        let (mut seeds, mut family) = (0, 0);
+        for row in rows
+            .iter()
+            .filter(|row| row["stage"] == "native_collection_page")
+        {
+            let counts = &row["counts"];
+            seeds += counts["forced_family_seeds"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(|(_, n)| n.as_u64().unwrap())
+                .sum::<u64>();
+            family += [
+                "forced_family_roots",
+                "forced_family_members_pulled",
+                "forced_family_member_scoped",
+            ]
+            .iter()
+            .map(|key| counts["page_selection"][*key].as_u64().unwrap_or(0))
+            .sum::<u64>();
+        }
+        self.uploader
+            .activate(self.source, context.into(), &mut self.index);
+        let before = self.uploader.posts.len();
+        self.uploader
+            .send(self.source, &mut self.index, &previous, &scan.snapshots)
+            .unwrap();
+        FamilyPass {
+            parsed,
+            bytes: bytes + group_bytes,
+            seeds,
+            family,
+            posts: self.uploader.posts.len() - before,
+        }
+    }
+}
+
+/// [regress] [money] A Claude family: the root, two subagents, and a copy of
+/// the root in a second project (a path twin, which forces its family when
+/// read). Every entity was ACKed, then re-offered under a new upload context
+/// and answered without storing. After `usage_identical`, passes past the
+/// 6 h and 12 h retries parse no file of the family, read no body byte, seed
+/// no forced family, pull no member and POST nothing. The positive control
+/// is the same family answered `dominated_by_head`. Once due, that retry
+/// seeds the family and re-reads it, so these counters can fail.
+#[test]
+fn usage_identical_family_is_never_re_read_by_a_retry() {
+    for (basis, retried) in [("usage_identical", false), ("dominated_by_head", true)] {
+        let mut f = Fixture::new(SnapshotSource::ClaudeCode);
+        let project = f.root.clone();
+        // Scan the Claude projects root, so both homes of the root are listed.
+        f.root = project.parent().unwrap().to_path_buf();
+        let main = fs::read_to_string(&f.path).unwrap();
+        let row = |request: &str, input: u64| {
+            format!(
+                "{}\n",
+                json!({"type":"assistant","sessionId":SESSION,
+                "timestamp":"2026-10-29T10:01:00Z","requestId":request,
+                "message":{"id":format!("{request}-message"),"model":"claude-sonnet-4-6",
+                "usage":{"input_tokens":input,"output_tokens":1}}})
+            )
+        };
+        let mut family = vec![f.path.clone()];
+        for agent in 0..2 {
+            let path = project
+                .join(SESSION)
+                .join("subagents")
+                .join(format!("agent-{agent:03}.jsonl"));
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, main.clone() + &row(&format!("child-{agent}"), 20)).unwrap();
+            family.push(path);
+        }
+        let copy = f
+            .root
+            .join("synthetic-project-copy")
+            .join(format!("{SESSION}.jsonl"));
+        fs::create_dir_all(copy.parent().unwrap()).unwrap();
+        fs::write(&copy, main.clone() + &row("resumed", 9)).unwrap();
+        family.push(copy);
+
+        // Every entity is ACKed under the first context.
+        let first = f.index.active_upload_context_fingerprint.clone().unwrap();
+        let read = f.family_pass(&first);
+        assert!(read.posts > 0, "{basis}: the family is uploaded");
+        // A new context re-offers every body; the head stores none.
+        let context = "e".repeat(64);
+        f.index
+            .activate_file_upload_context(f.source, context.clone());
+        f.drop_entity_stamps();
+        // A live read cause at the same bytes, as `rearm_for_read`.
+        for key in f.index.files.keys().cloned().collect::<Vec<_>>() {
+            f.index
+                .files
+                .get_mut(&key)
+                .unwrap()
+                .source_file_fingerprint
+                .clear();
+        }
+        f.uploader.not_stored = Some(basis);
+        let answered = f.family_pass(&context);
+        assert!(answered.posts > 0, "{basis}: the family is re-offered");
+        f.uploader.not_stored = None;
+        let held = f.index.quarantined_snapshot_fingerprints.clone();
+        assert!(!held.is_empty(), "{basis}: the answer holds the family");
+        assert_eq!(
+            held.values()
+                .any(|hold| hold.disposition == SnapshotQuarantineDisposition::RetryPending),
+            retried,
+            "{basis}"
+        );
+
+        // Past the 6 h, then the 12 h retry.
+        for retry in ["6 h", "12 h"] {
+            f.uploader.expire_retry_holds(&mut f.index);
+            let pass = f.family_pass(&context);
+            if retried && retry == "6 h" {
+                assert!(
+                    family.iter().any(|path| pass.parsed.contains_key(path)),
+                    "control: the due retry re-reads its family: {:?}",
+                    pass.parsed
+                );
+                assert!(pass.bytes > 0, "control: body bytes read");
+                assert!(pass.seeds > 0, "control: the retry seeds its family");
+                assert!(pass.posts > 0, "control: the due body is offered again");
+            } else if !retried {
+                assert!(
+                    pass.parsed.is_empty(),
+                    "{retry}: no file parsed: {:?}",
+                    pass.parsed
+                );
+                assert_eq!(pass.bytes, 0, "{retry}: no body byte");
+                assert_eq!(pass.seeds, 0, "{retry}: no forced-family seed");
+                assert_eq!(pass.family, 0, "{retry}: no family root or member");
+                assert_eq!(pass.posts, 0, "{retry}: no POST");
+                assert_eq!(f.index.quarantined_snapshot_fingerprints, held);
+            }
+        }
+    }
+}
+
 #[test]
 fn real_uploader_duplicate_refusal_mints_nothing_and_does_not_loop() {
     let mut f = Fixture::new(SnapshotSource::ClaudeCode);

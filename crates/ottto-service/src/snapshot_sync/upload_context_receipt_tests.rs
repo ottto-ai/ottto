@@ -643,6 +643,16 @@ impl Uploader {
         );
         index.prepare_historical_replay(generation.into());
     }
+    /// The clock passes every timed hold's deadline, in the ledger and the
+    /// index alike. A terminal hold has no deadline to pass.
+    pub(crate) fn expire_retry_holds(&mut self, index: &mut ScanIndex) {
+        let holds = self.progress.quarantined_fingerprints.values_mut();
+        for hold in holds.chain(index.quarantined_snapshot_fingerprints.values_mut()) {
+            if hold.disposition == SnapshotQuarantineDisposition::RetryPending {
+                hold.retry_after_unix_seconds = 1;
+            }
+        }
+    }
     pub(crate) fn replay(&mut self, generation: &str) {
         assert!(self.progress.prepare_historical_replay(generation));
     }
