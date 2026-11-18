@@ -359,10 +359,10 @@ fn owes_trace(index: &ScanIndex, days: u64, now: u64) -> String {
         })
         .collect::<Vec<_>>();
     format!(
-        "persist={} unsettled={} decode={} deferred={} quarantine={} correction={} growth={} selected={selected:?}",
+        "persist={} unsettled={} decode_empty={} deferred={} quarantine={} correction={} growth={} selected={selected:?}",
         index.persistence_available(),
         index.bounded_sweep_had_unsettled_upload,
-        index.decode_holds.len(),
+        index.decode_holds.is_empty(),
         index.claude_account_deferred_holds.len(),
         index.claude_usage_authority_quarantine.values().any(|record| {
             record.disposition == ClaudeUsageAuthorityQuarantineDisposition::RetryPending

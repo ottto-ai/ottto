@@ -1311,7 +1311,7 @@ fn upload_owes_trace(
     now: u64,
 ) -> String {
     format!(
-        "ack={}/{} heads={} resend={} conflict={} id503={} qretry={} reoffers={} qdue={} \
+        "ack={}/{} heads={} resend={} conflict={} id503={:?} qretry={} reoffers={} qdue={} \
          cadence={:?} telemetry={}",
         progress.accepted_fingerprints.len(),
         progress.ack_capacity,
