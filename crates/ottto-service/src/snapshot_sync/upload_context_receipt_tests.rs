@@ -46,7 +46,6 @@ pub(crate) fn exact_acks(
                                 .then(|| "e".repeat(64)),
                             head_challenge: None,
                             unchanged_basis: None,
-                            retained_proof_missing: Vec::new(),
                             cache_observations_state: None,
                         })
                         .collect(),
@@ -496,7 +495,6 @@ impl Uploader {
                             head_etag: cas.then(|| "e".repeat(64)),
                             head_challenge: None,
                             unchanged_basis: not_stored.then(|| "usage_identical".into()),
-                            retained_proof_missing: Vec::new(),
                             cache_observations_state: None,
                         })
                         .collect::<Vec<_>>();

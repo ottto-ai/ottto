@@ -1363,8 +1363,8 @@ fn a_codec_route_error_holds_the_file_without_ram() {
 
 /// [money] An account-witness change, then a destination change, after a
 /// restart: each production namespace (`cycle_sampled_scope`) is new, and
-/// every source's head continues from Tail with no reconstruction (D168-3:
-/// account evidence is applied from stored facts and live evidence, never by
+/// every source's head continues from Tail with no reconstruction
+/// (account evidence is applied from stored facts and live evidence, never by
 /// a re-read). The body equals a cold Full under the new namespace, Codex's
 /// creator placement included. A new priority still replays for real.
 #[test]

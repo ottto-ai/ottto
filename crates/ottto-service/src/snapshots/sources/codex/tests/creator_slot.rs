@@ -249,7 +249,7 @@ fn codex_exec_creator_slot_reaches_active_sessions_with_workspace() {
     }
 }
 
-/// [regress] Forward only (D185): a session already uploaded as Unknown stays
+/// [regress] Forward only: a session already uploaded as Unknown stays
 /// Unknown on every later revision, counted, and mints no owner.
 #[test]
 fn codex_session_uploaded_unknown_stays_unknown_as_it_grows() {
@@ -281,7 +281,7 @@ fn codex_compressed_rollout_without_emission_history_stays_unknown() {
     assert_eq!(named, (None, None, counted(Some(PREVIOUSLY_UPLOADED))));
 }
 
-/// D185: a session found in slot A's home whose creator pair matches slot B
+/// A session found in slot A's home whose creator pair matches slot B
 /// is named B, never A.
 #[test]
 fn codex_creator_pair_names_its_slot_never_the_home_it_was_found_in() {

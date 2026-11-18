@@ -89,15 +89,11 @@ fn merge_rows(into: &mut Vec<SnapshotModelUsage>, rows: Vec<SnapshotModelUsage>)
     // cannot authorize combining two account/evidence partitions.
     let mut all = BTreeMap::new();
     for row in std::mem::take(into).into_iter().chain(rows) {
-        anyhow::ensure!(
-            row.identity_parts.is_none() && !row.identity_retained,
-            "unsupported folded placement"
-        );
+        anyhow::ensure!(row.identity_parts.is_none(), "unsupported folded placement");
         let identity = (
             row_key_from_model_usage(&row),
             row.account_identifier_hash.clone(),
             row.evidence_ref,
-            row.copy_invalidated,
         );
         if let Some(previous) = all.get_mut(&identity) {
             let previous: &mut SnapshotModelUsage = previous;
