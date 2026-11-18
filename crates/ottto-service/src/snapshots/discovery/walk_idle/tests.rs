@@ -31,10 +31,15 @@ impl Fixture {
     }
 
     fn pass(&self, index: &ScanIndex, replay: &str) -> Pass {
+        self.pass_days(index, replay, DAYS)
+    }
+
+    /// A pass whose server hint and window ask for `days`.
+    fn pass_days(&self, index: &ScanIndex, replay: &str, days: u64) -> Pass {
         let hint = decode_activity_hint(serde_json::json!({
             "source": self.source.api_slug(), "server_time": "2026-11-18T00:00:00Z",
             "last_data_at": null, "record_count_15m": 0, "record_count_24h": 0,
-            "local_usage_reconciliation_enabled": true, "backfill_window_days": DAYS,
+            "local_usage_reconciliation_enabled": true, "backfill_window_days": days,
             "recommended_scan_after": "2099-01-01T00:00:00Z"
         }))
         .unwrap();
@@ -44,7 +49,7 @@ impl Fixture {
             &self.scratch,
             &Scope("walk-gate-scope".into()),
             &self.scratch.join("index"),
-            DAYS,
+            days,
             replay,
             &hint,
             b"policy",
@@ -177,6 +182,27 @@ fn changed_input_walks_and_changing_back_still_walks() {
         !fixture.gate(&index, START + 120),
         "A -> B -> A walks again"
     );
+}
+
+#[test]
+fn backfill_window_flip_walks_and_flipping_back_still_walks() {
+    let fixture = Fixture::new(SnapshotSource::ClaudeCode);
+    let index = ScanIndex::default();
+    fixture.walk(&index, START);
+    let narrow = fixture.pass_days(&index, "a", 30);
+    assert!(!gate(
+        SnapshotSource::ClaudeCode,
+        &narrow,
+        &index,
+        true,
+        START + 60
+    ));
+    assert_eq!(armed_for_test(SnapshotSource::ClaudeCode), None);
+    assert!(
+        !fixture.gate(&index, START + 120),
+        "the old window never revives the old record"
+    );
+    assert_eq!(armed_for_test(SnapshotSource::ClaudeCode), None);
 }
 
 #[test]
