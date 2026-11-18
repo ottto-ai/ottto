@@ -180,6 +180,7 @@ pub(crate) fn load_source_for_test(
     source: SnapshotSource,
     support: &Path,
 ) -> Result<(ScanIndex, ScanIndexLoadOrigin)> {
+    bind_source_for_test(path, source);
     match ScanIndex::load_for_snapshot_source_with_origin(path, source, support) {
         Ok((index, origin)) if origin == ScanIndexLoadOrigin::Quarantined => {
             // Legacy quarantine authorizes a fresh rebuilt graph. The fixture

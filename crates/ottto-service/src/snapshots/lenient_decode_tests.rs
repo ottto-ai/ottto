@@ -1,6 +1,7 @@
 use super::*;
 
 fn write_decoder_fixture(index: &ScanIndex, path: &Path) {
+    e2_pipeline_scan_fixture::bind_input_for_test(index, path);
     let mut bytes = Vec::new();
     lenient_decode::write_index(&mut bytes, index).unwrap();
     e2_pipeline_scan_fixture::legacy_input_for_test(path, &bytes);
@@ -92,7 +93,7 @@ fn lenient_positive_matrix_load_and_both_cas_readers() {
                 .unwrap()
                 .replace(&format!("\"{sentinel}\""), bad)
                 .into_bytes();
-            e2_pipeline_scan_fixture::legacy_input_for_test(&path, &(&bytes));
+            e2_pipeline_scan_fixture::legacy_input_for_test(&path, &bytes);
             let before = scan_index_containment_lines_for_test().len();
             let loaded = read_decoder_fixture(&path).unwrap();
             assert_eq!(fs::read(&path).unwrap(), bytes);
@@ -156,7 +157,7 @@ fn lenient_opaque_holds_refuse_new_cas_then_round_trip_original_slot() {
             value[field][&key] = bad.clone();
             let bytes = serde_json::to_vec_pretty(&value).unwrap();
             let original_slot = raw_slot(&bytes, field, &key);
-            e2_pipeline_scan_fixture::legacy_input_for_test(&path, &(&bytes));
+            e2_pipeline_scan_fixture::legacy_input_for_test(&path, &bytes);
             let result = if bounded {
                 working.save_with_read_limit(&path, 1024 * 1024)
             } else {
@@ -252,7 +253,7 @@ fn lenient_control_matrix_refuses_without_quarantine_or_rewrite() {
                     .unwrap()
                     .replace("\"CONTROL_TOKEN\"", bad)
                     .into_bytes();
-                e2_pipeline_scan_fixture::legacy_input_for_test(&path, &(&bytes));
+                e2_pipeline_scan_fixture::legacy_input_for_test(&path, &bytes);
                 assert!(read_decoder_fixture(&path).is_err(), "{field} {bad}");
                 let result = if bounded {
                     working.save_with_read_limit(&path, 1024 * 1024)
@@ -284,7 +285,7 @@ fn lenient_native_retry_and_terminal_scalar_repairs() {
                 let bytes = serde_json::to_string(&value)
                     .unwrap()
                     .replace("\"BAD_SCALAR\"", bad);
-                e2_pipeline_scan_fixture::legacy_input_for_test(&path, &(bytes.as_bytes()));
+                e2_pipeline_scan_fixture::legacy_input_for_test(&path, bytes.as_bytes());
                 let loaded = read_decoder_fixture(&path).unwrap();
                 assert!(loaded.decode_holds.is_empty());
                 let repaired = &loaded.quarantined_snapshot_fingerprints[&"e".repeat(64)];
@@ -352,7 +353,7 @@ fn lenient_budget_overflow_uses_existing_load_and_cas_outcomes() {
     let mut value = serde_json::to_value(&working).unwrap();
     value["files"]["huge-held"] = serde_json::json!({"unknown": "x".repeat(2 * 1024 * 1024)});
     let bytes = serde_json::to_vec(&value).unwrap();
-    e2_pipeline_scan_fixture::legacy_input_for_test(&path, &(&bytes));
+    e2_pipeline_scan_fixture::legacy_input_for_test(&path, &bytes);
     assert!(working.save(&path).is_err());
     assert_eq!(fs::read(&path).unwrap(), bytes);
     let before = scan_index_containment_lines_for_test().len();
@@ -375,12 +376,12 @@ fn lenient_budget_overflow_uses_existing_load_and_cas_outcomes() {
 fn lenient_legacy_defaults_duplicate_headers_and_generation_refusals() {
     let scratch = crate::test_scratch::ScratchDir::new("lenient-defaults");
     let path = scratch.as_ref().join("index.json");
-    e2_pipeline_scan_fixture::legacy_input_for_test(&path, &(b"{\"files\":{}}"));
+    e2_pipeline_scan_fixture::legacy_input_for_test(&path, b"{\"files\":{}}");
     let mut index = read_decoder_fixture(&path).unwrap();
     assert_eq!(index.accepted_snapshot_fingerprint_ledger_version, 0);
     assert_eq!(index.generation, 0);
     let original = b"{\"files\":{},\"generation\":0,\"gener\\u0061tion\":0}";
-    e2_pipeline_scan_fixture::legacy_input_for_test(&path, &(original));
+    e2_pipeline_scan_fixture::legacy_input_for_test(&path, original);
     assert!(read_decoder_fixture(&path).is_err());
     assert!(index.save(&path).is_err());
     assert_eq!(fs::read(&path).unwrap(), original);
@@ -439,7 +440,7 @@ fn lenient_authority_scalar_repair_and_held_family_correction_custody() {
             serde_json::json!(u64::MAX);
         e2_pipeline_scan_fixture::legacy_input_for_test(
             &path,
-            &(serde_json::to_vec(&value).unwrap()),
+            &serde_json::to_vec(&value).unwrap(),
         );
         let mut loaded = read_decoder_fixture(&path).unwrap();
         assert!(loaded.decode_holds.is_empty());
@@ -464,7 +465,7 @@ fn lenient_authority_scalar_repair_and_held_family_correction_custody() {
             serde_json::json!([17]);
         let bytes = serde_json::to_vec(&value).unwrap();
         let original = raw_slot(&bytes, "claude_usage_authority_quarantine", "family");
-        e2_pipeline_scan_fixture::legacy_input_for_test(&path, &(&bytes));
+        e2_pipeline_scan_fixture::legacy_input_for_test(&path, &bytes);
         let mut held = read_decoder_fixture(&path).unwrap();
         assert!(held.decode_holds_family("family"));
         held.drop_unbound_claude_authority_records("test");
@@ -492,7 +493,7 @@ fn lenient_shape_caps_and_hold_count_preserve_original_disk() {
     value["unknown_large_shape"] =
         Value::Array(vec![Value::Null; crate::snapshot_retry::STATE_NODES]);
     let bytes = serde_json::to_vec(&value).unwrap();
-    e2_pipeline_scan_fixture::legacy_input_for_test(&path, &(&bytes));
+    e2_pipeline_scan_fixture::legacy_input_for_test(&path, &bytes);
     assert!(index.save_with_read_limit(&path, 1024 * 1024).is_err());
     assert_eq!(fs::read(&path).unwrap(), bytes);
     assert!(index.save_with_read_limit(&path, bytes.len() - 1).is_err());
@@ -503,7 +504,7 @@ fn lenient_shape_caps_and_hold_count_preserve_original_disk() {
         value["files"][format!("held-{n}")] = Value::Bool(false);
     }
     let bytes = serde_json::to_vec(&value).unwrap();
-    e2_pipeline_scan_fixture::legacy_input_for_test(&path, &(&bytes));
+    e2_pipeline_scan_fixture::legacy_input_for_test(&path, &bytes);
     assert!(index.save(&path).is_err());
     assert_eq!(fs::read(&path).unwrap(), bytes);
     assert!(e2_pipeline_scan_fixture::load_source_for_test(
@@ -553,7 +554,7 @@ fn lenient_unkeyed_or_unaddressable_debt_refuses_without_rebuild() {
         let mut value = serde_json::to_value(&index).unwrap();
         value[field] = Value::Bool(false);
         let bytes = serde_json::to_vec(&value).unwrap();
-        e2_pipeline_scan_fixture::legacy_input_for_test(&path, &(&bytes));
+        e2_pipeline_scan_fixture::legacy_input_for_test(&path, &bytes);
         assert!(read_decoder_fixture(&path).is_err());
         assert!(index.save(&path).is_err());
         assert!(index.save_with_read_limit(&path, 1024 * 1024).is_err());
@@ -568,7 +569,7 @@ fn lenient_unkeyed_or_unaddressable_debt_refuses_without_rebuild() {
     value["quarantined_snapshot_fingerprints"]["damaged-identity"] =
         serde_json::json!({"disposition":"unknown"});
     let bytes = serde_json::to_vec(&value).unwrap();
-    e2_pipeline_scan_fixture::legacy_input_for_test(&path, &(&bytes));
+    e2_pipeline_scan_fixture::legacy_input_for_test(&path, &bytes);
     assert!(read_decoder_fixture(&path).is_err());
     assert_eq!(fs::read(&path).unwrap(), bytes);
     assert_eq!(corrupt_count(scratch.as_ref()), 0);
@@ -595,7 +596,7 @@ fn repaired_records_can_advance_after_load_but_new_cas_damage_still_requires_rel
                 ["failed_reconstruction_count"] = serde_json::json!(300);
             e2_pipeline_scan_fixture::legacy_input_for_test(
                 &path,
-                &(serde_json::to_vec(&value).unwrap()),
+                &serde_json::to_vec(&value).unwrap(),
             );
             let mut loaded = read_decoder_fixture(&path).unwrap();
             loaded = e2_pipeline_scan_fixture::seed_index_for_test(&loaded, &path);
@@ -640,7 +641,7 @@ fn repaired_records_can_advance_after_load_but_new_cas_damage_still_requires_rel
             serde_json::json!(300);
         e2_pipeline_scan_fixture::legacy_input_for_test(
             &path,
-            &(serde_json::to_vec(&value).unwrap()),
+            &serde_json::to_vec(&value).unwrap(),
         );
         let mut loaded = read_decoder_fixture(&path).unwrap();
         loaded.insert_unproven_terminal_claude_authority_for_test("family", &"1".repeat(64));
@@ -676,7 +677,7 @@ fn held_entity_finalization_keeps_file_membership_and_never_confirms_empty() {
     let mut value = serde_json::to_value(&index).unwrap();
     value["quarantined_snapshot_fingerprints"][&fingerprint] =
         serde_json::json!({"disposition": "unknown"});
-    e2_pipeline_scan_fixture::legacy_input_for_test(&path, &(serde_json::to_vec(&value).unwrap()));
+    e2_pipeline_scan_fixture::legacy_input_for_test(&path, &serde_json::to_vec(&value).unwrap());
     let mut loaded = read_decoder_fixture(&path).unwrap();
     let mut empty_index = ScanIndex::default();
     let mut scan = scan_source_roots_with_test_limit(
@@ -790,7 +791,7 @@ fn main_depth_resource_refuses_but_admitted_bad_grammar_still_quarantines() {
         "]".repeat(1000)
     )
     .into_bytes();
-    e2_pipeline_scan_fixture::legacy_input_for_test(&path, &(&bytes));
+    e2_pipeline_scan_fixture::legacy_input_for_test(&path, &bytes);
     assert!(format!("{:#}", read_decoder_fixture(&path).unwrap_err()).contains("resource cap"));
     for bounded in [false, true] {
         let result = if bounded {
@@ -814,8 +815,13 @@ fn main_depth_resource_refuses_but_admitted_bad_grammar_still_quarantines() {
         let scratch = crate::test_scratch::ScratchDir::new("lenient-admitted-bad-grammar");
         let path = scratch.as_ref().join("index.json");
         e2_pipeline_scan_fixture::legacy_input_for_test(&path, invalid.as_bytes());
-        ScanIndex::load(&path).unwrap();
-        assert!(!path.exists());
+        let held = ScanIndex::load(&path).unwrap_err();
+        assert_eq!(
+            held.downcast_ref::<state_v2::Hold>(),
+            Some(&state_v2::Hold::ReloadRequired)
+        );
+        assert!(ScanIndex::load(&path).unwrap().files.is_empty());
+        assert!(path.exists(), "quarantine publishes the fresh native fence");
         assert_eq!(corrupt_count(scratch.as_ref()), 1);
     }
 }
@@ -849,7 +855,7 @@ fn unbound_type_repair_freezes_siblings_without_retaining_repair_keys() {
     let bytes = serde_json::to_vec(&value).unwrap();
     let authority = raw_slot(&bytes, "claude_usage_authority_quarantine", "family");
     let witness = raw_slot(&bytes, "claude_usage_family_witnesses", "family");
-    e2_pipeline_scan_fixture::legacy_input_for_test(&path, &(&bytes));
+    e2_pipeline_scan_fixture::legacy_input_for_test(&path, &bytes);
     let mut loaded = read_decoder_fixture(&path).unwrap();
     assert!(loaded.decode_holds_family("family"));
     assert!(loaded.claude_usage_authority_quarantine.is_empty());
@@ -886,7 +892,7 @@ fn opaque_file_incidence_preserves_existing_acks_through_both_pruners_and_restar
             value["files"][key] = Value::Bool(false);
             e2_pipeline_scan_fixture::legacy_input_for_test(
                 &path,
-                &(serde_json::to_vec(&value).unwrap()),
+                &serde_json::to_vec(&value).unwrap(),
             );
             let mut loaded = read_decoder_fixture(&path).unwrap();
             assert!(loaded.decode_holds_file(key));
@@ -952,7 +958,7 @@ fn opaque_file_incidence_blocks_both_legacy_seals_and_ack_reopening() {
         value["files"]["/synthetic/0.jsonl"] = Value::Bool(false);
         e2_pipeline_scan_fixture::legacy_input_for_test(
             &path,
-            &(serde_json::to_vec(&value).unwrap()),
+            &serde_json::to_vec(&value).unwrap(),
         );
         let mut loaded = read_decoder_fixture(&path).unwrap();
         let accepted = loaded.accepted_snapshot_fingerprints.clone();
@@ -1015,7 +1021,7 @@ fn held_owner_range_survives_clone_original_drop_and_restart() {
             serde_json::json!({"size_bytes": [], "codex_protected_owner": &owner});
         let bytes = serde_json::to_vec(&value).unwrap();
         let original_slot = raw_slot(&bytes, "files", key);
-        e2_pipeline_scan_fixture::legacy_input_for_test(&path, &(&bytes));
+        e2_pipeline_scan_fixture::legacy_input_for_test(&path, &bytes);
         let loaded = read_decoder_fixture(&path).unwrap();
         let mut cloned = loaded.clone();
         drop(loaded);
@@ -1087,7 +1093,7 @@ fn si_strict_refusal_matrix_preserves_bytes_generation_and_sibling_binding() {
             for bounded in [false, true] {
                 let scratch = crate::test_scratch::ScratchDir::new("si-strict-refusal");
                 let path = scratch.as_ref().join("index.json");
-                e2_pipeline_scan_fixture::legacy_input_for_test(&path, &(&bytes));
+                e2_pipeline_scan_fixture::legacy_input_for_test(&path, &bytes);
                 let before = scan_index_containment_lines_for_test().len();
                 let loaded = read_decoder_fixture(&path);
                 let mut working = seed.clone();
@@ -1142,7 +1148,7 @@ fn si_strict_refusal_matrix_preserves_bytes_generation_and_sibling_binding() {
         value["files"]["/synthetic/0.jsonl"] = serde_json::json!(false);
         let bytes = serde_json::to_vec_pretty(&value).unwrap();
         let binding = raw_slot(&bytes, "session_account_bindings", "sibling-session");
-        e2_pipeline_scan_fixture::legacy_input_for_test(&path, &(&bytes));
+        e2_pipeline_scan_fixture::legacy_input_for_test(&path, &bytes);
         let loaded = read_decoder_fixture(&path).unwrap();
         assert_eq!(
             raw_slot(
@@ -1193,7 +1199,7 @@ fn si_unknown_contract_persists_through_save_and_restart() {
         let mut bad = serde_json::to_value(&loaded).unwrap();
         bad["claude_request_identity_contract"] = serde_json::json!(17);
         let bytes = serde_json::to_vec(&bad).unwrap();
-        e2_pipeline_scan_fixture::legacy_input_for_test(&path, &(&bytes));
+        e2_pipeline_scan_fixture::legacy_input_for_test(&path, &bytes);
         assert!(read_decoder_fixture(&path).is_err());
         assert!(if bounded {
             loaded.save_with_read_limit(&path, 1024 * 1024)
@@ -1215,7 +1221,7 @@ fn hold_budget_floor_and_daily_rebuild_loop_guard() {
     let mut value = serde_json::to_value(fixture()).unwrap();
     value["files"]["floor-held"] = serde_json::json!({"unknown": "x".repeat(128 * 1024)});
     let bytes = serde_json::to_vec(&value).unwrap();
-    e2_pipeline_scan_fixture::legacy_input_for_test(&path, &(&bytes));
+    e2_pipeline_scan_fixture::legacy_input_for_test(&path, &bytes);
     let loaded = read_decoder_fixture(&path).unwrap();
     assert!(loaded.decode_holds_file("floor-held"));
     assert_eq!(corrupt_count(scratch.as_ref()), 0);
@@ -1247,7 +1253,7 @@ fn hold_budget_floor_and_daily_rebuild_loop_guard() {
         .files
         .is_empty());
         assert_eq!(corrupt_count(scratch.as_ref()), 1);
-        e2_pipeline_scan_fixture::legacy_input_for_test(&path, &(&bytes));
+        e2_pipeline_scan_fixture::legacy_input_for_test(&path, &bytes);
         let before = scan_index_containment_lines_for_test().len();
         assert!(format!("{:#}", ScanIndex::load(&path).unwrap_err())
             .contains("lenient_hold_budget_exceeded"));
@@ -1285,7 +1291,7 @@ fn user_repair_override_passes_the_guard_once_and_rearms_it() {
         assert!(scan_index_rebuild_paused(source));
         assert_eq!(fs::read(&path).unwrap(), damage);
     };
-    e2_pipeline_scan_fixture::legacy_input_for_test(&path, &(b"{"));
+    e2_pipeline_scan_fixture::legacy_input_for_test(&path, b"{");
     assert_eq!(load().unwrap().1, ScanIndexLoadOrigin::Loaded);
     // A press with no pause arms nothing for a later incident.
     assert_eq!(
@@ -1295,7 +1301,7 @@ fn user_repair_override_passes_the_guard_once_and_rearms_it() {
     // Hold-budget damage: its session-identity fields are strictly
     // recoverable, so a press may rebuild past the guard.
     let damage = whole_index_damage("budget");
-    e2_pipeline_scan_fixture::legacy_input_for_test(&path, &(&damage));
+    e2_pipeline_scan_fixture::legacy_input_for_test(&path, &damage);
     refused(&damage);
     // The pause names its automatic retry: 24 hours after the witness.
     let day = 24 * 60 * 60;
@@ -1360,7 +1366,7 @@ fn user_repair_override_passes_the_guard_once_and_rearms_it() {
 
     // A fresh failure inside 24 hours of the override refuses again; the
     // spent press does not carry over.
-    e2_pipeline_scan_fixture::legacy_input_for_test(&path, &(b"{  "));
+    e2_pipeline_scan_fixture::legacy_input_for_test(&path, b"{  ");
     refused(b"{  ");
     assert_eq!(
         arm_scan_index_rebuild_manual_override(source, SystemTime::now()),
@@ -1968,6 +1974,7 @@ fn actual_transcript_rescans_keep_file_and_family_holds_out_of_publication() {
             }
             let scratch = crate::test_scratch::ScratchDir::new("lenient-real-rescan");
             let path = scratch.as_ref().join("index.json");
+            e2_pipeline_scan_fixture::bind_source_for_test(&path, source);
             let root = scratch.as_ref().join("projects");
             let session = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
             fs::create_dir_all(&root).unwrap();
@@ -2042,7 +2049,7 @@ fn actual_transcript_rescans_keep_file_and_family_holds_out_of_publication() {
             value[field][&held_key] = serde_json::json!({"members": [false], "opaque": "future"});
             let bytes = serde_json::to_vec_pretty(&value).unwrap();
             let original = raw_slot(&bytes, field, &held_key);
-            e2_pipeline_scan_fixture::legacy_input_for_test(&path, &(&bytes));
+            e2_pipeline_scan_fixture::legacy_input_for_test(&path, &bytes);
             let mut loaded = read_decoder_fixture(&path).unwrap();
             assert!(loaded.decode_holds_file(&key));
             // Pins the NewFile decision independently of the scan's earlier
@@ -2273,7 +2280,7 @@ fn history_gate_damage_is_local_through_load_and_both_cas_readers() {
                     value["claude_history_gate_loaded"] = bad.clone();
                 }
                 let bytes = serde_json::to_vec(&value).unwrap();
-                e2_pipeline_scan_fixture::legacy_input_for_test(&path, &(&bytes));
+                e2_pipeline_scan_fixture::legacy_input_for_test(&path, &bytes);
                 let loaded = read_decoder_fixture(&path).unwrap();
                 // Inspect CAS decode results as well as the real save APIs:
                 // a later overwrite must not conceal missing normalization.
@@ -2346,13 +2353,18 @@ fn every_whole_index_rebuild_cause_shares_the_daily_guard() {
             let scratch = crate::test_scratch::ScratchDir::new("lenient-all-rebuild-causes");
             let path = scratch.join("index.json");
             let previous_bytes = whole_index_damage(previous);
-            e2_pipeline_scan_fixture::legacy_input_for_test(&path, &(&previous_bytes));
+            e2_pipeline_scan_fixture::legacy_input_for_test(&path, &previous_bytes);
             let before = scan_index_containment_lines_for_test().len();
+            let held = ScanIndex::load_inner(&path, Some(SnapshotSource::ClaudeCode)).unwrap_err();
+            assert_eq!(
+                held.downcast_ref::<state_v2::Hold>(),
+                Some(&state_v2::Hold::ReloadRequired)
+            );
             let (index, origin) =
                 ScanIndex::load_inner(&path, Some(SnapshotSource::ClaudeCode)).unwrap();
             assert!(index.files.is_empty());
-            assert!(matches!(origin, LoadOrigin::Quarantined));
-            assert!(!path.exists());
+            assert!(matches!(origin, LoadOrigin::Loaded));
+            assert!(path.exists(), "quarantine publishes the fresh native fence");
             assert_eq!(corrupt_count(scratch.as_ref()), 1);
             let backup = fs::read_dir(scratch.as_ref())
                 .unwrap()
@@ -2374,7 +2386,7 @@ fn every_whole_index_rebuild_cause_shares_the_daily_guard() {
             assert!(success[0].contains("history_policy=prior_history_gated_rebuild"));
 
             let bytes = whole_index_damage(current);
-            e2_pipeline_scan_fixture::legacy_input_for_test(&path, &(&bytes));
+            e2_pipeline_scan_fixture::legacy_input_for_test(&path, &bytes);
             let before = scan_index_containment_lines_for_test().len();
             let error = ScanIndex::load_inner(&path, Some(SnapshotSource::ClaudeCode)).unwrap_err();
             assert!(
@@ -2407,7 +2419,7 @@ fn load_refuses_future_quarantine_stamp_and_rebuilds_after_24_hours() {
         let scratch = crate::test_scratch::ScratchDir::new("lenient-load-cooldown-time");
         let path = scratch.join("index.json");
         let bytes = whole_index_damage(current);
-        e2_pipeline_scan_fixture::legacy_input_for_test(&path, &(&bytes));
+        e2_pipeline_scan_fixture::legacy_input_for_test(&path, &bytes);
         // A future rename stamp remains a hold during clock rollback.
         let stamp = now_nanos + 24 * 60 * 60 * 1_000_000_000;
         let backup = scratch.join(format!("index.corrupt.123.{stamp}.json"));
@@ -2427,12 +2439,16 @@ fn load_refuses_future_quarantine_stamp_and_rebuilds_after_24_hours() {
             .is_some());
         assert_eq!(fs::read(&path).unwrap(), bytes);
         let before = scan_index_containment_lines_for_test().len();
-        let (index, origin) =
-            ScanIndex::load_inner_at(&path, None, boundary + std::time::Duration::from_nanos(1))
-                .unwrap();
+        let after_boundary = boundary + std::time::Duration::from_nanos(1);
+        let held = ScanIndex::load_inner_at(&path, None, after_boundary).unwrap_err();
+        assert_eq!(
+            held.downcast_ref::<state_v2::Hold>(),
+            Some(&state_v2::Hold::ReloadRequired)
+        );
+        let (index, origin) = ScanIndex::load_inner_at(&path, None, after_boundary).unwrap();
         assert!(index.files.is_empty());
-        assert!(matches!(origin, LoadOrigin::Quarantined));
-        assert!(!path.exists());
+        assert!(matches!(origin, LoadOrigin::Loaded));
+        assert!(path.exists(), "quarantine publishes the fresh native fence");
         assert_eq!(corrupt_count(scratch.as_ref()), 2);
         assert_eq!(fs::read(&backup).unwrap(), b"prior witness");
         assert!(scan_index_containment_lines_for_test()[before..]
@@ -2548,14 +2564,13 @@ fn malformed_upload_ack_retirement_handoff_keeps_index_identity_without_pause() 
         ] {
             let scratch = crate::test_scratch::ScratchDir::new("lenient-ack-handoff");
             let path = scratch.join("index.json");
-            let support = scratch.join("support");
             let source = SnapshotSource::ClaudeCode;
-            let mut seed = override_identity_seed("handoff-owner");
+            let seed = override_identity_seed("handoff-owner");
             write_decoder_fixture(&seed, &path);
             let mut value = serde_json::to_value(&seed).unwrap();
             value["upload_ack_retirement_handoff"] = damaged;
             let bytes = serde_json::to_vec(&value).unwrap();
-            e2_pipeline_scan_fixture::legacy_input_for_test(&path, &(&bytes));
+            e2_pipeline_scan_fixture::legacy_input_for_test(&path, &bytes);
 
             let before = scan_index_containment_lines_for_test().len();
             let mut loaded = read_decoder_fixture(&path).unwrap();
@@ -2625,12 +2640,12 @@ fn user_repair_override_keeps_prior_identity_authoritative_through_failures() {
     e2_pipeline_scan_fixture::bind_source_for_test(&path, source);
     let load = || e2_pipeline_scan_fixture::load_source_for_test(&path, source, &support);
     // The first incident is the pre-existing gated rebuild.
-    e2_pipeline_scan_fixture::legacy_input_for_test(&path, &(b"{"));
+    e2_pipeline_scan_fixture::legacy_input_for_test(&path, b"{");
     assert_eq!(load().unwrap().1, ScanIndexLoadOrigin::Loaded);
 
     let seed = override_identity_seed(&session);
     let damage = struct_order_budget_damage(&seed, "");
-    e2_pipeline_scan_fixture::legacy_input_for_test(&path, &(&damage));
+    e2_pipeline_scan_fixture::legacy_input_for_test(&path, &damage);
     let error = load().unwrap_err();
     assert!(
         error.downcast_ref::<ScanIndexRebuildLoop>().is_some(),
@@ -2769,9 +2784,9 @@ fn user_repair_override_refuses_when_identity_state_is_unrecoverable() {
             assert_eq!(fs::read(&path).unwrap(), damage, "{case}");
             error
         };
-        e2_pipeline_scan_fixture::legacy_input_for_test(&path, &(b"{"));
+        e2_pipeline_scan_fixture::legacy_input_for_test(&path, b"{");
         assert_eq!(load().unwrap().1, ScanIndexLoadOrigin::Loaded);
-        e2_pipeline_scan_fixture::legacy_input_for_test(&path, &(&damage));
+        e2_pipeline_scan_fixture::legacy_input_for_test(&path, &damage);
         // The whole-index failure wins over the strict field, so the guard
         // (not a strict refusal) is what pauses the source.
         refused();
@@ -2844,12 +2859,12 @@ fn user_repair_override_refuses_when_identity_state_is_unrecoverable() {
         // incident can arm immediately, without waiting the 24-hour cooldown.
         e2_pipeline_scan_fixture::legacy_input_for_test(
             &path,
-            &(serde_json::to_vec(&fixture()).unwrap()),
+            &serde_json::to_vec(&fixture()).unwrap(),
         );
         assert_eq!(load().unwrap().1, ScanIndexLoadOrigin::Loaded);
         e2_pipeline_scan_fixture::legacy_input_for_test(
             &path,
-            &(struct_order_budget_damage(&fixture(), "")),
+            &struct_order_budget_damage(&fixture(), ""),
         );
         assert!(load().is_err());
         assert_eq!(
@@ -3010,7 +3025,7 @@ fn carried_ack_debt_admission_refuses_before_writes_and_counts_by_code() {
         let support = scratch.join("support");
         e2_pipeline_scan_fixture::bind_source_for_test(&path, source);
         let load = || e2_pipeline_scan_fixture::load_source_for_test(&path, source, &support);
-        e2_pipeline_scan_fixture::legacy_input_for_test(&path, &(b"{"));
+        e2_pipeline_scan_fixture::legacy_input_for_test(&path, b"{");
         assert_eq!(load().unwrap().1, ScanIndexLoadOrigin::Loaded);
         let mut seed = fixture();
         if byte_exhaustion {
@@ -3028,7 +3043,7 @@ fn carried_ack_debt_admission_refuses_before_writes_and_counts_by_code() {
             );
         }
         let damage = struct_order_budget_damage(&seed, "");
-        e2_pipeline_scan_fixture::legacy_input_for_test(&path, &(&damage));
+        e2_pipeline_scan_fixture::legacy_input_for_test(&path, &damage);
         assert!(load()
             .unwrap_err()
             .downcast_ref::<ScanIndexRebuildLoop>()
@@ -3084,10 +3099,10 @@ fn override_persistence_refusal_leaves_cooldown_unspent() {
     let support = scratch.join("support");
     e2_pipeline_scan_fixture::bind_source_for_test(&path, source);
     let load = || e2_pipeline_scan_fixture::load_source_for_test(&path, source, &support);
-    e2_pipeline_scan_fixture::legacy_input_for_test(&path, &(b"{"));
+    e2_pipeline_scan_fixture::legacy_input_for_test(&path, b"{");
     assert_eq!(load().unwrap().1, ScanIndexLoadOrigin::Loaded);
     let damage = struct_order_budget_damage(&fixture(), "");
-    e2_pipeline_scan_fixture::legacy_input_for_test(&path, &(&damage));
+    e2_pipeline_scan_fixture::legacy_input_for_test(&path, &damage);
     assert!(load()
         .unwrap_err()
         .downcast_ref::<ScanIndexRebuildLoop>()
@@ -3249,7 +3264,7 @@ fn carried_ack_for_unvisited_family_hold_survives_until_reconstruction() {
     let mut value = serde_json::to_value(&rebuilt).unwrap();
     value["claude_usage_family_witnesses"] =
         serde_json::json!({session: {"members": [false], "opaque": "future"}});
-    e2_pipeline_scan_fixture::legacy_input_for_test(&path, &(serde_json::to_vec(&value).unwrap()));
+    e2_pipeline_scan_fixture::legacy_input_for_test(&path, &serde_json::to_vec(&value).unwrap());
     let mut held = read_decoder_fixture(&path).unwrap();
     assert!(held.decode_holds_file(&key));
     let walk = scan(&mut held, "2026-10-22T00:01:00Z");
@@ -3284,10 +3299,7 @@ fn carried_ack_for_unvisited_family_hold_survives_until_reconstruction() {
     // derived file entry now forces actual reconstruction on a healthy pass.
     let mut repaired = serde_json::to_value(&restarted).unwrap();
     repaired["claude_usage_family_witnesses"] = serde_json::json!({});
-    e2_pipeline_scan_fixture::legacy_input_for_test(
-        &path,
-        &(serde_json::to_vec(&repaired).unwrap()),
-    );
+    e2_pipeline_scan_fixture::legacy_input_for_test(&path, &serde_json::to_vec(&repaired).unwrap());
     let mut healthy = read_decoder_fixture(&path).unwrap();
     let release = scan(&mut healthy, "2026-10-22T00:02:00Z");
     assert!(release.census_complete);
@@ -3478,7 +3490,7 @@ fn carried_ack_clock_scalars_bound_malformed_spans_across_load_cas_and_override(
             let mut value = serde_json::to_value(&carried).unwrap();
             value[field] = Value::String("x".repeat(2 * 1024 * 1024));
             let bytes = serde_json::to_vec(&value).unwrap();
-            e2_pipeline_scan_fixture::legacy_input_for_test(&path, &(&bytes));
+            e2_pipeline_scan_fixture::legacy_input_for_test(&path, &bytes);
             let loaded = read_decoder_fixture(&path).unwrap();
             assert_eq!(serde_json::to_value(&loaded).unwrap().get(field), None);
             assert_eq!(
@@ -3577,10 +3589,7 @@ fn legacy_nested_positional_traversal_counts_keep_their_original_slots() {
             "observed_index_keys":[], "reconciliation_upper_bound":null,
             "reconciliation_after":null, "reconciliation_started":true, "counts":slots
         });
-        e2_pipeline_scan_fixture::legacy_input_for_test(
-            &path,
-            &(serde_json::to_vec(&root).unwrap()),
-        );
+        e2_pipeline_scan_fixture::legacy_input_for_test(&path, &serde_json::to_vec(&root).unwrap());
         let mut loaded = read_decoder_fixture(&path).expect("legacy nested sequence loads");
         let counts = &loaded.traversal.as_ref().unwrap().counts;
         assert_eq!(serde_json::to_value(counts).unwrap(), expected);
