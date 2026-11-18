@@ -445,6 +445,15 @@ The pass contains macOS `malloc_in_use_bytes_start` and
 A finish without a matching prepare omits `pass`. Three fixed source slots
 retain only endpoint samples.
 
+The pass reports each of the following outcome counts even when it is zero.
+
+- `selected` counts snapshots after policy and local hold filtering, including telemetry-only snapshots.
+- `accepted` is the accepted snapshot count used by the terminal Success receipt.
+- `index_saved` is 1 when a scan-index save or state-v2 graph commit advanced the generation.
+- `progress_committed` counts state-v2 progress pages that committed.
+- `progress_unchanged` counts state-v2 progress pages that already matched the saved rows.
+- `progress_not_published` counts state-v2 progress pages that returned `NotPublished`.
+
 `pass.retained_heap_bytes` records the finishing source's in-memory index just
 before finish consumes it: `files_bytes`, `census_bytes`, `side_maps_bytes`,
 `accounts_identity_bytes`, and `traversal_bytes`. The last three split the

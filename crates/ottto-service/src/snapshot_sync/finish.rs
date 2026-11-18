@@ -113,6 +113,7 @@ use super::SnapshotSourceManifest;
 #[cfg(test)]
 use super::SnapshotUploadPolicy;
 use super::SnapshotUploadProgress;
+use crate::local_resource_diagnostics::pass_outcomes;
 
 /// Commit a `Completed` upload that left local holds. Every uploaded entity was
 /// accepted or unchanged; only the held revisions are unsettled.
@@ -1586,6 +1587,7 @@ pub(super) fn finish_sync_source(
         &mut scan_result,
         &claude_authority_disposition,
     );
+    pass_outcomes(|counts| counts.selected = scan_result.snapshots.len() as u64);
     let locally_held_fingerprints = &local_holds.held_fingerprints;
     if let Some(validate_recovery_save) = recovery_save_guard {
         // Retry a consistent local delta before any upload/ACK. Reuse the
@@ -1989,6 +1991,7 @@ pub(super) fn finish_sync_source(
             )
         })
     };
+    pass_outcomes(|counts| counts.accepted = accepted);
     // Main-upload mode ends with it; retries never record or drain custody.
     let identity_503_this_pass = upload_progress.identity_503_pass.take();
     // The logical offer ends here; normal bounded HTTP retries happened inside.
