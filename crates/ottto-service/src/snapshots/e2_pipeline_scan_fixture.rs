@@ -998,6 +998,7 @@ impl E2ScanFixture {
             self.capture_claude_identity,
             &[],
             sampled.then_some((self.cache.as_ref(), &scope)),
+            false,
         );
         if sampled {
             scan = scan.with_sampled_acquisition(self.cache.clone(), scope);
@@ -1057,6 +1058,7 @@ impl E2ScanFixture {
             false,
             &[],
             sampled.then_some((self.cache.as_ref(), &scope)),
+            false,
         );
         if sampled {
             scan = scan.with_sampled_acquisition(self.cache.clone(), scope);
@@ -1735,6 +1737,7 @@ pub(crate) fn scan_native_full_pipeline_for_test(
         true,
         &[],
         Some((cache.as_ref(), &scope)),
+        false,
     )
     .with_sampled_acquisition(cache, scope);
     loop {

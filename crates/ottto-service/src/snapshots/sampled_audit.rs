@@ -1643,6 +1643,17 @@ pub(super) fn expired_growth_claims(
     due
 }
 
+/// `expired_growth_claims` is non-empty, without its wake diagnostic.
+pub(super) fn growth_claim_expired(index: &ScanIndex, now: u64) -> bool {
+    growth_active(index)
+        && index.v2().growth_retention.values().any(|state| {
+            state.predecessor_size.is_some()
+                && state
+                    .last_growth_full_unix
+                    .is_some_and(|claim| now >= claim.saturating_add(GROWTH_FULL_INTERVAL))
+        })
+}
+
 /// The claim is one store transaction CAS'd on this lineage's G; no
 /// committed graph is decoded. A graph without its v2 runtime is refused.
 fn claim_growth_full(index: &mut ScanIndex, key: &str, now: u64) -> Result<bool> {

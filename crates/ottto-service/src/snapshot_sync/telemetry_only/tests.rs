@@ -41,3 +41,45 @@ fn generation_shapes_and_candidate_ledger_golden() {
     )
     .is_err());
 }
+
+/// Telemetry-only work only a walk takes up keeps an idle pass off: no ledger
+/// at the advertised floor, or a pending append notice, owes a walk.
+#[test]
+fn pending_telemetry_notice_owes_a_walk() {
+    let support = crate::test_scratch::ScratchDir::new("telemetry-owes-walk");
+    let hint = crate::snapshot_client::decode_activity_hint(json!({
+        "source":"claude_code", "server_time":"2026-11-18T00:00:00Z", "record_count_15m":0,
+        "record_count_24h":0, "local_usage_reconciliation_enabled":true,
+        "backfill_window_days":30, "recommended_scan_after":"2099-01-01T00:00:00Z",
+        "snapshot_head_cas_enabled":true, "snapshot_head_cas_required":false,
+        "claude_otel_only_sessions_contract":CONTRACT,
+        "claude_otel_only_pairing_floor":"2026-08-02T06:00:00Z"
+    }))
+    .unwrap();
+    let window = advertised(&hint).unwrap();
+    let mut progress: SnapshotUploadProgress = serde_json::from_value(json!({
+        "schema_version": SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION,
+        "destination_namespace_hash": "fixture-destination", "generation": 7}))
+    .unwrap();
+    let index = ScanIndex::default();
+    assert!(
+        progress.telemetry_owes_walk(&support, &hint, &index),
+        "no ledger"
+    );
+    progress.telemetry_only = Some(Box::new(Ledger {
+        floor: window.floor,
+        start: window.start,
+        candidates: BTreeMap::new(),
+    }));
+    assert!(
+        !progress.telemetry_owes_walk(&support, &hint, &index),
+        "settled"
+    );
+    otel::telemetry_notices::configure(&support, true).unwrap();
+    otel::telemetry_notices::appended_for_test(&support, "synthetic-root");
+    assert!(
+        progress.telemetry_owes_walk(&support, &hint, &index),
+        "a pending notice walks"
+    );
+    otel::telemetry_notices::configure(&support, false).unwrap();
+}

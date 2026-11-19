@@ -54,6 +54,20 @@ impl OwnedSourceScan {
                 "scan_index_map_unavailable",
             ));
         }
+        if self.walk_idle {
+            // The walk gate held this pass: nothing is listed or read.
+            let scan = SourceScanResult {
+                walk_idle: true,
+                backfill_window_days: self.backfill_window_days,
+                backfill_file_limit: self.file_limit,
+                census_window_end: self.census_window_end,
+                ..SourceScanResult::empty(self.source)
+            };
+            return Ok(OwnedSourceScanStep::Complete {
+                index: self.index,
+                scan,
+            });
+        }
 
         // Prepare one demand batch through bounded native continuations. Group
         // owners come from the completed header census, never arbitrary names.
@@ -162,6 +176,7 @@ impl OwnedSourceScan {
             mut line_delivery,
             codex_versions,
             launch_events,
+            walk_idle: _,
         } = self;
         let scan_launch_events = launch_events.clone();
         let launch_lookup = attribution_context
@@ -3305,6 +3320,12 @@ impl OwnedSourceScan {
                     .expect("traversal remains active");
                 let routine_recensus =
                     traversal_transition::routine_recensus(source, &traversal_snapshot);
+                // A clean walk retiring here may arm the gate.
+                let settled_walk = !traversal_snapshot.rewalk_owed
+                    && traversal_snapshot
+                        .pending_candidates
+                        .iter()
+                        .all(|candidate| candidate.census_member);
                 let traversal_healthy = !traversal_snapshot.has_errors();
                 let clean_frozen_generation = !traversal_snapshot.watcher_hint_seen;
                 let reconciliation_complete = if traversal_discovery_done
@@ -3606,6 +3627,8 @@ impl OwnedSourceScan {
                 });
                 let scan = SourceScanResult {
                     census_status,
+                    walk_idle: false,
+                    settled_walk: settled_walk && census_complete,
                     charge_deferred: history_upgrade.charge_deferred > 0,
                     page_file_limit_hit,
                     routine_recensus,
@@ -4015,6 +4038,12 @@ impl OwnedSourceScan {
                 } else {
                     HistoryDecision::NotOwed
                 };
+                if matches!(history, HistoryDecision::Held(HistoryHold::Budget)) {
+                    // Held for a later walk: this walk cannot settle it.
+                    if let Some(traversal) = index.traversal.as_mut() {
+                        traversal.rewalk_owed = true;
+                    }
+                }
                 // A held, unchanged member owed only a proof correction is not
                 // re-read every traversal either: its bodies would be vetoed,
                 // and the correction waits for the gate (StateMissing).
@@ -5195,6 +5224,7 @@ impl OwnedSourceScan {
             line_delivery,
             codex_versions,
             launch_events,
+            walk_idle: false,
         }))
     }
 }

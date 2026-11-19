@@ -1648,6 +1648,7 @@ pub(super) fn prepare_continuation_source(
     .with_codex_versions(inputs.codex_versions.clone());
     Ok(Ok(SourcePreparation {
         source,
+        walk_idle_pass: None,
         claude_scan_roots: None,
         account_witness: inputs.account_witness,
         scan_started_at,

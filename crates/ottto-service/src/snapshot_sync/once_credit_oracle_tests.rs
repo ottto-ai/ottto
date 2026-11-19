@@ -133,6 +133,8 @@ struct OracleServer {
     batches: Arc<Mutex<Vec<Vec<u8>>>>,
     placement: Arc<Mutex<BTreeMap<String, Value>>>,
     acknowledged: Arc<Mutex<Vec<Vec<Value>>>>,
+    /// Every collector status body, in arrival order.
+    statuses: Arc<Mutex<Vec<Value>>>,
 }
 impl OracleServer {
     fn new(source: SnapshotSource, handle: Handle) -> Self {
@@ -152,6 +154,8 @@ impl OracleServer {
         let placed = placement.clone();
         let acknowledged = Arc::new(Mutex::new(Vec::new()));
         let proved = acknowledged.clone();
+        let statuses = Arc::new(Mutex::new(Vec::new()));
+        let reported = statuses.clone();
         let worker = std::thread::spawn(move || {
             let _entered = handle.enter();
             while !done.load(Ordering::Relaxed) {
@@ -172,6 +176,9 @@ impl OracleServer {
                 } else {
                     serde_json::from_str(raw).unwrap()
                 };
+                if value.get("report_kind").is_some() {
+                    reported.lock().unwrap().push(value.clone());
+                }
                 let response = if request.contains("/relay-token") {
                     json!({"token":"synthetic-oracle-token","expires_at":"2099-01-01T00:00:00Z"})
                 } else if request.contains("/activity-hints") {
@@ -302,6 +309,7 @@ impl OracleServer {
             batches,
             placement,
             acknowledged,
+            statuses,
         }
     }
 }
@@ -397,6 +405,8 @@ struct Cycle {
     schedule: Option<Value>,
     evidence_chunks: usize,
     debt: Value,
+    /// The scan's `unacked_usage_lost_to_deletion` counts, summed over its pages.
+    unacked_lost: BTreeMap<String, u64>,
 }
 
 impl Cycle {
@@ -441,6 +451,9 @@ impl Drop for EvidenceSchedule {
 impl OracleHome {
     fn new(source: SnapshotSource, server: &OracleServer) -> Self {
         crate::client_report::reset_for_test();
+        // Release the native sessions of earlier homes whose directories are
+        // gone, so one test process does not run out of descriptors.
+        crate::snapshots::state_v2::close_removed_routes_for_test();
         let mut fixture = IdentityPipelineHome::new();
         fixture.base = fixture.base.canonicalize().unwrap();
         fixture.home = fixture.home.canonicalize().unwrap();
@@ -667,6 +680,9 @@ impl OracleHome {
         let pre_index_bytes = serde_json::to_vec(&frame.committed_index).unwrap();
         let handle = recording.handle();
         let worker_births = self.births.clone();
+        // The page rows the scan worker emits.
+        let pages = Mutex::new(Vec::new());
+        let worker_pages = &pages;
         let (preparation, index, scan, steps, mut io) = run_on_scan_worker_stack(move || {
             let _entered = handle.enter();
 
@@ -712,14 +728,29 @@ impl OracleHome {
             };
             let read =
                 || crate::snapshots::OwnedSourceScan::with_oracle_births(worker_births, read);
-            if small_page {
-                crate::snapshots::with_test_limits_for_test(2048, 1024, 64, || {
-                    crate::snapshots::OwnedSourceScan::with_oracle_state_budget(budget, read)
-                })
-            } else {
-                read()
-            }
+            let (result, rows) = crate::local_resource_diagnostics::capture(|| {
+                if small_page {
+                    crate::snapshots::with_test_limits_for_test(2048, 1024, 64, || {
+                        crate::snapshots::OwnedSourceScan::with_oracle_state_budget(budget, read)
+                    })
+                } else {
+                    read()
+                }
+            });
+            *worker_pages.lock().unwrap() = rows;
+            result
         });
+        let mut unacked_lost = BTreeMap::<String, u64>::new();
+        for page in pages.into_inner().unwrap() {
+            if page["stage"] != "native_collection_page" {
+                continue;
+            }
+            if let Some(lost) = page["counts"]["unacked_usage_lost_to_deletion"].as_object() {
+                for (name, count) in lost {
+                    *unacked_lost.entry(name.clone()).or_default() += count.as_u64().unwrap();
+                }
+            }
+        }
         let gate = scan.trace_projection(&roots);
         test_effects::record(
             "gate_c",
@@ -835,6 +866,7 @@ impl OracleHome {
             schedule,
             evidence_chunks,
             debt,
+            unacked_lost,
         };
         let mut expected = Vec::new();
         if self.restarted {
@@ -3945,4 +3977,9 @@ mod money_equivalence_tests {
         }
         emit_money("once_credit_native", receipt_bodies, fixture_inputs);
     }
+}
+
+// The walk gate on this runner: idle passes, wakes, the backstop and hint loss.
+mod walk_gate_oracle_tests {
+    include!("walk_gate_oracle_tests.rs");
 }

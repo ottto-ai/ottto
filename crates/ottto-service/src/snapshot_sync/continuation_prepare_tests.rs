@@ -182,6 +182,7 @@ impl ContinuationFixture {
             legacy_reconciliation_pending: BTreeSet::new(),
             active_legacy_reconciliation: BTreeSet::new(),
             scan: None,
+            walk_idle_pass: None,
         }
     }
 

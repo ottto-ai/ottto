@@ -100,7 +100,7 @@ pub(super) fn jittered_retry_after(key: &str, from: u64, base: u64) -> u64 {
 /// further: neither the filesystem watcher nor a server directive can suppress
 /// a scan, because a watcher that silently stops delivering events would
 /// otherwise stop collection with every health signal green.
-pub(super) const MAX_CYCLE_INTERVAL: Duration = Duration::from_secs(30 * 60);
+pub(crate) const MAX_CYCLE_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
 /// How long the loop is willing to sit inside one wait before re-deciding.
 /// Filesystem events shorten a wait to the next tier boundary; they never

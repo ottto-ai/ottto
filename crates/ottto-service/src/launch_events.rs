@@ -416,6 +416,12 @@ pub(crate) fn valid_worker(worker: &str) -> bool {
     is_uuid(worker)
 }
 
+/// The two inbox directories a launch event lands in or moves to.
+pub(crate) fn inbox_dirs(home: &Path) -> [PathBuf; 2] {
+    let root = home.join(DROP_ROOT_DIR);
+    [root.join(PENDING_SUBDIR), root.join(PROCESSED_SUBDIR)]
+}
+
 fn directory_stamp(dir: &Path) -> Option<SystemTime> {
     fs::metadata(dir)
         .and_then(|metadata| metadata.modified())

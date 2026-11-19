@@ -752,12 +752,16 @@ impl std::fmt::Display for UploadFailureDiagnostics {
 
 impl std::error::Error for UploadFailureDiagnostics {}
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct ActivityHintResponse {
     pub source: String,
+    #[serde(skip_serializing)]
     pub server_time: String,
+    #[serde(skip_serializing)]
     pub last_data_at: Option<String>,
+    #[serde(skip_serializing)]
     pub record_count_15m: u64,
+    #[serde(skip_serializing)]
     pub record_count_24h: u64,
     pub local_usage_reconciliation_enabled: bool,
     pub backfill_window_days: u64,
@@ -768,7 +772,7 @@ pub struct ActivityHintResponse {
     /// `workspace_labels_enabled` exactly as sent; `None` when the response
     /// omitted it (the field above then defaults to on). Set only by
     /// `decode_activity_hint`. Instruction-file paths need `Some(true)`.
-    #[serde(skip)]
+    #[serde(skip_deserializing)]
     pub workspace_labels_explicit: Option<bool>,
     #[serde(default)]
     pub session_artifacts_enabled: bool,
@@ -793,7 +797,7 @@ pub struct ActivityHintResponse {
     /// `session_titles_enabled` privacy choice; it is not a second consent.
     #[serde(default)]
     pub session_attribution_labels_enabled: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub session_attribution_hmac_key: Option<String>,
     #[serde(default)]
     pub session_attribution_hmac_key_version: Option<String>,
@@ -808,13 +812,13 @@ pub struct ActivityHintResponse {
     #[serde(default)]
     pub copy_unproven_contract: Option<String>,
     /// Receiver item limit; decoded tolerantly by `decode_activity_hint`.
-    #[serde(skip)]
+    #[serde(skip_deserializing)]
     pub max_snapshot_item_bytes: Option<u64>,
-    #[serde(skip)]
+    #[serde(skip_deserializing)]
     pub claude_otel_only_sessions_contract: Option<String>,
-    #[serde(skip)]
+    #[serde(skip_deserializing)]
     pub claude_otel_only_pairing_floor: Option<String>,
-    #[serde(skip)]
+    #[serde(skip_deserializing)]
     pub claude_otel_only_pairing_ceiling: Option<String>,
     /// Additive head-CAS capability; absent stays disabled.
     #[serde(default)]
@@ -843,11 +847,12 @@ pub struct ActivityHintResponse {
     /// server resolves it. An older server omits it, which means off. This
     /// and the next one are set only by `decode_activity_hint`, tolerantly:
     /// a missing or malformed value is off and never fails the hint.
-    #[serde(skip)]
+    #[serde(skip_deserializing)]
     pub codex_cloud_tasks_enabled: bool,
     /// Codex only: the task-list contract the server accepts.
-    #[serde(skip)]
+    #[serde(skip_deserializing)]
     pub codex_cloud_tasks_contract: Option<String>,
+    #[serde(skip_serializing)]
     pub recommended_scan_after: String,
 }
 

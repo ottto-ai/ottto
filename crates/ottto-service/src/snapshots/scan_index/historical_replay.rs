@@ -395,6 +395,7 @@ impl ScanIndex {
             residue: ScanTraversalResidue::default(),
             listing_started_unix_seconds: None,
             listing_owed_requeued_unix_seconds: Default::default(),
+            rewalk_owed: false,
         });
     }
 

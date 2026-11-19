@@ -1817,3 +1817,22 @@ fn graph_save_keeps_progress_rows_outside_the_graph() {
     assert_eq!(headers(&mut db), before);
     assert_persisted(&mut db, &next);
 }
+
+/// A checkpoint stored before the walk gate's `rewalk_owed` existed decodes
+/// exactly and re-encodes to the same bytes; a set flag is the only addition.
+#[test]
+fn checkpoint_without_rewalk_owed_keeps_its_bytes() {
+    type Checkpoint = Option<crate::snapshots::ScanTraversalCheckpoint>;
+    let stored = serde_json::to_vec(&fixture().traversal).unwrap();
+    let row: serde_json::Value = serde_json::from_slice(&stored).unwrap();
+    assert!(row.get("rewalk_owed").is_none());
+    let (decoded, canonical) = codec::exact_json::<Checkpoint>(&stored).unwrap();
+    assert_eq!(canonical, stored);
+    let mut checkpoint = decoded.unwrap();
+    assert!(!checkpoint.rewalk_owed);
+    let index = hydrate_with_shipped_row("scan_state.traversal", row).unwrap();
+    assert!(!index.traversal.as_ref().unwrap().rewalk_owed);
+    checkpoint.rewalk_owed = true;
+    let flagged = serde_json::to_value(&checkpoint).unwrap();
+    assert_eq!(flagged["rewalk_owed"], true);
+}

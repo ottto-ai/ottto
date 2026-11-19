@@ -1653,6 +1653,25 @@ files are all skipped waits the ordinary cadence. These observations add no
 timer or trigger.
 No full fingerprint, path or key is emitted, and none of these fields enters uploads.
 
+## Idle passes of a settled source
+
+A pass the walk gate held logs `walk_idle=true` at the end of its
+`snapshot terminal_census` line, with `census_complete=false` and no scanned
+files. Its status report is a Success with no census loss, no census or parse
+error code, and the source manifest withdrawn; nothing was read, uploaded or
+saved. A hint, a listing request, a changed input, a failure, an account switch
+or a restart makes the next pass walk, and a settled source still walks at
+least once every listing interval (three hours).
+
+`bounded_traversal_transition` rows carry the walk's counts, including
+`listing_changes_without_hint`: changed files a listing queued that no watcher
+hint announced. `listing_changes_by_class` splits that total into six rows of
+`[first, repeat]` counts, in this order: Claude main transcripts, Claude
+subagent transcripts, Codex live rollouts, Codex archived rollouts, compressed
+Codex rollouts and Pi sessions. `first` counts a file's first sighting in the
+walk's generation and `repeat` a later one. The cells sum to the total. The
+field is report only and is omitted while every cell is zero.
+
 ## Prior Held Family Observation
 
 A `bounded_traversal_transition` row with `event: starting` includes

@@ -82,7 +82,59 @@ impl Ledger {
     }
 }
 
+/// Whether a seeded candidate's current generation needs a body.
+fn owed(
+    candidate: &Candidate,
+    generation: &TelemetryGeneration,
+    accepted: &BTreeMap<String, String>,
+    contexts: &BTreeMap<String, String>,
+    resend: &super::upload_context_resend::Cycle,
+) -> bool {
+    generation.api.is_some()
+        && generation.trace.is_some()
+        && candidate.built.as_ref().is_none_or(|built| {
+            otel::telemetry_not_truncated(generation, &built.generation)
+                && !(built.generation == *generation
+                    && accepted.get(&built.fingerprint) == Some(&built.body)
+                    && !resend.requires_resend(&built.fingerprint, contexts))
+        })
+}
+
 impl SnapshotUploadProgress {
+    /// Telemetry-only work only a walking pass takes up (`walk_idle`).
+    pub(super) fn telemetry_owes_walk(
+        &self,
+        support: &Path,
+        hint: &crate::snapshot_client::ActivityHintResponse,
+        index: &ScanIndex,
+    ) -> bool {
+        let Some(window) = advertised(hint) else {
+            return false;
+        };
+        let Some(ledger) = (self.telemetry_only.as_ref()).filter(|l| l.floor == window.floor)
+        else {
+            return true;
+        };
+        if !otel::telemetry_notices::pending(support).is_ok_and(|pending| pending.is_empty()) {
+            return true;
+        }
+        let candidates = ledger.candidates.keys().cloned().collect();
+        let (absent, _) =
+            crate::snapshots::claude_request_money::e2::telemetry_scope(index, &candidates);
+        ledger.candidates.iter().any(|(root, candidate)| {
+            absent.contains(root)
+                && otel::telemetry_generation(support, root).is_ok_and(|generation| {
+                    owed(
+                        candidate,
+                        &generation,
+                        &self.accepted_body_witnesses,
+                        &self.accepted_body_contexts,
+                        &self.context_resend,
+                    )
+                })
+        })
+    }
+
     /// Shared across the whole ACK-retirement owner, including capacity and recovery.
     pub(super) fn ack_incidence<'a>(
         &'a self,
@@ -152,16 +204,7 @@ impl SnapshotUploadProgress {
             let Ok(generation) = otel::telemetry_generation(support, root) else {
                 continue;
             };
-            if (generation.api.is_none() || generation.trace.is_none())
-                || candidate.built.as_ref().is_some_and(|built| {
-                    !otel::telemetry_not_truncated(&generation, &built.generation)
-                })
-                || candidate.built.as_ref().is_some_and(|built| {
-                    built.generation == generation
-                        && accepted.get(&built.fingerprint) == Some(&built.body)
-                        && !resend.requires_resend(&built.fingerprint, contexts)
-                })
-            {
+            if !owed(candidate, &generation, accepted, contexts, resend) {
                 continue;
             }
             candidate.reading = Some(generation);
