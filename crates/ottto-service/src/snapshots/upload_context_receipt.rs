@@ -589,6 +589,7 @@ impl ScanIndex {
 
     /// An exact ACK of a body this daemon sent, in any context; proves a body, not each id.
     /// A settled revision (stamped before POST) and server-learned heads are not evidence.
+    #[cfg(test)]
     pub(super) fn file_has_accepted_body(&self, key: &str) -> bool {
         !self.decode_holds_file(key) && self.file_has_accepted_body_unheld(key)
     }

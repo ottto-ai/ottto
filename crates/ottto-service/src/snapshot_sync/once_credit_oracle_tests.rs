@@ -2461,7 +2461,7 @@ fn scheduling_equal_birth_twins(before_cutoff: bool) {
                         }
                         if before_cutoff {
                             let index = ScanIndex::load(&home.index_path()).unwrap();
-                            crate::snapshots::claude_request_money::e2::pipeline_test_observer::assert_counting_twin_grandfather_premise(
+                            crate::snapshots::claude_request_money::e2::pipeline_test_observer::assert_counting_twin_premise(
                                 &index,
                                 &paths[0],
                                 &paths[1],

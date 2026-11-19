@@ -395,8 +395,6 @@ pub(crate) fn release_emitted_fold(item: &mut SnapshotItem) {
         copied: _,
         native_copied: _,
         first_own,
-        first_own_at: _,
-        grandfathered: _,
         twin_pending: _,
         ambiguous,
         disclosed: _,
@@ -994,10 +992,6 @@ pub(crate) struct FileFold {
     /// Parse-time copy presence, before any restoration; transient, never stored.
     native_copied: bool,
     first_own: Option<u64>,
-    /// The provider time of the `first_own` response (RAM only).
-    first_own_at: Option<i128>,
-    /// An accepted copy decided before `COPY_PROOF_FROM` keeps its decision.
-    grandfathered: bool,
     /// Only the native subagent branch leaves these skips for page proof.
     twin_pending: bool,
     /// Request hashes two responses of this file claim; filled on demand.
@@ -1016,7 +1010,7 @@ pub(crate) struct FileFold {
     /// copy route the page takes: the page's evidence scope reads its pair.
     fork_parent: Option<String>,
 }
-money_heap_fields!(FileFold; inline: [own_requests, copy_unproven_wire, money_birth, role, copied, native_copied, grandfathered, twin_pending, disclosed, e2_nanos, responses, root_fallbacks, side, prefix]; heap: [entity, physical, location, first_own, first_own_at, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, idless_inherited, first_idless, proof, prefix_inherited, ambiguous, telemetry, accounts, fork_parent]);
+money_heap_fields!(FileFold; inline: [own_requests, copy_unproven_wire, money_birth, role, copied, native_copied, twin_pending, disclosed, e2_nanos, responses, root_fallbacks, side, prefix]; heap: [entity, physical, location, first_own, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, idless_inherited, first_idless, proof, prefix_inherited, ambiguous, telemetry, accounts, fork_parent]);
 
 impl FileFold {
     pub(in crate::snapshots) fn new(
@@ -1110,8 +1104,6 @@ impl FileFold {
             copied: 0,
             native_copied: false,
             first_own: None,
-            first_own_at: None,
-            grandfathered: false,
             twin_pending: false,
             ambiguous: BTreeSet::new(),
             disclosed: 0,
@@ -1256,7 +1248,6 @@ impl FileFold {
         let copied = self.money_birth.copied_with_slack(at, SLACK);
         if copied == Some(false) && self.first_own.is_none() {
             self.first_own = Some(sequence);
-            self.first_own_at = at;
         }
         let Some(placed) = placed else {
             return;
@@ -1349,15 +1340,13 @@ impl FileFold {
     /// Confirm, or undo, the held pre-birth skip. A copied MAIN file
     /// (all-pre-birth /branch, or the prefix of a resume) needs a PROOF that
     /// `decide_page_copies` checks per request on the page: earlier main
-    /// files of other sessions in its folder hold the request ids. An
-    /// accepted copy decided before `COPY_PROOF_FROM` keeps its decision.
+    /// files of other sessions in its folder hold the request ids.
     /// Without a proof the copies count and are disclosed.
     /// `fork_parent`: the session a `fork-context-ref` line names (empty:
     /// none single).
     pub(in crate::snapshots) fn finish_native(
         &mut self,
         context: Option<&ReadContext<'_>>,
-        markers: Option<&claude_request_identity::OrgMarkers>,
         fork_parent: Option<&str>,
     ) {
         let started = Instant::now();
@@ -1365,7 +1354,7 @@ impl FileFold {
             .filter(|parent| !parent.is_empty())
             .map(str::to_owned);
         self.native_copied = self.copied > 0;
-        self.decide_native(context, markers);
+        self.decide_native(context);
         if self.proof.is_none() {
             self.proof = context
                 .and_then(|context| {
@@ -1380,25 +1369,12 @@ impl FileFold {
         self.spend(started);
     }
 
-    fn decide_native(
-        &mut self,
-        context: Option<&ReadContext<'_>>,
-        markers: Option<&claude_request_identity::OrgMarkers>,
-    ) {
+    fn decide_native(&mut self, context: Option<&ReadContext<'_>>) {
         if self.money_birth.uncertain_root() {
             self.disclose("uncertain_birth", self.responses); // counted, disclosed
         }
         if self.copied == 0 {
-            self.finish_identity_start(false, markers);
-            return;
-        }
-        if self.grandfathered(context) {
-            // Accepted history keeps its decision: id-less copies stay
-            // skipped with the rest.
-            self.grandfathered = true;
-            self.idless_copy = None;
-            self.idless_inherited = None;
-            self.keep_copies(markers);
+            self.finish_identity_start();
             return;
         }
         if let Some(context) = context.filter(|context| self.cross_session_candidate(context)) {
@@ -1428,7 +1404,7 @@ impl FileFold {
         {
             self.twin_pending = true;
             self.copy = None;
-            self.finish_identity_start(false, markers);
+            self.finish_identity_start();
             return;
         }
         if let Some(mut copy) = self.copy.take() {
@@ -1443,24 +1419,11 @@ impl FileFold {
         self.skipped.clear();
         self.disclose("copy_unproven", self.copied);
         self.copied = 0;
-        self.finish_identity_start(false, markers);
+        self.finish_identity_start();
     }
 
-    /// Hold the copies as removed (finally, or until the page checks them).
-    fn keep_copies(&mut self, markers: Option<&claude_request_identity::OrgMarkers>) {
-        self.finish_identity_start(true, markers);
-        self.copy = None;
-    }
-
-    fn finish_identity_start(
-        &mut self,
-        prefix_excluded: bool,
-        markers: Option<&claude_request_identity::OrgMarkers>,
-    ) {
-        if let Some(accounts) = self.accounts.as_deref_mut() {
-            accounts.finish_native(markers, prefix_excluded);
-        }
-        self.absorb_prefix_inherited(prefix_excluded);
+    fn finish_identity_start(&mut self) {
+        self.absorb_prefix_inherited(false);
     }
 
     fn absorb_prefix_inherited(&mut self, repartition: bool) {
@@ -1473,43 +1436,6 @@ impl FileFold {
                 self.entity.absorb_grains(&inherited);
             }
         }
-    }
-
-    /// Forward-only: a resumed copy whose first own response (provider
-    /// time) is before `COPY_PROOF_FROM`, whose body was settled with copies
-    /// removed and accepted, and that has no saved removal, keeps that
-    /// decision. A later copy, an all-copy file or an unaccepted one takes
-    /// the request-id proof. A path that a same-session twin's saved removal
-    /// names as its holder counted those requests: a summed body's COPY mark
-    /// on it never authorizes dropping them.
-    fn grandfathered(&self, context: Option<&ReadContext<'_>>) -> bool {
-        let (Some(context), Some(at), Some(Located(location))) =
-            (context, self.first_own_at, self.location)
-        else {
-            return false;
-        };
-        let index = context.index;
-        let witness = || {
-            session_member(context.path).is_some_and(|member| {
-                index
-                    .claude_money_birth_store
-                    .observations(&member)
-                    .any(|(other, _)| {
-                        other != location
-                            && context.indexed(&member, other)
-                            && index
-                                .claude_copy_removals
-                                .get(other)
-                                .iter()
-                                .any(|(holder, _)| *holder == location)
-                    })
-            })
-        };
-        !from_copy_proof_cutoff(at)
-            && index.claude_money_birth_store.money_marks(location) & money_mark::COPY != 0
-            && index.file_has_accepted_body(&local_index_key(context.path))
-            && index.claude_copy_removals.get(location).is_empty()
-            && !witness()
     }
 
     /// /branch and --fork-session (an all-pre-birth MAIN file) and resume
@@ -2015,8 +1941,6 @@ pub(crate) fn decide_page_copies_planned(
             ..PrefixTally::default()
         };
         let twin_pending = std::mem::take(&mut fold.twin_pending);
-        // Accepted history (a grandfathered fold): its later twin only drops.
-        let drop_only = fold.grandfathered;
         let proof = fold.proof.clone();
         if !matches!(proof, Some(CopyProof::Holders { .. })) {
             if let Some(Located(file)) = fold.location {
@@ -2028,7 +1952,7 @@ pub(crate) fn decide_page_copies_planned(
         match proof {
             Some(CopyProof::Holders { .. }) => holders.push(at),
             Some(CopyProof::Family(root)) => {
-                if twin_pending || drop_only {
+                if twin_pending {
                     decide_subagent_twins(items, at);
                     items[at].claude_money.as_deref_mut().unwrap().proof =
                         Some(CopyProof::Family(root.clone()));
@@ -2921,8 +2845,7 @@ const SUBAGENT_TWIN_FROM: i128 = 1_793_836_800_000_000_000;
 /// `LocationKey` for equal births). One pass over a later home's responses:
 /// a held native skip stays removed, an unheld one counts again, and a held
 /// response it would count (a copy within the slack before its birth) is
-/// dropped. A grandfathered home keeps its accepted skips and only drops. A
-/// zero-usage or untimed response is never dropped.
+/// dropped. A zero-usage or untimed response is never dropped.
 /// Main path twins with no copies at parse time instead use usage dominance,
 /// with equal native accounts and copy-order ties, drop-only and without a
 /// birth/cutoff gate.
@@ -2932,7 +2855,6 @@ fn decide_subagent_twins(items: &mut [SnapshotItem], at: usize) {
         return;
     };
     let uncopied = !fold.native_copied && fold.proof.is_none();
-    let drop_only = fold.grandfathered || uncopied;
     let group = items
         .iter()
         .enumerate()
@@ -2953,9 +2875,6 @@ fn decide_subagent_twins(items: &mut [SnapshotItem], at: usize) {
             })
         })
         .unwrap_or_default();
-    if fold.grandfathered && !uncopied && earlier.is_empty() {
-        return;
-    }
     let first_own = first_own_turn(item, 0, &earlier).map(|o| o.sequence);
     let (mut kept, mut uncovered, mut drops) = (0, Vec::new(), Vec::new());
     let mut overcount = 0;
@@ -3005,7 +2924,7 @@ fn decide_subagent_twins(items: &mut [SnapshotItem], at: usize) {
         let held = || earlier.iter().any(|ids| ids.contains(id));
         let before_own = first_own.is_none_or(|own| occurrence.sequence < own);
         if fold.is_skipped(occurrence.sequence) {
-            if drop_only {
+            if uncopied {
                 continue;
             }
             let eligible = before_own
@@ -3033,7 +2952,7 @@ fn decide_subagent_twins(items: &mut [SnapshotItem], at: usize) {
             drops.push(id.clone());
         }
     }
-    if !drop_only {
+    if !uncopied {
         restore_uncovered(&mut items[at], &uncovered);
     }
     if let SnapshotItem {
@@ -3325,8 +3244,7 @@ fn parent_proves(
 }
 
 /// 2026-11-04T00:00:00Z (UTC ms). A copy whose own turns start at or after
-/// it takes the request-id proofs alone (also the same-session page proof);
-/// an earlier accepted copy keeps the decision it already had.
+/// it also takes the same-session page proof.
 const COPY_PROOF_FROM: i64 = 1_793_750_400_000;
 
 /// A provider time (UTC ns) at or after `COPY_PROOF_FROM`.
@@ -4939,8 +4857,8 @@ pub(crate) fn finish_page_planned(
         };
         let source_session_id: &String = source_session_id;
         // Released money restored a resumed prefix. Count only a proven
-        // removal, never a held/unproven request or a grandfathered skip.
-        if fold.first_own.is_some() && !fold.grandfathered && fold.entity.removed_requests > 0 {
+        // removal, never a held/unproven request.
+        if fold.first_own.is_some() && fold.entity.removed_requests > 0 {
             corrected_sessions.insert(source_session_id.clone());
         }
         // Work counts on every read; decisions only when decided (below).

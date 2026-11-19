@@ -21,10 +21,6 @@ fn route(arm: Settled, mode: Mode, page: &Page) -> RouteResult {
 enum Settled {
     /// The delivered holder proves the prefix again by request ids.
     Holders,
-    /// What an earlier build left: the copy settled before the cutoff with
-    /// its prefix removed and accepted, and nothing saved. The holder family
-    /// is then listed for re-emission, so no holder proves the prefix anew.
-    Grandfathered,
     /// The removal is saved, then the holder family is listed: listing
     /// pauses new removals only.
     ListedHolder,
@@ -34,17 +30,8 @@ impl Settled {
     fn name(self) -> &'static str {
         match self {
             Settled::Holders => "resumed_copy_prefix_dedupe",
-            Settled::Grandfathered => "resumed_copy_prefix_dedupe_grandfathered",
             Settled::ListedHolder => "resumed_copy_prefix_dedupe_listed_holder",
         }
-    }
-
-    /// The committed index every route of the next page reads.
-    fn prior(self, mut prior: ScanIndex) -> ScanIndex {
-        if self == Settled::Grandfathered {
-            prior.claude_copy_removals = Default::default();
-        }
-        prior
     }
 }
 
@@ -245,16 +232,11 @@ fn opened(scanner: &E2ScanFixture, path: &Path) -> bool {
 /// older release left (pending usage evidence and owed bits on every file);
 /// no grown body is smaller than the accepted one, and a restart after the
 /// last delivered page parses and sends nothing. The prefix stays removed when
-/// the delivered holder proves it, when an earlier build's accepted removal
-/// has nothing saved and no holder proves it anew, and when the holder
-/// family of a saved removal is listed.
+/// the delivered holder proves it and when the holder family of a saved
+/// removal is listed.
 #[test]
 fn resumed_copy_prefix_dedupe_is_route_equivalent() {
-    for arm in [
-        Settled::Holders,
-        Settled::Grandfathered,
-        Settled::ListedHolder,
-    ] {
+    for arm in [Settled::Holders, Settled::ListedHolder] {
         if !supported(arm.name()) {
             return;
         }
@@ -298,8 +280,7 @@ fn copy_prefix_routes(arm: Settled) {
     if arm != Settled::Holders {
         crate::snapshots::e2_pipeline_scan_fixture::write_exclusions(&c.support, &[ROOT]);
     }
-    let mut prior =
-        arm.prior(disk.commit(&first.cache, SnapshotSource::ClaudeCode, &mut first.index));
+    let mut prior = disk.commit(&first.cache, SnapshotSource::ClaudeCode, &mut first.index);
     // A deleted session beside the holder is still indexed in the committed
     // prior. Every route's complete read of that directory proves it absent
     // and retires it; no body, total or placement moves.
@@ -379,11 +360,11 @@ fn copy_prefix_routes(arm: Settled) {
         // new route, holds a growth claim bound to the old one (as
         // `restart_between_pages`).
         deliver(&mut disk_page);
-        let next = arm.prior(disk.commit(
+        let next = disk.commit(
             &disk_page.cache,
             SnapshotSource::ClaudeCode,
             &mut disk_page.index,
-        ));
+        );
         priors = [next.clone(), next.clone(), next];
         accepted = cold;
     }

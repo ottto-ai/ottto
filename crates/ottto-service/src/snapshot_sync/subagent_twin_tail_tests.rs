@@ -34,8 +34,8 @@ fn counts(page: &Page, session: &str) -> (u64, u64) {
 /// [money] Two subagents, each stored in two homes. The later home is born
 /// 114 ms after the last shared response, so that response is inside the
 /// 2 s copy slack. agent-000 dates from 2026-08 and its later home keeps an
-/// accepted copy body (its re-read is accepted history); agent-001 dates
-/// from 2026-11. First sight, then an own turn in each later home. The
+/// accepted copy body, which changes no decision; agent-001 dates from
+/// 2026-11. First sight, then an own turn in each later home. The
 /// retained, cold and restarted owners emit the same envelopes. Each shared
 /// request counts once, at the earlier home; the later home removes all three.
 #[cfg(unix)]

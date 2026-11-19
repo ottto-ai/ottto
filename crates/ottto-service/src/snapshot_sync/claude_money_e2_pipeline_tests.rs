@@ -3021,7 +3021,7 @@ fn e2_pipeline_uncopied_guard_carried_accounts() {
 
 /// [money] A summed body's COPY mark never lets its counting carrier drop r1.
 #[test]
-fn equal_birth_carrier_never_grandfathers_its_counted_request() {
+fn equal_birth_carrier_never_drops_its_counted_request() {
     use crate::snapshots::claude_money_birth_store::location_key;
     use crate::snapshots::claude_request_census::claude_request_hash;
     use crate::snapshots::sampled_scan::transition_fixture::with_scan_clock;
@@ -3141,7 +3141,6 @@ fn equal_birth_carrier_never_grandfathers_its_counted_request() {
                 .any(|(holder, hashes)| *holder == carrier_key
                     && hashes.binary_search(&r1_hash).is_ok()));
 
-            // This regression fails without the counting-holder guard.
             append(&carrier, &line(ROOT, "r2", own_at, 20));
             let grown = with_scan_clock(refreshed_at + 6 * 60 * 60, || {
                 ready(&c, &scanner, prior.clone(), 100, false)
@@ -4796,13 +4795,14 @@ fn e2_pipeline_lossy_absence_never_invalidates_a_stored_removal() {
     });
 }
 
-/// [money] Forward-only: an accepted copy settled with its prefix removed
-/// before the copy proof cutoff keeps that removal when its saved removal
-/// metadata is lost (absent or damaged), even when no census proves it any
-/// more; re-counting would re-emit a larger body than the one accepted. Own
-/// turns publish without delay.
+/// [money] An accepted copy whose saved removal metadata is lost (absent or
+/// damaged) is decided by the request-id holder proof like any other copy:
+/// while the census still proves the holder, the prefix stays removed; once
+/// nothing proves it, the prefix is counted and flagged as unproven, and a
+/// damaged record is also flagged as lost metadata. Own turns publish
+/// without delay.
 #[test]
-fn e2_pipeline_lost_removal_metadata_keeps_an_accepted_copys_decision() {
+fn e2_pipeline_lost_removal_metadata_decides_by_holder_proof() {
     for missing in [false, true] {
         for retired in [false, true] {
             with_e2(|| {
@@ -4831,16 +4831,31 @@ fn e2_pipeline_lost_removal_metadata_keeps_an_accepted_copys_decision() {
                 let page = ready(&c, &E2ScanFixture::default(), prior, 100, false);
                 let third = body(&page, THIRD).expect("own turns always publish");
                 let case = format!("missing {missing} retired {retired}");
-                assert_eq!(
-                    (third.request_count, third.removed_request_count),
-                    (2, Some(3)),
-                    "{case}"
-                );
-                assert_eq!(
-                    copy_diag(&["copy_prefix_unproven", "copy_removal_metadata_lost"]),
-                    [0, 0],
-                    "{case}: nothing flagged"
-                );
+                if retired {
+                    // No proof left: the prefix counts and is flagged.
+                    assert_eq!(
+                        (third.request_count, third.removed_request_count),
+                        (5, Some(0)),
+                        "{case}"
+                    );
+                    assert_eq!(
+                        copy_diag(&["copy_prefix_unproven", "copy_removal_metadata_lost"]),
+                        [3, if missing { 0 } else { 3 }],
+                        "{case}: counted prefix is flagged"
+                    );
+                } else {
+                    // The census still proves the holder: the removal stays.
+                    assert_eq!(
+                        (third.request_count, third.removed_request_count),
+                        (2, Some(3)),
+                        "{case}"
+                    );
+                    assert_eq!(
+                        copy_diag(&["copy_prefix_unproven", "copy_removal_metadata_lost"]),
+                        [0, 0],
+                        "{case}: nothing flagged"
+                    );
+                }
             });
         }
     }
