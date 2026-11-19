@@ -136,7 +136,10 @@ file-system hint / periodic listing → select file → read new bytes from save
   release is unsafe once a copy is decided locally; fix forward. Source and
   copy uploads stay independent, so ACK order can leave a temporary gap.
   An all-covered copy-only page drops its items when the session has another
-  file; own turns still publish. A selected content twin pulls every live
+  file; own turns still publish. The first on-page file of a session carries its
+  summed body and keeps its own start; the body's last-activity clock is the
+  latest of every on-page file of that session, and only a later request clock
+  sets its end. A selected content twin pulls every live
   overlapping census main, and a selected main file (not history-held)
   pulls every live census content twin sharing a request hash. Ordinary discovery
   acquires pulled files through the existing history and resident admission gates.

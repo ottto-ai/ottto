@@ -2432,6 +2432,10 @@ mod accepted_holder_row_tests {
     include!("accepted_holder_row_tests.rs");
 }
 
+mod entity_last_clock_tests {
+    include!("entity_last_clock_tests.rs");
+}
+
 /// [money] A current carrier keeps the main's Local proof for both a stored
 /// copy and a new copy, even when old state has no accepted counted rows.
 #[test]

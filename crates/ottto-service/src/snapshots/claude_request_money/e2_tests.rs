@@ -1108,6 +1108,14 @@ fn e2_withheld_session_keeps_every_item_unchanged_for_the_hold() {
             items[0].claude_money.as_deref_mut().unwrap().entity.held = true;
             expected.insert("request_owned_held", 1);
         }
+        // The other path's later clock would move the carrier's last.
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.source_last_activity_at.clone())
+                .collect::<Vec<_>>(),
+            [Some(at(1)), Some(at(2))]
+        );
         let before = canonical(&items);
         let mut reasons = BTreeMap::new();
         let withheld = finish_page(
@@ -1149,6 +1157,85 @@ fn e2_withheld_session_keeps_every_item_unchanged_for_the_hold() {
     assert!(withheld.is_empty());
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].request_count, 2);
+    assert_eq!(
+        (
+            items[0].source_last_activity_at.as_deref(),
+            items[0].source_ended_at.as_deref()
+        ),
+        (Some(at(2).as_str()), None)
+    );
+    cleanup(&[&first, &copy]);
+}
+
+/// [money] [regress] One body summed from two path twins keeps the latest
+/// last clock of either file, whichever carries it, and the carrier's own
+/// start. The span moves no total, hour or row. A side call later than every
+/// file's last record still ends the body at its clock.
+#[test]
+fn e2_summed_twins_keep_the_latest_file_clock_and_a_later_side_call_ends_them() {
+    let first = root_file("span-a");
+    let copy = root_file("span-b");
+    let index = ScanIndex::default();
+    let tail = at(30);
+    let note = json!({"type":"user","sessionId":ROOT,"timestamp":tail,
+        "message":{"role":"user","content":"later"}});
+    let money = |item: &SnapshotItem| {
+        json!([
+            item.request_count,
+            item.input_tokens,
+            item.output_tokens,
+            item.cost,
+            item.model_usage,
+            item.usage_buckets
+        ])
+    };
+    for side in [false, true] {
+        let mut sums = Vec::new();
+        for (noted, reverse) in [(false, false), (true, false), (true, true)] {
+            let mut lines = vec![line("r", &at(1), 10)];
+            if noted {
+                lines.push(note.clone());
+            }
+            let mut items = vec![
+                parse(&first, Some(t0()), &index, &lines),
+                parse(&copy, Some(t0()), &index, &[line("o", &at(2), 20)]),
+            ];
+            if reverse {
+                items.reverse();
+            }
+            let start = items[0].source_started_at.clone();
+            let read = side.then(|| sidecar(&[row("r", 1, 10), row("o", 2, 20), row("s", 40, 5)]));
+            let got = publish(items, read.as_ref(), TelemetryRead::Loaded, &index);
+            assert_eq!(got.len(), 1);
+            let item = &got[0];
+            assert_eq!(item.request_count, 2 + u64::from(side));
+            assert_eq!(
+                item.source_started_at, start,
+                "the carrier keeps its own start"
+            );
+            let last = if noted { tail.clone() } else { at(2) };
+            let expected = if side {
+                // The side call's clock (07:00:40) is after every file's.
+                let clock = Some("2026-08-02T07:00:40Z".to_owned());
+                (clock.clone(), clock)
+            } else {
+                (Some(last), None)
+            };
+            assert_eq!(
+                (
+                    item.source_last_activity_at.clone(),
+                    item.source_ended_at.clone()
+                ),
+                expected,
+                "noted={noted} reverse={reverse} side={side}"
+            );
+            sums.push(money(item));
+        }
+        assert!(
+            sums.windows(2).all(|pair| pair[0] == pair[1]),
+            "the clock span moves no money"
+        );
+    }
     cleanup(&[&first, &copy]);
 }
 
