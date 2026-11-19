@@ -973,3 +973,124 @@ fn an_armed_source_beats_without_a_scan_start() {
     walk_idle::restart_for_test();
     assert_eq!(start(source, "now"), Some("now"));
 }
+
+/// Settles a clean Claude home, then holds its root family in a standing
+/// UnprovenTerminal authority record bound to the present, unchanged
+/// transcript, and requests a listing so the next pass walks.
+fn hold_claude_family(home: &mut OracleHome, server: &OracleServer, recording: &Recording) {
+    walk_idle::restart_for_test();
+    settle(home, server, recording);
+    let path = home.index_path();
+    let mut index = ScanIndex::load(&path).unwrap();
+    let key = transcript(home).to_string_lossy().into_owned();
+    let revision = index.files[&key].source_file_fingerprint.clone();
+    assert!(!revision.is_empty(), "the transcript is indexed");
+    index.insert_unproven_terminal_claude_authority_for_test(IDENTITY_PIPELINE_ROOT, &revision);
+    index.save_fixture(&path).unwrap();
+    request_listing_all(ListingTrigger::Rescan);
+}
+
+fn claude_authority_terminal_members(home: &OracleHome) -> usize {
+    ScanIndex::load(&home.index_path())
+        .unwrap()
+        .claude_usage_authority_terminal_entity_count()
+}
+
+/// A standing Claude authority hold on a present member goes through the real
+/// finish fold: the walk discloses it as settled ownership loss and still
+/// arms, and the idle passes after it send no receipt.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn claude_standing_authority_hold_arms_and_idles() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let recording = Recording::start();
+    let source = SnapshotSource::ClaudeCode;
+    let server = OracleServer::new(source, recording.handle());
+    let mut home = OracleHome::new(source, &server);
+    home.row = "w17";
+    let watched = roots(&home);
+    with_simulated_watch(&watched, || {
+        hold_claude_family(&mut home, &server, &recording);
+        let walk = pass(&mut home, &server, &recording, STEP);
+        assert!(walked(&walk), "the listing walks: {}", walk.gate);
+        assert_eq!(
+            claude_authority_terminal_members(&home),
+            1,
+            "the hold stands"
+        );
+        let receipt = last_status(&server);
+        let incomplete = receipt["last_ownership_incomplete_file_count"].as_u64();
+        assert!(incomplete >= Some(1), "disclosed: {receipt}");
+        assert_eq!(
+            receipt["last_terminal_ownership_incomplete_file_count"].as_u64(),
+            incomplete,
+            "settled: {receipt}"
+        );
+        assert!(
+            walk_idle::armed_for_test(source).is_some(),
+            "a standing hold is not walk loss: {receipt}"
+        );
+        idle_passes_keep_the_walk(&mut home, &server, &recording, "w17");
+        assert_eq!(claude_authority_terminal_members(&home), 1);
+    });
+}
+
+/// Control: the same standing hold plus a transcript whose positive usage
+/// yields no entity (this walk's own loss) never arms; each pass reports.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn claude_standing_authority_hold_with_walk_loss_never_arms() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let recording = Recording::start();
+    let source = SnapshotSource::ClaudeCode;
+    let server = OracleServer::new(source, recording.handle());
+    let mut home = OracleHome::new(source, &server);
+    home.row = "w18";
+    let watched = roots(&home);
+    with_simulated_watch(&watched, || {
+        hold_claude_family(&mut home, &server, &recording);
+        // Positive usage with no timestamp: no entity, so the file is loss.
+        let lossy = transcript(&home).with_file_name(format!("{SECOND_CODEX_THREAD}.jsonl"));
+        let row = json!({"type":"assistant","sessionId":SECOND_CODEX_THREAD,
+            "requestId":"req_lossy","message":{"id":"m_lossy","model":"claude-haiku-4-5",
+            "usage":{"input_tokens":5,"output_tokens":1}}});
+        std::fs::write(&lossy, format!("{row}\n")).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&lossy)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(NOW - 3600))
+            .unwrap();
+        for _ in 0..2 {
+            let sent = status_count(&server);
+            let next = pass(&mut home, &server, &recording, STEP);
+            assert!(next.finish.is_ok(), "{:?}", next.finish);
+            assert_eq!(
+                walk_idle::armed_for_test(source),
+                None,
+                "walk loss: {}",
+                next.gate
+            );
+            assert!(status_count(&server) > sent, "each pass reports");
+            let receipt = last_status(&server);
+            let walk_loss: u64 = [
+                "last_zero_snapshot_usage_evidence_count",
+                "last_dropped_usage_record_count",
+            ]
+            .iter()
+            .map(|field| receipt[*field].as_u64().unwrap())
+            .sum();
+            assert!(walk_loss > 0, "this walk's loss: {receipt}");
+            assert!(
+                receipt["last_ownership_incomplete_file_count"].as_u64() >= Some(1),
+                "the hold is still disclosed: {receipt}"
+            );
+        }
+    });
+}
