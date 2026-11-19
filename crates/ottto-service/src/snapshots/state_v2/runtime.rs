@@ -1198,6 +1198,10 @@ fn note_head_writes(state: &mut RouteState, written: impl IntoIterator<Item = Ve
     }
 }
 fn register(state: &mut RouteState, index: &ScanIndex) -> Result<()> {
+    // One test process opens thousands of routes: release the sessions of
+    // removed ones first, so it does not run out of descriptors.
+    #[cfg(test)]
+    close_removed_routes_for_test();
     // A new session: another writer may have changed any head.
     state.head_writes = None;
     state.runtimes.retain(|r| r.strong_count() != 0);
