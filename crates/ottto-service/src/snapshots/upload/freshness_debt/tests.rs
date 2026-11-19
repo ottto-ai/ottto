@@ -320,6 +320,37 @@ fn restart_and_failed_pass_keep_the_earliest_debt() {
         f.close();
     }
 }
+
+/// [money] A Claude transcript listed and gone before its lstat is a removal,
+/// yet that walk proves nothing absent: its unaccepted Tail head is not erased
+/// or counted deleted. The next walk, which no longer lists it, erases it once.
+#[cfg(unix)]
+#[test]
+fn walk_entry_removal_erases_no_tail_head_that_walk() {
+    let mut f = Fixture::new(Source::Claude, "walk-entry-erasure");
+    let never = f.file("never.jsonl", 70);
+    f.walk();
+    f.save();
+    assert_eq!(committed(&f.index, &never).len(), 1);
+    let (root, target) = (f.root.clone(), never.clone());
+    let race = move |read: &Path, type_read: bool| {
+        if type_read && read == root.as_path() && target.exists() {
+            std::fs::remove_file(&target).unwrap();
+        }
+        false
+    };
+    let row = with_directory_read_fault(race, || f.walk());
+    assert!(!never.exists());
+    assert_eq!(row["debt"]["deleted_unaccepted_files"], 0);
+    f.save();
+    assert_eq!(committed(&f.index, &never).len(), 1, "head kept");
+    let row = f.walk();
+    assert_eq!(row["debt"]["deleted_unaccepted_files"], 1);
+    f.save();
+    assert!(committed(&f.index, &never).is_empty());
+    f.close();
+}
+
 /// [regress] Listed Claude history the gate holds kept the alarm on for good.
 /// It stays owed and counted, out of the age alarm; a refused snapshot keeps it in.
 #[test]

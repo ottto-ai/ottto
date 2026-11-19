@@ -1453,6 +1453,177 @@ fn deleted_sibling_lost_ack_settles_once() {
     });
 }
 
+/// [money] An indexed transcript with an accepted prefix and an owed change is
+/// listed, gone before its lstat and recreated before the page's absence
+/// proof. That page keeps the accepted witness, sends nothing and credits no
+/// deletion. The owed change is then sent and ACKed exactly once, either by a
+/// later page of the same generation or by a restarted owner after the save,
+/// equal to cold Full with placement and never smaller than the accepted
+/// body, and a quiet restart after its delivery reads and sends nothing.
+#[test]
+fn recreated_before_absence_proof_recovers_owed_change_once() {
+    use super::state_v2_money_tests::routed;
+    use crate::snapshots::sampled_scan::transition_fixture::{money_oracle, observe_consumed};
+    let name = "recreated_before_absence_proof";
+    if !supported(name) {
+        return;
+    }
+    with_e2(|| {
+        let mut c = corpus(name);
+        let path = c.root(ROOT, &line(ROOT, "r1", AT, 10));
+        input_clock(&path);
+        // A directory the walk reads after the transcript's.
+        std::fs::create_dir_all(c.root.join("zz")).unwrap();
+        std::fs::write(c.root.join("zz/notes.txt"), "synthetic\n").unwrap();
+        let mut disk = Disk::new(&c);
+        let scanner = E2ScanFixture::default();
+        disk.begin(&scanner, SnapshotSource::ClaudeCode);
+        let mut warm = c.raw(&scanner, ScanIndex::default(), 100, true, &[]);
+        warm.enrich(&c);
+        warm.finish();
+        let accepted = routed(&warm, SnapshotUploadPolicy::default());
+        accept_page(&mut warm);
+        let prior = disk.commit(&warm.cache, SnapshotSource::ClaudeCode, &mut warm.index);
+        let key = path.to_string_lossy().into_owned();
+        let before = prior.files.get(&key).unwrap().clone();
+        assert!(before.last_upload_body_witness.is_some());
+        grow(&path, "r2", 20);
+        let bytes = std::fs::read(&path).unwrap();
+        let step = std::rc::Rc::new(std::cell::Cell::new(0));
+        let (listed, later, target, seen) = (
+            c.root.clone(),
+            c.root.join("zz"),
+            path.clone(),
+            step.clone(),
+        );
+        let race = move |read: &Path, type_read: bool| {
+            if type_read && read == listed.as_path() && seen.get() == 0 {
+                std::fs::remove_file(&target).unwrap();
+                seen.set(1);
+            } else if read == later.as_path() && seen.get() == 1 {
+                std::fs::write(&target, &bytes).unwrap();
+                input_clock(&target);
+                seen.set(2);
+            }
+            false
+        };
+        // The race page starts the next census generation; its pages run, each
+        // delivered and committed as the daemon does, until that census
+        // completes. A later page may read the recreated file and send the
+        // owed change: `sent` keeps each sending page's route and its prior.
+        let mut rows = Vec::new();
+        let mut sent = Vec::new();
+        let (saved, sites) = crate::snapshots::observe_sites(|| {
+            crate::snapshots::with_directory_read_fault(race, || {
+                let mut index = Some(prior);
+                for number in 0..12 {
+                    let prior = index.take().unwrap();
+                    let page_prior = prior.clone();
+                    let (mut page, page_rows) = crate::local_resource_diagnostics::capture(|| {
+                        c.raw(&scanner, prior, 100, true, &[])
+                    });
+                    page.enrich(&c);
+                    page.finish();
+                    if number == 0 {
+                        assert!(
+                            page_rows.iter().any(|row| {
+                                row["stage"] == "bounded_traversal_transition"
+                                    && row["counts"]["event"] == "starting"
+                            }),
+                            "the race page lists a new census generation"
+                        );
+                        let kept = page.index.files.get(&key).expect("the entry is kept");
+                        assert_eq!(
+                            kept.last_upload_body_witness,
+                            before.last_upload_body_witness
+                        );
+                        assert!(
+                            page.scan.snapshots.is_empty(),
+                            "the race page sends nothing"
+                        );
+                    }
+                    if !page.scan.snapshots.is_empty() {
+                        sent.push((page_prior, routed(&page, SnapshotUploadPolicy::default())));
+                        accept_page(&mut page);
+                    }
+                    rows.extend(page_rows);
+                    let committed =
+                        disk.commit(&page.cache, SnapshotSource::ClaudeCode, &mut page.index);
+                    if page.scan.census_complete {
+                        return committed;
+                    }
+                    index = Some(committed);
+                }
+                panic!("the race generation did not complete its census");
+            })
+        });
+        assert_eq!(step.get(), 2, "deleted after the listing, then recreated");
+        assert_eq!(
+            sites[SnapshotSource::ClaudeCode.slot()],
+            [[0, 0], [0, 1], [0, 0], [0, 0], [0, 0]],
+            "one WalkEntry removal and no other NotFound"
+        );
+        for row in &rows {
+            for count in ["unacked_usage_lost_to_deletion", "withheld_hold_released"] {
+                assert!(row["counts"].get(count).is_none(), "{count}: {row}");
+            }
+        }
+        assert!(
+            sent.len() <= 1,
+            "the race generation sends the change at most once"
+        );
+        let restart = disk.owner(SnapshotSource::ClaudeCode);
+        let mut pages = [&scanner, &E2ScanFixture::default(), &restart]
+            .map(|owner| c.raw(owner, saved.clone(), 100, true, &[]));
+        finish_claude_pages(&c, &mut pages);
+        let (cold, delivered, next) = if let Some((sending_prior, delivered)) = sent.pop() {
+            // The branch run 44333739701 took: a later race-generation page
+            // read the recreated file and its delivery settled the change.
+            // No owner sends it again; cold Full reads that page's prior.
+            for page in &pages {
+                assert!(page.scan.snapshots.is_empty(), "the change is sent once");
+            }
+            let mut cold = c.raw(&E2ScanFixture::default(), sending_prior, 100, true, &[]);
+            assert_eq!(cold.modes.1 + cold.modes.2, 0, "cold Full");
+            cold.enrich(&c);
+            cold.finish();
+            let cold = routed(&cold, SnapshotUploadPolicy::default());
+            (cold, delivered, saved)
+        } else {
+            // The race generation left the change owed: the restarted owner
+            // sends it, equal to the retained owner and cold Full.
+            assert_eq!(pages[1].modes.1 + pages[1].modes.2, 0, "cold Full");
+            compare_claude_uploads(&pages);
+            let routes = pages
+                .each_ref()
+                .map(|page| routed(page, SnapshotUploadPolicy::default()));
+            money_oracle::assert_equivalent(&routes[1], &routes[0]);
+            money_oracle::assert_no_smaller_reemit(ROOT, &accepted, &routes[0], &routes[1], false);
+            let [_, _, mut recovered] = pages;
+            accept_page(&mut recovered);
+            let next = disk.commit(
+                &recovered.cache,
+                SnapshotSource::ClaudeCode,
+                &mut recovered.index,
+            );
+            let [_, cold, delivered] = routes;
+            (cold, delivered, next)
+        };
+        assert!(
+            delivered.snapshots.contains_key(ROOT),
+            "the change is delivered"
+        );
+        money_oracle::assert_equivalent(&cold, &delivered);
+        money_oracle::assert_no_smaller_reemit(ROOT, &accepted, &delivered, &cold, false);
+        let quiet_owner = disk.owner(SnapshotSource::ClaudeCode);
+        let (mut quiet, consumed) = observe_consumed(|| c.raw(&quiet_owner, next, 100, true, &[]));
+        quiet.enrich(&c);
+        quiet.finish();
+        assert_eq!((quiet.modes.0, consumed), (0, 0), "the quiet restart read");
+        assert!(quiet.scan.snapshots.is_empty(), "the change is sent once");
+    });
+}
+
 /// Money equivalence receipts. `claude_bad_record_sibling`: a malformed record
 /// between valid responses never counts and its siblings count on every arm.
 /// `claude_paused_suffix`: an unterminated final response is pending on its

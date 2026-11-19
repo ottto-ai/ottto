@@ -144,7 +144,7 @@ fn directory_read_fault<T>(
 
 /// Runs `run` with a directory entry/type read fault, for tests only.
 #[cfg(test)]
-pub(in crate::snapshots) fn with_directory_read_fault<T>(
+pub(crate) fn with_directory_read_fault<T>(
     fault: impl FnMut(&Path, bool) -> bool + 'static,
     run: impl FnOnce() -> T,
 ) -> T {
@@ -332,7 +332,8 @@ pub(in crate::snapshots) fn advance_bounded_directory_traversal_with_budget(
             )
             .collect();
         // Listed names. A key missing only from a partial listing is just a
-        // nominee: the absence proof refuses any key still present.
+        // nominee: the absence proof refuses any key still present. A listed
+        // Claude entry proven gone before its lstat is nominated directly.
         let mut names = BTreeSet::new();
         for entry in entries {
             let entry = match directory_read_fault(&directory.path, false, entry) {
@@ -388,11 +389,33 @@ pub(in crate::snapshots) fn advance_bounded_directory_traversal_with_budget(
             let metadata = match entry.metadata() {
                 Ok(metadata) => metadata,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    disappearance_diagnostics::not_found(
-                        &mut traversal.counts.disappeared_file_count,
-                        source,
-                        disappearance_diagnostics::Site::WalkEntry,
-                    );
+                    // Gone after read_dir. A securely absent Claude entry is
+                    // a removal, its indexed key nominated for the page's
+                    // proof. The key stays observed, so a recreation before
+                    // that proof keeps its entry for the next generation.
+                    if source == SnapshotSource::ClaudeCode
+                        && sampled_audit::proven_absent(
+                            &path,
+                            std::slice::from_ref(&directory.scan_root),
+                        )
+                    {
+                        debt.unlisted();
+                        disappearance_diagnostics::not_found_removal(
+                            source,
+                            disappearance_diagnostics::Site::WalkEntry,
+                        );
+                        let key = local_index_key(&path);
+                        if index.files.contains_key(&key) {
+                            traversal.observed_index_keys.insert(key.clone());
+                            unlisted.insert(key);
+                        }
+                    } else {
+                        disappearance_diagnostics::not_found(
+                            &mut traversal.counts.disappeared_file_count,
+                            source,
+                            disappearance_diagnostics::Site::WalkEntry,
+                        );
+                    }
                     continue;
                 }
                 Err(_) => {

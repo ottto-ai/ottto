@@ -196,7 +196,7 @@ pub(super) fn snapshot(source: SnapshotSource) -> Totals {
 }
 
 #[cfg(test)]
-type SiteEvents = [[[u64; OUTCOMES]; SITES]; 3];
+pub(crate) type SiteEvents = [[[u64; OUTCOMES]; SITES]; 3];
 
 #[cfg(test)]
 thread_local! {
@@ -223,7 +223,7 @@ pub(super) fn observe<T>(f: impl FnOnce() -> T) -> (T, [[u64; 4]; 3]) {
 
 /// The caller-thread NotFound site split, per source, `Site` order, `[loss, removal]`.
 #[cfg(test)]
-pub(super) fn observe_sites<T>(f: impl FnOnce() -> T) -> (T, SiteEvents) {
+pub(crate) fn observe_sites<T>(f: impl FnOnce() -> T) -> (T, SiteEvents) {
     struct Reset(Option<SiteEvents>);
     impl Drop for Reset {
         fn drop(&mut self) {
@@ -2312,6 +2312,108 @@ pub(super) mod tests {
                     assert!(index.claude_request_census_for_test().get(&key).is_some());
                 }
             }
+        }
+    }
+
+    /// [behaviour] A listed Claude transcript gone before its lstat is a
+    /// removal: the walk stays clean and an indexed key retires, also when
+    /// its directory went too. Recreated before the page's proof, the entry
+    /// is kept. Codex and Pi keep the loss and nominate nothing.
+    #[cfg(unix)]
+    #[test]
+    fn walk_entry_gone_after_read_dir_is_a_claude_removal() {
+        // (row, indexed, remove the directory, recreate, key kept).
+        for (row, indexed, directory, recreate, kept) in [
+            ("indexed", true, false, false, false),
+            ("unindexed", false, false, false, false),
+            ("directory gone", true, true, false, false),
+            ("recreated", true, false, true, true),
+        ] {
+            let dir = crate::test_scratch::ScratchDir::new("walk-entry-removal");
+            let root = fs::canonicalize(&dir).unwrap();
+            let (project, later) = (root.join("project"), root.join("zz"));
+            fs::create_dir(&project).unwrap();
+            fs::create_dir(&later).unwrap();
+            // Its one entry's reads come after `project`'s, before the proof.
+            fs::write(later.join("notes.txt"), b"synthetic\n").unwrap();
+            let path = project.join("a1111111-1111-4111-8111-111111111111.jsonl");
+            fs::write(&path, b"{}\n").unwrap();
+            let key = local_index_key(&path);
+            let mut index = ScanIndex::default();
+            if indexed {
+                let entry = super::super::tests::manifest_index_entry(None);
+                index.files.insert(key.clone(), entry);
+            }
+            let (listed, target, mut gone) = (project.clone(), path.clone(), false);
+            let race = move |read: &Path, type_read: bool| {
+                if type_read && read == listed.as_path() && !gone {
+                    gone = true;
+                    if directory {
+                        fs::remove_dir_all(&listed).unwrap();
+                    } else {
+                        fs::remove_file(&target).unwrap();
+                    }
+                } else if recreate && read == later.as_path() && !target.exists() {
+                    fs::write(&target, b"{}\n").unwrap();
+                }
+                false
+            };
+            let (pages, sites) = super::super::with_directory_read_fault(race, || {
+                observe_sites(|| claude_generation(&mut index, &root, NOW, 10, &[]))
+            });
+            let mut expected = [[[0; OUTCOMES]; SITES]; 3];
+            expected[1][Site::WalkEntry.index()] = [0, 1];
+            assert_eq!(sites, expected, "{row}");
+            assert!(
+                pages.iter().all(|page| page.disappeared_file_count == 0),
+                "{row}"
+            );
+            assert!(pages.last().unwrap().census_complete, "{row}");
+            assert_eq!(index.files.contains_key(&key), kept, "{row}");
+        }
+
+        for source in [SnapshotSource::Codex, SnapshotSource::Pi] {
+            let dir = crate::test_scratch::ScratchDir::new("walk-entry-loss");
+            let root = fs::canonicalize(&dir).unwrap();
+            let path = root.join("rollout-2026-10-07T10-00-00-session.jsonl");
+            fs::write(&path, b"{}\n").unwrap();
+            let key = local_index_key(&path);
+            let mut index = ScanIndex::default();
+            let entry = super::super::tests::manifest_index_entry(None);
+            index.files.insert(key.clone(), entry);
+            ensure_bounded_traversal(
+                source,
+                std::slice::from_ref(&root),
+                &mut index,
+                NOW,
+                BACKFILL_WINDOW_DAYS,
+            );
+            let (listed, target) = (root.clone(), path.clone());
+            let race = move |read: &Path, type_read: bool| {
+                if type_read && read == listed.as_path() && target.exists() {
+                    fs::remove_file(&target).unwrap();
+                }
+                false
+            };
+            let (unlisted, sites) = super::super::with_directory_read_fault(race, || {
+                observe_sites(|| {
+                    super::super::advance_bounded_directory_traversal_with_budget(
+                        source,
+                        &mut index,
+                        BACKFILL_WINDOW_DAYS,
+                        1_000,
+                        None,
+                        |_| {},
+                    )
+                })
+            });
+            let mut expected = [[[0; OUTCOMES]; SITES]; 3];
+            expected[source.slot()][Site::WalkEntry.index()] = [1, 0];
+            assert_eq!(sites, expected, "{source:?}");
+            assert!(unlisted.is_empty(), "{source:?}: nothing nominated");
+            let counts = &index.traversal.as_ref().unwrap().counts;
+            assert_eq!(counts.disappeared_file_count, 1, "{source:?}");
+            assert!(index.files.contains_key(&key), "{source:?}");
         }
     }
 }
