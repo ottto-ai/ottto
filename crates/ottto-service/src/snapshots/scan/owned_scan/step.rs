@@ -1544,6 +1544,18 @@ impl OwnedSourceScan {
                         );
                     }
                 }
+                crate::local_resource_diagnostics::change_reason::admin_read(
+                    source.api_slug(),
+                    &local_index_key(&active.candidate.path),
+                    active
+                        .parser
+                        .reader
+                        .acquisition
+                        .as_ref()
+                        .filter(|_| sampling.is_some())
+                        .map(|plan| (plan.mode(), plan.metrics().native_bytes)),
+                    active.parser.reader.consumed_bytes(),
+                );
                 if active.sampling.as_ref().is_some_and(|acquisition| {
                     !matches!(
                         acquisition.mode,
@@ -4450,6 +4462,7 @@ impl OwnedSourceScan {
             let mut resident_loaded_bytes = 0;
             let mut file_sampling = None;
             let mut retained_offset = None;
+            let mut tail_restore = "bypass";
             // Counted once the page actually reads the file: a fence
             // or deferral below does not inflate the read diagnostics.
             let mut planned_mode = None;
@@ -4633,6 +4646,7 @@ impl OwnedSourceScan {
                                 resident_loaded_bytes = loaded_bytes;
                                 match loaded {
                                     tail_source::load::Load::Reused(retained, base) => {
+                                        tail_restore = "hit";
                                         if let Some(base) = base {
                                             parser.set_tail_base(base);
                                         }
@@ -4652,6 +4666,7 @@ impl OwnedSourceScan {
                                     }
                                     // A pulled twin falls back to this page's native read.
                                     tail_source::load::Load::Held if forced_twin => {
+                                        tail_restore = "miss";
                                         #[cfg(test)]
                                         twin_diagnostics::event(&candidate.path, || {
                                             "Held forced_twin=true native_fallback".into()
@@ -4669,6 +4684,7 @@ impl OwnedSourceScan {
                                         pending!();
                                     }
                                     tail_source::load::Load::Cold(proven) => {
+                                        tail_restore = "miss";
                                         tail_proven_full = proven;
                                         (None, debt)
                                     }
@@ -4732,8 +4748,9 @@ impl OwnedSourceScan {
                         )
                         });
                         context.admission.sampling_allowed.observe(allow_sample);
-                        if !allow_sample {
-                            drop(retained.take());
+                        // Only the cap turns sampling off after a kept hit.
+                        if !allow_sample && retained.take().is_some() {
+                            tail_restore = "hit_discarded_by_cap";
                         }
                         context.admission.prepare_started =
                             context.admission.prepare_started.saturating_add(1);
@@ -4936,6 +4953,25 @@ impl OwnedSourceScan {
                     .set_extent_limit(plan.frozen_length() - plan.start_offset());
             }
             index.note_change_reason_selected(source, &candidate, parse_reason, source_change);
+            crate::local_resource_diagnostics::change_reason::read_context(
+                &local_index_key(&candidate.path),
+                tail_restore,
+                retained_offset
+                    .zip(
+                        index
+                            .files
+                            .get(&local_index_key(&candidate.path))
+                            .map(|entry| entry.size_bytes),
+                    )
+                    .zip(
+                        parser
+                            .reader
+                            .acquisition
+                            .as_ref()
+                            .map(|plan| plan.frozen_length()),
+                    )
+                    .map(|((seal, indexed), opening)| (seal, indexed, opening)),
+            );
             // Frozen here, before this read can change the index entry.
             let prior_stamp =
                 crate::local_resource_diagnostics::claude_reread::PriorStamp::classify(

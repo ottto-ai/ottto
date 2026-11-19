@@ -65,6 +65,10 @@ pub(crate) fn clear(key: &str, entry: &mut ScanIndexEntry, cause: Cause) {
     }
     entry.source_file_fingerprint.clear();
 }
+/// The outstanding clear of `key` is the audit-cap delay.
+pub(crate) fn audit_cap_cleared(key: &str) -> bool {
+    with_tags(|tags| tags.0.get(key) == Some(&Cause::AuditCapDelay))
+}
 pub(crate) fn reproven(key: &str) {
     with_tags(|tags| {
         tags.0.remove(key);
