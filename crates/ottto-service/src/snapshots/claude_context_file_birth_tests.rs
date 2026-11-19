@@ -324,8 +324,8 @@ fn compaction_summary(timestamp: &str, uuid: &str, parent: Option<&str>) -> Stri
     )
 }
 
-/// Pair ambiguity on the #676-integrated head: the birth filter drops records
-/// one by one, then #676 pairs what is left (by `parentUuid` chain, else by a
+/// Pair ambiguity: the birth filter drops records
+/// one by one, then the pairing step uses what is left (by `parentUuid` chain, else by a
 /// 2 s window for a summary naming no parent). No compaction counts twice, and
 /// a copied half never lends an owned half its metrics or its partner.
 #[test]
@@ -1220,7 +1220,7 @@ fn api_sidecar_without_trace_sidecar_still_vetoes() {
         if !veto_rows {
             let _ = fs::remove_file(&path);
         }
-        let (_, _, stats) = crate::snapshot_sync::apply_claude_local_evidence_to_scan_for_test(
+        let (_, _, stats) = crate::snapshot_sync::apply_claude_local_evidence_to_scan(
             &support, &mut scan, &mut index,
         );
         let item = scan
@@ -1430,9 +1430,7 @@ fn capture_on_bodies_match_the_clear_outside_context_scalars() {
         )
         .unwrap();
         let apply = |scan: &mut SourceScanResult, index: &mut ScanIndex| {
-            crate::snapshot_sync::apply_claude_local_evidence_to_scan_for_test(
-                &support, scan, index,
-            )
+            crate::snapshot_sync::apply_claude_local_evidence_to_scan(&support, scan, index)
         };
         let (_, _, stats) = if rule_on {
             apply(&mut scan, &mut index)
@@ -1683,7 +1681,7 @@ fn tail_and_full_read_select_the_same_first_request() {
     let _ = fs::remove_dir_all(dir);
 }
 
-/// #677 stop latch: the first Claude fold that
+/// Birth backfill stop latch: the first Claude fold that
 /// withholds for a resource limit stops the one-time re-read until the daemon
 /// restarts; a later clean fold does not resume it. The evidence-bound trigger
 /// uses the merged seam; the full remembered-veto table triggers it too.

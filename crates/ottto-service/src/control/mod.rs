@@ -957,14 +957,11 @@ pub fn handle_request_with_peer(
         .client_install_owner
         .unwrap_or(InstallOwner::Unknown);
     let cli_session_exec = request.client_kind == Some(LocalClientKind::Cli);
-    let status_refresh_quota_source =
-        status_refresh_quota_source(request.client_kind, request.protocol_version);
     match handle_command(
         daemon,
         authorization,
         request.command,
         client_install_owner,
-        status_refresh_quota_source,
         cli_session_exec,
     ) {
         Ok(payload) => LocalControlResponse {
@@ -1023,30 +1020,6 @@ pub fn handle_request_json_with_peer(
     })
 }
 
-/// Companion apps up to this protocol version have no `quota_refresh`: their
-/// Refresh button sends `status` with `refresh_agent_status`, the same request
-/// as their 5-minute scan. Those requests stand in for an explicit refresh of
-/// every Codex home, at most once per
-/// [`LEGACY_APP_QUOTA_REFRESH_MIN_GAP_SECONDS`] per home. Claude is left out:
-/// its Refresh never forced a provider read, and its accounts are served the
-/// stored reading the daemon's schedule keeps current. Such a request cannot
-/// be told from the app's timer, so it reads nothing while Codex background
-/// limit refresh is off.
-const LEGACY_APP_QUOTA_REFRESH_MAX_PROTOCOL_VERSION: u16 = 15;
-
-const LEGACY_APP_QUOTA_REFRESH_MIN_GAP_SECONDS: u64 = 5 * 60;
-
-/// The source whose quota a `status` refresh from this client refreshes
-/// explicitly, if any.
-fn status_refresh_quota_source(
-    client_kind: Option<LocalClientKind>,
-    protocol_version: u16,
-) -> Option<SourceKind> {
-    (client_kind == Some(LocalClientKind::CompanionApp)
-        && protocol_version <= LEGACY_APP_QUOTA_REFRESH_MAX_PROTOCOL_VERSION)
-        .then_some(SourceKind::Codex)
-}
-
 fn require_session_launch_schema(version: u16) -> Result<(), LocalApiError> {
     if version != 1 {
         return Err(LocalApiError::InvalidRequest(
@@ -1061,7 +1034,6 @@ fn handle_command(
     authorization: RequestAuthorization,
     command: LocalControlCommand,
     client_install_owner: InstallOwner,
-    status_refresh_quota_source: Option<SourceKind>,
     cli_session_exec: bool,
 ) -> Result<serde_json::Value, LocalApiError> {
     // Invalidate pending handoffs before any explicit account/slot mutation.
@@ -1224,20 +1196,6 @@ fn handle_command(
                 daemon.refresh_shell_profile_health()?;
             }
             if refresh_agent_status {
-                if let Some(source) = status_refresh_quota_source.as_ref().filter(|_| {
-                    FileCodexAccountSlotSettingsStore::default().background_quota_refresh_allowed()
-                }) {
-                    require_authorized_local_client(daemon, &authorization)?;
-                    crate::provider_calls::with_trigger(
-                        crate::provider_calls::Trigger::OlderAppCompat,
-                        || {
-                            request_explicit_quota_refresh(
-                                Some(source),
-                                LEGACY_APP_QUOTA_REFRESH_MIN_GAP_SECONDS,
-                            )
-                        },
-                    );
-                }
                 refresh_agent_status_for(daemon, &authorization, None)?;
             }
             let mut status = status_for(daemon, &authorization)?;
@@ -1307,7 +1265,7 @@ fn handle_command(
                 require_authorized_local_client(daemon, &authorization)?;
                 crate::provider_calls::with_trigger(
                     crate::provider_calls::Trigger::ExplicitRefresh,
-                    || request_explicit_quota_refresh(source.as_ref(), 0),
+                    || request_explicit_quota_refresh(source.as_ref()),
                 );
             }
             to_value(refresh_agent_status_for(daemon, &authorization, source)?)

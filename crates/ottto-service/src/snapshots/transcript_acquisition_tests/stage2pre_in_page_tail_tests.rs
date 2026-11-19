@@ -20,7 +20,7 @@
 //!   both sample windows, followed by growth, is accepted (append-only
 //!   sampled-prefix semantics, as the cursor).
 //! - SP-10: Unchanged-mode growth keeps dropping the copy.
-//! - SP-12 (Codex 2 GiB crossing) is not added: it needs #656 on main.
+//! - SP-12 (a Codex file crossing 2 GiB) is not added: it needs support that is not on main yet.
 //! - The N2 `sealed_fragment_withheld` counter is cursor-only (`finish_job`) and
 //!   private to `codex_cursor`; the unmodified `codex_cursor_tests` pin it.
 use super::*;

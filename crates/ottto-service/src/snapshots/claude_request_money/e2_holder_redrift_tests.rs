@@ -220,7 +220,7 @@ fn run_page(
             .grains
             .keys()
             .any(|(key, origin, _)| *key == slot.key && *origin == slot.origin)),
-        "#944 reads the row each lent request ended on"
+        "the copy-derived check reads the row each lent request ended on"
     );
     let mut reasons = BTreeMap::new();
     let withheld = finish_page(
@@ -291,7 +291,11 @@ fn e2_holder_rebuild_moves_unstaged_own_requests_and_conserves_money() {
             assert_eq!(matched(items), 3, "every request attaches to its telemetry");
             assert_eq!(cost_micros(items), 300);
             let slots = lent(items);
-            assert_eq!(slots.len(), 3, "#944 records all three loans");
+            assert_eq!(
+                slots.len(),
+                3,
+                "the copy-derived check records all three loans"
+            );
             assert!(slots.iter().all(|slot| slot.lent.org.as_deref()
                 == Some(org_hash(ORG_A).as_str())
                 && slot.origin == MATCHED));

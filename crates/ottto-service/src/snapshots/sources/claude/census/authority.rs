@@ -38,7 +38,7 @@ pub struct ClaudeUsageAuthorityDisposition {
     /// Contract-5 only: each rebuilt item's requests, classified and folded
     /// into bounded row x authority-key groups during the rebuild.
     pub(crate) request_groupings: BTreeMap<String, claude_request_identity::Grouping>,
-    /// Copy-derived rows (#944): the accepted rows this
+    /// Copy-derived rows: the accepted rows this
     /// pass's bodies treat as never accepted. The sync loop tombstones them
     /// through `AcceptedBuckets` and saves before any upload.
     pub(crate) copy_invalidated: Vec<claude_request_identity::CopyInvalidation>,

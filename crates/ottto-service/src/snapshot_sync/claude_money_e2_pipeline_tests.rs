@@ -212,7 +212,7 @@ impl Page {
     fn enrich(&mut self, corpus: &Corpus) -> crate::snapshots::ClaudeUsageAuthorityDisposition {
         self.enrich_with(corpus, None)
     }
-    /// `enrich` with this cycle's #909 accepted-share hints, which it then
+    /// `enrich` with this cycle's accepted-share hints, which it then
     /// updates as the sync loop does before any upload.
     fn enrich_with(
         &mut self,
@@ -254,18 +254,13 @@ impl Page {
         let one = checks.map(|_| reference(&crate::snapshot_sync::ONE_EVIDENCE_CHUNK));
         let before = crate::claude_local_otel::evidence_read_counts_for_test().0;
         let chunks_before = crate::snapshot_sync::evidence_chunks_for_test();
-        // The sync loop sets the server's advertised capability on its ledger
-        // every cycle; production advertises it for every Claude Code upload.
-        // Without a ledger, a keyless one matches no session: only carry differs.
-        let mut cycle = accepted.as_deref().cloned().unwrap_or_default();
-        cycle.set_account_source_enabled(true);
         let ((mut disposition, _, stats), released) =
             e2::pipeline_test_observer::capture_released(|| {
                 apply_claude_local_evidence_to_scan_with_ledger_and_budget(
                     &corpus.support,
                     &mut self.scan,
                     &mut self.index,
-                    Some(&cycle),
+                    accepted.as_deref(),
                     wire_budget,
                     None,
                 )
@@ -598,8 +593,8 @@ const RESUMED: &str = "3338a80a-f36e-4cbc-a5bb-50fc66430ba5";
 const LOGINS: &str = "4338a80a-f36e-4cbc-a5bb-50fc66430ba5";
 const MALFORMED: &str = "5338a80a-f36e-4cbc-a5bb-50fc66430ba5";
 
-/// Five roots swept one file per page, then again after the page root grows,
-/// with the account-source capability on: root A (side call, a switch from
+/// Five roots swept one file per page, then again after the page root grows:
+/// root A (side call, a switch from
 /// login-only L1 to L2 with a complete org mid-stream, then an own request
 /// with no telemetry row that carries L2 forward), legacy
 /// fork F of A, resume copy C of A with no rows of its own, D (L1's complete
@@ -690,7 +685,6 @@ fn five_root_sweep_paged(multi_root: bool, limit: usize) {
         let scanner = E2ScanFixture::default();
         let mut index = ScanIndex::default();
         let mut accepted = crate::snapshots::claude_request_identity::AcceptedBuckets::for_test();
-        accepted.set_account_source_enabled(true);
         for sweep in 0..2 {
             if sweep == 1 {
                 // A packed-page comparison needs every family selected on
@@ -3006,7 +3000,6 @@ fn e2_pipeline_uncopied_guard_carried_accounts() {
             let mut page = c.raw(&scanner, ScanIndex::default(), 100, false, &[]);
             let mut accepted =
                 crate::snapshots::claude_request_identity::AcceptedBuckets::for_test();
-            accepted.set_account_source_enabled(true);
             e2::take_diag();
             page.enrich_with(&c, Some(&mut accepted));
             let result = body(&page, ROOT).unwrap();
@@ -3112,7 +3105,7 @@ fn equal_birth_carrier_never_grandfathers_its_counted_request() {
             let accepted_body = snapshot_upload_body_witness(body(&twins, ROOT).unwrap());
             let prior = settle(&c, &prior, twins, &mut e2_progress());
 
-            // CS1 refreshes the ACK carrier with blank JSONL: unchanged usage
+            // Refresh the ACK carrier with blank JSONL so unchanged usage
             // acquires the summed body's COPY mark before the own turn grows.
             append(&carrier, "\n");
             let refreshed_at = crate::scan_clock::utc_seconds();
@@ -3148,7 +3141,7 @@ fn equal_birth_carrier_never_grandfathers_its_counted_request() {
                 .any(|(holder, hashes)| *holder == carrier_key
                     && hashes.binary_search(&r1_hash).is_ok()));
 
-            // Red on main without the counting-holder guard (CS1 run 43868949339).
+            // This regression fails without the counting-holder guard.
             append(&carrier, &line(ROOT, "r2", own_at, 20));
             let grown = with_scan_clock(refreshed_at + 6 * 60 * 60, || {
                 ready(&c, &scanner, prior.clone(), 100, false)
@@ -4289,7 +4282,7 @@ const PREFIX_KEYS: [&str; 5] = [
 /// The original (2 requests), its resume (copies a, b; own c) and the
 /// resume of that (copies a, b, c; own d), each read after the previous
 /// file settled. Returns the settled index.
-/// A checked released-format value (pre-dedupe bodies, #909 ledgers, held
+/// A checked released-format value (pre-dedupe bodies, accepted-share ledgers, held
 /// scan-index state), captured once from the released copy path; see
 /// `snapshots/fixtures/README.md`. `name` is `<fixture>.<value>`.
 fn released(name: &str) -> serde_json::Value {
@@ -4612,8 +4605,7 @@ fn e2_pipeline_resumed_copy_without_proof_or_stored_removal_counts_flagged() {
     }
 }
 
-/// [money] #964 proof target (audited resumed main files counted their
-/// copied requests twice).
+/// [money] Regression test: resumed main files counted their copied requests twice.
 /// The shape: a resumed main file of any writer version, own turns in
 /// later hours and its holder in an earlier accepted member. Its re-read of
 /// the same bytes removes exactly the copied requests; every token counter is
@@ -5179,8 +5171,8 @@ fn identity_count(counts: &serde_json::Value, key: &str) -> u64 {
     counts["identity_cap"][key].as_u64().unwrap_or(0)
 }
 
-/// [money] #944 xPR F5 fixtures 1-5, in #909 mode. Fixture 4 composes #947:
-/// the tombstoned row on an unhealthy root stays definite (no refusal, marker or second tombstone). The
+/// [money] Five copy-derived identity fixtures in accepted-share protection mode.
+/// In fixture 4, the tombstoned row on an unhealthy root stays definite (no refusal, marker or second tombstone). The
 /// released body froze an own turn's org a copied prefix marker lent (X).
 /// Copy-prefix dedupe tombstones that row once, counted, and sends it
 /// untagged with no refusal or marker (today's attribution), while a later
@@ -5294,7 +5286,7 @@ fn e2_pipeline_upgrade_invalidates_identity_a_copied_marker_lent() {
             assert_eq!(org_shares(&copy).get(&x), None);
         }
         // Fixture 4: one sidecar of the pair makes the root unhealthy
-        // (#947: all-Unknown). Only the row B proves keeps protection.
+        // (all accounts Unknown). Only the row B proves keeps protection.
         let effort = c
             .support
             .join("local-otel/claude-code-effort")
@@ -5309,7 +5301,7 @@ fn e2_pipeline_upgrade_invalidates_identity_a_copied_marker_lent() {
         assert_eq!(
             body(&page, COPY).and_then(|copy| copy.telemetry_owned_complete),
             Some(false),
-            "#947: the half pair leaves the root unproven"
+            "the half pair leaves the root unproven"
         );
         assert_eq!(identity_count(&counts, "copy_derived_proof_invalidated"), 0);
         assert_eq!(
@@ -5342,7 +5334,8 @@ fn e2_pipeline_upgrade_invalidates_identity_a_copied_marker_lent() {
         let row = &copy.usage_buckets[0].model_usage[0];
         assert!(row.identity_parts.is_some(), "fresh own tags");
         assert_eq!(org_shares(&copy).get(&x), None);
-        // A copied marker never lent B's row: its own later change is #909's.
+        // A copied marker never lent B's row, so its later change is an ordinary
+        // accepted-share change.
         text += &switched(
             "33333333-3333-4333-8333-333333333333",
             "late@example.invalid",
@@ -5439,9 +5432,9 @@ fn e2_pipeline_copy_derived_rows_of_a_later_path_twin_are_invalidated() {
     });
 }
 
-/// [regress] Strict review 2026-10-31: a row frozen from the corrected
+/// [regress] A row frozen from the corrected
 /// (deduped) body holds the lent request's own share beside an own-proved
-/// copy of the lent org. A later own change there keeps #909's protection;
+/// copy of the lent org. A later own change there keeps accepted-share protection;
 /// it is never read as copy-derived.
 #[test]
 fn e2_pipeline_corrected_body_freeze_is_not_copy_derived() {
@@ -5500,8 +5493,8 @@ fn e2_pipeline_corrected_body_freeze_is_not_copy_derived() {
 /// [money] A row frozen {X} by a copied marker is not tombstoned while this
 /// pass cannot read the session's own evidence (a partial telemetry sidecar
 /// pair).
-/// #909 protection stays, counted; money and account unchanged.
-/// Composed with #947: the unhealthy root's no-fallback branch leaves every
+/// Accepted-share protection stays and is counted. Money and account stay unchanged.
+/// The unhealthy root's no-fallback branch leaves every
 /// loan unread, so the row is skipped, never tombstoned.
 #[test]
 fn e2_pipeline_copy_derived_row_is_kept_while_own_evidence_is_unreadable() {
@@ -5541,7 +5534,7 @@ fn e2_pipeline_copy_derived_row_is_kept_while_own_evidence_is_unreadable() {
         take_identity_counts();
         page.enrich_with(&c, Some(&mut ledger));
         let counts = serde_json::to_value(take_identity_counts()).unwrap();
-        // #947: the half pair leaves the root's evidence unavailable.
+        // The half pair leaves the root's evidence unavailable.
         assert_eq!(
             identity_count(&counts, "copy_derived_skipped_evidence_unavailable"),
             1
@@ -5577,7 +5570,7 @@ fn e2_pipeline_declared_prefix_removal_over_accepted_buckets_publishes() {
         with_e2(|| {
             let mut c = Corpus::new("e2-pipeline-accepted-prefix-hold");
             c.root(ROOT, &resumed(ROOT, &[A, B]));
-            // Tagged, so the stored body's buckets enter the #909 hints.
+            // Tagged, so the stored body's buckets enter the accepted-share hints.
             let scanner = E2ScanFixture::capturing_identity();
             let mut progress = e2_progress();
             let old = ScanIndex::default();

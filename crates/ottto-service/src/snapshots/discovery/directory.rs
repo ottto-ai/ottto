@@ -917,8 +917,7 @@ pub(crate) const FIRST_READ_WINDOW_DAYS: u64 = 60;
 /// read. Any read evidence keeps the walk window: an index entry (it also
 /// carries every recovery and verification debt), confirmed-empty, an account
 /// hold, a committed Tail head (G7 debt included; an unreadable store counts
-/// as one), or a legacy held archive member key. The latter grants eligibility
-/// only; ordinary header and ownership admission still apply.
+/// as one).
 /// Checked where a file is first admitted (the walk, a watcher hint, the Codex
 /// roster refresh). Queued work and the open recheck keep the walk window.
 pub(in crate::snapshots) fn first_read_aged(
@@ -937,9 +936,7 @@ pub(in crate::snapshots) fn first_read_aged(
         || index.confirmed_empty_files.contains(&key)
         || index.claude_account_deferred_holds.contains_key(&key)
         || (!matches!(state_v2::tail_route_path(index), Ok(None))
-            && (!matches!(state_v2::load_head(index, &key, u32::MAX), Ok(None))
-                || (codex_archive_path(path)
-                    && !matches!(state_v2::legacy_archive_was_seen(index, &key), Ok(false)))));
+            && !matches!(state_v2::load_head(index, &key, u32::MAX), Ok(None)));
     !read
 }
 

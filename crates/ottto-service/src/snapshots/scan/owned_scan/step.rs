@@ -1646,7 +1646,7 @@ impl OwnedSourceScan {
                     active_file = Some(active);
                     pending!();
                 }
-                // #631 review: the bytes this attempt read, taken before
+                // The bytes this attempt read, taken before
                 // `finish_job` consumes the acquisition's start offset. An
                 // exact-stamp memo below must not cover anything past them.
                 if source == SnapshotSource::Codex && active.group.is_none() {
@@ -1828,7 +1828,7 @@ impl OwnedSourceScan {
                     let stamp = sampled_scan::codex_cursor::OpenStamp::capture(file).ok()?;
                     // PR-1: every singleton entry is exact until a counted tail
                     // makes growth replayable, so the stamp must cover exactly
-                    // the bytes read (#631 review: captured after
+                    // the bytes read (captured after
                     // `finish_job`'s check).
                     if stamp.extent() != attempt_read_end {
                         return None;
@@ -3403,7 +3403,7 @@ impl OwnedSourceScan {
                         .context_read_counts
                         .transport_reservation_refused,
                     // Completeness also falls on identity conflicts: require
-                    // an actual failed loader (#985), not just a false gate.
+                    // an actual failed loader, not just a false gate.
                     state_loader_failed: source == SnapshotSource::Codex
                         && (!state_census_complete || !sidecar_census_complete)
                         && [

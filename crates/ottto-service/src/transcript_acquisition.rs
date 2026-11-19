@@ -2362,8 +2362,8 @@ mod tests {
     }
 
     /// Ordinary checkpoint completion shares admission's audit predicate;
-    /// the exact-stamp proof seal still refuses elapsed debt. At 57ffaa32,
-    /// the overdue ordinary seal below returns PrefixRefusal::AuditDue.
+    /// the exact-stamp proof seal still refuses elapsed debt. Before the fix,
+    /// the overdue ordinary seal also returned PrefixRefusal::AuditDue.
     #[test]
     fn overdue_tail_seals_with_identical_debt_but_proof_horizon_still_refuses() {
         let f = Fixture::new(b"one\n");

@@ -2453,7 +2453,7 @@ fn withheld_account_reparses_only_on_start_evidence_or_growth() {
         assert_eq!(reads, Vec::new(), "held audit debt, pass {pass}: deferred");
     }
     assert_eq!(reparses(), BTreeMap::new());
-    // The binding parse discharges it (#876-A's aging fixture); clear it so the
+    // The binding parse discharges the audit debt. Clear it so the
     // later steps keep their read modes.
     assert!(committed.complete_full_audit(&key, &fingerprint));
 

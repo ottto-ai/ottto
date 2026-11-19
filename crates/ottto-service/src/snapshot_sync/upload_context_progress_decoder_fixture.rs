@@ -1,7 +1,4 @@
-// Complete released SnapshotUploadProgress serde codec, identical at:
-// 0.1.201 f174d111fbcdfb0ab9c2abeb299c12d50b435c29
-// 0.1.202 79488a7297817edfe1eb5cfc34b779408d511726
-// 0.1.203 bf4d653b2165a95d04d337be4a058513d3163a18
+// Complete SnapshotUploadProgress serde codec shared by releases 0.1.201–0.1.203.
 // Source-span SHA256 b8812ecf2b79cc341acadc8b28f3cc496f0ef3f3a735a06c214cbc10ef592539
 use super::*;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

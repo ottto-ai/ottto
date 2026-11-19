@@ -319,8 +319,8 @@ impl<T: Borrow<SnapshotItem>> Serialize for SnapshotBatchWireRequest<'_, T> {
 }
 
 // Hoisted onto each SnapshotModelUsage row in v6: these participate in the
-// backend's billing_hash (one of the two row-key dimensions). Names match
-// `_usage_row_key` in backend/app/schemas/agent_session_snapshots.py.
+// receiver's billing hash, one of the two row-key dimensions. Names match the
+// receiver's usage row key.
 pub(super) const ROW_BILLING_FIELDS: &[&str] = &[
     "auth_mode",
     "billing_channel",
@@ -852,17 +852,12 @@ pub struct SnapshotRequestEvidence {
     pub identity_basis: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_workspace_hash: Option<String>,
-    /// Absent: existing provenance (own evidence or existing fills). Present under the
-    /// `session_request_account_source:v1` capability: an account carried
-    /// within one transcript to a request with no telemetry row (placement,
-    /// never per-request proof).
+    /// Absent: existing provenance (own evidence or existing fills). Present:
+    /// an account carried within one transcript to a request with no
+    /// telemetry row (placement, never per-request proof).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_source: Option<AccountSource>,
 }
-
-/// Exact shared activity-hint capability for carried-account provenance.
-/// Missing/null/unknown keeps existing wire bytes for every source.
-pub(crate) const ACCOUNT_SOURCE_CONTRACT: &str = "session_request_account_source:v1";
 
 /// How a carried account reached a request (counts only).
 /// Shared wire shape for source reducers; unmarked provenance stays absent.

@@ -41,8 +41,8 @@ struct HistoryCycle<'a> {
     upload: PipelineUpload,
     /// Another relay destination (its own index); `None` is the default one.
     destination: Option<&'a str>,
-    /// Stand in for MONEY's emitter (#699): after finalization, add one
-    /// request-owned literal copy of every item, ignoring #699's own
+    /// Stand in for the money item emitter: after finalization, add one
+    /// request-owned literal copy of every item, ignoring the emitter's own
     /// protected-root skip, so only the gate's hook can remove it.
     mint_literal: bool,
     /// Observe the contract-5 contract before the scan, as a daemon cycle
@@ -257,7 +257,7 @@ impl HistoryFixture {
         .expect("scan Claude page");
         before_evidence(&mut scan);
         let (mut disposition, _, _) =
-            apply_claude_local_evidence_to_scan_for_test(&self.support, &mut scan, &mut index);
+            apply_claude_local_evidence_to_scan(&self.support, &mut scan, &mut index);
         index.veto_claude_history_emission(SnapshotSource::ClaudeCode, &mut scan.snapshots);
         let deferred_accounts = index.bind_session_accounts_with_mixed(
             SnapshotSource::ClaudeCode,
@@ -488,7 +488,7 @@ const HISTORY_CURRENT: HistoryCycle<'static> = HistoryCycle {
 /// Primary incident shape (addendum 2) on an unverified Mac: a bootstrapped
 /// destination's index is quarantined, no list and no seen-marker, the
 /// backfill state is unreadable, the active revision is bumped. Every file
-/// comes back as a new file. On dba838f0 every body is re-sent (`uploaded`
+/// comes back as a new file. Previously every body was re-sent (`uploaded`
 /// holds all three sessions); here none is, every file is recorded locally
 /// with its census record, and the next two cycles do not re-read anything.
 #[test]
@@ -1134,7 +1134,7 @@ fn revision_three_listed_change_emits_its_ordinary_body_without_the_literal() {
 }
 
 /// Through the pipeline: a census re-owes a stored 3
-/// (as #699's selection-loss path will); the file is owed again, a listed
+/// (as the money selection-loss path will); the file is owed again, a listed
 /// one is held and keeps 2, an unlisted one upgrades back to 3.
 #[test]
 fn a_re_owed_file_goes_back_through_the_gate() {
@@ -1178,7 +1178,7 @@ fn a_re_owed_file_goes_back_through_the_gate() {
     });
 }
 
-/// Addendum 2 item 14 (#700): with the seen-marker present, an empty load
+/// With the seen-marker present, an empty load
 /// latches; held history stays held even with an installed list, while a
 /// file born after the cutoff still ingests.
 #[test]
@@ -1875,7 +1875,7 @@ fn session_created_after_a_pre_gate_index_last_receipt_is_uploaded() {
 
 /// The incident shape with the list intended: prior
 /// uploads, the list installed (one family listed) and its seen-marker
-/// written, then the index quarantined. The rebuild latches (#700): nothing
+/// written, then the index quarantined. The rebuild latches: nothing
 /// is emitted. After a restart, the listed family is never emitted and the
 /// rest is paced through the budget.
 #[test]
@@ -2417,7 +2417,7 @@ fn e2_switch_on_rereads_history_once_paced_and_money_rules_reread_only_marked_fi
     use crate::snapshots::claude_money_birth_store::location_key;
     use crate::snapshots::claude_request_money::e2::{money_mark, with_money_rules};
     use crate::snapshots::{history_local_count, HistoryLocalCount};
-    // Version 2 is #825's zero-mask row, kept for version stability.
+    // Version 2 is the zero-mask row, kept for version stability.
     const RELEASE: &[(u16, u8)] = &[(1, 0), (2, 0), (6, money_mark::ESTIMATED)];
     let fixture = HistoryFixture::new("e2-switch-on-once");
     let at_two = fixture.baseline_at(2);
@@ -2603,7 +2603,7 @@ fn e2_listed_family_keeps_ordinary_money_beside_an_unlisted_literal() {
 /// gate on: no owed file is re-read or stamped 3. [money] The pause holds
 /// adoption only: a genuine change of an unlisted family uploads the `e2`
 /// literal, as under the installed list, never withheld (G1), and its file
-/// is not stamped 3 while the list is missing (G3).
+/// is not stamped 3 while the list is missing.
 #[test]
 fn e2_missing_list_pauses_history_and_uploads_changes_as_e2() {
     let fixture = HistoryFixture::new("e2-list-missing-ordinary");
@@ -2954,7 +2954,7 @@ fn e2_stem_listed_before_root_indexing_counts_each_session_request_once() {
 
 /// Contract-5 cutover, first run after upgrade:
 /// revision-3 history stamped by a permit-era build without the permit
-/// (recorded contract `""`, no capture), some carrying #825's retired
+/// (recorded contract `""`, no capture), some carrying the retired
 /// `STAMPED_WITHOUT_PERMIT` bit (64), meets the always-on contract. Nothing
 /// is re-read or re-owed: a record that never captured is not "no marker
 /// existed", and waits for real content change. The bit is decoded and kept
@@ -2976,7 +2976,7 @@ fn e2_always_on_contract_reowes_no_uncaptured_history() {
             .files
             .values()
             .all(|entry| entry.effective_upload_body_witness_revision == 3));
-        // The permit-era record: contract `""`, and #825's bit on one file.
+        // The permit-era record: contract `""`, and the retired bit on one file.
         let mut old = ScanIndex::load(&fixture.index_path).unwrap();
         let marked = PipelineFixture::key(&old, HISTORY_SESSIONS[0]);
         let kept = old
@@ -3038,7 +3038,7 @@ fn e2_always_on_contract_reowes_no_uncaptured_history() {
 }
 
 /// Contract 5: a real content change restamps a file's money marks from its
-/// new body. #825's retired bit is carried as stored through that restamp
+/// new body. The retired bit is carried as stored through that restamp
 /// (durable entry digests bind the raw byte), never cleared or set. The
 /// stored byte keeps only the retired bit, so the body's own marks return
 /// only if the restamp ran.

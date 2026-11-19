@@ -1186,14 +1186,6 @@ pub(super) fn finish_sync_source(
     upload_progress
         .accepted_identity_buckets
         .set_item_cap(identity_item_cap);
-    upload_progress
-        .accepted_identity_buckets
-        .set_account_source_enabled(
-            activity_hint
-                .session_request_account_source_contract
-                .as_deref()
-                == Some(crate::snapshots::ACCOUNT_SOURCE_CONTRACT),
-        );
     let state_v2_baseline = crate::snapshots::state_v2_baseline_release(&index_path, &index);
     // Resets the census-wait count on every exit that is not a capacity stop.
     let mut census_wait = ack_retention::CapacityStopCensusCount::begin(source);
@@ -1296,7 +1288,7 @@ pub(super) fn finish_sync_source(
             receipt_window_days,
             &mut disposition,
         );
-        // Copy-derived rows (#944): the bodies just built treat these
+        // Copy-derived rows: the bodies just built treat these
         // rows as never accepted; the ledger records that durably before any
         // upload, so a lost reply or restart cannot restore their proof.
         if upload_progress
@@ -2071,12 +2063,12 @@ pub(super) fn finish_sync_source(
     let walk_retired = index.walk_retired_since(&committed_index);
     // Local-hold Completed/Deferred/Rejected subsets and selected-state
     // restoration below can omit a still-live file. Capture which retirement
-    // obligations this full scan references before any selection (#794 F1).
+    // obligations this full scan references before any selection.
     let ack_scan_referenced =
         upload_progress.ack_retirement_scan_references(&committed_index, &index);
     // Shed and upload-error partial checkpoint: save wholly settled files,
-    // then release adopted ACK capacity against the full scan's references
-    // (#778 R2-2). A failed save is logged and yields `None`; a failed
+    // then release adopted ACK capacity against the full scan's references.
+    // A failed save is logged and yields `None`; a failed
     // release fails the pass.
     let mut partial_checkpoint =
         |cause: UnsettledUploadCause, keep_adopted_for_retry: bool| -> Result<Option<ScanIndex>> {

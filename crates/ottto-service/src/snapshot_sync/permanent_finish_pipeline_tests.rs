@@ -100,7 +100,7 @@ impl FinishServer {
                     serde_json::json!({"token":"synthetic-finish-token","expires_at":"2099-01-01T00:00:00Z"})
                 } else if request.contains("/activity-hints") {
                     let mut hint = serde_json::json!({"source":"claude_code","server_time":current_rfc3339(),
-                        "session_request_account_source_contract":crate::snapshots::ACCOUNT_SOURCE_CONTRACT,
+                        "session_request_account_source_contract":"session_request_account_source:v1",
                         "last_data_at":null,"record_count_15m":0,"record_count_24h":0,
                         "local_usage_reconciliation_enabled":true,"backfill_window_days":183,
                         "recommended_scan_after":"2099-01-01T00:00:00Z"});
@@ -839,7 +839,7 @@ pub(in crate::snapshot_sync) fn ack_post_save_failure(stage: &'static str) -> Re
     Ok(())
 }
 
-/// #794: one scripted response per snapshot POST; an empty script accepts.
+/// One scripted response per snapshot POST; an empty script accepts.
 #[derive(Clone, Copy, Debug)]
 enum AckScriptedPost {
     Accept,
@@ -900,7 +900,7 @@ impl AckScriptedServer {
                     serde_json::json!({"token":"synthetic-finish-token","expires_at":"2099-01-01T00:00:00Z"})
                 } else if request.contains("/activity-hints") {
                     serde_json::json!({"source":"claude_code","server_time":current_rfc3339(),
-                        "session_request_account_source_contract":crate::snapshots::ACCOUNT_SOURCE_CONTRACT,
+                        "session_request_account_source_contract":"session_request_account_source:v1",
                         "last_data_at":null,"record_count_15m":0,"record_count_24h":0,
                         "local_usage_reconciliation_enabled":true,"backfill_window_days":183,
                         "recommended_scan_after":"2099-01-01T00:00:00Z"})
@@ -1142,7 +1142,7 @@ fn ack_followup_set_debt(preparation: &mut SourcePreparation, debt: &[String], p
         .unwrap();
 }
 
-/// #794 F3: incomplete-census capacity stop, then a Disabled finish, then
+/// Incomplete-census capacity stop, then a Disabled finish, then
 /// another incomplete-census capacity stop. The Disabled exit resets the
 /// consecutive count, so the second stop reports 1, not 2.
 #[test]

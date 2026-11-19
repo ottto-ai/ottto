@@ -61,11 +61,7 @@ fn e2_page(
     support: &Path,
     index: &mut ScanIndex,
 ) -> (Vec<SnapshotItem>, ClaudeUsageAuthorityDisposition, bool) {
-    // A keyless ledger matches no session: only the advertised carry differs
-    // from the plain stage, as on every production Claude Code cycle.
-    let mut carry_on = claude_request_identity::AcceptedBuckets::default();
-    carry_on.set_account_source_enabled(true);
-    e2_page_with(dirs, support, index, Some(&carry_on))
+    e2_page_with(dirs, support, index, None)
 }
 
 /// `e2_page` under this cycle's accepted-identity state (its capabilities);
@@ -416,9 +412,9 @@ fn e2_pipeline_markerless_a_to_b_keeps_own_logins_with_and_without_a_binding() {
             .iter()
             .find(|item| item.source_session_id == root)
             .unwrap();
-        // Carry.on (CI run 44113140067): without req_2/req_4 rows the gaps
-        // take the starting binding (A): these own requests are unproven
-        // copies, which never seed a carry. Own logins are kept either way.
+        // Without req_2/req_4 rows the gaps take the starting binding (A):
+        // these own requests are unproven copies, which never seed a carry.
+        // Own logins are kept either way.
         let (a, b) = if partial { (3, 1) } else { (2, 2) };
         assert_eq!(
             e2_login_counts(item),
@@ -436,13 +432,12 @@ fn e2_pipeline_markerless_a_to_b_keeps_own_logins_with_and_without_a_binding() {
 }
 
 /// The A-to-B family (req_1-2 own A, req_3-4 own B) with the `gaps` API rows
-/// removed and the `no_account` rows naming no account, evidence-staged once
-/// per mode on the same files: `None` the plain stage, `Some(capability)`
-/// this cycle's `session_request_account_source:v1` state. Root items.
+/// removed and the `no_account` rows naming no account, evidence-staged
+/// `runs` times on the same files over one accepted ledger. Root items.
 fn e2_carry_pages(
     gaps: &[&str],
     no_account: &[(&str, bool)],
-    modes: &[Option<bool>],
+    runs: usize,
     acknowledge: bool,
     marker: bool,
     zero_and_side: bool,
@@ -516,29 +511,25 @@ fn e2_carry_pages(
             &trace,
         );
         let mut accepted = claude_request_identity::AcceptedBuckets::for_test();
-        let pages = modes
-            .iter()
-            .map(|mode| {
-                accepted.set_account_source_enabled(*mode == Some(true));
+        let pages = (0..runs)
+            .map(|_| {
                 let (items, _, failed) = e2_page_with(
                     std::slice::from_ref(&dir),
                     &support,
                     &mut ScanIndex::default(),
-                    mode.map(|_| &accepted),
+                    Some(&accepted),
                 );
                 assert!(!failed);
                 // req_5 belongs to the child stream and keeps its own account;
                 // it cannot seed the parent's leading gaps or take the parent's B.
-                if *mode == Some(true) {
-                    let child = items
-                        .iter()
-                        .find(|item| item.source_session_id != root)
-                        .unwrap();
-                    assert_eq!(
-                        e2_source_counts(child),
-                        BTreeMap::from([((Some(e2_account()), None), 1)])
-                    );
-                }
+                let child = items
+                    .iter()
+                    .find(|item| item.source_session_id != root)
+                    .unwrap();
+                assert_eq!(
+                    e2_source_counts(child),
+                    BTreeMap::from([((Some(e2_account()), None), 1)])
+                );
                 if acknowledge {
                     for item in &items {
                         accepted.record(&serde_json::to_value(item).unwrap());
@@ -592,15 +583,29 @@ fn e2_source_counts(item: &SnapshotItem) -> BTreeMap<(Option<String>, Option<Acc
     counts
 }
 
-/// [money] Under `session_request_account_source:v1` a gap's share moves only
-/// between keys of its own item: forward to the latest own account, backward
-/// to the first, each marked. Request, token and cost totals equal the
-/// capability-off placement, including a zero-usage response and a telemetry-only call.
+/// [money] A gap's share moves only between keys of its own item: forward to
+/// the latest own account, backward to the first, each marked. Every request
+/// is placed exactly once, including a zero-usage response and a
+/// telemetry-only call, and totals are stable across an acknowledged re-run.
 #[test]
 fn e2_pipeline_carry_moves_gap_shares_and_keeps_totals() {
     use AccountSource::{CarriedBackward, CarriedForward};
     let a = Some(e2_account());
     let b = Some("b".repeat(64));
+    // Independent reference: the same files with every own row present place
+    // no carry, so their request and token totals do not depend on it.
+    let tokens = |item: &SnapshotItem| {
+        (
+            item.request_count,
+            item.input_tokens,
+            item.output_tokens,
+            item.cache_read_tokens,
+            item.cache_creation_5m_tokens + item.cache_creation_1h_tokens,
+        )
+    };
+    let reference = e2_carry_pages(&[], &[], 1, false, false, true);
+    assert_eq!(e2_source_counts(&reference[0]).values().sum::<u64>(), 5);
+    let reference = tokens(&reference[0]);
     for (gaps, expected) in [
         (
             &["req_2", "req_4"][..],
@@ -621,15 +626,8 @@ fn e2_pipeline_carry_moves_gap_shares_and_keeps_totals() {
             ],
         ),
     ] {
-        let pages = e2_carry_pages(
-            gaps,
-            &[],
-            &[Some(false), Some(true), Some(true)],
-            true,
-            false,
-            true,
-        );
-        let [off, on, again] = &pages[..] else {
+        let pages = e2_carry_pages(gaps, &[], 2, true, false, true);
+        let [on, again] = &pages[..] else {
             unreachable!()
         };
         assert_eq!(
@@ -639,8 +637,8 @@ fn e2_pipeline_carry_moves_gap_shares_and_keeps_totals() {
         );
         // req_3 is observed B inside the gap stream: carry cannot replace it.
         assert_eq!(e2_source_counts(on).get(&(b.clone(), None)), Some(&1));
-        // Marking the old merged carry and acknowledging it never strips the
-        // accepted account or invokes B31's starting-binding fallback.
+        // Acknowledging the marked carry never strips the accepted account
+        // or invokes B31's starting-binding fallback on the next body.
         assert_eq!(on.request_identity_refusals, 0);
         assert_eq!(again.request_identity_refusals, 0);
         assert_eq!(e2_source_counts(again), e2_source_counts(on));
@@ -654,23 +652,32 @@ fn e2_pipeline_carry_moves_gap_shares_and_keeps_totals() {
                 e2_source_counts(item).values().sum::<u64>(),
             )
         };
-        assert_eq!(totals(on), totals(off), "{gaps:?}: money never changes");
+        assert_eq!(totals(again), totals(on), "{gaps:?}: money never changes");
+        assert_eq!(tokens(on), reference, "{gaps:?}: carry never moves usage");
+        // Each supplied telemetry row reports 100 micro-USD: the own rows left
+        // after the gaps plus the side call. Removed rows report no cost.
+        let supplied = 4 - gaps.len() + 1;
+        assert_eq!(
+            on.cost
+                .as_ref()
+                .and_then(|cost| cost.total_cost_usd.as_deref()),
+            Some(format!("0.{supplied:04}").as_str()),
+            "{gaps:?}: reported cost"
+        );
         assert_eq!(
             on.request_count, 5,
             "four non-zero responses plus the side call"
         );
+        assert_eq!(
+            e2_source_counts(on).values().sum::<u64>(),
+            on.request_count,
+            "{gaps:?}: every request is placed exactly once"
+        );
     }
-    // The first ACK is already ON. req_1's native marker and req_4's
-    // carried B share the same native row; record stores {marker, None}.
-    // Its next body must retain carried B without treating it as proof.
-    let pages = e2_carry_pages(
-        &["req_1", "req_4"],
-        &[],
-        &[Some(true), Some(true)],
-        true,
-        true,
-        false,
-    );
+    // req_1's native marker and req_4's carried B share the same native row;
+    // record stores {marker, None}. Its next body must retain carried B
+    // without treating it as proof.
+    let pages = e2_carry_pages(&["req_1", "req_4"], &[], 2, true, true, false);
     let [first, again] = &pages[..] else {
         unreachable!()
     };
@@ -691,31 +698,6 @@ fn e2_pipeline_carry_moves_gap_shares_and_keeps_totals() {
             && parts.iter().any(|part| part.account_identifier_hash == b))));
 }
 
-/// [off=main] Without the capability the stage is main's: the same bytes as
-/// the plain evidence stage, no `account_source`, main's unmarked fill.
-#[test]
-fn e2_pipeline_carry_capability_absent_keeps_main_bytes() {
-    let pages = e2_carry_pages(
-        &["req_2", "req_4"],
-        &[],
-        &[None, Some(false), Some(true)],
-        false,
-        false,
-        false,
-    );
-    let [plain, off, on] = &pages[..] else {
-        unreachable!()
-    };
-    let bytes = |item: &SnapshotItem| serde_json::to_string(item).unwrap();
-    assert_eq!(bytes(plain), bytes(off));
-    assert!(!bytes(off).contains("account_source"));
-    assert_eq!(
-        e2_login_counts(off),
-        BTreeMap::from([(Some(e2_account()), 2), (Some("b".repeat(64)), 2)])
-    );
-    assert!(bytes(on).contains(r#""account_source":"carried_forward""#));
-}
-
 /// [behaviour] A telemetry row naming no account blocks the carry: it stays
 /// Unknown; the next own account seeds again.
 #[test]
@@ -726,7 +708,7 @@ fn e2_pipeline_no_account_row_blocks_the_carry() {
         let pages = e2_carry_pages(
             &["req_3"],
             &[("req_2", contradictory)],
-            &[Some(true)],
+            1,
             false,
             false,
             false,
@@ -745,7 +727,7 @@ fn e2_pipeline_no_account_row_blocks_the_carry() {
         let pages = e2_carry_pages(
             &["req_2", "req_3", "req_4"],
             &[("req_1", contradictory)],
-            &[Some(true)],
+            1,
             false,
             true,
             false,
@@ -759,8 +741,9 @@ fn e2_pipeline_no_account_row_blocks_the_carry() {
     }
 }
 
-/// [money] Existing own-key overflow and carried-twin exhaustion conserve
-/// all money; provenance-enabled overflow stays held before any strip.
+/// [money] Own-key overflow and carried-twin exhaustion of the item's key cap
+/// stay held before any strip: never refused, usage and known identity kept,
+/// nothing uploadable.
 #[test]
 fn e2_pipeline_exact_telemetry_over_cap_refuses_upstream_lost_proof() {
     let dir = temp_dir("e2-identity-telemetry-cap");
@@ -791,40 +774,11 @@ fn e2_pipeline_exact_telemetry_over_cap_refuses_upstream_lost_proof() {
         root,
         &trace,
     );
-    // The plain stage (capability off) strips; the advertised one holds (below).
-    let (items, disposition, failed) = e2_page_with(
-        std::slice::from_ref(&dir),
-        &support,
-        &mut ScanIndex::default(),
-        None,
-    );
-    assert!(!failed);
-    assert_eq!(items.len(), 1);
-    let item = &items[0];
-    assert!(e2_is_literal(item));
-    assert_eq!(item.request_count, 33);
-    assert_eq!(
-        e2_login_counts(item),
-        BTreeMap::from([(None, 33)]),
-        "SOURCE: lost 33rd-key proof cannot borrow the starting or 32nd login"
-    );
-    assert_eq!(
-        item.cost.as_ref().unwrap().total_cost_usd.as_deref(),
-        Some("0.0033")
-    );
-    let display = item.claude_account_display.as_deref().unwrap();
-    assert_eq!(display.current.status, "unknown");
-    assert_eq!(display.current.account_identifier_hash, None);
-    assert_eq!(
-        display.current.unknown_reason.as_deref(),
-        Some("identity_withheld")
-    );
-    assert_eq!(item.request_identity_refusals, 1);
-    assert_eq!(disposition.quarantined_entity_count(), 0);
-    // The existing 33-request fixture also reaches the cap through
-    // a forward twin, a backward twin, and a twin occupying a later own key's
-    // slot. No raised byte limit is required for provenance to remain owed.
-    for gaps in [vec![1], vec![33], (2..=32).step_by(2).collect()] {
+    // The 33-request fixture reaches the cap through a forward twin, a
+    // backward twin, and a twin occupying a later own key's slot. No raised
+    // byte limit is required for provenance to remain owed.
+    // All 33 own logins: one key over the cap, held like the carried twins.
+    for gaps in [vec![], vec![1], vec![33], (2..=32).step_by(2).collect()] {
         let own = api
             .iter()
             .filter(|row| !gaps.iter().any(|n| row.request_id == format!("req_{n}")))
@@ -832,17 +786,7 @@ fn e2_pipeline_exact_telemetry_over_cap_refuses_upstream_lost_proof() {
             .collect::<Vec<_>>();
         e2_write_rows(&support, crate::claude_local_otel::STORE_DIR, root, &own);
         claude_request_money::e2::with_fixture_birth(1_785_542_400_000_000_000, || {
-            let mut accepted = claude_request_identity::AcceptedBuckets::for_test();
-            accepted.set_account_source_enabled(false);
-            let (off, off_disposition, failed) = e2_page_with(
-                std::slice::from_ref(&dir),
-                &support,
-                &mut ScanIndex::default(),
-                Some(&accepted),
-            );
-            assert!(!failed);
-            assert_eq!(off_disposition.quarantined_entity_count(), 0);
-            accepted.set_account_source_enabled(true);
+            let accepted = claude_request_identity::AcceptedBuckets::for_test();
             let (on, disposition, failed) = e2_page_with(
                 std::slice::from_ref(&dir),
                 &support,
@@ -857,14 +801,22 @@ fn e2_pipeline_exact_telemetry_over_cap_refuses_upstream_lost_proof() {
                 "{gaps:?}: item Held"
             );
             assert!(disposition.quarantined_source_session_ids.contains(root));
-            assert_eq!(on[0].request_count, off[0].request_count);
-            assert_eq!(on[0].input_tokens, off[0].input_tokens);
-            assert_eq!(on[0].output_tokens, off[0].output_tokens);
-            assert_eq!(
-                on[0].cost, off[0].cost,
-                "{gaps:?}: money conserved while Held"
-            );
             assert_eq!(on[0].request_count, 33);
+            assert_eq!(
+                (on[0].input_tokens, on[0].output_tokens),
+                (330, 330),
+                "{gaps:?}: usage conserved while Held"
+            );
+            // Each own row still supplied reports 100 micro-USD.
+            let supplied = 33 - gaps.len();
+            assert_eq!(
+                on[0]
+                    .cost
+                    .as_ref()
+                    .and_then(|cost| cost.total_cost_usd.as_deref()),
+                Some(format!("0.{supplied:04}").as_str()),
+                "{gaps:?}: reported cost kept while Held"
+            );
             assert_eq!(on[0].request_identity_refusals, 0, "HOLD never strips");
             assert!(
                 e2_source_counts(&on[0])
@@ -908,10 +860,9 @@ fn e2_page_with_stats(
             &index,
             "e2-identity-machine",
         );
-        let (disposition, _, stats) =
-            crate::snapshot_sync::apply_claude_local_evidence_to_scan_for_test(
-                support, &mut scan, &mut index,
-            );
+        let (disposition, _, stats) = crate::snapshot_sync::apply_claude_local_evidence_to_scan(
+            support, &mut scan, &mut index,
+        );
         (scan.snapshots, disposition, stats)
     }
 }
@@ -1092,15 +1043,9 @@ fn e2_bound_trace_page(
             );
         }
         assert_eq!(index.claude_history_emission.files.len(), 2);
-        // No ledger: a keyless one under the advertised carry (see `e2_page`).
-        let mut carry_on = claude_request_identity::AcceptedBuckets::default();
-        carry_on.set_account_source_enabled(true);
         let (disposition, _, stats) =
             crate::snapshot_sync::apply_claude_local_evidence_to_scan_with_accepted_for_test(
-                support,
-                &mut scan,
-                index,
-                accepted.or(Some(&carry_on)),
+                support, &mut scan, index, accepted,
             );
         for gated in index.claude_history_emission.files.values() {
             assert!(gated.permitted, "owed permission is retained");
@@ -1240,7 +1185,7 @@ fn e2_bound_trace_case(
     let support = dir.join("support");
     let (mut api, trace) = e2_family_evidence(&root);
     // Own login B, except the mixed arm: own A == the bound owner, which main
-    // uploads and only #947's clear would hold.
+    // uploads unless the unhealthy trace requires clearing the account.
     let own = if billing == "mixed" { "a" } else { "b" };
     for row in &mut api {
         row.account_identifier_hash = Some(own.repeat(64).into());
@@ -1420,7 +1365,7 @@ fn e2_bound_trace_case(
             assert_eq!(
                 held,
                 BTreeSet::from([root.clone()]),
-                "#932's discard keeps main's account hold"
+                "the discard keeps main's account hold"
             );
         }
         assert_eq!(stats.trace_discard_deferred_items, 2);
@@ -1463,7 +1408,7 @@ fn e2_bound_trace_case(
         }
         for item in &items {
             assert_eq!(item.telemetry_owned_complete, Some(false));
-            // #909: one refusal per changed accepted row; none if never accepted.
+            // One refusal per changed accepted row. A row never accepted gets no refusal.
             assert_eq!(
                 item.request_identity_refusals,
                 refusals.get(&item.source_session_id).copied().unwrap_or(0),
@@ -1515,13 +1460,13 @@ fn e2_bound_trace_case(
     fs::remove_dir_all(dir).unwrap();
 }
 
-/// [money] #932: a discard withholds, never another account.
+/// [money] A discarded trace withholds attribution to every account.
 #[test]
 fn e2_pipeline_bound_a_own_b_cap_discard_has_no_fallback_then_recovers() {
     e2_bound_trace_case("cap", false, "subscription", false, false);
 }
 
-/// [money] #932: a replaced trace is a discard too.
+/// [money] A replaced trace is a discard too.
 #[cfg(unix)]
 #[test]
 fn e2_pipeline_bound_a_own_b_generation_discard_has_no_fallback_then_recovers() {
@@ -1530,7 +1475,7 @@ fn e2_pipeline_bound_a_own_b_generation_discard_has_no_fallback_then_recovers() 
 
 /// [money] Uniform B on a malformed trace is Unknown until a clean read,
 /// never B through the request-census shortcut.
-/// guard: unseen live (0 of 3,614 evidence pages); code-derived from #932 review P2-1
+/// Covers the no-fallback path when trace ownership cannot be verified.
 #[test]
 fn e2_pipeline_bound_a_uniform_b_malformed_trace_is_unknown_not_a() {
     e2_bound_trace_case("malformed", false, "subscription", false, false);
@@ -1538,7 +1483,7 @@ fn e2_pipeline_bound_a_uniform_b_malformed_trace_is_unknown_not_a() {
 
 /// [money] Split B/C on a malformed trace is Unknown, never retained A.
 /// Never accepted, so no refusal.
-/// guard: unseen live (0 of 3,614 evidence pages); code-derived from #932 review P2-1
+/// Covers the no-fallback path when trace ownership cannot be verified.
 #[test]
 fn e2_pipeline_bound_a_split_logins_malformed_trace_is_unknown_not_a() {
     e2_bound_trace_case("malformed", true, "subscription", false, false);
@@ -1561,26 +1506,26 @@ fn e2_pipeline_bound_a_split_logins_unhealthy_trace_reasons_are_unknown_not_a() 
     }
 }
 
-/// [money] #932: the discard withholds the split family too.
+/// [money] The discard withholds the split family too.
 #[test]
 fn e2_pipeline_bound_a_split_logins_cap_discard_blocks_retained_a() {
     e2_bound_trace_case("cap", true, "subscription", false, false);
 }
 
-/// [money] #932: the same for a replaced trace.
+/// [money] The split family is also withheld for a replaced trace.
 #[cfg(unix)]
 #[test]
 fn e2_pipeline_bound_a_split_logins_generation_discard_blocks_retained_a() {
     e2_bound_trace_case("generation", true, "subscription", false, false);
 }
 
-/// [money] #932: external billing bypasses grouping; the discard clears it.
+/// [money] External billing bypasses grouping; the discard clears its wire account.
 #[test]
 fn e2_pipeline_external_billing_cap_discard_clears_wire_account_then_recovers() {
     e2_bound_trace_case("cap", false, "external", false, false);
 }
 
-/// [money] #932: the same for a replaced trace.
+/// [money] A replaced trace clears the wire account too.
 #[cfg(unix)]
 #[test]
 fn e2_pipeline_external_billing_generation_discard_clears_wire_account_then_recovers() {
@@ -1598,14 +1543,14 @@ fn e2_pipeline_external_billing_malformed_trace_clears_wire_account() {
 
 /// [money] Mixed billing (only req_3/req_4
 /// API-key billed), own login A == bound owner: the body uploads Unknown on
-/// the same page with 0 account holds, decision-2 refusals (none here: this
-/// body never enters the #909 ledger) and unchanged totals.
+/// the same page with zero account holds, zero refusals (this
+/// body never enters the accepted-share ledger) and unchanged totals.
 #[test]
 fn e2_pipeline_mixed_billing_malformed_trace_clears_wire_account() {
     e2_bound_trace_case("malformed", false, "mixed", false, false);
 }
 
-/// [money] #932 x #909: a bucket already accepted tagged (B root, C child) is
+/// [money] A bucket already accepted tagged (B root, C child) is
 /// never replaced by an untagged revision: the discard page uploads nothing
 /// for the family, and the next clean page uploads B/C again.
 #[test]
@@ -1613,21 +1558,21 @@ fn e2_pipeline_accepted_b_cap_discard_defers_upload_then_recovers() {
     e2_bound_trace_case("cap", true, "subscription", true, false);
 }
 
-/// [money] #932 x #909: the same for a replaced trace.
+/// [money] A replaced trace also withholds the untagged revision of an accepted bucket.
 #[cfg(unix)]
 #[test]
 fn e2_pipeline_accepted_b_generation_discard_defers_upload_then_recovers() {
     e2_bound_trace_case("generation", true, "subscription", true, false);
 }
 
-/// [money] #947 x #909: an accepted bucket made Unknown by a
-/// malformed trace keeps #909's refusal, one per changed accepted row.
+/// [money] An accepted bucket made Unknown by a
+/// malformed trace keeps its refusal, one per changed accepted row.
 #[test]
 fn e2_pipeline_accepted_bucket_unhealthy_root_keeps_909_refusal() {
     e2_bound_trace_case("malformed", true, "subscription", true, false);
 }
 
-/// [money] #932 x #909: a listed family (real
+/// [money] A listed family (real
 /// re-emission list, no `e2` fold) whose accepted trace grows mid-read is held
 /// like a folded one: nothing untagged or refused uploads, its history stays
 /// owed, and the next clean read keeps the tags.

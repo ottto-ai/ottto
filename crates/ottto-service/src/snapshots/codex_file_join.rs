@@ -3729,12 +3729,12 @@ pub(super) mod tests {
         fs::remove_dir_all(root).unwrap();
     }
     /// The two-member fixture with creation times, so a cutover can select V2.
-    /// Each member's native and UI share one bound turn (#630: a V2 group
-    /// proves native-turn UI).
+    /// Each member's native and UI share one bound turn, which a V2 group
+    /// can use to prove native-turn UI.
     pub(crate) fn counting_v2_fixture() -> (PathBuf, [String; 2]) {
         counting_v2_fixture_with(true)
     }
-    /// #603's original rows: UI in an unbound span, which a V2 group holds.
+    /// The original fixture has UI in an unbound span, which a V2 group holds.
     pub(crate) fn counting_v2_unbound_fixture() -> (PathBuf, [String; 2]) {
         counting_v2_fixture_with(false)
     }
@@ -3772,7 +3772,7 @@ pub(super) mod tests {
             .expect("an executed configured group parse owns receipts");
         assert_eq!(receipts.v2_sessions, 1, "a joined group folds once");
         // One carried accumulator saw both members' records, each inside
-        // its member's bound turn (#630 re-fixture: was 2 and 2 unbound).
+        // its member's bound turn.
         assert_eq!(receipts.native_counted, 2, "both members' natives");
         assert_eq!(receipts.native_outside_open_turn, 0);
         assert_eq!(receipts.ui_in_unbound_span, 0);

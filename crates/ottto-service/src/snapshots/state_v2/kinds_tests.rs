@@ -166,12 +166,7 @@ fn previous_layout_defaults_new_kinds_and_upgrades_on_save_without_masking_damag
     {
         let mut tx = db.begin(TxnMode::Read).unwrap();
         for (kind, field, introduced) in catalogue::LAYOUTS {
-            // Archive custody is written only while held; this fixture holds
-            // none. A retired kind is never written.
-            if *introduced > previous_layout
-                && !["v1_field.archives", "v1_field.archive_deferred_alarm_count"].contains(kind)
-                && !field.starts_with("retired_")
-            {
+            if *introduced > previous_layout && !field.starts_with("retired_") {
                 assert!(
                     tx.get(&mapper::key(kind, "", 0).unwrap())
                         .unwrap()
@@ -879,8 +874,8 @@ fn census_evidence_larger_than_the_projected_row_cap_roundtrips() {
     );
 }
 
-/// [format] #938 copy removals map losslessly between checked v1 bytes and v2.
-/// Goldens are CCR2 of #938's persisted-field fixture plus one prefix-hold
+/// [format] Copy removals map losslessly between checked v1 bytes and v2.
+/// Goldens are CCR2 of the persisted copy-removals fixture plus one prefix-hold
 /// debt file, with definite and lost metadata; an absent slot stays empty.
 #[test]
 fn copy_removals_roundtrip_checked_v1_bytes_through_v2() {
@@ -962,8 +957,8 @@ fn shipped_traversal(edit: impl FnOnce(&mut serde_json::Value)) -> serde_json::V
 }
 
 /// [regress] 0.1.215 writes `upload_context_proof.direction` every source
-/// cycle (383f8bca6 upload_context_receipt.rs:920-934); #1287 retired it as a
-/// decode-only placeholder. The real v2 read path must still decode it.
+/// cycle. The field is now a decode-only placeholder that the real v2 read path
+/// must still decode.
 #[test]
 fn shipped_0_1_215_upload_context_proof_direction_hydrates() {
     let row = serde_json::json!({ "direction": shipped_direction() });
@@ -973,7 +968,7 @@ fn shipped_0_1_215_upload_context_proof_direction_hydrates() {
 }
 
 /// [regress] 0.1.212-0.1.215 persist nonzero
-/// `counts.caps.inventory_hold_keys_discarded` (removed by #1290).
+/// `counts.caps.inventory_hold_keys_discarded`, now retired.
 #[test]
 fn shipped_0_1_215_traversal_caps_inventory_hold_keys_discarded_hydrates() {
     let row = shipped_traversal(|counts| {
@@ -985,7 +980,7 @@ fn shipped_0_1_215_traversal_caps_inventory_hold_keys_discarded_hydrates() {
 }
 
 /// [regress] 0.1.208-0.1.215 persist nonzero
-/// `counts.listing_owed_pace_evicted` (removed by #1290).
+/// `counts.listing_owed_pace_evicted`, now retired.
 #[test]
 fn shipped_0_1_215_traversal_listing_owed_pace_evicted_hydrates() {
     let row = shipped_traversal(|counts| {

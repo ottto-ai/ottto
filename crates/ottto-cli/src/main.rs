@@ -82,7 +82,7 @@ enum Command {
     Sessions(SessionsArgs),
     #[command(about = "Print Advisor recommendations for AI agents")]
     Recommendations(RecommendationsArgs),
-    #[command(about = "Print staff-only provider-impact events for AI agents")]
+    #[command(about = "Print provider-impact events for AI agents")]
     ProviderImpact(ProviderImpactArgs),
     #[command(about = "Connect this Mac through a browser claim")]
     Setup(SetupArgs),

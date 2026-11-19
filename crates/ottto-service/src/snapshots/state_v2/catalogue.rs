@@ -80,7 +80,7 @@ macro_rules! scan_index_fields {
             claude_copy_removals => Misc (misc check_field Field) ["v1_field.claude_copy_removals" => 1] side,
             // Its stamps are one row per entity, as accepted.entity (layout 6).
             upload_context_proof => Misc (misc check_field Field) ["v1_field.upload_context_proof" => 2, "proof.upload_context" => 6, "proof.request_contribution" => 8] side,
-            // Inert accepted catalogue entries; member keys retain legacy first-seen evidence.
+            // Accepted for retirement by the next committed graph save.
             retired_archives => Misc (retired none) ["v1_field.archives" => 2] side,
             retired_archive_deferred_alarm_count => Misc (retired none) ["v1_field.archive_deferred_alarm_count" => 2] side,
             decode_holds => Misc (hook none) ["v1_field.repair_provenance" => 1, "raw_hold.files" => 1, "raw_hold.growth_retention" => 1, "raw_hold.claude_usage_family_witnesses" => 1, "raw_hold.claude_usage_authority_quarantine" => 1, "raw_hold.quarantined_snapshot_fingerprints" => 1] side,

@@ -1099,7 +1099,7 @@ fn placement() {
                 &births,
                 &[],
             );
-            crate::snapshot_sync::apply_claude_local_evidence_to_scan_for_test(
+            crate::snapshot_sync::apply_claude_local_evidence_to_scan(
                 &support, &mut scan, &mut index,
             );
             for item in &mut scan.snapshots {

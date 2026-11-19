@@ -2064,7 +2064,7 @@ mod growth_tests {
         assert_eq!(serde_json::to_vec(&restart(&index)).unwrap(), before);
         let mut census = ScanCensus::default();
         let now = unix_seconds(SystemTime::now()).unwrap() + 40 * 86400;
-        // Main's #876 retains an indexed grown file across the window
+        // Ordinary discovery retains an indexed grown file across the window
         // (DiscoveryRetention::owes_stamped / sources::codex::eof_fragment::grown); OFF
         // selects it exactly as main does, without any v2 growth custody.
         assert!(candidate_from_traversal_path(

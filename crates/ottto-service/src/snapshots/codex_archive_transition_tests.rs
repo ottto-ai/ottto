@@ -953,60 +953,78 @@ fn legacy_age_corpus() -> (Corpus, PathBuf, Vec<u8>) {
     (c, compressed, encoded)
 }
 
-/// [regress] An older archive Held for AdmissionRefused is already seen;
-/// becoming readable still requires normal admission and counted acquisition.
+/// [behaviour] A retired archive membership alone does not admit an aged rollout.
 #[test]
-fn legacy_owed_held_archive_older_than_first_read_window_is_counted() {
+fn membership_only_aged_archive_stays_unqueued_after_restart() {
     let _lock = DECODER_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let (c, compressed, encoded) = legacy_age_corpus();
-    let (cold_index, cold, _, _, _) = page(
-        &c,
-        ScanIndex::default(),
-        Arc::new(sampled_scan::SharedCache::default()),
-    );
-    let expected = emitted(&cold_index, &cold);
-    assert_eq!(expected.snapshots.len(), 4);
-    fs::write(&compressed, b"previously refused compressed input").unwrap();
-    aged_mtime(&compressed);
-    let (session, prior) = StateV2ColdSession::publish(
-        Source::Codex,
-        &ScanIndex::default(),
-        &c.scratch.join("state"),
-    );
+    let (c, compressed, _) = legacy_age_corpus();
     let key = local_index_key(&compressed);
-    state_v2::seed_0217_archive_for_test(&prior, &key);
-    let mut prior = ScanIndex::load(session.path()).unwrap();
-    assert!(!prior.files.contains_key(&key));
-    // A save before discovery must not erase the old first-seen evidence.
-    prior.save(session.path()).unwrap();
-    let prior = ScanIndex::load(session.path()).unwrap();
-    assert!(!first_read_aged(
-        &prior,
-        &compressed,
-        fs::metadata(&compressed)
-            .unwrap()
-            .modified()
-            .ok()
-            .and_then(unix_seconds)
-            .unwrap(),
-        rfc3339_unix_seconds(NOW)
-    ));
-    fs::write(&compressed, encoded).unwrap();
-    aged_mtime(&compressed);
-    let (working, scan, _, consumed, logs) = page(
-        &c,
-        prior.clone(),
-        Arc::new(sampled_scan::SharedCache::default()),
+    let slots = named_creator_slots();
+    let (mut cold_index, mut cold, _, _, _) = page_observed_with_limit(
+        &c.roots(),
+        ScanIndex::default(),
+        Arc::default(),
+        100,
+        &slots,
+        |_| {},
     );
-    assert!(consumed > 0);
-    assert!(full_decodes(&logs) > 0, "compressed first read is counted");
-    let (index, posts) = working.checkpoint_with_captured_posts(&scan, &prior, "accept");
-    let actual = route(&index, &scan, posts);
+    assert_eq!(cold.snapshots.len(), 4);
+    cold.snapshots.retain(|item| item.source_session_id != MAIN);
+    assert_eq!(cold.snapshots.len(), 3);
+    cold_index.files.remove(&key);
+    let expected = emitted(&cold_index, &cold);
+    aged_mtime(&compressed);
+
+    let (session, prior) = c.publish();
+    state_v2::seed_0217_archive_for_test(&prior, &key);
+    drop(prior);
+    let prior = ScanIndex::load(session.path()).unwrap();
+    assert!(prior.decode_holds.is_empty());
+    assert!(prior.files.is_empty());
+    assert!(prior.confirmed_empty_files.is_empty());
+    assert!(prior.accepted_snapshot_fingerprints.is_empty());
+    assert!(state_v2::load_head(&prior, &key, u32::MAX)
+        .unwrap()
+        .is_none());
+    assert!(serde_json::to_value(&prior)
+        .unwrap()
+        .get("archives")
+        .is_none());
+    state_v2::assert_0217_archive_rows_for_test(&prior, &key, true);
+
+    let scan_excluded = |index| {
+        let (working, scan, _, _, logs) =
+            page_observed_with_limit(&c.roots(), index, Arc::default(), 100, &slots, |step| {
+                assert!(
+                    !e2_pipeline_scan_fixture::pending_keys_for_test(&step.index).contains(&key)
+                );
+                assert!(!step.selected_flags.contains_key(&key));
+            });
+        assert!(!e2_pipeline_scan_fixture::pending_keys_for_test(&working).contains(&key));
+        assert!(!working.files.contains_key(&key));
+        assert!(state_v2::load_head(&working, &key, u32::MAX)
+            .unwrap()
+            .is_none());
+        assert_eq!(full_decodes(&logs), 0);
+        let actual = emitted(&working, &scan);
+        assert!(!actual.snapshots.contains_key(MAIN));
+        (working, actual)
+    };
+
+    let (mut working, actual) = scan_excluded(prior);
     money_oracle::assert_equivalent(&expected, &actual);
-    money_oracle::assert_no_smaller_reemit(MAIN, &expected, &actual, &expected, false);
-    assert!(index.files.contains_key(&key));
+    let saved = session.save_reload(&mut working);
+    state_v2::assert_0217_archive_rows_for_test(&saved, &key, false);
+    drop((working, saved));
+    state_v2::cold_close_for_test(session.path()).unwrap();
+
+    let mut restarted = ScanIndex::load(session.path()).unwrap();
+    assert!(restarted.decode_holds.is_empty());
+    state_v2::assert_0217_archive_rows_for_test(&restarted, &key, false);
+    restarted.traversal = None;
+    scan_excluded(restarted);
 }
 
 /// One ordinary pass's reads and emissions, as the test seams observe them.
@@ -1460,37 +1478,6 @@ fn never_seen_old_compressed_and_plain_rollouts_share_first_read_skip() {
         }
         drop(session);
     }
-}
-
-/// [format] A release-shaped archive manifest plus member (header_attempts
-/// included) loads inert and survives an unrelated ordinary save.
-#[test]
-fn release_0217_archive_manifest_members_and_header_attempts_load_inert() {
-    let c = Corpus::new();
-    let (session, prior) = StateV2ColdSession::publish(
-        Source::Codex,
-        &ScanIndex::default(),
-        &c.scratch.join("state"),
-    );
-    let key = local_index_key(&c.sessions.join(format!("rollout-{MAIN}.jsonl.zst")));
-    state_v2::seed_0217_archive_for_test(&prior, &key);
-    let mut index = ScanIndex::load(session.path()).unwrap();
-    assert!(index.decode_holds.is_empty());
-    assert!(index.files.is_empty());
-    assert!(index.accepted_snapshot_fingerprints.is_empty());
-    assert!(state_v2::legacy_archive_was_seen(&index, &key).unwrap());
-    assert!(state_v2::load_head(&index, &key, REVISION)
-        .unwrap()
-        .is_none());
-    assert!(serde_json::to_value(&index)
-        .unwrap()
-        .get("archives")
-        .is_none());
-    index.save(session.path()).unwrap();
-    let index = ScanIndex::load(session.path()).unwrap();
-    assert!(state_v2::legacy_archive_was_seen(&index, &key).unwrap());
-    assert!(index.decode_holds.is_empty());
-    assert!(index.files.is_empty());
 }
 
 /// Named creator slots for both accounts, so rows carry account tags.
