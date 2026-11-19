@@ -632,7 +632,9 @@ pub(super) fn sync_once(
             &device_secret,
             source,
             &machine_id,
-            Some(&cycle_started_at),
+            // An armed source may idle: no scan start may move the server's
+            // window past the walk its manifest is paired with.
+            Some(&cycle_started_at).filter(|_| !crate::snapshots::walk_idle::armed(source)),
         ) {
             eprintln!(
                 "local snapshot cycle-start receipt skipped for {}: {}",

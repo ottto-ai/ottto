@@ -53,6 +53,11 @@ fn with_slot<T>(source: SnapshotSource, run: impl FnOnce(&mut Slot) -> T) -> T {
     })
 }
 
+/// Whether `source` holds an armed record, so its next pass may idle.
+pub(crate) fn armed(source: SnapshotSource) -> bool {
+    with_slot(source, |slot| slot.record.is_some())
+}
+
 pub(crate) fn clear(source: SnapshotSource) {
     with_slot(source, |slot| slot.record = None);
 }
