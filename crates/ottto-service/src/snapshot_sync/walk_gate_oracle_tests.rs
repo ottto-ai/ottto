@@ -151,25 +151,74 @@ fn placement(server: &OracleServer) -> Value {
         .into()
 }
 
-/// Whether the source's terminal manifest is published: every terminal report
-/// withdraws it first, and only a complete census publishes it again.
-fn manifest(source: SnapshotSource) -> bool {
+/// The source's cached terminal manifest: a complete census publishes it, and
+/// an idle pass keeps the last walk's for check-in beats to refresh.
+fn manifest(source: SnapshotSource) -> Option<crate::snapshots::SnapshotSourceManifest> {
     crate::snapshot_sync::finish::source_manifests()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .keys()
-        .any(|(_, slug)| *slug == source.api_slug())
+        .iter()
+        .find(|(key, _)| key.1 == source.api_slug())
+        .map(|(_, manifest)| manifest.clone())
 }
 
-/// One pass that must walk or idle. Each census money step with a seam (the
-/// terminal manifest) runs once per completed walk and never on an idle pass.
-fn expect_pass(source: SnapshotSource, row: &str, cycle: &Cycle, walk: bool) {
+/// The last collector status body the server received.
+fn last_status(server: &OracleServer) -> Value {
+    server.statuses.lock().unwrap().last().cloned().unwrap()
+}
+
+fn status_count(server: &OracleServer) -> usize {
+    server.statuses.lock().unwrap().len()
+}
+
+/// What the local cache and the server held after the last pass.
+struct Seen {
+    manifest: Option<crate::snapshots::SnapshotSourceManifest>,
+    statuses: usize,
+}
+
+impl Seen {
+    fn now(source: SnapshotSource, server: &OracleServer) -> Self {
+        Self {
+            manifest: manifest(source),
+            statuses: status_count(server),
+        }
+    }
+}
+
+/// One pass that must walk or idle. A completed walk sends its terminal
+/// receipt and publishes the manifest. An idle pass sends no receipt (the
+/// server would read one as a new scan result) and keeps the walk's manifest.
+fn expect_pass(
+    source: SnapshotSource,
+    row: &str,
+    cycle: &Cycle,
+    walk: bool,
+    server: &OracleServer,
+    seen: &mut Seen,
+) {
     if walk {
         assert!(walked(cycle), "{row}: expected a walk: {}", cycle.gate);
     } else {
         assert_idle(cycle);
     }
-    assert_eq!(manifest(source), walk, "{row}: manifest: {}", cycle.gate);
+    let now = Seen::now(source, server);
+    assert!(now.manifest.is_some(), "{row}: manifest: {}", cycle.gate);
+    if walk {
+        assert!(now.statuses > seen.statuses, "{row}: the walk's receipt");
+        let receipt = last_status(server);
+        assert_eq!(receipt["report_kind"], "scan_status", "{row}: {receipt}");
+    } else {
+        assert_eq!(
+            now.statuses, seen.statuses,
+            "{row}: an idle pass sends no receipt"
+        );
+        assert_eq!(
+            now.manifest, seen.manifest,
+            "{row}: the walk's manifest stands"
+        );
+    }
+    *seen = now;
 }
 
 fn unacked_lost(cycles: &[Cycle]) -> BTreeMap<String, u64> {
@@ -232,9 +281,10 @@ fn lifecycle(source: SnapshotSource, row: &'static str, gated: bool) -> Lifecycl
         }
         let mut cycles = settle(&mut home, &server, &recording);
         let mut walks = cycles.iter().filter(|cycle| walked(cycle)).count();
+        let mut seen = Seen::now(source, &server);
         let mut expect = |cycle: Cycle, walk: bool, cycles: &mut Vec<Cycle>| {
             let walk = walk || !gated;
-            expect_pass(source, row, &cycle, walk);
+            expect_pass(source, row, &cycle, walk, &server, &mut seen);
             walks += usize::from(walk);
             cycles.push(cycle);
         };
@@ -564,6 +614,7 @@ fn no_hint_arm(
             settle(&mut home, &server, &recording)
         };
         let mut walks = cycles.iter().filter(|cycle| walked(cycle)).count();
+        let mut seen = Seen::now(source, &server);
         let backstop = WALK_GAP / STEP;
         for step in 1..=backstop + 1 {
             if step == 2 {
@@ -578,7 +629,7 @@ fn no_hint_arm(
             } else {
                 step == backstop || !gated
             };
-            expect_pass(source, row, &cycle, walk);
+            expect_pass(source, row, &cycle, walk, &server, &mut seen);
             walks += usize::from(walk);
             cycles.push(cycle);
         }
@@ -715,9 +766,13 @@ fn settled_loss_never_arms_and_the_next_pass_rediscloses_it() {
         assert!(cycle.gate["ownership_incomplete_file_count"].as_u64() > Some(0));
         assert_eq!(walk_idle::armed_for_test(source), None, "settled loss");
         for _ in 0..2 {
+            let sent = status_count(&server);
             let next = pass(&mut home, &server, &recording, STEP);
             assert!(walked(&next), "the next pass walks: {}", next.gate);
-            let status = server.statuses.lock().unwrap().last().cloned().unwrap();
+            assert_eq!(walk_idle::armed_for_test(source), None, "never arms");
+            assert!(status_count(&server) > sent, "each walk sends its receipt");
+            let status = last_status(&server);
+            assert_eq!(status["report_kind"], "scan_status", "{status}");
             let lost: u64 = [
                 "last_ownership_incomplete_file_count",
                 "last_zero_snapshot_usage_evidence_count",
@@ -807,4 +862,118 @@ fn lane_clears_drop_armed_records() {
             "{source:?}: requested"
         );
     }
+}
+
+/// Idle passes after an armed walk: no receipt reaches the server, so the
+/// walk's receipt is the last one it holds, and the walk's manifest stays
+/// cached for check-in beats.
+fn idle_passes_keep_the_walk(
+    home: &mut OracleHome,
+    server: &OracleServer,
+    recording: &Recording,
+    row: &str,
+) {
+    let receipt = last_status(server);
+    assert_eq!(receipt["report_kind"], "scan_status", "{row}: {receipt}");
+    assert_eq!(receipt["last_census_complete"], true, "{row}: {receipt}");
+    let published = manifest(home.source);
+    assert!(
+        published.is_some(),
+        "{row}: the walk published its manifest"
+    );
+    let sent = status_count(server);
+    for _ in 0..2 {
+        assert_idle(&pass(home, server, recording, STEP));
+        assert_eq!(
+            status_count(server),
+            sent,
+            "{row}: an idle pass sends no receipt"
+        );
+        assert_eq!(
+            last_status(server),
+            receipt,
+            "{row}: the walk's receipt stands"
+        );
+        assert_eq!(
+            manifest(home.source),
+            published,
+            "{row}: the walk's manifest"
+        );
+        assert!(walk_idle::armed_for_test(home.source).is_some(), "{row}");
+    }
+}
+
+/// A clean source settles, then idles without a receipt: the server keeps the
+/// walk's clean census and its manifest pairing.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn clean_source_idles_without_a_receipt() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for (source, row) in [
+        (SnapshotSource::ClaudeCode, "w15_claude"),
+        (SnapshotSource::Codex, "w15_codex"),
+        (SnapshotSource::Pi, "w15_pi"),
+    ] {
+        let recording = Recording::start();
+        let server = OracleServer::new(source, recording.handle());
+        let mut home = OracleHome::new(source, &server);
+        home.row = row;
+        install(&home);
+        let watched = roots(&home);
+        with_simulated_watch(&watched, || {
+            walk_idle::restart_for_test();
+            settle(&mut home, &server, &recording);
+            let receipt = last_status(&server);
+            assert!(receipt["last_error_code"].is_null(), "{row}: {receipt}");
+            idle_passes_keep_the_walk(&mut home, &server, &recording, row);
+        });
+    }
+}
+
+/// A standing terminal hold (a body the server dominates, settled
+/// unproven-terminal) is disclosed by the walk, which still arms: the next
+/// passes idle and send no receipt, so that disclosure is what the server
+/// last holds.
+#[test]
+#[serial]
+#[serial(source_cadences, source_manifests, client_report)]
+fn standing_terminal_hold_arms_and_idles() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let recording = Recording::start();
+    let source = SnapshotSource::ClaudeCode;
+    let server = OracleServer::new(source, recording.handle());
+    let mut home = OracleHome::new(source, &server);
+    home.row = "w16";
+    // A known reason is never re-offered: the refused entity settles.
+    *server.fallback.lock().unwrap() = Answer::Refuse("usage_accounting_authority_downgrade");
+    let watched = roots(&home);
+    with_simulated_watch(&watched, || {
+        walk_idle::restart_for_test();
+        settle(&mut home, &server, &recording);
+        let index = ScanIndex::load(&home.index_path()).unwrap();
+        assert_eq!(
+            index.snapshot_unproven_terminal_count(),
+            1,
+            "a standing hold"
+        );
+        let receipt = last_status(&server);
+        assert_eq!(
+            receipt["last_snapshot_unproven_terminal_count"], 1,
+            "disclosed: {receipt}"
+        );
+        assert!(
+            receipt["last_ownership_incomplete_file_count"].as_u64() >= Some(1),
+            "{receipt}"
+        );
+        assert!(
+            !receipt["last_error_code"].is_null(),
+            "disclosed: {receipt}"
+        );
+        idle_passes_keep_the_walk(&mut home, &server, &recording, "w16");
+    });
 }
