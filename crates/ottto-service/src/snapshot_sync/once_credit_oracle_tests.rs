@@ -405,6 +405,9 @@ impl Drop for EvidenceSchedule {
 impl OracleHome {
     fn new(source: SnapshotSource, server: &OracleServer) -> Self {
         crate::client_report::reset_for_test();
+        // Release the native sessions of earlier homes whose directories are
+        // gone, so one test process does not run out of descriptors.
+        crate::snapshots::state_v2::close_removed_routes_for_test();
         let mut fixture = IdentityPipelineHome::new();
         fixture.base = fixture.base.canonicalize().unwrap();
         fixture.home = fixture.home.canonicalize().unwrap();
