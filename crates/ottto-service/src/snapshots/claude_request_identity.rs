@@ -250,8 +250,11 @@ pub(crate) enum Refusal {
     IncompleteEvidence,
 }
 
-/// Closed local diagnostic labels, one per route that raises
-/// `request_identity_refusals`; append-only. Counts only, never on the wire.
+/// Closed local diagnostic labels for refusal events in one tagging attempt:
+/// classifier reasons and the two other `add_at` arms per request,
+/// `cost_missing_collapse` per bucket row, `over_cap_strip` per body that took
+/// the full-strip fallback. Partial cap recovery and share protection count in
+/// `identity_cap`. Append-only; counts only, never on the wire.
 const REFUSAL_CAUSES: [&str; 11] = [
     "conflicting_duplicate",
     "foreign_owner",

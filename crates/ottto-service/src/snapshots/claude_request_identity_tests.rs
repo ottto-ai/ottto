@@ -957,8 +957,8 @@ fn byte_cap_diagnostic_measures_tagged_attempt_and_preserves_full_strip() {
     );
 }
 
-/// Every route that raises `request_identity_refusals` counts under its own
-/// closed label in the page's identity counts, and under no other label.
+/// Each refusal event counts under its own closed label in the page's
+/// identity counts, and under no other label.
 #[test]
 fn refusal_causes_count_under_their_own_label() {
     let refusals = || {
@@ -1006,16 +1006,20 @@ fn refusal_causes_count_under_their_own_label() {
     let contributions = (1..=rows.len())
         .map(|n| contribution(&item, 1, Some("1"), login_key(&format!("{n:064x}"))))
         .collect::<Vec<_>>();
-    identity::apply(&mut item, &contributions).unwrap();
-    let counted = refusals();
-    assert_eq!(counted["row_authority_cap"], 1, "{counted}");
-    let classified = counted
-        .as_object()
-        .unwrap()
-        .keys()
-        .filter(|label| !matches!(label.as_str(), "row_authority_cap" | "over_cap_strip"))
-        .collect::<Vec<_>>();
-    assert!(classified.is_empty(), "{counted}");
+    // Its only bucket cannot be retained, so the body is fully stripped.
+    let result = identity::apply(&mut item, &contributions).unwrap();
+    let Tagged::Fallback {
+        over_cap,
+        refusals: 1,
+    } = result
+    else {
+        panic!("{result:?}");
+    };
+    assert!(over_cap.contains(&identity::OverCap::AuthorityKeys));
+    assert_eq!(
+        refusals(),
+        json!({"row_authority_cap": 1, "over_cap_strip": 1})
+    );
 
     // Unsplittable app-reported money collapses the row to untagged.
     let mut item = one_row_item(&[(10, Some("1")), (20, None)]);
