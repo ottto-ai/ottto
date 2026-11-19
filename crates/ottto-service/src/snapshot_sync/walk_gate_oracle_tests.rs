@@ -949,11 +949,23 @@ fn standing_terminal_hold_arms_and_idles() {
     let server = OracleServer::new(source, recording.handle());
     let mut home = OracleHome::new(source, &server);
     home.row = "w16";
-    // A known reason is never re-offered: the refused entity settles.
-    *server.fallback.lock().unwrap() = Answer::Refuse("usage_accounting_authority_downgrade");
     let watched = roots(&home);
     with_simulated_watch(&watched, || {
         walk_idle::restart_for_test();
+        settle(&mut home, &server, &recording);
+        // A standing terminal hold: an entity whose reconstruction ladder is
+        // exhausted. Every receipt discloses it and nothing re-offers it.
+        let mut index = ScanIndex::load(&home.index_path()).unwrap();
+        let mut record = crate::snapshots::snapshot_quarantine_record(source);
+        record.upload_body_witness = Some("b".repeat(64));
+        record.retry_after_unix_seconds = 0;
+        record.failed_reconstruction_count = MAX_SNAPSHOT_RECONSTRUCTION_FAILURES;
+        record.disposition = SnapshotQuarantineDisposition::UnprovenTerminal;
+        index
+            .quarantined_snapshot_fingerprints
+            .insert("d".repeat(64), record);
+        index.save_fixture(&home.index_path()).unwrap();
+        // The moved store walks, and that walk arms despite the standing hold.
         settle(&mut home, &server, &recording);
         let index = ScanIndex::load(&home.index_path()).unwrap();
         assert_eq!(
