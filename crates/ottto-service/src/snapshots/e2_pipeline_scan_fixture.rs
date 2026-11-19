@@ -5,7 +5,9 @@ use crate::transcript_acquisition::Scope;
 #[path = "e2_pipeline_twin_diagnostics.rs"]
 pub(crate) mod twin_diagnostics;
 
-pub(crate) use crate::snapshots::upload::freshness_debt::tests::assert_file_receipt_retires_debt;
+pub(crate) use crate::snapshots::upload::freshness_debt::tests::{
+    assert_file_debt_retired, assert_file_receipt_retires_debt,
+};
 
 /// The sampled scope and identity-capture mode this fixture's scans bind.
 fn scan_binding(source: SnapshotSource) -> (Scope, bool) {

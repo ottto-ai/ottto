@@ -1386,8 +1386,25 @@ pub(super) fn prepare_upload_progress_for_cycle_with_reoffer(
     let same_index_replay = index.historical_replay_generation_matches(replay_generation);
     let mut progress_changed = upload_progress.prepare_historical_replay(replay_generation);
     if same_index_replay {
-        progress_changed |=
-            upload_progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints);
+        // A terminal hold from before this replay stays in the index for its
+        // disclosure until a page parses its entity; until then it must not
+        // suppress that entity's re-entry, as it does not on the first page.
+        let parsed = index
+            .file_snapshot_fingerprints
+            .values()
+            .flatten()
+            .collect::<BTreeSet<_>>();
+        let holds = index
+            .quarantined_snapshot_fingerprints
+            .iter()
+            .filter(|(fingerprint, record)| {
+                parsed.contains(fingerprint)
+                    || record.contract_retry_claims.is_some()
+                    || record.disposition != SnapshotQuarantineDisposition::UnprovenTerminal
+            })
+            .map(|(fingerprint, record)| (fingerprint.clone(), record.clone()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        progress_changed |= upload_progress.prepare_quarantine_retries(&holds);
     }
     progress_changed
 }

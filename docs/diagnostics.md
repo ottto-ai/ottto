@@ -2455,7 +2455,16 @@ cannot be read. Each listed file's owed changes are kept as metadata of its
 or rewrite adds a revision timed at the live mtime, and only the file's own
 matched exact upload receipt retires it, and only the prefix it covers (a newer
 suffix keeps its own time and bytes). A stamp match, a read, a hold or a newer
-receipt elsewhere retires nothing. A rewritten file folds its old debt into the
+receipt elsewhere retires nothing. One answer stands in for the receipt that no
+stored body can earn: `unchanged` with `unchanged_basis: usage_identical` says
+the server already holds that body's usage. The daemon then holds the exact body
+terminally at once, so it is not offered again (a current-context re-offer
+answered `dominated_by_head` keeps its 6 h, then 12 h retry). For a file with one
+entity, the walk retires the read prefix as a receipt would, while the index
+still holds that body under the same destination, upload context and replay
+generation. The
+answer is kept in process memory only: a restart before the walk that lists
+the file leaves its debt held until the file changes. A rewritten file folds its old debt into the
 new object with the earliest time. Compressed Codex extents count by compressed size, and
 outside the discovery window no new debt starts. `outstanding_files` counts every
 owed file, `held_files` those whose debt is read or held rather than unread

@@ -27,7 +27,7 @@ fn items(count: usize) -> Vec<SnapshotItem> {
 }
 
 /// A hash-neutral change to a witnessed leaf: same entity, different body.
-fn change_witnessed_body(item: &mut SnapshotItem) {
+pub(super) fn change_witnessed_body(item: &mut SnapshotItem) {
     item.tool_usage
         .get_or_insert_with(Vec::new)
         .push(crate::snapshots::SnapshotToolUsage {

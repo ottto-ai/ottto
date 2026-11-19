@@ -1159,6 +1159,12 @@ where
             .filter(|entity| entity.unchanged_basis.is_some())
             .map(|entity| entity.snapshot_fingerprint.as_str())
             .collect::<BTreeSet<_>>();
+        let usage_identical = response
+            .unchanged_entities
+            .iter()
+            .filter(|entity| entity.unchanged_basis.as_deref() == Some("usage_identical"))
+            .map(|entity| entity.snapshot_fingerprint.as_str())
+            .collect::<BTreeSet<_>>();
         let settled = response
             .accepted_entities
             .iter()
@@ -1222,7 +1228,11 @@ where
                         .map(|entity| (*entity, witness.as_str())),
                 )?;
             } else if not_stored.contains(item_fingerprint) {
-                progress.hold_unstored_body(item_fingerprint, &body_witness(item));
+                progress.hold_unstored_body(
+                    item_fingerprint,
+                    &body_witness(item),
+                    usage_identical.contains(item_fingerprint),
+                );
                 progress
                     .context_resend
                     .not_stored
@@ -1230,11 +1240,7 @@ where
             }
         }
         if !not_stored.is_empty() {
-            let usage_identical = response
-                .unchanged_entities
-                .iter()
-                .filter(|entity| entity.unchanged_basis.as_deref() == Some("usage_identical"))
-                .count();
+            let usage_identical = usage_identical.len();
             eprintln!(
                 "local snapshot unchanged not stored for {poison_scope}: count={} \
                  usage_identical={usage_identical} other={}; exact bodies held, not marked emitted",

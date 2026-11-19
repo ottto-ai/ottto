@@ -173,14 +173,30 @@ pub(in crate::snapshots) struct Fixture {
 }
 impl Fixture {
     pub(in crate::snapshots) fn new(store: Source, name: &str) -> Self {
+        Self::at_destination(store, name, &"a".repeat(64))
+    }
+    /// A fixture whose Tail route is bound to the `destination` namespace.
+    fn at_destination(store: Source, name: &str, destination: &str) -> Self {
         restart();
         let dir = crate::test_scratch::canonical_private_dir(name);
         let root = dir.join("root");
         std::fs::create_dir_all(&root).unwrap();
-        let (session, index) = crate::snapshots::StateV2ColdSession::publish(
-            store,
+        let progress = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 3,
+            "destination_namespace_hash": destination,
+        }))
+        .unwrap();
+        let route = dir
+            .join("store/snapshots/destinations")
+            .join(destination)
+            .join(format!(
+                "{}-synthetic-scan-index.json",
+                store.snapshot().api_slug()
+            ));
+        let (session, index) = crate::snapshots::StateV2ColdSession::publish_at(
             &ScanIndex::default(),
-            &dir.join("store"),
+            &route,
+            &progress,
         );
         Self {
             index,
@@ -1018,6 +1034,20 @@ pub(crate) fn assert_file_receipt_retires_debt(
     delivered: bool,
     accept_receipt: impl FnOnce(&mut ScanIndex),
 ) {
+    assert_file_debt_retired(items, delivered, delivered, |index, _| {
+        accept_receipt(index)
+    });
+}
+
+/// `settle` runs under the fixture's upload context (its second argument):
+/// the file then has a receipt exactly when `receipted`, and its held debt is
+/// retired exactly when `retired`.
+pub(crate) fn assert_file_debt_retired(
+    items: &[SnapshotItem],
+    receipted: bool,
+    retired: bool,
+    settle: impl FnOnce(&mut ScanIndex, &str),
+) {
     let mut f = Fixture::new(Source::Claude, "stale-file-receipt");
     let path = f.file("session.jsonl", 100);
     age(&path, 9 * HOUR);
@@ -1043,21 +1073,294 @@ pub(crate) fn assert_file_receipt_retires_debt(
     f.save();
     f.index
         .activate_file_upload_context(f.source, CONTEXT.into());
-    accept_receipt(&mut f.index);
+    settle(&mut f.index, CONTEXT);
     assert_eq!(
         f.index.files[&key].upload_context_receipt.is_some(),
-        delivered
+        receipted
     );
     let after = f.walk();
-    assert_eq!(after["debt"]["over_6h_files"], u64::from(!delivered));
-    assert_eq!(after["debt"]["outstanding_files"], u64::from(!delivered));
+    assert_eq!(after["debt"]["over_6h_files"], u64::from(!retired));
+    assert_eq!(after["debt"]["outstanding_files"], u64::from(!retired));
     f.save();
-    assert_eq!(committed(&f.index, &path).is_empty(), delivered);
+    assert_eq!(committed(&f.index, &path).is_empty(), retired);
     assert_eq!(
         f.index.files[&key].upload_context_receipt.is_some(),
-        delivered
+        receipted
     );
     f.close();
+}
+
+fn hex(n: u64) -> String {
+    format!("{n:064x}")
+}
+
+/// A read file aged 9 h whose `entities` the index holds terminally with the
+/// exact `body`, as a `usage_identical` answer leaves them; no receipt.
+fn usage_identical_file(f: &mut Fixture, entities: &[String], body: &str) -> PathBuf {
+    let path = f.file("session.jsonl", 100);
+    age(&path, 9 * HOUR);
+    let key = local_index_key(&path);
+    let mut stored = entry(&path);
+    stored.last_upload_body_witness = Some(snapshot_file_upload_body_set_hex([body]));
+    f.index.files.insert(key.clone(), stored);
+    f.index
+        .file_snapshot_fingerprints
+        .insert(key, entities.iter().cloned().collect());
+    for entity in entities {
+        let mut hold = snapshot_quarantine_record(f.source);
+        hold.upload_body_witness = Some(body.into());
+        hold.failed_reconstruction_count = MAX_SNAPSHOT_RECONSTRUCTION_FAILURES;
+        hold.disposition = SnapshotQuarantineDisposition::UnprovenTerminal;
+        hold.retry_after_unix_seconds = 0;
+        f.index
+            .quarantined_snapshot_fingerprints
+            .insert(entity.clone(), hold);
+    }
+    f.index
+        .activate_file_upload_context(f.source, CONTEXT.into());
+    path
+}
+
+/// The destination namespace the index's Tail route is bound to.
+fn destination(index: &ScanIndex) -> String {
+    let route = state_v2::tail_route_path(index).unwrap().unwrap();
+    crate::snapshots::scan_index_integration::scan_index_storage_binding(&route)
+        .unwrap()
+        .namespace_hash
+}
+
+/// The note `hold_unstored_body` leaves for a `usage_identical` answer, in
+/// the index's own destination, upload context and replay generation.
+fn note(index: &ScanIndex, entity: &str, body: &str) {
+    money_freshness::note_usage_identical(
+        entity,
+        &destination(index),
+        CONTEXT,
+        index.historical_replay_generation.as_deref(),
+        body,
+    );
+}
+
+/// [regress] [money] A `usage_identical` answer stands in for the receipt of
+/// a one-entity file only for its exact read body, in the upload context and
+/// replay generation it was given in, while the index still holds that body
+/// terminally. Every other shape stays held. A same-stem confirmed-empty
+/// sibling in a second folder keeps its own empty proof, byte for byte.
+#[test]
+fn usage_identical_note_retires_only_its_exact_one_entity_body() {
+    type Case = fn(&mut ScanIndex, &str, &str);
+    let cases: [(&str, usize, bool, Case); 10] = [
+        ("noted", 1, true, |index, entity, body| {
+            note(index, entity, body)
+        }),
+        ("no note", 1, false, |_, _, _| {}),
+        ("note of another body", 1, false, |index, entity, _| {
+            note(index, entity, &hex(0xb2))
+        }),
+        ("file witness unknown", 1, false, |index, entity, body| {
+            note(index, entity, body);
+            for entry in index.files.values_mut() {
+                entry.last_upload_body_witness = None;
+            }
+        }),
+        ("two entities, both noted", 2, false, |index, _, body| {
+            for entity in [hex(1), hex(2)] {
+                note(index, &entity, body);
+            }
+        }),
+        (
+            "another account's context",
+            1,
+            false,
+            |index, entity, body| {
+                money_freshness::note_usage_identical(
+                    entity,
+                    &destination(index),
+                    "another-account-context",
+                    index.historical_replay_generation.as_deref(),
+                    body,
+                )
+            },
+        ),
+        (
+            "another replay generation",
+            1,
+            false,
+            |index, entity, body| {
+                money_freshness::note_usage_identical(
+                    entity,
+                    &destination(index),
+                    CONTEXT,
+                    Some("another-replay-generation"),
+                    body,
+                )
+            },
+        ),
+        ("another destination", 1, false, |index, entity, body| {
+            money_freshness::note_usage_identical(
+                entity,
+                &hex(0xd),
+                CONTEXT,
+                index.historical_replay_generation.as_deref(),
+                body,
+            )
+        }),
+        (
+            "the index holds another body",
+            1,
+            false,
+            |index, entity, body| {
+                note(index, entity, body);
+                index
+                    .quarantined_snapshot_fingerprints
+                    .get_mut(entity)
+                    .unwrap()
+                    .upload_body_witness = Some(hex(0xb2));
+            },
+        ),
+        (
+            "a later hold dropped the note",
+            1,
+            false,
+            |index, entity, body| {
+                note(index, entity, body);
+                money_freshness::forget_usage_identical(entity);
+            },
+        ),
+    ];
+    for (case, entity_count, retired, settle) in cases {
+        let mut f = Fixture::new(Source::Claude, "usage-identical-note");
+        let entities = (1..=entity_count as u64).map(hex).collect::<Vec<_>>();
+        let body = hex(0xb1);
+        let path = usage_identical_file(&mut f, &entities, &body);
+        let second = f.root.join("second-project");
+        std::fs::create_dir_all(&second).unwrap();
+        let sibling = second.join("session.jsonl");
+        std::fs::write(&sibling, b"{}\n").unwrap();
+        age(&sibling, 9 * HOUR);
+        let sibling_key = local_index_key(&sibling);
+        f.index.files.insert(sibling_key.clone(), entry(&sibling));
+        f.index.confirmed_empty_files.insert(sibling_key.clone());
+        accept(f.source, &mut f.index, &sibling);
+        let empty = f.index.files.get_mut(&sibling_key).unwrap();
+        empty.last_upload_body_witness = None;
+        empty
+            .upload_context_receipt
+            .as_mut()
+            .unwrap()
+            .body_witness
+            .clear();
+        let proof = f.index.files[&sibling_key].upload_context_receipt.clone();
+
+        let before = f.walk();
+        assert_eq!(before["debt"]["outstanding_files"], 1, "{case}");
+        assert_eq!(before["debt"]["held_files"], 1, "{case}");
+        f.save();
+        f.index
+            .activate_file_upload_context(f.source, CONTEXT.into());
+        settle(&mut f.index, &entities[0], &body);
+        let after = f.walk();
+        assert_eq!(
+            after["debt"]["outstanding_files"],
+            u64::from(!retired),
+            "{case}"
+        );
+        assert_eq!(
+            after["debt"]["no_upload_required_files"], before["debt"]["no_upload_required_files"],
+            "{case}"
+        );
+        f.save();
+        assert_eq!(committed(&f.index, &path).is_empty(), retired, "{case}");
+        assert!(committed(&f.index, &sibling).is_empty(), "{case}");
+        assert_eq!(
+            f.index.files[&sibling_key].upload_context_receipt, proof,
+            "{case}"
+        );
+        assert!(f.index.confirmed_empty_files.contains(&sibling_key));
+        assert!(f.index.files[&local_index_key(&path)]
+            .upload_context_receipt
+            .is_none());
+        f.close();
+    }
+}
+
+/// [regress] [money] Two destinations of one account share the upload
+/// context, and neither has a replay generation. Destination A's
+/// `usage_identical` answer clears A's file only: B holds the same entity and
+/// exact body terminally, with the same file witness, and stays held.
+#[test]
+fn usage_identical_note_of_one_destination_leaves_another_held() {
+    let entity = hex(1);
+    let body = hex(0xb1);
+    let mut a = Fixture::at_destination(Source::Claude, "usage-identical-a", &hex(0xa));
+    let mut b = Fixture::at_destination(Source::Claude, "usage-identical-b", &hex(0xb));
+    let mut paths = Vec::new();
+    for f in [&mut a, &mut b] {
+        paths.push(usage_identical_file(
+            f,
+            std::slice::from_ref(&entity),
+            &body,
+        ));
+        assert_eq!(f.walk()["debt"]["outstanding_files"], 1);
+        f.save();
+        f.index
+            .activate_file_upload_context(f.source, CONTEXT.into());
+        assert_eq!(f.index.historical_replay_generation, None);
+    }
+    assert_eq!(destination(&a.index), hex(0xa));
+    assert_eq!(destination(&b.index), hex(0xb));
+    note(&a.index, &entity, &body);
+    for (f, path, retired) in [(&mut a, &paths[0], true), (&mut b, &paths[1], false)] {
+        assert_eq!(f.walk()["debt"]["outstanding_files"], u64::from(!retired));
+        f.save();
+        assert_eq!(committed(&f.index, path).is_empty(), retired);
+    }
+    a.close();
+    b.close();
+}
+
+/// [regress] The note lives in this process only. Cleared and saved, a file
+/// stays clear after a restart while the last complete walk began after its
+/// change. A restart before the clearing walk, or no complete walk since the
+/// change, leaves the read prefix held again.
+#[test]
+fn usage_identical_clearing_survives_a_restart_only_after_its_complete_walk() {
+    for (case, restart_before_walk, complete_since_change) in [
+        ("cleared, saved, restarted", false, true),
+        ("restarted before the clearing walk", true, true),
+        ("no complete walk since the change", false, false),
+    ] {
+        let mut f = Fixture::new(Source::Claude, "usage-identical-restart");
+        let entity = hex(1);
+        let body = hex(0xb1);
+        let path = usage_identical_file(&mut f, std::slice::from_ref(&entity), &body);
+        assert_eq!(f.walk()["debt"]["outstanding_files"], 1, "{case}");
+        f.save();
+        f.index
+            .activate_file_upload_context(f.source, CONTEXT.into());
+        note(&f.index, &entity, &body);
+        if restart_before_walk {
+            restart();
+        }
+        let cleared = f.walk()["debt"]["outstanding_files"] == 0;
+        assert_eq!(cleared, !restart_before_walk, "{case}");
+        f.save();
+        assert_eq!(committed(&f.index, &path).is_empty(), cleared, "{case}");
+        if !complete_since_change {
+            // The last complete walk began before the file's change.
+            f.index.tail_discovery.last_complete_discovery_at = Some(1);
+        }
+        restart();
+        f.index
+            .activate_file_upload_context(f.source, CONTEXT.into());
+        let held = restart_before_walk || !complete_since_change;
+        assert_eq!(
+            f.walk()["debt"]["outstanding_files"],
+            u64::from(held),
+            "{case}"
+        );
+        f.close();
+    }
 }
 
 /// Commits a Codex Tail head for `path` whose certificate is the same object
