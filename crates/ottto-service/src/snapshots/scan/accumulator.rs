@@ -1044,6 +1044,14 @@ fn repository_identity_cache() -> &'static Mutex<RepositoryIdentityCache> {
     CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
+/// Rest-heap diagnostics: cached workspaces, or None while busy.
+pub(in crate::snapshots) fn repository_identity_entries() -> Option<usize> {
+    repository_identity_cache()
+        .try_lock()
+        .ok()
+        .map(|cache| cache.len())
+}
+
 fn fresh_repository_identity(
     cache: &RepositoryIdentityCache,
     workspace: &Path,

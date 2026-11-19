@@ -1583,6 +1583,11 @@ use session_facts::display_title::{
 };
 
 mod scan;
+
+/// Rest-heap diagnostics: cached repository identities, or None while busy.
+pub(crate) fn repository_identity_entries() -> Option<usize> {
+    scan::accumulator::repository_identity_entries()
+}
 use scan::source_session_id::codex_identity_is_uuid_shaped;
 
 #[cfg(test)]

@@ -182,6 +182,11 @@ fn states() -> &'static Mutex<BTreeMap<PathBuf, RouteHandle>> {
     STATES.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
+/// Rest-heap diagnostics: open store routes, or None while busy.
+pub(super) fn route_entries() -> Option<usize> {
+    states().try_lock().ok().map(|states| states.len())
+}
+
 /// Cold-close one saved synthetic route; leave every durable row and fence intact.
 #[cfg(test)]
 pub(crate) fn cold_close_for_test(path: &Path) -> Result<()> {

@@ -477,6 +477,18 @@ fields are
 inline stack storage, and conservatively charge shared buffers per owner.
 Codex sidecar facts retain only the active cycle scope; a scope change drops
 the previous scope's idle facts when the new pass returns its facts.
+
+`process_rest_heap` is one row per ordinary sync cycle, written by the sync
+loop after the cycle and never inside a pass. It reports what the process holds
+at rest: `malloc_in_use_bytes` (macOS), `sqlite_memory_used_bytes` and
+`sqlite_memory_highwater_bytes` (SQLite's own heap across every connection),
+and entry counts for process-lifetime maps: `rearm_clear_tags`,
+`rearm_open_pages`, `counted_poison_scopes`, `counted_poison_fingerprints`,
+`telemetry_notice_dirs`, `telemetry_notice_roots`, `state_v2_routes`,
+`grant_rebind_refusals`, `claude_token_owners`, `claude_spawn_admitted`, and
+`repository_identities`. Counts only, never keys. A map whose lock is busy
+reports `null` instead of waiting. A count that keeps rising across quiet hours
+names the map behind a rising rest footprint.
 Unknown/unsupported charges or busy cache locks are `null`, never invented
 zeros; finishes without the capture omit the object. Title facts use completion
 accounting with a separate existing visit counter per cached entry; ordinary

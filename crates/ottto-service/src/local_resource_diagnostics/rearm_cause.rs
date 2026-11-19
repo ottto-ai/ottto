@@ -160,6 +160,13 @@ pub(crate) fn full_by_parse_reason(page: Instant) -> super::claude_reread::FullB
             .unwrap_or_default()
     })
 }
+/// Rest-heap diagnostics: outstanding clear tags and still-open page rows.
+pub(crate) fn rest_entries() -> (usize, usize) {
+    (
+        with_tags(|tags| tags.0.len()),
+        with_pages(|pages| pages.len()),
+    )
+}
 pub(crate) fn finish_page(page: Instant) {
     with_pages(|pages| {
         pages.remove(&page);

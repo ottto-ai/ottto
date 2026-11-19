@@ -121,6 +121,8 @@ pub fn spawn_local_snapshot_sync(daemon: LocalDaemon) -> Result<()> {
                         crate::net_resilience::handle_sync_failure(&daemon);
                     }
                 }
+                // Between passes: report what the process holds at rest.
+                crate::local_resource_diagnostics::rest_heap::emit();
                 // The cycle cadence itself is unchanged. What the tiers gate is the
                 // expensive part — the local transcript scan and its upload — while
                 // agent-status/quota freshness has an independent source owner.
