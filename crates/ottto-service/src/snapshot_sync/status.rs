@@ -208,6 +208,16 @@ impl SyncCounts {
             || self.dropped_usage_record_count > 0
     }
 
+    /// This walk's own loss. Standing terminal holds (`standing`) are disclosed
+    /// again by every receipt, idle ones included, so they do not count.
+    pub(super) fn has_walk_loss(&self, standing: u64) -> bool {
+        self.ownership_incomplete_file_count
+            .saturating_sub(standing)
+            > 0
+            || self.zero_snapshot_usage_evidence_count > 0
+            || self.dropped_usage_record_count > 0
+    }
+
     pub(super) fn disclosed_loss(&self) -> DisclosedLoss {
         // A partial census is itself unsettled evidence even when it has not
         // yet populated one of the public loss counters. In particular,
