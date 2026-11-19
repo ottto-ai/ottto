@@ -933,61 +933,30 @@ fn clean_source_idles_without_a_receipt() {
     }
 }
 
-/// A standing terminal hold (a body the server dominates, settled
-/// unproven-terminal) is disclosed by the walk, which still arms: the next
-/// passes idle and send no receipt, so that disclosure is what the server
-/// last holds.
+/// A standing terminal hold is disclosed by every receipt but is not this
+/// walk's loss, so it does not keep the gate from arming; real loss still does.
 #[test]
-#[serial]
-#[serial(source_cadences, source_manifests, client_report)]
-fn standing_terminal_hold_arms_and_idles() {
-    if !crate::heap_layout_bound::layout_supported() {
-        return;
-    }
-    let recording = Recording::start();
-    let source = SnapshotSource::ClaudeCode;
-    let server = OracleServer::new(source, recording.handle());
-    let mut home = OracleHome::new(source, &server);
-    home.row = "w16";
-    let watched = roots(&home);
-    with_simulated_watch(&watched, || {
-        walk_idle::restart_for_test();
-        settle(&mut home, &server, &recording);
-        // A standing terminal hold: an entity whose reconstruction ladder is
-        // exhausted. Every receipt discloses it and nothing re-offers it.
-        let mut index = ScanIndex::load(&home.index_path()).unwrap();
-        let mut record = crate::snapshots::snapshot_quarantine_record(source);
-        record.upload_body_witness = Some("b".repeat(64));
-        record.retry_after_unix_seconds = 0;
-        record.failed_reconstruction_count = MAX_SNAPSHOT_RECONSTRUCTION_FAILURES;
-        record.disposition = SnapshotQuarantineDisposition::UnprovenTerminal;
-        index
-            .quarantined_snapshot_fingerprints
-            .insert("d".repeat(64), record);
-        index.save_fixture(&home.index_path()).unwrap();
-        // The moved store walks, and that walk arms despite the standing hold.
-        settle(&mut home, &server, &recording);
-        let index = ScanIndex::load(&home.index_path()).unwrap();
-        assert_eq!(
-            index.snapshot_unproven_terminal_count(),
-            1,
-            "a standing hold"
-        );
-        let receipt = last_status(&server);
-        assert_eq!(
-            receipt["last_snapshot_unproven_terminal_count"], 1,
-            "disclosed: {receipt}"
-        );
-        assert!(
-            receipt["last_ownership_incomplete_file_count"].as_u64() >= Some(1),
-            "{receipt}"
-        );
-        assert!(
-            !receipt["last_error_code"].is_null(),
-            "disclosed: {receipt}"
-        );
-        idle_passes_keep_the_walk(&mut home, &server, &recording, "w16");
-    });
+fn a_standing_terminal_hold_is_not_walk_loss() {
+    let mut index = ScanIndex::default();
+    let mut record = crate::snapshots::snapshot_quarantine_record(SnapshotSource::ClaudeCode);
+    record.failed_reconstruction_count = MAX_SNAPSHOT_RECONSTRUCTION_FAILURES;
+    record.disposition = SnapshotQuarantineDisposition::UnprovenTerminal;
+    index
+        .quarantined_snapshot_fingerprints
+        .insert("d".repeat(64), record);
+    let counts = SyncCounts::for_policy(30).with_snapshot_terminal_counts(&index);
+    assert_eq!(counts.snapshot_unproven_terminal_count, 1);
+    assert!(
+        counts.has_disclosed_loss(),
+        "the receipt discloses the hold"
+    );
+    assert!(
+        !counts.has_walk_loss(&index),
+        "but it is not this walk's loss"
+    );
+    let mut lossy = SyncCounts::for_policy(30).with_snapshot_terminal_counts(&index);
+    lossy.ownership_incomplete_file_count += 1;
+    assert!(lossy.has_walk_loss(&index), "one more incomplete file is");
 }
 
 /// The cycle-start beat of an armed source carries no scan start, so the

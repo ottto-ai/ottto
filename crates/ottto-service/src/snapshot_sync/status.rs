@@ -208,9 +208,11 @@ impl SyncCounts {
             || self.dropped_usage_record_count > 0
     }
 
-    /// This walk's own loss. Standing terminal holds (`standing`) are disclosed
-    /// again by every receipt, idle ones included, so they do not count.
-    pub(super) fn has_walk_loss(&self, standing: u64) -> bool {
+    /// This walk's own loss. Standing terminal holds are disclosed again by
+    /// every receipt, idle ones included, so they do not count.
+    pub(super) fn has_walk_loss(&self, index: &ScanIndex) -> bool {
+        let standing = self.snapshot_unproven_terminal_count
+            + index.claude_usage_authority_terminal_entity_count() as u64;
         self.ownership_incomplete_file_count
             .saturating_sub(standing)
             > 0

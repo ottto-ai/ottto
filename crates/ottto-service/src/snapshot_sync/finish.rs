@@ -2730,9 +2730,7 @@ pub(super) fn finish_sync_source(
         // This walk's loss blocks arming; standing terminal holds do not.
         let counts = SyncCounts::from_scan_result(&scan_result, accepted, receipt_window_days)
             .with_snapshot_terminal_counts(&index);
-        let standing = counts.snapshot_unproven_terminal_count
-            + index.claude_usage_authority_terminal_entity_count() as u64;
-        let loss_free = !counts.has_walk_loss(standing);
+        let loss_free = !counts.has_walk_loss(&index);
         report_status_with_fresh_relay_token(
             client,
             device,
