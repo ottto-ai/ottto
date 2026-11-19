@@ -957,6 +957,89 @@ fn byte_cap_diagnostic_measures_tagged_attempt_and_preserves_full_strip() {
     );
 }
 
+/// Every route that raises `request_identity_refusals` counts under its own
+/// closed label in the page's identity counts, and under no other label.
+#[test]
+fn refusal_causes_count_under_their_own_label() {
+    let refusals = || {
+        serde_json::to_value(identity::take_identity_counts()).unwrap()["request_identity_refusal"]
+            .clone()
+    };
+    let only = |label: &str| Value::Object([(label.to_string(), json!(1))].into_iter().collect());
+    let _ = refusals();
+    for (refusal, label) in [
+        (Refusal::ConflictingDuplicate, "conflicting_duplicate"),
+        (Refusal::ForeignOwner, "foreign_owner"),
+        (Refusal::InvalidEvidence, "invalid_evidence"),
+        (Refusal::ContradictoryOrg, "contradictory_org"),
+        (Refusal::BadClock, "bad_clock"),
+        (Refusal::UntrustedFlip, "untrusted_flip"),
+        (Refusal::IncompleteEvidence, "incomplete_evidence"),
+    ] {
+        let mut item = one_row_item(&[(10, Some("1")), (20, Some("2"))]);
+        let contributions = vec![
+            contribution(&item, 10, Some("1"), telemetry('a', 'd')),
+            contribution(&item, 20, Some("2"), RequestIdentity::Refused(refusal)),
+        ];
+        assert_eq!(
+            identity::apply(&mut item, &contributions),
+            Ok(Tagged::Sent { refusals: 1 }),
+            "{label}"
+        );
+        assert_eq!(refusals(), only(label));
+    }
+
+    let mut item = one_row_item(&[(10, Some("1")), (20, Some("2"))]);
+    let contributions = vec![
+        contribution(&item, 10, Some("1"), telemetry('a', 'd')),
+        contribution(&item, 20, Some("2"), login_key(&"C".repeat(64))),
+    ];
+    assert_eq!(
+        identity::apply(&mut item, &contributions),
+        Ok(Tagged::Sent { refusals: 1 })
+    );
+    assert_eq!(refusals(), only("invalid_login"));
+
+    // One more distinct login than a row may carry.
+    let rows = vec![(1, Some("1")); identity::MAX_AUTHORITY_KEYS + 1];
+    let mut item = one_row_item(&rows);
+    let contributions = (1..=rows.len())
+        .map(|n| contribution(&item, 1, Some("1"), login_key(&format!("{n:064x}"))))
+        .collect::<Vec<_>>();
+    identity::apply(&mut item, &contributions).unwrap();
+    let counted = refusals();
+    assert_eq!(counted["row_authority_cap"], 1, "{counted}");
+    let classified = counted
+        .as_object()
+        .unwrap()
+        .keys()
+        .filter(|label| !matches!(label.as_str(), "row_authority_cap" | "over_cap_strip"))
+        .collect::<Vec<_>>();
+    assert!(classified.is_empty(), "{counted}");
+
+    // Unsplittable app-reported money collapses the row to untagged.
+    let mut item = one_row_item(&[(10, Some("1")), (20, None)]);
+    let contributions = vec![
+        contribution(&item, 10, Some("1"), telemetry('a', 'd')),
+        contribution(&item, 20, None, telemetry('b', 'd')),
+    ];
+    assert_eq!(
+        identity::apply(&mut item, &contributions),
+        Ok(Tagged::Sent { refusals: 1 })
+    );
+    assert_eq!(refusals(), only("cost_missing_collapse"));
+
+    // A body over the byte cap is sent with every identity stripped.
+    let mut item = one_row_item(&[(10, None)]);
+    let request = contribution(&item, 10, None, login_key(OWNER_A));
+    identity::apply(&mut item, std::slice::from_ref(&request)).unwrap();
+    assert_eq!(refusals(), Value::Null);
+    item.session_display_name = Some("x".repeat(identity::MAX_ITEM_BYTES));
+    let result = identity::apply(&mut item, &[request]).unwrap();
+    assert!(matches!(result, Tagged::Fallback { .. }), "{result:?}");
+    assert_eq!(refusals(), only("over_cap_strip"));
+}
+
 // --- Classification ---------------------------------------------------------
 
 const ROOT: &str = "1338a80a-f36e-4cbc-a5bb-50fc66430ba5";

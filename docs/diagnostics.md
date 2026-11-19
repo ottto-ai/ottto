@@ -2355,6 +2355,22 @@ hint or display cannot prove the backend's parent binding. Zero
 `same_as_parent` is explicit when this object is present. Counts describe tagging
 attempts, including retries, rather than distinct sessions.
 
+`native_collection_page.counts.request_identity_refusal` names why usage was
+left untagged with a refusal, as sparse page counts under closed, append-only
+labels. Requests whose own identity evidence was refused, by classifier
+reason: `conflicting_duplicate`, `foreign_owner`, `invalid_evidence`,
+`contradictory_org`, `bad_clock`, `untrusted_flip`, `incomplete_evidence`;
+plus `invalid_login` (a login that is not lowercase hex) and
+`row_authority_cap` (a row already carrying its maximum authority keys).
+`cost_missing_collapse` counts bucket rows left untagged because app-reported
+money could not be split per request, and `over_cap_strip` counts bodies sent
+with every identity stripped. Like `identity_cap`, counts describe tagging
+attempts, including retries and held bodies. A request-owned body is grouped
+after its account fold has already placed each request or left it unknown, so
+its refusals appear only under the row and body labels. The
+`accepted_share_changed` and `unpriced_part_untagged` routes above are not
+repeated here. No id, key, path or session text is recorded.
+
 Within the existing item caps, acknowledged tagged buckets have priority over
 never-acknowledged buckets. If those accepted buckets overflow, a fitting open
 current-hour accepted bucket has priority; settled buckets are considered newest first, preferring to drop the oldest

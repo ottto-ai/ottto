@@ -250,6 +250,77 @@ pub(crate) enum Refusal {
     IncompleteEvidence,
 }
 
+/// Closed local diagnostic labels, one per route that raises
+/// `request_identity_refusals`; append-only. Counts only, never on the wire.
+const REFUSAL_CAUSES: [&str; 11] = [
+    "conflicting_duplicate",
+    "foreign_owner",
+    "invalid_evidence",
+    "contradictory_org",
+    "bad_clock",
+    "untrusted_flip",
+    "incomplete_evidence",
+    "invalid_login",
+    "row_authority_cap",
+    "cost_missing_collapse",
+    "over_cap_strip",
+];
+const INVALID_LOGIN: usize = 7;
+const ROW_AUTHORITY_CAP: usize = 8;
+const COST_MISSING_COLLAPSE: usize = 9;
+const OVER_CAP_STRIP: usize = 10;
+type RefusalCauses = [u32; REFUSAL_CAUSES.len()];
+
+impl Refusal {
+    /// This reason's slot in `REFUSAL_CAUSES`.
+    const fn cause(self) -> usize {
+        match self {
+            Refusal::ConflictingDuplicate => 0,
+            Refusal::ForeignOwner => 1,
+            Refusal::InvalidEvidence => 2,
+            Refusal::ContradictoryOrg => 3,
+            Refusal::BadClock => 4,
+            Refusal::UntrustedFlip => 5,
+            Refusal::IncompleteEvidence => 6,
+        }
+    }
+}
+
+fn count_cause(causes: &mut RefusalCauses, cause: usize) {
+    causes[cause] = causes[cause].saturating_add(1);
+}
+
+crate::local_resource_diagnostics::process_static!(fn with_refusal_causes:
+    [std::sync::atomic::AtomicU64; REFUSAL_CAUSES.len()] =
+        [const { std::sync::atomic::AtomicU64::new(0) }; REFUSAL_CAUSES.len()]);
+
+/// Adds one tagging attempt's refusal causes to this page's counters.
+fn record_refusal_causes(causes: &RefusalCauses) {
+    if causes.iter().all(|count| *count == 0) {
+        return;
+    }
+    with_refusal_causes(|counters| {
+        for (counter, count) in counters.iter().zip(causes) {
+            let _ = counter.try_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |n| Some(n.saturating_add(u64::from(*count))),
+            );
+        }
+    });
+}
+
+fn take_refusal_causes() -> BTreeMap<&'static str, u64> {
+    with_refusal_causes(|counters| {
+        REFUSAL_CAUSES
+            .into_iter()
+            .zip(counters)
+            .map(|(label, counter)| (label, counter.swap(0, std::sync::atomic::Ordering::Relaxed)))
+            .filter(|(_, count)| *count != 0)
+            .collect()
+    })
+}
+
 /// Owned form of `IdentityRef`, for tests and the W0 builder oracle.
 #[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -467,6 +538,8 @@ pub(crate) struct Grouping {
     accepted_rows_vanished: u64,
     /// Why the caller found no accepted state, when it found none.
     accepted_miss: accepted::UnknownCause,
+    /// Requests refused here, by `REFUSAL_CAUSES` slot (local diagnostics).
+    refusal_causes: RefusalCauses,
     failed: Option<Ineligible>,
     /// Requests a `RequestSink` admitted: those the item's transcript holds,
     /// and telemetry-only (auxiliary) ones the reported rebuild added.
@@ -596,6 +669,7 @@ impl Grouping {
             accepted_share_changed: BTreeSet::new(),
             accepted_rows_vanished: 0,
             accepted_miss: accepted::UnknownCause::NoKey,
+            refusal_causes: [0; REFUSAL_CAUSES.len()],
             failed: None,
             transcript_requests: 0,
             telemetry_only_requests: 0,
@@ -671,6 +745,7 @@ impl Grouping {
             // else is refused here, never transformed into another identity.
             IdentityRef::Tagged(key) if !key.login.map_or(true, wire_login_is_valid) => {
                 group.refused = true;
+                count_cause(&mut self.refusal_causes, INVALID_LOGIN);
                 None
             }
             IdentityRef::Tagged(key) => {
@@ -693,12 +768,14 @@ impl Grouping {
                 } else {
                     group.truncated = true;
                     group.refused = true;
+                    count_cause(&mut self.refusal_causes, ROW_AUTHORITY_CAP);
                     None
                 }
             }
             IdentityRef::Missing => None,
-            IdentityRef::Refused(_) => {
+            IdentityRef::Refused(reason) => {
                 group.refused = true;
+                count_cause(&mut self.refusal_causes, reason.cause());
                 None
             }
         };
@@ -946,6 +1023,7 @@ fn apply_grouped_with_accepted(
     }
 
     // A row whose app-reported money cannot be split per request stays untagged.
+    let mut causes = grouping.refusal_causes;
     for group in grouping.groups.values_mut().flat_map(BTreeMap::values_mut) {
         let unsplittable =
             (0..5).any(|index| group.total.wire(index).is_some()) && group.total.cost_missing;
@@ -953,6 +1031,7 @@ fn apply_grouped_with_accepted(
             let total = group.total.clone();
             group.by_key = BTreeMap::from([(None, total)]);
             group.refused = true;
+            count_cause(&mut causes, COST_MISSING_COLLAPSE);
         }
     }
 
@@ -1030,6 +1109,9 @@ fn apply_grouped_with_accepted(
         }
         top_identities.push(identity);
     }
+    // Every early `Ineligible` exit is behind us. Per tagging attempt: a held
+    // or retried body counts again.
+    record_refusal_causes(&causes);
     if total_parts > max_parts_per_item(max_item_bytes) {
         over_cap.insert(OverCap::PartsPerItem);
     }
@@ -1224,6 +1306,9 @@ fn apply_grouped_with_accepted(
         })
         .count() as u64;
     let refusals = lost.max(1).saturating_add(prior_refusals);
+    let mut stripped = [0; REFUSAL_CAUSES.len()];
+    count_cause(&mut stripped, OVER_CAP_STRIP);
+    record_refusal_causes(&stripped);
     strip(item);
     item.provenance.collector = COLLECTOR.to_string();
     #[cfg(test)]
@@ -3634,6 +3719,9 @@ pub(crate) struct IdentityCounts {
     /// Retained Claude parses scrubbed on an attribution key change.
     #[serde(skip_serializing_if = "is_zero")]
     claude_context_digest_scrubs: u64,
+    /// Why usage was left untagged with a refusal, by closed cause label.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    request_identity_refusal: BTreeMap<&'static str, u64>,
 }
 fn is_zero(value: &u64) -> bool {
     *value == 0
@@ -3644,6 +3732,7 @@ pub(crate) fn take_identity_counts() -> IdentityCounts {
         claude_context_digest_scrubs: with_context_digest_scrubs(|counter| {
             counter.swap(0, std::sync::atomic::Ordering::Relaxed)
         }),
+        request_identity_refusal: take_refusal_causes(),
     }
 }
 
