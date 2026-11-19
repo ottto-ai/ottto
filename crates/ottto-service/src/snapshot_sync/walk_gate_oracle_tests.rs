@@ -977,3 +977,18 @@ fn standing_terminal_hold_arms_and_idles() {
         idle_passes_keep_the_walk(&mut home, &server, &recording, "w16");
     });
 }
+
+/// The cycle-start beat of an armed source carries no scan start, so the
+/// server keeps the window the walk's manifest is paired with.
+#[test]
+fn an_armed_source_beats_without_a_scan_start() {
+    let source = SnapshotSource::Pi;
+    walk_idle::restart_for_test();
+    let start = crate::snapshot_sync::lane::cycle_start_scan_started_at;
+    assert_eq!(start(source, "now"), Some("now"));
+    walk_idle::arm_for_test(source);
+    assert_eq!(start(source, "now"), None);
+    assert_eq!(start(SnapshotSource::Codex, "now"), Some("now"));
+    walk_idle::restart_for_test();
+    assert_eq!(start(source, "now"), Some("now"));
+}
