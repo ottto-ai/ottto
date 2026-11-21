@@ -2005,6 +2005,15 @@ mod tests {
 
     #[test]
     fn available_pi_route_status_clears_stale_aggregate_smoke_failure() {
+        for text in [
+            "No Pi model routes passed smoke verification.",
+            "The provider couldn't find Pi's default model, gcp-glm / zai-org/glm-5-maas. Choose another default model in Pi, or ignore this; usage collection is not affected.",
+        ] {
+            available_pi_route_clears_stale_smoke_failure(text);
+        }
+    }
+
+    fn available_pi_route_clears_stale_smoke_failure(text: &str) {
         let daemon = daemon().with_account(account("user_1", "ron@example.com"));
         let result = SourceVerificationResult {
             source: SourceKind::Pi,
@@ -2022,7 +2031,7 @@ mod tests {
             smoke_after: Some("2026-05-05T10:00:00Z".to_string()),
             message: StableMessage {
                 code: PI_ROUTE_SMOKE_FAILED_MESSAGE_CODE.to_string(),
-                text: "No Pi model routes passed smoke verification.".to_string(),
+                text: text.to_string(),
             },
             route_results: Vec::new(),
             check: None,

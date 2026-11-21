@@ -1487,6 +1487,59 @@ fn subscription_oauth_local_evidence_accepts_recent_session_or_identity() {
 }
 
 #[test]
+#[serial]
+fn pi_default_model_not_found_names_the_model() {
+    let _lock = lock_backend_test_env();
+    // The route builder reads Pi's auth file; keep both lookups empty.
+    let root = control_test_root("pi-default-model-not-found");
+    let _home_guard = EnvVarGuard::set_path("HOME", &root);
+    let _pi_dir_guard = EnvVarGuard::set_path("PI_CODING_AGENT_DIR", &root.join("pi-agent"));
+    let failed_smoke = |diagnostic: &str| SmokeResult {
+        command_found: true,
+        succeeded: false,
+        exit_status: Some(1),
+        duration_ms: 9_000,
+        message: "Pi smoke session failed.".to_string(),
+        diagnostic: Some(diagnostic.to_string()),
+        error_code: None,
+        local_session_observed: None,
+    };
+    let route = live_pi_route();
+    let label = format!("{} / {}", route.provider, route.model);
+    let failed =
+        |diagnostic: &str| pi_route_result_from_smoke(&route, &failed_smoke(diagnostic), None);
+    let generic = "No Pi model routes passed smoke verification.";
+
+    let not_found = pi_route_aggregate_result(vec![failed(
+        r#"Error: 404 {"error":{"code":404,"message":"Publisher Model was not found or your project does not have access to it."}}"#,
+    )]);
+    assert_eq!(not_found.status, SourceVerificationStatus::Failed);
+    assert_eq!(not_found.message.code, "pi_route_smoke_failed");
+    assert_eq!(
+        not_found.message.text,
+        format!(
+            "The provider couldn't find Pi's default model, {label}. Choose another default model in Pi, or ignore this; usage collection is not affected."
+        )
+    );
+
+    for other in [
+        "connection reset by peer",
+        "Error: 404 page not found",
+        "404 /v1/models endpoint not found",
+        "model is overloaded",
+    ] {
+        let result = pi_route_aggregate_result(vec![failed(other)]);
+        assert_eq!(result.status, SourceVerificationStatus::Failed, "{other}");
+        assert_eq!(result.message.code, "pi_route_smoke_failed", "{other}");
+        assert_eq!(result.message.text, generic, "{other}");
+    }
+    let not_found_404 = r#"404 model not found"#;
+    let two_routes = pi_route_aggregate_result(vec![failed(not_found_404), failed(not_found_404)]);
+    assert_eq!(two_routes.message.text, generic);
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn pi_reauth_pending_route_aggregates_to_warning_not_failed() {
     let route = subscription_oauth_route();
     let reauth = pi_route_passive_result(
