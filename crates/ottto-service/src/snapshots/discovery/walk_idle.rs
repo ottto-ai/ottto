@@ -31,6 +31,10 @@ struct Slot {
     /// The inputs and gate-clock time of the pass that began the walk.
     walk_start: Option<(Pass, u64)>,
     last_pass_at: Option<u64>,
+    /// A history budget hold left a change of the current walk unread, so
+    /// that walk cannot settle. In memory only, like the record: after a
+    /// restart the resumed walk has no start on this clock and cannot arm.
+    rewalk_owed: bool,
 }
 
 impl Slot {
@@ -38,6 +42,7 @@ impl Slot {
         record: None,
         walk_start: None,
         last_pass_at: None,
+        rewalk_owed: false,
     };
 }
 
@@ -60,6 +65,16 @@ pub(crate) fn armed(source: SnapshotSource) -> bool {
 
 pub(crate) fn clear(source: SnapshotSource) {
     with_slot(source, |slot| slot.record = None);
+}
+
+/// The walk in progress left a held change unread: it cannot arm the gate.
+pub(crate) fn owe_rewalk(source: SnapshotSource) {
+    with_slot(source, |slot| slot.rewalk_owed = true);
+}
+
+/// Whether the walk in progress left a held change unread.
+pub(crate) fn rewalk_owed(source: SnapshotSource) -> bool {
+    with_slot(source, |slot| slot.rewalk_owed)
 }
 
 impl Pass {
@@ -158,6 +173,7 @@ pub(crate) fn gate(
         let walking = index.traversal.is_some();
         if !walking {
             slot.walk_start = Some((pass.clone(), now));
+            slot.rewalk_owed = false;
         }
         let idle = !walking
             && pass.covered

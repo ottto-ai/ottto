@@ -23,6 +23,9 @@ type Given = fn(&mut Synth) -> Result<Json, DeError>;
 type Row = (String, String, u64, Box<RawValue>);
 
 const HISTORY: &str = "tests/fixtures/state_v2/serialized-fields.json";
+/// The stored field paths of the release a rollback may return to (that
+/// release's history file). Its reader refuses a key it does not know.
+const ROLLBACK_FLOOR: &str = "tests/fixtures/state_v2/rollback-floor-0.1.259.json";
 /// Frozen releases: each one's rows and the catalogue layout it wrote.
 const RELEASES: [(&str, u32); 2] = [
     ("tests/fixtures/state_v2/release-0.1.216.json", 5),
@@ -805,6 +808,35 @@ fn stored_field_paths_check() {
             retired_path_loads(&index, kind, path);
         }
     }
+}
+/// [format] Every field path the writer stores is one the rollback floor's
+/// reader knows, so rolling back to that release loads every stored row. A
+/// release that must store a new path records a format step and raises the
+/// floor with it.
+#[test]
+fn stored_field_paths_stay_within_the_rollback_floor() {
+    deep_stack(rollback_floor_check);
+}
+fn rollback_floor_check() {
+    let index = sample();
+    let (_scratch, mut db) = stored(&index).unwrap();
+    let current = schema(&dump(&mut db).unwrap().rows).unwrap();
+    let floor: Schema = serde_json::from_str(&read_fixture(ROLLBACK_FLOOR)).unwrap();
+    let beyond = current
+        .iter()
+        .flat_map(|(kind, paths)| {
+            let known = floor.get(kind);
+            paths
+                .iter()
+                .filter(move |path| !known.is_some_and(|known| known.contains(*path)))
+                .map(move |path| format!("{kind}: {path}"))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        beyond.is_empty(),
+        "stored paths the rollback floor cannot read:\n{}",
+        beyond.join("\n")
+    );
 }
 fn retired_path_loads(index: &ScanIndex, kind: &str, path: &str) {
     let (_scratch, mut db) = stored(index).unwrap();

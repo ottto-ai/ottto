@@ -15,6 +15,54 @@ use std::{
 type Recensus = BTreeMap<(usize, String), Option<String>>;
 static RECENSUS: Mutex<Recensus> = Mutex::new(BTreeMap::new());
 
+// Listing changes without a hint in the walk in progress, per source, by
+// class and first or repeat sight. Report only: kept in this process, never
+// stored, reset when a walk starts and emitted when it retires.
+type ClassCounts = [[u64; 2]; 6];
+crate::local_resource_diagnostics::process_static!(
+    fn with_class_counts: Mutex<[ClassCounts; 3]> = Mutex::new([[[0; 2]; 6]; 3])
+);
+
+fn class_counts<T>(source: SnapshotSource, f: impl FnOnce(&mut ClassCounts) -> T) -> T {
+    with_class_counts(|counts| {
+        f(&mut counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)[source.slot()])
+    })
+}
+
+/// Counts one listing change without a hint in its class and sight cell.
+pub(in crate::snapshots) fn note_class_change(source: SnapshotSource, class: usize, first: bool) {
+    class_counts(source, |counts| counts[class][usize::from(!first)] += 1);
+}
+
+fn no_class_counts(counts: &ClassCounts) -> bool {
+    *counts == [[0; 2]; 6]
+}
+
+#[cfg(test)]
+pub(in crate::snapshots) fn class_counts_for_test(source: SnapshotSource) -> ClassCounts {
+    class_counts(source, |counts| *counts)
+}
+
+#[cfg(test)]
+pub(in crate::snapshots) fn reset_class_counts_for_test() {
+    with_class_counts(|counts| {
+        *counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = [[[0; 2]; 6]; 3];
+    });
+}
+
+/// The stored counts as a diagnostics row, with the walk's class split.
+#[derive(Serialize)]
+struct CountsRow<'a> {
+    #[serde(flatten)]
+    counts: &'a ScanTraversalCounts,
+    #[serde(skip_serializing_if = "no_class_counts")]
+    listing_changes_by_class: ClassCounts,
+}
+
 fn recensus() -> MutexGuard<'static, Recensus> {
     RECENSUS.lock().unwrap_or_else(|poisoned| {
         RECENSUS.clear_poison();
@@ -86,6 +134,8 @@ impl Starting {
         matches: bool,
         attempt: u8,
     ) -> Self {
+        // A new walk starts its own class split.
+        class_counts(source, |counts| *counts = [[0; 2]; 6]);
         let previous = index.traversal.as_ref().map(|t| Previous {
             window_unix_seconds: rfc3339_unix_seconds(&t.census_window_end),
             pending_directories: t.pending_directories.len(),
@@ -229,7 +279,7 @@ pub(super) fn retiring(
         gates: CensusGates,
         /// Fixed names of the paths that set the clean follow-up's flag.
         unsettled_causes: Vec<&'static str>,
-        counts: &'a ScanTraversalCounts,
+        counts: CountsRow<'a>,
         max_unread_bytes: u64,
         disappearance_process_totals_v1: disappearance_diagnostics::Totals,
     }
@@ -264,7 +314,10 @@ pub(super) fn retiring(
             context_fingerprint: traversal.context_fingerprint.get(..8).unwrap_or_default(),
             gates,
             unsettled_causes: UnsettledUploadCause::names(unsettled_causes),
-            counts: &traversal.counts,
+            counts: CountsRow {
+                counts: &traversal.counts,
+                listing_changes_by_class: class_counts(source, std::mem::take),
+            },
             max_unread_bytes: traversal.counts.max_unread_bytes,
             disappearance_process_totals_v1: disappearance_diagnostics::snapshot(source),
         },
@@ -403,6 +456,62 @@ mod tests {
                 .malformed_json_line_count,
             0
         );
+    }
+
+    /// The class split of listing changes without a hint is reported on the
+    /// retiring row under `counts`, from this process only, and starts over
+    /// with the next walk.
+    #[test]
+    fn retiring_row_reports_the_walks_class_split_once() {
+        let scratch = crate::test_scratch::ScratchDir::new("class-split");
+        let roots = [scratch.to_path_buf()];
+        let start = |index: &mut ScanIndex, now: &str| {
+            capture(|| {
+                ensure_bounded_traversal(
+                    SnapshotSource::Pi,
+                    &roots,
+                    index,
+                    now,
+                    BACKFILL_WINDOW_DAYS,
+                )
+            })
+        };
+        let mut index = ScanIndex::default();
+        start(&mut index, T0);
+        let traversal = index.traversal.clone().unwrap();
+        note_class_change(SnapshotSource::Pi, 5, true);
+        note_class_change(SnapshotSource::Pi, 5, false);
+        let retire = || {
+            capture(|| {
+                retiring(
+                    SnapshotSource::Pi,
+                    0,
+                    &traversal,
+                    true,
+                    0,
+                    CensusGates::default(),
+                )
+            })
+            .1
+        };
+        let retired = |rows: Vec<Value>| {
+            rows.into_iter()
+                .find(|row| row["counts"]["event"] == "retiring")
+                .unwrap()
+        };
+        let row = retired(retire());
+        let counts = &row["counts"]["counts"];
+        assert_eq!(counts["listing_changes_by_class"][5], json!([1, 1]));
+        assert!(serde_json::to_value(&traversal.counts)
+            .unwrap()
+            .get("listing_changes_by_class")
+            .is_none());
+        assert!(retired(retire())["counts"]["counts"]
+            .get("listing_changes_by_class")
+            .is_none());
+        note_class_change(SnapshotSource::Pi, 5, true);
+        start(&mut ScanIndex::default(), T1);
+        assert_eq!(class_counts_for_test(SnapshotSource::Pi), [[0; 2]; 6]);
     }
 
     #[test]

@@ -3321,7 +3321,7 @@ impl OwnedSourceScan {
                 let routine_recensus =
                     traversal_transition::routine_recensus(source, &traversal_snapshot);
                 // A clean walk retiring here may arm the gate.
-                let settled_walk = !traversal_snapshot.rewalk_owed
+                let settled_walk = !crate::snapshots::discovery::walk_idle::rewalk_owed(source)
                     && traversal_snapshot
                         .pending_candidates
                         .iter()
@@ -4040,8 +4040,8 @@ impl OwnedSourceScan {
                 };
                 if matches!(history, HistoryDecision::Held(HistoryHold::Budget)) {
                     // Held for a later walk: this walk cannot settle it.
-                    if let Some(traversal) = index.traversal.as_mut() {
-                        traversal.rewalk_owed = true;
+                    if index.traversal.is_some() {
+                        crate::snapshots::discovery::walk_idle::owe_rewalk(source);
                     }
                 }
                 // A held, unchanged member owed only a proof correction is not

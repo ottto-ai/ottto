@@ -1818,21 +1818,15 @@ fn graph_save_keeps_progress_rows_outside_the_graph() {
     assert_persisted(&mut db, &next);
 }
 
-/// A checkpoint stored before the walk gate's `rewalk_owed` existed decodes
-/// exactly and re-encodes to the same bytes; a set flag is the only addition.
+/// A checkpoint an earlier build stored with the retired `rewalk_owed` flag
+/// still loads, and the flag is never written again: the stored traversal row
+/// keeps the previous release's key set.
 #[test]
-fn checkpoint_without_rewalk_owed_keeps_its_bytes() {
-    type Checkpoint = Option<crate::snapshots::ScanTraversalCheckpoint>;
-    let stored = serde_json::to_vec(&fixture().traversal).unwrap();
-    let row: serde_json::Value = serde_json::from_slice(&stored).unwrap();
+fn checkpoint_with_the_retired_rewalk_flag_loads_and_drops_it() {
+    let mut row = serde_json::to_value(&fixture().traversal).unwrap();
     assert!(row.get("rewalk_owed").is_none());
-    let (decoded, canonical) = codec::exact_json::<Checkpoint>(&stored).unwrap();
-    assert_eq!(canonical, stored);
-    let mut checkpoint = decoded.unwrap();
-    assert!(!checkpoint.rewalk_owed);
+    row["rewalk_owed"] = serde_json::Value::Bool(true);
     let index = hydrate_with_shipped_row("scan_state.traversal", row).unwrap();
-    assert!(!index.traversal.as_ref().unwrap().rewalk_owed);
-    checkpoint.rewalk_owed = true;
-    let flagged = serde_json::to_value(&checkpoint).unwrap();
-    assert_eq!(flagged["rewalk_owed"], true);
+    let written = serde_json::to_value(&index.traversal).unwrap();
+    assert!(written.get("rewalk_owed").is_none());
 }

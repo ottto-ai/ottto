@@ -138,7 +138,7 @@ fn terminal_unhealthy_traversal(context_fingerprint: String) -> ScanTraversalChe
         residue: ScanTraversalResidue::default(),
         listing_started_unix_seconds: None,
         listing_owed_requeued_unix_seconds: Default::default(),
-        rewalk_owed: false,
+        retired_rewalk_owed: serde::de::IgnoredAny,
     }
 }
 
@@ -2826,7 +2826,7 @@ fn traversal_restart_after_scan_derivation_upgrade_revisits_consumed_prefix() {
         residue: ScanTraversalResidue::default(),
         listing_started_unix_seconds: None,
         listing_owed_requeued_unix_seconds: Default::default(),
-        rewalk_owed: false,
+        retired_rewalk_owed: serde::de::IgnoredAny,
     });
 
     let scan = scan_source_roots(
@@ -3230,7 +3230,7 @@ fn deletion_reconciliation_is_bounded_and_resumable() {
             residue: ScanTraversalResidue::default(),
             listing_started_unix_seconds: None,
             listing_owed_requeued_unix_seconds: Default::default(),
-            rewalk_owed: false,
+            retired_rewalk_owed: serde::de::IgnoredAny,
         }),
         ..ScanIndex::default()
     };
@@ -4053,7 +4053,7 @@ fn unhealthy_retry_latch_saturates_at_its_cap_and_a_missing_deadline_is_due_now(
             residue: ScanTraversalResidue::default(),
             listing_started_unix_seconds: None,
             listing_owed_requeued_unix_seconds: Default::default(),
-            rewalk_owed: false,
+            retired_rewalk_owed: serde::de::IgnoredAny,
         };
 
     index.traversal = Some(stale_witness(&index, 46, Some(now - 15 * 60 * 60)));
@@ -21621,7 +21621,7 @@ pub(super) fn traversal_checkpoint() -> ScanTraversalCheckpoint {
         residue: ScanTraversalResidue::default(),
         listing_started_unix_seconds: None,
         listing_owed_requeued_unix_seconds: Default::default(),
-        rewalk_owed: false,
+        retired_rewalk_owed: serde::de::IgnoredAny,
     }
 }
 
@@ -22657,7 +22657,7 @@ fn traversal_reset_scope_checkpoint(
         residue: ScanTraversalResidue::default(),
         listing_started_unix_seconds: None,
         listing_owed_requeued_unix_seconds: Default::default(),
-        rewalk_owed: false,
+        retired_rewalk_owed: serde::de::IgnoredAny,
     }
 }
 

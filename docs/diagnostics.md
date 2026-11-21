@@ -1666,12 +1666,14 @@ least once every listing interval (three hours).
 
 `bounded_traversal_transition` rows carry the walk's counts, including
 `listing_changes_without_hint`: changed files a listing queued that no watcher
-hint announced. `listing_changes_by_class` splits that total into six rows of
-`[first, repeat]` counts, in this order: Claude main transcripts, Claude
-subagent transcripts, Codex live rollouts, Codex archived rollouts, compressed
-Codex rollouts and Pi sessions. `first` counts a file's first sighting in the
-walk's generation and `repeat` a later one. The cells sum to the total. The
-field is report only and is omitted while every cell is zero.
+hint announced. On the `retiring` row, `counts.listing_changes_by_class`
+splits that walk's changes into six rows of `[first, repeat]` counts, in this
+order: Claude main transcripts, Claude subagent transcripts, Codex live
+rollouts, Codex archived rollouts, compressed Codex rollouts and Pi sessions.
+`first` counts a file's first sighting in the walk's generation and `repeat` a
+later one. The split is counted in memory by this process for the walk in
+progress and never stored, so a walk resumed after a restart reports only its
+changes since then. It is omitted while every cell is zero.
 
 ## Prior Held Family Observation
 

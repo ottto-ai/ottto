@@ -219,7 +219,6 @@ pub(in crate::snapshots) fn advance_bounded_directory_traversal_with_budget(
                    members: &mut usize| {
         if let Some(mut saved) = saved {
             saved.listing_changes_without_hint = counts.listing_changes_without_hint;
-            saved.listing_changes_by_class = counts.listing_changes_by_class;
             saved.listing_owed_requeued = counts.listing_owed_requeued;
             saved.discovered_file_count += std::mem::take(members);
             *counts = saved;
