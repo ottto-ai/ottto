@@ -287,13 +287,15 @@ fn budget_held_new_root_keeps_its_fork_copy_counted_once() {
             };
             // Paced: born before the cutoff, so every file is owed history.
             let scanner = E2ScanFixture::default();
-            let mut index = ScanIndex::default();
-            index.claude_history_cutoff_unix_seconds = Some(
-                std::time::SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
-            );
+            let mut index = ScanIndex {
+                claude_history_cutoff_unix_seconds: Some(
+                    std::time::SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs(),
+                ),
+                ..ScanIndex::default()
+            };
             let limit = if next_page {
                 2
             } else {
