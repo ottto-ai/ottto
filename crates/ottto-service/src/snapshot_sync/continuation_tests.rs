@@ -2873,6 +2873,7 @@ fn first_import_classes_end_when_backfill_completes() {
     let mut state = BackfillState::default();
     let mut scan = empty_scan();
     (scan.census_status.pending_work, scan.routine_recensus) = (true, false);
+    scan.census_complete = false;
     super::super::source_upload_deadlines()
         .lock()
         .unwrap()
