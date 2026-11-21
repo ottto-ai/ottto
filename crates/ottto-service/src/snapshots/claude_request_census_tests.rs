@@ -665,8 +665,7 @@ fn census_continuation_rejects_unproven_native_bases() {
                 .get(&key)
                 .unwrap()
                 .unverified_for_test());
-            let custody = state_v2::published(session.path()).unwrap();
-            state_v2::save_locked(session.path(), &mut next, true, custody).unwrap();
+            state_v2::save_locked(session.path(), &mut next, true).unwrap();
             state_v2::unstage_tail(session.path(), [key.clone()]).unwrap();
             // Simulate a crash losing the staged Tail after the claim-only save.
             let restored = ScanIndex::load(session.path()).unwrap();
@@ -1079,7 +1078,7 @@ fn base64_hashes(hashes: &[u64]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
-/// The legacy `h` wire form (#664): concatenated 16-digit lowercase hex.
+/// The legacy `h` wire form: concatenated 16-digit lowercase hex.
 fn legacy_hex_hashes(hashes: &[u64]) -> String {
     hashes.iter().map(|hash| format!("{hash:016x}")).collect()
 }
@@ -1293,7 +1292,7 @@ fn census_numeric_overflow_is_isolated_from_load_and_cas() {
         let json = serde_json::to_string(&value)
             .unwrap()
             .replace(&format!("\"{marker}\""), &raw);
-        let mut loaded = census_load(&scratch, name, &json);
+        let loaded = census_load(&scratch, name, &json);
         let mut actual = serde_json::to_value(&loaded).unwrap();
         let mut expected = expected.clone();
         for key in ["claude_request_census", "claude_request_census_shadow"] {
@@ -1309,14 +1308,11 @@ fn census_numeric_overflow_is_isolated_from_load_and_cas() {
         }
         let bounded_path = scratch.join(format!("{name}-bounded.json"));
         std::fs::write(&bounded_path, &json).unwrap();
-        loaded
-            .clone()
-            .save_with_read_limit(&bounded_path, 128 * 1024)
-            .expect("bounded CAS also isolates malformed evidence");
-        loaded
-            .save(&scratch.join(format!("{name}.json")))
-            .expect("CAS accepts the same malformed shadow");
-        assert_eq!(loaded.generation, 8);
+        // Integer census fields cannot serialize a non-finite JSON number.
+        e2_pipeline_scan_fixture::assert_import_support_for_test(&bounded_path);
+        e2_pipeline_scan_fixture::assert_import_support_for_test(
+            &scratch.join(format!("{name}.json")),
+        );
     }
 }
 
@@ -1349,7 +1345,7 @@ fn census_past_the_old_raw_byte_limit_loads_whole() {
     }
     write!(file, "\"}},\"small\":{small}}}{after}").unwrap();
     drop(file);
-    let mut loaded = ScanIndex::load(&path).expect("a large census loads");
+    let loaded = ScanIndex::load(&path).expect("a large census loads");
     assert_eq!(loaded.files.len(), 1);
     let census = loaded.claude_request_census_for_test();
     assert_eq!(
@@ -1358,9 +1354,8 @@ fn census_past_the_old_raw_byte_limit_loads_whole() {
     );
     assert_eq!(census.get("big").unwrap().request_hashes_for_test(), &[1]);
     assert_eq!(census.hash_total_for_test(), 2);
-    loaded
-        .save(&path)
-        .expect("the CAS reads the large census too");
+    // The hand-added padding field has no released census serializer slot.
+    e2_pipeline_scan_fixture::assert_import_support_for_test(&path);
 }
 
 /// A pre-census shape has no census fields: IgnoredAny consumes their tokens,
@@ -1499,7 +1494,7 @@ fn census_sequence_index_preserves_serde_compatibility_and_isolates_evidence() {
         serde_json::json!(false),
         serde_json::json!([]),
         serde_json::json!({}),
-        // U1a-2a (#660): the side/proof fields after the parent ledgers
+        // Codex parent side-record and proof fields follow the parent ledgers
         // (`serde(skip)` RAM fields take no slot).
         serde_json::json!({}),
         serde_json::json!({}),
@@ -1555,8 +1550,9 @@ fn census_sequence_index_preserves_serde_compatibility_and_isolates_evidence() {
         loaded.claude_request_census_for_test(),
         control.claude_request_census_for_test()
     );
+    loaded = e2_pipeline_scan_fixture::seed_index_for_test(&loaded, &scratch.join("sequence.json"));
     loaded
-        .save(&scratch.join("sequence.json"))
+        .save_fixture(&scratch.join("sequence.json"))
         .expect("positional CAS remains supported");
 }
 
@@ -1593,7 +1589,10 @@ fn census_valid_shadow_state_round_trips_exactly() {
                 2
             );
             let path = scratch.join(format!("{name}.json"));
-            loaded.save(&path).expect("CAS preserves shadow state");
+            loaded = e2_pipeline_scan_fixture::seed_index_for_test(&loaded, &path);
+            loaded
+                .save_fixture(&path)
+                .expect("CAS preserves shadow state");
             let reloaded = ScanIndex::load(&path).unwrap();
             assert_eq!(
                 serde_json::to_value(&reloaded).unwrap()["claude_request_census_shadow"],
@@ -1634,8 +1633,12 @@ fn census_duplicate_optional_fields_invalidate_only_the_ambiguous_evidence() {
                 None
             );
         }
+        loaded = e2_pipeline_scan_fixture::seed_index_for_test(
+            &loaded,
+            &scratch.join(format!("{field}.json")),
+        );
         loaded
-            .save(&scratch.join(format!("{field}.json")))
+            .save_fixture(&scratch.join(format!("{field}.json")))
             .expect("CAS isolates optional duplicates");
     }
     // Required duplicate fields are ambiguous. Refuse without replacing the

@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
@@ -17,7 +17,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{bail, ensure, Context, Result};
-use serde::de::{DeserializeSeed, Deserializer as _, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::de::{DeserializeSeed, Deserializer as _, IgnoredAny, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -256,30 +256,6 @@ enum Root {
 /// immutable baseline retry maxima and hold/repair provenance alongside this.
 #[derive(Clone, Debug)]
 pub(crate) struct LoadedRoot(Arc<Root>);
-/// Opaque, in-process custody for a rebuild already authorized by the existing
-/// LEGACY quarantine policy. Never minted for sharded/partial state or on load
-/// of a missing root. Not a receipt and never persisted or inferred from names.
-#[derive(Debug)]
-pub(crate) struct LegacyRecovery {
-    binding: Binding,
-    root: String,
-    quarantine: String,
-    digest: String,
-    spent: std::sync::atomic::AtomicBool,
-}
-impl LegacyRecovery {
-    #[cfg_attr(
-        test,
-        allow(dead_code, reason = "the #[path] contract test crate does not call it")
-    )]
-    pub(crate) fn retained_bytes(&self) -> usize {
-        self.binding.namespace_hash.capacity()
-            + self.root.capacity()
-            + self.quarantine.capacity()
-            + self.digest.capacity()
-    }
-}
-
 impl LoadedRoot {
     pub(crate) fn generation(&self) -> Option<u64> {
         match &*self.0 {
@@ -461,7 +437,6 @@ pub(crate) struct LockedStore {
     binding: Binding,
     metadata_fields: &'static [&'static str],
     prior_root_seen: std::cell::Cell<bool>,
-    authorized_legacy_replacement: std::cell::Cell<bool>,
     read_stats: std::cell::Cell<ReadStats>,
 }
 
@@ -596,65 +571,6 @@ impl<W: Write> Write for HashWriter<W> {
     }
     fn flush(&mut self) -> io::Result<()> {
         self.writer.flush()
-    }
-}
-
-// The probe is not a semantic decoder: it skips values and recognizes only the
-// representation fence. Unknown versions refuse while visiting their header,
-// before envelope size checks or ANY mutation. Arrays remain legacy-compatible.
-struct Probe<'a>(&'a std::cell::Cell<bool>);
-impl<'de> Visitor<'de> for Probe<'_> {
-    type Value = (u16, u64);
-    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("index representation header")
-    }
-    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<(u16, u64), A::Error> {
-        let schema = seq.next_element::<u16>()?.unwrap_or(LOGICAL_SCHEMA);
-        if schema != LOGICAL_SCHEMA {
-            return Err(serde::de::Error::custom(
-                "scan_index_representation_refused",
-            ));
-        }
-        let generation = seq.next_element::<u64>()?.unwrap_or(0);
-        while seq.next_element::<IgnoredAny>()?.is_some() {}
-        Ok((schema, generation))
-    }
-    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> std::result::Result<(u16, u64), A::Error> {
-        let mut schema = None;
-        let mut storage = false;
-        let mut generation = None;
-        while let Some(key) = map.next_key::<String>()? {
-            if key == "schema_version" {
-                if schema.is_some() {
-                    return Err(serde::de::Error::custom("scan_index_duplicate_header"));
-                }
-                let v: u16 = map.next_value()?;
-                if v != LOGICAL_SCHEMA && v != OUTER_SCHEMA {
-                    return Err(serde::de::Error::custom(
-                        "scan_index_representation_refused",
-                    ));
-                }
-                schema = Some(v);
-                // New envelopes always put the fence first. Stop here so an
-                // oversized/future root cannot force a corpus-sized parse.
-                if v == OUTER_SCHEMA {
-                    self.0.set(true);
-                    return Err(serde::de::Error::custom("scan_index_header_complete"));
-                }
-            } else if key == "generation" {
-                if generation.is_some() {
-                    return Err(serde::de::Error::custom("scan_index_duplicate_header"));
-                }
-                generation = Some(map.next_value::<u64>()?);
-            } else {
-                storage |= key == "storage_format";
-                map.next_value::<IgnoredAny>()?;
-            }
-        }
-        if storage {
-            return Err(serde::de::Error::custom("scan_index_bad_fence"));
-        }
-        Ok((schema.unwrap_or(LOGICAL_SCHEMA), generation.unwrap_or(0)))
     }
 }
 
@@ -871,7 +787,6 @@ impl LockedStore {
             binding,
             metadata_fields,
             prior_root_seen: std::cell::Cell::new(false),
-            authorized_legacy_replacement: std::cell::Cell::new(false),
             read_stats: std::cell::Cell::new(ReadStats::default()),
         })
     }
@@ -897,10 +812,7 @@ impl LockedStore {
                 match self.directory() {
                     Ok(dir) => {
                         self.refuse_reserved_without_root(&dir)?;
-                        ensure!(
-                            self.authorized_legacy_replacement.get(),
-                            "scan_index_root_missing_with_shards"
-                        );
+                        bail!("scan_index_root_missing_with_shards");
                     }
                     Err(e)
                         if e.downcast_ref::<io::Error>()
@@ -1010,8 +922,7 @@ impl LockedStore {
     pub(crate) fn open(&self) -> Result<Opened> {
         self.open_structural()
     }
-    // Internal reconciliation of a just-serialized publication. Production
-    // LOAD callers must supply their semantic decoder through the checked API.
+    #[cfg(test)]
     fn open_structural(&self) -> Result<Opened> {
         self.open_with_map_validator(&mut |_, _| Ok(()))
     }
@@ -1197,220 +1108,14 @@ impl LockedStore {
         }
     }
 
-    /// An observed fresh load may write progress during its first sync pass.
-    /// Keep that custody through publication, but reject ANY intervening root/
-    /// quarantine witness. This check does not discard files or infer freshness.
-    fn check_initial_cas(&self) -> Result<()> {
-        if self.authorized_legacy_replacement.get() {
-            return Ok(());
-        }
+    /// Existing containment authority applies only to a complete legacy root.
+    pub(crate) fn require_legacy_rebuild(&self) -> Result<()> {
+        self.recover_fresh_init()?;
         ensure!(
-            !self.prior_root_seen.get(),
-            "scan_index_prior_state_requires_repair"
+            matches!(self.current()?.1, Root::Legacy { .. }),
+            "scan_index_legacy_recovery_refused"
         );
-        let root = self.root_name.to_str()?;
-        let stem = root.strip_suffix(".json").unwrap_or(root);
-        let family = stem.strip_suffix("-v2").unwrap_or(stem);
-        let temp_prefix = format!("{root}.storage-tmp-");
-        visit_storage_directory(&self.parent, |name| {
-            let text = name
-                .to_str()
-                .map_err(|_| anyhow::anyhow!("scan_index_prior_state_unknown"))?;
-            if text.starts_with(family) {
-                if text == format!("{stem}-upload-progress.lock")
-                    || text == format!("{stem}-upload-progress.json")
-                    || text == format!("{root}.lock")
-                    || text == format!("{stem}.lock")
-                {
-                    Stamp::capture(&open_at(&self.parent, name, libc::O_RDONLY)?, false)?;
-                } else if text == format!("{stem}.durable-tail") {
-                    check_directory(&open_at(
-                        &self.parent,
-                        name,
-                        libc::O_RDONLY | libc::O_DIRECTORY,
-                    )?)?;
-                } else if text == format!("{stem}.private-labels") || temp_named(text, &temp_prefix)
-                {
-                    Stamp::capture(&open_at(&self.parent, name, libc::O_RDONLY)?, true)?;
-                } else {
-                    bail!("scan_index_prior_state_requires_repair");
-                }
-            }
-            Ok(())
-        })
-    }
-
-    /// Bounded manifest-only CAS on an already loaded sharded baseline. No old
-    /// logical decode. Legacy callers still perform their original full CAS.
-    pub(crate) fn compare(&self, expected: &LoadedRoot) -> Result<()> {
-        ensure!(
-            !matches!(&*expected.0, Root::Unavailable { .. }),
-            "scan_index_unknown_maps_require_repair"
-        );
-        let (_, current) = self.current()?;
-        let same = match (&*expected.0, &current) {
-            (Root::Missing, Root::Missing) => {
-                self.check_initial_cas()?;
-                true
-            }
-            (Root::Legacy { digest: a, .. }, Root::Legacy { digest: b, .. }) => a == b,
-            (
-                Root::Sharded {
-                    digest: a,
-                    manifest: x,
-                    ..
-                },
-                Root::Sharded {
-                    digest: b,
-                    manifest: y,
-                    ..
-                },
-            ) => a == b && x.generation == y.generation,
-            _ => false,
-        };
-        ensure!(same, "local snapshot scan index changed concurrently");
         Ok(())
-    }
-
-    #[cfg_attr(
-        test,
-        allow(dead_code, reason = "the #[path] contract test crate does not call it")
-    )]
-    pub(crate) fn legacy_recovery(&self, quarantine: &str) -> Result<Arc<LegacyRecovery>> {
-        ensure!(
-            quarantine.len() <= MAX_KEY_BYTES
-                && !quarantine.contains('/')
-                && quarantine != "."
-                && quarantine != "..",
-            "scan_index_legacy_recovery_refused"
-        );
-        let (_, root) = self.current()?;
-        let Root::Legacy { digest, .. } = root else {
-            bail!("scan_index_legacy_recovery_refused");
-        };
-        Ok(Arc::new(LegacyRecovery {
-            binding: self.binding.clone(),
-            root: self.root_name.to_str()?.into(),
-            quarantine: quarantine.into(),
-            digest,
-            spent: std::sync::atomic::AtomicBool::new(false),
-        }))
-    }
-    #[cfg_attr(
-        test,
-        allow(dead_code, reason = "the #[path] contract test crate does not call it")
-    )]
-    pub(crate) fn write_recovered_legacy(
-        &self,
-        recovery: &LegacyRecovery,
-        generation: u64,
-        encode: impl FnOnce(&mut dyn Write) -> Result<()>,
-    ) -> Result<LoadedRoot> {
-        ensure!(
-            recovery.binding == self.binding
-                && recovery.root.as_bytes() == self.root_name.to_bytes(),
-            "scan_index_legacy_recovery_refused"
-        );
-        // Verify the exact preserved legacy witness, not merely a sibling name
-        // or matching generation, before granting the missing-root replacement.
-        let mut file = open_at(
-            &self.parent,
-            &cstring(recovery.quarantine.as_bytes())?,
-            libc::O_RDONLY,
-        )?;
-        let before = Stamp::capture(&file, false)?;
-        let digest = legacy_digest(&mut file)?;
-        ensure!(
-            before == Stamp::capture(&file, false)? && digest == recovery.digest,
-            "scan_index_legacy_recovery_refused"
-        );
-        struct Reset<'a>(&'a std::cell::Cell<bool>);
-        impl Drop for Reset<'_> {
-            fn drop(&mut self) {
-                self.0.set(false);
-            }
-        }
-        ensure!(
-            recovery
-                .spent
-                .compare_exchange(
-                    false,
-                    true,
-                    std::sync::atomic::Ordering::AcqRel,
-                    std::sync::atomic::Ordering::Acquire
-                )
-                .is_ok(),
-            "scan_index_legacy_recovery_spent"
-        );
-        self.authorized_legacy_replacement.set(true);
-        let _reset = Reset(&self.authorized_legacy_replacement);
-        let result = self.write_legacy(&LoadedRoot(Arc::new(Root::Missing)), generation, encode);
-        if result
-            .as_ref()
-            .is_err_and(|error| error.downcast_ref::<CommitPublished>().is_none())
-            && !self.prior_root_seen.get()
-            && matches!(open_at(&self.parent, &self.root_name, libc::O_RDONLY), Err(error) if error.kind() == io::ErrorKind::NotFound)
-        {
-            recovery
-                .spent
-                .store(false, std::sync::atomic::Ordering::Release);
-        }
-        result
-    }
-
-    /// Release N always writes the existing legacy format, including after a
-    /// sharded load. Caller retains the existing normalization, semantic CAS,
-    /// retry-claim merge and held-output checks. No new logical field table.
-    pub(crate) fn write_legacy(
-        &self,
-        expected: &LoadedRoot,
-        generation: u64,
-        encode: impl FnOnce(&mut dyn Write) -> Result<()>,
-    ) -> Result<LoadedRoot> {
-        self.compare(expected)?;
-        ensure!(
-            expected.generation().unwrap_or(0).checked_add(1) == Some(generation),
-            "scan_index_generation"
-        );
-        let mut prefix = self.root_name.to_bytes().to_vec();
-        prefix.extend_from_slice(b".storage-tmp-");
-        let temp = Temp::with_prefix(&self.parent, &prefix)?;
-        {
-            let mut output = BufWriter::with_capacity(BUFFER_BYTES, &temp.file);
-            encode(&mut output)?;
-            output.flush()?;
-        }
-        temp.file.sync_all()?;
-        // The encoder's output must be legacy JSON at the promised generation.
-        // Validate the control header using a temporary read handle; semantic
-        // field/hold checks remain the existing serializer's responsibility.
-        let mut candidate = open_at(&self.parent, &temp.name, libc::O_RDONLY)?;
-        let header = serde_json::Deserializer::from_reader(BufReader::new(KeyGuard::headers(
-            &mut candidate,
-        )))
-        .deserialize_any(Probe(&std::cell::Cell::new(false)))
-        .map_err(|_| anyhow::anyhow!("scan_index_legacy_output_refused"))?;
-        ensure!(
-            header == (LOGICAL_SCHEMA, generation),
-            "scan_index_legacy_output_refused"
-        );
-        self.compare(expected)?;
-        rename_at(&self.parent, &temp.name, &self.parent, &self.root_name)?;
-        let result = (|| -> Result<LoadedRoot> {
-            self.note_prior_root()?;
-            self.parent.sync_all()?;
-            match self.open_structural()? {
-                Opened::Legacy(_, root) if root.generation() == Some(generation) => Ok(root),
-                _ => bail!("scan_index_legacy_output_refused"),
-            }
-        })();
-        result.map_err(|_| {
-            CommitPublished {
-                generation,
-                verified: false,
-            }
-            .into()
-        })
     }
 }
 
@@ -1444,12 +1149,6 @@ impl Drop for Temp<'_> {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error("scan_index_commit_published generation={generation} verified={verified}; reload before effects")]
-pub(crate) struct CommitPublished {
-    pub generation: u64,
-    pub verified: bool,
-}
 /// tracks JSON punctuation and string escapes for resource admission.
 struct KeyGuard<R> {
     inner: R,
@@ -1478,12 +1177,6 @@ impl<R: Read> KeyGuard<R> {
             header_key_len: 0,
             control_value: false,
             array_position: 0,
-        }
-    }
-    fn headers(inner: R) -> Self {
-        Self {
-            headers: true,
-            ..Self::new(inner)
         }
     }
 }
@@ -1961,7 +1654,7 @@ impl LockedStore {
             Ok(())
         })
     }
-    fn recover_fresh_init(&self) -> Result<()> {
+    pub(crate) fn recover_fresh_init(&self) -> Result<()> {
         match open_at(&self.parent, &self.root_name, libc::O_RDONLY) {
             Ok(_) => return Ok(()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -1997,6 +1690,8 @@ impl LockedStore {
             if temp_named(text, &temp_prefix) {
                 Stamp::capture(&open_at(&self.parent, name, libc::O_RDONLY)?, true)?;
                 temps = true;
+            } else if text == format!("{root}.v2.sqlite.owner") {
+                Stamp::capture(&open_at(&self.parent, name, libc::O_RDONLY)?, true)?;
             } else if text == format!("{stem}-upload-progress.lock") {
                 Stamp::capture(&open_at(&self.parent, name, libc::O_RDONLY)?, false)?;
             } else if text == format!("{stem}.durable-tail") {

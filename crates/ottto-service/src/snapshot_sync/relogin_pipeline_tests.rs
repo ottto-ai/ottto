@@ -110,7 +110,9 @@ fn relogin_alias_keeps_accepted_history_without_a_reread() {
         .accepted_snapshot_fingerprint_recorded(&accepted));
     let namespace = snapshot_upload_destination_namespace(&device_a, "secret-a");
     let ledger = || {
-        SnapshotUploadProgress::load(
+        SnapshotUploadProgress::load_for_index(
+            &ScanIndex::load(&index_path).unwrap(),
+            &index_path,
             &progress_path,
             &namespace,
             snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
@@ -326,7 +328,7 @@ fn owner_return_preserves_all_source_carry() {
             }))
             .unwrap(),
         );
-        legacy.save(&cx_path).unwrap();
+        legacy.save_fixture(&cx_path).unwrap();
         crate::snapshots::older_build_logs_priority("return-turn");
         // A claim switch keeps the daemon alive. Keep its physical-header cache
         // while reloading account/index state on each ordinary source pass.
@@ -453,7 +455,7 @@ fn owner_return_preserves_all_source_carry() {
         });
         let saved = ScanIndex::load(&cx_path).unwrap();
         let entry = &saved.files[&codex.to_string_lossy().into_owned()];
-        assert!(!entry.codex_counting_v2, "Legacy ACK keeps the UI counter");
+        assert!(entry.codex_counting_v2, "new Codex reads retain V2");
         assert!(saved.historical_replay_generation_matches(&generation));
         // The disposable progress ledger can clear after ACK handoff. Its
         // destination/replay proof survives in the authoritative index.
@@ -509,7 +511,7 @@ fn owner_return_preserves_all_source_carry() {
             let source = SnapshotSource::Pi;
             let mut old = ScanIndex::load(&index_path(&namespace_a, source)).unwrap();
             old.prepare_historical_replay(format!("pi:old-revision:{namespace_a}"));
-            old.save(&index_path(&namespace_a, source)).unwrap();
+            old.save_fixture(&index_path(&namespace_a, source)).unwrap();
             crate::backfill::update_backfill_state(&support, |state| {
                 state
                     .completed_destination_replays
@@ -636,7 +638,7 @@ fn owner_return_preserves_all_source_carry() {
             }
             let saved = ScanIndex::load(&cx_path).unwrap();
             let entry = &saved.files[&codex.to_string_lossy().into_owned()];
-            assert!(!entry.codex_counting_v2);
+            assert!(entry.codex_counting_v2);
             assert_eq!(
                 serde_json::to_value(entry).unwrap()["codex_applied_tier_receipt"],
                 tier
@@ -839,7 +841,7 @@ fn account_return_history_row(recorded_a: bool) {
         }))
         .unwrap(),
     );
-    legacy.save(&cx_path).unwrap();
+    legacy.save_fixture(&cx_path).unwrap();
     // Like install_legacy_active: A already completed its initial Codex backfill.
     crate::backfill::update_backfill_state(&support, |state| {
         crate::backfill::mark_backfill_complete_for_destination(
@@ -969,7 +971,7 @@ fn account_return_history_row(recorded_a: bool) {
     }
     let saved = ScanIndex::load(&cx_path).unwrap();
     let entry = &saved.files[&codex.to_string_lossy().into_owned()];
-    assert!(!entry.codex_counting_v2, "Legacy ACK keeps the UI counter");
+    assert!(entry.codex_counting_v2, "new Codex reads retain V2");
     assert!(!serde_json::to_value(entry).unwrap()["codex_applied_tier_receipt"].is_null());
     let original_store = std::fs::read(&cx_path).unwrap();
     let tier = serde_json::to_value(entry).unwrap()["codex_applied_tier_receipt"].clone();
@@ -1050,7 +1052,7 @@ fn account_return_history_row(recorded_a: bool) {
         }
         let returned_cx = ScanIndex::load(&index_path(&namespace, SnapshotSource::Codex)).unwrap();
         let entry = &returned_cx.files[&codex.to_string_lossy().into_owned()];
-        assert_eq!(entry.codex_counting_v2, !reattached);
+        assert!(entry.codex_counting_v2);
         if reattached {
             assert_eq!(
                 serde_json::to_value(entry).unwrap()["codex_applied_tier_receipt"],
@@ -1085,15 +1087,7 @@ fn account_return_history_row(recorded_a: bool) {
         })
     };
     for (source, session, expected) in [
-        (
-            1,
-            CX,
-            Some(if recorded_a {
-                [2000, 200, 0, 0, 0, 0, 0, 1]
-            } else {
-                [1000, 100, 0, 0, 0, 0, 0, 1]
-            }),
-        ),
+        (1, CX, Some([1000, 100, 0, 0, 0, 0, 0, 1])),
         (0, OLD, recorded_a.then_some([30, 3, 0, 0, 0, 0, 0, 1])),
         (0, IDENTITY_PIPELINE_ROOT, Some([30, 3, 0, 0, 0, 0, 0, 1])),
         (2, "return-pi", Some([12, 4, 0, 0, 0, 0, 0, 1])),
@@ -1136,7 +1130,7 @@ fn account_return_history_row(recorded_a: bool) {
                 );
             }
             if source == 1 {
-                assert_eq!(counts(prior), [2000, 200, 0, 0, 0, 0, 0, 1]);
+                assert_eq!(counts(prior), [1000, 100, 0, 0, 0, 0, 0, 1]);
                 assert_eq!(counts(&prior["model_usage"][0]), counts(prior));
                 assert_eq!(counts(&after["model_usage"][0]), expected);
                 assert_eq!(

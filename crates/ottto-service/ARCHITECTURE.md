@@ -28,6 +28,24 @@ file-system hint / periodic listing → select file → read new bytes from save
   witness belongs to the next ordinary census, under its existing admission gates.
   Candidate discovery retains its earlier immediate-live-parent shortcut, which does
   not provide the secure proof's ancestor or recreation guarantees.
+- **Settled sources skip repeated walks** (`snapshots/discovery/walk_idle.rs`). A walk that
+  completed its census cleanly, with nothing owed to the index, the upload or telemetry, arms one
+  in-memory record per source, bound to the inputs the walk read and the store generation its
+  finish left. Until `WALK_GAP` (the listing interval, three hours) after that walk's first
+  pass, a pass with no watcher hint or listing request, unchanged inputs, a live watcher covering
+  every existing root, and a pass gap of at most one hour returns an empty, census-incomplete page:
+  it reads, uploads and saves nothing and sends no status receipt: the walk's receipt and manifest
+  stand, and check-in beats (sent with no scan start while a record is armed) keep them fresh.
+  Anything else walks as before: any failure, an account switch, a restart or another writer's
+  save. A due sampled audit waits for the next walk, at the latest the backstop. A pass that took
+  a hint clears the record before any fallible step, so a failed pass is followed by a walk. An
+  idle pass never emits a body. A watcher overflow, a dropped-event rescan (FSEvents
+  MustScanSubDirs with its user or kernel drop flags) or a watcher re-create requests a listing,
+  so that pass walks. Limit: a change the watcher misses silently, with no event and no drop
+  flag, waits for the backstop; if its file is deleted before then, its unread usage is lost.
+  Back-to-back walks narrow that window to about one walk but do not close it.
+  Desktop store-only edits to idle sessions (rename, archive, removal) do not wake the gate:
+  their titles, lineage and placement can show up to `WALK_GAP` late. Amounts are unaffected.
 - **Selection.** Each pass picks files and a read mode (`transcript_acquisition.rs`). Tail, a read
   from the saved offset, is the normal mode, so bytes read track bytes appended. A Full read has a
   named cause (new or replaced file, missing or invalid saved result, a real edit) and is counted
@@ -46,6 +64,16 @@ file-system hint / periodic listing → select file → read new bytes from save
   Unsampled native reads without a plan (including some protected/forced paths) remain unbounded and out of scope.
 - **Reduction.** One reducer per source turns lines into usage and keeps a running result. Old
   evidence is read only for the session group a change affects.
+- **Codex counting.** Every new parse uses V2. An accepted old-formula file keeps its
+  accepted body until its physical content stamp changes, including during audit,
+  retry and cursor resume. A changed file is recounted to cold V2 exactly, even when
+  the total falls; a joined group recounts together when any member changes.
+  Missing or corrupt old heads remain skipped with repair owed. Index rebuilds and
+  a new destination start with V2. V2 heads and paused jobs ignore retired counting
+  views and retain their existing Tail path. The process-local `codex_legacy_recount`
+  alarm records shrink, unknown baseline or previously unaccepted usage; retries or
+  crashes may repeat it. Historical counting slots still decode without selecting a rule.
+  Retired counting histories drop their values; two empty store roots remain for older readers.
 - **Codex rollout encodings.** Plain `.jsonl` and compressed `.jsonl.zst` use the same
   ordinary first-read selection, reducer, modification-time age rules and decoded-byte page
   budget. Exact plaintext siblings win before either header opens. Decoder memory is funded
@@ -58,17 +86,14 @@ file-system hint / periodic listing → select file → read new bytes from save
   budget and deferred-path requeue. Fill does not count as a census turn. A periodic relist
   can select files and certify their membership from the retained census while only
   non-census directories remain pending; pending census-member directories still block.
-  Compressed rollouts keep their original modification time,
-  so they age as the plain file did. Legacy held archive member keys count as already seen
-  for the ordinary first-read age gate; their values remain inert, and header/ownership
-  admission still applies. A provider-written new plaintext object takes the existing
+  Compressed rollouts keep their original modification time, so they age as the plain file did.
+  A provider-written new plaintext object takes the existing
   counted Full path; only a returning original object can continue from its saved suffix.
   A restart during its first read re-decodes the prefix, counted as decoder work, before reaching
   EOF. It does not restore a compressed decoder or introduce a stepped compressed reader.
 - **Codex ownership.** One secure header opener supplies ordinary membership proof for either
   encoding. A failure holds its file and decisions depending on it; an unknown header remains
-  a wildcard over every potentially colliding owner. Any missing header/listing proof still
-  prevents absence-based counting-evidence collection. Boundary validation covers surviving
+  a wildcard over every potentially colliding owner. Boundary validation covers surviving
   singleton sessions and joined groups across every registered home. A new file
   naming a page owner fails; unrelated new files defer to the next roster refresh.
   New directories are recursively listed with the same helper and their rollouts
@@ -129,7 +154,10 @@ file-system hint / periodic listing → select file → read new bytes from save
   release is unsafe once a copy is decided locally; fix forward. Source and
   copy uploads stay independent, so ACK order can leave a temporary gap.
   An all-covered copy-only page drops its items when the session has another
-  file; own turns still publish. A selected content twin pulls every live
+  file; own turns still publish. The first on-page file of a session carries its
+  summed body and keeps its own start; the body's last-activity clock is the
+  latest of every on-page file of that session, and only a later request clock
+  sets its end. A selected content twin pulls every live
   overlapping census main, and a selected main file (not history-held)
   pulls every live census content twin sharing a request hash. Ordinary discovery
   acquires pulled files through the existing history and resident admission gates.
@@ -395,9 +423,8 @@ backfill-state save, so re-upgrade omits the cutoff for existing destinations.
   the ordinary save. A failed save exposes the complete old or complete new state.
   A provider-written new plaintext object follows the existing replaced-file path: one counted
   Full and one whole-session replacement. Returning the original object retains ordinary Tail
-  continuation. The old archive catalogue entries remain accepted and inert; their physical rows
-  are neither hydrated nor rewritten, and old field/cause ordinals and formats stay unchanged.
-  Compatibility with older binaries is decode-only; older scheduling may replay retained work.
+  continuation. The old archive catalogue entries remain readable by key and keep their field and
+  cause ordinals. The generic retirement path deletes their rows on the next committed graph save.
 - A parser or scan-identity version bump invalidates every saved record. A change that bumps one
   also migrates saved state forward, or it explicitly accepts the full re-read.
 
@@ -459,6 +486,18 @@ retention, decode holds and unchanged held or conflicted debt grant no follow-up
 queued unblocked siblings can still advance. Terminal-unhealthy walks use the scanner's own
 retry eligibility. Battery cannot renew this reason; an AC request already issued may wake
 once after unplugging. Clean retirement or bootstrap completion ends this request.
+
+All scan-index saves use SQLite. Legacy JSON is retained only as one-time
+import input. Collection waits for verified publication and adoption. Ordinary
+source passes retry transient import/publication failures; deterministic input
+refusals retain the existing support blocker. Successful authenticated adoption
+clears it. Quarantine and user Repair use the same verified publisher at G=0;
+Repair keeps its identity and accepted-debt carry, witness and cooldown ordering.
+
+Snapshot audits start from an empty in-memory graph, finish the traversal in
+memory and aggregate every page. Each invocation reports the complete selected
+source again; the report schema is unchanged. Audit state directories retain
+only their privacy marker; old audit checkpoints are neither loaded nor updated.
 
 ## SQLite
 
@@ -552,39 +591,6 @@ exempt a new production file from the ceiling.
   restored record plus tail, a restart between pages and an upgrade produce the same totals and
   the same account placement. The money oracle in `snapshots/sampled_scan/transition_fixture.rs`
   and the `money_equivalence` CI job check this.
-
-## Billing route annotation
-
-`snapshots/billing_route.rs` labels each session's billing route (`session_billing_route:v1`).
-It is annotation only: pricing, placement, identity, row keys, hashes, body witnesses and upload
-decisions never read it, and the wire object is sent only when the receiver advertises that exact
-contract. Nothing is persisted. Codex reads the auth mode recorded on its rows and Pi accepts only
-allowlisted cloud provider and explicit auth pairs; they keep no latch: each pass takes the first
-route from the earliest hour bucket holding a known route (rows within an hour sort by row key, not
-time), and two known routes there are `signal_conflict`. Claude Code keeps in-memory latches, keyed
-by destination, source, machine and session, for known first routes only. Only the session's first
-own response (sequence order, never filtered away) can name one, and only when every physical line
-of the file decoded (the read report spans Tail resumes), no response, resolved or not, precedes it,
-the session's earliest stamped line of any kind (`claude_line_clocks`, inherited and invalid fork lines included)
-is strictly after this process started and that response has a request id, is not synthetic and
-has a complete clock whose start and end are strictly after the start (precise timestamps). Any
-other missing, unstamped or unproven input is `first_request_snapshot_missing`; a later request
-never stands in, and later requests, under the same clock rule, only join `routes_seen`. Latches
-follow one destination at a time, as the source manifests do. The status refresh publishes the
-login evaluator result with when it last changed and when it was last observed; a request is
-classified with it only when it changed at or before the request started (its preceding prompt or
-tool-result record) and was observed at or after the request ended. A request not yet covered is
-deferred to a later pass (no object meanwhile); one whose evaluator changed after it started is
-`first_request_snapshot_missing`. The evaluator never labels alone: OAuth needs that session's own
-Desktop request or a request whose own telemetry row named a valid account, an API key needs a
-native `req_`/`msg_` pair, and a cloud message or request id (`msg_bdrk_`, `msg_vrtx_`) or
-cloud-shaped model on any owned request keeps both unknown. A known first route never becomes a
-different known route (Codex/Pi: a second route in its hour turns it to `signal_conflict`); later
-proven routes join `routes_seen`. Disclosed residuals: a gateway forwarding native-looking
-ids can satisfy either conjunction, a same-session account does not prove who paid for the first
-request, and a login switched and switched back between two status refreshes is not seen, so the
-label is not fail-closed for every proxy. `PRODUCER_ENABLED` turns the annotation on in a later
-release; off, no route clock, lock, capability copy or telemetry flag is touched.
 
 ## One version
 

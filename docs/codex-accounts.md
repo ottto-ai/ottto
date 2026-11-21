@@ -219,8 +219,6 @@ While it is off:
   and not shown past the last-known cap;
 - a home with no usable saved reading reports
   `codex_quota_background_refresh_off` instead of `codex_quota_not_read_yet`;
-- an older companion app's status refresh, which cannot be told from its timer,
-  reads nothing;
 - an idle home is not renewed, so after a long idle period its next read may
   ask to sign in again.
 

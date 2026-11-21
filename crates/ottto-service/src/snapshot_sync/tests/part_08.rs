@@ -35,7 +35,9 @@ fn codex_union_capture_failure_holds_only_protected_group_and_preserves_cas() {
             let index_path = root.join("index.json");
             let progress_path = root.join("progress.json");
             let mut committed = ScanIndex::default();
-            committed.save(&index_path).unwrap();
+            committed
+                .save_fixture_for_source(&index_path, SnapshotSource::Codex)
+                .unwrap();
             let mut working = committed.clone();
             let mut result = prepare_codex_union_fixture(&root, &mut working);
             assert_eq!(result.snapshots.len(), 3);
@@ -48,7 +50,7 @@ fn codex_union_capture_failure_holds_only_protected_group_and_preserves_cas() {
                 }
                 "cas" => {
                     let mut concurrent = committed.clone();
-                    concurrent.save(&index_path).unwrap();
+                    concurrent.save_fixture(&index_path).unwrap();
                 }
                 "source" => std::fs::write(root.join("sessions/b.jsonl"), "changed\n").unwrap(),
                 _ => {}
@@ -100,7 +102,9 @@ fn codex_union_native_transport_partial_rejection_keeps_capture_and_quarantine_g
         let index_path = root.join("index.json");
         let progress_path = root.join("progress.json");
         let mut baseline = ScanIndex::default();
-        baseline.save(&index_path).unwrap();
+        baseline
+            .save_fixture_for_source(&index_path, SnapshotSource::Codex)
+            .unwrap();
         let mut working = baseline.clone();
         let mut result = prepare_codex_union_fixture(&root, &mut working);
         capture_codex_recovery_evidence(
@@ -165,7 +169,7 @@ fn codex_union_native_transport_partial_rejection_keeps_capture_and_quarantine_g
                     false,
                 )
             },
-            |progress| progress.save(&progress_path),
+            |progress| progress.save_fixture(&progress_path),
         )
         .unwrap();
         assert_eq!(outcome, ResumableUploadResult::Rejected { count: 1 });
@@ -224,6 +228,7 @@ fn codex_union_native_transport_partial_rejection_keeps_capture_and_quarantine_g
             2
         );
         std::fs::remove_dir_all(root).unwrap();
+        crate::snapshots::state_v2::close_removed_routes_for_test();
     }
 }
 mod codex_counting_lifecycle_tests {
@@ -257,7 +262,7 @@ fn codex_union_native_transport_restart(priority: bool, lose_member_after_ack: b
     let progress_path = root.join("progress.json");
     let receipt_dir = root.canonicalize().unwrap().join("receipts");
     let mut baseline = ScanIndex::default();
-    baseline.save(&index_path).unwrap();
+    baseline.save_fixture(&index_path).unwrap();
     let prepare = |index: &mut ScanIndex| prepare_codex_union_fixture(&root, index);
     let mut working = baseline.clone();
     let mut result = prepare(&mut working);
@@ -395,7 +400,7 @@ fn codex_union_native_transport_restart(priority: bool, lose_member_after_ack: b
             };
             client.upload_batch("synthetic-relay", &request, false)
         },
-        |progress| progress.save(&progress_path),
+        |progress| progress.save_fixture(&progress_path),
     )
     .unwrap();
     assert!(matches!(outcome, ResumableUploadResult::Completed));
@@ -426,6 +431,7 @@ fn codex_union_native_transport_restart(priority: bool, lose_member_after_ack: b
         assert!(held.snapshots.is_empty(), "durable standard-tier ACK must not permit a smaller replacement after loss before index promotion: {:?}", held.snapshots.iter().map(|item| item.input_tokens).collect::<Vec<_>>());
         assert!(!held.census_complete);
         std::fs::remove_dir_all(root).unwrap();
+        crate::snapshots::state_v2::close_removed_routes_for_test();
         return;
     }
     let before_promotion = ScanIndex::load(&index_path).unwrap();
@@ -467,7 +473,7 @@ fn codex_union_native_transport_restart(priority: bool, lose_member_after_ack: b
         |item: &SnapshotItem| item.snapshot_fingerprint.as_str(),
         snapshot_upload_body_witness,
         |_| panic!("durable common ACK must suppress a repeated POST"),
-        |progress| progress.save(&progress_path),
+        |progress| progress.save_fixture(&progress_path),
     )
     .unwrap();
     assert!(matches!(resumed, ResumableUploadResult::Completed));
@@ -509,6 +515,7 @@ fn codex_union_native_transport_restart(priority: bool, lose_member_after_ack: b
     assert!(quiet.snapshots.is_empty());
     assert_eq!(quiet.semantic_noop_count, 2);
     std::fs::remove_dir_all(root).unwrap();
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 fn same_source_fixture_ack(
@@ -605,7 +612,9 @@ impl SameSourceAckFixture {
         let index_path = root.join("boundary-index.json");
         let progress_path = root.join("boundary-progress.json");
         let (mut baseline, mut working, mut progress) = Self::fresh_state(&root);
-        baseline.save(&index_path).unwrap();
+        baseline
+            .save_fixture_for_source(&index_path, SnapshotSource::Codex)
+            .unwrap();
         let mut items = Self::prepare(&root, &mut working, None).snapshots;
         items.sort_by(|a, b| a.source_session_id.cmp(&b.source_session_id));
         assert_eq!(items.len(), 3);
@@ -720,7 +729,7 @@ impl SameSourceAckFixture {
             &snapshot_upload_body_witness,
             &|item: &SnapshotItem| Some(item.source_session_id.as_str()),
             &mut { upload },
-            &mut |p: &mut SnapshotUploadProgress| p.save(&self.progress_path),
+            &mut |p: &mut SnapshotUploadProgress| p.save_fixture(&self.progress_path),
         )
     }
     fn checkpoint_boundary(&mut self, authority: impl FnOnce() -> Result<()>) -> Result<usize> {
@@ -952,6 +961,7 @@ fn v2_progress_above_old_bound_uploads_receipts_and_recovers_exactly() {
             grow(&copied);
             let scanned = SameSourceAckFixture::cold_full_of(&copy, true);
             std::fs::remove_dir_all(&copy).unwrap();
+            crate::snapshots::state_v2::close_removed_routes_for_test();
             let patch = scanned
                 .iter()
                 .find(|item| item.source_session_id == f.items[2].source_session_id)
@@ -1017,7 +1027,7 @@ fn v2_progress_above_old_bound_uploads_receipts_and_recovers_exactly() {
                 },
             );
         }
-        f.progress.save(&f.progress_path).unwrap();
+        f.progress.save_fixture(&f.progress_path).unwrap();
         let bytes = std::fs::read(&f.progress_path).unwrap();
         assert!(
             phase == 0 || bytes.len() > OLD_PROGRESS_BOUND_FOR_TEST,
@@ -1055,7 +1065,7 @@ fn v2_progress_above_old_bound_uploads_receipts_and_recovers_exactly() {
                     post(items);
                     headed(items)
                 },
-                |progress| progress.save(&f.progress_path),
+                |progress| progress.save_fixture(&f.progress_path),
             )
             .unwrap();
             // Only T's head is new: the probe's.
@@ -1167,7 +1177,7 @@ fn v2_progress_above_old_bound_uploads_receipts_and_recovers_exactly() {
         for _ in 0..3 {
             f.restart_preparation();
             assert!(f.items.is_empty(), "accepted bodies stay suppressed");
-            f.working.save(&f.index_path).unwrap();
+            f.working.save_fixture(&f.index_path).unwrap();
             if adopted(&f.working) {
                 break;
             }
@@ -1263,11 +1273,11 @@ fn v2_identity_ledger_above_old_bound_recovers_cold_placement() {
             serde_json::json!({"observations":[], "value":"x".repeat(100_000)}),
         );
     }
-    progress.save(&path).unwrap();
+    progress.save_fixture(&path).unwrap();
     for snapshot in cold.snapshots.values() {
         progress.record_stored_state(snapshot, false, None).unwrap();
     }
-    progress.save(&path).unwrap();
+    progress.save_fixture(&path).unwrap();
     let after = std::fs::read(&path).unwrap();
     assert!(
         after.len() > OLD_PROGRESS_BOUND_FOR_TEST,
@@ -1392,7 +1402,7 @@ fn same_source_ack_manual_index_race_is_not_generation_only_rebased() {
     manual
         .snapshot_activity_at
         .extend(f.working.snapshot_activity_at.clone());
-    manual.save(&f.index_path).unwrap();
+    manual.save_fixture(&f.index_path).unwrap();
     let disk = std::fs::read(&f.index_path).unwrap();
     assert!(f.checkpoint_boundary(|| Ok(())).is_err());
     assert_eq!(f.baseline.generation, before);
@@ -1427,7 +1437,7 @@ fn same_source_ack_progress_manual_race_rejects_older_ledger() {
     newer
         .accepted_cache_heads
         .insert(cache_session_key("newer"), "e".repeat(64));
-    newer.save(&f.progress_path).unwrap();
+    newer.save_fixture(&f.progress_path).unwrap();
     assert!(f.checkpoint_boundary(|| Ok(())).is_err());
     assert_eq!(f.baseline.generation, before);
     assert_eq!(f.working.generation, before);
@@ -1671,7 +1681,7 @@ fn claude_p92_typed_mixed_uses_full_enrichment_order() {
         );
         assert!(stored || case != "complete", "{case}");
         let (proof, _, _) =
-            apply_claude_local_evidence_to_scan_for_test(&support, &mut candidate, &mut case_index);
+            apply_claude_local_evidence_to_scan(&support, &mut candidate, &mut case_index);
         let item = &mut candidate.snapshots[0];
         if case == "complete" {
             assert_eq!(
@@ -1758,7 +1768,7 @@ fn claude_p92_mixed_503_lost_ack_restart_preserves_candidate() {
     let body = snapshot_upload_body_witness(&candidate);
     let path = root.join("progress.json");
     let index_path = root.join("index.json");
-    index.save(&index_path).unwrap();
+    index.save_fixture(&index_path).unwrap();
     let namespace = format!("{:064x}", 99);
     let mut progress = SnapshotUploadProgress::new(
         namespace.clone(),
@@ -1781,7 +1791,7 @@ fn claude_p92_mixed_503_lost_ack_restart_preserves_candidate() {
                 code: None,
             }))
         },
-        |state| state.save(&path),
+        |state| state.save_fixture(&path),
     )
     .unwrap();
     assert_eq!(
@@ -1798,7 +1808,7 @@ fn claude_p92_mixed_503_lost_ack_restart_preserves_candidate() {
     );
     // Save/reload the existing checkpoint domains. Fresh proof reconstructs
     // the same body; a marker-only restarted binder cannot release it.
-    progress.save(&path).unwrap();
+    progress.save_fixture(&path).unwrap();
     let mut restored = SnapshotUploadProgress::load(
         &path,
         &namespace,
@@ -1844,12 +1854,12 @@ fn claude_p92_mixed_503_lost_ack_restart_preserves_candidate() {
             assert_eq!(serde_json::to_vec(&items[0]).unwrap(), expected);
             Err(anyhow!("synthetic response lost after server settlement"))
         },
-        |state| state.save(&path),
+        |state| state.save_fixture(&path),
     );
     assert!(lost.is_err());
     assert_eq!(accepted, 0);
     assert!(!restored.accepted_fingerprints.contains(&semantic));
-    restored.save(&path).unwrap();
+    restored.save_fixture(&path).unwrap();
     let mut after_loss = SnapshotUploadProgress::load(
         &path,
         &namespace,
@@ -1884,7 +1894,6 @@ fn claude_p92_mixed_503_lost_ack_restart_preserves_candidate() {
                     head_etag: Some("f".repeat(64)),
                     head_challenge: None,
                     unchanged_basis: None,
-                    retained_proof_missing: Vec::new(),
                     cache_observations_state: None,
                 });
             let request = SnapshotBatchRequest {
@@ -1899,7 +1908,7 @@ fn claude_p92_mixed_503_lost_ack_restart_preserves_candidate() {
             response.validate_entity_ack_with_head_cas(&request, true)?;
             Ok(response)
         },
-        |state| state.save(&path),
+        |state| state.save_fixture(&path),
     )
     .unwrap();
     assert_eq!(accepted, 1);
@@ -1921,12 +1930,15 @@ fn claude_p92_mixed_503_lost_ack_restart_preserves_candidate() {
             calls += 1;
             Ok(accepted_batch(1))
         },
-        |state| state.save(&path),
+        |state| state.save_fixture(&path),
     )
     .unwrap();
     assert_eq!(calls, 0);
     assert_eq!(accepted, 1, "same settled candidate is a no-op");
     std::fs::remove_dir_all(root).unwrap();
+    crate::snapshots::state_v2::close_removed_routes_for_test();
     std::fs::remove_dir_all(candidate_root).unwrap();
+    crate::snapshots::state_v2::close_removed_routes_for_test();
     std::fs::remove_dir_all(retry_root).unwrap();
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }

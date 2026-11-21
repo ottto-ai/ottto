@@ -35,7 +35,7 @@ pub(super) fn save_with(path: &Path, index: &mut ScanIndex) -> Result<bool> {
     save_with_mode(path, index, false)
 }
 pub(super) fn save_with_mode(path: &Path, index: &mut ScanIndex, claim_only: bool) -> Result<bool> {
-    save_locked(path, index, claim_only, published(path)?)
+    save_locked(path, index, claim_only).map(|()| true)
 }
 
 /// Generation of a freshly imported native fixture store.
@@ -167,10 +167,10 @@ fn off_v1_growth_is_unknown_and_diagnostics_need_no_registry() {
                                 ScanIndex::load_attributed(&path, Some(source)).unwrap();
                             assert!(index.v2.is_none());
                             assert!(index.decode_holds.is_empty());
-                            index.save(&path).unwrap();
-                            let saved: serde_json::Value =
-                                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-                            assert!(saved.get("growth_retention").is_none());
+                            let before = fs::read(&path).unwrap();
+                            let error = index.save(&path).unwrap_err();
+                            assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::ForeignBinding));
+                            assert_eq!(fs::read(&path).unwrap(), before);
                         },
                         |_| false,
                     );
@@ -183,6 +183,7 @@ fn off_v1_growth_is_unknown_and_diagnostics_need_no_registry() {
         assert!(completed.is_ok(), "OFF loads waited for the v2 registry");
     });
     fs::remove_dir_all(root).unwrap();
+    crate::snapshots::state_v2::close_removed_routes_for_test();
 }
 
 /// [regress] F5: uninstall must not flock or latch a paused v1 import route.
@@ -309,7 +310,8 @@ fn publication_pending_pause_does_not_touch_v1() {
     fs::write(&f.path, &bytes).unwrap();
     assert!(load_with(&f.path, true).unwrap().is_none());
     let mut index = ScanIndex::default();
-    after_v1_locked(&f.path, &mut index).unwrap();
+    let error = after_v1_locked(&f.path, &mut index).unwrap_err();
+    assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::DbUnavailable));
     assert_eq!(fs::read(&f.path).unwrap(), bytes);
     assert_eq!(fs::read_dir(f.path.parent().unwrap()).unwrap().count(), 1);
 }
@@ -471,7 +473,7 @@ fn real_mapper_runtime_saves_admitted_state_and_keeps_runtime_policy() {
     let mut index = load_with(&f.path, false).unwrap().unwrap();
     index.historical_replay_generation = Some("synthetic-policy".into());
     index.active_upload_context_fingerprint = Some("active-synthetic-policy".into());
-    assert!(save_locked(&f.path, &mut index, false, published(&f.path).unwrap()).unwrap());
+    assert!(save_locked(&f.path, &mut index, false).is_ok());
     // Committed row digests seed the next page; idle releases them.
     with_state(&f.path, |state| {
         assert_eq!(
@@ -488,7 +490,7 @@ fn real_mapper_runtime_saves_admitted_state_and_keeps_runtime_policy() {
         Ok(())
     })
     .unwrap();
-    assert!(save_locked(&f.path, &mut index, false, true).unwrap());
+    assert!(save_locked(&f.path, &mut index, false).is_ok());
     with_state(&f.path, |state| {
         assert!(state.save_digests.is_some());
         Ok(())
@@ -545,7 +547,8 @@ fn import_without_original_inventory_refuses_publication() {
     fs::write(&f.path, bytes).unwrap();
     assert!(load_with(&f.path, true).unwrap().is_none());
     let mut index = ScanIndex::default();
-    after_v1_locked(&f.path, &mut index).unwrap();
+    let error = after_v1_locked(&f.path, &mut index).unwrap_err();
+    assert_eq!(error.downcast_ref::<Hold>(), Some(&Hold::DbUnavailable));
     assert!(index.v2().persistence_v2.is_none());
     assert_eq!(fs::read(&f.path).unwrap(), bytes);
     for (suffix, _, _) in fence::ARTIFACTS
@@ -1256,9 +1259,10 @@ fn unknown_fields_and_interrupted_save_never_reset_progress_or_publish_partial_c
     raw["future_money"] = serde_json::json!({"owed": 19});
     fs::write(&f.path, serde_json::to_vec(&raw).unwrap()).unwrap();
     assert!(load_with(&f.path, true).unwrap().is_none());
-    let legacy = ScanIndex::load(&f.path).unwrap();
-    assert!(legacy.persistence_available());
-    assert!(legacy.v2().persistence_v2.is_none());
+    assert_eq!(
+        ScanIndex::load(&f.path).unwrap_err().downcast_ref::<Hold>(),
+        Some(&Hold::DbUnavailable)
+    );
     assert_eq!(fs::read(&progress_path).unwrap(), progress);
     assert!(!fence::sibling(&f.path, ".v2.sqlite").exists());
 
@@ -1274,7 +1278,7 @@ fn unknown_fields_and_interrupted_save_never_reset_progress_or_publish_partial_c
     let committed_context = current.historical_replay_generation.clone();
     assert!(current.prepare_historical_replay("uncommitted-context".into()));
     fill_session(&mut current);
-    assert!(save_locked(&f.path, &mut current, false, published(&f.path).unwrap()).is_err());
+    assert!(save_locked(&f.path, &mut current, false).is_err());
     with_state(&f.path, |state| {
         assert!(state.save_digests.is_none());
         Ok(())
@@ -1640,31 +1644,23 @@ fn expired_growth_claim_rides_the_next_selecting_page() {
     );
 }
 
-/// [behaviour] a bound v1 source with no support dir never opens, creates or migrates SQLite custody.
+/// [behaviour] A bound legacy source adopts SQLite even without a support directory.
 #[test]
-fn off_bound_v1_load_and_save_leave_all_database_paths_absent() {
+fn bound_v1_load_without_support_adopts_native_custody_before_saving() {
     let f = Fixture::new();
     let bytes = serde_json::to_vec(&ScanIndex::default()).unwrap();
     fs::write(&f.path, &bytes).unwrap();
     let mut index = ScanIndex::load(&f.path).unwrap();
-    assert!(index.v2().persistence_v2.is_none());
+    assert!(index.v2().persistence_v2.is_some());
+    assert_eq!(index.generation, 1);
     index.save(&f.path).unwrap();
-    assert!(f.path.exists());
-    assert!(!states().lock().unwrap().contains_key(&f.path));
-    for suffix in [
-        ".v2.sqlite",
-        ".v2.sqlite.import",
-        ".v2.sqlite.owner",
-        ".v2.sqlite-wal",
-        ".v2.sqlite-shm",
-        ".v2-ack-receipt",
-        ".v1-readonly",
-    ] {
-        assert!(
-            !fence::sibling(&f.path, suffix).exists(),
-            "OFF created {suffix}"
-        );
-    }
+    assert_eq!(index.generation, 2);
+    assert!(fence::sibling(&f.path, ".v2.sqlite").exists());
+    assert_eq!(
+        fs::read(fence::sibling(&f.path, ".v1-readonly")).unwrap(),
+        bytes
+    );
+    assert!(published(&f.path).unwrap());
 }
 
 /// [format] Legacy refusal debt survives exact decoding and ordinary save removes it on native and imported stores.

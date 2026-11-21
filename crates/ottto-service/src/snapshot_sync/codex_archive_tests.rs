@@ -89,34 +89,52 @@ impl ScanIndex {
     ) -> (ScanIndex, Vec<Vec<u8>>) {
         let mut index = self;
         let mut posts = Vec::new();
-        let root = crate::test_scratch::ScratchDir::canonical("archive-upload-checkpoint");
         let route = crate::snapshots::e2_pipeline_scan_fixture::route_of(&index);
-        let index_path = route.clone().unwrap_or_else(|| root.join("index.json"));
+        let index_path = route.clone().unwrap_or_else(|| {
+            // The returned index retains this route between pages; the corpus
+            // owns its scanned roots and removes them when the fixture ends.
+            let root = index
+                .files
+                .keys()
+                .chain(previous.files.keys())
+                .next()
+                .and_then(|key| Path::new(key).parent().map(Path::to_owned))
+                .expect("archive checkpoint has a fixture scan root");
+            root.join(crate::test_scratch::unique_name(
+                "archive-upload-checkpoint",
+            ))
+            .join("index.json")
+        });
         // A prepare-time carry already committed both old/new keys. Match
         // the production constructor's baseline, without admitting later work.
         let prepared = (route.is_some() && index.generation != previous.generation)
             .then(|| ScanIndex::load(&index_path).unwrap());
-        let previous = prepared.as_ref().unwrap_or(previous);
-        let progress_path = snapshot_upload_progress_path(&index_path);
-        if route.is_none() {
-            std::fs::write(&index_path, serde_json::to_vec(previous).unwrap()).unwrap();
+        let seeded = route.is_none().then(|| {
+            crate::snapshots::e2_pipeline_scan_fixture::bind_source_for_test(
+                &index_path,
+                SnapshotSource::Codex,
+            );
+            crate::snapshots::e2_pipeline_scan_fixture::seed_index_for_test(previous, &index_path)
+        });
+        let previous = prepared.as_ref().or(seeded.as_ref()).unwrap_or(previous);
+        if let Some(seed) = &seeded {
+            index.retain_persistence_baseline_from(seed);
+            index.generation = seed.generation;
         }
-        let expected = test_upload_progress();
-        let destination = route
-            .as_ref()
-            .and_then(|path| path.parent()?.file_name()?.to_str())
-            .unwrap_or(&expected.destination_namespace_hash);
+        let progress_path = snapshot_upload_progress_path(&index_path);
+        let (_, destination) =
+            crate::snapshots::e2_pipeline_scan_fixture::binding_for_test(&index_path);
         let mut progress = SnapshotUploadProgress::load_for_index(
             &index,
             &index_path,
             &progress_path,
-            destination,
+            &destination,
             snapshot_quarantine_witness(SnapshotSource::Codex),
         )
         .unwrap();
         progress.context_receipt_candidates =
             index.file_upload_context_ack_candidates(&scan.snapshots, &BTreeMap::new());
-        progress.save(&progress_path).unwrap();
+        progress.save_fixture(&progress_path).unwrap();
         // The service computes census-absent ACKs before the upload.
         let census_absent = progress.complete_census_ack_retirements(&index, scan.census_complete);
         if outcome != "partial" {
@@ -139,7 +157,7 @@ impl ScanIndex {
                         ack_retention_tests::exact_ack(items)
                     }
                 },
-                |state| state.save(&progress_path),
+                |state| state.save_fixture(&progress_path),
             )
             .unwrap();
             if outcome == "shed" {
@@ -189,10 +207,10 @@ impl ScanIndex {
                 &progress.accepted_body_contexts,
             );
             scan.validate_codex_checkpoint().unwrap();
-            index.save(&index_path).unwrap();
+            index.save_fixture(&index_path).unwrap();
             progress.add_saved_handoff_retirements(&mut retired, &index);
             progress.retire_planned_acks_after_index_save(&index, &retired, &BTreeSet::new());
-            progress.finish_cycle(&progress_path).unwrap();
+            progress.finish_cycle_fixture(&progress_path).unwrap();
             return (ScanIndex::load(&index_path).unwrap(), posts);
         }
         if outcome == "accept" {
@@ -202,7 +220,7 @@ impl ScanIndex {
             for witness in progress.accepted_body_witnesses.values_mut() {
                 *witness = "0".repeat(64);
             }
-            progress.save(&progress_path).unwrap();
+            progress.save_fixture(&progress_path).unwrap();
         }
         let checkpoint = checkpoint_partial_snapshot_index(
             &index,
@@ -272,12 +290,18 @@ pub(crate) fn assert_archive_debt_preserves_replay_progress(
     .unwrap();
     let destination = snapshot_upload_destination_namespace(&device, "device-secret");
     let daemon = test_daemon("otm_test");
-    let path = support.join("index.json");
-    std::fs::write(&path, serde_json::to_vec(&index).unwrap()).unwrap();
-    let progress_path = snapshot_upload_progress_path(&path);
-    let mut progress = SnapshotUploadProgress::new(
-        destination.clone(),
-        snapshot_quarantine_witness(SnapshotSource::Codex),
+    let path = support
+        .join("snapshots/destinations")
+        .join(&destination)
+        .join("codex-scan-index-v3.json");
+    index = crate::snapshots::e2_pipeline_scan_fixture::seed_index_for_test(&index, &path);
+    let (progress_path, mut progress) = routed_progress(
+        &index,
+        &path,
+        SnapshotUploadProgress::new(
+            destination.clone(),
+            snapshot_quarantine_witness(SnapshotSource::Codex),
+        ),
     );
     progress.save(&progress_path).unwrap();
     let fixture = ContinuationFixture {

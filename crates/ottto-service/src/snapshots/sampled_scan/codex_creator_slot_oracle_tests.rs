@@ -23,7 +23,7 @@ fn shared_codex_creator_slot_naming_matches_cold_full() {
     const SECOND: &str = "2338a80a-f36e-4cbc-a5bb-50fc66430ba5";
     const UNMATCHED: &str = "3338a80a-f36e-4cbc-a5bb-50fc66430ba5";
     let source = SnapshotSource::Codex;
-    let _cutover = crate::snapshots::TestCutover::set(0);
+
     let hash = |kind: &str, session: &str| {
         let prefix = if kind == "account" {
             "user"

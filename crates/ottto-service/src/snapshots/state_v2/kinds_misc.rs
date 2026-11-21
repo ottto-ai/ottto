@@ -34,6 +34,28 @@ fn read_field<T: serde::de::DeserializeOwned + Serialize>(
 ) -> Result<T> {
     mapper::field_read(tx, kind, field_mode(kind), seed, default)
 }
+
+/// Older readers require these roots, even though their history is retired.
+/// Only the exact empty encodings survive; no member or diagnostic is retained.
+pub(super) fn empty_counting_root(tx: &mut dyn Transaction, h: &Header) -> Result<bool> {
+    let RowKey::Record {
+        kind,
+        key_bytes,
+        position: 0,
+    } = &h.key
+    else {
+        return Ok(false);
+    };
+    if !key_bytes.is_empty() {
+        return Ok(false);
+    }
+    let expected: &[u8] = match kind.name() {
+        "v1_field.codex_counting_tombstones" => b"0",
+        "v1_field.codex_counting_evicted_legacy" => b"[]",
+        _ => return Ok(false),
+    };
+    Ok(h.len == expected.len() as u64 && mapper::bytes(tx, h)? == expected)
+}
 #[derive(Serialize, Deserialize, Default)]
 struct HoldMetadata {
     provenance: (u128, u64),
@@ -357,6 +379,18 @@ pub(super) fn rows(index: &ScanIndex, rows: &mut mapper::Rows<'_>, cx: &mut Kind
         ($($t:tt)*) => {};
     }
     scan_index_fields!(each save);
+    mapper::field_write(
+        rows,
+        "v1_field.codex_counting_tombstones",
+        &BTreeMap::<String, ()>::new(),
+        mapper::Members::Map,
+    )?;
+    mapper::field_write(
+        rows,
+        "v1_field.codex_counting_evicted_legacy",
+        &Vec::<()>::new(),
+        mapper::Members::Field,
+    )?;
     write_holds(index, rows)?;
     rows.raw(
         RowKey::Meta("field_presence".into()),
@@ -406,6 +440,18 @@ pub(super) fn hydrate_txn(
         ($($t:tt)*) => {};
     }
     scan_index_fields!(each load);
+    for kind in [
+        "v1_field.codex_counting_tombstones",
+        "v1_field.codex_counting_evicted_legacy",
+    ] {
+        let key = mapper::key(kind, "", 0)?;
+        if let Some(h) = tx.get(&key)? {
+            if empty_counting_root(tx, &h)? {
+                // Match the ordinary row writer's digest without hydrating history.
+                mapper::read::<serde_json::Value>(tx, &h, Some(&mut cx.digests))?;
+            }
+        }
+    }
     read_holds(index, tx, Some(&mut cx.digests))
 }
 pub(super) fn references(

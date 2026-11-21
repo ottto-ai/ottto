@@ -23,9 +23,7 @@ use super::{
     claude_request_money, deserialize_lenient_claude_history_cutoff, deserialize_lenient_move_hold,
     deserialize_lenient_true, terminal_contract_retry,
 };
-use serde_lenient::{
-    deserialize_lenient_default, deserialize_lenient_map, deserialize_unsettled_causes,
-};
+use serde_lenient::{deserialize_lenient_default, deserialize_unsettled_causes};
 
 /// Saved only by the hand-written `impl Serialize` in `lenient_decode.rs`; add
 /// each new field's save rule there (serde `skip_serializing*` keys here are inert).
@@ -43,8 +41,6 @@ pub struct ScanIndex {
     pub(super) persistence_unavailable: [Option<scan_index_persistence::MapUnavailable>; 3],
     #[serde(skip)]
     pub(super) persistence_controls: Option<Arc<lenient_decode::PersistenceControls>>,
-    #[serde(skip)]
-    pub(super) persistence_legacy_recovery: Option<Arc<scan_index_persistence::LegacyRecovery>>,
     #[serde(skip)]
     pub(super) decode_holds: lenient_decode::Holds,
     /// RAM-only pacing spans ordinary + continuation pages, never durable authority.
@@ -309,11 +305,6 @@ pub struct ScanIndex {
     /// indexes can only treat as unknown/incomplete.
     #[serde(default)]
     pub confirmed_empty_files: BTreeSet<String>,
-    /// Scan-local moved-session evidence from the existing bounded header
-    /// inventory. Never serialized or used as file/body settlement evidence.
-    #[serde(skip)]
-    pub(super) codex_counting_moved_evidence:
-        BTreeMap<String, sources::codex::counting::version::AckEvidence>,
     /// Final post-policy entity fingerprints produced by each transcript.
     /// Most files contain one session; the set preserves exact entity grain
     /// for split/provider files instead of hiding all but an arbitrary last.
@@ -438,26 +429,15 @@ pub struct ScanIndex {
     /// Persisted alarm throttle; a future value stays throttled on rollback.
     #[serde(default, deserialize_with = "deserialize_lenient_default")]
     pub(super) accepted_rebuild_last_alarm_unix_seconds: Option<u64>,
-    /// Hash-only counting evidence of retired, unprotected Codex entries, by
-    /// owner, so a moved session's evidence outlives its old entry being
-    /// pruned on an earlier page. Written whatever the cutover, bounded by
-    /// `sources::codex::counting::version::MAX_COUNTING_TOMBSTONES`. Never file/body
-    /// settlement evidence. Type damage decodes as empty, like a lost index.
-    /// Appended serialized slot, so older positional indexes keep their slots.
-    #[serde(default, deserialize_with = "deserialize_lenient_map")]
-    pub(super) codex_counting_tombstones:
-        BTreeMap<String, sources::codex::counting::version::CountingTombstone>,
+    /// Retired counting history: preserve the positional slot, retain no values.
+    #[serde(rename = "codex_counting_tombstones", default, skip_serializing)]
+    pub(super) retired_codex_counting_tombstones: serde::de::IgnoredAny,
     /// Retired replay slot: drain old values without retaining authority.
     #[serde(rename = "reread_guard", default, skip_serializing)]
     pub(super) retired_reread_guard: serde::de::IgnoredAny,
-    /// Diagnostic-only bounded FIFO of evicted Legacy tombstones. Appended
-    /// serialized slot; old indexes default empty, damaged values are dropped.
-    #[serde(default, deserialize_with = "deserialize_lenient_default")]
-    pub(super) codex_counting_evicted_legacy:
-        sources::codex::counting::version::EvictedLegacyOwners,
-    /// Scan-local cap eviction events by safety class; drained into receipts.
-    #[serde(skip)]
-    pub(super) codex_counting_evictions: [u64; 3],
+    /// Retired counting diagnostic history, decoded and dropped.
+    #[serde(rename = "codex_counting_evicted_legacy", default, skip_serializing)]
+    pub(super) retired_codex_counting_evicted_legacy: serde::de::IgnoredAny,
     /// Appended persisted field: preserve every older positional index slot.
     #[serde(default)]
     pub(crate) upload_ack_retirement_handoff: Option<UploadAckRetirementHandoff>,
@@ -476,7 +456,7 @@ pub struct ScanIndex {
     #[serde(default, deserialize_with = "deserialize_lenient_default")]
     pub(crate) claude_money_birth_store: claude_money_birth_store::BirthStore,
     /// Inventory fence for the Desktop pagination cursor, never identity proof.
-    /// The version prefix rejects #851's legacy digest; an absent/mismatched
+    /// The version prefix rejects the legacy digest. An absent or mismatched
     /// fence restarts discovery before any census can certify completeness.
     /// Reuses the existing appended positional slot.
     #[serde(
@@ -624,7 +604,6 @@ impl Default for ScanIndex {
             persistence_root: None,
             persistence_unavailable: [None; 3],
             persistence_controls: None,
-            persistence_legacy_recovery: None,
             decode_holds: lenient_decode::Holds::default(),
             withheld_memo: Default::default(),
             first_read_pending: false,
@@ -709,10 +688,8 @@ impl Default for ScanIndex {
             retired_context_curve_replay_epoch: serde::de::IgnoredAny,
             retired_completed_context_curve_replay_generation: serde::de::IgnoredAny,
             confirmed_empty_files: BTreeSet::new(),
-            codex_counting_moved_evidence: BTreeMap::new(),
-            codex_counting_tombstones: BTreeMap::new(),
-            codex_counting_evicted_legacy: Default::default(),
-            codex_counting_evictions: [0; 3],
+            retired_codex_counting_tombstones: serde::de::IgnoredAny,
+            retired_codex_counting_evicted_legacy: serde::de::IgnoredAny,
             file_snapshot_fingerprints: SharedMap::default(),
             snapshot_activity_at: SharedMap::default(),
             accepted_snapshot_fingerprints: Default::default(),

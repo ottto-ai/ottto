@@ -79,24 +79,6 @@ pub(in crate::snapshots) fn deserialize_codex_protected_owner<'de, D: serde::Des
     let value = Option::<Value>::deserialize(deserializer)?;
     Ok(value.map(|value| value.as_str().unwrap_or("").to_owned()))
 }
-/// U1a: decode a string-keyed map one entry at a time; entries this binary
-/// cannot decode (unknown tag, newer shape) are dropped. A non-object is an
-/// empty map, so this field can never quarantine the index.
-pub(in crate::snapshots) fn deserialize_lenient_map<'de, D, V>(
-    deserializer: D,
-) -> std::result::Result<BTreeMap<String, V>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    V: serde::de::DeserializeOwned,
-{
-    let Value::Object(raw) = Value::deserialize(deserializer)? else {
-        return Ok(BTreeMap::new());
-    };
-    Ok(raw
-        .into_iter()
-        .filter_map(|(key, value)| serde_json::from_value(value).ok().map(|value| (key, value)))
-        .collect())
-}
 /// Decode a cost-only leaf as a whole; any value this binary cannot decode
 /// (wrong shape, newer layout) is its empty default, never an index error.
 pub(in crate::snapshots) fn deserialize_lenient_default<'de, D, V>(

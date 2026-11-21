@@ -87,7 +87,7 @@ fn account_rule_gates_on_the_request_provider_time() {
     );
 }
 
-/// [money] B9: both native-copy rebuilds keep `trust_from`, so a copied
+/// [money] B9: the native-copy rebuild keeps `trust_from`, so a copied
 /// prefix straddling T keeps the org line from it.
 #[test]
 fn native_copy_rebuilds_keep_trust_from() {
@@ -100,11 +100,6 @@ fn native_copy_rebuilds_keep_trust_from() {
         .expect("the copied repeat is excluded");
     assert_eq!(
         (decided.trust_from, orgs(&decided, [4, 9])),
-        (Some(5), [org_hash(ORG_1), org_hash(ORG_2)])
-    );
-    accounts.finish_native(Some(&markers), true);
-    assert_eq!(
-        (accounts.trust_from, orgs(&accounts, [4, 9])),
         (Some(5), [org_hash(ORG_1), org_hash(ORG_2)])
     );
 }

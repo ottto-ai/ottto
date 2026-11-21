@@ -370,6 +370,47 @@ fn summed() -> (Corpus, ScanIndex, PathBuf, PathBuf) {
     (c, index, main, twin)
 }
 
+/// [regress] Summed path twins emit the later file's last clock whichever
+/// file carries the body, with no end below or at it.
+#[test]
+#[serial(client_report)]
+fn summed_contributors_share_the_later_last_clock_in_either_order() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    with_e2(|| {
+        let (c, _, main, twin) = summed();
+        let clocks = [false, true].map(|main_first| {
+            // Unrouted: each arm reads both files fresh, independent of the
+            // seeded route and of the other arm.
+            let mut page = c.raw(
+                &E2ScanFixture::default(),
+                ScanIndex::default(),
+                100,
+                false,
+                &[],
+            );
+            let carrier = if main_first { &main } else { &twin };
+            let carrier = page.index.files[carrier.to_string_lossy().as_ref()]
+                .source_file_fingerprint
+                .clone();
+            page.scan
+                .snapshots
+                .sort_by_key(|item| item.source_file_fingerprint.as_ref() != Some(&carrier));
+            page.enrich(&c);
+            let item = body(&page, ROOT).unwrap();
+            assert_eq!(item.source_file_fingerprint.as_ref(), Some(&carrier));
+            assert_eq!(item.request_count, 2);
+            (
+                item.source_last_activity_at.clone(),
+                item.source_ended_at.clone(),
+            )
+        });
+        assert_eq!(clocks[0], clocks[1]);
+        assert_eq!(clocks[0], (Some(B.1.to_owned()), None));
+    });
+}
+
 #[test]
 #[serial(client_report)]
 fn summed_contributors_keep_only_their_own_counted_hashes() {

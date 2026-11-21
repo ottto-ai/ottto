@@ -49,7 +49,7 @@ fn production_import_preserves_pre_archive_presence_and_rows() {
             .collect();
         let original = Original::read(&c.path).unwrap();
         assert_eq!(original.presence, expected, "{shape}");
-        let index = ScanIndex::load(&c.path).unwrap();
+        let index = crate::snapshots::e2_pipeline_scan_fixture::read_legacy_for_test(&c.path);
         let mut db =
             sqlite::Sqlite::create_import(&fence::sibling(&c.path, ".v2.sqlite.import")).unwrap();
         db.path_extractor(kinds::private_paths);
@@ -111,7 +111,7 @@ fn import_carries_archive_custody_from_a_v1_original() {
     assert!(!original
         .presence
         .contains_key("archive_deferred_alarm_count"));
-    let index = ScanIndex::load(&c.path).unwrap();
+    let index = crate::snapshots::e2_pipeline_scan_fixture::read_legacy_for_test(&c.path);
     assert!(serde_json::to_value(&index)
         .unwrap()
         .get("archives")

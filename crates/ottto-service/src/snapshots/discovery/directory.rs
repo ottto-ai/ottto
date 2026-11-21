@@ -144,7 +144,7 @@ fn directory_read_fault<T>(
 
 /// Runs `run` with a directory entry/type read fault, for tests only.
 #[cfg(test)]
-pub(in crate::snapshots) fn with_directory_read_fault<T>(
+pub(crate) fn with_directory_read_fault<T>(
     fault: impl FnMut(&Path, bool) -> bool + 'static,
     run: impl FnOnce() -> T,
 ) -> T {
@@ -219,6 +219,7 @@ pub(in crate::snapshots) fn advance_bounded_directory_traversal_with_budget(
                    members: &mut usize| {
         if let Some(mut saved) = saved {
             saved.listing_changes_without_hint = counts.listing_changes_without_hint;
+            saved.listing_changes_by_class = counts.listing_changes_by_class;
             saved.listing_owed_requeued = counts.listing_owed_requeued;
             saved.discovered_file_count += std::mem::take(members);
             *counts = saved;
@@ -331,7 +332,8 @@ pub(in crate::snapshots) fn advance_bounded_directory_traversal_with_budget(
             )
             .collect();
         // Listed names. A key missing only from a partial listing is just a
-        // nominee: the absence proof refuses any key still present.
+        // nominee: the absence proof refuses any key still present. A listed
+        // Claude entry proven gone before its lstat is nominated directly.
         let mut names = BTreeSet::new();
         for entry in entries {
             let entry = match directory_read_fault(&directory.path, false, entry) {
@@ -387,11 +389,33 @@ pub(in crate::snapshots) fn advance_bounded_directory_traversal_with_budget(
             let metadata = match entry.metadata() {
                 Ok(metadata) => metadata,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    disappearance_diagnostics::not_found(
-                        &mut traversal.counts.disappeared_file_count,
-                        source,
-                        disappearance_diagnostics::Site::WalkEntry,
-                    );
+                    // Gone after read_dir. A securely absent Claude entry is
+                    // a removal, its indexed key nominated for the page's
+                    // proof. The key stays observed, so a recreation before
+                    // that proof keeps its entry for the next generation.
+                    if source == SnapshotSource::ClaudeCode
+                        && sampled_audit::proven_absent(
+                            &path,
+                            std::slice::from_ref(&directory.scan_root),
+                        )
+                    {
+                        debt.unlisted();
+                        disappearance_diagnostics::not_found_removal(
+                            source,
+                            disappearance_diagnostics::Site::WalkEntry,
+                        );
+                        let key = local_index_key(&path);
+                        if index.files.contains_key(&key) {
+                            traversal.observed_index_keys.insert(key.clone());
+                            unlisted.insert(key);
+                        }
+                    } else {
+                        disappearance_diagnostics::not_found(
+                            &mut traversal.counts.disappeared_file_count,
+                            source,
+                            disappearance_diagnostics::Site::WalkEntry,
+                        );
+                    }
                     continue;
                 }
                 Err(_) => {
@@ -511,22 +535,25 @@ pub(in crate::snapshots) fn advance_bounded_directory_traversal_with_budget(
             );
             traversal.counts.discovered_file_count += 1;
             let first_observed = traversal.observed_index_keys.insert(key);
+            let queued = pending
+                .get(&path)
+                .map(|&at| &traversal.pending_candidates[at]);
+            if changed && !queued.map_or(directory.watcher_hint, |queued| queued.watcher_hint) {
+                let root = &directory.scan_root;
+                (traversal.counts).note_change_without_hint(source, root, &path, first_observed);
+            }
 
             if let Some(&position) = pending.get(&path) {
                 let existing = traversal
                     .pending_candidates
                     .get_mut(position)
                     .expect("walk queue position");
-                traversal.counts.listing_changes_without_hint +=
-                    u64::from(changed && !existing.watcher_hint);
                 if !relisting {
                     existing.census_member = true;
                 }
                 existing.watcher_hint |= directory.watcher_hint || changed;
             } else {
                 // Changed indexed files get hint priority even on a census walk.
-                traversal.counts.listing_changes_without_hint +=
-                    u64::from(changed && !directory.watcher_hint);
                 traversal.counts.listing_owed_requeued += u64::from(owed_unchanged);
                 relisted_members += usize::from(relisting && census_member && first_observed);
                 pending.insert(path.clone(), traversal.pending_candidates.len());
@@ -713,8 +740,6 @@ pub(in crate::snapshots) fn reconcile_missing_index_entries_with_side(
                 .files
                 .get(key)
                 .is_some_and(ScanIndexEntry::codex_history_is_protected)
-                || (source == SnapshotSource::Codex
-                    && !sources::codex::counting::version::tombstone_before_retire(index, key))
             {
                 index
                     .files
@@ -733,7 +758,6 @@ pub(in crate::snapshots) fn reconcile_missing_index_entries_with_side(
                 .files
                 .get(key)
                 .is_some_and(ScanIndexEntry::retain_history_evidence)
-            && sources::codex::counting::version::tombstone_before_retire(index, key)
         {
             index.drop_file_entry(key);
             index.file_snapshot_fingerprints.remove(key);
@@ -897,8 +921,7 @@ pub(crate) const FIRST_READ_WINDOW_DAYS: u64 = 60;
 /// read. Any read evidence keeps the walk window: an index entry (it also
 /// carries every recovery and verification debt), confirmed-empty, an account
 /// hold, a committed Tail head (G7 debt included; an unreadable store counts
-/// as one), or a legacy held archive member key. The latter grants eligibility
-/// only; ordinary header and ownership admission still apply.
+/// as one).
 /// Checked where a file is first admitted (the walk, a watcher hint, the Codex
 /// roster refresh). Queued work and the open recheck keep the walk window.
 pub(in crate::snapshots) fn first_read_aged(
@@ -917,9 +940,7 @@ pub(in crate::snapshots) fn first_read_aged(
         || index.confirmed_empty_files.contains(&key)
         || index.claude_account_deferred_holds.contains_key(&key)
         || (!matches!(state_v2::tail_route_path(index), Ok(None))
-            && (!matches!(state_v2::load_head(index, &key, u32::MAX), Ok(None))
-                || (codex_archive_path(path)
-                    && !matches!(state_v2::legacy_archive_was_seen(index, &key), Ok(false)))));
+            && !matches!(state_v2::load_head(index, &key, u32::MAX), Ok(None)));
     !read
 }
 

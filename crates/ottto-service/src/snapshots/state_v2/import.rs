@@ -1,8 +1,7 @@
-//! Pre-publication pacing and the semantic mapper boundary.
+//! Verified graph publication and the semantic mapper boundary.
 use super::*;
 use anyhow::bail;
 use std::path::Path;
-use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -21,21 +20,16 @@ impl std::fmt::Display for Pause {
     }
 }
 impl std::error::Error for Pause {}
-/// Every attempt, whatever its pause class, is retried after one fixed day.
-#[derive(Default)]
-pub(super) struct Pace {
-    attempts: u64,
-    next: Option<Instant>,
-}
-impl Pace {
-    pub(super) fn start(&mut self, now: Instant) -> Option<bool> {
-        if self.next.is_some_and(|next| now < next) {
-            return None;
+impl Pause {
+    pub(super) fn hold(self) -> Hold {
+        match self {
+            Self::Io | Self::Mismatch => Hold::ReloadRequired,
+            Self::Partial
+            | Self::Malformed
+            | Self::UnknownClass
+            | Self::Oversize
+            | Self::UnsafeParent => Hold::DbUnavailable,
         }
-        let first = self.attempts == 0;
-        self.attempts = self.attempts.saturating_add(1);
-        self.next = Some(now + Duration::from_secs(24 * 3600));
-        Some(first)
     }
 }
 
@@ -51,16 +45,24 @@ pub(super) fn import_generation(index: &ScanIndex, original: &Original) -> Resul
         .checked_add(u64::from(original.missing.is_none()))
         .ok_or_else(|| Pause::Oversize.into())
 }
+#[cfg(test)]
 pub(super) fn import_graph(
     store: &mut sqlite::Sqlite,
     index: &ScanIndex,
     original: Option<&Original>,
 ) -> Result<KindCx> {
     let original = original.ok_or(Pause::Mismatch)?;
+    map_graph_at(store, index, original, import_generation(index, original)?)
+}
+fn map_graph_at(
+    store: &mut sqlite::Sqlite,
+    index: &ScanIndex,
+    original: &Original,
+    generation: u64,
+) -> Result<KindCx> {
     original.unchanged()?;
     let mut tx = store.begin(TxnMode::Write)?;
     let identity = identity(&mut tx)?;
-    let generation = import_generation(index, original)?;
     anyhow::ensure!(identity.fence_generation == generation, Pause::Mismatch);
     let mut cx = KindCx::default();
     cx.binding = Some(identity.binding.clone());
@@ -74,6 +76,42 @@ pub(super) fn import_graph(
     // an absent original keeps G=0 until its first collection save.
     let mut tx = store.begin(TxnMode::Read)?;
     verify_normalized_at(&mut tx, index, original, identity.binding, generation)
+}
+/// The only graph publication: preserve input, map, read back, then fence.
+/// Authorized rebuilds use an empty inventory and G=0; the caller retains
+/// the damaged witness and CheckpointLock and does not adopt a runtime here.
+pub(super) fn publish_graph(
+    path: &Path,
+    index: &ScanIndex,
+    original: &Original,
+    generation: u64,
+    latched: &mut bool,
+    pending: &mut Option<(Identity, Option<fence::InputStamp>)>,
+) -> Result<KindCx> {
+    original.unchanged()?;
+    telemetry::event(
+        "orphan_removed",
+        &fence::cleanup_unpublished(path, *latched)?,
+    );
+    let mut random = [0_u8; 16];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
+    let identity = Identity {
+        format: FORMAT,
+        db_id: crate::hex::encode(&random),
+        binding: super::super::scan_index_integration::scan_index_storage_binding(path)
+            .ok_or(Hold::ForeignBinding)?,
+        fence_generation: generation,
+    };
+    original.preserve(path)?;
+    telemetry::baseline(path);
+    let mut db = sqlite::Sqlite::create_import(&fence::sibling(path, ".v2.sqlite.import"))?;
+    db.control("identity", &identity)?;
+    db.control("generation", &index.generation)?;
+    let cx = map_graph_at(&mut db, index, original, generation)?;
+    *pending = Some((identity.clone(), fence::input_stamp(path)?));
+    original.publish_import(path, &identity, db, latched)?;
+    *pending = None;
+    Ok(cx)
 }
 /// Read every semantic row through Transaction::read_value, verifying
 /// value digests while decoding. Never return
@@ -123,7 +161,6 @@ pub(super) fn save(
         next,
         super::super::sampled_scan::now_seconds(),
     );
-    super::super::lenient_decode::check_held_output(next)?;
     next.prune_request_contributions();
     let mut saved = kinds::save_graph(db, identity, previous, next, cx)?;
     next.deleted_holders.clear();
@@ -677,7 +714,7 @@ impl Original {
         self.unchanged()?;
         fence::publish(path, identity, latched)
     }
-    fn verify_baseline(&self, path: &Path) -> Result<()> {
+    pub(super) fn verify_baseline(&self, path: &Path) -> Result<()> {
         for (n, source) in self.files.iter().enumerate() {
             let target = if n == 0 {
                 fence::sibling(path, ".v1-readonly")
@@ -909,6 +946,7 @@ mod application_cases {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
 
     struct Corpus {
         dir: PathBuf,
@@ -1137,9 +1175,7 @@ mod application_cases {
             current.traversal.as_mut().unwrap().context_fingerprint = "x".repeat(16 * 1024 * 1024);
             let wide = serde_json::to_vec(&current.traversal).unwrap();
             assert!(wide.len() > 16 * 1024 * 1024);
-            assert!(
-                super::super::runtime::save_locked(&c.path, &mut current, false, true).unwrap()
-            );
+            assert!(super::super::runtime::save_locked(&c.path, &mut current, false).is_ok());
             let saved = serde_json::to_vec(&current).unwrap();
             let reloaded = super::super::runtime::load_locked(&c.path, false, true)
                 .unwrap()
@@ -1513,7 +1549,8 @@ mod application_cases {
             ..Default::default()
         };
         // The production v1 loader owns all original-span repair/freeze ordering.
-        let mut normalized = ScanIndex::load(&c.path).unwrap();
+        let mut normalized =
+            crate::snapshots::e2_pipeline_scan_fixture::read_legacy_for_test(&c.path);
         assert!(normalized.decode_holds_family("family"));
         assert!(normalized.claude_usage_authority_quarantine.is_empty());
         assert!(normalized.claude_usage_family_witnesses.is_empty());

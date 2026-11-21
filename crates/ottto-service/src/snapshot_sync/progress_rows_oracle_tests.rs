@@ -193,7 +193,7 @@ fn settle(page: &mut Page, progress: &mut SnapshotUploadProgress, index_path: &P
         &page.scan.snapshots,
         &progress.fresh_context_body_acks,
     );
-    page.index.save(index_path).unwrap();
+    page.index.save_fixture(index_path).unwrap();
     progress.finish_cycle(&path).unwrap();
 }
 
@@ -505,14 +505,14 @@ fn published_with_json_ledger(
         .bind_test_key(Some([0x42; 32]));
     let mut page = native_page(source, c, ScanIndex::default(), 100, false);
     let (status, _) = send_with(source, &page, &mut progress, ack, |progress| {
-        progress.save(&path)
+        progress.save_legacy_fixture(&path, None)
     });
     assert_eq!(status.unwrap(), ResumableUploadResult::Completed);
     for n in 1..=3 {
         seed_keyed(&mut progress, n);
     }
     seed_money_maps(&mut progress);
-    progress.save(&path).unwrap();
+    progress.save_legacy_fixture(&path, None).unwrap();
     let mut bytes = std::fs::read(&path).unwrap();
     if let Some(generation) = generation {
         let mut value: Value = serde_json::from_slice(&bytes).unwrap();
@@ -1137,7 +1137,7 @@ fn progress_rows_own_graph_saves_never_reload_the_next_page() {
                     first
                         .index
                         .record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
-                    first.index.save(path).unwrap();
+                    first.index.save_fixture(path).unwrap();
                     first.index
                 }
             };
@@ -1170,8 +1170,54 @@ fn progress_rows_own_graph_saves_never_reload_the_next_page() {
     });
 }
 
-/// [money] For every source, uploads before publication keep saving the JSON
-/// ledger; the first load after publication imports exactly those bytes,
+/// Pre-publication progress cannot advance a JSON ledger or its pending ACK.
+#[test]
+fn unpublished_progress_holds_without_touching_legacy_ack_input() {
+    for (slot, source) in SOURCES.into_iter().enumerate() {
+        let c = corpus(&format!("unpublished-progress-{}", source.api_slug()));
+        let index_path = c.base.join("unpublished").join("index.json");
+        std::fs::create_dir_all(index_path.parent().unwrap()).unwrap();
+        let path = progress_path(&index_path);
+        let ack_path = receipt(&index_path);
+        let mut progress =
+            SnapshotUploadProgress::new(namespace(), snapshot_quarantine_witness(source));
+        progress.record_body(&"b".repeat(64), &"c".repeat(64));
+        let before = serde_json::to_vec(&progress).unwrap();
+        write_owned(&path, &before);
+        let ack = b"legacy-pending-ack-input";
+        write_owned(&ack_path, ack);
+        let error = SnapshotUploadProgress::load_for_index(
+            &ScanIndex::default(),
+            &index_path,
+            &path,
+            &namespace(),
+            snapshot_quarantine_witness(source),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<v2::Hold>(),
+            Some(&v2::Hold::ReloadRequired)
+        );
+        for _ in 0..2 {
+            let error = progress.save(&path).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<v2::Hold>(),
+                Some(&v2::Hold::ReloadRequired)
+            );
+            crate::snapshots::scan_index_health::observe_failure(source, &error);
+            assert!(crate::snapshots::scan_index_health::observations()[2][slot]
+                .0
+                .is_some());
+            assert_eq!(serde_json::to_vec(&progress).unwrap(), before);
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert_eq!(std::fs::read(&ack_path).unwrap(), ack);
+            assert!(!index_path.exists());
+        }
+    }
+}
+
+/// [money] For every source, a released writer's legacy fixture ledger is
+/// imported by the first load after publication with exactly those bytes,
 /// every money map included, at progress generation 1 whatever the JSON
 /// generation (0 or many saves), and the route then restarts quietly.
 #[test]
@@ -1634,7 +1680,7 @@ fn progress_rows_codex_continuation_loads_the_route_rows() {
                 window_start_unix_seconds: now.saturating_sub(30 * 86_400),
             }),
         );
-        index.save(path).unwrap();
+        index.save_fixture(path).unwrap();
         progress.save(&progress_path(path)).unwrap();
         let rows_ledger = durable(&progress);
         drop((index, progress));

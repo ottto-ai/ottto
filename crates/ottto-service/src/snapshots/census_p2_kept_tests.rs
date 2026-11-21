@@ -307,7 +307,7 @@ fn codex_observed_unindexed_file_is_read_once_after_restart() {
     traversal.pending_candidates.clear();
     assert!(!orphaned.files.contains_key(&key));
     let index_path = dir.join("codex-index.json");
-    orphaned.save(&index_path).unwrap();
+    orphaned.save_fixture(&index_path).unwrap();
     let support = dir.join("support");
     fs::create_dir_all(&support).unwrap();
     let load = || {

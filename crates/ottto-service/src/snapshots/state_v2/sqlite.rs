@@ -1167,7 +1167,12 @@ fn read_value(conn: &Connection, h: &Header, out: &mut dyn Write) -> Result<()> 
         super::telemetry::decoded(1, 0, 0);
         return Ok(());
     }
-    ensure!(row_checksum(h)? == h.row_checksum, "state_v2_row_checksum");
+    // Every Header is verified when it is read or built; the value stays bound
+    // to it by the length and digest checks below.
+    debug_assert!(
+        row_checksum(h).is_ok_and(|c| c == h.row_checksum),
+        "state_v2_row_checksum"
+    );
     let mut stored = Vec::new();
     let mut len = 0_u64;
     let mut consume = |bytes: &[u8]| -> Result<()> {

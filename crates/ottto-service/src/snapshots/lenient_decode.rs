@@ -362,11 +362,6 @@ impl Serialize for ScanIndex {
         field!(accepted_rebuild_incidence, BTreeMap::is_empty);
         field!(accepted_rebuild_pending_since_unix_seconds, Option::is_none);
         field!(accepted_rebuild_last_alarm_unix_seconds, Option::is_none);
-        field!(codex_counting_tombstones, BTreeMap::is_empty);
-        field!(
-            codex_counting_evicted_legacy,
-            sources::codex::counting::version::EvictedLegacyOwners::is_empty
-        );
         field!(upload_ack_retirement_handoff, Option::is_none);
         field!(
             claude_money_birth_store,
@@ -2030,10 +2025,7 @@ impl<R: BufRead + Seek> Decoder<R> {
                         "confirmed_empty_files" => {
                             index.confirmed_empty_files = self.typed(value)?
                         }
-                        "codex_counting_evicted_legacy" => {
-                            index.codex_counting_evicted_legacy =
-                                self.history_scalar(value, Default::default())?
-                        }
+                        "codex_counting_evicted_legacy" => {} // Retired counting history.
                         "copy_prefix_last_accepted_nonce" => {
                             index.copy_prefix_last_accepted_nonce = self.typed(value)?
                         }
@@ -2045,12 +2037,7 @@ impl<R: BufRead + Seek> Decoder<R> {
                             index.upload_context_proof =
                                 self.history_scalar(value, Default::default())?
                         }
-                        "codex_counting_tombstones" => {
-                            // Counting-only memory: damage loses it like a
-                            // lost index, never refuses the index.
-                            index.codex_counting_tombstones =
-                                self.history_scalar(value, BTreeMap::new())?
-                        }
+                        "codex_counting_tombstones" => {} // Retired counting history.
                         "file_snapshot_fingerprints" => {
                             if pass == Pass::IdentityCarry
                                 && value.len > CARRIED_ACK_BYTES_MAX as u64
@@ -2684,10 +2671,8 @@ fn held_file_owner(raw: &RawValue) -> Option<std::ops::Range<usize>> {
     None
 }
 
-// The one scan-index file layout, used by the save and by the restart
-// admission check below. Compact JSON, except while decode holds exist: then
-// the earlier pretty layout stays, so a hold that an older pretty file's
-// whitespace funded is still funded by the bytes rewritten on every save.
+// Frozen legacy JSON encoding for decoder/import fixtures only.
+#[cfg(test)]
 pub(super) fn write_index<W: std::io::Write>(
     writer: W,
     index: &ScanIndex,
@@ -2697,44 +2682,6 @@ pub(super) fn write_index<W: std::io::Write>(
     } else {
         serde_json::to_writer_pretty(writer, index)
     }
-}
-
-// Exactly the bytes write_index emits. This streams to a counter, never
-// another encoded byte buffer.
-pub(super) fn written_len(index: &ScanIndex) -> serde_json::Result<u64> {
-    struct Count(u64);
-    impl std::io::Write for Count {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0 = self
-                .0
-                .checked_add(bytes.len() as u64)
-                .ok_or_else(|| std::io::Error::other("scan index output length"))?;
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut output = Count(0);
-    write_index(&mut output, index)?;
-    Ok(output.0)
-}
-
-// Dropped optional/unknown input can make the next wire document much smaller.
-// Refuse before writing if that would turn an admitted hold into excess damage
-// on restart.
-pub(super) fn check_held_output(index: &ScanIndex) -> anyhow::Result<()> {
-    if index.decode_holds.is_empty() {
-        return Ok(());
-    }
-    if index.decode_holds.held_bytes() > hold_bytes_limit(written_len(index)?) {
-        emit_scan_index_containment_line(
-            "local snapshot scan index save: source=unattributed lenient_hold_budget_exceeded=1"
-                .into(),
-        );
-        return Err(Error::HoldBudget.into());
-    }
-    Ok(())
 }
 
 /// A full 256-bit key over the exact string: equal strings give equal keys

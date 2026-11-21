@@ -1674,8 +1674,8 @@ fn generic_login_for_pair_whose_saved_connection_is_dead_is_admitted() {
     }
 }
 
-/// AutoReview P2 on 83657166: with upkeep consent granted the admission
-/// runs the real one-slot quota collection. When that first read is
+/// With upkeep consent granted, admission runs the real one-slot quota
+/// collection. When that first read is
 /// unavailable, the admitted login must still own the canonical anchor in
 /// persisted coverage over a dead slot with complete historical limits.
 #[test]

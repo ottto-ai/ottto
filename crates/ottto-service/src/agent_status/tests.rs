@@ -1663,8 +1663,8 @@ fn claude_worker_receipt_publication_respects_controls_rebind_and_removal() {
     fs::remove_dir_all(root).unwrap();
 }
 
-/// AutoReview P2 on 83657166: an admitted fresh login whose first quota
-/// read is unavailable must still become the canonical anchor over a dead
+/// An admitted fresh login whose first quota read is unavailable must still
+/// become the canonical anchor over a dead
 /// slot that only has older complete limits, in both the collector's
 /// selection and the persisted anchor coverage readers use.
 #[test]
@@ -1800,8 +1800,8 @@ fn usable_connection_outranks_dead_slot_with_complete_history_for_canonical_anch
     );
 }
 
-/// Opus review F1 on 6d43ff24: the limits/upload choice must follow the
-/// health-first canonical choice. An old slot with valid access but a
+/// The limits/upload choice must follow the health-first canonical choice.
+/// An old slot with valid access but a
 /// passed refresh deadline (fresh, complete limits, unusable) and a new
 /// working login with partial limits: the new login is canonical, preferred
 /// and uploads; the old slot is the duplicate, never the reverse.
@@ -3824,13 +3824,13 @@ fn codex_explicit_refresh_is_rate_limited_and_the_schedule_waits_its_interval() 
     codex_saved_quota::forget_running_homes();
     let before = codex_app_server_runs();
 
-    let first = with_trigger(Trigger::ExplicitRefresh, || refresh_codex_quota_now(0));
+    let first = with_trigger(Trigger::ExplicitRefresh, refresh_codex_quota_now);
     assert_eq!(first.read, 1);
     assert_eq!(first.rate_limited, 0);
     assert_eq!(codex_app_server_runs(), before + 1);
 
     // A second press within the minute reads nothing.
-    let second = refresh_codex_quota_now(0);
+    let second = refresh_codex_quota_now();
     assert_eq!(second.read, 0);
     assert_eq!(second.rate_limited, 1);
     assert_eq!(codex_app_server_runs(), before + 1);
@@ -3952,7 +3952,7 @@ fn codex_background_refresh_off_stops_the_schedule_but_not_refresh_or_setup() {
     assert_eq!(codex_app_server_runs(), before);
 
     // A person's Refresh reads.
-    let refreshed = refresh_codex_quota_now(0);
+    let refreshed = refresh_codex_quota_now();
     assert_eq!((refreshed.read, refreshed.rate_limited), (1, 0));
     assert_eq!(codex_app_server_runs(), before + 1);
     // The setup check's provider read reads too.
@@ -8729,7 +8729,7 @@ fn registered_claude_accounts_carry_their_product_into_source_health() {
     // on its own slot snapshot, and the app titles its rows from these
     // observations — without the merge they read as a bare email.
     let current = claude_account_snapshot(
-        "ron@ottto.net",
+        "user@example.com",
         "claude_max_20x",
         "hash-current",
         "org-current",
@@ -8771,7 +8771,7 @@ fn registered_claude_accounts_carry_their_product_into_source_health() {
     assert_eq!(
         described,
         vec![
-            ("ron@ottto.net", "claude_max_20x", Some(true)),
+            ("user@example.com", "claude_max_20x", Some(true)),
             ("personal.member@example.com", "claude_max_20x", Some(false)),
             (
                 "team.member@example.com",
@@ -8788,7 +8788,7 @@ fn registered_claude_plan_observations_describe_each_account_once() {
     // and again as its own registered slot. It must not gain a second
     // observation, which would give the app two rows for one account.
     let current = claude_account_snapshot(
-        "ron@ottto.net",
+        "user@example.com",
         "claude_max_20x",
         "hash-current",
         "org-current",
@@ -10116,7 +10116,7 @@ fn claude_desktop_metadata_observations_split_current_desktop_account() {
               "cliSessionId": "identity-cli-session",
               "lastActivityAt": "2026-07-06T10:00:00Z",
               "emailAddress": "team.member@example.com",
-              "accountName": "Ron",
+              "accountName": "Alex",
               "organizationName": "Acme",
               "subscriptionType": "team",
               "initialMessage": "must not be persisted"

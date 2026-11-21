@@ -180,7 +180,9 @@ pub(crate) fn is_version_refusal(error: &anyhow::Error) -> bool {
 
 pub(super) fn observe(source: SnapshotSource, loaded: &anyhow::Result<(ScanIndex, LoadOrigin)>) {
     match loaded {
-        Ok((index, LoadOrigin::Loaded)) => {
+        Ok((index, origin))
+            if matches!(origin, LoadOrigin::Loaded) || index.v2().persistence_v2.is_some() =>
+        {
             if index.persistence_available() {
                 set(source, Reason::NewerApp, false, 0);
             }
@@ -229,6 +231,13 @@ pub(super) fn observe(source: SnapshotSource, loaded: &anyhow::Result<(ScanIndex
         _ => {}
     }
 }
+/// Progress and graph holds share the same per-source collection blocker.
+pub(crate) fn observe_failure(source: SnapshotSource, error: &anyhow::Error) {
+    if let Some(reason) = state_v2_reason(error) {
+        set_refusal(source, reason);
+    }
+}
+
 fn set_refusal(source: SnapshotSource, reason: Reason) {
     for candidate in REASONS {
         set(source, candidate, candidate == reason, 0);

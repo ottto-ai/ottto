@@ -612,6 +612,11 @@ fn count_page(outcome: Option<&ProgressPage>) {
 fn count_page(_: Option<&ProgressPage>) {}
 
 impl ProgressRows {
+    #[cfg(test)]
+    pub(crate) fn index_path_for_test(&self) -> &Path {
+        &self.path
+    }
+
     pub(crate) fn generation(&self) -> u64 {
         self.baseline.generation
     }
@@ -676,6 +681,11 @@ impl ProgressRows {
                 return Err(error);
             }
         };
+        crate::local_resource_diagnostics::pass_outcomes(|counts| match outcome {
+            ProgressPage::Committed(_) => counts.progress_committed += 1,
+            ProgressPage::Unchanged => counts.progress_unchanged += 1,
+            ProgressPage::NotPublished => counts.progress_not_published += 1,
+        });
         count_page(Some(&outcome));
         Ok(outcome)
     }

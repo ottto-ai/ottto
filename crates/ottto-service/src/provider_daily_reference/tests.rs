@@ -589,7 +589,7 @@ fn an_injected_extra_key_or_free_text_value_fails_the_content_free_check() {
     assert!(!wire_payload_is_content_free(&prose_model));
 
     let mut path_model = base.clone();
-    path_model["rows"][0]["model"] = json!("/Users/ron/secret");
+    path_model["rows"][0]["model"] = json!("/Users/example/secret");
     assert!(!wire_payload_is_content_free(&path_model));
 
     let mut bad_fingerprint = base.clone();

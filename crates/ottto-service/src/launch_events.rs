@@ -386,11 +386,6 @@ impl LaunchEventInventory {
     }
 
     #[cfg(test)]
-    pub(crate) fn expire_for_test(&self) {
-        self.lookup.lock().unwrap().loaded_at = Some(Instant::now() - INVENTORY_TTL);
-    }
-
-    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.lookup
             .lock()
@@ -419,6 +414,12 @@ impl LaunchEventInventory {
 
 pub(crate) fn valid_worker(worker: &str) -> bool {
     is_uuid(worker)
+}
+
+/// The two inbox directories a launch event lands in or moves to.
+pub(crate) fn inbox_dirs(home: &Path) -> [PathBuf; 2] {
+    let root = home.join(DROP_ROOT_DIR);
+    [root.join(PENDING_SUBDIR), root.join(PROCESSED_SUBDIR)]
 }
 
 fn directory_stamp(dir: &Path) -> Option<SystemTime> {

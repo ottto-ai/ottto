@@ -373,7 +373,7 @@ impl ClaudeRequestCensusRecord {
         self.request_hashes().binary_search(&hash).is_ok()
     }
 
-    /// A #588/failed-finish invalidation kept only the first-seen birth:
+    /// Invalidating a deferred comparison or failed finish kept only the first-seen birth:
     /// every reader treats the key as having no record.
     pub(crate) fn is_birth_stub(&self) -> bool {
         self.derivation == BIRTH_STUB_DERIVATION
@@ -697,7 +697,7 @@ impl ClaudeRequestCensus {
     }
 
     /// Invalidate `key`'s record but keep its first-seen birth in place, so a
-    /// re-created record of the SAME physical object keeps it (#588 selected
+    /// re-created record of the SAME physical object keeps it (selected
     /// restore, failed finish, comparison target). The stub replaces the
     /// record in its own map slot: no key or node is allocated, so a prepaid
     /// restore stays within its reservation. Every reader skips stubs.

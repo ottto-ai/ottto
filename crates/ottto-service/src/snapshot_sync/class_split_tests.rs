@@ -454,7 +454,7 @@ fn observed_unanswered_challenge_survives_a_headless_ordinary_accept() {
     let root = crate::test_scratch::ScratchDir::new("class-split-restart");
     let path = root.join("upload-progress.json");
     progress.generation = 0;
-    progress.save(&path).unwrap();
+    progress.save_fixture(&path).unwrap();
     let restarted = SnapshotUploadProgress::load(
         &path,
         &"a".repeat(64),
@@ -993,7 +993,7 @@ fn assert_lost_class_request_resends_only_unsettled(items: &[FamilyItem], first:
         let root = crate::test_scratch::ScratchDir::new("e2-class-lost");
         let path = root.join("progress.json");
         let mut progress = test_upload_progress();
-        progress.save(&path).unwrap();
+        progress.save_fixture(&path).unwrap();
         // The server stores each new body once; a stored body is unchanged.
         let stored = std::cell::RefCell::new(BTreeMap::<String, usize>::new());
         let serve = |batch: &[&FamilyItem]| {
@@ -1038,7 +1038,7 @@ fn assert_lost_class_request_resends_only_unsettled(items: &[FamilyItem], first:
                 if save_fails && saving_lost {
                     return Err(anyhow!("synthetic save failure"));
                 }
-                state.save(&path)
+                state.save_fixture(&path)
             },
         );
         let case = format!("{first}->{second} lost {lost} save_fails {save_fails}");

@@ -3,6 +3,7 @@
 //! `debt`, aggregated at each root walk's end, so it survives restarts.
 use crate::snapshots::upload::freshness_debt::{Report, Roster, Walk};
 use crate::snapshots::SnapshotSource;
+use std::collections::BTreeMap;
 
 pub(in crate::snapshots) const ALARM_AFTER: u64 = 6 * 60 * 60;
 
@@ -58,18 +59,73 @@ impl WalkFold {
 /// Each source's walk in progress, its last walk's aggregate, the roster of
 /// its last walk when that walk was complete (RAM only), and whether the
 /// backlog retirement already ran on that roster (once per complete walk).
+/// `usage_identical` is not walk state: it lives for the process, one note
+/// per entity (see `note_usage_identical`).
 struct Walks {
     folds: [WalkFold; 3],
     last: [Option<Report>; 3],
     roster: [Option<std::sync::Arc<Roster>>; 3],
     backlog_ran: [bool; 3],
+    usage_identical: BTreeMap<String, UsageIdentical>,
 }
 const NO_WALKS: Walks = Walks {
     folds: [WalkFold::EMPTY; 3],
     last: [None; 3],
     roster: [None, None, None],
     backlog_ran: [false; 3],
+    usage_identical: BTreeMap::new(),
 };
+
+/// The scope an answer was given in, and the exact body it was given for.
+struct UsageIdentical {
+    destination: String,
+    context: String,
+    replay: Option<String>,
+    body: String,
+}
+
+/// The server answered `usage_identical` for `entity`'s exact `body`: its head
+/// already holds this usage, though it stored nothing, so no receipt exists.
+/// The destination namespace, the upload context and the historical replay
+/// generation scope the note. Process-local: a restart forgets it; nothing is
+/// stored.
+pub(crate) fn note_usage_identical(
+    entity: &str,
+    destination: &str,
+    context: &str,
+    replay: Option<&str>,
+    body: &str,
+) {
+    let note = UsageIdentical {
+        destination: destination.to_string(),
+        context: context.to_string(),
+        replay: replay.map(str::to_string),
+        body: body.to_string(),
+    };
+    with_walks(|walks| walks.usage_identical.insert(entity.to_string(), note));
+}
+
+/// Any new hold of `entity` replaces the answer its note recorded.
+pub(crate) fn forget_usage_identical(entity: &str) {
+    with_walks(|walks| walks.usage_identical.remove(entity));
+}
+
+/// `entity`'s noted body in this destination, upload context and replay
+/// generation.
+pub(in crate::snapshots) fn usage_identical_body(
+    entity: &str,
+    destination: &str,
+    context: &str,
+    replay: Option<&str>,
+) -> Option<String> {
+    with_walks(|walks| {
+        let note = walks.usage_identical.get(entity)?;
+        (note.destination == destination
+            && note.context == context
+            && note.replay.as_deref() == replay)
+            .then(|| note.body.clone())
+    })
+}
 
 /// The one gate for deleting by absence: the source's last root walk began
 /// in this process and listed every root with no walk issue. Its roster, and

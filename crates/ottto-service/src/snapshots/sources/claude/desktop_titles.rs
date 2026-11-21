@@ -329,7 +329,7 @@ impl ClaudeTitleMetadata {
             (None, Some(_)) => true,
         };
         // Keep the existing 64-byte inventory decoder boundary. The non-hex
-        // version marker distinguishes this 248-bit cursor fence from #851's
+        // version marker distinguishes this 248-bit cursor fence from the
         // legacy SHA-256 digest. This is never account/identity proof.
         let mut inventory = claude_request_identity::inventory_digest(store_dirs);
         inventory.replace_range(..2, "p1");

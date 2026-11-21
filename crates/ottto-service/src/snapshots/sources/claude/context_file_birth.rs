@@ -350,12 +350,6 @@ impl ClaudeFileBirth {
             .or_else(|| self.birth_nanos())
     }
 
-    /// The sequence of the file's first response not proven copied, id-less
-    /// and synthetic ones included.
-    pub(in crate::snapshots) fn first_own_sequence(&self) -> Option<u64> {
-        self.first_own_sequence
-    }
-
     fn root_with_birth(&self) -> bool {
         matches!(self.scope, ClaudeBirthScope::Root(_))
     }
@@ -815,7 +809,7 @@ impl ClaudeTelemetryTripwire {
     }
 
     /// Family roots over their own evidence bound this fold. Read-only, for
-    /// #677's local stop alarm (hashed there; never logged raw).
+    /// the local backfill stop alarm (hashed there and never logged raw).
     pub(in crate::snapshots) fn over_bound_roots(&self) -> &BTreeSet<String> {
         &self.over_bound_roots
     }
@@ -1125,7 +1119,7 @@ pub struct ClaudeContextFileBirthCounts {
 impl ClaudeContextFileBirthCounts {
     /// This fold withheld scalars for a resource limit,
     /// not for their content: a family over its own evidence bound, or a full
-    /// remembered-veto list. The #677 backfill stops on it.
+    /// remembered-veto list. The backfill stops on either condition.
     pub(crate) fn resource_withheld(&self) -> bool {
         self.total.withheld_evidence_bound_session_count > 0 || self.remembered_veto_overflowed
     }

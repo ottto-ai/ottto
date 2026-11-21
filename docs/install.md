@@ -95,6 +95,13 @@ ottto status --json
 ottto update check --json
 ```
 
+## Uninstall
+
+Uninstalling with `ottto uninstall` or Homebrew leaves Ottto's Open at Login
+entry in System Settings → General → Login Items. It does nothing once the app
+is gone; remove it there if you like. Uninstall from Ottto's Settings removes it
+for you.
+
 ## Agent Notes
 
 Agents may check `command -v ottto` and run `ottto status --json`. If the CLI is

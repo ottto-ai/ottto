@@ -60,6 +60,16 @@ pub(in super::super) fn oversize_header_for_test(db: &mut Sqlite) {
     let c = db.conn().unwrap();
     c.execute_batch("PRAGMA ignore_check_constraints=ON; UPDATE records SET header=zeroblob(1048576); PRAGMA ignore_check_constraints=OFF;").unwrap();
 }
+/// Flip one byte of `column` in the only stored record row.
+pub(in super::super) fn flip_record_byte_for_test(db: &Sqlite, column: &str) {
+    let conn = db.conn().unwrap();
+    let mut bytes: Vec<u8> = conn
+        .query_row(&format!("SELECT {column} FROM records"), [], |r| r.get(0))
+        .unwrap();
+    bytes[0] ^= 1;
+    let sql = format!("UPDATE records SET {column}=?1");
+    assert_eq!(conn.execute(&sql, params![bytes]).unwrap(), 1);
+}
 pub(in super::super) fn corrupt_header_for_test(db: &mut Sqlite) {
     db.conn()
         .unwrap()

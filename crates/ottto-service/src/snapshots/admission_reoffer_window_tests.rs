@@ -203,7 +203,7 @@ fn admission_window_persisted_retry_is_seen_after_reload() {
         }
         let path = support.join(format!("{}-scan-index-v3.json", source.api_slug()));
         let reload = |index: &mut ScanIndex| {
-            index.save(&path).unwrap();
+            index.save_fixture(&path).unwrap();
             ScanIndex::load_for_snapshot_source(&path, source, &support).unwrap()
         };
         let loaded = reload(&mut index);
