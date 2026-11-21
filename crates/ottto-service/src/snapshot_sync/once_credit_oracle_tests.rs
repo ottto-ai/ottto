@@ -4018,8 +4018,9 @@ fn c30_tiers_advance_through_finish_and_pace_the_final_tier_gently() {
         .unwrap();
     home.write_rows(&pi_session("oracle-pi-new", 10));
     super::resource_schedule::with_power("ac", || {
+        let support = home.support.clone();
         let tier = || {
-            crate::backfill::load_backfill_state(&home.support)
+            crate::backfill::load_backfill_state(&support)
                 .first_read_tiers
                 .get(&destination)
                 .map(|tier| tier.days)
