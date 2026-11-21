@@ -1129,6 +1129,35 @@ pub(super) fn clear_source_manifests_for_test() {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clear();
 }
+/// What one finish reads and never changes: fixed values of the preparation
+/// and the caller's handles. Built once, after the preparation is unpacked.
+/// The working state (index, scan, upload progress) is passed beside it.
+#[derive(Clone, Copy)]
+#[expect(dead_code, reason = "read by the stage functions")]
+struct FinishEnv<'a> {
+    source: SnapshotSource,
+    claude_scan_roots: &'a Option<Vec<PathBuf>>,
+    scan_started_at: &'a String,
+    activity_hint: &'a crate::snapshot_client::ActivityHintResponse,
+    receipt_window_days: u64,
+    cache_observations_enabled: bool,
+    scan_agent_status_collection: &'a super::AgentStatusCollection,
+    upload_policy: super::SnapshotUploadPolicy,
+    upload_destination_namespace: &'a str,
+    client: &'a SnapshotApiClient,
+    index_path: &'a Path,
+    upload_progress_path: &'a Path,
+    backfill_state: &'a crate::backfill::BackfillState,
+    backfill_pending: bool,
+    device: &'a LocalDeviceBinding,
+    device_secret: &'a str,
+    machine_id: &'a str,
+    support_dir: &'a Path,
+    daemon: &'a LocalDaemon,
+    cache_full_replacement: bool,
+    identity_item_cap: usize,
+}
+
 #[expect(clippy::too_many_arguments, reason = "12 args; no options struct yet")]
 pub(super) fn finish_sync_source(
     preparation: SourcePreparation,
@@ -1192,6 +1221,29 @@ pub(super) fn finish_sync_source(
     // Resets the census-wait count on every exit that is not a capacity stop.
     let mut census_wait = ack_retention::CapacityStopCensusCount::begin(source);
     let client = &receipt_client;
+    let _env = FinishEnv {
+        source,
+        claude_scan_roots: &claude_scan_roots,
+        scan_started_at: &scan_started_at,
+        activity_hint: &activity_hint,
+        receipt_window_days,
+        cache_observations_enabled,
+        scan_agent_status_collection: &scan_agent_status_collection,
+        upload_policy,
+        upload_destination_namespace: &upload_destination_namespace,
+        client,
+        index_path: &index_path,
+        upload_progress_path: &upload_progress_path,
+        backfill_state: &backfill_state,
+        backfill_pending,
+        device,
+        device_secret,
+        machine_id,
+        support_dir,
+        daemon,
+        cache_full_replacement,
+        identity_item_cap,
+    };
     let codex_join_validator = scan_result.codex_joining_validator();
     let validate_joined = |snapshots: &[&SnapshotItem]| -> Result<()> {
         if let Some(validator) = &codex_join_validator {
