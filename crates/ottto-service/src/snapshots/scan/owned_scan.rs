@@ -1502,9 +1502,57 @@ pub(in crate::snapshots) fn requeue_members<'a>(
     }
 }
 
-/// Growth gets one same-walk retry with its original selection flags. A
-/// second hit keeps a committed body and releases its hint to the next walk;
-/// without a body the existing unreadable census must remain red.
+/// The file's one same-walk retry, shared by growth and a changed strict
+/// reopen: the first refusal requeues it with its original selection flags.
+/// False once the walk has spent it. `hold_walk` (strict reopen, with the
+/// page's discovered count): the walk cannot retire until the retry reads or
+/// refuses again, so the requeued path holds the census even if it was
+/// selected as a re-read, and a retry whose growth Full pacing would only
+/// defer, unread, is not granted.
+fn retry_file_once(
+    index: &mut ScanIndex,
+    flags: &BTreeMap<String, (bool, bool)>,
+    candidate: &CandidateFile,
+    hold_walk: Option<&mut usize>,
+) -> bool {
+    let key = local_index_key(&candidate.path);
+    if hold_walk.is_some()
+        && sampled_audit::growth_full_paced(index, &key, sampled_scan::now_seconds())
+    {
+        return false;
+    }
+    let retries = &mut index
+        .traversal
+        .as_mut()
+        .expect("active retry walk")
+        .residue
+        .growth_retries;
+    let std::collections::btree_map::Entry::Vacant(entry) = retries.entry(key) else {
+        return false;
+    };
+    entry.insert(false);
+    sampled_scan::codex_cursor::requeue(index, flags, candidate);
+    if let Some(page_discovered) = hold_walk {
+        let walk = index.traversal.as_mut().expect("active retry walk");
+        if let Some(pending) = walk
+            .pending_candidates
+            .iter_mut()
+            .find(|pending| pending.path == candidate.path && !pending.census_member)
+        {
+            // It joins the census as a re-listed member does, so pending
+            // never exceeds discovered, in the walk and in this page's
+            // result, which captured the walk's count at open.
+            pending.census_member = true;
+            walk.counts.discovered_file_count += 1;
+            *page_discovered += 1;
+        }
+    }
+    true
+}
+
+/// Growth uses the file's one same-walk retry. A second hit keeps a
+/// committed body and releases its hint to the next walk; without a body the
+/// existing unreadable census must remain red.
 fn retry_grown_file(
     index: &mut ScanIndex,
     flags: &BTreeMap<String, (bool, bool)>,
@@ -1512,19 +1560,17 @@ fn retry_grown_file(
     census: &mut ScanCensus,
     cap_delay: bool,
 ) {
+    if retry_file_once(index, flags, candidate, None) {
+        return;
+    }
     let key = local_index_key(&candidate.path);
-    let retries = &mut index
+    index
         .traversal
         .as_mut()
         .expect("active growth walk")
         .residue
-        .growth_retries;
-    if let std::collections::btree_map::Entry::Vacant(entry) = retries.entry(key.clone()) {
-        entry.insert(false);
-        sampled_scan::codex_cursor::requeue(index, flags, candidate);
-        return;
-    }
-    retries.insert(key.clone(), true);
+        .growth_retries
+        .insert(key.clone(), true);
     if index
         .files
         .get(&key)

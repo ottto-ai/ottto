@@ -147,7 +147,7 @@ impl OwnedSourceScan {
             sidecar_census_complete,
             codex_census_valid,
             census_window_end,
-            discovered_file_count,
+            mut discovered_file_count,
             census_unix_seconds,
             mut census,
             mut snapshots,
@@ -2102,7 +2102,20 @@ impl OwnedSourceScan {
                                     &candidate.path,
                                 );
                             }
-                            census.record_unreadable_file(cause, &candidate.path);
+                            // Nothing of this read is kept. A changed object
+                            // or scope uses the file's one same-walk retry,
+                            // which holds the walk; a second refusal keeps
+                            // the census red.
+                            if !matches!(cause, UnreadableCause::ScopeObject)
+                                || !scan::owned_scan::retry_file_once(
+                                    index,
+                                    &selected_flags,
+                                    &candidate,
+                                    Some(&mut discovered_file_count),
+                                )
+                            {
+                                census.record_unreadable_file(cause, &candidate.path);
+                            }
                             pending!();
                         }
                         #[cfg(test)]

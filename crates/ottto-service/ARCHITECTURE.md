@@ -59,8 +59,12 @@ file-system hint / periodic listing → select file → read new bytes from save
   validates its held-file prefix and path before publishing; it keeps no new Tail
   checkpoint and earns no Full-audit or source-verification credit. An unfinished
   boundary record remains withheld. If the prefix would weaken a committed body or
-  cannot reserve its audit marker, that file gets one same-walk retry; a second refusal
-  releases a committed body to the next pass, or leaves a new file unreadable.
+  cannot reserve its audit marker, that file gets one same-walk retry; a second growth
+  refusal releases a committed body to the next pass, or leaves a new file unreadable.
+  A changed scope or object at strict revalidation discards the attempt and shares this
+  persisted same-walk retry, which holds the walk as a census member until the file reads
+  or refuses again; a file whose growth Full is paced gets no retry. If the allowance is
+  spent, strict revalidation records the file as unreadable.
   Unsampled native reads without a plan (including some protected/forced paths) remain unbounded and out of scope.
 - **Reduction.** One reducer per source turns lines into usage and keeps a running result. Old
   evidence is read only for the session group a change affects.

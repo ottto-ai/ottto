@@ -339,8 +339,9 @@ impl ScanTraversalCheckpoint {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub(in crate::snapshots) struct ScanTraversalResidue {
-    /// One growth retry per file per walk: false after requeue, true once
-    /// deferred. Saved with the walk so restart cannot renew its allowance.
+    /// One same-walk retry per file, shared by growth and a changed strict
+    /// reopen: false after requeue, true once growth deferred it. Saved with
+    /// the walk so restart cannot renew its allowance.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub(in crate::snapshots) growth_retries: BTreeMap<String, bool>,
     /// Local index keys of the residue files (the same key space as `files`).
