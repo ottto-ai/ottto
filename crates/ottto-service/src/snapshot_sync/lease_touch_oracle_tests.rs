@@ -256,9 +256,9 @@ fn same_size_edits(owner: &E2ScanFixture) -> usize {
 /// renewal, at the same size: the count proves no byte was written. The
 /// restarted process restores from its stored head and the retained one
 /// continues its checkpoint, both after their samples and without a
-/// transcript read, each equal to cold Full; the next pass is Skip. A later
-/// backward touch is proven by the count on the retained route and stays
-/// today's lease renewal on the durable route.
+/// transcript read, each equal to cold Full. A later backward touch is proven
+/// by the count on the retained route and stays today's lease renewal on the
+/// durable route. Once delivered, the next pass is Skip.
 #[test]
 fn proven_touch_restores_and_continues_like_cold_full() {
     with_e2(|| {
@@ -283,21 +283,14 @@ fn proven_touch_restores_and_continues_like_cold_full() {
         assert_eq!(retained.modes, (0, 0, 1));
         against_cold(&s, &mut retained, &s.index, Mode::Ram);
 
-        accept_page(&mut restored);
+        // Committed undelivered, as the seed is: a cold Full of an accepted
+        // body re-emits nothing, so it would be no control for the restores
+        // below. Delivery and the quiet pass follow them.
         let index = s.disk.commit(
             &restored.cache,
             SnapshotSource::ClaudeCode,
             &mut restored.index,
         );
-        let (mut quiet, consumed) = observe_consumed(|| s.c.raw(&restart, index, 100, true, &[]));
-        quiet.enrich(&s.c);
-        quiet.finish();
-        assert_eq!(consumed, 0, "the next pass is Skip");
-        assert_eq!(quiet.scan.scanned_file_count, 0);
-        assert!(quiet.scan.snapshots.is_empty(), "no re-emission");
-        let index = s
-            .disk
-            .commit(&quiet.cache, SnapshotSource::ClaudeCode, &mut quiet.index);
 
         // Backward, still above the birth. The retained checkpoint has no
         // change-time bound: only the count proves this touch.
@@ -315,6 +308,18 @@ fn proven_touch_restores_and_continues_like_cold_full() {
         assert_eq!(same_size_edits(&other), 0);
         assert_eq!(renewed.modes, (0, 0, 1));
         against_cold(&s, &mut renewed, &index, Mode::DiskRestore);
+
+        // Delivered, the next pass is Skip.
+        accept_page(&mut back);
+        let index = s
+            .disk
+            .commit(&back.cache, SnapshotSource::ClaudeCode, &mut back.index);
+        let (mut quiet, consumed) = observe_consumed(|| s.c.raw(&restart, index, 100, true, &[]));
+        quiet.enrich(&s.c);
+        quiet.finish();
+        assert_eq!(consumed, 0, "the next pass is Skip");
+        assert_eq!(quiet.scan.scanned_file_count, 0);
+        assert!(quiet.scan.snapshots.is_empty(), "no re-emission");
     });
 }
 
