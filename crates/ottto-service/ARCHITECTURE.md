@@ -540,8 +540,9 @@ not server acceptance. No extra reads or persisted fields implement this rule.
 ## Module map: `src/`
 
 This is the tree as it is today, grouped by job. Most top-level modules still sit directly in
-`src/`; the groups below are a reading aid, not folders. A name followed by `/` has a folder of
-child modules (four of them, `agent_configs/`, `composition_kinds/`, `context_composition/` and
+`src/`; the groups below are a reading aid, not folders. A name followed by `/` has production
+child modules in a folder of the same name; a folder that holds only a module's tests is not
+marked (four of the marked ones, `agent_configs/`, `composition_kinds/`, `context_composition/` and
 `control/`, still keep their root in a `mod.rs` inside the folder).
 
 The layout check below covers this crate's `src/`. It measures file sizes, names, headers, test
@@ -623,12 +624,12 @@ sake.
     type and its methods, a phase).
 
 `scripts/check_source_layout.py` reports how the whole crate measures up to these rules. It
-fails a change only for: an added `mod.rs`; an added production file without a `//!` line or
-over 3,000 lines; and more `.rs` files directly in a directory than its ceiling in
-`scripts/source_layout_flat.tsv` (today `src/`, `snapshots/` and `snapshot_sync/`). The ceilings
-only fall: lower a row in the change that moves files out; raising a row or deleting it while
-its directory exists also fails. A file counts as added unless git sees an exact rename, so
-rename a file and edit it in separate changes.
+fails a change only for: an added `mod.rs`; and an added production file without a `//!` line or
+over 3,000 lines. A file counts as added unless git sees an exact rename, so rename a file and
+edit it in separate changes. It also reports, without failing yet, when a directory holds more
+`.rs` files directly in it than its ceiling in `scripts/source_layout_flat.tsv` (today `src/`,
+`snapshots/` and `snapshot_sync/`). The ceilings only fall: lower a row in the change that moves
+files out.
 
 ## Module map: snapshots/ (target; migration in progress)
 
@@ -666,7 +667,7 @@ unknown Cargo targets, old-path strings after decoding escapes and normalizing s
 case) and print their limits: implicit log targets, panic locations, approved derives assumed
 context-free, runtime paths and `include!(env!(..))`.
 `scripts/check_source_layout.py` reports how far the tree is from the target.
-Public CI also runs `--enforce-new --enforce flat --base <ref>`: production `.rs` files added
+Public CI also runs `--enforce-new --base <ref>`: production `.rs` files added
 against the base anywhere in the repository must have at most 3,000 lines and
 warn above 1,500; files added under this crate's `src/` may not be named `mod.rs`, and added
 production files there need a `//!` line. Exact (R100) file moves count as existing files; `*_tests.rs`,

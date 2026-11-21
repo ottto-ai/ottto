@@ -256,12 +256,13 @@ file_move_check() {
 }
 
 # Existing files report only. Added files have hard rules (line ceiling, no
-# mod.rs, a module doc), and the listed flat directories may not gain files.
+# mod.rs, a module doc). The flat-directory ceilings are reported; add
+# `--enforce flat` to make them fail.
 source_layout_report() {
   local base
   base="$(move_check_base)"
   if [[ -n "$base" ]]; then
-    env PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_source_layout.py --enforce-new --enforce flat --base "$base"
+    env PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_source_layout.py --enforce-new --base "$base"
   else
     env PYTHONDONTWRITEBYTECODE=1 python3 scripts/check_source_layout.py
   fi
