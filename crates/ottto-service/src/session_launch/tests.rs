@@ -1310,3 +1310,15 @@ fn codex_app_preferences_are_read_for_managed_keys_only() {
     let error = preflight::codex(&binding, &cwd, &system).unwrap_err();
     assert_eq!(error.reason, Reason::SettingsMalformed);
 }
+
+// A Pending handoff without credentials, provider probes, or executable launches.
+// Keep the fixture beside Entry so control tests need no production test seam.
+impl Registry {
+    pub(crate) fn seed_pending_for_control_test(&mut self, root: &Path) -> String {
+        let id = "synthetic-pending-control-launch".to_string();
+        let entry = fixture_entry(root);
+        fs::write(&entry.launcher, "synthetic launcher").expect("write fixture launcher");
+        self.entries.insert(id.clone(), entry);
+        id
+    }
+}

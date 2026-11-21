@@ -1036,6 +1036,16 @@ fn handle_command(
     client_install_owner: InstallOwner,
     cli_session_exec: bool,
 ) -> Result<serde_json::Value, LocalApiError> {
+    #[cfg(test)]
+    crate::test_effects::record(
+        "control_dispatch_entered",
+        vec![(
+            "trusted_companion",
+            crate::test_effects::Scalar::Bool(
+                authorization == RequestAuthorization::TrustedCompanionApp,
+            ),
+        )],
+    );
     // Invalidate pending handoffs before any explicit account/slot mutation.
     // Existing mutation handlers retain all of their authorization and order.
     if matches!(
@@ -1276,7 +1286,7 @@ fn handle_command(
             match &authorization {
                 RequestAuthorization::Token(token) => daemon.control_token.authorize(token)?,
                 RequestAuthorization::TrustedCompanionApp => {}
-                RequestAuthorization::Untrusted => {
+                RequestAuthorization::Untrusted | RequestAuthorization::DaemonInternal => {
                     return Err(LocalApiError::LocalClientNotTrusted)
                 }
             }
@@ -1600,7 +1610,9 @@ fn handle_command(
                     daemon.set_relay_state_for_trusted_client(relay)?;
                     to_value(daemon.status_for_trusted_client()?.relay)
                 }
-                RequestAuthorization::Untrusted => Err(LocalApiError::LocalClientNotTrusted),
+                RequestAuthorization::Untrusted | RequestAuthorization::DaemonInternal => {
+                    Err(LocalApiError::LocalClientNotTrusted)
+                }
             }
         }
         LocalControlCommand::RelayStop => {
@@ -1619,7 +1631,9 @@ fn handle_command(
                     daemon.set_relay_state_for_trusted_client(relay)?;
                     to_value(daemon.status_for_trusted_client()?.relay)
                 }
-                RequestAuthorization::Untrusted => Err(LocalApiError::LocalClientNotTrusted),
+                RequestAuthorization::Untrusted | RequestAuthorization::DaemonInternal => {
+                    Err(LocalApiError::LocalClientNotTrusted)
+                }
             }
         }
         LocalControlCommand::Verify { source, repair } => {
@@ -1735,6 +1749,11 @@ fn handle_command(
             to_value(plan_local_uninstall(&home))
         }
         LocalControlCommand::UninstallExecute { confirm } => {
+            // Only a request caller may uninstall: refuse the daemon's own
+            // caller before the shared check admits it and before any work.
+            if authorization == RequestAuthorization::DaemonInternal {
+                return Err(LocalApiError::LocalClientNotTrusted);
+            }
             require_authorized_local_client(daemon, &authorization)?;
             if !confirm {
                 return Err(LocalApiError::InvalidRequest(
@@ -1753,7 +1772,7 @@ fn handle_command(
             match &authorization {
                 RequestAuthorization::Token(token) => daemon.stop(token)?,
                 RequestAuthorization::TrustedCompanionApp => daemon.stop_for_trusted_client()?,
-                RequestAuthorization::Untrusted => {
+                RequestAuthorization::Untrusted | RequestAuthorization::DaemonInternal => {
                     return Err(LocalApiError::LocalClientNotTrusted)
                 }
             }

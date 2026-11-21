@@ -80,6 +80,10 @@ pub(super) fn daemon_effective_uid() -> u32 {
 pub(super) enum RequestAuthorization {
     Token(String),
     TrustedCompanionApp,
+    /// The daemon's own source verification, never built from a request. It
+    /// takes the trusted path only at the checks that verification reaches
+    /// and is refused at every other caller check.
+    DaemonInternal,
     Untrusted,
 }
 

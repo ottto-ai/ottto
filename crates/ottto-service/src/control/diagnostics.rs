@@ -40,7 +40,9 @@ pub(super) fn diagnostics_collect(
         RequestAuthorization::TrustedCompanionApp => {
             daemon.diagnostics_stub_for_trusted_client()?
         }
-        RequestAuthorization::Untrusted => return Err(LocalApiError::LocalClientNotTrusted),
+        RequestAuthorization::Untrusted | RequestAuthorization::DaemonInternal => {
+            return Err(LocalApiError::LocalClientNotTrusted)
+        }
     };
 
     if !upload {
