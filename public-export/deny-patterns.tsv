@@ -6,6 +6,7 @@ path	(^|/)frontend(/|$)	Private frontend code is not part of the public local ru
 path	(^|/)infra(/|$)	Private infrastructure code is not part of the public local runtime export.
 path	(^|/)dist(/|$)	Build artifacts must not be exported.
 path	(^|/)target(/|$)	Rust build output must not be exported.
+content	(^|[^A-Za-z0-9_])/Users/(?!(example|test|tester|someone|private|sensitive|me|Shared|x|owner|dev|alice|user|you)([^A-Za-z0-9._-]|$))[A-Za-z0-9][A-Za-z0-9._-]*	Local home paths must not appear in public export candidates; use a placeholder such as /Users/example.
 content	/var/folders/[A-Za-z0-9._/ -]+	Local temporary filesystem paths must not appear in public export candidates.
 content	docs/dev/	Private session-note links must not appear in public export candidates.
 content	docs/ai/	Private AI KB links must not appear in public export candidates.
