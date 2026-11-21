@@ -820,6 +820,34 @@ class UseBindingTests(unittest.TestCase):
         self.passes(self.root('use self::x::v;\n', 'v()'), self.root('use self::x::v;\nuse self::z as w;\n', 'v()'))
         self.passes(self.root('use self::z as w;\n'), self.root(''))
 
+    def repath(self, before, after, stays=''):
+        """(base, head): fn f moves from S::a to S::b while the root's facade line goes from `before` to `after`."""
+        f = MOVED_F.format('1')
+        root = 'mod a;\nmod b;\n' + self.ROOT
+        base = module_files(root + before, {**self.SIBLINGS, 'snapshots/a.rs': stays + f, 'snapshots/b.rs': ''})
+        return base, {'snapshots.rs': root + after, 'snapshots/a.rs': stays, 'snapshots/b.rs': f}
+
+    def test_a_facade_binding_may_follow_its_moved_item(self):
+        for name, before, after in (
+            ('self', 'use self::a::f;\n', 'use self::b::f;\n'),
+            ('crate', 'pub(crate) use crate::snapshots::a::f;\n', 'pub(crate) use crate::snapshots::b::f;\n'),
+            ('alias', 'use self::a::f as g;\n', 'use self::b::f as g;\n'),
+            ('cfg', '#[cfg(test)]\nuse self::a::f;\n', '#[cfg(test)]\nuse self::b::f;\n'),
+        ):
+            with self.subTest(name):
+                self.passes(*self.repath(before, after), 're-pathed: use ')
+        twin = '#[cfg(test)]\n' + MOVED_F.format('2')
+        for name, before, after, stays in (
+            ('item did not move there', 'use self::a::f;\n', 'use self::z::v as f;\n', ''),
+            ('visibility', 'use self::a::f;\n', 'pub(crate) use self::b::f;\n', ''),
+            ('attribute', 'use self::a::f;\n', '#[cfg(test)]\nuse self::b::f;\n', ''),
+            ('alias', 'use self::a::f as g;\n', 'use self::b::f as h;\nuse self::x::v as g;\n', ''),
+            ('bare path', 'use a::f;\n', 'use b::f;\n', ''),
+            ('a twin of that name stays behind', 'use self::a::f;\n', 'use self::b::f;\n', twin),
+        ):
+            with self.subTest(name):
+                self.fails(*self.repath(before, after, stays), 'use binding changed: ')
+
     def test_a_binding_moved_to_another_module_may_not_reach_further(self):
         base, head = self.move_f('use crate::snapshots::x::v;\n', 'pub(crate) use crate::snapshots::x::v;\n')
         self.fails(base, head, 'widened: use v (crates/demo/src/snapshots/dest/new.rs:1): private in '
@@ -881,7 +909,8 @@ class UseBindingTests(unittest.TestCase):
 
     def test_audited_import_free_macro_calls_allow_new_explicit_bindings(self):
         for macro in ('thread_local! { static FLAG: u8 = 0; }\n',
-                      'crate::heap_layout_bound::fields!(Holder; value);\n'):
+                      'crate::heap_layout_bound::fields!(Holder; value);\n',
+                      'crate::heap_layout_bound::no_heap!(false; Holder);\n'):
             with self.subTest(macro=macro):
                 base, head = self.move_f(macro, macro + 'use crate::snapshots::x::v;\n')
                 self.passes(base, head)
@@ -889,7 +918,7 @@ class UseBindingTests(unittest.TestCase):
                 self.fails(base, head, 'new glob import:')
 
     def test_unknown_macro_paths_still_reject_new_explicit_bindings(self):
-        for macro in ('unknown!();\n', 'fields!(Holder; value);\n',
+        for macro in ('unknown!();\n', 'fields!(Holder; value);\n', 'no_heap!(false; Holder);\n',
                       'other::thread_local! { static FLAG: u8 = 0; }\n'):
             with self.subTest(macro=macro):
                 base, head = self.move_f(macro, macro + 'use crate::snapshots::x::v;\n')

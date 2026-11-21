@@ -537,10 +537,98 @@ its next fold can prove the copy. A root rewrite replaces the census; the child'
 next fold then follows that replacement. Membership proves local source presence,
 not server acceptance. No extra reads or persisted fields implement this rule.
 
+## Module map: `src/`
+
+This is the tree as it is today, grouped by job. Most top-level modules still sit directly in
+`src/`; the groups below are a reading aid, not folders. A name followed by `/` has a folder of
+child modules beside its `.rs` file.
+
+- **Read path** (find transcript files, read them, reduce them to usage; no network):
+  `snapshots/`, `transcript_acquisition`, `transcript_cache`, `snapshot_roots`,
+  `snapshot_watcher`, `source_rotation`, `adaptive_collector`, `scan_clock`,
+  `durable_tail_codec`, `heap_layout_bound`, `owned_heap`.
+- **Upload cycle** (prepare, upload, settle the server's answer, retry timing):
+  `snapshot_sync/`, `backfill`, `upload_policy`, `upload_receipts/`, `client_report`,
+  `telemetry_attach`, `session_attribution`, `external_scheduler_attribution/`.
+- **Server calls**: `snapshot_client`, `snapshot_retry`, `retry_tls`, `net_resilience`,
+  `net_transition`, `relay_auth`, `grant_rebind`.
+- **Accounts and quota**: `agent_status/`, `agent_status_refresh`, `quota_credit_model/`,
+  `codex_process_homes`, `account_nicknames`, `provider_daily_reference/`, `cloud_sessions/`,
+  `provider_calls`.
+- **Provider sign-in upkeep**: `claude_browser_auth/`, `claude_refresher`, `claude_spawn_gate`,
+  `claude_upkeep`, `codex_sign_in`.
+- **Context-window collectors**: `context_composition/`, `composition_kinds/`,
+  `context_footprint`, `context_posture`, `context_file_counts`, `instruction_inventory`,
+  `mcp_inventory/`, `codex_prelude_footprint/`.
+- **Local control API**: `control/`, `unix_socket`, `xpc_mach` (with `xpc_shim.c`),
+  `control_plane_health`, `session_launch/`, `launch_events`, `agent_configs/`.
+- **Process host and install**: `main.rs`, `lib.rs`, `daemon/`, `macos_service`,
+  `legacy_service`, `service_bootstrap/`, `locked_state_dir`, `local_state_sweep/`,
+  `process_guard`, `keychain`, `app_bundle_version`, `command_env`.
+- **Local telemetry and diagnostics**: `claude_local_otel/`, `otlp_relay/`,
+  `claude_shell_telemetry`, `local_resource_diagnostics/`, `codex_scan_diagnostics`,
+  `collection_health`, `source_health`, `tracking_confirmation`, `snapshot_audit`.
+- **Local session views**: `active_sessions`, `detected_uses`, `desktop_recent`,
+  `claude_desktop`, `claude_session_registrations`, `internal_session`.
+- **Small shared code**: `hex`, `canonical_json`.
+- **Test support** (compiled only for tests): `test_effects`, `test_isolation`, `test_scratch`,
+  `retry_allocation_probe`, and the `*_tests.rs` files.
+
+A "snapshot" is one whole-session usage summary sent to the server. Seven names carry the word,
+and not all of them say what the code does:
+
+| Name | What it is |
+|---|---|
+| `snapshots/` | The local read path: discovery, file readers, reduction to usage, the scan index, the state database and the wire model. No network. |
+| `snapshot_sync/` | The upload cycle per source. It uploads one way; it does not sync in both directions. |
+| `snapshot_client.rs` | The HTTP client for every server call, not only snapshot uploads. |
+| `snapshot_retry.rs` | Response size limits and a bounded JSON decoder. It holds no retry logic; that is in `snapshot_sync/retry.rs` and `net_resilience.rs`. |
+| `retry_tls.rs` | The TLS connector behind every HTTP agent. |
+| `snapshot_audit.rs` | The `snapshot-audit` command: a privacy-safe local report. |
+| `snapshot_watcher.rs`, `snapshot_roots.rs` | The file-system watcher, and the folders each source is scanned and watched in. |
+
+The folder names `snapshots/`, `snapshot_sync/` and `state_v2/` stay as they are: thousands of
+paths and test names use them.
+
+## Layout and naming rules
+
+These apply to new and moved code. Existing code that predates them is not rewritten for their
+sake.
+
+1. A folder's listing is its table of contents: aim for at most about 25 entries. Do not add
+   files directly to `src/`, `snapshots/` or `snapshot_sync/`; put a new module in the folder of
+   its feature.
+2. Group by what the code does first (a stage or a feature), by provider (Claude, Codex, Pi)
+   second. Provider-specific code is a leaf folder, not a file-name prefix.
+3. The file path mirrors the module path: `foo.rs` with `foo/` beside it. No new `mod.rs`, and
+   no new `#[path]` or `include!` to wire code into a module.
+4. A name says what the code does today. No ticket, phase or step codes, and no version suffix
+   unless it is a wire or stored format version.
+5. The folder supplies the context: `scan_index/health.rs`, not `scan_index_health.rs` beside
+   `scan_index/`.
+6. Tests live in `foo/tests.rs`, or in `foo/tests/<topic>.rs` when there are many. A short
+   inline `mod tests` in a small file is fine. Test files do not sit in the same flat list as
+   production files.
+7. Every production file opens with a `//!` line that says what it owns now.
+8. Imports name what they use. No new glob imports (`use super::*`, `use crate::x::*`) outside
+   test modules.
+9. `pub` only for what the binary or the integration tests use; otherwise `pub(crate)` or
+   narrower.
+10. A move is its own change, checked as described below, and never mixed with a logic change.
+    File length alone does not justify a split: split along a real seam (a responsibility, a
+    type and its methods, a phase).
+
+`scripts/check_source_layout.py` reports how the whole crate measures up to these rules. It
+fails a change only for: an added `mod.rs`; an added production file without a `//!` line or
+over 3,000 lines; and more `.rs` files directly in a directory than its ceiling in
+`scripts/source_layout_flat.tsv` (today `src/`, `snapshots/` and `snapshot_sync/`). The ceilings
+only fall: lower a row in the change that moves files out.
+
 ## Module map: snapshots/ (target; migration in progress)
 
 `snapshots.rs` and `snapshots/` are being split into the tree below by move-only changes. This is
-the target, not an enforced layout; today most code still sits in `snapshots.rs`.
+the target, not an enforced layout; today much of the code still sits in files directly under
+`snapshots/`.
 
 - `snapshots.rs`: the facade (at most 400 lines): module declarations, re-exports and the entry
   points other modules call.
@@ -554,7 +642,8 @@ Move-only changes are checked with `scripts/check_move_ledger.py` (every item mo
 except that a fn with an unchanged body may have a signature rustfmt re-wrapped and a struct may
 have named fields rustfmt re-wrapped; only visibility, `use`/`mod` lines, path literals and wrappers
 change; a `use` binding kept by name keeps its target, visibility, literal-preserving attributes and
-multiplicity; modules with moved items reject every added glob and every added explicit binding
+multiplicity, except that a single `self`/`super`/`crate` binding may follow its item when the
+ledger shows every item of that name moving from the old module to the new one; modules with moved items reject every added glob and every added explicit binding
 beside an item-level macro call; edits to listed validator files that anchor on moved code are
 reported) and
 `scripts/check_test_id_map.py` (every test keeps its ID or has a row in
@@ -572,12 +661,13 @@ unknown Cargo targets, old-path strings after decoding escapes and normalizing s
 case) and print their limits: implicit log targets, panic locations, approved derives assumed
 context-free, runtime paths and `include!(env!(..))`.
 `scripts/check_source_layout.py` reports how far the tree is from the target.
-Public CI also runs `--enforce-new --base <ref>`: production `.rs` files added
+Public CI also runs `--enforce-new --enforce flat --base <ref>`: production `.rs` files added
 against the base anywhere in the repository must have at most 3,000 lines and
-warn above 1,500. Exact (R100) file moves count as existing files; `*_tests.rs`,
-`tests.rs` and files under `tests/` are excluded. Existing files remain report-only
-unless a rule is explicitly enabled with `--enforce`; a limits-table row cannot
-exempt a new production file from the ceiling.
+warn above 1,500; files added under this crate's `src/` may not be named `mod.rs`, and added
+production files there need a `//!` line. Exact (R100) file moves count as existing files; `*_tests.rs`,
+`tests.rs` and files under `tests/` are excluded from the line ceiling and the `//!` rule. Existing
+files remain report-only unless a rule is explicitly enabled with `--enforce`; a limits-table row
+cannot exempt a new production file from the ceiling.
 
 ## Never drop data
 
