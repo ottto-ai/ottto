@@ -1154,7 +1154,8 @@ keeps the page line under its size bound): nonzero counts of why a body was
 read or uploaded, by one first cause. They are local diagnostics only; they
 gate, cap and upload nothing.
 
-- **Causes:** `append` (growth or a new file in a known index), `finalizer_revision`,
+- **Causes:** `append` (growth, including a due audit of a file that grew, or a
+  new file in a known index), `finalizer_revision`,
   `account_evidence`, `copy_ownership`, `parser_revision`, `ack_recovery`,
   `head_conflict`, `privacy_off_erase`, `source_reset`, `destination_bootstrap`,
   `admin_other`, `operator_repair`, and `unattributed` (a tag lost to a restart or
@@ -1182,8 +1183,8 @@ gate, cap and upload nothing.
   context, inode or sampled-byte move cannot be told apart. `adoption` is a
   non-money body-witness revision adoption, `rearm` a cleared entry
   fingerprint, `memo` an account memo-miss, `new_file_fresh_index` a new file
-  after a fresh index without prior-history evidence, `audit` a due audit, and
-  `other` the rest.
+  after a fresh index without prior-history evidence, `audit` a due audit of a
+  file that did not grow, and `other` the rest.
   - `<cause>.<mode>` is the actual acquisition mode: `unchanged`, `tail`,
     `full:<reason>`, or `no_plan`. A `no_plan` read counts its parser bytes and
     is never in `read`, so the planned modes sum to `read.admin_other`.
@@ -1824,8 +1825,9 @@ keys are no longer emitted: `take_*`, `insert_*`,
 `cursor_reservation_entries_evicted`, `copy_refusal_*`, `clear_*`,
 `retention_*`, `insert_count_entries_evicted`, `insert_byte_entries_evicted`,
 `reinsert_failed`, and in `sampled_acquisition.acquisition_admission`
-`cache_lookup_miss_unknown_origin`, `retained_entry` and
-`retained_entry_rejected_by_eligibility`. `sampled_audit_account_release`
+`cache_lookup_miss_unknown_origin`, `retained_entry`,
+`retained_entry_rejected_by_eligibility` and `comparison_target` (it never
+matched). `sampled_audit_account_release`
 no longer reports `marker_staged`.
 
 All diagnostics are best-effort local stderr observations. Their counters never
