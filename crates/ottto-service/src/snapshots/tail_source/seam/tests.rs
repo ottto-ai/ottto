@@ -198,6 +198,7 @@ impl Route {
             key: local_index_key(path),
             id: HeadIdentity::new(&self.path, S::SOURCE, &self.dir, path, false),
             certificate: completed.checkpoint.durable_certificate(0).unwrap(),
+            write_generation: None,
             unsealed: completed.unsealed,
             full: base.is_none(),
             base,
@@ -441,6 +442,7 @@ fn resident_size_includes_unchanged_pages_without_reencoding_them() {
             &certificate,
             &id,
             Change::Ordinary,
+            None,
             &mut bytes
         )
         .unwrap()
@@ -465,6 +467,7 @@ fn resident_size_includes_unchanged_pages_without_reencoding_them() {
             &certificate,
             &id,
             Change::Ordinary,
+            None,
             &mut bytes,
         )
         .unwrap()
