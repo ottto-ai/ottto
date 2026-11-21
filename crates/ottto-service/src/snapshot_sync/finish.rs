@@ -1157,6 +1157,13 @@ struct FinishEnv<'a> {
     identity_item_cap: usize,
 }
 
+/// What the local evidence fold hands to the rest of the pass.
+struct LocalEvidence {
+    backfill_succeeded: bool,
+    claude_authority_disposition: crate::snapshots::ClaudeUsageAuthorityDisposition,
+    claude_cutoff_corrections: Vec<crate::snapshots::ClaudeCutoffCorrectionCandidate>,
+}
+
 /// What the final progress retirement consumes.
 struct ProgressRetirement<'a> {
     local_holds: &'a LocalHoldSettlement,
@@ -1328,215 +1335,11 @@ pub(super) fn finish_sync_source(
     if std::mem::take(&mut scan_result.walk_idle) {
         crate::snapshots::walk_idle::clear(source);
     }
-    let scan_agent_status = reconciliation_agent_status(&scan_agent_status_collection);
-    // State advances only after the exact paged replay census and its upload
-    // both finish. Incomplete pages persist their cursor in the destination
-    // index and remain pending across restarts.
-    let mut backfill_succeeded = backfill_pending && scan_result.census_complete;
-    if backfill_pending && !backfill_succeeded {
-        eprintln!(
-            "local snapshot backfill remains pending for {}: census incomplete",
-            source.api_slug(),
-        );
-    }
-
-    // Backfill snapshots are appended after the live scan, so run the same
-    // content-free effort enrichment over the combined set. Already-split live
-    // buckets are naturally skipped because they now have multiple effort rows.
-    // This must precede upload-policy stripping: parent/root references are
-    // identity evidence needed locally even when the org disables attribution
-    // labels on the wire.
-    let mut claude_authority_disposition =
-        crate::snapshots::ClaudeUsageAuthorityDisposition::default();
-    if source == SnapshotSource::ClaudeCode {
-        let evidence_started = Instant::now();
-        crate::snapshots::claude_request_identity::retain_root_accounts(
-            &mut scan_result.snapshots,
-            &index,
-            machine_id,
-        );
-        let telemetry_window = upload_progress.seed_telemetry(
-            support_dir,
-            &activity_hint,
-            &mut scan_result,
-            &index,
-            &upload_progress_path,
-        )?;
-        upload_progress.load_identity(
-            (scan_result.snapshots.iter()).map(|item| item.source_session_id.as_str()),
-        )?;
-        let mut telemetry_ledger = upload_progress.telemetry_only.take();
-        let reserve_cache_bytes = |item: &SnapshotItem| {
-            if cache_observations_enabled || item.evidence_basis == Some("otel_only") {
-                identity_cache_wire_reserve(item, &upload_progress, cache_full_replacement)
-            } else {
-                0
-            }
-        };
-        let (mut disposition, census_withheld, stats) =
-            apply_claude_local_evidence_to_scan_with_ledger_and_budget(
-                support_dir,
-                &mut scan_result,
-                &mut index,
-                Some(&upload_progress.accepted_identity_buckets),
-                crate::snapshots::claude_request_identity::WireBudget {
-                    max_item_bytes: identity_item_cap,
-                    reservation: Some(&reserve_cache_bytes),
-                },
-                telemetry_window.zip(telemetry_ledger.as_deref_mut()),
-            );
-        upload_progress.telemetry_only = telemetry_ledger;
-        scan_result.queue_side_call_hints(
-            &mut index,
-            claude_scan_roots.as_deref().unwrap_or_default(),
-            receipt_window_days,
-            &mut disposition,
-        );
-        // Copy-derived rows: the bodies just built treat these
-        // rows as never accepted; the ledger records that durably before any
-        // upload, so a lost reply or restart cannot restore their proof.
-        if upload_progress
-            .accepted_identity_buckets
-            .invalidate_copy_derived(&std::mem::take(&mut disposition.copy_invalidated))
-        {
-            upload_progress.save(&upload_progress_path)?;
-        }
-        if let Ok(counts) = serde_json::to_string(&stats) {
-            eprintln!(
-                "local snapshot sync: claude local evidence duration_ms={} cache_creation_rejected_interpretations_total={} counts={counts}",
-                evidence_started.elapsed().as_millis(),
-                crate::snapshots::claude_api_cache_creation_rejection_count(),
-            );
-        }
-        if let Ok(counts) = serde_json::to_string(&stats.context_file_birth) {
-            eprintln!("local snapshot sync: claude context basis counts={counts}");
-        }
-        claude_authority_disposition = disposition;
-        if census_withheld {
-            backfill_succeeded = false;
-        }
-    }
-    // The history-upgrade emission seam: after the local evidence fold, before
-    // every ordinary and correction upload path can see a held body.
-    index.veto_claude_history_emission(source, &mut scan_result.snapshots);
-    // Diagnostics only: counted from the finished bodies, borrowed.
-    crate::local_resource_diagnostics::usage_gaps(source.api_slug(), &scan_result.snapshots);
-
-    // Recheck after the potentially long scan, not only when status was
-    // acquired. A cached login must not claim sessions created after a switch.
-    let current_codex_bindings =
-        crate::agent_status_refresh::current_codex_home_bindings(&scan_agent_status_collection);
-    let cached_codex_login_changed = source == SnapshotSource::Codex
-        && current_codex_bindings.len() != scan_agent_status_collection.codex_home_bindings.len();
-    let creator_slots = (source == SnapshotSource::Codex)
-        .then(crate::agent_status::registered_codex_creator_slots)
-        .unwrap_or_default();
-    let codex_diagnostics = scan_result.local_codex_diagnostics.as_mut();
-    let deferred_accounts = index.bind_session_accounts_with_mixed(
-        source,
-        machine_id,
-        &mut scan_result.snapshots,
-        &current_codex_bindings,
-        (
-            &creator_slots,
-            codex_diagnostics.map_or(&mut [0; 9], |d| &mut d.creator_slot_naming),
-        ),
-        &claude_authority_disposition.mixed_uploads,
-    );
-    claude_authority_disposition.defer_sessions(deferred_accounts);
-
-    // The Companion uses machine-local labels before upload policy clears them.
-    let reconciliation_status = crate::agent_status_refresh::status_for_reconciliation(
-        scan_agent_status,
-        &current_codex_bindings,
-        cached_codex_login_changed,
-    );
-    // Claude activity remains recent relative to the scan's observation
-    // horizon, while future timestamps are bounded by the reconciliation clock.
-    let tracking_episode = daemon.tracking_episode(&source_kind(source));
-    let reconciled_at = current_rfc3339();
-    let since = tracking_episode
-        .as_ref()
-        .and_then(|(_, since)| OffsetDateTime::parse(since, &Rfc3339).ok());
-    let mut latest = None;
-    let mut observe = |new, previous, within_ceiling| {
-        latest = latest.max(crate::tracking_confirmation::parsed_activity_witness(
-            since,
-            new,
-            previous,
-            within_ceiling,
-        ));
-    };
-    if crate::active_sessions::reconcile_with_registrations(
-        support_dir,
-        source,
-        &scan_result.snapshots,
-        Some(&reconciliation_status),
-        (source == SnapshotSource::ClaudeCode).then_some(scan_started_at.as_str()),
-        &reconciled_at,
-        Some("local"),
-        with_source_cadence(source, |cadence| {
-            cadence.ordinary_interval().min(MAX_CYCLE_INTERVAL)
-        })
-        .unwrap_or(SNAPSHOT_SYNC_INTERVAL),
-        crate::agent_status::claude_session_registrations,
-        tracking_episode
-            .as_ref()
-            .map(|_| &mut observe as &mut dyn FnMut(_, _, _)),
-    )
-    .is_err()
-    {
-        eprintln!(
-            "local active-session cache update skipped for {}",
-            source.api_slug()
-        );
-    }
-
-    // A scan completed even if the optional cache write failed or upload later fails.
-    with_source_cadence_state(source, |cadence| {
-        if let Some(pulse) = cadence.collection.as_mut() {
-            pulse.complete(&reconciled_at);
-        }
-    });
-
-    if let (Some((generation, _)), Some(at)) = (
-        tracking_episode,
-        latest.and_then(|at| at.format(&Rfc3339).ok()),
-    ) {
-        daemon
-            .confirm_tracking_activity(&source_kind(source), generation, &at)
-            .map_err(|_| anyhow!("tracking state unavailable"))?;
-    }
-
-    crate::snapshots::apply_upload_policy(source, &mut scan_result.snapshots, upload_policy);
-
-    // Account-switch backfill cutoff (server-issued at claim completion): a
-    // machine claimed by a different same-org user must not re-attribute the
-    // previous owner's already-ingested history. Applies to everything headed
-    // upstream this cycle — sessions whose activity ended strictly before the
-    // cutoff are historical by definition, whichever scan produced them; live
-    // sessions always have activity at/after the cutoff and pass untouched.
-    let (skipped_before_cutoff, claude_cutoff_corrections) = if source == SnapshotSource::ClaudeCode
-    {
-        apply_backfill_cutoff_with_claude_corrections(
-            &mut scan_result,
-            &index,
-            &claude_authority_disposition,
-            &backfill_state,
-        )
-    } else {
-        (
-            apply_backfill_cutoff(&mut scan_result.snapshots, &backfill_state),
-            Vec::new(),
-        )
-    };
-    if skipped_before_cutoff > 0 {
-        eprintln!(
-            "ottto-service: skipped {} historical {} snapshot(s) that ended before the account-switch backfill cutoff",
-            skipped_before_cutoff,
-            source.api_slug(),
-        );
-    }
+    let LocalEvidence {
+        mut backfill_succeeded,
+        claude_authority_disposition,
+        claude_cutoff_corrections,
+    } = fold_local_evidence(&env, &mut index, &mut scan_result, &mut upload_progress)?;
 
     backfill_succeeded &= scan_result.census_complete;
     let deferred_cache_head_identities = capture_deferred_cache_head_identities(
@@ -2666,6 +2469,250 @@ pub(super) fn finish_sync_source(
             terminal_scan_started_at,
         },
     )
+}
+
+/// Turns what the scan found into the bodies this pass may send: Claude local
+/// evidence, account binding, the active-session cache, tracking confirmation,
+/// upload policy and the account-switch cutoff. No upload happens here.
+fn fold_local_evidence(
+    env: &FinishEnv<'_>,
+    index: &mut ScanIndex,
+    scan_result: &mut SourceScanResult,
+    upload_progress: &mut SnapshotUploadProgress,
+) -> Result<LocalEvidence> {
+    let FinishEnv {
+        source,
+        claude_scan_roots,
+        scan_started_at,
+        activity_hint,
+        receipt_window_days,
+        cache_observations_enabled,
+        scan_agent_status_collection,
+        upload_policy,
+        upload_progress_path,
+        backfill_state,
+        backfill_pending,
+        machine_id,
+        support_dir,
+        daemon,
+        cache_full_replacement,
+        identity_item_cap,
+        ..
+    } = *env;
+    let scan_agent_status = reconciliation_agent_status(scan_agent_status_collection);
+    // State advances only after the exact paged replay census and its upload
+    // both finish. Incomplete pages persist their cursor in the destination
+    // index and remain pending across restarts.
+    let mut backfill_succeeded = backfill_pending && scan_result.census_complete;
+    if backfill_pending && !backfill_succeeded {
+        eprintln!(
+            "local snapshot backfill remains pending for {}: census incomplete",
+            source.api_slug(),
+        );
+    }
+
+    // Backfill snapshots are appended after the live scan, so run the same
+    // content-free effort enrichment over the combined set. Already-split live
+    // buckets are naturally skipped because they now have multiple effort rows.
+    // This must precede upload-policy stripping: parent/root references are
+    // identity evidence needed locally even when the org disables attribution
+    // labels on the wire.
+    let mut claude_authority_disposition =
+        crate::snapshots::ClaudeUsageAuthorityDisposition::default();
+    if source == SnapshotSource::ClaudeCode {
+        let evidence_started = Instant::now();
+        crate::snapshots::claude_request_identity::retain_root_accounts(
+            &mut scan_result.snapshots,
+            index,
+            machine_id,
+        );
+        let telemetry_window = upload_progress.seed_telemetry(
+            support_dir,
+            activity_hint,
+            scan_result,
+            index,
+            upload_progress_path,
+        )?;
+        upload_progress.load_identity(
+            (scan_result.snapshots.iter()).map(|item| item.source_session_id.as_str()),
+        )?;
+        let mut telemetry_ledger = upload_progress.telemetry_only.take();
+        let reserve_cache_bytes = |item: &SnapshotItem| {
+            if cache_observations_enabled || item.evidence_basis == Some("otel_only") {
+                identity_cache_wire_reserve(item, upload_progress, cache_full_replacement)
+            } else {
+                0
+            }
+        };
+        let (mut disposition, census_withheld, stats) =
+            apply_claude_local_evidence_to_scan_with_ledger_and_budget(
+                support_dir,
+                scan_result,
+                index,
+                Some(&upload_progress.accepted_identity_buckets),
+                crate::snapshots::claude_request_identity::WireBudget {
+                    max_item_bytes: identity_item_cap,
+                    reservation: Some(&reserve_cache_bytes),
+                },
+                telemetry_window.zip(telemetry_ledger.as_deref_mut()),
+            );
+        upload_progress.telemetry_only = telemetry_ledger;
+        scan_result.queue_side_call_hints(
+            index,
+            claude_scan_roots.as_deref().unwrap_or_default(),
+            receipt_window_days,
+            &mut disposition,
+        );
+        // Copy-derived rows: the bodies just built treat these
+        // rows as never accepted; the ledger records that durably before any
+        // upload, so a lost reply or restart cannot restore their proof.
+        if upload_progress
+            .accepted_identity_buckets
+            .invalidate_copy_derived(&std::mem::take(&mut disposition.copy_invalidated))
+        {
+            upload_progress.save(upload_progress_path)?;
+        }
+        if let Ok(counts) = serde_json::to_string(&stats) {
+            eprintln!(
+                "local snapshot sync: claude local evidence duration_ms={} cache_creation_rejected_interpretations_total={} counts={counts}",
+                evidence_started.elapsed().as_millis(),
+                crate::snapshots::claude_api_cache_creation_rejection_count(),
+            );
+        }
+        if let Ok(counts) = serde_json::to_string(&stats.context_file_birth) {
+            eprintln!("local snapshot sync: claude context basis counts={counts}");
+        }
+        claude_authority_disposition = disposition;
+        if census_withheld {
+            backfill_succeeded = false;
+        }
+    }
+    // The history-upgrade emission seam: after the local evidence fold, before
+    // every ordinary and correction upload path can see a held body.
+    index.veto_claude_history_emission(source, &mut scan_result.snapshots);
+    // Diagnostics only: counted from the finished bodies, borrowed.
+    crate::local_resource_diagnostics::usage_gaps(source.api_slug(), &scan_result.snapshots);
+
+    // Recheck after the potentially long scan, not only when status was
+    // acquired. A cached login must not claim sessions created after a switch.
+    let current_codex_bindings =
+        crate::agent_status_refresh::current_codex_home_bindings(scan_agent_status_collection);
+    let cached_codex_login_changed = source == SnapshotSource::Codex
+        && current_codex_bindings.len() != scan_agent_status_collection.codex_home_bindings.len();
+    let creator_slots = (source == SnapshotSource::Codex)
+        .then(crate::agent_status::registered_codex_creator_slots)
+        .unwrap_or_default();
+    let codex_diagnostics = scan_result.local_codex_diagnostics.as_mut();
+    let deferred_accounts = index.bind_session_accounts_with_mixed(
+        source,
+        machine_id,
+        &mut scan_result.snapshots,
+        &current_codex_bindings,
+        (
+            &creator_slots,
+            codex_diagnostics.map_or(&mut [0; 9], |d| &mut d.creator_slot_naming),
+        ),
+        &claude_authority_disposition.mixed_uploads,
+    );
+    claude_authority_disposition.defer_sessions(deferred_accounts);
+
+    // The Companion uses machine-local labels before upload policy clears them.
+    let reconciliation_status = crate::agent_status_refresh::status_for_reconciliation(
+        scan_agent_status,
+        &current_codex_bindings,
+        cached_codex_login_changed,
+    );
+    // Claude activity remains recent relative to the scan's observation
+    // horizon, while future timestamps are bounded by the reconciliation clock.
+    let tracking_episode = daemon.tracking_episode(&source_kind(source));
+    let reconciled_at = current_rfc3339();
+    let since = tracking_episode
+        .as_ref()
+        .and_then(|(_, since)| OffsetDateTime::parse(since, &Rfc3339).ok());
+    let mut latest = None;
+    let mut observe = |new, previous, within_ceiling| {
+        latest = latest.max(crate::tracking_confirmation::parsed_activity_witness(
+            since,
+            new,
+            previous,
+            within_ceiling,
+        ));
+    };
+    if crate::active_sessions::reconcile_with_registrations(
+        support_dir,
+        source,
+        &scan_result.snapshots,
+        Some(&reconciliation_status),
+        (source == SnapshotSource::ClaudeCode).then_some(scan_started_at.as_str()),
+        &reconciled_at,
+        Some("local"),
+        with_source_cadence(source, |cadence| {
+            cadence.ordinary_interval().min(MAX_CYCLE_INTERVAL)
+        })
+        .unwrap_or(SNAPSHOT_SYNC_INTERVAL),
+        crate::agent_status::claude_session_registrations,
+        tracking_episode
+            .as_ref()
+            .map(|_| &mut observe as &mut dyn FnMut(_, _, _)),
+    )
+    .is_err()
+    {
+        eprintln!(
+            "local active-session cache update skipped for {}",
+            source.api_slug()
+        );
+    }
+
+    // A scan completed even if the optional cache write failed or upload later fails.
+    with_source_cadence_state(source, |cadence| {
+        if let Some(pulse) = cadence.collection.as_mut() {
+            pulse.complete(&reconciled_at);
+        }
+    });
+
+    if let (Some((generation, _)), Some(at)) = (
+        tracking_episode,
+        latest.and_then(|at| at.format(&Rfc3339).ok()),
+    ) {
+        daemon
+            .confirm_tracking_activity(&source_kind(source), generation, &at)
+            .map_err(|_| anyhow!("tracking state unavailable"))?;
+    }
+
+    crate::snapshots::apply_upload_policy(source, &mut scan_result.snapshots, upload_policy);
+
+    // Account-switch backfill cutoff (server-issued at claim completion): a
+    // machine claimed by a different same-org user must not re-attribute the
+    // previous owner's already-ingested history. Applies to everything headed
+    // upstream this cycle — sessions whose activity ended strictly before the
+    // cutoff are historical by definition, whichever scan produced them; live
+    // sessions always have activity at/after the cutoff and pass untouched.
+    let (skipped_before_cutoff, claude_cutoff_corrections) = if source == SnapshotSource::ClaudeCode
+    {
+        apply_backfill_cutoff_with_claude_corrections(
+            scan_result,
+            index,
+            &claude_authority_disposition,
+            backfill_state,
+        )
+    } else {
+        (
+            apply_backfill_cutoff(&mut scan_result.snapshots, backfill_state),
+            Vec::new(),
+        )
+    };
+    if skipped_before_cutoff > 0 {
+        eprintln!(
+            "ottto-service: skipped {} historical {} snapshot(s) that ended before the account-switch backfill cutoff",
+            skipped_before_cutoff,
+            source.api_slug(),
+        );
+    }
+    Ok(LocalEvidence {
+        backfill_succeeded,
+        claude_authority_disposition,
+        claude_cutoff_corrections,
+    })
 }
 
 /// After the selected save: the source's cadence, the next resident scan and
