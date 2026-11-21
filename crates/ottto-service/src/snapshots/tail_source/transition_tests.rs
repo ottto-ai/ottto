@@ -933,3 +933,50 @@ mod independent {
 mod legacy_recount {
     include!("codex_legacy_recount_tests.rs");
 }
+
+/// [money] A Codex rollout touched at its size, ending in a closed record or
+/// in a final record without its newline (an EOF fragment past the sealed
+/// offset). Under an unchanged write generation count it continues from its
+/// committed head as a Claude transcript does: `Unchanged`, or a Tail that
+/// re-reads only the fragment, each equal to a cold Full. Without counts the
+/// closed rollout's touch is the same-size edit it was (positive control).
+#[test]
+fn a_touched_codex_rollout_continues_like_claude_under_an_equal_count() {
+    use crate::transcript_acquisition::{FullReason, Generations, UseGenerations};
+    for fragment in [false, true] {
+        let _counts = UseGenerations::new(Generations::Simulated);
+        let mut route = route_for(Source::Codex);
+        let path = route.dir.join(Codex::name());
+        let body = codex_lines(6).join("\n") + if fragment { "" } else { "\n" };
+        std::fs::write(&path, body).unwrap();
+        let (tail, native) = complete::<Codex>(&route, &path, None, |_| {});
+        let key = tail.key.clone();
+        assert!(tail.publish(&native));
+        route.save(false);
+        if !fragment {
+            assert!(head::<Codex>(&route, &key).write_generation.is_some());
+        }
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(modified + std::time::Duration::from_secs(2))
+            .unwrap();
+        if !fragment {
+            let _off = UseGenerations::new(Generations::Off);
+            assert!(matches!(
+                load_at::<Codex>(&route, &path, &key),
+                Load::Cold(Some(FullReason::SameSizeEdit))
+            ));
+        }
+        let expect: fn(&ReadMode) -> bool = if fragment {
+            |read| matches!(read, ReadMode::Tail)
+        } else {
+            |read| matches!(read, ReadMode::Unchanged)
+        };
+        let paths = std::slice::from_ref(&path);
+        let (stored, _) = codex_stored(&route, paths, Mode::Restart, expect);
+        money_oracle::assert_equivalent(&codex_cold(&route, paths), &stored);
+    }
+}

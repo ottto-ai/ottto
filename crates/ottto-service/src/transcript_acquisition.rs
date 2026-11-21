@@ -935,7 +935,7 @@ impl PrefixSeal {
             .flatten()
             .map(|due_unix_seconds| AuditDebt { due_unix_seconds });
         let mut guard = 0;
-        let mode = select_mode(Some(view), debt, &stamp, scope, now, None, |at| {
+        let mode = select_mode(Some(view), debt, &stamp, scope, now, false, |at| {
             let (offset, expected) = match at {
                 SampleAt::Head => (0, &self.head_sha256),
                 SampleAt::Boundary => (sealed - len as u64, &self.boundary_sha256),
@@ -1204,17 +1204,19 @@ fn audit_due(exact_stamp: bool, debt: Option<AuditDebt>, now: u64) -> bool {
 /// `prepare`'s mode decision. `sample_eq` compares one sample window of the
 /// held FD with the certificate's; it is called only when the decision needs
 /// that window, in the order head then boundary.
-/// `generation` is the held FD's count, taken with `stamp`: a same-size moved
-/// mtime it proves a touch (`CertificateView::same_size_touch`) is no
-/// `SameSizeEdit`. It continues as an unchanged file does, after both samples
-/// match, and carries the certificate's verification and debt.
+/// `touched`: the held FD's count, taken with `stamp`, proves a same-size
+/// moved mtime a touch (`CertificateView::same_size_touch`, or a restore that
+/// proved it). That is no `SameSizeEdit`: with a due debt it is the audit's
+/// Full, otherwise it continues as an unchanged file does, after both samples
+/// match (on a restore, the restore's), and carries the certificate's
+/// verification and debt.
 fn select_mode(
     old: Option<CertificateView<'_>>,
     debt: Option<AuditDebt>,
     stamp: &FileStamp,
     scope: &Scope,
     now: u64,
-    generation: Option<WriteGeneration>,
+    touched: bool,
     mut sample_eq: impl FnMut(SampleAt) -> io::Result<bool>,
 ) -> io::Result<ReadMode> {
     // Only PrefixSeal uses the exact-stamp view. Its proof horizon stays
@@ -1235,7 +1237,6 @@ fn select_mode(
     } else if audit_due(proof_horizon, debt, now) {
         ReadMode::Full(FullReason::AuditDue)
     } else if let Some(old) = old {
-        let touched = old.same_size_touch(stamp, generation);
         if !old.samples_valid {
             ReadMode::Full(FullReason::InvalidCheckpoint)
         } else if old.scope != scope.0 {
@@ -1248,6 +1249,10 @@ fn select_mode(
             ReadMode::Full(FullReason::Shrunk)
         } else if stamp.length == old.stamp.length && !old.unchanged(stamp) && !touched {
             ReadMode::Full(FullReason::SameSizeEdit)
+        } else if touched && debt.is_some_and(|debt| now >= debt.due_unix_seconds) {
+            // A proven touch never stands in for a due audit, and so never
+            // reaches a quiet retirement: the audit reads Full.
+            ReadMode::Full(FullReason::AuditDue)
         } else if old.unchanged(stamp) && old.sealed_offset == stamp.length {
             ReadMode::Unchanged
         } else if !sample_eq(SampleAt::Head)? {
@@ -1298,11 +1303,17 @@ impl ReadPlan {
             view.samples_valid &= !OLD_CHECKPOINT_INVALID.with(std::cell::Cell::get);
             view
         });
+        // A retained checkpoint proves a touch here; a restored one proved it
+        // across its samples, and still holds only under the same count now.
         let touched = view
             .as_ref()
             .is_some_and(|view| view.same_size_touch(&stamp, generation))
-            || checkpoint.is_some_and(|checkpoint| checkpoint.touch_proven);
-        let mode = select_mode(view, debt, &stamp, scope, now, generation, |at| {
+            || checkpoint.is_some_and(|checkpoint| {
+                checkpoint.touch_proven
+                    && generation.is_some()
+                    && checkpoint.write_generation == generation
+            });
+        let mode = select_mode(view, debt, &stamp, scope, now, touched, |at| {
             #[cfg(test)]
             if OLD_SAMPLE_IO_ERROR.with(std::cell::Cell::get) {
                 return Err(io::Error::other(
@@ -1830,12 +1841,59 @@ pub(crate) fn durable_sample_digest(bytes: &[u8]) -> [u8; 32] {
 /// report it. Never a default such as mtime or now.
 #[cfg(unix)]
 pub(crate) fn birth_unix_nanos(metadata: &Metadata) -> u64 {
-    metadata
-        .created()
-        .ok()
-        .and_then(|created| created.duration_since(std::time::UNIX_EPOCH).ok())
-        .and_then(|since| u64::try_from(since.as_nanos()).ok())
-        .unwrap_or(0)
+    recycled(
+        metadata
+            .created()
+            .ok()
+            .and_then(|created| created.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|since| u64::try_from(since.as_nanos()).ok())
+            .unwrap_or(0),
+    )
+}
+
+#[cfg(all(not(test), unix))]
+fn recycled(birth: u64) -> u64 {
+    birth
+}
+
+#[cfg(all(test, unix))]
+fn recycled(birth: u64) -> u64 {
+    match RECYCLED_BIRTH.with(std::cell::Cell::get) {
+        None => birth,
+        Some(0) => 0,
+        Some(shift) => birth.wrapping_add(shift),
+    }
+}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    /// Tests only: `None` reads real births; `Some(0)` reads every birth as
+    /// unknown; `Some(n)` reads every birth `n` nanoseconds later, as an
+    /// inode reused by a new object reports it.
+    static RECYCLED_BIRTH: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Tests only: births read on this thread are another object's (or unknown)
+/// until the guard drops, while the inode, bytes and count stay.
+#[cfg(all(test, unix))]
+pub(crate) struct RecycledBirth(());
+#[cfg(all(test, unix))]
+impl RecycledBirth {
+    pub(crate) fn later(nanos: u64) -> Self {
+        assert_ne!(nanos, 0);
+        RECYCLED_BIRTH.with(|birth| birth.set(Some(nanos)));
+        Self(())
+    }
+    pub(crate) fn unknown() -> Self {
+        RECYCLED_BIRTH.with(|birth| birth.set(Some(0)));
+        Self(())
+    }
+}
+#[cfg(all(test, unix))]
+impl Drop for RecycledBirth {
+    fn drop(&mut self) {
+        RECYCLED_BIRTH.with(|birth| birth.set(None));
+    }
 }
 
 /// APFS moves an object's birth down to its mtime when the mtime is set
@@ -2345,6 +2403,30 @@ mod tests {
             assert_eq!(next.write_generation, cp.write_generation);
             assert_ne!(next.stamp.modified, cp.stamp.modified);
         }
+        // Never a bare Unchanged: either sample that differs is a Full.
+        move_mtime(&f, 3);
+        let mut head = cp.clone();
+        head.samples.head[0] ^= 1;
+        assert_eq!(
+            run(&f, Some(&head), None, 32).0,
+            ReadMode::Full(FullReason::HeadChanged)
+        );
+        let mut boundary = cp.clone();
+        let last = boundary.samples.boundary.len() - 2;
+        boundary.samples.boundary[last] ^= 1;
+        assert_eq!(
+            run(&f, Some(&boundary), None, 33).0,
+            ReadMode::Full(FullReason::BoundaryChanged)
+        );
+        // A due debt is the audit's Full, never a touch continued into a
+        // quiet retirement.
+        let due = Some(AuditDebt {
+            due_unix_seconds: 35,
+        });
+        let mut file = f.open();
+        let plan = ReadPlan::prepare(&mut file, Some(&cp), &scope(), due, 35).unwrap();
+        assert_eq!(plan.mode(), ReadMode::Full(FullReason::AuditDue));
+        assert!(!plan.same_size_touch_proven());
         {
             let _off = UseGenerations::new(Generations::Off);
             let (mode, _, _) = run(&f, Some(&cp), None, 40);
@@ -2456,6 +2538,40 @@ mod tests {
             .unwrap();
         assert_eq!(next.last_full_verified(), 10);
         assert_eq!(next.write_generation_for(birth), count);
+        // Never a bare Unchanged: the restore compares both samples first.
+        let mut head = certificate.clone();
+        head.head_sha256[0] ^= 1;
+        assert_eq!(
+            head.restore_grown_counted(&mut f.open(), scope(), None, count)
+                .err(),
+            Some(CertificateRefusal::Changed(FullReason::HeadChanged))
+        );
+        let mut boundary = certificate.clone();
+        boundary.boundary_sha256[0] ^= 1;
+        assert_eq!(
+            boundary
+                .restore_grown_counted(&mut f.open(), scope(), None, count)
+                .err(),
+            Some(CertificateRefusal::Changed(FullReason::BoundaryChanged))
+        );
+        // A due debt on the restored checkpoint is the audit's Full.
+        let restored = restore(count).unwrap();
+        let due = Some(AuditDebt {
+            due_unix_seconds: 20,
+        });
+        let plan = ReadPlan::prepare(&mut f.open(), Some(&restored), &scope(), due, 20).unwrap();
+        assert_eq!(plan.mode(), ReadMode::Full(FullReason::AuditDue));
+        // A write after the restore is not the restore's touch: it moves
+        // the count, so it is the edit it would be without one.
+        {
+            use std::os::unix::fs::FileExt;
+            let restored = restore(count).unwrap();
+            f.open().write_all_at(b"O", 0).unwrap();
+            let (mode, _, _) = run(&f, Some(&restored), None, 21);
+            assert_eq!(mode, ReadMode::Full(FullReason::SameSizeEdit));
+            f.open().write_all_at(b"o", 0).unwrap();
+            move_mtime(&f, 600);
+        }
         let mut reborn = certificate.clone();
         reborn.birth_nanos = birth + 1;
         assert_eq!(

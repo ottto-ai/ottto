@@ -419,3 +419,49 @@ fn uncounted_touch_reads_full_until_a_read_stores_a_count() {
         against_cold(&s, &mut restored, &index, Mode::DiskRestore);
     });
 }
+
+/// [money] An inode reused by a new object with the same bytes and so an
+/// equal count, but another birth, or a birth the volume no longer reports:
+/// no count proves the touch, so both routes read Full, equal to cold Full and
+/// never a smaller re-emit. With the real birth the same touch restores
+/// (positive control).
+#[test]
+fn recycled_inode_with_an_equal_count_and_another_birth_reads_full() {
+    use crate::transcript_acquisition::RecycledBirth;
+    for unknown in [false, true] {
+        with_e2(|| {
+            let _counts = UseGenerations::new(Generations::Simulated);
+            let s = seed(&format!("touch-proof-recycled-{unknown}"));
+            if !counted(&s.root) {
+                return;
+            }
+            set_mtime(&s.root, SystemTime::now());
+            let recycled = || {
+                if unknown {
+                    RecycledBirth::unknown()
+                } else {
+                    RecycledBirth::later(1_000_000_000)
+                }
+            };
+
+            let guard = recycled();
+            let (_, mut restored, _) = restart_pass(&s, &s.index);
+            drop(guard);
+            assert_eq!(restored.modes, (1, 0, 0), "unknown={unknown}");
+            against_cold(&s, &mut restored, &s.index, Mode::DiskRestore);
+
+            let guard = recycled();
+            let edits = same_size_edits(&s.owner);
+            let mut retained = s.c.raw(&s.owner, s.index.clone(), 100, true, &[]);
+            drop(guard);
+            assert_eq!(retained.modes, (1, 0, 0), "unknown={unknown}");
+            assert_eq!(same_size_edits(&s.owner), edits + 1, "unknown={unknown}");
+            against_cold(&s, &mut retained, &s.index, Mode::Ram);
+
+            let (_, mut control, consumed) = restart_pass(&s, &s.index);
+            assert_eq!(control.modes, (0, 0, 1), "the real birth restores");
+            assert_eq!(consumed, 0);
+            against_cold(&s, &mut control, &s.index, Mode::DiskRestore);
+        });
+    }
+}

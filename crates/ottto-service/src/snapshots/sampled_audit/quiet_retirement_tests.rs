@@ -2097,3 +2097,81 @@ fn pi_recordless_due_audit_reads_once_without_counting_a_content_change() {
         assert_eq!(reads.get(&fixture.file.0), Some(&1));
     }
 }
+
+/// [money] A same-size touch that an unchanged write generation count proves,
+/// on a file that owes an audit. Undue: the retained checkpoint continues
+/// (`Unchanged`, no audit started), the debt and its deadline stay, and no
+/// quiet retirement is staged. Due: the audit reads Full (`audit_due`, one
+/// audit started) and nothing retires quietly. Without counts the touch reads
+/// Full as before (positive control).
+#[test]
+fn a_proven_touch_keeps_undue_debt_and_reads_a_due_audit_full() {
+    use crate::transcript_acquisition::{Generations, UseGenerations};
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _clock = Clock::at(START);
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        for (generations, due) in [
+            (Generations::Simulated, false),
+            (Generations::Simulated, true),
+            (Generations::Off, false),
+        ] {
+            let case = format!("{source:?} {generations:?} due={due}");
+            let _counts = UseGenerations::new(generations);
+            sampled_scan::set_test_now(Some(START));
+            let fixture = ScanFixture::new(source);
+            fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+            let cache = Arc::new(sampled_scan::SharedCache::default());
+            let scan =
+                |index| production_scan(&fixture, source, index, Some(cache.clone()), "touch-debt");
+            let (index, _, _) = scan(ScanIndex::default());
+            fixture.file.append(&usage(source, 130, 1, "fixture-model"));
+            let (index, _, modes) = scan(index);
+            assert_eq!(modes, (0, 1, 0), "{case}");
+            let key = local_index_key(&fixture.file.0);
+            let deadline = index.files[&key].unverified_deadline().unwrap();
+            sampled_scan::set_test_now(Some(if due { deadline } else { deadline - 1 }));
+            let modified = fs::metadata(&fixture.file.0).unwrap().modified().unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&fixture.file.0)
+                .unwrap()
+                .set_modified(modified + std::time::Duration::from_secs(2))
+                .unwrap();
+            let ((index, _, modes), diagnostics) =
+                crate::local_resource_diagnostics::capture(|| scan(index));
+            let page = diagnostics
+                .iter()
+                .find(|row| row["stage"] == "native_collection_page")
+                .unwrap();
+            let counts = &page["counts"]["sampled_acquisition"];
+            let events = &counts["page_events"];
+            assert_eq!(
+                counts["index_state_at_page_end"]["audit_quiet_retired"], 0,
+                "{case}"
+            );
+            match (generations, due) {
+                (Generations::Simulated, false) => {
+                    assert_eq!(modes, (0, 0, 1), "{case}");
+                    assert_eq!(events["audits_started"], 0, "{case}");
+                    assert!(index.files[&key].has_unverified_source(), "{case}");
+                    assert_eq!(
+                        index.files[&key].unverified_deadline(),
+                        Some(deadline),
+                        "{case}"
+                    );
+                }
+                (Generations::Simulated, true) => {
+                    assert_eq!(modes, (1, 0, 0), "{case}");
+                    assert_eq!(events["full_reasons"]["audit_due"], 1, "{case}");
+                    assert_eq!(events["audits_started"], 1, "{case}");
+                }
+                _ => {
+                    assert_eq!(modes, (1, 0, 0), "{case}");
+                    assert_eq!(events["full_reasons"]["same_size_edit"], 1, "{case}");
+                }
+            }
+        }
+    }
+}
