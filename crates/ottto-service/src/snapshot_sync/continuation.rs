@@ -77,6 +77,15 @@ pub(super) fn session_power_stretch(power: PlatformState) -> u32 {
         PlatformState::Allowed | PlatformState::Unknown => 1,
     }
 }
+/// The fixed diagnostics key for a power state.
+pub(super) fn power_label(power: PlatformState) -> &'static str {
+    match power {
+        PlatformState::Allowed => "power_allowed",
+        PlatformState::Battery => "power_battery",
+        PlatformState::Refused => "power_refused",
+        PlatformState::Unknown => "power_unknown",
+    }
+}
 fn resident_pacing(power: PlatformState) -> Option<ContinuationPacing> {
     match power {
         PlatformState::Allowed => Some(PACED_AC),
@@ -158,6 +167,9 @@ pub(super) fn resident_scan_requested(scan: &SourceScanResult, first_read_bootst
                     && !scan.census_complete)))
 }
 /// An AC request can wake once after unplugging; battery cannot renew this reason.
+/// Every request made during the source's first import carries the
+/// first-import flag, so its pages run at the import QoS on AC; battery and
+/// steady-state passes stay at background QoS (`paced_pass_qos`).
 pub(super) fn resident_scan_request_after_settlement(
     scan: &SourceScanResult,
     bootstrap: bool,
@@ -165,8 +177,44 @@ pub(super) fn resident_scan_request_after_settlement(
     runnable: bool,
 ) -> Option<bool> {
     let existing = resident_scan_requested(scan, bootstrap);
-    (existing || (bootstrap && power == PlatformState::Allowed && runnable))
-        .then_some(bootstrap && existing)
+    (existing || (bootstrap && power == PlatformState::Allowed && runnable)).then_some(bootstrap)
+}
+#[cfg(not(test))]
+fn with_last_destinations<T>(f: impl FnOnce(&mut [Option<[u8; 32]>; 3]) -> T) -> T {
+    static LAST: Mutex<[Option<[u8; 32]>; 3]> = Mutex::new([None; 3]);
+    f(&mut LAST.lock().unwrap_or_else(|p| p.into_inner()))
+}
+#[cfg(test)]
+fn with_last_destinations<T>(f: impl FnOnce(&mut [Option<[u8; 32]>; 3]) -> T) -> T {
+    thread_local! {
+        static LAST: std::cell::RefCell<[Option<[u8; 32]>; 3]> = const { std::cell::RefCell::new([None; 3]) };
+    }
+    LAST.with(|last| f(&mut last.borrow_mut()))
+}
+/// When a source first sees a destination (an account switch, or the first
+/// cycle of this process) and still owes its first import there, it asks for a
+/// paced scan at once instead of waiting out the tier it carried from before.
+/// AC requests carry the first-import flag; battery keeps its own pacing. An
+/// unchanged destination, or nothing owed, requests nothing. Returns whether a
+/// request was made.
+pub(super) fn request_on_destination_change(
+    source: SnapshotSource,
+    destination: &str,
+    power: PlatformState,
+    bootstrap_pending: impl FnOnce() -> bool,
+) -> bool {
+    let digest: [u8; 32] = Sha256::digest(destination.as_bytes()).into();
+    let changed = with_last_destinations(|last| {
+        let slot = &mut last[source.slot()];
+        let changed = *slot != Some(digest);
+        *slot = Some(digest);
+        changed
+    });
+    if !changed || resident_pacing(power).is_none() || !bootstrap_pending() {
+        return false;
+    }
+    request_resident_scan_on_power(source, power == PlatformState::Allowed, power);
+    true
 }
 #[cfg(test)]
 pub(super) fn request_resident_scan(source: SnapshotSource, first_import: bool) {

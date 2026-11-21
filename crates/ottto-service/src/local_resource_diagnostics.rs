@@ -1551,6 +1551,33 @@ impl Observation {
     }
 }
 
+/// Why a prepare ran or stopped at the cadence gate: one fixed key each for the
+/// due reason and the power state, plus whether a destination change asked
+/// for a paced scan. Counts only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PrepareDue {
+    pub(crate) due: &'static str,
+    pub(crate) destination_switch: bool,
+    pub(crate) power: &'static str,
+}
+thread_local! {
+    static PREPARE_DUE: std::cell::Cell<Option<PrepareDue>> = const { std::cell::Cell::new(None) };
+}
+pub(crate) fn prepare_due(due: PrepareDue) {
+    PREPARE_DUE.set(Some(due));
+}
+fn prepare_due_counts() -> BTreeMap<&'static str, u64> {
+    let mut counts = BTreeMap::new();
+    if let Some(due) = PREPARE_DUE.take() {
+        counts.insert(due.due, 1);
+        counts.insert(due.power, 1);
+        if due.destination_switch {
+            counts.insert("destination_switch", 1);
+        }
+    }
+    counts
+}
+
 /// Local prepare window, including index load/baseline work before page probes.
 /// Return values and errors pass through; unwinding closes sampling silently.
 pub(crate) fn source_prepare<T>(
@@ -1559,6 +1586,7 @@ pub(crate) fn source_prepare<T>(
     v2_active: impl FnOnce(&T) -> bool,
 ) -> T {
     flush_offpass();
+    PREPARE_DUE.set(None);
     let probe = Probe::start();
     let (malloc_in_use_bytes, malloc_allocated_bytes) = footprint::malloc_zone();
     if let Some(slot) = source_slot(source) {
@@ -1593,7 +1621,7 @@ pub(crate) fn source_prepare<T>(
             cli_children: cli_children::snapshot(),
             ..probe.stage_observation(footprint.as_ref())
         },
-        counts: BTreeMap::<&str, u64>::new(),
+        counts: prepare_due_counts(),
     });
     result
 }
@@ -1724,6 +1752,14 @@ pub(crate) struct PassOutcomes {
     pub(crate) progress_committed: u64,
     pub(crate) progress_unchanged: u64,
     pub(crate) progress_not_published: u64,
+    /// The paced request this finish made: a page reason (`existing`) or the
+    /// first-import AC arm (`bootstrap_runnable`), its first-import flag and
+    /// the power state it saw. All zero when no request was made.
+    pub(crate) paced_request_existing: u64,
+    pub(crate) paced_request_bootstrap_runnable: u64,
+    pub(crate) paced_first_import: u64,
+    pub(crate) paced_power_allowed: u64,
+    pub(crate) paced_power_battery: u64,
 }
 thread_local! {
     // Rotation owns a source from prepare through finish on the same thread.
@@ -3585,6 +3621,48 @@ mod tests {
                 assert_eq!(records[3]["counts"]["pass"][field].as_u64(), Some(0));
             }
         }
+    }
+
+    #[test]
+    fn source_prepare_reports_due_reason_power_and_switch_and_finish_the_paced_request() {
+        let (_, records) = capture(|| {
+            source_prepare(
+                "codex",
+                || {
+                    prepare_due(PrepareDue {
+                        due: "due_deferred",
+                        destination_switch: true,
+                        power: "power_allowed",
+                    })
+                },
+                |_| false,
+            );
+            source_prepare("codex", || (), |_| false);
+            source_finish("codex", false, || {
+                pass_outcomes(|counts| {
+                    counts.paced_request_bootstrap_runnable = 1;
+                    counts.paced_first_import = 1;
+                    counts.paced_power_allowed = 1;
+                });
+                Ok(())
+            })
+            .unwrap();
+        });
+        assert_eq!(
+            records[0]["counts"],
+            serde_json::json!({"due_deferred": 1, "power_allowed": 1, "destination_switch": 1})
+        );
+        assert_eq!(
+            records[1]["counts"],
+            serde_json::json!({}),
+            "never carried over"
+        );
+        let pass = &records[2]["counts"]["pass"];
+        assert_eq!(pass["paced_request_bootstrap_runnable"].as_u64(), Some(1));
+        assert_eq!(pass["paced_request_existing"].as_u64(), Some(0));
+        assert_eq!(pass["paced_first_import"].as_u64(), Some(1));
+        assert_eq!(pass["paced_power_allowed"].as_u64(), Some(1));
+        assert_eq!(pass["paced_power_battery"].as_u64(), Some(0));
     }
 
     #[test]

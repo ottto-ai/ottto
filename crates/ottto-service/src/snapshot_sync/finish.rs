@@ -2581,6 +2581,14 @@ pub(super) fn finish_sync_source(
             &current_rfc3339(),
         ),
     ) {
+        let existing = continuation::resident_scan_requested(&scan_result, first_read_bootstrap);
+        pass_outcomes(|counts| {
+            counts.paced_request_existing = u64::from(existing);
+            counts.paced_request_bootstrap_runnable = u64::from(!existing);
+            counts.paced_first_import = u64::from(first_import);
+            counts.paced_power_allowed = u64::from(power == continuation::PlatformState::Allowed);
+            counts.paced_power_battery = u64::from(power == continuation::PlatformState::Battery);
+        });
         continuation::request_resident_scan_on_power(source, first_import, power);
     }
 
