@@ -406,6 +406,7 @@ pub(crate) fn release_emitted_fold(item: &mut SnapshotItem) {
         accounts,
         prefix: _,
         fork_parent,
+        own_tools,
     } = fold;
     *entity = Default::default();
     *physical = None;
@@ -425,6 +426,7 @@ pub(crate) fn release_emitted_fold(item: &mut SnapshotItem) {
     *telemetry = Default::default();
     *accounts = None;
     *fork_parent = None;
+    *own_tools = None;
 }
 
 /// Once per money-rule version, after the revision activates: re-owe every
@@ -1009,8 +1011,12 @@ pub(crate) struct FileFold {
     /// The one session this file's `fork-context-ref` line names, whatever
     /// copy route the page takes: the page's evidence scope reads its pair.
     fork_parent: Option<String>,
+    /// An emitted twin carrier's own tool rows before the twin merge; set
+    /// only when the merge changed them, until the identity byte cap or the
+    /// fold release takes them.
+    own_tools: Option<Box<(Option<Vec<super::super::SnapshotToolUsage>>, bool)>>,
 }
-money_heap_fields!(FileFold; inline: [own_requests, copy_unproven_wire, money_birth, role, copied, native_copied, twin_pending, disclosed, e2_nanos, responses, root_fallbacks, side, prefix]; heap: [entity, physical, location, first_own, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, idless_inherited, first_idless, proof, prefix_inherited, ambiguous, telemetry, accounts, fork_parent]);
+money_heap_fields!(FileFold; inline: [own_requests, copy_unproven_wire, money_birth, role, copied, native_copied, twin_pending, disclosed, e2_nanos, responses, root_fallbacks, side, prefix]; heap: [entity, physical, location, first_own, base_selector, bucket_fallback, model_fallbacks, skipped, copy, idless_copy, idless_inherited, first_idless, proof, prefix_inherited, ambiguous, telemetry, accounts, fork_parent, own_tools]);
 
 impl FileFold {
     pub(in crate::snapshots) fn new(
@@ -1115,6 +1121,7 @@ impl FileFold {
             accounts: None,
             prefix: PrefixTally::default(),
             fork_parent: None,
+            own_tools: None,
         };
         fold.spend(started);
         fold
@@ -1195,6 +1202,12 @@ impl FileFold {
 
     pub(crate) fn fork_parent(&self) -> Option<&str> {
         self.fork_parent.as_deref()
+    }
+    /// The carrier's own pre-merge tool rows and truncation flag, once.
+    pub(crate) fn take_own_tools(
+        &mut self,
+    ) -> Option<(Option<Vec<super::super::SnapshotToolUsage>>, bool)> {
+        self.own_tools.take().map(|own| *own)
     }
     /// This file's own location key, when it has one.
     pub(crate) fn location_key(&self) -> Option<LocationKey> {
@@ -5011,9 +5024,14 @@ pub(crate) fn finish_page_planned(
     // Tool usage is display data: the one body carries every twin's names,
     // each at its highest per-file count, so scan order cannot change it. A
     // copied turn counts once; distinct same-tool turns split across twins
-    // undercount, never overcount.
+    // undercount, never overcount. Single-file sessions keep their own rows.
     let mut twin_tools = BTreeMap::<String, (BTreeMap<String, u64>, bool)>::new();
-    for item in items.iter().filter(|item| item.claude_money.is_some()) {
+    for item in items.iter().filter(|item| {
+        item.claude_money.is_some()
+            && entities
+                .get(&item.source_session_id)
+                .is_some_and(|(_, (original, _), _, _)| original.is_some())
+    }) {
         let Some(rows) = item.tool_usage.as_deref() else {
             continue;
         };
@@ -5054,12 +5072,15 @@ pub(crate) fn finish_page_planned(
                 rows.truncate(super::super::MAX_TOOL_USAGE_NAMES);
                 if item.tool_usage.as_ref() != Some(&rows) || item.tool_usage_truncated != truncated
                 {
-                    item.tool_usage = Some(rows);
-                    item.tool_usage_truncated = truncated;
-                    item.snapshot_fingerprint = super::super::snapshot_fingerprint(
-                        super::super::SnapshotSource::ClaudeCode,
-                        item,
+                    // Outside the fingerprint. The carrier's own rows stay on
+                    // the fold: the identity byte cap sheds the added rows first.
+                    let own = (
+                        item.tool_usage.replace(rows),
+                        std::mem::replace(&mut item.tool_usage_truncated, truncated),
                     );
+                    if let Some(fold) = item.claude_money.as_deref_mut() {
+                        fold.own_tools = Some(Box::new(own));
+                    }
                 }
             }
             item.request_contributions = contributions.into_boxed_slice();

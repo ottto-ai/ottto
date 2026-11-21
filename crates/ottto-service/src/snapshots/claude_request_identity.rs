@@ -1930,6 +1930,18 @@ fn shed_display_leaves(
     let rest = grouping.item_bytes(&probe);
     drop(probe);
     let fits = |item: &SnapshotItem| grouping.item_bytes(item) <= max_item_bytes;
+    // Twin tool rows merged at emission are display data: fall back to the
+    // carrier's own rows before any cache evidence goes, so the merge never
+    // holds a body that fit without it.
+    if !fits(item) {
+        let own = item
+            .claude_money
+            .as_deref_mut()
+            .and_then(|fold| fold.take_own_tools());
+        if let Some((rows, truncated)) = own {
+            (item.tool_usage, item.tool_usage_truncated) = (rows, truncated);
+        }
+    }
     while !fits(item) {
         let Some(cache) = item.cache_observations.as_mut() else {
             break;

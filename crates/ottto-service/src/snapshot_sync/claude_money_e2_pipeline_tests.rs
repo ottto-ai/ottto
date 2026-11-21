@@ -1444,57 +1444,57 @@ fn tool_line(request: &str, at: &str, tokens: u64, tools: &[&str]) -> String {
         .collect();
     turn.to_string() + "\n"
 }
-/// The one twin body: tool rows, truncation, money totals, total cost and
-/// requests per hour bucket.
-type TwinBody = (
-    Vec<(String, u64)>,
-    bool,
-    [u64; 6],
-    Option<String>,
-    Vec<(String, u64)>,
-);
-fn twin_body(page: &Page) -> TwinBody {
-    literal(page);
-    assert_eq!(page.scan.snapshots.len(), 1, "one body per session");
-    let item = &page.scan.snapshots[0];
-    let tools = item
-        .tool_usage
-        .as_deref()
-        .expect("a Claude body lists tools");
-    (
-        tools
-            .iter()
-            .map(|row| (row.name.clone(), row.count))
-            .collect(),
-        item.tool_usage_truncated,
-        [
-            item.request_count,
-            item.input_tokens,
-            item.output_tokens,
-            item.cache_read_tokens,
-            item.cache_creation_5m_tokens,
-            item.cache_creation_1h_tokens,
-        ],
-        item.cost
-            .as_ref()
-            .and_then(|cost| cost.total_cost_usd.clone()),
-        item.usage_buckets
-            .iter()
-            .map(|bucket| {
-                let requests = bucket.model_usage.iter().map(|row| row.request_count);
-                (bucket.bucket_start.clone(), requests.sum())
-            })
-            .collect(),
-    )
-}
 fn tool_rows(rows: &[(&str, u64)]) -> Vec<(String, u64)> {
     rows.iter()
         .map(|(name, count)| (name.to_string(), *count))
         .collect()
 }
+/// The page's one literal body: its tool rows and truncation flag.
+fn twin_tools(page: &Page) -> (Vec<(String, u64)>, bool) {
+    literal(page);
+    assert_eq!(page.scan.snapshots.len(), 1, "one body per session");
+    let item = &page.scan.snapshots[0];
+    let rows = item
+        .tool_usage
+        .as_deref()
+        .expect("a Claude body lists tools");
+    (
+        rows.iter()
+            .map(|row| (row.name.clone(), row.count))
+            .collect(),
+        item.tool_usage_truncated,
+    )
+}
+/// Per-entity money fields (totals, cost, per-model rows and hourly
+/// buckets) of two routes, which must match exactly.
+fn assert_same_money(
+    a: &crate::snapshots::sampled_scan::transition_fixture::RouteResult,
+    b: &crate::snapshots::sampled_scan::transition_fixture::RouteResult,
+    what: &str,
+) {
+    let mut differences = Vec::new();
+    crate::snapshots::sampled_scan::transition_fixture::money_oracle::entity_differences(
+        a,
+        b,
+        &mut differences,
+    );
+    assert!(
+        differences.is_empty(),
+        "{what}:\n{}",
+        differences.join("\n")
+    );
+}
 /// Path twins of `ROOT` (an original and its later copy) read cold on one
-/// page in the requested discovery order: the one body sent.
-fn tool_twins(name: &str, reverse: bool, original: &str, copy: &str) -> TwinBody {
+/// page in the requested discovery order: the one body's tools and money.
+fn tool_twins(
+    name: &str,
+    reverse: bool,
+    original: &str,
+    copy: &str,
+) -> (
+    (Vec<(String, u64)>, bool),
+    crate::snapshots::sampled_scan::transition_fixture::RouteResult,
+) {
     let mut c = Corpus::new(&format!("{name}-{reverse}"));
     let (old_dir, new_dir) = if reverse {
         ("z-original", "a-copy")
@@ -1512,7 +1512,9 @@ fn tool_twins(name: &str, reverse: bool, original: &str, copy: &str) -> TwinBody
         "2026-11-04T07:03:00Z",
     );
     let scanner = E2ScanFixture::default();
-    let page = ready(&c, &scanner, ScanIndex::default(), 100, false);
+    let page = ready(&c, &scanner, ScanIndex::default(), 100, true);
+    assert_mode(page.modes, (2, 0, 0));
+    assert_eq!(total(&page), 2, "{name}: r1 counts once, plus r2");
     let paths = scanner.paths();
     assert_eq!(paths.len(), 2, "{name}: both twins are read");
     assert!(
@@ -1522,15 +1524,15 @@ fn tool_twins(name: &str, reverse: bool, original: &str, copy: &str) -> TwinBody
         )),
         "{name}: fixture must exercise the requested discovery order"
     );
-    twin_body(&page)
+    (twin_tools(&page), sent_money(&page))
 }
 
 /// [regress] Tool usage is display data. One body per session sums every
 /// path twin's money but kept only the first-read twin's tool counts, so the
 /// discovery order decided `tool_usage`. Each tool now takes its highest
 /// count over the twins: a turn only one twin holds is kept, a copied turn
-/// counts once, and a superset twin adds its extra tool. Money is unchanged
-/// and the same in both orders.
+/// counts once, and a superset twin adds its extra tool. Money is the same
+/// in both orders.
 #[test]
 fn e2_pipeline_twin_tool_usage_is_independent_of_scan_order() {
     let (r2_at, r2_tokens) = ("2026-11-04T07:03:10Z", 20);
@@ -1555,24 +1557,21 @@ fn e2_pipeline_twin_tool_usage_is_independent_of_scan_order() {
         ),
     ] {
         with_e2(|| {
-            let forward = tool_twins(name, false, &original, &copy);
-            let reverse = tool_twins(name, true, &original, &copy);
-            assert_eq!(
-                (&forward.0, forward.1),
-                (&expected, false),
-                "{name}: tool rows"
-            );
-            assert_eq!(forward.2[0], 2, "{name}: r1 counts once, plus r2");
-            assert_eq!(forward, reverse, "{name}: both orders send one body");
+            let (forward, forward_money) = tool_twins(name, false, &original, &copy);
+            let (reverse, reverse_money) = tool_twins(name, true, &original, &copy);
+            assert_eq!(forward, (expected.clone(), false), "{name}: forward tools");
+            assert_eq!(reverse, forward, "{name}: both orders send one tool list");
+            assert_same_money(&forward_money, &reverse_money, name);
         });
     }
 }
 
 /// [regress] A tool turn appended to one settled twin, hinted first: the
-/// tail sends the same body as a cold full read of the same bytes, which
-/// reads the twin without the tool turn first.
+/// Tail, a cold restart and a cold Full of the same bytes (which reads the
+/// twin without the tool turn first) send the same tool rows and money.
 #[test]
 fn e2_pipeline_twin_tool_turn_tail_matches_cold_full() {
+    use crate::snapshots::sampled_scan::transition_fixture::money_oracle;
     with_e2(|| {
         let seed = |c: &mut Corpus| {
             c.write_at(
@@ -1590,42 +1589,145 @@ fn e2_pipeline_twin_tool_turn_tail_matches_cold_full() {
         let mut c = Corpus::new("e2-twin-tools-tail");
         let grown = seed(&mut c);
         let scanner = E2ScanFixture::default();
-        let mut first = ready(&c, &scanner, ScanIndex::default(), 100, false);
-        assert_eq!(twin_body(&first).0, tool_rows(&[]), "no tool turn yet");
-        first.finish();
-        let prior = c.reload(&mut first.index);
+        let first = ready(&c, &scanner, ScanIndex::default(), 100, true);
+        assert_mode(first.modes, (2, 0, 0));
+        assert_eq!(
+            twin_tools(&first),
+            (tool_rows(&[]), false),
+            "no tool turn yet"
+        );
+        let prior = settle(&c, &ScanIndex::default(), first, &mut e2_progress());
         append(&grown, &r3);
-        let mut page = c.raw(&scanner, prior, 100, false, std::slice::from_ref(&grown));
-        page.enrich(&c);
-        let mut deferred = 0;
-        while page.scan.snapshots.is_empty() {
-            deferred += 1;
-            assert!(deferred <= 3, "the grown twin is read on a later page");
-            page.finish();
-            let next = c.reload(&mut page.index);
-            page = c.raw(&scanner, next, 100, false, &[]);
-            page.enrich(&c);
+        let mut warm = c.raw(
+            &scanner,
+            prior.clone(),
+            100,
+            true,
+            std::slice::from_ref(&grown),
+        );
+        warm.enrich(&c);
+        let warm = deliver_page(warm);
+        if crate::heap_layout_bound::layout_supported() {
+            assert_eq!(warm.modes.0, 0, "the growth reads Tail, not Full");
+            assert!(warm.modes.1 > 0, "the grown twin reads Tail");
         }
-        let tail = twin_body(&page);
+        let expected = (tool_rows(&[("Read", 1)]), false);
+        assert_eq!(twin_tools(&warm), expected, "tail tools");
+        let warm_money = sent_money(&warm);
+        drop(warm);
+        let restarted = cold_ready(&c, prior, 100, true);
+        assert!(restarted.modes.0 > 0, "the cold restart reads Full");
+        assert_eq!(twin_tools(&restarted), expected, "restart tools");
 
         let mut cold = Corpus::new("e2-twin-tools-tail-cold");
         append(&seed(&mut cold), &r3);
         let cold_scanner = E2ScanFixture::default();
-        let full = ready(&cold, &cold_scanner, ScanIndex::default(), 100, false);
+        let full = ready(&cold, &cold_scanner, ScanIndex::default(), 100, true);
+        assert_mode(full.modes, (2, 0, 0));
         assert!(
             cold_scanner.paths()[0].ends_with(format!("a/{ROOT}.jsonl")),
-            "the cold full reads the twin without the tool turn first"
+            "the cold Full reads the twin without the tool turn first"
         );
-        let full = twin_body(&full);
-        assert_eq!(
-            (&full.0, full.1),
-            (&tool_rows(&[("Read", 1)]), false),
-            "cold full keeps the tool turn"
+        assert_eq!(twin_tools(&full), expected, "cold Full keeps the tool turn");
+        assert_eq!(total(&full), 3, "r1 counts once, plus r2 and r3");
+        let full_money = sent_money(&full);
+        money_oracle::assert_equivalent(&full_money, &warm_money);
+        money_oracle::assert_equivalent(&full_money, &sent_money(&restarted));
+    });
+}
+
+/// [regress] The identity byte cap measures the merged tool rows. A body
+/// that fits with the carrier's own rows but not with the merged ones falls
+/// back to its own rows: it is offered and exactly acknowledged, never held,
+/// and its money is unchanged.
+#[test]
+fn e2_pipeline_twin_tool_merge_never_holds_a_fitting_body() {
+    use crate::snapshots::claude_request_identity::{item_bytes, WireBudget};
+    with_e2(|| {
+        let names = (0..150)
+            .map(|n| format!("NearCapTool{n:03}_{}", "x".repeat(80)))
+            .collect::<Vec<_>>();
+        let names = names.iter().map(String::as_str).collect::<Vec<_>>();
+        let r1 = tool_line("r1", AT, 10, &["Read"]);
+        let copy = r1.clone() + &tool_line("r2", "2026-11-04T07:03:10Z", 20, &names);
+        let corpus = |name: &str| {
+            let mut c = Corpus::new(name);
+            c.write_at(&format!("a/{ROOT}.jsonl"), &r1, "2026-08-02T07:00:00Z");
+            c.write_at(&format!("z/{ROOT}.jsonl"), &copy, "2026-11-04T07:03:00Z");
+            c
+        };
+        let own = tool_rows(&[("Read", 1)]);
+
+        let c = corpus("e2-twin-tools-cap-default");
+        let scanner = E2ScanFixture::default();
+        let merged = ready(&c, &scanner, ScanIndex::default(), 100, false);
+        assert!(
+            scanner.paths()[0].ends_with(format!("a/{ROOT}.jsonl")),
+            "the carrier is the twin with only the Read turn"
         );
-        assert_eq!(full.2[0], 3, "r1 counts once, plus r2 and r3");
+        let (rows, truncated) = twin_tools(&merged);
         assert_eq!(
-            tail, full,
-            "the hinted tail and the cold full send one body"
+            (rows.len(), truncated),
+            (151, false),
+            "every twin tool merged"
+        );
+        let item = &merged.scan.snapshots[0];
+        let mut fallback = item.clone();
+        fallback.tool_usage = Some(
+            own.iter()
+                .map(|(name, count)| crate::snapshots::SnapshotToolUsage {
+                    name: name.clone(),
+                    count: *count,
+                })
+                .collect(),
+        );
+        let (merged_bytes, own_bytes) = (item_bytes(item), item_bytes(&fallback));
+        assert!(
+            merged_bytes > own_bytes + 8_000,
+            "{merged_bytes} vs {own_bytes}"
+        );
+        let merged_money = sent_money(&merged);
+        drop(merged);
+
+        let c = corpus("e2-twin-tools-cap-near");
+        let mut page = c.raw(
+            &E2ScanFixture::default(),
+            ScanIndex::default(),
+            100,
+            false,
+            &[],
+        );
+        page.enrich_with_budget(
+            &c,
+            None,
+            WireBudget {
+                max_item_bytes: own_bytes + (merged_bytes - own_bytes) / 2,
+                reservation: None,
+            },
+        );
+        assert!(
+            page.disposition.request_owned_hold_reasons.is_empty(),
+            "nothing is held: {:?}",
+            page.disposition.request_owned_hold_reasons
+        );
+        assert_eq!(
+            twin_tools(&page),
+            (own.clone(), false),
+            "own rows fall back"
+        );
+        assert_same_money(&merged_money, &sent_money(&page), "near cap");
+        page.finish();
+        assert_eq!(twin_tools(&page), (own, false), "the finished body");
+        let item = page.scan.snapshots[0].clone();
+        let mut progress = e2_progress();
+        let (result, _, _) = upload(&page.scan.snapshots, &mut progress, ack);
+        assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
+        assert_eq!(
+            progress
+                .accepted_body_witnesses
+                .get(&item.snapshot_fingerprint),
+            Some(&snapshot_upload_body_witness(&item)),
+            "the offered body is exactly acknowledged"
         );
     });
 }
