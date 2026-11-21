@@ -403,21 +403,21 @@ fn family_entities_keep_exact_heads_across_acks() {
         assert_eq!(heads(&carried), expected, "seed");
         assert_eq!(family(&heads(&carried)), (70, 5));
         let mut prior = commit(&session, first);
-        for (step, relative, entity, head, total) in [
+        for (step, relative, twin, entity, head, total) in [
             (
                 0,
                 format!("z/{ROOT}.jsonl"),
+                format!("a/{ROOT}.jsonl"),
                 ROOT.to_string(),
                 (29, 3),
                 (78, 6),
             ),
-            (1, member("z", 0), child(0), (28, 2), (86, 7)),
+            (1, member("z", 0), member("a", 0), child(0), (28, 2), (86, 7)),
         ] {
             let path = c.root.join(relative);
             let request = format!("family-head-{step}");
             let mut turn: serde_json::Value =
                 serde_json::from_str(&line(ROOT, &request, GROW, 8)).unwrap();
-            // The exact body witness covers additive evidence such as tool use.
             turn["message"]["role"] = json!("assistant");
             turn["message"]["content"] = json!([{
                 "type": "tool_use",
@@ -425,14 +425,22 @@ fn family_entities_keep_exact_heads_across_acks() {
                 "name": "Read",
                 "input": {},
             }]);
+            // Both twins carry the tool turn because the first item's list is published.
             append(&path, &(turn.to_string() + "\n"));
-            let warm = hinted(&c, prior, 100, true, std::slice::from_ref(&path));
-            if step == 0 {
-                assert_main_only(&c, &warm, &carried, Mode::Ram);
-            }
+            turn["requestId"] = json!(format!("{request}-tool"));
+            turn["message"]["id"] = json!(format!("msg-{request}-tool"));
+            turn["message"]["usage"] = json!({"input_tokens":0,"output_tokens":0});
+            let twin = c.root.join(twin);
+            append(&twin, &(turn.to_string() + "\n"));
+
+            let mut warm = hinted(&c, prior, 100, true, &[path, twin]);
             let mut actual = result(&warm, Mode::Ram);
             actual.accepted = carried.clone();
             money_oracle::assert_carried_equivalent(&cold(&c), &actual);
+            warm.finish();
+            if step == 0 {
+                assert_main_only(&c, &warm, &carried, Mode::Ram);
+            }
             let now = acked(&warm);
             for (id, accepted) in &now {
                 if *id != entity {
@@ -453,7 +461,7 @@ fn family_entities_keep_exact_heads_across_acks() {
             expected.insert(entity, head);
             assert_eq!(heads(&carried), expected, "step {step}");
             assert_eq!(family(&heads(&carried)), total, "step {step}");
-            let (settled, progress) = commit_with_progress(&session, warm);
+            let (settled, progress) = commit_finished_with_progress(&session, warm);
             assert!(settled.accepted_snapshot_fingerprint_recorded(&fingerprint));
             assert_eq!(
                 progress.accepted_body_witnesses.get(&fingerprint),
