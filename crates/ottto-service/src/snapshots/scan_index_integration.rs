@@ -208,7 +208,7 @@ pub(super) fn storage_decode_error(error: anyhow::Error) -> anyhow::Error {
     if matches!(
         error.downcast_ref::<lenient_decode::Error>(),
         Some(lenient_decode::Error::Refused(
-            "schema_version" | "accepted-ledger version"
+            "schema_version" | "accepted-ledger version" | lenient_decode::OLDER_LEDGER_REFUSAL
         ))
     ) {
         return error;

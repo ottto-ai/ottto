@@ -1823,7 +1823,7 @@ fn h360_head_required_mode_has_no_probe_and_held_body_never_retires_pending_head
         .unwrap());
     // Required CAS strips the patch, so no probe forms and nothing bootstraps.
     let mut projected = item.clone();
-    prepare_snapshot_cache_for_upload(&mut projected, &ledger, true, true, &BTreeSet::new());
+    prepare_snapshot_cache_for_upload(&mut projected, &ledger, true, true);
     assert!(projected.cache_observations.is_none());
     assert_eq!(
         apply_bootstrapped_cache_heads("codex", std::slice::from_mut(&mut projected), &ledger)
@@ -2136,14 +2136,7 @@ fn effective_witness_is_probe_only_while_probe_held() {
     let probe = cache_head_probe(&item);
     let p = snapshot_upload_body_witness(&probe);
     let witness = |ledger: &SnapshotUploadProgress, enabled| {
-        effective_snapshot_upload_body_witness(
-            &item,
-            ledger,
-            enabled,
-            false,
-            &BTreeSet::new(),
-            &Default::default(),
-        )
+        effective_snapshot_upload_body_witness(&item, ledger, enabled, false, &Default::default())
     };
     let w = witness(&permanent, true);
     assert_ne!(w, p);
@@ -2161,14 +2154,14 @@ fn effective_witness_is_probe_only_while_probe_held() {
         .accepted_cache_heads
         .insert(cache_session_key(&item.source_session_id), "e".repeat(64));
     let mut projected = item.clone();
-    prepare_snapshot_cache_for_upload(&mut projected, &headed, true, false, &BTreeSet::new());
+    prepare_snapshot_cache_for_upload(&mut projected, &headed, true, false);
     assert_eq!(
         witness(&headed, true),
         snapshot_upload_body_witness(&projected)
     );
     assert!(projected.cache_base_head_etag.is_some());
     let mut stripped = item.clone();
-    prepare_snapshot_cache_for_upload(&mut stripped, &permanent, false, false, &BTreeSet::new());
+    prepare_snapshot_cache_for_upload(&mut stripped, &permanent, false, false);
     assert_eq!(
         witness(&permanent, false),
         snapshot_upload_body_witness(&stripped)

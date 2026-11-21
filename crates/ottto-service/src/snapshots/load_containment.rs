@@ -16,7 +16,6 @@
 pub(crate) struct ScanIndexLoadDrops {
     pub(crate) activity: usize,
     pub(crate) accepted: usize,
-    pub(crate) cursor: usize,
     pub(crate) quarantine: usize,
 }
 
@@ -24,12 +23,11 @@ impl ScanIndexLoadDrops {
     const NONE: Self = Self {
         activity: 0,
         accepted: 0,
-        cursor: 0,
         quarantine: 0,
     };
 
     fn records(&self) -> usize {
-        self.activity + self.accepted + self.cursor + self.quarantine
+        self.activity + self.accepted + self.quarantine
     }
 }
 
@@ -37,24 +35,24 @@ static SCAN_INDEX_RECORD_DROPS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 static SCAN_INDEX_WHOLE_QUARANTINES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
-/// Sources already alarmed for a future accepted-ledger version: at most one
-/// alarm per source per process. Tests keep the set per thread so parallel
-/// tests stay independent.
+/// Sources already alarmed for an unsupported accepted-ledger version: at
+/// most one alarm per source per process. Tests keep the set per thread so
+/// parallel tests stay independent.
 #[cfg(not(test))]
-static SCAN_INDEX_FUTURE_LEDGER_ALARMED: std::sync::Mutex<BTreeSet<&'static str>> =
+static SCAN_INDEX_LEDGER_ALARMED: std::sync::Mutex<BTreeSet<&'static str>> =
     std::sync::Mutex::new(BTreeSet::new());
 
 #[cfg(test)]
 thread_local! {
     static SCAN_INDEX_LOAD_DROPS_FOR_TEST: std::cell::Cell<ScanIndexLoadDrops> =
         const { std::cell::Cell::new(ScanIndexLoadDrops::NONE) };
-    static SCAN_INDEX_FUTURE_LEDGER_ALARMED: std::cell::RefCell<BTreeSet<&'static str>> =
+    static SCAN_INDEX_LEDGER_ALARMED: std::cell::RefCell<BTreeSet<&'static str>> =
         const { std::cell::RefCell::new(BTreeSet::new()) };
     static SCAN_INDEX_CONTAINMENT_LINES_FOR_TEST: std::cell::RefCell<Vec<String>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// This thread's record-drop and future-ledger lines, in emission order.
+/// This thread's record-drop and ledger-version lines, in emission order.
 #[cfg(test)]
 pub(crate) fn scan_index_containment_lines_for_test() -> Vec<String> {
     SCAN_INDEX_CONTAINMENT_LINES_FOR_TEST.with(|lines| lines.borrow().clone())
@@ -72,23 +70,29 @@ fn scan_index_source_label(source: Option<SnapshotSource>) -> &'static str {
     source.map_or("unattributed", SnapshotSource::api_slug)
 }
 
-/// A newer build wrote this index's accepted ledger, so every load refuses
-/// it and the source collects nothing until a compatible build runs. Say so
-/// once per source per process instead of failing silently each cycle.
-fn alarm_future_scan_index_ledger(source: &'static str, version: u8) {
+/// Every load refuses an accepted ledger this build does not read, and the
+/// source collects nothing meanwhile. Say so once per source per process
+/// instead of failing silently each cycle. A newer build's ledger waits for
+/// an update; an older build's ledger is never migrated and needs a reset.
+fn alarm_unsupported_scan_index_ledger(source: &'static str, version: u8) {
     #[cfg(not(test))]
-    let first = SCAN_INDEX_FUTURE_LEDGER_ALARMED
+    let first = SCAN_INDEX_LEDGER_ALARMED
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(source);
     #[cfg(test)]
-    let first =
-        SCAN_INDEX_FUTURE_LEDGER_ALARMED.with(|alarmed| alarmed.borrow_mut().insert(source));
+    let first = SCAN_INDEX_LEDGER_ALARMED.with(|alarmed| alarmed.borrow_mut().insert(source));
     if first {
+        let cause = if version > SNAPSHOT_ACCEPTED_LEDGER_VERSION {
+            "written by a newer build, so this source is paused until a compatible build runs"
+        } else {
+            "store from an older build; reset needed, so this source is paused until support \
+             resets its local data"
+        };
         emit_scan_index_containment_line(format!(
             "local snapshot scan index refused: source={source} accepted_ledger_version={version} \
-             supported={SNAPSHOT_ACCEPTED_LEDGER_VERSION}; written by a newer build, so this \
-             source is paused until a compatible build runs (alarm once per source per process)"
+             supported={SNAPSHOT_ACCEPTED_LEDGER_VERSION}; {cause} (alarm once per source per \
+             process)"
         ));
     }
 }
@@ -97,13 +101,6 @@ fn alarm_future_scan_index_ledger(source: &'static str, version: u8) {
 #[cfg(test)]
 pub(crate) fn scan_index_load_drops_for_test() -> ScanIndexLoadDrops {
     SCAN_INDEX_LOAD_DROPS_FOR_TEST.with(std::cell::Cell::get)
-}
-
-/// The lowest well-formed legacy sweep cursor. The sweep wraps, so resuming
-/// here re-walks every pending identity once; the cursor's presence keeps a
-/// set the sweep is already proving from reading as never armed.
-fn lowest_legacy_settlement_cursor() -> String {
-    "0".repeat(64)
 }
 
 use crate::hex::is_sha256_lower as is_snapshot_fingerprint;
@@ -761,8 +758,8 @@ impl ScanIndex {
     /// (`lenient_decode::IDENTITY_CARRY_FIELDS`, each field's decoder). Bindings
     /// stay authoritative, so conflicting creator evidence defers; held and
     /// deferred families stay held. The contract token is kept. Accepted
-    /// acknowledgements and their upload-context stamps carry only from a
-    /// current ledger, so an unproven one re-offers rather than suppresses. The replay generations carry so the
+    /// acknowledgements and their upload-context stamps carry; the carry read
+    /// refuses any ledger but the current one. The replay generations carry so the
     /// replacement cycle replays only what the damaged index still owed; a
     /// spurious replay would clear the carried acknowledgements. Files, traversal and the Codex ownership ledgers
     /// (the collision-bearing fields) are rebuilt by scan.
@@ -773,56 +770,54 @@ impl ScanIndex {
         self.session_account_bindings = carry.session_account_bindings;
         self.claude_account_deferred_holds = carry.claude_account_deferred_holds;
         self.claude_request_identity_contract = carry.claude_request_identity_contract;
-        if carry.accepted_snapshot_fingerprint_ledger_version == SNAPSHOT_ACCEPTED_LEDGER_VERSION {
-            // Keep prior carried incidence, including history-held files whose
-            // ordinary exact set is empty. Add only ORIGINAL accepted identities.
-            let accepted = &carry.accepted_snapshot_fingerprints;
-            for members in carry.accepted_rebuild_incidence.values_mut() {
-                members.retain(|fp| accepted.contains(fp));
-            }
-            for (key, mut members) in carry.file_snapshot_fingerprints {
-                members.retain(|fp| accepted.contains(fp));
-                if !members.is_empty() {
-                    carry
-                        .accepted_rebuild_incidence
-                        .entry(key)
-                        .or_default()
-                        .extend(members);
-                }
-            }
-            carry
-                .accepted_rebuild_incidence
-                .retain(|_, members| !members.is_empty());
-            let anchored = carry
-                .accepted_rebuild_incidence
-                .values()
-                .flat_map(BTreeSet::iter)
-                .collect::<BTreeSet<_>>();
-            let unassigned = accepted
-                .iter()
-                .filter(|fp| !anchored.contains(fp))
-                .cloned()
-                .collect::<BTreeSet<_>>();
-            if !unassigned.is_empty() {
+        // Keep prior carried incidence, including history-held files whose
+        // ordinary exact set is empty. Add only ORIGINAL accepted identities.
+        let accepted = &carry.accepted_snapshot_fingerprints;
+        for members in carry.accepted_rebuild_incidence.values_mut() {
+            members.retain(|fp| accepted.contains(fp));
+        }
+        for (key, mut members) in carry.file_snapshot_fingerprints {
+            members.retain(|fp| accepted.contains(fp));
+            if !members.is_empty() {
                 carry
                     .accepted_rebuild_incidence
-                    .entry(String::new())
+                    .entry(key)
                     .or_default()
-                    .extend(unassigned);
+                    .extend(members);
             }
-            self.accepted_rebuild_incidence = carry.accepted_rebuild_incidence;
-            self.admit_carried_ack_debt()?;
-            self.accepted_snapshot_fingerprints = carry.accepted_snapshot_fingerprints;
-            // P2: the durable exact-ACK stamps carry with the ledger they
-            // copy. They prove a body only under their context, destination
-            // and replay generation; file receipts are rebuilt by scan.
-            self.upload_context_proof = carry.upload_context_proof;
-            if !self.accepted_rebuild_incidence.is_empty() {
-                self.accepted_rebuild_pending_since_unix_seconds =
-                    carry.accepted_rebuild_pending_since_unix_seconds;
-                self.accepted_rebuild_last_alarm_unix_seconds =
-                    carry.accepted_rebuild_last_alarm_unix_seconds;
-            }
+        }
+        carry
+            .accepted_rebuild_incidence
+            .retain(|_, members| !members.is_empty());
+        let anchored = carry
+            .accepted_rebuild_incidence
+            .values()
+            .flat_map(BTreeSet::iter)
+            .collect::<BTreeSet<_>>();
+        let unassigned = accepted
+            .iter()
+            .filter(|fp| !anchored.contains(fp))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if !unassigned.is_empty() {
+            carry
+                .accepted_rebuild_incidence
+                .entry(String::new())
+                .or_default()
+                .extend(unassigned);
+        }
+        self.accepted_rebuild_incidence = carry.accepted_rebuild_incidence;
+        self.admit_carried_ack_debt()?;
+        self.accepted_snapshot_fingerprints = carry.accepted_snapshot_fingerprints;
+        // P2: the durable exact-ACK stamps carry with the ledger they
+        // copy. They prove a body only under their context, destination
+        // and replay generation; file receipts are rebuilt by scan.
+        self.upload_context_proof = carry.upload_context_proof;
+        if !self.accepted_rebuild_incidence.is_empty() {
+            self.accepted_rebuild_pending_since_unix_seconds =
+                carry.accepted_rebuild_pending_since_unix_seconds;
+            self.accepted_rebuild_last_alarm_unix_seconds =
+                carry.accepted_rebuild_last_alarm_unix_seconds;
         }
         self.accepted_incidence_pending_census = !self.accepted_rebuild_incidence.is_empty();
         let (entries, bytes) = self.carried_ack_debt_size();
@@ -943,8 +938,8 @@ impl ScanIndex {
     /// activity clock (the gate re-reads the file to re-derive it) and a
     /// malformed accepted identity (it can never equal a real body
     /// fingerprint, so it vouched for nothing; the ledger version is kept so
-    /// valid acceptance evidence is retained), and normalize a malformed sweep
-    /// cursor and every out-of-shape refusal record in place.
+    /// valid acceptance evidence is retained), and normalize every
+    /// out-of-shape refusal record in place.
     fn drop_invalid_index_records(&mut self) -> ScanIndexLoadDrops {
         let mut drops = ScanIndexLoadDrops::NONE;
         self.snapshot_activity_at.retain(|_, activity| {
@@ -956,15 +951,6 @@ impl ScanIndex {
         self.accepted_snapshot_fingerprints
             .retain(|fingerprint| is_snapshot_fingerprint(fingerprint));
         drops.accepted = accepted_before - self.accepted_snapshot_fingerprints.len();
-        if self
-            .legacy_settlement_reconcile_after_fingerprint
-            .as_deref()
-            .is_some_and(|cursor| !is_snapshot_fingerprint(cursor))
-        {
-            self.legacy_settlement_reconcile_after_fingerprint =
-                Some(lowest_legacy_settlement_cursor());
-            drops.cursor = 1;
-        }
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_secs())
@@ -996,7 +982,6 @@ fn note_scan_index_record_drops_and_decode(
         cell.set(ScanIndexLoadDrops {
             activity: total.activity + drops.activity,
             accepted: total.accepted + drops.accepted,
-            cursor: total.cursor + drops.cursor,
             quarantine: total.quarantine + drops.quarantine,
         });
     });
@@ -1009,9 +994,9 @@ fn note_scan_index_record_drops_and_decode(
         .saturating_add(records);
     emit_scan_index_containment_line(format!(
         "local snapshot scan index {stage} dropped or normalized invalid record(s); index kept: \
-         source={source} activity_dropped={} accepted_dropped={} cursor_normalized={} \
+         source={source} activity_dropped={} accepted_dropped={} \
          quarantine_normalized={} record_repairs_this_process={process_total} decode_held={} file_records_held={} family_records_held={} authority_normalized={}",
-        drops.activity, drops.accepted, drops.cursor, drops.quarantine, decode[0], decode[1], decode[2], decode[3]
+        drops.activity, drops.accepted, drops.quarantine, decode[0], decode[1], decode[2], decode[3]
     ));
 }
 

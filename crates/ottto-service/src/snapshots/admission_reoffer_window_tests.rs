@@ -90,7 +90,8 @@ fn admission_window_in_window_holds_keep_window_and_context() {
                 "legacy" => {
                     record.failed_reconstruction_count = 0;
                     record.retry_after_unix_seconds = 0;
-                    record.witness.contract = SNAPSHOT_UNPROVEN_RETRY_CONTRACT_VERSION.into();
+                    // A stored record may still carry this contract string.
+                    record.witness.contract = "snapshot_unproven_retry:v1".into();
                 }
                 "admission" => record.witness.item_wire_byte_limit = 128 * 1024,
                 _ => {}

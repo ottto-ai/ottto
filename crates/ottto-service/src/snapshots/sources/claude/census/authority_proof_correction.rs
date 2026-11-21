@@ -12,7 +12,7 @@ use crate::snapshots::{
     ClaudeUsageAuthorityQuarantineDisposition, ClaudeUsageAuthorityQuarantineRecord, ScanIndex,
     SnapshotItem, SnapshotQuarantineDisposition, SnapshotSource, SourceScanResult,
     CLAUDE_USAGE_AUTHORITY_CORRECTION_CONTRACT_VERSION,
-    CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION, SNAPSHOT_ACCEPTED_LEDGER_VERSION,
+    CLAUDE_USAGE_AUTHORITY_QUARANTINE_CONTRACT_VERSION,
 };
 
 #[derive(Debug)]
@@ -827,9 +827,7 @@ impl ScanIndex {
                     && accepted_bodies.get(&item.fingerprint) == Some(&item.body_witness))
                     || rejected(item)
             });
-            let noop = previous.accepted_snapshot_fingerprint_ledger_version
-                == SNAPSHOT_ACCEPTED_LEDGER_VERSION
-                && previous.file_snapshot_fingerprints.get(key) == Some(&fingerprints)
+            let noop = previous.file_snapshot_fingerprints.get(key) == Some(&fingerprints)
                 && previous
                     .files
                     .get(key)

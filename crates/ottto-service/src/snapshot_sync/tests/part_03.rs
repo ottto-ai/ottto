@@ -662,12 +662,6 @@ fn due_not_pending_quarantine_resends_once_and_paces_local_holds() {
     assert!(retained.retry_after_unix_seconds > current_unix_seconds());
     assert!(snapshot_quarantine_deadline_is_bounded(retained));
     assert_eq!(retained.failed_reconstruction_count, failures);
-    assert!(
-        index
-            .legacy_settlement_reconciliation_pending_fingerprints()
-            .is_empty(),
-        "the current-schema manifest revision stays armed rather than becoming unproven"
-    );
     // Resume the retained traversal with this file already observed and
     // absent from its candidate queue, just like the four quarantines observed live.
     let mut state = serde_json::to_value(&index).unwrap();
@@ -900,82 +894,6 @@ fn due_retry_uploads_only_the_quarantined_revision_after_its_sibling_settled() {
     assert!(progress.accepted_fingerprints.contains(&settled_sibling));
     assert!(progress.accepted_fingerprints.contains(&retry));
     assert!(progress.quarantined_fingerprints.is_empty());
-}
-
-#[test]
-fn divergent_legacy_reconcile_is_batch_isolated_and_lands_in_bounded_quarantine() {
-    let ordinary = "a".repeat(64);
-    let divergent_reconcile = "b".repeat(64);
-    let reconcile_class = BTreeSet::from([divergent_reconcile.clone()]);
-    let mut progress = test_upload_progress();
-    progress.quarantine([divergent_reconcile.as_str()]);
-    progress
-        .quarantined_fingerprints
-        .get_mut(&divergent_reconcile)
-        .expect("legacy retry is armed")
-        .retry_after_unix_seconds = 0;
-    assert!(progress.prepare_quarantine_retries(&BTreeMap::new()));
-
-    let mut accepted = 0;
-    let mut observed_classes = Vec::new();
-    let result = upload_resumable_batches_with_literal_families(
-        &[ordinary.clone(), divergent_reconcile.clone()],
-        &unique_poison_scope(),
-        &mut progress,
-        &mut accepted,
-        String::as_str,
-        |item| item.clone(),
-        |_| None,
-        |item| 2 * u8::from(reconcile_class.contains(item)),
-        |_| None,
-        &mut InplaceRetryBudget::default(),
-        |batch| {
-            let is_reconcile = batch
-                .iter()
-                .all(|fingerprint| reconcile_class.contains(*fingerprint));
-            assert!(
-                is_reconcile
-                    || batch
-                        .iter()
-                        .all(|fingerprint| !reconcile_class.contains(*fingerprint)),
-                "ordinary and CAS-bootstrap reconciliation must never share one request"
-            );
-            observed_classes.push(is_reconcile);
-            if is_reconcile {
-                let mut response = entity_ack_batch(&[], &[], batch);
-                for entity in &mut response.conflict_entities {
-                    entity.head_challenge = Some("c".repeat(64));
-                }
-                Ok(response)
-            } else {
-                Ok(entity_ack_batch(batch, &[], &[]))
-            }
-        },
-        |_| Ok(()),
-    )
-    .expect("a normal entity conflict is a closed-machine result");
-
-    assert_eq!(
-        result,
-        ResumableUploadResult::Deferred {
-            count: 1,
-            isolated: 1,
-            identity_503: 0
-        }
-    );
-    assert_eq!(observed_classes, vec![false, true]);
-    assert_eq!(accepted, 1);
-    assert!(progress.accepted_fingerprints.contains(&ordinary));
-    let quarantined = progress
-        .quarantined_fingerprints
-        .get(&divergent_reconcile)
-        .expect("divergent reconcile remains quarantined");
-    assert_eq!(
-        quarantined.disposition,
-        SnapshotQuarantineDisposition::RetryPending
-    );
-    assert_eq!(quarantined.failed_reconstruction_count, 1);
-    assert!(quarantined.retry_after_unix_seconds > current_unix_seconds());
 }
 
 #[test]
@@ -1240,9 +1158,6 @@ fn supersede_while_quarantined_preserves_absence_holds_and_retry_budgets() {
     assert!(progress.retain_current_quarantines(&current_set, &index));
     index.retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
     assert_eq!(index.snapshot_superseded_terminal_count(), 1);
-    assert!(!index
-        .legacy_settlement_reconciliation_pending_fingerprints()
-        .contains(&stale));
     assert!(!progress.retain_current_quarantines(&current_set, &index));
     assert_eq!(
         progress.quarantined_fingerprints[&current].retry_after_unix_seconds,
@@ -1310,87 +1225,6 @@ fn supersede_while_quarantined_preserves_absence_holds_and_retry_budgets() {
         assert_eq!(blocked.quarantined_fingerprints[&stale], before, "{guard}");
         assert!(blocked.active_reason_reoffers.is_empty());
     }
-}
-
-#[test]
-fn legacy_reconciliation_is_fail_closed_until_exact_existing_entity_ack() {
-    let fingerprint = "a".repeat(64);
-    let request_fingerprints = BTreeSet::from([fingerprint.clone()]);
-    let legacy_pending = request_fingerprints.clone();
-    let mut progress = test_upload_progress();
-    progress.quarantine([fingerprint.as_str()]);
-    progress
-        .quarantined_fingerprints
-        .get_mut(&fingerprint)
-        .expect("armed legacy identity")
-        .retry_after_unix_seconds = 0;
-    progress.prepare_quarantine_retries(&BTreeMap::new());
-
-    let rejected_bool = serde_json::from_value::<crate::snapshot_client::SnapshotBatchResponse>(
-        serde_json::json!({
-            "accepted": false,
-            "sessions_reconciled": 0,
-            "session_ids": [],
-            "disabled": false
-        }),
-    );
-    assert!(rejected_bool.is_err(), "accepted:false is not a batch ACK");
-    let rejected_status = serde_json::from_value::<crate::snapshot_client::SnapshotStatusResponse>(
-        serde_json::json!({
-            "accepted": false,
-            "source": "codex",
-            "machine_id": "otm_test",
-            "disabled": false,
-            "disabled_reason": null,
-            "settlement_ack": {
-                "accepted_snapshot_fingerprints": [fingerprint.clone()]
-            }
-        }),
-    )
-    .expect("forward-tolerant status receipt");
-    assert!(!rejected_status.accepted);
-
-    let mut disabled = entity_ack_response(0);
-    disabled.disabled = true;
-    assert!(require_normal_write_ack_for_legacy_reconciliation(
-        &disabled,
-        &request_fingerprints,
-        &legacy_pending,
-    )
-    .is_err());
-
-    let mut missing_contract = entity_ack_response(1);
-    missing_contract.entity_ack_contract = None;
-    assert!(require_normal_write_ack_for_legacy_reconciliation(
-        &missing_contract,
-        &request_fingerprints,
-        &legacy_pending,
-    )
-    .is_err());
-
-    let partial = entity_ack_batch::<String>(&[], &[], &[]);
-    assert!(partial
-        .validate_entity_ack_identities(std::iter::once((
-            format!("session-{fingerprint}").as_str(),
-            fingerprint.as_str(),
-        )))
-        .is_err());
-    assert!(progress.quarantined_fingerprints.contains_key(&fingerprint));
-    assert!(progress.active_quarantine_retries.contains(&fingerprint));
-
-    let exact = entity_ack_batch(std::slice::from_ref(&fingerprint), &[], &[]);
-    exact
-        .validate_entity_ack_identities(std::iter::once((
-            format!("session-{fingerprint}").as_str(),
-            fingerprint.as_str(),
-        )))
-        .expect("exact fingerprint-bound entity ACK");
-    require_normal_write_ack_for_legacy_reconciliation(
-        &exact,
-        &request_fingerprints,
-        &legacy_pending,
-    )
-    .expect("deployed entity ACK contract is sufficient");
 }
 
 #[test]

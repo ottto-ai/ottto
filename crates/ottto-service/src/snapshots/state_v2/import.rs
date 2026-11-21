@@ -1278,7 +1278,10 @@ mod application_cases {
             Some(serde_json::json!(fence)),
         ] {
             let c = Corpus::new();
-            let mut value = serde_json::json!({"schema_version":2,"generation":0,"files":{}});
+            let mut value = serde_json::json!({
+                "schema_version":2,"generation":0,"files":{},
+                "accepted_snapshot_fingerprint_ledger_version":2
+            });
             if let Some(inventory) = &inventory {
                 value["claude_desktop_store_inventory"] = inventory.clone();
             }

@@ -189,24 +189,18 @@ impl HeadStore {
 }
 
 /// One production-shaped main-upload page (see `cycle_with_transport`)
-/// under the production class; only a legacy reconciliation declares head
-/// CAS for its whole request.
+/// under the production class; no request declares head CAS as a whole.
 fn page(
     progress: &mut SnapshotUploadProgress,
     items: &[SnapshotItem],
-    legacy: &BTreeSet<String>,
     server: impl FnMut(&SnapshotBatchRequest<&SnapshotItem>, &Value) -> Result<SnapshotBatchResponse>,
 ) -> (Result<ResumableUploadResult>, Vec<Value>) {
     cycle_with_transport(
         progress,
         items,
         current_unix_seconds(),
-        |item| snapshot_upload_batch_class(item, legacy.contains(&item.snapshot_fingerprint)),
-        |batch| {
-            batch
-                .iter()
-                .all(|item| legacy.contains(&item.snapshot_fingerprint))
-        },
+        snapshot_upload_batch_class,
+        |_| false,
         server,
     )
 }
@@ -235,7 +229,6 @@ fn single_class_page(
 /// own ACK. The headed cap-withheld body goes CAS and keeps a fresh head.
 #[test]
 fn mixed_page_sends_each_patch_class_in_its_own_request() {
-    let none = BTreeSet::new();
     let mut store = HeadStore::default();
     let mut progress = fresh_progress();
     let patched = body("patched", Some(item().cache_observations.unwrap()));
@@ -300,7 +293,7 @@ fn mixed_page_sends_each_patch_class_in_its_own_request() {
         .head_conflict_challenges
         .contains_key(&cache_session_key("birth-withheld")));
 
-    let (result, wires) = page(&mut progress, &items, &none, |request, wire| {
+    let (result, wires) = page(&mut progress, &items, |request, wire| {
         Ok(store.post(request, wire))
     });
     assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
@@ -392,7 +385,7 @@ fn mixed_page_sends_each_patch_class_in_its_own_request() {
         body("single-patched", Some(item().cache_observations.unwrap())),
         body("single-admitted-empty", Some(complete_empty())),
     ];
-    let (result, now) = page(&mut fresh_progress(), &single, &none, |request, wire| {
+    let (result, now) = page(&mut fresh_progress(), &single, |request, wire| {
         Ok(HeadStore::default().post(request, wire))
     });
     assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
@@ -411,7 +404,6 @@ fn mixed_page_sends_each_patch_class_in_its_own_request() {
 /// until an ACK with a head.
 #[test]
 fn observed_unanswered_challenge_survives_a_headless_ordinary_accept() {
-    let none = BTreeSet::new();
     let mut store = HeadStore::default();
     let mut progress = fresh_progress();
     let owed = body("owed", None);
@@ -431,7 +423,6 @@ fn observed_unanswered_challenge_survives_a_headless_ordinary_accept() {
     let (result, wires) = page(
         &mut progress,
         &[owed.clone(), sibling.clone()],
-        &none,
         |request, wire| Ok(store.post(request, wire)),
     );
     assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
@@ -488,7 +479,6 @@ fn observed_unanswered_challenge_survives_a_headless_ordinary_accept() {
 /// base the session is never mirrored, and no POST carries the rescan claim.
 #[test]
 fn a_session_that_regains_a_patch_clears_through_the_ordinary_bootstrap() {
-    let none = BTreeSet::new();
     for regained in [
         item().cache_observations.unwrap(),
         CacheObservations::partial(Some(2)),
@@ -542,7 +532,7 @@ fn a_session_that_regains_a_patch_clears_through_the_ordinary_bootstrap() {
             items[0].cache_base_head_etag.as_deref(),
             Some(head.as_str())
         );
-        let (result, wires) = page(&mut progress, &items, &none, |request, wire| {
+        let (result, wires) = page(&mut progress, &items, |request, wire| {
             Ok(store.post(request, wire))
         });
         assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
@@ -581,7 +571,6 @@ fn a_session_that_regains_a_patch_clears_through_the_ordinary_bootstrap() {
 /// Every body settles by its exact ACK, stored once.
 #[test]
 fn a_mixed_owed_page_answers_only_the_base_holding_patched_body() {
-    let none = BTreeSet::new();
     let mut store = HeadStore::default();
     let mut progress = fresh_progress();
     let based = body("owed-based", Some(item().cache_observations.unwrap()));
@@ -609,14 +598,13 @@ fn a_mixed_owed_page_answers_only_the_base_holding_patched_body() {
     assert!(mirrored(&progress, &based_key), "a saved base: native Full");
     assert!(!mirrored(&progress, &baseless_key), "no base: may re-fold");
     assert!(!mirrored(&progress, &sibling_key), "healthy");
-    assert_eq!(snapshot_upload_batch_class(&baseless, false), 0);
-    assert_eq!(snapshot_upload_batch_class(&based, false), 1);
-    assert_eq!(snapshot_upload_batch_class(&sibling, false), 1);
+    assert_eq!(snapshot_upload_batch_class(&baseless), 0);
+    assert_eq!(snapshot_upload_batch_class(&based), 1);
+    assert_eq!(snapshot_upload_batch_class(&sibling), 1);
 
     let (result, wires) = page(
         &mut progress,
         &[based.clone(), baseless.clone(), sibling.clone()],
-        &none,
         |request, wire| Ok(store.post(request, wire)),
     );
     assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
@@ -692,7 +680,6 @@ fn a_mixed_owed_page_answers_only_the_base_holding_patched_body() {
 /// revision, which keeps the stale saved base and so declares head CAS.
 #[test]
 fn lost_ack_replays_unchanged_and_a_fresh_challenge_clears_again() {
-    let none = BTreeSet::new();
     let mut store = HeadStore::default();
     let mut progress = fresh_progress();
     let owed = body("owed", None);
@@ -703,7 +690,6 @@ fn lost_ack_replays_unchanged_and_a_fresh_challenge_clears_again() {
     let (lost, _) = page(
         &mut progress,
         std::slice::from_ref(&owed),
-        &none,
         |request, wire| {
             store.post(request, wire);
             Err(anyhow!("synthetic lost reply"))
@@ -718,7 +704,6 @@ fn lost_ack_replays_unchanged_and_a_fresh_challenge_clears_again() {
     let (result, _) = page(
         &mut progress,
         std::slice::from_ref(&owed),
-        &none,
         |request, wire| Ok(store.post(request, wire)),
     );
     assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
@@ -741,7 +726,7 @@ fn lost_ack_replays_unchanged_and_a_fresh_challenge_clears_again() {
     progress
         .accepted_cache_heads
         .insert(key.clone(), stale_head());
-    let (result, wires) = page(&mut progress, &[patched], &none, |request, wire| {
+    let (result, wires) = page(&mut progress, &[patched], |request, wire| {
         Ok(store.post(request, wire))
     });
     assert_eq!(
@@ -760,7 +745,7 @@ fn lost_ack_replays_unchanged_and_a_fresh_challenge_clears_again() {
     // The next unpatched revision answers it under CAS and keeps the head.
     let owed_challenge = progress.head_conflict_challenges[&key].challenge.clone();
     let next = revised(&owed, 2);
-    let (result, wires) = page(&mut progress, &[next], &none, |request, wire| {
+    let (result, wires) = page(&mut progress, &[next], |request, wire| {
         Ok(store.post(request, wire))
     });
     assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
@@ -782,7 +767,6 @@ fn lost_ack_replays_unchanged_and_a_fresh_challenge_clears_again() {
 /// body is held, no receipt. No saved head is created or lowered.
 #[test]
 fn ordinary_fence_outcomes_settle_the_owed_challenge_by_their_own_rules() {
-    let none = BTreeSet::new();
     for (outcome, permanent) in [
         ("accepted_log_stale_older_upload", Some(true)),
         ("usage_accounting_authority_downgrade", Some(true)),
@@ -793,43 +777,35 @@ fn ordinary_fence_outcomes_settle_the_owed_challenge_by_their_own_rules() {
         let owed = body("owed", None);
         let key = cache_session_key("owed");
         owe(&mut progress, &owed, challenge(0xc));
-        let (result, wires) = page(
-            &mut progress,
-            std::slice::from_ref(&owed),
-            &none,
-            |request, _| {
-                let item = &request.snapshots[0];
-                let mut ack = empty_ack();
-                match permanent {
-                    Some(permanent) => {
-                        ack.rejected_entities.push(
-                            crate::snapshot_client::SnapshotEntityRejection {
-                                source_session_id: item.source_session_id.clone(),
-                                snapshot_fingerprint: item.snapshot_fingerprint.clone(),
-                                occurrence_count: 1,
-                                permanent,
-                                reason: outcome.into(),
-                                detail: String::new(),
-                            },
-                        );
-                    }
-                    None => {
-                        let version =
-                            crate::snapshot_client::snapshot_ack_body_witness_version(item)
-                                .unwrap();
-                        ack.accepted = 1;
-                        ack.unchanged_entities.push(SnapshotEntityRef {
-                            body_witness_version: version,
-                            body_witness_digest: version
-                                .map(|_| snapshot_upload_body_witness(item)),
-                            unchanged_basis: Some(outcome.into()),
-                            ..reference(item)
+        let (result, wires) = page(&mut progress, std::slice::from_ref(&owed), |request, _| {
+            let item = &request.snapshots[0];
+            let mut ack = empty_ack();
+            match permanent {
+                Some(permanent) => {
+                    ack.rejected_entities
+                        .push(crate::snapshot_client::SnapshotEntityRejection {
+                            source_session_id: item.source_session_id.clone(),
+                            snapshot_fingerprint: item.snapshot_fingerprint.clone(),
+                            occurrence_count: 1,
+                            permanent,
+                            reason: outcome.into(),
+                            detail: String::new(),
                         });
-                    }
                 }
-                Ok(ack)
-            },
-        );
+                None => {
+                    let version =
+                        crate::snapshot_client::snapshot_ack_body_witness_version(item).unwrap();
+                    ack.accepted = 1;
+                    ack.unchanged_entities.push(SnapshotEntityRef {
+                        body_witness_version: version,
+                        body_witness_digest: version.map(|_| snapshot_upload_body_witness(item)),
+                        unchanged_basis: Some(outcome.into()),
+                        ..reference(item)
+                    });
+                }
+            }
+            Ok(ack)
+        });
         assert!(wires[0].get("head_cas_contract").is_none(), "{outcome}");
         let result = result.unwrap();
         let retryable = permanent == Some(false);
@@ -862,43 +838,6 @@ fn ordinary_fence_outcomes_settle_the_owed_challenge_by_their_own_rules() {
         );
         assert!(progress.accepted_cache_heads.is_empty(), "{outcome}");
     }
-}
-
-/// [money] Negative control: a legacy reconciliation stays CAS and alone in
-/// its request, after the ordinary and patched requests.
-#[test]
-fn a_legacy_reconciliation_stays_cas_and_alone_in_its_request() {
-    let mut store = HeadStore::default();
-    let mut progress = fresh_progress();
-    let legacy_item = body("legacy", None);
-    let ordinary = body("ordinary", None);
-    let patched = body("patched", Some(item().cache_observations.unwrap()));
-    for item in [&legacy_item, &patched] {
-        let head = store.seed(&item.source_session_id);
-        progress
-            .accepted_cache_heads
-            .insert(cache_session_key(&item.source_session_id), head);
-    }
-    let legacy = BTreeSet::from([legacy_item.snapshot_fingerprint.clone()]);
-    let (result, wires) = page(
-        &mut progress,
-        &[legacy_item, ordinary, patched],
-        &legacy,
-        |request, wire| Ok(store.post(request, wire)),
-    );
-    assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
-    let shape = wires
-        .iter()
-        .map(|wire| (wire["head_cas_contract"].is_string(), sessions(wire)))
-        .collect::<Vec<_>>();
-    assert_eq!(
-        shape,
-        [
-            (false, vec!["ordinary".to_owned()]),
-            (true, vec!["patched".to_owned()]),
-            (true, vec!["legacy".to_owned()]),
-        ]
-    );
 }
 
 fn with_class(mut item: FamilyItem, class: u8) -> FamilyItem {
@@ -982,7 +921,7 @@ fn mixed_class_family_is_class_pure_root_first_in_both_directions() {
 /// packed exactly as before the class split: same requests, same order.
 #[test]
 fn single_class_pages_keep_the_previous_batches() {
-    for class in [0u8, 1, 2, 3] {
+    for class in [0u8, 1, 3] {
         let mut items = (0..60).rev().map(plain_item).collect::<Vec<_>>();
         items.extend(family("root-s", 5, 0));
         items.extend(family("root-t", 3, 0));
@@ -1025,11 +964,11 @@ fn single_class_pages_keep_the_previous_batches() {
 /// After a restart from the saved ledger only unsettled bodies are re-sent;
 /// a replay of a stored body is an exact repeat (unchanged), so nothing is
 /// stored or credited twice. Every class order: ordinary before patched, patched
-/// before legacy, and a mixed literal family whose patched root is sent
+/// before telemetry-only, and a mixed literal family whose patched root is sent
 /// before its ordinary members.
 #[test]
 fn class_request_lost_after_a_checkpoint_resends_only_unsettled_bodies() {
-    for (first, second) in [(0u8, 1u8), (1, 2)] {
+    for (first, second) in [(0u8, 1u8), (1, 3)] {
         let items = vec![
             with_class(plain_item(1), second),
             with_class(plain_item(2), first),
@@ -1240,7 +1179,6 @@ pub(in crate::snapshot_sync) fn assert_no_smaller_body(wires: &[Value], item: &S
 /// as an ordinary write that drops the head plus the probe stages.
 #[test]
 fn a_headed_update_without_a_patch_keeps_its_head() {
-    let none = BTreeSet::new();
     let first = body("headed", Some(item().cache_observations.unwrap()));
     let key = cache_session_key("headed");
     let mut store = HeadStore::default();
@@ -1248,7 +1186,6 @@ fn a_headed_update_without_a_patch_keeps_its_head() {
     let (result, _) = page(
         &mut progress,
         std::slice::from_ref(&first),
-        &none,
         |request, wire| Ok(store.post(request, wire)),
     );
     assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
@@ -1262,7 +1199,6 @@ fn a_headed_update_without_a_patch_keeps_its_head() {
     let (result, wires) = page(
         &mut progress,
         std::slice::from_ref(&plain),
-        &none,
         |request, wire| Ok(store.post(request, wire)),
     );
     assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
@@ -1281,7 +1217,7 @@ fn a_headed_update_without_a_patch_keeps_its_head() {
             .unwrap()
             .is_empty()
     );
-    let (result, wires) = page(&mut progress, &next, &none, |request, wire| {
+    let (result, wires) = page(&mut progress, &next, |request, wire| {
         Ok(store.post(request, wire))
     });
     assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
@@ -1290,12 +1226,9 @@ fn a_headed_update_without_a_patch_keeps_its_head() {
 
     // Control: the ordinary write drops the head; the patch probes again.
     old.accepted_cache_heads.remove(&key);
-    let (result, ordinary) = page(
-        &mut old,
-        std::slice::from_ref(&plain),
-        &none,
-        |request, wire| Ok(old_store.post(request, wire)),
-    );
+    let (result, ordinary) = page(&mut old, std::slice::from_ref(&plain), |request, wire| {
+        Ok(old_store.post(request, wire))
+    });
     assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
     assert!(ordinary[0].get("head_cas_contract").is_none());
     assert_eq!(
@@ -1304,7 +1237,7 @@ fn a_headed_update_without_a_patch_keeps_its_head() {
     );
     let mut next = vec![patched.clone()];
     apply_bootstrapped_cache_heads("codex", &mut next, &old).unwrap();
-    let (result, _) = page(&mut old, &next, &none, |request, wire| {
+    let (result, _) = page(&mut old, &next, |request, wire| {
         Ok(old_store.post(request, wire))
     });
     assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
@@ -1317,17 +1250,13 @@ fn a_headed_update_without_a_patch_keeps_its_head() {
 /// body as two ordinary writes.
 #[test]
 fn copies_of_a_headed_session_wait_one_page_and_drop_nothing() {
-    let none = BTreeSet::new();
     let first = body("copied", Some(item().cache_observations.unwrap()));
     let key = cache_session_key("copied");
     let mut store = HeadStore::default();
     let mut a = fresh_progress();
-    let (result, _) = page(
-        &mut a,
-        std::slice::from_ref(&first),
-        &none,
-        |request, wire| Ok(store.post(request, wire)),
-    );
+    let (result, _) = page(&mut a, std::slice::from_ref(&first), |request, wire| {
+        Ok(store.post(request, wire))
+    });
     assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
     let mut b = a.clone();
     let stale = b.accepted_cache_heads[&key].clone();
@@ -1338,20 +1267,14 @@ fn copies_of_a_headed_session_wait_one_page_and_drop_nothing() {
         copy
     };
     let (copy_a, copy_b) = (unpatched(1), unpatched(2));
-    let (result, _) = page(
-        &mut a,
-        std::slice::from_ref(&copy_a),
-        &none,
-        |request, wire| Ok(store.post(request, wire)),
-    );
+    let (result, _) = page(&mut a, std::slice::from_ref(&copy_a), |request, wire| {
+        Ok(store.post(request, wire))
+    });
     assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
 
-    let (result, wires) = page(
-        &mut b,
-        std::slice::from_ref(&copy_b),
-        &none,
-        |request, wire| Ok(store.post(request, wire)),
-    );
+    let (result, wires) = page(&mut b, std::slice::from_ref(&copy_b), |request, wire| {
+        Ok(store.post(request, wire))
+    });
     assert_eq!(
         result.unwrap(),
         ResumableUploadResult::Deferred {
@@ -1372,12 +1295,9 @@ fn copies_of_a_headed_session_wait_one_page_and_drop_nothing() {
     assert!(mirrored(&b, &key), "a saved base: native Full");
     let owed = b.head_conflict_challenges[&key].challenge.clone();
 
-    let (result, wires) = page(
-        &mut b,
-        std::slice::from_ref(&copy_b),
-        &none,
-        |request, wire| Ok(store.post(request, wire)),
-    );
+    let (result, wires) = page(&mut b, std::slice::from_ref(&copy_b), |request, wire| {
+        Ok(store.post(request, wire))
+    });
     assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
     let answer = envelope(&wires[0]);
     assert!(answer.get("base_head_etag").is_none());
@@ -1396,12 +1316,9 @@ fn copies_of_a_headed_session_wait_one_page_and_drop_nothing() {
     let mut old_store = HeadStore::default();
     let mut old = fresh_progress();
     for item in [&copy_a, &copy_b] {
-        let (result, _) = page(
-            &mut old,
-            std::slice::from_ref(item),
-            &none,
-            |request, wire| Ok(old_store.post(request, wire)),
-        );
+        let (result, _) = page(&mut old, std::slice::from_ref(item), |request, wire| {
+            Ok(old_store.post(request, wire))
+        });
         assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
     }
     assert_eq!(old_store.heads["copied"].1, store.heads["copied"].1);
@@ -1418,7 +1335,6 @@ fn a_settled_unpatched_revision_keeps_its_ordinary_request() {
     let (result, _) = page(
         &mut progress,
         std::slice::from_ref(&plain),
-        &BTreeSet::new(),
         |request, wire| Ok(store.post(request, wire)),
     );
     assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
@@ -1426,7 +1342,6 @@ fn a_settled_unpatched_revision_keeps_its_ordinary_request() {
     let (result, wires) = page(
         &mut progress,
         std::slice::from_ref(&next),
-        &BTreeSet::new(),
         |request, wire| Ok(store.post(request, wire)),
     );
     assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
@@ -1454,15 +1369,8 @@ fn normal_source_requests_keep_patch_only_head_contract_and_ack_validation() {
             progress
                 .accepted_cache_heads
                 .insert(cache_session_key(&item.source_session_id), stale_head());
-            prepare_snapshot_cache_for_upload(
-                &mut item,
-                &progress,
-                patched,
-                false,
-                &BTreeSet::new(),
-            );
-            assert_eq!(snapshot_upload_batch_class(&item, false), u8::from(patched));
-            assert_eq!(snapshot_upload_batch_class(&item, true), 2);
+            prepare_snapshot_cache_for_upload(&mut item, &progress, patched, false);
+            assert_eq!(snapshot_upload_batch_class(&item), u8::from(patched));
             let mut request = request(vec![item.clone()]);
             request.source = source.api_slug().into();
             let wire = serde_json::to_value(&request).unwrap();

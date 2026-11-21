@@ -135,8 +135,7 @@ fn cycle(
 /// and conflict binding, and the normal page settlement saved at each page
 /// boundary. Held conflict bodies are offered under their bounded retry
 /// lease, as the quarantine retry selection does. A request that `enforce`
-/// accepts declares head CAS on the wire (a legacy reconciliation, or the
-/// single-body cycle); any other declares it for a body with a cache patch, a
+/// accepts declares head CAS on the wire (the single-body cycle); any other declares it for a body with a cache patch, a
 /// saved head or telemetry-only evidence.
 /// Returns the result and each request's wire, in send order.
 pub(super) fn cycle_with_transport(
@@ -1079,7 +1078,7 @@ fn healthy_sessions_send_the_unchanged_wire_and_keep_no_challenge() {
     );
     let reserved = identity_cache_wire_reserve(&item, &progress, false);
     let mut projected = item.clone();
-    prepare_snapshot_cache_for_upload(&mut projected, &progress, true, false, &BTreeSet::new());
+    prepare_snapshot_cache_for_upload(&mut projected, &progress, true, false);
     attach_head_conflict_answers(
         std::slice::from_mut(&mut projected),
         &progress,
@@ -1690,7 +1689,7 @@ fn full_replacement_marks_only_the_owed_empty_state_answer() {
         .insert(key.clone(), stale_head());
     let reserved = identity_cache_wire_reserve(&item, &reserving, true);
     let mut projected = item.clone();
-    prepare_snapshot_cache_for_upload(&mut projected, &reserving, true, false, &BTreeSet::new());
+    prepare_snapshot_cache_for_upload(&mut projected, &reserving, true, false);
     attach_head_conflict_answers(
         std::slice::from_mut(&mut projected),
         &reserving,
@@ -1867,7 +1866,7 @@ fn echoed_cache_state_settles_a_stored_state_divergence_and_converges() {
     let stored = std::cell::RefCell::new(server_state.clone());
     let project = |progress: &SnapshotUploadProgress, item: &SnapshotItem| {
         let mut sent = item.clone();
-        prepare_snapshot_cache_for_upload(&mut sent, progress, true, true, &BTreeSet::new());
+        prepare_snapshot_cache_for_upload(&mut sent, progress, true, true);
         sent
     };
     let refusals = || {
@@ -2149,7 +2148,7 @@ fn source_and_money_equivalence() {
 
     let mut pi = w1.clone();
     let progress = fresh_progress();
-    prepare_snapshot_cache_for_upload(&mut pi, &progress, false, false, &BTreeSet::new());
+    prepare_snapshot_cache_for_upload(&mut pi, &progress, false, false);
     assert!(pi.cache_observations.is_none() && pi.cache_base_head_etag.is_none());
-    assert_eq!(snapshot_upload_batch_class(&pi, false), 0, "no CAS");
+    assert_eq!(snapshot_upload_batch_class(&pi), 0, "no CAS");
 }

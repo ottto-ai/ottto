@@ -1016,7 +1016,7 @@ fn cache_effective_wire_projection_matches_index_retractions_and_held_local_evid
         let mut wire_index = baseline.clone();
         if !held {
             for item in &mut wire_scan.snapshots {
-                prepare_snapshot_cache_for_upload(item, &progress, enabled, true, &BTreeSet::new());
+                prepare_snapshot_cache_for_upload(item, &progress, enabled, true);
             }
         }
         finalize_scan_after_policy(SnapshotSource::Codex, &mut wire_scan, &mut wire_index);
@@ -1030,14 +1030,7 @@ fn cache_effective_wire_projection_matches_index_retractions_and_held_local_evid
             &mut effective_scan,
             &mut effective_index,
             |item| {
-                effective_snapshot_upload_body_witness(
-                    item,
-                    &progress,
-                    enabled,
-                    true,
-                    &BTreeSet::new(),
-                    &disposition,
-                )
+                effective_snapshot_upload_body_witness(item, &progress, enabled, true, &disposition)
             },
         );
         let effective = effective_index.files.values().next().unwrap();
@@ -1174,13 +1167,12 @@ fn cache_effective_wire_mandatory_head_obligation_survives_finalizer_noop() {
                 &progress,
                 false,
                 false,
-                &BTreeSet::new(),
                 &crate::snapshots::ClaudeUsageAuthorityDisposition::default(),
             )
         },
     );
     for item in &mut off.snapshots {
-        prepare_snapshot_cache_for_upload(item, &progress, false, false, &BTreeSet::new());
+        prepare_snapshot_cache_for_upload(item, &progress, false, false);
     }
     let mut accepted = 0;
     upload_resumable_batches_with_body_witness(
@@ -1230,8 +1222,6 @@ fn cache_effective_wire_mandatory_head_obligation_survives_finalizer_noop() {
         &progress,
         true,
         true,
-        &BTreeSet::new(),
-        &BTreeSet::new(),
         &disposition,
     );
     assert_eq!(identities.len(), 1);
@@ -1241,8 +1231,6 @@ fn cache_effective_wire_mandatory_head_obligation_survives_finalizer_noop() {
         &progress,
         false,
         true,
-        &BTreeSet::new(),
-        &BTreeSet::new(),
         &disposition
     )
     .is_empty());
@@ -1254,37 +1242,14 @@ fn cache_effective_wire_mandatory_head_obligation_survives_finalizer_noop() {
         &progress,
         true,
         true,
-        &BTreeSet::new(),
-        &BTreeSet::new(),
         &held
-    )
-    .is_empty());
-    let legacy = BTreeSet::from([identities[0].snapshot_fingerprint.clone()]);
-    assert!(capture_deferred_cache_head_identities(
-        SnapshotSource::Codex,
-        &on.snapshots,
-        &progress,
-        true,
-        true,
-        &legacy,
-        &BTreeSet::new(),
-        &disposition
     )
     .is_empty());
     finalize_scan_after_policy_with_body_witness(
         SnapshotSource::Codex,
         &mut on,
         &mut index,
-        |item| {
-            effective_snapshot_upload_body_witness(
-                item,
-                &progress,
-                true,
-                true,
-                &BTreeSet::new(),
-                &disposition,
-            )
-        },
+        |item| effective_snapshot_upload_body_witness(item, &progress, true, true, &disposition),
     );
     // The new context owes even an equal ordinary body once: finalization
     // keeps it for its exact ACK under that context, not as a no-op.
@@ -1348,21 +1313,12 @@ fn cache_effective_wire_mandatory_head_obligation_survives_finalizer_noop() {
         SnapshotSource::Codex,
         &mut enriched,
         &mut loaded,
-        |item| {
-            effective_snapshot_upload_body_witness(
-                item,
-                &progress,
-                true,
-                true,
-                &BTreeSet::new(),
-                &disposition,
-            )
-        },
+        |item| effective_snapshot_upload_body_witness(item, &progress, true, true, &disposition),
     );
     assert_eq!(enriched.snapshots.len(), 1);
     let witnesses = progress.pending_cache_head_file_witnesses(&loaded);
     for item in &mut enriched.snapshots {
-        prepare_snapshot_cache_for_upload(item, &progress, true, true, &BTreeSet::new());
+        prepare_snapshot_cache_for_upload(item, &progress, true, true);
     }
     upload_resumable_batches_with_body_witness(
         &enriched.snapshots,
@@ -1425,7 +1381,6 @@ fn cache_effective_wire_unchanged_capability_enable_reads_nothing() {
     assert!(off.snapshots[0].cache_observations.is_some());
     let mut progress = test_upload_progress();
     let held = crate::snapshots::ClaudeUsageAuthorityDisposition::default();
-    let legacy = BTreeSet::new();
     apply_upload_policy(
         SnapshotSource::Codex,
         &mut off.snapshots,
@@ -1435,16 +1390,14 @@ fn cache_effective_wire_unchanged_capability_enable_reads_nothing() {
         SnapshotSource::Codex,
         &mut off,
         &mut index,
-        |item| {
-            effective_snapshot_upload_body_witness(item, &progress, false, false, &legacy, &held)
-        },
+        |item| effective_snapshot_upload_body_witness(item, &progress, false, false, &held),
     );
     assert!(
         off.snapshots[0].cache_observations.is_some(),
         "local consumers preserve authorized raw evidence"
     );
     for item in &mut off.snapshots {
-        prepare_snapshot_cache_for_upload(item, &progress, false, false, &legacy);
+        prepare_snapshot_cache_for_upload(item, &progress, false, false);
     }
     let mut accepted = 0;
     upload_resumable_batches_with_body_witness(
@@ -1513,7 +1466,7 @@ fn cache_effective_wire_unchanged_capability_enable_reads_nothing() {
         SnapshotSource::Codex,
         &mut on,
         &mut index,
-        |item| effective_snapshot_upload_body_witness(item, &progress, true, false, &legacy, &held),
+        |item| effective_snapshot_upload_body_witness(item, &progress, true, false, &held),
     );
     assert_eq!(
         on.snapshots.len(),
@@ -1523,7 +1476,7 @@ fn cache_effective_wire_unchanged_capability_enable_reads_nothing() {
     let semantic = on.snapshots[0].snapshot_fingerprint.clone();
     let mut local_item = on.snapshots[0].clone();
     assert!(progress.accepted_cache_states.is_empty());
-    prepare_snapshot_cache_for_upload(&mut local_item, &progress, true, false, &legacy);
+    prepare_snapshot_cache_for_upload(&mut local_item, &progress, true, false);
     let prepared_body = snapshot_upload_body_witness(&local_item);
     let mut probe = local_item.clone();
     probe.cache_observations = None;
@@ -1570,7 +1523,7 @@ fn cache_effective_wire_unchanged_capability_enable_reads_nothing() {
         [true],
         "already settled ordinary bytes still require their exact CAS repeat"
     );
-    prepare_snapshot_cache_for_upload(&mut on.snapshots[0], &progress, true, false, &legacy);
+    prepare_snapshot_cache_for_upload(&mut on.snapshots[0], &progress, true, false);
     assert_eq!(
         snapshot_upload_body_witness(&on.snapshots[0]),
         prepared_body,
@@ -2211,11 +2164,10 @@ fn cache_overcap_byte_trim_witness_network_and_ack_use_identical_completion() {
         &progress,
         true,
         true,
-        &BTreeSet::new(),
         &crate::snapshots::ClaudeUsageAuthorityDisposition::default(),
     );
     let mut network = raw.clone();
-    prepare_snapshot_cache_for_upload(&mut network, &progress, true, true, &BTreeSet::new());
+    prepare_snapshot_cache_for_upload(&mut network, &progress, true, true);
     assert_eq!(witness, snapshot_upload_body_witness(&network));
     assert_eq!(
         progress.accepted_cache_states[&key], prior,

@@ -71,6 +71,7 @@ fn pi_fixture() -> ScanIndex {
         // Missing activity is not empty: keep one known and one unknown.
         "snapshot_activity_at": {PI_ACTIVE: "2026-10-27T06:00:01Z", PI_OWED: null},
         "accepted_snapshot_fingerprints": ["pi-accepted"],
+        "accepted_snapshot_fingerprint_ledger_version": 2,
     }))
     .unwrap()
 }

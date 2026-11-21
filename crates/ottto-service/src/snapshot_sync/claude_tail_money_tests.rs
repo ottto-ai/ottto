@@ -3509,7 +3509,7 @@ fn forked_root(c: &mut Corpus) -> PathBuf {
 fn under_cas(items: &[SnapshotItem], progress: &SnapshotUploadProgress) -> Vec<SnapshotItem> {
     let mut items = items.to_vec();
     for item in &mut items {
-        prepare_snapshot_cache_for_upload(item, progress, true, false, &BTreeSet::new());
+        prepare_snapshot_cache_for_upload(item, progress, true, false);
     }
     items
 }
@@ -3579,7 +3579,7 @@ fn under_required_cas(
 ) -> Vec<SnapshotItem> {
     let mut items = items.to_vec();
     for item in &mut items {
-        prepare_snapshot_cache_for_upload(item, progress, true, true, &BTreeSet::new());
+        prepare_snapshot_cache_for_upload(item, progress, true, true);
     }
     items
 }
@@ -3850,7 +3850,7 @@ fn head_first_route(
         .bind_test_key(Some([0x42; 32]));
     let mut sent = page.scan.snapshots.clone();
     for item in &mut sent {
-        prepare_snapshot_cache_for_upload(item, &progress, true, false, &BTreeSet::new());
+        prepare_snapshot_cache_for_upload(item, &progress, true, false);
     }
     let mut store = crate::snapshot_sync::tests::class_split_tests::HeadStore::default();
     let mut posts = 0;

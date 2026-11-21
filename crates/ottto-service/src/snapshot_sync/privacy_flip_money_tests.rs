@@ -193,19 +193,11 @@ fn settle(c: &Corpus, page: &mut Page, mode: Mode) {
     page.enrich(c);
     let progress = e2_progress();
     let disposition = page.disposition.clone();
-    let legacy = BTreeSet::new();
     page.finish_with(|item| {
-        effective_snapshot_upload_body_witness(
-            item,
-            &progress,
-            mode.cache,
-            false,
-            &legacy,
-            &disposition,
-        )
+        effective_snapshot_upload_body_witness(item, &progress, mode.cache, false, &disposition)
     });
     for snapshot in &mut page.scan.snapshots {
-        prepare_snapshot_cache_for_upload(snapshot, &progress, mode.cache, false, &legacy);
+        prepare_snapshot_cache_for_upload(snapshot, &progress, mode.cache, false);
     }
 }
 fn carried(value: &serde_json::Value) -> bool {

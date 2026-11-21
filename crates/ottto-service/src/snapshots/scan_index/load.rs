@@ -180,25 +180,11 @@ impl ScanIndex {
                     });
             (decoded, LoadOrigin::Loaded)
         };
+        // An unsupported schema or ledger is refused, never rebuilt over.
+        let decoded = decoded.and_then(|index| {
+            lenient_decode::controls(&index, scan_index_source_label(source)).map(|()| index)
+        });
         match decoded {
-            Ok(index) if index.schema_version != SCAN_INDEX_SCHEMA_VERSION => Err(anyhow::anyhow!(
-                "unsupported local snapshot scan index schema"
-            )),
-            // Written by a newer build: future state, refused like a schema
-            // mismatch and never rebuilt over.
-            Ok(index)
-                if index.accepted_snapshot_fingerprint_ledger_version
-                    > SNAPSHOT_ACCEPTED_LEDGER_VERSION =>
-            {
-                alarm_future_scan_index_ledger(
-                    scan_index_source_label(source),
-                    index.accepted_snapshot_fingerprint_ledger_version,
-                );
-                Err(anyhow::anyhow!(
-                    "unsupported local snapshot scan index accepted-ledger version {}",
-                    index.accepted_snapshot_fingerprint_ledger_version
-                ))
-            }
             Ok(mut index) => {
                 index.finish_decoded_load(source);
                 if try_import {

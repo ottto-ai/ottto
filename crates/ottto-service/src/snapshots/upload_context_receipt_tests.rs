@@ -2920,11 +2920,11 @@ fn confirmed_empty_counts_settled_only_when_absent() {
     );
 }
 
-/// [behaviour] Exact ledger acceptance settles a file only on a current
-/// ledger, with every committed member accepted and unquarantined, and no
-/// open evidence debt. Codex also needs its proven owner.
+/// [behaviour] Exact ledger acceptance settles a file only with every
+/// committed member accepted and unquarantined, and no open evidence debt.
+/// Codex also needs its proven owner.
 #[test]
-fn ledger_accepted_file_counts_settled_only_with_current_ledger() {
+fn ledger_accepted_file_counts_settled_only_with_every_member_accepted() {
     let settled = |index: &ScanIndex, source| {
         let counts = index.upload_context_owed_counts(source);
         assert_eq!(counts.owed_files + counts.ledger_accepted_files, 1);
@@ -2932,15 +2932,6 @@ fn ledger_accepted_file_counts_settled_only_with_current_ledger() {
     };
     let (_scratch, index, key) = owed_count_index(SnapshotSource::ClaudeCode);
     assert!(settled(&index, SnapshotSource::ClaudeCode));
-    let mut stale = index.clone();
-    stale.accepted_snapshot_fingerprint_ledger_version = 0;
-    assert!(!settled(&stale, SnapshotSource::ClaudeCode), "stale ledger");
-    let mut reconciling = index.clone();
-    reconciling.legacy_settlement_reconcile_after_fingerprint = Some("entity".into());
-    assert!(
-        !settled(&reconciling, SnapshotSource::ClaudeCode),
-        "ledger being rebuilt"
-    );
     let mut quarantined = index.clone();
     quarantined.quarantined_snapshot_fingerprints.insert(
         "entity".into(),

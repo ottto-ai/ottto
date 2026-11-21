@@ -558,7 +558,6 @@ impl ApcFixture {
                     &progress,
                     false,
                     false,
-                    &BTreeSet::new(),
                     &disposition,
                 )
             });
@@ -572,7 +571,6 @@ impl ApcFixture {
                     &progress,
                     false,
                     false,
-                    &BTreeSet::new(),
                     &disposition,
                 )
             },
@@ -630,7 +628,7 @@ impl ApcFixture {
             };
         }
         for snapshot in &mut scan.snapshots {
-            prepare_snapshot_cache_for_upload(snapshot, &progress, false, false, &BTreeSet::new());
+            prepare_snapshot_cache_for_upload(snapshot, &progress, false, false);
         }
         let offered_bodies = scan
             .snapshots

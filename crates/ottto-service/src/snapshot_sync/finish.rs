@@ -40,7 +40,6 @@ use super::reason_reoffer;
 use super::reconciliation_agent_status;
 use super::refused_entity_state;
 use super::report_status_with_fresh_relay_token;
-use super::require_normal_write_ack_for_legacy_reconciliation;
 use super::safe_error;
 
 use super::shed_backoff;
@@ -1167,8 +1166,6 @@ pub(super) fn finish_sync_source(
         mut committed_index,
         backfill_state,
         backfill_pending,
-        legacy_reconciliation_pending,
-        active_legacy_reconciliation,
         scan: _,
     } = preparation;
     let cache_full_replacement = cache_full_replacement_negotiated(source, &activity_hint);
@@ -1472,8 +1469,6 @@ pub(super) fn finish_sync_source(
         &upload_progress,
         cache_observations_enabled,
         activity_hint.snapshot_head_cas_required,
-        &legacy_reconciliation_pending,
-        &active_legacy_reconciliation,
         &claude_authority_disposition,
     );
     exclude_held_effective_body_witness_revision(
@@ -1498,7 +1493,6 @@ pub(super) fn finish_sync_source(
                     &upload_progress,
                     cache_observations_enabled,
                     activity_hint.snapshot_head_cas_required,
-                    &legacy_reconciliation_pending,
                     &claude_authority_disposition,
                 )
             },
@@ -1521,7 +1515,6 @@ pub(super) fn finish_sync_source(
                 &upload_progress,
                 cache_observations_enabled,
                 activity_hint.snapshot_head_cas_required,
-                &legacy_reconciliation_pending,
                 &claude_authority_disposition,
             )
         },
@@ -1551,13 +1544,6 @@ pub(super) fn finish_sync_source(
         state_v2_guard()?;
         ensure_destination_authority()
     };
-    // A parsed file can emit several legacy siblings. Only the persisted
-    // migration lease may re-enter an ambiguous old identity this cycle; new
-    // fingerprints and ordinary changed entities continue through normally.
-    scan_result.snapshots.retain(|snapshot| {
-        !legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint)
-            || active_legacy_reconciliation.contains(&snapshot.snapshot_fingerprint)
-    });
     // A long-lived poison item can keep upload progress around while unrelated
     // files continue changing. Drop quarantine revisions no longer represented
     // by the authoritative current index before any early upload error can
@@ -1661,7 +1647,6 @@ pub(super) fn finish_sync_source(
     };
     let cache_head_groups = if cache_observations_enabled
         && (activity_hint.snapshot_head_cas_required
-            || !legacy_reconciliation_pending.is_empty()
             || !upload_progress.pending_cache_heads.is_empty()
             || scan_result
                 .snapshots
@@ -1688,8 +1673,7 @@ pub(super) fn finish_sync_source(
             // Every headless patch is owed until its exact patched ACK with a
             // head is saved. Only a required head fails on a missing binding.
             let owed = headless(&upload_progress, snapshot);
-            let required = activity_hint.snapshot_head_cas_required
-                || legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint);
+            let required = activity_hint.snapshot_head_cas_required;
             pending_cache_heads_changed |=
                 match upload_progress.record_pending_cache_head(snapshot, &cache_head_groups, owed)
                 {
@@ -1702,7 +1686,6 @@ pub(super) fn finish_sync_source(
             &upload_progress,
             cache_observations_enabled,
             activity_hint.snapshot_head_cas_required,
-            &legacy_reconciliation_pending,
         );
     }
     if pending_cache_heads_changed {
@@ -1942,12 +1925,7 @@ pub(super) fn finish_sync_source(
             |snapshot| snapshot.snapshot_fingerprint.as_str(),
             snapshot_upload_body_witness,
             |snapshot| Some(snapshot.source_session_id.as_str()),
-            |snapshot| {
-                snapshot_upload_batch_class(
-                    snapshot,
-                    legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint),
-                )
-            },
+            snapshot_upload_batch_class,
             crate::snapshots::claude_request_money::request_owned_family_root,
             &mut inplace_retry,
             |snapshots| {
@@ -1966,28 +1944,8 @@ pub(super) fn finish_sync_source(
                     upload_policy,
                     client_report.report().clone(),
                 );
-                let reconcile_class = request.snapshots.iter().all(|snapshot| {
-                    legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint)
-                });
-                debug_assert!(
-                    reconcile_class
-                        || request.snapshots.iter().all(|snapshot| {
-                            !legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint)
-                        }),
-                    "legacy reconciliation must stay isolated at a batch boundary"
-                );
-                let mut response = upload_checked(&request, reconcile_class)?;
+                let mut response = upload_checked(&request, false)?;
                 response.bind_conflict_rescans(&request);
-                let request_fingerprints = request
-                    .snapshots
-                    .iter()
-                    .map(|snapshot| snapshot.snapshot_fingerprint.clone())
-                    .collect::<BTreeSet<_>>();
-                require_normal_write_ack_for_legacy_reconciliation(
-                    &response,
-                    &request_fingerprints,
-                    &legacy_reconciliation_pending,
-                )?;
                 // Clear only what this accepted request carried. A failed upload
                 // leaves the counters in place so the losses are reported on the
                 // next batch instead of vanishing with the request that died.
@@ -2497,7 +2455,6 @@ pub(super) fn finish_sync_source(
     // The whole ledger, before the current-entity prune below: a refusal from
     // this page that is not current still keeps its reported reason.
     let permanent_refusals = PermanentRefusalCounts::of(&upload_progress);
-    index.finish_legacy_settlement_reconciliation();
     ensure_authority()?;
     scan_result.validate_codex_checkpoint()?;
     save_index_and_publish_manifest(

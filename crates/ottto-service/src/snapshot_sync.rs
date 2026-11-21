@@ -284,7 +284,6 @@ use self::upload::is_shed_failure;
 #[cfg(test)]
 use self::upload::is_snapshot_batch_split_failure;
 use self::upload::is_upload_outage;
-use self::upload::require_normal_write_ack_for_legacy_reconciliation;
 use self::upload::snapshot_entity_deferred;
 pub(crate) use self::upload::snapshot_packing_json_length;
 use self::upload::snapshot_upload_error_class;
@@ -465,11 +464,6 @@ pub(crate) const SNAPSHOT_BATCH_MAX_BYTES: usize = 2 * 1024 * 1024;
 const SNAPSHOT_ADAPTIVE_SPLIT_LIMIT: usize = 6;
 const SNAPSHOT_ADAPTIVE_ATTEMPT_LIMIT: usize = SNAPSHOT_BATCH_LIMIT + 4;
 const SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE: usize = SNAPSHOT_BATCH_LIMIT;
-// A pre-ledger checkpoint with ambiguous settlement is re-entered through the
-// existing entity-ACK upload machine. Arm at most one normal 50-entity page per
-// five-minute source cycle; the scan-index cursor and quarantine map resume the
-// remaining identities across restarts.
-const LEGACY_SETTLEMENT_RECONCILE_LIMIT_PER_CYCLE: usize = SNAPSHOT_BATCH_LIMIT;
 static ONE_SHOT_SYNC_IN_FLIGHT: OnceLock<Mutex<bool>> = OnceLock::new();
 static SNAPSHOT_SYNC_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 #[cfg(test)]

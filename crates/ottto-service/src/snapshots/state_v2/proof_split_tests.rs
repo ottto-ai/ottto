@@ -11,7 +11,9 @@ use super::super::super::save_graph;
 #[test]
 fn upload_context_proof_stamps_split_and_migrate() {
     deep_stack(|| {
-        for (path, layout) in RELEASES {
+        // Only releases before the per-entity stamp rows hold inline stamps.
+        let split = catalogue::introduced("proof.upload_context").unwrap();
+        for (path, layout) in RELEASES.into_iter().filter(|(_, layout)| *layout < split) {
             proof_split_check(path, layout);
         }
     });

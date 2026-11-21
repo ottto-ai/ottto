@@ -353,10 +353,6 @@ impl Serialize for ScanIndex {
         field!(snapshot_activity_at, BTreeMap::is_empty);
         field!(accepted_snapshot_fingerprints, BTreeSet::is_empty);
         field!(accepted_snapshot_fingerprint_ledger_version, is_zero_u8);
-        field!(
-            legacy_settlement_reconcile_after_fingerprint,
-            Option::is_none
-        );
         field!(held quarantined_snapshot_fingerprints);
         field!(claude_history_cutoff_unix_seconds, Option::is_none);
         field!(claude_history_gate_loaded, std::ops::Not::not);
@@ -460,7 +456,7 @@ pub(super) const FIELDS: &[&str] = &[
     "snapshot_activity_at",
     "accepted_snapshot_fingerprints",
     "accepted_snapshot_fingerprint_ledger_version",
-    "legacy_settlement_reconcile_after_fingerprint",
+    "legacy_settlement_reconcile_after_fingerprint", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
     "quarantined_snapshot_fingerprints",
     "claude_history_cutoff_unix_seconds",
     "claude_history_gate_loaded",
@@ -485,6 +481,9 @@ pub(super) const FIELDS: &[&str] = &[
     "claude_folder_login_ledger", // TOMBSTONE: decode-and-drop; preserve the legacy positional slot.
     "tail_discovery",
 ];
+
+/// An accepted ledger older than this build reads: held until a reset.
+pub(super) const OLDER_LEDGER_REFUSAL: &str = "older accepted-ledger version";
 
 #[derive(Debug, thiserror::Error)]
 pub(super) enum Error {
@@ -892,9 +891,9 @@ fn optional_census(name: Option<&str>) -> bool {
 
 fn note_refusal(error: &Error, stage: &str, source: &str) {
     let kind = match error {
-        // The future-ledger path already has its once-per-source alarm. Keep
-        // that existing counter/alarm contract rather than adding repeats.
-        Error::Refused("accepted-ledger version") => return,
+        // The ledger-version paths already have their once-per-source alarm.
+        // Keep that existing counter/alarm contract rather than adding repeats.
+        Error::Refused("accepted-ledger version" | OLDER_LEDGER_REFUSAL) => return,
         Error::Refused("schema_version") => "control",
         Error::Refused("duplicate index field" | "duplicate record key") => "duplicate",
         Error::Refused("main document nesting resource cap" | "nesting resource cap") => "resource",
@@ -970,7 +969,7 @@ fn read_persistence_mode<R: BufRead + Seek>(
         }
         headers.schema_version = SCAN_INDEX_SCHEMA_VERSION;
     }
-    controls(&headers, source)?;
+    view_controls(&headers, source, map_only)?;
     drop(headers);
     decoder.reader.seek(SeekFrom::Start(0))?;
     let result = decoder.index(Pass::Full);
@@ -1014,7 +1013,7 @@ fn finish_decode(
     source: &'static str,
     map_only: bool,
 ) -> std::result::Result<(), Error> {
-    controls(index, source)?;
+    view_controls(index, source, map_only)?;
     // Normalize on every successful read, including both CAS readers. A bad
     // cutoff clears the loaded marker so prior-history signals re-derive it.
     index.drop_malformed_claude_history_cutoff();
@@ -1027,7 +1026,6 @@ fn finish_decode(
     };
     counts.drops.activity += semantic.activity;
     counts.drops.accepted += semantic.accepted;
-    counts.drops.cursor += semantic.cursor;
     counts.drops.quarantine += semantic.quarantine;
     note_scan_index_record_drops_and_decode(
         stage,
@@ -1046,11 +1044,7 @@ fn finish_decode(
     if map_only
         && (!index.decode_holds.is_empty()
             || index.decode_holds.1.count != 0
-            || counts.drops.activity
-                + counts.drops.accepted
-                + counts.drops.cursor
-                + counts.drops.quarantine
-                != 0)
+            || counts.drops.activity + counts.drops.accepted + counts.drops.quarantine != 0)
     {
         return Err(Error::Refused("incomplete persistence map"));
     }
@@ -1334,15 +1328,33 @@ pub(super) fn read_identity_carry(
     Ok(carry)
 }
 
+/// Refuse a schema or accepted-ledger version this build does not read. Only
+/// the current ledger loads: an older one is held for a reset, never migrated.
 pub(super) fn controls(index: &ScanIndex, source: &'static str) -> std::result::Result<(), Error> {
+    view_controls(index, source, false)
+}
+/// A map-only shard view is synthetic and carries no ledger (it decodes as
+/// 0), so it checks the schema only. Every other read checks the real ledger.
+fn view_controls(
+    index: &ScanIndex,
+    source: &'static str,
+    map_only: bool,
+) -> std::result::Result<(), Error> {
     if index.schema_version != SCAN_INDEX_SCHEMA_VERSION {
         return Err(Error::Refused("schema_version"));
     }
-    if index.accepted_snapshot_fingerprint_ledger_version > SNAPSHOT_ACCEPTED_LEDGER_VERSION {
-        alarm_future_scan_index_ledger(source, index.accepted_snapshot_fingerprint_ledger_version);
-        return Err(Error::Refused("accepted-ledger version"));
+    let version = index.accepted_snapshot_fingerprint_ledger_version;
+    if map_only || version == SNAPSHOT_ACCEPTED_LEDGER_VERSION {
+        return Ok(());
     }
-    Ok(())
+    alarm_unsupported_scan_index_ledger(source, version);
+    Err(Error::Refused(
+        if version > SNAPSHOT_ACCEPTED_LEDGER_VERSION {
+            "accepted-ledger version"
+        } else {
+            OLDER_LEDGER_REFUSAL
+        },
+    ))
 }
 fn family_hold_roots<'a>(holds: &'a BTreeMap<&'static str, HeldSlots>) -> BTreeSet<&'a str> {
     holds
@@ -1938,6 +1950,7 @@ impl<R: BufRead + Seek> Decoder<R> {
                         | "claude_duplicate_fence_next_full_rearm_unix_seconds"
                         | "claude_full_rearm_progress"
                         | "claude_request_identity_contract_changed"
+                        | "legacy_settlement_reconcile_after_fingerprint"
                         | "claude_stale_family_carry"
                         | "held_audit_progress"
                         | "claude_retired_family_tombstones"
@@ -2054,16 +2067,6 @@ impl<R: BufRead + Seek> Decoder<R> {
                         "accepted_snapshot_fingerprint_ledger_version" => {
                             index.accepted_snapshot_fingerprint_ledger_version =
                                 self.typed(value)?
-                        }
-                        "legacy_settlement_reconcile_after_fingerprint" => {
-                            index.legacy_settlement_reconcile_after_fingerprint =
-                                match self.typed(value) {
-                                    Ok(cursor) => cursor,
-                                    Err(_) => {
-                                        self.counts.drops.cursor += 1;
-                                        Some(lowest_legacy_settlement_cursor())
-                                    }
-                                }
                         }
                         "quarantined_snapshot_fingerprints" => {
                             index.quarantined_snapshot_fingerprints = self.quarantines(value)?

@@ -71,7 +71,6 @@ use super::SyncCounts;
 use super::UploadShed;
 use super::Zeroize;
 use super::AGENT_STATUS_SNAPSHOT_TTL_MINUTES;
-use super::LEGACY_SETTLEMENT_RECONCILE_LIMIT_PER_CYCLE;
 use super::MAX_BACKFILL_FILES_PER_SOURCE;
 use super::MAX_CYCLE_INTERVAL;
 use super::SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE;
@@ -357,8 +356,6 @@ pub(super) struct SourcePreparation {
     pub(super) committed_index: ScanIndex,
     pub(super) backfill_state: crate::backfill::BackfillState,
     pub(super) backfill_pending: bool,
-    pub(super) legacy_reconciliation_pending: BTreeSet<String>,
-    pub(super) active_legacy_reconciliation: BTreeSet<String>,
     pub(super) scan: Option<crate::snapshots::OwnedSourceScan>,
 }
 
@@ -1038,27 +1035,6 @@ pub(super) fn prepare_sync_source_inner(
     }
     let admission_reoffer_pending =
         index.snapshot_admission_reoffer_pending_for_scan(source, receipt_window_days);
-    let mut legacy_reconciliation_pending = BTreeSet::new();
-    if !backfill_pending && index.legacy_settlement_ledger_needs_migration() {
-        let (armed, changed) = index.prepare_legacy_settlement_reconciliation(
-            source,
-            LEGACY_SETTLEMENT_RECONCILE_LIMIT_PER_CYCLE,
-        );
-        legacy_reconciliation_pending =
-            index.legacy_settlement_reconciliation_pending_fingerprints();
-        if changed {
-            // The bounded cursor and armed identities are durable before the
-            // disposable upload ledger can lease this cycle's retry page.
-            index.save(&index_path)?;
-            if !armed.is_empty() {
-                eprintln!(
-                    "ottto-service: re-armed {} ambiguous legacy snapshot revision(s) through the existing entity-ACK contract for {}; remaining revisions resume on later source cycles",
-                    armed.len(),
-                    source.api_slug()
-                );
-            }
-        }
-    }
     // Due exact refusal re-offers are reserved from the loaded, committed
     // index and saved below before any lease reaches the scan or uploader.
     let reoffer_now = reason_reoffer::now_unix_seconds();
@@ -1091,11 +1067,6 @@ pub(super) fn prepare_sync_source_inner(
             &serde_json::json!({"action": "enqueued", "count": quarantine_retry_paths.len()}),
         );
     }
-    let active_legacy_reconciliation = upload_progress
-        .active_quarantine_retries
-        .intersection(&legacy_reconciliation_pending)
-        .cloned()
-        .collect::<BTreeSet<_>>();
     // Under this pass's sync lock, before the scan is built. Every source
     // replays when one is pending; true when it reset the index.
     let replay_dropped_entries =
@@ -1207,8 +1178,7 @@ pub(super) fn prepare_sync_source_inner(
     let cycle_owes_nothing = !backfill_pending
         && !admission_reoffer_pending
         && !claude_index_loaded_fresh
-        && copy_prefix_scope.is_empty()
-        && legacy_reconciliation_pending.is_empty();
+        && copy_prefix_scope.is_empty();
     let now = crate::scan_clock::utc_seconds();
     let walk_idle = crate::snapshots::walk_idle::gate(
         source,
@@ -1272,8 +1242,6 @@ pub(super) fn prepare_sync_source_inner(
         committed_index,
         backfill_state,
         backfill_pending,
-        legacy_reconciliation_pending,
-        active_legacy_reconciliation,
         scan: Some(scan),
     }))
 }

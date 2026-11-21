@@ -1326,7 +1326,6 @@ use super::prepare_upload_progress_for_cycle_with_reoffer;
 use super::reason_reoffer;
 use super::scan_request_window_days;
 use super::stale_owed;
-use super::BTreeSet;
 use super::PathBuf;
 use super::Result;
 use super::SessionAttributionContext;
@@ -1441,7 +1440,6 @@ pub(super) fn take_continuation_inputs(
 pub(super) enum ContinuationRefusal {
     HistoricalReplay,
     AdmissionReoffer,
-    LegacySettlement,
     UploadClaim,
     ReasonReoffer,
     EvidenceChanged,
@@ -1452,7 +1450,6 @@ impl ContinuationRefusal {
         match self {
             Self::HistoricalReplay => "historical_replay_pending",
             Self::AdmissionReoffer => "admission_reoffer_pending",
-            Self::LegacySettlement => "legacy_settlement_pending",
             Self::UploadClaim => "upload_progress_claim_needed",
             Self::ReasonReoffer => "reason_reoffer_active",
             Self::EvidenceChanged => "continuation_evidence_changed",
@@ -1616,13 +1613,6 @@ pub(super) fn prepare_continuation_source(
     if index.snapshot_admission_reoffer_pending() {
         return Ok(Err(ContinuationRefusal::AdmissionReoffer));
     }
-    if index.legacy_settlement_ledger_needs_migration()
-        || !index
-            .legacy_settlement_reconciliation_pending_fingerprints()
-            .is_empty()
-    {
-        return Ok(Err(ContinuationRefusal::LegacySettlement));
-    }
     let reoffer_now = reason_reoffer::now_unix_seconds();
     let claim_needed = continuation_upload_claim_needed(
         &upload_progress,
@@ -1714,8 +1704,6 @@ pub(super) fn prepare_continuation_source(
         committed_index,
         backfill_state,
         backfill_pending: false,
-        legacy_reconciliation_pending: BTreeSet::new(),
-        active_legacy_reconciliation: BTreeSet::new(),
         scan: Some(scan),
     }))
 }

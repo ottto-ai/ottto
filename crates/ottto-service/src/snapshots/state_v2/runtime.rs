@@ -13,6 +13,8 @@ use std::time::Instant;
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Hold {
     Future,
+    /// An older build's accepted ledger: never migrated, held for a reset.
+    OlderLedger,
     UnknownRecordKind,
     DbUnavailable,
     ForeignBinding,
@@ -27,6 +29,7 @@ impl std::fmt::Display for Hold {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Future | Self::UnknownRecordKind => "scan_index_representation_refused",
+            Self::OlderLedger => "scan_index_older_ledger_refused",
             Self::DbUnavailable => "state_v2_db_unavailable",
             Self::ForeignBinding => "state_v2_foreign_binding",
             Self::NewerSchema => "state_v2_newer_schema_refused",
@@ -450,7 +453,10 @@ fn load_with_custody(
                 state.current = None;
             }
             let _gauge = telemetry::Stage::new(telemetry::Kind::Hydrate);
-            let mut db = sqlite::Sqlite::open(&db_path, &identity).map_err(Hold::storage)?;
+            let mut db = sqlite::Sqlite::open_gated(&db_path, &identity, |db| {
+                refuse_unsupported_versions(db, binding.source)
+            })
+            .map_err(Hold::storage)?;
             // Static stage labels: Hold::storage reports where a reopen failed.
             db.stamp().context("state_v2_open_stamp")?;
             let image = hydrate_image(&mut db, binding.source, |index, db| {
@@ -566,14 +572,30 @@ fn normalize_hydrated(
 ) -> Result<()> {
     use super::super::lenient_decode;
     let slug = source.snapshot().api_slug();
-    lenient_decode::post_decode_hydrated(index, "load", slug).map_err(|error| match error {
-        lenient_decode::Error::Refused("schema_version" | "accepted-ledger version") => {
-            anyhow::Error::from(Hold::Future)
-        }
-        error => anyhow::Error::from(error),
-    })?;
+    lenient_decode::post_decode_hydrated(index, "load", slug).map_err(refusal_hold)?;
     index.clear_retired_file_size_debt();
+    // After the baseline: the next save writes a stale retired cursor as null.
+    index.legacy_settlement_reconcile_after_fingerprint = None;
     Ok(())
+}
+/// The shared load gate on the persisted versions, before the native open
+/// writes anything: an unsupported schema or ledger keeps the database as is.
+fn refuse_unsupported_versions(
+    db: &mut sqlite::Sqlite,
+    source: super::super::scan_index_persistence::Source,
+) -> Result<()> {
+    let mut versions = ScanIndex::default();
+    kinds_misc::read_version_controls(&mut db.begin(TxnMode::Read)?, &mut versions)?;
+    super::super::lenient_decode::controls(&versions, source.snapshot().api_slug())
+        .map_err(refusal_hold)
+}
+fn refusal_hold(error: super::super::lenient_decode::Error) -> anyhow::Error {
+    use super::super::lenient_decode::{Error, OLDER_LEDGER_REFUSAL};
+    match error {
+        Error::Refused("schema_version" | "accepted-ledger version") => Hold::Future.into(),
+        Error::Refused(OLDER_LEDGER_REFUSAL) => Hold::OlderLedger.into(),
+        error => error.into(),
+    }
 }
 
 fn pause(state: &mut RouteState, class: Pause) {

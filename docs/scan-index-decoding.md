@@ -11,8 +11,7 @@ publication, manifest and removal gates preserve their scope. This first slice
 keeps holds until a compatible implementation understands the original slot;
 it introduces no automatic release. A held file without exact incidence keeps
 its prior membership UNKNOWN. Acceptance pruning, including partial commits, retains existing ACKs while
-that uncertainty exists, and legacy reconciliation neither reopens ACKs nor seals
-until incidence is known. This creates no acceptance or manifest membership;
+that uncertainty exists. This creates no acceptance or manifest membership;
 an explicit exact empty set remains known empty.
 
 Hold admission checks lexically delimited keys before String allocation and

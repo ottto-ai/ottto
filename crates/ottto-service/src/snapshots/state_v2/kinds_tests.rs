@@ -236,6 +236,27 @@ fn retired_upload_context_row_is_purged_by_the_next_save() {
     assert!(tx.get(&row).unwrap().is_none(), "still absent after reopen");
 }
 
+/// [format] The retired legacy sweep cursor keeps its layout-1 row: a save
+/// still writes it (null), so an earlier reader that requires it still opens.
+#[test]
+fn retired_legacy_cursor_row_is_still_written_by_a_save() {
+    let row = mapper::key(
+        "v1_field.legacy_settlement_reconcile_after_fingerprint",
+        "",
+        0,
+    )
+    .unwrap();
+    let (_scratch, mut db) = Scratch::store();
+    commit_populate(&mut db, &fixture());
+    let identity = db.read_control::<Identity>("identity").unwrap().unwrap();
+    let (mut restored, mut cx) = hydrate(&mut db, Scratch::binding()).unwrap();
+    assert_eq!(restored.legacy_settlement_reconcile_after_fingerprint, None);
+    let previous = restored.clone();
+    save_graph(&mut db, &identity, &previous, &mut restored, &mut cx).unwrap();
+    let mut tx = db.begin(TxnMode::Read).unwrap();
+    assert!(tx.get(&row).unwrap().is_some(), "the layout-1 row stays");
+}
+
 /// [format] A store that never had the retired row opens at the current
 /// layout: the root is not required.
 #[test]

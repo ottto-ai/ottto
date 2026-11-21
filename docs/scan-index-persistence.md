@@ -364,13 +364,21 @@ needed; the strict refusal fence is retained and frozen for both versions.
 
 ## Reader N: visible version refusal
 
-A source-aware schema or accepted-ledger version refusal immediately records
+A source-aware schema or newer accepted-ledger version refusal immediately records
 `scan_index_newer_than_app` for that source. The source row is unavailable and
 its source-owned warning makes machine health degraded, preserving other
 sources. Label: **Not collecting: update Ottto**. Hover detail explains that a
 newer Ottto must load the index; preserve local state. No restart, reset,
 quarantine or transcript read is added. A compatible root load clears it;
 missing state or unrelated errors cannot clear an existing version refusal.
+
+An accepted ledger older than the current version (0 or 1, from a build that
+predates the version-2 ledger) is never migrated. Every JSON and native load and
+save refuses it, keeps its bytes (a native open reads the versions before its
+first write), and records the support-directed `index_shard_unavailable` status
+instead; stderr names the older store once per source per process. Collection
+for that source stays paused until the local data is reset. The user Repair override cannot rebuild it either, because its
+identity carry refuses the same ledger.
 
 Each source transition emits one content-free log. The next daemon status emits
 one `ScanIndexCollectionChanged` event with only source slug, fixed reason,

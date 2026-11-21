@@ -17,13 +17,7 @@ fn prepare(root: &Path, index: &mut ScanIndex) -> SourceScanResult {
         SnapshotUploadPolicy::default(),
     );
     for item in &mut scan.snapshots {
-        prepare_snapshot_cache_for_upload(
-            item,
-            &test_upload_progress(),
-            false,
-            false,
-            &BTreeSet::new(),
-        );
+        prepare_snapshot_cache_for_upload(item, &test_upload_progress(), false, false);
     }
     finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, index);
     scan

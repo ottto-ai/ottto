@@ -315,15 +315,17 @@ pub struct ScanIndex {
     /// file mtime or the collector observation clock.
     #[serde(default)]
     pub snapshot_activity_at: SharedMap<String, Option<String>>,
-    /// Exact entity ACK identities known durable at the backend. Older indexes
-    /// deserialize this empty. The separate version bit distinguishes that
-    /// legacy absence from a current, authoritatively empty ledger.
+    /// Exact entity ACK identities known durable at the backend.
     #[serde(default)]
     pub(super) accepted_snapshot_fingerprints: Shared<BTreeSet<String>>,
+    /// Every load and save refuses any version other than
+    /// `SNAPSHOT_ACCEPTED_LEDGER_VERSION`; an absent field reads as 0.
     #[serde(default)]
     pub(super) accepted_snapshot_fingerprint_ledger_version: u8,
-    /// Restart-stable lexicographic cursor for bounded re-entry of ambiguous
-    /// pre-ledger entities through the existing snapshot entity-ACK contract.
+    /// Retired legacy sweep cursor: always None, never set. JSON reads and
+    /// drops it; a native hydrate clears it after the baseline, so the next
+    /// save writes a stale value as null. The native layout-1 row stays
+    /// because older readers require it; remove it with the next layout change.
     #[serde(default)]
     pub(super) legacy_settlement_reconcile_after_fingerprint: Option<String>,
     /// Rejected entities are quarantined under the exact daemon/parser/wire
@@ -530,7 +532,8 @@ pub(crate) enum UnsettledUploadCause {
     /// stamp (the debt is a census reason, not an unsettled upload). Kept so
     /// a bit recorded by an earlier daemon still decodes by name.
     AuthorityCensusWithheld,
-    /// Legacy settlement reconciliation armed revisions.
+    /// Legacy settlement reconciliation armed revisions. No longer produced;
+    /// kept so a recorded bit decodes by name.
     LegacyReconcile,
     /// An admission-limit re-offer armed revisions.
     AdmissionReoffer,

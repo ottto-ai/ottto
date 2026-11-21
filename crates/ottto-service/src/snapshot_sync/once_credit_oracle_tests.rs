@@ -804,7 +804,7 @@ impl OracleHome {
         // Our hint leaves cache negotiation disabled; apply that SAME function
         // to the captured types, then require exact typed/wire correspondence.
         for item in &mut finalized {
-            prepare_snapshot_cache_for_upload(item, &wire_progress, false, false, &BTreeSet::new());
+            prepare_snapshot_cache_for_upload(item, &wire_progress, false, false);
         }
         drop(wire_progress);
         let evidence_chunks = evidence_chunks_for_test() - chunks_before;

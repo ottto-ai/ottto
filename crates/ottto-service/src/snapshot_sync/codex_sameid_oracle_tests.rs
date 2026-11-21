@@ -559,13 +559,7 @@ fn codex_group_finish_uploads_after_its_capture_on_a_state_store() {
     let mut wire = expected.snapshots.clone();
     let ledger = SnapshotUploadProgress::new("a".repeat(64), snapshot_quarantine_witness(SOURCE));
     for item in &mut wire {
-        prepare_snapshot_cache_for_upload(
-            item,
-            &ledger,
-            false,
-            false,
-            &std::collections::BTreeSet::new(),
-        );
+        prepare_snapshot_cache_for_upload(item, &ledger, false, false);
     }
     let captured = Arc::new(Mutex::new(Vec::new()));
     let url = snapshot_status_server_with_hint_extras_and_batch(
