@@ -479,9 +479,15 @@ Prepare, finish, server minima, upload backoff and background QoS still apply.
 During a first backfill (not a replay revision bump), a Codex page that spent a byte budget with
 work still queued also requests a paced pass.
 While destination bootstrap is pending, AC passes also keep runnable bounded-walk work or an
-owed clean follow-up on the same 30-second pacing. Every request made during the first import
-carries the first-import flag, so on AC its pages keep the thread's ordinary QoS instead of
-background; battery and steady-state passes stay at background. When a source first sees an
+owed clean follow-up paced. Every request made during the first import carries the
+first-import flag. On AC such a request asks for the next pass with no gap, and that pass runs
+at UTILITY: the thread is only lowered, never raised; a failed UTILITY query or set falls back to
+background, and a failed background entry clears the request. One rule,
+`continuation::paced_pass_policy`, picks the gap with the power at request time and the class
+with the power at pass entry. A zero wait still polls the watcher and the account-switch probe
+once. Battery keeps 180 seconds at background, and steady-state AC passes keep 30 seconds at
+background. A cycle that fails before rotation clears the paced requests of every source it did
+not rotate, so a past-due request cannot spin the loop. When a source first sees an
 upload destination while its first import there is owed, it requests one such paced pass at once
 instead of waiting out the tier it carried from before. The request uses the
 index after upload settlement, including a first offer's final-page conflict. Metadata-only

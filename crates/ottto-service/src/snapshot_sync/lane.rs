@@ -203,9 +203,12 @@ pub(super) fn collect_file_activity_for(
 ) -> bool {
     let deadline = crate::scan_clock::now() + wait;
     let mut watcher = watcher;
+    // A zero wait (a due first-import page) still polls once, without
+    // blocking: the watcher channel and the account-switch probe.
+    let mut poll = wait.is_zero();
     loop {
         let now = crate::scan_clock::now();
-        if now >= deadline {
+        if now >= deadline && !std::mem::take(&mut poll) {
             return false;
         }
         let slice = deadline
@@ -663,6 +666,7 @@ pub(super) fn sync_once(
         paced_qos: None,
         account_witness,
     };
+    continuation_cycle.rotating(&enabled_sources);
     crate::source_rotation::run(
         &mut owner,
         &enabled_sources,

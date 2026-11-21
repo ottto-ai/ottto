@@ -458,7 +458,10 @@ The pass reports each of the following outcome counts even when it is zero.
   budget, first-read progress or deferred charge), or from the first-import AC
   arm for a runnable walk. `paced_first_import` is 1 when that request carries
   the first-import flag, and `paced_power_allowed` or `paced_power_battery`
-  records the power state it saw. All are 0 when no request was made.
+  records the power state it saw. `paced_gap_secs` is the gap the request
+  chose: 0 for a first import on AC, 30 for other AC requests and 180 on
+  battery; it is also 0 when no request stands (Low Power Mode, unknown power
+  or a disabled source). All are 0 when no request was made.
 
 `source_prepare` counts say why the pass ran or stopped. Exactly one of
 `due_paced` (a paced request was due), `due_ordinary` (the ordinary cadence
@@ -2057,12 +2060,15 @@ The Codex `native_collection_page` line carries `page_byte_budget_hit: 1` in
 spent. During a first backfill, such a page with queued work requests a paced
 pass. It never affects selection or money.
 
-Completed native pages also carry a `first_import_default_qos` boolean: the
-pass ran a paced request made during the source's first import while on AC
-power, so it kept the thread's default QoS instead of background QoS. Battery,
-Low Power Mode and unknown power behave as before, and paced passes requested
-after the first import stay at background QoS. The reason is held in memory
-only; it changes priority, never selection or money.
+During a first import on AC, every paced request asks for the next paced pass
+with no gap, run at UTILITY QoS: the thread is lowered to UTILITY and never
+raised. A zero wait still polls the watcher and the account-switch probe once.
+Completed native pages report `first_import_qos`: `utility`, or `background`
+when the UTILITY query or set failed. The field is absent otherwise. Battery
+keeps background QoS and the 180 s gap, Low Power Mode and unknown power clear
+the request, and paced passes requested after the first import keep the 30 s
+gap at background QoS. The reason is held in memory only; it changes timing
+and priority, never selection or money.
 
 ## Claude OTLP spans and relay requests: stored and not stored
 

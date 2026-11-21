@@ -191,6 +191,19 @@ fn claude_account_switch_probe_fires_only_on_a_changed_account() {
     assert!(probe.observe(at(60), || account("acct-b")));
     assert!(!probe.observe(at(80), || account("acct-b")));
 }
+
+/// [behaviour] A zero wait (a due first-import page) does not block, but
+/// still polls the account-switch probe once before the pass.
+#[test]
+fn zero_wait_still_polls_the_account_switch_probe_once() {
+    let mut probe = ClaudeAccountSwitchProbe::default();
+    assert!(!super::lane::collect_file_activity_for(
+        Duration::ZERO,
+        None,
+        &mut probe
+    ));
+    assert!(probe.checked_at.is_some(), "the zero wait polled once");
+}
 use crate::ControlToken;
 use ottto_core::{
     FileDeviceStore, LocalConnectionBinding, OTTTO_RELAY_DEVICE_SECRET_ACCOUNT,

@@ -86,72 +86,98 @@ pub(super) fn power_label(power: PlatformState) -> &'static str {
         PlatformState::Unknown => "power_unknown",
     }
 }
-fn resident_pacing(power: PlatformState) -> Option<ContinuationPacing> {
-    match power {
-        PlatformState::Allowed => Some(PACED_AC),
-        PlatformState::Battery => Some(PACED_BATTERY),
-        PlatformState::Refused | PlatformState::Unknown => None,
-    }
-}
+/// First-import pages on AC follow each other at once, guarded by UTILITY
+/// QoS ([`paced_pass_policy`]).
+pub(super) const PACED_FIRST_IMPORT: ContinuationPacing = ContinuationPacing {
+    min_gap: Duration::ZERO,
+    idle_per_work: 0,
+};
+pub(super) const QOS_UTILITY: u32 = 0x11;
+pub(super) const QOS_BACKGROUND: u32 = 0x09;
 /// The QoS a due paced pass runs at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PassQos {
     Background,
-    /// The thread's default QoS: a first-import pass on AC.
-    Default,
-    /// Refused or unknown power: the source's paced request is cleared.
-    Cleared,
+    /// At most UTILITY, never raised: a first-import pass on AC.
+    Utility,
 }
-/// The one rule: only a first-import request on AC skips background QoS.
-pub(super) fn paced_pass_qos(power: PlatformState, first_import: bool) -> PassQos {
-    match power {
-        PlatformState::Allowed if first_import => PassQos::Default,
-        PlatformState::Allowed | PlatformState::Battery => PassQos::Background,
-        PlatformState::Refused | PlatformState::Unknown => PassQos::Cleared,
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct PacedPolicy {
+    pub(super) pacing: ContinuationPacing,
+    pub(super) qos: PassQos,
+}
+/// The one paced-pass rule, read when the request is made (its gap) and again
+/// at pass entry (its QoS), each time with the power at that moment. On AC a
+/// first-import request asks for the next pass at once, at UTILITY; any other
+/// AC request waits 30 s at background. So after an unplug an already-due
+/// zero-gap page runs at once at background and the next request waits 180 s;
+/// after plugging in, a page asked for on battery has waited 180 s and runs at
+/// its AC class. `None` (Low Power Mode, unknown power) clears the request.
+pub(super) fn paced_pass_policy(power: PlatformState, first_import: bool) -> Option<PacedPolicy> {
+    let (pacing, qos) = match power {
+        PlatformState::Allowed if first_import => (PACED_FIRST_IMPORT, PassQos::Utility),
+        PlatformState::Allowed => (PACED_AC, PassQos::Background),
+        PlatformState::Battery => (PACED_BATTERY, PassQos::Background),
+        PlatformState::Refused | PlatformState::Unknown => return None,
+    };
+    Some(PacedPolicy { pacing, qos })
 }
 thread_local! {
-    /// This owner thread's current pass took [`PassQos::Default`]; diagnostics only.
-    static FIRST_IMPORT_DEFAULT_QOS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The class this owner thread's first-import pass took on AC; diagnostics only.
+    static FIRST_IMPORT_QOS: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
 }
-pub(crate) fn first_import_default_qos() -> bool {
-    FIRST_IMPORT_DEFAULT_QOS.get()
+pub(crate) fn first_import_qos() -> Option<&'static str> {
+    FIRST_IMPORT_QOS.get()
 }
-/// Background QoS for one source's ordinary pass, only while THAT source's
-/// paced scan is due; a refused entry clears only that source's request.
+/// The QoS for one source's ordinary pass, only while THAT source's paced scan
+/// is due. A UTILITY entry only lowers: a thread already at or below UTILITY
+/// is left alone. A failed UTILITY query or set falls back to background; a
+/// refused entry clears only that source's request.
 pub(super) fn paced_source_qos(
     source: SnapshotSource,
     power: impl FnOnce() -> PlatformState,
-    background: impl FnOnce() -> Option<MacPlatformSignals>,
+    current_class: impl FnOnce() -> Option<u32>,
+    mut lower: impl FnMut(u32) -> Option<MacPlatformSignals>,
 ) -> Option<MacPlatformSignals> {
-    FIRST_IMPORT_DEFAULT_QOS.set(false);
+    FIRST_IMPORT_QOS.set(None);
     if !source_paced_due(source).is_some_and(|due| due <= crate::scan_clock::now()) {
         return None;
     }
     let first_import = with_source_cadence(source, |c| c.paced_first_import()) == Some(true);
-    let qos = match paced_pass_qos(power(), first_import) {
-        PassQos::Default => {
-            FIRST_IMPORT_DEFAULT_QOS.set(true);
-            return None;
-        }
-        PassQos::Background => background(),
-        PassQos::Cleared => None,
+    let (qos, label) = match paced_pass_policy(power(), first_import).map(|policy| policy.qos) {
+        Some(PassQos::Utility) => match current_class() {
+            // Clamp, never raise: at or below UTILITY already, nothing is set.
+            Some(class) if class != 0 && class <= QOS_UTILITY => (None, Some("utility")),
+            class => match class.and_then(|_| lower(QOS_UTILITY)) {
+                Some(qos) => (Some(qos), Some("utility")),
+                None => (lower(QOS_BACKGROUND), Some("background")),
+            },
+        },
+        Some(PassQos::Background) => (lower(QOS_BACKGROUND), None),
+        None => (None, None),
     };
-    if qos.is_none() {
+    let runs = qos.is_some() || label == Some("utility");
+    if !runs {
         with_source_cadence(source, SourceCadence::clear_continuation);
     }
+    FIRST_IMPORT_QOS.set(label.filter(|_| runs));
     qos
 }
 /// Shared ordinary-owner entry seam; preserve drop-before-enter ordering.
 pub(super) fn enter_source_qos(slot: &mut Option<MacPlatformSignals>, source: SnapshotSource) {
     drop(slot.take());
     let power = || MacPlatformSignals::default().power();
-    *slot = paced_source_qos(source, power, MacPlatformSignals::background);
+    *slot = paced_source_qos(
+        source,
+        power,
+        current_qos_class,
+        MacPlatformSignals::lowered,
+    );
 }
-/// The ordinary-owner exit seam: drop the pass's QoS and its row flag.
+/// The ordinary-owner exit seam: drop the pass's QoS and its row label.
 pub(super) fn leave_source_qos(slot: &mut Option<MacPlatformSignals>) {
     drop(slot.take());
-    FIRST_IMPORT_DEFAULT_QOS.set(false);
+    FIRST_IMPORT_QOS.set(None);
 }
 /// A spent byte budget or first-read progress asks only during the source's
 /// first backfill. Progress asks only while the census is unfinished and not
@@ -169,7 +195,7 @@ pub(super) fn resident_scan_requested(scan: &SourceScanResult, first_read_bootst
 /// An AC request can wake once after unplugging; battery cannot renew this reason.
 /// Every request made during the source's first import carries the
 /// first-import flag, so its pages run at the import QoS on AC; battery and
-/// steady-state passes stay at background QoS (`paced_pass_qos`).
+/// steady-state passes stay at background QoS ([`paced_pass_policy`]).
 pub(super) fn resident_scan_request_after_settlement(
     scan: &SourceScanResult,
     bootstrap: bool,
@@ -210,27 +236,29 @@ pub(super) fn request_on_destination_change(
         *slot = Some(digest);
         changed
     });
-    if !changed || resident_pacing(power).is_none() || !bootstrap_pending() {
+    if !changed || paced_pass_policy(power, false).is_none() || !bootstrap_pending() {
         return false;
     }
-    request_resident_scan_on_power(source, power == PlatformState::Allowed, power);
-    true
+    request_resident_scan_on_power(source, power == PlatformState::Allowed, power).is_some()
 }
 #[cfg(test)]
 pub(super) fn request_resident_scan(source: SnapshotSource, first_import: bool) {
     request_resident_scan_on_power(source, first_import, MacPlatformSignals::default().power());
 }
+/// Request a paced pass under [`paced_pass_policy`] at `power`. Returns the
+/// gap it chose when the request stands.
 pub(super) fn request_resident_scan_on_power(
     source: SnapshotSource,
     first_import: bool,
     power: PlatformState,
-) {
-    if let Some(pacing) = resident_pacing(power) {
-        with_source_cadence(source, |cadence| {
-            let now = crate::scan_clock::now();
-            cadence.request_paced_scan(now, Duration::ZERO, pacing, first_import)
-        });
-    }
+) -> Option<Duration> {
+    let policy = paced_pass_policy(power, first_import)?;
+    with_source_cadence(source, |cadence| {
+        let now = crate::scan_clock::now();
+        cadence.request_paced_scan(now, Duration::ZERO, policy.pacing, first_import)
+    })
+    .filter(|requested| *requested)
+    .map(|_| policy.pacing.min_gap)
 }
 
 /// A page whose measured work exceeds this is read as contention (a loaded
@@ -416,9 +444,17 @@ fn set_qos(_class: u32, _rel: i32) -> bool {
     #[cfg(not(target_os = "macos"))]
     false
 }
+pub(super) fn current_qos_class() -> Option<u32> {
+    query_qos().map(|(class, _)| class)
+}
 impl MacPlatformSignals {
-    fn enter(&mut self, saved: Option<(u32, i32)>, set: fn(u32, i32) -> bool) -> PlatformState {
-        if let Some(saved) = saved.filter(|_| set(0x09, 0)) {
+    fn enter(
+        &mut self,
+        saved: Option<(u32, i32)>,
+        set: fn(u32, i32) -> bool,
+        class: u32,
+    ) -> PlatformState {
+        if let Some(saved) = saved.filter(|_| set(class, 0)) {
             self.saved = Some(saved);
             PlatformState::Allowed
         } else {
@@ -426,8 +462,12 @@ impl MacPlatformSignals {
         }
     }
     pub(crate) fn background() -> Option<Self> {
+        Self::lowered(QOS_BACKGROUND)
+    }
+    /// This thread at `class` until dropped; `None` when the set failed.
+    pub(crate) fn lowered(class: u32) -> Option<Self> {
         let mut signals = Self::default();
-        (signals.enter_background_qos() == PlatformState::Allowed).then_some(signals)
+        (signals.enter(query_qos(), set_qos, class) == PlatformState::Allowed).then_some(signals)
     }
 }
 impl PlatformGates for MacPlatformSignals {
@@ -443,7 +483,7 @@ impl PlatformGates for MacPlatformSignals {
         power_state(answer)
     }
     fn enter_background_qos(&mut self) -> PlatformState {
-        self.enter(query_qos(), set_qos)
+        self.enter(query_qos(), set_qos, QOS_BACKGROUND)
     }
     fn restore_qos(&mut self) {
         if let Some((class, rel)) = self.saved.take() {
@@ -982,9 +1022,14 @@ pub(super) fn settle_cycle(
 #[derive(Default)]
 pub(super) struct CycleSettlement {
     succeeded_with_codex: bool,
+    rotated: Vec<SnapshotSource>,
 }
 
 impl CycleSettlement {
+    /// These sources are about to rotate; each settles its own paced request.
+    pub(super) fn rotating(&mut self, sources: &[SnapshotSource]) {
+        self.rotated = sources.to_vec();
+    }
     /// The cycle succeeded; `codex_granted` is whether it ran with Codex.
     pub(super) fn succeeded(&mut self, codex_granted: bool) {
         self.succeeded_with_codex = codex_granted;
@@ -994,6 +1039,22 @@ impl CycleSettlement {
 impl Drop for CycleSettlement {
     fn drop(&mut self) {
         settle_cycle(&mut CodexCadence, &TICKET, self.succeeded_with_codex);
+        clear_unrotated(&self.rotated);
+    }
+}
+
+/// A source that did not rotate (the cycle failed early on credentials,
+/// machine id or witness, or the source is off) settles nothing itself: its
+/// past-due paced request would wake the loop at once, every time.
+pub(super) fn clear_unrotated(rotated: &[SnapshotSource]) {
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        if !rotated.contains(&source) {
+            with_source_cadence(source, SourceCadence::clear_continuation);
+        }
     }
 }
 

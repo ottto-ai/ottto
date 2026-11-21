@@ -45,6 +45,7 @@ jobs:
           python3 scripts/test_resource_baseline.py
           bash scripts/test_macos_public_rc_gate.sh
           bash scripts/test_resource_native_qos_pr.sh
+          bash scripts/test_resource_native_first_import_gate.sh
 
       # SQLite is bundled and selected resource tests use Python CLI stubs,
       # so no apt/zsh bootstrap is needed. Preserve the existing private,
