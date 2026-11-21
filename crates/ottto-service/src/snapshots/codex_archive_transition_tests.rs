@@ -1436,7 +1436,7 @@ fn same_object_archive_rename_with_job_and_owed_debt_defers_and_holds_owner() {
         .insert(to.clone());
     let (deferred, held) = index.prepare_codex_carries(None);
     assert_eq!(deferred, BTreeSet::from([to.clone()]));
-    assert_eq!(held, BTreeSet::from([codex_protected_owner(MAIN)]));
+    assert_eq!(held, BTreeSet::from([MAIN.to_owned()]));
     assert!(index
         .traversal
         .as_ref()
