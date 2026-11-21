@@ -33,9 +33,11 @@ fn pair(index: &mut ScanIndex) -> Result<()> {
         tail::PathCarry {
             from: FILE.into(),
             scan_root: PathBuf::from("/synthetic/tail"),
-            head: b"rebound".to_vec(),
-            inventory: facts(),
-            job: Some(job(2)),
+            contents: tail::CarryContents::File {
+                head: b"rebound".to_vec(),
+                inventory: facts(),
+                job: Some(job(2)),
+            },
         },
     )
 }

@@ -1302,6 +1302,78 @@ fn archive_whole_unread_debt_settles_after_one_counted_full() {
     }
 }
 
+/// A first decision made in an archive has file custody without a reduction.
+#[test]
+fn same_object_archive_rename_carries_terminal_job_without_progress() {
+    use crate::session_attribution::job_template::{context, JobState};
+    use std::os::unix::fs::MetadataExt;
+
+    const TASK: &str = "Inspect the service and explain every failure with clear evidence";
+    let _lock = DECODER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let c = Corpus::new();
+    let (session, prior) = c.publish();
+    let original = c.path(MAIN).with_extension("jsonl.zst");
+    let prompt = json!({"type": "event_msg", "payload": {"type": "user_message", "message": TASK}});
+    let bytes = header(MAIN, Some("a")) + &format!("{prompt}\n") + &turn(1);
+    fs::write(
+        &original,
+        zstd::stream::encode_all(bytes.as_bytes(), 1).unwrap(),
+    )
+    .unwrap();
+    let (mut index, _, first) =
+        observed_pass(&c, &original, prior, "archive-job-context", &Arc::default());
+    assert_eq!(first.posts, 1);
+    let from = local_index_key(&original);
+    let progress = serde_json::to_value(&index.files[&from]).unwrap();
+    let head = state_v2::load_head(&index, &from, REVISION)
+        .unwrap()
+        .unwrap();
+    assert!(head.metadata_only);
+    let job = head.common.job.unwrap();
+    assert_eq!(job.state, JobState::NoId);
+    assert_ne!(job.birth_nanos, 0);
+
+    let archived = c.archived.join(original.file_name().unwrap());
+    fs::rename(&original, &archived).unwrap();
+    let to = local_index_key(&archived);
+    let stat = fs::metadata(&archived).unwrap();
+    let mut candidate = codex_file_join::header_candidate(c.archived.clone(), archived, &stat);
+    candidate.physical_identity = Some([stat.dev(), stat.ino()]);
+    candidate.fingerprint_birth_nanos = crate::transcript_acquisition::birth_unix_nanos(&stat);
+    assert_eq!(candidate.fingerprint_birth_nanos, job.birth_nanos);
+    let carry = |index: &mut ScanIndex| {
+        index
+            .carry_codex_rollout_with_cache(
+                session.path(),
+                &candidate,
+                vec![(from.clone(), c.sessions.clone(), MAIN.to_owned())],
+                None,
+            )
+            .unwrap()
+    };
+    assert!(carry(&mut index));
+    assert_eq!(serde_json::to_value(&index.files[&from]).unwrap(), progress);
+    assert!(!index.files.contains_key(&to));
+    assert!(state_v2::load_head(&index, &from, REVISION)
+        .unwrap()
+        .is_none_or(|head| head.common.job.is_none()));
+    let head = state_v2::load_head(&index, &to, REVISION).unwrap().unwrap();
+    assert!(head.metadata_only);
+    assert_eq!(head.common.job, Some(job));
+    assert!(
+        !carry(&mut index),
+        "an unfinished census can revisit the old key"
+    );
+
+    let mut acc = SnapshotAccumulator::new(SnapshotSource::Codex);
+    tail_source::seed_full_job_template(&index, &candidate, &[], &mut acc).unwrap();
+    acc.observe_job(TASK);
+    acc.finish_job_template(Some(&context(7)));
+    assert_eq!(acc.job_template, Some(JobState::NoId));
+}
+
 /// [regress] A provider archive moves a rollout to another path, keeping its
 /// old mtime. The walk that lists the moved file counts it only after its path
 /// carry, so in that same walk it owes what its predecessor owed: an ACKed file

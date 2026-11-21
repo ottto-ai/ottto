@@ -89,9 +89,9 @@ pub(in crate::snapshots) use sqlite::{sidecar, sqlite_uri};
     reason = "the acquisition cutover consumes these staged types"
 )]
 pub(in crate::snapshots) use tail::{
-    Change, Collection, CollectionMeta, Common, DebtSummary, FileJob, InventoryFacts, JobUpdate,
-    NoUploadRequired, Observation, PathCarry, Representation, SetAside, SetAsideCause, Shape,
-    StagedFile, TailHead,
+    CarryContents, Change, Collection, CollectionMeta, Common, DebtSummary, FileJob,
+    InventoryFacts, JobUpdate, NoUploadRequired, Observation, PathCarry, Representation, SetAside,
+    SetAsideCause, Shape, StagedFile, TailHead,
 };
 
 /// One lazy attachment keeps v2 custody, claim lineage and debt out of v1's

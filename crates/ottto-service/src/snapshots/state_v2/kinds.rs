@@ -335,8 +335,10 @@ pub(super) fn save_graph(
         );
         next.generation = generation.checked_add(1).ok_or(Hold::DbUnavailable)?;
         if let Some((to, carry)) = &pending.carry {
-            // CAS-restored custody joins the same map move before encoding.
-            next.rekey_account_custody(&carry.from, to, Some(&carry.scan_root));
+            if matches!(carry.contents, tail::CarryContents::File { .. }) {
+                // CAS-restored custody joins the same map move before encoding.
+                next.rekey_account_custody(&carry.from, to, Some(&carry.scan_root));
+            }
         }
         let mut tx = store.begin(TxnMode::Write)?;
         let mut digests = delta(previous, next, &mut tx, &mut pending)?;

@@ -297,10 +297,20 @@ pub(super) struct TailStage {
 pub(in crate::snapshots) struct PathCarry {
     pub(in crate::snapshots) from: String,
     pub(in crate::snapshots) scan_root: std::path::PathBuf,
-    pub(in crate::snapshots) head: Vec<u8>,
-    pub(in crate::snapshots) inventory: InventoryFacts,
-    pub(in crate::snapshots) job: Option<FileJob>,
+    pub(in crate::snapshots) contents: CarryContents,
 }
+
+#[derive(Clone)]
+pub(in crate::snapshots) enum CarryContents {
+    File {
+        head: Vec<u8>,
+        inventory: InventoryFacts,
+        job: Option<FileJob>,
+    },
+    /// Same object, with no reduction that could authorize carrying progress.
+    Job(FileJob),
+}
+
 pub(super) enum EffectiveHead {
     Removed,
     Staged(u32, Vec<u8>),
@@ -344,13 +354,15 @@ impl TailStage {
                         && !self.erase.contains(*key)),
             "state_v2_tail_carry_conflict"
         );
-        // A provisional discovery observation is superseded by the proven
-        // predecessor, including its logical representation and existing debt.
-        self.debt.remove(&to);
         let mut moved = Self::default();
-        if let Some(mut debt) = self.debt.remove(from) {
-            debt.inventory = Some(carry.inventory.clone());
-            moved.debt.insert(to, debt);
+        if let CarryContents::File { inventory, .. } = &carry.contents {
+            // A provisional observation is superseded by the proven predecessor,
+            // including its logical representation and existing debt.
+            self.debt.remove(&to);
+            if let Some(mut debt) = self.debt.remove(from) {
+                debt.inventory = Some(inventory.clone());
+                moved.debt.insert(to, debt);
+            }
         }
         Ok(moved)
     }
@@ -1473,6 +1485,26 @@ fn move_row(tx: &mut dyn Transaction, old: &Header, new: RowKey) -> Result<()> {
 pub(super) fn move_tail(tx: &mut dyn Transaction, to: &[u8], carry: &PathCarry) -> Result<()> {
     let from = carry.from.as_bytes();
     let mut head = read_head(tx, from)?.context("state_v2_tail_carry_missing")?;
+    let (rebound, inventory, job) = match &carry.contents {
+        CarryContents::File {
+            head,
+            inventory,
+            job,
+        } => (head, inventory, job),
+        CarryContents::Job(job) => {
+            // This proof rehomes only the decision. It conveys no reduction,
+            // progress or authority to settle either key's existing debt.
+            ensure!(
+                head.reduction.is_none()
+                    && head.common.job.is_some()
+                    && read_head(tx, to)?.is_none_or(|head| head.common.job.is_none()),
+                "state_v2_tail_carry_conflict"
+            );
+            write_file(tx, to, None, None, Some(&JobUpdate::Set(job.clone())))?;
+            write_file(tx, from, None, None, Some(&JobUpdate::Clear))?;
+            return Ok(());
+        }
+    };
     ensure!(
         tx.get(&row(HEAD, to, 0)?)?.is_none(),
         "state_v2_tail_carry_conflict"
@@ -1522,10 +1554,10 @@ pub(super) fn move_tail(tx: &mut dyn Transaction, to: &[u8], carry: &PathCarry) 
     if let Some(marker) = tx.get(&set_aside_key(from)?)? {
         move_row(tx, &marker, set_aside_key(to)?)?;
     }
-    head.common.inventory = Some(carry.inventory.clone());
-    head.common.job.clone_from(&carry.job);
+    head.common.inventory = Some(inventory.clone());
+    head.common.job.clone_from(job);
     // A metadata-only head stays metadata-only; a reduction remains Tail.
-    let reduction = head.reduction.as_ref().map(|_| carry.head.as_slice());
+    let reduction = head.reduction.as_ref().map(|_| rebound.as_slice());
     let value = encode_head(head.revision, &head.table, &head.common, reduction)?;
     write_value(tx, to, HEAD_OWNER, 0, &row(HEAD, to, 0)?, &value)?;
     tx.delete(&row(HEAD, from, 0)?)?;
